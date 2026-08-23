@@ -11,5 +11,10 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[bench]]
+name = "store"
+harness = false
+test = false
+
 [lints]
 workspace = true

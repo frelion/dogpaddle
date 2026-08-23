@@ -193,3 +193,67 @@ impl StoreValue for () {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+
+    use super::{StoreKey, StoreValue};
+
+    fn assert_key_codec<T>(values: &[T])
+    where
+        T: StoreKey + Debug + Eq,
+    {
+        for value in values {
+            let encoded = value.encode_key().unwrap();
+            assert_eq!(T::decode_key(&encoded).unwrap(), *value);
+        }
+        for pair in values.windows(2) {
+            assert!(pair[0] < pair[1]);
+            assert!(pair[0].encode_key().unwrap() < pair[1].encode_key().unwrap());
+        }
+    }
+
+    #[test]
+    fn integer_keys_round_trip_and_preserve_order() {
+        assert_key_codec(&[0_u32, 1, u32::MAX - 1, u32::MAX]);
+        assert_key_codec(&[0_u64, 1, u64::MAX - 1, u64::MAX]);
+        assert_key_codec(&[i64::MIN, -2, -1, 0, 1, 2, i64::MAX]);
+    }
+
+    #[test]
+    fn byte_and_string_keys_round_trip_and_preserve_order() {
+        assert_key_codec(&[Vec::new(), vec![0], vec![0, 0], vec![0, 1], vec![0xff]]);
+        assert_key_codec(&[
+            String::new(),
+            "a".to_owned(),
+            "aa".to_owned(),
+            "b".to_owned(),
+            "犬".to_owned(),
+        ]);
+    }
+
+    #[test]
+    fn values_round_trip() {
+        for value in [false, true] {
+            assert_eq!(
+                bool::decode_value(&value.encode_value().unwrap()).unwrap(),
+                value
+            );
+        }
+        assert_eq!(<()>::decode_value(&().encode_value().unwrap()).unwrap(), ());
+        let text = "Shiba 柴犬".to_owned();
+        assert_eq!(
+            String::decode_value(&text.encode_value().unwrap()).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn malformed_values_are_rejected() {
+        assert!(bool::decode_value(&[2]).is_err());
+        assert!(<()>::decode_value(&[0]).is_err());
+        assert!(String::decode_value(&[0xff]).is_err());
+        assert!(u64::decode_value(&[0; 7]).is_err());
+    }
+}

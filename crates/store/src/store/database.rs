@@ -18,11 +18,11 @@ use super::{
 use crate::StoreError;
 
 const MDBX_DATA_FILE: &str = "mdbx.dat";
-const FORMAT_KEY: &[u8] = &[0];
+const STORE_MARKER_KEY: &[u8] = &[0];
 const NEXT_ID_KEY: &[u8] = &[1];
 const NEXT_DEDICATED_KEY: &[u8] = &[4];
 const CATALOG_DOMAIN: u8 = 2;
-const FORMAT_MAGIC: &[u8] = b"dogpaddle.store/v4\0";
+const STORE_MARKER: &[u8] = b"dogpaddle.store\0";
 const MAX_NAME_BYTES: usize = 255;
 const MAX_DEDICATED_TABLES: u32 = 64;
 const SHARED_PLACEMENT: u8 = 0;
@@ -58,8 +58,13 @@ impl Store {
             .open_table(None)
             .map_err(|error| StoreError::storage("open store table", error))?;
         transaction
-            .put(&table, FORMAT_KEY, FORMAT_MAGIC, WriteFlags::NO_OVERWRITE)
-            .map_err(|error| StoreError::storage("write store format", error))?;
+            .put(
+                &table,
+                STORE_MARKER_KEY,
+                STORE_MARKER,
+                WriteFlags::NO_OVERWRITE,
+            )
+            .map_err(|error| StoreError::storage("write store marker", error))?;
         transaction
             .put(
                 &table,
@@ -87,7 +92,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store is missing, corrupt, or incompatible.
+    /// Returns an error when the store is missing or corrupt.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if !path.is_dir() || !path.join(MDBX_DATA_FILE).is_file() {
@@ -100,11 +105,11 @@ impl Store {
         let table = transaction
             .open_table(None)
             .map_err(|error| StoreError::storage("open store table", error))?;
-        let format = transaction
-            .get::<Vec<u8>>(&table, FORMAT_KEY)
-            .map_err(|error| StoreError::storage("read store format", error))?
+        let marker = transaction
+            .get::<Vec<u8>>(&table, STORE_MARKER_KEY)
+            .map_err(|error| StoreError::storage("read store marker", error))?
             .ok_or(StoreError::InvalidStore)?;
-        if format != FORMAT_MAGIC {
+        if marker != STORE_MARKER {
             return Err(StoreError::InvalidStore);
         }
         let next_id = transaction

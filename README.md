@@ -10,12 +10,12 @@
 
 Typed data structures live in `collections/` and compose the generic handle.
 They own their codecs and semantics; the transaction does not know about
-`Cell`, `OrderedMap`, or future collection types.
+`Cell` and `OrderedMap`.
 
 The durable catalog binds a name to an encoded key/value namespace and its
 physical placement. It does not record or validate a collection type or codec.
-Code reopening a data handle must wrap it with the same collection and
-compatible codecs that wrote its contents.
+Code reopening a data handle must use the same collection and codecs that
+wrote its contents.
 
 Small data uses `DataPlacement::Shared` and shares the main B+Tree. Large data
 uses `DataPlacement::Dedicated` and owns an MDBX named table. Placement is
@@ -64,9 +64,9 @@ assert_eq!(batch.items, vec![(42, "Shiba".to_owned())]);
 ```
 
 Dropping a transaction rolls it back. `Transaction` has no explicit abort
-method and no object-specific operations. Reads and writes through all access
+method and no collection-specific operations. Reads and writes through all access
 values share the same transaction snapshot, so any number of data objects
-commit atomically. The MDBX adapter and physical key format are private.
+commit atomically. The MDBX adapter and physical layout are private.
 
 `DataHandle::access` yields the complete collection-building surface: point
 reads, writes, deletes, and bounded ordered scans in either direction. A scan
@@ -78,3 +78,35 @@ failures; raw storage failures are classified automatically.
 
 Access values are attempt-local capabilities: bind them again for every new
 transaction and never cache them across Stage steps.
+
+## Tests
+
+Architecture and collection behavior are separate integration targets:
+
+```bash
+cargo test -p dogpaddle-store --test architecture
+cargo test -p dogpaddle-store --test collections
+```
+
+Individual areas remain directly filterable, for example:
+
+```bash
+cargo test -p dogpaddle-store --test architecture transaction::
+cargo test -p dogpaddle-store --test collections scan::
+```
+
+## Performance
+
+Run the release benchmark with:
+
+```bash
+cargo bench -p dogpaddle-store --bench store
+```
+
+It reports paired `Shared`/`Dedicated` samples for fresh bulk writes, warmed
+point reads and ordered scans, durable overwrites, and warmed reads with
+multiple shared background namespaces. Results include min/median/max; they
+describe this machine and temporary filesystem, not cold-cache or power-loss
+behavior. Workload sizes can be changed with `DOGPADDLE_BENCH_ENTRIES`,
+`DOGPADDLE_BENCH_COMMITS`, `DOGPADDLE_BENCH_SAMPLES`, and
+`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`.

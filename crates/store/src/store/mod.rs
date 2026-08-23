@@ -50,6 +50,11 @@ pub struct DataHandle {
 ///
 /// Dropping this value without calling [`Transaction::commit`] rolls back all
 /// its changes. A transaction is intentionally neither `Send` nor `Sync`.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<dogpaddle_store::Transaction<'static>>();
+/// ```
 #[must_use = "dropping a transaction rolls back its changes"]
 pub struct Transaction<'handle> {
     mdbx: MdbxTransaction<'handle, RW, NoWriteMap>,

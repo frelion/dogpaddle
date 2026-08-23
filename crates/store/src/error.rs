@@ -27,8 +27,8 @@ pub enum StoreError {
     #[error("data namespace {0:?} does not exist")]
     DataNotFound(String),
 
-    /// The durable store format or catalog metadata is invalid or incompatible.
-    #[error("durable store format or catalog metadata is invalid or incompatible")]
+    /// The store marker or catalog metadata is invalid.
+    #[error("store marker or catalog metadata is invalid")]
     InvalidStore,
 
     /// No more durable data namespace identifiers are available.
