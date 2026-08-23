@@ -1,0 +1,63 @@
+use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc, sync::Arc};
+
+use libmdbx::{Database, NoWriteMap, RW, Transaction as MdbxTransaction};
+
+mod data;
+mod database;
+mod transaction;
+
+pub use data::{DataAccess, ScanBatch, ScanDirection, ScanLimit};
+
+/// Physical placement of one logical data namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataPlacement {
+    /// Share the main B+Tree with other small data namespaces.
+    Shared,
+    /// Own a dedicated MDBX named table for large data.
+    Dedicated,
+}
+
+#[derive(Clone, Copy)]
+enum DataLocation {
+    Shared(u32),
+    Dedicated(u32),
+}
+
+/// Owns one durable store while its named data objects are provisioned.
+pub struct Store {
+    database: Database<NoWriteMap>,
+    token: u64,
+}
+
+/// Grants the sole runtime capability to begin store transactions.
+///
+/// This value is obtained by consuming a fully provisioned [`Store`]. It does
+/// not expose the catalog or allow data objects to be created or opened.
+pub struct Transactions {
+    database: Database<NoWriteMap>,
+    store_token: u64,
+}
+
+/// Locates one named key/value namespace in a particular [`Store`].
+#[derive(Clone)]
+pub struct DataHandle {
+    store_token: u64,
+    location: DataLocation,
+    name: Arc<str>,
+}
+
+/// Owns one atomic store transaction.
+///
+/// Dropping this value without calling [`Transaction::commit`] rolls back all
+/// its changes. A transaction is intentionally neither `Send` nor `Sync`.
+#[must_use = "dropping a transaction rolls back its changes"]
+pub struct Transaction<'handle> {
+    mdbx: MdbxTransaction<'handle, RW, NoWriteMap>,
+    store_token: u64,
+    poisoned: PoisonFlag<bool>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+fn dedicated_table_name(table_id: u32) -> String {
+    format!("d/{table_id:08x}")
+}
