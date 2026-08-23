@@ -5,7 +5,7 @@ use std::{
 
 use libmdbx::{Cursor, ObjectLength, RW, Table, WriteFlags};
 
-use super::{DataHandle, DataLocation, Transaction, dedicated_table_name};
+use super::{DataHandle, DataLocation, DataPlacement, Transaction, dedicated_table_name};
 use crate::StoreError;
 
 const DATA_DOMAIN: u8 = 3;
@@ -99,6 +99,15 @@ impl ScanLimit {
 }
 
 impl DataHandle {
+    /// Returns this namespace's durable physical placement.
+    #[must_use]
+    pub const fn placement(&self) -> DataPlacement {
+        match self.location {
+            DataLocation::Shared(_) => DataPlacement::Shared,
+            DataLocation::Dedicated(_) => DataPlacement::Dedicated,
+        }
+    }
+
     /// Returns the durable name bound to this handle.
     #[must_use]
     pub fn name(&self) -> &str {

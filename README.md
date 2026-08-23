@@ -1,4 +1,23 @@
-# DogPaddle Store
+# DogPaddle
+
+DogPaddle is built around three execution concepts:
+
+- `Flow` owns a durable static DAG and fair scheduling;
+- `Stage` owns one operation and one atomic execution boundary;
+- `Operation` owns domain semantics; its durable state lives only in injected
+  Store collections or its checkpoint.
+
+Each successful Stage transition commits operation state, checkpoint, output,
+input progress, and scheduler progress in one Store transaction. `Pending`
+rolls the attempt back. Outputs are bounded to one retained block per edge, so
+a slow fan-out consumer applies backpressure without an unbounded spool.
+
+The `dogpaddle-flow` crate contains only these runtime responsibilities. SQL,
+connectors, and higher-level APIs belong in separate crates implemented as
+operations. External effects are outside the Store transaction and require a
+stable idempotency key when crash retries must not duplicate them.
+
+## Store
 
 `dogpaddle-store` separates provisioning from runtime access:
 
