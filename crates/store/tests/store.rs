@@ -1,8 +1,8 @@
 use std::{ops::Bound, path::Path};
 
 use dogpaddle_store::{
-    Cell, CodecError, DataPlacement, Map, ScanDirection, ScanLimit, Store, StoreError, StoreKey,
-    StoreValue, Transactions,
+    Cell, CodecError, DataPlacement, OrderedMap, ScanDirection, ScanLimit, Store, StoreError,
+    StoreKey, StoreValue, Transactions,
 };
 use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode};
 use tempfile::TempDir;
@@ -24,7 +24,7 @@ fn path(root: &TempDir) -> std::path::PathBuf {
     root.path().join("store")
 }
 
-fn create_store(path: &Path) -> (Transactions, Cell<u64>, Map<u64, User>) {
+fn create_store(path: &Path) -> (Transactions, Cell<u64>, OrderedMap<u64, User>) {
     let mut store = Store::create(path).expect("create store");
     let counter = create_cell(&mut store, "counter").expect("create counter");
     let users = create_map(&mut store, "users").expect("create users");
@@ -42,15 +42,17 @@ fn open_cell<T: StoreValue>(store: &Store, name: &str) -> Result<Cell<T>, StoreE
 fn create_map<K: StoreKey, V: StoreValue>(
     store: &mut Store,
     name: &str,
-) -> Result<Map<K, V>, StoreError> {
-    Ok(Map::new(store.create_data(name, DataPlacement::Shared)?))
+) -> Result<OrderedMap<K, V>, StoreError> {
+    Ok(OrderedMap::new(
+        store.create_data(name, DataPlacement::Shared)?,
+    ))
 }
 
 fn open_map<K: StoreKey, V: StoreValue>(
     store: &Store,
     name: &str,
-) -> Result<Map<K, V>, StoreError> {
-    Ok(Map::new(store.open_data(name)?))
+) -> Result<OrderedMap<K, V>, StoreError> {
+    Ok(OrderedMap::new(store.open_data(name)?))
 }
 
 #[test]
@@ -104,12 +106,12 @@ fn generic_data_namespaces_are_isolated_and_transactional() {
 }
 
 #[test]
-fn cell_and_map_commit_atomically_and_reopen() {
+fn cell_and_ordered_map_commit_atomically_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let store_path = path(&root);
     let mut store = Store::create(&store_path).unwrap();
     let counter = create_cell::<u64>(&mut store, "counter").unwrap();
-    let users = Map::<u64, User>::new(
+    let users = OrderedMap::<u64, User>::new(
         store
             .create_data("users", DataPlacement::Dedicated)
             .unwrap(),
@@ -178,7 +180,7 @@ fn dropping_a_transaction_rolls_back() {
 fn ordered_scans_support_ranges_directions_and_exclusive_continuations() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(path(&root)).unwrap();
-    let values = Map::<i64, String>::new(
+    let values = OrderedMap::<i64, String>::new(
         store
             .create_data("values", DataPlacement::Dedicated)
             .unwrap(),

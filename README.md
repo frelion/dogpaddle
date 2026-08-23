@@ -10,7 +10,7 @@
 
 Typed data structures live in `collections/` and compose the generic handle.
 They own their codecs and semantics; the transaction does not know about
-`Cell`, `Map`, or future collection types.
+`Cell`, `OrderedMap`, or future collection types.
 
 The durable catalog binds a name to an encoded key/value namespace and its
 physical placement. It does not record or validate a collection type or codec.
@@ -24,7 +24,7 @@ the collection API. One Store supports up to `Store::DEDICATED_CAPACITY`
 dedicated namespaces.
 
 ```rust
-use dogpaddle_store::{Cell, Map, ScanDirection, ScanLimit, Store};
+use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store};
 use dogpaddle_store::DataPlacement::{Dedicated, Shared};
 
 # fn example(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +32,7 @@ let mut store = Store::create(path)?;
 let counter_data = store.create_data("counter", Shared)?;
 let users_data = store.create_data("users", Dedicated)?;
 let counter = Cell::<u64>::new(counter_data);
-let users = Map::<u64, String>::new(users_data);
+let users = OrderedMap::<u64, String>::new(users_data);
 
 let mut transactions = store.into_transactions();
 

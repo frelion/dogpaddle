@@ -11,18 +11,18 @@ use crate::{
 type EncodedRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 /// A typed ordered key/value map over one generic data namespace.
-pub struct Map<K, V> {
+pub struct OrderedMap<K, V> {
     data: DataHandle,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-/// Transaction-bound access to a [`Map`].
-pub struct MapAccess<'transaction, K, V> {
+/// Transaction-bound access to an [`OrderedMap`].
+pub struct OrderedMapAccess<'transaction, K, V> {
     data: DataAccess<'transaction>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-impl<K: StoreKey, V: StoreValue> Map<K, V> {
+impl<K: StoreKey, V: StoreValue> OrderedMap<K, V> {
     /// Wraps an existing generic data handle with ordered map behavior.
     #[must_use]
     pub fn new(data: DataHandle) -> Self {
@@ -41,15 +41,15 @@ impl<K: StoreKey, V: StoreValue> Map<K, V> {
     pub fn access<'transaction>(
         &self,
         transaction: &'transaction Transaction<'transaction>,
-    ) -> Result<MapAccess<'transaction, K, V>, StoreError> {
-        Ok(MapAccess {
+    ) -> Result<OrderedMapAccess<'transaction, K, V>, StoreError> {
+        Ok(OrderedMapAccess {
             data: self.data.access(transaction)?,
             _types: PhantomData,
         })
     }
 }
 
-impl<K: StoreKey, V: StoreValue> MapAccess<'_, K, V> {
+impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
     /// Reads one value.
     ///
     /// # Errors
@@ -128,7 +128,7 @@ impl<K: StoreKey, V: StoreValue> MapAccess<'_, K, V> {
     }
 }
 
-impl<K, V> Clone for Map<K, V> {
+impl<K, V> Clone for OrderedMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
