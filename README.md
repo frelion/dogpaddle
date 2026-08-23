@@ -17,11 +17,12 @@ physical placement. It does not record or validate a collection type or codec.
 Code reopening a data handle must use the same collection and codecs that
 wrote its contents.
 
-Small data uses `DataPlacement::Shared` and shares the main B+Tree. Large data
-uses `DataPlacement::Dedicated` and owns an MDBX named table. Placement is
-chosen once during provisioning, persisted in the catalog, and invisible to
-the collection API. One Store supports up to `Store::DEDICATED_CAPACITY`
-dedicated namespaces.
+`DataPlacement::Shared` suits numerous small or commit-heavy namespaces that
+share the main B+Tree. `DataPlacement::Dedicated` gives a hot or bulk-oriented
+namespace its own MDBX named table. Placement is chosen once during
+provisioning, persisted in the catalog, and invisible to the collection API;
+the benchmark below should guide the choice for a concrete workload. One Store
+supports up to `Store::DEDICATED_CAPACITY` dedicated namespaces.
 
 ```rust
 use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store};
@@ -103,10 +104,12 @@ Run the release benchmark with:
 cargo bench -p dogpaddle-store --bench store
 ```
 
-It reports paired `Shared`/`Dedicated` samples for fresh bulk writes, warmed
-point reads and ordered scans, durable overwrites, and warmed reads with
-multiple shared background namespaces. Results include min/median/max; they
-describe this machine and temporary filesystem, not cold-cache or power-loss
-behavior. Workload sizes can be changed with `DOGPADDLE_BENCH_ENTRIES`,
+It reports paired `Shared`/`Dedicated` samples for raw and typed bulk writes,
+point reads, ascending and descending scans, durable overwrites, Stage-shaped
+multi-collection transactions, and warmed reads with multiple shared
+background namespaces. Results include min/median/max; they describe this
+machine and temporary filesystem, not cold-cache or power-loss behavior.
+Workload sizes can be changed with `DOGPADDLE_BENCH_ENTRIES`,
 `DOGPADDLE_BENCH_COMMITS`, `DOGPADDLE_BENCH_SAMPLES`, and
-`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`.
+`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`. `DOGPADDLE_BENCH_SCAN_ITEMS`
+controls the number of entries admitted per scan batch.

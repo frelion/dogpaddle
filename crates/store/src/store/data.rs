@@ -9,9 +9,29 @@ use super::{DataHandle, DataLocation, Transaction, dedicated_table_name};
 use crate::StoreError;
 
 const DATA_DOMAIN: u8 = 3;
+const INLINE_PHYSICAL_KEY_BYTES: usize = 64;
 
-type EncodedBound = (Vec<u8>, bool);
+type EncodedBound<'key> = (&'key [u8], bool);
 type ScanProbe<'txn> = (Cow<'txn, [u8]>, ObjectLength);
+
+enum PhysicalKey<'key> {
+    Borrowed(&'key [u8]),
+    Inline {
+        bytes: [u8; INLINE_PHYSICAL_KEY_BYTES],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl AsRef<[u8]> for PhysicalKey<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(key) => key,
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(key) => key,
+        }
+    }
+}
 
 /// Direction of an ordered scan over encoded keys.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,16 +216,16 @@ impl DataAccess<'_> {
         R: RangeBounds<&'range [u8]>,
     {
         let declared_lower = match range.start_bound() {
-            Bound::Included(key) => Some(((*key).to_vec(), true)),
-            Bound::Excluded(key) => Some(((*key).to_vec(), false)),
+            Bound::Included(key) => Some((*key, true)),
+            Bound::Excluded(key) => Some((*key, false)),
             Bound::Unbounded => None,
         };
         let declared_upper = match range.end_bound() {
-            Bound::Included(key) => Some(((*key).to_vec(), true)),
-            Bound::Excluded(key) => Some(((*key).to_vec(), false)),
+            Bound::Included(key) => Some((*key, true)),
+            Bound::Excluded(key) => Some((*key, false)),
             Bound::Unbounded => None,
         };
-        let resume = resume_after.map(|key| (key.to_vec(), false));
+        let resume = resume_after.map(|key| (key, false));
         let (lower, upper) = match direction {
             ScanDirection::Ascending => (later_bound(declared_lower, resume), declared_upper),
             ScanDirection::Descending => (declared_lower, earlier_bound(declared_upper, resume)),
@@ -271,7 +291,7 @@ impl DataAccess<'_> {
                 let key = key.to_vec();
                 drop(physical_key);
                 let ((), value) = cursor
-                    .get_current::<(), Cow<'_, [u8]>>()
+                    .get_current::<(), Vec<u8>>()
                     .map_err(|error| StoreError::storage("read scanned data", error))?
                     .ok_or_else(|| {
                         StoreError::storage("read scanned data", "MDBX cursor lost its position")
@@ -284,7 +304,7 @@ impl DataAccess<'_> {
                     });
                 };
                 bytes = next_bytes;
-                items.push((key, value.into_owned()));
+                items.push((key, value));
                 current = move_scan(&mut cursor, direction)?;
             }
 
@@ -301,14 +321,23 @@ fn data_prefix(data_id: u32) -> [u8; 5] {
     [DATA_DOMAIN, a, b, c, d]
 }
 
-fn physical_key<'key>(prefix: Option<&[u8; 5]>, logical_key: &'key [u8]) -> Cow<'key, [u8]> {
+fn physical_key<'key>(prefix: Option<&[u8; 5]>, logical_key: &'key [u8]) -> PhysicalKey<'key> {
     match prefix {
         Some(prefix) => {
-            let mut key = prefix.to_vec();
-            key.extend_from_slice(logical_key);
-            Cow::Owned(key)
+            if logical_key.len() <= INLINE_PHYSICAL_KEY_BYTES - prefix.len() {
+                let len = prefix.len() + logical_key.len();
+                let mut bytes = [0; INLINE_PHYSICAL_KEY_BYTES];
+                bytes[..prefix.len()].copy_from_slice(prefix);
+                bytes[prefix.len()..len].copy_from_slice(logical_key);
+                PhysicalKey::Inline { bytes, len }
+            } else {
+                let mut key = Vec::with_capacity(prefix.len() + logical_key.len());
+                key.extend_from_slice(prefix);
+                key.extend_from_slice(logical_key);
+                PhysicalKey::Heap(key)
+            }
         }
-        None => Cow::Borrowed(logical_key),
+        None => PhysicalKey::Borrowed(logical_key),
     }
 }
 
@@ -316,8 +345,8 @@ fn seek_scan<'txn>(
     cursor: &mut Cursor<'txn, RW>,
     prefix: Option<&[u8; 5]>,
     direction: ScanDirection,
-    lower: Option<&EncodedBound>,
-    upper: Option<&EncodedBound>,
+    lower: Option<&EncodedBound<'_>>,
+    upper: Option<&EncodedBound<'_>>,
 ) -> Result<Option<ScanProbe<'txn>>, StoreError> {
     match direction {
         ScanDirection::Ascending => match lower {
@@ -397,21 +426,27 @@ fn move_scan<'txn>(
     .map_err(|error| StoreError::storage("advance data scan", error))
 }
 
-fn later_bound(left: Option<EncodedBound>, right: Option<EncodedBound>) -> Option<EncodedBound> {
+fn later_bound<'key>(
+    left: Option<EncodedBound<'key>>,
+    right: Option<EncodedBound<'key>>,
+) -> Option<EncodedBound<'key>> {
     choose_bound(left, right, std::cmp::Ordering::Greater)
 }
 
-fn earlier_bound(left: Option<EncodedBound>, right: Option<EncodedBound>) -> Option<EncodedBound> {
+fn earlier_bound<'key>(
+    left: Option<EncodedBound<'key>>,
+    right: Option<EncodedBound<'key>>,
+) -> Option<EncodedBound<'key>> {
     choose_bound(left, right, std::cmp::Ordering::Less)
 }
 
-fn choose_bound(
-    left: Option<EncodedBound>,
-    right: Option<EncodedBound>,
+fn choose_bound<'key>(
+    left: Option<EncodedBound<'key>>,
+    right: Option<EncodedBound<'key>>,
     preferred: std::cmp::Ordering,
-) -> Option<EncodedBound> {
+) -> Option<EncodedBound<'key>> {
     match (left, right) {
-        (Some(left), Some(right)) => match left.0.cmp(&right.0) {
+        (Some(left), Some(right)) => match left.0.cmp(right.0) {
             std::cmp::Ordering::Less => Some(if preferred == std::cmp::Ordering::Less {
                 left
             } else {
@@ -428,11 +463,15 @@ fn choose_bound(
     }
 }
 
-fn within_bounds(key: &[u8], lower: Option<&EncodedBound>, upper: Option<&EncodedBound>) -> bool {
+fn within_bounds(
+    key: &[u8],
+    lower: Option<&EncodedBound<'_>>,
+    upper: Option<&EncodedBound<'_>>,
+) -> bool {
     within_lower(key, lower) && within_upper(key, upper)
 }
 
-fn within_lower(key: &[u8], lower: Option<&EncodedBound>) -> bool {
+fn within_lower(key: &[u8], lower: Option<&EncodedBound<'_>>) -> bool {
     lower.is_none_or(|(lower_key, inclusive)| match key.cmp(lower_key) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Equal => *inclusive,
@@ -440,7 +479,7 @@ fn within_lower(key: &[u8], lower: Option<&EncodedBound>) -> bool {
     })
 }
 
-fn within_upper(key: &[u8], upper: Option<&EncodedBound>) -> bool {
+fn within_upper(key: &[u8], upper: Option<&EncodedBound<'_>>) -> bool {
     upper.is_none_or(|(upper_key, inclusive)| match key.cmp(upper_key) {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Equal => *inclusive,

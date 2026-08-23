@@ -52,7 +52,7 @@ impl<T: StoreValue> CellAccess<'_, T> {
     pub fn get(&self) -> Result<Option<T>, StoreError> {
         let encoded = self.data.get(CELL_KEY)?;
         self.data
-            .poison_on_error(encoded.map(|bytes| T::decode_value(&bytes)).transpose())
+            .poison_on_error(encoded.map(T::decode_value).transpose())
             .map_err(StoreError::from)
     }
 
@@ -66,7 +66,7 @@ impl<T: StoreValue> CellAccess<'_, T> {
             .data
             .poison_on_error(value.encode_value())
             .map_err(StoreError::from)?;
-        self.data.put(CELL_KEY, &encoded)
+        self.data.put(CELL_KEY, encoded.as_ref())
     }
 
     /// Removes the current value and reports whether one existed.

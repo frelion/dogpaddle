@@ -1,5 +1,3 @@
-use std::str;
-
 use thiserror::Error;
 
 /// A stable codec failure.
@@ -29,77 +27,75 @@ pub trait StoreValue: Sized {
     /// # Errors
     ///
     /// Returns an error when this value cannot be encoded canonically.
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError>;
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError>;
 
-    /// Decodes bytes produced by [`StoreValue::encode_value`].
+    /// Decodes owned bytes produced by [`StoreValue::encode_value`].
     ///
     /// # Errors
     ///
     /// Returns an error when `bytes` is not a valid value for this codec.
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError>;
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError>;
 }
 
 /// A key whose encoding preserves its [`Ord`] ordering byte-for-byte.
 ///
 /// Implementations must be canonical, injective, and round-trip exactly. For
 /// any `a` and `b`, `a.cmp(b)` must equal
-/// `a.encode_key()?.cmp(&b.encode_key()?)`.
+/// `a.encode_key()?.as_ref().cmp(b.encode_key()?.as_ref())`.
 pub trait StoreKey: Sized + Ord {
     /// Encodes this key in lexicographically order-preserving form.
     ///
     /// # Errors
     ///
     /// Returns an error when this key cannot be encoded canonically.
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError>;
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError>;
 
-    /// Decodes bytes produced by [`StoreKey::encode_key`].
+    /// Decodes owned bytes produced by [`StoreKey::encode_key`].
     ///
     /// # Errors
     ///
     /// Returns an error when `bytes` is not a valid key for this codec.
-    fn decode_key(bytes: &[u8]) -> Result<Self, CodecError>;
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError>;
 }
 
 impl StoreValue for Vec<u8> {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.clone())
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.as_slice())
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
-        Ok(bytes.to_vec())
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        Ok(bytes)
     }
 }
 
 impl StoreKey for Vec<u8> {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.clone())
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.as_slice())
     }
 
-    fn decode_key(bytes: &[u8]) -> Result<Self, CodecError> {
-        Ok(bytes.to_vec())
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        Ok(bytes)
     }
 }
 
 impl StoreValue for String {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.as_bytes().to_vec())
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.as_bytes())
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
-        str::from_utf8(bytes)
-            .map(str::to_owned)
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        String::from_utf8(bytes)
             .map_err(|error| CodecError::new(format!("invalid UTF-8 value: {error}")))
     }
 }
 
 impl StoreKey for String {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.as_bytes().to_vec())
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.as_bytes())
     }
 
-    fn decode_key(bytes: &[u8]) -> Result<Self, CodecError> {
-        str::from_utf8(bytes)
-            .map(str::to_owned)
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        String::from_utf8(bytes)
             .map_err(|error| CodecError::new(format!("invalid UTF-8 key: {error}")))
     }
 }
@@ -107,12 +103,13 @@ impl StoreKey for String {
 macro_rules! unsigned_codec {
     ($ty:ty, $name:literal) => {
         impl StoreValue for $ty {
-            fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-                Ok(self.to_be_bytes().to_vec())
+            fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+                Ok(self.to_be_bytes())
             }
 
-            fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
+            fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
                 let array: [u8; size_of::<$ty>()] = bytes
+                    .as_slice()
                     .try_into()
                     .map_err(|_| CodecError::new(concat!("invalid ", $name, " value length")))?;
                 Ok(<$ty>::from_be_bytes(array))
@@ -120,12 +117,13 @@ macro_rules! unsigned_codec {
         }
 
         impl StoreKey for $ty {
-            fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-                Ok(self.to_be_bytes().to_vec())
+            fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+                Ok(self.to_be_bytes())
             }
 
-            fn decode_key(bytes: &[u8]) -> Result<Self, CodecError> {
+            fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
                 let array: [u8; size_of::<$ty>()] = bytes
+                    .as_slice()
                     .try_into()
                     .map_err(|_| CodecError::new(concat!("invalid ", $name, " key length")))?;
                 Ok(<$ty>::from_be_bytes(array))
@@ -138,12 +136,13 @@ unsigned_codec!(u32, "u32");
 unsigned_codec!(u64, "u64");
 
 impl StoreValue for i64 {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.to_be_bytes().to_vec())
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.to_be_bytes())
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
         let array: [u8; size_of::<i64>()] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| CodecError::new("invalid i64 value length"))?;
         Ok(Self::from_be_bytes(array))
@@ -151,14 +150,15 @@ impl StoreValue for i64 {
 }
 
 impl StoreKey for i64 {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         let mut bytes = self.to_be_bytes();
         bytes[0] ^= 0x80;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
-    fn decode_key(bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
         let mut array: [u8; size_of::<Self>()] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| CodecError::new("invalid i64 key length"))?;
         array[0] ^= 0x80;
@@ -167,12 +167,12 @@ impl StoreKey for i64 {
 }
 
 impl StoreValue for bool {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(vec![u8::from(*self)])
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok([u8::from(*self)])
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
-        match bytes {
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        match bytes.as_slice() {
             [0] => Ok(false),
             [1] => Ok(true),
             _ => Err(CodecError::new("invalid bool encoding")),
@@ -181,11 +181,11 @@ impl StoreValue for bool {
 }
 
 impl StoreValue for () {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(Vec::new())
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok([])
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
         if bytes.is_empty() {
             Ok(())
         } else {
@@ -206,11 +206,13 @@ mod tests {
     {
         for value in values {
             let encoded = value.encode_key().unwrap();
-            assert_eq!(T::decode_key(&encoded).unwrap(), *value);
+            assert_eq!(T::decode_key(encoded.as_ref().to_vec()).unwrap(), *value);
         }
         for pair in values.windows(2) {
             assert!(pair[0] < pair[1]);
-            assert!(pair[0].encode_key().unwrap() < pair[1].encode_key().unwrap());
+            assert!(
+                pair[0].encode_key().unwrap().as_ref() < pair[1].encode_key().unwrap().as_ref()
+            );
         }
     }
 
@@ -237,23 +239,26 @@ mod tests {
     fn values_round_trip() {
         for value in [false, true] {
             assert_eq!(
-                bool::decode_value(&value.encode_value().unwrap()).unwrap(),
+                bool::decode_value(value.encode_value().unwrap().as_ref().to_vec()).unwrap(),
                 value
             );
         }
-        assert_eq!(<()>::decode_value(&().encode_value().unwrap()).unwrap(), ());
+        assert_eq!(
+            <()>::decode_value(().encode_value().unwrap().as_ref().to_vec()).unwrap(),
+            ()
+        );
         let text = "Shiba 柴犬".to_owned();
         assert_eq!(
-            String::decode_value(&text.encode_value().unwrap()).unwrap(),
+            String::decode_value(text.encode_value().unwrap().as_ref().to_vec()).unwrap(),
             text
         );
     }
 
     #[test]
     fn malformed_values_are_rejected() {
-        assert!(bool::decode_value(&[2]).is_err());
-        assert!(<()>::decode_value(&[0]).is_err());
-        assert!(String::decode_value(&[0xff]).is_err());
-        assert!(u64::decode_value(&[0; 7]).is_err());
+        assert!(bool::decode_value(vec![2]).is_err());
+        assert!(<()>::decode_value(vec![0]).is_err());
+        assert!(String::decode_value(vec![0xff]).is_err());
+        assert!(u64::decode_value(vec![0; 7]).is_err());
     }
 }

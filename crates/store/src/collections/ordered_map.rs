@@ -8,8 +8,6 @@ use crate::{
     StoreValue, Transaction,
 };
 
-type EncodedRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
-
 /// A typed ordered key/value map over one generic data namespace.
 pub struct OrderedMap<K, V> {
     data: DataHandle,
@@ -60,9 +58,9 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
             .data
             .poison_on_error(key.encode_key())
             .map_err(StoreError::from)?;
-        let encoded = self.data.get(&encoded_key)?;
+        let encoded = self.data.get(encoded_key.as_ref())?;
         self.data
-            .poison_on_error(encoded.map(|bytes| V::decode_value(&bytes)).transpose())
+            .poison_on_error(encoded.map(V::decode_value).transpose())
             .map_err(StoreError::from)
     }
 
@@ -80,7 +78,7 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
             .data
             .poison_on_error(value.encode_value())
             .map_err(StoreError::from)?;
-        self.data.put(&encoded_key, &encoded_value)
+        self.data.put(encoded_key.as_ref(), encoded_value.as_ref())
     }
 
     /// Removes one key and reports whether it existed.
@@ -93,7 +91,7 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
             .data
             .poison_on_error(key.encode_key())
             .map_err(StoreError::from)?;
-        self.data.delete(&encoded_key)
+        self.data.delete(encoded_key.as_ref())
     }
 
     /// Scans an ordered key range after an optional exclusive continuation.
@@ -108,9 +106,21 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
         resume_after: Option<&K>,
         limit: ScanLimit,
     ) -> Result<ScanBatch<K, V>, StoreError> {
-        let (lower, upper) = self
+        let lower = self
             .data
-            .poison_on_error(encode_range(&range))
+            .poison_on_error(match range.start_bound() {
+                Bound::Included(key) => key.encode_key().map(Bound::Included),
+                Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+                Bound::Unbounded => Ok(Bound::Unbounded),
+            })
+            .map_err(StoreError::from)?;
+        let upper = self
+            .data
+            .poison_on_error(match range.end_bound() {
+                Bound::Included(key) => key.encode_key().map(Bound::Included),
+                Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+                Bound::Unbounded => Ok(Bound::Unbounded),
+            })
             .map_err(StoreError::from)?;
         let continuation = self
             .data
@@ -119,7 +129,7 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
         let raw = self.data.scan(
             (borrow_bound(&lower), borrow_bound(&upper)),
             direction,
-            continuation.as_deref(),
+            continuation.as_ref().map(AsRef::as_ref),
             limit,
         )?;
         self.data
@@ -137,24 +147,10 @@ impl<K, V> Clone for OrderedMap<K, V> {
     }
 }
 
-fn encode_range<K: StoreKey, R: RangeBounds<K>>(range: &R) -> Result<EncodedRange, CodecError> {
-    let lower = match range.start_bound() {
-        Bound::Included(key) => Bound::Included(key.encode_key()?),
-        Bound::Excluded(key) => Bound::Excluded(key.encode_key()?),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    let upper = match range.end_bound() {
-        Bound::Included(key) => Bound::Included(key.encode_key()?),
-        Bound::Excluded(key) => Bound::Excluded(key.encode_key()?),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    Ok((lower, upper))
-}
-
-fn borrow_bound(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+fn borrow_bound<T: AsRef<[u8]>>(bound: &Bound<T>) -> Bound<&[u8]> {
     match bound {
-        Bound::Included(key) => Bound::Included(key),
-        Bound::Excluded(key) => Bound::Excluded(key),
+        Bound::Included(key) => Bound::Included(key.as_ref()),
+        Bound::Excluded(key) => Bound::Excluded(key.as_ref()),
         Bound::Unbounded => Bound::Unbounded,
     }
 }
@@ -165,12 +161,9 @@ fn decode_batch<K: StoreKey, V: StoreValue>(
     let items = raw
         .items
         .into_iter()
-        .map(|(key, value)| Ok((K::decode_key(&key)?, V::decode_value(&value)?)))
+        .map(|(key, value)| Ok((K::decode_key(key)?, V::decode_value(value)?)))
         .collect::<Result<Vec<_>, CodecError>>()?;
-    let continuation = raw
-        .continuation
-        .map(|key| K::decode_key(&key))
-        .transpose()?;
+    let continuation = raw.continuation.map(K::decode_key).transpose()?;
     Ok(ScanBatch {
         items,
         continuation,

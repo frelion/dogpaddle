@@ -115,8 +115,11 @@ fn raw_binary_keys_page_in_both_directions() {
         vec![0],
         vec![0, 0],
         vec![0, 1],
+        vec![0x7f; 59],
+        vec![0x7f; 60],
         vec![0xff],
         vec![0xff, 0],
+        vec![0xff; 128],
     ];
 
     for placement in PLACEMENTS {
@@ -135,6 +138,9 @@ fn raw_binary_keys_page_in_both_directions() {
 
         let transaction = transactions.begin().unwrap();
         let access = data.access(&transaction).unwrap();
+        for key in &keys {
+            assert_eq!(access.get(key).unwrap(), Some(key.clone()));
+        }
         for direction in [ScanDirection::Ascending, ScanDirection::Descending] {
             let mut expected = keys
                 .iter()

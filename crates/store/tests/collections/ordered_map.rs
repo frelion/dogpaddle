@@ -63,12 +63,25 @@ fn ordered_map_survives_reopen() {
 struct TestKey(u64);
 
 impl StoreKey for TestKey {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         self.0.encode_key()
     }
 
-    fn decode_key(bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
         u64::decode_key(bytes).map(Self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BorrowedKey(Vec<u8>);
+
+impl StoreKey for BorrowedKey {
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.0.as_slice())
+    }
+
+    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        Ok(Self(bytes))
     }
 }
 
@@ -93,25 +106,70 @@ fn ordered_map_accepts_external_key_and_value_codecs() {
     );
 }
 
+#[test]
+fn borrowed_key_codecs_support_points_ranges_and_continuations() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let map = create_map::<BorrowedKey, u64>(&mut store, "map", DataPlacement::Shared).unwrap();
+    let mut transactions = store.into_transactions();
+
+    let keys = [
+        BorrowedKey(b"a".to_vec()),
+        BorrowedKey(b"b".to_vec()),
+        BorrowedKey(b"c".to_vec()),
+    ];
+    let transaction = transactions.begin().unwrap();
+    {
+        let mut access = map.access(&transaction).unwrap();
+        for (value, key) in keys.iter().enumerate() {
+            access.put(key, &(value as u64)).unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+
+    let transaction = transactions.begin().unwrap();
+    let access = map.access(&transaction).unwrap();
+    assert_eq!(access.get(&keys[1]).unwrap(), Some(1));
+    let limit = ScanLimit::new(1, 1_024).unwrap();
+    let ascending = access
+        .scan(
+            (
+                std::ops::Bound::Included(&keys[0]),
+                std::ops::Bound::Included(&keys[2]),
+            ),
+            ScanDirection::Ascending,
+            None,
+            limit,
+        )
+        .unwrap();
+    assert_eq!(ascending.items, vec![(keys[0].clone(), 0)]);
+    assert_eq!(ascending.continuation, Some(keys[0].clone()));
+    let descending = access
+        .scan(.., ScanDirection::Descending, None, limit)
+        .unwrap();
+    assert_eq!(descending.items, vec![(keys[2].clone(), 2)]);
+    assert_eq!(descending.continuation, Some(keys[2].clone()));
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BrokenKey;
 
 impl StoreKey for BrokenKey {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        Err(CodecError::new("intentional key failure"))
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Err::<[u8; 0], _>(CodecError::new("intentional key failure"))
     }
 
-    fn decode_key(_bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_key(_bytes: Vec<u8>) -> Result<Self, CodecError> {
         Err(CodecError::new("intentional key failure"))
     }
 }
 
 impl StoreValue for BrokenKey {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Err(CodecError::new("intentional value failure"))
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Err::<[u8; 0], _>(CodecError::new("intentional value failure"))
     }
 
-    fn decode_value(_bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_value(_bytes: Vec<u8>) -> Result<Self, CodecError> {
         Err(CodecError::new("intentional value failure"))
     }
 }

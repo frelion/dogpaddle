@@ -11,11 +11,11 @@ pub const PLACEMENTS: [DataPlacement; 2] = [DataPlacement::Shared, DataPlacement
 pub struct TestValue(pub u64);
 
 impl StoreValue for TestValue {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         self.0.encode_value()
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
         u64::decode_value(bytes).map(Self)
     }
 }

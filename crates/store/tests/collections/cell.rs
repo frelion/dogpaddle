@@ -64,11 +64,11 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
 struct BrokenValue;
 
 impl StoreValue for BrokenValue {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Err(CodecError::new("intentional encode failure"))
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Err::<[u8; 0], _>(CodecError::new("intentional encode failure"))
     }
 
-    fn decode_value(_bytes: &[u8]) -> Result<Self, CodecError> {
+    fn decode_value(_bytes: Vec<u8>) -> Result<Self, CodecError> {
         Err(CodecError::new("intentional decode failure"))
     }
 }

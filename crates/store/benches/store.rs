@@ -1,32 +1,51 @@
 use std::{hint::black_box, time::Duration};
 
-use dogpaddle_store::{DataPlacement, OrderedMap, ScanDirection, ScanLimit, Store, Transactions};
+use dogpaddle_store::{
+    Cell, DataHandle, DataPlacement, OrderedMap, ScanDirection, ScanLimit, Store, Transactions,
+};
 use tempfile::TempDir;
 
 const DEFAULT_ENTRIES: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_BACKGROUND_NAMESPACES: usize = 8;
+const DEFAULT_SCAN_ITEMS: usize = 1_024;
 const VALUE_BYTES: usize = 64;
+const STAGE_KEYS: usize = 1_024;
 const RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 struct Fixture {
     transactions: Transactions,
+    data: DataHandle,
     map: OrderedMap<u64, Vec<u8>>,
     _root: TempDir,
+}
+
+struct StageFixture {
+    transactions: Transactions,
+    cursor: Cell<u64>,
+    map: OrderedMap<u64, Vec<u8>>,
+    _root: TempDir,
+}
+
+#[derive(Clone, Copy)]
+struct ScanWorkload {
+    name: &'static str,
+    direction: ScanDirection,
+    raw: bool,
 }
 
 impl Fixture {
     fn empty(placement: DataPlacement) -> Self {
         let root = tempfile::tempdir().expect("temporary benchmark directory");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
-        let map = OrderedMap::new(
-            store
-                .create_data("map", placement)
-                .expect("create benchmark map"),
-        );
+        let data = store
+            .create_data("map", placement)
+            .expect("create benchmark map");
+        let map = OrderedMap::new(data.clone());
         Self {
             transactions: store.into_transactions(),
+            data,
             map,
             _root: root,
         }
@@ -56,11 +75,10 @@ impl Fixture {
     ) -> Self {
         let root = tempfile::tempdir().expect("temporary benchmark directory");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
-        let map = OrderedMap::new(
-            store
-                .create_data("target", placement)
-                .expect("create target map"),
-        );
+        let data = store
+            .create_data("target", placement)
+            .expect("create target map");
+        let map = OrderedMap::new(data.clone());
         let backgrounds = (0..background_namespaces)
             .map(|index| {
                 OrderedMap::<u64, Vec<u8>>::new(
@@ -72,6 +90,7 @@ impl Fixture {
             .collect::<Vec<_>>();
         let mut fixture = Self {
             transactions: store.into_transactions(),
+            data,
             map,
             _root: root,
         };
@@ -86,18 +105,62 @@ impl Fixture {
                 target.put(&(key as u64), &value).expect("seed target map");
             }
         }
-        let entries_per_background = entries.div_ceil(background_namespaces);
-        for background in &backgrounds {
+        let entries_per_background = entries / background_namespaces;
+        let extra_entries = entries % background_namespaces;
+        for (index, background) in backgrounds.iter().enumerate() {
             let mut background = background
                 .access(&transaction)
                 .expect("access background map");
-            for key in 0..entries_per_background {
+            let background_entries = entries_per_background + usize::from(index < extra_entries);
+            for key in 0..background_entries {
                 background
                     .put(&(key as u64), &value)
                     .expect("seed background map");
             }
         }
         transaction.commit().expect("commit mixed benchmark seed");
+        fixture
+    }
+}
+
+impl StageFixture {
+    fn populated(map_placement: DataPlacement) -> Self {
+        let root = tempfile::tempdir().expect("temporary stage benchmark directory");
+        let mut store = Store::create(root.path().join("store")).expect("create stage store");
+        let cursor = Cell::new(
+            store
+                .create_data("cursor", DataPlacement::Shared)
+                .expect("create stage cursor"),
+        );
+        let map = OrderedMap::new(
+            store
+                .create_data("map", map_placement)
+                .expect("create stage map"),
+        );
+        let mut fixture = Self {
+            transactions: store.into_transactions(),
+            cursor,
+            map,
+            _root: root,
+        };
+        let transaction = fixture
+            .transactions
+            .begin()
+            .expect("begin stage seed transaction");
+        fixture
+            .cursor
+            .access(&transaction)
+            .expect("access stage cursor")
+            .set(&0)
+            .expect("seed stage cursor");
+        {
+            let mut map = fixture.map.access(&transaction).expect("access stage map");
+            let value = vec![0x5a; VALUE_BYTES];
+            for key in 0..STAGE_KEYS {
+                map.put(&(key as u64), &value).expect("seed stage map");
+            }
+        }
+        transaction.commit().expect("commit stage seed");
         fixture
     }
 }
@@ -114,11 +177,14 @@ fn main() {
         "DOGPADDLE_BENCH_BACKGROUND_NAMESPACES",
         DEFAULT_BACKGROUND_NAMESPACES,
     );
-    assert!(entries > 0 && commits > 0 && samples > 0 && background_namespaces > 0);
+    let scan_items = setting("DOGPADDLE_BENCH_SCAN_ITEMS", DEFAULT_SCAN_ITEMS);
+    assert!(
+        entries > 0 && commits > 0 && samples > 0 && background_namespaces > 0 && scan_items > 0
+    );
 
     println!("DogPaddle Store benchmark");
     println!(
-        "entries={entries} value_bytes={VALUE_BYTES} commits={commits} samples={samples} background_namespaces={background_namespaces}"
+        "entries={entries} value_bytes={VALUE_BYTES} commits={commits} samples={samples} background_namespaces={background_namespaces} scan_items={scan_items}"
     );
     println!(
         "sync=durable point_scan_cache=warm random_seed={RANDOM_SEED:#x} root=temporary-directory"
@@ -129,6 +195,18 @@ fn main() {
         "workload", "placement", "operations", "min", "median", "max", "median ops/s"
     );
 
+    benchmark_isolated(entries, commits, samples, scan_items);
+    benchmark_mixed(entries, samples, background_namespaces, scan_items);
+}
+
+fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items: usize) {
+    report_pair(
+        "raw bulk put + commit",
+        entries,
+        samples,
+        || measure_raw_bulk_put(DataPlacement::Shared, entries),
+        || measure_raw_bulk_put(DataPlacement::Dedicated, entries),
+    );
     report_pair(
         "bulk put + commit",
         entries,
@@ -140,18 +218,73 @@ fn main() {
     let mut shared = Fixture::populated(DataPlacement::Shared, entries);
     let mut dedicated = Fixture::populated(DataPlacement::Dedicated, entries);
     report_pair(
+        "hot raw point get",
+        entries,
+        samples,
+        || measure_raw_point_get(&mut shared, entries),
+        || measure_raw_point_get(&mut dedicated, entries),
+    );
+    report_pair(
         "hot point get",
         entries,
         samples,
         || measure_point_get(&mut shared, entries),
         || measure_point_get(&mut dedicated, entries),
     );
-    report_pair(
-        "hot ordered scan",
+    report_scan_pair(
+        ScanWorkload {
+            name: "hot raw ascending scan",
+            direction: ScanDirection::Ascending,
+            raw: true,
+        },
+        &mut shared,
+        &mut dedicated,
         entries,
         samples,
-        || measure_scan(&mut shared, entries),
-        || measure_scan(&mut dedicated, entries),
+        scan_items,
+    );
+    report_scan_pair(
+        ScanWorkload {
+            name: "hot raw descending scan",
+            direction: ScanDirection::Descending,
+            raw: true,
+        },
+        &mut shared,
+        &mut dedicated,
+        entries,
+        samples,
+        scan_items,
+    );
+    report_scan_pair(
+        ScanWorkload {
+            name: "hot ascending scan",
+            direction: ScanDirection::Ascending,
+            raw: false,
+        },
+        &mut shared,
+        &mut dedicated,
+        entries,
+        samples,
+        scan_items,
+    );
+    report_scan_pair(
+        ScanWorkload {
+            name: "hot descending scan",
+            direction: ScanDirection::Descending,
+            raw: false,
+        },
+        &mut shared,
+        &mut dedicated,
+        entries,
+        samples,
+        scan_items,
+    );
+    report_pair(
+        "hot overwrite + rollback",
+        entries,
+        samples,
+        || measure_hot_overwrite_rollback(&mut shared, entries),
+        || measure_hot_overwrite_rollback(&mut dedicated, entries),
     );
 
     let mut shared = Fixture::empty(DataPlacement::Shared);
@@ -164,6 +297,29 @@ fn main() {
         || measure_single_put_commits(&mut dedicated, commits),
     );
 
+    benchmark_stage_steps(commits, samples);
+}
+
+fn benchmark_stage_steps(steps: usize, samples: usize) {
+    for operations_per_step in [1, 8, 64] {
+        let mut shared = StageFixture::populated(DataPlacement::Shared);
+        let mut dedicated = StageFixture::populated(DataPlacement::Dedicated);
+        report_pair(
+            &format!("stage step x{operations_per_step}"),
+            steps,
+            samples,
+            || measure_stage_steps(&mut shared, steps, operations_per_step),
+            || measure_stage_steps(&mut dedicated, steps, operations_per_step),
+        );
+    }
+}
+
+fn benchmark_mixed(
+    entries: usize,
+    samples: usize,
+    background_namespaces: usize,
+    scan_items: usize,
+) {
     let mut shared = Fixture::populated_with_shared_background(
         DataPlacement::Shared,
         entries,
@@ -181,13 +337,85 @@ fn main() {
         || measure_point_get(&mut shared, entries),
         || measure_point_get(&mut dedicated, entries),
     );
-    report_pair(
-        "mixed hot ordered scan",
+    report_scan_pair(
+        ScanWorkload {
+            name: "mixed hot ascending scan",
+            direction: ScanDirection::Ascending,
+            raw: false,
+        },
+        &mut shared,
+        &mut dedicated,
         entries,
         samples,
-        || measure_scan(&mut shared, entries),
-        || measure_scan(&mut dedicated, entries),
+        scan_items,
     );
+    report_scan_pair(
+        ScanWorkload {
+            name: "mixed hot descending scan",
+            direction: ScanDirection::Descending,
+            raw: false,
+        },
+        &mut shared,
+        &mut dedicated,
+        entries,
+        samples,
+        scan_items,
+    );
+}
+
+fn report_scan_pair(
+    workload: ScanWorkload,
+    shared: &mut Fixture,
+    dedicated: &mut Fixture,
+    entries: usize,
+    samples: usize,
+    scan_items: usize,
+) {
+    report_pair(
+        workload.name,
+        entries,
+        samples,
+        || {
+            measure_scan(
+                shared,
+                entries,
+                scan_items,
+                workload.direction,
+                workload.raw,
+            )
+        },
+        || {
+            measure_scan(
+                dedicated,
+                entries,
+                scan_items,
+                workload.direction,
+                workload.raw,
+            )
+        },
+    );
+}
+
+fn measure_raw_bulk_put(placement: DataPlacement, entries: usize) -> Duration {
+    let mut fixture = Fixture::empty(placement);
+    let value = vec![0x5a; VALUE_BYTES];
+    let started = std::time::Instant::now();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin raw write transaction");
+    {
+        let mut data = fixture
+            .data
+            .access(&transaction)
+            .expect("access raw write data");
+        for key in 0..entries {
+            data.put(&(key as u64).to_be_bytes(), &value)
+                .expect("write raw benchmark item");
+        }
+    }
+    transaction.commit().expect("commit raw benchmark writes");
+    started.elapsed()
 }
 
 fn measure_bulk_put(placement: DataPlacement, entries: usize) -> Duration {
@@ -231,29 +459,79 @@ fn measure_point_get(fixture: &mut Fixture, entries: usize) -> Duration {
     started.elapsed()
 }
 
-fn measure_scan(fixture: &mut Fixture, entries: usize) -> Duration {
+fn measure_raw_point_get(fixture: &mut Fixture, entries: usize) -> Duration {
+    let started = std::time::Instant::now();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin raw read transaction");
+    let data = fixture.data.access(&transaction).expect("access raw data");
+    let mut state = RANDOM_SEED;
+    let mut checksum = 0_usize;
+    for _ in 0..entries {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let key = (state % entries as u64).to_be_bytes();
+        let value = data.get(&key).expect("read raw benchmark item").unwrap();
+        checksum = checksum.wrapping_add(usize::from(value[0]));
+    }
+    black_box(checksum);
+    transaction.commit().expect("finish raw read transaction");
+    started.elapsed()
+}
+
+fn measure_scan(
+    fixture: &mut Fixture,
+    entries: usize,
+    scan_items: usize,
+    direction: ScanDirection,
+    raw: bool,
+) -> Duration {
     let started = std::time::Instant::now();
     let transaction = fixture
         .transactions
         .begin()
         .expect("begin scan transaction");
-    let map = fixture.map.access(&transaction).expect("access scan map");
-    let limit = ScanLimit::new(1_024, 4 * 1_024 * 1_024).unwrap();
-    let mut continuation = None;
+    let limit = ScanLimit::new(scan_items, 4 * 1_024 * 1_024).unwrap();
     let mut count = 0_usize;
     let mut checksum = 0_usize;
-    loop {
-        let batch = map
-            .scan(.., ScanDirection::Ascending, continuation.as_ref(), limit)
-            .expect("scan benchmark page");
-        count += batch.items.len();
-        checksum = batch.items.iter().fold(checksum, |checksum, (_, value)| {
-            checksum.wrapping_add(usize::from(value[0]))
-        });
-        if let Some(next) = batch.continuation {
-            continuation = Some(next);
-        } else {
-            break;
+    if raw {
+        let data = fixture
+            .data
+            .access(&transaction)
+            .expect("access raw scan data");
+        let mut continuation = None;
+        loop {
+            let batch = data
+                .scan(.., direction, continuation.as_deref(), limit)
+                .expect("scan raw benchmark page");
+            count += batch.items.len();
+            checksum = batch.items.iter().fold(checksum, |checksum, (_, value)| {
+                checksum.wrapping_add(usize::from(value[0]))
+            });
+            if let Some(next) = batch.continuation {
+                continuation = Some(next);
+            } else {
+                break;
+            }
+        }
+    } else {
+        let map = fixture.map.access(&transaction).expect("access scan map");
+        let mut continuation = None;
+        loop {
+            let batch = map
+                .scan(.., direction, continuation.as_ref(), limit)
+                .expect("scan benchmark page");
+            count += batch.items.len();
+            checksum = batch.items.iter().fold(checksum, |checksum, (_, value)| {
+                checksum.wrapping_add(usize::from(value[0]))
+            });
+            if let Some(next) = batch.continuation {
+                continuation = Some(next);
+            } else {
+                break;
+            }
         }
     }
     assert_eq!(count, entries);
@@ -262,10 +540,78 @@ fn measure_scan(fixture: &mut Fixture, entries: usize) -> Duration {
     started.elapsed()
 }
 
+fn measure_stage_steps(
+    fixture: &mut StageFixture,
+    steps: usize,
+    operations_per_step: usize,
+) -> Duration {
+    let operations_per_step =
+        u64::try_from(operations_per_step).expect("stage batch size fits in u64");
+    let stage_keys = u64::try_from(STAGE_KEYS).expect("stage key count fits in u64");
+    let started = std::time::Instant::now();
+    for _ in 0..steps {
+        let transaction = fixture
+            .transactions
+            .begin()
+            .expect("begin stage transaction");
+        let cursor = fixture
+            .cursor
+            .access(&transaction)
+            .expect("access stage cursor")
+            .get()
+            .expect("read stage cursor")
+            .expect("seeded stage cursor");
+        {
+            let mut map = fixture.map.access(&transaction).expect("access stage map");
+            for offset in 0..operations_per_step {
+                let key = cursor
+                    .wrapping_mul(operations_per_step)
+                    .wrapping_add(offset)
+                    % stage_keys;
+                let mut value = map
+                    .get(&key)
+                    .expect("read stage item")
+                    .expect("seeded stage item");
+                value[0] = value[0].wrapping_add(1);
+                map.put(&key, &value).expect("write stage item");
+            }
+        }
+        fixture
+            .cursor
+            .access(&transaction)
+            .expect("access stage cursor")
+            .set(&cursor.wrapping_add(1))
+            .expect("advance stage cursor");
+        transaction.commit().expect("commit stage transaction");
+    }
+    started.elapsed()
+}
+
+fn measure_hot_overwrite_rollback(fixture: &mut Fixture, entries: usize) -> Duration {
+    let value = vec![0xa5; VALUE_BYTES];
+    let started = std::time::Instant::now();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin overwrite transaction");
+    {
+        let mut map = fixture
+            .map
+            .access(&transaction)
+            .expect("access overwrite map");
+        for key in 0..entries {
+            map.put(&(key as u64), &value)
+                .expect("overwrite benchmark item");
+        }
+    }
+    drop(transaction);
+    started.elapsed()
+}
+
 fn measure_single_put_commits(fixture: &mut Fixture, commits: usize) -> Duration {
     let started = std::time::Instant::now();
+    let mut encoded = vec![0x5a; VALUE_BYTES];
     for value in 0..commits {
-        let mut encoded = vec![0x5a; VALUE_BYTES];
         encoded[..std::mem::size_of::<u64>()].copy_from_slice(&(value as u64).to_be_bytes());
         let transaction = fixture
             .transactions
@@ -302,6 +648,18 @@ fn report_pair(
             shared_durations.push(shared());
         }
     }
+    let mut ratios = shared_durations
+        .iter()
+        .zip(&dedicated_durations)
+        .map(|(shared, dedicated)| shared.as_secs_f64() / dedicated.as_secs_f64())
+        .collect::<Vec<_>>();
+    ratios.sort_by(f64::total_cmp);
+    let median_ratio = ratios[ratios.len() / 2];
+    let shared_wins = shared_durations
+        .iter()
+        .zip(&dedicated_durations)
+        .filter(|(shared, dedicated)| shared < dedicated)
+        .count();
     report(
         workload,
         DataPlacement::Shared,
@@ -313,6 +671,9 @@ fn report_pair(
         DataPlacement::Dedicated,
         operations,
         dedicated_durations,
+    );
+    println!(
+        "  paired Shared/Dedicated median={median_ratio:.3}x; Shared wins {shared_wins}/{samples}"
     );
 }
 
