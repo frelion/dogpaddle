@@ -106,11 +106,10 @@ dependencies = [
 [[package]]
 name = "dogpaddle-flow"
 version = "0.1.0"
-dependencies = [
- "dogpaddle-store",
- "tempfile",
- "thiserror",
-]
+
+[[package]]
+name = "dogpaddle-operation"
+version = "0.1.0"
 
 [[package]]
 name = "dogpaddle-store"

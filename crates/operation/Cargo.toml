@@ -1,5 +1,5 @@
 [package]
-name = "dogpaddle-flow"
+name = "dogpaddle-operation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
