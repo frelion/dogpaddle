@@ -12,8 +12,8 @@ fn shared_and_dedicated_have_identical_data_semantics() {
         .unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
     {
+        let transaction = transactions.begin().unwrap();
         let mut shared = shared.access(&transaction).unwrap();
         let mut dedicated = dedicated.access(&transaction).unwrap();
         for number in 0_u64..10 {
@@ -22,8 +22,8 @@ fn shared_and_dedicated_have_identical_data_semantics() {
             shared.put(&key, value.as_bytes()).unwrap();
             dedicated.put(&key, value.as_bytes()).unwrap();
         }
+        transaction.commit().unwrap();
     }
-    transaction.commit().unwrap();
 
     let transaction = transactions.begin().unwrap();
     let shared = shared.access(&transaction).unwrap();

@@ -15,16 +15,16 @@ fn commit_is_atomic_across_shared_and_dedicated_data() {
         .unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
     {
+        let transaction = transactions.begin().unwrap();
         let mut shared = shared.access(&transaction).unwrap();
         let mut dedicated = dedicated.access(&transaction).unwrap();
         shared.put(b"key", b"shared").unwrap();
         dedicated.put(b"key", b"dedicated").unwrap();
         assert_eq!(shared.get(b"key").unwrap(), Some(b"shared".to_vec()));
         assert_eq!(dedicated.get(b"key").unwrap(), Some(b"dedicated".to_vec()));
+        transaction.commit().unwrap();
     }
-    transaction.commit().unwrap();
     drop(transactions);
 
     let store = Store::open(&path).unwrap();

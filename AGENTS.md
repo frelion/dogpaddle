@@ -17,7 +17,7 @@ DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品�
 
 ## 编码风格与命名约定
 
-遵循标准 `rustfmt` 输出，使用四空格缩进。模块、函数、变量和测试使用 `snake_case`；类型和 trait 使用 `UpperCamelCase`；常量使用 `SCREAMING_SNAKE_CASE`。工作区禁止 unsafe 代码。保持事务边界明确，并维持通用存储原语、类型化集合、流调度和操作语义之间的职责分离。公共 API 必须提供文档；可失败的方法应包含 `# Errors` 小节。
+遵循标准 `rustfmt` 输出，使用四空格缩进。模块、函数、变量和测试使用 `snake_case`；类型和 trait 使用 `UpperCamelCase`；常量使用 `SCREAMING_SNAKE_CASE`。工作区禁止 unsafe 代码。保持事务边界明确：需要显式作用域时，在同一个 `{ ... }` 中完成 `begin()`、所有访问和 `commit()`，不要为访问句柄另设内层块。维持通用存储原语、类型化集合、流调度和操作语义之间的职责分离。公共 API 必须提供文档；可失败的方法应包含 `# Errors` 小节。
 
 ## 测试规范
 

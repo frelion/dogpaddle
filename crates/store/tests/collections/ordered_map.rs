@@ -118,14 +118,14 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
         BorrowedKey(b"b".to_vec()),
         BorrowedKey(b"c".to_vec()),
     ];
-    let transaction = transactions.begin().unwrap();
     {
+        let transaction = transactions.begin().unwrap();
         let mut access = map.access(&transaction).unwrap();
         for (value, key) in keys.iter().enumerate() {
             access.put(key, &(value as u64)).unwrap();
         }
+        transaction.commit().unwrap();
     }
-    transaction.commit().unwrap();
 
     let transaction = transactions.begin().unwrap();
     let access = map.access(&transaction).unwrap();

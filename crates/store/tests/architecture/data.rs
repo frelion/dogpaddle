@@ -34,16 +34,16 @@ fn namespaces_isolate_identical_keys() {
         let right = store.create_data("right", placement).unwrap();
         let mut transactions = store.into_transactions();
 
-        let transaction = transactions.begin().unwrap();
         {
+            let transaction = transactions.begin().unwrap();
             let mut left = left.access(&transaction).unwrap();
             let mut right = right.access(&transaction).unwrap();
             left.put(b"", b"left-empty").unwrap();
             left.put(b"key", b"left").unwrap();
             right.put(b"", b"right-empty").unwrap();
             right.put(b"key", b"right").unwrap();
+            transaction.commit().unwrap();
         }
-        transaction.commit().unwrap();
 
         let transaction = transactions.begin().unwrap();
         let left = left.access(&transaction).unwrap();
@@ -127,14 +127,14 @@ fn raw_binary_keys_page_in_both_directions() {
         let mut store = Store::create(store_path(&root)).unwrap();
         let data = store.create_data("data", placement).unwrap();
         let mut transactions = store.into_transactions();
-        let transaction = transactions.begin().unwrap();
         {
+            let transaction = transactions.begin().unwrap();
             let mut access = data.access(&transaction).unwrap();
             for key in &keys {
                 access.put(key, key).unwrap();
             }
+            transaction.commit().unwrap();
         }
-        transaction.commit().unwrap();
 
         let transaction = transactions.begin().unwrap();
         let access = data.access(&transaction).unwrap();

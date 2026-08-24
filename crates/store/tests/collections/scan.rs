@@ -101,14 +101,14 @@ fn every_range_direction_and_page_size_matches_a_btree_model() {
         let mut store = Store::create(store_path(&root)).unwrap();
         let map = create_map::<i64, String>(&mut store, "map", placement).unwrap();
         let mut transactions = store.into_transactions();
-        let transaction = transactions.begin().unwrap();
         {
+            let transaction = transactions.begin().unwrap();
             let mut access = map.access(&transaction).unwrap();
             for (key, value) in &model {
                 access.put(key, value).unwrap();
             }
+            transaction.commit().unwrap();
         }
-        transaction.commit().unwrap();
 
         let transaction = transactions.begin().unwrap();
         let access = map.access(&transaction).unwrap();
@@ -136,14 +136,14 @@ fn byte_limits_and_continuations_are_exact() {
         let mut store = Store::create(store_path(&root)).unwrap();
         let map = create_map::<i64, String>(&mut store, "map", placement).unwrap();
         let mut transactions = store.into_transactions();
-        let transaction = transactions.begin().unwrap();
         {
+            let transaction = transactions.begin().unwrap();
             let mut access = map.access(&transaction).unwrap();
             for key in [-2, -1, 0] {
                 access.put(&key, &format!("v{key}")).unwrap();
             }
+            transaction.commit().unwrap();
         }
-        transaction.commit().unwrap();
 
         let transaction = transactions.begin().unwrap();
         let access = map.access(&transaction).unwrap();
@@ -189,14 +189,14 @@ fn continuation_outside_the_range_returns_no_items() {
     let mut store = Store::create(store_path(&root)).unwrap();
     let map = create_map::<i64, i64>(&mut store, "map", DataPlacement::Shared).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
     {
+        let transaction = transactions.begin().unwrap();
         let mut access = map.access(&transaction).unwrap();
         for key in -2..=2 {
             access.put(&key, &key).unwrap();
         }
+        transaction.commit().unwrap();
     }
-    transaction.commit().unwrap();
 
     let transaction = transactions.begin().unwrap();
     let access = map.access(&transaction).unwrap();

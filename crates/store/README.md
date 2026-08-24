@@ -42,15 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin()?;
     {
+        let transaction = transactions.begin()?;
         let mut counter = counter.access(&transaction)?;
         let mut users = users.access(&transaction)?;
 
         counter.set(&1)?;
         users.put(&42, &"Shiba".to_owned())?;
+        transaction.commit()?;
     }
-    transaction.commit()?;
 
     let transaction = transactions.begin()?;
     let counter = counter.access(&transaction)?;
