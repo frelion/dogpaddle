@@ -3,16 +3,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use dogpaddle_operation::OperationDefinition;
 use thiserror::Error;
 
 static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) trait InputCount {
-    fn input_count(&self) -> usize;
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct StageId(String);
 
 /// Temporary reference to a stage declared in one [`FlowBuilder`](crate::FlowBuilder).
 ///
@@ -25,21 +19,21 @@ pub struct StageRef {
 }
 
 #[derive(Debug)]
-pub(crate) struct StageDefinition<D> {
-    id: StageId,
-    operation: D,
-    sources: Vec<StageId>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Topology<D> {
-    stages: Vec<StageDefinition<D>>,
-}
-
-#[derive(Debug)]
-struct PendingStage<D> {
+pub(crate) struct StageDefinition {
     id: String,
-    operation: D,
+    operation: OperationDefinition,
+    sources: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Topology {
+    stages: Vec<StageDefinition>,
+}
+
+#[derive(Debug)]
+struct PendingStage {
+    id: String,
+    operation: OperationDefinition,
 }
 
 #[derive(Debug)]
@@ -49,9 +43,9 @@ struct PendingConnection {
 }
 
 #[derive(Debug)]
-pub(crate) struct TopologyBuilder<D> {
+pub(crate) struct TopologyBuilder {
     token: u64,
-    stages: Vec<PendingStage<D>>,
+    stages: Vec<PendingStage>,
     connections: Vec<PendingConnection>,
 }
 
@@ -109,37 +103,27 @@ pub enum TopologyError {
     Cycle,
 }
 
-impl StageId {
-    fn new_validated(id: String) -> Self {
-        Self(id)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<D> StageDefinition<D> {
+impl StageDefinition {
     pub(crate) fn id(&self) -> &str {
-        self.id.as_str()
+        &self.id
     }
 
-    pub(crate) const fn operation(&self) -> &D {
+    pub(crate) const fn operation(&self) -> &OperationDefinition {
         &self.operation
     }
 
     pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.sources.iter().map(StageId::as_str)
+        self.sources.iter().map(String::as_str)
     }
 }
 
-impl<D> Topology<D> {
-    pub(crate) fn stages(&self) -> &[StageDefinition<D>] {
+impl Topology {
+    pub(crate) fn stages(&self) -> &[StageDefinition] {
         &self.stages
     }
 }
 
-impl<D> TopologyBuilder<D> {
+impl TopologyBuilder {
     pub(crate) fn new() -> Self {
         let token = NEXT_BUILDER_TOKEN.fetch_add(1, Ordering::Relaxed);
         assert_ne!(token, 0, "topology builder token space exhausted");
@@ -150,7 +134,11 @@ impl<D> TopologyBuilder<D> {
         }
     }
 
-    pub(crate) fn stage(&mut self, id: impl Into<String>, operation: D) -> StageRef {
+    pub(crate) fn stage(
+        &mut self,
+        id: impl Into<String>,
+        operation: OperationDefinition,
+    ) -> StageRef {
         let reference = StageRef {
             builder_token: self.token,
             index: self.stages.len(),
@@ -176,10 +164,8 @@ impl<D> TopologyBuilder<D> {
     pub(crate) fn validate_stage_ids(&self) -> Result<(), TopologyError> {
         validate_stage_ids(&self.stages)
     }
-}
 
-impl<D: InputCount> TopologyBuilder<D> {
-    pub(crate) fn finish(self) -> Result<Topology<D>, TopologyError> {
+    pub(crate) fn finish(self) -> Result<Topology, TopologyError> {
         let Self {
             token,
             stages,
@@ -192,7 +178,7 @@ impl<D: InputCount> TopologyBuilder<D> {
 
         let stage_ids = stages
             .iter()
-            .map(|stage| StageId::new_validated(stage.id.clone()))
+            .map(|stage| stage.id.clone())
             .collect::<Vec<_>>();
         let stages = stages
             .into_iter()
@@ -213,14 +199,8 @@ impl<D: InputCount> TopologyBuilder<D> {
     }
 }
 
-impl<D> Default for TopologyBuilder<D> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn validate_input_counts<D: InputCount>(
-    stages: &[PendingStage<D>],
+fn validate_input_counts(
+    stages: &[PendingStage],
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
     for (stage, sources) in stages.iter().zip(sources_by_target) {
@@ -237,7 +217,7 @@ fn validate_input_counts<D: InputCount>(
     Ok(())
 }
 
-fn validate_stage_ids<D>(stages: &[PendingStage<D>]) -> Result<(), TopologyError> {
+fn validate_stage_ids(stages: &[PendingStage]) -> Result<(), TopologyError> {
     if stages.is_empty() {
         return Err(TopologyError::EmptyTopology);
     }
@@ -264,9 +244,9 @@ fn validate_stage_ids<D>(stages: &[PendingStage<D>]) -> Result<(), TopologyError
     Ok(())
 }
 
-fn validate_connections<D>(
+fn validate_connections(
     token: u64,
-    stages: &[PendingStage<D>],
+    stages: &[PendingStage],
     connections: &[PendingConnection],
 ) -> Result<Vec<Option<Vec<usize>>>, TopologyError> {
     let mut sources_by_target = vec![None; stages.len()];

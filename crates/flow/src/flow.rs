@@ -8,7 +8,7 @@ use dogpaddle_store::{
 use crate::{
     FlowError, StageRef, format,
     stage::Stage,
-    topology::{InputCount, Topology, TopologyBuilder},
+    topology::{Topology, TopologyBuilder},
 };
 
 /// Builder for one persistent, immutable Flow definition.
@@ -17,7 +17,7 @@ use crate::{
 /// validates the complete graph before creating the Store at the target path.
 pub struct FlowBuilder {
     path: PathBuf,
-    topology: TopologyBuilder<OperationDefinition>,
+    topology: TopologyBuilder,
 }
 
 /// An opened persistent Flow.
@@ -26,12 +26,12 @@ pub struct FlowBuilder {
 /// topology and data namespaces were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
-    topology: Topology<OperationDefinition>,
+    topology: Topology,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "flow state is consumed by the next run phase")
     )]
-    data: FlowData,
+    state: OrderedMap<Vec<u8>, Vec<u8>>,
     #[cfg_attr(
         not(test),
         expect(
@@ -45,20 +45,6 @@ pub struct Flow {
         expect(dead_code, reason = "transactions are consumed by the next run phase")
     )]
     transactions: Transactions,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "flow state is consumed by the next run phase")
-)]
-struct FlowData {
-    state: OrderedMap<Vec<u8>, Vec<u8>>,
-}
-
-impl InputCount for OperationDefinition {
-    fn input_count(&self) -> usize {
-        OperationDefinition::input_count(self)
-    }
 }
 
 impl Flow {
@@ -104,9 +90,7 @@ impl Flow {
         Ok(Self {
             path,
             topology,
-            data: FlowData {
-                state: OrderedMap::new(flow_state),
-            },
+            state: OrderedMap::new(flow_state),
             stages,
             transactions,
         })
@@ -189,9 +173,7 @@ impl FlowBuilder {
         Ok(Flow {
             path: self.path,
             topology,
-            data: FlowData {
-                state: OrderedMap::new(flow_state),
-            },
+            state: OrderedMap::new(flow_state),
             stages,
             transactions,
         })
@@ -217,10 +199,7 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
     }
 }
 
-fn create_stages(
-    store: &mut Store,
-    topology: &Topology<OperationDefinition>,
-) -> Result<Vec<Stage>, FlowError> {
+fn create_stages(store: &mut Store, topology: &Topology) -> Result<Vec<Stage>, FlowError> {
     topology
         .stages()
         .iter()
@@ -229,10 +208,7 @@ fn create_stages(
         .collect()
 }
 
-fn open_stages(
-    store: &Store,
-    topology: &Topology<OperationDefinition>,
-) -> Result<Vec<Stage>, FlowError> {
+fn open_stages(store: &Store, topology: &Topology) -> Result<Vec<Stage>, FlowError> {
     topology
         .stages()
         .iter()

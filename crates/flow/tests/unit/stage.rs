@@ -36,14 +36,12 @@ fn open_rematerializes_each_definition_and_its_own_data_handles() {
             .unwrap()
             .set(&20)
             .unwrap();
-        left.data
-            .state
+        left.state
             .access(&transaction)
             .unwrap()
             .put(&b"key".to_vec(), &b"left".to_vec())
             .unwrap();
         right
-            .data
             .state
             .access(&transaction)
             .unwrap()
@@ -76,7 +74,6 @@ fn open_rematerializes_each_definition_and_its_own_data_handles() {
         );
         assert_eq!(
             stage
-                .data
                 .state
                 .access(&transaction)
                 .unwrap()

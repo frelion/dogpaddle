@@ -63,9 +63,7 @@ pub(crate) fn count_state_name(index: usize) -> String {
     format!("stage/{index:08x}/operation/count")
 }
 
-pub(crate) fn encode(
-    topology: &Topology<OperationDefinition>,
-) -> Result<Vec<u8>, FlowDefinitionError> {
+pub(crate) fn encode(topology: &Topology) -> Result<Vec<u8>, FlowDefinitionError> {
     let stage_count = u32::try_from(topology.stages().len())
         .map_err(|_| FlowDefinitionError::LengthOverflow("stage count"))?;
     let mut encoded = Vec::new();
@@ -89,7 +87,7 @@ pub(crate) fn encode(
     Ok(encoded)
 }
 
-pub(crate) fn decode(encoded: &[u8]) -> Result<Topology<OperationDefinition>, FlowDefinitionError> {
+pub(crate) fn decode(encoded: &[u8]) -> Result<Topology, FlowDefinitionError> {
     if encoded.len() < MAGIC.len() {
         return Err(FlowDefinitionError::Truncated);
     }
@@ -140,9 +138,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<Topology<OperationDefinition>, Fl
     topology_from_records(&records)
 }
 
-fn topology_from_records(
-    records: &[StageRecord],
-) -> Result<Topology<OperationDefinition>, FlowDefinitionError> {
+fn topology_from_records(records: &[StageRecord]) -> Result<Topology, FlowDefinitionError> {
     let ids = records
         .iter()
         .map(|record| record.id.clone())

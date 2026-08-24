@@ -3,7 +3,7 @@ use dogpaddle_operation::{CountDefinition, SequenceSourceDefinition};
 use super::{CHECKSUM_LENGTH, crc32, decode, encode};
 use crate::{FlowDefinitionError, topology::TopologyBuilder};
 
-fn topology() -> crate::topology::Topology<dogpaddle_operation::OperationDefinition> {
+fn topology() -> crate::topology::Topology {
     let mut builder = TopologyBuilder::new();
     let source = builder.stage("source", SequenceSourceDefinition::new(7).into());
     let count = builder.stage("count", CountDefinition::new().into());
@@ -11,10 +11,7 @@ fn topology() -> crate::topology::Topology<dogpaddle_operation::OperationDefinit
     builder.finish().unwrap()
 }
 
-fn topology_with_ids(
-    source_id: &str,
-    count_id: &str,
-) -> crate::topology::Topology<dogpaddle_operation::OperationDefinition> {
+fn topology_with_ids(source_id: &str, count_id: &str) -> crate::topology::Topology {
     let mut builder = TopologyBuilder::new();
     let source = builder.stage(source_id, SequenceSourceDefinition::new(7).into());
     let count = builder.stage(count_id, CountDefinition::new().into());

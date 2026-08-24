@@ -13,16 +13,8 @@ use crate::{FlowError, format};
     )
 )]
 pub(crate) struct Stage {
-    data: StageData,
-    operation: OperationInstance,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "stage state is consumed by the next run phase")
-)]
-struct StageData {
     state: OrderedMap<Vec<u8>, Vec<u8>>,
+    operation: OperationInstance,
 }
 
 #[expect(
@@ -42,9 +34,7 @@ impl Stage {
     ) -> Result<Self, FlowError> {
         let state = store.create_data(&format::stage_state_name(index), DataPlacement::Shared)?;
         Ok(Self {
-            data: StageData {
-                state: OrderedMap::new(state),
-            },
+            state: OrderedMap::new(state),
             operation: OperationInstance::create(store, index, definition)?,
         })
     }
@@ -56,9 +46,7 @@ impl Stage {
     ) -> Result<Self, FlowError> {
         let state = open_required_data(store, &format::stage_state_name(index))?;
         Ok(Self {
-            data: StageData {
-                state: OrderedMap::new(state),
-            },
+            state: OrderedMap::new(state),
             operation: OperationInstance::open(store, index, definition)?,
         })
     }
