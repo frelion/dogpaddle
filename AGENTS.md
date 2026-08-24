@@ -2,7 +2,7 @@
 
 ## 项目结构与模块组织
 
-DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有未来的内部 Stage 运行时。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
+DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按职责拆分：`flow.rs` 处理生命周期，`stage.rs` 负责单个 Stage 及其 Operation 的资源物化，`topology.rs` 只处理纯图模型，`format.rs` 维护磁盘编码和稳定资源名。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
 
 ## 构建、测试与开发命令
 

@@ -1,14 +1,67 @@
 use dogpaddle_operation::OperationDefinition;
+use thiserror::Error;
 
-use crate::{
-    FlowDefinitionError,
-    topology::{Topology, TopologyBuilder},
-};
+use crate::topology::{Topology, TopologyBuilder, TopologyError};
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
 const FORMAT_VERSION: u16 = 1;
 const CHECKSUM_LENGTH: usize = size_of::<u32>();
 const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
+pub(crate) const DEFINITION_DATA_NAME: &str = "flow/definition";
+pub(crate) const FLOW_STATE_DATA_NAME: &str = "flow/state";
+
+/// Failure while encoding or decoding a durable Flow definition.
+#[derive(Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FlowDefinitionError {
+    /// The encoded definition ends before all declared fields are present.
+    #[error("flow definition is truncated")]
+    Truncated,
+    /// The encoded bytes do not begin with the `DogPaddle` Flow marker.
+    #[error("flow definition marker is invalid")]
+    InvalidMagic,
+    /// The Flow definition format version is unsupported.
+    #[error("unsupported flow definition format version {0}")]
+    UnsupportedVersion(u16),
+    /// A stage or source ID is not valid UTF-8.
+    #[error("flow definition contains an invalid UTF-8 stage ID")]
+    InvalidUtf8,
+    /// A length cannot be represented by the durable format.
+    #[error("{0} is too large for the flow definition format")]
+    LengthOverflow(&'static str),
+    /// A source ID does not identify a declared stage.
+    #[error("stage {stage:?} references unknown source {source_id:?}")]
+    UnknownSource {
+        /// Stage containing the invalid source reference.
+        stage: String,
+        /// Missing source ID.
+        source_id: String,
+    },
+    /// One operation definition is invalid or unsupported.
+    #[error(transparent)]
+    Operation(#[from] dogpaddle_operation::DefinitionCodecError),
+    /// The persisted checksum does not match the definition bytes.
+    #[error("flow definition checksum does not match its contents")]
+    IntegrityMismatch,
+    /// The decoded graph violates topology rules.
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+    /// Bytes remain after the complete definition.
+    #[error("flow definition contains trailing bytes")]
+    TrailingBytes,
+}
+
+pub(crate) fn stage_state_name(index: usize) -> String {
+    format!("stage/{index:08x}/state")
+}
+
+pub(crate) fn sequence_position_name(index: usize) -> String {
+    format!("stage/{index:08x}/operation/sequence_source.position")
+}
+
+pub(crate) fn count_state_name(index: usize) -> String {
+    format!("stage/{index:08x}/operation/count")
+}
 
 pub(crate) fn encode(
     topology: &Topology<OperationDefinition>,
@@ -208,156 +261,5 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use dogpaddle_operation::{CountDefinition, SequenceSourceDefinition};
-
-    use super::{CHECKSUM_LENGTH, crc32, decode, encode};
-    use crate::{FlowDefinitionError, topology::TopologyBuilder};
-
-    fn topology() -> crate::topology::Topology<dogpaddle_operation::OperationDefinition> {
-        let mut builder = TopologyBuilder::new();
-        let source = builder.stage("source", SequenceSourceDefinition::new(7).into());
-        let count = builder.stage("count", CountDefinition::new().into());
-        builder.connect([source], count);
-        builder.finish().unwrap()
-    }
-
-    fn topology_with_ids(
-        source_id: &str,
-        count_id: &str,
-    ) -> crate::topology::Topology<dogpaddle_operation::OperationDefinition> {
-        let mut builder = TopologyBuilder::new();
-        let source = builder.stage(source_id, SequenceSourceDefinition::new(7).into());
-        let count = builder.stage(count_id, CountDefinition::new().into());
-        builder.connect([source], count);
-        builder.finish().unwrap()
-    }
-
-    #[test]
-    fn codec_is_canonical_and_round_trips_ordered_sources() {
-        let encoded = encode(&topology()).unwrap();
-        let mut expected = [
-            b"dogpaddle.flow\0".as_slice(),
-            &[0, 1, 0, 0, 0, 2],
-            &[0, 0, 0, 6],
-            b"source",
-            &[0, 0, 0, 32],
-            b"dogpaddle.operation\0",
-            &[0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7],
-            &[0, 0, 0, 0],
-            &[0, 0, 0, 5],
-            b"count",
-            &[0, 0, 0, 24],
-            b"dogpaddle.operation\0",
-            &[0, 1, 0, 2],
-            &[0, 0, 0, 1, 0, 0, 0, 6],
-            b"source",
-        ]
-        .concat();
-        expected.extend_from_slice(&crc32(&expected).to_be_bytes());
-        assert_eq!(encoded, expected);
-
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(encode(&decoded).unwrap(), encoded);
-    }
-
-    #[test]
-    fn decoder_rejects_truncation_and_trailing_bytes() {
-        let encoded = encode(&topology()).unwrap();
-        let payload_end = encoded.len() - CHECKSUM_LENGTH;
-        let mut truncated = encoded[..payload_end - 1].to_vec();
-        truncated.extend_from_slice(&crc32(&truncated).to_be_bytes());
-        assert_eq!(
-            decode(&truncated).unwrap_err(),
-            FlowDefinitionError::Truncated
-        );
-
-        let mut trailing = encoded;
-        let checksum_offset = trailing.len() - CHECKSUM_LENGTH;
-        trailing.insert(checksum_offset, 0);
-        let checksum_offset = trailing.len() - CHECKSUM_LENGTH;
-        let checksum = crc32(&trailing[..checksum_offset]);
-        trailing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
-        assert_eq!(
-            decode(&trailing).unwrap_err(),
-            FlowDefinitionError::TrailingBytes
-        );
-    }
-
-    #[test]
-    fn decoder_validates_all_stage_ids_before_resolving_sources() {
-        let mut encoded = encode(&topology_with_ids("first", "other")).unwrap();
-        let duplicate = encoded
-            .windows(b"other".len())
-            .position(|window| window == b"other")
-            .unwrap();
-        encoded[duplicate..duplicate + b"first".len()].copy_from_slice(b"first");
-        let source_reference = encoded
-            .windows(b"first".len())
-            .rposition(|window| window == b"first")
-            .unwrap();
-        encoded[source_reference..source_reference + b"ghost".len()].copy_from_slice(b"ghost");
-        let checksum_offset = encoded.len() - CHECKSUM_LENGTH;
-        let checksum = crc32(&encoded[..checksum_offset]);
-        encoded[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
-
-        assert_eq!(
-            decode(&encoded).unwrap_err(),
-            FlowDefinitionError::Topology(crate::TopologyError::DuplicateStageId(
-                "first".to_owned()
-            ))
-        );
-    }
-
-    #[test]
-    fn decoder_rejects_semantic_bit_flips_and_checksum_damage() {
-        let original = encode(&topology()).unwrap();
-
-        let mut changed_start = original.clone();
-        let start = changed_start
-            .windows(7_u64.to_be_bytes().len())
-            .position(|window| window == 7_u64.to_be_bytes())
-            .unwrap();
-        changed_start[start + 7] ^= 1;
-        assert_eq!(
-            decode(&changed_start).unwrap_err(),
-            FlowDefinitionError::IntegrityMismatch
-        );
-
-        let mut changed_id = original.clone();
-        let id = changed_id
-            .windows(b"source".len())
-            .position(|window| window == b"source")
-            .unwrap();
-        changed_id[id + b"source".len() - 1] = b'f';
-        assert_eq!(
-            decode(&changed_id).unwrap_err(),
-            FlowDefinitionError::IntegrityMismatch
-        );
-
-        let mut changed_source = encode(&topology_with_ids("first", "other")).unwrap();
-        let source_reference = changed_source
-            .windows(b"first".len())
-            .rposition(|window| window == b"first")
-            .unwrap();
-        changed_source[source_reference..source_reference + b"other".len()]
-            .copy_from_slice(b"other");
-        assert_eq!(
-            decode(&changed_source).unwrap_err(),
-            FlowDefinitionError::IntegrityMismatch
-        );
-
-        let mut changed_checksum = original;
-        let final_byte = changed_checksum.last_mut().unwrap();
-        *final_byte ^= 1;
-        assert_eq!(
-            decode(&changed_checksum).unwrap_err(),
-            FlowDefinitionError::IntegrityMismatch
-        );
-    }
-
-    #[test]
-    fn checksum_uses_the_stable_ieee_crc32_algorithm() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-    }
-}
+#[path = "../tests/unit/format.rs"]
+mod tests;

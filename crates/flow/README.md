@@ -60,6 +60,13 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 
 `index` 是 Stage 声明顺序。修改编码、tag 或资源名必须作为磁盘格式变更处理并补充迁移设计。
 
+## 源码边界
+
+`flow.rs` 是 `build/open` 生命周期门面；`stage.rs` 负责一个 Stage、一个 Operation 及其全部
+资源的创建和重新物化；`topology.rs` 只包含无 Store 副作用的图模型与校验；`format.rs`
+集中维护稳定磁盘编码和资源名。公共错误单独位于 `error.rs`，各模块的白盒测试放在对应的
+`tests/unit/<module>.rs` 中；`tests/` 顶层文件验证 crate 的公共行为。
+
 ## 当前边界
 
 本阶段只完成定义、持久化 `build` 和无 Definition 参数的 `open`。尚未实现 `run`、Stage

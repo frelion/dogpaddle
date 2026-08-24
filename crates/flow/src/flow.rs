@@ -1,19 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_operation::{
-    CountData, CountOperation, OperationDefinition, SequenceSourceData, SequenceSourceOperation,
-};
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_store::{
     Cell, DataHandle, DataPlacement, OrderedMap, Store, StoreError, Transactions,
 };
 
 use crate::{
-    FlowError, StageRef, manifest,
-    topology::{Topology, TopologyBuilder},
+    FlowError, StageRef, format,
+    stage::Stage,
+    topology::{InputCount, Topology, TopologyBuilder},
 };
-
-const DEFINITION_DATA_NAME: &str = "flow/definition";
-const FLOW_STATE_DATA_NAME: &str = "flow/state";
 
 /// Builder for one persistent, immutable Flow definition.
 ///
@@ -59,33 +55,10 @@ struct FlowData {
     state: OrderedMap<Vec<u8>, Vec<u8>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "stage instances are consumed by the next run phase"
-    )
-)]
-struct Stage {
-    data: StageData,
-    operation: OperationInstance,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "stage state is consumed by the next run phase")
-)]
-struct StageData {
-    state: OrderedMap<Vec<u8>, Vec<u8>>,
-}
-
-#[expect(
-    dead_code,
-    reason = "operation instances are consumed by the next run phase"
-)]
-enum OperationInstance {
-    SequenceSource(SequenceSourceOperation),
-    Count(CountOperation),
+impl InputCount for OperationDefinition {
+    fn input_count(&self) -> usize {
+        OperationDefinition::input_count(self)
+    }
 }
 
 impl Flow {
@@ -112,11 +85,11 @@ impl Flow {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, FlowError> {
         let path = path.as_ref().to_path_buf();
         let definition_bytes = read_published_definition(&path)?;
-        let topology = manifest::decode(&definition_bytes)?;
+        let topology = format::decode(&definition_bytes)?;
 
         let store = Store::open(&path)?;
         let definition = open_definition_cell(&store)?;
-        let flow_state = open_required_data(&store, FLOW_STATE_DATA_NAME)?;
+        let flow_state = open_required_data(&store, format::FLOW_STATE_DATA_NAME)?;
         let stages = open_stages(&store, &topology)?;
         let mut transactions = store.into_transactions();
         let observed_definition = {
@@ -198,11 +171,12 @@ impl FlowBuilder {
     /// leave an incomplete build that [`Flow::open`] refuses to open.
     pub fn build(self) -> Result<Flow, FlowError> {
         let topology = self.topology.finish()?;
-        let definition_bytes = manifest::encode(&topology)?;
+        let definition_bytes = format::encode(&topology)?;
 
         let mut store = Store::create(&self.path)?;
-        let definition = Cell::new(store.create_data(DEFINITION_DATA_NAME, DataPlacement::Shared)?);
-        let flow_state = store.create_data(FLOW_STATE_DATA_NAME, DataPlacement::Shared)?;
+        let definition =
+            Cell::new(store.create_data(format::DEFINITION_DATA_NAME, DataPlacement::Shared)?);
+        let flow_state = store.create_data(format::FLOW_STATE_DATA_NAME, DataPlacement::Shared)?;
         let stages = create_stages(&mut store, &topology)?;
         let mut transactions = store.into_transactions();
         {
@@ -234,9 +208,9 @@ fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
 }
 
 fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
-    match store.open_data(DEFINITION_DATA_NAME) {
+    match store.open_data(format::DEFINITION_DATA_NAME) {
         Ok(data) => Ok(Cell::new(data)),
-        Err(StoreError::DataNotFound(name)) if name == DEFINITION_DATA_NAME => {
+        Err(StoreError::DataNotFound(name)) if name == format::DEFINITION_DATA_NAME => {
             Err(FlowError::IncompleteBuild)
         }
         Err(error) => Err(error.into()),
@@ -251,15 +225,7 @@ fn create_stages(
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| {
-            let state = store.create_data(&stage_state_name(index), DataPlacement::Shared)?;
-            Ok(Stage {
-                data: StageData {
-                    state: OrderedMap::new(state),
-                },
-                operation: create_operation(store, index, stage.operation())?,
-            })
-        })
+        .map(|(index, stage)| Stage::create(store, index, stage.operation()))
         .collect()
 }
 
@@ -271,76 +237,8 @@ fn open_stages(
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| {
-            let state = open_required_data(store, &stage_state_name(index))?;
-            Ok(Stage {
-                data: StageData {
-                    state: OrderedMap::new(state),
-                },
-                operation: open_operation(store, index, stage.operation())?,
-            })
-        })
+        .map(|(index, stage)| Stage::open(store, index, stage.operation()))
         .collect()
-}
-
-fn stage_state_name(index: usize) -> String {
-    format!("stage/{index:08x}/state")
-}
-
-fn create_operation(
-    store: &mut Store,
-    index: usize,
-    definition: &OperationDefinition,
-) -> Result<OperationInstance, StoreError> {
-    match definition {
-        OperationDefinition::SequenceSource(definition) => {
-            let position = Cell::new(store.create_data(
-                &format!("stage/{index:08x}/operation/sequence_source.position"),
-                DataPlacement::Shared,
-            )?);
-            Ok(OperationInstance::SequenceSource(
-                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
-            ))
-        }
-        OperationDefinition::Count(definition) => {
-            let count = Cell::new(store.create_data(
-                &format!("stage/{index:08x}/operation/count"),
-                DataPlacement::Shared,
-            )?);
-            Ok(OperationInstance::Count(CountOperation::new(
-                *definition,
-                CountData::new(count),
-            )))
-        }
-    }
-}
-
-fn open_operation(
-    store: &Store,
-    index: usize,
-    definition: &OperationDefinition,
-) -> Result<OperationInstance, FlowError> {
-    match definition {
-        OperationDefinition::SequenceSource(definition) => {
-            let position = Cell::new(open_required_data(
-                store,
-                &format!("stage/{index:08x}/operation/sequence_source.position"),
-            )?);
-            Ok(OperationInstance::SequenceSource(
-                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
-            ))
-        }
-        OperationDefinition::Count(definition) => {
-            let count = Cell::new(open_required_data(
-                store,
-                &format!("stage/{index:08x}/operation/count"),
-            )?);
-            Ok(OperationInstance::Count(CountOperation::new(
-                *definition,
-                CountData::new(count),
-            )))
-        }
-    }
 }
 
 fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError> {
@@ -352,110 +250,5 @@ fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError
 }
 
 #[cfg(test)]
-mod tests {
-    use dogpaddle_operation::SequenceSourceDefinition;
-    use dogpaddle_store::{Cell, OrderedMap, Store};
-
-    use super::{Flow, OperationInstance};
-
-    #[test]
-    fn open_rematerializes_each_definition_and_its_own_data_handles() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("flow");
-        let mut builder = Flow::builder(&path);
-        builder.stage("left", SequenceSourceDefinition::new(100));
-        builder.stage("right", SequenceSourceDefinition::new(200));
-        drop(builder.build().unwrap());
-
-        let store = Store::open(&path).unwrap();
-        let left_position: Cell<u64> = Cell::new(
-            store
-                .open_data("stage/00000000/operation/sequence_source.position")
-                .unwrap(),
-        );
-        let right_position: Cell<u64> = Cell::new(
-            store
-                .open_data("stage/00000001/operation/sequence_source.position")
-                .unwrap(),
-        );
-        let left_state: OrderedMap<Vec<u8>, Vec<u8>> =
-            OrderedMap::new(store.open_data("stage/00000000/state").unwrap());
-        let right_state: OrderedMap<Vec<u8>, Vec<u8>> =
-            OrderedMap::new(store.open_data("stage/00000001/state").unwrap());
-        let flow_state: OrderedMap<Vec<u8>, Vec<u8>> =
-            OrderedMap::new(store.open_data("flow/state").unwrap());
-        let mut transactions = store.into_transactions();
-        {
-            let transaction = transactions.begin().unwrap();
-            left_position
-                .access(&transaction)
-                .unwrap()
-                .set(&10)
-                .unwrap();
-            right_position
-                .access(&transaction)
-                .unwrap()
-                .set(&20)
-                .unwrap();
-            left_state
-                .access(&transaction)
-                .unwrap()
-                .put(&b"key".to_vec(), &b"left".to_vec())
-                .unwrap();
-            right_state
-                .access(&transaction)
-                .unwrap()
-                .put(&b"key".to_vec(), &b"right".to_vec())
-                .unwrap();
-            flow_state
-                .access(&transaction)
-                .unwrap()
-                .put(&b"key".to_vec(), &b"flow".to_vec())
-                .unwrap();
-            transaction.commit().unwrap();
-        }
-        drop(transactions);
-
-        let mut flow = Flow::open(&path).unwrap();
-        let transaction = flow.transactions.begin().unwrap();
-        assert_eq!(
-            flow.data
-                .state
-                .access(&transaction)
-                .unwrap()
-                .get(&b"key".to_vec())
-                .unwrap(),
-            Some(b"flow".to_vec())
-        );
-        for (index, (expected_start, expected_position, expected_state)) in
-            [(100, 10, b"left".to_vec()), (200, 20, b"right".to_vec())]
-                .into_iter()
-                .enumerate()
-        {
-            let OperationInstance::SequenceSource(operation) = &flow.stages[index].operation else {
-                panic!("sequence source was materialized as another operation");
-            };
-            assert_eq!(operation.definition().start(), expected_start);
-            assert_eq!(
-                operation
-                    .data()
-                    .position()
-                    .access(&transaction)
-                    .unwrap()
-                    .get()
-                    .unwrap(),
-                Some(expected_position)
-            );
-            assert_eq!(
-                flow.stages[index]
-                    .data
-                    .state
-                    .access(&transaction)
-                    .unwrap()
-                    .get(&b"key".to_vec())
-                    .unwrap(),
-                Some(expected_state)
-            );
-        }
-    }
-}
+#[path = "../tests/unit/flow.rs"]
+mod tests;
