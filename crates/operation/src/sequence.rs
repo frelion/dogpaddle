@@ -1,0 +1,108 @@
+use dogpaddle_store::{Cell, CellAccess, StoreError};
+use thiserror::Error;
+
+/// Pure definition of a monotonically increasing source.
+///
+/// The source accepts no inputs and emits `u64` values beginning at `start`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceSourceDefinition {
+    start: u64,
+}
+
+/// Persistent data handles required by [`SequenceSourceOperation`].
+pub struct SequenceSourceData {
+    position: Cell<u64>,
+}
+
+/// Materialized monotonically increasing source operation.
+///
+/// This value owns its pure definition and persistent data handles, but never
+/// begins, commits, or stores a transaction.
+pub struct SequenceSourceOperation {
+    definition: SequenceSourceDefinition,
+    data: SequenceSourceData,
+}
+
+/// Failure while producing one value from a [`SequenceSourceOperation`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SequenceSourceError {
+    /// Persistent position access failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The source has already emitted [`u64::MAX`].
+    #[error("sequence exhausted after emitting u64::MAX")]
+    Exhausted,
+}
+
+impl SequenceSourceDefinition {
+    pub(crate) const INPUT_COUNT: usize = 0;
+
+    /// Creates a source whose first emitted value is `start`.
+    #[must_use]
+    pub const fn new(start: u64) -> Self {
+        Self { start }
+    }
+
+    /// Returns the first value emitted by a new source.
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+}
+
+impl SequenceSourceData {
+    /// Creates Sequence data from the cell storing its last emitted value.
+    #[must_use]
+    pub const fn new(position: Cell<u64>) -> Self {
+        Self { position }
+    }
+
+    /// Returns the cell storing the last committed emitted value.
+    #[must_use]
+    pub const fn position(&self) -> &Cell<u64> {
+        &self.position
+    }
+}
+
+impl SequenceSourceOperation {
+    /// Materializes a Sequence source from its pure definition and durable data.
+    #[must_use]
+    pub const fn new(definition: SequenceSourceDefinition, data: SequenceSourceData) -> Self {
+        Self { definition, data }
+    }
+
+    /// Returns the pure definition used to materialize this source.
+    #[must_use]
+    pub const fn definition(&self) -> &SequenceSourceDefinition {
+        &self.definition
+    }
+
+    /// Returns the persistent data handles owned by this source.
+    #[must_use]
+    pub const fn data(&self) -> &SequenceSourceData {
+        &self.data
+    }
+
+    /// Produces and records the next sequence value.
+    ///
+    /// A missing position emits the configured start value. Otherwise the last
+    /// committed value is incremented. The caller owns the transaction that
+    /// produced `position` and decides whether to commit the new position and
+    /// returned output together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequenceSourceError::Exhausted`] after [`u64::MAX`] has been emitted.
+    /// Storage and codec failures are returned as [`SequenceSourceError::Store`].
+    pub fn apply(&self, position: &mut CellAccess<'_, u64>) -> Result<u64, SequenceSourceError> {
+        let next = match position.get()? {
+            Some(previous) => previous
+                .checked_add(1)
+                .ok_or(SequenceSourceError::Exhausted)?,
+            None => self.definition.start,
+        };
+        position.set(&next)?;
+        Ok(next)
+    }
+}

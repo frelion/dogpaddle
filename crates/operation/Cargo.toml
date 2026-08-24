@@ -5,5 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 
+[dependencies]
+dogpaddle-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

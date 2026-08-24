@@ -1,32 +1,73 @@
 # dogpaddle-operation
 
-`dogpaddle-operation` 是 `DogPaddle` 的强类型 `Operation Definition` 层。
+`dogpaddle-operation` 提供具体、强类型的 Operation Definition、持久化 Data 和运行实例。
+Definition 是无副作用、可形式化的数据；实例由 Definition 与 Flow 在 `build/open` 阶段
+注入的 Store-bound Data 构成。
 
-每类 `Operation` 将拥有自己的强类型 `Definition`，并按其算法需要拥有持久化 `Data` 和
-运行实例。不同 Definition 最终通过闭合、类型安全的联合交给 `Flow`，不使用
-`kind: String`、不透明配置字节或运行时 Registry 分发。
+不同 Definition 通过闭合的 [`OperationDefinition`] 联合进入 Flow，不使用 `kind: String`、
+不透明配置字节或运行时 Registry。联合提供精确输入数量，并以显式版本和稳定 tag 编解码；
+用户只构造具体 Definition：
 
-## Definition 边界
+```rust
+use dogpaddle_operation::{OperationDefinition, SequenceSourceDefinition};
 
-Definition 是纯、可形式化的数据，只保存重建 Operation 语义所需的配置，不包含 `Store`、
-`DataHandle`、事务、闭包或运行时客户端。每个具体 Definition 决定自己接受的精确、有序
-输入数量；`Flow` 在冻结拓扑前验证连接数量。
+let source = OperationDefinition::from(SequenceSourceDefinition::new(10));
+assert_eq!(source.input_count(), 0);
+assert_eq!(OperationDefinition::decode(&source.encode()).unwrap(), source);
+```
 
-当前不公开通用 Definition trait。未来持久化异构 Flow 时，闭合的 Definition 联合将提供
-拓扑所需的输入数量，并穷尽处理稳定编码与物化。实现一个任意 Rust trait 不会被误解为可以
-自动加入可持久化 Flow。当前也不定义通用 Signature、端口 schema 或持久化 codec。
+## `SequenceSource`
 
-## 物化边界
+[`SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的
+[`SequenceSourceOperation`] 使用 [`SequenceSourceData`] 中的 `Cell<u64>` 保存最后一次已
+提交的值；首次产生 `start`，随后逐一递增。`u64::MAX` 可以产生一次，再次推进返回
+[`SequenceSourceError::Exhausted`]。
 
-Operation 实例由纯 Definition 和 `build/open` 阶段解析出的具体、Store-bound 依赖构成。
-`Flow` 负责编排 Store 生命周期、Stage 资源作用域和冻结时机；具体 Operation 模块决定自己的
-状态布局并构造运行实例。
+## Count
 
-无状态 Operation 不需要虚构持久化 Data；有状态 Operation 使用与自身算法匹配的具体
-依赖。构造函数名称、Definition 的传递方式以及是否需要专用 Data 结构，由第一个真实
-Operation 的所有权与状态需求决定。运行实例不得借用嵌套在 Flow 持久化定义中的字段，避免
-让 Flow 形成自引用结构。
+[`CountDefinition`] 要求一个输入。每成功应用一条记录，[`CountOperation`] 将
+[`CountData`] 中的 `Cell<u64>` 加一并返回新计数；未写入的 Cell 解释为 `0`，溢出返回
+[`CountError::Overflow`]。
 
-当前不提供通用 `DataBundle`、`OperationInstance`、factory 或依赖注入容器，也没有临时
-No-op、Source、Filter 或 Join 实现。该 crate 目前不依赖 `dogpaddle-store`；具体 Data
-布局、事务适配和执行结果协议会随真实 Operation 的状态算法一起确定。
+```rust,no_run
+use dogpaddle_operation::{CountData, CountDefinition, CountOperation};
+use dogpaddle_store::{Cell, DataPlacement, Store};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let mut store = Store::create(root.path().join("store"))?;
+    let count = Cell::new(store.create_data("count", DataPlacement::Shared)?);
+    let operation = CountOperation::new(CountDefinition::new(), CountData::new(count));
+    let mut transactions = store.into_transactions();
+
+    let transaction = transactions.begin()?;
+    let mut count = operation.data().count().access(&transaction)?;
+    assert_eq!(operation.apply(&mut count)?, 1);
+    transaction.commit()?;
+    Ok(())
+}
+```
+
+Operation 业务逻辑不接收、开始、提交或保存 Transaction。未来 Flow 内部的 Stage 负责事务
+边界，从 Operation 持有的 Cell 取得具体 `CellAccess`，再注入 `apply()`。这使 Operation
+保持可测试，同时让状态、输入进度和输出以后能够由 Stage 原子提交。
+
+## 扩展约束
+
+新增 Operation 时应新增自己的 Definition、Data 和实例类型，再显式加入
+`OperationDefinition`、稳定 tag、输入数量分发以及 Flow 的穷尽物化分支。Data 类型表达该
+算子的具体状态形状；Flow 分支负责按这一形状创建或打开全部命名资源并注入构造函数。不要
+增加通用 Data bundle、字符串 Registry、factory 或让 Definition 持有 `DataHandle`。
+
+`OperationDefinition` 刻意保持可穷尽，使新增变体时编译器强制 `dogpaddle-flow` 同步补齐
+资源布局和物化。两个 crate 因此必须锁步升级；新增变体属于协调的 API 兼容性变更。已发布
+的格式版本和 tag 必须继续可读，不能通过简单覆盖 V1 decoder 来升级。修改已有 tag、字段
+编码或状态资源布局都需要迁移设计。
+
+## 验证
+
+```bash
+cargo test -p dogpaddle-operation
+cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
+cargo doc -p dogpaddle-operation --no-deps
+```

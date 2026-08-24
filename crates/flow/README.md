@@ -1,36 +1,76 @@
 # dogpaddle-flow
 
-`dogpaddle-flow` 是 `DogPaddle` 的 `Flow` 定义与运行容器。`Stage` 是该 crate 内部的通用
-执行单元：一个 `Stage` 只承载一个 `Operation`，`Stage` 内部不再维护额外的算子图。
+`dogpaddle-flow` 负责定义、构建和重新打开一条持久化 Flow。Stage 是 crate 内部的一对一
+Operation 容器；一个 Stage 只有一个强类型 Definition，不再维护额外的算子图。
 
-## 当前实现
+## 构建 Flow
 
-当前只实现私有、无副作用的拓扑内核，尚未公开 `Flow` API。内核负责：
+Builder 阶段是纯声明：`stage()` 返回仅属于当前 Builder 的临时 `StageRef`，`connect()`
+记录目标 Stage 完整、有序的输入列表。只有 `build()` 才集中校验拓扑并创建 Store。
 
-- 使用稳定 `Stage` ID 描述节点身份；
-- 将 `Builder` 中的临时 `Stage` 引用解析为有序的上游 `Stage` ID；
-- 保留多元 `Operation` 的输入顺序；
-- 根据具体 Definition 声明的输入数量执行精确校验；
-- 校验重复 ID、外来引用、重复连接、自环和多节点环；
-- 允许扇出、重复上游和互不相连的 DAG 分量。
+```rust,no_run
+use dogpaddle_flow::Flow;
+use dogpaddle_operation::{CountDefinition, SequenceSourceDefinition};
 
-拓扑 `Builder` 不接收路径，不访问 `Store`，也不会创建任何文件。没有上游的 `Stage` 只有
-在其 Definition 声明零输入时才合法；一元、二元和 N 元 Definition 必须获得恰好对应数量
-的有序上游。
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("flow");
+    let mut builder = Flow::builder(&path);
+    let source = builder.stage("source", SequenceSourceDefinition::new(0));
+    let count = builder.stage("count", CountDefinition::new());
+    builder.connect([source], count);
 
-## 后续边界
+    let flow = builder.build()?;
+    assert_eq!(flow.stage_ids().collect::<Vec<_>>(), ["source", "count"]);
+    drop(flow);
 
-持久化 `build` 和 `open` 只会在第一个真实 `Operation Definition`、完整数据资源布局和稳定
-磁盘编码确定后一起实现。物化时，`Flow` 负责编排同一 `Store` 的生命周期和 Stage 资源
-作用域；具体 Operation 模块决定自己的 Data 布局并构造实例。该过程不使用通用 Data bundle
-或运行时 Registry。全部资源声明完成后，`Flow` 才会实例化内部 `Stage` 并消费 `Store` 进入
-只能运行事务的冻结状态。本 crate 当前没有 `run`、调度、检查点、背压、恢复状态或最终用户
-入口。
+    let reopened = Flow::open(&path)?;
+    assert_eq!(reopened.stage_count(), 2);
+    Ok(())
+}
+```
+
+Stage ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。连接保留 source 顺序，允许
+fan-out 和重复 source；输入数量必须与具体 Definition 完全一致，整个拓扑必须是 DAG。
+拓扑校验或 manifest 编码失败不会创建目标目录。
+
+## 持久化边界
+
+每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
+持久化 state map，并声明该 Operation 的全部状态空间，最后提交 manifest Cell 作为构建
+完成标记。Flow state map 保留生命周期状态；Stage state map 是未来队列、进度和输出协议
+的唯一持久化容器。后续运行层只能在这些 map 的键域内写状态，不能新增数据空间。此后
+Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
+
+Store 目录和 catalog 已有效、但 manifest 尚未提交时，`Flow::open()` 返回 `IncompleteBuild`；
+manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
+留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
+
+`open()` 分两遍完成：第一遍只读取、解码并重新校验 manifest；第二遍按持久化定义打开全部
+资源、物化 Stage，再冻结 Store。调用方不需要重新提交 Definition。
+
+当前磁盘格式使用显式 magic、版本号、定长整数、闭合 Operation tag 和 IEEE `CRC32` 完整性
+校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
+
+- Flow manifest：`flow/definition`
+- Flow 状态：`flow/state`
+- Stage 状态：`stage/{index:08x}/state`
+- `SequenceSource` 位置：`stage/{index:08x}/operation/sequence_source.position`
+- Count 状态：`stage/{index:08x}/operation/count`
+
+`index` 是 Stage 声明顺序。修改编码、tag 或资源名必须作为磁盘格式变更处理并补充迁移设计。
+
+## 当前边界
+
+本阶段只完成定义、持久化 `build` 和无 Definition 参数的 `open`。尚未实现 `run`、Stage
+调度、Stage state map 的键协议、输入进度、输出发布、背压、中断或运行恢复；
+`SequenceSource` 只是第一个真实零输入 Definition，用于形成可构建的
+`SequenceSource → Count` DAG，并不代表调度器已经存在。
 
 ## 验证
 
 ```bash
 cargo test -p dogpaddle-flow
-cargo clippy -p dogpaddle-flow --all-targets -- -D warnings
+cargo clippy -p dogpaddle-flow --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-flow --no-deps
 ```

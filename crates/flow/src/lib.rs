@@ -1,7 +1,10 @@
 #![doc = include_str!("../README.md")]
 
-#[expect(
-    dead_code,
-    reason = "the private topology core will be wired into the durable Flow builder"
-)]
+mod error;
+mod flow;
+mod manifest;
 mod topology;
+
+pub use error::{FlowDefinitionError, FlowError};
+pub use flow::{Flow, FlowBuilder};
+pub use topology::{InvalidStageIdReason, StageRef, TopologyError};

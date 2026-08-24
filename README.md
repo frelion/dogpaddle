@@ -1,49 +1,53 @@
 # DogPaddle
 
-DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它面向需要长期运行和可靠
-恢复的数据流，将计算定义、操作状态和执行进度保存在本地事务存储中。
+DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它面向需要长期运行、可靠恢复且
+不希望部署独立分布式系统的数据流，把静态计算拓扑和算子状态放在同一个本地事务存储中。
 
-## DogPaddle 解决什么问题
+## 产品定位
 
-需要长期运行的数据流不仅要完成计算，还要处理进程崩溃、重复执行、上下游速度不一致和
-多份状态的一致性。DogPaddle 将一次 Stage 转换作为一个原子事务：操作状态、检查点、
-输出和消费进度要么一起提交，要么一起回滚。业务操作因此可以专注于领域逻辑，而不必
-分别协调状态存储、恢复位置和调度进度。
+流计算不仅要描述“数据如何转换”，还要明确拓扑何时冻结、状态如何保存，以及进程重启后
+如何重新获得同一组计算资源。DogPaddle 将 Flow 分成两个阶段：构建阶段声明完整 DAG 和
+所有持久化数据空间；构建成功后拓扑与资源布局不可变，只保留运行所需的事务能力。
 
-## 设计目标
+## 已有能力
 
-- **持久化静态 DAG**：构建成功时保存完整定义，此后冻结拓扑和数据空间。
-- **原子状态转换**：一次计算推进在同一 Store 事务中提交相关运行状态。
-- **崩溃恢复**：重新打开后从最后一次已提交的位置继续运行。
-- **持续执行**：暂时没有输入不是完成状态，Flow 会等待后续数据。
-- **职责分层**：Flow、Stage、Operation 与 Store 各自维护明确的抽象边界。
+- **强类型静态 DAG**：具体 Operation Definition 声明输入数量，Flow 校验有序连接、唯一
+  Stage ID、自环和多节点环。
+- **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
+  标记最后提交。
+- **直接重新打开**：`Flow::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
+  调用方不需要再次组装。
+- **稳定格式边界**：Flow 与 Operation Definition 使用显式版本、tag、完整性校验和确定性
+  资源命名，不依赖 Rust 内存布局。
+- **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
+  二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
 
-## 内部 crate 架构
+## 内部架构
 
 | crate | 职责 |
 | --- | --- |
-| [`dogpaddle-flow`](crates/flow/README.md) | Flow 拓扑与生命周期，以及内部 Stage 运行时；当前已实现输入数感知的私有拓扑内核。 |
-| [`dogpaddle-operation`](crates/operation/README.md) | 具体 Operation 的强类型定义、状态和执行语义；当前已确定 Definition 与物化边界。 |
-| [`dogpaddle-store`](crates/store/README.md) | 提供 MDBX 支持的事务存储、命名数据空间、编解码器和类型化集合。 |
+| [`dogpaddle-flow`](crates/flow/README.md) | Flow Builder、拓扑校验、持久化 `build/open`，以及未来的内部 Stage 运行时。 |
+| [`dogpaddle-operation`](crates/operation/README.md) | 具体 Operation 的纯 Definition、稳定编码、持久化 Data 与实例。 |
+| [`dogpaddle-store`](crates/store/README.md) | MDBX 事务存储、命名数据空间、编解码器和类型化集合。 |
 
-这些 crate 是引擎内核的实现模块，不是最终面向用户的产品入口。
+Stage 是 Flow 内部的一对一 Operation 执行单元，不是独立 crate。上述 crate 是引擎内核的
+实现模块，不是最终用户二进制入口。
 
 ## 适用场景
 
-DogPaddle 面向需要本地持久化和确定恢复边界的数据处理任务，例如嵌入式数据管道、
-可恢复的多阶段任务，以及需要在同一事务中更新多份操作状态的处理流程。
+DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及需要把多份计算状态放进明确
+事务边界的长期任务。静态 DAG 和单 Store 所有权尤其适合“先完整定义，再持续执行”的工作负载。
 
-## 当前能力边界
+## 当前边界
 
-- 当前仓库包含 Store 实现、Flow 的私有拓扑内核和 Operation 层边界，尚无可运行的
-  流引擎或最终用户二进制。
-- Stage 是 Flow 内部的一对一 Operation 运行容器，不是独立的公共模块。
-- 持久化构建、重新打开和持续运行尚未实现；当前设计目标不代表已有公共 API。
-- SQL、连接器、高层 API 和分布式调度不属于当前内核。
+当前仓库完成了 Flow 的持久化定义、构建和重新打开，尚未实现 `run`、Stage 调度、边队列、
+背压、中断续跑或输出提交，因此还不是可执行的流引擎。仓库也没有最终用户二进制、SQL、
+连接器或分布式调度。一个 Store 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等
+协议将在运行层设计时确定。
 
 ## 深入阅读
 
-- [Flow 内核设计与用法](crates/flow/README.md)
-- [Operation 层职责](crates/operation/README.md)
+- [Flow 构建、磁盘布局与当前边界](crates/flow/README.md)
+- [Operation Definition 与实例约束](crates/operation/README.md)
 - [Store 存储语义、测试与性能](crates/store/README.md)
 - [仓库贡献指南](AGENTS.md)

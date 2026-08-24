@@ -12,6 +12,7 @@ libmdbx = { version = "=0.6.6", default-features = false }
 thiserror = "=2.0.20"
 tempfile = "=3.27.0"
 dogpaddle-store = { path = "crates/store" }
+dogpaddle-operation = { path = "crates/operation" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

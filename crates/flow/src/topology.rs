@@ -3,17 +3,30 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use dogpaddle_operation::OperationDefinition;
+use thiserror::Error;
+
 static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) trait InputCount {
     fn input_count(&self) -> usize;
 }
 
+impl InputCount for OperationDefinition {
+    fn input_count(&self) -> usize {
+        OperationDefinition::input_count(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StageId(String);
 
+/// Temporary reference to a stage declared in one [`FlowBuilder`](crate::FlowBuilder).
+///
+/// A reference is valid only while assembling the builder that created it. The
+/// durable Flow definition stores stable stage IDs instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct StageRef {
+pub struct StageRef {
     builder_token: u64,
     index: usize,
 }
@@ -50,28 +63,56 @@ pub(crate) struct TopologyBuilder<D> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InvalidStageIdReason {
+#[non_exhaustive]
+pub enum InvalidStageIdReason {
+    /// The stage ID is empty.
     Empty,
+    /// The stage ID contains a NUL character.
     ContainsNul,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum TopologyError {
+/// Failure while validating a Flow's static topology.
+#[derive(Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum TopologyError {
+    /// A Flow must contain at least one stage.
+    #[error("a flow must contain at least one stage")]
     EmptyTopology,
+    /// A stage ID violates the stable identity rules.
+    #[error("invalid stage ID {id:?}: {reason:?}")]
     InvalidStageId {
+        /// The rejected ID.
         id: String,
+        /// Why the ID was rejected.
         reason: InvalidStageIdReason,
     },
+    /// Two stages declared the same stable ID.
+    #[error("duplicate stage ID {0:?}")]
     DuplicateStageId(String),
+    /// A connection used a reference created by another builder.
+    #[error("stage reference belongs to another flow builder")]
     ForeignStageRef(StageRef),
+    /// `connect` was called without any sources.
+    #[error("stage {0:?} was connected with an empty source list")]
     EmptySources(String),
+    /// A target's complete source list was declared more than once.
+    #[error("sources for stage {0:?} were already set")]
     SourcesAlreadySet(String),
+    /// A stage directly references itself.
+    #[error("stage {0:?} directly references itself")]
     SelfLoop(String),
+    /// The number of connected sources does not match the operation definition.
+    #[error("stage {stage:?} requires {expected} sources but received {actual}")]
     InputCount {
+        /// The stage whose arity did not match.
         stage: String,
+        /// Required source count.
         expected: usize,
+        /// Connected source count.
         actual: usize,
     },
+    /// The topology contains an indirect cycle.
+    #[error("flow topology contains a cycle")]
     Cycle,
 }
 
@@ -80,8 +121,28 @@ impl StageId {
         Self(id)
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<D> StageDefinition<D> {
+    pub(crate) fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    pub(crate) const fn operation(&self) -> &D {
+        &self.operation
+    }
+
+    pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.sources.iter().map(StageId::as_str)
+    }
+}
+
+impl<D> Topology<D> {
+    pub(crate) fn stages(&self) -> &[StageDefinition<D>] {
+        &self.stages
     }
 }
 
@@ -117,6 +178,10 @@ impl<D> TopologyBuilder<D> {
             target,
         });
         self
+    }
+
+    pub(crate) fn validate_stage_ids(&self) -> Result<(), TopologyError> {
+        validate_stage_ids(&self.stages)
     }
 }
 
@@ -284,6 +349,8 @@ fn validate_acyclic(
 
 #[cfg(test)]
 mod tests {
+    use dogpaddle_operation::{CountDefinition, OperationDefinition};
+
     use super::{
         InputCount, InvalidStageIdReason, StageDefinition, StageRef, Topology, TopologyBuilder,
         TopologyError,
@@ -561,5 +628,20 @@ mod tests {
         builder.connect([right], left);
 
         assert_eq!(builder.finish().unwrap_err(), TopologyError::Cycle);
+    }
+
+    #[test]
+    fn finish_uses_the_closed_operation_definition_input_count() {
+        let mut builder = TopologyBuilder::<OperationDefinition>::new();
+        builder.stage("count", CountDefinition::new().into());
+
+        assert_eq!(
+            builder.finish().unwrap_err(),
+            TopologyError::InputCount {
+                stage: "count".to_owned(),
+                expected: 1,
+                actual: 0,
+            }
+        );
     }
 }
