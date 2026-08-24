@@ -1,4 +1,4 @@
-//! A small transactional key/value store with composable typed collections.
+#![doc = include_str!("../README.md")]
 
 mod codec;
 mod collections;

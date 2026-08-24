@@ -1,134 +1,55 @@
 # DogPaddle
 
-DogPaddle is built around three execution concepts:
+DogPaddle 是一个用 Rust 实现的嵌入式、持久化流计算引擎。它将计算拓扑、操作状态、
+检查点、输入输出进度和调度进度统一保存在本地事务存储中，使数据流在进程退出后仍能从
+一致的位置继续执行。
 
-- `Flow` owns a durable static DAG and fair scheduling;
-- `Stage` owns one operation and one atomic execution boundary;
-- `Operation` owns domain semantics; its durable state lives only in injected
-  Store collections or its checkpoint.
+## DogPaddle 解决什么问题
 
-Each successful Stage transition commits operation state, checkpoint, output,
-input progress, and scheduler progress in one Store transaction. `Pending`
-rolls the attempt back. Outputs are bounded to one retained block per edge, so
-a slow fan-out consumer applies backpressure without an unbounded spool.
+需要长期运行的数据流不仅要完成计算，还要处理进程崩溃、重复执行、上下游速度不一致和
+多份状态的一致性。DogPaddle 将一次 Stage 转换作为一个原子事务：操作状态、检查点、
+输出和消费进度要么一起提交，要么一起回滚。业务操作因此可以专注于领域逻辑，而不必
+分别协调状态存储、恢复位置和调度进度。
 
-The `dogpaddle-flow` crate contains only these runtime responsibilities. SQL,
-connectors, and higher-level APIs belong in separate crates implemented as
-operations. External effects are outside the Store transaction and require a
-stable idempotency key when crash retries must not duplicate them.
+## 核心能力
 
-## Store
+- **持久化静态 DAG**：`Flow` 保存固定的数据流拓扑，并在重新打开时校验声明是否一致。
+- **原子状态转换**：每次成功的 `Stage` 执行在同一 Store 事务中提交全部运行状态。
+- **崩溃恢复**：重新声明相同的数据、拓扑和操作指纹后，可从已提交进度继续执行。
+- **公平调度**：持久化的轮转调度进度避免单个 Stage 长期独占执行机会。
+- **有界背压**：每条边最多保留一个待消费输出块；扇出会等待最慢的消费者。
+- **可组合状态**：`Operation` 可通过检查点或注入的类型化集合维护持久化状态。
 
-`dogpaddle-store` separates provisioning from runtime access:
+## 工作原理
 
-- `Store` creates and opens named data, then is consumed before runtime;
-- `Transactions` is the sole runtime capability for beginning transactions;
-- `DataHandle` is one named encoded key/value namespace;
-- `Transaction` owns one atomic commit boundary and rolls back on drop;
-- transaction-bound access values perform the actual data operations.
+一个 `Flow` 由若干 `Stage` 及其连接关系组成，每个 Stage 持有一个 `Operation`。
+调度器每次选择一个可推进的 Stage，并在事务中执行一次尝试。成功结果会原子提交操作
+状态、检查点、输出、输入游标和下一调度位置；`Pending` 或错误则不会留下部分状态。
+已经提交的输出不会因后续尝试失败而失效。
 
-Typed data structures live in `collections/` and compose the generic handle.
-They own their codecs and semantics; the transaction does not know about
-`Cell` and `OrderedMap`.
+## 内部 crate 架构
 
-The durable catalog binds a name to an encoded key/value namespace and its
-physical placement. It does not record or validate a collection type or codec.
-Code reopening a data handle must use the same collection and codecs that
-wrote its contents.
+| crate | 职责 |
+| --- | --- |
+| [`dogpaddle-flow`](crates/flow/README.md) | 实现 DAG 声明、Stage 调度、Operation 执行、检查点、恢复和背压。 |
+| [`dogpaddle-store`](crates/store/README.md) | 提供 MDBX 支持的事务存储、命名数据空间、编解码器和类型化集合。 |
 
-`DataPlacement::Shared` suits numerous small or commit-heavy namespaces that
-share the main B+Tree. `DataPlacement::Dedicated` gives a hot or bulk-oriented
-namespace its own MDBX named table. Placement is chosen once during
-provisioning, persisted in the catalog, and invisible to the collection API;
-the benchmark below should guide the choice for a concrete workload. One Store
-supports up to `Store::DEDICATED_CAPACITY` dedicated namespaces.
+这两个 crate 是当前引擎内核的实现模块，不是最终面向用户的产品入口。
 
-```rust
-use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store};
-use dogpaddle_store::DataPlacement::{Dedicated, Shared};
+## 适用场景
 
-# fn example(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-let mut store = Store::create(path)?;
-let counter_data = store.create_data("counter", Shared)?;
-let users_data = store.create_data("users", Dedicated)?;
-let counter = Cell::<u64>::new(counter_data);
-let users = OrderedMap::<u64, String>::new(users_data);
+DogPaddle 当前的引擎内核适合需要本地持久化和确定恢复边界的数据处理任务，例如嵌入式
+数据管道、可恢复的多阶段任务，以及需要在同一事务中更新多份操作状态的处理流程。
 
-let mut transactions = store.into_transactions();
+## 当前能力边界
 
-let transaction = transactions.begin()?;
-{
-    let mut counter = counter.access(&transaction)?;
-    let mut users = users.access(&transaction)?;
+- 当前仓库只包含引擎内核，尚未包含最终面向用户的二进制入口。
+- 执行拓扑是静态 DAG；一个 Store 路径同一时间只能由一个活动的 `Flow` 执行器打开。
+- SQL、连接器、高层 API 和分布式调度不属于当前内核。
+- 外部副作用位于 Store 事务之外；崩溃重试不能重复执行时，操作必须使用稳定的幂等键。
 
-    counter.set(&1)?;
-    users.put(&42, &"Shiba".to_owned())?;
-}
-transaction.commit()?;
+## 深入阅读
 
-let transaction = transactions.begin()?;
-let counter = counter.access(&transaction)?;
-let users = users.access(&transaction)?;
-assert_eq!(counter.get()?, Some(1));
-assert_eq!(users.get(&42)?.as_deref(), Some("Shiba"));
-
-let batch = users.scan(
-    ..,
-    ScanDirection::Descending,
-    None,
-    ScanLimit::new(100, 1024 * 1024)?,
-)?;
-assert_eq!(batch.items, vec![(42, "Shiba".to_owned())]);
-# Ok(())
-# }
-```
-
-Dropping a transaction rolls it back. `Transaction` has no explicit abort
-method and no collection-specific operations. Reads and writes through all access
-values share the same transaction snapshot, so any number of data objects
-commit atomically. The MDBX adapter and physical layout are private.
-
-`DataHandle::access` yields the complete collection-building surface: point
-reads, writes, deletes, and bounded ordered scans in either direction. A scan
-returns owned items and an optional exclusive continuation key. Reuse the same
-range and direction with that key for the next batch. Built-in collections
-perform their codecs through the same transaction poison boundary. A custom
-collection uses `DataAccess::poison_on_error` for hard codec or invariant
-failures; raw storage failures are classified automatically.
-
-Access values are attempt-local capabilities: bind them again for every new
-transaction and never cache them across Stage steps.
-
-## Tests
-
-Architecture and collection behavior are separate integration targets:
-
-```bash
-cargo test -p dogpaddle-store --test architecture
-cargo test -p dogpaddle-store --test collections
-```
-
-Individual areas remain directly filterable, for example:
-
-```bash
-cargo test -p dogpaddle-store --test architecture transaction::
-cargo test -p dogpaddle-store --test collections scan::
-```
-
-## Performance
-
-Run the release benchmark with:
-
-```bash
-cargo bench -p dogpaddle-store --bench store
-```
-
-It reports paired `Shared`/`Dedicated` samples for raw and typed bulk writes,
-point reads, ascending and descending scans, durable overwrites, Stage-shaped
-multi-collection transactions, and warmed reads with multiple shared
-background namespaces. Results include min/median/max; they describe this
-machine and temporary filesystem, not cold-cache or power-loss behavior.
-Workload sizes can be changed with `DOGPADDLE_BENCH_ENTRIES`,
-`DOGPADDLE_BENCH_COMMITS`, `DOGPADDLE_BENCH_SAMPLES`, and
-`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`. `DOGPADDLE_BENCH_SCAN_ITEMS`
-controls the number of entries admitted per scan batch.
+- [Flow 内核设计与用法](crates/flow/README.md)
+- [Store 存储语义、测试与性能](crates/store/README.md)
+- [仓库贡献指南](AGENTS.md)
