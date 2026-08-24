@@ -1,5 +1,7 @@
 use std::{
+    collections::HashSet,
     fs,
+    io::ErrorKind,
     path::Path,
     sync::{
         Arc,
@@ -95,9 +97,7 @@ impl Store {
     /// Returns an error when the store is missing or corrupt.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        if !path.is_dir() || !path.join(MDBX_DATA_FILE).is_file() {
-            return Err(StoreError::StoreNotFound(path.to_path_buf()));
-        }
+        validate_store_path(path)?;
         let database = open_database(path)?;
         let transaction = database
             .begin_ro_txn()
@@ -116,14 +116,16 @@ impl Store {
             .get::<Vec<u8>>(&table, NEXT_ID_KEY)
             .map_err(|error| StoreError::storage("read store counter", error))?
             .ok_or(StoreError::InvalidStore)?;
-        decode_u32(&next_id)?;
+        let next_id = decode_u32(&next_id)?;
         let next_dedicated = transaction
             .get::<Vec<u8>>(&table, NEXT_DEDICATED_KEY)
             .map_err(|error| StoreError::storage("read dedicated table counter", error))?
             .ok_or(StoreError::InvalidStore)?;
-        if decode_u32(&next_dedicated)? > MAX_DEDICATED_TABLES {
+        let next_dedicated = decode_u32(&next_dedicated)?;
+        if next_dedicated > MAX_DEDICATED_TABLES {
             return Err(StoreError::InvalidStore);
         }
+        validate_catalog(&transaction, &table, next_id, next_dedicated)?;
         drop(transaction);
         Ok(Self {
             database,
@@ -255,6 +257,87 @@ fn open_database(path: &Path) -> Result<Database<NoWriteMap>, StoreError> {
         },
     )
     .map_err(|error| StoreError::storage("open MDBX environment", error))
+}
+
+fn validate_store_path(path: &Path) -> Result<(), StoreError> {
+    let directory = metadata(path, path, "inspect store directory")?;
+    if !directory.is_dir() {
+        return Err(StoreError::StoreNotFound(path.to_path_buf()));
+    }
+
+    let data_file = metadata(&path.join(MDBX_DATA_FILE), path, "inspect store data file")?;
+    if !data_file.is_file() {
+        return Err(StoreError::StoreNotFound(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn metadata(
+    target: &Path,
+    store_path: &Path,
+    operation: &'static str,
+) -> Result<fs::Metadata, StoreError> {
+    fs::metadata(target).map_err(|error| {
+        if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
+            StoreError::StoreNotFound(store_path.to_path_buf())
+        } else {
+            StoreError::storage(operation, error)
+        }
+    })
+}
+
+fn validate_catalog(
+    transaction: &libmdbx::Transaction<'_, libmdbx::RO, NoWriteMap>,
+    table: &libmdbx::Table<'_>,
+    next_id: u32,
+    next_dedicated: u32,
+) -> Result<(), StoreError> {
+    let mut cursor = transaction
+        .cursor(table)
+        .map_err(|error| StoreError::storage("open data catalog cursor", error))?;
+    let mut shared_ids = HashSet::new();
+    let mut dedicated_ids = HashSet::new();
+    let mut entry = cursor
+        .set_range::<Vec<u8>, Vec<u8>>(&[CATALOG_DOMAIN])
+        .map_err(|error| StoreError::storage("seek data catalog", error))?;
+
+    while let Some((key, binding)) = entry {
+        let [domain, name @ ..] = key.as_slice() else {
+            return Err(StoreError::InvalidStore);
+        };
+        if *domain != CATALOG_DOMAIN {
+            break;
+        }
+        let name = std::str::from_utf8(name).map_err(|_| StoreError::InvalidStore)?;
+        validate_name(name).map_err(|_| StoreError::InvalidStore)?;
+
+        let unique_and_allocated = match decode_binding(&binding)? {
+            DataLocation::Shared(id) => id < next_id && shared_ids.insert(id),
+            DataLocation::Dedicated(id) => id < next_dedicated && dedicated_ids.insert(id),
+        };
+        if !unique_and_allocated {
+            return Err(StoreError::InvalidStore);
+        }
+
+        entry = cursor
+            .next::<Vec<u8>, Vec<u8>>()
+            .map_err(|error| StoreError::storage("scan data catalog", error))?;
+    }
+
+    let shared_count = u32::try_from(shared_ids.len()).map_err(|_| StoreError::InvalidStore)?;
+    let dedicated_count =
+        u32::try_from(dedicated_ids.len()).map_err(|_| StoreError::InvalidStore)?;
+    if shared_count != next_id || dedicated_count != next_dedicated {
+        return Err(StoreError::InvalidStore);
+    }
+    drop(cursor);
+
+    for id in dedicated_ids {
+        transaction
+            .open_table(Some(&dedicated_table_name(id)))
+            .map_err(|_| StoreError::InvalidStore)?;
+    }
+    Ok(())
 }
 
 fn fresh_token() -> u64 {

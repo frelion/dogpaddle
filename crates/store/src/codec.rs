@@ -200,6 +200,22 @@ mod tests {
 
     use super::{StoreKey, StoreValue};
 
+    fn assert_value_bytes<T>(value: &T, expected: &[u8])
+    where
+        T: StoreValue + Debug + Eq,
+    {
+        assert_eq!(value.encode_value().unwrap().as_ref(), expected);
+        assert_eq!(&T::decode_value(expected.to_vec()).unwrap(), value);
+    }
+
+    fn assert_key_bytes<T>(value: &T, expected: &[u8])
+    where
+        T: StoreKey + Debug + Eq,
+    {
+        assert_eq!(value.encode_key().unwrap().as_ref(), expected);
+        assert_eq!(&T::decode_key(expected.to_vec()).unwrap(), value);
+    }
+
     fn assert_key_codec<T>(values: &[T])
     where
         T: StoreKey + Debug + Eq,
@@ -236,22 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn values_round_trip() {
-        for value in [false, true] {
-            assert_eq!(
-                bool::decode_value(value.encode_value().unwrap().as_ref().to_vec()).unwrap(),
-                value
-            );
-        }
-        assert_eq!(
-            <()>::decode_value(().encode_value().unwrap().as_ref().to_vec()).unwrap(),
-            ()
-        );
-        let text = "Shiba 柴犬".to_owned();
-        assert_eq!(
-            String::decode_value(text.encode_value().unwrap().as_ref().to_vec()).unwrap(),
-            text
-        );
+    fn primitive_values_have_stable_encodings() {
+        assert_value_bytes(&0x0102_0304_u32, &[1, 2, 3, 4]);
+        assert_value_bytes(&0x0102_0304_0506_0708_u64, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_value_bytes(&-2_i64, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe]);
+        assert_value_bytes(&false, &[0]);
+        assert_value_bytes(&true, &[1]);
+        assert_value_bytes(&(), &[]);
+        assert_value_bytes(&"Shiba 柴犬".to_owned(), "Shiba 柴犬".as_bytes());
+    }
+
+    #[test]
+    fn primitive_keys_have_stable_ordered_encodings() {
+        assert_key_bytes(&0x0102_0304_u32, &[1, 2, 3, 4]);
+        assert_key_bytes(&0x0102_0304_0506_0708_u64, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_key_bytes(&-2_i64, &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe]);
     }
 
     #[test]

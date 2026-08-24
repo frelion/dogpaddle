@@ -1,6 +1,6 @@
 # dogpaddle-store
 
-`dogpaddle-store` 是 DogPaddle 内部的事务状态层。它基于 MDBX 提供命名键值空间、
+`dogpaddle-store` 是 `DogPaddle` 内部的事务状态层。它基于 MDBX 提供命名键值空间、
 原子事务、编解码器和类型化集合，为 Flow 的运行进度与 Operation 状态提供统一的持久化
 边界。该 crate 是引擎实现模块，不是最终面向用户的存储产品。
 
@@ -21,6 +21,9 @@
 
 持久化目录将名称绑定到经过编码的键值命名空间及其物理放置方式。它不记录或验证集合
 类型与编解码器。重新打开数据句柄时，必须使用与写入内容时相同的集合和编解码器。
+`Store::open` 会验证目录标记、分配计数、catalog 名称与 binding 的唯一性和范围，并确认
+所有已声明 Dedicated 表存在；这些元数据不变量不一致时返回 `InvalidStore`，不会让两个
+逻辑命名空间静默绑定到同一物理位置。
 
 `DataPlacement::Shared` 适合数量较多、规模较小或频繁提交的命名空间，它们共享主
 B+Tree。`DataPlacement::Dedicated` 为热点或面向批处理的命名空间分配独立的 MDBX

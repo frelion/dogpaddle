@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use dogpaddle_operation::OperationDefinition;
 use thiserror::Error;
 
@@ -145,31 +147,34 @@ fn validate_definition(
     stages: Vec<StageDefinition>,
 ) -> Result<FlowDefinition, FlowDefinitionError> {
     validate_stage_ids(&stages)?;
-    let ids = stages
-        .iter()
-        .map(|stage| stage.id.as_str())
-        .collect::<Vec<_>>();
-    let sources_by_target = stages
-        .iter()
-        .map(|stage| {
-            if stage.sources.is_empty() {
-                return Ok(None);
-            }
-            stage
-                .sources
-                .iter()
-                .map(|source| {
-                    ids.iter().position(|id| id == source).ok_or_else(|| {
-                        FlowDefinitionError::UnknownSource {
-                            stage: stage.id.clone(),
-                            source_id: source.clone(),
-                        }
+    let sources_by_target = {
+        let ids = stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| (stage.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        stages
+            .iter()
+            .map(|stage| {
+                if stage.sources.is_empty() {
+                    return Ok(None);
+                }
+                stage
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        ids.get(source.as_str()).copied().ok_or_else(|| {
+                            FlowDefinitionError::UnknownSource {
+                                stage: stage.id.clone(),
+                                source_id: source.clone(),
+                            }
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     validate_decoded_definition(&stages, &sources_by_target)?;
     Ok(FlowDefinition::new(stages))
 }

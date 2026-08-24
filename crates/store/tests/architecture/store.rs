@@ -98,7 +98,7 @@ fn opening_rejects_an_invalid_store_marker() {
 }
 
 #[test]
-fn opening_data_rejects_a_corrupt_catalog_binding() {
+fn opening_rejects_a_corrupt_catalog_binding() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
@@ -116,9 +116,72 @@ fn opening_data_rejects_a_corrupt_catalog_binding() {
     assert!(!transaction.commit().unwrap());
     drop(database);
 
-    let store = Store::open(&path).unwrap();
+    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
+}
+
+#[test]
+fn opening_rejects_duplicate_physical_catalog_bindings() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    store.create_data("left", DataPlacement::Shared).unwrap();
+    store.create_data("right", DataPlacement::Shared).unwrap();
+    drop(store);
+
+    let database = raw_database(&path);
+    let transaction = database.begin_rw_txn().unwrap();
+    let table = transaction.open_table(None).unwrap();
+    let mut right_catalog_key = vec![2];
+    right_catalog_key.extend_from_slice(b"right");
+    transaction
+        .put(
+            &table,
+            &right_catalog_key,
+            [0, 0, 0, 0, 0],
+            WriteFlags::UPSERT,
+        )
+        .unwrap();
+    assert!(!transaction.commit().unwrap());
+    drop(database);
+
+    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
+}
+
+#[test]
+fn opening_rejects_a_catalog_counter_behind_its_bindings() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    store.create_data("zero", DataPlacement::Shared).unwrap();
+    store.create_data("one", DataPlacement::Shared).unwrap();
+    drop(store);
+
+    let database = raw_database(&path);
+    let transaction = database.begin_rw_txn().unwrap();
+    let table = transaction.open_table(None).unwrap();
+    transaction
+        .put(&table, [1], 1_u32.to_be_bytes(), WriteFlags::UPSERT)
+        .unwrap();
+    assert!(!transaction.commit().unwrap());
+    drop(database);
+
+    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_preserves_non_not_found_metadata_errors() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    symlink("store", &path).unwrap();
+
     assert!(matches!(
-        store.open_data("data"),
-        Err(StoreError::InvalidStore)
+        Store::open(&path),
+        Err(StoreError::Storage {
+            operation: "inspect store directory",
+            ..
+        })
     ));
 }

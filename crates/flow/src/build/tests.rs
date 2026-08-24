@@ -329,6 +329,25 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
 }
 
 #[test]
+fn decoder_round_trips_a_large_chain() {
+    const STAGE_COUNT: usize = 4_096;
+
+    let mut builder = builder();
+    let mut previous = builder.stage("stage-0000", source(0));
+    for index in 1..STAGE_COUNT {
+        let current = builder.stage(format!("stage-{index:04}"), count());
+        builder.connect([previous], current);
+        previous = current;
+    }
+    let encoded = encode(&builder.finish_definition().unwrap()).unwrap();
+
+    let decoded = decode(&encoded).unwrap();
+
+    assert_eq!(decoded.stages().len(), STAGE_COUNT);
+    assert_eq!(encode(&decoded).unwrap(), encoded);
+}
+
+#[test]
 fn decoder_rejects_truncation_and_trailing_bytes() {
     let encoded = encode(&codec_definition()).unwrap();
     let payload_end = encoded.len() - CHECKSUM_LENGTH;
