@@ -2,7 +2,7 @@
 
 ## 项目结构与模块组织
 
-DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按职责拆分：`flow.rs` 处理生命周期，`stage.rs` 负责单个 Stage 及其 Operation 的资源物化，`topology.rs` 只处理纯图模型，`format.rs` 维护磁盘编码和稳定资源名。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
+DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按生命周期拆分：`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、纯校验和稳定编码；`flow/` 只处理已构建 Flow 的打开与生命周期；`stage/` 只处理运行期 Stage 及其 Operation 资源的物化。拓扑是 Flow Definition 的连接关系，不再拥有独立 Builder。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
 
 ## 构建、测试与开发命令
 
@@ -21,7 +21,7 @@ DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品�
 
 ## 测试规范
 
-测试名称应清楚描述行为，例如 `finish_rejects_a_multi_stage_cycle`。私有实现测试放在对应模块旁，公共行为和持久性测试放在所属 crate 的 `tests/` 目录。使用 `tempfile` 创建隔离的临时存储。目前没有硬性覆盖率指标；持久化变更必须覆盖成功构建、纯校验失败无文件副作用、不完整构建、资源布局、稳定编码和重新打开。
+测试名称应清楚描述行为，例如 `finish_rejects_a_multi_stage_cycle`。每个源码模块目录只维护一个 `tests.rs`，其中统一覆盖该目录内模块及子模块的私有实现；不要为单个源码文件再创建同名测试子目录。公共行为和持久性测试放在所属 crate 的 `tests/` 目录。使用 `tempfile` 创建隔离的临时存储。目前没有硬性覆盖率指标；持久化变更必须覆盖成功构建、纯校验失败无文件副作用、不完整构建、资源布局、稳定编码和重新打开。
 
 ## 提交与 Pull Request 规范
 

@@ -1,12 +1,10 @@
 #![doc = include_str!("../README.md")]
 
+mod build;
 mod error;
 mod flow;
-mod format;
 mod stage;
-mod topology;
 
+pub use build::{FlowBuilder, FlowDefinitionError, InvalidStageIdReason, StageRef, TopologyError};
 pub use error::FlowError;
-pub use flow::{Flow, FlowBuilder};
-pub use format::FlowDefinitionError;
-pub use topology::{InvalidStageIdReason, StageRef, TopologyError};
+pub use flow::Flow;

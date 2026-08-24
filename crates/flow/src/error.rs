@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use dogpaddle_store::StoreError;
 
-use crate::{format::FlowDefinitionError, topology::TopologyError};
+use crate::build::{FlowDefinitionError, TopologyError};
 
 /// Failure while building or opening a persistent Flow.
 #[derive(Debug, Error)]

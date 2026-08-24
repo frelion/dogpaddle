@@ -1,53 +1,11 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::{HashSet, VecDeque};
 
-use dogpaddle_operation::OperationDefinition;
 use thiserror::Error;
 
-static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Temporary reference to a stage declared in one [`FlowBuilder`](crate::FlowBuilder).
-///
-/// A reference is valid only while assembling the builder that created it. The
-/// durable Flow definition stores stable stage IDs instead.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StageRef {
-    builder_token: u64,
-    index: usize,
-}
-
-#[derive(Debug)]
-pub(crate) struct StageDefinition {
-    id: String,
-    operation: OperationDefinition,
-    sources: Vec<String>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Topology {
-    stages: Vec<StageDefinition>,
-}
-
-#[derive(Debug)]
-struct PendingStage {
-    id: String,
-    operation: OperationDefinition,
-}
-
-#[derive(Debug)]
-struct PendingConnection {
-    sources: Vec<StageRef>,
-    target: StageRef,
-}
-
-#[derive(Debug)]
-pub(crate) struct TopologyBuilder {
-    token: u64,
-    stages: Vec<PendingStage>,
-    connections: Vec<PendingConnection>,
-}
+use super::{
+    StageRef,
+    definition::{FlowDefinition, StageDefinition},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -103,104 +61,51 @@ pub enum TopologyError {
     Cycle,
 }
 
-impl StageDefinition {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
+pub(super) fn finish_definition(
+    token: u64,
+    mut stages: Vec<StageDefinition>,
+    connections: &[(Vec<StageRef>, StageRef)],
+) -> Result<FlowDefinition, TopologyError> {
+    validate_stage_ids(&stages)?;
+    let mut sources_by_target = validate_connections(token, &stages, connections)?;
+    validate_input_counts(&stages, &sources_by_target)?;
+    validate_acyclic(stages.len(), &sources_by_target)?;
+
+    let stage_ids = stages
+        .iter()
+        .map(|stage| stage.id.clone())
+        .collect::<Vec<_>>();
+    for (index, stage) in stages.iter_mut().enumerate() {
+        stage.sources = sources_by_target[index]
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|source| stage_ids[source].clone())
+            .collect();
     }
 
-    pub(crate) const fn operation(&self) -> &OperationDefinition {
-        &self.operation
-    }
-
-    pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.sources.iter().map(String::as_str)
-    }
+    Ok(FlowDefinition::new(stages))
 }
 
-impl Topology {
-    pub(crate) fn stages(&self) -> &[StageDefinition] {
-        &self.stages
-    }
-}
-
-impl TopologyBuilder {
-    pub(crate) fn new() -> Self {
-        let token = NEXT_BUILDER_TOKEN.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(token, 0, "topology builder token space exhausted");
-        Self {
-            token,
-            stages: Vec::new(),
-            connections: Vec::new(),
+pub(super) fn validate_decoded_definition(
+    stages: &[StageDefinition],
+    sources_by_target: &[Option<Vec<usize>>],
+) -> Result<(), TopologyError> {
+    validate_stage_ids(stages)?;
+    for (target, sources) in sources_by_target.iter().enumerate() {
+        if sources
+            .as_ref()
+            .is_some_and(|sources| sources.contains(&target))
+        {
+            return Err(TopologyError::SelfLoop(stages[target].id.clone()));
         }
     }
-
-    pub(crate) fn stage(
-        &mut self,
-        id: impl Into<String>,
-        operation: OperationDefinition,
-    ) -> StageRef {
-        let reference = StageRef {
-            builder_token: self.token,
-            index: self.stages.len(),
-        };
-        self.stages.push(PendingStage {
-            id: id.into(),
-            operation,
-        });
-        reference
-    }
-
-    pub(crate) fn connect<I>(&mut self, sources: I, target: StageRef) -> &mut Self
-    where
-        I: IntoIterator<Item = StageRef>,
-    {
-        self.connections.push(PendingConnection {
-            sources: sources.into_iter().collect(),
-            target,
-        });
-        self
-    }
-
-    pub(crate) fn validate_stage_ids(&self) -> Result<(), TopologyError> {
-        validate_stage_ids(&self.stages)
-    }
-
-    pub(crate) fn finish(self) -> Result<Topology, TopologyError> {
-        let Self {
-            token,
-            stages,
-            connections,
-        } = self;
-        validate_stage_ids(&stages)?;
-        let mut sources_by_target = validate_connections(token, &stages, &connections)?;
-        validate_input_counts(&stages, &sources_by_target)?;
-        validate_acyclic(stages.len(), &sources_by_target)?;
-
-        let stage_ids = stages
-            .iter()
-            .map(|stage| stage.id.clone())
-            .collect::<Vec<_>>();
-        let stages = stages
-            .into_iter()
-            .enumerate()
-            .map(|(index, stage)| StageDefinition {
-                id: stage_ids[index].clone(),
-                operation: stage.operation,
-                sources: sources_by_target[index]
-                    .take()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|source| stage_ids[source].clone())
-                    .collect(),
-            })
-            .collect();
-
-        Ok(Topology { stages })
-    }
+    validate_input_counts(stages, sources_by_target)?;
+    validate_acyclic(stages.len(), sources_by_target)
 }
 
 fn validate_input_counts(
-    stages: &[PendingStage],
+    stages: &[StageDefinition],
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
     for (stage, sources) in stages.iter().zip(sources_by_target) {
@@ -217,7 +122,7 @@ fn validate_input_counts(
     Ok(())
 }
 
-fn validate_stage_ids(stages: &[PendingStage]) -> Result<(), TopologyError> {
+pub(super) fn validate_stage_ids(stages: &[StageDefinition]) -> Result<(), TopologyError> {
     if stages.is_empty() {
         return Err(TopologyError::EmptyTopology);
     }
@@ -244,23 +149,22 @@ fn validate_stage_ids(stages: &[PendingStage]) -> Result<(), TopologyError> {
     Ok(())
 }
 
-fn validate_connections(
+pub(super) fn validate_connections(
     token: u64,
-    stages: &[PendingStage],
-    connections: &[PendingConnection],
+    stages: &[StageDefinition],
+    connections: &[(Vec<StageRef>, StageRef)],
 ) -> Result<Vec<Option<Vec<usize>>>, TopologyError> {
     let mut sources_by_target = vec![None; stages.len()];
-    for connection in connections {
-        let target = resolve_ref(token, stages.len(), connection.target)?;
-        if connection.sources.is_empty() {
+    for (sources, target) in connections {
+        let target = resolve_ref(token, stages.len(), *target)?;
+        if sources.is_empty() {
             return Err(TopologyError::EmptySources(stages[target].id.clone()));
         }
         if sources_by_target[target].is_some() {
             return Err(TopologyError::SourcesAlreadySet(stages[target].id.clone()));
         }
 
-        let sources = connection
-            .sources
+        let sources = sources
             .iter()
             .map(|source| resolve_ref(token, stages.len(), *source))
             .collect::<Result<Vec<_>, _>>()?;
@@ -284,7 +188,7 @@ fn resolve_ref(
     }
 }
 
-fn validate_acyclic(
+pub(super) fn validate_acyclic(
     stage_count: usize,
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
@@ -319,7 +223,3 @@ fn validate_acyclic(
         Err(TopologyError::Cycle)
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/topology.rs"]
-mod tests;

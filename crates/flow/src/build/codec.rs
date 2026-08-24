@@ -1,11 +1,14 @@
 use dogpaddle_operation::OperationDefinition;
 use thiserror::Error;
 
-use crate::topology::{Topology, TopologyBuilder, TopologyError};
+use super::{
+    definition::{FlowDefinition, StageDefinition},
+    validate::{TopologyError, validate_decoded_definition, validate_stage_ids},
+};
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
 const FORMAT_VERSION: u16 = 1;
-const CHECKSUM_LENGTH: usize = size_of::<u32>();
+pub(super) const CHECKSUM_LENGTH: usize = size_of::<u32>();
 const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
 pub(crate) const DEFINITION_DATA_NAME: &str = "flow/definition";
 pub(crate) const FLOW_STATE_DATA_NAME: &str = "flow/state";
@@ -63,15 +66,15 @@ pub(crate) fn count_state_name(index: usize) -> String {
     format!("stage/{index:08x}/operation/count")
 }
 
-pub(crate) fn encode(topology: &Topology) -> Result<Vec<u8>, FlowDefinitionError> {
-    let stage_count = u32::try_from(topology.stages().len())
+pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {
+    let stage_count = u32::try_from(definition.stages().len())
         .map_err(|_| FlowDefinitionError::LengthOverflow("stage count"))?;
     let mut encoded = Vec::new();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
     encoded.extend_from_slice(&stage_count.to_be_bytes());
 
-    for stage in topology.stages() {
+    for stage in definition.stages() {
         encode_string(&mut encoded, stage.id(), "stage ID")?;
         let operation = stage.operation().encode();
         encode_bytes(&mut encoded, &operation, "operation definition")?;
@@ -87,7 +90,7 @@ pub(crate) fn encode(topology: &Topology) -> Result<Vec<u8>, FlowDefinitionError
     Ok(encoded)
 }
 
-pub(crate) fn decode(encoded: &[u8]) -> Result<Topology, FlowDefinitionError> {
+pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionError> {
     if encoded.len() < MAGIC.len() {
         return Err(FlowDefinitionError::Truncated);
     }
@@ -116,7 +119,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<Topology, FlowDefinitionError> {
     }
 
     let stage_count = cursor.read_u32()?;
-    let mut records = Vec::new();
+    let mut stages = Vec::new();
     for _ in 0..stage_count {
         let id = cursor.read_string()?;
         let operation = OperationDefinition::decode(cursor.read_bytes()?)?;
@@ -125,7 +128,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<Topology, FlowDefinitionError> {
         for _ in 0..source_count {
             sources.push(cursor.read_string()?);
         }
-        records.push(StageRecord {
+        stages.push(StageDefinition {
             id,
             operation,
             sources,
@@ -135,41 +138,40 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<Topology, FlowDefinitionError> {
         return Err(FlowDefinitionError::TrailingBytes);
     }
 
-    topology_from_records(&records)
+    validate_definition(stages)
 }
 
-fn topology_from_records(records: &[StageRecord]) -> Result<Topology, FlowDefinitionError> {
-    let ids = records
+fn validate_definition(
+    stages: Vec<StageDefinition>,
+) -> Result<FlowDefinition, FlowDefinitionError> {
+    validate_stage_ids(&stages)?;
+    let ids = stages
         .iter()
-        .map(|record| record.id.clone())
+        .map(|stage| stage.id.as_str())
         .collect::<Vec<_>>();
-    let mut builder = TopologyBuilder::new();
-    let references = records
+    let sources_by_target = stages
         .iter()
-        .map(|record| builder.stage(record.id.clone(), record.operation.clone()))
-        .collect::<Vec<_>>();
-    builder.validate_stage_ids()?;
-
-    for (target, record) in records.iter().enumerate() {
-        if record.sources.is_empty() {
-            continue;
-        }
-        let sources = record
-            .sources
-            .iter()
-            .map(|source| {
-                ids.iter()
-                    .position(|id| id == source)
-                    .map(|index| references[index])
-                    .ok_or_else(|| FlowDefinitionError::UnknownSource {
-                        stage: record.id.clone(),
-                        source_id: source.clone(),
+        .map(|stage| {
+            if stage.sources.is_empty() {
+                return Ok(None);
+            }
+            stage
+                .sources
+                .iter()
+                .map(|source| {
+                    ids.iter().position(|id| id == source).ok_or_else(|| {
+                        FlowDefinitionError::UnknownSource {
+                            stage: stage.id.clone(),
+                            source_id: source.clone(),
+                        }
                     })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        builder.connect(sources, references[target]);
-    }
-    builder.finish().map_err(FlowDefinitionError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_decoded_definition(&stages, &sources_by_target)?;
+    Ok(FlowDefinition::new(stages))
 }
 
 fn encode_string(
@@ -192,7 +194,7 @@ fn encode_bytes(
     Ok(())
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
+pub(super) fn crc32(bytes: &[u8]) -> u32 {
     let mut checksum = u32::MAX;
     for byte in bytes {
         checksum ^= u32::from(*byte);
@@ -202,12 +204,6 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     !checksum
-}
-
-struct StageRecord {
-    id: String,
-    operation: OperationDefinition,
-    sources: Vec<String>,
 }
 
 struct Cursor<'a> {
@@ -255,7 +251,3 @@ impl<'a> Cursor<'a> {
         Ok(*value)
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/format.rs"]
-mod tests;
