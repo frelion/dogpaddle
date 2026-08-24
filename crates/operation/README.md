@@ -16,6 +16,11 @@ assert_eq!(source.input_count(), 0);
 assert_eq!(OperationDefinition::decode(&source.encode()).unwrap(), source);
 ```
 
+物化后的具体实例统一实现 sealed [`Operation`] trait。Flow 可以将不同实例保存为
+`Box<dyn Operation>`，并通过 [`Operation::definition`] 取回与实例对应的闭合 Definition；
+该 trait 是引擎运行时的公共父类型，不是供外部 crate 实现的扩展点。新增 Operation 仍需在
+本 crate 中加入具体类型和 [`OperationDefinition`] 变体。
+
 ## `SequenceSource`
 
 [`SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的

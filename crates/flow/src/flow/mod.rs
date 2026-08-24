@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_operation::OperationDefinition;
+use dogpaddle_operation::{
+    CountData, CountOperation, OperationDefinition, SequenceSourceData, SequenceSourceOperation,
+};
 use dogpaddle_store::{Cell, DataHandle, OrderedMap, Store, StoreError, Transactions};
 
 use crate::{
@@ -157,11 +159,17 @@ fn open_stage(
                 store,
                 &codec::sequence_position_name(index),
             )?);
-            Ok(Stage::sequence_source(state, *definition, position))
+            Ok(Stage::new(
+                state,
+                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
+            ))
         }
         OperationDefinition::Count(definition) => {
             let count = Cell::new(open_required_data(store, &codec::count_state_name(index))?);
-            Ok(Stage::count(state, *definition, count))
+            Ok(Stage::new(
+                state,
+                CountOperation::new(*definition, CountData::new(count)),
+            ))
         }
     }
 }

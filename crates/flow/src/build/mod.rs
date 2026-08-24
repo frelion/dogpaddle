@@ -3,7 +3,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::OperationDefinition;
+use dogpaddle_operation::{
+    CountData, CountOperation, OperationDefinition, SequenceSourceData, SequenceSourceOperation,
+};
 use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
 
 use crate::{error::FlowError, flow::Flow, stage::Stage};
@@ -145,13 +147,19 @@ fn create_stage(
             let position = Cell::new(
                 store.create_data(&codec::sequence_position_name(index), DataPlacement::Shared)?,
             );
-            Ok(Stage::sequence_source(state, *definition, position))
+            Ok(Stage::new(
+                state,
+                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
+            ))
         }
         OperationDefinition::Count(definition) => {
             let count = Cell::new(
                 store.create_data(&codec::count_state_name(index), DataPlacement::Shared)?,
             );
-            Ok(Stage::count(state, *definition, count))
+            Ok(Stage::new(
+                state,
+                CountOperation::new(*definition, CountData::new(count)),
+            ))
         }
     }
 }
