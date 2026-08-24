@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_store::{Cell, DataHandle, OrderedMap, Store, StoreError, Transactions};
 
 use crate::{
@@ -140,8 +141,29 @@ fn open_stages(store: &Store, definition: &FlowDefinition) -> Result<Vec<Stage>,
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| Stage::open(store, index, stage.operation()))
+        .map(|(index, stage)| open_stage(store, index, stage.operation()))
         .collect()
+}
+
+fn open_stage(
+    store: &Store,
+    index: usize,
+    definition: &OperationDefinition,
+) -> Result<Stage, FlowError> {
+    let state = OrderedMap::new(open_required_data(store, &codec::stage_state_name(index))?);
+    match definition {
+        OperationDefinition::SequenceSource(definition) => {
+            let position = Cell::new(open_required_data(
+                store,
+                &codec::sequence_position_name(index),
+            )?);
+            Ok(Stage::sequence_source(state, *definition, position))
+        }
+        OperationDefinition::Count(definition) => {
+            let count = Cell::new(open_required_data(store, &codec::count_state_name(index))?);
+            Ok(Stage::count(state, *definition, count))
+        }
+    }
 }
 
 fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError> {

@@ -2,7 +2,7 @@
 
 ## 项目结构与模块组织
 
-DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按生命周期拆分：`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、纯校验和稳定编码；`flow/` 只处理已构建 Flow 的打开与生命周期；`stage/` 只处理运行期 Stage 及其 Operation 资源的物化。拓扑是 Flow Definition 的连接关系，不再拥有独立 Builder。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
+DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 和执行语义，当前包含 SequenceSource 与 Count；`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按生命周期拆分：`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、纯校验和稳定编码，并在构建时创建全部资源；`flow/` 处理已构建 Flow 的打开与生命周期，并在打开时解析全部资源；`stage/` 只保存运行期 Stage 及其已注入的类型化数据句柄。Stage 不接收 Store，不创建或打开资源，也不知道 `DataPlacement` 或稳定资源名。拓扑是 Flow Definition 的连接关系，不再拥有独立 Builder。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。当前 Flow 工作不得修改 `dogpaddle-store` 的 API、语义或文档，除非任务明确解除该边界。
 
 ## 构建、测试与开发命令
 

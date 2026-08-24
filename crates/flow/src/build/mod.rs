@@ -129,8 +129,31 @@ fn create_stages(store: &mut Store, definition: &FlowDefinition) -> Result<Vec<S
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| Stage::create(store, index, stage.operation()))
+        .map(|(index, stage)| create_stage(store, index, stage.operation()))
         .collect()
+}
+
+fn create_stage(
+    store: &mut Store,
+    index: usize,
+    definition: &OperationDefinition,
+) -> Result<Stage, FlowError> {
+    let state =
+        OrderedMap::new(store.create_data(&codec::stage_state_name(index), DataPlacement::Shared)?);
+    match definition {
+        OperationDefinition::SequenceSource(definition) => {
+            let position = Cell::new(
+                store.create_data(&codec::sequence_position_name(index), DataPlacement::Shared)?,
+            );
+            Ok(Stage::sequence_source(state, *definition, position))
+        }
+        OperationDefinition::Count(definition) => {
+            let count = Cell::new(
+                store.create_data(&codec::count_state_name(index), DataPlacement::Shared)?,
+            );
+            Ok(Stage::count(state, *definition, count))
+        }
+    }
 }
 
 #[cfg(test)]
