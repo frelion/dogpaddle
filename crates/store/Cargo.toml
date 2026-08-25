@@ -27,5 +27,10 @@ name = "append_log"
 harness = false
 test = false
 
+[[bench]]
+name = "append_log_endurance"
+harness = false
+test = false
+
 [lints]
 workspace = true

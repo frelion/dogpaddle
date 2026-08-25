@@ -16,6 +16,7 @@ microbenchmark 外推成上层吞吐承诺。
 | 128 B、10k 条、一个 durable transaction | `2.135x`，9/9 配对胜 | 收益穿透一次 durable commit |
 | 1 KiB / 8 KiB durable total | `1.042x`（5/9）/ `1.023x`（6/9） | 没有检测到稳定改善 |
 | cursor prefix GC | paired median `1.181x`，5/5 进程级配对胜 | 20k 条的一次 truncate 总延迟约降低 15% |
+| `AppendLog` 64 MiB 固定窗口长稳 | 处理 1 GiB 后文件为 80/96/112 MiB，后半程波动均为 0% | 前缀 GC 后 MDBX 页可稳定复用 |
 | `Cell<u64>` committed hot get | paired median `1.204x`，5/5 配对胜 | 延迟约降低 17% |
 | `OrderedMap<_, Vec<u8>, _>` point get | 胜负混合，paired median 约 `1.02x–1.04x` | 未观察到稳定回退，也不能归因为加速 |
 | `OrderedMap::scan` | 本轮没有修改 | 仍是 owned scan，不能称为零拷贝 |
@@ -43,6 +44,9 @@ CPU/body 改善，这是实测负结果，不应删掉。
    rollback；durable workload 两侧都包含 begin、访问、写入和一次 commit。
 2. **优化前后进程级配对**：GC、Cell 和 Map 保存优化前后的 release benchmark 二进制，按平衡
    顺序交错运行。每个进程内部仍取多个样本的中位数，最终比较五对进程中位数。
+3. **固定窗口长稳**：AppendLog 对每种记录宽度连续运行 960 个 epoch；每个 epoch 先用一个
+   durable transaction 追加约 1 MiB，再用另一个 durable transaction 删除等量前缀。报告给出
+   两次连续完整运行的范围，并在每种宽度结束后重开 Store、逐条校验整个保留窗口。
 
 `records/s` 和 `encoded MiB/s` 都是按逻辑编码大小计算的吞吐，不是 MDBX 物理写放大或磁盘带宽。
 当前 WSL2 文件系统的 durable 延迟会出现整轮漂移；因此结论以配对结果和胜出次数为主，不用一次
@@ -100,6 +104,39 @@ GC A/B 固定为 20,000 条 128 B records，一次 `truncate_before` transaction
 五对全部改善，paired speedup 中位数为 **1.181x**，对应总延迟约降低 **15%**；单对观察范围约
 为 13%–31%。包含 append 和两次 durable transaction 的 steady workload 没有检测到稳定变化，
 因为 GC 只是总成本的一部分，且该 workload 的 append 仍使用 scalar API。
+
+### 固定窗口长稳与空间复用
+
+长稳基准使用 128 B、1 KiB 和 8 KiB 三种完整编码宽度。每种宽度先填充 64 MiB 保留窗口，再执行
+960 个 `append_batch + durable commit`、`truncate_before + durable commit` epoch；稳态阶段累计
+追加并回收 960 MiB，加上初始窗口后每种宽度总共写入 1 GiB。batch 的目标编码大小为 1 MiB。
+
+两次连续完整运行得到完全一致的空间结果：
+
+| record | 保留条目 | seed | final | sampled peak | 已分配空间 / payload | 后半程波动 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 B | 524,288 | 80 MiB | 80 MiB | 80 MiB | 1.25x | 0.00% |
+| 1 KiB | 65,536 | 96 MiB | 96 MiB | 96 MiB | 1.50x | 0.00% |
+| 8 KiB | 8,192 | 112 MiB | 112 MiB | 112 MiB | 1.75x | 0.00% |
+
+这里同时读取了逻辑文件大小和 ext4 实际分配 block；本机两者相等。固定窗口形成后，所有 64-epoch
+checkpoint 都保持不变，所以本轮结果不是“文件增长得较慢”，而是在处理后续 960 MiB 时没有增加
+文件高水位。三组文件尺寸都以 16 MiB 为增量，MDBX 在本机表现出的映射/增长粒度相对 64 MiB
+payload 仍然可见；不要把这三个空间放大比例外推到不同窗口大小或其他文件系统。
+
+事务延迟与协议吞吐在两次连续运行中的范围如下。协议吞吐只累计 append 与 GC transaction，
+不包含预填充和最终校验；每个 epoch 含两次 durable commit。
+
+| record | append p50 | append p99 | append max | GC p50 | GC p99 | GC max | encoded throughput |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 B | 2.045–2.290 ms | 4.524–5.335 ms | 6.898–7.430 ms | 2.026–2.166 ms | 4.298–5.775 ms | 4.953–9.528 ms | 206.7–223.4 MiB/s |
+| 1 KiB | 12.071–13.938 ms | 29.136–32.219 ms | 228.335–262.873 ms | 1.259–1.319 ms | 14.353–14.834 ms | 17.319–19.557 ms | 55.5–70.7 MiB/s |
+| 8 KiB | 1.702–2.034 ms | 25.792–33.575 ms | 229.905–251.141 ms | 0.796–0.902 ms | 10.484–12.041 ms | 18.400–18.794 ms | 101.1–151.4 MiB/s |
+
+1 KiB 和 8 KiB append 都出现约 228–263 ms 的最大延迟，且两轮总体吞吐有明显波动；报告保留这些
+尾峰，不用平均值掩盖。128 B 的提交延迟更集中。三种宽度在两轮中都成功关闭并重新打开 Store，
+持久化 bounds 与预期一致，整个 64 MiB 保留窗口的 offset、diff、key、长度和 payload 均逐条通过
+校验。这个结果支持“当前协议可稳定复用页”，但不证明断电恢复延迟、冷缓存读取或 Flow 端到端性能。
 
 ### 读取和投影的当前数量级
 
@@ -200,6 +237,7 @@ durable overwrite 也出现约 0.8–2.7 ms/事务的整轮变化。这个波动
 cargo bench -p dogpaddle-store --bench cell
 cargo bench -p dogpaddle-store --bench ordered_map
 cargo bench -p dogpaddle-store --bench append_log
+cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
 常用环境变量及 workload 解释见 [`README.md`](./README.md#性能)。做回归比较时必须固定机器、

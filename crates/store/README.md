@@ -208,12 +208,13 @@ table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败�
 
 ## 性能
 
-Store 有三个按数据对象隔离的 release 基准入口：
+Store 有四个按数据对象与运行目的隔离的 release 基准入口：
 
 ```bash
 cargo bench -p dogpaddle-store --bench cell
 cargo bench -p dogpaddle-store --bench ordered_map
 cargo bench -p dogpaddle-store --bench append_log
+cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
 按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
@@ -274,7 +275,32 @@ commit 在计时内。只读扫描复用已填充 Store，明确测 warm-cache�
 - `DOGPADDLE_BENCH_LOG_GC_ITEMS`：每次 GC 最多删除的条目数，默认 1024；
 - `DOGPADDLE_BENCH_LOG_READERS`：逗号分隔的下游数量，默认 `1,4`。
 
-三套基准都使用 MDBX durable sync、单线程执行和当前系统的临时目录。结果描述当前机器、文件系统
+### `AppendLog` 长稳与空间复用基准
+
+`append_log_endurance` 是刻意与日常场景基准分开的长稳入口。对每种记录宽度，它先在计时外填满
+固定保留窗口，然后持续执行两次独立的 durable transaction：`append_batch` 一批，随后
+`truncate_before` 等量旧前缀。默认每种宽度累计追加 1 GiB 逻辑编码，同时始终只保留约 64 MiB；
+因此它观察的是持续运行中的页复用和尾延迟，而不是无限增长日志的顺序写峰值。
+
+输出分别报告 append transaction 与 GC transaction 的 p50、p95、p99 和最大延迟、只累计这两类
+事务的协议吞吐、实际 wall time，以及 MDBX data file 的逻辑大小、文件系统已分配字节、峰值、相对
+保留 payload 的空间放大和后半程空间波动。逻辑大小可能包含稀疏区间，因此在 Unix 上空间判断应以
+已分配字节为主；非 Unix 平台无法读取 block allocation 时退化为逻辑文件大小。
+
+每个宽度结束后，基准会关闭事务环境、重新打开 Store、校验持久化的 `[head, tail)`，再逐条扫描整个
+保留窗口并验证 offset、diff、key、记录长度和 payload。校验不计入协议延迟。这个入口不设置依赖
+机器和文件系统的性能阈值；它提供可复现的测量与正确性断言，回归判定应在相同环境中对比。
+
+长稳 workload 可通过以下环境变量调整：
+
+- `DOGPADDLE_BENCH_ENDURANCE_RECORD_BYTES`：逗号分隔的完整记录宽度，默认
+  `128,1024,8192`；
+- `DOGPADDLE_BENCH_ENDURANCE_LOGICAL_MIB`：每种宽度累计处理的逻辑 MiB，默认 1024；
+- `DOGPADDLE_BENCH_ENDURANCE_WINDOW_MIB`：始终保留的目标窗口 MiB，默认 64；
+- `DOGPADDLE_BENCH_ENDURANCE_BATCH_MIB`：每个 append/GC transaction 的目标 MiB，默认 1；
+- `DOGPADDLE_BENCH_ENDURANCE_CHECKPOINT_EPOCHS`：文件空间采样间隔，默认 64 个循环。
+
+四套基准都使用 MDBX durable sync、单线程执行和当前系统的临时目录。结果描述当前机器、文件系统
 与 warm-cache 条件下的 Store 协议成本，不代表冷缓存、断电恢复、网络 CDC、Operation 动态分发
 或完整调度器的端到端吞吐。进行回归对比时应固定机器、文件系统、环境变量和 Rust profile。
 这些场景只用于测量 Store 数据结构，不规定 Flow 将来如何选择 batch、事务或调度策略。
