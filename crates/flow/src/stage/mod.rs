@@ -1,4 +1,4 @@
-use dogpaddle_operation::Operation;
+use dogpaddle_operation::operation::Operation;
 use dogpaddle_store::OrderedMap;
 
 #[cfg_attr(
@@ -14,14 +14,8 @@ pub(crate) struct Stage {
 }
 
 impl Stage {
-    pub(crate) fn new<O>(state: OrderedMap<Vec<u8>, Vec<u8>>, operation: O) -> Self
-    where
-        O: Operation,
-    {
-        Self {
-            state,
-            operation: Box::new(operation),
-        }
+    pub(crate) fn new(state: OrderedMap<Vec<u8>, Vec<u8>>, operation: Box<dyn Operation>) -> Self {
+        Self { state, operation }
     }
 }
 

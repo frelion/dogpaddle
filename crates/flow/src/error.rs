@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use dogpaddle_operation::MaterializeError;
 use dogpaddle_store::StoreError;
 
 use crate::build::{FlowDefinitionError, TopologyError};
@@ -17,6 +18,9 @@ pub enum FlowError {
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Provisioned data handles do not match an operation definition.
+    #[error(transparent)]
+    Materialize(#[from] MaterializeError),
     /// A Store exists, but no complete Flow definition was published.
     #[error("flow build is incomplete")]
     IncompleteBuild,

@@ -1,6 +1,9 @@
 use dogpaddle_operation::{
-    CountData, CountDefinition, CountOperation, OperationDefinition, SequenceSourceData,
-    SequenceSourceDefinition, SequenceSourceOperation,
+    encode_definition,
+    operation::{
+        source::{SequenceSourceData, SequenceSourceDefinition, SequenceSourceOperation},
+        transform::{CountData, CountDefinition, CountOperation},
+    },
 };
 use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
 
@@ -18,14 +21,14 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
                 .create_data("source-state", DataPlacement::Shared)
                 .unwrap(),
         ),
-        SequenceSourceOperation::new(
+        Box::new(SequenceSourceOperation::new(
             source_definition,
             SequenceSourceData::new(Cell::new(
                 store
                     .create_data("source-position", DataPlacement::Shared)
                     .unwrap(),
             )),
-        ),
+        )),
     );
 
     let count_definition = CountDefinition::new();
@@ -35,23 +38,23 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
                 .create_data("count-state", DataPlacement::Shared)
                 .unwrap(),
         ),
-        CountOperation::new(
+        Box::new(CountOperation::new(
             count_definition,
             CountData::new(Cell::new(
                 store
                     .create_data("count-value", DataPlacement::Shared)
                     .unwrap(),
             )),
-        ),
+        )),
     );
 
     assert_eq!(
-        source.operation.definition(),
-        OperationDefinition::from(source_definition)
+        encode_definition(source.operation.definition()),
+        encode_definition(&source_definition)
     );
     assert_eq!(
-        count.operation.definition(),
-        OperationDefinition::from(count_definition)
+        encode_definition(count.operation.definition()),
+        encode_definition(&count_definition)
     );
 
     let mut transactions = store.into_transactions();

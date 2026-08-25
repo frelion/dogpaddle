@@ -3,9 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{
-    CountData, CountOperation, OperationDefinition, SequenceSourceData, SequenceSourceOperation,
-};
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
 
 use crate::{error::FlowError, flow::Flow, stage::Stage};
@@ -59,14 +57,14 @@ impl FlowBuilder {
     /// [`FlowBuilder::connect`]. The string ID is the stage's durable identity.
     pub fn stage<D>(&mut self, id: impl Into<String>, definition: D) -> StageRef
     where
-        D: Into<OperationDefinition>,
+        D: OperationDefinition,
     {
         let reference = StageRef {
             builder_token: self.token,
             index: self.stages.len(),
         };
         self.stages
-            .push(StageDefinition::new(id.into(), definition.into()));
+            .push(StageDefinition::new(id.into(), Box::new(definition)));
         reference
     }
 
@@ -138,30 +136,18 @@ fn create_stages(store: &mut Store, definition: &FlowDefinition) -> Result<Vec<S
 fn create_stage(
     store: &mut Store,
     index: usize,
-    definition: &OperationDefinition,
+    definition: &dyn OperationDefinition,
 ) -> Result<Stage, FlowError> {
     let state =
         OrderedMap::new(store.create_data(&codec::stage_state_name(index), DataPlacement::Shared)?);
-    match definition {
-        OperationDefinition::SequenceSource(definition) => {
-            let position = Cell::new(
-                store.create_data(&codec::sequence_position_name(index), DataPlacement::Shared)?,
-            );
-            Ok(Stage::new(
-                state,
-                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
-            ))
-        }
-        OperationDefinition::Count(definition) => {
-            let count = Cell::new(
-                store.create_data(&codec::count_state_name(index), DataPlacement::Shared)?,
-            );
-            Ok(Stage::new(
-                state,
-                CountOperation::new(*definition, CountData::new(count)),
-            ))
-        }
+    let mut data = Vec::with_capacity(definition.data_names().len());
+    for logical_name in definition.data_names() {
+        data.push(store.create_data(
+            &codec::operation_data_name(index, logical_name),
+            DataPlacement::Shared,
+        )?);
     }
+    Ok(Stage::new(state, definition.materialize(data)?))
 }
 
 #[cfg(test)]

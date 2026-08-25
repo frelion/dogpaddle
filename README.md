@@ -11,8 +11,8 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 
 ## 已有能力
 
-- **强类型静态 DAG**：具体 Operation Definition 声明输入数量，Flow 校验有序连接、唯一
-  Stage ID、自环和多节点环。
+- **强类型静态 DAG**：sealed `OperationDefinition` trait 声明输入数量和状态形状，Flow 校验
+  有序连接、唯一 Stage ID、自环和多节点环。
 - **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
   标记最后提交。
 - **直接重新打开**：`Flow::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，

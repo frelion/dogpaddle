@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_operation::{
-    CountData, CountOperation, OperationDefinition, SequenceSourceData, SequenceSourceOperation,
-};
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_store::{Cell, DataHandle, OrderedMap, Store, StoreError, Transactions};
 
 use crate::{
@@ -150,28 +148,17 @@ fn open_stages(store: &Store, definition: &FlowDefinition) -> Result<Vec<Stage>,
 fn open_stage(
     store: &Store,
     index: usize,
-    definition: &OperationDefinition,
+    definition: &dyn OperationDefinition,
 ) -> Result<Stage, FlowError> {
     let state = OrderedMap::new(open_required_data(store, &codec::stage_state_name(index))?);
-    match definition {
-        OperationDefinition::SequenceSource(definition) => {
-            let position = Cell::new(open_required_data(
-                store,
-                &codec::sequence_position_name(index),
-            )?);
-            Ok(Stage::new(
-                state,
-                SequenceSourceOperation::new(*definition, SequenceSourceData::new(position)),
-            ))
-        }
-        OperationDefinition::Count(definition) => {
-            let count = Cell::new(open_required_data(store, &codec::count_state_name(index))?);
-            Ok(Stage::new(
-                state,
-                CountOperation::new(*definition, CountData::new(count)),
-            ))
-        }
+    let mut data = Vec::with_capacity(definition.data_names().len());
+    for logical_name in definition.data_names() {
+        data.push(open_required_data(
+            store,
+            &codec::operation_data_name(index, logical_name),
+        )?);
     }
+    Ok(Stage::new(state, definition.materialize(data)?))
 }
 
 fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError> {

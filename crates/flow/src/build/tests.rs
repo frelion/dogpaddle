@@ -1,4 +1,7 @@
-use dogpaddle_operation::{CountDefinition, OperationDefinition, SequenceSourceDefinition};
+use dogpaddle_operation::{
+    OperationDefinition, encode_definition,
+    operation::{source::SequenceSourceDefinition, transform::CountDefinition},
+};
 
 use super::{
     FlowBuilder, FlowDefinitionError, InvalidStageIdReason, StageRef, TopologyError,
@@ -7,12 +10,12 @@ use super::{
     validate::{validate_acyclic, validate_connections},
 };
 
-fn source(start: u64) -> OperationDefinition {
-    SequenceSourceDefinition::new(start).into()
+fn source(start: u64) -> SequenceSourceDefinition {
+    SequenceSourceDefinition::new(start)
 }
 
-fn count() -> OperationDefinition {
-    CountDefinition::new().into()
+fn count() -> CountDefinition {
+    CountDefinition::new()
 }
 
 fn builder() -> FlowBuilder {
@@ -27,10 +30,10 @@ fn find_stage<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StageDefiniti
         .unwrap()
 }
 
-fn finish_target(
-    operation: OperationDefinition,
-    actual: usize,
-) -> Result<FlowDefinition, TopologyError> {
+fn finish_target<D>(operation: D, actual: usize) -> Result<FlowDefinition, TopologyError>
+where
+    D: OperationDefinition,
+{
     let mut builder = builder();
     let sources = (0..actual)
         .map(|index| builder.stage(format!("source-{index}"), source(index as u64)))
@@ -61,7 +64,10 @@ fn finish_preserves_stage_order_and_resolves_references() {
         ["first", "second", "target"]
     );
     let target = find_stage(&definition, "target");
-    assert_eq!(target.operation, count());
+    assert_eq!(
+        encode_definition(target.operation()),
+        encode_definition(&count())
+    );
     assert_eq!(
         target
             .sources
@@ -184,16 +190,30 @@ fn finish_accepts_the_known_zero_and_unary_input_counts() {
 
 #[test]
 fn finish_rejects_every_known_input_count_mismatch() {
-    for (operation, expected, actual) in [(source(0), 0, 1), (count(), 1, 0), (count(), 1, 2)] {
-        assert_eq!(
-            finish_target(operation, actual).unwrap_err(),
-            TopologyError::InputCount {
-                stage: "target".to_owned(),
-                expected,
-                actual,
-            }
-        );
-    }
+    assert_eq!(
+        finish_target(source(0), 1).unwrap_err(),
+        TopologyError::InputCount {
+            stage: "target".to_owned(),
+            expected: 0,
+            actual: 1,
+        }
+    );
+    assert_eq!(
+        finish_target(count(), 0).unwrap_err(),
+        TopologyError::InputCount {
+            stage: "target".to_owned(),
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        finish_target(count(), 2).unwrap_err(),
+        TopologyError::InputCount {
+            stage: "target".to_owned(),
+            expected: 1,
+            actual: 2,
+        }
+    );
 }
 
 #[test]

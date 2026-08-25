@@ -1,5 +1,14 @@
-use dogpaddle_store::{Cell, CellAccess, StoreError};
+use dogpaddle_store::{Cell, CellAccess, DataHandle, StoreError};
 use thiserror::Error;
+
+use crate::{
+    DefinitionCodecError, MaterializeError, OperationDefinition,
+    definition::Sealed as SealedDefinition,
+    operation::{Operation, Sealed as SealedOperation},
+};
+
+pub(crate) const TAG: u16 = 2;
+const DATA_NAMES: &[&str] = &["count"];
 
 /// Pure definition of a running count operation.
 ///
@@ -41,13 +50,42 @@ pub enum CountError {
     reason = "definitions keep one explicit construction path"
 )]
 impl CountDefinition {
-    pub(crate) const INPUT_COUNT: usize = 1;
-
     /// Creates a running count definition.
     #[must_use]
     pub const fn new() -> Self {
         Self { _private: () }
     }
+}
+
+impl SealedDefinition for CountDefinition {}
+
+impl OperationDefinition for CountDefinition {
+    fn input_count(&self) -> usize {
+        1
+    }
+
+    fn data_names(&self) -> &'static [&'static str] {
+        DATA_NAMES
+    }
+
+    fn materialize(&self, data: Vec<DataHandle>) -> Result<Box<dyn Operation>, MaterializeError> {
+        let actual = data.len();
+        let [count]: [DataHandle; 1] =
+            data.try_into().map_err(|_| MaterializeError::DataCount {
+                expected: 1,
+                actual,
+            })?;
+        Ok(Box::new(CountOperation::new(
+            *self,
+            CountData::new(Cell::new(count)),
+        )))
+    }
+
+    fn persistence_tag(&self) -> u16 {
+        TAG
+    }
+
+    fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
 impl CountData {
@@ -101,5 +139,23 @@ impl CountOperation {
             .ok_or(CountError::Overflow)?;
         count.set(&next)?;
         Ok(next)
+    }
+}
+
+impl SealedOperation for CountOperation {}
+
+impl Operation for CountOperation {
+    fn definition(&self) -> &dyn OperationDefinition {
+        &self.definition
+    }
+}
+
+pub(crate) fn decode_definition(
+    payload: &[u8],
+) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    if payload.is_empty() {
+        Ok(Box::new(CountDefinition::new()))
+    } else {
+        Err(DefinitionCodecError::TrailingBytes)
     }
 }

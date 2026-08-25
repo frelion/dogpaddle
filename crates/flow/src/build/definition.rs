@@ -8,7 +8,7 @@ pub(crate) struct FlowDefinition {
 #[derive(Debug)]
 pub(crate) struct StageDefinition {
     pub(super) id: String,
-    pub(super) operation: OperationDefinition,
+    pub(super) operation: Box<dyn OperationDefinition>,
     pub(super) sources: Vec<String>,
 }
 
@@ -23,7 +23,7 @@ impl FlowDefinition {
 }
 
 impl StageDefinition {
-    pub(super) fn new(id: String, operation: OperationDefinition) -> Self {
+    pub(super) fn new(id: String, operation: Box<dyn OperationDefinition>) -> Self {
         Self {
             id,
             operation,
@@ -35,8 +35,8 @@ impl StageDefinition {
         &self.id
     }
 
-    pub(crate) const fn operation(&self) -> &OperationDefinition {
-        &self.operation
+    pub(crate) fn operation(&self) -> &dyn OperationDefinition {
+        self.operation.as_ref()
     }
 
     pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {

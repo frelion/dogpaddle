@@ -1,5 +1,14 @@
-use dogpaddle_store::{Cell, CellAccess, StoreError};
+use dogpaddle_store::{Cell, CellAccess, DataHandle, StoreError};
 use thiserror::Error;
+
+use crate::{
+    DefinitionCodecError, MaterializeError, OperationDefinition,
+    definition::Sealed as SealedDefinition,
+    operation::{Operation, Sealed as SealedOperation},
+};
+
+pub(crate) const TAG: u16 = 1;
+const DATA_NAMES: &[&str] = &["sequence_source.position"];
 
 /// Pure definition of a monotonically increasing source.
 ///
@@ -36,8 +45,6 @@ pub enum SequenceSourceError {
 }
 
 impl SequenceSourceDefinition {
-    pub(crate) const INPUT_COUNT: usize = 0;
-
     /// Creates a source whose first emitted value is `start`.
     #[must_use]
     pub const fn new(start: u64) -> Self {
@@ -48,6 +55,39 @@ impl SequenceSourceDefinition {
     #[must_use]
     pub const fn start(&self) -> u64 {
         self.start
+    }
+}
+
+impl SealedDefinition for SequenceSourceDefinition {}
+
+impl OperationDefinition for SequenceSourceDefinition {
+    fn input_count(&self) -> usize {
+        0
+    }
+
+    fn data_names(&self) -> &'static [&'static str] {
+        DATA_NAMES
+    }
+
+    fn materialize(&self, data: Vec<DataHandle>) -> Result<Box<dyn Operation>, MaterializeError> {
+        let actual = data.len();
+        let [position]: [DataHandle; 1] =
+            data.try_into().map_err(|_| MaterializeError::DataCount {
+                expected: 1,
+                actual,
+            })?;
+        Ok(Box::new(SequenceSourceOperation::new(
+            *self,
+            SequenceSourceData::new(Cell::new(position)),
+        )))
+    }
+
+    fn persistence_tag(&self) -> u16 {
+        TAG
+    }
+
+    fn encode_payload(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(&self.start.to_be_bytes());
     }
 }
 
@@ -105,4 +145,25 @@ impl SequenceSourceOperation {
         position.set(&next)?;
         Ok(next)
     }
+}
+
+impl SealedOperation for SequenceSourceOperation {}
+
+impl Operation for SequenceSourceOperation {
+    fn definition(&self) -> &dyn OperationDefinition {
+        &self.definition
+    }
+}
+
+pub(crate) fn decode_definition(
+    payload: &[u8],
+) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    let start = match <[u8; 8]>::try_from(payload) {
+        Ok(bytes) => u64::from_be_bytes(bytes),
+        Err(_) if payload.len() < size_of::<u64>() => {
+            return Err(DefinitionCodecError::Truncated);
+        }
+        Err(_) => return Err(DefinitionCodecError::TrailingBytes),
+    };
+    Ok(Box::new(SequenceSourceDefinition::new(start)))
 }

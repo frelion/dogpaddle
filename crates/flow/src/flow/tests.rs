@@ -1,4 +1,4 @@
-use dogpaddle_operation::SequenceSourceDefinition;
+use dogpaddle_operation::operation::source::SequenceSourceDefinition;
 use dogpaddle_store::{OrderedMap, Store};
 
 use super::Flow;

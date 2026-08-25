@@ -1,4 +1,4 @@
-use dogpaddle_operation::{
+use dogpaddle_operation::operation::source::{
     SequenceSourceData, SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation,
 };
 use dogpaddle_store::{Cell, DataPlacement, Store};

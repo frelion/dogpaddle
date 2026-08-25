@@ -1,5 +1,7 @@
 use dogpaddle_flow::{Flow, FlowError, TopologyError};
-use dogpaddle_operation::{CountDefinition, SequenceSourceDefinition};
+use dogpaddle_operation::operation::{
+    source::SequenceSourceDefinition, transform::CountDefinition,
+};
 use dogpaddle_store::{Cell, DataPlacement, Store};
 
 #[test]
@@ -177,6 +179,9 @@ fn open_reports_a_missing_resource_after_publication() {
     store
         .create_data("flow/state", DataPlacement::Shared)
         .unwrap();
+    store
+        .create_data("stage/00000000/state", DataPlacement::Shared)
+        .unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
@@ -191,6 +196,7 @@ fn open_reports_a_missing_resource_after_publication() {
 
     assert!(matches!(
         Flow::open(&incomplete_path),
-        Err(FlowError::MissingResource { name }) if name == "stage/00000000/state"
+        Err(FlowError::MissingResource { name })
+            if name == "stage/00000000/operation/sequence_source.position"
     ));
 }

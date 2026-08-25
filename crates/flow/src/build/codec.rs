@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dogpaddle_operation::OperationDefinition;
+use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
 
 use super::{
@@ -60,12 +60,8 @@ pub(crate) fn stage_state_name(index: usize) -> String {
     format!("stage/{index:08x}/state")
 }
 
-pub(crate) fn sequence_position_name(index: usize) -> String {
-    format!("stage/{index:08x}/operation/sequence_source.position")
-}
-
-pub(crate) fn count_state_name(index: usize) -> String {
-    format!("stage/{index:08x}/operation/count")
+pub(crate) fn operation_data_name(index: usize, logical_name: &str) -> String {
+    format!("stage/{index:08x}/operation/{logical_name}")
 }
 
 pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {
@@ -78,7 +74,7 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
 
     for stage in definition.stages() {
         encode_string(&mut encoded, stage.id(), "stage ID")?;
-        let operation = stage.operation().encode();
+        let operation = encode_definition(stage.operation());
         encode_bytes(&mut encoded, &operation, "operation definition")?;
         let source_count = u32::try_from(stage.sources().len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("source count"))?;
@@ -124,7 +120,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
     let mut stages = Vec::new();
     for _ in 0..stage_count {
         let id = cursor.read_string()?;
-        let operation = OperationDefinition::decode(cursor.read_bytes()?)?;
+        let operation = decode_definition(cursor.read_bytes()?)?;
         let source_count = cursor.read_u32()?;
         let mut sources = Vec::new();
         for _ in 0..source_count {

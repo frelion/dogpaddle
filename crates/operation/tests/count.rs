@@ -1,17 +1,14 @@
 use dogpaddle_operation::{
-    CountData, CountDefinition, CountError, CountOperation, OperationDefinition,
+    OperationDefinition,
+    operation::transform::{CountData, CountDefinition, CountError, CountOperation},
 };
 use dogpaddle_store::{Cell, DataPlacement, Store};
 
 #[test]
-fn count_definition_enters_the_closed_union_with_one_input() {
+fn count_definition_implements_the_shared_trait_with_one_input() {
     let definition = CountDefinition::new();
 
-    assert_eq!(
-        OperationDefinition::from(definition),
-        OperationDefinition::Count(definition)
-    );
-    assert_eq!(OperationDefinition::from(definition).input_count(), 1);
+    assert_eq!(definition.input_count(), 1);
 }
 
 #[test]
