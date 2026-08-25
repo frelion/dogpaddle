@@ -3,7 +3,8 @@
 use std::{hint::black_box, time::Duration};
 
 use dogpaddle_store::{
-    Cell, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store, StoreData, Transactions,
+    Cell, CodecError, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store, StoreData,
+    StoreError, StoreValue, Transactions,
 };
 use tempfile::TempDir;
 
@@ -12,7 +13,10 @@ const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_BACKGROUND_NAMESPACES: usize = 8;
 const DEFAULT_SCAN_ITEMS: usize = 1_024;
+const DEFAULT_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
+const DEFAULT_WIDE_SCAN_ENTRIES: usize = 10_000;
 const VALUE_BYTES: usize = 64;
+const WIDE_VALUE_BYTES: usize = 8 * 1_024;
 const STAGE_KEYS: usize = 1_024;
 const RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -30,6 +34,12 @@ struct StageFixture<SIZE> {
     transactions: Transactions,
     cursor: Cell<u64>,
     map: TypedMap<SIZE>,
+    _root: TempDir,
+}
+
+struct ScanFixture<V, SIZE> {
+    transactions: Transactions,
+    map: OrderedMap<u64, V, SIZE>,
     _root: TempDir,
 }
 
@@ -206,6 +216,43 @@ where
     }
 }
 
+impl<V: StoreValue, SIZE> ScanFixture<V, SIZE>
+where
+    OrderedMap<u64, V, SIZE>: StoreData,
+{
+    fn populated(entries: usize, value: &V) -> Self {
+        let root = tempfile::tempdir().expect("temporary scan benchmark directory");
+        let mut store =
+            Store::create(root.path().join("store")).expect("create scan benchmark store");
+        let map = store
+            .create_data::<OrderedMap<u64, V, SIZE>>("map")
+            .expect("create scan benchmark map");
+        let mut fixture = Self {
+            transactions: store.into_transactions(),
+            map,
+            _root: root,
+        };
+        let transaction = fixture
+            .transactions
+            .begin()
+            .expect("begin scan benchmark seed transaction");
+        {
+            let mut map = fixture
+                .map
+                .access(transaction.access())
+                .expect("access scan benchmark seed map");
+            for key in 0..entries {
+                map.put(&(key as u64), value)
+                    .expect("seed scan benchmark map");
+            }
+        }
+        transaction
+            .commit()
+            .expect("commit scan benchmark seed transaction");
+        fixture
+    }
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         return;
@@ -219,13 +266,24 @@ fn main() {
         DEFAULT_BACKGROUND_NAMESPACES,
     );
     let scan_items = setting("DOGPADDLE_BENCH_SCAN_ITEMS", DEFAULT_SCAN_ITEMS);
+    let scan_bytes = setting("DOGPADDLE_BENCH_SCAN_BYTES", DEFAULT_SCAN_BYTES);
+    let wide_scan_entries = setting(
+        "DOGPADDLE_BENCH_WIDE_SCAN_ENTRIES",
+        DEFAULT_WIDE_SCAN_ENTRIES,
+    );
     assert!(
-        entries > 0 && commits > 0 && samples > 0 && background_namespaces > 0 && scan_items > 0
+        entries > 0
+            && commits > 0
+            && samples > 0
+            && background_namespaces > 0
+            && scan_items > 0
+            && scan_bytes > 0
+            && wide_scan_entries > 0
     );
 
     println!("DogPaddle OrderedMap benchmark");
     println!(
-        "entries={entries} value_bytes={VALUE_BYTES} commits={commits} samples={samples} background_namespaces={background_namespaces} scan_items={scan_items}"
+        "entries={entries} value_bytes={VALUE_BYTES} wide_scan_entries={wide_scan_entries} wide_value_bytes={WIDE_VALUE_BYTES} commits={commits} samples={samples} background_namespaces={background_namespaces} scan_items={scan_items} scan_bytes={scan_bytes}"
     );
     println!(
         "sync=durable execution=single-thread point_scan_cache=warm random_seed={RANDOM_SEED:#x}"
@@ -242,18 +300,100 @@ fn main() {
         "same workloads; Small shares the main table, Large owns a dedicated table",
     );
     print_group("isolated object: bulk write, warm point read, scan, and rollback");
-    benchmark_isolated(entries, samples, scan_items);
+    benchmark_isolated(entries, samples, scan_items, scan_bytes);
+    print_group("scan decoding cost: primitive value, wide full decode, and wide projection");
+    benchmark_scan_decoding(entries, wide_scan_entries, samples, scan_items, scan_bytes);
     print_group(&format!(
         "target map with {background_namespaces} populated Small background namespaces"
     ));
-    benchmark_mixed(entries, samples, background_namespaces, scan_items);
+    benchmark_mixed(
+        entries,
+        samples,
+        background_namespaces,
+        scan_items,
+        scan_bytes,
+    );
     print_group("Stage-shaped atomic batches: map updates plus one Cell cursor");
     benchmark_stage_steps(commits, samples);
     print_group("worst-case commit amortization: one overwrite per durable transaction");
     benchmark_durable_overwrite(commits, samples);
 }
 
-fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
+fn benchmark_scan_decoding(
+    entries: usize,
+    wide_entries: usize,
+    samples: usize,
+    scan_items: usize,
+    scan_bytes: usize,
+) {
+    let mut small_primitive = ScanFixture::<u64, Small>::populated(entries, &0x5a);
+    let mut large_primitive = ScanFixture::<u64, Large>::populated(entries, &0x5a);
+    report_pair(
+        "primitive asc full scan",
+        entries,
+        samples,
+        || measure_primitive_scan(&mut small_primitive, entries, scan_items, scan_bytes),
+        || measure_primitive_scan(&mut large_primitive, entries, scan_items, scan_bytes),
+    );
+
+    let wide_value = vec![0x5a; WIDE_VALUE_BYTES];
+    let mut small_wide = ScanFixture::<Vec<u8>, Small>::populated(wide_entries, &wide_value);
+    let mut large_wide = ScanFixture::<Vec<u8>, Large>::populated(wide_entries, &wide_value);
+    report_mode_pair(
+        "wide asc scan Small",
+        wide_entries,
+        samples,
+        &mut small_wide,
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                wide_entries,
+                scan_items,
+                scan_bytes,
+                false,
+            )
+        },
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                wide_entries,
+                scan_items,
+                scan_bytes,
+                true,
+            )
+        },
+    );
+    report_mode_pair(
+        "wide asc scan Large",
+        wide_entries,
+        samples,
+        &mut large_wide,
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                wide_entries,
+                scan_items,
+                scan_bytes,
+                false,
+            )
+        },
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                wide_entries,
+                scan_items,
+                scan_bytes,
+                true,
+            )
+        },
+    );
+}
+
+fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize, scan_bytes: usize) {
     report_pair(
         "byte map bulk put + commit",
         entries,
@@ -289,6 +429,7 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
         entries,
         samples,
         scan_items,
+        scan_bytes,
     );
     report_scan_pair(
         ScanWorkload {
@@ -301,6 +442,7 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
         entries,
         samples,
         scan_items,
+        scan_bytes,
     );
 
     let mut small = Fixture::<Small>::populated_typed(entries);
@@ -323,6 +465,7 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
         entries,
         samples,
         scan_items,
+        scan_bytes,
     );
     report_scan_pair(
         ScanWorkload {
@@ -335,6 +478,10 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
         entries,
         samples,
         scan_items,
+        scan_bytes,
+    );
+    benchmark_narrow_scan_modes(
+        &mut small, &mut large, entries, samples, scan_items, scan_bytes,
     );
     report_pair(
         "hot overwrite + rollback",
@@ -342,6 +489,68 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
         samples,
         || measure_hot_overwrite_rollback(&mut small, entries),
         || measure_hot_overwrite_rollback(&mut large, entries),
+    );
+}
+
+fn benchmark_narrow_scan_modes(
+    small: &mut Fixture<Small>,
+    large: &mut Fixture<Large>,
+    entries: usize,
+    samples: usize,
+    scan_items: usize,
+    scan_bytes: usize,
+) {
+    report_mode_pair(
+        "narrow asc scan Small",
+        entries,
+        samples,
+        small,
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                entries,
+                scan_items,
+                scan_bytes,
+                false,
+            )
+        },
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                entries,
+                scan_items,
+                scan_bytes,
+                true,
+            )
+        },
+    );
+    report_mode_pair(
+        "narrow asc scan Large",
+        entries,
+        samples,
+        large,
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                entries,
+                scan_items,
+                scan_bytes,
+                false,
+            )
+        },
+        |fixture| {
+            measure_vec_scan(
+                &mut fixture.transactions,
+                &fixture.map,
+                entries,
+                scan_items,
+                scan_bytes,
+                true,
+            )
+        },
     );
 }
 
@@ -376,6 +585,7 @@ fn benchmark_mixed(
     samples: usize,
     background_namespaces: usize,
     scan_items: usize,
+    scan_bytes: usize,
 ) {
     let mut small =
         Fixture::<Small>::populated_with_small_background(entries, background_namespaces);
@@ -399,6 +609,7 @@ fn benchmark_mixed(
         entries,
         samples,
         scan_items,
+        scan_bytes,
     );
     report_scan_pair(
         ScanWorkload {
@@ -411,6 +622,7 @@ fn benchmark_mixed(
         entries,
         samples,
         scan_items,
+        scan_bytes,
     );
 }
 
@@ -421,6 +633,7 @@ fn report_scan_pair<SmallSize, LargeSize>(
     entries: usize,
     samples: usize,
     scan_items: usize,
+    scan_bytes: usize,
 ) {
     report_pair(
         workload.name,
@@ -428,15 +641,19 @@ fn report_scan_pair<SmallSize, LargeSize>(
         samples,
         || match workload.kind {
             ScanKind::ByteMap => {
-                measure_byte_map_scan(small, entries, scan_items, workload.direction)
+                measure_byte_map_scan(small, entries, scan_items, scan_bytes, workload.direction)
             }
-            ScanKind::TypedMap => measure_scan(small, entries, scan_items, workload.direction),
+            ScanKind::TypedMap => {
+                measure_scan(small, entries, scan_items, scan_bytes, workload.direction)
+            }
         },
         || match workload.kind {
             ScanKind::ByteMap => {
-                measure_byte_map_scan(large, entries, scan_items, workload.direction)
+                measure_byte_map_scan(large, entries, scan_items, scan_bytes, workload.direction)
             }
-            ScanKind::TypedMap => measure_scan(large, entries, scan_items, workload.direction),
+            ScanKind::TypedMap => {
+                measure_scan(large, entries, scan_items, scan_bytes, workload.direction)
+            }
         },
     );
 }
@@ -552,6 +769,7 @@ fn measure_byte_map_scan<SIZE>(
     fixture: &mut Fixture<SIZE>,
     entries: usize,
     scan_items: usize,
+    scan_bytes: usize,
     direction: ScanDirection,
 ) -> Duration {
     let started = std::time::Instant::now();
@@ -559,7 +777,7 @@ fn measure_byte_map_scan<SIZE>(
         .transactions
         .begin()
         .expect("begin byte map scan transaction");
-    let limit = ScanLimit::new(scan_items, 4 * 1_024 * 1_024).unwrap();
+    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
     let bytes = fixture
         .bytes
         .access(transaction.access())
@@ -568,14 +786,15 @@ fn measure_byte_map_scan<SIZE>(
     let mut count = 0_usize;
     let mut checksum = 0_usize;
     loop {
-        let batch = bytes
-            .scan(.., direction, continuation.as_ref(), limit)
+        let next = bytes
+            .scan(.., direction, continuation.as_ref(), limit, |entry| {
+                let (_, value) = entry.decode_owned()?;
+                count += 1;
+                checksum = checksum.wrapping_add(usize::from(value[0]));
+                Ok::<(), StoreError>(())
+            })
             .expect("scan byte map benchmark page");
-        count += batch.items.len();
-        checksum = batch.items.iter().fold(checksum, |checksum, (_, value)| {
-            checksum.wrapping_add(usize::from(value[0]))
-        });
-        if let Some(next) = batch.continuation {
+        if let Some(next) = next {
             continuation = Some(next);
         } else {
             break;
@@ -593,6 +812,7 @@ fn measure_scan<SIZE>(
     fixture: &mut Fixture<SIZE>,
     entries: usize,
     scan_items: usize,
+    scan_bytes: usize,
     direction: ScanDirection,
 ) -> Duration {
     let started = std::time::Instant::now();
@@ -600,7 +820,7 @@ fn measure_scan<SIZE>(
         .transactions
         .begin()
         .expect("begin scan transaction");
-    let limit = ScanLimit::new(scan_items, 4 * 1_024 * 1_024).unwrap();
+    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
     let mut count = 0_usize;
     let mut checksum = 0_usize;
     let map = fixture
@@ -609,14 +829,15 @@ fn measure_scan<SIZE>(
         .expect("access scan map");
     let mut continuation = None;
     loop {
-        let batch = map
-            .scan(.., direction, continuation.as_ref(), limit)
+        let next = map
+            .scan(.., direction, continuation.as_ref(), limit, |entry| {
+                let (_, value) = entry.decode_owned()?;
+                count += 1;
+                checksum = checksum.wrapping_add(usize::from(value[0]));
+                Ok::<(), StoreError>(())
+            })
             .expect("scan benchmark page");
-        count += batch.items.len();
-        checksum = batch.items.iter().fold(checksum, |checksum, (_, value)| {
-            checksum.wrapping_add(usize::from(value[0]))
-        });
-        if let Some(next) = batch.continuation {
+        if let Some(next) = next {
             continuation = Some(next);
         } else {
             break;
@@ -626,6 +847,113 @@ fn measure_scan<SIZE>(
     black_box(checksum);
     transaction.commit().expect("finish scan transaction");
     started.elapsed()
+}
+
+fn measure_primitive_scan<SIZE>(
+    fixture: &mut ScanFixture<u64, SIZE>,
+    entries: usize,
+    scan_items: usize,
+    scan_bytes: usize,
+) -> Duration {
+    let started = std::time::Instant::now();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin primitive scan transaction");
+    let map = fixture
+        .map
+        .access(transaction.access())
+        .expect("access primitive scan map");
+    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
+    let mut continuation = None;
+    let mut count = 0_usize;
+    let mut checksum = 0_u64;
+    loop {
+        let next = map
+            .scan(
+                ..,
+                ScanDirection::Ascending,
+                continuation.as_ref(),
+                limit,
+                |entry| {
+                    let (key, value) = entry.decode_owned()?;
+                    count += 1;
+                    checksum = checksum.wrapping_add(key ^ value);
+                    Ok::<(), StoreError>(())
+                },
+            )
+            .expect("scan primitive benchmark page");
+        if let Some(next) = next {
+            continuation = Some(next);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(count, entries);
+    black_box(checksum);
+    transaction
+        .commit()
+        .expect("finish primitive scan transaction");
+    started.elapsed()
+}
+
+fn measure_vec_scan<SIZE>(
+    transactions: &mut Transactions,
+    map: &OrderedMap<u64, Vec<u8>, SIZE>,
+    entries: usize,
+    scan_items: usize,
+    scan_bytes: usize,
+    project: bool,
+) -> Duration {
+    let started = std::time::Instant::now();
+    let transaction = transactions.begin().expect("begin vector scan transaction");
+    let map = map
+        .access(transaction.access())
+        .expect("access vector scan map");
+    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
+    let mut continuation = None;
+    let mut count = 0_usize;
+    let mut checksum = 0_u64;
+    loop {
+        let next = map
+            .scan(
+                ..,
+                ScanDirection::Ascending,
+                continuation.as_ref(),
+                limit,
+                |entry| {
+                    let value = if project {
+                        entry.project(project_vec_checksum)?
+                    } else {
+                        let (key, value) = entry.decode_owned()?;
+                        key ^ u64::from(value[0])
+                    };
+                    count += 1;
+                    checksum = checksum.wrapping_add(value);
+                    Ok::<(), StoreError>(())
+                },
+            )
+            .expect("scan wide benchmark page");
+        if let Some(next) = next {
+            continuation = Some(next);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(count, entries);
+    black_box(checksum);
+    transaction
+        .commit()
+        .expect("finish vector scan transaction");
+    started.elapsed()
+}
+
+fn project_vec_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
+    let key = u64::from_be_bytes(
+        key.try_into()
+            .map_err(|_| CodecError::new("invalid benchmark key"))?,
+    );
+    Ok(key ^ u64::from(value[0]))
 }
 
 fn measure_stage_steps<SIZE>(
@@ -754,6 +1082,46 @@ fn report_pair(
     report(workload, "Small", operations, small_durations);
     report(workload, "Large", operations, large_durations);
     println!("  paired Small/Large median={median_ratio:.3}x; Small wins {small_wins}/{samples}");
+}
+
+fn report_mode_pair<T>(
+    workload: &str,
+    operations: usize,
+    samples: usize,
+    fixture: &mut T,
+    mut full: impl FnMut(&mut T) -> Duration,
+    mut projected: impl FnMut(&mut T) -> Duration,
+) {
+    full(fixture);
+    projected(fixture);
+    let mut full_durations = Vec::with_capacity(samples);
+    let mut projected_durations = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        if sample % 2 == 0 {
+            full_durations.push(full(fixture));
+            projected_durations.push(projected(fixture));
+        } else {
+            projected_durations.push(projected(fixture));
+            full_durations.push(full(fixture));
+        }
+    }
+    let mut ratios = full_durations
+        .iter()
+        .zip(&projected_durations)
+        .map(|(full, projected)| full.as_secs_f64() / projected.as_secs_f64())
+        .collect::<Vec<_>>();
+    ratios.sort_by(f64::total_cmp);
+    let median_ratio = ratios[ratios.len() / 2];
+    let projected_wins = full_durations
+        .iter()
+        .zip(&projected_durations)
+        .filter(|(full, projected)| projected < full)
+        .count();
+    report(workload, "Full", operations, full_durations);
+    report(workload, "Projected", operations, projected_durations);
+    println!(
+        "  paired Full/Projected median={median_ratio:.3}x; projection wins {projected_wins}/{samples}"
+    );
 }
 
 fn report(workload: &str, size: &str, operations: usize, mut durations: Vec<Duration>) {

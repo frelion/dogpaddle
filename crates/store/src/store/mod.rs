@@ -7,7 +7,7 @@ mod database;
 mod transaction;
 
 pub(crate) use data::DataAccess;
-pub use data::{ScanBatch, ScanDirection, ScanLimit};
+pub use data::{ScanDirection, ScanLimit};
 
 // These two types are nominally `pub` so the sealed StoreData supertrait can
 // mention them. This module is private and the crate root reexports them only

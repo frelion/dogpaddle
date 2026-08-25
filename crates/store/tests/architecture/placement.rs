@@ -27,14 +27,22 @@ fn small_and_large_have_identical_data_semantics() {
     let small = small.access(transaction.access()).unwrap();
     let large = large.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(100, 4_096).unwrap();
-    assert_eq!(
-        small
-            .scan(.., ScanDirection::Ascending, None, limit)
-            .unwrap(),
-        large
-            .scan(.., ScanDirection::Ascending, None, limit)
-            .unwrap()
-    );
+    let mut small_items = Vec::new();
+    let small_continuation = small
+        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
+            small_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+    let mut large_items = Vec::new();
+    let large_continuation = large
+        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
+            large_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+    assert_eq!(small_items, large_items);
+    assert_eq!(small_continuation, large_continuation);
 }
 
 #[test]

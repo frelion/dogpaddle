@@ -9,14 +9,12 @@ mod store;
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
     AppendLog, AppendLogAccess, AppendLogEntry, AppendLogScan, Cell, CellAccess, OrderedMap,
-    OrderedMapAccess,
+    OrderedMapAccess, OrderedMapEntry,
 };
 pub use data_class::StoreData;
 pub use error::StoreError;
 pub(crate) use store::{DataAccess, DataHandle, DataPlacement};
-pub use store::{
-    ScanBatch, ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions,
-};
+pub use store::{ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions};
 
 /// Persistent size marker selecting shared physical storage for collections
 /// that support a size choice.

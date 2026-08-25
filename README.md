@@ -21,6 +21,8 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   资源命名，不依赖 Rust 内存布局。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
+- **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
+  `OrderedMap<K, V, SIZE>`；有界 map scan 可完整解码，也可只投影编码中的所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
   投影解码、同事务原样转发和有界前缀回收；Flow 尚未将它装配为 Stage 间数据通道。
 

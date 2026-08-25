@@ -57,15 +57,6 @@ pub struct ScanLimit {
     max_bytes: usize,
 }
 
-/// One owned result batch from an ordered scan.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScanBatch<K, V> {
-    /// Entries in the requested scan direction.
-    pub items: Vec<(K, V)>,
-    /// Last returned key when another matching entry exists.
-    pub continuation: Option<K>,
-}
-
 /// Transaction-bound access to one encoded key/value namespace.
 ///
 /// This value cannot outlive its transaction. Collection implementations use
@@ -367,7 +358,7 @@ impl<'transaction> DataAccess<'transaction> {
     /// Scans encoded entries in ascending key order without copying clean MDBX values.
     ///
     /// The returned values remain bound to this transaction. `limited` is
-    /// true when another entry was observed but excluded by either scan bound.
+    /// true when another matching entry exists but was excluded by a scan limit.
     ///
     /// # Errors
     ///
@@ -379,72 +370,15 @@ impl<'transaction> DataAccess<'transaction> {
         limit: ScanLimit,
     ) -> Result<BorrowedScanBatch<'transaction>, StoreError> {
         debug_assert!(self.prefix.is_none());
-        self.transaction.ensure_healthy()?;
-        self.transaction.record_result((|| {
-            let mut cursor = self
-                .transaction
-                .mdbx
-                .cursor(&self.table)
-                .map_err(|error| StoreError::storage("open data cursor", error))?;
-            let seek = physical_key(self.prefix.as_ref(), start);
-            let mut current = cursor
-                .set_range::<Cow<'transaction, [u8]>, ObjectLength>(seek.as_ref())
-                .map_err(|error| StoreError::storage("seek data scan", error))?;
-            let mut items = Vec::new();
-            let mut bytes = 0_usize;
-
-            while let Some((physical_key, value_length)) = current {
-                if items.len() == limit.max_items() {
-                    return Ok(BorrowedScanBatch {
-                        items,
-                        limited: true,
-                    });
-                }
-
-                let item_bytes = physical_key.len().checked_add(*value_length).ok_or(
-                    StoreError::ItemTooLarge {
-                        size: usize::MAX,
-                        limit: limit.max_bytes(),
-                    },
-                )?;
-                let next_bytes = bytes.checked_add(item_bytes);
-                if next_bytes.is_none_or(|size| size > limit.max_bytes()) {
-                    if items.is_empty() {
-                        return Err(StoreError::ItemTooLarge {
-                            size: item_bytes,
-                            limit: limit.max_bytes(),
-                        });
-                    }
-                    return Ok(BorrowedScanBatch {
-                        items,
-                        limited: true,
-                    });
-                }
-
-                // The probe reads only the value length. Materialize the
-                // value after admission so oversized entries are not copied.
-                let ((), value) = cursor
-                    .get_current::<(), Cow<'transaction, [u8]>>()
-                    .map_err(|error| StoreError::storage("read scanned data", error))?
-                    .ok_or_else(|| {
-                        StoreError::storage("read scanned data", "MDBX cursor lost its position")
-                    })?;
-                debug_assert_eq!(value.len(), *value_length);
-                bytes = next_bytes.expect("checked above");
-                items.push((physical_key, value));
-                current = cursor
-                    .next::<Cow<'transaction, [u8]>, ObjectLength>()
-                    .map_err(|error| StoreError::storage("advance data scan", error))?;
-            }
-
-            Ok(BorrowedScanBatch {
-                items,
-                limited: false,
-            })
-        })())
+        self.scan_borrowed(
+            (Bound::Included(start), Bound::Unbounded),
+            ScanDirection::Ascending,
+            None,
+            limit,
+        )
     }
 
-    /// Scans encoded keys in byte order within this namespace.
+    /// Borrows one bounded batch of encoded entries in byte order.
     ///
     /// `resume_after` is the last key returned by a previous scan with the
     /// same range and direction. It is always excluded from the result.
@@ -453,13 +387,13 @@ impl<'transaction> DataAccess<'transaction> {
     ///
     /// Returns an error when the transaction is poisoned, MDBX cannot scan, or
     /// the first matching item exceeds the byte limit.
-    pub fn scan<'range, R>(
+    pub(crate) fn scan_borrowed<'range, R>(
         &self,
         range: R,
         direction: ScanDirection,
         resume_after: Option<&[u8]>,
         limit: ScanLimit,
-    ) -> Result<ScanBatch<Vec<u8>, Vec<u8>>, StoreError>
+    ) -> Result<BorrowedScanBatch<'transaction>, StoreError>
     where
         R: RangeBounds<&'range [u8]>,
     {
@@ -493,21 +427,22 @@ impl<'transaction> DataAccess<'transaction> {
                 lower.as_ref(),
                 upper.as_ref(),
             )?;
-            let mut items: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut items = Vec::new();
             let mut bytes = 0_usize;
 
             while let Some((physical_key, value_length)) = current {
-                let key = match self.prefix.as_ref() {
-                    Some(prefix) => {
-                        let Some(key) = physical_key.as_ref().strip_prefix(prefix) else {
-                            break;
-                        };
-                        key
-                    }
-                    None => physical_key.as_ref(),
-                };
-                if !within_bounds(key, lower.as_ref(), upper.as_ref()) {
+                let Some(key) = logical_key(physical_key, self.prefix.as_ref()) else {
                     break;
+                };
+                if !within_bounds(key.as_ref(), lower.as_ref(), upper.as_ref()) {
+                    break;
+                }
+
+                if items.len() == limit.max_items() {
+                    return Ok(BorrowedScanBatch {
+                        items,
+                        limited: true,
+                    });
                 }
 
                 let item_bytes =
@@ -518,28 +453,23 @@ impl<'transaction> DataAccess<'transaction> {
                             limit: limit.max_bytes(),
                         })?;
                 let next_bytes = bytes.checked_add(item_bytes);
-                if items.len() == limit.max_items()
-                    || next_bytes.is_none_or(|size| size > limit.max_bytes())
-                {
+                if next_bytes.is_none_or(|size| size > limit.max_bytes()) {
                     if items.is_empty() {
                         return Err(StoreError::ItemTooLarge {
                             size: item_bytes,
                             limit: limit.max_bytes(),
                         });
                     }
-                    let continuation = items.last().map(|(key, _)| key.clone());
-                    return Ok(ScanBatch {
+                    return Ok(BorrowedScanBatch {
                         items,
-                        continuation,
+                        limited: true,
                     });
                 }
 
                 // The probe reads only the value length. Materialize the value
                 // after admission so rejected oversized entries are never copied.
-                let key = key.to_vec();
-                drop(physical_key);
                 let ((), value) = cursor
-                    .get_current::<(), Vec<u8>>()
+                    .get_current::<(), Cow<'transaction, [u8]>>()
                     .map_err(|error| StoreError::storage("read scanned data", error))?
                     .ok_or_else(|| {
                         StoreError::storage("read scanned data", "MDBX cursor lost its position")
@@ -556,9 +486,9 @@ impl<'transaction> DataAccess<'transaction> {
                 current = move_scan(&mut cursor, direction)?;
             }
 
-            Ok(ScanBatch {
+            Ok(BorrowedScanBatch {
                 items,
-                continuation: None,
+                limited: false,
             })
         })())
     }
@@ -586,6 +516,27 @@ fn physical_key<'key>(prefix: Option<&[u8; 5]>, logical_key: &'key [u8]) -> Phys
             }
         }
         None => PhysicalKey::Borrowed(logical_key),
+    }
+}
+
+fn logical_key<'transaction>(
+    physical_key: Cow<'transaction, [u8]>,
+    prefix: Option<&[u8; 5]>,
+) -> Option<Cow<'transaction, [u8]>> {
+    let Some(prefix) = prefix else {
+        return Some(physical_key);
+    };
+    match physical_key {
+        Cow::Borrowed(key) => key.strip_prefix(prefix).map(Cow::Borrowed),
+        Cow::Owned(mut key) => {
+            if !key.starts_with(prefix) {
+                return None;
+            }
+            let logical_len = key.len() - prefix.len();
+            key.copy_within(prefix.len().., 0);
+            key.truncate(logical_len);
+            Some(Cow::Owned(key))
+        }
     }
 }
 

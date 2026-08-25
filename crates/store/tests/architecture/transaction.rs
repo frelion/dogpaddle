@@ -243,15 +243,21 @@ fn scan_admission_errors_are_soft() {
 
     let transaction = transactions.begin().unwrap();
     let mut access = data.access(transaction.access()).unwrap();
+    let mut visited = false;
     assert!(matches!(
         access.scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(1, 1).unwrap(),
+            |_| {
+                visited = true;
+                Ok::<(), StoreError>(())
+            },
         ),
         Err(StoreError::ItemTooLarge { .. })
     ));
+    assert!(!visited);
     access
         .put(&b"second".to_vec(), &b"still writable".to_vec())
         .unwrap();

@@ -73,28 +73,36 @@ where
     );
 
     let limit = ScanLimit::new(10, 1_024).unwrap();
-    let left = left
-        .scan(.., ScanDirection::Ascending, None, limit)
+    let mut left_items = Vec::new();
+    let left_continuation = left
+        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
+            left_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
         .unwrap();
-    let right = right
-        .scan(.., ScanDirection::Ascending, None, limit)
+    let mut right_items = Vec::new();
+    let right_continuation = right
+        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
+            right_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
         .unwrap();
     assert_eq!(
-        left.items,
+        left_items,
         vec![
             (Vec::new(), b"left-empty".to_vec()),
             (b"key".to_vec(), b"left".to_vec()),
         ]
     );
-    assert_eq!(left.continuation, None);
+    assert_eq!(left_continuation, None);
     assert_eq!(
-        right.items,
+        right_items,
         vec![
             (Vec::new(), b"right-empty".to_vec()),
             (b"key".to_vec(), b"right".to_vec()),
         ]
     );
-    assert_eq!(right.continuation, None);
+    assert_eq!(right_continuation, None);
 }
 
 #[test]
@@ -109,21 +117,27 @@ fn byte_map_writes_are_visible_inside_the_same_transaction() {
     access.put(&b"a".to_vec(), &b"one".to_vec()).unwrap();
     access.put(&b"b".to_vec(), &b"two".to_vec()).unwrap();
     assert_eq!(access.get(&b"a".to_vec()).unwrap(), Some(b"one".to_vec()));
-    let batch = access
+    let mut items = Vec::new();
+    let continuation = access
         .scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(10, 1_024).unwrap(),
+            |entry| {
+                items.push(entry.decode_owned()?);
+                Ok::<(), StoreError>(())
+            },
         )
         .unwrap();
     assert_eq!(
-        batch.items,
+        items,
         vec![
             (b"a".to_vec(), b"one".to_vec()),
             (b"b".to_vec(), b"two".to_vec()),
         ]
     );
+    assert_eq!(continuation, None);
 }
 
 #[test]
@@ -178,23 +192,25 @@ where
         let mut actual = Vec::new();
         let mut continuation = None;
         loop {
-            let batch = access
+            let mut page = Vec::new();
+            let next = access
                 .scan(
                     ..,
                     direction,
                     continuation.as_ref(),
                     ScanLimit::new(1, 1_024).unwrap(),
+                    |entry| {
+                        page.push(entry.decode_owned()?);
+                        Ok::<(), StoreError>(())
+                    },
                 )
                 .unwrap();
-            assert!(batch.items.len() <= 1);
-            assert_eq!(
-                batch.items,
-                expected[actual.len()..actual.len() + batch.items.len()]
-            );
-            let has_more = actual.len() + batch.items.len() < expected.len();
-            assert_eq!(batch.continuation.is_some(), has_more);
-            actual.extend(batch.items);
-            if let Some(next) = batch.continuation {
+            assert!(page.len() <= 1);
+            assert_eq!(page, expected[actual.len()..actual.len() + page.len()]);
+            let has_more = actual.len() + page.len() < expected.len();
+            assert_eq!(next.is_some(), has_more);
+            actual.extend(page);
+            if let Some(next) = next {
                 assert!(!actual.is_empty());
                 continuation = Some(next);
             } else {

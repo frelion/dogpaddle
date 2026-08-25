@@ -87,13 +87,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(counter.get()?, Some(1));
     assert_eq!(users.get(&42)?.as_deref(), Some("Shiba"));
 
-    let batch = users.scan(
+    let mut users_page = Vec::new();
+    let continuation = users.scan(
         ..,
         ScanDirection::Descending,
         None,
         ScanLimit::new(100, 1024 * 1024)?,
+        |entry| -> Result<(), StoreError> {
+            users_page.push(entry.decode_owned()?);
+            Ok(())
+        },
     )?;
-    assert_eq!(batch.items, vec![(42, "Shiba".to_owned())]);
+    assert_eq!(users_page, vec![(42, "Shiba".to_owned())]);
+    assert_eq!(continuation, None);
     let mut observed = Vec::new();
     let scan = changes.scan(
         0,
@@ -145,15 +151,18 @@ catalog。通过同一能力创建的所有访问值共享事务快照，因此�
 以及提交返回 `TransactionPoisoned`；无法容纳单个扫描项的 `ItemTooLarge` 是可调整 scan
 limit 后重试的软错误，不会毒化事务。
 
-`StoreValue::decode_value` 接收 `Cow<'_, [u8]>`。只读 decoder 应从 `as_ref()` 解析，确实需要
-拥有完整编码的类型应使用 `into_owned()`；两种 variant 表示相同的持久字节，codec 不得依赖
-某个 variant 必然出现。MDBX clean page 可以直接借用，dirty page 则会安全地物化为 owned
-buffer。`StoreKey::decode_key` 仍接收已经由 owned scan 产生的 `Vec<u8>`，不会为没有收益的
-路径扩大 Cow 契约。
+`StoreKey::decode_key` 与 `StoreValue::decode_value` 都接收 `Cow<'_, [u8]>`。只读 decoder 应从
+`as_ref()` 解析，确实需要拥有完整编码的类型应使用 `into_owned()`；两种 variant 表示相同的
+持久字节，codec 不得依赖某个 variant 必然出现。MDBX clean page 可以直接借用，dirty page
+则会安全地物化为 owned buffer。具体 variant 是性能行为，不是正确性契约。
 
-`OrderedMapAccess::scan` 支持有界范围、升序或降序、条目数与逻辑编码字节数双重限制，并
-返回拥有所有权的结果与可选排他续传 key。下一批扫描应复用相同范围和方向，并传入上一批的
-续传 key。
+`OrderedMapAccess::scan` 支持有界范围、升序或降序、条目数与逻辑编码字节数双重限制。它先在
+Store 内完成当前页的范围判断、限额和续传 key 解码，释放 MDBX cursor，随后才把短生命周期的
+`OrderedMapEntry` 逐条交给 callback。因此 callback 可以修改同一事务中的 map，而当前已经准入
+的页保持不变；后续页则读取事务当时的状态。`entry.project` 可以只读取 key、diff 或少数列，
+`entry.decode_owned` 仅在确实需要完整业务对象时物化结果。返回的 `Option<K>` 是排他的续传 key：
+只有当前页达到限制且仍存在另一条匹配记录时才为 `Some`。下一页必须复用相同范围和方向，并把
+它作为 `resume_after` 传回；scan 不会为了判断续传而预读下一条 value。
 
 ## `AppendLog` 语义
 
@@ -224,10 +233,14 @@ cargo bench -p dogpaddle-store --bench append_log_endurance
 `cell` 独立覆盖同事务 warm get，以及每次读取、更新并 durable commit 的状态事务。
 `ordered_map` 为 `Small` 与 `Large` map 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、
 热点读取、升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个 `Small`
-后台命名空间时的预热读取。两种 map 使用各自独立的具名数据对象；byte map 的类型是
-`OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸句柄。可通过
+后台命名空间时的预热读取。扫描还单独覆盖固定宽度 `u64` 完整解码，以及 8 KiB value 的完整
+解码与单字段投影；后者以交错配对样本直接报告 projection 的收益。两种 map 使用各自独立的具名
+数据对象；byte map 的类型是 `OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸句柄。可通过
 `DOGPADDLE_BENCH_ENTRIES`、`DOGPADDLE_BENCH_COMMITS`、`DOGPADDLE_BENCH_SAMPLES`、
-`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES` 与 `DOGPADDLE_BENCH_SCAN_ITEMS` 调整它。
+`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`、`DOGPADDLE_BENCH_SCAN_ITEMS`、
+`DOGPADDLE_BENCH_SCAN_BYTES` 与 `DOGPADDLE_BENCH_WIDE_SCAN_ENTRIES` 调整它。扫描页同时受
+item 和 byte limit 约束；默认 byte budget 为 4 MiB，所以 8 KiB wide workload 的实际页大小
+会先被 byte limit 限制。
 Cell 的读取次数由 `DOGPADDLE_BENCH_CELL_READS` 控制；commit 数与样本数复用
 `DOGPADDLE_BENCH_COMMITS` 和 `DOGPADDLE_BENCH_SAMPLES`。
 

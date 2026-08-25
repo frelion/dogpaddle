@@ -57,12 +57,17 @@ pub trait StoreKey: Sized + Ord {
     /// Returns an error when this key cannot be encoded canonically.
     fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError>;
 
-    /// Decodes owned bytes produced by [`StoreKey::encode_key`].
+    /// Decodes borrowed or owned bytes produced by [`StoreKey::encode_key`].
+    ///
+    /// Both [`Cow::Borrowed`] and [`Cow::Owned`] represent the same logical
+    /// encoding. Implementations must not require one variant: inspect bytes
+    /// through [`AsRef::as_ref`], or call [`Cow::into_owned`] when the decoded
+    /// key can reuse an owned buffer.
     ///
     /// # Errors
     ///
     /// Returns an error when `bytes` is not a valid key for this codec.
-    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError>;
+    fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError>;
 }
 
 impl StoreValue for Vec<u8> {
@@ -80,8 +85,8 @@ impl StoreKey for Vec<u8> {
         Ok(self.as_slice())
     }
 
-    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
-        Ok(bytes)
+    fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        Ok(bytes.into_owned())
     }
 }
 
@@ -101,8 +106,8 @@ impl StoreKey for String {
         Ok(self.as_bytes())
     }
 
-    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
-        String::from_utf8(bytes)
+    fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        String::from_utf8(bytes.into_owned())
             .map_err(|error| CodecError::new(format!("invalid UTF-8 key: {error}")))
     }
 }
@@ -128,9 +133,9 @@ macro_rules! unsigned_codec {
                 Ok(self.to_be_bytes())
             }
 
-            fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
+            fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
                 let array: [u8; size_of::<$ty>()] = bytes
-                    .as_slice()
+                    .as_ref()
                     .try_into()
                     .map_err(|_| CodecError::new(concat!("invalid ", $name, " key length")))?;
                 Ok(<$ty>::from_be_bytes(array))
@@ -163,9 +168,9 @@ impl StoreKey for i64 {
         Ok(bytes)
     }
 
-    fn decode_key(bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         let mut array: [u8; size_of::<Self>()] = bytes
-            .as_slice()
+            .as_ref()
             .try_into()
             .map_err(|_| CodecError::new("invalid i64 key length"))?;
         array[0] ^= 0x80;
@@ -220,7 +225,11 @@ mod tests {
         T: StoreKey + Debug + Eq,
     {
         assert_eq!(value.encode_key().unwrap().as_ref(), expected);
-        assert_eq!(&T::decode_key(expected.to_vec()).unwrap(), value);
+        assert_eq!(&T::decode_key(Cow::Borrowed(expected)).unwrap(), value);
+        assert_eq!(
+            &T::decode_key(Cow::Owned(expected.to_vec())).unwrap(),
+            value
+        );
     }
 
     fn assert_key_codec<T>(values: &[T])
@@ -229,7 +238,10 @@ mod tests {
     {
         for value in values {
             let encoded = value.encode_key().unwrap();
-            assert_eq!(T::decode_key(encoded.as_ref().to_vec()).unwrap(), *value);
+            assert_eq!(
+                T::decode_key(Cow::Borrowed(encoded.as_ref())).unwrap(),
+                *value
+            );
         }
         for pair in values.windows(2) {
             assert!(pair[0] < pair[1]);

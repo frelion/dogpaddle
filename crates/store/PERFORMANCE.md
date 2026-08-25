@@ -19,11 +19,13 @@ microbenchmark 外推成上层吞吐承诺。
 | `AppendLog` 64 MiB 固定窗口长稳 | 处理 1 GiB 后文件为 80/96/112 MiB，后半程波动均为 0% | 前缀 GC 后 MDBX 页可稳定复用 |
 | `Cell<u64>` committed hot get | paired median `1.204x`，5/5 配对胜 | 延迟约降低 17% |
 | `OrderedMap<_, Vec<u8>, _>` point get | 胜负混合，paired median 约 `1.02x–1.04x` | 未观察到稳定回退，也不能归因为加速 |
-| `OrderedMap::scan` | 本轮没有修改 | 仍是 owned scan，不能称为零拷贝 |
+| `OrderedMap::scan`，64 B full decode | paired median `1.296x–1.426x`，39/40 进程级配对胜 | owned batch 改为 bounded Cow + visitor 后稳定改善 |
+| `OrderedMap::scan`，64 B projection | `1.185x–1.204x`，10/10 进程胜 | 小 value 也能跳过完整 value materialization |
+| `OrderedMap::scan`，8 KiB projection | `5.813x–6.307x`，10/10 进程胜 | wide value 的列裁剪收益明确 |
 
-底层收益最明确的三条路径是：AppendLog 批量追加的事务体、AppendLog 连续前缀删除，以及固定
-宽度 value 的 clean point get。durable commit 的磁盘延迟足以掩盖 1 KiB 和 8 KiB append 的
-CPU/body 改善，这是实测负结果，不应删掉。
+底层收益最明确的路径包括 AppendLog 批量追加的事务体、AppendLog 连续前缀删除、固定宽度
+value 的 clean point get，以及 OrderedMap committed scan 的 borrowed admission 与投影。durable
+commit 的磁盘延迟足以掩盖 1 KiB 和 8 KiB append 的 CPU/body 改善，这是实测负结果，不应删掉。
 
 ## 环境与指标口径
 
@@ -37,7 +39,7 @@ CPU/body 改善，这是实测负结果，不应删掉。
 | 读取 | warm cache |
 | 变更样本 | 每个样本使用新临时 Store，构造和校验在计时外 |
 
-本报告使用两种比较：
+本报告使用三种比较：
 
 1. **同二进制配对**：新的 AppendLog benchmark 对相同 records 交错执行 scalar 与 batch，采用
    ABBA/BAAB 顺序，同时报告 paired ratio 和胜出次数。body workload 在活动事务内计时，随后
@@ -181,39 +183,67 @@ Store 的正确性承诺。
 
 ### 当前读取数量级
 
-当前默认 benchmark 使用 100,000 个 `u64 -> Vec<u8>` 条目，value 为 64 B。最新完整运行的
-warm read/scan 中位数如下：
+当前默认 benchmark 使用 100,000 个 `u64 -> Vec<u8>` 条目，常规 value 为 64 B。下表取五个
+after 进程各自 9 个样本中位数的中位数；scan page 同时受 1024 items 和 4 MiB 约束。
 
 | workload | `Small` | `Large` | 说明 |
 |---|---:|---:|---|
-| random point get | 342 ns/次 | 279 ns/次 | 返回 owned 64 B `Vec<u8>` |
-| ascending scan | 133 ns/条 | 129 ns/条 | owned batch，batch size 1024 |
-| descending scan | 133 ns/条 | 128 ns/条 | owned batch，batch size 1024 |
-| overwrite + rollback | 215 ns/次 | 190 ns/次 | 同一事务反复覆盖 |
-| 8 个 Small 背景 namespace 下 point get | 363 ns/次 | 286 ns/次 | target workload 不变 |
+| random point get | 326 ns/次 | 270 ns/次 | 返回 owned 64 B `Vec<u8>` |
+| ascending full scan | 86.8 ns/条 | 89.2 ns/条 | visitor 中执行 `decode_owned` |
+| descending full scan | 86.9 ns/条 | 89.5 ns/条 | visitor 中执行 `decode_owned` |
+| `u64 -> u64` ascending full scan | 85.2 ns/条 | 87.7 ns/条 | after-only 绝对数量级 |
+| overwrite + rollback | 206 ns/次 | 179 ns/次 | 同一事务反复覆盖 |
+| 8 个 Small 背景 namespace 下 point get | 385 ns/次 | 298 ns/次 | target workload 不变 |
 
 `Small` 共享主 B+Tree，`Large` 使用独立 named table。这里的差异只描述当前数据规模和访问形状；
 Size 仍然由对象用途决定，不是根据某一行纳秒数据动态选择。
 
-### Cow 回归门禁
+### owned batch 到 bounded Cow visitor 的 A/B
 
-本轮 point-get 改造也经过优化前后进程级 A/B，但现有 Map benchmark 的 value 是 `Vec<u8>`：
-无论旧路径还是新路径，公开返回 owned `Vec<u8>` 都必须复制一次。因此它只能验证没有稳定回退，
-不能直接证明 Map 获得了 Cow 加速。
+旧实现先构造 public owned key/value batch，再由 typed layer 解码。新实现先在私有 cursor 内完成
+range、续传和 item/byte admission，把有界 `Cow` 页带出 cursor，随后才调用 visitor。下面只比较
+旧、新二进制中完全同形的 100,000 条、64 B value full-decode workload；业务 checksum、方向、
+事务边界、1024 items 与 4 MiB page limit 均相同。
 
-| workload | paired median before/after | after wins | 判定 |
-|---|---:|---:|---|
-| typed key, `Small` | 1.024x | 4/5 | 未观察到稳定回退 |
-| typed key, `Large` | 1.043x | 4/5 | 未观察到稳定回退 |
-| byte key, `Small` | 约 1.030x | 3/5 | 胜负混合，视为无变化 |
-| byte key, `Large` | 约 1.019x | 3/5 | 胜负混合，视为无变化 |
+冻结的 release 二进制按 Before→After / After→Before 平衡顺序运行五对，每个进程内部取 9 个
+样本。paired speedup 是每一对进程中位数的 `before / after`，范围保留全部五对而不是挑最好值。
 
-要单独证明 OrderedMap 的 Cow 正收益，需要增加优化前后同形状的
-`OrderedMap<u64, u64, SIZE>` 基准。本轮没有伪造缺失的 before 数据，也没有把 Cell 的比例直接
-复制给 Map。
+| workload | before median | after median | paired speedup | after wins | 五对范围 |
+|---|---:|---:|---:|---:|---:|
+| byte key ascending，`Small` | 13.426 ms | 10.088 ms | **1.338x** | 5/5 | 1.228–1.425x |
+| byte key ascending，`Large` | 13.227 ms | 10.662 ms | **1.296x** | 5/5 | 1.066–1.442x |
+| byte key descending，`Small` | 12.669 ms | 9.498 ms | **1.369x** | 5/5 | 1.126–1.461x |
+| byte key descending，`Large` | 12.612 ms | 10.127 ms | **1.314x** | 4/5 | 1.000–1.393x |
+| typed key ascending，`Small` | 12.640 ms | 8.683 ms | **1.398x** | 5/5 | 1.064–1.487x |
+| typed key ascending，`Large` | 12.209 ms | 8.919 ms | **1.326x** | 5/5 | 1.246–1.465x |
+| typed key descending，`Small` | 11.990 ms | 8.688 ms | **1.426x** | 5/5 | 1.283–1.441x |
+| typed key descending，`Large` | 12.017 ms | 8.951 ms | **1.343x** | 5/5 | 1.101–1.375x |
 
-OrderedMap scan 本轮完全没有优化：raw scan 仍会物化 owned key/value batch，再由 typed layer
-解码。报告不会称其为 borrowed 或 zero-copy scan。
+八个 workload 中有 39/40 个进程配对改善，elapsed time 约降低 23%–30%。收益不是“所有结果
+都不再复制”：full decode 返回 `Vec<u8>` 时仍需拥有 value。主要变化是 clean committed page
+可以借用 MDBX 编码，避免旧 raw batch 的临时 key/value materialization；typed fixed-width key
+也可直接从借用字节解析。`u64 -> u64` 是新增 after-only workload，没有伪造旧基线，所以这里只
+报告其当前绝对数量级，不计算因果比例。
+
+### 完整解码与 projection
+
+这一组不是旧新实现 A/B，而是在同一个 after 二进制、同一个已填充 fixture 上交错执行 Full 与
+Projected。两种模式都解析同一个 `u64` key、读取 value 首字节并参与同形 checksum；区别仅是
+Full 构造完整 `Vec<u8>`，Projected 直接从 entry 的编码视图读取。每个进程内部仍为 9 个 ABBA
+样本，下表汇总五个进程各自的 paired median。
+
+| value / layout | Full median | Projected median | paired Full / Projected | projection wins | 五进程范围 |
+|---|---:|---:|---:|---:|---:|
+| 64 B，`Small` | 8.828 ms | 7.517 ms | **1.204x** | 5/5 | 1.181–1.222x |
+| 64 B，`Large` | 9.233 ms | 7.714 ms | **1.185x** | 5/5 | 1.160–1.214x |
+| 8 KiB，`Small` | 7.298 ms | 1.213 ms | **6.307x** | 5/5 | 5.208–6.618x |
+| 8 KiB，`Large` | 7.306 ms | 1.268 ms | **5.813x** | 5/5 | 5.637–6.308x |
+
+8 KiB workload 使用 10,000 条 committed records。每项逻辑大小约为 8 B key + 8192 B value，
+所以默认 4 MiB byte budget 先于 1024 item limit 生效，有效页约为 511 条；Full 与 Projected 的
+admission 完全相同。这里能说的是：在 warm committed scan 中，projection 跳过完整
+`StoreValue` decode 和业务对象 materialization。它不是零拷贝承诺：每页仍有私有 `Vec<Cow>`，
+dirty page 仍可能由 MDBX 物化为 owned buffer，scan byte limit 也始终按完整编码计费。
 
 ### Durable 写入波动
 
@@ -226,9 +256,11 @@ durable overwrite 也出现约 0.8–2.7 ms/事务的整轮变化。这个波动
 - 可以说：AppendLog typed batch 明显减少同事务内 metadata/cursor 开销。
 - 可以说：cursor prefix GC 在固定单事务 workload 中稳定降低了总延迟。
 - 可以说：固定宽度 value 的 committed hot get 可以避免临时 `Vec`，Cell 实测约降低 17% 延迟。
+- 可以说：OrderedMap 的 bounded Cow visitor 在同形 64 B full scan A/B 中稳定改善 23%–30%。
+- 可以说：warm committed wide-value scan 中，只读少数字段时 projection 可跳过完整业务对象物化。
 - 不可以说：Flow、Source 或 Stage 吞吐已经提高相同比例；本报告没有测这些上层策略。
 - 不可以说：1 KiB/8 KiB durable append 已稳定变快；配对结果不支持。
-- 不可以说：OrderedMap scan 已零拷贝；本轮没有修改该路径。
+- 不可以说：OrderedMap scan 是零拷贝；它仍保留有界私有 Cow 页，dirty page 也可能物化。
 - 不可以说：所有 `StoreValue` 都会更快；返回 `Vec`/`String` 时仍需拥有结果。
 
 ## 重新运行

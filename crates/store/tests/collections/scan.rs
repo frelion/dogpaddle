@@ -51,29 +51,31 @@ fn collect_pages(
     let mut items = Vec::new();
     let mut continuation = None;
     for _ in 0..100 {
-        let batch = access
+        let mut page = Vec::new();
+        let next = access
             .scan(
                 (lower, upper),
                 direction,
                 continuation.as_ref(),
                 ScanLimit::new(max_items, 4_096).unwrap(),
+                |entry| {
+                    page.push(entry.decode_owned()?);
+                    Ok::<(), StoreError>(())
+                },
             )
             .unwrap();
-        assert!(batch.items.len() <= max_items);
-        assert_eq!(
-            batch.items,
-            expected[items.len()..items.len() + batch.items.len()]
-        );
-        let has_more = items.len() + batch.items.len() < expected.len();
-        assert_eq!(batch.continuation.is_some(), has_more);
+        assert!(page.len() <= max_items);
+        assert_eq!(page, expected[items.len()..items.len() + page.len()]);
+        let has_more = items.len() + page.len() < expected.len();
+        assert_eq!(next.is_some(), has_more);
 
-        if let Some(next) = batch.continuation {
-            assert_eq!(batch.items.last().map(|(key, _)| key), Some(&next));
-            assert!(!batch.items.is_empty());
+        if let Some(next) = next {
+            assert_eq!(page.last().map(|(key, _)| key), Some(&next));
+            assert!(!page.is_empty());
             continuation = Some(next);
-            items.extend(batch.items);
+            items.extend(page);
         } else {
-            items.extend(batch.items);
+            items.extend(page);
             assert_eq!(items.len(), expected.len());
             return items;
         }
@@ -162,26 +164,36 @@ where
 
     let transaction = transactions.begin().unwrap();
     let access = map.access(transaction.access()).unwrap();
-    let first = access
+    let mut first = Vec::new();
+    let first_continuation = access
         .scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(10, 22).unwrap(),
+            |entry| {
+                first.push(entry.decode_owned()?);
+                Ok::<(), StoreError>(())
+            },
         )
         .unwrap();
-    assert_eq!(first.items, vec![(-2, "v-2".into()), (-1, "v-1".into())]);
-    assert_eq!(first.continuation, Some(-1));
-    let second = access
+    assert_eq!(first, vec![(-2, "v-2".into()), (-1, "v-1".into())]);
+    assert_eq!(first_continuation, Some(-1));
+    let mut second = Vec::new();
+    let second_continuation = access
         .scan(
             ..,
             ScanDirection::Ascending,
-            first.continuation.as_ref(),
+            first_continuation.as_ref(),
             ScanLimit::new(10, 22).unwrap(),
+            |entry| {
+                second.push(entry.decode_owned()?);
+                Ok::<(), StoreError>(())
+            },
         )
         .unwrap();
-    assert_eq!(second.items, vec![(0, "v0".into())]);
-    assert_eq!(second.continuation, None);
+    assert_eq!(second, vec![(0, "v0".into())]);
+    assert_eq!(second_continuation, None);
 
     assert!(matches!(
         access.scan(
@@ -189,6 +201,7 @@ where
             ScanDirection::Ascending,
             None,
             ScanLimit::new(10, 10).unwrap(),
+            |_| Ok::<(), StoreError>(()),
         ),
         Err(StoreError::ItemTooLarge {
             size: 11,
@@ -215,12 +228,17 @@ fn continuation_outside_the_range_returns_no_items() {
     let transaction = transactions.begin().unwrap();
     let access = map.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(10, 1_024).unwrap();
+    let mut visits = 0;
     let ascending = access
         .scan(
             (Bound::Included(-1), Bound::Included(1)),
             ScanDirection::Ascending,
             Some(&9),
             limit,
+            |_| {
+                visits += 1;
+                Ok::<(), StoreError>(())
+            },
         )
         .unwrap();
     let descending = access
@@ -229,10 +247,62 @@ fn continuation_outside_the_range_returns_no_items() {
             ScanDirection::Descending,
             Some(&-9),
             limit,
+            |_| {
+                visits += 1;
+                Ok::<(), StoreError>(())
+            },
         )
         .unwrap();
-    assert!(ascending.items.is_empty());
-    assert_eq!(ascending.continuation, None);
-    assert!(descending.items.is_empty());
-    assert_eq!(descending.continuation, None);
+    assert_eq!(visits, 0);
+    assert_eq!(ascending, None);
+    assert_eq!(descending, None);
+}
+
+#[test]
+fn an_exact_page_stops_at_the_neighboring_small_namespace() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let first = create_map::<i64, i64, Small>(&mut store, "first").unwrap();
+    let second = create_map::<i64, i64, Small>(&mut store, "second").unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin().unwrap();
+        first
+            .access(transaction.access())
+            .unwrap()
+            .put(&1, &1)
+            .unwrap();
+        second
+            .access(transaction.access())
+            .unwrap()
+            .put(&2, &2)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let transaction = transactions.begin().unwrap();
+    let limit = ScanLimit::new(1, 1_024).unwrap();
+    let mut first_items = Vec::new();
+    let first_continuation = first
+        .access(transaction.access())
+        .unwrap()
+        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
+            first_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+    let mut second_items = Vec::new();
+    let second_continuation = second
+        .access(transaction.access())
+        .unwrap()
+        .scan(.., ScanDirection::Descending, None, limit, |entry| {
+            second_items.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+
+    assert_eq!(first_items, vec![(1, 1)]);
+    assert_eq!(first_continuation, None);
+    assert_eq!(second_items, vec![(2, 2)]);
+    assert_eq!(second_continuation, None);
 }
