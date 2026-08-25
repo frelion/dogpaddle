@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_operation::OperationDefinition;
+use dogpaddle_operation::{DataBindings, OperationDefinition};
 use dogpaddle_store::{Cell, DataHandle, OrderedMap, Store, StoreError, Transactions};
 
 use crate::{
@@ -151,14 +151,14 @@ fn open_stage(
     definition: &dyn OperationDefinition,
 ) -> Result<Stage, FlowError> {
     let state = OrderedMap::new(open_required_data(store, &codec::stage_state_name(index))?);
-    let mut data = Vec::with_capacity(definition.data_names().len());
+    let mut data = DataBindings::new();
     for logical_name in definition.data_names() {
-        data.push(open_required_data(
-            store,
-            &codec::operation_data_name(index, logical_name),
-        )?);
+        let handle = open_required_data(store, &codec::operation_data_name(index, logical_name))?;
+        data.insert(logical_name, handle)?;
     }
-    Ok(Stage::new(state, definition.materialize(data)?))
+    let operation = definition.materialize(&mut data)?;
+    data.finish()?;
+    Ok(Stage::new(state, operation))
 }
 
 fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError> {

@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::OperationDefinition;
+use dogpaddle_operation::{DataBindings, OperationDefinition};
 use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
 
 use crate::{error::FlowError, flow::Flow, stage::Stage};
@@ -140,14 +140,17 @@ fn create_stage(
 ) -> Result<Stage, FlowError> {
     let state =
         OrderedMap::new(store.create_data(&codec::stage_state_name(index), DataPlacement::Shared)?);
-    let mut data = Vec::with_capacity(definition.data_names().len());
+    let mut data = DataBindings::new();
     for logical_name in definition.data_names() {
-        data.push(store.create_data(
+        let handle = store.create_data(
             &codec::operation_data_name(index, logical_name),
             DataPlacement::Shared,
-        )?);
+        )?;
+        data.insert(logical_name, handle)?;
     }
-    Ok(Stage::new(state, definition.materialize(data)?))
+    let operation = definition.materialize(&mut data)?;
+    data.finish()?;
+    Ok(Stage::new(state, operation))
 }
 
 #[cfg(test)]

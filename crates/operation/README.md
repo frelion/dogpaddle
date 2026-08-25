@@ -12,9 +12,10 @@ Definition 是无副作用、可形式化的数据；实例由 Definition 与 Fl
 ## Definition 与持久化
 
 具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量，并
-向 Flow 声明稳定、有序的逻辑数据名；Flow 负责生成完整资源名、创建或打开 Store 数据空间，
-再把得到的句柄交回 Definition 物化具体实例。Definition 不接收 Store，不决定
-`DataPlacement`，也不开始或提交 Transaction。
+向 Flow 声明稳定逻辑数据名；Flow 负责生成完整资源名、创建或打开 Store 数据空间，再把得到
+的句柄按逻辑名放入具名绑定集合。具体算子按名称取出资源，同时提供 `Cell<T>` 或
+`OrderedMap<K, V>` 等明确的类型化 collection 构造函数；声明顺序不参与绑定。Definition
+不接收 Store，不决定 `DataPlacement`，也不开始或提交 Transaction。
 
 ```rust
 use dogpaddle_operation::{
@@ -81,14 +82,20 @@ Operation 业务逻辑不接收、开始、提交或保存 Transaction。未来 
 ## 扩展约束
 
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
-模块中加入 Definition、Data 和实例，实现两个 sealed trait，并声明唯一稳定 tag、有序逻辑
-数据名、payload codec 与物化逻辑；公共 decoder 表只增加一条 `tag → decode function` 记录。
+模块中加入 Definition、Data 和实例，实现两个 sealed trait，并声明唯一稳定 tag、逻辑资源
+名、payload codec 与物化逻辑；公共 decoder 表只增加一条 `tag → decode function` 记录。
 Flow 的 build/open 不应出现具体算子分支。
 
-一个 Operation 的 tag、payload、逻辑数据名称与顺序、集合类型、值 codec 和构建 placement
-共同构成持久化 schema。修改已有 schema 必须分配新 tag、提升格式版本或提供迁移；不能让
-同一 tag 在不同版本中要求不同资源。编码 tag 与 decoder 表必须复用具体模块中的同一个 tag
-常量，并通过 tag 唯一性、黄金字节、资源布局和 reopen 测试约束。
+分类模块只负责容纳多个具体算子并重导出它们的公共类型，不拥有或重导出分类级的单一 tag
+或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
+分类内增加任意数量的算子都不会产生注册名称冲突。
+
+一个 Operation 的 tag、payload、逻辑数据名称、类型化 collection、值 codec 和构建 placement
+共同构成持久化 schema。materialize 按逻辑名取出绑定，并在同一调用点提供该资源的类型化
+collection 构造函数；绑定集合拒绝重复、缺失或未消费的资源。修改已有 schema 必须分配新
+tag、提升格式版本或提供迁移；不能让同一 tag 在不同版本中要求不同资源。编码 tag 与 decoder
+表必须复用具体模块中的同一个 tag 常量，并通过 tag 唯一性、黄金字节、资源布局和 reopen
+测试约束。
 
 当前所有 Operation 自有资源由 Flow 以 `DataPlacement::Shared` 创建。真正出现 Dedicated
 需求后再扩展资源声明，不提前增加 placement descriptor。

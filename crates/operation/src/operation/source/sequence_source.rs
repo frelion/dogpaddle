@@ -1,14 +1,15 @@
-use dogpaddle_store::{Cell, CellAccess, DataHandle, StoreError};
+use dogpaddle_store::{Cell, CellAccess, StoreError};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, MaterializeError, OperationDefinition,
+    DataBindings, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::Sealed as SealedDefinition,
     operation::{Operation, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
-const DATA_NAMES: &[&str] = &["sequence_source.position"];
+const POSITION: &str = "sequence_source.position";
+const DATA_NAMES: &[&str] = &[POSITION];
 
 /// Pure definition of a monotonically increasing source.
 ///
@@ -69,16 +70,11 @@ impl OperationDefinition for SequenceSourceDefinition {
         DATA_NAMES
     }
 
-    fn materialize(&self, data: Vec<DataHandle>) -> Result<Box<dyn Operation>, MaterializeError> {
-        let actual = data.len();
-        let [position]: [DataHandle; 1] =
-            data.try_into().map_err(|_| MaterializeError::DataCount {
-                expected: 1,
-                actual,
-            })?;
+    fn materialize(&self, data: &mut DataBindings) -> Result<Box<dyn Operation>, MaterializeError> {
+        let position = data.take(POSITION, Cell::<u64>::new)?;
         Ok(Box::new(SequenceSourceOperation::new(
             *self,
-            SequenceSourceData::new(Cell::new(position)),
+            SequenceSourceData::new(position),
         )))
     }
 

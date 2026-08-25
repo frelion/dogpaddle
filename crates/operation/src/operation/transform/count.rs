@@ -1,14 +1,15 @@
-use dogpaddle_store::{Cell, CellAccess, DataHandle, StoreError};
+use dogpaddle_store::{Cell, CellAccess, StoreError};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, MaterializeError, OperationDefinition,
+    DataBindings, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::Sealed as SealedDefinition,
     operation::{Operation, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 2;
-const DATA_NAMES: &[&str] = &["count"];
+const COUNT: &str = "count";
+const DATA_NAMES: &[&str] = &[COUNT];
 
 /// Pure definition of a running count operation.
 ///
@@ -68,17 +69,9 @@ impl OperationDefinition for CountDefinition {
         DATA_NAMES
     }
 
-    fn materialize(&self, data: Vec<DataHandle>) -> Result<Box<dyn Operation>, MaterializeError> {
-        let actual = data.len();
-        let [count]: [DataHandle; 1] =
-            data.try_into().map_err(|_| MaterializeError::DataCount {
-                expected: 1,
-                actual,
-            })?;
-        Ok(Box::new(CountOperation::new(
-            *self,
-            CountData::new(Cell::new(count)),
-        )))
+    fn materialize(&self, data: &mut DataBindings) -> Result<Box<dyn Operation>, MaterializeError> {
+        let count = data.take(COUNT, Cell::<u64>::new)?;
+        Ok(Box::new(CountOperation::new(*self, CountData::new(count))))
     }
 
     fn persistence_tag(&self) -> u16 {

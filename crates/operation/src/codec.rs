@@ -11,8 +11,11 @@ const FORMAT_VERSION: u16 = 1;
 pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
 
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
-    (source::TAG, source::decode_definition),
-    (transform::TAG, transform::decode_definition),
+    (
+        source::sequence_source::TAG,
+        source::sequence_source::decode_definition,
+    ),
+    (transform::count::TAG, transform::count::decode_definition),
 ];
 
 /// Stable operation-definition encoding failure.

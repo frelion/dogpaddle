@@ -5,7 +5,7 @@ mod definition;
 pub mod operation;
 
 pub use codec::{DefinitionCodecError, decode_definition, encode_definition};
-pub use definition::{MaterializeError, OperationDefinition};
+pub use definition::{DataBindings, MaterializeError, OperationDefinition};
 
 #[cfg(test)]
 mod tests;

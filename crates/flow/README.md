@@ -41,9 +41,10 @@ fan-out 和重复 source；输入数量必须与具体 Definition 完全一致�
 ## 持久化边界
 
 每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
-持久化 state map，并按 Operation Definition 的有序逻辑数据名声明全部状态空间，最后提交
-manifest Cell 作为构建完成标记。Flow 负责完整资源名、`DataPlacement` 和 Store create/open；
-Definition 只用已解析的 `DataHandle` 物化具体 Operation。Flow state map 保留生命周期状态；
+持久化 state map，并按 Operation Definition 的逻辑数据名声明全部状态空间，最后提交
+manifest Cell 作为构建完成标记。Flow 负责完整资源名、`DataPlacement` 和 Store create/open，
+并把句柄按逻辑名放入 `DataBindings`；Definition 按名称取出资源并在同一调用点构造成明确的
+类型化 collection，声明顺序不参与绑定。Flow state map 保留生命周期状态；
 Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续运行层只能在这些 map 的
 键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
 

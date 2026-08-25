@@ -1,5 +1,5 @@
 use dogpaddle_operation::{
-    MaterializeError, OperationDefinition, encode_definition,
+    DataBindings, MaterializeError, OperationDefinition, encode_definition,
     operation::{
         Operation,
         source::{SequenceSourceData, SequenceSourceDefinition, SequenceSourceOperation},
@@ -59,10 +59,17 @@ fn definitions_materialize_exact_declared_data_shapes() {
     assert_eq!(source_definition.data_names(), ["sequence_source.position"]);
     assert_eq!(count_definition.data_names(), ["count"]);
 
-    let source = source_definition
-        .materialize(vec![source_position])
+    let mut source_data = DataBindings::new();
+    source_data
+        .insert("sequence_source.position", source_position)
         .unwrap();
-    let count = count_definition.materialize(vec![count]).unwrap();
+    let source = source_definition.materialize(&mut source_data).unwrap();
+    source_data.finish().unwrap();
+
+    let mut count_data = DataBindings::new();
+    count_data.insert("count", count).unwrap();
+    let count = count_definition.materialize(&mut count_data).unwrap();
+    count_data.finish().unwrap();
     assert_eq!(
         encode_definition(source.definition()),
         encode_definition(&source_definition)
@@ -72,11 +79,9 @@ fn definitions_materialize_exact_declared_data_shapes() {
         encode_definition(&count_definition)
     );
 
-    assert!(matches!(
-        count_definition.materialize(Vec::new()),
-        Err(MaterializeError::DataCount {
-            expected: 1,
-            actual: 0,
-        })
-    ));
+    let mut missing = DataBindings::new();
+    let Err(error) = count_definition.materialize(&mut missing) else {
+        panic!("count unexpectedly materialized without its named data binding");
+    };
+    assert_eq!(error, MaterializeError::MissingData { name: "count" });
 }
