@@ -80,9 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
-    let access = transaction.access();
-    let mut count = operation.count().access(access)?;
-    assert_eq!(operation.apply(&mut count)?, 1);
+    assert_eq!(operation.apply(transaction.access())?, 1);
     transaction.commit()?;
     Ok(())
 }

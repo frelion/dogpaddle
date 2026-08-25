@@ -1,4 +1,4 @@
-use dogpaddle_store::{Cell, CellAccess, Small, StoreError};
+use dogpaddle_store::{Cell, Small, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -98,24 +98,19 @@ impl SequenceSourceOperation {
         &self.definition
     }
 
-    /// Returns the cell storing the last committed emitted value.
-    #[must_use]
-    pub const fn position(&self) -> &Cell<u64, Small> {
-        &self.position
-    }
-
     /// Produces and records the next sequence value.
     ///
     /// A missing position emits the configured start value. Otherwise the last
-    /// committed value is incremented. The caller owns the transaction that
-    /// produced `position` and decides whether to commit the new position and
-    /// returned output together.
+    /// committed value is incremented. The operation binds its own position
+    /// cell through `access`; the caller retains transaction ownership and
+    /// decides whether to commit the new position and returned output together.
     ///
     /// # Errors
     ///
     /// Returns [`SequenceSourceError::Exhausted`] after [`u64::MAX`] has been emitted.
     /// Storage and codec failures are returned as [`SequenceSourceError::Store`].
-    pub fn apply(&self, position: &mut CellAccess<'_, u64>) -> Result<u64, SequenceSourceError> {
+    pub fn apply(&self, access: TransactionAccess<'_>) -> Result<u64, SequenceSourceError> {
+        let mut position = self.position.access(access)?;
         let next = match position.get()? {
             Some(previous) => previous
                 .checked_add(1)

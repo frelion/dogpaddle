@@ -22,9 +22,8 @@ fn count_starts_at_zero_and_continues_after_reopen() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut count = operation.count().access(transaction.access()).unwrap();
-        assert_eq!(operation.apply(&mut count).unwrap(), 1);
-        assert_eq!(operation.apply(&mut count).unwrap(), 2);
+        assert_eq!(operation.apply(transaction.access()).unwrap(), 1);
+        assert_eq!(operation.apply(transaction.access()).unwrap(), 2);
         transaction.commit().unwrap();
     }
     drop(transactions);
@@ -34,8 +33,7 @@ fn count_starts_at_zero_and_continues_after_reopen() {
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-    let mut count = operation.count().access(transaction.access()).unwrap();
-    assert_eq!(operation.apply(&mut count).unwrap(), 3);
+    assert_eq!(operation.apply(transaction.access()).unwrap(), 3);
     transaction.commit().unwrap();
 }
 
@@ -49,13 +47,11 @@ fn dropping_the_transaction_rolls_back_count_progress() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut count = operation.count().access(transaction.access()).unwrap();
-        assert_eq!(operation.apply(&mut count).unwrap(), 1);
+        assert_eq!(operation.apply(transaction.access()).unwrap(), 1);
     }
 
     let transaction = transactions.begin().unwrap();
-    let mut count = operation.count().access(transaction.access()).unwrap();
-    assert_eq!(operation.apply(&mut count).unwrap(), 1);
+    assert_eq!(operation.apply(transaction.access()).unwrap(), 1);
     transaction.commit().unwrap();
 }
 
@@ -64,13 +60,13 @@ fn count_rejects_overflow_without_changing_the_cell() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
     let count = store.create_data::<Cell<u64, Small>>("count").unwrap();
+    let count_state = count.clone();
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();
 
     {
         let transaction = transactions.begin().unwrap();
-        operation
-            .count()
+        count_state
             .access(transaction.access())
             .unwrap()
             .set(&u64::MAX)
@@ -79,10 +75,10 @@ fn count_rejects_overflow_without_changing_the_cell() {
     }
 
     let transaction = transactions.begin().unwrap();
-    let mut count = operation.count().access(transaction.access()).unwrap();
-    assert!(matches!(
-        operation.apply(&mut count),
-        Err(CountError::Overflow)
-    ));
-    assert_eq!(count.get().unwrap(), Some(u64::MAX));
+    let access = transaction.access();
+    assert!(matches!(operation.apply(access), Err(CountError::Overflow)));
+    assert_eq!(
+        count_state.access(access).unwrap().get().unwrap(),
+        Some(u64::MAX)
+    );
 }

@@ -1,4 +1,4 @@
-use dogpaddle_store::{Cell, CellAccess, Small, StoreError};
+use dogpaddle_store::{Cell, Small, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -92,23 +92,19 @@ impl CountOperation {
         &self.definition
     }
 
-    /// Returns the cell holding the committed count.
-    #[must_use]
-    pub const fn count(&self) -> &Cell<u64, Small> {
-        &self.count
-    }
-
     /// Applies one accepted input and returns the updated running count.
     ///
-    /// A missing cell value is interpreted as zero. The caller owns the
-    /// transaction that produced `count` and decides whether to commit or roll
-    /// back the state change and returned output together.
+    /// A missing cell value is interpreted as zero. The operation binds its
+    /// own count cell through `access`; the caller retains transaction
+    /// ownership and decides whether to commit or roll back the state change
+    /// and returned output together.
     ///
     /// # Errors
     ///
     /// Returns [`CountError::Overflow`] rather than wrapping at [`u64::MAX`].
     /// Storage and codec failures are returned as [`CountError::Store`].
-    pub fn apply(&self, count: &mut CellAccess<'_, u64>) -> Result<u64, CountError> {
+    pub fn apply(&self, access: TransactionAccess<'_>) -> Result<u64, CountError> {
+        let mut count = self.count.access(access)?;
         let next = count
             .get()?
             .unwrap_or_default()
