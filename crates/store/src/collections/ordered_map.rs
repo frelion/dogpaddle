@@ -8,10 +8,12 @@ use crate::{
     StoreValue, Transaction,
 };
 
+type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
+
 /// A typed ordered key/value map over one generic data namespace.
-pub struct OrderedMap<K, V> {
+pub struct OrderedMap<K, V, SIZE> {
     data: DataHandle,
-    _types: PhantomData<fn() -> (K, V)>,
+    _types: PhantomData<MapTypes<K, V, SIZE>>,
 }
 
 /// Transaction-bound access to an [`OrderedMap`].
@@ -20,10 +22,8 @@ pub struct OrderedMapAccess<'transaction, K, V> {
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-impl<K: StoreKey, V: StoreValue> OrderedMap<K, V> {
-    /// Wraps an existing generic data handle with ordered map behavior.
-    #[must_use]
-    pub fn new(data: DataHandle) -> Self {
+impl<K: StoreKey, V: StoreValue, SIZE> OrderedMap<K, V, SIZE> {
+    pub(crate) fn from_handle(data: DataHandle) -> Self {
         Self {
             data,
             _types: PhantomData,
@@ -34,7 +34,7 @@ impl<K: StoreKey, V: StoreValue> OrderedMap<K, V> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the handle belongs to another store or the
+    /// Returns an error when this data object belongs to another store or the
     /// transaction is already poisoned.
     pub fn access<'transaction>(
         &self,
@@ -138,7 +138,7 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
     }
 }
 
-impl<K, V> Clone for OrderedMap<K, V> {
+impl<K, V, SIZE> Clone for OrderedMap<K, V, SIZE> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),

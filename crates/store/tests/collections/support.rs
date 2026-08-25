@@ -1,11 +1,7 @@
 use std::path::PathBuf;
 
-use dogpaddle_store::{
-    CodecError, DataPlacement, OrderedMap, Store, StoreError, StoreKey, StoreValue,
-};
+use dogpaddle_store::{CodecError, OrderedMap, Store, StoreData, StoreError, StoreKey, StoreValue};
 use tempfile::TempDir;
-
-pub const PLACEMENTS: [DataPlacement; 2] = [DataPlacement::Shared, DataPlacement::Dedicated];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestValue(pub u64);
@@ -24,10 +20,12 @@ pub fn store_path(root: &TempDir) -> PathBuf {
     root.path().join("store")
 }
 
-pub fn create_map<K: StoreKey, V: StoreValue>(
+pub fn create_map<K: StoreKey, V: StoreValue, SIZE>(
     store: &mut Store,
     name: &str,
-    placement: DataPlacement,
-) -> Result<OrderedMap<K, V>, StoreError> {
-    Ok(OrderedMap::new(store.create_data(name, placement)?))
+) -> Result<OrderedMap<K, V, SIZE>, StoreError>
+where
+    OrderedMap<K, V, SIZE>: StoreData,
+{
+    store.create_data(name)
 }

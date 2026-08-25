@@ -18,7 +18,7 @@ pub enum FlowError {
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// Provisioned data handles do not match an operation definition.
+    /// Materialized typed data instances do not match an operation definition.
     #[error(transparent)]
     Materialize(#[from] MaterializeError),
     /// A Store exists, but no complete Flow definition was published.

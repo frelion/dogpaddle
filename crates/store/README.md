@@ -1,47 +1,58 @@
 # dogpaddle-store
 
-`dogpaddle-store` 是 `DogPaddle` 内部的事务状态层。它基于 MDBX 提供命名键值空间、
-原子事务、编解码器和类型化集合，为 Flow 的运行进度与 Operation 状态提供统一的持久化
-边界。该 crate 是引擎实现模块，不是最终面向用户的存储产品。
+`dogpaddle-store` 是 `DogPaddle` 内部的事务状态层。它基于 MDBX 提供具名的类型化数据对象、
+原子事务和稳定编解码器，为 Flow 运行进度与 Operation 状态提供统一的持久化边界。该 crate
+是引擎实现模块，不是最终面向用户的通用存储产品。
 
 ## 能力分层
 
-`dogpaddle-store` 将初始化配置与运行时访问分离：
+Store 将资源装配与运行时访问分离：
 
-- `Store` 创建和打开命名数据；进入运行期前，其所有权会被消费；
+- `Store` 创建或打开全部具名数据对象；进入运行期前，其所有权会被消费；
+- `Cell<T, SIZE>` 保存一个可选的类型化值；
+- `OrderedMap<K, V, SIZE>` 保存按稳定 key codec 排序的类型化映射；
 - `Transactions` 是运行期内启动事务的唯一能力；
-- `DataHandle` 表示一个命名的、经过编码的键值命名空间；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
-- 与事务绑定的访问值负责执行实际的数据操作。
+- `CellAccess` 与 `OrderedMapAccess` 绑定一次具体事务并执行实际读写。
 
-类型化数据结构位于 `collections/`，并组合通用句柄。它们自行管理编解码器和语义；
-事务本身并不知道 `Cell` 或 `OrderedMap`。
+底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
+也不能绕过类型上的 Size 自行组合物理资源。
 
-## 数据放置
+## Size 是持久化 schema
 
-持久化目录将名称绑定到经过编码的键值命名空间及其物理放置方式。它不记录或验证集合
-类型与编解码器。重新打开数据句柄时，必须使用与写入内容时相同的集合和编解码器。
-`Store::open` 会验证目录标记、分配计数、catalog 名称与 binding 的唯一性和范围，并确认
-所有已声明 Dedicated 表存在；这些元数据不变量不一致时返回 `InvalidStore`，不会让两个
-逻辑命名空间静默绑定到同一物理位置。
+每个持久化数据对象都必须显式选择 `Small` 或 `Large`，没有默认值：
 
-`DataPlacement::Shared` 适合数量较多、规模较小或频繁提交的命名空间，它们共享主
-B+Tree。`DataPlacement::Dedicated` 为热点或面向批处理的命名空间分配独立的 MDBX
-命名表。放置方式在初始化时选定一次并持久化到目录中，对集合 API 不可见。单个 Store
-最多支持 `Store::DEDICATED_CAPACITY` 个独立命名空间；具体工作负载应通过基准测试选择。
+```rust
+use dogpaddle_store::{Cell, Large, OrderedMap, Small};
+
+type Counter = Cell<u64, Small>;
+type Cache = OrderedMap<u64, String, Small>;
+type Records = OrderedMap<u64, Vec<u8>, Large>;
+```
+
+Size 描述这个具名对象的静态存储类别，不是运行时容量上限，也不会根据当前数据量自动改变：
+
+- `Small` 与其他小对象共享主 B+Tree，适合数量较多、规模较小或频繁提交的状态；
+- `Large` 使用独立的 MDBX named table，适合可能很大、热点或面向批处理的数据；
+- 单个 Store 最多包含 `Store::LARGE_DATA_CAPACITY` 个 Large 对象。
+
+Size 在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。`Store::open_data::<D>` 会
+校验请求类型的 Size；以 `Large` 打开实际为 `Small` 的资源，或反过来，都会返回
+`StoreError::DataSizeMismatch`。
+
+Store catalog 不记录或验证 `Cell`/`OrderedMap`、`K`、`V` 或 codec 类型。同一个 Size 下，
+调用方必须按照创建者定义的稳定 schema 重新打开数据。不要把 Rust `TypeId`、类型名或内存
+布局当作磁盘格式。
 
 ## 完整示例
 
 ```rust,no_run
-use dogpaddle_store::DataPlacement::{Dedicated, Shared};
-use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store};
+use dogpaddle_store::{Cell, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::create("./dogpaddle-store-data")?;
-    let counter_data = store.create_data("counter", Shared)?;
-    let users_data = store.create_data("users", Dedicated)?;
-    let counter = Cell::<u64>::new(counter_data);
-    let users = OrderedMap::<u64, String>::new(users_data);
+    let counter = store.create_data::<Cell<u64, Small>>("counter")?;
+    let users = store.create_data::<OrderedMap<u64, String, Large>>("users")?;
 
     let mut transactions = store.into_transactions();
 
@@ -72,17 +83,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+重新打开时必须声明同一个完整数据类型：
+
+```rust,no_run
+use dogpaddle_store::{Cell, Small, Store};
+
+# fn open() -> Result<(), Box<dyn std::error::Error>> {
+let store = Store::open("./dogpaddle-store-data")?;
+let counter = store.open_data::<Cell<u64, Small>>("counter")?;
+let mut transactions = store.into_transactions();
+let transaction = transactions.begin()?;
+assert_eq!(counter.access(&transaction)?.get()?, Some(1));
+# Ok(())
+# }
+```
+
+`StoreData` 是 Store generic create/open 使用的 sealed marker trait。它只由内建集合的
+`Small`/`Large` 形式实现；一般业务代码不需要直接引用它。
+
 ## 事务与扫描语义
 
-丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。通过所有
-访问值进行的读写共享同一事务快照，因此任意数量的数据对象都可以原子提交。MDBX 适配器
-和物理布局均为私有实现。访问值只在一次尝试中有效：每个新事务都必须重新绑定，不能跨
-Stage 步骤缓存。
+丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。通过所有访问
+值进行的读写共享同一事务快照，因此任意数量、任意 Size 的数据对象都可以原子提交。访问值
+只在一次事务尝试中有效：每个新事务都必须重新绑定，不能跨 Stage 步骤缓存。
 
-`DataHandle::access` 提供点读取、写入、删除和双向有界有序扫描。扫描返回拥有所有权的
-数据项和一个可选的排他续传键；下一批扫描应复用相同的范围与方向，并传入该续传键。
-内置集合通过同一个事务中毒边界执行编解码。自定义集合应使用
-`DataAccess::poison_on_error` 处理严重的编解码或不变量错误；原始存储错误会被自动分类。
+内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
+以及提交返回 `TransactionPoisoned`；无法容纳单个扫描项的 `ItemTooLarge` 是可调整 scan
+limit 后重试的软错误，不会毒化事务。
+
+`OrderedMapAccess::scan` 支持有界范围、升序或降序、条目数与逻辑编码字节数双重限制，并
+返回拥有所有权的结果与可选排他续传 key。下一批扫描应复用相同范围和方向，并传入上一批的
+续传 key。
 
 ## 测试
 
@@ -100,6 +131,10 @@ cargo test -p dogpaddle-store --test architecture transaction::
 cargo test -p dogpaddle-store --test collections scan::
 ```
 
+架构测试会对 Small 与 Large 运行相同的数据、事务与扫描语义，并通过 MDBX 白盒适配器锁定
+catalog binding、共享前缀和独立 named table 的物理布局。错误 Size reopen、崩溃恢复、事务
+中毒和 codec 失败也有独立覆盖。
+
 ## 性能
 
 使用以下命令运行 release 模式的存储基准测试：
@@ -108,10 +143,11 @@ cargo test -p dogpaddle-store --test collections scan::
 cargo bench -p dogpaddle-store --bench store
 ```
 
-基准测试会为 `Shared` 和 `Dedicated` 生成成对样本，覆盖原始与类型化批量写入、点读取、
-升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个共享后台命名
-空间时的预热读取。结果包含最小值、中位数和最大值；它们描述当前机器与临时文件系统上的
-表现，不代表冷缓存或断电场景。
+基准测试为 Small 与 Large 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、热点
+读取、升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个 Small 后台
+命名空间时的预热读取。byte map 使用 `OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸
+句柄。结果包含最小值、中位数和最大值；它们描述当前机器与临时文件系统上的表现，不代表冷
+缓存或断电场景。
 
 可通过 `DOGPADDLE_BENCH_ENTRIES`、`DOGPADDLE_BENCH_COMMITS`、
 `DOGPADDLE_BENCH_SAMPLES` 和 `DOGPADDLE_BENCH_BACKGROUND_NAMESPACES` 调整工作负载

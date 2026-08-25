@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{DataBindings, OperationDefinition};
-use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
+use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition};
+use dogpaddle_store::{Cell, OrderedMap, Small, Store};
 
 use crate::{error::FlowError, flow::Flow, stage::Stage};
 
@@ -95,12 +96,13 @@ impl FlowBuilder {
     pub fn build(self) -> Result<Flow, FlowError> {
         let path = self.path.clone();
         let definition = self.finish_definition()?;
+        validate_data_declarations(&definition)?;
         let definition_bytes = codec::encode(&definition)?;
 
         let mut store = Store::create(&path)?;
-        let published =
-            Cell::new(store.create_data(codec::DEFINITION_DATA_NAME, DataPlacement::Shared)?);
-        let flow_state = store.create_data(codec::FLOW_STATE_DATA_NAME, DataPlacement::Shared)?;
+        let published: Cell<Vec<u8>, Small> = store.create_data(codec::DEFINITION_DATA_NAME)?;
+        let flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+            store.create_data(codec::FLOW_STATE_DATA_NAME)?;
         let stages = create_stages(&mut store, &definition)?;
         let mut transactions = store.into_transactions();
         {
@@ -113,7 +115,7 @@ impl FlowBuilder {
         Ok(Flow::from_build(
             path,
             definition,
-            OrderedMap::new(flow_state),
+            flow_state,
             stages,
             transactions,
         ))
@@ -122,6 +124,20 @@ impl FlowBuilder {
     fn finish_definition(self) -> Result<FlowDefinition, TopologyError> {
         validate::finish_definition(self.token, self.stages, &self.connections)
     }
+}
+
+fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), MaterializeError> {
+    for stage in definition.stages() {
+        let mut names = BTreeSet::new();
+        for declaration in stage.operation().data() {
+            if !names.insert(declaration.name()) {
+                return Err(MaterializeError::DuplicateData {
+                    name: declaration.name(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create_stages(store: &mut Store, definition: &FlowDefinition) -> Result<Vec<Stage>, FlowError> {
@@ -138,15 +154,12 @@ fn create_stage(
     index: usize,
     definition: &dyn OperationDefinition,
 ) -> Result<Stage, FlowError> {
-    let state =
-        OrderedMap::new(store.create_data(&codec::stage_state_name(index), DataPlacement::Shared)?);
-    let mut data = DataBindings::new();
-    for logical_name in definition.data_names() {
-        let handle = store.create_data(
-            &codec::operation_data_name(index, logical_name),
-            DataPlacement::Shared,
-        )?;
-        data.insert(logical_name, handle)?;
+    let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data(&codec::stage_state_name(index))?;
+    let mut data = DataInstances::new();
+    for declaration in definition.data() {
+        let physical_name = codec::operation_data_name(index, declaration.name());
+        data.insert(declaration.create(store, &physical_name)?)?;
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;

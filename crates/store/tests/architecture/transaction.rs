@@ -1,44 +1,56 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use dogpaddle_store::{DataPlacement, ScanDirection, ScanLimit, Store, StoreError};
+use dogpaddle_store::{Large, ScanDirection, ScanLimit, Small, Store, StoreError};
 
-use crate::support::store_path;
+use crate::support::{create_byte_map, open_byte_map, store_path};
 
 #[test]
-fn commit_is_atomic_across_shared_and_dedicated_data() {
+fn commit_is_atomic_across_small_and_large_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    let shared = store.create_data("shared", DataPlacement::Shared).unwrap();
-    let dedicated = store
-        .create_data("dedicated", DataPlacement::Dedicated)
-        .unwrap();
+    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
+    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
     let mut transactions = store.into_transactions();
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut shared = shared.access(&transaction).unwrap();
-        let mut dedicated = dedicated.access(&transaction).unwrap();
-        shared.put(b"key", b"shared").unwrap();
-        dedicated.put(b"key", b"dedicated").unwrap();
-        assert_eq!(shared.get(b"key").unwrap(), Some(b"shared".to_vec()));
-        assert_eq!(dedicated.get(b"key").unwrap(), Some(b"dedicated".to_vec()));
+        let mut small = small.access(&transaction).unwrap();
+        let mut large = large.access(&transaction).unwrap();
+        small.put(&b"key".to_vec(), &b"small".to_vec()).unwrap();
+        large.put(&b"key".to_vec(), &b"large".to_vec()).unwrap();
+        assert_eq!(
+            small.get(&b"key".to_vec()).unwrap(),
+            Some(b"small".to_vec())
+        );
+        assert_eq!(
+            large.get(&b"key".to_vec()).unwrap(),
+            Some(b"large".to_vec())
+        );
         transaction.commit().unwrap();
     }
     drop(transactions);
 
     let store = Store::open(&path).unwrap();
-    let shared = store.open_data("shared").unwrap();
-    let dedicated = store.open_data("dedicated").unwrap();
+    let small = open_byte_map::<Small>(&store, "small").unwrap();
+    let large = open_byte_map::<Large>(&store, "large").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        shared.access(&transaction).unwrap().get(b"key").unwrap(),
-        Some(b"shared".to_vec())
+        small
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"small".to_vec())
     );
     assert_eq!(
-        dedicated.access(&transaction).unwrap().get(b"key").unwrap(),
-        Some(b"dedicated".to_vec())
+        large
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"large".to_vec())
     );
 }
 
@@ -46,33 +58,39 @@ fn commit_is_atomic_across_shared_and_dedicated_data() {
 fn dropping_a_transaction_rolls_back_every_namespace() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let shared = store.create_data("shared", DataPlacement::Shared).unwrap();
-    let dedicated = store
-        .create_data("dedicated", DataPlacement::Dedicated)
-        .unwrap();
+    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
+    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
     let mut transactions = store.into_transactions();
 
     {
         let transaction = transactions.begin().unwrap();
-        shared
+        small
             .access(&transaction)
             .unwrap()
-            .put(b"key", b"shared")
+            .put(&b"key".to_vec(), &b"small".to_vec())
             .unwrap();
-        dedicated
+        large
             .access(&transaction)
             .unwrap()
-            .put(b"key", b"dedicated")
+            .put(&b"key".to_vec(), &b"large".to_vec())
             .unwrap();
     }
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        shared.access(&transaction).unwrap().get(b"key").unwrap(),
+        small
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         None
     );
     assert_eq!(
-        dedicated.access(&transaction).unwrap().get(b"key").unwrap(),
+        large
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         None
     );
 }
@@ -81,14 +99,14 @@ fn dropping_a_transaction_rolls_back_every_namespace() {
 fn panic_rolls_back_the_transaction() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let data = store.create_data("data", DataPlacement::Shared).unwrap();
+    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
     let mut transactions = store.into_transactions();
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
         let transaction = transactions.begin().unwrap();
         data.access(&transaction)
             .unwrap()
-            .put(b"key", b"value")
+            .put(&b"key".to_vec(), &b"value".to_vec())
             .unwrap();
         panic!("stop the attempt");
     }));
@@ -96,7 +114,10 @@ fn panic_rolls_back_the_transaction() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction).unwrap().get(b"key").unwrap(),
+        data.access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         None
     );
 }
@@ -105,25 +126,23 @@ fn panic_rolls_back_the_transaction() {
 fn wrong_store_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut first_store = Store::create(root.path().join("first")).unwrap();
-    let first = first_store
-        .create_data("data", DataPlacement::Shared)
-        .unwrap();
+    let first = create_byte_map::<Small>(&mut first_store, "data").unwrap();
     let mut first_transactions = first_store.into_transactions();
 
     let mut second_store = Store::create(root.path().join("second")).unwrap();
-    let second = second_store
-        .create_data("data", DataPlacement::Shared)
-        .unwrap();
+    let second = create_byte_map::<Small>(&mut second_store, "data").unwrap();
 
     let transaction = first_transactions.begin().unwrap();
     let mut first_access = first.access(&transaction).unwrap();
-    first_access.put(b"key", b"value").unwrap();
+    first_access
+        .put(&b"key".to_vec(), &b"value".to_vec())
+        .unwrap();
     assert!(matches!(
         second.access(&transaction),
         Err(StoreError::WrongStore)
     ));
     assert!(matches!(
-        first_access.get(b"key"),
+        first_access.get(&b"key".to_vec()),
         Err(StoreError::TransactionPoisoned)
     ));
     assert!(matches!(
@@ -133,21 +152,25 @@ fn wrong_store_poison_rolls_back_prior_writes() {
 
     let transaction = first_transactions.begin().unwrap();
     assert_eq!(
-        first.access(&transaction).unwrap().get(b"key").unwrap(),
+        first
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         None
     );
 }
 
 #[test]
-fn handles_from_a_previous_open_are_rejected() {
+fn data_objects_from_a_previous_open_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    let stale = store.create_data("data", DataPlacement::Shared).unwrap();
+    let stale = create_byte_map::<Small>(&mut store, "data").unwrap();
     drop(store);
 
     let store = Store::open(&path).unwrap();
-    let current = store.open_data("data").unwrap();
+    let current = open_byte_map::<Small>(&store, "data").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert!(matches!(
@@ -160,46 +183,17 @@ fn handles_from_a_previous_open_are_rejected() {
     ));
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BrokenInvariant;
-
-#[test]
-fn client_errors_can_poison_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = store.create_data("data", DataPlacement::Shared).unwrap();
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin().unwrap();
-    let mut access = data.access(&transaction).unwrap();
-    access.put(b"key", b"value").unwrap();
-    assert_eq!(
-        access.poison_on_error(Err::<(), _>(BrokenInvariant)),
-        Err(BrokenInvariant)
-    );
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        data.access(&transaction).unwrap().get(b"key").unwrap(),
-        None
-    );
-}
-
 #[test]
 fn scan_admission_errors_are_soft() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let data = store.create_data("data", DataPlacement::Shared).unwrap();
+    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
     data.access(&transaction)
         .unwrap()
-        .put(b"key", b"wide")
+        .put(&b"key".to_vec(), &b"wide".to_vec())
         .unwrap();
     transaction.commit().unwrap();
 
@@ -214,12 +208,17 @@ fn scan_admission_errors_are_soft() {
         ),
         Err(StoreError::ItemTooLarge { .. })
     ));
-    access.put(b"second", b"still writable").unwrap();
+    access
+        .put(&b"second".to_vec(), &b"still writable".to_vec())
+        .unwrap();
     transaction.commit().unwrap();
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction).unwrap().get(b"second").unwrap(),
+        data.access(&transaction)
+            .unwrap()
+            .get(&b"second".to_vec())
+            .unwrap(),
         Some(b"still writable".to_vec())
     );
 }
@@ -228,7 +227,7 @@ fn scan_admission_errors_are_soft() {
 fn transaction_capability_can_move_to_a_stage_thread() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let data = store.create_data("data", DataPlacement::Shared).unwrap();
+    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
     let transactions = store.into_transactions();
 
     let (mut transactions, data) = std::thread::spawn(move || {
@@ -236,7 +235,7 @@ fn transaction_capability_can_move_to_a_stage_thread() {
         let transaction = transactions.begin().unwrap();
         data.access(&transaction)
             .unwrap()
-            .put(b"key", b"value")
+            .put(&b"key".to_vec(), &b"value".to_vec())
             .unwrap();
         transaction.commit().unwrap();
         (transactions, data)
@@ -246,7 +245,10 @@ fn transaction_capability_can_move_to_a_stage_thread() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction).unwrap().get(b"key").unwrap(),
+        data.access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         Some(b"value".to_vec())
     );
 }

@@ -62,7 +62,7 @@ pub struct ScanBatch<K, V> {
 ///
 /// This value cannot outlive its transaction. Collection implementations use
 /// it as their only raw storage capability.
-pub struct DataAccess<'transaction> {
+pub(crate) struct DataAccess<'transaction> {
     transaction: &'transaction Transaction<'transaction>,
     table: Table<'transaction>,
     prefix: Option<[u8; 5]>,
@@ -99,19 +99,11 @@ impl ScanLimit {
 }
 
 impl DataHandle {
-    /// Returns this namespace's durable physical placement.
-    #[must_use]
-    pub const fn placement(&self) -> DataPlacement {
+    pub(crate) const fn placement(&self) -> DataPlacement {
         match self.location {
             DataLocation::Shared(_) => DataPlacement::Shared,
             DataLocation::Dedicated(_) => DataPlacement::Dedicated,
         }
-    }
-
-    /// Returns the durable name bound to this handle.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     /// Binds this namespace to an active transaction.
@@ -120,7 +112,7 @@ impl DataHandle {
     ///
     /// Returns an error for a wrong-store handle, a poisoned transaction, or
     /// when MDBX cannot open the underlying table.
-    pub fn access<'transaction>(
+    pub(crate) fn access<'transaction>(
         &self,
         transaction: &'transaction Transaction<'transaction>,
     ) -> Result<DataAccess<'transaction>, StoreError> {
@@ -153,7 +145,7 @@ impl DataAccess<'_> {
     /// # Errors
     ///
     /// Returns the original error after poisoning the transaction.
-    pub fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+    pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
         self.transaction.poison_on_error(result)
     }
 
@@ -162,7 +154,7 @@ impl DataAccess<'_> {
     /// # Errors
     ///
     /// Returns an error when the transaction is poisoned or MDBX cannot read.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.transaction.ensure_healthy()?;
         let key = physical_key(self.prefix.as_ref(), key);
         self.transaction.record_result(
@@ -178,7 +170,7 @@ impl DataAccess<'_> {
     /// # Errors
     ///
     /// Returns an error when the transaction is poisoned or MDBX cannot write.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.transaction.ensure_healthy()?;
         let key = physical_key(self.prefix.as_ref(), key);
         self.transaction.record_result(
@@ -194,7 +186,7 @@ impl DataAccess<'_> {
     /// # Errors
     ///
     /// Returns an error when the transaction is poisoned or MDBX cannot delete.
-    pub fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
+    pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
         self.transaction.ensure_healthy()?;
         let key = physical_key(self.prefix.as_ref(), key);
         self.transaction.record_result(

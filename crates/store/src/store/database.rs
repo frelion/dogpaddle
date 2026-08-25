@@ -3,10 +3,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use libmdbx::{
@@ -17,7 +14,7 @@ use super::{
     DataHandle, DataLocation, DataPlacement, Store, Transactions, dedicated_table_name,
     transaction::commit_mdbx,
 };
-use crate::StoreError;
+use crate::{StoreData, StoreError, data_class};
 
 const MDBX_DATA_FILE: &str = "mdbx.dat";
 const STORE_MARKER_KEY: &[u8] = &[0];
@@ -34,7 +31,7 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
     /// Maximum number of data namespaces that may use dedicated physical tables.
-    pub const DEDICATED_CAPACITY: u32 = MAX_DEDICATED_TABLES;
+    pub const LARGE_DATA_CAPACITY: u32 = MAX_DEDICATED_TABLES;
 
     /// Creates an empty store at a new path.
     ///
@@ -133,17 +130,22 @@ impl Store {
         })
     }
 
-    /// Creates a named key/value namespace.
+    /// Creates one named typed data object.
     ///
     /// # Errors
     ///
-    /// Placement is durable and is recovered automatically by [`Store::open_data`].
-    /// At most [`Store::DEDICATED_CAPACITY`] namespaces may use
-    /// [`DataPlacement::Dedicated`].
+    /// The data object's final [`crate::Small`] or [`crate::Large`] type
+    /// parameter selects its durable physical placement. At most
+    /// [`Store::LARGE_DATA_CAPACITY`] objects may use [`crate::Large`].
     ///
     /// Returns an error for an invalid or duplicate name, exhausted dedicated
     /// capacity, or an MDBX failure.
-    pub fn create_data(
+    pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
+        let handle = self.create_handle(name, data_class::placement::<D>())?;
+        Ok(data_class::from_handle(handle))
+    }
+
+    fn create_handle(
         &mut self,
         name: &str,
         placement: DataPlacement,
@@ -173,7 +175,7 @@ impl Store {
             DataPlacement::Dedicated => {
                 let current = read_counter(&transaction, &table, NEXT_DEDICATED_KEY)?;
                 if current >= MAX_DEDICATED_TABLES {
-                    return Err(StoreError::DedicatedCapacityExhausted);
+                    return Err(StoreError::LargeDataCapacityExhausted);
                 }
                 let next = current + 1;
                 transaction
@@ -194,15 +196,30 @@ impl Store {
             .put(&table, counter_key, next.to_be_bytes(), WriteFlags::UPSERT)
             .map_err(|error| StoreError::storage("advance store counter", error))?;
         commit_mdbx(transaction)?;
-        Ok(self.handle(location, name))
+        Ok(self.handle(location))
     }
 
-    /// Opens a named key/value namespace.
+    /// Opens one named typed data object.
     ///
     /// # Errors
     ///
-    /// Returns an error when the namespace is missing or MDBX fails.
-    pub fn open_data(&self, name: &str) -> Result<DataHandle, StoreError> {
+    /// Returns an error when the namespace is missing, its durable size does
+    /// not match `D`, or MDBX fails.
+    pub fn open_data<D: StoreData>(&self, name: &str) -> Result<D, StoreError> {
+        let handle = self.open_handle(name)?;
+        let expected = data_class::placement::<D>();
+        let actual = handle.placement();
+        if actual != expected {
+            return Err(StoreError::DataSizeMismatch {
+                name: name.to_owned(),
+                expected: expected.size_name(),
+                actual: actual.size_name(),
+            });
+        }
+        Ok(data_class::from_handle(handle))
+    }
+
+    fn open_handle(&self, name: &str) -> Result<DataHandle, StoreError> {
         validate_name(name)?;
         let transaction = self
             .database
@@ -221,7 +238,7 @@ impl Store {
                 .open_table(Some(&dedicated_table_name(table_id)))
                 .map_err(|error| StoreError::storage("open dedicated data table", error))?;
         }
-        Ok(self.handle(location, name))
+        Ok(self.handle(location))
     }
 
     /// Finishes provisioning and yields the runtime transaction capability.
@@ -233,11 +250,19 @@ impl Store {
         }
     }
 
-    fn handle(&self, location: DataLocation, name: &str) -> DataHandle {
+    const fn handle(&self, location: DataLocation) -> DataHandle {
         DataHandle {
             store_token: self.token,
             location,
-            name: Arc::from(name),
+        }
+    }
+}
+
+impl DataPlacement {
+    const fn size_name(self) -> &'static str {
+        match self {
+            Self::Shared => "small",
+            Self::Dedicated => "large",
         }
     }
 }

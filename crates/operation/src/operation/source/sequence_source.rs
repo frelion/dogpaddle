@@ -1,15 +1,15 @@
-use dogpaddle_store::{Cell, CellAccess, StoreError};
+use dogpaddle_store::{Cell, CellAccess, Small, StoreError};
 use thiserror::Error;
 
 use crate::{
-    DataBindings, DefinitionCodecError, MaterializeError, OperationDefinition,
-    definition::Sealed as SealedDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    definition::{DataName, Sealed as SealedDefinition},
     operation::{Operation, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
-const POSITION: &str = "sequence_source.position";
-const DATA_NAMES: &[&str] = &[POSITION];
+const POSITION: DataName<Cell<u64, Small>> = DataName::new("sequence_source.position");
+const DATA: &[DataDeclaration] = &[POSITION.declaration()];
 
 /// Pure definition of a monotonically increasing source.
 ///
@@ -19,18 +19,13 @@ pub struct SequenceSourceDefinition {
     start: u64,
 }
 
-/// Persistent data handles required by [`SequenceSourceOperation`].
-pub struct SequenceSourceData {
-    position: Cell<u64>,
-}
-
 /// Materialized monotonically increasing source operation.
 ///
-/// This value owns its pure definition and persistent data handles, but never
+/// This value owns its pure definition and persistent position, but never
 /// begins, commits, or stores a transaction.
 pub struct SequenceSourceOperation {
     definition: SequenceSourceDefinition,
-    data: SequenceSourceData,
+    position: Cell<u64, Small>,
 }
 
 /// Failure while producing one value from a [`SequenceSourceOperation`].
@@ -66,16 +61,16 @@ impl OperationDefinition for SequenceSourceDefinition {
         0
     }
 
-    fn data_names(&self) -> &'static [&'static str] {
-        DATA_NAMES
+    fn data(&self) -> &'static [DataDeclaration] {
+        DATA
     }
 
-    fn materialize(&self, data: &mut DataBindings) -> Result<Box<dyn Operation>, MaterializeError> {
-        let position = data.take(POSITION, Cell::<u64>::new)?;
-        Ok(Box::new(SequenceSourceOperation::new(
-            *self,
-            SequenceSourceData::new(position),
-        )))
+    fn materialize(
+        &self,
+        data: &mut DataInstances,
+    ) -> Result<Box<dyn Operation>, MaterializeError> {
+        let position = data.take(&POSITION)?;
+        Ok(Box::new(SequenceSourceOperation::new(*self, position)))
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -87,25 +82,14 @@ impl OperationDefinition for SequenceSourceDefinition {
     }
 }
 
-impl SequenceSourceData {
-    /// Creates Sequence data from the cell storing its last emitted value.
-    #[must_use]
-    pub const fn new(position: Cell<u64>) -> Self {
-        Self { position }
-    }
-
-    /// Returns the cell storing the last committed emitted value.
-    #[must_use]
-    pub const fn position(&self) -> &Cell<u64> {
-        &self.position
-    }
-}
-
 impl SequenceSourceOperation {
     /// Materializes a Sequence source from its pure definition and durable data.
     #[must_use]
-    pub const fn new(definition: SequenceSourceDefinition, data: SequenceSourceData) -> Self {
-        Self { definition, data }
+    pub const fn new(definition: SequenceSourceDefinition, position: Cell<u64, Small>) -> Self {
+        Self {
+            definition,
+            position,
+        }
     }
 
     /// Returns the pure definition used to materialize this source.
@@ -114,10 +98,10 @@ impl SequenceSourceOperation {
         &self.definition
     }
 
-    /// Returns the persistent data handles owned by this source.
+    /// Returns the cell storing the last committed emitted value.
     #[must_use]
-    pub const fn data(&self) -> &SequenceSourceData {
-        &self.data
+    pub const fn position(&self) -> &Cell<u64, Small> {
+        &self.position
     }
 
     /// Produces and records the next sequence value.

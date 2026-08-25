@@ -2,6 +2,4 @@
 
 pub(crate) mod sequence_source;
 
-pub use sequence_source::{
-    SequenceSourceData, SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation,
-};
+pub use sequence_source::{SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation};

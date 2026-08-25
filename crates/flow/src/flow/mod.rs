@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_operation::{DataBindings, OperationDefinition};
-use dogpaddle_store::{Cell, DataHandle, OrderedMap, Store, StoreError, Transactions};
+use dogpaddle_operation::{DataInstances, OperationDefinition};
+use dogpaddle_store::{Cell, OrderedMap, Small, Store, StoreData, StoreError, Transactions};
 
 use crate::{
     build::{FlowBuilder, FlowDefinition, StageDefinition, codec},
@@ -20,7 +20,7 @@ pub struct Flow {
         not(test),
         expect(dead_code, reason = "flow state is consumed by the next run phase")
     )]
-    state: OrderedMap<Vec<u8>, Vec<u8>>,
+    state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     #[cfg_attr(
         not(test),
         expect(
@@ -61,7 +61,10 @@ impl Flow {
 
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
-        let flow_state = open_required_data(&store, codec::FLOW_STATE_DATA_NAME)?;
+        let flow_state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
+            &store,
+            codec::FLOW_STATE_DATA_NAME,
+        )?;
         let stages = open_stages(&store, &definition)?;
         let mut transactions = store.into_transactions();
         let observed_definition = {
@@ -76,7 +79,7 @@ impl Flow {
         Ok(Self {
             path,
             definition,
-            state: OrderedMap::new(flow_state),
+            state: flow_state,
             stages,
             transactions,
         })
@@ -85,7 +88,7 @@ impl Flow {
     pub(crate) fn from_build(
         path: PathBuf,
         definition: FlowDefinition,
-        state: OrderedMap<Vec<u8>, Vec<u8>>,
+        state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         stages: Vec<Stage>,
         transactions: Transactions,
     ) -> Self {
@@ -126,9 +129,9 @@ fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
 
-fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
+fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>, Small>, FlowError> {
     match store.open_data(codec::DEFINITION_DATA_NAME) {
-        Ok(data) => Ok(Cell::new(data)),
+        Ok(data) => Ok(data),
         Err(StoreError::DataNotFound(name)) if name == codec::DEFINITION_DATA_NAME => {
             Err(FlowError::IncompleteBuild)
         }
@@ -150,21 +153,31 @@ fn open_stage(
     index: usize,
     definition: &dyn OperationDefinition,
 ) -> Result<Stage, FlowError> {
-    let state = OrderedMap::new(open_required_data(store, &codec::stage_state_name(index))?);
-    let mut data = DataBindings::new();
-    for logical_name in definition.data_names() {
-        let handle = open_required_data(store, &codec::operation_data_name(index, logical_name))?;
-        data.insert(logical_name, handle)?;
+    let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
+        store,
+        &codec::stage_state_name(index),
+    )?;
+    let mut data = DataInstances::new();
+    for declaration in definition.data() {
+        let physical_name = codec::operation_data_name(index, declaration.name());
+        let instance = open_required(&physical_name, declaration.open(store, &physical_name))?;
+        data.insert(instance)?;
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
     Ok(Stage::new(state, operation))
 }
 
-fn open_required_data(store: &Store, name: &str) -> Result<DataHandle, FlowError> {
-    match store.open_data(name) {
+fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {
+    open_required(name, store.open_data(name))
+}
+
+fn open_required<T>(name: &str, result: Result<T, StoreError>) -> Result<T, FlowError> {
+    match result {
         Ok(data) => Ok(data),
-        Err(StoreError::DataNotFound(name)) => Err(FlowError::MissingResource { name }),
+        Err(StoreError::DataNotFound(_)) => Err(FlowError::MissingResource {
+            name: name.to_owned(),
+        }),
         Err(error) => Err(error.into()),
     }
 }

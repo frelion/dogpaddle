@@ -8,19 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{DataPlacement, Store};
+use dogpaddle_store::{Large, Small, Store};
 
-use crate::support::store_path;
+use crate::support::{create_byte_map, open_byte_map, store_path};
 
 const WORKER_SCENARIO: &str = "DOGPADDLE_CRASH_SCENARIO";
 const WORKER_STORE: &str = "DOGPADDLE_CRASH_STORE";
 
 fn prepare(path: &Path) {
     let mut store = Store::create(path).unwrap();
-    store.create_data("shared", DataPlacement::Shared).unwrap();
-    store
-        .create_data("dedicated", DataPlacement::Dedicated)
-        .unwrap();
+    create_byte_map::<Small>(&mut store, "small").unwrap();
+    create_byte_map::<Large>(&mut store, "large").unwrap();
 }
 
 fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
@@ -50,16 +48,24 @@ fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
 
 fn assert_values(path: &Path, expected: Option<&[u8]>) {
     let store = Store::open(path).unwrap();
-    let shared = store.open_data("shared").unwrap();
-    let dedicated = store.open_data("dedicated").unwrap();
+    let small = open_byte_map::<Small>(&store, "small").unwrap();
+    let large = open_byte_map::<Large>(&store, "large").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        shared.access(&transaction).unwrap().get(b"key").unwrap(),
+        small
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         expected.map(<[u8]>::to_vec)
     );
     assert_eq!(
-        dedicated.access(&transaction).unwrap().get(b"key").unwrap(),
+        large
+            .access(&transaction)
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
         expected.map(<[u8]>::to_vec)
     );
 }
@@ -87,19 +93,19 @@ fn crash_worker() {
     };
     let path = std::env::var_os(WORKER_STORE).expect("worker store path");
     let store = Store::open(path).unwrap();
-    let shared = store.open_data("shared").unwrap();
-    let dedicated = store.open_data("dedicated").unwrap();
+    let small = open_byte_map::<Small>(&store, "small").unwrap();
+    let large = open_byte_map::<Large>(&store, "large").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-    shared
+    small
         .access(&transaction)
         .unwrap()
-        .put(b"key", b"committed")
+        .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();
-    dedicated
+    large
         .access(&transaction)
         .unwrap()
-        .put(b"key", b"committed")
+        .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();
 
     match scenario.as_str() {

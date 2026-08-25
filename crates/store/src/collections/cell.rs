@@ -5,9 +5,9 @@ use crate::{DataAccess, DataHandle, StoreError, StoreValue, Transaction};
 const CELL_KEY: &[u8] = &[];
 
 /// A typed optional value stored in one generic data namespace.
-pub struct Cell<T> {
+pub struct Cell<T, SIZE> {
     data: DataHandle,
-    _value: PhantomData<fn() -> T>,
+    _types: PhantomData<fn() -> (T, SIZE)>,
 }
 
 /// Transaction-bound access to a [`Cell`].
@@ -16,13 +16,11 @@ pub struct CellAccess<'transaction, T> {
     _value: PhantomData<fn() -> T>,
 }
 
-impl<T: StoreValue> Cell<T> {
-    /// Wraps an existing generic data handle with cell behavior.
-    #[must_use]
-    pub fn new(data: DataHandle) -> Self {
+impl<T: StoreValue, SIZE> Cell<T, SIZE> {
+    pub(crate) fn from_handle(data: DataHandle) -> Self {
         Self {
             data,
-            _value: PhantomData,
+            _types: PhantomData,
         }
     }
 
@@ -30,7 +28,7 @@ impl<T: StoreValue> Cell<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the handle belongs to another store or the
+    /// Returns an error when this data object belongs to another store or the
     /// transaction is already poisoned.
     pub fn access<'transaction>(
         &self,
@@ -79,11 +77,11 @@ impl<T: StoreValue> CellAccess<'_, T> {
     }
 }
 
-impl<T> Clone for Cell<T> {
+impl<T, SIZE> Clone for Cell<T, SIZE> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            _value: PhantomData,
+            _types: PhantomData,
         }
     }
 }

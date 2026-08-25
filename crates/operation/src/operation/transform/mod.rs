@@ -2,4 +2,4 @@
 
 pub(crate) mod count;
 
-pub use count::{CountData, CountDefinition, CountError, CountOperation};
+pub use count::{CountDefinition, CountError, CountOperation};

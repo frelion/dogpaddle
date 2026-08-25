@@ -27,6 +27,19 @@ pub enum StoreError {
     #[error("data namespace {0:?} does not exist")]
     DataNotFound(String),
 
+    /// A typed open requested a different durable size than the catalog records.
+    #[error(
+        "data namespace {name:?} has size {actual}, but the requested data class requires {expected}"
+    )]
+    DataSizeMismatch {
+        /// Durable data namespace name.
+        name: String,
+        /// Size required by the requested data class.
+        expected: &'static str,
+        /// Size recorded by the durable catalog.
+        actual: &'static str,
+    },
+
     /// The store marker or catalog metadata is invalid.
     #[error("store marker or catalog metadata is invalid")]
     InvalidStore,
@@ -35,12 +48,12 @@ pub enum StoreError {
     #[error("store has exhausted its data namespace identifiers")]
     DataIdExhausted,
 
-    /// No more dedicated physical tables are available.
-    #[error("store has exhausted its dedicated data tables")]
-    DedicatedCapacityExhausted,
+    /// No more physical tables are available for large data objects.
+    #[error("store has exhausted its large-data capacity")]
+    LargeDataCapacityExhausted,
 
-    /// A handle belongs to another store.
-    #[error("data handle belongs to another store")]
+    /// A data object belongs to another store.
+    #[error("data object belongs to another store")]
     WrongStore,
 
     /// A scan limit must reserve at least one item and one byte.

@@ -1,15 +1,15 @@
-use dogpaddle_store::{Cell, CellAccess, StoreError};
+use dogpaddle_store::{Cell, CellAccess, Small, StoreError};
 use thiserror::Error;
 
 use crate::{
-    DataBindings, DefinitionCodecError, MaterializeError, OperationDefinition,
-    definition::Sealed as SealedDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    definition::{DataName, Sealed as SealedDefinition},
     operation::{Operation, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 2;
-const COUNT: &str = "count";
-const DATA_NAMES: &[&str] = &[COUNT];
+const COUNT: DataName<Cell<u64, Small>> = DataName::new("count");
+const DATA: &[DataDeclaration] = &[COUNT.declaration()];
 
 /// Pure definition of a running count operation.
 ///
@@ -20,18 +20,13 @@ pub struct CountDefinition {
     _private: (),
 }
 
-/// Persistent data handles required by [`CountOperation`].
-pub struct CountData {
-    count: Cell<u64>,
-}
-
 /// Materialized running count operation.
 ///
-/// This value owns its pure definition and persistent data handles, but never
+/// This value owns its pure definition and persistent count, but never
 /// begins, commits, or stores a transaction.
 pub struct CountOperation {
     definition: CountDefinition,
-    data: CountData,
+    count: Cell<u64, Small>,
 }
 
 /// Failure while applying one input to a [`CountOperation`].
@@ -65,13 +60,16 @@ impl OperationDefinition for CountDefinition {
         1
     }
 
-    fn data_names(&self) -> &'static [&'static str] {
-        DATA_NAMES
+    fn data(&self) -> &'static [DataDeclaration] {
+        DATA
     }
 
-    fn materialize(&self, data: &mut DataBindings) -> Result<Box<dyn Operation>, MaterializeError> {
-        let count = data.take(COUNT, Cell::<u64>::new)?;
-        Ok(Box::new(CountOperation::new(*self, CountData::new(count))))
+    fn materialize(
+        &self,
+        data: &mut DataInstances,
+    ) -> Result<Box<dyn Operation>, MaterializeError> {
+        let count = data.take(&COUNT)?;
+        Ok(Box::new(CountOperation::new(*self, count)))
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -81,25 +79,11 @@ impl OperationDefinition for CountDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-impl CountData {
-    /// Creates Count data from its durable cell.
-    #[must_use]
-    pub const fn new(count: Cell<u64>) -> Self {
-        Self { count }
-    }
-
-    /// Returns the cell holding the committed count.
-    #[must_use]
-    pub const fn count(&self) -> &Cell<u64> {
-        &self.count
-    }
-}
-
 impl CountOperation {
     /// Materializes a Count operation from its pure definition and durable data.
     #[must_use]
-    pub const fn new(definition: CountDefinition, data: CountData) -> Self {
-        Self { definition, data }
+    pub const fn new(definition: CountDefinition, count: Cell<u64, Small>) -> Self {
+        Self { definition, count }
     }
 
     /// Returns the pure definition used to materialize this operation.
@@ -108,10 +92,10 @@ impl CountOperation {
         &self.definition
     }
 
-    /// Returns the persistent data handles owned by this operation.
+    /// Returns the cell holding the committed count.
     #[must_use]
-    pub const fn data(&self) -> &CountData {
-        &self.data
+    pub const fn count(&self) -> &Cell<u64, Small> {
+        &self.count
     }
 
     /// Applies one accepted input and returns the updated running count.

@@ -1,5 +1,5 @@
 use dogpaddle_operation::operation::source::SequenceSourceDefinition;
-use dogpaddle_store::{OrderedMap, Store};
+use dogpaddle_store::{OrderedMap, Small, Store};
 
 use super::Flow;
 
@@ -12,8 +12,7 @@ fn open_rematerializes_flow_state() {
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
-    let state: OrderedMap<Vec<u8>, Vec<u8>> =
-        OrderedMap::new(store.open_data("flow/state").unwrap());
+    let state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();

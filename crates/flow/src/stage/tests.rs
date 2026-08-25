@@ -1,11 +1,11 @@
 use dogpaddle_operation::{
     encode_definition,
     operation::{
-        source::{SequenceSourceData, SequenceSourceDefinition, SequenceSourceOperation},
-        transform::{CountData, CountDefinition, CountOperation},
+        source::{SequenceSourceDefinition, SequenceSourceOperation},
+        transform::{CountDefinition, CountOperation},
     },
 };
-use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
+use dogpaddle_store::{Cell, OrderedMap, Small, Store};
 
 use super::Stage;
 
@@ -16,35 +16,27 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
 
     let source_definition = SequenceSourceDefinition::new(100);
     let source = Stage::new(
-        OrderedMap::new(
-            store
-                .create_data("source-state", DataPlacement::Shared)
-                .unwrap(),
-        ),
+        store
+            .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("source-state")
+            .unwrap(),
         Box::new(SequenceSourceOperation::new(
             source_definition,
-            SequenceSourceData::new(Cell::new(
-                store
-                    .create_data("source-position", DataPlacement::Shared)
-                    .unwrap(),
-            )),
+            store
+                .create_data::<Cell<u64, Small>>("source-position")
+                .unwrap(),
         )),
     );
 
     let count_definition = CountDefinition::new();
     let count = Stage::new(
-        OrderedMap::new(
-            store
-                .create_data("count-state", DataPlacement::Shared)
-                .unwrap(),
-        ),
+        store
+            .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("count-state")
+            .unwrap(),
         Box::new(CountOperation::new(
             count_definition,
-            CountData::new(Cell::new(
-                store
-                    .create_data("count-value", DataPlacement::Shared)
-                    .unwrap(),
-            )),
+            store
+                .create_data::<Cell<u64, Small>>("count-value")
+                .unwrap(),
         )),
     );
 

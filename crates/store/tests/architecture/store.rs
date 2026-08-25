@@ -1,29 +1,53 @@
 use std::fs;
 
-use dogpaddle_store::{DataPlacement, Store, StoreError};
+use dogpaddle_store::{Large, Small, Store, StoreError};
 use libmdbx::WriteFlags;
 
-use crate::support::{raw_database, store_path};
+use crate::support::{ByteMap, create_byte_map, open_byte_map, raw_database, store_path};
 
 #[test]
 fn creates_opens_and_recovers_named_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    let shared = store.create_data("shared", DataPlacement::Shared).unwrap();
-    let dedicated = store
-        .create_data("dedicated", DataPlacement::Dedicated)
-        .unwrap();
-    assert_eq!(shared.name(), "shared");
-    assert_eq!(dedicated.name(), "dedicated");
+    create_byte_map::<Small>(&mut store, "small").unwrap();
+    create_byte_map::<Large>(&mut store, "large").unwrap();
     drop(store);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.open_data("shared").unwrap().name(), "shared");
-    assert_eq!(store.open_data("dedicated").unwrap().name(), "dedicated");
+    open_byte_map::<Small>(&store, "small").unwrap();
+    open_byte_map::<Large>(&store, "large").unwrap();
     assert!(matches!(
-        store.open_data("missing"),
+        store.open_data::<ByteMap<Small>>("missing"),
         Err(StoreError::DataNotFound(name)) if name == "missing"
+    ));
+}
+
+#[test]
+fn typed_open_rejects_a_different_durable_size() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    create_byte_map::<Small>(&mut store, "small").unwrap();
+    create_byte_map::<Large>(&mut store, "large").unwrap();
+    drop(store);
+
+    let store = Store::open(path).unwrap();
+    assert!(matches!(
+        open_byte_map::<Large>(&store, "small"),
+        Err(StoreError::DataSizeMismatch {
+            name,
+            expected: "large",
+            actual: "small",
+        }) if name == "small"
+    ));
+    assert!(matches!(
+        open_byte_map::<Small>(&store, "large"),
+        Err(StoreError::DataSizeMismatch {
+            name,
+            expected: "small",
+            actual: "large",
+        }) if name == "large"
     ));
 }
 
@@ -61,20 +85,20 @@ fn opening_rejects_missing_and_partial_directories() {
 }
 
 #[test]
-fn data_names_are_validated_and_unique_across_placements() {
+fn data_names_are_validated_and_unique_across_sizes() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
 
     for name in [String::new(), "bad\0name".to_owned(), "x".repeat(256)] {
         assert!(matches!(
-            store.create_data(&name, DataPlacement::Shared),
+            store.create_data::<ByteMap<Small>>(&name),
             Err(StoreError::InvalidName { .. })
         ));
     }
 
-    store.create_data("data", DataPlacement::Shared).unwrap();
+    create_byte_map::<Small>(&mut store, "data").unwrap();
     assert!(matches!(
-        store.create_data("data", DataPlacement::Dedicated),
+        store.create_data::<ByteMap<Large>>("data"),
         Err(StoreError::DataAlreadyExists(name)) if name == "data"
     ));
 }
@@ -102,7 +126,7 @@ fn opening_rejects_a_corrupt_catalog_binding() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    store.create_data("data", DataPlacement::Shared).unwrap();
+    create_byte_map::<Small>(&mut store, "data").unwrap();
     drop(store);
 
     let database = raw_database(&path);
@@ -124,8 +148,8 @@ fn opening_rejects_duplicate_physical_catalog_bindings() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    store.create_data("left", DataPlacement::Shared).unwrap();
-    store.create_data("right", DataPlacement::Shared).unwrap();
+    create_byte_map::<Small>(&mut store, "left").unwrap();
+    create_byte_map::<Small>(&mut store, "right").unwrap();
     drop(store);
 
     let database = raw_database(&path);
@@ -152,8 +176,8 @@ fn opening_rejects_a_catalog_counter_behind_its_bindings() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    store.create_data("zero", DataPlacement::Shared).unwrap();
-    store.create_data("one", DataPlacement::Shared).unwrap();
+    create_byte_map::<Small>(&mut store, "zero").unwrap();
+    create_byte_map::<Small>(&mut store, "one").unwrap();
     drop(store);
 
     let database = raw_database(&path);

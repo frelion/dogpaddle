@@ -42,9 +42,11 @@ fan-out 和重复 source；输入数量必须与具体 Definition 完全一致�
 
 每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
 持久化 state map，并按 Operation Definition 的逻辑数据名声明全部状态空间，最后提交
-manifest Cell 作为构建完成标记。Flow 负责完整资源名、`DataPlacement` 和 Store create/open，
-并把句柄按逻辑名放入 `DataBindings`；Definition 按名称取出资源并在同一调用点构造成明确的
-类型化 collection，声明顺序不参与绑定。Flow state map 保留生命周期状态；
+manifest Cell 作为构建完成标记。Operation Definition 返回稳定的“逻辑名称 → 类型化 data
+class”声明；Flow 负责完整资源名，并通过 Store 将每个 class 创建或打开为具体实例，再按
+逻辑名称交给 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、
+底层句柄或物理布局。Flow definition Cell、Flow state map 和 Stage state map 都显式声明为
+`Small`。Flow state map 保留生命周期状态；
 Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续运行层只能在这些 map 的
 键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
 
@@ -71,8 +73,9 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 `build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、无 Store 副作用的图校验、
 稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition 中的连接关系，
 不再拥有独立 Builder。`build/` 与 `flow/` 分别按 Definition 声明的逻辑数据名通用创建或打开
-句柄，再让 Definition 物化具体 Operation；二者都不枚举具体算子。`stage/` 只保存公共 state
-map 和装箱后的 `Operation` trait object，不接收 Store，也不知道资源名或 `DataPlacement`。
+类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。`stage/` 只保存
+公共 state map 和装箱后的 `Operation` trait object，不接收 Store，也不知道资源名或底层
+物理 placement。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 顶层文件只验证 crate 的公共行为。
 

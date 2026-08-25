@@ -1,15 +1,21 @@
 use std::collections::HashSet;
 
-use dogpaddle_store::{Cell, DataPlacement, OrderedMap, Store};
+use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataBindings, MaterializeError, OperationDefinition,
+    DataInstances, MaterializeError, OperationDefinition,
     codec::DECODERS,
+    definition::DataName,
     operation::{source::SequenceSourceDefinition, transform::CountDefinition},
 };
 
+const COUNT: DataName<Cell<u64, Small>> = DataName::new("count");
+const LARGE_COUNT: DataName<Cell<u64, Large>> = DataName::new("count");
+const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("count");
+const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
+
 #[test]
-fn decoder_tags_and_data_names_are_unique() {
+fn decoder_tags_and_data_declaration_names_are_unique() {
     let mut tags = HashSet::new();
     for (tag, _) in DECODERS {
         assert!(tags.insert(*tag), "duplicate operation decoder tag {tag}");
@@ -21,65 +27,110 @@ fn decoder_tags_and_data_names_are_unique() {
     ] {
         assert!(tags.contains(&definition.persistence_tag()));
         let mut names = HashSet::new();
-        for name in definition.data_names() {
+        for declaration in definition.data().iter().copied() {
+            let name = declaration.name();
             assert!(!name.is_empty());
             assert!(!name.as_bytes().contains(&0));
-            assert!(
-                names.insert(*name),
-                "duplicate operation data name {name:?}"
-            );
+            assert!(names.insert(name), "duplicate operation data name {name:?}");
         }
     }
 }
 
 #[test]
-fn data_bindings_resolve_typed_resources_by_name_not_position() {
-    const COUNT: &str = "count";
-    const STATE: &str = "state";
-
+fn data_instances_resolve_typed_objects_by_name_not_insertion_order() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
-    let count = store
-        .create_data("physical-count", DataPlacement::Shared)
+    let count = COUNT
+        .declaration()
+        .create(&mut store, "physical-count")
         .unwrap();
-    let state = store
-        .create_data("physical-state", DataPlacement::Shared)
+    let state = STATE
+        .declaration()
+        .create(&mut store, "physical-state")
         .unwrap();
 
-    let mut bindings = DataBindings::new();
-    bindings.insert(STATE, state).unwrap();
-    bindings.insert(COUNT, count.clone()).unwrap();
-    assert_eq!(
-        bindings.insert(COUNT, count).unwrap_err(),
-        MaterializeError::DuplicateData { name: "count" }
-    );
+    let mut instances = DataInstances::new();
+    instances.insert(state).unwrap();
+    instances.insert(count).unwrap();
 
-    let _count: Cell<u64> = bindings.take(COUNT, Cell::<u64>::new).unwrap();
-    let _state: OrderedMap<Vec<u8>, Vec<u8>> = bindings
-        .take(STATE, OrderedMap::<Vec<u8>, Vec<u8>>::new)
-        .unwrap();
-    bindings.finish().unwrap();
+    let _count: Cell<u64, Small> = instances.take(&COUNT).unwrap();
+    let _state: OrderedMap<Vec<u8>, Vec<u8>, Large> = instances.take(&STATE).unwrap();
+    instances.finish().unwrap();
 }
 
 #[test]
-fn data_bindings_reject_missing_and_unconsumed_names() {
-    const COUNT: &str = "count";
+fn data_instances_reject_duplicate_names() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("store")).unwrap();
+    let first = COUNT
+        .declaration()
+        .create(&mut store, "physical-count-a")
+        .unwrap();
+    let duplicate = COUNT
+        .declaration()
+        .create(&mut store, "physical-count-b")
+        .unwrap();
 
-    let mut missing = DataBindings::new();
-    let Err(error) = missing.take(COUNT, Cell::<u64>::new) else {
-        panic!("missing binding unexpectedly resolved");
+    let mut instances = DataInstances::new();
+    instances.insert(first).unwrap();
+    assert_eq!(
+        instances.insert(duplicate).unwrap_err(),
+        MaterializeError::DuplicateData { name: "count" }
+    );
+}
+
+#[test]
+fn data_instances_reject_missing_and_unconsumed_names() {
+    let mut missing = DataInstances::new();
+    let Err(error) = missing.take(&COUNT) else {
+        panic!("missing data instance unexpectedly resolved");
     };
     assert_eq!(error, MaterializeError::MissingData { name: "count" });
 
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
-    let count = store
-        .create_data("physical-count", DataPlacement::Shared)
+    let count = COUNT
+        .declaration()
+        .create(&mut store, "physical-count")
         .unwrap();
-    let mut unconsumed = DataBindings::new();
-    unconsumed.insert(COUNT, count).unwrap();
+    let mut unconsumed = DataInstances::new();
+    unconsumed.insert(count).unwrap();
     assert_eq!(
         unconsumed.finish().unwrap_err(),
         MaterializeError::UnexpectedData { name: "count" }
     );
+}
+
+#[test]
+fn data_instances_reject_the_wrong_data_class() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("store")).unwrap();
+    let count = COUNT
+        .declaration()
+        .create(&mut store, "physical-count")
+        .unwrap();
+    let mut instances = DataInstances::new();
+    instances.insert(count).unwrap();
+
+    let Err(error) = instances.take(&LARGE_COUNT) else {
+        panic!("small cell unexpectedly materialized as a large cell");
+    };
+    assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
+}
+
+#[test]
+fn data_instances_reject_a_different_collection_with_the_same_size() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("store")).unwrap();
+    let count = COUNT
+        .declaration()
+        .create(&mut store, "physical-count")
+        .unwrap();
+    let mut instances = DataInstances::new();
+    instances.insert(count).unwrap();
+
+    let Err(error) = instances.take(&MAP_COUNT) else {
+        panic!("cell unexpectedly materialized as an ordered map of the same size");
+    };
+    assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
 }
