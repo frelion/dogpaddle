@@ -10,7 +10,7 @@ use crate::{
 
 type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
 
-/// A typed ordered key/value map over one generic data namespace.
+/// A named persistent ordered map with typed keys and values.
 pub struct OrderedMap<K, V, SIZE> {
     data: DataHandle,
     _types: PhantomData<MapTypes<K, V, SIZE>>,

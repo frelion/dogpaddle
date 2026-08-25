@@ -18,7 +18,7 @@ pub enum FlowError {
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// Materialized typed data instances do not match an operation definition.
+    /// Provided typed data instances do not match an operation definition.
     #[error(transparent)]
     Materialize(#[from] MaterializeError),
     /// A Store exists, but no complete Flow definition was published.
@@ -30,7 +30,7 @@ pub enum FlowError {
     /// A published definition references a required resource that is absent.
     #[error("published flow is missing required resource {name:?}")]
     MissingResource {
-        /// Stable Store namespace that could not be opened.
+        /// Stable Store data object name that could not be opened.
         name: String,
     },
 }

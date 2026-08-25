@@ -32,12 +32,12 @@ where
 }
 
 #[test]
-fn namespaces_isolate_identical_keys() {
-    assert_namespaces_isolate_identical_keys::<Small>();
-    assert_namespaces_isolate_identical_keys::<Large>();
+fn data_objects_isolate_identical_keys() {
+    assert_data_objects_isolate_identical_keys::<Small>();
+    assert_data_objects_isolate_identical_keys::<Large>();
 }
 
-fn assert_namespaces_isolate_identical_keys<SIZE>()
+fn assert_data_objects_isolate_identical_keys<SIZE>()
 where
     ByteMap<SIZE>: StoreData,
 {

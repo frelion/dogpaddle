@@ -14,17 +14,20 @@ const VALUE_BYTES: usize = 64;
 const STAGE_KEYS: usize = 1_024;
 const RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
+type ByteMap<SIZE> = OrderedMap<Vec<u8>, Vec<u8>, SIZE>;
+type TypedMap<SIZE> = OrderedMap<u64, Vec<u8>, SIZE>;
+
 struct Fixture<SIZE> {
     transactions: Transactions,
-    bytes: OrderedMap<Vec<u8>, Vec<u8>, SIZE>,
-    map: OrderedMap<u64, Vec<u8>, SIZE>,
+    bytes: ByteMap<SIZE>,
+    map: TypedMap<SIZE>,
     _root: TempDir,
 }
 
 struct StageFixture<SIZE> {
     transactions: Transactions,
     cursor: Cell<u64, Small>,
-    map: OrderedMap<u64, Vec<u8>, SIZE>,
+    map: TypedMap<SIZE>,
     _root: TempDir,
 }
 
@@ -43,18 +46,18 @@ enum ScanKind {
 
 impl<SIZE> Fixture<SIZE>
 where
-    OrderedMap<u64, Vec<u8>, SIZE>: StoreData,
-    OrderedMap<Vec<u8>, Vec<u8>, SIZE>: StoreData,
+    ByteMap<SIZE>: StoreData,
+    TypedMap<SIZE>: StoreData,
 {
     fn empty() -> Self {
         let root = tempfile::tempdir().expect("temporary benchmark directory");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
-            .create_data::<OrderedMap<u64, Vec<u8>, SIZE>>("map")
+            .create_data::<TypedMap<SIZE>>("map")
             .expect("create benchmark map");
         let bytes = store
-            .open_data::<OrderedMap<Vec<u8>, Vec<u8>, SIZE>>("map")
-            .expect("open benchmark byte map");
+            .create_data::<ByteMap<SIZE>>("bytes")
+            .expect("create benchmark byte map");
         Self {
             transactions: store.into_transactions(),
             bytes,
@@ -71,9 +74,16 @@ where
             .expect("begin seed transaction");
         {
             let mut map = fixture.map.access(&transaction).expect("access seed map");
+            let mut bytes = fixture
+                .bytes
+                .access(&transaction)
+                .expect("access seed byte map");
             let value = vec![0x5a; VALUE_BYTES];
             for key in 0..entries {
                 map.put(&(key as u64), &value).expect("seed benchmark map");
+                bytes
+                    .put(&(key as u64).to_be_bytes().to_vec(), &value)
+                    .expect("seed benchmark byte map");
             }
         }
         transaction.commit().expect("commit benchmark seed");
@@ -84,11 +94,11 @@ where
         let root = tempfile::tempdir().expect("temporary benchmark directory");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
-            .create_data::<OrderedMap<u64, Vec<u8>, SIZE>>("target")
+            .create_data::<TypedMap<SIZE>>("target")
             .expect("create target map");
         let bytes = store
-            .open_data::<OrderedMap<Vec<u8>, Vec<u8>, SIZE>>("target")
-            .expect("open target byte map");
+            .create_data::<ByteMap<SIZE>>("target-bytes")
+            .expect("create target byte map");
         let backgrounds = (0..background_namespaces)
             .map(|index| {
                 store
@@ -133,7 +143,7 @@ where
 
 impl<SIZE> StageFixture<SIZE>
 where
-    OrderedMap<u64, Vec<u8>, SIZE>: StoreData,
+    TypedMap<SIZE>: StoreData,
 {
     fn populated() -> Self {
         let root = tempfile::tempdir().expect("temporary stage benchmark directory");
@@ -142,7 +152,7 @@ where
             .create_data::<Cell<u64, Small>>("cursor")
             .expect("create stage cursor");
         let map = store
-            .create_data::<OrderedMap<u64, Vec<u8>, SIZE>>("map")
+            .create_data::<TypedMap<SIZE>>("map")
             .expect("create stage map");
         let mut fixture = Self {
             transactions: store.into_transactions(),
@@ -393,8 +403,8 @@ fn report_scan_pair<SmallSize, LargeSize>(
 
 fn measure_byte_map_bulk_put<SIZE>(entries: usize) -> Duration
 where
-    OrderedMap<u64, Vec<u8>, SIZE>: StoreData,
-    OrderedMap<Vec<u8>, Vec<u8>, SIZE>: StoreData,
+    ByteMap<SIZE>: StoreData,
+    TypedMap<SIZE>: StoreData,
 {
     let mut fixture = Fixture::<SIZE>::empty();
     let value = vec![0x5a; VALUE_BYTES];
@@ -419,8 +429,8 @@ where
 
 fn measure_bulk_put<SIZE>(entries: usize) -> Duration
 where
-    OrderedMap<u64, Vec<u8>, SIZE>: StoreData,
-    OrderedMap<Vec<u8>, Vec<u8>, SIZE>: StoreData,
+    ByteMap<SIZE>: StoreData,
+    TypedMap<SIZE>: StoreData,
 {
     let mut fixture = Fixture::<SIZE>::empty();
     let value = vec![0x5a; VALUE_BYTES];

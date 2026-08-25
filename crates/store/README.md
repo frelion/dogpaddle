@@ -16,7 +16,7 @@ Store 将资源装配与运行时访问分离：
 - `CellAccess` 与 `OrderedMapAccess` 绑定一次具体事务并执行实际读写。
 
 底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
-也不能绕过类型上的 Size 自行组合物理资源。
+也不能绕过类型上的 `Size` 自行组合物理资源。
 
 ## Size 是持久化 schema
 
@@ -30,17 +30,17 @@ type Cache = OrderedMap<u64, String, Small>;
 type Records = OrderedMap<u64, Vec<u8>, Large>;
 ```
 
-Size 描述这个具名对象的静态存储类别，不是运行时容量上限，也不会根据当前数据量自动改变：
+`Size` 描述这个具名对象的静态存储类别，不是运行时容量上限，也不会根据当前数据量自动改变：
 
 - `Small` 与其他小对象共享主 B+Tree，适合数量较多、规模较小或频繁提交的状态；
 - `Large` 使用独立的 MDBX named table，适合可能很大、热点或面向批处理的数据；
 - 单个 Store 最多包含 `Store::LARGE_DATA_CAPACITY` 个 Large 对象。
 
-Size 在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。`Store::open_data::<D>` 会
-校验请求类型的 Size；以 `Large` 打开实际为 `Small` 的资源，或反过来，都会返回
+`Size` 在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。`Store::open_data::<D>`
+会校验请求类型的 `Size`；以 `Large` 打开实际为 `Small` 的资源，或反过来，都会返回
 `StoreError::DataSizeMismatch`。
 
-Store catalog 不记录或验证 `Cell`/`OrderedMap`、`K`、`V` 或 codec 类型。同一个 Size 下，
+Store catalog 不记录或验证 `Cell`/`OrderedMap`、`K`、`V` 或 codec 类型。同一个 `Size` 下，
 调用方必须按照创建者定义的稳定 schema 重新打开数据。不要把 Rust `TypeId`、类型名或内存
 布局当作磁盘格式。
 
@@ -98,13 +98,13 @@ assert_eq!(counter.access(&transaction)?.get()?, Some(1));
 # }
 ```
 
-`StoreData` 是 Store generic create/open 使用的 sealed marker trait。它只由内建集合的
+`StoreData` 是 Store 泛型 create/open 使用的 sealed marker trait。它只由内建集合的
 `Small`/`Large` 形式实现；一般业务代码不需要直接引用它。
 
 ## 事务与扫描语义
 
 丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。通过所有访问
-值进行的读写共享同一事务快照，因此任意数量、任意 Size 的数据对象都可以原子提交。访问值
+值进行的读写共享同一事务快照，因此任意数量、任意 `Size` 的数据对象都可以原子提交。访问值
 只在一次事务尝试中有效：每个新事务都必须重新绑定，不能跨 Stage 步骤缓存。
 
 内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
@@ -131,9 +131,9 @@ cargo test -p dogpaddle-store --test architecture transaction::
 cargo test -p dogpaddle-store --test collections scan::
 ```
 
-架构测试会对 Small 与 Large 运行相同的数据、事务与扫描语义，并通过 MDBX 白盒适配器锁定
-catalog binding、共享前缀和独立 named table 的物理布局。错误 Size reopen、崩溃恢复、事务
-中毒和 codec 失败也有独立覆盖。
+架构测试会对 `Small` 与 `Large` 运行相同的数据、事务与扫描语义，并通过 MDBX 白盒适配器
+锁定 catalog binding、共享前缀和独立 named table 的物理布局。`Size` 不匹配的 reopen、
+崩溃恢复、事务中毒和 codec 失败也有独立覆盖。
 
 ## 性能
 
@@ -143,11 +143,11 @@ catalog binding、共享前缀和独立 named table 的物理布局。错误 Siz
 cargo bench -p dogpaddle-store --bench store
 ```
 
-基准测试为 Small 与 Large 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、热点
-读取、升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个 Small 后台
-命名空间时的预热读取。byte map 使用 `OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸
-句柄。结果包含最小值、中位数和最大值；它们描述当前机器与临时文件系统上的表现，不代表冷
-缓存或断电场景。
+基准测试为 `Small` 与 `Large` 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、热点
+读取、升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个 `Small` 后台
+命名空间时的预热读取。两种 map 使用各自独立的具名数据对象；byte map 的类型是
+`OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸句柄。结果包含最小值、中位数和最大值；
+它们描述当前机器与临时文件系统上的表现，不代表冷缓存或断电场景。
 
 可通过 `DOGPADDLE_BENCH_ENTRIES`、`DOGPADDLE_BENCH_COMMITS`、
 `DOGPADDLE_BENCH_SAMPLES` 和 `DOGPADDLE_BENCH_BACKGROUND_NAMESPACES` 调整工作负载

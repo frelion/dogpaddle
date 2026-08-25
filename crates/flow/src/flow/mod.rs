@@ -12,7 +12,7 @@ use crate::{
 /// An opened persistent Flow.
 ///
 /// A Flow owns the only active Store transaction capability for its path. Its
-/// definition and data namespaces were frozen by a successful build.
+/// definition and data object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
     definition: FlowDefinition,
@@ -43,11 +43,12 @@ impl Flow {
         FlowBuilder::new(path)
     }
 
-    /// Opens a completely built Flow and rematerializes all stage resources.
+    /// Opens a completely built Flow and reassembles all runtime stages.
     ///
-    /// The definition is read first, then the Store is reopened so every data
-    /// namespace can be resolved before the Store is frozen into transaction
-    /// capability. The definition is read again to guard the two-phase open.
+    /// The definition is read first, then the Store is reopened so every
+    /// declared data object can be opened before the Store is frozen into
+    /// transaction capability. The definition is read again to guard the
+    /// two-phase open.
     ///
     /// # Errors
     ///
@@ -132,9 +133,7 @@ fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
 fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>, Small>, FlowError> {
     match store.open_data(codec::DEFINITION_DATA_NAME) {
         Ok(data) => Ok(data),
-        Err(StoreError::DataNotFound(name)) if name == codec::DEFINITION_DATA_NAME => {
-            Err(FlowError::IncompleteBuild)
-        }
+        Err(StoreError::DataNotFound(_)) => Err(FlowError::IncompleteBuild),
         Err(error) => Err(error.into()),
     }
 }
@@ -160,7 +159,7 @@ fn open_stage(
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::operation_data_name(index, declaration.name());
-        let instance = open_required(&physical_name, declaration.open(store, &physical_name))?;
+        let instance = require_resource(&physical_name, declaration.open(store, &physical_name))?;
         data.insert(instance)?;
     }
     let operation = definition.materialize(&mut data)?;
@@ -169,10 +168,10 @@ fn open_stage(
 }
 
 fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {
-    open_required(name, store.open_data(name))
+    require_resource(name, store.open_data(name))
 }
 
-fn open_required<T>(name: &str, result: Result<T, StoreError>) -> Result<T, FlowError> {
+fn require_resource<T>(name: &str, result: Result<T, StoreError>) -> Result<T, FlowError> {
     match result {
         Ok(data) => Ok(data),
         Err(StoreError::DataNotFound(_)) => Err(FlowError::MissingResource {

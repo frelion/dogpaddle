@@ -7,12 +7,12 @@ use crate::CodecError;
 /// Store declaration, open, and data-access failure.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    /// A data namespace name is invalid.
-    #[error("invalid data namespace name {name:?}: {reason}")]
+    /// A data object name is invalid.
+    #[error("invalid data object name {name:?}: {reason}")]
     InvalidName { name: String, reason: &'static str },
 
-    /// A data namespace already uses this name.
-    #[error("data namespace {0:?} already exists")]
+    /// A data object already uses this name.
+    #[error("data object {0:?} already exists")]
     DataAlreadyExists(String),
 
     /// Creation requires an unused path.
@@ -23,16 +23,16 @@ pub enum StoreError {
     #[error("store path does not exist or is not a directory: {0}")]
     StoreNotFound(PathBuf),
 
-    /// A data namespace is not present in the durable catalog.
-    #[error("data namespace {0:?} does not exist")]
+    /// A data object is not present in the durable catalog.
+    #[error("data object {0:?} does not exist")]
     DataNotFound(String),
 
     /// A typed open requested a different durable size than the catalog records.
     #[error(
-        "data namespace {name:?} has size {actual}, but the requested data class requires {expected}"
+        "data object {name:?} has size {actual}, but the requested data class requires {expected}"
     )]
     DataSizeMismatch {
-        /// Durable data namespace name.
+        /// Durable data object name.
         name: String,
         /// Size required by the requested data class.
         expected: &'static str,
@@ -44,8 +44,8 @@ pub enum StoreError {
     #[error("store marker or catalog metadata is invalid")]
     InvalidStore,
 
-    /// No more durable data namespace identifiers are available.
-    #[error("store has exhausted its data namespace identifiers")]
+    /// No more durable data object identifiers are available.
+    #[error("store has exhausted its data object identifiers")]
     DataIdExhausted,
 
     /// No more physical tables are available for large data objects.

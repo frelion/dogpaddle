@@ -1,5 +1,5 @@
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationDefinition, encode_definition,
+    DataDeclaration, DataInstances, MaterializeError, OperationDefinition, encode_definition,
     operation::{
         Operation,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
@@ -50,7 +50,7 @@ fn definitions_materialize_exact_declared_data_shapes() {
         source_definition
             .data()
             .iter()
-            .map(|declaration| declaration.name())
+            .map(DataDeclaration::name)
             .collect::<Vec<_>>(),
         ["sequence_source.position"]
     );
@@ -58,7 +58,7 @@ fn definitions_materialize_exact_declared_data_shapes() {
         count_definition
             .data()
             .iter()
-            .map(|declaration| declaration.name())
+            .map(DataDeclaration::name)
             .collect::<Vec<_>>(),
         ["count"]
     );
@@ -67,7 +67,6 @@ fn definitions_materialize_exact_declared_data_shapes() {
     let source_position = source_definition
         .data()
         .iter()
-        .copied()
         .find(|declaration| declaration.name() == "sequence_source.position")
         .unwrap();
     source_data
@@ -84,7 +83,6 @@ fn definitions_materialize_exact_declared_data_shapes() {
     let count_cell = count_definition
         .data()
         .iter()
-        .copied()
         .find(|declaration| declaration.name() == "count")
         .unwrap();
     count_data
@@ -103,7 +101,7 @@ fn definitions_materialize_exact_declared_data_shapes() {
 
     let mut missing = DataInstances::new();
     let Err(error) = count_definition.materialize(&mut missing) else {
-        panic!("count unexpectedly materialized without its named data binding");
+        panic!("count unexpectedly materialized without its named data instance");
     };
     assert_eq!(error, MaterializeError::MissingData { name: "count" });
 }

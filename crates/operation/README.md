@@ -2,8 +2,11 @@
 
 `dogpaddle-operation` 提供具体、强类型的 Operation Definition、持久化 Data 和运行实例。
 Definition 是无副作用、可持久化的数据；它声明所需数据对象的稳定逻辑名、collection 类型
-及 `Small`/`Large` size。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
+及 `Small`/`Large` Size。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
 Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
+
+下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、`K`、`V` 和
+`SIZE`，例如 `OrderedMap<u64, String, Large>`。
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
@@ -12,14 +15,14 @@ Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandl
 
 ## Definition 与持久化
 
-具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量，并
-以 `{ 逻辑名: collection<..., SIZE> }` 的形式向 Flow 声明完整数据 schema。Flow 负责生成
-完整资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
-Definition 的 `materialize`。具体 Definition 只按名称取得已经构造好的 `Cell<T, SIZE>` 或
-`OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
+具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量，并以
+`{ 逻辑名: collection<..., SIZE> }` 的形式向 Flow 声明完整数据 schema。Flow 负责生成完整
+资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
+Definition 的 `materialize`。具体 Definition 只按名称取得已经创建或打开的
+`Cell<T, SIZE>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
 
-所有 collection 都显式携带 size：`Small` 对象共享底层物理空间，`Large` 对象拥有独立物理
-空间。size 属于每一个具名数据对象的静态 schema，而不是由 Flow 根据数据量猜测。Flow 只
+所有 collection 都显式携带 Size：`Small` 对象共享底层物理空间，`Large` 对象拥有独立物理
+空间。Size 属于每一个具名数据对象的静态 schema，而不是由 Flow 根据数据量猜测。Flow 只
 解释声明，不枚举具体算子或 collection 类型。
 
 ```rust
@@ -41,7 +44,7 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 数据声明和物化逻辑。Flow 不枚举具体算子，也不解析 Operation payload。
 
 为穿过 object-safe 的 [`OperationDefinition`] 边界，数据实例仅在一次性的 build/open 装配
-过程中进行私有类型擦除；具名声明在 `materialize` 中将其安全恢复为精确 collection 类型。
+过程中进行私有类型擦除；具名声明在 `materialize` 中将其安全恢复为精确 data class。
 类型不匹配会返回错误而不是 panic。类型擦除不会进入运行实例、事务访问路径或持久化格式。
 
 物化后的具体实例统一实现 sealed [`operation::Operation`] trait。Flow 将异构实例保存为

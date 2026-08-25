@@ -30,7 +30,7 @@ const DEDICATED_PLACEMENT: u8 = 1;
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
-    /// Maximum number of data namespaces that may use dedicated physical tables.
+    /// Maximum number of data objects that may use dedicated physical tables.
     pub const LARGE_DATA_CAPACITY: u32 = MAX_DEDICATED_TABLES;
 
     /// Creates an empty store at a new path.
@@ -203,7 +203,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns an error when the namespace is missing, its durable size does
+    /// Returns an error when the data object is missing, its durable size does
     /// not match `D`, or MDBX fails.
     pub fn open_data<D: StoreData>(&self, name: &str) -> Result<D, StoreError> {
         let handle = self.open_handle(name)?;
@@ -241,7 +241,7 @@ impl Store {
         Ok(self.handle(location))
     }
 
-    /// Finishes provisioning and yields the runtime transaction capability.
+    /// Ends data object setup and yields the runtime transaction capability.
     #[must_use]
     pub fn into_transactions(self) -> Transactions {
         Transactions {

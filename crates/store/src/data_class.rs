@@ -2,9 +2,8 @@ use crate::{Cell, DataHandle, DataPlacement, Large, OrderedMap, Small, StoreKey,
 
 /// A typed persistent data object that can be created and opened by [`crate::Store`].
 ///
-/// This trait is sealed and implemented by every built-in Store collection for
-/// the [`Small`] and [`Large`] size classes. Its private implementation is the
-/// sole source of physical placement and typed handle construction.
+/// This trait is sealed and implemented by each built-in collection for the
+/// [`Small`] and [`Large`] size classes.
 pub trait StoreData: private::SealedStoreData {}
 
 pub(crate) mod private {

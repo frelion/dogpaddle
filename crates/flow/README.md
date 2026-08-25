@@ -42,20 +42,22 @@ fan-out 和重复 source；输入数量必须与具体 Definition 完全一致�
 
 每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
 持久化 state map，并按 Operation Definition 的逻辑数据名声明全部状态空间，最后提交
-manifest Cell 作为构建完成标记。Operation Definition 返回稳定的“逻辑名称 → 类型化 data
-class”声明；Flow 负责完整资源名，并通过 Store 将每个 class 创建或打开为具体实例，再按
-逻辑名称交给 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、
-底层句柄或物理布局。Flow definition Cell、Flow state map 和 Stage state map 都显式声明为
-`Small`。Flow state map 保留生命周期状态；
-Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续运行层只能在这些 map 的
-键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
+manifest Cell 作为构建完成标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”
+声明；Flow 负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称交给
+Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或物理
+布局。
+
+Flow definition Cell、Flow state map 和 Stage state map 都显式声明为 `Small`。Flow state
+map 保留生命周期状态；Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续
+运行层只能在这些 map 的键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑
+和资源目录都没有修改入口。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`Flow::open()` 返回 `IncompleteBuild`；
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
 `open()` 分两遍完成：第一遍只读取、解码并重新校验 manifest；第二遍按持久化定义打开全部
-资源、物化 Stage，再冻结 Store。调用方不需要重新提交 Definition。
+数据对象、重新装配 Stage，再冻结 Store。调用方不需要重新提交 Definition。
 
 当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
@@ -75,7 +77,7 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 不再拥有独立 Builder。`build/` 与 `flow/` 分别按 Definition 声明的逻辑数据名通用创建或打开
 类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。`stage/` 只保存
 公共 state map 和装箱后的 `Operation` trait object，不接收 Store，也不知道资源名或底层
-物理 placement。
+物理布局。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 顶层文件只验证 crate 的公共行为。
 

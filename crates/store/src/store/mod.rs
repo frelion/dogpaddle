@@ -27,7 +27,14 @@ enum DataLocation {
     Dedicated(u32),
 }
 
-/// Owns one durable store while its named data objects are provisioned.
+/// Locates one data object in a particular [`Store`].
+#[derive(Clone)]
+pub struct DataHandle {
+    store_token: u64,
+    location: DataLocation,
+}
+
+/// Owns one durable store during named data object setup.
 pub struct Store {
     database: Database<NoWriteMap>,
     token: u64,
@@ -35,18 +42,11 @@ pub struct Store {
 
 /// Grants the sole runtime capability to begin store transactions.
 ///
-/// This value is obtained by consuming a fully provisioned [`Store`]. It does
-/// not expose the catalog or allow data objects to be created or opened.
+/// This value is obtained by consuming [`Store`]. It does not expose the
+/// catalog or allow data objects to be created or opened.
 pub struct Transactions {
     database: Database<NoWriteMap>,
     store_token: u64,
-}
-
-/// Locates one named key/value namespace in a particular [`Store`].
-#[derive(Clone)]
-pub struct DataHandle {
-    store_token: u64,
-    location: DataLocation,
 }
 
 /// Owns one atomic store transaction.
@@ -59,8 +59,8 @@ pub struct DataHandle {
 /// require_send::<dogpaddle_store::Transaction<'static>>();
 /// ```
 #[must_use = "dropping a transaction rolls back its changes"]
-pub struct Transaction<'handle> {
-    mdbx: MdbxTransaction<'handle, RW, NoWriteMap>,
+pub struct Transaction<'database> {
+    mdbx: MdbxTransaction<'database, RW, NoWriteMap>,
     store_token: u64,
     poisoned: PoisonFlag<bool>,
     _thread_bound: PhantomData<Rc<()>>,

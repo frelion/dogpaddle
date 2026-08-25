@@ -4,7 +4,7 @@ use crate::{DataAccess, DataHandle, StoreError, StoreValue, Transaction};
 
 const CELL_KEY: &[u8] = &[];
 
-/// A typed optional value stored in one generic data namespace.
+/// A named persistent cell holding one optional typed value.
 pub struct Cell<T, SIZE> {
     data: DataHandle,
     _types: PhantomData<fn() -> (T, SIZE)>,

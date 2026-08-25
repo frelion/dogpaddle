@@ -55,7 +55,7 @@ fn commit_is_atomic_across_small_and_large_data() {
 }
 
 #[test]
-fn dropping_a_transaction_rolls_back_every_namespace() {
+fn dropping_a_transaction_rolls_back_every_data_object() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let small = create_byte_map::<Small>(&mut store, "small").unwrap();

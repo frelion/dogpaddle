@@ -82,10 +82,10 @@ impl FlowBuilder {
         self
     }
 
-    /// Validates, provisions, and atomically publishes this Flow definition.
+    /// Validates the Flow, creates its data objects, and atomically publishes its definition.
     ///
     /// Pure topology validation and definition encoding finish before the Store
-    /// path is created. Resource namespaces are then provisioned and the
+    /// path is created. Required data objects are then created and the
     /// definition Cell is committed last as the build-complete marker.
     ///
     /// # Errors
@@ -130,10 +130,9 @@ fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), Materia
     for stage in definition.stages() {
         let mut names = BTreeSet::new();
         for declaration in stage.operation().data() {
-            if !names.insert(declaration.name()) {
-                return Err(MaterializeError::DuplicateData {
-                    name: declaration.name(),
-                });
+            let name = declaration.name();
+            if !names.insert(name) {
+                return Err(MaterializeError::DuplicateData { name });
             }
         }
     }

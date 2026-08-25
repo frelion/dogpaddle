@@ -6,8 +6,8 @@ use crate::StoreError;
 impl Transactions {
     /// Begins one atomic transaction.
     ///
-    /// The mutable borrow prevents a second transaction from being started
-    /// through this handle until the first transaction is committed or dropped.
+    /// The mutable borrow prevents this capability from starting another
+    /// transaction until the first one is committed or dropped.
     ///
     /// # Errors
     ///

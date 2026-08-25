@@ -27,7 +27,7 @@ fn decoder_tags_and_data_declaration_names_are_unique() {
     ] {
         assert!(tags.contains(&definition.persistence_tag()));
         let mut names = HashSet::new();
-        for declaration in definition.data().iter().copied() {
+        for declaration in definition.data() {
             let name = declaration.name();
             assert!(!name.is_empty());
             assert!(!name.as_bytes().contains(&0));

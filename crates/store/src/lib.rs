@@ -13,10 +13,10 @@ pub use error::StoreError;
 pub(crate) use store::{DataAccess, DataHandle, DataPlacement};
 pub use store::{ScanBatch, ScanDirection, ScanLimit, Store, Transaction, Transactions};
 
-/// Marks a data object that shares physical storage with other small objects.
+/// Persistent size marker selecting shared physical storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Small;
 
-/// Marks a data object that owns dedicated physical storage.
+/// Persistent size marker selecting dedicated physical storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Large;
