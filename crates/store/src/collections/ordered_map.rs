@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     CodecError, DataAccess, DataHandle, ScanBatch, ScanDirection, ScanLimit, StoreError, StoreKey,
-    StoreValue, Transaction,
+    StoreValue, TransactionAccess,
 };
 
 type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
@@ -30,18 +30,18 @@ impl<K: StoreKey, V: StoreValue, SIZE> OrderedMap<K, V, SIZE> {
         }
     }
 
-    /// Binds this map to an active transaction.
+    /// Binds this map through an active transaction's access capability.
     ///
     /// # Errors
     ///
     /// Returns an error when this data object belongs to another store or the
-    /// transaction is already poisoned.
+    /// underlying transaction is already poisoned.
     pub fn access<'transaction>(
         &self,
-        transaction: &'transaction Transaction<'transaction>,
+        access: TransactionAccess<'transaction>,
     ) -> Result<OrderedMapAccess<'transaction, K, V>, StoreError> {
         Ok(OrderedMapAccess {
-            data: self.data.access(transaction)?,
+            data: self.data.access(access)?,
             _types: PhantomData,
         })
     }

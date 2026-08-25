@@ -111,7 +111,7 @@ where
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
-        let mut access = map.access(&transaction).unwrap();
+        let mut access = map.access(transaction.access()).unwrap();
         for (key, value) in &model {
             access.put(key, value).unwrap();
         }
@@ -119,7 +119,7 @@ where
     }
 
     let transaction = transactions.begin().unwrap();
-    let access = map.access(&transaction).unwrap();
+    let access = map.access(transaction.access()).unwrap();
     for lower in &bounds {
         for upper in &bounds {
             for direction in [ScanDirection::Ascending, ScanDirection::Descending] {
@@ -153,7 +153,7 @@ where
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
-        let mut access = map.access(&transaction).unwrap();
+        let mut access = map.access(transaction.access()).unwrap();
         for key in [-2, -1, 0] {
             access.put(&key, &format!("v{key}")).unwrap();
         }
@@ -161,7 +161,7 @@ where
     }
 
     let transaction = transactions.begin().unwrap();
-    let access = map.access(&transaction).unwrap();
+    let access = map.access(transaction.access()).unwrap();
     let first = access
         .scan(
             ..,
@@ -205,7 +205,7 @@ fn continuation_outside_the_range_returns_no_items() {
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
-        let mut access = map.access(&transaction).unwrap();
+        let mut access = map.access(transaction.access()).unwrap();
         for key in -2..=2 {
             access.put(&key, &key).unwrap();
         }
@@ -213,7 +213,7 @@ fn continuation_outside_the_range_returns_no_items() {
     }
 
     let transaction = transactions.begin().unwrap();
-    let access = map.access(&transaction).unwrap();
+    let access = map.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(10, 1_024).unwrap();
     let ascending = access
         .scan(

@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{DataAccess, DataHandle, StoreError, StoreValue, Transaction};
+use crate::{DataAccess, DataHandle, StoreError, StoreValue, TransactionAccess};
 
 const CELL_KEY: &[u8] = &[];
 
@@ -24,18 +24,18 @@ impl<T: StoreValue, SIZE> Cell<T, SIZE> {
         }
     }
 
-    /// Binds this cell to an active transaction.
+    /// Binds this cell through an active transaction's access capability.
     ///
     /// # Errors
     ///
     /// Returns an error when this data object belongs to another store or the
-    /// transaction is already poisoned.
+    /// underlying transaction is already poisoned.
     pub fn access<'transaction>(
         &self,
-        transaction: &'transaction Transaction<'transaction>,
+        access: TransactionAccess<'transaction>,
     ) -> Result<CellAccess<'transaction, T>, StoreError> {
         Ok(CellAccess {
-            data: self.data.access(transaction)?,
+            data: self.data.access(access)?,
             _value: PhantomData,
         })
     }

@@ -54,13 +54,13 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
         let transaction = transactions.begin().unwrap();
         source
             .state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"source".to_vec())
             .unwrap();
         count
             .state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"count".to_vec())
             .unwrap();
@@ -71,7 +71,7 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
     assert_eq!(
         source
             .state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -80,7 +80,7 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
     assert_eq!(
         count
             .state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),

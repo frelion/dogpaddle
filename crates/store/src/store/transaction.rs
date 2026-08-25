@@ -1,6 +1,6 @@
 use libmdbx::{NoWriteMap, RW, Transaction as MdbxTransaction};
 
-use super::{DataHandle, Transaction, Transactions};
+use super::{DataHandle, Transaction, TransactionAccess, Transactions};
 use crate::StoreError;
 
 impl Transactions {
@@ -26,6 +26,16 @@ impl Transactions {
 }
 
 impl Transaction<'_> {
+    /// Borrows this transaction as a typed data-access capability.
+    ///
+    /// The returned value may be passed to existing [`crate::Cell`] and
+    /// [`crate::OrderedMap`] objects. It cannot commit the transaction or
+    /// create, open, or enumerate data objects.
+    #[must_use]
+    pub fn access(&self) -> TransactionAccess<'_> {
+        TransactionAccess { transaction: self }
+    }
+
     /// Atomically commits all changes and consumes the transaction.
     ///
     /// # Errors
@@ -70,6 +80,12 @@ impl Transaction<'_> {
         } else {
             Ok(())
         }
+    }
+}
+
+impl<'transaction> TransactionAccess<'transaction> {
+    pub(super) const fn transaction(self) -> &'transaction Transaction<'transaction> {
+        self.transaction
     }
 }
 

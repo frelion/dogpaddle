@@ -12,8 +12,8 @@ fn small_and_large_have_identical_data_semantics() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut small = small.access(&transaction).unwrap();
-        let mut large = large.access(&transaction).unwrap();
+        let mut small = small.access(transaction.access()).unwrap();
+        let mut large = large.access(transaction.access()).unwrap();
         for number in 0_u64..10 {
             let key = number.to_be_bytes().to_vec();
             let value = format!("value-{number}").into_bytes();
@@ -24,8 +24,8 @@ fn small_and_large_have_identical_data_semantics() {
     }
 
     let transaction = transactions.begin().unwrap();
-    let small = small.access(&transaction).unwrap();
-    let large = large.access(&transaction).unwrap();
+    let small = small.access(transaction.access()).unwrap();
+    let large = large.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(100, 4_096).unwrap();
     assert_eq!(
         small
@@ -52,12 +52,12 @@ fn catalog_reopens_each_declared_size() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     small
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"small".to_vec())
         .unwrap();
     large
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"large".to_vec())
         .unwrap();
@@ -66,7 +66,7 @@ fn catalog_reopens_each_declared_size() {
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -74,7 +74,7 @@ fn catalog_reopens_each_declared_size() {
     );
     assert_eq!(
         large
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -100,27 +100,27 @@ fn physical_layout_uses_shared_prefixes_and_dedicated_keys() {
 
     let transaction = transactions.begin().unwrap();
     shared_zero
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"shared-zero".to_vec())
         .unwrap();
     shared_one
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"shared-one".to_vec())
         .unwrap();
     dedicated_zero
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"dedicated-zero".to_vec())
         .unwrap();
     dedicated_one
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"dedicated-one".to_vec())
         .unwrap();
     dedicated_cell
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .set(&b"cell".to_vec())
         .unwrap();
@@ -182,7 +182,7 @@ fn large_capacity_does_not_limit_small_data() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     small
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"value".to_vec())
         .unwrap();
@@ -195,7 +195,7 @@ fn large_capacity_does_not_limit_small_data() {
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),

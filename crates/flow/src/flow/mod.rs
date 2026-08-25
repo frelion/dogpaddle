@@ -70,7 +70,7 @@ impl Flow {
         let mut transactions = store.into_transactions();
         let observed_definition = {
             let transaction = transactions.begin()?;
-            let published = published.access(&transaction)?;
+            let published = published.access(transaction.access())?;
             published.get()?.ok_or(FlowError::IncompleteBuild)?
         };
         if observed_definition != definition_bytes {
@@ -126,7 +126,7 @@ fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
     let definition = open_definition_cell(&store)?;
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin()?;
-    let definition = definition.access(&transaction)?;
+    let definition = definition.access(transaction.access())?;
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
 

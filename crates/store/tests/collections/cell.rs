@@ -37,7 +37,7 @@ where
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    let mut access = cell.access(&transaction).unwrap();
+    let mut access = cell.access(transaction.access()).unwrap();
     assert_eq!(access.get().unwrap(), None);
     access.set(&1).unwrap();
     assert_eq!(access.get().unwrap(), Some(1));
@@ -57,7 +57,7 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
     let cell = create_cell::<TestValue, Large>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-    cell.access(&transaction)
+    cell.access(transaction.access())
         .unwrap()
         .set(&TestValue(42))
         .unwrap();
@@ -69,7 +69,7 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        cell.access(&transaction).unwrap().get().unwrap(),
+        cell.access(transaction.access()).unwrap().get().unwrap(),
         Some(TestValue(42))
     );
 }
@@ -95,9 +95,12 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    safe.access(&transaction).unwrap().set(&99).unwrap();
+    safe.access(transaction.access()).unwrap().set(&99).unwrap();
     assert!(matches!(
-        broken.access(&transaction).unwrap().set(&BrokenValue),
+        broken
+            .access(transaction.access())
+            .unwrap()
+            .set(&BrokenValue),
         Err(StoreError::Codec(_))
     ));
     assert!(matches!(
@@ -106,7 +109,10 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
     ));
 
     let transaction = transactions.begin().unwrap();
-    assert_eq!(safe.access(&transaction).unwrap().get().unwrap(), None);
+    assert_eq!(
+        safe.access(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -121,14 +127,17 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    safe.access(&transaction).unwrap().set(&100).unwrap();
+    safe.access(transaction.access())
+        .unwrap()
+        .set(&100)
+        .unwrap();
     broken_data
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&Vec::new(), &b"invalid".to_vec())
         .unwrap();
     assert!(matches!(
-        broken.access(&transaction).unwrap().get(),
+        broken.access(transaction.access()).unwrap().get(),
         Err(StoreError::Codec(_))
     ));
     assert!(matches!(
@@ -137,10 +146,13 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
     ));
 
     let transaction = transactions.begin().unwrap();
-    assert_eq!(safe.access(&transaction).unwrap().get().unwrap(), None);
+    assert_eq!(
+        safe.access(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
     assert_eq!(
         broken_data
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&Vec::new())
             .unwrap(),

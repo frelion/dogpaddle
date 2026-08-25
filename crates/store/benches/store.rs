@@ -73,10 +73,13 @@ where
             .begin()
             .expect("begin seed transaction");
         {
-            let mut map = fixture.map.access(&transaction).expect("access seed map");
+            let mut map = fixture
+                .map
+                .access(transaction.access())
+                .expect("access seed map");
             let mut bytes = fixture
                 .bytes
-                .access(&transaction)
+                .access(transaction.access())
                 .expect("access seed byte map");
             let value = vec![0x5a; VALUE_BYTES];
             for key in 0..entries {
@@ -118,7 +121,10 @@ where
             .expect("begin mixed seed transaction");
         let value = vec![0x5a; VALUE_BYTES];
         {
-            let mut target = fixture.map.access(&transaction).expect("access target map");
+            let mut target = fixture
+                .map
+                .access(transaction.access())
+                .expect("access target map");
             for key in 0..entries {
                 target.put(&(key as u64), &value).expect("seed target map");
             }
@@ -127,7 +133,7 @@ where
         let extra_entries = entries % background_namespaces;
         for (index, background) in backgrounds.iter().enumerate() {
             let mut background = background
-                .access(&transaction)
+                .access(transaction.access())
                 .expect("access background map");
             let background_entries = entries_per_background + usize::from(index < extra_entries);
             for key in 0..background_entries {
@@ -166,12 +172,15 @@ where
             .expect("begin stage seed transaction");
         fixture
             .cursor
-            .access(&transaction)
+            .access(transaction.access())
             .expect("access stage cursor")
             .set(&0)
             .expect("seed stage cursor");
         {
-            let mut map = fixture.map.access(&transaction).expect("access stage map");
+            let mut map = fixture
+                .map
+                .access(transaction.access())
+                .expect("access stage map");
             let value = vec![0x5a; VALUE_BYTES];
             for key in 0..STAGE_KEYS {
                 map.put(&(key as u64), &value).expect("seed stage map");
@@ -414,7 +423,10 @@ where
         .begin()
         .expect("begin byte map write transaction");
     {
-        let mut bytes = fixture.bytes.access(&transaction).expect("access byte map");
+        let mut bytes = fixture
+            .bytes
+            .access(transaction.access())
+            .expect("access byte map");
         for key in 0..entries {
             bytes
                 .put(&(key as u64).to_be_bytes().to_vec(), &value)
@@ -440,7 +452,10 @@ where
         .begin()
         .expect("begin write transaction");
     {
-        let mut map = fixture.map.access(&transaction).expect("access write map");
+        let mut map = fixture
+            .map
+            .access(transaction.access())
+            .expect("access write map");
         for key in 0..entries {
             map.put(&(key as u64), &value)
                 .expect("write benchmark item");
@@ -456,7 +471,10 @@ fn measure_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Durat
         .transactions
         .begin()
         .expect("begin read transaction");
-    let map = fixture.map.access(&transaction).expect("access read map");
+    let map = fixture
+        .map
+        .access(transaction.access())
+        .expect("access read map");
     let mut state = RANDOM_SEED;
     let mut checksum = 0_usize;
     for _ in 0..entries {
@@ -478,7 +496,10 @@ fn measure_byte_map_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize)
         .transactions
         .begin()
         .expect("begin byte map read transaction");
-    let bytes = fixture.bytes.access(&transaction).expect("access byte map");
+    let bytes = fixture
+        .bytes
+        .access(transaction.access())
+        .expect("access byte map");
     let mut state = RANDOM_SEED;
     let mut checksum = 0_usize;
     for _ in 0..entries {
@@ -510,7 +531,7 @@ fn measure_byte_map_scan<SIZE>(
     let limit = ScanLimit::new(scan_items, 4 * 1_024 * 1_024).unwrap();
     let bytes = fixture
         .bytes
-        .access(&transaction)
+        .access(transaction.access())
         .expect("access byte map scan");
     let mut continuation = None;
     let mut count = 0_usize;
@@ -551,7 +572,10 @@ fn measure_scan<SIZE>(
     let limit = ScanLimit::new(scan_items, 4 * 1_024 * 1_024).unwrap();
     let mut count = 0_usize;
     let mut checksum = 0_usize;
-    let map = fixture.map.access(&transaction).expect("access scan map");
+    let map = fixture
+        .map
+        .access(transaction.access())
+        .expect("access scan map");
     let mut continuation = None;
     loop {
         let batch = map
@@ -589,13 +613,16 @@ fn measure_stage_steps<SIZE>(
             .expect("begin stage transaction");
         let cursor = fixture
             .cursor
-            .access(&transaction)
+            .access(transaction.access())
             .expect("access stage cursor")
             .get()
             .expect("read stage cursor")
             .expect("seeded stage cursor");
         {
-            let mut map = fixture.map.access(&transaction).expect("access stage map");
+            let mut map = fixture
+                .map
+                .access(transaction.access())
+                .expect("access stage map");
             for offset in 0..operations_per_step {
                 let key = cursor
                     .wrapping_mul(operations_per_step)
@@ -611,7 +638,7 @@ fn measure_stage_steps<SIZE>(
         }
         fixture
             .cursor
-            .access(&transaction)
+            .access(transaction.access())
             .expect("access stage cursor")
             .set(&cursor.wrapping_add(1))
             .expect("advance stage cursor");
@@ -630,7 +657,7 @@ fn measure_hot_overwrite_rollback<SIZE>(fixture: &mut Fixture<SIZE>, entries: us
     {
         let mut map = fixture
             .map
-            .access(&transaction)
+            .access(transaction.access())
             .expect("access overwrite map");
         for key in 0..entries {
             map.put(&(key as u64), &value)
@@ -652,7 +679,7 @@ fn measure_single_put_commits<SIZE>(fixture: &mut Fixture<SIZE>, commits: usize)
             .expect("begin single-put transaction");
         fixture
             .map
-            .access(&transaction)
+            .access(transaction.access())
             .expect("access single-put map")
             .put(&0, &encoded)
             .expect("write single-put value");

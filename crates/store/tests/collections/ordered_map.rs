@@ -31,7 +31,7 @@ where
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    let mut access = map.access(&transaction).unwrap();
+    let mut access = map.access(transaction.access()).unwrap();
     assert_eq!(access.get(&7).unwrap(), None);
     access.put(&7, &"first".to_owned()).unwrap();
     assert_eq!(access.get(&7).unwrap(), Some("first".to_owned()));
@@ -51,7 +51,7 @@ fn ordered_map_survives_reopen() {
     let map = create_map::<u64, TestValue, Large>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-    map.access(&transaction)
+    map.access(transaction.access())
         .unwrap()
         .put(&42, &TestValue(9))
         .unwrap();
@@ -63,7 +63,7 @@ fn ordered_map_survives_reopen() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        map.access(&transaction).unwrap().get(&42).unwrap(),
+        map.access(transaction.access()).unwrap().get(&42).unwrap(),
         Some(TestValue(9))
     );
 }
@@ -102,7 +102,7 @@ fn ordered_map_accepts_external_key_and_value_codecs() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    map.access(&transaction)
+    map.access(transaction.access())
         .unwrap()
         .put(&TestKey(3), &TestValue(4))
         .unwrap();
@@ -110,7 +110,10 @@ fn ordered_map_accepts_external_key_and_value_codecs() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        map.access(&transaction).unwrap().get(&TestKey(3)).unwrap(),
+        map.access(transaction.access())
+            .unwrap()
+            .get(&TestKey(3))
+            .unwrap(),
         Some(TestValue(4))
     );
 }
@@ -129,7 +132,7 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
     ];
     {
         let transaction = transactions.begin().unwrap();
-        let mut access = map.access(&transaction).unwrap();
+        let mut access = map.access(transaction.access()).unwrap();
         for (value, key) in keys.iter().enumerate() {
             access.put(key, &(value as u64)).unwrap();
         }
@@ -137,7 +140,7 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
     }
 
     let transaction = transactions.begin().unwrap();
-    let access = map.access(&transaction).unwrap();
+    let access = map.access(transaction.access()).unwrap();
     assert_eq!(access.get(&keys[1]).unwrap(), Some(1));
     let limit = ScanLimit::new(1, 1_024).unwrap();
     let ascending = access
@@ -192,9 +195,12 @@ fn key_codec_errors_poison_the_transaction() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    safe.access(&transaction).unwrap().put(&1, &1).unwrap();
+    safe.access(transaction.access())
+        .unwrap()
+        .put(&1, &1)
+        .unwrap();
     assert!(matches!(
-        broken.access(&transaction).unwrap().get(&BrokenKey),
+        broken.access(transaction.access()).unwrap().get(&BrokenKey),
         Err(StoreError::Codec(_))
     ));
     assert!(matches!(
@@ -203,7 +209,10 @@ fn key_codec_errors_poison_the_transaction() {
     ));
 
     let transaction = transactions.begin().unwrap();
-    assert_eq!(safe.access(&transaction).unwrap().get(&1).unwrap(), None);
+    assert_eq!(
+        safe.access(transaction.access()).unwrap().get(&1).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -216,13 +225,16 @@ fn scan_decode_errors_poison_the_transaction() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    safe.access(&transaction).unwrap().put(&1, &1).unwrap();
-    raw.access(&transaction)
+    safe.access(transaction.access())
+        .unwrap()
+        .put(&1, &1)
+        .unwrap();
+    raw.access(transaction.access())
         .unwrap()
         .put(&vec![0], &0_u64.to_be_bytes().to_vec())
         .unwrap();
     assert!(matches!(
-        malformed.access(&transaction).unwrap().scan(
+        malformed.access(transaction.access()).unwrap().scan(
             ..,
             ScanDirection::Ascending,
             None,
@@ -236,9 +248,15 @@ fn scan_decode_errors_poison_the_transaction() {
     ));
 
     let transaction = transactions.begin().unwrap();
-    assert_eq!(safe.access(&transaction).unwrap().get(&1).unwrap(), None);
     assert_eq!(
-        raw.access(&transaction).unwrap().get(&vec![0]).unwrap(),
+        safe.access(transaction.access()).unwrap().get(&1).unwrap(),
+        None
+    );
+    assert_eq!(
+        raw.access(transaction.access())
+            .unwrap()
+            .get(&vec![0])
+            .unwrap(),
         None
     );
 }

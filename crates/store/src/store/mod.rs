@@ -66,6 +66,51 @@ pub struct Transaction<'database> {
     _thread_bound: PhantomData<Rc<()>>,
 }
 
+/// Borrows one active transaction only for typed data access.
+///
+/// This capability can bind existing [`crate::Cell`] and
+/// [`crate::OrderedMap`] objects to the transaction, but cannot begin or
+/// commit a transaction or access the Store catalog. Copying it only copies a
+/// shared borrow; transaction ownership and commit authority remain unique.
+///
+/// ```compile_fail
+/// fn commit(access: dogpaddle_store::TransactionAccess<'_>) {
+///     access.commit();
+/// }
+/// ```
+///
+/// Like its transaction owner, this capability is thread-bound.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<dogpaddle_store::TransactionAccess<'static>>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<dogpaddle_store::TransactionAccess<'static>>();
+/// ```
+///
+/// The capability cannot outlive its transaction or keep being used after the
+/// transaction owner commits.
+///
+/// ```compile_fail
+/// use dogpaddle_store::{Cell, Small, Transaction};
+///
+/// fn commit_before_later_access(
+///     transaction: Transaction<'_>,
+///     cell: &Cell<u64, Small>,
+/// ) {
+///     let access = transaction.access();
+///     transaction.commit().unwrap();
+///     cell.access(access).unwrap();
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub struct TransactionAccess<'transaction> {
+    transaction: &'transaction Transaction<'transaction>,
+}
+
 fn dedicated_table_name(table_id: u32) -> String {
     format!("d/{table_id:08x}")
 }

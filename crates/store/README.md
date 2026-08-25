@@ -13,6 +13,7 @@ Store 将资源装配与运行时访问分离：
 - `OrderedMap<K, V, SIZE>` 保存按稳定 key codec 排序的类型化映射；
 - `Transactions` 是运行期内启动事务的唯一能力；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
+- `TransactionAccess` 从活动 Transaction 临时借用，只允许已有类型化数据对象绑定访问；
 - `CellAccess` 与 `OrderedMapAccess` 绑定一次具体事务并执行实际读写。
 
 底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
@@ -58,8 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let transaction = transactions.begin()?;
-        let mut counter = counter.access(&transaction)?;
-        let mut users = users.access(&transaction)?;
+        let access = transaction.access();
+        let mut counter = counter.access(access)?;
+        let mut users = users.access(access)?;
 
         counter.set(&1)?;
         users.put(&42, &"Shiba".to_owned())?;
@@ -67,8 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let transaction = transactions.begin()?;
-    let counter = counter.access(&transaction)?;
-    let users = users.access(&transaction)?;
+    let access = transaction.access();
+    let counter = counter.access(access)?;
+    let users = users.access(access)?;
     assert_eq!(counter.get()?, Some(1));
     assert_eq!(users.get(&42)?.as_deref(), Some("Shiba"));
 
@@ -93,7 +96,8 @@ let store = Store::open("./dogpaddle-store-data")?;
 let counter = store.open_data::<Cell<u64, Small>>("counter")?;
 let mut transactions = store.into_transactions();
 let transaction = transactions.begin()?;
-assert_eq!(counter.access(&transaction)?.get()?, Some(1));
+let access = transaction.access();
+assert_eq!(counter.access(access)?.get()?, Some(1));
 # Ok(())
 # }
 ```
@@ -103,9 +107,16 @@ assert_eq!(counter.access(&transaction)?.get()?, Some(1));
 
 ## 事务与扫描语义
 
-丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。通过所有访问
-值进行的读写共享同一事务快照，因此任意数量、任意 `Size` 的数据对象都可以原子提交。访问值
-只在一次事务尝试中有效：每个新事务都必须重新绑定，不能跨 Stage 步骤缓存。
+丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。调用
+`Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
+持有的 `Cell` 或 `OrderedMap` 创建事务级 Access。Flow/Stage 因此可以保留 Transaction
+所有权并把受限能力交给 Operation，Operation 无法开始或结束原子边界，也无法访问 Store
+catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意 `Size` 的数据对象
+都可以原子提交。
+
+`TransactionAccess`、`CellAccess` 和 `OrderedMapAccess` 都不能脱离所属事务；每个新事务都
+必须重新绑定，不能跨 Stage 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
+执行的事务。
 
 内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
 以及提交返回 `TransactionPoisoned`；无法容纳单个扫描项的 `ItemTooLarge` 是可调整 scan

@@ -5,7 +5,9 @@ use std::{
 
 use libmdbx::{Cursor, ObjectLength, RW, Table, WriteFlags};
 
-use super::{DataHandle, DataLocation, DataPlacement, Transaction, dedicated_table_name};
+use super::{
+    DataHandle, DataLocation, DataPlacement, Transaction, TransactionAccess, dedicated_table_name,
+};
 use crate::StoreError;
 
 const DATA_DOMAIN: u8 = 3;
@@ -106,7 +108,7 @@ impl DataHandle {
         }
     }
 
-    /// Binds this namespace to an active transaction.
+    /// Binds this namespace through an active transaction's access capability.
     ///
     /// # Errors
     ///
@@ -114,8 +116,9 @@ impl DataHandle {
     /// when MDBX cannot open the underlying table.
     pub(crate) fn access<'transaction>(
         &self,
-        transaction: &'transaction Transaction<'transaction>,
+        access: TransactionAccess<'transaction>,
     ) -> Result<DataAccess<'transaction>, StoreError> {
+        let transaction = access.transaction();
         transaction.ensure_access(self)?;
         let (table_name, prefix) = match self.location {
             DataLocation::Shared(data_id) => (None, Some(data_prefix(data_id))),

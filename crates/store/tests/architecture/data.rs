@@ -19,7 +19,7 @@ where
 
     let key = b"key".to_vec();
     let transaction = transactions.begin().unwrap();
-    let mut access = data.access(&transaction).unwrap();
+    let mut access = data.access(transaction.access()).unwrap();
     assert_eq!(access.get(&key).unwrap(), None);
     access.put(&key, &b"first".to_vec()).unwrap();
     assert_eq!(access.get(&key).unwrap(), Some(b"first".to_vec()));
@@ -49,8 +49,8 @@ where
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut left = left.access(&transaction).unwrap();
-        let mut right = right.access(&transaction).unwrap();
+        let mut left = left.access(transaction.access()).unwrap();
+        let mut right = right.access(transaction.access()).unwrap();
         left.put(&Vec::new(), &b"left-empty".to_vec()).unwrap();
         left.put(&b"key".to_vec(), &b"left".to_vec()).unwrap();
         right.put(&Vec::new(), &b"right-empty".to_vec()).unwrap();
@@ -59,8 +59,8 @@ where
     }
 
     let transaction = transactions.begin().unwrap();
-    let left = left.access(&transaction).unwrap();
-    let right = right.access(&transaction).unwrap();
+    let left = left.access(transaction.access()).unwrap();
+    let right = right.access(transaction.access()).unwrap();
     assert_eq!(left.get(&Vec::new()).unwrap(), Some(b"left-empty".to_vec()));
     assert_eq!(left.get(&b"key".to_vec()).unwrap(), Some(b"left".to_vec()));
     assert_eq!(
@@ -105,7 +105,7 @@ fn byte_map_writes_are_visible_inside_the_same_transaction() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    let mut access = data.access(&transaction).unwrap();
+    let mut access = data.access(transaction.access()).unwrap();
     access.put(&b"a".to_vec(), &b"one".to_vec()).unwrap();
     access.put(&b"b".to_vec(), &b"two".to_vec()).unwrap();
     assert_eq!(access.get(&b"a".to_vec()).unwrap(), Some(b"one".to_vec()));
@@ -154,7 +154,7 @@ where
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
-        let mut access = data.access(&transaction).unwrap();
+        let mut access = data.access(transaction.access()).unwrap();
         for key in &keys {
             access.put(key, key).unwrap();
         }
@@ -162,7 +162,7 @@ where
     }
 
     let transaction = transactions.begin().unwrap();
-    let access = data.access(&transaction).unwrap();
+    let access = data.access(transaction.access()).unwrap();
     for key in &keys {
         assert_eq!(access.get(key).unwrap(), Some(key.clone()));
     }

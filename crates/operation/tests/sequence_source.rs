@@ -14,7 +14,7 @@ fn sequence_source_starts_at_the_definition_and_continues_after_reopen() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut position = operation.position().access(&transaction).unwrap();
+        let mut position = operation.position().access(transaction.access()).unwrap();
         assert_eq!(operation.apply(&mut position).unwrap(), 41);
         assert_eq!(operation.apply(&mut position).unwrap(), 42);
         transaction.commit().unwrap();
@@ -26,7 +26,7 @@ fn sequence_source_starts_at_the_definition_and_continues_after_reopen() {
     let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(41), position);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-    let mut position = operation.position().access(&transaction).unwrap();
+    let mut position = operation.position().access(transaction.access()).unwrap();
     assert_eq!(operation.apply(&mut position).unwrap(), 43);
     transaction.commit().unwrap();
 }
@@ -41,13 +41,13 @@ fn sequence_source_emits_u64_max_once_and_then_reports_exhaustion() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut position = operation.position().access(&transaction).unwrap();
+        let mut position = operation.position().access(transaction.access()).unwrap();
         assert_eq!(operation.apply(&mut position).unwrap(), u64::MAX);
         transaction.commit().unwrap();
     }
 
     let transaction = transactions.begin().unwrap();
-    let mut position = operation.position().access(&transaction).unwrap();
+    let mut position = operation.position().access(transaction.access()).unwrap();
     assert!(matches!(
         operation.apply(&mut position),
         Err(SequenceSourceError::Exhausted)

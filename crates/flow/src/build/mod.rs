@@ -107,7 +107,7 @@ impl FlowBuilder {
         let mut transactions = store.into_transactions();
         {
             let transaction = transactions.begin()?;
-            let mut published = published.access(&transaction)?;
+            let mut published = published.access(transaction.access())?;
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }

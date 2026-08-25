@@ -80,16 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
-    let mut count = operation.count().access(&transaction)?;
+    let access = transaction.access();
+    let mut count = operation.count().access(access)?;
     assert_eq!(operation.apply(&mut count)?, 1);
     transaction.commit()?;
     Ok(())
 }
 ```
 
-Operation 业务逻辑不接收、开始、提交或保存 Transaction。未来 Flow 内部的 Stage 负责事务
-边界，从 Operation 持有的 Cell 取得具体 `CellAccess`，再注入 `apply()`。这使状态、输入
-进度和输出以后能够由 Stage 原子提交。
+Operation 业务逻辑不接收、开始、提交或保存 Transaction。未来 Flow 内部的 Stage 保留完整
+Transaction，只把不能提交的 `TransactionAccess` 交给 `apply()`；Operation 再用自己持有的
+`Cell` 或 `OrderedMap` 创建具体事务级 Access。这样 Flow 不必知道算子的数据结构，Operation
+也不能控制事务边界，而状态、输入进度和输出仍可由 Stage 原子提交。
 
 ## 扩展约束
 

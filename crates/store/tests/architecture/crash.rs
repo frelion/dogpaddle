@@ -54,7 +54,7 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -62,7 +62,7 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
     );
     assert_eq!(
         large
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -98,12 +98,12 @@ fn crash_worker() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     small
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();
     large
-        .access(&transaction)
+        .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();

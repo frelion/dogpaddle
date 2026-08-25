@@ -17,7 +17,7 @@ fn open_rematerializes_flow_state() {
     {
         let transaction = transactions.begin().unwrap();
         state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"flow".to_vec())
             .unwrap();
@@ -30,7 +30,7 @@ fn open_rematerializes_flow_state() {
     let transaction = flow.transactions.begin().unwrap();
     assert_eq!(
         flow.state
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),

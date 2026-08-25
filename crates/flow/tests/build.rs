@@ -62,7 +62,7 @@ fn build_uses_the_stable_resource_layout() {
     let transaction = transactions.begin().unwrap();
     assert!(
         definition
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get()
             .unwrap()
@@ -134,7 +134,7 @@ fn open_rejects_a_corrupt_published_definition() {
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
-        let mut definition = definition.access(&transaction).unwrap();
+        let mut definition = definition.access(transaction.access()).unwrap();
         definition.set(&b"not a flow".to_vec()).unwrap();
         transaction.commit().unwrap();
     }
@@ -157,7 +157,7 @@ fn open_reports_a_missing_resource_after_publication() {
     let definition = {
         let transaction = transactions.begin().unwrap();
         definition
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get()
             .unwrap()
@@ -175,7 +175,7 @@ fn open_reports_a_missing_resource_after_publication() {
     {
         let transaction = transactions.begin().unwrap();
         published
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .set(&definition)
             .unwrap();
@@ -204,7 +204,7 @@ fn open_reports_an_operation_data_size_mismatch() {
     let definition = {
         let transaction = transactions.begin().unwrap();
         definition
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get()
             .unwrap()
@@ -225,7 +225,7 @@ fn open_reports_an_operation_data_size_mismatch() {
     {
         let transaction = transactions.begin().unwrap();
         published
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .set(&definition)
             .unwrap();

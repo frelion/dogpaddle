@@ -11,7 +11,9 @@ pub use collections::{Cell, CellAccess, OrderedMap, OrderedMapAccess};
 pub use data_class::StoreData;
 pub use error::StoreError;
 pub(crate) use store::{DataAccess, DataHandle, DataPlacement};
-pub use store::{ScanBatch, ScanDirection, ScanLimit, Store, Transaction, Transactions};
+pub use store::{
+    ScanBatch, ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions,
+};
 
 /// Persistent size marker selecting shared physical storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

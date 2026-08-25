@@ -1,8 +1,54 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use dogpaddle_store::{Large, ScanDirection, ScanLimit, Small, Store, StoreError};
+use dogpaddle_store::{
+    Large, ScanDirection, ScanLimit, Small, Store, StoreError, TransactionAccess,
+};
 
-use crate::support::{create_byte_map, open_byte_map, store_path};
+use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
+
+fn write_pair(
+    access: TransactionAccess<'_>,
+    small: &ByteMap<Small>,
+    large: &ByteMap<Large>,
+) -> Result<(), StoreError> {
+    small
+        .access(access)?
+        .put(&b"key".to_vec(), &b"small".to_vec())?;
+    large
+        .access(access)?
+        .put(&b"key".to_vec(), &b"large".to_vec())
+}
+
+#[test]
+fn transaction_access_can_bind_multiple_objects_without_owning_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
+    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
+    let mut transactions = store.into_transactions();
+
+    let transaction = transactions.begin().unwrap();
+    write_pair(transaction.access(), &small, &large).unwrap();
+    transaction.commit().unwrap();
+
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        small
+            .access(transaction.access())
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"small".to_vec())
+    );
+    assert_eq!(
+        large
+            .access(transaction.access())
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"large".to_vec())
+    );
+}
 
 #[test]
 fn commit_is_atomic_across_small_and_large_data() {
@@ -15,8 +61,8 @@ fn commit_is_atomic_across_small_and_large_data() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut small = small.access(&transaction).unwrap();
-        let mut large = large.access(&transaction).unwrap();
+        let mut small = small.access(transaction.access()).unwrap();
+        let mut large = large.access(transaction.access()).unwrap();
         small.put(&b"key".to_vec(), &b"small".to_vec()).unwrap();
         large.put(&b"key".to_vec(), &b"large".to_vec()).unwrap();
         assert_eq!(
@@ -38,7 +84,7 @@ fn commit_is_atomic_across_small_and_large_data() {
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -46,7 +92,7 @@ fn commit_is_atomic_across_small_and_large_data() {
     );
     assert_eq!(
         large
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -65,12 +111,12 @@ fn dropping_a_transaction_rolls_back_every_data_object() {
     {
         let transaction = transactions.begin().unwrap();
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"small".to_vec())
             .unwrap();
         large
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"large".to_vec())
             .unwrap();
@@ -79,7 +125,7 @@ fn dropping_a_transaction_rolls_back_every_data_object() {
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         small
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -87,7 +133,7 @@ fn dropping_a_transaction_rolls_back_every_data_object() {
     );
     assert_eq!(
         large
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -104,7 +150,7 @@ fn panic_rolls_back_the_transaction() {
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
         let transaction = transactions.begin().unwrap();
-        data.access(&transaction)
+        data.access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"value".to_vec())
             .unwrap();
@@ -114,7 +160,7 @@ fn panic_rolls_back_the_transaction() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction)
+        data.access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -133,14 +179,12 @@ fn wrong_store_poison_rolls_back_prior_writes() {
     let second = create_byte_map::<Small>(&mut second_store, "data").unwrap();
 
     let transaction = first_transactions.begin().unwrap();
-    let mut first_access = first.access(&transaction).unwrap();
+    let access = transaction.access();
+    let mut first_access = first.access(access).unwrap();
     first_access
         .put(&b"key".to_vec(), &b"value".to_vec())
         .unwrap();
-    assert!(matches!(
-        second.access(&transaction),
-        Err(StoreError::WrongStore)
-    ));
+    assert!(matches!(second.access(access), Err(StoreError::WrongStore)));
     assert!(matches!(
         first_access.get(&b"key".to_vec()),
         Err(StoreError::TransactionPoisoned)
@@ -153,7 +197,7 @@ fn wrong_store_poison_rolls_back_prior_writes() {
     let transaction = first_transactions.begin().unwrap();
     assert_eq!(
         first
-            .access(&transaction)
+            .access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
@@ -174,11 +218,11 @@ fn data_objects_from_a_previous_open_are_rejected() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert!(matches!(
-        stale.access(&transaction),
+        stale.access(transaction.access()),
         Err(StoreError::WrongStore)
     ));
     assert!(matches!(
-        current.access(&transaction),
+        current.access(transaction.access()),
         Err(StoreError::TransactionPoisoned)
     ));
 }
@@ -191,14 +235,14 @@ fn scan_admission_errors_are_soft() {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
-    data.access(&transaction)
+    data.access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"wide".to_vec())
         .unwrap();
     transaction.commit().unwrap();
 
     let transaction = transactions.begin().unwrap();
-    let mut access = data.access(&transaction).unwrap();
+    let mut access = data.access(transaction.access()).unwrap();
     assert!(matches!(
         access.scan(
             ..,
@@ -215,7 +259,7 @@ fn scan_admission_errors_are_soft() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction)
+        data.access(transaction.access())
             .unwrap()
             .get(&b"second".to_vec())
             .unwrap(),
@@ -233,7 +277,7 @@ fn transaction_capability_can_move_to_a_stage_thread() {
     let (mut transactions, data) = std::thread::spawn(move || {
         let mut transactions = transactions;
         let transaction = transactions.begin().unwrap();
-        data.access(&transaction)
+        data.access(transaction.access())
             .unwrap()
             .put(&b"key".to_vec(), &b"value".to_vec())
             .unwrap();
@@ -245,7 +289,7 @@ fn transaction_capability_can_move_to_a_stage_thread() {
 
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        data.access(&transaction)
+        data.access(transaction.access())
             .unwrap()
             .get(&b"key".to_vec())
             .unwrap(),
