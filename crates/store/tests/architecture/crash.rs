@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{Large, Small, Store};
+use dogpaddle_store::{AppendLog, Large, ScanLimit, Small, Store, StoreError};
 
 use crate::support::{create_byte_map, open_byte_map, store_path};
 
@@ -19,6 +19,7 @@ fn prepare(path: &Path) {
     let mut store = Store::create(path).unwrap();
     create_byte_map::<Small>(&mut store, "small").unwrap();
     create_byte_map::<Large>(&mut store, "large").unwrap();
+    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
 }
 
 fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
@@ -50,6 +51,7 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
     let store = Store::open(path).unwrap();
     let small = open_byte_map::<Small>(&store, "small").unwrap();
     let large = open_byte_map::<Large>(&store, "large").unwrap();
+    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
@@ -59,6 +61,17 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
             .get(&b"key".to_vec())
             .unwrap(),
         expected.map(<[u8]>::to_vec)
+    );
+    let log = log.access(transaction.access()).unwrap();
+    let mut logged = Vec::new();
+    log.scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
+        logged.push(entry.decode_owned()?);
+        Ok::<(), StoreError>(())
+    })
+    .unwrap();
+    assert_eq!(
+        logged,
+        expected.map(<[u8]>::to_vec).into_iter().collect::<Vec<_>>()
     );
     assert_eq!(
         large
@@ -95,6 +108,7 @@ fn crash_worker() {
     let store = Store::open(path).unwrap();
     let small = open_byte_map::<Small>(&store, "small").unwrap();
     let large = open_byte_map::<Large>(&store, "large").unwrap();
+    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     small
@@ -106,6 +120,10 @@ fn crash_worker() {
         .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"committed".to_vec())
+        .unwrap();
+    log.access(transaction.access())
+        .unwrap()
+        .append(&b"committed".to_vec())
         .unwrap();
 
     match scenario.as_str() {

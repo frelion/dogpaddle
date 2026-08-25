@@ -135,9 +135,10 @@ impl Store {
     /// # Errors
     ///
     /// The data class fixes or selects its durable physical placement. A
-    /// [`crate::Cell`] is always shared, while an [`crate::OrderedMap`] uses
-    /// its [`crate::Small`] or [`crate::Large`] type parameter. At most
-    /// [`Store::LARGE_DATA_CAPACITY`] objects may use dedicated placement.
+    /// [`crate::Cell`] is always shared, an [`crate::AppendLog`] is always
+    /// dedicated, and an [`crate::OrderedMap`] uses its [`crate::Small`] or
+    /// [`crate::Large`] type parameter. At most [`Store::LARGE_DATA_CAPACITY`]
+    /// objects may use dedicated placement.
     ///
     /// Returns an error for an invalid or duplicate name, exhausted dedicated
     /// capacity, or an MDBX failure.

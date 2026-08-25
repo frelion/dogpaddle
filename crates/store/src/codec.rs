@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 /// A stable codec failure.
@@ -29,12 +31,17 @@ pub trait StoreValue: Sized {
     /// Returns an error when this value cannot be encoded canonically.
     fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError>;
 
-    /// Decodes owned bytes produced by [`StoreValue::encode_value`].
+    /// Decodes borrowed or owned bytes produced by [`StoreValue::encode_value`].
+    ///
+    /// Both [`Cow::Borrowed`] and [`Cow::Owned`] represent the same logical
+    /// encoding. Implementations must not require one variant: inspect bytes
+    /// through [`AsRef::as_ref`], or call [`Cow::into_owned`] when the decoded
+    /// value can reuse an owned buffer.
     ///
     /// # Errors
     ///
     /// Returns an error when `bytes` is not a valid value for this codec.
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError>;
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError>;
 }
 
 /// A key whose encoding preserves its [`Ord`] ordering byte-for-byte.
@@ -63,8 +70,8 @@ impl StoreValue for Vec<u8> {
         Ok(self.as_slice())
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
-        Ok(bytes)
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        Ok(bytes.into_owned())
     }
 }
 
@@ -83,8 +90,8 @@ impl StoreValue for String {
         Ok(self.as_bytes())
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
-        String::from_utf8(bytes)
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        String::from_utf8(bytes.into_owned())
             .map_err(|error| CodecError::new(format!("invalid UTF-8 value: {error}")))
     }
 }
@@ -107,9 +114,9 @@ macro_rules! unsigned_codec {
                 Ok(self.to_be_bytes())
             }
 
-            fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+            fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
                 let array: [u8; size_of::<$ty>()] = bytes
-                    .as_slice()
+                    .as_ref()
                     .try_into()
                     .map_err(|_| CodecError::new(concat!("invalid ", $name, " value length")))?;
                 Ok(<$ty>::from_be_bytes(array))
@@ -140,9 +147,9 @@ impl StoreValue for i64 {
         Ok(self.to_be_bytes())
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         let array: [u8; size_of::<i64>()] = bytes
-            .as_slice()
+            .as_ref()
             .try_into()
             .map_err(|_| CodecError::new("invalid i64 value length"))?;
         Ok(Self::from_be_bytes(array))
@@ -171,8 +178,8 @@ impl StoreValue for bool {
         Ok([u8::from(*self)])
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
-        match bytes.as_slice() {
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        match bytes.as_ref() {
             [0] => Ok(false),
             [1] => Ok(true),
             _ => Err(CodecError::new("invalid bool encoding")),
@@ -185,7 +192,7 @@ impl StoreValue for () {
         Ok([])
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         if bytes.is_empty() {
             Ok(())
         } else {
@@ -198,14 +205,14 @@ impl StoreValue for () {
 mod tests {
     use std::fmt::Debug;
 
-    use super::{StoreKey, StoreValue};
+    use super::{Cow, StoreKey, StoreValue};
 
     fn assert_value_bytes<T>(value: &T, expected: &[u8])
     where
         T: StoreValue + Debug + Eq,
     {
         assert_eq!(value.encode_value().unwrap().as_ref(), expected);
-        assert_eq!(&T::decode_value(expected.to_vec()).unwrap(), value);
+        assert_eq!(&T::decode_value(Cow::Borrowed(expected)).unwrap(), value);
     }
 
     fn assert_key_bytes<T>(value: &T, expected: &[u8])
@@ -263,6 +270,24 @@ mod tests {
     }
 
     #[test]
+    fn owning_codecs_accept_borrowed_and_owned_inputs() {
+        let bytes = b"Shiba";
+        assert_eq!(
+            Vec::<u8>::decode_value(Cow::Borrowed(bytes)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            Vec::<u8>::decode_value(Cow::Owned(bytes.to_vec())).unwrap(),
+            bytes
+        );
+        assert_eq!(String::decode_value(Cow::Borrowed(bytes)).unwrap(), "Shiba");
+        assert_eq!(
+            String::decode_value(Cow::Owned(bytes.to_vec())).unwrap(),
+            "Shiba"
+        );
+    }
+
+    #[test]
     fn primitive_keys_have_stable_ordered_encodings() {
         assert_key_bytes(&0x0102_0304_u32, &[1, 2, 3, 4]);
         assert_key_bytes(&0x0102_0304_0506_0708_u64, &[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -271,9 +296,9 @@ mod tests {
 
     #[test]
     fn malformed_values_are_rejected() {
-        assert!(bool::decode_value(vec![2]).is_err());
-        assert!(<()>::decode_value(vec![0]).is_err());
-        assert!(String::decode_value(vec![0xff]).is_err());
-        assert!(u64::decode_value(vec![0; 7]).is_err());
+        assert!(bool::decode_value(Cow::Borrowed(&[2])).is_err());
+        assert!(<()>::decode_value(Cow::Borrowed(&[0])).is_err());
+        assert!(String::decode_value(Cow::Borrowed(&[0xff])).is_err());
+        assert!(u64::decode_value(Cow::Borrowed(&[0; 7])).is_err());
     }
 }

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use dogpaddle_store::{
     CodecError, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store, StoreData, StoreError,
     StoreKey, StoreValue,
@@ -181,7 +183,7 @@ impl StoreValue for BrokenKey {
         Err::<[u8; 0], _>(CodecError::new("intentional value failure"))
     }
 
-    fn decode_value(_bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_value(_bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         Err(CodecError::new("intentional value failure"))
     }
 }

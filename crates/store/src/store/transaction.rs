@@ -28,9 +28,9 @@ impl Transactions {
 impl Transaction<'_> {
     /// Borrows this transaction as a typed data-access capability.
     ///
-    /// The returned value may be passed to existing [`crate::Cell`] and
-    /// [`crate::OrderedMap`] objects. It cannot commit the transaction or
-    /// create, open, or enumerate data objects.
+    /// The returned value may be passed to existing [`crate::Cell`],
+    /// [`crate::OrderedMap`], and [`crate::AppendLog`] objects. It cannot
+    /// commit the transaction or create, open, or enumerate data objects.
     #[must_use]
     pub fn access(&self) -> TransactionAccess<'_> {
         TransactionAccess { transaction: self }
@@ -86,6 +86,18 @@ impl Transaction<'_> {
 impl<'transaction> TransactionAccess<'transaction> {
     pub(super) const fn transaction(self) -> &'transaction Transaction<'transaction> {
         self.transaction
+    }
+
+    pub(crate) fn poison_on_error<T, E>(self, result: Result<T, E>) -> Result<T, E> {
+        self.transaction.poison_on_error(result)
+    }
+
+    pub(crate) fn poison(self) {
+        self.transaction.poisoned.set(true);
+    }
+
+    pub(crate) fn same_transaction(self, other: TransactionAccess<'_>) -> bool {
+        std::ptr::eq(self.transaction, other.transaction)
     }
 }
 

@@ -68,8 +68,8 @@ pub struct Transaction<'database> {
 
 /// Borrows one active transaction only for typed data access.
 ///
-/// This capability can bind existing [`crate::Cell`] and
-/// [`crate::OrderedMap`] objects to the transaction, but cannot begin or
+/// This capability can bind existing [`crate::Cell`], [`crate::OrderedMap`],
+/// and [`crate::AppendLog`] objects to the transaction, but cannot begin or
 /// commit a transaction or access the Store catalog. Copying it only copies a
 /// shared borrow; transaction ownership and commit authority remain unique.
 ///

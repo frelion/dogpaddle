@@ -56,6 +56,10 @@ pub enum StoreError {
     #[error("data object belongs to another store")]
     WrongStore,
 
+    /// Transaction-bound values from different transactions were mixed.
+    #[error("data access belongs to another transaction")]
+    WrongTransaction,
+
     /// A scan limit must reserve at least one item and one byte.
     #[error("scan limits must have non-zero item and byte bounds")]
     InvalidScanLimit,
@@ -63,6 +67,28 @@ pub enum StoreError {
     /// A single encoded item cannot fit in the requested scan batch.
     #[error("encoded item requires {size} bytes but the scan allows {limit}")]
     ItemTooLarge { size: usize, limit: usize },
+
+    /// An append-log cursor or truncation target is outside its valid range.
+    #[error("append-log offset {offset} is outside valid range [{head}, {tail}]")]
+    LogOffsetOutOfRange {
+        /// Requested offset.
+        offset: u64,
+        /// First retained offset.
+        head: u64,
+        /// Next append offset.
+        tail: u64,
+    },
+
+    /// An append log has consumed every representable offset.
+    #[error("append log has exhausted its offset space")]
+    LogOffsetExhausted,
+
+    /// Persisted append-log metadata and entries violate the log invariants.
+    #[error("append log is corrupt: {reason}")]
+    CorruptAppendLog {
+        /// Violated invariant.
+        reason: &'static str,
+    },
 
     /// Typed encoding or decoding failed.
     #[error("codec failure: {0}")]

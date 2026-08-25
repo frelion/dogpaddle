@@ -11,7 +11,7 @@ DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品�
 - `cargo test -p dogpaddle-store --test architecture transaction::`：运行指定测试区域；可按需替换包、测试目标或过滤条件。
 - `cargo fmt --all -- --check`：检查格式，不修改文件。
 - `cargo clippy --workspace --all-targets -- -D warnings`：执行已配置的 `all` 和 `pedantic` Clippy 规则。若命令不可用，请先安装 Clippy rustup 组件。
-- `cargo bench -p dogpaddle-store --bench store`：运行 release 模式的存储基准测试；工作负载环境变量见 `crates/store/README.md`。
+- `cargo bench -p dogpaddle-store --bench cell`、`--bench ordered_map`、`--bench append_log`：分别运行 Cell、OrderedMap 和 AppendLog 的 release 基准测试；工作负载环境变量及本机可读报告见 `crates/store/README.md` 与 `crates/store/PERFORMANCE.md`。
 
 请使用根目录 `Cargo.toml` 指定的 Rust 1.96 或更高版本。
 

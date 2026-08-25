@@ -13,7 +13,17 @@ thiserror.workspace = true
 tempfile.workspace = true
 
 [[bench]]
-name = "store"
+name = "ordered_map"
+harness = false
+test = false
+
+[[bench]]
+name = "cell"
+harness = false
+test = false
+
+[[bench]]
+name = "append_log"
 harness = false
 test = false
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use dogpaddle_store::{CodecError, OrderedMap, Store, StoreData, StoreError, StoreKey, StoreValue};
 use tempfile::TempDir;
@@ -11,7 +11,7 @@ impl StoreValue for TestValue {
         self.0.encode_value()
     }
 
-    fn decode_value(bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         u64::decode_value(bytes).map(Self)
     }
 }

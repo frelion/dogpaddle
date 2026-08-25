@@ -7,7 +7,10 @@ mod error;
 mod store;
 
 pub use codec::{CodecError, StoreKey, StoreValue};
-pub use collections::{Cell, CellAccess, OrderedMap, OrderedMapAccess};
+pub use collections::{
+    AppendLog, AppendLogAccess, AppendLogEntry, AppendLogScan, Cell, CellAccess, OrderedMap,
+    OrderedMapAccess,
+};
 pub use data_class::StoreData;
 pub use error::StoreError;
 pub(crate) use store::{DataAccess, DataHandle, DataPlacement};

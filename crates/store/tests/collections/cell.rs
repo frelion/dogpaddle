@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use dogpaddle_store::{Cell, CodecError, OrderedMap, Small, Store, StoreError, StoreValue};
 
 use crate::support::{TestValue, store_path};
@@ -57,12 +59,55 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
 
 struct BrokenValue;
 
+struct OwnershipObservedValue {
+    value: u64,
+    input_was_owned: bool,
+}
+
+impl StoreValue for OwnershipObservedValue {
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.value.to_be_bytes())
+    }
+
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        let input_was_owned = matches!(&bytes, Cow::Owned(_));
+        let bytes = bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| CodecError::new("invalid observed value"))?;
+        Ok(Self {
+            value: u64::from_be_bytes(bytes),
+            input_was_owned,
+        })
+    }
+}
+
+#[test]
+fn dirty_cell_values_are_owned_for_decoding() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let cell = create_cell::<OwnershipObservedValue>(&mut store, "cell").unwrap();
+    let mut transactions = store.into_transactions();
+
+    let transaction = transactions.begin().unwrap();
+    let mut access = cell.access(transaction.access()).unwrap();
+    access
+        .set(&OwnershipObservedValue {
+            value: 42,
+            input_was_owned: false,
+        })
+        .unwrap();
+    let decoded = access.get().unwrap().unwrap();
+    assert_eq!(decoded.value, 42);
+    assert!(decoded.input_was_owned);
+}
+
 impl StoreValue for BrokenValue {
     fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         Err::<[u8; 0], _>(CodecError::new("intentional encode failure"))
     }
 
-    fn decode_value(_bytes: Vec<u8>) -> Result<Self, CodecError> {
+    fn decode_value(_bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         Err(CodecError::new("intentional decode failure"))
     }
 }

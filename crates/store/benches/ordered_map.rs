@@ -1,3 +1,5 @@
+//! Scenario benchmarks for both physical forms of `OrderedMap`.
+
 use std::{hint::black_box, time::Duration};
 
 use dogpaddle_store::{
@@ -66,30 +68,43 @@ where
         }
     }
 
-    fn populated(entries: usize) -> Self {
+    fn populated_typed(entries: usize) -> Self {
         let mut fixture = Self::empty();
         let transaction = fixture
             .transactions
             .begin()
             .expect("begin seed transaction");
-        {
-            let mut map = fixture
-                .map
-                .access(transaction.access())
-                .expect("access seed map");
-            let mut bytes = fixture
-                .bytes
-                .access(transaction.access())
-                .expect("access seed byte map");
-            let value = vec![0x5a; VALUE_BYTES];
-            for key in 0..entries {
-                map.put(&(key as u64), &value).expect("seed benchmark map");
-                bytes
-                    .put(&(key as u64).to_be_bytes().to_vec(), &value)
-                    .expect("seed benchmark byte map");
-            }
+        let mut map = fixture
+            .map
+            .access(transaction.access())
+            .expect("access seed map");
+        let value = vec![0x5a; VALUE_BYTES];
+        for key in 0..entries {
+            map.put(&(key as u64), &value).expect("seed benchmark map");
         }
         transaction.commit().expect("commit benchmark seed");
+        fixture
+    }
+
+    fn populated_bytes(entries: usize) -> Self {
+        let mut fixture = Self::empty();
+        let transaction = fixture
+            .transactions
+            .begin()
+            .expect("begin byte map seed transaction");
+        let mut bytes = fixture
+            .bytes
+            .access(transaction.access())
+            .expect("access seed byte map");
+        let value = vec![0x5a; VALUE_BYTES];
+        for key in 0..entries {
+            bytes
+                .put(&(key as u64).to_be_bytes().to_vec(), &value)
+                .expect("seed benchmark byte map");
+        }
+        transaction
+            .commit()
+            .expect("commit benchmark byte map seed");
         fixture
     }
 
@@ -208,24 +223,37 @@ fn main() {
         entries > 0 && commits > 0 && samples > 0 && background_namespaces > 0 && scan_items > 0
     );
 
-    println!("DogPaddle Store benchmark");
+    println!("DogPaddle OrderedMap benchmark");
     println!(
         "entries={entries} value_bytes={VALUE_BYTES} commits={commits} samples={samples} background_namespaces={background_namespaces} scan_items={scan_items}"
     );
     println!(
-        "sync=durable point_scan_cache=warm random_seed={RANDOM_SEED:#x} root=temporary-directory"
+        "sync=durable execution=single-thread point_scan_cache=warm random_seed={RANDOM_SEED:#x}"
     );
-    println!();
     println!(
-        "{:<28} {:<10} {:>12} {:>12} {:>12} {:>12} {:>14}",
-        "workload", "size", "operations", "min", "median", "max", "median ops/s"
+        "platform={}-{} temp_root={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::temp_dir().display()
     );
 
-    benchmark_isolated(entries, commits, samples, scan_items);
+    print_section(
+        "OrderedMap<K, V, Small> vs OrderedMap<K, V, Large>",
+        "same workloads; Small shares the main table, Large owns a dedicated table",
+    );
+    print_group("isolated object: bulk write, warm point read, scan, and rollback");
+    benchmark_isolated(entries, samples, scan_items);
+    print_group(&format!(
+        "target map with {background_namespaces} populated Small background namespaces"
+    ));
     benchmark_mixed(entries, samples, background_namespaces, scan_items);
+    print_group("Stage-shaped atomic batches: map updates plus one Cell cursor");
+    benchmark_stage_steps(commits, samples);
+    print_group("worst-case commit amortization: one overwrite per durable transaction");
+    benchmark_durable_overwrite(commits, samples);
 }
 
-fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items: usize) {
+fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize) {
     report_pair(
         "byte map bulk put + commit",
         entries,
@@ -241,21 +269,14 @@ fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items
         || measure_bulk_put::<Large>(entries),
     );
 
-    let mut small = Fixture::<Small>::populated(entries);
-    let mut large = Fixture::<Large>::populated(entries);
+    let mut small_bytes = Fixture::<Small>::populated_bytes(entries);
+    let mut large_bytes = Fixture::<Large>::populated_bytes(entries);
     report_pair(
         "hot byte map point get",
         entries,
         samples,
-        || measure_byte_map_point_get(&mut small, entries),
-        || measure_byte_map_point_get(&mut large, entries),
-    );
-    report_pair(
-        "hot point get",
-        entries,
-        samples,
-        || measure_point_get(&mut small, entries),
-        || measure_point_get(&mut large, entries),
+        || measure_byte_map_point_get(&mut small_bytes, entries),
+        || measure_byte_map_point_get(&mut large_bytes, entries),
     );
     report_scan_pair(
         ScanWorkload {
@@ -263,8 +284,8 @@ fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items
             direction: ScanDirection::Ascending,
             kind: ScanKind::ByteMap,
         },
-        &mut small,
-        &mut large,
+        &mut small_bytes,
+        &mut large_bytes,
         entries,
         samples,
         scan_items,
@@ -275,11 +296,21 @@ fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items
             direction: ScanDirection::Descending,
             kind: ScanKind::ByteMap,
         },
-        &mut small,
-        &mut large,
+        &mut small_bytes,
+        &mut large_bytes,
         entries,
         samples,
         scan_items,
+    );
+
+    let mut small = Fixture::<Small>::populated_typed(entries);
+    let mut large = Fixture::<Large>::populated_typed(entries);
+    report_pair(
+        "hot point get",
+        entries,
+        samples,
+        || measure_point_get(&mut small, entries),
+        || measure_point_get(&mut large, entries),
     );
     report_scan_pair(
         ScanWorkload {
@@ -312,18 +343,6 @@ fn benchmark_isolated(entries: usize, commits: usize, samples: usize, scan_items
         || measure_hot_overwrite_rollback(&mut small, entries),
         || measure_hot_overwrite_rollback(&mut large, entries),
     );
-
-    let mut small = Fixture::<Small>::empty();
-    let mut large = Fixture::<Large>::empty();
-    report_pair(
-        "durable overwrite commit",
-        commits,
-        samples,
-        || measure_single_put_commits(&mut small, commits),
-        || measure_single_put_commits(&mut large, commits),
-    );
-
-    benchmark_stage_steps(commits, samples);
 }
 
 fn benchmark_stage_steps(steps: usize, samples: usize) {
@@ -338,6 +357,18 @@ fn benchmark_stage_steps(steps: usize, samples: usize) {
             || measure_stage_steps(&mut large, steps, operations_per_step),
         );
     }
+}
+
+fn benchmark_durable_overwrite(commits: usize, samples: usize) {
+    let mut small = Fixture::<Small>::empty();
+    let mut large = Fixture::<Large>::empty();
+    report_pair(
+        "durable overwrite commit",
+        commits,
+        samples,
+        || measure_single_put_commits(&mut small, commits),
+        || measure_single_put_commits(&mut large, commits),
+    );
 }
 
 fn benchmark_mixed(
@@ -731,12 +762,35 @@ fn report(workload: &str, size: &str, operations: usize, mut durations: Vec<Dura
     let median = durations[durations.len() / 2];
     let max = durations[durations.len() - 1];
     let rate = operations as u128 * 1_000_000_000 / median.as_nanos();
+    let median_per_operation = average_duration(median, operations);
     println!(
-        "{workload:<28} {size:<10} {operations:>12} {:>12} {:>12} {:>12} {rate:>14}",
+        "{workload:<28} {size:<10} {operations:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
         duration(min),
         duration(median),
         duration(max),
     );
+}
+
+fn print_section(name: &str, description: &str) {
+    println!();
+    println!("=== {name} ===");
+    println!("{description}");
+    println!(
+        "{:<28} {:<10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>14}",
+        "workload", "data", "operations", "min", "median", "max", "median/op", "median ops/s"
+    );
+}
+
+fn print_group(description: &str) {
+    println!();
+    println!("-- {description} --");
+}
+
+fn average_duration(total: Duration, operations: usize) -> String {
+    let nanos = total.as_nanos() / operations as u128;
+    duration(Duration::from_nanos(
+        u64::try_from(nanos).expect("average benchmark duration fits in u64 nanoseconds"),
+    ))
 }
 
 fn duration(value: Duration) -> String {

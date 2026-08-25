@@ -1,6 +1,8 @@
 #[path = "architecture/support.rs"]
 mod support;
 
+#[path = "architecture/append_log.rs"]
+mod append_log;
 #[path = "architecture/crash.rs"]
 mod crash;
 #[path = "architecture/data.rs"]

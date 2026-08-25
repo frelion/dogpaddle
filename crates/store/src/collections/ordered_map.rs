@@ -164,7 +164,7 @@ fn decode_batch<K: StoreKey, V: StoreValue>(
     let items = raw
         .items
         .into_iter()
-        .map(|(key, value)| Ok((K::decode_key(key)?, V::decode_value(value)?)))
+        .map(|(key, value)| Ok((K::decode_key(key)?, V::decode_value(value.into())?)))
         .collect::<Result<Vec<_>, CodecError>>()?;
     let continuation = raw.continuation.map(K::decode_key).transpose()?;
     Ok(ScanBatch {

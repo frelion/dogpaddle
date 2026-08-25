@@ -1,4 +1,6 @@
-use crate::{Cell, DataHandle, DataPlacement, Large, OrderedMap, Small, StoreKey, StoreValue};
+use crate::{
+    AppendLog, Cell, DataHandle, DataPlacement, Large, OrderedMap, Small, StoreKey, StoreValue,
+};
 
 /// A typed persistent data object that can be created and opened by [`crate::Store`].
 ///
@@ -31,6 +33,7 @@ macro_rules! impl_store_data {
 }
 
 impl_store_data!(Cell<T>, DataPlacement::Shared; T: StoreValue);
+impl_store_data!(AppendLog<T>, DataPlacement::Dedicated; T: StoreValue);
 impl_store_data!(
     OrderedMap<K, V, Small>,
     DataPlacement::Shared;
