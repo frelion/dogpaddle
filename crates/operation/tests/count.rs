@@ -2,7 +2,7 @@ use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{CountDefinition, CountError, CountOperation},
 };
-use dogpaddle_store::{Cell, Small, Store};
+use dogpaddle_store::{Cell, Store};
 
 #[test]
 fn count_definition_implements_the_shared_trait_with_one_input() {
@@ -16,7 +16,7 @@ fn count_starts_at_zero_and_continues_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
     let mut store = Store::create(&path).unwrap();
-    let count = store.create_data::<Cell<u64, Small>>("count").unwrap();
+    let count = store.create_data::<Cell<u64>>("count").unwrap();
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();
 
@@ -29,7 +29,7 @@ fn count_starts_at_zero_and_continues_after_reopen() {
     drop(transactions);
 
     let store = Store::open(&path).unwrap();
-    let count = store.open_data::<Cell<u64, Small>>("count").unwrap();
+    let count = store.open_data::<Cell<u64>>("count").unwrap();
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
@@ -41,7 +41,7 @@ fn count_starts_at_zero_and_continues_after_reopen() {
 fn dropping_the_transaction_rolls_back_count_progress() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
-    let count = store.create_data::<Cell<u64, Small>>("count").unwrap();
+    let count = store.create_data::<Cell<u64>>("count").unwrap();
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();
 
@@ -59,7 +59,7 @@ fn dropping_the_transaction_rolls_back_count_progress() {
 fn count_rejects_overflow_without_changing_the_cell() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
-    let count = store.create_data::<Cell<u64, Small>>("count").unwrap();
+    let count = store.create_data::<Cell<u64>>("count").unwrap();
     let count_state = count.clone();
     let operation = CountOperation::new(CountDefinition::new(), count);
     let mut transactions = store.into_transactions();

@@ -130,7 +130,7 @@ fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
 
-fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>, Small>, FlowError> {
+fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
     match store.open_data(codec::DEFINITION_DATA_NAME) {
         Ok(data) => Ok(data),
         Err(StoreError::DataNotFound(_)) => Err(FlowError::IncompleteBuild),

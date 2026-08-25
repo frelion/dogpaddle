@@ -56,9 +56,10 @@ pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
     /// Returns the operation's stable logical data names and typed classes.
     ///
     /// Flow prefixes each name with the owning stage's stable resource path.
-    /// Names, collection types, codecs, and sizes form part of the operation's
-    /// persistent schema. The returned slice has deterministic declaration
-    /// order, while materialization binds instances by name.
+    /// Names, collection types, codecs, and any applicable size choices form
+    /// part of the operation's persistent schema. The returned slice has
+    /// deterministic declaration order, while materialization binds instances
+    /// by name.
     #[doc(hidden)]
     fn data(&self) -> &'static [DataDeclaration];
 
@@ -111,7 +112,7 @@ impl DataDeclaration {
     /// # Errors
     ///
     /// Returns a Store error when the physical resource is missing, has the
-    /// wrong size, or cannot be opened.
+    /// wrong placement, or cannot be opened.
     #[doc(hidden)]
     pub fn open(&self, store: &Store, physical_name: &str) -> Result<DataInstance, StoreError> {
         (self.open)(store, physical_name).map(|data| DataInstance {

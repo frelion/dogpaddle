@@ -9,7 +9,7 @@
 Store 将资源装配与运行时访问分离：
 
 - `Store` 创建或打开全部具名数据对象；进入运行期前，其所有权会被消费；
-- `Cell<T, SIZE>` 保存一个可选的类型化值；
+- `Cell<T>` 保存一个可选的类型化值，并固定使用共享物理空间；
 - `OrderedMap<K, V, SIZE>` 保存按稳定 key codec 排序的类型化映射；
 - `Transactions` 是运行期内启动事务的唯一能力；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
@@ -17,31 +17,34 @@ Store 将资源装配与运行时访问分离：
 - `CellAccess` 与 `OrderedMapAccess` 绑定一次具体事务并执行实际读写。
 
 底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
-也不能绕过类型上的 `Size` 自行组合物理资源。
+也不能绕过数据类型自行组合物理资源。
 
-## Size 是持久化 schema
+## 数据结构决定物理布局
 
-每个持久化数据对象都必须显式选择 `Small` 或 `Large`，没有默认值：
+只有确实存在两种合理规模的 collection 才暴露 `Size`。`Cell` 的基数永远至多为一，因此
+固定使用共享物理空间；`OrderedMap` 可能很小，也可能随业务 key 增长，所以必须显式选择
+`Small` 或 `Large`：
 
 ```rust
 use dogpaddle_store::{Cell, Large, OrderedMap, Small};
 
-type Counter = Cell<u64, Small>;
+type Counter = Cell<u64>;
 type Cache = OrderedMap<u64, String, Small>;
 type Records = OrderedMap<u64, Vec<u8>, Large>;
 ```
 
-`Size` 描述这个具名对象的静态存储类别，不是运行时容量上限，也不会根据当前数据量自动改变：
+`Size` 描述支持规模选择的具名对象的静态存储类别，不是运行时容量上限，也不会根据当前
+数据量自动改变：
 
-- `Small` 与其他小对象共享主 B+Tree，适合数量较多、规模较小或频繁提交的状态；
+- `Cell` 与 `Small` collection 共享主 B+Tree，适合数量较多、规模较小或频繁提交的状态；
 - `Large` 使用独立的 MDBX named table，适合可能很大、热点或面向批处理的数据；
 - 单个 Store 最多包含 `Store::LARGE_DATA_CAPACITY` 个 Large 对象。
 
-`Size` 在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。`Store::open_data::<D>`
-会校验请求类型的 `Size`；以 `Large` 打开实际为 `Small` 的资源，或反过来，都会返回
-`StoreError::DataSizeMismatch`。
+物理布局在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。
+`Store::open_data::<D>` 会校验数据类型要求的布局；以 `Large` 打开实际为 `Small` 的资源，
+或用固定为共享布局的 `Cell` 打开 dedicated 资源，都会返回 `StoreError::DataSizeMismatch`。
 
-Store catalog 不记录或验证 `Cell`/`OrderedMap`、`K`、`V` 或 codec 类型。同一个 `Size` 下，
+Store catalog 不记录或验证 `Cell`/`OrderedMap`、`K`、`V` 或 codec 类型。同一个物理布局下，
 调用方必须按照创建者定义的稳定 schema 重新打开数据。不要把 Rust `TypeId`、类型名或内存
 布局当作磁盘格式。
 
@@ -52,7 +55,7 @@ use dogpaddle_store::{Cell, Large, OrderedMap, ScanDirection, ScanLimit, Small, 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::create("./dogpaddle-store-data")?;
-    let counter = store.create_data::<Cell<u64, Small>>("counter")?;
+    let counter = store.create_data::<Cell<u64>>("counter")?;
     let users = store.create_data::<OrderedMap<u64, String, Large>>("users")?;
 
     let mut transactions = store.into_transactions();
@@ -89,11 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 重新打开时必须声明同一个完整数据类型：
 
 ```rust,no_run
-use dogpaddle_store::{Cell, Small, Store};
+use dogpaddle_store::{Cell, Store};
 
 # fn open() -> Result<(), Box<dyn std::error::Error>> {
 let store = Store::open("./dogpaddle-store-data")?;
-let counter = store.open_data::<Cell<u64, Small>>("counter")?;
+let counter = store.open_data::<Cell<u64>>("counter")?;
 let mut transactions = store.into_transactions();
 let transaction = transactions.begin()?;
 let access = transaction.access();
@@ -102,8 +105,8 @@ assert_eq!(counter.access(access)?.get()?, Some(1));
 # }
 ```
 
-`StoreData` 是 Store 泛型 create/open 使用的 sealed marker trait。它只由内建集合的
-`Small`/`Large` 形式实现；一般业务代码不需要直接引用它。
+`StoreData` 是 Store 泛型 create/open 使用的 sealed marker trait。它只由布局完整的内建
+collection 实现；一般业务代码不需要直接引用它。
 
 ## 事务与扫描语义
 
@@ -111,8 +114,8 @@ assert_eq!(counter.access(access)?.get()?, Some(1));
 `Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
 持有的 `Cell` 或 `OrderedMap` 创建事务级 Access。Flow/Stage 因此可以保留 Transaction
 所有权并把受限能力交给 Operation，Operation 无法开始或结束原子边界，也无法访问 Store
-catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意 `Size` 的数据对象
-都可以原子提交。
+catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式选择布局
+的数据对象都可以原子提交。
 
 `TransactionAccess`、`CellAccess` 和 `OrderedMapAccess` 都不能脱离所属事务；每个新事务都
 必须重新绑定，不能跨 Stage 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
@@ -142,9 +145,9 @@ cargo test -p dogpaddle-store --test architecture transaction::
 cargo test -p dogpaddle-store --test collections scan::
 ```
 
-架构测试会对 `Small` 与 `Large` 运行相同的数据、事务与扫描语义，并通过 MDBX 白盒适配器
-锁定 catalog binding、共享前缀和独立 named table 的物理布局。`Size` 不匹配的 reopen、
-崩溃恢复、事务中毒和 codec 失败也有独立覆盖。
+架构测试会对 `OrderedMap` 的 `Small` 与 `Large` 形式运行相同的数据、事务与扫描语义，并
+通过 MDBX 白盒适配器锁定 Cell 的共享布局、Small map 的共享前缀和 Large map 的独立 named
+table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。
 
 ## 性能
 

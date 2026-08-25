@@ -6,7 +6,7 @@ use dogpaddle_operation::{
         transform::{CountDefinition, CountOperation},
     },
 };
-use dogpaddle_store::{Cell, Small, Store};
+use dogpaddle_store::{Cell, Store};
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
@@ -19,12 +19,12 @@ fn boxed_operations_preserve_their_concrete_definitions() {
     let mut store = Store::create(root.path().join("store")).unwrap();
     let count = CountOperation::new(
         CountDefinition::new(),
-        store.create_data::<Cell<u64, Small>>("count").unwrap(),
+        store.create_data::<Cell<u64>>("count").unwrap(),
     );
     let source_definition = SequenceSourceDefinition::new(42);
     let source = SequenceSourceOperation::new(
         source_definition,
-        store.create_data::<Cell<u64, Small>>("position").unwrap(),
+        store.create_data::<Cell<u64>>("position").unwrap(),
     );
 
     let operations: Vec<Box<dyn Operation>> = vec![Box::new(count), Box::new(source)];

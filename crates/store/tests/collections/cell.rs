@@ -1,39 +1,20 @@
-use dogpaddle_store::{
-    Cell, CodecError, Large, OrderedMap, Small, Store, StoreData, StoreError, StoreValue,
-};
+use dogpaddle_store::{Cell, CodecError, OrderedMap, Small, Store, StoreError, StoreValue};
 
 use crate::support::{TestValue, store_path};
 
-fn create_cell<T: StoreValue, SIZE>(
-    store: &mut Store,
-    name: &str,
-) -> Result<Cell<T, SIZE>, StoreError>
-where
-    Cell<T, SIZE>: StoreData,
-{
+fn create_cell<T: StoreValue>(store: &mut Store, name: &str) -> Result<Cell<T>, StoreError> {
     store.create_data(name)
 }
 
-fn open_cell<T: StoreValue, SIZE>(store: &Store, name: &str) -> Result<Cell<T, SIZE>, StoreError>
-where
-    Cell<T, SIZE>: StoreData,
-{
+fn open_cell<T: StoreValue>(store: &Store, name: &str) -> Result<Cell<T>, StoreError> {
     store.open_data(name)
 }
 
 #[test]
 fn cell_state_transitions_are_exact() {
-    assert_cell_state_transitions::<Small>();
-    assert_cell_state_transitions::<Large>();
-}
-
-fn assert_cell_state_transitions<SIZE>()
-where
-    Cell<u64, SIZE>: StoreData,
-{
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let cell = create_cell::<u64, SIZE>(&mut store, "cell").unwrap();
+    let cell = create_cell::<u64>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
@@ -54,7 +35,7 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    let cell = create_cell::<TestValue, Large>(&mut store, "cell").unwrap();
+    let cell = create_cell::<TestValue>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     cell.access(transaction.access())
@@ -65,7 +46,7 @@ fn cell_uses_custom_value_codecs_and_survives_reopen() {
     drop(transactions);
 
     let store = Store::open(&path).unwrap();
-    let cell = open_cell::<TestValue, Large>(&store, "cell").unwrap();
+    let cell = open_cell::<TestValue>(&store, "cell").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
@@ -90,8 +71,8 @@ impl StoreValue for BrokenValue {
 fn encoding_failure_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let safe = create_cell::<u64, Small>(&mut store, "safe").unwrap();
-    let broken = create_cell::<BrokenValue, Small>(&mut store, "broken").unwrap();
+    let safe = create_cell::<u64>(&mut store, "safe").unwrap();
+    let broken = create_cell::<BrokenValue>(&mut store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
@@ -119,11 +100,11 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
 fn decoding_failure_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let safe = create_cell::<u64, Small>(&mut store, "safe").unwrap();
+    let safe = create_cell::<u64>(&mut store, "safe").unwrap();
     let broken_data = store
         .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("broken")
         .unwrap();
-    let broken = open_cell::<BrokenValue, Small>(&store, "broken").unwrap();
+    let broken = open_cell::<BrokenValue>(&store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();

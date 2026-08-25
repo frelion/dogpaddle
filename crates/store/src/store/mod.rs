@@ -95,11 +95,11 @@ pub struct Transaction<'database> {
 /// transaction owner commits.
 ///
 /// ```compile_fail
-/// use dogpaddle_store::{Cell, Small, Transaction};
+/// use dogpaddle_store::{Cell, Transaction};
 ///
 /// fn commit_before_later_access(
 ///     transaction: Transaction<'_>,
-///     cell: &Cell<u64, Small>,
+///     cell: &Cell<u64>,
 /// ) {
 ///     let access = transaction.access();
 ///     transaction.commit().unwrap();

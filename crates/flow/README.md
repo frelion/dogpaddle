@@ -47,8 +47,8 @@ manifest Cell 作为构建完成标记。Operation Definition 返回稳定的“
 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或物理
 布局。
 
-Flow definition Cell、Flow state map 和 Stage state map 都显式声明为 `Small`。Flow state
-map 保留生命周期状态；Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续
+Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state map 显式声明为
+`Small`。Flow state map 保留生命周期状态；Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续
 运行层只能在这些 map 的键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑
 和资源目录都没有修改入口。
 

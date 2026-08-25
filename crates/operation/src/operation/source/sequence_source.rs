@@ -1,4 +1,4 @@
-use dogpaddle_store::{Cell, Small, StoreError, TransactionAccess};
+use dogpaddle_store::{Cell, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 1;
-const POSITION: DataName<Cell<u64, Small>> = DataName::new("sequence_source.position");
+const POSITION: DataName<Cell<u64>> = DataName::new("sequence_source.position");
 const DATA: &[DataDeclaration] = &[POSITION.declaration()];
 
 /// Pure definition of a monotonically increasing source.
@@ -25,7 +25,7 @@ pub struct SequenceSourceDefinition {
 /// begins, commits, or stores a transaction.
 pub struct SequenceSourceOperation {
     definition: SequenceSourceDefinition,
-    position: Cell<u64, Small>,
+    position: Cell<u64>,
 }
 
 /// Failure while producing one value from a [`SequenceSourceOperation`].
@@ -85,7 +85,7 @@ impl OperationDefinition for SequenceSourceDefinition {
 impl SequenceSourceOperation {
     /// Materializes a Sequence source from its pure definition and durable data.
     #[must_use]
-    pub const fn new(definition: SequenceSourceDefinition, position: Cell<u64, Small>) -> Self {
+    pub const fn new(definition: SequenceSourceDefinition, position: Cell<u64>) -> Self {
         Self {
             definition,
             position,

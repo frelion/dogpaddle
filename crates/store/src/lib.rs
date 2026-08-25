@@ -15,10 +15,12 @@ pub use store::{
     ScanBatch, ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions,
 };
 
-/// Persistent size marker selecting shared physical storage.
+/// Persistent size marker selecting shared physical storage for collections
+/// that support a size choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Small;
 
-/// Persistent size marker selecting dedicated physical storage.
+/// Persistent size marker selecting dedicated physical storage for collections
+/// that support a size choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Large;

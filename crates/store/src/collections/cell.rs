@@ -5,9 +5,12 @@ use crate::{DataAccess, DataHandle, StoreError, StoreValue, TransactionAccess};
 const CELL_KEY: &[u8] = &[];
 
 /// A named persistent cell holding one optional typed value.
-pub struct Cell<T, SIZE> {
+///
+/// Cells always use shared physical storage because their cardinality is
+/// intrinsically bounded; callers do not choose a size class.
+pub struct Cell<T> {
     data: DataHandle,
-    _types: PhantomData<fn() -> (T, SIZE)>,
+    _value: PhantomData<fn() -> T>,
 }
 
 /// Transaction-bound access to a [`Cell`].
@@ -16,11 +19,11 @@ pub struct CellAccess<'transaction, T> {
     _value: PhantomData<fn() -> T>,
 }
 
-impl<T: StoreValue, SIZE> Cell<T, SIZE> {
+impl<T: StoreValue> Cell<T> {
     pub(crate) fn from_handle(data: DataHandle) -> Self {
         Self {
             data,
-            _types: PhantomData,
+            _value: PhantomData,
         }
     }
 
@@ -77,11 +80,11 @@ impl<T: StoreValue> CellAccess<'_, T> {
     }
 }
 
-impl<T, SIZE> Clone for Cell<T, SIZE> {
+impl<T> Clone for Cell<T> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            _types: PhantomData,
+            _value: PhantomData,
         }
     }
 }

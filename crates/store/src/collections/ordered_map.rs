@@ -11,6 +11,9 @@ use crate::{
 type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
 
 /// A named persistent ordered map with typed keys and values.
+///
+/// `SIZE` explicitly selects shared [`crate::Small`] or dedicated
+/// [`crate::Large`] physical storage.
 pub struct OrderedMap<K, V, SIZE> {
     data: DataHandle,
     _types: PhantomData<MapTypes<K, V, SIZE>>,

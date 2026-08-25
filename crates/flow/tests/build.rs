@@ -48,16 +48,16 @@ fn build_uses_the_stable_resource_layout() {
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
-    let definition: Cell<Vec<u8>, Small> = store.open_data("flow/definition").unwrap();
+    let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
     let _source_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("stage/00000000/state").unwrap();
     let _count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("stage/00000001/state").unwrap();
-    let _source_position: Cell<u64, Small> = store
+    let _source_position: Cell<u64> = store
         .open_data("stage/00000000/operation/sequence_source.position")
         .unwrap();
-    let _count: Cell<u64, Small> = store.open_data("stage/00000001/operation/count").unwrap();
+    let _count: Cell<u64> = store.open_data("stage/00000001/operation/count").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert!(
@@ -118,7 +118,7 @@ fn open_rejects_an_unpublished_build() {
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
     store
-        .create_data::<Cell<Vec<u8>, Small>>("flow/definition")
+        .create_data::<Cell<Vec<u8>>>("flow/definition")
         .unwrap();
     drop(store);
 
@@ -130,7 +130,7 @@ fn open_rejects_a_corrupt_published_definition() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
-    let definition: Cell<Vec<u8>, Small> = store.create_data("flow/definition").unwrap();
+    let definition: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
@@ -152,7 +152,7 @@ fn open_reports_a_missing_resource_after_publication() {
     drop(builder.build().unwrap());
 
     let store = Store::open(&complete_path).unwrap();
-    let definition: Cell<Vec<u8>, Small> = store.open_data("flow/definition").unwrap();
+    let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
     let definition = {
         let transaction = transactions.begin().unwrap();
@@ -167,7 +167,7 @@ fn open_reports_a_missing_resource_after_publication() {
 
     let incomplete_path = root.path().join("missing-resource");
     let mut store = Store::create(&incomplete_path).unwrap();
-    let published: Cell<Vec<u8>, Small> = store.create_data("flow/definition").unwrap();
+    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
     let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data("stage/00000000/state").unwrap();
@@ -199,7 +199,7 @@ fn open_reports_an_operation_data_size_mismatch() {
     drop(builder.build().unwrap());
 
     let store = Store::open(&complete_path).unwrap();
-    let definition: Cell<Vec<u8>, Small> = store.open_data("flow/definition").unwrap();
+    let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
     let definition = {
         let transaction = transactions.begin().unwrap();
@@ -214,11 +214,11 @@ fn open_reports_an_operation_data_size_mismatch() {
 
     let mismatched_path = root.path().join("size-mismatch");
     let mut store = Store::create(&mismatched_path).unwrap();
-    let published: Cell<Vec<u8>, Small> = store.create_data("flow/definition").unwrap();
+    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
     let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data("stage/00000000/state").unwrap();
-    let _position: Cell<u64, Large> = store
+    let _position: OrderedMap<u64, u64, Large> = store
         .create_data("stage/00000000/operation/sequence_source.position")
         .unwrap();
     let mut transactions = store.into_transactions();

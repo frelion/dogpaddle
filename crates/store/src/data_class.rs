@@ -2,8 +2,8 @@ use crate::{Cell, DataHandle, DataPlacement, Large, OrderedMap, Small, StoreKey,
 
 /// A typed persistent data object that can be created and opened by [`crate::Store`].
 ///
-/// This trait is sealed and implemented by each built-in collection for the
-/// [`Small`] and [`Large`] size classes.
+/// This trait is sealed. Each built-in collection fixes or explicitly selects
+/// the physical placement appropriate for its semantics.
 pub trait StoreData: private::SealedStoreData {}
 
 pub(crate) mod private {
@@ -30,8 +30,7 @@ macro_rules! impl_store_data {
     };
 }
 
-impl_store_data!(Cell<T, Small>, DataPlacement::Shared; T: StoreValue);
-impl_store_data!(Cell<T, Large>, DataPlacement::Dedicated; T: StoreValue);
+impl_store_data!(Cell<T>, DataPlacement::Shared; T: StoreValue);
 impl_store_data!(
     OrderedMap<K, V, Small>,
     DataPlacement::Shared;

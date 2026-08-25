@@ -134,9 +134,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// The data object's final [`crate::Small`] or [`crate::Large`] type
-    /// parameter selects its durable physical placement. At most
-    /// [`Store::LARGE_DATA_CAPACITY`] objects may use [`crate::Large`].
+    /// The data class fixes or selects its durable physical placement. A
+    /// [`crate::Cell`] is always shared, while an [`crate::OrderedMap`] uses
+    /// its [`crate::Small`] or [`crate::Large`] type parameter. At most
+    /// [`Store::LARGE_DATA_CAPACITY`] objects may use dedicated placement.
     ///
     /// Returns an error for an invalid or duplicate name, exhausted dedicated
     /// capacity, or an MDBX failure.
@@ -203,8 +204,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns an error when the data object is missing, its durable size does
-    /// not match `D`, or MDBX fails.
+    /// Returns an error when the data object is missing, its durable placement
+    /// does not match `D`, or MDBX fails.
     pub fn open_data<D: StoreData>(&self, name: &str) -> Result<D, StoreError> {
         let handle = self.open_handle(name)?;
         let expected = data_class::placement::<D>();

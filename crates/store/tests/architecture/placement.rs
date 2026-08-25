@@ -93,9 +93,7 @@ fn physical_layout_uses_shared_prefixes_and_dedicated_keys() {
     let shared_one = create_byte_map::<Small>(&mut store, "shared-one").unwrap();
     let dedicated_zero = create_byte_map::<Large>(&mut store, "dedicated-zero").unwrap();
     let dedicated_one = create_byte_map::<Large>(&mut store, "dedicated-one").unwrap();
-    let dedicated_cell = store
-        .create_data::<Cell<Vec<u8>, Large>>("dedicated-cell")
-        .unwrap();
+    let shared_cell = store.create_data::<Cell<Vec<u8>>>("shared-cell").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin().unwrap();
@@ -119,7 +117,7 @@ fn physical_layout_uses_shared_prefixes_and_dedicated_keys() {
         .unwrap()
         .put(&b"key".to_vec(), &b"dedicated-one".to_vec())
         .unwrap();
-    dedicated_cell
+    shared_cell
         .access(transaction.access())
         .unwrap()
         .set(&b"cell".to_vec())
@@ -132,12 +130,12 @@ fn physical_layout_uses_shared_prefixes_and_dedicated_keys() {
     let main = transaction.open_table(None).unwrap();
     let dedicated_zero = transaction.open_table(Some("d/00000000")).unwrap();
     let dedicated_one = transaction.open_table(Some("d/00000001")).unwrap();
-    let dedicated_cell = transaction.open_table(Some("d/00000002")).unwrap();
 
     let mut shared_zero_key = vec![3, 0, 0, 0, 0];
     shared_zero_key.extend_from_slice(b"key");
     let mut shared_one_key = vec![3, 0, 0, 0, 1];
     shared_one_key.extend_from_slice(b"key");
+    let shared_cell_key = [3, 0, 0, 0, 2];
     assert_eq!(
         transaction.get::<Vec<u8>>(&main, &shared_zero_key).unwrap(),
         Some(b"shared-zero".to_vec())
@@ -161,7 +159,7 @@ fn physical_layout_uses_shared_prefixes_and_dedicated_keys() {
         None
     );
     assert_eq!(
-        transaction.get::<Vec<u8>>(&dedicated_cell, b"").unwrap(),
+        transaction.get::<Vec<u8>>(&main, &shared_cell_key).unwrap(),
         Some(b"cell".to_vec())
     );
 }

@@ -9,8 +9,8 @@ use crate::{
     operation::{source::SequenceSourceDefinition, transform::CountDefinition},
 };
 
-const COUNT: DataName<Cell<u64, Small>> = DataName::new("count");
-const LARGE_COUNT: DataName<Cell<u64, Large>> = DataName::new("count");
+const COUNT: DataName<Cell<u64>> = DataName::new("count");
+const STRING_COUNT: DataName<Cell<String>> = DataName::new("count");
 const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("count");
 const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
 
@@ -53,7 +53,7 @@ fn data_instances_resolve_typed_objects_by_name_not_insertion_order() {
     instances.insert(state).unwrap();
     instances.insert(count).unwrap();
 
-    let _count: Cell<u64, Small> = instances.take(&COUNT).unwrap();
+    let _count: Cell<u64> = instances.take(&COUNT).unwrap();
     let _state: OrderedMap<Vec<u8>, Vec<u8>, Large> = instances.take(&STATE).unwrap();
     instances.finish().unwrap();
 }
@@ -112,14 +112,14 @@ fn data_instances_reject_the_wrong_data_class() {
     let mut instances = DataInstances::new();
     instances.insert(count).unwrap();
 
-    let Err(error) = instances.take(&LARGE_COUNT) else {
-        panic!("small cell unexpectedly materialized as a large cell");
+    let Err(error) = instances.take(&STRING_COUNT) else {
+        panic!("u64 cell unexpectedly materialized as a string cell");
     };
     assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
 }
 
 #[test]
-fn data_instances_reject_a_different_collection_with_the_same_size() {
+fn data_instances_reject_a_different_collection_with_the_same_layout() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
     let count = COUNT
@@ -130,7 +130,7 @@ fn data_instances_reject_a_different_collection_with_the_same_size() {
     instances.insert(count).unwrap();
 
     let Err(error) = instances.take(&MAP_COUNT) else {
-        panic!("cell unexpectedly materialized as an ordered map of the same size");
+        panic!("cell unexpectedly materialized as an ordered map with the same layout");
     };
     assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
 }

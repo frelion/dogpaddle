@@ -26,7 +26,7 @@ struct Fixture<SIZE> {
 
 struct StageFixture<SIZE> {
     transactions: Transactions,
-    cursor: Cell<u64, Small>,
+    cursor: Cell<u64>,
     map: TypedMap<SIZE>,
     _root: TempDir,
 }
@@ -155,7 +155,7 @@ where
         let root = tempfile::tempdir().expect("temporary stage benchmark directory");
         let mut store = Store::create(root.path().join("store")).expect("create stage store");
         let cursor = store
-            .create_data::<Cell<u64, Small>>("cursor")
+            .create_data::<Cell<u64>>("cursor")
             .expect("create stage cursor");
         let map = store
             .create_data::<TypedMap<SIZE>>("map")

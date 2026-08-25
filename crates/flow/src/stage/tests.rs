@@ -21,9 +21,7 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
             .unwrap(),
         Box::new(SequenceSourceOperation::new(
             source_definition,
-            store
-                .create_data::<Cell<u64, Small>>("source-position")
-                .unwrap(),
+            store.create_data::<Cell<u64>>("source-position").unwrap(),
         )),
     );
 
@@ -34,9 +32,7 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
             .unwrap(),
         Box::new(CountOperation::new(
             count_definition,
-            store
-                .create_data::<Cell<u64, Small>>("count-value")
-                .unwrap(),
+            store.create_data::<Cell<u64>>("count-value").unwrap(),
         )),
     );
 

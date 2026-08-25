@@ -1,4 +1,4 @@
-use dogpaddle_store::{Cell, Small, StoreError, TransactionAccess};
+use dogpaddle_store::{Cell, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 2;
-const COUNT: DataName<Cell<u64, Small>> = DataName::new("count");
+const COUNT: DataName<Cell<u64>> = DataName::new("count");
 const DATA: &[DataDeclaration] = &[COUNT.declaration()];
 
 /// Pure definition of a running count operation.
@@ -26,7 +26,7 @@ pub struct CountDefinition {
 /// begins, commits, or stores a transaction.
 pub struct CountOperation {
     definition: CountDefinition,
-    count: Cell<u64, Small>,
+    count: Cell<u64>,
 }
 
 /// Failure while stepping a [`CountOperation`] for one accepted input.
@@ -82,7 +82,7 @@ impl OperationDefinition for CountDefinition {
 impl CountOperation {
     /// Materializes a Count operation from its pure definition and durable data.
     #[must_use]
-    pub const fn new(definition: CountDefinition, count: Cell<u64, Small>) -> Self {
+    pub const fn new(definition: CountDefinition, count: Cell<u64>) -> Self {
         Self { definition, count }
     }
 

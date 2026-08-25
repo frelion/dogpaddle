@@ -100,7 +100,7 @@ impl FlowBuilder {
         let definition_bytes = codec::encode(&definition)?;
 
         let mut store = Store::create(&path)?;
-        let published: Cell<Vec<u8>, Small> = store.create_data(codec::DEFINITION_DATA_NAME)?;
+        let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
         let flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
             store.create_data(codec::FLOW_STATE_DATA_NAME)?;
         let stages = create_stages(&mut store, &definition)?;
