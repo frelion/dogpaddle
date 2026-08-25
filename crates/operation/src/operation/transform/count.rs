@@ -29,7 +29,7 @@ pub struct CountOperation {
     count: Cell<u64, Small>,
 }
 
-/// Failure while applying one input to a [`CountOperation`].
+/// Failure while stepping a [`CountOperation`] for one accepted input.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CountError {
@@ -103,7 +103,7 @@ impl CountOperation {
     ///
     /// Returns [`CountError::Overflow`] rather than wrapping at [`u64::MAX`].
     /// Storage and codec failures are returned as [`CountError::Store`].
-    pub fn apply(&self, access: TransactionAccess<'_>) -> Result<u64, CountError> {
+    pub fn step(&self, access: TransactionAccess<'_>) -> Result<u64, CountError> {
         let mut count = self.count.access(access)?;
         let next = count
             .get()?

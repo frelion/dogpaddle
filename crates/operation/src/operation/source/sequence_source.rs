@@ -109,7 +109,7 @@ impl SequenceSourceOperation {
     ///
     /// Returns [`SequenceSourceError::Exhausted`] after [`u64::MAX`] has been emitted.
     /// Storage and codec failures are returned as [`SequenceSourceError::Store`].
-    pub fn apply(&self, access: TransactionAccess<'_>) -> Result<u64, SequenceSourceError> {
+    pub fn step(&self, access: TransactionAccess<'_>) -> Result<u64, SequenceSourceError> {
         let mut position = self.position.access(access)?;
         let next = match position.get()? {
             Some(previous) => previous
