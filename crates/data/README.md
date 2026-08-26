@@ -57,6 +57,62 @@ roundtrip 测试约束，而不只是内存 Schema 校验。
 `$dogpaddle.` 字段名和 `dogpaddle.` Schema/Field metadata key 是物理协议的保留命名空间，
 不能用于逻辑记录。
 
+## 投影
+
+`ChangeProjection` 表示绑定到一个精确逻辑 Schema 的顶层列删除计划。索引必须严格递增，因而
+投影只能删列，不能重排列；空投影合法，表示记录侧不保留任何列，但仍保留原行数、事件顺序和
+全部 diff。物理 `$dogpaddle.diff` 不属于逻辑索引，始终由 Data 隐式读取。选择 List 或 Struct
+会选择它的完整子树，第一版不提供嵌套字段裁剪。
+
+同一份投影计划用于两条路径：
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use dogpaddle_data::{
+    Change, ChangeProjection, decode_change_projected, encode_change,
+};
+
+let logical_schema = Arc::new(Schema::new(vec![
+    Field::new("id", DataType::UInt64, false),
+    Field::new("payload", DataType::UInt64, false),
+    Field::new("tail", DataType::UInt64, false),
+]));
+let records = RecordBatch::try_new(
+    Arc::clone(&logical_schema),
+    vec![
+        Arc::new(UInt64Array::from(vec![7])),
+        Arc::new(UInt64Array::from(vec![8])),
+        Arc::new(UInt64Array::from(vec![9])),
+    ],
+)?;
+let change = Change::try_new(records, Int64Array::from(vec![1]))?;
+let encoded = encode_change(&change)?;
+
+let projection = ChangeProjection::try_new(logical_schema, [0, 2])?;
+
+// 已在内存中的 Change：只重组 Schema 和 ArrayRef，底层 Arrow buffer 不复制。
+let narrow = change.try_project(&projection)?;
+
+// AppendLog entry 中的完整 IPC：只物化 diff 和所选逻辑字段。
+let narrow = decode_change_projected(&encoded, &projection)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+内存路径返回普通的 owned `Change`，其 Arrow 引用可以独立于源值存活。IPC 路径先读取 entry
+自带的 Schema，要求它与投影绑定的 Schema 完全相同；随后验证完整 Stream framing、全部 field
+node 和 buffer descriptor 的数量、顺序与边界，将 diff 和所选字段的 buffer 复制到紧凑的新
+Arrow body，再交给 Arrow 官方 decoder。未选字段的 payload 不会被 Data decoder 访问、复制或
+物化，因此不同消费者可以对同一个完整 entry 使用各自的读取计划，而完整 Change 仍只需写一次。
+
+少读也确定了验证边界：未选字段的 descriptor 仍必须合法，但其 UTF-8 内容、List offsets 等
+值级约束不会被读取和验证；所选字段和 diff 仍执行完整 Arrow 解码与 `Change` invariant 校验。
+需要审计全部字段内容时使用 `decode_change`。投影减少的是算子对 Arrow body 的访问、解码和
+owned allocation；它不减少日志写入内容、entry 大小或 `ScanLimit` 的字节计费，也不承诺 MDBX
+或操作系统提供字段级物理 I/O。投影只增加读取能力，不改变下面的持久化格式。
+
 ## 持久化编码
 
 `encode_change` 把每个 Change 编码成一个标准、完整、自描述的 Arrow IPC Stream，不再增加

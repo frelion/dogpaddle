@@ -2,7 +2,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use thiserror::Error;
 
-use crate::{SchemaError, validate_schema};
+use crate::{ChangeProjection, ProjectionError, SchemaError, validate_schema};
 
 /// A non-empty contiguous columnar segment of an ordered change sequence.
 ///
@@ -93,6 +93,36 @@ impl Change {
         Ok(Self {
             records: self.records.slice(offset, length),
             diffs: self.diffs.slice(offset, length),
+        })
+    }
+
+    /// Returns an order-preserving, zero-copy logical-field projection.
+    ///
+    /// Selected Arrow arrays and the difference array share their existing
+    /// buffers with this Change. The result is an ordinary owned `Change` and
+    /// can outlive the source value. Projection never deletes or reorders rows
+    /// and never changes differences.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::SchemaMismatch`] when `projection` was
+    /// created for a different logical Schema. Arrow projection failures are
+    /// also returned rather than panicking.
+    pub fn try_project(&self, projection: &ChangeProjection) -> Result<Self, ProjectionError> {
+        projection.require_schema(self.records.schema_ref())?;
+        if projection.is_identity() {
+            return Ok(self.clone());
+        }
+        let records = self
+            .records
+            .project(projection.field_indices())
+            .map_err(|error| ProjectionError::Arrow {
+                message: error.to_string(),
+            })?;
+        debug_assert_eq!(records.schema_ref(), projection.output_schema());
+        Ok(Self {
+            records,
+            diffs: self.diffs.clone(),
         })
     }
 

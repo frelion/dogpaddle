@@ -1,12 +1,13 @@
 use std::{
     io::Cursor,
+    ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_ipc::{
-    Endianness, MessageHeader, MetadataVersion,
+    Endianness, Message, MessageHeader, MetadataVersion,
     reader::StreamReader,
     root_as_message,
     writer::{IpcWriteOptions, StreamWriter},
@@ -14,7 +15,12 @@ use arrow_ipc::{
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use thiserror::Error;
 
-use crate::{Change, ChangeError, SchemaError, schema::RESERVED_METADATA_PREFIX, validate_schema};
+use crate::{
+    Change, ChangeError, ChangeProjection, ProjectionError, SchemaError,
+    schema::RESERVED_METADATA_PREFIX, validate_schema,
+};
+
+mod projected;
 
 const DIFF_FIELD_NAME: &str = "$dogpaddle.diff";
 const CHANGE_KIND_KEY: &str = "dogpaddle.kind";
@@ -64,6 +70,34 @@ pub fn decode_change(encoded: &[u8]) -> Result<Change, CodecError> {
         .map_err(|_| CodecError::invalid("Arrow IPC decoding panicked"))?
 }
 
+/// Decodes selected top-level logical fields from one self-contained Change.
+///
+/// The embedded Schema, stream framing, complete `RecordBatch` metadata, and
+/// every buffer descriptor are validated before body access. Only the physical
+/// diff buffers and the complete buffer subtrees of fields selected by
+/// `projection` are then copied into owned Arrow memory and decoded. The
+/// returned value is an ordinary `Change`, not a lazy view over `encoded`.
+///
+/// Value-level invariants of unselected field bodies, such as UTF-8 contents or
+/// nested offsets, cannot be validated without reading those bodies. Use
+/// [`decode_change`] when every logical field must be fully decoded and
+/// validated.
+///
+/// # Errors
+///
+/// Returns `CodecError` for malformed or non-canonical Arrow IPC, an invalid
+/// `DogPaddle` physical Schema, a Schema different from the one bound to
+/// `projection`, malformed batch metadata, invalid selected Arrow values, or
+/// invalid differences.
+pub fn decode_change_projected(
+    encoded: &[u8],
+    projection: &ChangeProjection,
+) -> Result<Change, CodecError> {
+    ensure_little_endian_target()?;
+    catch_unwind(AssertUnwindSafe(|| projected::decode(encoded, projection)))
+        .map_err(|_| CodecError::invalid("Arrow IPC projected decoding panicked"))?
+}
+
 /// A self-contained Change encoding failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -74,6 +108,9 @@ pub enum CodecError {
     /// The decoded change violates its logical invariants.
     #[error(transparent)]
     Change(#[from] ChangeError),
+    /// The requested logical projection is invalid for this Change.
+    #[error(transparent)]
+    Projection(#[from] ProjectionError),
     /// The embedded `DogPaddle` Change format version is unsupported.
     #[error("unsupported DogPaddle Change format version {version:?}")]
     UnsupportedVersion {
@@ -107,19 +144,34 @@ fn decode_change_inner(encoded: &[u8]) -> Result<Change, CodecError> {
     let cursor = Cursor::new(encoded);
     let mut reader = StreamReader::try_new(cursor, None)?;
     let logical_schema = logical_schema(reader.schema().as_ref())?;
-    require_position(&reader, layout.batch_offset, "Schema")?;
+    require_position(&reader, layout.schema.end(), "Schema")?;
 
     let physical = reader
         .next()
         .transpose()?
         .ok_or_else(|| CodecError::invalid("stream contains no record batch"))?;
-    require_position(&reader, layout.eos_offset, "RecordBatch")?;
+    require_position(&reader, layout.batch.end(), "RecordBatch")?;
     if reader.next().transpose()?.is_some() {
         return Err(CodecError::invalid(
             "stream contains more than one record batch",
         ));
     }
 
+    change_from_physical(physical, logical_schema)
+}
+
+#[cfg(test)]
+pub(crate) fn projected_body_lengths_for_test(
+    encoded: &[u8],
+    projection: &ChangeProjection,
+) -> Result<(usize, usize), CodecError> {
+    projected::body_lengths(encoded, projection)
+}
+
+fn change_from_physical(
+    physical: RecordBatch,
+    logical_schema: SchemaRef,
+) -> Result<Change, CodecError> {
     let (_, mut columns, row_count) = physical.into_parts();
     if columns.is_empty() {
         return Err(CodecError::invalid(
@@ -138,29 +190,37 @@ fn decode_change_inner(encoded: &[u8]) -> Result<Change, CodecError> {
 }
 
 struct StreamLayout {
-    batch_offset: usize,
-    eos_offset: usize,
+    schema: MessageLayout,
+    batch: MessageLayout,
+}
+
+struct MessageLayout {
+    metadata: Range<usize>,
+    body: Range<usize>,
+}
+
+impl MessageLayout {
+    const fn end(&self) -> usize {
+        self.body.end
+    }
 }
 
 fn preflight_stream(encoded: &[u8]) -> Result<StreamLayout, CodecError> {
-    let batch_offset = preflight_message(encoded, 0, MessageHeader::Schema)?;
-    let eos_offset = preflight_message(encoded, batch_offset, MessageHeader::RecordBatch)?;
-    if encoded.get(eos_offset..) != Some(CANONICAL_EOS.as_slice()) {
+    let schema = preflight_message(encoded, 0, MessageHeader::Schema)?;
+    let batch = preflight_message(encoded, schema.end(), MessageHeader::RecordBatch)?;
+    if encoded.get(batch.end()..) != Some(CANONICAL_EOS.as_slice()) {
         return Err(CodecError::invalid(
             "the first record batch must be followed by one canonical EOS marker and no other bytes",
         ));
     }
-    Ok(StreamLayout {
-        batch_offset,
-        eos_offset,
-    })
+    Ok(StreamLayout { schema, batch })
 }
 
 fn preflight_message(
     encoded: &[u8],
     offset: usize,
     expected: MessageHeader,
-) -> Result<usize, CodecError> {
+) -> Result<MessageLayout, CodecError> {
     if !offset.is_multiple_of(8) {
         return Err(CodecError::invalid(format!(
             "{expected:?} message is not 8-byte aligned"
@@ -241,7 +301,30 @@ fn preflight_message(
             "{expected:?} body length exceeds the encoded entry"
         )));
     }
-    Ok(body_end)
+    Ok(MessageLayout {
+        metadata: metadata_start..metadata_end,
+        body: metadata_end..body_end,
+    })
+}
+
+fn message_at<'encoded>(
+    encoded: &'encoded [u8],
+    layout: &MessageLayout,
+    expected: MessageHeader,
+) -> Result<Message<'encoded>, CodecError> {
+    let metadata = encoded.get(layout.metadata.clone()).ok_or_else(|| {
+        CodecError::invalid(format!("{expected:?} metadata is outside the entry"))
+    })?;
+    let message = root_as_message(metadata).map_err(|error| {
+        CodecError::invalid(format!("invalid {expected:?} IPC metadata: {error}"))
+    })?;
+    if message.header_type() != expected {
+        return Err(CodecError::invalid(format!(
+            "expected {expected:?} message, found {:?}",
+            message.header_type()
+        )));
+    }
+    Ok(message)
 }
 
 fn preflight_schema_message(message: arrow_ipc::Message<'_>) -> Result<(), CodecError> {
@@ -277,6 +360,27 @@ fn preflight_batch_message(message: arrow_ipc::Message<'_>) -> Result<(), CodecE
         return Err(CodecError::invalid(
             "RecordBatch must contain at least one row",
         ));
+    }
+    usize::try_from(batch.length())
+        .map_err(|_| CodecError::invalid("RecordBatch row count does not fit this platform"))?;
+    if let Some(nodes) = batch.nodes() {
+        for (index, node) in nodes.iter().enumerate() {
+            let length = usize::try_from(node.length()).map_err(|_| {
+                CodecError::invalid(format!(
+                    "RecordBatch field node {index} length does not fit this platform"
+                ))
+            })?;
+            let null_count = usize::try_from(node.null_count()).map_err(|_| {
+                CodecError::invalid(format!(
+                    "RecordBatch field node {index} null count does not fit this platform"
+                ))
+            })?;
+            if null_count > length {
+                return Err(CodecError::invalid(format!(
+                    "RecordBatch field node {index} has more nulls than rows"
+                )));
+            }
+        }
     }
     if batch.compression().is_some() {
         return Err(CodecError::invalid(

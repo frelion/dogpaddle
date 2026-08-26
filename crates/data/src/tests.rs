@@ -1,22 +1,24 @@
-use std::{collections::HashMap, fmt::Write as _, io::Cursor, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, io::Cursor, ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch,
     RecordBatchOptions, StringArray, StructArray, UInt64Array, new_null_array, types::Int64Type,
 };
 use arrow_ipc::{
-    BodyCompression, BodyCompressionArgs, Endianness, Message as IpcMessage, MessageArgs,
-    MessageHeader, MetadataVersion, RecordBatch as IpcRecordBatch, RecordBatchArgs,
-    Schema as IpcSchema, SchemaArgs,
+    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Endianness, FieldNode,
+    Message as IpcMessage, MessageArgs, MessageHeader, MetadataVersion,
+    RecordBatch as IpcRecordBatch, RecordBatchArgs, Schema as IpcSchema, SchemaArgs,
     reader::StreamReader,
+    root_as_message,
     writer::{IpcWriteOptions, StreamWriter},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use flatbuffers::FlatBufferBuilder;
 
 use super::{
-    Change, ChangeError, CodecError, MAX_NESTING_DEPTH, SchemaError, decode_change, encode_change,
-    validate_schema,
+    Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, ProjectionError,
+    SchemaError, codec::projected_body_lengths_for_test, decode_change, decode_change_projected,
+    encode_change, validate_schema,
 };
 
 const KIND_KEY: &str = "dogpaddle.kind";
@@ -36,6 +38,53 @@ fn simple_change(diffs: impl IntoIterator<Item = i64>) -> Change {
     let records =
         RecordBatch::try_new(simple_schema(), vec![Arc::new(UInt64Array::from(values))]).unwrap();
     Change::try_new(records, Int64Array::from(diffs)).unwrap()
+}
+
+fn projection_change() -> Change {
+    let items = ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(1), None]),
+        None,
+        Some(Vec::<Option<i64>>::new()),
+    ]);
+    let name_field = Arc::new(Field::new("name", DataType::Utf8, true));
+    let score_field = Arc::new(Field::new("score", DataType::Int64, false));
+    let object = StructArray::from(vec![
+        (
+            Arc::clone(&name_field),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
+        ),
+        (
+            Arc::clone(&score_field),
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+        ),
+    ]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![7, 7, 8])),
+        Arc::new(StringArray::from(vec![Some("add"), None, Some("next")])),
+        Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+        Arc::new(items),
+        Arc::new(object),
+        new_null_array(&DataType::Null, 3),
+        Arc::new(UInt64Array::from(vec![70, 71, 72])),
+    ];
+    let mut fields = [
+        "id", "label", "enabled", "items", "object", "nothing", "tail",
+    ]
+    .into_iter()
+    .zip(&columns)
+    .map(|(name, column)| Field::new(name, column.data_type().clone(), true))
+    .collect::<Vec<_>>();
+    fields[0] = Field::new("id", DataType::UInt64, false);
+    fields[1] = fields[1]
+        .clone()
+        .with_metadata(HashMap::from([("semantic".to_owned(), "label".to_owned())]));
+    fields[6] = Field::new("tail", DataType::UInt64, false);
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        HashMap::from([("source".to_owned(), "projection-test".to_owned())]),
+    ));
+    let records = RecordBatch::try_new(schema, columns).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap()
 }
 
 fn event_change(events: &[(u64, i64)]) -> Change {
@@ -116,6 +165,68 @@ fn replace_batch_message(encoded: &[u8], metadata: &[u8], body: &[u8]) -> Vec<u8
     replaced
 }
 
+fn message_layout(encoded: &[u8], offset: usize) -> (Range<usize>, Range<usize>) {
+    let metadata_len = usize::try_from(i32::from_le_bytes(
+        encoded[offset + 4..offset + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let metadata = offset + 8..offset + 8 + metadata_len;
+    let message = root_as_message(&encoded[metadata.clone()]).unwrap();
+    let body_len = usize::try_from(message.bodyLength()).unwrap();
+    let body = metadata.end..metadata.end + body_len;
+    (metadata, body)
+}
+
+fn batch_body_and_buffers(encoded: &[u8]) -> (Range<usize>, Vec<IpcBuffer>) {
+    let (body, _, _, buffers) = batch_body_nodes_and_buffers(encoded);
+    (body, buffers)
+}
+
+fn batch_body_nodes_and_buffers(
+    encoded: &[u8],
+) -> (Range<usize>, i64, Vec<FieldNode>, Vec<IpcBuffer>) {
+    let (_, schema_body) = message_layout(encoded, 0);
+    let (batch_metadata, batch_body) = message_layout(encoded, schema_body.end);
+    let message = root_as_message(&encoded[batch_metadata]).unwrap();
+    let batch = message.header_as_record_batch().unwrap();
+    let nodes = batch.nodes().unwrap().iter().copied().collect::<Vec<_>>();
+    let buffers = batch.buffers().unwrap().iter().copied().collect();
+    (batch_body, batch.length(), nodes, buffers)
+}
+
+fn replace_batch_layout(
+    encoded: &[u8],
+    row_count: i64,
+    nodes: &[FieldNode],
+    buffers: &[IpcBuffer],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let nodes = builder.create_vector(nodes);
+    let buffers = builder.create_vector(buffers);
+    let batch = IpcRecordBatch::create(
+        &mut builder,
+        &RecordBatchArgs {
+            length: row_count,
+            nodes: Some(nodes),
+            buffers: Some(buffers),
+            ..RecordBatchArgs::default()
+        },
+    );
+    let message = IpcMessage::create(
+        &mut builder,
+        &MessageArgs {
+            version: MetadataVersion::V5,
+            header_type: MessageHeader::RecordBatch,
+            header: Some(batch.as_union_value()),
+            bodyLength: i64::try_from(body.len()).unwrap(),
+            ..MessageArgs::default()
+        },
+    );
+    builder.finish(message, None);
+    replace_batch_message(encoded, builder.finished_data(), body)
+}
+
 fn ipc_batch_metadata(body_length: i64, compressed: bool) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let compression =
@@ -181,11 +292,21 @@ fn assert_schema_type_round_trips(data_type: &DataType) {
         true,
     )]));
     assert!(validate_schema(&schema).is_ok());
-    let records = RecordBatch::try_new(schema, vec![new_null_array(data_type, 1)]).unwrap();
+    let records =
+        RecordBatch::try_new(Arc::clone(&schema), vec![new_null_array(data_type, 1)]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
     let encoded = encode_change(&change).unwrap();
     let decoded = decode_change(&encoded).unwrap();
     assert_eq!(decoded.schema(), change.schema());
+
+    let selected = ChangeProjection::try_new(Arc::clone(&schema), [0]).unwrap();
+    let selected = decode_change_projected(&encoded, &selected).unwrap();
+    assert_change_eq(&selected, &change);
+    let skipped = ChangeProjection::try_new(schema, []).unwrap();
+    let skipped = decode_change_projected(&encoded, &skipped).unwrap();
+    assert_eq!(skipped.records().num_columns(), 0);
+    assert_eq!(skipped.num_rows(), 1);
+    assert_eq!(skipped.diffs().values(), &[1]);
 }
 
 fn hex(encoded: &[u8]) -> String {
@@ -254,6 +375,309 @@ fn slice_preserves_a_contiguous_event_subsequence_and_rejects_invalid_ranges() {
     assert!(matches!(
         change.try_slice(3, 2),
         Err(ChangeError::SliceOutOfBounds { .. })
+    ));
+}
+
+#[test]
+fn projection_only_deletes_columns_and_shares_in_memory_arrow_buffers() {
+    let change = projection_change();
+    let projection = ChangeProjection::try_new(change.schema(), [0, 3, 6]).unwrap();
+    let projected = change.try_project(&projection).unwrap();
+
+    assert_eq!(
+        projected
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["id", "items", "tail"]
+    );
+    assert_eq!(projected.schema().metadata(), change.schema().metadata());
+    assert_eq!(projected.num_rows(), 3);
+    assert_eq!(projected.diffs().values(), &[1, -1, 2]);
+    for (source, target) in [(0, 0), (3, 1), (6, 2)] {
+        assert!(Arc::ptr_eq(
+            change.records().column(source),
+            projected.records().column(target)
+        ));
+    }
+    assert_eq!(
+        change.diffs().values().as_ptr(),
+        projected.diffs().values().as_ptr()
+    );
+}
+
+#[test]
+fn empty_and_full_projections_preserve_rows_diffs_and_schema_identity() {
+    let change = projection_change();
+    let empty = ChangeProjection::try_new(change.schema(), []).unwrap();
+    let empty = change.try_project(&empty).unwrap();
+    assert_eq!(empty.records().num_columns(), 0);
+    assert_eq!(empty.num_rows(), change.num_rows());
+    assert_eq!(empty.diffs(), change.diffs());
+    assert_eq!(empty.schema().metadata(), change.schema().metadata());
+
+    let field_count = change.schema().fields().len();
+    let full = ChangeProjection::try_new(change.schema(), 0..field_count).unwrap();
+    let full = change.try_project(&full).unwrap();
+    assert_change_eq(&full, &change);
+    for index in 0..field_count {
+        assert!(Arc::ptr_eq(
+            change.records().column(index),
+            full.records().column(index)
+        ));
+    }
+}
+
+#[test]
+fn zero_column_change_accepts_the_empty_projection() {
+    let schema = Arc::new(Schema::empty());
+    let records = RecordBatch::try_new_with_options(
+        Arc::clone(&schema),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(2)),
+    )
+    .unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![-1, 1])).unwrap();
+    let projection = ChangeProjection::try_new(schema, []).unwrap();
+    let projected = change.try_project(&projection).unwrap();
+    assert_eq!(projected.records().num_columns(), 0);
+    assert_eq!(projected.num_rows(), 2);
+    assert_eq!(projected.diffs().values(), &[-1, 1]);
+}
+
+#[test]
+fn projection_rejects_reordering_duplicates_bounds_and_schema_drift() {
+    let change = projection_change();
+    let schema = change.schema();
+    assert!(matches!(
+        ChangeProjection::try_new(Arc::clone(&schema), [2, 0]),
+        Err(ProjectionError::FieldsNotStrictlyIncreasing {
+            previous: 2,
+            current: 0
+        })
+    ));
+    assert!(matches!(
+        ChangeProjection::try_new(Arc::clone(&schema), [1, 1]),
+        Err(ProjectionError::FieldsNotStrictlyIncreasing {
+            previous: 1,
+            current: 1
+        })
+    ));
+    assert!(matches!(
+        ChangeProjection::try_new(Arc::clone(&schema), [schema.fields().len()]),
+        Err(ProjectionError::FieldOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        ChangeProjection::try_new(schema, [usize::MAX]),
+        Err(ProjectionError::FieldOutOfBounds { .. })
+    ));
+
+    let other = ChangeProjection::try_new(simple_schema(), [0]).unwrap();
+    assert!(matches!(
+        change.try_project(&other),
+        Err(ProjectionError::SchemaMismatch)
+    ));
+}
+
+#[test]
+fn projected_ipc_decode_matches_in_memory_projection_for_every_layout_shape() {
+    let change = projection_change();
+    let encoded = encode_change(&change).unwrap();
+    let selections = [
+        vec![],
+        vec![0],
+        vec![1],
+        vec![2],
+        vec![3],
+        vec![4],
+        vec![5],
+        vec![6],
+        vec![0, 2, 6],
+        (0..change.schema().fields().len()).collect(),
+    ];
+    for selection in selections {
+        let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
+        let expected = change.try_project(&projection).unwrap();
+        let actual = decode_change_projected(&encoded, &projection).unwrap();
+        assert_change_eq(&actual, &expected);
+        assert_eq!(actual.schema(), projection.output_schema().clone());
+    }
+}
+
+#[test]
+fn projected_decode_rejects_schema_drift_before_selected_body_values() {
+    let change = projection_change();
+    let mut corrupted = encode_change(&change).unwrap();
+    let (body, buffers) = batch_body_and_buffers(&corrupted);
+    let label_values = buffers[6];
+    corrupted[body.start + usize::try_from(label_values.offset()).unwrap()] = 0xff;
+
+    let schema = change.schema();
+    let mut metadata = schema.metadata().clone();
+    metadata.insert("schema-drift".to_owned(), "true".to_owned());
+    let drifted = Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata));
+    let projection = ChangeProjection::try_new(drifted, [1]).unwrap();
+    assert!(matches!(
+        decode_change_projected(&corrupted, &projection),
+        Err(CodecError::Projection(ProjectionError::SchemaMismatch))
+    ));
+}
+
+#[test]
+fn projected_decode_validates_metadata_of_unselected_fields() {
+    let change = projection_change();
+    let encoded = encode_change(&change).unwrap();
+    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    let (body_range, row_count, nodes, buffers) = batch_body_nodes_and_buffers(&encoded);
+    let body = &encoded[body_range];
+    assert_eq!(nodes.len(), 11);
+    assert_eq!(buffers.len(), 21);
+
+    let mut short_tail = buffers.clone();
+    let tail_values = short_tail.last_mut().unwrap();
+    assert_eq!(tail_values.length(), 24);
+    *tail_values = IpcBuffer::new(tail_values.offset(), 16);
+    let short_tail = replace_batch_layout(
+        &encoded,
+        row_count,
+        &nodes,
+        &short_tail,
+        &body[..body.len() - 8],
+    );
+    assert!(matches!(
+        decode_change_projected(&short_tail, &projection),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+
+    let mut invalid_struct_nodes = nodes.clone();
+    invalid_struct_nodes[8] = FieldNode::new(2, invalid_struct_nodes[8].null_count());
+    let invalid_struct =
+        replace_batch_layout(&encoded, row_count, &invalid_struct_nodes, &buffers, body);
+    assert!(matches!(
+        decode_change_projected(&invalid_struct, &projection),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+
+    let mut out_of_bounds = buffers.clone();
+    out_of_bounds[6] = IpcBuffer::new(i64::try_from(body.len() + 8).unwrap(), 1);
+    let out_of_bounds = replace_batch_layout(&encoded, row_count, &nodes, &out_of_bounds, body);
+    assert!(matches!(
+        decode_change_projected(&out_of_bounds, &projection),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+}
+
+#[test]
+fn projected_decode_validates_nested_offsets_only_when_selected() {
+    let change = projection_change();
+    let mut corrupted = encode_change(&change).unwrap();
+    let (body, buffers) = batch_body_and_buffers(&corrupted);
+    let list_offsets = buffers[10];
+    assert_eq!(list_offsets.length(), 16);
+    let last_offset = body.start
+        + usize::try_from(list_offsets.offset()).unwrap()
+        + change.num_rows() * size_of::<i32>();
+    corrupted[last_offset..last_offset + size_of::<i32>()].copy_from_slice(&i32::MAX.to_le_bytes());
+
+    let keep_id = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    assert!(decode_change_projected(&corrupted, &keep_id).is_ok());
+    let select_list = ChangeProjection::try_new(change.schema(), [3]).unwrap();
+    assert!(decode_change_projected(&corrupted, &select_list).is_err());
+    assert!(decode_change(&corrupted).is_err());
+}
+
+#[test]
+fn full_projected_decode_reencodes_to_the_identical_canonical_stream() {
+    let change = projection_change();
+    let encoded = encode_change(&change).unwrap();
+    let projection =
+        ChangeProjection::try_new(change.schema(), 0..change.schema().fields().len()).unwrap();
+    let projected = decode_change_projected(&encoded, &projection).unwrap();
+
+    assert_change_eq(&projected, &change);
+    assert_eq!(encode_change(&projected).unwrap(), encoded);
+}
+
+#[test]
+fn projected_ipc_body_omits_a_large_unselected_middle_column() {
+    let huge = vec![7_u8; 8 * 1_024 * 1_024];
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![10])),
+        Arc::new(BinaryArray::from(vec![Some(huge.as_slice())])),
+        Arc::new(UInt64Array::from(vec![20])),
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("head", DataType::UInt64, false),
+        Field::new("huge", DataType::Binary, false),
+        Field::new("tail", DataType::UInt64, false),
+    ]));
+    let change = Change::try_new(
+        RecordBatch::try_new(Arc::clone(&schema), columns).unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+    let encoded = encode_change(&change).unwrap();
+    let projection = ChangeProjection::try_new(schema, [0, 2]).unwrap();
+    let (source_body, compact_body) =
+        projected_body_lengths_for_test(&encoded, &projection).unwrap();
+    assert!(source_body > 8 * 1_024 * 1_024);
+    assert!(compact_body < 1_024);
+
+    let projected = decode_change_projected(&encoded, &projection).unwrap();
+    assert_eq!(projected.records().num_columns(), 2);
+    assert_eq!(
+        projected
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values(),
+        &[10]
+    );
+    assert_eq!(
+        projected
+            .records()
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values(),
+        &[20]
+    );
+}
+
+#[test]
+fn projected_decode_skips_unselected_value_validation_but_validates_selected_values() {
+    let change = projection_change();
+    let mut corrupted = encode_change(&change).unwrap();
+    let (body, buffers) = batch_body_and_buffers(&corrupted);
+    assert_eq!(buffers.len(), 21);
+    let label_values = buffers[6];
+    let value_offset = usize::try_from(label_values.offset()).unwrap();
+    assert!(label_values.length() > 0);
+    corrupted[body.start + value_offset] = 0xff;
+
+    assert!(decode_change(&corrupted).is_err());
+    let keep = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    assert!(decode_change_projected(&corrupted, &keep).is_ok());
+    let empty = ChangeProjection::try_new(change.schema(), []).unwrap();
+    assert!(decode_change_projected(&corrupted, &empty).is_ok());
+    let poison = ChangeProjection::try_new(change.schema(), [1]).unwrap();
+    assert!(decode_change_projected(&corrupted, &poison).is_err());
+}
+
+#[test]
+fn empty_projection_still_decodes_and_validates_differences() {
+    let schema = unit_physical_schema(marked_metadata());
+    let zero = unit_physical_batch(schema.clone(), Int64Array::from(vec![0]));
+    let encoded = encode_stream(&schema, &[zero]);
+    let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
+    assert!(matches!(
+        decode_change_projected(&encoded, &projection),
+        Err(CodecError::Change(ChangeError::ZeroDiff { index: 0 }))
     ));
 }
 
@@ -554,46 +978,65 @@ fn decoder_requires_the_physical_schema_contract_and_version_markers() {
 #[test]
 fn decoder_requires_exactly_one_batch_and_canonical_eos() {
     let change = simple_change([-1, 1]);
+    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
     let encoded = encode_change(&change).unwrap();
     for end in 0..encoded.len() {
         assert!(
             decode_change(&encoded[..end]).is_err(),
             "accepted truncation at byte {end}"
         );
+        assert!(
+            decode_change_projected(&encoded[..end], &projection).is_err(),
+            "projected decoder accepted truncation at byte {end}"
+        );
     }
 
     let mut trailing = encoded.clone();
     trailing.push(0);
     assert!(decode_change(&trailing).is_err());
+    assert!(decode_change_projected(&trailing, &projection).is_err());
     let mut repeated_eos = encoded;
     repeated_eos.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
     assert!(decode_change(&repeated_eos).is_err());
+    assert!(decode_change_projected(&repeated_eos, &projection).is_err());
 
     let encoded = encode_change(&change).unwrap();
     let legacy_schema_framing = encoded[4..].to_vec();
     assert!(decode_change(&legacy_schema_framing).is_err());
+    assert!(decode_change_projected(&legacy_schema_framing, &projection).is_err());
     let arrow_reader = StreamReader::try_new(Cursor::new(encoded.as_slice()), None).unwrap();
     let batch_offset = usize::try_from(arrow_reader.get_ref().position()).unwrap();
     let mut legacy_batch_framing = encoded;
     legacy_batch_framing.drain(batch_offset..batch_offset + 4);
     assert!(decode_change(&legacy_batch_framing).is_err());
+    assert!(decode_change_projected(&legacy_batch_framing, &projection).is_err());
 
     let schema = unit_physical_schema(marked_metadata());
+    let unit_projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
     let empty_stream = encode_stream(&schema, &[]);
     assert!(decode_change(&empty_stream).is_err());
+    assert!(decode_change_projected(&empty_stream, &unit_projection).is_err());
     let first = unit_physical_batch(schema.clone(), Int64Array::from(vec![1]));
     let second = unit_physical_batch(schema.clone(), Int64Array::from(vec![-1]));
-    assert!(decode_change(&encode_stream(&schema, &[first, second])).is_err());
+    let multiple = encode_stream(&schema, &[first, second]);
+    assert!(decode_change(&multiple).is_err());
+    assert!(decode_change_projected(&multiple, &unit_projection).is_err());
 }
 
 #[test]
 fn decoder_preflights_declared_lengths_before_arrow_allocates() {
-    let encoded = encode_change(&simple_change([1])).unwrap();
+    let change = simple_change([1]);
+    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    let encoded = encode_change(&change).unwrap();
     let mut oversized_metadata = encoded.clone();
     let oversized_aligned_length = i32::MAX - 7;
     oversized_metadata[4..8].copy_from_slice(&oversized_aligned_length.to_le_bytes());
     assert!(matches!(
         decode_change(&oversized_metadata),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+    assert!(matches!(
+        decode_change_projected(&oversized_metadata, &projection),
         Err(CodecError::InvalidEncoding { .. })
     ));
 
@@ -604,22 +1047,33 @@ fn decoder_preflights_declared_lengths_before_arrow_allocates() {
         decode_change(&oversized_body),
         Err(CodecError::InvalidEncoding { .. })
     ));
+    assert!(matches!(
+        decode_change_projected(&oversized_body, &projection),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
 }
 
 #[test]
 fn decoder_rejects_non_v5_big_endian_and_compressed_ipc() {
     let schema = unit_physical_schema(marked_metadata());
+    let unit_projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
     let batch = unit_physical_batch(schema.clone(), Int64Array::from(vec![1]));
     let v4_options = IpcWriteOptions::try_new(8, false, MetadataVersion::V4).unwrap();
     let v4 = encode_stream_with_options(&schema, &[batch], v4_options);
     assert!(decode_change(&v4).is_err());
+    assert!(decode_change_projected(&v4, &unit_projection).is_err());
 
-    assert!(decode_change(&big_endian_schema_stream()).is_err());
+    let big_endian = big_endian_schema_stream();
+    assert!(decode_change(&big_endian).is_err());
+    assert!(decode_change_projected(&big_endian, &unit_projection).is_err());
 
-    let encoded = encode_change(&simple_change([1])).unwrap();
+    let change = simple_change([1]);
+    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    let encoded = encode_change(&change).unwrap();
     let compressed_metadata = ipc_batch_metadata(0, true);
     let compressed = replace_batch_message(&encoded, &compressed_metadata, &[]);
     assert!(decode_change(&compressed).is_err());
+    assert!(decode_change_projected(&compressed, &projection).is_err());
 }
 
 #[test]

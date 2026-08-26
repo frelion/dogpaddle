@@ -21,7 +21,8 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   资源命名，不依赖 Rust 内存布局。
 - **有序 Arrow 批量差分**：Data 提供 `Change = RecordBatch + Int64Array`，逐行绑定记录与
   非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
-  恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。
+  恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
+  完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
