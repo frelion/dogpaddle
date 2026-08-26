@@ -48,9 +48,17 @@ Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子�
 布局。
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state map 显式声明为
-`Small`。Flow state map 保留生命周期状态；Stage state map 是未来队列、进度和输出协议的唯一持久化容器。后续
-运行层只能在这些 map 的键域内写状态，不能新增数据空间。此后 Store 已转换为事务能力，拓扑
-和资源目录都没有修改入口。
+`Small`。Flow state map 保留生命周期状态，Stage state map 保存运行期 Stage 状态。未来的
+边数据通道将使用构建期显式声明的日志资源；每个日志 value 是一个内嵌 Schema 的完整 Change
+IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不由 Data codec
+中的外部 Schema 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增
+数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
+
+每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
+不是稳定 event ID。未来 Stage 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件
+序列必须逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；若多输入
+Operation 依赖跨端口交错顺序，运行层必须另行定义并持久化 ingress 顺序，不能从 source 声明
+顺序推断事件发生顺序。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`Flow::open()` 返回 `IncompleteBuild`；
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只

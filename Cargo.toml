@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flow", "crates/operation", "crates/store"]
+members = ["crates/data", "crates/flow", "crates/operation", "crates/store"]
 resolver = "3"
 
 [workspace.package]
@@ -8,9 +8,14 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
+arrow-array = "=59.2.0"
+arrow-ipc = "=59.2.0"
+arrow-schema = "=59.2.0"
+flatbuffers = { version = "=25.12.19", default-features = false }
 libmdbx = { version = "=0.6.6", default-features = false }
 thiserror = "=2.0.20"
 tempfile = "=3.27.0"
+dogpaddle-data = { path = "crates/data" }
 dogpaddle-store = { path = "crates/store" }
 dogpaddle-operation = { path = "crates/operation" }
 

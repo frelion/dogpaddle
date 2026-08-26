@@ -5,38 +5,18 @@ Definition 是无副作用、可持久化的数据；它声明所需数据对象
 及该 collection 真正需要的布局参数。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
 Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
 
-## 差分记录模型
+## 数据边界
 
-[`data`] 模块定义数据库无关的数据语言。每个 [`data::Change`] 由一个非零 `i64` 差分和一个
-不可变 [`data::Record`] 组成；正数增加记录权重，负数撤回记录权重，零差分不能构造。
-Record 是按字段名 UTF-8 字节顺序规范化的字典，拒绝重复字段，并区分字段缺失与显式
-[`data::Value::Null`]。
+共享的 Arrow Schema、批量差分模型和“每个 Change 一个自描述 IPC Stream”的编码属于独立的
+`dogpaddle-data` crate，而不是 Operation。未来运行接口以内存中的 `Change` 为输入输出；
+Operation 只负责数据变换和自己声明的持久化状态，不读写 IPC、不读取边日志，也不决定物理
+batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须依次观察输入事件，并按
+其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
+独立定义的窗口、barrier 或 flush 信号，Operation 的可观察结果必须在稳定合并或切分 Change
+后保持不变；物理 Change 边界不能被算子当成业务事件。
 
-```rust
-use dogpaddle_operation::data::{Change, Record, Value};
-
-let record = Record::try_new([
-    ("name", Value::String("Alice".to_owned())),
-    ("user_id", Value::U64(42)),
-])?;
-let insertion = Change::insertion(record);
-
-assert_eq!(insertion.diff().get(), 1);
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-[`data::Value`] 第一版只包含 `Null`、`Bool`、`I64`、`U64`、规范化 `F64`、UTF-8
-`String`、`Bytes`、`Array` 和嵌套 `Object`。它不承诺映射任一数据库的完整类型系统；数据库
-适配器负责将外部值转换为这些基础类型。容器最多嵌套 64 层，浮点数将负零规范为正零，并将
-所有 NaN 规范为同一种位模式，使 Record 具有可靠的 `Eq` 和 `Hash` 身份。模型不提供 `Ord`
-或 `StoreKey`，避免把尚未设计的跨类型排序冻结为持久化契约。
-
-只有 Change 实现 `StoreValue`。其 v1 持久化编码以 `u16` 版本和 big-endian `i64` diff
-开头，随后是规范 Record；Value 使用显式稳定 tag，字段值和数组元素使用 `u32` 长度定界。
-解码器拒绝未知版本或 tag、零 diff、非规范字段顺序、非法 UTF-8、非规范浮点数、超深嵌套、
-截断和尾随字节。[`data::Change::project_diff`] 只校验固定 envelope 并投影 diff，使只关心权重的
-Operation 无需分配或解码宽 Record。`AppendLog<Change>` 可以完整解码，也可以在同一事务中通过
-`append_entry` 原样转发编码。
+当前阶段尚未公开运行 trait 的批量处理方法，因此本 crate 不提前增加空的 `run` 或
+`process` 接口。Flow/Stage 数据通道接入时再引入对 `dogpaddle-data` 的实际代码依赖。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -97,7 +77,7 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 
 ## `operation::transform::Count`
 
-[`operation::transform::CountDefinition`] 要求一个输入。每成功应用一条记录，
+[`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
 [`operation::transform::CountOperation`] 将直接持有的 `Cell<u64>` 加一并返回新计数；
 未写入的 Cell 解释为 `0`，溢出返回
 [`operation::transform::CountError::Overflow`]。

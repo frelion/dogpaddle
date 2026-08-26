@@ -19,8 +19,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   调用方不需要再次组装。
 - **稳定格式边界**：Flow 与 Operation Definition 使用显式版本、tag、完整性校验和确定性
   资源命名，不依赖 Rust 内存布局。
-- **规范差分记录**：Operation 提供数据库无关的 `Change = non-zero diff + canonical Record`
-  模型、基础 Value 类型和稳定 v1 编码；相同逻辑 Record 具有唯一字段顺序和持久化字节。
+- **有序 Arrow 批量差分**：Data 提供 `Change = RecordBatch + Int64Array`，逐行绑定记录与
+  非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
+  恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
@@ -33,6 +34,7 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 | crate | 职责 |
 | --- | --- |
 | [`dogpaddle-flow`](crates/flow/README.md) | Flow Builder、拓扑校验、持久化 `build/open`，以及未来的内部 Stage 运行时。 |
+| [`dogpaddle-data`](crates/data/README.md) | 共享 `Change`、Schema 校验与自描述 Arrow IPC Stream 编解码。 |
 | [`dogpaddle-operation`](crates/operation/README.md) | 具体 Operation 的纯 Definition、稳定编码、持久化 Data 与实例。 |
 | [`dogpaddle-store`](crates/store/README.md) | MDBX 事务存储、命名数据空间、编解码器和类型化集合。 |
 
@@ -46,14 +48,16 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 ## 当前边界
 
-当前仓库完成了 Flow 的持久化定义、构建和重新打开，以及差分 Record 的建模、编码和
-`AppendLog` 持久化验证；尚未实现 `run`、Stage 调度、边队列、背压、中断续跑或输出提交，
-因此还不是可执行的流引擎。仓库也没有最终用户二进制、SQL、连接器或分布式调度。一个 Store
+当前仓库完成了 Flow 的持久化定义、构建和重新打开，以及 Arrow `Change`、自描述 Stream
+编码和 `AppendLog<Vec<u8>>` 持久化验证；尚未实现 `run`、Stage 调度、边队列、背压、中断
+续跑或输出提交，因此还不是可执行的流引擎。仓库也没有最终用户二进制、SQL、连接器或
+分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。
 
 ## 深入阅读
 
 - [Flow 构建、磁盘布局与当前边界](crates/flow/README.md)
+- [Arrow Change 与自描述 IPC Stream](crates/data/README.md)
 - [Operation Definition 与实例约束](crates/operation/README.md)
 - [Store 存储语义、测试与性能](crates/store/README.md)
 - [Cell、Small/Large OrderedMap 与 AppendLog 实测报告](crates/store/PERFORMANCE.md)
