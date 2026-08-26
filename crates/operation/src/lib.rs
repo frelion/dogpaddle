@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod codec;
+pub mod data;
 mod definition;
 pub mod operation;
 

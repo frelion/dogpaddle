@@ -5,6 +5,39 @@ Definition 是无副作用、可持久化的数据；它声明所需数据对象
 及该 collection 真正需要的布局参数。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
 Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
 
+## 差分记录模型
+
+[`data`] 模块定义数据库无关的数据语言。每个 [`data::Change`] 由一个非零 `i64` 差分和一个
+不可变 [`data::Record`] 组成；正数增加记录权重，负数撤回记录权重，零差分不能构造。
+Record 是按字段名 UTF-8 字节顺序规范化的字典，拒绝重复字段，并区分字段缺失与显式
+[`data::Value::Null`]。
+
+```rust
+use dogpaddle_operation::data::{Change, Record, Value};
+
+let record = Record::try_new([
+    ("name", Value::String("Alice".to_owned())),
+    ("user_id", Value::U64(42)),
+])?;
+let insertion = Change::insertion(record);
+
+assert_eq!(insertion.diff().get(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+[`data::Value`] 第一版只包含 `Null`、`Bool`、`I64`、`U64`、规范化 `F64`、UTF-8
+`String`、`Bytes`、`Array` 和嵌套 `Object`。它不承诺映射任一数据库的完整类型系统；数据库
+适配器负责将外部值转换为这些基础类型。容器最多嵌套 64 层，浮点数将负零规范为正零，并将
+所有 NaN 规范为同一种位模式，使 Record 具有可靠的 `Eq` 和 `Hash` 身份。模型不提供 `Ord`
+或 `StoreKey`，避免把尚未设计的跨类型排序冻结为持久化契约。
+
+只有 Change 实现 `StoreValue`。其 v1 持久化编码以 `u16` 版本和 big-endian `i64` diff
+开头，随后是规范 Record；Value 使用显式稳定 tag，字段值和数组元素使用 `u32` 长度定界。
+解码器拒绝未知版本或 tag、零 diff、非规范字段顺序、非法 UTF-8、非规范浮点数、超深嵌套、
+截断和尾随字节。[`data::Change::project_diff`] 只校验固定 envelope 并投影 diff，使只关心权重的
+Operation 无需分配或解码宽 Record。`AppendLog<Change>` 可以完整解码，也可以在同一事务中通过
+`append_entry` 原样转发编码。
+
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
 
