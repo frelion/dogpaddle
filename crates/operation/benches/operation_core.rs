@@ -2,6 +2,7 @@
 
 use std::{hint::black_box, path::Path, time::Duration};
 
+use dogpaddle_bench_protocol::require_benchmark_build;
 use dogpaddle_operation::{
     OperationDefinition, decode_definition, encode_definition,
     operation::{
@@ -11,7 +12,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 
-use support::{BenchRoot, Config, SampleRecord, emit_samples, record_samples};
+use support::{BenchRoot, Config, MachineRecords};
 
 mod support;
 
@@ -101,10 +102,7 @@ impl SequenceFixture {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        eprintln!("operation_core must run through `cargo bench`");
-        return;
-    }
+    require_benchmark_build("operation_core");
 
     let config = Config::load();
     let root = BenchRoot::from_environment();
@@ -115,7 +113,7 @@ fn main() {
     root.emit_environment();
     config.emit(root.profile());
 
-    let mut records = Vec::<SampleRecord>::new();
+    let mut records = MachineRecords::new();
     benchmark_definition_codec(&config, &mut records);
     for &steps in &config.steps {
         benchmark_count_body(&config, &root, steps, &mut records);
@@ -123,10 +121,11 @@ fn main() {
         benchmark_count_durable(&config, &root, steps, &mut records);
         benchmark_sequence_durable(&config, &root, steps, &mut records);
     }
-    emit_samples(&records);
+    root.assert_samples_released();
+    records.emit();
 }
 
-fn benchmark_definition_codec(config: &Config, records: &mut Vec<SampleRecord>) {
+fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
     println!();
     println!("=== Definition public codec ===");
     let definitions: [(&str, Box<dyn OperationDefinition>); 2] = [
@@ -148,8 +147,7 @@ fn benchmark_definition_codec(config: &Config, records: &mut Vec<SampleRecord>) 
         let durations = (0..config.samples)
             .map(|_| measure_encode(definition.as_ref(), config.codec_operations))
             .collect();
-        record_samples(
-            records,
+        records.record(
             operation,
             "definition_encode",
             config.codec_operations,
@@ -162,8 +160,7 @@ fn benchmark_definition_codec(config: &Config, records: &mut Vec<SampleRecord>) 
         let durations = (0..config.samples)
             .map(|_| measure_decode(&encoded, config.codec_operations))
             .collect();
-        record_samples(
-            records,
+        records.record(
             operation,
             "definition_decode",
             config.codec_operations,
@@ -178,15 +175,15 @@ fn benchmark_count_body(
     config: &Config,
     root: &BenchRoot,
     steps: usize,
-    records: &mut Vec<SampleRecord>,
+    records: &mut MachineRecords,
 ) {
-    let mut fixture = CountFixture::create(&root.store_path(&format!("count-body-{steps}")));
+    let sample_store = root.sample(&format!("count-body-{steps}"));
+    let mut fixture = CountFixture::create(sample_store.path());
     measure_count_body(&mut fixture, steps, config.warmup_transactions);
     let durations = (0..config.samples)
         .map(|_| measure_count_body(&mut fixture, steps, config.body_transactions))
         .collect();
-    record_samples(
-        records,
+    records.record(
         "count",
         "step_rollback_body",
         operation_count(steps, config.body_transactions),
@@ -200,15 +197,15 @@ fn benchmark_sequence_body(
     config: &Config,
     root: &BenchRoot,
     steps: usize,
-    records: &mut Vec<SampleRecord>,
+    records: &mut MachineRecords,
 ) {
-    let mut fixture = SequenceFixture::create(&root.store_path(&format!("sequence-body-{steps}")));
+    let sample_store = root.sample(&format!("sequence-body-{steps}"));
+    let mut fixture = SequenceFixture::create(sample_store.path());
     measure_sequence_body(&mut fixture, steps, config.warmup_transactions);
     let durations = (0..config.samples)
         .map(|_| measure_sequence_body(&mut fixture, steps, config.body_transactions))
         .collect();
-    record_samples(
-        records,
+    records.record(
         "sequence",
         "step_rollback_body",
         operation_count(steps, config.body_transactions),
@@ -222,21 +219,21 @@ fn benchmark_count_durable(
     config: &Config,
     root: &BenchRoot,
     steps: usize,
-    records: &mut Vec<SampleRecord>,
+    records: &mut MachineRecords,
 ) {
-    let mut warmup =
-        CountFixture::create(&root.store_path(&format!("count-durable-{steps}-warmup")));
-    measure_count_durable(&mut warmup, steps, config.warmup_transactions);
+    {
+        let warmup_store = root.sample(&format!("count-durable-{steps}-warmup"));
+        let mut warmup = CountFixture::create(warmup_store.path());
+        measure_count_durable(&mut warmup, steps, config.warmup_transactions);
+    }
     let durations = (0..config.samples)
         .map(|sample| {
-            let mut fixture = CountFixture::create(
-                &root.store_path(&format!("count-durable-{steps}-sample-{sample}")),
-            );
+            let sample_store = root.sample(&format!("count-durable-{steps}-sample-{sample}"));
+            let mut fixture = CountFixture::create(sample_store.path());
             measure_count_durable(&mut fixture, steps, config.durable_transactions)
         })
         .collect();
-    record_samples(
-        records,
+    records.record(
         "count",
         "step_durable_transaction",
         operation_count(steps, config.durable_transactions),
@@ -250,21 +247,21 @@ fn benchmark_sequence_durable(
     config: &Config,
     root: &BenchRoot,
     steps: usize,
-    records: &mut Vec<SampleRecord>,
+    records: &mut MachineRecords,
 ) {
-    let mut warmup =
-        SequenceFixture::create(&root.store_path(&format!("sequence-durable-{steps}-warmup")));
-    measure_sequence_durable(&mut warmup, steps, config.warmup_transactions);
+    {
+        let warmup_store = root.sample(&format!("sequence-durable-{steps}-warmup"));
+        let mut warmup = SequenceFixture::create(warmup_store.path());
+        measure_sequence_durable(&mut warmup, steps, config.warmup_transactions);
+    }
     let durations = (0..config.samples)
         .map(|sample| {
-            let mut fixture = SequenceFixture::create(
-                &root.store_path(&format!("sequence-durable-{steps}-sample-{sample}")),
-            );
+            let sample_store = root.sample(&format!("sequence-durable-{steps}-sample-{sample}"));
+            let mut fixture = SequenceFixture::create(sample_store.path());
             measure_sequence_durable(&mut fixture, steps, config.durable_transactions)
         })
         .collect();
-    record_samples(
-        records,
+    records.record(
         "sequence",
         "step_durable_transaction",
         operation_count(steps, config.durable_transactions),

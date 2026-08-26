@@ -8,15 +8,21 @@ microbenchmark 外推成上层吞吐承诺。
 
 ## 当前 runner 与历史基线
 
-当前四个 benchmark target 已统一到 [`TESTING.md`](./TESTING.md) 定义的 runner 协议：逐样本
-JSON、完整环境指纹、计时外 oracle、隔离样本 Store，以及 `smoke`/`reference` 文件系统档位。
-`append_log_endurance` 还增加了独立 `smoke`/`full` workload、工作集和总写入硬预算、逐 cycle
-append/truncate 记录与 reopen checksum。
+当前四个 benchmark target 遵循[工作区测试协议](../../TESTING.md)。共享
+`dogpaddle-bench-protocol` 提供严格设置解析、环境指纹、typed JSONL、统计和配对顺序；Store
+自己的 `benches/support` 只保留 benchmark root、样本路径与人类格式薄适配。`ordered_map` 和
+`append_log` 的入口负责场景编排，并各自把 fixture、measure、oracle、report 放在同名子目录，
+不增加 Cargo target，也不把产品语义放进共享协议 crate。完整 Store 目录和配置见
+[`TESTING.md`](./TESTING.md)。
+
+`append_log_endurance` 另有独立 `smoke`/`full` workload、工作集和总写入硬预算、逐 cycle
+append/truncate 记录与 reopen checksum。所有 target 都输出完整环境指纹、计时外 oracle、隔离
+样本 Store，以及 `smoke`/`reference` 文件系统档位。
 
 下文 2026-08-25 数值是旧 runner 在明确记录的 WSL2 `/tmp` 环境中得到的历史优化证据，应保留
 用于解释设计决策；它们不能直接作为新 runner 的回归基线。建立新基线时必须在固定 reference
-目录重新运行，保存 stdout 中所有 `record=sample` 与 `record=pair_summary` JSON，再从同一协议的
-原始配对样本比较。
+目录重新运行，保存 stdout 中所有 `record=sample` 与 `record=pair_summary` JSONL，再从同一协议
+的原始配对样本比较。
 
 ## 结论摘要
 
@@ -277,6 +283,15 @@ durable overwrite 也出现约 0.8–2.7 ms/事务的整轮变化。这个波动
 
 ## 重新运行
 
+PR 中的规范 protocol smoke 入口是：
+
+```bash
+cargo xtask bench-smoke
+```
+
+它使用代码内固定的缩小矩阵实际运行工作区所有 benchmark。以下 Store 单 target 命令用于本地
+场景诊断，或在固定 reference 环境建立正式基线：
+
 ```bash
 cargo bench -p dogpaddle-store --bench cell
 cargo bench -p dogpaddle-store --bench ordered_map
@@ -297,7 +312,7 @@ DOGPADDLE_STORE_ENDURANCE_PROFILE=full \
 cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
-常用环境变量及 workload 解释见 [`README.md`](./README.md#性能)，运行档位、JSON schema 和预算见
-[`TESTING.md`](./TESTING.md)。做回归比较时必须固定机器、文件系统、Rust profile、records、
-record bytes、transaction 数与 codec；至少同时查看 paired ratio、胜出次数、min/median/max，
-并保留没有收益的结果。
+常用环境变量及 workload 解释见 [`README.md`](./README.md#性能)，Store 目录、运行档位和预算见
+[`TESTING.md`](./TESTING.md)，typed JSONL 与统一验证矩阵见[根目录 `TESTING.md`](../../TESTING.md)。
+做回归比较时必须固定机器、文件系统、Rust profile、records、record bytes、transaction 数与
+codec；至少同时查看 paired ratio、胜出次数、min/median/max，并保留没有收益的结果。

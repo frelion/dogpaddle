@@ -6,12 +6,14 @@ DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品�
 
 ## 构建、测试与开发命令
 
-- `cargo build --workspace`：使用工作区锁定的依赖构建四个产品 crate 和不可发布的集成测试包。
+- `cargo build --workspace`：使用工作区锁定的依赖构建四个产品 crate、不可发布的集成测试包与内部测试工具。
 - `cargo test --workspace`：运行单元测试、集成测试和文档测试。
 - `cargo test -p dogpaddle-change-store-integration`：只运行 Change 与 AppendLog 的外部组合测试。
 - `cargo test -p dogpaddle-store --test correctness transaction::`：运行指定公共测试区域；所有 crate 的公共测试 target 都统一命名为 `correctness`。
 - `cargo fmt --all -- --check`：检查格式，不修改文件。
 - `cargo clippy --workspace --all-targets -- -D warnings`：执行已配置的 `all` 和 `pedantic` Clippy 规则。若命令不可用，请先安装 Clippy rustup 组件。
+- `cargo xtask check`：运行格式、debug/release correctness、Clippy 与 Rustdoc 的统一工作区 gate。
+- `cargo xtask bench-smoke`：使用仓库固定的缩小参数实际执行全部 10 个 release benchmark target。
 - `cargo bench -p dogpaddle-store --bench cell`、`--bench ordered_map`、`--bench append_log`、`--bench append_log_endurance`：分别运行 Cell、OrderedMap、通用 AppendLog 和 AppendLog 长稳 release 基准测试；Change 使用 `change_core`/`change_codec`，Operation 使用 `operation_core`，Flow 冷路径使用 `flow_lifecycle`，Change + Store 使用 `change_append_log`/`change_append_log_endurance`。工作负载与口径见根目录 `TESTING.md` 及各自的测试或性能说明。
 
 请使用根目录 `Cargo.toml` 指定的 Rust 1.96 或更高版本。

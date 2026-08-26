@@ -4,6 +4,16 @@
 混成一个数字。结果只在相同 git revision、rustc、机器、profile 和文件系统上可比较；当前没有
 绝对吞吐 SLA。
 
+## 实现边界
+
+`dogpaddle-bench-protocol` 统一严格配置/profile 解析、主机指纹、typed JSONL writer/record 与
+持续时间统计，且不依赖 Change 或 Store。`benches/support/mod.rs` 只保留两个 target 共用的
+`BenchStoreRoot`/`SampleStore`、Change 解码错误适配与主机记录/JSONL 输出薄层；
+`benches/support/regular.rs` 只由有界正常路径编译，保留 `SampleWork`、workload 字段、
+投影解码适配和人类摘要。endurance 特有的固定窗口计划、文件峰值、reopen oracle 和
+稳定 `cycle_sample`/`endurance_summary` 字段仍留在 endurance target，只通过共享 typed
+`Fields`/extension record 输出，不冒充普通路径的标准 `sample`/`summary` schema。
+
 ## 有界正常路径
 
 `change_append_log` 使用同一组确定性 wide Change，并把 `rows/Change` 与
@@ -38,7 +48,7 @@ Change 与 full/内存 projection 的完整 Schema、array、diff 比较。
 | `DOGPADDLE_CHANGE_STORE_BENCH_MAX_WORKING_SET_BYTES` | 512 MiB | fixture 工作集硬预算 |
 
 启动时先用 checked arithmetic 检查事件 ID、工作集与 Arrow Binary 的 i32 offset 上限，再构造
-大 fixture。每条 sample JSONL 包含 elapsed ns、transactions、changes、rows、encoded/logical
+大 fixture。每条 typed sample JSONL 包含 elapsed ns、transactions、changes、rows、encoded/logical
 bytes 及每事务数据量；summary 给出 min/median/max 和基于 median 的吞吐。
 
 ## 长稳与空间复用
@@ -55,7 +65,7 @@ truncate 后的 peak。最终关闭、reopen 后重新生成预期 Change，一�
 字节、全量解码和顺序 checksum。长期内存队列只保存 offset、event seed、encoded length 和
 checksum，不复制 retained payload，避免 oracle 与 MDBX 争抢数百 MiB page cache。
 
-append 与 truncate 都从 `begin()` 前开始计时并包含 durable commit。逐 cycle JSONL 保留两类
+append 与 truncate 都从 `begin()` 前开始计时并包含 durable commit。逐 `cycle_sample` JSONL 保留两类
 原始 latency、append/truncate 后的文件尺寸及 head/target/tail/removed 进度；机器可读摘要报告
 p50/p95/p99/max、initial/seed/final/reopened/peak logical/allocated bytes、验证 checksum 和相对
 retained encoded bytes 的 allocated amplification。可比较的 `protocol_ns` 是所有 durable append
@@ -96,7 +106,18 @@ cargo bench -p dogpaddle-change-store-integration --bench change_append_log_endu
 OS/arch/kernel、CPU、并行度、resolved filesystem path、`df` mount 信息、MDBX durable sync mode
 和完整 workload 配置。
 
-stdout 同时包含人类摘要和单行 JSON records；reference runner 应保存完整 stdout，再筛选以
+stdout 同时包含人类摘要和单行 typed JSON records；所有机器字段都经 validated `Fields`
+构造，不接受本地拼接的裸 JSON fragment。reference runner 应保存完整 stdout，再筛选以
 `{` 开头的记录形成 JSONL，并以同 sample index 做配对分析。不要比较不同文件系统上的 durable
 commit，也不要把 reopen 称为 cold cache。没有稳定历史基线前只报告数据，不在普通
 `cargo test` 中加入 wall-clock 断言。
+
+PR 的 benchmark 协议验证使用根 xtask 内置的固定缩小参数；xtask 会先移除继承的
+`DOGPADDLE_*` 变量再注入该 target 的完整配置，不从个人 shell 历史复制配置：
+
+```bash
+cargo xtask bench-smoke
+```
+
+性能统一协议、完整 smoke matrix 和 reference runner 规则以根目录
+[`TESTING.md`](../../TESTING.md) 为准。

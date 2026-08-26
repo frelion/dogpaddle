@@ -5,6 +5,8 @@ members = [
     "crates/operation",
     "crates/store",
     "integration-tests/change-store",
+    "test-support/bench-protocol",
+    "tools/xtask",
 ]
 resolver = "3"
 
@@ -18,13 +20,16 @@ arrow-array = "=59.2.0"
 arrow-buffer = "=59.2.0"
 arrow-ipc = "=59.2.0"
 arrow-schema = "=59.2.0"
-flatbuffers = { version = "=25.12.19", default-features = false }
-libmdbx = { version = "=0.6.6", default-features = false }
-thiserror = "=2.0.20"
-tempfile = "=3.27.0"
+dogpaddle-bench-protocol = { path = "test-support/bench-protocol" }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-operation = { path = "crates/operation" }
 dogpaddle-store = { path = "crates/store" }
+flatbuffers = { version = "=25.12.19", default-features = false }
+libmdbx = { version = "=0.6.6", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+tempfile = "=3.27.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

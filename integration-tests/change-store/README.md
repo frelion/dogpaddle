@@ -10,6 +10,11 @@ oracle 和 workload，不能形成新的产品抽象。
 
 manifest 关闭自动 test/bench 发现，只显式声明一个 `correctness` target 和两套性能协议。
 
+benchmark 作为 dev target 使用零产品依赖的 `dogpaddle-bench-protocol`：共享 crate 只负责
+严格 profile/环境变量解析、rustc/CPU/git/文件系统指纹、持续时间统计与 typed JSONL。
+本 package 仍拥有 Change fixture/oracle、Store 生命周期、workload 字段、计时边界、严格结果
+比较和人类可读摘要；共享协议不吸收 Change 或 Store 语义。
+
 ## 目录
 
 - `tests/correctness.rs`：单一公共 API 集成 target；子模块按 entry、scan、sequence 和
@@ -19,6 +24,10 @@ manifest 关闭自动 test/bench 发现，只显式声明一个 `correctness` ta
 - `benches/change_append_log.rs`：有界正常路径，区分 rows/Change 与 Changes/transaction。
 - `benches/change_append_log_endurance.rs`：固定 retained encoded-byte 窗口的 append、前缀回收、
   空间复用和 reopen 长稳协议。
+- `benches/support/mod.rs`：两个 target 共用的本地 `BenchStoreRoot`/`SampleStore`、Change 解码适配
+  与 typed environment/JSONL 输出薄层。
+- `benches/support/regular.rs`：只由 `change_append_log` 编译，拥有普通路径的 `SampleWork`、
+  checked workload 运算、投影解码适配、typed configuration/sample/summary 与人类摘要。
 - [`PERFORMANCE.md`](./PERFORMANCE.md)：计时边界、环境变量、原始样本和 reference 运行规则。
 
 ## 正确性
@@ -56,7 +65,16 @@ cargo bench -p dogpaddle-change-store-integration --bench change_append_log
 
 长稳的 `full` workload 还需要同时设置
 `DOGPADDLE_CHANGE_STORE_ENDURANCE_PROFILE=full`。所有 fixture、预热、严格结果比较和临时目录
-清理都在计时外。stdout 中每个以 `{` 开头的行都是可筛选为 JSONL 的 environment、configuration、
-sample 或 summary record；正式运行必须保存这些原始记录，不能只复制控制台摘要。
+清理都在计时外。stdout 中每个以 `{` 开头的行都是通过共享 typed record 与
+validated `Fields` 输出的 JSONL：普通路径使用标准 environment、configuration、sample、summary，
+长稳路径另使用 `cycle_sample` 与 `endurance_summary` extension；本地 support 不拼接 JSON
+fragment。正式运行必须保存这些原始记录，不能只复制控制台摘要。
 
-全工作区的测试所有权、目录约束与统一数据规格见根目录 [`TESTING.md`](../../TESTING.md)。
+PR 不手工复制缩小环境变量；使用根 xtask 中受审查的 release smoke matrix：
+
+```bash
+cargo xtask bench-smoke
+```
+
+全工作区的测试所有权、typed benchmark 协议、smoke matrix 与 reference 规则
+以根目录 [`TESTING.md`](../../TESTING.md) 为准。

@@ -2,15 +2,15 @@
 
 use std::{hint::black_box, time::Duration};
 
+use dogpaddle_bench_protocol::{
+    ConfigurationRecord, DurationSummary, Fields, SampleRecord, SummaryRecord, positive_usize,
+};
 use dogpaddle_store::{Cell, Store, Transactions};
 use tempfile::TempDir;
 
 mod support;
 
-use support::{
-    SampleWork, average_duration, emit_configuration, emit_samples, emit_summary, format_duration,
-    initialize, sample_dir, setting,
-};
+use support::{average_duration, format_duration, initialize, sample_dir, write_record};
 
 const DEFAULT_READS: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
@@ -20,6 +20,13 @@ struct Fixture {
     transactions: Transactions,
     cell: Cell<u64>,
     _root: TempDir,
+}
+
+#[derive(Clone, Copy)]
+struct SampleWork {
+    operations: usize,
+    transactions: usize,
+    logical_bytes: usize,
 }
 
 impl Fixture {
@@ -51,15 +58,23 @@ impl Fixture {
 }
 
 fn main() {
-    initialize("store_cell");
+    let _bench_root = initialize("store_cell");
 
-    let reads = setting("DOGPADDLE_BENCH_CELL_READS", DEFAULT_READS);
-    let commits = setting("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS);
-    let samples = setting("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES);
-    emit_configuration(
-        "store_cell",
-        &format!("\"reads\":{reads},\"commits\":{commits},\"samples\":{samples}"),
-    );
+    let reads =
+        positive_usize("DOGPADDLE_BENCH_CELL_READS", DEFAULT_READS).expect("parse Cell read count");
+    let commits = positive_usize("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS)
+        .expect("parse Cell commit count");
+    let samples = positive_usize("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES)
+        .expect("parse Cell sample count");
+    let mut fields = Fields::new();
+    for (name, value) in [("reads", reads), ("commits", commits), ("samples", samples)] {
+        fields
+            .insert(name, value)
+            .expect("construct Cell configuration fields");
+    }
+    let record = ConfigurationRecord::new("store_cell", fields)
+        .expect("construct Cell configuration record");
+    write_record(&record);
 
     println!("DogPaddle Cell benchmark");
     println!("reads={reads} commits={commits} samples={samples}");
@@ -73,15 +88,24 @@ fn main() {
     );
 
     let mut fixture = Fixture::populated();
-    report("hot get, one tx", reads, 1, 8 * reads, samples, || {
-        measure_get(&mut fixture, reads)
-    });
+    report(
+        "hot get, one tx",
+        SampleWork {
+            operations: reads,
+            transactions: 1,
+            logical_bytes: 8 * reads,
+        },
+        samples,
+        || measure_get(&mut fixture, reads),
+    );
 
     report(
         "read + update + commit",
-        commits,
-        commits,
-        16 * commits,
+        SampleWork {
+            operations: commits,
+            transactions: commits,
+            logical_bytes: 16 * commits,
+        },
         samples,
         || {
             let mut fixture = Fixture::populated();
@@ -155,33 +179,48 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
     elapsed
 }
 
-fn report(
-    workload: &str,
-    operations: usize,
-    transactions: usize,
-    logical_bytes: usize,
-    samples: usize,
-    mut measure: impl FnMut() -> Duration,
-) {
+fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl FnMut() -> Duration) {
     measure();
-    let mut durations = (0..samples).map(|_| measure()).collect::<Vec<_>>();
-    let work = SampleWork {
-        operations,
-        transactions,
-        logical_bytes,
-    };
-    emit_samples("store_cell", workload, "Cell", &durations, work);
-    emit_summary("store_cell", workload, "Cell", &durations, work);
-    durations.sort_unstable();
-    let min = durations[0];
-    let median = durations[durations.len() / 2];
-    let max = durations[durations.len() - 1];
-    let rate = operations as u128 * 1_000_000_000 / median.as_nanos();
-    let median_per_operation = average_duration(median, operations);
+    let durations = (0..samples).map(|_| measure()).collect::<Vec<_>>();
+    for (sample, elapsed) in durations.iter().copied().enumerate() {
+        let record = SampleRecord::new(
+            "store_cell",
+            workload,
+            sample,
+            elapsed,
+            measurement_fields(work),
+        )
+        .expect("construct Cell sample record");
+        write_record(&record);
+    }
+    let summary = DurationSummary::from_samples(&durations).expect("summarize Cell measurements");
+    let record = SummaryRecord::new("store_cell", workload, summary, measurement_fields(work))
+        .expect("construct Cell summary record");
+    write_record(&record);
+    let rate = work.operations as u128 * 1_000_000_000 / summary.median().as_nanos();
+    let median_per_operation = average_duration(summary.median(), work.operations);
     println!(
-        "{workload:<30} {operations:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
-        format_duration(min),
-        format_duration(median),
-        format_duration(max),
+        "{workload:<30} {:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
+        work.operations,
+        format_duration(summary.min()),
+        format_duration(summary.median()),
+        format_duration(summary.max()),
     );
+}
+
+fn measurement_fields(work: SampleWork) -> Fields {
+    let mut fields = Fields::new();
+    fields
+        .insert("variant", "Cell")
+        .expect("construct Cell variant field");
+    for (name, value) in [
+        ("operations", work.operations),
+        ("transactions", work.transactions),
+        ("logical_bytes", work.logical_bytes),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct Cell work fields");
+    }
+    fields
 }

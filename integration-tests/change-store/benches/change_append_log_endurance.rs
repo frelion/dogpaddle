@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dogpaddle_bench_protocol::{
+    ConfigurationRecord, ExtensionRecord, Fields, LatencySummary, require_benchmark_build, string,
+};
 use dogpaddle_change::{decode_change, encode_change};
 use dogpaddle_change_store_integration::{assert_change_eq, checksum_change, wide_change};
 use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError};
@@ -14,11 +17,23 @@ use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError};
 #[path = "support/mod.rs"]
 mod support;
 
-use support::{BenchStoreRoot, decode_entry, emit_host_environment, fold_checksum, setting};
+use support::{BenchStoreRoot, decode_entry, emit_host_environment, emit_record, setting};
 
 const MDBX_DATA_FILE: &str = "mdbx.dat";
 const DEFAULT_MAX_WORKING_SET_BYTES: usize = 1_073_741_824;
 const DEFAULT_MAX_TOTAL_WRITTEN_BYTES: usize = 1_099_511_627_776;
+
+macro_rules! json_fields {
+    ($($name:literal => $value:expr),+ $(,)?) => {{
+        let mut fields = Fields::new();
+        $(
+            fields
+                .insert($name, $value)
+                .expect(concat!("encode ", $name));
+        )+
+        fields
+    }};
+}
 
 struct Config {
     profile: String,
@@ -42,13 +57,6 @@ struct FileSize {
 struct FilePeaks {
     logical: u64,
     allocated: u64,
-}
-
-struct Latencies {
-    p50: Duration,
-    p95: Duration,
-    p99: Duration,
-    max: Duration,
 }
 
 struct RetainedEntry {
@@ -76,11 +84,156 @@ struct PreparedBatch {
     encoded_bytes: usize,
 }
 
-fn main() {
-    if cfg!(debug_assertions) {
-        eprintln!("change_append_log_endurance must run through `cargo bench`");
-        return;
+struct CycleSample {
+    cycle: usize,
+    append_duration: Duration,
+    truncate_duration: Duration,
+    head_before: u64,
+    target: u64,
+    tail: u64,
+    removed_entries: usize,
+    removed_bytes: usize,
+    retained_entries: usize,
+    retained_encoded_bytes: usize,
+    append_file: FileSize,
+    truncate_file: FileSize,
+}
+
+struct EnduranceSummary<'summary> {
+    plan: &'summary WorkloadPlan,
+    actual_written_bytes: usize,
+    protocol_elapsed: Duration,
+    wall_elapsed: Duration,
+    changes_per_second: u128,
+    rows_per_second: u128,
+    encoded_bytes_per_second: u128,
+    append: LatencySummary,
+    truncate: LatencySummary,
+    initial_file: FileSize,
+    seed_file: FileSize,
+    final_file: FileSize,
+    reopened_file: FileSize,
+    file_peaks: &'summary FilePeaks,
+    allocated_amplification_hundredths: u128,
+    validation_checksum: u64,
+}
+
+fn emit_configuration(config: &Config, plan: &WorkloadPlan) {
+    let fields = json_fields! {
+        "endurance_profile" => &config.profile,
+        "rows_per_change" => config.rows_per_change,
+        "changes_per_cycle" => config.changes_per_cycle,
+        "cycles" => config.cycles,
+        "payload_bytes" => config.payload_bytes,
+        "encoded_bytes_per_change" => plan.encoded_bytes_per_change,
+        "seed_entries" => plan.seed_entries,
+        "seed_encoded_bytes" => plan.seed_encoded_bytes,
+        "retained_encoded_bytes" => config.retained_encoded_bytes,
+        "truncate_items" => config.truncate_items.get(),
+        "max_working_set_bytes" => config.max_working_set_bytes,
+        "estimated_working_set_bytes" => plan.estimated_working_set_bytes,
+        "max_total_written_bytes" => config.max_total_written_bytes,
+        "estimated_total_written_bytes" => plan.total_written_bytes,
+    };
+    emit_record(
+        &ConfigurationRecord::new("change_append_log_endurance", fields)
+            .expect("build endurance configuration record"),
+    );
+}
+
+fn emit_cycle_sample(sample: &CycleSample) {
+    let fields = json_fields! {
+        "cycle" => sample.cycle,
+        "append_ns" => sample.append_duration.as_nanos(),
+        "truncate_ns" => sample.truncate_duration.as_nanos(),
+        "head_before" => sample.head_before,
+        "target" => sample.target,
+        "tail" => sample.tail,
+        "removed_entries" => sample.removed_entries,
+        "removed_bytes" => sample.removed_bytes,
+        "retained_entries" => sample.retained_entries,
+        "retained_encoded_bytes" => sample.retained_encoded_bytes,
+        "append_file_logical_bytes" => sample.append_file.logical,
+        "append_file_allocated_bytes" => sample.append_file.allocated,
+        "truncate_file_logical_bytes" => sample.truncate_file.logical,
+        "truncate_file_allocated_bytes" => sample.truncate_file.allocated,
+    };
+    emit_record(
+        &ExtensionRecord::new("cycle_sample", "change_append_log_endurance", fields)
+            .expect("build endurance sample record"),
+    );
+}
+
+fn emit_endurance_summary(summary: &EnduranceSummary<'_>) {
+    let mut fields = json_fields! {
+        "seed_entries" => summary.plan.seed_entries,
+        "seed_encoded_bytes" => summary.plan.seed_encoded_bytes,
+        "measured_changes" => summary.plan.measured_changes,
+        "measured_rows" => summary.plan.measured_rows,
+        "measured_encoded_bytes" => summary.plan.measured_encoded_bytes,
+        "actual_written_bytes" => summary.actual_written_bytes,
+        "protocol_ns" => summary.protocol_elapsed.as_nanos(),
+        "wall_ns" => summary.wall_elapsed.as_nanos(),
+        "changes_per_second" => summary.changes_per_second,
+        "rows_per_second" => summary.rows_per_second,
+        "encoded_bytes_per_second" => summary.encoded_bytes_per_second,
+    };
+    insert_latency_fields(&mut fields, "append", summary.append);
+    insert_latency_fields(&mut fields, "truncate", summary.truncate);
+    insert_file_fields(&mut fields, "initial", summary.initial_file);
+    insert_file_fields(&mut fields, "seed", summary.seed_file);
+    insert_file_fields(&mut fields, "final", summary.final_file);
+    insert_file_fields(&mut fields, "reopened", summary.reopened_file);
+    insert_file_fields(
+        &mut fields,
+        "peak",
+        FileSize {
+            logical: summary.file_peaks.logical,
+            allocated: summary.file_peaks.allocated,
+        },
+    );
+    fields
+        .insert(
+            "allocated_amplification_hundredths",
+            summary.allocated_amplification_hundredths,
+        )
+        .expect("encode allocation amplification");
+    fields
+        .insert(
+            "validation_checksum",
+            format!("{:#018x}", summary.validation_checksum),
+        )
+        .expect("encode validation checksum");
+    emit_record(
+        &ExtensionRecord::new("endurance_summary", "change_append_log_endurance", fields)
+            .expect("build endurance summary record"),
+    );
+}
+
+fn insert_latency_fields(fields: &mut Fields, prefix: &str, latency: LatencySummary) {
+    for (suffix, value) in [
+        ("p50_ns", latency.p50().as_nanos()),
+        ("p95_ns", latency.p95().as_nanos()),
+        ("p99_ns", latency.p99().as_nanos()),
+        ("max_ns", latency.max().as_nanos()),
+    ] {
+        fields
+            .insert(format!("{prefix}_{suffix}"), value)
+            .expect("encode endurance latency");
     }
+}
+
+fn insert_file_fields(fields: &mut Fields, prefix: &str, size: FileSize) {
+    fields
+        .insert(format!("{prefix}_file_logical_bytes"), size.logical)
+        .expect("encode logical file bytes");
+    fields
+        .insert(format!("{prefix}_file_allocated_bytes"), size.allocated)
+        .expect("encode allocated file bytes");
+}
+
+fn main() {
+    require_benchmark_build("change_append_log_endurance");
 
     let config = config();
     let batch_working_set_bytes = preflight_dimensions(&config);
@@ -103,23 +256,7 @@ fn main() {
     }
     let sample_store = stores.sample("change-append-log-endurance");
     emit_host_environment(&stores, "change_append_log_endurance");
-    println!(
-        "{{\"record\":\"configuration\",\"benchmark\":\"change_append_log_endurance\",\"endurance_profile\":\"{}\",\"rows_per_change\":{},\"changes_per_cycle\":{},\"cycles\":{},\"payload_bytes\":{},\"encoded_bytes_per_change\":{},\"seed_entries\":{},\"seed_encoded_bytes\":{},\"retained_encoded_bytes\":{},\"truncate_items\":{},\"max_working_set_bytes\":{},\"estimated_working_set_bytes\":{},\"max_total_written_bytes\":{},\"estimated_total_written_bytes\":{}}}",
-        config.profile,
-        config.rows_per_change,
-        config.changes_per_cycle,
-        config.cycles,
-        config.payload_bytes,
-        plan.encoded_bytes_per_change,
-        plan.seed_entries,
-        plan.seed_encoded_bytes,
-        config.retained_encoded_bytes,
-        config.truncate_items,
-        config.max_working_set_bytes,
-        plan.estimated_working_set_bytes,
-        config.max_total_written_bytes,
-        plan.total_written_bytes
-    );
+    emit_configuration(&config, &plan);
     println!(
         "Change + AppendLog endurance: profile={} rows/change={} changes/cycle={} cycles={} payload_bytes={} retained_encoded_bytes={} truncate_items={}",
         config.profile,
@@ -304,17 +441,20 @@ fn run(config: &Config, plan: &WorkloadPlan, store_path: &Path) {
         truncate_durations.push(truncate_duration);
         let file = data_file_size(store_path);
         file_peaks.observe(file);
-        println!(
-            "{{\"record\":\"sample\",\"benchmark\":\"change_append_log_endurance\",\"cycle\":{cycle},\"append_ns\":{},\"truncate_ns\":{},\"head_before\":{head_before},\"target\":{target},\"tail\":{next_offset},\"removed_entries\":{removed_entries},\"removed_bytes\":{removed_bytes},\"retained_entries\":{},\"retained_encoded_bytes\":{},\"append_file_logical_bytes\":{},\"append_file_allocated_bytes\":{},\"truncate_file_logical_bytes\":{},\"truncate_file_allocated_bytes\":{}}}",
-            append_duration.as_nanos(),
-            truncate_duration.as_nanos(),
-            retained.len(),
-            retained_bytes,
-            append_file.logical,
-            append_file.allocated,
-            file.logical,
-            file.allocated,
-        );
+        emit_cycle_sample(&CycleSample {
+            cycle,
+            append_duration,
+            truncate_duration,
+            head_before,
+            target,
+            tail: next_offset,
+            removed_entries,
+            removed_bytes,
+            retained_entries: retained.len(),
+            retained_encoded_bytes: retained_bytes,
+            append_file,
+            truncate_file: file,
+        });
     }
     let wall_elapsed = wall_started.elapsed();
     let protocol_elapsed = total_duration(&append_durations)
@@ -330,8 +470,9 @@ fn run(config: &Config, plan: &WorkloadPlan, store_path: &Path) {
     file_peaks.observe(final_file);
     file_peaks.observe(reopened_file);
 
-    let append = Latencies::from_samples(&append_durations);
-    let truncate = Latencies::from_samples(&truncate_durations);
+    let append = LatencySummary::from_samples(&append_durations).expect("summarize append latency");
+    let truncate =
+        LatencySummary::from_samples(&truncate_durations).expect("summarize truncate latency");
     let rows_per_second = rate_per_second(plan.measured_rows, protocol_elapsed);
     let changes_per_second = rate_per_second(plan.measured_changes, protocol_elapsed);
     let encoded_bytes_per_second = rate_per_second(plan.measured_encoded_bytes, protocol_elapsed);
@@ -349,35 +490,24 @@ fn run(config: &Config, plan: &WorkloadPlan, store_path: &Path) {
     };
 
     black_box(validation_checksum);
-    println!(
-        "{{\"record\":\"summary\",\"benchmark\":\"change_append_log_endurance\",\"seed_entries\":{},\"seed_encoded_bytes\":{},\"measured_changes\":{},\"measured_rows\":{},\"measured_encoded_bytes\":{},\"actual_written_bytes\":{},\"protocol_ns\":{},\"wall_ns\":{},\"changes_per_second\":{changes_per_second},\"rows_per_second\":{rows_per_second},\"encoded_bytes_per_second\":{encoded_bytes_per_second},\"append_p50_ns\":{},\"append_p95_ns\":{},\"append_p99_ns\":{},\"append_max_ns\":{},\"truncate_p50_ns\":{},\"truncate_p95_ns\":{},\"truncate_p99_ns\":{},\"truncate_max_ns\":{},\"initial_file_logical_bytes\":{},\"initial_file_allocated_bytes\":{},\"seed_file_logical_bytes\":{},\"seed_file_allocated_bytes\":{},\"final_file_logical_bytes\":{},\"final_file_allocated_bytes\":{},\"reopened_file_logical_bytes\":{},\"reopened_file_allocated_bytes\":{},\"peak_file_logical_bytes\":{},\"peak_file_allocated_bytes\":{},\"allocated_amplification_hundredths\":{allocated_amplification_hundredths},\"validation_checksum\":\"{validation_checksum:#018x}\"}}",
-        plan.seed_entries,
-        plan.seed_encoded_bytes,
-        plan.measured_changes,
-        plan.measured_rows,
-        plan.measured_encoded_bytes,
+    emit_endurance_summary(&EnduranceSummary {
+        plan,
         actual_written_bytes,
-        protocol_elapsed.as_nanos(),
-        wall_elapsed.as_nanos(),
-        append.p50.as_nanos(),
-        append.p95.as_nanos(),
-        append.p99.as_nanos(),
-        append.max.as_nanos(),
-        truncate.p50.as_nanos(),
-        truncate.p95.as_nanos(),
-        truncate.p99.as_nanos(),
-        truncate.max.as_nanos(),
-        initial_file.logical,
-        initial_file.allocated,
-        seed_file.logical,
-        seed_file.allocated,
-        final_file.logical,
-        final_file.allocated,
-        reopened_file.logical,
-        reopened_file.allocated,
-        file_peaks.logical,
-        file_peaks.allocated,
-    );
+        protocol_elapsed,
+        wall_elapsed,
+        changes_per_second,
+        rows_per_second,
+        encoded_bytes_per_second,
+        append,
+        truncate,
+        initial_file,
+        seed_file,
+        final_file,
+        reopened_file,
+        file_peaks: &file_peaks,
+        allocated_amplification_hundredths,
+        validation_checksum,
+    });
     println!(
         "completed: seed_entries={} measured_changes={} measured_rows={} measured_encoded_bytes={} retained_entries={} retained_encoded_bytes={} protocol={} wall={} changes/s={changes_per_second} rows/s={rows_per_second} encoded_MiB/s={}.{:02}",
         plan.seed_entries,
@@ -393,17 +523,17 @@ fn run(config: &Config, plan: &WorkloadPlan, store_path: &Path) {
     );
     println!(
         "  append tx   p50={} p95={} p99={} max={}",
-        duration(append.p50),
-        duration(append.p95),
-        duration(append.p99),
-        duration(append.max)
+        duration(append.p50()),
+        duration(append.p95()),
+        duration(append.p99()),
+        duration(append.max())
     );
     println!(
         "  truncate tx p50={} p95={} p99={} max={}",
-        duration(truncate.p50),
-        duration(truncate.p95),
-        duration(truncate.p99),
-        duration(truncate.max)
+        duration(truncate.p50()),
+        duration(truncate.p95()),
+        duration(truncate.p99()),
+        duration(truncate.max())
     );
     println!(
         "  file initial(logical/allocated)={}/{} seed={}/{} final={}/{} reopened={}/{} peak={}/{} allocated_amplification={}.{:02}x",
@@ -426,8 +556,8 @@ fn run(config: &Config, plan: &WorkloadPlan, store_path: &Path) {
 }
 
 fn config() -> Config {
-    let profile = std::env::var("DOGPADDLE_CHANGE_STORE_ENDURANCE_PROFILE")
-        .unwrap_or_else(|_| "smoke".to_owned());
+    let profile = string("DOGPADDLE_CHANGE_STORE_ENDURANCE_PROFILE", "smoke")
+        .expect("load Change + Store endurance workload profile");
     let defaults = match profile.as_str() {
         "smoke" => (256, 8, 16, 128, 4 * 1024 * 1024, 64),
         "full" => (4_096, 32, 500, 1_024, 512 * 1024 * 1024, 4_096),
@@ -671,6 +801,10 @@ fn total_duration(samples: &[Duration]) -> Duration {
         })
 }
 
+fn fold_checksum(state: u64, value: u64) -> u64 {
+    state.rotate_left(11) ^ value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 fn rate_per_second(value: usize, elapsed: Duration) -> u128 {
     assert!(!elapsed.is_zero());
     u128::try_from(value)
@@ -766,30 +900,6 @@ impl FilePeaks {
         self.logical = self.logical.max(size.logical);
         self.allocated = self.allocated.max(size.allocated);
     }
-}
-
-impl Latencies {
-    fn from_samples(samples: &[Duration]) -> Self {
-        assert!(!samples.is_empty(), "latency samples cannot be empty");
-        let mut sorted = samples.to_vec();
-        sorted.sort_unstable();
-        Self {
-            p50: percentile(&sorted, 50),
-            p95: percentile(&sorted, 95),
-            p99: percentile(&sorted, 99),
-            max: *sorted.last().expect("non-empty latency samples"),
-        }
-    }
-}
-
-fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
-    assert!((1..=100).contains(&percentile));
-    let rank = sorted
-        .len()
-        .checked_mul(percentile)
-        .expect("percentile rank fits usize")
-        .div_ceil(100);
-    sorted[rank - 1]
 }
 
 fn data_file_size(store_path: &Path) -> FileSize {

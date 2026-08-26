@@ -1,18 +1,22 @@
 use std::{hint::black_box, time::Instant};
 
+use dogpaddle_bench_protocol::require_benchmark_build;
 use dogpaddle_change::{Change, ChangeProjection, encode_change};
 use dogpaddle_change_store_integration::{
     EncodedWorkload, assert_change_eq, encoded_wide_workload,
 };
 use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError, Transactions};
 
+#[path = "support/regular.rs"]
+mod regular_support;
 #[path = "support/mod.rs"]
 mod support;
 
-use support::{
-    BenchStoreRoot, SampleWork, checked_product, checked_sum, decode_entry, decode_projected_entry,
-    emit_environment, emit_sample, report, setting,
+use regular_support::{
+    SampleWork, checked_product, checked_sum, decode_projected_entry, emit_environment,
+    emit_sample, report,
 };
+use support::{BenchStoreRoot, decode_entry, setting};
 
 const DEFAULT_ROWS_PER_CHANGE: usize = 1_024;
 const DEFAULT_CHANGES_PER_TX: usize = 32;
@@ -44,10 +48,7 @@ struct Config {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        eprintln!("change_append_log must run through `cargo bench`");
-        return;
-    }
+    require_benchmark_build("change_append_log");
 
     let config = Config {
         rows_per_change: setting(
@@ -199,7 +200,7 @@ fn benchmark_preencoded_append_rollback(
         emit_sample(scenario, sample, elapsed, work);
         durations.push(elapsed);
     }
-    report(scenario, &mut durations, work);
+    report(scenario, &durations, work);
 }
 
 fn run_preencoded_append_rollback(
@@ -255,7 +256,7 @@ fn benchmark_preencoded_append_durable(
         emit_sample(scenario, sample, elapsed, work);
         durations.push(elapsed);
     }
-    report(scenario, &mut durations, work);
+    report(scenario, &durations, work);
 }
 
 fn run_preencoded_append_durable(
@@ -300,7 +301,7 @@ fn benchmark_encode_append_durable(
         emit_sample(scenario, sample, elapsed, work);
         durations.push(elapsed);
     }
-    report(scenario, &mut durations, work);
+    report(scenario, &durations, work);
 }
 
 fn run_encode_append_durable(
@@ -363,7 +364,7 @@ fn benchmark_append_entry_forward(
         emit_sample(scenario, sample, elapsed, work);
         durations.push(elapsed);
     }
-    report(scenario, &mut durations, work);
+    report(scenario, &durations, work);
 }
 
 fn run_append_entry_forward(
@@ -490,7 +491,7 @@ fn benchmark_warm_scans(config: &Config, workload: &EncodedWorkload, stores: &Be
         emit_sample(raw_scenario, sample, elapsed, work);
         raw_durations.push(elapsed);
     }
-    report(raw_scenario, &mut raw_durations, work);
+    report(raw_scenario, &raw_durations, work);
 
     let mut durations: [Vec<std::time::Duration>; 3] =
         std::array::from_fn(|_| Vec::with_capacity(config.samples));
@@ -506,7 +507,7 @@ fn benchmark_warm_scans(config: &Config, workload: &EncodedWorkload, stores: &Be
         }
     }
     for (case, samples) in cases.into_iter().zip(&mut durations) {
-        report(case.scenario, samples, work);
+        report(case.scenario, samples.as_slice(), work);
     }
 
     // Re-run strict untimed comparisons after all samples so timing callbacks

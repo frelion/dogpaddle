@@ -23,8 +23,14 @@ crates/operation/
 ├── tests/fixtures/v1/           # Definition v1 黄金字节
 └── benches/
     ├── operation_core.rs        # codec、事务体与 durable transaction
-    └── support/mod.rs           # 配置、环境与原始样本输出
+    └── support/mod.rs           # 本地 Store 生命周期、workload 字段与报告适配
 ```
+
+benchmark 作为 dev target 使用零产品依赖的 `dogpaddle-bench-protocol`。共享 crate
+统一严格解析 benchmark/Cargo profile 与正整数环境变量，采集 rustc、CPU、git 和文件系统
+指纹，构造 typed JSONL record，并计算持续时间统计。本地 `benches/support/mod.rs` 只定义
+Operation 的环境变量名与默认 workload、`BenchRoot`/`SampleStore` 生命周期、业务字段和
+人类可读报告；fixture、计时边界与结果 oracle 仍由 `operation_core.rs` 拥有。
 
 `src/tests.rs` 可以访问私有 `DECODERS`、`DataName` 和类型擦除容器，因此负责 decoder tag 与内建
 Definition 集合双向一致、逻辑名合法唯一，以及实例按名称而非插入顺序绑定。duplicate、missing、
@@ -63,10 +69,16 @@ Definition codec 的 tag、payload 和完整字节是持久化兼容性边界。
 默认 `steps/transaction` 为 1、64、1024，分别观察单步成本和事务摊销。codec fixture、Store 创建、
 预热、期望值计算与状态校验均不计时；rollback body 与 durable workload 使用彼此独立的 Store，
 durable 预热及每个计入统计的样本也各自使用新 Store，避免页复用、缓存和状态历史串扰样本。
-每个样本输出 JSON，至少包含原始 `elapsed_ns`、operation 数、transaction 数和 steps/transaction；
+每个 durable 预热或测量样本在计时后先完成状态校验，再立即 drop 其 `SampleStore`；
+rollback body 的场景 Store 也在该场景验证完成后释放。runner 在输出样本前确认 run root 已无
+任何 sample 目录，不会把所有 Store 积累到整次 benchmark 结束。
+
+每个样本通过共享协议输出 typed JSONL，至少包含原始 `elapsed_ns`、operation 数、
+transaction 数和 steps/transaction；每个场景还输出协议统一的 min/median/max summary record。
 环境记录包含 rustc、OS/kernel、CPU、profile、git revision/state、文件系统和实际 Store 路径。
-stdout 同时包含便于本机阅读的摘要与 JSON；机器收集器只读取首字符为 `{` 的行。environment、
-config 和 sample 三种记录都带有 `"benchmark":"operation_core"`。
+stdout 同时包含便于本机阅读的摘要与 JSONL；机器收集器只读取首字符为 `{` 的行。
+environment、configuration、sample 和 summary 都由 typed record + validated `Fields` 构造，且带有
+`"benchmark":"operation_core"`；本地 support 不拼接 JSON fragment。
 
 Operation 当前一次 `step` 对应一个逻辑状态推进，没有 Change 行数概念，因此本 benchmark 只报告
 ns/operation 和 operation/transaction，不报告 rows/s。两个现有 Operation 都只覆写固定大小 Cell；
@@ -90,8 +102,8 @@ ns/operation 和 operation/transaction，不报告 rows/s。两个现有 Operati
 正式对比必须设置 `DOGPADDLE_OPERATION_BENCH_PROFILE=reference`，并把
 `DOGPADDLE_OPERATION_BENCH_STORE_DIR` 显式指向固定文件系统上的绝对路径；目录不存在时 runner
 会创建它，随后 canonicalize 并验证为目录。还必须固定 rustc、机器、同步模式和所有 workload
-参数。environment 与 config JSON 都用 `profile` 记录 `smoke|reference`，并用 `cargo_profile`
-单独记录声明的 Rust 构建 profile；environment 还记录 debug assertions。默认
+参数。environment 与 configuration JSON 都用 `profile` 记录 `smoke|reference`；environment
+还单独记录声明的 Rust 构建 profile 与 debug assertions。默认
 `cargo bench` 声明为 `bench`；使用 `--profile <name>` 时必须同时设置
 `DOGPADDLE_CARGO_PROFILE=<name>`。未建立 reference 基线前只保存
 并比较原始配对样本，不规定绝对 SLA。
@@ -106,6 +118,11 @@ cargo clippy -p dogpaddle-operation --all-targets -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 
 cargo bench -p dogpaddle-operation --bench operation_core
+
+# PR 级全工作区检查与固定缩小参数的 release benchmark smoke
+cargo xtask check
+cargo xtask bench-smoke
 ```
 
-全工作区的测试所有权与统一性能规则见根目录 `TESTING.md`。
+单个 target 命令用于本地迭代；PR 必须使用上述两个 xtask 入口。全工作区的测试所有权、
+typed benchmark 协议、smoke matrix 与 reference 规则以根目录 [`TESTING.md`](../../TESTING.md) 为准。

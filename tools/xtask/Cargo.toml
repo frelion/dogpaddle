@@ -1,0 +1,16 @@
+[package]
+name = "dogpaddle-xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "dogpaddle-xtask"
+path = "src/main.rs"
+bench = false
+
+[lints]
+workspace = true

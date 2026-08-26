@@ -1,9 +1,9 @@
 # dogpaddle-change 性能协议
 
-本文件定义可复现的 Change 单体基准，不把某台开发机的一次运行包装成产品吞吐承诺。正式基线
-必须记录 git revision、实际 rustc、声明的 Cargo profile、CPU、OS/arch/kernel 和负载参数，并在固定机器
-上保存原始配对样本。默认 `cargo bench` 记录 `bench`；使用 `--profile <name>` 时
-必须同时设置 `DOGPADDLE_CARGO_PROFILE=<name>`，完整协议见根目录 `TESTING.md`。
+本文件只定义 Change 单体 benchmark 的 workload、计时边界、配置和人类报告。统一的环境/profile
+规则、typed JSONL、统计与 reference 比较协议见[根目录测试协议](../../TESTING.md)。机械协议由内部
+crate `dogpaddle-bench-protocol` 提供；Change benchmark 仍在本地拥有 Arrow fixture、结果 oracle、
+尺寸预检、五种 codec case 的交错顺序和人类可读表格。
 
 ## 工作负载
 
@@ -32,7 +32,6 @@ index 下可配对的原始结果。结果等价验证位于计时外。
 
 | 环境变量 | 含义 |
 | --- | --- |
-| `DOGPADDLE_CARGO_PROFILE` | 显式 `--profile` 的同名声明；标准 `cargo bench` 留空 |
 | `DOGPADDLE_BENCH_CHANGE_ROWS` | 逗号分隔的 rows/Change |
 | `DOGPADDLE_BENCH_CHANGE_PAYLOAD_BYTES` | wide payload 每行字节数 |
 | `DOGPADDLE_BENCH_CHANGE_WORKLOADS` | 逗号分隔的 workload 名称 |
@@ -55,12 +54,8 @@ cargo bench -p dogpaddle-change --bench change_codec
 rows/s 和 encoded MiB/s。它们是 warm single-thread CPU 数量级，不是 Store、磁盘或 Flow 吞吐。
 真实持久化路径由 `dogpaddle-change-store-integration` 独立测量。
 
-控制台摘要之后有一个以明确起止标记包围的 CSV block，逐样本包含 workload、scenario、sample、
-elapsed ns、operations、rows/Change 和 encoded bytes/Change。运行头同时打印 rustc、OS、arch、
-kernel、git revision 和 working-tree 状态；reference runner 应保存完整 stdout，而不是只复制摘要。启动时会用 checked
-arithmetic 预检 fixture 尺寸，并在分配前拒绝超过 Arrow i32 offset 容量的 Binary、Utf8 或 List
-配置。
-
-在建立 reference baseline 前不设置绝对 rows/s 门槛。后续回归比较必须固定 toolchain 与
-`Cargo.lock`，交错运行 baseline/candidate，保存每个原始样本，并用配对比而不是两次独立最小值
-判断变化。
+stdout 保留上述人类表格；每个以 `{` 开头的机器记录均由共享 writer 生成，是 typed JSONL
+`environment`、`configuration`、`sample` 或 `summary`。Change 的 sample/summary 扩展字段为
+`workload`、`operations`、`rows_per_change` 和 `encoded_bytes_per_change`；原始耗时与
+min/median/max 使用协议字段。启动时仍由 Change fixture 用 checked arithmetic 预检尺寸，并在分配
+前拒绝超过 Arrow i32 offset 容量的 Binary、Utf8 或 List 配置。

@@ -9,16 +9,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dogpaddle_bench_protocol::{
+    BenchmarkProfile, ConfigurationRecord, ExtensionRecord, Fields, LatencySummary, SampleRecord,
+    positive_usize, positive_usize_list, string,
+};
 use dogpaddle_store::{
     AppendLog, CodecError, ScanLimit, Store, StoreError, StoreValue, Transactions,
 };
 
 mod support;
 
-use support::{
-    SampleWork, emit_configuration, emit_sample, format_duration as duration, initialize,
-    json_string, sample_dir, setting, setting_list,
-};
+use support::{format_duration as duration, initialize, sample_dir, write_record};
 
 const DEFAULT_RECORD_BYTES: &[usize] = &[128, 1_024, 8_192];
 const DEFAULT_SMOKE_LOGICAL_MIB: usize = 8;
@@ -46,21 +47,14 @@ struct FileSize {
     allocated: u64,
 }
 
-struct Latencies {
-    p50: Duration,
-    p95: Duration,
-    p99: Duration,
-    max: Duration,
-}
-
 struct EnduranceResult {
     record_bytes: usize,
     batch_items: usize,
     window_items: usize,
     steady_epochs: usize,
     steady_records: usize,
-    append: Latencies,
-    gc: Latencies,
+    append: LatencySummary,
+    gc: LatencySummary,
     protocol_elapsed: Duration,
     wall_elapsed: Duration,
     seed_file: FileSize,
@@ -139,8 +133,8 @@ fn main() {
     let config = endurance_config();
     if config.profile == "full" {
         assert_eq!(
-            environment.profile(),
-            "reference",
+            environment.profile,
+            BenchmarkProfile::Reference,
             "the full Store endurance workload requires DOGPADDLE_STORE_BENCH_PROFILE=reference and DOGPADDLE_STORE_BENCH_STORE_DIR"
         );
     }
@@ -164,22 +158,30 @@ fn main() {
         budget.total_written_bytes,
         config.max_total_written_bytes
     );
-    emit_configuration(
-        "store_append_log_endurance",
-        &format!(
-            "\"endurance_profile\":{},\"record_bytes\":{:?},\"logical_mib_per_width\":{},\"window_mib\":{},\"batch_mib\":{},\"checkpoint_epochs\":{},\"max_working_set_bytes\":{},\"estimated_working_set_bytes\":{},\"max_total_written_bytes\":{},\"estimated_total_written_bytes\":{}",
-            json_string(&config.profile),
-            config.record_sizes,
-            config.logical_mib,
-            config.window_mib,
-            config.batch_mib,
-            config.checkpoint_epochs,
-            config.max_working_set_bytes,
-            budget.max_working_set_bytes,
-            config.max_total_written_bytes,
-            budget.total_written_bytes,
-        ),
-    );
+    let mut fields = Fields::new();
+    fields
+        .insert("endurance_profile", &config.profile)
+        .expect("construct endurance profile field");
+    fields
+        .insert("record_bytes", &config.record_sizes)
+        .expect("construct endurance record-size field");
+    for (name, value) in [
+        ("logical_mib_per_width", config.logical_mib),
+        ("window_mib", config.window_mib),
+        ("batch_mib", config.batch_mib),
+        ("checkpoint_epochs", config.checkpoint_epochs),
+        ("max_working_set_bytes", config.max_working_set_bytes),
+        ("estimated_working_set_bytes", budget.max_working_set_bytes),
+        ("max_total_written_bytes", config.max_total_written_bytes),
+        ("estimated_total_written_bytes", budget.total_written_bytes),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct endurance configuration fields");
+    }
+    let record = ConfigurationRecord::new("store_append_log_endurance", fields)
+        .expect("construct endurance configuration record");
+    write_record(&record);
 
     println!("DogPaddle AppendLog endurance benchmark");
     println!(
@@ -217,8 +219,8 @@ fn main() {
 }
 
 fn endurance_config() -> WorkloadConfig {
-    let profile =
-        std::env::var("DOGPADDLE_STORE_ENDURANCE_PROFILE").unwrap_or_else(|_| "smoke".to_owned());
+    let profile = string("DOGPADDLE_STORE_ENDURANCE_PROFILE", "smoke")
+        .expect("parse Store endurance workload profile");
     let defaults = match profile.as_str() {
         "smoke" => (
             DEFAULT_SMOKE_LOGICAL_MIB,
@@ -236,22 +238,32 @@ fn endurance_config() -> WorkloadConfig {
     };
     WorkloadConfig {
         profile,
-        record_sizes: setting_list(
+        record_sizes: positive_usize_list(
             "DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES",
             DEFAULT_RECORD_BYTES,
-        ),
-        logical_mib: setting("DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB", defaults.0),
-        window_mib: setting("DOGPADDLE_STORE_ENDURANCE_WINDOW_MIB", defaults.1),
-        batch_mib: setting("DOGPADDLE_STORE_ENDURANCE_BATCH_MIB", defaults.2),
-        checkpoint_epochs: setting("DOGPADDLE_STORE_ENDURANCE_CHECKPOINT_EPOCHS", defaults.3),
-        max_working_set_bytes: setting(
+        )
+        .expect("parse endurance record sizes"),
+        logical_mib: positive_usize("DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB", defaults.0)
+            .expect("parse endurance logical MiB"),
+        window_mib: positive_usize("DOGPADDLE_STORE_ENDURANCE_WINDOW_MIB", defaults.1)
+            .expect("parse endurance window MiB"),
+        batch_mib: positive_usize("DOGPADDLE_STORE_ENDURANCE_BATCH_MIB", defaults.2)
+            .expect("parse endurance batch MiB"),
+        checkpoint_epochs: positive_usize(
+            "DOGPADDLE_STORE_ENDURANCE_CHECKPOINT_EPOCHS",
+            defaults.3,
+        )
+        .expect("parse endurance checkpoint cadence"),
+        max_working_set_bytes: positive_usize(
             "DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES",
             DEFAULT_MAX_WORKING_SET_BYTES,
-        ),
-        max_total_written_bytes: setting(
+        )
+        .expect("parse endurance working-set budget"),
+        max_total_written_bytes: positive_usize(
             "DOGPADDLE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES",
             DEFAULT_MAX_TOTAL_WRITTEN_BYTES,
-        ),
+        )
+        .expect("parse endurance total-write budget"),
     }
 }
 
@@ -389,8 +401,10 @@ fn run_endurance(
         window_items,
         steady_epochs,
         steady_records,
-        append: summarize(run.append_durations),
-        gc: summarize(run.gc_durations),
+        append: LatencySummary::from_samples(&run.append_durations)
+            .expect("summarize endurance append latencies"),
+        gc: LatencySummary::from_samples(&run.gc_durations)
+            .expect("summarize endurance truncate latencies"),
         protocol_elapsed,
         wall_elapsed: run.wall_elapsed,
         seed_file,
@@ -456,11 +470,6 @@ fn run_protocol(
         .map(|record| record.encoded.len())
         .sum::<usize>();
     let scenario = format!("record_bytes={}", config.record_bytes);
-    let sample_work = SampleWork {
-        operations: batch_items,
-        transactions: 1,
-        logical_bytes: batch_logical_bytes,
-    };
     print_checkpoint(config.record_bytes, 0, head, tail, config.seed_file);
 
     let wall_started = Instant::now();
@@ -479,14 +488,15 @@ fn run_protocol(
             .expect("commit endurance append transaction");
         let append_duration = append_started.elapsed();
         assert_eq!(assigned, tail..tail + batch_items_u64);
-        emit_sample(
+        let record = SampleRecord::new(
             "store_append_log_endurance",
             &scenario,
-            "append",
             epoch - 1,
             append_duration,
-            sample_work,
-        );
+            sample_fields("append", batch_items, 1, batch_logical_bytes),
+        )
+        .expect("construct endurance append sample record");
+        write_record(&record);
         append_durations.push(append_duration);
         tail += batch_items_u64;
 
@@ -505,14 +515,15 @@ fn run_protocol(
             .expect("commit endurance GC transaction");
         let gc_duration = gc_started.elapsed();
         assert_eq!(next_head, target);
-        emit_sample(
+        let record = SampleRecord::new(
             "store_append_log_endurance",
             &scenario,
-            "truncate",
             epoch - 1,
             gc_duration,
-            sample_work,
-        );
+            sample_fields("truncate", batch_items, 1, batch_logical_bytes),
+        )
+        .expect("construct endurance truncate sample record");
+        write_record(&record);
         gc_durations.push(gc_duration);
         head = next_head;
 
@@ -632,26 +643,6 @@ fn verify_record(
     Ok(key ^ u64::from(fill) ^ diff.cast_unsigned())
 }
 
-fn summarize(mut samples: Vec<Duration>) -> Latencies {
-    samples.sort_unstable();
-    Latencies {
-        p50: percentile(&samples, 50),
-        p95: percentile(&samples, 95),
-        p99: percentile(&samples, 99),
-        max: *samples.last().expect("at least one latency sample exists"),
-    }
-}
-
-fn percentile(samples: &[Duration], percentile: usize) -> Duration {
-    let rank = samples
-        .len()
-        .checked_mul(percentile)
-        .expect("percentile rank fits in usize")
-        .div_ceil(100)
-        .saturating_sub(1);
-    samples[rank.min(samples.len() - 1)]
-}
-
 fn tail_spread_basis_points(samples: &[FileSize]) -> u64 {
     let tail = &samples[samples.len() / 2..];
     let minimum = tail
@@ -681,10 +672,26 @@ fn print_checkpoint(record_bytes: usize, epoch: usize, head: u64, tail: u64, siz
         bytes(size.logical),
         bytes(size.allocated)
     );
-    println!(
-        "{{\"record\":\"checkpoint\",\"benchmark\":\"store_append_log_endurance\",\"record_bytes\":{record_bytes},\"epoch\":{epoch},\"head\":{head},\"tail\":{tail},\"file_logical_bytes\":{},\"file_allocated_bytes\":{}}}",
-        size.logical, size.allocated,
-    );
+    let mut fields = Fields::new();
+    fields
+        .insert("record_bytes", record_bytes)
+        .expect("construct checkpoint record-width field");
+    fields
+        .insert("epoch", epoch)
+        .expect("construct checkpoint epoch field");
+    for (name, value) in [
+        ("head", head),
+        ("tail", tail),
+        ("file_logical_bytes", size.logical),
+        ("file_allocated_bytes", size.allocated),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct checkpoint fields");
+    }
+    let record = ExtensionRecord::new("checkpoint", "store_append_log_endurance", fields)
+        .expect("construct checkpoint record");
+    write_record(&record);
 }
 
 fn print_summary(results: &[EnduranceResult]) {
@@ -723,17 +730,17 @@ fn print_summary(results: &[EnduranceResult]) {
         );
         println!(
             "  append tx p50={} p95={} p99={} max={}",
-            duration(result.append.p50),
-            duration(result.append.p95),
-            duration(result.append.p99),
-            duration(result.append.max)
+            duration(result.append.p50()),
+            duration(result.append.p95()),
+            duration(result.append.p99()),
+            duration(result.append.max())
         );
         println!(
             "  GC tx     p50={} p95={} p99={} max={}",
-            duration(result.gc.p50),
-            duration(result.gc.p95),
-            duration(result.gc.p99),
-            duration(result.gc.max)
+            duration(result.gc.p50()),
+            duration(result.gc.p95()),
+            duration(result.gc.p99()),
+            duration(result.gc.max())
         );
         println!(
             "  protocol={} wall={} throughput={records_per_second:.0} records/s",
@@ -750,33 +757,86 @@ fn print_summary(results: &[EnduranceResult]) {
             "  validation=reopen+full-retained-scan checksum={:#018x}",
             result.validation_checksum
         );
-        println!(
-            "{{\"record\":\"endurance_summary\",\"benchmark\":\"store_append_log_endurance\",\"record_bytes\":{},\"batch_items\":{},\"window_items\":{},\"steady_epochs\":{},\"steady_records\":{},\"append_p50_ns\":{},\"append_p95_ns\":{},\"append_p99_ns\":{},\"append_max_ns\":{},\"truncate_p50_ns\":{},\"truncate_p95_ns\":{},\"truncate_p99_ns\":{},\"truncate_max_ns\":{},\"protocol_elapsed_ns\":{},\"wall_elapsed_ns\":{},\"seed_file_logical_bytes\":{},\"seed_file_allocated_bytes\":{},\"final_file_logical_bytes\":{},\"final_file_allocated_bytes\":{},\"peak_file_logical_bytes\":{},\"peak_file_allocated_bytes\":{},\"tail_allocated_spread_basis_points\":{},\"validation_checksum\":{}}}",
-            result.record_bytes,
-            result.batch_items,
-            result.window_items,
-            result.steady_epochs,
-            result.steady_records,
-            result.append.p50.as_nanos(),
-            result.append.p95.as_nanos(),
-            result.append.p99.as_nanos(),
-            result.append.max.as_nanos(),
-            result.gc.p50.as_nanos(),
-            result.gc.p95.as_nanos(),
-            result.gc.p99.as_nanos(),
-            result.gc.max.as_nanos(),
-            result.protocol_elapsed.as_nanos(),
-            result.wall_elapsed.as_nanos(),
-            result.seed_file.logical,
-            result.seed_file.allocated,
-            result.final_file.logical,
-            result.final_file.allocated,
-            result.peak_file.logical,
-            result.peak_file.allocated,
-            result.tail_allocated_spread_basis_points,
-            json_string(&format!("{:#018x}", result.validation_checksum)),
-        );
+        emit_endurance_summary(result);
     }
+}
+
+fn emit_endurance_summary(result: &EnduranceResult) {
+    let mut fields = Fields::new();
+    for (name, value) in [
+        ("record_bytes", result.record_bytes),
+        ("batch_items", result.batch_items),
+        ("window_items", result.window_items),
+        ("steady_epochs", result.steady_epochs),
+        ("steady_records", result.steady_records),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct endurance summary workload fields");
+    }
+    for (name, value) in [
+        ("append_p50_ns", result.append.p50().as_nanos()),
+        ("append_p95_ns", result.append.p95().as_nanos()),
+        ("append_p99_ns", result.append.p99().as_nanos()),
+        ("append_max_ns", result.append.max().as_nanos()),
+        ("truncate_p50_ns", result.gc.p50().as_nanos()),
+        ("truncate_p95_ns", result.gc.p95().as_nanos()),
+        ("truncate_p99_ns", result.gc.p99().as_nanos()),
+        ("truncate_max_ns", result.gc.max().as_nanos()),
+        ("protocol_elapsed_ns", result.protocol_elapsed.as_nanos()),
+        ("wall_elapsed_ns", result.wall_elapsed.as_nanos()),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct endurance summary timing fields");
+    }
+    for (name, value) in [
+        ("seed_file_logical_bytes", result.seed_file.logical),
+        ("seed_file_allocated_bytes", result.seed_file.allocated),
+        ("final_file_logical_bytes", result.final_file.logical),
+        ("final_file_allocated_bytes", result.final_file.allocated),
+        ("peak_file_logical_bytes", result.peak_file.logical),
+        ("peak_file_allocated_bytes", result.peak_file.allocated),
+        (
+            "tail_allocated_spread_basis_points",
+            result.tail_allocated_spread_basis_points,
+        ),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct endurance summary storage fields");
+    }
+    fields
+        .insert(
+            "validation_checksum",
+            format!("{:#018x}", result.validation_checksum),
+        )
+        .expect("construct endurance checksum field");
+    let record = ExtensionRecord::new("endurance_summary", "store_append_log_endurance", fields)
+        .expect("construct endurance summary record");
+    write_record(&record);
+}
+
+fn sample_fields(
+    variant: &str,
+    operations: usize,
+    transactions: usize,
+    logical_bytes: usize,
+) -> Fields {
+    let mut fields = Fields::new();
+    fields
+        .insert("variant", variant)
+        .expect("construct endurance variant field");
+    for (name, value) in [
+        ("operations", operations),
+        ("transactions", transactions),
+        ("logical_bytes", logical_bytes),
+    ] {
+        fields
+            .insert(name, value)
+            .expect("construct endurance work fields");
+    }
+    fields
 }
 
 fn data_file_size(store_path: &Path) -> FileSize {

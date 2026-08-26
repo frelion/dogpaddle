@@ -1,4 +1,9 @@
-use std::{hint::black_box, process::Command, time::Duration};
+use std::{hint::black_box, io, time::Duration};
+
+use dogpaddle_bench_protocol::{
+    ConfigurationRecord, DurationSummary, EnvironmentRecord, Fields, HostEnvironment, JsonlWriter,
+    SampleRecord, SummaryRecord, positive_usize, positive_usize_list, string_list,
+};
 
 use super::fixture::{DEFAULT_WORKLOADS, validate_dimensions};
 
@@ -7,8 +12,6 @@ const DEFAULT_PAYLOAD_BYTES: usize = 1_024;
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_TARGET_ROWS: usize = 65_536;
 const DEFAULT_MAX_CHANGES: usize = 1_024;
-#[allow(dead_code)]
-const MEBIBYTE_BYTES: u128 = 1_048_576;
 
 pub(crate) struct Config {
     pub(crate) rows: Vec<usize>,
@@ -25,31 +28,91 @@ pub(crate) struct Measurement {
     pub(crate) checksum: u64,
 }
 
-pub(crate) struct SampleRecord {
-    workload: &'static str,
-    scenario: &'static str,
-    sample: usize,
-    elapsed: Duration,
-    operations: usize,
-    rows_per_change: usize,
-    encoded_bytes_per_change: usize,
+#[derive(Clone, Copy)]
+pub(crate) struct Metric {
+    pub(crate) rows_per_change: usize,
+    pub(crate) encoded_bytes_per_change: usize,
+    pub(crate) operations: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BenchmarkCase {
+    pub(crate) workload: &'static str,
+    pub(crate) scenario: &'static str,
+    pub(crate) metric: Metric,
+}
+
+pub(crate) struct MachineRecords {
+    benchmark: &'static str,
+    samples: Vec<SampleRecord>,
+    summaries: Vec<SummaryRecord>,
+}
+
+impl Metric {
+    pub(crate) const fn new(
+        rows_per_change: usize,
+        encoded_bytes_per_change: usize,
+        operations: usize,
+    ) -> Self {
+        assert!(operations > 0, "benchmark operation count must be non-zero");
+        Self {
+            rows_per_change,
+            encoded_bytes_per_change,
+            operations,
+        }
+    }
+}
+
+impl BenchmarkCase {
+    pub(crate) const fn new(
+        workload: &'static str,
+        scenario: &'static str,
+        metric: Metric,
+    ) -> Self {
+        Self {
+            workload,
+            scenario,
+            metric,
+        }
+    }
+
+    pub(crate) fn label(self) -> String {
+        format!("{}/{}", self.workload, self.scenario)
+    }
+
+    fn fields(self) -> Fields {
+        Fields::new()
+            .with("workload", self.workload)
+            .expect("add Change benchmark workload")
+            .with("operations", self.metric.operations)
+            .expect("add Change benchmark operation count")
+            .with("rows_per_change", self.metric.rows_per_change)
+            .expect("add Change benchmark rows per Change")
+            .with(
+                "encoded_bytes_per_change",
+                self.metric.encoded_bytes_per_change,
+            )
+            .expect("add Change benchmark encoded size")
+    }
 }
 
 impl Config {
     pub(crate) fn load() -> Self {
-        let rows = setting_list("DOGPADDLE_BENCH_CHANGE_ROWS", DEFAULT_ROWS);
-        let payload_bytes = setting(
+        let rows = positive_usize_list("DOGPADDLE_BENCH_CHANGE_ROWS", DEFAULT_ROWS)
+            .expect("read Change benchmark row counts");
+        let payload_bytes = positive_usize(
             "DOGPADDLE_BENCH_CHANGE_PAYLOAD_BYTES",
             DEFAULT_PAYLOAD_BYTES,
-        );
-        let samples = setting("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES);
-        let target_rows = setting("DOGPADDLE_BENCH_CHANGE_TARGET_ROWS", DEFAULT_TARGET_ROWS);
-        let max_changes = setting("DOGPADDLE_BENCH_CHANGE_MAX_CHANGES", DEFAULT_MAX_CHANGES);
-        let workloads = string_list("DOGPADDLE_BENCH_CHANGE_WORKLOADS", DEFAULT_WORKLOADS);
-        assert!(rows.iter().all(|rows| *rows > 0));
-        assert!(payload_bytes > 0);
-        assert!(samples > 0 && target_rows > 0 && max_changes > 0);
-        assert!(!workloads.is_empty());
+        )
+        .expect("read Change benchmark payload size");
+        let samples = positive_usize("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES)
+            .expect("read Change benchmark sample count");
+        let target_rows = positive_usize("DOGPADDLE_BENCH_CHANGE_TARGET_ROWS", DEFAULT_TARGET_ROWS)
+            .expect("read Change benchmark target row count");
+        let max_changes = positive_usize("DOGPADDLE_BENCH_CHANGE_MAX_CHANGES", DEFAULT_MAX_CHANGES)
+            .expect("read Change benchmark maximum Change count");
+        let workloads = string_list("DOGPADDLE_BENCH_CHANGE_WORKLOADS", DEFAULT_WORKLOADS)
+            .expect("read Change benchmark workloads");
         for workload in &workloads {
             assert!(
                 DEFAULT_WORKLOADS.contains(&workload.as_str()),
@@ -77,7 +140,7 @@ impl Config {
         self.target_rows.div_ceil(rows).clamp(1, self.max_changes)
     }
 
-    pub(crate) fn print(&self, title: &str) {
+    pub(crate) fn print(&self, benchmark: &'static str, title: &str) {
         println!("{title}");
         println!(
             "rows/change={:?} target_rows/sample={} max_changes/sample={} samples={} payload_bytes={} workloads={:?}",
@@ -91,7 +154,101 @@ impl Config {
         println!(
             "execution=single-thread cache=warm setup=outside-timing validation=outside-timing"
         );
-        print_environment();
+        let environment = EnvironmentRecord::new(
+            benchmark,
+            HostEnvironment::collect(None).expect("collect Change benchmark environment"),
+            Fields::new(),
+        )
+        .expect("construct Change benchmark environment record");
+        let configuration = ConfigurationRecord::new(
+            benchmark,
+            Fields::new()
+                .with("rows_per_change", &self.rows)
+                .expect("add Change benchmark row counts")
+                .with("target_rows_per_sample", self.target_rows)
+                .expect("add Change benchmark target row count")
+                .with("max_changes_per_sample", self.max_changes)
+                .expect("add Change benchmark maximum Change count")
+                .with("samples", self.samples)
+                .expect("add Change benchmark sample count")
+                .with("payload_bytes", self.payload_bytes)
+                .expect("add Change benchmark payload size")
+                .with("workloads", &self.workloads)
+                .expect("add Change benchmark workloads")
+                .with("execution", "single_thread")
+                .expect("add Change benchmark execution policy")
+                .with("cache", "warm")
+                .expect("add Change benchmark cache policy")
+                .with("setup", "outside_timing")
+                .expect("add Change benchmark setup policy")
+                .with("validation", "outside_timing")
+                .expect("add Change benchmark validation policy"),
+        )
+        .expect("construct Change benchmark configuration record");
+        let stdout = io::stdout();
+        let mut writer = JsonlWriter::new(stdout.lock());
+        writer
+            .write(&environment)
+            .expect("write Change benchmark environment record");
+        writer
+            .write(&configuration)
+            .expect("write Change benchmark configuration record");
+        writer
+            .flush()
+            .expect("flush Change benchmark protocol records");
+    }
+}
+
+impl MachineRecords {
+    pub(crate) const fn new(benchmark: &'static str) -> Self {
+        Self {
+            benchmark,
+            samples: Vec::new(),
+            summaries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn print(&self) {
+        let stdout = io::stdout();
+        let mut writer = JsonlWriter::new(stdout.lock());
+        for sample in &self.samples {
+            writer
+                .write(sample)
+                .expect("write Change benchmark sample record");
+        }
+        for summary in &self.summaries {
+            writer
+                .write(summary)
+                .expect("write Change benchmark summary record");
+        }
+        writer
+            .flush()
+            .expect("flush Change benchmark protocol records");
+    }
+
+    pub(crate) fn record(&mut self, case: BenchmarkCase, measurements: &[Measurement]) {
+        let fields = case.fields();
+        for (sample, measurement) in measurements.iter().enumerate() {
+            self.samples.push(
+                SampleRecord::new(
+                    self.benchmark,
+                    case.scenario,
+                    sample,
+                    measurement.elapsed,
+                    fields.clone(),
+                )
+                .expect("construct Change benchmark sample record"),
+            );
+        }
+        self.summaries.push(
+            SummaryRecord::new(
+                self.benchmark,
+                case.scenario,
+                duration_summary(measurements),
+                fields,
+            )
+            .expect("construct Change benchmark summary record"),
+        );
     }
 }
 
@@ -108,227 +265,15 @@ pub(crate) fn timed(iterations: usize, mut operation: impl FnMut() -> u64) -> Me
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn print_core_header(description: &str) {
-    println!();
-    println!("=== {description} ===");
-    println!(
-        "{:<40} {:>10} {:>10} {:>12} {:>12} {:>12} {:>13}",
-        "workload", "rows/chg", "operations", "min/op", "median/op", "max/op", "rows/s"
-    );
+pub(crate) fn duration_summary(measurements: &[Measurement]) -> DurationSummary {
+    let durations = measurements
+        .iter()
+        .map(|measurement| measurement.elapsed)
+        .collect::<Vec<_>>();
+    DurationSummary::from_samples(&durations).expect("summarize Change benchmark measurements")
 }
 
-#[allow(dead_code)]
-pub(crate) fn print_codec_header(description: &str) {
-    println!();
-    println!("=== {description} ===");
-    println!(
-        "{:<40} {:>10} {:>10} {:>12} {:>12} {:>12} {:>12} {:>13} {:>14}",
-        "workload",
-        "rows/chg",
-        "changes",
-        "encoded B",
-        "min/chg",
-        "median/chg",
-        "max/chg",
-        "rows/s",
-        "encoded MiB/s"
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn report_rows(
-    workload: &'static str,
-    scenario: &'static str,
-    rows: usize,
-    encoded_bytes: usize,
-    iterations: usize,
-    samples: usize,
-    records: &mut Vec<SampleRecord>,
-    measure: impl FnMut() -> Measurement,
-) {
-    let measurements = collect_samples(iterations, samples, measure);
-    summarize_core(workload, scenario, rows, iterations, &measurements, true);
-    record_samples(
-        records,
-        workload,
-        scenario,
-        rows,
-        encoded_bytes,
-        iterations,
-        &measurements,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn report_latency(
-    workload: &'static str,
-    scenario: &'static str,
-    rows: usize,
-    encoded_bytes: usize,
-    iterations: usize,
-    samples: usize,
-    records: &mut Vec<SampleRecord>,
-    measure: impl FnMut() -> Measurement,
-) {
-    let measurements = collect_samples(iterations, samples, measure);
-    summarize_core(workload, scenario, rows, iterations, &measurements, false);
-    record_samples(
-        records,
-        workload,
-        scenario,
-        rows,
-        encoded_bytes,
-        iterations,
-        &measurements,
-    );
-}
-
-#[allow(dead_code)]
-pub(crate) fn summarize_codec(
-    workload: &str,
-    scenario: &str,
-    rows: usize,
-    encoded_bytes: usize,
-    iterations: usize,
-    measurements: &[Measurement],
-) {
-    let sorted = sorted_measurements(measurements);
-    let min = sorted[0].elapsed;
-    let median = sorted[sorted.len() / 2].elapsed;
-    let max = sorted[sorted.len() - 1].elapsed;
-    let elapsed_nanos = median.as_nanos().max(1);
-    let iterations_u128 = u128::try_from(iterations).expect("iteration count fits in u128");
-    let rows_u128 = u128::try_from(rows).expect("row count fits in u128");
-    let bytes_u128 = u128::try_from(encoded_bytes).expect("encoded byte count fits in u128");
-    let rows_per_second = rows_u128
-        .checked_mul(iterations_u128)
-        .and_then(|value| value.checked_mul(1_000_000_000))
-        .expect("benchmark row throughput numerator fits in u128")
-        / elapsed_nanos;
-    let encoded_mib_tenths_per_second = bytes_u128
-        .checked_mul(iterations_u128)
-        .and_then(|value| value.checked_mul(10_000_000_000))
-        .expect("benchmark byte throughput numerator fits in u128")
-        / elapsed_nanos
-        / MEBIBYTE_BYTES;
-    let label = format!("{workload}/{scenario}");
-    println!(
-        "{label:<40} {rows:>10} {iterations:>10} {encoded_bytes:>12} {:>12} {:>12} {:>12} {rows_per_second:>13} {:>11}.{:01}",
-        per_operation(min, iterations),
-        per_operation(median, iterations),
-        per_operation(max, iterations),
-        encoded_mib_tenths_per_second / 10,
-        encoded_mib_tenths_per_second % 10,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_samples(
-    records: &mut Vec<SampleRecord>,
-    workload: &'static str,
-    scenario: &'static str,
-    rows: usize,
-    encoded_bytes: usize,
-    iterations: usize,
-    measurements: &[Measurement],
-) {
-    records.extend(
-        measurements
-            .iter()
-            .enumerate()
-            .map(|(sample, measurement)| SampleRecord {
-                workload,
-                scenario,
-                sample,
-                elapsed: measurement.elapsed,
-                operations: iterations,
-                rows_per_change: rows,
-                encoded_bytes_per_change: encoded_bytes,
-            }),
-    );
-}
-
-pub(crate) fn print_sample_csv(records: &[SampleRecord]) {
-    println!();
-    println!("=== machine-readable sample CSV ===");
-    println!(
-        "workload,scenario,sample,elapsed_ns,operations,rows_per_change,encoded_bytes_per_change"
-    );
-    for record in records {
-        println!(
-            "{},{},{},{},{},{},{}",
-            record.workload,
-            record.scenario,
-            record.sample,
-            record.elapsed.as_nanos(),
-            record.operations,
-            record.rows_per_change,
-            record.encoded_bytes_per_change
-        );
-    }
-    println!("=== end machine-readable sample CSV ===");
-}
-
-#[allow(dead_code)]
-fn collect_samples(
-    iterations: usize,
-    samples: usize,
-    mut measure: impl FnMut() -> Measurement,
-) -> Vec<Measurement> {
-    let warm = measure();
-    black_box(warm.checksum);
-    let mut measurements = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        let measurement = measure();
-        assert_eq!(measurement.checksum, warm.checksum);
-        measurements.push(measurement);
-    }
-    assert!(iterations > 0);
-    measurements
-}
-
-#[allow(dead_code)]
-fn summarize_core(
-    workload: &str,
-    scenario: &str,
-    rows: usize,
-    iterations: usize,
-    measurements: &[Measurement],
-    report_rows_per_second: bool,
-) {
-    let sorted = sorted_measurements(measurements);
-    let min = sorted[0].elapsed;
-    let median = sorted[sorted.len() / 2].elapsed;
-    let max = sorted[sorted.len() - 1].elapsed;
-    let rows_per_second = report_rows_per_second.then(|| {
-        u128::try_from(rows)
-            .expect("row count fits in u128")
-            .checked_mul(u128::try_from(iterations).expect("iteration count fits in u128"))
-            .and_then(|value| value.checked_mul(1_000_000_000))
-            .expect("benchmark row throughput numerator fits in u128")
-            / median.as_nanos().max(1)
-    });
-    let rows_per_second = rows_per_second.map_or_else(|| "-".to_owned(), |value| value.to_string());
-    let label = format!("{workload}/{scenario}");
-    println!(
-        "{label:<40} {rows:>10} {iterations:>10} {:>12} {:>12} {:>12} {rows_per_second:>13}",
-        per_operation(min, iterations),
-        per_operation(median, iterations),
-        per_operation(max, iterations),
-    );
-}
-
-fn sorted_measurements(measurements: &[Measurement]) -> Vec<Measurement> {
-    assert!(!measurements.is_empty());
-    let mut sorted = measurements.to_vec();
-    sorted.sort_unstable_by_key(|measurement| measurement.elapsed);
-    sorted
-}
-
-fn per_operation(total: Duration, operations: usize) -> String {
+pub(crate) fn per_operation(total: Duration, operations: usize) -> String {
     let nanos =
         total.as_nanos() / u128::try_from(operations).expect("operation count fits in u128");
     duration(Duration::from_nanos(
@@ -344,121 +289,4 @@ fn duration(value: Duration) -> String {
     } else {
         format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
     }
-}
-
-fn print_environment() {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
-    let (cargo_profile, cargo_profile_source) = cargo_profile();
-    println!(
-        "environment rustc={:?} cargo_profile={cargo_profile:?} cargo_profile_source={cargo_profile_source} debug_assertions={} os={} arch={} cpu={:?} kernel={:?} git_revision={:?} git_dirty={}",
-        command_output(&rustc, &["--version"]),
-        cfg!(debug_assertions),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        cpu_description(),
-        command_output("uname", &["-sr"]),
-        command_output("git", &["rev-parse", "HEAD"]),
-        git_dirty()
-    );
-}
-
-fn cargo_profile() -> (String, &'static str) {
-    match std::env::var("DOGPADDLE_CARGO_PROFILE") {
-        Ok(profile) => {
-            assert!(
-                !profile.is_empty() && profile.trim() == profile,
-                "DOGPADDLE_CARGO_PROFILE must be a non-empty Cargo profile name without surrounding whitespace"
-            );
-            (profile, "environment")
-        }
-        Err(std::env::VarError::NotPresent) => ("bench".to_owned(), "default"),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("DOGPADDLE_CARGO_PROFILE must be valid Unicode")
-        }
-    }
-}
-
-fn cpu_description() -> String {
-    if std::env::consts::OS == "macos" {
-        let description = command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
-        if description != "unavailable" {
-            return description;
-        }
-    }
-    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
-        && let Some(description) = cpuinfo.lines().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            matches!(key.trim(), "model name" | "Hardware").then(|| value.trim().to_owned())
-        })
-    {
-        return description;
-    }
-    "unavailable".to_owned()
-}
-
-fn git_dirty() -> &'static str {
-    Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map_or("unavailable", |output| {
-            if output.stdout.is_empty() {
-                "false"
-            } else {
-                "true"
-            }
-        })
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> String {
-    Command::new(program)
-        .args(arguments)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_owned())
-        .filter(|output| !output.is_empty())
-        .unwrap_or_else(|| "unavailable".to_owned())
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
-        value.parse().expect("benchmark setting must be an integer")
-    })
-}
-
-fn setting_list(name: &str, default: &[usize]) -> Vec<usize> {
-    std::env::var(name).map_or_else(
-        |_| default.to_vec(),
-        |value| {
-            let parsed = value
-                .split(',')
-                .map(str::trim)
-                .map(|item| {
-                    item.parse::<usize>()
-                        .expect("benchmark list setting must contain integers")
-                })
-                .collect::<Vec<_>>();
-            assert!(!parsed.is_empty(), "benchmark list setting cannot be empty");
-            parsed
-        },
-    )
-}
-
-fn string_list(name: &str, default: &[&str]) -> Vec<String> {
-    std::env::var(name).map_or_else(
-        |_| default.iter().map(ToString::to_string).collect(),
-        |value| {
-            let parsed = value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            assert!(!parsed.is_empty(), "benchmark list setting cannot be empty");
-            parsed
-        },
-    )
 }

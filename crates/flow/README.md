@@ -89,7 +89,8 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 使用单一 `correctness` target 验证 crate 的公共行为。Flow 是 Operation 与 Store 的组合根，
 因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个重复的
-`flow-store` 集成 package。完整目录、fixture 规则与计时边界见 [`TESTING.md`](./TESTING.md)。
+`flow-store` 集成 package。完整目录、fixture 规则与计时边界见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。
 
 ## 当前边界
 
@@ -111,4 +112,4 @@ cargo bench -p dogpaddle-flow --bench flow_lifecycle
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
 `open`，按 Stage 数量逐轴扩展。它不报告 rows/s，也不声称代表尚未实现的 Stage 调度或运行时
 吞吐。正式结果必须在显式 reference 文件系统上保留逐样本 JSONL；配置与输出协议见
-[`TESTING.md`](./TESTING.md)。
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。

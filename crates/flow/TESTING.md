@@ -22,13 +22,18 @@ crates/flow/
 ├── tests/fixtures/v1/                 # 完整 Flow Definition 黄金字节
 └── benches/
     ├── flow_lifecycle.rs              # 唯一生命周期 benchmark
-    └── support/mod.rs                 # reference 路径、环境和 JSONL 输出
+    └── support/mod.rs                 # benchmark 根目录和临时 sample 路径
 ```
 
 `src/**/tests.rs` 可以访问私有 Definition、codec 和 Stage 字段，只验证无法通过公共 API 精确
 表达的实现契约。`tests/correctness.rs` 作为独立下游 crate，只使用 Flow、Operation 和 Store 的
 公共 API。公共持久化测试直接打开 Store 是有意的：Flow 拥有这些正常依赖，资源名称和类型又是
 Flow 的磁盘兼容性边界。测试 fixture 和 helper 不进入产品库，也不为测试扩张公共 API。
+
+benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命周期；`flow_lifecycle.rs` 拥有
+线性 DAG workload、计时边界、结果校验和人类摘要。严格 profile/配置解析、主机与文件系统指纹、
+持续时间统计和 typed JSONL record/writer 统一来自 `dogpaddle-bench-protocol`，共享 crate 不创建或
+打开 Flow，也不拥有 Store 生命周期。完整统一规则见[根目录测试协议](../../TESTING.md)。
 
 ## 正确性契约
 
@@ -80,20 +85,17 @@ Flow endurance，长期日志空间和 GC 属于已存在的 Store/Change+Store 
 
 环境变量：
 
-- `DOGPADDLE_CARGO_PROFILE=<name>`（仅在显式 `--profile <name>` 时设置）
 - `DOGPADDLE_FLOW_BENCH_PROFILE=smoke|reference`
 - `DOGPADDLE_FLOW_BENCH_STORE_DIR=/absolute/path`
 - `DOGPADDLE_FLOW_BENCH_STAGE_COUNTS=1,64,1024`
 - `DOGPADDLE_FLOW_BENCH_SAMPLES=9`
 - `DOGPADDLE_FLOW_BENCH_WARMUPS=2`
 
-stdout 中每个以 `{` 开头的行都是 JSONL `environment`、`configuration`、`sample` 或 `summary`
-record。environment 包含实际 rustc、声明的 Cargo profile、OS/arch/kernel、CPU、并行度、git
-revision/state、workload profile、MDBX sync、文件系统描述和实际基准根目录。正式比较只能在
-固定机器、Rust、profile 和显式
-reference 文件系统上保存并比较原始 sample；在建立重复基线前不设置绝对延迟 SLA。
-`cargo bench --profile <name>` 必须同时设置 `DOGPADDLE_CARGO_PROFILE=<name>`；默认
-`cargo bench` 自动声明为 `bench`。
+stdout 保留每个 scenario/stage count 的人类摘要；每个以 `{` 开头的机器记录均由共享 writer
+生成，是 typed JSONL `environment`、`configuration`、`sample` 或 `summary`。Flow 将 workload
+profile 与实际 benchmark 根目录交给协议记录，并补充 MDBX sync；configuration 记录本地的 stage
+counts 与 setup/cache 口径，sample/summary 补充 `stage_count`。Cargo profile、环境指纹和 reference
+比较规则不在本 crate 重复定义，统一遵循根目录协议。
 
 ## 命令
 

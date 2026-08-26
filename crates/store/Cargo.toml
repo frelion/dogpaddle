@@ -15,6 +15,7 @@ libmdbx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+dogpaddle-bench-protocol.workspace = true
 tempfile.workspace = true
 
 [[test]]
@@ -23,21 +24,25 @@ path = "tests/correctness.rs"
 
 [[bench]]
 name = "ordered_map"
+path = "benches/ordered_map.rs"
 harness = false
 test = false
 
 [[bench]]
 name = "cell"
+path = "benches/cell.rs"
 harness = false
 test = false
 
 [[bench]]
 name = "append_log"
+path = "benches/append_log.rs"
 harness = false
 test = false
 
 [[bench]]
 name = "append_log_endurance"
+path = "benches/append_log_endurance.rs"
 harness = false
 test = false
 

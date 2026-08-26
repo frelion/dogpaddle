@@ -28,7 +28,7 @@ crates/<crate>/
 ├── tests/correctness/*.rs       # 按领域能力分模块，不按历史阶段分组
 ├── tests/fixtures/v<N>/         # 版本化持久化黄金字节（需要时）
 ├── benches/<scenario>.rs        # 一个可解释成本边界一个 target（需要时）
-└── benches/support/             # 仅该 crate 的 fixture、runner、环境和报告
+└── benches/support/             # 仅该 crate 的 fixture、Store root、oracle 和人类报告薄适配
 ```
 
 跨 crate 接缝采用不可发布的下游 package：
@@ -47,8 +47,10 @@ integration-tests/<seam>/
 目标 crate 的公共 API；持久布局检查可以使用独立的磁盘格式适配器，但不得访问产品私有模块。
 
 测试支持代码保持在所有者目录内，不为共享 fixture 扩张产品 API，也不创建携带产品语义的
-“万能 test-utils” crate。只有真正跨 target 共用且不属于产品语义的 runner 代码才进入本地
-`benches/support/` 或外部集成 package 的 `src/`。
+“万能 test-utils” crate。`test-support/bench-protocol/` 是唯一的工作区级例外，只拥有严格环境
+变量解析、主机指纹、typed JSONL、持续时间统计和 AB/BA 样本顺序；它不依赖产品 crate，也不拥有
+fixture、Store 生命周期、workload、计时边界、结果 oracle 或人类报告。跨 test/bench 共用且包含
+产品语义的数据仍留在 owner 的 `tests/`、`benches/support/` 或外部集成 package 的 `src/`。
 
 ## 所有权和依赖方向
 
@@ -135,7 +137,8 @@ logical/allocated/peak bytes 和 reopen checksum。allocation calls/bytes 只有
 
 ### 可复现环境
 
-每个 benchmark 输出机器可读逐样本记录，并记录实际 rustc、OS/kernel、CPU、profile、git revision
+每个 benchmark 通过 `dogpaddle-bench-protocol` 输出具有稳定 discriminator 的 typed JSONL 逐样本
+记录，并记录实际 rustc、OS/kernel、CPU、profile、git revision
 与 dirty 状态；持久化基准还要记录实际文件系统路径和 durable sync mode。`smoke` 可使用临时目录，
 `reference` 必须显式指定固定文件系统。正式回归只比较同一 rustc、profile、机器、文件系统和
 workload 的原始配对样本；建立稳定基线前只报告结果，不凭空规定绝对 SLA。
@@ -147,6 +150,13 @@ workload 的原始配对样本；建立稳定基线前只报告结果，不凭�
 性能协议，不能进入 reference 基线。
 
 ## 验证层级
+
+工作区提供两个规范入口：`cargo xtask check` 依次运行格式、debug/release correctness、Clippy 和
+`-D warnings` Rustdoc；`cargo xtask bench-smoke` 使用代码内固定的缩小参数实际执行以下 10 个
+release target。
+benchmark smoke matrix 变更必须与 Cargo target 和本节同步评审，不能依赖个人 shell 历史。
+`bench-smoke` 会先清除父进程全部 `DOGPADDLE_*` 变量，再逐 target 注入受审查配置，避免本地
+workload filter、profile 或 Store 路径悄悄改变 PR gate。
 
 ### 日常正确性
 
@@ -175,12 +185,19 @@ cargo bench -p dogpaddle-change-store-integration --bench change_append_log_endu
 ```
 
 PR 必须运行全量 correctness、格式化、Clippy 和文档检查，并实际执行缩小配置的 benchmark
-protocol smoke。正式性能结果只由固定 reference runner 产生。
+protocol smoke，即：
+
+```bash
+cargo xtask check
+cargo xtask bench-smoke
+```
+
+正式性能结果只由固定 reference runner 产生。
 
 ### 全工作区静态检查
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```

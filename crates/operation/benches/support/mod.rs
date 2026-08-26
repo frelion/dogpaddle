@@ -1,17 +1,18 @@
 use std::{
-    env,
-    fmt::Write as _,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
+use dogpaddle_bench_protocol::{
+    BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
+    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
+    positive_usize_list,
+};
 use tempfile::TempDir;
 
 const PROFILE_ENV: &str = "DOGPADDLE_OPERATION_BENCH_PROFILE";
 const STORE_DIR_ENV: &str = "DOGPADDLE_OPERATION_BENCH_STORE_DIR";
-const CARGO_PROFILE_ENV: &str = "DOGPADDLE_CARGO_PROFILE";
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_CODEC_OPERATIONS: usize = 100_000;
 const DEFAULT_BODY_TRANSACTIONS: usize = 512;
@@ -29,25 +30,25 @@ pub(crate) struct Config {
 }
 
 pub(crate) struct BenchRoot {
-    profile: &'static str,
+    profile: BenchmarkProfile,
     filesystem_base: PathBuf,
     run_root: TempDir,
     _temporary_base: Option<TempDir>,
 }
 
-pub(crate) struct SampleRecord {
-    operation: &'static str,
-    scenario: &'static str,
-    sample: usize,
-    elapsed: Duration,
-    operations: usize,
-    transactions: usize,
-    steps_per_transaction: usize,
+pub(crate) struct SampleStore {
+    _root: TempDir,
+    store: PathBuf,
+}
+
+pub(crate) struct MachineRecords {
+    samples: Vec<SampleRecord>,
+    summaries: Vec<SummaryRecord>,
 }
 
 impl Config {
     pub(crate) fn load() -> Self {
-        let config = Self {
+        Self {
             samples: setting("DOGPADDLE_OPERATION_BENCH_SAMPLES", DEFAULT_SAMPLES),
             codec_operations: setting(
                 "DOGPADDLE_OPERATION_BENCH_CODEC_OPERATIONS",
@@ -65,64 +66,63 @@ impl Config {
                 "DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS",
                 DEFAULT_WARMUP_TRANSACTIONS,
             ),
-            steps: setting_list(
+            steps: positive_usize_list(
                 "DOGPADDLE_OPERATION_BENCH_STEPS_PER_TRANSACTION",
                 DEFAULT_STEPS,
-            ),
-        };
-        assert!(!config.steps.is_empty());
-        assert!(config.steps.iter().all(|steps| *steps > 0));
-        let mut sorted_steps = config.steps.clone();
-        sorted_steps.sort_unstable();
-        assert!(
-            sorted_steps.windows(2).all(|pair| pair[0] != pair[1]),
-            "DOGPADDLE_OPERATION_BENCH_STEPS_PER_TRANSACTION must not contain duplicate values"
-        );
-        config
+            )
+            .expect("load Operation benchmark step counts"),
+        }
     }
 
     pub(crate) fn codec_warmup_operations(&self) -> usize {
         self.codec_operations.min(1_000)
     }
 
-    pub(crate) fn emit(&self, profile: &str) {
-        let steps = self
-            .steps
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let (cargo_profile, cargo_profile_source) = cargo_profile();
-        println!(
-            "{{\"record\":\"config\",\"benchmark\":\"operation_core\",\"profile\":{},\"cargo_profile\":{},\"cargo_profile_source\":{},\"samples\":{},\"codec_operations_per_sample\":{},\"body_transactions_per_sample\":{},\"durable_transactions_per_sample\":{},\"warmup_transactions\":{},\"steps_per_transaction\":[{}]}}",
-            json_string(profile),
-            json_string(&cargo_profile),
-            json_string(cargo_profile_source),
-            self.samples,
-            self.codec_operations,
-            self.body_transactions,
-            self.durable_transactions,
-            self.warmup_transactions,
-            steps
+    pub(crate) fn emit(&self, profile: BenchmarkProfile) {
+        let mut fields = Fields::new();
+        fields
+            .insert("profile", profile)
+            .expect("encode Operation benchmark profile");
+        fields
+            .insert("samples", self.samples)
+            .expect("encode sample count");
+        fields
+            .insert("codec_operations_per_sample", self.codec_operations)
+            .expect("encode codec operation count");
+        fields
+            .insert("body_transactions_per_sample", self.body_transactions)
+            .expect("encode body transaction count");
+        fields
+            .insert("durable_transactions_per_sample", self.durable_transactions)
+            .expect("encode durable transaction count");
+        fields
+            .insert("warmup_transactions", self.warmup_transactions)
+            .expect("encode warmup transaction count");
+        fields
+            .insert("steps_per_transaction", &self.steps)
+            .expect("encode step counts");
+        emit_record(
+            &ConfigurationRecord::new("operation_core", fields)
+                .expect("build Operation configuration record"),
         );
     }
 }
 
 impl BenchRoot {
     pub(crate) fn from_environment() -> Self {
-        let profile = env::var(PROFILE_ENV).unwrap_or_else(|_| "smoke".to_owned());
-        let configured = env::var_os(STORE_DIR_ENV).map(PathBuf::from);
-        match profile.as_str() {
-            "smoke" => {
-                configured.map_or_else(Self::temporary, |base| Self::configured("smoke", &base))
+        let profile = BenchmarkProfile::from_environment(PROFILE_ENV)
+            .expect("load Operation benchmark profile");
+        let configured = std::env::var_os(STORE_DIR_ENV).map(PathBuf::from);
+        match profile {
+            BenchmarkProfile::Smoke => {
+                configured.map_or_else(Self::temporary, |base| Self::configured(profile, &base))
             }
-            "reference" => {
+            BenchmarkProfile::Reference => {
                 let base = configured.unwrap_or_else(|| {
                     panic!("{PROFILE_ENV}=reference requires an explicit {STORE_DIR_ENV}")
                 });
-                Self::configured("reference", &base)
+                Self::configured(profile, &base)
             }
-            _ => panic!("{PROFILE_ENV} must be smoke or reference"),
         }
     }
 
@@ -134,15 +134,15 @@ impl BenchRoot {
             .tempdir_in(&filesystem_base)
             .expect("create temporary operation benchmark run root");
         Self {
-            profile: "smoke",
+            profile: BenchmarkProfile::Smoke,
             filesystem_base,
             run_root,
             _temporary_base: Some(temporary_base),
         }
     }
 
-    fn configured(profile: &'static str, base: &Path) -> Self {
-        if profile == "reference" {
+    fn configured(profile: BenchmarkProfile, base: &Path) -> Self {
+        if profile == BenchmarkProfile::Reference {
             assert!(
                 base.is_absolute(),
                 "reference benchmark Store base must be an absolute path"
@@ -181,195 +181,153 @@ impl BenchRoot {
         }
     }
 
-    pub(crate) const fn profile(&self) -> &'static str {
+    pub(crate) const fn profile(&self) -> BenchmarkProfile {
         self.profile
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        self.run_root.path()
-    }
-
-    pub(crate) fn store_path(&self, name: &str) -> PathBuf {
-        self.path().join(name)
+    pub(crate) fn sample(&self, name: &str) -> SampleStore {
+        let root = tempfile::Builder::new()
+            .prefix(&format!("dogpaddle-{name}-"))
+            .tempdir_in(self.run_root.path())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "create Operation benchmark sample under {}: {error}",
+                    self.run_root.path().display()
+                )
+            });
+        let store = root.path().join("store");
+        SampleStore { _root: root, store }
     }
 
     pub(crate) fn emit_environment(&self) {
-        let rustc_program = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
-        let rustc = command_output(&rustc_program, &["--version"]);
-        let kernel = command_output("uname", &["-sr"]);
-        let cpu = cpu_name();
-        let revision = command_output("git", &["rev-parse", "HEAD"]);
-        let git_state = match Command::new("git").args(["status", "--porcelain"]).output() {
-            Ok(output) if output.status.success() && output.stdout.is_empty() => "clean".to_owned(),
-            Ok(output) if output.status.success() => "dirty".to_owned(),
-            _ => "unavailable".to_owned(),
-        };
-        let filesystem = filesystem(&self.filesystem_base);
-        let (cargo_profile, cargo_profile_source) = cargo_profile();
-        println!(
-            "{{\"record\":\"environment\",\"benchmark\":\"operation_core\",\"profile\":{},\"cargo_profile\":{},\"cargo_profile_source\":{},\"debug_assertions\":{},\"rustc\":{},\"os\":{},\"arch\":{},\"kernel\":{},\"cpu\":{},\"git_revision\":{},\"git_state\":{},\"filesystem_path\":{},\"filesystem\":{},\"store_root\":{},\"execution\":\"single-thread\",\"cache\":\"warm\",\"mdbx_sync_mode\":\"durable\"}}",
-            json_string(self.profile),
-            json_string(&cargo_profile),
-            json_string(cargo_profile_source),
-            cfg!(debug_assertions),
-            json_string(&rustc),
-            json_string(env::consts::OS),
-            json_string(env::consts::ARCH),
-            json_string(&kernel),
-            json_string(&cpu),
-            json_string(&revision),
-            json_string(&git_state),
-            json_string(&self.filesystem_base.display().to_string()),
-            json_string(&filesystem),
-            json_string(&self.path().display().to_string()),
+        let host = HostEnvironment::collect(Some(&self.filesystem_base))
+            .expect("collect Operation benchmark environment");
+        let mut fields = Fields::new();
+        fields
+            .insert("store_root", self.run_root.path().display().to_string())
+            .expect("encode benchmark Store root");
+        fields
+            .insert("execution", "single-thread")
+            .expect("encode execution mode");
+        fields.insert("cache", "warm").expect("encode cache mode");
+        fields
+            .insert("mdbx_sync_mode", "durable")
+            .expect("encode MDBX sync mode");
+        emit_record(
+            &EnvironmentRecord::for_profile("operation_core", self.profile, host, fields)
+                .expect("build Operation environment record"),
+        );
+    }
+
+    pub(crate) fn assert_samples_released(&self) {
+        assert!(
+            fs::read_dir(self.run_root.path())
+                .expect("read Operation benchmark run root")
+                .next()
+                .is_none(),
+            "validated Operation sample Stores must be released immediately"
         );
     }
 }
 
-pub(crate) fn record_samples(
-    records: &mut Vec<SampleRecord>,
-    operation: &'static str,
-    scenario: &'static str,
+impl SampleStore {
+    pub(crate) fn path(&self) -> &Path {
+        &self.store
+    }
+}
+
+impl MachineRecords {
+    pub(crate) const fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+            summaries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        operation: &str,
+        scenario: &str,
+        operations: usize,
+        transactions: usize,
+        steps_per_transaction: usize,
+        durations: Vec<Duration>,
+    ) {
+        assert!(operations > 0);
+        let summary =
+            DurationSummary::from_samples(&durations).expect("summarize Operation samples");
+        println!(
+            "{operation:<10} {scenario:<28} steps/tx={steps_per_transaction:<5} operations={operations:<9} min={} median={} max={}",
+            duration(summary.min()),
+            duration(summary.median()),
+            duration(summary.max())
+        );
+
+        let fields = measurement_fields(operation, operations, transactions, steps_per_transaction);
+        for (sample, elapsed) in durations.into_iter().enumerate() {
+            let mut sample_fields = fields.clone();
+            let ns_per_operation =
+                elapsed.as_nanos() / u128::try_from(operations).expect("operation count fits u128");
+            sample_fields
+                .insert("ns_per_operation", ns_per_operation)
+                .expect("encode per-operation duration");
+            self.samples.push(
+                SampleRecord::new("operation_core", scenario, sample, elapsed, sample_fields)
+                    .expect("build Operation sample record"),
+            );
+        }
+        self.summaries.push(
+            SummaryRecord::new("operation_core", scenario, summary, fields)
+                .expect("build Operation summary record"),
+        );
+    }
+
+    pub(crate) fn emit(&self) {
+        println!();
+        println!("=== machine-readable JSONL samples and summaries ===");
+        let stdout = io::stdout();
+        let mut writer = JsonlWriter::new(stdout.lock());
+        for sample in &self.samples {
+            writer
+                .write(sample)
+                .expect("write Operation benchmark sample record");
+        }
+        for summary in &self.summaries {
+            writer
+                .write(summary)
+                .expect("write Operation benchmark summary record");
+        }
+        writer
+            .flush()
+            .expect("flush Operation benchmark protocol records");
+    }
+}
+
+fn measurement_fields(
+    operation: &str,
     operations: usize,
     transactions: usize,
     steps_per_transaction: usize,
-    durations: Vec<Duration>,
-) {
-    assert!(!durations.is_empty());
-    assert!(operations > 0);
-    let mut sorted = durations.clone();
-    sorted.sort_unstable();
-    let min = sorted[0];
-    let median = sorted[sorted.len() / 2];
-    let max = sorted[sorted.len() - 1];
-    println!(
-        "{operation:<10} {scenario:<28} steps/tx={steps_per_transaction:<5} operations={operations:<9} min={} median={} max={}",
-        duration(min),
-        duration(median),
-        duration(max)
-    );
-    records.extend(
-        durations
-            .into_iter()
-            .enumerate()
-            .map(|(sample, elapsed)| SampleRecord {
-                operation,
-                scenario,
-                sample,
-                elapsed,
-                operations,
-                transactions,
-                steps_per_transaction,
-            }),
-    );
-}
-
-pub(crate) fn emit_samples(records: &[SampleRecord]) {
-    println!();
-    println!("=== machine-readable raw JSON samples ===");
-    for record in records {
-        let elapsed_ns = record.elapsed.as_nanos();
-        let operations = u128::try_from(record.operations).expect("operation count fits u128");
-        let ns_per_operation = elapsed_ns / operations;
-        println!(
-            "{{\"record\":\"sample\",\"benchmark\":\"operation_core\",\"operation\":{},\"scenario\":{},\"sample\":{},\"elapsed_ns\":{},\"operations\":{},\"transactions\":{},\"steps_per_transaction\":{},\"ns_per_operation\":{}}}",
-            json_string(record.operation),
-            json_string(record.scenario),
-            record.sample,
-            elapsed_ns,
-            record.operations,
-            record.transactions,
-            record.steps_per_transaction,
-            ns_per_operation
-        );
-    }
+) -> Fields {
+    Fields::new()
+        .with("operation", operation)
+        .expect("encode Operation name")
+        .with("operations", operations)
+        .expect("encode operation count")
+        .with("transactions", transactions)
+        .expect("encode transaction count")
+        .with("steps_per_transaction", steps_per_transaction)
+        .expect("encode step count")
 }
 
 fn setting(name: &str, default: usize) -> usize {
-    let value = env::var(name).map_or(default, |value| {
-        value
-            .parse::<usize>()
-            .unwrap_or_else(|_| panic!("{name} must be a positive integer"))
-    });
-    assert!(value > 0, "{name} must be positive");
-    value
+    positive_usize(name, default).expect("load positive Operation benchmark setting")
 }
 
-fn cargo_profile() -> (String, &'static str) {
-    match env::var(CARGO_PROFILE_ENV) {
-        Ok(profile) => {
-            assert!(
-                !profile.is_empty() && profile.trim() == profile,
-                "{CARGO_PROFILE_ENV} must be a non-empty Cargo profile name without surrounding whitespace"
-            );
-            (profile, "environment")
-        }
-        Err(env::VarError::NotPresent) => ("bench".to_owned(), "default"),
-        Err(env::VarError::NotUnicode(_)) => {
-            panic!("{CARGO_PROFILE_ENV} must be valid Unicode")
-        }
-    }
-}
-
-fn setting_list(name: &str, default: &[usize]) -> Vec<usize> {
-    env::var(name).map_or_else(
-        |_| default.to_vec(),
-        |value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .map(|item| {
-                    item.parse::<usize>()
-                        .unwrap_or_else(|_| panic!("{name} must be a comma-separated integer list"))
-                })
-                .collect()
-        },
-    )
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> String {
-    Command::new(program)
-        .args(arguments)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map_or_else(
-            || "unavailable".to_owned(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        )
-}
-
-fn cpu_name() -> String {
-    if env::consts::OS == "macos" {
-        return command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
-    }
-    if env::consts::OS == "linux" {
-        return fs::read_to_string("/proc/cpuinfo")
-            .ok()
-            .and_then(|contents| {
-                contents.lines().find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    matches!(key.trim(), "model name" | "Hardware").then(|| value.trim().to_owned())
-                })
-            })
-            .unwrap_or_else(|| "unavailable".to_owned());
-    }
-    "unavailable".to_owned()
-}
-
-fn filesystem(path: &Path) -> String {
-    let path = path.display().to_string();
-    if env::consts::OS == "macos" {
-        let kind = command_output("stat", &["-f", "%T", &path]);
-        let usage = command_output("df", &["-k", &path]);
-        return format!("type={kind}; {usage}");
-    }
-    let typed = command_output("df", &["-T", &path]);
-    if typed == "unavailable" || typed.is_empty() {
-        command_output("df", &[&path])
-    } else {
-        typed
-    }
+fn emit_record(record: &impl BenchmarkRecord) {
+    JsonlWriter::new(io::stdout().lock())
+        .write(record)
+        .expect("write Operation benchmark JSONL");
 }
 
 fn duration(value: Duration) -> String {
@@ -380,25 +338,4 @@ fn duration(value: Duration) -> String {
     } else {
         format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
     }
-}
-
-fn json_string(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() + 2);
-    encoded.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => encoded.push_str("\\\""),
-            '\\' => encoded.push_str("\\\\"),
-            '\n' => encoded.push_str("\\n"),
-            '\r' => encoded.push_str("\\r"),
-            '\t' => encoded.push_str("\\t"),
-            character if character.is_control() => {
-                write!(encoded, "\\u{:04x}", u32::from(character))
-                    .expect("writing to String cannot fail");
-            }
-            character => encoded.push(character),
-        }
-    }
-    encoded.push('"');
-    encoded
 }

@@ -4,36 +4,36 @@ use std::{hint::black_box, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
+use dogpaddle_bench_protocol::require_benchmark_build;
 use dogpaddle_change::{Change, ChangeProjection, encode_change};
 
 use support::{
     fixture::{Fixture, fixtures},
-    runner::{
-        Config, Measurement, SampleRecord, print_core_header, print_sample_csv, report_latency,
-        report_rows, timed,
-    },
+    runner::{BenchmarkCase, Config, MachineRecords, Measurement, Metric, timed},
 };
 
+#[path = "support/core_report.rs"]
+mod report;
 mod support;
 
+const BENCHMARK: &str = "change_core";
+
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
-    }
+    require_benchmark_build(BENCHMARK);
 
     let config = Config::load();
-    config.print("DogPaddle Change core benchmark");
-    print_core_header("Change public in-memory operations; '-' means rows/s is not meaningful");
-    let mut samples = Vec::<SampleRecord>::new();
+    config.print(BENCHMARK, "DogPaddle Change core benchmark");
+    report::print_header("Change public in-memory operations; '-' means rows/s is not meaningful");
+    let mut records = MachineRecords::new(BENCHMARK);
     for &rows in &config.rows {
         for fixture in fixtures(rows, config.payload_bytes, &config.workloads) {
-            benchmark_fixture(&config, &fixture, &mut samples);
+            benchmark_fixture(&config, &fixture, &mut records);
         }
     }
-    print_sample_csv(&samples);
+    records.print();
 }
 
-fn benchmark_fixture(config: &Config, fixture: &Fixture, samples: &mut Vec<SampleRecord>) {
+fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRecords) {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
     let encoded_bytes = encode_change(&fixture.change)
@@ -47,45 +47,30 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, samples: &mut Vec<Sampl
     let slice_length = if rows > 1 { (rows / 2).max(1) } else { 1 };
     validate_slice(&fixture.change, slice_offset, slice_length);
     validate_projection(&fixture.change, &projection, fixture.narrow_fields);
+    let metric = Metric::new(rows, encoded_bytes, iterations);
 
-    report_rows(
-        fixture.name,
-        "try_new",
-        rows,
-        encoded_bytes,
-        iterations,
+    report::rows(
+        BenchmarkCase::new(fixture.name, "try_new", metric),
         config.samples,
-        samples,
+        records,
         || measure_try_new(&fixture.change, iterations),
     );
-    report_latency(
-        fixture.name,
-        "projection_new",
-        rows,
-        encoded_bytes,
-        iterations,
+    report::latency(
+        BenchmarkCase::new(fixture.name, "projection_new", metric),
         config.samples,
-        samples,
+        records,
         || measure_projection_new(&schema, fixture.narrow_fields, iterations),
     );
-    report_latency(
-        fixture.name,
-        "try_slice",
-        rows,
-        encoded_bytes,
-        iterations,
+    report::latency(
+        BenchmarkCase::new(fixture.name, "try_slice", metric),
         config.samples,
-        samples,
+        records,
         || measure_slice(&fixture.change, slice_offset, slice_length, iterations),
     );
-    report_latency(
-        fixture.name,
-        "try_project",
-        rows,
-        encoded_bytes,
-        iterations,
+    report::latency(
+        BenchmarkCase::new(fixture.name, "try_project", metric),
         config.samples,
-        samples,
+        records,
         || measure_project(&fixture.change, &projection, iterations),
     );
 }

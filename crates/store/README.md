@@ -214,11 +214,18 @@ cargo test -p dogpaddle-store --test correctness scan::
 通过 MDBX 持久化适配器锁定 `Cell` 的共享布局、`Small` map 的共享前缀、`Large` map 与
 `AppendLog` 的
 独立 named table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。目录
-所有权、模块职责和完整验证协议见 [`TESTING.md`](./TESTING.md)。
+所有权、模块职责和完整验证协议见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
 
 ## 性能
 
-Store 有四个按数据对象与运行目的隔离的 release 基准入口：
+PR 中统一通过工作区 smoke runner 实际执行缩小后的 benchmark 协议：
+
+```bash
+cargo xtask bench-smoke
+```
+
+Store 仍有四个按数据对象与运行目的隔离的 release 入口，供单场景诊断和固定 reference 测量：
 
 ```bash
 cargo bench -p dogpaddle-store --bench cell
@@ -228,9 +235,15 @@ cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
 按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
-设计结论见 [`PERFORMANCE.md`](./PERFORMANCE.md)。基准同时输出人类可读表格与逐样本 JSON，
-并记录实际 rustc、CPU、OS/kernel、git 状态、文件系统和运行档位；输出及计时口径见
-[`TESTING.md`](./TESTING.md#性能-target)。
+设计结论见
+[`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/PERFORMANCE.md)。
+基准同时输出人类可读表格与 typed JSONL，并记录实际 rustc、CPU、OS/kernel、git 状态、
+文件系统和运行档位。共享 `dogpaddle-bench-protocol` 统一负责严格设置、环境指纹、机器记录、
+统计和配对顺序；Store support 只保留 root、样本路径和人类格式薄适配。`ordered_map` 与
+`append_log` 的 fixture、measure、oracle、report 已分别放入同名子目录，但仍各自只有一个 Cargo
+target。工作区协议见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)，Store 目录与 workload 见
+[`crates/store/TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
 
 `cell` 独立覆盖同事务 warm get，以及每次读取、更新并 durable commit 的状态事务。
 `ordered_map` 为 `Small` 与 `Large` map 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、

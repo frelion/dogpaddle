@@ -18,6 +18,9 @@ arrow-schema.workspace = true
 flatbuffers.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+dogpaddle-bench-protocol.workspace = true
+
 [[test]]
 name = "correctness"
 path = "tests/correctness.rs"

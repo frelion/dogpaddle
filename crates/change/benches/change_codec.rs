@@ -2,19 +2,21 @@
 
 use std::{hint::black_box, sync::Arc};
 
+use dogpaddle_bench_protocol::require_benchmark_build;
 use dogpaddle_change::{
     Change, ChangeProjection, decode_change, decode_change_projected, encode_change,
 };
 
 use support::{
     fixture::{Fixture, fixtures},
-    runner::{
-        Config, Measurement, SampleRecord, print_codec_header, print_sample_csv, record_samples,
-        summarize_codec, timed,
-    },
+    runner::{BenchmarkCase, Config, MachineRecords, Measurement, Metric, timed},
 };
 
+#[path = "support/codec_report.rs"]
+mod report;
 mod support;
+
+const BENCHMARK: &str = "change_codec";
 
 #[derive(Clone, Copy)]
 enum CodecMode<'fixture> {
@@ -43,23 +45,21 @@ impl CodecMode<'_> {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
-    }
+    require_benchmark_build(BENCHMARK);
 
     let config = Config::load();
-    config.print("DogPaddle Change codec benchmark");
-    print_codec_header("one complete self-contained Arrow IPC Stream per Change");
-    let mut samples = Vec::<SampleRecord>::new();
+    config.print(BENCHMARK, "DogPaddle Change codec benchmark");
+    report::print_header("one complete self-contained Arrow IPC Stream per Change");
+    let mut records = MachineRecords::new(BENCHMARK);
     for &rows in &config.rows {
         for fixture in fixtures(rows, config.payload_bytes, &config.workloads) {
-            benchmark_fixture(&config, &fixture, &mut samples);
+            benchmark_fixture(&config, &fixture, &mut records);
         }
     }
-    print_sample_csv(&samples);
+    records.print();
 }
 
-fn benchmark_fixture(config: &Config, fixture: &Fixture, samples: &mut Vec<SampleRecord>) {
+fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRecords) {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
     let encoded = encode_change(&fixture.change).expect("encode valid benchmark fixture");
@@ -123,23 +123,12 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, samples: &mut Vec<Sampl
         }
     }
 
+    let metric = Metric::new(rows, encoded.len(), iterations);
     for case in cases {
-        summarize_codec(
-            fixture.name,
-            case.scenario,
-            rows,
-            encoded.len(),
-            iterations,
+        report::measurements(
+            BenchmarkCase::new(fixture.name, case.scenario, metric),
             &case.measurements,
-        );
-        record_samples(
-            samples,
-            fixture.name,
-            case.scenario,
-            rows,
-            encoded.len(),
-            iterations,
-            &case.measurements,
+            records,
         );
     }
 }

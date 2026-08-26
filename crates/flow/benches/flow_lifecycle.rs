@@ -1,16 +1,20 @@
 mod support;
 
-use std::{path::Path, time::Duration};
+use std::{io, path::Path, time::Duration};
 
+use dogpaddle_bench_protocol::{
+    BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
+    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
+    positive_usize_list, require_benchmark_build,
+};
 use dogpaddle_flow::{Flow, FlowBuilder};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
 
-use support::{
-    BenchRoot, emit_configuration, emit_environment, emit_sample, report, setting, setting_list,
-};
+use support::BenchRoot;
 
+const BENCHMARK: &str = "flow_lifecycle";
 const SMOKE_STAGE_COUNTS: &[usize] = &[1, 8, 64];
 const REFERENCE_STAGE_COUNTS: &[usize] = &[1, 64, 1_024];
 const SMOKE_SAMPLES: usize = 3;
@@ -25,15 +29,20 @@ struct Config {
 }
 
 impl Config {
-    fn load(profile: &str) -> Self {
+    fn load(profile: BenchmarkProfile) -> Self {
         let (default_stage_counts, default_samples, default_warmups) = match profile {
-            "smoke" => (SMOKE_STAGE_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
-            "reference" => (REFERENCE_STAGE_COUNTS, REFERENCE_SAMPLES, REFERENCE_WARMUPS),
-            _ => unreachable!("BenchRoot validates the benchmark profile"),
+            BenchmarkProfile::Smoke => (SMOKE_STAGE_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
+            BenchmarkProfile::Reference => {
+                (REFERENCE_STAGE_COUNTS, REFERENCE_SAMPLES, REFERENCE_WARMUPS)
+            }
         };
-        let stage_counts = setting_list("DOGPADDLE_FLOW_BENCH_STAGE_COUNTS", default_stage_counts);
-        let samples = setting("DOGPADDLE_FLOW_BENCH_SAMPLES", default_samples);
-        let warmups = setting("DOGPADDLE_FLOW_BENCH_WARMUPS", default_warmups);
+        let stage_counts =
+            positive_usize_list("DOGPADDLE_FLOW_BENCH_STAGE_COUNTS", default_stage_counts)
+                .expect("read Flow benchmark stage counts");
+        let samples = positive_usize("DOGPADDLE_FLOW_BENCH_SAMPLES", default_samples)
+            .expect("read Flow benchmark sample count");
+        let warmups = positive_usize("DOGPADDLE_FLOW_BENCH_WARMUPS", default_warmups)
+            .expect("read Flow benchmark warmup count");
         assert!(
             stage_counts.windows(2).all(|pair| pair[0] < pair[1]),
             "DOGPADDLE_FLOW_BENCH_STAGE_COUNTS must be strictly increasing"
@@ -47,10 +56,7 @@ impl Config {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        eprintln!("flow_lifecycle must run through `cargo bench`");
-        return;
-    }
+    require_benchmark_build(BENCHMARK);
 
     let root = BenchRoot::from_environment();
     let config = Config::load(root.profile());
@@ -59,7 +65,7 @@ fn main() {
         "scope=build/open runtime=absent sync=durable execution=single-thread validation=outside-timing"
     );
     emit_environment(&root);
-    emit_configuration(&config.stage_counts, config.samples, config.warmups);
+    emit_configuration(&config);
 
     for &stage_count in &config.stage_counts {
         benchmark_fresh_build(&root, &config, stage_count);
@@ -78,7 +84,7 @@ fn benchmark_fresh_build(root: &BenchRoot, config: &Config, stage_count: usize) 
         emit_sample("fresh_durable_build", stage_count, sample, elapsed);
         durations.push(elapsed);
     }
-    report("fresh_durable_build", stage_count, &mut durations);
+    report("fresh_durable_build", stage_count, &durations);
 }
 
 fn measure_fresh_build(root: &BenchRoot, stage_count: usize) -> Duration {
@@ -119,7 +125,7 @@ fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, stage_count: usize) 
         emit_sample("warm_reopen", stage_count, sample, elapsed);
         durations.push(elapsed);
     }
-    report("warm_reopen", stage_count, &mut durations);
+    report("warm_reopen", stage_count, &durations);
 }
 
 fn measure_reopen(path: &Path, stage_count: usize) -> Duration {
@@ -154,4 +160,82 @@ fn validate_flow(flow: &Flow, path: &Path, stage_count: usize) {
         assert_eq!(ids.next(), Some(expected.as_str()));
     }
     assert_eq!(ids.next(), None);
+}
+
+fn emit_environment(root: &BenchRoot) {
+    let fields = Fields::new()
+        .with("mdbx_sync_mode", "durable")
+        .expect("add Flow benchmark MDBX sync mode");
+    let environment = EnvironmentRecord::for_profile(
+        BENCHMARK,
+        root.profile(),
+        HostEnvironment::collect(Some(root.base())).expect("collect Flow benchmark environment"),
+        fields,
+    )
+    .expect("construct Flow benchmark environment record");
+    emit_record(&environment);
+}
+
+fn emit_configuration(config: &Config) {
+    let fields = Fields::new()
+        .with("stage_counts", &config.stage_counts)
+        .expect("add Flow benchmark stage counts")
+        .with("samples", config.samples)
+        .expect("add Flow benchmark sample count")
+        .with("warmups", config.warmups)
+        .expect("add Flow benchmark warmup count")
+        .with("fresh_build_path_and_builder", "outside_timing")
+        .expect("add Flow fresh-build setup policy")
+        .with("fresh_build_store_per_sample", true)
+        .expect("add Flow fresh-build store policy")
+        .with("reopen_fixture_and_warmup", "outside_timing")
+        .expect("add Flow reopen setup policy")
+        .with("reopen_cache", "warm_committed")
+        .expect("add Flow reopen cache policy")
+        .with("validation", "outside_timing")
+        .expect("add Flow benchmark validation policy");
+    let configuration = ConfigurationRecord::new(BENCHMARK, fields)
+        .expect("construct Flow benchmark configuration record");
+    emit_record(&configuration);
+}
+
+fn emit_sample(scenario: &'static str, stage_count: usize, sample: usize, elapsed: Duration) {
+    let sample = SampleRecord::new(
+        BENCHMARK,
+        scenario,
+        sample,
+        elapsed,
+        stage_fields(stage_count),
+    )
+    .expect("construct Flow benchmark sample record");
+    emit_record(&sample);
+}
+
+fn report(scenario: &'static str, stage_count: usize, samples: &[Duration]) {
+    let summary = DurationSummary::from_samples(samples).expect("summarize Flow benchmark samples");
+    let min = summary.min();
+    let median = summary.median();
+    let max = summary.max();
+    assert!(!median.is_zero(), "benchmark median must be non-zero");
+    println!("{scenario} stages={stage_count}: min={min:?} median={median:?} max={max:?}");
+    let summary = SummaryRecord::new(BENCHMARK, scenario, summary, stage_fields(stage_count))
+        .expect("construct Flow benchmark summary record");
+    emit_record(&summary);
+}
+
+fn stage_fields(stage_count: usize) -> Fields {
+    Fields::new()
+        .with("stage_count", stage_count)
+        .expect("add Flow benchmark stage count")
+}
+
+fn emit_record(record: &impl BenchmarkRecord) {
+    let stdout = io::stdout();
+    let mut writer = JsonlWriter::new(stdout.lock());
+    writer
+        .write(record)
+        .expect("write Flow benchmark protocol record");
+    writer
+        .flush()
+        .expect("flush Flow benchmark protocol record");
 }

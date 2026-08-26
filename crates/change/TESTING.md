@@ -22,6 +22,10 @@ manifest 关闭自动 test/bench 发现，只显式声明一个公共 `correctne
 公共测试不能依赖私有实现来计算预期值。编码互操作以标准 Arrow reader 为独立 oracle；选择性
 解码以内存 projection 为 oracle；顺序和稳定重批以简单展平事件向量为 oracle。
 
+benchmark target 与 `benches/support/` 只保留 Change 特有的 Arrow fixture、结果 oracle、尺寸预检、
+场景顺序和人类可读表格。严格配置解析、主机指纹、持续时间统计和 typed JSONL record/writer 由
+工作区内部的 `dogpaddle-bench-protocol` 提供；它不拥有 Change workload、计时边界或结果校验。
+
 ## 数据边界
 
 正确性覆盖全部 v1 类型的真实值和 null 值，并特别覆盖：数值极值、浮点特殊值、7/8/9 与
@@ -45,4 +49,4 @@ cargo bench -p dogpaddle-change --bench change_core
 cargo bench -p dogpaddle-change --bench change_codec
 ```
 
-完整的跨 crate 所有权、性能口径和 reference-runner 规则见根目录 `TESTING.md`。
+完整的跨 crate 所有权、性能口径和 reference 规则见[根目录统一测试协议](../../TESTING.md)。

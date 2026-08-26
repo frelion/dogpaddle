@@ -132,13 +132,21 @@ Transaction，只把不能提交的 `TransactionAccess` 交给 `step()`；Operat
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、Definition、Source 与 Transform 分区。Definition v1 使用版本化
 黄金字节约束，具体 Operation 覆盖 commit、rollback、reopen、极值错误不改状态和 Store 错误透明
-传播。完整目录所有权、测试矩阵和 fixture 规则见 [`TESTING.md`](./TESTING.md)。
+传播。完整目录所有权、测试矩阵和 fixture 规则见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务
 内的 `step` body，以及包含 begin 和 durable commit 的完整事务。它报告 operation 成本而不是尚未
 存在的 Change rows/s；固定大小 Cell 的长稳归 Store 所有，因此当前不设置 Operation endurance。
+benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹、计算持续时间
+统计并输出 typed JSONL。Operation 本地 support 仍拥有 workload 字段、计时/oracle 和
+`BenchRoot`/`SampleStore`；`SampleStore` 在所属场景或 durable 样本校验后立即释放，
+不积累到 run root 最终 drop。
 smoke 默认使用临时目录，正式回归必须选择 `reference` profile 并显式指定固定文件系统目录，具体
-环境变量和 JSON 输出协议见 [`TESTING.md`](./TESTING.md#operation_core-性能协议)。
+环境变量和 typed JSONL 输出协议见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)；
+全工作区统一规则以根目录
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md) 为准。
 
 ## 验证命令
 
@@ -148,4 +156,7 @@ cargo test -p dogpaddle-operation --test correctness
 cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 cargo bench -p dogpaddle-operation --bench operation_core
+
+# PR benchmark protocol smoke
+cargo xtask bench-smoke
 ```
