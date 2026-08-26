@@ -127,7 +127,8 @@ fn validate_field(field: &Field, path: &str, depth: usize) -> Result<(), SchemaE
 fn validate_metadata(metadata: &HashMap<String, String>, owner: &str) -> Result<(), SchemaError> {
     if let Some(key) = metadata
         .keys()
-        .find(|key| key.starts_with(RESERVED_METADATA_PREFIX))
+        .filter(|key| key.starts_with(RESERVED_METADATA_PREFIX))
+        .min()
     {
         Err(SchemaError::ReservedMetadataKey {
             owner: owner.to_owned(),

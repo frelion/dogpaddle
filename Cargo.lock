@@ -265,7 +265,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dogpaddle-data"
+name = "dogpaddle-change"
 version = "0.1.0"
 dependencies = [
  "arrow-array",

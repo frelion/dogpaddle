@@ -2,7 +2,10 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use thiserror::Error;
 
-use crate::{ChangeProjection, ProjectionError, SchemaError, validate_schema};
+use crate::{
+    projection::{ChangeProjection, ProjectionError},
+    schema::{SchemaError, validate_schema},
+};
 
 /// A non-empty contiguous columnar segment of an ordered change sequence.
 ///
@@ -28,6 +31,15 @@ impl Change {
     /// Returns `ChangeError` when the change is empty, row counts differ,
     /// a diff is null or zero, or the record schema is unsupported.
     pub fn try_new(records: RecordBatch, diffs: Int64Array) -> Result<Self, ChangeError> {
+        let change = Self::try_new_with_validated_schema(records, diffs)?;
+        validate_schema(change.records.schema_ref())?;
+        Ok(change)
+    }
+
+    pub(crate) fn try_new_with_validated_schema(
+        records: RecordBatch,
+        diffs: Int64Array,
+    ) -> Result<Self, ChangeError> {
         if records.num_rows() == 0 {
             return Err(ChangeError::Empty);
         }
@@ -44,7 +56,6 @@ impl Change {
                 Some(_) => {}
             }
         }
-        validate_schema(records.schema_ref())?;
         Ok(Self { records, diffs })
     }
 
@@ -113,13 +124,8 @@ impl Change {
         if projection.is_identity() {
             return Ok(self.clone());
         }
-        let records = self
-            .records
-            .project(projection.field_indices())
-            .map_err(|error| ProjectionError::Arrow {
-                message: error.to_string(),
-            })?;
-        debug_assert_eq!(records.schema_ref(), projection.output_schema());
+        let records = self.records.project(projection.field_indices())?;
+        debug_assert_eq!(records.schema_ref(), projection.output_schema_ref());
         Ok(Self {
             records,
             diffs: self.diffs.clone(),

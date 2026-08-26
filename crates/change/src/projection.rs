@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use thiserror::Error;
 
-use crate::{SchemaError, validate_schema};
+use crate::schema::{SchemaError, validate_schema};
 
 /// A top-level logical-field projection bound to one exact input Schema.
 ///
@@ -56,14 +56,7 @@ impl ChangeProjection {
             previous = Some(current);
         }
 
-        let fields = field_indices
-            .iter()
-            .map(|&index| Arc::clone(&input_schema.fields()[index]))
-            .collect::<Vec<_>>();
-        let output_schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            input_schema.metadata().clone(),
-        ));
+        let output_schema = Arc::new(input_schema.project(&field_indices)?);
         Ok(Self {
             input_schema,
             output_schema,
@@ -71,22 +64,18 @@ impl ChangeProjection {
         })
     }
 
-    /// Returns the exact logical Schema this projection accepts.
-    #[must_use]
-    pub const fn input_schema(&self) -> &SchemaRef {
-        &self.input_schema
-    }
-
     /// Returns the projected logical Schema.
     #[must_use]
-    pub const fn output_schema(&self) -> &SchemaRef {
-        &self.output_schema
+    pub fn output_schema(&self) -> SchemaRef {
+        Arc::clone(&self.output_schema)
     }
 
-    /// Returns the selected top-level logical field indices.
-    #[must_use]
-    pub const fn field_indices(&self) -> &[usize] {
+    pub(crate) const fn field_indices(&self) -> &[usize] {
         &self.field_indices
+    }
+
+    pub(crate) const fn output_schema_ref(&self) -> &SchemaRef {
+        &self.output_schema
     }
 
     pub(crate) fn require_schema(&self, actual: &Schema) -> Result<(), ProjectionError> {
@@ -103,7 +92,7 @@ impl ChangeProjection {
 }
 
 /// A logical Change projection failure.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProjectionError {
     /// The bound logical Schema is invalid.
@@ -129,9 +118,6 @@ pub enum ProjectionError {
     #[error("the projection was created for a different logical schema")]
     SchemaMismatch,
     /// Arrow rejected an otherwise validated in-memory projection.
-    #[error("Arrow rejected the logical projection: {message}")]
-    Arrow {
-        /// Arrow diagnostic message.
-        message: String,
-    },
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
 }

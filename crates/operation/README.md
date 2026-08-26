@@ -8,7 +8,7 @@ Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandl
 ## 数据边界
 
 共享的 Arrow Schema、批量差分模型和“每个 Change 一个自描述 IPC Stream”的编码属于独立的
-`dogpaddle-data` crate，而不是 Operation。未来运行接口以内存中的 `Change` 为输入输出；
+`dogpaddle-change` crate，而不是 Operation。未来运行接口以内存中的 `Change` 为输入输出；
 Operation 只负责数据变换和自己声明的持久化状态，不读写 IPC、不读取边日志，也不决定物理
 batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须依次观察输入事件，并按
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
@@ -16,7 +16,7 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 后保持不变；物理 Change 边界不能被算子当成业务事件。
 
 当前阶段尚未公开运行 trait 的批量处理方法，因此本 crate 不提前增加空的 `run` 或
-`process` 接口。Flow/Stage 数据通道接入时再引入对 `dogpaddle-data` 的实际代码依赖。
+`process` 接口。Flow/Stage 数据通道接入时再引入对 `dogpaddle-change` 的实际代码依赖。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。

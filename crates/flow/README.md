@@ -50,9 +50,9 @@ Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子�
 Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state map 显式声明为
 `Small`。Flow state map 保留生命周期状态，Stage state map 保存运行期 Stage 状态。未来的
 边数据通道将使用构建期显式声明的日志资源；每个日志 value 是一个内嵌 Schema 的完整 Change
-IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不由 Data codec
-中的外部 Schema 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增
-数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
+IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不依赖 Change
+codec 之外的 Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，
+不能动态新增数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
 
 每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
 不是稳定 event ID。未来 Stage 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件

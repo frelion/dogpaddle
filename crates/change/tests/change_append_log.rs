@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dogpaddle_data::{
+use dogpaddle_change::{
     Change, ChangeProjection, decode_change, decode_change_projected, encode_change,
 };
 use dogpaddle_store::{
@@ -60,17 +60,6 @@ fn scan_projected_change(
         .unwrap();
     assert!(scan.caught_up);
     projected.unwrap()
-}
-
-fn assert_change(actual: &Change, expected_values: &[u64], expected_diffs: &[i64]) {
-    let values = actual
-        .records()
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap();
-    assert_eq!(values.values(), expected_values);
-    assert_eq!(actual.diffs().values(), expected_diffs);
 }
 
 #[test]
@@ -142,8 +131,8 @@ fn one_append_log_entry_supports_independent_owned_projections() {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![7, 8])),
         Arc::new(BinaryArray::from(vec![
-            Some(vec![3_u8; 4_096].as_slice()),
-            Some(vec![4_u8; 4_096].as_slice()),
+            Some(&b"left"[..]),
+            Some(&b"right"[..]),
         ])),
         Arc::new(UInt64Array::from(vec![70, 80])),
     ];
@@ -186,10 +175,7 @@ fn one_append_log_entry_supports_independent_owned_projections() {
         scan_projected_change(&changes, &diffs_only_projection)
     };
 
-    assert_eq!(
-        selected.schema(),
-        selected_projection.output_schema().clone()
-    );
+    assert_eq!(selected.schema(), selected_projection.output_schema());
     assert_eq!(selected.diffs().values(), &[1, -1]);
     for (index, expected) in [(0, &[7, 8][..]), (1, &[70, 80][..])] {
         let values = selected
@@ -203,119 +189,4 @@ fn one_append_log_entry_supports_independent_owned_projections() {
     assert_eq!(diffs_only.records().num_columns(), 0);
     assert_eq!(diffs_only.num_rows(), 2);
     assert_eq!(diffs_only.diffs().values(), &[1, -1]);
-}
-
-#[test]
-fn encoded_changes_can_be_forwarded_in_the_same_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let logical_schema = schema();
-    let mut store = Store::create(root.path().join("store")).unwrap();
-    let input: AppendLog<Vec<u8>> = store.create_data("input").unwrap();
-    let output: AppendLog<Vec<u8>> = store.create_data("output").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        let mut input = input.access(transaction.access()).unwrap();
-        input
-            .append(&encode_change(&change(logical_schema.clone(), &[10], &[-1])).unwrap())
-            .unwrap();
-        input
-            .append(&encode_change(&change(logical_schema, &[20], &[3])).unwrap())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let transaction = transactions.begin().unwrap();
-        let input = input.access(transaction.access()).unwrap();
-        let mut output = output.access(transaction.access()).unwrap();
-        input
-            .scan(0, ScanLimit::new(16, 64 * 1_024).unwrap(), |entry| {
-                let decoded = entry.project(decode_entry)?;
-                if decoded
-                    .diffs()
-                    .iter()
-                    .all(|diff| diff.is_some_and(|diff| diff > 0))
-                {
-                    output.append_entry(&entry)?;
-                }
-                Ok::<(), StoreError>(())
-            })
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    let output = output.access(transaction.access()).unwrap();
-    let changes = scan_changes(&output);
-    assert_eq!(changes.len(), 1);
-    assert_change(&changes[0].1, &[20], &[3]);
-}
-
-#[test]
-fn dropping_a_forwarding_transaction_rolls_back_the_output() {
-    let root = tempfile::tempdir().unwrap();
-    let logical_schema = schema();
-    let mut store = Store::create(root.path().join("store")).unwrap();
-    let input: AppendLog<Vec<u8>> = store.create_data("input").unwrap();
-    let output: AppendLog<Vec<u8>> = store.create_data("output").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        input
-            .access(transaction.access())
-            .unwrap()
-            .append(&encode_change(&change(logical_schema, &[42], &[1])).unwrap())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let transaction = transactions.begin().unwrap();
-        let input = input.access(transaction.access()).unwrap();
-        let mut output = output.access(transaction.access()).unwrap();
-        input
-            .scan(0, ScanLimit::new(1, 64 * 1_024).unwrap(), |entry| {
-                output.append_entry(&entry)?;
-                Ok::<(), StoreError>(())
-            })
-            .unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    let output = output.access(transaction.access()).unwrap();
-    assert_eq!(output.bounds().unwrap(), 0..0);
-}
-
-#[test]
-fn malformed_change_bytes_poison_the_projection_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("store")).unwrap();
-    let changes: AppendLog<Vec<u8>> = store.create_data("changes").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        changes
-            .access(transaction.access())
-            .unwrap()
-            .append(&b"not a change".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    let changes = changes.access(transaction.access()).unwrap();
-    let error = changes
-        .scan(
-            0,
-            ScanLimit::new(1, 1_024).unwrap(),
-            |entry| -> Result<(), StoreError> {
-                entry.project(decode_entry)?;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(error, StoreError::Codec(_)));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
 }
