@@ -1,4 +1,11 @@
-use std::{collections::HashMap, fmt::Write as _, io::Cursor, ops::Range, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    io::Cursor,
+    ops::Range,
+    process::{Command, exit},
+    sync::Arc,
+};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Int64Array, RecordBatch, RecordBatchOptions, StructArray,
@@ -6,9 +13,10 @@ use arrow_array::{
 };
 use arrow_buffer::NullBuffer;
 use arrow_ipc::{
-    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Endianness, FieldNode,
-    Message as IpcMessage, MessageArgs, MessageHeader, MetadataVersion,
-    RecordBatch as IpcRecordBatch, RecordBatchArgs, Schema as IpcSchema, SchemaArgs,
+    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Endianness, Field as IpcField,
+    FieldArgs, FieldNode, Int as IpcInt, IntArgs, Message as IpcMessage, MessageArgs,
+    MessageHeader, MetadataVersion, RecordBatch as IpcRecordBatch, RecordBatchArgs,
+    Schema as IpcSchema, SchemaArgs, Type as IpcType,
     reader::StreamReader,
     writer::{IpcWriteOptions, StreamWriter},
 };
@@ -27,6 +35,8 @@ const KIND_KEY: &str = "dogpaddle.kind";
 const VERSION_KEY: &str = "dogpaddle.change.version";
 const OFFSETS_BUFFER: usize = 1;
 const VARIABLE_VALUES_BUFFER: usize = 2;
+const MALFORMED_SCHEMA_PANIC_PROBE: &str = "DOGPADDLE_CHANGE_MALFORMED_SCHEMA_PANIC_PROBE";
+const PANIC_HOOK_EXIT_CODE: i32 = 86;
 
 fn simple_change(diffs: &[i64]) -> Change {
     let values = (0..u64::try_from(diffs.len()).unwrap()).collect::<Vec<_>>();
@@ -157,6 +167,49 @@ fn big_endian_schema_stream() -> Vec<u8> {
         &mut builder,
         &SchemaArgs {
             endianness: Endianness::Big,
+            fields: Some(fields),
+            ..SchemaArgs::default()
+        },
+    );
+    let message = IpcMessage::create(
+        &mut builder,
+        &MessageArgs {
+            version: MetadataVersion::V5,
+            header_type: MessageHeader::Schema,
+            header: Some(schema.as_union_value()),
+            ..MessageArgs::default()
+        },
+    );
+    builder.finish(message, None);
+    let mut encoded = frame_ipc_message(builder.finished_data(), &[]);
+    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    encoded
+}
+
+fn malformed_int_width_schema_stream() -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let name = builder.create_string("$dogpaddle.diff");
+    let integer = IpcInt::create(
+        &mut builder,
+        &IntArgs {
+            bitWidth: 24,
+            is_signed: true,
+        },
+    );
+    let field = IpcField::create(
+        &mut builder,
+        &FieldArgs {
+            name: Some(name),
+            type_type: IpcType::Int,
+            type_: Some(integer.as_union_value()),
+            ..FieldArgs::default()
+        },
+    );
+    let fields = builder.create_vector(&[field]);
+    let schema = IpcSchema::create(
+        &mut builder,
+        &SchemaArgs {
+            endianness: Endianness::Little,
             fields: Some(fields),
             ..SchemaArgs::default()
         },
@@ -334,6 +387,60 @@ fn zero_column_change_stream_has_stable_golden_bytes() {
     let encoded = encode_change(&change).unwrap();
     assert_eq!(hex(&encoded), expected);
     assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+}
+
+#[test]
+fn sliced_representative_change_stream_has_stable_golden_bytes() {
+    let source = representative_change();
+    let change = source.try_slice(1, 2).unwrap();
+    assert_eq!(
+        change.diffs().values().as_ptr(),
+        source.diffs().values()[1..].as_ptr()
+    );
+    let encoded = encode_change(&change).unwrap();
+
+    let expected = include_str!("fixtures/sliced_representative_change_v1.hex")
+        .split_ascii_whitespace()
+        .collect::<String>();
+
+    assert_eq!(hex(&encoded), expected);
+    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+}
+
+#[test]
+fn decoder_rejects_malformed_schema_without_invoking_the_panic_hook() {
+    // Isolate the process-wide hook from other tests that may run concurrently.
+    if std::env::var_os(MALFORMED_SCHEMA_PANIC_PROBE).is_some() {
+        let encoded = malformed_int_width_schema_stream();
+        let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| exit(PANIC_HOOK_EXIT_CODE)));
+
+        let complete = decode_change(&encoded);
+        let projected = decode_change_projected(&encoded, &projection);
+
+        std::panic::set_hook(previous_hook);
+        assert!(complete.is_err());
+        assert!(projected.is_err());
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "codec::tests::decoder_rejects_malformed_schema_without_invoking_the_panic_hook",
+            "--nocapture",
+        ])
+        .env(MALFORMED_SCHEMA_PANIC_PROBE, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "malformed Schema decoder probe exited with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

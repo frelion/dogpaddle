@@ -1,10 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{
-    Endianness, Message, MessageHeader, MetadataVersion, RecordBatch as IpcRecordBatch,
-    convert::fb_to_schema,
-    root_as_message,
+    Endianness, Field as IpcField, Message, MessageHeader, MetadataVersion, Precision,
+    RecordBatch as IpcRecordBatch, Schema as IpcSchema, Type as IpcType, root_as_message,
     writer::{IpcWriteOptions, StreamWriter},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -12,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use super::CodecError;
 use crate::{
     change::Change,
-    schema::{RESERVED_METADATA_PREFIX, validate_schema},
+    schema::{MAX_NESTING_DEPTH, RESERVED_METADATA_PREFIX, validate_schema},
 };
 
 const DIFF_FIELD_NAME: &str = "$dogpaddle.diff";
@@ -64,7 +63,7 @@ pub(super) fn parse(encoded: &[u8]) -> Result<ParsedChange<'_>, CodecError> {
             "Arrow Schema features are not supported",
         ));
     }
-    let physical_schema = Arc::new(fb_to_schema(embedded_schema));
+    let physical_schema = Arc::new(parse_schema(embedded_schema)?);
     let logical_schema = logical_schema(&physical_schema)?;
 
     let batch_message = parse_message(encoded, schema_message.end, MessageHeader::RecordBatch)?;
@@ -106,6 +105,139 @@ pub(super) fn parse(encoded: &[u8]) -> Result<ParsedChange<'_>, CodecError> {
         body: batch_message.body,
         row_count,
     })
+}
+
+// Arrow's general FlatBuffer converter is infallible and panics on malformed
+// type parameters. Decode the deliberately narrow v1 type set directly.
+fn parse_schema(embedded: IpcSchema<'_>) -> Result<Schema, CodecError> {
+    let fields = embedded
+        .fields()
+        .ok_or_else(|| CodecError::invalid("Arrow Schema has no fields vector"))?
+        .iter()
+        .map(|field| parse_field(field, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = parse_metadata(embedded.custom_metadata());
+    Ok(Schema::new_with_metadata(fields, metadata))
+}
+
+fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
+    let name = field.name().unwrap_or_default();
+    if field.dictionary().is_some() {
+        return Err(CodecError::invalid(format!(
+            "dictionary encoding is not supported at Arrow field {name:?}"
+        )));
+    }
+
+    let data_type = match field.type_type() {
+        IpcType::Null => DataType::Null,
+        IpcType::Bool => DataType::Boolean,
+        IpcType::Int => parse_integer_type(field)?,
+        IpcType::FloatingPoint => parse_floating_type(field)?,
+        IpcType::Binary => DataType::Binary,
+        IpcType::Utf8 => DataType::Utf8,
+        IpcType::List => {
+            let children = field.children().ok_or_else(|| {
+                CodecError::invalid(format!("List field {name:?} has no children vector"))
+            })?;
+            if children.len() != 1 {
+                return Err(CodecError::invalid(format!(
+                    "List field {name:?} must have exactly one child, found {}",
+                    children.len()
+                )));
+            }
+            DataType::List(Arc::new(parse_field(
+                children.get(0),
+                nested_depth(depth)?,
+            )?))
+        }
+        IpcType::Struct_ => {
+            let nested = nested_depth(depth)?;
+            let children = field
+                .children()
+                .map(|children| {
+                    children
+                        .iter()
+                        .map(|child| parse_field(child, nested))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            DataType::Struct(children.into())
+        }
+        data_type => {
+            return Err(CodecError::invalid(format!(
+                "unsupported Arrow IPC type {data_type:?} at field {name:?}"
+            )));
+        }
+    };
+
+    Ok(Field::new(name, data_type, field.nullable())
+        .with_metadata(parse_metadata(field.custom_metadata())))
+}
+
+fn parse_integer_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+    let name = field.name().unwrap_or_default();
+    let integer = field
+        .type_as_int()
+        .ok_or_else(|| CodecError::invalid(format!("Int field {name:?} has no Int type table")))?;
+    match (integer.bitWidth(), integer.is_signed()) {
+        (8, true) => Ok(DataType::Int8),
+        (8, false) => Ok(DataType::UInt8),
+        (16, true) => Ok(DataType::Int16),
+        (16, false) => Ok(DataType::UInt16),
+        (32, true) => Ok(DataType::Int32),
+        (32, false) => Ok(DataType::UInt32),
+        (64, true) => Ok(DataType::Int64),
+        (64, false) => Ok(DataType::UInt64),
+        (bit_width, is_signed) => Err(CodecError::invalid(format!(
+            "Int field {name:?} has unsupported bit width {bit_width} and signedness {is_signed}"
+        ))),
+    }
+}
+
+fn parse_floating_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+    let name = field.name().unwrap_or_default();
+    let floating = field.type_as_floating_point().ok_or_else(|| {
+        CodecError::invalid(format!(
+            "FloatingPoint field {name:?} has no FloatingPoint type table"
+        ))
+    })?;
+    match floating.precision() {
+        Precision::SINGLE => Ok(DataType::Float32),
+        Precision::DOUBLE => Ok(DataType::Float64),
+        precision => Err(CodecError::invalid(format!(
+            "FloatingPoint field {name:?} has unsupported precision {precision:?}"
+        ))),
+    }
+}
+
+fn nested_depth(depth: usize) -> Result<usize, CodecError> {
+    let nested = depth
+        .checked_add(1)
+        .ok_or_else(|| CodecError::invalid("Arrow Schema nesting depth overflowed"))?;
+    if nested > MAX_NESTING_DEPTH {
+        Err(CodecError::invalid(format!(
+            "Arrow Schema nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+        )))
+    } else {
+        Ok(nested)
+    }
+}
+
+fn parse_metadata<'a>(
+    metadata: Option<
+        flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<arrow_ipc::KeyValue<'a>>>,
+    >,
+) -> HashMap<String, String> {
+    let mut parsed = HashMap::new();
+    if let Some(metadata) = metadata {
+        for pair in metadata {
+            if let (Some(key), Some(value)) = (pair.key(), pair.value()) {
+                parsed.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    parsed
 }
 
 struct ParsedMessage<'encoded> {

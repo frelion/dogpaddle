@@ -111,6 +111,11 @@ writer 固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压�
 batch、canonical EOS 且无尾随字节。Arrow IPC version、writer options、Schema marker、物理
 diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
 
+这里的 canonical 限定的是消息 framing、EOS 和 writer options，并不表示 decoder 会把输入重新
+编码后逐字节比较，也不要求每个逻辑 `Change` 只有一种可接受的字节表示。符合 Arrow framing
+且不改变语义的 `FlatBuffer` 布局、默认值或 body padding 内容变体可能被接受；
+`encode_change` 的确定性输出及其黄金字节才是 `DogPaddle` 写入端的持久化基准。
+
 运行层可以用 `AppendLog<Vec<u8>>` 保存完整 Stream，每个日志 entry 恰好对应一个 Change；
 同一 entry 可供不同消费者独立投影。`dogpaddle-change` 不实现 Store collection，Store 也不
 依赖 Arrow。

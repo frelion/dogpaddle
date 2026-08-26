@@ -9,6 +9,42 @@ pub const MAX_NESTING_DEPTH: usize = 60;
 pub(crate) const RESERVED_FIELD_PREFIX: &str = "$dogpaddle.";
 pub(crate) const RESERVED_METADATA_PREFIX: &str = "dogpaddle.";
 
+#[derive(Clone, Copy)]
+pub(crate) enum DataTypeLayout<'a> {
+    Null,
+    Bitmap,
+    FixedWidth(usize),
+    VariableWidth,
+    List(&'a Field),
+    Struct(&'a Fields),
+}
+
+impl<'a> DataTypeLayout<'a> {
+    pub(crate) fn classify(data_type: &'a DataType) -> Option<Self> {
+        match data_type {
+            DataType::Null => Some(Self::Null),
+            DataType::Boolean => Some(Self::Bitmap),
+            DataType::Int8 | DataType::UInt8 => Some(Self::FixedWidth(1)),
+            DataType::Int16 | DataType::UInt16 => Some(Self::FixedWidth(2)),
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(Self::FixedWidth(4)),
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 => Some(Self::FixedWidth(8)),
+            DataType::Utf8 | DataType::Binary => Some(Self::VariableWidth),
+            DataType::List(child) => Some(Self::List(child)),
+            DataType::Struct(fields) => Some(Self::Struct(fields)),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn own_buffer_count(self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Struct(_) => 1,
+            Self::Bitmap | Self::FixedWidth(_) | Self::List(_) => 2,
+            Self::VariableWidth => 3,
+        }
+    }
+}
+
 /// Validates a logical `DogPaddle` record schema.
 ///
 /// Field order, names, nullability, data types, and metadata remain part of
@@ -94,32 +130,19 @@ fn validate_field(field: &Field, path: &str, depth: usize) -> Result<(), SchemaE
         });
     }
     validate_metadata(field.metadata(), path)?;
-    match field.data_type() {
-        DataType::Null
-        | DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::Binary => Ok(()),
-        DataType::List(child) => {
+    match DataTypeLayout::classify(field.data_type()) {
+        Some(DataTypeLayout::List(child)) => {
             let nested = enter_container(depth)?;
             validate_field(child, &join_path(path, child.name()), nested)
         }
-        DataType::Struct(fields) => {
+        Some(DataTypeLayout::Struct(fields)) => {
             let nested = enter_container(depth)?;
             validate_fields(fields, path, nested)
         }
-        data_type => Err(SchemaError::UnsupportedType {
+        Some(_) => Ok(()),
+        None => Err(SchemaError::UnsupportedType {
             field: path.to_owned(),
-            data_type: data_type.clone(),
+            data_type: field.data_type().clone(),
         }),
     }
 }

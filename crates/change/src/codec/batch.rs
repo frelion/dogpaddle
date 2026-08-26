@@ -6,14 +6,14 @@ use arrow_ipc::{
     Buffer as IpcBuffer, FieldNode, MetadataVersion, RecordBatch as IpcRecordBatch,
     RecordBatchArgs, reader::RecordBatchDecoder,
 };
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_schema::{Field, SchemaRef};
 use flatbuffers::FlatBufferBuilder;
 
 use super::{
     CodecError,
     stream::{ParsedChange, physical_schema},
 };
-use crate::{change::Change, projection::ChangeProjection};
+use crate::{change::Change, projection::ChangeProjection, schema::DataTypeLayout};
 
 pub(super) fn decode(
     parsed: &ParsedChange<'_>,
@@ -290,7 +290,13 @@ fn consume_field_layout(
             field.name()
         )));
     }
-    if matches!(field.data_type(), DataType::Null) && null_count != length {
+    let data_type_layout = DataTypeLayout::classify(field.data_type()).ok_or_else(|| {
+        CodecError::invalid(format!(
+            "unsupported Arrow type {} in RecordBatch layout",
+            field.data_type()
+        ))
+    })?;
+    if matches!(data_type_layout, DataTypeLayout::Null) && null_count != length {
         return Err(CodecError::invalid(format!(
             "RecordBatch Null field {:?} must mark every row as null",
             field.name()
@@ -300,7 +306,7 @@ fn consume_field_layout(
     let buffer_start = cursor.buffers;
     let own_buffer_end = cursor
         .buffers
-        .checked_add(own_buffer_count(field.data_type())?)
+        .checked_add(data_type_layout.own_buffer_count())
         .ok_or_else(|| CodecError::invalid("RecordBatch buffer count overflowed"))?;
     let own_buffers = buffers.get(buffer_start..own_buffer_end).ok_or_else(|| {
         CodecError::invalid(format!(
@@ -308,14 +314,14 @@ fn consume_field_layout(
             field.name()
         ))
     })?;
-    validate_own_buffer_lengths(field, length, own_buffers)?;
+    validate_own_buffer_lengths(data_type_layout, field, length, own_buffers)?;
     cursor.buffers = own_buffer_end;
 
-    match field.data_type() {
-        DataType::List(child) => {
+    match data_type_layout {
+        DataTypeLayout::List(child) => {
             consume_field_layout(child, None, 0, nodes, buffers, cursor)?;
         }
-        DataType::Struct(children) => {
+        DataTypeLayout::Struct(children) => {
             for child in children {
                 consume_field_layout(child, Some(length), null_count, nodes, buffers, cursor)?;
             }
@@ -329,34 +335,27 @@ fn consume_field_layout(
 }
 
 fn validate_own_buffer_lengths(
+    data_type: DataTypeLayout<'_>,
     field: &Field,
     length: usize,
     buffers: &[Range<usize>],
 ) -> Result<(), CodecError> {
-    if matches!(field.data_type(), DataType::Null) {
+    if matches!(data_type, DataTypeLayout::Null) {
         return Ok(());
     }
 
     require_buffer_length(field, &buffers[0], bitmap_byte_len(length)?, "validity")?;
-    let value_length = match field.data_type() {
-        DataType::Boolean => bitmap_byte_len(length),
-        DataType::Int8 | DataType::UInt8 => Ok(length),
-        DataType::Int16 | DataType::UInt16 => fixed_width_byte_len(length, 2),
-        DataType::Int32 | DataType::UInt32 | DataType::Float32 => fixed_width_byte_len(length, 4),
-        DataType::Int64 | DataType::UInt64 | DataType::Float64 => fixed_width_byte_len(length, 8),
-        DataType::Utf8 | DataType::Binary | DataType::List(_) => {
+    let value_length = match data_type {
+        DataTypeLayout::Struct(_) => return Ok(()),
+        DataTypeLayout::Bitmap => bitmap_byte_len(length),
+        DataTypeLayout::FixedWidth(byte_width) => fixed_width_byte_len(length, byte_width),
+        DataTypeLayout::VariableWidth | DataTypeLayout::List(_) => {
             let offset_count = length
                 .checked_add(1)
                 .ok_or_else(|| CodecError::invalid("Arrow offset count overflowed"))?;
             fixed_width_byte_len(offset_count, 4)
         }
-        DataType::Struct(_) => return Ok(()),
-        DataType::Null => unreachable!("Null fields returned before buffer validation"),
-        data_type => {
-            return Err(CodecError::invalid(format!(
-                "unsupported Arrow type {data_type} in RecordBatch layout"
-            )));
-        }
+        DataTypeLayout::Null => unreachable!("Null fields returned before buffer validation"),
     }?;
     require_buffer_length(field, &buffers[1], value_length, "values")
 }
@@ -389,29 +388,6 @@ fn bitmap_byte_len(length: usize) -> Result<usize, CodecError> {
         .checked_add(7)
         .map(|length| length / 8)
         .ok_or_else(|| CodecError::invalid("Arrow bitmap length overflowed"))
-}
-
-fn own_buffer_count(data_type: &DataType) -> Result<usize, CodecError> {
-    match data_type {
-        DataType::Null => Ok(0),
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::List(_) => Ok(2),
-        DataType::Utf8 | DataType::Binary => Ok(3),
-        DataType::Struct(_) => Ok(1),
-        data_type => Err(CodecError::invalid(format!(
-            "unsupported Arrow type {data_type} in RecordBatch layout"
-        ))),
-    }
 }
 
 fn validate_buffer_layout(
