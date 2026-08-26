@@ -8,6 +8,13 @@ use dogpaddle_store::{
 };
 use tempfile::TempDir;
 
+mod support;
+
+use support::{
+    SampleWork, average_duration, emit_configuration, emit_pair_summary, emit_samples,
+    emit_summary, format_duration, initialize, sample_dir, setting,
+};
+
 const DEFAULT_ENTRIES: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
@@ -62,7 +69,7 @@ where
     TypedMap<SIZE>: StoreData,
 {
     fn empty() -> Self {
-        let root = tempfile::tempdir().expect("temporary benchmark directory");
+        let root = sample_dir("ordered-map");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
             .create_data::<TypedMap<SIZE>>("map")
@@ -119,7 +126,7 @@ where
     }
 
     fn populated_with_small_background(entries: usize, background_namespaces: usize) -> Self {
-        let root = tempfile::tempdir().expect("temporary benchmark directory");
+        let root = sample_dir("ordered-map-background");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
             .create_data::<TypedMap<SIZE>>("target")
@@ -177,7 +184,7 @@ where
     TypedMap<SIZE>: StoreData,
 {
     fn populated() -> Self {
-        let root = tempfile::tempdir().expect("temporary stage benchmark directory");
+        let root = sample_dir("ordered-map-multi-collection");
         let mut store = Store::create(root.path().join("store")).expect("create stage store");
         let cursor = store
             .create_data::<Cell<u64>>("cursor")
@@ -221,7 +228,7 @@ where
     OrderedMap<u64, V, SIZE>: StoreData,
 {
     fn populated(entries: usize, value: &V) -> Self {
-        let root = tempfile::tempdir().expect("temporary scan benchmark directory");
+        let root = sample_dir("ordered-map-scan");
         let mut store =
             Store::create(root.path().join("store")).expect("create scan benchmark store");
         let map = store
@@ -254,9 +261,7 @@ where
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
-    }
+    initialize("store_ordered_map");
 
     let entries = setting("DOGPADDLE_BENCH_ENTRIES", DEFAULT_ENTRIES);
     let commits = setting("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS);
@@ -280,6 +285,12 @@ fn main() {
             && scan_bytes > 0
             && wide_scan_entries > 0
     );
+    emit_configuration(
+        "store_ordered_map",
+        &format!(
+            "\"entries\":{entries},\"value_bytes\":{VALUE_BYTES},\"wide_scan_entries\":{wide_scan_entries},\"wide_value_bytes\":{WIDE_VALUE_BYTES},\"commits\":{commits},\"samples\":{samples},\"background_namespaces\":{background_namespaces},\"scan_items\":{scan_items},\"scan_bytes\":{scan_bytes},\"random_seed\":{RANDOM_SEED}"
+        ),
+    );
 
     println!("DogPaddle OrderedMap benchmark");
     println!(
@@ -287,12 +298,6 @@ fn main() {
     );
     println!(
         "sync=durable execution=single-thread point_scan_cache=warm random_seed={RANDOM_SEED:#x}"
-    );
-    println!(
-        "platform={}-{} temp_root={}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::temp_dir().display()
     );
 
     print_section(
@@ -487,8 +492,14 @@ fn benchmark_isolated(entries: usize, samples: usize, scan_items: usize, scan_by
         "hot overwrite + rollback",
         entries,
         samples,
-        || measure_hot_overwrite_rollback(&mut small, entries),
-        || measure_hot_overwrite_rollback(&mut large, entries),
+        || {
+            let mut fixture = Fixture::<Small>::populated_typed(entries);
+            measure_hot_overwrite_rollback(&mut fixture, entries)
+        },
+        || {
+            let mut fixture = Fixture::<Large>::populated_typed(entries);
+            measure_hot_overwrite_rollback(&mut fixture, entries)
+        },
     );
 }
 
@@ -556,27 +567,35 @@ fn benchmark_narrow_scan_modes(
 
 fn benchmark_stage_steps(steps: usize, samples: usize) {
     for operations_per_step in [1, 8, 64] {
-        let mut small = StageFixture::<Small>::populated();
-        let mut large = StageFixture::<Large>::populated();
         report_pair(
             &format!("stage step x{operations_per_step}"),
             steps,
             samples,
-            || measure_stage_steps(&mut small, steps, operations_per_step),
-            || measure_stage_steps(&mut large, steps, operations_per_step),
+            || {
+                let mut fixture = StageFixture::<Small>::populated();
+                measure_stage_steps(&mut fixture, steps, operations_per_step)
+            },
+            || {
+                let mut fixture = StageFixture::<Large>::populated();
+                measure_stage_steps(&mut fixture, steps, operations_per_step)
+            },
         );
     }
 }
 
 fn benchmark_durable_overwrite(commits: usize, samples: usize) {
-    let mut small = Fixture::<Small>::empty();
-    let mut large = Fixture::<Large>::empty();
     report_pair(
         "durable overwrite commit",
         commits,
         samples,
-        || measure_single_put_commits(&mut small, commits),
-        || measure_single_put_commits(&mut large, commits),
+        || {
+            let mut fixture = Fixture::<Small>::empty();
+            measure_single_put_commits(&mut fixture, commits)
+        },
+        || {
+            let mut fixture = Fixture::<Large>::empty();
+            measure_single_put_commits(&mut fixture, commits)
+        },
     );
 }
 
@@ -684,7 +703,29 @@ where
     transaction
         .commit()
         .expect("commit byte map benchmark writes");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin byte map write validation transaction");
+    let bytes = fixture
+        .bytes
+        .access(transaction.access())
+        .expect("access byte map for write validation");
+    let first = 0_u64.to_be_bytes().to_vec();
+    let last = u64::try_from(entries - 1)
+        .expect("entry count fits u64")
+        .to_be_bytes()
+        .to_vec();
+    assert_eq!(
+        bytes.get(&first).unwrap().as_deref(),
+        Some(value.as_slice())
+    );
+    assert_eq!(bytes.get(&last).unwrap().as_deref(), Some(value.as_slice()));
+    transaction
+        .commit()
+        .expect("finish byte map write validation transaction");
+    elapsed
 }
 
 fn measure_bulk_put<SIZE>(entries: usize) -> Duration
@@ -710,7 +751,26 @@ where
         }
     }
     transaction.commit().expect("commit benchmark writes");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin map write validation transaction");
+    let map = fixture
+        .map
+        .access(transaction.access())
+        .expect("access map for write validation");
+    assert_eq!(map.get(&0).unwrap().as_deref(), Some(value.as_slice()));
+    assert_eq!(
+        map.get(&u64::try_from(entries - 1).expect("entry count fits u64"))
+            .unwrap()
+            .as_deref(),
+        Some(value.as_slice())
+    );
+    transaction
+        .commit()
+        .expect("finish map write validation transaction");
+    elapsed
 }
 
 fn measure_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Duration {
@@ -735,7 +795,9 @@ fn measure_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Durat
     }
     black_box(checksum);
     transaction.commit().expect("finish read transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
+    elapsed
 }
 
 fn measure_byte_map_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Duration {
@@ -762,7 +824,9 @@ fn measure_byte_map_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize)
     transaction
         .commit()
         .expect("finish byte map read transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
+    elapsed
 }
 
 fn measure_byte_map_scan<SIZE>(
@@ -800,12 +864,14 @@ fn measure_byte_map_scan<SIZE>(
             break;
         }
     }
-    assert_eq!(count, entries);
     black_box(checksum);
     transaction
         .commit()
         .expect("finish byte map scan transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(count, entries);
+    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
+    elapsed
 }
 
 fn measure_scan<SIZE>(
@@ -843,10 +909,12 @@ fn measure_scan<SIZE>(
             break;
         }
     }
-    assert_eq!(count, entries);
     black_box(checksum);
     transaction.commit().expect("finish scan transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(count, entries);
+    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
+    elapsed
 }
 
 fn measure_primitive_scan<SIZE>(
@@ -889,12 +957,14 @@ fn measure_primitive_scan<SIZE>(
             break;
         }
     }
-    assert_eq!(count, entries);
     black_box(checksum);
     transaction
         .commit()
         .expect("finish primitive scan transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(count, entries);
+    assert_eq!(checksum, expected_scan_checksum(entries, 0x5a));
+    elapsed
 }
 
 fn measure_vec_scan<SIZE>(
@@ -940,12 +1010,14 @@ fn measure_vec_scan<SIZE>(
             break;
         }
     }
-    assert_eq!(count, entries);
     black_box(checksum);
     transaction
         .commit()
         .expect("finish vector scan transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(count, entries);
+    assert_eq!(checksum, expected_scan_checksum(entries, 0x5a));
+    elapsed
 }
 
 fn project_vec_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
@@ -960,10 +1032,16 @@ fn measure_stage_steps<SIZE>(
     fixture: &mut StageFixture<SIZE>,
     steps: usize,
     operations_per_step: usize,
-) -> Duration {
-    let operations_per_step =
+) -> Duration
+where
+    TypedMap<SIZE>: StoreData,
+{
+    let operations_per_step_u64 =
         u64::try_from(operations_per_step).expect("stage batch size fits in u64");
     let stage_keys = u64::try_from(STAGE_KEYS).expect("stage key count fits in u64");
+    let initial_cursor = read_stage_cursor(fixture);
+    let expected_first_bytes =
+        expected_stage_first_bytes(initial_cursor, steps, operations_per_step_u64, stage_keys);
     let started = std::time::Instant::now();
     for _ in 0..steps {
         let transaction = fixture
@@ -982,9 +1060,9 @@ fn measure_stage_steps<SIZE>(
                 .map
                 .access(transaction.access())
                 .expect("access stage map");
-            for offset in 0..operations_per_step {
+            for offset in 0..operations_per_step_u64 {
                 let key = cursor
-                    .wrapping_mul(operations_per_step)
+                    .wrapping_mul(operations_per_step_u64)
                     .wrapping_add(offset)
                     % stage_keys;
                 let mut value = map
@@ -1003,7 +1081,13 @@ fn measure_stage_steps<SIZE>(
             .expect("advance stage cursor");
         transaction.commit().expect("commit stage transaction");
     }
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(
+        read_stage_cursor(fixture),
+        initial_cursor.wrapping_add(u64::try_from(steps).expect("step count fits u64"))
+    );
+    assert_stage_map(fixture, &expected_first_bytes);
+    elapsed
 }
 
 fn measure_hot_overwrite_rollback<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Duration {
@@ -1024,7 +1108,23 @@ fn measure_hot_overwrite_rollback<SIZE>(fixture: &mut Fixture<SIZE>, entries: us
         }
     }
     drop(transaction);
-    started.elapsed()
+    let elapsed = started.elapsed();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin rollback validation transaction");
+    let value = fixture
+        .map
+        .access(transaction.access())
+        .expect("access map for rollback validation")
+        .get(&0)
+        .expect("read rollback validation value")
+        .expect("seeded rollback validation value");
+    assert_eq!(value[0], 0x5a);
+    transaction
+        .commit()
+        .expect("finish rollback validation transaction");
+    elapsed
 }
 
 fn measure_single_put_commits<SIZE>(fixture: &mut Fixture<SIZE>, commits: usize) -> Duration {
@@ -1044,7 +1144,104 @@ fn measure_single_put_commits<SIZE>(fixture: &mut Fixture<SIZE>, commits: usize)
             .expect("write single-put value");
         transaction.commit().expect("commit single-put transaction");
     }
-    started.elapsed()
+    let elapsed = started.elapsed();
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin durable overwrite validation transaction");
+    let actual = fixture
+        .map
+        .access(transaction.access())
+        .expect("access durable overwrite validation map")
+        .get(&0)
+        .expect("read durable overwrite validation value")
+        .expect("durable overwrite value exists");
+    assert_eq!(
+        &actual[..size_of::<u64>()],
+        &u64::try_from(commits - 1)
+            .expect("commit count fits u64")
+            .to_be_bytes()
+    );
+    transaction
+        .commit()
+        .expect("finish durable overwrite validation transaction");
+    elapsed
+}
+
+fn read_stage_cursor<SIZE>(fixture: &mut StageFixture<SIZE>) -> u64
+where
+    TypedMap<SIZE>: StoreData,
+{
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin stage cursor validation transaction");
+    let cursor = fixture
+        .cursor
+        .access(transaction.access())
+        .expect("access stage cursor for validation")
+        .get()
+        .expect("read stage cursor for validation")
+        .expect("seeded stage cursor exists");
+    transaction
+        .commit()
+        .expect("finish stage cursor validation transaction");
+    cursor
+}
+
+fn expected_stage_first_bytes(
+    initial_cursor: u64,
+    steps: usize,
+    operations_per_step: u64,
+    stage_keys: u64,
+) -> Vec<u8> {
+    let mut expected = vec![0x5a_u8; STAGE_KEYS];
+    for step in 0..steps {
+        let cursor =
+            initial_cursor.wrapping_add(u64::try_from(step).expect("stage step fits in u64"));
+        for offset in 0..operations_per_step {
+            let key = cursor
+                .wrapping_mul(operations_per_step)
+                .wrapping_add(offset)
+                % stage_keys;
+            let key = usize::try_from(key).expect("stage key fits in usize");
+            expected[key] = expected[key].wrapping_add(1);
+        }
+    }
+    expected
+}
+
+fn assert_stage_map<SIZE>(fixture: &mut StageFixture<SIZE>, expected_first_bytes: &[u8])
+where
+    TypedMap<SIZE>: StoreData,
+{
+    assert_eq!(expected_first_bytes.len(), STAGE_KEYS);
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin stage map validation transaction");
+    let map = fixture
+        .map
+        .access(transaction.access())
+        .expect("access stage map for validation");
+    for (key, expected_first) in expected_first_bytes.iter().copied().enumerate() {
+        let value = map
+            .get(&u64::try_from(key).expect("stage validation key fits in u64"))
+            .expect("read stage map validation value")
+            .expect("seeded stage map value exists");
+        assert_eq!(value.len(), VALUE_BYTES);
+        assert_eq!(value[0], expected_first);
+        assert!(value[1..].iter().all(|byte| *byte == 0x5a));
+    }
+    transaction
+        .commit()
+        .expect("finish stage map validation transaction");
+}
+
+fn expected_scan_checksum(entries: usize, value: u64) -> u64 {
+    (0..entries).fold(0_u64, |checksum, key| {
+        checksum.wrapping_add(u64::try_from(key).expect("benchmark key fits u64") ^ value)
+    })
 }
 
 fn report_pair(
@@ -1079,6 +1276,14 @@ fn report_pair(
         .zip(&large_durations)
         .filter(|(small, large)| small < large)
         .count();
+    emit_pair_summary(
+        "store_ordered_map",
+        workload,
+        "Small",
+        "Large",
+        &small_durations,
+        &large_durations,
+    );
     report(workload, "Small", operations, small_durations);
     report(workload, "Large", operations, large_durations);
     println!("  paired Small/Large median={median_ratio:.3}x; Small wins {small_wins}/{samples}");
@@ -1117,6 +1322,14 @@ fn report_mode_pair<T>(
         .zip(&projected_durations)
         .filter(|(full, projected)| projected < full)
         .count();
+    emit_pair_summary(
+        "store_ordered_map",
+        workload,
+        "Full",
+        "Projected",
+        &full_durations,
+        &projected_durations,
+    );
     report(workload, "Full", operations, full_durations);
     report(workload, "Projected", operations, projected_durations);
     println!(
@@ -1125,6 +1338,39 @@ fn report_mode_pair<T>(
 }
 
 fn report(workload: &str, size: &str, operations: usize, mut durations: Vec<Duration>) {
+    let transactions =
+        if workload.starts_with("stage step") || workload == "durable overwrite commit" {
+            operations
+        } else {
+            1
+        };
+    let logical_bytes = if let Some(operations_per_step) = workload
+        .strip_prefix("stage step x")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        let bytes_per_step = operations_per_step
+            .checked_mul(2 * (size_of::<u64>() + VALUE_BYTES))
+            .and_then(|value| value.checked_add(2 * size_of::<u64>()))
+            .unwrap();
+        operations.checked_mul(bytes_per_step).unwrap()
+    } else if workload.contains("wide") {
+        operations
+            .checked_mul(size_of::<u64>() + WIDE_VALUE_BYTES)
+            .unwrap()
+    } else if workload.contains("primitive") {
+        operations.checked_mul(size_of::<u64>() * 2).unwrap()
+    } else {
+        operations
+            .checked_mul(size_of::<u64>() + VALUE_BYTES)
+            .unwrap()
+    };
+    let work = SampleWork {
+        operations,
+        transactions,
+        logical_bytes,
+    };
+    emit_samples("store_ordered_map", workload, size, &durations, work);
+    emit_summary("store_ordered_map", workload, size, &durations, work);
     durations.sort_unstable();
     let min = durations[0];
     let median = durations[durations.len() / 2];
@@ -1133,9 +1379,9 @@ fn report(workload: &str, size: &str, operations: usize, mut durations: Vec<Dura
     let median_per_operation = average_duration(median, operations);
     println!(
         "{workload:<28} {size:<10} {operations:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
-        duration(min),
-        duration(median),
-        duration(max),
+        format_duration(min),
+        format_duration(median),
+        format_duration(max),
     );
 }
 
@@ -1152,27 +1398,4 @@ fn print_section(name: &str, description: &str) {
 fn print_group(description: &str) {
     println!();
     println!("-- {description} --");
-}
-
-fn average_duration(total: Duration, operations: usize) -> String {
-    let nanos = total.as_nanos() / operations as u128;
-    duration(Duration::from_nanos(
-        u64::try_from(nanos).expect("average benchmark duration fits in u64 nanoseconds"),
-    ))
-}
-
-fn duration(value: Duration) -> String {
-    if value.as_secs_f64() >= 1.0 {
-        format!("{:.3} s", value.as_secs_f64())
-    } else if value.as_millis() > 0 {
-        format!("{:.3} ms", value.as_secs_f64() * 1_000.0)
-    } else {
-        format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
-    }
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
-        value.parse().expect("benchmark setting must be an integer")
-    })
 }

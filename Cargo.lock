@@ -272,10 +272,19 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
- "dogpaddle-store",
  "flatbuffers",
- "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "dogpaddle-change-store-integration"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "dogpaddle-change",
+ "dogpaddle-store",
+ "tempfile",
 ]
 
 [[package]]

@@ -40,7 +40,10 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 | [`dogpaddle-store`](crates/store/README.md) | MDBX 事务存储、命名数据空间、编解码器和类型化集合。 |
 
 Stage 是 Flow 内部的一对一 Operation 执行单元，不是独立 crate。上述 crate 是引擎内核的
-实现模块，不是最终用户二进制入口。
+实现模块，不是最终用户二进制入口。正常产品依赖的装配契约归组合根 crate 所有，例如 Flow
+负责验证 Operation + Store 的 build/open；只有没有产品组合根的 sibling 接缝才进入外部测试
+package。`integration-tests/change-store` 因而作为不可发布的下游包，只通过公共 API 验证完整
+Change Stream 与 `AppendLog<Vec<u8>>` 的装配边界。
 
 ## 适用场景
 
@@ -62,4 +65,6 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 - [Operation Definition 与实例约束](crates/operation/README.md)
 - [Store 存储语义、测试与性能](crates/store/README.md)
 - [Cell、Small/Large OrderedMap 与 AppendLog 实测报告](crates/store/PERFORMANCE.md)
+- [Change + AppendLog 外部集成与长稳协议](integration-tests/change-store/README.md)
+- [正确性、集成与性能测试体系](TESTING.md)
 - [仓库贡献指南](AGENTS.md)

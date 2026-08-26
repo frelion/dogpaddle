@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 readme = "README.md"
+autotests = false
+autobenches = false
+
+[lib]
+bench = false
 
 [dependencies]
 arrow-array.workspace = true
@@ -13,9 +18,21 @@ arrow-schema.workspace = true
 flatbuffers.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-dogpaddle-store.workspace = true
-tempfile.workspace = true
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[[bench]]
+name = "change_core"
+path = "benches/change_core.rs"
+harness = false
+test = false
+
+[[bench]]
+name = "change_codec"
+path = "benches/change_codec.rs"
+harness = false
+test = false
 
 [lints]
 workspace = true

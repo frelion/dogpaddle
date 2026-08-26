@@ -4,7 +4,19 @@
 事务批次将来应当如何组织。报告同时保留正收益、未检测到收益和回归门禁结果，避免把底层
 microbenchmark 外推成上层吞吐承诺。
 
-报告生成于 2026-08-25。完整基准可以通过文末命令重新运行。
+表格中的历史报告生成于 2026-08-25。完整基准可以通过文末命令重新运行。
+
+## 当前 runner 与历史基线
+
+当前四个 benchmark target 已统一到 [`TESTING.md`](./TESTING.md) 定义的 runner 协议：逐样本
+JSON、完整环境指纹、计时外 oracle、隔离样本 Store，以及 `smoke`/`reference` 文件系统档位。
+`append_log_endurance` 还增加了独立 `smoke`/`full` workload、工作集和总写入硬预算、逐 cycle
+append/truncate 记录与 reopen checksum。
+
+下文 2026-08-25 数值是旧 runner 在明确记录的 WSL2 `/tmp` 环境中得到的历史优化证据，应保留
+用于解释设计决策；它们不能直接作为新 runner 的回归基线。建立新基线时必须在固定 reference
+目录重新运行，保存 stdout 中所有 `record=sample` 与 `record=pair_summary` JSON，再从同一协议的
+原始配对样本比较。
 
 ## 结论摘要
 
@@ -272,6 +284,20 @@ cargo bench -p dogpaddle-store --bench append_log
 cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
-常用环境变量及 workload 解释见 [`README.md`](./README.md#性能)。做回归比较时必须固定机器、
-文件系统、Rust profile、records、record bytes、transaction 数与 codec；至少同时查看 paired
-ratio、胜出次数、min/median/max，并保留没有收益的结果。
+默认运行是安全的 `smoke` 档。正式基准示例：
+
+```bash
+DOGPADDLE_STORE_BENCH_PROFILE=reference \
+DOGPADDLE_STORE_BENCH_STORE_DIR=/absolute/path/on/reference-disk \
+cargo bench -p dogpaddle-store --bench append_log
+
+DOGPADDLE_STORE_BENCH_PROFILE=reference \
+DOGPADDLE_STORE_BENCH_STORE_DIR=/absolute/path/on/reference-disk \
+DOGPADDLE_STORE_ENDURANCE_PROFILE=full \
+cargo bench -p dogpaddle-store --bench append_log_endurance
+```
+
+常用环境变量及 workload 解释见 [`README.md`](./README.md#性能)，运行档位、JSON schema 和预算见
+[`TESTING.md`](./TESTING.md)。做回归比较时必须固定机器、文件系统、Rust profile、records、
+record bytes、transaction 数与 codec；至少同时查看 paired ratio、胜出次数、min/median/max，
+并保留没有收益的结果。

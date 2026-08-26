@@ -8,6 +8,13 @@ use dogpaddle_store::{
 };
 use tempfile::TempDir;
 
+mod support;
+
+use support::{
+    SampleWork, average_duration, emit_configuration, emit_pair_summary, emit_samples,
+    emit_summary, format_duration, initialize, sample_dir, setting, setting_list,
+};
+
 const DEFAULT_ENTRIES: usize = 10_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
@@ -93,7 +100,7 @@ impl StoreValue for CdcRecord {
 
 impl LogFixture {
     fn populated(entries: usize, record_bytes: usize, readers: usize) -> Self {
-        let root = tempfile::tempdir().expect("temporary append-log benchmark directory");
+        let root = sample_dir("append-log-fixture");
         let mut store =
             Store::create(root.path().join("store")).expect("create append-log benchmark store");
         let input = store
@@ -174,9 +181,7 @@ impl LogFixture {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
-    }
+    initialize("store_append_log");
 
     let entries = setting("DOGPADDLE_BENCH_LOG_ENTRIES", DEFAULT_ENTRIES);
     let commits = setting("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS);
@@ -203,6 +208,12 @@ fn main() {
     assert!(record_sizes.iter().all(|size| *size >= RECORD_HEADER_BYTES));
     assert!(source_batches.iter().all(|size| *size > 0));
     assert!(readers.iter().all(|count| *count > 0));
+    emit_configuration(
+        "store_append_log",
+        &format!(
+            "\"entries\":{entries},\"commits_cap\":{commits},\"samples\":{samples},\"record_bytes\":{record_sizes:?},\"source_batch_items\":{source_batches:?},\"stage_record_bytes\":{stage_record_bytes},\"stage_batch_items\":{stage_batch_items},\"gc_items\":{gc_items},\"readers\":{readers:?}"
+        ),
+    );
 
     println!("DogPaddle AppendLog benchmark");
     println!(
@@ -213,12 +224,6 @@ fn main() {
     );
     println!(
         "sync=durable execution=single-thread cache=warm seed=outside-timing validation=outside-timing"
-    );
-    println!(
-        "platform={}-{} temp_root={}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::temp_dir().display()
     );
     print_log_section(
         "AppendLog<T>: encoded width and read strategy",
@@ -264,6 +269,7 @@ fn benchmark_record_widths(
             "bulk append pre-encoded, one tx",
             entries,
             record_bytes,
+            1,
             samples,
             || measure_append(&encoded, entries),
         );
@@ -287,12 +293,22 @@ fn benchmark_record_widths(
         );
 
         let mut fixture = LogFixture::populated(entries, record_bytes, 0);
-        report_log("scan project diff", entries, record_bytes, samples, || {
-            measure_project_scan(&mut fixture, entries, record_bytes, scan_items)
-        });
-        report_log("scan full decode", entries, record_bytes, samples, || {
-            measure_decode_scan(&mut fixture, entries, record_bytes, scan_items)
-        });
+        report_log_mode_pair(
+            &format!("scan decode record_bytes={record_bytes}"),
+            "scan project diff",
+            "scan full decode",
+            entries,
+            record_bytes,
+            1,
+            samples,
+            |full| {
+                if full {
+                    measure_decode_scan(&mut fixture, entries, record_bytes, scan_items)
+                } else {
+                    measure_project_scan(&mut fixture, entries, record_bytes, scan_items)
+                }
+            },
+        );
     }
 }
 
@@ -311,6 +327,7 @@ fn benchmark_durable_source(
             &format!("source append b{batch_items} ({transactions} tx)"),
             measured_entries,
             record_bytes,
+            transactions,
             samples,
             || measure_durable_append(&records[..measured_entries], measured_entries, batch_items),
         );
@@ -330,22 +347,41 @@ fn benchmark_stage_transactions(
         &format!("stage count project ({transactions} tx)"),
         entries,
         record_bytes,
+        transactions,
         samples,
         || measure_count_stage(entries, record_bytes, batch_items),
     );
-    for (name, mode) in [
-        ("stage raw pass-through", FilterMode::PassThrough),
-        ("stage filter 50% project", FilterMode::ProjectedHalf),
-        ("stage filter 50% decode", FilterMode::DecodedHalf),
-    ] {
-        report_log(
-            &format!("{name} ({transactions} tx)"),
-            entries,
-            record_bytes,
-            samples,
-            || measure_filter_stage(entries, record_bytes, batch_items, mode),
-        );
-    }
+    report_log(
+        &format!("stage raw pass-through ({transactions} tx)"),
+        entries,
+        record_bytes,
+        transactions,
+        samples,
+        || measure_filter_stage(entries, record_bytes, batch_items, FilterMode::PassThrough),
+    );
+    let projected = format!("stage filter 50% project ({transactions} tx)");
+    let decoded = format!("stage filter 50% decode ({transactions} tx)");
+    report_log_mode_pair(
+        &format!("stage filter 50% record_bytes={record_bytes}"),
+        &projected,
+        &decoded,
+        entries,
+        record_bytes,
+        transactions,
+        samples,
+        |decode| {
+            measure_filter_stage(
+                entries,
+                record_bytes,
+                batch_items,
+                if decode {
+                    FilterMode::DecodedHalf
+                } else {
+                    FilterMode::ProjectedHalf
+                },
+            )
+        },
+    );
 
     let steady_transactions =
         entries.div_ceil(batch_items) + chunked_gc_transactions(entries, batch_items, gc_items);
@@ -353,6 +389,7 @@ fn benchmark_stage_transactions(
         &format!("steady append + GC ({steady_transactions} tx)"),
         entries,
         record_bytes,
+        steady_transactions,
         samples,
         || measure_steady_window(entries, record_bytes, batch_items, gc_items),
     );
@@ -368,6 +405,7 @@ fn benchmark_stage_transactions(
             &format!("downstream replay x{reader_count} ({reader_transactions} tx)"),
             deliveries,
             record_bytes,
+            reader_transactions,
             samples,
             || measure_readers(entries, record_bytes, batch_items, reader_count),
         );
@@ -378,6 +416,7 @@ fn benchmark_stage_transactions(
         &format!("prefix GC b{gc_items} ({gc_transactions} tx)"),
         entries,
         record_bytes,
+        gc_transactions,
         samples,
         || measure_gc(entries, record_bytes, gc_items),
     );
@@ -388,7 +427,7 @@ fn measure_append<T: StoreValue>(records: &[T], expected: usize) -> Duration {
 }
 
 fn measure_batch_append<T: StoreValue>(records: &[T], expected: usize) -> Duration {
-    let root = tempfile::tempdir().expect("temporary batch append benchmark directory");
+    let root = sample_dir("append-log-batch");
     let mut store =
         Store::create(root.path().join("store")).expect("create batch append benchmark store");
     let log = store
@@ -413,31 +452,39 @@ fn measure_batch_append<T: StoreValue>(records: &[T], expected: usize) -> Durati
 }
 
 fn measure_append_body<T: StoreValue>(records: &[T], batch: bool) -> Duration {
-    let root = tempfile::tempdir().expect("temporary append-body benchmark directory");
+    let root = sample_dir("append-log-body");
     let mut store =
         Store::create(root.path().join("store")).expect("create append-body benchmark store");
-    let log = store
+    let log_handle = store
         .create_data::<AppendLog<T>>("log")
         .expect("create append-body benchmark log");
     let mut transactions = store.into_transactions();
     let transaction = transactions
         .begin()
         .expect("begin append-body benchmark transaction");
-    let mut log = log
-        .access(transaction.access())
-        .expect("access append-body benchmark log");
+    let elapsed = {
+        let mut log = log_handle
+            .access(transaction.access())
+            .expect("access append-body benchmark log");
 
-    let started = std::time::Instant::now();
-    if batch {
-        log.append_batch(records)
-            .expect("append benchmark batch body");
-    } else {
-        for record in records {
-            log.append(record).expect("append benchmark scalar body");
+        let started = std::time::Instant::now();
+        if batch {
+            log.append_batch(records)
+                .expect("append benchmark batch body");
+        } else {
+            for record in records {
+                log.append(record).expect("append benchmark scalar body");
+            }
         }
-    }
-    let elapsed = started.elapsed();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            log.bounds().expect("read append-body bounds"),
+            0..u64::try_from(records.len()).expect("record count fits u64")
+        );
+        elapsed
+    };
     drop(transaction);
+    assert_bounds(&mut transactions, &log_handle, 0, 0);
     elapsed
 }
 
@@ -446,7 +493,7 @@ fn measure_durable_append<T: StoreValue>(
     expected: usize,
     batch_items: usize,
 ) -> Duration {
-    let root = tempfile::tempdir().expect("temporary append benchmark directory");
+    let root = sample_dir("append-log-durable");
     let mut store =
         Store::create(root.path().join("store")).expect("create append benchmark store");
     let log = store
@@ -480,6 +527,7 @@ fn measure_project_scan(
     record_bytes: usize,
     batch_items: usize,
 ) -> Duration {
+    let expected_checksum = expected_diff_checksum(entries);
     let started = std::time::Instant::now();
     let transaction = fixture
         .transactions
@@ -511,6 +559,7 @@ fn measure_project_scan(
     let elapsed = started.elapsed();
     assert_eq!(count, entries);
     assert_eq!(cursor, to_u64(entries));
+    assert_eq!(checksum, expected_checksum);
     black_box(checksum);
     elapsed
 }
@@ -521,6 +570,7 @@ fn measure_decode_scan(
     record_bytes: usize,
     batch_items: usize,
 ) -> Duration {
+    let expected_checksum = expected_full_scan_checksum(entries, record_bytes);
     let started = std::time::Instant::now();
     let transaction = fixture
         .transactions
@@ -555,12 +605,14 @@ fn measure_decode_scan(
     let elapsed = started.elapsed();
     assert_eq!(count, entries);
     assert_eq!(cursor, to_u64(entries));
+    assert_eq!(checksum, expected_checksum);
     black_box(checksum);
     elapsed
 }
 
 fn measure_count_stage(entries: usize, record_bytes: usize, batch_items: usize) -> Duration {
     let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+    let expected_count = expected_diff_checksum(entries);
     let mut processed = 0_usize;
     let started = std::time::Instant::now();
     loop {
@@ -617,7 +669,7 @@ fn measure_count_stage(entries: usize, record_bytes: usize, batch_items: usize) 
     }
     let elapsed = started.elapsed();
     assert_eq!(processed, entries);
-    assert_stage_cursor(&mut fixture, entries);
+    assert_count_stage(&mut fixture, entries, expected_count);
     elapsed
 }
 
@@ -859,6 +911,33 @@ fn assert_stage_cursor(fixture: &mut LogFixture, expected: usize) {
         .expect("finish stage validation transaction");
 }
 
+fn assert_count_stage(fixture: &mut LogFixture, expected_cursor: usize, expected_count: i64) {
+    let transaction = fixture
+        .transactions
+        .begin()
+        .expect("begin count stage validation transaction");
+    let cursor = fixture
+        .stage_state
+        .access(transaction.access())
+        .expect("access count stage validation state")
+        .get(&CURSOR_KEY.to_vec())
+        .expect("read count stage validation cursor")
+        .map(decode_cursor)
+        .expect("seeded count stage validation cursor");
+    let count = fixture
+        .count
+        .access(transaction.access())
+        .expect("access count stage validation count")
+        .get()
+        .expect("read count stage validation count")
+        .expect("seeded count stage validation count");
+    assert_eq!(cursor, to_u64(expected_cursor));
+    assert_eq!(count, expected_count);
+    transaction
+        .commit()
+        .expect("finish count stage validation transaction");
+}
+
 fn assert_bounds<T: StoreValue>(
     transactions: &mut Transactions,
     log: &AppendLog<T>,
@@ -908,6 +987,22 @@ fn decode_cursor(encoded: Vec<u8>) -> u64 {
     u64::decode_value(encoded.into()).expect("valid benchmark cursor encoding")
 }
 
+fn expected_diff_checksum(entries: usize) -> i64 {
+    i64::from(!entries.is_multiple_of(2))
+}
+
+fn expected_full_scan_checksum(entries: usize, record_bytes: usize) -> u64 {
+    (0..entries).fold(0_u64, |checksum, index| {
+        let key = to_u64(index);
+        let fill = if record_bytes == RECORD_HEADER_BYTES {
+            0
+        } else {
+            u8::try_from(key & 0xff).expect("masked payload byte fits in u8")
+        };
+        checksum.wrapping_add(key).wrapping_add(u64::from(fill))
+    })
+}
+
 fn make_records(entries: usize, record_bytes: usize) -> Vec<CdcRecord> {
     make_records_from(0, entries, record_bytes)
 }
@@ -943,6 +1038,7 @@ fn report_log(
     workload: &str,
     records: usize,
     record_bytes: usize,
+    transactions: usize,
     samples: usize,
     mut measure: impl FnMut() -> Duration,
 ) {
@@ -951,6 +1047,88 @@ fn report_log(
     for _ in 0..samples {
         durations.push(measure());
     }
+    report_log_measurements(workload, records, record_bytes, transactions, &durations);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_log_mode_pair(
+    pair_scenario: &str,
+    first_name: &str,
+    second_name: &str,
+    records: usize,
+    record_bytes: usize,
+    transactions: usize,
+    samples: usize,
+    mut measure: impl FnMut(bool) -> Duration,
+) {
+    measure(false);
+    measure(true);
+    let mut first_durations = Vec::with_capacity(samples);
+    let mut second_durations = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        if matches!(sample % 4, 0 | 3) {
+            first_durations.push(measure(false));
+            second_durations.push(measure(true));
+        } else {
+            second_durations.push(measure(true));
+            first_durations.push(measure(false));
+        }
+    }
+
+    report_log_measurements(
+        first_name,
+        records,
+        record_bytes,
+        transactions,
+        &first_durations,
+    );
+    report_log_measurements(
+        second_name,
+        records,
+        record_bytes,
+        transactions,
+        &second_durations,
+    );
+    emit_pair_summary(
+        "store_append_log",
+        pair_scenario,
+        first_name,
+        second_name,
+        &first_durations,
+        &second_durations,
+    );
+    let wins = first_durations
+        .iter()
+        .zip(&second_durations)
+        .filter(|(first, second)| second < first)
+        .count();
+    let mut ratios = first_durations
+        .iter()
+        .zip(&second_durations)
+        .map(|(first, second)| first.as_secs_f64() / second.as_secs_f64())
+        .collect::<Vec<_>>();
+    ratios.sort_by(f64::total_cmp);
+    println!(
+        "  paired first/second median={:.3}x; second wins {wins}/{samples}",
+        ratios[ratios.len() / 2]
+    );
+}
+
+fn report_log_measurements(
+    workload: &str,
+    records: usize,
+    record_bytes: usize,
+    transactions: usize,
+    durations: &[Duration],
+) {
+    let work = SampleWork {
+        operations: records,
+        transactions,
+        logical_bytes: records.checked_mul(record_bytes).unwrap(),
+    };
+    emit_samples("store_append_log", workload, "default", durations, work);
+    emit_summary("store_append_log", workload, "default", durations, work);
+    let mut durations = durations.to_vec();
     durations.sort_unstable();
     let min = durations[0];
     let median = durations[durations.len() / 2];
@@ -967,9 +1145,9 @@ fn report_log(
     );
     println!(
         "{workload:<45} {record_bytes:>9} {records:>11} {:>12} {:>12} {:>12} {median_per_record:>12} {records_per_second:>13} {encoded_mib_per_second:>13}",
-        duration(min),
-        duration(median),
-        duration(max),
+        format_duration(min),
+        format_duration(median),
+        format_duration(max),
     );
 }
 
@@ -995,6 +1173,48 @@ fn report_log_pair(
             first_durations.push(first());
         }
     }
+
+    let work = SampleWork {
+        operations: records,
+        transactions: 1,
+        logical_bytes: records.checked_mul(record_bytes).unwrap(),
+    };
+    emit_samples(
+        "store_append_log",
+        first_name,
+        "first",
+        &first_durations,
+        work,
+    );
+    emit_summary(
+        "store_append_log",
+        first_name,
+        "first",
+        &first_durations,
+        work,
+    );
+    emit_samples(
+        "store_append_log",
+        second_name,
+        "second",
+        &second_durations,
+        work,
+    );
+    emit_summary(
+        "store_append_log",
+        second_name,
+        "second",
+        &second_durations,
+        work,
+    );
+    emit_pair_summary(
+        "store_append_log",
+        &format!("record_bytes={record_bytes}"),
+        first_name,
+        second_name,
+        &first_durations,
+        &second_durations,
+    );
 
     print_log_measurements(first_name, records, record_bytes, first_durations.clone());
     print_log_measurements(second_name, records, record_bytes, second_durations.clone());
@@ -1038,9 +1258,9 @@ fn print_log_measurements(
     );
     println!(
         "{workload:<45} {record_bytes:>9} {records:>11} {:>12} {:>12} {:>12} {median_per_record:>12} {records_per_second:>13} {encoded_mib_per_second:>13}",
-        duration(min),
-        duration(median),
-        duration(max),
+        format_duration(min),
+        format_duration(median),
+        format_duration(max),
     );
 }
 
@@ -1060,47 +1280,6 @@ fn print_log_section(name: &str, description: &str) {
         "records/s",
         "encoded MiB/s"
     );
-}
-
-fn average_duration(total: Duration, records: usize) -> String {
-    let nanos = total.as_nanos() / records as u128;
-    duration(Duration::from_nanos(
-        u64::try_from(nanos).expect("average benchmark duration fits in u64 nanoseconds"),
-    ))
-}
-
-fn duration(value: Duration) -> String {
-    if value.as_secs_f64() >= 1.0 {
-        format!("{:.3} s", value.as_secs_f64())
-    } else if value.as_millis() > 0 {
-        format!("{:.3} ms", value.as_secs_f64() * 1_000.0)
-    } else {
-        format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
-    }
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
-        value.parse().expect("benchmark setting must be an integer")
-    })
-}
-
-fn setting_list(name: &str, default: &[usize]) -> Vec<usize> {
-    std::env::var(name).map_or_else(
-        |_| default.to_vec(),
-        |value| {
-            let parsed = value
-                .split(',')
-                .map(str::trim)
-                .map(|item| {
-                    item.parse::<usize>()
-                        .expect("benchmark list setting must contain integers")
-                })
-                .collect::<Vec<_>>();
-            assert!(!parsed.is_empty(), "benchmark list setting cannot be empty");
-            parsed
-        },
-    )
 }
 
 fn to_u64(value: usize) -> u64 {

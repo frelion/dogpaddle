@@ -1,0 +1,41 @@
+[package]
+name = "dogpaddle-change-store-integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+readme = "README.md"
+autotests = false
+autobenches = false
+
+[lib]
+doc = false
+doctest = false
+bench = false
+test = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+dogpaddle-change.workspace = true
+dogpaddle-store.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "change_append_log"
+path = "benches/change_append_log.rs"
+harness = false
+test = false
+
+[[bench]]
+name = "change_append_log_endurance"
+path = "benches/change_append_log_endurance.rs"
+harness = false
+test = false

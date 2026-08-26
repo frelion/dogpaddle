@@ -13,11 +13,24 @@ use dogpaddle_store::{
     AppendLog, CodecError, ScanLimit, Store, StoreError, StoreValue, Transactions,
 };
 
+mod support;
+
+use support::{
+    SampleWork, emit_configuration, emit_sample, format_duration as duration, initialize,
+    json_string, sample_dir, setting, setting_list,
+};
+
 const DEFAULT_RECORD_BYTES: &[usize] = &[128, 1_024, 8_192];
-const DEFAULT_LOGICAL_MIB: usize = 1_024;
-const DEFAULT_WINDOW_MIB: usize = 64;
-const DEFAULT_BATCH_MIB: usize = 1;
-const DEFAULT_CHECKPOINT_EPOCHS: usize = 64;
+const DEFAULT_SMOKE_LOGICAL_MIB: usize = 8;
+const DEFAULT_SMOKE_WINDOW_MIB: usize = 2;
+const DEFAULT_SMOKE_BATCH_MIB: usize = 1;
+const DEFAULT_SMOKE_CHECKPOINT_EPOCHS: usize = 2;
+const DEFAULT_FULL_LOGICAL_MIB: usize = 1_024;
+const DEFAULT_FULL_WINDOW_MIB: usize = 64;
+const DEFAULT_FULL_BATCH_MIB: usize = 1;
+const DEFAULT_FULL_CHECKPOINT_EPOCHS: usize = 64;
+const DEFAULT_MAX_WORKING_SET_BYTES: usize = 1_073_741_824;
+const DEFAULT_MAX_TOTAL_WRITTEN_BYTES: usize = 4_294_967_295;
 const RECORD_HEADER_BYTES: usize = 16;
 const MEBIBYTE_BYTES: usize = 1_048_576;
 const MDBX_DATA_FILE: &str = "mdbx.dat";
@@ -69,10 +82,28 @@ struct ProtocolRun {
 #[derive(Clone, Copy)]
 struct ProtocolConfig<'a> {
     store_path: &'a Path,
+    record_bytes: usize,
     window_items: usize,
     steady_epochs: usize,
     checkpoint_epochs: usize,
     seed_file: FileSize,
+}
+
+struct WorkloadConfig {
+    profile: String,
+    record_sizes: Vec<usize>,
+    logical_mib: usize,
+    window_mib: usize,
+    batch_mib: usize,
+    checkpoint_epochs: usize,
+    max_working_set_bytes: usize,
+    max_total_written_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetEstimate {
+    max_working_set_bytes: usize,
+    total_written_bytes: usize,
 }
 
 impl EnduranceRecord {
@@ -104,56 +135,165 @@ impl StoreValue for EnduranceRecord {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
+    let environment = initialize("store_append_log_endurance");
+    let config = endurance_config();
+    if config.profile == "full" {
+        assert_eq!(
+            environment.profile(),
+            "reference",
+            "the full Store endurance workload requires DOGPADDLE_STORE_BENCH_PROFILE=reference and DOGPADDLE_STORE_BENCH_STORE_DIR"
+        );
     }
-
-    let record_sizes = setting_list(
-        "DOGPADDLE_BENCH_ENDURANCE_RECORD_BYTES",
-        DEFAULT_RECORD_BYTES,
-    );
-    let logical_mib = setting("DOGPADDLE_BENCH_ENDURANCE_LOGICAL_MIB", DEFAULT_LOGICAL_MIB);
-    let window_mib = setting("DOGPADDLE_BENCH_ENDURANCE_WINDOW_MIB", DEFAULT_WINDOW_MIB);
-    let batch_mib = setting("DOGPADDLE_BENCH_ENDURANCE_BATCH_MIB", DEFAULT_BATCH_MIB);
-    let checkpoint_epochs = setting(
-        "DOGPADDLE_BENCH_ENDURANCE_CHECKPOINT_EPOCHS",
-        DEFAULT_CHECKPOINT_EPOCHS,
-    );
-
-    assert!(logical_mib > window_mib);
-    assert!(window_mib > 0 && batch_mib > 0 && checkpoint_epochs > 0);
+    assert!(config.logical_mib > config.window_mib);
     assert!(
-        record_sizes
+        config
+            .record_sizes
             .iter()
             .all(|record_bytes| *record_bytes >= RECORD_HEADER_BYTES)
+    );
+    let budget = estimate_budget(&config);
+    assert!(
+        budget.max_working_set_bytes <= config.max_working_set_bytes,
+        "estimated endurance working set {} exceeds configured {} byte budget",
+        budget.max_working_set_bytes,
+        config.max_working_set_bytes
+    );
+    assert!(
+        budget.total_written_bytes <= config.max_total_written_bytes,
+        "estimated endurance writes {} exceed configured {} byte budget",
+        budget.total_written_bytes,
+        config.max_total_written_bytes
+    );
+    emit_configuration(
+        "store_append_log_endurance",
+        &format!(
+            "\"endurance_profile\":{},\"record_bytes\":{:?},\"logical_mib_per_width\":{},\"window_mib\":{},\"batch_mib\":{},\"checkpoint_epochs\":{},\"max_working_set_bytes\":{},\"estimated_working_set_bytes\":{},\"max_total_written_bytes\":{},\"estimated_total_written_bytes\":{}",
+            json_string(&config.profile),
+            config.record_sizes,
+            config.logical_mib,
+            config.window_mib,
+            config.batch_mib,
+            config.checkpoint_epochs,
+            config.max_working_set_bytes,
+            budget.max_working_set_bytes,
+            config.max_total_written_bytes,
+            budget.total_written_bytes,
+        ),
     );
 
     println!("DogPaddle AppendLog endurance benchmark");
     println!(
-        "record_bytes={record_sizes:?} logical_mib_per_width={logical_mib} window_mib={window_mib} batch_mib={batch_mib} checkpoint_epochs={checkpoint_epochs}"
+        "profile={} record_bytes={:?} logical_mib_per_width={} window_mib={} batch_mib={} checkpoint_epochs={}",
+        config.profile,
+        config.record_sizes,
+        config.logical_mib,
+        config.window_mib,
+        config.batch_mib,
+        config.checkpoint_epochs,
     );
     println!(
         "protocol=append_batch+durable_commit then truncate_before+durable_commit sync=durable execution=single-thread"
     );
     println!(
-        "platform={}-{} temp_root={}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::temp_dir().display()
+        "budgets: estimated_working_set={} max_working_set={} estimated_total_written={} max_total_written={}",
+        bytes(to_u64(budget.max_working_set_bytes)),
+        bytes(to_u64(config.max_working_set_bytes)),
+        bytes(to_u64(budget.total_written_bytes)),
+        bytes(to_u64(config.max_total_written_bytes)),
     );
 
-    let mut results = Vec::with_capacity(record_sizes.len());
-    for record_bytes in record_sizes {
+    let mut results = Vec::with_capacity(config.record_sizes.len());
+    for &record_bytes in &config.record_sizes {
         results.push(run_endurance(
             record_bytes,
-            logical_mib,
-            window_mib,
-            batch_mib,
-            checkpoint_epochs,
+            config.logical_mib,
+            config.window_mib,
+            config.batch_mib,
+            config.checkpoint_epochs,
         ));
     }
 
     print_summary(&results);
+}
+
+fn endurance_config() -> WorkloadConfig {
+    let profile =
+        std::env::var("DOGPADDLE_STORE_ENDURANCE_PROFILE").unwrap_or_else(|_| "smoke".to_owned());
+    let defaults = match profile.as_str() {
+        "smoke" => (
+            DEFAULT_SMOKE_LOGICAL_MIB,
+            DEFAULT_SMOKE_WINDOW_MIB,
+            DEFAULT_SMOKE_BATCH_MIB,
+            DEFAULT_SMOKE_CHECKPOINT_EPOCHS,
+        ),
+        "full" => (
+            DEFAULT_FULL_LOGICAL_MIB,
+            DEFAULT_FULL_WINDOW_MIB,
+            DEFAULT_FULL_BATCH_MIB,
+            DEFAULT_FULL_CHECKPOINT_EPOCHS,
+        ),
+        _ => panic!("DOGPADDLE_STORE_ENDURANCE_PROFILE must be smoke or full"),
+    };
+    WorkloadConfig {
+        profile,
+        record_sizes: setting_list(
+            "DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES",
+            DEFAULT_RECORD_BYTES,
+        ),
+        logical_mib: setting("DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB", defaults.0),
+        window_mib: setting("DOGPADDLE_STORE_ENDURANCE_WINDOW_MIB", defaults.1),
+        batch_mib: setting("DOGPADDLE_STORE_ENDURANCE_BATCH_MIB", defaults.2),
+        checkpoint_epochs: setting("DOGPADDLE_STORE_ENDURANCE_CHECKPOINT_EPOCHS", defaults.3),
+        max_working_set_bytes: setting(
+            "DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES",
+            DEFAULT_MAX_WORKING_SET_BYTES,
+        ),
+        max_total_written_bytes: setting(
+            "DOGPADDLE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES",
+            DEFAULT_MAX_TOTAL_WRITTEN_BYTES,
+        ),
+    }
+}
+
+fn estimate_budget(config: &WorkloadConfig) -> BudgetEstimate {
+    let mut max_working_set_bytes = 0_usize;
+    let mut total_written_bytes = 0_usize;
+    for &record_bytes in &config.record_sizes {
+        let batch_items = (mib_bytes(config.batch_mib) / record_bytes).max(1);
+        let batch_bytes = batch_items
+            .checked_mul(record_bytes)
+            .expect("endurance batch bytes fit usize");
+        let window_batches = mib_bytes(config.window_mib).div_ceil(batch_bytes).max(1);
+        let total_batches = mib_bytes(config.logical_mib)
+            .div_ceil(batch_bytes)
+            .max(window_batches + 1);
+        let steady_epochs = total_batches - window_batches;
+        let latency_bytes = steady_epochs
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(size_of::<Duration>()))
+            .expect("endurance latency sample bytes fit usize");
+        let checkpoint_count = steady_epochs.div_ceil(config.checkpoint_epochs) + 1;
+        let checkpoint_bytes = checkpoint_count
+            .checked_mul(size_of::<FileSize>())
+            .expect("endurance checkpoint bytes fit usize");
+        let working_set = batch_bytes
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(latency_bytes))
+            .and_then(|value| value.checked_add(checkpoint_bytes))
+            .expect("endurance working-set estimate fits usize");
+        max_working_set_bytes = max_working_set_bytes.max(working_set);
+        total_written_bytes = total_written_bytes
+            .checked_add(
+                total_batches
+                    .checked_mul(batch_bytes)
+                    .expect("per-width endurance writes fit usize"),
+            )
+            .expect("total endurance writes fit usize");
+    }
+    BudgetEstimate {
+        max_working_set_bytes,
+        total_written_bytes,
+    }
 }
 
 fn run_endurance(
@@ -184,7 +324,7 @@ fn run_endurance(
         .map(|index| EnduranceRecord::new(index, record_bytes))
         .collect::<Vec<_>>();
 
-    let root = tempfile::tempdir().expect("temporary endurance benchmark directory");
+    let root = sample_dir(&format!("append-log-endurance-{record_bytes}"));
     let store_path = root.path().join("store");
     let mut store = Store::create(&store_path).expect("create endurance benchmark store");
     let log = store
@@ -201,6 +341,7 @@ fn run_endurance(
         max_gc_items,
         ProtocolConfig {
             store_path: &store_path,
+            record_bytes,
             window_items,
             steady_epochs,
             checkpoint_epochs,
@@ -310,7 +451,17 @@ fn run_protocol(
     let mut file_samples = vec![config.seed_file];
     let mut append_durations = Vec::with_capacity(config.steady_epochs);
     let mut gc_durations = Vec::with_capacity(config.steady_epochs);
-    print_checkpoint(0, head, tail, config.seed_file);
+    let batch_logical_bytes = records
+        .iter()
+        .map(|record| record.encoded.len())
+        .sum::<usize>();
+    let scenario = format!("record_bytes={}", config.record_bytes);
+    let sample_work = SampleWork {
+        operations: batch_items,
+        transactions: 1,
+        logical_bytes: batch_logical_bytes,
+    };
+    print_checkpoint(config.record_bytes, 0, head, tail, config.seed_file);
 
     let wall_started = Instant::now();
     for epoch in 1..=config.steady_epochs {
@@ -323,11 +474,20 @@ fn run_protocol(
             .expect("access endurance append log")
             .append_batch(records)
             .expect("append endurance batch");
-        assert_eq!(assigned, tail..tail + batch_items_u64);
         transaction
             .commit()
             .expect("commit endurance append transaction");
-        append_durations.push(append_started.elapsed());
+        let append_duration = append_started.elapsed();
+        assert_eq!(assigned, tail..tail + batch_items_u64);
+        emit_sample(
+            "store_append_log_endurance",
+            &scenario,
+            "append",
+            epoch - 1,
+            append_duration,
+            sample_work,
+        );
+        append_durations.push(append_duration);
         tail += batch_items_u64;
 
         let target = tail - to_u64(config.window_items);
@@ -340,17 +500,26 @@ fn run_protocol(
             .expect("access endurance GC log")
             .truncate_before(target, max_gc_items)
             .expect("truncate endurance log");
-        assert_eq!(next_head, target);
         transaction
             .commit()
             .expect("commit endurance GC transaction");
-        gc_durations.push(gc_started.elapsed());
+        let gc_duration = gc_started.elapsed();
+        assert_eq!(next_head, target);
+        emit_sample(
+            "store_append_log_endurance",
+            &scenario,
+            "truncate",
+            epoch - 1,
+            gc_duration,
+            sample_work,
+        );
+        gc_durations.push(gc_duration);
         head = next_head;
 
         if epoch.is_multiple_of(config.checkpoint_epochs) || epoch == config.steady_epochs {
             let size = data_file_size(config.store_path);
             file_samples.push(size);
-            print_checkpoint(epoch, head, tail, size);
+            print_checkpoint(config.record_bytes, epoch, head, tail, size);
         }
     }
 
@@ -506,11 +675,15 @@ fn tail_spread_basis_points(samples: &[FileSize]) -> u64 {
     }
 }
 
-fn print_checkpoint(epoch: usize, head: u64, tail: u64, size: FileSize) {
+fn print_checkpoint(record_bytes: usize, epoch: usize, head: u64, tail: u64, size: FileSize) {
     println!(
         "{epoch:<12} {head:>14} {tail:>14} {:>14} {:>14}",
         bytes(size.logical),
         bytes(size.allocated)
+    );
+    println!(
+        "{{\"record\":\"checkpoint\",\"benchmark\":\"store_append_log_endurance\",\"record_bytes\":{record_bytes},\"epoch\":{epoch},\"head\":{head},\"tail\":{tail},\"file_logical_bytes\":{},\"file_allocated_bytes\":{}}}",
+        size.logical, size.allocated,
     );
 }
 
@@ -577,6 +750,32 @@ fn print_summary(results: &[EnduranceResult]) {
             "  validation=reopen+full-retained-scan checksum={:#018x}",
             result.validation_checksum
         );
+        println!(
+            "{{\"record\":\"endurance_summary\",\"benchmark\":\"store_append_log_endurance\",\"record_bytes\":{},\"batch_items\":{},\"window_items\":{},\"steady_epochs\":{},\"steady_records\":{},\"append_p50_ns\":{},\"append_p95_ns\":{},\"append_p99_ns\":{},\"append_max_ns\":{},\"truncate_p50_ns\":{},\"truncate_p95_ns\":{},\"truncate_p99_ns\":{},\"truncate_max_ns\":{},\"protocol_elapsed_ns\":{},\"wall_elapsed_ns\":{},\"seed_file_logical_bytes\":{},\"seed_file_allocated_bytes\":{},\"final_file_logical_bytes\":{},\"final_file_allocated_bytes\":{},\"peak_file_logical_bytes\":{},\"peak_file_allocated_bytes\":{},\"tail_allocated_spread_basis_points\":{},\"validation_checksum\":{}}}",
+            result.record_bytes,
+            result.batch_items,
+            result.window_items,
+            result.steady_epochs,
+            result.steady_records,
+            result.append.p50.as_nanos(),
+            result.append.p95.as_nanos(),
+            result.append.p99.as_nanos(),
+            result.append.max.as_nanos(),
+            result.gc.p50.as_nanos(),
+            result.gc.p95.as_nanos(),
+            result.gc.p99.as_nanos(),
+            result.gc.max.as_nanos(),
+            result.protocol_elapsed.as_nanos(),
+            result.wall_elapsed.as_nanos(),
+            result.seed_file.logical,
+            result.seed_file.allocated,
+            result.final_file.logical,
+            result.final_file.allocated,
+            result.peak_file.logical,
+            result.peak_file.allocated,
+            result.tail_allocated_spread_basis_points,
+            json_string(&format!("{:#018x}", result.validation_checksum)),
+        );
     }
 }
 
@@ -623,40 +822,6 @@ fn scaled_bytes(value: u64, unit_bytes: u64, unit: &str) -> String {
         .expect("byte formatting calculation fits in u128")
         / u128::from(unit_bytes);
     format!("{}.{:02} {unit}", hundredths / 100, hundredths % 100)
-}
-
-fn duration(value: Duration) -> String {
-    if value.as_secs_f64() >= 1.0 {
-        format!("{:.3} s", value.as_secs_f64())
-    } else if value.as_millis() > 0 {
-        format!("{:.3} ms", value.as_secs_f64() * 1_000.0)
-    } else {
-        format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
-    }
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
-        value.parse().expect("benchmark setting must be an integer")
-    })
-}
-
-fn setting_list(name: &str, default: &[usize]) -> Vec<usize> {
-    std::env::var(name).map_or_else(
-        |_| default.to_vec(),
-        |value| {
-            let parsed = value
-                .split(',')
-                .map(str::trim)
-                .map(|item| {
-                    item.parse::<usize>()
-                        .expect("benchmark list setting must contain integers")
-                })
-                .collect::<Vec<_>>();
-            assert!(!parsed.is_empty(), "benchmark list setting cannot be empty");
-            parsed
-        },
-    )
 }
 
 fn to_u64(value: usize) -> u64 {

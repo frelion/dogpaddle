@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 readme = "README.md"
+autotests = false
+autobenches = false
+
+[lib]
+bench = false
 
 [dependencies]
 dogpaddle-operation.workspace = true
@@ -12,6 +17,16 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[[bench]]
+name = "flow_lifecycle"
+path = "benches/flow_lifecycle.rs"
+harness = false
+test = false
 
 [lints]
 workspace = true

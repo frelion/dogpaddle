@@ -5,6 +5,13 @@ use std::{hint::black_box, time::Duration};
 use dogpaddle_store::{Cell, Store, Transactions};
 use tempfile::TempDir;
 
+mod support;
+
+use support::{
+    SampleWork, average_duration, emit_configuration, emit_samples, emit_summary, format_duration,
+    initialize, sample_dir, setting,
+};
+
 const DEFAULT_READS: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
@@ -17,7 +24,7 @@ struct Fixture {
 
 impl Fixture {
     fn populated() -> Self {
-        let root = tempfile::tempdir().expect("temporary cell benchmark directory");
+        let root = sample_dir("cell");
         let mut store =
             Store::create(root.path().join("store")).expect("create cell benchmark store");
         let cell = store
@@ -44,24 +51,19 @@ impl Fixture {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        return;
-    }
+    initialize("store_cell");
 
     let reads = setting("DOGPADDLE_BENCH_CELL_READS", DEFAULT_READS);
     let commits = setting("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS);
     let samples = setting("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES);
-    assert!(reads > 0 && commits > 0 && samples > 0);
+    emit_configuration(
+        "store_cell",
+        &format!("\"reads\":{reads},\"commits\":{commits},\"samples\":{samples}"),
+    );
 
     println!("DogPaddle Cell benchmark");
     println!("reads={reads} commits={commits} samples={samples}");
     println!("sync=durable execution=single-thread cache=warm validation=outside-timing");
-    println!(
-        "platform={}-{} temp_root={}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::temp_dir().display()
-    );
     println!();
     println!("=== Cell<T> ===");
     println!("one shared value; hot access and one durable state update per transaction");
@@ -71,14 +73,21 @@ fn main() {
     );
 
     let mut fixture = Fixture::populated();
-    report("hot get, one tx", reads, samples, || {
+    report("hot get, one tx", reads, 1, 8 * reads, samples, || {
         measure_get(&mut fixture, reads)
     });
 
-    let mut fixture = Fixture::populated();
-    report("read + update + commit", commits, samples, || {
-        measure_updates(&mut fixture, commits)
-    });
+    report(
+        "read + update + commit",
+        commits,
+        commits,
+        16 * commits,
+        samples,
+        || {
+            let mut fixture = Fixture::populated();
+            measure_updates(&mut fixture, commits)
+        },
+    );
 }
 
 fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
@@ -101,7 +110,9 @@ fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
     }
     black_box(checksum);
     transaction.commit().expect("finish cell read transaction");
-    started.elapsed()
+    let elapsed = started.elapsed();
+    assert_eq!(checksum, 0, "seeded Cell reads must preserve the oracle");
+    elapsed
 }
 
 fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
@@ -147,11 +158,20 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
 fn report(
     workload: &str,
     operations: usize,
+    transactions: usize,
+    logical_bytes: usize,
     samples: usize,
     mut measure: impl FnMut() -> Duration,
 ) {
     measure();
     let mut durations = (0..samples).map(|_| measure()).collect::<Vec<_>>();
+    let work = SampleWork {
+        operations,
+        transactions,
+        logical_bytes,
+    };
+    emit_samples("store_cell", workload, "Cell", &durations, work);
+    emit_summary("store_cell", workload, "Cell", &durations, work);
     durations.sort_unstable();
     let min = durations[0];
     let median = durations[durations.len() / 2];
@@ -160,31 +180,8 @@ fn report(
     let median_per_operation = average_duration(median, operations);
     println!(
         "{workload:<30} {operations:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
-        duration(min),
-        duration(median),
-        duration(max),
+        format_duration(min),
+        format_duration(median),
+        format_duration(max),
     );
-}
-
-fn average_duration(total: Duration, operations: usize) -> String {
-    let nanos = total.as_nanos() / operations as u128;
-    duration(Duration::from_nanos(
-        u64::try_from(nanos).expect("average benchmark duration fits in u64 nanoseconds"),
-    ))
-}
-
-fn duration(value: Duration) -> String {
-    if value.as_secs_f64() >= 1.0 {
-        format!("{:.3} s", value.as_secs_f64())
-    } else if value.as_millis() > 0 {
-        format!("{:.3} ms", value.as_secs_f64() * 1_000.0)
-    } else {
-        format!("{:.3} us", value.as_secs_f64() * 1_000_000.0)
-    }
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
-        value.parse().expect("benchmark setting must be an integer")
-    })
 }

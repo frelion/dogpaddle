@@ -197,23 +197,24 @@ big-endian offset key 保存 `T` 的稳定编码。全新且从未使用的空�
 
 ## 测试
 
-架构行为与集合行为使用独立的集成测试目标：
+全部公共行为与持久化契约使用一个按语义分模块的外部正确性 target：
 
 ```bash
-cargo test -p dogpaddle-store --test architecture
-cargo test -p dogpaddle-store --test collections
+cargo test -p dogpaddle-store --test correctness
 ```
 
 也可以直接过滤并运行单个测试区域：
 
 ```bash
-cargo test -p dogpaddle-store --test architecture transaction::
-cargo test -p dogpaddle-store --test collections scan::
+cargo test -p dogpaddle-store --test correctness transaction::
+cargo test -p dogpaddle-store --test correctness scan::
 ```
 
-架构测试会对 `OrderedMap` 的 `Small` 与 `Large` 形式运行相同的数据、事务与扫描语义，并
-通过 MDBX 白盒适配器锁定 Cell 的共享布局、Small map 的共享前缀和 Large map 的独立 named
-table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。
+该 target 会对 `OrderedMap` 的 `Small` 与 `Large` 形式运行相同的数据、事务与扫描语义，并
+通过 MDBX 持久化适配器锁定 `Cell` 的共享布局、`Small` map 的共享前缀、`Large` map 与
+`AppendLog` 的
+独立 named table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。目录
+所有权、模块职责和完整验证协议见 [`TESTING.md`](./TESTING.md)。
 
 ## 性能
 
@@ -227,8 +228,9 @@ cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
 按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
-设计结论见 [`PERFORMANCE.md`](./PERFORMANCE.md)。基准输出本身也按数据对象和场景分段，并同时
-报告中位总耗时、平均每项耗时、吞吐及样本区间。
+设计结论见 [`PERFORMANCE.md`](./PERFORMANCE.md)。基准同时输出人类可读表格与逐样本 JSON，
+并记录实际 rustc、CPU、OS/kernel、git 状态、文件系统和运行档位；输出及计时口径见
+[`TESTING.md`](./TESTING.md#性能-target)。
 
 `cell` 独立覆盖同事务 warm get，以及每次读取、更新并 durable commit 的状态事务。
 `ordered_map` 为 `Small` 与 `Large` map 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、
@@ -264,10 +266,11 @@ Cell 的读取次数由 `DOGPADDLE_BENCH_CELL_READS` 控制；commit 数与样�
 - prefix GC 按固定条数删除并提交；steady workload 先保留一个非空窗口，再交替 append 新批次和
   回收等量旧前缀，用于观察非零 offset、长期页复用及分批提交的组合成本。
 
-每个会改变数据的样本都使用新临时 Store，避免前一个样本的 tail、空闲页或文件尺寸污染后一个
-样本。资源创建、输入构造、预填充和结果校验均在计时外；事务的 begin、全部 Store 访问以及
-commit 在计时内。只读扫描复用已填充 Store，明确测 warm-cache；每项先执行一次不计入结果的
-预热，再报告样本的最小值、中位数和最大值。
+每个会改变数据的样本都在所选 benchmark base 下使用新 Store，避免前一个样本的 tail、空闲页或
+文件尺寸污染后一个样本。资源创建、输入构造、预填充和结果校验均在计时外；需要反映完整事务的
+durable/production workload 把 begin、全部相关 Store 访问和 commit 一起计时。明确标为 rollback
+body 的配对场景只计追加 body，事务准备和回滚均在计时外。只读扫描复用已填充 Store，明确测
+warm-cache；每项先执行一次不计入结果的预热，再报告样本的最小值、中位数和最大值。
 
 `records/s` 表示该 workload 处理的逻辑记录数。`encoded MiB/s` 使用完整输入编码大小计算：多下游
 读取按 delivery 次数累计，filter 按检查的输入累计，GC 按回收的逻辑记录累计；它不是 MDBX 的
@@ -292,8 +295,9 @@ commit 在计时内。只读扫描复用已填充 Store，明确测 warm-cache�
 
 `append_log_endurance` 是刻意与日常场景基准分开的长稳入口。对每种记录宽度，它先在计时外填满
 固定保留窗口，然后持续执行两次独立的 durable transaction：`append_batch` 一批，随后
-`truncate_before` 等量旧前缀。默认每种宽度累计追加 1 GiB 逻辑编码，同时始终只保留约 64 MiB；
-因此它观察的是持续运行中的页复用和尾延迟，而不是无限增长日志的顺序写峰值。
+`truncate_before` 等量旧前缀。默认 `smoke` 档每种宽度累计 8 MiB、保留约 2 MiB；`full` 档维持
+原协议的每种宽度 1 GiB/64 MiB，并强制使用显式 reference 文件系统。因此它观察的是持续运行中
+的页复用和尾延迟，而不是无限增长日志的顺序写峰值。
 
 输出分别报告 append transaction 与 GC transaction 的 p50、p95、p99 和最大延迟、只累计这两类
 事务的协议吞吐、实际 wall time，以及 MDBX data file 的逻辑大小、文件系统已分配字节、峰值、相对
@@ -306,14 +310,15 @@ commit 在计时内。只读扫描复用已填充 Store，明确测 warm-cache�
 
 长稳 workload 可通过以下环境变量调整：
 
-- `DOGPADDLE_BENCH_ENDURANCE_RECORD_BYTES`：逗号分隔的完整记录宽度，默认
+- `DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES`：逗号分隔的完整记录宽度，默认
   `128,1024,8192`；
-- `DOGPADDLE_BENCH_ENDURANCE_LOGICAL_MIB`：每种宽度累计处理的逻辑 MiB，默认 1024；
-- `DOGPADDLE_BENCH_ENDURANCE_WINDOW_MIB`：始终保留的目标窗口 MiB，默认 64；
-- `DOGPADDLE_BENCH_ENDURANCE_BATCH_MIB`：每个 append/GC transaction 的目标 MiB，默认 1；
-- `DOGPADDLE_BENCH_ENDURANCE_CHECKPOINT_EPOCHS`：文件空间采样间隔，默认 64 个循环。
+- `DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB`、`_WINDOW_MIB`、`_BATCH_MIB` 与
+  `_CHECKPOINT_EPOCHS`：覆盖所选 workload 档位；
+- `DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES` 与 `_MAX_TOTAL_WRITTEN_BYTES`：创建
+  Store 前执行的硬预算。
 
-四套基准都使用 MDBX durable sync、单线程执行和当前系统的临时目录。结果描述当前机器、文件系统
-与 warm-cache 条件下的 Store 协议成本，不代表冷缓存、断电恢复、网络 CDC、Operation 动态分发
-或完整调度器的端到端吞吐。进行回归对比时应固定机器、文件系统、环境变量和 Rust profile。
+四套基准都使用 MDBX durable sync 和单线程执行。默认 `smoke` 可使用临时 base；正式回归必须设置
+`DOGPADDLE_STORE_BENCH_PROFILE=reference` 与绝对路径
+`DOGPADDLE_STORE_BENCH_STORE_DIR`。结果描述当前机器、文件系统与 warm-cache 条件下的 Store
+协议成本，不代表冷缓存、断电恢复、网络 CDC、Operation 动态分发或完整调度器的端到端吞吐。
 这些场景只用于测量 Store 数据结构，不规定 Flow 将来如何选择 batch、事务或调度策略。

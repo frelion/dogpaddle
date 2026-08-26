@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fmt::Write as _,
     io::Cursor,
     ops::Range,
     process::{Command, exit},
@@ -8,15 +7,17 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Int64Array, RecordBatch, RecordBatchOptions, StructArray,
-    UInt64Array, new_null_array,
+    ArrayRef, BinaryArray, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
+    StructArray, UInt64Array, new_null_array, types::Int64Type,
 };
-use arrow_buffer::NullBuffer;
 use arrow_ipc::{
-    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Endianness, Field as IpcField,
-    FieldArgs, FieldNode, Int as IpcInt, IntArgs, Message as IpcMessage, MessageArgs,
-    MessageHeader, MetadataVersion, RecordBatch as IpcRecordBatch, RecordBatchArgs,
-    Schema as IpcSchema, SchemaArgs, Type as IpcType,
+    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, DictionaryEncoding,
+    DictionaryEncodingArgs, Endianness, Field as IpcField, FieldArgs, FieldNode,
+    FloatingPoint as IpcFloatingPoint, FloatingPointArgs, Int as IpcInt, IntArgs,
+    LargeUtf8 as IpcLargeUtf8, LargeUtf8Args, List as IpcList, ListArgs, Message as IpcMessage,
+    MessageArgs, MessageHeader, MetadataVersion, Null as IpcNull, NullArgs, Precision,
+    RecordBatch as IpcRecordBatch, RecordBatchArgs, Schema as IpcSchema, SchemaArgs,
+    Type as IpcType,
     reader::StreamReader,
     writer::{IpcWriteOptions, StreamWriter},
 };
@@ -26,10 +27,7 @@ use flatbuffers::FlatBufferBuilder;
 use super::{
     CodecError, batch::BatchLayout, decode_change, decode_change_projected, encode_change, stream,
 };
-use crate::{
-    Change, ChangeError, ChangeProjection, MAX_NESTING_DEPTH, ProjectionError,
-    tests::{assert_change_eq, representative_change},
-};
+use crate::{Change, ChangeError, ChangeProjection, ProjectionError};
 
 const KIND_KEY: &str = "dogpaddle.kind";
 const VERSION_KEY: &str = "dogpaddle.change.version";
@@ -37,6 +35,8 @@ const OFFSETS_BUFFER: usize = 1;
 const VARIABLE_VALUES_BUFFER: usize = 2;
 const MALFORMED_SCHEMA_PANIC_PROBE: &str = "DOGPADDLE_CHANGE_MALFORMED_SCHEMA_PANIC_PROBE";
 const PANIC_HOOK_EXIT_CODE: i32 = 86;
+const DECODE_PANIC_MESSAGE: &str = "Arrow IPC decoding panicked";
+const PANIC_PROBE_COMPLETED: &str = "dogpaddle-change malformed decoder probe completed";
 
 fn simple_change(diffs: &[i64]) -> Change {
     let values = (0..u64::try_from(diffs.len()).unwrap()).collect::<Vec<_>>();
@@ -47,6 +47,59 @@ fn simple_change(diffs: &[i64]) -> Change {
     )]));
     let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(values))]).unwrap();
     Change::try_new(records, Int64Array::from(diffs.to_vec())).unwrap()
+}
+
+fn layout_change() -> Change {
+    let items = ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(1), None]),
+        None,
+        Some(Vec::<Option<i64>>::new()),
+    ]);
+    let object_name = Arc::new(Field::new("name", DataType::Utf8, true));
+    let object_score = Arc::new(Field::new("score", DataType::Int64, false));
+    let object = StructArray::from(vec![
+        (
+            Arc::clone(&object_name),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
+        ),
+        (
+            Arc::clone(&object_score),
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+        ),
+    ]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![7, 7, 8])),
+        Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+        Arc::new(StringArray::from(vec![Some("add"), None, Some("next")])),
+        Arc::new(BinaryArray::from(vec![
+            Some(b"one".as_slice()),
+            Some(b"two".as_slice()),
+            Some(b"three".as_slice()),
+        ])),
+        Arc::new(items),
+        Arc::new(object),
+        new_null_array(&DataType::Null, 3),
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("enabled", DataType::Boolean, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("payload", DataType::Binary, false),
+        Field::new("items", columns[4].data_type().clone(), true),
+        Field::new(
+            "object",
+            DataType::Struct(vec![object_name, object_score].into()),
+            true,
+        ),
+        Field::new("nothing", DataType::Null, true),
+    ]));
+    let records = RecordBatch::try_new(schema, columns).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap()
+}
+
+fn assert_change_eq(actual: &Change, expected: &Change) {
+    assert_eq!(actual.records(), expected.records());
+    assert_eq!(actual.diffs(), expected.diffs());
 }
 
 fn marked_metadata() -> HashMap<String, String> {
@@ -186,25 +239,181 @@ fn big_endian_schema_stream() -> Vec<u8> {
     encoded
 }
 
-fn malformed_int_width_schema_stream() -> Vec<u8> {
+#[derive(Clone, Copy, Debug)]
+enum MalformedSchemaCase {
+    Dictionary,
+    FloatMissingTable,
+    HalfFloat,
+    IntMissingTable,
+    IntWidth,
+    ListMissingChildren,
+    ListTwoChildren,
+    NestingTooDeep,
+    UnsupportedType,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "each malformed FlatBuffer shape stays explicit and locally auditable"
+)]
+fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
-    let name = builder.create_string("$dogpaddle.diff");
-    let integer = IpcInt::create(
-        &mut builder,
-        &IntArgs {
-            bitWidth: 24,
-            is_signed: true,
-        },
-    );
-    let field = IpcField::create(
-        &mut builder,
-        &FieldArgs {
-            name: Some(name),
-            type_type: IpcType::Int,
-            type_: Some(integer.as_union_value()),
-            ..FieldArgs::default()
-        },
-    );
+    let name = builder.create_string("malformed");
+    let field = match case {
+        MalformedSchemaCase::Dictionary => {
+            let data_type = IpcNull::create(&mut builder, &NullArgs::default());
+            let dictionary =
+                DictionaryEncoding::create(&mut builder, &DictionaryEncodingArgs::default());
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::Null,
+                    type_: Some(data_type.as_union_value()),
+                    dictionary: Some(dictionary),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+        MalformedSchemaCase::FloatMissingTable => IpcField::create(
+            &mut builder,
+            &FieldArgs {
+                name: Some(name),
+                type_type: IpcType::FloatingPoint,
+                ..FieldArgs::default()
+            },
+        ),
+        MalformedSchemaCase::HalfFloat => {
+            let floating = IpcFloatingPoint::create(
+                &mut builder,
+                &FloatingPointArgs {
+                    precision: Precision::HALF,
+                },
+            );
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::FloatingPoint,
+                    type_: Some(floating.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+        MalformedSchemaCase::IntMissingTable => IpcField::create(
+            &mut builder,
+            &FieldArgs {
+                name: Some(name),
+                type_type: IpcType::Int,
+                ..FieldArgs::default()
+            },
+        ),
+        MalformedSchemaCase::IntWidth => {
+            let integer = IpcInt::create(
+                &mut builder,
+                &IntArgs {
+                    bitWidth: 24,
+                    is_signed: true,
+                },
+            );
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::Int,
+                    type_: Some(integer.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+        MalformedSchemaCase::ListMissingChildren => {
+            let data_type = IpcList::create(&mut builder, &ListArgs::default());
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::List,
+                    type_: Some(data_type.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+        MalformedSchemaCase::ListTwoChildren => {
+            let child_name = builder.create_string("child");
+            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
+            let first = IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(child_name),
+                    type_type: IpcType::Null,
+                    type_: Some(null_type.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            );
+            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
+            let second = IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(child_name),
+                    type_type: IpcType::Null,
+                    type_: Some(null_type.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            );
+            let children = builder.create_vector(&[first, second]);
+            let data_type = IpcList::create(&mut builder, &ListArgs::default());
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::List,
+                    type_: Some(data_type.as_union_value()),
+                    children: Some(children),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+        MalformedSchemaCase::NestingTooDeep => {
+            let leaf_name = builder.create_string("leaf");
+            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
+            let mut current = IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(leaf_name),
+                    type_type: IpcType::Null,
+                    type_: Some(null_type.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            );
+            for _ in 0..=crate::MAX_NESTING_DEPTH {
+                let children = builder.create_vector(&[current]);
+                let data_type = IpcList::create(&mut builder, &ListArgs::default());
+                current = IpcField::create(
+                    &mut builder,
+                    &FieldArgs {
+                        name: Some(name),
+                        type_type: IpcType::List,
+                        type_: Some(data_type.as_union_value()),
+                        children: Some(children),
+                        ..FieldArgs::default()
+                    },
+                );
+            }
+            current
+        }
+        MalformedSchemaCase::UnsupportedType => {
+            let data_type = IpcLargeUtf8::create(&mut builder, &LargeUtf8Args::default());
+            IpcField::create(
+                &mut builder,
+                &FieldArgs {
+                    name: Some(name),
+                    type_type: IpcType::LargeUtf8,
+                    type_: Some(data_type.as_union_value()),
+                    ..FieldArgs::default()
+                },
+            )
+        }
+    };
     let fields = builder.create_vector(&[field]);
     let schema = IpcSchema::create(
         &mut builder,
@@ -280,148 +489,57 @@ fn corrupt_layout(
     )
 }
 
-fn assert_both_reject(encoded: &[u8], projection: &ChangeProjection) {
-    assert!(decode_change(encoded).is_err());
-    assert!(decode_change_projected(encoded, projection).is_err());
+fn assert_both_invalid_encoding(encoded: &[u8], projection: &ChangeProjection) {
+    assert_invalid_encoding_without_decoder_panic(decode_change(encoded));
+    assert_invalid_encoding_without_decoder_panic(decode_change_projected(encoded, projection));
 }
 
-fn assert_both_reject_metadata(encoded: &[u8], projection: &ChangeProjection) {
-    assert!(matches!(
-        decode_change(encoded),
-        Err(CodecError::InvalidEncoding { .. })
-    ));
-    assert!(matches!(
-        decode_change_projected(encoded, projection),
-        Err(CodecError::InvalidEncoding { .. })
-    ));
+fn assert_arrow_error(result: &Result<Change, CodecError>) {
+    assert!(
+        matches!(result, Err(CodecError::Arrow(_))),
+        "expected Arrow, found {result:?}"
+    );
 }
 
-fn assert_type_round_trips(data_type: &DataType) {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        data_type.clone(),
-        true,
-    )]));
-    let records =
-        RecordBatch::try_new(Arc::clone(&schema), vec![new_null_array(data_type, 1)]).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-}
-
-fn hex(encoded: &[u8]) -> String {
-    let mut output = String::with_capacity(encoded.len() * 2);
-    for byte in encoded {
-        write!(&mut output, "{byte:02x}").unwrap();
+fn assert_invalid_encoding_without_decoder_panic(result: Result<Change, CodecError>) {
+    match result {
+        Err(CodecError::InvalidEncoding { message }) => {
+            assert_ne!(message, DECODE_PANIC_MESSAGE, "decoder panic was caught");
+        }
+        other => panic!("expected InvalidEncoding, found {other:?}"),
     }
-    output
-}
-
-#[test]
-fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
-    let change = representative_change();
-    let encoded = encode_change(&change).unwrap();
-    let decoded = decode_change(&encoded).unwrap();
-
-    assert_change_eq(&decoded, &change);
-    assert_eq!(decoded.diffs().values(), &[1, -1, 2]);
-
-    let slice = change.try_slice(1, 2).unwrap();
-    let slice_encoded = encode_change(&slice).unwrap();
-    assert_change_eq(&decode_change(&slice_encoded).unwrap(), &slice);
-    let identity =
-        ChangeProjection::try_new(slice.schema(), 0..slice.schema().fields().len()).unwrap();
-    assert_change_eq(
-        &decode_change_projected(&slice_encoded, &identity).unwrap(),
-        &slice,
-    );
-    let empty = ChangeProjection::try_new(slice.schema(), []).unwrap();
-    let empty = decode_change_projected(&slice_encoded, &empty).unwrap();
-    assert_eq!(empty.num_rows(), 2);
-    assert_eq!(empty.diffs().values(), &[-1, 2]);
-
-    let mut reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
-    let schema = reader.schema();
-
-    assert_eq!(schema.field(0).name(), "$dogpaddle.diff");
-    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-    assert!(!schema.field(0).is_nullable());
-    assert_eq!(schema.metadata().get(KIND_KEY).unwrap(), "change");
-    assert_eq!(schema.metadata().get(VERSION_KEY).unwrap(), "1");
-    let physical = reader.next().unwrap().unwrap();
-    assert_eq!(physical.num_columns(), change.records().num_columns() + 1);
-    assert_eq!(
-        physical
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap(),
-        change.diffs()
-    );
-    assert!(reader.next().is_none());
-}
-
-#[test]
-fn zero_column_change_stream_has_stable_golden_bytes() {
-    let options = RecordBatchOptions::new().with_row_count(Some(1));
-    let records =
-        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![-1])).unwrap();
-    let expected = concat!(
-        "ffffffff000100001000000000000a000e000c000b0004000a00000014000000",
-        "0000000104000a000c000000080004000a000000080000007800000002000000",
-        "3c00000004000000d4ffffff0800000010000000060000006368616e67650000",
-        "0e000000646f67706164646c652e6b696e64000008000c000800040008000000",
-        "080000000c000000010000003100000018000000646f67706164646c652e6368",
-        "616e67652e76657273696f6e0000000001000000140000001000140010000000",
-        "0f00040000000800100000001800000020000000000000021c00000008000c00",
-        "04000b00080000004000000000000001000000000f00000024646f6770616464",
-        "6c652e6469666600ffffffff88000000100000000c001a001800170004000800",
-        "0c000000200000001000000000000000000000000000000304000a0018000c00",
-        "080004000a0000002c0000001000000001000000000000000000000001000000",
-        "0100000000000000000000000000000000000000020000000000000000000000",
-        "010000000000000008000000000000000800000000000000ff00000000000000",
-        "ffffffffffffffffffffffff00000000",
-    );
-
-    let encoded = encode_change(&change).unwrap();
-    assert_eq!(hex(&encoded), expected);
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-}
-
-#[test]
-fn sliced_representative_change_stream_has_stable_golden_bytes() {
-    let source = representative_change();
-    let change = source.try_slice(1, 2).unwrap();
-    assert_eq!(
-        change.diffs().values().as_ptr(),
-        source.diffs().values()[1..].as_ptr()
-    );
-    let encoded = encode_change(&change).unwrap();
-
-    let expected = include_str!("fixtures/sliced_representative_change_v1.hex")
-        .split_ascii_whitespace()
-        .collect::<String>();
-
-    assert_eq!(hex(&encoded), expected);
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
 }
 
 #[test]
 fn decoder_rejects_malformed_schema_without_invoking_the_panic_hook() {
     // Isolate the process-wide hook from other tests that may run concurrently.
     if std::env::var_os(MALFORMED_SCHEMA_PANIC_PROBE).is_some() {
-        let encoded = malformed_int_width_schema_stream();
+        let encoded = [
+            MalformedSchemaCase::Dictionary,
+            MalformedSchemaCase::FloatMissingTable,
+            MalformedSchemaCase::HalfFloat,
+            MalformedSchemaCase::IntMissingTable,
+            MalformedSchemaCase::IntWidth,
+            MalformedSchemaCase::ListMissingChildren,
+            MalformedSchemaCase::ListTwoChildren,
+            MalformedSchemaCase::NestingTooDeep,
+            MalformedSchemaCase::UnsupportedType,
+        ]
+        .map(malformed_schema_stream);
         let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| exit(PANIC_HOOK_EXIT_CODE)));
 
-        let complete = decode_change(&encoded);
-        let projected = decode_change_projected(&encoded, &projection);
+        for encoded in encoded {
+            assert_invalid_encoding_without_decoder_panic(decode_change(&encoded));
+            assert_invalid_encoding_without_decoder_panic(decode_change_projected(
+                &encoded,
+                &projection,
+            ));
+        }
 
         std::panic::set_hook(previous_hook);
-        assert!(complete.is_err());
-        assert!(projected.is_err());
+        println!("{PANIC_PROBE_COMPLETED}");
         return;
     }
 
@@ -441,82 +559,57 @@ fn decoder_rejects_malformed_schema_without_invoking_the_panic_hook() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-}
-
-#[test]
-fn metadata_insertion_order_does_not_change_stream_bytes() {
-    let encode = |metadata| {
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![Field::new("value", DataType::UInt64, false)],
-            metadata,
-        ));
-        let records =
-            RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![7]))]).unwrap();
-        encode_change(&Change::try_new(records, Int64Array::from(vec![1])).unwrap()).unwrap()
-    };
-    assert_eq!(
-        encode(HashMap::from([
-            ("z".to_owned(), "last".to_owned()),
-            ("a".to_owned(), "first".to_owned()),
-        ])),
-        encode(HashMap::from([
-            ("a".to_owned(), "first".to_owned()),
-            ("z".to_owned(), "last".to_owned()),
-        ]))
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(PANIC_PROBE_COMPLETED),
+        "malformed Schema decoder probe did not execute the child test\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
 #[test]
-fn zero_logical_columns_keep_their_non_zero_row_count() {
-    let options = RecordBatchOptions::new().with_row_count(Some(2));
-    let records =
-        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![-1, 1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+fn fallible_schema_pipeline_rejects_malformed_v1_type_encodings() {
+    let cases = [
+        (MalformedSchemaCase::Dictionary, "dictionary encoding"),
+        (
+            MalformedSchemaCase::FloatMissingTable,
+            "Exactly one of union discriminant",
+        ),
+        (MalformedSchemaCase::HalfFloat, "unsupported precision"),
+        (
+            MalformedSchemaCase::IntMissingTable,
+            "Exactly one of union discriminant",
+        ),
+        (MalformedSchemaCase::IntWidth, "unsupported bit width"),
+        (
+            MalformedSchemaCase::ListMissingChildren,
+            "has no children vector",
+        ),
+        (
+            MalformedSchemaCase::ListTwoChildren,
+            "must have exactly one child",
+        ),
+        (
+            MalformedSchemaCase::NestingTooDeep,
+            "Nested table depth limit reached",
+        ),
+        (
+            MalformedSchemaCase::UnsupportedType,
+            "unsupported Arrow IPC type",
+        ),
+    ];
 
-    let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
-    assert_change_eq(
-        &decode_change_projected(&encoded, &projection).unwrap(),
-        &change,
-    );
-}
-
-#[test]
-fn every_scalar_and_maximum_nested_layout_round_trips() {
-    for data_type in [
-        DataType::Null,
-        DataType::Boolean,
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
-        DataType::UInt8,
-        DataType::UInt16,
-        DataType::UInt32,
-        DataType::UInt64,
-        DataType::Float32,
-        DataType::Float64,
-        DataType::Utf8,
-        DataType::Binary,
-    ] {
-        assert_type_round_trips(&data_type);
-    }
-
-    let mut list = DataType::Int64;
-    let mut structure = DataType::Int64;
-    let mut mixed = DataType::Int64;
-    for depth in 0..MAX_NESTING_DEPTH {
-        list = DataType::List(Arc::new(Field::new("item", list, true)));
-        structure = DataType::Struct(vec![Field::new("member", structure, true)].into());
-        mixed = if depth.is_multiple_of(2) {
-            DataType::List(Arc::new(Field::new("item", mixed, true)))
-        } else {
-            DataType::Struct(vec![Field::new("member", mixed, true)].into())
+    for (case, expected) in cases {
+        let Err(CodecError::InvalidEncoding { message }) =
+            stream::parse(&malformed_schema_stream(case))
+        else {
+            panic!("{case:?} did not return InvalidEncoding");
         };
-    }
-    for data_type in [list, structure, mixed] {
-        assert_type_round_trips(&data_type);
+        assert!(
+            message.contains(expected),
+            "{case:?} returned {message:?}, expected a diagnostic containing {expected:?}"
+        );
+        assert_ne!(message, DECODE_PANIC_MESSAGE, "decoder panic was caught");
     }
 }
 
@@ -549,7 +642,7 @@ fn decoder_rejects_invalid_physical_schema_and_version_markers() {
             data_type => unreachable!("unexpected physical diff type {data_type}"),
         };
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
-        assert_both_reject(&encode_stream(&schema, &[batch]), &projection);
+        assert_both_invalid_encoding(&encode_stream(&schema, &[batch]), &projection);
     }
 
     let mut version = marked_metadata();
@@ -566,13 +659,16 @@ fn decoder_rejects_invalid_physical_schema_and_version_markers() {
         decode_change(&encoded),
         Err(CodecError::UnsupportedVersion { version }) if version == "2"
     ));
-    assert!(decode_change_projected(&encoded, &projection).is_err());
+    assert!(matches!(
+        decode_change_projected(&encoded, &projection),
+        Err(CodecError::UnsupportedVersion { version }) if version == "2"
+    ));
 
     let mut unknown = marked_metadata();
     unknown.insert("dogpaddle.unknown".to_owned(), "value".to_owned());
     let schema = unit_physical_schema(unknown);
     let batch = unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![1]));
-    assert_both_reject(&encode_stream(&schema, &[batch]), &projection);
+    assert_both_invalid_encoding(&encode_stream(&schema, &[batch]), &projection);
 }
 
 #[test]
@@ -581,46 +677,46 @@ fn decoder_rejects_incomplete_noncanonical_or_unsupported_streams() {
     let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
     let encoded = encode_change(&change).unwrap();
     for end in 0..encoded.len() {
-        assert_both_reject(&encoded[..end], &projection);
+        assert_both_invalid_encoding(&encoded[..end], &projection);
     }
 
     let mut trailing = encoded.clone();
     trailing.push(0);
-    assert_both_reject(&trailing, &projection);
-    assert_both_reject(&encoded[4..], &projection);
+    assert_both_invalid_encoding(&trailing, &projection);
+    assert_both_invalid_encoding(&encoded[4..], &projection);
 
     let reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
     let batch_offset = usize::try_from(reader.get_ref().position()).unwrap();
     let mut legacy_batch = encoded.clone();
     legacy_batch.drain(batch_offset..batch_offset + 4);
-    assert_both_reject(&legacy_batch, &projection);
+    assert_both_invalid_encoding(&legacy_batch, &projection);
 
     let schema = unit_physical_schema(marked_metadata());
     let unit_projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
-    assert_both_reject(&encode_stream(&schema, &[]), &unit_projection);
+    assert_both_invalid_encoding(&encode_stream(&schema, &[]), &unit_projection);
     let batches = [
         unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![1])),
         unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![-1])),
     ];
-    assert_both_reject(&encode_stream(&schema, &batches), &unit_projection);
+    assert_both_invalid_encoding(&encode_stream(&schema, &batches), &unit_projection);
 
     let mut oversized_metadata = encoded.clone();
     oversized_metadata[4..8].copy_from_slice(&(i32::MAX - 7).to_le_bytes());
-    assert_both_reject_metadata(&oversized_metadata, &projection);
+    assert_both_invalid_encoding(&oversized_metadata, &projection);
     let metadata = ipc_batch_metadata(1, None, None, i64::MAX - 7, false);
     let oversized_body = replace_batch_message(&encoded, &metadata, &[]);
-    assert_both_reject_metadata(&oversized_body, &projection);
+    assert_both_invalid_encoding(&oversized_body, &projection);
 
     let batch = unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![1]));
     let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V4).unwrap();
-    assert_both_reject(
+    assert_both_invalid_encoding(
         &encode_stream_with_options(&schema, &[batch], options),
         &unit_projection,
     );
-    assert_both_reject(&big_endian_schema_stream(), &unit_projection);
+    assert_both_invalid_encoding(&big_endian_schema_stream(), &unit_projection);
     let compressed =
         replace_batch_message(&encoded, &ipc_batch_metadata(1, None, None, 0, true), &[]);
-    assert_both_reject(&compressed, &projection);
+    assert_both_invalid_encoding(&compressed, &projection);
 }
 
 #[test]
@@ -644,29 +740,7 @@ fn decoder_rechecks_zero_diff_after_arrow_decoding() {
     ));
 
     let empty = unit_physical_batch(Arc::clone(&schema), Int64Array::from(Vec::<i64>::new()));
-    assert_both_reject(&encode_stream(&schema, &[empty]), &projection);
-}
-
-#[test]
-fn projected_decode_matches_memory_for_every_top_level_layout() {
-    let change = representative_change();
-    let encoded = encode_change(&change).unwrap();
-    let field_count = change.schema().fields().len();
-    let mut selections = vec![vec![], vec![0, 2, 4, 6]];
-    selections.extend((0..field_count).map(|index| vec![index]));
-    selections.push((0..field_count).collect());
-
-    for selection in selections {
-        let full = selection.len() == field_count;
-        let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
-        let expected = change.try_project(&projection).unwrap();
-        let actual = decode_change_projected(&encoded, &projection).unwrap();
-        assert_change_eq(&actual, &expected);
-        assert_eq!(actual.schema(), projection.output_schema());
-        if full {
-            assert_eq!(encode_change(&actual).unwrap(), encoded);
-        }
-    }
+    assert_both_invalid_encoding(&encode_stream(&schema, &[empty]), &projection);
 }
 
 #[test]
@@ -701,7 +775,7 @@ fn projected_body_omits_a_large_unselected_binary_field() {
 
 #[test]
 fn projected_decode_skips_only_unselected_utf8_value_validation() {
-    let change = representative_change();
+    let change = layout_change();
     let mut encoded = encode_change(&change).unwrap();
     let values = field_buffer_range(&encoded, "label", VARIABLE_VALUES_BUFFER);
     encoded[values.start] = 0xff;
@@ -718,32 +792,38 @@ fn projected_decode_skips_only_unselected_utf8_value_validation() {
     ));
 
     let keep_id = ChangeProjection::try_new(change.schema(), [0]).unwrap();
-    assert!(decode_change_projected(&encoded, &keep_id).is_ok());
+    assert_change_eq(
+        &decode_change_projected(&encoded, &keep_id).unwrap(),
+        &change.try_project(&keep_id).unwrap(),
+    );
     let label = change.schema().index_of("label").unwrap();
     let select_label = ChangeProjection::try_new(change.schema(), [label]).unwrap();
-    assert!(decode_change_projected(&encoded, &select_label).is_err());
-    assert!(decode_change(&encoded).is_err());
+    assert_arrow_error(&decode_change_projected(&encoded, &select_label));
+    assert_arrow_error(&decode_change(&encoded));
 }
 
 #[test]
 fn projected_decode_skips_only_unselected_list_offset_validation() {
-    let change = representative_change();
+    let change = layout_change();
     let mut encoded = encode_change(&change).unwrap();
     let offsets = field_buffer_range(&encoded, "items", OFFSETS_BUFFER);
     let last = offsets.start + change.num_rows() * size_of::<i32>();
     encoded[last..last + size_of::<i32>()].copy_from_slice(&i32::MAX.to_le_bytes());
 
     let keep_id = ChangeProjection::try_new(change.schema(), [0]).unwrap();
-    assert!(decode_change_projected(&encoded, &keep_id).is_ok());
+    assert_change_eq(
+        &decode_change_projected(&encoded, &keep_id).unwrap(),
+        &change.try_project(&keep_id).unwrap(),
+    );
     let items = change.schema().index_of("items").unwrap();
     let select_items = ChangeProjection::try_new(change.schema(), [items]).unwrap();
-    assert!(decode_change_projected(&encoded, &select_items).is_err());
-    assert!(decode_change(&encoded).is_err());
+    assert_arrow_error(&decode_change_projected(&encoded, &select_items));
+    assert_arrow_error(&decode_change(&encoded));
 }
 
 #[test]
 fn both_decoders_validate_all_unselected_batch_metadata() {
-    let change = representative_change();
+    let change = layout_change();
     let encoded = encode_change(&change).unwrap();
     let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
     let short_fixed_width = corrupt_layout(&encoded, |parsed, layout, _, buffers| {
@@ -775,35 +855,73 @@ fn both_decoders_validate_all_unselected_batch_metadata() {
         invalid_non_nullable,
         out_of_body,
     ] {
-        assert_both_reject_metadata(&malformed, &projection);
+        assert_both_invalid_encoding(&malformed, &projection);
     }
 }
 
 #[test]
-fn nullable_struct_masks_nulls_in_a_non_nullable_child() {
-    let child = Arc::new(Field::new("value", DataType::Int64, false));
-    let object = StructArray::new(
-        vec![child].into(),
-        vec![Arc::new(Int64Array::from(vec![None, Some(2)]))],
-        Some(NullBuffer::from(vec![false, true])),
-    );
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "object",
-        object.data_type().clone(),
-        true,
-    )]));
-    let records = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(object)]).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![1, 1])).unwrap();
+fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descriptors() {
+    let change = simple_change(&[1, -1]);
     let encoded = encode_change(&change).unwrap();
+    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
+    let (parsed, layout) = parsed_layout(&encoded);
+    let row_count = parsed.batch.length();
+    let body = parsed.body.to_vec();
+    let nodes = layout.nodes;
+    let buffers = parsed
+        .batch
+        .buffers()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
 
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-    let identity = ChangeProjection::try_new(Arc::clone(&schema), [0]).unwrap();
-    assert_change_eq(
-        &decode_change_projected(&encoded, &identity).unwrap(),
-        &change,
-    );
-    let empty = ChangeProjection::try_new(schema, []).unwrap();
-    let empty = decode_change_projected(&encoded, &empty).unwrap();
-    assert_eq!(empty.num_rows(), 2);
-    assert_eq!(empty.diffs().values(), &[1, 1]);
+    let replace = |nodes: Option<&[FieldNode]>, buffers: Option<&[IpcBuffer]>| {
+        let metadata = ipc_batch_metadata(
+            row_count,
+            nodes,
+            buffers,
+            i64::try_from(body.len()).unwrap(),
+            false,
+        );
+        replace_batch_message(&encoded, &metadata, &body)
+    };
+
+    let mut extra_nodes = nodes.clone();
+    extra_nodes.push(FieldNode::new(0, 0));
+    let mut extra_buffers = buffers.clone();
+    extra_buffers.push(IpcBuffer::new(i64::try_from(body.len()).unwrap(), 0));
+
+    let mut negative_length_node = nodes.clone();
+    negative_length_node[0] = FieldNode::new(-1, 0);
+    let mut negative_null_count = nodes.clone();
+    negative_null_count[0] = FieldNode::new(row_count, -1);
+    let mut excessive_null_count = nodes.clone();
+    excessive_null_count[0] = FieldNode::new(row_count, row_count + 1);
+
+    let mut negative_offset = buffers.clone();
+    negative_offset[0] = IpcBuffer::new(-1, negative_offset[0].length());
+    let mut negative_buffer_length = buffers.clone();
+    negative_buffer_length[0] = IpcBuffer::new(negative_buffer_length[0].offset(), -1);
+    let mut gap = buffers.clone();
+    gap[1] = IpcBuffer::new(gap[1].offset() + 8, gap[1].length());
+    let mut overlap = buffers.clone();
+    overlap[1] = IpcBuffer::new(0, overlap[1].length());
+
+    let malformed = [
+        replace(None, Some(&buffers)),
+        replace(Some(&nodes), None),
+        replace(Some(&extra_nodes), Some(&buffers)),
+        replace(Some(&nodes), Some(&extra_buffers)),
+        replace(Some(&negative_length_node), Some(&buffers)),
+        replace(Some(&negative_null_count), Some(&buffers)),
+        replace(Some(&excessive_null_count), Some(&buffers)),
+        replace(Some(&nodes), Some(&negative_offset)),
+        replace(Some(&nodes), Some(&negative_buffer_length)),
+        replace(Some(&nodes), Some(&gap)),
+        replace(Some(&nodes), Some(&overlap)),
+    ];
+    for encoded in malformed {
+        assert_both_invalid_encoding(&encoded, &projection);
+    }
 }

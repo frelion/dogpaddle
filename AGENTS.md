@@ -2,16 +2,17 @@
 
 ## 项目结构与模块组织
 
-DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/change/` 定义共享 Arrow Schema、`Change`、Schema 校验、Schema 绑定的顶层投影，以及每个 Change 独立、自描述、恰好一个 RecordBatch 的完整 Arrow IPC Stream 编码与选择性读取；它的库代码与正常依赖不依赖 Flow、Operation 或 Store。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；每个持久化集合以最后一个 `Small` 或 `Large` 泛型参数显式声明物理规模，Store 直接创建或打开具体集合实例，裸句柄与 placement 不对外开放，且不依赖 Arrow。`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 声明和执行语义，运行 trait 与具体算子统一放在 `operation/`，并在其下按 `source/`、`transform/`、`sink/` 分类，当前包含 SequenceSource 与 Count；共享记录模型不属于 Operation。`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按生命周期拆分：`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、纯校验和稳定编码，并在构建时创建全部资源；`flow/` 处理已构建 Flow 的打开与生命周期，并在打开时解析全部资源；`stage/` 只保存运行期 Stage 及其已注入的类型化数据对象。Stage 不接收 Store，不创建或打开资源，也不知道物理 placement 或稳定资源名。拓扑是 Flow Definition 的连接关系，不再拥有独立 Builder。每个 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页。
+DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品定位、已有能力和当前边界。`crates/change/` 定义共享 Arrow Schema、`Change`、Schema 校验、Schema 绑定的顶层投影，以及每个 Change 独立、自描述、恰好一个 RecordBatch 的完整 Arrow IPC Stream 编码与选择性读取；它的库代码与正常依赖不依赖 Flow、Operation 或 Store。`crates/store/` 实现 MDBX 事务存储、编解码器和类型化集合；每个持久化集合以最后一个 `Small` 或 `Large` 泛型参数显式声明物理规模，Store 直接创建或打开具体集合实例，裸句柄与 placement 不对外开放，且不依赖 Arrow。`crates/operation/` 承载具体 Operation 的纯 Definition、稳定编码、持久化 Data 声明和执行语义，运行 trait 与具体算子统一放在 `operation/`，并在其下按 `source/`、`transform/`、`sink/` 分类，当前包含 SequenceSource 与 Count；共享记录模型不属于 Operation。`crates/flow/` 提供公共 Builder、拓扑校验、持久化 `build/open`，并拥有内部 Stage。Flow 内部按生命周期拆分：`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、纯校验和稳定编码，并在构建时创建全部资源；`flow/` 处理已构建 Flow 的打开与生命周期，并在打开时解析全部资源；`stage/` 只保存运行期 Stage 及其已注入的类型化数据对象。Stage 不接收 Store，不创建或打开资源，也不知道物理 placement 或稳定资源名。拓扑是 Flow Definition 的连接关系，不再拥有独立 Builder。`integration-tests/change-store/` 是不可发布的下游测试包，只通过公共 API 验证完整 Change Stream 与 `AppendLog<Vec<u8>>` 的接缝；产品 crate 不得依赖它。每个产品 crate 的语义、用法和验证方式写入自身 `README.md`，并作为 Rustdoc 首页；不可发布的测试 package 只需维护自身测试说明。全工作区测试所有权、数据规格和性能口径统一写在根目录 `TESTING.md`。
 
 ## 构建、测试与开发命令
 
-- `cargo build --workspace`：使用工作区锁定的依赖构建四个 crate。
+- `cargo build --workspace`：使用工作区锁定的依赖构建四个产品 crate 和不可发布的集成测试包。
 - `cargo test --workspace`：运行单元测试、集成测试和文档测试。
-- `cargo test -p dogpaddle-store --test architecture transaction::`：运行指定测试区域；可按需替换包、测试目标或过滤条件。
+- `cargo test -p dogpaddle-change-store-integration`：只运行 Change 与 AppendLog 的外部组合测试。
+- `cargo test -p dogpaddle-store --test correctness transaction::`：运行指定公共测试区域；所有 crate 的公共测试 target 都统一命名为 `correctness`。
 - `cargo fmt --all -- --check`：检查格式，不修改文件。
 - `cargo clippy --workspace --all-targets -- -D warnings`：执行已配置的 `all` 和 `pedantic` Clippy 规则。若命令不可用，请先安装 Clippy rustup 组件。
-- `cargo bench -p dogpaddle-store --bench cell`、`--bench ordered_map`、`--bench append_log`：分别运行 Cell、OrderedMap 和 AppendLog 的 release 基准测试；工作负载环境变量及本机可读报告见 `crates/store/README.md` 与 `crates/store/PERFORMANCE.md`。
+- `cargo bench -p dogpaddle-store --bench cell`、`--bench ordered_map`、`--bench append_log`、`--bench append_log_endurance`：分别运行 Cell、OrderedMap、通用 AppendLog 和 AppendLog 长稳 release 基准测试；Change 使用 `change_core`/`change_codec`，Operation 使用 `operation_core`，Flow 冷路径使用 `flow_lifecycle`，Change + Store 使用 `change_append_log`/`change_append_log_endurance`。工作负载与口径见根目录 `TESTING.md` 及各自的测试或性能说明。
 
 请使用根目录 `Cargo.toml` 指定的 Rust 1.96 或更高版本。
 
@@ -23,7 +24,9 @@ Change crate 的 `Change` 是无事件时间、有稳定事件顺序、允许重
 
 ## 测试规范
 
-测试名称应清楚描述行为，例如 `finish_rejects_a_multi_stage_cycle`。每个源码模块目录只维护一个 `tests.rs`，其中统一覆盖该目录内模块及子模块的私有实现；不要为单个源码文件再创建同名测试子目录。公共行为和持久性测试放在所属 crate 的 `tests/` 目录。使用 `tempfile` 创建隔离的临时存储。目前没有硬性覆盖率指标；持久化变更必须覆盖成功构建、纯校验失败无文件副作用、不完整构建、资源布局、稳定编码和重新打开。
+测试名称应清楚描述行为，例如 `finish_rejects_a_multi_stage_cycle`。每个源码模块目录只维护一个 `tests.rs`，其中统一覆盖该目录内模块及子模块的私有实现；不要为单个源码文件再创建同名测试子目录。每个 crate 的公共行为和持久性测试只能有一个显式 Cargo target：`tests/correctness.rs` 作为入口、`tests/correctness/*.rs` 按领域拆分；manifest 必须关闭自动 test/bench 发现，产品 library 设置 `[lib] bench = false`，并逐项声明 target，防止重新碎片化。能经公共 API 证明的行为不得留在白盒测试中。
+
+正常产品依赖的跨 crate 契约由组合根拥有：Operation + Store 归 Operation，Flow + Operation + Store 归 Flow。只有没有产品组合根的 sibling seam 才建立 `publish = false` 的 `integration-tests/<seam>` package；当前 `crates/change/tests/` 不得依赖 Store，`crates/store/tests/` 不得依赖 Change，必须同时依赖二者的行为、性能或长稳验证统一放在 `integration-tests/change-store/`。使用 `tempfile` 创建隔离的临时存储。普通测试不得使用 wall-clock 断言；benchmark 的 fixture、seed、预热和结果校验必须位于计时外，输出原始样本及 rustc/CPU/profile/git 信息，持久化 reference 运行还必须使用显式固定文件系统。目前没有硬性覆盖率指标；持久化变更必须覆盖成功构建、纯校验失败无文件副作用、不完整构建、资源布局、稳定编码和重新打开。完整规范见根目录 `TESTING.md`。
 
 ## 提交与 Pull Request 规范
 

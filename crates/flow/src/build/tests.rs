@@ -304,6 +304,134 @@ fn finish_rejects_a_cycle_in_one_of_multiple_components() {
     );
 }
 
+#[test]
+fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
+    const MAX_STAGE_COUNT: usize = 5;
+    const EXPECTED_GRAPH_COUNT: usize = 8_476;
+
+    let mut visited = 0;
+
+    for stage_count in 1..=MAX_STAGE_COUNT {
+        for count_mask in 0..(1_usize << stage_count) {
+            let count_targets = (0..stage_count)
+                .filter(|index| count_mask & (1_usize << index) != 0)
+                .collect::<Vec<_>>();
+            let assignment_count = stage_count.pow(u32::try_from(count_targets.len()).unwrap());
+
+            for assignment in 0..assignment_count {
+                visited += 1;
+                let parents = decode_parent_assignment(stage_count, &count_targets, assignment);
+                let expected = classify_unary_graph(&parents);
+                let graph = format!(
+                    "stage_count={stage_count}, count_mask={count_mask:#b}, parents={parents:?}"
+                );
+
+                let mut builder = builder();
+                let references = (0..stage_count)
+                    .map(|index| {
+                        let id = stage_id(index);
+                        if parents[index].is_some() {
+                            builder.stage(id, count())
+                        } else {
+                            builder.stage(id, source(index as u64))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for &target in &count_targets {
+                    builder.connect([references[parents[target].unwrap()]], references[target]);
+                }
+
+                match expected {
+                    UnaryGraphClass::Acyclic => {
+                        let definition = builder
+                            .finish_definition()
+                            .unwrap_or_else(|error| panic!("{graph}: rejected with {error:?}"));
+                        let expected_ids = (0..stage_count).map(stage_id).collect::<Vec<_>>();
+                        assert_eq!(
+                            definition
+                                .stages
+                                .iter()
+                                .map(|stage| stage.id.as_str())
+                                .collect::<Vec<_>>(),
+                            expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                            "{graph}: declaration order changed"
+                        );
+                        for (target, stage) in definition.stages.iter().enumerate() {
+                            let expected_sources = parents[target]
+                                .map(|parent| vec![stage_id(parent)])
+                                .unwrap_or_default();
+                            assert_eq!(
+                                stage.sources, expected_sources,
+                                "{graph}: source order changed for target {target}"
+                            );
+                        }
+                    }
+                    UnaryGraphClass::SelfLoop(target) => assert_eq!(
+                        builder.finish_definition().unwrap_err(),
+                        TopologyError::SelfLoop(stage_id(target)),
+                        "{graph}: direct cycle classification changed"
+                    ),
+                    UnaryGraphClass::Cycle => assert_eq!(
+                        builder.finish_definition().unwrap_err(),
+                        TopologyError::Cycle,
+                        "{graph}: indirect cycle classification changed"
+                    ),
+                }
+            }
+        }
+    }
+
+    assert_eq!(visited, EXPECTED_GRAPH_COUNT);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnaryGraphClass {
+    Acyclic,
+    SelfLoop(usize),
+    Cycle,
+}
+
+fn decode_parent_assignment(
+    stage_count: usize,
+    count_targets: &[usize],
+    mut assignment: usize,
+) -> Vec<Option<usize>> {
+    let mut parents = vec![None; stage_count];
+    for &target in count_targets {
+        parents[target] = Some(assignment % stage_count);
+        assignment /= stage_count;
+    }
+    assert_eq!(assignment, 0);
+    parents
+}
+
+fn classify_unary_graph(parents: &[Option<usize>]) -> UnaryGraphClass {
+    if let Some((target, _)) = parents
+        .iter()
+        .enumerate()
+        .find(|(target, parent)| **parent == Some(*target))
+    {
+        return UnaryGraphClass::SelfLoop(target);
+    }
+
+    for start in 0..parents.len() {
+        let mut visited = vec![false; parents.len()];
+        let mut current = Some(start);
+        while let Some(stage) = current {
+            if visited[stage] {
+                return UnaryGraphClass::Cycle;
+            }
+            visited[stage] = true;
+            current = parents[stage];
+        }
+    }
+    UnaryGraphClass::Acyclic
+}
+
+fn stage_id(index: usize) -> String {
+    format!("stage-{index}")
+}
+
 fn codec_definition() -> FlowDefinition {
     let mut builder = builder();
     let source = builder.stage("source", source(7));

@@ -1,8 +1,8 @@
 # dogpaddle-change
 
-`dogpaddle-change` 定义 `DogPaddle` 各执行层共享的有序 Arrow 变化契约。它不依赖 Flow、
-Operation 或 Store：Operation 消费和产生 `Change`，运行层负责路由与持久化，Store 只保存
-不透明字节。
+`dogpaddle-change` 定义 `DogPaddle` 各执行层将共享的有序 Arrow 变化契约。它不依赖 Flow、
+Operation 或 Store：未来的运行层会让 Operation 消费和产生 `Change` 并负责路由与持久化，
+Store 只保存不透明字节；当前 Operation 尚未接入 Change。
 
 ## Change
 
@@ -126,4 +126,11 @@ diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
 cargo test -p dogpaddle-change
 cargo clippy -p dogpaddle-change --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-change --no-deps
+cargo bench -p dogpaddle-change --bench change_core
+cargo bench -p dogpaddle-change --bench change_codec
 ```
+
+正确性分层、fixture 所有权和负向测试口径见 [`TESTING.md`](./TESTING.md)，Change 单体
+benchmark 的 workload、环境变量与结果解释见 [`PERFORMANCE.md`](./PERFORMANCE.md)。真实
+`Change + AppendLog<Vec<u8>>` 正确性和性能属于工作区下游
+`integration-tests/change-store/`，不由本 crate 的测试依赖 Store。

@@ -12,20 +12,28 @@ use crate::{
 const COUNT: DataName<Cell<u64>> = DataName::new("count");
 const STRING_COUNT: DataName<Cell<String>> = DataName::new("count");
 const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("count");
+const SMALL_STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("state");
 const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
 
 #[test]
-fn decoder_tags_and_data_declaration_names_are_unique() {
-    let mut tags = HashSet::new();
-    for (tag, _) in DECODERS {
-        assert!(tags.insert(*tag), "duplicate operation decoder tag {tag}");
-    }
-
-    for definition in [
+fn decoder_registry_exactly_matches_builtins_and_data_names_are_valid() {
+    let definitions = [
         &SequenceSourceDefinition::new(0) as &dyn OperationDefinition,
         &CountDefinition::new(),
-    ] {
-        assert!(tags.contains(&definition.persistence_tag()));
+    ];
+    let expected_tags = definitions
+        .iter()
+        .map(|definition| definition.persistence_tag())
+        .collect::<HashSet<_>>();
+    let registered_tags = DECODERS.iter().map(|(tag, _)| *tag).collect::<HashSet<_>>();
+    assert_eq!(
+        registered_tags.len(),
+        DECODERS.len(),
+        "duplicate decoder tag"
+    );
+    assert_eq!(registered_tags, expected_tags);
+
+    for definition in definitions {
         let mut names = HashSet::new();
         for declaration in definition.data() {
             let name = declaration.name();
@@ -133,4 +141,21 @@ fn data_instances_reject_a_different_collection_with_the_same_layout() {
         panic!("cell unexpectedly materialized as an ordered map with the same layout");
     };
     assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
+}
+
+#[test]
+fn data_instances_reject_a_different_size_of_the_same_collection() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("store")).unwrap();
+    let state = SMALL_STATE
+        .declaration()
+        .create(&mut store, "physical-state")
+        .unwrap();
+    let mut instances = DataInstances::new();
+    instances.insert(state).unwrap();
+
+    let Err(error) = instances.take(&STATE) else {
+        panic!("small map unexpectedly materialized as the large data class");
+    };
+    assert_eq!(error, MaterializeError::WrongDataClass { name: "state" });
 }
