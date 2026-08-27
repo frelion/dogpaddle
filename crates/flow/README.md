@@ -35,24 +35,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Stage ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。连接保留 source 顺序，允许
-fan-out 和重复 source；输入数量必须与具体 Definition 完全一致，整个拓扑必须是 DAG。
-拓扑校验或 manifest 编码失败不会创建目标目录。
+fan-out 和重复 source；输入数量必须与具体 Definition 完全一致，作为 source 的 Operation
+必须声明自己产生输出，整个拓扑必须是 DAG。拓扑校验或 manifest 编码失败不会创建目标目录。
 
 ## 持久化边界
 
 每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
-持久化 state map，并按 Operation Definition 的逻辑数据名声明全部状态空间，最后提交
-manifest Cell 作为构建完成标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”
-声明；Flow 负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称交给
-Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或物理
-布局。
+持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个
+`produces_output() == true` 的 Stage 创建一个 output log，最后提交 manifest Cell 作为构建完成
+标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；Flow 负责完整资源名，
+并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称交给 Definition 直接装配
+Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或物理布局。
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state map 显式声明为
-`Small`。Flow state map 保留生命周期状态，Stage state map 保存运行期 Stage 状态。未来的
-边数据通道将使用构建期显式声明的日志资源；每个日志 value 是一个内嵌 Schema 的完整 Change
-IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不依赖 Change
-codec 之外的 Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，
-不能动态新增数据空间。此后 Store 已转换为事务能力，拓扑和资源目录都没有修改入口。
+`Small`。Flow state map 保留生命周期状态，Stage state map 保存运行期 Stage 状态，并将在运行
+协议中保存各 input 自己的 next-unread offset。output 是 `AppendLog<Vec<u8>>`；每个 value 将保存一个内嵌 Schema
+的完整 Change IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不
+依赖 Change codec 之外的 Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map
+和日志，不能动态新增数据空间。此后 Store 被转换为可克隆的事务启动能力：Flow 保留一份，每个
+Stage 各自获得一份，拓扑和资源目录都没有修改入口。
+
+资源创建和 Stage 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
+output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
+`ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
+Stage 不知道上游 Stage，只知道自己的有序 inputs；它拥有自己的完整可选 output，因此可以在
+同一个事务中读取 input、推进 state、更新 Operation 状态并发布 output。没有 output 的 Sink
+使用 `None`，不能被其他 Stage 作为 source。
 
 每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
 不是稳定 event ID。未来 Stage 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件
@@ -64,8 +72,8 @@ Store 目录和 catalog 已有效、但 manifest 尚未提交时，`Flow::open()
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
-`open()` 分两遍完成：第一遍只读取、解码并重新校验 manifest；第二遍按持久化定义打开全部
-数据对象、重新装配 Stage，再冻结 Store。调用方不需要重新提交 Definition。
+`open()` 先读取、解码并重新校验 manifest，再打开全部数据对象和 output，最后按 source ID
+重新注入 inputs、装配 Stage 并冻结 Store。调用方不需要重新提交 Definition。
 
 当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
@@ -73,10 +81,12 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 - Flow manifest：`flow/definition`
 - Flow 状态：`flow/state`
 - Stage 状态：`stage/{index:08x}/state`
+- Stage 输出：`stage/{index:08x}/output`（仅限声明产生输出的 Operation）
 - `SequenceSource` 位置：`stage/{index:08x}/operation/sequence_source.position`
 - Count 状态：`stage/{index:08x}/operation/count`
 
-`index` 是 Stage 声明顺序。修改编码、tag 或资源名必须作为磁盘格式变更处理并补充迁移设计。
+`index` 是 Stage 声明顺序。当前仍是开发期 v1，编码、tag 或资源布局可以破坏性调整，但每次
+调整必须同步更新黄金字节、布局和 reopen 测试，不保留旧格式兼容层。
 
 ## 源码边界
 
@@ -84,8 +94,8 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition 中的连接关系，
 不再拥有独立 Builder。`build/` 与 `flow/` 分别按 Definition 声明的逻辑数据名通用创建或打开
 类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。`stage/` 只保存
-公共 state map 和装箱后的 `Operation` trait object，不接收 Store，也不知道资源名或底层
-物理布局。
+事务启动能力、state、装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不接收 Store，
+也不知道 Stage ID、上游 Stage、资源名或底层物理布局。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 使用单一 `correctness` target 验证 crate 的公共行为。Flow 是 Operation 与 Store 的组合根，
 因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个重复的
@@ -94,8 +104,9 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 
 ## 当前边界
 
-本阶段只完成定义、持久化 `build` 和无 Definition 参数的 `open`。尚未实现 `run`、Stage
-调度、Stage state map 的键协议、输入进度、输出发布、背压、中断或运行恢复；
+本阶段完成定义、持久化 `build/open`，以及 Stage 的事务、只读 inputs 和可选 output 装配。
+尚未实现 `run`、Stage 调度、Stage state map 的 offset 键协议、Change 解码与 Operation 批量
+接口、背压、中断或运行恢复。
 `SequenceSource` 只是第一个真实零输入 Definition，用于形成可构建的
 `SequenceSource → Count` DAG，并不代表调度器已经存在。
 

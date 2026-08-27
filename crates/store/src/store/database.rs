@@ -3,7 +3,10 @@ use std::{
     fs,
     io::ErrorKind,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use libmdbx::{
@@ -23,7 +26,7 @@ const NEXT_DEDICATED_KEY: &[u8] = &[4];
 const CATALOG_DOMAIN: u8 = 2;
 const STORE_MARKER: &[u8] = b"dogpaddle.store\0";
 const MAX_NAME_BYTES: usize = 255;
-const MAX_DEDICATED_TABLES: u32 = 64;
+const MAX_DEDICATED_TABLES: u32 = 4_096;
 const SHARED_PLACEMENT: u8 = 0;
 const DEDICATED_PLACEMENT: u8 = 1;
 
@@ -247,7 +250,7 @@ impl Store {
     #[must_use]
     pub fn into_transactions(self) -> Transactions {
         Transactions {
-            database: self.database,
+            database: Arc::new(self.database),
             store_token: self.token,
         }
     }

@@ -35,10 +35,12 @@ fn definitions_expose_their_stable_public_contracts() {
     let source = SequenceSourceDefinition::new(42);
     assert_eq!(source.start(), 42);
     assert_eq!(source.input_count(), 0);
+    assert!(source.produces_output());
     assert_eq!(names(&source), ["sequence_source.position"]);
 
     let count = CountDefinition::new();
     assert_eq!(count.input_count(), 1);
+    assert!(count.produces_output());
     assert_eq!(names(&count), ["count"]);
 }
 

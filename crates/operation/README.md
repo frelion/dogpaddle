@@ -16,7 +16,8 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 后保持不变；物理 Change 边界不能被算子当成业务事件。
 
 当前阶段尚未公开运行 trait 的批量处理方法，因此本 crate 不提前增加空的 `run` 或
-`process` 接口。Flow/Stage 数据通道接入时再引入对 `dogpaddle-change` 的实际代码依赖。
+`process` 接口。Flow 已经装配持久化 output log 与只读 input capability；等 Change 真正进入
+Operation 调用协议时，再引入对 `dogpaddle-change` 的实际代码依赖。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -28,8 +29,10 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 ## Definition 与持久化
 
-具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量，并以
-`{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。Flow 负责生成完整
+具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量和
+`produces_output()`，并以 `{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。
+`produces_output()` 表示 Operation 是否拥有语义输出端口，不表示某次处理一定产生记录，也不
+取决于当前拓扑是否存在下游；Source 与 Transform 可以是 `true`，Sink 是 `false`。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
 Definition 的 `materialize`。具体 Definition 只按名称取得已经创建或打开的
 `Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
@@ -47,6 +50,7 @@ use dogpaddle_operation::{
 
 let source = SequenceSourceDefinition::new(10);
 assert_eq!(source.input_count(), 0);
+assert!(source.produces_output());
 
 let encoded = encode_definition(&source);
 let decoded = decode_definition(&encoded).unwrap();
@@ -71,7 +75,7 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 [`operation::source::SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的
 [`operation::source::SequenceSourceOperation`] 直接持有 `Cell<u64>`，保存最后一次
 已提交的值；首次产生 `start`，随后逐一递增。`u64::MAX` 可以产生一次，再次推进返回
-[`operation::source::SequenceSourceError::Exhausted`]。
+[`operation::source::SequenceSourceError::Exhausted`]。它声明自己产生输出。
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Stage 资源名。
 
@@ -80,7 +84,8 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 [`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
 [`operation::transform::CountOperation`] 将直接持有的 `Cell<u64>` 加一并返回新计数；
 未写入的 Cell 解释为 `0`，溢出返回
-[`operation::transform::CountError::Overflow`]。
+[`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Stage，它仍声明自己产生
+输出；拓扑位置不会把 Transform 隐式变成 Sink。
 
 ```rust,no_run
 use dogpaddle_operation::operation::transform::{CountDefinition, CountOperation};
@@ -100,10 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Operation 业务逻辑不接收、开始、提交或保存 Transaction。未来 Flow 内部的 Stage 保留完整
-Transaction，只把不能提交的 `TransactionAccess` 交给 `step()`；Operation 再用自己持有的
-`Cell` 或 `OrderedMap` 创建具体事务级 Access。这样 Flow 不必知道算子的数据结构，Operation
-也不能控制事务边界，而状态、输入进度和输出仍可由 Stage 原子提交。
+Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow 内部的每个 Stage 拥有自己的
+`Transactions` capability；一次工作由 Stage 开始 Transaction，并只把不能提交的
+`TransactionAccess` 交给 Operation。Operation 再用自己持有的 `Cell` 或 `OrderedMap` 创建具体
+事务级 Access。这样 Flow 调度器只需要唤醒 Stage，Flow 不必知道算子的数据结构，Operation 也
+不能控制事务边界，而状态、输入进度和输出可由 Stage 在同一事务中原子提交。
 
 ## 扩展约束
 
@@ -117,11 +123,12 @@ Transaction，只把不能提交的 `TransactionAccess` 交给 `step()`；Operat
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
 分类内增加任意数量的算子都不会产生注册名称冲突。
 
-一个 Operation 的 tag、payload、逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE`
-共同构成持久化 schema。Flow 根据声明创建实例，materialize 再按逻辑名取出；实例集合拒绝
-重复、缺失、错误 class 或未消费的资源。修改已有 schema 必须分配新 tag、提升格式版本或
-提供迁移；不能让同一 tag 在不同版本中要求不同资源。编码 tag 与 decoder 表必须复用具体
-模块中的同一个 tag 常量，并通过 tag 唯一性、黄金字节、资源布局和 reopen 测试约束。
+一个 Operation 的 tag、payload、`produces_output()`、逻辑数据名称、类型化 collection、codec
+和适用时的 `SIZE` 共同决定持久化资源 schema。Flow 根据声明创建实例，materialize 再按逻辑名
+取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
+旧格式兼容层的前提下破坏性调整已有 tag 对应的 schema，但必须同步更新 decoder、黄金字节、
+资源布局和 reopen 测试。格式稳定后，这类变化才需要新 tag、新版本或明确迁移。编码 tag 与
+decoder 表必须复用具体模块中的同一个 tag 常量。
 
 声明使用普通静态 Rust 值表达，不引入 Slot、Assembler、Factory registry 或位置 ABI。只有在
 出现稳定且机械的声明样板后，才考虑用很薄的 `macro_rules!` 生成声明常量；宏不得生成算子

@@ -1,4 +1,4 @@
-use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc};
+use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc, sync::Arc};
 
 use libmdbx::{Database, NoWriteMap, RW, Transaction as MdbxTransaction};
 
@@ -40,12 +40,16 @@ pub struct Store {
     token: u64,
 }
 
-/// Grants the sole runtime capability to begin store transactions.
+/// Grants one clonable runtime capability to begin store transactions.
 ///
 /// This value is obtained by consuming [`Store`]. It does not expose the
-/// catalog or allow data objects to be created or opened.
+/// catalog or allow data objects to be created or opened. Clones share the
+/// same database and Store identity, so a Flow and its stages can each own a
+/// transaction-start capability without sharing the capability value itself.
+/// The Store path remains open and exclusive until the last clone is dropped.
+#[derive(Clone)]
 pub struct Transactions {
-    database: Database<NoWriteMap>,
+    database: Arc<Database<NoWriteMap>>,
     store_token: u64,
 }
 

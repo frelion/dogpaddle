@@ -60,6 +60,10 @@ pub(crate) fn stage_state_name(index: usize) -> String {
     format!("stage/{index:08x}/state")
 }
 
+pub(crate) fn stage_output_name(index: usize) -> String {
+    format!("stage/{index:08x}/output")
+}
+
 pub(crate) fn operation_data_name(index: usize, logical_name: &str) -> String {
     format!("stage/{index:08x}/operation/{logical_name}")
 }

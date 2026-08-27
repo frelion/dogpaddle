@@ -2,7 +2,7 @@ use dogpaddle_flow::{Flow, FlowError};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store, StoreError};
+use dogpaddle_store::{AppendLog, Cell, Large, OrderedMap, Small, Store, StoreError};
 
 use super::support::{build_source_and_read_definition, fixture_bytes, read_published_definition};
 
@@ -43,6 +43,9 @@ fn build_uses_the_stable_resource_layout() {
         store.open_data("stage/00000000/state").unwrap();
     let _count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("stage/00000001/state").unwrap();
+    let _source_output: AppendLog<Vec<u8>> = store.open_data("stage/00000000/output").unwrap();
+    let _terminal_count_output: AppendLog<Vec<u8>> =
+        store.open_data("stage/00000001/output").unwrap();
     let _source_position: Cell<u64> = store
         .open_data("stage/00000000/operation/sequence_source.position")
         .unwrap();
@@ -57,6 +60,76 @@ fn build_uses_the_stable_resource_layout() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn open_reports_a_missing_stage_output_after_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let definition = build_source_and_read_definition(&root.path().join("complete"));
+
+    let incomplete_path = root.path().join("missing-output");
+    let mut store = Store::create(&incomplete_path).unwrap();
+    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
+    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
+    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("stage/00000000/state").unwrap();
+    let _position: Cell<u64> = store
+        .create_data("stage/00000000/operation/sequence_source.position")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin().unwrap();
+        published
+            .access(transaction.access())
+            .unwrap()
+            .set(&definition)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    assert!(matches!(
+        Flow::open(&incomplete_path),
+        Err(FlowError::MissingResource { name })
+            if name == "stage/00000000/output"
+    ));
+}
+
+#[test]
+fn open_reports_a_stage_output_size_mismatch() {
+    let root = tempfile::tempdir().unwrap();
+    let definition = build_source_and_read_definition(&root.path().join("complete"));
+
+    let mismatched_path = root.path().join("output-size-mismatch");
+    let mut store = Store::create(&mismatched_path).unwrap();
+    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
+    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
+    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("stage/00000000/state").unwrap();
+    let _position: Cell<u64> = store
+        .create_data("stage/00000000/operation/sequence_source.position")
+        .unwrap();
+    let _wrong_output: Cell<Vec<u8>> = store.create_data("stage/00000000/output").unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin().unwrap();
+        published
+            .access(transaction.access())
+            .unwrap()
+            .set(&definition)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    assert!(matches!(
+        Flow::open(&mismatched_path),
+        Err(FlowError::Store(StoreError::DataSizeMismatch {
+            name,
+            expected: "large",
+            actual: "small",
+        })) if name == "stage/00000000/output"
+    ));
 }
 
 #[test]

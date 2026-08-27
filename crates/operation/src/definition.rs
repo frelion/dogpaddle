@@ -53,6 +53,13 @@ pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
     /// Returns the exact number of ordered upstream stages this definition accepts.
     fn input_count(&self) -> usize;
 
+    /// Returns whether this operation produces a downstream change stream.
+    ///
+    /// Flow uses this declaration to decide whether the owning stage has an
+    /// output log. It is independent of whether the current topology happens
+    /// to connect any downstream stages.
+    fn produces_output(&self) -> bool;
+
     /// Returns the operation's stable logical data names and typed classes.
     ///
     /// Flow prefixes each name with the owning stage's stable resource path.

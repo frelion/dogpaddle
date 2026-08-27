@@ -61,6 +61,10 @@ impl OperationDefinition for SequenceSourceDefinition {
         0
     }
 
+    fn produces_output(&self) -> bool {
+        true
+    }
+
     fn data(&self) -> &'static [DataDeclaration] {
         DATA
     }

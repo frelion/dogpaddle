@@ -1,18 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use dogpaddle_operation::{DataInstances, OperationDefinition};
-use dogpaddle_store::{Cell, OrderedMap, Small, Store, StoreData, StoreError, Transactions};
+use dogpaddle_store::{
+    AppendLog, Cell, OrderedMap, ReadOnly, Small, Store, StoreData, StoreError, Transactions,
+};
 
 use crate::{
     build::{FlowBuilder, FlowDefinition, StageDefinition, codec},
     error::FlowError,
-    stage::Stage,
+    stage::{Stage, StageParts},
 };
 
 /// An opened persistent Flow.
 ///
-/// A Flow owns the only active Store transaction capability for its path. Its
-/// definition and data object set were frozen by a successful build.
+/// A Flow owns a Store transaction capability for its own coordination. Each
+/// runtime stage owns another capability for the same Store. The definition
+/// and data object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
     definition: FlowDefinition,
@@ -66,7 +72,7 @@ impl Flow {
             &store,
             codec::FLOW_STATE_DATA_NAME,
         )?;
-        let stages = open_stages(&store, &definition)?;
+        let stage_parts = open_stage_parts(&store, &definition)?;
         let mut transactions = store.into_transactions();
         let observed_definition = {
             let transaction = transactions.begin()?;
@@ -76,6 +82,7 @@ impl Flow {
         if observed_definition != definition_bytes {
             return Err(FlowError::DefinitionChangedDuringOpen);
         }
+        let stages = assemble_stages(&definition, stage_parts, &transactions);
 
         Ok(Self {
             path,
@@ -138,20 +145,23 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
     }
 }
 
-fn open_stages(store: &Store, definition: &FlowDefinition) -> Result<Vec<Stage>, FlowError> {
+fn open_stage_parts(
+    store: &Store,
+    definition: &FlowDefinition,
+) -> Result<Vec<StageParts>, FlowError> {
     definition
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| open_stage(store, index, stage.operation()))
+        .map(|(index, stage)| open_stage_part(store, index, stage.operation()))
         .collect()
 }
 
-fn open_stage(
+fn open_stage_part(
     store: &Store,
     index: usize,
     definition: &dyn OperationDefinition,
-) -> Result<Stage, FlowError> {
+) -> Result<StageParts, FlowError> {
     let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
         store,
         &codec::stage_state_name(index),
@@ -164,7 +174,62 @@ fn open_stage(
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
-    Ok(Stage::new(state, operation))
+    let output = definition
+        .produces_output()
+        .then(|| {
+            let name = codec::stage_output_name(index);
+            open_required_data::<AppendLog<Vec<u8>>>(store, &name)
+        })
+        .transpose()?;
+    Ok(StageParts {
+        state,
+        operation,
+        output,
+    })
+}
+
+pub(crate) fn assemble_stages(
+    definition: &FlowDefinition,
+    parts: Vec<StageParts>,
+    transactions: &Transactions,
+) -> Vec<Stage> {
+    let indices = definition
+        .stages()
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| (stage.id(), index))
+        .collect::<HashMap<_, _>>();
+    let inputs = definition
+        .stages()
+        .iter()
+        .map(|stage| {
+            stage
+                .sources()
+                .map(|source| {
+                    let source_index = indices[source];
+                    let output = parts[source_index]
+                        .output
+                        .as_ref()
+                        .expect("validated source stage must produce output");
+                    ReadOnly::new(output.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    parts
+        .into_iter()
+        .zip(inputs)
+        .map(|(part, inputs)| {
+            Stage::new(
+                transactions.clone(),
+                part.state,
+                part.operation,
+                inputs,
+                part.output,
+            )
+        })
+        .collect()
 }
 
 fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {

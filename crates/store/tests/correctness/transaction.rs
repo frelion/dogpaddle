@@ -51,6 +51,41 @@ fn transaction_access_can_bind_multiple_objects_without_owning_commit() {
 }
 
 #[test]
+fn cloned_transaction_capabilities_share_one_store_sequentially() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
+    let mut first = store.into_transactions();
+    let mut second = first.clone();
+
+    {
+        let transaction = first.begin().unwrap();
+        data.access(transaction.access())
+            .unwrap()
+            .put(&b"first".to_vec(), &b"one".to_vec())
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    {
+        let transaction = second.begin().unwrap();
+        let mut data = data.access(transaction.access()).unwrap();
+        assert_eq!(data.get(&b"first".to_vec()).unwrap(), Some(b"one".to_vec()));
+        data.put(&b"second".to_vec(), &b"two".to_vec()).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let transaction = first.begin().unwrap();
+    assert_eq!(
+        data.access(transaction.access())
+            .unwrap()
+            .get(&b"second".to_vec())
+            .unwrap(),
+        Some(b"two".to_vec())
+    );
+}
+
+#[test]
 fn commit_is_atomic_across_small_and_large_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);

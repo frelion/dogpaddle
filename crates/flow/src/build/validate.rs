@@ -56,6 +56,14 @@ pub enum TopologyError {
         /// Connected source count.
         actual: usize,
     },
+    /// A connection names a stage that has no output stream as its source.
+    #[error("stage {target_stage:?} cannot read from outputless stage {source_stage:?}")]
+    SourceHasNoOutput {
+        /// Stage without an output stream.
+        source_stage: String,
+        /// Stage that attempted to consume it.
+        target_stage: String,
+    },
     /// The topology contains an indirect cycle.
     #[error("flow topology contains a cycle")]
     Cycle,
@@ -69,6 +77,7 @@ pub(super) fn finish_definition(
     validate_stage_ids(&stages)?;
     let mut sources_by_target = validate_connections(token, &stages, connections)?;
     validate_input_counts(&stages, &sources_by_target)?;
+    validate_sources_produce_output(&stages, &sources_by_target)?;
     validate_acyclic(stages.len(), &sources_by_target)?;
 
     let stage_ids = stages
@@ -101,7 +110,25 @@ pub(super) fn validate_decoded_definition(
         }
     }
     validate_input_counts(stages, sources_by_target)?;
+    validate_sources_produce_output(stages, sources_by_target)?;
     validate_acyclic(stages.len(), sources_by_target)
+}
+
+fn validate_sources_produce_output(
+    stages: &[StageDefinition],
+    sources_by_target: &[Option<Vec<usize>>],
+) -> Result<(), TopologyError> {
+    for (target, sources) in sources_by_target.iter().enumerate() {
+        for source in sources.iter().flatten() {
+            if !stages[*source].operation.produces_output() {
+                return Err(TopologyError::SourceHasNoOutput {
+                    source_stage: stages[*source].id.clone(),
+                    target_stage: stages[target].id.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_input_counts(

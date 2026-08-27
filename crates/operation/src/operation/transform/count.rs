@@ -60,6 +60,10 @@ impl OperationDefinition for CountDefinition {
         1
     }
 
+    fn produces_output(&self) -> bool {
+        true
+    }
+
     fn data(&self) -> &'static [DataDeclaration] {
         DATA
     }

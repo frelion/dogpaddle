@@ -5,9 +5,13 @@ use std::{
 };
 
 use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition};
-use dogpaddle_store::{Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
-use crate::{error::FlowError, flow::Flow, stage::Stage};
+use crate::{
+    error::FlowError,
+    flow::{Flow, assemble_stages},
+    stage::StageParts,
+};
 
 pub(crate) mod codec;
 mod definition;
@@ -103,7 +107,7 @@ impl FlowBuilder {
         let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
         let flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
             store.create_data(codec::FLOW_STATE_DATA_NAME)?;
-        let stages = create_stages(&mut store, &definition)?;
+        let stage_parts = create_stage_parts(&mut store, &definition)?;
         let mut transactions = store.into_transactions();
         {
             let transaction = transactions.begin()?;
@@ -111,6 +115,7 @@ impl FlowBuilder {
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
+        let stages = assemble_stages(&definition, stage_parts, &transactions);
 
         Ok(Flow::from_build(
             path,
@@ -139,20 +144,23 @@ fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), Materia
     Ok(())
 }
 
-fn create_stages(store: &mut Store, definition: &FlowDefinition) -> Result<Vec<Stage>, FlowError> {
+fn create_stage_parts(
+    store: &mut Store,
+    definition: &FlowDefinition,
+) -> Result<Vec<StageParts>, FlowError> {
     definition
         .stages()
         .iter()
         .enumerate()
-        .map(|(index, stage)| create_stage(store, index, stage.operation()))
+        .map(|(index, stage)| create_stage_part(store, index, stage.operation()))
         .collect()
 }
 
-fn create_stage(
+fn create_stage_part(
     store: &mut Store,
     index: usize,
     definition: &dyn OperationDefinition,
-) -> Result<Stage, FlowError> {
+) -> Result<StageParts, FlowError> {
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data(&codec::stage_state_name(index))?;
     let mut data = DataInstances::new();
@@ -162,7 +170,15 @@ fn create_stage(
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
-    Ok(Stage::new(state, operation))
+    let output = definition
+        .produces_output()
+        .then(|| store.create_data::<AppendLog<Vec<u8>>>(&codec::stage_output_name(index)))
+        .transpose()?;
+    Ok(StageParts {
+        state,
+        operation,
+        output,
+    })
 }
 
 #[cfg(test)]

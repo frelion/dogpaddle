@@ -24,10 +24,10 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
 fn every_builtin_definition_has_stable_v1_golden_bytes() {
     for (golden, definition) in golden_cases() {
         assert_eq!(encode_definition(definition.as_ref()), golden);
-        assert_eq!(
-            encode_definition(decode_definition(&golden).unwrap().as_ref()),
-            golden
-        );
+        let decoded = decode_definition(&golden).unwrap();
+        assert_eq!(decoded.input_count(), definition.input_count());
+        assert_eq!(decoded.produces_output(), definition.produces_output());
+        assert_eq!(encode_definition(decoded.as_ref()), golden);
     }
 }
 

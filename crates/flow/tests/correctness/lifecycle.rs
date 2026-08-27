@@ -35,3 +35,25 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     drop(flow);
     assert!(Flow::open(&path).is_ok());
 }
+
+#[test]
+fn build_and_open_support_many_stage_output_logs() {
+    const STAGE_COUNT: usize = 65;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = Flow::builder(&path);
+    let mut previous = builder.stage("source", SequenceSourceDefinition::new(0));
+    for index in 1..STAGE_COUNT {
+        let current = builder.stage(format!("count-{index}"), CountDefinition::new());
+        builder.connect([previous], current);
+        previous = current;
+    }
+
+    let flow = builder.build().unwrap();
+    assert_eq!(flow.stage_count(), STAGE_COUNT);
+    drop(flow);
+
+    let reopened = Flow::open(path).unwrap();
+    assert_eq!(reopened.stage_count(), STAGE_COUNT);
+}

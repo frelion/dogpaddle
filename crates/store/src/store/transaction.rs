@@ -6,8 +6,13 @@ use crate::StoreError;
 impl Transactions {
     /// Begins one atomic transaction.
     ///
-    /// The mutable borrow prevents this capability from starting another
-    /// transaction until the first one is committed or dropped.
+    /// The mutable borrow prevents this particular capability clone from
+    /// starting another transaction until the first one is committed or
+    /// dropped. Other clones may independently attempt to begin a transaction;
+    /// the database serializes concurrent writers by blocking a new `begin`
+    /// while another write transaction remains alive. Callers must commit or
+    /// drop the current transaction before synchronously beginning one through
+    /// another clone.
     ///
     /// # Errors
     ///

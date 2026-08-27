@@ -13,8 +13,8 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 
 ## 已有能力
 
-- **强类型静态 DAG**：sealed `OperationDefinition` trait 声明输入数量和状态形状，Flow 校验
-  有序连接、唯一 Stage ID、自环和多节点环。
+- **强类型静态 DAG**：sealed `OperationDefinition` trait 声明输入数量、是否产生输出和状态
+  形状，Flow 校验有序连接、唯一 Stage ID、自环、多节点环，以及 source 确实拥有输出。
 - **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
   标记最后提交。
 - **直接重新打开**：`Flow::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
@@ -27,10 +27,13 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
+- **Stage 数据通道装配**：每个会产生输出的 Stage 拥有自己的 `AppendLog<Vec<u8>>`；每个
+  下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
   `OrderedMap<K, V, SIZE>`；有界 map scan 可完整解码，也可只投影编码中的所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
-  投影解码、同事务原样转发和有界前缀回收；Flow 尚未将它装配为 Stage 间数据通道。
+  投影解码、同事务原样转发和有界前缀回收；Flow 已完成 Stage output 与只读 input 的资源
+  装配，运行调度与 Change 处理协议仍未实现。
 
 ## 内部架构
 
@@ -54,9 +57,10 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 ## 当前边界
 
-当前仓库完成了 Flow 的持久化定义、构建和重新打开，以及 Arrow `Change`、自描述 Stream
-编码和 `AppendLog<Vec<u8>>` 持久化验证；尚未实现 `run`、Stage 调度、边队列、背压、中断
-续跑或输出提交，因此还不是可执行的流引擎。仓库也没有最终用户二进制、SQL、连接器或
+当前仓库完成了 Flow 的持久化定义、构建和重新打开，Stage output/input capability 装配，
+以及 Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>` 持久化验证；尚未实现
+`run`、Stage 调度、输入 offset 协议、背压、中断续跑或输出提交，因此还不是可执行的流引擎。
+仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。
 

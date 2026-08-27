@@ -2,16 +2,17 @@
 
 本文件规定 `dogpaddle-flow` 的测试所有权、持久化兼容性验证和 `build/open` 生命周期基准。
 Flow 是 Operation 与 Store 的产品组合根，因此真实资源创建、Operation 物化和重新打开测试属于
-本 crate；它们不需要再放入 `integration-tests/flow-store`。当前尚无 `run`、边日志或可观察
-Sink，所以本协议不伪造端到端运行测试，也不建立空的 `integration-tests/engine` package。
+本 crate；它们不需要再放入 `integration-tests/flow-store`。当前已有 Stage output log 与只读
+input capability 的装配，但尚无 `run`、Change 处理或可观察 Sink，所以本协议不伪造端到端
+运行测试，也不建立空的 `integration-tests/engine` package。
 
 ## 目录与所有权
 
 ```text
 crates/flow/
 ├── src/build/tests.rs                 # 私有拓扑、Definition codec 和 CRC 白盒测试
-├── src/flow/tests.rs                  # 私有 Flow 生命周期状态装配测试
-├── src/stage/tests.rs                 # 私有 Stage/Operation 容器测试
+├── src/flow/tests.rs                  # 私有 Flow 生命周期与跨 Stage capability 装配测试
+├── src/stage/tests.rs                 # 私有 Stage/Operation/事务容器测试
 ├── tests/correctness.rs               # 唯一公共正确性 target
 ├── tests/correctness/
 │   ├── lifecycle.rs                   # build/open 与 Store 独占
@@ -45,16 +46,19 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   source、自环和间接环都返回稳定错误，且目标路径不存在。私有纯校验还穷举 1 到 5 个 Stage
   的全部零输入 Source / 一输入 Count 标号小图，以独立的逐路径 oracle 验证合法 DAG、直接/间接环
   分类、声明顺序和 source 绑定；已经存在的 Store 必须原样保留。
-- **持久化**：v1 Definition 黄金字节来自实际 `FlowBuilder::build` 发布的 Cell；Flow/Stage state
-  和内建 Operation data 使用稳定名称与精确类型；未发布、Definition 损坏、资源缺失和 Size
-  不匹配均被拒绝；完整 Flow 可以重新打开。
+- **持久化**：v1 Definition 黄金字节来自实际 `FlowBuilder::build` 发布的 Cell；Flow/Stage state、
+  Stage output 和内建 Operation data 使用稳定名称与精确类型；terminal producer 仍有 output；
+  未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
+- **运行期装配**：Flow 和每个 Stage 获得同一 Store 的独立事务启动 capability；Stage 可以用
+  自己的事务写 output，下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在
+  target 之后声明，build 和 reopen 仍按 source ID 正确注入。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用 `Flow::open` 不得 panic，
   且必须在 Definition 解码阶段失败，不能由后续缺失资源错误冒充通过。
 
 黄金 fixture 位于 `tests/fixtures/v1/sequence_source_count.hex`，包含 magic、版本、Stage 顺序、
-Operation tag/payload、source 连接和 CRC。修改这些字节或稳定资源名时，必须先给出迁移设计，再
-显式更新 fixture、资源布局和 reopen 测试，不能把测试改成只验证新编码自洽。
+Operation tag/payload、source 连接和 CRC。当前开发期允许破坏性更新 v1；修改这些字节或稳定
+资源名时必须显式更新 fixture、资源布局和 reopen 测试，不能把测试改成只验证新编码自洽。
 
 `DefinitionChangedDuringOpen` 保护两阶段 open 之间的变化。当前测试不通过竞态、sleep 或
 wall-clock 猜测制造这个窗口；除非以后出现无需扩张公共 API 的确定性故障注入点，否则保留该
@@ -68,7 +72,7 @@ wall-clock 猜测制造这个窗口；除非以后出现无需扩张公共 API �
 | scenario | 计时内 | 计时外 |
 | --- | --- | --- |
 | `fresh_durable_build` | 一次 `FlowBuilder::build`：拓扑校验、编码、fresh Store、全部资源创建及 durable Definition 发布 | 临时路径和 Builder 声明、结果校验、drop、重新打开校验、目录清理 |
-| `warm_reopen` | 一次 `Flow::open`：两阶段 Definition 读取、解码、资源打开和 Operation 物化 | fixture 构建、preflight、预热、Stage ID 校验和 drop |
+| `warm_reopen` | 一次 `Flow::open`：两阶段 Definition 读取、解码、state/Operation/output 打开、Operation 物化和只读 input 注入 | fixture 构建、preflight、预热、Stage ID 校验和 drop |
 
 fresh build 的每个预热和样本使用独立 Store 路径。warm reopen 使用同一个已提交 fixture，并在
 采样前完成 preflight 和显式预热，因此它是 warm committed reopen，不是 cold filesystem cache。
