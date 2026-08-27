@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use dogpaddle_store::{
-    Large, ScanDirection, ScanLimit, Small, Store, StoreError, TransactionAccess,
+    Large, ScanDirection, ScanLimit, Small, Store, StoreError, TransactionAccess, Transactions,
 };
 
 use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
@@ -47,41 +47,6 @@ fn transaction_access_can_bind_multiple_objects_without_owning_commit() {
             .get(&b"key".to_vec())
             .unwrap(),
         Some(b"large".to_vec())
-    );
-}
-
-#[test]
-fn cloned_transaction_capabilities_share_one_store_sequentially() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
-    let mut first = store.into_transactions();
-    let mut second = first.clone();
-
-    {
-        let transaction = first.begin().unwrap();
-        data.access(transaction.access())
-            .unwrap()
-            .put(&b"first".to_vec(), &b"one".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    {
-        let transaction = second.begin().unwrap();
-        let mut data = data.access(transaction.access()).unwrap();
-        assert_eq!(data.get(&b"first".to_vec()).unwrap(), Some(b"one".to_vec()));
-        data.put(&b"second".to_vec(), &b"two".to_vec()).unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = first.begin().unwrap();
-    assert_eq!(
-        data.access(transaction.access())
-            .unwrap()
-            .get(&b"second".to_vec())
-            .unwrap(),
-        Some(b"two".to_vec())
     );
 }
 
@@ -309,7 +274,10 @@ fn scan_admission_errors_are_soft() {
 }
 
 #[test]
-fn transaction_capability_can_move_to_a_stage_thread() {
+fn unique_transaction_capability_can_move_to_another_thread() {
+    fn require_send<T: Send>() {}
+    require_send::<Transactions>();
+
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let data = create_byte_map::<Small>(&mut store, "data").unwrap();

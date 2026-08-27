@@ -12,7 +12,7 @@ use crate::{build::FlowFactory, flow::Flow};
 use super::{Stage, StageParts};
 
 struct StageFixture {
-    flow_transactions: Transactions,
+    transactions: Transactions,
     source: Stage,
     count: Stage,
     source_definition: SequenceSourceDefinition,
@@ -33,10 +33,9 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
         encode_definition(&fixture.count_definition)
     );
 
-    put_state(&mut fixture.source, b"source");
-    put_state(&mut fixture.count, b"count");
-
-    let transaction = fixture.flow_transactions.begin().unwrap();
+    let transaction = fixture.transactions.begin().unwrap();
+    put_state(&fixture.source, transaction.access(), b"source");
+    put_state(&fixture.count, transaction.access(), b"count");
     assert_eq!(
         read_state(&fixture.source, transaction.access()),
         b"source".to_vec()
@@ -45,10 +44,11 @@ fn construction_boxes_heterogeneous_operations_and_keeps_stage_state_isolated() 
         read_state(&fixture.count, transaction.access()),
         b"count".to_vec()
     );
+    transaction.commit().unwrap();
 }
 
 #[test]
-fn stage_owns_transactions_and_output_while_the_downstream_input_is_read_only() {
+fn flow_owned_transaction_reaches_stage_output_and_read_only_input() {
     let mut fixture = stage_fixture();
 
     assert!(fixture.source.inputs.is_empty());
@@ -56,30 +56,25 @@ fn stage_owns_transactions_and_output_while_the_downstream_input_is_read_only() 
     assert!(fixture.source.output.is_some());
     assert!(fixture.count.output.is_some());
 
-    {
-        let transaction = fixture.source.transactions.begin().unwrap();
-        fixture
-            .source
-            .output
-            .as_ref()
-            .unwrap()
+    let transaction = fixture.transactions.begin().unwrap();
+    fixture
+        .source
+        .output
+        .as_ref()
+        .unwrap()
+        .access(transaction.access())
+        .unwrap()
+        .append(&b"change".to_vec())
+        .unwrap();
+    assert_eq!(
+        fixture.count.inputs[0]
             .access(transaction.access())
             .unwrap()
-            .append(&b"change".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let transaction = fixture.count.transactions.begin().unwrap();
-        assert_eq!(
-            fixture.count.inputs[0]
-                .access(transaction.access())
-                .unwrap()
-                .bounds()
-                .unwrap(),
-            0..1
-        );
-    }
+            .bounds()
+            .unwrap(),
+        0..1
+    );
+    transaction.commit().unwrap();
 }
 
 #[test]
@@ -96,40 +91,32 @@ fn build_and_open_inject_the_later_declared_source_output_as_read_only_input() {
 }
 
 fn assert_stage_wiring(flow: Flow) {
-    let mut stages = flow.into_stages();
+    let (mut transactions, stages) = flow.into_runtime_parts();
     assert_eq!(stages.len(), 2);
     assert_eq!(stages[0].inputs.len(), 1);
     assert!(stages[0].output.is_some());
     assert!(stages[1].inputs.is_empty());
     assert!(stages[1].output.is_some());
 
-    {
-        let source = &mut stages[1];
-        let transaction = source.transactions.begin().unwrap();
-        let mut output = source
-            .output
-            .as_ref()
-            .expect("source produces output")
+    let transaction = transactions.begin().unwrap();
+    let mut output = stages[1]
+        .output
+        .as_ref()
+        .expect("source produces output")
+        .access(transaction.access())
+        .unwrap();
+    if output.bounds().unwrap().is_empty() {
+        output.append(&b"change".to_vec()).unwrap();
+    }
+    assert_eq!(
+        stages[0].inputs[0]
             .access(transaction.access())
-            .unwrap();
-        if output.bounds().unwrap().is_empty() {
-            output.append(&b"change".to_vec()).unwrap();
-        }
-        transaction.commit().unwrap();
-    }
-
-    {
-        let count = &mut stages[0];
-        let transaction = count.transactions.begin().unwrap();
-        assert_eq!(
-            count.inputs[0]
-                .access(transaction.access())
-                .unwrap()
-                .bounds()
-                .unwrap(),
-            0..1
-        );
-    }
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        0..1
+    );
+    transaction.commit().unwrap();
 }
 
 fn stage_fixture() -> StageFixture {
@@ -161,13 +148,13 @@ fn stage_fixture() -> StageFixture {
         .create_data::<AppendLog<Vec<u8>>>("count-output")
         .unwrap();
 
-    let flow_transactions = store.into_transactions();
-    let source = StageParts::new(source_state, source_operation, Some(source_output))
-        .finish(flow_transactions.clone(), Vec::new());
-    let count = StageParts::new(count_state, count_operation, Some(count_output))
-        .finish(flow_transactions.clone(), vec![count_input]);
+    let transactions = store.into_transactions();
+    let source =
+        StageParts::new(source_state, source_operation, Some(source_output)).finish(Vec::new());
+    let count =
+        StageParts::new(count_state, count_operation, Some(count_output)).finish(vec![count_input]);
     StageFixture {
-        flow_transactions,
+        transactions,
         source,
         count,
         source_definition,
@@ -176,15 +163,13 @@ fn stage_fixture() -> StageFixture {
     }
 }
 
-fn put_state(stage: &mut Stage, value: &[u8]) {
-    let transaction = stage.transactions.begin().unwrap();
+fn put_state(stage: &Stage, access: dogpaddle_store::TransactionAccess<'_>, value: &[u8]) {
     stage
         .state
-        .access(transaction.access())
+        .access(access)
         .unwrap()
         .put(&b"key".to_vec(), &value.to_vec())
         .unwrap();
-    transaction.commit().unwrap();
 }
 
 fn read_state(stage: &Stage, access: dogpaddle_store::TransactionAccess<'_>) -> Vec<u8> {

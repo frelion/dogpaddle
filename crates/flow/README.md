@@ -55,15 +55,17 @@ Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state m
 协议中保存各 input 自己的 next-unread offset。output 是 `AppendLog<Vec<u8>>`；每个 value 将保存一个内嵌 Schema
 的完整 Change IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Stage 契约，不
 依赖 Change codec 之外的 Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map
-和日志，不能动态新增数据空间。此后 Store 被转换为可克隆的事务启动能力：Flow 保留一份，每个
-Stage 各自获得一份，拓扑和资源目录都没有修改入口。
+和日志，不能动态新增数据空间。此后 Store 被转换为唯一的事务启动能力并只由 Flow 长期持有；
+Stage 不保存或复制该能力，拓扑和资源目录也没有修改入口。未来每次 work 由 Flow 临时借出
+`&mut Transactions`，借用只覆盖这一次调用。
 
 资源创建和 Stage 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
 output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
 `ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
-Stage 不知道上游 Stage，只知道自己的有序 inputs；它拥有自己的完整可选 output，因此可以在
-同一个事务中读取 input、推进 state、更新 Operation 状态并发布 output。没有 output 的 Sink
-使用 `None`，不能被其他 Stage 作为 source。
+Stage 不知道上游 Stage，只知道自己的有序 inputs；它拥有自己的 state 与完整可选 output。未来
+一次 work 接收 Flow 临时注入的 `&mut Transactions`，由 Stage 开始并提交一个事务，在同一边界内
+读取 input、推进 state、更新 Operation 状态并发布 output；Operation 仍只接收不能提交的
+`TransactionAccess`。没有 output 的 Sink 使用 `None`，不能被其他 Stage 作为 source。
 
 每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
 不是稳定 event ID。未来 Stage 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件
@@ -99,10 +101,10 @@ source ID 重新注入 inputs、装配 Stage 并冻结 Store。调用方不需�
 中的连接关系，不再拥有独立构建类型。`open/` 实现 `FlowFactory::open` 的两阶段读取、资源打开
 和重新物化。`build/` 与 `open/` 都按 Definition 声明的逻辑数据名通用创建或打开类型化实例，
 再让 Definition 物化具体 Operation；二者都不枚举具体算子。`flow/` 只保存 build/open 返回的
-运行态 `Flow` 及其生命周期状态，不创建或打开 Store 资源。`stage/` 只保存事务启动能力、state、
-装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不接收 Store，也不知道 Stage ID、
-上游 Stage、资源名或底层物理布局。私有 `assembly.rs` 只承接 build/open 共用的 source ID 解析
-和最终 Stage 装配，不公开新的领域类型。
+运行态 `Flow`、生命周期状态、全部 Stage 与唯一的事务启动能力，不创建或打开 Store 资源。
+`stage/` 只保存 state、装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不长期持有
+`Transactions`，也不接收 Store，不知道 Stage ID、上游 Stage、资源名或底层物理布局。私有
+`assembly.rs` 只承接 build/open 共用的 source ID 解析和最终 Stage 装配，不公开新的领域类型。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 使用单一 `correctness` target 验证 crate 的公共行为。dogpaddle-flow 是 Operation 与 Store 的
 组合根，因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个
@@ -111,9 +113,9 @@ source ID 重新注入 inputs、装配 Stage 并冻结 Store。调用方不需�
 
 ## 当前边界
 
-本阶段完成定义、持久化 `build/open`，以及 Stage 的事务、只读 inputs 和可选 output 装配。
-尚未实现 `run`、Stage 调度、Stage state map 的 offset 键协议、Change 解码与 Operation 批量
-接口、背压、中断或运行恢复。
+本阶段完成定义、持久化 `build/open`、Flow 对唯一事务启动能力的所有权，以及 Stage 的 state、
+只读 inputs 和可选 output 装配。尚未实现 `run`、Flow 到 Stage 的临时事务能力注入、Stage 调度、
+Stage state map 的 offset 键协议、Change 解码与 Operation 批量接口、背压、中断或运行恢复。
 `SequenceSource` 只是第一个真实零输入 Definition，用于形成可构建的
 `SequenceSource → Count` DAG，并不代表调度器已经存在。
 

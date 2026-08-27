@@ -1,17 +1,13 @@
 use std::collections::HashMap;
 
-use dogpaddle_store::{ReadOnly, Transactions};
+use dogpaddle_store::ReadOnly;
 
 use crate::{
     build::FlowDefinition,
     stage::{Stage, StageParts},
 };
 
-pub(crate) fn assemble_stages(
-    definition: &FlowDefinition,
-    parts: Vec<StageParts>,
-    transactions: &Transactions,
-) -> Vec<Stage> {
+pub(crate) fn assemble_stages(definition: &FlowDefinition, parts: Vec<StageParts>) -> Vec<Stage> {
     let indices = definition
         .stages()
         .iter()
@@ -38,6 +34,6 @@ pub(crate) fn assemble_stages(
     parts
         .into_iter()
         .zip(inputs)
-        .map(|(part, inputs)| part.finish(transactions.clone(), inputs))
+        .map(|(part, inputs)| part.finish(inputs))
         .collect()
 }

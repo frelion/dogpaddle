@@ -1,5 +1,5 @@
 use dogpaddle_operation::operation::Operation;
-use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small, Transactions};
+use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small};
 
 pub(crate) struct StageParts {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
@@ -15,7 +15,6 @@ pub(crate) struct StageParts {
     )
 )]
 pub(crate) struct Stage {
-    transactions: Transactions,
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     operation: Box<dyn Operation>,
     inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
@@ -39,11 +38,7 @@ impl StageParts {
         self.output.as_ref()
     }
 
-    pub(crate) fn finish(
-        self,
-        transactions: Transactions,
-        inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
-    ) -> Stage {
+    pub(crate) fn finish(self, inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>) -> Stage {
         assert_eq!(
             inputs.len(),
             self.operation.definition().input_count(),
@@ -55,7 +50,6 @@ impl StageParts {
             "stage output capability must match its operation definition"
         );
         Stage {
-            transactions,
             state: self.state,
             operation: self.operation,
             inputs,

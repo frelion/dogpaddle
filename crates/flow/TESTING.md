@@ -13,7 +13,7 @@ crates/flow/
 ├── src/build/tests.rs                 # 私有 FlowFactory 构建、拓扑、Definition codec 与 CRC 测试
 ├── src/open/tests.rs                  # 私有两阶段 reopen 与资源重新装配测试
 ├── src/flow/tests.rs                  # 私有运行态 Flow 所有权与生命周期测试
-├── src/stage/tests.rs                 # 私有 Stage/Operation/事务容器测试
+├── src/stage/tests.rs                 # 私有 Stage/Operation/数据 capability 装配测试
 ├── tests/correctness.rs               # 唯一公共正确性 target
 ├── tests/correctness/
 │   ├── lifecycle.rs                   # build/open 与 Store 独占
@@ -51,9 +51,11 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
 - **持久化**：v1 Definition 黄金字节来自实际 `FlowFactory::build` 发布的 Cell；Flow/Stage state、
   Stage output 和内建 Operation data 使用稳定名称与精确类型；terminal producer 仍有 output；
   未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
-- **运行期装配**：Flow 和每个 Stage 获得同一 Store 的独立事务启动 capability；Stage 可以用
-  自己的事务写 output，下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在
-  target 之后声明，build 和 reopen 仍按 source ID 正确注入。
+- **运行期装配**：唯一事务启动 capability 归 Flow 长期持有，Stage 只保存自己的 state、完整可选
+  output 与只读 inputs，不长期持有 `Transactions`。私有测试从 Flow 一侧临时开始事务并验证同一
+  `TransactionAccess` 可以访问 Stage output，而下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察
+  同一日志。source 即使在 target 之后声明，build 和 reopen 仍按 source ID 正确注入。当前没有
+  Operation 统一执行协议，因此不伪造 `Stage::work` 或提交行为测试。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用
   `FlowFactory::open` 不得 panic，且必须在 Definition 解码阶段失败，不能由后续缺失资源错误

@@ -6,13 +6,23 @@ use crate::StoreError;
 impl Transactions {
     /// Begins one atomic transaction.
     ///
-    /// The mutable borrow prevents this particular capability clone from
-    /// starting another transaction until the first one is committed or
-    /// dropped. Other clones may independently attempt to begin a transaction;
-    /// the database serializes concurrent writers by blocking a new `begin`
-    /// while another write transaction remains alive. Callers must commit or
-    /// drop the current transaction before synchronously beginning one through
-    /// another clone.
+    /// The returned [`Transaction`] exclusively borrows this unique capability.
+    /// While that guard remains live, another transaction cannot be started
+    /// through it. Because [`Transactions`] is not cloneable, its owner is the
+    /// sole coordinator of transaction boundaries for this Store.
+    /// Intentionally leaking the guard also leaks the underlying write
+    /// transaction and is outside the normal RAII lifecycle.
+    ///
+    /// ```compile_fail
+    /// use dogpaddle_store::{StoreError, Transactions};
+    ///
+    /// fn begin_twice(transactions: &mut Transactions) -> Result<(), StoreError> {
+    ///     let first = transactions.begin()?;
+    ///     let second = transactions.begin()?;
+    ///     drop((first, second));
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// # Errors
     ///

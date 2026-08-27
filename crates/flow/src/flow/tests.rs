@@ -4,7 +4,7 @@ use dogpaddle_store::{OrderedMap, Small, Store};
 use crate::build::FlowFactory;
 
 #[test]
-fn open_rematerializes_flow_state() {
+fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);

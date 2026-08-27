@@ -12,8 +12,8 @@ Store 将资源装配与运行时访问分离：
 - `Cell<T>`、`OrderedMap<K, V, SIZE>` 与 `AppendLog<T>` 是 collection 的完整能力，可以产生
   完整的事务级读写 Access；
 - `ReadOnly<C>` 由完整 collection 显式单向衰减得到，只能产生只读事务 Access；
-- `Transactions` 是可克隆的运行期事务启动能力；所有 clone 共享同一个数据库与 Store identity，
-  但不暴露 catalog；
+- `Transactions` 是唯一、不可克隆的运行期事务启动能力；它可以在空闲时移动到其他线程，但不
+  暴露 catalog；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
 - `TransactionAccess` 从活动 Transaction 临时借用，只允许已有类型化数据对象绑定访问；
 - 完整的 `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 执行实际读写，包在
@@ -179,20 +179,21 @@ Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，�
 
 ## 事务与扫描语义
 
-`Store::into_transactions()` 只发生一次，之后可以把 `Transactions` clone 分别交给 Flow 和各个
-Stage。每个 clone 的 `begin(&mut self)` 都独占借用该 clone，因而同一个 clone 不能重入；MDBX
-仍会串行化来自不同 clone 的写事务。一个组件应完成并提交或丢弃当前事务后，再同步启动另一个
-组件的事务。
+`Store::into_transactions()` 只发生一次，并产生唯一、不可克隆的 `Transactions`。运行协调者
+集中持有它；`begin(&mut self)` 返回的 Transaction guard 在存活期间独占借用该能力，因此无法
+在前一 guard 被提交或丢弃前再次开始事务。显式泄漏 guard 会同时泄漏底层写事务，不属于正常
+RAII 生命周期。能力本身可以在线程之间移动，但活动 Transaction 及其访问值仍然绑定在创建
+它们的线程。
 
 丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。调用
 `Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
-持有的完整或 `ReadOnly` collection handle 创建事务级 Access。Stage 因此可以保留当前
-Transaction 的所有权并把受限能力交给 Operation，Operation 无法开始或结束原子边界，也无法访问
-Store catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式选择
-布局的数据对象都可以原子提交。
+持有的完整或 `ReadOnly` collection handle 创建事务级 Access。事务协调者因此可以保留当前
+Transaction 的所有权并把受限能力交给 Operation；Operation 无法开始或结束原子边界，也无法
+访问 Store catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式
+选择布局的数据对象都可以原子提交。
 
-`TransactionAccess` 本身不区分只读与读写，因为同一个 Stage 事务需要同时读取 input 并写入
-自身 state/output。静态权限来自 collection handle：`ReadOnly<C>` 只能绑定出
+`TransactionAccess` 本身不区分只读与读写，因为一次工作事务需要同时读取 input 并写入对应的
+state/output。静态权限来自 collection handle：`ReadOnly<C>` 只能绑定出
 `ReadOnly<...Access>`，完整 handle 则绑定出完整 Access。两者仍然共享同一个事务快照和中毒、
 回滚、提交边界。
 

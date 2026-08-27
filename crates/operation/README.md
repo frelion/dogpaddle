@@ -105,11 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow 内部的每个 Stage 拥有自己的
-`Transactions` capability；一次工作由 Stage 开始 Transaction，并只把不能提交的
-`TransactionAccess` 交给 Operation。Operation 再用自己持有的 `Cell` 或 `OrderedMap` 创建具体
-事务级 Access。这样 Flow 调度器只需要唤醒 Stage，Flow 不必知道算子的数据结构，Operation 也
-不能控制事务边界，而状态、输入进度和输出可由 Stage 在同一事务中原子提交。
+Operation 业务逻辑不接收、开始、提交或保存 Transaction。`Flow` 唯一持有不可克隆的
+`Transactions`；未来调度一次工作时，只在调用期间把 `&mut Transactions` 借给目标 Stage。
+Stage 由此开始并持有该次 Transaction，再只把不能提交的 `TransactionAccess` 交给 Operation。
+Operation 用自己持有的 `Cell` 或 `OrderedMap` 创建具体事务级 Access。这样 Flow 不知道算子的
+数据结构，Stage 不会跨工作保留事务启动能力，Operation 也不能控制事务边界，而状态、输入进度
+和输出可由 Stage 在同一事务中原子提交。
 
 ## 扩展约束
 

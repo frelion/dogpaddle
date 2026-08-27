@@ -9,9 +9,11 @@ use crate::{
 
 /// The runtime handle for a built or reopened persistent Flow.
 ///
-/// A Flow owns a Store transaction capability for its own coordination. Each
-/// runtime stage owns another capability for the same Store. The definition
-/// and data object set were frozen by a successful build.
+/// A Flow uniquely owns its Store transaction capability. During future work,
+/// it will temporarily lend `&mut Transactions` to one runtime stage. The stage
+/// starts and commits that work transaction during the call, but cannot retain
+/// the transaction-start capability across calls. The definition and data
+/// object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
     definition: FlowDefinition,
@@ -71,8 +73,8 @@ impl Flow {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_stages(self) -> Vec<Stage> {
-        self.stages
+    pub(crate) fn into_runtime_parts(self) -> (Transactions, Vec<Stage>) {
+        (self.transactions, self.stages)
     }
 }
 

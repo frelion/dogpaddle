@@ -3,10 +3,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use libmdbx::{
@@ -246,11 +243,11 @@ impl Store {
         Ok(self.handle(location))
     }
 
-    /// Ends data object setup and yields the runtime transaction capability.
+    /// Ends data object setup and yields the unique runtime transaction capability.
     #[must_use]
     pub fn into_transactions(self) -> Transactions {
         Transactions {
-            database: Arc::new(self.database),
+            database: self.database,
             store_token: self.token,
         }
     }

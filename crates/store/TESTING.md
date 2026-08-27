@@ -39,6 +39,10 @@ tests/
 衰减的公共行为；写方法不可用、不能升级回完整 handle 且不能作为 `StoreData` 打开的静态边界
 由 `ReadOnly` 的 Rustdoc compile-fail 测试拥有。
 
+`transaction.rs` 验证唯一事务启动能力可以顺序复用并在线程间移动，同时验证活动 Transaction
+及其访问值的回滚、中毒和线程绑定语义；`Transactions` 不可克隆、存活 guard 阻止再次 begin，
+以及 `Transaction` 的 `!Send + !Sync` 静态边界由对应 Rustdoc compile-fail 测试拥有。
+
 这些模块作为下游 crate 编译，只通过 `dogpaddle_store` 的公共 Rust API 观察行为。`store`、
 `placement` 和 `append_log_layout` 可以使用 `libmdbx` 适配器准备损坏数据库或审计稳定磁盘布局，
 但错误、回滚和 reopen 结果仍通过 Store 公共 API 断言，不能为测试给产品库增加公开后门。

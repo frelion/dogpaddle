@@ -1,4 +1,4 @@
-use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc, sync::Arc};
+use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc};
 
 use libmdbx::{Database, NoWriteMap, RW, Transaction as MdbxTransaction};
 
@@ -40,16 +40,26 @@ pub struct Store {
     token: u64,
 }
 
-/// Grants one clonable runtime capability to begin store transactions.
+/// Uniquely owns the runtime capability to begin store transactions.
 ///
 /// This value is obtained by consuming [`Store`]. It does not expose the
-/// catalog or allow data objects to be created or opened. Clones share the
-/// same database and Store identity, so a Flow and its stages can each own a
-/// transaction-start capability without sharing the capability value itself.
-/// The Store path remains open and exclusive until the last clone is dropped.
-#[derive(Clone)]
+/// catalog or allow data objects to be created or opened. The capability is
+/// intentionally not cloneable, so one runtime coordinator remains the sole
+/// owner of transaction boundaries for this Store. It can be moved between
+/// threads while idle, and the Store path remains open and exclusive until it
+/// is dropped.
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<dogpaddle_store::Transactions>();
+/// ```
+///
+/// ```no_run
+/// fn require_send<T: Send>() {}
+/// require_send::<dogpaddle_store::Transactions>();
+/// ```
 pub struct Transactions {
-    database: Arc<Database<NoWriteMap>>,
+    database: Database<NoWriteMap>,
     store_token: u64,
 }
 
@@ -61,6 +71,11 @@ pub struct Transactions {
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
 /// require_send::<dogpaddle_store::Transaction<'static>>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<dogpaddle_store::Transaction<'static>>();
 /// ```
 #[must_use = "dropping a transaction rolls back its changes"]
 pub struct Transaction<'database> {

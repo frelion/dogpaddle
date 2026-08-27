@@ -45,7 +45,7 @@ impl FlowFactory {
         if observed_definition != definition_bytes {
             return Err(FlowError::DefinitionChangedDuringOpen);
         }
-        let stages = assemble_stages(&definition, stage_parts, &transactions);
+        let stages = assemble_stages(&definition, stage_parts);
 
         Ok(Flow::from_parts(
             path,

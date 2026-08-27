@@ -119,7 +119,7 @@ impl FlowFactory {
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
-        let stages = assemble_stages(&definition, stage_parts, &transactions);
+        let stages = assemble_stages(&definition, stage_parts);
 
         Ok(Flow::from_parts(
             path,
