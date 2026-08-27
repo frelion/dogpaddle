@@ -5,7 +5,7 @@ use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, Stor
 
 use crate::{
     assembly::assemble_stations,
-    build::{FlowDefinition, FlowFactory, codec},
+    build::{FlowFactory, codec},
     error::FlowError,
     flow::Flow,
     station::StationParts,
@@ -35,11 +35,16 @@ impl FlowFactory {
             &store,
             codec::FLOW_STATE_DATA_NAME,
         )?;
-        let station_parts = open_station_parts(&store, &definition)?;
-        let mut transactions = store.into_transactions();
+        let station_parts = definition
+            .stations()
+            .iter()
+            .enumerate()
+            .map(|(index, station)| open_station_part(&store, index, station.operation()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (transactions, reads) = store.into_transactions().split();
         let observed_definition = {
-            let transaction = transactions.begin()?;
-            let published = published.access(transaction.access())?;
+            let transaction = reads.begin()?;
+            let published = published.read(transaction.access())?;
             published.get()?.ok_or(FlowError::IncompleteBuild)?
         };
         if observed_definition != definition_bytes {
@@ -53,6 +58,7 @@ impl FlowFactory {
             flow_state,
             stations,
             transactions,
+            reads,
         ))
     }
 }
@@ -60,9 +66,9 @@ impl FlowFactory {
 fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
     let store = Store::open(path)?;
     let definition = open_definition_cell(&store)?;
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin()?;
-    let definition = definition.access(transaction.access())?;
+    let (_, reads) = store.into_transactions().split();
+    let transaction = reads.begin()?;
+    let definition = definition.read(transaction.access())?;
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
 
@@ -72,18 +78,6 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
         Err(StoreError::DataNotFound(_)) => Err(FlowError::IncompleteBuild),
         Err(error) => Err(error.into()),
     }
-}
-
-fn open_station_parts(
-    store: &Store,
-    definition: &FlowDefinition,
-) -> Result<Vec<StationParts>, FlowError> {
-    definition
-        .stations()
-        .iter()
-        .enumerate()
-        .map(|(index, station)| open_station_part(store, index, station.operation()))
-        .collect()
 }
 
 fn open_station_part(

@@ -341,3 +341,44 @@ fn append_entry_rejects_another_transaction() {
         Err(StoreError::TransactionPoisoned)
     ));
 }
+
+#[test]
+fn append_entry_rejects_a_read_snapshot_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let input = create_log::<u64>(&mut store, "input");
+    let output = create_log::<u64>(&mut store, "output");
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let transaction = writes.begin().unwrap();
+        input
+            .access(transaction.access())
+            .unwrap()
+            .append(&7)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let read_transaction = reads.begin().unwrap();
+    let write_transaction = writes.begin().unwrap();
+    let input = input.read(read_transaction.access()).unwrap();
+    let mut output = output.access(write_transaction.access()).unwrap();
+    let error = input
+        .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
+            assert!(matches!(
+                output.append_entry(&entry),
+                Err(StoreError::WrongTransaction)
+            ));
+            Ok::<(), StoreError>(())
+        })
+        .unwrap_err();
+    assert!(matches!(error, StoreError::TransactionPoisoned));
+    assert!(matches!(
+        input.bounds(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    assert!(matches!(
+        write_transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+}

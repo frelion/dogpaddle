@@ -3,10 +3,14 @@ use std::{
     ops::{Bound, RangeBounds},
 };
 
-use libmdbx::{Cursor, ObjectLength, RW, Table, WriteFlags};
+use libmdbx::{
+    Cursor, NoWriteMap, ObjectLength, Table, Transaction as MdbxTransaction, TransactionKind,
+    WriteFlags,
+};
 
 use super::{
-    DataHandle, DataLocation, DataPlacement, Transaction, TransactionAccess, dedicated_table_name,
+    DataHandle, DataLocation, DataPlacement, ReadTransaction, ReadTransactionAccess, Transaction,
+    TransactionAccess, dedicated_table_name,
 };
 use crate::StoreError;
 
@@ -62,9 +66,27 @@ pub struct ScanLimit {
 /// This value cannot outlive its transaction. Collection implementations use
 /// it as their only raw storage capability.
 pub(crate) struct DataAccess<'transaction> {
+    read: ReadDataAccess<'transaction>,
     transaction: &'transaction Transaction<'transaction>,
+}
+
+/// Read-only transaction-bound access to one encoded key/value namespace.
+///
+/// This is the single raw read core for both transaction kinds. Unlike
+/// [`DataAccess`], it has no mutation methods. Collection read-access types use
+/// it directly, while writable collection access composes it with the write
+/// authority stored by [`DataAccess`].
+pub(crate) struct ReadDataAccess<'transaction> {
+    transaction: TransactionRef<'transaction>,
     table: Table<'transaction>,
     prefix: Option<[u8; 5]>,
+}
+
+/// Identifies the transaction that backs a read without exposing mutation.
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionRef<'transaction> {
+    Read(&'transaction ReadTransaction<'transaction>),
+    Write(&'transaction Transaction<'transaction>),
 }
 
 impl ScanLimit {
@@ -116,18 +138,35 @@ impl DataHandle {
         access: TransactionAccess<'transaction>,
     ) -> Result<DataAccess<'transaction>, StoreError> {
         let transaction = access.transaction();
+        let read = self.bind_read(TransactionRef::Write(transaction))?;
+        Ok(DataAccess { read, transaction })
+    }
+
+    /// Binds this namespace through an active read-only transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong-store handle, a poisoned transaction, or
+    /// when MDBX cannot open the underlying table.
+    pub(crate) fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<ReadDataAccess<'transaction>, StoreError> {
+        let transaction = access.transaction();
+        self.bind_read(TransactionRef::Read(transaction))
+    }
+
+    fn bind_read<'transaction>(
+        &self,
+        transaction: TransactionRef<'transaction>,
+    ) -> Result<ReadDataAccess<'transaction>, StoreError> {
         transaction.ensure_access(self)?;
         let (table_name, prefix) = match self.location {
             DataLocation::Shared(data_id) => (None, Some(data_prefix(data_id))),
             DataLocation::Dedicated(table_id) => (Some(dedicated_table_name(table_id)), None),
         };
-        let table = transaction.record_result(
-            transaction
-                .mdbx
-                .open_table(table_name.as_deref())
-                .map_err(|error| StoreError::storage("open store table", error)),
-        )?;
-        Ok(DataAccess {
+        let table = transaction.open_table(table_name.as_deref())?;
+        Ok(ReadDataAccess {
             transaction,
             table,
             prefix,
@@ -136,16 +175,19 @@ impl DataHandle {
 }
 
 impl<'transaction> DataAccess<'transaction> {
-    /// Reborrows the transaction capability for a short-lived encoded entry.
-    pub(crate) const fn transaction_access(&self) -> TransactionAccess<'transaction> {
-        TransactionAccess {
-            transaction: self.transaction,
-        }
+    /// Consumes this composed access and retains only its shared read core.
+    pub(crate) fn into_read(self) -> ReadDataAccess<'transaction> {
+        self.read
     }
 
-    /// Verifies that no earlier hard operation has poisoned the transaction.
-    pub(crate) fn ensure_healthy(&self) -> Result<(), StoreError> {
-        self.transaction.ensure_healthy()
+    /// Borrows the shared read core without transferring write authority.
+    pub(crate) const fn as_read(&self) -> &ReadDataAccess<'transaction> {
+        &self.read
+    }
+
+    /// Reports whether `source` is this access's write transaction.
+    pub(crate) fn is_same_write_transaction(&self, source: TransactionRef<'_>) -> bool {
+        source.is_same_write_transaction(self.transaction)
     }
 
     /// Marks the transaction unusable when a collection-level hard operation fails.
@@ -158,28 +200,7 @@ impl<'transaction> DataAccess<'transaction> {
     ///
     /// Returns the original error after poisoning the transaction.
     pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
-        self.transaction.poison_on_error(result)
-    }
-
-    /// Applies the store's normal hard-versus-retryable error policy.
-    pub(crate) fn record_result<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
-        self.transaction.record_result(result)
-    }
-
-    /// Reads an encoded value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot read.
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Cow<'transaction, [u8]>>, StoreError> {
-        self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
-        self.transaction.record_result(
-            self.transaction
-                .mdbx
-                .get::<Cow<'transaction, [u8]>>(&self.table, key.as_ref())
-                .map_err(|error| StoreError::storage("read data", error)),
-        )
+        self.read.poison_on_error(result)
     }
 
     /// Reports whether an encoded key exists without copying its value.
@@ -188,15 +209,7 @@ impl<'transaction> DataAccess<'transaction> {
     ///
     /// Returns an error when the transaction is poisoned or MDBX cannot read.
     pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
-        self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
-        self.transaction.record_result(
-            self.transaction
-                .mdbx
-                .get::<ObjectLength>(&self.table, key.as_ref())
-                .map(|value| value.is_some())
-                .map_err(|error| StoreError::storage("inspect data", error)),
-        )
+        self.read.contains_key(key)
     }
 
     /// Inserts or replaces an encoded value.
@@ -206,11 +219,11 @@ impl<'transaction> DataAccess<'transaction> {
     /// Returns an error when the transaction is poisoned or MDBX cannot write.
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
+        let key = physical_key(self.read.prefix.as_ref(), key);
         self.transaction.record_result(
             self.transaction
                 .mdbx
-                .put(&self.table, key.as_ref(), value, WriteFlags::UPSERT)
+                .put(&self.read.table, key.as_ref(), value, WriteFlags::UPSERT)
                 .map_err(|error| StoreError::storage("write data", error)),
         )
     }
@@ -233,13 +246,13 @@ impl<'transaction> DataAccess<'transaction> {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        debug_assert!(self.prefix.is_none());
+        debug_assert!(self.read.prefix.is_none());
         self.transaction.ensure_healthy()?;
         self.transaction.poison_on_error((|| {
             let mut cursor = self
                 .transaction
                 .mdbx
-                .cursor(&self.table)
+                .cursor(&self.read.table)
                 .map_err(|error| StoreError::storage("open append cursor", error))?;
             for entry in entries {
                 let (key, value) = entry?;
@@ -266,11 +279,11 @@ impl<'transaction> DataAccess<'transaction> {
     /// Returns an error when the transaction is poisoned or MDBX cannot delete.
     pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
         self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
+        let key = physical_key(self.read.prefix.as_ref(), key);
         self.transaction.record_result(
             self.transaction
                 .mdbx
-                .del(&self.table, key.as_ref(), None)
+                .del(&self.read.table, key.as_ref(), None)
                 .map_err(|error| StoreError::storage("delete data", error)),
         )
     }
@@ -292,7 +305,7 @@ impl<'transaction> DataAccess<'transaction> {
     where
         K: AsRef<[u8]>,
     {
-        debug_assert!(self.prefix.is_none());
+        debug_assert!(self.read.prefix.is_none());
         self.transaction.ensure_healthy()?;
         self.transaction.record_result((|| {
             let mut keys = keys.into_iter().peekable();
@@ -302,7 +315,7 @@ impl<'transaction> DataAccess<'transaction> {
             let mut cursor = self
                 .transaction
                 .mdbx
-                .cursor(&self.table)
+                .cursor(&self.read.table)
                 .map_err(|error| StoreError::storage("open deletion cursor", error))?;
             let mut current = cursor
                 .set_range::<Cow<'transaction, [u8]>, ()>(first.as_ref())
@@ -330,40 +343,127 @@ impl<'transaction> DataAccess<'transaction> {
             Ok(true)
         })())
     }
+}
+
+impl<'transaction> TransactionRef<'transaction> {
+    fn is_same_write_transaction(self, other: &Transaction<'_>) -> bool {
+        match self {
+            Self::Read(_) => false,
+            Self::Write(transaction) => std::ptr::eq(transaction, other),
+        }
+    }
+
+    pub(crate) fn poison(self) {
+        match self {
+            Self::Read(transaction) => transaction.poisoned.set(true),
+            Self::Write(transaction) => transaction.poisoned.set(true),
+        }
+    }
+
+    fn ensure_access(self, handle: &DataHandle) -> Result<(), StoreError> {
+        match self {
+            Self::Read(transaction) => transaction.ensure_access(handle),
+            Self::Write(transaction) => transaction.ensure_access(handle),
+        }
+    }
+
+    fn ensure_healthy(self) -> Result<(), StoreError> {
+        match self {
+            Self::Read(transaction) => transaction.ensure_healthy(),
+            Self::Write(transaction) => transaction.ensure_healthy(),
+        }
+    }
+
+    pub(crate) fn poison_on_error<T, E>(self, result: Result<T, E>) -> Result<T, E> {
+        match self {
+            Self::Read(transaction) => transaction.poison_on_error(result),
+            Self::Write(transaction) => transaction.poison_on_error(result),
+        }
+    }
+
+    fn record_result<T>(self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        match self {
+            Self::Read(transaction) => transaction.record_result(result),
+            Self::Write(transaction) => transaction.record_result(result),
+        }
+    }
+
+    fn open_table(self, name: Option<&str>) -> Result<Table<'transaction>, StoreError> {
+        let result = match self {
+            Self::Read(transaction) => transaction.mdbx.open_table(name),
+            Self::Write(transaction) => transaction.mdbx.open_table(name),
+        }
+        .map_err(|error| StoreError::storage("open store table", error));
+        self.record_result(result)
+    }
+}
+
+impl<'transaction> ReadDataAccess<'transaction> {
+    /// Reborrows the transaction source for a short-lived read entry.
+    pub(crate) const fn transaction_ref(&self) -> TransactionRef<'transaction> {
+        self.transaction
+    }
+
+    /// Verifies that no earlier hard operation has poisoned the transaction.
+    pub(crate) fn ensure_healthy(&self) -> Result<(), StoreError> {
+        self.transaction.ensure_healthy()
+    }
+
+    /// Marks the transaction unusable when a collection-level operation fails.
+    pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+        self.transaction.poison_on_error(result)
+    }
+
+    /// Applies the Store's normal hard-versus-retryable error policy.
+    pub(crate) fn record_result<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        self.transaction.record_result(result)
+    }
+
+    /// Reads an encoded value.
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Cow<'transaction, [u8]>>, StoreError> {
+        self.transaction.ensure_healthy()?;
+        let key = physical_key(self.prefix.as_ref(), key);
+        let result = match self.transaction {
+            TransactionRef::Read(transaction) => transaction
+                .mdbx
+                .get::<Cow<'transaction, [u8]>>(&self.table, key.as_ref()),
+            TransactionRef::Write(transaction) => transaction
+                .mdbx
+                .get::<Cow<'transaction, [u8]>>(&self.table, key.as_ref()),
+        }
+        .map_err(|error| StoreError::storage("read data", error));
+        self.transaction.record_result(result)
+    }
+
+    /// Reports whether an encoded key exists without copying its value.
+    pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
+        self.transaction.ensure_healthy()?;
+        let key = physical_key(self.prefix.as_ref(), key);
+        let result = match self.transaction {
+            TransactionRef::Read(transaction) => transaction
+                .mdbx
+                .get::<ObjectLength>(&self.table, key.as_ref()),
+            TransactionRef::Write(transaction) => transaction
+                .mdbx
+                .get::<ObjectLength>(&self.table, key.as_ref()),
+        }
+        .map(|value| value.is_some())
+        .map_err(|error| StoreError::storage("inspect data", error));
+        self.transaction.record_result(result)
+    }
 
     /// Reports whether this physical table contains no entries.
-    ///
-    /// This is used only by dedicated collections, where the whole table is
-    /// one logical data object.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot read.
     pub(crate) fn is_physically_empty(&self) -> Result<bool, StoreError> {
         debug_assert!(self.prefix.is_none());
         self.transaction.ensure_healthy()?;
-        self.transaction.record_result((|| {
-            let mut cursor = self
-                .transaction
-                .mdbx
-                .cursor(&self.table)
-                .map_err(|error| StoreError::storage("open data cursor", error))?;
-            cursor
-                .first::<(), ObjectLength>()
-                .map(|entry| entry.is_none())
-                .map_err(|error| StoreError::storage("inspect data table", error))
-        })())
+        let result = match self.transaction {
+            TransactionRef::Read(transaction) => table_is_empty(&transaction.mdbx, &self.table),
+            TransactionRef::Write(transaction) => table_is_empty(&transaction.mdbx, &self.table),
+        };
+        self.transaction.record_result(result)
     }
 
-    /// Scans encoded entries in ascending key order without copying clean MDBX values.
-    ///
-    /// The returned values remain bound to this transaction. `limited` is
-    /// true when another matching entry exists but was excluded by a scan limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned, MDBX cannot scan,
-    /// or the first entry exceeds the byte limit.
+    /// Scans encoded entries in ascending key order from `start`.
     pub(crate) fn scan_borrowed_from(
         &self,
         start: &[u8],
@@ -379,14 +479,6 @@ impl<'transaction> DataAccess<'transaction> {
     }
 
     /// Borrows one bounded batch of encoded entries in byte order.
-    ///
-    /// `resume_after` is the last key returned by a previous scan with the
-    /// same range and direction. It is always excluded from the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned, MDBX cannot scan, or
-    /// the first matching item exceeds the byte limit.
     pub(crate) fn scan_borrowed<'range, R>(
         &self,
         range: R,
@@ -414,84 +506,119 @@ impl<'transaction> DataAccess<'transaction> {
         };
 
         self.transaction.ensure_healthy()?;
-        self.transaction.record_result((|| {
-            let mut cursor = self
-                .transaction
-                .mdbx
-                .cursor(&self.table)
-                .map_err(|error| StoreError::storage("open data cursor", error))?;
-            let mut current = seek_scan(
-                &mut cursor,
+        let result = match self.transaction {
+            TransactionRef::Read(transaction) => scan_data(
+                &transaction.mdbx,
+                &self.table,
                 self.prefix.as_ref(),
                 direction,
                 lower.as_ref(),
                 upper.as_ref(),
-            )?;
-            let mut items = Vec::new();
-            let mut bytes = 0_usize;
-
-            while let Some((physical_key, value_length)) = current {
-                let Some(key) = logical_key(physical_key, self.prefix.as_ref()) else {
-                    break;
-                };
-                if !within_bounds(key.as_ref(), lower.as_ref(), upper.as_ref()) {
-                    break;
-                }
-
-                if items.len() == limit.max_items() {
-                    return Ok(BorrowedScanBatch {
-                        items,
-                        limited: true,
-                    });
-                }
-
-                let item_bytes =
-                    key.len()
-                        .checked_add(*value_length)
-                        .ok_or(StoreError::ItemTooLarge {
-                            size: usize::MAX,
-                            limit: limit.max_bytes(),
-                        })?;
-                let next_bytes = bytes.checked_add(item_bytes);
-                if next_bytes.is_none_or(|size| size > limit.max_bytes()) {
-                    if items.is_empty() {
-                        return Err(StoreError::ItemTooLarge {
-                            size: item_bytes,
-                            limit: limit.max_bytes(),
-                        });
-                    }
-                    return Ok(BorrowedScanBatch {
-                        items,
-                        limited: true,
-                    });
-                }
-
-                // The probe reads only the value length. Materialize the value
-                // after admission so rejected oversized entries are never copied.
-                let ((), value) = cursor
-                    .get_current::<(), Cow<'transaction, [u8]>>()
-                    .map_err(|error| StoreError::storage("read scanned data", error))?
-                    .ok_or_else(|| {
-                        StoreError::storage("read scanned data", "MDBX cursor lost its position")
-                    })?;
-                debug_assert_eq!(value.len(), *value_length);
-                let Some(next_bytes) = next_bytes else {
-                    return Err(StoreError::ItemTooLarge {
-                        size: usize::MAX,
-                        limit: limit.max_bytes(),
-                    });
-                };
-                bytes = next_bytes;
-                items.push((key, value));
-                current = move_scan(&mut cursor, direction)?;
-            }
-
-            Ok(BorrowedScanBatch {
-                items,
-                limited: false,
-            })
-        })())
+                limit,
+            ),
+            TransactionRef::Write(transaction) => scan_data(
+                &transaction.mdbx,
+                &self.table,
+                self.prefix.as_ref(),
+                direction,
+                lower.as_ref(),
+                upper.as_ref(),
+                limit,
+            ),
+        };
+        self.transaction.record_result(result)
     }
+}
+
+fn table_is_empty<K: TransactionKind>(
+    transaction: &MdbxTransaction<'_, K, NoWriteMap>,
+    table: &Table<'_>,
+) -> Result<bool, StoreError> {
+    let mut cursor = transaction
+        .cursor(table)
+        .map_err(|error| StoreError::storage("open data cursor", error))?;
+    cursor
+        .first::<(), ObjectLength>()
+        .map(|entry| entry.is_none())
+        .map_err(|error| StoreError::storage("inspect data table", error))
+}
+
+fn scan_data<'transaction, K: TransactionKind>(
+    transaction: &'transaction MdbxTransaction<'transaction, K, NoWriteMap>,
+    table: &Table<'transaction>,
+    prefix: Option<&[u8; 5]>,
+    direction: ScanDirection,
+    lower: Option<&EncodedBound<'_>>,
+    upper: Option<&EncodedBound<'_>>,
+    limit: ScanLimit,
+) -> Result<BorrowedScanBatch<'transaction>, StoreError> {
+    let mut cursor = transaction
+        .cursor(table)
+        .map_err(|error| StoreError::storage("open data cursor", error))?;
+    let mut current = seek_scan(&mut cursor, prefix, direction, lower, upper)?;
+    let mut items = Vec::new();
+    let mut bytes = 0_usize;
+
+    while let Some((physical_key, value_length)) = current {
+        let Some(key) = logical_key(physical_key, prefix) else {
+            break;
+        };
+        if !within_bounds(key.as_ref(), lower, upper) {
+            break;
+        }
+
+        if items.len() == limit.max_items() {
+            return Ok(BorrowedScanBatch {
+                items,
+                limited: true,
+            });
+        }
+
+        let item_bytes = key
+            .len()
+            .checked_add(*value_length)
+            .ok_or(StoreError::ItemTooLarge {
+                size: usize::MAX,
+                limit: limit.max_bytes(),
+            })?;
+        let next_bytes = bytes.checked_add(item_bytes);
+        if next_bytes.is_none_or(|size| size > limit.max_bytes()) {
+            if items.is_empty() {
+                return Err(StoreError::ItemTooLarge {
+                    size: item_bytes,
+                    limit: limit.max_bytes(),
+                });
+            }
+            return Ok(BorrowedScanBatch {
+                items,
+                limited: true,
+            });
+        }
+
+        // The probe reads only the value length. Materialize the value after
+        // admission so rejected oversized entries are never copied.
+        let ((), value) = cursor
+            .get_current::<(), Cow<'transaction, [u8]>>()
+            .map_err(|error| StoreError::storage("read scanned data", error))?
+            .ok_or_else(|| {
+                StoreError::storage("read scanned data", "MDBX cursor lost its position")
+            })?;
+        debug_assert_eq!(value.len(), *value_length);
+        let Some(next_bytes) = next_bytes else {
+            return Err(StoreError::ItemTooLarge {
+                size: usize::MAX,
+                limit: limit.max_bytes(),
+            });
+        };
+        bytes = next_bytes;
+        items.push((key, value));
+        current = move_scan(&mut cursor, direction)?;
+    }
+
+    Ok(BorrowedScanBatch {
+        items,
+        limited: false,
+    })
 }
 
 fn data_prefix(data_id: u32) -> [u8; 5] {
@@ -540,8 +667,8 @@ fn logical_key<'transaction>(
     }
 }
 
-fn seek_scan<'txn>(
-    cursor: &mut Cursor<'txn, RW>,
+fn seek_scan<'txn, K: TransactionKind>(
+    cursor: &mut Cursor<'txn, K>,
     prefix: Option<&[u8; 5]>,
     direction: ScanDirection,
     lower: Option<&EncodedBound<'_>>,
@@ -590,8 +717,8 @@ fn seek_scan<'txn>(
     }
 }
 
-fn seek_at_or_below<'txn>(
-    cursor: &mut Cursor<'txn, RW>,
+fn seek_at_or_below<'txn, K: TransactionKind>(
+    cursor: &mut Cursor<'txn, K>,
     seek: &[u8],
     inclusive: bool,
     direction: ScanDirection,
@@ -614,8 +741,8 @@ fn seek_at_or_below<'txn>(
     }
 }
 
-fn move_scan<'txn>(
-    cursor: &mut Cursor<'txn, RW>,
+fn move_scan<'txn, K: TransactionKind>(
+    cursor: &mut Cursor<'txn, K>,
     direction: ScanDirection,
 ) -> Result<Option<ScanProbe<'txn>>, StoreError> {
     match direction {

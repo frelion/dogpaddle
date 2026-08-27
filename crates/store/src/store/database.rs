@@ -3,7 +3,10 @@ use std::{
     fs,
     io::ErrorKind,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use libmdbx::{
@@ -243,11 +246,14 @@ impl Store {
         Ok(self.handle(location))
     }
 
-    /// Ends data object setup and yields the unique runtime transaction capability.
+    /// Ends data object setup and yields the unique runtime write capability.
+    ///
+    /// Its owner can subsequently derive a read-only runtime capability by
+    /// consuming it with [`Transactions::split`].
     #[must_use]
     pub fn into_transactions(self) -> Transactions {
         Transactions {
-            database: self.database,
+            database: Arc::new(self.database),
             store_token: self.token,
         }
     }

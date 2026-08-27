@@ -50,15 +50,52 @@ fn build_uses_the_stable_resource_layout() {
         .open_data("station/00000000/operation/sequence_source.position")
         .unwrap();
     let _count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let (_, reads) = store.into_transactions().split();
+    let transaction = reads.begin().unwrap();
     assert!(
         definition
-            .access(transaction.access())
+            .read(transaction.access())
             .unwrap()
             .get()
             .unwrap()
             .is_some()
+    );
+}
+
+#[test]
+fn build_initializes_each_input_cursor_at_the_stable_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
+    builder.connect([source], count);
+    drop(builder.build().unwrap());
+
+    let store = Store::open(&path).unwrap();
+    let source_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000000/state").unwrap();
+    let count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let (_, reads) = store.into_transactions().split();
+    let transaction = reads.begin().unwrap();
+    let key = b"input/00000000/cursor".to_vec();
+
+    assert_eq!(
+        source_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&key)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        count_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&key)
+            .unwrap(),
+        Some(vec![0; 16])
     );
 }
 

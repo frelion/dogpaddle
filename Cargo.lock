@@ -301,7 +301,10 @@ dependencies = [
 name = "dogpaddle-flow"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "dogpaddle-bench-protocol",
+ "dogpaddle-change",
  "dogpaddle-operation",
  "dogpaddle-store",
  "tempfile",

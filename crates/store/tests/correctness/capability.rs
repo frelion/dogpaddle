@@ -22,10 +22,11 @@ fn read_only_cell_observes_the_same_transaction_and_committed_writes() {
     assert_eq!(input_access.get().unwrap(), Some(41));
     transaction.commit().unwrap();
 
-    let transaction = transactions.begin().unwrap();
+    let (_, reads) = transactions.split();
+    let transaction = reads.begin().unwrap();
     assert_eq!(
         cloned_input
-            .access(transaction.access())
+            .read(transaction.access())
             .unwrap()
             .get()
             .unwrap(),
@@ -96,6 +97,26 @@ where
     assert_eq!(second_page, vec![(3, "three".to_owned())]);
     assert_eq!(continuation, None);
     transaction.commit().unwrap();
+
+    let (_, reads) = transactions.split();
+    let transaction = reads.begin().unwrap();
+    let input_access = input.read(transaction.access()).unwrap();
+    assert_eq!(input_access.get(&1).unwrap().as_deref(), Some("one"));
+
+    let mut observed = Vec::new();
+    input_access
+        .scan(
+            ..,
+            ScanDirection::Ascending,
+            None,
+            ScanLimit::new(3, 1024).unwrap(),
+            |entry| -> Result<(), StoreError> {
+                observed.push(entry.decode_owned()?);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(observed.len(), 3);
 }
 
 #[test]
@@ -162,11 +183,11 @@ fn read_only_append_logs_support_independent_scans_after_reopen() {
     let store = Store::open(&path).unwrap();
     let reopened = store.open_data::<AppendLog<Vec<u8>>>("changes").unwrap();
     let reopened_input = ReadOnly::new(reopened);
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let (_, reads) = store.into_transactions().split();
+    let transaction = reads.begin().unwrap();
     let mut observed_after_reopen = Vec::new();
     let scan = reopened_input
-        .access(transaction.access())
+        .read(transaction.access())
         .unwrap()
         .scan(
             0,
@@ -186,4 +207,42 @@ fn read_only_append_logs_support_independent_scans_after_reopen() {
         ]
     );
     assert!(scan.caught_up);
+}
+
+#[test]
+fn read_only_append_log_rw_view_preserves_entry_forwarding_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let source = store.create_data::<AppendLog<Vec<u8>>>("source").unwrap();
+    let input = ReadOnly::new(source.clone());
+    let output = store.create_data::<AppendLog<Vec<u8>>>("output").unwrap();
+    let mut transactions = store.into_transactions();
+
+    let transaction = transactions.begin().unwrap();
+    let access = transaction.access();
+    source
+        .access(access)
+        .unwrap()
+        .append(&b"change".to_vec())
+        .unwrap();
+    let input_access = input.access(access).unwrap();
+    let mut output_access = output.access(access).unwrap();
+    input_access
+        .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
+            output_access.append_entry(&entry)?;
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let transaction = transactions.begin().unwrap();
+    let output = output.access(transaction.access()).unwrap();
+    let mut observed = Vec::new();
+    output
+        .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
+            observed.push(entry.decode_owned()?);
+            Ok::<(), StoreError>(())
+        })
+        .unwrap();
+    assert_eq!(observed, vec![b"change".to_vec()]);
 }

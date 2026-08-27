@@ -8,12 +8,14 @@ mod store;
 
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
-    AppendLog, AppendLogAccess, AppendLogEntry, AppendLogScan, Cell, CellAccess, OrderedMap,
-    OrderedMapAccess, OrderedMapEntry, ReadOnly,
+    AppendLog, AppendLogAccess, AppendLogEntry, AppendLogReadAccess, AppendLogScan, Cell,
+    CellAccess, CellReadAccess, OrderedMap, OrderedMapAccess, OrderedMapEntry,
+    OrderedMapReadAccess, ReadOnly,
 };
 pub use data_class::StoreData;
 pub use error::StoreError;
-pub(crate) use store::{DataAccess, DataHandle, DataPlacement};
+pub(crate) use store::{DataAccess, DataHandle, DataPlacement, ReadDataAccess, TransactionRef};
+pub use store::{ReadTransaction, ReadTransactionAccess, ReadTransactions};
 pub use store::{ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions};
 
 /// Persistent size marker selecting shared physical storage for collections

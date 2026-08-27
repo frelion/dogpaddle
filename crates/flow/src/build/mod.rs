@@ -111,10 +111,18 @@ impl FlowFactory {
         let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
         let flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
             store.create_data(codec::FLOW_STATE_DATA_NAME)?;
-        let station_parts = create_station_parts(&mut store, &definition)?;
-        let mut transactions = store.into_transactions();
+        let station_parts = definition
+            .stations()
+            .iter()
+            .enumerate()
+            .map(|(index, station)| create_station_part(&mut store, index, station.operation()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mut transactions, reads) = store.into_transactions().split();
         {
             let transaction = transactions.begin()?;
+            for station in &station_parts {
+                station.initialize_cursors(transaction.access())?;
+            }
             let mut published = published.access(transaction.access())?;
             published.set(&definition_bytes)?;
             transaction.commit()?;
@@ -127,6 +135,7 @@ impl FlowFactory {
             flow_state,
             stations,
             transactions,
+            reads,
         ))
     }
 
@@ -146,18 +155,6 @@ fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), Materia
         }
     }
     Ok(())
-}
-
-fn create_station_parts(
-    store: &mut Store,
-    definition: &FlowDefinition,
-) -> Result<Vec<StationParts>, FlowError> {
-    definition
-        .stations()
-        .iter()
-        .enumerate()
-        .map(|(index, station)| create_station_part(store, index, station.operation()))
-        .collect()
 }
 
 fn create_station_part(

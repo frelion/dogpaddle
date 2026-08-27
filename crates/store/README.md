@@ -11,13 +11,18 @@ Store 将资源装配与运行时访问分离：
 - `Store` 创建或打开全部具名数据对象；进入运行期前，其所有权会被消费；
 - `Cell<T>`、`OrderedMap<K, V, SIZE>` 与 `AppendLog<T>` 是 collection 的完整能力，可以产生
   完整的事务级读写 Access；
-- `ReadOnly<C>` 由完整 collection 显式单向衰减得到，只能产生只读事务 Access；
-- `Transactions` 是唯一、不可克隆的运行期事务启动能力；它可以在空闲时移动到其他线程，但不
-  暴露 catalog；
+- `ReadOnly<C>` 由完整 collection 显式单向衰减得到，长期移除该 handle 的写权限；
+- `Transactions` 是唯一、不可克隆的运行期写事务启动能力；它可以在空闲时移动到其他线程，
+  也可以由完整 owner 消费式 `split`，但不暴露 catalog；
+- `ReadTransactions` 由 `Transactions::split` 显式产生，不可 clone、可以在线程间共享，并为
+  同一个 MDBX environment 开启彼此独立的只读 snapshot；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
+- `ReadTransaction` 持有一个没有提交能力的只读 snapshot，并在被丢弃时释放；
 - `TransactionAccess` 从活动 Transaction 临时借用，只允许已有类型化数据对象绑定访问；
-- 完整的 `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 执行实际读写，包在
-  `ReadOnly<...>` 中的 Access 只公开对应 collection 的读取方法。
+- `ReadTransactionAccess` 只能绑定 `CellReadAccess`、`OrderedMapReadAccess` 或
+  `AppendLogReadAccess`，类型层面没有写方法；
+- 完整的 `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 执行实际读写；
+  `ReadOnly<C>::access` 与 `ReadOnly<C>::read` 都统一返回对应的 `*ReadAccess`。
 
 底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
 也不能绕过数据类型自行组合物理资源。
@@ -66,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let users = store.create_data::<OrderedMap<u64, String, Large>>("users")?;
     let changes = store.create_data::<AppendLog<Vec<u8>>>("changes")?;
 
-    let mut transactions = store.into_transactions();
+    let (mut transactions, read_transactions) = store.into_transactions().split();
 
     {
         let transaction = transactions.begin()?;
@@ -81,11 +86,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         transaction.commit()?;
     }
 
-    let transaction = transactions.begin()?;
+    let transaction = read_transactions.begin()?;
     let access = transaction.access();
-    let counter = counter.access(access)?;
-    let users = users.access(access)?;
-    let changes = changes.access(access)?;
+    let counter = counter.read(access)?;
+    let users = users.read(access)?;
+    let changes = changes.read(access)?;
     assert_eq!(counter.get()?, Some(1));
     assert_eq!(users.get(&42)?.as_deref(), Some("Shiba"));
 
@@ -125,10 +130,10 @@ use dogpaddle_store::{Cell, Store};
 # fn open() -> Result<(), Box<dyn std::error::Error>> {
 let store = Store::open("./dogpaddle-store-data")?;
 let counter = store.open_data::<Cell<u64>>("counter")?;
-let mut transactions = store.into_transactions();
-let transaction = transactions.begin()?;
+let (_, read_transactions) = store.into_transactions().split();
+let transaction = read_transactions.begin()?;
 let access = transaction.access();
-assert_eq!(counter.access(access)?.get()?, Some(1));
+assert_eq!(counter.read(access)?.get()?, Some(1));
 # Ok(())
 # }
 ```
@@ -175,15 +180,27 @@ transaction.commit()?;
 衰减不会撤销装配者仍然持有的完整 alias；它保证的是只收到 `ReadOnly<C>` 的组件无法在 safe
 Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，因此多个下游可以安全地
 共享同一个输入 collection。当前白名单是：`Cell` 的 `get`，`OrderedMap` 的 `get/scan`，以及
-`AppendLog` 的 `bounds/scan`。
+`AppendLog` 的 `bounds/scan`。它与只读事务是两个正交约束：`ReadOnly<C>::access` 可在一个写
+事务中提供受限读取，`ReadOnly<C>::read` 则绑定真正的只读 snapshot；两条路径统一返回没有
+写方法的 `CellReadAccess`、`OrderedMapReadAccess` 或 `AppendLogReadAccess`。完整 collection 的
+`read` 也返回同一组类型。
 
 ## 事务与扫描语义
 
-`Store::into_transactions()` 只发生一次，并产生唯一、不可克隆的 `Transactions`。运行协调者
-集中持有它；`begin(&mut self)` 返回的 Transaction guard 在存活期间独占借用该能力，因此无法
-在前一 guard 被提交或丢弃前再次开始事务。显式泄漏 guard 会同时泄漏底层写事务，不属于正常
-RAII 生命周期。能力本身可以在线程之间移动，但活动 Transaction 及其访问值仍然绑定在创建
-它们的线程。
+`Store::into_transactions()` 只发生一次，并产生唯一、不可克隆的写能力 `Transactions`。运行
+协调者集中持有它；`begin(&mut self)` 返回的 Transaction guard 在存活期间独占借用该能力，
+因此无法在前一 guard 被提交或丢弃前再次开始写事务。显式泄漏 guard 会同时泄漏底层写事务，
+不属于正常 RAII 生命周期。写能力本身可以在线程之间移动，但活动 Transaction 及其访问值仍然
+绑定在创建它们的线程。
+
+`Transactions::split(self)` 消费完整 owner，并把同一个唯一写能力与一个只读启动能力一起返回，
+不会创建第二个 MDBX environment。完整 owner 取回写能力后可以有意地再次授权；只拿到
+`&mut Transactions` 的 Station 无法消费它，因而不能 split 或导出 owned reader。返回的
+`ReadTransactions` 不可 clone、但为 `Send + Sync`；共享引用可以通过 `begin(&self)` 开启彼此
+独立的 `ReadTransaction`，借用方无法把事务启动能力留到借用期之外。只读 snapshot 可以和唯一
+写能力同时存活：它持续观察开始时的稳定视图，writer 的后续 commit 只对之后开始的 snapshot
+可见。活动 `ReadTransaction` 与 `ReadTransactionAccess` 仍然是线程绑定的；并发读取应在线程间
+共享启动能力的引用，再在线程内开始、读取并结束 snapshot，而不是把活动事务跨线程传递。
 
 丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。调用
 `Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
@@ -192,14 +209,15 @@ Transaction 的所有权并把受限能力交给 Operation；Operation 无法开
 访问 Store catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式
 选择布局的数据对象都可以原子提交。
 
-`TransactionAccess` 本身不区分只读与读写，因为一次工作事务需要同时读取 input 并写入对应的
-state/output。静态权限来自 collection handle：`ReadOnly<C>` 只能绑定出
-`ReadOnly<...Access>`，完整 handle 则绑定出完整 Access。两者仍然共享同一个事务快照和中毒、
-回滚、提交边界。
+`TransactionAccess` 属于写事务，但它自身没有 commit 权限；一次原子工作可以用它同时读取 input
+并写入 state/output。静态 collection 权限仍由 handle 决定：完整 handle 的 `access` 绑定完整
+Access，`ReadOnly<C>::access` 则绑定对应的 `*ReadAccess`。`ReadTransactionAccess` 是更强的
+事务级衰减：无论调用方持有完整还是 `ReadOnly` collection，都只能通过 `read` 得到同一组
+`CellReadAccess`、`OrderedMapReadAccess` 或 `AppendLogReadAccess`。这些类型根本没有
+`set/put/remove/append/truncate` 方法，`ReadTransaction` 也没有 `commit`。
 
-`TransactionAccess`、`CellAccess` 和 `OrderedMapAccess` 都不能脱离所属事务；每个新事务都
-必须重新绑定，不能跨 Station 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
-执行的事务。
+两种 `TransactionAccess` 和所有 collection Access 都不能脱离所属事务；每个新事务都必须重新
+绑定，不能跨 Station 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在执行的事务。
 
 内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
 以及提交返回 `TransactionPoisoned`；无法容纳单个扫描项的 `ItemTooLarge` 是可调整 scan
@@ -235,9 +253,12 @@ callback：`project` 可以只解码 diff 或少数列，`decode_owned` 只在�
 `append_entry` 则能把相同 `T` 的编码原样写入同一事务中的另一个 log。Entry 不公开 MDBX
 借用或裸字节，也不能逃出 callback 或跨线程。
 
-作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/scan`，不能 append 或 truncate。多个消费
-者可以 clone 同一份只读 handle 并读取同一个物理日志；各自的 next-unread offset 由上层分别
-持久化，不属于 `AppendLog` 或只读 capability。
+作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/scan`，不能 append 或 truncate。它既能
+通过 `access(TransactionAccess)` 参与包含其他写入的原子事务，也能通过
+`read(ReadTransactionAccess)` 绑定独立只读 snapshot。多个消费者可以 clone 同一份只读 handle
+并读取同一个物理日志。写事务中的只读 view 扫出的 entry 仍可原样转发给同一事务内自有的 output；
+真正只读 snapshot 的 entry 不携带这种写事务关联。各自的 next-unread offset 由上层分别持久化，
+不属于 `AppendLog` 或只读 capability。
 
 一个 scan 在调用 callback 前先验证选中 offset 连续。callback 的任意错误都会毒化事务，
 避免已经写入部分输出后仍被提交；第一项无法装入 byte limit 的 `ItemTooLarge` 仍是可增大
@@ -273,9 +294,11 @@ cargo test -p dogpaddle-store --test correctness scan::
 通过 MDBX 持久化适配器锁定 `Cell` 的共享布局、`Small` map 的共享前缀、`Large` map 与
 `AppendLog` 的
 独立 named table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。目录
-中的 `capability` 模块验证衰减后仍读取同一物理对象、fan-out 与 reopen 后重新衰减；写方法
-不可用、不能恢复完整 handle 且不能作为 `StoreData` 打开的静态边界由 Rustdoc compile-fail
-测试锁定。测试目录所有权、模块职责和完整验证协议见
+中的 `capability` 模块验证衰减后仍读取同一物理对象、fan-out 与 reopen 后重新衰减；transaction
+模块验证旧只读 snapshot 与 writer 同时存在时保持稳定，并验证共享的读能力引用可在线程中独立
+开始 snapshot。写方法不可用、事务启动能力不可 clone、活动事务不能跨线程、不能恢复完整 handle
+且不能作为 `StoreData` 打开的静态边界由 Rustdoc compile-fail 测试锁定。测试目录所有权、模块
+职责和完整验证协议见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
 
 ## 性能

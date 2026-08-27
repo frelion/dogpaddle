@@ -11,11 +11,14 @@ autobenches = false
 bench = false
 
 [dependencies]
+dogpaddle-change.workspace = true
 dogpaddle-operation.workspace = true
 dogpaddle-store.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
 dogpaddle-bench-protocol.workspace = true
 tempfile.workspace = true
 

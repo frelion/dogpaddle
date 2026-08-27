@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    CodecError, DataAccess, DataHandle, ScanDirection, ScanLimit, StoreError, StoreKey, StoreValue,
-    TransactionAccess,
+    CodecError, DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanDirection,
+    ScanLimit, StoreError, StoreKey, StoreValue, TransactionAccess, TransactionRef,
 };
 
 type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
@@ -23,6 +23,24 @@ pub struct OrderedMap<K, V, SIZE> {
 /// Transaction-bound access to an [`OrderedMap`].
 pub struct OrderedMapAccess<'transaction, K, V> {
     data: DataAccess<'transaction>,
+    _types: PhantomData<fn() -> (K, V)>,
+}
+
+/// A read-only transaction-bound view of an [`OrderedMap`].
+///
+/// This view can originate from either an active [`crate::Transaction`] or
+/// [`crate::ReadTransaction`]. It exposes point reads and scans, but no
+/// insertion or removal API, and cannot outlive the originating transaction.
+///
+/// ```compile_fail
+/// use dogpaddle_store::OrderedMapReadAccess;
+///
+/// fn put(access: &mut OrderedMapReadAccess<'_, u64, u64>) {
+///     access.put(&1, &2).unwrap();
+/// }
+/// ```
+pub struct OrderedMapReadAccess<'transaction, K, V> {
+    data: ReadDataAccess<'transaction>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
@@ -50,7 +68,7 @@ pub struct OrderedMapAccess<'transaction, K, V> {
 pub struct OrderedMapEntry<'entry, K, V> {
     encoded_key: Cow<'entry, [u8]>,
     encoded_value: Cow<'entry, [u8]>,
-    access: TransactionAccess<'entry>,
+    transaction: TransactionRef<'entry>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
@@ -77,23 +95,39 @@ impl<K: StoreKey, V: StoreValue, SIZE> OrderedMap<K, V, SIZE> {
             _types: PhantomData,
         })
     }
+
+    /// Binds this map through an active read-only transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<OrderedMapReadAccess<'transaction, K, V>, StoreError> {
+        Ok(OrderedMapReadAccess {
+            data: self.data.read(access)?,
+            _types: PhantomData,
+        })
+    }
 }
 
-impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
+impl<'transaction, K: StoreKey, V: StoreValue> OrderedMapAccess<'transaction, K, V> {
+    pub(crate) fn into_read(self) -> OrderedMapReadAccess<'transaction, K, V> {
+        OrderedMapReadAccess {
+            data: self.data.into_read(),
+            _types: PhantomData,
+        }
+    }
+
     /// Reads one value.
     ///
     /// # Errors
     ///
     /// Returns an error when key encoding, storage access, or value decoding fails.
     pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
-        let encoded_key = self
-            .data
-            .poison_on_error(key.encode_key())
-            .map_err(StoreError::from)?;
-        let encoded = self.data.get(encoded_key.as_ref())?;
-        self.data
-            .poison_on_error(encoded.map(V::decode_value).transpose())
-            .map_err(StoreError::from)
+        read_map_value(self.data.as_read(), key)
     }
 
     /// Inserts or replaces one value.
@@ -156,68 +190,131 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
         direction: ScanDirection,
         resume_after: Option<&K>,
         limit: ScanLimit,
-        mut visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
+        visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
     ) -> Result<Option<K>, E>
     where
         E: From<StoreError>,
     {
-        let lower = self
-            .data
-            .poison_on_error(match range.start_bound() {
-                Bound::Included(key) => key.encode_key().map(Bound::Included),
-                Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
-                Bound::Unbounded => Ok(Bound::Unbounded),
-            })
-            .map_err(StoreError::from)
-            .map_err(E::from)?;
-        let upper = self
-            .data
-            .poison_on_error(match range.end_bound() {
-                Bound::Included(key) => key.encode_key().map(Bound::Included),
-                Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
-                Bound::Unbounded => Ok(Bound::Unbounded),
-            })
-            .map_err(StoreError::from)
-            .map_err(E::from)?;
-        let continuation = self
-            .data
-            .poison_on_error(resume_after.map(StoreKey::encode_key).transpose())
-            .map_err(StoreError::from)
-            .map_err(E::from)?;
-        let raw = self
-            .data
-            .scan_borrowed(
-                (borrow_bound(&lower), borrow_bound(&upper)),
-                direction,
-                continuation.as_ref().map(AsRef::as_ref),
-                limit,
-            )
-            .map_err(E::from)?;
-        debug_assert!(!raw.limited || !raw.items.is_empty());
-        let continuation = self
-            .data
-            .poison_on_error(
-                raw.items
-                    .last()
-                    .filter(|_| raw.limited)
-                    .map(|(key, _)| K::decode_key(Cow::Borrowed(key.as_ref())))
-                    .transpose(),
-            )
-            .map_err(StoreError::from)
-            .map_err(E::from)?;
-
-        for (encoded_key, encoded_value) in raw.items {
-            let entry = OrderedMapEntry {
-                encoded_key,
-                encoded_value,
-                access: self.data.transaction_access(),
-                _types: PhantomData,
-            };
-            self.data.poison_on_error(visit(entry))?;
-            self.data.ensure_healthy().map_err(E::from)?;
-        }
-        Ok(continuation)
+        scan_map(
+            self.data.as_read(),
+            range,
+            direction,
+            resume_after,
+            limit,
+            visit,
+        )
     }
+}
+
+impl<K: StoreKey, V: StoreValue> OrderedMapReadAccess<'_, K, V> {
+    /// Reads one value visible to the originating transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key encoding, storage access, or value decoding fails.
+    pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
+        read_map_value(&self.data, key)
+    }
+
+    /// Visits one bounded page through this read-only view.
+    ///
+    /// Range, continuation, admission, and callback semantics match
+    /// [`OrderedMapAccess::scan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bound encoding, storage access, continuation or
+    /// entry decoding fails, the first matching entry exceeds the byte limit,
+    /// or the visitor fails.
+    pub fn scan<E>(
+        &self,
+        range: impl RangeBounds<K>,
+        direction: ScanDirection,
+        resume_after: Option<&K>,
+        limit: ScanLimit,
+        visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
+    ) -> Result<Option<K>, E>
+    where
+        E: From<StoreError>,
+    {
+        scan_map(&self.data, range, direction, resume_after, limit, visit)
+    }
+}
+
+fn read_map_value<K: StoreKey, V: StoreValue>(
+    data: &ReadDataAccess<'_>,
+    key: &K,
+) -> Result<Option<V>, StoreError> {
+    let encoded_key = data
+        .poison_on_error(key.encode_key())
+        .map_err(StoreError::from)?;
+    let encoded = data.get(encoded_key.as_ref())?;
+    data.poison_on_error(encoded.map(V::decode_value).transpose())
+        .map_err(StoreError::from)
+}
+
+fn scan_map<K: StoreKey, V: StoreValue, E>(
+    data: &ReadDataAccess<'_>,
+    range: impl RangeBounds<K>,
+    direction: ScanDirection,
+    resume_after: Option<&K>,
+    limit: ScanLimit,
+    mut visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
+) -> Result<Option<K>, E>
+where
+    E: From<StoreError>,
+{
+    let lower = data
+        .poison_on_error(match range.start_bound() {
+            Bound::Included(key) => key.encode_key().map(Bound::Included),
+            Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+            Bound::Unbounded => Ok(Bound::Unbounded),
+        })
+        .map_err(StoreError::from)
+        .map_err(E::from)?;
+    let upper = data
+        .poison_on_error(match range.end_bound() {
+            Bound::Included(key) => key.encode_key().map(Bound::Included),
+            Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+            Bound::Unbounded => Ok(Bound::Unbounded),
+        })
+        .map_err(StoreError::from)
+        .map_err(E::from)?;
+    let continuation = data
+        .poison_on_error(resume_after.map(StoreKey::encode_key).transpose())
+        .map_err(StoreError::from)
+        .map_err(E::from)?;
+    let raw = data
+        .scan_borrowed(
+            (borrow_bound(&lower), borrow_bound(&upper)),
+            direction,
+            continuation.as_ref().map(AsRef::as_ref),
+            limit,
+        )
+        .map_err(E::from)?;
+    debug_assert!(!raw.limited || !raw.items.is_empty());
+    let continuation = data
+        .poison_on_error(
+            raw.items
+                .last()
+                .filter(|_| raw.limited)
+                .map(|(key, _)| K::decode_key(Cow::Borrowed(key.as_ref())))
+                .transpose(),
+        )
+        .map_err(StoreError::from)
+        .map_err(E::from)?;
+
+    for (encoded_key, encoded_value) in raw.items {
+        let entry = OrderedMapEntry {
+            encoded_key,
+            encoded_value,
+            transaction: data.transaction_ref(),
+            _types: PhantomData,
+        };
+        data.poison_on_error(visit(entry))?;
+        data.ensure_healthy().map_err(E::from)?;
+    }
+    Ok(continuation)
 }
 
 impl<K, V> OrderedMapEntry<'_, K, V> {
@@ -234,7 +331,7 @@ impl<K, V> OrderedMapEntry<'_, K, V> {
         &self,
         project: impl for<'encoded> FnOnce(&'encoded [u8], &'encoded [u8]) -> Result<R, CodecError>,
     ) -> Result<R, StoreError> {
-        self.access
+        self.transaction
             .poison_on_error(project(
                 self.encoded_key.as_ref(),
                 self.encoded_value.as_ref(),
@@ -257,12 +354,14 @@ impl<K: StoreKey, V: StoreValue> OrderedMapEntry<'_, K, V> {
         let Self {
             encoded_key,
             encoded_value,
-            access,
+            transaction,
             _types: _,
         } = self;
         let decoded: Result<(K, V), CodecError> =
             (|| Ok((K::decode_key(encoded_key)?, V::decode_value(encoded_value)?)))();
-        access.poison_on_error(decoded).map_err(StoreError::from)
+        transaction
+            .poison_on_error(decoded)
+            .map_err(StoreError::from)
     }
 }
 

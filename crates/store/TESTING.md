@@ -35,13 +35,19 @@ tests/
 `append_log::{errors,projection}`。文件拆开是为了让成功路径、错误路径、扫描和投影各自聚焦，
 不会增加 Cargo target，也不会改变测试过滤路径。
 
-`capability.rs` 统一拥有 collection 能力衰减、共享底层对象、只读 fan-out 和 reopen 后重新
-衰减的公共行为；写方法不可用、不能升级回完整 handle 且不能作为 `StoreData` 打开的静态边界
-由 `ReadOnly` 的 Rustdoc compile-fail 测试拥有。
+`capability.rs` 统一拥有 collection 能力衰减、共享底层对象、只读 fan-out、RW/RO 两种事务绑定
+统一返回 `*ReadAccess`、RW read view 的 entry 保留同事务转发能力，以及 reopen 后重新衰减的
+公共行为；`append_log_errors.rs` 锁定真正 RO snapshot 的 entry 不能转发并同时毒化读写两侧事务。
+写方法不可用、不能升级回完整 handle 且不能作为 `StoreData` 打开的静态边界由 `ReadOnly` 与
+`*ReadAccess` 的 Rustdoc compile-fail 测试拥有。
 
-`transaction.rs` 验证唯一事务启动能力可以顺序复用并在线程间移动，同时验证活动 Transaction
-及其访问值的回滚、中毒和线程绑定语义；`Transactions` 不可克隆、存活 guard 阻止再次 begin，
-以及 `Transaction` 的 `!Send + !Sync` 静态边界由对应 Rustdoc compile-fail 测试拥有。
+`transaction.rs` 验证唯一写事务启动能力可以顺序复用并在线程间移动，同时验证活动 Transaction
+及其访问值的回滚、中毒和线程绑定语义；它还验证共享的 `ReadTransactions` 引用可在独立线程开始
+snapshot、旧 snapshot 与 writer 并存时保持一致、读 scan 的软错误可重试，以及读 visitor 或
+decode 的硬错误会毒化 snapshot。`Transactions` 与 `ReadTransactions` 不可克隆、借用的
+`Transactions` 不能消费式 split 并导出 owned reader、存活写 guard 阻止再次 begin、
+`ReadTransaction` 没有 commit，以及两种活动 Transaction 的 `!Send + !Sync` 静态边界由对应
+Rustdoc compile-fail 测试拥有。
 
 这些模块作为下游 crate 编译，只通过 `dogpaddle_store` 的公共 Rust API 观察行为。`store`、
 `placement` 和 `append_log_layout` 可以使用 `libmdbx` 适配器准备损坏数据库或审计稳定磁盘布局，

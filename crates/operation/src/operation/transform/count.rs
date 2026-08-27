@@ -99,9 +99,9 @@ impl CountOperation {
     /// Applies one accepted input and returns the updated running count.
     ///
     /// A missing cell value is interpreted as zero. The operation binds its
-    /// own count cell through `access`; the caller retains transaction
-    /// ownership and decides whether to commit or roll back the state change
-    /// and returned output together.
+    /// own count cell through `access`; the Station's read-write processing
+    /// phase retains transaction ownership and decides whether to commit or
+    /// roll back the state change and returned output together.
     ///
     /// # Errors
     ///

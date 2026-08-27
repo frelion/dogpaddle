@@ -106,8 +106,9 @@ impl SequenceSourceOperation {
     ///
     /// A missing position emits the configured start value. Otherwise the last
     /// committed value is incremented. The operation binds its own position
-    /// cell through `access`; the caller retains transaction ownership and
-    /// decides whether to commit the new position and returned output together.
+    /// cell through `access`; the Station's read-write processing phase retains
+    /// transaction ownership and decides whether to commit the new position
+    /// and returned output together.
     ///
     /// # Errors
     ///

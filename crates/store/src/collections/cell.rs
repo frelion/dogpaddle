@@ -1,6 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::{DataAccess, DataHandle, StoreError, StoreValue, TransactionAccess};
+use crate::{
+    DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, StoreError, StoreValue,
+    TransactionAccess,
+};
 
 const CELL_KEY: &[u8] = &[];
 
@@ -16,6 +19,24 @@ pub struct Cell<T> {
 /// Transaction-bound access to a [`Cell`].
 pub struct CellAccess<'transaction, T> {
     data: DataAccess<'transaction>,
+    _value: PhantomData<fn() -> T>,
+}
+
+/// A read-only transaction-bound view of a [`Cell`].
+///
+/// This view can originate from either an active [`crate::Transaction`] or
+/// [`crate::ReadTransaction`]. It has no `set` or `clear` method and cannot
+/// outlive that transaction.
+///
+/// ```compile_fail
+/// use dogpaddle_store::CellReadAccess;
+///
+/// fn set(access: &mut CellReadAccess<'_, u64>) {
+///     access.set(&1).unwrap();
+/// }
+/// ```
+pub struct CellReadAccess<'transaction, T> {
+    data: ReadDataAccess<'transaction>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -42,19 +63,39 @@ impl<T: StoreValue> Cell<T> {
             _value: PhantomData,
         })
     }
+
+    /// Binds this cell through an active read-only transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<CellReadAccess<'transaction, T>, StoreError> {
+        Ok(CellReadAccess {
+            data: self.data.read(access)?,
+            _value: PhantomData,
+        })
+    }
 }
 
-impl<T: StoreValue> CellAccess<'_, T> {
+impl<'transaction, T: StoreValue> CellAccess<'transaction, T> {
+    pub(crate) fn into_read(self) -> CellReadAccess<'transaction, T> {
+        CellReadAccess {
+            data: self.data.into_read(),
+            _value: PhantomData,
+        }
+    }
+
     /// Reads the current value.
     ///
     /// # Errors
     ///
     /// Returns an error when storage access or value decoding fails.
     pub fn get(&self) -> Result<Option<T>, StoreError> {
-        let encoded = self.data.get(CELL_KEY)?;
-        self.data
-            .poison_on_error(encoded.map(T::decode_value).transpose())
-            .map_err(StoreError::from)
+        read_cell(self.data.as_read())
     }
 
     /// Replaces the current value.
@@ -78,6 +119,23 @@ impl<T: StoreValue> CellAccess<'_, T> {
     pub fn clear(&mut self) -> Result<bool, StoreError> {
         self.data.delete(CELL_KEY)
     }
+}
+
+impl<T: StoreValue> CellReadAccess<'_, T> {
+    /// Reads the current value visible to the originating transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access or value decoding fails.
+    pub fn get(&self) -> Result<Option<T>, StoreError> {
+        read_cell(&self.data)
+    }
+}
+
+fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, StoreError> {
+    let encoded = data.get(CELL_KEY)?;
+    data.poison_on_error(encoded.map(T::decode_value).transpose())
+        .map_err(StoreError::from)
 }
 
 impl<T> Clone for Cell<T> {

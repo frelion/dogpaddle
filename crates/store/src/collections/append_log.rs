@@ -1,7 +1,8 @@
 use std::{borrow::Cow, marker::PhantomData, num::NonZeroUsize, ops::Range};
 
 use crate::{
-    CodecError, DataAccess, DataHandle, ScanLimit, StoreError, StoreValue, TransactionAccess,
+    CodecError, DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanLimit,
+    StoreError, StoreValue, TransactionAccess, TransactionRef,
 };
 
 const METADATA_KEY: &[u8] = &[];
@@ -25,11 +26,31 @@ pub struct AppendLogAccess<'transaction, T> {
     _value: PhantomData<fn() -> T>,
 }
 
+/// A read-only transaction-bound view of an [`AppendLog`].
+///
+/// This view can originate from either an active [`crate::Transaction`] or
+/// [`crate::ReadTransaction`]. It exposes bounds and scans, but no append or
+/// truncation API, and cannot outlive the originating transaction.
+///
+/// ```compile_fail
+/// use dogpaddle_store::AppendLogReadAccess;
+///
+/// fn append(access: &mut AppendLogReadAccess<'_, Vec<u8>>) {
+///     access.append(&b"change".to_vec()).unwrap();
+/// }
+/// ```
+pub struct AppendLogReadAccess<'transaction, T> {
+    data: ReadDataAccess<'transaction>,
+    _value: PhantomData<fn() -> T>,
+}
+
 /// One encoded append-log entry borrowed for a scan callback.
 ///
 /// The entry cannot outlive its callback. Callers may project only the fields
-/// they need, decode the complete value, or forward the unchanged encoding to
-/// another [`AppendLog`] of the same value type.
+/// they need or decode the complete value. An entry borrowed from a writable
+/// transaction may also be forwarded unchanged to another [`AppendLog`] in
+/// that same write transaction; a read-snapshot entry carries no such
+/// authority.
 ///
 /// The entry is transaction-bound and cannot cross threads.
 ///
@@ -55,7 +76,7 @@ pub struct AppendLogAccess<'transaction, T> {
 pub struct AppendLogEntry<'entry, T> {
     offset: u64,
     encoded: Cow<'entry, [u8]>,
-    access: TransactionAccess<'entry>,
+    transaction: TransactionRef<'entry>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -91,9 +112,32 @@ impl<T: StoreValue> AppendLog<T> {
             _value: PhantomData,
         })
     }
+
+    /// Binds this log through an active read-only transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<AppendLogReadAccess<'transaction, T>, StoreError> {
+        Ok(AppendLogReadAccess {
+            data: self.data.read(access)?,
+            _value: PhantomData,
+        })
+    }
 }
 
-impl<T: StoreValue> AppendLogAccess<'_, T> {
+impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
+    pub(crate) fn into_read(self) -> AppendLogReadAccess<'transaction, T> {
+        AppendLogReadAccess {
+            data: self.data.into_read(),
+            _value: PhantomData,
+        }
+    }
+
     /// Returns the retained offset range `[head, tail)`.
     ///
     /// `tail` is also the offset that the next append will receive.
@@ -102,7 +146,7 @@ impl<T: StoreValue> AppendLogAccess<'_, T> {
     ///
     /// Returns an error when storage access fails or the log metadata is corrupt.
     pub fn bounds(&self) -> Result<Range<u64>, StoreError> {
-        self.read_bounds()
+        read_log_bounds(self.data.as_read())
     }
 
     /// Appends one value and returns its stable offset.
@@ -147,12 +191,8 @@ impl<T: StoreValue> AppendLogAccess<'_, T> {
     /// Returns an error when storage fails, the offset space is exhausted, or
     /// the persisted destination log is corrupt.
     pub fn append_entry(&mut self, entry: &AppendLogEntry<'_, T>) -> Result<u64, StoreError> {
-        if !self
-            .data
-            .transaction_access()
-            .same_transaction(entry.access)
-        {
-            entry.access.poison();
+        if !self.data.is_same_write_transaction(entry.transaction) {
+            entry.transaction.poison();
             return self.fail(StoreError::WrongTransaction);
         }
         let offsets =
@@ -182,81 +222,12 @@ impl<T: StoreValue> AppendLogAccess<'_, T> {
         &self,
         offset: u64,
         limit: ScanLimit,
-        mut visit: impl for<'entry> FnMut(AppendLogEntry<'entry, T>) -> Result<(), E>,
+        visit: impl for<'entry> FnMut(AppendLogEntry<'entry, T>) -> Result<(), E>,
     ) -> Result<AppendLogScan, E>
     where
         E: From<StoreError>,
     {
-        let bounds = self.read_bounds().map_err(E::from)?;
-        if offset < bounds.start || offset > bounds.end {
-            return self
-                .fail(StoreError::LogOffsetOutOfRange {
-                    offset,
-                    head: bounds.start,
-                    tail: bounds.end,
-                })
-                .map_err(E::from);
-        }
-        if offset == bounds.end {
-            return Ok(AppendLogScan {
-                next_offset: offset,
-                caught_up: true,
-            });
-        }
-
-        let remaining = bounds.end - offset;
-        let max_items = usize::try_from(remaining)
-            .unwrap_or(limit.max_items())
-            .min(limit.max_items());
-        let raw_limit = ScanLimit::new(max_items, limit.max_bytes()).map_err(E::from)?;
-        let raw = self
-            .data
-            .scan_borrowed_from(&encode_offset(offset), raw_limit)
-            .map_err(E::from)?;
-
-        let mut expected = offset;
-        for (key, _) in &raw.items {
-            if key.as_ref() != encode_offset(expected) {
-                return self
-                    .fail(StoreError::CorruptAppendLog {
-                        reason: "entry offsets are not contiguous",
-                    })
-                    .map_err(E::from);
-            }
-            expected += 1;
-        }
-        if !raw.limited && expected < bounds.end {
-            return self
-                .fail(StoreError::CorruptAppendLog {
-                    reason: "retained entries end before the recorded tail",
-                })
-                .map_err(E::from);
-        }
-        if raw.limited && expected == bounds.end {
-            return self
-                .fail(StoreError::CorruptAppendLog {
-                    reason: "an entry exists at or beyond the recorded tail",
-                })
-                .map_err(E::from);
-        }
-
-        let mut next_offset = offset;
-        for (_, encoded) in raw.items {
-            let entry = AppendLogEntry {
-                offset: next_offset,
-                encoded,
-                access: self.data.transaction_access(),
-                _value: PhantomData,
-            };
-            self.data.poison_on_error(visit(entry))?;
-            self.data.ensure_healthy().map_err(E::from)?;
-            next_offset += 1;
-        }
-
-        Ok(AppendLogScan {
-            next_offset,
-            caught_up: next_offset == bounds.end,
-        })
+        scan_log(self.data.as_read(), offset, limit, visit)
     }
 
     /// Deletes at most `max_items` retained entries below `target` and
@@ -340,19 +311,7 @@ impl<T: StoreValue> AppendLogAccess<'_, T> {
     }
 
     fn read_bounds(&self) -> Result<Range<u64>, StoreError> {
-        let Some(encoded) = self.data.get(METADATA_KEY)? else {
-            return if self.data.is_physically_empty()? {
-                Ok(0..0)
-            } else {
-                self.fail(StoreError::CorruptAppendLog {
-                    reason: "entries exist without log metadata",
-                })
-            };
-        };
-        let bounds = decode_bounds(&encoded).ok_or(StoreError::CorruptAppendLog {
-            reason: "invalid log metadata",
-        });
-        self.data.record_result(bounds)
+        read_log_bounds(self.data.as_read())
     }
 
     fn write_bounds(&mut self, bounds: Range<u64>) -> Result<(), StoreError> {
@@ -360,8 +319,156 @@ impl<T: StoreValue> AppendLogAccess<'_, T> {
     }
 
     fn fail<R>(&self, error: StoreError) -> Result<R, StoreError> {
-        self.data.record_result(Err(error))
+        fail_read(self.data.as_read(), error)
     }
+}
+
+impl<T: StoreValue> AppendLogReadAccess<'_, T> {
+    /// Returns the retained offset range `[head, tail)` visible to the
+    /// originating transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access fails or the log metadata is corrupt.
+    pub fn bounds(&self) -> Result<Range<u64>, StoreError> {
+        read_log_bounds(&self.data)
+    }
+
+    /// Visits one bounded batch beginning at `offset` through this read-only
+    /// view.
+    ///
+    /// Admission, callback, and progress semantics match
+    /// [`AppendLogAccess::scan`]. Entries retain their transaction origin: an
+    /// entry read through a write transaction can be forwarded within that
+    /// transaction, while a read-snapshot entry cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `offset` is outside the retained range, the first
+    /// entry exceeds the byte limit, storage access or the callback fails, or
+    /// the persisted log is corrupt.
+    pub fn scan<E>(
+        &self,
+        offset: u64,
+        limit: ScanLimit,
+        visit: impl for<'entry> FnMut(AppendLogEntry<'entry, T>) -> Result<(), E>,
+    ) -> Result<AppendLogScan, E>
+    where
+        E: From<StoreError>,
+    {
+        scan_log(&self.data, offset, limit, visit)
+    }
+}
+
+fn read_log_bounds(data: &ReadDataAccess<'_>) -> Result<Range<u64>, StoreError> {
+    let Some(encoded) = data.get(METADATA_KEY)? else {
+        return if data.is_physically_empty()? {
+            Ok(0..0)
+        } else {
+            fail_read(
+                data,
+                StoreError::CorruptAppendLog {
+                    reason: "entries exist without log metadata",
+                },
+            )
+        };
+    };
+    let bounds = decode_bounds(&encoded).ok_or(StoreError::CorruptAppendLog {
+        reason: "invalid log metadata",
+    });
+    data.record_result(bounds)
+}
+
+fn scan_log<T: StoreValue, E>(
+    data: &ReadDataAccess<'_>,
+    offset: u64,
+    limit: ScanLimit,
+    mut visit: impl for<'entry> FnMut(AppendLogEntry<'entry, T>) -> Result<(), E>,
+) -> Result<AppendLogScan, E>
+where
+    E: From<StoreError>,
+{
+    let bounds = read_log_bounds(data).map_err(E::from)?;
+    if offset < bounds.start || offset > bounds.end {
+        return fail_read(
+            data,
+            StoreError::LogOffsetOutOfRange {
+                offset,
+                head: bounds.start,
+                tail: bounds.end,
+            },
+        )
+        .map_err(E::from);
+    }
+    if offset == bounds.end {
+        return Ok(AppendLogScan {
+            next_offset: offset,
+            caught_up: true,
+        });
+    }
+
+    let remaining = bounds.end - offset;
+    let max_items = usize::try_from(remaining)
+        .unwrap_or(limit.max_items())
+        .min(limit.max_items());
+    let raw_limit = ScanLimit::new(max_items, limit.max_bytes()).map_err(E::from)?;
+    let raw = data
+        .scan_borrowed_from(&encode_offset(offset), raw_limit)
+        .map_err(E::from)?;
+
+    let mut expected = offset;
+    for (key, _) in &raw.items {
+        if key.as_ref() != encode_offset(expected) {
+            return fail_read(
+                data,
+                StoreError::CorruptAppendLog {
+                    reason: "entry offsets are not contiguous",
+                },
+            )
+            .map_err(E::from);
+        }
+        expected += 1;
+    }
+    if !raw.limited && expected < bounds.end {
+        return fail_read(
+            data,
+            StoreError::CorruptAppendLog {
+                reason: "retained entries end before the recorded tail",
+            },
+        )
+        .map_err(E::from);
+    }
+    if raw.limited && expected == bounds.end {
+        return fail_read(
+            data,
+            StoreError::CorruptAppendLog {
+                reason: "an entry exists at or beyond the recorded tail",
+            },
+        )
+        .map_err(E::from);
+    }
+
+    let mut next_offset = offset;
+    for (_, encoded) in raw.items {
+        let entry = AppendLogEntry {
+            offset: next_offset,
+            encoded,
+            transaction: data.transaction_ref(),
+            _value: PhantomData,
+        };
+        data.poison_on_error(visit(entry))?;
+        data.ensure_healthy().map_err(E::from)?;
+        next_offset += 1;
+    }
+
+    Ok(AppendLogScan {
+        next_offset,
+        caught_up: next_offset == bounds.end,
+    })
+}
+
+fn fail_read<R>(data: &ReadDataAccess<'_>, error: StoreError) -> Result<R, StoreError> {
+    data.record_result(Err(error))
 }
 
 impl<T> AppendLogEntry<'_, T> {
@@ -385,7 +492,7 @@ impl<T> AppendLogEntry<'_, T> {
         &self,
         project: impl for<'encoded> FnOnce(&'encoded [u8]) -> Result<R, CodecError>,
     ) -> Result<R, StoreError> {
-        self.access
+        self.transaction
             .poison_on_error(project(self.encoded.as_ref()))
             .map_err(StoreError::from)
     }
@@ -403,7 +510,7 @@ impl<T: StoreValue> AppendLogEntry<'_, T> {
     ///
     /// Returns an error when the encoded entry is not a valid `T`.
     pub fn decode_owned(&self) -> Result<T, StoreError> {
-        self.access
+        self.transaction
             .poison_on_error(T::decode_value(Cow::Borrowed(self.encoded.as_ref())))
             .map_err(StoreError::from)
     }

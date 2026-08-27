@@ -1,18 +1,16 @@
-use std::ops::{Range, RangeBounds};
-
 use super::{
-    AppendLog, AppendLogAccess, AppendLogEntry, AppendLogScan, Cell, CellAccess, OrderedMap,
-    OrderedMapAccess, OrderedMapEntry,
+    AppendLog, AppendLogReadAccess, Cell, CellReadAccess, OrderedMap, OrderedMapReadAccess,
 };
-use crate::{ScanDirection, ScanLimit, StoreError, StoreKey, StoreValue, TransactionAccess};
+use crate::{ReadTransactionAccess, StoreError, StoreKey, StoreValue, TransactionAccess};
 
 /// An opaque, owned attenuation of a typed collection capability.
 ///
-/// `ReadOnly<C>` consumes a collection handle or transaction access capability
-/// and never exposes `C` again. Its collection-specific APIs bind the same
-/// persistent object and return a read-only transaction access that forwards
-/// only read operations. Cloning a `ReadOnly<C>` clones only the attenuated
-/// capability.
+/// `ReadOnly<C>` consumes a typed collection handle and never exposes `C`
+/// again. Its collection-specific APIs bind the same persistent object and
+/// return the collection's corresponding `*ReadAccess`.
+/// It can bind either a write transaction through `access` or a genuine
+/// read-only snapshot through `read`. Cloning a `ReadOnly<C>` clones only the
+/// attenuated collection capability.
 ///
 /// This is a process-local capability, not a persistent data class. It does
 /// not implement [`crate::StoreData`] and cannot be created or opened by
@@ -195,19 +193,21 @@ impl<T: StoreValue> ReadOnly<Cell<T>> {
     pub fn access<'transaction>(
         &self,
         access: TransactionAccess<'transaction>,
-    ) -> Result<ReadOnly<CellAccess<'transaction, T>>, StoreError> {
-        self.inner.access(access).map(ReadOnly::new)
+    ) -> Result<CellReadAccess<'transaction, T>, StoreError> {
+        Ok(self.inner.access(access)?.into_read())
     }
-}
 
-impl<T: StoreValue> ReadOnly<CellAccess<'_, T>> {
-    /// Reads the current cell value.
+    /// Binds this cell through an active read-only transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when storage access or value decoding fails.
-    pub fn get(&self) -> Result<Option<T>, StoreError> {
-        self.inner.get()
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<CellReadAccess<'transaction, T>, StoreError> {
+        self.inner.read(access)
     }
 }
 
@@ -221,41 +221,21 @@ impl<K: StoreKey, V: StoreValue, SIZE> ReadOnly<OrderedMap<K, V, SIZE>> {
     pub fn access<'transaction>(
         &self,
         access: TransactionAccess<'transaction>,
-    ) -> Result<ReadOnly<OrderedMapAccess<'transaction, K, V>>, StoreError> {
-        self.inner.access(access).map(ReadOnly::new)
+    ) -> Result<OrderedMapReadAccess<'transaction, K, V>, StoreError> {
+        Ok(self.inner.access(access)?.into_read())
     }
-}
 
-impl<K: StoreKey, V: StoreValue> ReadOnly<OrderedMapAccess<'_, K, V>> {
-    /// Reads one map value.
+    /// Binds this map through an active read-only transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when key encoding, storage access, or value decoding fails.
-    pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
-        self.inner.get(key)
-    }
-
-    /// Visits one bounded page using [`OrderedMapAccess::scan`] semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when bound encoding, storage access, continuation or
-    /// entry decoding fails, the first matching entry exceeds the byte limit,
-    /// or the visitor fails.
-    pub fn scan<E>(
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
         &self,
-        range: impl RangeBounds<K>,
-        direction: ScanDirection,
-        resume_after: Option<&K>,
-        limit: ScanLimit,
-        visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
-    ) -> Result<Option<K>, E>
-    where
-        E: From<StoreError>,
-    {
-        self.inner
-            .scan(range, direction, resume_after, limit, visit)
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<OrderedMapReadAccess<'transaction, K, V>, StoreError> {
+        self.inner.read(access)
     }
 }
 
@@ -269,37 +249,20 @@ impl<T: StoreValue> ReadOnly<AppendLog<T>> {
     pub fn access<'transaction>(
         &self,
         access: TransactionAccess<'transaction>,
-    ) -> Result<ReadOnly<AppendLogAccess<'transaction, T>>, StoreError> {
-        self.inner.access(access).map(ReadOnly::new)
+    ) -> Result<AppendLogReadAccess<'transaction, T>, StoreError> {
+        Ok(self.inner.access(access)?.into_read())
     }
-}
 
-impl<T: StoreValue> ReadOnly<AppendLogAccess<'_, T>> {
-    /// Returns the retained offset range `[head, tail)`.
+    /// Binds this append log through an active read-only transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when storage access fails or the log metadata is corrupt.
-    pub fn bounds(&self) -> Result<Range<u64>, StoreError> {
-        self.inner.bounds()
-    }
-
-    /// Visits one bounded batch using [`AppendLogAccess::scan`] semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `offset` is outside the retained range, the first
-    /// entry exceeds the byte limit, storage access or the callback fails, or
-    /// the persisted log is corrupt.
-    pub fn scan<E>(
+    /// Returns an error when this data object belongs to another Store or the
+    /// underlying read transaction is already poisoned.
+    pub fn read<'transaction>(
         &self,
-        offset: u64,
-        limit: ScanLimit,
-        visit: impl for<'entry> FnMut(AppendLogEntry<'entry, T>) -> Result<(), E>,
-    ) -> Result<AppendLogScan, E>
-    where
-        E: From<StoreError>,
-    {
-        self.inner.scan(offset, limit, visit)
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<AppendLogReadAccess<'transaction, T>, StoreError> {
+        self.inner.read(access)
     }
 }

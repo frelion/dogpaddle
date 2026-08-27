@@ -16,8 +16,10 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 后保持不变；物理 Change 边界不能被算子当成业务事件。
 
 当前阶段尚未公开运行 trait 的批量处理方法，因此本 crate 不提前增加空的 `run` 或
-`process` 接口。Flow 已经装配持久化 output log 与只读 input capability；等 Change 真正进入
-Operation 调用协议时，再引入对 `dogpaddle-change` 的实际代码依赖。
+`process` 接口。Flow 已经装配持久化 output log 与只读 input capability；未来 Station
+先在只读事务中摄入上游日志并解码为不借用事务的内存数据，再在单独的读写事务中调用
+Operation。等 Change 真正进入 Operation 调用协议时，再确定批量方法并引入对
+`dogpaddle-change` 的实际代码依赖。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -105,12 +107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Operation 业务逻辑不接收、开始、提交或保存 Transaction。`Flow` 唯一持有不可克隆的
-`Transactions`；内部 `Station::work` 已固定为只在调用期间接收 `&mut Transactions`。work 的
-执行体尚未实现；实现后由 Station 开始并持有该次 Transaction，再只把不能提交的
-`TransactionAccess` 交给 Operation。Operation 用自己持有的 `Cell` 或 `OrderedMap` 创建具体
-事务级 Access。这样 Flow 不知道算子的数据结构，Station 不会跨工作保留事务启动能力，Operation
-也不能控制事务边界，而状态、输入进度和输出可由 Station 在同一事务中原子提交。
+Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow 长期持有事务启动能力；
+Station 的 intake 阶段只用只读事务读取上游日志，不推进 cursor，也不调用 Operation。进入
+process 阶段后，Station 开始并持有读写 Transaction，只把不能提交的
+`TransactionAccess` 交给 Operation。Operation 可以用自己持有的 `Cell` 或
+`OrderedMap` 直接读写持久化状态；Station 则在同一读写事务中推进输入 cursor 并发布
+output。因此 Flow 不需要知道算子的数据结构，Operation 也不能控制事务边界；Operation
+状态、输入进度和输出仍由 Station 原子提交。具体的 Change 批量方法和返回类型尚未确定。
 
 ## 扩展约束
 

@@ -51,28 +51,40 @@ build/open 通路负责完整资源名，并通过 Store 将每项声明创建�
 物理布局。
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Station state map 显式声明为
-`Small`。Flow state map 保留生命周期状态，Station state map 保存运行期 Station 状态，并将在运行
-协议中保存各 input 自己的 next-unread offset。output 是 `AppendLog<Vec<u8>>`；每个 value 将保存一个内嵌 Schema
-的完整 Change IPC Stream，不另建 Schema Cell。端口 Schema 一致性属于 Flow/Station 契约，不
-依赖 Change codec 之外的 Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map
-和日志，不能动态新增数据空间。此后 Store 被转换为唯一的事务启动能力并只由 Flow 长期持有；
-Station 不保存或复制该能力，拓扑和资源目录也没有修改入口。内部 `Station::work` 接收 Flow 临时
-借出的 `&mut Transactions`，借用只覆盖这一次调用。
+`Small`。Flow state map 保留生命周期状态；Station state map 保存运行期 Station 状态，并为每个
+input 保存 next-unread `(AppendLog offset, Change row_index)`。`build()` 在发布 manifest 的同一
+事务中把全部 input cursor 显式初始化为 `(0, 0)`，不存在“缺失时从当前 log head 开始”的隐式
+恢复。output 是 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，
+不另建 Schema Cell。端口 Schema 一致性属于 Flow/Station 契约，不依赖 Change codec 之外的
+Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增数据
+空间。
+
+Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
+显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
+克隆但可安全共享，并且只能开启 RO snapshot。Station 不长期保存任何事务启动能力：内部
+`Station::intake` 只在调用期间借用 `ReadTransactions`，`Station::process` 将只在调用期间借用
+`&mut Transactions`；后者无法消费 writer 来 split 出 owned reader。拓扑和资源目录都没有运行期
+修改入口。
 
 资源创建和 Station 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
 output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
 `ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
 Station 不知道上游 Station，只知道自己的有序 inputs；它拥有自己的 state 与完整可选 output。
-`work` 的协议已经固定为接收 Flow 临时注入的 `&mut Transactions`，并返回 `Idle` 或
-`Progressed`；具体实现仍为 `todo!()`。实现后由 Station 开始并提交一个事务，在同一边界内读取
-input、推进 state、更新 Operation 状态并发布 output；Operation 仍只接收不能提交的
-`TransactionAccess`。没有 output 的 Sink 使用 `None`，不能被其他 Station 作为 source。
+`intake` 通过 RO snapshot 按 durable cursor 幂等准备输入，不推进 cursor，也不调用 Operation；
+后续 `process` 才在写事务中处理已准备的输入。重开 Flow 时始终根据 durable cursor 恢复。
+没有 output 的 Sink 使用 `None`，不能被其他 Station 作为 source。
+
+`process(&mut Transactions)` 及其 `Idle / Progressed` 结果类型已经留下明确位置，但方法体仍为
+`todo!()`。Station–Operation 的 Change 批处理、partial consumption、输出和原子提交协议尚未
+确定，因此当前代码不会伪造调用或提前承诺其返回类型。Operation 以后仍只会接收不能提交的
+`TransactionAccess`，不会读取 AppendLog、cursor 或 Station 运行元数据。
 
 每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
 不是稳定 event ID。未来 Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件
 序列必须逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；若多输入
 Operation 依赖跨端口交错顺序，运行层必须另行定义并持久化 ingress 顺序，不能从 source 声明
-顺序推断事件发生顺序。
+顺序推断事件发生顺序。cursor 表示下一条未消费事件；entry 的最后一行消费完成后必须规范化为
+`(offset + 1, 0)`，不能持久化等于 Change 行数的 `row_index`。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
 `IncompleteBuild`；
@@ -88,12 +100,15 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 - Flow manifest：`flow/definition`
 - Flow 状态：`flow/state`
 - Station 状态：`station/{index:08x}/state`
+- Station input cursor key：`input/{input_index:08x}/cursor`
 - Station 输出：`station/{index:08x}/output`（仅限声明产生输出的 Operation）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - Count 状态：`station/{index:08x}/operation/count`
 
-`index` 是 Station 声明顺序。当前仍是开发期 v1，编码、tag 或资源布局可以破坏性调整，但每次
-调整必须同步更新黄金字节、布局和 reopen 测试，不保留旧格式兼容层。
+`index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。cursor
+value 固定为 16 字节：big-endian `u64 offset` 后接 big-endian `u64 row_index`。当前仍是开发期
+v1，编码、tag 或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局和 reopen
+测试，不保留旧格式兼容层。
 
 ## 源码边界
 
@@ -101,10 +116,12 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 副作用的图校验、稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition
 中的连接关系，不再拥有独立构建类型。`open/` 实现 `FlowFactory::open` 的两阶段读取、资源打开
 和重新物化。`build/` 与 `open/` 都按 Definition 声明的逻辑数据名通用创建或打开类型化实例，
-再让 Definition 物化具体 Operation；二者都不枚举具体算子。`flow/` 只保存 build/open 返回的
-运行态 `Flow`、生命周期状态、全部 Station 与唯一的事务启动能力，不创建或打开 Store 资源。
-`station/` 只保存 state、装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不长期持有
-`Transactions`，也不接收 Store，不知道 Station ID、上游 Station、资源名或底层物理布局。私有
+再让 Definition 物化具体 Operation；二者都不枚举具体算子。`flow/mod.rs` 只声明模块并导出
+`Flow`，`flow/runtime.rs` 保存 build/open 返回的运行态对象、生命周期状态、全部 Station 与分离的
+读写事务启动能力，不创建或打开 Store 资源。`station/mod.rs` 同样只声明边界；
+`station/runtime.rs` 保存 Station 装配与 `process` 边界，`station/input.rs` 独立拥有 cursor 和
+`intake`，`station/protocol.rs` 只拥有 outcome/error。Station 不长期持有事务启动
+能力，也不接收 Store，不知道 Station ID、上游 Station、资源名或底层物理布局。私有
 `assembly.rs` 只承接 build/open 共用的 source ID 解析和最终 Station 装配，不公开新的领域类型。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
 使用单一 `correctness` target 验证 crate 的公共行为。dogpaddle-flow 是 Operation 与 Store 的
@@ -114,11 +131,12 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 
 ## 当前边界
 
-本阶段完成定义、持久化 `build/open`、Flow 对唯一事务启动能力的所有权，以及 Station 的 state、
-只读 inputs 和可选 output 装配。内部 `Station::work(&mut self, &mut Transactions)` 及其
-`Idle / Progressed` 返回协议已经固定，但方法体仍为 `todo!()`；尚未实现 `Flow::start`、
-`Flow::advance`、Station state map 的 offset 键协议、Change 解码与 Operation 批量接口、背压、
-中断或运行恢复。
+本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Station 的
+state、只读 inputs、可选 output 和稳定 cursor。`intake` 已能通过 RO snapshot 幂等准备输入；
+`process(&mut Transactions)` 及其
+`Idle / Progressed` 位置已经固定，但方法体仍为 `todo!()`。尚未实现 `Flow::start`、
+`Flow::advance`、Station–Operation 批处理与 partial-consumption 提交协议、背压、中断、GC 或
+完整运行恢复。
 `SequenceSource` 只是第一个真实零输入 Definition，用于形成可构建的
 `SequenceSource → Count` DAG，并不代表调度器已经存在。
 
