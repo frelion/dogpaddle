@@ -30,7 +30,8 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Stage 预先声明通用 state map。
 - **Stage 数据通道装配**：每个会产生输出的 Stage 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Stage 不长期持有
-  事务启动能力；它由 Flow 唯一拥有，并将在未来每次 work 时临时注入。
+  事务启动能力；它由 Flow 唯一拥有，内部 `Stage::work` 已固定为在调用期间临时接收
+  `&mut Transactions`。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
   `OrderedMap<K, V, SIZE>`；有界 map scan 可完整解码，也可只投影编码中的所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
@@ -61,8 +62,9 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 当前仓库完成了 `FlowFactory` 的持久化定义、构建和重新打开，以及运行态 Flow 的 Stage
 output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>`
-持久化验证；尚未实现 `run`、Flow 到 Stage 的临时事务能力注入、Stage 调度、输入 offset 协议、
-背压、中断续跑或输出提交，因此还不是可执行的流引擎。
+持久化验证，并固定了内部 `Stage::work` 的事务能力注入与 `Idle / Progressed` 返回协议；该方法
+当前仍为 `todo!()`。尚未实现 `run`、Stage 调度、输入 offset 协议、背压、中断续跑或输出提交，
+因此还不是可执行的流引擎。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

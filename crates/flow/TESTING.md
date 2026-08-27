@@ -54,8 +54,10 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
 - **运行期装配**：唯一事务启动 capability 归 Flow 长期持有，Stage 只保存自己的 state、完整可选
   output 与只读 inputs，不长期持有 `Transactions`。私有测试从 Flow 一侧临时开始事务并验证同一
   `TransactionAccess` 可以访问 Stage output，而下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察
-  同一日志。source 即使在 target 之后声明，build 和 reopen 仍按 source ID 正确注入。当前没有
-  Operation 统一执行协议，因此不伪造 `Stage::work` 或提交行为测试。
+  同一日志。source 即使在 target 之后声明，build 和 reopen 仍按 source ID 正确注入。私有测试
+  只编译校验 `Stage::work(&mut self, &mut Transactions) -> Result<WorkOutcome, StageError>` 及
+  `Idle / Progressed` 两个结果；Operation 统一执行协议尚未定义，因此不调用 `todo!()` 方法体，
+  也不伪造提交行为测试。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用
   `FlowFactory::open` 不得 panic，且必须在 Definition 解码阶段失败，不能由后续缺失资源错误

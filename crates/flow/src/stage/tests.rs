@@ -9,7 +9,7 @@ use dogpaddle_store::{AppendLog, Cell, OrderedMap, ReadOnly, Small, Store, Trans
 
 use crate::{build::FlowFactory, flow::Flow};
 
-use super::{Stage, StageParts};
+use super::{Stage, StageError, StageParts, WorkOutcome};
 
 struct StageFixture {
     transactions: Transactions,
@@ -18,6 +18,12 @@ struct StageFixture {
     source_definition: SequenceSourceDefinition,
     count_definition: CountDefinition,
     _root: tempfile::TempDir,
+}
+
+#[test]
+fn work_protocol_borrows_the_flow_transaction_capability_and_has_two_outcomes() {
+    let _: fn(&mut Stage, &mut Transactions) -> Result<WorkOutcome, StageError> = Stage::work;
+    assert_ne!(WorkOutcome::Idle, WorkOutcome::Progressed);
 }
 
 #[test]

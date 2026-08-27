@@ -1,5 +1,21 @@
 use dogpaddle_operation::operation::Operation;
-use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small};
+use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small, Transactions};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "stage work outcomes are returned by the next run phase"
+    )
+)]
+pub(crate) enum WorkOutcome {
+    Idle,
+    Progressed,
+}
+
+#[derive(Debug)]
+pub(crate) enum StageError {}
 
 pub(crate) struct StageParts {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
@@ -19,6 +35,20 @@ pub(crate) struct Stage {
     operation: Box<dyn Operation>,
     inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
     output: Option<AppendLog<Vec<u8>>>,
+}
+
+impl Stage {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Flow scheduler is not implemented yet")
+    )]
+    pub(crate) fn work(
+        &mut self,
+        transactions: &mut Transactions,
+    ) -> Result<WorkOutcome, StageError> {
+        let _ = transactions;
+        todo!("stage work is not implemented yet")
+    }
 }
 
 impl StageParts {
