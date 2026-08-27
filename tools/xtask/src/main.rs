@@ -6,6 +6,8 @@ use std::{
     process::{Command, ExitCode},
 };
 
+mod change_store_reference;
+
 const BENCH_SMOKE: &[BenchSpec] = &[
     BenchSpec::new(
         "dogpaddle-change",
@@ -126,6 +128,7 @@ const BENCH_SMOKE: &[BenchSpec] = &[
             ("DOGPADDLE_CHANGE_STORE_BENCH_PROFILE", "smoke"),
             ("DOGPADDLE_CHANGE_STORE_BENCH_ROWS_PER_CHANGE", "1"),
             ("DOGPADDLE_CHANGE_STORE_BENCH_CHANGES_PER_TX", "1"),
+            ("DOGPADDLE_CHANGE_STORE_BENCH_TRANSACTIONS_PER_SAMPLE", "2"),
             ("DOGPADDLE_CHANGE_STORE_BENCH_PAYLOAD_BYTES", "1"),
             ("DOGPADDLE_CHANGE_STORE_BENCH_SAMPLES", "1"),
             ("DOGPADDLE_CHANGE_STORE_BENCH_WARMUPS", "1"),
@@ -147,6 +150,16 @@ const BENCH_SMOKE: &[BenchSpec] = &[
             ("DOGPADDLE_CHANGE_STORE_ENDURANCE_PAYLOAD_BYTES", "1"),
             ("DOGPADDLE_CHANGE_STORE_ENDURANCE_RETAINED_BYTES", "65536"),
             ("DOGPADDLE_CHANGE_STORE_ENDURANCE_TRUNCATE_ITEMS", "1"),
+            ("DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_ITEMS", "1"),
+            (
+                "DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_BYTES",
+                "1048576",
+            ),
+            (
+                "DOGPADDLE_CHANGE_STORE_ENDURANCE_REOPEN_INTERVAL_CYCLES",
+                "1",
+            ),
+            ("DOGPADDLE_CHANGE_STORE_ENDURANCE_WORKLOAD_MODE", "all"),
             (
                 "DOGPADDLE_CHANGE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES",
                 "67108864",
@@ -191,11 +204,15 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let task = env::args().nth(1).ok_or_else(usage)?;
+    let mut arguments = env::args().skip(1);
+    let task = arguments.next().ok_or_else(usage)?;
     let workspace = workspace_root();
     match task.as_str() {
         "check" => check(&workspace),
         "bench-smoke" => bench_smoke(&workspace),
+        "change-store-reference" => {
+            change_store_reference::run(&workspace, arguments.collect::<Vec<_>>())
+        }
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             Ok(())
@@ -205,7 +222,10 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <check|bench-smoke>".to_owned()
+    "usage: cargo xtask <check|bench-smoke|change-store-reference>\n\
+     change-store-reference --store-dir <absolute-path> --output-dir <new-absolute-path> \
+     [--target normal|endurance] [--runs N]"
+        .to_owned()
 }
 
 fn workspace_root() -> PathBuf {

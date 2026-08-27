@@ -1,5 +1,7 @@
 #[path = "correctness/entry.rs"]
 mod entry;
+#[path = "correctness/persona.rs"]
+mod persona;
 #[path = "correctness/scan.rs"]
 mod scan;
 #[path = "correctness/sequence.rs"]

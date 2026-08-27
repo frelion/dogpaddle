@@ -101,21 +101,25 @@ decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一�
 
 ## Change 数据规格
 
-Change 正确性与性能沿用以下代表性形状：
+Change 正确性与性能沿用以下代表性形状。`logical / physical` 是顶层业务字段数与加入固定
+`$dogpaddle.diff` 后的 Stream 顶层字段数；嵌套 persona 还必须单独报告 leaf fields：
 
-| 数据形状 | 用途 |
-| --- | --- |
-| `diff_only` | 零 logical column，观察最小 Stream 固定成本 |
-| `narrow_fixed` | 常见固定宽度列与 rows/s |
-| `wide_projectable` | `id + Binary payload + tail`，观察投影选择率 |
-| `mixed_nullable` | validity、bitmap、整数、浮点、Utf8 与 Binary |
-| `nested` | List/Struct 递归布局和完整子树投影 |
-| `sliced` | 非零 Arrow offset、共享 buffer 和编码 |
-| `heterogeneous_sequence` | 同一 AppendLog 内不同 Schema 与稳定重批 |
+| 数据形状 | logical / physical | 用途 |
+| --- | ---: | --- |
+| `diff_only_control` | 0 / 1 | 最小完整 Stream 固定成本 |
+| `layout_v1_16` | 16 / 17 | v1 全部物理布局与 nullable 边界 |
+| `fixed_event_8` | 8 / 9 | 常见固定宽度事件 |
+| `mixed_event_16` | 16 / 17 | 数值、Boolean、Utf8、Binary 与 nullable 的主 anchor |
+| `wide_numeric_64` | 64 / 65 | 多列 Schema、metadata 与 buffer 遍历 |
+| `blob_event_4` | 4 / 5 | 128 B、1 KiB、8 KiB payload 轴 |
+| `nested_event_8` | 8 / 9 | List/Struct 递归布局和完整子树投影 |
+| `sliced_mixed_16` | 16 / 17 | 非零 Arrow offset、共享 buffer 和编码 |
+| `heterogeneous` | 多种 | 同一 AppendLog 内不同 Schema、entry 大小与稳定重批 |
 
 重点行数覆盖 1、7/8/9、63/64/65 等 bitmap 和对齐边界。性能默认行数锚点为 1、64、1024、
 16384，宽 payload 锚点为 128 B、1 KiB、8 KiB；不执行所有维度的完整笛卡尔积，而是固定
-代表性基线后逐轴扫描。
+代表性基线后逐轴扫描。组合层的完整 persona、有效 diff model、correctness 与 endurance 契约见
+[`integration-tests/change-store/TESTING.md`](./integration-tests/change-store/TESTING.md)。
 
 ## 性能统一协议
 
@@ -193,6 +197,20 @@ cargo xtask bench-smoke
 ```
 
 正式性能结果只由固定 reference runner 产生。
+
+Change + AppendLog 的常规 reference 默认运行 5 个独立进程，endurance 默认运行 1 个；二者都要求
+显式绝对 Store 路径和全新输出目录，并保存每次 stdout/stderr：
+
+```bash
+cargo xtask change-store-reference \
+  --store-dir /absolute/path/on/reference-filesystem \
+  --output-dir /absolute/new/result-directory
+
+cargo xtask change-store-reference \
+  --target endurance \
+  --store-dir /absolute/path/on/reference-filesystem \
+  --output-dir /absolute/new/endurance-result-directory
+```
 
 ### 全工作区静态检查
 

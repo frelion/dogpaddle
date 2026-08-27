@@ -41,9 +41,9 @@ pub fn wide_schema() -> SchemaRef {
 
 /// Builds a deterministic wide Change with fixed-size payloads.
 ///
-/// Differences alternate between insertion and retraction. IDs and tail
-/// values encode the caller-provided start so checksums remain sensitive to
-/// order and loss.
+/// Every row inserts a distinct record, so the fixture is a valid stream from
+/// an empty relation. IDs and tail values encode the caller-provided start so
+/// checksums remain sensitive to order and loss.
 ///
 /// # Panics
 ///
@@ -63,7 +63,7 @@ pub fn wide_change(start: u64, rows: usize, payload_bytes: usize) -> Change {
         let id = start.checked_add(index).expect("fixture id fits u64");
         ids.push(id);
         tails.push(id.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15);
-        diffs.push(if index.is_multiple_of(3) { -1 } else { 1 });
+        diffs.push(1);
 
         let mut payload = vec![0_u8; payload_bytes];
         for (byte_index, byte) in payload.iter_mut().enumerate() {
