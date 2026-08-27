@@ -2,27 +2,27 @@ use dogpaddle_operation::OperationDefinition;
 
 #[derive(Debug)]
 pub(crate) struct FlowDefinition {
-    pub(super) stages: Vec<StageDefinition>,
+    pub(super) stations: Vec<StationDefinition>,
 }
 
 #[derive(Debug)]
-pub(crate) struct StageDefinition {
+pub(crate) struct StationDefinition {
     pub(super) id: String,
     pub(super) operation: Box<dyn OperationDefinition>,
     pub(super) sources: Vec<String>,
 }
 
 impl FlowDefinition {
-    pub(super) const fn new(stages: Vec<StageDefinition>) -> Self {
-        Self { stages }
+    pub(super) const fn new(stations: Vec<StationDefinition>) -> Self {
+        Self { stations }
     }
 
-    pub(crate) fn stages(&self) -> &[StageDefinition] {
-        &self.stages
+    pub(crate) fn stations(&self) -> &[StationDefinition] {
+        &self.stations
     }
 }
 
-impl StageDefinition {
+impl StationDefinition {
     pub(super) fn new(id: String, operation: Box<dyn OperationDefinition>) -> Self {
         Self {
             id,

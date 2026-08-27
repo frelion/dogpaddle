@@ -6,7 +6,7 @@ use dogpaddle_store::{Cell, Store};
 
 pub(super) fn build_source_and_read_definition(path: &Path) -> Vec<u8> {
     let mut builder = FlowFactory::new(path);
-    builder.stage("source", SequenceSourceDefinition::new(0));
+    builder.station("source", SequenceSourceDefinition::new(0));
     drop(builder.build().unwrap());
 
     read_published_definition(path)

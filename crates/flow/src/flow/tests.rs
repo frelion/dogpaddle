@@ -8,7 +8,7 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    builder.stage("source", SequenceSourceDefinition::new(0));
+    builder.station("source", SequenceSourceDefinition::new(0));
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
@@ -26,7 +26,7 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
     drop(transactions);
 
     let mut flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(flow.stages.len(), 1);
+    assert_eq!(flow.stations.len(), 1);
     let transaction = flow.transactions.begin().unwrap();
     assert_eq!(
         flow.state

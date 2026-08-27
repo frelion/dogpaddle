@@ -4,15 +4,15 @@ use dogpaddle_operation::{DataInstances, OperationDefinition};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
 use crate::{
-    assembly::assemble_stages,
+    assembly::assemble_stations,
     build::{FlowDefinition, FlowFactory, codec},
     error::FlowError,
     flow::Flow,
-    stage::StageParts,
+    station::StationParts,
 };
 
 impl FlowFactory {
-    /// Opens a completely built Flow and reassembles all runtime stages.
+    /// Opens a completely built Flow and reassembles all runtime stations.
     ///
     /// The definition is read first, then the Store is reopened so every
     /// declared data object can be opened before the Store is frozen into
@@ -23,7 +23,7 @@ impl FlowFactory {
     ///
     /// Returns [`FlowError::IncompleteBuild`] when no complete definition was
     /// published, or another [`FlowError`] when the Store, definition, topology,
-    /// or required stage resources are invalid.
+    /// or required station resources are invalid.
     pub fn open(path: impl AsRef<Path>) -> Result<Flow, FlowError> {
         let path = path.as_ref().to_path_buf();
         let definition_bytes = read_published_definition(&path)?;
@@ -35,7 +35,7 @@ impl FlowFactory {
             &store,
             codec::FLOW_STATE_DATA_NAME,
         )?;
-        let stage_parts = open_stage_parts(&store, &definition)?;
+        let station_parts = open_station_parts(&store, &definition)?;
         let mut transactions = store.into_transactions();
         let observed_definition = {
             let transaction = transactions.begin()?;
@@ -45,13 +45,13 @@ impl FlowFactory {
         if observed_definition != definition_bytes {
             return Err(FlowError::DefinitionChangedDuringOpen);
         }
-        let stages = assemble_stages(&definition, stage_parts);
+        let stations = assemble_stations(&definition, station_parts);
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
-            stages,
+            stations,
             transactions,
         ))
     }
@@ -74,30 +74,30 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
     }
 }
 
-fn open_stage_parts(
+fn open_station_parts(
     store: &Store,
     definition: &FlowDefinition,
-) -> Result<Vec<StageParts>, FlowError> {
+) -> Result<Vec<StationParts>, FlowError> {
     definition
-        .stages()
+        .stations()
         .iter()
         .enumerate()
-        .map(|(index, stage)| open_stage_part(store, index, stage.operation()))
+        .map(|(index, station)| open_station_part(store, index, station.operation()))
         .collect()
 }
 
-fn open_stage_part(
+fn open_station_part(
     store: &Store,
     index: usize,
     definition: &dyn OperationDefinition,
-) -> Result<StageParts, FlowError> {
+) -> Result<StationParts, FlowError> {
     let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
         store,
-        &codec::stage_state_name(index),
+        &codec::station_state_name(index),
     )?;
     let mut data = DataInstances::new();
     for declaration in definition.data() {
-        let physical_name = codec::operation_data_name(index, declaration.name());
+        let physical_name = codec::station_operation_data_name(index, declaration.name());
         let instance = require_resource(&physical_name, declaration.open(store, &physical_name))?;
         data.insert(instance)?;
     }
@@ -106,11 +106,11 @@ fn open_stage_part(
     let output = definition
         .produces_output()
         .then(|| {
-            let name = codec::stage_output_name(index);
+            let name = codec::station_output_name(index);
             open_required_data::<AppendLog<Vec<u8>>>(store, &name)
         })
         .transpose()?;
-    Ok(StageParts::new(state, operation, output))
+    Ok(StationParts::new(state, operation, output))
 }
 
 fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {

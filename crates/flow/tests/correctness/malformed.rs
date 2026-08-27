@@ -51,9 +51,9 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     assert!(matches!(
         error,
         FlowError::Definition(FlowDefinitionError::UnknownSource {
-            stage,
+            station,
             source_id,
-        }) if stage == "count" && source_id == "ghost!"
+        }) if station == "count" && source_id == "ghost!"
     ));
 
     let mut unknown_operation = original.clone();

@@ -1,7 +1,7 @@
 use dogpaddle_store::{Cell, OrderedMap, Small, Store, StoreData, StoreValue, Transactions};
 use tempfile::TempDir;
 
-use crate::{STAGE_KEYS, VALUE_BYTES, support::sample_dir};
+use crate::{STATION_KEYS, VALUE_BYTES, support::sample_dir};
 
 pub(super) type ByteMap<SIZE> = OrderedMap<Vec<u8>, Vec<u8>, SIZE>;
 pub(super) type TypedMap<SIZE> = OrderedMap<u64, Vec<u8>, SIZE>;
@@ -13,7 +13,7 @@ pub(super) struct Fixture<SIZE> {
     _root: TempDir,
 }
 
-pub(super) struct StageFixture<SIZE> {
+pub(super) struct StationFixture<SIZE> {
     pub(super) transactions: Transactions,
     pub(super) cursor: Cell<u64>,
     pub(super) map: TypedMap<SIZE>,
@@ -145,19 +145,19 @@ where
     }
 }
 
-impl<SIZE> StageFixture<SIZE>
+impl<SIZE> StationFixture<SIZE>
 where
     TypedMap<SIZE>: StoreData,
 {
     pub(super) fn populated() -> Self {
         let root = sample_dir("ordered-map-multi-collection");
-        let mut store = Store::create(root.path().join("store")).expect("create stage store");
+        let mut store = Store::create(root.path().join("store")).expect("create station store");
         let cursor = store
             .create_data::<Cell<u64>>("cursor")
-            .expect("create stage cursor");
+            .expect("create station cursor");
         let map = store
             .create_data::<TypedMap<SIZE>>("map")
-            .expect("create stage map");
+            .expect("create station map");
         let mut fixture = Self {
             transactions: store.into_transactions(),
             cursor,
@@ -167,24 +167,24 @@ where
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin stage seed transaction");
+            .expect("begin station seed transaction");
         fixture
             .cursor
             .access(transaction.access())
-            .expect("access stage cursor")
+            .expect("access station cursor")
             .set(&0)
-            .expect("seed stage cursor");
+            .expect("seed station cursor");
         {
             let mut map = fixture
                 .map
                 .access(transaction.access())
-                .expect("access stage map");
+                .expect("access station map");
             let value = vec![0x5a; VALUE_BYTES];
-            for key in 0..STAGE_KEYS {
-                map.put(&(key as u64), &value).expect("seed stage map");
+            for key in 0..STATION_KEYS {
+                map.put(&(key as u64), &value).expect("seed station map");
             }
         }
-        transaction.commit().expect("commit stage seed");
+        transaction.commit().expect("commit station seed");
         fixture
     }
 }

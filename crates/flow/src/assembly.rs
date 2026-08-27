@@ -4,27 +4,30 @@ use dogpaddle_store::ReadOnly;
 
 use crate::{
     build::FlowDefinition,
-    stage::{Stage, StageParts},
+    station::{Station, StationParts},
 };
 
-pub(crate) fn assemble_stages(definition: &FlowDefinition, parts: Vec<StageParts>) -> Vec<Stage> {
+pub(crate) fn assemble_stations(
+    definition: &FlowDefinition,
+    parts: Vec<StationParts>,
+) -> Vec<Station> {
     let indices = definition
-        .stages()
+        .stations()
         .iter()
         .enumerate()
-        .map(|(index, stage)| (stage.id(), index))
+        .map(|(index, station)| (station.id(), index))
         .collect::<HashMap<_, _>>();
     let inputs = definition
-        .stages()
+        .stations()
         .iter()
-        .map(|stage| {
-            stage
+        .map(|station| {
+            station
                 .sources()
                 .map(|source| {
                     let source_index = indices[source];
                     let output = parts[source_index]
                         .output()
-                        .expect("validated source stage must produce output");
+                        .expect("validated source station must produce output");
                     ReadOnly::new(output.clone())
                 })
                 .collect::<Vec<_>>()

@@ -3,36 +3,42 @@ use std::path::{Path, PathBuf};
 use dogpaddle_store::{OrderedMap, Small, Transactions};
 
 use crate::{
-    build::{FlowDefinition, StageDefinition},
-    stage::Stage,
+    build::{FlowDefinition, StationDefinition},
+    station::Station,
 };
 
 /// The runtime handle for a built or reopened persistent Flow.
 ///
 /// A Flow uniquely owns its Store transaction capability. During future work,
-/// it will temporarily lend `&mut Transactions` to one runtime stage. The stage
-/// starts and commits that work transaction during the call, but cannot retain
-/// the transaction-start capability across calls. The definition and data
-/// object set were frozen by a successful build.
+/// it will temporarily lend `&mut Transactions` to one runtime station. The
+/// station starts and commits that work transaction during the call, but cannot
+/// retain the transaction-start capability across calls. The definition and
+/// data object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
     definition: FlowDefinition,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "flow state is consumed by the next run phase")
+        expect(
+            dead_code,
+            reason = "flow state is consumed by the future scheduling phase"
+        )
     )]
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "stage instances are consumed by the next run phase"
+            reason = "station instances are consumed by the future scheduling phase"
         )
     )]
-    stages: Vec<Stage>,
+    stations: Vec<Station>,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "transactions are consumed by the next run phase")
+        expect(
+            dead_code,
+            reason = "transactions are consumed by the future scheduling phase"
+        )
     )]
     transactions: Transactions,
 }
@@ -42,14 +48,14 @@ impl Flow {
         path: PathBuf,
         definition: FlowDefinition,
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
-        stages: Vec<Stage>,
+        stations: Vec<Station>,
         transactions: Transactions,
     ) -> Self {
         Self {
             path,
             definition,
             state,
-            stages,
+            stations,
             transactions,
         }
     }
@@ -60,21 +66,21 @@ impl Flow {
         &self.path
     }
 
-    /// Returns the number of stages in declaration order.
+    /// Returns the number of stations in declaration order.
     #[must_use]
-    pub fn stage_count(&self) -> usize {
-        self.definition.stages().len()
+    pub fn station_count(&self) -> usize {
+        self.definition.stations().len()
     }
 
-    /// Iterates over stable stage IDs in declaration order.
+    /// Iterates over stable station IDs in declaration order.
     #[must_use]
-    pub fn stage_ids(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.definition.stages().iter().map(StageDefinition::id)
+    pub fn station_ids(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.definition.stations().iter().map(StationDefinition::id)
     }
 
     #[cfg(test)]
-    pub(crate) fn into_runtime_parts(self) -> (Transactions, Vec<Stage>) {
-        (self.transactions, self.stages)
+    pub(crate) fn into_runtime_parts(self) -> (Transactions, Vec<Station>) {
+        (self.transactions, self.stations)
     }
 }
 

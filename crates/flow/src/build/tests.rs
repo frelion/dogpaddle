@@ -4,9 +4,9 @@ use dogpaddle_operation::{
 };
 
 use super::{
-    FlowDefinitionError, FlowFactory, InvalidStageIdReason, StageRef, TopologyError,
+    FlowDefinitionError, FlowFactory, InvalidStationIdReason, StationRef, TopologyError,
     codec::{CHECKSUM_LENGTH, crc32, decode, encode},
-    definition::{FlowDefinition, StageDefinition},
+    definition::{FlowDefinition, StationDefinition},
     validate::{validate_acyclic, validate_connections},
 };
 
@@ -22,11 +22,11 @@ fn factory() -> FlowFactory {
     FlowFactory::new("")
 }
 
-fn find_stage<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StageDefinition {
+fn find_station<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StationDefinition {
     definition
-        .stages
+        .stations
         .iter()
-        .find(|stage| stage.id == id)
+        .find(|station| station.id == id)
         .unwrap()
 }
 
@@ -36,9 +36,9 @@ where
 {
     let mut builder = factory();
     let sources = (0..actual)
-        .map(|index| builder.stage(format!("source-{index}"), source(index as u64)))
+        .map(|index| builder.station(format!("source-{index}"), source(index as u64)))
         .collect::<Vec<_>>();
-    let target = builder.stage("target", operation);
+    let target = builder.station("target", operation);
     if !sources.is_empty() {
         builder.connect(sources, target);
     }
@@ -46,24 +46,24 @@ where
 }
 
 #[test]
-fn finish_preserves_stage_order_and_resolves_references() {
+fn finish_preserves_station_order_and_resolves_references() {
     let mut builder = factory();
-    builder.stage("first", source(1));
-    let second = builder.stage("second", source(2));
-    let target = builder.stage("target", count());
+    builder.station("first", source(1));
+    let second = builder.station("second", source(2));
+    let target = builder.station("target", count());
     builder.connect([second], target);
 
     let definition = builder.finish_definition().unwrap();
 
     assert_eq!(
         definition
-            .stages
+            .stations
             .iter()
-            .map(|stage| stage.id.as_str())
+            .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
         ["first", "second", "target"]
     );
-    let target = find_stage(&definition, "target");
+    let target = find_station(&definition, "target");
     assert_eq!(
         encode_definition(target.operation()),
         encode_definition(&count())
@@ -81,16 +81,16 @@ fn finish_preserves_stage_order_and_resolves_references() {
 #[test]
 fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
     let mut builder = factory();
-    let first = builder.stage("first", source(1));
-    let second = builder.stage("second", source(2));
-    let target = builder.stage("target", count());
+    let first = builder.station("first", source(1));
+    let second = builder.station("second", source(2));
+    let target = builder.station("target", count());
     builder.connect([second, first, second], target);
 
     let sources =
-        validate_connections(builder.token, &builder.stages, &builder.connections).unwrap();
+        validate_connections(builder.token, &builder.stations, &builder.connections).unwrap();
 
     assert_eq!(sources[target.index].as_deref(), Some([1, 0, 1].as_slice()));
-    assert_eq!(validate_acyclic(builder.stages.len(), &sources), Ok(()));
+    assert_eq!(validate_acyclic(builder.stations.len(), &sources), Ok(()));
 }
 
 #[test]
@@ -102,38 +102,38 @@ fn finish_rejects_an_empty_definition() {
 }
 
 #[test]
-fn finish_rejects_invalid_stage_ids_in_declaration_order() {
+fn finish_rejects_invalid_station_ids_in_declaration_order() {
     let mut builder = factory();
-    builder.stage("", source(0));
-    builder.stage("contains\0nul", source(1));
+    builder.station("", source(0));
+    builder.station("contains\0nul", source(1));
 
     assert_eq!(
         builder.finish_definition().unwrap_err(),
-        TopologyError::InvalidStageId {
+        TopologyError::InvalidStationId {
             id: String::new(),
-            reason: InvalidStageIdReason::Empty,
+            reason: InvalidStationIdReason::Empty,
         }
     );
 
     let mut nul_builder = FlowFactory::new("");
-    nul_builder.stage("contains\0nul", source(0));
+    nul_builder.station("contains\0nul", source(0));
     assert_eq!(
         nul_builder.finish_definition().unwrap_err(),
-        TopologyError::InvalidStageId {
+        TopologyError::InvalidStationId {
             id: "contains\0nul".to_owned(),
-            reason: InvalidStageIdReason::ContainsNul,
+            reason: InvalidStationIdReason::ContainsNul,
         }
     );
 }
 
 #[test]
-fn finish_rejects_duplicate_stage_ids_before_connections() {
+fn finish_rejects_duplicate_station_ids_before_connections() {
     let mut builder = factory();
-    let first = builder.stage("same", source(0));
-    builder.stage("same", source(1));
+    let first = builder.station("same", source(0));
+    builder.station("same", source(1));
     builder.connect(
         [first],
-        StageRef {
+        StationRef {
             factory_token: 0,
             index: 0,
         },
@@ -141,36 +141,36 @@ fn finish_rejects_duplicate_stage_ids_before_connections() {
 
     assert_eq!(
         builder.finish_definition().unwrap_err(),
-        TopologyError::DuplicateStageId("same".to_owned())
+        TopologyError::DuplicateStationId("same".to_owned())
     );
 }
 
 #[test]
 fn finish_rejects_foreign_source_and_target_references() {
     let mut left = factory();
-    let foreign = left.stage("foreign", source(0));
+    let foreign = left.station("foreign", source(0));
 
     let mut right = factory();
-    let target = right.stage("target", count());
+    let target = right.station("target", count());
     right.connect([foreign], target);
     assert_eq!(
         right.finish_definition().unwrap_err(),
-        TopologyError::ForeignStageRef(foreign)
+        TopologyError::ForeignStationRef(foreign)
     );
 
     let mut right = factory();
-    let source = right.stage("source", source(0));
+    let source = right.station("source", source(0));
     right.connect([source], foreign);
     assert_eq!(
         right.finish_definition().unwrap_err(),
-        TopologyError::ForeignStageRef(foreign)
+        TopologyError::ForeignStationRef(foreign)
     );
 }
 
 #[test]
 fn finish_rejects_an_explicit_empty_source_list() {
     let mut builder = factory();
-    let target = builder.stage("target", source(0));
+    let target = builder.station("target", source(0));
     builder.connect([], target);
 
     assert_eq!(
@@ -182,10 +182,14 @@ fn finish_rejects_an_explicit_empty_source_list() {
 #[test]
 fn finish_accepts_the_known_zero_and_unary_input_counts() {
     let source_definition = finish_target(source(0), 0).unwrap();
-    assert!(find_stage(&source_definition, "target").sources.is_empty());
+    assert!(
+        find_station(&source_definition, "target")
+            .sources
+            .is_empty()
+    );
 
     let count_definition = finish_target(count(), 1).unwrap();
-    assert_eq!(find_stage(&count_definition, "target").sources.len(), 1);
+    assert_eq!(find_station(&count_definition, "target").sources.len(), 1);
 }
 
 #[test]
@@ -193,7 +197,7 @@ fn finish_rejects_every_known_input_count_mismatch() {
     assert_eq!(
         finish_target(source(0), 1).unwrap_err(),
         TopologyError::InputCount {
-            stage: "target".to_owned(),
+            station: "target".to_owned(),
             expected: 0,
             actual: 1,
         }
@@ -201,7 +205,7 @@ fn finish_rejects_every_known_input_count_mismatch() {
     assert_eq!(
         finish_target(count(), 0).unwrap_err(),
         TopologyError::InputCount {
-            stage: "target".to_owned(),
+            station: "target".to_owned(),
             expected: 1,
             actual: 0,
         }
@@ -209,7 +213,7 @@ fn finish_rejects_every_known_input_count_mismatch() {
     assert_eq!(
         finish_target(count(), 2).unwrap_err(),
         TopologyError::InputCount {
-            stage: "target".to_owned(),
+            station: "target".to_owned(),
             expected: 1,
             actual: 2,
         }
@@ -219,9 +223,9 @@ fn finish_rejects_every_known_input_count_mismatch() {
 #[test]
 fn finish_rejects_setting_sources_twice() {
     let mut builder = factory();
-    let first = builder.stage("first", source(1));
-    let second = builder.stage("second", source(2));
-    let target = builder.stage("target", count());
+    let first = builder.station("first", source(1));
+    let second = builder.station("second", source(2));
+    let target = builder.station("target", count());
     builder.connect([first], target);
     builder.connect([second], target);
 
@@ -234,21 +238,21 @@ fn finish_rejects_setting_sources_twice() {
 #[test]
 fn finish_rejects_a_direct_self_loop() {
     let mut builder = factory();
-    let stage = builder.stage("stage", count());
-    builder.connect([stage], stage);
+    let station = builder.station("station", count());
+    builder.connect([station], station);
 
     assert_eq!(
         builder.finish_definition().unwrap_err(),
-        TopologyError::SelfLoop("stage".to_owned())
+        TopologyError::SelfLoop("station".to_owned())
     );
 }
 
 #[test]
-fn finish_rejects_a_multi_stage_cycle() {
+fn finish_rejects_a_multi_station_cycle() {
     let mut builder = factory();
-    let first = builder.stage("first", count());
-    let second = builder.stage("second", count());
-    let third = builder.stage("third", count());
+    let first = builder.station("first", count());
+    let second = builder.station("second", count());
+    let third = builder.station("third", count());
     builder.connect([first], second);
     builder.connect([second], third);
     builder.connect([third], first);
@@ -262,39 +266,39 @@ fn finish_rejects_a_multi_stage_cycle() {
 #[test]
 fn finish_allows_fan_out() {
     let mut builder = factory();
-    let source = builder.stage("source", source(0));
-    let left = builder.stage("left", count());
-    let right = builder.stage("right", count());
+    let source = builder.station("source", source(0));
+    let left = builder.station("left", count());
+    let right = builder.station("right", count());
     builder.connect([source], left);
     builder.connect([source], right);
 
     let definition = builder.finish_definition().unwrap();
 
-    assert_eq!(find_stage(&definition, "left").sources, ["source"]);
-    assert_eq!(find_stage(&definition, "right").sources, ["source"]);
+    assert_eq!(find_station(&definition, "left").sources, ["source"]);
+    assert_eq!(find_station(&definition, "right").sources, ["source"]);
 }
 
 #[test]
-fn finish_allows_zero_input_stages_and_disconnected_components() {
+fn finish_allows_zero_input_stations_and_disconnected_components() {
     let mut builder = factory();
-    builder.stage("isolated", source(0));
-    let source = builder.stage("source", source(1));
-    let count = builder.stage("count", count());
+    builder.station("isolated", source(0));
+    let source = builder.station("source", source(1));
+    let count = builder.station("count", count());
     builder.connect([source], count);
 
     let definition = builder.finish_definition().unwrap();
 
-    assert!(find_stage(&definition, "isolated").sources.is_empty());
-    assert!(find_stage(&definition, "source").sources.is_empty());
-    assert_eq!(find_stage(&definition, "count").sources, ["source"]);
+    assert!(find_station(&definition, "isolated").sources.is_empty());
+    assert!(find_station(&definition, "source").sources.is_empty());
+    assert_eq!(find_station(&definition, "count").sources, ["source"]);
 }
 
 #[test]
 fn finish_rejects_a_cycle_in_one_of_multiple_components() {
     let mut builder = factory();
-    builder.stage("isolated", source(0));
-    let left = builder.stage("left", count());
-    let right = builder.stage("right", count());
+    builder.station("isolated", source(0));
+    let left = builder.station("left", count());
+    let right = builder.station("right", count());
     builder.connect([left], right);
     builder.connect([right], left);
 
@@ -306,34 +310,34 @@ fn finish_rejects_a_cycle_in_one_of_multiple_components() {
 
 #[test]
 fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
-    const MAX_STAGE_COUNT: usize = 5;
+    const MAX_STATION_COUNT: usize = 5;
     const EXPECTED_GRAPH_COUNT: usize = 8_476;
 
     let mut visited = 0;
 
-    for stage_count in 1..=MAX_STAGE_COUNT {
-        for count_mask in 0..(1_usize << stage_count) {
-            let count_targets = (0..stage_count)
+    for station_count in 1..=MAX_STATION_COUNT {
+        for count_mask in 0..(1_usize << station_count) {
+            let count_targets = (0..station_count)
                 .filter(|index| count_mask & (1_usize << index) != 0)
                 .collect::<Vec<_>>();
-            let assignment_count = stage_count.pow(u32::try_from(count_targets.len()).unwrap());
+            let assignment_count = station_count.pow(u32::try_from(count_targets.len()).unwrap());
 
             for assignment in 0..assignment_count {
                 visited += 1;
-                let parents = decode_parent_assignment(stage_count, &count_targets, assignment);
+                let parents = decode_parent_assignment(station_count, &count_targets, assignment);
                 let expected = classify_unary_graph(&parents);
                 let graph = format!(
-                    "stage_count={stage_count}, count_mask={count_mask:#b}, parents={parents:?}"
+                    "station_count={station_count}, count_mask={count_mask:#b}, parents={parents:?}"
                 );
 
                 let mut builder = factory();
-                let references = (0..stage_count)
+                let references = (0..station_count)
                     .map(|index| {
-                        let id = stage_id(index);
+                        let id = station_id(index);
                         if parents[index].is_some() {
-                            builder.stage(id, count())
+                            builder.station(id, count())
                         } else {
-                            builder.stage(id, source(index as u64))
+                            builder.station(id, source(index as u64))
                         }
                     })
                     .collect::<Vec<_>>();
@@ -346,29 +350,29 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                         let definition = builder
                             .finish_definition()
                             .unwrap_or_else(|error| panic!("{graph}: rejected with {error:?}"));
-                        let expected_ids = (0..stage_count).map(stage_id).collect::<Vec<_>>();
+                        let expected_ids = (0..station_count).map(station_id).collect::<Vec<_>>();
                         assert_eq!(
                             definition
-                                .stages
+                                .stations
                                 .iter()
-                                .map(|stage| stage.id.as_str())
+                                .map(|station| station.id.as_str())
                                 .collect::<Vec<_>>(),
                             expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                             "{graph}: declaration order changed"
                         );
-                        for (target, stage) in definition.stages.iter().enumerate() {
+                        for (target, station) in definition.stations.iter().enumerate() {
                             let expected_sources = parents[target]
-                                .map(|parent| vec![stage_id(parent)])
+                                .map(|parent| vec![station_id(parent)])
                                 .unwrap_or_default();
                             assert_eq!(
-                                stage.sources, expected_sources,
+                                station.sources, expected_sources,
                                 "{graph}: source order changed for target {target}"
                             );
                         }
                     }
                     UnaryGraphClass::SelfLoop(target) => assert_eq!(
                         builder.finish_definition().unwrap_err(),
-                        TopologyError::SelfLoop(stage_id(target)),
+                        TopologyError::SelfLoop(station_id(target)),
                         "{graph}: direct cycle classification changed"
                     ),
                     UnaryGraphClass::Cycle => assert_eq!(
@@ -392,14 +396,14 @@ enum UnaryGraphClass {
 }
 
 fn decode_parent_assignment(
-    stage_count: usize,
+    station_count: usize,
     count_targets: &[usize],
     mut assignment: usize,
 ) -> Vec<Option<usize>> {
-    let mut parents = vec![None; stage_count];
+    let mut parents = vec![None; station_count];
     for &target in count_targets {
-        parents[target] = Some(assignment % stage_count);
-        assignment /= stage_count;
+        parents[target] = Some(assignment % station_count);
+        assignment /= station_count;
     }
     assert_eq!(assignment, 0);
     parents
@@ -417,33 +421,33 @@ fn classify_unary_graph(parents: &[Option<usize>]) -> UnaryGraphClass {
     for start in 0..parents.len() {
         let mut visited = vec![false; parents.len()];
         let mut current = Some(start);
-        while let Some(stage) = current {
-            if visited[stage] {
+        while let Some(station) = current {
+            if visited[station] {
                 return UnaryGraphClass::Cycle;
             }
-            visited[stage] = true;
-            current = parents[stage];
+            visited[station] = true;
+            current = parents[station];
         }
     }
     UnaryGraphClass::Acyclic
 }
 
-fn stage_id(index: usize) -> String {
-    format!("stage-{index}")
+fn station_id(index: usize) -> String {
+    format!("station-{index}")
 }
 
 fn codec_definition() -> FlowDefinition {
     let mut builder = factory();
-    let source = builder.stage("source", source(7));
-    let count = builder.stage("count", count());
+    let source = builder.station("source", source(7));
+    let count = builder.station("count", count());
     builder.connect([source], count);
     builder.finish_definition().unwrap()
 }
 
 fn codec_definition_with_ids(source_id: &str, count_id: &str) -> FlowDefinition {
     let mut builder = factory();
-    let source = builder.stage(source_id, source(7));
-    let count = builder.stage(count_id, count());
+    let source = builder.station(source_id, source(7));
+    let count = builder.station(count_id, count());
     builder.connect([source], count);
     builder.finish_definition().unwrap()
 }
@@ -478,12 +482,12 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
 
 #[test]
 fn decoder_round_trips_a_large_chain() {
-    const STAGE_COUNT: usize = 4_096;
+    const STATION_COUNT: usize = 4_096;
 
     let mut builder = factory();
-    let mut previous = builder.stage("stage-0000", source(0));
-    for index in 1..STAGE_COUNT {
-        let current = builder.stage(format!("stage-{index:04}"), count());
+    let mut previous = builder.station("station-0000", source(0));
+    for index in 1..STATION_COUNT {
+        let current = builder.station(format!("station-{index:04}"), count());
         builder.connect([previous], current);
         previous = current;
     }
@@ -491,7 +495,7 @@ fn decoder_round_trips_a_large_chain() {
 
     let decoded = decode(&encoded).unwrap();
 
-    assert_eq!(decoded.stages().len(), STAGE_COUNT);
+    assert_eq!(decoded.stations().len(), STATION_COUNT);
     assert_eq!(encode(&decoded).unwrap(), encoded);
 }
 
@@ -519,7 +523,7 @@ fn decoder_rejects_truncation_and_trailing_bytes() {
 }
 
 #[test]
-fn decoder_validates_all_stage_ids_before_resolving_sources() {
+fn decoder_validates_all_station_ids_before_resolving_sources() {
     let mut encoded = encode(&codec_definition_with_ids("first", "other")).unwrap();
     let duplicate = encoded
         .windows(b"other".len())
@@ -537,7 +541,7 @@ fn decoder_validates_all_stage_ids_before_resolving_sources() {
 
     assert_eq!(
         decode(&encoded).unwrap_err(),
-        FlowDefinitionError::Topology(TopologyError::DuplicateStageId("first".to_owned()))
+        FlowDefinitionError::Topology(TopologyError::DuplicateStationId("first".to_owned()))
     );
 }
 

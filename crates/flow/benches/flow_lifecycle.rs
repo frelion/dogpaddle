@@ -15,40 +15,44 @@ use dogpaddle_operation::operation::{
 use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_lifecycle";
-const SMOKE_STAGE_COUNTS: &[usize] = &[1, 8, 64];
-const REFERENCE_STAGE_COUNTS: &[usize] = &[1, 64, 1_024];
+const SMOKE_STATION_COUNTS: &[usize] = &[1, 8, 64];
+const REFERENCE_STATION_COUNTS: &[usize] = &[1, 64, 1_024];
 const SMOKE_SAMPLES: usize = 3;
 const REFERENCE_SAMPLES: usize = 9;
 const SMOKE_WARMUPS: usize = 1;
 const REFERENCE_WARMUPS: usize = 2;
 
 struct Config {
-    stage_counts: Vec<usize>,
+    station_counts: Vec<usize>,
     samples: usize,
     warmups: usize,
 }
 
 impl Config {
     fn load(profile: BenchmarkProfile) -> Self {
-        let (default_stage_counts, default_samples, default_warmups) = match profile {
-            BenchmarkProfile::Smoke => (SMOKE_STAGE_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
-            BenchmarkProfile::Reference => {
-                (REFERENCE_STAGE_COUNTS, REFERENCE_SAMPLES, REFERENCE_WARMUPS)
-            }
+        let (default_station_counts, default_samples, default_warmups) = match profile {
+            BenchmarkProfile::Smoke => (SMOKE_STATION_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
+            BenchmarkProfile::Reference => (
+                REFERENCE_STATION_COUNTS,
+                REFERENCE_SAMPLES,
+                REFERENCE_WARMUPS,
+            ),
         };
-        let stage_counts =
-            positive_usize_list("DOGPADDLE_FLOW_BENCH_STAGE_COUNTS", default_stage_counts)
-                .expect("read Flow benchmark stage counts");
+        let station_counts = positive_usize_list(
+            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS",
+            default_station_counts,
+        )
+        .expect("read Flow benchmark station counts");
         let samples = positive_usize("DOGPADDLE_FLOW_BENCH_SAMPLES", default_samples)
             .expect("read Flow benchmark sample count");
         let warmups = positive_usize("DOGPADDLE_FLOW_BENCH_WARMUPS", default_warmups)
             .expect("read Flow benchmark warmup count");
         assert!(
-            stage_counts.windows(2).all(|pair| pair[0] < pair[1]),
-            "DOGPADDLE_FLOW_BENCH_STAGE_COUNTS must be strictly increasing"
+            station_counts.windows(2).all(|pair| pair[0] < pair[1]),
+            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS must be strictly increasing"
         );
         Self {
-            stage_counts,
+            station_counts,
             samples,
             warmups,
         }
@@ -67,95 +71,95 @@ fn main() {
     emit_environment(&root);
     emit_configuration(&config);
 
-    for &stage_count in &config.stage_counts {
-        benchmark_fresh_build(&root, &config, stage_count);
-        benchmark_warm_reopen(&root, &config, stage_count);
+    for &station_count in &config.station_counts {
+        benchmark_fresh_build(&root, &config, station_count);
+        benchmark_warm_reopen(&root, &config, station_count);
     }
 }
 
-fn benchmark_fresh_build(root: &BenchRoot, config: &Config, stage_count: usize) {
+fn benchmark_fresh_build(root: &BenchRoot, config: &Config, station_count: usize) {
     for _ in 0..config.warmups {
-        measure_fresh_build(root, stage_count);
+        measure_fresh_build(root, station_count);
     }
 
     let mut durations = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
-        let elapsed = measure_fresh_build(root, stage_count);
-        emit_sample("fresh_durable_build", stage_count, sample, elapsed);
+        let elapsed = measure_fresh_build(root, station_count);
+        emit_sample("fresh_durable_build", station_count, sample, elapsed);
         durations.push(elapsed);
     }
-    report("fresh_durable_build", stage_count, &durations);
+    report("fresh_durable_build", station_count, &durations);
 }
 
-fn measure_fresh_build(root: &BenchRoot, stage_count: usize) -> Duration {
+fn measure_fresh_build(root: &BenchRoot, station_count: usize) -> Duration {
     let sample = root.sample("flow-build");
-    let factory = linear_factory(sample.path(), stage_count);
+    let factory = linear_factory(sample.path(), station_count);
 
     let started = std::time::Instant::now();
     let flow = factory.build().expect("build benchmark Flow");
     let elapsed = started.elapsed();
 
-    validate_flow(&flow, sample.path(), stage_count);
+    validate_flow(&flow, sample.path(), station_count);
     drop(flow);
     let reopened = FlowFactory::open(sample.path()).expect("reopen freshly built benchmark Flow");
-    validate_flow(&reopened, sample.path(), stage_count);
+    validate_flow(&reopened, sample.path(), station_count);
     drop(reopened);
     drop(sample);
     elapsed
 }
 
-fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, stage_count: usize) {
+fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, station_count: usize) {
     let fixture = root.sample("flow-reopen");
-    let flow = linear_factory(fixture.path(), stage_count)
+    let flow = linear_factory(fixture.path(), station_count)
         .build()
         .expect("build reopen benchmark fixture");
-    validate_flow(&flow, fixture.path(), stage_count);
+    validate_flow(&flow, fixture.path(), station_count);
     drop(flow);
 
     let preflight = FlowFactory::open(fixture.path()).expect("preflight reopen benchmark fixture");
-    validate_flow(&preflight, fixture.path(), stage_count);
+    validate_flow(&preflight, fixture.path(), station_count);
     drop(preflight);
     for _ in 0..config.warmups {
-        measure_reopen(fixture.path(), stage_count);
+        measure_reopen(fixture.path(), station_count);
     }
 
     let mut durations = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
-        let elapsed = measure_reopen(fixture.path(), stage_count);
-        emit_sample("warm_reopen", stage_count, sample, elapsed);
+        let elapsed = measure_reopen(fixture.path(), station_count);
+        emit_sample("warm_reopen", station_count, sample, elapsed);
         durations.push(elapsed);
     }
-    report("warm_reopen", stage_count, &durations);
+    report("warm_reopen", station_count, &durations);
 }
 
-fn measure_reopen(path: &Path, stage_count: usize) -> Duration {
+fn measure_reopen(path: &Path, station_count: usize) -> Duration {
     let started = std::time::Instant::now();
     let flow = FlowFactory::open(path).expect("open benchmark Flow");
     let elapsed = started.elapsed();
 
-    validate_flow(&flow, path, stage_count);
+    validate_flow(&flow, path, station_count);
     drop(flow);
     elapsed
 }
 
-fn linear_factory(path: &Path, stage_count: usize) -> FlowFactory {
-    assert!(stage_count > 0, "benchmark Flow must contain a stage");
+fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
+    assert!(station_count > 0, "benchmark Flow must contain a station");
     let mut factory = FlowFactory::new(path);
-    let mut previous = factory.stage("source", SequenceSourceDefinition::new(0));
-    for index in 1..stage_count {
-        let current = factory.stage(format!("count-{index:08x}"), CountDefinition::new());
+    let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
+    for index in 1..station_count {
+        let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
         factory.connect([previous], current);
         previous = current;
     }
     factory
 }
 
-fn validate_flow(flow: &Flow, path: &Path, stage_count: usize) {
+fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
     assert_eq!(flow.path(), path);
-    assert_eq!(flow.stage_count(), stage_count);
-    let mut ids = flow.stage_ids();
+    assert_eq!(flow.station_count(), station_count);
+    let mut ids = flow.station_ids();
     assert_eq!(ids.next(), Some("source"));
-    for index in 1..stage_count {
+    for index in 1..station_count {
         let expected = format!("count-{index:08x}");
         assert_eq!(ids.next(), Some(expected.as_str()));
     }
@@ -178,8 +182,8 @@ fn emit_environment(root: &BenchRoot) {
 
 fn emit_configuration(config: &Config) {
     let fields = Fields::new()
-        .with("stage_counts", &config.stage_counts)
-        .expect("add Flow benchmark stage counts")
+        .with("station_counts", &config.station_counts)
+        .expect("add Flow benchmark station counts")
         .with("samples", config.samples)
         .expect("add Flow benchmark sample count")
         .with("warmups", config.warmups)
@@ -199,34 +203,34 @@ fn emit_configuration(config: &Config) {
     emit_record(&configuration);
 }
 
-fn emit_sample(scenario: &'static str, stage_count: usize, sample: usize, elapsed: Duration) {
+fn emit_sample(scenario: &'static str, station_count: usize, sample: usize, elapsed: Duration) {
     let sample = SampleRecord::new(
         BENCHMARK,
         scenario,
         sample,
         elapsed,
-        stage_fields(stage_count),
+        station_fields(station_count),
     )
     .expect("construct Flow benchmark sample record");
     emit_record(&sample);
 }
 
-fn report(scenario: &'static str, stage_count: usize, samples: &[Duration]) {
+fn report(scenario: &'static str, station_count: usize, samples: &[Duration]) {
     let summary = DurationSummary::from_samples(samples).expect("summarize Flow benchmark samples");
     let min = summary.min();
     let median = summary.median();
     let max = summary.max();
     assert!(!median.is_zero(), "benchmark median must be non-zero");
-    println!("{scenario} stages={stage_count}: min={min:?} median={median:?} max={max:?}");
-    let summary = SummaryRecord::new(BENCHMARK, scenario, summary, stage_fields(stage_count))
+    println!("{scenario} stations={station_count}: min={min:?} median={median:?} max={max:?}");
+    let summary = SummaryRecord::new(BENCHMARK, scenario, summary, station_fields(station_count))
         .expect("construct Flow benchmark summary record");
     emit_record(&summary);
 }
 
-fn stage_fields(stage_count: usize) -> Fields {
+fn station_fields(station_count: usize) -> Fields {
     Fields::new()
-        .with("stage_count", stage_count)
-        .expect("add Flow benchmark stage count")
+        .with("station_count", station_count)
+        .expect("add Flow benchmark station count")
 }
 
 fn emit_record(record: &impl BenchmarkRecord) {

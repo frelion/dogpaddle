@@ -5,26 +5,26 @@ use crate::{
     fixture::{CdcRecord, LogFixture, decode_header},
 };
 
-pub(super) fn assert_stage_cursor(fixture: &mut LogFixture, expected: usize) {
+pub(super) fn assert_station_cursor(fixture: &mut LogFixture, expected: usize) {
     let transaction = fixture
         .transactions
         .begin()
-        .expect("begin stage validation transaction");
+        .expect("begin station validation transaction");
     let cursor = fixture
-        .stage_state
+        .station_state
         .access(transaction.access())
-        .expect("access stage validation state")
+        .expect("access station validation state")
         .get(&CURSOR_KEY.to_vec())
-        .expect("read stage validation cursor")
+        .expect("read station validation cursor")
         .map(decode_cursor)
-        .expect("seeded stage validation cursor");
+        .expect("seeded station validation cursor");
     assert_eq!(cursor, to_u64(expected));
     transaction
         .commit()
-        .expect("finish stage validation transaction");
+        .expect("finish station validation transaction");
 }
 
-pub(super) fn assert_count_stage(
+pub(super) fn assert_count_station(
     fixture: &mut LogFixture,
     expected_cursor: usize,
     expected_count: i64,
@@ -32,27 +32,27 @@ pub(super) fn assert_count_stage(
     let transaction = fixture
         .transactions
         .begin()
-        .expect("begin count stage validation transaction");
+        .expect("begin count station validation transaction");
     let cursor = fixture
-        .stage_state
+        .station_state
         .access(transaction.access())
-        .expect("access count stage validation state")
+        .expect("access count station validation state")
         .get(&CURSOR_KEY.to_vec())
-        .expect("read count stage validation cursor")
+        .expect("read count station validation cursor")
         .map(decode_cursor)
-        .expect("seeded count stage validation cursor");
+        .expect("seeded count station validation cursor");
     let count = fixture
         .count
         .access(transaction.access())
-        .expect("access count stage validation count")
+        .expect("access count station validation count")
         .get()
-        .expect("read count stage validation count")
-        .expect("seeded count stage validation count");
+        .expect("read count station validation count")
+        .expect("seeded count station validation count");
     assert_eq!(cursor, to_u64(expected_cursor));
     assert_eq!(count, expected_count);
     transaction
         .commit()
-        .expect("finish count stage validation transaction");
+        .expect("finish count station validation transaction");
 }
 
 pub(super) fn assert_bounds<T: StoreValue>(

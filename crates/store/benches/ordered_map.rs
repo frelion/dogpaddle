@@ -14,11 +14,11 @@ mod oracle;
 #[path = "ordered_map/report.rs"]
 mod report;
 
-use fixture::{Fixture, ScanFixture, StageFixture};
+use fixture::{Fixture, ScanFixture, StationFixture};
 use measure::{
     measure_bulk_put, measure_byte_map_bulk_put, measure_byte_map_point_get, measure_byte_map_scan,
     measure_hot_overwrite_rollback, measure_point_get, measure_primitive_scan, measure_scan,
-    measure_single_put_commits, measure_stage_steps, measure_vec_scan,
+    measure_single_put_commits, measure_station_steps, measure_vec_scan,
 };
 use report::{BenchmarkCase, print_group, print_section, report_mode_pair, report_size_pair};
 use support::{initialize, write_record};
@@ -32,7 +32,7 @@ const DEFAULT_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
 const DEFAULT_WIDE_SCAN_ENTRIES: usize = 10_000;
 const VALUE_BYTES: usize = 64;
 const WIDE_VALUE_BYTES: usize = 8 * 1_024;
-const STAGE_KEYS: usize = 1_024;
+const STATION_KEYS: usize = 1_024;
 const RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 struct ScanWorkload {
@@ -128,8 +128,8 @@ fn main() {
         scan_items,
         scan_bytes,
     );
-    print_group("Stage-shaped atomic batches: map updates plus one Cell cursor");
-    benchmark_stage_steps(commits, samples);
+    print_group("Station-shaped atomic batches: map updates plus one Cell cursor");
+    benchmark_station_steps(commits, samples);
     print_group("worst-case commit amortization: one overwrite per durable transaction");
     benchmark_durable_overwrite(commits, samples);
 }
@@ -365,18 +365,18 @@ fn benchmark_narrow_scan_modes(
     );
 }
 
-fn benchmark_stage_steps(steps: usize, samples: usize) {
+fn benchmark_station_steps(steps: usize, samples: usize) {
     for operations_per_step in [1, 8, 64] {
         report_size_pair(
-            &stage_case(steps, operations_per_step),
+            &station_case(steps, operations_per_step),
             samples,
             || {
-                let mut fixture = StageFixture::<Small>::populated();
-                measure_stage_steps(&mut fixture, steps, operations_per_step)
+                let mut fixture = StationFixture::<Small>::populated();
+                measure_station_steps(&mut fixture, steps, operations_per_step)
             },
             || {
-                let mut fixture = StageFixture::<Large>::populated();
-                measure_stage_steps(&mut fixture, steps, operations_per_step)
+                let mut fixture = StationFixture::<Large>::populated();
+                measure_station_steps(&mut fixture, steps, operations_per_step)
             },
         );
     }
@@ -494,13 +494,13 @@ fn wide_case(workload: impl Into<String>, operations: usize) -> BenchmarkCase {
     BenchmarkCase::per_operation(workload, operations, 1, size_of::<u64>() + WIDE_VALUE_BYTES)
 }
 
-fn stage_case(steps: usize, operations_per_step: usize) -> BenchmarkCase {
+fn station_case(steps: usize, operations_per_step: usize) -> BenchmarkCase {
     let bytes_per_step = operations_per_step
         .checked_mul(2 * (size_of::<u64>() + VALUE_BYTES))
         .and_then(|bytes| bytes.checked_add(2 * size_of::<u64>()))
-        .expect("stage logical byte count fits in usize");
+        .expect("station logical byte count fits in usize");
     BenchmarkCase::per_operation(
-        format!("stage step x{operations_per_step}"),
+        format!("station step x{operations_per_step}"),
         steps,
         steps,
         bytes_per_step,

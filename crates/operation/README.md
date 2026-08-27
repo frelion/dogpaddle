@@ -77,14 +77,14 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 已提交的值；首次产生 `start`，随后逐一递增。`u64::MAX` 可以产生一次，再次推进返回
 [`operation::source::SequenceSourceError::Exhausted`]。它声明自己产生输出。
 
-它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Stage 资源名。
+它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 
 ## `operation::transform::Count`
 
 [`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
 [`operation::transform::CountOperation`] 将直接持有的 `Cell<u64>` 加一并返回新计数；
 未写入的 Cell 解释为 `0`，溢出返回
-[`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Stage，它仍声明自己产生
+[`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Station，它仍声明自己产生
 输出；拓扑位置不会把 Transform 隐式变成 Sink。
 
 ```rust,no_run
@@ -106,11 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Operation 业务逻辑不接收、开始、提交或保存 Transaction。`Flow` 唯一持有不可克隆的
-`Transactions`；内部 `Stage::work` 已固定为只在调用期间接收 `&mut Transactions`。work 的
-执行体尚未实现；实现后由 Stage 开始并持有该次 Transaction，再只把不能提交的
+`Transactions`；内部 `Station::work` 已固定为只在调用期间接收 `&mut Transactions`。work 的
+执行体尚未实现；实现后由 Station 开始并持有该次 Transaction，再只把不能提交的
 `TransactionAccess` 交给 Operation。Operation 用自己持有的 `Cell` 或 `OrderedMap` 创建具体
-事务级 Access。这样 Flow 不知道算子的数据结构，Stage 不会跨工作保留事务启动能力，Operation
-也不能控制事务边界，而状态、输入进度和输出可由 Stage 在同一事务中原子提交。
+事务级 Access。这样 Flow 不知道算子的数据结构，Station 不会跨工作保留事务启动能力，Operation
+也不能控制事务边界，而状态、输入进度和输出可由 Station 在同一事务中原子提交。
 
 ## 扩展约束
 

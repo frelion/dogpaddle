@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use crate::{CURSOR_KEY, RECORD_HEADER_BYTES, SEED_BATCH_ITEMS, support::sample_dir};
 
-pub(super) type StageState = OrderedMap<Vec<u8>, Vec<u8>, Small>;
+pub(super) type StationState = OrderedMap<Vec<u8>, Vec<u8>, Small>;
 
 #[derive(Clone)]
 pub(super) struct CdcRecord {
@@ -26,9 +26,9 @@ pub(super) struct LogFixture {
     pub(super) transactions: Transactions,
     pub(super) input: AppendLog<CdcRecord>,
     pub(super) output: AppendLog<CdcRecord>,
-    pub(super) stage_state: StageState,
+    pub(super) station_state: StationState,
     pub(super) count: Cell<i64>,
-    pub(super) reader_states: Vec<StageState>,
+    pub(super) reader_states: Vec<StationState>,
     _root: TempDir,
 }
 
@@ -87,24 +87,24 @@ impl LogFixture {
         let output = store
             .create_data::<AppendLog<CdcRecord>>("output")
             .expect("create benchmark output log");
-        let stage_state = store
-            .create_data::<StageState>("stage/00000000/state")
-            .expect("create benchmark stage state");
+        let station_state = store
+            .create_data::<StationState>("station/00000000/state")
+            .expect("create benchmark station state");
         let count = store
             .create_data::<Cell<i64>>("count")
             .expect("create benchmark count");
         let reader_states = (0..readers)
             .map(|reader| {
                 store
-                    .create_data::<StageState>(&format!("stage/{:08x}/state", reader + 1))
-                    .expect("create benchmark reader stage state")
+                    .create_data::<StationState>(&format!("station/{:08x}/state", reader + 1))
+                    .expect("create benchmark reader station state")
             })
             .collect::<Vec<_>>();
         let mut fixture = Self {
             transactions: store.into_transactions(),
             input,
             output,
-            stage_state,
+            station_state,
             count,
             reader_states,
             _root: root,
@@ -116,11 +116,11 @@ impl LogFixture {
                 .begin()
                 .expect("begin benchmark state seed");
             fixture
-                .stage_state
+                .station_state
                 .access(transaction.access())
-                .expect("access benchmark stage state")
+                .expect("access benchmark station state")
                 .put(&CURSOR_KEY.to_vec(), &0_u64.to_be_bytes().to_vec())
-                .expect("seed benchmark stage cursor");
+                .expect("seed benchmark station cursor");
             fixture
                 .count
                 .access(transaction.access())
@@ -130,7 +130,7 @@ impl LogFixture {
             for state in &fixture.reader_states {
                 state
                     .access(transaction.access())
-                    .expect("access benchmark reader stage state")
+                    .expect("access benchmark reader station state")
                     .put(&CURSOR_KEY.to_vec(), &0_u64.to_be_bytes().to_vec())
                     .expect("seed benchmark reader cursor");
             }

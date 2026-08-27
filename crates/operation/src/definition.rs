@@ -50,19 +50,19 @@ pub(crate) struct DataName<D> {
 /// crate. Flow creates or opens the declared data objects before asking the
 /// definition to assemble its runtime [`Operation`].
 pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
-    /// Returns the exact number of ordered upstream stages this definition accepts.
+    /// Returns the exact number of ordered upstream stations this definition accepts.
     fn input_count(&self) -> usize;
 
     /// Returns whether this operation produces a downstream change stream.
     ///
-    /// Flow uses this declaration to decide whether the owning stage has an
+    /// Flow uses this declaration to decide whether the owning station has an
     /// output log. It is independent of whether the current topology happens
-    /// to connect any downstream stages.
+    /// to connect any downstream stations.
     fn produces_output(&self) -> bool;
 
     /// Returns the operation's stable logical data names and typed classes.
     ///
-    /// Flow prefixes each name with the owning stage's stable resource path.
+    /// Flow prefixes each name with the owning station's stable resource path.
     /// Names, collection types, codecs, and any applicable size choices form
     /// part of the operation's persistent schema. The returned slice has
     /// deterministic declaration order, while materialization binds instances

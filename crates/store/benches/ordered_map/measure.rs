@@ -5,10 +5,11 @@ use dogpaddle_store::{
 };
 
 use crate::{
-    RANDOM_SEED, STAGE_KEYS, VALUE_BYTES,
-    fixture::{ByteMap, Fixture, ScanFixture, StageFixture, TypedMap},
+    RANDOM_SEED, STATION_KEYS, VALUE_BYTES,
+    fixture::{ByteMap, Fixture, ScanFixture, StationFixture, TypedMap},
     oracle::{
-        assert_stage_map, expected_scan_checksum, expected_stage_first_bytes, read_stage_cursor,
+        assert_station_map, expected_scan_checksum, expected_station_first_bytes,
+        read_station_cursor,
     },
 };
 
@@ -366,8 +367,8 @@ fn project_vec_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
     Ok(key ^ u64::from(value[0]))
 }
 
-pub(super) fn measure_stage_steps<SIZE>(
-    fixture: &mut StageFixture<SIZE>,
+pub(super) fn measure_station_steps<SIZE>(
+    fixture: &mut StationFixture<SIZE>,
     steps: usize,
     operations_per_step: usize,
 ) -> Duration
@@ -375,56 +376,56 @@ where
     TypedMap<SIZE>: StoreData,
 {
     let operations_per_step_u64 =
-        u64::try_from(operations_per_step).expect("stage batch size fits in u64");
-    let stage_keys = u64::try_from(STAGE_KEYS).expect("stage key count fits in u64");
-    let initial_cursor = read_stage_cursor(fixture);
+        u64::try_from(operations_per_step).expect("station batch size fits in u64");
+    let station_keys = u64::try_from(STATION_KEYS).expect("station key count fits in u64");
+    let initial_cursor = read_station_cursor(fixture);
     let expected_first_bytes =
-        expected_stage_first_bytes(initial_cursor, steps, operations_per_step_u64, stage_keys);
+        expected_station_first_bytes(initial_cursor, steps, operations_per_step_u64, station_keys);
     let started = std::time::Instant::now();
     for _ in 0..steps {
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin stage transaction");
+            .expect("begin station transaction");
         let cursor = fixture
             .cursor
             .access(transaction.access())
-            .expect("access stage cursor")
+            .expect("access station cursor")
             .get()
-            .expect("read stage cursor")
-            .expect("seeded stage cursor");
+            .expect("read station cursor")
+            .expect("seeded station cursor");
         {
             let mut map = fixture
                 .map
                 .access(transaction.access())
-                .expect("access stage map");
+                .expect("access station map");
             for offset in 0..operations_per_step_u64 {
                 let key = cursor
                     .wrapping_mul(operations_per_step_u64)
                     .wrapping_add(offset)
-                    % stage_keys;
+                    % station_keys;
                 let mut value = map
                     .get(&key)
-                    .expect("read stage item")
-                    .expect("seeded stage item");
+                    .expect("read station item")
+                    .expect("seeded station item");
                 value[0] = value[0].wrapping_add(1);
-                map.put(&key, &value).expect("write stage item");
+                map.put(&key, &value).expect("write station item");
             }
         }
         fixture
             .cursor
             .access(transaction.access())
-            .expect("access stage cursor")
+            .expect("access station cursor")
             .set(&cursor.wrapping_add(1))
-            .expect("advance stage cursor");
-        transaction.commit().expect("commit stage transaction");
+            .expect("advance station cursor");
+        transaction.commit().expect("commit station transaction");
     }
     let elapsed = started.elapsed();
     assert_eq!(
-        read_stage_cursor(fixture),
+        read_station_cursor(fixture),
         initial_cursor.wrapping_add(u64::try_from(steps).expect("step count fits u64"))
     );
-    assert_stage_map(fixture, &expected_first_bytes);
+    assert_station_map(fixture, &expected_first_bytes);
     elapsed
 }
 

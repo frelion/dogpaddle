@@ -1,4 +1,4 @@
-use dogpaddle_flow::{FlowError, FlowFactory, InvalidStageIdReason, TopologyError};
+use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, TopologyError};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
@@ -19,43 +19,43 @@ fn empty_topology_failure_has_no_store_side_effect() {
 }
 
 #[test]
-fn invalid_and_duplicate_stage_ids_have_no_store_side_effect() {
+fn invalid_and_duplicate_station_ids_have_no_store_side_effect() {
     let root = tempfile::tempdir().unwrap();
 
     let empty_path = root.path().join("empty-id");
     let mut builder = FlowFactory::new(&empty_path);
-    builder.stage("", SequenceSourceDefinition::new(0));
+    builder.station("", SequenceSourceDefinition::new(0));
     let error = build_error(builder);
     assert!(matches!(
         error,
-        FlowError::Topology(TopologyError::InvalidStageId {
+        FlowError::Topology(TopologyError::InvalidStationId {
             id,
-            reason: InvalidStageIdReason::Empty,
+            reason: InvalidStationIdReason::Empty,
         }) if id.is_empty()
     ));
     assert!(!empty_path.exists());
 
     let nul_path = root.path().join("nul-id");
     let mut builder = FlowFactory::new(&nul_path);
-    builder.stage("contains\0nul", SequenceSourceDefinition::new(0));
+    builder.station("contains\0nul", SequenceSourceDefinition::new(0));
     let error = build_error(builder);
     assert!(matches!(
         error,
-        FlowError::Topology(TopologyError::InvalidStageId {
+        FlowError::Topology(TopologyError::InvalidStationId {
             id,
-            reason: InvalidStageIdReason::ContainsNul,
+            reason: InvalidStationIdReason::ContainsNul,
         }) if id == "contains\0nul"
     ));
     assert!(!nul_path.exists());
 
     let duplicate_path = root.path().join("duplicate-id");
     let mut builder = FlowFactory::new(&duplicate_path);
-    builder.stage("same", SequenceSourceDefinition::new(0));
-    builder.stage("same", SequenceSourceDefinition::new(1));
+    builder.station("same", SequenceSourceDefinition::new(0));
+    builder.station("same", SequenceSourceDefinition::new(1));
     let error = build_error(builder);
     assert!(matches!(
         error,
-        FlowError::Topology(TopologyError::DuplicateStageId(id)) if id == "same"
+        FlowError::Topology(TopologyError::DuplicateStationId(id)) if id == "same"
     ));
     assert!(!duplicate_path.exists());
 }
@@ -65,7 +65,7 @@ fn topology_failure_has_no_store_side_effect() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    builder.stage("count", CountDefinition::new());
+    builder.station("count", CountDefinition::new());
 
     let Err(error) = builder.build() else {
         panic!("invalid topology unexpectedly built");
@@ -73,10 +73,10 @@ fn topology_failure_has_no_store_side_effect() {
     assert!(matches!(
         error,
         FlowError::Topology(TopologyError::InputCount {
-            stage,
+            station,
             expected: 1,
             actual: 0,
-        }) if stage == "count"
+        }) if station == "count"
     ));
     assert!(!path.exists());
 }
@@ -86,18 +86,18 @@ fn foreign_reference_failure_has_no_store_side_effect() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut foreign_builder = FlowFactory::new(root.path().join("foreign"));
-    let foreign_source = foreign_builder.stage("source", SequenceSourceDefinition::new(0));
+    let foreign_source = foreign_builder.station("source", SequenceSourceDefinition::new(0));
 
     let mut builder = FlowFactory::new(&path);
-    builder.stage("own-source", SequenceSourceDefinition::new(0));
-    let count = builder.stage("count", CountDefinition::new());
+    builder.station("own-source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
     builder.connect([foreign_source], count);
     let Err(error) = builder.build() else {
         panic!("foreign reference unexpectedly built");
     };
     assert!(matches!(
         error,
-        FlowError::Topology(TopologyError::ForeignStageRef(_))
+        FlowError::Topology(TopologyError::ForeignStationRef(_))
     ));
     assert!(!path.exists());
 }
@@ -108,7 +108,7 @@ fn invalid_connection_shapes_have_no_store_side_effect() {
 
     let empty_path = root.path().join("empty-sources");
     let mut builder = FlowFactory::new(&empty_path);
-    let source = builder.stage("source", SequenceSourceDefinition::new(0));
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
     builder.connect([], source);
     let error = build_error(builder);
     assert!(matches!(
@@ -119,9 +119,9 @@ fn invalid_connection_shapes_have_no_store_side_effect() {
 
     let duplicate_path = root.path().join("sources-twice");
     let mut builder = FlowFactory::new(&duplicate_path);
-    let first = builder.stage("first", SequenceSourceDefinition::new(0));
-    let second = builder.stage("second", SequenceSourceDefinition::new(1));
-    let count = builder.stage("count", CountDefinition::new());
+    let first = builder.station("first", SequenceSourceDefinition::new(0));
+    let second = builder.station("second", SequenceSourceDefinition::new(1));
+    let count = builder.station("count", CountDefinition::new());
     builder.connect([first], count);
     builder.connect([second], count);
     let error = build_error(builder);
@@ -138,7 +138,7 @@ fn direct_and_indirect_cycles_have_no_store_side_effect() {
 
     let self_loop_path = root.path().join("self-loop");
     let mut builder = FlowFactory::new(&self_loop_path);
-    let count = builder.stage("count", CountDefinition::new());
+    let count = builder.station("count", CountDefinition::new());
     builder.connect([count], count);
     let error = build_error(builder);
     assert!(matches!(
@@ -149,8 +149,8 @@ fn direct_and_indirect_cycles_have_no_store_side_effect() {
 
     let cycle_path = root.path().join("cycle");
     let mut builder = FlowFactory::new(&cycle_path);
-    let left = builder.stage("left", CountDefinition::new());
-    let right = builder.stage("right", CountDefinition::new());
+    let left = builder.station("left", CountDefinition::new());
+    let right = builder.station("right", CountDefinition::new());
     builder.connect([left], right);
     builder.connect([right], left);
     let error = build_error(builder);
@@ -177,7 +177,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
     drop(transactions);
 
     let mut builder = FlowFactory::new(&path);
-    builder.stage("source", SequenceSourceDefinition::new(0));
+    builder.station("source", SequenceSourceDefinition::new(0));
     let error = build_error(builder);
     assert!(matches!(
         error,

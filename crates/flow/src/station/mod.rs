@@ -6,7 +6,7 @@ use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small, Transactions};
     not(test),
     expect(
         dead_code,
-        reason = "stage work outcomes are returned by the next run phase"
+        reason = "station work outcomes are returned by the future scheduling phase"
     )
 )]
 pub(crate) enum WorkOutcome {
@@ -15,9 +15,9 @@ pub(crate) enum WorkOutcome {
 }
 
 #[derive(Debug)]
-pub(crate) enum StageError {}
+pub(crate) enum StationError {}
 
-pub(crate) struct StageParts {
+pub(crate) struct StationParts {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     operation: Box<dyn Operation>,
     output: Option<AppendLog<Vec<u8>>>,
@@ -27,17 +27,17 @@ pub(crate) struct StageParts {
     not(test),
     expect(
         dead_code,
-        reason = "stage instances are consumed by the next run phase"
+        reason = "station instances are consumed by the future scheduling phase"
     )
 )]
-pub(crate) struct Stage {
+pub(crate) struct Station {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     operation: Box<dyn Operation>,
     inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
     output: Option<AppendLog<Vec<u8>>>,
 }
 
-impl Stage {
+impl Station {
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the Flow scheduler is not implemented yet")
@@ -45,13 +45,13 @@ impl Stage {
     pub(crate) fn work(
         &mut self,
         transactions: &mut Transactions,
-    ) -> Result<WorkOutcome, StageError> {
+    ) -> Result<WorkOutcome, StationError> {
         let _ = transactions;
-        todo!("stage work is not implemented yet")
+        todo!("station work is not implemented yet")
     }
 }
 
-impl StageParts {
+impl StationParts {
     pub(crate) fn new(
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         operation: Box<dyn Operation>,
@@ -68,18 +68,18 @@ impl StageParts {
         self.output.as_ref()
     }
 
-    pub(crate) fn finish(self, inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>) -> Stage {
+    pub(crate) fn finish(self, inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>) -> Station {
         assert_eq!(
             inputs.len(),
             self.operation.definition().input_count(),
-            "stage input capabilities must match its operation definition"
+            "station input capabilities must match its operation definition"
         );
         assert_eq!(
             self.output.is_some(),
             self.operation.definition().produces_output(),
-            "stage output capability must match its operation definition"
+            "station output capability must match its operation definition"
         );
-        Stage {
+        Station {
             state: self.state,
             operation: self.operation,
             inputs,

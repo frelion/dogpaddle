@@ -15,8 +15,8 @@ mod report;
 
 use fixture::{CdcRecord, FilterMode, LogFixture};
 use measure::{
-    measure_append, measure_append_body, measure_batch_append, measure_count_stage,
-    measure_decode_scan, measure_durable_append, measure_filter_stage, measure_gc,
+    measure_append, measure_append_body, measure_batch_append, measure_count_station,
+    measure_decode_scan, measure_durable_append, measure_filter_station, measure_gc,
     measure_project_scan, measure_readers, measure_steady_window,
 };
 use oracle::{chunked_gc_transactions, make_records};
@@ -30,8 +30,8 @@ const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_RECORD_BYTES: &[usize] = &[128, 1_024, 8_192];
 const DEFAULT_SOURCE_BATCH_ITEMS: &[usize] = &[1, 64, 1_024];
-const DEFAULT_STAGE_RECORD_BYTES: usize = 1_024;
-const DEFAULT_STAGE_BATCH_ITEMS: usize = 1_024;
+const DEFAULT_STATION_RECORD_BYTES: usize = 1_024;
+const DEFAULT_STATION_BATCH_ITEMS: usize = 1_024;
 const DEFAULT_GC_ITEMS: usize = 1_024;
 const DEFAULT_READERS: &[usize] = &[1, 4];
 const RECORD_HEADER_BYTES: usize = 16;
@@ -45,8 +45,8 @@ struct AppendConfiguration<'a> {
     samples: usize,
     record_sizes: &'a [usize],
     source_batches: &'a [usize],
-    stage_record_bytes: usize,
-    stage_batch_items: usize,
+    station_record_bytes: usize,
+    station_batch_items: usize,
     gc_items: usize,
     readers: &'a [usize],
 }
@@ -68,24 +68,24 @@ fn main() {
         DEFAULT_SOURCE_BATCH_ITEMS,
     )
     .expect("parse AppendLog source batch sizes");
-    let stage_record_bytes = positive_usize(
-        "DOGPADDLE_BENCH_LOG_STAGE_RECORD_BYTES",
-        DEFAULT_STAGE_RECORD_BYTES,
+    let station_record_bytes = positive_usize(
+        "DOGPADDLE_BENCH_LOG_STATION_RECORD_BYTES",
+        DEFAULT_STATION_RECORD_BYTES,
     )
-    .expect("parse AppendLog stage record size");
-    let stage_batch_items = positive_usize(
-        "DOGPADDLE_BENCH_LOG_STAGE_BATCH_ITEMS",
-        DEFAULT_STAGE_BATCH_ITEMS,
+    .expect("parse AppendLog station record size");
+    let station_batch_items = positive_usize(
+        "DOGPADDLE_BENCH_LOG_STATION_BATCH_ITEMS",
+        DEFAULT_STATION_BATCH_ITEMS,
     )
-    .expect("parse AppendLog stage batch size");
+    .expect("parse AppendLog station batch size");
     let gc_items = positive_usize("DOGPADDLE_BENCH_LOG_GC_ITEMS", DEFAULT_GC_ITEMS)
         .expect("parse AppendLog GC item limit");
     let readers = positive_usize_list("DOGPADDLE_BENCH_LOG_READERS", DEFAULT_READERS)
         .expect("parse AppendLog reader counts");
 
     assert!(entries > 0 && commits > 0 && samples > 0);
-    assert!(stage_batch_items > 0 && gc_items > 0);
-    assert!(stage_record_bytes >= RECORD_HEADER_BYTES);
+    assert!(station_batch_items > 0 && gc_items > 0);
+    assert!(station_record_bytes >= RECORD_HEADER_BYTES);
     assert!(record_sizes.iter().all(|size| *size >= RECORD_HEADER_BYTES));
     assert!(source_batches.iter().all(|size| *size > 0));
     assert!(readers.iter().all(|count| *count > 0));
@@ -95,8 +95,8 @@ fn main() {
         samples,
         record_sizes: &record_sizes,
         source_batches: &source_batches,
-        stage_record_bytes,
-        stage_batch_items,
+        station_record_bytes,
+        station_batch_items,
         gc_items,
         readers: &readers,
     });
@@ -106,7 +106,7 @@ fn main() {
         "entries={entries} commits_cap={commits} samples={samples} record_bytes={record_sizes:?}"
     );
     println!(
-        "source_batch_items={source_batches:?} stage_record_bytes={stage_record_bytes} stage_batch_items={stage_batch_items} gc_items={gc_items} readers={readers:?}"
+        "source_batch_items={source_batches:?} station_record_bytes={station_record_bytes} station_batch_items={station_batch_items} gc_items={gc_items} readers={readers:?}"
     );
     println!(
         "sync=durable execution=single-thread cache=warm seed=outside-timing validation=outside-timing"
@@ -115,7 +115,7 @@ fn main() {
         "AppendLog<T>: encoded width and read strategy",
         "one durable bulk append transaction; warm scans stay in one transaction",
     );
-    benchmark_record_widths(entries, samples, stage_batch_items, &record_sizes);
+    benchmark_record_widths(entries, samples, station_batch_items, &record_sizes);
     print_log_section(
         "AppendLog<T>: Source commit amortization",
         "each batch is one begin -> append -> durable commit transaction",
@@ -124,18 +124,18 @@ fn main() {
         entries,
         commits,
         samples,
-        stage_record_bytes,
+        station_record_bytes,
         &source_batches,
     );
     print_log_section(
-        "AppendLog<T>: Stage, fan-out, and GC",
-        "Stage state cursor, log work, output/state writes, and durable commit are timed together",
+        "AppendLog<T>: Station, fan-out, and GC",
+        "Station state cursor, log work, output/state writes, and durable commit are timed together",
     );
-    benchmark_stage_transactions(
+    benchmark_station_transactions(
         entries,
         samples,
-        stage_record_bytes,
-        stage_batch_items,
+        station_record_bytes,
+        station_batch_items,
         gc_items,
         &readers,
     );
@@ -147,8 +147,8 @@ fn emit_configuration(config: &AppendConfiguration<'_>) {
         ("entries", config.entries),
         ("commits_cap", config.commits),
         ("samples", config.samples),
-        ("stage_record_bytes", config.stage_record_bytes),
-        ("stage_batch_items", config.stage_batch_items),
+        ("station_record_bytes", config.station_record_bytes),
+        ("station_batch_items", config.station_batch_items),
         ("gc_items", config.gc_items),
     ] {
         fields
@@ -248,7 +248,7 @@ fn benchmark_durable_source(
     }
 }
 
-fn benchmark_stage_transactions(
+fn benchmark_station_transactions(
     entries: usize,
     samples: usize,
     record_bytes: usize,
@@ -259,35 +259,35 @@ fn benchmark_stage_transactions(
     let transactions = entries.div_ceil(batch_items);
     report_log(
         &LogCase::new(
-            format!("stage count project ({transactions} tx)"),
+            format!("station count project ({transactions} tx)"),
             entries,
             record_bytes,
             transactions,
         ),
         samples,
-        || measure_count_stage(entries, record_bytes, batch_items),
+        || measure_count_station(entries, record_bytes, batch_items),
     );
     report_log(
         &LogCase::new(
-            format!("stage raw pass-through ({transactions} tx)"),
+            format!("station raw pass-through ({transactions} tx)"),
             entries,
             record_bytes,
             transactions,
         ),
         samples,
-        || measure_filter_stage(entries, record_bytes, batch_items, FilterMode::PassThrough),
+        || measure_filter_station(entries, record_bytes, batch_items, FilterMode::PassThrough),
     );
-    let projected = format!("stage filter 50% project ({transactions} tx)");
-    let decoded = format!("stage filter 50% decode ({transactions} tx)");
+    let projected = format!("station filter 50% project ({transactions} tx)");
+    let decoded = format!("station filter 50% decode ({transactions} tx)");
     report_log_mode_pair(
         &LogPair::modes(
-            format!("stage filter 50% record_bytes={record_bytes}"),
+            format!("station filter 50% record_bytes={record_bytes}"),
             LogCase::new(projected, entries, record_bytes, transactions),
             decoded,
         ),
         samples,
         |decode| {
-            measure_filter_stage(
+            measure_filter_station(
                 entries,
                 record_bytes,
                 batch_items,

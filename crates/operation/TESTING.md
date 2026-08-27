@@ -4,7 +4,7 @@
 Operation 的状态推进测试。`dogpaddle-store` 是 Operation 的正式运行依赖，因此 Cell 状态的
 commit、rollback、错误传播和 reopen 属于本 crate 的公共正确性，而不是额外的跨 crate 测试包。
 
-Flow 负责完整 Stage 资源名、资源创建顺序、Flow Definition 布局和 build/open 后的装配；这些
+Flow 负责完整 Station 资源名、资源创建顺序、Flow Definition 布局和 build/open 后的装配；这些
 组合契约应在 `dogpaddle-flow` 的公共测试中验证。当前 Operation 尚无 Change 批处理接口，因此
 本 crate 不引入 `dogpaddle-change`，也不预建空的 Change 集成测试。
 
@@ -40,7 +40,7 @@ wrong class、不同 collection、不同 `Small`/`Large` 和 unconsumed 都在�
 公共 correctness target 只从外部 crate 视角使用公开 API。`DataDeclaration`、`DataInstances`
 虽然是 `#[doc(hidden)]`，却是 Flow 实际使用的 crate-to-crate 接缝，因此公共测试覆盖声明的精确
 逻辑名以及 create → close → reopen → declaration open → materialize。Flow 的
-`stage/{index:08x}/...` 完整物理名不属于本 crate。
+`station/{index:08x}/...` 完整物理名不属于本 crate。
 
 ## 正确性口径
 

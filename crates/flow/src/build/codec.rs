@@ -4,8 +4,8 @@ use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
 
 use super::{
-    definition::{FlowDefinition, StageDefinition},
-    validate::{TopologyError, validate_decoded_definition, validate_stage_ids},
+    definition::{FlowDefinition, StationDefinition},
+    validate::{TopologyError, validate_decoded_definition, validate_station_ids},
 };
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
@@ -28,17 +28,17 @@ pub enum FlowDefinitionError {
     /// The Flow definition format version is unsupported.
     #[error("unsupported flow definition format version {0}")]
     UnsupportedVersion(u16),
-    /// A stage or source ID is not valid UTF-8.
-    #[error("flow definition contains an invalid UTF-8 stage ID")]
+    /// A station or source ID is not valid UTF-8.
+    #[error("flow definition contains an invalid UTF-8 station ID")]
     InvalidUtf8,
     /// A length cannot be represented by the durable format.
     #[error("{0} is too large for the flow definition format")]
     LengthOverflow(&'static str),
-    /// A source ID does not identify a declared stage.
-    #[error("stage {stage:?} references unknown source {source_id:?}")]
+    /// A source ID does not identify a declared station.
+    #[error("station {station:?} references unknown source {source_id:?}")]
     UnknownSource {
-        /// Stage containing the invalid source reference.
-        stage: String,
+        /// Station containing the invalid source reference.
+        station: String,
         /// Missing source ID.
         source_id: String,
     },
@@ -56,34 +56,34 @@ pub enum FlowDefinitionError {
     TrailingBytes,
 }
 
-pub(crate) fn stage_state_name(index: usize) -> String {
-    format!("stage/{index:08x}/state")
+pub(crate) fn station_state_name(index: usize) -> String {
+    format!("station/{index:08x}/state")
 }
 
-pub(crate) fn stage_output_name(index: usize) -> String {
-    format!("stage/{index:08x}/output")
+pub(crate) fn station_output_name(index: usize) -> String {
+    format!("station/{index:08x}/output")
 }
 
-pub(crate) fn operation_data_name(index: usize, logical_name: &str) -> String {
-    format!("stage/{index:08x}/operation/{logical_name}")
+pub(crate) fn station_operation_data_name(index: usize, logical_name: &str) -> String {
+    format!("station/{index:08x}/operation/{logical_name}")
 }
 
 pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {
-    let stage_count = u32::try_from(definition.stages().len())
-        .map_err(|_| FlowDefinitionError::LengthOverflow("stage count"))?;
+    let station_count = u32::try_from(definition.stations().len())
+        .map_err(|_| FlowDefinitionError::LengthOverflow("station count"))?;
     let mut encoded = Vec::new();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-    encoded.extend_from_slice(&stage_count.to_be_bytes());
+    encoded.extend_from_slice(&station_count.to_be_bytes());
 
-    for stage in definition.stages() {
-        encode_string(&mut encoded, stage.id(), "stage ID")?;
-        let operation = encode_definition(stage.operation());
+    for station in definition.stations() {
+        encode_string(&mut encoded, station.id(), "station ID")?;
+        let operation = encode_definition(station.operation());
         encode_bytes(&mut encoded, &operation, "operation definition")?;
-        let source_count = u32::try_from(stage.sources().len())
+        let source_count = u32::try_from(station.sources().len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("source count"))?;
         encoded.extend_from_slice(&source_count.to_be_bytes());
-        for source in stage.sources() {
+        for source in station.sources() {
             encode_string(&mut encoded, source, "source ID")?;
         }
     }
@@ -120,9 +120,9 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
         return Err(FlowDefinitionError::UnsupportedVersion(version));
     }
 
-    let stage_count = cursor.read_u32()?;
-    let mut stages = Vec::new();
-    for _ in 0..stage_count {
+    let station_count = cursor.read_u32()?;
+    let mut stations = Vec::new();
+    for _ in 0..station_count {
         let id = cursor.read_string()?;
         let operation = decode_definition(cursor.read_bytes()?)?;
         let source_count = cursor.read_u32()?;
@@ -130,7 +130,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
         for _ in 0..source_count {
             sources.push(cursor.read_string()?);
         }
-        stages.push(StageDefinition {
+        stations.push(StationDefinition {
             id,
             operation,
             sources,
@@ -140,32 +140,32 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
         return Err(FlowDefinitionError::TrailingBytes);
     }
 
-    validate_definition(stages)
+    validate_definition(stations)
 }
 
 fn validate_definition(
-    stages: Vec<StageDefinition>,
+    stations: Vec<StationDefinition>,
 ) -> Result<FlowDefinition, FlowDefinitionError> {
-    validate_stage_ids(&stages)?;
+    validate_station_ids(&stations)?;
     let sources_by_target = {
-        let ids = stages
+        let ids = stations
             .iter()
             .enumerate()
-            .map(|(index, stage)| (stage.id.as_str(), index))
+            .map(|(index, station)| (station.id.as_str(), index))
             .collect::<HashMap<_, _>>();
-        stages
+        stations
             .iter()
-            .map(|stage| {
-                if stage.sources.is_empty() {
+            .map(|station| {
+                if station.sources.is_empty() {
                     return Ok(None);
                 }
-                stage
+                station
                     .sources
                     .iter()
                     .map(|source| {
                         ids.get(source.as_str()).copied().ok_or_else(|| {
                             FlowDefinitionError::UnknownSource {
-                                stage: stage.id.clone(),
+                                station: station.id.clone(),
                                 source_id: source.clone(),
                             }
                         })
@@ -175,8 +175,8 @@ fn validate_definition(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    validate_decoded_definition(&stages, &sources_by_target)?;
-    Ok(FlowDefinition::new(stages))
+    validate_decoded_definition(&stations, &sources_by_target)?;
+    Ok(FlowDefinition::new(stations))
 }
 
 fn encode_string(

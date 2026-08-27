@@ -6,7 +6,7 @@ use crate::{
     CURSOR_KEY,
     fixture::{FilterMode, LogFixture},
     oracle::{
-        assert_bounds, assert_count_stage, assert_stage_cursor, decode_cursor, decode_diff,
+        assert_bounds, assert_count_station, assert_station_cursor, decode_cursor, decode_diff,
         decode_key, expected_diff_checksum, expected_full_scan_checksum, make_records_from,
         scan_limit, to_u64,
     },
@@ -201,7 +201,7 @@ pub(super) fn measure_decode_scan(
     elapsed
 }
 
-pub(super) fn measure_count_stage(
+pub(super) fn measure_count_station(
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
@@ -214,20 +214,20 @@ pub(super) fn measure_count_stage(
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin count stage transaction");
-        let mut stage_state = fixture
-            .stage_state
+            .expect("begin count station transaction");
+        let mut station_state = fixture
+            .station_state
             .access(transaction.access())
-            .expect("access count stage state");
-        let cursor = stage_state
+            .expect("access count station state");
+        let cursor = station_state
             .get(&CURSOR_KEY.to_vec())
-            .expect("read count stage cursor")
+            .expect("read count station cursor")
             .map(decode_cursor)
-            .expect("seeded count stage cursor");
+            .expect("seeded count station cursor");
         let input = fixture
             .input
             .access(transaction.access())
-            .expect("access count stage input");
+            .expect("access count station input");
         let mut batch_diff = 0_i64;
         let mut batch_count = 0_usize;
         let scan = input
@@ -236,27 +236,27 @@ pub(super) fn measure_count_stage(
                 batch_count += 1;
                 Ok::<(), StoreError>(())
             })
-            .expect("scan count stage input");
+            .expect("scan count station input");
         let mut count = fixture
             .count
             .access(transaction.access())
-            .expect("access count stage state");
+            .expect("access count station state");
         let current = count
             .get()
-            .expect("read count stage state")
-            .expect("seeded count stage state");
+            .expect("read count station state")
+            .expect("seeded count station state");
         count
             .set(&current.wrapping_add(batch_diff))
-            .expect("write count stage state");
-        stage_state
+            .expect("write count station state");
+        station_state
             .put(
                 &CURSOR_KEY.to_vec(),
                 &scan.next_offset.to_be_bytes().to_vec(),
             )
-            .expect("advance count stage cursor");
+            .expect("advance count station cursor");
         transaction
             .commit()
-            .expect("commit count stage transaction");
+            .expect("commit count station transaction");
         processed += batch_count;
         if scan.caught_up {
             break;
@@ -264,11 +264,11 @@ pub(super) fn measure_count_stage(
     }
     let elapsed = started.elapsed();
     assert_eq!(processed, entries);
-    assert_count_stage(&mut fixture, entries, expected_count);
+    assert_count_station(&mut fixture, entries, expected_count);
     elapsed
 }
 
-pub(super) fn measure_filter_stage(
+pub(super) fn measure_filter_station(
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
@@ -282,24 +282,24 @@ pub(super) fn measure_filter_stage(
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin filter stage transaction");
-        let mut stage_state = fixture
-            .stage_state
+            .expect("begin filter station transaction");
+        let mut station_state = fixture
+            .station_state
             .access(transaction.access())
-            .expect("access filter stage state");
-        let cursor = stage_state
+            .expect("access filter station state");
+        let cursor = station_state
             .get(&CURSOR_KEY.to_vec())
-            .expect("read filter stage cursor")
+            .expect("read filter station cursor")
             .map(decode_cursor)
-            .expect("seeded filter stage cursor");
+            .expect("seeded filter station cursor");
         let input = fixture
             .input
             .access(transaction.access())
-            .expect("access filter stage input");
+            .expect("access filter station input");
         let mut output = fixture
             .output
             .access(transaction.access())
-            .expect("access filter stage output");
+            .expect("access filter station output");
         let scan = input
             .scan(cursor, scan_limit(record_bytes, batch_items), |entry| {
                 let pass = match mode {
@@ -314,16 +314,16 @@ pub(super) fn measure_filter_stage(
                 processed += 1;
                 Ok::<(), StoreError>(())
             })
-            .expect("scan filter stage input");
-        stage_state
+            .expect("scan filter station input");
+        station_state
             .put(
                 &CURSOR_KEY.to_vec(),
                 &scan.next_offset.to_be_bytes().to_vec(),
             )
-            .expect("advance filter stage cursor");
+            .expect("advance filter station cursor");
         transaction
             .commit()
-            .expect("commit filter stage transaction");
+            .expect("commit filter station transaction");
         if scan.caught_up {
             break;
         }
@@ -335,7 +335,7 @@ pub(super) fn measure_filter_stage(
     };
     assert_eq!(processed, entries);
     assert_eq!(forwarded, expected_forwarded);
-    assert_stage_cursor(&mut fixture, entries);
+    assert_station_cursor(&mut fixture, entries);
     assert_bounds(
         &mut fixture.transactions,
         &fixture.output,
@@ -366,10 +366,10 @@ pub(super) fn measure_readers(
                 .transactions
                 .begin()
                 .expect("begin downstream transaction");
-            let mut stage_state = fixture.reader_states[reader]
+            let mut station_state = fixture.reader_states[reader]
                 .access(transaction.access())
-                .expect("access downstream stage state");
-            let cursor = stage_state
+                .expect("access downstream station state");
+            let cursor = station_state
                 .get(&CURSOR_KEY.to_vec())
                 .expect("read downstream cursor")
                 .map(decode_cursor)
@@ -385,7 +385,7 @@ pub(super) fn measure_readers(
                     Ok::<(), StoreError>(())
                 })
                 .expect("scan downstream input");
-            stage_state
+            station_state
                 .put(
                     &CURSOR_KEY.to_vec(),
                     &scan.next_offset.to_be_bytes().to_vec(),

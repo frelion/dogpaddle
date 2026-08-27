@@ -198,7 +198,7 @@ state/output。静态权限来自 collection handle：`ReadOnly<C>` 只能绑定
 回滚、提交边界。
 
 `TransactionAccess`、`CellAccess` 和 `OrderedMapAccess` 都不能脱离所属事务；每个新事务都
-必须重新绑定，不能跨 Stage 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
+必须重新绑定，不能跨 Station 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
 执行的事务。
 
 内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
@@ -308,7 +308,7 @@ target。工作区协议见
 
 `cell` 独立覆盖同事务 warm get，以及每次读取、更新并 durable commit 的状态事务。
 `ordered_map` 为 `Small` 与 `Large` map 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、
-热点读取、升序与降序扫描、持久化覆盖写入、类似 Stage 的多集合事务，以及存在多个 `Small`
+热点读取、升序与降序扫描、持久化覆盖写入、类似 Station 的多集合事务，以及存在多个 `Small`
 后台命名空间时的预热读取。扫描还单独覆盖固定宽度 `u64` 完整解码，以及 8 KiB value 的完整
 解码与单字段投影；后者以交错配对样本直接报告 projection 的收益。两种 map 使用各自独立的具名
 数据对象；byte map 的类型是 `OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸句柄。可通过
@@ -323,7 +323,7 @@ Cell 的读取次数由 `DOGPADDLE_BENCH_CELL_READS` 控制；commit 数与样�
 ### `AppendLog` 场景基准
 
 `append_log` 使用 `[diff: i64][key: u64][payload]` 的 CDC 记录，配置的 record bytes 是包含
-16 字节头部在内的精确稳定编码大小。它不只测孤立 API，而是覆盖 Store 在差分 Stage 中承担的
+16 字节头部在内的精确稳定编码大小。它不只测孤立 API，而是覆盖 Store 在差分 Station 中承担的
 实际工作：
 
 - 对 128 B、1 KiB 与 8 KiB 记录分别测试已编码值 append、业务 codec append、只投影 diff
@@ -331,11 +331,11 @@ Cell 的读取次数由 `DOGPADDLE_BENCH_CELL_READS` 控制；commit 数与样�
 - 对同一批 typed value 成对交错测试逐条 `append` 与 `append_batch`，分别报告只计追加事务体
   的 rollback workload 和包含一次 durable commit 的总耗时；
 - Source 按 1、64 与 1024 条一批开启事务、append 并 durable commit，显示提交摊销；
-- Count Stage 在一个事务内从自己的 `Small OrderedMap<Vec<u8>, Vec<u8>>` 读取输入 cursor，
+- Count Station 在一个事务内从自己的 `Small OrderedMap<Vec<u8>, Vec<u8>>` 读取输入 cursor，
   从 log 投影 diff，更新 `Cell<i64>`，推进 cursor 并提交；
-- 直通与 50% filter Stage 在同一个事务内扫描输入、使用 `append_entry` 原样转发编码、推进
+- 直通与 50% filter Station 在同一个事务内扫描输入、使用 `append_entry` 原样转发编码、推进
   cursor 并提交；filter 同时对比 key 投影和完整值解码；
-- 一个共享 log 被 1 个或 4 个下游读取时，每个下游持有独立的 Stage state map 与 cursor，并按
+- 一个共享 log 被 1 个或 4 个下游读取时，每个下游持有独立的 Station state map 与 cursor，并按
   单线程调度顺序分别完成扫描、推进和提交；这里不会为 fan-out 复制多份输入；
 - prefix GC 按固定条数删除并提交；steady workload 先保留一个非空窗口，再交替 append 新批次和
   回收等量旧前缀，用于观察非零 offset、长期页复用及分批提交的组合成本。
@@ -352,7 +352,7 @@ warm-cache；每项先执行一次不计入结果的预热，再报告样本的�
 
 默认配置可通过以下环境变量覆盖：
 
-- `DOGPADDLE_BENCH_LOG_ENTRIES`：宽度、Stage、fan-out、GC 和 steady 样本的记录数，默认
+- `DOGPADDLE_BENCH_LOG_ENTRIES`：宽度、Station、fan-out、GC 和 steady 样本的记录数，默认
   10,000；
 - `DOGPADDLE_BENCH_COMMITS`：Source workload 最多执行的 commit 数，默认 1,000，避免 batch=1
   遮蔽其余样本；
@@ -360,8 +360,8 @@ warm-cache；每项先执行一次不计入结果的预热，再报告样本的�
 - `DOGPADDLE_BENCH_LOG_RECORD_BYTES`：逗号分隔的记录宽度矩阵，默认 `128,1024,8192`；
 - `DOGPADDLE_BENCH_LOG_SOURCE_BATCH_ITEMS`：逗号分隔的 Source 批量矩阵，默认
   `1,64,1024`；
-- `DOGPADDLE_BENCH_LOG_STAGE_RECORD_BYTES`：事务场景使用的记录宽度，默认 1024；
-- `DOGPADDLE_BENCH_LOG_STAGE_BATCH_ITEMS`：Stage 与独立扫描的批量上限，默认 1024；
+- `DOGPADDLE_BENCH_LOG_STATION_RECORD_BYTES`：事务场景使用的记录宽度，默认 1024；
+- `DOGPADDLE_BENCH_LOG_STATION_BATCH_ITEMS`：Station 与独立扫描的批量上限，默认 1024；
 - `DOGPADDLE_BENCH_LOG_GC_ITEMS`：每次 GC 最多删除的条目数，默认 1024；
 - `DOGPADDLE_BENCH_LOG_READERS`：逗号分隔的下游数量，默认 `1,4`。
 

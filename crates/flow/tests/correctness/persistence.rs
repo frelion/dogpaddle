@@ -13,8 +13,8 @@ fn build_publishes_the_stable_v1_definition_bytes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let source = builder.stage("source", SequenceSourceDefinition::new(7));
-    let count = builder.stage("count", CountDefinition::new());
+    let source = builder.station("source", SequenceSourceDefinition::new(7));
+    let count = builder.station("count", CountDefinition::new());
     builder.connect([source], count);
     drop(builder.build().unwrap());
 
@@ -23,7 +23,7 @@ fn build_publishes_the_stable_v1_definition_bytes() {
         fixture_bytes(V1_SEQUENCE_COUNT)
     );
     let flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(flow.stage_ids().collect::<Vec<_>>(), ["source", "count"]);
+    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["source", "count"]);
 }
 
 #[test]
@@ -31,8 +31,8 @@ fn build_uses_the_stable_resource_layout() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let source = builder.stage("source", SequenceSourceDefinition::new(0));
-    let count = builder.stage("count", CountDefinition::new());
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
     builder.connect([source], count);
     drop(builder.build().unwrap());
 
@@ -40,16 +40,16 @@ fn build_uses_the_stable_resource_layout() {
     let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
     let _source_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("stage/00000000/state").unwrap();
+        store.open_data("station/00000000/state").unwrap();
     let _count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("stage/00000001/state").unwrap();
-    let _source_output: AppendLog<Vec<u8>> = store.open_data("stage/00000000/output").unwrap();
+        store.open_data("station/00000001/state").unwrap();
+    let _source_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let _terminal_count_output: AppendLog<Vec<u8>> =
-        store.open_data("stage/00000001/output").unwrap();
+        store.open_data("station/00000001/output").unwrap();
     let _source_position: Cell<u64> = store
-        .open_data("stage/00000000/operation/sequence_source.position")
+        .open_data("station/00000000/operation/sequence_source.position")
         .unwrap();
-    let _count: Cell<u64> = store.open_data("stage/00000001/operation/count").unwrap();
+    let _count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert!(
@@ -63,7 +63,7 @@ fn build_uses_the_stable_resource_layout() {
 }
 
 #[test]
-fn open_reports_a_missing_stage_output_after_publication() {
+fn open_reports_a_missing_station_output_after_publication() {
     let root = tempfile::tempdir().unwrap();
     let definition = build_source_and_read_definition(&root.path().join("complete"));
 
@@ -71,10 +71,10 @@ fn open_reports_a_missing_stage_output_after_publication() {
     let mut store = Store::create(&incomplete_path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("stage/00000000/state").unwrap();
+    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("station/00000000/state").unwrap();
     let _position: Cell<u64> = store
-        .create_data("stage/00000000/operation/sequence_source.position")
+        .create_data("station/00000000/operation/sequence_source.position")
         .unwrap();
     let mut transactions = store.into_transactions();
     {
@@ -91,12 +91,12 @@ fn open_reports_a_missing_stage_output_after_publication() {
     assert!(matches!(
         FlowFactory::open(&incomplete_path),
         Err(FlowError::MissingResource { name })
-            if name == "stage/00000000/output"
+            if name == "station/00000000/output"
     ));
 }
 
 #[test]
-fn open_reports_a_stage_output_size_mismatch() {
+fn open_reports_a_station_output_size_mismatch() {
     let root = tempfile::tempdir().unwrap();
     let definition = build_source_and_read_definition(&root.path().join("complete"));
 
@@ -104,12 +104,12 @@ fn open_reports_a_stage_output_size_mismatch() {
     let mut store = Store::create(&mismatched_path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("stage/00000000/state").unwrap();
+    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("station/00000000/state").unwrap();
     let _position: Cell<u64> = store
-        .create_data("stage/00000000/operation/sequence_source.position")
+        .create_data("station/00000000/operation/sequence_source.position")
         .unwrap();
-    let _wrong_output: Cell<Vec<u8>> = store.create_data("stage/00000000/output").unwrap();
+    let _wrong_output: Cell<Vec<u8>> = store.create_data("station/00000000/output").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
@@ -128,7 +128,7 @@ fn open_reports_a_stage_output_size_mismatch() {
             name,
             expected: "large",
             actual: "small",
-        })) if name == "stage/00000000/output"
+        })) if name == "station/00000000/output"
     ));
 }
 
@@ -178,8 +178,8 @@ fn open_reports_a_missing_resource_after_publication() {
     let mut store = Store::create(&incomplete_path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("stage/00000000/state").unwrap();
+    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("station/00000000/state").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
@@ -195,7 +195,7 @@ fn open_reports_a_missing_resource_after_publication() {
     assert!(matches!(
         FlowFactory::open(&incomplete_path),
         Err(FlowError::MissingResource { name })
-            if name == "stage/00000000/operation/sequence_source.position"
+            if name == "station/00000000/operation/sequence_source.position"
     ));
 }
 
@@ -208,10 +208,10 @@ fn open_reports_an_operation_data_size_mismatch() {
     let mut store = Store::create(&mismatched_path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _stage_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("stage/00000000/state").unwrap();
+    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.create_data("station/00000000/state").unwrap();
     let _position: OrderedMap<u64, u64, Large> = store
-        .create_data("stage/00000000/operation/sequence_source.position")
+        .create_data("station/00000000/operation/sequence_source.position")
         .unwrap();
     let mut transactions = store.into_transactions();
     {
@@ -231,6 +231,6 @@ fn open_reports_an_operation_data_size_mismatch() {
             name,
             expected: "small",
             actual: "large",
-        })) if name == "stage/00000000/operation/sequence_source.position"
+        })) if name == "station/00000000/operation/sequence_source.position"
     ));
 }
