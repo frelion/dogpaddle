@@ -52,12 +52,11 @@ build/open 通路负责完整资源名，并通过 Store 将每项声明创建�
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Station state map 显式声明为
 `Small`。Flow state map 保留生命周期状态；Station state map 保存运行期 Station 状态，并为每个
-input 保存 next-unread `(AppendLog offset, Change row_index)`。`build()` 在发布 manifest 的同一
-事务中把全部 input cursor 显式初始化为 `(0, 0)`，不存在“缺失时从当前 log head 开始”的隐式
-恢复。output 是 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，
-不另建 Schema Cell。端口 Schema 一致性属于 Flow/Station 契约，不依赖 Change codec 之外的
-Schema resource 或 fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增数据
-空间。
+input 保存当前尚未完全退休的 Change offset。`build()` 在发布 manifest 的同一事务中把全部 input
+cursor 显式初始化为 `0`，不存在“缺失时从当前 log head 开始”的隐式恢复。output 是
+`AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，不另建 Schema
+Cell。端口 Schema 一致性属于 Flow/Station 契约，不依赖 Change codec 之外的 Schema resource 或
+fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
 
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
 显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
@@ -70,21 +69,23 @@ Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所
 output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
 `ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
 Station 不知道上游 Station，只知道自己的有序 inputs；它拥有自己的 state 与完整可选 output。
-`intake` 通过 RO snapshot 按 durable cursor 幂等准备输入，不推进 cursor，也不调用 Operation；
-后续 `process` 才在写事务中处理已准备的输入。重开 Flow 时始终根据 durable cursor 恢复。
-没有 output 的 Sink 使用 `None`，不能被其他 Station 作为 source。
+`intake` 通过 RO snapshot 为每个空 cache 按 durable offset 固定读取一个完整 owned Change；cache
+命中不访问 Store，intake 也不推进 cursor 或调用 Operation。后续 `process` 可以多次使用同一
+cache；Change 内部消费进度属于尚未确定的处理协议，不进入通用 input cursor。重开 Flow 时 cache
+为空，并根据 durable offset 重新读取。没有 output 的 Sink 使用 `None`，不能被其他 Station 作为
+source。
 
 `process(&mut Transactions)` 及其 `Idle / Progressed` 结果类型已经留下明确位置，但方法体仍为
 `todo!()`。Station–Operation 的 Change 批处理、partial consumption、输出和原子提交协议尚未
 确定，因此当前代码不会伪造调用或提前承诺其返回类型。Operation 以后仍只会接收不能提交的
 `TransactionAccess`，不会读取 AppendLog、cursor 或 Station 运行元数据。
 
-每条边按 `(AppendLog offset, Change row_index)` 遍历事件；它是当前持久化分批下的坐标，而
-不是稳定 event ID。未来 Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件
-序列必须逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；若多输入
-Operation 依赖跨端口交错顺序，运行层必须另行定义并持久化 ingress 顺序，不能从 source 声明
-顺序推断事件发生顺序。cursor 表示下一条未消费事件；entry 的最后一行消费完成后必须规范化为
-`(offset + 1, 0)`，不能持久化等于 Change 行数的 `row_index`。
+每条边的 cursor 只定位一个完整 Change IPC entry；它是当前持久化分批下的读取位置，而不是稳定
+event ID。未来 Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件序列必须
+逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；若多输入 Operation
+依赖跨端口交错顺序，运行层必须另行定义并持久化 ingress 顺序，不能从 source 声明顺序推断事件
+发生顺序。一个 Change 完全退休后 cursor 才推进到下一个 offset；Change 内部多次消费所需的额外
+记录由后续处理协议定义。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
 `IncompleteBuild`；
@@ -106,9 +107,8 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 - Count 状态：`station/{index:08x}/operation/count`
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。cursor
-value 固定为 16 字节：big-endian `u64 offset` 后接 big-endian `u64 row_index`。当前仍是开发期
-v1，编码、tag 或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局和 reopen
-测试，不保留旧格式兼容层。
+value 固定为 8 字节 big-endian `u64 offset`。当前仍是开发期 v1，编码、tag 或资源布局可以
+破坏性调整，但每次调整必须同步更新黄金字节、布局和 reopen 测试，不保留旧格式兼容层。
 
 ## 源码边界
 

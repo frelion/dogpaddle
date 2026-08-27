@@ -30,8 +30,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Station 预先声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Station 不长期持有
-  事务启动能力；`intake` 经真正的只读 snapshot 按 durable `(offset, row_index)` 幂等准备输入，
-  后续 `process` 才会临时接收 `&mut Transactions` 进入写阶段。
+  事务启动能力；`intake` 经真正的只读 snapshot 按 durable Change offset 为每个空 cache 固定读取
+  一个完整 Change，cache 命中不再访问 Store；后续 `process` 才会临时接收 `&mut Transactions`
+  进入写阶段。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
   `OrderedMap<K, V, SIZE>`；collection handle 与事务能力分别控制长期写权限和本次访问权限，
   真正的只读事务在类型层没有写入或提交入口。有界 map scan 可完整解码，也可只投影编码中的

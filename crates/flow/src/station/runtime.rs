@@ -4,7 +4,7 @@ use dogpaddle_store::{
 };
 
 use super::{
-    input::{Cursor, Input, cursor_key},
+    input::{CURSOR_ORIGIN, Input, cursor_key, encode_cursor},
     protocol::{ProcessOutcome, StationError},
 };
 
@@ -63,7 +63,7 @@ impl StationParts {
         access: TransactionAccess<'_>,
     ) -> Result<(), StoreError> {
         let mut state = self.state.access(access)?;
-        let origin = Cursor::ORIGIN.encode().to_vec();
+        let origin = encode_cursor(CURSOR_ORIGIN).to_vec();
         for index in 0..self.operation.definition().input_count() {
             state.put(&cursor_key(index), &origin)?;
         }

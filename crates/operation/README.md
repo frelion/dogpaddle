@@ -111,9 +111,10 @@ Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow �
 Station 的 intake 阶段只用只读事务读取上游日志，不推进 cursor，也不调用 Operation。进入
 process 阶段后，Station 开始并持有读写 Transaction，只把不能提交的
 `TransactionAccess` 交给 Operation。Operation 可以用自己持有的 `Cell` 或
-`OrderedMap` 直接读写持久化状态；Station 则在同一读写事务中推进输入 cursor 并发布
-output。因此 Flow 不需要知道算子的数据结构，Operation 也不能控制事务边界；Operation
-状态、输入进度和输出仍由 Station 原子提交。具体的 Change 批量方法和返回类型尚未确定。
+`OrderedMap` 直接读写持久化状态；Station 则在同一读写事务中记录处理协议要求的输入进度并
+发布 output，只有一个缓存 Change 完全退休后才推进通用 input offset。因此 Flow 不需要知道
+算子的数据结构，Operation 也不能控制事务边界；Operation 状态、输入进度和输出仍由 Station
+协调提交。具体的 Change 消费记录、批量方法和返回类型尚未确定。
 
 ## 扩展约束
 

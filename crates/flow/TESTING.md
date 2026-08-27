@@ -59,9 +59,10 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   可选 output、只读 inputs 及每个 input 至多一个 owned Change cache，不长期持有事务启动能力。
   私有测试从 Flow 一侧临时开始事务并验证同一 `TransactionAccess` 可以访问 Station output，而
   下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在 target 之后声明，build
-  和 reopen 仍按 source ID 正确注入。build 在发布 Definition 的同一事务中用稳定 key 与 16 字节
+  和 reopen 仍按 source ID 正确注入。build 在发布 Definition 的同一事务中用稳定 key 与 8 字节
   value 初始化每个 input cursor。私有测试验证 `Station::intake` 经独立 RO snapshot 加载一个完整
-  owned Change、cache hit 完全不访问 Store、entry 完成后可加载后继，以及非规范 row 被拒绝；
+  owned Change、cache hit 完全不访问 Store、cursor 推进并释放 cache 后可加载后继，以及缺失或
+  非 8 字节 cursor 与非法 Change 被拒绝；
   `Station::process(&mut Transactions) -> Result<ProcessOutcome, StationError>` 仍为明确 `todo!()`，
   Operation 统一执行协议尚未定义，测试不伪造提交行为。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须

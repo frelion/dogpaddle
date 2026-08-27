@@ -29,20 +29,4 @@ pub(crate) enum StationError {
     MissingCursor { input: usize },
     #[error("station input {input} has a malformed durable cursor")]
     MalformedCursor { input: usize },
-    #[error(
-        "station input {input} cursor row {row_index} is outside the cached Change with {rows} rows"
-    )]
-    CursorRowOutOfRange {
-        input: usize,
-        row_index: u64,
-        rows: usize,
-    },
-    #[error(
-        "station input {input} is caught up at offset {offset}, but its cursor row is {row_index}"
-    )]
-    NonzeroRowAtTail {
-        input: usize,
-        offset: u64,
-        row_index: u64,
-    },
 }

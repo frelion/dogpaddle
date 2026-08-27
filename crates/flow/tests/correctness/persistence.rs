@@ -95,7 +95,7 @@ fn build_initializes_each_input_cursor_at_the_stable_origin() {
             .unwrap()
             .get(&key)
             .unwrap(),
-        Some(vec![0; 16])
+        Some(vec![0; 8])
     );
 }
 

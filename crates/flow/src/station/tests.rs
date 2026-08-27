@@ -17,7 +17,7 @@ use dogpaddle_store::{
 use crate::{build::FlowFactory, flow::Flow};
 
 use super::{
-    Cursor, Input, Station, StationParts, cursor_key,
+    CURSOR_ORIGIN, Input, Station, StationParts, cursor_key, decode_cursor, encode_cursor,
     protocol::{ProcessOutcome, StationError},
 };
 
@@ -39,13 +39,13 @@ struct IntakeFixture {
 }
 
 impl IntakeFixture {
-    fn write_cursor(&mut self, station: usize, input: usize, cursor: Cursor) {
+    fn write_cursor(&mut self, station: usize, input: usize, offset: u64) {
         let transaction = self.transactions.begin().unwrap();
         self.stations[station]
             .state
             .access(transaction.access())
             .unwrap()
-            .put(&cursor_key(input), &cursor.encode().to_vec())
+            .put(&cursor_key(input), &encode_cursor(offset).to_vec())
             .unwrap();
         transaction.commit().unwrap();
     }
@@ -142,14 +142,7 @@ fn populated_intake_cache_is_a_store_free_idempotent_noop() {
         change.records().column(0).clone()
     };
 
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 0,
-            row_index: u64::MAX,
-        },
-    );
+    fixture.write_cursor(1, 0, u64::MAX);
     fixture.stations[1].intake(&fixture.reads).unwrap();
 
     let change = fixture.stations[1].inputs[0].cache.as_ref().unwrap();
@@ -170,55 +163,16 @@ fn intake_loads_the_next_entry_after_the_cursor_advances_and_cache_is_released()
         .column(0)
         .clone();
 
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 1,
-            row_index: 0,
-        },
-    );
+    fixture.write_cursor(1, 0, 1);
     fixture.stations[1].inputs[0].cache = None;
     fixture.stations[1].intake(&fixture.reads).unwrap();
     let change = fixture.stations[1].inputs[0].cache.as_ref().unwrap();
     assert_eq!(change.records(), fixture.changes[1].records());
     assert!(!Arc::ptr_eq(&first_column, change.records().column(0)));
 
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 2,
-            row_index: 0,
-        },
-    );
+    fixture.write_cursor(1, 0, 2);
     fixture.stations[1].inputs[0].cache = None;
     fixture.stations[1].intake(&fixture.reads).unwrap();
-    assert!(fixture.stations[1].inputs[0].cache.is_none());
-}
-
-#[test]
-fn intake_rejects_noncanonical_cursor_rows_without_populating_the_cache() {
-    let mut fixture = flow_with_changes(&[&[10, 11]]);
-
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 0,
-            row_index: 2,
-        },
-    );
-    let error = fixture.stations[1].intake(&fixture.reads).unwrap_err();
-
-    assert!(matches!(
-        error,
-        StationError::CursorRowOutOfRange {
-            input: 0,
-            row_index: 2,
-            rows: 2,
-        }
-    ));
     assert!(fixture.stations[1].inputs[0].cache.is_none());
 }
 
@@ -250,37 +204,13 @@ fn intake_rejects_a_malformed_durable_cursor() {
             .state
             .access(transaction.access())
             .unwrap()
-            .put(&cursor_key(0), &vec![0; 15])
+            .put(&cursor_key(0), &vec![0; 7])
             .unwrap();
         transaction.commit().unwrap();
     }
     let error = fixture.stations[1].intake(&fixture.reads).unwrap_err();
 
     assert!(matches!(error, StationError::MalformedCursor { input: 0 }));
-    assert!(fixture.stations[1].inputs[0].cache.is_none());
-}
-
-#[test]
-fn intake_rejects_a_nonzero_row_at_the_log_tail() {
-    let mut fixture = flow_with_changes(&[]);
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 0,
-            row_index: 1,
-        },
-    );
-    let error = fixture.stations[1].intake(&fixture.reads).unwrap_err();
-
-    assert!(matches!(
-        error,
-        StationError::NonzeroRowAtTail {
-            input: 0,
-            offset: 0,
-            row_index: 1,
-        }
-    ));
     assert!(fixture.stations[1].inputs[0].cache.is_none());
 }
 
@@ -309,13 +239,13 @@ fn intake_surfaces_invalid_change_bytes_without_populating_the_cache() {
 }
 
 #[test]
-fn intake_does_not_install_earlier_misses_when_a_later_input_is_invalid() {
+fn intake_keeps_an_earlier_cache_when_a_later_input_is_invalid() {
     let mut fixture = flow_with_changes(&[&[10, 11]]);
     let second_log = fixture.stations[1].output.as_ref().unwrap().clone();
     fixture.stations[1]
         .inputs
         .push(Input::new(ReadOnly::new(second_log)));
-    fixture.write_cursor(1, 1, Cursor::ORIGIN);
+    fixture.write_cursor(1, 1, CURSOR_ORIGIN);
     {
         let transaction = fixture.transactions.begin().unwrap();
         fixture.stations[1]
@@ -334,25 +264,16 @@ fn intake_does_not_install_earlier_misses_when_a_later_input_is_invalid() {
         error,
         StationError::InvalidInputChange { input: 1, .. }
     ));
-    assert!(
-        fixture.stations[1]
-            .inputs
-            .iter()
-            .all(|input| input.cache.is_none())
-    );
+    let change = fixture.stations[1].inputs[0].cache.as_ref().unwrap();
+    assert_eq!(change.records(), fixture.changes[0].records());
+    assert_eq!(change.diffs(), fixture.changes[0].diffs());
+    assert!(fixture.stations[1].inputs[1].cache.is_none());
 }
 
 #[test]
-fn reopen_rebuilds_an_empty_cache_from_the_durable_partial_cursor() {
-    let mut fixture = flow_with_changes(&[&[10, 11, 12]]);
-    fixture.write_cursor(
-        1,
-        0,
-        Cursor {
-            offset: 0,
-            row_index: 1,
-        },
-    );
+fn reopen_rebuilds_an_empty_cache_from_the_durable_offset() {
+    let mut fixture = flow_with_changes(&[&[10, 11, 12], &[20, 21]]);
+    fixture.write_cursor(1, 0, 1);
     let IntakeFixture {
         transactions,
         reads,
@@ -370,8 +291,8 @@ fn reopen_rebuilds_an_empty_cache_from_the_durable_partial_cursor() {
 
     stations[1].intake(&reads).unwrap();
     let change = stations[1].inputs[0].cache.as_ref().unwrap();
-    assert_eq!(change.records(), changes[0].records());
-    assert_eq!(change.diffs(), changes[0].diffs());
+    assert_eq!(change.records(), changes[1].records());
+    assert_eq!(change.diffs(), changes[1].diffs());
 }
 
 #[test]
@@ -379,21 +300,11 @@ fn cursor_keys_and_values_have_stable_port_ordered_encodings() {
     assert_eq!(cursor_key(0), b"input/00000000/cursor");
     assert_eq!(cursor_key(15), b"input/0000000f/cursor");
     assert_eq!(
-        Cursor {
-            offset: 0x0102_0304_0506_0708,
-            row_index: 0x1112_1314_1516_1718,
-        }
-        .encode(),
-        [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
-            0x17, 0x18,
-        ]
+        encode_cursor(0x0102_0304_0506_0708),
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
     );
-    assert_eq!(
-        Cursor::decode(&Cursor::ORIGIN.encode()),
-        Some(Cursor::ORIGIN)
-    );
-    assert_eq!(Cursor::decode(&[0; 15]), None);
+    assert_eq!(decode_cursor(&encode_cursor(CURSOR_ORIGIN)), Some(0));
+    assert_eq!(decode_cursor(&[0; 7]), None);
 }
 
 fn assert_station_wiring(flow: Flow) {
