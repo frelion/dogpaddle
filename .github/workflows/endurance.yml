@@ -1,0 +1,102 @@
+name: Endurance protocol
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: endurance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  endurance:
+    name: Weekly storage endurance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Restore and save Cargo cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-v1-${{ runner.os }}-endurance-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-v1-${{ runner.os }}-endurance-1.96-
+
+      - name: Create artifact directory
+        run: mkdir -p benchmark-artifacts
+
+      - name: Run Store AppendLog endurance
+        env:
+          DOGPADDLE_STORE_BENCH_PROFILE: smoke
+          DOGPADDLE_STORE_ENDURANCE_PROFILE: smoke
+          DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES: "128"
+          DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB: "64"
+          DOGPADDLE_STORE_ENDURANCE_WINDOW_MIB: "32"
+          DOGPADDLE_STORE_ENDURANCE_BATCH_MIB: "4"
+          DOGPADDLE_STORE_ENDURANCE_CHECKPOINT_EPOCHS: "4"
+          DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES: "268435456"
+          DOGPADDLE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES: "536870912"
+        run: >-
+          cargo bench --locked -p dogpaddle-store --bench append_log_endurance
+          > benchmark-artifacts/store-append-log.stdout.log
+          2> benchmark-artifacts/store-append-log.stderr.log
+
+      - name: Run Change + AppendLog endurance
+        env:
+          DOGPADDLE_CHANGE_STORE_BENCH_PROFILE: smoke
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_PROFILE: smoke
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_ROWS_PER_CHANGE: "1024"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_CHANGES_PER_CYCLE: "8"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_CYCLES: "64"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_PAYLOAD_BYTES: "256"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_RETAINED_BYTES: "33554432"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_TRUNCATE_ITEMS: "16"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_ITEMS: "8"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_BYTES: "8388608"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_REOPEN_INTERVAL_CYCLES: "8"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES: "268435456"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES: "536870912"
+          DOGPADDLE_CHANGE_STORE_ENDURANCE_WORKLOAD_MODE: all
+        run: >-
+          cargo bench --locked -p dogpaddle-change-store-integration --bench change_append_log_endurance
+          > benchmark-artifacts/change-append-log.stdout.log
+          2> benchmark-artifacts/change-append-log.stderr.log
+
+      - name: Validate machine-readable benchmark records
+        run: |
+          for output in benchmark-artifacts/*.stdout.log; do
+            records="$(awk '/^\{/' "$output")"
+            test -n "$records"
+            printf '%s\n' "$records" | jq -e . >/dev/null
+          done
+
+      - name: Upload raw benchmark records
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: endurance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-artifacts/
+          if-no-files-found: error
+          retention-days: 14

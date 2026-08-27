@@ -1,0 +1,17 @@
+* @frelion
+
+# Root build, automation, and compatibility boundaries.
+/.github/ @frelion
+/.cargo/ @frelion
+/Cargo.toml @frelion
+/Cargo.lock @frelion
+/rust-toolchain.toml @frelion
+/tools/ @frelion
+/test-support/ @frelion
+
+# Product and cross-product ownership boundaries.
+/crates/change/ @frelion
+/crates/store/ @frelion
+/crates/operation/ @frelion
+/crates/flow/ @frelion
+/integration-tests/ @frelion

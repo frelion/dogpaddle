@@ -1,3 +1,6 @@
 /target/
 .DS_Store
 
+# Machine-specific benchmark output is an artifact, not source. Stable
+# protocols and reviewed conclusions belong in TESTING/PERFORMANCE docs.
+/integration-tests/change-store/reports/

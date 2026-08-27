@@ -162,6 +162,21 @@ benchmark smoke matrix 变更必须与 Cargo target 和本节同步评审，不�
 `bench-smoke` 会先清除父进程全部 `DOGPADDLE_*` 变量，再逐 target 注入受审查配置，避免本地
 workload filter、profile 或 Store 路径悄悄改变 PR gate。
 
+### CI 分层
+
+GitHub Actions 的 PR/push gate 使用固定 Ubuntu 24.04 和 `rust-toolchain.toml` 中的 Rust 1.96：
+
+- `Workspace check` 执行规范入口 `cargo xtask check`；
+- `Latest stable compatibility` 只补充运行最新 stable 的 workspace tests，不替代 MSRV gate；
+- `Benchmark protocol smoke` 在 workspace gate 成功后实际运行 10 个 release target，只验证场景、
+  oracle 和 typed machine protocol，绝不比较 wall-clock；
+- 每周 `Endurance protocol` 用 GitHub hosted runner 执行受控 Store 与 Change + AppendLog 长稳并上传
+  14 天原始日志。共享 runner 的 latency 不能进入正式性能基线。
+
+workflow 使用只读 token、不可变 action commit SHA、并发取消和按 toolchain/lock/manifests 隔离的
+Cargo cache。缓存只加速依赖与构建产物，不保存 benchmark 数据。正式 reference 仍必须在固定专用
+机器和文件系统上由下述 runner 产生。
+
 ### 日常正确性
 
 ```bash

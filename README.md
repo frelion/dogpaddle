@@ -1,5 +1,7 @@
 # DogPaddle
 
+[![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
+
 DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它面向需要长期运行、可靠恢复且
 不希望部署独立分布式系统的数据流，把静态计算拓扑和算子状态放在同一个本地事务存储中。
 
