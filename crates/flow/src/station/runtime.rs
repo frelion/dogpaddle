@@ -1,6 +1,7 @@
 use dogpaddle_operation::operation::Operation;
 use dogpaddle_store::{
-    AppendLog, OrderedMap, ReadOnly, Small, StoreError, TransactionAccess, Transactions,
+    AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, StoreError, TransactionAccess,
+    Transactions,
 };
 
 use super::{
@@ -14,28 +15,31 @@ pub(crate) struct StationParts {
     output: Option<AppendLog<Vec<u8>>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "station instances are consumed by the future scheduling phase"
-    )
-)]
 pub(crate) struct Station {
     pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the future processing protocol")
+    )]
     pub(super) operation: Box<dyn Operation>,
     pub(super) inputs: Vec<Input>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the future processing protocol")
+    )]
     pub(super) output: Option<AppendLog<Vec<u8>>>,
 }
 
 impl Station {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Station-Operation batch protocol is not defined yet"
-        )
-    )]
+    pub(crate) fn advance(
+        &mut self,
+        reads: &ReadTransactions,
+        transactions: &mut Transactions,
+    ) -> Result<ProcessOutcome, StationError> {
+        self.intake(reads)?;
+        self.process(transactions)
+    }
+
     pub(crate) fn process(
         &mut self,
         transactions: &mut Transactions,

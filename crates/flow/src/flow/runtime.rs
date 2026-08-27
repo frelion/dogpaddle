@@ -10,44 +10,18 @@ use crate::{
 /// The runtime handle for a built or reopened persistent Flow.
 ///
 /// A Flow owns separate Store capabilities for beginning read-only and write
-/// transactions. During future scheduling it will lend the read capability to
-/// station intake and the write capability to one station's process phase. A
-/// station cannot retain either transaction-start capability across calls. The
+/// transactions. During scheduling it lends the read capability to Station
+/// intake and the write capability to one Station's process phase. A Station
+/// cannot retain either transaction-start capability across calls. The
 /// definition and data object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
-    definition: FlowDefinition,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "flow state is consumed by the future scheduling phase"
-        )
-    )]
+    pub(super) definition: FlowDefinition,
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved durable Flow state"))]
     pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "station instances are consumed by the future scheduling phase"
-        )
-    )]
     pub(super) stations: Vec<Station>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "transactions are consumed by the future scheduling phase"
-        )
-    )]
+    pub(super) schedule: Vec<usize>,
     pub(super) transactions: Transactions,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read transactions are consumed by the future scheduling phase"
-        )
-    )]
     pub(super) reads: ReadTransactions,
 }
 
@@ -57,6 +31,7 @@ impl Flow {
         definition: FlowDefinition,
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         stations: Vec<Station>,
+        schedule: Vec<usize>,
         transactions: Transactions,
         reads: ReadTransactions,
     ) -> Self {
@@ -65,6 +40,7 @@ impl Flow {
             definition,
             state,
             stations,
+            schedule,
             transactions,
             reads,
         }

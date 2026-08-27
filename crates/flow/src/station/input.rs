@@ -22,10 +22,6 @@ impl Station {
     /// A populated cache is already a complete owned entry, so repeated calls
     /// do not read that input again. This phase neither advances the offset nor
     /// interprets progress within the cached Change.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Flow scheduler is not implemented yet")
-    )]
     pub(crate) fn intake(&mut self, reads: &ReadTransactions) -> Result<(), StationError> {
         if self.inputs.iter().all(|input| input.cache.is_some()) {
             return Ok(());

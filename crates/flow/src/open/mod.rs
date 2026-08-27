@@ -50,13 +50,14 @@ impl FlowFactory {
         if observed_definition != definition_bytes {
             return Err(FlowError::DefinitionChangedDuringOpen);
         }
-        let stations = assemble_stations(&definition, station_parts);
+        let (stations, schedule) = assemble_stations(&definition, station_parts);
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
             stations,
+            schedule,
             transactions,
             reads,
         ))

@@ -127,13 +127,14 @@ impl FlowFactory {
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
-        let stations = assemble_stations(&definition, station_parts);
+        let (stations, schedule) = assemble_stations(&definition, station_parts);
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
             stations,
+            schedule,
             transactions,
             reads,
         ))

@@ -11,7 +11,7 @@ DogPaddle 用同一套规则组织全部产品 crate 和跨 crate 接缝。测�
 | Change | IPC 私有 framing/layout | Change、Schema、Projection、codec | `change_core`、`change_codec` | 暂无独立状态，不适用 |
 | Store | 当前无必须访问私有实现的测试 | Store、事务、布局、Cell、OrderedMap、AppendLog、崩溃恢复 | `cell`、`ordered_map`、`append_log` | `append_log_endurance` |
 | Operation | decoder registry、类型擦除和具名实例绑定 | Definition、codec、materialize、SequenceSource、Count | `operation_core` | 当前只有定长 Cell 状态，不适用 |
-| Flow | definition/拓扑 codec、内部 Station 装配与 intake cache | build/open、资源布局、失败无副作用 | `flow_lifecycle`（冷路径） | 尚无完整运行时，不适用 |
+| Flow | definition/拓扑 codec、派生 schedule、内部 Station 装配与 intake cache | build/open、资源布局、失败无副作用、`advance` 有界轮次签名 | `flow_lifecycle`（冷路径） | 尚无完整运行时，不适用 |
 | Change + Store | 不适用 | 完整 Change entry、回放、事务、重批、reopen | `change_append_log` | `change_append_log_endurance` |
 
 这里的“不适用”是显式边界，不是漏测。新增稳定运行路径、无界状态或跨层调度器时，必须先确定

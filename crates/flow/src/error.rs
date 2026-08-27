@@ -3,7 +3,10 @@ use thiserror::Error;
 use dogpaddle_operation::MaterializeError;
 use dogpaddle_store::StoreError;
 
-use crate::build::{FlowDefinitionError, TopologyError};
+use crate::{
+    build::{FlowDefinitionError, TopologyError},
+    station::StationError,
+};
 
 /// Failure while building or opening a persistent Flow.
 #[derive(Debug, Error)]
@@ -33,4 +36,28 @@ pub enum FlowError {
         /// Stable Store data object name that could not be opened.
         name: String,
     },
+}
+
+/// Failure while advancing one Station in a running Flow.
+#[derive(Debug, Error)]
+#[error("station {station_id:?} failed: {source}")]
+pub struct FlowRunError {
+    station_id: String,
+    #[source]
+    source: StationError,
+}
+
+impl FlowRunError {
+    pub(crate) fn new(station_id: &str, source: StationError) -> Self {
+        Self {
+            station_id: station_id.to_owned(),
+            source,
+        }
+    }
+
+    /// Returns the stable ID of the Station whose turn failed.
+    #[must_use]
+    pub fn station_id(&self) -> &str {
+        &self.station_id
+    }
 }

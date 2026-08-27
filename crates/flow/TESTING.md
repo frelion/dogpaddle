@@ -3,8 +3,10 @@
 本文件规定 `dogpaddle-flow` 的测试所有权、持久化兼容性验证和 `build/open` 生命周期基准。
 dogpaddle-flow 是 Operation 与 Store 的产品组合根，因此真实资源创建、Operation 物化和重新
 打开测试属于本 crate；它们不需要再放入 `integration-tests/flow-store`。当前已有 Station output
-log 与只读 input capability 的装配，但尚无 `Flow::start`、`Flow::advance`、Change 处理或可观察
-Sink，所以本协议不伪造端到端运行测试，也不建立空的 `integration-tests/engine` package。
+log、只读 input capability、确定性拓扑 schedule 和公共有界轮次骨架，但尚无公共
+`Flow::start`、Change 处理或可观察 Sink；`Flow::advance` 已公开，但会明确到达
+`Station::process` 的 `todo!()`。因此本协议锁定其有界轮次签名和这个显式处理边界，不伪造端到端
+运行测试，也不建立空的 `integration-tests/engine` package。
 
 ## 目录与所有权
 
@@ -12,8 +14,9 @@ Sink，所以本协议不伪造端到端运行测试，也不建立空的 `integ
 crates/flow/
 ├── src/build/tests.rs                 # 私有 FlowFactory 构建、拓扑、Definition codec 与 CRC 测试
 ├── src/open/tests.rs                  # 私有两阶段 reopen 与资源重新装配测试
-├── src/flow/runtime.rs                # 运行态 Flow 数据与 API
-├── src/flow/tests.rs                  # 私有运行态 Flow 所有权与生命周期测试
+├── src/flow/runtime.rs                # 运行态 Flow 数据与生命周期 API
+├── src/flow/advance.rs                # 单轮调度协议与 Flow::advance
+├── src/flow/tests.rs                  # 私有运行态 Flow 所有权、schedule 与生命周期测试
 ├── src/station/runtime.rs             # Station 装配与 process 边界
 ├── src/station/input.rs               # durable cursor、owned cache 与 intake
 ├── src/station/protocol.rs            # Station outcome 与错误
@@ -59,8 +62,9 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   可选 output、只读 inputs 及每个 input 至多一个 owned Change cache，不长期持有事务启动能力。
   私有测试从 Flow 一侧临时开始事务并验证同一 `TransactionAccess` 可以访问 Station output，而
   下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在 target 之后声明，build
-  和 reopen 仍按 source ID 正确注入。build 在发布 Definition 的同一事务中用稳定 key 与 8 字节
-  value 初始化每个 input cursor。私有测试验证 `Station::intake` 经独立 RO snapshot 加载一个完整
+  和 reopen 仍按 source ID 正确注入；二者派生相同的分层拓扑 schedule，同层保持声明顺序，且
+  公共有界轮次的方法签名保持固定。build 在发布 Definition 的同一事务中用稳定 key
+  与 8 字节 value 初始化每个 input cursor。私有测试验证 `Station::intake` 经独立 RO snapshot 加载一个完整
   owned Change、cache hit 完全不访问 Store、cursor 推进并释放 cache 后可加载后继，以及缺失或
   非 8 字节 cursor 与非法 Change 被拒绝；
   `Station::process(&mut Transactions) -> Result<ProcessOutcome, StationError>` 仍为明确 `todo!()`，

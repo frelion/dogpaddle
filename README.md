@@ -39,7 +39,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
   投影解码、同事务原样转发和有界前缀回收；Flow 已完成 Station output 与只读 input 的资源
-  装配及只读 intake，完整运行调度与 Operation Change 处理协议仍未实现。
+  装配及只读 intake，并从 Definition 派生确定性的分层拓扑 schedule。内部有界轮次已经按该
+  schedule 为每个 Station 保留一次 turn，并通过 `Flow::advance` 暴露；Operation Change 处理协议
+  仍未实现，当前轮次会明确停在 `Station::process` 的 `todo!()`。
 
 ## 内部架构
 
@@ -67,8 +69,10 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>`
 持久化验证。Station 已有稳定 input cursor，以及通过只读事务幂等准备输入的 `intake`；写阶段
 `process(&mut Transactions)` 的位置和 `Idle / Progressed` 结果已经固定，但方法体
-仍为 `todo!()`，等待 Station–Operation 批处理协议。尚未实现 `Flow::start`、`Flow::advance`、
-输入消费与输出的原子提交、背压或中断续跑，因此还不是可执行的流引擎。
+仍为 `todo!()`，等待 Station–Operation 批处理协议。Flow 已经拥有 build/open 共用的稳定拓扑
+schedule，并公开一次最多给每个 Station 一个 turn 的 `Flow::advance`；当前调用会按设计撞上
+`Station::process` 的 `todo!()`。尚未实现 `Flow::start`、输入消费与输出的原子提交、背压或中断
+续跑，因此还不是可执行的流引擎。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

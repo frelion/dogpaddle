@@ -3,14 +3,11 @@ use dogpaddle_store::StoreError;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "station process outcomes are returned by the future scheduling phase"
-    )
-)]
 pub(crate) enum ProcessOutcome {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Station readiness awaits the processing protocol")
+    )]
     Idle,
     Progressed,
 }

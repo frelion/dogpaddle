@@ -1,7 +1,24 @@
-use dogpaddle_flow::{FlowError, FlowFactory};
+use dogpaddle_flow::{AdvanceOutcome, Flow, FlowError, FlowFactory, FlowRunError};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
+
+#[test]
+fn advance_exposes_one_bounded_scheduling_round() {
+    let _: fn(&mut Flow) -> Result<AdvanceOutcome, FlowRunError> = Flow::advance;
+    assert_ne!(AdvanceOutcome::Idle, AdvanceOutcome::Progressed);
+}
+
+#[test]
+#[should_panic(expected = "station processing awaits the Station-Operation batch protocol")]
+fn advance_reaches_the_explicit_station_processing_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let mut builder = FlowFactory::new(root.path().join("flow"));
+    builder.station("source", SequenceSourceDefinition::new(0));
+    let mut flow = builder.build().unwrap();
+
+    let _ = flow.advance();
+}
 
 #[test]
 fn build_freezes_and_open_rematerializes_a_real_flow() {
