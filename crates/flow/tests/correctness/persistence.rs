@@ -1,4 +1,4 @@
-use dogpaddle_flow::{Flow, FlowError};
+use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
@@ -12,7 +12,7 @@ const V1_SEQUENCE_COUNT: &str = include_str!("../fixtures/v1/sequence_source_cou
 fn build_publishes_the_stable_v1_definition_bytes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut builder = Flow::builder(&path);
+    let mut builder = FlowFactory::new(&path);
     let source = builder.stage("source", SequenceSourceDefinition::new(7));
     let count = builder.stage("count", CountDefinition::new());
     builder.connect([source], count);
@@ -22,7 +22,7 @@ fn build_publishes_the_stable_v1_definition_bytes() {
         read_published_definition(&path),
         fixture_bytes(V1_SEQUENCE_COUNT)
     );
-    let flow = Flow::open(&path).unwrap();
+    let flow = FlowFactory::open(&path).unwrap();
     assert_eq!(flow.stage_ids().collect::<Vec<_>>(), ["source", "count"]);
 }
 
@@ -30,7 +30,7 @@ fn build_publishes_the_stable_v1_definition_bytes() {
 fn build_uses_the_stable_resource_layout() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut builder = Flow::builder(&path);
+    let mut builder = FlowFactory::new(&path);
     let source = builder.stage("source", SequenceSourceDefinition::new(0));
     let count = builder.stage("count", CountDefinition::new());
     builder.connect([source], count);
@@ -89,7 +89,7 @@ fn open_reports_a_missing_stage_output_after_publication() {
     drop(transactions);
 
     assert!(matches!(
-        Flow::open(&incomplete_path),
+        FlowFactory::open(&incomplete_path),
         Err(FlowError::MissingResource { name })
             if name == "stage/00000000/output"
     ));
@@ -123,7 +123,7 @@ fn open_reports_a_stage_output_size_mismatch() {
     drop(transactions);
 
     assert!(matches!(
-        Flow::open(&mismatched_path),
+        FlowFactory::open(&mismatched_path),
         Err(FlowError::Store(StoreError::DataSizeMismatch {
             name,
             expected: "large",
@@ -142,7 +142,10 @@ fn open_rejects_an_unpublished_build() {
         .unwrap();
     drop(store);
 
-    assert!(matches!(Flow::open(&path), Err(FlowError::IncompleteBuild)));
+    assert!(matches!(
+        FlowFactory::open(&path),
+        Err(FlowError::IncompleteBuild)
+    ));
 }
 
 #[test]
@@ -160,7 +163,10 @@ fn open_rejects_a_corrupt_published_definition() {
     }
     drop(transactions);
 
-    assert!(matches!(Flow::open(&path), Err(FlowError::Definition(_))));
+    assert!(matches!(
+        FlowFactory::open(&path),
+        Err(FlowError::Definition(_))
+    ));
 }
 
 #[test]
@@ -187,7 +193,7 @@ fn open_reports_a_missing_resource_after_publication() {
     drop(transactions);
 
     assert!(matches!(
-        Flow::open(&incomplete_path),
+        FlowFactory::open(&incomplete_path),
         Err(FlowError::MissingResource { name })
             if name == "stage/00000000/operation/sequence_source.position"
     ));
@@ -220,7 +226,7 @@ fn open_reports_an_operation_data_size_mismatch() {
     drop(transactions);
 
     assert!(matches!(
-        Flow::open(&mismatched_path),
+        FlowFactory::open(&mismatched_path),
         Err(FlowError::Store(StoreError::DataSizeMismatch {
             name,
             expected: "small",

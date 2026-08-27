@@ -34,8 +34,8 @@ pub enum TopologyError {
     /// Two stages declared the same stable ID.
     #[error("duplicate stage ID {0:?}")]
     DuplicateStageId(String),
-    /// A connection used a reference created by another builder.
-    #[error("stage reference belongs to another flow builder")]
+    /// A connection used a reference created by another factory.
+    #[error("stage reference belongs to another flow factory")]
     ForeignStageRef(StageRef),
     /// `connect` was called without any sources.
     #[error("stage {0:?} was connected with an empty source list")]
@@ -208,7 +208,7 @@ fn resolve_ref(
     stage_count: usize,
     reference: StageRef,
 ) -> Result<usize, TopologyError> {
-    if reference.builder_token != token || reference.index >= stage_count {
+    if reference.factory_token != token || reference.index >= stage_count {
         Err(TopologyError::ForeignStageRef(reference))
     } else {
         Ok(reference.index)

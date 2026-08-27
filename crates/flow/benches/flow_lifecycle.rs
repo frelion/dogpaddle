@@ -7,7 +7,7 @@ use dogpaddle_bench_protocol::{
     Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
     positive_usize_list, require_benchmark_build,
 };
-use dogpaddle_flow::{Flow, FlowBuilder};
+use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
@@ -89,15 +89,15 @@ fn benchmark_fresh_build(root: &BenchRoot, config: &Config, stage_count: usize) 
 
 fn measure_fresh_build(root: &BenchRoot, stage_count: usize) -> Duration {
     let sample = root.sample("flow-build");
-    let builder = linear_builder(sample.path(), stage_count);
+    let factory = linear_factory(sample.path(), stage_count);
 
     let started = std::time::Instant::now();
-    let flow = builder.build().expect("build benchmark Flow");
+    let flow = factory.build().expect("build benchmark Flow");
     let elapsed = started.elapsed();
 
     validate_flow(&flow, sample.path(), stage_count);
     drop(flow);
-    let reopened = Flow::open(sample.path()).expect("reopen freshly built benchmark Flow");
+    let reopened = FlowFactory::open(sample.path()).expect("reopen freshly built benchmark Flow");
     validate_flow(&reopened, sample.path(), stage_count);
     drop(reopened);
     drop(sample);
@@ -106,13 +106,13 @@ fn measure_fresh_build(root: &BenchRoot, stage_count: usize) -> Duration {
 
 fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, stage_count: usize) {
     let fixture = root.sample("flow-reopen");
-    let flow = linear_builder(fixture.path(), stage_count)
+    let flow = linear_factory(fixture.path(), stage_count)
         .build()
         .expect("build reopen benchmark fixture");
     validate_flow(&flow, fixture.path(), stage_count);
     drop(flow);
 
-    let preflight = Flow::open(fixture.path()).expect("preflight reopen benchmark fixture");
+    let preflight = FlowFactory::open(fixture.path()).expect("preflight reopen benchmark fixture");
     validate_flow(&preflight, fixture.path(), stage_count);
     drop(preflight);
     for _ in 0..config.warmups {
@@ -130,7 +130,7 @@ fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, stage_count: usize) 
 
 fn measure_reopen(path: &Path, stage_count: usize) -> Duration {
     let started = std::time::Instant::now();
-    let flow = Flow::open(path).expect("open benchmark Flow");
+    let flow = FlowFactory::open(path).expect("open benchmark Flow");
     let elapsed = started.elapsed();
 
     validate_flow(&flow, path, stage_count);
@@ -138,16 +138,16 @@ fn measure_reopen(path: &Path, stage_count: usize) -> Duration {
     elapsed
 }
 
-fn linear_builder(path: &Path, stage_count: usize) -> FlowBuilder {
+fn linear_factory(path: &Path, stage_count: usize) -> FlowFactory {
     assert!(stage_count > 0, "benchmark Flow must contain a stage");
-    let mut builder = Flow::builder(path);
-    let mut previous = builder.stage("source", SequenceSourceDefinition::new(0));
+    let mut factory = FlowFactory::new(path);
+    let mut previous = factory.stage("source", SequenceSourceDefinition::new(0));
     for index in 1..stage_count {
-        let current = builder.stage(format!("count-{index:08x}"), CountDefinition::new());
-        builder.connect([previous], current);
+        let current = factory.stage(format!("count-{index:08x}"), CountDefinition::new());
+        factory.connect([previous], current);
         previous = current;
     }
-    builder
+    factory
 }
 
 fn validate_flow(flow: &Flow, path: &Path, stage_count: usize) {
@@ -184,7 +184,7 @@ fn emit_configuration(config: &Config) {
         .expect("add Flow benchmark sample count")
         .with("warmups", config.warmups)
         .expect("add Flow benchmark warmup count")
-        .with("fresh_build_path_and_builder", "outside_timing")
+        .with("fresh_build_path_and_factory", "outside_timing")
         .expect("add Flow fresh-build setup policy")
         .with("fresh_build_store_per_sample", true)
         .expect("add Flow fresh-build store policy")

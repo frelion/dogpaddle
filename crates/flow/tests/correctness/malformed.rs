@@ -1,6 +1,6 @@
 use std::panic::catch_unwind;
 
-use dogpaddle_flow::{Flow, FlowDefinitionError, FlowError};
+use dogpaddle_flow::{FlowDefinitionError, FlowError, FlowFactory};
 use dogpaddle_operation::DefinitionCodecError;
 
 use super::support::{fixture_bytes, publish_definition, rewrite_checksum};
@@ -125,8 +125,8 @@ fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
     for (index, (name, encoded)) in cases.into_iter().enumerate() {
         let path = root.path().join(format!("case-{index:03}"));
         publish_definition(&path, &encoded);
-        let outcome = catch_unwind(|| Flow::open(&path));
-        assert!(outcome.is_ok(), "Flow::open panicked for {name}");
+        let outcome = catch_unwind(|| FlowFactory::open(&path));
+        assert!(outcome.is_ok(), "FlowFactory::open panicked for {name}");
         let Err(error) = outcome.unwrap() else {
             panic!("malformed definition {name} unexpectedly opened");
         };
@@ -140,7 +140,7 @@ fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
 fn open_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowError {
     let path = root.join(name);
     publish_definition(&path, encoded);
-    let Err(error) = Flow::open(path) else {
+    let Err(error) = FlowFactory::open(path) else {
         panic!("mutated definition unexpectedly opened");
     };
     error

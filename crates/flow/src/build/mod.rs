@@ -7,11 +7,7 @@ use std::{
 use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
-use crate::{
-    error::FlowError,
-    flow::{Flow, assemble_stages},
-    stage::StageParts,
-};
+use crate::{assembly::assemble_stages, error::FlowError, flow::Flow, stage::StageParts};
 
 pub(crate) mod codec;
 mod definition;
@@ -21,33 +17,41 @@ pub use codec::FlowDefinitionError;
 pub(crate) use definition::{FlowDefinition, StageDefinition};
 pub use validate::{InvalidStageIdReason, TopologyError};
 
-static NEXT_BUILDER_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Builder for one persistent, immutable Flow definition.
+/// Factory for building or opening a persistent Flow.
 ///
-/// Declaring stages and connections is side-effect free. [`FlowBuilder::build`]
+/// Declaring stages and connections is side-effect free. [`FlowFactory::build`]
 /// validates the complete graph before creating the Store at the target path.
-pub struct FlowBuilder {
+/// [`FlowFactory::open`] directly restores an already-built Flow without
+/// creating a factory instance.
+pub struct FlowFactory {
     path: PathBuf,
     token: u64,
     stages: Vec<StageDefinition>,
     connections: Vec<(Vec<StageRef>, StageRef)>,
 }
 
-/// Temporary reference to a stage declared in one [`FlowBuilder`].
+/// Temporary reference to a stage declared in one [`FlowFactory`].
 ///
-/// A reference is valid only while assembling the builder that created it. The
+/// A reference is valid only while assembling the factory that created it. The
 /// durable Flow definition stores stable stage IDs instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StageRef {
-    builder_token: u64,
+    factory_token: u64,
     index: usize,
 }
 
-impl FlowBuilder {
-    pub(crate) fn new(path: impl AsRef<Path>) -> Self {
-        let token = NEXT_BUILDER_TOKEN.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(token, 0, "flow builder token space exhausted");
+impl FlowFactory {
+    /// Starts a side-effect-free definition for a new persistent Flow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process exhausts the nonzero factory-token space.
+    #[must_use]
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        let token = NEXT_FACTORY_TOKEN.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(token, 0, "flow factory token space exhausted");
         Self {
             path: path.as_ref().to_path_buf(),
             token,
@@ -58,14 +62,14 @@ impl FlowBuilder {
 
     /// Declares one stage containing exactly one concrete operation definition.
     ///
-    /// The returned reference belongs to this builder and is used only by
-    /// [`FlowBuilder::connect`]. The string ID is the stage's durable identity.
+    /// The returned reference belongs to this factory and is used only by
+    /// [`FlowFactory::connect`]. The string ID is the stage's durable identity.
     pub fn stage<D>(&mut self, id: impl Into<String>, definition: D) -> StageRef
     where
         D: OperationDefinition,
     {
         let reference = StageRef {
-            builder_token: self.token,
+            factory_token: self.token,
             index: self.stages.len(),
         };
         self.stages
@@ -96,7 +100,7 @@ impl FlowBuilder {
     ///
     /// Returns a [`FlowError`] for an invalid topology, unencodable definition,
     /// occupied path, or Store failure. A Store failure after path creation can
-    /// leave an incomplete build that [`Flow::open`] refuses to open.
+    /// leave an incomplete build that [`FlowFactory::open`] refuses to open.
     pub fn build(self) -> Result<Flow, FlowError> {
         let path = self.path.clone();
         let definition = self.finish_definition()?;
@@ -117,7 +121,7 @@ impl FlowBuilder {
         }
         let stages = assemble_stages(&definition, stage_parts, &transactions);
 
-        Ok(Flow::from_build(
+        Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
@@ -174,11 +178,7 @@ fn create_stage_part(
         .produces_output()
         .then(|| store.create_data::<AppendLog<Vec<u8>>>(&codec::stage_output_name(index)))
         .transpose()?;
-    Ok(StageParts {
-        state,
-        operation,
-        output,
-    })
+    Ok(StageParts::new(state, operation, output))
 }
 
 #[cfg(test)]

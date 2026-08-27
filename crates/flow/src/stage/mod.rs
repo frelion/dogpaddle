@@ -2,9 +2,9 @@ use dogpaddle_operation::operation::Operation;
 use dogpaddle_store::{AppendLog, OrderedMap, ReadOnly, Small, Transactions};
 
 pub(crate) struct StageParts {
-    pub(crate) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
-    pub(crate) operation: Box<dyn Operation>,
-    pub(crate) output: Option<AppendLog<Vec<u8>>>,
+    state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
+    operation: Box<dyn Operation>,
+    output: Option<AppendLog<Vec<u8>>>,
 }
 
 #[cfg_attr(
@@ -15,37 +15,51 @@ pub(crate) struct StageParts {
     )
 )]
 pub(crate) struct Stage {
-    pub(crate) transactions: Transactions,
-    pub(crate) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
-    pub(crate) operation: Box<dyn Operation>,
-    pub(crate) inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
-    pub(crate) output: Option<AppendLog<Vec<u8>>>,
+    transactions: Transactions,
+    state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
+    operation: Box<dyn Operation>,
+    inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
+    output: Option<AppendLog<Vec<u8>>>,
 }
 
-impl Stage {
+impl StageParts {
     pub(crate) fn new(
-        transactions: Transactions,
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         operation: Box<dyn Operation>,
-        inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
         output: Option<AppendLog<Vec<u8>>>,
     ) -> Self {
+        Self {
+            state,
+            operation,
+            output,
+        }
+    }
+
+    pub(crate) fn output(&self) -> Option<&AppendLog<Vec<u8>>> {
+        self.output.as_ref()
+    }
+
+    pub(crate) fn finish(
+        self,
+        transactions: Transactions,
+        inputs: Vec<ReadOnly<AppendLog<Vec<u8>>>>,
+    ) -> Stage {
         assert_eq!(
             inputs.len(),
-            operation.definition().input_count(),
+            self.operation.definition().input_count(),
             "stage input capabilities must match its operation definition"
         );
         assert_eq!(
-            output.is_some(),
-            operation.definition().produces_output(),
+            self.output.is_some(),
+            self.operation.definition().produces_output(),
             "stage output capability must match its operation definition"
         );
-        Self {
+        Stage {
             transactions,
-            state,
-            operation,
+            state: self.state,
+            operation: self.operation,
             inputs,
-            output,
+            output: self.output,
         }
     }
 }

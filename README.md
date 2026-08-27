@@ -8,16 +8,17 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 ## 产品定位
 
 流计算不仅要描述“数据如何转换”，还要明确拓扑何时冻结、状态如何保存，以及进程重启后
-如何重新获得同一组计算资源。DogPaddle 将 Flow 分成两个阶段：构建阶段声明完整 DAG 和
-所有持久化数据空间；构建成功后拓扑与资源布局不可变，只保留运行所需的事务能力。
+如何重新获得同一组计算资源。DogPaddle 用 `FlowFactory` 声明、构建或重新打开完整 DAG 和
+所有持久化数据空间；成功返回的 `Flow` 只表示拓扑与资源布局已经冻结的运行态，只保留运行
+所需的事务能力。
 
 ## 已有能力
 
 - **强类型静态 DAG**：sealed `OperationDefinition` trait 声明输入数量、是否产生输出和状态
-  形状，Flow 校验有序连接、唯一 Stage ID、自环、多节点环，以及 source 确实拥有输出。
+  形状，`FlowFactory` 校验有序连接、唯一 Stage ID、自环、多节点环，以及 source 确实拥有输出。
 - **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
   标记最后提交。
-- **直接重新打开**：`Flow::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
+- **直接重新打开**：`FlowFactory::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
   调用方不需要再次组装。
 - **稳定格式边界**：Flow 与 Operation Definition 使用显式版本、tag、完整性校验和确定性
   资源命名，不依赖 Rust 内存布局。
@@ -39,16 +40,16 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 
 | crate | 职责 |
 | --- | --- |
-| [`dogpaddle-flow`](crates/flow/README.md) | Flow Builder、拓扑校验、持久化 `build/open`，以及未来的内部 Stage 运行时。 |
+| [`dogpaddle-flow`](crates/flow/README.md) | `FlowFactory`、拓扑校验、持久化 `build/open`，以及运行态 `Flow` 与内部 Stage。 |
 | [`dogpaddle-change`](crates/change/README.md) | 共享 `Change`、Schema 校验与自描述 Arrow IPC Stream 编解码。 |
 | [`dogpaddle-operation`](crates/operation/README.md) | 具体 Operation 的纯 Definition、稳定编码、持久化 Data 与实例。 |
 | [`dogpaddle-store`](crates/store/README.md) | MDBX 事务存储、命名数据空间、编解码器和类型化集合。 |
 
 Stage 是 Flow 内部的一对一 Operation 执行单元，不是独立 crate。上述 crate 是引擎内核的
-实现模块，不是最终用户二进制入口。正常产品依赖的装配契约归组合根 crate 所有，例如 Flow
-负责验证 Operation + Store 的 build/open；只有没有产品组合根的 sibling 接缝才进入外部测试
-package。`integration-tests/change-store` 因而作为不可发布的下游包，只通过公共 API 验证完整
-Change Stream 与 `AppendLog<Vec<u8>>` 的装配边界。
+实现模块，不是最终用户二进制入口。正常产品依赖的装配契约归组合根 crate 所有，例如
+dogpaddle-flow 负责验证 Operation + Store 的 build/open；只有没有产品组合根的 sibling 接缝
+才进入外部测试 package。`integration-tests/change-store` 因而作为不可发布的下游包，只通过
+公共 API 验证完整 Change Stream 与 `AppendLog<Vec<u8>>` 的装配边界。
 
 ## 适用场景
 
@@ -57,8 +58,9 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 ## 当前边界
 
-当前仓库完成了 Flow 的持久化定义、构建和重新打开，Stage output/input capability 装配，
-以及 Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>` 持久化验证；尚未实现
+当前仓库完成了 `FlowFactory` 的持久化定义、构建和重新打开，以及运行态 Flow 的 Stage
+output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>`
+持久化验证；尚未实现
 `run`、Stage 调度、输入 offset 协议、背压、中断续跑或输出提交，因此还不是可执行的流引擎。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store

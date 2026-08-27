@@ -7,7 +7,9 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, ReadOnly, Small, Store, Transactions};
 
-use super::Stage;
+use crate::{build::FlowFactory, flow::Flow};
+
+use super::{Stage, StageParts};
 
 struct StageFixture {
     flow_transactions: Transactions,
@@ -80,6 +82,56 @@ fn stage_owns_transactions_and_output_while_the_downstream_input_is_read_only() 
     }
 }
 
+#[test]
+fn build_and_open_inject_the_later_declared_source_output_as_read_only_input() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let count = factory.stage("count", CountDefinition::new());
+    let source = factory.stage("source", SequenceSourceDefinition::new(0));
+    factory.connect([source], count);
+
+    assert_stage_wiring(factory.build().unwrap());
+    assert_stage_wiring(FlowFactory::open(&path).unwrap());
+}
+
+fn assert_stage_wiring(flow: Flow) {
+    let mut stages = flow.into_stages();
+    assert_eq!(stages.len(), 2);
+    assert_eq!(stages[0].inputs.len(), 1);
+    assert!(stages[0].output.is_some());
+    assert!(stages[1].inputs.is_empty());
+    assert!(stages[1].output.is_some());
+
+    {
+        let source = &mut stages[1];
+        let transaction = source.transactions.begin().unwrap();
+        let mut output = source
+            .output
+            .as_ref()
+            .expect("source produces output")
+            .access(transaction.access())
+            .unwrap();
+        if output.bounds().unwrap().is_empty() {
+            output.append(&b"change".to_vec()).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    {
+        let count = &mut stages[0];
+        let transaction = count.transactions.begin().unwrap();
+        assert_eq!(
+            count.inputs[0]
+                .access(transaction.access())
+                .unwrap()
+                .bounds()
+                .unwrap(),
+            0..1
+        );
+    }
+}
+
 fn stage_fixture() -> StageFixture {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("flow")).unwrap();
@@ -95,6 +147,7 @@ fn stage_fixture() -> StageFixture {
     let source_output = store
         .create_data::<AppendLog<Vec<u8>>>("source-output")
         .unwrap();
+    let count_input = ReadOnly::new(source_output.clone());
 
     let count_definition = CountDefinition::new();
     let count_state = store
@@ -109,22 +162,10 @@ fn stage_fixture() -> StageFixture {
         .unwrap();
 
     let flow_transactions = store.into_transactions();
-    let source = Stage::new(
-        flow_transactions.clone(),
-        source_state,
-        source_operation,
-        Vec::new(),
-        Some(source_output),
-    );
-    let count = Stage::new(
-        flow_transactions.clone(),
-        count_state,
-        count_operation,
-        vec![ReadOnly::new(
-            source.output.as_ref().expect("source has output").clone(),
-        )],
-        Some(count_output),
-    );
+    let source = StageParts::new(source_state, source_operation, Some(source_output))
+        .finish(flow_transactions.clone(), Vec::new());
+    let count = StageParts::new(count_state, count_operation, Some(count_output))
+        .finish(flow_transactions.clone(), vec![count_input]);
     StageFixture {
         flow_transactions,
         source,

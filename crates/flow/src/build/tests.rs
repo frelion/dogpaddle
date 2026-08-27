@@ -4,7 +4,7 @@ use dogpaddle_operation::{
 };
 
 use super::{
-    FlowBuilder, FlowDefinitionError, InvalidStageIdReason, StageRef, TopologyError,
+    FlowDefinitionError, FlowFactory, InvalidStageIdReason, StageRef, TopologyError,
     codec::{CHECKSUM_LENGTH, crc32, decode, encode},
     definition::{FlowDefinition, StageDefinition},
     validate::{validate_acyclic, validate_connections},
@@ -18,8 +18,8 @@ fn count() -> CountDefinition {
     CountDefinition::new()
 }
 
-fn builder() -> FlowBuilder {
-    FlowBuilder::new("")
+fn factory() -> FlowFactory {
+    FlowFactory::new("")
 }
 
 fn find_stage<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StageDefinition {
@@ -34,7 +34,7 @@ fn finish_target<D>(operation: D, actual: usize) -> Result<FlowDefinition, Topol
 where
     D: OperationDefinition,
 {
-    let mut builder = builder();
+    let mut builder = factory();
     let sources = (0..actual)
         .map(|index| builder.stage(format!("source-{index}"), source(index as u64)))
         .collect::<Vec<_>>();
@@ -47,7 +47,7 @@ where
 
 #[test]
 fn finish_preserves_stage_order_and_resolves_references() {
-    let mut builder = builder();
+    let mut builder = factory();
     builder.stage("first", source(1));
     let second = builder.stage("second", source(2));
     let target = builder.stage("target", count());
@@ -80,7 +80,7 @@ fn finish_preserves_stage_order_and_resolves_references() {
 
 #[test]
 fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
-    let mut builder = builder();
+    let mut builder = factory();
     let first = builder.stage("first", source(1));
     let second = builder.stage("second", source(2));
     let target = builder.stage("target", count());
@@ -96,14 +96,14 @@ fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
 #[test]
 fn finish_rejects_an_empty_definition() {
     assert_eq!(
-        builder().finish_definition().unwrap_err(),
+        factory().finish_definition().unwrap_err(),
         TopologyError::EmptyTopology
     );
 }
 
 #[test]
 fn finish_rejects_invalid_stage_ids_in_declaration_order() {
-    let mut builder = builder();
+    let mut builder = factory();
     builder.stage("", source(0));
     builder.stage("contains\0nul", source(1));
 
@@ -115,7 +115,7 @@ fn finish_rejects_invalid_stage_ids_in_declaration_order() {
         }
     );
 
-    let mut nul_builder = FlowBuilder::new("");
+    let mut nul_builder = FlowFactory::new("");
     nul_builder.stage("contains\0nul", source(0));
     assert_eq!(
         nul_builder.finish_definition().unwrap_err(),
@@ -128,13 +128,13 @@ fn finish_rejects_invalid_stage_ids_in_declaration_order() {
 
 #[test]
 fn finish_rejects_duplicate_stage_ids_before_connections() {
-    let mut builder = builder();
+    let mut builder = factory();
     let first = builder.stage("same", source(0));
     builder.stage("same", source(1));
     builder.connect(
         [first],
         StageRef {
-            builder_token: 0,
+            factory_token: 0,
             index: 0,
         },
     );
@@ -147,10 +147,10 @@ fn finish_rejects_duplicate_stage_ids_before_connections() {
 
 #[test]
 fn finish_rejects_foreign_source_and_target_references() {
-    let mut left = builder();
+    let mut left = factory();
     let foreign = left.stage("foreign", source(0));
 
-    let mut right = builder();
+    let mut right = factory();
     let target = right.stage("target", count());
     right.connect([foreign], target);
     assert_eq!(
@@ -158,7 +158,7 @@ fn finish_rejects_foreign_source_and_target_references() {
         TopologyError::ForeignStageRef(foreign)
     );
 
-    let mut right = builder();
+    let mut right = factory();
     let source = right.stage("source", source(0));
     right.connect([source], foreign);
     assert_eq!(
@@ -169,7 +169,7 @@ fn finish_rejects_foreign_source_and_target_references() {
 
 #[test]
 fn finish_rejects_an_explicit_empty_source_list() {
-    let mut builder = builder();
+    let mut builder = factory();
     let target = builder.stage("target", source(0));
     builder.connect([], target);
 
@@ -218,7 +218,7 @@ fn finish_rejects_every_known_input_count_mismatch() {
 
 #[test]
 fn finish_rejects_setting_sources_twice() {
-    let mut builder = builder();
+    let mut builder = factory();
     let first = builder.stage("first", source(1));
     let second = builder.stage("second", source(2));
     let target = builder.stage("target", count());
@@ -233,7 +233,7 @@ fn finish_rejects_setting_sources_twice() {
 
 #[test]
 fn finish_rejects_a_direct_self_loop() {
-    let mut builder = builder();
+    let mut builder = factory();
     let stage = builder.stage("stage", count());
     builder.connect([stage], stage);
 
@@ -245,7 +245,7 @@ fn finish_rejects_a_direct_self_loop() {
 
 #[test]
 fn finish_rejects_a_multi_stage_cycle() {
-    let mut builder = builder();
+    let mut builder = factory();
     let first = builder.stage("first", count());
     let second = builder.stage("second", count());
     let third = builder.stage("third", count());
@@ -261,7 +261,7 @@ fn finish_rejects_a_multi_stage_cycle() {
 
 #[test]
 fn finish_allows_fan_out() {
-    let mut builder = builder();
+    let mut builder = factory();
     let source = builder.stage("source", source(0));
     let left = builder.stage("left", count());
     let right = builder.stage("right", count());
@@ -276,7 +276,7 @@ fn finish_allows_fan_out() {
 
 #[test]
 fn finish_allows_zero_input_stages_and_disconnected_components() {
-    let mut builder = builder();
+    let mut builder = factory();
     builder.stage("isolated", source(0));
     let source = builder.stage("source", source(1));
     let count = builder.stage("count", count());
@@ -291,7 +291,7 @@ fn finish_allows_zero_input_stages_and_disconnected_components() {
 
 #[test]
 fn finish_rejects_a_cycle_in_one_of_multiple_components() {
-    let mut builder = builder();
+    let mut builder = factory();
     builder.stage("isolated", source(0));
     let left = builder.stage("left", count());
     let right = builder.stage("right", count());
@@ -326,7 +326,7 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                     "stage_count={stage_count}, count_mask={count_mask:#b}, parents={parents:?}"
                 );
 
-                let mut builder = builder();
+                let mut builder = factory();
                 let references = (0..stage_count)
                     .map(|index| {
                         let id = stage_id(index);
@@ -433,7 +433,7 @@ fn stage_id(index: usize) -> String {
 }
 
 fn codec_definition() -> FlowDefinition {
-    let mut builder = builder();
+    let mut builder = factory();
     let source = builder.stage("source", source(7));
     let count = builder.stage("count", count());
     builder.connect([source], count);
@@ -441,7 +441,7 @@ fn codec_definition() -> FlowDefinition {
 }
 
 fn codec_definition_with_ids(source_id: &str, count_id: &str) -> FlowDefinition {
-    let mut builder = builder();
+    let mut builder = factory();
     let source = builder.stage(source_id, source(7));
     let count = builder.stage(count_id, count());
     builder.connect([source], count);
@@ -480,7 +480,7 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
 fn decoder_round_trips_a_large_chain() {
     const STAGE_COUNT: usize = 4_096;
 
-    let mut builder = builder();
+    let mut builder = factory();
     let mut previous = builder.stage("stage-0000", source(0));
     for index in 1..STAGE_COUNT {
         let current = builder.stage(format!("stage-{index:04}"), count());

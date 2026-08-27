@@ -1,16 +1,18 @@
 # dogpaddle-flow
 
-`dogpaddle-flow` 负责定义、构建和重新打开一条持久化 Flow。Stage 是 crate 内部的一对一
-Operation 容器；它保存一个实现封闭 `Operation` trait 的运行实例，不再重复枚举具体算子，
-也不维护额外的算子图。
+`dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
+`Flow` 只表示运行态，不承担声明、构建或打开职责。Stage 是 crate 内部的一对一 Operation
+容器；它保存一个实现封闭 `Operation` trait 的运行实例，不再重复枚举具体算子，也不维护
+额外的算子图。
 
 ## 构建 Flow
 
-Builder 阶段是纯声明：`stage()` 返回仅属于当前 Builder 的临时 `StageRef`，`connect()`
-记录目标 Stage 完整、有序的输入列表。只有 `build()` 才集中校验拓扑并创建 Store。
+Factory 的声明阶段没有 Store 副作用：`stage()` 返回仅属于当前 `FlowFactory` 的临时
+`StageRef`，`connect()` 记录目标 Stage 完整、有序的输入列表。只有 `build()` 才集中校验
+拓扑并创建 Store。
 
 ```rust,no_run
-use dogpaddle_flow::Flow;
+use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
     operation::source::SequenceSourceDefinition,
     operation::transform::CountDefinition,
@@ -19,16 +21,16 @@ use dogpaddle_operation::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("flow");
-    let mut builder = Flow::builder(&path);
-    let source = builder.stage("source", SequenceSourceDefinition::new(0));
-    let count = builder.stage("count", CountDefinition::new());
-    builder.connect([source], count);
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.stage("source", SequenceSourceDefinition::new(0));
+    let count = factory.stage("count", CountDefinition::new());
+    factory.connect([source], count);
 
-    let flow = builder.build()?;
+    let flow = factory.build()?;
     assert_eq!(flow.stage_ids().collect::<Vec<_>>(), ["source", "count"]);
     drop(flow);
 
-    let reopened = Flow::open(&path)?;
+    let reopened = FlowFactory::open(&path)?;
     assert_eq!(reopened.stage_count(), 2);
     Ok(())
 }
@@ -40,12 +42,13 @@ fan-out 和重复 source；输入数量必须与具体 Definition 完全一致�
 
 ## 持久化边界
 
-每条 Flow 独占一个 Store。`build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
+每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成纯校验，再为 Flow 和每个 Stage 各声明一个
 持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个
 `produces_output() == true` 的 Stage 创建一个 output log，最后提交 manifest Cell 作为构建完成
-标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；Flow 负责完整资源名，
-并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称交给 Definition 直接装配
-Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或物理布局。
+标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
+build/open 通路负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称
+交给 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或
+物理布局。
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Stage state map 显式声明为
 `Small`。Flow state map 保留生命周期状态，Stage state map 保存运行期 Stage 状态，并将在运行
@@ -68,12 +71,13 @@ Stage 不知道上游 Stage，只知道自己的有序 inputs；它拥有自己�
 Operation 依赖跨端口交错顺序，运行层必须另行定义并持久化 ingress 顺序，不能从 source 声明
 顺序推断事件发生顺序。
 
-Store 目录和 catalog 已有效、但 manifest 尚未提交时，`Flow::open()` 返回 `IncompleteBuild`；
+Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
+`IncompleteBuild`；
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
-`open()` 先读取、解码并重新校验 manifest，再打开全部数据对象和 output，最后按 source ID
-重新注入 inputs、装配 Stage 并冻结 Store。调用方不需要重新提交 Definition。
+`FlowFactory::open()` 先读取、解码并重新校验 manifest，再打开全部数据对象和 output，最后按
+source ID 重新注入 inputs、装配 Stage 并冻结 Store。调用方不需要重新提交 Definition。
 
 当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
@@ -90,16 +94,19 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 
 ## 源码边界
 
-`build/` 统一拥有 `FlowBuilder`、`StageRef`、Flow/Stage Definition、无 Store 副作用的图校验、
-稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition 中的连接关系，
-不再拥有独立 Builder。`build/` 与 `flow/` 分别按 Definition 声明的逻辑数据名通用创建或打开
-类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。`stage/` 只保存
-事务启动能力、state、装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不接收 Store，
-也不知道 Stage ID、上游 Stage、资源名或底层物理布局。
+`build/` 统一拥有 `FlowFactory` 的声明与构建路径、`StageRef`、Flow/Stage Definition、无 Store
+副作用的图校验、稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition
+中的连接关系，不再拥有独立构建类型。`open/` 实现 `FlowFactory::open` 的两阶段读取、资源打开
+和重新物化。`build/` 与 `open/` 都按 Definition 声明的逻辑数据名通用创建或打开类型化实例，
+再让 Definition 物化具体 Operation；二者都不枚举具体算子。`flow/` 只保存 build/open 返回的
+运行态 `Flow` 及其生命周期状态，不创建或打开 Store 资源。`stage/` 只保存事务启动能力、state、
+装箱后的 `Operation`、只读 inputs 和自己的可选 output；它不接收 Store，也不知道 Stage ID、
+上游 Stage、资源名或底层物理布局。私有 `assembly.rs` 只承接 build/open 共用的 source ID 解析
+和最终 Stage 装配，不公开新的领域类型。
 公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
-使用单一 `correctness` target 验证 crate 的公共行为。Flow 是 Operation 与 Store 的组合根，
-因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个重复的
-`flow-store` 集成 package。完整目录、fixture 规则与计时边界见
+使用单一 `correctness` target 验证 crate 的公共行为。dogpaddle-flow 是 Operation 与 Store 的
+组合根，因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个
+重复的 `flow-store` 集成 package。完整目录、fixture 规则与计时边界见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。
 
 ## 当前边界
