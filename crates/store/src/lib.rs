@@ -9,7 +9,7 @@ mod store;
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
     AppendLog, AppendLogAccess, AppendLogEntry, AppendLogScan, Cell, CellAccess, OrderedMap,
-    OrderedMapAccess, OrderedMapEntry,
+    OrderedMapAccess, OrderedMapEntry, ReadOnly,
 };
 pub use data_class::StoreData;
 pub use error::StoreError;

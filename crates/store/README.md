@@ -9,13 +9,14 @@
 Store 将资源装配与运行时访问分离：
 
 - `Store` 创建或打开全部具名数据对象；进入运行期前，其所有权会被消费；
-- `Cell<T>` 保存一个可选的类型化值，并固定使用共享物理空间；
-- `OrderedMap<K, V, SIZE>` 保存按稳定 key codec 排序的类型化映射；
-- `AppendLog<T>` 保存具有稳定 offset、支持有界前缀回收的追加序列，并固定使用独立物理表；
+- `Cell<T>`、`OrderedMap<K, V, SIZE>` 与 `AppendLog<T>` 是 collection 的完整能力，可以产生
+  完整的事务级读写 Access；
+- `ReadOnly<C>` 由完整 collection 显式单向衰减得到，只能产生只读事务 Access；
 - `Transactions` 是运行期内启动事务的唯一能力；
 - `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
 - `TransactionAccess` 从活动 Transaction 临时借用，只允许已有类型化数据对象绑定访问；
-- `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 绑定一次具体事务并执行实际读写。
+- 完整的 `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 执行实际读写，包在
+  `ReadOnly<...>` 中的 Access 只公开对应 collection 的读取方法。
 
 底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
 也不能绕过数据类型自行组合物理资源。
@@ -132,16 +133,62 @@ assert_eq!(counter.access(access)?.get()?, Some(1));
 ```
 
 `StoreData` 是 Store 泛型 create/open 使用的 sealed marker trait。它只由布局完整的内建
-collection 实现；一般业务代码不需要直接引用它。
+collection 实现；一般业务代码不需要直接引用它。权限不属于持久化 schema：`ReadOnly<C>`
+不实现 `StoreData`，Store catalog 也不记录 capability。重新打开时总是先按完整 collection
+类型打开，再由运行期装配者重新衰减。
+
+## 只读能力衰减
+
+`ReadOnly::new` 消费一个完整 collection handle，并且不提供 `Deref`、`AsRef`、`Borrow`、
+`into_inner` 或任何能重新取得内部 handle 的 callback。需要同时保留完整能力时，装配者必须
+显式 clone，再衰减其中一个 clone：
+
+```rust,no_run
+use dogpaddle_store::{AppendLog, ReadOnly, ScanLimit, Store, StoreError};
+
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mut store = Store::create("./dogpaddle-read-only-example")?;
+let output = store.create_data::<AppendLog<Vec<u8>>>("changes")?;
+let input = ReadOnly::new(output.clone());
+let mut transactions = store.into_transactions();
+
+let transaction = transactions.begin()?;
+let access = transaction.access();
+output.access(access)?.append(&b"change".to_vec())?;
+
+let mut observed = Vec::new();
+input.access(access)?.scan(
+    0,
+    ScanLimit::new(100, 1024 * 1024)?,
+    |entry| -> Result<(), StoreError> {
+        observed.push(entry.decode_owned()?);
+        Ok(())
+    },
+)?;
+assert_eq!(observed, vec![b"change".to_vec()]);
+transaction.commit()?;
+# Ok(())
+# }
+```
+
+衰减不会撤销装配者仍然持有的完整 alias；它保证的是只收到 `ReadOnly<C>` 的组件无法在 safe
+Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，因此多个下游可以安全地
+共享同一个输入 collection。当前白名单是：`Cell` 的 `get`，`OrderedMap` 的 `get/scan`，以及
+`AppendLog` 的 `bounds/scan`。
 
 ## 事务与扫描语义
 
 丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。调用
 `Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
-持有的 `Cell`、`OrderedMap` 或 `AppendLog` 创建事务级 Access。Flow/Stage 因此可以保留 Transaction
-所有权并把受限能力交给 Operation，Operation 无法开始或结束原子边界，也无法访问 Store
-catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式选择布局
-的数据对象都可以原子提交。
+持有的完整或 `ReadOnly` collection handle 创建事务级 Access。Flow/Stage 因此可以保留
+Transaction 所有权并把受限能力交给 Operation，Operation 无法开始或结束原子边界，也无法访问
+Store catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式选择
+布局的数据对象都可以原子提交。
+
+`TransactionAccess` 本身不区分只读与读写，因为同一个 Stage 事务需要同时读取 input 并写入
+自身 state/output。静态权限来自 collection handle：`ReadOnly<C>` 只能绑定出
+`ReadOnly<...Access>`，完整 handle 则绑定出完整 Access。两者仍然共享同一个事务快照和中毒、
+回滚、提交边界。
 
 `TransactionAccess`、`CellAccess` 和 `OrderedMapAccess` 都不能脱离所属事务；每个新事务都
 必须重新绑定，不能跨 Stage 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在
@@ -181,6 +228,10 @@ callback：`project` 可以只解码 diff 或少数列，`decode_owned` 只在�
 `append_entry` 则能把相同 `T` 的编码原样写入同一事务中的另一个 log。Entry 不公开 MDBX
 借用或裸字节，也不能逃出 callback 或跨线程。
 
+作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/scan`，不能 append 或 truncate。多个消费
+者可以 clone 同一份只读 handle 并读取同一个物理日志；各自的 next-unread offset 由上层分别
+持久化，不属于 `AppendLog` 或只读 capability。
+
 一个 scan 在调用 callback 前先验证选中 offset 连续。callback 的任意错误都会毒化事务，
 避免已经写入部分输出后仍被提交；第一项无法装入 byte limit 的 `ItemTooLarge` 仍是可增大
 limit 后重试的软错误。`AppendLogScan::next_offset` 可直接持久化为下游 next-unread cursor，
@@ -201,6 +252,7 @@ big-endian offset key 保存 `T` 的稳定编码。全新且从未使用的空�
 
 ```bash
 cargo test -p dogpaddle-store --test correctness
+cargo test -p dogpaddle-store --doc
 ```
 
 也可以直接过滤并运行单个测试区域：
@@ -214,7 +266,9 @@ cargo test -p dogpaddle-store --test correctness scan::
 通过 MDBX 持久化适配器锁定 `Cell` 的共享布局、`Small` map 的共享前缀、`Large` map 与
 `AppendLog` 的
 独立 named table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。目录
-所有权、模块职责和完整验证协议见
+中的 `capability` 模块验证衰减后仍读取同一物理对象、fan-out 与 reopen 后重新衰减；写方法
+不可用、不能恢复完整 handle 且不能作为 `StoreData` 打开的静态边界由 Rustdoc compile-fail
+测试锁定。测试目录所有权、模块职责和完整验证协议见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
 
 ## 性能

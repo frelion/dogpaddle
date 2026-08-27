@@ -13,6 +13,7 @@ tests/
 ├── correctness.rs
 └── correctness/
     ├── support.rs
+    ├── capability.rs
     ├── codec.rs
     ├── store.rs
     ├── placement.rs
@@ -34,6 +35,10 @@ tests/
 `append_log::{errors,projection}`。文件拆开是为了让成功路径、错误路径、扫描和投影各自聚焦，
 不会增加 Cargo target，也不会改变测试过滤路径。
 
+`capability.rs` 统一拥有 collection 能力衰减、共享底层对象、只读 fan-out 和 reopen 后重新
+衰减的公共行为；写方法不可用、不能升级回完整 handle 且不能作为 `StoreData` 打开的静态边界
+由 `ReadOnly` 的 Rustdoc compile-fail 测试拥有。
+
 这些模块作为下游 crate 编译，只通过 `dogpaddle_store` 的公共 Rust API 观察行为。`store`、
 `placement` 和 `append_log_layout` 可以使用 `libmdbx` 适配器准备损坏数据库或审计稳定磁盘布局，
 但错误、回滚和 reopen 结果仍通过 Store 公共 API 断言，不能为测试给产品库增加公开后门。
@@ -43,6 +48,7 @@ tests/
 
 ```bash
 cargo test -p dogpaddle-store --test correctness
+cargo test -p dogpaddle-store --doc
 cargo test -p dogpaddle-store --test correctness transaction::
 cargo test -p dogpaddle-store --test correctness ordered_map::scans::
 cargo test -p dogpaddle-store --test correctness append_log::projection::

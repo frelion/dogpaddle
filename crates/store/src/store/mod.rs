@@ -68,10 +68,11 @@ pub struct Transaction<'database> {
 
 /// Borrows one active transaction only for typed data access.
 ///
-/// This capability can bind existing [`crate::Cell`], [`crate::OrderedMap`],
-/// and [`crate::AppendLog`] objects to the transaction, but cannot begin or
-/// commit a transaction or access the Store catalog. Copying it only copies a
-/// shared borrow; transaction ownership and commit authority remain unique.
+/// This capability can bind existing full or [`crate::ReadOnly`] collection
+/// handles to the transaction, but cannot begin or commit a transaction or
+/// access the Store catalog. The collection handle determines which methods
+/// the resulting access exposes. Copying this capability only copies a shared
+/// borrow; transaction ownership and commit authority remain unique.
 ///
 /// ```compile_fail
 /// fn commit(access: dogpaddle_store::TransactionAccess<'_>) {

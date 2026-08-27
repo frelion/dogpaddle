@@ -5,7 +5,10 @@ use crate::{
 /// A typed persistent data object that can be created and opened by [`crate::Store`].
 ///
 /// This trait is sealed. Each built-in collection fixes or explicitly selects
-/// the physical placement appropriate for its semantics.
+/// the physical placement appropriate for its semantics. Process-local
+/// capability wrappers such as [`crate::ReadOnly`] intentionally do not
+/// implement this trait; Store setup always creates or opens a full collection
+/// handle before an assembler attenuates it.
 pub trait StoreData: private::SealedStoreData {}
 
 pub(crate) mod private {

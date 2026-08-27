@@ -2,6 +2,8 @@
 mod append_log;
 #[path = "correctness/append_log_layout.rs"]
 mod append_log_layout;
+#[path = "correctness/capability.rs"]
+mod capability;
 #[path = "correctness/cell.rs"]
 mod cell;
 #[path = "correctness/codec.rs"]
