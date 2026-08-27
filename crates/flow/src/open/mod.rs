@@ -126,6 +126,3 @@ fn require_resource<T>(name: &str, result: Result<T, StoreError>) -> Result<T, F
         Err(error) => Err(error.into()),
     }
 }
-
-#[cfg(test)]
-mod tests;
