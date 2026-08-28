@@ -52,7 +52,7 @@ build/open 通路负责完整资源名，并通过 Store 将每项声明创建�
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Station state map 显式声明为
 `Small`。Flow state map 保留生命周期状态；Station state map 保存运行期 Station 状态，并为每个
-input 保存当前尚未完全退休的 Change offset；有输入的 Station 还保存循环查找的 active input。
+input 保存下一条未处理 Change 的 offset；有输入的 Station 还保存循环查找的 active input。
 `build()` 在发布 manifest 的同一事务中把 active input 和全部 cursor 显式初始化为 `0`，不存在
 “缺失时从当前 log head 开始”的隐式恢复。output 是
 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，不另建 Schema
@@ -77,34 +77,31 @@ cache、state、完整可选 output 以及 output consumer cursor capabilities�
 build/open 得到相同结果，不需要单独持久化。`intake` 在 Station 唯一 cache 为空时，通过一个 RO
 snapshot 从 durable active input 开始循环检查各端口，跳过空日志，并只装入第一个可用 entry。
 cache 显式保存该 entry 的 input index、AppendLog offset 和完整 owned Change；命中时不访问 Store。
-intake 不修改 active input 或 cursor，也不调用 Operation。后续 `process` 可以多次使用同一 cache；
-Change 内部消费进度将由具体 Operation 自己的持久化 data 维护，不进入 Station state。重开 Flow
-时 cache 为空，并根据 durable active input 与对应 cursor 重新读取。没有 output 的 Sink 使用
-`None`，不能被其他 Station 作为 source。
+intake 不修改 active input 或 cursor，也不调用 Operation。当前 `process` 成功一次即完整处理并退休
+该 cache；重开 Flow 时 cache 为空，并根据 durable active input 与对应 cursor 重新读取。没有 output
+的 Sink 使用 `None`，不能被其他 Station 作为 source。
 
-`process(&mut Transactions)` 及其 `Idle / Progressed` 结果类型已经留下明确位置，但方法体仍为
-`todo!()`。Station–Operation 的 Change 批处理、partial consumption、输出和原子提交协议尚未
-确定，因此当前代码不会伪造调用或提前承诺其返回类型。Operation 以后仍只会接收不能提交的
-`TransactionAccess`，不会读取 AppendLog、cursor 或 Station 运行元数据；它自行解释和持久化
-Change 内部消费进度。未来处理所选 Change 后若仍未完成，Station 必须在同一写事务中把 active
-input 固定为 cache 的 input，并保留对应 cursor；若已经完整退休，则在该事务中推进 cache 所属
-input 的 cursor，并把 active input 移到它的下一个端口。该提交状态机仍位于当前 `process` 的
-`todo!()` 之后。
+`process(&mut Transactions)` 为每次 Operation 调用开始并持有唯一写事务。有输入 Operation 每次只
+接收端口、一个完整 `Change` 和不能提交的 `TransactionAccess`，不会看到 `AppendLog` offset、
+cursor 或 Station 运行元数据。成功返回表示该 Change 已完整处理，并可携带至多一个 owned output
+Change。Station 在调用前要求 cache offset 仍等于该端口的 durable cursor，然后把 Operation 状态、
+output、cursor 推进和 active 轮转原子提交，commit 成功后才清 cache。任何 Operation、编码、
+append、Station state 或 commit 错误都会回滚并保留 cache。
 
 每条边的 cursor 只定位一个完整 Change IPC entry；它是当前持久化分批下的读取位置，而不是稳定
 event ID。未来 Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件序列必须
 逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；active input 只规定从
 哪个端口开始循环寻找下一个可用物理 Change，不声称还原跨上游事件发生时间。一个 Change 完全
-退休后 cursor 才推进到下一个 offset；Change 内部多次消费所需的额外记录属于具体 Operation。
-按完整物理 Change 轮转可能改变跨端口交错，因此多输入 Operation 必须对稳定重批保持可观察结果
+处理成功后 cursor 才推进到下一个 offset。按完整物理 Change 轮转可能改变跨端口交错，因此多输入
+Operation 必须对稳定重批保持可观察结果
 不变；需要业务级跨端口顺序时，必须另行引入逻辑 ingress、barrier 或窗口语义。
 
 每个 Station turn 只要成功返回，无论结果是 `Idle` 还是 `Progressed`，Flow 都会按去重后的直接
 上游列表各触发一次 GC。上游 Station 在独立写事务中读取自己全部 consumer edge 的 durable
 cursor，校验它们位于 output 的 `[head, tail]`，以最小 cursor 为安全水位，并调用一次
 `truncate_before`，单次最多删除 1024 个 entry。重复 source edge 在触发列表中只调用一次，但每条
-edge 的 cursor 都参与最小值；GC 失败以实际执行 GC 的上游 Station ID 返回。当前 `process` 仍为
-`todo!()`，因此公共 `advance` 暂时还没有成功 turn 能到达该调度位置。
+edge 的 cursor 都参与最小值；GC 失败以实际执行 GC 的上游 Station ID 返回。Operation 与 cursor
+成功提交后，后续 GC 才允许回收对应 Change。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
 `IncompleteBuild`；
@@ -141,8 +138,8 @@ Flow Definition 中的连接关系，不再拥有独立构建类型。`flow/mod.
 `Flow`，`flow/runtime.rs` 保存 build/open 返回的运行态对象、生命周期状态、全部 Station、派生的
 schedule 与分离的读写事务启动能力，不创建或打开 Store 资源。`flow/advance.rs` 定义公共
 outcome 并实现一次有界轮次：按 schedule 为每个 Station 至多提供一个 turn，先 `intake` 再进入
-`process`，成功后再对直接上游各触发一次 GC，通过公共 `Flow::advance` 暴露。当前调用会明确到达
-`Station::process` 的 `todo!()`，不伪造尚未确定的 Operation 协议。`station/mod.rs` 同样只声明边界；
+`process`，成功后再对直接上游各触发一次 GC，通过公共 `Flow::advance` 暴露。`station/mod.rs`
+只声明边界；
 `station/runtime.rs` 保存 Station 装配与 `process` 边界，`station/input.rs` 独立拥有 active input、
 cursor 和唯一 cache 的 `intake`，`station/gc.rs` 保存 consumer cursor capability 与有界 output GC，
 `station/protocol.rs` 只拥有 outcome/error。Station 不长期持有事务启动
@@ -159,13 +156,11 @@ cursor 和唯一 cache 的 `intake`，`station/gc.rs` 保存 consumer cursor cap
 本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Station 的
 state、只读 inputs、可选 output、稳定 active input/cursor 和可重建的确定性拓扑 schedule。
 `intake` 已能通过 RO snapshot 从 active input 循环查找并幂等准备至多一个带来源身份的 Change；
-成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定；
-`process(&mut Transactions)` 及其
-`Idle / Progressed` 位置已经固定，但方法体仍为 `todo!()`。Flow 已公开有界的 `Flow::advance`，
-当前会按拓扑 schedule 进入 Station 并停在这个明确边界；尚未实现 `Flow::start`、
-Station–Operation 批处理与 partial-consumption 提交协议、背压、中断或完整运行恢复。
-`SequenceSource` 只是第一个真实零输入 Definition，用于形成可构建的
-`SequenceSource → Count` DAG；它仍未接入运行调用协议。
+`process` 已通过同一写事务原子协调 Operation 状态、output、active 与 cursor，
+成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定。Flow 已公开有界的
+`Flow::advance`，真实 `SequenceSource → Count` DAG 可以按拓扑逐轮推进并在 reopen 后续跑。
+尚未实现单个 Change 跨 turn 的 continuation、`Flow::start`、背压、中断控制、端口 Schema 静态
+约束或外部副作用协议。
 
 ## 验证
 
@@ -178,6 +173,6 @@ cargo bench -p dogpaddle-flow --bench flow_lifecycle
 ```
 
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
-`open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表尚未可执行的 Station processing
+`open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
 或运行时吞吐。正式结果必须在显式 reference 文件系统上保留逐样本 JSONL；配置与输出协议见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。

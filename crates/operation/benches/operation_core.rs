@@ -1,11 +1,15 @@
-//! Definition codec and persistent operation-step benchmark protocol.
+//! Definition codec and persistent Operation-turn benchmark protocol.
 
-use std::{hint::black_box, path::Path, time::Duration};
+use std::{hint::black_box, path::Path, sync::Arc, time::Duration};
 
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::require_benchmark_build;
+use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, decode_definition, encode_definition,
     operation::{
+        Operation, OperationInput,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
         transform::{CountDefinition, CountOperation},
     },
@@ -22,6 +26,7 @@ struct CountFixture {
     transactions: Transactions,
     state: Cell<u64>,
     operation: CountOperation,
+    input: Change,
     expected: Option<u64>,
 }
 
@@ -43,6 +48,7 @@ impl CountFixture {
             transactions: store.into_transactions(),
             state,
             operation,
+            input: one_row_change(),
             expected: None,
         }
     }
@@ -52,9 +58,10 @@ impl CountFixture {
             .transactions
             .begin()
             .expect("begin Count validation transaction");
+        let access = transaction.access();
         let actual = self
             .state
-            .access(transaction.access())
+            .access(access)
             .expect("access Count state for validation")
             .get()
             .expect("read Count state for validation");
@@ -108,7 +115,7 @@ fn main() {
     let root = BenchRoot::from_environment();
     println!("DogPaddle Operation core benchmark");
     println!(
-        "timing=explicit-boundaries setup=outside validation=outside warmup=unreported rows-metric=not-applicable"
+        "timing=explicit-boundaries setup=outside validation=outside warmup=unreported rows-per-turn=1"
     );
     root.emit_environment();
     config.emit(root.profile());
@@ -185,7 +192,7 @@ fn benchmark_count_body(
         .collect();
     records.record(
         "count",
-        "step_rollback_body",
+        "turn_rollback_body",
         operation_count(steps, config.body_transactions),
         config.body_transactions,
         steps,
@@ -207,7 +214,7 @@ fn benchmark_sequence_body(
         .collect();
     records.record(
         "sequence",
-        "step_rollback_body",
+        "turn_rollback_body",
         operation_count(steps, config.body_transactions),
         config.body_transactions,
         steps,
@@ -235,7 +242,7 @@ fn benchmark_count_durable(
         .collect();
     records.record(
         "count",
-        "step_durable_transaction",
+        "turn_durable_transaction",
         operation_count(steps, config.durable_transactions),
         config.durable_transactions,
         steps,
@@ -263,7 +270,7 @@ fn benchmark_sequence_durable(
         .collect();
     records.record(
         "sequence",
-        "step_durable_transaction",
+        "turn_durable_transaction",
         operation_count(steps, config.durable_transactions),
         config.durable_transactions,
         steps,
@@ -303,7 +310,6 @@ fn measure_decode(encoded: &[u8], operations: usize) -> Duration {
 }
 
 fn measure_count_body(fixture: &mut CountFixture, steps: usize, transactions: usize) -> Duration {
-    let expected_last = u64::try_from(steps).expect("step count fits u64");
     let mut total = Duration::ZERO;
     for _ in 0..transactions {
         let transaction = fixture
@@ -311,19 +317,20 @@ fn measure_count_body(fixture: &mut CountFixture, steps: usize, transactions: us
             .begin()
             .expect("begin Count rollback transaction");
         let access = transaction.access();
-        let mut last = None;
+        let input = OperationInput {
+            port: 0,
+            change: &fixture.input,
+        };
         let started = std::time::Instant::now();
         for _ in 0..steps {
-            last = Some(
+            black_box(
                 fixture
                     .operation
-                    .step(access)
-                    .expect("step Count rollback workload"),
+                    .turn(Some(input), access)
+                    .expect("run Count rollback workload"),
             );
-            black_box(last);
         }
         let elapsed = started.elapsed();
-        assert_eq!(last, Some(expected_last));
         total = total.checked_add(elapsed).expect("body duration fits");
     }
     fixture.expected = None;
@@ -336,9 +343,6 @@ fn measure_sequence_body(
     steps: usize,
     transactions: usize,
 ) -> Duration {
-    let expected_last = SEQUENCE_START
-        .checked_add(u64::try_from(steps - 1).expect("step count fits u64"))
-        .expect("Sequence body fixture does not overflow");
     let mut total = Duration::ZERO;
     for _ in 0..transactions {
         let transaction = fixture
@@ -346,19 +350,16 @@ fn measure_sequence_body(
             .begin()
             .expect("begin Sequence rollback transaction");
         let access = transaction.access();
-        let mut last = None;
         let started = std::time::Instant::now();
         for _ in 0..steps {
-            last = Some(
+            black_box(
                 fixture
                     .operation
-                    .step(access)
-                    .expect("step Sequence rollback workload"),
+                    .turn(None, access)
+                    .expect("run Sequence rollback workload"),
             );
-            black_box(last);
         }
         let elapsed = started.elapsed();
-        assert_eq!(last, Some(expected_last));
         total = total.checked_add(elapsed).expect("body duration fits");
     }
     fixture.expected = None;
@@ -372,7 +373,6 @@ fn measure_count_durable(
     transactions: usize,
 ) -> Duration {
     let operations = operation_count(steps, transactions);
-    let mut last = None;
     let started = std::time::Instant::now();
     for _ in 0..transactions {
         let transaction = fixture
@@ -380,14 +380,17 @@ fn measure_count_durable(
             .begin()
             .expect("begin Count durable transaction");
         let access = transaction.access();
+        let input = OperationInput {
+            port: 0,
+            change: &fixture.input,
+        };
         for _ in 0..steps {
-            last = Some(
+            black_box(
                 fixture
                     .operation
-                    .step(access)
-                    .expect("step Count durable workload"),
+                    .turn(Some(input), access)
+                    .expect("run Count durable workload"),
             );
-            black_box(last);
         }
         transaction
             .commit()
@@ -399,7 +402,6 @@ fn measure_count_durable(
         .unwrap_or_default()
         .checked_add(u64::try_from(operations).expect("operation count fits u64"))
         .expect("Count durable fixture does not overflow");
-    assert_eq!(last, Some(expected));
     fixture.expected = Some(expected);
     fixture.validate();
     elapsed
@@ -411,7 +413,6 @@ fn measure_sequence_durable(
     transactions: usize,
 ) -> Duration {
     let operations = operation_count(steps, transactions);
-    let mut last = None;
     let started = std::time::Instant::now();
     for _ in 0..transactions {
         let transaction = fixture
@@ -420,13 +421,12 @@ fn measure_sequence_durable(
             .expect("begin Sequence durable transaction");
         let access = transaction.access();
         for _ in 0..steps {
-            last = Some(
+            black_box(
                 fixture
                     .operation
-                    .step(access)
-                    .expect("step Sequence durable workload"),
+                    .turn(None, access)
+                    .expect("run Sequence durable workload"),
             );
-            black_box(last);
         }
         transaction
             .commit()
@@ -446,10 +446,20 @@ fn measure_sequence_durable(
                 .expect("Sequence durable fixture does not overflow")
         },
     );
-    assert_eq!(last, Some(expected));
     fixture.expected = Some(expected);
     fixture.validate();
     elapsed
+}
+
+fn one_row_change() -> Change {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "input",
+        DataType::UInt64,
+        false,
+    )]));
+    let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![0]))])
+        .expect("build Count benchmark input batch");
+    Change::try_new(records, Int64Array::from(vec![1])).expect("build Count benchmark input Change")
 }
 
 fn operation_count(steps: usize, transactions: usize) -> usize {

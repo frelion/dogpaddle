@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, decode_change, encode_change};
 use dogpaddle_operation::{
     encode_definition,
     operation::{
@@ -11,7 +11,8 @@ use dogpaddle_operation::{
     },
 };
 use dogpaddle_store::{
-    AppendLog, Cell, OrderedMap, ReadOnly, ReadTransactions, Small, Store, Transactions,
+    AppendLog, Cell, OrderedMap, ReadOnly, ReadTransactions, ScanLimit, Small, Store, StoreError,
+    Transactions,
 };
 
 use crate::{build::FlowFactory, flow::Flow};
@@ -540,6 +541,133 @@ fn reopen_rebuilds_cache_from_the_durable_active_input_and_offset() {
 }
 
 #[test]
+fn process_consumes_the_complete_change_and_reopen_does_not_replay_it() {
+    let values = (0_u64..=1_024).collect::<Vec<_>>();
+    let mut fixture = flow_with_changes(&[&values]);
+
+    fixture.stations[1].intake(&fixture.reads).unwrap();
+    assert_eq!(
+        fixture.stations[1]
+            .process(&mut fixture.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert!(fixture.stations[1].inputs.cache.is_none());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            read_cursor(&fixture.stations[1], transaction.access(), 0),
+            1
+        );
+        assert_eq!(
+            read_active_input(&fixture.stations[1], transaction.access()),
+            0
+        );
+    }
+    assert_eq!(
+        count_output_values(&fixture.stations[1], &mut fixture.transactions),
+        (1_u64..=1_025).collect::<Vec<_>>()
+    );
+
+    let IntakeFixture {
+        transactions,
+        reads,
+        stations,
+        changes: _,
+        root,
+    } = fixture;
+    drop(stations);
+    drop(reads);
+    drop(transactions);
+
+    let flow = FlowFactory::open(root.path().join("flow")).unwrap();
+    let (mut transactions, reads, mut stations) = flow.into_runtime_parts();
+    stations[1].intake(&reads).unwrap();
+    assert!(stations[1].inputs.cache.is_none());
+    assert_eq!(
+        stations[1].process(&mut transactions).unwrap(),
+        ProcessOutcome::Idle
+    );
+    assert_eq!(
+        count_output_values(&stations[1], &mut transactions),
+        (1_u64..=1_025).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn process_rejects_a_stale_cache_before_calling_the_operation() {
+    let mut fixture = flow_with_changes(&[&[10]]);
+    fixture.stations[1].intake(&fixture.reads).unwrap();
+    fixture.write_cursor(1, 0, 1);
+
+    let error = fixture.stations[1]
+        .process(&mut fixture.transactions)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StationError::CachedCursorMismatch {
+            input: 0,
+            cached: 0,
+            durable: 1,
+        }
+    ));
+    assert!(fixture.stations[1].inputs.cache.is_some());
+    assert!(count_output_values(&fixture.stations[1], &mut fixture.transactions).is_empty());
+
+    fixture.write_cursor(1, 0, 0);
+    assert_eq!(
+        fixture.stations[1]
+            .process(&mut fixture.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert_eq!(
+        count_output_values(&fixture.stations[1], &mut fixture.transactions),
+        [1]
+    );
+}
+
+#[test]
+fn output_append_failure_rolls_back_operation_progress_and_keeps_the_cache() {
+    let mut fixture = flow_with_changes(&[&[10]]);
+    fixture.stations[1].intake(&fixture.reads).unwrap();
+
+    let valid_output = fixture.stations[1].output.take().unwrap();
+    let foreign_root = tempfile::tempdir().unwrap();
+    let mut foreign_store = Store::create(foreign_root.path().join("store")).unwrap();
+    let foreign_output = foreign_store
+        .create_data::<AppendLog<Vec<u8>>>("output")
+        .unwrap();
+    let _foreign_transactions = foreign_store.into_transactions();
+    fixture.stations[1].output = Some(foreign_output);
+
+    let error = fixture.stations[1]
+        .process(&mut fixture.transactions)
+        .unwrap_err();
+    assert!(matches!(error, StationError::Store(StoreError::WrongStore)));
+    assert!(fixture.stations[1].inputs.cache.is_some());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            read_cursor(&fixture.stations[1], transaction.access(), 0),
+            0
+        );
+    }
+
+    fixture.stations[1].output = Some(valid_output);
+    assert_eq!(
+        fixture.stations[1]
+            .process(&mut fixture.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert_eq!(
+        count_output_values(&fixture.stations[1], &mut fixture.transactions),
+        [1]
+    );
+}
+
+#[test]
 fn input_state_keys_and_values_have_stable_encodings() {
     assert_eq!(ACTIVE_INPUT_KEY, b"input/active");
     assert_eq!(encode_active_input(0x0102_0304), [0x01, 0x02, 0x03, 0x04]);
@@ -725,6 +853,59 @@ fn read_active_input(station: &Station, access: dogpaddle_store::TransactionAcce
         .unwrap()
         .unwrap();
     decode_active_input(&encoded).unwrap()
+}
+
+fn read_cursor(
+    station: &Station,
+    access: dogpaddle_store::TransactionAccess<'_>,
+    input: usize,
+) -> u64 {
+    let encoded = station
+        .state
+        .access(access)
+        .unwrap()
+        .get(&cursor_key(input))
+        .unwrap()
+        .unwrap();
+    decode_cursor(&encoded).unwrap()
+}
+
+fn count_output_values(station: &Station, transactions: &mut Transactions) -> Vec<u64> {
+    let transaction = transactions.begin().unwrap();
+    let output = station
+        .output
+        .as_ref()
+        .unwrap()
+        .access(transaction.access())
+        .unwrap();
+    let bounds = output.bounds().unwrap();
+    let mut encoded = Vec::new();
+    output
+        .scan(
+            bounds.start,
+            ScanLimit::new(usize::MAX, usize::MAX).unwrap(),
+            |entry| -> Result<(), StoreError> {
+                encoded.push(entry.decode_owned()?);
+                Ok(())
+            },
+        )
+        .unwrap();
+    drop(transaction);
+
+    encoded
+        .iter()
+        .flat_map(|encoded| {
+            let change = decode_change(encoded).unwrap();
+            change
+                .records()
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
 }
 
 fn output_bounds(station: &Station, transactions: &mut Transactions) -> std::ops::Range<u64> {

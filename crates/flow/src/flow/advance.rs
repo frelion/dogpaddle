@@ -24,12 +24,6 @@ impl Flow {
     ///
     /// Returns [`FlowRunError`] with the stable Station ID when intake,
     /// processing, or an upstream GC attempt returns an error.
-    ///
-    /// # Panics
-    ///
-    /// The current implementation reaches the explicit `todo!()` in
-    /// `Station::process`; the Station-Operation processing protocol is not yet
-    /// defined.
     pub fn advance(&mut self) -> Result<AdvanceOutcome, FlowRunError> {
         let mut outcome = AdvanceOutcome::Idle;
         for &index in &self.topology.schedule {

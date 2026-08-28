@@ -1,10 +1,15 @@
+use std::sync::{Arc, OnceLock};
+
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use dogpaddle_change::{Change, ChangeError};
 use dogpaddle_store::{Cell, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, Sealed as SealedOperation},
+    operation::{Operation, OperationError, OperationInput, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -13,8 +18,8 @@ const DATA: &[DataDeclaration] = &[COUNT.declaration()];
 
 /// Pure definition of a running count operation.
 ///
-/// The operation accepts one input record at a time, increments its durable
-/// count, and returns the updated count as its output.
+/// The operation counts ordered input rows independently of their diff values
+/// and emits each updated count as an insertion event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CountDefinition {
     _private: (),
@@ -22,23 +27,38 @@ pub struct CountDefinition {
 
 /// Materialized running count operation.
 ///
-/// This value owns its pure definition and persistent count, but never
-/// begins, commits, or stores a transaction.
+/// This value owns its pure definition and persistent count, but never begins,
+/// commits, or stores a transaction.
 pub struct CountOperation {
     definition: CountDefinition,
     count: Cell<u64>,
 }
 
-/// Failure while stepping a [`CountOperation`] for one accepted input.
+/// Failure during one [`CountOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CountError {
+    /// The input Operation was called without a Change.
+    #[error("count requires one input Change")]
+    MissingInput,
+    /// Count only accepts its definition's first input port.
+    #[error("count does not accept input port {port}")]
+    InvalidInputPort {
+        /// Rejected zero-based port index.
+        port: usize,
+    },
     /// Persistent count access failed.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The durable count has reached [`u64::MAX`].
     #[error("count overflow")]
     Overflow,
+    /// Arrow rejected the fixed Count output batch.
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
+    /// Change validation rejected the fixed Count output.
+    #[error(transparent)]
+    Change(#[from] ChangeError),
 }
 
 #[expect(
@@ -96,26 +116,28 @@ impl CountOperation {
         &self.definition
     }
 
-    /// Applies one accepted input and returns the updated running count.
-    ///
-    /// A missing cell value is interpreted as zero. The operation binds its
-    /// own count cell through `access`; the Station's read-write processing
-    /// phase retains transaction ownership and decides whether to commit or
-    /// roll back the state change and returned output together.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CountError::Overflow`] rather than wrapping at [`u64::MAX`].
-    /// Storage and codec failures are returned as [`CountError::Store`].
-    pub fn step(&self, access: TransactionAccess<'_>) -> Result<u64, CountError> {
+    fn execute_turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, CountError> {
+        let input = input.ok_or(CountError::MissingInput)?;
+        if input.port != 0 {
+            return Err(CountError::InvalidInputPort { port: input.port });
+        }
+
         let mut count = self.count.access(access)?;
-        let next = count
-            .get()?
-            .unwrap_or_default()
+        let current = count.get()?.unwrap_or_default();
+        let rows = u64::try_from(input.change.num_rows()).map_err(|_| CountError::Overflow)?;
+        let final_count = current.checked_add(rows).ok_or(CountError::Overflow)?;
+        let first = current
             .checked_add(1)
-            .ok_or(CountError::Overflow)?;
-        count.set(&next)?;
-        Ok(next)
+            .expect("nonempty Change fitting the count has a first value");
+        let values = (first..=final_count).collect::<Vec<_>>();
+        let output = uint64_change(values)?;
+
+        count.set(&final_count)?;
+        Ok(Some(output))
     }
 }
 
@@ -125,6 +147,33 @@ impl Operation for CountOperation {
     fn definition(&self) -> &dyn OperationDefinition {
         &self.definition
     }
+
+    fn turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        self.execute_turn(input, access)
+            .map_err(|source| Box::new(source) as OperationError)
+    }
+}
+
+fn uint64_change(values: Vec<u64>) -> Result<Change, CountError> {
+    let row_count = values.len();
+    let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
+    let diffs = Int64Array::from(vec![1_i64; row_count]);
+    Ok(Change::try_new(records, diffs)?)
+}
+
+fn output_schema() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    Arc::clone(SCHEMA.get_or_init(|| {
+        Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]))
+    }))
 }
 
 pub(crate) fn decode_definition(

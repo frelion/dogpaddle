@@ -8,18 +8,18 @@ Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandl
 ## 数据边界
 
 共享的 Arrow Schema、批量差分模型和“每个 Change 一个自描述 IPC Stream”的编码属于独立的
-`dogpaddle-change` crate，而不是 Operation。未来运行接口以内存中的 `Change` 为输入输出；
-Operation 只负责数据变换和自己声明的持久化状态，不读写 IPC、不读取边日志，也不决定物理
+`dogpaddle-change` crate。Operation 的运行接口以内存中的 `Change` 为输入输出；Operation 只
+负责数据变换和自己声明的持久化状态，不读写 IPC、不读取边日志，也不决定物理
 batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须依次观察输入事件，并按
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
 独立定义的窗口、barrier 或 flush 信号，Operation 的可观察结果必须在稳定合并或切分 Change
 后保持不变；物理 Change 边界不能被算子当成业务事件。
 
-当前阶段尚未公开运行 trait 的批量处理方法，因此本 crate 不提前增加空的 `run` 或
-`process` 接口。Flow 已经装配持久化 output log 与只读 input capability；未来 Station
-先在只读事务中摄入上游日志并解码为不借用事务的内存数据，再在单独的读写事务中调用
-Operation。等 Change 真正进入 Operation 调用协议时，再确定批量方法并引入对
-`dogpaddle-change` 的实际代码依赖。
+封闭的 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 收到
+`None`；Transform 与 Sink 每次只收到一个完整 borrowed Change，以及它在 Definition 有序输入中的
+`usize` 端口序号。Operation 不接收 `AppendLog` offset。成功返回表示本次提供的工作已经完整完成，
+并至多返回一个 owned Change；filter 或 Sink 可以返回 `None`。具体错误统一擦除为标准 boxed
+[`operation::OperationError`]，仍可按原始具体错误类型 downcast。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -69,39 +69,49 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 
 物化后的具体实例统一实现 sealed [`operation::Operation`] trait。Flow 将异构实例保存为
 `Box<dyn operation::Operation>`，并通过 [`operation::Operation::definition`] 取得实例实际
-持有的 Definition。两个 trait 都不是外部 crate 的扩展点；开放第三方算子需要另行设计 tag
-分配与 decoder 注册。
+持有的 Definition，再通过同一个 `turn` 分派运行。两个 trait 都不是外部 crate 的扩展点；开放
+第三方算子需要另行设计 tag 分配、decoder 注册和运行错误边界。
 
 ## `operation::source::SequenceSource`
 
 [`operation::source::SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的
 [`operation::source::SequenceSourceOperation`] 直接持有 `Cell<u64>`，保存最后一次
-已提交的值；首次产生 `start`，随后逐一递增。`u64::MAX` 可以产生一次，再次推进返回
-[`operation::source::SequenceSourceError::Exhausted`]。它声明自己产生输出。
+已提交的值；首次产生 `start`，随后逐一递增。每个 turn 产生一行，输出固定为一个
+non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
+下一次 turn 返回 [`operation::source::SequenceSourceError::Exhausted`]。它声明自己产生输出。
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 
 ## `operation::transform::Count`
 
 [`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
-[`operation::transform::CountOperation`] 将直接持有的 `Cell<u64>` 加一并返回新计数；
-未写入的 Cell 解释为 `0`，溢出返回
+[`operation::transform::CountOperation`] 按输入行序计算事件数量：每一行恰好令直接持有的
+`Cell<u64>` 加一，输入 diff 的符号和数值不改变“一个有序事件”的计数。每个已处理输入行输出
+一个 non-null `UInt64` `count`，diff 固定为 `+1`；因此它是插入式的运行计数事件流，不是维护
+单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
 [`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Station，它仍声明自己产生
 输出；拓扑位置不会把 Transform 隐式变成 Sink。
 
+Count 只声明 `count: Cell<u64>`。每个 turn 一次处理完整 Change；它在写状态前预检整批行数，若
+最终值无法用 `u64` 表示，则返回 overflow，整个 turn 不产生部分进展。
+
 ```rust,no_run
-use dogpaddle_operation::operation::transform::{CountDefinition, CountOperation};
+use dogpaddle_operation::operation::{
+    Operation,
+    source::{SequenceSourceDefinition, SequenceSourceOperation},
+};
 use dogpaddle_store::{Cell, Store};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = tempfile::tempdir()?;
     let mut store = Store::create(root.path().join("store"))?;
-    let count = store.create_data::<Cell<u64>>("count")?;
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let position = store.create_data::<Cell<u64>>("position")?;
+    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(42), position);
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
-    assert_eq!(operation.step(transaction.access())?, 1);
+    let output = operation.turn(None, transaction.access())?;
+    assert!(output.is_some());
     transaction.commit()?;
     Ok(())
 }
@@ -111,13 +121,10 @@ Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow �
 Station 的 intake 阶段只用只读事务读取上游日志，不推进 cursor，也不调用 Operation。进入
 process 阶段后，Station 开始并持有读写 Transaction，只把不能提交的
 `TransactionAccess` 交给 Operation。Operation 可以用自己持有的 `Cell` 或
-`OrderedMap` 直接读写持久化状态，并用自己的具体 data 维护 Change 内部消费进度；Station 只在
-同一写事务中协调 Operation 状态、output、active input 和完整 Change 的 input offset，只有唯一
-缓存 Change 完全退休后才推进该 offset 并轮转端口。第一次成功提交未完成的 Change 时，Station
-会在同一事务中把 active input 固定到该 cache；从这次提交起，durable active input 与 cursor 共同
-保证重开后重新加载同一个 Change。在此前无持久化副作用的 intake 窗口崩溃，只会重新执行循环
-查找。因此 Flow 不需要知道算子的数据结构，Operation 也不能控制事务边界。具体的批量方法和
-返回类型尚未确定。
+`OrderedMap` 直接读写持久化状态。输入中的 `port` 只表达 Definition 中的端口位置，不是 Change
+identity。Station 在同一写事务中协调 Operation 状态、output 和完整 Change 的 input offset；
+Operation 成功后才推进 offset，Operation 返回错误时调用方必须回滚。因此 Flow 不需要知道算子的
+数据结构，Operation 也不能控制事务边界。
 
 ## 扩展约束
 
@@ -146,13 +153,13 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、Definition、Source 与 Transform 分区。Definition v1 使用版本化
-黄金字节约束，具体 Operation 覆盖 commit、rollback、reopen、极值错误不改状态和 Store 错误透明
-传播。完整目录所有权、测试矩阵和 fixture 规则见
+黄金字节约束，具体 Operation 覆盖完整 turn、commit、rollback、reopen、极值错误不改状态、固定
+output Schema/diff 和 Store 错误透明传播。完整目录所有权、测试矩阵和 fixture 规则见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务
-内的 `step` body，以及包含 begin 和 durable commit 的完整事务。它报告 operation 成本而不是尚未
-存在的 Change rows/s；固定大小 Cell 的长稳归 Store 所有，因此当前不设置 Operation endurance。
+内的一行 `turn` body，以及包含 begin、turn 和 durable commit 的完整事务。固定大小 Cell 的长稳
+归 Store 所有，因此当前不设置 Operation endurance。
 benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹、计算持续时间
 统计并输出 typed JSONL。Operation 本地 support 仍拥有 workload 字段、计时/oracle 和
 `BenchRoot`/`SampleStore`；`SampleStore` 在所属场景或 durable 样本校验后立即释放，

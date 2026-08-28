@@ -315,7 +315,10 @@ dependencies = [
 name = "dogpaddle-operation"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "dogpaddle-bench-protocol",
+ "dogpaddle-change",
  "dogpaddle-store",
  "tempfile",
  "thiserror",

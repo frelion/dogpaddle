@@ -1,7 +1,10 @@
+use std::{ops::Range, path::Path};
+
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowError, FlowFactory, FlowRunError};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
+use dogpaddle_store::{AppendLog, Cell, Store};
 
 #[test]
 fn advance_exposes_one_bounded_scheduling_round() {
@@ -10,14 +13,76 @@ fn advance_exposes_one_bounded_scheduling_round() {
 }
 
 #[test]
-#[should_panic(expected = "station processing awaits the Station-Operation batch protocol")]
-fn advance_reaches_the_explicit_station_processing_boundary() {
+fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_position() {
     let root = tempfile::tempdir().unwrap();
-    let mut builder = FlowFactory::new(root.path().join("flow"));
-    builder.station("source", SequenceSourceDefinition::new(0));
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
+    builder.connect([source], count);
     let mut flow = builder.build().unwrap();
 
-    let _ = flow.advance();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+    let first = execution_state(&path);
+
+    let mut reopened = FlowFactory::open(&path).unwrap();
+    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(reopened);
+    let second = execution_state(&path);
+
+    assert_eq!(first.source_output, 1..1);
+    assert_eq!(first.count_output, 0..1);
+    assert_eq!(second.source_output, 2..2);
+    assert_eq!(second.count_output, 0..2);
+    assert!(second.source_position > first.source_position);
+    assert!(second.count > first.count);
+    assert_eq!(first.count, first.source_position + 1);
+    assert_eq!(second.count, second.source_position + 1);
+}
+
+struct ExecutionState {
+    source_position: u64,
+    count: u64,
+    source_output: Range<u64>,
+    count_output: Range<u64>,
+}
+
+fn execution_state(path: &Path) -> ExecutionState {
+    let store = Store::open(path).unwrap();
+    let source_position: Cell<u64> = store
+        .open_data("station/00000000/operation/sequence_source.position")
+        .unwrap();
+    let count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
+    let source_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let count_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    ExecutionState {
+        source_position: source_position
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap()
+            .unwrap(),
+        count: count
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap()
+            .unwrap(),
+        source_output: source_output
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        count_output: count_output
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+    }
 }
 
 #[test]

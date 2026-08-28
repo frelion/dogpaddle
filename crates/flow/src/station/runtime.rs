@@ -1,4 +1,5 @@
-use dogpaddle_operation::operation::Operation;
+use dogpaddle_change::{Change, encode_change};
+use dogpaddle_operation::operation::{Operation, OperationInput};
 use dogpaddle_store::{
     AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, StoreError, TransactionAccess,
     Transactions,
@@ -7,7 +8,8 @@ use dogpaddle_store::{
 use super::{
     gc::ConsumerCursor,
     input::{
-        ACTIVE_INPUT_KEY, CURSOR_ORIGIN, Inputs, cursor_key, encode_active_input, encode_cursor,
+        ACTIVE_INPUT_KEY, CURSOR_ORIGIN, Inputs, cursor_key, decode_cursor, encode_active_input,
+        encode_cursor,
     },
     protocol::{ProcessOutcome, StationError},
 };
@@ -20,10 +22,6 @@ pub(crate) struct StationParts {
 
 pub(crate) struct Station {
     pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the future processing protocol")
-    )]
     pub(super) operation: Box<dyn Operation>,
     pub(super) inputs: Inputs,
     pub(super) output: Option<AppendLog<Vec<u8>>>,
@@ -44,9 +42,75 @@ impl Station {
         &mut self,
         transactions: &mut Transactions,
     ) -> Result<ProcessOutcome, StationError> {
-        let _ = transactions;
-        todo!("station processing awaits the Station-Operation batch protocol")
+        if !self.inputs.logs.is_empty() && self.inputs.cache.is_none() {
+            return Ok(ProcessOutcome::Idle);
+        }
+
+        let transaction = transactions.begin()?;
+        let access = transaction.access();
+
+        let input = if let Some(cached) = self.inputs.cache.as_ref() {
+            let input = cached.input;
+            let offset = cached.offset;
+            let next_offset = offset
+                .checked_add(1)
+                .expect("an AppendLog entry offset always has a successor");
+            let next_input = if input + 1 == self.inputs.logs.len() {
+                0
+            } else {
+                input + 1
+            };
+
+            let mut state = self.state.access(access)?;
+            let key = cursor_key(input);
+            let encoded = state
+                .get(&key)?
+                .ok_or(StationError::MissingCursor { input })?;
+            let durable = decode_cursor(&encoded).ok_or(StationError::MalformedCursor { input })?;
+            if durable != offset {
+                return Err(StationError::CachedCursorMismatch {
+                    input,
+                    cached: offset,
+                    durable,
+                });
+            }
+
+            state.put(&key, &encode_cursor(next_offset).to_vec())?;
+            state.put(
+                &ACTIVE_INPUT_KEY.to_vec(),
+                &encode_active_input(next_input).to_vec(),
+            )?;
+
+            Some(OperationInput {
+                port: input,
+                change: &cached.change,
+            })
+        } else {
+            None
+        };
+
+        let emitted = self.operation.turn(input, access)?;
+        append_output(self.output.as_ref(), emitted, access)?;
+        transaction.commit()?;
+
+        self.inputs.cache = None;
+        Ok(ProcessOutcome::Progressed)
     }
+}
+
+fn append_output(
+    output: Option<&AppendLog<Vec<u8>>>,
+    emitted: Option<Change>,
+    access: TransactionAccess<'_>,
+) -> Result<(), StationError> {
+    let Some(change) = emitted else {
+        return Ok(());
+    };
+    let output = output.ok_or(StationError::UnexpectedOutput)?;
+    let encoded =
+        encode_change(&change).map_err(|source| StationError::InvalidOutputChange { source })?;
+    output.access(access)?.append(&encoded)?;
+    Ok(())
 }
 
 impl StationParts {

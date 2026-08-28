@@ -11,6 +11,9 @@ autobenches = false
 bench = false
 
 [dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+dogpaddle-change.workspace = true
 dogpaddle-store.workspace = true
 thiserror.workspace = true
 

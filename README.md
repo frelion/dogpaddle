@@ -26,14 +26,15 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   记录与非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
-- **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元 Count；build/open 会为
+- **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元事件 Count；build/open 会为
   二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Station 预先声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Station 不长期持有
   事务启动能力；每个有输入的 Station 持久化一个 active input 和每条边的 Change offset，
   `intake` 经真正的只读 snapshot 从 active input 开始循环寻找第一个可用 entry，并只缓存其
-  `input + offset + Change`。cache 命中不再访问 Store；后续 `process` 才会临时接收
-  `&mut Transactions` 进入写阶段。
+  `input + offset + Change`。cache 命中不再访问 Store；`process` 临时接收
+  `&mut Transactions`，在调用 Operation 前校验 cache offset 仍等于 durable cursor，再把输入端口、
+  完整 `Change` 和不能提交的 `TransactionAccess` 交给 Operation。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
   `OrderedMap<K, V, SIZE>`；collection handle 与事务能力分别控制长期写权限和本次访问权限，
   真正的只读事务在类型层没有写入或提交入口。有界 map scan 可完整解码，也可只投影编码中的
@@ -42,8 +43,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   投影解码、同事务原样转发和有界前缀回收；Flow 已完成 Station output 与只读 input 的资源
   装配及只读 intake，并从 Definition 派生确定性的分层拓扑 schedule。内部有界轮次已经按该
   schedule 为每个 Station 保留一次 turn，并在每个成功 turn 后为其直接上游各触发一次有界前缀
-  GC；安全水位取 output 全部 consumer edge cursor 的最小值。该轮次通过 `Flow::advance` 暴露；
-  Operation Change 处理协议仍未实现，当前调用会明确停在 `Station::process` 的 `todo!()`。
+  GC；安全水位取 output 全部 consumer edge cursor 的最小值。该轮次通过 `Flow::advance` 暴露。
+  Operation 的业务状态、本 turn output、Station active/cursor 在同一写事务提交；Operation 成功
+  即表示完整 Change 已处理，cursor/active 随 commit 生效，commit 成功后 Station 才清空 cache。
 
 ## 内部架构
 
@@ -69,14 +71,12 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 当前仓库完成了 `FlowFactory` 的持久化定义、构建和重新打开，以及运行态 Flow 的 Station
 output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>`
-持久化验证。Station 已有稳定 active input 和每边 cursor，以及通过只读事务循环选择并幂等准备
-一个完整 input entry 的 `intake`；写阶段
-`process(&mut Transactions)` 的位置和 `Idle / Progressed` 结果已经固定，但方法体
-仍为 `todo!()`，等待 Station–Operation 批处理协议。Flow 已经拥有 build/open 共用的稳定拓扑
-schedule，并公开一次最多给每个 Station 一个 turn 的 `Flow::advance`；当前调用会按设计撞上
-`Station::process` 的 `todo!()`。成功 turn 后的上游 GC 位置和有界回收内核已经固定，但尚无成功
-turn 可以端到端到达它。尚未实现 `Flow::start`、输入消费与输出的原子提交、背压或中断续跑，
-因此还不是可执行的流引擎。
+持久化验证。Station 通过只读 `intake` 幂等准备一个完整 input entry，再通过写事务让 Operation
+完整处理该 Change，并原子提交 Operation 状态、output、active 和 cursor。`Flow::advance` 已能按
+稳定拓扑 schedule 执行真实的
+`SequenceSource → Count` 轮次，并在成功 turn 后进行安全的上游有界 GC。尚未实现持续运行的
+`Flow::start`、跨 turn 的单 Change continuation、背压、中断控制、端口 Schema 静态约束或外部
+Sink 的幂等协议。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

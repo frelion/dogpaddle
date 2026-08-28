@@ -1,10 +1,15 @@
+use std::sync::{Arc, OnceLock};
+
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use dogpaddle_change::{Change, ChangeError};
 use dogpaddle_store::{Cell, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, Sealed as SealedOperation},
+    operation::{Operation, OperationError, OperationInput, Sealed as SealedOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -28,16 +33,25 @@ pub struct SequenceSourceOperation {
     position: Cell<u64>,
 }
 
-/// Failure while producing one value from a [`SequenceSourceOperation`].
+/// Failure during one [`SequenceSourceOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SequenceSourceError {
+    /// A source was incorrectly supplied an input Change.
+    #[error("sequence source does not accept input")]
+    UnexpectedInput,
     /// Persistent position access failed.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The source has already emitted [`u64::MAX`].
     #[error("sequence exhausted after emitting u64::MAX")]
     Exhausted,
+    /// Arrow rejected the fixed source output batch.
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
+    /// Change validation rejected the fixed source output.
+    #[error(transparent)]
+    Change(#[from] ChangeError),
 }
 
 impl SequenceSourceDefinition {
@@ -102,19 +116,15 @@ impl SequenceSourceOperation {
         &self.definition
     }
 
-    /// Produces and records the next sequence value.
-    ///
-    /// A missing position emits the configured start value. Otherwise the last
-    /// committed value is incremented. The operation binds its own position
-    /// cell through `access`; the Station's read-write processing phase retains
-    /// transaction ownership and decides whether to commit the new position
-    /// and returned output together.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SequenceSourceError::Exhausted`] after [`u64::MAX`] has been emitted.
-    /// Storage and codec failures are returned as [`SequenceSourceError::Store`].
-    pub fn step(&self, access: TransactionAccess<'_>) -> Result<u64, SequenceSourceError> {
+    fn execute_turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, SequenceSourceError> {
+        if input.is_some() {
+            return Err(SequenceSourceError::UnexpectedInput);
+        }
+
         let mut position = self.position.access(access)?;
         let next = match position.get()? {
             Some(previous) => previous
@@ -122,8 +132,10 @@ impl SequenceSourceOperation {
                 .ok_or(SequenceSourceError::Exhausted)?,
             None => self.definition.start,
         };
+        let output = uint64_change(vec![next])?;
+
         position.set(&next)?;
-        Ok(next)
+        Ok(Some(output))
     }
 }
 
@@ -133,6 +145,33 @@ impl Operation for SequenceSourceOperation {
     fn definition(&self) -> &dyn OperationDefinition {
         &self.definition
     }
+
+    fn turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        self.execute_turn(input, access)
+            .map_err(|source| Box::new(source) as OperationError)
+    }
+}
+
+fn uint64_change(values: Vec<u64>) -> Result<Change, SequenceSourceError> {
+    let row_count = values.len();
+    let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
+    let diffs = Int64Array::from(vec![1_i64; row_count]);
+    Ok(Change::try_new(records, diffs)?)
+}
+
+fn output_schema() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    Arc::clone(SCHEMA.get_or_init(|| {
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt64,
+            false,
+        )]))
+    }))
 }
 
 pub(crate) fn decode_definition(

@@ -1,13 +1,10 @@
 use dogpaddle_change::CodecError as ChangeCodecError;
+use dogpaddle_operation::operation::OperationError;
 use dogpaddle_store::StoreError;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessOutcome {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Station readiness awaits the processing protocol")
-    )]
     Idle,
     Progressed,
 }
@@ -16,6 +13,8 @@ pub(crate) enum ProcessOutcome {
 pub(crate) enum StationError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Operation(#[from] OperationError),
     #[error("station input {input} contains an invalid Change: {source}")]
     InvalidInputChange {
         input: usize,
@@ -32,6 +31,19 @@ pub(crate) enum StationError {
     MissingCursor { input: usize },
     #[error("station input {input} has a malformed durable cursor")]
     MalformedCursor { input: usize },
+    #[error("cached station input {input} offset {cached} does not match durable cursor {durable}")]
+    CachedCursorMismatch {
+        input: usize,
+        cached: u64,
+        durable: u64,
+    },
+    #[error("operation produced output for a Station without an output stream")]
+    UnexpectedOutput,
+    #[error("operation produced a Change that cannot be encoded: {source}")]
+    InvalidOutputChange {
+        #[source]
+        source: ChangeCodecError,
+    },
     #[error("output consumer {consumer} has no durable cursor")]
     MissingConsumerCursor { consumer: usize },
     #[error("output consumer {consumer} has a malformed durable cursor")]

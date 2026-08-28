@@ -1,9 +1,9 @@
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{OrderedMap, Small, Store};
+use dogpaddle_store::{AppendLog, OrderedMap, Small, Store};
 
-use crate::build::FlowFactory;
+use crate::{build::FlowFactory, station::ProcessOutcome};
 
 #[test]
 fn build_and_open_derive_a_stable_layered_topological_schedule() {
@@ -65,5 +65,46 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
             .get(&b"key".to_vec())
             .unwrap(),
         Some(b"flow".to_vec())
+    );
+}
+
+#[test]
+fn advance_runs_upstream_gc_after_an_idle_station_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
+    builder.connect([source], count);
+    let mut flow = builder.build().unwrap();
+
+    assert_eq!(
+        flow.stations[0]
+            .advance(&flow.reads, &mut flow.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert_eq!(
+        flow.stations[1]
+            .advance(&flow.reads, &mut flow.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+
+    flow.topology.schedule = vec![1];
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Idle);
+    drop(flow);
+
+    let store = Store::open(path).unwrap();
+    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        output
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        1..1
     );
 }

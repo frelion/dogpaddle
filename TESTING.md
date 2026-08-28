@@ -11,7 +11,7 @@ DogPaddle 用同一套规则组织全部产品 crate 和跨 crate 接缝。测�
 | Change | IPC 私有 framing/layout | Change、Schema、Projection、codec | `change_core`、`change_codec` | 暂无独立状态，不适用 |
 | Store | 当前无必须访问私有实现的测试 | Store、事务、布局、Cell、OrderedMap、AppendLog、崩溃恢复 | `cell`、`ordered_map`、`append_log` | `append_log_endurance` |
 | Operation | decoder registry、类型擦除和具名实例绑定 | Definition、codec、materialize、SequenceSource、Count | `operation_core` | 当前只有定长 Cell 状态，不适用 |
-| Flow | definition/拓扑 codec、派生 schedule、内部 Station 装配、active input 与 intake cache | build/open、资源布局、失败无副作用、`advance` 有界轮次签名 | `flow_lifecycle`（冷路径） | 尚无完整运行时，不适用 |
+| Flow | definition/拓扑 codec、派生 schedule、Station intake/process/GC 与事务原子性 | build/open、资源布局、失败无副作用、真实 `advance` 有界轮次 | `flow_lifecycle`（冷路径） | 尚无持续运行入口，不适用 |
 | Change + Store | 不适用 | 完整 Change entry、回放、事务、重批、reopen | `change_append_log` | `change_append_log_endurance` |
 
 这里的“不适用”是显式边界，不是漏测。新增稳定运行路径、无界状态或跨层调度器时，必须先确定
@@ -58,13 +58,12 @@ fixture、Store 生命周期、workload、计时边界、结果 oracle 或人类
 - `crates/store/tests/` 与 `crates/store/benches/` 不得依赖 Arrow、Change、Operation 或 Flow。
 - Operation 正式依赖 Store，因此 Operation 的状态推进、rollback、commit 和 reopen 由
   `crates/operation/tests/correctness/` 拥有，不另建 `operation-store` package。
-- Flow 是 Operation + Store 的产品组合根，因此 build/open/materialize 和稳定资源布局由
-  `crates/flow/tests/correctness/` 拥有，不另建 `flow-store` package。
+- Flow 是 Operation + Change + Store 的产品组合根，因此 build/open/materialize、稳定资源布局和
+  真实 Change 调度执行链由 `crates/flow/tests/correctness/` 与必要的私有 Station 测试拥有，不另建
+  `flow-store` 或 `engine` package。
 - Change 与 Store 是刻意独立的 sibling；唯一同时依赖两者的位置是
   `integration-tests/change-store/`。
 - 产品 crate 不得依赖任何 `integration-tests/*`；外部集成 package 必须 `publish = false`。
-- 将来出现真正的 Change 调度执行链时，再按实际组合根决定归 Flow/runtime 还是新增外部 seam，
-  不提前创建空 package。
 
 ## 正确性分层
 
@@ -90,7 +89,8 @@ decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一�
 
 性质测试使用确定性 seed，并在失败时打印 seed。Change 重点验证 roundtrip、投影等价、切片和
 稳定重批；Store 重点验证分页/方向与 `BTreeMap` 模型一致、事务原子性和单调 offset；Operation
-重点验证稳定 definition codec 与状态推进；Flow 重点验证任意合法 DAG 的顺序和拓扑约束。
+重点验证稳定 definition codec、状态推进和稳定重批；Flow 重点验证任意合法 DAG 的顺序、拓扑
+约束，以及 Station 完整 Change 退休、cursor/output 原子性和成功 turn 后的上游 GC。
 任意输入 decoder 必须返回结果而非 panic、abort、无限循环或按未验证长度分配。
 
 ### 崩溃与长稳

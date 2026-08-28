@@ -6,10 +6,6 @@ use super::{protocol::StationError, runtime::Station};
 pub(super) const ACTIVE_INPUT_KEY: &[u8] = b"input/active";
 pub(super) const CURSOR_ORIGIN: u64 = 0;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the future processing protocol")
-)]
 pub(super) struct InputChange {
     pub(super) input: usize,
     pub(super) offset: u64,
@@ -83,9 +79,9 @@ impl Station {
                     Ok(())
                 },
             )?;
-            if loaded.is_some() {
-                self.inputs.cache = loaded;
-                break;
+            if let Some(change) = loaded {
+                self.inputs.cache = Some(change);
+                return Ok(());
             }
         }
         Ok(())
