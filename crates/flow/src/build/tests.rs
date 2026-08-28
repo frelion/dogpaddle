@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use dogpaddle_operation::{
     OperationDefinition, encode_definition,
     operation::{
@@ -28,6 +30,26 @@ fn factory() -> FlowFactory {
     FlowFactory::new("")
 }
 
+fn declare_output_capacities(builder: &mut FlowFactory) {
+    let output_stations = builder
+        .stations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, station)| {
+            station.has_output().then_some((
+                StationRef {
+                    factory_token: builder.token,
+                    index,
+                },
+                NonZeroU64::new(u64::try_from(index + 1).unwrap() * 1_024).unwrap(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (station, capacity) in output_stations {
+        builder.output_capacity_bytes(station, capacity);
+    }
+}
+
 fn find_station<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StationDefinition {
     definition
         .stations
@@ -56,6 +78,7 @@ where
         let sink = builder.station("sink", discard());
         builder.connect([target], sink);
     }
+    declare_output_capacities(&mut builder);
     builder.finish_definition()
 }
 
@@ -70,6 +93,7 @@ fn finish_preserves_station_order_and_resolves_references() {
     builder.connect([first], first_sink);
     builder.connect([second], target);
     builder.connect([target], target_sink);
+    declare_output_capacities(&mut builder);
 
     let definition = builder.finish_definition().unwrap();
 
@@ -214,6 +238,76 @@ fn finish_accepts_each_builtin_input_count() {
 }
 
 #[test]
+fn finish_persists_exactly_one_capacity_for_each_output_station() {
+    let definition = codec_definition();
+
+    assert_eq!(
+        find_station(&definition, "source").output_capacity_bytes(),
+        NonZeroU64::new(1_024)
+    );
+    assert_eq!(
+        find_station(&definition, "count").output_capacity_bytes(),
+        NonZeroU64::new(2_048)
+    );
+    assert_eq!(
+        find_station(&definition, "sink").output_capacity_bytes(),
+        None
+    );
+}
+
+#[test]
+fn finish_rejects_missing_unexpected_and_duplicate_output_capacities() {
+    let mut missing = factory();
+    let missing_source = missing.station("source", source(0));
+    let sink = missing.station("sink", discard());
+    missing.connect([missing_source], sink);
+    assert_eq!(
+        missing.finish_definition().unwrap_err(),
+        TopologyError::MissingOutputCapacity("source".to_owned())
+    );
+
+    let mut unexpected = factory();
+    let unexpected_source = unexpected.station("source", source(0));
+    let sink = unexpected.station("sink", discard());
+    unexpected.connect([unexpected_source], sink);
+    unexpected.output_capacity_bytes(unexpected_source, NonZeroU64::new(1).unwrap());
+    unexpected.output_capacity_bytes(sink, NonZeroU64::new(1).unwrap());
+    assert_eq!(
+        unexpected.finish_definition().unwrap_err(),
+        TopologyError::UnexpectedOutputCapacity("sink".to_owned())
+    );
+
+    let mut duplicate = factory();
+    let duplicate_source = duplicate.station("source", source(0));
+    let sink = duplicate.station("sink", discard());
+    duplicate.connect([duplicate_source], sink);
+    duplicate.output_capacity_bytes(duplicate_source, NonZeroU64::new(1).unwrap());
+    duplicate.output_capacity_bytes(duplicate_source, NonZeroU64::new(2).unwrap());
+    assert_eq!(
+        duplicate.finish_definition().unwrap_err(),
+        TopologyError::OutputCapacityAlreadySet("source".to_owned())
+    );
+}
+
+#[test]
+fn finish_rejects_a_foreign_output_capacity_reference() {
+    let mut foreign_factory = factory();
+    let foreign = foreign_factory.station("foreign", source(0));
+
+    let mut builder = factory();
+    let source = builder.station("source", source(0));
+    let sink = builder.station("sink", discard());
+    builder.connect([source], sink);
+    builder.output_capacity_bytes(source, NonZeroU64::new(1).unwrap());
+    builder.output_capacity_bytes(foreign, NonZeroU64::new(1).unwrap());
+
+    assert_eq!(
+        builder.finish_definition().unwrap_err(),
+        TopologyError::ForeignStationRef(foreign)
+    );
+}
+
+#[test]
 fn finish_rejects_forbidden_or_excess_inputs() {
     assert_eq!(
         finish_with_target(source(0), 1).unwrap_err(),
@@ -308,6 +402,7 @@ fn finish_allows_fan_out() {
     builder.connect([source], right);
     builder.connect([left], left_sink);
     builder.connect([right], right_sink);
+    declare_output_capacities(&mut builder);
 
     let definition = builder.finish_definition().unwrap();
 
@@ -326,6 +421,7 @@ fn finish_allows_multiple_source_sink_components() {
     builder.connect([direct_source], direct_sink);
     builder.connect([source], count);
     builder.connect([count], count_sink);
+    declare_output_capacities(&mut builder);
 
     let definition = builder.finish_definition().unwrap();
 
@@ -401,6 +497,7 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                     let sink = builder.station(format!("sink-{leaf}"), discard());
                     builder.connect([references[leaf]], sink);
                 }
+                declare_output_capacities(&mut builder);
 
                 match expected {
                     UnaryGraphClass::Acyclic => {
@@ -514,6 +611,7 @@ fn codec_definition() -> FlowDefinition {
     let sink = builder.station("sink", discard());
     builder.connect([source], count);
     builder.connect([count], sink);
+    declare_output_capacities(&mut builder);
     builder.finish_definition().unwrap()
 }
 
@@ -524,6 +622,7 @@ fn codec_definition_with_ids(source_id: &str, count_id: &str) -> FlowDefinition 
     let sink = builder.station("sink", discard());
     builder.connect([source], count);
     builder.connect([count], sink);
+    declare_output_capacities(&mut builder);
     builder.finish_definition().unwrap()
 }
 
@@ -538,12 +637,14 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
         &[0, 0, 0, 32],
         b"dogpaddle.operation\0",
         &[0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7],
+        &[0, 0, 0, 0, 0, 0, 4, 0],
         &[0, 0, 0, 0],
         &[0, 0, 0, 5],
         b"count",
         &[0, 0, 0, 24],
         b"dogpaddle.operation\0",
         &[0, 1, 0, 2],
+        &[0, 0, 0, 0, 0, 0, 8, 0],
         &[0, 0, 0, 1, 0, 0, 0, 6],
         b"source",
         &[0, 0, 0, 4],
@@ -551,6 +652,7 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
         &[0, 0, 0, 24],
         b"dogpaddle.operation\0",
         &[0, 1, 0, 3],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
         &[0, 0, 0, 1, 0, 0, 0, 5],
         b"count",
     ]
@@ -575,6 +677,7 @@ fn decoder_round_trips_a_large_chain() {
     }
     let sink = builder.station("sink", discard());
     builder.connect([previous], sink);
+    declare_output_capacities(&mut builder);
     let encoded = encode(&builder.finish_definition().unwrap()).unwrap();
 
     let decoded = decode(&encoded).unwrap();
@@ -603,6 +706,41 @@ fn decoder_rejects_truncation_and_trailing_bytes() {
     assert_eq!(
         decode(&trailing).unwrap_err(),
         FlowDefinitionError::TrailingBytes
+    );
+}
+
+#[test]
+fn decoder_validates_capacity_against_the_decoded_operation_category() {
+    let mut missing = encode(&codec_definition()).unwrap();
+    let source_start = missing
+        .windows(7_u64.to_be_bytes().len())
+        .position(|window| window == 7_u64.to_be_bytes())
+        .unwrap();
+    let source_capacity = source_start + size_of::<u64>();
+    missing[source_capacity..source_capacity + size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_be_bytes());
+    let checksum_offset = missing.len() - CHECKSUM_LENGTH;
+    let checksum = crc32(&missing[..checksum_offset]);
+    missing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(
+        decode(&missing).unwrap_err(),
+        FlowDefinitionError::Topology(TopologyError::MissingOutputCapacity("source".to_owned()))
+    );
+
+    let mut unexpected = encode(&codec_definition()).unwrap();
+    let sink_operation = unexpected
+        .windows(b"dogpaddle.operation\0".len())
+        .rposition(|window| window == b"dogpaddle.operation\0")
+        .unwrap();
+    let sink_capacity = sink_operation + 24;
+    unexpected[sink_capacity..sink_capacity + size_of::<u64>()]
+        .copy_from_slice(&1_u64.to_be_bytes());
+    let checksum_offset = unexpected.len() - CHECKSUM_LENGTH;
+    let checksum = crc32(&unexpected[..checksum_offset]);
+    unexpected[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(
+        decode(&unexpected).unwrap_err(),
+        FlowDefinitionError::Topology(TopologyError::UnexpectedOutputCapacity("sink".to_owned()))
     );
 }
 

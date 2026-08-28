@@ -1,4 +1,10 @@
-use std::{borrow::Cow, marker::PhantomData, num::NonZeroUsize, ops::Range};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    marker::PhantomData,
+    num::{NonZeroU64, NonZeroUsize},
+    ops::Range,
+};
 
 use crate::{
     CodecError, DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanLimit,
@@ -6,8 +12,41 @@ use crate::{
 };
 
 const METADATA_KEY: &[u8] = &[];
-const METADATA_BYTES: usize = 16;
+const METADATA_BYTES: usize = 3 * size_of::<u64>();
 const OFFSET_BYTES: usize = size_of::<u64>();
+
+#[derive(Clone, Copy)]
+struct LogMetadata {
+    head: u64,
+    tail: u64,
+    retained_bytes: u64,
+}
+
+impl LogMetadata {
+    const EMPTY: Self = Self {
+        head: 0,
+        tail: 0,
+        retained_bytes: 0,
+    };
+
+    const fn bounds(self) -> Range<u64> {
+        self.head..self.tail
+    }
+
+    fn is_valid(self) -> bool {
+        let Some(entries) = self.tail.checked_sub(self.head) else {
+            return false;
+        };
+        if entries == 0 {
+            return self.retained_bytes == 0;
+        }
+        entries
+            .checked_mul(
+                u64::try_from(OFFSET_BYTES).expect("u64 can represent the fixed offset width"),
+            )
+            .is_some_and(|minimum| self.retained_bytes >= minimum)
+    }
+}
 
 /// A named append-only sequence of typed values.
 ///
@@ -29,8 +68,9 @@ pub struct AppendLogAccess<'transaction, T> {
 /// A read-only transaction-bound view of an [`AppendLog`].
 ///
 /// This view can originate from either an active [`crate::Transaction`] or
-/// [`crate::ReadTransaction`]. It exposes bounds and scans, but no append or
-/// truncation API, and cannot outlive the originating transaction.
+/// [`crate::ReadTransaction`]. It exposes bounds, retained-byte accounting,
+/// and scans, but no append or truncation API, and cannot outlive the
+/// originating transaction.
 ///
 /// ```compile_fail
 /// use dogpaddle_store::AppendLogReadAccess;
@@ -149,17 +189,68 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
         read_log_bounds(self.data.as_read())
     }
 
+    /// Returns the logical encoded bytes retained in `[head, tail)`.
+    ///
+    /// Each entry contributes its eight-byte offset key plus its complete
+    /// encoded value. Storage-engine pages, metadata, and MVCC history are not
+    /// included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access fails or the log metadata is corrupt.
+    pub fn retained_bytes(&self) -> Result<u64, StoreError> {
+        Ok(self.read_metadata()?.retained_bytes)
+    }
+
     /// Appends one value and returns its stable offset.
     ///
     /// # Errors
     ///
-    /// Returns an error when encoding or storage fails, the offset space is
-    /// exhausted, or the persisted log is corrupt.
+    /// Returns an error when encoding or storage fails, the offset or
+    /// retained-byte space is exhausted, or the persisted log is corrupt.
     pub fn append(&mut self, value: &T) -> Result<u64, StoreError> {
         let offsets = self.append_encoded(std::iter::once(
             value.encode_value().map_err(StoreError::from),
         ))?;
         Ok(offsets.start)
+    }
+
+    /// Appends one value when it fits within a retained-byte capacity.
+    ///
+    /// A log whose retained range is empty (`head == tail`) always admits one
+    /// entry, even when that entry is larger than `capacity`. A non-empty log
+    /// admits the entry only when the resulting retained-byte count is at most
+    /// `capacity`. Capacity rejection returns `Ok(None)` without writing or
+    /// poisoning the transaction. The capacity covers logical encoded
+    /// key-plus-value bytes, not storage-engine pages, metadata, MVCC history,
+    /// or the backing file's allocated size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding or storage fails, the offset or retained
+    /// byte space is exhausted, or the persisted log is corrupt.
+    pub fn try_append(
+        &mut self,
+        value: &T,
+        capacity: NonZeroU64,
+    ) -> Result<Option<u64>, StoreError> {
+        let metadata = self.read_metadata()?;
+        let encoded = self
+            .data
+            .poison_on_error(value.encode_value().map_err(StoreError::from))?;
+        let item_bytes = self
+            .data
+            .poison_on_error(encoded_item_bytes(encoded.as_ref()))?;
+        if metadata.head < metadata.tail
+            && (metadata.retained_bytes >= capacity.get()
+                || item_bytes > capacity.get() - metadata.retained_bytes)
+        {
+            return Ok(None);
+        }
+
+        let offsets =
+            self.append_encoded_to(metadata, std::iter::once(Ok::<_, StoreError>(encoded)))?;
+        Ok(Some(offsets.start))
     }
 
     /// Appends one batch and returns the stable offset range assigned to it.
@@ -169,9 +260,10 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when encoding or storage fails, the offset range would
-    /// overflow, or the persisted log is corrupt. Any failure poisons the
-    /// transaction and rolls back entries already written from this batch.
+    /// Returns an error when encoding or storage fails, the offset range or
+    /// retained-byte count would overflow, or the persisted log is corrupt.
+    /// Any failure poisons the transaction and rolls back entries already
+    /// written from this batch.
     pub fn append_batch(&mut self, values: &[T]) -> Result<Range<u64>, StoreError> {
         self.append_encoded(
             values
@@ -188,8 +280,8 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when storage fails, the offset space is exhausted, or
-    /// the persisted destination log is corrupt.
+    /// Returns an error when storage fails, the offset or retained-byte space
+    /// is exhausted, or the persisted destination log is corrupt.
     pub fn append_entry(&mut self, entry: &AppendLogEntry<'_, T>) -> Result<u64, StoreError> {
         if !self.data.is_same_write_transaction(entry.transaction) {
             entry.transaction.poison();
@@ -239,13 +331,15 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
     /// # Errors
     ///
     /// Returns an error when `target` is beyond the current tail, storage
-    /// access fails, or the persisted log is corrupt.
+    /// access fails, the deleted byte count cannot be represented, or the
+    /// persisted log is corrupt.
     pub fn truncate_before(
         &mut self,
         target: u64,
         max_items: NonZeroUsize,
     ) -> Result<u64, StoreError> {
-        let bounds = self.read_bounds()?;
+        let metadata = self.read_metadata()?;
+        let bounds = metadata.bounds();
         if target > bounds.end {
             return self.fail(StoreError::LogOffsetOutOfRange {
                 offset: target,
@@ -260,15 +354,29 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
         let available = target - bounds.start;
         let requested = u64::try_from(max_items.get()).unwrap_or(u64::MAX);
         let next_head = bounds.start + available.min(requested);
-        if !self
+        let Some(deleted_bytes) = self
             .data
             .delete_exact_keys((bounds.start..next_head).map(encode_offset))?
-        {
+        else {
             return self.fail(StoreError::CorruptAppendLog {
                 reason: "retained entries are missing or out of order during truncation",
             });
+        };
+        let Some(retained_bytes) = metadata.retained_bytes.checked_sub(deleted_bytes) else {
+            return self.fail(StoreError::CorruptAppendLog {
+                reason: "retained-byte metadata is smaller than the deleted prefix",
+            });
+        };
+        if next_head == bounds.end && retained_bytes != 0 {
+            return self.fail(StoreError::CorruptAppendLog {
+                reason: "an empty log has a non-zero retained-byte count",
+            });
         }
-        self.write_bounds(next_head..bounds.end)?;
+        self.write_metadata(LogMetadata {
+            head: next_head,
+            tail: bounds.end,
+            retained_bytes,
+        })?;
         Ok(next_head)
     }
 
@@ -279,7 +387,19 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
     where
         B: AsRef<[u8]>,
     {
-        let bounds = self.read_bounds()?;
+        let metadata = self.read_metadata()?;
+        self.append_encoded_to(metadata, encoded)
+    }
+
+    fn append_encoded_to<B>(
+        &mut self,
+        metadata: LogMetadata,
+        encoded: impl ExactSizeIterator<Item = Result<B, StoreError>>,
+    ) -> Result<Range<u64>, StoreError>
+    where
+        B: AsRef<[u8]>,
+    {
+        let bounds = metadata.bounds();
         let Ok(count) = u64::try_from(encoded.len()) else {
             return self.fail(StoreError::LogOffsetExhausted);
         };
@@ -295,27 +415,46 @@ impl<'transaction, T: StoreValue> AppendLogAccess<'transaction, T> {
             });
         }
         let tail = bounds.end;
+        let retained_bytes = Cell::new(metadata.retained_bytes);
         let entries = encoded.enumerate().map(|(index, encoded)| {
             let offset = tail
                 + u64::try_from(index)
                     .expect("exact-size iterator length was converted to u64 above");
-            encoded.map(|encoded| (encode_offset(offset), encoded))
+            encoded.and_then(|encoded| {
+                let item_bytes = encoded_item_bytes(encoded.as_ref())?;
+                let next_retained_bytes = retained_bytes
+                    .get()
+                    .checked_add(item_bytes)
+                    .ok_or(StoreError::LogRetainedBytesExhausted)?;
+                retained_bytes.set(next_retained_bytes);
+                Ok((encode_offset(offset), encoded))
+            })
         });
         if !self.data.append_ordered(entries)? {
             return self.fail(StoreError::CorruptAppendLog {
                 reason: "the next append offset is occupied or out of physical order",
             });
         }
-        self.write_bounds(bounds.start..next_tail)?;
+        let retained_bytes = retained_bytes.get();
+        self.write_metadata(LogMetadata {
+            head: bounds.start,
+            tail: next_tail,
+            retained_bytes,
+        })?;
         Ok(tail..next_tail)
     }
 
-    fn read_bounds(&self) -> Result<Range<u64>, StoreError> {
-        read_log_bounds(self.data.as_read())
+    fn read_metadata(&self) -> Result<LogMetadata, StoreError> {
+        read_log_metadata(self.data.as_read())
     }
 
-    fn write_bounds(&mut self, bounds: Range<u64>) -> Result<(), StoreError> {
-        self.data.put(METADATA_KEY, &encode_bounds(bounds))
+    fn write_metadata(&mut self, metadata: LogMetadata) -> Result<(), StoreError> {
+        if !metadata.is_valid() {
+            return self.fail(StoreError::CorruptAppendLog {
+                reason: "an update would write invalid log metadata",
+            });
+        }
+        self.data.put(METADATA_KEY, &encode_metadata(metadata))
     }
 
     fn fail<R>(&self, error: StoreError) -> Result<R, StoreError> {
@@ -332,6 +471,19 @@ impl<T: StoreValue> AppendLogReadAccess<'_, T> {
     /// Returns an error when storage access fails or the log metadata is corrupt.
     pub fn bounds(&self) -> Result<Range<u64>, StoreError> {
         read_log_bounds(&self.data)
+    }
+
+    /// Returns the logical encoded bytes retained in `[head, tail)`.
+    ///
+    /// Each entry contributes its eight-byte offset key plus its complete
+    /// encoded value. Storage-engine pages, metadata, and MVCC history are not
+    /// included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access fails or the log metadata is corrupt.
+    pub fn retained_bytes(&self) -> Result<u64, StoreError> {
+        Ok(read_log_metadata(&self.data)?.retained_bytes)
     }
 
     /// Visits one bounded batch beginning at `offset` through this read-only
@@ -361,9 +513,13 @@ impl<T: StoreValue> AppendLogReadAccess<'_, T> {
 }
 
 fn read_log_bounds(data: &ReadDataAccess<'_>) -> Result<Range<u64>, StoreError> {
+    Ok(read_log_metadata(data)?.bounds())
+}
+
+fn read_log_metadata(data: &ReadDataAccess<'_>) -> Result<LogMetadata, StoreError> {
     let Some(encoded) = data.get(METADATA_KEY)? else {
         return if data.is_physically_empty()? {
-            Ok(0..0)
+            Ok(LogMetadata::EMPTY)
         } else {
             fail_read(
                 data,
@@ -373,10 +529,10 @@ fn read_log_bounds(data: &ReadDataAccess<'_>) -> Result<Range<u64>, StoreError> 
             )
         };
     };
-    let bounds = decode_bounds(&encoded).ok_or(StoreError::CorruptAppendLog {
+    let metadata = decode_metadata(&encoded).ok_or(StoreError::CorruptAppendLog {
         reason: "invalid log metadata",
     });
-    data.record_result(bounds)
+    data.record_result(metadata)
 }
 
 fn scan_log<T: StoreValue, E>(
@@ -529,16 +685,32 @@ fn encode_offset(offset: u64) -> [u8; OFFSET_BYTES] {
     offset.to_be_bytes()
 }
 
-fn encode_bounds(bounds: Range<u64>) -> [u8; METADATA_BYTES] {
+fn encoded_item_bytes(encoded: &[u8]) -> Result<u64, StoreError> {
+    let value_bytes =
+        u64::try_from(encoded.len()).map_err(|_| StoreError::LogRetainedBytesExhausted)?;
+    u64::try_from(OFFSET_BYTES)
+        .expect("u64 can represent the fixed offset width")
+        .checked_add(value_bytes)
+        .ok_or(StoreError::LogRetainedBytesExhausted)
+}
+
+fn encode_metadata(metadata: LogMetadata) -> [u8; METADATA_BYTES] {
     let mut encoded = [0; METADATA_BYTES];
-    encoded[..OFFSET_BYTES].copy_from_slice(&bounds.start.to_be_bytes());
-    encoded[OFFSET_BYTES..].copy_from_slice(&bounds.end.to_be_bytes());
+    encoded[..OFFSET_BYTES].copy_from_slice(&metadata.head.to_be_bytes());
+    encoded[OFFSET_BYTES..2 * OFFSET_BYTES].copy_from_slice(&metadata.tail.to_be_bytes());
+    encoded[2 * OFFSET_BYTES..].copy_from_slice(&metadata.retained_bytes.to_be_bytes());
     encoded
 }
 
-fn decode_bounds(encoded: &[u8]) -> Option<Range<u64>> {
+fn decode_metadata(encoded: &[u8]) -> Option<LogMetadata> {
     let encoded: &[u8; METADATA_BYTES] = encoded.try_into().ok()?;
     let head = u64::from_be_bytes(encoded[..OFFSET_BYTES].try_into().ok()?);
-    let tail = u64::from_be_bytes(encoded[OFFSET_BYTES..].try_into().ok()?);
-    (head <= tail).then_some(head..tail)
+    let tail = u64::from_be_bytes(encoded[OFFSET_BYTES..2 * OFFSET_BYTES].try_into().ok()?);
+    let retained_bytes = u64::from_be_bytes(encoded[2 * OFFSET_BYTES..].try_into().ok()?);
+    let metadata = LogMetadata {
+        head,
+        tail,
+        retained_bytes,
+    };
+    metadata.is_valid().then_some(metadata)
 }

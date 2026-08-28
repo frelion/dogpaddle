@@ -30,7 +30,7 @@ commit 使用 `input: None`；收到输入的 Operation 必须使用 `Some(Keep)
 跨 turn continuation 必须放在 Operation 自己通过 Definition 声明的持久化 Store 状态中，不能
 隐藏在 Station。具体错误统一擦除为标准 boxed [`operation::OperationError`]：算子语义错误保留
 具体算子错误类型，Store、Arrow 和 Change 等基础错误保留原始类型，均可按具体类型 downcast。
-由于 `Idle`、错误或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
+由于 `Idle`、错误、Station output 容量拒绝或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
 Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂等提交协议，当前尚未定义。
 
 | decision | `input` progress | 本 turn 写入与 output | 当前输入 |

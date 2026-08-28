@@ -43,10 +43,12 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   真正的只读事务在类型层没有写入或提交入口。有界 map scan 可完整解码，也可只投影编码中的
   所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
-  投影解码、同事务原样转发和有界前缀回收；Flow 已完成 Station output 与只读 input 的资源
+  投影解码、同事务原样转发、有界前缀回收和按物理 head 维护的 retained-byte 账本；Flow 已完成 Station output 与只读 input 的资源
   装配及 input 准备，并从 Definition 派生确定性的分层拓扑 schedule。内部有界轮次已经按该
   schedule 为每个 Station 保留一次 turn，并在每个成功 turn 后为其直接上游各触发一次有界前缀
-  GC；安全水位取 output 全部 consumer edge cursor 的最小值。该轮次通过 `Flow::advance` 暴露。
+  GC；安全水位取 output 全部 consumer edge cursor 的最小值，只有物理 head 实际前进才释放容量。
+  每个有 output 的 Station 在 Definition 中显式保存独立字节高水位，空日志允许一条 oversize
+  entry；容量拒绝会回滚整个 Operation turn，并通过 `Flow::advance` 的 `Backpressured` 暴露。
   Source 与其他 Operation 使用同一个 `turn` 协议，只以 `None` 区分无输入。`Idle` 回滚 turn；
   `Commit` 的 input 进展与 output 正交：`Keep` 提交 Operation continuation/output，但保留
   active/cursor/cache 并在下一 turn 重放相同完整 Change，`Complete` 才推进 cursor、轮转 active，
@@ -81,8 +83,10 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
 `SequenceSource → Count → Discard` 轮次，并在成功 turn 后进行安全的上游有界 GC。拓扑已经拒绝
-没有任何 consumer 的 output；尚未实现持续运行的 `Flow::start`、针对缓慢 consumer 的容量背压、
-中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。Operation 的展平
+没有任何 consumer 的 output，per-output retained-byte 高水位会让缓慢 consumer 自然向上游传播
+背压；尚未实现持续运行的 `Flow::start`、中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。
+该高水位不计算 MDBX page、Operation state 或 decoded cache，也允许空日志容纳一条 oversize，
+因此不是磁盘或内存硬配额。Operation 的展平
 output 事件序列与最终业务状态必须同时不受稳定重批和 `Keep` turn 切分影响。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store

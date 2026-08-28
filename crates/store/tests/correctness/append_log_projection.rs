@@ -82,6 +82,7 @@ fn projection_reads_only_needed_fields_and_filter_forwards_encoded_entries() {
 
     let transaction = transactions.begin().unwrap();
     let output = output.access(transaction.access()).unwrap();
+    assert_eq!(output.retained_bytes().unwrap(), 4_112);
     let mut forwarded = Vec::new();
     output
         .scan(0, ScanLimit::new(10, 8_192).unwrap(), |entry| {
@@ -122,5 +123,6 @@ fn full_decode_can_precede_unchanged_forwarding() {
         .unwrap();
     let (values, _) = scan_values(&output, 0, ScanLimit::new(1, 1_024).unwrap());
     assert_eq!(values, vec![(0, 7)]);
+    assert_eq!(output.retained_bytes().unwrap(), 16);
     transaction.commit().unwrap();
 }

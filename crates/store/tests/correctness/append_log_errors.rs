@@ -1,4 +1,7 @@
-use std::{borrow::Cow, num::NonZeroUsize};
+use std::{
+    borrow::Cow,
+    num::{NonZeroU64, NonZeroUsize},
+};
 
 use dogpaddle_store::{CodecError, ScanLimit, Store, StoreError, StoreValue};
 
@@ -140,14 +143,9 @@ fn visitor_business_errors_poison_and_roll_back_prior_writes() {
     ));
 
     let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        0..0
-    );
+    let access = output.access(transaction.access()).unwrap();
+    assert_eq!(access.bounds().unwrap(), 0..0);
+    assert_eq!(access.retained_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -227,6 +225,32 @@ fn batch_encoding_failure_rolls_back_entries_written_before_the_error() {
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
     assert_eq!(access.bounds().unwrap(), 0..0);
+    assert_eq!(access.retained_bytes().unwrap(), 0);
+}
+
+#[test]
+fn try_append_encoding_failure_poison_rolls_back_the_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let log = create_log::<BatchValue>(&mut store, "log");
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin().unwrap();
+        let mut access = log.access(transaction.access()).unwrap();
+        assert!(matches!(
+            access.try_append(&BatchValue::Reject, NonZeroU64::new(1).unwrap()),
+            Err(StoreError::Codec(_))
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+    }
+
+    let transaction = transactions.begin().unwrap();
+    let access = log.access(transaction.access()).unwrap();
+    assert_eq!(access.bounds().unwrap(), 0..0);
+    assert_eq!(access.retained_bytes().unwrap(), 0);
 }
 
 struct RejectedDecode;

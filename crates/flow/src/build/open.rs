@@ -96,10 +96,10 @@ fn open_station_part(
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
     let output = station
-        .has_output()
-        .then(|| {
+        .output_capacity_bytes()
+        .map(|capacity| {
             let name = codec::station_output_name(index);
-            open_required_data::<AppendLog<Vec<u8>>>(store, &name)
+            open_required_data::<AppendLog<Vec<u8>>>(store, &name).map(|log| (log, capacity))
         })
         .transpose()?;
     Ok(StationParts::new(state, operation, output))

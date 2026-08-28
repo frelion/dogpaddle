@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
@@ -11,6 +13,10 @@ use super::support::{
 const V1_SEQUENCE_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_source_count_discard.hex");
 
+fn capacity(bytes: u64) -> NonZeroU64 {
+    NonZeroU64::new(bytes).unwrap()
+}
+
 #[test]
 fn build_publishes_the_stable_v1_definition_bytes() {
     let root = tempfile::tempdir().unwrap();
@@ -21,6 +27,8 @@ fn build_publishes_the_stable_v1_definition_bytes() {
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
     builder.connect([count], sink);
+    builder.output_capacity_bytes(source, capacity(1_024));
+    builder.output_capacity_bytes(count, capacity(2_048));
     drop(builder.build().unwrap());
 
     assert_eq!(
@@ -44,6 +52,8 @@ fn build_uses_the_stable_resource_layout() {
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
     builder.connect([count], sink);
+    builder.output_capacity_bytes(source, capacity(1_024));
+    builder.output_capacity_bytes(count, capacity(2_048));
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
@@ -87,6 +97,8 @@ fn build_initializes_input_state_at_the_stable_origins() {
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
     builder.connect([count], sink);
+    builder.output_capacity_bytes(source, capacity(1_024));
+    builder.output_capacity_bytes(count, capacity(2_048));
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();

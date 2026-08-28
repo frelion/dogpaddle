@@ -7,10 +7,11 @@ use crate::support::{raw_database, store_path};
 
 const LOG_TABLE: &str = "d/00000000";
 
-fn metadata(head: u64, tail: u64) -> [u8; 16] {
-    let mut encoded = [0; 16];
+fn metadata(head: u64, tail: u64, retained_bytes: u64) -> [u8; 24] {
+    let mut encoded = [0; 24];
     encoded[..8].copy_from_slice(&head.to_be_bytes());
-    encoded[8..].copy_from_slice(&tail.to_be_bytes());
+    encoded[8..16].copy_from_slice(&tail.to_be_bytes());
+    encoded[16..].copy_from_slice(&retained_bytes.to_be_bytes());
     encoded
 }
 
@@ -43,7 +44,7 @@ fn append_log_has_a_stable_dedicated_layout() {
         let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
         assert_eq!(
             transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-            Some(metadata(1, 2).to_vec())
+            Some(metadata(1, 2, 9).to_vec())
         );
         assert_eq!(
             transaction
@@ -78,7 +79,7 @@ fn append_log_has_a_stable_dedicated_layout() {
     let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
     assert_eq!(
         transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(2, 3).to_vec())
+        Some(metadata(2, 3, 9).to_vec())
     );
     assert_eq!(
         transaction
@@ -122,7 +123,16 @@ fn an_empty_batch_does_not_materialize_log_metadata() {
 
 #[test]
 fn missing_or_invalid_metadata_is_corruption() {
-    for invalid_metadata in [None, Some(vec![0; 15]), Some(metadata(2, 1).to_vec())] {
+    for invalid_metadata in [
+        None,
+        Some(vec![0; 8]),
+        Some(vec![0; 16]),
+        Some(vec![0; 23]),
+        Some(vec![0; 25]),
+        Some(metadata(2, 1, 0).to_vec()),
+        Some(metadata(2, 2, 1).to_vec()),
+        Some(metadata(0, 2, 15).to_vec()),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let path = store_path(&root);
         let mut store = Store::create(&path).unwrap();
@@ -216,7 +226,7 @@ fn truncation_gap_rolls_back_entries_deleted_before_the_failure() {
         let transaction = database.begin_rw_txn().unwrap();
         let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
         transaction
-            .put(&table, [], metadata(0, 3), WriteFlags::UPSERT)
+            .put(&table, [], metadata(0, 3, 27), WriteFlags::UPSERT)
             .unwrap();
         transaction
             .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
@@ -253,7 +263,59 @@ fn truncation_gap_rolls_back_entries_deleted_before_the_failure() {
     );
     assert_eq!(
         transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(0, 3).to_vec())
+        Some(metadata(0, 3, 27).to_vec())
+    );
+}
+
+#[test]
+fn truncation_rejects_a_retained_byte_count_too_small_for_the_remaining_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    drop(store);
+    {
+        let database = raw_database(&path);
+        let transaction = database.begin_rw_txn().unwrap();
+        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+        transaction
+            .put(&table, [], metadata(0, 3, 24), WriteFlags::UPSERT)
+            .unwrap();
+        for offset in 0_u64..3 {
+            transaction
+                .put(&table, offset.to_be_bytes(), b"a", WriteFlags::UPSERT)
+                .unwrap();
+        }
+        assert!(!transaction.commit().unwrap());
+    }
+
+    let store = Store::open(&path).unwrap();
+    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let mut access = log.access(transaction.access()).unwrap();
+    assert!(matches!(
+        access.truncate_before(1, NonZeroUsize::new(1).unwrap()),
+        Err(StoreError::CorruptAppendLog { .. })
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    drop(transactions);
+
+    let database = raw_database(&path);
+    let transaction = database.begin_ro_txn().unwrap();
+    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+    assert_eq!(
+        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
+        Some(metadata(0, 3, 24).to_vec())
+    );
+    assert_eq!(
+        transaction
+            .get::<Vec<u8>>(&table, &0_u64.to_be_bytes())
+            .unwrap(),
+        Some(b"a".to_vec())
     );
 }
 
@@ -269,7 +331,7 @@ fn scan_rejects_an_entry_at_the_recorded_tail() {
         let transaction = database.begin_rw_txn().unwrap();
         let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
         transaction
-            .put(&table, [], metadata(0, 1), WriteFlags::UPSERT)
+            .put(&table, [], metadata(0, 1, 9), WriteFlags::UPSERT)
             .unwrap();
         transaction
             .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
@@ -303,8 +365,8 @@ fn scan_rejects_an_entry_at_the_recorded_tail() {
 #[test]
 fn tail_collision_and_offset_exhaustion_do_not_overwrite_data() {
     for (bounds, expected_error) in [
-        (metadata(0, 0), "collision"),
-        (metadata(u64::MAX, u64::MAX), "exhaustion"),
+        (metadata(0, 0, 0), "collision"),
+        (metadata(u64::MAX, u64::MAX, 0), "exhaustion"),
     ] {
         let root = tempfile::tempdir().unwrap();
         let path = store_path(&root);
@@ -345,6 +407,56 @@ fn tail_collision_and_offset_exhaustion_do_not_overwrite_data() {
 }
 
 #[test]
+fn retained_byte_counter_exhaustion_poison_rolls_back_the_append() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    drop(store);
+    {
+        let database = raw_database(&path);
+        let transaction = database.begin_rw_txn().unwrap();
+        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+        transaction
+            .put(&table, [], metadata(0, 1, u64::MAX), WriteFlags::UPSERT)
+            .unwrap();
+        transaction
+            .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
+            .unwrap();
+        assert!(!transaction.commit().unwrap());
+    }
+
+    let store = Store::open(&path).unwrap();
+    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let mut access = log.access(transaction.access()).unwrap();
+    assert!(matches!(
+        access.append(&b"b".to_vec()),
+        Err(StoreError::LogRetainedBytesExhausted)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    drop(transactions);
+
+    let database = raw_database(&path);
+    let transaction = database.begin_ro_txn().unwrap();
+    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+    assert_eq!(
+        transaction
+            .get::<Vec<u8>>(&table, &1_u64.to_be_bytes())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
+        Some(metadata(0, 1, u64::MAX).to_vec())
+    );
+}
+
+#[test]
 fn ordered_batch_append_rejects_a_physical_key_beyond_the_recorded_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
@@ -356,7 +468,7 @@ fn ordered_batch_append_rejects_a_physical_key_beyond_the_recorded_tail() {
         let transaction = database.begin_rw_txn().unwrap();
         let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
         transaction
-            .put(&table, [], metadata(0, 0), WriteFlags::UPSERT)
+            .put(&table, [], metadata(0, 0, 0), WriteFlags::UPSERT)
             .unwrap();
         transaction
             .put(&table, 1_u64.to_be_bytes(), b"future", WriteFlags::UPSERT)
@@ -411,7 +523,7 @@ fn batch_offset_overflow_is_rejected_before_any_entry_is_written() {
             .put(
                 &table,
                 [],
-                metadata(u64::MAX - 1, u64::MAX - 1),
+                metadata(u64::MAX - 1, u64::MAX - 1, 0),
                 WriteFlags::UPSERT,
             )
             .unwrap();

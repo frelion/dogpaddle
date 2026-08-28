@@ -34,9 +34,9 @@ impl ConsumerCursor {
 }
 
 impl Station {
-    pub(crate) fn gc(&self, transactions: &mut Transactions) -> Result<(), StationError> {
+    pub(crate) fn gc(&self, transactions: &mut Transactions) -> Result<bool, StationError> {
         if self.consumers.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let transaction = transactions.begin()?;
@@ -59,8 +59,8 @@ impl Station {
             }
             target = target.min(offset);
         }
-        output.truncate_before(target, GC_MAX_ITEMS)?;
+        let head = output.truncate_before(target, GC_MAX_ITEMS)?;
         transaction.commit()?;
-        Ok(())
+        Ok(head > bounds.start)
     }
 }

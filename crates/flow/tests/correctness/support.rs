@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::operation::{sink::DiscardDefinition, source::SequenceSourceDefinition};
@@ -9,6 +9,7 @@ pub(super) fn build_source_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], sink);
+    builder.output_capacity_bytes(source, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 
     read_published_definition(path)

@@ -5,7 +5,7 @@ dogpaddle-flow 是 Operation 与 Store 的产品组合根，因此真实资源�
 打开测试属于本 crate；它们不需要再放入 `integration-tests/flow-store`。当前已有 Station output
 log、只读 input capability、唯一 owned Change cache、确定性拓扑 schedule、Operation
 `Idle`/`Commit(Keep)`/`Commit(Complete)` 协议、原子 output/input-progress 提交、强重放、上游有界
-GC 和公共 `Flow::advance`。尚无公共 `Flow::start` 或外部可观察 Sink；真实 Store 内执行链仍由本
+GC、per-output retained-byte 高水位和公共 `Flow::advance` 三态。尚无公共 `Flow::start` 或外部可观察 Sink；真实 Store 内执行链仍由本
 crate 验证，不建立重复的
 `integration-tests/engine` package。
 
@@ -54,13 +54,15 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
 - **生命周期**：真实 `SequenceSource → Count → Discard` Flow 成功构建，声明顺序和 ID 保持不变，释放后
   可以重新打开；活动 Flow 独占 Store 路径。
 - **纯校验**：空拓扑、非法或重复 ID、错误输入数量、外部 `StationRef`、空 source 列表、重复设置
-  source、自环、间接环、非 Source 起点、非 Sink 终点和 Sink 作为上游都返回稳定错误，且目标路径
+  source、遗漏/重复 output capacity、outputless Station 配置 capacity、自环、间接环、非 Source
+  起点、非 Sink 终点和 Sink 作为上游都返回稳定错误，且目标路径
   不存在。多个 Source、多个 Sink 和多个合法分量可以构建。私有纯校验还穷举 1 到 5 个
   Source/Count 标号小图，并为每个叶节点连接 Discard，以独立的逐路径 oracle 验证合法 DAG、
   直接/间接环分类、声明顺序和 source 绑定；已经存在的 Store 必须原样保留。
-- **持久化**：v1 Definition 黄金字节来自实际 `FlowFactory::build` 发布的 Cell；Flow/Station state、
-  Station output 和内建 Operation data 使用稳定名称与精确类型；Source/Transform 有 output，
-  Discard Sink 没有 output；
+- **持久化**：包含每 Station capacity 的新 v1 Definition 黄金字节来自实际 `FlowFactory::build`
+  发布的 Cell；Flow/Station state、
+  Station output 和内建 Operation data 使用稳定名称与精确类型；
+  `OperationCategory::has_output()` 为 true 的 Station 创建日志，Discard Sink 没有 output；
   未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
 - **运行期装配**：分离的读写事务启动 capability 归 Flow 长期持有，Station 只保存自己的 state、完整
   可选 output、有序只读 input logs、唯一 owned input-Change cache 及 output consumer cursor 的只读
@@ -80,16 +82,20 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   提交状态、可选 output、cursor 推进和 active 轮转，并在 commit 后清 cache。零输入 Source 通过
   相同的 `turn(None, ...)` 和 `Commit(TurnCommit { input: None, .. })` 路径执行；调用/input-progress
   形状不匹配会被拒绝。测试覆盖 Keep 后同一完整 Change 重放、Complete 后退休、reopen 后 claim
-  恢复、stale cache 拒绝、output append 失败回滚和无重复输出。`Flow::advance`
-  在同一轮让拓扑下游观察上游已提交 output，并在每个成功 turn 后触发全部不同的直接上游 GC。
+  恢复、stale cache 拒绝、output append 失败回滚、capacity 拒绝后的 Source/Keep/Complete 回滚、
+  oversize 空日志准入、物理 head 释放与无重复输出。`Flow::advance` 在同一轮让拓扑下游观察上游
+  已提交 output，并在每个成功 turn 后触发全部不同的直接上游 GC。outcome 按 `Progressed >
+  Backpressured > Idle` 聚合；durable pin 和实际 head 前进都算 progress，背压不得短路后续 Station
+  或 GC。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用
   `FlowFactory::open` 不得 panic，且必须在 Definition 解码阶段失败，不能由后续缺失资源错误
   冒充通过。
 
-黄金 fixture 位于 `tests/fixtures/v1/sequence_source_count_discard.hex`，包含 magic、版本、Station 顺序、
-Operation tag/payload、source 连接和 CRC。当前开发期允许破坏性更新 v1；修改这些字节或稳定
-资源名时必须显式更新 fixture、资源布局和 reopen 测试，不能把测试改成只验证新编码自洽。
+黄金 fixture 位于 `tests/fixtures/v1/sequence_source_count_discard.hex`，包含 magic、版本、Station
+顺序、Operation tag/payload、每个 Station 的 output capacity、source 连接和 CRC。当前开发期允许
+破坏性更新 v1；修改这些字节或稳定资源名时必须显式更新 fixture、资源布局和 reopen 测试，不能
+把测试改成只验证新编码自洽。
 
 `DefinitionChangedDuringOpen` 保护两阶段 open 之间的变化。当前测试不通过竞态、sleep 或
 wall-clock 猜测制造这个窗口；除非以后出现无需扩张公共 API 的确定性故障注入点，否则保留该

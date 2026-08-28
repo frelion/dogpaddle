@@ -1,4 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    num::NonZeroU64,
+};
 
 use thiserror::Error;
 
@@ -75,16 +78,27 @@ pub enum TopologyError {
         /// Downstream Station that attempted to consume it.
         downstream_station: String,
     },
+    /// A Station with an output has no declared retained-byte capacity.
+    #[error("output capacity for station {0:?} is missing")]
+    MissingOutputCapacity(String),
+    /// An outputless Station declared an output capacity.
+    #[error("outputless station {0:?} cannot declare an output capacity")]
+    UnexpectedOutputCapacity(String),
+    /// A Station's output capacity was declared more than once.
+    #[error("output capacity for station {0:?} was already set")]
+    OutputCapacityAlreadySet(String),
 }
 
 pub(super) fn finish_definition(
     token: u64,
     mut stations: Vec<StationDefinition>,
     connections: &[(Vec<StationRef>, StationRef)],
+    output_capacities: &[(StationRef, NonZeroU64)],
 ) -> Result<FlowDefinition, TopologyError> {
     validate_station_ids(&stations)?;
     let mut sources_by_target = validate_connections(token, &stations, connections)?;
     validate_topology(&stations, &sources_by_target)?;
+    apply_output_capacities(token, &mut stations, output_capacities)?;
 
     let station_ids = stations
         .iter()
@@ -114,7 +128,44 @@ pub(super) fn validate_decoded_topology(
             return Err(TopologyError::SelfLoop(stations[target].id.clone()));
         }
     }
-    validate_topology(stations, sources_by_target)
+    validate_topology(stations, sources_by_target)?;
+    validate_output_capacities(stations)
+}
+
+fn apply_output_capacities(
+    token: u64,
+    stations: &mut [StationDefinition],
+    declarations: &[(StationRef, NonZeroU64)],
+) -> Result<(), TopologyError> {
+    let mut capacities = vec![None; stations.len()];
+    for (reference, capacity) in declarations {
+        let index = resolve_ref(token, stations.len(), *reference)?;
+        if capacities[index].replace(*capacity).is_some() {
+            return Err(TopologyError::OutputCapacityAlreadySet(
+                stations[index].id.clone(),
+            ));
+        }
+    }
+
+    for (station, capacity) in stations.iter_mut().zip(capacities) {
+        station.output_capacity_bytes = capacity;
+    }
+    validate_output_capacities(stations)
+}
+
+fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), TopologyError> {
+    for station in stations {
+        match (station.has_output(), station.output_capacity_bytes) {
+            (true, None) => {
+                return Err(TopologyError::MissingOutputCapacity(station.id.clone()));
+            }
+            (false, Some(_)) => {
+                return Err(TopologyError::UnexpectedOutputCapacity(station.id.clone()));
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_topology(

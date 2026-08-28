@@ -9,10 +9,12 @@
 ## 构建 Flow
 
 Factory 的声明阶段没有 Store 副作用：`station()` 返回仅属于当前 `FlowFactory` 的临时
-`StationRef`，`connect()` 记录目标 Station 完整、有序的输入列表。只有 `build()` 才集中校验
-拓扑并创建 Store。
+`StationRef`，`output_capacity_bytes()` 为每个具有 output 的 Station 声明持久化字节高水位，
+`connect()` 记录目标 Station 完整、有序的输入列表。只有 `build()` 才集中校验并创建 Store。
 
 ```rust,no_run
+use std::num::NonZeroU64;
+
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
     operation::sink::DiscardDefinition,
@@ -27,6 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
+    let capacity = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+    factory.output_capacity_bytes(source, capacity);
+    factory.output_capacity_bytes(count, capacity);
     factory.connect([source], count);
     factory.connect([count], sink);
 
@@ -47,7 +52,9 @@ Station ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。�
 fan-out 和重复 source；连接数量必须与 Station 对外声明的输入数量完全一致，整个拓扑
 必须是 DAG。所有入度为零的起点必须是 Source Station，所有出度为零的终点必须是 Sink Station；
 Sink 没有 output，不能作为其他 Station 的上游。允许多个 Source、多个 Sink 和多个互不连接的
-合法 DAG 分量。拓扑校验或 manifest 编码失败不会创建目标目录。
+合法 DAG 分量。每个 `OperationCategory::has_output()` 为 true 的 Station 必须且只能声明一次非零
+output capacity，outputless Station 不得声明；重复、遗漏、类别不匹配或 foreign `StationRef` 都在
+纯校验阶段失败。拓扑、容量校验或 manifest 编码失败不会创建目标目录。
 
 ## 持久化边界
 
@@ -65,7 +72,9 @@ input 保存下一条未处理 Change 的 offset；有输入的 Station 还保�
 `build()` 在发布 manifest 的同一事务中把 active input 和全部 cursor 显式初始化为 `0`，不存在
 “缺失时从当前 log head 开始”的隐式恢复。output 是
 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，不另建 Schema
-Cell。端口 Schema 一致性属于 Flow/Station 契约，不依赖 Change codec 之外的 Schema resource 或
+Cell。每个 output capacity 直接保存在 Flow Definition 中，build/open 都把它与对应 output log
+装配成一个不可失配的运行期 capability，不创建另一份 Station state。端口 Schema 一致性属于
+Flow/Station 契约，不依赖 Change codec 之外的 Schema resource 或
 fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
 
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
@@ -80,7 +89,7 @@ output；第二遍才按 Definition 中的有序 source ID 找到上游 output�
 `ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
 每条 consumer edge 还把下游 state 衰减成只能读取对应 cursor 的内部 capability，注入上游用于
 GC。Station 不知道上下游 Station ID，只拥有自己的有序 input logs、唯一 owned input-Change
-cache、state、完整可选 output 以及 output consumer cursor capabilities。
+cache、state、带固定 capacity 的完整可选 output 以及 output consumer cursor capabilities。
 装配同时从已验证的 Definition 派生运行期 schedule：先按拓扑层次排列，同一层按 Station 声明
 顺序排列，并为每个 target 保留按上游 Station 去重的 GC 触发列表。二者完全由 Definition 推导，
 build/open 得到相同结果，不需要单独持久化。输入准备在 Station 唯一 cache 为空时，通过一个 RO
@@ -106,6 +115,14 @@ output，但不推进 cursor、不轮转 active input，也不清 cache；`Compl
 可选 output、cursor 推进和 active input 轮转，并在 commit 成功后清 cache。任何 Operation、编码、
 append、Station state 或 commit 错误都会回滚本次事务并保留 durable claim 和 cache。
 
+Operation 在调用前不会因 output 已达到水位而被跳过，因为 Station 尚不知道本次是否产生 output
+以及编码后大小。没有 output 的 `Commit` 即使日志已经达到水位也可以正常提交；有 output 时
+Station 先完成 Change 编码，再调用 `AppendLog` 的 capacity-aware append。非空日志追加后超过
+capacity 会正常返回背压而非错误：本次 Operation 写事务整体回滚，Source position、`Keep`
+continuation、`Complete` cursor/active 都不前进，cache 与 durable claim 保留，下一 turn 重新执行
+Operation。物理空日志按 `head == tail` 判断并允许一条 oversize entry，避免单个合法 Change 永久
+无法前进。这是一项 per-output soft high watermark，不是 MDBX 文件大小或进程内存硬配额。
+
 只要当前输入尚未 `Complete`，无论前一 turn 是 `Idle`、`Keep`、错误、output append 失败、commit
 失败还是进程重开，下一次调用都必须收到同一 `(port, offset, bytes)` 所标识的完整 Change；这要求
 同一日志 entry 的原始字节不变，不要求重新解码后拥有相同内存地址。Change 内部的处理位置属于
@@ -120,13 +137,21 @@ event ID。Station 可以为了吞吐稳定地合并或切分物理批次，但�
 展平 output 事件序列和最终业务状态必须同时对稳定重批及同一 Change 的 `Keep` turn 切分保持不变；
 需要业务级跨端口顺序时，必须另行引入逻辑 ingress、barrier 或窗口语义。
 
-每个 Station turn 只要成功返回，无论结果是 `Idle` 还是 `Progressed`，Flow 都会按去重后的直接
+每个 Station turn 只要成功返回，无论结果是 `Idle`、`Backpressured` 还是 `Progressed`，Flow 都会按去重后的直接
 上游列表各触发一次 GC。上游 Station 在独立写事务中读取自己全部 consumer edge 的 durable
 cursor，校验它们位于 output 的 `[head, tail]`，以最小 cursor 为安全水位，并调用一次
 `truncate_before`，单次最多删除 1024 个 entry。重复 source edge 在触发列表中只调用一次，但每条
 edge 的 cursor 都参与最小值；GC 失败以实际执行 GC 的上游 Station ID 返回。Operation 与 cursor
 以 `Complete` 成功提交后，后续 GC 才允许回收对应 Change；`Keep` 即使已经发布 output，也因
-cursor 不动而继续保护当前 entry。
+cursor 不动而继续保护当前 entry。consumer cursor 只表示可回收 target；只有 truncate 事务成功
+提交并真正推进物理 head，AppendLog 的 retained-byte 账本才减少，该 GC 才算 progress。即使下游
+Operation 已经 Idle，补偿 GC 仍会让本轮返回 `Progressed`，保证调用方继续调度直到容量真实释放。
+
+`Flow::advance` 聚合为 `Progressed > Backpressured > Idle`：任一 Operation、durable input pin 或
+物理 GC 有提交就返回 `Progressed`；整轮没有提交、但至少一个实际 output 被容量拒绝时返回
+`Backpressured`；既无提交也无容量拒绝才返回 `Idle`。背压不会提前终止 schedule，所以下游和其他
+DAG 分量仍获得本轮 turn。fan-out 共享一份 output log 和 capacity，最慢 consumer 的 cursor 会有意
+阻塞整个 producer；各下游独立持有的 decoded cache 不计入该容量。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
 `IncompleteBuild`；
@@ -150,7 +175,8 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
-当前仍是开发期 v1，编码、tag 或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
+当前仍是开发期 v1；output capacity 直接成为新的 v1 Station Definition 布局，不解码旧布局。
+编码、tag 或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
 和 reopen 测试，不保留旧格式兼容层。
 
 ## 源码边界
@@ -183,10 +209,11 @@ state、只读 inputs、可选 output、稳定 active input/cursor 和可重建�
 输入准备已能通过 RO snapshot 从 active input 循环查找、durable pin 并幂等准备至多一个带来源
 身份的 Change；`process` 已支持 `Idle`、`Commit(Keep)` 和 `Commit(Complete)`，在同一写事务中
 按 decision 原子协调 Operation continuation、output、active 与 cursor，
-成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定。Flow 已公开有界的
+成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定。每个 output Station 还拥有持久化
+retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
 `Flow::advance`，真实 `SequenceSource → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
-后续跑。端点校验已经排除完全没有 consumer 的 output，但尚未实现针对缓慢或停滞 consumer 的
-容量水位背压。也尚未实现 `Flow::start`、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
+后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
+自然反压上游。尚未实现 `Flow::start`、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 

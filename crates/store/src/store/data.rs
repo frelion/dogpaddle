@@ -290,9 +290,11 @@ impl<'transaction> DataAccess<'transaction> {
 
     /// Deletes an exact ascending sequence of encoded keys with one cursor.
     ///
-    /// `false` means the physical successor did not equal the next requested
-    /// key. Deletion may already have started, so collection callers must turn
-    /// `false` into a hard error before the transaction can commit.
+    /// `None` means the physical successor did not equal the next requested
+    /// key. `Some(bytes)` reports the encoded key-plus-value bytes actually
+    /// deleted without materializing any value. Deletion may already have
+    /// started on either failure path, so collection callers must propagate a
+    /// hard error before the transaction can commit.
     ///
     /// # Errors
     ///
@@ -301,7 +303,7 @@ impl<'transaction> DataAccess<'transaction> {
     pub(crate) fn delete_exact_keys<K>(
         &mut self,
         keys: impl IntoIterator<Item = K>,
-    ) -> Result<bool, StoreError>
+    ) -> Result<Option<u64>, StoreError>
     where
         K: AsRef<[u8]>,
     {
@@ -310,7 +312,7 @@ impl<'transaction> DataAccess<'transaction> {
         self.transaction.record_result((|| {
             let mut keys = keys.into_iter().peekable();
             let Some(first) = keys.peek() else {
-                return Ok(true);
+                return Ok(Some(0));
             };
             let mut cursor = self
                 .transaction
@@ -318,16 +320,27 @@ impl<'transaction> DataAccess<'transaction> {
                 .cursor(&self.read.table)
                 .map_err(|error| StoreError::storage("open deletion cursor", error))?;
             let mut current = cursor
-                .set_range::<Cow<'transaction, [u8]>, ()>(first.as_ref())
+                .set_range::<Cow<'transaction, [u8]>, ObjectLength>(first.as_ref())
                 .map_err(|error| StoreError::storage("seek deletion cursor", error))?;
+            let mut deleted_bytes = 0_u64;
 
             while let Some(expected) = keys.next() {
-                let Some((actual, ())) = current.take() else {
-                    return Ok(false);
+                let Some((actual, value_length)) = current.take() else {
+                    return Ok(None);
                 };
                 if actual.as_ref() != expected.as_ref() {
-                    return Ok(false);
+                    return Ok(None);
                 }
+                let key_bytes = u64::try_from(actual.len())
+                    .map_err(|_| StoreError::LogRetainedBytesExhausted)?;
+                let value_bytes = u64::try_from(*value_length)
+                    .map_err(|_| StoreError::LogRetainedBytesExhausted)?;
+                let item_bytes = key_bytes
+                    .checked_add(value_bytes)
+                    .ok_or(StoreError::LogRetainedBytesExhausted)?;
+                deleted_bytes = deleted_bytes
+                    .checked_add(item_bytes)
+                    .ok_or(StoreError::LogRetainedBytesExhausted)?;
                 drop(actual);
                 cursor
                     .del(WriteFlags::CURRENT)
@@ -336,11 +349,11 @@ impl<'transaction> DataAccess<'transaction> {
                     // After deletion MDBX_GET_CURRENT already yields the
                     // successor. Advancing with NEXT as well would skip it.
                     current = cursor
-                        .get_current::<Cow<'transaction, [u8]>, ()>()
+                        .get_current::<Cow<'transaction, [u8]>, ObjectLength>()
                         .map_err(|error| StoreError::storage("advance deletion cursor", error))?;
                 }
             }
-            Ok(true)
+            Ok(Some(deleted_bytes))
         })())
     }
 }

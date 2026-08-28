@@ -3,7 +3,7 @@ mod errors;
 #[path = "append_log_projection.rs"]
 mod projection;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError, StoreValue};
 
@@ -42,13 +42,16 @@ fn fresh_log_is_empty_and_append_offsets_are_stable() {
         let transaction = transactions.begin().unwrap();
         let mut access = log.access(transaction.access()).unwrap();
         assert_eq!(access.bounds().unwrap(), 0..0);
+        assert_eq!(access.retained_bytes().unwrap(), 0);
         let (_, scan) = scan_values(&access, 0, ScanLimit::new(10, 1_024).unwrap());
         assert_eq!(scan.next_offset, 0);
         assert!(scan.caught_up);
 
         assert_eq!(access.append(&"a".to_owned()).unwrap(), 0);
+        assert_eq!(access.retained_bytes().unwrap(), 9);
         assert_eq!(access.append(&"bb".to_owned()).unwrap(), 1);
         assert_eq!(access.bounds().unwrap(), 0..2);
+        assert_eq!(access.retained_bytes().unwrap(), 19);
         transaction.commit().unwrap();
     }
 
@@ -58,6 +61,44 @@ fn fresh_log_is_empty_and_append_offsets_are_stable() {
     assert_eq!(values, vec![(0, "a".to_owned()), (1, "bb".to_owned())]);
     assert_eq!(scan.next_offset, 2);
     assert!(scan.caught_up);
+    assert_eq!(access.retained_bytes().unwrap(), 19);
+}
+
+#[test]
+fn retained_bytes_are_visible_in_read_snapshots_and_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let log = create_log::<Vec<u8>>(&mut store, "log");
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let transaction = writes.begin().unwrap();
+        let mut access = log.access(transaction.access()).unwrap();
+        access
+            .append_batch(&[b"".to_vec(), b"abc".to_vec()])
+            .unwrap();
+        assert_eq!(access.retained_bytes().unwrap(), 19);
+        transaction.commit().unwrap();
+    }
+    {
+        let transaction = reads.begin().unwrap();
+        let access = log.read(transaction.access()).unwrap();
+        assert_eq!(access.bounds().unwrap(), 0..2);
+        assert_eq!(access.retained_bytes().unwrap(), 19);
+    }
+    drop((writes, reads));
+
+    let store = Store::open(&path).unwrap();
+    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    let (_, reads) = store.into_transactions().split();
+    let transaction = reads.begin().unwrap();
+    assert_eq!(
+        log.read(transaction.access())
+            .unwrap()
+            .retained_bytes()
+            .unwrap(),
+        19
+    );
 }
 
 #[test]
@@ -89,9 +130,11 @@ fn batch_append_is_ordered_and_visible_across_same_transaction_accesses() {
         let mut second = log.access(transaction.access()).unwrap();
         assert_eq!(first.append_batch(&[]).unwrap(), 0..0);
         assert_eq!(first.append_batch(&[10, 20, 30]).unwrap(), 0..3);
+        assert_eq!(first.retained_bytes().unwrap(), 48);
         assert_eq!(second.bounds().unwrap(), 0..3);
         assert_eq!(second.append_batch(&[40, 50]).unwrap(), 3..5);
         assert_eq!(first.bounds().unwrap(), 0..5);
+        assert_eq!(first.retained_bytes().unwrap(), 80);
         transaction.commit().unwrap();
     }
 
@@ -100,6 +143,39 @@ fn batch_append_is_ordered_and_visible_across_same_transaction_accesses() {
     let (values, scan) = scan_values(&access, 0, ScanLimit::new(10, 1_024).unwrap());
     assert_eq!(values, vec![(0, 10), (1, 20), (2, 30), (3, 40), (4, 50)]);
     assert!(scan.caught_up);
+}
+
+#[test]
+fn try_append_enforces_capacity_without_poisoning_and_allows_one_empty_log_oversize() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let log = create_log::<Vec<u8>>(&mut store, "log");
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let mut access = log.access(transaction.access()).unwrap();
+    let capacity = NonZeroU64::new(17).unwrap();
+
+    assert_eq!(
+        access.try_append(&b"a".to_vec(), capacity).unwrap(),
+        Some(0)
+    );
+    assert_eq!(access.try_append(&Vec::new(), capacity).unwrap(), Some(1));
+    assert_eq!(access.retained_bytes().unwrap(), 17);
+    assert_eq!(access.try_append(&Vec::new(), capacity).unwrap(), None);
+    assert_eq!(access.bounds().unwrap(), 0..2);
+    assert_eq!(access.retained_bytes().unwrap(), 17);
+
+    assert_eq!(
+        access
+            .truncate_before(2, NonZeroUsize::new(2).unwrap())
+            .unwrap(),
+        2
+    );
+    assert_eq!(access.retained_bytes().unwrap(), 0);
+    assert_eq!(access.try_append(&vec![7; 20], capacity).unwrap(), Some(2));
+    assert_eq!(access.retained_bytes().unwrap(), 28);
+    assert_eq!(access.try_append(&Vec::new(), capacity).unwrap(), None);
+    transaction.commit().unwrap();
 }
 
 #[test]
@@ -177,6 +253,7 @@ fn truncation_is_bounded_and_never_reuses_offsets() {
         let mut access = log.access(transaction.access()).unwrap();
         assert_eq!(access.append(&10).unwrap(), 0);
         assert_eq!(access.append(&20).unwrap(), 1);
+        assert_eq!(access.retained_bytes().unwrap(), 32);
         assert_eq!(
             access
                 .truncate_before(2, NonZeroUsize::new(1).unwrap())
@@ -184,6 +261,7 @@ fn truncation_is_bounded_and_never_reuses_offsets() {
             1
         );
         assert_eq!(access.bounds().unwrap(), 1..2);
+        assert_eq!(access.retained_bytes().unwrap(), 16);
         assert_eq!(
             access
                 .truncate_before(2, NonZeroUsize::new(1).unwrap())
@@ -191,8 +269,10 @@ fn truncation_is_bounded_and_never_reuses_offsets() {
             2
         );
         assert_eq!(access.bounds().unwrap(), 2..2);
+        assert_eq!(access.retained_bytes().unwrap(), 0);
         assert_eq!(access.append(&30).unwrap(), 2);
         assert_eq!(access.bounds().unwrap(), 2..3);
+        assert_eq!(access.retained_bytes().unwrap(), 16);
         transaction.commit().unwrap();
     }
 
@@ -218,6 +298,7 @@ fn cursor_truncation_deletes_each_exact_prefix_entry_without_skipping() {
         3
     );
     assert_eq!(access.bounds().unwrap(), 3..5);
+    assert_eq!(access.retained_bytes().unwrap(), 32);
     let (values, _) = scan_values(&access, 3, ScanLimit::new(10, 1_024).unwrap());
     assert_eq!(values, vec![(3, 3), (4, 4)]);
     assert_eq!(
@@ -228,6 +309,7 @@ fn cursor_truncation_deletes_each_exact_prefix_entry_without_skipping() {
     );
     let (values, _) = scan_values(&access, 4, ScanLimit::new(10, 1_024).unwrap());
     assert_eq!(values, vec![(4, 4)]);
+    assert_eq!(access.retained_bytes().unwrap(), 16);
     transaction.commit().unwrap();
 }
 
@@ -248,8 +330,19 @@ fn dropped_append_and_truncation_transactions_roll_back() {
     }
     {
         let transaction = transactions.begin().unwrap();
+        assert_eq!(
+            log.access(transaction.access())
+                .unwrap()
+                .try_append(&1, NonZeroU64::new(1).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+    }
+    {
+        let transaction = transactions.begin().unwrap();
         let mut access = log.access(transaction.access()).unwrap();
         assert_eq!(access.bounds().unwrap(), 0..0);
+        assert_eq!(access.retained_bytes().unwrap(), 0);
         access.append(&1).unwrap();
         access.append(&2).unwrap();
         transaction.commit().unwrap();
@@ -269,6 +362,7 @@ fn dropped_append_and_truncation_transactions_roll_back() {
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
     assert_eq!(access.bounds().unwrap(), 0..2);
+    assert_eq!(access.retained_bytes().unwrap(), 32);
     let (values, _) = scan_values(&access, 0, ScanLimit::new(10, 1_024).unwrap());
     assert_eq!(values, vec![(0, 1), (1, 2)]);
 }

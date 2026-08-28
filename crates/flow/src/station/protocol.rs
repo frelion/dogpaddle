@@ -6,7 +6,18 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessOutcome {
     Idle,
+    Backpressured,
     Progressed,
+}
+
+impl ProcessOutcome {
+    pub(crate) const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Progressed, _) | (_, Self::Progressed) => Self::Progressed,
+            (Self::Backpressured, _) | (_, Self::Backpressured) => Self::Backpressured,
+            (Self::Idle, Self::Idle) => Self::Idle,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

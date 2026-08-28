@@ -11,7 +11,7 @@ DogPaddle 用同一套规则组织全部产品 crate 和跨 crate 接缝。测�
 | Change | IPC 私有 framing/layout | Change、Schema、Projection、codec | `change_core`、`change_codec` | 暂无独立状态，不适用 |
 | Store | 当前无必须访问私有实现的测试 | Store、事务、布局、Cell、OrderedMap、AppendLog、崩溃恢复 | `cell`、`ordered_map`、`append_log` | `append_log_endurance` |
 | Operation | decoder registry、类别、类型擦除和具名实例绑定 | Definition、codec、materialize、SequenceSource、Count、Discard | `operation_core` | 当前只有定长 Cell 状态，不适用 |
-| Flow | definition/拓扑 codec、派生 schedule、Station intake/process/GC 与事务原子性 | build/open、资源布局、失败无副作用、真实 `advance` 有界轮次 | `flow_lifecycle`（冷路径） | 尚无持续运行入口，不适用 |
+| Flow | definition/拓扑 codec、派生 schedule、Station intake/process/GC、容量拒绝重放与事务原子性 | build/open、资源布局、失败无副作用、真实 `advance` 三态有界轮次 | `flow_lifecycle`（冷路径） | 尚无持续运行入口，不适用 |
 | Change + Store | 不适用 | 完整 Change entry、回放、事务、重批、reopen | `change_append_log` | `change_append_log_endurance` |
 
 这里的“不适用”是显式边界，不是漏测。新增稳定运行路径、无界状态或跨层调度器时，必须先确定
@@ -83,7 +83,9 @@ fixture、Store 生命周期、workload、计时边界、结果 oracle 或人类
 
 稳定 magic、版本、tag、codec、物理布局和资源名必须有版本化黄金字节或原始布局断言，并覆盖
 decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一套生产逻辑动态拼出 expected。
-改变已有 fixture 需要迁移设计，不能用重新生成文件掩盖兼容性变化。
+改变已经承诺兼容的 fixture 需要迁移设计；明确标记为开发期、尚不承诺兼容的布局可以破坏性
+更新，但必须同步更新独立 fixture、布局/reopen 测试和边界文档，不能只重新生成 expected 来掩盖
+未经评审的格式变化。
 
 ### 性质、变形与鲁棒性
 
@@ -91,8 +93,9 @@ decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一�
 稳定重批；Store 重点验证分页/方向与 `BTreeMap` 模型一致、事务原子性和单调 offset；Operation
 重点验证稳定 definition codec、状态推进和稳定重批；Flow 重点验证任意合法 DAG 的顺序、拓扑
 约束，以及 Station 的 durable input claim、`Idle` 回滚、`Keep` continuation/output 提交、同一
-`(port, offset, bytes)` 完整 Change 重放、`Complete` 退休、cursor/output 原子性和成功 turn 后的
-上游 GC。稳定重批 oracle 必须同时比较展平 output 事件序列和最终业务状态，并证明结果不受同一
+`(port, offset, bytes)` 完整 Change 重放、`Complete` 退休、cursor/output 原子性、output 容量拒绝
+后的 Source/Keep/Complete 回滚、物理 head 驱动的 retained-byte 释放，以及 `Progressed >
+Backpressured > Idle` 聚合。稳定重批 oracle 必须同时比较展平 output 事件序列和最终业务状态，并证明结果不受同一
 Change 被划分为多少个 `Keep` turn 影响。
 任意输入 decoder 必须返回结果而非 panic、abort、无限循环或按未验证长度分配。
 

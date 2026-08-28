@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -22,8 +23,9 @@ static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Factory for building or opening a persistent Flow.
 ///
-/// Declaring stations and connections is side-effect free. [`FlowFactory::build`]
-/// validates the complete graph before creating the Store at the target path.
+/// Declaring stations, output capacities, and connections is side-effect free.
+/// [`FlowFactory::build`] validates the complete graph before creating the Store
+/// at the target path.
 /// [`FlowFactory::open`] directly restores an already-built Flow without
 /// creating a factory instance.
 pub struct FlowFactory {
@@ -31,6 +33,7 @@ pub struct FlowFactory {
     token: u64,
     stations: Vec<StationDefinition>,
     connections: Vec<(Vec<StationRef>, StationRef)>,
+    output_capacities: Vec<(StationRef, NonZeroU64)>,
 }
 
 /// Temporary reference to a station declared in one [`FlowFactory`].
@@ -58,13 +61,15 @@ impl FlowFactory {
             token,
             stations: Vec::new(),
             connections: Vec::new(),
+            output_capacities: Vec::new(),
         }
     }
 
     /// Declares one station containing exactly one concrete operation definition.
     ///
-    /// The returned reference belongs to this factory and is used only by
-    /// [`FlowFactory::connect`]. The string ID is the station's durable identity.
+    /// The returned reference belongs to this factory and is used by
+    /// [`FlowFactory::connect`] and [`FlowFactory::output_capacity_bytes`]. The
+    /// string ID is the station's durable identity.
     pub fn station<D>(&mut self, id: impl Into<String>, definition: D) -> StationRef
     where
         D: OperationDefinition,
@@ -88,6 +93,22 @@ impl FlowFactory {
     {
         self.connections
             .push((sources.into_iter().collect(), target));
+        self
+    }
+
+    /// Declares the retained-output byte high-water mark for one Station.
+    ///
+    /// Call this exactly once for every Station whose Operation category has an
+    /// output. Outputless Stations must not declare a capacity. The capacity is
+    /// persisted as part of the immutable Flow definition. An empty output log
+    /// may accept one entry larger than this mark so that one large change cannot
+    /// permanently stall the Flow.
+    pub fn output_capacity_bytes(
+        &mut self,
+        station: StationRef,
+        capacity: NonZeroU64,
+    ) -> &mut Self {
+        self.output_capacities.push((station, capacity));
         self
     }
 
@@ -142,7 +163,12 @@ impl FlowFactory {
     }
 
     fn finish_definition(self) -> Result<FlowDefinition, TopologyError> {
-        validate::finish_definition(self.token, self.stations, &self.connections)
+        validate::finish_definition(
+            self.token,
+            self.stations,
+            &self.connections,
+            &self.output_capacities,
+        )
     }
 }
 
@@ -175,8 +201,12 @@ fn create_station_part(
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
     let output = station
-        .has_output()
-        .then(|| store.create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index)))
+        .output_capacity_bytes()
+        .map(|capacity| {
+            store
+                .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))
+                .map(|log| (log, capacity))
+        })
         .transpose()?;
     Ok(StationParts::new(state, operation, output))
 }

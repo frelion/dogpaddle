@@ -54,6 +54,12 @@ Rustdoc compile-fail 测试拥有。
 但错误、回滚和 reopen 结果仍通过 Store 公共 API 断言，不能为测试给产品库增加公开后门。
 `crash` 的子进程 worker 必须保持顶层路径 `crash::crash_worker`。
 
+AppendLog 正确性测试还必须锁定 24 字节 metadata 布局，以及
+`retained_bytes = Σ(8-byte offset key + encoded value)` 的精确账本。测试覆盖 scalar/batch/entry
+append、部分与完整 truncate、rollback 和 reopen；容量准入覆盖恰好命中水位、非空日志软拒绝、
+空日志单条 oversize 准入和拒绝后无写入。旧的 8/16 字节 metadata 与不可能的账本组合都按损坏
+数据拒绝，不提供旧格式兼容路径。
+
 常用命令：
 
 ```bash
@@ -133,7 +139,7 @@ cargo bench -p dogpaddle-store --bench append_log
 - `ordered_map`：Small/Large 的写入、点读、双向 scan、完整解码/投影、共享 namespace 干扰和
   Cell + map 多集合原子事务；
 - `append_log`：固定宽度记录的 scalar/batch append、durable commit、warm scan、投影、原样
-  转发、fan-out、前缀 GC 和非空固定窗口；
+  转发、fan-out、retained-byte 账本维护、前缀 GC 和非空固定窗口；
 - `append_log_endurance`：固定保留窗口内持续执行 `append_batch + durable commit` 与
   `truncate_before + durable commit`，记录延迟和空间，并在 reopen 后校验完整窗口。
 

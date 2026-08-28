@@ -247,13 +247,20 @@ append 使用的 offset。读取 cursor 同样表示“下一条尚未读取的 
 不物化 metadata 的 no-op。任意编码、碰撞或存储失败都会毒化事务，已经写入的批内前缀不能
 单独提交。单条 `append` 与批量追加共享同一套持久化不变量。
 
+`retained_bytes()` 返回物理 `[head, tail)` 中所有 entry 的逻辑编码字节和：每项包含八字节
+offset key 与完整 encoded value，不包含 `AppendLog` metadata、MDBX page/index、MVCC 旧页或文件
+系统分配开销。`try_append(value, capacity)` 使用同一账本做准入：非空日志只有在追加后不超过
+capacity 时才写入，否则返回不毒化事务的 `Ok(None)`；空日志始终允许写入一项，因此单个超大
+entry 不会造成永久等待。该 capacity 是 backlog 高水位，不是 MDBX 文件大小硬配额。
+
 `AppendLogAccess::scan` 使用与 map 相同的 `ScanLimit`，每项按八字节 offset key 加完整编码
 value 计费。它不会预先构造完整的 `T`，而是把短生命周期的 `AppendLogEntry` 逐条交给
 callback：`project` 可以只解码 diff 或少数列，`decode_owned` 只在确实需要完整值时执行，
 `append_entry` 则能把相同 `T` 的编码原样写入同一事务中的另一个 log。Entry 不公开 MDBX
 借用或裸字节，也不能逃出 callback 或跨线程。
 
-作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/scan`，不能 append 或 truncate。它既能
+作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/retained_bytes/scan`，不能 append 或
+truncate。它既能
 通过 `access(TransactionAccess)` 参与包含其他写入的原子事务，也能通过
 `read(ReadTransactionAccess)` 绑定独立只读 snapshot。多个消费者可以 clone 同一份只读 handle
 并读取同一个物理日志。写事务中的只读 view 扫出的 entry 仍可原样转发给同一事务内自有的 output；
@@ -266,13 +273,15 @@ limit 后重试的软错误。`AppendLogScan::next_offset` 可直接持久化为
 `caught_up` 表示本批已经追到 scan 开始时捕获的 tail。
 
 `truncate_before(target, max_items)` 只删除 `target` 以下且当前仍保留的连续前缀，并限制单次
-删除条数。删除与 head 推进处于同一个 MDBX 事务；调用方应以所有下游 cursor 的最小值作为
+删除条数。删除过程通过 MDBX cursor 读取 value length，不复制或解码 value；entry 删除、head
+推进和 retained-byte 扣账处于同一个 MDBX 事务。调用方应以所有下游 cursor 的最小值作为
 target，并分批提交 GC。
 
-持久布局固定为一个独立表：空 key 保存 16 字节 big-endian `head || tail`，八字节
-big-endian offset key 保存 `T` 的稳定编码。全新且从未使用的空表可以没有 metadata；一旦
-使用，即使回收到空区间也保留单调的 head/tail。该布局和 `T` 的 codec 都属于调用方需要
-稳定维护的持久化 schema。
+持久布局固定为一个独立表：空 key 保存 24 字节 big-endian
+`head || tail || retained_bytes`，八字节 big-endian offset key 保存 `T` 的稳定编码。全新且
+从未使用的空表可以没有 metadata；一旦使用，即使回收到空区间也保留单调的 head/tail，并把
+retained bytes 记为零。旧的 8 字节或 16 字节 metadata 不做迁移，按损坏拒绝。该布局和 `T` 的
+codec 都属于调用方需要稳定维护的持久化 schema。
 
 ## 测试
 

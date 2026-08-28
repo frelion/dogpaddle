@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
@@ -16,6 +18,9 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     let first_source = builder.station("first-source", SequenceSourceDefinition::new(0));
     let first_sink = builder.station("first-sink", DiscardDefinition::new());
     let second_sink = builder.station("second-sink", DiscardDefinition::new());
+    for station in [first_target, second_target, second_source, first_source] {
+        builder.output_capacity_bytes(station, NonZeroU64::MAX);
+    }
     builder.connect([first_source], first_target);
     builder.connect([second_source], second_target);
     builder.connect([first_target], first_sink);
@@ -44,6 +49,7 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(source, NonZeroU64::MAX);
     builder.connect([source], sink);
     drop(builder.build().unwrap());
 
@@ -75,13 +81,15 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
 }
 
 #[test]
-fn advance_runs_upstream_gc_after_an_idle_station_turn() {
+fn advance_counts_physical_upstream_gc_after_an_idle_station_turn_as_progress() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let count = builder.station("count", CountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(source, NonZeroU64::MAX);
+    builder.output_capacity_bytes(count, NonZeroU64::MAX);
     builder.connect([source], count);
     builder.connect([count], sink);
     let mut flow = builder.build().unwrap();
@@ -100,7 +108,7 @@ fn advance_runs_upstream_gc_after_an_idle_station_turn() {
     );
 
     flow.topology.schedule = vec![1];
-    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Idle);
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     drop(flow);
 
     let store = Store::open(path).unwrap();
@@ -114,5 +122,90 @@ fn advance_runs_upstream_gc_after_an_idle_station_turn() {
             .bounds()
             .unwrap(),
         1..1
+    );
+}
+
+#[test]
+fn advance_reports_backpressure_when_no_station_commits_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let mut builder = FlowFactory::new(root.path().join("flow"));
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(source, NonZeroU64::new(1).unwrap());
+    builder.connect([source], sink);
+    let mut flow = builder.build().unwrap();
+    flow.topology.schedule = vec![0];
+
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
+    assert_eq!(
+        flow.advance().unwrap(),
+        super::AdvanceOutcome::Backpressured
+    );
+}
+
+#[test]
+fn open_reinstates_the_persisted_output_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(source, NonZeroU64::new(1).unwrap());
+    builder.connect([source], sink);
+    drop(builder.build().unwrap());
+
+    let mut reopened = FlowFactory::open(path).unwrap();
+    reopened.topology.schedule = vec![0];
+    assert_eq!(
+        reopened.advance().unwrap(),
+        super::AdvanceOutcome::Progressed
+    );
+    assert_eq!(
+        reopened.advance().unwrap(),
+        super::AdvanceOutcome::Backpressured
+    );
+}
+
+#[test]
+fn advance_does_not_short_circuit_and_progress_dominates_backpressure() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let blocked_source = builder.station("blocked-source", SequenceSourceDefinition::new(0));
+    let progressing_source =
+        builder.station("progressing-source", SequenceSourceDefinition::new(0));
+    let blocked_sink = builder.station("blocked-sink", DiscardDefinition::new());
+    let progressing_sink = builder.station("progressing-sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(blocked_source, NonZeroU64::new(1).unwrap());
+    builder.output_capacity_bytes(progressing_source, NonZeroU64::MAX);
+    builder.connect([blocked_source], blocked_sink);
+    builder.connect([progressing_source], progressing_sink);
+    let mut flow = builder.build().unwrap();
+    flow.topology.schedule = vec![0, 1];
+
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let store = Store::open(path).unwrap();
+    let blocked: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let progressing: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        blocked
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        0..1
+    );
+    assert_eq!(
+        progressing
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        0..2
     );
 }

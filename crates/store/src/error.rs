@@ -83,6 +83,10 @@ pub enum StoreError {
     #[error("append log has exhausted its offset space")]
     LogOffsetExhausted,
 
+    /// An append log cannot represent its retained encoded-byte count.
+    #[error("append log has exhausted its retained-byte counter")]
+    LogRetainedBytesExhausted,
+
     /// Persisted append-log metadata and entries violate the log invariants.
     #[error("append log is corrupt: {reason}")]
     CorruptAppendLog {

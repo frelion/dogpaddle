@@ -1,8 +1,14 @@
+use std::num::NonZeroU64;
+
 use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, TopologyError};
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{Cell, Store, StoreError};
+
+fn capacity() -> NonZeroU64 {
+    NonZeroU64::new(1_024).unwrap()
+}
 
 #[test]
 fn empty_topology_failure_has_no_store_side_effect() {
@@ -119,6 +125,9 @@ fn multiple_source_sink_components_build() {
     builder.connect([first_source], first_sink);
     builder.connect([second_source], count);
     builder.connect([count], second_sink);
+    builder.output_capacity_bytes(first_source, capacity());
+    builder.output_capacity_bytes(second_source, capacity());
+    builder.output_capacity_bytes(count, capacity());
 
     let flow = builder.build().unwrap();
 
@@ -132,6 +141,67 @@ fn multiple_source_sink_components_build() {
             "second-sink"
         ]
     );
+}
+
+#[test]
+fn invalid_output_capacities_have_no_store_side_effect() {
+    let root = tempfile::tempdir().unwrap();
+
+    let missing_path = root.path().join("missing");
+    let mut builder = FlowFactory::new(&missing_path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::MissingOutputCapacity(id)) if id == "source"
+    ));
+    assert!(!missing_path.exists());
+
+    let unexpected_path = root.path().join("unexpected");
+    let mut builder = FlowFactory::new(&unexpected_path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
+    builder.output_capacity_bytes(source, capacity());
+    builder.output_capacity_bytes(sink, capacity());
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::UnexpectedOutputCapacity(id)) if id == "sink"
+    ));
+    assert!(!unexpected_path.exists());
+
+    let duplicate_path = root.path().join("duplicate");
+    let mut builder = FlowFactory::new(&duplicate_path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
+    builder.output_capacity_bytes(source, capacity());
+    builder.output_capacity_bytes(source, capacity());
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::OutputCapacityAlreadySet(id)) if id == "source"
+    ));
+    assert!(!duplicate_path.exists());
+
+    let foreign_path = root.path().join("foreign-reference");
+    let mut foreign_factory = FlowFactory::new(root.path().join("foreign-factory"));
+    let foreign = foreign_factory.station("foreign", SequenceSourceDefinition::new(0));
+    let mut builder = FlowFactory::new(&foreign_path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
+    builder.output_capacity_bytes(source, capacity());
+    builder.output_capacity_bytes(foreign, capacity());
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::ForeignStationRef(reference)) if reference == foreign
+    ));
+    assert!(!foreign_path.exists());
 }
 
 #[test]
@@ -258,6 +328,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], sink);
+    builder.output_capacity_bytes(source, capacity());
     let error = build_error(builder);
     assert!(matches!(
         error,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU64};
 
 use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
@@ -80,6 +80,12 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
         encode_string(&mut encoded, station.id(), "station ID")?;
         let operation = encode_definition(station.operation());
         encode_bytes(&mut encoded, &operation, "operation definition")?;
+        encoded.extend_from_slice(
+            &station
+                .output_capacity_bytes()
+                .map_or(0, NonZeroU64::get)
+                .to_be_bytes(),
+        );
         let source_count = u32::try_from(station.sources().len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("source count"))?;
         encoded.extend_from_slice(&source_count.to_be_bytes());
@@ -125,6 +131,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
     for _ in 0..station_count {
         let id = cursor.read_string()?;
         let operation = decode_definition(cursor.read_bytes()?)?;
+        let output_capacity_bytes = NonZeroU64::new(cursor.read_u64()?);
         let source_count = cursor.read_u32()?;
         let mut sources = Vec::new();
         for _ in 0..source_count {
@@ -133,6 +140,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
         stations.push(StationDefinition {
             id,
             operation,
+            output_capacity_bytes,
             sources,
         });
     }
@@ -230,6 +238,10 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32, FlowDefinitionError> {
         Ok(u32::from_be_bytes(self.take::<4>()?))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, FlowDefinitionError> {
+        Ok(u64::from_be_bytes(self.take::<8>()?))
     }
 
     fn read_bytes(&mut self) -> Result<&'a [u8], FlowDefinitionError> {

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
@@ -27,6 +30,7 @@ use super::{
     decode_active_input, decode_cursor, encode_active_input, encode_cursor,
     gc::GC_MAX_ITEMS,
     protocol::{ProcessOutcome, StationError},
+    runtime::StationOutput,
 };
 
 struct StationFixture {
@@ -50,6 +54,7 @@ struct ReplayFixture {
     transactions: Transactions,
     reads: ReadTransactions,
     station: Station,
+    empty_input: AppendLog<Vec<u8>>,
     continuation: Cell<u64>,
     observed: Arc<Mutex<Vec<ObservedInput>>>,
     _root: tempfile::TempDir,
@@ -83,6 +88,11 @@ struct FailOnceThenCompleteOperation {
     definition: CountDefinition,
     continuation: Cell<u64>,
     failed: AtomicBool,
+}
+
+struct CompleteWithoutOutputOperation {
+    definition: CountDefinition,
+    continuation: Cell<u64>,
 }
 
 impl Operation for KeepThenCompleteOperation {
@@ -189,6 +199,25 @@ impl Operation for FailOnceThenCompleteOperation {
             return Err(std::io::Error::other("planned replay test failure").into());
         }
         continuation.set(&2)?;
+        Ok(TurnDecision::Commit(TurnCommit {
+            input: Some(InputProgress::Complete),
+            output: None,
+        }))
+    }
+}
+
+impl Operation for CompleteWithoutOutputOperation {
+    fn definition(&self) -> &dyn OperationDefinition {
+        &self.definition
+    }
+
+    fn turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<TurnDecision, OperationError> {
+        assert_replay_input(input, &[7, 8, 9]);
+        self.continuation.access(access)?.set(&1)?;
         Ok(TurnDecision::Commit(TurnCommit {
             input: Some(InputProgress::Complete),
             output: None,
@@ -306,6 +335,8 @@ fn build_and_open_inject_the_later_declared_source_output_as_read_only_input() {
     let count = factory.station("count", CountDefinition::new());
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, NonZeroU64::MAX);
+    factory.output_capacity_bytes(count, NonZeroU64::MAX);
     factory.connect([source], count);
     factory.connect([count], sink);
 
@@ -496,7 +527,7 @@ fn intake_rejects_a_malformed_durable_cursor() {
 #[test]
 fn intake_surfaces_invalid_change_bytes_without_populating_the_cache() {
     let mut fixture = flow_with_changes(&[]);
-    let empty_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let empty_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -538,7 +569,7 @@ fn intake_surfaces_invalid_change_bytes_without_populating_the_cache() {
 #[test]
 fn intake_stops_after_populating_the_single_cache() {
     let mut fixture = flow_with_changes(&[&[10, 11]]);
-    let second_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let second_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -571,7 +602,7 @@ fn intake_stops_after_populating_the_single_cache() {
 fn intake_searches_cyclically_from_the_durable_active_input() {
     let mut fixture = flow_with_changes(&[&[10]]);
     let second_changes = [change(&[20]), change(&[30])];
-    let second_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let second_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -610,7 +641,7 @@ fn intake_searches_cyclically_from_the_durable_active_input() {
 #[test]
 fn intake_pins_the_wrapped_input_before_populating_the_cache() {
     let mut fixture = flow_with_changes(&[&[10]]);
-    let empty_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let empty_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -648,6 +679,9 @@ fn gc_truncates_only_the_prefix_retired_by_every_consumer() {
     let second = factory.station("second", CountDefinition::new());
     let first_sink = factory.station("first-sink", DiscardDefinition::new());
     let second_sink = factory.station("second-sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, NonZeroU64::MAX);
+    factory.output_capacity_bytes(first, NonZeroU64::MAX);
+    factory.output_capacity_bytes(second, NonZeroU64::MAX);
     factory.connect([source], first);
     factory.connect([source], second);
     factory.connect([first], first_sink);
@@ -665,11 +699,18 @@ fn gc_truncates_only_the_prefix_retired_by_every_consumer() {
             .append_batch(&[vec![0], vec![1], vec![2]])
             .unwrap();
         write_cursor(&stations[1], transaction.access(), 0, 3);
-        write_cursor(&stations[2], transaction.access(), 0, 1);
+        write_cursor(&stations[2], transaction.access(), 0, 0);
         transaction.commit().unwrap();
     }
 
-    stations[0].gc(&mut transactions).unwrap();
+    assert!(!stations[0].gc(&mut transactions).unwrap());
+    assert_eq!(output_bounds(&stations[0], &mut transactions), 0..3);
+    {
+        let transaction = transactions.begin().unwrap();
+        write_cursor(&stations[2], transaction.access(), 0, 1);
+        transaction.commit().unwrap();
+    }
+    assert!(stations[0].gc(&mut transactions).unwrap());
 
     assert_eq!(output_bounds(&stations[0], &mut transactions), 1..3);
 }
@@ -681,6 +722,8 @@ fn gc_deletes_at_most_one_bounded_batch() {
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, NonZeroU64::MAX);
+    factory.output_capacity_bytes(count, NonZeroU64::MAX);
     factory.connect([source], count);
     factory.connect([count], sink);
     let flow = factory.build().unwrap();
@@ -705,7 +748,7 @@ fn gc_deletes_at_most_one_bounded_batch() {
         transaction.commit().unwrap();
     }
 
-    stations[0].gc(&mut transactions).unwrap();
+    assert!(stations[0].gc(&mut transactions).unwrap());
 
     assert_eq!(
         output_bounds(&stations[0], &mut transactions),
@@ -749,7 +792,7 @@ fn reopen_rebuilds_cache_from_the_durable_active_input_and_offset() {
 
     let flow = FlowFactory::open(root.path().join("flow")).unwrap();
     let (mut transactions, reads, mut stations) = flow.into_runtime_parts();
-    let second_log = stations[1].output.as_ref().unwrap().clone();
+    let second_log = stations[1].output.as_ref().unwrap().log().clone();
     stations[1].inputs.logs.push(ReadOnly::new(second_log));
     assert!(stations[1].inputs.cache.is_none());
 
@@ -866,6 +909,209 @@ fn keep_commits_a_prefix_and_reoffers_the_same_complete_change_until_complete() 
 }
 
 #[test]
+fn source_backpressure_rolls_back_its_position_until_physical_output_is_released() {
+    let mut fixture = station_fixture_with_capacities(NonZeroU64::new(1).unwrap(), NonZeroU64::MAX);
+
+    assert_eq!(
+        fixture.source.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert_eq!(
+        count_output_values(&fixture.source, &mut fixture.transactions),
+        [100]
+    );
+
+    assert_eq!(
+        fixture.source.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Backpressured
+    );
+    assert_eq!(
+        count_output_values(&fixture.source, &mut fixture.transactions),
+        [100]
+    );
+
+    clear_output(&fixture.source, &mut fixture.transactions);
+    assert_eq!(
+        fixture.source.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert_eq!(
+        count_output_values(&fixture.source, &mut fixture.transactions),
+        [101]
+    );
+}
+
+#[test]
+fn backpressured_keep_rolls_back_continuation_output_and_input_progress() {
+    let mut fixture = replay_fixture_with_capacity(NonZeroU64::new(1).unwrap());
+    append_output_change(&fixture.station, &mut fixture.transactions, &change(&[99]));
+    fixture
+        .station
+        .intake(&fixture.reads, &mut fixture.transactions)
+        .unwrap();
+
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Backpressured
+    );
+    assert!(fixture.station.inputs.cache.is_some());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            None
+        );
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 0);
+        assert_eq!(read_active_input(&fixture.station, transaction.access()), 0);
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        count_output_values(&fixture.station, &mut fixture.transactions),
+        [99]
+    );
+
+    clear_output(&fixture.station, &mut fixture.transactions);
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert!(fixture.station.inputs.cache.is_some());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 0);
+        assert_eq!(read_active_input(&fixture.station, transaction.access()), 0);
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        count_output_values(&fixture.station, &mut fixture.transactions),
+        [10]
+    );
+    let observed = fixture.observed.lock().unwrap();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[test]
+fn backpressured_complete_rolls_back_completion_and_reoffers_the_same_change() {
+    let mut fixture = replay_fixture_with_capacity(NonZeroU64::new(1).unwrap());
+    fixture
+        .station
+        .intake(&fixture.reads, &mut fixture.transactions)
+        .unwrap();
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Backpressured
+    );
+    assert!(fixture.station.inputs.cache.is_some());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 0);
+        assert_eq!(read_active_input(&fixture.station, transaction.access()), 0);
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        count_output_values(&fixture.station, &mut fixture.transactions),
+        [10]
+    );
+
+    clear_output(&fixture.station, &mut fixture.transactions);
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert!(fixture.station.inputs.cache.is_none());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            None
+        );
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 1);
+        assert_eq!(read_active_input(&fixture.station, transaction.access()), 0);
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        count_output_values(&fixture.station, &mut fixture.transactions),
+        [20]
+    );
+    let observed = fixture.observed.lock().unwrap();
+    assert_eq!(observed.len(), 3);
+    assert_eq!(observed[0], observed[1]);
+    assert_eq!(observed[1], observed[2]);
+}
+
+#[test]
+fn outputless_commit_succeeds_while_the_station_output_is_over_capacity() {
+    let mut fixture = replay_fixture_with_capacity(NonZeroU64::new(1).unwrap());
+    append_output_change(&fixture.station, &mut fixture.transactions, &change(&[99]));
+    fixture.station.operation = Box::new(CompleteWithoutOutputOperation {
+        definition: CountDefinition::new(),
+        continuation: fixture.continuation.clone(),
+    });
+    fixture
+        .station
+        .intake(&fixture.reads, &mut fixture.transactions)
+        .unwrap();
+
+    assert_eq!(
+        fixture.station.process(&mut fixture.transactions).unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert!(fixture.station.inputs.cache.is_none());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 1);
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        count_output_values(&fixture.station, &mut fixture.transactions),
+        [99]
+    );
+}
+
+#[test]
 fn idle_rolls_back_operation_writes_and_keeps_the_same_input_claimed() {
     let mut fixture = replay_fixture();
     fixture.station.operation = Box::new(AlwaysIdleOperation {
@@ -957,7 +1203,7 @@ fn operation_error_rolls_back_writes_and_retries_the_same_input() {
 #[test]
 fn a_durable_intake_pin_counts_as_progress_when_the_operation_is_idle() {
     let mut fixture = flow_with_changes(&[&[10]]);
-    let empty_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let empty_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -995,6 +1241,61 @@ fn a_durable_intake_pin_counts_as_progress_when_the_operation_is_idle() {
             .advance(&fixture.reads, &mut fixture.transactions)
             .unwrap(),
         ProcessOutcome::Idle
+    );
+}
+
+#[test]
+fn a_durable_intake_pin_takes_precedence_over_backpressure_for_that_round() {
+    let mut fixture = replay_fixture_with_capacity(NonZeroU64::new(1).unwrap());
+    append_output_change(&fixture.station, &mut fixture.transactions, &change(&[99]));
+    fixture
+        .station
+        .inputs
+        .logs
+        .push(ReadOnly::new(fixture.empty_input.clone()));
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        write_cursor(&fixture.station, transaction.access(), 1, CURSOR_ORIGIN);
+        fixture
+            .station
+            .state
+            .access(transaction.access())
+            .unwrap()
+            .put(&ACTIVE_INPUT_KEY.to_vec(), &encode_active_input(1).to_vec())
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    assert_eq!(
+        fixture
+            .station
+            .advance(&fixture.reads, &mut fixture.transactions)
+            .unwrap(),
+        ProcessOutcome::Progressed
+    );
+    assert!(fixture.station.inputs.cache.is_some());
+    {
+        let transaction = fixture.transactions.begin().unwrap();
+        assert_eq!(read_active_input(&fixture.station, transaction.access()), 0);
+        assert_eq!(read_cursor(&fixture.station, transaction.access(), 0), 0);
+        assert_eq!(
+            fixture
+                .continuation
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            None
+        );
+        transaction.commit().unwrap();
+    }
+
+    assert_eq!(
+        fixture
+            .station
+            .advance(&fixture.reads, &mut fixture.transactions)
+            .unwrap(),
+        ProcessOutcome::Backpressured
     );
 }
 
@@ -1057,7 +1358,7 @@ fn process_consumes_the_complete_change_and_reopen_does_not_replay_it() {
 #[test]
 fn process_rejects_a_cache_whose_port_is_not_the_durable_active_input() {
     let mut fixture = flow_with_changes(&[&[10]]);
-    let second_log = fixture.stations[1].output.as_ref().unwrap().clone();
+    let second_log = fixture.stations[1].output.as_ref().unwrap().log().clone();
     fixture.stations[1]
         .inputs
         .logs
@@ -1163,7 +1464,10 @@ fn output_append_failure_rolls_back_operation_progress_and_keeps_the_cache() {
         .create_data::<AppendLog<Vec<u8>>>("output")
         .unwrap();
     let _foreign_transactions = foreign_store.into_transactions();
-    fixture.stations[1].output = Some(foreign_output);
+    fixture.stations[1].output = Some(StationOutput::new(
+        foreign_output,
+        valid_output.capacity_bytes(),
+    ));
 
     let error = fixture.stations[1]
         .process(&mut fixture.transactions)
@@ -1242,6 +1546,13 @@ fn assert_station_wiring(flow: Flow) {
 }
 
 fn station_fixture() -> StationFixture {
+    station_fixture_with_capacities(NonZeroU64::MAX, NonZeroU64::MAX)
+}
+
+fn station_fixture_with_capacities(
+    source_capacity: NonZeroU64,
+    count_capacity: NonZeroU64,
+) -> StationFixture {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("flow")).unwrap();
 
@@ -1271,12 +1582,21 @@ fn station_fixture() -> StationFixture {
         .unwrap();
 
     let transactions = store.into_transactions();
-    let source = StationParts::new(source_state, source_operation, Some(source_output)).finish(
+    let source = StationParts::new(
+        source_state,
+        source_operation,
+        Some((source_output, source_capacity)),
+    )
+    .finish(
         Vec::new(),
         vec![ConsumerCursor::new(ReadOnly::new(count_state.clone()), 0)],
     );
-    let count = StationParts::new(count_state, count_operation, Some(count_output))
-        .finish(vec![count_input], Vec::new());
+    let count = StationParts::new(
+        count_state,
+        count_operation,
+        Some((count_output, count_capacity)),
+    )
+    .finish(vec![count_input], Vec::new());
     StationFixture {
         transactions,
         source,
@@ -1294,6 +1614,8 @@ fn flow_with_changes(values: &[&[u64]]) -> IntakeFixture {
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, NonZeroU64::MAX);
+    factory.output_capacity_bytes(count, NonZeroU64::MAX);
     factory.connect([source], count);
     factory.connect([count], sink);
     let flow = factory.build().unwrap();
@@ -1330,6 +1652,10 @@ fn flow_with_changes(values: &[&[u64]]) -> IntakeFixture {
 }
 
 fn replay_fixture() -> ReplayFixture {
+    replay_fixture_with_capacity(NonZeroU64::MAX)
+}
+
+fn replay_fixture_with_capacity(capacity: NonZeroU64) -> ReplayFixture {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("flow")).unwrap();
     let state = store
@@ -1337,6 +1663,9 @@ fn replay_fixture() -> ReplayFixture {
         .unwrap();
     let continuation = store.create_data::<Cell<u64>>("continuation").unwrap();
     let input_log = store.create_data::<AppendLog<Vec<u8>>>("input").unwrap();
+    let empty_input = store
+        .create_data::<AppendLog<Vec<u8>>>("empty-input")
+        .unwrap();
     let output = store.create_data::<AppendLog<Vec<u8>>>("output").unwrap();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let operation = Box::new(KeepThenCompleteOperation {
@@ -1344,7 +1673,7 @@ fn replay_fixture() -> ReplayFixture {
         continuation: continuation.clone(),
         observed: Arc::clone(&observed),
     });
-    let parts = StationParts::new(state, operation, Some(output));
+    let parts = StationParts::new(state, operation, Some((output, capacity)));
     let input = ReadOnly::new(input_log.clone());
     let (mut transactions, reads) = store.into_transactions().split();
     {
@@ -1363,6 +1692,7 @@ fn replay_fixture() -> ReplayFixture {
         transactions,
         reads,
         station,
+        empty_input,
         continuation,
         observed,
         _root: root,
@@ -1487,4 +1817,32 @@ fn output_bounds(station: &Station, transactions: &mut Transactions) -> std::ops
         .unwrap()
         .bounds()
         .unwrap()
+}
+
+fn append_output_change(station: &Station, transactions: &mut Transactions, change: &Change) {
+    let transaction = transactions.begin().unwrap();
+    station
+        .output
+        .as_ref()
+        .unwrap()
+        .access(transaction.access())
+        .unwrap()
+        .append(&encode_change(change).unwrap())
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+fn clear_output(station: &Station, transactions: &mut Transactions) {
+    let transaction = transactions.begin().unwrap();
+    let mut output = station
+        .output
+        .as_ref()
+        .unwrap()
+        .access(transaction.access())
+        .unwrap();
+    let tail = output.bounds().unwrap().end;
+    output
+        .truncate_before(tail, NonZeroUsize::new(usize::MAX).unwrap())
+        .unwrap();
+    transaction.commit().unwrap();
 }

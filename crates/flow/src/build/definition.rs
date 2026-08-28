@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use dogpaddle_operation::OperationDefinition;
 
 #[derive(Debug)]
@@ -9,6 +11,7 @@ pub(crate) struct FlowDefinition {
 pub(crate) struct StationDefinition {
     pub(super) id: String,
     pub(super) operation: Box<dyn OperationDefinition>,
+    pub(super) output_capacity_bytes: Option<NonZeroU64>,
     pub(super) sources: Vec<String>,
 }
 
@@ -27,6 +30,7 @@ impl StationDefinition {
         Self {
             id,
             operation,
+            output_capacity_bytes: None,
             sources: Vec::new(),
         }
     }
@@ -53,6 +57,10 @@ impl StationDefinition {
 
     pub(crate) fn has_output(&self) -> bool {
         self.operation.category().has_output()
+    }
+
+    pub(crate) const fn output_capacity_bytes(&self) -> Option<NonZeroU64> {
+        self.output_capacity_bytes
     }
 
     pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {

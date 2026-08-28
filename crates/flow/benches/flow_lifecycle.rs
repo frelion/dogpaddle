@@ -1,6 +1,6 @@
 mod support;
 
-use std::{io, path::Path, time::Duration};
+use std::{io, num::NonZeroU64, path::Path, time::Duration};
 
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
@@ -21,6 +21,7 @@ const SMOKE_SAMPLES: usize = 3;
 const REFERENCE_SAMPLES: usize = 9;
 const SMOKE_WARMUPS: usize = 1;
 const REFERENCE_WARMUPS: usize = 2;
+const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
 struct Config {
     station_counts: Vec<usize>,
@@ -153,8 +154,10 @@ fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
     );
     let mut factory = FlowFactory::new(path);
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
+    factory.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..station_count - 1 {
         let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
+        factory.output_capacity_bytes(current, OUTPUT_CAPACITY_BYTES);
         factory.connect([previous], current);
         previous = current;
     }
