@@ -54,9 +54,8 @@ Definition codec 的 tag、payload 和完整字节是持久化兼容性边界。
 边界错误不改状态，以及错误后再次读取。Count 使用多行 Change 验证整批原子完成，并用稳定重批
 锁定逐项不变的输出；带正、负和大幅 diff 的输入锁定其“每行一个事件”的计数语义。SequenceSource
 覆盖单行推进、含 `u64::MAX` 的最后成功输出和下一 turn Exhausted。绑定到另一个 Store 的
-`TransactionAccess` 必须透明
-包装为具体 Operation error 中的 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
-安全返回包装的 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、
+`TransactionAccess` 必须透明返回 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
+安全返回 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、
 崩溃恢复和通用 Cell codec 由 `dogpaddle-store` 测试拥有，不在这里重复。
 
 普通测试没有 wall-clock 断言，也不依赖测试执行顺序。

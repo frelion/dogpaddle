@@ -1,15 +1,15 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::{Cell, StoreError, TransactionAccess};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use dogpaddle_change::Change;
+use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, OperationError, OperationInput, Sealed as SealedOperation},
+    operation::{Operation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -34,7 +34,7 @@ pub struct CountOperation {
     count: Cell<u64>,
 }
 
-/// Failure during one [`CountOperation`] turn.
+/// Count-specific failure during one [`CountOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CountError {
@@ -47,18 +47,9 @@ pub enum CountError {
         /// Rejected zero-based port index.
         port: usize,
     },
-    /// Persistent count access failed.
-    #[error(transparent)]
-    Store(#[from] StoreError),
     /// The durable count has reached [`u64::MAX`].
     #[error("count overflow")]
     Overflow,
-    /// Arrow rejected the fixed Count output batch.
-    #[error(transparent)]
-    Arrow(#[from] ArrowError),
-    /// Change validation rejected the fixed Count output.
-    #[error(transparent)]
-    Change(#[from] ChangeError),
 }
 
 #[expect(
@@ -115,15 +106,21 @@ impl CountOperation {
     pub const fn definition(&self) -> &CountDefinition {
         &self.definition
     }
+}
 
-    fn execute_turn(
+impl Operation for CountOperation {
+    fn definition(&self) -> &dyn OperationDefinition {
+        &self.definition
+    }
+
+    fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, CountError> {
+    ) -> Result<Option<Change>, OperationError> {
         let input = input.ok_or(CountError::MissingInput)?;
         if input.port != 0 {
-            return Err(CountError::InvalidInputPort { port: input.port });
+            return Err(CountError::InvalidInputPort { port: input.port }.into());
         }
 
         let mut count = self.count.access(access)?;
@@ -141,24 +138,7 @@ impl CountOperation {
     }
 }
 
-impl SealedOperation for CountOperation {}
-
-impl Operation for CountOperation {
-    fn definition(&self) -> &dyn OperationDefinition {
-        &self.definition
-    }
-
-    fn turn(
-        &self,
-        input: Option<OperationInput<'_>>,
-        access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
-        self.execute_turn(input, access)
-            .map_err(|source| Box::new(source) as OperationError)
-    }
-}
-
-fn uint64_change(values: Vec<u64>) -> Result<Change, CountError> {
+fn uint64_change(values: Vec<u64>) -> Result<Change, OperationError> {
     let row_count = values.len();
     let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
     let diffs = Int64Array::from(vec![1_i64; row_count]);

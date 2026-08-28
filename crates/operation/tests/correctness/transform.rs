@@ -305,8 +305,8 @@ fn count_transparently_reports_wrong_store_access() {
         )
         .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<CountError>(),
-        Some(CountError::Store(StoreError::WrongStore))
+        error.downcast_ref::<StoreError>(),
+        Some(StoreError::WrongStore)
     ));
 }
 
@@ -345,8 +345,8 @@ fn count_reports_a_persisted_wrong_codec_without_mutating_the_bytes() {
             )
             .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<CountError>(),
-            Some(CountError::Store(StoreError::Codec(_)))
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::Codec(_))
         ));
     }
     drop(transactions);

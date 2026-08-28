@@ -15,11 +15,12 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 独立定义的窗口、barrier 或 flush 信号，Operation 的可观察结果必须在稳定合并或切分 Change
 后保持不变；物理 Change 边界不能被算子当成业务事件。
 
-封闭的 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 收到
+运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 收到
 `None`；Transform 与 Sink 每次只收到一个完整 borrowed Change，以及它在 Definition 有序输入中的
 `usize` 端口序号。Operation 不接收 `AppendLog` offset。成功返回表示本次提供的工作已经完整完成，
 并至多返回一个 owned Change；filter 或 Sink 可以返回 `None`。具体错误统一擦除为标准 boxed
-[`operation::OperationError`]，仍可按原始具体错误类型 downcast。
+[`operation::OperationError`]：算子语义错误保留具体算子错误类型，Store、Arrow 和 Change
+等基础错误保留原始类型，均可按具体类型 downcast。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -67,10 +68,11 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 过程中进行私有类型擦除；具名声明在 `materialize` 中将其安全恢复为精确 data class。
 类型不匹配会返回错误而不是 panic。类型擦除不会进入运行实例、事务访问路径或持久化格式。
 
-物化后的具体实例统一实现 sealed [`operation::Operation`] trait。Flow 将异构实例保存为
+物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
 `Box<dyn operation::Operation>`，并通过 [`operation::Operation::definition`] 取得实例实际
-持有的 Definition，再通过同一个 `turn` 分派运行。两个 trait 都不是外部 crate 的扩展点；开放
-第三方算子需要另行设计 tag 分配、decoder 注册和运行错误边界。
+持有的 Definition，再通过同一个 `turn` 分派运行。Operation 本身可以在外部实现，但 Flow 只从
+sealed Definition 物化运行实例；开放可注入 Flow 的第三方算子仍需另行设计 tag 分配、decoder
+注册和运行错误边界。
 
 ## `operation::source::SequenceSource`
 

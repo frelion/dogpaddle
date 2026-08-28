@@ -1,15 +1,15 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::{Cell, StoreError, TransactionAccess};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use dogpaddle_change::Change;
+use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, OperationError, OperationInput, Sealed as SealedOperation},
+    operation::{Operation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -33,25 +33,16 @@ pub struct SequenceSourceOperation {
     position: Cell<u64>,
 }
 
-/// Failure during one [`SequenceSourceOperation`] turn.
+/// Sequence-specific failure during one [`SequenceSourceOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SequenceSourceError {
     /// A source was incorrectly supplied an input Change.
     #[error("sequence source does not accept input")]
     UnexpectedInput,
-    /// Persistent position access failed.
-    #[error(transparent)]
-    Store(#[from] StoreError),
     /// The source has already emitted [`u64::MAX`].
     #[error("sequence exhausted after emitting u64::MAX")]
     Exhausted,
-    /// Arrow rejected the fixed source output batch.
-    #[error(transparent)]
-    Arrow(#[from] ArrowError),
-    /// Change validation rejected the fixed source output.
-    #[error(transparent)]
-    Change(#[from] ChangeError),
 }
 
 impl SequenceSourceDefinition {
@@ -115,14 +106,20 @@ impl SequenceSourceOperation {
     pub const fn definition(&self) -> &SequenceSourceDefinition {
         &self.definition
     }
+}
 
-    fn execute_turn(
+impl Operation for SequenceSourceOperation {
+    fn definition(&self) -> &dyn OperationDefinition {
+        &self.definition
+    }
+
+    fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, SequenceSourceError> {
+    ) -> Result<Option<Change>, OperationError> {
         if input.is_some() {
-            return Err(SequenceSourceError::UnexpectedInput);
+            return Err(SequenceSourceError::UnexpectedInput.into());
         }
 
         let mut position = self.position.access(access)?;
@@ -139,24 +136,7 @@ impl SequenceSourceOperation {
     }
 }
 
-impl SealedOperation for SequenceSourceOperation {}
-
-impl Operation for SequenceSourceOperation {
-    fn definition(&self) -> &dyn OperationDefinition {
-        &self.definition
-    }
-
-    fn turn(
-        &self,
-        input: Option<OperationInput<'_>>,
-        access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
-        self.execute_turn(input, access)
-            .map_err(|source| Box::new(source) as OperationError)
-    }
-}
-
-fn uint64_change(values: Vec<u64>) -> Result<Change, SequenceSourceError> {
+fn uint64_change(values: Vec<u64>) -> Result<Change, OperationError> {
     let row_count = values.len();
     let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
     let diffs = Int64Array::from(vec![1_i64; row_count]);

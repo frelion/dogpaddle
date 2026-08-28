@@ -166,7 +166,7 @@ fn sequence_source_transparently_reports_wrong_store_access() {
     let transaction = foreign_transactions.begin().unwrap();
     let error = operation.turn(None, transaction.access()).unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SequenceSourceError>(),
-        Some(SequenceSourceError::Store(StoreError::WrongStore))
+        error.downcast_ref::<StoreError>(),
+        Some(StoreError::WrongStore)
     ));
 }
