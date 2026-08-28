@@ -116,7 +116,7 @@ const BENCH_SMOKE: &[BenchSpec] = &[
         "flow_lifecycle",
         &[
             ("DOGPADDLE_FLOW_BENCH_PROFILE", "smoke"),
-            ("DOGPADDLE_FLOW_BENCH_STATION_COUNTS", "1,2"),
+            ("DOGPADDLE_FLOW_BENCH_STATION_COUNTS", "2,3"),
             ("DOGPADDLE_FLOW_BENCH_SAMPLES", "1"),
             ("DOGPADDLE_FLOW_BENCH_WARMUPS", "1"),
         ],

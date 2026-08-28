@@ -9,14 +9,14 @@ use dogpaddle_bench_protocol::{
 };
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
-    source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 
 use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_lifecycle";
-const SMOKE_STATION_COUNTS: &[usize] = &[1, 8, 64];
-const REFERENCE_STATION_COUNTS: &[usize] = &[1, 64, 1_024];
+const SMOKE_STATION_COUNTS: &[usize] = &[2, 8, 64];
+const REFERENCE_STATION_COUNTS: &[usize] = &[2, 64, 1_024];
 const SMOKE_SAMPLES: usize = 3;
 const REFERENCE_SAMPLES: usize = 9;
 const SMOKE_WARMUPS: usize = 1;
@@ -50,6 +50,10 @@ impl Config {
         assert!(
             station_counts.windows(2).all(|pair| pair[0] < pair[1]),
             "DOGPADDLE_FLOW_BENCH_STATION_COUNTS must be strictly increasing"
+        );
+        assert!(
+            station_counts.iter().all(|count| *count >= 2),
+            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS must contain only counts of at least two"
         );
         Self {
             station_counts,
@@ -143,14 +147,19 @@ fn measure_reopen(path: &Path, station_count: usize) -> Duration {
 }
 
 fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
-    assert!(station_count > 0, "benchmark Flow must contain a station");
+    assert!(
+        station_count >= 2,
+        "benchmark Flow must contain a source and sink"
+    );
     let mut factory = FlowFactory::new(path);
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
-    for index in 1..station_count {
+    for index in 1..station_count - 1 {
         let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
         factory.connect([previous], current);
         previous = current;
     }
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.connect([previous], sink);
     factory
 }
 
@@ -159,10 +168,11 @@ fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
     assert_eq!(flow.station_count(), station_count);
     let mut ids = flow.station_ids();
     assert_eq!(ids.next(), Some("source"));
-    for index in 1..station_count {
+    for index in 1..station_count - 1 {
         let expected = format!("count-{index:08x}");
         assert_eq!(ids.next(), Some(expected.as_str()));
     }
+    assert_eq!(ids.next(), Some("sink"));
     assert_eq!(ids.next(), None);
 }
 

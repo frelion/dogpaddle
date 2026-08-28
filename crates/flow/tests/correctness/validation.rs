@@ -1,6 +1,6 @@
 use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, TopologyError};
 use dogpaddle_operation::operation::{
-    source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -61,22 +61,100 @@ fn invalid_and_duplicate_station_ids_have_no_store_side_effect() {
 }
 
 #[test]
-fn topology_failure_has_no_store_side_effect() {
+fn non_source_root_has_no_store_side_effect() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    builder.station("count", CountDefinition::new());
+    let count = builder.station("count", CountDefinition::new());
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([count], sink);
 
     let Err(error) = builder.build() else {
         panic!("invalid topology unexpectedly built");
     };
     assert!(matches!(
         error,
-        FlowError::Topology(TopologyError::InputCount {
-            station,
-            expected: 1,
-            actual: 0,
-        }) if station == "count"
+        FlowError::Topology(TopologyError::RootIsNotSource(id)) if id == "count"
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
+fn non_sink_terminals_have_no_store_side_effect() {
+    let root = tempfile::tempdir().unwrap();
+
+    let source_path = root.path().join("source-terminal");
+    let mut builder = FlowFactory::new(&source_path);
+    builder.station("source", SequenceSourceDefinition::new(0));
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::TerminalIsNotSink(id)) if id == "source"
+    ));
+    assert!(!source_path.exists());
+
+    let transform_path = root.path().join("transform-terminal");
+    let mut builder = FlowFactory::new(&transform_path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let count = builder.station("count", CountDefinition::new());
+    builder.connect([source], count);
+    let error = build_error(builder);
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::TerminalIsNotSink(id)) if id == "count"
+    ));
+    assert!(!transform_path.exists());
+}
+
+#[test]
+fn multiple_source_sink_components_build() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let first_source = builder.station("first-source", SequenceSourceDefinition::new(0));
+    let first_sink = builder.station("first-sink", DiscardDefinition::new());
+    let second_source = builder.station("second-source", SequenceSourceDefinition::new(10));
+    let count = builder.station("count", CountDefinition::new());
+    let second_sink = builder.station("second-sink", DiscardDefinition::new());
+    builder.connect([first_source], first_sink);
+    builder.connect([second_source], count);
+    builder.connect([count], second_sink);
+
+    let flow = builder.build().unwrap();
+
+    assert_eq!(
+        flow.station_ids().collect::<Vec<_>>(),
+        [
+            "first-source",
+            "first-sink",
+            "second-source",
+            "count",
+            "second-sink"
+        ]
+    );
+}
+
+#[test]
+fn sink_cannot_feed_another_station() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    let count = builder.station("count", CountDefinition::new());
+    let terminal = builder.station("terminal", DiscardDefinition::new());
+    builder.connect([source], sink);
+    builder.connect([sink], count);
+    builder.connect([count], terminal);
+
+    let error = build_error(builder);
+
+    assert!(matches!(
+        error,
+        FlowError::Topology(TopologyError::UpstreamHasNoOutput {
+            upstream_station,
+            downstream_station,
+        }) if upstream_station == "sink" && downstream_station == "count"
     ));
     assert!(!path.exists());
 }
@@ -177,7 +255,9 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
     drop(transactions);
 
     let mut builder = FlowFactory::new(&path);
-    builder.station("source", SequenceSourceDefinition::new(0));
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
     let error = build_error(builder);
     assert!(matches!(
         error,

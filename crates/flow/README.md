@@ -1,9 +1,10 @@
 # dogpaddle-flow
 
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
-`Flow` 只表示运行态，不承担声明、构建或打开职责。Station 是 crate 内部的一对一 Operation
-容器；它保存一个实现 `Operation` trait 的运行实例，不再重复枚举具体算子，也不维护
-额外的算子图。
+`Flow` 只表示运行态，不承担声明、构建或打开职责。Station 当前是 crate 内部的一对一 Operation
+容器；它读取所包裹 Definition 显式声明的 `OperationCategory`，向 Flow 提供 source、sink、输入数量
+和 output 属性。Flow 不枚举具体算子；未来一个 Station 包裹多个 Operation 时，只需在 Station
+内部归纳这些属性，不必改变 Flow 的拓扑接口。
 
 ## 构建 Flow
 
@@ -14,6 +15,7 @@ Factory 的声明阶段没有 Store 副作用：`station()` 返回仅属于当�
 ```rust,no_run
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
+    operation::sink::DiscardDefinition,
     operation::source::SequenceSourceDefinition,
     operation::transform::CountDefinition,
 };
@@ -24,27 +26,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = FlowFactory::new(&path);
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
     factory.connect([source], count);
+    factory.connect([count], sink);
 
     let flow = factory.build()?;
-    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["source", "count"]);
+    assert_eq!(
+        flow.station_ids().collect::<Vec<_>>(),
+        ["source", "count", "sink"]
+    );
     drop(flow);
 
     let reopened = FlowFactory::open(&path)?;
-    assert_eq!(reopened.station_count(), 2);
+    assert_eq!(reopened.station_count(), 3);
     Ok(())
 }
 ```
 
 Station ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。连接保留 source 顺序，允许
-fan-out 和重复 source；输入数量必须与具体 Definition 完全一致，作为 source 的 Operation
-必须声明自己产生输出，整个拓扑必须是 DAG。拓扑校验或 manifest 编码失败不会创建目标目录。
+fan-out 和重复 source；连接数量必须与 Station 对外声明的输入数量完全一致，整个拓扑
+必须是 DAG。所有入度为零的起点必须是 Source Station，所有出度为零的终点必须是 Sink Station；
+Sink 没有 output，不能作为其他 Station 的上游。允许多个 Source、多个 Sink 和多个互不连接的
+合法 DAG 分量。拓扑校验或 manifest 编码失败不会创建目标目录。
 
 ## 持久化边界
 
 每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成纯校验，再为 Flow 和每个 Station 各声明一个
-持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个
-`produces_output() == true` 的 Station 创建一个 output log，最后提交 manifest Cell 作为构建完成
+持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个具有外部
+output 的 Station 创建一个 output log，最后提交 manifest Cell 作为构建完成
 标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
 build/open 通路负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称
 交给 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或
@@ -135,7 +144,7 @@ source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需
 - Station 状态：`station/{index:08x}/state`
 - Station active input key：`input/active`
 - Station input cursor key：`input/{input_index:08x}/cursor`
-- Station 输出：`station/{index:08x}/output`（仅限声明产生输出的 Operation）
+- Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - Count 状态：`station/{index:08x}/operation/count`
 
@@ -175,8 +184,9 @@ state、只读 inputs、可选 output、稳定 active input/cursor 和可重建�
 身份的 Change；`process` 已支持 `Idle`、`Commit(Keep)` 和 `Commit(Complete)`，在同一写事务中
 按 decision 原子协调 Operation continuation、output、active 与 cursor，
 成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定。Flow 已公开有界的
-`Flow::advance`，真实 `SequenceSource → Count` DAG 可以按拓扑逐轮推进并在 reopen 后续跑。
-尚未实现 `Flow::start`、背压、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
+`Flow::advance`，真实 `SequenceSource → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
+后续跑。端点校验已经排除完全没有 consumer 的 output，但尚未实现针对缓慢或停滞 consumer 的
+容量水位背压。也尚未实现 `Flow::start`、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 

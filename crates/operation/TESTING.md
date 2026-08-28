@@ -21,6 +21,7 @@ crates/operation/
 │   ├── definition.rs           # Definition、声明、create/open/materialize
 │   ├── source.rs               # SequenceSource 状态与事务语义
 │   ├── transform.rs            # Count 状态与事务语义
+│   ├── sink.rs                 # Discard 输入完成与无输出语义
 │   └── support.rs              # 临时 Store 与测试 fixture 辅助
 ├── tests/fixtures/v1/           # Definition v1 黄金字节
 └── benches/
@@ -51,12 +52,14 @@ Definition codec 的 tag、payload 和完整字节是持久化兼容性边界。
 合法 fixture 的所有严格前缀都必须拒绝，magic/version/tag/trailing bytes 分别锁定错误类别，固定
 字节生成器额外证明任意探针不会引发 panic。
 
-每个有状态 Operation 覆盖固定 output Schema/diff、decision 形状、commit 后 reopen、显式
+每个 Definition 的显式 `OperationCategory` 与输入数量都纳入公开或 registry 测试；每个有状态
+Operation 覆盖固定 output Schema/diff、decision 形状、commit 后 reopen、显式
 rollback、边界错误不改状态，以及错误后再次读取。SequenceSource 锁定无输入 commit 的
 `input: None`，Count 锁定有输入 commit 的 `Some(Complete)`。Count 使用多行 Change 验证其当前
 整批原子完成策略，并用稳定重批锁定展平 output 与最终状态逐项不变；带正、负和大幅 diff 的输入
 锁定其“每行一个事件”的计数语义。SequenceSource 覆盖单行推进、含 `u64::MAX` 的最后成功输出和
-下一 turn Exhausted。绑定到另一个 Store 的
+下一 turn Exhausted。无状态 Discard 锁定 `Sink` category、`Some(Complete)` 和 `output: None`，
+并拒绝缺失输入或非零端口。绑定到另一个 Store 的
 `TransactionAccess` 必须透明返回 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
 安全返回 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、
 崩溃恢复和通用 Cell codec 由 `dogpaddle-store` 测试拥有，不在这里重复。
@@ -67,7 +70,7 @@ rollback、边界错误不改状态，以及错误后再次读取。SequenceSour
 
 唯一正常性能入口覆盖四类场景：
 
-- Count 与 SequenceSource Definition 的公开 encode；
+- Count、SequenceSource 与 Discard Definition 的公开 encode；
 - 同一份预编码 Definition 的公开 decode；
 - 已开始事务内的 N 次单行 `turn`，计时只包含 Operation 调用，随后 rollback；
 - begin + N 次单行 `turn` + durable commit 的完整事务。
@@ -86,8 +89,9 @@ stdout 同时包含便于本机阅读的摘要与 JSONL；机器收集器只读�
 environment、configuration、sample 和 summary 都由 typed record + validated `Fields` 构造，且带有
 `"benchmark":"operation_core"`；本地 support 不拼接 JSON fragment。
 
-Operation benchmark 的每个 turn 固定处理或产生一行，因此 ns/operation 同时对应单行 turn 成本；
-报告仍使用统一的 operation/transaction 字段。两个现有 Operation 都只覆写固定大小 Cell；
+Operation benchmark 的 Count/Sequence turn 固定处理或产生一行，因此 ns/operation 同时对应单行 turn 成本；
+报告仍使用统一的 operation/transaction 字段。两个有状态 Operation 都只覆写固定大小 Cell，
+Discard 无状态；
 独立 endurance 会重复 Store 的页复用协议，因此当前明确不设置 Operation endurance target。出现
 无界状态算子或真实 Change 调度循环后，应在拥有该组合生命周期的 runtime 集成层新增长稳协议。
 

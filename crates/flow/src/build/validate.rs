@@ -46,27 +46,35 @@ pub enum TopologyError {
     /// A station directly references itself.
     #[error("station {0:?} directly references itself")]
     SelfLoop(String),
-    /// The number of connected sources does not match the operation definition.
-    #[error("station {station:?} requires {expected} sources but received {actual}")]
-    InputCount {
-        /// The station whose arity did not match.
-        station: String,
-        /// Required source count.
-        expected: usize,
-        /// Connected source count.
-        actual: usize,
-    },
-    /// A connection names a station that has no output stream as its source.
-    #[error("station {target_station:?} cannot read from outputless station {source_station:?}")]
-    SourceHasNoOutput {
-        /// Station without an output stream.
-        source_station: String,
-        /// Station that attempted to consume it.
-        target_station: String,
-    },
     /// The topology contains an indirect cycle.
     #[error("flow topology contains a cycle")]
     Cycle,
+    /// A root Station is not a source.
+    #[error("root station {0:?} is not a source")]
+    RootIsNotSource(String),
+    /// A terminal Station is not a sink.
+    #[error("terminal station {0:?} is not a sink")]
+    TerminalIsNotSink(String),
+    /// The connected upstream count does not match the Station's input arity.
+    #[error("station {station:?} requires {expected} upstreams but received {actual}")]
+    InputCount {
+        /// Station whose input arity did not match.
+        station: String,
+        /// Required upstream count.
+        expected: usize,
+        /// Connected upstream count.
+        actual: usize,
+    },
+    /// A connection uses a Station without an output stream as its upstream.
+    #[error(
+        "station {downstream_station:?} cannot read from outputless upstream {upstream_station:?}"
+    )]
+    UpstreamHasNoOutput {
+        /// Upstream Station without an output stream.
+        upstream_station: String,
+        /// Downstream Station that attempted to consume it.
+        downstream_station: String,
+    },
 }
 
 pub(super) fn finish_definition(
@@ -76,9 +84,7 @@ pub(super) fn finish_definition(
 ) -> Result<FlowDefinition, TopologyError> {
     validate_station_ids(&stations)?;
     let mut sources_by_target = validate_connections(token, &stations, connections)?;
-    validate_input_counts(&stations, &sources_by_target)?;
-    validate_sources_produce_output(&stations, &sources_by_target)?;
-    validate_acyclic(stations.len(), &sources_by_target)?;
+    validate_topology(&stations, &sources_by_target)?;
 
     let station_ids = stations
         .iter()
@@ -96,11 +102,10 @@ pub(super) fn finish_definition(
     Ok(FlowDefinition::new(stations))
 }
 
-pub(super) fn validate_decoded_definition(
+pub(super) fn validate_decoded_topology(
     stations: &[StationDefinition],
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
-    validate_station_ids(stations)?;
     for (target, sources) in sources_by_target.iter().enumerate() {
         if sources
             .as_ref()
@@ -109,21 +114,50 @@ pub(super) fn validate_decoded_definition(
             return Err(TopologyError::SelfLoop(stations[target].id.clone()));
         }
     }
-    validate_input_counts(stations, sources_by_target)?;
-    validate_sources_produce_output(stations, sources_by_target)?;
-    validate_acyclic(stations.len(), sources_by_target)
+    validate_topology(stations, sources_by_target)
 }
 
-fn validate_sources_produce_output(
+fn validate_topology(
     stations: &[StationDefinition],
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
-    for (target, sources) in sources_by_target.iter().enumerate() {
-        for source in sources.iter().flatten() {
-            if !stations[*source].operation.produces_output() {
-                return Err(TopologyError::SourceHasNoOutput {
-                    source_station: stations[*source].id.clone(),
-                    target_station: stations[target].id.clone(),
+    validate_acyclic(stations.len(), sources_by_target)?;
+    validate_endpoints(stations, sources_by_target)?;
+    validate_input_counts(stations, sources_by_target)?;
+    validate_upstreams_have_output(stations, sources_by_target)
+}
+
+fn validate_endpoints(
+    stations: &[StationDefinition],
+    sources_by_target: &[Option<Vec<usize>>],
+) -> Result<(), TopologyError> {
+    let mut has_downstream = vec![false; stations.len()];
+    for upstream in sources_by_target.iter().flatten().flatten() {
+        has_downstream[*upstream] = true;
+    }
+
+    for (index, station) in stations.iter().enumerate() {
+        let is_root = sources_by_target[index].as_ref().is_none_or(Vec::is_empty);
+        if is_root && !station.is_source() {
+            return Err(TopologyError::RootIsNotSource(station.id.clone()));
+        }
+        if !has_downstream[index] && !station.is_sink() {
+            return Err(TopologyError::TerminalIsNotSink(station.id.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upstreams_have_output(
+    stations: &[StationDefinition],
+    sources_by_target: &[Option<Vec<usize>>],
+) -> Result<(), TopologyError> {
+    for (downstream, upstreams) in sources_by_target.iter().enumerate() {
+        for upstream in upstreams.iter().flatten() {
+            if !stations[*upstream].has_output() {
+                return Err(TopologyError::UpstreamHasNoOutput {
+                    upstream_station: stations[*upstream].id.clone(),
+                    downstream_station: stations[downstream].id.clone(),
                 });
             }
         }
@@ -136,7 +170,7 @@ fn validate_input_counts(
     sources_by_target: &[Option<Vec<usize>>],
 ) -> Result<(), TopologyError> {
     for (station, sources) in stations.iter().zip(sources_by_target) {
-        let expected = station.operation.input_count();
+        let expected = station.input_count();
         let actual = sources.as_ref().map_or(0, Vec::len);
         if actual != expected {
             return Err(TopologyError::InputCount {

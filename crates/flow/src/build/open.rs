@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use dogpaddle_operation::{DataInstances, OperationDefinition};
+use dogpaddle_operation::DataInstances;
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
 use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
 
-use super::{FlowFactory, codec};
+use super::{FlowFactory, StationDefinition, codec};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
@@ -35,7 +35,7 @@ impl FlowFactory {
             .stations()
             .iter()
             .enumerate()
-            .map(|(index, station)| open_station_part(&store, index, station.operation()))
+            .map(|(index, station)| open_station_part(&store, index, station))
             .collect::<Result<Vec<_>, _>>()?;
         let (transactions, reads) = store.into_transactions().split();
         let observed_definition = {
@@ -80,12 +80,13 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
 fn open_station_part(
     store: &Store,
     index: usize,
-    definition: &dyn OperationDefinition,
+    station: &StationDefinition,
 ) -> Result<StationParts, FlowError> {
     let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
         store,
         &codec::station_state_name(index),
     )?;
+    let definition = station.operation();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::station_operation_data_name(index, declaration.name());
@@ -94,8 +95,8 @@ fn open_station_part(
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
-    let output = definition
-        .produces_output()
+    let output = station
+        .has_output()
         .then(|| {
             let name = codec::station_output_name(index);
             open_required_data::<AppendLog<Vec<u8>>>(store, &name)

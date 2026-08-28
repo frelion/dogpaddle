@@ -1,6 +1,8 @@
 use dogpaddle_operation::{
     OperationDefinition, encode_definition,
-    operation::{source::SequenceSourceDefinition, transform::CountDefinition},
+    operation::{
+        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    },
 };
 
 use super::{
@@ -18,6 +20,10 @@ fn count() -> CountDefinition {
     CountDefinition::new()
 }
 
+fn discard() -> DiscardDefinition {
+    DiscardDefinition::new()
+}
+
 fn factory() -> FlowFactory {
     FlowFactory::new("")
 }
@@ -30,17 +36,25 @@ fn find_station<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StationDefi
         .unwrap()
 }
 
-fn finish_target<D>(operation: D, actual: usize) -> Result<FlowDefinition, TopologyError>
+fn finish_with_target<D>(
+    operation: D,
+    upstream_count: usize,
+) -> Result<FlowDefinition, TopologyError>
 where
     D: OperationDefinition,
 {
     let mut builder = factory();
-    let sources = (0..actual)
+    let has_output = operation.category().has_output();
+    let upstreams = (0..upstream_count)
         .map(|index| builder.station(format!("source-{index}"), source(index as u64)))
         .collect::<Vec<_>>();
     let target = builder.station("target", operation);
-    if !sources.is_empty() {
-        builder.connect(sources, target);
+    if !upstreams.is_empty() {
+        builder.connect(upstreams, target);
+    }
+    if has_output {
+        let sink = builder.station("sink", discard());
+        builder.connect([target], sink);
     }
     builder.finish_definition()
 }
@@ -48,10 +62,14 @@ where
 #[test]
 fn finish_preserves_station_order_and_resolves_references() {
     let mut builder = factory();
-    builder.station("first", source(1));
+    let first = builder.station("first", source(1));
     let second = builder.station("second", source(2));
     let target = builder.station("target", count());
+    let first_sink = builder.station("first-sink", discard());
+    let target_sink = builder.station("target-sink", discard());
+    builder.connect([first], first_sink);
     builder.connect([second], target);
+    builder.connect([target], target_sink);
 
     let definition = builder.finish_definition().unwrap();
 
@@ -61,7 +79,7 @@ fn finish_preserves_station_order_and_resolves_references() {
             .iter()
             .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
-        ["first", "second", "target"]
+        ["first", "second", "target", "first-sink", "target-sink"]
     );
     let target = find_station(&definition, "target");
     assert_eq!(
@@ -180,22 +198,25 @@ fn finish_rejects_an_explicit_empty_source_list() {
 }
 
 #[test]
-fn finish_accepts_the_known_zero_and_unary_input_counts() {
-    let source_definition = finish_target(source(0), 0).unwrap();
+fn finish_accepts_each_builtin_input_count() {
+    let source_definition = finish_with_target(source(0), 0).unwrap();
     assert!(
         find_station(&source_definition, "target")
             .sources
             .is_empty()
     );
 
-    let count_definition = finish_target(count(), 1).unwrap();
+    let count_definition = finish_with_target(count(), 1).unwrap();
     assert_eq!(find_station(&count_definition, "target").sources.len(), 1);
+
+    let discard_definition = finish_with_target(discard(), 1).unwrap();
+    assert_eq!(find_station(&discard_definition, "target").sources.len(), 1);
 }
 
 #[test]
-fn finish_rejects_every_known_input_count_mismatch() {
+fn finish_rejects_forbidden_or_excess_inputs() {
     assert_eq!(
-        finish_target(source(0), 1).unwrap_err(),
+        finish_with_target(source(0), 1).unwrap_err(),
         TopologyError::InputCount {
             station: "target".to_owned(),
             expected: 0,
@@ -203,20 +224,32 @@ fn finish_rejects_every_known_input_count_mismatch() {
         }
     );
     assert_eq!(
-        finish_target(count(), 0).unwrap_err(),
-        TopologyError::InputCount {
-            station: "target".to_owned(),
-            expected: 1,
-            actual: 0,
-        }
-    );
-    assert_eq!(
-        finish_target(count(), 2).unwrap_err(),
+        finish_with_target(count(), 2).unwrap_err(),
         TopologyError::InputCount {
             station: "target".to_owned(),
             expected: 1,
             actual: 2,
         }
+    );
+    assert_eq!(
+        finish_with_target(discard(), 2).unwrap_err(),
+        TopologyError::InputCount {
+            station: "target".to_owned(),
+            expected: 1,
+            actual: 2,
+        }
+    );
+}
+
+#[test]
+fn finish_reports_a_non_source_root_before_its_missing_input() {
+    assert_eq!(
+        finish_with_target(count(), 0).unwrap_err(),
+        TopologyError::RootIsNotSource("target".to_owned())
+    );
+    assert_eq!(
+        finish_with_target(discard(), 0).unwrap_err(),
+        TopologyError::RootIsNotSource("target".to_owned())
     );
 }
 
@@ -269,8 +302,12 @@ fn finish_allows_fan_out() {
     let source = builder.station("source", source(0));
     let left = builder.station("left", count());
     let right = builder.station("right", count());
+    let left_sink = builder.station("left-sink", discard());
+    let right_sink = builder.station("right-sink", discard());
     builder.connect([source], left);
     builder.connect([source], right);
+    builder.connect([left], left_sink);
+    builder.connect([right], right_sink);
 
     let definition = builder.finish_definition().unwrap();
 
@@ -279,18 +316,31 @@ fn finish_allows_fan_out() {
 }
 
 #[test]
-fn finish_allows_zero_input_stations_and_disconnected_components() {
+fn finish_allows_multiple_source_sink_components() {
     let mut builder = factory();
-    builder.station("isolated", source(0));
+    let direct_source = builder.station("direct-source", source(0));
     let source = builder.station("source", source(1));
     let count = builder.station("count", count());
+    let direct_sink = builder.station("direct-sink", discard());
+    let count_sink = builder.station("count-sink", discard());
+    builder.connect([direct_source], direct_sink);
     builder.connect([source], count);
+    builder.connect([count], count_sink);
 
     let definition = builder.finish_definition().unwrap();
 
-    assert!(find_station(&definition, "isolated").sources.is_empty());
+    assert!(
+        find_station(&definition, "direct-source")
+            .sources
+            .is_empty()
+    );
     assert!(find_station(&definition, "source").sources.is_empty());
     assert_eq!(find_station(&definition, "count").sources, ["source"]);
+    assert_eq!(
+        find_station(&definition, "direct-sink").sources,
+        ["direct-source"]
+    );
+    assert_eq!(find_station(&definition, "count-sink").sources, ["count"]);
 }
 
 #[test]
@@ -344,13 +394,23 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                 for &target in &count_targets {
                     builder.connect([references[parents[target].unwrap()]], references[target]);
                 }
+                let leaves = (0..station_count)
+                    .filter(|candidate| !parents.contains(&Some(*candidate)))
+                    .collect::<Vec<_>>();
+                for &leaf in &leaves {
+                    let sink = builder.station(format!("sink-{leaf}"), discard());
+                    builder.connect([references[leaf]], sink);
+                }
 
                 match expected {
                     UnaryGraphClass::Acyclic => {
                         let definition = builder
                             .finish_definition()
                             .unwrap_or_else(|error| panic!("{graph}: rejected with {error:?}"));
-                        let expected_ids = (0..station_count).map(station_id).collect::<Vec<_>>();
+                        let expected_ids = (0..station_count)
+                            .map(station_id)
+                            .chain(leaves.iter().map(|leaf| format!("sink-{leaf}")))
+                            .collect::<Vec<_>>();
                         assert_eq!(
                             definition
                                 .stations
@@ -360,13 +420,24 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                             expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                             "{graph}: declaration order changed"
                         );
-                        for (target, station) in definition.stations.iter().enumerate() {
+                        for (target, station) in
+                            definition.stations.iter().take(station_count).enumerate()
+                        {
                             let expected_sources = parents[target]
                                 .map(|parent| vec![station_id(parent)])
                                 .unwrap_or_default();
                             assert_eq!(
                                 station.sources, expected_sources,
                                 "{graph}: source order changed for target {target}"
+                            );
+                        }
+                        for (&leaf, station) in
+                            leaves.iter().zip(&definition.stations[station_count..])
+                        {
+                            assert_eq!(
+                                station.sources,
+                                [station_id(leaf)],
+                                "{graph}: sink source changed for leaf {leaf}"
                             );
                         }
                     }
@@ -440,7 +511,9 @@ fn codec_definition() -> FlowDefinition {
     let mut builder = factory();
     let source = builder.station("source", source(7));
     let count = builder.station("count", count());
+    let sink = builder.station("sink", discard());
     builder.connect([source], count);
+    builder.connect([count], sink);
     builder.finish_definition().unwrap()
 }
 
@@ -448,7 +521,9 @@ fn codec_definition_with_ids(source_id: &str, count_id: &str) -> FlowDefinition 
     let mut builder = factory();
     let source = builder.station(source_id, source(7));
     let count = builder.station(count_id, count());
+    let sink = builder.station("sink", discard());
     builder.connect([source], count);
+    builder.connect([count], sink);
     builder.finish_definition().unwrap()
 }
 
@@ -457,7 +532,7 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
     let encoded = encode(&codec_definition()).unwrap();
     let mut expected = [
         b"dogpaddle.flow\0".as_slice(),
-        &[0, 1, 0, 0, 0, 2],
+        &[0, 1, 0, 0, 0, 3],
         &[0, 0, 0, 6],
         b"source",
         &[0, 0, 0, 32],
@@ -471,6 +546,13 @@ fn codec_is_canonical_and_round_trips_ordered_sources() {
         &[0, 1, 0, 2],
         &[0, 0, 0, 1, 0, 0, 0, 6],
         b"source",
+        &[0, 0, 0, 4],
+        b"sink",
+        &[0, 0, 0, 24],
+        b"dogpaddle.operation\0",
+        &[0, 1, 0, 3],
+        &[0, 0, 0, 1, 0, 0, 0, 5],
+        b"count",
     ]
     .concat();
     expected.extend_from_slice(&crc32(&expected).to_be_bytes());
@@ -491,11 +573,13 @@ fn decoder_round_trips_a_large_chain() {
         builder.connect([previous], current);
         previous = current;
     }
+    let sink = builder.station("sink", discard());
+    builder.connect([previous], sink);
     let encoded = encode(&builder.finish_definition().unwrap()).unwrap();
 
     let decoded = decode(&encoded).unwrap();
 
-    assert_eq!(decoded.stations().len(), STATION_COUNT);
+    assert_eq!(decoded.stations().len(), STATION_COUNT + 1);
     assert_eq!(encode(&decoded).unwrap(), encoded);
 }
 

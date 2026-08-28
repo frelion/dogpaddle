@@ -39,6 +39,22 @@ impl StationDefinition {
         self.operation.as_ref()
     }
 
+    pub(crate) fn input_count(&self) -> usize {
+        self.operation.input_count()
+    }
+
+    pub(crate) fn is_source(&self) -> bool {
+        self.operation.category().is_source()
+    }
+
+    pub(crate) fn is_sink(&self) -> bool {
+        self.operation.category().is_sink()
+    }
+
+    pub(crate) fn has_output(&self) -> bool {
+        self.operation.category().has_output()
+    }
+
     pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {
         self.sources.iter().map(String::as_str)
     }

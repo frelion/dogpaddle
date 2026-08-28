@@ -1,12 +1,14 @@
 use std::path::Path;
 
 use dogpaddle_flow::FlowFactory;
-use dogpaddle_operation::operation::source::SequenceSourceDefinition;
+use dogpaddle_operation::operation::{sink::DiscardDefinition, source::SequenceSourceDefinition};
 use dogpaddle_store::{Cell, Store};
 
-pub(super) fn build_source_and_read_definition(path: &Path) -> Vec<u8> {
+pub(super) fn build_source_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let mut builder = FlowFactory::new(path);
-    builder.station("source", SequenceSourceDefinition::new(0));
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
     drop(builder.build().unwrap());
 
     read_published_definition(path)

@@ -7,7 +7,8 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationCategory,
+    OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
     operation::{
         InputProgress, Operation, OperationError, OperationInput, TurnCommit, TurnDecision,
@@ -69,12 +70,12 @@ impl CountDefinition {
 impl SealedDefinition for CountDefinition {}
 
 impl OperationDefinition for CountDefinition {
-    fn input_count(&self) -> usize {
-        1
+    fn category(&self) -> OperationCategory {
+        OperationCategory::Transform
     }
 
-    fn produces_output(&self) -> bool {
-        true
+    fn input_count(&self) -> usize {
+        1
     }
 
     fn data(&self) -> &'static [DataDeclaration] {

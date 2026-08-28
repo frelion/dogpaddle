@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use super::{
     definition::{FlowDefinition, StationDefinition},
-    validate::{TopologyError, validate_decoded_definition, validate_station_ids},
+    validate::{TopologyError, validate_decoded_topology, validate_station_ids},
 };
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
@@ -175,7 +175,7 @@ fn validate_definition(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    validate_decoded_definition(&stations, &sources_by_target)?;
+    validate_decoded_topology(&stations, &sources_by_target)?;
     Ok(FlowDefinition::new(stations))
 }
 

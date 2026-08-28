@@ -7,7 +7,8 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationCategory,
+    OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
     operation::{Operation, OperationError, OperationInput, TurnCommit, TurnDecision},
 };
@@ -62,12 +63,12 @@ impl SequenceSourceDefinition {
 impl SealedDefinition for SequenceSourceDefinition {}
 
 impl OperationDefinition for SequenceSourceDefinition {
-    fn input_count(&self) -> usize {
-        0
+    fn category(&self) -> OperationCategory {
+        OperationCategory::Source
     }
 
-    fn produces_output(&self) -> bool {
-        true
+    fn input_count(&self) -> usize {
+        0
     }
 
     fn data(&self) -> &'static [DataDeclaration] {

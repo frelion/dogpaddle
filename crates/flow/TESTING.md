@@ -51,14 +51,16 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
 
 公共正确性测试覆盖四组边界：
 
-- **生命周期**：真实 `SequenceSource → Count` Flow 成功构建，声明顺序和 ID 保持不变，释放后
+- **生命周期**：真实 `SequenceSource → Count → Discard` Flow 成功构建，声明顺序和 ID 保持不变，释放后
   可以重新打开；活动 Flow 独占 Store 路径。
 - **纯校验**：空拓扑、非法或重复 ID、错误输入数量、外部 `StationRef`、空 source 列表、重复设置
-  source、自环和间接环都返回稳定错误，且目标路径不存在。私有纯校验还穷举 1 到 5 个 Station
-  的全部零输入 Source / 一输入 Count 标号小图，以独立的逐路径 oracle 验证合法 DAG、直接/间接环
-  分类、声明顺序和 source 绑定；已经存在的 Store 必须原样保留。
+  source、自环、间接环、非 Source 起点、非 Sink 终点和 Sink 作为上游都返回稳定错误，且目标路径
+  不存在。多个 Source、多个 Sink 和多个合法分量可以构建。私有纯校验还穷举 1 到 5 个
+  Source/Count 标号小图，并为每个叶节点连接 Discard，以独立的逐路径 oracle 验证合法 DAG、
+  直接/间接环分类、声明顺序和 source 绑定；已经存在的 Store 必须原样保留。
 - **持久化**：v1 Definition 黄金字节来自实际 `FlowFactory::build` 发布的 Cell；Flow/Station state、
-  Station output 和内建 Operation data 使用稳定名称与精确类型；terminal producer 仍有 output；
+  Station output 和内建 Operation data 使用稳定名称与精确类型；Source/Transform 有 output，
+  Discard Sink 没有 output；
   未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
 - **运行期装配**：分离的读写事务启动 capability 归 Flow 长期持有，Station 只保存自己的 state、完整
   可选 output、有序只读 input logs、唯一 owned input-Change cache 及 output consumer cursor 的只读
@@ -85,7 +87,7 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   `FlowFactory::open` 不得 panic，且必须在 Definition 解码阶段失败，不能由后续缺失资源错误
   冒充通过。
 
-黄金 fixture 位于 `tests/fixtures/v1/sequence_source_count.hex`，包含 magic、版本、Station 顺序、
+黄金 fixture 位于 `tests/fixtures/v1/sequence_source_count_discard.hex`，包含 magic、版本、Station 顺序、
 Operation tag/payload、source 连接和 CRC。当前开发期允许破坏性更新 v1；修改这些字节或稳定
 资源名时必须显式更新 fixture、资源布局和 reopen 测试，不能把测试改成只验证新编码自洽。
 
@@ -96,7 +98,8 @@ wall-clock 猜测制造这个窗口；除非以后出现无需扩张公共 API �
 ## `flow_lifecycle` 性能边界
 
 此 benchmark 只回答持久化 Flow 的冷路径成本，不代表运行时吞吐。工作负载是一条由一个
-`SequenceSource` 和 `station_count - 1` 个 Count 组成的线性 DAG；`station_count` 是唯一规模轴。
+`SequenceSource`、`station_count - 2` 个 Count 和一个 Discard 组成的线性 DAG；`station_count`
+是唯一规模轴，最小值为 2。
 
 | scenario | 计时内 | 计时外 |
 | --- | --- | --- |
@@ -113,14 +116,14 @@ Flow endurance；当前只锁定有界 GC 的正确性，不把它冒充完整�
 
 | profile | station counts | samples | warmups | Store 根目录 |
 | --- | --- | ---: | ---: | --- |
-| `smoke` | `1,8,64` | 3 | 1 | 未配置时使用隔离临时目录 |
-| `reference` | `1,64,1024` | 9 | 2 | 必须显式提供绝对路径 |
+| `smoke` | `2,8,64` | 3 | 1 | 未配置时使用隔离临时目录 |
+| `reference` | `2,64,1024` | 9 | 2 | 必须显式提供绝对路径 |
 
 环境变量：
 
 - `DOGPADDLE_FLOW_BENCH_PROFILE=smoke|reference`
 - `DOGPADDLE_FLOW_BENCH_STORE_DIR=/absolute/path`
-- `DOGPADDLE_FLOW_BENCH_STATION_COUNTS=1,64,1024`
+- `DOGPADDLE_FLOW_BENCH_STATION_COUNTS=2,64,1024`
 - `DOGPADDLE_FLOW_BENCH_SAMPLES=9`
 - `DOGPADDLE_FLOW_BENCH_WARMUPS=2`
 

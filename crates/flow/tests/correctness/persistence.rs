@@ -1,12 +1,15 @@
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, Large, OrderedMap, Small, Store, StoreError};
 
-use super::support::{build_source_and_read_definition, fixture_bytes, read_published_definition};
+use super::support::{
+    build_source_sink_and_read_definition, fixture_bytes, read_published_definition,
+};
 
-const V1_SEQUENCE_COUNT: &str = include_str!("../fixtures/v1/sequence_source_count.hex");
+const V1_SEQUENCE_COUNT_DISCARD: &str =
+    include_str!("../fixtures/v1/sequence_source_count_discard.hex");
 
 #[test]
 fn build_publishes_the_stable_v1_definition_bytes() {
@@ -15,15 +18,20 @@ fn build_publishes_the_stable_v1_definition_bytes() {
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(7));
     let count = builder.station("count", CountDefinition::new());
+    let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
+    builder.connect([count], sink);
     drop(builder.build().unwrap());
 
     assert_eq!(
         read_published_definition(&path),
-        fixture_bytes(V1_SEQUENCE_COUNT)
+        fixture_bytes(V1_SEQUENCE_COUNT_DISCARD)
     );
     let flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["source", "count"]);
+    assert_eq!(
+        flow.station_ids().collect::<Vec<_>>(),
+        ["source", "count", "sink"]
+    );
 }
 
 #[test]
@@ -33,7 +41,9 @@ fn build_uses_the_stable_resource_layout() {
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let count = builder.station("count", CountDefinition::new());
+    let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
+    builder.connect([count], sink);
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
@@ -43,9 +53,14 @@ fn build_uses_the_stable_resource_layout() {
         store.open_data("station/00000000/state").unwrap();
     let _count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000001/state").unwrap();
+    let _sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000002/state").unwrap();
     let _source_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let _terminal_count_output: AppendLog<Vec<u8>> =
-        store.open_data("station/00000001/output").unwrap();
+    let _count_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    assert!(matches!(
+        store.open_data::<AppendLog<Vec<u8>>>("station/00000002/output"),
+        Err(StoreError::DataNotFound(name)) if name == "station/00000002/output"
+    ));
     let _source_position: Cell<u64> = store
         .open_data("station/00000000/operation/sequence_source.position")
         .unwrap();
@@ -69,7 +84,9 @@ fn build_initializes_input_state_at_the_stable_origins() {
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(0));
     let count = builder.station("count", CountDefinition::new());
+    let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
+    builder.connect([count], sink);
     drop(builder.build().unwrap());
 
     let store = Store::open(&path).unwrap();
@@ -77,6 +94,8 @@ fn build_initializes_input_state_at_the_stable_origins() {
         store.open_data("station/00000000/state").unwrap();
     let count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000001/state").unwrap();
+    let sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000002/state").unwrap();
     let (_, reads) = store.into_transactions().split();
     let transaction = reads.begin().unwrap();
     let active_key = b"input/active".to_vec();
@@ -114,12 +133,28 @@ fn build_initializes_input_state_at_the_stable_origins() {
             .unwrap(),
         Some(vec![0; 8])
     );
+    assert_eq!(
+        sink_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&active_key)
+            .unwrap(),
+        Some(vec![0; 4])
+    );
+    assert_eq!(
+        sink_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&cursor_key)
+            .unwrap(),
+        Some(vec![0; 8])
+    );
 }
 
 #[test]
 fn open_reports_a_missing_station_output_after_publication() {
     let root = tempfile::tempdir().unwrap();
-    let definition = build_source_and_read_definition(&root.path().join("complete"));
+    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
 
     let incomplete_path = root.path().join("missing-output");
     let mut store = Store::create(&incomplete_path).unwrap();
@@ -152,7 +187,7 @@ fn open_reports_a_missing_station_output_after_publication() {
 #[test]
 fn open_reports_a_station_output_size_mismatch() {
     let root = tempfile::tempdir().unwrap();
-    let definition = build_source_and_read_definition(&root.path().join("complete"));
+    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
 
     let mismatched_path = root.path().join("output-size-mismatch");
     let mut store = Store::create(&mismatched_path).unwrap();
@@ -226,7 +261,7 @@ fn open_rejects_a_corrupt_published_definition() {
 #[test]
 fn open_reports_a_missing_resource_after_publication() {
     let root = tempfile::tempdir().unwrap();
-    let definition = build_source_and_read_definition(&root.path().join("complete"));
+    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
 
     let incomplete_path = root.path().join("missing-resource");
     let mut store = Store::create(&incomplete_path).unwrap();
@@ -256,7 +291,7 @@ fn open_reports_a_missing_resource_after_publication() {
 #[test]
 fn open_reports_an_operation_data_size_mismatch() {
     let root = tempfile::tempdir().unwrap();
-    let definition = build_source_and_read_definition(&root.path().join("complete"));
+    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
 
     let mismatched_path = root.path().join("size-mismatch");
     let mut store = Store::create(&mismatched_path).unwrap();

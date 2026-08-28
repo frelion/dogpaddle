@@ -206,7 +206,7 @@ impl StationParts {
         );
         assert_eq!(
             self.output.is_some(),
-            self.operation.definition().produces_output(),
+            self.operation.definition().category().has_output(),
             "station output capability must match its operation definition"
         );
         assert!(

@@ -44,21 +44,63 @@ pub(crate) struct DataName<D> {
     _data: PhantomData<fn() -> D>,
 }
 
+/// Structural category explicitly declared by an Operation definition.
+///
+/// A category is nominal metadata supplied by the concrete Operation; it is
+/// not inferred from its port count or its position in a Flow. A Station reads
+/// the category of its contained Operation and exposes Station-level topology
+/// properties to Flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OperationCategory {
+    /// Produces records without consuming upstream input.
+    Source,
+    /// Consumes upstream records and produces downstream records.
+    Transform,
+    /// Consumes upstream records without producing downstream output.
+    Sink,
+}
+
+impl OperationCategory {
+    /// Returns whether this category is a source.
+    #[must_use]
+    pub const fn is_source(self) -> bool {
+        match self {
+            Self::Source => true,
+            Self::Transform | Self::Sink => false,
+        }
+    }
+
+    /// Returns whether this category is a sink.
+    #[must_use]
+    pub const fn is_sink(self) -> bool {
+        match self {
+            Self::Sink => true,
+            Self::Source | Self::Transform => false,
+        }
+    }
+
+    /// Returns whether this category owns a downstream output stream.
+    #[must_use]
+    pub const fn has_output(self) -> bool {
+        match self {
+            Self::Source | Self::Transform => true,
+            Self::Sink => false,
+        }
+    }
+}
+
 /// Pure definition shared by every built-in operation.
 ///
 /// The trait is sealed: the persistent operation set is closed inside this
 /// crate. Flow creates or opens the declared data objects before asking the
 /// definition to assemble its runtime [`Operation`].
 pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
+    /// Returns the Operation's explicitly declared structural category.
+    fn category(&self) -> OperationCategory;
+
     /// Returns the exact number of ordered upstream stations this definition accepts.
     fn input_count(&self) -> usize;
-
-    /// Returns whether this operation produces a downstream change stream.
-    ///
-    /// Flow uses this declaration to decide whether the owning station has an
-    /// output log. It is independent of whether the current topology happens
-    /// to connect any downstream stations.
-    fn produces_output(&self) -> bool;
 
     /// Returns the operation's stable logical data names and typed classes.
     ///

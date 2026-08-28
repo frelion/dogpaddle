@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     OperationDefinition,
-    operation::{source, transform},
+    operation::{sink, source, transform},
 };
 
 const MAGIC: &[u8] = b"dogpaddle.operation\0";
@@ -13,6 +13,7 @@ pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, Def
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     (source::sequence::TAG, source::sequence::decode_definition),
     (transform::count::TAG, transform::count::decode_definition),
+    (sink::discard::TAG, sink::discard::decode_definition),
 ];
 
 /// Stable operation-definition encoding failure.

@@ -2,17 +2,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use dogpaddle_operation::{
     DefinitionCodecError, OperationDefinition, decode_definition, encode_definition,
-    operation::{source::SequenceSourceDefinition, transform::CountDefinition},
+    operation::{
+        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    },
 };
 
 use super::support::decode_hex;
 
 const COUNT_V1: &str = include_str!("../fixtures/v1/count_definition.hex");
+const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
 
 fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
     vec![
         (decode_hex(COUNT_V1), Box::new(CountDefinition::new())),
+        (decode_hex(DISCARD_V1), Box::new(DiscardDefinition::new())),
         (
             decode_hex(SEQUENCE_V1),
             Box::new(SequenceSourceDefinition::new(42)),
@@ -25,8 +29,8 @@ fn every_builtin_definition_has_stable_v1_golden_bytes() {
     for (golden, definition) in golden_cases() {
         assert_eq!(encode_definition(definition.as_ref()), golden);
         let decoded = decode_definition(&golden).unwrap();
+        assert_eq!(decoded.category(), definition.category());
         assert_eq!(decoded.input_count(), definition.input_count());
-        assert_eq!(decoded.produces_output(), definition.produces_output());
         assert_eq!(encode_definition(decoded.as_ref()), golden);
     }
 }

@@ -7,12 +7,13 @@ use super::support::{fixture_bytes, publish_definition, rewrite_checksum};
 
 const FLOW_MAGIC: &[u8] = b"dogpaddle.flow\0";
 const OPERATION_MAGIC: &[u8] = b"dogpaddle.operation\0";
-const V1_SEQUENCE_COUNT: &str = include_str!("../fixtures/v1/sequence_source_count.hex");
+const V1_SEQUENCE_COUNT_DISCARD: &str =
+    include_str!("../fixtures/v1/sequence_source_count_discard.hex");
 
 #[test]
 fn open_reports_semantic_errors_after_a_valid_checksum() {
     let root = tempfile::tempdir().unwrap();
-    let original = fixture_bytes(V1_SEQUENCE_COUNT);
+    let original = fixture_bytes(V1_SEQUENCE_COUNT_DISCARD);
 
     let mut invalid_magic = original.clone();
     invalid_magic[0] ^= 1;
@@ -86,7 +87,7 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
 #[test]
 fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
     let root = tempfile::tempdir().unwrap();
-    let original = fixture_bytes(V1_SEQUENCE_COUNT);
+    let original = fixture_bytes(V1_SEQUENCE_COUNT_DISCARD);
     let mut cases = Vec::new();
 
     for length in [

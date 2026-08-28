@@ -10,6 +10,7 @@ use dogpaddle_operation::{
     OperationDefinition, encode_definition,
     operation::{
         InputProgress, Operation, OperationError, OperationInput, TurnCommit, TurnDecision,
+        sink::DiscardDefinition,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
         transform::{CountDefinition, CountOperation},
     },
@@ -304,7 +305,9 @@ fn build_and_open_inject_the_later_declared_source_output_as_read_only_input() {
     let mut factory = FlowFactory::new(&path);
     let count = factory.station("count", CountDefinition::new());
     let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let sink = factory.station("sink", DiscardDefinition::new());
     factory.connect([source], count);
+    factory.connect([count], sink);
 
     assert_station_wiring(factory.build().unwrap());
     assert_station_wiring(FlowFactory::open(&path).unwrap());
@@ -643,8 +646,12 @@ fn gc_truncates_only_the_prefix_retired_by_every_consumer() {
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let first = factory.station("first", CountDefinition::new());
     let second = factory.station("second", CountDefinition::new());
+    let first_sink = factory.station("first-sink", DiscardDefinition::new());
+    let second_sink = factory.station("second-sink", DiscardDefinition::new());
     factory.connect([source], first);
     factory.connect([source], second);
+    factory.connect([first], first_sink);
+    factory.connect([second], second_sink);
     let flow = factory.build().unwrap();
     let (mut transactions, _reads, stations) = flow.into_runtime_parts();
     {
@@ -673,7 +680,9 @@ fn gc_deletes_at_most_one_bounded_batch() {
     let mut factory = FlowFactory::new(root.path().join("flow"));
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
     factory.connect([source], count);
+    factory.connect([count], sink);
     let flow = factory.build().unwrap();
     let (mut transactions, _reads, stations) = flow.into_runtime_parts();
     let entry_count = GC_MAX_ITEMS.get() + 1;
@@ -1200,13 +1209,16 @@ fn input_state_keys_and_values_have_stable_encodings() {
 
 fn assert_station_wiring(flow: Flow) {
     let (mut transactions, _reads, stations) = flow.into_runtime_parts();
-    assert_eq!(stations.len(), 2);
+    assert_eq!(stations.len(), 3);
     assert_eq!(stations[0].inputs.logs.len(), 1);
-    assert!(stations[0].consumers.is_empty());
+    assert_eq!(stations[0].consumers.len(), 1);
     assert!(stations[0].output.is_some());
     assert!(stations[1].inputs.logs.is_empty());
     assert_eq!(stations[1].consumers.len(), 1);
     assert!(stations[1].output.is_some());
+    assert_eq!(stations[2].inputs.logs.len(), 1);
+    assert!(stations[2].consumers.is_empty());
+    assert!(stations[2].output.is_none());
 
     let transaction = transactions.begin().unwrap();
     let mut output = stations[1]
@@ -1281,7 +1293,9 @@ fn flow_with_changes(values: &[&[u64]]) -> IntakeFixture {
     let mut factory = FlowFactory::new(&path);
     let source = factory.station("source", SequenceSourceDefinition::new(0));
     let count = factory.station("count", CountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
     factory.connect([source], count);
+    factory.connect([count], sink);
     let flow = factory.build().unwrap();
     let (mut transactions, reads, stations) = flow.into_runtime_parts();
 

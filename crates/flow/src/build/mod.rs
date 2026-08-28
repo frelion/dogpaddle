@@ -116,7 +116,7 @@ impl FlowFactory {
             .stations()
             .iter()
             .enumerate()
-            .map(|(index, station)| create_station_part(&mut store, index, station.operation()))
+            .map(|(index, station)| create_station_part(&mut store, index, station))
             .collect::<Result<Vec<_>, _>>()?;
         let (mut transactions, reads) = store.into_transactions().split();
         {
@@ -162,10 +162,11 @@ fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), Materia
 fn create_station_part(
     store: &mut Store,
     index: usize,
-    definition: &dyn OperationDefinition,
+    station: &StationDefinition,
 ) -> Result<StationParts, FlowError> {
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data(&codec::station_state_name(index))?;
+    let definition = station.operation();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::station_operation_data_name(index, declaration.name());
@@ -173,8 +174,8 @@ fn create_station_part(
     }
     let operation = definition.materialize(&mut data)?;
     data.finish()?;
-    let output = definition
-        .produces_output()
+    let output = station
+        .has_output()
         .then(|| store.create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index)))
         .transpose()?;
     Ok(StationParts::new(state, operation, output))

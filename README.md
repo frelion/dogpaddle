@@ -14,8 +14,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 
 ## 已有能力
 
-- **强类型静态 DAG**：sealed `OperationDefinition` trait 声明输入数量、是否产生输出和状态
-  形状，`FlowFactory` 校验有序连接、唯一 Station ID、自环、多节点环，以及 source 确实拥有输出。
+- **强类型静态 DAG**：sealed `OperationDefinition` trait 手动声明 Source、Transform 或 Sink
+  category、输入数量和状态形状；Station 读取所包裹算子的类别，`FlowFactory` 校验有序连接、
+  唯一 Station ID、自环、多节点环，以及所有起点都是 Source、所有终点都是 Sink。
 - **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
   标记最后提交。
 - **直接重新打开**：`FlowFactory::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
@@ -26,8 +27,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   记录与非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
-- **真实定义与状态物化**：当前包含零输入 SequenceSource 和一元事件 Count；build/open 会为
-  二者创建并重新绑定持久化 Cell，同时为 Flow 和每个 Station 预先声明通用 state map。
+- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count 和无输出 Discard
+  Sink；build/open 会为有状态算子创建并重新绑定持久化 Cell，同时为 Flow 和每个 Station 预先
+  声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Station 不长期持有
   事务启动能力；每个有输入的 Station 持久化一个 active input 和每条边的 Change offset，
@@ -78,8 +80,9 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 `Idle`/`Commit(Keep)`/`Commit(Complete)` decision。只要尚未 `Complete`，下一 turn（包括 reopen
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
-`SequenceSource → Count` 轮次，并在成功 turn 后进行安全的上游有界 GC。尚未实现持续运行的
-`Flow::start`、背压、中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。Operation 的展平
+`SequenceSource → Count → Discard` 轮次，并在成功 turn 后进行安全的上游有界 GC。拓扑已经拒绝
+没有任何 consumer 的 output；尚未实现持续运行的 `Flow::start`、针对缓慢 consumer 的容量背压、
+中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。Operation 的展平
 output 事件序列与最终业务状态必须同时不受稳定重批和 `Keep` turn 切分影响。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store

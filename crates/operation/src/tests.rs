@@ -3,10 +3,12 @@ use std::collections::HashSet;
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataInstances, MaterializeError, OperationDefinition,
+    DataInstances, MaterializeError, OperationCategory, OperationDefinition,
     codec::DECODERS,
     definition::DataName,
-    operation::{source::SequenceSourceDefinition, transform::CountDefinition},
+    operation::{
+        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    },
 };
 
 const COUNT: DataName<Cell<u64>> = DataName::new("count");
@@ -15,12 +17,17 @@ const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("
 const SMALL_STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("state");
 const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
 
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 3] {
+    [
+        Box::new(SequenceSourceDefinition::new(0)),
+        Box::new(CountDefinition::new()),
+        Box::new(DiscardDefinition::new()),
+    ]
+}
+
 #[test]
-fn decoder_registry_exactly_matches_builtins_and_data_names_are_valid() {
-    let definitions = [
-        &SequenceSourceDefinition::new(0) as &dyn OperationDefinition,
-        &CountDefinition::new(),
-    ];
+fn decoder_registry_exactly_matches_builtins() {
+    let definitions = builtin_definitions();
     let expected_tags = definitions
         .iter()
         .map(|definition| definition.persistence_tag())
@@ -37,8 +44,29 @@ fn decoder_registry_exactly_matches_builtins_and_data_names_are_valid() {
         "duplicate decoder tag"
     );
     assert_eq!(registered_tags, expected_tags);
+}
 
-    for definition in definitions {
+#[test]
+fn builtin_categories_match_their_input_contracts() {
+    for definition in builtin_definitions() {
+        match definition.category() {
+            OperationCategory::Source => assert_eq!(
+                definition.input_count(),
+                0,
+                "source definition accepts upstream input"
+            ),
+            OperationCategory::Transform | OperationCategory::Sink => assert_ne!(
+                definition.input_count(),
+                0,
+                "input-consuming definition accepts no upstream input"
+            ),
+        }
+    }
+}
+
+#[test]
+fn builtin_data_names_are_valid() {
+    for definition in builtin_definitions() {
         let mut names = HashSet::new();
         for declaration in definition.data() {
             let name = declaration.name();

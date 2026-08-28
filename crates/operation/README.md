@@ -45,15 +45,17 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count，`sink` 尚无具体
-实现。目录分类目前不引入额外 marker trait 或运行时类型系统。
+的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count，`sink` 包含
+Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
+[`OperationDefinition::category`] 显式声明自己的结构类别。
 
 ## Definition 与持久化
 
-具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 提供精确输入数量和
-`produces_output()`，并以 `{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。
-`produces_output()` 表示 Operation 是否拥有语义输出端口，不表示某次处理一定产生记录，也不
-取决于当前拓扑是否存在下游；Source 与 Transform 可以是 `true`，Sink 是 `false`。Flow 负责生成完整
+具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 要求每个具体算子手动返回
+[`OperationCategory`]，同时声明精确输入数量，并以 `{ 逻辑名: data class }` 的形式向 Flow
+声明完整数据 schema。类别不是从输入数量或拓扑位置推断：Source、Transform 和 Sink 分别声明
+自己在数据流中的结构语义；Station 读取所包裹 Definition 的类别，再向 Flow 提供自己的
+source/sink 与 output 属性。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
 Definition 的 `materialize`。具体 Definition 只按名称取得已经创建或打开的
 `Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
@@ -65,13 +67,13 @@ collection 只暴露真实存在的布局选择：`Cell<T>` 永远使用共享�
 
 ```rust
 use dogpaddle_operation::{
-    OperationDefinition, decode_definition, encode_definition,
+    OperationCategory, OperationDefinition, decode_definition, encode_definition,
     operation::source::SequenceSourceDefinition,
 };
 
 let source = SequenceSourceDefinition::new(10);
+assert_eq!(source.category(), OperationCategory::Source);
 assert_eq!(source.input_count(), 0);
-assert!(source.produces_output());
 
 let encoded = encode_definition(&source);
 let decoded = decode_definition(&encoded).unwrap();
@@ -111,13 +113,23 @@ non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` �
 `Cell<u64>` 加一，输入 diff 的符号和数值不改变“一个有序事件”的计数。每个已处理输入行输出
 一个 non-null `UInt64` `count`，diff 固定为 `+1`；因此它是插入式的运行计数事件流，不是维护
 单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
-[`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Station，它仍声明自己产生
-输出；拓扑位置不会把 Transform 隐式变成 Sink。
+[`operation::transform::CountError::Overflow`]。Count 显式声明为
+[`OperationCategory::Transform`]；拓扑位置不会把它隐式变成 Sink，因此完整 Flow 必须把它连接到
+一个下游 Sink。
 
 Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 Change，并返回
 `input: Some(Complete)`；它在写状态前预检整批行数，若最终值无法用 `u64` 表示，则返回 overflow，
 整个 turn 不产生部分进展。协议允许其他 Operation 用声明的持久化状态在多个 `Keep` turn 中处理
 同一 Change，这不是 Count 必须采用的实现策略。
+
+## `operation::sink::Discard`
+
+[`operation::sink::DiscardDefinition`] 显式声明为 [`OperationCategory::Sink`]，要求一个输入，
+不声明 Operation data，也没有 output。物化后的 [`operation::sink::DiscardOperation`] 接受端口
+零上的完整 Change，并返回
+`Commit(TurnCommit { input: Some(Complete), output: None })`。输入完成仍由 Station 在同一事务中
+持久化 cursor；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
+Sink 的幂等提交协议仍需单独设计。
 
 ```rust,no_run
 use dogpaddle_operation::operation::{
@@ -162,7 +174,7 @@ Flow 不需要知道算子的业务数据结构，Operation 也不能控制事�
 
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
 模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
-`Operation`，并声明唯一稳定 tag、逻辑资源名、
+`Operation`，手动声明正确的 [`OperationCategory`]，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec 与物化逻辑；公共 decoder 表只增加一条
 `tag → decode function` 记录。运行实例直接保存所需 collection，不再为每个算子增加只包裹
 字段的 `OperationData` 类型。Flow 的 build/open 不应出现具体算子分支。
@@ -171,7 +183,7 @@ Flow 不需要知道算子的业务数据结构，Operation 也不能控制事�
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
 分类内增加任意数量的算子都不会产生注册名称冲突。
 
-一个 Operation 的 tag、payload、`input_count()` 及有序 port 语义、`produces_output()`、
+一个 Operation 的 tag、payload、显式 category、`input_count()` 及有序 port 语义、
 逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE` 共同决定持久化 schema。
 Flow 根据声明创建实例，materialize 再按逻辑名
 取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
@@ -186,7 +198,7 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
-`correctness` target，按 codec、Definition、Source 与 Transform 分区。Definition v1 使用版本化
+`correctness` target，按 codec、Definition、Source、Transform 与 Sink 分区。Definition v1 使用版本化
 黄金字节约束，具体 Operation 覆盖完整 turn、commit、rollback、reopen、极值错误不改状态、固定
 output Schema/diff 和 Store 错误透明传播。完整目录所有权、测试矩阵和 fixture 规则见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)。

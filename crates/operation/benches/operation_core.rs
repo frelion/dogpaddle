@@ -10,6 +10,7 @@ use dogpaddle_operation::{
     OperationDefinition, decode_definition, encode_definition,
     operation::{
         Operation, OperationInput,
+        sink::DiscardDefinition,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
         transform::{CountDefinition, CountOperation},
     },
@@ -135,8 +136,9 @@ fn main() {
 fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
     println!();
     println!("=== Definition public codec ===");
-    let definitions: [(&str, Box<dyn OperationDefinition>); 2] = [
+    let definitions: [(&str, Box<dyn OperationDefinition>); 3] = [
         ("count", Box::new(CountDefinition::new())),
+        ("discard", Box::new(DiscardDefinition::new())),
         (
             "sequence",
             Box::new(SequenceSourceDefinition::new(SEQUENCE_START)),
