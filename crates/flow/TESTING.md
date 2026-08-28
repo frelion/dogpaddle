@@ -3,9 +3,10 @@
 本文件规定 `dogpaddle-flow` 的测试所有权、持久化兼容性验证和 `build/open` 生命周期基准。
 dogpaddle-flow 是 Operation 与 Store 的产品组合根，因此真实资源创建、Operation 物化和重新
 打开测试属于本 crate；它们不需要再放入 `integration-tests/flow-store`。当前已有 Station output
-log、只读 input capability、唯一 owned Change cache、确定性拓扑 schedule、Operation 单 turn
-完整 Change 处理、原子 output/cursor 提交、上游有界 GC 和公共 `Flow::advance`。尚无公共 `Flow::start` 或
-外部可观察 Sink；真实 Store 内执行链仍由本 crate 验证，不建立重复的
+log、只读 input capability、唯一 owned Change cache、确定性拓扑 schedule、Operation
+`Idle`/`Commit(Keep)`/`Commit(Complete)` 协议、原子 output/input-progress 提交、强重放、上游有界
+GC 和公共 `Flow::advance`。尚无公共 `Flow::start` 或外部可观察 Sink；真实 Store 内执行链仍由本
+crate 验证，不建立重复的
 `integration-tests/engine` package。
 
 ## 目录与所有权
@@ -67,13 +68,17 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   和 reopen 仍按 source ID 正确注入；二者派生相同的分层拓扑 schedule，同层保持声明顺序，且
   公共有界轮次的方法签名保持固定。build 在发布 Definition 的同一事务中，用稳定 key 和 4 字节
   value 初始化 active input，用稳定 port key 和 8 字节 value 初始化每个 cursor。私有测试验证
-  `Station::intake` 经独立 RO snapshot 从 active input 循环查找、跳过空端口、只缓存第一个可用
-  entry 的 input/offset/Change，cache hit 完全不访问 Store；缺失、错误长度或越界 active input，
-  缺失或非 8 字节 cursor，以及非法 Change 均被拒绝。上游 GC 取全部 consumer edge cursor 的最小值
-  并且单次至多删除 1024 个 entry。`Station::process` 在调用 Operation 前验证 cache/cursor 身份；
-  Operation 成功即表示完整 Change 已处理，其业务状态、可选 output、cursor 推进和 active 轮转
-  在同一写事务中提交，commit 后才清 cache。测试覆盖整个 Change 一次退休、reopen 不重放、
-  stale cache 拒绝、output append 失败回滚和无重复输出。`Flow::advance`
+  输入准备经独立 RO snapshot 从 active input 循环查找、跳过空端口、只选择第一个可用 entry，并在
+  Operation 调用前用独立短写事务把选中 port durable-pin 为 active input；cache hit 完全不访问
+  Store。缺失、错误长度或越界 active input，缺失或非 8 字节 cursor，以及非法 Change 均被拒绝。
+  reopen 从 active/cursor 重建相同 `(port, offset, bytes)` 的完整 Change。上游 GC 取全部 consumer
+  edge cursor 的最小值并且单次至多删除 1024 个 entry。`Station::process` 在调用 Operation 前验证
+  cache 的 port/cursor 身份；`Idle` 回滚 Operation 写入并保留 claim/cache，`Commit(Keep)` 原子提交
+  continuation 和可选 output 但不推进 cursor、轮转 active 或清 cache，`Commit(Complete)` 才原子
+  提交状态、可选 output、cursor 推进和 active 轮转，并在 commit 后清 cache。零输入 Source 通过
+  相同的 `turn(None, ...)` 和 `Commit(TurnCommit { input: None, .. })` 路径执行；调用/input-progress
+  形状不匹配会被拒绝。测试覆盖 Keep 后同一完整 Change 重放、Complete 后退休、reopen 后 claim
+  恢复、stale cache 拒绝、output append 失败回滚和无重复输出。`Flow::advance`
   在同一轮让拓扑下游观察上游已提交 output，并在每个成功 turn 后触发全部不同的直接上游 GC。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用

@@ -90,7 +90,10 @@ decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一�
 性质测试使用确定性 seed，并在失败时打印 seed。Change 重点验证 roundtrip、投影等价、切片和
 稳定重批；Store 重点验证分页/方向与 `BTreeMap` 模型一致、事务原子性和单调 offset；Operation
 重点验证稳定 definition codec、状态推进和稳定重批；Flow 重点验证任意合法 DAG 的顺序、拓扑
-约束，以及 Station 完整 Change 退休、cursor/output 原子性和成功 turn 后的上游 GC。
+约束，以及 Station 的 durable input claim、`Idle` 回滚、`Keep` continuation/output 提交、同一
+`(port, offset, bytes)` 完整 Change 重放、`Complete` 退休、cursor/output 原子性和成功 turn 后的
+上游 GC。稳定重批 oracle 必须同时比较展平 output 事件序列和最终业务状态，并证明结果不受同一
+Change 被划分为多少个 `Keep` turn 影响。
 任意输入 decoder 必须返回结果而非 panic、abort、无限循环或按未验证长度分配。
 
 ### 崩溃与长稳

@@ -4,7 +4,7 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
-    Operation, OperationInput,
+    InputProgress, Operation, OperationInput, TurnCommit, TurnDecision,
     transform::{CountDefinition, CountError, CountOperation},
 };
 use dogpaddle_store::{Cell, Store, StoreError};
@@ -22,8 +22,14 @@ fn input_change(diffs: Vec<i64>) -> Change {
     Change::try_new(records, Int64Array::from(diffs)).unwrap()
 }
 
-fn count_values(output: Option<Change>) -> Vec<u64> {
-    let change = output.expect("Count did not return one output Change");
+fn count_values(decision: TurnDecision) -> Vec<u64> {
+    let TurnDecision::Commit(TurnCommit {
+        input: Some(InputProgress::Complete),
+        output: Some(change),
+    }) = decision
+    else {
+        panic!("Count did not complete its input and commit one output Change");
+    };
     let schema = change.schema();
     assert_eq!(schema.fields().len(), 1);
     let field = schema.field(0);

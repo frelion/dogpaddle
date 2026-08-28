@@ -12,15 +12,33 @@ Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandl
 负责数据变换和自己声明的持久化状态，不读写 IPC、不读取边日志，也不决定物理
 batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须依次观察输入事件，并按
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
-独立定义的窗口、barrier 或 flush 信号，Operation 的可观察结果必须在稳定合并或切分 Change
-后保持不变；物理 Change 边界不能被算子当成业务事件。
+独立定义的窗口、barrier 或 flush 信号，Operation 的展平输出事件序列和最终业务状态必须在稳定
+合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Keep` turn 而改变；物理
+Change 边界和 turn 边界都不能被算子当成业务事件。
 
-运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 收到
-`None`；Transform 与 Sink 每次只收到一个完整 borrowed Change，以及它在 Definition 有序输入中的
-`usize` 端口序号。Operation 不接收 `AppendLog` offset。成功返回表示本次提供的工作已经完整完成，
-并至多返回一个 owned Change；filter 或 Sink 可以返回 `None`。具体错误统一擦除为标准 boxed
-[`operation::OperationError`]：算子语义错误保留具体算子错误类型，Store、Arrow 和 Change
-等基础错误保留原始类型，均可按具体类型 downcast。
+运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 与其他
+Operation 走同一个调用协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed
+Change，以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 `AppendLog`
+offset。
+
+turn 返回 [`operation::TurnDecision`]：`Idle` 表示没有可提交进展，调用方必须回滚该 turn 的全部
+写入；`Commit` 携带 [`operation::TurnCommit`]，其中 `input` 进展与可选 `output` 正交。Source 的
+commit 使用 `input: None`；收到输入的 Operation 必须使用 `Some(Keep)` 或 `Some(Complete)`，其
+形状必须与本次调用一致。`Keep` 会提交 Operation 状态和可选 output，但不完成当前输入；下一 turn
+仍收到同一端口、同一日志 offset 和逐字节相同的完整 Change。`Complete` 才声明该 Change 已完整
+处理。两种 commit 都至多产生一个 owned output Change；filter 或 Sink 可以使用 `output: None`。
+跨 turn continuation 必须放在 Operation 自己通过 Definition 声明的持久化 Store 状态中，不能
+隐藏在 Station。具体错误统一擦除为标准 boxed [`operation::OperationError`]：算子语义错误保留
+具体算子错误类型，Store、Arrow 和 Change 等基础错误保留原始类型，均可按具体类型 downcast。
+由于 `Idle`、错误或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
+Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂等提交协议，当前尚未定义。
+
+| decision | `input` progress | 本 turn 写入与 output | 当前输入 |
+| --- | --- | --- | --- |
+| `Idle` | 不存在 | 全部回滚 | 有输入时保持不变 |
+| `Commit` | `None` | 提交 | 零输入 Operation，没有输入进展 |
+| `Commit` | `Some(Keep)` | 提交 | 保留，下一 turn 完整重放 |
+| `Commit` | `Some(Complete)` | 提交 | 完成，调用方才可推进 |
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -80,7 +98,9 @@ sealed Definition 物化运行实例；开放可注入 Flow 的第三方算子�
 [`operation::source::SequenceSourceOperation`] 直接持有 `Cell<u64>`，保存最后一次
 已提交的值；首次产生 `start`，随后逐一递增。每个 turn 产生一行，输出固定为一个
 non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
-下一次 turn 返回 [`operation::source::SequenceSourceError::Exhausted`]。它声明自己产生输出。
+下一次 turn 返回 [`operation::source::SequenceSourceError::Exhausted`]。每次成功 turn 返回
+`Commit(TurnCommit { input: None, output: Some(_) })`；Station 不为 Source 建立另一套 outcome 或
+事务路径。它声明自己产生输出。
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 
@@ -94,12 +114,14 @@ non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` �
 [`operation::transform::CountError::Overflow`]。即使 Count 当前是终端 Station，它仍声明自己产生
 输出；拓扑位置不会把 Transform 隐式变成 Sink。
 
-Count 只声明 `count: Cell<u64>`。每个 turn 一次处理完整 Change；它在写状态前预检整批行数，若
-最终值无法用 `u64` 表示，则返回 overflow，整个 turn 不产生部分进展。
+Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 Change，并返回
+`input: Some(Complete)`；它在写状态前预检整批行数，若最终值无法用 `u64` 表示，则返回 overflow，
+整个 turn 不产生部分进展。协议允许其他 Operation 用声明的持久化状态在多个 `Keep` turn 中处理
+同一 Change，这不是 Count 必须采用的实现策略。
 
 ```rust,no_run
 use dogpaddle_operation::operation::{
-    Operation,
+    Operation, TurnCommit, TurnDecision,
     source::{SequenceSourceDefinition, SequenceSourceOperation},
 };
 use dogpaddle_store::{Cell, Store};
@@ -112,21 +134,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
-    let output = operation.turn(None, transaction.access())?;
-    assert!(output.is_some());
+    let decision = operation.turn(None, transaction.access())?;
+    assert!(matches!(
+        decision,
+        TurnDecision::Commit(TurnCommit {
+            input: None,
+            output: Some(_),
+        })
+    ));
     transaction.commit()?;
     Ok(())
 }
 ```
 
 Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow 长期持有事务启动能力；
-Station 的 intake 阶段只用只读事务读取上游日志，不推进 cursor，也不调用 Operation。进入
-process 阶段后，Station 开始并持有读写 Transaction，只把不能提交的
+Station 的输入准备先用只读事务选择上游日志 entry，必要时再用独立短写事务 durable-pin active
+input；它不推进 cursor，也不调用 Operation。进入 process 阶段后，Station 开始并持有读写
+Transaction，只把不能提交的
 `TransactionAccess` 交给 Operation。Operation 可以用自己持有的 `Cell` 或
 `OrderedMap` 直接读写持久化状态。输入中的 `port` 只表达 Definition 中的端口位置，不是 Change
-identity。Station 在同一写事务中协调 Operation 状态、output 和完整 Change 的 input offset；
-Operation 成功后才推进 offset，Operation 返回错误时调用方必须回滚。因此 Flow 不需要知道算子的
-数据结构，Operation 也不能控制事务边界。
+identity。Station 在同一写事务中协调 Operation 状态、output 和输入进展：`Keep` 提交前两者但不
+推进 offset，`Complete` 才同时推进 offset，`Idle` 或错误则回滚。只要输入尚未 `Complete`，后续
+turn 必须重放相同的完整 Change；Operation 把片段内 continuation 保存在自己声明的状态中。因此
+Flow 不需要知道算子的业务数据结构，Operation 也不能控制事务边界。
 
 ## 扩展约束
 

@@ -6,8 +6,9 @@ commit、rollback、错误传播和 reopen 属于本 crate 的公共正确性，
 
 Flow 负责完整 Station 资源名、资源创建顺序、Flow Definition 布局和 build/open 后的装配；这些
 组合契约应在 `dogpaddle-flow` 的公共测试中验证。Operation 自身拥有 object-safe Change turn
-接口、有序输入端口、完整 Change 消费、输出 Change 和可 downcast 错误，因此这些无需日志或
-Station 的行为由本 crate 直接验证。
+接口、有序输入端口、`Idle`/`Commit` decision、正交的 input progress/output 和可 downcast 错误，
+因此这些无需日志或 Station 的行为由本 crate 直接验证。`Keep` 后 durable input claim、同一 Change
+重放和 `Complete` 后退休属于 Flow 与 Store 的组合契约，由 flow crate 验证。
 
 ## 目录职责
 
@@ -50,10 +51,12 @@ Definition codec 的 tag、payload 和完整字节是持久化兼容性边界。
 合法 fixture 的所有严格前缀都必须拒绝，magic/version/tag/trailing bytes 分别锁定错误类别，固定
 字节生成器额外证明任意探针不会引发 panic。
 
-每个有状态 Operation 覆盖固定 output Schema/diff、完整 turn、commit 后 reopen、显式 rollback、
-边界错误不改状态，以及错误后再次读取。Count 使用多行 Change 验证整批原子完成，并用稳定重批
-锁定逐项不变的输出；带正、负和大幅 diff 的输入锁定其“每行一个事件”的计数语义。SequenceSource
-覆盖单行推进、含 `u64::MAX` 的最后成功输出和下一 turn Exhausted。绑定到另一个 Store 的
+每个有状态 Operation 覆盖固定 output Schema/diff、decision 形状、commit 后 reopen、显式
+rollback、边界错误不改状态，以及错误后再次读取。SequenceSource 锁定无输入 commit 的
+`input: None`，Count 锁定有输入 commit 的 `Some(Complete)`。Count 使用多行 Change 验证其当前
+整批原子完成策略，并用稳定重批锁定展平 output 与最终状态逐项不变；带正、负和大幅 diff 的输入
+锁定其“每行一个事件”的计数语义。SequenceSource 覆盖单行推进、含 `u64::MAX` 的最后成功输出和
+下一 turn Exhausted。绑定到另一个 Store 的
 `TransactionAccess` 必须透明返回 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
 安全返回 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、
 崩溃恢复和通用 Cell codec 由 `dogpaddle-store` 测试拥有，不在这里重复。

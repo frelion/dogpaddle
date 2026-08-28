@@ -1,5 +1,5 @@
 use dogpaddle_change::{Change, encode_change};
-use dogpaddle_operation::operation::{Operation, OperationInput};
+use dogpaddle_operation::operation::{InputProgress, Operation, OperationInput, TurnDecision};
 use dogpaddle_store::{
     AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, StoreError, TransactionAccess,
     Transactions,
@@ -34,8 +34,11 @@ impl Station {
         reads: &ReadTransactions,
         transactions: &mut Transactions,
     ) -> Result<ProcessOutcome, StationError> {
-        self.intake(reads)?;
-        self.process(transactions)
+        let pinned = self.intake(reads, transactions)?;
+        match self.process(transactions)? {
+            ProcessOutcome::Idle if pinned => Ok(ProcessOutcome::Progressed),
+            outcome => Ok(outcome),
+        }
     }
 
     pub(crate) fn process(
@@ -52,16 +55,25 @@ impl Station {
         let input = if let Some(cached) = self.inputs.cache.as_ref() {
             let input = cached.input;
             let offset = cached.offset;
-            let next_offset = offset
-                .checked_add(1)
-                .expect("an AppendLog entry offset always has a successor");
-            let next_input = if input + 1 == self.inputs.logs.len() {
-                0
-            } else {
-                input + 1
-            };
+            let state = self.state.access(access)?;
+            let encoded = state
+                .get(&ACTIVE_INPUT_KEY.to_vec())?
+                .ok_or(StationError::MissingActiveInput)?;
+            let active = super::input::decode_active_input(&encoded)
+                .ok_or(StationError::MalformedActiveInput)?;
+            if active >= self.inputs.logs.len() {
+                return Err(StationError::ActiveInputOutOfRange {
+                    input: active,
+                    input_count: self.inputs.logs.len(),
+                });
+            }
+            if active != input {
+                return Err(StationError::CachedActiveInputMismatch {
+                    cached: input,
+                    durable: active,
+                });
+            }
 
-            let mut state = self.state.access(access)?;
             let key = cursor_key(input);
             let encoded = state
                 .get(&key)?
@@ -75,12 +87,6 @@ impl Station {
                 });
             }
 
-            state.put(&key, &encode_cursor(next_offset).to_vec())?;
-            state.put(
-                &ACTIVE_INPUT_KEY.to_vec(),
-                &encode_active_input(next_input).to_vec(),
-            )?;
-
             Some(OperationInput {
                 port: input,
                 change: &cached.change,
@@ -89,11 +95,49 @@ impl Station {
             None
         };
 
-        let emitted = self.operation.turn(input, access)?;
-        append_output(self.output.as_ref(), emitted, access)?;
+        let decision = self.operation.turn(input, access)?;
+        let TurnDecision::Commit(commit) = decision else {
+            return Ok(ProcessOutcome::Idle);
+        };
+        let offered_input = self.inputs.cache.is_some();
+        if offered_input != commit.input.is_some() {
+            return Err(StationError::OperationInputProgressMismatch {
+                offered_input,
+                returned_input: commit.input.is_some(),
+            });
+        }
+
+        append_output(self.output.as_ref(), commit.output, access)?;
+        if let Some(InputProgress::Complete) = commit.input {
+            let cached = self
+                .inputs
+                .cache
+                .as_ref()
+                .expect("input progress shape was validated");
+            let next_offset = cached
+                .offset
+                .checked_add(1)
+                .expect("an AppendLog entry offset always has a successor");
+            let next_input = if cached.input + 1 == self.inputs.logs.len() {
+                0
+            } else {
+                cached.input + 1
+            };
+            let mut state = self.state.access(access)?;
+            state.put(
+                &cursor_key(cached.input),
+                &encode_cursor(next_offset).to_vec(),
+            )?;
+            state.put(
+                &ACTIVE_INPUT_KEY.to_vec(),
+                &encode_active_input(next_input).to_vec(),
+            )?;
+        }
         transaction.commit()?;
 
-        self.inputs.cache = None;
+        if matches!(commit.input, Some(InputProgress::Complete)) {
+            self.inputs.cache = None;
+        }
         Ok(ProcessOutcome::Progressed)
     }
 }

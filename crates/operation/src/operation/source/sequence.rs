@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, OperationError, OperationInput},
+    operation::{Operation, OperationError, OperationInput, TurnCommit, TurnDecision},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -117,7 +117,7 @@ impl Operation for SequenceSourceOperation {
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
+    ) -> Result<TurnDecision, OperationError> {
         if input.is_some() {
             return Err(SequenceSourceError::UnexpectedInput.into());
         }
@@ -132,7 +132,10 @@ impl Operation for SequenceSourceOperation {
         let output = uint64_change(vec![next])?;
 
         position.set(&next)?;
-        Ok(Some(output))
+        Ok(TurnDecision::Commit(TurnCommit {
+            input: None,
+            output: Some(output),
+        }))
     }
 }
 

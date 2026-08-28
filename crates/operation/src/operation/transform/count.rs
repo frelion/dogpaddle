@@ -9,7 +9,9 @@ use thiserror::Error;
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, OperationError, OperationInput},
+    operation::{
+        InputProgress, Operation, OperationError, OperationInput, TurnCommit, TurnDecision,
+    },
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -117,7 +119,7 @@ impl Operation for CountOperation {
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
+    ) -> Result<TurnDecision, OperationError> {
         let input = input.ok_or(CountError::MissingInput)?;
         if input.port != 0 {
             return Err(CountError::InvalidInputPort { port: input.port }.into());
@@ -134,7 +136,10 @@ impl Operation for CountOperation {
         let output = uint64_change(values)?;
 
         count.set(&final_count)?;
-        Ok(Some(output))
+        Ok(TurnDecision::Commit(TurnCommit {
+            input: Some(InputProgress::Complete),
+            output: Some(output),
+        }))
     }
 }
 

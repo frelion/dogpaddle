@@ -37,6 +37,17 @@ pub(crate) enum StationError {
         cached: u64,
         durable: u64,
     },
+    #[error(
+        "cached station input port {cached} does not match durable active input port {durable}"
+    )]
+    CachedActiveInputMismatch { cached: usize, durable: usize },
+    #[error(
+        "operation input progress shape does not match its invocation: offered input {offered_input}, returned progress {returned_input}"
+    )]
+    OperationInputProgressMismatch {
+        offered_input: bool,
+        returned_input: bool,
+    },
     #[error("operation produced output for a Station without an output stream")]
     UnexpectedOutput,
     #[error("operation produced a Change that cannot be encoded: {source}")]

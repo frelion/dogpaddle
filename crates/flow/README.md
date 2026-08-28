@@ -62,9 +62,9 @@ fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
 显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
 克隆但可安全共享，并且只能开启 RO snapshot。Station 不长期保存任何事务启动能力：内部
-`Station::intake` 只在调用期间借用 `ReadTransactions`，`Station::process` 将只在调用期间借用
-`&mut Transactions`；后者无法消费 writer 来 split 出 owned reader。拓扑和资源目录都没有运行期
-修改入口。
+输入准备只在调用期间借用 `ReadTransactions`，并在需要把选中端口固定为 active input 时临时借用
+`&mut Transactions`；`Station::process` 同样只在调用期间借用 writer。后者无法消费 writer 来
+split 出 owned reader。拓扑和资源目录都没有运行期修改入口。
 
 资源创建和 Station 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
 output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
@@ -74,34 +74,50 @@ GC。Station 不知道上下游 Station ID，只拥有自己的有序 input logs
 cache、state、完整可选 output 以及 output consumer cursor capabilities。
 装配同时从已验证的 Definition 派生运行期 schedule：先按拓扑层次排列，同一层按 Station 声明
 顺序排列，并为每个 target 保留按上游 Station 去重的 GC 触发列表。二者完全由 Definition 推导，
-build/open 得到相同结果，不需要单独持久化。`intake` 在 Station 唯一 cache 为空时，通过一个 RO
-snapshot 从 durable active input 开始循环检查各端口，跳过空日志，并只装入第一个可用 entry。
-cache 显式保存该 entry 的 input index、AppendLog offset 和完整 owned Change；命中时不访问 Store。
-intake 不修改 active input 或 cursor，也不调用 Operation。当前 `process` 成功一次即完整处理并退休
-该 cache；重开 Flow 时 cache 为空，并根据 durable active input 与对应 cursor 重新读取。没有 output
-的 Sink 使用 `None`，不能被其他 Station 作为 source。
+build/open 得到相同结果，不需要单独持久化。输入准备在 Station 唯一 cache 为空时，通过一个 RO
+snapshot 从 durable active input 开始循环检查各端口，跳过空日志，并只选择第一个可用 entry。
+选中端口若不是当前 active input，Station 在调用 Operation 前用一个独立的短写事务把它固定为
+active input，cursor 保持不变；已有的 `active input + cursor` 因而就是 durable input claim，不增加
+另一套 current-input key。随后 cache 保存该 entry 的 input index、AppendLog offset 和完整 owned
+Change；cache 只是 durable claim 的内存副本，命中时不访问 Store。重开 Flow 时 cache 为空，并
+根据 active input 与对应 cursor 重建同一输入。零输入 Source 不经过 input claim，但仍由相同的
+Station `process` 调用 `turn(None, ...)`，没有 Source 专用 outcome 或事务路径。没有 output 的 Sink
+使用 `None`，不能被其他 Station 作为 source。
 
 `process(&mut Transactions)` 为每次 Operation 调用开始并持有唯一写事务。有输入 Operation 每次只
 接收端口、一个完整 `Change` 和不能提交的 `TransactionAccess`，不会看到 `AppendLog` offset、
-cursor 或 Station 运行元数据。成功返回表示该 Change 已完整处理，并可携带至多一个 owned output
-Change。Station 在调用前要求 cache offset 仍等于该端口的 durable cursor，然后把 Operation 状态、
-output、cursor 推进和 active 轮转原子提交，commit 成功后才清 cache。任何 Operation、编码、
-append、Station state 或 commit 错误都会回滚并保留 cache。
+cursor 或 Station 运行元数据；Source 在同一入口收到 `None`。Station 在调用前要求 cache 的 port
+等于 durable active input，且 cache offset 仍等于该端口的 durable cursor。
+
+Operation 返回的 `TurnDecision` 把“是否提交”与“输入是否完成”分开：`Idle` 丢弃本次事务，因而
+不发布 output、不保存 Operation 写入，也不改变当前输入；`Commit` 的 `input` 与可选 `output`
+正交。零输入调用必须返回 `input: None`，有输入调用必须返回 `Some(Keep)` 或
+`Some(Complete)`，形状不匹配是协议错误。`Keep` 在同一事务中提交 Operation continuation 与可选
+output，但不推进 cursor、不轮转 active input，也不清 cache；`Complete` 才原子提交 Operation 状态、
+可选 output、cursor 推进和 active input 轮转，并在 commit 成功后清 cache。任何 Operation、编码、
+append、Station state 或 commit 错误都会回滚本次事务并保留 durable claim 和 cache。
+
+只要当前输入尚未 `Complete`，无论前一 turn 是 `Idle`、`Keep`、错误、output append 失败、commit
+失败还是进程重开，下一次调用都必须收到同一 `(port, offset, bytes)` 所标识的完整 Change；这要求
+同一日志 entry 的原始字节不变，不要求重新解码后拥有相同内存地址。Change 内部的处理位置属于
+Operation continuation，必须存入该 Operation 通过 Definition 声明的 Store 状态；Station 只拥有
+durable active input、各 input cursor 和可丢弃重建的 owned cache。
 
 每条边的 cursor 只定位一个完整 Change IPC entry；它是当前持久化分批下的读取位置，而不是稳定
-event ID。未来 Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的事件序列必须
-逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；active input 只规定从
-哪个端口开始循环寻找下一个可用物理 Change，不声称还原跨上游事件发生时间。一个 Change 完全
-处理成功后 cursor 才推进到下一个 offset。按完整物理 Change 轮转可能改变跨端口交错，因此多输入
-Operation 必须对稳定重批保持可观察结果
-不变；需要业务级跨端口顺序时，必须另行引入逻辑 ingress、barrier 或窗口语义。
+event ID。Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的输入事件序列必须
+逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；active input 既是未完成
+输入的 durable port，又在没有未完成输入时规定从哪个端口开始循环寻找下一个可用物理 Change，
+不声称还原跨上游事件发生时间。只有 `Complete` 才把 cursor 推进到下一个 offset。Operation 的
+展平 output 事件序列和最终业务状态必须同时对稳定重批及同一 Change 的 `Keep` turn 切分保持不变；
+需要业务级跨端口顺序时，必须另行引入逻辑 ingress、barrier 或窗口语义。
 
 每个 Station turn 只要成功返回，无论结果是 `Idle` 还是 `Progressed`，Flow 都会按去重后的直接
 上游列表各触发一次 GC。上游 Station 在独立写事务中读取自己全部 consumer edge 的 durable
 cursor，校验它们位于 output 的 `[head, tail]`，以最小 cursor 为安全水位，并调用一次
 `truncate_before`，单次最多删除 1024 个 entry。重复 source edge 在触发列表中只调用一次，但每条
 edge 的 cursor 都参与最小值；GC 失败以实际执行 GC 的上游 Station ID 返回。Operation 与 cursor
-成功提交后，后续 GC 才允许回收对应 Change。
+以 `Complete` 成功提交后，后续 GC 才允许回收对应 Change；`Keep` 即使已经发布 output，也因
+cursor 不动而继续保护当前 entry。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
 `IncompleteBuild`；
@@ -155,12 +171,14 @@ cursor 和唯一 cache 的 `intake`，`station/gc.rs` 保存 consumer cursor cap
 
 本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Station 的
 state、只读 inputs、可选 output、稳定 active input/cursor 和可重建的确定性拓扑 schedule。
-`intake` 已能通过 RO snapshot 从 active input 循环查找并幂等准备至多一个带来源身份的 Change；
-`process` 已通过同一写事务原子协调 Operation 状态、output、active 与 cursor，
+输入准备已能通过 RO snapshot 从 active input 循环查找、durable pin 并幂等准备至多一个带来源
+身份的 Change；`process` 已支持 `Idle`、`Commit(Keep)` 和 `Commit(Complete)`，在同一写事务中
+按 decision 原子协调 Operation continuation、output、active 与 cursor，
 成功 turn 后的直接上游 GC 调度位置和有界回收内核也已经固定。Flow 已公开有界的
 `Flow::advance`，真实 `SequenceSource → Count` DAG 可以按拓扑逐轮推进并在 reopen 后续跑。
-尚未实现单个 Change 跨 turn 的 continuation、`Flow::start`、背压、中断控制、端口 Schema 静态
-约束或外部副作用协议。
+尚未实现 `Flow::start`、背压、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
+当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
+continuation。
 
 ## 验证
 

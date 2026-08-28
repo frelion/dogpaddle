@@ -19,6 +19,9 @@ impl Flow {
     /// round, while an unbounded source cannot monopolize the call. After every
     /// successful turn, each distinct direct upstream receives one bounded GC
     /// attempt, independently of whether the turn was idle or progressed.
+    /// Selecting a non-active input durably pins that port before its Operation
+    /// turn. That pin counts as progress even if the Operation is idle; a later
+    /// turn with the already-pinned input can then report idle normally.
     ///
     /// # Errors
     ///

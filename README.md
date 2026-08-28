@@ -31,21 +31,24 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Station 不长期持有
   事务启动能力；每个有输入的 Station 持久化一个 active input 和每条边的 Change offset，
-  `intake` 经真正的只读 snapshot 从 active input 开始循环寻找第一个可用 entry，并只缓存其
-  `input + offset + Change`。cache 命中不再访问 Store；`process` 临时接收
-  `&mut Transactions`，在调用 Operation 前校验 cache offset 仍等于 durable cursor，再把输入端口、
-  完整 `Change` 和不能提交的 `TransactionAccess` 交给 Operation。
+  输入准备经真正的只读 snapshot 从 active input 开始循环寻找第一个可用 entry，并在调用
+  Operation 前 durable-pin 选中端口；已有的 `active + cursor` 就是 input claim，不新增另一套 key。
+  owned cache 保存 `input + offset + Change`，命中不再访问 Store；`process` 临时接收
+  `&mut Transactions`，校验 cache port/offset 仍等于 durable active/cursor，再把输入端口、完整
+  `Change` 和不能提交的 `TransactionAccess` 交给 Operation。
 - **类型化事务状态**：Store 提供 `Cell<T>` 与显式 `Small`/`Large` 布局的
   `OrderedMap<K, V, SIZE>`；collection handle 与事务能力分别控制长期写权限和本次访问权限，
   真正的只读事务在类型层没有写入或提交入口。有界 map scan 可完整解码，也可只投影编码中的
   所需字段。
 - **差分流存储基础**：Store 提供固定独立布局的 `AppendLog<T>`，具有单调 offset、按需
   投影解码、同事务原样转发和有界前缀回收；Flow 已完成 Station output 与只读 input 的资源
-  装配及只读 intake，并从 Definition 派生确定性的分层拓扑 schedule。内部有界轮次已经按该
+  装配及 input 准备，并从 Definition 派生确定性的分层拓扑 schedule。内部有界轮次已经按该
   schedule 为每个 Station 保留一次 turn，并在每个成功 turn 后为其直接上游各触发一次有界前缀
   GC；安全水位取 output 全部 consumer edge cursor 的最小值。该轮次通过 `Flow::advance` 暴露。
-  Operation 的业务状态、本 turn output、Station active/cursor 在同一写事务提交；Operation 成功
-  即表示完整 Change 已处理，cursor/active 随 commit 生效，commit 成功后 Station 才清空 cache。
+  Source 与其他 Operation 使用同一个 `turn` 协议，只以 `None` 区分无输入。`Idle` 回滚 turn；
+  `Commit` 的 input 进展与 output 正交：`Keep` 提交 Operation continuation/output，但保留
+  active/cursor/cache 并在下一 turn 重放相同完整 Change，`Complete` 才推进 cursor、轮转 active，
+  且只在 commit 成功后清 cache。
 
 ## 内部架构
 
@@ -71,12 +74,13 @@ DogPaddle 适合嵌入式数据管道、可恢复的本地事件处理，以及�
 
 当前仓库完成了 `FlowFactory` 的持久化定义、构建和重新打开，以及运行态 Flow 的 Station
 output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `AppendLog<Vec<u8>>`
-持久化验证。Station 通过只读 `intake` 幂等准备一个完整 input entry，再通过写事务让 Operation
-完整处理该 Change，并原子提交 Operation 状态、output、active 和 cursor。`Flow::advance` 已能按
-稳定拓扑 schedule 执行真实的
+持久化验证。Station 幂等 claim 并准备一个完整 input entry，再通过写事务执行 Operation 的
+`Idle`/`Commit(Keep)`/`Commit(Complete)` decision。只要尚未 `Complete`，下一 turn（包括 reopen
+之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
+自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
 `SequenceSource → Count` 轮次，并在成功 turn 后进行安全的上游有界 GC。尚未实现持续运行的
-`Flow::start`、跨 turn 的单 Change continuation、背压、中断控制、端口 Schema 静态约束或外部
-Sink 的幂等协议。
+`Flow::start`、背压、中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。Operation 的展平
+output 事件序列与最终业务状态必须同时不受稳定重批和 `Keep` turn 切分影响。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

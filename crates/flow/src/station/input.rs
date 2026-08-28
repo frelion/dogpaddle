@@ -1,5 +1,5 @@
 use dogpaddle_change::{Change, decode_change};
-use dogpaddle_store::{AppendLog, ReadOnly, ReadTransactions, ScanLimit};
+use dogpaddle_store::{AppendLog, ReadOnly, ReadTransactions, ScanLimit, Transactions};
 
 use super::{protocol::StationError, runtime::Station};
 
@@ -10,6 +10,12 @@ pub(super) struct InputChange {
     pub(super) input: usize,
     pub(super) offset: u64,
     pub(super) change: Change,
+}
+
+struct EncodedInputChange {
+    input: usize,
+    offset: u64,
+    encoded: Vec<u8>,
 }
 
 pub(super) struct Inputs {
@@ -28,63 +34,90 @@ impl Station {
     ///
     /// A populated cache is already a complete owned entry, so repeated calls
     /// do not access the Store. On a miss, inputs are searched cyclically from
-    /// the durable active input until one complete Change is loaded. The cache
+    /// the durable active input until one complete entry is selected. When the
+    /// selected port differs from the active port, a separate write transaction
+    /// durably pins that port before the entry is decoded and cached. The cache
     /// retains only that entry's input and offset identity alongside the owned
-    /// Change. This phase does not modify durable state or interpret progress
-    /// within the Change.
-    pub(crate) fn intake(&mut self, reads: &ReadTransactions) -> Result<(), StationError> {
+    /// Change. This phase does not advance a cursor or interpret progress within
+    /// the Change.
+    pub(crate) fn intake(
+        &mut self,
+        reads: &ReadTransactions,
+        transactions: &mut Transactions,
+    ) -> Result<bool, StationError> {
         if self.inputs.cache.is_some() || self.inputs.logs.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
-        let transaction = reads.begin()?;
-        let state = self.state.read(transaction.access())?;
-        let encoded = state
-            .get(&ACTIVE_INPUT_KEY.to_vec())?
-            .ok_or(StationError::MissingActiveInput)?;
-        let active = decode_active_input(&encoded).ok_or(StationError::MalformedActiveInput)?;
-        if active >= self.inputs.logs.len() {
-            return Err(StationError::ActiveInputOutOfRange {
-                input: active,
-                input_count: self.inputs.logs.len(),
-            });
-        }
-
-        for index in (active..self.inputs.logs.len()).chain(0..active) {
-            let key = cursor_key(index);
+        let (active, selected) = {
+            let transaction = reads.begin()?;
+            let state = self.state.read(transaction.access())?;
             let encoded = state
-                .get(&key)?
-                .ok_or(StationError::MissingCursor { input: index })?;
-            let offset =
-                decode_cursor(&encoded).ok_or(StationError::MalformedCursor { input: index })?;
-
-            let input_log = self.inputs.logs[index].read(transaction.access())?;
-            let mut loaded = None;
-            input_log.scan(
-                offset,
-                ScanLimit::new(1, usize::MAX)?,
-                |entry| -> Result<(), StationError> {
-                    let encoded = entry.decode_owned()?;
-                    let change = decode_change(&encoded).map_err(|source| {
-                        StationError::InvalidInputChange {
-                            input: index,
-                            source,
-                        }
-                    })?;
-                    loaded = Some(InputChange {
-                        input: index,
-                        offset: entry.offset(),
-                        change,
-                    });
-                    Ok(())
-                },
-            )?;
-            if let Some(change) = loaded {
-                self.inputs.cache = Some(change);
-                return Ok(());
+                .get(&ACTIVE_INPUT_KEY.to_vec())?
+                .ok_or(StationError::MissingActiveInput)?;
+            let active = decode_active_input(&encoded).ok_or(StationError::MalformedActiveInput)?;
+            if active >= self.inputs.logs.len() {
+                return Err(StationError::ActiveInputOutOfRange {
+                    input: active,
+                    input_count: self.inputs.logs.len(),
+                });
             }
+
+            let mut selected = None;
+            for index in (active..self.inputs.logs.len()).chain(0..active) {
+                let key = cursor_key(index);
+                let encoded = state
+                    .get(&key)?
+                    .ok_or(StationError::MissingCursor { input: index })?;
+                let offset = decode_cursor(&encoded)
+                    .ok_or(StationError::MalformedCursor { input: index })?;
+
+                let input_log = self.inputs.logs[index].read(transaction.access())?;
+                input_log.scan(
+                    offset,
+                    ScanLimit::new(1, usize::MAX)?,
+                    |entry| -> Result<(), StationError> {
+                        selected = Some(EncodedInputChange {
+                            input: index,
+                            offset: entry.offset(),
+                            encoded: entry.decode_owned()?,
+                        });
+                        Ok(())
+                    },
+                )?;
+                if selected.is_some() {
+                    break;
+                }
+            }
+            (active, selected)
+        };
+
+        let Some(selected) = selected else {
+            return Ok(false);
+        };
+
+        let pinned = selected.input != active;
+        if pinned {
+            let transaction = transactions.begin()?;
+            self.state.access(transaction.access())?.put(
+                &ACTIVE_INPUT_KEY.to_vec(),
+                &encode_active_input(selected.input).to_vec(),
+            )?;
+            transaction.commit()?;
         }
-        Ok(())
+
+        let change = decode_change(&selected.encoded).map_err(|source| {
+            StationError::InvalidInputChange {
+                input: selected.input,
+                source,
+            }
+        })?;
+        self.inputs.cache = Some(InputChange {
+            input: selected.input,
+            offset: selected.offset,
+            change,
+        });
+        Ok(pinned)
     }
 }
 
