@@ -121,20 +121,20 @@ impl FlowFactory {
         {
             let transaction = transactions.begin()?;
             for station in &station_parts {
-                station.initialize_cursors(transaction.access())?;
+                station.initialize_input_state(transaction.access())?;
             }
             let mut published = published.access(transaction.access())?;
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
-        let (stations, schedule) = assemble_stations(&definition, station_parts);
+        let (stations, topology) = assemble_stations(&definition, station_parts);
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
             stations,
-            schedule,
+            topology,
             transactions,
             reads,
         ))

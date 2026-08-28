@@ -1,16 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dogpaddle_store::ReadOnly;
 
 use crate::{
     build::FlowDefinition,
-    station::{Station, StationParts},
+    flow::RuntimeTopology,
+    station::{ConsumerCursor, Station, StationParts},
 };
 
 pub(crate) fn assemble_stations(
     definition: &FlowDefinition,
     parts: Vec<StationParts>,
-) -> (Vec<Station>, Vec<usize>) {
+) -> (Vec<Station>, RuntimeTopology) {
     let indices = definition
         .stations()
         .iter()
@@ -41,14 +42,43 @@ pub(crate) fn assemble_stations(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut consumers = std::iter::repeat_with(Vec::new)
+        .take(parts.len())
+        .collect::<Vec<_>>();
+    for (target, sources) in sources_by_target.iter().enumerate() {
+        for (input, source) in sources.iter().copied().enumerate() {
+            consumers[source].push(ConsumerCursor::new(
+                ReadOnly::new(parts[target].state().clone()),
+                input,
+            ));
+        }
+    }
 
     let stations = parts
         .into_iter()
         .zip(inputs)
-        .map(|(part, inputs)| part.finish(inputs))
+        .zip(consumers)
+        .map(|((part, inputs), consumers)| part.finish(inputs, consumers))
         .collect();
     let schedule = topological_schedule(&sources_by_target);
-    (stations, schedule)
+    let gc_upstreams = sources_by_target
+        .iter()
+        .map(|sources| {
+            let mut seen = HashSet::new();
+            sources
+                .iter()
+                .copied()
+                .filter(|source| seen.insert(*source))
+                .collect()
+        })
+        .collect();
+    (
+        stations,
+        RuntimeTopology {
+            schedule,
+            gc_upstreams,
+        },
+    )
 }
 
 fn topological_schedule(sources_by_target: &[Vec<usize>]) -> Vec<usize> {

@@ -7,20 +7,25 @@ use crate::{
     station::Station,
 };
 
+pub(crate) struct RuntimeTopology {
+    pub(crate) schedule: Vec<usize>,
+    pub(crate) gc_upstreams: Vec<Vec<usize>>,
+}
+
 /// The runtime handle for a built or reopened persistent Flow.
 ///
 /// A Flow owns separate Store capabilities for beginning read-only and write
 /// transactions. During scheduling it lends the read capability to Station
-/// intake and the write capability to one Station's process phase. A Station
-/// cannot retain either transaction-start capability across calls. The
-/// definition and data object set were frozen by a successful build.
+/// intake and the write capability to one Station's process or GC phase. A
+/// Station cannot retain either transaction-start capability across calls.
+/// The definition and data object set were frozen by a successful build.
 pub struct Flow {
     path: PathBuf,
     pub(super) definition: FlowDefinition,
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved durable Flow state"))]
     pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     pub(super) stations: Vec<Station>,
-    pub(super) schedule: Vec<usize>,
+    pub(super) topology: RuntimeTopology,
     pub(super) transactions: Transactions,
     pub(super) reads: ReadTransactions,
 }
@@ -31,7 +36,7 @@ impl Flow {
         definition: FlowDefinition,
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         stations: Vec<Station>,
-        schedule: Vec<usize>,
+        topology: RuntimeTopology,
         transactions: Transactions,
         reads: ReadTransactions,
     ) -> Self {
@@ -40,7 +45,7 @@ impl Flow {
             definition,
             state,
             stations,
-            schedule,
+            topology,
             transactions,
             reads,
         }

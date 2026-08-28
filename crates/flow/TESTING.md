@@ -3,7 +3,8 @@
 本文件规定 `dogpaddle-flow` 的测试所有权、持久化兼容性验证和 `build/open` 生命周期基准。
 dogpaddle-flow 是 Operation 与 Store 的产品组合根，因此真实资源创建、Operation 物化和重新
 打开测试属于本 crate；它们不需要再放入 `integration-tests/flow-store`。当前已有 Station output
-log、只读 input capability、确定性拓扑 schedule 和公共有界轮次骨架，但尚无公共
+log、只读 input capability、唯一 owned Change cache、确定性拓扑 schedule、上游有界 GC 和公共
+有界轮次骨架，但尚无公共
 `Flow::start`、Change 处理或可观察 Sink；`Flow::advance` 已公开，但会明确到达
 `Station::process` 的 `todo!()`。因此本协议锁定其有界轮次签名和这个显式处理边界，不伪造端到端
 运行测试，也不建立空的 `integration-tests/engine` package。
@@ -18,7 +19,8 @@ crates/flow/
 ├── src/flow/advance.rs                # 单轮调度协议与 Flow::advance
 ├── src/flow/tests.rs                  # 私有运行态 Flow 所有权、schedule 与生命周期测试
 ├── src/station/runtime.rs             # Station 装配与 process 边界
-├── src/station/input.rs               # durable cursor、owned cache 与 intake
+├── src/station/input.rs               # durable active/cursor、owned cache 与 intake
+├── src/station/gc.rs                  # consumer cursor capability 与有界 output GC
 ├── src/station/protocol.rs            # Station outcome 与错误
 ├── src/station/tests.rs               # 私有 Station/Operation/数据 capability 装配测试
 ├── tests/correctness.rs               # 唯一公共正确性 target
@@ -59,14 +61,18 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   Station output 和内建 Operation data 使用稳定名称与精确类型；terminal producer 仍有 output；
   未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
 - **运行期装配**：分离的读写事务启动 capability 归 Flow 长期持有，Station 只保存自己的 state、完整
-  可选 output、只读 inputs 及每个 input 至多一个 owned Change cache，不长期持有事务启动能力。
+  可选 output、有序只读 input logs、唯一 owned input-Change cache 及 output consumer cursor 的只读
+  capability，不长期持有事务启动能力。
   私有测试从 Flow 一侧临时开始事务并验证同一 `TransactionAccess` 可以访问 Station output，而
   下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在 target 之后声明，build
   和 reopen 仍按 source ID 正确注入；二者派生相同的分层拓扑 schedule，同层保持声明顺序，且
-  公共有界轮次的方法签名保持固定。build 在发布 Definition 的同一事务中用稳定 key
-  与 8 字节 value 初始化每个 input cursor。私有测试验证 `Station::intake` 经独立 RO snapshot 加载一个完整
-  owned Change、cache hit 完全不访问 Store、cursor 推进并释放 cache 后可加载后继，以及缺失或
-  非 8 字节 cursor 与非法 Change 被拒绝；
+  公共有界轮次的方法签名保持固定。build 在发布 Definition 的同一事务中，用稳定 key 和 4 字节
+  value 初始化 active input，用稳定 port key 和 8 字节 value 初始化每个 cursor。私有测试验证
+  `Station::intake` 经独立 RO snapshot 从 active input 循环查找、跳过空端口、只缓存第一个可用
+  entry 的 input/offset/Change，cache hit 完全不访问 Store；缺失、错误长度或越界 active input，
+  缺失或非 8 字节 cursor，以及非法 Change 均被拒绝。上游 GC 取全部 consumer edge cursor 的最小值
+  并且单次至多删除 1024 个 entry。`Flow::advance` 已固定每个成功 turn 后触发全部不同的直接上游，
+  但在 `process` 仍为 `todo!()` 时不伪造成功路径；
   `Station::process(&mut Transactions) -> Result<ProcessOutcome, StationError>` 仍为明确 `todo!()`，
   Operation 统一执行协议尚未定义，测试不伪造提交行为。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
@@ -96,7 +102,7 @@ fresh build 的每个预热和样本使用独立 Store 路径。warm reopen 使�
 采样前完成 preflight 和显式预热，因此它是 warm committed reopen，不是 cold filesystem cache。
 两种场景都使用 Store 固定的 durable MDBX sync。输出只报告每次生命周期操作的 ns，以及
 `station_count`；没有输入记录，因而不报告 rows/s、changes/s 或虚构的引擎吞吐。本阶段也不做
-Flow endurance，长期日志空间和 GC 属于已存在的 Store/Change+Store 协议。
+Flow endurance；当前只锁定有界 GC 的正确性，不把它冒充完整运行吞吐。
 
 默认配置：
 

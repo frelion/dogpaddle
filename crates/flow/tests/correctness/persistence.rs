@@ -63,7 +63,7 @@ fn build_uses_the_stable_resource_layout() {
 }
 
 #[test]
-fn build_initializes_each_input_cursor_at_the_stable_origin() {
+fn build_initializes_input_state_at_the_stable_origins() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
@@ -79,13 +79,22 @@ fn build_initializes_each_input_cursor_at_the_stable_origin() {
         store.open_data("station/00000001/state").unwrap();
     let (_, reads) = store.into_transactions().split();
     let transaction = reads.begin().unwrap();
-    let key = b"input/00000000/cursor".to_vec();
+    let active_key = b"input/active".to_vec();
+    let cursor_key = b"input/00000000/cursor".to_vec();
 
     assert_eq!(
         source_state
             .read(transaction.access())
             .unwrap()
-            .get(&key)
+            .get(&active_key)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        source_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&cursor_key)
             .unwrap(),
         None
     );
@@ -93,7 +102,15 @@ fn build_initializes_each_input_cursor_at_the_stable_origin() {
         count_state
             .read(transaction.access())
             .unwrap()
-            .get(&key)
+            .get(&active_key)
+            .unwrap(),
+        Some(vec![0; 4])
+    );
+    assert_eq!(
+        count_state
+            .read(transaction.access())
+            .unwrap()
+            .get(&cursor_key)
             .unwrap(),
         Some(vec![0; 8])
     );

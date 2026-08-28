@@ -38,7 +38,7 @@ pub enum FlowError {
     },
 }
 
-/// Failure while advancing one Station in a running Flow.
+/// Failure during one Station turn or its post-turn upstream GC.
 #[derive(Debug, Error)]
 #[error("station {station_id:?} failed: {source}")]
 pub struct FlowRunError {
@@ -55,7 +55,7 @@ impl FlowRunError {
         }
     }
 
-    /// Returns the stable ID of the Station whose turn failed.
+    /// Returns the stable ID of the Station whose turn or GC attempt failed.
     #[must_use]
     pub fn station_id(&self) -> &str {
         &self.station_id

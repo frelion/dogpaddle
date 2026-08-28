@@ -18,11 +18,19 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     builder.connect([second_source], second_target);
 
     let flow = builder.build().unwrap();
-    assert_eq!(flow.schedule, [2, 3, 0, 1]);
+    assert_eq!(flow.topology.schedule, [2, 3, 0, 1]);
+    assert_eq!(
+        flow.topology.gc_upstreams,
+        [vec![3], vec![2], vec![], vec![]]
+    );
     drop(flow);
 
     let reopened = FlowFactory::open(path).unwrap();
-    assert_eq!(reopened.schedule, [2, 3, 0, 1]);
+    assert_eq!(reopened.topology.schedule, [2, 3, 0, 1]);
+    assert_eq!(
+        reopened.topology.gc_upstreams,
+        [vec![3], vec![2], vec![], vec![]]
+    );
 }
 
 #[test]
