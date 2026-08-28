@@ -1,5 +1,5 @@
 //! Source operations that produce records without consuming upstream input.
 
-pub(crate) mod sequence_source;
+pub(crate) mod sequence;
 
-pub use sequence_source::{SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation};
+pub use sequence::{SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation};
