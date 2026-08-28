@@ -14,7 +14,7 @@ log、只读 input capability、唯一 owned Change cache、确定性拓扑 sche
 ```text
 crates/flow/
 ├── src/build/tests.rs                 # 私有 FlowFactory 构建、拓扑、Definition codec 与 CRC 测试
-├── src/open/tests.rs                  # 私有两阶段 reopen 与资源重新装配测试
+├── src/build/open.rs                  # FlowFactory 两阶段 reopen 与资源重新装配
 ├── src/flow/runtime.rs                # 运行态 Flow 数据与生命周期 API
 ├── src/flow/advance.rs                # 单轮调度协议与 Flow::advance
 ├── src/flow/tests.rs                  # 私有运行态 Flow 所有权、schedule 与生命周期测试

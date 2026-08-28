@@ -133,11 +133,11 @@ input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字�
 
 ## 源码边界
 
-`build/` 统一拥有 `FlowFactory` 的声明与构建路径、`StationRef`、Flow/Station Definition、无 Store
-副作用的图校验、稳定磁盘编码和完整资源名，并在构建时创建全部资源；拓扑只是 Flow Definition
-中的连接关系，不再拥有独立构建类型。`open/` 实现 `FlowFactory::open` 的两阶段读取、资源打开
-和重新物化。`build/` 与 `open/` 都按 Definition 声明的逻辑数据名通用创建或打开类型化实例，
-再让 Definition 物化具体 Operation；二者都不枚举具体算子。`flow/mod.rs` 只声明模块并导出
+`build/` 统一拥有 `FlowFactory` 的声明与 build/open 路径、`StationRef`、Flow/Station Definition、
+无 Store 副作用的图校验、稳定磁盘编码和完整资源名；构建路径创建全部资源，`build/open.rs`
+完成两阶段 Definition 读取、资源打开和重新物化。两条路径都按 Definition 声明的逻辑数据名
+通用创建或打开类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。拓扑只是
+Flow Definition 中的连接关系，不再拥有独立构建类型。`flow/mod.rs` 只声明模块并导出
 `Flow`，`flow/runtime.rs` 保存 build/open 返回的运行态对象、生命周期状态、全部 Station、派生的
 schedule 与分离的读写事务启动能力，不创建或打开 Store 资源。`flow/advance.rs` 定义公共
 outcome 并实现一次有界轮次：按 schedule 为每个 Station 至多提供一个 turn，先 `intake` 再进入

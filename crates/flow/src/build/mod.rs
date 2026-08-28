@@ -11,6 +11,7 @@ use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::
 
 pub(crate) mod codec;
 mod definition;
+mod open;
 mod validate;
 
 pub use codec::FlowDefinitionError;

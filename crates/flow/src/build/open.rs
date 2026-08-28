@@ -3,13 +3,9 @@ use std::path::Path;
 use dogpaddle_operation::{DataInstances, OperationDefinition};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
-use crate::{
-    assembly::assemble_stations,
-    build::{FlowFactory, codec},
-    error::FlowError,
-    flow::Flow,
-    station::StationParts,
-};
+use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
+
+use super::{FlowFactory, codec};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.

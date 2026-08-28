@@ -4,7 +4,6 @@ mod assembly;
 mod build;
 mod error;
 mod flow;
-mod open;
 mod station;
 
 pub use build::{
