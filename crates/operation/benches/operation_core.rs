@@ -122,11 +122,11 @@ fn main() {
 
     let mut records = MachineRecords::new();
     benchmark_definition_codec(&config, &mut records);
-    for &steps in &config.steps {
-        benchmark_count_body(&config, &root, steps, &mut records);
-        benchmark_sequence_body(&config, &root, steps, &mut records);
-        benchmark_count_durable(&config, &root, steps, &mut records);
-        benchmark_sequence_durable(&config, &root, steps, &mut records);
+    for &turns in &config.turns {
+        benchmark_count_body(&config, &root, turns, &mut records);
+        benchmark_sequence_body(&config, &root, turns, &mut records);
+        benchmark_count_durable(&config, &root, turns, &mut records);
+        benchmark_sequence_durable(&config, &root, turns, &mut records);
     }
     root.assert_samples_released();
     records.emit();
@@ -181,21 +181,21 @@ fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
 fn benchmark_count_body(
     config: &Config,
     root: &BenchRoot,
-    steps: usize,
+    turns: usize,
     records: &mut MachineRecords,
 ) {
-    let sample_store = root.sample(&format!("count-body-{steps}"));
+    let sample_store = root.sample(&format!("count-body-{turns}"));
     let mut fixture = CountFixture::create(sample_store.path());
-    measure_count_body(&mut fixture, steps, config.warmup_transactions);
+    measure_count_body(&mut fixture, turns, config.warmup_transactions);
     let durations = (0..config.samples)
-        .map(|_| measure_count_body(&mut fixture, steps, config.body_transactions))
+        .map(|_| measure_count_body(&mut fixture, turns, config.body_transactions))
         .collect();
     records.record(
         "count",
         "turn_rollback_body",
-        operation_count(steps, config.body_transactions),
+        operation_count(turns, config.body_transactions),
         config.body_transactions,
-        steps,
+        turns,
         durations,
     );
 }
@@ -203,21 +203,21 @@ fn benchmark_count_body(
 fn benchmark_sequence_body(
     config: &Config,
     root: &BenchRoot,
-    steps: usize,
+    turns: usize,
     records: &mut MachineRecords,
 ) {
-    let sample_store = root.sample(&format!("sequence-body-{steps}"));
+    let sample_store = root.sample(&format!("sequence-body-{turns}"));
     let mut fixture = SequenceFixture::create(sample_store.path());
-    measure_sequence_body(&mut fixture, steps, config.warmup_transactions);
+    measure_sequence_body(&mut fixture, turns, config.warmup_transactions);
     let durations = (0..config.samples)
-        .map(|_| measure_sequence_body(&mut fixture, steps, config.body_transactions))
+        .map(|_| measure_sequence_body(&mut fixture, turns, config.body_transactions))
         .collect();
     records.record(
         "sequence",
         "turn_rollback_body",
-        operation_count(steps, config.body_transactions),
+        operation_count(turns, config.body_transactions),
         config.body_transactions,
-        steps,
+        turns,
         durations,
     );
 }
@@ -225,27 +225,27 @@ fn benchmark_sequence_body(
 fn benchmark_count_durable(
     config: &Config,
     root: &BenchRoot,
-    steps: usize,
+    turns: usize,
     records: &mut MachineRecords,
 ) {
     {
-        let warmup_store = root.sample(&format!("count-durable-{steps}-warmup"));
+        let warmup_store = root.sample(&format!("count-durable-{turns}-warmup"));
         let mut warmup = CountFixture::create(warmup_store.path());
-        measure_count_durable(&mut warmup, steps, config.warmup_transactions);
+        measure_count_durable(&mut warmup, turns, config.warmup_transactions);
     }
     let durations = (0..config.samples)
         .map(|sample| {
-            let sample_store = root.sample(&format!("count-durable-{steps}-sample-{sample}"));
+            let sample_store = root.sample(&format!("count-durable-{turns}-sample-{sample}"));
             let mut fixture = CountFixture::create(sample_store.path());
-            measure_count_durable(&mut fixture, steps, config.durable_transactions)
+            measure_count_durable(&mut fixture, turns, config.durable_transactions)
         })
         .collect();
     records.record(
         "count",
         "turn_durable_transaction",
-        operation_count(steps, config.durable_transactions),
+        operation_count(turns, config.durable_transactions),
         config.durable_transactions,
-        steps,
+        turns,
         durations,
     );
 }
@@ -253,27 +253,27 @@ fn benchmark_count_durable(
 fn benchmark_sequence_durable(
     config: &Config,
     root: &BenchRoot,
-    steps: usize,
+    turns: usize,
     records: &mut MachineRecords,
 ) {
     {
-        let warmup_store = root.sample(&format!("sequence-durable-{steps}-warmup"));
+        let warmup_store = root.sample(&format!("sequence-durable-{turns}-warmup"));
         let mut warmup = SequenceFixture::create(warmup_store.path());
-        measure_sequence_durable(&mut warmup, steps, config.warmup_transactions);
+        measure_sequence_durable(&mut warmup, turns, config.warmup_transactions);
     }
     let durations = (0..config.samples)
         .map(|sample| {
-            let sample_store = root.sample(&format!("sequence-durable-{steps}-sample-{sample}"));
+            let sample_store = root.sample(&format!("sequence-durable-{turns}-sample-{sample}"));
             let mut fixture = SequenceFixture::create(sample_store.path());
-            measure_sequence_durable(&mut fixture, steps, config.durable_transactions)
+            measure_sequence_durable(&mut fixture, turns, config.durable_transactions)
         })
         .collect();
     records.record(
         "sequence",
         "turn_durable_transaction",
-        operation_count(steps, config.durable_transactions),
+        operation_count(turns, config.durable_transactions),
         config.durable_transactions,
-        steps,
+        turns,
         durations,
     );
 }
@@ -309,7 +309,7 @@ fn measure_decode(encoded: &[u8], operations: usize) -> Duration {
     elapsed
 }
 
-fn measure_count_body(fixture: &mut CountFixture, steps: usize, transactions: usize) -> Duration {
+fn measure_count_body(fixture: &mut CountFixture, turns: usize, transactions: usize) -> Duration {
     let mut total = Duration::ZERO;
     for _ in 0..transactions {
         let transaction = fixture
@@ -322,7 +322,7 @@ fn measure_count_body(fixture: &mut CountFixture, steps: usize, transactions: us
             change: &fixture.input,
         };
         let started = std::time::Instant::now();
-        for _ in 0..steps {
+        for _ in 0..turns {
             black_box(
                 fixture
                     .operation
@@ -340,7 +340,7 @@ fn measure_count_body(fixture: &mut CountFixture, steps: usize, transactions: us
 
 fn measure_sequence_body(
     fixture: &mut SequenceFixture,
-    steps: usize,
+    turns: usize,
     transactions: usize,
 ) -> Duration {
     let mut total = Duration::ZERO;
@@ -351,7 +351,7 @@ fn measure_sequence_body(
             .expect("begin Sequence rollback transaction");
         let access = transaction.access();
         let started = std::time::Instant::now();
-        for _ in 0..steps {
+        for _ in 0..turns {
             black_box(
                 fixture
                     .operation
@@ -369,10 +369,10 @@ fn measure_sequence_body(
 
 fn measure_count_durable(
     fixture: &mut CountFixture,
-    steps: usize,
+    turns: usize,
     transactions: usize,
 ) -> Duration {
-    let operations = operation_count(steps, transactions);
+    let operations = operation_count(turns, transactions);
     let started = std::time::Instant::now();
     for _ in 0..transactions {
         let transaction = fixture
@@ -384,7 +384,7 @@ fn measure_count_durable(
             port: 0,
             change: &fixture.input,
         };
-        for _ in 0..steps {
+        for _ in 0..turns {
             black_box(
                 fixture
                     .operation
@@ -409,10 +409,10 @@ fn measure_count_durable(
 
 fn measure_sequence_durable(
     fixture: &mut SequenceFixture,
-    steps: usize,
+    turns: usize,
     transactions: usize,
 ) -> Duration {
-    let operations = operation_count(steps, transactions);
+    let operations = operation_count(turns, transactions);
     let started = std::time::Instant::now();
     for _ in 0..transactions {
         let transaction = fixture
@@ -420,7 +420,7 @@ fn measure_sequence_durable(
             .begin()
             .expect("begin Sequence durable transaction");
         let access = transaction.access();
-        for _ in 0..steps {
+        for _ in 0..turns {
             black_box(
                 fixture
                     .operation
@@ -462,8 +462,8 @@ fn one_row_change() -> Change {
     Change::try_new(records, Int64Array::from(vec![1])).expect("build Count benchmark input Change")
 }
 
-fn operation_count(steps: usize, transactions: usize) -> usize {
-    steps
+fn operation_count(turns: usize, transactions: usize) -> usize {
+    turns
         .checked_mul(transactions)
         .expect("configured operation count fits usize")
 }

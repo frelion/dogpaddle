@@ -131,7 +131,8 @@ Operation 成功后才推进 offset，Operation 返回错误时调用方必须�
 ## 扩展约束
 
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
-模块中加入 Definition 和运行实例，实现两个 sealed trait，并声明唯一稳定 tag、逻辑资源名、
+模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
+`Operation`，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec 与物化逻辑；公共 decoder 表只增加一条
 `tag → decode function` 记录。运行实例直接保存所需 collection，不再为每个算子增加只包裹
 字段的 `OperationData` 类型。Flow 的 build/open 不应出现具体算子分支。
@@ -140,8 +141,9 @@ Operation 成功后才推进 offset，Operation 返回错误时调用方必须�
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
 分类内增加任意数量的算子都不会产生注册名称冲突。
 
-一个 Operation 的 tag、payload、`produces_output()`、逻辑数据名称、类型化 collection、codec
-和适用时的 `SIZE` 共同决定持久化资源 schema。Flow 根据声明创建实例，materialize 再按逻辑名
+一个 Operation 的 tag、payload、`input_count()` 及有序 port 语义、`produces_output()`、
+逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE` 共同决定持久化 schema。
+Flow 根据声明创建实例，materialize 再按逻辑名
 取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
 旧格式兼容层的前提下破坏性调整已有 tag 对应的 schema，但必须同步更新 decoder、黄金字节、
 资源布局和 reopen 测试。格式稳定后，这类变化才需要新 tag、新版本或明确迁移。编码 tag 与

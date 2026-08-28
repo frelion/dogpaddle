@@ -2,7 +2,7 @@
 
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
 `Flow` 只表示运行态，不承担声明、构建或打开职责。Station 是 crate 内部的一对一 Operation
-容器；它保存一个实现封闭 `Operation` trait 的运行实例，不再重复枚举具体算子，也不维护
+容器；它保存一个实现 `Operation` trait 的运行实例，不再重复枚举具体算子，也不维护
 额外的算子图。
 
 ## 构建 Flow

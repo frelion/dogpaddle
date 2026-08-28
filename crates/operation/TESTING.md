@@ -69,7 +69,7 @@ Definition codec 的 tag、payload 和完整字节是持久化兼容性边界。
 - 已开始事务内的 N 次单行 `turn`，计时只包含 Operation 调用，随后 rollback；
 - begin + N 次单行 `turn` + durable commit 的完整事务。
 
-默认 `steps/transaction` 为 1、64、1024，分别观察单步成本和事务摊销。codec fixture、Store 创建、
+默认 `turns/transaction` 为 1、64、1024，分别观察单 turn 成本和事务摊销。codec fixture、Store 创建、
 预热、期望值计算与状态校验均不计时；rollback body 与 durable workload 使用彼此独立的 Store，
 durable 预热及每个计入统计的样本也各自使用新 Store，避免页复用、缓存和状态历史串扰样本。
 每个 durable 预热或测量样本在计时后先完成状态校验，再立即 drop 其 `SampleStore`；
@@ -77,7 +77,7 @@ rollback body 的场景 Store 也在该场景验证完成后释放。runner 在�
 任何 sample 目录，不会把所有 Store 积累到整次 benchmark 结束。
 
 每个样本通过共享协议输出 typed JSONL，至少包含原始 `elapsed_ns`、operation 数、
-transaction 数和 steps/transaction；每个场景还输出协议统一的 min/median/max summary record。
+transaction 数和 turns/transaction；每个场景还输出协议统一的 min/median/max summary record。
 环境记录包含 rustc、OS/kernel、CPU、profile、git revision/state、文件系统和实际 Store 路径。
 stdout 同时包含便于本机阅读的摘要与 JSONL；机器收集器只读取首字符为 `{` 的行。
 environment、configuration、sample 和 summary 都由 typed record + validated `Fields` 构造，且带有
@@ -99,8 +99,8 @@ Operation benchmark 的每个 turn 固定处理或产生一行，因此 ns/opera
 | `DOGPADDLE_OPERATION_BENCH_CODEC_OPERATIONS` | 100000 | 每个 codec 样本的调用数 |
 | `DOGPADDLE_OPERATION_BENCH_BODY_TRANSACTIONS_PER_SAMPLE` | 512 | rollback body 样本聚合的事务数 |
 | `DOGPADDLE_OPERATION_BENCH_DURABLE_TRANSACTIONS_PER_SAMPLE` | 64 | durable 样本中的提交事务数 |
-| `DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS` | 4 | 每个 step workload 的未报告预热事务数 |
-| `DOGPADDLE_OPERATION_BENCH_STEPS_PER_TRANSACTION` | `1,64,1024` | 逗号分隔且不重复的事务内步数 |
+| `DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS` | 4 | 每个 turn workload 的未报告预热事务数 |
+| `DOGPADDLE_OPERATION_BENCH_TURNS_PER_TRANSACTION` | `1,64,1024` | 逗号分隔且不重复的事务内 turn 数 |
 
 正式对比必须设置 `DOGPADDLE_OPERATION_BENCH_PROFILE=reference`，并把
 `DOGPADDLE_OPERATION_BENCH_STORE_DIR` 显式指向固定文件系统上的绝对路径；目录不存在时 runner

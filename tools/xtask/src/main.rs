@@ -108,7 +108,7 @@ const BENCH_SMOKE: &[BenchSpec] = &[
                 "1",
             ),
             ("DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS", "1"),
-            ("DOGPADDLE_OPERATION_BENCH_STEPS_PER_TRANSACTION", "1"),
+            ("DOGPADDLE_OPERATION_BENCH_TURNS_PER_TRANSACTION", "1"),
         ],
     ),
     BenchSpec::new(

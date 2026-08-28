@@ -236,17 +236,16 @@ fn count_rejects_a_change_that_would_overflow_without_partial_progress() {
             error.downcast_ref::<CountError>(),
             Some(CountError::Overflow)
         ));
+        assert_eq!(
+            count_state
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(u64::MAX - 1)
+        );
+        transaction.commit().unwrap();
     }
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        count_state
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap(),
-        Some(u64::MAX - 1)
-    );
 }
 
 #[test]

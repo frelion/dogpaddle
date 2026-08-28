@@ -47,7 +47,7 @@ pub enum CountError {
         /// Rejected zero-based port index.
         port: usize,
     },
-    /// The durable count has reached [`u64::MAX`].
+    /// The durable count plus the input row count cannot be represented by [`u64`].
     #[error("count overflow")]
     Overflow,
 }

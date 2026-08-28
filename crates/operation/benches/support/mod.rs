@@ -18,7 +18,7 @@ const DEFAULT_CODEC_OPERATIONS: usize = 100_000;
 const DEFAULT_BODY_TRANSACTIONS: usize = 512;
 const DEFAULT_DURABLE_TRANSACTIONS: usize = 64;
 const DEFAULT_WARMUP_TRANSACTIONS: usize = 4;
-const DEFAULT_STEPS: &[usize] = &[1, 64, 1_024];
+const DEFAULT_TURNS: &[usize] = &[1, 64, 1_024];
 
 pub(crate) struct Config {
     pub(crate) samples: usize,
@@ -26,7 +26,7 @@ pub(crate) struct Config {
     pub(crate) body_transactions: usize,
     pub(crate) durable_transactions: usize,
     pub(crate) warmup_transactions: usize,
-    pub(crate) steps: Vec<usize>,
+    pub(crate) turns: Vec<usize>,
 }
 
 pub(crate) struct BenchRoot {
@@ -66,11 +66,11 @@ impl Config {
                 "DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS",
                 DEFAULT_WARMUP_TRANSACTIONS,
             ),
-            steps: positive_usize_list(
-                "DOGPADDLE_OPERATION_BENCH_STEPS_PER_TRANSACTION",
-                DEFAULT_STEPS,
+            turns: positive_usize_list(
+                "DOGPADDLE_OPERATION_BENCH_TURNS_PER_TRANSACTION",
+                DEFAULT_TURNS,
             )
-            .expect("load Operation benchmark step counts"),
+            .expect("load Operation benchmark turn counts"),
         }
     }
 
@@ -99,8 +99,8 @@ impl Config {
             .insert("warmup_transactions", self.warmup_transactions)
             .expect("encode warmup transaction count");
         fields
-            .insert("steps_per_transaction", &self.steps)
-            .expect("encode step counts");
+            .insert("turns_per_transaction", &self.turns)
+            .expect("encode turn counts");
         emit_record(
             &ConfigurationRecord::new("operation_core", fields)
                 .expect("build Operation configuration record"),
@@ -250,20 +250,20 @@ impl MachineRecords {
         scenario: &str,
         operations: usize,
         transactions: usize,
-        steps_per_transaction: usize,
+        turns: usize,
         durations: Vec<Duration>,
     ) {
         assert!(operations > 0);
         let summary =
             DurationSummary::from_samples(&durations).expect("summarize Operation samples");
         println!(
-            "{operation:<10} {scenario:<28} steps/tx={steps_per_transaction:<5} operations={operations:<9} min={} median={} max={}",
+            "{operation:<10} {scenario:<28} turns/tx={turns:<5} operations={operations:<9} min={} median={} max={}",
             duration(summary.min()),
             duration(summary.median()),
             duration(summary.max())
         );
 
-        let fields = measurement_fields(operation, operations, transactions, steps_per_transaction);
+        let fields = measurement_fields(operation, operations, transactions, turns);
         for (sample, elapsed) in durations.into_iter().enumerate() {
             let mut sample_fields = fields.clone();
             let ns_per_operation =
@@ -307,7 +307,7 @@ fn measurement_fields(
     operation: &str,
     operations: usize,
     transactions: usize,
-    steps_per_transaction: usize,
+    turns: usize,
 ) -> Fields {
     Fields::new()
         .with("operation", operation)
@@ -316,8 +316,8 @@ fn measurement_fields(
         .expect("encode operation count")
         .with("transactions", transactions)
         .expect("encode transaction count")
-        .with("steps_per_transaction", steps_per_transaction)
-        .expect("encode step count")
+        .with("turns_per_transaction", turns)
+        .expect("encode turn count")
 }
 
 fn setting(name: &str, default: usize) -> usize {

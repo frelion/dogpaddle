@@ -25,6 +25,11 @@ fn decoder_registry_exactly_matches_builtins_and_data_names_are_valid() {
         .iter()
         .map(|definition| definition.persistence_tag())
         .collect::<HashSet<_>>();
+    assert_eq!(
+        expected_tags.len(),
+        definitions.len(),
+        "duplicate built-in definition tag"
+    );
     let registered_tags = DECODERS.iter().map(|(tag, _)| *tag).collect::<HashSet<_>>();
     assert_eq!(
         registered_tags.len(),

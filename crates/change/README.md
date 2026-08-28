@@ -1,8 +1,8 @@
 # dogpaddle-change
 
-`dogpaddle-change` 定义 `DogPaddle` 各执行层将共享的有序 Arrow 变化契约。它不依赖 Flow、
-Operation 或 Store：未来的运行层会让 Operation 消费和产生 `Change` 并负责路由与持久化，
-Store 只保存不透明字节；当前 Operation 尚未接入 Change。
+`dogpaddle-change` 定义 `DogPaddle` 各执行层共享的有序 Arrow 变化契约。它不依赖 Flow、
+Operation 或 Store：Operation 消费和产生 `Change`，Flow 负责路由与持久化，Store 只保存
+不透明字节。
 
 ## Change
 

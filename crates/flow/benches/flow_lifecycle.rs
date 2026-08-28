@@ -66,7 +66,7 @@ fn main() {
     let config = Config::load(root.profile());
     println!("DogPaddle Flow lifecycle benchmark");
     println!(
-        "scope=build/open runtime=absent sync=durable execution=single-thread validation=outside-timing"
+        "scope=build/open runtime=excluded sync=durable execution=single-thread validation=outside-timing"
     );
     emit_environment(&root);
     emit_configuration(&config);

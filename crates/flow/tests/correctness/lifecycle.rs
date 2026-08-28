@@ -1,16 +1,10 @@
 use std::{ops::Range, path::Path};
 
-use dogpaddle_flow::{AdvanceOutcome, Flow, FlowError, FlowFactory, FlowRunError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, Store};
-
-#[test]
-fn advance_exposes_one_bounded_scheduling_round() {
-    let _: fn(&mut Flow) -> Result<AdvanceOutcome, FlowRunError> = Flow::advance;
-    assert_ne!(AdvanceOutcome::Idle, AdvanceOutcome::Progressed);
-}
 
 #[test]
 fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_position() {
