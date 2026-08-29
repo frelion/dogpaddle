@@ -20,6 +20,8 @@ const DATA: &[DataDeclaration] = &[POSITION.declaration()];
 /// Pure definition of a monotonically increasing source.
 ///
 /// The source accepts no inputs and emits `u64` values beginning at `start`.
+/// After committing [`u64::MAX`], subsequent turns return
+/// [`TurnDecision::Idle`] without changing persistent state or producing output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SequenceSourceDefinition {
     start: u64,
@@ -41,9 +43,6 @@ pub enum SequenceSourceError {
     /// A source was incorrectly supplied an input Change.
     #[error("sequence source does not accept input")]
     UnexpectedInput,
-    /// The source has already emitted [`u64::MAX`].
-    #[error("sequence exhausted after emitting u64::MAX")]
-    Exhausted,
 }
 
 impl SequenceSourceDefinition {
@@ -125,9 +124,12 @@ impl Operation for SequenceSourceOperation {
 
         let mut position = self.position.access(access)?;
         let next = match position.get()? {
-            Some(previous) => previous
-                .checked_add(1)
-                .ok_or(SequenceSourceError::Exhausted)?,
+            Some(previous) => {
+                let Some(next) = previous.checked_add(1) else {
+                    return Ok(TurnDecision::Idle);
+                };
+                next
+            }
             None => self.definition.start,
         };
         let output = uint64_change(vec![next])?;

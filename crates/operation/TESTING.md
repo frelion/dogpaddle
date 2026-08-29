@@ -58,7 +58,7 @@ rollback、边界错误不改状态，以及错误后再次读取。SequenceSour
 `input: None`，Count 锁定有输入 commit 的 `Some(Complete)`。Count 使用多行 Change 验证其当前
 整批原子完成策略，并用稳定重批锁定展平 output 与最终状态逐项不变；带正、负和大幅 diff 的输入
 锁定其“每行一个事件”的计数语义。SequenceSource 覆盖单行推进、含 `u64::MAX` 的最后成功输出和
-下一 turn Exhausted。无状态 Discard 锁定 `Sink` category、`Some(Complete)` 和 `output: None`，
+后续 turn 稳定 `Idle`。无状态 Discard 锁定 `Sink` category、`Some(Complete)` 和 `output: None`，
 并拒绝缺失输入或非零端口。绑定到另一个 Store 的
 `TransactionAccess` 必须透明返回 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
 安全返回 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、

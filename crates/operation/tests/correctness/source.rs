@@ -101,7 +101,7 @@ fn dropping_the_transaction_rolls_back_sequence_source_progress_and_output() {
 }
 
 #[test]
-fn sequence_source_emits_u64_max_once_then_reports_exhaustion() {
+fn sequence_source_emits_u64_max_once_then_remains_idle() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
@@ -126,11 +126,18 @@ fn sequence_source_emits_u64_max_once_then_reports_exhaustion() {
         transaction.commit().unwrap();
     }
 
+    {
+        let transaction = transactions.begin().unwrap();
+        assert!(matches!(
+            operation.turn(None, transaction.access()).unwrap(),
+            TurnDecision::Idle
+        ));
+    }
+
     let transaction = transactions.begin().unwrap();
-    let error = operation.turn(None, transaction.access()).unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SequenceSourceError>(),
-        Some(SequenceSourceError::Exhausted)
+        operation.turn(None, transaction.access()).unwrap(),
+        TurnDecision::Idle
     ));
 }
 

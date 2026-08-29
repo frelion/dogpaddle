@@ -100,9 +100,9 @@ sealed Definition 物化运行实例；开放可注入 Flow 的第三方算子�
 [`operation::source::SequenceSourceOperation`] 直接持有 `Cell<u64>`，保存最后一次
 已提交的值；首次产生 `start`，随后逐一递增。每个 turn 产生一行，输出固定为一个
 non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
-下一次 turn 返回 [`operation::source::SequenceSourceError::Exhausted`]。每次成功 turn 返回
-`Commit(TurnCommit { input: None, output: Some(_) })`；Station 不为 Source 建立另一套 outcome 或
-事务路径。它声明自己产生输出。
+后续 turn 返回 `Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
+Change。每次产生值的 turn 返回 `Commit(TurnCommit { input: None, output: Some(_) })`；Station 不为
+Source 建立另一套 outcome 或事务路径。它声明自己产生输出。
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 

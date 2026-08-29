@@ -1,8 +1,12 @@
 use std::{num::NonZeroU64, ops::Range, path::Path};
 
+use dogpaddle_change::encode_change;
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    Operation, TurnCommit, TurnDecision,
+    sink::DiscardDefinition,
+    source::{SequenceSourceDefinition, SequenceSourceOperation},
+    transform::CountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, Store};
 
@@ -39,6 +43,60 @@ fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_positi
     assert!(second.count > first.count);
     assert_eq!(first.count, first.source_position + 1);
     assert_eq!(second.count, second.source_position + 1);
+}
+
+#[test]
+fn reopen_drains_a_committed_final_source_change_after_sequence_becomes_idle() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
+    builder.connect([source], sink);
+    drop(builder.build().unwrap());
+
+    {
+        let store = Store::open(&path).unwrap();
+        let position: Cell<u64> = store
+            .open_data("station/00000000/operation/sequence_source.position")
+            .unwrap();
+        let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+        let operation =
+            SequenceSourceOperation::new(SequenceSourceDefinition::new(u64::MAX), position);
+        let mut transactions = store.into_transactions();
+        let transaction = transactions.begin().unwrap();
+        let TurnDecision::Commit(TurnCommit {
+            input: None,
+            output: Some(change),
+        }) = operation.turn(None, transaction.access()).unwrap()
+        else {
+            panic!("the final source turn did not commit one output Change");
+        };
+        let encoded = encode_change(&change).unwrap();
+        assert_eq!(
+            output
+                .access(transaction.access())
+                .unwrap()
+                .try_append(&encoded, OUTPUT_CAPACITY_BYTES)
+                .unwrap(),
+            Some(0)
+        );
+        transaction.commit().unwrap();
+    }
+
+    let mut reopened = FlowFactory::open(&path).unwrap();
+    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
+    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
+    drop(reopened);
+
+    let store = Store::open(&path).unwrap();
+    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let output = output.access(transaction.access()).unwrap();
+    assert_eq!(output.bounds().unwrap(), 1..1);
+    assert_eq!(output.retained_bytes().unwrap(), 0);
 }
 
 struct ExecutionState {

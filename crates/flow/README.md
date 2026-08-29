@@ -100,7 +100,8 @@ active input，cursor 保持不变；已有的 `active input + cursor` 因而就
 Change；cache 只是 durable claim 的内存副本，命中时不访问 Store。重开 Flow 时 cache 为空，并
 根据 active input 与对应 cursor 重建同一输入。零输入 Source 不经过 input claim，但仍由相同的
 Station `process` 调用 `turn(None, ...)`，没有 Source 专用 outcome 或事务路径。没有 output 的 Sink
-使用 `None`，不能被其他 Station 作为 source。
+使用 `None`，不能被其他 Station 作为 source。SequenceSource 提交 `u64::MAX` 后稳定返回 `Idle`，
+因此即使进程在最终 source commit 后退出，重开后的 schedule 仍会继续排空下游。
 
 `process(&mut Transactions)` 为每次 Operation 调用开始并持有唯一写事务。有输入 Operation 每次只
 接收端口、一个完整 `Change` 和不能提交的 `TransactionAccess`，不会看到 `AppendLog` offset、

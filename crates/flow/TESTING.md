@@ -86,7 +86,8 @@ benchmark 的本地 support 只拥有 Store 根目录与临时 sample 的生命�
   oversize 空日志准入、物理 head 释放与无重复输出。`Flow::advance` 在同一轮让拓扑下游观察上游
   已提交 output，并在每个成功 turn 后触发全部不同的直接上游 GC。outcome 按 `Progressed >
   Backpressured > Idle` 聚合；durable pin 和实际 head 前进都算 progress，背压不得短路后续 Station
-  或 GC。
+  或 GC。SequenceSource 的最终 `u64::MAX` 已提交但尚未消费时，reopen 后 source 的稳定 `Idle` 不得
+  阻断下游退休该 Change。
 - **鲁棒性**：带重新计算 CRC 的 magic、版本、UTF-8、source 引用和 Operation payload 变异必须
   到达并返回对应语义错误；确定性的截断、bit flip 和结构化垃圾输入调用
   `FlowFactory::open` 不得 panic，且必须在 Definition 解码阶段失败，不能由后续缺失资源错误
