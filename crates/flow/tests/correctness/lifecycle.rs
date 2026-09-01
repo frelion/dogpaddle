@@ -62,8 +62,7 @@ fn reopen_drains_a_committed_final_source_change_after_sequence_becomes_idle() {
             .open_data("station/00000000/operation/sequence_source.position")
             .unwrap();
         let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-        let operation =
-            SequenceSourceOperation::new(SequenceSourceDefinition::new(u64::MAX), position);
+        let operation = SequenceSourceOperation::new(u64::MAX, position);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin().unwrap();
         let Action::Commit(Some(change)) = operation.turn(None, transaction.access()).unwrap()

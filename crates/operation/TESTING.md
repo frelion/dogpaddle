@@ -3,6 +3,8 @@
 本 crate 拥有 Operation Definition、稳定 codec、类型化数据声明、materialize，以及当前具体
 Operation 的状态推进测试。`dogpaddle-store` 是 Operation 的正式运行依赖，因此 Cell 状态的
 commit、rollback、错误传播和 reopen 属于本 crate 的公共正确性，而不是额外的跨 crate 测试包。
+Definition 只能单向物化运行实例；具体 runtime 构造入口只接收执行所需的参数与 collection，实例不
+保存或暴露 Definition。
 
 Flow 负责完整 Station 资源名、资源创建顺序、Flow Definition 布局和 build/open 后的装配；这些
 组合契约应在 `dogpaddle-flow` 的公共测试中验证。Operation 自身拥有 object-safe Change turn
@@ -64,6 +66,10 @@ rollback、边界错误不改状态，以及错误后再次读取。SequenceSour
 `TransactionAccess` 必须透明返回 `StoreError::WrongStore`；同 placement、错误持久化 codec 也必须
 安全返回 `StoreError::Codec`，并保持原始字节不变。Store 自己的事务中毒、物理 placement、
 崩溃恢复和通用 Cell codec 由 `dogpaddle-store` 测试拥有，不在这里重复。
+
+公开 runtime 测试不创建 Definition：SequenceSource 只以 `start + position` 构造，Count 只以 count
+Cell 构造，Discard 直接使用零状态 unit value。Definition 测试独立覆盖 data create/open 后的
+materialize，使直接运行语义与 Definition 装配接缝分别受测而不建立反向回链。
 
 普通测试没有 wall-clock 断言，也不依赖测试执行顺序。
 

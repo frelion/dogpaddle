@@ -1,11 +1,12 @@
+use arrow_array::UInt64Array;
 use dogpaddle_operation::{
     DataDeclaration, DataInstances, OperationDefinition, OperationKind,
     operation::{
-        Operation, sink::DiscardDefinition, source::SequenceSourceDefinition,
-        transform::CountDefinition,
+        Action, Operation, OperationInput, sink::DiscardDefinition,
+        source::SequenceSourceDefinition, transform::CountDefinition,
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::{Cell, Store};
 
 use super::support::TestStore;
 
@@ -77,8 +78,56 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     drop(store);
 
     let store = Store::open(fixture.path()).unwrap();
+    let source_position = store.open_data::<Cell<u64>>("source-position").unwrap();
     let source = materialize(&source_definition, &store, &["source-position"]);
     let count = materialize(&count_definition, &store, &["count"]);
     let discard = materialize(&discard_definition, &store, &[]);
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let Action::Commit(Some(output)) = source.turn(None, transaction.access()).unwrap() else {
+        panic!("materialized SequenceSource did not commit one output Change");
+    };
+    assert_eq!(output.num_rows(), 1);
+    let values = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 42);
+    assert_eq!(
+        source_position
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(42)
+    );
+    let Action::Complete(Some(count_output)) = count
+        .turn(
+            Some(OperationInput {
+                port: 0,
+                change: &output,
+            }),
+            transaction.access(),
+        )
+        .unwrap()
+    else {
+        panic!("materialized Count did not complete one input with output");
+    };
+    assert_eq!(count_output.num_rows(), 1);
+    let Action::Complete(None) = discard
+        .turn(
+            Some(OperationInput {
+                port: 0,
+                change: &output,
+            }),
+            transaction.access(),
+        )
+        .unwrap()
+    else {
+        panic!("materialized Discard did not complete one input without output");
+    };
+    transaction.commit().unwrap();
     drop((source, count, discard));
 }

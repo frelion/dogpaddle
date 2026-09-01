@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
     Action, Operation, OperationInput,
-    source::{SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation},
+    source::{SequenceSourceError, SequenceSourceOperation},
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -47,7 +47,7 @@ fn sequence_source_emits_one_value_and_continues_after_reopen() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(41), position);
+    let operation = SequenceSourceOperation::new(41, position);
     let mut transactions = store.into_transactions();
 
     {
@@ -62,7 +62,7 @@ fn sequence_source_emits_one_value_and_continues_after_reopen() {
 
     let store = Store::open(fixture.path()).unwrap();
     let position = store.open_data::<Cell<u64>>("position").unwrap();
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(41), position);
+    let operation = SequenceSourceOperation::new(41, position);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
@@ -77,7 +77,7 @@ fn dropping_the_transaction_rolls_back_sequence_source_progress_and_output() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(41), position);
+    let operation = SequenceSourceOperation::new(41, position);
     let mut transactions = store.into_transactions();
 
     {
@@ -101,8 +101,7 @@ fn sequence_source_emits_u64_max_once_then_remains_idle() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let operation =
-        SequenceSourceOperation::new(SequenceSourceDefinition::new(u64::MAX - 1), position);
+    let operation = SequenceSourceOperation::new(u64::MAX - 1, position);
     let mut transactions = store.into_transactions();
 
     {
@@ -142,7 +141,7 @@ fn sequence_source_rejects_an_input_change_with_a_downcastable_error() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(0), position);
+    let operation = SequenceSourceOperation::new(0, position);
     let mut transactions = store.into_transactions();
     let change = input_change();
     let transaction = transactions.begin().unwrap();
@@ -168,7 +167,7 @@ fn sequence_source_transparently_reports_wrong_store_access() {
     let root = tempfile::tempdir().unwrap();
     let mut owning_store = Store::create(root.path().join("owning")).unwrap();
     let position = owning_store.create_data::<Cell<u64>>("position").unwrap();
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(0), position);
+    let operation = SequenceSourceOperation::new(0, position);
 
     let foreign_store = Store::create(root.path().join("foreign")).unwrap();
     let mut foreign_transactions = foreign_store.into_transactions();

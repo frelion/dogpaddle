@@ -23,9 +23,7 @@ pub struct DiscardDefinition {
 ///
 /// Input completion remains durable because the owning Station commits its
 /// cursor in the same transaction as this Operation turn.
-pub struct DiscardOperation {
-    definition: DiscardDefinition,
-}
+pub struct DiscardOperation;
 
 /// Discard-specific failure during one [`DiscardOperation`] turn.
 #[derive(Debug, Error)]
@@ -69,7 +67,7 @@ impl OperationDefinition for DiscardDefinition {
         &self,
         _data: &mut DataInstances,
     ) -> Result<Box<dyn Operation>, MaterializeError> {
-        Ok(Box::new(DiscardOperation::new(*self)))
+        Ok(Box::new(DiscardOperation))
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -77,20 +75,6 @@ impl OperationDefinition for DiscardDefinition {
     }
 
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
-}
-
-impl DiscardOperation {
-    /// Materializes a Discard sink from its pure definition.
-    #[must_use]
-    pub const fn new(definition: DiscardDefinition) -> Self {
-        Self { definition }
-    }
-
-    /// Returns the pure definition used to materialize this sink.
-    #[must_use]
-    pub const fn definition(&self) -> &DiscardDefinition {
-        &self.definition
-    }
 }
 
 impl Operation for DiscardOperation {

@@ -29,10 +29,11 @@ pub struct SequenceSourceDefinition {
 
 /// Materialized monotonically increasing source operation.
 ///
-/// This value owns its pure definition and persistent position, but never
-/// begins, commits, or stores a transaction.
+/// This value stores only the first value and persistent position needed at
+/// execution time. It never retains its definition or begins, commits, or
+/// stores a transaction.
 pub struct SequenceSourceOperation {
-    definition: SequenceSourceDefinition,
+    start: u64,
     position: Cell<u64>,
 }
 
@@ -75,7 +76,7 @@ impl OperationDefinition for SequenceSourceDefinition {
         data: &mut DataInstances,
     ) -> Result<Box<dyn Operation>, MaterializeError> {
         let position = data.take(&POSITION)?;
-        Ok(Box::new(SequenceSourceOperation::new(*self, position)))
+        Ok(Box::new(SequenceSourceOperation::new(self.start, position)))
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -88,19 +89,10 @@ impl OperationDefinition for SequenceSourceDefinition {
 }
 
 impl SequenceSourceOperation {
-    /// Materializes a Sequence source from its pure definition and durable data.
+    /// Creates a Sequence source from its first value and durable position.
     #[must_use]
-    pub const fn new(definition: SequenceSourceDefinition, position: Cell<u64>) -> Self {
-        Self {
-            definition,
-            position,
-        }
-    }
-
-    /// Returns the pure definition used to materialize this source.
-    #[must_use]
-    pub const fn definition(&self) -> &SequenceSourceDefinition {
-        &self.definition
+    pub const fn new(start: u64, position: Cell<u64>) -> Self {
+        Self { start, position }
     }
 }
 
@@ -122,7 +114,7 @@ impl Operation for SequenceSourceOperation {
                 };
                 next
             }
-            None => self.definition.start,
+            None => self.start,
         };
         let output = uint64_change(vec![next])?;
 

@@ -31,10 +31,9 @@ pub struct CountDefinition {
 
 /// Materialized running count operation.
 ///
-/// This value owns its pure definition and persistent count, but never begins,
-/// commits, or stores a transaction.
+/// This value stores only its persistent count. It never retains its definition
+/// or begins, commits, or stores a transaction.
 pub struct CountOperation {
-    definition: CountDefinition,
     count: Cell<u64>,
 }
 
@@ -84,7 +83,7 @@ impl OperationDefinition for CountDefinition {
         data: &mut DataInstances,
     ) -> Result<Box<dyn Operation>, MaterializeError> {
         let count = data.take(&COUNT)?;
-        Ok(Box::new(CountOperation::new(*self, count)))
+        Ok(Box::new(CountOperation::new(count)))
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -95,16 +94,10 @@ impl OperationDefinition for CountDefinition {
 }
 
 impl CountOperation {
-    /// Materializes a Count operation from its pure definition and durable data.
+    /// Creates a Count operation from its durable count.
     #[must_use]
-    pub const fn new(definition: CountDefinition, count: Cell<u64>) -> Self {
-        Self { definition, count }
-    }
-
-    /// Returns the pure definition used to materialize this operation.
-    #[must_use]
-    pub const fn definition(&self) -> &CountDefinition {
-        &self.definition
+    pub const fn new(count: Cell<u64>) -> Self {
+        Self { count }
     }
 }
 

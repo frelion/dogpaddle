@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
     Action, Operation, OperationInput,
-    sink::{DiscardDefinition, DiscardError, DiscardOperation},
+    sink::{DiscardError, DiscardOperation},
 };
 use dogpaddle_store::Store;
 
@@ -26,7 +26,7 @@ fn input_change() -> Change {
 fn discard_completes_one_input_without_output() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
-    let operation = DiscardOperation::new(DiscardDefinition::new());
+    let operation = DiscardOperation;
     let change = input_change();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
@@ -49,7 +49,7 @@ fn discard_completes_one_input_without_output() {
 fn discard_rejects_missing_input_and_nonzero_ports() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
-    let operation = DiscardOperation::new(DiscardDefinition::new());
+    let operation = DiscardOperation;
     let change = input_change();
     let mut transactions = store.into_transactions();
 

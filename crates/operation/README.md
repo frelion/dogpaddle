@@ -3,7 +3,8 @@
 `dogpaddle-operation` 提供具体、强类型的 Operation Definition、持久化 Data 和运行实例。
 Definition 是无副作用、可持久化的数据；它声明所需数据对象的稳定逻辑名、collection 类型
 及该 collection 真正需要的布局参数。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
-Definition 直接装配运行实例。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
+Definition 直接装配运行实例。物化是严格单向的：运行实例只保存执行参数和具体持久化 collection，
+不保留 Definition 或返回 Definition 的方法。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
 
 ## 数据边界
 
@@ -89,15 +90,16 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 
 物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
 `Box<dyn operation::Operation>`，并通过同一个 `turn` 分派运行。Definition 单向物化 Operation；运行
-trait 不再反向暴露 Definition，Flow 在 build/open 时已经从持久 Definition 获得 kind 与资源声明。
+trait 和三个具体运行类型都不反向保存或暴露 Definition，Flow 在 build/open 时已经从持久 Definition
+获得 kind 与资源声明。
 Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化运行实例；开放可注入 Flow 的
 第三方算子仍需另行设计 tag 分配、decoder 注册和运行错误边界。
 
 ## `operation::source::SequenceSource`
 
 [`operation::source::SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的
-[`operation::source::SequenceSourceOperation`] 直接持有 `Cell<u64>`，保存最后一次
-已提交的值；首次产生 `start`，随后逐一递增。每个 turn 产生一行，输出固定为一个
+[`operation::source::SequenceSourceOperation`] 只持有复制出的 `start: u64` 和直接的
+`Cell<u64>` position；首次产生 `start`，随后根据最后一次已提交的值逐一递增。每个 turn 产生一行，输出固定为一个
 non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
 后续 turn 返回 `Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
 Change。每次产生值的 turn 返回 `Action::Commit(Some(_))`；Station 不为
@@ -109,7 +111,7 @@ Source 建立另一套 outcome 或事务路径。它声明自己产生输出。
 
 [`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
 [`operation::transform::CountOperation`] 按输入行序计算事件数量：每一行恰好令直接持有的
-`Cell<u64>` 加一，输入 diff 的符号和数值不改变“一个有序事件”的计数。每个已处理输入行输出
+唯一字段 `Cell<u64>` 加一，输入 diff 的符号和数值不改变“一个有序事件”的计数。每个已处理输入行输出
 一个 non-null `UInt64` `count`，diff 固定为 `+1`；因此它是插入式的运行计数事件流，不是维护
 单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
 [`operation::transform::CountError::Overflow`]。Count 显式声明为携带一个输入的
@@ -124,15 +126,15 @@ Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 
 ## `operation::sink::Discard`
 
 [`operation::sink::DiscardDefinition`] 显式声明为携带一个输入的 [`OperationKind::Sink`]，
-不声明 Operation data，也没有 output。物化后的 [`operation::sink::DiscardOperation`] 接受端口
-零上的完整 Change，并返回 `Action::Complete(None)`。输入完成仍由 Station 在同一事务中
+不声明 Operation data，也没有 output。物化后的 [`operation::sink::DiscardOperation`] 是零状态
+unit struct；它接受端口零上的完整 Change，并返回 `Action::Complete(None)`。输入完成仍由 Station 在同一事务中
 持久化 cursor；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
 Sink 的幂等提交协议仍需单独设计。
 
 ```rust,no_run
 use dogpaddle_operation::operation::{
     Action, Operation,
-    source::{SequenceSourceDefinition, SequenceSourceOperation},
+    source::SequenceSourceOperation,
 };
 use dogpaddle_store::{Cell, Store};
 
@@ -140,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = tempfile::tempdir()?;
     let mut store = Store::create(root.path().join("store"))?;
     let position = store.create_data::<Cell<u64>>("position")?;
-    let operation = SequenceSourceOperation::new(SequenceSourceDefinition::new(42), position);
+    let operation = SequenceSourceOperation::new(42, position);
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
@@ -171,8 +173,9 @@ Flow 不需要知道算子的业务数据结构，Operation 也不能控制事�
 模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
 `Operation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec 与物化逻辑；公共 decoder 表只增加一条
-`tag → decode function` 记录。运行实例直接保存所需 collection，不再为每个算子增加只包裹
-字段的 `OperationData` 类型。Flow 的 build/open 不应出现具体算子分支。
+`tag → decode function` 记录。运行实例只直接保存执行所需的标量参数与 collection，不能保存
+Definition 或提供回到 Definition 的 getter，也不再为每个算子增加只包裹字段的 `OperationData`
+类型。Flow 的 build/open 不应出现具体算子分支。
 
 分类模块只负责容纳多个具体算子并重导出它们的公共类型，不拥有或重导出分类级的单一 tag
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一

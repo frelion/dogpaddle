@@ -44,7 +44,7 @@ impl CountFixture {
         let state = store
             .create_data::<Cell<u64>>("count")
             .expect("create Count benchmark state");
-        let operation = CountOperation::new(CountDefinition::new(), state.clone());
+        let operation = CountOperation::new(state.clone());
         Self {
             transactions: store.into_transactions(),
             state,
@@ -79,10 +79,7 @@ impl SequenceFixture {
         let state = store
             .create_data::<Cell<u64>>("position")
             .expect("create Sequence benchmark state");
-        let operation = SequenceSourceOperation::new(
-            SequenceSourceDefinition::new(SEQUENCE_START),
-            state.clone(),
-        );
+        let operation = SequenceSourceOperation::new(SEQUENCE_START, state.clone());
         Self {
             transactions: store.into_transactions(),
             state,

@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
     Action, Operation, OperationInput,
-    transform::{CountDefinition, CountError, CountOperation},
+    transform::{CountError, CountOperation},
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -49,7 +49,7 @@ fn run_count(diffs: &[i64], segment_rows: &[usize]) -> Vec<u64> {
     let mut store = Store::create(fixture.path()).unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
     let count_state = count.clone();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let mut transactions = store.into_transactions();
     let mut flattened = Vec::new();
     let mut start = 0;
@@ -89,7 +89,7 @@ fn count_finishes_a_complete_change_and_continues_after_reopen() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![2, -1, 7]);
     let mut transactions = store.into_transactions();
 
@@ -116,7 +116,7 @@ fn count_finishes_a_complete_change_and_continues_after_reopen() {
     let store = Store::open(fixture.path()).unwrap();
     let count = store.open_data::<Cell<u64>>("count").unwrap();
     let count_state = count.clone();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1, 1]);
     let mut transactions = store.into_transactions();
     {
@@ -164,7 +164,7 @@ fn dropping_a_turn_rolls_back_the_complete_count_change() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1, 1]);
     let mut transactions = store.into_transactions();
 
@@ -210,7 +210,7 @@ fn count_rejects_a_change_that_would_overflow_without_partial_progress() {
     let mut store = Store::create(fixture.path()).unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
     let count_state = count.clone();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1, 1]);
     let mut transactions = store.into_transactions();
 
@@ -255,7 +255,7 @@ fn count_rejects_missing_input_and_nonzero_ports() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1]);
     let mut transactions = store.into_transactions();
 
@@ -290,7 +290,7 @@ fn count_transparently_reports_wrong_store_access() {
     let root = tempfile::tempdir().unwrap();
     let mut owning_store = Store::create(root.path().join("owning")).unwrap();
     let count = owning_store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1]);
 
     let foreign_store = Store::create(root.path().join("foreign")).unwrap();
@@ -331,7 +331,7 @@ fn count_reports_a_persisted_wrong_codec_without_mutating_the_bytes() {
 
     let store = Store::open(fixture.path()).unwrap();
     let count = store.open_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(CountDefinition::new(), count);
+    let operation = CountOperation::new(count);
     let change = input_change(vec![1]);
     let mut transactions = store.into_transactions();
     {
