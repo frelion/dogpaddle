@@ -88,7 +88,7 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 背压；尚未实现持续运行的 `Flow::start`、中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。
 该高水位不计算 MDBX page、Operation state 或 decoded cache，也允许空日志容纳一条 oversize，
 因此不是磁盘或内存硬配额。Operation 的展平
-output 事件序列与最终业务状态必须同时不受稳定重批和 `Keep` turn 切分影响。
+output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

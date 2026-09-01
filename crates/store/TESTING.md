@@ -162,7 +162,7 @@ cargo xtask check
 cargo xtask bench-smoke
 ```
 
-`cargo xtask bench-smoke` 在代码内固定缩小配置，并实际执行工作区全部十个 release benchmark；
+`cargo xtask bench-smoke` 在代码内固定缩小配置，并实际执行工作区全部 11 个 release benchmark；
 其中 Store 的 `cell`、`ordered_map`、`append_log` 和 `append_log_endurance` 都会运行，不是只编译。
 单独的 `cargo bench -p dogpaddle-store --bench <target>` 用于本地场景诊断或固定 reference
 环境的正式测量。完整矩阵和统一 PR 规则以[根目录 `TESTING.md`](../../TESTING.md)为准。

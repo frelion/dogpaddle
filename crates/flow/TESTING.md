@@ -20,7 +20,7 @@ crates/flow/
 ├── src/flow/advance.rs                # 单轮调度协议与 Flow::advance
 ├── src/flow/tests.rs                  # 私有运行态 Flow 所有权、schedule 与生命周期测试
 ├── src/station/runtime.rs             # Station 装配与 process 边界
-├── src/station/input.rs               # Inbox/Claim、durable cursor 与内联 retention/reclaim
+├── src/station/input.rs               # 统一 Output、Inbox/Claim、cursor 与内联 reclaim
 ├── src/station/protocol.rs            # Station outcome 与错误
 ├── src/station/tests.rs               # 私有 Station/Operation/数据 capability 装配测试
 ├── tests/correctness.rs               # 唯一公共正确性 target
@@ -67,12 +67,12 @@ profile/配置解析、主机与文件系统指纹、持续时间统计和 typed
   Station output 和内建 Operation data 使用稳定名称与精确类型；
   `OperationKind::has_output()` 为 true 的 Station 创建日志，Discard Sink 没有 output；
   未发布、Definition 损坏、资源缺失和 Size 不匹配均被拒绝；完整 Flow 可以重新打开。
-- **运行期装配**：分离的读写事务启动 capability 归 Flow 长期持有，Station 只保存自己的 state、完整
-  可选 output 与拥有有序 `InputPort` 和至多一个 owned `Claim` 的 `Inbox`，不长期持有事务启动能力。
-  每个 InputPort 持有只读 input log、共享 `OutputRetention` 和 consumer slot；OutputRetention 组合
-  producer output 与全部 consumer cursor 的只读 capability。
-  私有测试从 Flow 一侧临时开始事务并验证同一 `TransactionAccess` 可以访问 Station output，而
-  下游只能经 `ReadOnly<AppendLog<Vec<u8>>>` 观察同一日志。source 即使在 target 之后声明，build
+- **运行期装配**：分离的读写事务启动 capability 归 Flow 长期持有，Station 只保存 Operation、完整
+  可选 `Arc<Output>` 与拥有 state、有序 `InputPort` 和至多一个 owned `Claim` 的 `Inbox`，不长期持有
+  事务启动能力。assembly 先从 target state 派生全部 consumer cursor 的只读 capability，再把每个
+  producer 的原始 log 与 capacity 唯一 move 进一个 Output；producer Station 与所有 InputPort 只共享
+  该 Arc，InputPort 自身只保存 Arc 和 consumer slot。私有测试用 `Arc::ptr_eq` 证明 producer 与下游
+  port 指向同一 Output，因而 input read、append、校验与 reclaim 不能错配。source 即使在 target 之后声明，build
   和 reopen 仍按 source ID 正确注入；二者派生相同的分层拓扑 schedule，同层保持声明顺序，且
   公共有界轮次的方法签名保持固定。build 在发布 Definition 的同一事务中，用稳定 key 和 4 字节
   value 初始化 active input，用稳定 port key 和 8 字节 value 初始化每个 cursor。私有测试验证
@@ -90,8 +90,8 @@ profile/配置解析、主机与文件系统指纹、持续时间统计和 typed
   oversize 空日志准入、物理 head 释放与无重复输出。
 
   build 后的每个已提交事务边界，每个 producer output 都必须满足
-  `head == min(all consumer edge cursors)`，且全部 cursor 位于 `[head, tail]`；open 显式验证这些
-  条件并拒绝损坏状态。单个 Complete 只推进一条 edge cursor 一个 offset，因此新的最小值最多从
+  `head == min(all consumer edge cursors)`，且全部 cursor 位于 `[head, tail]`；open 在第二次 Definition
+  读取所用的同一个 RO snapshot 中验证这些条件并拒绝损坏状态，不启动空写事务。单个 Complete 只推进一条 edge cursor 一个 offset，因此新的最小值最多从
   head 前进到 `head + 1`，只需在同一事务中至多回收一个 entry。fan-out、重复 source edge 和最慢
   consumer 测试证明所有 edge cursor 都参与最小值；cursor、active、head 和 retained bytes 在错误、
   背压或 commit 失败时一起回滚。没有独立回收 phase、补偿调度或回收 progress 状态。
@@ -123,7 +123,7 @@ wall-clock 猜测制造这个窗口；除非以后出现无需扩张公共 API �
 | scenario | 计时内 | 计时外 |
 | --- | --- | --- |
 | `fresh_durable_build` | 一次 `FlowFactory::build`：拓扑校验、编码、fresh Store、全部资源创建及 durable Definition 发布 | 临时路径和 Factory 声明、结果校验、drop、重新打开校验、目录清理 |
-| `warm_reopen` | 一次 `FlowFactory::open`：两阶段 Definition 读取、解码、state/Operation/output 打开、Operation 物化和只读 input 注入 | fixture 构建、preflight、预热、Station ID 校验和 drop |
+| `warm_reopen` | 一次 `FlowFactory::open`：两阶段 Definition 读取、解码、state/Operation/output 打开、Operation 物化、统一 Output 装配和 RO frontier 校验 | fixture 构建、preflight、预热、Station ID 校验和 drop |
 
 fresh build 的每个预热和样本使用独立 Store 路径。warm reopen 使用同一个已提交 fixture，并在
 采样前完成 preflight 和显式预热，因此它是 warm committed reopen，不是 cold filesystem cache。
@@ -154,11 +154,14 @@ counts 与 setup/cache 口径，sample/summary 补充 `station_count`。Cargo pr
 
 ## `flow_runtime` 性能边界
 
-此 benchmark 回答预先构建的持久化 Flow 执行连续 `Flow::advance` 轮次的成本。每个 sample 计时内
-只有固定次数的 `advance` 调用和 outcome 计数；Flow build、capacity-pressure backlog 注入与 reopen、
-预热、状态校验和清理都在计时外。所有场景的每轮聚合结果都必须是 `Progressed`，否则样本无效。
-当前内建 input Operation 只覆盖 Complete 路径，因此这个 benchmark 不冒充 retained-input
-continuation 的性能数据。
+此 benchmark 回答预先构建的持久化 Flow 执行连续 `Flow::advance` 轮次的成本。v2 协议单独计时
+每次完整 `advance`，原始 round latency、outcome 断言和 durable oracle 校验位于计时外；sample 的
+`elapsed_ns` 是其原始 round latency 之和。Flow build、capacity-pressure backlog 注入与 reopen、
+预热和清理也都在计时外。所有场景的每轮聚合结果都必须是 `Progressed`，否则样本无效。
+
+当前内建 input Operation 只覆盖 Complete 路径，因此覆盖的每个 input Change 完成前
+input-retaining `Commit` 次数为 0；次数 1/8 在 typed configuration 中明确登记为 unavailable，
+benchmark 不用容量拒绝重放冒充 retained-input continuation。
 
 | scenario | topology / 压力 | 本轮覆盖 |
 | --- | --- | --- |
@@ -171,21 +174,30 @@ continuation 的性能数据。
 
 | profile | chain station counts | fan-outs | rounds/sample | samples | warmup rounds |
 | --- | --- | --- | ---: | ---: | ---: |
-| `smoke` | `3,8` | `1,4` | 32 | 3 | 4 |
-| `reference` | `3,8,32` | `1,4,16` | 1024 | 9 | 64 |
+| `smoke` | `3,8` | `4` | 32 | 3 | 4 |
+| `reference` | `3,16,64` | `4,16` | 1024 | 9 | 64 |
+
+`sink_steady` 已完整覆盖 fan-out 为 1 时同构的 source-to-Discard 路径，默认 fan-out 矩阵不再重复它；
+需要显式对照时，`DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS=1` 仍是合法配置。
 
 `flow_runtime` 与 `flow_lifecycle` 共享 `DOGPADDLE_FLOW_BENCH_PROFILE` 和
 `DOGPADDLE_FLOW_BENCH_STORE_DIR`；运行期规模还可用下列变量覆盖：
 
-- `DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS=3,8,32`
-- `DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS=1,4,16`
+- `DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS=3,16,64`
+- `DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS=4,16`
 - `DOGPADDLE_FLOW_RUNTIME_BENCH_ROUNDS_PER_SAMPLE=1024`
 - `DOGPADDLE_FLOW_RUNTIME_BENCH_SAMPLES=9`
 - `DOGPADDLE_FLOW_RUNTIME_BENCH_WARMUP_ROUNDS=64`
 
-sample/summary 记录 scenario、topology、station count、fan-out、capacity mode、round 数与预期 outcome；
-它只报告每组 advance 轮次的 duration，不从当前批量 Change 推导 rows/s。正式 reference 运行仍必须
-使用显式绝对 Store 根目录。
+sample/summary 记录 scenario、topology、station count、fan-out、capacity mode、预期 outcome，以及
+advances、committed Station turns 和 durable input completions 的数量与整数向下取整吞吐。committed
+Station turn 只在 Operation 返回 action 后外层 Station 写事务成功 commit 时计数；仅返回 action、
+durable pin 或内联 reclaim 都不另算 turn。一次 input completion 是一条 input edge 的 durable
+cursor/frontier 前进，fan-out 按 edge 分别计数。每个 sample 保存完整 `round_latencies_ns`，sample 与
+汇总分别报告 nearest-rank round p50/p95；汇总吞吐使用全部 sampled round 的工作量除以对应原始
+latency 总和。source position、每个 input cursor、Count state 以及 capacity 场景最终恰好一条 backlog
+共同构成计时外 durable oracle。v2 的逐轮计时包含 clock 成本，不能和旧批量计时 median 混用；比较
+实现时必须对所有版本重跑同一 v2 配置。正式 reference 运行仍必须使用显式绝对 Store 根目录。
 
 ## 命令
 

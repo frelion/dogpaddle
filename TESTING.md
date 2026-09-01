@@ -17,10 +17,29 @@ DogPaddle 用同一套规则组织全部产品 crate 和跨 crate 接缝。测�
 这里的“不适用”是显式边界，不是漏测。新增稳定运行路径、无界状态或跨层调度器时，必须先确定
 成本边界和结果 oracle，再登记新的 benchmark 或 endurance target。
 
-`flow_runtime` 只使用公共内建 Operation，覆盖 source-to-sink、Count chain、fan-out sinks 和预填
-output 后 producer 持续容量拒绝而 Sink 持续推进的 steady `advance`。fixture、预填与 oracle 位于
-计时外；当前没有能从公共 API 构造 Keep-heavy Flow 的内建 Operation，因此该轴被显式记录为未覆盖，
-不为 benchmark 新增产品 API。
+`flow_runtime` 只使用公共内建 Operation，覆盖 2-Station source-to-sink、3-Station 最小 Count chain、
+reference 的 16/64-Station Count chain、fan-out sinks，以及预填 output 后 producer 持续容量拒绝而
+Sink 持续推进的 steady `advance`。fixture、预填与 oracle 位于计时外；oracle 检查 source position、
+每个 input cursor 和 Count state，证明用于吞吐计算的 committed Station turns 与 durable input
+completion 数量，而不从 `AdvanceOutcome` 聚合值反推。
+
+当前 `OperationDefinition` 是 sealed trait，外部 benchmark 无法实现 Definition；公共内建集合中
+SequenceSource 不接收 input，Count 与 Discard 对每个 input turn 都直接返回 Complete，没有返回 Commit
+以保留当前 input 的 Operation。因此每个 Change 完成前成功提交 1 或 8 次 input-retaining `Commit` 的
+Flow 在不新增生产 Operation、decoder tag 和稳定格式的前提下不可构造；`flow_runtime` 只覆盖
+input-retaining `Commit` 次数 0，并在 typed JSONL 中把次数 1/8 明确登记为 unavailable，不建立
+benchmark-only 产品抽象。容量拒绝导致的同一 input 重放会回滚 Operation state、output 和 cursor，
+不是已提交的 input-retaining `Commit`，不能冒充该 workload。
+
+`flow_runtime` 的 `individual_advance_v2` 协议逐次计时完整 `Flow::advance`，逐样本及汇总报告整数向下
+取整的 advances/s、committed Station turns/s、input completions/s，以及 nearest-rank round latency
+p50/p95。committed Station turn 只在 Operation 返回 action 后外层 Station 写事务成功 commit 时计数；
+只返回 action、durable pin 或内联 reclaim 都不另算 turn。一次 input completion 是一条 input edge 的
+durable cursor/frontier 前进，fan-out 按 edge 分别计数。样本 `elapsed_ns` 是这些逐轮区间之和，
+`round_latencies_ns` 保留可重新计算 percentile 的逐轮原始值，两者都不含 outcome/oracle 校验。
+默认 fan-out 矩阵省略与 `sink_steady` 同构的单 consumer 场景，只测 4/16；显式配置 fan-out 1 仍合法。
+v2 之前的整批计时 median 与该协议不直接可比；比较实现前后必须用 v2 对全部候选版本重跑，不能
+混用历史数值。
 
 ## 目录与 Cargo 约束
 
@@ -97,11 +116,11 @@ decode/reopen。黄金 fixture 是独立文件，不能只在测试中用同一�
 性质测试使用确定性 seed，并在失败时打印 seed。Change 重点验证 roundtrip、投影等价、切片和
 稳定重批；Store 重点验证分页/方向与 `BTreeMap` 模型一致、事务原子性和单调 offset；Operation
 重点验证稳定 definition codec、状态推进和稳定重批；Flow 重点验证任意合法 DAG 的顺序、拓扑
-约束，以及 Station 的 durable input claim、`Idle` 回滚、`Keep` continuation/output 提交、同一
+约束，以及 Station 的 durable input claim、`Idle` 回滚、input-retaining `Commit` continuation/output 提交、同一
 `(port, offset, bytes)` 完整 Change 重放、`Complete` 退休、cursor/output 原子性、output 容量拒绝
-后的 Source/Keep/Complete 回滚、物理 head 驱动的 retained-byte 释放，以及 `Progressed >
+后的 Source/input-retaining `Commit`/`Complete` 回滚、物理 head 驱动的 retained-byte 释放，以及 `Progressed >
 Backpressured > Idle` 聚合。稳定重批 oracle 必须同时比较展平 output 事件序列和最终业务状态，并证明结果不受同一
-Change 被划分为多少个 `Keep` turn 影响。
+Change 被划分为多少个 input-retaining `Commit` turn 影响。
 任意输入 decoder 必须返回结果而非 panic、abort、无限循环或按未验证长度分配。
 
 ### 崩溃与长稳
