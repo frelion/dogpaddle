@@ -1,12 +1,16 @@
-use std::{num::NonZeroUsize, ops::Range, sync::Arc};
-
-use dogpaddle_change::{Change, decode_change};
-use dogpaddle_store::{
-    AppendLog, OrderedMap, ReadOnly, ReadTransactions, ScanLimit, Small, TransactionAccess,
-    Transactions,
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    ops::Range,
+    sync::Arc,
 };
 
-use super::{protocol::StationError, runtime::Station};
+use dogpaddle_change::{Change, decode_change, encode_change};
+use dogpaddle_store::{
+    AppendLog, OrderedMap, ReadOnly, ReadTransactionAccess, ReadTransactions, ScanLimit, Small,
+    TransactionAccess, Transactions,
+};
+
+use super::protocol::StationError;
 
 pub(super) const ACTIVE_INPUT_KEY: &[u8] = b"input/active";
 pub(super) const CURSOR_ORIGIN: u64 = 0;
@@ -27,13 +31,13 @@ struct EncodedClaim {
 
 /// One input edge and its acknowledgement capability.
 pub(crate) struct InputPort {
-    log: ReadOnly<AppendLog<Vec<u8>>>,
-    retention: Arc<OutputRetention>,
+    output: Arc<Output>,
     consumer_slot: usize,
 }
 
 /// A Station's complete input-delivery state.
 pub(super) struct Inbox {
+    state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     ports: Vec<InputPort>,
     claim: Option<Claim>,
 }
@@ -44,9 +48,10 @@ pub(crate) struct ConsumerCursor {
     input: usize,
 }
 
-/// Shared acknowledgement and physical-retention state for one producer output.
-pub(crate) struct OutputRetention {
-    output: AppendLog<Vec<u8>>,
+/// One producer's append, input-read, and physical-retention capability.
+pub(crate) struct Output {
+    log: AppendLog<Vec<u8>>,
+    capacity_bytes: NonZeroU64,
     consumers: Box<[ConsumerCursor]>,
 }
 
@@ -65,23 +70,16 @@ impl Claim {
     }
 }
 
-impl InputPort {
-    pub(crate) fn new(
-        log: ReadOnly<AppendLog<Vec<u8>>>,
-        retention: Arc<OutputRetention>,
-        consumer_slot: usize,
+impl Inbox {
+    pub(super) const fn new(
+        state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
+        ports: Vec<InputPort>,
     ) -> Self {
         Self {
-            log,
-            retention,
-            consumer_slot,
+            state,
+            ports,
+            claim: None,
         }
-    }
-}
-
-impl Inbox {
-    pub(super) const fn new(ports: Vec<InputPort>) -> Self {
-        Self { ports, claim: None }
     }
 
     pub(super) const fn is_input_free(&self) -> bool {
@@ -92,16 +90,12 @@ impl Inbox {
         self.claim.as_ref()
     }
 
-    pub(super) fn complete(
-        &self,
-        state: &OrderedMap<Vec<u8>, Vec<u8>, Small>,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), StationError> {
+    pub(super) fn complete(&self, access: TransactionAccess<'_>) -> Result<(), StationError> {
         let claim = self
             .claim
             .as_ref()
             .expect("an input completion requires an offered claim");
-        let durable_active = read_active_input(state, self.ports.len(), access)?;
+        let durable_active = read_active_input(&self.state, self.ports.len(), access)?;
         if durable_active != claim.port {
             return Err(StationError::ClaimActiveInputMismatch {
                 claimed: claim.port,
@@ -110,14 +104,15 @@ impl Inbox {
         }
 
         let port = &self.ports[claim.port];
-        let (head, target) =
-            port.retention
-                .target_after(port.consumer_slot, claim.offset, access)?;
+        let (head, target) = port
+            .output
+            .target_after(port.consumer_slot, claim.offset, access)?;
         let next_offset = claim
             .offset
             .checked_add(1)
             .expect("an AppendLog entry offset always has a successor");
-        state.access(access)?.put(
+        let mut state = self.state.access(access)?;
+        state.put(
             &cursor_key(claim.port),
             &encode_cursor(next_offset).to_vec(),
         )?;
@@ -126,11 +121,11 @@ impl Inbox {
         } else {
             claim.port + 1
         };
-        state.access(access)?.put(
+        state.put(
             &ACTIVE_INPUT_KEY.to_vec(),
             &encode_active_input(next_port).to_vec(),
         )?;
-        port.retention.reclaim(head, target, access)
+        port.output.reclaim(head, target, access)
     }
 
     pub(super) fn clear_claim(&mut self) {
@@ -140,6 +135,11 @@ impl Inbox {
     #[cfg(test)]
     pub(super) fn ports(&self) -> &[InputPort] {
         &self.ports
+    }
+
+    #[cfg(test)]
+    pub(super) const fn state(&self) -> &OrderedMap<Vec<u8>, Vec<u8>, Small> {
+        &self.state
     }
 
     #[cfg(test)]
@@ -153,6 +153,13 @@ impl Inbox {
     }
 }
 
+impl InputPort {
+    #[cfg(test)]
+    pub(super) const fn output(&self) -> &Arc<Output> {
+        &self.output
+    }
+}
+
 impl ConsumerCursor {
     pub(crate) const fn new(
         state: ReadOnly<OrderedMap<Vec<u8>, Vec<u8>, Small>>,
@@ -163,27 +170,95 @@ impl ConsumerCursor {
 
     fn read(&self, consumer: usize, access: TransactionAccess<'_>) -> Result<u64, StationError> {
         let state = self.state.access(access)?;
-        let encoded = state
-            .get(&cursor_key(self.input))?
-            .ok_or(StationError::MissingConsumerCursor { consumer })?;
+        Self::decode(consumer, state.get(&cursor_key(self.input))?)
+    }
+
+    fn read_snapshot(
+        &self,
+        consumer: usize,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<u64, StationError> {
+        let state = self.state.read(access)?;
+        Self::decode(consumer, state.get(&cursor_key(self.input))?)
+    }
+
+    fn decode(consumer: usize, encoded: Option<Vec<u8>>) -> Result<u64, StationError> {
+        let encoded = encoded.ok_or(StationError::MissingConsumerCursor { consumer })?;
         decode_cursor(&encoded).ok_or(StationError::MalformedConsumerCursor { consumer })
     }
 }
 
-impl OutputRetention {
-    pub(crate) fn new(output: AppendLog<Vec<u8>>, consumers: Vec<ConsumerCursor>) -> Self {
+impl Output {
+    pub(super) fn new(
+        log: AppendLog<Vec<u8>>,
+        capacity_bytes: NonZeroU64,
+        consumers: Vec<ConsumerCursor>,
+    ) -> Self {
         assert!(
             !consumers.is_empty(),
             "a validated producer output must have at least one consumer edge"
         );
         Self {
-            output,
+            log,
+            capacity_bytes,
             consumers: consumers.into_boxed_slice(),
         }
     }
 
-    pub(crate) fn validate(&self, access: TransactionAccess<'_>) -> Result<(), StationError> {
-        self.validated_state(access).map(|_| ())
+    pub(crate) fn port(self: &Arc<Self>, consumer_slot: usize) -> InputPort {
+        assert!(
+            consumer_slot < self.consumers.len(),
+            "an assembled input port must reference its producer consumer slot"
+        );
+        InputPort {
+            output: Arc::clone(self),
+            consumer_slot,
+        }
+    }
+
+    pub(super) fn validate_snapshot(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<(), StationError> {
+        let bounds = self.log.read(access)?.bounds()?;
+        let cursors = self
+            .consumers
+            .iter()
+            .enumerate()
+            .map(|(consumer, cursor)| cursor.read_snapshot(consumer, access))
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_state(bounds, cursors).map(|_| ())
+    }
+
+    pub(super) fn try_append(
+        &self,
+        change: &Change,
+        access: TransactionAccess<'_>,
+    ) -> Result<bool, StationError> {
+        let encoded =
+            encode_change(change).map_err(|source| StationError::InvalidOutputChange { source })?;
+        Ok(self
+            .log
+            .access(access)?
+            .try_append(&encoded, self.capacity_bytes)?
+            .is_some())
+    }
+
+    fn read_one(
+        &self,
+        offset: u64,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<Option<(u64, Vec<u8>)>, StationError> {
+        let mut selected = None;
+        self.log.read(access)?.scan(
+            offset,
+            ScanLimit::new(1, usize::MAX)?,
+            |entry| -> Result<(), StationError> {
+                selected = Some((entry.offset(), entry.decode_owned()?));
+                Ok(())
+            },
+        )?;
+        Ok(selected)
     }
 
     fn target_after(
@@ -215,16 +290,6 @@ impl OutputRetention {
             .iter()
             .min()
             .expect("a validated producer has at least one consumer");
-        let next_head = bounds
-            .start
-            .checked_add(1)
-            .expect("a completable retained head always has a successor");
-        if target > next_head {
-            return Err(StationError::RetentionTargetJump {
-                head: bounds.start,
-                target,
-            });
-        }
         Ok((bounds.start, target))
     }
 
@@ -232,31 +297,14 @@ impl OutputRetention {
         &self,
         access: TransactionAccess<'_>,
     ) -> Result<(Range<u64>, Vec<u64>), StationError> {
-        let bounds = self.output.access(access)?.bounds()?;
-        let mut cursors = Vec::with_capacity(self.consumers.len());
-        for (consumer, cursor) in self.consumers.iter().enumerate() {
-            let offset = cursor.read(consumer, access)?;
-            if offset < bounds.start || offset > bounds.end {
-                return Err(StationError::ConsumerCursorOutOfRange {
-                    consumer,
-                    offset,
-                    head: bounds.start,
-                    tail: bounds.end,
-                });
-            }
-            cursors.push(offset);
-        }
-        let minimum = *cursors
+        let bounds = self.log.access(access)?.bounds()?;
+        let cursors = self
+            .consumers
             .iter()
-            .min()
-            .expect("a validated producer has at least one consumer");
-        if minimum != bounds.start {
-            return Err(StationError::RetentionHeadMismatch {
-                head: bounds.start,
-                minimum,
-            });
-        }
-        Ok((bounds, cursors))
+            .enumerate()
+            .map(|(consumer, cursor)| cursor.read(consumer, access))
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_state(bounds, cursors)
     }
 
     fn reclaim(
@@ -269,7 +317,7 @@ impl OutputRetention {
             return Ok(());
         }
         let actual = self
-            .output
+            .log
             .access(access)?
             .truncate_before(target, RECLAIM_ONE)?;
         if actual != target {
@@ -277,16 +325,21 @@ impl OutputRetention {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) const fn log(&self) -> &AppendLog<Vec<u8>> {
+        &self.log
+    }
 }
 
-impl Station {
+impl Inbox {
     /// Idempotently loads at most one durable input Claim into the Inbox.
-    pub(crate) fn intake(
+    pub(super) fn intake(
         &mut self,
         reads: &ReadTransactions,
         transactions: &mut Transactions,
     ) -> Result<bool, StationError> {
-        if self.inbox.claim.is_some() || self.inbox.ports.is_empty() {
+        if self.claim.is_some() || self.ports.is_empty() {
             return Ok(false);
         }
 
@@ -297,34 +350,29 @@ impl Station {
                 .get(&ACTIVE_INPUT_KEY.to_vec())?
                 .ok_or(StationError::MissingActiveInput)?;
             let active = decode_active_input(&encoded).ok_or(StationError::MalformedActiveInput)?;
-            if active >= self.inbox.ports.len() {
+            if active >= self.ports.len() {
                 return Err(StationError::ActiveInputOutOfRange {
                     input: active,
-                    input_count: self.inbox.ports.len(),
+                    input_count: self.ports.len(),
                 });
             }
 
             let mut selected = None;
-            for index in (active..self.inbox.ports.len()).chain(0..active) {
+            for index in (active..self.ports.len()).chain(0..active) {
                 let encoded = state
                     .get(&cursor_key(index))?
                     .ok_or(StationError::MissingCursor { input: index })?;
                 let offset = decode_cursor(&encoded)
                     .ok_or(StationError::MalformedCursor { input: index })?;
-                let input_log = self.inbox.ports[index].log.read(transaction.access())?;
-                input_log.scan(
-                    offset,
-                    ScanLimit::new(1, usize::MAX)?,
-                    |entry| -> Result<(), StationError> {
-                        selected = Some(EncodedClaim {
-                            port: index,
-                            offset: entry.offset(),
-                            encoded: entry.decode_owned()?,
-                        });
-                        Ok(())
-                    },
-                )?;
-                if selected.is_some() {
+                if let Some((offset, encoded)) = self.ports[index]
+                    .output
+                    .read_one(offset, transaction.access())?
+                {
+                    selected = Some(EncodedClaim {
+                        port: index,
+                        offset,
+                        encoded,
+                    });
                     break;
                 }
             }
@@ -349,13 +397,40 @@ impl Station {
                 source,
             }
         })?;
-        self.inbox.claim = Some(Claim {
+        self.claim = Some(Claim {
             port: selected.port,
             offset: selected.offset,
             change,
         });
         Ok(pinned)
     }
+}
+
+fn validate_state(
+    bounds: Range<u64>,
+    cursors: Vec<u64>,
+) -> Result<(Range<u64>, Vec<u64>), StationError> {
+    for (consumer, offset) in cursors.iter().copied().enumerate() {
+        if offset < bounds.start || offset > bounds.end {
+            return Err(StationError::ConsumerCursorOutOfRange {
+                consumer,
+                offset,
+                head: bounds.start,
+                tail: bounds.end,
+            });
+        }
+    }
+    let minimum = *cursors
+        .iter()
+        .min()
+        .expect("a validated producer has at least one consumer");
+    if minimum != bounds.start {
+        return Err(StationError::RetentionHeadMismatch {
+            head: bounds.start,
+            minimum,
+        });
+    }
+    Ok((bounds, cursors))
 }
 
 fn read_active_input(

@@ -85,15 +85,15 @@ Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所
 split 出 owned reader。拓扑和资源目录都没有运行期修改入口。
 
 资源创建和 Station 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
-output；第二遍才按 Definition 中的有序 source ID 找到上游 output，并将 clone 单向衰减为
-`ReadOnly<AppendLog<Vec<u8>>>` 注入下游。声明顺序不必是拓扑顺序，fan-out 仍共享同一份日志。
-每条 consumer edge 都装配成一个 `InputPort`：它持有只读 input log、对应 producer 的共享
-`OutputRetention` 和自己的 consumer slot。`OutputRetention` 把 producer output 与所有 edge 的只读
-cursor capability 绑定起来，使完成输入的一方只能确认自己的 edge，却能在同一事务中计算整个
-fan-out 的安全保留边界。Station 不知道上下游 Station ID，只拥有自己的 `Inbox`、state 和带固定
-capacity 的完整可选 output；`Inbox` 统一拥有有序 ports 与至多一个 owned `Claim`。装配还从已验证
-Definition 派生唯一运行期 schedule：先按拓扑层次排列，同一层按 Station 声明顺序排列。build/open
-得到相同结果，不需要持久化 schedule，也没有第二套回收 schedule。
+output；第二遍先从每个 target state 派生各 consumer edge 的只读 cursor capability，再把每个
+producer 的 output log、capacity 和完整 consumer frontier 绑定成唯一、不可错配的 output capability。
+producer append、capacity 判定与所有下游 intake、frontier 校验和物理回收必须引用同一 capability，
+不得分别持有可独立替换的日志或 retention handle；每条 input edge 只补充自己的 consumer slot。
+声明顺序不必是拓扑顺序，fan-out 仍共享同一个物理日志与保留边界。Station 不知道上下游 Station ID，
+只拥有 Operation、带固定 capacity 的可选 output capability，以及统一拥有 state、有序 ports 与至多
+一个 owned `Claim` 的 `Inbox`。
+装配还从已验证 Definition 派生唯一运行期 schedule：先按拓扑层次排列，同一层按 Station 声明
+顺序排列。build/open 得到相同结果，不需要持久化 schedule，也没有第二套回收 schedule。
 
 `Inbox` 没有 Claim 时，输入准备通过一个 RO snapshot 从 durable active input 开始循环检查各端口，
 跳过空日志，并只选择第一个可用 entry。选中端口若不是当前 active input，Station 在调用 Operation
@@ -129,7 +129,7 @@ Operation。物理空日志按 `head == tail` 判断并允许一条 oversize ent
 只要当前输入尚未 `Complete`，无论前一 turn 是 `Idle`、`Commit`、错误、output append 失败、commit
 失败还是进程重开，下一次调用都必须收到同一 `(port, offset, bytes)` 所标识的完整 Change；这要求
 同一日志 entry 的原始字节不变，不要求重新解码后拥有相同内存地址。Change 内部的处理位置属于
-Operation continuation，必须存入该 Operation 通过 Definition 声明的 Store 状态；Station 只拥有
+Operation continuation，必须存入该 Operation 通过 Definition 声明的 Store 状态；`Inbox` 只拥有
 durable active input、各 input cursor 和可丢弃重建的 owned Claim。
 
 每条边的 cursor 只定位一个完整 Change IPC entry；它是当前持久化分批下的读取位置，而不是稳定
@@ -147,6 +147,8 @@ event ID。Station 可以为了吞吐稳定地合并或切分物理批次，但�
 `truncate_before` 并精确删除 head entry。重复 source edge 各有独立 cursor 和 consumer slot，全部
 参与最小值；最慢 consumer 因而继续保护共享 entry。cursor advance、active rotation、物理 head 和
 `AppendLog` retained-byte 账本要么一起提交，要么一起回滚，不存在独立回收 phase、补偿轮次或回收 debt。
+open 只把这些 retention 不变量违例报告为 `InvalidRuntimeState`；底层 Store 访问失败继续保留为结构化
+`FlowError::Store`，不会被字符串化或误分类。
 
 `Flow::advance` 聚合为 `Progressed > Backpressured > Idle`：任一 Operation、durable input pin 或
 Complete 内联回收有提交就返回 `Progressed`；整轮没有提交、但至少一个实际 output 被容量拒绝时返回
@@ -162,7 +164,8 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
 `FlowFactory::open()` 先读取、解码并重新校验 manifest，再打开全部数据对象和 output，最后按
-source ID 重新注入 inputs、装配 Station 并冻结 Store。调用方不需要重新提交 Definition。
+source ID 重新注入 inputs、装配 Station；第二次 Definition 读取和所有 output frontier 校验共享
+同一个 RO snapshot，不启动或提交写事务。调用方不需要重新提交 Definition。
 
 当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
@@ -193,8 +196,8 @@ Flow Definition 中的连接关系，不再拥有独立构建类型。`flow/mod.
 schedule 与分离的读写事务启动能力，不创建或打开 Store 资源。`flow/advance.rs` 定义公共
 outcome 并实现一次有界轮次：按 schedule 为每个 Station 至多提供一个 turn，先 `intake` 再进入
 `process`，通过公共 `Flow::advance` 暴露，不运行第二个回收 phase。`station/mod.rs` 只声明边界；
-`station/runtime.rs` 保存 Station 装配与 `process` 边界，`station/input.rs` 独立拥有 `Inbox`、
-`Claim`、active/cursor、consumer cursor capability 与 Complete 内联 output reclaim，
+`station/runtime.rs` 保存 Station 装配与 `process` 边界，`station/input.rs` 独立拥有统一 `Output`、
+`Inbox`、`Claim`、active/cursor、consumer cursor capability 与 Complete 内联 output reclaim，
 `station/protocol.rs` 只拥有 outcome/error。Station 不长期持有事务启动
 能力，也不接收 Store，不知道 Station ID、上游 Station、资源名或底层物理布局。私有
 `assembly.rs` 只承接 build/open 共用的 source ID 解析和最终 Station 装配，不公开新的领域类型。
@@ -206,8 +209,8 @@ outcome 并实现一次有界轮次：按 schedule 为每个 Station 至多提�
 
 ## 当前边界
 
-本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Station 的
-state、只读 inputs、可选 output、稳定 active input/cursor 和可重建的确定性拓扑 schedule。
+本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Inbox 独占的
+state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和可重建的确定性拓扑 schedule。
 输入准备已能通过 RO snapshot 从 active input 循环查找、durable pin 并幂等准备至多一个带来源
 身份的 Claim；`process` 已支持 `Action::{Idle, Commit, Complete}`，Complete 在同一写事务中
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，

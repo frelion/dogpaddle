@@ -1,20 +1,21 @@
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationKind,
     operation::{Action, Operation, OperationInput},
 };
 use dogpaddle_store::{
-    AppendLog, OrderedMap, ReadTransactions, Small, StoreError, TransactionAccess, Transactions,
+    AppendLog, OrderedMap, ReadTransactionAccess, ReadTransactions, Small, StoreError,
+    TransactionAccess, Transactions,
 };
 
 use crate::flow::AdvanceOutcome;
 
 use super::{
     input::{
-        ACTIVE_INPUT_KEY, CURSOR_ORIGIN, Inbox, InputPort, cursor_key, encode_active_input,
-        encode_cursor,
+        ACTIVE_INPUT_KEY, CURSOR_ORIGIN, ConsumerCursor, Inbox, InputPort, Output, cursor_key,
+        encode_active_input, encode_cursor,
     },
     protocol::StationError,
 };
@@ -23,19 +24,13 @@ pub(crate) struct StationParts {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     operation: Box<dyn Operation>,
     kind: OperationKind,
-    output: Option<StationOutput>,
+    output: Option<(AppendLog<Vec<u8>>, NonZeroU64)>,
 }
 
 pub(crate) struct Station {
-    pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     pub(super) operation: Box<dyn Operation>,
     pub(super) inbox: Inbox,
-    pub(super) output: Option<StationOutput>,
-}
-
-pub(super) struct StationOutput {
-    log: AppendLog<Vec<u8>>,
-    capacity_bytes: NonZeroU64,
+    pub(super) output: Option<Arc<Output>>,
 }
 
 impl Station {
@@ -44,7 +39,7 @@ impl Station {
         reads: &ReadTransactions,
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
-        let pinned = self.intake(reads, transactions)?;
+        let pinned = self.inbox.intake(reads, transactions)?;
         let outcome = self.process(transactions)?;
         if pinned {
             Ok(AdvanceOutcome::Progressed)
@@ -53,7 +48,7 @@ impl Station {
         }
     }
 
-    pub(crate) fn process(
+    pub(super) fn process(
         &mut self,
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
@@ -79,11 +74,11 @@ impl Station {
             }
         };
 
-        if !append_output(self.output.as_ref(), output, access)? {
+        if !append_output(self.output.as_deref(), output, access)? {
             return Ok(AdvanceOutcome::Backpressured);
         }
         if completes_input {
-            self.inbox.complete(&self.state, access)?;
+            self.inbox.complete(access)?;
         }
         transaction.commit()?;
 
@@ -92,10 +87,19 @@ impl Station {
         }
         Ok(AdvanceOutcome::Progressed)
     }
+
+    pub(crate) fn validate_output(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<(), StationError> {
+        self.output
+            .as_deref()
+            .map_or(Ok(()), |output| output.validate_snapshot(access))
+    }
 }
 
 fn append_output(
-    output: Option<&StationOutput>,
+    output: Option<&Output>,
     emitted: Option<Change>,
     access: TransactionAccess<'_>,
 ) -> Result<bool, StationError> {
@@ -117,7 +121,7 @@ impl StationParts {
             state,
             operation,
             kind,
-            output: output.map(|(log, capacity_bytes)| StationOutput::new(log, capacity_bytes)),
+            output,
         }
     }
 
@@ -138,58 +142,35 @@ impl StationParts {
         Ok(())
     }
 
-    pub(crate) fn output(&self) -> Option<&AppendLog<Vec<u8>>> {
-        self.output.as_ref().map(|output| &output.log)
-    }
-
     pub(crate) fn state(&self) -> &OrderedMap<Vec<u8>, Vec<u8>, Small> {
         &self.state
     }
 
-    pub(crate) fn finish(self, inputs: Vec<InputPort>) -> Station {
+    pub(crate) fn prepare_output(&mut self, consumers: Vec<ConsumerCursor>) -> Option<Arc<Output>> {
+        self.output
+            .take()
+            .map(|(log, capacity_bytes)| Arc::new(Output::new(log, capacity_bytes, consumers)))
+    }
+
+    pub(crate) fn finish(self, inputs: Vec<InputPort>, output: Option<Arc<Output>>) -> Station {
         assert_eq!(
             inputs.len(),
             usize::try_from(self.kind.input_count()).expect("an Operation input count fits usize"),
             "station input capabilities must match its operation definition"
         );
         assert_eq!(
-            self.output.is_some(),
+            output.is_some(),
             self.kind.has_output(),
             "station output capability must match its operation definition"
         );
+        assert!(
+            self.output.is_none(),
+            "station output must be moved exactly once during assembly"
+        );
         Station {
-            state: self.state,
             operation: self.operation,
-            inbox: Inbox::new(inputs),
-            output: self.output,
+            inbox: Inbox::new(self.state, inputs),
+            output,
         }
-    }
-}
-
-impl StationOutput {
-    pub(super) const fn new(log: AppendLog<Vec<u8>>, capacity_bytes: NonZeroU64) -> Self {
-        Self {
-            log,
-            capacity_bytes,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) const fn log(&self) -> &AppendLog<Vec<u8>> {
-        &self.log
-    }
-
-    fn try_append(
-        &self,
-        change: &Change,
-        access: TransactionAccess<'_>,
-    ) -> Result<bool, StationError> {
-        let encoded =
-            encode_change(change).map_err(|source| StationError::InvalidOutputChange { source })?;
-        Ok(self
-            .log
-            .access(access)?
-            .try_append(&encoded, self.capacity_bytes)?
-            .is_some())
     }
 }

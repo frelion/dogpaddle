@@ -55,8 +55,6 @@ pub(crate) enum StationError {
     },
     #[error("output retention head {head} does not equal minimum consumer cursor {minimum}")]
     RetentionHeadMismatch { head: u64, minimum: u64 },
-    #[error("output retention target jumped from head {head} to {target}")]
-    RetentionTargetJump { head: u64, target: u64 },
     #[error("output retention truncated to {actual} instead of target {target}")]
     RetentionTruncateMismatch { target: u64, actual: u64 },
 }

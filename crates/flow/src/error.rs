@@ -46,6 +46,16 @@ pub enum FlowError {
     },
 }
 
+pub(crate) fn retention_open_error(station_id: &str, source: StationError) -> FlowError {
+    match source {
+        StationError::Store(source) => FlowError::Store(source),
+        source => FlowError::InvalidRuntimeState {
+            station_id: station_id.to_owned(),
+            reason: source.to_string(),
+        },
+    }
+}
+
 /// Failure during one Station turn.
 #[derive(Debug, Error)]
 #[error("station {station_id:?} failed: {source}")]

@@ -6,6 +6,12 @@ use dogpaddle_operation::{
         sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
     },
 };
+use dogpaddle_store::StoreError;
+
+use crate::{
+    error::{FlowError, retention_open_error},
+    station::StationError,
+};
 
 use super::{
     FlowDefinitionError, FlowFactory, InvalidStationIdReason, StationRef, TopologyError,
@@ -816,4 +822,39 @@ fn decoder_rejects_semantic_bit_flips_and_checksum_damage() {
 #[test]
 fn checksum_uses_the_stable_ieee_crc32_algorithm() {
     assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+}
+
+#[test]
+fn retention_open_error_preserves_store_error_classification() {
+    let error = retention_open_error(
+        "producer",
+        StationError::Store(StoreError::CorruptAppendLog {
+            reason: "test corruption",
+        }),
+    );
+
+    assert!(matches!(
+        error,
+        FlowError::Store(StoreError::CorruptAppendLog {
+            reason: "test corruption"
+        })
+    ));
+}
+
+#[test]
+fn retention_open_error_maps_an_invariant_to_runtime_state() {
+    let error = retention_open_error(
+        "producer",
+        StationError::RetentionHeadMismatch {
+            head: 3,
+            minimum: 4,
+        },
+    );
+
+    assert!(matches!(
+        error,
+        FlowError::InvalidRuntimeState { station_id, reason }
+            if station_id == "producer"
+                && reason == "output retention head 3 does not equal minimum consumer cursor 4"
+    ));
 }

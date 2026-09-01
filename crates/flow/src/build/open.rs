@@ -3,7 +3,12 @@ use std::path::Path;
 use dogpaddle_operation::DataInstances;
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
-use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
+use crate::{
+    assembly::assemble_stations,
+    error::{FlowError, retention_open_error},
+    flow::Flow,
+    station::StationParts,
+};
 
 use super::{FlowFactory, StationDefinition, codec};
 
@@ -12,8 +17,8 @@ impl FlowFactory {
     ///
     /// The definition is read first, then the Store is reopened so every
     /// declared data object can be opened before the Store is frozen into
-    /// transaction capability. The definition is read again to guard the
-    /// two-phase open.
+    /// transaction capability. One read-only snapshot then checks the definition
+    /// again and validates every output frontier before the Flow is returned.
     ///
     /// # Errors
     ///
@@ -37,29 +42,22 @@ impl FlowFactory {
             .enumerate()
             .map(|(index, station)| open_station_part(&store, index, station))
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut transactions, reads) = store.into_transactions().split();
-        let observed_definition = {
-            let transaction = reads.begin()?;
-            let published = published.read(transaction.access())?;
-            published.get()?.ok_or(FlowError::IncompleteBuild)?
-        };
-        if observed_definition != definition_bytes {
-            return Err(FlowError::DefinitionChangedDuringOpen);
-        }
+        let (transactions, reads) = store.into_transactions().split();
         let assembled = assemble_stations(&definition, station_parts);
         {
-            let transaction = transactions.begin()?;
-            for (index, retention) in assembled.retentions.iter().enumerate() {
-                if let Some(retention) = retention {
-                    retention.validate(transaction.access()).map_err(|source| {
-                        FlowError::InvalidRuntimeState {
-                            station_id: definition.stations()[index].id().to_owned(),
-                            reason: source.to_string(),
-                        }
-                    })?;
-                }
+            let transaction = reads.begin()?;
+            let published = published.read(transaction.access())?;
+            let observed_definition = published.get()?.ok_or(FlowError::IncompleteBuild)?;
+            if observed_definition != definition_bytes {
+                return Err(FlowError::DefinitionChangedDuringOpen);
             }
-            transaction.commit()?;
+            for (station_definition, station) in
+                definition.stations().iter().zip(assembled.stations.iter())
+            {
+                station
+                    .validate_output(transaction.access())
+                    .map_err(|source| retention_open_error(station_definition.id(), source))?;
+            }
         }
 
         Ok(Flow::from_parts(

@@ -1,22 +1,21 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use dogpaddle_store::ReadOnly;
 
 use crate::{
     build::FlowDefinition,
     flow::RuntimeTopology,
-    station::{ConsumerCursor, InputPort, OutputRetention, Station, StationParts},
+    station::{ConsumerCursor, Station, StationParts},
 };
 
 pub(crate) struct AssembledFlow {
     pub(crate) stations: Vec<Station>,
     pub(crate) topology: RuntimeTopology,
-    pub(crate) retentions: Vec<Option<Arc<OutputRetention>>>,
 }
 
 pub(crate) fn assemble_stations(
     definition: &FlowDefinition,
-    parts: Vec<StationParts>,
+    mut parts: Vec<StationParts>,
 ) -> AssembledFlow {
     let indices = definition
         .stations()
@@ -51,14 +50,10 @@ pub(crate) fn assemble_stations(
         }
     }
 
-    let retentions = consumers
+    let outputs = consumers
         .into_iter()
         .enumerate()
-        .map(|(source, consumers)| {
-            parts[source]
-                .output()
-                .map(|output| Arc::new(OutputRetention::new(output.clone(), consumers)))
-        })
+        .map(|(source, consumers)| parts[source].prepare_output(consumers))
         .collect::<Vec<_>>();
     let inputs = sources_by_target
         .iter()
@@ -69,15 +64,10 @@ pub(crate) fn assemble_stations(
                 .copied()
                 .zip(slots)
                 .map(|(source, slot)| {
-                    let output = parts[source]
-                        .output()
-                        .expect("validated source station must produce output");
-                    let retention = Arc::clone(
-                        retentions[source]
-                            .as_ref()
-                            .expect("validated source output must have retention state"),
-                    );
-                    InputPort::new(ReadOnly::new(output.clone()), retention, slot)
+                    outputs[source]
+                        .as_ref()
+                        .expect("validated source station must produce output")
+                        .port(slot)
                 })
                 .collect::<Vec<_>>()
         })
@@ -86,13 +76,13 @@ pub(crate) fn assemble_stations(
     let stations = parts
         .into_iter()
         .zip(inputs)
-        .map(|(part, inputs)| part.finish(inputs))
+        .zip(outputs)
+        .map(|((part, inputs), output)| part.finish(inputs, output))
         .collect();
     let schedule = topological_schedule(&sources_by_target);
     AssembledFlow {
         stations,
         topology: RuntimeTopology { schedule },
-        retentions,
     }
 }
 
