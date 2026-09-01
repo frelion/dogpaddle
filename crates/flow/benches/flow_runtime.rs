@@ -6,23 +6,23 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
-    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
-    positive_usize_list, require_benchmark_build,
+    Fields, HostEnvironment, JsonlWriter, LatencySummary, SampleRecord, SummaryRecord,
+    positive_usize, positive_usize_list, require_benchmark_build,
 };
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, Store};
+use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
 use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_runtime";
 const SMOKE_CHAIN_STATIONS: &[usize] = &[3, 8];
-const REFERENCE_CHAIN_STATIONS: &[usize] = &[3, 8, 32];
-const SMOKE_FANOUTS: &[usize] = &[1, 4];
-const REFERENCE_FANOUTS: &[usize] = &[1, 4, 16];
+const REFERENCE_CHAIN_STATIONS: &[usize] = &[3, 16, 64];
+const SMOKE_FANOUTS: &[usize] = &[4];
+const REFERENCE_FANOUTS: &[usize] = &[4, 16];
 const SMOKE_ROUNDS_PER_SAMPLE: usize = 32;
 const REFERENCE_ROUNDS_PER_SAMPLE: usize = 1_024;
 const SMOKE_SAMPLES: usize = 3;
@@ -41,26 +41,32 @@ struct Config {
 }
 
 #[derive(Clone, Copy)]
-enum Topology {
+enum Scenario {
     Sink,
+    CapacityPressure,
     Chain { station_count: usize },
     Fanout { consumers: usize },
 }
 
-#[derive(Clone, Copy)]
-struct Scenario {
-    label: &'static str,
-    topology: Topology,
-    output_capacity_bytes: NonZeroU64,
-    capacity_mode: &'static str,
-    prefill_capacity_backlog: bool,
+struct Measurement {
+    round_latencies: Vec<Duration>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct OutcomeCounts {
-    idle: usize,
-    backpressured: usize,
-    progressed: usize,
+#[derive(Clone, Copy)]
+struct WorkCounts {
+    advances: usize,
+    committed_station_turns: usize,
+    input_completions: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeMetrics {
+    elapsed: Duration,
+    latency: LatencySummary,
+    work: WorkCounts,
+    advances_per_second: u128,
+    committed_station_turns_per_second: u128,
+    input_completions_per_second: u128,
 }
 
 impl Config {
@@ -128,10 +134,19 @@ impl Config {
     }
 }
 
-impl Topology {
+impl Scenario {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Sink => "sink_steady",
+            Self::CapacityPressure => "capacity_pressure_steady",
+            Self::Chain { .. } => "chain_steady",
+            Self::Fanout { .. } => "fanout_steady",
+        }
+    }
+
     const fn station_count(self) -> usize {
         match self {
-            Self::Sink => 2,
+            Self::Sink | Self::CapacityPressure => 2,
             Self::Chain { station_count } => station_count,
             Self::Fanout { consumers } => consumers + 1,
         }
@@ -139,36 +154,91 @@ impl Topology {
 
     const fn fanout(self) -> usize {
         match self {
-            Self::Sink | Self::Chain { .. } => 1,
+            Self::Sink | Self::CapacityPressure | Self::Chain { .. } => 1,
             Self::Fanout { consumers } => consumers,
         }
     }
 
-    const fn name(self) -> &'static str {
+    const fn topology_name(self) -> &'static str {
         match self {
-            Self::Sink => "source_sink",
+            Self::Sink | Self::CapacityPressure => "source_sink",
             Self::Chain { .. } => "count_chain",
             Self::Fanout { .. } => "source_fanout_sinks",
         }
     }
-}
 
-impl OutcomeCounts {
-    fn observe(&mut self, outcome: AdvanceOutcome) {
-        match outcome {
-            AdvanceOutcome::Idle => self.idle += 1,
-            AdvanceOutcome::Backpressured => self.backpressured += 1,
-            AdvanceOutcome::Progressed => self.progressed += 1,
+    const fn output_capacity_bytes(self) -> NonZeroU64 {
+        match self {
+            Self::CapacityPressure => TIGHT_OUTPUT_CAPACITY_BYTES,
+            Self::Sink | Self::Chain { .. } | Self::Fanout { .. } => OUTPUT_CAPACITY_BYTES,
         }
     }
 
-    fn validate_all_progressed(self, rounds: usize) {
-        assert_eq!(self.idle, 0, "steady runtime unexpectedly became idle");
-        assert_eq!(
-            self.backpressured, 0,
-            "steady runtime unexpectedly reported backpressure"
-        );
-        assert_eq!(self.progressed, rounds);
+    const fn capacity_mode(self) -> &'static str {
+        if self.is_capacity_pressure() {
+            "prefilled_backlog"
+        } else {
+            "roomy"
+        }
+    }
+
+    const fn is_capacity_pressure(self) -> bool {
+        matches!(self, Self::CapacityPressure)
+    }
+
+    const fn committed_station_turns_per_advance(self) -> usize {
+        if self.is_capacity_pressure() {
+            1
+        } else {
+            self.station_count()
+        }
+    }
+
+    const fn input_completions_per_advance(self) -> usize {
+        if self.is_capacity_pressure() {
+            1
+        } else {
+            self.station_count() - 1
+        }
+    }
+
+    fn work_counts(self, advances: usize) -> WorkCounts {
+        WorkCounts {
+            advances,
+            committed_station_turns: advances
+                .checked_mul(self.committed_station_turns_per_advance())
+                .expect("Flow runtime committed Station turn count fits usize"),
+            input_completions: advances
+                .checked_mul(self.input_completions_per_advance())
+                .expect("Flow runtime input completion count fits usize"),
+        }
+    }
+}
+
+impl Measurement {
+    fn elapsed(&self) -> Duration {
+        sum_durations(&self.round_latencies)
+    }
+
+    fn metrics(&self, scenario: Scenario) -> RuntimeMetrics {
+        RuntimeMetrics::new(scenario, &self.round_latencies)
+    }
+}
+
+impl RuntimeMetrics {
+    fn new(scenario: Scenario, round_latencies: &[Duration]) -> Self {
+        let elapsed = sum_durations(round_latencies);
+        let work = scenario.work_counts(round_latencies.len());
+        let latency = LatencySummary::from_samples(round_latencies)
+            .expect("summarize Flow runtime round latencies");
+        Self {
+            elapsed,
+            latency,
+            work,
+            advances_per_second: rate(work.advances, elapsed),
+            committed_station_turns_per_second: rate(work.committed_station_turns, elapsed),
+            input_completions_per_second: rate(work.input_completions, elapsed),
+        }
     }
 }
 
@@ -179,95 +249,51 @@ fn main() {
     let config = Config::load(root.profile());
     println!("DogPaddle Flow steady runtime benchmark");
     println!(
-        "scope=advance steady=chain+fanout+sink+tight_capacity keep_heavy=unavailable_public_builtin sync=durable execution=single-thread validation=outside-timing"
+        "scope=advance steady=chain+fanout+sink+tight_capacity input_retaining_commits_per_change=0 unavailable_input_retaining_commit_profiles=1+8 sync=durable execution=single-thread timing=individual_advance validation=outside-timing"
     );
     emit_environment(&root);
     emit_configuration(&config);
 
-    benchmark_scenario(
-        &root,
-        &config,
-        Scenario {
-            label: "sink_steady",
-            topology: Topology::Sink,
-            output_capacity_bytes: OUTPUT_CAPACITY_BYTES,
-            capacity_mode: "roomy",
-            prefill_capacity_backlog: false,
-        },
-    );
-    benchmark_scenario(
-        &root,
-        &config,
-        Scenario {
-            label: "capacity_pressure_steady",
-            topology: Topology::Sink,
-            output_capacity_bytes: TIGHT_OUTPUT_CAPACITY_BYTES,
-            capacity_mode: "prefilled_backlog",
-            prefill_capacity_backlog: true,
-        },
-    );
+    benchmark_scenario(&root, &config, Scenario::Sink);
+    benchmark_scenario(&root, &config, Scenario::CapacityPressure);
     for &station_count in &config.chain_stations {
-        benchmark_scenario(
-            &root,
-            &config,
-            Scenario {
-                label: "chain_steady",
-                topology: Topology::Chain { station_count },
-                output_capacity_bytes: OUTPUT_CAPACITY_BYTES,
-                capacity_mode: "roomy",
-                prefill_capacity_backlog: false,
-            },
-        );
+        benchmark_scenario(&root, &config, Scenario::Chain { station_count });
     }
     for &consumers in &config.fanouts {
-        benchmark_scenario(
-            &root,
-            &config,
-            Scenario {
-                label: "fanout_steady",
-                topology: Topology::Fanout { consumers },
-                output_capacity_bytes: OUTPUT_CAPACITY_BYTES,
-                capacity_mode: "roomy",
-                prefill_capacity_backlog: false,
-            },
-        );
+        benchmark_scenario(&root, &config, Scenario::Fanout { consumers });
     }
 }
 
 fn benchmark_scenario(root: &BenchRoot, config: &Config, scenario: Scenario) {
-    let fixture = root.sample(scenario.label);
+    let fixture = root.sample(scenario.label());
     let mut flow = scenario_factory(fixture.path(), scenario)
         .build()
         .expect("build Flow runtime benchmark fixture");
     validate_flow(&flow, fixture.path(), scenario);
-    if scenario.prefill_capacity_backlog {
+    if scenario.is_capacity_pressure() {
         drop(flow);
-        seed_capacity_backlog(fixture.path(), measured_rounds(config));
+        seed_capacity_backlog(fixture.path(), capacity_backlog_entries(config));
         flow = FlowFactory::open(fixture.path())
             .expect("reopen capacity-pressure runtime benchmark fixture");
     }
 
-    let (_, warmup_outcomes) = run_rounds(&mut flow, config.warmup_rounds);
-    warmup_outcomes.validate_all_progressed(config.warmup_rounds);
+    run_rounds(&mut flow, config.warmup_rounds);
 
-    let mut durations = Vec::with_capacity(config.samples);
+    let mut measurements = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
-        let (elapsed, outcomes) = run_rounds(&mut flow, config.rounds_per_sample);
-        outcomes.validate_all_progressed(config.rounds_per_sample);
-        emit_sample(scenario, config.rounds_per_sample, sample, elapsed);
-        durations.push(elapsed);
+        let measurement = run_rounds(&mut flow, config.rounds_per_sample);
+        emit_sample(scenario, sample, &measurement);
+        measurements.push(measurement);
     }
-    report(scenario, config.rounds_per_sample, &durations);
+    report(scenario, &measurements);
 
     validate_flow(&flow, fixture.path(), scenario);
     drop(flow);
-    if scenario.prefill_capacity_backlog {
-        validate_capacity_source_rolled_back(fixture.path());
-    }
+    validate_durable_work(fixture.path(), scenario, completed_rounds(config));
     drop(fixture);
 }
 
-fn measured_rounds(config: &Config) -> usize {
+fn completed_rounds(config: &Config) -> usize {
     let sampled = config
         .rounds_per_sample
         .checked_mul(config.samples)
@@ -275,7 +301,12 @@ fn measured_rounds(config: &Config) -> usize {
     config
         .warmup_rounds
         .checked_add(sampled)
-        .and_then(|rounds| rounds.checked_add(1))
+        .expect("Flow runtime benchmark completed round count fits usize")
+}
+
+fn capacity_backlog_entries(config: &Config) -> usize {
+    completed_rounds(config)
+        .checked_add(1)
         .expect("Flow runtime benchmark capacity backlog count fits usize")
 }
 
@@ -317,40 +348,126 @@ fn encoded_fixture_change() -> Vec<u8> {
     encode_change(&change).expect("encode capacity backlog Change")
 }
 
-fn validate_capacity_source_rolled_back(path: &Path) {
-    let store = Store::open(path).expect("open Flow Store to validate capacity pressure");
+fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usize) {
+    let completed_rounds =
+        u64::try_from(completed_rounds).expect("Flow runtime completed round count fits u64");
+    let store = Store::open(path).expect("open Flow Store to validate runtime work counts");
     let position: Cell<u64> = store
         .open_data("station/00000000/operation/sequence_source.position")
-        .expect("open source position to validate capacity pressure");
+        .expect("open source position to validate runtime work counts");
+    let input_states = (1..scenario.station_count())
+        .map(|index| {
+            store
+                .open_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(&format!(
+                    "station/{index:08x}/state"
+                ))
+                .expect("open Station state to validate runtime work counts")
+        })
+        .collect::<Vec<_>>();
+    let count_states = match scenario {
+        Scenario::Chain { station_count } => (1..station_count - 1)
+            .map(|index| {
+                store
+                    .open_data::<Cell<u64>>(&format!("station/{index:08x}/operation/count"))
+                    .expect("open Count state to validate runtime work counts")
+            })
+            .collect::<Vec<_>>(),
+        Scenario::Sink | Scenario::CapacityPressure | Scenario::Fanout { .. } => Vec::new(),
+    };
+    let capacity_output = scenario.is_capacity_pressure().then(|| {
+        store
+            .open_data::<AppendLog<Vec<u8>>>("station/00000000/output")
+            .expect("open source output to validate capacity backlog")
+    });
     let mut transactions = store.into_transactions();
     let transaction = transactions
         .begin()
-        .expect("begin capacity-pressure validation transaction");
+        .expect("begin runtime work-count validation transaction");
+    let source_position = position
+        .access(transaction.access())
+        .expect("access source position to validate runtime work counts")
+        .get()
+        .expect("read source position to validate runtime work counts");
+    let expected_position = if scenario.is_capacity_pressure() {
+        None
+    } else {
+        Some(
+            completed_rounds
+                .checked_sub(1)
+                .expect("Flow runtime executes at least one round"),
+        )
+    };
     assert_eq!(
-        position
-            .access(transaction.access())
-            .expect("access source position to validate capacity pressure")
-            .get()
-            .expect("read source position to validate capacity pressure"),
-        None,
-        "capacity-pressure source position must roll back every rejected output"
+        source_position, expected_position,
+        "durable source position must match committed source turns"
     );
+    let cursor_key = b"input/00000000/cursor".to_vec();
+    for state in &input_states {
+        let encoded = state
+            .access(transaction.access())
+            .expect("access Station state to validate runtime input completions")
+            .get(&cursor_key)
+            .expect("read Station cursor to validate runtime input completions")
+            .expect("runtime input Station has a durable cursor");
+        let bytes = <[u8; size_of::<u64>()]>::try_from(encoded.as_slice())
+            .expect("runtime input cursor is a big-endian u64");
+        assert_eq!(
+            u64::from_be_bytes(bytes),
+            completed_rounds,
+            "durable cursor must match input completions"
+        );
+    }
+    for count in &count_states {
+        assert_eq!(
+            count
+                .access(transaction.access())
+                .expect("access Count state to validate committed turns")
+                .get()
+                .expect("read Count state to validate committed turns"),
+            Some(completed_rounds),
+            "durable Count state must match committed Count turns"
+        );
+    }
+    if let Some(output) = capacity_output {
+        let tail = completed_rounds
+            .checked_add(1)
+            .expect("Flow runtime capacity backlog tail fits u64");
+        assert_eq!(
+            output
+                .access(transaction.access())
+                .expect("access source output to validate capacity backlog")
+                .bounds()
+                .expect("read source output bounds to validate capacity backlog"),
+            completed_rounds..tail,
+            "capacity-pressure backlog must retain exactly one entry"
+        );
+    }
 }
 
-fn run_rounds(flow: &mut Flow, rounds: usize) -> (Duration, OutcomeCounts) {
-    let mut outcomes = OutcomeCounts::default();
-    let started = std::time::Instant::now();
-    for _ in 0..rounds {
-        outcomes.observe(flow.advance().expect("advance runtime benchmark Flow"));
+fn run_rounds(flow: &mut Flow, rounds: usize) -> Measurement {
+    let mut round_latencies = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let started = std::time::Instant::now();
+        let outcome = flow.advance();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome.expect("advance runtime benchmark Flow"),
+            AdvanceOutcome::Progressed,
+            "steady runtime round {round} did not progress"
+        );
+        round_latencies.push(elapsed);
     }
-    (started.elapsed(), outcomes)
+    Measurement { round_latencies }
 }
 
 fn scenario_factory(path: &Path, scenario: Scenario) -> FlowFactory {
-    match scenario.topology {
-        Topology::Sink => sink_factory(path, scenario.output_capacity_bytes),
-        Topology::Chain { station_count } => chain_factory(path, station_count),
-        Topology::Fanout { consumers } => fanout_factory(path, consumers),
+    let output_capacity_bytes = scenario.output_capacity_bytes();
+    match scenario {
+        Scenario::Sink | Scenario::CapacityPressure => sink_factory(path, output_capacity_bytes),
+        Scenario::Chain { station_count } => {
+            chain_factory(path, station_count, output_capacity_bytes)
+        }
+        Scenario::Fanout { consumers } => fanout_factory(path, consumers, output_capacity_bytes),
     }
 }
 
@@ -363,13 +480,17 @@ fn sink_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     factory
 }
 
-fn chain_factory(path: &Path, station_count: usize) -> FlowFactory {
+fn chain_factory(
+    path: &Path,
+    station_count: usize,
+    output_capacity_bytes: NonZeroU64,
+) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
-    factory.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
+    factory.output_capacity_bytes(previous, output_capacity_bytes);
     for index in 1..station_count - 1 {
         let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
-        factory.output_capacity_bytes(current, OUTPUT_CAPACITY_BYTES);
+        factory.output_capacity_bytes(current, output_capacity_bytes);
         factory.connect([previous], current);
         previous = current;
     }
@@ -378,10 +499,10 @@ fn chain_factory(path: &Path, station_count: usize) -> FlowFactory {
     factory
 }
 
-fn fanout_factory(path: &Path, consumers: usize) -> FlowFactory {
+fn fanout_factory(path: &Path, consumers: usize, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     let source = factory.station("source", SequenceSourceDefinition::new(0));
-    factory.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
+    factory.output_capacity_bytes(source, output_capacity_bytes);
     for index in 0..consumers {
         let sink = factory.station(format!("sink-{index:08x}"), DiscardDefinition::new());
         factory.connect([source], sink);
@@ -391,7 +512,7 @@ fn fanout_factory(path: &Path, consumers: usize) -> FlowFactory {
 
 fn validate_flow(flow: &Flow, path: &Path, scenario: Scenario) {
     assert_eq!(flow.path(), path);
-    assert_eq!(flow.station_count(), scenario.topology.station_count());
+    assert_eq!(flow.station_count(), scenario.station_count());
 }
 
 fn emit_environment(root: &BenchRoot) {
@@ -428,8 +549,45 @@ fn emit_configuration(config: &Config) {
             TIGHT_OUTPUT_CAPACITY_BYTES.get(),
         )
         .expect("add Flow runtime tight output capacity")
-        .with("keep_heavy", "unavailable_public_builtin")
-        .expect("add Flow runtime Keep coverage boundary")
+        .with("input_retaining_commits_per_change_covered", [0_usize])
+        .expect("add Flow runtime covered input-retaining Commit profile")
+        .with(
+            "input_retaining_commits_per_change_unavailable",
+            [1_usize, 8],
+        )
+        .expect("add Flow runtime unavailable input-retaining Commit profiles")
+        .with(
+            "input_retaining_commit_unavailable_reason",
+            "sealed_definition_set_has_no_input_operation_that_returns_commit",
+        )
+        .expect("add Flow runtime input-retaining Commit coverage boundary")
+        .with(
+            "input_completion_unit",
+            "durable_input_cursor_frontier_advance_fanout_counts_each_edge",
+        )
+        .expect("add Flow runtime input completion unit")
+        .with(
+            "committed_station_turn_unit",
+            "outer_station_transaction_committed_after_action_pin_and_reclaim_are_not_additional_turns",
+        )
+        .expect("add Flow runtime committed Station turn unit")
+        .with("round_latency_scope", "one_complete_flow_advance_call")
+        .expect("add Flow runtime round latency scope")
+        .with("round_latency_percentile", "nearest_rank")
+        .expect("add Flow runtime round latency percentile convention")
+        .with("throughput_rate", "integer_floor_from_timed_advance_ns")
+        .expect("add Flow runtime throughput convention")
+        .with("sample_elapsed", "sum_of_individually_timed_advances")
+        .expect("add Flow runtime elapsed convention")
+        .with("raw_round_latencies", "sample_field_round_latencies_ns")
+        .expect("add Flow runtime raw round latency convention")
+        .with("measurement_protocol", "individual_advance_v2")
+        .expect("add Flow runtime measurement protocol")
+        .with(
+            "comparison_boundary",
+            "rerun_all_variants_v2_pre_v2_batch_medians_are_not_comparable",
+        )
+        .expect("add Flow runtime comparison boundary")
         .with("fixtures", "built_once_outside_timing")
         .expect("add Flow runtime fixture policy")
         .with("validation", "outside_timing")
@@ -439,68 +597,153 @@ fn emit_configuration(config: &Config) {
     emit_record(&configuration);
 }
 
-fn emit_sample(scenario: Scenario, rounds: usize, sample: usize, elapsed: Duration) {
-    let sample = SampleRecord::new(
-        BENCHMARK,
-        scenario.label,
-        sample,
-        elapsed,
-        scenario_fields(scenario, rounds),
-    )
-    .expect("construct Flow runtime benchmark sample record");
+fn emit_sample(scenario: Scenario, sample: usize, measurement: &Measurement) {
+    let metrics = measurement.metrics(scenario);
+    let round_latencies_ns = measurement
+        .round_latencies
+        .iter()
+        .map(Duration::as_nanos)
+        .collect::<Vec<_>>();
+    let fields = measurement_fields(scenario, metrics)
+        .with("round_latencies_ns", round_latencies_ns)
+        .expect("add raw Flow runtime round latencies");
+    let sample = SampleRecord::new(BENCHMARK, scenario.label(), sample, metrics.elapsed, fields)
+        .expect("construct Flow runtime benchmark sample record");
     emit_record(&sample);
 }
 
-fn report(scenario: Scenario, rounds: usize, samples: &[Duration]) {
-    let summary =
-        DurationSummary::from_samples(samples).expect("summarize Flow runtime benchmark samples");
+fn report(scenario: Scenario, measurements: &[Measurement]) {
+    let sample_durations = measurements
+        .iter()
+        .map(Measurement::elapsed)
+        .collect::<Vec<_>>();
+    let round_latencies = measurements
+        .iter()
+        .flat_map(|measurement| measurement.round_latencies.iter().copied())
+        .collect::<Vec<_>>();
+    let metrics = RuntimeMetrics::new(scenario, &round_latencies);
+    let summary = DurationSummary::from_samples(&sample_durations)
+        .expect("summarize Flow runtime benchmark samples");
     let min = summary.min();
     let median = summary.median();
     let max = summary.max();
     assert!(!median.is_zero(), "benchmark median must be non-zero");
     println!(
-        "{} topology={} stations={} fanout={} rounds={rounds}: min={min:?} median={median:?} max={max:?}",
-        scenario.label,
-        scenario.topology.name(),
-        scenario.topology.station_count(),
-        scenario.topology.fanout(),
+        "{} topology={} stations={} fanout={} advances={} batch_min={min:?} batch_median={median:?} batch_max={max:?} advances/s={} committed_station_turns/s={} input_completions/s={} round_p50={:?} round_p95={:?}",
+        scenario.label(),
+        scenario.topology_name(),
+        scenario.station_count(),
+        scenario.fanout(),
+        metrics.work.advances,
+        metrics.advances_per_second,
+        metrics.committed_station_turns_per_second,
+        metrics.input_completions_per_second,
+        metrics.latency.p50(),
+        metrics.latency.p95(),
     );
     let summary = SummaryRecord::new(
         BENCHMARK,
-        scenario.label,
+        scenario.label(),
         summary,
-        scenario_fields(scenario, rounds),
+        measurement_fields(scenario, metrics),
     )
     .expect("construct Flow runtime benchmark summary record");
     emit_record(&summary);
 }
 
-fn scenario_fields(scenario: Scenario, rounds: usize) -> Fields {
+fn scenario_fields(scenario: Scenario) -> Fields {
     Fields::new()
-        .with("topology", scenario.topology.name())
+        .with("topology", scenario.topology_name())
         .expect("add Flow runtime topology")
-        .with("station_count", scenario.topology.station_count())
+        .with("station_count", scenario.station_count())
         .expect("add Flow runtime station count")
-        .with("fanout", scenario.topology.fanout())
+        .with("fanout", scenario.fanout())
         .expect("add Flow runtime fan-out")
         .with(
             "output_capacity_bytes",
-            scenario.output_capacity_bytes.get(),
+            scenario.output_capacity_bytes().get(),
         )
         .expect("add Flow runtime output capacity")
-        .with("capacity_mode", scenario.capacity_mode)
+        .with("capacity_mode", scenario.capacity_mode())
         .expect("add Flow runtime capacity mode")
         .with(
             "producer_expected_backpressured",
-            scenario.prefill_capacity_backlog,
+            scenario.is_capacity_pressure(),
         )
         .expect("add Flow runtime producer pressure expectation")
-        .with("rounds", rounds)
-        .expect("add Flow runtime rounds")
         .with("expected_outcome", "progressed")
         .expect("add Flow runtime expected outcome")
-        .with("input_disposition", "complete_only")
+        .with(
+            "input_disposition",
+            "complete_only_input_retaining_commit_0",
+        )
         .expect("add Flow runtime input disposition")
+        .with("input_retaining_commits_per_change", 0)
+        .expect("add Flow runtime input-retaining Commit count")
+        .with(
+            "committed_station_turns_per_advance",
+            scenario.committed_station_turns_per_advance(),
+        )
+        .expect("add Flow runtime committed Station turns per advance")
+        .with(
+            "input_completions_per_advance",
+            scenario.input_completions_per_advance(),
+        )
+        .expect("add Flow runtime input completions per advance")
+}
+
+fn measurement_fields(scenario: Scenario, metrics: RuntimeMetrics) -> Fields {
+    scenario_fields(scenario)
+        .with("advances", metrics.work.advances)
+        .expect("add Flow runtime advance count")
+        .with(
+            "committed_station_turns",
+            metrics.work.committed_station_turns,
+        )
+        .expect("add Flow runtime committed Station turn count")
+        .with("input_completions", metrics.work.input_completions)
+        .expect("add Flow runtime input completion count")
+        .with("timed_advance_ns_total", metrics.elapsed.as_nanos())
+        .expect("add Flow runtime timed advance duration")
+        .with("advances_per_second", metrics.advances_per_second)
+        .expect("add Flow runtime advance throughput")
+        .with(
+            "committed_station_turns_per_second",
+            metrics.committed_station_turns_per_second,
+        )
+        .expect("add Flow runtime committed Station turn throughput")
+        .with(
+            "input_completions_per_second",
+            metrics.input_completions_per_second,
+        )
+        .expect("add Flow runtime input completion throughput")
+        .with("round_latency_p50_ns", metrics.latency.p50().as_nanos())
+        .expect("add Flow runtime round latency p50")
+        .with("round_latency_p95_ns", metrics.latency.p95().as_nanos())
+        .expect("add Flow runtime round latency p95")
+}
+
+fn sum_durations(durations: &[Duration]) -> Duration {
+    durations
+        .iter()
+        .copied()
+        .fold(Duration::ZERO, |total, duration| {
+            total
+                .checked_add(duration)
+                .expect("Flow runtime timed duration fits Duration")
+        })
+}
+
+fn rate(count: usize, elapsed: Duration) -> u128 {
+    assert!(
+        !elapsed.is_zero(),
+        "Flow runtime throughput requires nonzero elapsed time"
+    );
+    u128::try_from(count)
+        .expect("Flow runtime work count fits u128")
+        .checked_mul(1_000_000_000)
+        .expect("Flow runtime rate numerator fits u128")
+        / elapsed.as_nanos()
 }
 
 fn emit_record(record: &impl BenchmarkRecord) {
