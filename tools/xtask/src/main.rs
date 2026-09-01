@@ -122,6 +122,18 @@ const BENCH_SMOKE: &[BenchSpec] = &[
         ],
     ),
     BenchSpec::new(
+        "dogpaddle-flow",
+        "flow_runtime",
+        &[
+            ("DOGPADDLE_FLOW_BENCH_PROFILE", "smoke"),
+            ("DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS", "3"),
+            ("DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS", "2"),
+            ("DOGPADDLE_FLOW_RUNTIME_BENCH_ROUNDS_PER_SAMPLE", "1"),
+            ("DOGPADDLE_FLOW_RUNTIME_BENCH_SAMPLES", "1"),
+            ("DOGPADDLE_FLOW_RUNTIME_BENCH_WARMUP_ROUNDS", "1"),
+        ],
+    ),
+    BenchSpec::new(
         "dogpaddle-change-store-integration",
         "change_append_log",
         &[
@@ -323,9 +335,9 @@ fn validate_bench_specs() -> Result<(), String> {
             }
         }
     }
-    if BENCH_SMOKE.len() != 10 {
+    if BENCH_SMOKE.len() != 11 {
         return Err(format!(
-            "benchmark smoke matrix must contain 10 explicit targets, found {}",
+            "benchmark smoke matrix must contain 11 explicit targets, found {}",
             BENCH_SMOKE.len()
         ));
     }
@@ -395,7 +407,7 @@ mod tests {
     #[test]
     fn benchmark_smoke_matrix_is_complete_and_unambiguous() {
         validate_bench_specs().unwrap();
-        assert_eq!(BENCH_SMOKE.len(), 10);
+        assert_eq!(BENCH_SMOKE.len(), 11);
     }
 
     #[test]

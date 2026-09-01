@@ -32,5 +32,11 @@ path = "benches/flow_lifecycle.rs"
 harness = false
 test = false
 
+[[bench]]
+name = "flow_runtime"
+path = "benches/flow_runtime.rs"
+harness = false
+test = false
+
 [lints]
 workspace = true

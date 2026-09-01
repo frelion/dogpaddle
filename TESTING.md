@@ -10,12 +10,17 @@ DogPaddle 用同一套规则组织全部产品 crate 和跨 crate 接缝。测�
 | --- | --- | --- | --- | --- |
 | Change | IPC 私有 framing/layout | Change、Schema、Projection、codec | `change_core`、`change_codec` | 暂无独立状态，不适用 |
 | Store | 当前无必须访问私有实现的测试 | Store、事务、布局、Cell、OrderedMap、AppendLog、崩溃恢复 | `cell`、`ordered_map`、`append_log` | `append_log_endurance` |
-| Operation | decoder registry、类别、类型擦除和具名实例绑定 | Definition、codec、materialize、SequenceSource、Count、Discard | `operation_core` | 当前只有定长 Cell 状态，不适用 |
-| Flow | definition/拓扑 codec、派生 schedule、Station intake/process/GC、容量拒绝重放与事务原子性 | build/open、资源布局、失败无副作用、真实 `advance` 三态有界轮次 | `flow_lifecycle`（冷路径） | 尚无持续运行入口，不适用 |
+| Operation | decoder registry、kind、类型擦除和具名实例绑定 | Definition、codec、materialize、SequenceSource、Count、Discard | `operation_core` | 当前只有定长 Cell 状态，不适用 |
+| Flow | definition/拓扑 codec、派生 schedule、Inbox/Claim、Complete 内联回收、容量拒绝重放与事务原子性 | build/open、资源布局、失败无副作用、真实 `advance` 三态有界轮次 | `flow_lifecycle`（冷路径）、`flow_runtime`（steady `advance`） | 当前调度有界，不适用 |
 | Change + Store | 不适用 | 完整 Change entry、回放、事务、重批、reopen | `change_append_log` | `change_append_log_endurance` |
 
 这里的“不适用”是显式边界，不是漏测。新增稳定运行路径、无界状态或跨层调度器时，必须先确定
 成本边界和结果 oracle，再登记新的 benchmark 或 endurance target。
+
+`flow_runtime` 只使用公共内建 Operation，覆盖 source-to-sink、Count chain、fan-out sinks 和预填
+output 后 producer 持续容量拒绝而 Sink 持续推进的 steady `advance`。fixture、预填与 oracle 位于
+计时外；当前没有能从公共 API 构造 Keep-heavy Flow 的内建 Operation，因此该轴被显式记录为未覆盖，
+不为 benchmark 新增产品 API。
 
 ## 目录与 Cargo 约束
 
@@ -162,7 +167,7 @@ workload 的原始配对样本；建立稳定基线前只报告结果，不凭�
 ## 验证层级
 
 工作区提供两个规范入口：`cargo xtask check` 依次运行格式、debug/release correctness、Clippy 和
-`-D warnings` Rustdoc；`cargo xtask bench-smoke` 使用代码内固定的缩小参数实际执行以下 10 个
+`-D warnings` Rustdoc；`cargo xtask bench-smoke` 使用代码内固定的缩小参数实际执行以下 11 个
 release target。
 benchmark smoke matrix 变更必须与 Cargo target 和本节同步评审，不能依赖个人 shell 历史。
 `bench-smoke` 会先清除父进程全部 `DOGPADDLE_*` 变量，再逐 target 注入受审查配置，避免本地
@@ -174,7 +179,7 @@ GitHub Actions 的 PR/push gate 使用固定 Ubuntu 24.04 和 `rust-toolchain.to
 
 - `Workspace check` 执行规范入口 `cargo xtask check`；
 - `Latest stable compatibility` 只补充运行最新 stable 的 workspace tests，不替代 MSRV gate；
-- `Benchmark protocol smoke` 在 workspace gate 成功后实际运行 10 个 release target，只验证场景、
+- `Benchmark protocol smoke` 在 workspace gate 成功后实际运行 11 个 release target，只验证场景、
   oracle 和 typed machine protocol，绝不比较 wall-clock；
 - 每周 `Endurance protocol` 用 GitHub hosted runner 执行受控 Store 与 Change + AppendLog 长稳并上传
   14 天原始日志。共享 runner 的 latency 不能进入正式性能基线。
@@ -205,6 +210,7 @@ cargo bench -p dogpaddle-store --bench append_log
 cargo bench -p dogpaddle-store --bench append_log_endurance
 cargo bench -p dogpaddle-operation --bench operation_core
 cargo bench -p dogpaddle-flow --bench flow_lifecycle
+cargo bench -p dogpaddle-flow --bench flow_runtime
 cargo bench -p dogpaddle-change-store-integration --bench change_append_log
 cargo bench -p dogpaddle-change-store-integration --bench change_append_log_endurance
 ```
