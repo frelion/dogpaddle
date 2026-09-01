@@ -335,3 +335,47 @@ fn open_reports_an_operation_data_size_mismatch() {
         })) if name == "station/00000000/operation/sequence_source.position"
     ));
 }
+
+#[test]
+fn open_rejects_a_retained_head_behind_the_minimum_consumer_cursor() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([source], sink);
+    builder.output_capacity_bytes(source, capacity(1_024));
+    drop(builder.build().unwrap());
+
+    let store = Store::open(&path).unwrap();
+    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin().unwrap();
+        output
+            .access(transaction.access())
+            .unwrap()
+            .append(&b"retained".to_vec())
+            .unwrap();
+        sink_state
+            .access(transaction.access())
+            .unwrap()
+            .put(
+                &b"input/00000000/cursor".to_vec(),
+                &1_u64.to_be_bytes().to_vec(),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    assert!(matches!(
+        FlowFactory::open(path),
+        Err(FlowError::InvalidRuntimeState { station_id, reason })
+            if station_id == "source"
+                && reason.contains("retention head 0")
+                && reason.contains("minimum consumer cursor 1")
+    ));
+}

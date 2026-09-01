@@ -37,7 +37,7 @@ impl FlowFactory {
             .enumerate()
             .map(|(index, station)| open_station_part(&store, index, station))
             .collect::<Result<Vec<_>, _>>()?;
-        let (transactions, reads) = store.into_transactions().split();
+        let (mut transactions, reads) = store.into_transactions().split();
         let observed_definition = {
             let transaction = reads.begin()?;
             let published = published.read(transaction.access())?;
@@ -46,14 +46,28 @@ impl FlowFactory {
         if observed_definition != definition_bytes {
             return Err(FlowError::DefinitionChangedDuringOpen);
         }
-        let (stations, topology) = assemble_stations(&definition, station_parts);
+        let assembled = assemble_stations(&definition, station_parts);
+        {
+            let transaction = transactions.begin()?;
+            for (index, retention) in assembled.retentions.iter().enumerate() {
+                if let Some(retention) = retention {
+                    retention.validate(transaction.access()).map_err(|source| {
+                        FlowError::InvalidRuntimeState {
+                            station_id: definition.stations()[index].id().to_owned(),
+                            reason: source.to_string(),
+                        }
+                    })?;
+                }
+            }
+            transaction.commit()?;
+        }
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
-            stations,
-            topology,
+            assembled.stations,
+            assembled.topology,
             transactions,
             reads,
         ))
@@ -102,7 +116,12 @@ fn open_station_part(
             open_required_data::<AppendLog<Vec<u8>>>(store, &name).map(|log| (log, capacity))
         })
         .transpose()?;
-    Ok(StationParts::new(state, operation, output))
+    Ok(StationParts::new(
+        state,
+        operation,
+        definition.kind(),
+        output,
+    ))
 }
 
 fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {

@@ -1,10 +1,9 @@
-mod gc;
 mod input;
 mod protocol;
 mod runtime;
 
-pub(crate) use gc::ConsumerCursor;
-pub(crate) use protocol::{ProcessOutcome, StationError};
+pub(crate) use input::{ConsumerCursor, InputPort, OutputRetention};
+pub(crate) use protocol::StationError;
 pub(crate) use runtime::{Station, StationParts};
 
 #[cfg(test)]

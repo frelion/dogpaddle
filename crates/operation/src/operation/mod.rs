@@ -3,8 +3,6 @@ use std::error::Error;
 use dogpaddle_change::Change;
 use dogpaddle_store::TransactionAccess;
 
-use crate::OperationDefinition;
-
 pub mod sink;
 pub mod source;
 pub mod transform;
@@ -18,43 +16,24 @@ pub struct OperationInput<'change> {
     pub change: &'change Change,
 }
 
-/// Progress made against the complete input Change offered to one turn.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InputProgress {
-    /// Retains the current input for another turn.
-    ///
-    /// The caller commits the Operation's state and optional output, but does
-    /// not advance the input. Its next turn must receive the same complete
-    /// Change on the same port.
-    Keep,
-    /// Completes the current input Change.
-    ///
-    /// The caller may advance to another input only after committing the
-    /// Operation's state, optional output, and input progress atomically.
-    Complete,
-}
-
-/// Work produced by a turn whose transaction may be committed.
+/// Action returned by one Operation turn.
 #[derive(Clone, Debug)]
-pub struct TurnCommit {
-    /// Progress for the offered input, or `None` for an input-free Operation.
-    ///
-    /// This must be `Some` exactly when the turn received an
-    /// [`OperationInput`].
-    pub input: Option<InputProgress>,
-    /// At most one owned output Change published by this turn.
-    pub output: Option<Change>,
-}
-
-/// Decision returned by one Operation turn.
-#[derive(Clone, Debug)]
-pub enum TurnDecision {
+pub enum Action {
     /// Makes no progress and asks the caller to roll back the turn.
     ///
     /// Any offered input remains current and must be offered again unchanged.
     Idle,
-    /// Makes progress that the caller may commit atomically.
-    Commit(TurnCommit),
+    /// Commits the Operation's state and optional output without completing an input.
+    ///
+    /// An input Operation retains the complete input Change for its next turn.
+    /// An input-free Operation uses this action for a successful turn.
+    Commit(Option<Change>),
+    /// Commits the Operation's state, optional output, and input completion atomically.
+    ///
+    /// The caller advances the offered input only after the enclosing
+    /// transaction commits successfully. Returning this action from an
+    /// input-free turn is a protocol violation.
+    Complete(Option<Change>),
 }
 
 /// Type-erased failure from one concrete Operation turn.
@@ -62,28 +41,25 @@ pub type OperationError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Runtime parent trait implemented by every materialized operation.
 pub trait Operation: Send + Sync + 'static {
-    /// Returns the pure definition that materialized this operation.
-    fn definition(&self) -> &dyn OperationDefinition;
-
     /// Executes one turn in an existing transaction.
     ///
     /// A source receives `None`. An input Operation receives exactly one
     /// complete Change. The caller retains transaction ownership and interprets
-    /// the returned decision:
+    /// the returned action:
     ///
-    /// - [`TurnDecision::Idle`] rolls back every write from the turn.
-    /// - [`InputProgress::Keep`] commits the Operation's state and optional
-    ///   output without advancing the input. The same complete Change on the
+    /// - [`Action::Idle`] rolls back every write from the turn.
+    /// - [`Action::Commit`] commits the Operation's state and optional output
+    ///   without advancing an offered input. The same complete Change on the
     ///   same port is offered again on its next turn.
-    /// - [`InputProgress::Complete`] commits the Operation's state, optional
-    ///   output, and completion of the current Change atomically.
+    /// - [`Action::Complete`] commits the Operation's state, optional output,
+    ///   and completion of the offered Change atomically.
     ///
-    /// An input-free Operation returns a commit with `input: None`. An
-    /// Operation receiving an input returns a commit with `input: Some(_)`.
-    /// Returning a shape that does not match the invocation is a protocol
-    /// violation.
+    /// An input-free Operation uses [`Action::Commit`] for successful work. An
+    /// input Operation chooses [`Action::Commit`] to retain the current Change
+    /// or [`Action::Complete`] to finish it. Returning [`Action::Complete`]
+    /// without an input is a protocol violation.
     ///
-    /// A turn can be replayed after an idle decision, an error, or failure of
+    /// A turn can be replayed after an idle action, an error, or failure of
     /// the caller's enclosing commit. Implementations must therefore avoid
     /// non-transactional observable side effects inside `turn`; those require a
     /// separate idempotency protocol beyond this Store transaction contract.
@@ -97,5 +73,5 @@ pub trait Operation: Send + Sync + 'static {
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<TurnDecision, OperationError>;
+    ) -> Result<Action, OperationError>;
 }

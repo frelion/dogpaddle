@@ -7,10 +7,10 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationCategory,
-    OperationDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    OperationKind,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Operation, OperationError, OperationInput, TurnCommit, TurnDecision},
+    operation::{Action, Operation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -21,7 +21,7 @@ const DATA: &[DataDeclaration] = &[POSITION.declaration()];
 ///
 /// The source accepts no inputs and emits `u64` values beginning at `start`.
 /// After committing [`u64::MAX`], subsequent turns return
-/// [`TurnDecision::Idle`] without changing persistent state or producing output.
+/// [`Action::Idle`] without changing persistent state or producing output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SequenceSourceDefinition {
     start: u64,
@@ -62,12 +62,8 @@ impl SequenceSourceDefinition {
 impl SealedDefinition for SequenceSourceDefinition {}
 
 impl OperationDefinition for SequenceSourceDefinition {
-    fn category(&self) -> OperationCategory {
-        OperationCategory::Source
-    }
-
-    fn input_count(&self) -> usize {
-        0
+    fn kind(&self) -> OperationKind {
+        OperationKind::Source
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -109,15 +105,11 @@ impl SequenceSourceOperation {
 }
 
 impl Operation for SequenceSourceOperation {
-    fn definition(&self) -> &dyn OperationDefinition {
-        &self.definition
-    }
-
     fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<TurnDecision, OperationError> {
+    ) -> Result<Action, OperationError> {
         if input.is_some() {
             return Err(SequenceSourceError::UnexpectedInput.into());
         }
@@ -126,7 +118,7 @@ impl Operation for SequenceSourceOperation {
         let next = match position.get()? {
             Some(previous) => {
                 let Some(next) = previous.checked_add(1) else {
-                    return Ok(TurnDecision::Idle);
+                    return Ok(Action::Idle);
                 };
                 next
             }
@@ -135,10 +127,7 @@ impl Operation for SequenceSourceOperation {
         let output = uint64_change(vec![next])?;
 
         position.set(&next)?;
-        Ok(TurnDecision::Commit(TurnCommit {
-            input: None,
-            output: Some(output),
-        }))
+        Ok(Action::Commit(Some(output)))
     }
 }
 

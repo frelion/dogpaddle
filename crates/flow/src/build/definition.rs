@@ -44,19 +44,20 @@ impl StationDefinition {
     }
 
     pub(crate) fn input_count(&self) -> usize {
-        self.operation.input_count()
+        usize::try_from(self.operation.kind().input_count())
+            .expect("an Operation input count fits usize")
     }
 
     pub(crate) fn is_source(&self) -> bool {
-        self.operation.category().is_source()
+        self.operation.kind().is_source()
     }
 
     pub(crate) fn is_sink(&self) -> bool {
-        self.operation.category().is_sink()
+        self.operation.kind().is_sink()
     }
 
     pub(crate) fn has_output(&self) -> bool {
-        self.operation.category().has_output()
+        self.operation.kind().has_output()
     }
 
     pub(crate) const fn output_capacity_bytes(&self) -> Option<NonZeroU64> {

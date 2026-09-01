@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataInstances, MaterializeError, OperationCategory, OperationDefinition,
+    DataInstances, MaterializeError, OperationDefinition, OperationKind,
     codec::DECODERS,
     definition::DataName,
     operation::{
@@ -47,21 +47,16 @@ fn decoder_registry_exactly_matches_builtins() {
 }
 
 #[test]
-fn builtin_categories_match_their_input_contracts() {
-    for definition in builtin_definitions() {
-        match definition.category() {
-            OperationCategory::Source => assert_eq!(
-                definition.input_count(),
-                0,
-                "source definition accepts upstream input"
-            ),
-            OperationCategory::Transform | OperationCategory::Sink => assert_ne!(
-                definition.input_count(),
-                0,
-                "input-consuming definition accepts no upstream input"
-            ),
-        }
-    }
+fn builtin_kinds_match_their_structural_contracts() {
+    let kinds = builtin_definitions().map(|definition| definition.kind());
+    assert_eq!(
+        kinds,
+        [
+            OperationKind::Source,
+            OperationKind::Transform(std::num::NonZeroU32::MIN),
+            OperationKind::Sink(std::num::NonZeroU32::MIN),
+        ]
+    );
 }
 
 #[test]

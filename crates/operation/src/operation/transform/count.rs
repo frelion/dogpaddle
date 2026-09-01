@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -7,12 +10,10 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationCategory,
-    OperationDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    OperationKind,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{
-        InputProgress, Operation, OperationError, OperationInput, TurnCommit, TurnDecision,
-    },
+    operation::{Action, Operation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -70,12 +71,8 @@ impl CountDefinition {
 impl SealedDefinition for CountDefinition {}
 
 impl OperationDefinition for CountDefinition {
-    fn category(&self) -> OperationCategory {
-        OperationCategory::Transform
-    }
-
-    fn input_count(&self) -> usize {
-        1
+    fn kind(&self) -> OperationKind {
+        OperationKind::Transform(NonZeroU32::MIN)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -112,15 +109,11 @@ impl CountOperation {
 }
 
 impl Operation for CountOperation {
-    fn definition(&self) -> &dyn OperationDefinition {
-        &self.definition
-    }
-
     fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
-    ) -> Result<TurnDecision, OperationError> {
+    ) -> Result<Action, OperationError> {
         let input = input.ok_or(CountError::MissingInput)?;
         if input.port != 0 {
             return Err(CountError::InvalidInputPort { port: input.port }.into());
@@ -137,10 +130,7 @@ impl Operation for CountOperation {
         let output = uint64_change(values)?;
 
         count.set(&final_count)?;
-        Ok(TurnDecision::Commit(TurnCommit {
-            input: Some(InputProgress::Complete),
-            output: Some(output),
-        }))
+        Ok(Action::Complete(Some(output)))
     }
 }
 

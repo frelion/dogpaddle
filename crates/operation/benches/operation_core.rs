@@ -297,18 +297,24 @@ fn measure_encode(definition: &dyn OperationDefinition, operations: usize) -> Du
 fn measure_decode(encoded: &[u8], operations: usize) -> Duration {
     let expected_signature = {
         let definition = decode_definition(encoded).expect("decode benchmark fixture");
-        definition.input_count() + definition.data().len()
+        definition_signature(definition.as_ref())
     };
     let mut checksum = 0_usize;
     let started = std::time::Instant::now();
     for _ in 0..operations {
         let definition = decode_definition(encoded).expect("decode valid benchmark definition");
-        checksum = checksum.wrapping_add(definition.input_count() + definition.data().len());
+        checksum = checksum.wrapping_add(definition_signature(definition.as_ref()));
         black_box(definition);
     }
     let elapsed = started.elapsed();
     assert_eq!(checksum, expected_signature.wrapping_mul(operations));
     elapsed
+}
+
+fn definition_signature(definition: &dyn OperationDefinition) -> usize {
+    usize::try_from(definition.kind().input_count())
+        .expect("Operation input count fits usize")
+        .wrapping_add(definition.data().len())
 }
 
 fn measure_count_body(fixture: &mut CountFixture, turns: usize, transactions: usize) -> Duration {

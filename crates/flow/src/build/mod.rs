@@ -149,14 +149,14 @@ impl FlowFactory {
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
-        let (stations, topology) = assemble_stations(&definition, station_parts);
+        let assembled = assemble_stations(&definition, station_parts);
 
         Ok(Flow::from_parts(
             path,
             definition,
             flow_state,
-            stations,
-            topology,
+            assembled.stations,
+            assembled.topology,
             transactions,
             reads,
         ))
@@ -208,7 +208,12 @@ fn create_station_part(
                 .map(|log| (log, capacity))
         })
         .transpose()?;
-    Ok(StationParts::new(state, operation, output))
+    Ok(StationParts::new(
+        state,
+        operation,
+        definition.kind(),
+        output,
+    ))
 }
 
 #[cfg(test)]

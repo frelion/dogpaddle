@@ -3,7 +3,7 @@ use std::{num::NonZeroU64, ops::Range, path::Path};
 use dogpaddle_change::encode_change;
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    Operation, TurnCommit, TurnDecision,
+    Action, Operation,
     sink::DiscardDefinition,
     source::{SequenceSourceDefinition, SequenceSourceOperation},
     transform::CountDefinition,
@@ -66,10 +66,7 @@ fn reopen_drains_a_committed_final_source_change_after_sequence_becomes_idle() {
             SequenceSourceOperation::new(SequenceSourceDefinition::new(u64::MAX), position);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin().unwrap();
-        let TurnDecision::Commit(TurnCommit {
-            input: None,
-            output: Some(change),
-        }) = operation.turn(None, transaction.access()).unwrap()
+        let Action::Commit(Some(change)) = operation.turn(None, transaction.access()).unwrap()
         else {
             panic!("the final source turn did not commit one output Change");
         };

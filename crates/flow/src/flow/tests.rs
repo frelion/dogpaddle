@@ -5,7 +5,7 @@ use dogpaddle_operation::operation::{
 };
 use dogpaddle_store::{AppendLog, OrderedMap, Small, Store};
 
-use crate::{build::FlowFactory, station::ProcessOutcome};
+use crate::build::FlowFactory;
 
 #[test]
 fn build_and_open_derive_a_stable_layered_topological_schedule() {
@@ -28,18 +28,10 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
 
     let flow = builder.build().unwrap();
     assert_eq!(flow.topology.schedule, [2, 3, 0, 1, 4, 5]);
-    assert_eq!(
-        flow.topology.gc_upstreams,
-        [vec![3], vec![2], vec![], vec![], vec![0], vec![1]]
-    );
     drop(flow);
 
     let reopened = FlowFactory::open(path).unwrap();
     assert_eq!(reopened.topology.schedule, [2, 3, 0, 1, 4, 5]);
-    assert_eq!(
-        reopened.topology.gc_upstreams,
-        [vec![3], vec![2], vec![], vec![], vec![0], vec![1]]
-    );
 }
 
 #[test]
@@ -81,7 +73,7 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
 }
 
 #[test]
-fn advance_counts_physical_upstream_gc_after_an_idle_station_turn_as_progress() {
+fn completing_an_input_reclaims_its_upstream_entry_inline() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
@@ -98,17 +90,14 @@ fn advance_counts_physical_upstream_gc_after_an_idle_station_turn_as_progress() 
         flow.stations[0]
             .advance(&flow.reads, &mut flow.transactions)
             .unwrap(),
-        ProcessOutcome::Progressed
+        super::AdvanceOutcome::Progressed
     );
     assert_eq!(
         flow.stations[1]
             .advance(&flow.reads, &mut flow.transactions)
             .unwrap(),
-        ProcessOutcome::Progressed
+        super::AdvanceOutcome::Progressed
     );
-
-    flow.topology.schedule = vec![1];
-    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     drop(flow);
 
     let store = Store::open(path).unwrap();

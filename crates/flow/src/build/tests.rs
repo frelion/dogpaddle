@@ -66,7 +66,7 @@ where
     D: OperationDefinition,
 {
     let mut builder = factory();
-    let has_output = operation.category().has_output();
+    let has_output = operation.kind().has_output();
     let upstreams = (0..upstream_count)
         .map(|index| builder.station(format!("source-{index}"), source(index as u64)))
         .collect::<Vec<_>>();

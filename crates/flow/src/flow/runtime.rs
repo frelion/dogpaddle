@@ -9,14 +9,13 @@ use crate::{
 
 pub(crate) struct RuntimeTopology {
     pub(crate) schedule: Vec<usize>,
-    pub(crate) gc_upstreams: Vec<Vec<usize>>,
 }
 
 /// The runtime handle for a built or reopened persistent Flow.
 ///
 /// A Flow owns separate Store capabilities for beginning read-only and write
 /// transactions. During scheduling it lends the read capability to Station
-/// intake and the write capability to one Station's process or GC phase. A
+/// intake and the write capability to one Station's processing phase. A
 /// Station cannot retain either transaction-start capability across calls.
 /// The definition and data object set were frozen by a successful build.
 pub struct Flow {

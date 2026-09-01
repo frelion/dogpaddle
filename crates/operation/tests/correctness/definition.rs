@@ -1,5 +1,5 @@
 use dogpaddle_operation::{
-    DataDeclaration, DataInstances, OperationCategory, OperationDefinition, encode_definition,
+    DataDeclaration, DataInstances, OperationDefinition, OperationKind,
     operation::{
         Operation, sink::DiscardDefinition, source::SequenceSourceDefinition,
         transform::CountDefinition,
@@ -38,19 +38,22 @@ fn materialize(
 #[test]
 fn definitions_expose_their_stable_public_contracts() {
     let source = SequenceSourceDefinition::new(42);
-    assert_eq!(source.category(), OperationCategory::Source);
+    assert_eq!(source.kind(), OperationKind::Source);
     assert_eq!(source.start(), 42);
-    assert_eq!(source.input_count(), 0);
     assert_eq!(names(&source), ["sequence_source.position"]);
 
     let count = CountDefinition::new();
-    assert_eq!(count.category(), OperationCategory::Transform);
-    assert_eq!(count.input_count(), 1);
+    assert_eq!(
+        count.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::MIN)
+    );
     assert_eq!(names(&count), ["count"]);
 
     let discard = DiscardDefinition::new();
-    assert_eq!(discard.category(), OperationCategory::Sink);
-    assert_eq!(discard.input_count(), 1);
+    assert_eq!(
+        discard.kind(),
+        OperationKind::Sink(std::num::NonZeroU32::MIN)
+    );
     assert!(names(&discard).is_empty());
 }
 
@@ -77,17 +80,5 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     let source = materialize(&source_definition, &store, &["source-position"]);
     let count = materialize(&count_definition, &store, &["count"]);
     let discard = materialize(&discard_definition, &store, &[]);
-
-    assert_eq!(
-        encode_definition(source.definition()),
-        encode_definition(&source_definition)
-    );
-    assert_eq!(
-        encode_definition(count.definition()),
-        encode_definition(&count_definition)
-    );
-    assert_eq!(
-        encode_definition(discard.definition()),
-        encode_definition(&discard_definition)
-    );
+    drop((source, count, discard));
 }

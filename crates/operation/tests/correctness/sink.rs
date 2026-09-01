@@ -4,7 +4,7 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
-    InputProgress, Operation, OperationInput, TurnCommit, TurnDecision,
+    Action, Operation, OperationInput,
     sink::{DiscardDefinition, DiscardError, DiscardOperation},
 };
 use dogpaddle_store::Store;
@@ -41,13 +41,7 @@ fn discard_completes_one_input_without_output() {
         )
         .unwrap();
 
-    assert!(matches!(
-        decision,
-        TurnDecision::Commit(TurnCommit {
-            input: Some(InputProgress::Complete),
-            output: None,
-        })
-    ));
+    assert!(matches!(decision, Action::Complete(None)));
     transaction.commit().unwrap();
 }
 

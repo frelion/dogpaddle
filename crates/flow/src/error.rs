@@ -36,9 +36,17 @@ pub enum FlowError {
         /// Stable Store data object name that could not be opened.
         name: String,
     },
+    /// Published runtime frontiers violate the output-retention invariant.
+    #[error("station {station_id:?} has invalid runtime state: {reason}")]
+    InvalidRuntimeState {
+        /// Stable producer Station ID whose output retention is invalid.
+        station_id: String,
+        /// Concrete invariant violation detected while reopening.
+        reason: String,
+    },
 }
 
-/// Failure during one Station turn or its post-turn upstream GC.
+/// Failure during one Station turn.
 #[derive(Debug, Error)]
 #[error("station {station_id:?} failed: {source}")]
 pub struct FlowRunError {
@@ -55,7 +63,7 @@ impl FlowRunError {
         }
     }
 
-    /// Returns the stable ID of the Station whose turn or GC attempt failed.
+    /// Returns the stable ID of the Station whose turn failed.
     #[must_use]
     pub fn station_id(&self) -> &str {
         &self.station_id

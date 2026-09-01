@@ -1,13 +1,13 @@
+use std::num::NonZeroU32;
+
 use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationCategory,
-    OperationDefinition,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
+    OperationKind,
     definition::Sealed as SealedDefinition,
-    operation::{
-        InputProgress, Operation, OperationError, OperationInput, TurnCommit, TurnDecision,
-    },
+    operation::{Action, Operation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 3;
@@ -57,12 +57,8 @@ impl DiscardDefinition {
 impl SealedDefinition for DiscardDefinition {}
 
 impl OperationDefinition for DiscardDefinition {
-    fn category(&self) -> OperationCategory {
-        OperationCategory::Sink
-    }
-
-    fn input_count(&self) -> usize {
-        1
+    fn kind(&self) -> OperationKind {
+        OperationKind::Sink(NonZeroU32::MIN)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -98,24 +94,17 @@ impl DiscardOperation {
 }
 
 impl Operation for DiscardOperation {
-    fn definition(&self) -> &dyn OperationDefinition {
-        &self.definition
-    }
-
     fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,
-    ) -> Result<TurnDecision, OperationError> {
+    ) -> Result<Action, OperationError> {
         let input = input.ok_or(DiscardError::MissingInput)?;
         if input.port != 0 {
             return Err(DiscardError::InvalidInputPort { port: input.port }.into());
         }
 
-        Ok(TurnDecision::Commit(TurnCommit {
-            input: Some(InputProgress::Complete),
-            output: None,
-        }))
+        Ok(Action::Complete(None))
     }
 }
 

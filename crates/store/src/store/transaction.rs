@@ -106,6 +106,11 @@ impl Transaction<'_> {
 
     /// Atomically commits all changes and consumes the transaction.
     ///
+    /// A successful return makes every change visible together. An error
+    /// means the transaction was aborted and none of its changes became
+    /// visible; callers never need to account for a partially committed write
+    /// transaction.
+    ///
     /// # Errors
     ///
     /// Returns an error when the transaction is poisoned or MDBX cannot commit it.

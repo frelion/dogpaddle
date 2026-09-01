@@ -4,7 +4,7 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
-    Operation, OperationInput, TurnCommit, TurnDecision,
+    Action, Operation, OperationInput,
     source::{SequenceSourceDefinition, SequenceSourceError, SequenceSourceOperation},
 };
 use dogpaddle_store::{Cell, Store, StoreError};
@@ -21,12 +21,8 @@ fn input_change() -> Change {
     Change::try_new(records, Int64Array::from(vec![1])).unwrap()
 }
 
-fn source_values(decision: TurnDecision) -> Vec<u64> {
-    let TurnDecision::Commit(TurnCommit {
-        input: None,
-        output: Some(change),
-    }) = decision
-    else {
+fn source_values(action: Action) -> Vec<u64> {
+    let Action::Commit(Some(change)) = action else {
         panic!("SequenceSource did not commit one input-free output Change");
     };
     let schema = change.schema();
@@ -130,14 +126,14 @@ fn sequence_source_emits_u64_max_once_then_remains_idle() {
         let transaction = transactions.begin().unwrap();
         assert!(matches!(
             operation.turn(None, transaction.access()).unwrap(),
-            TurnDecision::Idle
+            Action::Idle
         ));
     }
 
     let transaction = transactions.begin().unwrap();
     assert!(matches!(
         operation.turn(None, transaction.access()).unwrap(),
-        TurnDecision::Idle
+        Action::Idle
     ));
 }
 

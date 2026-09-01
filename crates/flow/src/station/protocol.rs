@@ -3,23 +3,6 @@ use dogpaddle_operation::operation::OperationError;
 use dogpaddle_store::StoreError;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProcessOutcome {
-    Idle,
-    Backpressured,
-    Progressed,
-}
-
-impl ProcessOutcome {
-    pub(crate) const fn join(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Progressed, _) | (_, Self::Progressed) => Self::Progressed,
-            (Self::Backpressured, _) | (_, Self::Backpressured) => Self::Backpressured,
-            (Self::Idle, Self::Idle) => Self::Idle,
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum StationError {
     #[error(transparent)]
@@ -42,23 +25,14 @@ pub(crate) enum StationError {
     MissingCursor { input: usize },
     #[error("station input {input} has a malformed durable cursor")]
     MalformedCursor { input: usize },
-    #[error("cached station input {input} offset {cached} does not match durable cursor {durable}")]
-    CachedCursorMismatch {
-        input: usize,
-        cached: u64,
-        durable: u64,
-    },
-    #[error(
-        "cached station input port {cached} does not match durable active input port {durable}"
-    )]
-    CachedActiveInputMismatch { cached: usize, durable: usize },
-    #[error(
-        "operation input progress shape does not match its invocation: offered input {offered_input}, returned progress {returned_input}"
-    )]
-    OperationInputProgressMismatch {
-        offered_input: bool,
-        returned_input: bool,
-    },
+    #[error("claimed input offset {claimed} does not match durable consumer cursor {durable}")]
+    ClaimCursorMismatch { claimed: u64, durable: u64 },
+    #[error("claimed input port {claimed} does not match durable active input port {durable}")]
+    ClaimActiveInputMismatch { claimed: usize, durable: usize },
+    #[error("claimed input offset {offset} is at output tail {tail}")]
+    ClaimAtTail { offset: u64, tail: u64 },
+    #[error("an input-free Operation returned Complete")]
+    OperationCompletedWithoutInput,
     #[error("operation produced output for a Station without an output stream")]
     UnexpectedOutput,
     #[error("operation produced a Change that cannot be encoded: {source}")]
@@ -79,4 +53,10 @@ pub(crate) enum StationError {
         head: u64,
         tail: u64,
     },
+    #[error("output retention head {head} does not equal minimum consumer cursor {minimum}")]
+    RetentionHeadMismatch { head: u64, minimum: u64 },
+    #[error("output retention target jumped from head {head} to {target}")]
+    RetentionTargetJump { head: u64, target: u64 },
+    #[error("output retention truncated to {actual} instead of target {target}")]
+    RetentionTruncateMismatch { target: u64, actual: u64 },
 }
