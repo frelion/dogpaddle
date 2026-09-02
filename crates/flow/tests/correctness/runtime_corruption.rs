@@ -1,4 +1,8 @@
-use std::{num::NonZeroU64, ops::Range, path::Path};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    ops::Range,
+    path::Path,
+};
 
 use dogpaddle_change::encode_change;
 use dogpaddle_flow::{FlowError, FlowFactory};
@@ -26,22 +30,35 @@ struct DurableInputState {
 fn open_rejects_missing_malformed_and_out_of_range_cursors_without_writes() {
     let root = tempfile::tempdir().unwrap();
     let cases = [
-        ("missing", None, "output consumer 0 has no durable cursor"),
+        (
+            "missing",
+            None,
+            false,
+            "output consumer 0 has no durable cursor",
+        ),
         (
             "malformed",
             Some(vec![0; 7]),
+            false,
             "output consumer 0 has a malformed durable cursor",
         ),
         (
-            "out-of-range",
+            "above-tail",
             Some(2_u64.to_be_bytes().to_vec()),
+            false,
             "output consumer 0 cursor 2 is outside retained range [0, 1]",
+        ),
+        (
+            "below-head",
+            Some(0_u64.to_be_bytes().to_vec()),
+            true,
+            "output consumer 0 cursor 0 is outside retained range [1, 2]",
         ),
     ];
 
-    for (case, value, expected_reason) in cases {
+    for (case, value, shift_head, expected_reason) in cases {
         let path = root.path().join(case);
-        publish_pending_final_input(&path, None);
+        publish_pending_final_input(&path, None, shift_head);
         write_sink_state(&path, CURSOR_KEY, value);
         let before = durable_input_state(&path);
 
@@ -80,7 +97,7 @@ fn advance_rejects_missing_malformed_and_out_of_range_active_input_without_write
 
     for (case, value, expected_error) in cases {
         let path = root.path().join(case);
-        publish_pending_final_input(&path, None);
+        publish_pending_final_input(&path, None, false);
         write_sink_state(&path, ACTIVE_INPUT_KEY, value);
         let before = durable_input_state(&path);
 
@@ -97,7 +114,7 @@ fn advance_rejects_missing_malformed_and_out_of_range_active_input_without_write
 fn advance_rejects_an_invalid_encoded_change_without_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    publish_pending_final_input(&path, Some(b"not an Arrow IPC stream"));
+    publish_pending_final_input(&path, Some(b"not an Arrow IPC stream"), false);
     let before = durable_input_state(&path);
 
     let mut flow = FlowFactory::open(&path).unwrap();
@@ -112,7 +129,7 @@ fn advance_rejects_an_invalid_encoded_change_without_writes() {
     assert_eq!(durable_input_state(&path), before);
 }
 
-fn publish_pending_final_input(path: &Path, encoded_override: Option<&[u8]>) {
+fn publish_pending_final_input(path: &Path, encoded_override: Option<&[u8]>, shift_head: bool) {
     let mut builder = FlowFactory::new(path);
     let source = builder.station("source", SequenceSourceDefinition::new(u64::MAX));
     let sink = builder.station("sink", DiscardDefinition::new());
@@ -142,14 +159,12 @@ fn publish_pending_final_input(path: &Path, encoded_override: Option<&[u8]>) {
         };
         encode_change(&change).unwrap()
     };
-    assert_eq!(
-        output
-            .access(transaction.access())
-            .unwrap()
-            .append(&encoded)
-            .unwrap(),
-        0
-    );
+    let mut output = output.access(transaction.access()).unwrap();
+    assert_eq!(output.append(&encoded).unwrap(), 0);
+    if shift_head {
+        assert_eq!(output.append(&encoded).unwrap(), 1);
+        assert_eq!(output.truncate_before(1, NonZeroUsize::MIN).unwrap(), 1);
+    }
     transaction.commit().unwrap();
 }
 

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use dogpaddle_bench_protocol::{
-    DurationSummary, Fields, PairOrder, PairSchedule, PairSummaryRecord, PairVariant,
-    PairedDurationSummary, SampleRecord, SummaryRecord, measure_pair_with,
+    DurationSummary, Fields, PairOrder, PairSchedule, PairVariant, PairedDurationSummary,
+    SampleRecord, measure_pair_with,
 };
 
 use crate::{
@@ -59,7 +59,6 @@ impl PairedSamples {
 
     fn summary(&self) -> PairedDurationSummary {
         PairedDurationSummary::from_pairs(&self.first, &self.second)
-            .expect("summarize paired OrderedMap measurements")
     }
 
     fn first_wins(&self) -> usize {
@@ -115,43 +114,23 @@ fn emit_pair(
     second_label: &str,
     measurements: &PairedSamples,
 ) {
-    let record = PairSummaryRecord::new(
-        BENCHMARK,
-        &case.workload,
-        first_label,
-        second_label,
-        measurements.summary(),
-        Fields::new(),
-    )
-    .expect("construct OrderedMap pair summary record");
-    write_record(&record);
-    report(case, first_label, &measurements.first);
-    report(case, second_label, &measurements.second);
+    report(case, first_label, "first", &measurements.first);
+    report(case, second_label, "second", &measurements.second);
 }
 
-fn report(case: &BenchmarkCase, variant: &str, durations: &[Duration]) {
+fn report(case: &BenchmarkCase, variant: &str, side: &str, durations: &[Duration]) {
+    let series = format!("{}::{variant}", case.workload);
     for (sample, elapsed) in durations.iter().copied().enumerate() {
         let record = SampleRecord::new(
             BENCHMARK,
-            &case.workload,
+            &series,
             sample,
             elapsed,
-            measurement_fields(case, variant),
-        )
-        .expect("construct OrderedMap sample record");
+            measurement_fields(case, variant, side),
+        );
         write_record(&record);
     }
-    let summary =
-        DurationSummary::from_samples(durations).expect("summarize OrderedMap measurements");
-    let record = SummaryRecord::new(
-        BENCHMARK,
-        &case.workload,
-        summary,
-        measurement_fields(case, variant),
-    )
-    .expect("construct OrderedMap summary record");
-    write_record(&record);
-
+    let summary = DurationSummary::from_samples(durations);
     let rate = case.operations as u128 * 1_000_000_000 / summary.median().as_nanos();
     let median_per_operation = average_duration(summary.median(), case.operations);
     println!(
@@ -164,19 +143,17 @@ fn report(case: &BenchmarkCase, variant: &str, durations: &[Duration]) {
     );
 }
 
-fn measurement_fields(case: &BenchmarkCase, variant: &str) -> Fields {
+fn measurement_fields(case: &BenchmarkCase, variant: &str, side: &str) -> Fields {
     let mut fields = Fields::new();
-    fields
-        .insert("variant", variant)
-        .expect("construct OrderedMap variant field");
+    fields.insert("variant", variant);
+    fields.insert("pair", &case.workload);
+    fields.insert("side", side);
     for (name, value) in [
         ("operations", case.operations),
         ("transactions", case.transactions),
         ("logical_bytes", case.logical_bytes),
     ] {
-        fields
-            .insert(name, value)
-            .expect("construct OrderedMap work fields");
+        fields.insert(name, value);
     }
     fields
 }

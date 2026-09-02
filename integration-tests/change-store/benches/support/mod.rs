@@ -35,15 +35,14 @@ impl BenchStoreRoot {
     }
 
     pub(crate) fn emit_environment(&self, benchmark: &str) {
-        let host = HostEnvironment::collect(Some(self.root.filesystem_root()))
-            .expect("collect Change + Store benchmark environment");
-        let fields = Fields::new()
-            .with("mdbx_sync_mode", "durable")
-            .expect("encode MDBX sync mode");
-        emit_record(
-            &EnvironmentRecord::new(benchmark, self.profile(), host, fields)
-                .expect("build Change + Store environment record"),
-        );
+        let host = HostEnvironment::collect(Some(self.root.filesystem_root()));
+        let fields = Fields::new().with("mdbx_sync_mode", "durable");
+        emit_record(&EnvironmentRecord::new(
+            benchmark,
+            self.profile(),
+            host,
+            fields,
+        ));
     }
 }
 
@@ -58,11 +57,9 @@ pub(crate) fn decode_entry(encoded: &[u8]) -> Result<Change, StoreCodecError> {
 }
 
 pub(crate) fn complete(benchmark: &str) {
-    emit_record(&CompletionRecord::new(benchmark).expect("build benchmark completion record"));
+    emit_record(&CompletionRecord::new(benchmark));
 }
 
 pub(crate) fn emit_record(record: &impl BenchmarkRecord) {
-    JsonlWriter::new(io::stdout().lock())
-        .write(record)
-        .expect("write Change + Store benchmark JSONL");
+    JsonlWriter::new(io::stdout().lock()).write(record);
 }

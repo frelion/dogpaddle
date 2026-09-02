@@ -102,24 +102,7 @@ fn retained_bytes_are_visible_in_read_snapshots_and_survive_reopen() {
 }
 
 #[test]
-fn multiple_accesses_see_same_transaction_appends() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let log = create_log::<u64>(&mut store, "log");
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let mut first = log.access(transaction.access()).unwrap();
-    let mut second = log.access(transaction.access()).unwrap();
-    assert_eq!(first.append(&10).unwrap(), 0);
-    assert_eq!(second.append(&20).unwrap(), 1);
-    let (values, scan) = scan_values(&first, 0, ScanLimit::new(10, 1_024).unwrap());
-    assert_eq!(values, vec![(0, 10), (1, 20)]);
-    assert!(scan.caught_up);
-    transaction.commit().unwrap();
-}
-
-#[test]
-fn batch_append_is_ordered_and_visible_across_same_transaction_accesses() {
+fn singleton_and_batch_appends_are_ordered_across_same_transaction_accesses() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let log = create_log::<u64>(&mut store, "log");
@@ -129,12 +112,14 @@ fn batch_append_is_ordered_and_visible_across_same_transaction_accesses() {
         let mut first = log.access(transaction.access()).unwrap();
         let mut second = log.access(transaction.access()).unwrap();
         assert_eq!(first.append_batch(&[]).unwrap(), 0..0);
-        assert_eq!(first.append_batch(&[10, 20, 30]).unwrap(), 0..3);
-        assert_eq!(first.retained_bytes().unwrap(), 48);
-        assert_eq!(second.bounds().unwrap(), 0..3);
-        assert_eq!(second.append_batch(&[40, 50]).unwrap(), 3..5);
+        assert_eq!(first.append(&10).unwrap(), 0);
+        assert_eq!(second.bounds().unwrap(), 0..1);
+        assert_eq!(second.append_batch(&[20, 30, 40, 50]).unwrap(), 1..5);
         assert_eq!(first.bounds().unwrap(), 0..5);
         assert_eq!(first.retained_bytes().unwrap(), 80);
+        let (values, scan) = scan_values(&first, 0, ScanLimit::new(10, 1_024).unwrap());
+        assert_eq!(values, vec![(0, 10), (1, 20), (2, 30), (3, 40), (4, 50)]);
+        assert!(scan.caught_up);
         transaction.commit().unwrap();
     }
 

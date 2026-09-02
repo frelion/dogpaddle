@@ -7,7 +7,7 @@
 
 | package | 所有权 |
 | --- | --- |
-| [`change-store`](./change-store/) | 完整 Change Stream 与 `AppendLog<Vec<u8>>` 的正确性、常规性能和长稳协议 |
+| [`change-store`](./change-store/) | 完整 Change Stream 与 `AppendLog<Vec<u8>>` 的最小接缝正确性和常规性能 |
 
 Operation 正式依赖 Store，其组合契约归 `crates/operation/tests/correctness/`；Flow 是 Operation +
 Store 的组合根，其 build/open/materialize 契约归 `crates/flow/tests/correctness/`。不要为这些正常

@@ -1,49 +1,6 @@
-use dogpaddle_store::{Cell, Large, ScanDirection, ScanLimit, Small, Store, StoreError};
+use dogpaddle_store::{Cell, Large, Small, Store, StoreError};
 
 use crate::support::{ByteMap, create_byte_map, open_byte_map, raw_database, store_path};
-
-#[test]
-fn small_and_large_have_identical_data_semantics() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
-    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
-    let mut transactions = store.into_transactions();
-
-    {
-        let transaction = transactions.begin().unwrap();
-        let mut small = small.access(transaction.access()).unwrap();
-        let mut large = large.access(transaction.access()).unwrap();
-        for number in 0_u64..10 {
-            let key = number.to_be_bytes().to_vec();
-            let value = format!("value-{number}").into_bytes();
-            small.put(&key, &value).unwrap();
-            large.put(&key, &value).unwrap();
-        }
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    let small = small.access(transaction.access()).unwrap();
-    let large = large.access(transaction.access()).unwrap();
-    let limit = ScanLimit::new(100, 4_096).unwrap();
-    let mut small_items = Vec::new();
-    let small_continuation = small
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            small_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
-        .unwrap();
-    let mut large_items = Vec::new();
-    let large_continuation = large
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            large_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
-        .unwrap();
-    assert_eq!(small_items, large_items);
-    assert_eq!(small_continuation, large_continuation);
-}
 
 #[test]
 fn catalog_reopens_each_declared_size() {

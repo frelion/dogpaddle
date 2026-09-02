@@ -13,7 +13,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
     EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, LatencySummary, SampleRecord,
-    SummaryRecord, require_benchmark_build,
+    require_benchmark_build,
 };
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
@@ -114,14 +114,14 @@ impl Config {
         }
     }
 
-    fn expected_data_records(&self) -> NonZeroUsize {
+    fn expected_samples(&self) -> NonZeroUsize {
         let scenarios = 2_usize
             .checked_add(self.chain_stations.len())
             .and_then(|value| value.checked_add(self.fanouts.len()))
             .expect("Flow runtime scenario count fits usize");
         let count = scenarios
-            .checked_mul(self.samples + 1)
-            .expect("Flow runtime data-record count fits usize");
+            .checked_mul(self.samples)
+            .expect("Flow runtime sample count fits usize");
         NonZeroUsize::new(count).expect("Flow runtime has at least one data record")
     }
 }
@@ -134,6 +134,17 @@ impl Scenario {
             Self::Chain { .. } => "chain_steady",
             Self::Fanout { .. } => "fanout_steady",
         }
+    }
+
+    fn series(self) -> String {
+        format!(
+            "{}/topology={}/stations={}/fanout={}/capacity={}",
+            self.label(),
+            self.topology_name(),
+            self.station_count(),
+            self.fanout(),
+            self.output_capacity_bytes()
+        )
     }
 
     const fn station_count(self) -> usize {
@@ -221,8 +232,7 @@ impl RuntimeMetrics {
     fn new(scenario: Scenario, round_latencies: &[Duration]) -> Self {
         let elapsed = sum_durations(round_latencies);
         let work = scenario.work_counts(round_latencies.len());
-        let latency = LatencySummary::from_samples(round_latencies)
-            .expect("summarize Flow runtime round latencies");
+        let latency = LatencySummary::from_samples(round_latencies);
         Self {
             elapsed,
             latency,
@@ -254,10 +264,7 @@ fn main() {
     for &consumers in &config.fanouts {
         benchmark_scenario(&root, &config, Scenario::Fanout { consumers });
     }
-    emit_record(
-        &CompletionRecord::new(BENCHMARK)
-            .expect("construct Flow runtime benchmark completion record"),
-    );
+    emit_record(&CompletionRecord::new(BENCHMARK));
 }
 
 fn benchmark_scenario(root: &BenchRoot, config: &Config, scenario: Scenario) {
@@ -512,84 +519,58 @@ fn validate_flow(flow: &Flow, path: &Path, scenario: Scenario) {
 }
 
 fn emit_environment(root: &BenchRoot) {
-    let fields = Fields::new()
-        .with("mdbx_sync_mode", "durable")
-        .expect("add Flow runtime benchmark MDBX sync mode");
+    let fields = Fields::new().with("mdbx_sync_mode", "durable");
     let environment = EnvironmentRecord::new(
         BENCHMARK,
         root.profile(),
-        HostEnvironment::collect(Some(root.base()))
-            .expect("collect Flow runtime benchmark environment"),
+        HostEnvironment::collect(Some(root.base())),
         fields,
-    )
-    .expect("construct Flow runtime benchmark environment record");
+    );
     emit_record(&environment);
 }
 
 fn emit_configuration(config: &Config) {
     let fields = Fields::new()
         .with("chain_station_counts", &config.chain_stations)
-        .expect("add Flow runtime benchmark chain station counts")
         .with("fanouts", &config.fanouts)
-        .expect("add Flow runtime benchmark fan-outs")
         .with("rounds_per_sample", config.rounds_per_sample)
-        .expect("add Flow runtime benchmark rounds per sample")
         .with("samples", config.samples)
-        .expect("add Flow runtime benchmark sample count")
         .with("warmup_rounds", config.warmup_rounds)
-        .expect("add Flow runtime benchmark warmup rounds")
         .with("normal_output_capacity_bytes", OUTPUT_CAPACITY_BYTES.get())
-        .expect("add Flow runtime normal output capacity")
         .with(
             "tight_output_capacity_bytes",
             TIGHT_OUTPUT_CAPACITY_BYTES.get(),
         )
-        .expect("add Flow runtime tight output capacity")
         .with("input_retaining_commits_per_change_covered", [0_usize])
-        .expect("add Flow runtime covered input-retaining Commit profile")
         .with(
             "input_retaining_commits_per_change_unavailable",
             [1_usize, 8],
         )
-        .expect("add Flow runtime unavailable input-retaining Commit profiles")
         .with(
             "input_retaining_commit_unavailable_reason",
             "sealed_definition_set_has_no_input_operation_that_returns_commit",
         )
-        .expect("add Flow runtime input-retaining Commit coverage boundary")
         .with(
             "input_completion_unit",
             "durable_input_cursor_frontier_advance_fanout_counts_each_edge",
         )
-        .expect("add Flow runtime input completion unit")
         .with(
             "committed_station_turn_unit",
             "outer_station_transaction_committed_after_action_pin_and_reclaim_are_not_additional_turns",
         )
-        .expect("add Flow runtime committed Station turn unit")
         .with("round_latency_scope", "one_complete_flow_advance_call")
-        .expect("add Flow runtime round latency scope")
         .with("round_latency_percentile", "nearest_rank")
-        .expect("add Flow runtime round latency percentile convention")
         .with("throughput_rate", "integer_floor_from_timed_advance_ns")
-        .expect("add Flow runtime throughput convention")
         .with("sample_elapsed", "sum_of_individually_timed_advances")
-        .expect("add Flow runtime elapsed convention")
         .with("raw_round_latencies", "sample_field_round_latencies_ns")
-        .expect("add Flow runtime raw round latency convention")
         .with("measurement_protocol", "individual_advance_v2")
-        .expect("add Flow runtime measurement protocol")
         .with(
             "comparison_boundary",
             "rerun_all_variants_v2_pre_v2_batch_medians_are_not_comparable",
         )
-        .expect("add Flow runtime comparison boundary")
         .with("fixtures", "built_once_outside_timing")
-        .expect("add Flow runtime fixture policy")
-        .with("validation", "outside_timing")
-        .expect("add Flow runtime validation policy");
-    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_data_records(), fields)
-        .expect("construct Flow runtime benchmark configuration record");
+        .with("validation", "outside_timing");
+    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_samples(), fields);
     emit_record(&configuration);
 }
 
@@ -600,11 +581,15 @@ fn emit_sample(scenario: Scenario, sample: usize, measurement: &Measurement) {
         .iter()
         .map(Duration::as_nanos)
         .collect::<Vec<_>>();
-    let fields = measurement_fields(scenario, metrics)
-        .with("round_latencies_ns", round_latencies_ns)
-        .expect("add raw Flow runtime round latencies");
-    let sample = SampleRecord::new(BENCHMARK, scenario.label(), sample, metrics.elapsed, fields)
-        .expect("construct Flow runtime benchmark sample record");
+    let fields =
+        measurement_fields(scenario, metrics).with("round_latencies_ns", round_latencies_ns);
+    let sample = SampleRecord::new(
+        BENCHMARK,
+        scenario.series(),
+        sample,
+        metrics.elapsed,
+        fields,
+    );
     emit_record(&sample);
 }
 
@@ -618,8 +603,7 @@ fn report(scenario: Scenario, measurements: &[Measurement]) {
         .flat_map(|measurement| measurement.round_latencies.iter().copied())
         .collect::<Vec<_>>();
     let metrics = RuntimeMetrics::new(scenario, &round_latencies);
-    let summary = DurationSummary::from_samples(&sample_durations)
-        .expect("summarize Flow runtime benchmark samples");
+    let summary = DurationSummary::from_samples(&sample_durations);
     let min = summary.min();
     let median = summary.median();
     let max = summary.max();
@@ -637,86 +621,34 @@ fn report(scenario: Scenario, measurements: &[Measurement]) {
         metrics.latency.p50(),
         metrics.latency.p95(),
     );
-    let summary = SummaryRecord::new(
-        BENCHMARK,
-        scenario.label(),
-        summary,
-        measurement_fields(scenario, metrics),
-    )
-    .expect("construct Flow runtime benchmark summary record");
-    emit_record(&summary);
 }
 
 fn scenario_fields(scenario: Scenario) -> Fields {
     Fields::new()
         .with("topology", scenario.topology_name())
-        .expect("add Flow runtime topology")
         .with("station_count", scenario.station_count())
-        .expect("add Flow runtime station count")
         .with("fanout", scenario.fanout())
-        .expect("add Flow runtime fan-out")
         .with(
             "output_capacity_bytes",
             scenario.output_capacity_bytes().get(),
         )
-        .expect("add Flow runtime output capacity")
         .with("capacity_mode", scenario.capacity_mode())
-        .expect("add Flow runtime capacity mode")
         .with(
             "producer_expected_backpressured",
             scenario.is_capacity_pressure(),
         )
-        .expect("add Flow runtime producer pressure expectation")
         .with("expected_outcome", "progressed")
-        .expect("add Flow runtime expected outcome")
-        .with(
-            "input_disposition",
-            "complete_only_input_retaining_commit_0",
-        )
-        .expect("add Flow runtime input disposition")
         .with("input_retaining_commits_per_change", 0)
-        .expect("add Flow runtime input-retaining Commit count")
-        .with(
-            "committed_station_turns_per_advance",
-            scenario.committed_station_turns_per_advance(),
-        )
-        .expect("add Flow runtime committed Station turns per advance")
-        .with(
-            "input_completions_per_advance",
-            scenario.input_completions_per_advance(),
-        )
-        .expect("add Flow runtime input completions per advance")
 }
 
 fn measurement_fields(scenario: Scenario, metrics: RuntimeMetrics) -> Fields {
     scenario_fields(scenario)
         .with("advances", metrics.work.advances)
-        .expect("add Flow runtime advance count")
         .with(
             "committed_station_turns",
             metrics.work.committed_station_turns,
         )
-        .expect("add Flow runtime committed Station turn count")
         .with("input_completions", metrics.work.input_completions)
-        .expect("add Flow runtime input completion count")
-        .with("timed_advance_ns_total", metrics.elapsed.as_nanos())
-        .expect("add Flow runtime timed advance duration")
-        .with("advances_per_second", metrics.advances_per_second)
-        .expect("add Flow runtime advance throughput")
-        .with(
-            "committed_station_turns_per_second",
-            metrics.committed_station_turns_per_second,
-        )
-        .expect("add Flow runtime committed Station turn throughput")
-        .with(
-            "input_completions_per_second",
-            metrics.input_completions_per_second,
-        )
-        .expect("add Flow runtime input completion throughput")
-        .with("round_latency_p50_ns", metrics.latency.p50().as_nanos())
-        .expect("add Flow runtime round latency p50")
-        .with("round_latency_p95_ns", metrics.latency.p95().as_nanos())
-        .expect("add Flow runtime round latency p95")
 }
 
 fn sum_durations(durations: &[Duration]) -> Duration {
@@ -745,10 +677,6 @@ fn rate(count: usize, elapsed: Duration) -> u128 {
 fn emit_record(record: &impl BenchmarkRecord) {
     let stdout = io::stdout();
     let mut writer = JsonlWriter::new(stdout.lock());
-    writer
-        .write(record)
-        .expect("write Flow runtime benchmark protocol record");
-    writer
-        .flush()
-        .expect("flush Flow runtime benchmark protocol record");
+    writer.write(record);
+    writer.flush();
 }

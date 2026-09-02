@@ -118,16 +118,11 @@ fn main() {
         ("scan_items", scan_items),
         ("scan_bytes", scan_bytes),
     ] {
-        fields
-            .insert(name, value)
-            .expect("construct OrderedMap configuration fields");
+        fields.insert(name, value);
     }
-    fields
-        .insert("random_seed", RANDOM_SEED)
-        .expect("construct OrderedMap random seed field");
-    let expected_data_records = NonZeroUsize::new(21 * (2 * samples + 3)).unwrap();
-    let record = ConfigurationRecord::new(BENCHMARK, expected_data_records, fields)
-        .expect("construct OrderedMap configuration record");
+    fields.insert("random_seed", RANDOM_SEED);
+    let expected_samples = NonZeroUsize::new(21 * 2 * samples).unwrap();
+    let record = ConfigurationRecord::new(BENCHMARK, expected_samples, fields);
     write_record(&record);
 
     println!("DogPaddle OrderedMap benchmark");

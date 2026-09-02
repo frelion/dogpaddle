@@ -1,7 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
-    fmt, fs,
+    fs,
     path::Path,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -115,20 +115,18 @@ impl HostEnvironment {
     /// `filesystem_path`.
     ///
     /// Informational command failures are retained as `unavailable: ...` values.
-    /// This method fails only for a system clock before the Unix epoch.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`EnvironmentCollectionError`] when the current system time
-    /// precedes the Unix epoch.
-    pub fn collect(filesystem_path: Option<&Path>) -> Result<Self, EnvironmentCollectionError> {
+    /// Panics when the system clock precedes the Unix epoch.
+    #[must_use]
+    #[track_caller]
+    pub fn collect(filesystem_path: Option<&Path>) -> Self {
         Self::collect_with(filesystem_path, SystemTime::now())
     }
 
-    fn collect_with(
-        filesystem_path: Option<&Path>,
-        now: SystemTime,
-    ) -> Result<Self, EnvironmentCollectionError> {
+    #[track_caller]
+    fn collect_with(filesystem_path: Option<&Path>, now: SystemTime) -> Self {
         let rustc_program = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
         let rustc = CommandOutput::capture(&rustc_program, &["--version"]).non_empty("rustc");
         let git_revision =
@@ -141,11 +139,12 @@ impl HostEnvironment {
         };
         let filesystem = filesystem_path.map(filesystem_description);
         let filesystem_path = filesystem_path.map(|path| path.display().to_string());
-        let unix_seconds = now
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| EnvironmentCollectionError::ClockBeforeUnixEpoch)?
-            .as_secs();
-        Ok(Self {
+        let unix_seconds = now.duration_since(UNIX_EPOCH).unwrap_or_else(|source| {
+            panic!(
+                "benchmark environment failure: stage=unix_seconds label=system_time value={now:?} source={source}"
+            )
+        });
+        Self {
             cargo_profile: "bench",
             cargo_profile_source: "default",
             filesystem_path,
@@ -159,32 +158,7 @@ impl HostEnvironment {
             git_revision,
             git_state,
             debug_assertions: cfg!(debug_assertions),
-            unix_seconds,
-        })
-    }
-}
-
-/// Failure to collect required benchmark environment metadata.
-#[derive(Debug)]
-pub enum EnvironmentCollectionError {
-    /// The system clock is before the Unix epoch.
-    ClockBeforeUnixEpoch,
-}
-
-impl fmt::Display for EnvironmentCollectionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ClockBeforeUnixEpoch => {
-                formatter.write_str("system clock is before the Unix epoch")
-            }
-        }
-    }
-}
-
-impl std::error::Error for EnvironmentCollectionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ClockBeforeUnixEpoch => None,
+            unix_seconds: unix_seconds.as_secs(),
         }
     }
 }

@@ -2,7 +2,7 @@ use std::{hint::black_box, io, num::NonZeroUsize, time::Duration};
 
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, CompletionRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
-    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord,
+    Fields, HostEnvironment, JsonlWriter, SampleRecord,
 };
 
 use super::fixture::{DEFAULT_WORKLOADS, validate_dimensions};
@@ -43,7 +43,6 @@ pub(crate) struct BenchmarkCase {
 pub(crate) struct MachineRecords {
     benchmark: &'static str,
     samples: Vec<SampleRecord>,
-    summaries: Vec<SummaryRecord>,
 }
 
 impl Metric {
@@ -78,25 +77,32 @@ impl BenchmarkCase {
         format!("{}/{}", self.workload, self.scenario)
     }
 
+    fn series(self) -> String {
+        format!(
+            "{}/{}/rows={}/encoded_bytes={}/operations={}",
+            self.workload,
+            self.scenario,
+            self.metric.rows_per_change,
+            self.metric.encoded_bytes_per_change,
+            self.metric.operations
+        )
+    }
+
     fn fields(self) -> Fields {
         Fields::new()
             .with("workload", self.workload)
-            .expect("add Change benchmark workload")
             .with("operations", self.metric.operations)
-            .expect("add Change benchmark operation count")
             .with("rows_per_change", self.metric.rows_per_change)
-            .expect("add Change benchmark rows per Change")
             .with(
                 "encoded_bytes_per_change",
                 self.metric.encoded_bytes_per_change,
             )
-            .expect("add Change benchmark encoded size")
     }
 }
 
 impl Config {
     pub(crate) fn load() -> Self {
-        let profile = BenchmarkProfile::from_environment().expect("read Change benchmark profile");
+        let profile = BenchmarkProfile::from_environment();
         Self::for_profile(profile)
     }
 
@@ -149,61 +155,39 @@ impl Config {
         let environment = EnvironmentRecord::new(
             benchmark,
             self.profile,
-            HostEnvironment::collect(None).expect("collect Change benchmark environment"),
+            HostEnvironment::collect(None),
             Fields::new(),
-        )
-        .expect("construct Change benchmark environment record");
+        );
         let configuration = ConfigurationRecord::new(
             benchmark,
-            self.expected_data_records(scenarios_per_fixture),
+            self.expected_samples(scenarios_per_fixture),
             Fields::new()
                 .with("rows_per_change", &self.rows)
-                .expect("add Change benchmark row counts")
                 .with("target_rows_per_sample", self.target_rows)
-                .expect("add Change benchmark target row count")
                 .with("max_changes_per_sample", self.max_changes)
-                .expect("add Change benchmark maximum Change count")
                 .with("samples", self.samples)
-                .expect("add Change benchmark sample count")
                 .with("payload_bytes", self.payload_bytes)
-                .expect("add Change benchmark payload size")
                 .with("workloads", &self.workloads)
-                .expect("add Change benchmark workloads")
                 .with("execution", "single_thread")
-                .expect("add Change benchmark execution policy")
                 .with("cache", "warm")
-                .expect("add Change benchmark cache policy")
                 .with("setup", "outside_timing")
-                .expect("add Change benchmark setup policy")
-                .with("validation", "outside_timing")
-                .expect("add Change benchmark validation policy"),
-        )
-        .expect("construct Change benchmark configuration record");
+                .with("validation", "outside_timing"),
+        );
         let stdout = io::stdout();
         let mut writer = JsonlWriter::new(stdout.lock());
-        writer
-            .write(&environment)
-            .expect("write Change benchmark environment record");
-        writer
-            .write(&configuration)
-            .expect("write Change benchmark configuration record");
-        writer
-            .flush()
-            .expect("flush Change benchmark protocol records");
+        writer.write(&environment);
+        writer.write(&configuration);
+        writer.flush();
     }
 
-    fn expected_data_records(&self, scenarios_per_fixture: usize) -> NonZeroUsize {
-        let records_per_scenario = self
-            .samples
-            .checked_add(1)
-            .expect("Change benchmark records per scenario fit usize");
+    fn expected_samples(&self, scenarios_per_fixture: usize) -> NonZeroUsize {
         let count = self
             .rows
             .len()
             .checked_mul(self.workloads.len())
             .and_then(|value| value.checked_mul(scenarios_per_fixture))
-            .and_then(|value| value.checked_mul(records_per_scenario))
-            .expect("Change benchmark data-record count fits usize");
+            .and_then(|value| value.checked_mul(self.samples))
+            .expect("Change benchmark sample count fits usize");
         NonZeroUsize::new(count).expect("Change benchmark has at least one data record")
     }
 }
@@ -213,7 +197,6 @@ impl MachineRecords {
         Self {
             benchmark,
             samples: Vec::new(),
-            summaries: Vec::new(),
         }
     }
 
@@ -221,49 +204,24 @@ impl MachineRecords {
         let stdout = io::stdout();
         let mut writer = JsonlWriter::new(stdout.lock());
         for sample in &self.samples {
-            writer
-                .write(sample)
-                .expect("write Change benchmark sample record");
+            writer.write(sample);
         }
-        for summary in &self.summaries {
-            writer
-                .write(summary)
-                .expect("write Change benchmark summary record");
-        }
-        writer
-            .write(
-                &CompletionRecord::new(self.benchmark)
-                    .expect("construct Change benchmark completion record"),
-            )
-            .expect("write Change benchmark completion record");
-        writer
-            .flush()
-            .expect("flush Change benchmark protocol records");
+        writer.write(&CompletionRecord::new(self.benchmark));
+        writer.flush();
     }
 
     pub(crate) fn record(&mut self, case: BenchmarkCase, measurements: &[Measurement]) {
         let fields = case.fields();
+        let series = case.series();
         for (sample, measurement) in measurements.iter().enumerate() {
-            self.samples.push(
-                SampleRecord::new(
-                    self.benchmark,
-                    case.scenario,
-                    sample,
-                    measurement.elapsed,
-                    fields.clone(),
-                )
-                .expect("construct Change benchmark sample record"),
-            );
-        }
-        self.summaries.push(
-            SummaryRecord::new(
+            self.samples.push(SampleRecord::new(
                 self.benchmark,
-                case.scenario,
-                duration_summary(measurements),
-                fields,
-            )
-            .expect("construct Change benchmark summary record"),
-        );
+                &series,
+                sample,
+                measurement.elapsed,
+                fields.clone(),
+            ));
+        }
     }
 }
 
@@ -285,7 +243,7 @@ pub(crate) fn duration_summary(measurements: &[Measurement]) -> DurationSummary 
         .iter()
         .map(|measurement| measurement.elapsed)
         .collect::<Vec<_>>();
-    DurationSummary::from_samples(&durations).expect("summarize Change benchmark measurements")
+    DurationSummary::from_samples(&durations)
 }
 
 pub(crate) fn per_operation(total: Duration, operations: usize) -> String {

@@ -17,19 +17,28 @@ pub enum BenchmarkProfile {
 impl BenchmarkProfile {
     /// Reads [`BENCHMARK_PROFILE_ENV`], defaulting to [`Self::Smoke`].
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`EnvError`] for a non-Unicode value or a value other than
-    /// exactly `smoke` and `reference`.
-    pub fn from_environment() -> Result<Self, EnvError> {
+    /// Panics for a non-Unicode value or a value other than exactly `smoke` and
+    /// `reference`.
+    #[must_use]
+    #[track_caller]
+    pub fn from_environment() -> Self {
         match env::var_os(BENCHMARK_PROFILE_ENV) {
-            None => Ok(Self::Smoke),
+            None => Self::Smoke,
             Some(value) => {
-                let value = value.into_string().map_err(|_| EnvError::NotUnicode)?;
+                let value = value.into_string().unwrap_or_else(|value| {
+                    panic!(
+                        "benchmark profile failure: stage=read_environment label={BENCHMARK_PROFILE_ENV} value={} source=value is not valid Unicode",
+                        value.to_string_lossy()
+                    )
+                });
                 match value.as_str() {
-                    "smoke" => Ok(Self::Smoke),
-                    "reference" => Ok(Self::Reference),
-                    _ => Err(EnvError::InvalidProfile(value)),
+                    "smoke" => Self::Smoke,
+                    "reference" => Self::Reference,
+                    _ => panic!(
+                        "benchmark profile failure: stage=validate_profile label={BENCHMARK_PROFILE_ENV} value={value:?} source=expected smoke or reference"
+                    ),
                 }
             }
         }
@@ -50,26 +59,3 @@ impl fmt::Display for BenchmarkProfile {
         formatter.write_str(self.as_str())
     }
 }
-
-/// Describes a malformed common benchmark profile.
-#[derive(Debug)]
-pub enum EnvError {
-    /// The configured profile is not Unicode.
-    NotUnicode,
-    /// The configured profile is neither `smoke` nor `reference`.
-    InvalidProfile(String),
-}
-
-impl fmt::Display for EnvError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotUnicode => write!(formatter, "{BENCHMARK_PROFILE_ENV} must be valid Unicode"),
-            Self::InvalidProfile(value) => write!(
-                formatter,
-                "{BENCHMARK_PROFILE_ENV} must be smoke or reference, got {value:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EnvError {}

@@ -9,8 +9,7 @@ use std::{
 
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
-    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord,
-    require_benchmark_build,
+    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, SampleRecord, require_benchmark_build,
 };
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
@@ -59,13 +58,13 @@ impl Config {
         }
     }
 
-    fn expected_data_records(&self) -> NonZeroUsize {
+    fn expected_samples(&self) -> NonZeroUsize {
         let count = self
             .station_counts
             .len()
             .checked_mul(2)
-            .and_then(|value| value.checked_mul(self.samples + 1))
-            .expect("Flow lifecycle data-record count fits usize");
+            .and_then(|value| value.checked_mul(self.samples))
+            .expect("Flow lifecycle sample count fits usize");
         NonZeroUsize::new(count).expect("Flow lifecycle has at least one data record")
     }
 }
@@ -86,9 +85,7 @@ fn main() {
         benchmark_fresh_build(&root, &config, station_count);
         benchmark_warm_reopen(&root, &config, station_count);
     }
-    emit_record(
-        &CompletionRecord::new(BENCHMARK).expect("construct Flow benchmark completion record"),
-    );
+    emit_record(&CompletionRecord::new(BENCHMARK));
 }
 
 fn benchmark_fresh_build(root: &BenchRoot, config: &Config, station_count: usize) {
@@ -189,79 +186,58 @@ fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
 }
 
 fn emit_environment(root: &BenchRoot) {
-    let fields = Fields::new()
-        .with("mdbx_sync_mode", "durable")
-        .expect("add Flow benchmark MDBX sync mode");
+    let fields = Fields::new().with("mdbx_sync_mode", "durable");
     let environment = EnvironmentRecord::new(
         BENCHMARK,
         root.profile(),
-        HostEnvironment::collect(Some(root.base())).expect("collect Flow benchmark environment"),
+        HostEnvironment::collect(Some(root.base())),
         fields,
-    )
-    .expect("construct Flow benchmark environment record");
+    );
     emit_record(&environment);
 }
 
 fn emit_configuration(config: &Config) {
     let fields = Fields::new()
         .with("station_counts", &config.station_counts)
-        .expect("add Flow benchmark station counts")
         .with("samples", config.samples)
-        .expect("add Flow benchmark sample count")
         .with("warmups", config.warmups)
-        .expect("add Flow benchmark warmup count")
         .with("fresh_build_path_and_factory", "outside_timing")
-        .expect("add Flow fresh-build setup policy")
         .with("fresh_build_store_per_sample", true)
-        .expect("add Flow fresh-build store policy")
         .with("reopen_fixture_and_warmup", "outside_timing")
-        .expect("add Flow reopen setup policy")
         .with("reopen_cache", "warm_committed")
-        .expect("add Flow reopen cache policy")
-        .with("validation", "outside_timing")
-        .expect("add Flow benchmark validation policy");
-    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_data_records(), fields)
-        .expect("construct Flow benchmark configuration record");
+        .with("validation", "outside_timing");
+    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_samples(), fields);
     emit_record(&configuration);
 }
 
 fn emit_sample(scenario: &'static str, station_count: usize, sample: usize, elapsed: Duration) {
+    let series = format!("{scenario}/stations={station_count}");
     let sample = SampleRecord::new(
         BENCHMARK,
-        scenario,
+        series,
         sample,
         elapsed,
         station_fields(station_count),
-    )
-    .expect("construct Flow benchmark sample record");
+    );
     emit_record(&sample);
 }
 
 fn report(scenario: &'static str, station_count: usize, samples: &[Duration]) {
-    let summary = DurationSummary::from_samples(samples).expect("summarize Flow benchmark samples");
+    let summary = DurationSummary::from_samples(samples);
     let min = summary.min();
     let median = summary.median();
     let max = summary.max();
     assert!(!median.is_zero(), "benchmark median must be non-zero");
     println!("{scenario} stations={station_count}: min={min:?} median={median:?} max={max:?}");
-    let summary = SummaryRecord::new(BENCHMARK, scenario, summary, station_fields(station_count))
-        .expect("construct Flow benchmark summary record");
-    emit_record(&summary);
 }
 
 fn station_fields(station_count: usize) -> Fields {
-    Fields::new()
-        .with("station_count", station_count)
-        .expect("add Flow benchmark station count")
+    Fields::new().with("station_count", station_count)
 }
 
 fn emit_record(record: &impl BenchmarkRecord) {
     let stdout = io::stdout();
     let mut writer = JsonlWriter::new(stdout.lock());
-    writer
-        .write(record)
-        .expect("write Flow benchmark protocol record");
-    writer
-        .flush()
-        .expect("flush Flow benchmark protocol record");
+    writer.write(record);
+    writer.flush();
 }

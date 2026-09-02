@@ -3,7 +3,7 @@
 use std::{hint::black_box, num::NonZeroUsize, time::Duration};
 
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord, SummaryRecord,
+    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord,
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 use tempfile::TempDir;
@@ -91,13 +91,10 @@ fn main() {
     } = Config::for_profile(bench_root.profile());
     let mut fields = Fields::new();
     for (name, value) in [("reads", reads), ("commits", commits), ("samples", samples)] {
-        fields
-            .insert(name, value)
-            .expect("construct Cell configuration fields");
+        fields.insert(name, value);
     }
-    let expected_data_records = NonZeroUsize::new(2 * (samples + 1)).unwrap();
-    let record = ConfigurationRecord::new(BENCHMARK, expected_data_records, fields)
-        .expect("construct Cell configuration record");
+    let expected_samples = NonZeroUsize::new(2 * samples).unwrap();
+    let record = ConfigurationRecord::new(BENCHMARK, expected_samples, fields);
     write_record(&record);
 
     println!("DogPaddle Cell benchmark");
@@ -214,14 +211,10 @@ fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl Fn
             sample,
             elapsed,
             measurement_fields(work),
-        )
-        .expect("construct Cell sample record");
+        );
         write_record(&record);
     }
-    let summary = DurationSummary::from_samples(&durations).expect("summarize Cell measurements");
-    let record = SummaryRecord::new(BENCHMARK, workload, summary, measurement_fields(work))
-        .expect("construct Cell summary record");
-    write_record(&record);
+    let summary = DurationSummary::from_samples(&durations);
     let rate = work.operations as u128 * 1_000_000_000 / summary.median().as_nanos();
     let median_per_operation = average_duration(summary.median(), work.operations);
     println!(
@@ -235,17 +228,13 @@ fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl Fn
 
 fn measurement_fields(work: SampleWork) -> Fields {
     let mut fields = Fields::new();
-    fields
-        .insert("variant", "Cell")
-        .expect("construct Cell variant field");
+    fields.insert("variant", "Cell");
     for (name, value) in [
         ("operations", work.operations),
         ("transactions", work.transactions),
         ("logical_bytes", work.logical_bytes),
     ] {
-        fields
-            .insert(name, value)
-            .expect("construct Cell work fields");
+        fields.insert(name, value);
     }
     fields
 }

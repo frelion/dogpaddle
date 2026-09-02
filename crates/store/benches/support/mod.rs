@@ -26,13 +26,9 @@ impl BenchRoot {
     }
 
     fn emit_environment(&self) {
-        let host = HostEnvironment::collect(Some(self.root.filesystem_root()))
-            .expect("collect Store benchmark host environment");
-        let fields = Fields::new()
-            .with("mdbx_sync_mode", "durable")
-            .expect("construct Store environment fields");
-        let record = EnvironmentRecord::new(self.benchmark, self.root.profile(), host, fields)
-            .expect("construct Store environment record");
+        let host = HostEnvironment::collect(Some(self.root.filesystem_root()));
+        let fields = Fields::new().with("mdbx_sync_mode", "durable");
+        let record = EnvironmentRecord::new(self.benchmark, self.root.profile(), host, fields);
         write_record(&record);
     }
 
@@ -47,15 +43,11 @@ impl BenchRoot {
 
 pub(crate) fn write_record(record: &impl BenchmarkRecord) {
     let stdout = std::io::stdout();
-    JsonlWriter::new(stdout.lock())
-        .write(record)
-        .expect("write Store benchmark JSONL record");
+    JsonlWriter::new(stdout.lock()).write(record);
 }
 
 pub(crate) fn complete(benchmark: &'static str) {
-    write_record(
-        &CompletionRecord::new(benchmark).expect("construct Store benchmark completion record"),
-    );
+    write_record(&CompletionRecord::new(benchmark));
 }
 
 #[allow(dead_code)]

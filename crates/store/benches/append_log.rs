@@ -166,26 +166,15 @@ fn emit_configuration(config: &AppendConfiguration<'_>) {
         ("station_batch_items", config.station_batch_items),
         ("gc_items", config.gc_items),
     ] {
-        fields
-            .insert(name, value)
-            .expect("construct AppendLog configuration fields");
+        fields.insert(name, value);
     }
-    fields
-        .insert("record_bytes", config.record_sizes)
-        .expect("construct AppendLog record-size field");
-    fields
-        .insert("source_batch_items", config.source_batches)
-        .expect("construct AppendLog batch-size field");
-    fields
-        .insert("readers", config.readers)
-        .expect("construct AppendLog reader field");
-    let samples_and_summary = config.samples + 1;
-    let records = config.record_sizes.len() * (7 * config.samples + 10)
-        + config.source_batches.len() * samples_and_summary
-        + (4 + config.readers.len()) * samples_and_summary
-        + (2 * config.samples + 3);
-    let record = ConfigurationRecord::new(BENCHMARK, NonZeroUsize::new(records).unwrap(), fields)
-        .expect("construct AppendLog configuration record");
+    fields.insert("record_bytes", config.record_sizes);
+    fields.insert("source_batch_items", config.source_batches);
+    fields.insert("readers", config.readers);
+    let records =
+        (7 * config.record_sizes.len() + config.source_batches.len() + 6 + config.readers.len())
+            * config.samples;
+    let record = ConfigurationRecord::new(BENCHMARK, NonZeroUsize::new(records).unwrap(), fields);
     write_record(&record);
 }
 

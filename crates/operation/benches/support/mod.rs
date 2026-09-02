@@ -7,7 +7,7 @@ use std::{
 
 use dogpaddle_bench_protocol::{
     BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
-    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, RunRoot, SampleRecord, SummaryRecord,
+    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, RunRoot, SampleRecord,
 };
 use tempfile::TempDir;
 
@@ -35,7 +35,6 @@ pub(crate) struct SampleStore {
 
 pub(crate) struct MachineRecords {
     samples: Vec<SampleRecord>,
-    summaries: Vec<SummaryRecord>,
 }
 
 impl Config {
@@ -66,34 +65,23 @@ impl Config {
 
     pub(crate) fn emit(&self) {
         let mut fields = Fields::new();
-        fields
-            .insert("samples", self.samples)
-            .expect("encode sample count");
-        fields
-            .insert("codec_operations_per_sample", self.codec_operations)
-            .expect("encode codec operation count");
-        fields
-            .insert("body_transactions_per_sample", self.body_transactions)
-            .expect("encode body transaction count");
-        fields
-            .insert("durable_transactions_per_sample", self.durable_transactions)
-            .expect("encode durable transaction count");
-        fields
-            .insert("warmup_transactions", self.warmup_transactions)
-            .expect("encode warmup transaction count");
-        fields
-            .insert("turns_per_transaction", &self.turns)
-            .expect("encode turn counts");
-        emit_record(
-            &ConfigurationRecord::new(BENCHMARK, self.expected_data_records(), fields)
-                .expect("build Operation configuration record"),
-        );
+        fields.insert("samples", self.samples);
+        fields.insert("codec_operations_per_sample", self.codec_operations);
+        fields.insert("body_transactions_per_sample", self.body_transactions);
+        fields.insert("durable_transactions_per_sample", self.durable_transactions);
+        fields.insert("warmup_transactions", self.warmup_transactions);
+        fields.insert("turns_per_transaction", &self.turns);
+        emit_record(&ConfigurationRecord::new(
+            BENCHMARK,
+            self.expected_samples(),
+            fields,
+        ));
     }
 
-    fn expected_data_records(&self) -> NonZeroUsize {
+    fn expected_samples(&self) -> NonZeroUsize {
         NonZeroUsize::new(
             (6 + 4 * self.turns.len())
-                .checked_mul(self.samples + 1)
+                .checked_mul(self.samples)
                 .expect("Operation record count fits usize"),
         )
         .expect("Operation benchmark emits data records")
@@ -118,23 +106,18 @@ impl BenchRoot {
     }
 
     pub(crate) fn emit_environment(&self) {
-        let host = HostEnvironment::collect(Some(self.root.filesystem_root()))
-            .expect("collect Operation benchmark environment");
+        let host = HostEnvironment::collect(Some(self.root.filesystem_root()));
         let mut fields = Fields::new();
-        fields
-            .insert("store_root", self.root.path().display().to_string())
-            .expect("encode benchmark Store root");
-        fields
-            .insert("execution", "single-thread")
-            .expect("encode execution mode");
-        fields.insert("cache", "warm").expect("encode cache mode");
-        fields
-            .insert("mdbx_sync_mode", "durable")
-            .expect("encode MDBX sync mode");
-        emit_record(
-            &EnvironmentRecord::new(BENCHMARK, self.profile(), host, fields)
-                .expect("build Operation environment record"),
-        );
+        fields.insert("store_root", self.root.path().display().to_string());
+        fields.insert("execution", "single-thread");
+        fields.insert("cache", "warm");
+        fields.insert("mdbx_sync_mode", "durable");
+        emit_record(&EnvironmentRecord::new(
+            BENCHMARK,
+            self.profile(),
+            host,
+            fields,
+        ));
     }
 
     pub(crate) fn assert_samples_released(&self) {
@@ -158,7 +141,6 @@ impl MachineRecords {
     pub(crate) const fn new() -> Self {
         Self {
             samples: Vec::new(),
-            summaries: Vec::new(),
         }
     }
 
@@ -172,8 +154,7 @@ impl MachineRecords {
         durations: Vec<Duration>,
     ) {
         assert!(operations > 0);
-        let summary =
-            DurationSummary::from_samples(&durations).expect("summarize Operation samples");
+        let summary = DurationSummary::from_samples(&durations);
         println!(
             "{operation:<10} {scenario:<28} turns/tx={turns:<5} operations={operations:<9} min={} median={} max={}",
             duration(summary.min()),
@@ -182,45 +163,30 @@ impl MachineRecords {
         );
 
         let fields = measurement_fields(operation, operations, transactions, turns);
-        for (sample, elapsed) in durations.into_iter().enumerate() {
-            let mut sample_fields = fields.clone();
-            let ns_per_operation =
-                elapsed.as_nanos() / u128::try_from(operations).expect("operation count fits u128");
-            sample_fields
-                .insert("ns_per_operation", ns_per_operation)
-                .expect("encode per-operation duration");
-            self.samples.push(
-                SampleRecord::new(BENCHMARK, scenario, sample, elapsed, sample_fields)
-                    .expect("build Operation sample record"),
-            );
-        }
-        self.summaries.push(
-            SummaryRecord::new(BENCHMARK, scenario, summary, fields)
-                .expect("build Operation summary record"),
+        let series = format!(
+            "{operation}/{scenario}/turns={turns}/operations={operations}/transactions={transactions}"
         );
+        for (sample, elapsed) in durations.into_iter().enumerate() {
+            self.samples.push(SampleRecord::new(
+                BENCHMARK,
+                &series,
+                sample,
+                elapsed,
+                fields.clone(),
+            ));
+        }
     }
 
     pub(crate) fn emit(&self) {
         println!();
-        println!("=== machine-readable JSONL samples and summaries ===");
+        println!("=== machine-readable JSONL samples ===");
         let stdout = io::stdout();
         let mut writer = JsonlWriter::new(stdout.lock());
         for sample in &self.samples {
-            writer
-                .write(sample)
-                .expect("write Operation benchmark sample record");
+            writer.write(sample);
         }
-        for summary in &self.summaries {
-            writer
-                .write(summary)
-                .expect("write Operation benchmark summary record");
-        }
-        writer
-            .write(&CompletionRecord::new(BENCHMARK).expect("build Operation completion record"))
-            .expect("write Operation completion record");
-        writer
-            .flush()
-            .expect("flush Operation benchmark protocol records");
+        writer.write(&CompletionRecord::new(BENCHMARK));
+        writer.flush();
     }
 }
 
@@ -232,19 +198,13 @@ fn measurement_fields(
 ) -> Fields {
     Fields::new()
         .with("operation", operation)
-        .expect("encode Operation name")
         .with("operations", operations)
-        .expect("encode operation count")
         .with("transactions", transactions)
-        .expect("encode transaction count")
         .with("turns_per_transaction", turns)
-        .expect("encode turn count")
 }
 
 fn emit_record(record: &impl BenchmarkRecord) {
-    JsonlWriter::new(io::stdout().lock())
-        .write(record)
-        .expect("write Operation benchmark JSONL");
+    JsonlWriter::new(io::stdout().lock()).write(record);
 }
 
 fn duration(value: Duration) -> String {

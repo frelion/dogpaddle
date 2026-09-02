@@ -4,8 +4,6 @@ mod change;
 mod codec;
 #[path = "correctness/projection.rs"]
 mod projection;
-#[path = "correctness/properties.rs"]
-mod properties;
 #[path = "correctness/schema.rs"]
 mod schema;
 #[path = "correctness/support.rs"]

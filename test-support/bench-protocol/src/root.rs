@@ -35,7 +35,7 @@ impl RunRoot {
     /// when the configured filesystem cannot be prepared.
     #[must_use]
     pub fn from_environment(benchmark: &str) -> Self {
-        let profile = BenchmarkProfile::from_environment().expect("read benchmark profile");
+        let profile = BenchmarkProfile::from_environment();
         let configured = std::env::var_os(BENCHMARK_ROOT_ENV).map(PathBuf::from);
         match (profile, configured) {
             (BenchmarkProfile::Smoke, None) => Self::temporary(benchmark),

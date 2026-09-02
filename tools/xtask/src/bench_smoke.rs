@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -34,11 +34,8 @@ enum Phase {
     Complete,
 }
 
-#[derive(Default)]
-struct StandardRecords {
-    samples: Vec<Map<String, Value>>,
-    summaries: Vec<Map<String, Value>>,
-}
+type SeriesSamples = BTreeMap<String, Vec<usize>>;
+type PairedSamples = BTreeMap<String, BTreeMap<String, (String, Vec<usize>)>>;
 
 pub(crate) fn run(workspace: &Path) -> Result<(), String> {
     let targets = discover_bench_targets(workspace)?;
@@ -189,8 +186,12 @@ fn validate_output(
 ) -> Result<(), String> {
     let mut phase = Phase::Start;
     let mut data_records = 0_usize;
-    let mut expected_data_records = None;
-    let mut standard = StandardRecords::default();
+    let mut sample_records = 0_usize;
+    let mut expected_samples = None;
+    let mut sample_indices = SeriesSamples::new();
+    let mut pair_indices = PairedSamples::new();
+    let mut required_observations = BTreeMap::new();
+    let mut observation_indices = SeriesSamples::new();
 
     for (index, line) in stdout.lines().enumerate() {
         let line = line.trim_start();
@@ -224,11 +225,9 @@ fn validate_output(
                 Phase::Environment
             }
             (Phase::Environment, "configuration") => {
-                expected_data_records = Some(
-                    usize::try_from(unsigned(record, "expected_data_records")?).map_err(
-                        |error| format!("expected data-record count does not fit usize: {error}"),
-                    )?,
-                );
+                let (samples, observations) = configuration_requirements(record)?;
+                expected_samples = Some(samples);
+                required_observations = observations;
                 Phase::Configuration
             }
             (Phase::Configuration | Phase::Data, "completion") if data_records > 0 => {
@@ -243,9 +242,23 @@ fn validate_output(
             (Phase::Configuration | Phase::Data, _) => {
                 data_records += 1;
                 match discriminator {
-                    "sample" => standard.samples.push(record.clone()),
-                    "summary" => standard.summaries.push(record.clone()),
-                    _ => {}
+                    "sample" => {
+                        sample_records += 1;
+                        record_sample(record, &mut sample_indices, &mut pair_indices)?;
+                    }
+                    "observation" => record_observation(record, &mut observation_indices)?,
+                    "summary" | "pair_summary" => {
+                        return Err(format!(
+                            "retired derived record {discriminator:?} on stdout line {}; emit raw samples instead",
+                            index + 1
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown data record {discriminator:?} on stdout line {}; expected sample or observation",
+                            index + 1
+                        ));
+                    }
                 }
                 Phase::Data
             }
@@ -264,6 +277,26 @@ fn validate_output(
         };
     }
 
+    finish_validation(
+        phase,
+        sample_records,
+        expected_samples,
+        sample_indices,
+        pair_indices,
+        &required_observations,
+        &observation_indices,
+    )
+}
+
+fn finish_validation(
+    phase: Phase,
+    sample_records: usize,
+    expected_samples: Option<usize>,
+    sample_indices: SeriesSamples,
+    pair_indices: PairedSamples,
+    required_observations: &BTreeMap<String, usize>,
+    observation_indices: &SeriesSamples,
+) -> Result<(), String> {
     if phase != Phase::Complete {
         return Err(match phase {
             Phase::Start => "benchmark emitted no machine JSONL records".to_owned(),
@@ -273,132 +306,153 @@ fn validate_output(
             Phase::Complete => unreachable!(),
         });
     }
-    let expected_data_records = expected_data_records.expect("complete protocol has configuration");
-    if data_records != expected_data_records {
+    let expected_samples = expected_samples.expect("complete protocol has configuration");
+    if sample_records != expected_samples {
         return Err(format!(
-            "benchmark emitted {data_records} data records, configuration requires {expected_data_records}"
+            "benchmark emitted {sample_records} samples, configuration requires {expected_samples}"
         ));
     }
-    if standard.samples.is_empty() != standard.summaries.is_empty() {
-        return Err(
-            "standard samples and summaries must either both be present or both be absent"
-                .to_owned(),
-        );
+    for (series, indices) in sample_indices {
+        validate_series_indices("sample", &series, &indices)?;
     }
-    if !standard.samples.is_empty() {
-        validate_standard_summaries(&standard.samples, &standard.summaries)?;
+    for (pair, sides) in pair_indices {
+        validate_pair_indices(&pair, &sides)?;
     }
+    validate_observations(required_observations, observation_indices)?;
     Ok(())
 }
 
-fn validate_standard_summaries(
-    samples: &[Map<String, Value>],
-    summaries: &[Map<String, Value>],
+fn record_observation(
+    record: &Map<String, Value>,
+    observations: &mut SeriesSamples,
 ) -> Result<(), String> {
-    let mut summary_keys = BTreeSet::new();
-    let mut sample_matches = vec![0_usize; samples.len()];
-    for summary in summaries {
-        let key = standard_summary_key(summary)?;
-        if !summary_keys.insert(key.clone()) {
-            return Err(format!("duplicate summary for series {key}"));
-        }
-        let mut matched = Vec::new();
-        for (index, sample) in samples.iter().enumerate() {
-            if standard_summary_matches(summary, sample)? {
-                sample_matches[index] += 1;
-                matched.push(sample);
-            }
-        }
-        if matched.is_empty() {
-            return Err(format!("summary for series {key} has no matching samples"));
-        }
-        validate_sample_indices(&matched)?;
-        let mut durations = matched
-            .iter()
-            .map(|sample| unsigned(sample, "elapsed_ns"))
-            .collect::<Result<Vec<_>, _>>()?;
-        durations.sort_unstable();
-        require_unsigned(summary, "samples", durations.len() as u128, &key)?;
-        require_unsigned(summary, "min_ns", durations[0], &key)?;
-        require_unsigned(summary, "median_ns", durations[durations.len() / 2], &key)?;
-        require_unsigned(
-            summary,
-            "max_ns",
-            *durations.last().expect("matched samples are non-empty"),
-            &key,
-        )?;
+    let series = string(record, "series")?.to_owned();
+    if series.is_empty() {
+        return Err("observation series must not be empty".to_owned());
     }
-    for (index, matches) in sample_matches.into_iter().enumerate() {
-        if matches != 1 {
-            return Err(format!(
-                "sample record {index} matched {matches} summaries instead of exactly one"
-            ));
-        }
-    }
+    let sample = usize::try_from(unsigned(record, "sample")?)
+        .map_err(|error| format!("observation index does not fit usize: {error}"))?;
+    observations.entry(series).or_default().push(sample);
     Ok(())
 }
 
-fn standard_summary_key(summary: &Map<String, Value>) -> Result<String, String> {
-    let mut identity = Map::new();
-    for (name, value) in summary {
-        if !matches!(
-            name.as_str(),
-            "record" | "samples" | "min_ns" | "median_ns" | "max_ns"
-        ) {
-            identity.insert(name.clone(), value.clone());
+fn record_sample(
+    record: &Map<String, Value>,
+    samples: &mut SeriesSamples,
+    pairs: &mut PairedSamples,
+) -> Result<(), String> {
+    let series = string(record, "series")?.to_owned();
+    if series.is_empty() {
+        return Err("sample series must not be empty".to_owned());
+    }
+    let sample = usize::try_from(unsigned(record, "sample")?)
+        .map_err(|error| format!("sample index does not fit usize: {error}"))?;
+    unsigned(record, "elapsed_ns")?;
+    samples.entry(series.clone()).or_default().push(sample);
+
+    match (record.get("pair"), record.get("side")) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(format!(
+            "sample series {series:?} must provide pair and side together"
+        )),
+        (Some(_), Some(_)) => {
+            let pair = string(record, "pair")?;
+            if pair.is_empty() {
+                return Err("sample pair must not be empty".to_owned());
+            }
+            let side = string(record, "side")?;
+            if !matches!(side, "first" | "second") {
+                return Err(format!(
+                    "sample pair {pair:?} side must be first or second, found {side:?}"
+                ));
+            }
+            let entry = pairs
+                .entry(pair.to_owned())
+                .or_default()
+                .entry(side.to_owned())
+                .or_insert_with(|| (series.clone(), Vec::new()));
+            if entry.0 != series {
+                return Err(format!(
+                    "sample pair {pair:?} side {side:?} is shared by series {:?} and {series:?}",
+                    entry.0
+                ));
+            }
+            entry.1.push(sample);
+            Ok(())
         }
     }
-    serde_json::to_string(&identity).map_err(|error| format!("encode summary identity: {error}"))
 }
 
-fn standard_summary_matches(
-    summary: &Map<String, Value>,
-    sample: &Map<String, Value>,
-) -> Result<bool, String> {
-    if string(summary, "scenario")? != string(sample, "scenario")? {
-        return Ok(false);
-    }
-    Ok(summary.iter().all(|(name, value)| {
-        matches!(
-            name.as_str(),
-            "record" | "benchmark" | "scenario" | "samples" | "min_ns" | "median_ns" | "max_ns"
-        ) || sample.get(name) == Some(value)
-    }))
-}
-
-fn validate_sample_indices(records: &[&Map<String, Value>]) -> Result<(), String> {
-    let mut indices = records
-        .iter()
-        .map(|record| {
-            usize::try_from(unsigned(record, "sample")?)
-                .map_err(|error| format!("sample index does not fit usize: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+fn validate_series_indices(kind: &str, series: &str, records: &[usize]) -> Result<(), String> {
+    let mut indices = records.to_vec();
     indices.sort_unstable();
     for (expected, actual) in indices.into_iter().enumerate() {
         if actual != expected {
             return Err(format!(
-                "sample indices must be unique and contiguous from zero; expected {expected}, found {actual}"
+                "{kind} series {series:?} must have unique contiguous indices from zero; expected {expected}, found {actual}"
             ));
         }
     }
     Ok(())
 }
 
-fn require_unsigned(
-    record: &Map<String, Value>,
-    field: &str,
-    expected: u128,
-    context: &str,
+fn validate_pair_indices(
+    pair: &str,
+    sides: &BTreeMap<String, (String, Vec<usize>)>,
 ) -> Result<(), String> {
-    let actual = unsigned(record, field)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "{context} field {field:?} is {actual}, recomputed value is {expected}"
-        ))
+    let (_, first) = sides
+        .get("first")
+        .ok_or_else(|| format!("sample pair {pair:?} has no first side"))?;
+    let (_, second) = sides
+        .get("second")
+        .ok_or_else(|| format!("sample pair {pair:?} has no second side"))?;
+    let mut first = first.clone();
+    let mut second = second.clone();
+    first.sort_unstable();
+    second.sort_unstable();
+    if first != second {
+        return Err(format!(
+            "sample pair {pair:?} sides have different sample indices: first={first:?}, second={second:?}"
+        ));
     }
+    Ok(())
+}
+
+fn validate_observations(
+    required: &BTreeMap<String, usize>,
+    actual: &SeriesSamples,
+) -> Result<(), String> {
+    for (series, indices) in actual {
+        let Some(expected) = required.get(series) else {
+            return Err(format!(
+                "observation series {series:?} is not declared by `required_observations`"
+            ));
+        };
+        validate_series_indices("observation", series, indices)?;
+        if indices.len() != *expected {
+            return Err(format!(
+                "observation series {series:?} emitted {} records, configuration requires {expected}",
+                indices.len()
+            ));
+        }
+    }
+    if let Some(missing) = required.keys().find(|series| !actual.contains_key(*series)) {
+        return Err(format!(
+            "required observation series {missing:?} is missing"
+        ));
+    }
+    Ok(())
+}
+
+fn configuration_requirements(
+    configuration: &Map<String, Value>,
+) -> Result<(usize, BTreeMap<String, usize>), String> {
+    let samples = usize::try_from(unsigned(configuration, "expected_samples")?)
+        .map_err(|error| format!("expected sample count does not fit usize: {error}"))?;
+    if samples == 0 {
+        return Err("field `expected_samples` must be non-zero".to_owned());
+    }
+    Ok((samples, observation_requirements(configuration)?))
 }
 
 fn array<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a Vec<Value>, String> {
@@ -406,6 +460,35 @@ fn array<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a Vec<Valu
         .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| format!("field {field:?} must be an array"))
+}
+
+fn observation_requirements(
+    configuration: &Map<String, Value>,
+) -> Result<BTreeMap<String, usize>, String> {
+    let Some(value) = configuration.get("required_observations") else {
+        return Ok(BTreeMap::new());
+    };
+    let requirements = value
+        .as_object()
+        .ok_or_else(|| "field `required_observations` must be an object".to_owned())?;
+    if requirements.is_empty() {
+        return Err("field `required_observations` must not be empty".to_owned());
+    }
+    let mut result = BTreeMap::new();
+    for (series, value) in requirements {
+        if series.is_empty() {
+            return Err("observation series must not be empty".to_owned());
+        }
+        let count = usize::try_from(unsigned_value(value, "required_observations count")?)
+            .map_err(|error| format!("observation count does not fit usize: {error}"))?;
+        if count == 0 {
+            return Err(format!(
+                "required observation series {series:?} must have a non-zero count"
+            ));
+        }
+        result.insert(series.clone(), count);
+    }
+    Ok(result)
 }
 
 fn string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
@@ -419,6 +502,10 @@ fn unsigned(object: &Map<String, Value>, field: &str) -> Result<u128, String> {
     let value = object
         .get(field)
         .ok_or_else(|| format!("missing unsigned integer field {field:?}"))?;
+    unsigned_value(value, field)
+}
+
+fn unsigned_value(value: &Value, field: &str) -> Result<u128, String> {
     let Value::Number(number) = value else {
         return Err(format!("field {field:?} must be an unsigned integer"));
     };
@@ -438,29 +525,38 @@ mod tests {
 
     const ENVIRONMENT: &str = r#"{"record":"environment","benchmark":"bench","profile":"smoke"}"#;
     const CONFIGURATION: &str =
-        r#"{"record":"configuration","benchmark":"bench","expected_data_records":2}"#;
+        r#"{"record":"configuration","benchmark":"bench","expected_samples":1}"#;
     const SAMPLE: &str =
-        r#"{"record":"sample","benchmark":"bench","scenario":"case","sample":0,"elapsed_ns":10}"#;
-    const SUMMARY: &str = r#"{"record":"summary","benchmark":"bench","scenario":"case","samples":1,"min_ns":10,"median_ns":10,"max_ns":10}"#;
+        r#"{"record":"sample","benchmark":"bench","series":"case","sample":0,"elapsed_ns":10}"#;
     const COMPLETION: &str = r#"{"record":"completion","benchmark":"bench"}"#;
 
     #[test]
     fn output_accepts_a_generic_complete_protocol() {
         validate_output(
             "bench",
-            &[ENVIRONMENT, CONFIGURATION, SAMPLE, SUMMARY, COMPLETION].join("\n"),
+            &[ENVIRONMENT, CONFIGURATION, SAMPLE, COMPLETION].join("\n"),
         )
         .unwrap();
     }
 
     #[test]
-    fn output_accepts_owner_extensions_without_learning_their_schema() {
-        let configuration =
-            r#"{"record":"configuration","benchmark":"bench","expected_data_records":1}"#;
-        let extension = r#"{"record":"future_owner_record","benchmark":"bench","value":1}"#;
+    fn output_accepts_exact_declared_observations_without_owner_schema() {
+        let configuration = r#"{"record":"configuration","benchmark":"bench","expected_samples":1,"required_observations":{"record_bytes=128/checkpoint":2,"record_bytes=128/terminal":1}}"#;
+        let checkpoint_0 = r#"{"record":"observation","benchmark":"bench","series":"record_bytes=128/checkpoint","sample":0,"epoch":0}"#;
+        let checkpoint_1 = r#"{"record":"observation","benchmark":"bench","series":"record_bytes=128/checkpoint","sample":1,"epoch":8}"#;
+        let terminal = r#"{"record":"observation","benchmark":"bench","series":"record_bytes=128/terminal","sample":0,"checksum":"owner-defined"}"#;
         validate_output(
             "bench",
-            &[ENVIRONMENT, configuration, extension, COMPLETION].join("\n"),
+            &[
+                ENVIRONMENT,
+                configuration,
+                SAMPLE,
+                checkpoint_0,
+                checkpoint_1,
+                terminal,
+                COMPLETION,
+            ]
+            .join("\n"),
         )
         .unwrap();
         let reference_environment =
@@ -468,9 +564,65 @@ mod tests {
         super::validate_output(
             "bench",
             "reference",
-            &[reference_environment, configuration, extension, COMPLETION].join("\n"),
+            &[
+                reference_environment,
+                configuration,
+                SAMPLE,
+                checkpoint_0,
+                checkpoint_1,
+                terminal,
+                COMPLETION,
+            ]
+            .join("\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn output_rejects_missing_or_duplicate_required_observations() {
+        let required = r#"{"record":"configuration","benchmark":"bench","expected_samples":1,"required_observations":{"record_bytes=128/terminal":1}}"#;
+        let missing = validate_output(
+            "bench",
+            &[ENVIRONMENT, required, SAMPLE, COMPLETION].join("\n"),
+        )
+        .unwrap_err();
+        assert!(missing.contains("required observation series"));
+        assert!(missing.contains("is missing"));
+
+        let terminal = r#"{"record":"observation","benchmark":"bench","series":"record_bytes=128/terminal","sample":0}"#;
+        let duplicate = validate_output(
+            "bench",
+            &[
+                ENVIRONMENT,
+                required,
+                SAMPLE,
+                terminal,
+                terminal,
+                COMPLETION,
+            ]
+            .join("\n"),
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("must have unique contiguous indices"));
+    }
+
+    #[test]
+    fn output_rejects_undeclared_observations_and_unknown_data_records() {
+        let terminal = r#"{"record":"observation","benchmark":"bench","series":"record_bytes=128/terminal","sample":0}"#;
+        let undeclared = validate_output(
+            "bench",
+            &[ENVIRONMENT, CONFIGURATION, SAMPLE, terminal, COMPLETION].join("\n"),
+        )
+        .unwrap_err();
+        assert!(undeclared.contains("is not declared"));
+
+        let unknown = r#"{"record":"future_owner_record","benchmark":"bench","value":1}"#;
+        let unexpected = validate_output(
+            "bench",
+            &[ENVIRONMENT, CONFIGURATION, SAMPLE, unknown, COMPLETION].join("\n"),
+        )
+        .unwrap_err();
+        assert!(unexpected.contains("unknown data record"));
     }
 
     #[test]
@@ -510,38 +662,135 @@ mod tests {
     }
 
     #[test]
-    fn output_recomputes_standard_summaries() {
-        let wrong = r#"{"record":"summary","benchmark":"bench","scenario":"case","samples":1,"min_ns":10,"median_ns":11,"max_ns":10}"#;
+    fn output_rejects_invalid_raw_sample_series() {
+        let duplicate_configuration =
+            r#"{"record":"configuration","benchmark":"bench","expected_samples":2}"#;
+        let duplicate =
+            r#"{"record":"sample","benchmark":"bench","series":"case","sample":0,"elapsed_ns":11}"#;
         assert!(
             validate_output(
                 "bench",
-                &[ENVIRONMENT, CONFIGURATION, SAMPLE, wrong, COMPLETION].join("\n")
+                &[
+                    ENVIRONMENT,
+                    duplicate_configuration,
+                    SAMPLE,
+                    duplicate,
+                    COMPLETION,
+                ]
+                .join("\n")
             )
             .is_err()
         );
-        let wrong_count =
-            r#"{"record":"configuration","benchmark":"bench","expected_data_records":3}"#;
+        let gap =
+            r#"{"record":"sample","benchmark":"bench","series":"case","sample":2,"elapsed_ns":11}"#;
         assert!(
             validate_output(
                 "bench",
-                &[ENVIRONMENT, wrong_count, SAMPLE, SUMMARY, COMPLETION].join("\n")
+                &[
+                    ENVIRONMENT,
+                    duplicate_configuration,
+                    SAMPLE,
+                    gap,
+                    COMPLETION,
+                ]
+                .join("\n")
             )
             .is_err()
         );
+        let missing_series =
+            r#"{"record":"sample","benchmark":"bench","sample":0,"elapsed_ns":10}"#;
         assert!(
             validate_output(
                 "bench",
-                &[ENVIRONMENT, CONFIGURATION, SAMPLE, COMPLETION].join("\n")
+                &[ENVIRONMENT, CONFIGURATION, missing_series, COMPLETION].join("\n")
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn output_validates_lossless_raw_pairs() {
+        let configuration =
+            r#"{"record":"configuration","benchmark":"bench","expected_samples":2}"#;
+        let first = r#"{"record":"sample","benchmark":"bench","series":"case/first","sample":0,"elapsed_ns":10,"pair":"case","side":"first"}"#;
+        let second = r#"{"record":"sample","benchmark":"bench","series":"case/second","sample":0,"elapsed_ns":11,"pair":"case","side":"second"}"#;
+        validate_output(
+            "bench",
+            &[ENVIRONMENT, configuration, first, second, COMPLETION].join("\n"),
+        )
+        .unwrap();
+
+        let missing_side = r#"{"record":"sample","benchmark":"bench","series":"case/first","sample":0,"elapsed_ns":10,"pair":"case"}"#;
         assert!(
             validate_output(
                 "bench",
-                &[ENVIRONMENT, CONFIGURATION, SUMMARY, COMPLETION].join("\n")
+                &[ENVIRONMENT, CONFIGURATION, missing_side, COMPLETION].join("\n")
             )
             .is_err()
         );
+        let only_first = r#"{"record":"sample","benchmark":"bench","series":"case/first","sample":0,"elapsed_ns":10,"pair":"case","side":"first"}"#;
+        assert!(
+            validate_output(
+                "bench",
+                &[ENVIRONMENT, CONFIGURATION, only_first, COMPLETION].join("\n")
+            )
+            .is_err()
+        );
+
+        let invalid_side = r#"{"record":"sample","benchmark":"bench","series":"case/first","sample":0,"elapsed_ns":10,"pair":"case","side":"left"}"#;
+        assert!(
+            validate_output(
+                "bench",
+                &[ENVIRONMENT, CONFIGURATION, invalid_side, COMPLETION].join("\n")
+            )
+            .is_err()
+        );
+
+        let three_records =
+            r#"{"record":"configuration","benchmark":"bench","expected_samples":3}"#;
+        let first_1 = r#"{"record":"sample","benchmark":"bench","series":"case/first","sample":1,"elapsed_ns":12,"pair":"case","side":"first"}"#;
+        assert!(
+            validate_output(
+                "bench",
+                &[
+                    ENVIRONMENT,
+                    three_records,
+                    first,
+                    first_1,
+                    second,
+                    COMPLETION,
+                ]
+                .join("\n")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn output_rejects_retired_derived_records_and_wrong_counts() {
+        let summary = r#"{"record":"summary","benchmark":"bench"}"#;
+        assert!(
+            validate_output(
+                "bench",
+                &[ENVIRONMENT, CONFIGURATION, summary, COMPLETION].join("\n")
+            )
+            .is_err()
+        );
+        let wrong_count = r#"{"record":"configuration","benchmark":"bench","expected_samples":2}"#;
+        assert!(
+            validate_output(
+                "bench",
+                &[ENVIRONMENT, wrong_count, SAMPLE, COMPLETION].join("\n")
+            )
+            .is_err()
+        );
+        let zero_count = r#"{"record":"configuration","benchmark":"bench","expected_samples":0}"#;
+        let error = validate_output(
+            "bench",
+            &[ENVIRONMENT, zero_count, SAMPLE, COMPLETION].join("\n"),
+        )
+        .unwrap_err();
+        assert!(error.contains("`expected_samples` must be non-zero"));
     }
 
     #[test]

@@ -15,14 +15,19 @@ microbenchmark 外推成上层吞吐承诺。
 不增加 Cargo target，也不把产品语义放进共享协议 crate。统一配置见根目录
 [`TESTING.md`](../../TESTING.md)。
 
-`append_log_endurance` 由统一 `smoke`/`reference` profile 选择固定 workload、工作集和总写入预算、逐 cycle
-append/truncate 记录与 reopen checksum。所有 target 都输出完整环境指纹、计时外 oracle、隔离
-样本 Store，以及 `smoke`/`reference` 文件系统档位。
+`append_log_endurance` 由统一 `smoke`/`reference` profile 选择固定 workload、工作集和总写入预算；
+逐 append/truncate 耗时使用按 record width 和动作拆分的标准 SampleRecord series，`checkpoint` 保留
+空间轨迹，每个 record width 的 terminal series 只补充 wall elapsed 与最终 reopen checksum。
+checkpoint 与 terminal 共用固定 ObservationRecord；configuration 的 `required_observations` 精确声明
+每条 series 的数量，通用 gate 验证连续 index 而不解析 Store owner payload。延迟分位、协议耗时、
+吞吐、peak 和 tail spread 都可从这些 raw facts 无损派生。所有 target 都输出完整环境指纹、计时外
+oracle、隔离样本 Store，以及 `smoke`/`reference` 文件系统档位。
 
 下文 2026-08-25 数值是旧 runner 在明确记录的 WSL2 `/tmp` 环境中得到的历史优化证据，应保留
 用于解释设计决策；它们不能直接作为新 runner 的回归基线。建立新基线时必须在固定 reference
-目录重新运行，保存 stdout 中所有 `record=sample` 与 `record=pair_summary` JSONL，再从同一协议
-的原始配对样本比较。
+目录重新运行，保存 stdout 中全部 machine JSONL；普通序列按 `series` 派生统计，配对序列按
+`pair + side + sample` 一一对应，endurance 则按 record-width/action sample series 聚合 cycle，结合
+checkpoint 与 terminal observations，再从同一协议的原始观测比较。
 
 ## 结论摘要
 

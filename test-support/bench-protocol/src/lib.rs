@@ -8,16 +8,15 @@ mod root;
 mod settings;
 mod statistics;
 
-pub use environment::{EnvironmentCollectionError, HostEnvironment};
+pub use environment::HostEnvironment;
 pub use jsonl::{
-    BenchmarkRecord, CompletionRecord, ConfigurationRecord, EnvironmentRecord, ExtensionRecord,
-    FieldError, Fields, JsonlError, JsonlWriter, PairSummaryRecord, RecordError, SampleRecord,
-    SummaryRecord,
+    BenchmarkRecord, CompletionRecord, ConfigurationRecord, EnvironmentRecord, Fields, JsonlWriter,
+    ObservationRecord, SampleRecord,
 };
 pub use order::{PairMeasurements, PairOrder, PairSchedule, PairVariant, measure_pair_with};
 pub use root::{BENCHMARK_PROFILE_ENV, BENCHMARK_ROOT_ENV, RunRoot};
-pub use settings::{BenchmarkProfile, EnvError};
-pub use statistics::{DurationSummary, LatencySummary, PairedDurationSummary, StatisticsError};
+pub use settings::BenchmarkProfile;
+pub use statistics::{DurationSummary, LatencySummary, PairedDurationSummary};
 
 /// Rejects accidental execution of a benchmark built with debug assertions.
 ///

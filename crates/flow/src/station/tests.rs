@@ -100,10 +100,9 @@ impl Operation for WritingOperation {
 impl Operation for WritingActionOperation {
     fn turn(
         &self,
-        input: Option<OperationInput<'_>>,
+        _input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
-        assert!(input.is_some());
         self.state
             .access(access)?
             .put(&b"attempt".to_vec(), &self.value)?;
@@ -372,7 +371,7 @@ fn duplicate_edges_share_one_output_and_acknowledge_the_entry_independently() {
 }
 
 #[test]
-fn commit_retains_input_and_reoffers_the_identical_owned_claim() {
+fn commit_reoffers_the_same_claim_in_memory_and_after_cache_loss() {
     let mut fixture = source_sink(1, NonZeroU64::MAX);
     assert_eq!(
         advance(&mut fixture, 0).unwrap(),
@@ -386,7 +385,10 @@ fn commit_retains_input_and_reoffers_the_identical_owned_claim() {
         advance(&mut fixture, 1).unwrap(),
         AdvanceOutcome::Progressed
     );
-    let identity = std::ptr::from_ref(fixture.stations[1].inbox.cached_claim().unwrap().change());
+    let claim = fixture.stations[1].inbox.cached_claim().unwrap();
+    let durable_identity = (claim.port(), claim.offset());
+    let identity = std::ptr::from_ref(claim.change());
+    let encoded = encode_change(claim.change()).unwrap();
     assert_eq!(
         read_cursor(&fixture.stations[1], &mut fixture.transactions, 0),
         0
@@ -403,6 +405,20 @@ fn commit_retains_input_and_reoffers_the_identical_owned_claim() {
     assert_eq!(
         std::ptr::from_ref(fixture.stations[1].inbox.cached_claim().unwrap().change()),
         identity
+    );
+    fixture.stations[1].inbox.clear_cached_claim();
+    assert!(
+        !fixture.stations[1]
+            .inbox
+            .intake(&fixture.reads, &mut fixture.transactions)
+            .unwrap()
+    );
+    let rebuilt = fixture.stations[1].inbox.cached_claim().unwrap();
+    assert_eq!((rebuilt.port(), rebuilt.offset()), durable_identity);
+    assert_eq!(encode_change(rebuilt.change()).unwrap(), encoded);
+    assert_eq!(
+        read_cursor(&fixture.stations[1], &mut fixture.transactions, 0),
+        0
     );
     fixture.stations[1].operation = Box::new(FixedOperation {
         action: Action::Complete(None),
@@ -606,7 +622,10 @@ fn unexpected_output_rolls_back_completion_and_preserves_the_claim() {
         advance(&mut fixture, 0).unwrap(),
         AdvanceOutcome::Progressed
     );
-    fixture.stations[1].operation = Box::new(FixedOperation {
+    let state = fixture.stations[1].inbox.state().clone();
+    fixture.stations[1].operation = Box::new(WritingActionOperation {
+        state: state.clone(),
+        value: b"must-roll-back".to_vec(),
         action: Action::Complete(Some(change(&[9]))),
     });
 
@@ -614,6 +633,7 @@ fn unexpected_output_rolls_back_completion_and_preserves_the_claim() {
         advance(&mut fixture, 1),
         Err(StationError::UnexpectedOutput)
     ));
+    assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
     assert!(fixture.stations[1].inbox.cached_claim().is_some());
     assert_eq!(
         read_cursor(&fixture.stations[1], &mut fixture.transactions, 0),
@@ -628,7 +648,10 @@ fn unexpected_output_rolls_back_completion_and_preserves_the_claim() {
 #[test]
 fn source_complete_is_rejected_without_committing_its_turn() {
     let mut fixture = source_sink(1, NonZeroU64::MAX);
-    fixture.stations[0].operation = Box::new(FixedOperation {
+    let state = fixture.stations[0].inbox.state().clone();
+    fixture.stations[0].operation = Box::new(WritingActionOperation {
+        state: state.clone(),
+        value: b"must-roll-back".to_vec(),
         action: Action::Complete(None),
     });
 
@@ -636,6 +659,7 @@ fn source_complete_is_rejected_without_committing_its_turn() {
         advance(&mut fixture, 0),
         Err(StationError::OperationCompletedWithoutInput)
     ));
+    assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
     assert_eq!(
         output_bounds(&fixture.stations[0], &mut fixture.transactions),
         0..0
@@ -643,7 +667,7 @@ fn source_complete_is_rejected_without_committing_its_turn() {
 }
 
 #[test]
-fn a_non_active_input_pin_dominates_idle_then_reoffers_the_same_claim() {
+fn a_non_active_input_pin_dominates_idle_and_survives_cache_loss() {
     let mut fixture = multi_input_station(Action::Idle);
 
     assert_eq!(
@@ -654,8 +678,10 @@ fn a_non_active_input_pin_dominates_idle_then_reoffers_the_same_claim() {
         AdvanceOutcome::Progressed
     );
     let claim = fixture.station.inbox.cached_claim().unwrap();
-    assert_eq!((claim.port(), claim.offset()), (1, 0));
+    let durable_identity = (claim.port(), claim.offset());
+    assert_eq!(durable_identity, (1, 0));
     let identity = std::ptr::from_ref(claim.change());
+    let encoded = encode_change(claim.change()).unwrap();
     assert_eq!(read_active(&fixture.station, &mut fixture.transactions), 1);
     assert_eq!(
         read_cursor(&fixture.station, &mut fixture.transactions, 1),
@@ -673,7 +699,22 @@ fn a_non_active_input_pin_dominates_idle_then_reoffers_the_same_claim() {
         std::ptr::from_ref(fixture.station.inbox.cached_claim().unwrap().change()),
         identity
     );
+    fixture.station.inbox.clear_cached_claim();
+    assert!(
+        !fixture
+            .station
+            .inbox
+            .intake(&fixture.reads, &mut fixture.transactions)
+            .unwrap()
+    );
+    let rebuilt = fixture.station.inbox.cached_claim().unwrap();
+    assert_eq!((rebuilt.port(), rebuilt.offset()), durable_identity);
+    assert_eq!(encode_change(rebuilt.change()).unwrap(), encoded);
     assert_eq!(read_active(&fixture.station, &mut fixture.transactions), 1);
+    assert_eq!(
+        read_cursor(&fixture.station, &mut fixture.transactions, 1),
+        0
+    );
     assert_eq!(
         output_bounds_log(&fixture.second_output, &mut fixture.transactions),
         0..1

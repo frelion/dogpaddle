@@ -43,8 +43,9 @@ rows/s 和 encoded MiB/s。它们是 warm single-thread CPU 数量级，不是 S
 真实持久化路径由 `dogpaddle-change-store-integration` 独立测量。
 
 stdout 保留上述人类表格；每个以 `{` 开头的机器记录均由共享 writer 生成，是 typed JSONL
-`environment`、`configuration`、`sample`、`summary`，并以 `completion` 结束。Change 的
-sample/summary 扩展字段为 `workload`、`operations`、`rows_per_change` 和
+`environment`、`configuration`、带稳定 `series` 的原始 `sample`，并以 `completion` 结束；
+min/upper-median/max 只在进程内人类表格中派生。Change 的 sample 扩展字段为
+`workload`、`operations`、`rows_per_change` 和
 `encoded_bytes_per_change`；原始耗时与
 min/median/max 使用协议字段。启动时仍由 Change fixture 用 checked arithmetic 预检尺寸，并在分配
 前拒绝超过 Arrow i32 offset 容量的 Binary、Utf8 或 List 配置。

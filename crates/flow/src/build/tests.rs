@@ -1,7 +1,7 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use dogpaddle_operation::{
-    OperationDefinition, encode_definition,
+    OperationDefinition, OperationKind,
     operation::{
         sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
     },
@@ -16,7 +16,7 @@ use crate::{
 use super::{
     FlowDefinitionError, FlowFactory, StationRef, TopologyError,
     codec::{CHECKSUM_LENGTH, crc32, decode, encode},
-    definition::{FlowDefinition, StationDefinition},
+    definition::FlowDefinition,
     validate::{validate_acyclic, validate_connections},
 };
 
@@ -56,14 +56,6 @@ fn declare_output_capacities(builder: &mut FlowFactory) {
     }
 }
 
-fn find_station<'a>(definition: &'a FlowDefinition, id: &str) -> &'a StationDefinition {
-    definition
-        .stations
-        .iter()
-        .find(|station| station.id == id)
-        .unwrap()
-}
-
 fn finish_with_target<D>(
     operation: D,
     upstream_count: usize,
@@ -86,44 +78,6 @@ where
     }
     declare_output_capacities(&mut builder);
     builder.finish_definition()
-}
-
-#[test]
-fn finish_preserves_station_order_and_resolves_references() {
-    let mut builder = factory();
-    let first = builder.station("first", source(1));
-    let second = builder.station("second", source(2));
-    let target = builder.station("target", count());
-    let first_sink = builder.station("first-sink", discard());
-    let target_sink = builder.station("target-sink", discard());
-    builder.connect([first], first_sink);
-    builder.connect([second], target);
-    builder.connect([target], target_sink);
-    declare_output_capacities(&mut builder);
-
-    let definition = builder.finish_definition().unwrap();
-
-    assert_eq!(
-        definition
-            .stations
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        ["first", "second", "target", "first-sink", "target-sink"]
-    );
-    let target = find_station(&definition, "target");
-    assert_eq!(
-        encode_definition(target.operation()),
-        encode_definition(&count())
-    );
-    assert_eq!(
-        target
-            .sources
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["second"]
-    );
 }
 
 #[test]
@@ -235,6 +189,11 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                         for (target, station) in
                             definition.stations.iter().take(station_count).enumerate()
                         {
+                            let expected_kind = parents[target]
+                                .map_or(OperationKind::Source, |_| {
+                                    OperationKind::Transform(NonZeroU32::MIN)
+                                });
+                            assert_eq!(station.operation().kind(), expected_kind, "{graph}");
                             let expected_sources = parents[target]
                                 .map(|parent| vec![station_id(parent)])
                                 .unwrap_or_default();

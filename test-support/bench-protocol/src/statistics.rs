@@ -1,17 +1,11 @@
-use std::{fmt, time::Duration};
-
-use serde::Serialize;
+use std::time::Duration;
 
 /// Min/median/max statistics for ordinary benchmark samples.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurationSummary {
-    samples: usize,
-    #[serde(rename = "min_ns")]
-    min: DurationNanos,
-    #[serde(rename = "median_ns")]
-    median: DurationNanos,
-    #[serde(rename = "max_ns")]
-    max: DurationNanos,
+    min: Duration,
+    median: Duration,
+    max: Duration,
 }
 
 impl DurationSummary {
@@ -21,100 +15,94 @@ impl DurationSummary {
     /// preserves the established ordinary benchmark summary convention;
     /// endurance p50 remains nearest-rank via [`LatencySummary`].
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`StatisticsError::EmptySamples`] when `samples` is empty.
-    pub fn from_samples(samples: &[Duration]) -> Result<Self, StatisticsError> {
-        let sorted = sorted(samples)?;
-        let max = *sorted.last().ok_or(StatisticsError::EmptySamples)?;
-        Ok(Self {
-            samples: sorted.len(),
-            min: DurationNanos(sorted[0]),
-            median: DurationNanos(sorted[sorted.len() / 2]),
-            max: DurationNanos(max),
-        })
+    /// Panics when `samples` is empty.
+    #[must_use]
+    #[track_caller]
+    pub fn from_samples(samples: &[Duration]) -> Self {
+        let sorted = sorted("duration_summary", samples);
+        Self {
+            min: sorted[0],
+            median: sorted[sorted.len() / 2],
+            max: sorted[sorted.len() - 1],
+        }
     }
 
     /// Returns the minimum duration.
     #[must_use]
     pub const fn min(self) -> Duration {
-        self.min.0
+        self.min
     }
 
     /// Returns the median, using the upper middle element for an even count.
     #[must_use]
     pub const fn median(self) -> Duration {
-        self.median.0
+        self.median
     }
 
     /// Returns the maximum duration.
     #[must_use]
     pub const fn max(self) -> Duration {
-        self.max.0
+        self.max
     }
 }
 
 /// P50/p95/p99/max latency statistics for endurance protocols.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LatencySummary {
-    samples: usize,
-    #[serde(rename = "p50_ns")]
-    p50: DurationNanos,
-    #[serde(rename = "p95_ns")]
-    p95: DurationNanos,
-    #[serde(rename = "p99_ns")]
-    p99: DurationNanos,
-    #[serde(rename = "max_ns")]
-    max: DurationNanos,
+    p50: Duration,
+    p95: Duration,
+    p99: Duration,
+    max: Duration,
 }
 
 impl LatencySummary {
     /// Computes nearest-rank endurance percentiles from non-empty samples.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`StatisticsError::EmptySamples`] when `samples` is empty.
-    pub fn from_samples(samples: &[Duration]) -> Result<Self, StatisticsError> {
-        let sorted = sorted(samples)?;
-        let max = *sorted.last().ok_or(StatisticsError::EmptySamples)?;
-        Ok(Self {
-            samples: sorted.len(),
-            p50: DurationNanos(percentile_of_sorted(&sorted, 50)),
-            p95: DurationNanos(percentile_of_sorted(&sorted, 95)),
-            p99: DurationNanos(percentile_of_sorted(&sorted, 99)),
-            max: DurationNanos(max),
-        })
+    /// Panics when `samples` is empty.
+    #[must_use]
+    #[track_caller]
+    pub fn from_samples(samples: &[Duration]) -> Self {
+        let sorted = sorted("latency_summary", samples);
+        Self {
+            p50: percentile_of_sorted(&sorted, 50),
+            p95: percentile_of_sorted(&sorted, 95),
+            p99: percentile_of_sorted(&sorted, 99),
+            max: sorted[sorted.len() - 1],
+        }
     }
 
     /// Returns the nearest-rank p50 latency.
     #[must_use]
     pub const fn p50(self) -> Duration {
-        self.p50.0
+        self.p50
     }
 
     /// Returns the nearest-rank p95 latency.
     #[must_use]
     pub const fn p95(self) -> Duration {
-        self.p95.0
+        self.p95
     }
 
     /// Returns the nearest-rank p99 latency.
     #[must_use]
     pub const fn p99(self) -> Duration {
-        self.p99.0
+        self.p99
     }
 
     /// Returns the maximum observed latency.
     #[must_use]
     pub const fn max(self) -> Duration {
-        self.max.0
+        self.max
     }
 }
 
 /// Statistics derived from paired first/second benchmark samples.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PairedDurationSummary {
-    samples: usize,
     median_first_over_second: f64,
     second_wins: usize,
 }
@@ -125,38 +113,41 @@ impl PairedDurationSummary {
     /// Ratios are computed pairwise as `first / second`; the win count is the
     /// number of pairs where the second duration is strictly smaller.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`StatisticsError`] when either slice is empty, lengths differ, or
-    /// any duration is zero.
-    pub fn from_pairs(first: &[Duration], second: &[Duration]) -> Result<Self, StatisticsError> {
-        if first.len() != second.len() {
-            return Err(StatisticsError::LengthMismatch {
-                first: first.len(),
-                second: second.len(),
-            });
-        }
-        if first.is_empty() {
-            return Err(StatisticsError::EmptySamples);
-        }
-        if first.iter().chain(second).any(Duration::is_zero) {
-            return Err(StatisticsError::ZeroDuration);
-        }
+    /// Panics when either slice is empty, lengths differ, or any duration is
+    /// zero.
+    #[must_use]
+    #[track_caller]
+    pub fn from_pairs(first: &[Duration], second: &[Duration]) -> Self {
+        assert!(
+            first.len() == second.len(),
+            "benchmark statistics failure: stage=validate_pairs label=length value=first:{},second:{} source=paired sample lengths differ",
+            first.len(),
+            second.len()
+        );
+        assert!(
+            !first.is_empty(),
+            "benchmark statistics failure: stage=validate_pairs label=samples value=0 source=paired samples must not be empty"
+        );
+        assert!(
+            !first.iter().chain(second).any(Duration::is_zero),
+            "benchmark statistics failure: stage=validate_pairs label=duration value=0ns source=paired durations must be non-zero"
+        );
         let mut ratios = first
             .iter()
             .zip(second)
             .map(|(first, second)| first.as_secs_f64() / second.as_secs_f64())
             .collect::<Vec<_>>();
         ratios.sort_by(f64::total_cmp);
-        Ok(Self {
-            samples: first.len(),
+        Self {
             median_first_over_second: ratios[ratios.len() / 2],
             second_wins: first
                 .iter()
                 .zip(second)
                 .filter(|(first, second)| second < first)
                 .count(),
-        })
+        }
     }
 
     /// Returns the median of the pairwise `first / second` ratios.
@@ -172,53 +163,15 @@ impl PairedDurationSummary {
     }
 }
 
-/// Describes invalid benchmark sample statistics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsError {
-    /// At least one duration sample is required.
-    EmptySamples,
-    /// Paired sample slices must have equal lengths.
-    LengthMismatch { first: usize, second: usize },
-    /// Paired ratios are undefined for zero durations.
-    ZeroDuration,
-}
-
-impl fmt::Display for StatisticsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptySamples => formatter.write_str("benchmark samples must not be empty"),
-            Self::LengthMismatch { first, second } => write!(
-                formatter,
-                "paired sample lengths differ: first={first}, second={second}"
-            ),
-            Self::ZeroDuration => {
-                formatter.write_str("paired benchmark durations must be non-zero")
-            }
-        }
-    }
-}
-
-impl std::error::Error for StatisticsError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DurationNanos(Duration);
-
-impl Serialize for DurationNanos {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_u128(self.0.as_nanos())
-    }
-}
-
-fn sorted(samples: &[Duration]) -> Result<Vec<Duration>, StatisticsError> {
-    if samples.is_empty() {
-        return Err(StatisticsError::EmptySamples);
-    }
+#[track_caller]
+fn sorted(stage: &'static str, samples: &[Duration]) -> Vec<Duration> {
+    assert!(
+        !samples.is_empty(),
+        "benchmark statistics failure: stage={stage} label=samples value=0 source=samples must not be empty"
+    );
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
-    Ok(sorted)
+    sorted
 }
 
 fn percentile_of_sorted(sorted: &[Duration], percentile: u8) -> Duration {

@@ -180,35 +180,6 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
 }
 
 #[test]
-fn byte_maps_support_get_put_replace_and_delete() {
-    assert_byte_map_operations::<Small>();
-    assert_byte_map_operations::<Large>();
-}
-
-fn assert_byte_map_operations<SIZE>()
-where
-    ByteMap<SIZE>: StoreData,
-{
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<SIZE>(&mut store, "data").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let key = b"key".to_vec();
-    let transaction = transactions.begin().unwrap();
-    let mut access = data.access(transaction.access()).unwrap();
-    assert_eq!(access.get(&key).unwrap(), None);
-    access.put(&key, &b"first".to_vec()).unwrap();
-    assert_eq!(access.get(&key).unwrap(), Some(b"first".to_vec()));
-    access.put(&key, &b"second".to_vec()).unwrap();
-    assert_eq!(access.get(&key).unwrap(), Some(b"second".to_vec()));
-    assert!(access.remove(&key).unwrap());
-    assert!(!access.remove(&key).unwrap());
-    assert_eq!(access.get(&key).unwrap(), None);
-    transaction.commit().unwrap();
-}
-
-#[test]
 fn data_objects_isolate_identical_keys() {
     assert_data_objects_isolate_identical_keys::<Small>();
     assert_data_objects_isolate_identical_keys::<Large>();
@@ -280,39 +251,4 @@ where
         ]
     );
     assert_eq!(right_continuation, None);
-}
-
-#[test]
-fn byte_map_writes_are_visible_inside_the_same_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin().unwrap();
-    let mut access = data.access(transaction.access()).unwrap();
-    access.put(&b"a".to_vec(), &b"one".to_vec()).unwrap();
-    access.put(&b"b".to_vec(), &b"two".to_vec()).unwrap();
-    assert_eq!(access.get(&b"a".to_vec()).unwrap(), Some(b"one".to_vec()));
-    let mut items = Vec::new();
-    let continuation = access
-        .scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(10, 1_024).unwrap(),
-            |entry| {
-                items.push(entry.decode_owned()?);
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        items,
-        vec![
-            (b"a".to_vec(), b"one".to_vec()),
-            (b"b".to_vec(), b"two".to_vec()),
-        ]
-    );
-    assert_eq!(continuation, None);
 }

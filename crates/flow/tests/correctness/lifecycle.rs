@@ -26,11 +26,23 @@ fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_positi
     builder.connect([count], sink);
     let mut flow = builder.build().unwrap();
 
+    assert_eq!(flow.path(), path);
+    assert_eq!(flow.station_count(), 3);
+    assert_eq!(
+        flow.station_ids().collect::<Vec<_>>(),
+        ["source", "count", "sink"]
+    );
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
     let first = execution_state(&path);
 
     let mut reopened = FlowFactory::open(&path).unwrap();
+    assert_eq!(reopened.path(), path);
+    assert_eq!(reopened.station_count(), 3);
+    assert_eq!(
+        reopened.station_ids().collect::<Vec<_>>(),
+        ["source", "count", "sink"]
+    );
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(reopened);
     let second = execution_state(&path);
@@ -198,36 +210,6 @@ fn execution_state(path: &Path) -> ExecutionState {
             .bounds()
             .unwrap(),
     }
-}
-
-#[test]
-fn build_freezes_and_open_rematerializes_a_real_flow() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(100));
-    let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    builder.output_capacity_bytes(count, OUTPUT_CAPACITY_BYTES);
-    builder.connect([source], count);
-    builder.connect([count], sink);
-
-    let flow = builder.build().unwrap();
-    assert_eq!(flow.path(), path);
-    assert_eq!(flow.station_count(), 3);
-    assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
-    );
-    drop(flow);
-
-    let flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(flow.station_count(), 3);
-    assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
-    );
 }
 
 #[test]

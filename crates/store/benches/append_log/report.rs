@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use dogpaddle_bench_protocol::{
-    DurationSummary, Fields, PairOrder, PairSchedule, PairSummaryRecord, PairVariant,
-    PairedDurationSummary, SampleRecord, SummaryRecord, measure_pair_with,
+    DurationSummary, Fields, PairOrder, PairSchedule, PairVariant, PairedDurationSummary,
+    SampleRecord, measure_pair_with,
 };
 
 use crate::{
@@ -32,11 +32,20 @@ impl LogCase {
         }
     }
 
-    fn fields(&self, variant: &str) -> Fields {
+    fn series(&self, variant: &str) -> String {
+        format!(
+            "{}::{variant}::records={}::record_bytes={}::transactions={}",
+            self.workload, self.records, self.record_bytes, self.transactions
+        )
+    }
+
+    fn fields(&self, variant: &str, pairing: Option<(&str, &str)>) -> Fields {
         let mut fields = Fields::new();
-        fields
-            .insert("variant", variant)
-            .expect("construct AppendLog variant field");
+        fields.insert("variant", variant);
+        if let Some((pair, side)) = pairing {
+            fields.insert("pair", pair);
+            fields.insert("side", side);
+        }
         for (name, value) in [
             ("operations", self.records),
             ("transactions", self.transactions),
@@ -47,9 +56,7 @@ impl LogCase {
                     .expect("benchmark logical byte count fits in usize"),
             ),
         ] {
-            fields
-                .insert(name, value)
-                .expect("construct AppendLog work fields");
+            fields.insert(name, value);
         }
         fields
     }
@@ -100,6 +107,13 @@ impl LogPair {
             transactions: self.first.transactions,
         }
     }
+
+    fn pair(&self) -> String {
+        format!(
+            "{}::{}::{}",
+            self.scenario, self.first.workload, self.second_workload
+        )
+    }
 }
 
 struct PairedSamples {
@@ -126,7 +140,6 @@ impl PairedSamples {
 
     fn summary(&self) -> PairedDurationSummary {
         PairedDurationSummary::from_pairs(&self.first, &self.second)
-            .expect("summarize paired AppendLog measurements")
     }
 }
 
@@ -136,7 +149,7 @@ pub(super) fn report_log(case: &LogCase, samples: usize, mut measure: impl FnMut
     for _ in 0..samples {
         durations.push(measure());
     }
-    report_measurements(case, "default", &durations);
+    report_measurements(case, "default", None, &durations);
 }
 
 pub(super) fn report_log_pair(
@@ -165,19 +178,20 @@ pub(super) fn report_log_mode_pair(
 
 fn report_pair_measurements(pair: &LogPair, measurements: &PairedSamples, samples: usize) {
     let second = pair.second();
-    report_measurements(&pair.first, pair.first_data, &measurements.first);
-    report_measurements(&second, pair.second_data, &measurements.second);
+    let pair_id = pair.pair();
+    report_measurements(
+        &pair.first,
+        pair.first_data,
+        Some((&pair_id, "first")),
+        &measurements.first,
+    );
+    report_measurements(
+        &second,
+        pair.second_data,
+        Some((&pair_id, "second")),
+        &measurements.second,
+    );
     let summary = measurements.summary();
-    let record = PairSummaryRecord::new(
-        BENCHMARK,
-        &pair.scenario,
-        &pair.first.workload,
-        &second.workload,
-        summary,
-        Fields::new(),
-    )
-    .expect("construct AppendLog pair summary record");
-    write_record(&record);
     println!(
         "  paired first/second median={:.3}x; second wins {}/{samples}",
         summary.median_first_over_second(),
@@ -185,24 +199,24 @@ fn report_pair_measurements(pair: &LogPair, measurements: &PairedSamples, sample
     );
 }
 
-fn report_measurements(case: &LogCase, variant: &str, durations: &[Duration]) {
+fn report_measurements(
+    case: &LogCase,
+    variant: &str,
+    pairing: Option<(&str, &str)>,
+    durations: &[Duration],
+) {
+    let series = case.series(variant);
     for (sample, elapsed) in durations.iter().copied().enumerate() {
         let record = SampleRecord::new(
             BENCHMARK,
-            &case.workload,
+            &series,
             sample,
             elapsed,
-            case.fields(variant),
-        )
-        .expect("construct AppendLog sample record");
+            case.fields(variant, pairing),
+        );
         write_record(&record);
     }
-    let summary =
-        DurationSummary::from_samples(durations).expect("summarize AppendLog measurements");
-    let record = SummaryRecord::new(BENCHMARK, &case.workload, summary, case.fields(variant))
-        .expect("construct AppendLog summary record");
-    write_record(&record);
-
+    let summary = DurationSummary::from_samples(durations);
     let records_per_second = case.records as u128 * 1_000_000_000 / summary.median().as_nanos();
     let median_per_record = average_duration(summary.median(), case.records);
     let encoded_mib_tenths_per_second =

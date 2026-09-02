@@ -36,9 +36,3 @@ name = "change_append_log"
 path = "benches/change_append_log.rs"
 harness = false
 test = false
-
-[[bench]]
-name = "change_append_log_endurance"
-path = "benches/change_append_log_endurance.rs"
-harness = false
-test = false

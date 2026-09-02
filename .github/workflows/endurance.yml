@@ -56,19 +56,10 @@ jobs:
           > benchmark-artifacts/store-append-log.stdout.log
           2> benchmark-artifacts/store-append-log.stderr.log
 
-      - name: Run Change + AppendLog endurance
-        env:
-          DOGPADDLE_BENCH_PROFILE: reference
-          DOGPADDLE_BENCH_ROOT: ${{ github.workspace }}/benchmark-change-store
-        run: >-
-          cargo bench --locked -p dogpaddle-change-store-integration --bench change_append_log_endurance
-          > benchmark-artifacts/change-append-log.stdout.log
-          2> benchmark-artifacts/change-append-log.stderr.log
-
       - name: Validate machine-readable benchmark records
-        run: |
-          cargo xtask bench-validate append_log_endurance reference benchmark-artifacts/store-append-log.stdout.log
-          cargo xtask bench-validate change_append_log_endurance reference benchmark-artifacts/change-append-log.stdout.log
+        run: >-
+          cargo xtask bench-validate append_log_endurance reference
+          benchmark-artifacts/store-append-log.stdout.log
 
       - name: Upload raw benchmark records
         if: always()

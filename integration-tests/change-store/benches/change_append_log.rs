@@ -5,7 +5,7 @@ use std::{hint::black_box, num::NonZeroUsize, path::Path, time::Duration};
 
 use arrow_array::UInt64Array;
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord, SummaryRecord,
+    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord,
     require_benchmark_build,
 };
 use dogpaddle_change::{Change, ChangeProjection, decode_change_projected};
@@ -103,25 +103,20 @@ impl Config {
 fn emit_configuration(config: &Config) {
     let fields = Fields::new()
         .with("fixtures", ["heterogeneous_pages", "projectable"])
-        .unwrap()
         .with("rows_per_change", config.rows_per_change)
-        .unwrap()
         .with("changes_per_transaction", config.changes_per_transaction)
-        .unwrap()
         .with("transactions_per_sample", config.transactions_per_sample)
-        .unwrap()
         .with("payload_bytes", config.payload_bytes)
-        .unwrap()
         .with("samples", config.samples)
-        .unwrap()
         .with("warmups", config.warmups)
-        .unwrap()
         .with("max_working_set_bytes", config.max_working_set_bytes)
-        .unwrap()
-        .with("fixture_and_validation", "outside_timing")
-        .unwrap();
-    let expected_data_records = NonZeroUsize::new(4 * (config.samples + 1)).unwrap();
-    emit_record(&ConfigurationRecord::new(BENCHMARK, expected_data_records, fields).unwrap());
+        .with("fixture_and_validation", "outside_timing");
+    let expected_samples = NonZeroUsize::new(4 * config.samples).unwrap();
+    emit_record(&ConfigurationRecord::new(
+        BENCHMARK,
+        expected_samples,
+        fields,
+    ));
 }
 
 fn run_scenario(
@@ -138,43 +133,29 @@ fn run_scenario(
         let measurement = measure();
         let fields = scenario_fields(config, fixture)
             .with("observed_pages", measurement.pages)
-            .unwrap()
-            .with("result_checksum", measurement.checksum)
-            .unwrap();
-        emit_record(
-            &SampleRecord::new(BENCHMARK, scenario, sample, measurement.elapsed, fields).unwrap(),
-        );
-        durations.push(measurement.elapsed);
-    }
-    let summary = DurationSummary::from_samples(&durations).unwrap();
-    emit_record(
-        &SummaryRecord::new(
+            .with("result_checksum", measurement.checksum);
+        emit_record(&SampleRecord::new(
             BENCHMARK,
             scenario,
-            summary,
-            scenario_fields(config, fixture),
-        )
-        .unwrap(),
-    );
+            sample,
+            measurement.elapsed,
+            fields,
+        ));
+        durations.push(measurement.elapsed);
+    }
+    let summary = DurationSummary::from_samples(&durations);
     println!("{scenario}: median={:?}", summary.median());
 }
 
 fn scenario_fields(config: &Config, fixture: &'static str) -> Fields {
     Fields::new()
         .with("fixture", fixture)
-        .unwrap()
         .with("rows_per_change", config.rows_per_change)
-        .unwrap()
         .with("changes_per_transaction", config.changes_per_transaction)
-        .unwrap()
         .with("transactions_per_sample", config.transactions_per_sample)
-        .unwrap()
         .with("changes_per_sample", config.total_changes())
-        .unwrap()
         .with("payload_bytes", config.payload_bytes)
-        .unwrap()
         .with("validation", "outside_timing")
-        .unwrap()
 }
 
 fn representative_workload(config: &Config) -> EncodedChanges {

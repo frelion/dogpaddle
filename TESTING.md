@@ -38,20 +38,20 @@
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
 | Operation | Definition codec/materialize、状态 commit/rollback/reopen、重批 | `operation_core` |
 | Flow | build/open、拓扑、Claim 重放、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
-| Change + Store | 完整 IPC entry 的顺序、投影、分页、计费、truncate、reopen、poison | `change_append_log`、`change_append_log_endurance` |
+| Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。
 
-## Change + Store 的三个 fixture
+## Change + Store 的最小接缝
 
-组合包只共享三种数据，不建立可配置 persona 生成框架：
+组合包只保留两个不能由 Change 与 Store 各自的证明组合推出的 witness：
 
-1. `ordered_diff`：重复记录、正负 diff，以及相同事件序列的两种稳定物理分批。
-2. `projectable`：nested、variable-width、非零 Arrow slice offset，验证 full/projected owned decode。
-3. `heterogeneous_pages`：交替 Schema 与 entry 大小，覆盖 rollback、item/byte paging、原字节复制、
-   retained-byte 精确计费、有界 truncate、reopen 和 corrupt Change poison。
+1. nested、variable-width、非零 Arrow slice offset 的 full/projected decode 在 entry transaction
+   结束后仍然 owned；
+2. corrupt Change decode poison 同一 Store transaction，并回滚已经发生的 forwarding/cursor 写入。
 
-新增 seam 情形应先尝试扩充这三种数据；只有出现新的独立契约轴才增加 fixture。
+稳定重批属于 Change/Operation；AppendLog paging、计费、truncate、reopen、crash 和 endurance
+属于 Store。组合包不得重建这些矩阵。
 
 ## 持久化变更的最低证据
 
@@ -68,7 +68,7 @@ Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-wri
 
 ## Benchmark 协议
 
-全部 11 个 target 是独立 release 进程，只有两个统一设置：
+全部 10 个 target 是独立 release 进程，只有两个统一设置：
 
 - `DOGPADDLE_BENCH_PROFILE=smoke|reference`：选择 owner 内固定、不可拼出非法组合的规模。
 - `DOGPADDLE_BENCH_ROOT=/absolute/path`：reference 的固定文件系统根；smoke 默认使用临时目录。
@@ -78,16 +78,25 @@ wall-clock 断言。持久化 reference 必须报告实际文件系统路径；�
 CPU、Cargo profile、git revision/dirty state 和实际配置。
 
 stdout 的 machine records 使用 typed JSONL。每个 target 必须依次产生唯一 environment、唯一
-configuration、样本/汇总或 endurance records，并以唯一 `completion` 结束；completion 后不得再有
-machine record。configuration 必须声明精确的 `expected_data_records`，通用 gate 会与实际数量
-比较，防止 workload 尾段静默漏跑。`cargo xtask bench-smoke` 从 Cargo metadata 自动发现全部 target，逐进程执行，拒绝
-无输出、畸形 JSON、错误 benchmark identity、标准 sample 索引空洞、标准 summary 重复或与原始
-样本不一致、缺失或非末尾 completion。owner 自定义 endurance record 由 benchmark 自身 oracle
-校验，smoke gate 只验证其通用 envelope 与 completion；新增 benchmark 不需要维护第二份清单。
+configuration、带稳定 `series` 的原始 `sample | observation`，并以唯一 `completion` 结束；completion
+后不得再有 machine record。configuration 用 `expected_samples` 声明精确的 duration sample 总数，
+并可用 `required_observations: {series: count}` 声明每条非 duration observation series 的精确非零数量。
+通用 gate 分别验证 sample 总数与每条 sample/observation series 从零连续且唯一的 index，拒绝未声明、
+缺失、重复或额外 observation；它不解析 owner payload，也不接受第三种 data discriminator。
+`cargo xtask bench-smoke` 从 Cargo metadata 自动发现全部 target，逐进程执行，拒绝无输出、畸形 JSON、
+错误 benchmark identity、退役的派生 summary record、缺失或非末尾 completion；新增 benchmark 不需要
+维护第二份 target 清单。
 
-常规 benchmark 保留原始样本并报告 min/upper-median/max。长稳 benchmark 报告 p50/p95/p99/max、
-logical/retained/allocated/peak bytes 以及 reopen oracle。正式前后对比只能使用相同代码协议版本、
-rustc、机器、profile、文件系统和 workload；不设置机器相关的 CI wall-clock 阈值。
+常规 benchmark 的 machine stream 只保留原始样本，进程内人类表格报告派生统计；配对样本以
+`pair + side + sample index` 无损表达一一对应关系。Operation 的 per-operation 耗时由 `elapsed_ns / operations`
+派生；Flow runtime 的总耗时、速率和 p50/p95 由 sample `elapsed_ns`、work counts 与
+`round_latencies_ns` 派生，不重复写回 machine fields。AppendLog 长稳的 append/truncate 事务也使用标准
+SampleRecord，并按 record width 和动作拆分稳定 series；checkpoint 与 terminal 使用同一个固定
+ObservationRecord，其中 checkpoint series 保留状态与文件大小，terminal series 只补充 raw samples
+无法导出的 wall elapsed 和最终 reopen checksum。两者都由 `required_observations` 提供精确数量证据。
+p50/p95/p99/max、吞吐、peak 和 tail spread 均从这些 raw facts 派生并显示在人类 summary。正式前后
+对比只能使用相同代码协议版本、rustc、机器、profile、文件系统和 workload；不设置机器相关的 CI
+wall-clock 阈值。
 
 ## Canonical gates
 

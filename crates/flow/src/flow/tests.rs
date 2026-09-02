@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{AppendLog, OrderedMap, Small, Store};
+use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
 use crate::build::FlowFactory;
 
@@ -73,48 +73,7 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
 }
 
 #[test]
-fn advance_reports_backpressure_when_no_station_commits_progress() {
-    let root = tempfile::tempdir().unwrap();
-    let mut builder = FlowFactory::new(root.path().join("flow"));
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, NonZeroU64::new(1).unwrap());
-    builder.connect([source], sink);
-    let mut flow = builder.build().unwrap();
-    flow.topology.schedule = vec![0];
-
-    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
-    assert_eq!(
-        flow.advance().unwrap(),
-        super::AdvanceOutcome::Backpressured
-    );
-}
-
-#[test]
-fn open_reinstates_the_persisted_output_capacity() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, NonZeroU64::new(1).unwrap());
-    builder.connect([source], sink);
-    drop(builder.build().unwrap());
-
-    let mut reopened = FlowFactory::open(path).unwrap();
-    reopened.topology.schedule = vec![0];
-    assert_eq!(
-        reopened.advance().unwrap(),
-        super::AdvanceOutcome::Progressed
-    );
-    assert_eq!(
-        reopened.advance().unwrap(),
-        super::AdvanceOutcome::Backpressured
-    );
-}
-
-#[test]
-fn advance_does_not_short_circuit_and_progress_dominates_backpressure() {
+fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressure() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
@@ -129,18 +88,44 @@ fn advance_does_not_short_circuit_and_progress_dominates_backpressure() {
     builder.connect([progressing_source], progressing_sink);
     let mut flow = builder.build().unwrap();
     flow.topology.schedule = vec![0, 1];
-
-    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     drop(flow);
 
+    let mut reopened = FlowFactory::open(&path).unwrap();
+    reopened.topology.schedule = vec![0, 1];
+    assert_eq!(
+        reopened.advance().unwrap(),
+        super::AdvanceOutcome::Progressed
+    );
+    reopened.topology.schedule = vec![0];
+    assert_eq!(
+        reopened.advance().unwrap(),
+        super::AdvanceOutcome::Backpressured
+    );
+    drop(reopened);
+
     let store = Store::open(path).unwrap();
-    let blocked: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let progressing: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let blocked_position: Cell<u64> = store
+        .open_data("station/00000000/operation/sequence_source.position")
+        .unwrap();
+    let progressing_position: Cell<u64> = store
+        .open_data("station/00000001/operation/sequence_source.position")
+        .unwrap();
+    let blocked_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let progressing_output: AppendLog<Vec<u8>> =
+        store.open_data("station/00000001/output").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        blocked
+        blocked_position
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        blocked_output
             .access(transaction.access())
             .unwrap()
             .bounds()
@@ -148,7 +133,15 @@ fn advance_does_not_short_circuit_and_progress_dominates_backpressure() {
         0..1
     );
     assert_eq!(
-        progressing
+        progressing_position
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        progressing_output
             .access(transaction.access())
             .unwrap()
             .bounds()
