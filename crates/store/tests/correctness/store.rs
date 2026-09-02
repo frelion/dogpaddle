@@ -104,6 +104,21 @@ fn data_names_are_validated_and_unique_across_sizes() {
 }
 
 #[test]
+fn creation_writes_the_stable_store_marker_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    drop(Store::create(&path).unwrap());
+
+    let database = raw_database(&path);
+    let transaction = database.begin_ro_txn().unwrap();
+    let table = transaction.open_table(None).unwrap();
+    assert_eq!(
+        transaction.get::<Vec<u8>>(&table, &[0]).unwrap(),
+        Some(b"dogpaddle.store\0".to_vec())
+    );
+}
+
+#[test]
 fn opening_rejects_an_invalid_store_marker() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);

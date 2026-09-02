@@ -59,6 +59,12 @@ struct WritingOperation {
     result: WriteResult,
 }
 
+struct WritingActionOperation {
+    state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
+    value: Vec<u8>,
+    action: Action,
+}
+
 struct PoisonedCommitOperation {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     foreign: OrderedMap<Vec<u8>, Vec<u8>, Small>,
@@ -88,6 +94,20 @@ impl Operation for WritingOperation {
             WriteResult::Commit => Ok(Action::Commit(None)),
             WriteResult::Fail => Err(std::io::Error::other("planned turn failure").into()),
         }
+    }
+}
+
+impl Operation for WritingActionOperation {
+    fn turn(
+        &self,
+        input: Option<OperationInput<'_>>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Action, OperationError> {
+        assert!(input.is_some());
+        self.state
+            .access(access)?
+            .put(&b"attempt".to_vec(), &self.value)?;
+        Ok(self.action.clone())
     }
 }
 
@@ -395,6 +415,81 @@ fn commit_retains_input_and_reoffers_the_identical_owned_claim() {
     assert_eq!(
         output_bounds(&fixture.stations[0], &mut fixture.transactions),
         1..1
+    );
+}
+
+#[test]
+fn commit_with_output_is_atomic_across_success_and_capacity_rejection() {
+    let mut fixture = source_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
+    assert_eq!(
+        advance(&mut fixture, 0).unwrap(),
+        AdvanceOutcome::Progressed
+    );
+    let state = fixture.stations[1].inbox.state().clone();
+    fixture.stations[1].operation = Box::new(WritingActionOperation {
+        state: state.clone(),
+        value: b"committed".to_vec(),
+        action: Action::Commit(Some(change(&[9]))),
+    });
+
+    assert_eq!(
+        advance(&mut fixture, 1).unwrap(),
+        AdvanceOutcome::Progressed
+    );
+    let claim = std::ptr::from_ref(fixture.stations[1].inbox.cached_claim().unwrap().change());
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions),
+        Some(b"committed".to_vec())
+    );
+    assert_eq!(
+        read_cursor(&fixture.stations[1], &mut fixture.transactions, 0),
+        0
+    );
+    assert_eq!(
+        read_active(&fixture.stations[1], &mut fixture.transactions),
+        0
+    );
+    assert_eq!(
+        output_bounds(&fixture.stations[0], &mut fixture.transactions),
+        0..1
+    );
+    assert_eq!(
+        output_bounds(&fixture.stations[1], &mut fixture.transactions),
+        0..1
+    );
+
+    fixture.stations[1].operation = Box::new(WritingActionOperation {
+        state: state.clone(),
+        value: b"must-roll-back".to_vec(),
+        action: Action::Commit(Some(change(&[10]))),
+    });
+    assert_eq!(
+        advance(&mut fixture, 1).unwrap(),
+        AdvanceOutcome::Backpressured
+    );
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions),
+        Some(b"committed".to_vec())
+    );
+    assert_eq!(
+        read_cursor(&fixture.stations[1], &mut fixture.transactions, 0),
+        0
+    );
+    assert_eq!(
+        read_active(&fixture.stations[1], &mut fixture.transactions),
+        0
+    );
+    assert_eq!(
+        output_bounds(&fixture.stations[0], &mut fixture.transactions),
+        0..1
+    );
+    assert_eq!(
+        output_bounds(&fixture.stations[1], &mut fixture.transactions),
+        0..1
+    );
+    assert_eq!(
+        std::ptr::from_ref(fixture.stations[1].inbox.cached_claim().unwrap().change()),
+        claim
     );
 }
 

@@ -4,24 +4,20 @@
 mod environment;
 mod jsonl;
 mod order;
+mod root;
 mod settings;
 mod statistics;
 
-pub use environment::{CommandOutput, EnvironmentCollectionError, GitState, HostEnvironment};
+pub use environment::{EnvironmentCollectionError, HostEnvironment};
 pub use jsonl::{
-    BenchmarkRecord, ConfigurationRecord, EnvironmentRecord, ExtensionRecord, FieldError, Fields,
-    JsonlError, JsonlWriter, PairSummaryRecord, RecordError, SampleRecord, SummaryRecord,
+    BenchmarkRecord, CompletionRecord, ConfigurationRecord, EnvironmentRecord, ExtensionRecord,
+    FieldError, Fields, JsonlError, JsonlWriter, PairSummaryRecord, RecordError, SampleRecord,
+    SummaryRecord,
 };
-pub use order::{
-    PairMeasurements, PairOrder, PairSchedule, PairVariant, measure_pair, measure_pair_with,
-};
-pub use settings::{
-    BenchmarkProfile, CARGO_PROFILE_ENV, CargoProfile, CargoProfileSource, EnvError,
-    positive_usize, positive_usize_list, string, string_list,
-};
-pub use statistics::{
-    DurationSummary, LatencySummary, PairedDurationSummary, StatisticsError, duration_percentile,
-};
+pub use order::{PairMeasurements, PairOrder, PairSchedule, PairVariant, measure_pair_with};
+pub use root::{BENCHMARK_PROFILE_ENV, BENCHMARK_ROOT_ENV, RunRoot};
+pub use settings::{BenchmarkProfile, EnvError};
+pub use statistics::{DurationSummary, LatencySummary, PairedDurationSummary, StatisticsError};
 
 /// Rejects accidental execution of a benchmark built with debug assertions.
 ///

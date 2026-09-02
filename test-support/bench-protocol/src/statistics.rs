@@ -35,12 +35,6 @@ impl DurationSummary {
         })
     }
 
-    /// Returns the number of samples summarized.
-    #[must_use]
-    pub const fn samples(self) -> usize {
-        self.samples
-    }
-
     /// Returns the minimum duration.
     #[must_use]
     pub const fn min(self) -> Duration {
@@ -90,12 +84,6 @@ impl LatencySummary {
             p99: DurationNanos(percentile_of_sorted(&sorted, 99)),
             max: DurationNanos(max),
         })
-    }
-
-    /// Returns the number of samples summarized.
-    #[must_use]
-    pub const fn samples(self) -> usize {
-        self.samples
     }
 
     /// Returns the nearest-rank p50 latency.
@@ -171,12 +159,6 @@ impl PairedDurationSummary {
         })
     }
 
-    /// Returns the number of paired samples.
-    #[must_use]
-    pub const fn samples(self) -> usize {
-        self.samples
-    }
-
     /// Returns the median of the pairwise `first / second` ratios.
     #[must_use]
     pub const fn median_first_over_second(self) -> f64 {
@@ -190,33 +172,11 @@ impl PairedDurationSummary {
     }
 }
 
-/// Computes a nearest-rank percentile from duration samples.
-///
-/// `percentile` must be in `1..=100`; the input need not be sorted and is not
-/// mutated.
-///
-/// # Errors
-///
-/// Returns [`StatisticsError::EmptySamples`] for no samples and
-/// [`StatisticsError::InvalidPercentile`] outside `1..=100`.
-pub fn duration_percentile(
-    samples: &[Duration],
-    percentile: u8,
-) -> Result<Duration, StatisticsError> {
-    if !(1..=100).contains(&percentile) {
-        return Err(StatisticsError::InvalidPercentile(percentile));
-    }
-    let sorted = sorted(samples)?;
-    Ok(percentile_of_sorted(&sorted, percentile))
-}
-
 /// Describes invalid benchmark sample statistics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsError {
     /// At least one duration sample is required.
     EmptySamples,
-    /// Percentiles must be in `1..=100`.
-    InvalidPercentile(u8),
     /// Paired sample slices must have equal lengths.
     LengthMismatch { first: usize, second: usize },
     /// Paired ratios are undefined for zero durations.
@@ -227,9 +187,6 @@ impl fmt::Display for StatisticsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySamples => formatter.write_str("benchmark samples must not be empty"),
-            Self::InvalidPercentile(percentile) => {
-                write!(formatter, "percentile must be in 1..=100, got {percentile}")
-            }
             Self::LengthMismatch { first, second } => write!(
                 formatter,
                 "paired sample lengths differ: first={first}, second={second}"

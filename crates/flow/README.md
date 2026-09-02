@@ -187,25 +187,13 @@ input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字�
 
 ## 源码边界
 
-`build/` 统一拥有 `FlowFactory` 的声明与 build/open 路径、`StationRef`、Flow/Station Definition、
-无 Store 副作用的图校验、稳定磁盘编码和完整资源名；构建路径创建全部资源，`build/open.rs`
-完成两阶段 Definition 读取、资源打开和重新物化。两条路径都按 Definition 声明的逻辑数据名
-通用创建或打开类型化实例，再让 Definition 物化具体 Operation；二者都不枚举具体算子。拓扑只是
-Flow Definition 中的连接关系，不再拥有独立构建类型。`flow/mod.rs` 只声明模块并导出
-`Flow`，`flow/runtime.rs` 保存 build/open 返回的运行态对象、生命周期状态、全部 Station、派生的
-schedule 与分离的读写事务启动能力，不创建或打开 Store 资源。`flow/advance.rs` 定义公共
-outcome 并实现一次有界轮次：按 schedule 为每个 Station 至多提供一个 turn，先 `intake` 再进入
-`process`，通过公共 `Flow::advance` 暴露，不运行第二个回收 phase。`station/mod.rs` 只声明边界；
-`station/runtime.rs` 保存 Station 装配与 `process` 边界，`station/input.rs` 独立拥有统一 `Output`、
-`Inbox`、`Claim`、active/cursor、consumer cursor capability 与 Complete 内联 output reclaim，
-`station/protocol.rs` 只拥有 outcome/error。Station 不长期持有事务启动
-能力，也不接收 Store，不知道 Station ID、上游 Station、资源名或底层物理布局。私有
-`assembly.rs` 只承接 build/open 共用的 source ID 解析和最终 Station 装配，不公开新的领域类型。
-公共错误单独位于 `error.rs`；私有单元测试放在对应源码模块目录的 `tests.rs` 中，`tests/`
-使用单一 `correctness` target 验证 crate 的公共行为。dogpaddle-flow 是 Operation 与 Store 的
-组合根，因此公共测试可以通过二者的公共 API 检查实际资源布局和重新物化；无需再建立一个
-重复的 `flow-store` 集成 package。完整目录、fixture 规则与计时边界见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。
+`FlowFactory` 负责声明、纯拓扑校验、稳定编码以及 build/open 时的资源装配；运行态 `Flow` 只持有
+已装配 Station、确定性 schedule 和分离的事务启动能力。Station 是 crate 私有的单轮执行壳，拥有
+输入 claim 与 output retention，但不接收 Store、不知道物理 placement 或稳定资源名。Flow 作为
+Operation 与 Store 的组合根，通过单一公共 `correctness` target 验证资源布局、重新物化和运行
+协议，不再建立重复的集成 package。具体目录 ownership 与私有实现约束见仓库 `AGENTS.md`；fixture、
+证据分层和计时边界见工作区
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 ## 当前边界
 
@@ -237,5 +225,5 @@ cargo bench -p dogpaddle-flow --bench flow_runtime
 `open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
 或运行时吞吐。`flow_runtime` 则测预先构建的 source/sink、Count chain、fan-out 和 capacity-pressure
 Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。正式结果必须在显式 reference
-文件系统上保留逐样本 JSONL；配置与输出协议见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/TESTING.md)。
+文件系统上保留逐样本 JSONL；配置与输出协议见工作区
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

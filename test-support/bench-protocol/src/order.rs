@@ -57,33 +57,11 @@ pub struct PairMeasurements<A, B> {
     pub second: B,
 }
 
-/// Executes both callbacks in `order` and returns results in semantic A/B order.
-///
-/// This keeps counterbalancing control flow out of benchmark targets without
-/// losing the pairing between the returned samples.
-pub fn measure_pair<A, B>(
-    order: PairOrder,
-    first: impl FnOnce() -> A,
-    second: impl FnOnce() -> B,
-) -> PairMeasurements<A, B> {
-    match order {
-        PairOrder::Ab => PairMeasurements {
-            first: first(),
-            second: second(),
-        },
-        PairOrder::Ba => {
-            let second = second();
-            let first = first();
-            PairMeasurements { first, second }
-        }
-    }
-}
-
 /// Executes one mutable callback for both variants in `order`.
 ///
-/// Unlike [`measure_pair`], this form can naturally share one mutable fixture
-/// between variants without interior mutability. Results are still returned in
-/// semantic first/second order.
+/// The callback can naturally share one mutable fixture between variants
+/// without interior mutability. Results are returned in semantic first/second
+/// order.
 pub fn measure_pair_with<T>(
     order: PairOrder,
     mut measure: impl FnMut(PairVariant) -> T,

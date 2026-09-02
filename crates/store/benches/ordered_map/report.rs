@@ -5,9 +5,10 @@ use dogpaddle_bench_protocol::{
     PairedDurationSummary, SampleRecord, SummaryRecord, measure_pair_with,
 };
 
-use crate::support::{average_duration, format_duration, write_record};
-
-const BENCHMARK: &str = "store_ordered_map";
+use crate::{
+    BENCHMARK,
+    support::{average_duration, format_duration, write_record},
+};
 
 pub(super) struct BenchmarkCase {
     workload: String,

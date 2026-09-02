@@ -10,15 +10,23 @@ use crate::{
         decode_key, expected_diff_checksum, expected_full_scan_checksum, make_records_from,
         scan_limit, to_u64,
     },
-    support::sample_dir,
+    support::BenchRoot,
 };
 
-pub(super) fn measure_append<T: StoreValue>(records: &[T], expected: usize) -> Duration {
-    measure_durable_append(records, expected, records.len())
+pub(super) fn measure_append<T: StoreValue>(
+    bench_root: &BenchRoot,
+    records: &[T],
+    expected: usize,
+) -> Duration {
+    measure_durable_append(bench_root, records, expected, records.len())
 }
 
-pub(super) fn measure_batch_append<T: StoreValue>(records: &[T], expected: usize) -> Duration {
-    let root = sample_dir("append-log-batch");
+pub(super) fn measure_batch_append<T: StoreValue>(
+    bench_root: &BenchRoot,
+    records: &[T],
+    expected: usize,
+) -> Duration {
+    let root = bench_root.sample("append-log-batch");
     let mut store =
         Store::create(root.path().join("store")).expect("create batch append benchmark store");
     let log = store
@@ -42,8 +50,12 @@ pub(super) fn measure_batch_append<T: StoreValue>(records: &[T], expected: usize
     elapsed
 }
 
-pub(super) fn measure_append_body<T: StoreValue>(records: &[T], batch: bool) -> Duration {
-    let root = sample_dir("append-log-body");
+pub(super) fn measure_append_body<T: StoreValue>(
+    bench_root: &BenchRoot,
+    records: &[T],
+    batch: bool,
+) -> Duration {
+    let root = bench_root.sample("append-log-body");
     let mut store =
         Store::create(root.path().join("store")).expect("create append-body benchmark store");
     let log_handle = store
@@ -80,11 +92,12 @@ pub(super) fn measure_append_body<T: StoreValue>(records: &[T], batch: bool) -> 
 }
 
 pub(super) fn measure_durable_append<T: StoreValue>(
+    bench_root: &BenchRoot,
     records: &[T],
     expected: usize,
     batch_items: usize,
 ) -> Duration {
-    let root = sample_dir("append-log-durable");
+    let root = bench_root.sample("append-log-durable");
     let mut store =
         Store::create(root.path().join("store")).expect("create append benchmark store");
     let log = store
@@ -202,11 +215,12 @@ pub(super) fn measure_decode_scan(
 }
 
 pub(super) fn measure_count_station(
+    bench_root: &BenchRoot,
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
 ) -> Duration {
-    let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+    let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
     let expected_count = expected_diff_checksum(entries);
     let mut processed = 0_usize;
     let started = std::time::Instant::now();
@@ -269,12 +283,13 @@ pub(super) fn measure_count_station(
 }
 
 pub(super) fn measure_filter_station(
+    bench_root: &BenchRoot,
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
     mode: FilterMode,
 ) -> Duration {
-    let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+    let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
     let mut processed = 0_usize;
     let mut forwarded = 0_usize;
     let started = std::time::Instant::now();
@@ -346,12 +361,13 @@ pub(super) fn measure_filter_station(
 }
 
 pub(super) fn measure_readers(
+    bench_root: &BenchRoot,
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
     readers: usize,
 ) -> Duration {
-    let mut fixture = LogFixture::populated(entries, record_bytes, readers);
+    let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, readers);
     let mut caught_up = vec![false; readers];
     let mut active = readers;
     let mut deliveries = 0_usize;
@@ -409,8 +425,13 @@ pub(super) fn measure_readers(
     elapsed
 }
 
-pub(super) fn measure_gc(entries: usize, record_bytes: usize, gc_items: usize) -> Duration {
-    let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+pub(super) fn measure_gc(
+    bench_root: &BenchRoot,
+    entries: usize,
+    record_bytes: usize,
+    gc_items: usize,
+) -> Duration {
+    let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
     let max_items = NonZeroUsize::new(gc_items).expect("non-zero GC batch");
     let target = to_u64(entries);
     let mut head = 0;
@@ -431,12 +452,13 @@ pub(super) fn measure_gc(entries: usize, record_bytes: usize, gc_items: usize) -
 }
 
 pub(super) fn measure_steady_window(
+    bench_root: &BenchRoot,
     entries: usize,
     record_bytes: usize,
     batch_items: usize,
     gc_items: usize,
 ) -> Duration {
-    let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+    let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
     let records = make_records_from(entries, entries, record_bytes);
     let max_gc_items = NonZeroUsize::new(gc_items).expect("non-zero GC batch");
     let mut appended = 0_usize;

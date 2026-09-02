@@ -11,14 +11,15 @@ use crate::{
         assert_station_map, expected_scan_checksum, expected_station_first_bytes,
         read_station_cursor,
     },
+    support::BenchRoot,
 };
 
-pub(super) fn measure_byte_map_bulk_put<SIZE>(entries: usize) -> Duration
+pub(super) fn measure_byte_map_bulk_put<SIZE>(bench_root: &BenchRoot, entries: usize) -> Duration
 where
     ByteMap<SIZE>: StoreData,
     TypedMap<SIZE>: StoreData,
 {
-    let mut fixture = Fixture::<SIZE>::empty();
+    let mut fixture = Fixture::<SIZE>::empty(bench_root);
     let value = vec![0x5a; VALUE_BYTES];
     let started = std::time::Instant::now();
     let transaction = fixture
@@ -64,12 +65,12 @@ where
     elapsed
 }
 
-pub(super) fn measure_bulk_put<SIZE>(entries: usize) -> Duration
+pub(super) fn measure_bulk_put<SIZE>(bench_root: &BenchRoot, entries: usize) -> Duration
 where
     ByteMap<SIZE>: StoreData,
     TypedMap<SIZE>: StoreData,
 {
-    let mut fixture = Fixture::<SIZE>::empty();
+    let mut fixture = Fixture::<SIZE>::empty(bench_root);
     let value = vec![0x5a; VALUE_BYTES];
     let started = std::time::Instant::now();
     let transaction = fixture

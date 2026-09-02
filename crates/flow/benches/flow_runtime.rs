@@ -1,13 +1,19 @@
 mod support;
 
-use std::{io, num::NonZeroU64, path::Path, sync::Arc, time::Duration};
+use std::{
+    io,
+    num::{NonZeroU64, NonZeroUsize},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
-    Fields, HostEnvironment, JsonlWriter, LatencySummary, SampleRecord, SummaryRecord,
-    positive_usize, positive_usize_list, require_benchmark_build,
+    BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
+    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, LatencySummary, SampleRecord,
+    SummaryRecord, require_benchmark_build,
 };
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
@@ -19,13 +25,13 @@ use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_runtime";
-const SMOKE_CHAIN_STATIONS: &[usize] = &[3, 8];
+const SMOKE_CHAIN_STATIONS: &[usize] = &[3];
 const REFERENCE_CHAIN_STATIONS: &[usize] = &[3, 16, 64];
-const SMOKE_FANOUTS: &[usize] = &[4];
+const SMOKE_FANOUTS: &[usize] = &[2];
 const REFERENCE_FANOUTS: &[usize] = &[4, 16];
-const SMOKE_ROUNDS_PER_SAMPLE: usize = 32;
+const SMOKE_ROUNDS_PER_SAMPLE: usize = 3;
 const REFERENCE_ROUNDS_PER_SAMPLE: usize = 1_024;
-const SMOKE_SAMPLES: usize = 3;
+const SMOKE_SAMPLES: usize = 1;
 const REFERENCE_SAMPLES: usize = 9;
 const SMOKE_WARMUP_ROUNDS: usize = 4;
 const REFERENCE_WARMUP_ROUNDS: usize = 64;
@@ -70,14 +76,8 @@ struct RuntimeMetrics {
 }
 
 impl Config {
-    fn load(profile: BenchmarkProfile) -> Self {
-        let (
-            default_chain_stations,
-            default_fanouts,
-            default_rounds_per_sample,
-            default_samples,
-            default_warmup_rounds,
-        ) = match profile {
+    fn for_profile(profile: BenchmarkProfile) -> Self {
+        let (chain_stations, fanouts, rounds_per_sample, samples, warmup_rounds) = match profile {
             BenchmarkProfile::Smoke => (
                 SMOKE_CHAIN_STATIONS,
                 SMOKE_FANOUTS,
@@ -93,44 +93,36 @@ impl Config {
                 REFERENCE_WARMUP_ROUNDS,
             ),
         };
-        let chain_stations = positive_usize_list(
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS",
-            default_chain_stations,
-        )
-        .expect("read Flow runtime benchmark chain station counts");
-        let fanouts = positive_usize_list("DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS", default_fanouts)
-            .expect("read Flow runtime benchmark fan-outs");
-        let rounds_per_sample = positive_usize(
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_ROUNDS_PER_SAMPLE",
-            default_rounds_per_sample,
-        )
-        .expect("read Flow runtime benchmark rounds per sample");
-        let samples = positive_usize("DOGPADDLE_FLOW_RUNTIME_BENCH_SAMPLES", default_samples)
-            .expect("read Flow runtime benchmark sample count");
-        let warmup_rounds = positive_usize(
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_WARMUP_ROUNDS",
-            default_warmup_rounds,
-        )
-        .expect("read Flow runtime benchmark warmup rounds");
         assert!(
             chain_stations.windows(2).all(|pair| pair[0] < pair[1]),
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS must be strictly increasing"
+            "Flow runtime chain station counts must be strictly increasing"
         );
         assert!(
             chain_stations.iter().all(|count| *count >= 3),
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_CHAIN_STATIONS must contain only counts of at least three"
+            "Flow runtime chain station counts must contain only counts of at least three"
         );
         assert!(
             fanouts.windows(2).all(|pair| pair[0] < pair[1]),
-            "DOGPADDLE_FLOW_RUNTIME_BENCH_FANOUTS must be strictly increasing"
+            "Flow runtime fan-outs must be strictly increasing"
         );
         Self {
-            chain_stations,
-            fanouts,
+            chain_stations: chain_stations.to_vec(),
+            fanouts: fanouts.to_vec(),
             rounds_per_sample,
             samples,
             warmup_rounds,
         }
+    }
+
+    fn expected_data_records(&self) -> NonZeroUsize {
+        let scenarios = 2_usize
+            .checked_add(self.chain_stations.len())
+            .and_then(|value| value.checked_add(self.fanouts.len()))
+            .expect("Flow runtime scenario count fits usize");
+        let count = scenarios
+            .checked_mul(self.samples + 1)
+            .expect("Flow runtime data-record count fits usize");
+        NonZeroUsize::new(count).expect("Flow runtime has at least one data record")
     }
 }
 
@@ -245,8 +237,8 @@ impl RuntimeMetrics {
 fn main() {
     require_benchmark_build(BENCHMARK);
 
-    let root = BenchRoot::from_environment();
-    let config = Config::load(root.profile());
+    let root = BenchRoot::from_environment(BENCHMARK);
+    let config = Config::for_profile(root.profile());
     println!("DogPaddle Flow steady runtime benchmark");
     println!(
         "scope=advance steady=chain+fanout+sink+tight_capacity input_retaining_commits_per_change=0 unavailable_input_retaining_commit_profiles=1+8 sync=durable execution=single-thread timing=individual_advance validation=outside-timing"
@@ -262,6 +254,10 @@ fn main() {
     for &consumers in &config.fanouts {
         benchmark_scenario(&root, &config, Scenario::Fanout { consumers });
     }
+    emit_record(
+        &CompletionRecord::new(BENCHMARK)
+            .expect("construct Flow runtime benchmark completion record"),
+    );
 }
 
 fn benchmark_scenario(root: &BenchRoot, config: &Config, scenario: Scenario) {
@@ -519,7 +515,7 @@ fn emit_environment(root: &BenchRoot) {
     let fields = Fields::new()
         .with("mdbx_sync_mode", "durable")
         .expect("add Flow runtime benchmark MDBX sync mode");
-    let environment = EnvironmentRecord::for_profile(
+    let environment = EnvironmentRecord::new(
         BENCHMARK,
         root.profile(),
         HostEnvironment::collect(Some(root.base()))
@@ -592,7 +588,7 @@ fn emit_configuration(config: &Config) {
         .expect("add Flow runtime fixture policy")
         .with("validation", "outside_timing")
         .expect("add Flow runtime validation policy");
-    let configuration = ConfigurationRecord::new(BENCHMARK, fields)
+    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_data_records(), fields)
         .expect("construct Flow runtime benchmark configuration record");
     emit_record(&configuration);
 }

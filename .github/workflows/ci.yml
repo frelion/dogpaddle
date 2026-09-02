@@ -105,5 +105,5 @@ jobs:
           restore-keys: |
             cargo-v1-${{ runner.os }}-1.96-
 
-      - name: Execute all ten benchmark targets
+      - name: Execute every discovered benchmark target
         run: cargo xtask bench-smoke

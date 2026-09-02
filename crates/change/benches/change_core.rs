@@ -17,12 +17,17 @@ mod report;
 mod support;
 
 const BENCHMARK: &str = "change_core";
+const SCENARIOS_PER_FIXTURE: usize = 4;
 
 fn main() {
     require_benchmark_build(BENCHMARK);
 
     let config = Config::load();
-    config.print(BENCHMARK, "DogPaddle Change core benchmark");
+    config.print(
+        BENCHMARK,
+        "DogPaddle Change core benchmark",
+        SCENARIOS_PER_FIXTURE,
+    );
     report::print_header("Change public in-memory operations; '-' means rows/s is not meaningful");
     let mut records = MachineRecords::new(BENCHMARK);
     for &rows in &config.rows {

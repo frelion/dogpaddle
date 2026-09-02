@@ -7,9 +7,9 @@ boundary, result oracle, Store lifecycle, or human-readable report policy.
 
 The crate owns five small protocol concerns:
 
-- strict parsing for scalar/list settings, duplicate-free positive dimensions, and Cargo/run profiles;
+- one common `smoke`/`reference` profile and optional filesystem run root;
 - reproducibility metadata for rustc, OS/kernel, CPU, git, and an optional filesystem;
-- typed JSONL records with validated extension fields;
+- typed JSONL records with validated extension fields and an exact configured data-record count;
 - deterministic duration summaries and nearest-rank percentiles;
 - explicit alternating or four-round-counterbalanced A/B execution order.
 
@@ -17,9 +17,9 @@ Benchmark owners keep their semantic structs locally and put only additional
 machine-readable values in [`Fields`]. The record constructors reject collisions
 with protocol-owned keys, so a workload cannot silently replace fields such as
 `record`, `benchmark`, `elapsed_ns`, or `median_ns`. `ExtensionRecord` additionally
-rejects the five core discriminators (`environment`, `configuration`, `sample`,
-`summary`, and `pair_summary`) so a custom schema cannot masquerade as a standard
-record.
+rejects the core discriminators (`environment`, `configuration`, `sample`,
+`summary`, `pair_summary`, and `completion`) so a custom schema cannot masquerade
+as a standard record.
 
 ```rust
 use std::time::Duration;

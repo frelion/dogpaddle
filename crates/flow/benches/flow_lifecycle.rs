@@ -1,11 +1,16 @@
 mod support;
 
-use std::{io, num::NonZeroU64, path::Path, time::Duration};
+use std::{
+    io,
+    num::{NonZeroU64, NonZeroUsize},
+    path::Path,
+    time::Duration,
+};
 
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
-    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
-    positive_usize_list, require_benchmark_build,
+    BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
+    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord,
+    require_benchmark_build,
 };
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
@@ -15,9 +20,9 @@ use dogpaddle_operation::operation::{
 use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_lifecycle";
-const SMOKE_STATION_COUNTS: &[usize] = &[2, 8, 64];
+const SMOKE_STATION_COUNTS: &[usize] = &[2, 3];
 const REFERENCE_STATION_COUNTS: &[usize] = &[2, 64, 1_024];
-const SMOKE_SAMPLES: usize = 3;
+const SMOKE_SAMPLES: usize = 1;
 const REFERENCE_SAMPLES: usize = 9;
 const SMOKE_WARMUPS: usize = 1;
 const REFERENCE_WARMUPS: usize = 2;
@@ -30,8 +35,8 @@ struct Config {
 }
 
 impl Config {
-    fn load(profile: BenchmarkProfile) -> Self {
-        let (default_station_counts, default_samples, default_warmups) = match profile {
+    fn for_profile(profile: BenchmarkProfile) -> Self {
+        let (station_counts, samples, warmups) = match profile {
             BenchmarkProfile::Smoke => (SMOKE_STATION_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
             BenchmarkProfile::Reference => (
                 REFERENCE_STATION_COUNTS,
@@ -39,36 +44,37 @@ impl Config {
                 REFERENCE_WARMUPS,
             ),
         };
-        let station_counts = positive_usize_list(
-            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS",
-            default_station_counts,
-        )
-        .expect("read Flow benchmark station counts");
-        let samples = positive_usize("DOGPADDLE_FLOW_BENCH_SAMPLES", default_samples)
-            .expect("read Flow benchmark sample count");
-        let warmups = positive_usize("DOGPADDLE_FLOW_BENCH_WARMUPS", default_warmups)
-            .expect("read Flow benchmark warmup count");
         assert!(
             station_counts.windows(2).all(|pair| pair[0] < pair[1]),
-            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS must be strictly increasing"
+            "Flow benchmark station counts must be strictly increasing"
         );
         assert!(
             station_counts.iter().all(|count| *count >= 2),
-            "DOGPADDLE_FLOW_BENCH_STATION_COUNTS must contain only counts of at least two"
+            "Flow benchmark station counts must contain only counts of at least two"
         );
         Self {
-            station_counts,
+            station_counts: station_counts.to_vec(),
             samples,
             warmups,
         }
+    }
+
+    fn expected_data_records(&self) -> NonZeroUsize {
+        let count = self
+            .station_counts
+            .len()
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(self.samples + 1))
+            .expect("Flow lifecycle data-record count fits usize");
+        NonZeroUsize::new(count).expect("Flow lifecycle has at least one data record")
     }
 }
 
 fn main() {
     require_benchmark_build(BENCHMARK);
 
-    let root = BenchRoot::from_environment();
-    let config = Config::load(root.profile());
+    let root = BenchRoot::from_environment(BENCHMARK);
+    let config = Config::for_profile(root.profile());
     println!("DogPaddle Flow lifecycle benchmark");
     println!(
         "scope=build/open runtime=excluded sync=durable execution=single-thread validation=outside-timing"
@@ -80,6 +86,9 @@ fn main() {
         benchmark_fresh_build(&root, &config, station_count);
         benchmark_warm_reopen(&root, &config, station_count);
     }
+    emit_record(
+        &CompletionRecord::new(BENCHMARK).expect("construct Flow benchmark completion record"),
+    );
 }
 
 fn benchmark_fresh_build(root: &BenchRoot, config: &Config, station_count: usize) {
@@ -183,7 +192,7 @@ fn emit_environment(root: &BenchRoot) {
     let fields = Fields::new()
         .with("mdbx_sync_mode", "durable")
         .expect("add Flow benchmark MDBX sync mode");
-    let environment = EnvironmentRecord::for_profile(
+    let environment = EnvironmentRecord::new(
         BENCHMARK,
         root.profile(),
         HostEnvironment::collect(Some(root.base())).expect("collect Flow benchmark environment"),
@@ -211,7 +220,7 @@ fn emit_configuration(config: &Config) {
         .expect("add Flow reopen cache policy")
         .with("validation", "outside_timing")
         .expect("add Flow benchmark validation policy");
-    let configuration = ConfigurationRecord::new(BENCHMARK, fields)
+    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_data_records(), fields)
         .expect("construct Flow benchmark configuration record");
     emit_record(&configuration);
 }

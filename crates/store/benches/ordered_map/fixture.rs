@@ -1,7 +1,7 @@
 use dogpaddle_store::{Cell, OrderedMap, Small, Store, StoreData, StoreValue, Transactions};
 use tempfile::TempDir;
 
-use crate::{STATION_KEYS, VALUE_BYTES, support::sample_dir};
+use crate::{STATION_KEYS, VALUE_BYTES, support::BenchRoot};
 
 pub(super) type ByteMap<SIZE> = OrderedMap<Vec<u8>, Vec<u8>, SIZE>;
 pub(super) type TypedMap<SIZE> = OrderedMap<u64, Vec<u8>, SIZE>;
@@ -31,8 +31,8 @@ where
     ByteMap<SIZE>: StoreData,
     TypedMap<SIZE>: StoreData,
 {
-    pub(super) fn empty() -> Self {
-        let root = sample_dir("ordered-map");
+    pub(super) fn empty(bench_root: &BenchRoot) -> Self {
+        let root = bench_root.sample("ordered-map");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
             .create_data::<TypedMap<SIZE>>("map")
@@ -48,8 +48,8 @@ where
         }
     }
 
-    pub(super) fn populated_typed(entries: usize) -> Self {
-        let mut fixture = Self::empty();
+    pub(super) fn populated_typed(bench_root: &BenchRoot, entries: usize) -> Self {
+        let mut fixture = Self::empty(bench_root);
         let transaction = fixture
             .transactions
             .begin()
@@ -66,8 +66,8 @@ where
         fixture
     }
 
-    pub(super) fn populated_bytes(entries: usize) -> Self {
-        let mut fixture = Self::empty();
+    pub(super) fn populated_bytes(bench_root: &BenchRoot, entries: usize) -> Self {
+        let mut fixture = Self::empty(bench_root);
         let transaction = fixture
             .transactions
             .begin()
@@ -89,10 +89,11 @@ where
     }
 
     pub(super) fn populated_with_small_background(
+        bench_root: &BenchRoot,
         entries: usize,
         background_namespaces: usize,
     ) -> Self {
-        let root = sample_dir("ordered-map-background");
+        let root = bench_root.sample("ordered-map-background");
         let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
         let map = store
             .create_data::<TypedMap<SIZE>>("target")
@@ -149,8 +150,8 @@ impl<SIZE> StationFixture<SIZE>
 where
     TypedMap<SIZE>: StoreData,
 {
-    pub(super) fn populated() -> Self {
-        let root = sample_dir("ordered-map-multi-collection");
+    pub(super) fn populated(bench_root: &BenchRoot) -> Self {
+        let root = bench_root.sample("ordered-map-multi-collection");
         let mut store = Store::create(root.path().join("store")).expect("create station store");
         let cursor = store
             .create_data::<Cell<u64>>("cursor")
@@ -193,8 +194,8 @@ impl<V: StoreValue, SIZE> ScanFixture<V, SIZE>
 where
     OrderedMap<u64, V, SIZE>: StoreData,
 {
-    pub(super) fn populated(entries: usize, value: &V) -> Self {
-        let root = sample_dir("ordered-map-scan");
+    pub(super) fn populated(bench_root: &BenchRoot, entries: usize, value: &V) -> Self {
+        let root = bench_root.sample("ordered-map-scan");
         let mut store =
             Store::create(root.path().join("store")).expect("create scan benchmark store");
         let map = store

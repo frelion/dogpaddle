@@ -1,19 +1,17 @@
-use std::{hint::black_box, io, time::Duration};
+use std::{hint::black_box, io, num::NonZeroUsize, time::Duration};
 
 use dogpaddle_bench_protocol::{
-    ConfigurationRecord, DurationSummary, EnvironmentRecord, Fields, HostEnvironment, JsonlWriter,
-    SampleRecord, SummaryRecord, positive_usize, positive_usize_list, string_list,
+    BenchmarkProfile, CompletionRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
+    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord,
 };
 
 use super::fixture::{DEFAULT_WORKLOADS, validate_dimensions};
 
-const DEFAULT_ROWS: &[usize] = &[1, 64, 1_024, 16_384];
-const DEFAULT_PAYLOAD_BYTES: usize = 1_024;
-const DEFAULT_SAMPLES: usize = 9;
-const DEFAULT_TARGET_ROWS: usize = 65_536;
-const DEFAULT_MAX_CHANGES: usize = 1_024;
+const SMOKE_ROWS: &[usize] = &[4];
+const REFERENCE_ROWS: &[usize] = &[1, 64, 1_024, 16_384];
 
 pub(crate) struct Config {
+    profile: BenchmarkProfile,
     pub(crate) rows: Vec<usize>,
     pub(crate) payload_bytes: usize,
     pub(crate) samples: usize,
@@ -98,27 +96,20 @@ impl BenchmarkCase {
 
 impl Config {
     pub(crate) fn load() -> Self {
-        let rows = positive_usize_list("DOGPADDLE_BENCH_CHANGE_ROWS", DEFAULT_ROWS)
-            .expect("read Change benchmark row counts");
-        let payload_bytes = positive_usize(
-            "DOGPADDLE_BENCH_CHANGE_PAYLOAD_BYTES",
-            DEFAULT_PAYLOAD_BYTES,
-        )
-        .expect("read Change benchmark payload size");
-        let samples = positive_usize("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES)
-            .expect("read Change benchmark sample count");
-        let target_rows = positive_usize("DOGPADDLE_BENCH_CHANGE_TARGET_ROWS", DEFAULT_TARGET_ROWS)
-            .expect("read Change benchmark target row count");
-        let max_changes = positive_usize("DOGPADDLE_BENCH_CHANGE_MAX_CHANGES", DEFAULT_MAX_CHANGES)
-            .expect("read Change benchmark maximum Change count");
-        let workloads = string_list("DOGPADDLE_BENCH_CHANGE_WORKLOADS", DEFAULT_WORKLOADS)
-            .expect("read Change benchmark workloads");
-        for workload in &workloads {
-            assert!(
-                DEFAULT_WORKLOADS.contains(&workload.as_str()),
-                "unknown Change benchmark workload {workload:?}"
-            );
-        }
+        let profile = BenchmarkProfile::from_environment().expect("read Change benchmark profile");
+        Self::for_profile(profile)
+    }
+
+    fn for_profile(profile: BenchmarkProfile) -> Self {
+        let (rows, payload_bytes, samples, target_rows, max_changes) = match profile {
+            BenchmarkProfile::Smoke => (SMOKE_ROWS, 16, 1, 4, 1),
+            BenchmarkProfile::Reference => (REFERENCE_ROWS, 1_024, 9, 65_536, 1_024),
+        };
+        let rows = rows.to_vec();
+        let workloads = DEFAULT_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_owned())
+            .collect::<Vec<_>>();
         for &rows in &rows {
             validate_dimensions(rows, payload_bytes, &workloads);
         }
@@ -127,6 +118,7 @@ impl Config {
             .and_then(|value| value.checked_mul(samples))
             .expect("configured benchmark sample count fits usize");
         Self {
+            profile,
             rows,
             payload_bytes,
             samples,
@@ -140,7 +132,7 @@ impl Config {
         self.target_rows.div_ceil(rows).clamp(1, self.max_changes)
     }
 
-    pub(crate) fn print(&self, benchmark: &'static str, title: &str) {
+    pub(crate) fn print(&self, benchmark: &'static str, title: &str, scenarios_per_fixture: usize) {
         println!("{title}");
         println!(
             "rows/change={:?} target_rows/sample={} max_changes/sample={} samples={} payload_bytes={} workloads={:?}",
@@ -156,12 +148,14 @@ impl Config {
         );
         let environment = EnvironmentRecord::new(
             benchmark,
+            self.profile,
             HostEnvironment::collect(None).expect("collect Change benchmark environment"),
             Fields::new(),
         )
         .expect("construct Change benchmark environment record");
         let configuration = ConfigurationRecord::new(
             benchmark,
+            self.expected_data_records(scenarios_per_fixture),
             Fields::new()
                 .with("rows_per_change", &self.rows)
                 .expect("add Change benchmark row counts")
@@ -197,6 +191,21 @@ impl Config {
             .flush()
             .expect("flush Change benchmark protocol records");
     }
+
+    fn expected_data_records(&self, scenarios_per_fixture: usize) -> NonZeroUsize {
+        let records_per_scenario = self
+            .samples
+            .checked_add(1)
+            .expect("Change benchmark records per scenario fit usize");
+        let count = self
+            .rows
+            .len()
+            .checked_mul(self.workloads.len())
+            .and_then(|value| value.checked_mul(scenarios_per_fixture))
+            .and_then(|value| value.checked_mul(records_per_scenario))
+            .expect("Change benchmark data-record count fits usize");
+        NonZeroUsize::new(count).expect("Change benchmark has at least one data record")
+    }
 }
 
 impl MachineRecords {
@@ -221,6 +230,12 @@ impl MachineRecords {
                 .write(summary)
                 .expect("write Change benchmark summary record");
         }
+        writer
+            .write(
+                &CompletionRecord::new(self.benchmark)
+                    .expect("construct Change benchmark completion record"),
+            )
+            .expect("write Change benchmark completion record");
         writer
             .flush()
             .expect("flush Change benchmark protocol records");

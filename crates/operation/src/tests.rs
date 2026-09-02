@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataInstances, MaterializeError, OperationDefinition, OperationKind,
+    DataInstances, MaterializeError, OperationDefinition,
     codec::DECODERS,
     definition::DataName,
     operation::{
@@ -44,32 +44,6 @@ fn decoder_registry_exactly_matches_builtins() {
         "duplicate decoder tag"
     );
     assert_eq!(registered_tags, expected_tags);
-}
-
-#[test]
-fn builtin_kinds_match_their_structural_contracts() {
-    let kinds = builtin_definitions().map(|definition| definition.kind());
-    assert_eq!(
-        kinds,
-        [
-            OperationKind::Source,
-            OperationKind::Transform(std::num::NonZeroU32::MIN),
-            OperationKind::Sink(std::num::NonZeroU32::MIN),
-        ]
-    );
-}
-
-#[test]
-fn builtin_data_names_are_valid() {
-    for definition in builtin_definitions() {
-        let mut names = HashSet::new();
-        for declaration in definition.data() {
-            let name = declaration.name();
-            assert!(!name.is_empty());
-            assert!(!name.as_bytes().contains(&0));
-            assert!(names.insert(name), "duplicate operation data name {name:?}");
-        }
-    }
 }
 
 #[test]

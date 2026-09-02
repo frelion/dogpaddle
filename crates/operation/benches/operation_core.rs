@@ -21,6 +21,7 @@ use support::{BenchRoot, Config, MachineRecords};
 
 mod support;
 
+const BENCHMARK: &str = "operation_core";
 const SEQUENCE_START: u64 = 1_000_000;
 
 struct CountFixture {
@@ -107,16 +108,16 @@ impl SequenceFixture {
 }
 
 fn main() {
-    require_benchmark_build("operation_core");
+    require_benchmark_build(BENCHMARK);
 
-    let config = Config::load();
     let root = BenchRoot::from_environment();
+    let config = Config::for_profile(root.profile());
     println!("DogPaddle Operation core benchmark");
     println!(
         "timing=explicit-boundaries setup=outside validation=outside warmup=unreported rows-per-turn=1"
     );
     root.emit_environment();
-    config.emit(root.profile());
+    config.emit();
 
     let mut records = MachineRecords::new();
     benchmark_definition_codec(&config, &mut records);

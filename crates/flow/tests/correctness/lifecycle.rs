@@ -8,7 +8,7 @@ use dogpaddle_operation::operation::{
     source::{SequenceSourceDefinition, SequenceSourceOperation},
     transform::CountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, Store};
+use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
@@ -46,14 +46,16 @@ fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_positi
 }
 
 #[test]
-fn reopen_drains_a_committed_final_source_change_after_sequence_becomes_idle() {
+fn reopen_drains_a_committed_final_source_change_across_fanout() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
     let source = builder.station("source", SequenceSourceDefinition::new(u64::MAX));
-    let sink = builder.station("sink", DiscardDefinition::new());
+    let first_sink = builder.station("first-sink", DiscardDefinition::new());
+    let second_sink = builder.station("second-sink", DiscardDefinition::new());
     builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    builder.connect([source], sink);
+    builder.connect([source], first_sink);
+    builder.connect([source], second_sink);
     drop(builder.build().unwrap());
 
     {
@@ -80,19 +82,78 @@ fn reopen_drains_a_committed_final_source_change_after_sequence_becomes_idle() {
         );
         transaction.commit().unwrap();
     }
+    let committed = fanout_execution_state(&path);
+    assert_eq!(committed.source_position, u64::MAX);
+    assert_eq!(committed.cursors, [0, 0]);
+    assert_eq!(committed.source_output, 0..1);
+    assert!(committed.retained_bytes > 0);
 
     let mut reopened = FlowFactory::open(&path).unwrap();
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
     drop(reopened);
 
-    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        fanout_execution_state(&path),
+        FanoutExecutionState {
+            source_position: u64::MAX,
+            cursors: [1, 1],
+            source_output: 1..1,
+            retained_bytes: 0,
+        }
+    );
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FanoutExecutionState {
+    source_position: u64,
+    cursors: [u64; 2],
+    source_output: Range<u64>,
+    retained_bytes: u64,
+}
+
+fn fanout_execution_state(path: &Path) -> FanoutExecutionState {
+    let store = Store::open(path).unwrap();
+    let position: Cell<u64> = store
+        .open_data("station/00000000/operation/sequence_source.position")
+        .unwrap();
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let first_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let second_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000002/state").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
+    let source_position = position
+        .access(transaction.access())
+        .unwrap()
+        .get()
+        .unwrap()
+        .unwrap();
+    let cursor_key = b"input/00000000/cursor".to_vec();
+    let first_cursor = first_state
+        .access(transaction.access())
+        .unwrap()
+        .get(&cursor_key)
+        .unwrap()
+        .unwrap();
+    let second_cursor = second_state
+        .access(transaction.access())
+        .unwrap()
+        .get(&cursor_key)
+        .unwrap()
+        .unwrap();
     let output = output.access(transaction.access()).unwrap();
-    assert_eq!(output.bounds().unwrap(), 1..1);
-    assert_eq!(output.retained_bytes().unwrap(), 0);
+
+    FanoutExecutionState {
+        source_position,
+        cursors: [
+            u64::from_be_bytes(first_cursor.try_into().unwrap()),
+            u64::from_be_bytes(second_cursor.try_into().unwrap()),
+        ],
+        source_output: output.bounds().unwrap(),
+        retained_bytes: output.retained_bytes().unwrap(),
+    }
 }
 
 struct ExecutionState {

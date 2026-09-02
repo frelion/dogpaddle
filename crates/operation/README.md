@@ -198,8 +198,8 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、Definition、Source、Transform 与 Sink 分区。Definition v1 使用版本化
 黄金字节约束，具体 Operation 覆盖完整 turn、commit、rollback、reopen、极值错误不改状态、固定
-output Schema/diff 和 Store 错误透明传播。完整目录所有权、测试矩阵和 fixture 规则见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)。
+output Schema/diff 和 Store 错误透明传播。完整目录所有权、测试矩阵和 fixture 规则见工作区
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务
 内的一行 `turn` body，以及包含 begin、turn 和 durable commit 的完整事务。固定大小 Cell 的长稳
@@ -208,10 +208,8 @@ benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采
 统计并输出 typed JSONL。Operation 本地 support 仍拥有 workload 字段、计时/oracle 和
 `BenchRoot`/`SampleStore`；`SampleStore` 在所属场景或 durable 样本校验后立即释放，
 不积累到 run root 最终 drop。
-smoke 默认使用临时目录，正式回归必须选择 `reference` profile 并显式指定固定文件系统目录，具体
-环境变量和 typed JSONL 输出协议见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/operation/TESTING.md)；
-全工作区统一规则以根目录
+smoke 默认使用临时目录，正式回归必须选择 `reference` profile 并显式指定固定文件系统目录；
+环境变量和 typed JSONL 输出协议以根目录
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md) 为准。
 
 ## 验证命令

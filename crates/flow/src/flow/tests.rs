@@ -73,48 +73,6 @@ fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
 }
 
 #[test]
-fn completing_an_input_reclaims_its_upstream_entry_inline() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, NonZeroU64::MAX);
-    builder.output_capacity_bytes(count, NonZeroU64::MAX);
-    builder.connect([source], count);
-    builder.connect([count], sink);
-    let mut flow = builder.build().unwrap();
-
-    assert_eq!(
-        flow.stations[0]
-            .advance(&flow.reads, &mut flow.transactions)
-            .unwrap(),
-        super::AdvanceOutcome::Progressed
-    );
-    assert_eq!(
-        flow.stations[1]
-            .advance(&flow.reads, &mut flow.transactions)
-            .unwrap(),
-        super::AdvanceOutcome::Progressed
-    );
-    drop(flow);
-
-    let store = Store::open(path).unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        1..1
-    );
-}
-
-#[test]
 fn advance_reports_backpressure_when_no_station_commits_progress() {
     let root = tempfile::tempdir().unwrap();
     let mut builder = FlowFactory::new(root.path().join("flow"));

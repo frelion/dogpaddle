@@ -30,32 +30,21 @@ index 下可配对的原始结果。结果等价验证位于计时外。
 
 ## 配置
 
-| 环境变量 | 含义 |
-| --- | --- |
-| `DOGPADDLE_BENCH_CHANGE_ROWS` | 逗号分隔的 rows/Change |
-| `DOGPADDLE_BENCH_CHANGE_PAYLOAD_BYTES` | wide payload 每行字节数 |
-| `DOGPADDLE_BENCH_CHANGE_WORKLOADS` | 逗号分隔的 workload 名称 |
-| `DOGPADDLE_BENCH_CHANGE_TARGET_ROWS` | 每个样本的目标总行数 |
-| `DOGPADDLE_BENCH_CHANGE_MAX_CHANGES` | 每个样本最多执行的 Change 数 |
-| `DOGPADDLE_BENCH_SAMPLES` | 每个 workload 的正式样本数 |
-
-例如运行一个快速 release protocol smoke：
+benchmark 只有 `smoke` 与 `reference` 两套代码内固定矩阵，不接受逐维覆盖。快速协议检查：
 
 ```bash
-DOGPADDLE_BENCH_CHANGE_ROWS=64 \
-DOGPADDLE_BENCH_CHANGE_WORKLOADS=narrow_fixed,wide_projectable \
-DOGPADDLE_BENCH_CHANGE_TARGET_ROWS=1024 \
-DOGPADDLE_BENCH_CHANGE_MAX_CHANGES=16 \
-DOGPADDLE_BENCH_SAMPLES=1 \
-cargo bench -p dogpaddle-change --bench change_codec
+DOGPADDLE_BENCH_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_codec
 ```
+
+正式 reference 使用 `DOGPADDLE_BENCH_PROFILE=reference`；Change 不落盘，因此不要求 root。
 
 输出包含 rows/Change、changes/sample、encoded bytes/Change、每 Change 的 min/median/max、
 rows/s 和 encoded MiB/s。它们是 warm single-thread CPU 数量级，不是 Store、磁盘或 Flow 吞吐。
 真实持久化路径由 `dogpaddle-change-store-integration` 独立测量。
 
 stdout 保留上述人类表格；每个以 `{` 开头的机器记录均由共享 writer 生成，是 typed JSONL
-`environment`、`configuration`、`sample` 或 `summary`。Change 的 sample/summary 扩展字段为
-`workload`、`operations`、`rows_per_change` 和 `encoded_bytes_per_change`；原始耗时与
+`environment`、`configuration`、`sample`、`summary`，并以 `completion` 结束。Change 的
+sample/summary 扩展字段为 `workload`、`operations`、`rows_per_change` 和
+`encoded_bytes_per_change`；原始耗时与
 min/median/max 使用协议字段。启动时仍由 Change fixture 用 checked arithmetic 预检尺寸，并在分配
 前拒绝超过 Arrow i32 offset 容量的 Binary、Utf8 或 List 配置。

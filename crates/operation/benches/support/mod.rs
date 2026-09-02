@@ -1,24 +1,19 @@
 use std::{
     fs, io,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, BenchmarkRecord, ConfigurationRecord, DurationSummary, EnvironmentRecord,
-    Fields, HostEnvironment, JsonlWriter, SampleRecord, SummaryRecord, positive_usize,
-    positive_usize_list,
+    BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
+    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, RunRoot, SampleRecord, SummaryRecord,
 };
 use tempfile::TempDir;
 
-const PROFILE_ENV: &str = "DOGPADDLE_OPERATION_BENCH_PROFILE";
-const STORE_DIR_ENV: &str = "DOGPADDLE_OPERATION_BENCH_STORE_DIR";
-const DEFAULT_SAMPLES: usize = 9;
-const DEFAULT_CODEC_OPERATIONS: usize = 100_000;
-const DEFAULT_BODY_TRANSACTIONS: usize = 512;
-const DEFAULT_DURABLE_TRANSACTIONS: usize = 64;
-const DEFAULT_WARMUP_TRANSACTIONS: usize = 4;
-const DEFAULT_TURNS: &[usize] = &[1, 64, 1_024];
+use super::BENCHMARK;
+
+const REFERENCE_TURNS: &[usize] = &[1, 64, 1_024];
 
 pub(crate) struct Config {
     pub(crate) samples: usize,
@@ -30,10 +25,7 @@ pub(crate) struct Config {
 }
 
 pub(crate) struct BenchRoot {
-    profile: BenchmarkProfile,
-    filesystem_base: PathBuf,
-    run_root: TempDir,
-    _temporary_base: Option<TempDir>,
+    root: RunRoot,
 }
 
 pub(crate) struct SampleStore {
@@ -47,30 +39,24 @@ pub(crate) struct MachineRecords {
 }
 
 impl Config {
-    pub(crate) fn load() -> Self {
-        Self {
-            samples: setting("DOGPADDLE_OPERATION_BENCH_SAMPLES", DEFAULT_SAMPLES),
-            codec_operations: setting(
-                "DOGPADDLE_OPERATION_BENCH_CODEC_OPERATIONS",
-                DEFAULT_CODEC_OPERATIONS,
-            ),
-            body_transactions: setting(
-                "DOGPADDLE_OPERATION_BENCH_BODY_TRANSACTIONS_PER_SAMPLE",
-                DEFAULT_BODY_TRANSACTIONS,
-            ),
-            durable_transactions: setting(
-                "DOGPADDLE_OPERATION_BENCH_DURABLE_TRANSACTIONS_PER_SAMPLE",
-                DEFAULT_DURABLE_TRANSACTIONS,
-            ),
-            warmup_transactions: setting(
-                "DOGPADDLE_OPERATION_BENCH_WARMUP_TRANSACTIONS",
-                DEFAULT_WARMUP_TRANSACTIONS,
-            ),
-            turns: positive_usize_list(
-                "DOGPADDLE_OPERATION_BENCH_TURNS_PER_TRANSACTION",
-                DEFAULT_TURNS,
-            )
-            .expect("load Operation benchmark turn counts"),
+    pub(crate) fn for_profile(profile: BenchmarkProfile) -> Self {
+        match profile {
+            BenchmarkProfile::Smoke => Self {
+                samples: 1,
+                codec_operations: 1,
+                body_transactions: 1,
+                durable_transactions: 1,
+                warmup_transactions: 1,
+                turns: vec![1],
+            },
+            BenchmarkProfile::Reference => Self {
+                samples: 9,
+                codec_operations: 100_000,
+                body_transactions: 512,
+                durable_transactions: 64,
+                warmup_transactions: 4,
+                turns: REFERENCE_TURNS.to_vec(),
+            },
         }
     }
 
@@ -78,11 +64,8 @@ impl Config {
         self.codec_operations.min(1_000)
     }
 
-    pub(crate) fn emit(&self, profile: BenchmarkProfile) {
+    pub(crate) fn emit(&self) {
         let mut fields = Fields::new();
-        fields
-            .insert("profile", profile)
-            .expect("encode Operation benchmark profile");
         fields
             .insert("samples", self.samples)
             .expect("encode sample count");
@@ -102,109 +85,44 @@ impl Config {
             .insert("turns_per_transaction", &self.turns)
             .expect("encode turn counts");
         emit_record(
-            &ConfigurationRecord::new("operation_core", fields)
+            &ConfigurationRecord::new(BENCHMARK, self.expected_data_records(), fields)
                 .expect("build Operation configuration record"),
         );
+    }
+
+    fn expected_data_records(&self) -> NonZeroUsize {
+        NonZeroUsize::new(
+            (6 + 4 * self.turns.len())
+                .checked_mul(self.samples + 1)
+                .expect("Operation record count fits usize"),
+        )
+        .expect("Operation benchmark emits data records")
     }
 }
 
 impl BenchRoot {
     pub(crate) fn from_environment() -> Self {
-        let profile = BenchmarkProfile::from_environment(PROFILE_ENV)
-            .expect("load Operation benchmark profile");
-        let configured = std::env::var_os(STORE_DIR_ENV).map(PathBuf::from);
-        match profile {
-            BenchmarkProfile::Smoke => {
-                configured.map_or_else(Self::temporary, |base| Self::configured(profile, &base))
-            }
-            BenchmarkProfile::Reference => {
-                let base = configured.unwrap_or_else(|| {
-                    panic!("{PROFILE_ENV}=reference requires an explicit {STORE_DIR_ENV}")
-                });
-                Self::configured(profile, &base)
-            }
-        }
-    }
-
-    fn temporary() -> Self {
-        let temporary_base = tempfile::tempdir().expect("create temporary benchmark Store base");
-        let filesystem_base = temporary_base.path().to_path_buf();
-        let run_root = tempfile::Builder::new()
-            .prefix("dogpaddle-operation-run-")
-            .tempdir_in(&filesystem_base)
-            .expect("create temporary operation benchmark run root");
         Self {
-            profile: BenchmarkProfile::Smoke,
-            filesystem_base,
-            run_root,
-            _temporary_base: Some(temporary_base),
-        }
-    }
-
-    fn configured(profile: BenchmarkProfile, base: &Path) -> Self {
-        if profile == BenchmarkProfile::Reference {
-            assert!(
-                base.is_absolute(),
-                "reference benchmark Store base must be an absolute path"
-            );
-        }
-        fs::create_dir_all(base).unwrap_or_else(|error| {
-            panic!(
-                "create configured benchmark Store base {}: {error}",
-                base.display()
-            )
-        });
-        let filesystem_base = base.canonicalize().unwrap_or_else(|error| {
-            panic!(
-                "resolve configured benchmark Store base {}: {error}",
-                base.display()
-            )
-        });
-        assert!(
-            filesystem_base.is_dir(),
-            "benchmark Store base must be a directory"
-        );
-        let run_root = tempfile::Builder::new()
-            .prefix("dogpaddle-operation-run-")
-            .tempdir_in(&filesystem_base)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "create operation benchmark run root under {}: {error}",
-                    filesystem_base.display()
-                )
-            });
-        Self {
-            profile,
-            filesystem_base,
-            run_root,
-            _temporary_base: None,
+            root: RunRoot::from_environment(BENCHMARK),
         }
     }
 
     pub(crate) const fn profile(&self) -> BenchmarkProfile {
-        self.profile
+        self.root.profile()
     }
 
     pub(crate) fn sample(&self, name: &str) -> SampleStore {
-        let root = tempfile::Builder::new()
-            .prefix(&format!("dogpaddle-{name}-"))
-            .tempdir_in(self.run_root.path())
-            .unwrap_or_else(|error| {
-                panic!(
-                    "create Operation benchmark sample under {}: {error}",
-                    self.run_root.path().display()
-                )
-            });
+        let root = self.root.sample(name);
         let store = root.path().join("store");
         SampleStore { _root: root, store }
     }
 
     pub(crate) fn emit_environment(&self) {
-        let host = HostEnvironment::collect(Some(&self.filesystem_base))
+        let host = HostEnvironment::collect(Some(self.root.filesystem_root()))
             .expect("collect Operation benchmark environment");
         let mut fields = Fields::new();
         fields
-            .insert("store_root", self.run_root.path().display().to_string())
+            .insert("store_root", self.root.path().display().to_string())
             .expect("encode benchmark Store root");
         fields
             .insert("execution", "single-thread")
@@ -214,14 +132,14 @@ impl BenchRoot {
             .insert("mdbx_sync_mode", "durable")
             .expect("encode MDBX sync mode");
         emit_record(
-            &EnvironmentRecord::for_profile("operation_core", self.profile, host, fields)
+            &EnvironmentRecord::new(BENCHMARK, self.profile(), host, fields)
                 .expect("build Operation environment record"),
         );
     }
 
     pub(crate) fn assert_samples_released(&self) {
         assert!(
-            fs::read_dir(self.run_root.path())
+            fs::read_dir(self.root.path())
                 .expect("read Operation benchmark run root")
                 .next()
                 .is_none(),
@@ -272,12 +190,12 @@ impl MachineRecords {
                 .insert("ns_per_operation", ns_per_operation)
                 .expect("encode per-operation duration");
             self.samples.push(
-                SampleRecord::new("operation_core", scenario, sample, elapsed, sample_fields)
+                SampleRecord::new(BENCHMARK, scenario, sample, elapsed, sample_fields)
                     .expect("build Operation sample record"),
             );
         }
         self.summaries.push(
-            SummaryRecord::new("operation_core", scenario, summary, fields)
+            SummaryRecord::new(BENCHMARK, scenario, summary, fields)
                 .expect("build Operation summary record"),
         );
     }
@@ -297,6 +215,9 @@ impl MachineRecords {
                 .write(summary)
                 .expect("write Operation benchmark summary record");
         }
+        writer
+            .write(&CompletionRecord::new(BENCHMARK).expect("build Operation completion record"))
+            .expect("write Operation completion record");
         writer
             .flush()
             .expect("flush Operation benchmark protocol records");
@@ -318,10 +239,6 @@ fn measurement_fields(
         .expect("encode transaction count")
         .with("turns_per_transaction", turns)
         .expect("encode turn count")
-}
-
-fn setting(name: &str, default: usize) -> usize {
-    positive_usize(name, default).expect("load positive Operation benchmark setting")
 }
 
 fn emit_record(record: &impl BenchmarkRecord) {

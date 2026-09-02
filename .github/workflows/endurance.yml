@@ -49,15 +49,8 @@ jobs:
 
       - name: Run Store AppendLog endurance
         env:
-          DOGPADDLE_STORE_BENCH_PROFILE: smoke
-          DOGPADDLE_STORE_ENDURANCE_PROFILE: smoke
-          DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES: "128"
-          DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB: "64"
-          DOGPADDLE_STORE_ENDURANCE_WINDOW_MIB: "32"
-          DOGPADDLE_STORE_ENDURANCE_BATCH_MIB: "4"
-          DOGPADDLE_STORE_ENDURANCE_CHECKPOINT_EPOCHS: "4"
-          DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES: "268435456"
-          DOGPADDLE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES: "536870912"
+          DOGPADDLE_BENCH_PROFILE: reference
+          DOGPADDLE_BENCH_ROOT: ${{ github.workspace }}/benchmark-store
         run: >-
           cargo bench --locked -p dogpaddle-store --bench append_log_endurance
           > benchmark-artifacts/store-append-log.stdout.log
@@ -65,20 +58,8 @@ jobs:
 
       - name: Run Change + AppendLog endurance
         env:
-          DOGPADDLE_CHANGE_STORE_BENCH_PROFILE: smoke
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_PROFILE: smoke
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_ROWS_PER_CHANGE: "1024"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_CHANGES_PER_CYCLE: "8"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_CYCLES: "64"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_PAYLOAD_BYTES: "256"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_RETAINED_BYTES: "33554432"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_TRUNCATE_ITEMS: "16"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_ITEMS: "8"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_CONSUMER_PAGE_BYTES: "8388608"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_REOPEN_INTERVAL_CYCLES: "8"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES: "268435456"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_MAX_TOTAL_WRITTEN_BYTES: "536870912"
-          DOGPADDLE_CHANGE_STORE_ENDURANCE_WORKLOAD_MODE: all
+          DOGPADDLE_BENCH_PROFILE: reference
+          DOGPADDLE_BENCH_ROOT: ${{ github.workspace }}/benchmark-change-store
         run: >-
           cargo bench --locked -p dogpaddle-change-store-integration --bench change_append_log_endurance
           > benchmark-artifacts/change-append-log.stdout.log
@@ -86,11 +67,8 @@ jobs:
 
       - name: Validate machine-readable benchmark records
         run: |
-          for output in benchmark-artifacts/*.stdout.log; do
-            records="$(awk '/^\{/' "$output")"
-            test -n "$records"
-            printf '%s\n' "$records" | jq -e . >/dev/null
-          done
+          cargo xtask bench-validate append_log_endurance reference benchmark-artifacts/store-append-log.stdout.log
+          cargo xtask bench-validate change_append_log_endurance reference benchmark-artifacts/change-append-log.stdout.log
 
       - name: Upload raw benchmark records
         if: always()

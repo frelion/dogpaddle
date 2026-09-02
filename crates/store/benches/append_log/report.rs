@@ -6,11 +6,9 @@ use dogpaddle_bench_protocol::{
 };
 
 use crate::{
-    MEBIBYTE_BYTES,
+    BENCHMARK, MEBIBYTE_BYTES,
     support::{average_duration, format_duration, write_record},
 };
-
-const BENCHMARK: &str = "store_append_log";
 
 pub(super) struct LogCase {
     workload: String,

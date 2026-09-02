@@ -4,6 +4,8 @@ mod lifecycle;
 mod malformed;
 #[path = "correctness/persistence.rs"]
 mod persistence;
+#[path = "correctness/runtime_corruption.rs"]
+mod runtime_corruption;
 #[path = "correctness/support.rs"]
 mod support;
 #[path = "correctness/validation.rs"]

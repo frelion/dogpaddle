@@ -17,6 +17,7 @@ mod report;
 mod support;
 
 const BENCHMARK: &str = "change_codec";
+const SCENARIOS_PER_FIXTURE: usize = 5;
 
 #[derive(Clone, Copy)]
 enum CodecMode<'fixture> {
@@ -48,7 +49,11 @@ fn main() {
     require_benchmark_build(BENCHMARK);
 
     let config = Config::load();
-    config.print(BENCHMARK, "DogPaddle Change codec benchmark");
+    config.print(
+        BENCHMARK,
+        "DogPaddle Change codec benchmark",
+        SCENARIOS_PER_FIXTURE,
+    );
     report::print_header("one complete self-contained Arrow IPC Stream per Change");
     let mut records = MachineRecords::new(BENCHMARK);
     for &rows in &config.rows {

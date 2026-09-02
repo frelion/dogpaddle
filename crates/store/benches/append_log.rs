@@ -1,6 +1,8 @@
 //! CDC-oriented append, replay, projection, forwarding, fan-out, and GC scenarios.
 
-use dogpaddle_bench_protocol::{ConfigurationRecord, Fields, positive_usize, positive_usize_list};
+use std::num::NonZeroUsize;
+
+use dogpaddle_bench_protocol::{BenchmarkProfile, ConfigurationRecord, Fields};
 
 mod support;
 
@@ -23,8 +25,9 @@ use oracle::{chunked_gc_transactions, make_records};
 use report::{
     LogCase, LogPair, print_log_section, report_log, report_log_mode_pair, report_log_pair,
 };
-use support::{initialize, write_record};
+use support::{BenchRoot, complete, initialize, write_record};
 
+const BENCHMARK: &str = "append_log";
 const DEFAULT_ENTRIES: usize = 10_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
@@ -39,6 +42,7 @@ const SEED_BATCH_ITEMS: usize = 4_096;
 const MEBIBYTE_BYTES: u128 = 1_048_576;
 const CURSOR_KEY: &[u8] = b"input/00000000/cursor";
 
+#[derive(Clone, Copy)]
 struct AppendConfiguration<'a> {
     entries: usize,
     commits: usize,
@@ -51,37 +55,49 @@ struct AppendConfiguration<'a> {
     readers: &'a [usize],
 }
 
-fn main() {
-    let _bench_root = initialize("store_append_log");
+impl AppendConfiguration<'static> {
+    const fn for_profile(profile: BenchmarkProfile) -> Self {
+        match profile {
+            BenchmarkProfile::Smoke => Self {
+                entries: 3,
+                commits: 1,
+                samples: 1,
+                record_sizes: &[16, 64],
+                source_batches: &[1, 2],
+                station_record_bytes: 16,
+                station_batch_items: 1,
+                gc_items: 1,
+                readers: &[1, 2],
+            },
+            BenchmarkProfile::Reference => Self {
+                entries: DEFAULT_ENTRIES,
+                commits: DEFAULT_COMMITS,
+                samples: DEFAULT_SAMPLES,
+                record_sizes: DEFAULT_RECORD_BYTES,
+                source_batches: DEFAULT_SOURCE_BATCH_ITEMS,
+                station_record_bytes: DEFAULT_STATION_RECORD_BYTES,
+                station_batch_items: DEFAULT_STATION_BATCH_ITEMS,
+                gc_items: DEFAULT_GC_ITEMS,
+                readers: DEFAULT_READERS,
+            },
+        }
+    }
+}
 
-    let entries = positive_usize("DOGPADDLE_BENCH_LOG_ENTRIES", DEFAULT_ENTRIES)
-        .expect("parse AppendLog entry count");
-    let commits = positive_usize("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS)
-        .expect("parse AppendLog commit count");
-    let samples = positive_usize("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES)
-        .expect("parse AppendLog sample count");
-    let record_sizes =
-        positive_usize_list("DOGPADDLE_BENCH_LOG_RECORD_BYTES", DEFAULT_RECORD_BYTES)
-            .expect("parse AppendLog record sizes");
-    let source_batches = positive_usize_list(
-        "DOGPADDLE_BENCH_LOG_SOURCE_BATCH_ITEMS",
-        DEFAULT_SOURCE_BATCH_ITEMS,
-    )
-    .expect("parse AppendLog source batch sizes");
-    let station_record_bytes = positive_usize(
-        "DOGPADDLE_BENCH_LOG_STATION_RECORD_BYTES",
-        DEFAULT_STATION_RECORD_BYTES,
-    )
-    .expect("parse AppendLog station record size");
-    let station_batch_items = positive_usize(
-        "DOGPADDLE_BENCH_LOG_STATION_BATCH_ITEMS",
-        DEFAULT_STATION_BATCH_ITEMS,
-    )
-    .expect("parse AppendLog station batch size");
-    let gc_items = positive_usize("DOGPADDLE_BENCH_LOG_GC_ITEMS", DEFAULT_GC_ITEMS)
-        .expect("parse AppendLog GC item limit");
-    let readers = positive_usize_list("DOGPADDLE_BENCH_LOG_READERS", DEFAULT_READERS)
-        .expect("parse AppendLog reader counts");
+fn main() {
+    let bench_root = initialize(BENCHMARK);
+    let config = AppendConfiguration::for_profile(bench_root.profile());
+    let AppendConfiguration {
+        entries,
+        commits,
+        samples,
+        record_sizes,
+        source_batches,
+        station_record_bytes,
+        station_batch_items,
+        gc_items,
+        readers,
+    } = config;
 
     assert!(entries > 0 && commits > 0 && samples > 0);
     assert!(station_batch_items > 0 && gc_items > 0);
@@ -89,17 +105,7 @@ fn main() {
     assert!(record_sizes.iter().all(|size| *size >= RECORD_HEADER_BYTES));
     assert!(source_batches.iter().all(|size| *size > 0));
     assert!(readers.iter().all(|count| *count > 0));
-    emit_configuration(&AppendConfiguration {
-        entries,
-        commits,
-        samples,
-        record_sizes: &record_sizes,
-        source_batches: &source_batches,
-        station_record_bytes,
-        station_batch_items,
-        gc_items,
-        readers: &readers,
-    });
+    emit_configuration(&config);
 
     println!("DogPaddle AppendLog benchmark");
     println!(
@@ -115,30 +121,39 @@ fn main() {
         "AppendLog<T>: encoded width and read strategy",
         "one durable bulk append transaction; warm scans stay in one transaction",
     );
-    benchmark_record_widths(entries, samples, station_batch_items, &record_sizes);
+    benchmark_record_widths(
+        &bench_root,
+        entries,
+        samples,
+        station_batch_items,
+        record_sizes,
+    );
     print_log_section(
         "AppendLog<T>: Source commit amortization",
         "each batch is one begin -> append -> durable commit transaction",
     );
     benchmark_durable_source(
+        &bench_root,
         entries,
         commits,
         samples,
         station_record_bytes,
-        &source_batches,
+        source_batches,
     );
     print_log_section(
         "AppendLog<T>: Station, fan-out, and GC",
         "Station state cursor, log work, output/state writes, and durable commit are timed together",
     );
     benchmark_station_transactions(
+        &bench_root,
         entries,
         samples,
         station_record_bytes,
         station_batch_items,
         gc_items,
-        &readers,
+        readers,
     );
+    complete(BENCHMARK);
 }
 
 fn emit_configuration(config: &AppendConfiguration<'_>) {
@@ -164,12 +179,18 @@ fn emit_configuration(config: &AppendConfiguration<'_>) {
     fields
         .insert("readers", config.readers)
         .expect("construct AppendLog reader field");
-    let record = ConfigurationRecord::new("store_append_log", fields)
+    let samples_and_summary = config.samples + 1;
+    let records = config.record_sizes.len() * (7 * config.samples + 10)
+        + config.source_batches.len() * samples_and_summary
+        + (4 + config.readers.len()) * samples_and_summary
+        + (2 * config.samples + 3);
+    let record = ConfigurationRecord::new(BENCHMARK, NonZeroUsize::new(records).unwrap(), fields)
         .expect("construct AppendLog configuration record");
     write_record(&record);
 }
 
 fn benchmark_record_widths(
+    bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
     scan_items: usize,
@@ -182,7 +203,7 @@ fn benchmark_record_widths(
         report_log(
             &LogCase::new("bulk append pre-encoded, one tx", entries, record_bytes, 1),
             samples,
-            || measure_append(&encoded, entries),
+            || measure_append(bench_root, &encoded, entries),
         );
         report_log_pair(
             &LogPair::variants(
@@ -191,8 +212,8 @@ fn benchmark_record_widths(
                 "append batch body, rollback",
             ),
             samples,
-            || measure_append_body(&records, false),
-            || measure_append_body(&records, true),
+            || measure_append_body(bench_root, &records, false),
+            || measure_append_body(bench_root, &records, true),
         );
         report_log_pair(
             &LogPair::variants(
@@ -201,11 +222,11 @@ fn benchmark_record_widths(
                 "append batch, one durable tx",
             ),
             samples,
-            || measure_append(&records, entries),
-            || measure_batch_append(&records, entries),
+            || measure_append(bench_root, &records, entries),
+            || measure_batch_append(bench_root, &records, entries),
         );
 
-        let mut fixture = LogFixture::populated(entries, record_bytes, 0);
+        let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
         report_log_mode_pair(
             &LogPair::modes(
                 format!("scan decode record_bytes={record_bytes}"),
@@ -225,6 +246,7 @@ fn benchmark_record_widths(
 }
 
 fn benchmark_durable_source(
+    bench_root: &BenchRoot,
     entries: usize,
     commits: usize,
     samples: usize,
@@ -243,12 +265,20 @@ fn benchmark_durable_source(
                 transactions,
             ),
             samples,
-            || measure_durable_append(&records[..measured_entries], measured_entries, batch_items),
+            || {
+                measure_durable_append(
+                    bench_root,
+                    &records[..measured_entries],
+                    measured_entries,
+                    batch_items,
+                )
+            },
         );
     }
 }
 
 fn benchmark_station_transactions(
+    bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
     record_bytes: usize,
@@ -265,7 +295,7 @@ fn benchmark_station_transactions(
             transactions,
         ),
         samples,
-        || measure_count_station(entries, record_bytes, batch_items),
+        || measure_count_station(bench_root, entries, record_bytes, batch_items),
     );
     report_log(
         &LogCase::new(
@@ -275,7 +305,15 @@ fn benchmark_station_transactions(
             transactions,
         ),
         samples,
-        || measure_filter_station(entries, record_bytes, batch_items, FilterMode::PassThrough),
+        || {
+            measure_filter_station(
+                bench_root,
+                entries,
+                record_bytes,
+                batch_items,
+                FilterMode::PassThrough,
+            )
+        },
     );
     let projected = format!("station filter 50% project ({transactions} tx)");
     let decoded = format!("station filter 50% decode ({transactions} tx)");
@@ -288,6 +326,7 @@ fn benchmark_station_transactions(
         samples,
         |decode| {
             measure_filter_station(
+                bench_root,
                 entries,
                 record_bytes,
                 batch_items,
@@ -310,7 +349,7 @@ fn benchmark_station_transactions(
             steady_transactions,
         ),
         samples,
-        || measure_steady_window(entries, record_bytes, batch_items, gc_items),
+        || measure_steady_window(bench_root, entries, record_bytes, batch_items, gc_items),
     );
 
     for &reader_count in readers {
@@ -328,7 +367,7 @@ fn benchmark_station_transactions(
                 reader_transactions,
             ),
             samples,
-            || measure_readers(entries, record_bytes, batch_items, reader_count),
+            || measure_readers(bench_root, entries, record_bytes, batch_items, reader_count),
         );
     }
 
@@ -341,6 +380,6 @@ fn benchmark_station_transactions(
             gc_transactions,
         ),
         samples,
-        || measure_gc(entries, record_bytes, gc_items),
+        || measure_gc(bench_root, entries, record_bytes, gc_items),
     );
 }

@@ -307,8 +307,8 @@ cargo test -p dogpaddle-store --test correctness scan::
 模块验证旧只读 snapshot 与 writer 同时存在时保持稳定，并验证共享的读能力引用可在线程中独立
 开始 snapshot。写方法不可用、事务启动能力不可 clone、活动事务不能跨线程、不能恢复完整 handle
 且不能作为 `StoreData` 打开的静态边界由 Rustdoc compile-fail 测试锁定。测试目录所有权、模块
-职责和完整验证协议见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
+职责和完整验证协议见工作区
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 ## 性能
 
@@ -330,101 +330,8 @@ cargo bench -p dogpaddle-store --bench append_log_endurance
 按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
 设计结论见
 [`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/PERFORMANCE.md)。
-基准同时输出人类可读表格与 typed JSONL，并记录实际 rustc、CPU、OS/kernel、git 状态、
-文件系统和运行档位。共享 `dogpaddle-bench-protocol` 统一负责严格设置、环境指纹、机器记录、
-统计和配对顺序；Store support 只保留 root、样本路径和人类格式薄适配。`ordered_map` 与
-`append_log` 的 fixture、measure、oracle、report 已分别放入同名子目录，但仍各自只有一个 Cargo
-target。工作区协议见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)，Store 目录与 workload 见
-[`crates/store/TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/TESTING.md)。
-
-`cell` 独立覆盖同事务 warm get，以及每次读取、更新并 durable commit 的状态事务。
-`ordered_map` 为 `Small` 与 `Large` map 生成成对样本，覆盖 byte map 与业务类型 map 的批量写入、
-热点读取、升序与降序扫描、持久化覆盖写入、类似 Station 的多集合事务，以及存在多个 `Small`
-后台命名空间时的预热读取。扫描还单独覆盖固定宽度 `u64` 完整解码，以及 8 KiB value 的完整
-解码与单字段投影；后者以交错配对样本直接报告 projection 的收益。两种 map 使用各自独立的具名
-数据对象；byte map 的类型是 `OrderedMap<Vec<u8>, Vec<u8>, SIZE>`，不依赖私有裸句柄。可通过
-`DOGPADDLE_BENCH_ENTRIES`、`DOGPADDLE_BENCH_COMMITS`、`DOGPADDLE_BENCH_SAMPLES`、
-`DOGPADDLE_BENCH_BACKGROUND_NAMESPACES`、`DOGPADDLE_BENCH_SCAN_ITEMS`、
-`DOGPADDLE_BENCH_SCAN_BYTES` 与 `DOGPADDLE_BENCH_WIDE_SCAN_ENTRIES` 调整它。扫描页同时受
-item 和 byte limit 约束；默认 byte budget 为 4 MiB，所以 8 KiB wide workload 的实际页大小
-会先被 byte limit 限制。
-Cell 的读取次数由 `DOGPADDLE_BENCH_CELL_READS` 控制；commit 数与样本数复用
-`DOGPADDLE_BENCH_COMMITS` 和 `DOGPADDLE_BENCH_SAMPLES`。
-
-### `AppendLog` 场景基准
-
-`append_log` 使用 `[diff: i64][key: u64][payload]` 的 CDC 记录，配置的 record bytes 是包含
-16 字节头部在内的精确稳定编码大小。它不只测孤立 API，而是覆盖 Store 在差分 Station 中承担的
-实际工作：
-
-- 对 128 B、1 KiB 与 8 KiB 记录分别测试已编码值 append、业务 codec append、只投影 diff
-  的扫描和完整解码扫描；
-- 对同一批 typed value 成对交错测试逐条 `append` 与 `append_batch`，分别报告只计追加事务体
-  的 rollback workload 和包含一次 durable commit 的总耗时；
-- Source 按 1、64 与 1024 条一批开启事务、append 并 durable commit，显示提交摊销；
-- Count Station 在一个事务内从自己的 `Small OrderedMap<Vec<u8>, Vec<u8>>` 读取输入 cursor，
-  从 log 投影 diff，更新 `Cell<i64>`，推进 cursor 并提交；
-- 直通与 50% filter Station 在同一个事务内扫描输入、使用 `append_entry` 原样转发编码、推进
-  cursor 并提交；filter 同时对比 key 投影和完整值解码；
-- 一个共享 log 被 1 个或 4 个下游读取时，每个下游持有独立的 Station state map 与 cursor，并按
-  单线程调度顺序分别完成扫描、推进和提交；这里不会为 fan-out 复制多份输入；
-- prefix GC 按固定条数删除并提交；steady workload 先保留一个非空窗口，再交替 append 新批次和
-  回收等量旧前缀，用于观察非零 offset、长期页复用及分批提交的组合成本。
-
-每个会改变数据的样本都在所选 benchmark base 下使用新 Store，避免前一个样本的 tail、空闲页或
-文件尺寸污染后一个样本。资源创建、输入构造、预填充和结果校验均在计时外；需要反映完整事务的
-durable/production workload 把 begin、全部相关 Store 访问和 commit 一起计时。明确标为 rollback
-body 的配对场景只计追加 body，事务准备和回滚均在计时外。只读扫描复用已填充 Store，明确测
-warm-cache；每项先执行一次不计入结果的预热，再报告样本的最小值、中位数和最大值。
-
-`records/s` 表示该 workload 处理的逻辑记录数。`encoded MiB/s` 使用完整输入编码大小计算：多下游
-读取按 delivery 次数累计，filter 按检查的输入累计，GC 按回收的逻辑记录累计；它不是 MDBX 的
-物理写放大或磁盘带宽。
-
-默认配置可通过以下环境变量覆盖：
-
-- `DOGPADDLE_BENCH_LOG_ENTRIES`：宽度、Station、fan-out、GC 和 steady 样本的记录数，默认
-  10,000；
-- `DOGPADDLE_BENCH_COMMITS`：Source workload 最多执行的 commit 数，默认 1,000，避免 batch=1
-  遮蔽其余样本；
-- `DOGPADDLE_BENCH_SAMPLES`：计入统计的样本数，默认 9；
-- `DOGPADDLE_BENCH_LOG_RECORD_BYTES`：逗号分隔的记录宽度矩阵，默认 `128,1024,8192`；
-- `DOGPADDLE_BENCH_LOG_SOURCE_BATCH_ITEMS`：逗号分隔的 Source 批量矩阵，默认
-  `1,64,1024`；
-- `DOGPADDLE_BENCH_LOG_STATION_RECORD_BYTES`：事务场景使用的记录宽度，默认 1024；
-- `DOGPADDLE_BENCH_LOG_STATION_BATCH_ITEMS`：Station 与独立扫描的批量上限，默认 1024；
-- `DOGPADDLE_BENCH_LOG_GC_ITEMS`：每次 GC 最多删除的条目数，默认 1024；
-- `DOGPADDLE_BENCH_LOG_READERS`：逗号分隔的下游数量，默认 `1,4`。
-
-### `AppendLog` 长稳与空间复用基准
-
-`append_log_endurance` 是刻意与日常场景基准分开的长稳入口。对每种记录宽度，它先在计时外填满
-固定保留窗口，然后持续执行两次独立的 durable transaction：`append_batch` 一批，随后
-`truncate_before` 等量旧前缀。默认 `smoke` 档每种宽度累计 8 MiB、保留约 2 MiB；`full` 档维持
-原协议的每种宽度 1 GiB/64 MiB，并强制使用显式 reference 文件系统。因此它观察的是持续运行中
-的页复用和尾延迟，而不是无限增长日志的顺序写峰值。
-
-输出分别报告 append transaction 与 GC transaction 的 p50、p95、p99 和最大延迟、只累计这两类
-事务的协议吞吐、实际 wall time，以及 MDBX data file 的逻辑大小、文件系统已分配字节、峰值、相对
-保留 payload 的空间放大和后半程空间波动。逻辑大小可能包含稀疏区间，因此在 Unix 上空间判断应以
-已分配字节为主；非 Unix 平台无法读取 block allocation 时退化为逻辑文件大小。
-
-每个宽度结束后，基准会关闭事务环境、重新打开 Store、校验持久化的 `[head, tail)`，再逐条扫描整个
-保留窗口并验证 offset、diff、key、记录长度和 payload。校验不计入协议延迟。这个入口不设置依赖
-机器和文件系统的性能阈值；它提供可复现的测量与正确性断言，回归判定应在相同环境中对比。
-
-长稳 workload 可通过以下环境变量调整：
-
-- `DOGPADDLE_STORE_ENDURANCE_RECORD_BYTES`：逗号分隔的完整记录宽度，默认
-  `128,1024,8192`；
-- `DOGPADDLE_STORE_ENDURANCE_LOGICAL_MIB`、`_WINDOW_MIB`、`_BATCH_MIB` 与
-  `_CHECKPOINT_EPOCHS`：覆盖所选 workload 档位；
-- `DOGPADDLE_STORE_ENDURANCE_MAX_WORKING_SET_BYTES` 与 `_MAX_TOTAL_WRITTEN_BYTES`：创建
-  Store 前执行的硬预算。
-
-四套基准都使用 MDBX durable sync 和单线程执行。默认 `smoke` 可使用临时 base；正式回归必须设置
-`DOGPADDLE_STORE_BENCH_PROFILE=reference` 与绝对路径
-`DOGPADDLE_STORE_BENCH_STORE_DIR`。结果描述当前机器、文件系统与 warm-cache 条件下的 Store
-协议成本，不代表冷缓存、断电恢复、网络 CDC、Operation 动态分发或完整调度器的端到端吞吐。
-这些场景只用于测量 Store 数据结构，不规定 Flow 将来如何选择 batch、事务或调度策略。
+普通 target 覆盖各 collection 的独立与组合事务；`append_log_endurance` 单独观察长期前缀回收、
+页复用、尾延迟和实际文件占用。所有规模由 `smoke` 或 `reference` profile 固定，fixture、预热和
+结果 oracle 位于计时外。正式 reference 必须同时设置绝对路径 `DOGPADDLE_BENCH_ROOT`；机器记录、
+工作负载、统计口径与目录所有权见
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

@@ -1,152 +1,32 @@
 use std::{
-    cell::RefCell,
-    ffi::OsString,
     io::{self, Write},
+    num::NonZeroUsize,
     time::Duration,
 };
 
 use serde_json::Value;
 
 use super::*;
-use crate::environment::macos_filesystem_description;
-use crate::settings::{
-    parse_positive_usize, parse_positive_usize_list, parse_string, parse_string_list,
-};
+use crate::environment::{CommandOutput, macos_filesystem_description};
 
 #[test]
-fn cargo_profile_defaults_to_bench_and_tracks_an_explicit_name() {
-    let default = CargoProfile::parse(None).expect("default Cargo profile");
-    assert_eq!(default.name(), "bench");
-    assert_eq!(default.source(), CargoProfileSource::Default);
-
-    let explicit =
-        CargoProfile::parse(Some(OsString::from("release-lto"))).expect("explicit Cargo profile");
-    assert_eq!(explicit.name(), "release-lto");
-    assert_eq!(explicit.source(), CargoProfileSource::Environment);
-}
-
-#[test]
-fn cargo_profile_rejects_ambiguous_names() {
-    for value in ["", " bench", "bench ", "ben\nch"] {
-        assert!(
-            CargoProfile::parse(Some(OsString::from(value))).is_err(),
-            "profile {value:?} must be rejected"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn cargo_profile_rejects_non_unicode() {
-    use std::os::unix::ffi::OsStringExt;
-
-    let value = OsString::from_vec(vec![0xff]);
-    assert!(matches!(
-        CargoProfile::parse(Some(value)),
-        Err(EnvError::NotUnicode { .. })
-    ));
-}
-
-#[test]
-fn benchmark_profile_is_a_strict_two_value_protocol() {
-    assert_eq!(
-        BenchmarkProfile::parse("PROFILE", None).expect("default profile"),
-        BenchmarkProfile::Smoke
-    );
-    assert_eq!(
-        BenchmarkProfile::parse("PROFILE", Some(OsString::from("reference")))
-            .expect("reference profile"),
-        BenchmarkProfile::Reference
-    );
-    assert!(matches!(
-        BenchmarkProfile::parse("PROFILE", Some(OsString::from("full"))),
-        Err(EnvError::InvalidProfile { .. })
-    ));
-}
-
-#[test]
-fn positive_settings_reject_zero_signs_and_noncanonical_decimals() {
-    assert_eq!(
-        parse_positive_usize("ROWS", None, 64).expect("default rows"),
-        64
-    );
-    assert_eq!(
-        parse_positive_usize("ROWS", Some(OsString::from("1024")), 64).expect("configured rows"),
-        1_024
-    );
-    for value in ["0", "+1", "-1", "01", " 1", "1 ", "1.0"] {
-        assert!(
-            parse_positive_usize("ROWS", Some(OsString::from(value)), 64).is_err(),
-            "setting {value:?} must be rejected"
-        );
-    }
-    assert!(parse_positive_usize("ROWS", None, 0).is_err());
-}
-
-#[test]
-fn scalar_strings_are_strict_and_lists_reject_duplicate_dimensions() {
-    assert_eq!(
-        parse_string("PROFILE", None, "smoke").expect("default string"),
-        "smoke"
-    );
-    assert_eq!(
-        parse_string("PROFILE", Some(OsString::from("full")), "smoke").expect("configured string"),
-        "full"
-    );
-    for value in ["", " full", "full ", "fu\nll"] {
-        assert!(parse_string("PROFILE", Some(OsString::from(value)), "smoke").is_err());
-    }
-    assert!(parse_string("PROFILE", None, " bad").is_err());
-    assert!(matches!(
-        parse_positive_usize_list("ROWS", Some(OsString::from("1,2,1")), &[7]),
-        Err(EnvError::DuplicateListItem { index: 2, .. })
-    ));
-    assert!(matches!(
-        parse_string_list(
-            "WORKLOADS",
-            Some(OsString::from("narrow,nested,narrow")),
-            &["default"],
-        ),
-        Err(EnvError::DuplicateListItem { index: 2, .. })
-    ));
-}
-
-#[test]
-fn list_settings_trim_items_but_never_discard_empty_items() {
-    assert_eq!(
-        parse_positive_usize_list("ROWS", Some(OsString::from("1, 64,1024")), &[7])
-            .expect("integer list"),
-        [1, 64, 1_024]
-    );
-    assert!(parse_positive_usize_list("ROWS", Some(OsString::from("1,,2")), &[7]).is_err());
-    assert!(parse_positive_usize_list("ROWS", Some(OsString::from("1,0")), &[7]).is_err());
-    assert!(parse_positive_usize_list("ROWS", None, &[]).is_err());
-
-    assert_eq!(
-        parse_string_list(
-            "WORKLOADS",
-            Some(OsString::from("narrow, nested")),
-            &["default"],
-        )
-        .expect("string list"),
-        ["narrow", "nested"]
-    );
-    assert!(parse_string_list("WORKLOADS", Some(OsString::from("narrow,")), &["default"]).is_err());
+fn benchmark_profiles_have_stable_protocol_names() {
+    assert_eq!(BenchmarkProfile::Smoke.as_str(), "smoke");
+    assert_eq!(BenchmarkProfile::Reference.as_str(), "reference");
 }
 
 #[test]
 fn command_output_distinguishes_success_from_unavailability() {
     let rustc = CommandOutput::capture("rustc", &["--version"]);
     assert!(rustc.is_available());
-    assert!(
-        rustc
-            .value()
-            .is_some_and(|value| value.starts_with("rustc "))
-    );
+    assert!(matches!(
+        rustc,
+        CommandOutput::Available(value) if value.starts_with("rustc ")
+    ));
 
     let missing = CommandOutput::capture("dogpaddle-command-that-does-not-exist", &["--version"]);
     assert!(!missing.is_available());
-    assert_eq!(missing.value(), None);
+    assert!(matches!(missing, CommandOutput::Unavailable(_)));
 }
 
 #[test]
@@ -163,8 +43,13 @@ fn macos_filesystem_probe_combines_mount_type_and_device() {
 #[test]
 fn host_environment_serializes_every_required_reproducibility_field() {
     let host = HostEnvironment::collect(None).expect("collect host environment");
-    let record = EnvironmentRecord::new("protocol_test", host, Fields::new())
-        .expect("construct environment record");
+    let record = EnvironmentRecord::new(
+        "protocol_test",
+        BenchmarkProfile::Smoke,
+        host,
+        Fields::new(),
+    )
+    .expect("construct environment record");
     let value = emit_one(&record);
     for field in [
         "record",
@@ -213,6 +98,14 @@ fn fields_reject_invalid_duplicate_and_protocol_owned_names() {
         SampleRecord::new("bench", "case", 0, Duration::from_nanos(1), collision),
         Err(RecordError::ReservedField(field)) if field == "elapsed_ns"
     ));
+
+    let collision = Fields::new()
+        .with("expected_data_records", 2)
+        .expect("valid extension field before envelope validation");
+    assert!(matches!(
+        ConfigurationRecord::new("bench", NonZeroUsize::new(1).unwrap(), collision),
+        Err(RecordError::ReservedField(field)) if field == "expected_data_records"
+    ));
 }
 
 #[test]
@@ -248,12 +141,20 @@ fn typed_records_emit_compact_single_line_json() {
 fn configuration_summary_and_pair_records_keep_stable_core_fields() {
     let configuration = ConfigurationRecord::new(
         "store_append_log",
+        NonZeroUsize::new(19).unwrap(),
         Fields::new()
             .with("samples", 9)
             .expect("configuration samples"),
     )
     .expect("configuration record");
-    assert_eq!(emit_one(&configuration)["record"], "configuration");
+    let value = emit_one(&configuration);
+    assert_eq!(value["record"], "configuration");
+    assert_eq!(value["expected_data_records"], 19);
+
+    let completion = CompletionRecord::new("store_append_log").expect("completion record");
+    let value = emit_one(&completion);
+    assert_eq!(value["record"], "completion");
+    assert_eq!(value["benchmark"], "store_append_log");
 
     let samples = [
         Duration::from_nanos(30),
@@ -317,6 +218,7 @@ fn extension_records_preserve_stable_uncommon_discriminators() {
         "sample",
         "summary",
         "pair_summary",
+        "completion",
     ] {
         assert!(matches!(
             ExtensionRecord::new(reserved, "benchmark", Fields::new()),
@@ -335,7 +237,6 @@ fn duration_statistics_preserve_standard_and_endurance_median_conventions() {
     ];
     let original = samples;
     let summary = DurationSummary::from_samples(&samples).expect("duration summary");
-    assert_eq!(summary.samples(), 4);
     assert_eq!(summary.min(), Duration::from_nanos(10));
     assert_eq!(summary.median(), Duration::from_nanos(30));
     assert_eq!(summary.max(), Duration::from_nanos(40));
@@ -346,15 +247,6 @@ fn duration_statistics_preserve_standard_and_endurance_median_conventions() {
     assert_eq!(latency.p95(), Duration::from_nanos(40));
     assert_eq!(latency.p99(), Duration::from_nanos(40));
     assert_eq!(latency.max(), Duration::from_nanos(40));
-    assert_eq!(
-        duration_percentile(&samples, 25).expect("p25"),
-        Duration::from_nanos(10)
-    );
-    assert_eq!(
-        duration_percentile(&samples, 100).expect("p100"),
-        Duration::from_nanos(40)
-    );
-    assert!(duration_percentile(&samples, 0).is_err());
     assert!(DurationSummary::from_samples(&[]).is_err());
 }
 
@@ -371,7 +263,6 @@ fn paired_statistics_reject_invalid_pairs_and_report_semantic_wins() {
         Duration::from_nanos(10),
     ];
     let summary = PairedDurationSummary::from_pairs(&first, &second).expect("paired summary");
-    assert_eq!(summary.samples(), 3);
     assert!((summary.median_first_over_second() - 2.0).abs() < f64::EPSILON);
     assert_eq!(summary.second_wins(), 2);
     assert!(PairedDurationSummary::from_pairs(&first, &second[..2]).is_err());
@@ -411,27 +302,6 @@ fn pair_schedules_are_explicit_and_measurements_remain_semantically_ordered() {
         ]
     );
 
-    let calls = RefCell::new(Vec::new());
-    let measured = measure_pair(
-        PairOrder::Ba,
-        || {
-            calls.borrow_mut().push('A');
-            1
-        },
-        || {
-            calls.borrow_mut().push('B');
-            2
-        },
-    );
-    assert_eq!(*calls.borrow(), ['B', 'A']);
-    assert_eq!(
-        measured,
-        PairMeasurements {
-            first: 1,
-            second: 2
-        }
-    );
-
     let mut calls = Vec::new();
     let measured = measure_pair_with(PairOrder::Ba, |variant| {
         calls.push(variant);
@@ -452,7 +322,8 @@ fn pair_schedules_are_explicit_and_measurements_remain_semantically_ordered() {
 
 #[test]
 fn jsonl_writer_surfaces_destination_failures() {
-    let record = ConfigurationRecord::new("failure", Fields::new()).expect("configuration record");
+    let record = ConfigurationRecord::new("failure", NonZeroUsize::new(1).unwrap(), Fields::new())
+        .expect("configuration record");
     let mut writer = JsonlWriter::new(FailingWriter);
     assert!(matches!(
         writer.write(&record),

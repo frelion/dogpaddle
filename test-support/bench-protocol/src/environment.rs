@@ -9,8 +9,6 @@ use std::{
 
 use serde::{Serialize, Serializer};
 
-use crate::{CargoProfile, CargoProfileSource, EnvError};
-
 /// Captured output from an optional host command or platform probe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
@@ -44,15 +42,6 @@ impl CommandOutput {
                 Ok(stdout) => Self::Available(stdout.trim().to_owned()),
                 Err(error) => Self::Unavailable(format!("command output is not Unicode: {error}")),
             },
-        }
-    }
-
-    /// Returns the successful command output, if available.
-    #[must_use]
-    pub fn value(&self) -> Option<&str> {
-        match self {
-            Self::Available(value) => Some(value),
-            Self::Unavailable(_) => None,
         }
     }
 
@@ -103,8 +92,8 @@ pub enum GitState {
 /// Reproducibility metadata shared by all benchmark environment records.
 #[derive(Clone, Debug, Serialize)]
 pub struct HostEnvironment {
-    cargo_profile: String,
-    cargo_profile_source: CargoProfileSource,
+    cargo_profile: &'static str,
+    cargo_profile_source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     filesystem_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,69 +115,18 @@ impl HostEnvironment {
     /// `filesystem_path`.
     ///
     /// Informational command failures are retained as `unavailable: ...` values.
-    /// This method fails only for a malformed Cargo profile environment variable
-    /// or a system clock before the Unix epoch.
+    /// This method fails only for a system clock before the Unix epoch.
     ///
     /// # Errors
     ///
-    /// Returns [`EnvironmentCollectionError`] when strict Cargo-profile parsing
-    /// fails or the current system time precedes the Unix epoch.
+    /// Returns [`EnvironmentCollectionError`] when the current system time
+    /// precedes the Unix epoch.
     pub fn collect(filesystem_path: Option<&Path>) -> Result<Self, EnvironmentCollectionError> {
-        let cargo_profile = CargoProfile::from_environment()?;
-        Self::collect_with(filesystem_path, &cargo_profile, SystemTime::now())
-    }
-
-    /// Returns the recorded Cargo profile name.
-    #[must_use]
-    pub fn cargo_profile(&self) -> &str {
-        &self.cargo_profile
-    }
-
-    /// Returns where the recorded Cargo profile name came from.
-    #[must_use]
-    pub const fn cargo_profile_source(&self) -> CargoProfileSource {
-        self.cargo_profile_source
-    }
-
-    /// Returns the recorded filesystem path, when one was requested.
-    #[must_use]
-    pub fn filesystem_path(&self) -> Option<&Path> {
-        self.filesystem_path.as_deref().map(Path::new)
-    }
-
-    /// Returns the filesystem probe, when a filesystem path was requested.
-    #[must_use]
-    pub const fn filesystem(&self) -> Option<&CommandOutput> {
-        self.filesystem.as_ref()
-    }
-
-    /// Returns the rustc version probe.
-    #[must_use]
-    pub const fn rustc(&self) -> &CommandOutput {
-        &self.rustc
-    }
-
-    /// Returns the CPU description probe.
-    #[must_use]
-    pub const fn cpu(&self) -> &CommandOutput {
-        &self.cpu
-    }
-
-    /// Returns the git revision probe.
-    #[must_use]
-    pub const fn git_revision(&self) -> &CommandOutput {
-        &self.git_revision
-    }
-
-    /// Returns the git working-tree state.
-    #[must_use]
-    pub const fn git_state(&self) -> GitState {
-        self.git_state
+        Self::collect_with(filesystem_path, SystemTime::now())
     }
 
     fn collect_with(
         filesystem_path: Option<&Path>,
-        cargo_profile: &CargoProfile,
         now: SystemTime,
     ) -> Result<Self, EnvironmentCollectionError> {
         let rustc_program = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
@@ -208,8 +146,8 @@ impl HostEnvironment {
             .map_err(|_| EnvironmentCollectionError::ClockBeforeUnixEpoch)?
             .as_secs();
         Ok(Self {
-            cargo_profile: cargo_profile.name().to_owned(),
-            cargo_profile_source: cargo_profile.source(),
+            cargo_profile: "bench",
+            cargo_profile_source: "default",
             filesystem_path,
             filesystem,
             os: env::consts::OS,
@@ -229,8 +167,6 @@ impl HostEnvironment {
 /// Failure to collect required benchmark environment metadata.
 #[derive(Debug)]
 pub enum EnvironmentCollectionError {
-    /// Strict Cargo profile parsing failed.
-    Environment(EnvError),
     /// The system clock is before the Unix epoch.
     ClockBeforeUnixEpoch,
 }
@@ -238,7 +174,6 @@ pub enum EnvironmentCollectionError {
 impl fmt::Display for EnvironmentCollectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Environment(error) => error.fmt(formatter),
             Self::ClockBeforeUnixEpoch => {
                 formatter.write_str("system clock is before the Unix epoch")
             }
@@ -249,15 +184,8 @@ impl fmt::Display for EnvironmentCollectionError {
 impl std::error::Error for EnvironmentCollectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Environment(error) => Some(error),
             Self::ClockBeforeUnixEpoch => None,
         }
-    }
-}
-
-impl From<EnvError> for EnvironmentCollectionError {
-    fn from(error: EnvError) -> Self {
-        Self::Environment(error)
     }
 }
 

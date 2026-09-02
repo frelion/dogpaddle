@@ -1,17 +1,18 @@
 //! Hot-access and durable-update scenarios for `Cell`.
 
-use std::{hint::black_box, time::Duration};
+use std::{hint::black_box, num::NonZeroUsize, time::Duration};
 
 use dogpaddle_bench_protocol::{
-    ConfigurationRecord, DurationSummary, Fields, SampleRecord, SummaryRecord, positive_usize,
+    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord, SummaryRecord,
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 use tempfile::TempDir;
 
 mod support;
 
-use support::{average_duration, format_duration, initialize, sample_dir, write_record};
+use support::{BenchRoot, average_duration, complete, format_duration, initialize, write_record};
 
+const BENCHMARK: &str = "cell";
 const DEFAULT_READS: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
@@ -23,6 +24,13 @@ struct Fixture {
 }
 
 #[derive(Clone, Copy)]
+struct Config {
+    reads: usize,
+    commits: usize,
+    samples: usize,
+}
+
+#[derive(Clone, Copy)]
 struct SampleWork {
     operations: usize,
     transactions: usize,
@@ -30,8 +38,8 @@ struct SampleWork {
 }
 
 impl Fixture {
-    fn populated() -> Self {
-        let root = sample_dir("cell");
+    fn populated(bench_root: &BenchRoot) -> Self {
+        let root = bench_root.sample("cell");
         let mut store =
             Store::create(root.path().join("store")).expect("create cell benchmark store");
         let cell = store
@@ -57,22 +65,38 @@ impl Fixture {
     }
 }
 
-fn main() {
-    let _bench_root = initialize("store_cell");
+impl Config {
+    const fn for_profile(profile: BenchmarkProfile) -> Self {
+        match profile {
+            BenchmarkProfile::Smoke => Self {
+                reads: 1,
+                commits: 1,
+                samples: 1,
+            },
+            BenchmarkProfile::Reference => Self {
+                reads: DEFAULT_READS,
+                commits: DEFAULT_COMMITS,
+                samples: DEFAULT_SAMPLES,
+            },
+        }
+    }
+}
 
-    let reads =
-        positive_usize("DOGPADDLE_BENCH_CELL_READS", DEFAULT_READS).expect("parse Cell read count");
-    let commits = positive_usize("DOGPADDLE_BENCH_COMMITS", DEFAULT_COMMITS)
-        .expect("parse Cell commit count");
-    let samples = positive_usize("DOGPADDLE_BENCH_SAMPLES", DEFAULT_SAMPLES)
-        .expect("parse Cell sample count");
+fn main() {
+    let bench_root = initialize(BENCHMARK);
+    let Config {
+        reads,
+        commits,
+        samples,
+    } = Config::for_profile(bench_root.profile());
     let mut fields = Fields::new();
     for (name, value) in [("reads", reads), ("commits", commits), ("samples", samples)] {
         fields
             .insert(name, value)
             .expect("construct Cell configuration fields");
     }
-    let record = ConfigurationRecord::new("store_cell", fields)
+    let expected_data_records = NonZeroUsize::new(2 * (samples + 1)).unwrap();
+    let record = ConfigurationRecord::new(BENCHMARK, expected_data_records, fields)
         .expect("construct Cell configuration record");
     write_record(&record);
 
@@ -87,7 +111,7 @@ fn main() {
         "workload", "operations", "min", "median", "max", "median/op", "median ops/s"
     );
 
-    let mut fixture = Fixture::populated();
+    let mut fixture = Fixture::populated(&bench_root);
     report(
         "hot get, one tx",
         SampleWork {
@@ -108,10 +132,11 @@ fn main() {
         },
         samples,
         || {
-            let mut fixture = Fixture::populated();
+            let mut fixture = Fixture::populated(&bench_root);
             measure_updates(&mut fixture, commits)
         },
     );
+    complete(BENCHMARK);
 }
 
 fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
@@ -184,7 +209,7 @@ fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl Fn
     let durations = (0..samples).map(|_| measure()).collect::<Vec<_>>();
     for (sample, elapsed) in durations.iter().copied().enumerate() {
         let record = SampleRecord::new(
-            "store_cell",
+            BENCHMARK,
             workload,
             sample,
             elapsed,
@@ -194,7 +219,7 @@ fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl Fn
         write_record(&record);
     }
     let summary = DurationSummary::from_samples(&durations).expect("summarize Cell measurements");
-    let record = SummaryRecord::new("store_cell", workload, summary, measurement_fields(work))
+    let record = SummaryRecord::new(BENCHMARK, workload, summary, measurement_fields(work))
         .expect("construct Cell summary record");
     write_record(&record);
     let rate = work.operations as u128 * 1_000_000_000 / summary.median().as_nanos();

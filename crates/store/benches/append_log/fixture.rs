@@ -5,7 +5,7 @@ use dogpaddle_store::{
 };
 use tempfile::TempDir;
 
-use crate::{CURSOR_KEY, RECORD_HEADER_BYTES, SEED_BATCH_ITEMS, support::sample_dir};
+use crate::{CURSOR_KEY, RECORD_HEADER_BYTES, SEED_BATCH_ITEMS, support::BenchRoot};
 
 pub(super) type StationState = OrderedMap<Vec<u8>, Vec<u8>, Small>;
 
@@ -77,8 +77,13 @@ impl StoreValue for CdcRecord {
 }
 
 impl LogFixture {
-    pub(super) fn populated(entries: usize, record_bytes: usize, readers: usize) -> Self {
-        let root = sample_dir("append-log-fixture");
+    pub(super) fn populated(
+        bench_root: &BenchRoot,
+        entries: usize,
+        record_bytes: usize,
+        readers: usize,
+    ) -> Self {
+        let root = bench_root.sample("append-log-fixture");
         let mut store =
             Store::create(root.path().join("store")).expect("create append-log benchmark store");
         let input = store

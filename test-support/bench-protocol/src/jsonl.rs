@@ -1,4 +1,4 @@
-use std::{fmt, io::Write, time::Duration};
+use std::{fmt, io::Write, num::NonZeroUsize, time::Duration};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -60,18 +60,6 @@ impl Fields {
         Ok(self)
     }
 
-    /// Returns the number of extension fields.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns whether there are no extension fields.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     fn into_record_fields(
         self,
         reserved: &'static [&'static str],
@@ -121,8 +109,7 @@ impl std::error::Error for FieldError {
 pub struct EnvironmentRecord {
     record: &'static str,
     benchmark: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile: Option<BenchmarkProfile>,
+    profile: BenchmarkProfile,
     #[serde(flatten)]
     host: HostEnvironment,
     #[serde(flatten)]
@@ -130,7 +117,7 @@ pub struct EnvironmentRecord {
 }
 
 impl EnvironmentRecord {
-    /// Creates an environment record without a smoke/reference profile.
+    /// Creates an environment record with an explicit smoke/reference profile.
     ///
     /// # Errors
     ///
@@ -138,33 +125,11 @@ impl EnvironmentRecord {
     /// with protocol-owned environment keys.
     pub fn new(
         benchmark: impl Into<String>,
-        host: HostEnvironment,
-        fields: Fields,
-    ) -> Result<Self, RecordError> {
-        Self::build(benchmark.into(), None, host, fields)
-    }
-
-    /// Creates an environment record with an explicit smoke/reference profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecordError`] for an invalid benchmark name or fields colliding
-    /// with protocol-owned environment keys.
-    pub fn for_profile(
-        benchmark: impl Into<String>,
         profile: BenchmarkProfile,
         host: HostEnvironment,
         fields: Fields,
     ) -> Result<Self, RecordError> {
-        Self::build(benchmark.into(), Some(profile), host, fields)
-    }
-
-    fn build(
-        benchmark: String,
-        profile: Option<BenchmarkProfile>,
-        host: HostEnvironment,
-        fields: Fields,
-    ) -> Result<Self, RecordError> {
+        let benchmark = benchmark.into();
         validate_label("benchmark", &benchmark)?;
         let fields = fields.into_record_fields(&[
             "benchmark",
@@ -202,30 +167,67 @@ impl BenchmarkRecord for EnvironmentRecord {}
 pub struct ConfigurationRecord {
     record: &'static str,
     benchmark: String,
+    expected_data_records: NonZeroUsize,
     #[serde(flatten)]
     fields: Map<String, Value>,
 }
 
 impl ConfigurationRecord {
-    /// Creates a configuration record.
+    /// Creates a configuration record with the exact number of data records
+    /// that must follow it before completion.
     ///
     /// # Errors
     ///
-    /// Returns [`RecordError`] for an invalid benchmark name or a benchmark field
-    /// named `benchmark`.
-    pub fn new(benchmark: impl Into<String>, fields: Fields) -> Result<Self, RecordError> {
+    /// Returns [`RecordError`] for an invalid benchmark name or a field named
+    /// `benchmark` or `expected_data_records`.
+    pub fn new(
+        benchmark: impl Into<String>,
+        expected_data_records: NonZeroUsize,
+        fields: Fields,
+    ) -> Result<Self, RecordError> {
         let benchmark = benchmark.into();
         validate_label("benchmark", &benchmark)?;
         Ok(Self {
             record: "configuration",
             benchmark,
-            fields: fields.into_record_fields(&["benchmark"])?,
+            expected_data_records,
+            fields: fields.into_record_fields(&["benchmark", "expected_data_records"])?,
         })
     }
 }
 
 impl sealed::Sealed for ConfigurationRecord {}
 impl BenchmarkRecord for ConfigurationRecord {}
+
+/// Marks successful completion of one benchmark target.
+///
+/// A target emits this record exactly once, after all samples, summaries, and
+/// human-readable output. Consumers can therefore distinguish a complete run
+/// from a process that exited successfully before executing its full tail.
+#[derive(Debug, Serialize)]
+pub struct CompletionRecord {
+    record: &'static str,
+    benchmark: String,
+}
+
+impl CompletionRecord {
+    /// Creates a target completion record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError`] for an invalid benchmark label.
+    pub fn new(benchmark: impl Into<String>) -> Result<Self, RecordError> {
+        let benchmark = benchmark.into();
+        validate_label("benchmark", &benchmark)?;
+        Ok(Self {
+            record: "completion",
+            benchmark,
+        })
+    }
+}
+
+impl sealed::Sealed for CompletionRecord {}
+impl BenchmarkRecord for CompletionRecord {}
 
 /// A typed raw duration sample JSONL record.
 #[derive(Debug, Serialize)]
@@ -420,7 +422,7 @@ impl ExtensionRecord {
         validate_discriminator(&record)?;
         if matches!(
             record.as_str(),
-            "environment" | "configuration" | "sample" | "summary" | "pair_summary"
+            "environment" | "configuration" | "sample" | "summary" | "pair_summary" | "completion"
         ) {
             return Err(RecordError::ReservedDiscriminator(record));
         }

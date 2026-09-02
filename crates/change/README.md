@@ -130,9 +130,9 @@ cargo bench -p dogpaddle-change --bench change_core
 cargo bench -p dogpaddle-change --bench change_codec
 ```
 
-正确性分层、fixture 所有权和负向测试口径见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/crates/change/TESTING.md)，Change 单体
-benchmark 的 workload、环境变量与结果解释见
+正确性分层、fixture 所有权和负向测试口径见工作区
+[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)，Change 单体 benchmark
+的 workload 与结果解释见
 [`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/change/PERFORMANCE.md)。真实
 `Change + AppendLog<Vec<u8>>` 正确性和性能属于工作区下游
 `integration-tests/change-store/`，不由本 crate 的测试依赖 Store。

@@ -270,6 +270,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -337,6 +338,9 @@ dependencies = [
 [[package]]
 name = "dogpaddle-xtask"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "either"
