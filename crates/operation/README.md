@@ -17,7 +17,8 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
 独立定义的窗口、barrier 或 flush 信号，Operation 的展平输出事件序列和最终业务状态必须在稳定
 合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Commit` turn 而改变；物理
-Change 边界和 turn 边界都不能被算子当成业务事件。
+Change 边界和 turn 边界都不能被算子当成业务事件。这个比较域要求每种分批的输入和对应输出都能
+由其声明的 Arrow 类型物理表示；例如不能要求 `Utf8` offset 已溢出的单个 `RecordBatch` 成功构造。
 
 ## Schema 绑定
 
@@ -36,8 +37,42 @@ Sink 必须没有 output。一个 Definition 可以在不同 Flow 中绑定不�
 materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceSource` 固定
 输出 `{ value: UInt64 non-null }`；Count 接受任意合法的单一输入并固定输出
 `{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
-并以选中字段的完整 Schema 作为 output；Discard 接受任意合法的单一输入且没有 output。无需额外的
+并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
+Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Discard 接受任意合法的单一输入且没有 output。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
+
+Filter 与 Extend 共用 crate 根级的 [`Expression`]。它是 opaque 的线性后序程序，
+而不是公开递归 AST：持久化解码、Schema bind、求值和释放都不随表达式深度递归。当前稳定语言只包含
+顶层 `u32` 字段索引、`Boolean/Int64/UInt64/Utf8` 类型化 nullable literal、`Not/IsNull` 以及
+`Equal/NotEqual/And/Or`。字段本身可以是任意合法 `DogPaddle` Arrow 类型，所以 Extend 可以直接复制
+List、Struct 等完整列，`IsNull` 也能检查任意列；`Equal/NotEqual` 只接受两边精确同型的上述四种
+scalar，`And/Or/Not` 只接受 Boolean。不存在 untyped null、隐式 cast、字段名晚绑定、closure 或字符串
+DSL。普通运算传播 null，Boolean 组合采用 SQL/Kleene 三值逻辑，`IsNull` 固定产生 non-null Boolean。
+
+Expression 的 Definition 编码固定为 big-endian `u32 node_count + postfix nodes`，node、literal、
+unary 和 binary operator 都有显式稳定 tag；decoder 在分配前用每节点最小编码长度和剩余 payload
+约束 node count，只随实际已解码节点增长，并迭代校验操作数栈、canonical Boolean、UTF-8、截断和尾随。
+绑定还把同时存活的 evaluation value stack 限制为公开的 [`MAX_EXPRESSION_STACK_DEPTH`]（当前为 64），而不限制
+线性程序的总节点数或 unary-chain 深度；这让深 unary 程序保持迭代可用，同时静态封住宽表达式的批量内存放大。
+绑定结果保存 exact input Schema 与 private typed plan，但两者不持久化；运行时求值前
+再次核对完整 Schema，因而直接调用运行 Operation 也不能把同一个字段索引解释为漂移后的类型。
+运行时 literal 保持为借用 scalar，比较和 Boolean 运算直接处理 scalar/array 组合，不先复制成整列；
+只有最终 output 本身是 scalar 时才按输入行数物化对应 Arrow Array。
+
+```rust
+use dogpaddle_operation::{BinaryOperator, Expression, Literal};
+use dogpaddle_operation::operation::transform::{ExtendDefinition, FilterDefinition};
+
+let is_seven = Expression::binary(
+    BinaryOperator::Equal,
+    Expression::column(0),
+    Expression::literal(Literal::UInt64(Some(7))),
+);
+let extend = ExtendDefinition::new("is_seven", is_seven.clone());
+let filter = FilterDefinition::new(is_seven);
+assert_eq!(extend.field_name(), "is_seven");
+assert_eq!(filter.predicate(), extend.expression());
+```
 
 运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 与其他
 Operation 走同一个调用协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed
@@ -51,7 +86,8 @@ offset 和逐字节相同的完整 Change。零输入 Source 也用 `Commit` 表
 output Change；filter 或 Sink 可以使用 `None`。
 跨 turn continuation 必须放在 Operation 自己通过 Definition 声明的持久化 Store 状态中，不能
 隐藏在 Station。具体错误统一擦除为标准 boxed [`operation::OperationError`]：算子语义错误保留
-具体算子错误类型，Store、Arrow 和 Change 等基础错误保留原始类型，均可按具体类型 downcast。
+具体算子错误类型；具体错误可以透明包装 Expression、Store、Arrow 或 Change source，调用方可以
+downcast 顶层算子错误并沿标准 error source chain 检查基础原因。
 由于 `Idle`、错误、Station output 容量拒绝或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
 Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂等提交协议，当前尚未定义。
 
@@ -66,7 +102,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count 和 Project，`sink` 包含
+的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count、Project、Filter 和 Extend，`sink` 包含
 Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
@@ -164,6 +200,33 @@ Schema bind 接受任意合法的精确单一输入，并固定完整 output Sch
 索引数量和每个索引使用稳定 big-endian `u32` 编码，tag/payload 与 input Schema 一起决定 reopen 后
 重建的精确 output Schema。
 
+## `operation::transform::Filter`
+
+[`operation::transform::FilterDefinition`] 要求一个输入并持久化一个 [`Expression`] predicate。
+Schema bind 把表达式编译到精确 input Schema；最终类型不是 Boolean、字段越界或 operand 类型不兼容
+都会在 Flow 创建 Store 前以结构化 [`operation::transform::FilterSchemaError`] 拒绝。output Schema
+与 input 完全相同。
+
+[`operation::transform::FilterOperation`] 不声明 Store data。每个 turn 只保留 predicate 为 non-null
+`true` 的行；`false` 和 null 都删除，同一个 Arrow filter predicate 同时筛选 records 与 diff，因而
+相对事件顺序和每个保留事件的 diff 不变。没有行被选中时返回 `Action::Complete(None)`，因为空
+Change 不可表示；全部选中时直接 clone Change 并共享全部 buffer。部分筛选前只把可能的第三方 Arrow
+Array wrapper 通过 `to_data/make_array` 规范为标准 Array class（底层 buffer 仍共享），避免 Arrow
+kernel 对自定义 concrete type panic，随后才进行一次向量筛选。
+
+## `operation::transform::Extend`
+
+[`operation::transform::ExtendDefinition`] 要求一个输入，并只持久化 `field_name + Expression`。
+Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability；调用者不重复声明 Field/type，避免两套
+真相。output 依次保留所有 input `FieldRef` 与 Schema metadata，再追加一个 metadata 为空的新 Field；
+重复名称、`$dogpaddle.` 保留名称和非法派生 Schema 仍由统一 output Schema 校验拒绝。一次只追加一列，
+多列通过串联多个 Extend 明确表达，不引入同一算子内部的列依赖顺序。
+
+[`operation::transform::ExtendOperation`] 不声明 Store data，只保存 exact-Schema-bound private plan 和
+最终 output Schema。每个 turn 共享全部 input `ArrayRef` 与 diff buffer，只为真正计算出的列分配数据；
+若表达式只是 Column，新列本身也与源列共享同一 ArrayRef。结果保持行序并返回
+`Action::Complete(Some(_))`。
+
 ## `operation::sink::Discard`
 
 [`operation::sink::DiscardDefinition`] 显式声明为携带一个输入的 [`OperationKind::Sink`]，
@@ -241,10 +304,14 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖四个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
-以及 Project 对合法但不兼容 Schema 的结构化拒绝；runtime trace 统一覆盖完整 turn、commit、rollback、
-reopen、极值错误不改状态、固定 output Schema/diff、Project 零拷贝和 Store 错误透明
-传播。完整目录所有权、测试矩阵和 fixture 规则见工作区
+Schema 测试覆盖六个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+以及 Project、Filter、Extend 对合法但不兼容 Schema 的结构化拒绝；runtime trace 统一覆盖完整 turn、
+commit、rollback、reopen、固定 output Schema/diff、Project/Extend 零拷贝、Filter 的空/全量选择及覆盖
+Null/bitmap/fixed/variable/List/Struct 全部 v1 layout family 的部分选择、
+完整 Kleene truth table、四种 scalar/array 双向 equality 与 null 传播、value-stack 静态上界、超过
+旧 1024 深度的迭代执行、携带混合 diff 的稳定重批和 Store 错误。Expression golden
+会经过 `decode → bind → materialize → turn` 检查 tag 到执行语义，而不仅是重编码。完整目录所有权、
+测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务

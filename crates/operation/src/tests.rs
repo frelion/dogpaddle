@@ -4,8 +4,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DataInstances, Expression, Literal, MaterializeError, OperationBindError,
+    OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::DECODERS,
     definition::{DataName, Sealed},
     operation::{
@@ -13,7 +13,7 @@ use crate::{
         sink::DiscardDefinition,
         sink::DiscardOperation,
         source::SequenceSourceDefinition,
-        transform::{CountDefinition, ProjectDefinition},
+        transform::{CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition},
     },
 };
 
@@ -75,11 +75,15 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 4] {
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 6] {
     [
         Box::new(SequenceSourceDefinition::new(0)),
         Box::new(CountDefinition::new()),
         Box::new(ProjectDefinition::new([0])),
+        Box::new(FilterDefinition::new(Expression::literal(
+            Literal::Boolean(Some(true)),
+        ))),
+        Box::new(ExtendDefinition::new("copy", Expression::column(0))),
         Box::new(DiscardDefinition::new()),
     ]
 }

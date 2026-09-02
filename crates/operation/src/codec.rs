@@ -17,6 +17,8 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
         transform::project::TAG,
         transform::project::decode_definition,
     ),
+    (transform::filter::TAG, transform::filter::decode_definition),
+    (transform::extend::TAG, transform::extend::decode_definition),
     (sink::discard::TAG, sink::discard::decode_definition),
 ];
 
@@ -36,6 +38,9 @@ pub enum DefinitionCodecError {
     /// The operation variant tag is unknown to this binary.
     #[error("unknown operation definition tag {0}")]
     UnknownTag(u16),
+    /// A known operation variant contains a non-canonical persistent payload.
+    #[error("operation definition payload is invalid: {0}")]
+    InvalidPayload(&'static str),
     /// Bytes remain after decoding the selected operation variant.
     #[error("operation definition contains trailing bytes")]
     TrailingBytes,
@@ -68,7 +73,7 @@ pub fn decode_definition(
         return Err(DefinitionCodecError::InvalidMagic);
     }
 
-    let mut cursor = Cursor::new(&encoded[MAGIC.len()..]);
+    let mut cursor = PayloadCursor::new(&encoded[MAGIC.len()..]);
     let version = cursor.read_u16()?;
     if version != FORMAT_VERSION {
         return Err(DefinitionCodecError::UnsupportedVersion(version));
@@ -81,21 +86,58 @@ pub fn decode_definition(
     decoder(cursor.remaining())
 }
 
-struct Cursor<'a> {
+pub(crate) struct PayloadCursor<'a> {
     remaining: &'a [u8],
 }
 
-impl<'a> Cursor<'a> {
-    const fn new(remaining: &'a [u8]) -> Self {
+impl<'a> PayloadCursor<'a> {
+    pub(crate) const fn new(remaining: &'a [u8]) -> Self {
         Self { remaining }
     }
 
-    const fn remaining(&self) -> &'a [u8] {
+    pub(crate) const fn remaining(&self) -> &'a [u8] {
         self.remaining
     }
 
-    fn read_u16(&mut self) -> Result<u16, DefinitionCodecError> {
+    pub(crate) const fn remaining_len(&self) -> usize {
+        self.remaining.len()
+    }
+
+    pub(crate) fn read_u8(&mut self) -> Result<u8, DefinitionCodecError> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    pub(crate) fn read_u16(&mut self) -> Result<u16, DefinitionCodecError> {
         Ok(u16::from_be_bytes(self.take::<2>()?))
+    }
+
+    pub(crate) fn read_u32(&mut self) -> Result<u32, DefinitionCodecError> {
+        Ok(u32::from_be_bytes(self.take::<4>()?))
+    }
+
+    pub(crate) fn read_i64(&mut self) -> Result<i64, DefinitionCodecError> {
+        Ok(i64::from_be_bytes(self.take::<8>()?))
+    }
+
+    pub(crate) fn read_u64(&mut self) -> Result<u64, DefinitionCodecError> {
+        Ok(u64::from_be_bytes(self.take::<8>()?))
+    }
+
+    pub(crate) fn read_bytes(&mut self, length: usize) -> Result<&'a [u8], DefinitionCodecError> {
+        let (value, remaining) = self
+            .remaining
+            .split_at_checked(length)
+            .ok_or(DefinitionCodecError::Truncated)?;
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    pub(crate) fn finish(self) -> Result<(), DefinitionCodecError> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(DefinitionCodecError::TrailingBytes)
+        }
     }
 
     fn take<const N: usize>(&mut self) -> Result<[u8; N], DefinitionCodecError> {

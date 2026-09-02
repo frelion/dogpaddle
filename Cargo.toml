@@ -20,6 +20,7 @@ arrow-array = "=59.2.0"
 arrow-buffer = "=59.2.0"
 arrow-ipc = "=59.2.0"
 arrow-schema = "=59.2.0"
+arrow-select = "=59.2.0"
 dogpaddle-bench-protocol = { path = "test-support/bench-protocol" }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-operation = { path = "crates/operation" }

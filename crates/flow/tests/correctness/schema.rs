@@ -1,13 +1,17 @@
 use std::num::NonZeroU64;
 
-use dogpaddle_change::ProjectionError;
+use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
 use dogpaddle_operation::{
-    OperationBindError, encode_definition,
+    BinaryOperator, Expression, ExpressionBindError, Literal, OperationBindError,
+    OperationDefinition, UnaryOperator, encode_definition,
     operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
-        transform::{CountDefinition, ProjectDefinition, ProjectSchemaError},
+        transform::{
+            CountDefinition, ExtendDefinition, FilterDefinition, FilterSchemaError,
+            ProjectDefinition, ProjectSchemaError,
+        },
     },
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
@@ -34,6 +38,40 @@ fn build_reports_the_exact_project_schema_rejection_without_creating_a_store() {
     };
     assert_project_field_rejection(&error);
     assert!(!path.exists(), "Schema rejection created the Store path");
+}
+
+#[test]
+fn build_reports_filter_and_extend_schema_rejections_without_store_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+
+    let filter_path = root.path().join("filter");
+    let error = build_schema_error(
+        &filter_path,
+        "filter",
+        FilterDefinition::new(Expression::column(0)),
+    );
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("non-Boolean Filter returned the wrong binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<FilterSchemaError>(),
+        Some(FilterSchemaError::PredicateType {
+            actual: arrow_schema::DataType::UInt64
+        })
+    ));
+
+    let extend_path = root.path().join("extend");
+    let error = build_schema_error(
+        &extend_path,
+        "extend",
+        ExtendDefinition::new("value", Expression::column(0)),
+    );
+    assert!(matches!(
+        error.operation_error(),
+        OperationBindError::InvalidOutputSchema {
+            source: SchemaError::DuplicateField { name, .. }
+        } if name == "value"
+    ));
 }
 
 #[test]
@@ -67,6 +105,118 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     };
     assert_project_field_rejection(&error);
     assert_eq!(read_published_definition(&path), definition);
+}
+
+#[test]
+fn open_rebinds_decoded_filter_and_extend_definitions() {
+    let root = tempfile::tempdir().unwrap();
+
+    let filter_path = root.path().join("filter");
+    let valid_filter = FilterDefinition::new(Expression::unary(
+        UnaryOperator::IsNull,
+        Expression::column(0),
+    ));
+    let invalid_filter = FilterDefinition::new(Expression::unary(
+        UnaryOperator::IsNull,
+        Expression::column(1),
+    ));
+    build_and_replace_operation(&filter_path, "filter", valid_filter, &invalid_filter);
+    let Err(FlowError::Schema(error)) = FlowFactory::open(&filter_path) else {
+        panic!("open did not rebind the decoded schema-incompatible Filter");
+    };
+    assert_eq!(error.station_id(), "filter");
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("invalid Filter returned the wrong open binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<FilterSchemaError>(),
+        Some(FilterSchemaError::Expression(
+            ExpressionBindError::ColumnOutOfBounds {
+                index: 1,
+                fields: 1
+            }
+        ))
+    ));
+
+    let extend_path = root.path().join("extend");
+    build_and_replace_operation(
+        &extend_path,
+        "extend",
+        ExtendDefinition::new("other", Expression::column(0)),
+        &ExtendDefinition::new("value", Expression::column(0)),
+    );
+    let Err(FlowError::Schema(error)) = FlowFactory::open(&extend_path) else {
+        panic!("open did not rebind the decoded schema-incompatible Extend");
+    };
+    assert_eq!(error.station_id(), "extend");
+    assert!(matches!(
+        error.operation_error(),
+        OperationBindError::InvalidOutputSchema {
+            source: SchemaError::DuplicateField { name, .. }
+        } if name == "value"
+    ));
+}
+
+#[test]
+fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 1));
+    let extend = factory.station(
+        "extend",
+        ExtendDefinition::new(
+            "keep",
+            Expression::binary(
+                BinaryOperator::Equal,
+                Expression::column(0),
+                Expression::literal(Literal::UInt64(Some(u64::MAX - 1))),
+            ),
+        ),
+    );
+    let filter = factory.station("filter", FilterDefinition::new(Expression::column(1)));
+    let project = factory.station("project", ProjectDefinition::new([0]));
+    let count = factory.station("count", CountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [source, extend, filter, project, count] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([source], extend);
+    factory.connect([extend], filter);
+    factory.connect([filter], project);
+    factory.connect([project], count);
+    factory.connect([count], sink);
+    drop(factory.build().unwrap());
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut reached_idle = false;
+    for _ in 0..4 {
+        if flow.advance().unwrap() == AdvanceOutcome::Idle {
+            reached_idle = true;
+            break;
+        }
+    }
+    assert!(reached_idle, "finite expression Flow did not become idle");
+    drop(flow);
+
+    let store = Store::open(&path).unwrap();
+    let _extend_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let _extend_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let _filter_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000002/state").unwrap();
+    let _filter_output: AppendLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
+    let count: Cell<u64> = store.open_data("station/00000004/operation/count").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        count.access(transaction.access()).unwrap().get().unwrap(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -141,4 +291,52 @@ fn replace_published_definition(path: &std::path::Path, definition: &[u8]) {
         .set(&definition.to_vec())
         .unwrap();
     transaction.commit().unwrap();
+}
+
+fn build_schema_error<D>(path: &std::path::Path, station_id: &str, definition: D) -> FlowSchemaError
+where
+    D: OperationDefinition,
+{
+    let mut factory = FlowFactory::new(path);
+    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let operation = factory.station(station_id, definition);
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(operation, CAPACITY);
+    factory.connect([source], operation);
+    factory.connect([operation], sink);
+    let Err(FlowError::Schema(error)) = factory.build() else {
+        panic!("schema-incompatible Flow did not return FlowError::Schema");
+    };
+    assert_eq!(error.station_id(), station_id);
+    assert!(!path.exists(), "Schema rejection created the Store path");
+    error
+}
+
+fn build_and_replace_operation<D>(path: &std::path::Path, station_id: &str, valid: D, invalid: &D)
+where
+    D: OperationDefinition,
+{
+    let valid_operation = encode_definition(&valid);
+    let invalid_operation = encode_definition(invalid);
+    assert_eq!(valid_operation.len(), invalid_operation.len());
+
+    let mut factory = FlowFactory::new(path);
+    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let operation = factory.station(station_id, valid);
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(operation, CAPACITY);
+    factory.connect([source], operation);
+    factory.connect([operation], sink);
+    drop(factory.build().unwrap());
+
+    let mut definition = read_published_definition(path);
+    let offset = definition
+        .windows(valid_operation.len())
+        .position(|candidate| candidate == valid_operation)
+        .expect("published Flow contains the valid Operation definition");
+    definition[offset..offset + valid_operation.len()].copy_from_slice(&invalid_operation);
+    rewrite_checksum(&mut definition);
+    replace_published_definition(path, &definition);
 }

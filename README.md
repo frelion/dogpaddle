@@ -32,7 +32,7 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、Schema-sensitive 的
-  零拷贝顶层 Project 和无输出 Discard
+  零拷贝顶层 Project、共享稳定表达式内核的 Filter 与单列 Extend，以及无输出 Discard
   Sink；build/open 会先从 canonical Definition 产生一次性的 Schema binding，再为有状态算子创建
   或打开持久化 Cell 并消费 binding 装配运行实例，同时为 Flow 和每个 Station 预先声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
@@ -89,14 +89,15 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 `Idle`/`Commit`/`Complete` action。只要尚未 `Complete`，下一 turn（包括 reopen
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
-`SequenceSource → Project → Count → Discard` 轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
+`SequenceSource → Extend → Filter → Project → Count → Discard` 轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
 没有任何 consumer 的 output，per-output retained-byte 高水位会让缓慢 consumer 自然向上游传播
 背压。每个 output 在 build/open 时已经绑定一个精确 logical Schema；算子输出在编码前、持久化
 entry 在首次 intake 解码后还会再次校验，Schema 违例均不会提交本 turn 的状态或 cursor。
 尚未实现持续运行的 `Flow::start`、中断控制或外部 Sink 的幂等协议。
 该高水位不计算 MDBX page、Operation state 或 decoded cache，也允许空日志容纳一条 oversize，
 因此不是磁盘或内存硬配额。Operation 的展平
-output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响。
+output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响；
+比较的每种物理分批都必须能用声明的 Arrow input/output 类型表示。
 仓库也没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

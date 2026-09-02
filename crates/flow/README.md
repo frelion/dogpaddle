@@ -190,7 +190,7 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - Count 状态：`station/{index:08x}/operation/count`
-- Project 不声明 Operation data，只使用通用 Station state 和 output
+- Project、Filter 和 Extend 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
@@ -219,7 +219,7 @@ state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和�
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实 `SequenceSource → Project → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
+`Flow::advance`，真实 `SequenceSource → Extend → Filter → Project → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
 intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 Count

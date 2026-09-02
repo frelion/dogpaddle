@@ -1,16 +1,20 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::UInt64Array;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dogpaddle_change::ProjectionError;
+use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_operation::{
-    DataDeclaration, DataInstances, OperationBindError, OperationBinding, OperationDefinition,
-    OperationKind,
+    BinaryOperator, DataDeclaration, DataInstances, Expression, ExpressionBindError, Literal,
+    MAX_EXPRESSION_STACK_DEPTH, OperationBindError, OperationBinding, OperationDefinition,
+    OperationKind, UnaryOperator,
     operation::{
         Action, Operation, OperationInput,
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
-        transform::{CountDefinition, ProjectDefinition, ProjectSchemaError},
+        transform::{
+            CountDefinition, ExtendDefinition, ExtendSchemaError, FilterDefinition,
+            FilterSchemaError, ProjectDefinition, ProjectSchemaError,
+        },
     },
 };
 use dogpaddle_store::{Cell, Store};
@@ -79,6 +83,10 @@ fn project_input_schema() -> SchemaRef {
     ]))
 }
 
+fn equal(left: Expression, right: Expression) -> Expression {
+    Expression::binary(BinaryOperator::Equal, left, right)
+}
+
 #[test]
 fn definitions_expose_their_stable_public_contracts() {
     let source = SequenceSourceDefinition::new(42);
@@ -100,6 +108,28 @@ fn definitions_expose_their_stable_public_contracts() {
     );
     assert_eq!(project.field_indices(), [0, 2]);
     assert!(names(&project).is_empty());
+
+    let filter_expression = equal(
+        Expression::column(0),
+        Expression::literal(Literal::UInt64(Some(7))),
+    );
+    let filter = FilterDefinition::new(filter_expression.clone());
+    assert_eq!(
+        filter.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::MIN)
+    );
+    assert_eq!(filter.predicate(), &filter_expression);
+    assert!(names(&filter).is_empty());
+
+    let extend_expression = Expression::unary(UnaryOperator::IsNull, Expression::column(1));
+    let extend = ExtendDefinition::new("message_missing", extend_expression.clone());
+    assert_eq!(
+        extend.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::MIN)
+    );
+    assert_eq!(extend.field_name(), "message_missing");
+    assert_eq!(extend.expression(), &extend_expression);
+    assert!(names(&extend).is_empty());
 
     let discard = DiscardDefinition::new();
     assert_eq!(
@@ -129,6 +159,26 @@ fn definitions_bind_their_complete_logical_schema_contracts() {
     let project_binding = bind(&project, std::slice::from_ref(&project_input)).unwrap();
     let expected_project = Arc::new(project_input.project(&[0, 2]).unwrap());
     assert_eq!(project_binding.output_schema(), Some(&expected_project));
+
+    let filter = FilterDefinition::new(equal(
+        Expression::column(0),
+        Expression::literal(Literal::UInt64(Some(7))),
+    ));
+    let filter_binding = bind(&filter, std::slice::from_ref(&project_input)).unwrap();
+    assert_eq!(filter_binding.output_schema(), Some(&project_input));
+
+    let extend = ExtendDefinition::new(
+        "message_missing",
+        Expression::unary(UnaryOperator::IsNull, Expression::column(1)),
+    );
+    let extend_binding = bind(&extend, std::slice::from_ref(&project_input)).unwrap();
+    let expected_extend = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("message", DataType::Utf8, true),
+        Field::new("score", DataType::Int64, false),
+        Field::new("message_missing", DataType::Boolean, false),
+    ]));
+    assert_eq!(extend_binding.output_schema(), Some(&expected_extend));
 
     let discard = DiscardDefinition::new();
     assert!(
@@ -199,6 +249,220 @@ fn binding_rejects_wrong_arity_and_invalid_logical_input_schemas() {
             )) if (*actual_previous, *actual_current) == (previous, current)
         ));
     }
+}
+
+#[test]
+fn expression_binding_rejects_invalid_columns_types_and_filter_results() {
+    let input = project_input_schema();
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &ExtendDefinition::new("copy", Expression::column(3)),
+        std::slice::from_ref(&input),
+    ) else {
+        panic!("out-of-bounds expression column unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::ColumnOutOfBounds {
+                index: 3,
+                fields: 3
+            }
+        ))
+    ));
+
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &ExtendDefinition::new(
+            "bad",
+            equal(
+                Expression::column(0),
+                Expression::literal(Literal::Int64(Some(7))),
+            ),
+        ),
+        std::slice::from_ref(&input),
+    ) else {
+        panic!("mixed signed and unsigned equality unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::BinaryTypeMismatch {
+                operator: BinaryOperator::Equal,
+                left: DataType::UInt64,
+                right: DataType::Int64,
+            }
+        ))
+    ));
+
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &FilterDefinition::new(Expression::column(0)),
+        std::slice::from_ref(&input),
+    ) else {
+        panic!("non-Boolean filter predicate unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<FilterSchemaError>(),
+        Some(FilterSchemaError::PredicateType {
+            actual: DataType::UInt64
+        })
+    ));
+}
+
+#[test]
+fn expression_binding_rejects_unsupported_unary_and_binary_operands() {
+    let input = project_input_schema();
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &ExtendDefinition::new(
+            "bad_not",
+            Expression::unary(UnaryOperator::Not, Expression::column(0)),
+        ),
+        std::slice::from_ref(&input),
+    ) else {
+        panic!("Not over UInt64 unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::UnaryTypeMismatch {
+                operator: UnaryOperator::Not,
+                actual: DataType::UInt64,
+            }
+        ))
+    ));
+
+    let float_input = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Float64,
+        false,
+    )]));
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &ExtendDefinition::new(
+            "bad_equal",
+            equal(Expression::column(0), Expression::column(0)),
+        ),
+        std::slice::from_ref(&float_input),
+    ) else {
+        panic!("equality over Float64 unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::UnsupportedOperand {
+                operator: BinaryOperator::Equal,
+                data_type: DataType::Float64,
+            }
+        ))
+    ));
+
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &ExtendDefinition::new(
+            "bad_and",
+            Expression::binary(
+                BinaryOperator::And,
+                Expression::column(0),
+                Expression::column(0),
+            ),
+        ),
+        std::slice::from_ref(&input),
+    ) else {
+        panic!("And over UInt64 unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::UnsupportedOperand {
+                operator: BinaryOperator::And,
+                data_type: DataType::UInt64,
+            }
+        ))
+    ));
+}
+
+#[test]
+fn expression_binding_bounds_live_values_without_limiting_unary_depth() {
+    let mut expression = Expression::literal(Literal::Boolean(Some(true)));
+    for _ in 0..MAX_EXPRESSION_STACK_DEPTH {
+        expression = Expression::binary(
+            BinaryOperator::And,
+            Expression::literal(Literal::Boolean(Some(true))),
+            expression,
+        );
+    }
+
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &FilterDefinition::new(expression),
+        std::slice::from_ref(&value_schema()),
+    ) else {
+        panic!("expression with an excessive evaluation stack unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<FilterSchemaError>(),
+        Some(FilterSchemaError::Expression(
+            ExpressionBindError::EvaluationStackTooDeep {
+                depth,
+                maximum,
+                ..
+            }
+        )) if (*depth, *maximum)
+            == (MAX_EXPRESSION_STACK_DEPTH + 1, MAX_EXPRESSION_STACK_DEPTH)
+    ));
+}
+
+#[test]
+fn extend_derives_one_valid_field_and_preserves_input_schema_metadata() {
+    let mut metadata = HashMap::new();
+    metadata.insert("owner".to_owned(), "test".to_owned());
+    let input = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("flag", DataType::Boolean, true)
+                .with_metadata(HashMap::from([("meaning".to_owned(), "input".to_owned())])),
+            Field::new("nothing", DataType::Null, false),
+        ],
+        metadata.clone(),
+    ));
+
+    let copied_flag = ExtendDefinition::new("copied_flag", Expression::column(0));
+    let binding = bind(&copied_flag, std::slice::from_ref(&input)).unwrap();
+    let output = binding.output_schema().unwrap();
+    assert_eq!(output.metadata(), &metadata);
+    assert_eq!(output.field(0), input.field(0));
+    assert_eq!(output.field(2).data_type(), &DataType::Boolean);
+    assert!(output.field(2).is_nullable());
+    assert!(output.field(2).metadata().is_empty());
+
+    let copied_null = ExtendDefinition::new("copied_null", Expression::column(1));
+    let binding = bind(&copied_null, std::slice::from_ref(&input)).unwrap();
+    assert!(binding.output_schema().unwrap().field(2).is_nullable());
+
+    let non_null = ExtendDefinition::new(
+        "constant",
+        Expression::literal(Literal::Utf8(Some("ready".to_owned()))),
+    );
+    let binding = bind(&non_null, std::slice::from_ref(&input)).unwrap();
+    assert!(!binding.output_schema().unwrap().field(2).is_nullable());
+
+    let typed_null = ExtendDefinition::new("missing", Expression::literal(Literal::Int64(None)));
+    let binding = bind(&typed_null, std::slice::from_ref(&input)).unwrap();
+    assert!(binding.output_schema().unwrap().field(2).is_nullable());
+}
+
+#[test]
+fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
+    let input = project_input_schema();
+    let duplicate = ExtendDefinition::new("id", Expression::column(0));
+    assert!(matches!(
+        bind(&duplicate, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::DuplicateField { ref name, .. }
+        }) if name == "id"
+    ));
+
+    let reserved = ExtendDefinition::new("$dogpaddle.internal", Expression::column(0));
+    assert!(matches!(
+        bind(&reserved, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::ReservedFieldName { ref name, .. }
+        }) if name == "$dogpaddle.internal"
+    ));
 }
 
 #[test]
