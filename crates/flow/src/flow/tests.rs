@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{AppendLog, Cell, Store};
 
 use crate::build::FlowFactory;
 
@@ -32,44 +32,6 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
 
     let reopened = FlowFactory::open(path).unwrap();
     assert_eq!(reopened.topology.schedule, [2, 3, 0, 1, 4, 5]);
-}
-
-#[test]
-fn open_rematerializes_state_under_the_flow_owned_transaction_capability() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, NonZeroU64::MAX);
-    builder.connect([source], sink);
-    drop(builder.build().unwrap());
-
-    let store = Store::open(&path).unwrap();
-    let state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        state
-            .access(transaction.access())
-            .unwrap()
-            .put(&b"key".to_vec(), &b"flow".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-
-    let mut flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(flow.stations.len(), 2);
-    let transaction = flow.transactions.begin().unwrap();
-    assert_eq!(
-        flow.state
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        Some(b"flow".to_vec())
-    );
 }
 
 #[test]
@@ -117,35 +79,28 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
-        blocked_position
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap(),
-        Some(0)
-    );
-    assert_eq!(
-        blocked_output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        0..1
-    );
-    assert_eq!(
-        progressing_position
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap(),
-        Some(1)
-    );
-    assert_eq!(
-        progressing_output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        0..2
+        (
+            blocked_position
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            blocked_output
+                .access(transaction.access())
+                .unwrap()
+                .bounds()
+                .unwrap(),
+            progressing_position
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            progressing_output
+                .access(transaction.access())
+                .unwrap()
+                .bounds()
+                .unwrap(),
+        ),
+        (Some(0), 0..1, Some(1), 0..2)
     );
 }

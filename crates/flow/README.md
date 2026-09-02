@@ -224,7 +224,9 @@ cargo bench -p dogpaddle-flow --bench flow_runtime
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
 `open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
 或运行时吞吐。`flow_runtime` 则测预先构建的 source/sink、Count chain、fan-out 和 capacity-pressure
-Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。machine sample 只保留总
-`elapsed_ns`、work counts 和 raw `round_latencies_ns`；总耗时、三种速率及 p50/p95 只在人类表格中
-显示并可从这些 raw 值重建。正式结果必须在显式 reference 文件系统上保留逐样本 JSONL；配置与输出协议见工作区
+Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。`run` plan 保存静态 work counts，
+machine sample 只保留总 `elapsed_ns` 和 raw `round_latencies_ns`；统一 reporter 从这些 raw
+值重建 round p50/p95/p99，以及 advances/s、committed Station turns/s 和 input completions/s。
+相邻 `.plan.json` 由 `cargo xtask bench-plan-check` 在不构建 Flow fixture 的情况下验证 smoke/reference
+Plan。正式结果必须在显式 reference 文件系统上保留逐样本 JSONL；配置与输出协议见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

@@ -1,0 +1,1 @@
+{"benchmark":"change_core","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":24,"observations":6,"encoded_bytes":4005,"digest":"c7d9662cb59d2ffb94a0168ec38711f0"},"reference":{"cases":96,"observations":24,"encoded_bytes":15681,"digest":"0a077d19be6547d227b0c70abd431920"}}

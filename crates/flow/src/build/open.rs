@@ -32,7 +32,7 @@ impl FlowFactory {
 
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
-        let flow_state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
+        let _flow_state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
             &store,
             codec::FLOW_STATE_DATA_NAME,
         )?;
@@ -63,7 +63,6 @@ impl FlowFactory {
         Ok(Flow::from_parts(
             path,
             definition,
-            flow_state,
             assembled.stations,
             assembled.topology,
             transactions,

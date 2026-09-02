@@ -1,0 +1,1 @@
+{"benchmark":"flow_lifecycle","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":4,"observations":0,"encoded_bytes":633,"digest":"b18e1179223d95600591962797b8dfe9"},"reference":{"cases":6,"observations":0,"encoded_bytes":851,"digest":"08af9db78dc1135684d2862aef0c2784"}}

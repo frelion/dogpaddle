@@ -339,6 +339,7 @@ dependencies = [
 name = "dogpaddle-xtask"
 version = "0.1.0"
 dependencies = [
+ "dogpaddle-bench-protocol",
  "serde_json",
 ]
 

@@ -1,30 +1,18 @@
-mod support;
-
 use std::{
-    io,
     num::{NonZeroU64, NonZeroUsize},
     path::Path,
     time::Duration,
 };
 
-use dogpaddle_bench_protocol::{
-    BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
-    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, SampleRecord, require_benchmark_build,
-};
+use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 
-use support::BenchRoot;
-
 const BENCHMARK: &str = "flow_lifecycle";
 const SMOKE_STATION_COUNTS: &[usize] = &[2, 3];
 const REFERENCE_STATION_COUNTS: &[usize] = &[2, 64, 1_024];
-const SMOKE_SAMPLES: usize = 1;
-const REFERENCE_SAMPLES: usize = 9;
-const SMOKE_WARMUPS: usize = 1;
-const REFERENCE_WARMUPS: usize = 2;
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
 struct Config {
@@ -34,23 +22,15 @@ struct Config {
 }
 
 impl Config {
-    fn for_profile(profile: BenchmarkProfile) -> Self {
+    fn for_profile(profile: dogpaddle_bench_protocol::BenchmarkProfile) -> Self {
         let (station_counts, samples, warmups) = match profile {
-            BenchmarkProfile::Smoke => (SMOKE_STATION_COUNTS, SMOKE_SAMPLES, SMOKE_WARMUPS),
-            BenchmarkProfile::Reference => (
-                REFERENCE_STATION_COUNTS,
-                REFERENCE_SAMPLES,
-                REFERENCE_WARMUPS,
-            ),
+            dogpaddle_bench_protocol::BenchmarkProfile::Smoke => (SMOKE_STATION_COUNTS, 1, 1),
+            dogpaddle_bench_protocol::BenchmarkProfile::Reference => {
+                (REFERENCE_STATION_COUNTS, 9, 2)
+            }
         };
-        assert!(
-            station_counts.windows(2).all(|pair| pair[0] < pair[1]),
-            "Flow benchmark station counts must be strictly increasing"
-        );
-        assert!(
-            station_counts.iter().all(|count| *count >= 2),
-            "Flow benchmark station counts must contain only counts of at least two"
-        );
+        assert!(station_counts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(station_counts.iter().all(|count| *count >= 2));
         Self {
             station_counts: station_counts.to_vec(),
             samples,
@@ -58,106 +38,95 @@ impl Config {
         }
     }
 
-    fn expected_samples(&self) -> NonZeroUsize {
-        let count = self
-            .station_counts
-            .len()
-            .checked_mul(2)
-            .and_then(|value| value.checked_mul(self.samples))
-            .expect("Flow lifecycle sample count fits usize");
-        NonZeroUsize::new(count).expect("Flow lifecycle has at least one data record")
+    fn fields(&self) -> Fields {
+        Fields::new()
+            .with("station_counts", &self.station_counts)
+            .with("samples", self.samples)
+            .with("warmups", self.warmups)
+            .with("scope", "build_open_runtime_excluded")
+            .with("validation", "outside_timing")
+            .with("mdbx_sync_mode", "durable")
     }
 }
 
 fn main() {
-    require_benchmark_build(BENCHMARK);
-
-    let root = BenchRoot::from_environment(BENCHMARK);
-    let config = Config::for_profile(root.profile());
-    println!("DogPaddle Flow lifecycle benchmark");
-    println!(
-        "scope=build/open runtime=excluded sync=durable execution=single-thread validation=outside-timing"
-    );
-    emit_environment(&root);
-    emit_configuration(&config);
-
-    for &station_count in &config.station_counts {
-        benchmark_fresh_build(&root, &config, station_count);
-        benchmark_warm_reopen(&root, &config, station_count);
+    let profile = BenchmarkProfile::from_environment();
+    let config = Config::for_profile(profile);
+    let mut plan = Plan::new(profile, config.fields());
+    let cases = config
+        .station_counts
+        .iter()
+        .map(|&station_count| {
+            (
+                station_count,
+                plan.case(case("fresh_durable_build", station_count, config.samples)),
+                plan.case(case("warm_reopen", station_count, config.samples)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut run = Run::persistent(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
     }
-    emit_record(&CompletionRecord::new(BENCHMARK));
+    for (station_count, build, reopen) in cases {
+        for _ in 0..config.warmups {
+            measure_fresh_build(&run, station_count);
+        }
+        run.samples(build, |run| {
+            Measurement::new(measure_fresh_build(run, station_count))
+        });
+
+        let fixture = run.sample("flow-reopen");
+        let path = fixture.path().join("flow");
+        let flow = linear_factory(&path, station_count)
+            .build()
+            .expect("build reopen benchmark fixture");
+        validate_flow(&flow, &path, station_count);
+        drop(flow);
+        for _ in 0..=config.warmups {
+            measure_reopen(&path, station_count);
+        }
+        run.samples(reopen, |_| {
+            Measurement::new(measure_reopen(&path, station_count))
+        });
+    }
+    run.finish(|| {});
 }
 
-fn benchmark_fresh_build(root: &BenchRoot, config: &Config, station_count: usize) {
-    for _ in 0..config.warmups {
-        measure_fresh_build(root, station_count);
-    }
-
-    let mut durations = Vec::with_capacity(config.samples);
-    for sample in 0..config.samples {
-        let elapsed = measure_fresh_build(root, station_count);
-        emit_sample("fresh_durable_build", station_count, sample, elapsed);
-        durations.push(elapsed);
-    }
-    report("fresh_durable_build", station_count, &durations);
+fn case(scenario: &str, station_count: usize, samples: usize) -> CaseSpec {
+    CaseSpec::new(
+        format!("{scenario}/stations={station_count}"),
+        NonZeroUsize::new(samples).unwrap(),
+        Fields::new()
+            .with("station_count", station_count)
+            .with("operations", 1_usize),
+    )
 }
 
-fn measure_fresh_build(root: &BenchRoot, station_count: usize) -> Duration {
-    let sample = root.sample("flow-build");
-    let factory = linear_factory(sample.path(), station_count);
-
+fn measure_fresh_build(run: &Run, station_count: usize) -> Duration {
+    let sample = run.sample("flow-build");
+    let path = sample.path().join("flow");
+    let factory = linear_factory(&path, station_count);
     let started = std::time::Instant::now();
     let flow = factory.build().expect("build benchmark Flow");
     let elapsed = started.elapsed();
-
-    validate_flow(&flow, sample.path(), station_count);
+    validate_flow(&flow, &path, station_count);
     drop(flow);
-    let reopened = FlowFactory::open(sample.path()).expect("reopen freshly built benchmark Flow");
-    validate_flow(&reopened, sample.path(), station_count);
-    drop(reopened);
-    drop(sample);
+    let reopened = FlowFactory::open(&path).expect("reopen freshly built benchmark Flow");
+    validate_flow(&reopened, &path, station_count);
     elapsed
-}
-
-fn benchmark_warm_reopen(root: &BenchRoot, config: &Config, station_count: usize) {
-    let fixture = root.sample("flow-reopen");
-    let flow = linear_factory(fixture.path(), station_count)
-        .build()
-        .expect("build reopen benchmark fixture");
-    validate_flow(&flow, fixture.path(), station_count);
-    drop(flow);
-
-    let preflight = FlowFactory::open(fixture.path()).expect("preflight reopen benchmark fixture");
-    validate_flow(&preflight, fixture.path(), station_count);
-    drop(preflight);
-    for _ in 0..config.warmups {
-        measure_reopen(fixture.path(), station_count);
-    }
-
-    let mut durations = Vec::with_capacity(config.samples);
-    for sample in 0..config.samples {
-        let elapsed = measure_reopen(fixture.path(), station_count);
-        emit_sample("warm_reopen", station_count, sample, elapsed);
-        durations.push(elapsed);
-    }
-    report("warm_reopen", station_count, &durations);
 }
 
 fn measure_reopen(path: &Path, station_count: usize) -> Duration {
     let started = std::time::Instant::now();
     let flow = FlowFactory::open(path).expect("open benchmark Flow");
     let elapsed = started.elapsed();
-
     validate_flow(&flow, path, station_count);
-    drop(flow);
     elapsed
 }
 
 fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
-    assert!(
-        station_count >= 2,
-        "benchmark Flow must contain a source and sink"
-    );
     let mut factory = FlowFactory::new(path);
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
     factory.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
@@ -183,61 +152,4 @@ fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
     }
     assert_eq!(ids.next(), Some("sink"));
     assert_eq!(ids.next(), None);
-}
-
-fn emit_environment(root: &BenchRoot) {
-    let fields = Fields::new().with("mdbx_sync_mode", "durable");
-    let environment = EnvironmentRecord::new(
-        BENCHMARK,
-        root.profile(),
-        HostEnvironment::collect(Some(root.base())),
-        fields,
-    );
-    emit_record(&environment);
-}
-
-fn emit_configuration(config: &Config) {
-    let fields = Fields::new()
-        .with("station_counts", &config.station_counts)
-        .with("samples", config.samples)
-        .with("warmups", config.warmups)
-        .with("fresh_build_path_and_factory", "outside_timing")
-        .with("fresh_build_store_per_sample", true)
-        .with("reopen_fixture_and_warmup", "outside_timing")
-        .with("reopen_cache", "warm_committed")
-        .with("validation", "outside_timing");
-    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_samples(), fields);
-    emit_record(&configuration);
-}
-
-fn emit_sample(scenario: &'static str, station_count: usize, sample: usize, elapsed: Duration) {
-    let series = format!("{scenario}/stations={station_count}");
-    let sample = SampleRecord::new(
-        BENCHMARK,
-        series,
-        sample,
-        elapsed,
-        station_fields(station_count),
-    );
-    emit_record(&sample);
-}
-
-fn report(scenario: &'static str, station_count: usize, samples: &[Duration]) {
-    let summary = DurationSummary::from_samples(samples);
-    let min = summary.min();
-    let median = summary.median();
-    let max = summary.max();
-    assert!(!median.is_zero(), "benchmark median must be non-zero");
-    println!("{scenario} stations={station_count}: min={min:?} median={median:?} max={max:?}");
-}
-
-fn station_fields(station_count: usize) -> Fields {
-    Fields::new().with("station_count", station_count)
-}
-
-fn emit_record(record: &impl BenchmarkRecord) {
-    let stdout = io::stdout();
-    let mut writer = JsonlWriter::new(stdout.lock());
-    writer.write(record);
-    writer.flush();
 }

@@ -1,0 +1,1 @@
+{"benchmark":"append_log_endurance","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":2,"observations":2,"encoded_bytes":755,"digest":"5b23d5dec9a84c1c71f7de3c48684f61"},"reference":{"cases":6,"observations":6,"encoded_bytes":1490,"digest":"9c881af091c0d0c1371f20df2ed23555"}}

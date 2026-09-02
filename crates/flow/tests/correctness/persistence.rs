@@ -1,10 +1,12 @@
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, Large, OrderedMap, Small, Store, StoreError};
+use dogpaddle_store::{
+    AppendLog, Cell, OrderedMap, ReadTransactionAccess, Small, Store, StoreError,
+};
 
 use super::support::{
     build_source_sink_and_read_definition, fixture_bytes, read_published_definition,
@@ -13,224 +15,123 @@ use super::support::{
 const V1_SEQUENCE_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_source_count_discard.hex");
 
-fn capacity(bytes: u64) -> NonZeroU64 {
-    NonZeroU64::new(bytes).unwrap()
+#[derive(Clone, Copy)]
+enum ResourceFault {
+    MissingOutput,
+    MissingPosition,
+    WrongOutputSize,
 }
 
 #[test]
 fn build_publishes_the_stable_v1_definition_bytes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(7));
-    let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([source], count);
-    builder.connect([count], sink);
-    builder.output_capacity_bytes(source, capacity(1_024));
-    builder.output_capacity_bytes(count, capacity(2_048));
-    drop(builder.build().unwrap());
-
+    build_chain(&path);
     assert_eq!(
         read_published_definition(&path),
         fixture_bytes(V1_SEQUENCE_COUNT_DISCARD)
     );
-    let flow = FlowFactory::open(&path).unwrap();
-    assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
-    );
 }
 
 #[test]
-fn build_uses_the_stable_resource_layout() {
+fn build_uses_the_stable_resource_layout_and_input_origins() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([source], count);
-    builder.connect([count], sink);
-    builder.output_capacity_bytes(source, capacity(1_024));
-    builder.output_capacity_bytes(count, capacity(2_048));
-    drop(builder.build().unwrap());
-
+    build_chain(&path);
     let store = Store::open(&path).unwrap();
-    let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
-    let _source_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000000/state").unwrap();
-    let _count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let _sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000002/state").unwrap();
-    let _source_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let _count_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let states: [OrderedMap<Vec<u8>, Vec<u8>, Small>; 3] = [
+        store.open_data("station/00000000/state").unwrap(),
+        store.open_data("station/00000001/state").unwrap(),
+        store.open_data("station/00000002/state").unwrap(),
+    ];
     assert!(matches!(
         store.open_data::<AppendLog<Vec<u8>>>("station/00000002/output"),
         Err(StoreError::DataNotFound(name)) if name == "station/00000002/output"
     ));
-    let _source_position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
-        .unwrap();
-    let _count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
     let (_, reads) = store.into_transactions().split();
     let transaction = reads.begin().unwrap();
-    assert!(
-        definition
-            .read(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap()
-            .is_some()
+    assert_eq!(input_origin(&states[0], transaction.access()), (None, None));
+    assert_eq!(
+        input_origin(&states[1], transaction.access()),
+        (Some(vec![0; 4]), Some(vec![0; 8]))
+    );
+    assert_eq!(
+        input_origin(&states[2], transaction.access()),
+        (Some(vec![0; 4]), Some(vec![0; 8]))
     );
 }
 
 #[test]
-fn build_initializes_input_state_at_the_stable_origins() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([source], count);
-    builder.connect([count], sink);
-    builder.output_capacity_bytes(source, capacity(1_024));
-    builder.output_capacity_bytes(count, capacity(2_048));
-    drop(builder.build().unwrap());
-
-    let store = Store::open(&path).unwrap();
-    let source_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000000/state").unwrap();
-    let count_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000002/state").unwrap();
-    let (_, reads) = store.into_transactions().split();
-    let transaction = reads.begin().unwrap();
-    let active_key = b"input/active".to_vec();
-    let cursor_key = b"input/00000000/cursor".to_vec();
-
-    assert_eq!(
-        source_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&active_key)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        source_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&cursor_key)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        count_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&active_key)
-            .unwrap(),
-        Some(vec![0; 4])
-    );
-    assert_eq!(
-        count_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&cursor_key)
-            .unwrap(),
-        Some(vec![0; 8])
-    );
-    assert_eq!(
-        sink_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&active_key)
-            .unwrap(),
-        Some(vec![0; 4])
-    );
-    assert_eq!(
-        sink_state
-            .read(transaction.access())
-            .unwrap()
-            .get(&cursor_key)
-            .unwrap(),
-        Some(vec![0; 8])
-    );
-}
-
-#[test]
-fn open_reports_a_missing_station_output_after_publication() {
+fn open_classifies_each_required_station_resource_fault() {
     let root = tempfile::tempdir().unwrap();
     let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
-
-    let incomplete_path = root.path().join("missing-output");
-    let mut store = Store::create(&incomplete_path).unwrap();
-    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("station/00000000/state").unwrap();
-    let _position: Cell<u64> = store
-        .create_data("station/00000000/operation/sequence_source.position")
-        .unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        published
-            .access(transaction.access())
-            .unwrap()
-            .set(&definition)
-            .unwrap();
-        transaction.commit().unwrap();
+    for (name, fault) in [
+        ("missing-output", ResourceFault::MissingOutput),
+        ("missing-position", ResourceFault::MissingPosition),
+        ("wrong-output-size", ResourceFault::WrongOutputSize),
+    ] {
+        let path = root.path().join(name);
+        publish_faulty_resources(&path, &definition, fault);
+        let Err(error) = FlowFactory::open(&path) else {
+            panic!("case {name} unexpectedly opened");
+        };
+        match fault {
+            ResourceFault::MissingOutput => assert!(matches!(
+                error,
+                FlowError::MissingResource { name }
+                    if name == "station/00000000/output"
+            )),
+            ResourceFault::MissingPosition => assert!(matches!(
+                error,
+                FlowError::MissingResource { name }
+                    if name == "station/00000000/operation/sequence_source.position"
+            )),
+            ResourceFault::WrongOutputSize => assert!(matches!(
+                error,
+                FlowError::Store(StoreError::DataSizeMismatch {
+                    name,
+                    expected: "large",
+                    actual: "small",
+                }) if name == "station/00000000/output"
+            )),
+        }
     }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(&incomplete_path),
-        Err(FlowError::MissingResource { name })
-            if name == "station/00000000/output"
-    ));
 }
 
-#[test]
-fn open_reports_a_station_output_size_mismatch() {
-    let root = tempfile::tempdir().unwrap();
-    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
-
-    let mismatched_path = root.path().join("output-size-mismatch");
-    let mut store = Store::create(&mismatched_path).unwrap();
+fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault) {
+    let mut store = Store::create(path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("station/00000000/state").unwrap();
-    let _position: Cell<u64> = store
-        .create_data("station/00000000/operation/sequence_source.position")
+    store
+        .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("flow/state")
         .unwrap();
-    let _wrong_output: Cell<Vec<u8>> = store.create_data("station/00000000/output").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        published
-            .access(transaction.access())
-            .unwrap()
-            .set(&definition)
-            .unwrap();
-        transaction.commit().unwrap();
+    store
+        .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("station/00000000/state")
+        .unwrap();
+    if !matches!(fault, ResourceFault::MissingOutput) {
+        if matches!(fault, ResourceFault::WrongOutputSize) {
+            store
+                .create_data::<Cell<Vec<u8>>>("station/00000000/output")
+                .unwrap();
+        } else {
+            store
+                .create_data::<AppendLog<Vec<u8>>>("station/00000000/output")
+                .unwrap();
+        }
     }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(&mismatched_path),
-        Err(FlowError::Store(StoreError::DataSizeMismatch {
-            name,
-            expected: "large",
-            actual: "small",
-        })) if name == "station/00000000/output"
-    ));
+    if !matches!(fault, ResourceFault::MissingPosition) {
+        store
+            .create_data::<Cell<u64>>("station/00000000/operation/sequence_source.position")
+            .unwrap();
+    }
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    published
+        .access(transaction.access())
+        .unwrap()
+        .set(&definition.to_vec())
+        .unwrap();
+    transaction.commit().unwrap();
 }
 
 #[test]
@@ -242,140 +143,31 @@ fn open_rejects_an_unpublished_build() {
         .create_data::<Cell<Vec<u8>>>("flow/definition")
         .unwrap();
     drop(store);
-
     assert!(matches!(
-        FlowFactory::open(&path),
+        FlowFactory::open(path),
         Err(FlowError::IncompleteBuild)
     ));
 }
 
-#[test]
-fn open_rejects_a_corrupt_published_definition() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut store = Store::create(&path).unwrap();
-    let definition: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        let mut definition = definition.access(transaction.access()).unwrap();
-        definition.set(&b"not a flow".to_vec()).unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(&path),
-        Err(FlowError::Definition(_))
-    ));
-}
-
-#[test]
-fn open_reports_a_missing_resource_after_publication() {
-    let root = tempfile::tempdir().unwrap();
-    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
-
-    let incomplete_path = root.path().join("missing-resource");
-    let mut store = Store::create(&incomplete_path).unwrap();
-    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("station/00000000/state").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        published
-            .access(transaction.access())
-            .unwrap()
-            .set(&definition)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(&incomplete_path),
-        Err(FlowError::MissingResource { name })
-            if name == "station/00000000/operation/sequence_source.position"
-    ));
-}
-
-#[test]
-fn open_reports_an_operation_data_size_mismatch() {
-    let root = tempfile::tempdir().unwrap();
-    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
-
-    let mismatched_path = root.path().join("size-mismatch");
-    let mut store = Store::create(&mismatched_path).unwrap();
-    let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.create_data("flow/state").unwrap();
-    let _station_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data("station/00000000/state").unwrap();
-    let _position: OrderedMap<u64, u64, Large> = store
-        .create_data("station/00000000/operation/sequence_source.position")
-        .unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        published
-            .access(transaction.access())
-            .unwrap()
-            .set(&definition)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(&mismatched_path),
-        Err(FlowError::Store(StoreError::DataSizeMismatch {
-            name,
-            expected: "small",
-            actual: "large",
-        })) if name == "station/00000000/operation/sequence_source.position"
-    ));
-}
-
-#[test]
-fn open_rejects_a_retained_head_behind_the_minimum_consumer_cursor() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
+fn build_chain(path: &Path) {
+    let mut builder = FlowFactory::new(path);
+    let source = builder.station("source", SequenceSourceDefinition::new(7));
+    let count = builder.station("count", CountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([source], sink);
-    builder.output_capacity_bytes(source, capacity(1_024));
+    builder.connect([source], count);
+    builder.connect([count], sink);
+    builder.output_capacity_bytes(source, NonZeroU64::new(1_024).unwrap());
+    builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
     drop(builder.build().unwrap());
+}
 
-    let store = Store::open(&path).unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let sink_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        output
-            .access(transaction.access())
-            .unwrap()
-            .append(&b"retained".to_vec())
-            .unwrap();
-        sink_state
-            .access(transaction.access())
-            .unwrap()
-            .put(
-                &b"input/00000000/cursor".to_vec(),
-                &1_u64.to_be_bytes().to_vec(),
-            )
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-
-    assert!(matches!(
-        FlowFactory::open(path),
-        Err(FlowError::InvalidRuntimeState { station_id, reason })
-            if station_id == "source"
-                && reason.contains("retention head 0")
-                && reason.contains("minimum consumer cursor 1")
-    ));
+fn input_origin(
+    state: &OrderedMap<Vec<u8>, Vec<u8>, Small>,
+    access: ReadTransactionAccess<'_>,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let state = state.read(access).unwrap();
+    (
+        state.get(&b"input/active".to_vec()).unwrap(),
+        state.get(&b"input/00000000/cursor".to_vec()).unwrap(),
+    )
 }

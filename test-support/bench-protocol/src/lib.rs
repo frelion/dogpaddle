@@ -4,19 +4,19 @@
 mod environment;
 mod jsonl;
 mod order;
+mod report;
 mod root;
+mod run;
 mod settings;
-mod statistics;
+mod validate;
 
 pub use environment::HostEnvironment;
-pub use jsonl::{
-    BenchmarkRecord, CompletionRecord, ConfigurationRecord, EnvironmentRecord, Fields, JsonlWriter,
-    ObservationRecord, SampleRecord,
-};
+pub use jsonl::{CaseSpec, Fields, ObservationSpec, PROTOCOL_VERSION, PairSide, Record};
 pub use order::{PairMeasurements, PairOrder, PairSchedule, PairVariant, measure_pair_with};
 pub use root::{BENCHMARK_PROFILE_ENV, BENCHMARK_ROOT_ENV, RunRoot};
+pub use run::{BENCHMARK_PLAN_ONLY_ENV, CaseId, Measurement, ObservationId, Plan, Run};
 pub use settings::BenchmarkProfile;
-pub use statistics::{DurationSummary, LatencySummary, PairedDurationSummary};
+pub use validate::{Artifact, Observation, PlanFingerprint, RunValidator, Sample};
 
 /// Rejects accidental execution of a benchmark built with debug assertions.
 ///

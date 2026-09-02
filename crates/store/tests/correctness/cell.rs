@@ -13,37 +13,24 @@ fn open_cell<T: StoreValue>(store: &Store, name: &str) -> Result<Cell<T>, StoreE
 }
 
 #[test]
-fn cell_state_transitions_are_exact() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let cell = create_cell::<u64>(&mut store, "cell").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin().unwrap();
-    let mut access = cell.access(transaction.access()).unwrap();
-    assert_eq!(access.get().unwrap(), None);
-    access.set(&1).unwrap();
-    assert_eq!(access.get().unwrap(), Some(1));
-    access.set(&2).unwrap();
-    assert_eq!(access.get().unwrap(), Some(2));
-    assert!(access.clear().unwrap());
-    assert!(!access.clear().unwrap());
-    assert_eq!(access.get().unwrap(), None);
-    transaction.commit().unwrap();
-}
-
-#[test]
-fn cell_uses_custom_value_codecs_and_survives_reopen() {
+fn cell_state_transitions_and_custom_codec_survive_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let cell = create_cell::<TestValue>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
+
     let transaction = transactions.begin().unwrap();
-    cell.access(transaction.access())
-        .unwrap()
-        .set(&TestValue(42))
-        .unwrap();
+    let mut access = cell.access(transaction.access()).unwrap();
+    assert_eq!(access.get().unwrap(), None);
+    access.set(&TestValue(1)).unwrap();
+    assert_eq!(access.get().unwrap(), Some(TestValue(1)));
+    access.set(&TestValue(2)).unwrap();
+    assert_eq!(access.get().unwrap(), Some(TestValue(2)));
+    assert!(access.clear().unwrap());
+    assert!(!access.clear().unwrap());
+    assert_eq!(access.get().unwrap(), None);
+    access.set(&TestValue(42)).unwrap();
     transaction.commit().unwrap();
     drop(transactions);
 

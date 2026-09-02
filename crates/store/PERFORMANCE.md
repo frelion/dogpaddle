@@ -9,19 +9,23 @@ microbenchmark 外推成上层吞吐承诺。
 ## 当前 runner 与历史基线
 
 当前四个 benchmark target 遵循[工作区测试协议](../../TESTING.md)。共享
-`dogpaddle-bench-protocol` 提供严格设置解析、环境指纹、typed JSONL、统计和配对顺序；Store
-自己的 `benches/support` 只保留 benchmark root、样本路径与人类格式薄适配。`ordered_map` 和
-`append_log` 的入口负责场景编排，并各自把 fixture、measure、oracle、report 放在同名子目录，
+`dogpaddle-bench-protocol` 提供严格设置解析、环境指纹、单一 typed JSONL schema、统一 artifact
+校验与配对顺序；Store 自己的 `benches/support` 只保留样本路径。`ordered_map` 和
+`append_log` 的入口负责场景编排，并各自把 fixture、measure、oracle 和极小 case 描述放在同名子目录，
 不增加 Cargo target，也不把产品语义放进共享协议 crate。统一配置见根目录
 [`TESTING.md`](../../TESTING.md)。
 
 `append_log_endurance` 由统一 `smoke`/`reference` profile 选择固定 workload、工作集和总写入预算；
-逐 append/truncate 耗时使用按 record width 和动作拆分的标准 SampleRecord series，`checkpoint` 保留
+逐 append/truncate 耗时使用按 record width 和动作拆分的标准 sample series，`checkpoint` 保留
 空间轨迹，每个 record width 的 terminal series 只补充 wall elapsed 与最终 reopen checksum。
-checkpoint 与 terminal 共用固定 ObservationRecord；configuration 的 `required_observations` 精确声明
-每条 series 的数量，通用 gate 验证连续 index 而不解析 Store owner payload。延迟分位、协议耗时、
+checkpoint 与 terminal 共用固定 observation record；`run` plan 精确声明每条 series 的数量，通用
+validator 验证连续 index 而不解析 Store owner payload。延迟分位、协议耗时、
 吞吐、peak 和 tail spread 都可从这些 raw facts 无损派生。所有 target 都输出完整环境指纹、计时外
 oracle、隔离样本 Store，以及 `smoke`/`reference` 文件系统档位。
+
+每个 target 旁的 `.plan.json` 同时冻结 smoke/reference 的 canonical Plan fingerprint；
+`cargo xtask bench-plan-check` 只构造 Plan、不创建 Store 或执行 workload，即可检查两档声明。
+正常执行消费同一组冻结 case/observation ID，最终 completion 前必须逐项完成。
 
 下文 2026-08-25 数值是旧 runner 在明确记录的 WSL2 `/tmp` 环境中得到的历史优化证据，应保留
 用于解释设计决策；它们不能直接作为新 runner 的回归基线。建立新基线时必须在固定 reference
@@ -292,6 +296,12 @@ PR 中的规范 protocol smoke 入口是：
 
 ```bash
 cargo xtask bench-smoke
+```
+
+只验证全部 smoke/reference Plan golden、完全不运行 fixture 或 measurement：
+
+```bash
+cargo xtask bench-plan-check
 ```
 
 它使用代码内固定的缩小矩阵实际运行工作区所有 benchmark。以下 Store 单 target 命令用于本地

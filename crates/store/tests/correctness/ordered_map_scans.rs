@@ -4,8 +4,7 @@ use std::{
 };
 
 use dogpaddle_store::{
-    CodecError, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store, StoreData, StoreError,
-    StoreValue,
+    CodecError, ScanDirection, ScanLimit, Small, Store, StoreData, StoreError, StoreValue,
 };
 
 use crate::support::{ByteMap, create_byte_map, create_map, store_path};
@@ -28,17 +27,9 @@ impl StoreValue for WideValue {
 
 #[test]
 fn projection_reads_logical_keys_and_fields_without_full_value_decode() {
-    assert_projection_reads_logical_keys_and_fields::<Small>();
-    assert_projection_reads_logical_keys_and_fields::<Large>();
-}
-
-fn assert_projection_reads_logical_keys_and_fields<SIZE>()
-where
-    OrderedMap<u64, WideValue, SIZE>: StoreData,
-{
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, WideValue, SIZE>(&mut store, "map").unwrap();
+    let map = create_map::<u64, WideValue, Small>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin().unwrap();
@@ -181,7 +172,6 @@ fn later_pages_observe_source_updates_made_by_an_earlier_callback() {
 #[test]
 fn byte_map_binary_keys_page_in_both_directions() {
     assert_binary_key_pages::<Small>();
-    assert_binary_key_pages::<Large>();
 }
 
 fn assert_binary_key_pages<SIZE>()

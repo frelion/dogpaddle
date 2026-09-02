@@ -1,54 +1,56 @@
-# `DogPaddle` benchmark protocol
+# `DogPaddle` benchmark harness
 
-`dogpaddle-bench-protocol` is an internal, non-publishable workspace crate for the
-mechanical parts shared by benchmark executables. It has no dependency on any
-`DogPaddle` product crate and deliberately contains no fixture, workload, timing
-boundary, result oracle, Store lifecycle, or human-readable report policy.
+`dogpaddle-bench-protocol` is the internal, non-publishable harness shared by
+the ten release benchmark executables. Product crates do not depend on it.
 
-The crate owns five small protocol concerns:
+The crate owns only mechanical policy:
 
-- one common `smoke`/`reference` profile and optional filesystem run root;
-- reproducibility metadata for rustc, OS/kernel, CPU, git, and an optional filesystem;
-- typed JSONL records with validated workload fields, an exact sample count, and exact observation series;
-- deterministic duration summaries and nearest-rank percentiles;
-- explicit alternating or four-round-counterbalanced A/B execution order.
+- the fixed `smoke`/`reference` profiles and optional reference filesystem;
+- rustc, host, git, and filesystem reproducibility metadata;
+- a concrete `Run` that assigns case IDs and zero-based sample indices;
+- a fixture-free, profile-specific `Plan` frozen before execution;
+- deterministic paired execution order;
+- the sole `Serialize + Deserialize` JSONL `Record` schema;
+- a protocol-owned `RunValidator` and a report derived from validated raw facts.
 
-Benchmark owners keep their semantic structs locally and put only additional
-machine-readable values in [`Fields`]. Every raw sample has one stable `series`
-identity; derived summaries are computed for human output and are not duplicated
-in the machine stream. Non-duration raw facts use `ObservationRecord`; configuration
-declares every stable series and exact count in `required_observations`, while the
-generic gate validates only identity and continuous indices without interpreting
-owner payload. This is an internal executable harness: malformed
-settings, records, fields, statistics, or output fail immediately at the caller
-with a stage-and-source diagnostic instead of exposing recoverable error types.
-Optional host probes remain best-effort and serialize `unavailable: ...`. Record constructors reject collisions
-with protocol-owned keys, so a workload cannot silently replace fields such as
-`record`, `benchmark`, `series`, `sample`, or `elapsed_ns`. The sealed record set is
-`environment | configuration | sample | observation | completion`; arbitrary owner
-discriminators and retired derived summaries cannot enter the machine stream.
+Owners still own every fixture, workload, warmup, timing boundary, and oracle.
+They return an already-timed and already-validated `Measurement`; the harness
+never starts a clock around owner setup or validation.
 
-```rust
-use std::time::Duration;
+One run consists of:
 
-use dogpaddle_bench_protocol::{
-    Fields, JsonlWriter, SampleRecord,
-};
-
-let mut output = Vec::new();
-let mut writer = JsonlWriter::new(&mut output);
-
-let work = Fields::new()
-    .with("operations", 64_usize)
-    .with("logical_bytes", 4_096_usize);
-writer.write(&SampleRecord::new(
-    "example",
-    "warm_scan",
-    0,
-    Duration::from_micros(30),
-    work,
-));
+```text
+run { environment, configuration, exact cases and observations }
+sample { compact case id, index, elapsed_ns, dynamic fields } *
+observation { compact observation id, index, fields } *
+completion
 ```
 
-The JSONL writer emits exactly one compact JSON object followed by `\n` for each
-record. Human-readable tables remain the responsibility of each benchmark target.
+Stable series, pair identity, sample counts, and static work facts occur once in
+the run plan rather than in every sample. `completion` is written only after the
+owner's final oracle succeeds. Human summaries are views of the same validated
+artifact; no derived summary record enters the machine stream.
+
+Cases and observations use one canonical lexicographic order. Every adjacent
+`<target>.plan.json` records the smoke and reference case count, observation
+count, canonical byte length, and FNV-1a-128 digest. `cargo xtask
+bench-plan-check` asks each executable to construct only its pure Plan for both
+profiles—without creating fixtures or starting measurements—and compares it to
+that independent golden. A normal run consumes the same frozen IDs, and
+`finish` rejects any missing or extra sample or observation.
+
+`fnv1a-128-canonical-json-v1` hashes the UTF-8 canonical JSON bytes for
+`protocol, benchmark, profile, configuration, cases, observations` in that
+order. It starts at `6c62272e07bb014262b821756295c58d`; for each byte it XORs
+then multiplies modulo 2¹²⁸ by `0000000001000000000000000000013b`.
+Configuration/field maps are key-ordered, and case/observation arrays are
+series-ordered. Locked empty/`a`/`foobar` vectors protect the implementation.
+
+`Run::memory` is for benchmarks without persistent fixtures.
+`Run::persistent` applies the common temporary/fixed-filesystem rules and owns
+fresh per-sample directories. Ordinary cases use `Run::samples`, paired cases
+use `Run::paired`, and unusual multi-way or endurance protocols use `push` and
+`observe` with IDs returned while constructing the Plan. There is no
+cross-owner scenario trait or workload DSL. The single deserialized `Record`
+enum rejects unknown fields and invalid labels; `RunValidator` owns both full
+artifact validation and plan-only golden validation.

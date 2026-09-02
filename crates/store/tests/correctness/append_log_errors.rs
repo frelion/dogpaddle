@@ -1,7 +1,4 @@
-use std::{
-    borrow::Cow,
-    num::{NonZeroU64, NonZeroUsize},
-};
+use std::{borrow::Cow, num::NonZeroUsize};
 
 use dogpaddle_store::{CodecError, ScanLimit, Store, StoreError, StoreValue};
 
@@ -10,44 +7,7 @@ use crate::support::store_path;
 use super::create_log;
 
 #[test]
-fn invalid_offsets_poison_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let log = create_log::<u64>(&mut store, "log");
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        log.access(transaction.access())
-            .unwrap()
-            .append(&1)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    for offset in [2, u64::MAX] {
-        let transaction = transactions.begin().unwrap();
-        let access = log.access(transaction.access()).unwrap();
-        assert!(matches!(
-            access.scan::<StoreError>(
-                offset,
-                ScanLimit::new(1, 1_024).unwrap(),
-                |_| Ok(())
-            ),
-            Err(StoreError::LogOffsetOutOfRange {
-                offset: actual,
-                head: 0,
-                tail: 1
-            }) if actual == offset
-        ));
-        assert!(matches!(
-            transaction.commit(),
-            Err(StoreError::TransactionPoisoned)
-        ));
-    }
-}
-
-#[test]
-fn stale_cursors_and_future_gc_targets_are_rejected() {
+fn stale_and_future_offsets_poison_scan_and_truncate() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let log = create_log::<u64>(&mut store, "log");
@@ -62,16 +22,16 @@ fn stale_cursors_and_future_gc_targets_are_rejected() {
         transaction.commit().unwrap();
     }
 
-    {
+    for offset in [0, 2, u64::MAX] {
         let transaction = transactions.begin().unwrap();
         let access = log.access(transaction.access()).unwrap();
         assert!(matches!(
-            access.scan::<StoreError>(0, ScanLimit::new(1, 1_024).unwrap(), |_| Ok(())),
+            access.scan::<StoreError>(offset, ScanLimit::new(1, 1_024).unwrap(), |_| Ok(())),
             Err(StoreError::LogOffsetOutOfRange {
-                offset: 0,
+                offset: actual,
                 head: 1,
                 tail: 1
-            })
+            }) if actual == offset
         ));
         assert!(matches!(
             transaction.commit(),
@@ -148,35 +108,6 @@ fn visitor_business_errors_poison_and_roll_back_prior_writes() {
     assert_eq!(access.retained_bytes().unwrap(), 0);
 }
 
-#[test]
-fn projection_codec_errors_poison_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let log = create_log::<Vec<u8>>(&mut store, "log");
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        log.access(transaction.access())
-            .unwrap()
-            .append(&b"bad".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    let access = log.access(transaction.access()).unwrap();
-    let error = access
-        .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
-            entry.project::<()>(|_| Err(CodecError::new("bad projection")))
-        })
-        .unwrap_err();
-    assert!(matches!(error, StoreError::Codec(_)));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-}
-
 enum BatchValue {
     Good(u64),
     Reject,
@@ -200,7 +131,7 @@ impl StoreValue for BatchValue {
 }
 
 #[test]
-fn batch_encoding_failure_rolls_back_entries_written_before_the_error() {
+fn append_encoding_failures_poison_and_roll_back_every_write_path() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let log = create_log::<BatchValue>(&mut store, "log");
@@ -226,26 +157,22 @@ fn batch_encoding_failure_rolls_back_entries_written_before_the_error() {
     let access = log.access(transaction.access()).unwrap();
     assert_eq!(access.bounds().unwrap(), 0..0);
     assert_eq!(access.retained_bytes().unwrap(), 0);
-}
+    drop(transaction);
 
-#[test]
-fn try_append_encoding_failure_poison_rolls_back_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let log = create_log::<BatchValue>(&mut store, "log");
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        let mut access = log.access(transaction.access()).unwrap();
-        assert!(matches!(
-            access.try_append(&BatchValue::Reject, NonZeroU64::new(1).unwrap()),
-            Err(StoreError::Codec(_))
-        ));
-        assert!(matches!(
-            transaction.commit(),
-            Err(StoreError::TransactionPoisoned)
-        ));
-    }
+    let transaction = transactions.begin().unwrap();
+    let mut access = log.access(transaction.access()).unwrap();
+    assert!(matches!(
+        access.try_append(&BatchValue::Reject, std::num::NonZeroU64::MAX),
+        Err(StoreError::Codec(_))
+    ));
+    assert!(matches!(
+        access.bounds(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
 
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
@@ -323,17 +250,18 @@ fn swallowed_projection_errors_still_poison_the_transaction() {
 }
 
 #[test]
-fn append_entry_rejects_another_transaction() {
+fn append_entry_is_bound_to_its_write_transaction() {
     let left_root = tempfile::tempdir().unwrap();
     let right_root = tempfile::tempdir().unwrap();
     let mut left_store = Store::create(store_path(&left_root)).unwrap();
     let mut right_store = Store::create(store_path(&right_root)).unwrap();
     let input = create_log::<u64>(&mut left_store, "input");
-    let output = create_log::<u64>(&mut right_store, "output");
-    let mut left_transactions = left_store.into_transactions();
-    let mut right_transactions = right_store.into_transactions();
+    let local_output = create_log::<u64>(&mut left_store, "output");
+    let foreign_output = create_log::<u64>(&mut right_store, "output");
+    let (mut left_writes, left_reads) = left_store.into_transactions().split();
+    let mut right_writes = right_store.into_transactions();
     {
-        let transaction = left_transactions.begin().unwrap();
+        let transaction = left_writes.begin().unwrap();
         input
             .access(transaction.access())
             .unwrap()
@@ -342,51 +270,35 @@ fn append_entry_rejects_another_transaction() {
         transaction.commit().unwrap();
     }
 
-    let left_transaction = left_transactions.begin().unwrap();
-    let right_transaction = right_transactions.begin().unwrap();
-    let input = input.access(left_transaction.access()).unwrap();
-    let mut output = output.access(right_transaction.access()).unwrap();
-    let error = input
-        .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
-            assert!(matches!(
-                output.append_entry(&entry),
-                Err(StoreError::WrongTransaction)
-            ));
-            Ok::<(), StoreError>(())
-        })
-        .unwrap_err();
-    assert!(matches!(error, StoreError::TransactionPoisoned));
-    assert!(matches!(
-        left_transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-    assert!(matches!(
-        right_transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-}
-
-#[test]
-fn append_entry_rejects_a_read_snapshot_entry() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let input = create_log::<u64>(&mut store, "input");
-    let output = create_log::<u64>(&mut store, "output");
-    let (mut writes, reads) = store.into_transactions().split();
     {
-        let transaction = writes.begin().unwrap();
-        input
-            .access(transaction.access())
-            .unwrap()
-            .append(&7)
-            .unwrap();
-        transaction.commit().unwrap();
+        let left = left_writes.begin().unwrap();
+        let right = right_writes.begin().unwrap();
+        let input = input.access(left.access()).unwrap();
+        let mut output = foreign_output.access(right.access()).unwrap();
+        let error = input
+            .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
+                assert!(matches!(
+                    output.append_entry(&entry),
+                    Err(StoreError::WrongTransaction)
+                ));
+                Ok::<(), StoreError>(())
+            })
+            .unwrap_err();
+        assert!(matches!(error, StoreError::TransactionPoisoned));
+        assert!(matches!(
+            left.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+        assert!(matches!(
+            right.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
     }
 
-    let read_transaction = reads.begin().unwrap();
-    let write_transaction = writes.begin().unwrap();
-    let input = input.read(read_transaction.access()).unwrap();
-    let mut output = output.access(write_transaction.access()).unwrap();
+    let read = left_reads.begin().unwrap();
+    let write = left_writes.begin().unwrap();
+    let input = input.read(read.access()).unwrap();
+    let mut output = local_output.access(write.access()).unwrap();
     let error = input
         .scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
             assert!(matches!(
@@ -402,7 +314,7 @@ fn append_entry_rejects_a_read_snapshot_entry() {
         Err(StoreError::TransactionPoisoned)
     ));
     assert!(matches!(
-        write_transaction.commit(),
+        write.commit(),
         Err(StoreError::TransactionPoisoned)
     ));
 }

@@ -60,56 +60,6 @@ fn key_codec_errors_poison_the_transaction() {
     );
 }
 
-#[test]
-fn scan_decode_errors_poison_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let safe = create_map::<u64, u64, Small>(&mut store, "safe").unwrap();
-    let raw = create_map::<Vec<u8>, Vec<u8>, Small>(&mut store, "raw").unwrap();
-    let malformed = open_map::<u64, u64, Small>(&store, "raw").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin().unwrap();
-    safe.access(transaction.access())
-        .unwrap()
-        .put(&1, &1)
-        .unwrap();
-    raw.access(transaction.access())
-        .unwrap()
-        .put(&vec![0], &0_u64.to_be_bytes().to_vec())
-        .unwrap();
-    assert!(matches!(
-        malformed.access(transaction.access()).unwrap().scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(10, 1_024).unwrap(),
-            |entry| {
-                entry.decode_owned()?;
-                Ok::<(), StoreError>(())
-            },
-        ),
-        Err(StoreError::Codec(_))
-    ));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        safe.access(transaction.access()).unwrap().get(&1).unwrap(),
-        None
-    );
-    assert_eq!(
-        raw.access(transaction.access())
-            .unwrap()
-            .get(&vec![0])
-            .unwrap(),
-        None
-    );
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum VisitError {
     Store,

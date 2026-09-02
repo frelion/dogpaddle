@@ -43,6 +43,9 @@ DOGPADDLE_BENCH_ROOT=/absolute/reference-filesystem \
 cargo bench -p dogpaddle-change-store-integration --bench change_append_log
 ```
 
-PR 使用 `cargo xtask bench-smoke` 执行 release target 并验证 JSONL metadata 与完整样本。
-每个 target 只有完成全部验证后才发出最后一个 completion。reference 必须保存完整 stdout；不要
+PR 使用 `cargo xtask bench-smoke` 执行 release target，并由 protocol-owned validator 验证自包含
+`run` plan、完整样本和 completion。每个 target 只有完成全部验证后才发出最后一个 completion。
+`cargo xtask bench-plan-check` 则只构造 smoke/reference 的纯 Plan，并与相邻 `.plan.json` golden
+比较，不创建 Change fixture 或 Store。
+reference 必须保存完整 stdout；不要
 只复制人类摘要，也不要把 reopen 称作 cold cache。

@@ -13,6 +13,7 @@ DogPaddle 是一个 Rust 2024 工作区。根目录 `README.md` 只介绍产品�
 - `cargo fmt --all -- --check`：检查格式，不修改文件。
 - `cargo clippy --workspace --all-targets -- -D warnings`：执行已配置的 `all` 和 `pedantic` Clippy 规则。若命令不可用，请先安装 Clippy rustup 组件。
 - `cargo xtask check`：运行格式、debug/release correctness、Clippy 与 Rustdoc 的统一工作区 gate。
+- `cargo xtask bench-plan-check`：不创建 fixture 或计时，验证全部 benchmark 的 smoke/reference 纯 Plan 与相邻黄金指纹一致。
 - `cargo xtask bench-smoke`：使用仓库固定的缩小参数实际执行全部 10 个 release benchmark target。
 - `cargo bench -p dogpaddle-store --bench cell`、`--bench ordered_map`、`--bench append_log`、`--bench append_log_endurance`：分别运行 Cell、OrderedMap、通用 AppendLog 和 AppendLog 长稳 release 基准测试；Change 使用 `change_core`/`change_codec`，Operation 使用 `operation_core`，Flow 使用冷路径 `flow_lifecycle` 和单轮调度 `flow_runtime`，Change + Store 只保留接缝性能证据 `change_append_log`。工作负载与口径见根目录 `TESTING.md` 及各自的测试或性能说明。
 

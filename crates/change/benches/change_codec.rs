@@ -2,22 +2,26 @@
 
 use std::{hint::black_box, sync::Arc};
 
-use dogpaddle_bench_protocol::require_benchmark_build;
+use dogpaddle_bench_protocol::{BenchmarkProfile, CaseId, Plan, Run};
 use dogpaddle_change::{
     Change, ChangeProjection, decode_change, decode_change_projected, encode_change,
 };
 
 use support::{
     fixture::{Fixture, fixtures},
-    runner::{BenchmarkCase, Config, MachineRecords, Measurement, Metric, timed},
+    runner::{Config, FixturePlan, Timed, plan_fixtures, record, timed},
 };
 
-#[path = "support/codec_report.rs"]
-mod report;
 mod support;
 
 const BENCHMARK: &str = "change_codec";
-const SCENARIOS_PER_FIXTURE: usize = 5;
+const SCENARIOS: &[&str] = &[
+    "encode",
+    "decode_full",
+    "decode_diff_only",
+    "decode_narrow",
+    "decode_identity",
+];
 
 #[derive(Clone, Copy)]
 enum CodecMode<'fixture> {
@@ -27,14 +31,14 @@ enum CodecMode<'fixture> {
 }
 
 struct CodecCase<'fixture> {
-    scenario: &'static str,
+    id: CaseId,
     mode: CodecMode<'fixture>,
     warm_checksum: Option<u64>,
-    measurements: Vec<Measurement>,
+    measurements: Vec<Timed>,
 }
 
 impl CodecMode<'_> {
-    fn measure(self, iterations: usize) -> Measurement {
+    fn measure(self, iterations: usize) -> Timed {
         match self {
             Self::Encode(change) => measure_encode(change, iterations),
             Self::DecodeFull(encoded) => measure_decode(encoded, iterations),
@@ -46,28 +50,38 @@ impl CodecMode<'_> {
 }
 
 fn main() {
-    require_benchmark_build(BENCHMARK);
-
-    let config = Config::load();
-    config.print(
-        BENCHMARK,
-        "DogPaddle Change codec benchmark",
-        SCENARIOS_PER_FIXTURE,
-    );
-    report::print_header("one complete self-contained Arrow IPC Stream per Change");
-    let mut records = MachineRecords::new(BENCHMARK);
+    let profile = BenchmarkProfile::from_environment();
+    let config = Config::load(profile);
+    let mut plan = Plan::new(profile, config.fields());
+    let plans = plan_fixtures(&mut plan, &config, SCENARIOS);
+    let mut run = Run::memory(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
+    }
+    let mut plans = plans.iter();
     for &rows in &config.rows {
         for fixture in fixtures(rows, config.payload_bytes, &config.workloads) {
-            benchmark_fixture(&config, &fixture, &mut records);
+            benchmark_fixture(
+                &config,
+                &fixture,
+                plans.next().expect("one frozen plan per Change fixture"),
+                &mut run,
+            );
         }
     }
-    records.print();
+    assert!(
+        plans.next().is_none(),
+        "all Change fixture plans are consumed"
+    );
+    run.finish(|| {});
 }
 
-fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRecords) {
+fn benchmark_fixture(config: &Config, fixture: &Fixture, plan: &FixturePlan, run: &mut Run) {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
     let encoded = encode_change(&fixture.change).expect("encode valid benchmark fixture");
+    plan.observe(run, fixture, encoded.len());
     let schema = fixture.change.schema();
     let diff_only = ChangeProjection::try_new(Arc::clone(&schema), [])
         .expect("construct diff-only benchmark projection");
@@ -80,31 +94,31 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRe
     validate_fixture(fixture, &encoded, &diff_only, &narrow, &identity);
     let mut cases = vec![
         CodecCase {
-            scenario: "encode",
+            id: plan.case("encode"),
             mode: CodecMode::Encode(&fixture.change),
             warm_checksum: None,
             measurements: Vec::with_capacity(config.samples),
         },
         CodecCase {
-            scenario: "decode_full",
+            id: plan.case("decode_full"),
             mode: CodecMode::DecodeFull(&encoded),
             warm_checksum: None,
             measurements: Vec::with_capacity(config.samples),
         },
         CodecCase {
-            scenario: "decode_diff_only",
+            id: plan.case("decode_diff_only"),
             mode: CodecMode::DecodeProjected(&encoded, &diff_only),
             warm_checksum: None,
             measurements: Vec::with_capacity(config.samples),
         },
         CodecCase {
-            scenario: "decode_narrow",
+            id: plan.case("decode_narrow"),
             mode: CodecMode::DecodeProjected(&encoded, &narrow),
             warm_checksum: None,
             measurements: Vec::with_capacity(config.samples),
         },
         CodecCase {
-            scenario: "decode_identity",
+            id: plan.case("decode_identity"),
             mode: CodecMode::DecodeProjected(&encoded, &identity),
             warm_checksum: None,
             measurements: Vec::with_capacity(config.samples),
@@ -128,13 +142,8 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRe
         }
     }
 
-    let metric = Metric::new(rows, encoded.len(), iterations);
     for case in cases {
-        report::measurements(
-            BenchmarkCase::new(fixture.name, case.scenario, metric),
-            &case.measurements,
-            records,
-        );
+        record(run, case.id, &case.measurements);
     }
 }
 
@@ -160,7 +169,7 @@ fn validate_fixture(
     }
 }
 
-fn measure_encode(change: &Change, iterations: usize) -> Measurement {
+fn measure_encode(change: &Change, iterations: usize) -> Timed {
     timed(iterations, || {
         let encoded = encode_change(black_box(change)).expect("encode valid benchmark Change");
         black_box(encoded.as_slice());
@@ -168,7 +177,7 @@ fn measure_encode(change: &Change, iterations: usize) -> Measurement {
     })
 }
 
-fn measure_decode(encoded: &[u8], iterations: usize) -> Measurement {
+fn measure_decode(encoded: &[u8], iterations: usize) -> Timed {
     timed(iterations, || {
         let decoded = decode_change(black_box(encoded)).expect("decode valid benchmark Change");
         black_box(decoded.records());
@@ -180,7 +189,7 @@ fn measure_decode_projected(
     encoded: &[u8],
     projection: &ChangeProjection,
     iterations: usize,
-) -> Measurement {
+) -> Timed {
     timed(iterations, || {
         let decoded = decode_change_projected(black_box(encoded), projection)
             .expect("selectively decode valid benchmark Change");

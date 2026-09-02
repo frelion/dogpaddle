@@ -2,7 +2,6 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
     fs,
     hint::black_box,
     num::NonZeroUsize,
@@ -11,15 +10,12 @@ use std::{
 };
 
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, ConfigurationRecord, Fields, LatencySummary, ObservationRecord, SampleRecord,
+    Artifact, BenchmarkProfile, CaseId, CaseSpec, Fields, Measurement, ObservationId,
+    ObservationSpec, Plan, Run,
 };
 use dogpaddle_store::{
     AppendLog, CodecError, ScanLimit, Store, StoreError, StoreValue, Transactions,
 };
-
-mod support;
-
-use support::{BenchRoot, complete, format_duration as duration, initialize, write_record};
 
 const BENCHMARK: &str = "append_log_endurance";
 const DEFAULT_RECORD_BYTES: &[usize] = &[128, 1_024, 8_192];
@@ -44,40 +40,35 @@ struct FileSize {
     allocated: u64,
 }
 
-struct EnduranceResult {
-    record_bytes: usize,
-    batch_items: usize,
-    window_items: usize,
-    steady_epochs: usize,
-    steady_records: usize,
-    append: LatencySummary,
-    gc: LatencySummary,
-    protocol_elapsed: Duration,
-    wall_elapsed: Duration,
-    seed_file: FileSize,
-    final_file: FileSize,
-    peak_file: FileSize,
-    tail_allocated_spread_basis_points: u64,
-    validation_checksum: u64,
-}
-
 struct ProtocolRun {
     head: u64,
     tail: u64,
-    append_durations: Vec<Duration>,
-    gc_durations: Vec<Duration>,
-    file_samples: Vec<FileSize>,
-    wall_elapsed: Duration,
+    wall_elapsed_ns: u128,
+}
+
+#[derive(Clone, Copy)]
+struct EndurancePlan {
+    record_bytes: usize,
+    batch_items: usize,
+    window_batches: usize,
+    window_items: usize,
+    steady_epochs: usize,
+    checkpoint_epochs: usize,
+    checkpoint: ObservationId,
+    terminal: ObservationId,
+    append: CaseId,
+    truncate: CaseId,
 }
 
 #[derive(Clone, Copy)]
 struct ProtocolConfig<'a> {
     store_path: &'a Path,
-    record_bytes: usize,
     window_items: usize,
     steady_epochs: usize,
     checkpoint_epochs: usize,
-    seed_file: FileSize,
+    checkpoint: ObservationId,
+    append: CaseId,
+    truncate: CaseId,
 }
 
 struct WorkloadConfig {
@@ -114,29 +105,19 @@ impl WorkloadConfig {
         }
     }
 
-    fn output_shape(&self) -> (NonZeroUsize, BTreeMap<String, NonZeroUsize>) {
-        let mut samples = 0_usize;
-        let mut observations = BTreeMap::new();
-        for record_bytes in &self.record_sizes {
-            let batch_items = (mib_bytes(self.batch_mib) / record_bytes).max(1);
-            let batch_bytes = batch_items.checked_mul(*record_bytes).unwrap();
-            let window_batches = mib_bytes(self.window_mib).div_ceil(batch_bytes).max(1);
-            let total_batches = mib_bytes(self.logical_mib)
-                .div_ceil(batch_bytes)
-                .max(window_batches + 1);
-            let steady_epochs = total_batches - window_batches;
-            samples += 2 * steady_epochs;
-            observations.insert(
-                checkpoint_series(*record_bytes),
-                NonZeroUsize::new(steady_epochs.div_ceil(self.checkpoint_epochs) + 1)
-                    .expect("endurance benchmark emits checkpoints"),
-            );
-            observations.insert(terminal_series(*record_bytes), NonZeroUsize::MIN);
-        }
-        (
-            NonZeroUsize::new(samples).expect("endurance benchmark emits duration samples"),
-            observations,
-        )
+    fn fields(&self, budget: BudgetEstimate) -> Fields {
+        Fields::new()
+            .with("record_bytes", &self.record_sizes)
+            .with("logical_mib_per_width", self.logical_mib)
+            .with("window_mib", self.window_mib)
+            .with("batch_mib", self.batch_mib)
+            .with("checkpoint_epochs", self.checkpoint_epochs)
+            .with("max_working_set_bytes", self.max_working_set_bytes)
+            .with("estimated_working_set_bytes", budget.max_working_set_bytes)
+            .with("max_total_written_bytes", self.max_total_written_bytes)
+            .with("estimated_total_written_bytes", budget.total_written_bytes)
+            .with("execution", "single_thread")
+            .with("mdbx_sync_mode", "durable")
     }
 }
 
@@ -175,8 +156,7 @@ impl StoreValue for EnduranceRecord {
 }
 
 fn main() {
-    let environment = initialize(BENCHMARK);
-    let profile = environment.profile();
+    let profile = BenchmarkProfile::from_environment();
     let config = WorkloadConfig::for_profile(profile);
     assert!(config.logical_mib > config.window_mib);
     assert!(
@@ -198,62 +178,179 @@ fn main() {
         budget.total_written_bytes,
         config.max_total_written_bytes
     );
-    let (expected_samples, required_observations) = config.output_shape();
-    let mut fields = Fields::new();
-    fields.insert("record_bytes", &config.record_sizes);
-    for (name, value) in [
-        ("logical_mib_per_width", config.logical_mib),
-        ("window_mib", config.window_mib),
-        ("batch_mib", config.batch_mib),
-        ("checkpoint_epochs", config.checkpoint_epochs),
-        ("max_working_set_bytes", config.max_working_set_bytes),
-        ("estimated_working_set_bytes", budget.max_working_set_bytes),
-        ("max_total_written_bytes", config.max_total_written_bytes),
-        ("estimated_total_written_bytes", budget.total_written_bytes),
-    ] {
-        fields.insert(name, value);
+    let mut plan = Plan::new(profile, config.fields(budget));
+    let workloads = config
+        .record_sizes
+        .iter()
+        .map(|&record_bytes| plan_endurance(&mut plan, &config, record_bytes))
+        .collect::<Vec<_>>();
+    let mut run = Run::persistent(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
     }
-    let mut record = ConfigurationRecord::new(BENCHMARK, expected_samples, fields);
-    for (series, count) in required_observations {
-        record.require_observation(series, count);
+    for workload in workloads {
+        run_endurance(&mut run, workload);
     }
-    write_record(&record);
+    let artifact = run.finish(|| {});
+    print_summary(&artifact, &config);
+}
 
-    println!("DogPaddle AppendLog endurance benchmark");
-    println!(
-        "profile={} record_bytes={:?} logical_mib_per_width={} window_mib={} batch_mib={} checkpoint_epochs={}",
-        profile,
-        config.record_sizes,
-        config.logical_mib,
-        config.window_mib,
-        config.batch_mib,
-        config.checkpoint_epochs,
-    );
-    println!(
-        "protocol=append_batch+durable_commit then truncate_before+durable_commit sync=durable execution=single-thread"
-    );
-    println!(
-        "budgets: estimated_working_set={} max_working_set={} estimated_total_written={} max_total_written={}",
-        bytes(to_u64(budget.max_working_set_bytes)),
-        bytes(to_u64(config.max_working_set_bytes)),
-        bytes(to_u64(budget.total_written_bytes)),
-        bytes(to_u64(config.max_total_written_bytes)),
-    );
-
-    let mut results = Vec::with_capacity(config.record_sizes.len());
+fn print_summary(artifact: &Artifact, config: &WorkloadConfig) {
+    println!();
+    println!("=== Endurance derived summary ===");
     for &record_bytes in &config.record_sizes {
-        results.push(run_endurance(
-            &environment,
-            record_bytes,
-            config.logical_mib,
-            config.window_mib,
-            config.batch_mib,
-            config.checkpoint_epochs,
-        ));
-    }
+        let append_series = format!("record_bytes={record_bytes}/append");
+        let truncate_series = format!("record_bytes={record_bytes}/truncate");
+        let (append, append_samples) = artifact
+            .cases()
+            .find(|(case, _)| case.series() == append_series)
+            .expect("endurance artifact contains append samples");
+        let (_, truncate_samples) = artifact
+            .cases()
+            .find(|(case, _)| case.series() == truncate_series)
+            .expect("endurance artifact contains truncate samples");
+        let batch_items = append
+            .fields()
+            .get_u64("operations")
+            .expect("endurance append case declares operations");
+        let append_ns = sorted_elapsed(append_samples);
+        let truncate_ns = sorted_elapsed(truncate_samples);
+        let protocol_ns = append_ns
+            .iter()
+            .chain(&truncate_ns)
+            .map(|&value| u128::from(value))
+            .sum::<u128>();
+        let steady_records = u128::from(batch_items)
+            * u128::try_from(append_samples.len()).expect("sample count fits u128");
+        let throughput = steady_records * 1_000_000_000 / protocol_ns.max(1);
 
-    print_summary(&results);
-    complete(BENCHMARK);
+        let checkpoint_series = checkpoint_series(record_bytes);
+        let (_, checkpoints) = artifact
+            .observations()
+            .find(|(spec, _)| spec.series() == checkpoint_series)
+            .expect("endurance artifact contains checkpoints");
+        let allocated = checkpoints
+            .iter()
+            .map(|checkpoint| {
+                checkpoint
+                    .fields()
+                    .get_u64("file_allocated_bytes")
+                    .expect("endurance checkpoint contains allocated bytes")
+            })
+            .collect::<Vec<_>>();
+        let final_checkpoint = checkpoints.last().expect("endurance has checkpoints");
+        let head = observation_u64(final_checkpoint, "head");
+        let tail = observation_u64(final_checkpoint, "tail");
+        let retained_payload =
+            u128::from(tail - head) * u128::try_from(record_bytes).expect("record width fits u128");
+        let final_allocated = u128::from(*allocated.last().expect("endurance has checkpoints"));
+        let amplification_hundredths = final_allocated * 100 / retained_payload.max(1);
+        let spread_basis_points = tail_spread_basis_points(&allocated);
+
+        let terminal_series = terminal_series(record_bytes);
+        let (_, terminal) = artifact
+            .observations()
+            .find(|(spec, _)| spec.series() == terminal_series)
+            .expect("endurance artifact contains terminal observation");
+        let terminal = terminal
+            .first()
+            .expect("endurance has one terminal observation");
+        let wall_ns = observation_u64(terminal, "wall_elapsed_ns");
+        let checksum = terminal
+            .fields()
+            .get_str("validation_checksum")
+            .expect("endurance terminal contains validation checksum");
+
+        println!(
+            "record={record_bytes} B batch={batch_items} items epochs={} steady_records={steady_records}",
+            append_samples.len()
+        );
+        print_latency("append tx", &append_ns);
+        print_latency("truncate tx", &truncate_ns);
+        println!(
+            "  protocol={} wall={} throughput={throughput} records/s",
+            duration_ns(protocol_ns),
+            duration_ns(u128::from(wall_ns)),
+        );
+        println!(
+            "  file seed={} final={} peak={} allocated_amplification={}.{:02}x tail_spread={}.{:02}%",
+            bytes(allocated[0]),
+            bytes(u64::try_from(final_allocated).expect("allocated bytes fit u64")),
+            bytes(*allocated.iter().max().expect("endurance has checkpoints")),
+            amplification_hundredths / 100,
+            amplification_hundredths % 100,
+            spread_basis_points / 100,
+            spread_basis_points % 100,
+        );
+        println!("  validation=reopen+full-retained-scan checksum={checksum}");
+    }
+}
+
+fn sorted_elapsed(samples: &[dogpaddle_bench_protocol::Sample]) -> Vec<u64> {
+    let mut elapsed = samples
+        .iter()
+        .map(dogpaddle_bench_protocol::Sample::elapsed_ns)
+        .collect::<Vec<_>>();
+    elapsed.sort_unstable();
+    elapsed
+}
+
+fn print_latency(label: &str, sorted: &[u64]) {
+    println!(
+        "  {label:<11} p50={} p95={} p99={} max={}",
+        duration_ns(u128::from(percentile(sorted, 50))),
+        duration_ns(u128::from(percentile(sorted, 95))),
+        duration_ns(u128::from(percentile(sorted, 99))),
+        duration_ns(u128::from(
+            *sorted.last().expect("latency samples are non-empty")
+        )),
+    );
+}
+
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100);
+    sorted[rank.saturating_sub(1)]
+}
+
+fn observation_u64(observation: &dogpaddle_bench_protocol::Observation, field: &str) -> u64 {
+    observation
+        .fields()
+        .get_u64(field)
+        .unwrap_or_else(|| panic!("endurance observation requires u64 field {field:?}"))
+}
+
+fn tail_spread_basis_points(samples: &[u64]) -> u64 {
+    let tail = &samples[samples.len() / 2..];
+    let minimum = *tail.iter().min().expect("endurance has tail samples");
+    let maximum = *tail.iter().max().expect("endurance has tail samples");
+    if minimum == 0 {
+        0
+    } else {
+        u64::try_from(u128::from(maximum - minimum) * 10_000 / u128::from(minimum))
+            .expect("tail spread fits u64")
+    }
+}
+
+fn duration_ns(nanos: u128) -> String {
+    let duration = Duration::from_nanos(u64::try_from(nanos).expect("duration fits u64 nanos"));
+    if nanos >= 1_000_000_000 {
+        format!("{:.3}s", duration.as_secs_f64())
+    } else if nanos >= 1_000_000 {
+        format!("{:.3}ms", duration.as_secs_f64() * 1_000.0)
+    } else {
+        format!("{:.3}us", duration.as_secs_f64() * 1_000_000.0)
+    }
+}
+
+fn bytes(value: u64) -> String {
+    let unit = if value >= 1_073_741_824 {
+        (1_073_741_824_u64, "GiB")
+    } else {
+        (1_048_576_u64, "MiB")
+    };
+    let hundredths = u128::from(value) * 100 / u128::from(unit.0);
+    format!("{}.{:02} {}", hundredths / 100, hundredths % 100, unit.1)
 }
 
 fn estimate_budget(config: &WorkloadConfig) -> BudgetEstimate {
@@ -297,110 +394,108 @@ fn estimate_budget(config: &WorkloadConfig) -> BudgetEstimate {
     }
 }
 
-fn run_endurance(
-    bench_root: &BenchRoot,
-    record_bytes: usize,
-    logical_mib: usize,
-    window_mib: usize,
-    batch_mib: usize,
-    checkpoint_epochs: usize,
-) -> EnduranceResult {
-    let batch_target_bytes = mib_bytes(batch_mib);
+fn plan_endurance(plan: &mut Plan, config: &WorkloadConfig, record_bytes: usize) -> EndurancePlan {
+    let batch_target_bytes = mib_bytes(config.batch_mib);
     let batch_items = (batch_target_bytes / record_bytes).max(1);
     let batch_bytes = batch_items
         .checked_mul(record_bytes)
         .expect("batch byte size fits in usize");
-    let window_batches = mib_bytes(window_mib).div_ceil(batch_bytes).max(1);
+    let window_batches = mib_bytes(config.window_mib).div_ceil(batch_bytes).max(1);
     let window_items = window_batches
         .checked_mul(batch_items)
         .expect("window item count fits in usize");
-    let total_batches = mib_bytes(logical_mib)
+    let total_batches = mib_bytes(config.logical_mib)
         .div_ceil(batch_bytes)
         .max(window_batches + 1);
     let steady_epochs = total_batches - window_batches;
-    let steady_records = steady_epochs
-        .checked_mul(batch_items)
-        .expect("steady record count fits in usize");
-    let max_gc_items = NonZeroUsize::new(batch_items).expect("batch item count is non-zero");
-    let records = (0..batch_items)
-        .map(|index| EnduranceRecord::new(index, record_bytes))
+    let samples = NonZeroUsize::new(steady_epochs).expect("endurance has steady epochs");
+    let sample_fields = Fields::new()
+        .with("operations", batch_items)
+        .with("transactions", 1)
+        .with("logical_bytes", batch_bytes);
+    let append = plan.case(CaseSpec::new(
+        format!("record_bytes={record_bytes}/append"),
+        samples,
+        sample_fields.clone(),
+    ));
+    let truncate = plan.case(CaseSpec::new(
+        format!("record_bytes={record_bytes}/truncate"),
+        samples,
+        sample_fields,
+    ));
+    let checkpoint = plan.observation(ObservationSpec::new(
+        checkpoint_series(record_bytes),
+        NonZeroUsize::new(steady_epochs.div_ceil(config.checkpoint_epochs) + 1)
+            .expect("endurance emits checkpoints"),
+    ));
+    let terminal = plan.observation(ObservationSpec::new(
+        terminal_series(record_bytes),
+        NonZeroUsize::MIN,
+    ));
+    EndurancePlan {
+        record_bytes,
+        batch_items,
+        window_batches,
+        window_items,
+        steady_epochs,
+        checkpoint_epochs: config.checkpoint_epochs,
+        checkpoint,
+        terminal,
+        append,
+        truncate,
+    }
+}
+
+fn run_endurance(run: &mut Run, plan: EndurancePlan) {
+    let max_gc_items = NonZeroUsize::new(plan.batch_items).expect("batch item count is non-zero");
+    let records = (0..plan.batch_items)
+        .map(|index| EnduranceRecord::new(index, plan.record_bytes))
         .collect::<Vec<_>>();
 
-    let root = bench_root.sample(&format!("append-log-endurance-{record_bytes}"));
+    let root = run.sample(&format!("append-log-endurance-{}", plan.record_bytes));
     let store_path = root.path().join("store");
     let mut store = Store::create(&store_path).expect("create endurance benchmark store");
     let log = store
         .create_data::<AppendLog<EnduranceRecord>>("log")
         .expect("create endurance benchmark log");
     let mut transactions = store.into_transactions();
-    seed_window(&mut transactions, &log, &records, window_batches);
-    let seed_file = data_file_size(&store_path);
-    print_protocol_header(record_bytes, batch_items, window_items, steady_epochs);
-    let run = run_protocol(
+    seed_window(&mut transactions, &log, &records, plan.window_batches);
+    let protocol = run_protocol(
+        run,
         &mut transactions,
         &log,
         &records,
         max_gc_items,
         ProtocolConfig {
             store_path: &store_path,
-            record_bytes,
-            window_items,
-            steady_epochs,
-            checkpoint_epochs,
-            seed_file,
+            window_items: plan.window_items,
+            steady_epochs: plan.steady_epochs,
+            checkpoint_epochs: plan.checkpoint_epochs,
+            checkpoint: plan.checkpoint,
+            append: plan.append,
+            truncate: plan.truncate,
         },
     );
-    let protocol_elapsed = run
-        .append_durations
-        .iter()
-        .chain(&run.gc_durations)
-        .copied()
-        .sum();
-
-    let final_file = data_file_size(&store_path);
-    let peak_file = FileSize {
-        logical: run
-            .file_samples
-            .iter()
-            .map(|sample| sample.logical)
-            .max()
-            .expect("at least the seed file sample exists"),
-        allocated: run
-            .file_samples
-            .iter()
-            .map(|sample| sample.allocated)
-            .max()
-            .expect("at least the seed file sample exists"),
-    };
-    let tail_allocated_spread_basis_points = tail_spread_basis_points(&run.file_samples);
 
     drop(transactions);
     let validation_checksum = validate_reopened(
         &store_path,
-        run.head,
-        run.tail,
-        record_bytes,
-        batch_items,
-        window_items,
+        protocol.head,
+        protocol.tail,
+        plan.record_bytes,
+        plan.batch_items,
+        plan.window_items,
     );
     black_box(validation_checksum);
-
-    EnduranceResult {
-        record_bytes,
-        batch_items,
-        window_items,
-        steady_epochs,
-        steady_records,
-        append: LatencySummary::from_samples(&run.append_durations),
-        gc: LatencySummary::from_samples(&run.gc_durations),
-        protocol_elapsed,
-        wall_elapsed: run.wall_elapsed,
-        seed_file,
-        final_file,
-        peak_file,
-        tail_allocated_spread_basis_points,
-        validation_checksum,
-    }
+    run.observe(
+        plan.terminal,
+        Fields::new()
+            .with("wall_elapsed_ns", protocol.wall_elapsed_ns)
+            .with(
+                "validation_checksum",
+                format!("{validation_checksum:#018x}"),
+            ),
+    );
 }
 
 fn seed_window(
@@ -423,23 +518,8 @@ fn seed_window(
     }
 }
 
-fn print_protocol_header(
-    record_bytes: usize,
-    batch_items: usize,
-    window_items: usize,
-    steady_epochs: usize,
-) {
-    println!();
-    println!(
-        "=== record_bytes={record_bytes} batch_items={batch_items} window_items={window_items} steady_epochs={steady_epochs} ==="
-    );
-    println!(
-        "{:<12} {:>14} {:>14} {:>14} {:>14}",
-        "epoch", "head", "tail", "file logical", "file allocated"
-    );
-}
-
 fn run_protocol(
+    run: &mut Run,
     transactions: &mut Transactions,
     log: &AppendLog<EnduranceRecord>,
     records: &[EnduranceRecord],
@@ -450,14 +530,14 @@ fn run_protocol(
     let batch_items_u64 = to_u64(batch_items);
     let mut head = 0_u64;
     let mut tail = to_u64(config.window_items);
-    let mut file_samples = vec![config.seed_file];
-    let mut append_durations = Vec::with_capacity(config.steady_epochs);
-    let mut gc_durations = Vec::with_capacity(config.steady_epochs);
-    let batch_logical_bytes = records
-        .iter()
-        .map(|record| record.encoded.len())
-        .sum::<usize>();
-    print_checkpoint(config.record_bytes, 0, 0, head, tail, config.seed_file);
+    record_checkpoint(
+        run,
+        config.checkpoint,
+        0,
+        head,
+        tail,
+        data_file_size(config.store_path),
+    );
 
     let wall_started = Instant::now();
     for epoch in 1..=config.steady_epochs {
@@ -475,15 +555,7 @@ fn run_protocol(
             .expect("commit endurance append transaction");
         let append_duration = append_started.elapsed();
         assert_eq!(assigned, tail..tail + batch_items_u64);
-        emit_cycle_sample(
-            config.record_bytes,
-            epoch - 1,
-            append_duration,
-            "append",
-            batch_items,
-            batch_logical_bytes,
-        );
-        append_durations.push(append_duration);
+        run.push(config.append, Measurement::new(append_duration));
         tail += batch_items_u64;
 
         let target = tail - to_u64(config.window_items);
@@ -501,32 +573,19 @@ fn run_protocol(
             .expect("commit endurance GC transaction");
         let gc_duration = gc_started.elapsed();
         assert_eq!(next_head, target);
-        emit_cycle_sample(
-            config.record_bytes,
-            epoch - 1,
-            gc_duration,
-            "truncate",
-            batch_items,
-            batch_logical_bytes,
-        );
-        gc_durations.push(gc_duration);
+        run.push(config.truncate, Measurement::new(gc_duration));
         head = next_head;
 
         if epoch.is_multiple_of(config.checkpoint_epochs) || epoch == config.steady_epochs {
             let size = data_file_size(config.store_path);
-            let sample = file_samples.len();
-            file_samples.push(size);
-            print_checkpoint(config.record_bytes, sample, epoch, head, tail, size);
+            record_checkpoint(run, config.checkpoint, epoch, head, tail, size);
         }
     }
 
     ProtocolRun {
         head,
         tail,
-        append_durations,
-        gc_durations,
-        file_samples,
-        wall_elapsed: wall_started.elapsed(),
+        wall_elapsed_ns: wall_started.elapsed().as_nanos(),
     }
 }
 
@@ -629,42 +688,14 @@ fn verify_record(
     Ok(key ^ u64::from(fill) ^ diff.cast_unsigned())
 }
 
-fn tail_spread_basis_points(samples: &[FileSize]) -> u64 {
-    let tail = &samples[samples.len() / 2..];
-    let minimum = tail
-        .iter()
-        .map(|sample| sample.allocated)
-        .min()
-        .expect("at least one tail file sample exists");
-    let maximum = tail
-        .iter()
-        .map(|sample| sample.allocated)
-        .max()
-        .expect("at least one tail file sample exists");
-    if minimum == 0 {
-        0
-    } else {
-        let spread = u128::from(maximum - minimum)
-            .checked_mul(10_000)
-            .expect("tail spread calculation fits in u128")
-            / u128::from(minimum);
-        u64::try_from(spread).expect("tail spread basis points fit in u64")
-    }
-}
-
-fn print_checkpoint(
-    record_bytes: usize,
-    sample: usize,
+fn record_checkpoint(
+    run: &mut Run,
+    checkpoint: ObservationId,
     epoch: usize,
     head: u64,
     tail: u64,
     size: FileSize,
 ) {
-    println!(
-        "{epoch:<12} {head:>14} {tail:>14} {:>14} {:>14}",
-        bytes(size.logical),
-        bytes(size.allocated)
-    );
     let mut fields = Fields::new();
     fields.insert("epoch", epoch);
     for (name, value) in [
@@ -675,112 +706,7 @@ fn print_checkpoint(
     ] {
         fields.insert(name, value);
     }
-    let record = ObservationRecord::new(BENCHMARK, checkpoint_series(record_bytes), sample, fields);
-    write_record(&record);
-}
-
-fn print_summary(results: &[EnduranceResult]) {
-    println!();
-    println!("=== Endurance summary ===");
-    for result in results {
-        let retained_payload = result
-            .window_items
-            .checked_mul(result.record_bytes)
-            .expect("retained payload byte size fits in usize");
-        let amplification_hundredths = if retained_payload == 0 {
-            0
-        } else {
-            u128::from(result.final_file.allocated)
-                .checked_mul(100)
-                .expect("allocated amplification calculation fits in u128")
-                / u128::try_from(retained_payload).expect("retained payload fits in u128")
-        };
-        let records_per_second = u128::try_from(result.steady_records)
-            .expect("steady record count fits in u128")
-            .checked_mul(1_000_000_000)
-            .expect("throughput calculation fits in u128")
-            / result.protocol_elapsed.as_nanos();
-        let amplification_whole = amplification_hundredths / 100;
-        let amplification_fraction = amplification_hundredths % 100;
-        let spread_whole = result.tail_allocated_spread_basis_points / 100;
-        let spread_fraction = result.tail_allocated_spread_basis_points % 100;
-        println!();
-        println!(
-            "record={} B batch={} items window={} items epochs={} steady_records={}",
-            result.record_bytes,
-            result.batch_items,
-            result.window_items,
-            result.steady_epochs,
-            result.steady_records
-        );
-        println!(
-            "  append tx p50={} p95={} p99={} max={}",
-            duration(result.append.p50()),
-            duration(result.append.p95()),
-            duration(result.append.p99()),
-            duration(result.append.max())
-        );
-        println!(
-            "  GC tx     p50={} p95={} p99={} max={}",
-            duration(result.gc.p50()),
-            duration(result.gc.p95()),
-            duration(result.gc.p99()),
-            duration(result.gc.max())
-        );
-        println!(
-            "  protocol={} wall={} throughput={records_per_second:.0} records/s",
-            duration(result.protocol_elapsed),
-            duration(result.wall_elapsed)
-        );
-        println!(
-            "  file seed={} final={} peak={} allocated_amplification={amplification_whole}.{amplification_fraction:02}x tail_spread={spread_whole}.{spread_fraction:02}%",
-            bytes(result.seed_file.allocated),
-            bytes(result.final_file.allocated),
-            bytes(result.peak_file.allocated)
-        );
-        println!(
-            "  validation=reopen+full-retained-scan checksum={:#018x}",
-            result.validation_checksum
-        );
-        emit_terminal_observation(result);
-    }
-}
-
-fn emit_terminal_observation(result: &EnduranceResult) {
-    let fields = Fields::new()
-        .with("wall_elapsed_ns", result.wall_elapsed.as_nanos())
-        .with(
-            "validation_checksum",
-            format!("{:#018x}", result.validation_checksum),
-        );
-    let record = ObservationRecord::new(BENCHMARK, terminal_series(result.record_bytes), 0, fields);
-    write_record(&record);
-}
-
-fn emit_cycle_sample(
-    record_bytes: usize,
-    sample: usize,
-    elapsed: Duration,
-    variant: &str,
-    operations: usize,
-    logical_bytes: usize,
-) {
-    let mut fields = Fields::new();
-    for (name, value) in [
-        ("operations", operations),
-        ("transactions", 1),
-        ("logical_bytes", logical_bytes),
-    ] {
-        fields.insert(name, value);
-    }
-    let record = SampleRecord::new(
-        BENCHMARK,
-        format!("record_bytes={record_bytes}/{variant}"),
-        sample,
-        elapsed,
-        fields,
-    );
-    write_record(&record);
+    run.observe(checkpoint, fields);
 }
 
 fn terminal_series(record_bytes: usize) -> String {
@@ -815,25 +741,6 @@ fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
 fn mib_bytes(mib: usize) -> usize {
     mib.checked_mul(MEBIBYTE_BYTES)
         .expect("configured MiB value fits in usize")
-}
-
-fn bytes(value: u64) -> String {
-    const GIBIBYTE_BYTES: u64 = 1_073_741_824;
-    const MEBIBYTE_BYTES_U64: u64 = 1_048_576;
-
-    if value >= GIBIBYTE_BYTES {
-        scaled_bytes(value, GIBIBYTE_BYTES, "GiB")
-    } else {
-        scaled_bytes(value, MEBIBYTE_BYTES_U64, "MiB")
-    }
-}
-
-fn scaled_bytes(value: u64, unit_bytes: u64, unit: &str) -> String {
-    let hundredths = u128::from(value)
-        .checked_mul(100)
-        .expect("byte formatting calculation fits in u128")
-        / u128::from(unit_bytes);
-    format!("{}.{:02} {unit}", hundredths / 100, hundredths % 100)
 }
 
 fn to_u64(value: usize) -> u64 {

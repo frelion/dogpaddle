@@ -6,24 +6,6 @@ use libmdbx::WriteFlags;
 use crate::support::{ByteMap, create_byte_map, open_byte_map, raw_database, store_path};
 
 #[test]
-fn creates_opens_and_recovers_named_data() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    create_byte_map::<Small>(&mut store, "small").unwrap();
-    create_byte_map::<Large>(&mut store, "large").unwrap();
-    drop(store);
-
-    let store = Store::open(&path).unwrap();
-    open_byte_map::<Small>(&store, "small").unwrap();
-    open_byte_map::<Large>(&store, "large").unwrap();
-    assert!(matches!(
-        store.open_data::<ByteMap<Small>>("missing"),
-        Err(StoreError::DataNotFound(name)) if name == "missing"
-    ));
-}
-
-#[test]
 fn typed_open_rejects_a_different_durable_size() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
@@ -48,6 +30,10 @@ fn typed_open_rejects_a_different_durable_size() {
             expected: "small",
             actual: "large",
         }) if name == "large"
+    ));
+    assert!(matches!(
+        open_byte_map::<Small>(&store, "missing"),
+        Err(StoreError::DataNotFound(name)) if name == "missing"
     ));
 }
 

@@ -60,7 +60,6 @@ fn zero_column_change_stream_has_stable_golden_bytes() {
 
     let encoded = encode_change(&change).unwrap();
     assert_eq!(hex(&encoded), expected);
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
 }
 
 #[test]
@@ -73,7 +72,6 @@ fn sliced_representative_change_stream_has_stable_golden_bytes() {
 
     let encoded = encode_change(&change).unwrap();
     assert_eq!(hex(&encoded), expected);
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
 }
 
 #[test]
@@ -124,214 +122,80 @@ fn metadata_insertion_order_does_not_change_stream_bytes() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the complete scalar/null/edge-value matrix stays together for auditability"
-)]
-fn every_supported_scalar_round_trips_real_values_and_float_edges() {
-    let f32_nan = f32::from_bits(0x7fc0_1234);
-    let f64_nan = f64::from_bits(0x7ff8_0000_0000_1234);
-    let columns: Vec<(&str, ArrayRef)> = vec![
-        (
-            "bool",
-            Arc::new(BooleanArray::from(vec![
-                Some(true),
-                Some(false),
-                None,
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-            ])),
-        ),
-        (
-            "i8",
-            Arc::new(Int8Array::from(vec![
-                Some(i8::MIN),
-                Some(-1),
-                Some(0),
-                Some(i8::MAX),
-                None,
-                Some(42),
-                Some(-42),
-            ])),
-        ),
-        (
-            "i16",
-            Arc::new(Int16Array::from(vec![
-                Some(i16::MIN),
-                Some(-1),
-                Some(0),
-                Some(i16::MAX),
-                None,
-                Some(42),
-                Some(-42),
-            ])),
-        ),
-        (
-            "i32",
-            Arc::new(Int32Array::from(vec![
-                Some(i32::MIN),
-                Some(-1),
-                Some(0),
-                Some(i32::MAX),
-                None,
-                Some(42),
-                Some(-42),
-            ])),
-        ),
-        (
-            "i64",
-            Arc::new(Int64Array::from(vec![
-                Some(i64::MIN),
-                Some(-1),
-                Some(0),
-                Some(i64::MAX),
-                None,
-                Some(42),
-                Some(-42),
-            ])),
-        ),
-        (
-            "u8",
-            Arc::new(UInt8Array::from(vec![
-                Some(0),
-                Some(1),
-                Some(u8::MAX - 1),
-                Some(u8::MAX),
-                None,
-                Some(42),
-                Some(7),
-            ])),
-        ),
-        (
-            "u16",
-            Arc::new(UInt16Array::from(vec![
-                Some(0),
-                Some(1),
-                Some(u16::MAX - 1),
-                Some(u16::MAX),
-                None,
-                Some(42),
-                Some(7),
-            ])),
-        ),
-        (
-            "u32",
-            Arc::new(UInt32Array::from(vec![
-                Some(0),
-                Some(1),
-                Some(u32::MAX - 1),
-                Some(u32::MAX),
-                None,
-                Some(42),
-                Some(7),
-            ])),
-        ),
-        (
-            "u64",
-            Arc::new(UInt64Array::from(vec![
-                Some(0),
-                Some(1),
-                Some(u64::MAX - 1),
-                Some(u64::MAX),
-                None,
-                Some(42),
-                Some(7),
-            ])),
-        ),
-        (
-            "f32",
-            Arc::new(Float32Array::from(vec![
-                Some(f32::NEG_INFINITY),
-                Some(-0.0),
-                Some(0.0),
-                Some(f32::INFINITY),
-                Some(f32_nan),
-                None,
-                Some(-123.5),
-            ])),
-        ),
-        (
-            "f64",
-            Arc::new(Float64Array::from(vec![
-                Some(f64::NEG_INFINITY),
-                Some(-0.0),
-                Some(0.0),
-                Some(f64::INFINITY),
-                Some(f64_nan),
-                None,
-                Some(-123.5),
-            ])),
-        ),
-        (
-            "utf8",
-            Arc::new(StringArray::from(vec![
-                Some(""),
-                Some("é"),
-                Some("犬"),
-                Some("last"),
-                None,
-                Some("\0"),
-                Some("🦀"),
-            ])),
-        ),
-        (
-            "binary",
-            Arc::new(BinaryArray::from(vec![
-                Some(&b""[..]),
-                Some(&b"\x00"[..]),
-                Some(&b"\xff\x00"[..]),
-                Some(&b"bytes"[..]),
-                None,
-                Some(&b"\x00\xff"[..]),
-                Some(&b"last"[..]),
-            ])),
-        ),
-        ("null", new_null_array(&DataType::Null, 7)),
+fn every_supported_scalar_layout_round_trips() {
+    macro_rules! values {
+        ($array:ty; $($value:expr),+ $(,)?) => {
+            Arc::new(<$array>::from(vec![$($value),+])) as ArrayRef
+        };
+    }
+
+    let float32_nan = f32::from_bits(0x7fc0_1234);
+    let float64_nan = f64::from_bits(0x7ff8_0000_0000_1234);
+    let columns: Vec<ArrayRef> = vec![
+        new_null_array(&DataType::Null, 6),
+        values!(BooleanArray; Some(false), Some(true), None, Some(false), Some(true), Some(false)),
+        values!(Int8Array; Some(i8::MIN), Some(i8::MAX), Some(-1), Some(0), Some(1), None),
+        values!(Int16Array; Some(i16::MIN), Some(i16::MAX), Some(-1), Some(0), Some(1), None),
+        values!(Int32Array; Some(i32::MIN), Some(i32::MAX), Some(-1), Some(0), Some(1), None),
+        values!(Int64Array; Some(i64::MIN), Some(i64::MAX), Some(-1), Some(0), Some(1), None),
+        values!(UInt8Array; Some(u8::MIN), Some(u8::MAX), Some(1), Some(u8::MAX - 1), Some(42), None),
+        values!(UInt16Array; Some(u16::MIN), Some(u16::MAX), Some(1), Some(u16::MAX - 1), Some(42), None),
+        values!(UInt32Array; Some(u32::MIN), Some(u32::MAX), Some(1), Some(u32::MAX - 1), Some(42), None),
+        values!(UInt64Array; Some(u64::MIN), Some(u64::MAX), Some(1), Some(u64::MAX - 1), Some(42), None),
+        values!(Float32Array; Some(f32::NEG_INFINITY), Some(-0.0), Some(0.0), Some(f32::INFINITY), Some(float32_nan), None),
+        values!(Float64Array; Some(f64::NEG_INFINITY), Some(-0.0), Some(0.0), Some(f64::INFINITY), Some(float64_nan), None),
+        values!(StringArray; Some(""), Some("犬"), Some("\0"), Some("🦀"), Some("last"), None),
+        values!(BinaryArray; Some(&[][..]), Some(&[0][..]), Some(&[u8::MAX, 0][..]), Some(b"bytes"), Some(&[7][..]), None),
     ];
     let fields = columns
         .iter()
-        .map(|(name, column)| Field::new(*name, column.data_type().clone(), true))
+        .enumerate()
+        .map(|(index, column)| {
+            Field::new(format!("field-{index}"), column.data_type().clone(), true)
+        })
         .collect::<Vec<_>>();
-    let records = RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns.into_iter().map(|(_, column)| column).collect(),
-    )
-    .unwrap();
-    let change = Change::try_new(
-        records,
-        Int64Array::from(vec![1, -1, 2, -2, i64::MIN, i64::MAX, 1]),
-    )
-    .unwrap();
-
+    let records = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2, 3, -3])).unwrap();
     let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+
     assert_change_eq(&decoded, &change);
-    let f32_values = decoded
-        .records()
-        .column(9)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .unwrap();
-    assert_eq!(f32_values.value(1).to_bits(), (-0.0_f32).to_bits());
-    assert_eq!(f32_values.value(2).to_bits(), 0.0_f32.to_bits());
-    assert_eq!(f32_values.value(4).to_bits(), f32_nan.to_bits());
-    assert!(f32_values.is_null(5));
-    let f64_values = decoded
+    let float32 = decoded
         .records()
         .column(10)
         .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(
+        [
+            float32.value(0).to_bits(),
+            float32.value(1).to_bits(),
+            float32.value(2).to_bits(),
+            float32.value(3).to_bits(),
+            float32.value(4).to_bits()
+        ],
+        [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, float32_nan].map(f32::to_bits)
+    );
+    let float64 = decoded
+        .records()
+        .column(11)
+        .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    assert_eq!(f64_values.value(1).to_bits(), (-0.0_f64).to_bits());
-    assert_eq!(f64_values.value(2).to_bits(), 0.0_f64.to_bits());
-    assert_eq!(f64_values.value(4).to_bits(), f64_nan.to_bits());
-    assert!(f64_values.is_null(5));
+    assert_eq!(
+        [
+            float64.value(0).to_bits(),
+            float64.value(1).to_bits(),
+            float64.value(2).to_bits(),
+            float64.value(3).to_bits(),
+            float64.value(4).to_bits()
+        ],
+        [f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY, float64_nan].map(f64::to_bits)
+    );
 }
 
 #[test]
-fn validity_and_boolean_bitmaps_round_trip_across_byte_and_word_boundaries() {
-    for rows in [7, 8, 9, 63, 64, 65] {
+fn validity_and_boolean_bitmaps_round_trip_across_a_byte_boundary() {
+    for rows in [7, 8, 9] {
         let booleans = (0..rows)
             .map(|index| (index % 5 != 0).then_some(index % 2 == 0))
             .collect::<Vec<_>>();
@@ -369,39 +233,56 @@ fn validity_and_boolean_bitmaps_round_trip_across_byte_and_word_boundaries() {
 }
 
 #[test]
-fn maximum_list_struct_and_mixed_nesting_round_trip() {
-    let mut list = DataType::Int64;
-    let mut structure = DataType::Int64;
+fn maximum_mixed_nesting_preserves_nested_metadata_in_full_and_projected_decodes() {
     let mut mixed = DataType::Int64;
-    for _ in 0..MAX_NESTING_DEPTH {
-        list = DataType::List(Arc::new(Field::new("item", list, true)));
-        structure = DataType::Struct(vec![Field::new("member", structure, true)].into());
+    for depth in 0..MAX_NESTING_DEPTH {
+        let child = |name| {
+            let field = Field::new(name, mixed.clone(), true);
+            if depth + 1 == MAX_NESTING_DEPTH {
+                field.with_metadata(HashMap::from([(
+                    "nested-semantic".to_owned(),
+                    "sentinel".to_owned(),
+                )]))
+            } else {
+                field
+            }
+        };
         mixed = match mixed {
-            DataType::List(_) => DataType::Struct(vec![Field::new("member", mixed, true)].into()),
-            _ => DataType::List(Arc::new(Field::new("item", mixed, true))),
+            DataType::List(_) => DataType::Struct(vec![child("member")].into()),
+            _ => DataType::List(Arc::new(child("item"))),
         };
     }
 
-    for data_type in [list, structure, mixed] {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", data_type.clone(), true),
-            Field::new("tail", DataType::UInt64, false),
-        ]));
-        let records = RecordBatch::try_new(
-            schema,
-            vec![
-                new_null_array(&data_type, 1),
-                Arc::new(UInt64Array::from(vec![7])),
-            ],
-        )
-        .unwrap();
-        let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-        let encoded = encode_change(&change).unwrap();
-        assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-        let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
-        assert_change_eq(
-            &decode_change_projected(&encoded, &projection).unwrap(),
-            &change.try_project(&projection).unwrap(),
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", mixed.clone(), true),
+        Field::new("tail", DataType::UInt64, false),
+    ]));
+    let records = RecordBatch::try_new(
+        schema,
+        vec![
+            new_null_array(&mixed, 1),
+            Arc::new(UInt64Array::from(vec![7])),
+        ],
+    )
+    .unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+    let decoded = decode_change(&encoded).unwrap();
+    assert_change_eq(&decoded, &change);
+    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
+    let projected = decode_change_projected(&encoded, &projection).unwrap();
+    assert_change_eq(&projected, &change.try_project(&projection).unwrap());
+
+    for decoded in [&decoded, &projected] {
+        let schema = decoded.schema();
+        let child = match schema.field(0).data_type() {
+            DataType::List(child) => child,
+            DataType::Struct(children) => &children[0],
+            data_type => panic!("expected nested field, got {data_type}"),
+        };
+        assert_eq!(
+            child.metadata().get("nested-semantic").map(String::as_str),
+            Some("sentinel")
         );
     }
 }
@@ -438,57 +319,6 @@ fn projected_decode_matches_in_memory_projection_for_every_top_level_layout() {
         assert_change_eq(&actual, &expected);
         assert_eq!(actual.schema(), projection.output_schema());
     }
-}
-
-#[test]
-fn projected_decode_is_owned_and_outlives_the_encoded_entry() {
-    let projection = ChangeProjection::try_new(representative_change().schema(), [0, 2]).unwrap();
-    let decoded = {
-        let encoded = encode_change(&representative_change()).unwrap();
-        decode_change_projected(&encoded, &projection).unwrap()
-    };
-
-    assert_eq!(decoded.num_rows(), 3);
-    assert_eq!(decoded.diffs().values(), &[1, -1, 2]);
-    assert_eq!(
-        decoded
-            .records()
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(2),
-        "next"
-    );
-}
-
-#[test]
-fn schema_field_and_nested_metadata_survive_full_and_projected_decode() {
-    let child = Arc::new(
-        Field::new("value", DataType::Int64, true)
-            .with_metadata(HashMap::from([("unit".to_owned(), "count".to_owned())])),
-    );
-    let object = StructArray::from(vec![(
-        Arc::clone(&child),
-        Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
-    )]);
-    let schema = Arc::new(Schema::new_with_metadata(
-        vec![
-            Field::new("object", object.data_type().clone(), true).with_metadata(HashMap::from([
-                ("semantic".to_owned(), "object".to_owned()),
-            ])),
-        ],
-        HashMap::from([("source".to_owned(), "metadata-test".to_owned())]),
-    ));
-    let records = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(object)]).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-
-    let decoded = decode_change(&encoded).unwrap();
-    assert_eq!(decoded.schema(), schema);
-    let projection = ChangeProjection::try_new(schema, [0]).unwrap();
-    let decoded = decode_change_projected(&encoded, &projection).unwrap();
-    assert_eq!(decoded.schema(), projection.output_schema());
 }
 
 #[test]

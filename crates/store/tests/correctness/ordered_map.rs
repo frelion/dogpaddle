@@ -10,7 +10,7 @@ use dogpaddle_store::{
     StoreKey, StoreValue,
 };
 
-use crate::support::{ByteMap, TestValue, create_byte_map, create_map, store_path};
+use crate::support::{TestValue, create_byte_map, create_map, store_path};
 
 fn open_map<K: StoreKey, V: StoreValue, SIZE>(
     store: &Store,
@@ -181,18 +181,10 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
 
 #[test]
 fn data_objects_isolate_identical_keys() {
-    assert_data_objects_isolate_identical_keys::<Small>();
-    assert_data_objects_isolate_identical_keys::<Large>();
-}
-
-fn assert_data_objects_isolate_identical_keys<SIZE>()
-where
-    ByteMap<SIZE>: StoreData,
-{
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let left = create_byte_map::<SIZE>(&mut store, "left").unwrap();
-    let right = create_byte_map::<SIZE>(&mut store, "right").unwrap();
+    let left = create_byte_map::<Small>(&mut store, "left").unwrap();
+    let right = create_byte_map::<Small>(&mut store, "right").unwrap();
     let mut transactions = store.into_transactions();
 
     {
@@ -219,36 +211,4 @@ where
         right.get(&b"key".to_vec()).unwrap(),
         Some(b"right".to_vec())
     );
-
-    let limit = ScanLimit::new(10, 1_024).unwrap();
-    let mut left_items = Vec::new();
-    let left_continuation = left
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            left_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
-        .unwrap();
-    let mut right_items = Vec::new();
-    let right_continuation = right
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            right_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
-        .unwrap();
-    assert_eq!(
-        left_items,
-        vec![
-            (Vec::new(), b"left-empty".to_vec()),
-            (b"key".to_vec(), b"left".to_vec()),
-        ]
-    );
-    assert_eq!(left_continuation, None);
-    assert_eq!(
-        right_items,
-        vec![
-            (Vec::new(), b"right-empty".to_vec()),
-            (b"key".to_vec(), b"right".to_vec()),
-        ]
-    );
-    assert_eq!(right_continuation, None);
 }

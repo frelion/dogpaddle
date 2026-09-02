@@ -131,7 +131,7 @@ impl FlowFactory {
 
         let mut store = Store::create(&path)?;
         let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
-        let flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
             store.create_data(codec::FLOW_STATE_DATA_NAME)?;
         let station_parts = definition
             .stations()
@@ -154,7 +154,6 @@ impl FlowFactory {
         Ok(Flow::from_parts(
             path,
             definition,
-            flow_state,
             assembled.stations,
             assembled.topology,
             transactions,

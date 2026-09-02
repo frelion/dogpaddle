@@ -1,20 +1,33 @@
-use std::time::Duration;
+use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 
 use dogpaddle_bench_protocol::{
-    DurationSummary, Fields, PairOrder, PairSchedule, PairVariant, PairedDurationSummary,
-    SampleRecord, measure_pair_with,
+    CaseId, CaseSpec, Fields, Measurement, PairSchedule, PairVariant, Plan, Run,
 };
 
-use crate::{
-    BENCHMARK,
-    support::{average_duration, format_duration, write_record},
-};
-
+#[derive(Debug, PartialEq)]
 pub(super) struct BenchmarkCase {
     workload: String,
     operations: usize,
     transactions: usize,
     logical_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PairKind {
+    Size,
+    Mode,
+}
+
+struct PlannedPair {
+    case: BenchmarkCase,
+    samples: usize,
+    kind: PairKind,
+    first: CaseId,
+    second: CaseId,
+}
+
+pub(super) struct FrozenCases {
+    pairs: VecDeque<PlannedPair>,
 }
 
 impl BenchmarkCase {
@@ -33,142 +46,117 @@ impl BenchmarkCase {
                 .expect("benchmark logical byte count fits in usize"),
         }
     }
+
+    fn spec(&self, variant: &str, samples: usize) -> CaseSpec {
+        CaseSpec::new(
+            format!("{}::{variant}", self.workload),
+            NonZeroUsize::new(samples).expect("benchmark has samples"),
+            Fields::new()
+                .with("variant", variant)
+                .with("operations", self.operations)
+                .with("transactions", self.transactions)
+                .with("logical_bytes", self.logical_bytes),
+        )
+    }
 }
 
-struct PairedSamples {
-    first: Vec<Duration>,
-    second: Vec<Duration>,
-}
-
-impl PairedSamples {
-    fn collect(samples: usize, mut measure: impl FnMut(bool) -> Duration) -> Self {
-        let mut measure_variant = |variant| measure(matches!(variant, PairVariant::Second));
-        let _ = measure_pair_with(PairOrder::Ab, &mut measure_variant);
-        let mut first = Vec::with_capacity(samples);
-        let mut second = Vec::with_capacity(samples);
-        for sample in 0..samples {
-            let pair = measure_pair_with(
-                PairSchedule::Alternating.order(sample),
-                &mut measure_variant,
-            );
-            first.push(pair.first);
-            second.push(pair.second);
+impl FrozenCases {
+    pub(super) const fn new() -> Self {
+        Self {
+            pairs: VecDeque::new(),
         }
-        Self { first, second }
     }
 
-    fn summary(&self) -> PairedDurationSummary {
-        PairedDurationSummary::from_pairs(&self.first, &self.second)
+    pub(super) fn size(&mut self, plan: &mut Plan, case: BenchmarkCase, samples: usize) {
+        self.declare(plan, case, samples, PairKind::Size, "Small", "Large");
     }
 
-    fn first_wins(&self) -> usize {
-        self.first
-            .iter()
-            .zip(&self.second)
-            .filter(|(first, second)| first < second)
-            .count()
+    pub(super) fn mode(&mut self, plan: &mut Plan, case: BenchmarkCase, samples: usize) {
+        self.declare(plan, case, samples, PairKind::Mode, "Full", "Projected");
+    }
+
+    pub(super) fn finish(self) {
+        assert!(
+            self.pairs.is_empty(),
+            "all frozen OrderedMap benchmark pairs are consumed"
+        );
+    }
+
+    fn declare(
+        &mut self,
+        plan: &mut Plan,
+        case: BenchmarkCase,
+        samples: usize,
+        kind: PairKind,
+        first_variant: &str,
+        second_variant: &str,
+    ) {
+        let (first, second) = plan.pair(
+            &case.workload,
+            case.spec(first_variant, samples),
+            case.spec(second_variant, samples),
+        );
+        self.pairs.push_back(PlannedPair {
+            case,
+            samples,
+            kind,
+            first,
+            second,
+        });
+    }
+
+    fn take(
+        &mut self,
+        expected_case: &BenchmarkCase,
+        expected_samples: usize,
+        expected_kind: PairKind,
+    ) -> (CaseId, CaseId) {
+        let planned = self
+            .pairs
+            .pop_front()
+            .expect("missing frozen OrderedMap benchmark pair");
+        assert_eq!(&planned.case, expected_case);
+        assert_eq!(planned.samples, expected_samples);
+        assert_eq!(planned.kind, expected_kind);
+        (planned.first, planned.second)
     }
 }
 
 pub(super) fn report_size_pair(
+    run: &mut Run,
+    plan: &mut FrozenCases,
     case: &BenchmarkCase,
     samples: usize,
     mut small: impl FnMut() -> Duration,
     mut large: impl FnMut() -> Duration,
 ) {
-    let measurements =
-        PairedSamples::collect(samples, |second| if second { large() } else { small() });
-    emit_pair(case, "Small", "Large", &measurements);
-    println!(
-        "  paired Small/Large median={:.3}x; Small wins {}/{samples}",
-        measurements.summary().median_first_over_second(),
-        measurements.first_wins()
-    );
+    small();
+    large();
+    let (first, second) = plan.take(case, samples, PairKind::Size);
+    run.paired(first, second, PairSchedule::Alternating, |variant| {
+        Measurement::new(match variant {
+            PairVariant::First => small(),
+            PairVariant::Second => large(),
+        })
+    });
 }
 
 pub(super) fn report_mode_pair<T>(
+    run: &mut Run,
+    plan: &mut FrozenCases,
     case: &BenchmarkCase,
     samples: usize,
     fixture: &mut T,
     mut full: impl FnMut(&mut T) -> Duration,
     mut projected: impl FnMut(&mut T) -> Duration,
 ) {
-    let measurements = PairedSamples::collect(samples, |second| {
-        if second {
-            projected(fixture)
-        } else {
-            full(fixture)
-        }
+    full(fixture);
+    projected(fixture);
+    let (first, second) = plan.take(case, samples, PairKind::Mode);
+    run.paired(first, second, PairSchedule::Alternating, |variant| {
+        Measurement::new(match variant {
+            PairVariant::First => full(fixture),
+            PairVariant::Second => projected(fixture),
+        })
     });
-    emit_pair(case, "Full", "Projected", &measurements);
-    println!(
-        "  paired Full/Projected median={:.3}x; projection wins {}/{samples}",
-        measurements.summary().median_first_over_second(),
-        measurements.summary().second_wins()
-    );
-}
-
-fn emit_pair(
-    case: &BenchmarkCase,
-    first_label: &str,
-    second_label: &str,
-    measurements: &PairedSamples,
-) {
-    report(case, first_label, "first", &measurements.first);
-    report(case, second_label, "second", &measurements.second);
-}
-
-fn report(case: &BenchmarkCase, variant: &str, side: &str, durations: &[Duration]) {
-    let series = format!("{}::{variant}", case.workload);
-    for (sample, elapsed) in durations.iter().copied().enumerate() {
-        let record = SampleRecord::new(
-            BENCHMARK,
-            &series,
-            sample,
-            elapsed,
-            measurement_fields(case, variant, side),
-        );
-        write_record(&record);
-    }
-    let summary = DurationSummary::from_samples(durations);
-    let rate = case.operations as u128 * 1_000_000_000 / summary.median().as_nanos();
-    let median_per_operation = average_duration(summary.median(), case.operations);
-    println!(
-        "{:<28} {variant:<10} {:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
-        case.workload,
-        case.operations,
-        format_duration(summary.min()),
-        format_duration(summary.median()),
-        format_duration(summary.max()),
-    );
-}
-
-fn measurement_fields(case: &BenchmarkCase, variant: &str, side: &str) -> Fields {
-    let mut fields = Fields::new();
-    fields.insert("variant", variant);
-    fields.insert("pair", &case.workload);
-    fields.insert("side", side);
-    for (name, value) in [
-        ("operations", case.operations),
-        ("transactions", case.transactions),
-        ("logical_bytes", case.logical_bytes),
-    ] {
-        fields.insert(name, value);
-    }
-    fields
-}
-
-pub(super) fn print_section(name: &str, description: &str) {
-    println!();
-    println!("=== {name} ===");
-    println!("{description}");
-    println!(
-        "{:<28} {:<10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>14}",
-        "workload", "data", "operations", "min", "median", "max", "median/op", "median ops/s"
-    );
-}
-
-pub(super) fn print_group(description: &str) {
-    println!();
-    println!("-- {description} --");
 }

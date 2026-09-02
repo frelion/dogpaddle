@@ -1,6 +1,6 @@
-use std::{cell::Cell, num::NonZeroUsize};
+use std::{cell::Cell, num::NonZeroUsize, path::PathBuf};
 
-use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError};
+use dogpaddle_store::{AppendLog, ScanLimit, Store, StoreError, Transactions};
 use libmdbx::WriteFlags;
 
 use crate::support::{raw_database, store_path};
@@ -15,13 +15,73 @@ fn metadata(head: u64, tail: u64, retained_bytes: u64) -> [u8; 24] {
     encoded
 }
 
+fn entry(offset: u64, value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (offset.to_be_bytes().to_vec(), value.to_vec())
+}
+
+struct RawLog {
+    _root: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl RawLog {
+    fn empty() -> Self {
+        Self::with_entries(Vec::new())
+    }
+
+    fn with_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let path = store_path(&root);
+        let mut store = Store::create(&path).unwrap();
+        store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
+        drop(store);
+
+        if !entries.is_empty() {
+            let database = raw_database(&path);
+            let transaction = database.begin_rw_txn().unwrap();
+            let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+            for (key, value) in entries {
+                transaction
+                    .put(&table, &key, &value, WriteFlags::UPSERT)
+                    .unwrap();
+            }
+            assert!(!transaction.commit().unwrap());
+        }
+        Self { _root: root, path }
+    }
+
+    fn open(&self) -> (AppendLog<Vec<u8>>, Transactions) {
+        let store = Store::open(&self.path).unwrap();
+        let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
+        (log, store.into_transactions())
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let database = raw_database(&self.path);
+        let transaction = database.begin_ro_txn().unwrap();
+        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
+        transaction.get::<Vec<u8>>(&table, key).unwrap()
+    }
+}
+
+fn assert_corrupt_bounds(fixture: &RawLog) {
+    let (log, mut transactions) = fixture.open();
+    let transaction = transactions.begin().unwrap();
+    let access = log.access(transaction.access()).unwrap();
+    assert!(matches!(
+        access.bounds(),
+        Err(StoreError::CorruptAppendLog { .. })
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+}
+
 #[test]
 fn append_log_has_a_stable_dedicated_layout() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    let log = store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let fixture = RawLog::empty();
+    let (log, mut transactions) = fixture.open();
     {
         let transaction = transactions.begin().unwrap();
         let mut access = log.access(transaction.access()).unwrap();
@@ -37,32 +97,11 @@ fn append_log_has_a_stable_dedicated_layout() {
         transaction.commit().unwrap();
     }
     drop(transactions);
+    assert_eq!(fixture.get(&[]), Some(metadata(1, 2, 9).to_vec()));
+    assert_eq!(fixture.get(&0_u64.to_be_bytes()), None);
+    assert_eq!(fixture.get(&1_u64.to_be_bytes()), Some(b"b".to_vec()));
 
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_ro_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        assert_eq!(
-            transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-            Some(metadata(1, 2, 9).to_vec())
-        );
-        assert_eq!(
-            transaction
-                .get::<Vec<u8>>(&table, &0_u64.to_be_bytes())
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            transaction
-                .get::<Vec<u8>>(&table, &1_u64.to_be_bytes())
-                .unwrap(),
-            Some(b"b".to_vec())
-        );
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let (log, mut transactions) = fixture.open();
     {
         let transaction = transactions.begin().unwrap();
         let mut access = log.access(transaction.access()).unwrap();
@@ -73,57 +112,31 @@ fn append_log_has_a_stable_dedicated_layout() {
         transaction.commit().unwrap();
     }
     drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(2, 3, 9).to_vec())
-    );
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &1_u64.to_be_bytes())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &2_u64.to_be_bytes())
-            .unwrap(),
-        Some(b"c".to_vec())
-    );
+    assert_eq!(fixture.get(&[]), Some(metadata(2, 3, 9).to_vec()));
+    assert_eq!(fixture.get(&1_u64.to_be_bytes()), None);
+    assert_eq!(fixture.get(&2_u64.to_be_bytes()), Some(b"c".to_vec()));
 }
 
 #[test]
 fn an_empty_batch_does_not_materialize_log_metadata() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    let log = store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        assert_eq!(
-            log.access(transaction.access())
-                .unwrap()
-                .append_batch(&[])
-                .unwrap(),
-            0..0
-        );
-        transaction.commit().unwrap();
-    }
+    let fixture = RawLog::empty();
+    let (log, mut transactions) = fixture.open();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        log.access(transaction.access())
+            .unwrap()
+            .append_batch(&[])
+            .unwrap(),
+        0..0
+    );
+    transaction.commit().unwrap();
     drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(transaction.get::<Vec<u8>>(&table, &[]).unwrap(), None);
+    assert_eq!(fixture.get(&[]), None);
 }
 
 #[test]
 fn missing_or_invalid_metadata_is_corruption() {
-    for invalid_metadata in [
+    for invalid in [
         None,
         Some(vec![0; 8]),
         Some(vec![0; 16]),
@@ -133,70 +146,21 @@ fn missing_or_invalid_metadata_is_corruption() {
         Some(metadata(2, 2, 1).to_vec()),
         Some(metadata(0, 2, 15).to_vec()),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let path = store_path(&root);
-        let mut store = Store::create(&path).unwrap();
-        store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-        drop(store);
-
-        {
-            let database = raw_database(&path);
-            let transaction = database.begin_rw_txn().unwrap();
-            let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-            if let Some(encoded) = invalid_metadata {
-                transaction
-                    .put(&table, [], &encoded, WriteFlags::UPSERT)
-                    .unwrap();
-            } else {
-                transaction
-                    .put(&table, 0_u64.to_be_bytes(), b"orphan", WriteFlags::UPSERT)
-                    .unwrap();
-            }
-            assert!(!transaction.commit().unwrap());
-        }
-
-        let store = Store::open(&path).unwrap();
-        let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-        let mut transactions = store.into_transactions();
-        let transaction = transactions.begin().unwrap();
-        let access = log.access(transaction.access()).unwrap();
-        assert!(matches!(
-            access.bounds(),
-            Err(StoreError::CorruptAppendLog { .. })
-        ));
-        assert!(matches!(
-            transaction.commit(),
-            Err(StoreError::TransactionPoisoned)
-        ));
+        let entries = invalid.map_or_else(
+            || vec![entry(0, b"orphan")],
+            |encoded| vec![(Vec::new(), encoded)],
+        );
+        assert_corrupt_bounds(&RawLog::with_entries(entries));
     }
 }
 
 #[test]
 fn a_gap_is_detected_before_any_scan_callback_runs() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    let log = store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        let mut access = log.access(transaction.access()).unwrap();
-        access.append(&b"a".to_vec()).unwrap();
-        access.append(&b"b".to_vec()).unwrap();
-        transaction.commit().unwrap();
-    }
-    drop(transactions);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        assert!(transaction.del(&table, 1_u64.to_be_bytes(), None).unwrap());
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let fixture = RawLog::with_entries(vec![
+        (Vec::new(), metadata(0, 2, 18).to_vec()),
+        entry(0, b"a"),
+    ]);
+    let (log, mut transactions) = fixture.open();
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
     let called = Cell::new(false);
@@ -215,136 +179,49 @@ fn a_gap_is_detected_before_any_scan_callback_runs() {
 }
 
 #[test]
-fn truncation_gap_rolls_back_entries_deleted_before_the_failure() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(&table, [], metadata(0, 3, 27), WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 2_u64.to_be_bytes(), b"c", WriteFlags::UPSERT)
-            .unwrap();
-        assert!(!transaction.commit().unwrap());
+fn corrupt_truncation_rolls_back_prior_deletes() {
+    let cases = [
+        (
+            metadata(0, 3, 27),
+            vec![entry(0, b"a"), entry(2, b"c")],
+            3,
+            3,
+        ),
+        (
+            metadata(0, 3, 24),
+            vec![entry(0, b"a"), entry(1, b"a"), entry(2, b"a")],
+            1,
+            1,
+        ),
+    ];
+    for (metadata, mut entries, target, max_items) in cases {
+        entries.push((Vec::new(), metadata.to_vec()));
+        let fixture = RawLog::with_entries(entries);
+        let (log, mut transactions) = fixture.open();
+        let transaction = transactions.begin().unwrap();
+        let mut access = log.access(transaction.access()).unwrap();
+        assert!(matches!(
+            access.truncate_before(target, NonZeroUsize::new(max_items).unwrap()),
+            Err(StoreError::CorruptAppendLog { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+        drop(transactions);
+        assert_eq!(fixture.get(&[]), Some(metadata.to_vec()));
+        assert_eq!(fixture.get(&0_u64.to_be_bytes()), Some(b"a".to_vec()));
     }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let mut access = log.access(transaction.access()).unwrap();
-    assert!(matches!(
-        access.truncate_before(3, NonZeroUsize::new(3).unwrap()),
-        Err(StoreError::CorruptAppendLog { .. })
-    ));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-    drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &0_u64.to_be_bytes())
-            .unwrap(),
-        Some(b"a".to_vec())
-    );
-    assert_eq!(
-        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(0, 3, 27).to_vec())
-    );
-}
-
-#[test]
-fn truncation_rejects_a_retained_byte_count_too_small_for_the_remaining_entries() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(&table, [], metadata(0, 3, 24), WriteFlags::UPSERT)
-            .unwrap();
-        for offset in 0_u64..3 {
-            transaction
-                .put(&table, offset.to_be_bytes(), b"a", WriteFlags::UPSERT)
-                .unwrap();
-        }
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let mut access = log.access(transaction.access()).unwrap();
-    assert!(matches!(
-        access.truncate_before(1, NonZeroUsize::new(1).unwrap()),
-        Err(StoreError::CorruptAppendLog { .. })
-    ));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-    drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(0, 3, 24).to_vec())
-    );
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &0_u64.to_be_bytes())
-            .unwrap(),
-        Some(b"a".to_vec())
-    );
 }
 
 #[test]
 fn scan_rejects_an_entry_at_the_recorded_tail() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(&table, [], metadata(0, 1, 9), WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 1_u64.to_be_bytes(), b"extra", WriteFlags::UPSERT)
-            .unwrap();
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let fixture = RawLog::with_entries(vec![
+        (Vec::new(), metadata(0, 1, 9).to_vec()),
+        entry(0, b"a"),
+        entry(1, b"extra"),
+    ]);
+    let (log, mut transactions) = fixture.open();
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
     let called = Cell::new(false);
@@ -364,41 +241,22 @@ fn scan_rejects_an_entry_at_the_recorded_tail() {
 
 #[test]
 fn tail_collision_and_offset_exhaustion_do_not_overwrite_data() {
-    for (bounds, expected_error) in [
-        (metadata(0, 0, 0), "collision"),
-        (metadata(u64::MAX, u64::MAX, 0), "exhaustion"),
+    for (bounds, existing, exhausted) in [
+        (metadata(0, 0, 0), Some(entry(0, b"existing")), false),
+        (metadata(u64::MAX, u64::MAX, 0), None, true),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let path = store_path(&root);
-        let mut store = Store::create(&path).unwrap();
-        store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-        drop(store);
-        {
-            let database = raw_database(&path);
-            let transaction = database.begin_rw_txn().unwrap();
-            let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-            transaction
-                .put(&table, [], bounds, WriteFlags::UPSERT)
-                .unwrap();
-            if expected_error == "collision" {
-                transaction
-                    .put(&table, 0_u64.to_be_bytes(), b"existing", WriteFlags::UPSERT)
-                    .unwrap();
-            }
-            assert!(!transaction.commit().unwrap());
-        }
-
-        let store = Store::open(&path).unwrap();
-        let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut entries = vec![(Vec::new(), bounds.to_vec())];
+        entries.extend(existing);
+        let fixture = RawLog::with_entries(entries);
+        let (log, mut transactions) = fixture.open();
         let transaction = transactions.begin().unwrap();
         let mut access = log.access(transaction.access()).unwrap();
         let error = access.append(&b"new".to_vec()).unwrap_err();
-        if expected_error == "collision" {
-            assert!(matches!(error, StoreError::CorruptAppendLog { .. }));
+        assert!(if exhausted {
+            matches!(error, StoreError::LogOffsetExhausted)
         } else {
-            assert!(matches!(error, StoreError::LogOffsetExhausted));
-        }
+            matches!(error, StoreError::CorruptAppendLog { .. })
+        });
         assert!(matches!(
             transaction.commit(),
             Err(StoreError::TransactionPoisoned)
@@ -407,28 +265,12 @@ fn tail_collision_and_offset_exhaustion_do_not_overwrite_data() {
 }
 
 #[test]
-fn retained_byte_counter_exhaustion_poison_rolls_back_the_append() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(&table, [], metadata(0, 1, u64::MAX), WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 0_u64.to_be_bytes(), b"a", WriteFlags::UPSERT)
-            .unwrap();
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+fn retained_byte_counter_exhaustion_rolls_back_the_append() {
+    let fixture = RawLog::with_entries(vec![
+        (Vec::new(), metadata(0, 1, u64::MAX).to_vec()),
+        entry(0, b"a"),
+    ]);
+    let (log, mut transactions) = fixture.open();
     let transaction = transactions.begin().unwrap();
     let mut access = log.access(transaction.access()).unwrap();
     assert!(matches!(
@@ -440,45 +282,17 @@ fn retained_byte_counter_exhaustion_poison_rolls_back_the_append() {
         Err(StoreError::TransactionPoisoned)
     ));
     drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &1_u64.to_be_bytes())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        transaction.get::<Vec<u8>>(&table, &[]).unwrap(),
-        Some(metadata(0, 1, u64::MAX).to_vec())
-    );
+    assert_eq!(fixture.get(&1_u64.to_be_bytes()), None);
+    assert_eq!(fixture.get(&[]), Some(metadata(0, 1, u64::MAX).to_vec()));
 }
 
 #[test]
 fn ordered_batch_append_rejects_a_physical_key_beyond_the_recorded_tail() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(&table, [], metadata(0, 0, 0), WriteFlags::UPSERT)
-            .unwrap();
-        transaction
-            .put(&table, 1_u64.to_be_bytes(), b"future", WriteFlags::UPSERT)
-            .unwrap();
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let fixture = RawLog::with_entries(vec![
+        (Vec::new(), metadata(0, 0, 0).to_vec()),
+        entry(1, b"future"),
+    ]);
+    let (log, mut transactions) = fixture.open();
     let transaction = transactions.begin().unwrap();
     let mut access = log.access(transaction.access()).unwrap();
     assert!(matches!(
@@ -490,49 +304,17 @@ fn ordered_batch_append_rejects_a_physical_key_beyond_the_recorded_tail() {
         Err(StoreError::TransactionPoisoned)
     ));
     drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &0_u64.to_be_bytes())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &1_u64.to_be_bytes())
-            .unwrap(),
-        Some(b"future".to_vec())
-    );
+    assert_eq!(fixture.get(&0_u64.to_be_bytes()), None);
+    assert_eq!(fixture.get(&1_u64.to_be_bytes()), Some(b"future".to_vec()));
 }
 
 #[test]
 fn batch_offset_overflow_is_rejected_before_any_entry_is_written() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    drop(store);
-    {
-        let database = raw_database(&path);
-        let transaction = database.begin_rw_txn().unwrap();
-        let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-        transaction
-            .put(
-                &table,
-                [],
-                metadata(u64::MAX - 1, u64::MAX - 1, 0),
-                WriteFlags::UPSERT,
-            )
-            .unwrap();
-        assert!(!transaction.commit().unwrap());
-    }
-
-    let store = Store::open(&path).unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
+    let fixture = RawLog::with_entries(vec![(
+        Vec::new(),
+        metadata(u64::MAX - 1, u64::MAX - 1, 0).to_vec(),
+    )]);
+    let (log, mut transactions) = fixture.open();
     let transaction = transactions.begin().unwrap();
     let mut access = log.access(transaction.access()).unwrap();
     assert!(matches!(
@@ -544,14 +326,5 @@ fn batch_offset_overflow_is_rejected_before_any_entry_is_written() {
         Err(StoreError::TransactionPoisoned)
     ));
     drop(transactions);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(Some(LOG_TABLE)).unwrap();
-    assert_eq!(
-        transaction
-            .get::<Vec<u8>>(&table, &(u64::MAX - 1).to_be_bytes())
-            .unwrap(),
-        None
-    );
+    assert_eq!(fixture.get(&(u64::MAX - 1).to_be_bytes()), None);
 }

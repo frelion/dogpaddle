@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use dogpaddle_store::{OrderedMap, ReadTransactions, Small, Transactions};
+use dogpaddle_store::{ReadTransactions, Transactions};
 
 use crate::{
     build::{FlowDefinition, StationDefinition},
@@ -21,8 +21,6 @@ pub(crate) struct RuntimeTopology {
 pub struct Flow {
     path: PathBuf,
     pub(super) definition: FlowDefinition,
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved durable Flow state"))]
-    pub(super) state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     pub(super) stations: Vec<Station>,
     pub(super) topology: RuntimeTopology,
     pub(super) transactions: Transactions,
@@ -33,7 +31,6 @@ impl Flow {
     pub(crate) fn from_parts(
         path: PathBuf,
         definition: FlowDefinition,
-        state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         stations: Vec<Station>,
         topology: RuntimeTopology,
         transactions: Transactions,
@@ -42,7 +39,6 @@ impl Flow {
         Self {
             path,
             definition,
-            state,
             stations,
             topology,
             transactions,

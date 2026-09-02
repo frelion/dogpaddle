@@ -1,7 +1,4 @@
-mod support;
-
 use std::{
-    io,
     num::{NonZeroU64, NonZeroUsize},
     path::Path,
     sync::Arc,
@@ -11,9 +8,7 @@ use std::{
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::{
-    BenchmarkProfile, BenchmarkRecord, CompletionRecord, ConfigurationRecord, DurationSummary,
-    EnvironmentRecord, Fields, HostEnvironment, JsonlWriter, LatencySummary, SampleRecord,
-    require_benchmark_build,
+    BenchmarkProfile, CaseId, CaseSpec, Fields, Measurement, Plan, Run,
 };
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
@@ -21,8 +16,6 @@ use dogpaddle_operation::operation::{
     sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
-
-use support::BenchRoot;
 
 const BENCHMARK: &str = "flow_runtime";
 const SMOKE_CHAIN_STATIONS: &[usize] = &[3];
@@ -54,7 +47,7 @@ enum Scenario {
     Fanout { consumers: usize },
 }
 
-struct Measurement {
+struct RoundMeasurement {
     round_latencies: Vec<Duration>,
 }
 
@@ -63,16 +56,6 @@ struct WorkCounts {
     advances: usize,
     committed_station_turns: usize,
     input_completions: usize,
-}
-
-#[derive(Clone, Copy)]
-struct RuntimeMetrics {
-    elapsed: Duration,
-    latency: LatencySummary,
-    work: WorkCounts,
-    advances_per_second: u128,
-    committed_station_turns_per_second: u128,
-    input_completions_per_second: u128,
 }
 
 impl Config {
@@ -112,17 +95,6 @@ impl Config {
             samples,
             warmup_rounds,
         }
-    }
-
-    fn expected_samples(&self) -> NonZeroUsize {
-        let scenarios = 2_usize
-            .checked_add(self.chain_stations.len())
-            .and_then(|value| value.checked_add(self.fanouts.len()))
-            .expect("Flow runtime scenario count fits usize");
-        let count = scenarios
-            .checked_mul(self.samples)
-            .expect("Flow runtime sample count fits usize");
-        NonZeroUsize::new(count).expect("Flow runtime has at least one data record")
     }
 }
 
@@ -218,81 +190,93 @@ impl Scenario {
     }
 }
 
-impl Measurement {
+impl RoundMeasurement {
     fn elapsed(&self) -> Duration {
         sum_durations(&self.round_latencies)
-    }
-
-    fn metrics(&self, scenario: Scenario) -> RuntimeMetrics {
-        RuntimeMetrics::new(scenario, &self.round_latencies)
-    }
-}
-
-impl RuntimeMetrics {
-    fn new(scenario: Scenario, round_latencies: &[Duration]) -> Self {
-        let elapsed = sum_durations(round_latencies);
-        let work = scenario.work_counts(round_latencies.len());
-        let latency = LatencySummary::from_samples(round_latencies);
-        Self {
-            elapsed,
-            latency,
-            work,
-            advances_per_second: rate(work.advances, elapsed),
-            committed_station_turns_per_second: rate(work.committed_station_turns, elapsed),
-            input_completions_per_second: rate(work.input_completions, elapsed),
-        }
     }
 }
 
 fn main() {
-    require_benchmark_build(BENCHMARK);
-
-    let root = BenchRoot::from_environment(BENCHMARK);
-    let config = Config::for_profile(root.profile());
-    println!("DogPaddle Flow steady runtime benchmark");
-    println!(
-        "scope=advance steady=chain+fanout+sink+tight_capacity input_retaining_commits_per_change=0 unavailable_input_retaining_commit_profiles=1+8 sync=durable execution=single-thread timing=individual_advance validation=outside-timing"
-    );
-    emit_environment(&root);
-    emit_configuration(&config);
-
-    benchmark_scenario(&root, &config, Scenario::Sink);
-    benchmark_scenario(&root, &config, Scenario::CapacityPressure);
-    for &station_count in &config.chain_stations {
-        benchmark_scenario(&root, &config, Scenario::Chain { station_count });
+    let profile = BenchmarkProfile::from_environment();
+    let config = Config::for_profile(profile);
+    let scenarios = std::iter::once(Scenario::Sink)
+        .chain(std::iter::once(Scenario::CapacityPressure))
+        .chain(
+            config
+                .chain_stations
+                .iter()
+                .map(|&station_count| Scenario::Chain { station_count }),
+        )
+        .chain(
+            config
+                .fanouts
+                .iter()
+                .map(|&consumers| Scenario::Fanout { consumers }),
+        )
+        .collect::<Vec<_>>();
+    let mut plan = Plan::new(profile, configuration_fields(&config));
+    let cases = scenarios
+        .into_iter()
+        .map(|scenario| {
+            let work = scenario.work_counts(config.rounds_per_sample);
+            let case = plan.case(CaseSpec::new(
+                scenario.series(),
+                NonZeroUsize::new(config.samples).expect("Flow runtime has samples"),
+                scenario_fields(scenario)
+                    .with("advances", work.advances)
+                    .with("committed_station_turns", work.committed_station_turns)
+                    .with("input_completions", work.input_completions),
+            ));
+            (scenario, case)
+        })
+        .collect::<Vec<_>>();
+    let mut run = Run::persistent(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
     }
-    for &consumers in &config.fanouts {
-        benchmark_scenario(&root, &config, Scenario::Fanout { consumers });
+
+    for (scenario, case) in cases {
+        benchmark_scenario(&mut run, &config, scenario, case);
     }
-    emit_record(&CompletionRecord::new(BENCHMARK));
+    run.finish(|| {});
 }
 
-fn benchmark_scenario(root: &BenchRoot, config: &Config, scenario: Scenario) {
-    let fixture = root.sample(scenario.label());
-    let mut flow = scenario_factory(fixture.path(), scenario)
+fn benchmark_scenario(run: &mut Run, config: &Config, scenario: Scenario, case: CaseId) {
+    let fixture = run.sample(scenario.label());
+    let path = fixture.path().join("flow");
+    let mut flow = scenario_factory(&path, scenario)
         .build()
         .expect("build Flow runtime benchmark fixture");
-    validate_flow(&flow, fixture.path(), scenario);
+    validate_flow(&flow, &path, scenario);
     if scenario.is_capacity_pressure() {
         drop(flow);
-        seed_capacity_backlog(fixture.path(), capacity_backlog_entries(config));
-        flow = FlowFactory::open(fixture.path())
-            .expect("reopen capacity-pressure runtime benchmark fixture");
+        seed_capacity_backlog(&path, capacity_backlog_entries(config));
+        flow =
+            FlowFactory::open(&path).expect("reopen capacity-pressure runtime benchmark fixture");
     }
 
     run_rounds(&mut flow, config.warmup_rounds);
 
-    let mut measurements = Vec::with_capacity(config.samples);
-    for sample in 0..config.samples {
+    for _ in 0..config.samples {
         let measurement = run_rounds(&mut flow, config.rounds_per_sample);
-        emit_sample(scenario, sample, &measurement);
-        measurements.push(measurement);
+        let round_latencies_ns = measurement
+            .round_latencies
+            .iter()
+            .map(Duration::as_nanos)
+            .collect::<Vec<_>>();
+        run.push(
+            case,
+            Measurement::with_fields(
+                measurement.elapsed(),
+                Fields::new().with("round_latencies_ns", round_latencies_ns),
+            ),
+        );
     }
-    report(scenario, &measurements);
 
-    validate_flow(&flow, fixture.path(), scenario);
+    validate_flow(&flow, &path, scenario);
     drop(flow);
-    validate_durable_work(fixture.path(), scenario, completed_rounds(config));
+    validate_durable_work(&path, scenario, completed_rounds(config));
     drop(fixture);
 }
 
@@ -447,7 +431,7 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
     }
 }
 
-fn run_rounds(flow: &mut Flow, rounds: usize) -> Measurement {
+fn run_rounds(flow: &mut Flow, rounds: usize) -> RoundMeasurement {
     let mut round_latencies = Vec::with_capacity(rounds);
     for round in 0..rounds {
         let started = std::time::Instant::now();
@@ -460,7 +444,7 @@ fn run_rounds(flow: &mut Flow, rounds: usize) -> Measurement {
         );
         round_latencies.push(elapsed);
     }
-    Measurement { round_latencies }
+    RoundMeasurement { round_latencies }
 }
 
 fn scenario_factory(path: &Path, scenario: Scenario) -> FlowFactory {
@@ -518,19 +502,8 @@ fn validate_flow(flow: &Flow, path: &Path, scenario: Scenario) {
     assert_eq!(flow.station_count(), scenario.station_count());
 }
 
-fn emit_environment(root: &BenchRoot) {
-    let fields = Fields::new().with("mdbx_sync_mode", "durable");
-    let environment = EnvironmentRecord::new(
-        BENCHMARK,
-        root.profile(),
-        HostEnvironment::collect(Some(root.base())),
-        fields,
-    );
-    emit_record(&environment);
-}
-
-fn emit_configuration(config: &Config) {
-    let fields = Fields::new()
+fn configuration_fields(config: &Config) -> Fields {
+    Fields::new()
         .with("chain_station_counts", &config.chain_stations)
         .with("fanouts", &config.fanouts)
         .with("rounds_per_sample", config.rounds_per_sample)
@@ -569,58 +542,9 @@ fn emit_configuration(config: &Config) {
             "rerun_all_variants_v2_pre_v2_batch_medians_are_not_comparable",
         )
         .with("fixtures", "built_once_outside_timing")
-        .with("validation", "outside_timing");
-    let configuration = ConfigurationRecord::new(BENCHMARK, config.expected_samples(), fields);
-    emit_record(&configuration);
-}
-
-fn emit_sample(scenario: Scenario, sample: usize, measurement: &Measurement) {
-    let metrics = measurement.metrics(scenario);
-    let round_latencies_ns = measurement
-        .round_latencies
-        .iter()
-        .map(Duration::as_nanos)
-        .collect::<Vec<_>>();
-    let fields =
-        measurement_fields(scenario, metrics).with("round_latencies_ns", round_latencies_ns);
-    let sample = SampleRecord::new(
-        BENCHMARK,
-        scenario.series(),
-        sample,
-        metrics.elapsed,
-        fields,
-    );
-    emit_record(&sample);
-}
-
-fn report(scenario: Scenario, measurements: &[Measurement]) {
-    let sample_durations = measurements
-        .iter()
-        .map(Measurement::elapsed)
-        .collect::<Vec<_>>();
-    let round_latencies = measurements
-        .iter()
-        .flat_map(|measurement| measurement.round_latencies.iter().copied())
-        .collect::<Vec<_>>();
-    let metrics = RuntimeMetrics::new(scenario, &round_latencies);
-    let summary = DurationSummary::from_samples(&sample_durations);
-    let min = summary.min();
-    let median = summary.median();
-    let max = summary.max();
-    assert!(!median.is_zero(), "benchmark median must be non-zero");
-    println!(
-        "{} topology={} stations={} fanout={} advances={} batch_min={min:?} batch_median={median:?} batch_max={max:?} advances/s={} committed_station_turns/s={} input_completions/s={} round_p50={:?} round_p95={:?}",
-        scenario.label(),
-        scenario.topology_name(),
-        scenario.station_count(),
-        scenario.fanout(),
-        metrics.work.advances,
-        metrics.advances_per_second,
-        metrics.committed_station_turns_per_second,
-        metrics.input_completions_per_second,
-        metrics.latency.p50(),
-        metrics.latency.p95(),
-    );
+        .with("validation", "outside_timing")
+        .with("execution", "single_thread")
+        .with("mdbx_sync_mode", "durable")
 }
 
 fn scenario_fields(scenario: Scenario) -> Fields {
@@ -641,16 +565,6 @@ fn scenario_fields(scenario: Scenario) -> Fields {
         .with("input_retaining_commits_per_change", 0)
 }
 
-fn measurement_fields(scenario: Scenario, metrics: RuntimeMetrics) -> Fields {
-    scenario_fields(scenario)
-        .with("advances", metrics.work.advances)
-        .with(
-            "committed_station_turns",
-            metrics.work.committed_station_turns,
-        )
-        .with("input_completions", metrics.work.input_completions)
-}
-
 fn sum_durations(durations: &[Duration]) -> Duration {
     durations
         .iter()
@@ -660,23 +574,4 @@ fn sum_durations(durations: &[Duration]) -> Duration {
                 .checked_add(duration)
                 .expect("Flow runtime timed duration fits Duration")
         })
-}
-
-fn rate(count: usize, elapsed: Duration) -> u128 {
-    assert!(
-        !elapsed.is_zero(),
-        "Flow runtime throughput requires nonzero elapsed time"
-    );
-    u128::try_from(count)
-        .expect("Flow runtime work count fits u128")
-        .checked_mul(1_000_000_000)
-        .expect("Flow runtime rate numerator fits u128")
-        / elapsed.as_nanos()
-}
-
-fn emit_record(record: &impl BenchmarkRecord) {
-    let stdout = io::stdout();
-    let mut writer = JsonlWriter::new(stdout.lock());
-    writer.write(record);
-    writer.flush();
 }

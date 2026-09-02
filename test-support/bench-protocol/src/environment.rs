@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Captured output from an optional host command or platform probe.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,8 +77,21 @@ impl Serialize for CommandOutput {
     }
 }
 
+impl<'de> Deserialize<'de> for CommandOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(value.strip_prefix("unavailable: ").map_or_else(
+            || Self::Available(value.clone()),
+            |reason| Self::Unavailable(reason.to_owned()),
+        ))
+    }
+}
+
 /// State of the current git working tree at environment collection time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitState {
     /// `git status --porcelain` succeeded and emitted no changes.
@@ -90,16 +103,17 @@ pub enum GitState {
 }
 
 /// Reproducibility metadata shared by all benchmark environment records.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostEnvironment {
-    cargo_profile: &'static str,
-    cargo_profile_source: &'static str,
+    cargo_profile: String,
+    cargo_profile_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     filesystem_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filesystem: Option<CommandOutput>,
-    os: &'static str,
-    arch: &'static str,
+    os: String,
+    arch: String,
     kernel: CommandOutput,
     cpu: CommandOutput,
     parallelism: usize,
@@ -145,12 +159,12 @@ impl HostEnvironment {
             )
         });
         Self {
-            cargo_profile: "bench",
-            cargo_profile_source: "default",
+            cargo_profile: "bench".to_owned(),
+            cargo_profile_source: "default".to_owned(),
             filesystem_path,
             filesystem,
-            os: env::consts::OS,
-            arch: env::consts::ARCH,
+            os: env::consts::OS.to_owned(),
+            arch: env::consts::ARCH.to_owned(),
             kernel: CommandOutput::capture("uname", &["-a"]).non_empty("kernel probe"),
             cpu: cpu_description(),
             parallelism: std::thread::available_parallelism().map_or(0, usize::from),

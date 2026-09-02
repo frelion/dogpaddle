@@ -4,46 +4,54 @@ use std::{hint::black_box, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
-use dogpaddle_bench_protocol::require_benchmark_build;
+use dogpaddle_bench_protocol::{BenchmarkProfile, CaseId, Plan, Run};
 use dogpaddle_change::{Change, ChangeProjection, encode_change};
 
 use support::{
     fixture::{Fixture, fixtures},
-    runner::{BenchmarkCase, Config, MachineRecords, Measurement, Metric, timed},
+    runner::{Config, FixturePlan, Timed, plan_fixtures, record, timed},
 };
 
-#[path = "support/core_report.rs"]
-mod report;
 mod support;
 
 const BENCHMARK: &str = "change_core";
-const SCENARIOS_PER_FIXTURE: usize = 4;
+const SCENARIOS: &[&str] = &["try_new", "projection_new", "try_slice", "try_project"];
 
 fn main() {
-    require_benchmark_build(BENCHMARK);
-
-    let config = Config::load();
-    config.print(
-        BENCHMARK,
-        "DogPaddle Change core benchmark",
-        SCENARIOS_PER_FIXTURE,
-    );
-    report::print_header("Change public in-memory operations; '-' means rows/s is not meaningful");
-    let mut records = MachineRecords::new(BENCHMARK);
+    let profile = BenchmarkProfile::from_environment();
+    let config = Config::load(profile);
+    let mut plan = Plan::new(profile, config.fields());
+    let plans = plan_fixtures(&mut plan, &config, SCENARIOS);
+    let mut run = Run::memory(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
+    }
+    let mut plans = plans.iter();
     for &rows in &config.rows {
         for fixture in fixtures(rows, config.payload_bytes, &config.workloads) {
-            benchmark_fixture(&config, &fixture, &mut records);
+            benchmark_fixture(
+                &config,
+                &fixture,
+                plans.next().expect("one frozen plan per Change fixture"),
+                &mut run,
+            );
         }
     }
-    records.print();
+    assert!(
+        plans.next().is_none(),
+        "all Change fixture plans are consumed"
+    );
+    run.finish(|| {});
 }
 
-fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRecords) {
+fn benchmark_fixture(config: &Config, fixture: &Fixture, plan: &FixturePlan, run: &mut Run) {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
     let encoded_bytes = encode_change(&fixture.change)
         .expect("encode valid benchmark fixture")
         .len();
+    plan.observe(run, fixture, encoded_bytes);
     let schema = fixture.change.schema();
     let projection =
         ChangeProjection::try_new(Arc::clone(&schema), fixture.narrow_fields.iter().copied())
@@ -52,32 +60,31 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, records: &mut MachineRe
     let slice_length = if rows > 1 { (rows / 2).max(1) } else { 1 };
     validate_slice(&fixture.change, slice_offset, slice_length);
     validate_projection(&fixture.change, &projection, fixture.narrow_fields);
-    let metric = Metric::new(rows, encoded_bytes, iterations);
+    benchmark(run, plan.case("try_new"), config.samples, || {
+        measure_try_new(&fixture.change, iterations)
+    });
+    benchmark(run, plan.case("projection_new"), config.samples, || {
+        measure_projection_new(&schema, fixture.narrow_fields, iterations)
+    });
+    benchmark(run, plan.case("try_slice"), config.samples, || {
+        measure_slice(&fixture.change, slice_offset, slice_length, iterations)
+    });
+    benchmark(run, plan.case("try_project"), config.samples, || {
+        measure_project(&fixture.change, &projection, iterations)
+    });
+}
 
-    report::rows(
-        BenchmarkCase::new(fixture.name, "try_new", metric),
-        config.samples,
-        records,
-        || measure_try_new(&fixture.change, iterations),
-    );
-    report::latency(
-        BenchmarkCase::new(fixture.name, "projection_new", metric),
-        config.samples,
-        records,
-        || measure_projection_new(&schema, fixture.narrow_fields, iterations),
-    );
-    report::latency(
-        BenchmarkCase::new(fixture.name, "try_slice", metric),
-        config.samples,
-        records,
-        || measure_slice(&fixture.change, slice_offset, slice_length, iterations),
-    );
-    report::latency(
-        BenchmarkCase::new(fixture.name, "try_project", metric),
-        config.samples,
-        records,
-        || measure_project(&fixture.change, &projection, iterations),
-    );
+fn benchmark(run: &mut Run, case: CaseId, samples: usize, mut operation: impl FnMut() -> Timed) {
+    let warm = operation();
+    black_box(warm.checksum);
+    let measurements = (0..samples)
+        .map(|_| {
+            let measurement = operation();
+            assert_eq!(measurement.checksum, warm.checksum);
+            measurement
+        })
+        .collect::<Vec<_>>();
+    record(run, case, &measurements);
 }
 
 fn validate_slice(change: &Change, offset: usize, length: usize) {
@@ -121,7 +128,7 @@ fn validate_projection(change: &Change, projection: &ChangeProjection, fields: &
     assert_eq!(actual.diffs(), change.diffs());
 }
 
-fn measure_try_new(source: &Change, iterations: usize) -> Measurement {
+fn measure_try_new(source: &Change, iterations: usize) -> Timed {
     let records = (0..iterations)
         .map(|_| source.records().clone())
         .collect::<Vec<_>>();
@@ -147,7 +154,7 @@ fn measure_projection_new(
     schema: &arrow_schema::SchemaRef,
     fields: &[usize],
     iterations: usize,
-) -> Measurement {
+) -> Timed {
     let schemas = (0..iterations)
         .map(|_| Arc::clone(schema))
         .collect::<Vec<_>>();
@@ -167,7 +174,7 @@ fn measure_projection_new(
     measurement
 }
 
-fn measure_slice(change: &Change, offset: usize, length: usize, iterations: usize) -> Measurement {
+fn measure_slice(change: &Change, offset: usize, length: usize, iterations: usize) -> Timed {
     let expected = u64::try_from(length).expect("slice length fits in u64");
     let measurement = timed(iterations, || {
         let slice = change
@@ -183,11 +190,7 @@ fn measure_slice(change: &Change, offset: usize, length: usize, iterations: usiz
     measurement
 }
 
-fn measure_project(
-    change: &Change,
-    projection: &ChangeProjection,
-    iterations: usize,
-) -> Measurement {
+fn measure_project(change: &Change, projection: &ChangeProjection, iterations: usize) -> Timed {
     let expected = u64::try_from(projection.output_schema().fields().len())
         .expect("field count fits in u64")
         .wrapping_add(u64::try_from(change.num_rows()).expect("row count fits in u64"));

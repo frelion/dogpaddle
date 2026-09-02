@@ -1,214 +1,102 @@
-use std::{num::NonZeroU64, ops::Range, path::Path};
+use std::{num::NonZeroU64, path::Path};
 
-use dogpaddle_change::encode_change;
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    Action, Operation,
-    sink::DiscardDefinition,
-    source::{SequenceSourceDefinition, SequenceSourceOperation},
-    transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
 #[test]
-fn advance_runs_one_real_topological_round_and_reopens_at_the_next_source_position() {
+fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let chain_source = builder.station("chain-source", SequenceSourceDefinition::new(u64::MAX - 1));
     let count = builder.station("count", CountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    builder.output_capacity_bytes(count, OUTPUT_CAPACITY_BYTES);
-    builder.connect([source], count);
-    builder.connect([count], sink);
-    let mut flow = builder.build().unwrap();
-
-    assert_eq!(flow.path(), path);
-    assert_eq!(flow.station_count(), 3);
+    let chain_sink = builder.station("chain-sink", DiscardDefinition::new());
+    let fanout_source = builder.station("fanout-source", SequenceSourceDefinition::new(u64::MAX));
+    let first_sink = builder.station("first-fanout-sink", DiscardDefinition::new());
+    let second_sink = builder.station("second-fanout-sink", DiscardDefinition::new());
+    for station in [chain_source, count, fanout_source] {
+        builder.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
+    }
+    builder.connect([chain_source], count);
+    builder.connect([count], chain_sink);
+    builder.connect([fanout_source], first_sink);
+    builder.connect([fanout_source], second_sink);
+    let flow = builder.build().unwrap();
     assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
+        (flow.path(), flow.station_ids().collect::<Vec<_>>()),
+        (
+            path.as_path(),
+            vec![
+                "chain-source",
+                "count",
+                "chain-sink",
+                "fanout-source",
+                "first-fanout-sink",
+                "second-fanout-sink",
+            ]
+        )
     );
+    drop(flow);
+
+    let mut flow = FlowFactory::open(&path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
-    let first = execution_state(&path);
 
-    let mut reopened = FlowFactory::open(&path).unwrap();
-    assert_eq!(reopened.path(), path);
-    assert_eq!(reopened.station_count(), 3);
-    assert_eq!(
-        reopened.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
-    );
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
-    drop(reopened);
-    let second = execution_state(&path);
-
-    assert_eq!(first.source_output, 1..1);
-    assert_eq!(first.count_output, 1..1);
-    assert_eq!(second.source_output, 2..2);
-    assert_eq!(second.count_output, 2..2);
-    assert!(second.source_position > first.source_position);
-    assert!(second.count > first.count);
-    assert_eq!(first.count, first.source_position + 1);
-    assert_eq!(second.count, second.source_position + 1);
+    let mut flow = FlowFactory::open(&path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    drop(flow);
+    assert_completed_state(&path);
 }
 
-#[test]
-fn reopen_drains_a_committed_final_source_change_across_fanout() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("flow");
-    let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(u64::MAX));
-    let first_sink = builder.station("first-sink", DiscardDefinition::new());
-    let second_sink = builder.station("second-sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    builder.connect([source], first_sink);
-    builder.connect([source], second_sink);
-    drop(builder.build().unwrap());
-
-    {
-        let store = Store::open(&path).unwrap();
-        let position: Cell<u64> = store
+fn assert_completed_state(path: &Path) {
+    let store = Store::open(path).unwrap();
+    let positions: [Cell<u64>; 2] = [
+        store
             .open_data("station/00000000/operation/sequence_source.position")
-            .unwrap();
-        let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-        let operation = SequenceSourceOperation::new(u64::MAX, position);
-        let mut transactions = store.into_transactions();
-        let transaction = transactions.begin().unwrap();
-        let Action::Commit(Some(change)) = operation.turn(None, transaction.access()).unwrap()
-        else {
-            panic!("the final source turn did not commit one output Change");
-        };
-        let encoded = encode_change(&change).unwrap();
-        assert_eq!(
-            output
-                .access(transaction.access())
-                .unwrap()
-                .try_append(&encoded, OUTPUT_CAPACITY_BYTES)
-                .unwrap(),
-            Some(0)
-        );
-        transaction.commit().unwrap();
-    }
-    let committed = fanout_execution_state(&path);
-    assert_eq!(committed.source_position, u64::MAX);
-    assert_eq!(committed.cursors, [0, 0]);
-    assert_eq!(committed.source_output, 0..1);
-    assert!(committed.retained_bytes > 0);
-
-    let mut reopened = FlowFactory::open(&path).unwrap();
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
-    drop(reopened);
-
-    assert_eq!(
-        fanout_execution_state(&path),
-        FanoutExecutionState {
-            source_position: u64::MAX,
-            cursors: [1, 1],
-            source_output: 1..1,
-            retained_bytes: 0,
-        }
-    );
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct FanoutExecutionState {
-    source_position: u64,
-    cursors: [u64; 2],
-    source_output: Range<u64>,
-    retained_bytes: u64,
-}
-
-fn fanout_execution_state(path: &Path) -> FanoutExecutionState {
-    let store = Store::open(path).unwrap();
-    let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
-        .unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let first_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let second_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000002/state").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let source_position = position
-        .access(transaction.access())
-        .unwrap()
-        .get()
-        .unwrap()
-        .unwrap();
-    let cursor_key = b"input/00000000/cursor".to_vec();
-    let first_cursor = first_state
-        .access(transaction.access())
-        .unwrap()
-        .get(&cursor_key)
-        .unwrap()
-        .unwrap();
-    let second_cursor = second_state
-        .access(transaction.access())
-        .unwrap()
-        .get(&cursor_key)
-        .unwrap()
-        .unwrap();
-    let output = output.access(transaction.access()).unwrap();
-
-    FanoutExecutionState {
-        source_position,
-        cursors: [
-            u64::from_be_bytes(first_cursor.try_into().unwrap()),
-            u64::from_be_bytes(second_cursor.try_into().unwrap()),
-        ],
-        source_output: output.bounds().unwrap(),
-        retained_bytes: output.retained_bytes().unwrap(),
-    }
-}
-
-struct ExecutionState {
-    source_position: u64,
-    count: u64,
-    source_output: Range<u64>,
-    count_output: Range<u64>,
-}
-
-fn execution_state(path: &Path) -> ExecutionState {
-    let store = Store::open(path).unwrap();
-    let source_position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
-        .unwrap();
+            .unwrap(),
+        store
+            .open_data("station/00000003/operation/sequence_source.position")
+            .unwrap(),
+    ];
     let count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
-    let source_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let count_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let outputs: [AppendLog<Vec<u8>>; 3] = [
+        store.open_data("station/00000000/output").unwrap(),
+        store.open_data("station/00000001/output").unwrap(),
+        store.open_data("station/00000003/output").unwrap(),
+    ];
+    let fanout_states: [OrderedMap<Vec<u8>, Vec<u8>, Small>; 2] = [
+        store.open_data("station/00000004/state").unwrap(),
+        store.open_data("station/00000005/state").unwrap(),
+    ];
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
-
-    ExecutionState {
-        source_position: source_position
-            .access(transaction.access())
+    let access = transaction.access();
+    assert_eq!(
+        positions.map(|position| position.access(access).unwrap().get().unwrap()),
+        [Some(u64::MAX), Some(u64::MAX)]
+    );
+    assert_eq!(count.access(access).unwrap().get().unwrap(), Some(2));
+    for (output, bounds) in outputs.iter().zip([2..2, 2..2, 1..1]) {
+        let output = output.access(access).unwrap();
+        assert_eq!(
+            (output.bounds().unwrap(), output.retained_bytes().unwrap()),
+            (bounds, 0)
+        );
+    }
+    for state in fanout_states {
+        let encoded = state
+            .access(access)
             .unwrap()
-            .get()
+            .get(&b"input/00000000/cursor".to_vec())
             .unwrap()
-            .unwrap(),
-        count: count
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap()
-            .unwrap(),
-        source_output: source_output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        count_output: count_output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
+            .unwrap();
+        assert_eq!(u64::from_be_bytes(encoded.try_into().unwrap()), 1);
     }
 }
 
@@ -249,7 +137,8 @@ fn build_and_open_support_many_station_output_logs() {
     let flow = builder.build().unwrap();
     assert_eq!(flow.station_count(), OUTPUT_STATION_COUNT + 1);
     drop(flow);
-
-    let reopened = FlowFactory::open(path).unwrap();
-    assert_eq!(reopened.station_count(), OUTPUT_STATION_COUNT + 1);
+    assert_eq!(
+        FlowFactory::open(path).unwrap().station_count(),
+        OUTPUT_STATION_COUNT + 1
+    );
 }

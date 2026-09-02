@@ -4,7 +4,7 @@ use std::{hint::black_box, path::Path, sync::Arc, time::Duration};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_bench_protocol::require_benchmark_build;
+use dogpaddle_bench_protocol::{BenchmarkProfile, CaseId, Plan, Run};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, decode_definition, encode_definition,
@@ -17,7 +17,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 
-use support::{BenchRoot, Config, MachineRecords};
+use support::{Config, SampleStore, case, record};
 
 mod support;
 
@@ -37,6 +37,20 @@ struct SequenceFixture {
     state: Cell<u64>,
     operation: SequenceSourceOperation,
     expected: Option<u64>,
+}
+
+struct CodecPlan {
+    operation: &'static str,
+    encode: CaseId,
+    decode: CaseId,
+}
+
+struct TurnPlan {
+    turns: usize,
+    count_body: CaseId,
+    sequence_body: CaseId,
+    count_durable: CaseId,
+    sequence_durable: CaseId,
 }
 
 impl CountFixture {
@@ -108,32 +122,93 @@ impl SequenceFixture {
 }
 
 fn main() {
-    require_benchmark_build(BENCHMARK);
-
-    let root = BenchRoot::from_environment();
-    let config = Config::for_profile(root.profile());
-    println!("DogPaddle Operation core benchmark");
-    println!(
-        "timing=explicit-boundaries setup=outside validation=outside warmup=unreported rows-per-turn=1"
-    );
-    root.emit_environment();
-    config.emit();
-
-    let mut records = MachineRecords::new();
-    benchmark_definition_codec(&config, &mut records);
-    for &turns in &config.turns {
-        benchmark_count_body(&config, &root, turns, &mut records);
-        benchmark_sequence_body(&config, &root, turns, &mut records);
-        benchmark_count_durable(&config, &root, turns, &mut records);
-        benchmark_sequence_durable(&config, &root, turns, &mut records);
+    let profile = BenchmarkProfile::from_environment();
+    let config = Config::for_profile(profile);
+    let mut plan = Plan::new(profile, config.fields());
+    let codec = ["count", "discard", "sequence"]
+        .into_iter()
+        .map(|operation| CodecPlan {
+            operation,
+            encode: plan.case(case(
+                operation,
+                "definition_encode",
+                config.codec_operations,
+                0,
+                0,
+                config.samples,
+            )),
+            decode: plan.case(case(
+                operation,
+                "definition_decode",
+                config.codec_operations,
+                0,
+                0,
+                config.samples,
+            )),
+        })
+        .collect::<Vec<_>>();
+    let turns = config
+        .turns
+        .iter()
+        .map(|&turns| TurnPlan {
+            turns,
+            count_body: plan.case(case(
+                "count",
+                "turn_rollback_body",
+                operation_count(turns, config.body_transactions),
+                config.body_transactions,
+                turns,
+                config.samples,
+            )),
+            sequence_body: plan.case(case(
+                "sequence",
+                "turn_rollback_body",
+                operation_count(turns, config.body_transactions),
+                config.body_transactions,
+                turns,
+                config.samples,
+            )),
+            count_durable: plan.case(case(
+                "count",
+                "turn_durable_transaction",
+                operation_count(turns, config.durable_transactions),
+                config.durable_transactions,
+                turns,
+                config.samples,
+            )),
+            sequence_durable: plan.case(case(
+                "sequence",
+                "turn_durable_transaction",
+                operation_count(turns, config.durable_transactions),
+                config.durable_transactions,
+                turns,
+                config.samples,
+            )),
+        })
+        .collect::<Vec<_>>();
+    let mut run = Run::persistent(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
     }
-    root.assert_samples_released();
-    records.emit();
+    benchmark_definition_codec(&config, &codec, &mut run);
+    for planned in turns {
+        benchmark_count_body(&config, &mut run, planned.turns, planned.count_body);
+        benchmark_sequence_body(&config, &mut run, planned.turns, planned.sequence_body);
+        benchmark_count_durable(&config, &mut run, planned.turns, planned.count_durable);
+        benchmark_sequence_durable(&config, &mut run, planned.turns, planned.sequence_durable);
+    }
+    assert!(
+        std::fs::read_dir(run.path())
+            .expect("read Operation benchmark run root")
+            .next()
+            .is_none(),
+        "validated Operation sample Stores must be released immediately"
+    );
+    run.finish(|| {});
 }
 
-fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
-    println!();
-    println!("=== Definition public codec ===");
+fn benchmark_definition_codec(config: &Config, plan: &[CodecPlan], run: &mut Run) {
     let definitions: [(&str, Box<dyn OperationDefinition>); 3] = [
         ("count", Box::new(CountDefinition::new())),
         ("discard", Box::new(DiscardDefinition::new())),
@@ -143,7 +218,8 @@ fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
         ),
     ];
 
-    for (operation, definition) in definitions {
+    for ((operation, definition), planned) in definitions.into_iter().zip(plan) {
+        assert_eq!(operation, planned.operation);
         let encoded = encode_definition(definition.as_ref());
         assert_eq!(
             encode_definition(decode_definition(&encoded).unwrap().as_ref()),
@@ -154,128 +230,68 @@ fn benchmark_definition_codec(config: &Config, records: &mut MachineRecords) {
         let durations = (0..config.samples)
             .map(|_| measure_encode(definition.as_ref(), config.codec_operations))
             .collect();
-        records.record(
-            operation,
-            "definition_encode",
-            config.codec_operations,
-            0,
-            0,
-            durations,
-        );
+        record(run, planned.encode, durations);
 
         measure_decode(&encoded, config.codec_warmup_operations());
         let durations = (0..config.samples)
             .map(|_| measure_decode(&encoded, config.codec_operations))
             .collect();
-        records.record(
-            operation,
-            "definition_decode",
-            config.codec_operations,
-            0,
-            0,
-            durations,
-        );
+        record(run, planned.decode, durations);
     }
 }
 
-fn benchmark_count_body(
-    config: &Config,
-    root: &BenchRoot,
-    turns: usize,
-    records: &mut MachineRecords,
-) {
-    let sample_store = root.sample(&format!("count-body-{turns}"));
+fn benchmark_count_body(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
+    let sample_store = SampleStore::new(run, &format!("count-body-{turns}"));
     let mut fixture = CountFixture::create(sample_store.path());
     measure_count_body(&mut fixture, turns, config.warmup_transactions);
     let durations = (0..config.samples)
         .map(|_| measure_count_body(&mut fixture, turns, config.body_transactions))
         .collect();
-    records.record(
-        "count",
-        "turn_rollback_body",
-        operation_count(turns, config.body_transactions),
-        config.body_transactions,
-        turns,
-        durations,
-    );
+    record(run, case, durations);
 }
 
-fn benchmark_sequence_body(
-    config: &Config,
-    root: &BenchRoot,
-    turns: usize,
-    records: &mut MachineRecords,
-) {
-    let sample_store = root.sample(&format!("sequence-body-{turns}"));
+fn benchmark_sequence_body(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
+    let sample_store = SampleStore::new(run, &format!("sequence-body-{turns}"));
     let mut fixture = SequenceFixture::create(sample_store.path());
     measure_sequence_body(&mut fixture, turns, config.warmup_transactions);
     let durations = (0..config.samples)
         .map(|_| measure_sequence_body(&mut fixture, turns, config.body_transactions))
         .collect();
-    records.record(
-        "sequence",
-        "turn_rollback_body",
-        operation_count(turns, config.body_transactions),
-        config.body_transactions,
-        turns,
-        durations,
-    );
+    record(run, case, durations);
 }
 
-fn benchmark_count_durable(
-    config: &Config,
-    root: &BenchRoot,
-    turns: usize,
-    records: &mut MachineRecords,
-) {
+fn benchmark_count_durable(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
     {
-        let warmup_store = root.sample(&format!("count-durable-{turns}-warmup"));
+        let warmup_store = SampleStore::new(run, &format!("count-durable-{turns}-warmup"));
         let mut warmup = CountFixture::create(warmup_store.path());
         measure_count_durable(&mut warmup, turns, config.warmup_transactions);
     }
     let durations = (0..config.samples)
         .map(|sample| {
-            let sample_store = root.sample(&format!("count-durable-{turns}-sample-{sample}"));
+            let sample_store =
+                SampleStore::new(run, &format!("count-durable-{turns}-sample-{sample}"));
             let mut fixture = CountFixture::create(sample_store.path());
             measure_count_durable(&mut fixture, turns, config.durable_transactions)
         })
         .collect();
-    records.record(
-        "count",
-        "turn_durable_transaction",
-        operation_count(turns, config.durable_transactions),
-        config.durable_transactions,
-        turns,
-        durations,
-    );
+    record(run, case, durations);
 }
 
-fn benchmark_sequence_durable(
-    config: &Config,
-    root: &BenchRoot,
-    turns: usize,
-    records: &mut MachineRecords,
-) {
+fn benchmark_sequence_durable(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
     {
-        let warmup_store = root.sample(&format!("sequence-durable-{turns}-warmup"));
+        let warmup_store = SampleStore::new(run, &format!("sequence-durable-{turns}-warmup"));
         let mut warmup = SequenceFixture::create(warmup_store.path());
         measure_sequence_durable(&mut warmup, turns, config.warmup_transactions);
     }
     let durations = (0..config.samples)
         .map(|sample| {
-            let sample_store = root.sample(&format!("sequence-durable-{turns}-sample-{sample}"));
+            let sample_store =
+                SampleStore::new(run, &format!("sequence-durable-{turns}-sample-{sample}"));
             let mut fixture = SequenceFixture::create(sample_store.path());
             measure_sequence_durable(&mut fixture, turns, config.durable_transactions)
         })
         .collect();
-    records.record(
-        "sequence",
-        "turn_durable_transaction",
-        operation_count(turns, config.durable_transactions),
-        config.durable_transactions,
-        turns,
-        durations,
-    );
+    record(run, case, durations);
 }
 
 fn measure_encode(definition: &dyn OperationDefinition, operations: usize) -> Duration {

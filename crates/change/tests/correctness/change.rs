@@ -48,26 +48,7 @@ fn change_preserves_duplicates_event_order_and_negative_prefixes() {
 }
 
 #[test]
-fn into_parts_recovers_the_original_record_batch_and_differences() {
-    let change = representative_change();
-    let expected_records = change.records().clone();
-    let expected_diffs = change.diffs().clone();
-    let record_buffer = change.records().column(0).to_data().buffers()[0].as_ptr();
-    let diff_buffer = change.diffs().values().as_ptr();
-
-    let (records, diffs) = change.into_parts();
-
-    assert_eq!(records, expected_records);
-    assert_eq!(diffs, expected_diffs);
-    assert_eq!(
-        records.column(0).to_data().buffers()[0].as_ptr(),
-        record_buffer
-    );
-    assert_eq!(diffs.values().as_ptr(), diff_buffer);
-}
-
-#[test]
-fn slice_is_zero_copy_contiguous_owned_and_checks_its_bounds() {
+fn slice_and_into_parts_are_zero_copy_contiguous_owned_and_check_bounds() {
     let slice = {
         let source = representative_change();
         let slice = source.try_slice(1, 2).unwrap();
@@ -113,6 +94,14 @@ fn slice_is_zero_copy_contiguous_owned_and_checks_its_bounds() {
         slice.try_slice(usize::MAX, 1),
         Err(ChangeError::SliceOutOfBounds { .. })
     ));
+
+    let columns = slice.records().columns().to_vec();
+    let diffs = slice.diffs().values().as_ptr();
+    let (records, extracted_diffs) = slice.into_parts();
+    for (before, after) in columns.iter().zip(records.columns()) {
+        assert_array_buffers_shared(before.as_ref(), after.as_ref());
+    }
+    assert_eq!(diffs, extracted_diffs.values().as_ptr());
 }
 
 #[test]

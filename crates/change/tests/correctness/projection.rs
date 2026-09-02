@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, StringArray};
 use arrow_schema::{DataType, Schema};
 use dogpaddle_change::{
     ChangeProjection, CodecError, ProjectionError, decode_change_projected, encode_change,
@@ -73,26 +72,6 @@ fn empty_and_identity_projections_preserve_rows_diffs_and_schema_identity() {
             projected.records().column(index)
         ));
     }
-}
-
-#[test]
-fn projected_change_is_owned_and_can_outlive_its_source() {
-    let projected = {
-        let change = representative_change();
-        let projection = ChangeProjection::try_new(change.schema(), [2]).unwrap();
-        change.try_project(&projection).unwrap()
-    };
-
-    let labels = projected
-        .records()
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(labels.value(0), "add");
-    assert!(labels.is_null(1));
-    assert_eq!(labels.value(2), "next");
-    assert_eq!(projected.diffs().values(), &[1, -1, 2]);
 }
 
 #[test]

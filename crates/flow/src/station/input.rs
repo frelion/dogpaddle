@@ -29,6 +29,13 @@ struct EncodedClaim {
     encoded: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompletionPlan {
+    pub(super) next_cursor: u64,
+    pub(super) next_active: usize,
+    pub(super) reclaim_to: Option<u64>,
+}
+
 /// One input edge and its acknowledgement capability.
 pub(crate) struct InputPort {
     output: Arc<Output>,
@@ -96,36 +103,38 @@ impl Inbox {
             .as_ref()
             .expect("an input completion requires an offered claim");
         let durable_active = read_active_input(&self.state, self.ports.len(), access)?;
-        if durable_active != claim.port {
-            return Err(StationError::ClaimActiveInputMismatch {
-                claimed: claim.port,
-                durable: durable_active,
-            });
-        }
-
+        validate_claim_active(claim.port, durable_active)?;
         let port = &self.ports[claim.port];
-        let (head, target) = port
-            .output
-            .target_after(port.consumer_slot, claim.offset, access)?;
-        let next_offset = claim
-            .offset
-            .checked_add(1)
-            .expect("an AppendLog entry offset always has a successor");
+        let (bounds, cursors) = port.output.state(access)?;
+        let plan = plan_complete(
+            claim.port,
+            claim.offset,
+            durable_active,
+            NonZeroUsize::new(self.ports.len()).expect("a claimed Inbox has input ports"),
+            port.consumer_slot,
+            bounds,
+            &cursors,
+        )?;
         let mut state = self.state.access(access)?;
         state.put(
             &cursor_key(claim.port),
-            &encode_cursor(next_offset).to_vec(),
+            &encode_cursor(plan.next_cursor).to_vec(),
         )?;
-        let next_port = if claim.port + 1 == self.ports.len() {
-            0
-        } else {
-            claim.port + 1
-        };
         state.put(
             &ACTIVE_INPUT_KEY.to_vec(),
-            &encode_active_input(next_port).to_vec(),
+            &encode_active_input(plan.next_active).to_vec(),
         )?;
-        port.output.reclaim(head, target, access)
+        if let Some(target) = plan.reclaim_to {
+            let actual = port
+                .output
+                .log
+                .access(access)?
+                .truncate_before(target, RECLAIM_ONE)?;
+            if actual != target {
+                return Err(StationError::RetentionTruncateMismatch { target, actual });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn clear_claim(&mut self) {
@@ -227,7 +236,7 @@ impl Output {
             .enumerate()
             .map(|(consumer, cursor)| cursor.read_snapshot(consumer, access))
             .collect::<Result<Vec<_>, _>>()?;
-        validate_state(bounds, cursors).map(|_| ())
+        validate_state(&bounds, &cursors)
     }
 
     pub(super) fn try_append(
@@ -261,42 +270,7 @@ impl Output {
         Ok(selected)
     }
 
-    fn target_after(
-        &self,
-        consumer_slot: usize,
-        expected_offset: u64,
-        access: TransactionAccess<'_>,
-    ) -> Result<(u64, u64), StationError> {
-        let (bounds, mut cursors) = self.validated_state(access)?;
-        let current = cursors
-            .get_mut(consumer_slot)
-            .expect("an assembled input port must reference its producer consumer slot");
-        if *current != expected_offset {
-            return Err(StationError::ClaimCursorMismatch {
-                claimed: expected_offset,
-                durable: *current,
-            });
-        }
-        if expected_offset == bounds.end {
-            return Err(StationError::ClaimAtTail {
-                offset: expected_offset,
-                tail: bounds.end,
-            });
-        }
-        *current = expected_offset
-            .checked_add(1)
-            .expect("an AppendLog entry offset always has a successor");
-        let target = *cursors
-            .iter()
-            .min()
-            .expect("a validated producer has at least one consumer");
-        Ok((bounds.start, target))
-    }
-
-    fn validated_state(
-        &self,
-        access: TransactionAccess<'_>,
-    ) -> Result<(Range<u64>, Vec<u64>), StationError> {
+    fn state(&self, access: TransactionAccess<'_>) -> Result<(Range<u64>, Vec<u64>), StationError> {
         let bounds = self.log.access(access)?.bounds()?;
         let cursors = self
             .consumers
@@ -304,26 +278,7 @@ impl Output {
             .enumerate()
             .map(|(consumer, cursor)| cursor.read(consumer, access))
             .collect::<Result<Vec<_>, _>>()?;
-        validate_state(bounds, cursors)
-    }
-
-    fn reclaim(
-        &self,
-        head: u64,
-        target: u64,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), StationError> {
-        if target == head {
-            return Ok(());
-        }
-        let actual = self
-            .log
-            .access(access)?
-            .truncate_before(target, RECLAIM_ONE)?;
-        if actual != target {
-            return Err(StationError::RetentionTruncateMismatch { target, actual });
-        }
-        Ok(())
+        Ok((bounds, cursors))
     }
 
     #[cfg(test)]
@@ -406,10 +361,63 @@ impl Inbox {
     }
 }
 
-fn validate_state(
+pub(super) fn plan_complete(
+    claim_port: usize,
+    claim_offset: u64,
+    durable_active: usize,
+    input_count: NonZeroUsize,
+    consumer_slot: usize,
     bounds: Range<u64>,
-    cursors: Vec<u64>,
-) -> Result<(Range<u64>, Vec<u64>), StationError> {
+    cursors: &[u64],
+) -> Result<CompletionPlan, StationError> {
+    validate_claim_active(claim_port, durable_active)?;
+    validate_state(&bounds, cursors)?;
+    let current = cursors
+        .get(consumer_slot)
+        .expect("an assembled input port must reference its producer consumer slot");
+    if *current != claim_offset {
+        return Err(StationError::ClaimCursorMismatch {
+            claimed: claim_offset,
+            durable: *current,
+        });
+    }
+    if claim_offset == bounds.end {
+        return Err(StationError::ClaimAtTail {
+            offset: claim_offset,
+            tail: bounds.end,
+        });
+    }
+    let next_cursor = claim_offset
+        .checked_add(1)
+        .expect("an AppendLog entry offset before tail always has a successor");
+    let target = cursors
+        .iter()
+        .enumerate()
+        .map(|(slot, cursor)| {
+            if slot == consumer_slot {
+                next_cursor
+            } else {
+                *cursor
+            }
+        })
+        .min()
+        .expect("a validated producer has at least one consumer");
+    debug_assert!(target == bounds.start || target == bounds.start + 1);
+    Ok(CompletionPlan {
+        next_cursor,
+        next_active: (claim_port + 1) % input_count.get(),
+        reclaim_to: (target != bounds.start).then_some(target),
+    })
+}
+
+fn validate_claim_active(claimed: usize, durable: usize) -> Result<(), StationError> {
+    if durable != claimed {
+        return Err(StationError::ClaimActiveInputMismatch { claimed, durable });
+    }
+    Ok(())
+}
+
+fn validate_state(bounds: &Range<u64>, cursors: &[u64]) -> Result<(), StationError> {
     for (consumer, offset) in cursors.iter().copied().enumerate() {
         if offset < bounds.start || offset > bounds.end {
             return Err(StationError::ConsumerCursorOutOfRange {
@@ -430,7 +438,7 @@ fn validate_state(
             minimum,
         });
     }
-    Ok((bounds, cursors))
+    Ok(())
 }
 
 fn read_active_input(

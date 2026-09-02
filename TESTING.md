@@ -77,23 +77,26 @@ Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-wri
 wall-clock 断言。持久化 reference 必须报告实际文件系统路径；所有 target 报告 rustc、OS/kernel、
 CPU、Cargo profile、git revision/dirty state 和实际配置。
 
-stdout 的 machine records 使用 typed JSONL。每个 target 必须依次产生唯一 environment、唯一
-configuration、带稳定 `series` 的原始 `sample | observation`，并以唯一 `completion` 结束；completion
-后不得再有 machine record。configuration 用 `expected_samples` 声明精确的 duration sample 总数，
-并可用 `required_observations: {series: count}` 声明每条非 duration observation series 的精确非零数量。
-通用 gate 分别验证 sample 总数与每条 sample/observation series 从零连续且唯一的 index，拒绝未声明、
-缺失、重复或额外 observation；它不解析 owner payload，也不接受第三种 data discriminator。
-`cargo xtask bench-smoke` 从 Cargo metadata 自动发现全部 target，逐进程执行，拒绝无输出、畸形 JSON、
-错误 benchmark identity、退役的派生 summary record、缺失或非末尾 completion；新增 benchmark 不需要
-维护第二份 target 清单。
+stdout 的 machine records 使用唯一的 typed JSONL `Record` 枚举。每个 target 必须依次产生：
 
-常规 benchmark 的 machine stream 只保留原始样本，进程内人类表格报告派生统计；配对样本以
-`pair + side + sample index` 无损表达一一对应关系。Operation 的 per-operation 耗时由 `elapsed_ns / operations`
-派生；Flow runtime 的总耗时、速率和 p50/p95 由 sample `elapsed_ns`、work counts 与
-`round_latencies_ns` 派生，不重复写回 machine fields。AppendLog 长稳的 append/truncate 事务也使用标准
-SampleRecord，并按 record width 和动作拆分稳定 series；checkpoint 与 terminal 使用同一个固定
-ObservationRecord，其中 checkpoint series 保留状态与文件大小，terminal series 只补充 raw samples
-无法导出的 wall elapsed 和最终 reopen checksum。两者都由 `required_observations` 提供精确数量证据。
+1. 一个 `run`，声明环境、配置、按稳定 series 排序的完整 cases/observations 及各自精确数量；
+2. 只携带紧凑 plan ID、连续 index 和 raw facts 的 `sample | observation`；
+3. 唯一且位于末尾的 `completion`。
+
+通用 validator 拒绝未知字段、非法 label、错误 identity/profile、非 canonical plan、越界或乱序 ID、
+缺失/重复/额外记录，以及 completion 后的任何 machine record；它不解释 owner payload。
+每个 target 邻接的 `<target>.plan.json` 另外冻结 smoke/reference 两档纯 Plan 的 case/observation 数量、
+canonical byte length 与稳定 128-bit fingerprint。正常执行不读取 golden，而是消费预先冻结的同一组
+plan IDs；`finish` 因而能拒绝漏跑。`cargo xtask bench-plan-check` 从 Cargo metadata 发现全部 target，
+只构造两档 Plan、不创建 fixture 或开始计时，再与独立 golden 比较。`cargo xtask bench-smoke` 逐进程
+真实执行 smoke workload，并同时验证 smoke golden 与完整输出；新增 target 不维护第二份 target 清单。
+
+常规 benchmark 的 machine stream 只保留原始样本，进程内人类表格报告派生统计；pair/side 属于
+run plan，两个 case 的相同 sample index 无损表达一一对应关系。Operation 的 per-operation 耗时由
+`elapsed_ns / operations` 派生；Flow runtime 的总耗时、速率和分位数由 sample `elapsed_ns`、静态 work
+counts 与 `round_latencies_ns` 派生，不重复写回 machine fields。AppendLog 长稳的 append/truncate
+事务也是普通 duration cases；checkpoint observations 保留状态与文件大小，terminal observations 只补充
+raw samples 无法导出的 wall elapsed 和最终 reopen checksum，其精确数量均在 run plan 中声明。
 p50/p95/p99/max、吞吐、peak 和 tail spread 均从这些 raw facts 派生并显示在人类 summary。正式前后
 对比只能使用相同代码协议版本、rustc、机器、profile、文件系统和 workload；不设置机器相关的 CI
 wall-clock 阈值。
@@ -104,6 +107,7 @@ wall-clock 阈值。
 
 ```bash
 cargo xtask check
+cargo xtask bench-plan-check
 cargo xtask bench-smoke
 ```
 

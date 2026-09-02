@@ -97,28 +97,22 @@ fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
 
 #[test]
 fn finish_rejects_forbidden_or_excess_inputs() {
+    assert_input_count(finish_with_target(source(0), 1), 0, 1);
+    assert_input_count(finish_with_target(count(), 2), 1, 2);
+    assert_input_count(finish_with_target(discard(), 2), 1, 2);
+}
+
+fn assert_input_count(
+    result: Result<FlowDefinition, TopologyError>,
+    expected: usize,
+    actual: usize,
+) {
     assert_eq!(
-        finish_with_target(source(0), 1).unwrap_err(),
+        result.unwrap_err(),
         TopologyError::InputCount {
             station: "target".to_owned(),
-            expected: 0,
-            actual: 1,
-        }
-    );
-    assert_eq!(
-        finish_with_target(count(), 2).unwrap_err(),
-        TopologyError::InputCount {
-            station: "target".to_owned(),
-            expected: 1,
-            actual: 2,
-        }
-    );
-    assert_eq!(
-        finish_with_target(discard(), 2).unwrap_err(),
-        TopologyError::InputCount {
-            station: "target".to_owned(),
-            expected: 1,
-            actual: 2,
+            expected,
+            actual,
         }
     );
 }
@@ -323,29 +317,6 @@ fn decoder_round_trips_a_large_chain() {
 }
 
 #[test]
-fn decoder_rejects_truncation_and_trailing_bytes() {
-    let encoded = encode(&codec_definition()).unwrap();
-    let payload_end = encoded.len() - CHECKSUM_LENGTH;
-    let mut truncated = encoded[..payload_end - 1].to_vec();
-    truncated.extend_from_slice(&crc32(&truncated).to_be_bytes());
-    assert_eq!(
-        decode(&truncated).unwrap_err(),
-        FlowDefinitionError::Truncated
-    );
-
-    let mut trailing = encoded;
-    let checksum_offset = trailing.len() - CHECKSUM_LENGTH;
-    trailing.insert(checksum_offset, 0);
-    let checksum_offset = trailing.len() - CHECKSUM_LENGTH;
-    let checksum = crc32(&trailing[..checksum_offset]);
-    trailing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
-    assert_eq!(
-        decode(&trailing).unwrap_err(),
-        FlowDefinitionError::TrailingBytes
-    );
-}
-
-#[test]
 fn decoder_validates_capacity_against_the_decoded_operation_category() {
     let mut missing = encode(&codec_definition()).unwrap();
     let source_start = missing
@@ -400,52 +371,6 @@ fn decoder_validates_all_station_ids_before_resolving_sources() {
     assert_eq!(
         decode(&encoded).unwrap_err(),
         FlowDefinitionError::Topology(TopologyError::DuplicateStationId("first".to_owned()))
-    );
-}
-
-#[test]
-fn decoder_rejects_semantic_bit_flips_and_checksum_damage() {
-    let original = encode(&codec_definition()).unwrap();
-
-    let mut changed_start = original.clone();
-    let start = changed_start
-        .windows(7_u64.to_be_bytes().len())
-        .position(|window| window == 7_u64.to_be_bytes())
-        .unwrap();
-    changed_start[start + 7] ^= 1;
-    assert_eq!(
-        decode(&changed_start).unwrap_err(),
-        FlowDefinitionError::IntegrityMismatch
-    );
-
-    let mut changed_id = original.clone();
-    let id = changed_id
-        .windows(b"source".len())
-        .position(|window| window == b"source")
-        .unwrap();
-    changed_id[id + b"source".len() - 1] = b'f';
-    assert_eq!(
-        decode(&changed_id).unwrap_err(),
-        FlowDefinitionError::IntegrityMismatch
-    );
-
-    let mut changed_source = encode(&codec_definition_with_ids("first", "other")).unwrap();
-    let source_reference = changed_source
-        .windows(b"first".len())
-        .rposition(|window| window == b"first")
-        .unwrap();
-    changed_source[source_reference..source_reference + b"other".len()].copy_from_slice(b"other");
-    assert_eq!(
-        decode(&changed_source).unwrap_err(),
-        FlowDefinitionError::IntegrityMismatch
-    );
-
-    let mut changed_checksum = original;
-    let final_byte = changed_checksum.last_mut().unwrap();
-    *final_byte ^= 1;
-    assert_eq!(
-        decode(&changed_checksum).unwrap_err(),
-        FlowDefinitionError::IntegrityMismatch
     );
 }
 

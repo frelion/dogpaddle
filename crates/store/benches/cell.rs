@@ -2,15 +2,9 @@
 
 use std::{hint::black_box, num::NonZeroUsize, time::Duration};
 
-use dogpaddle_bench_protocol::{
-    BenchmarkProfile, ConfigurationRecord, DurationSummary, Fields, SampleRecord,
-};
+use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
 use dogpaddle_store::{Cell, Store, Transactions};
 use tempfile::TempDir;
-
-mod support;
-
-use support::{BenchRoot, average_duration, complete, format_duration, initialize, write_record};
 
 const BENCHMARK: &str = "cell";
 const DEFAULT_READS: usize = 100_000;
@@ -38,8 +32,8 @@ struct SampleWork {
 }
 
 impl Fixture {
-    fn populated(bench_root: &BenchRoot) -> Self {
-        let root = bench_root.sample("cell");
+    fn populated(run: &Run) -> Self {
+        let root = run.sample("cell");
         let mut store =
             Store::create(root.path().join("store")).expect("create cell benchmark store");
         let cell = store
@@ -83,33 +77,25 @@ impl Config {
 }
 
 fn main() {
-    let bench_root = initialize(BENCHMARK);
+    let profile = BenchmarkProfile::from_environment();
     let Config {
         reads,
         commits,
         samples,
-    } = Config::for_profile(bench_root.profile());
+    } = Config::for_profile(profile);
     let mut fields = Fields::new();
     for (name, value) in [("reads", reads), ("commits", commits), ("samples", samples)] {
         fields.insert(name, value);
     }
-    let expected_samples = NonZeroUsize::new(2 * samples).unwrap();
-    let record = ConfigurationRecord::new(BENCHMARK, expected_samples, fields);
-    write_record(&record);
-
-    println!("DogPaddle Cell benchmark");
-    println!("reads={reads} commits={commits} samples={samples}");
-    println!("sync=durable execution=single-thread cache=warm validation=outside-timing");
-    println!();
-    println!("=== Cell<T> ===");
-    println!("one shared value; hot access and one durable state update per transaction");
-    println!(
-        "{:<30} {:>12} {:>12} {:>12} {:>12} {:>12} {:>14}",
-        "workload", "operations", "min", "median", "max", "median/op", "median ops/s"
+    let mut plan = Plan::new(
+        profile,
+        fields
+            .with("execution", "single_thread")
+            .with("cache", "warm")
+            .with("validation", "outside_timing")
+            .with("mdbx_sync_mode", "durable"),
     );
-
-    let mut fixture = Fixture::populated(&bench_root);
-    report(
+    let get = plan.case(case(
         "hot get, one tx",
         SampleWork {
             operations: reads,
@@ -117,10 +103,8 @@ fn main() {
             logical_bytes: 8 * reads,
         },
         samples,
-        || measure_get(&mut fixture, reads),
-    );
-
-    report(
+    ));
+    let update = plan.case(case(
         "read + update + commit",
         SampleWork {
             operations: commits,
@@ -128,12 +112,22 @@ fn main() {
             logical_bytes: 16 * commits,
         },
         samples,
-        || {
-            let mut fixture = Fixture::populated(&bench_root);
-            measure_updates(&mut fixture, commits)
-        },
-    );
-    complete(BENCHMARK);
+    ));
+    let mut run = Run::persistent(BENCHMARK, plan);
+    if run.is_plan_only() {
+        run.emit_plan();
+        return;
+    }
+
+    let mut fixture = Fixture::populated(&run);
+    measure_get(&mut fixture, reads);
+    run.samples(get, |_| Measurement::new(measure_get(&mut fixture, reads)));
+
+    measure_updates(&mut Fixture::populated(&run), commits);
+    run.samples(update, |run| {
+        Measurement::new(measure_updates(&mut Fixture::populated(run), commits))
+    });
+    run.finish(|| {});
 }
 
 fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
@@ -201,40 +195,14 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
     elapsed
 }
 
-fn report(workload: &str, work: SampleWork, samples: usize, mut measure: impl FnMut() -> Duration) {
-    measure();
-    let durations = (0..samples).map(|_| measure()).collect::<Vec<_>>();
-    for (sample, elapsed) in durations.iter().copied().enumerate() {
-        let record = SampleRecord::new(
-            BENCHMARK,
-            workload,
-            sample,
-            elapsed,
-            measurement_fields(work),
-        );
-        write_record(&record);
-    }
-    let summary = DurationSummary::from_samples(&durations);
-    let rate = work.operations as u128 * 1_000_000_000 / summary.median().as_nanos();
-    let median_per_operation = average_duration(summary.median(), work.operations);
-    println!(
-        "{workload:<30} {:>12} {:>12} {:>12} {:>12} {median_per_operation:>12} {rate:>14}",
-        work.operations,
-        format_duration(summary.min()),
-        format_duration(summary.median()),
-        format_duration(summary.max()),
-    );
-}
-
-fn measurement_fields(work: SampleWork) -> Fields {
-    let mut fields = Fields::new();
-    fields.insert("variant", "Cell");
-    for (name, value) in [
-        ("operations", work.operations),
-        ("transactions", work.transactions),
-        ("logical_bytes", work.logical_bytes),
-    ] {
-        fields.insert(name, value);
-    }
-    fields
+fn case(workload: &str, work: SampleWork, samples: usize) -> CaseSpec {
+    CaseSpec::new(
+        workload,
+        NonZeroUsize::new(samples).unwrap(),
+        Fields::new()
+            .with("variant", "Cell")
+            .with("operations", work.operations)
+            .with("transactions", work.transactions)
+            .with("logical_bytes", work.logical_bytes),
+    )
 }

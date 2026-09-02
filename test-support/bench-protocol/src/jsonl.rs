@@ -1,66 +1,60 @@
-use std::{collections::BTreeMap, io::Write, num::NonZeroUsize, time::Duration};
+use std::{io::Write, num::NonZeroUsize};
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Map, Value};
 
 use crate::{BenchmarkProfile, HostEnvironment};
 
-mod sealed {
-    pub trait Sealed {}
-}
+/// Current benchmark artifact protocol.
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// A protocol-owned record that can be emitted by [`JsonlWriter`].
-///
-/// This trait is sealed so arbitrary serializable values cannot accidentally
-/// enter the benchmark JSONL stream without a stable `record` discriminator.
-pub trait BenchmarkRecord: sealed::Sealed + Serialize {}
-
-/// Validated, JSON-typed extension fields owned by an individual benchmark.
-#[derive(Clone, Debug)]
+/// JSON values owned by a benchmark rather than the common protocol.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Fields(Map<String, Value>);
 
-#[expect(
-    clippy::new_without_default,
-    reason = "benchmark records keep one explicit field-set construction path"
-)]
+impl<'de> Deserialize<'de> for Fields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        for name in fields.keys() {
+            validate_label_value("field", name).map_err(D::Error::custom)?;
+        }
+        Ok(Self(fields))
+    }
+}
+
 impl Fields {
-    /// Creates an empty set of extension fields.
+    /// Creates an empty field set.
     #[must_use]
     pub fn new() -> Self {
-        Self(Map::new())
+        Self::default()
     }
 
     /// Adds one JSON-serializable value.
     ///
     /// # Panics
     ///
-    /// Panics when the name is empty, untrimmed, contains a control character,
-    /// is the protocol discriminator `record`, already exists, or when `value`
-    /// cannot be encoded as JSON.
+    /// Panics for an invalid or duplicate field name, or a value that cannot be
+    /// represented by JSON.
     #[track_caller]
     pub fn insert<T>(&mut self, name: impl Into<String>, value: T)
     where
         T: Serialize,
     {
         let name = name.into();
-        validate_field_name(&name);
+        validate_label("field", &name);
         assert!(
             !self.0.contains_key(&name),
-            "benchmark protocol failure: stage=insert field={name:?} value=duplicate source=field already exists"
+            "benchmark field {name:?} is already present"
         );
-        let value = serde_json::to_value(value).unwrap_or_else(|source| {
-            panic!(
-                "benchmark protocol failure: stage=encode field={name:?} value=<unserializable> source={source}"
-            )
-        });
+        let value = serde_json::to_value(value)
+            .unwrap_or_else(|error| panic!("encode benchmark field {name:?}: {error}"));
         self.0.insert(name, value);
     }
 
-    /// Builder-style variant of [`Self::insert`].
-    ///
-    /// # Panics
-    ///
-    /// Panics under the same conditions as [`Self::insert`].
+    /// Builder form of [`Self::insert`].
     #[must_use]
     #[track_caller]
     pub fn with<T>(mut self, name: impl Into<String>, value: T) -> Self
@@ -71,342 +65,261 @@ impl Fields {
         self
     }
 
-    #[track_caller]
-    fn into_record_fields(
-        self,
-        stage: &'static str,
-        reserved: &'static [&'static str],
-    ) -> Map<String, Value> {
-        if let Some(name) = reserved.iter().find(|name| self.0.contains_key(**name)) {
-            panic!(
-                "benchmark protocol failure: stage={stage} field={name:?} value=<extension> source=field is protocol-owned"
-            );
-        }
-        self.0
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns one owner field by name.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.0.get(name)
+    }
+
+    /// Returns one unsigned integer owner field.
+    #[must_use]
+    pub fn get_u64(&self, name: &str) -> Option<u64> {
+        self.get(name).and_then(Value::as_u64)
+    }
+
+    /// Returns one string owner field.
+    #[must_use]
+    pub fn get_str(&self, name: &str) -> Option<&str> {
+        self.get(name).and_then(Value::as_str)
     }
 }
 
-/// A typed benchmark environment JSONL record.
-#[derive(Debug, Serialize)]
-pub struct EnvironmentRecord {
-    record: &'static str,
-    benchmark: String,
-    profile: BenchmarkProfile,
-    #[serde(flatten)]
-    host: HostEnvironment,
-    #[serde(flatten)]
-    fields: Map<String, Value>,
+/// Semantic side of a paired benchmark case.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairSide {
+    /// First semantic variant, independent of execution order.
+    First,
+    /// Second semantic variant, independent of execution order.
+    Second,
 }
 
-impl EnvironmentRecord {
-    /// Creates an environment record with an explicit smoke/reference profile.
-    ///
-    /// # Panics
-    ///
-    /// Panics for an invalid benchmark name or fields colliding with
-    /// protocol-owned environment keys.
+/// Stable paired-comparison identity declared once per case.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pairing {
+    #[serde(deserialize_with = "deserialize_pair")]
+    pair: String,
+    side: PairSide,
+}
+
+impl Pairing {
+    pub(crate) fn new(pair: impl Into<String>, side: PairSide) -> Self {
+        let pair = pair.into();
+        validate_label("pair", &pair);
+        Self { pair, side }
+    }
+
+    pub(crate) fn pair(&self) -> &str {
+        &self.pair
+    }
+
+    pub(crate) const fn side(&self) -> PairSide {
+        self.side
+    }
+}
+
+/// One duration series in a run plan.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseSpec {
+    #[serde(deserialize_with = "deserialize_series")]
+    series: String,
+    samples: NonZeroUsize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pairing: Option<Pairing>,
+    #[serde(default, skip_serializing_if = "Fields::is_empty")]
+    fields: Fields,
+}
+
+impl CaseSpec {
+    /// Declares a stable series and its exact sample count.
+    #[must_use]
     #[track_caller]
-    pub fn new(
-        benchmark: impl Into<String>,
-        profile: BenchmarkProfile,
-        host: HostEnvironment,
-        fields: Fields,
-    ) -> Self {
-        let benchmark = benchmark.into();
-        validate_label("environment", "benchmark", &benchmark);
-        let fields = fields.into_record_fields(
-            "construct_environment",
-            &[
-                "benchmark",
-                "profile",
-                "cargo_profile",
-                "cargo_profile_source",
-                "filesystem_path",
-                "filesystem",
-                "os",
-                "arch",
-                "kernel",
-                "cpu",
-                "parallelism",
-                "rustc",
-                "git_revision",
-                "git_state",
-                "debug_assertions",
-                "unix_seconds",
-            ],
-        );
+    pub fn new(series: impl Into<String>, samples: NonZeroUsize, fields: Fields) -> Self {
+        let series = series.into();
+        validate_label("series", &series);
         Self {
-            record: "environment",
-            benchmark,
-            profile,
-            host,
+            series,
+            samples,
+            pairing: None,
             fields,
         }
     }
-}
 
-impl sealed::Sealed for EnvironmentRecord {}
-impl BenchmarkRecord for EnvironmentRecord {}
-
-/// A typed benchmark configuration JSONL record.
-#[derive(Debug, Serialize)]
-pub struct ConfigurationRecord {
-    record: &'static str,
-    benchmark: String,
-    expected_samples: NonZeroUsize,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    required_observations: BTreeMap<String, NonZeroUsize>,
-    #[serde(flatten)]
-    fields: Map<String, Value>,
-}
-
-impl ConfigurationRecord {
-    /// Creates a configuration record with the exact number of duration samples
-    /// that must follow it before completion.
-    ///
-    /// Required non-duration observations are added explicitly with
-    /// [`Self::require_observation`].
-    ///
-    /// # Panics
-    ///
-    /// Panics for an invalid benchmark name or fields colliding with
-    /// protocol-owned keys.
+    /// Declares this case as one semantic side of a pair.
+    #[must_use]
     #[track_caller]
-    pub fn new(
-        benchmark: impl Into<String>,
-        expected_samples: NonZeroUsize,
-        fields: Fields,
-    ) -> Self {
-        let benchmark = benchmark.into();
-        validate_label("configuration", "benchmark", &benchmark);
-        Self {
-            record: "configuration",
-            benchmark,
-            expected_samples,
-            required_observations: BTreeMap::new(),
-            fields: fields.into_record_fields(
-                "construct_configuration",
-                &["benchmark", "expected_samples", "required_observations"],
-            ),
-        }
+    pub fn paired(mut self, pair: impl Into<String>, side: PairSide) -> Self {
+        self.pairing = Some(Pairing::new(pair, side));
+        self
     }
 
-    /// Requires one stable observation series with an exact record count.
-    ///
-    /// # Panics
-    ///
-    /// Panics for an invalid or duplicate series label.
-    #[track_caller]
-    pub fn require_observation(&mut self, series: impl Into<String>, count: NonZeroUsize) {
-        let series = series.into();
-        validate_label("configuration", "observation_series", &series);
-        assert!(
-            self.required_observations
-                .insert(series.clone(), count)
-                .is_none(),
-            "benchmark protocol failure: stage=construct_configuration label=observation_series value={series:?} source=series is already required"
-        );
+    /// Stable series identity used by comparison tools.
+    #[must_use]
+    pub fn series(&self) -> &str {
+        &self.series
+    }
+
+    /// Exact number of raw samples in this series.
+    #[must_use]
+    pub const fn samples(&self) -> NonZeroUsize {
+        self.samples
+    }
+
+    /// Static case facts shared by every sample.
+    #[must_use]
+    pub const fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
+    pub(crate) const fn pairing(&self) -> Option<&Pairing> {
+        self.pairing.as_ref()
     }
 }
 
-impl sealed::Sealed for ConfigurationRecord {}
-impl BenchmarkRecord for ConfigurationRecord {}
-
-/// Marks successful completion of one benchmark target.
-///
-/// A target emits this record exactly once, after all raw samples, owner observations, and
-/// human-readable output. Consumers can therefore distinguish a complete run
-/// from a process that exited successfully before executing its full tail.
-#[derive(Debug, Serialize)]
-pub struct CompletionRecord {
-    record: &'static str,
-    benchmark: String,
-}
-
-impl CompletionRecord {
-    /// Creates a target completion record.
-    ///
-    /// # Panics
-    ///
-    /// Panics for an invalid benchmark label.
-    #[track_caller]
-    pub fn new(benchmark: impl Into<String>) -> Self {
-        let benchmark = benchmark.into();
-        validate_label("completion", "benchmark", &benchmark);
-        Self {
-            record: "completion",
-            benchmark,
-        }
-    }
-}
-
-impl sealed::Sealed for CompletionRecord {}
-impl BenchmarkRecord for CompletionRecord {}
-
-/// A typed raw duration sample JSONL record.
-#[derive(Debug, Serialize)]
-pub struct SampleRecord {
-    record: &'static str,
-    benchmark: String,
+/// One non-duration observation series in a run plan.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationSpec {
+    #[serde(deserialize_with = "deserialize_observation_series")]
     series: String,
-    sample: usize,
-    elapsed_ns: u128,
-    #[serde(flatten)]
-    fields: Map<String, Value>,
+    samples: NonZeroUsize,
 }
 
-impl SampleRecord {
-    /// Creates one raw sample record.
-    ///
-    /// # Panics
-    ///
-    /// Panics for invalid benchmark/series labels or extension fields colliding
-    /// with protocol-owned sample keys.
+impl ObservationSpec {
+    /// Declares a stable observation series and exact record count.
+    #[must_use]
     #[track_caller]
-    pub fn new(
-        benchmark: impl Into<String>,
-        series: impl Into<String>,
-        sample: usize,
-        elapsed: Duration,
-        fields: Fields,
-    ) -> Self {
-        let benchmark = benchmark.into();
+    pub fn new(series: impl Into<String>, samples: NonZeroUsize) -> Self {
         let series = series.into();
-        validate_label("sample", "benchmark", &benchmark);
-        validate_label("sample", "series", &series);
-        Self {
-            record: "sample",
-            benchmark,
-            series,
-            sample,
-            elapsed_ns: elapsed.as_nanos(),
-            fields: fields.into_record_fields(
-                "construct_sample",
-                &["benchmark", "series", "sample", "elapsed_ns"],
-            ),
-        }
+        validate_label("observation series", &series);
+        Self { series, samples }
+    }
+
+    /// Stable observation identity.
+    #[must_use]
+    pub fn series(&self) -> &str {
+        &self.series
+    }
+
+    /// Exact record count.
+    #[must_use]
+    pub const fn samples(&self) -> NonZeroUsize {
+        self.samples
     }
 }
 
-impl sealed::Sealed for SampleRecord {}
-impl BenchmarkRecord for SampleRecord {}
-
-/// A typed non-duration observation in a stable series.
-///
-/// Configuration declares every observation series and its exact count through
-/// `required_observations`. A zero-based continuous `sample` index makes each
-/// observation independently identifiable without owner-specific validation.
-#[derive(Debug, Serialize)]
-pub struct ObservationRecord {
-    record: &'static str,
-    benchmark: String,
-    series: String,
-    sample: usize,
-    #[serde(flatten)]
-    fields: Map<String, Value>,
+/// The sole serialized and deserialized benchmark wire schema.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Record {
+    /// Self-contained run identity, environment, configuration, and exact plan.
+    Run {
+        /// Protocol version.
+        protocol: u16,
+        /// Cargo benchmark target name.
+        #[serde(deserialize_with = "deserialize_benchmark")]
+        benchmark: String,
+        /// Workload scale.
+        profile: BenchmarkProfile,
+        /// Reproducibility metadata.
+        host: Box<HostEnvironment>,
+        /// Owner configuration.
+        configuration: Fields,
+        /// Exact duration-series plan. Array index is the compact case ID.
+        cases: Vec<CaseSpec>,
+        /// Exact non-duration-series plan. Array index is the observation ID.
+        observations: Vec<ObservationSpec>,
+    },
+    /// One raw duration sample.
+    Sample {
+        /// Index into the run's cases.
+        case: usize,
+        /// Zero-based index within the case.
+        sample: usize,
+        /// Raw elapsed duration.
+        elapsed_ns: u64,
+        /// Facts that genuinely vary by sample.
+        #[serde(default, skip_serializing_if = "Fields::is_empty")]
+        fields: Fields,
+    },
+    /// One raw non-duration observation.
+    Observation {
+        /// Index into the run's observation plan.
+        observation: usize,
+        /// Zero-based index within the series.
+        sample: usize,
+        /// Owner observation payload.
+        #[serde(default, skip_serializing_if = "Fields::is_empty")]
+        fields: Fields,
+    },
+    /// Proof that all records and the final owner oracle completed.
+    Completion {},
 }
 
-impl ObservationRecord {
-    /// Creates one raw non-duration observation.
-    ///
-    /// # Panics
-    ///
-    /// Panics for invalid benchmark/series labels or fields colliding with
-    /// protocol-owned observation keys.
-    #[track_caller]
-    pub fn new(
-        benchmark: impl Into<String>,
-        series: impl Into<String>,
-        sample: usize,
-        fields: Fields,
-    ) -> Self {
-        let benchmark = benchmark.into();
-        let series = series.into();
-        validate_label("observation", "benchmark", &benchmark);
-        validate_label("observation", "series", &series);
-        Self {
-            record: "observation",
-            benchmark,
-            series,
-            sample,
-            fields: fields
-                .into_record_fields("construct_observation", &["benchmark", "series", "sample"]),
-        }
+pub(crate) fn write_record(output: &mut impl Write, record: &Record) {
+    serde_json::to_writer(&mut *output, record)
+        .unwrap_or_else(|error| panic!("serialize benchmark record: {error}"));
+    output
+        .write_all(b"\n")
+        .unwrap_or_else(|error| panic!("write benchmark record: {error}"));
+}
+
+#[track_caller]
+fn validate_label(kind: &str, value: &str) {
+    if let Err(error) = validate_label_value(kind, value) {
+        panic!("{error}");
     }
 }
 
-impl sealed::Sealed for ObservationRecord {}
-impl BenchmarkRecord for ObservationRecord {}
-
-/// Writes compact, newline-delimited benchmark records.
-#[derive(Debug)]
-pub struct JsonlWriter<W> {
-    output: W,
+fn validate_label_value(kind: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        Err(format!(
+            "benchmark {kind} must be non-empty, trimmed, and contain no control characters: {value:?}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
-impl<W> JsonlWriter<W>
+fn deserialize_label<'de, D>(deserializer: D, kind: &str) -> Result<String, D::Error>
 where
-    W: Write,
+    D: Deserializer<'de>,
 {
-    /// Wraps a destination implementing [`Write`].
-    pub const fn new(output: W) -> Self {
-        Self { output }
-    }
-
-    /// Serializes exactly one compact JSON object followed by a newline.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the record type, failing stage, and source error when
-    /// serialization or writing fails.
-    #[track_caller]
-    pub fn write<R>(&mut self, record: &R)
-    where
-        R: BenchmarkRecord,
-    {
-        serde_json::to_writer(&mut self.output, record).unwrap_or_else(|source| {
-            panic!(
-                "benchmark JSONL failure: stage=serialize record_type={} source={source}",
-                std::any::type_name::<R>()
-            )
-        });
-        self.output.write_all(b"\n").unwrap_or_else(|source| {
-            panic!(
-                "benchmark JSONL failure: stage=write_delimiter record_type={} source={source}",
-                std::any::type_name::<R>()
-            )
-        });
-    }
-
-    /// Flushes the wrapped destination.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the failing stage and source error when flushing fails.
-    #[track_caller]
-    pub fn flush(&mut self) {
-        self.output.flush().unwrap_or_else(|source| {
-            panic!("benchmark JSONL failure: stage=flush source={source}")
-        });
-    }
+    let value = String::deserialize(deserializer)?;
+    validate_label_value(kind, &value).map_err(D::Error::custom)?;
+    Ok(value)
 }
 
-#[track_caller]
-fn validate_field_name(name: &str) {
-    assert!(
-        name != "record",
-        "benchmark protocol failure: stage=validate_field field=name value={name:?} source=field is protocol-owned"
-    );
-    assert!(
-        !name.is_empty() && name.trim() == name && !name.chars().any(char::is_control),
-        "benchmark protocol failure: stage=validate_field field=name value={name:?} source=name must be non-empty, trimmed, and contain no control characters"
-    );
+fn deserialize_benchmark<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_label(deserializer, "benchmark")
 }
 
-#[track_caller]
-fn validate_label(stage: &'static str, label: &'static str, value: &str) {
-    assert!(
-        !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control),
-        "benchmark protocol failure: stage=construct_{stage} label={label} value={value:?} source=label must be non-empty, trimmed, and contain no control characters"
-    );
+fn deserialize_pair<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_label(deserializer, "pair")
+}
+
+fn deserialize_series<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_label(deserializer, "series")
+}
+
+fn deserialize_observation_series<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_label(deserializer, "observation series")
 }

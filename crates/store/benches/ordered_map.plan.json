@@ -1,0 +1,1 @@
+{"benchmark":"ordered_map","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":42,"observations":0,"encoded_bytes":8455,"digest":"8ad7d4dc7beae6e0b9194c6020eee2e6"},"reference":{"cases":42,"observations":0,"encoded_bytes":8848,"digest":"50d3769a274e91d268bba42ab78caebf"}}

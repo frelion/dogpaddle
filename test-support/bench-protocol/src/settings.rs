@@ -1,11 +1,11 @@
 use std::{env, fmt};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::root::BENCHMARK_PROFILE_ENV;
 
 /// Selects the workload scale and filesystem rules of a benchmark invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkProfile {
     /// A reduced run suitable for protocol validation and local iteration.

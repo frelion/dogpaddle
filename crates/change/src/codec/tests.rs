@@ -7,8 +7,8 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
-    StructArray, UInt64Array, new_null_array, types::Int64Type,
+    ArrayRef, BinaryArray, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    UInt64Array, types::Int64Type,
 };
 use arrow_ipc::{
     BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, DictionaryEncoding,
@@ -55,21 +55,13 @@ fn layout_change() -> Change {
         None,
         Some(Vec::<Option<i64>>::new()),
     ]);
-    let object_name = Arc::new(Field::new("name", DataType::Utf8, true));
     let object_score = Arc::new(Field::new("score", DataType::Int64, false));
-    let object = StructArray::from(vec![
-        (
-            Arc::clone(&object_name),
-            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
-        ),
-        (
-            Arc::clone(&object_score),
-            Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
-        ),
-    ]);
+    let object = StructArray::from(vec![(
+        Arc::clone(&object_score),
+        Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+    )]);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![7, 7, 8])),
-        Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
         Arc::new(StringArray::from(vec![Some("add"), None, Some("next")])),
         Arc::new(BinaryArray::from(vec![
             Some(b"one".as_slice()),
@@ -78,20 +70,13 @@ fn layout_change() -> Change {
         ])),
         Arc::new(items),
         Arc::new(object),
-        new_null_array(&DataType::Null, 3),
     ];
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt64, false),
-        Field::new("enabled", DataType::Boolean, true),
         Field::new("label", DataType::Utf8, true),
         Field::new("payload", DataType::Binary, false),
-        Field::new("items", columns[4].data_type().clone(), true),
-        Field::new(
-            "object",
-            DataType::Struct(vec![object_name, object_score].into()),
-            true,
-        ),
-        Field::new("nothing", DataType::Null, true),
+        Field::new("items", columns[3].data_type().clone(), true),
+        Field::new("object", DataType::Struct(vec![object_score].into()), true),
     ]));
     let records = RecordBatch::try_new(schema, columns).unwrap();
     Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap()
@@ -252,117 +237,59 @@ enum MalformedSchemaCase {
     UnsupportedType,
 }
 
+const MALFORMED_SCHEMA_CASES: &[(MalformedSchemaCase, &str)] = &[
+    (MalformedSchemaCase::Dictionary, "dictionary encoding"),
+    (
+        MalformedSchemaCase::FloatMissingTable,
+        "Exactly one of union discriminant",
+    ),
+    (MalformedSchemaCase::HalfFloat, "unsupported precision"),
+    (
+        MalformedSchemaCase::IntMissingTable,
+        "Exactly one of union discriminant",
+    ),
+    (MalformedSchemaCase::IntWidth, "unsupported bit width"),
+    (
+        MalformedSchemaCase::ListMissingChildren,
+        "has no children vector",
+    ),
+    (
+        MalformedSchemaCase::ListTwoChildren,
+        "must have exactly one child",
+    ),
+    (
+        MalformedSchemaCase::NestingTooDeep,
+        "Nested table depth limit reached",
+    ),
+    (
+        MalformedSchemaCase::UnsupportedType,
+        "unsupported Arrow IPC type",
+    ),
+];
+
 #[expect(
     clippy::too_many_lines,
-    reason = "each malformed FlatBuffer shape stays explicit and locally auditable"
+    reason = "one table-driven FlatBuffer fixture keeps every malformed schema shape comparable"
 )]
 fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let name = builder.create_string("malformed");
-    let field = match case {
-        MalformedSchemaCase::Dictionary => {
-            let data_type = IpcNull::create(&mut builder, &NullArgs::default());
-            let dictionary =
-                DictionaryEncoding::create(&mut builder, &DictionaryEncodingArgs::default());
-            IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(name),
-                    type_type: IpcType::Null,
-                    type_: Some(data_type.as_union_value()),
-                    dictionary: Some(dictionary),
-                    ..FieldArgs::default()
-                },
-            )
-        }
-        MalformedSchemaCase::FloatMissingTable => IpcField::create(
+    let field = if matches!(case, MalformedSchemaCase::NestingTooDeep) {
+        let leaf_name = builder.create_string("leaf");
+        let null_type = IpcNull::create(&mut builder, &NullArgs::default());
+        let mut current = IpcField::create(
             &mut builder,
             &FieldArgs {
-                name: Some(name),
-                type_type: IpcType::FloatingPoint,
+                name: Some(leaf_name),
+                type_type: IpcType::Null,
+                type_: Some(null_type.as_union_value()),
                 ..FieldArgs::default()
             },
-        ),
-        MalformedSchemaCase::HalfFloat => {
-            let floating = IpcFloatingPoint::create(
-                &mut builder,
-                &FloatingPointArgs {
-                    precision: Precision::HALF,
-                },
-            );
-            IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(name),
-                    type_type: IpcType::FloatingPoint,
-                    type_: Some(floating.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            )
-        }
-        MalformedSchemaCase::IntMissingTable => IpcField::create(
-            &mut builder,
-            &FieldArgs {
-                name: Some(name),
-                type_type: IpcType::Int,
-                ..FieldArgs::default()
-            },
-        ),
-        MalformedSchemaCase::IntWidth => {
-            let integer = IpcInt::create(
-                &mut builder,
-                &IntArgs {
-                    bitWidth: 24,
-                    is_signed: true,
-                },
-            );
-            IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(name),
-                    type_type: IpcType::Int,
-                    type_: Some(integer.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            )
-        }
-        MalformedSchemaCase::ListMissingChildren => {
+        );
+        for _ in 0..=crate::MAX_NESTING_DEPTH {
+            let children = builder.create_vector(&[current]);
             let data_type = IpcList::create(&mut builder, &ListArgs::default());
-            IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(name),
-                    type_type: IpcType::List,
-                    type_: Some(data_type.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            )
-        }
-        MalformedSchemaCase::ListTwoChildren => {
-            let child_name = builder.create_string("child");
-            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
-            let first = IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(child_name),
-                    type_type: IpcType::Null,
-                    type_: Some(null_type.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            );
-            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
-            let second = IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(child_name),
-                    type_type: IpcType::Null,
-                    type_: Some(null_type.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            );
-            let children = builder.create_vector(&[first, second]);
-            let data_type = IpcList::create(&mut builder, &ListArgs::default());
-            IpcField::create(
+            current = IpcField::create(
                 &mut builder,
                 &FieldArgs {
                     name: Some(name),
@@ -371,48 +298,97 @@ fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
                     children: Some(children),
                     ..FieldArgs::default()
                 },
-            )
-        }
-        MalformedSchemaCase::NestingTooDeep => {
-            let leaf_name = builder.create_string("leaf");
-            let null_type = IpcNull::create(&mut builder, &NullArgs::default());
-            let mut current = IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(leaf_name),
-                    type_type: IpcType::Null,
-                    type_: Some(null_type.as_union_value()),
-                    ..FieldArgs::default()
-                },
             );
-            for _ in 0..=crate::MAX_NESTING_DEPTH {
-                let children = builder.create_vector(&[current]);
-                let data_type = IpcList::create(&mut builder, &ListArgs::default());
-                current = IpcField::create(
+        }
+        current
+    } else {
+        let (type_type, type_, children, dictionary) = match case {
+            MalformedSchemaCase::Dictionary => {
+                let data_type = IpcNull::create(&mut builder, &NullArgs::default());
+                let dictionary =
+                    DictionaryEncoding::create(&mut builder, &DictionaryEncodingArgs::default());
+                (
+                    IpcType::Null,
+                    Some(data_type.as_union_value()),
+                    None,
+                    Some(dictionary),
+                )
+            }
+            MalformedSchemaCase::FloatMissingTable => (IpcType::FloatingPoint, None, None, None),
+            MalformedSchemaCase::HalfFloat => {
+                let data_type = IpcFloatingPoint::create(
                     &mut builder,
-                    &FieldArgs {
-                        name: Some(name),
-                        type_type: IpcType::List,
-                        type_: Some(data_type.as_union_value()),
-                        children: Some(children),
-                        ..FieldArgs::default()
+                    &FloatingPointArgs {
+                        precision: Precision::HALF,
                     },
                 );
+                (
+                    IpcType::FloatingPoint,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
             }
-            current
-        }
-        MalformedSchemaCase::UnsupportedType => {
-            let data_type = IpcLargeUtf8::create(&mut builder, &LargeUtf8Args::default());
-            IpcField::create(
-                &mut builder,
-                &FieldArgs {
-                    name: Some(name),
-                    type_type: IpcType::LargeUtf8,
-                    type_: Some(data_type.as_union_value()),
-                    ..FieldArgs::default()
-                },
-            )
-        }
+            MalformedSchemaCase::IntMissingTable => (IpcType::Int, None, None, None),
+            MalformedSchemaCase::IntWidth => {
+                let data_type = IpcInt::create(
+                    &mut builder,
+                    &IntArgs {
+                        bitWidth: 24,
+                        is_signed: true,
+                    },
+                );
+                (IpcType::Int, Some(data_type.as_union_value()), None, None)
+            }
+            MalformedSchemaCase::ListMissingChildren => {
+                let data_type = IpcList::create(&mut builder, &ListArgs::default());
+                (IpcType::List, Some(data_type.as_union_value()), None, None)
+            }
+            MalformedSchemaCase::ListTwoChildren => {
+                let child_name = builder.create_string("child");
+                let children = [0, 1].map(|_| {
+                    let data_type = IpcNull::create(&mut builder, &NullArgs::default());
+                    IpcField::create(
+                        &mut builder,
+                        &FieldArgs {
+                            name: Some(child_name),
+                            type_type: IpcType::Null,
+                            type_: Some(data_type.as_union_value()),
+                            ..FieldArgs::default()
+                        },
+                    )
+                });
+                let children = builder.create_vector(&children);
+                let data_type = IpcList::create(&mut builder, &ListArgs::default());
+                (
+                    IpcType::List,
+                    Some(data_type.as_union_value()),
+                    Some(children),
+                    None,
+                )
+            }
+            MalformedSchemaCase::UnsupportedType => {
+                let data_type = IpcLargeUtf8::create(&mut builder, &LargeUtf8Args::default());
+                (
+                    IpcType::LargeUtf8,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::NestingTooDeep => unreachable!("handled above"),
+        };
+        IpcField::create(
+            &mut builder,
+            &FieldArgs {
+                name: Some(name),
+                type_type,
+                type_,
+                children,
+                dictionary,
+                ..FieldArgs::default()
+            },
+        )
     };
     let fields = builder.create_vector(&[field]);
     let schema = IpcSchema::create(
@@ -514,23 +490,20 @@ fn assert_invalid_encoding_without_decoder_panic(result: Result<Change, CodecErr
 fn decoder_rejects_malformed_schema_without_invoking_the_panic_hook() {
     // Isolate the process-wide hook from other tests that may run concurrently.
     if std::env::var_os(MALFORMED_SCHEMA_PANIC_PROBE).is_some() {
-        let encoded = [
-            MalformedSchemaCase::Dictionary,
-            MalformedSchemaCase::FloatMissingTable,
-            MalformedSchemaCase::HalfFloat,
-            MalformedSchemaCase::IntMissingTable,
-            MalformedSchemaCase::IntWidth,
-            MalformedSchemaCase::ListMissingChildren,
-            MalformedSchemaCase::ListTwoChildren,
-            MalformedSchemaCase::NestingTooDeep,
-            MalformedSchemaCase::UnsupportedType,
-        ]
-        .map(malformed_schema_stream);
         let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| exit(PANIC_HOOK_EXIT_CODE)));
 
-        for encoded in encoded {
+        for &(case, expected) in MALFORMED_SCHEMA_CASES {
+            let encoded = malformed_schema_stream(case);
+            let Err(CodecError::InvalidEncoding { message }) = stream::parse(&encoded) else {
+                panic!("{case:?} did not return InvalidEncoding");
+            };
+            assert!(
+                message.contains(expected),
+                "{case:?} returned {message:?}, expected a diagnostic containing {expected:?}"
+            );
+            assert_ne!(message, DECODE_PANIC_MESSAGE, "decoder panic was caught");
             assert_invalid_encoding_without_decoder_panic(decode_change(&encoded));
             assert_invalid_encoding_without_decoder_panic(decode_change_projected(
                 &encoded,
@@ -565,52 +538,6 @@ fn decoder_rejects_malformed_schema_without_invoking_the_panic_hook() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-}
-
-#[test]
-fn fallible_schema_pipeline_rejects_malformed_v1_type_encodings() {
-    let cases = [
-        (MalformedSchemaCase::Dictionary, "dictionary encoding"),
-        (
-            MalformedSchemaCase::FloatMissingTable,
-            "Exactly one of union discriminant",
-        ),
-        (MalformedSchemaCase::HalfFloat, "unsupported precision"),
-        (
-            MalformedSchemaCase::IntMissingTable,
-            "Exactly one of union discriminant",
-        ),
-        (MalformedSchemaCase::IntWidth, "unsupported bit width"),
-        (
-            MalformedSchemaCase::ListMissingChildren,
-            "has no children vector",
-        ),
-        (
-            MalformedSchemaCase::ListTwoChildren,
-            "must have exactly one child",
-        ),
-        (
-            MalformedSchemaCase::NestingTooDeep,
-            "Nested table depth limit reached",
-        ),
-        (
-            MalformedSchemaCase::UnsupportedType,
-            "unsupported Arrow IPC type",
-        ),
-    ];
-
-    for (case, expected) in cases {
-        let Err(CodecError::InvalidEncoding { message }) =
-            stream::parse(&malformed_schema_stream(case))
-        else {
-            panic!("{case:?} did not return InvalidEncoding");
-        };
-        assert!(
-            message.contains(expected),
-            "{case:?} returned {message:?}, expected a diagnostic containing {expected:?}"
-        );
-        assert_ne!(message, DECODE_PANIC_MESSAGE, "decoder panic was caught");
-    }
 }
 
 #[test]

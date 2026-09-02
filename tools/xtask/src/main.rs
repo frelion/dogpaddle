@@ -30,12 +30,16 @@ fn run() -> Result<(), String> {
             require_no_arguments(arguments)?;
             bench_smoke::run(&workspace)
         }
+        "bench-plan-check" => {
+            require_no_arguments(arguments)?;
+            bench_smoke::check_plans(&workspace)
+        }
         "bench-validate" => {
             let benchmark = arguments.next().ok_or_else(usage)?;
             let profile = arguments.next().ok_or_else(usage)?;
             let path = arguments.next().ok_or_else(usage)?;
             require_no_arguments(arguments)?;
-            bench_smoke::validate_file(&benchmark, &profile, Path::new(&path))
+            bench_smoke::validate_file(&workspace, &benchmark, &profile, Path::new(&path))
         }
         "help" | "--help" | "-h" => {
             println!("{}", usage());
@@ -46,7 +50,8 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <check|bench-smoke|bench-validate BENCHMARK PROFILE FILE>".to_owned()
+    "usage: cargo xtask <check|bench-smoke|bench-plan-check|bench-validate BENCHMARK PROFILE FILE>"
+        .to_owned()
 }
 
 fn require_no_arguments(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {

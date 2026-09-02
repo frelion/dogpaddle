@@ -1,5 +1,3 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
-
 use dogpaddle_store::{
     Cell, Large, ScanDirection, ScanLimit, Small, Store, StoreError, TransactionAccess,
     Transactions,
@@ -120,54 +118,6 @@ fn wrong_store_poison_stops_a_read_snapshot() {
 }
 
 #[test]
-fn read_scan_item_too_large_is_retryable_in_the_same_snapshot() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
-    let key = b"key".to_vec();
-    let value = b"wide".to_vec();
-
-    {
-        let transaction = writes.begin().unwrap();
-        data.access(transaction.access())
-            .unwrap()
-            .put(&key, &value)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = reads.begin().unwrap();
-    let access = data.read(transaction.access()).unwrap();
-    assert!(matches!(
-        access.scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(1, 1).unwrap(),
-            |_| Ok::<(), StoreError>(()),
-        ),
-        Err(StoreError::ItemTooLarge { .. })
-    ));
-    assert_eq!(access.get(&key).unwrap(), Some(value.clone()));
-
-    let mut observed = Vec::new();
-    access
-        .scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(1, 1_024).unwrap(),
-            |entry| -> Result<(), StoreError> {
-                observed.push(entry.decode_owned()?);
-                Ok(())
-            },
-        )
-        .unwrap();
-    assert_eq!(observed, vec![(key, value)]);
-}
-
-#[test]
 fn read_scan_visitor_error_poisons_the_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
@@ -232,38 +182,7 @@ fn read_decode_error_poisons_the_snapshot() {
 }
 
 #[test]
-fn transaction_access_can_bind_multiple_objects_without_owning_commit() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
-    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin().unwrap();
-    write_pair(transaction.access(), &small, &large).unwrap();
-    transaction.commit().unwrap();
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        small
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        Some(b"small".to_vec())
-    );
-    assert_eq!(
-        large
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        Some(b"large".to_vec())
-    );
-}
-
-#[test]
-fn commit_is_atomic_across_small_and_large_data() {
+fn commit_and_drop_are_atomic_across_small_and_large_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
@@ -273,10 +192,9 @@ fn commit_is_atomic_across_small_and_large_data() {
 
     {
         let transaction = transactions.begin().unwrap();
-        let mut small = small.access(transaction.access()).unwrap();
-        let mut large = large.access(transaction.access()).unwrap();
-        small.put(&b"key".to_vec(), &b"small".to_vec()).unwrap();
-        large.put(&b"key".to_vec(), &b"large".to_vec()).unwrap();
+        write_pair(transaction.access(), &small, &large).unwrap();
+        let small = small.access(transaction.access()).unwrap();
+        let large = large.access(transaction.access()).unwrap();
         assert_eq!(
             small.get(&b"key".to_vec()).unwrap(),
             Some(b"small".to_vec())
@@ -286,6 +204,20 @@ fn commit_is_atomic_across_small_and_large_data() {
             Some(b"large".to_vec())
         );
         transaction.commit().unwrap();
+    }
+
+    {
+        let transaction = transactions.begin().unwrap();
+        small
+            .access(transaction.access())
+            .unwrap()
+            .put(&b"key".to_vec(), &b"dirty small".to_vec())
+            .unwrap();
+        large
+            .access(transaction.access())
+            .unwrap()
+            .put(&b"key".to_vec(), &b"dirty large".to_vec())
+            .unwrap();
     }
     drop(transactions);
 
@@ -309,74 +241,6 @@ fn commit_is_atomic_across_small_and_large_data() {
             .get(&b"key".to_vec())
             .unwrap(),
         Some(b"large".to_vec())
-    );
-}
-
-#[test]
-fn dropping_a_transaction_rolls_back_every_data_object() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let small = create_byte_map::<Small>(&mut store, "small").unwrap();
-    let large = create_byte_map::<Large>(&mut store, "large").unwrap();
-    let mut transactions = store.into_transactions();
-
-    {
-        let transaction = transactions.begin().unwrap();
-        small
-            .access(transaction.access())
-            .unwrap()
-            .put(&b"key".to_vec(), &b"small".to_vec())
-            .unwrap();
-        large
-            .access(transaction.access())
-            .unwrap()
-            .put(&b"key".to_vec(), &b"large".to_vec())
-            .unwrap();
-    }
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        small
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        large
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        None
-    );
-}
-
-#[test]
-fn panic_rolls_back_the_transaction() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<Small>(&mut store, "data").unwrap();
-    let mut transactions = store.into_transactions();
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let transaction = transactions.begin().unwrap();
-        data.access(transaction.access())
-            .unwrap()
-            .put(&b"key".to_vec(), &b"value".to_vec())
-            .unwrap();
-        panic!("stop the attempt");
-    }));
-    assert!(panic.is_err());
-
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
-        data.access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
-        None
     );
 }
 

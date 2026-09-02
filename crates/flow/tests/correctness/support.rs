@@ -32,15 +32,13 @@ pub(super) fn publish_definition(path: &Path, encoded: &[u8]) {
     let mut store = Store::create(path).unwrap();
     let definition: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin().unwrap();
-        definition
-            .access(transaction.access())
-            .unwrap()
-            .set(&encoded.to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
+    let transaction = transactions.begin().unwrap();
+    definition
+        .access(transaction.access())
+        .unwrap()
+        .set(&encoded.to_vec())
+        .unwrap();
+    transaction.commit().unwrap();
 }
 
 pub(super) fn fixture_bytes(contents: &str) -> Vec<u8> {
