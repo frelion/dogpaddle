@@ -1,11 +1,12 @@
 use std::num::NonZeroU32;
 
+use arrow_schema::SchemaRef;
 use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
-    OperationKind,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     definition::Sealed as SealedDefinition,
     operation::{Action, Operation, OperationError, OperationInput},
 };
@@ -52,7 +53,19 @@ impl DiscardDefinition {
     }
 }
 
-impl SealedDefinition for DiscardDefinition {}
+impl SealedDefinition for DiscardDefinition {
+    fn bind_schemas(
+        &self,
+        _input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        Ok(OperationBinding::new(
+            None,
+            |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+                Ok(Box::new(DiscardOperation))
+            },
+        ))
+    }
+}
 
 impl OperationDefinition for DiscardDefinition {
     fn kind(&self) -> OperationKind {
@@ -61,13 +74,6 @@ impl OperationDefinition for DiscardDefinition {
 
     fn data(&self) -> &'static [DataDeclaration] {
         DATA
-    }
-
-    fn materialize(
-        &self,
-        _data: &mut DataInstances,
-    ) -> Result<Box<dyn Operation>, MaterializeError> {
-        Ok(Box::new(DiscardOperation))
     }
 
     fn persistence_tag(&self) -> u16 {

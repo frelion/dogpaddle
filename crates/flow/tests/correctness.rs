@@ -6,6 +6,8 @@ mod malformed;
 mod persistence;
 #[path = "correctness/runtime_corruption.rs"]
 mod runtime_corruption;
+#[path = "correctness/schema.rs"]
+mod schema;
 #[path = "correctness/support.rs"]
 mod support;
 #[path = "correctness/validation.rs"]

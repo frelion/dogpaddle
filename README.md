@@ -17,6 +17,10 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 - **强类型静态 DAG**：sealed `OperationDefinition` trait 用一个 `OperationKind` 手动声明 Source、
   Transform 或 Sink、非零输入数量和状态形状；Station 读取所包裹算子的 kind，`FlowFactory` 校验有序连接、
   唯一 Station ID、自环、多节点环，以及所有起点都是 Source、所有终点都是 Sink。
+- **完整端口 Schema 绑定**：build/open 按拓扑把每条上游 output 的精确 logical Arrow Schema
+  传给下游 Definition；Definition 纯绑定有序 inputs，并为 Source/Transform 固定唯一 output Schema。
+  全图绑定成功后才创建或打开运行资源；运行时同一 `Output` capability 再同时约束生产和消费，
+  防止算子实现或持久化日志绕过静态结果。derived Schema 不另存 Cell、fingerprint 或 registry。
 - **持久化构建**：一条 Flow 对应一个 Store；所有资源声明完成后，manifest 作为构建完成
   标记最后提交。
 - **直接重新打开**：`FlowFactory::open(path)` 从持久化 Definition 重建拓扑和 Operation 实例，
@@ -27,11 +31,13 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   记录与非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
-- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count 和无输出 Discard
-  Sink；build/open 会为有状态算子创建并重新绑定持久化 Cell，同时为 Flow 和每个 Station 预先
-  声明通用 state map。
+- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、Schema-sensitive 的
+  零拷贝顶层 Project 和无输出 Discard
+  Sink；build/open 会先从 canonical Definition 产生一次性的 Schema binding，再为有状态算子创建
+  或打开持久化 Cell 并消费 binding 装配运行实例，同时为 Flow 和每个 Station 预先声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
-  下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志。Station 不长期持有
+  下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志；producer 和全部
+  consumers 共享该 output 已绑定的同一个精确 logical Schema。Station 不长期持有
   事务启动能力；每个有输入的 Station 持久化一个 active input 和每条边的 Change offset，
   输入准备经真正的只读 snapshot 从 active input 开始循环寻找第一个可用 entry，并在调用
   Operation 前 durable-pin 选中端口；已有的 `active + cursor` 就是 input claim，不新增另一套 key。
@@ -83,9 +89,11 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 `Idle`/`Commit`/`Complete` action。只要尚未 `Complete`，下一 turn（包括 reopen
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
-`SequenceSource → Count → Discard` 轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
+`SequenceSource → Project → Count → Discard` 轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
 没有任何 consumer 的 output，per-output retained-byte 高水位会让缓慢 consumer 自然向上游传播
-背压；尚未实现持续运行的 `Flow::start`、中断控制、端口 Schema 静态约束或外部 Sink 的幂等协议。
+背压。每个 output 在 build/open 时已经绑定一个精确 logical Schema；算子输出在编码前、持久化
+entry 在首次 intake 解码后还会再次校验，Schema 违例均不会提交本 turn 的状态或 cursor。
+尚未实现持续运行的 `Flow::start`、中断控制或外部 Sink 的幂等协议。
 该高水位不计算 MDBX page、Operation state 或 decoded cache，也允许空日志容纳一条 oversize，
 因此不是磁盘或内存硬配额。Operation 的展平
 output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响。

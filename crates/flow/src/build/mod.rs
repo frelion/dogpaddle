@@ -5,18 +5,25 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition};
+use dogpaddle_operation::{DataInstances, MaterializeError, OperationBinding, OperationDefinition};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
-use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
+use crate::{
+    assembly::{assemble_stations, resolve_topology},
+    error::FlowError,
+    flow::Flow,
+    station::StationParts,
+};
 
 pub(crate) mod codec;
 mod definition;
 mod open;
+mod schema;
 mod validate;
 
 pub use codec::FlowDefinitionError;
 pub(crate) use definition::{FlowDefinition, StationDefinition};
+pub use schema::FlowSchemaError;
 pub use validate::{InvalidStationIdReason, TopologyError};
 
 static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -115,8 +122,10 @@ impl FlowFactory {
     /// Validates the Flow, creates its data objects, and atomically publishes its definition.
     ///
     /// Pure topology validation and definition encoding finish before the Store
-    /// path is created. Required data objects are then created and the
-    /// definition Cell is committed last as the build-complete marker.
+    /// path is created. The encoded bytes are decoded as the canonical durable
+    /// Definition, all Operations are purely bound to exact Schemas, required
+    /// data objects are created, and the definition Cell is committed last as
+    /// the build-complete marker.
     ///
     /// # Errors
     ///
@@ -125,9 +134,12 @@ impl FlowFactory {
     /// leave an incomplete build that [`FlowFactory::open`] refuses to open.
     pub fn build(self) -> Result<Flow, FlowError> {
         let path = self.path.clone();
-        let definition = self.finish_definition()?;
+        let declared_definition = self.finish_definition()?;
+        let definition_bytes = codec::encode(&declared_definition)?;
+        let definition = codec::decode(&definition_bytes)?;
+        let topology = resolve_topology(&definition);
+        let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
-        let definition_bytes = codec::encode(&definition)?;
 
         let mut store = Store::create(&path)?;
         let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
@@ -137,7 +149,10 @@ impl FlowFactory {
             .stations()
             .iter()
             .enumerate()
-            .map(|(index, station)| create_station_part(&mut store, index, station))
+            .zip(bindings)
+            .map(|((index, station), binding)| {
+                create_station_part(&mut store, index, station, binding)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let (mut transactions, reads) = store.into_transactions().split();
         {
@@ -149,7 +164,7 @@ impl FlowFactory {
             published.set(&definition_bytes)?;
             transaction.commit()?;
         }
-        let assembled = assemble_stations(&definition, station_parts);
+        let assembled = assemble_stations(topology, station_parts);
 
         Ok(Flow::from_parts(
             path,
@@ -188,6 +203,7 @@ fn create_station_part(
     store: &mut Store,
     index: usize,
     station: &StationDefinition,
+    binding: OperationBinding,
 ) -> Result<StationParts, FlowError> {
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data(&codec::station_state_name(index))?;
@@ -197,16 +213,18 @@ fn create_station_part(
         let physical_name = codec::station_operation_data_name(index, declaration.name());
         data.insert(declaration.create(store, &physical_name)?)?;
     }
-    let operation = definition.materialize(&mut data)?;
+    let output_schema = binding.output_schema().cloned();
+    let operation = binding.materialize(&mut data)?;
     data.finish()?;
-    let output = station
-        .output_capacity_bytes()
-        .map(|capacity| {
-            store
-                .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))
-                .map(|log| (log, capacity))
-        })
-        .transpose()?;
+    let output = match (station.output_capacity_bytes(), output_schema) {
+        (Some(capacity), Some(schema)) => store
+            .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))
+            .map(|log| Some((log, capacity, schema)))?,
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            unreachable!("validated output capacity and bound Schema must agree")
+        }
+    };
     Ok(StationParts::new(
         state,
         operation,

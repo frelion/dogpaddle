@@ -1,16 +1,16 @@
 use std::path::Path;
 
-use dogpaddle_operation::DataInstances;
+use dogpaddle_operation::{DataInstances, OperationBinding};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
 use crate::{
-    assembly::assemble_stations,
+    assembly::{assemble_stations, resolve_topology},
     error::{FlowError, retention_open_error},
     flow::Flow,
     station::StationParts,
 };
 
-use super::{FlowFactory, StationDefinition, codec};
+use super::{FlowFactory, StationDefinition, codec, schema, validate_data_declarations};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
@@ -29,6 +29,9 @@ impl FlowFactory {
         let path = path.as_ref().to_path_buf();
         let definition_bytes = read_published_definition(&path)?;
         let definition = codec::decode(&definition_bytes)?;
+        let topology = resolve_topology(&definition);
+        let bindings = schema::bind_operations(&definition, &topology)?;
+        validate_data_declarations(&definition)?;
 
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
@@ -40,10 +43,11 @@ impl FlowFactory {
             .stations()
             .iter()
             .enumerate()
-            .map(|(index, station)| open_station_part(&store, index, station))
+            .zip(bindings)
+            .map(|((index, station), binding)| open_station_part(&store, index, station, binding))
             .collect::<Result<Vec<_>, _>>()?;
         let (transactions, reads) = store.into_transactions().split();
-        let assembled = assemble_stations(&definition, station_parts);
+        let assembled = assemble_stations(topology, station_parts);
         {
             let transaction = reads.begin()?;
             let published = published.read(transaction.access())?;
@@ -92,6 +96,7 @@ fn open_station_part(
     store: &Store,
     index: usize,
     station: &StationDefinition,
+    binding: OperationBinding,
 ) -> Result<StationParts, FlowError> {
     let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
         store,
@@ -104,15 +109,23 @@ fn open_station_part(
         let instance = require_resource(&physical_name, declaration.open(store, &physical_name))?;
         data.insert(instance)?;
     }
-    let operation = definition.materialize(&mut data)?;
+    let output_schema = binding.output_schema().cloned();
+    let operation = binding.materialize(&mut data)?;
     data.finish()?;
-    let output = station
-        .output_capacity_bytes()
-        .map(|capacity| {
+    let output = match (station.output_capacity_bytes(), output_schema) {
+        (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);
-            open_required_data::<AppendLog<Vec<u8>>>(store, &name).map(|log| (log, capacity))
-        })
-        .transpose()?;
+            Some((
+                open_required_data::<AppendLog<Vec<u8>>>(store, &name)?,
+                capacity,
+                schema,
+            ))
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            unreachable!("validated output capacity and bound Schema must agree")
+        }
+    };
     Ok(StationParts::new(
         state,
         operation,

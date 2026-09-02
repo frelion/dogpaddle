@@ -4,7 +4,7 @@ use dogpaddle_operation::MaterializeError;
 use dogpaddle_store::StoreError;
 
 use crate::{
-    build::{FlowDefinitionError, TopologyError},
+    build::{FlowDefinitionError, FlowSchemaError, TopologyError},
     station::StationError,
 };
 
@@ -18,6 +18,9 @@ pub enum FlowError {
     /// The durable Flow definition cannot be encoded or decoded.
     #[error(transparent)]
     Definition(#[from] FlowDefinitionError),
+    /// One Station rejected the exact Schemas supplied by its upstreams.
+    #[error(transparent)]
+    Schema(#[from] FlowSchemaError),
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),

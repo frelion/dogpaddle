@@ -13,10 +13,12 @@ pub(crate) struct AssembledFlow {
     pub(crate) topology: RuntimeTopology,
 }
 
-pub(crate) fn assemble_stations(
-    definition: &FlowDefinition,
-    mut parts: Vec<StationParts>,
-) -> AssembledFlow {
+pub(crate) struct ResolvedTopology {
+    sources_by_target: Vec<Vec<usize>>,
+    schedule: Vec<usize>,
+}
+
+pub(crate) fn resolve_topology(definition: &FlowDefinition) -> ResolvedTopology {
     let indices = definition
         .stations()
         .iter()
@@ -29,10 +31,40 @@ pub(crate) fn assemble_stations(
         .map(|station| {
             station
                 .sources()
-                .map(|source| indices[source])
+                .map(|source| {
+                    indices
+                        .get(source)
+                        .copied()
+                        .expect("validated source ID must identify one Station")
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let schedule = topological_schedule(&sources_by_target);
+    ResolvedTopology {
+        sources_by_target,
+        schedule,
+    }
+}
+
+impl ResolvedTopology {
+    pub(crate) fn sources(&self, station: usize) -> &[usize] {
+        &self.sources_by_target[station]
+    }
+
+    pub(crate) fn schedule(&self) -> &[usize] {
+        &self.schedule
+    }
+}
+
+pub(crate) fn assemble_stations(
+    topology: ResolvedTopology,
+    mut parts: Vec<StationParts>,
+) -> AssembledFlow {
+    let ResolvedTopology {
+        sources_by_target,
+        schedule,
+    } = topology;
     let mut consumers = std::iter::repeat_with(Vec::new)
         .take(parts.len())
         .collect::<Vec<_>>();
@@ -79,7 +111,6 @@ pub(crate) fn assemble_stations(
         .zip(outputs)
         .map(|((part, inputs), output)| part.finish(inputs, output))
         .collect();
-    let schedule = topological_schedule(&sources_by_target);
     AssembledFlow {
         stations,
         topology: RuntimeTopology { schedule },

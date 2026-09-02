@@ -1,3 +1,4 @@
+use arrow_schema::SchemaRef;
 use dogpaddle_change::CodecError as ChangeCodecError;
 use dogpaddle_operation::operation::OperationError;
 use dogpaddle_store::StoreError;
@@ -14,6 +15,14 @@ pub(crate) enum StationError {
         input: usize,
         #[source]
         source: ChangeCodecError,
+    },
+    #[error(
+        "station input {input} Schema does not match its bound output: expected {expected:?}, actual {actual:?}"
+    )]
+    InputSchemaMismatch {
+        input: usize,
+        expected: SchemaRef,
+        actual: SchemaRef,
     },
     #[error("station has inputs but no durable active input")]
     MissingActiveInput,
@@ -39,6 +48,13 @@ pub(crate) enum StationError {
     InvalidOutputChange {
         #[source]
         source: ChangeCodecError,
+    },
+    #[error(
+        "operation output Schema does not match its binding: expected {expected:?}, actual {actual:?}"
+    )]
+    OutputSchemaMismatch {
+        expected: SchemaRef,
+        actual: SchemaRef,
     },
     #[error("output consumer {consumer} has no durable cursor")]
     MissingConsumerCursor { consumer: usize },

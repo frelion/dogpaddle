@@ -174,6 +174,14 @@ fn assembly_shares_each_unified_output_with_its_input_ports() {
         fixture.stations[1].output.as_ref().unwrap(),
         fixture.stations[2].inbox.ports()[0].output(),
     ));
+    assert_eq!(
+        fixture.stations[0].output.as_ref().unwrap().schema(),
+        &value_schema()
+    );
+    assert_eq!(
+        fixture.stations[1].output.as_ref().unwrap().schema(),
+        &count_schema()
+    );
 }
 
 #[test]
@@ -246,7 +254,7 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         &mut fixture.stations[1],
         &state,
         b"commit",
-        Action::Commit(Some(change(&[9]))),
+        Action::Commit(Some(count_change(&[9]))),
     );
     assert_eq!(fixture.step(1), AdvanceOutcome::Progressed);
     let claim_identity = claim_ptr(&fixture.stations[1]);
@@ -261,7 +269,7 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         &mut fixture.stations[1],
         &state,
         b"rejected-commit",
-        Action::Commit(Some(change(&[10]))),
+        Action::Commit(Some(count_change(&[10]))),
     );
     assert_eq!(fixture.step(1), AdvanceOutcome::Backpressured);
     assert_eq!(
@@ -275,7 +283,7 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         &mut fixture.stations[1],
         &state,
         b"complete",
-        Action::Complete(Some(change(&[11]))),
+        Action::Complete(Some(count_change(&[11]))),
     );
     assert_eq!(fixture.step(1), AdvanceOutcome::Progressed);
     assert_eq!(
@@ -290,7 +298,7 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         &mut fixture.stations[1],
         &state,
         b"rejected-complete",
-        Action::Complete(Some(change(&[12]))),
+        Action::Complete(Some(count_change(&[12]))),
     );
     assert_eq!(fixture.step(1), AdvanceOutcome::Backpressured);
     assert_eq!(
@@ -302,6 +310,84 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         (1, 1..2, 1..2)
     );
     assert_eq!(claim_id(&fixture.stations[1]), Some((0, 1)));
+}
+
+#[test]
+fn output_schema_mismatch_precedes_backpressure_and_rolls_back_the_turn() {
+    let mut fixture = source_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
+    assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
+    let state = fixture.stations[1].inbox.state().clone();
+
+    set_script(
+        &mut fixture.stations[1],
+        &state,
+        b"valid",
+        Action::Commit(Some(count_change(&[9]))),
+    );
+    assert_eq!(fixture.step(1), AdvanceOutcome::Progressed);
+    let claim = claim_ptr(&fixture.stations[1]);
+    assert_eq!(fixture.bounds(1), 0..1);
+
+    set_script(
+        &mut fixture.stations[1],
+        &state,
+        b"wrong-schema",
+        Action::Complete(Some(change(&[10]))),
+    );
+    assert!(matches!(
+        fixture.try_step(1),
+        Err(StationError::OutputSchemaMismatch { .. })
+    ));
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions).as_deref(),
+        Some(b"valid".as_slice())
+    );
+    assert_eq!(claim_ptr(&fixture.stations[1]), claim);
+    assert_eq!(
+        (fixture.cursor(1, 0), fixture.bounds(0), fixture.bounds(1)),
+        (0, 0..1, 0..1)
+    );
+}
+
+#[test]
+fn input_schema_uses_the_selected_ports_distinct_output_schema() {
+    let schemas = [value_schema(), count_schema()];
+    let mut fixture = raw_station_with_change_and_schemas(
+        &[0, 1],
+        &[1],
+        Action::Idle,
+        &count_change(&[7]),
+        &schemas,
+    );
+    assert_eq!(fixture.active(), 0);
+
+    assert_eq!(fixture.step(), AdvanceOutcome::Progressed);
+    assert_eq!(fixture.active(), 1);
+    assert_eq!(fixture.cursor(1), 0);
+    assert_eq!(fixture.bounds(1), 0..1);
+    assert_eq!(claim_id(&fixture.station), Some((1, 0)));
+}
+
+#[test]
+fn input_schema_mismatch_does_not_pin_or_install_a_claim_or_advance_the_cursor() {
+    let schemas = [value_schema(), count_schema()];
+    let mut fixture = raw_station_with_change_and_schemas(
+        &[0, 1],
+        &[1],
+        Action::Complete(None),
+        &change(&[7]),
+        &schemas,
+    );
+    assert_eq!(fixture.active(), 0);
+
+    assert!(matches!(
+        fixture.try_step(),
+        Err(StationError::InputSchemaMismatch { input: 1, .. })
+    ));
+    assert_eq!(fixture.active(), 0);
+    assert_eq!(fixture.cursor(1), 0);
+    assert_eq!(fixture.bounds(1), 0..1);
+    assert_eq!(claim_id(&fixture.station), None);
 }
 
 #[test]
@@ -551,11 +637,35 @@ fn duplicate_input_station() -> MultiInputFixture {
 }
 
 fn raw_station(sources: &[usize], populated: &[usize], action: Action) -> MultiInputFixture {
+    raw_station_with_change(sources, populated, action, &change(&[7]))
+}
+
+fn raw_station_with_change(
+    sources: &[usize],
+    populated: &[usize],
+    action: Action,
+    populated_change: &Change,
+) -> MultiInputFixture {
+    let output_count = sources.iter().copied().max().unwrap() + 1;
+    let schemas = std::iter::repeat_with(value_schema)
+        .take(output_count)
+        .collect::<Vec<_>>();
+    raw_station_with_change_and_schemas(sources, populated, action, populated_change, &schemas)
+}
+
+fn raw_station_with_change_and_schemas(
+    sources: &[usize],
+    populated: &[usize],
+    action: Action,
+    populated_change: &Change,
+    output_schemas: &[Arc<Schema>],
+) -> MultiInputFixture {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
     let state = store.create_data::<State>("state").unwrap();
     let output_count = sources.iter().copied().max().unwrap() + 1;
+    assert_eq!(output_schemas.len(), output_count);
     let outputs = (0..output_count)
         .map(|index| {
             store
@@ -567,7 +677,7 @@ fn raw_station(sources: &[usize], populated: &[usize], action: Action) -> MultiI
     let (mut transactions, reads) = store.into_transactions().split();
     let transaction = transactions.begin().unwrap();
     parts.initialize_input_state(transaction.access()).unwrap();
-    let encoded = encode_change(&change(&[7])).unwrap();
+    let encoded = encode_change(populated_change).unwrap();
     for source in populated {
         outputs[*source]
             .access(transaction.access())
@@ -576,7 +686,7 @@ fn raw_station(sources: &[usize], populated: &[usize], action: Action) -> MultiI
             .unwrap();
     }
     transaction.commit().unwrap();
-    let station = finish_station(parts, &state, &outputs, sources);
+    let station = finish_station_with_schemas(parts, &state, &outputs, sources, output_schemas);
     MultiInputFixture {
         _root: root,
         transactions,
@@ -624,6 +734,20 @@ fn station_parts(state: State, input_count: usize, action: Action) -> StationPar
 }
 
 fn finish_station(parts: StationParts, state: &State, logs: &[Log], sources: &[usize]) -> Station {
+    let schemas = std::iter::repeat_with(value_schema)
+        .take(logs.len())
+        .collect::<Vec<_>>();
+    finish_station_with_schemas(parts, state, logs, sources, &schemas)
+}
+
+fn finish_station_with_schemas(
+    parts: StationParts,
+    state: &State,
+    logs: &[Log],
+    sources: &[usize],
+    output_schemas: &[Arc<Schema>],
+) -> Station {
+    assert_eq!(output_schemas.len(), logs.len());
     let outputs = logs
         .iter()
         .enumerate()
@@ -631,6 +755,7 @@ fn finish_station(parts: StationParts, state: &State, logs: &[Log], sources: &[u
             Arc::new(Output::new(
                 log.clone(),
                 NonZeroU64::MAX,
+                Arc::clone(&output_schemas[source]),
                 sources
                     .iter()
                     .enumerate()
@@ -747,12 +872,31 @@ fn output_bounds_log(output: &Log, transactions: &mut Transactions) -> std::ops:
 }
 
 fn change(values: &[u64]) -> Change {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::UInt64,
-        false,
-    )]));
+    uint64_change(value_schema(), values)
+}
+
+fn count_change(values: &[u64]) -> Change {
+    uint64_change(count_schema(), values)
+}
+
+fn uint64_change(schema: Arc<Schema>, values: &[u64]) -> Change {
     let records =
         RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(values.to_vec()))]).unwrap();
     Change::try_new(records, Int64Array::from(vec![1; values.len()])).unwrap()
+}
+
+fn value_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+fn count_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
 }

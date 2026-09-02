@@ -13,6 +13,10 @@ pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, Def
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     (source::sequence::TAG, source::sequence::decode_definition),
     (transform::count::TAG, transform::count::decode_definition),
+    (
+        transform::project::TAG,
+        transform::project::decode_definition,
+    ),
     (sink::discard::TAG, sink::discard::decode_definition),
 ];
 

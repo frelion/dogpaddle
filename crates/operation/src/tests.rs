@@ -1,13 +1,19 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, num::NonZeroU32, sync::Arc};
 
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataInstances, MaterializeError, OperationDefinition,
+    DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     codec::DECODERS,
-    definition::DataName,
+    definition::{DataName, Sealed},
     operation::{
-        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+        Operation,
+        sink::DiscardDefinition,
+        sink::DiscardOperation,
+        source::SequenceSourceDefinition,
+        transform::{CountDefinition, ProjectDefinition},
     },
 };
 
@@ -17,12 +23,116 @@ const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("
 const SMALL_STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("state");
 const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 3] {
+#[derive(Clone, Copy, Debug)]
+enum TestBinding {
+    Rejected,
+    MissingOutput,
+    UnexpectedOutput,
+    InvalidOutput,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TestDefinition {
+    kind: OperationKind,
+    binding: TestBinding,
+}
+
+impl Sealed for TestDefinition {
+    fn bind_schemas(
+        &self,
+        _input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        let output = match self.binding {
+            TestBinding::Rejected => {
+                return Err(std::io::Error::other("rejected by test definition").into());
+            }
+            TestBinding::MissingOutput => None,
+            TestBinding::UnexpectedOutput => Some(valid_schema()),
+            TestBinding::InvalidOutput => Some(invalid_schema()),
+        };
+        Ok(OperationBinding::new(
+            output,
+            |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+                Ok(Box::new(DiscardOperation))
+            },
+        ))
+    }
+}
+
+impl OperationDefinition for TestDefinition {
+    fn kind(&self) -> OperationKind {
+        self.kind
+    }
+
+    fn data(&self) -> &'static [DataDeclaration] {
+        &[]
+    }
+
+    fn persistence_tag(&self) -> u16 {
+        u16::MAX
+    }
+
+    fn encode_payload(&self, _output: &mut Vec<u8>) {}
+}
+
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 4] {
     [
         Box::new(SequenceSourceDefinition::new(0)),
         Box::new(CountDefinition::new()),
+        Box::new(ProjectDefinition::new([0])),
         Box::new(DiscardDefinition::new()),
     ]
+}
+
+fn valid_schema() -> SchemaRef {
+    Arc::new(Schema::empty())
+}
+
+fn invalid_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "$dogpaddle.invalid",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+#[test]
+fn final_binding_entrypoint_enforces_every_common_output_invariant() {
+    let rejected = TestDefinition {
+        kind: OperationKind::Source,
+        binding: TestBinding::Rejected,
+    };
+    assert!(matches!(
+        (&rejected as &dyn OperationDefinition).bind(&[]),
+        Err(OperationBindError::Rejected { .. })
+    ));
+
+    let missing = TestDefinition {
+        kind: OperationKind::Source,
+        binding: TestBinding::MissingOutput,
+    };
+    assert!(matches!(
+        (&missing as &dyn OperationDefinition).bind(&[]),
+        Err(OperationBindError::MissingOutput)
+    ));
+
+    let unexpected = TestDefinition {
+        kind: OperationKind::Sink(NonZeroU32::MIN),
+        binding: TestBinding::UnexpectedOutput,
+    };
+    assert!(matches!(
+        (&unexpected as &dyn OperationDefinition).bind(&[valid_schema()]),
+        Err(OperationBindError::UnexpectedOutput)
+    ));
+
+    let invalid = TestDefinition {
+        kind: OperationKind::Source,
+        binding: TestBinding::InvalidOutput,
+    };
+    assert!(matches!(
+        (&invalid as &dyn OperationDefinition).bind(&[]),
+        Err(OperationBindError::InvalidOutputSchema { .. })
+    ));
 }
 
 #[test]

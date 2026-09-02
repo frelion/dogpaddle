@@ -7,8 +7,8 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
-    OperationKind,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
     operation::{Action, Operation, OperationError, OperationInput},
 };
@@ -60,7 +60,21 @@ impl SequenceSourceDefinition {
     }
 }
 
-impl SealedDefinition for SequenceSourceDefinition {}
+impl SealedDefinition for SequenceSourceDefinition {
+    fn bind_schemas(
+        &self,
+        _input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        let start = self.start;
+        Ok(OperationBinding::new(
+            Some(output_schema()),
+            move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+                let position = data.take(&POSITION)?;
+                Ok(Box::new(SequenceSourceOperation::new(start, position)))
+            },
+        ))
+    }
+}
 
 impl OperationDefinition for SequenceSourceDefinition {
     fn kind(&self) -> OperationKind {
@@ -69,14 +83,6 @@ impl OperationDefinition for SequenceSourceDefinition {
 
     fn data(&self) -> &'static [DataDeclaration] {
         DATA
-    }
-
-    fn materialize(
-        &self,
-        data: &mut DataInstances,
-    ) -> Result<Box<dyn Operation>, MaterializeError> {
-        let position = data.take(&POSITION)?;
-        Ok(Box::new(SequenceSourceOperation::new(self.start, position)))
     }
 
     fn persistence_tag(&self) -> u16 {

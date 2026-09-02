@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use arrow_schema::SchemaRef;
 use dogpaddle_change::{Change, decode_change, encode_change};
 use dogpaddle_store::{
     AppendLog, OrderedMap, ReadOnly, ReadTransactionAccess, ReadTransactions, ScanLimit, Small,
@@ -59,6 +60,7 @@ pub(crate) struct ConsumerCursor {
 pub(crate) struct Output {
     log: AppendLog<Vec<u8>>,
     capacity_bytes: NonZeroU64,
+    schema: SchemaRef,
     consumers: Box<[ConsumerCursor]>,
 }
 
@@ -201,6 +203,7 @@ impl Output {
     pub(super) fn new(
         log: AppendLog<Vec<u8>>,
         capacity_bytes: NonZeroU64,
+        schema: SchemaRef,
         consumers: Vec<ConsumerCursor>,
     ) -> Self {
         assert!(
@@ -210,6 +213,7 @@ impl Output {
         Self {
             log,
             capacity_bytes,
+            schema,
             consumers: consumers.into_boxed_slice(),
         }
     }
@@ -244,6 +248,13 @@ impl Output {
         change: &Change,
         access: TransactionAccess<'_>,
     ) -> Result<bool, StationError> {
+        let actual = change.schema();
+        if !schemas_match(&self.schema, &actual) {
+            return Err(StationError::OutputSchemaMismatch {
+                expected: Arc::clone(&self.schema),
+                actual,
+            });
+        }
         let encoded =
             encode_change(change).map_err(|source| StationError::InvalidOutputChange { source })?;
         Ok(self
@@ -284,6 +295,10 @@ impl Output {
     #[cfg(test)]
     pub(super) const fn log(&self) -> &AppendLog<Vec<u8>> {
         &self.log
+    }
+
+    pub(super) const fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 }
 
@@ -337,6 +352,21 @@ impl Inbox {
         let Some(selected) = selected else {
             return Ok(false);
         };
+        let change = decode_change(&selected.encoded).map_err(|source| {
+            StationError::InvalidInputChange {
+                input: selected.port,
+                source,
+            }
+        })?;
+        let actual = change.schema();
+        let expected = self.ports[selected.port].output.schema();
+        if !schemas_match(expected, &actual) {
+            return Err(StationError::InputSchemaMismatch {
+                input: selected.port,
+                expected: Arc::clone(expected),
+                actual,
+            });
+        }
         let pinned = selected.port != active;
         if pinned {
             let transaction = transactions.begin()?;
@@ -346,12 +376,6 @@ impl Inbox {
             )?;
             transaction.commit()?;
         }
-        let change = decode_change(&selected.encoded).map_err(|source| {
-            StationError::InvalidInputChange {
-                input: selected.port,
-                source,
-            }
-        })?;
         self.claim = Some(Claim {
             port: selected.port,
             offset: selected.offset,
@@ -359,6 +383,10 @@ impl Inbox {
         });
         Ok(pinned)
     }
+}
+
+fn schemas_match(expected: &SchemaRef, actual: &SchemaRef) -> bool {
+    Arc::ptr_eq(expected, actual) || expected.as_ref() == actual.as_ref()
 }
 
 pub(super) fn plan_complete(

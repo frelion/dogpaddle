@@ -2,9 +2,11 @@
 
 `dogpaddle-operation` 提供具体、强类型的 Operation Definition、持久化 Data 和运行实例。
 Definition 是无副作用、可持久化的数据；它声明所需数据对象的稳定逻辑名、collection 类型
-及该 collection 真正需要的布局参数。Flow 在 `build/open` 阶段创建或打开这些类型化对象，再交给
-Definition 直接装配运行实例。物化是严格单向的：运行实例只保存执行参数和具体持久化 collection，
-不保留 Definition 或返回 Definition 的方法。具体算子不接触 `Store`、`DataHandle` 或物理放置策略。
+及该 collection 真正需要的布局参数，也把有序、精确的输入 logical Arrow Schema 纯绑定为一个
+一次性的编译结果。Flow 在 `build/open` 阶段先绑定完整拓扑，再创建或打开类型化对象，并消费
+binding 装配运行实例。方向严格单向：`Definition → OperationBinding → runtime Operation`；运行实例
+只保存执行参数和具体持久化 collection，不保留 Definition 或 binding。具体算子不接触 `Store`、
+`DataHandle` 或物理放置策略。
 
 ## 数据边界
 
@@ -16,6 +18,26 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 独立定义的窗口、barrier 或 flush 信号，Operation 的展平输出事件序列和最终业务状态必须在稳定
 合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Commit` turn 而改变；物理
 Change 边界和 turn 边界都不能被算子当成业务事件。
+
+## Schema 绑定
+
+这里的 Schema 是一个端口承载记录的完整、精确 logical Arrow Schema，不包含物理 IPC 中固定的
+`$dogpaddle.diff` 字段。字段名称、顺序、类型、nullability、嵌套结构以及 Schema/Field metadata
+都属于匹配内容；它不是“需要哪些列”的局部约束，也不是每个 Change 可以变化的动态类型。
+
+[`OperationDefinition`] 的统一 `bind` 入口接收按端口顺序排列的 `SchemaRef`：Source 收到空 slice，Transform
+和 Sink 收到恰好由 [`OperationKind`] 声明的数量。绑定先验证每个输入都是合法 `DogPaddle` logical
+Schema，再由具体 Definition 接受或拒绝，并为 Source/Transform 返回唯一、完整的 output Schema；
+Sink 必须没有 output。一个 Definition 可以在不同 Flow 中绑定不同输入，但同一次 Flow build/open
+完成后，每条 output 只对应一个精确 Schema。
+
+绑定必须是纯且确定的：相同持久化 tag、payload 和有序 input Schemas 必须得到相同语义。结果是
+短生命周期、只能消费一次的 `OperationBinding`，可携带 Schema 相关的已编译执行信息及最终
+materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceSource` 固定
+输出 `{ value: UInt64 non-null }`；Count 接受任意合法的单一输入并固定输出
+`{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
+并以选中字段的完整 Schema 作为 output；Discard 接受任意合法的单一输入且没有 output。无需额外的
+`Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
 运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 与其他
 Operation 走同一个调用协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed
@@ -44,7 +66,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count，`sink` 包含
+的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count 和 Project，`sink` 包含
 Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
@@ -57,7 +79,7 @@ input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位�
 分别声明自己在数据流中的结构语义；Station 读取所包裹 Definition 的 kind，再向 Flow 提供自己的
 source/sink 与 output 属性。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
-Definition 的 `materialize`。具体 Definition 只按名称取得已经创建或打开的
+此前 Schema bind 产生的 `OperationBinding::materialize`。binding 只按名称取得已经创建或打开的
 `Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
 
 collection 只暴露真实存在的布局选择：`Cell<T>` 永远使用共享空间；`OrderedMap` 的 `Small`
@@ -85,13 +107,13 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 数据声明和物化逻辑。Flow 不枚举具体算子，也不解析 Operation payload。
 
 为穿过 object-safe 的 [`OperationDefinition`] 边界，数据实例仅在一次性的 build/open 装配
-过程中进行私有类型擦除；具名声明在 `materialize` 中将其安全恢复为精确 data class。
+过程中进行私有类型擦除；具名声明在 binding 的 `materialize` 中将其安全恢复为精确 data class。
 类型不匹配会返回错误而不是 panic。类型擦除不会进入运行实例、事务访问路径或持久化格式。
 
 物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
-`Box<dyn operation::Operation>`，并通过同一个 `turn` 分派运行。Definition 单向物化 Operation；运行
-trait 和三个具体运行类型都不反向保存或暴露 Definition，Flow 在 build/open 时已经从持久 Definition
-获得 kind 与资源声明。
+`Box<dyn operation::Operation>`，并通过同一个 `turn` 分派运行。Schema binding 只在 build/open
+期间连接 Definition 与实例；运行 trait 和具体运行类型都不反向保存或暴露 Definition，Flow
+已经从持久 Definition 获得 kind、资源声明和端口 Schema。
 Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化运行实例；开放可注入 Flow 的
 第三方算子仍需另行设计 tag 分配、decoder 注册和运行错误边界。
 
@@ -104,6 +126,8 @@ non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` �
 后续 turn 返回 `Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
 Change。每次产生值的 turn 返回 `Action::Commit(Some(_))`；Station 不为
 Source 建立另一套 outcome 或事务路径。它声明自己产生输出。
+
+Schema bind 不接收输入，并固定完整 output Schema 为一个 non-null `UInt64` `value` 字段。
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 
@@ -123,6 +147,23 @@ Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 
 整个 turn 不产生部分进展。协议允许其他 Operation 用声明的持久化状态在多个 `Commit` turn 中处理
 同一 Change，这不是 Count 必须采用的实现策略。
 
+Schema bind 接受任意合法的精确单一输入，并固定完整 output Schema 为一个 non-null `UInt64`
+`count` 字段。
+
+## `operation::transform::Project`
+
+[`operation::transform::ProjectDefinition`] 要求一个输入，并用稳定的 zero-based `u32` 顶层字段
+索引描述投影。Schema bind 把这些索引编译为绑定精确 input Schema 的 `ChangeProjection`；索引必须
+严格递增且都存在，空投影合法。output Schema 完整保留所选字段及 Schema/Field metadata，嵌套字段
+只按完整子树选择，隐式 diff 始终保留。越界、重复或重排在 Flow 创建任何 Store 资源前以结构化
+[`operation::transform::ProjectSchemaError`] 拒绝。
+
+[`operation::transform::ProjectOperation`] 不声明 Store data，只保留 binding 编译出的
+`ChangeProjection`。每个 turn 对完整 Change 做保持行序和 diff 的顶层投影，并返回
+`Action::Complete(Some(_))`；所选 Arrow Array buffer 与输入共享，不复制列数据。Definition 的字段
+索引数量和每个索引使用稳定 big-endian `u32` 编码，tag/payload 与 input Schema 一起决定 reopen 后
+重建的精确 output Schema。
+
 ## `operation::sink::Discard`
 
 [`operation::sink::DiscardDefinition`] 显式声明为携带一个输入的 [`OperationKind::Sink`]，
@@ -130,6 +171,8 @@ Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 
 unit struct；它接受端口零上的完整 Change，并返回 `Action::Complete(None)`。输入完成仍由 Station 在同一事务中
 持久化 cursor；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
 Sink 的幂等提交协议仍需单独设计。
+
+Schema bind 接受任意合法的精确单一输入，并返回无 output 的 binding。
 
 ```rust,no_run
 use dogpaddle_operation::operation::{
@@ -172,7 +215,7 @@ Flow 不需要知道算子的业务数据结构，Operation 也不能控制事�
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
 模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
 `Operation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
-类型化 collection class、payload codec 与物化逻辑；公共 decoder 表只增加一条
+类型化 collection class、payload codec、纯 Schema bind 与一次性物化逻辑；公共 decoder 表只增加一条
 `tag → decode function` 记录。运行实例只直接保存执行所需的标量参数与 collection，不能保存
 Definition 或提供回到 Definition 的 getter，也不再为每个算子增加只包裹字段的 `OperationData`
 类型。Flow 的 build/open 不应出现具体算子分支。
@@ -181,9 +224,10 @@ Definition 或提供回到 Definition 的 getter，也不再为每个算子增�
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
 分类内增加任意数量的算子都不会产生注册名称冲突。
 
-一个 Operation 的 tag、payload、显式 kind 及有序 port 语义、
+一个 Operation 的 tag、payload、显式 kind、有序 port 语义以及“有序 input Schemas → binding”规则，
 逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE` 共同决定持久化 schema。
-Flow 根据声明创建实例，materialize 再按逻辑名
+derived input/output Schemas 不单独持久化；因此改变同一 tag/payload 对同一输入的绑定结果，或改变
+Schema 相关状态的 codec，仍是持久化 ABI 变化。Flow 根据声明创建实例，binding materialize 再按逻辑名
 取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
 旧格式兼容层的前提下破坏性调整已有 tag 对应的 schema，但必须同步更新 decoder、黄金字节、
 资源布局和 reopen 测试。格式稳定后，这类变化才需要新 tag、新版本或明确迁移。编码 tag 与
@@ -191,14 +235,16 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 
 声明使用普通静态 Rust 值表达，不引入 Slot、Assembler、Factory registry 或位置 ABI。只有在
 出现稳定且机械的声明样板后，才考虑用很薄的 `macro_rules!` 生成声明常量；宏不得生成算子
-主体、materialize、codec 或运行逻辑。
+主体、Schema bind、materialize、codec 或运行逻辑。
 
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
-runtime trace 统一覆盖三个 built-in 的完整 turn、commit、rollback、reopen、极值错误不改状态、固定
-output Schema/diff 和 Store 错误透明传播。完整目录所有权、测试矩阵和 fixture 规则见工作区
+Schema 测试覆盖四个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+以及 Project 对合法但不兼容 Schema 的结构化拒绝；runtime trace 统一覆盖完整 turn、commit、rollback、
+reopen、极值错误不改状态、固定 output Schema/diff、Project 零拷贝和 Store 错误透明
+传播。完整目录所有权、测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务

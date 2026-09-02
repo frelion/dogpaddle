@@ -1,5 +1,6 @@
 use std::{num::NonZeroU64, sync::Arc};
 
+use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationKind,
@@ -24,7 +25,7 @@ pub(crate) struct StationParts {
     state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
     operation: Box<dyn Operation>,
     kind: OperationKind,
-    output: Option<(AppendLog<Vec<u8>>, NonZeroU64)>,
+    output: Option<(AppendLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
 }
 
 pub(crate) struct Station {
@@ -115,7 +116,7 @@ impl StationParts {
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         operation: Box<dyn Operation>,
         kind: OperationKind,
-        output: Option<(AppendLog<Vec<u8>>, NonZeroU64)>,
+        output: Option<(AppendLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
     ) -> Self {
         Self {
             state,
@@ -147,9 +148,9 @@ impl StationParts {
     }
 
     pub(crate) fn prepare_output(&mut self, consumers: Vec<ConsumerCursor>) -> Option<Arc<Output>> {
-        self.output
-            .take()
-            .map(|(log, capacity_bytes)| Arc::new(Output::new(log, capacity_bytes, consumers)))
+        self.output.take().map(|(log, capacity_bytes, schema)| {
+            Arc::new(Output::new(log, capacity_bytes, schema, consumers))
+        })
     }
 
     pub(crate) fn finish(self, inputs: Vec<InputPort>, output: Option<Arc<Output>>) -> Station {

@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::Change;
+use dogpaddle_change::{Change, ChangeProjection, ProjectionError};
 use dogpaddle_operation::operation::{
     Action, Operation, OperationInput,
     sink::{DiscardError, DiscardOperation},
     source::{SequenceSourceError, SequenceSourceOperation},
-    transform::{CountError, CountOperation},
+    transform::{CountError, CountOperation, ProjectError, ProjectOperation},
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -250,6 +250,87 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     assert!(matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::WrongStore)
+    ));
+}
+
+#[test]
+fn project_input_protocol_errors_are_exact() {
+    let input = change(&[1]);
+    let project = ProjectOperation::new(ChangeProjection::try_new(input.schema(), [0]).unwrap());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let missing = project.turn(None, transaction.access()).unwrap_err();
+    assert!(matches!(
+        missing.downcast_ref::<ProjectError>(),
+        Some(ProjectError::MissingInput)
+    ));
+    let invalid_port = project
+        .turn(
+            Some(OperationInput {
+                port: 1,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        invalid_port.downcast_ref::<ProjectError>(),
+        Some(ProjectError::InvalidInputPort { port: 1 })
+    ));
+
+    let expected_schema = Arc::new(Schema::new(vec![Field::new(
+        "expected",
+        DataType::UInt64,
+        false,
+    )]));
+    let mismatched =
+        ProjectOperation::new(ChangeProjection::try_new(expected_schema, [0]).unwrap());
+    let error = mismatched
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ProjectError>(),
+        Some(ProjectError::Projection(ProjectionError::SchemaMismatch))
+    ));
+}
+
+#[test]
+fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("first", DataType::UInt64, false),
+        Field::new("second", DataType::UInt64, false),
+    ]));
+    let records = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1, 2])),
+            Arc::new(UInt64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
+    let operation = ProjectOperation::new(ChangeProjection::try_new(schema, [1]).unwrap());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("Project did not complete with one output Change");
+    };
+    assert_eq!(output.num_rows(), 2);
+    assert_eq!(output.diffs(), input.diffs());
+    assert_eq!(output.schema().fields().len(), 1);
+    assert_eq!(output.schema().field(0).name(), "second");
+    assert!(Arc::ptr_eq(
+        output.records().column(0),
+        input.records().column(1)
     ));
 }
 

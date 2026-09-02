@@ -1,9 +1,15 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
     DefinitionCodecError, OperationDefinition, decode_definition, encode_definition,
     operation::{
-        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+        sink::DiscardDefinition,
+        source::SequenceSourceDefinition,
+        transform::{CountDefinition, ProjectDefinition},
     },
 };
 
@@ -11,6 +17,7 @@ use super::support::decode_hex;
 
 const COUNT_V1: &str = include_str!("../fixtures/v1/count_definition.hex");
 const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
+const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
 
 fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
@@ -18,10 +25,38 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
         (decode_hex(COUNT_V1), Box::new(CountDefinition::new())),
         (decode_hex(DISCARD_V1), Box::new(DiscardDefinition::new())),
         (
+            decode_hex(PROJECT_V1),
+            Box::new(ProjectDefinition::new([0, 2])),
+        ),
+        (
             decode_hex(SEQUENCE_V1),
             Box::new(SequenceSourceDefinition::new(42)),
         ),
     ]
+}
+
+fn value_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+fn arbitrary_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("message", DataType::Utf8, true),
+        Field::new("score", DataType::Int64, false),
+    ]))
+}
+
+fn count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
 }
 
 #[test]
@@ -32,6 +67,44 @@ fn every_builtin_definition_has_stable_v1_golden_bytes() {
         assert_eq!(decoded.kind(), definition.kind());
         assert_eq!(encode_definition(decoded.as_ref()), golden);
     }
+}
+
+#[test]
+fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
+    let sequence = decode_definition(&decode_hex(SEQUENCE_V1)).unwrap();
+    assert_eq!(
+        sequence.bind(&[]).unwrap().output_schema(),
+        Some(&value_schema())
+    );
+
+    let arbitrary = arbitrary_schema();
+    let count = decode_definition(&decode_hex(COUNT_V1)).unwrap();
+    assert_eq!(
+        count
+            .bind(std::slice::from_ref(&arbitrary))
+            .unwrap()
+            .output_schema(),
+        Some(&count_schema())
+    );
+
+    let project = decode_definition(&decode_hex(PROJECT_V1)).unwrap();
+    let expected = Arc::new(arbitrary.project(&[0, 2]).unwrap());
+    assert_eq!(
+        project
+            .bind(std::slice::from_ref(&arbitrary))
+            .unwrap()
+            .output_schema(),
+        Some(&expected)
+    );
+
+    let discard = decode_definition(&decode_hex(DISCARD_V1)).unwrap();
+    assert!(
+        discard
+            .bind(std::slice::from_ref(&arbitrary))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
 }
 
 #[test]

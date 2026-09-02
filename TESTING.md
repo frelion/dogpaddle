@@ -36,8 +36,8 @@
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | Definition codec/materialize、状态 commit/rollback/reopen、重批 | `operation_core` |
-| Flow | build/open、拓扑、Claim 重放、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | Definition codec、精确 Schema bind/materialize、Project 静态拒绝与零拷贝、状态 commit/rollback/reopen、重批 | `operation_core` |
+| Flow | build/open、拓扑 Schema 传播、Project 拒绝无建库副作用与 reopen 重绑定、Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。

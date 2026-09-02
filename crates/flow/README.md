@@ -3,7 +3,7 @@
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
 `Flow` 只表示运行态，不承担声明、构建或打开职责。Station 当前是 crate 内部的一对一 Operation
 容器；它读取所包裹 Definition 显式声明的 `OperationKind`，向 Flow 提供 source、sink、输入数量
-和 output 属性。Flow 不枚举具体算子；未来一个 Station 包裹多个 Operation 时，只需在 Station
+和 output 属性，并在 build/open 时沿拓扑传递精确 logical Arrow Schema。Flow 不枚举具体算子；未来一个 Station 包裹多个 Operation 时，只需在 Station
 内部归纳这些属性，不必改变 Flow 的拓扑接口。
 
 ## 构建 Flow
@@ -54,17 +54,22 @@ fan-out 和重复 source；连接数量必须与 Station 对外声明的输入�
 Sink 没有 output，不能作为其他 Station 的上游。允许多个 Source、多个 Sink 和多个互不连接的
 合法 DAG 分量。每个 `OperationKind::has_output()` 为 true 的 Station 必须且只能声明一次非零
 output capacity，outputless Station 不得声明；重复、遗漏、类别不匹配或 foreign `StationRef` 都在
-纯校验阶段失败。拓扑、容量校验或 manifest 编码失败不会创建目标目录。
+纯校验阶段失败。拓扑解析后，Flow 还按确定性拓扑顺序把每个 producer 的精确 output Schema
+传到 consumer 的对应有序 input port，并调用 Definition 的纯 bind；任一 Schema 拒绝都会带
+Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
+编码失败都不会创建目标目录。
 
 ## 持久化边界
 
-每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成纯校验，再为 Flow 和每个 Station 各声明一个
+每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成声明并稳定编码，再立即解码这份 canonical
+manifest；拓扑解析、Schema 绑定和后续资源布局都只使用将要持久化的 Definition，而不依赖调用方
+原始 Rust 对象的额外状态。全部纯校验成功后，build 才为 Flow 和每个 Station 各声明一个
 持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个具有外部
 output 的 Station 创建一个 output log，最后提交 manifest Cell 作为构建完成
 标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
 build/open 通路负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称
-交给 Definition 直接装配 Operation。绑定不依赖声明顺序，具体算子不接触 Store、底层句柄或
-物理布局。
+交给先前 Schema bind 产生的一次性 `OperationBinding` 装配 Operation。数据实例绑定不依赖声明
+顺序，具体算子不接触 Store、底层句柄或物理布局。
 
 Flow definition Cell 固定使用共享布局；Flow state map 和 Station state map 显式声明为
 `Small`。Flow state map 保留生命周期状态；Station state map 保存运行期 Station 状态，并为每个
@@ -72,10 +77,11 @@ input 保存下一条未处理 Change 的 offset；有输入的 Station 还保�
 `build()` 在发布 manifest 的同一事务中把 active input 和全部 cursor 显式初始化为 `0`，不存在
 “缺失时从当前 log head 开始”的隐式恢复。output 是
 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，不另建 Schema
-Cell。每个 output capacity 直接保存在 Flow Definition 中，build/open 都把它与对应 output log
-装配成一个不可失配的运行期 capability，不创建另一份 Station state。端口 Schema 一致性属于
-Flow/Station 契约，不依赖 Change codec 之外的 Schema resource 或
-fingerprint 维持。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
+Cell。每个 output capacity 直接保存在 Flow Definition 中；build/open 都把它、对应 output log、
+完整 consumer frontier 和绑定得到的精确 logical Schema 装配成同一个不可失配的运行期
+`Output` capability，不创建另一份 Station state。端口 Schema 一致性不依赖 Change codec 之外的
+Schema resource、fingerprint 或 registry：持久化 Definition 加上有序上游 Schema 在 reopen 时
+确定性重建同一 binding。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
 
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
 显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
@@ -84,9 +90,9 @@ Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所
 `&mut Transactions`；`Station::process` 同样只在调用期间借用 writer。后者无法消费 writer 来
 split 出 owned reader。拓扑和资源目录都没有运行期修改入口。
 
-资源创建和 Station 装配分成两遍。第一遍按声明顺序创建或打开全部 state、Operation data 和
+资源创建和 Station 装配分成两遍。Schema binding 在两遍之前已对全图完成。第一遍按声明顺序创建或打开全部 state、Operation data 和
 output；第二遍先从每个 target state 派生各 consumer edge 的只读 cursor capability，再把每个
-producer 的 output log、capacity 和完整 consumer frontier 绑定成唯一、不可错配的 output capability。
+producer 的 output log、capacity、精确 Schema 和完整 consumer frontier 绑定成唯一、不可错配的 output capability。
 producer append、capacity 判定与所有下游 intake、frontier 校验和物理回收必须引用同一 capability，
 不得分别持有可独立替换的日志或 retention handle；每条 input edge 只补充自己的 consumer slot。
 声明顺序不必是拓扑顺序，fan-out 仍共享同一个物理日志与保留边界。Station 不知道上下游 Station ID，
@@ -100,7 +106,9 @@ producer append、capacity 判定与所有下游 intake、frontier 校验和物�
 前用一个独立的短写事务把它固定为 active input，cursor 保持不变；已有的
 `active input + cursor` 因而就是唯一 durable input identity，不增加另一套 current-input key。随后
 Claim 保存该 entry 的 port、AppendLog offset 和完整 owned Change；它只是 durable identity 的可丢弃
-内存副本，存在时 `intake` 不访问 Store。重开 Flow 时 Claim 为空，并根据 active input 与对应 cursor
+内存副本。IPC 解码完成后，`intake` 必须先把 Change 的完整 logical Schema 与该 input 共享的
+`Output` Schema 精确比较，匹配后才能安装 Claim；Schema 不匹配不会 pin、推进 cursor 或产生其他
+持久化写入。Claim 存在时 `intake` 不访问 Store。重开 Flow 时 Claim 为空，并根据 active input 与对应 cursor
 重建同一输入。零输入 Source 没有 Claim，但仍由相同的 Station 路径调用 `turn(None, ...)`；没有
 Source 专用 outcome 或事务路径。没有 output 的 Sink 不能被其他 Station 作为 source。
 
@@ -117,6 +125,8 @@ Operation 只返回三个 `Action`：`Idle` 丢弃本次事务，因而不发布
 port/offset 与 durable active input/cursor 相同，然后提交 Operation 状态、可选 output、cursor 推进、
 active input 轮转和必要的上游物理回收；只有外层 commit 成功后才清除 Claim。任何 Operation、编码、
 append、Station state、retention 或 commit 错误都会回滚本次事务并保留 durable identity 与 Claim。
+Operation 返回 output 时，Station 在 IPC 编码和 capacity 判定之前先按同样的精确规则校验其
+logical Schema；不匹配是协议错误，整个 turn 的 Operation 状态、output 与输入进展全部回滚。
 
 Operation 在调用前不会因 output 已达到水位而被跳过，因为 Station 尚不知道本次是否产生 output
 以及编码后大小。没有 output 的 `Commit` 即使日志已经达到水位也可以正常提交；有 output 时
@@ -163,9 +173,11 @@ Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory:
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
-`FlowFactory::open()` 先读取、解码并重新校验 manifest，再打开全部数据对象和 output，最后按
+`FlowFactory::open()` 先读取、解码并重新校验 manifest，再解析拓扑并纯重建全部 Schema bindings；
+只有成功后才重新打开全部数据对象和 output，最后按
 source ID 重新注入 inputs、装配 Station；第二次 Definition 读取和所有 output frontier 校验共享
-同一个 RO snapshot，不启动或提交写事务。调用方不需要重新提交 Definition。
+同一个 RO snapshot，不启动或提交写事务。open 不扫描全部 backlog；合法 IPC 中与绑定不一致的
+Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用方不需要重新提交 Definition。
 
 当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
@@ -178,17 +190,20 @@ source ID 重新注入 inputs、装配 Station；第二次 Definition 读取和�
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - Count 状态：`station/{index:08x}/operation/count`
+- Project 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
 当前仍是开发期 v1；output capacity 直接成为新的 v1 Station Definition 布局，不解码旧布局。
-编码、tag 或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
+derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有序 input Schemas 的绑定语义
+属于 reopen ABI。编码、tag、绑定语义或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
 和 reopen 测试，不保留旧格式兼容层。
 
 ## 源码边界
 
 `FlowFactory` 负责声明、纯拓扑校验、稳定编码以及 build/open 时的资源装配；运行态 `Flow` 只持有
-已装配 Station、确定性 schedule 和分离的事务启动能力。Station 是 crate 私有的单轮执行壳，拥有
+已装配 Station、确定性 schedule 和分离的事务启动能力。私有 `build/schema.rs` 只负责拓扑序
+Schema 传播和 Definition bind，不创建资源或进入运行调度；Station 是 crate 私有的单轮执行壳，拥有
 输入 claim 与 output retention，但不接收 Store、不知道物理 placement 或稳定资源名。Flow 作为
 Operation 与 Store 的组合根，通过单一公共 `correctness` target 验证资源布局、重新物化和运行
 协议，不再建立重复的集成 package。具体目录 ownership 与私有实现约束见仓库 `AGENTS.md`；fixture、
@@ -204,9 +219,10 @@ state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和�
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实 `SequenceSource → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
+`Flow::advance`，真实 `SequenceSource → Project → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
-自然反压上游。尚未实现 `Flow::start`、中断控制、端口 Schema 静态约束或外部副作用协议；内建 Count
+自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
+intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 Count
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 

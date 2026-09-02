@@ -10,8 +10,8 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationDefinition,
-    OperationKind,
+    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
     operation::{Action, Operation, OperationError, OperationInput},
 };
@@ -67,7 +67,20 @@ impl CountDefinition {
     }
 }
 
-impl SealedDefinition for CountDefinition {}
+impl SealedDefinition for CountDefinition {
+    fn bind_schemas(
+        &self,
+        _input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        Ok(OperationBinding::new(
+            Some(output_schema()),
+            |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+                let count = data.take(&COUNT)?;
+                Ok(Box::new(CountOperation::new(count)))
+            },
+        ))
+    }
+}
 
 impl OperationDefinition for CountDefinition {
     fn kind(&self) -> OperationKind {
@@ -76,14 +89,6 @@ impl OperationDefinition for CountDefinition {
 
     fn data(&self) -> &'static [DataDeclaration] {
         DATA
-    }
-
-    fn materialize(
-        &self,
-        data: &mut DataInstances,
-    ) -> Result<Box<dyn Operation>, MaterializeError> {
-        let count = data.take(&COUNT)?;
-        Ok(Box::new(CountOperation::new(count)))
     }
 
     fn persistence_tag(&self) -> u16 {

@@ -2,9 +2,12 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     ops::Range,
     path::Path,
+    sync::Arc,
 };
 
-use dogpaddle_change::encode_change;
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     Action, Operation,
@@ -95,6 +98,38 @@ fn advance_rejects_an_invalid_encoded_change_without_writes() {
     );
     drop(flow);
     assert_eq!(durable_input_state(&path), before);
+}
+
+#[test]
+fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let encoded = encode_change(&count_change(7)).unwrap();
+    publish_pending_input(&path, Some(&encoded), false);
+    let before = durable_input_state(&path);
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    let error = flow.advance().unwrap_err();
+    assert_eq!(error.station_id(), "sink");
+    assert!(
+        error
+            .to_string()
+            .contains("station input 0 Schema does not match its bound output")
+    );
+    drop(flow);
+
+    assert_eq!(durable_input_state(&path), before);
+}
+
+fn count_change(value: u64) -> Change {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]));
+    let records =
+        RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![value]))]).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1])).unwrap()
 }
 
 fn publish_pending_input(path: &Path, encoded: Option<&[u8]>, shift_head: bool) {
