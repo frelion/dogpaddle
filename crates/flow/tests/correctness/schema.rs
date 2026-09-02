@@ -3,8 +3,7 @@ use std::num::NonZeroU64;
 use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
 use dogpaddle_operation::{
-    BinaryOperator, Expression, ExpressionBindError, Literal, OperationBindError,
-    OperationDefinition, UnaryOperator, encode_definition,
+    ExpressionBindError, OperationBindError, OperationDefinition, col, encode_definition, lit,
     operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
@@ -48,7 +47,7 @@ fn build_reports_filter_and_extend_schema_rejections_without_store_side_effects(
     let error = build_schema_error(
         &filter_path,
         "filter",
-        FilterDefinition::new(Expression::column(0)),
+        FilterDefinition::try_new(col("value")).unwrap(),
     );
     let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("non-Boolean Filter returned the wrong binding error");
@@ -64,7 +63,7 @@ fn build_reports_filter_and_extend_schema_rejections_without_store_side_effects(
     let error = build_schema_error(
         &extend_path,
         "extend",
-        ExtendDefinition::new("value", Expression::column(0)),
+        ExtendDefinition::try_new("value", col("value")).unwrap(),
     );
     assert!(matches!(
         error.operation_error(),
@@ -112,14 +111,8 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
     let root = tempfile::tempdir().unwrap();
 
     let filter_path = root.path().join("filter");
-    let valid_filter = FilterDefinition::new(Expression::unary(
-        UnaryOperator::IsNull,
-        Expression::column(0),
-    ));
-    let invalid_filter = FilterDefinition::new(Expression::unary(
-        UnaryOperator::IsNull,
-        Expression::column(1),
-    ));
+    let valid_filter = FilterDefinition::try_new(col("value").is_null()).unwrap();
+    let invalid_filter = FilterDefinition::try_new(col("other").is_null()).unwrap();
     build_and_replace_operation(&filter_path, "filter", valid_filter, &invalid_filter);
     let Err(FlowError::Schema(error)) = FlowFactory::open(&filter_path) else {
         panic!("open did not rebind the decoded schema-incompatible Filter");
@@ -131,10 +124,7 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
     assert!(matches!(
         source.downcast_ref::<FilterSchemaError>(),
         Some(FilterSchemaError::Expression(
-            ExpressionBindError::ColumnOutOfBounds {
-                index: 1,
-                fields: 1
-            }
+            ExpressionBindError::DataFusion(_)
         ))
     ));
 
@@ -142,8 +132,8 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
     build_and_replace_operation(
         &extend_path,
         "extend",
-        ExtendDefinition::new("other", Expression::column(0)),
-        &ExtendDefinition::new("value", Expression::column(0)),
+        ExtendDefinition::try_new("other", col("value")).unwrap(),
+        &ExtendDefinition::try_new("value", col("value")).unwrap(),
     );
     let Err(FlowError::Schema(error)) = FlowFactory::open(&extend_path) else {
         panic!("open did not rebind the decoded schema-incompatible Extend");
@@ -165,16 +155,9 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 1));
     let extend = factory.station(
         "extend",
-        ExtendDefinition::new(
-            "keep",
-            Expression::binary(
-                BinaryOperator::Equal,
-                Expression::column(0),
-                Expression::literal(Literal::UInt64(Some(u64::MAX - 1))),
-            ),
-        ),
+        ExtendDefinition::try_new("keep", col("value").eq(lit(u64::MAX - 1))).unwrap(),
     );
-    let filter = factory.station("filter", FilterDefinition::new(Expression::column(1)));
+    let filter = factory.station("filter", FilterDefinition::try_new(col("keep")).unwrap());
     let project = factory.station("project", ProjectDefinition::new([0]));
     let count = factory.station("count", CountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());

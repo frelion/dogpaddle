@@ -7,8 +7,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, ChangeProjection, ProjectionError};
 use dogpaddle_operation::{
-    BinaryOperator, DataInstances, Expression, ExpressionError, Literal, OperationDefinition,
-    UnaryOperator,
+    DataInstances, Expr, ExpressionError, OperationDefinition, Operator, ScalarValue, cast, col,
+    lit,
     operation::{
         Action, Operation, OperationInput,
         sink::{DiscardError, DiscardOperation},
@@ -18,6 +18,7 @@ use dogpaddle_operation::{
             FilterError, ProjectError, ProjectOperation,
         },
     },
+    try_cast,
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -41,8 +42,12 @@ fn turn_input(change: &Change) -> OperationInput<'_> {
     OperationInput { port: 0, change }
 }
 
-fn equal(left: Expression, right: Expression) -> Expression {
-    Expression::binary(BinaryOperator::Equal, left, right)
+fn comparison(operator: Operator, left: Expr, right: Expr) -> Expr {
+    match operator {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        _ => panic!("comparison helper received unsupported operator {operator}"),
+    }
 }
 
 fn stateless_operation(
@@ -402,7 +407,7 @@ fn filter_keeps_only_true_rows_with_the_same_order_records_and_diffs() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2])).unwrap();
     let operation = stateless_operation(
-        &FilterDefinition::new(Expression::column(1)),
+        &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
@@ -498,7 +503,7 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 2, 3, 4])).unwrap();
     let operation = stateless_operation(
-        &FilterDefinition::new(Expression::column(0)),
+        &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
@@ -546,7 +551,7 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     let transaction = transactions.begin().unwrap();
 
     let all_true = stateless_operation(
-        &FilterDefinition::new(Expression::literal(Literal::Boolean(Some(true)))),
+        &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
     let Action::Complete(Some(output)) = all_true
@@ -564,11 +569,11 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
         input.diffs().values().as_ptr()
     );
 
-    for predicate in [
-        Expression::literal(Literal::Boolean(Some(false))),
-        Expression::literal(Literal::Boolean(None)),
-    ] {
-        let operation = stateless_operation(&FilterDefinition::new(predicate), input.schema());
+    for predicate in [lit(false), lit(ScalarValue::Boolean(None))] {
+        let operation = stateless_operation(
+            &FilterDefinition::try_new(predicate).unwrap(),
+            input.schema(),
+        );
         assert!(matches!(
             operation
                 .turn(Some(turn_input(&input)), transaction.access())
@@ -593,17 +598,11 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let expression = Expression::binary(
-        BinaryOperator::Or,
-        Expression::binary(
-            BinaryOperator::And,
-            Expression::column(0),
-            Expression::literal(Literal::Boolean(None)),
-        ),
-        Expression::unary(UnaryOperator::IsNull, Expression::column(1)),
-    );
+    let expression = col("flag")
+        .and(lit(ScalarValue::Boolean(None)))
+        .or(col("label").is_null());
     let operation = stateless_operation(
-        &ExtendDefinition::new("selected", expression),
+        &ExtendDefinition::try_new("selected", expression).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
@@ -643,7 +642,7 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     );
 
     let copy = stateless_operation(
-        &ExtendDefinition::new("label_copy", Expression::column(1)),
+        &ExtendDefinition::try_new("label_copy", col("label")).unwrap(),
         Arc::clone(&schema),
     );
     let Action::Complete(Some(copied)) = copy
@@ -662,11 +661,11 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
 fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
     let input = change(&[1]);
     let filter = stateless_operation(
-        &FilterDefinition::new(Expression::literal(Literal::Boolean(Some(true)))),
+        &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
     let extend = stateless_operation(
-        &ExtendDefinition::new("copy", Expression::column(0)),
+        &ExtendDefinition::try_new("copy", col("input")).unwrap(),
         input.schema(),
     );
     let fixture = TestStore::new();
@@ -772,7 +771,7 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
 
     for (name, expression, expected) in kleene_cases() {
         let operation = stateless_operation(
-            &ExtendDefinition::new(name, expression),
+            &ExtendDefinition::try_new(name, expression).unwrap(),
             Arc::clone(&schema),
         );
         let Action::Complete(Some(output)) = operation
@@ -800,15 +799,11 @@ fn repeat_each(values: [Option<bool>; 3]) -> Vec<Option<bool>> {
         .collect()
 }
 
-fn kleene_cases() -> Vec<(&'static str, Expression, Vec<Option<bool>>)> {
+fn kleene_cases() -> Vec<(&'static str, Expr, Vec<Option<bool>>)> {
     vec![
         (
             "and",
-            Expression::binary(
-                BinaryOperator::And,
-                Expression::column(0),
-                Expression::column(1),
-            ),
+            col("left").and(col("right")),
             vec![
                 Some(true),
                 Some(false),
@@ -823,11 +818,7 @@ fn kleene_cases() -> Vec<(&'static str, Expression, Vec<Option<bool>>)> {
         ),
         (
             "or",
-            Expression::binary(
-                BinaryOperator::Or,
-                Expression::column(0),
-                Expression::column(1),
-            ),
+            col("left").or(col("right")),
             vec![
                 Some(true),
                 Some(true),
@@ -842,42 +833,34 @@ fn kleene_cases() -> Vec<(&'static str, Expression, Vec<Option<bool>>)> {
         ),
         (
             "and_scalar_right",
-            Expression::binary(
-                BinaryOperator::And,
-                Expression::column(0),
-                Expression::literal(Literal::Boolean(None)),
-            ),
+            col("left").and(lit(ScalarValue::Boolean(None))),
             repeat_each([None, Some(false), None]),
         ),
         (
             "or_scalar_left",
-            Expression::binary(
-                BinaryOperator::Or,
-                Expression::literal(Literal::Boolean(Some(false))),
-                Expression::column(1),
-            ),
+            lit(false).or(col("right")),
             [Some(true), Some(false), None].repeat(3),
         ),
         (
             "not",
-            Expression::unary(UnaryOperator::Not, Expression::column(0)),
+            !col("left"),
             repeat_each([Some(false), Some(true), None]),
         ),
         (
             "null_type_is_null",
-            Expression::unary(UnaryOperator::IsNull, Expression::column(2)),
+            col("nothing").is_null(),
             vec![Some(true); 9],
         ),
         (
             "non_null_is_null",
-            Expression::unary(UnaryOperator::IsNull, Expression::column(3)),
+            col("number").is_null(),
             vec![Some(false); 9],
         ),
     ]
 }
 
 #[test]
-fn equality_operators_cover_every_v1_scalar_type_and_propagate_null() {
+fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("boolean", DataType::Boolean, true),
         Field::new("signed", DataType::Int64, true),
@@ -900,31 +883,23 @@ fn equality_operators_cover_every_v1_scalar_type_and_propagate_null() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let operands = [
-        (0, Literal::Boolean(Some(true))),
-        (1, Literal::Int64(Some(-2))),
-        (2, Literal::UInt64(Some(7))),
-        (3, Literal::Utf8(Some("x".to_owned()))),
+        ("boolean", ScalarValue::Boolean(Some(true))),
+        ("signed", ScalarValue::Int64(Some(-2))),
+        ("unsigned", ScalarValue::UInt64(Some(7))),
+        ("text", ScalarValue::Utf8(Some("x".to_owned()))),
     ];
 
     for (column, literal) in operands {
         for (operator, expected) in [
-            (BinaryOperator::Equal, [Some(true), Some(false), None]),
-            (BinaryOperator::NotEqual, [Some(false), Some(true), None]),
+            (Operator::Eq, [Some(true), Some(false), None]),
+            (Operator::NotEq, [Some(false), Some(true), None]),
         ] {
             for expression in [
-                Expression::binary(
-                    operator,
-                    Expression::column(column),
-                    Expression::literal(literal.clone()),
-                ),
-                Expression::binary(
-                    operator,
-                    Expression::literal(literal.clone()),
-                    Expression::column(column),
-                ),
+                comparison(operator, col(column), lit(literal.clone())),
+                comparison(operator, lit(literal.clone()), col(column)),
             ] {
                 let operation = stateless_operation(
-                    &ExtendDefinition::new("result", expression),
+                    &ExtendDefinition::try_new("result", expression).unwrap(),
                     Arc::clone(&schema),
                 );
                 let Action::Complete(Some(output)) = operation
@@ -947,14 +922,15 @@ fn equality_operators_cover_every_v1_scalar_type_and_propagate_null() {
     }
 
     for (operator, expected) in [
-        (BinaryOperator::Equal, [Some(true), Some(true), None]),
-        (BinaryOperator::NotEqual, [Some(false), Some(false), None]),
+        (Operator::Eq, [Some(true), Some(true), None]),
+        (Operator::NotEq, [Some(false), Some(false), None]),
     ] {
         let operation = stateless_operation(
-            &ExtendDefinition::new(
+            &ExtendDefinition::try_new(
                 "array_result",
-                Expression::binary(operator, Expression::column(0), Expression::column(0)),
-            ),
+                comparison(operator, col("boolean"), col("boolean")),
+            )
+            .unwrap(),
             Arc::clone(&schema),
         );
         let Action::Complete(Some(output)) = operation
@@ -973,6 +949,67 @@ fn equality_operators_cover_every_v1_scalar_type_and_propagate_null() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
+}
+
+#[test]
+fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::UInt64, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(UInt64Array::from(vec![7, 8])),
+            Arc::new(StringArray::from(vec![Some("10"), Some("bad")])),
+        ],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
+    let operation = stateless_operation(
+        &ExtendDefinition::try_new("greater", predicate).unwrap(),
+        Arc::clone(&schema),
+    );
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("arithmetic expression did not produce an output");
+    };
+    let greater = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert_eq!(
+        greater.iter().collect::<Vec<_>>(),
+        [Some(false), Some(true)]
+    );
+
+    let operation = stateless_operation(
+        &ExtendDefinition::try_new("parsed", try_cast(col("text"), DataType::Int64)).unwrap(),
+        Arc::clone(&schema),
+    );
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("try-cast expression did not produce an output");
+    };
+    let parsed = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(parsed.iter().collect::<Vec<_>>(), [Some(10), None]);
 }
 
 fn predicate_change(values: &[u64], keep: &[Option<bool>], diffs: &[i64]) -> Change {
@@ -1001,7 +1038,7 @@ fn filter_trace(
 ) -> Vec<(u64, i64)> {
     assert_eq!(batches.iter().sum::<usize>(), values.len());
     let schema = predicate_change(&values[..1], &keep[..1], &diffs[..1]).schema();
-    let operation = stateless_operation(&FilterDefinition::new(Expression::column(1)), schema);
+    let operation = stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1051,13 +1088,7 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
         false,
     )]));
     let operation = stateless_operation(
-        &ExtendDefinition::new(
-            "seven",
-            equal(
-                Expression::column(0),
-                Expression::literal(Literal::UInt64(Some(7))),
-            ),
-        ),
+        &ExtendDefinition::try_new("seven", col("value").eq(lit(7_u64))).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();

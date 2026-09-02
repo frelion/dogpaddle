@@ -32,8 +32,11 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
 - **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、Schema-sensitive 的
-  零拷贝顶层 Project、共享稳定表达式内核的 Filter 与单列 Extend，以及无输出 Discard
-  Sink；build/open 会先从 canonical Definition 产生一次性的 Schema binding，再为有状态算子创建
+  零拷贝顶层 Project、接收 DataFusion `Expr` 的 Filter 与单列 Extend，以及无输出 Discard Sink。
+  Filter/Extend 直接用 `datafusion-proto` 持久化表达式；build/open 通过 DataFusion
+  `create_physical_expr` 完成类型、nullability、cast 与向量化执行；当前不运行 logical coercion，混合类型需显式 cast。DogPaddle 不维护第二套
+  表达式语言，也不因此引入 SQL 层。build/open 会先从 canonical Definition
+  产生一次性的 Schema binding，再为有状态算子创建
   或打开持久化 Cell 并消费 binding 装配运行实例，同时为 Flow 和每个 Station 预先声明通用 state map。
 - **Station 数据通道装配**：每个会产生输出的 Station 拥有自己的 `AppendLog<Vec<u8>>`；每个
   下游 input 只拿到对应上游日志的 `ReadOnly` capability，fan-out 不复制日志；producer 和全部
@@ -98,7 +101,7 @@ entry 在首次 intake 解码后还会再次校验，Schema 违例均不会提�
 因此不是磁盘或内存硬配额。Operation 的展平
 output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响；
 比较的每种物理分批都必须能用声明的 Arrow input/output 类型表示。
-仓库也没有最终用户二进制、SQL、连接器或
+DataFusion 当前提供表达式 API、protobuf 和向量化执行；仓库仍没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。
 

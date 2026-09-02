@@ -21,6 +21,10 @@ arrow-buffer = "=59.2.0"
 arrow-ipc = "=59.2.0"
 arrow-schema = "=59.2.0"
 arrow-select = "=59.2.0"
+datafusion-common = { version = "=55.0.0", default-features = false }
+datafusion-expr = { version = "=55.0.0", default-features = false }
+datafusion-physical-expr = { version = "=55.0.0", default-features = false }
+datafusion-proto = { version = "=55.0.0", default-features = false }
 dogpaddle-bench-protocol = { path = "test-support/bench-protocol" }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-operation = { path = "crates/operation" }

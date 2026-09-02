@@ -8,12 +8,12 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expression, ExpressionBindError,
-    ExpressionError, MaterializeError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    DataDeclaration, DataInstances, DefinitionCodecError, Expr, ExpressionBindError,
+    ExpressionDefinitionError, ExpressionError, MaterializeError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    expression::BoundExpression,
+    expression::{BoundExpression, StoredExpression},
     operation::{Action, Operation, OperationError, OperationInput},
 };
 
@@ -27,7 +27,7 @@ const DATA: &[DataDeclaration] = &[];
 /// `false` and null both remove the row. Filtering never changes differences.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FilterDefinition {
-    predicate: Expression,
+    predicate: StoredExpression,
 }
 
 /// Materialized exact-Schema-bound row filter.
@@ -38,7 +38,7 @@ pub struct FilterOperation {
 }
 
 /// Filter-specific failure while binding exact input Schemas.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FilterSchemaError {
     /// The persistent predicate cannot bind to the input Schema.
@@ -83,16 +83,23 @@ pub enum FilterError {
 }
 
 impl FilterDefinition {
-    /// Creates a row filter from one stable scalar predicate.
-    #[must_use]
-    pub const fn new(predicate: Expression) -> Self {
-        Self { predicate }
+    /// Admits a `DataFusion` scalar expression as a persistent row predicate.
+    ///
+    /// The expression is immediately round-tripped through `DataFusion`'s
+    /// protobuf codec so Definition encoding cannot fail later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpressionDefinitionError`] when `DataFusion` cannot encode and
+    /// decode the expression exactly and canonically.
+    pub fn try_new(predicate: Expr) -> Result<Self, ExpressionDefinitionError> {
+        StoredExpression::try_new(predicate).map(|predicate| Self { predicate })
     }
 
-    /// Returns the persistent unbound predicate.
+    /// Returns the canonical `DataFusion` predicate admitted by this definition.
     #[must_use]
-    pub const fn predicate(&self) -> &Expression {
-        &self.predicate
+    pub fn predicate(&self) -> &Expr {
+        self.predicate.expression()
     }
 }
 
@@ -199,7 +206,7 @@ pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
-    let predicate = Expression::decode(&mut cursor)?;
+    let predicate = StoredExpression::decode(&mut cursor)?;
     cursor.finish()?;
-    Ok(Box::new(FilterDefinition::new(predicate)))
+    Ok(Box::new(FilterDefinition { predicate }))
 }

@@ -4,10 +4,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
-    DataDeclaration, DataInstances, Expression, Literal, MaterializeError, OperationBindError,
-    OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     codec::DECODERS,
+    col,
     definition::{DataName, Sealed},
+    lit,
     operation::{
         Operation,
         sink::DiscardDefinition,
@@ -80,10 +82,8 @@ fn builtin_definitions() -> [Box<dyn OperationDefinition>; 6] {
         Box::new(SequenceSourceDefinition::new(0)),
         Box::new(CountDefinition::new()),
         Box::new(ProjectDefinition::new([0])),
-        Box::new(FilterDefinition::new(Expression::literal(
-            Literal::Boolean(Some(true)),
-        ))),
-        Box::new(ExtendDefinition::new("copy", Expression::column(0))),
+        Box::new(FilterDefinition::try_new(lit(true)).unwrap()),
+        Box::new(ExtendDefinition::try_new("copy", col("value")).unwrap()),
         Box::new(DiscardDefinition::new()),
     ]
 }

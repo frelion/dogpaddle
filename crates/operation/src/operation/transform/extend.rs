@@ -7,12 +7,12 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expression, ExpressionBindError,
-    ExpressionError, MaterializeError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    DataDeclaration, DataInstances, DefinitionCodecError, Expr, ExpressionBindError,
+    ExpressionDefinitionError, ExpressionError, MaterializeError, OperationBinding,
+    OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    expression::BoundExpression,
+    expression::{BoundExpression, StoredExpression},
     operation::{Action, Operation, OperationError, OperationInput},
 };
 
@@ -28,7 +28,7 @@ const DATA: &[DataDeclaration] = &[];
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtendDefinition {
     field_name: String,
-    expression: Expression,
+    expression: StoredExpression,
 }
 
 /// Materialized exact-Schema-bound single-field extension.
@@ -41,12 +41,24 @@ pub struct ExtendOperation {
 }
 
 /// Extend-specific failure while binding exact input Schemas.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExtendSchemaError {
     /// The persistent expression cannot bind to the input Schema.
     #[error(transparent)]
     Expression(#[from] ExpressionBindError),
+}
+
+/// Failure while constructing an [`ExtendDefinition`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ExtendDefinitionError {
+    /// The appended field name cannot fit the stable definition format.
+    #[error("Extend field name is too long for the stable format")]
+    FieldNameTooLong,
+    /// The `DataFusion` expression cannot be persisted exactly and canonically.
+    #[error(transparent)]
+    Expression(#[from] ExpressionDefinitionError),
 }
 
 /// Extend-specific failure during one [`ExtendOperation`] turn.
@@ -74,26 +86,27 @@ pub enum ExtendError {
 }
 
 impl ExtendDefinition {
-    /// Creates a transform that appends one computed field.
+    /// Admits a `DataFusion` expression that appends one computed field.
     ///
     /// Field-name uniqueness and the reserved protocol namespace depend on the
     /// eventual input Schema and are checked by the final Schema binding.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the UTF-8 field name is too long for the stable v1 `u32`
-    /// length.
-    #[must_use]
-    pub fn new(field_name: impl Into<String>, expression: Expression) -> Self {
+    /// Returns [`ExtendDefinitionError`] when the field name cannot fit the
+    /// stable format or `DataFusion` cannot round-trip the expression.
+    pub fn try_new(
+        field_name: impl Into<String>,
+        expression: Expr,
+    ) -> Result<Self, ExtendDefinitionError> {
         let field_name = field_name.into();
-        assert!(
-            u32::try_from(field_name.len()).is_ok(),
-            "Extend field name length must fit the stable v1 format"
-        );
-        Self {
-            field_name,
-            expression,
+        if u32::try_from(field_name.len()).is_err() {
+            return Err(ExtendDefinitionError::FieldNameTooLong);
         }
+        Ok(Self {
+            field_name,
+            expression: StoredExpression::try_new(expression)?,
+        })
     }
 
     /// Returns the name of the appended top-level field.
@@ -102,10 +115,10 @@ impl ExtendDefinition {
         &self.field_name
     }
 
-    /// Returns the persistent unbound expression.
+    /// Returns the canonical `DataFusion` expression admitted by this definition.
     #[must_use]
-    pub const fn expression(&self) -> &Expression {
-        &self.expression
+    pub fn expression(&self) -> &Expr {
+        self.expression.expression()
     }
 }
 
@@ -159,7 +172,7 @@ impl OperationDefinition for ExtendDefinition {
 
     fn encode_payload(&self, output: &mut Vec<u8>) {
         let name_length = u32::try_from(self.field_name.len())
-            .expect("ExtendDefinition::new validated the stable field-name length");
+            .expect("ExtendDefinition::try_new validated the stable field-name length");
         output.extend_from_slice(&name_length.to_be_bytes());
         output.extend_from_slice(self.field_name.as_bytes());
         self.expression.encode(output);
@@ -201,7 +214,10 @@ pub(crate) fn decode_definition(
     let field_name = std::str::from_utf8(name)
         .map_err(|_| DefinitionCodecError::InvalidPayload("Extend field name is invalid UTF-8"))?
         .to_owned();
-    let expression = Expression::decode(&mut cursor)?;
+    let expression = StoredExpression::decode(&mut cursor)?;
     cursor.finish()?;
-    Ok(Box::new(ExtendDefinition::new(field_name, expression)))
+    Ok(Box::new(ExtendDefinition {
+        field_name,
+        expression,
+    }))
 }

@@ -12,8 +12,8 @@ pub use definition::{
     MaterializeError, OperationBindError, OperationDefinition, OperationKind, OperationSchemaError,
 };
 pub use expression::{
-    BinaryOperator, Expression, ExpressionBindError, ExpressionError, Literal,
-    MAX_EXPRESSION_STACK_DEPTH, UnaryOperator,
+    Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError, Operator, ScalarValue,
+    cast, col, ident, lit, try_cast,
 };
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     (sink::discard::TAG, sink::discard::decode_definition),
 ];
 
-/// Stable operation-definition encoding failure.
+/// Versioned operation-definition encoding failure.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DefinitionCodecError {
@@ -46,7 +46,11 @@ pub enum DefinitionCodecError {
     TrailingBytes,
 }
 
-/// Encodes a definition using `DogPaddle`'s stable explicit binary format.
+/// Encodes a definition using `DogPaddle`'s versioned binary format.
+///
+/// Some operation payloads contain bytes owned by an exactly pinned upstream
+/// codec. Such bytes are part of this outer format version and may require a
+/// version bump when that dependency changes.
 #[must_use]
 pub fn encode_definition(definition: &dyn OperationDefinition) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(MAGIC.len() + 12);
@@ -57,7 +61,7 @@ pub fn encode_definition(definition: &dyn OperationDefinition) -> Vec<u8> {
     encoded
 }
 
-/// Decodes one definition from `DogPaddle`'s stable explicit binary format.
+/// Decodes one definition from `DogPaddle`'s versioned binary format.
 ///
 /// # Errors
 ///
@@ -99,28 +103,12 @@ impl<'a> PayloadCursor<'a> {
         self.remaining
     }
 
-    pub(crate) const fn remaining_len(&self) -> usize {
-        self.remaining.len()
-    }
-
-    pub(crate) fn read_u8(&mut self) -> Result<u8, DefinitionCodecError> {
-        Ok(self.take::<1>()?[0])
-    }
-
     pub(crate) fn read_u16(&mut self) -> Result<u16, DefinitionCodecError> {
         Ok(u16::from_be_bytes(self.take::<2>()?))
     }
 
     pub(crate) fn read_u32(&mut self) -> Result<u32, DefinitionCodecError> {
         Ok(u32::from_be_bytes(self.take::<4>()?))
-    }
-
-    pub(crate) fn read_i64(&mut self) -> Result<i64, DefinitionCodecError> {
-        Ok(i64::from_be_bytes(self.take::<8>()?))
-    }
-
-    pub(crate) fn read_u64(&mut self) -> Result<u64, DefinitionCodecError> {
-        Ok(u64::from_be_bytes(self.take::<8>()?))
     }
 
     pub(crate) fn read_bytes(&mut self, length: usize) -> Result<&'a [u8], DefinitionCodecError> {

@@ -41,37 +41,43 @@ materialize closure；它不写 Store，也不进入持久化格式或运行态�
 Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Discard 接受任意合法的单一输入且没有 output。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
-Filter 与 Extend 共用 crate 根级的 [`Expression`]。它是 opaque 的线性后序程序，
-而不是公开递归 AST：持久化解码、Schema bind、求值和释放都不随表达式深度递归。当前稳定语言只包含
-顶层 `u32` 字段索引、`Boolean/Int64/UInt64/Utf8` 类型化 nullable literal、`Not/IsNull` 以及
-`Equal/NotEqual/And/Or`。字段本身可以是任意合法 `DogPaddle` Arrow 类型，所以 Extend 可以直接复制
-List、Struct 等完整列，`IsNull` 也能检查任意列；`Equal/NotEqual` 只接受两边精确同型的上述四种
-scalar，`And/Or/Not` 只接受 Boolean。不存在 untyped null、隐式 cast、字段名晚绑定、closure 或字符串
-DSL。普通运算传播 null，Boolean 组合采用 SQL/Kleene 三值逻辑，`IsNull` 固定产生 non-null Boolean。
+Filter 与 Extend 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
+[`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
+builder。需要按 Arrow 字段名逐字引用时使用 [`ident`]；[`col`] 保留 `DataFusion` 自身的大小写正规化和
+multipart identifier 解析规则。Definition 的 `try_new` 立即使用 `datafusion-proto` 编码 `Expr`，无法编码时返回构造错误；
+公开 getter 从同一表达式定义返回 `Expr`，不引入 `DogPaddle` 自有 AST。
 
-Expression 的 Definition 编码固定为 big-endian `u32 node_count + postfix nodes`，node、literal、
-unary 和 binary operator 都有显式稳定 tag；decoder 在分配前用每节点最小编码长度和剩余 payload
-约束 node count，只随实际已解码节点增长，并迭代校验操作数栈、canonical Boolean、UTF-8、截断和尾随。
-绑定还把同时存活的 evaluation value stack 限制为公开的 [`MAX_EXPRESSION_STACK_DEPTH`]（当前为 64），而不限制
-线性程序的总节点数或 unary-chain 深度；这让深 unary 程序保持迭代可用，同时静态封住宽表达式的批量内存放大。
-绑定结果保存 exact input Schema 与 private typed plan，但两者不持久化；运行时求值前
-再次核对完整 Schema，因而直接调用运行 Operation 也不能把同一个字段索引解释为漂移后的类型。
-运行时 literal 保持为借用 scalar，比较和 Boolean 运算直接处理 scalar/array 组合，不先复制成整列；
-只有最终 output 本身是 scalar 时才按输入行数物化对应 Arrow Array。
+Definition payload 直接保存 `DataFusion` Expr protobuf，不保存 `PhysicalExpr`。Schema bind 将完整 input
+Schema 交给 `DataFusion` `create_physical_expr`；表达式的字段解析、type、nullability、cast 与
+运行期 `evaluate` 全部由 `DataFusion` 定义。该 API 假定 logical coercion 已完成，而本 crate 不运行
+logical/SQL planner，因此不会额外插入隐式 cast；混合类型表达式需要调用方显式 [`cast`]。binding 只保存 exact input Schema、physical expression 和
+派生 output 属性；open 从 protobuf 还原 `Expr` 后重新完成同一过程。DogPaddle 继续负责完整 Schema
+guard、Filter/Extend 的 output Schema 约束，以及 records/diffs 的 Change 语义。
+
+这份 protobuf 是版本绑定的持久格式，不承诺跨 `DataFusion` 版本兼容。工作区精确 pin 相互匹配的
+`DataFusion`、`datafusion-proto` 与 Arrow；升级必须审查 proto roundtrip、physical planning 和执行语义。
+若新版本不能兼容旧 payload，必须 bump 外层 Operation Definition tag/version 并重建 Flow，不在同一
+版本内猜测或迁移旧表达式。DataFusion 的采用不等于引入 SQL 层。
 
 ```rust
-use dogpaddle_operation::{BinaryOperator, Expression, Literal};
+use arrow_schema::DataType;
+use dogpaddle_operation::{ScalarValue, cast, col, ident, lit, try_cast};
 use dogpaddle_operation::operation::transform::{ExtendDefinition, FilterDefinition};
 
-let is_seven = Expression::binary(
-    BinaryOperator::Equal,
-    Expression::column(0),
-    Expression::literal(Literal::UInt64(Some(7))),
-);
-let extend = ExtendDefinition::new("is_seven", is_seven.clone());
-let filter = FilterDefinition::new(is_seven);
+let is_seven = col("value").eq(lit(7_u64));
+let extend = ExtendDefinition::try_new("is_seven", is_seven.clone()).unwrap();
+let filter = FilterDefinition::try_new(is_seven).unwrap();
 assert_eq!(extend.field_name(), "is_seven");
 assert_eq!(filter.predicate(), extend.expression());
+
+let typed_null = lit(ScalarValue::Utf8(None));
+let strict_text = cast(col("value"), DataType::Utf8);
+let nullable_text = try_cast(col("value"), DataType::Utf8);
+let exact_arrow_name = ident("Case.Sensitive");
+assert!(ExtendDefinition::try_new("missing", typed_null).is_ok());
+assert!(ExtendDefinition::try_new("strict_text", strict_text).is_ok());
+assert!(ExtendDefinition::try_new("nullable_text", nullable_text).is_ok());
+assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 ```
 
 运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 与其他
@@ -86,7 +92,7 @@ offset 和逐字节相同的完整 Change。零输入 Source 也用 `Commit` 表
 output Change；filter 或 Sink 可以使用 `None`。
 跨 turn continuation 必须放在 Operation 自己通过 Definition 声明的持久化 Store 状态中，不能
 隐藏在 Station。具体错误统一擦除为标准 boxed [`operation::OperationError`]：算子语义错误保留
-具体算子错误类型；具体错误可以透明包装 Expression、Store、Arrow 或 Change source，调用方可以
+具体算子错误类型；具体错误可以透明包装 `DataFusion` expression、Store、Arrow 或 Change source，调用方可以
 downcast 顶层算子错误并沿标准 error source chain 检查基础原因。
 由于 `Idle`、错误、Station output 容量拒绝或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
 Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂等提交协议，当前尚未定义。
@@ -202,8 +208,9 @@ Schema bind 接受任意合法的精确单一输入，并固定完整 output Sch
 
 ## `operation::transform::Filter`
 
-[`operation::transform::FilterDefinition`] 要求一个输入并持久化一个 [`Expression`] predicate。
-Schema bind 把表达式编译到精确 input Schema；最终类型不是 Boolean、字段越界或 operand 类型不兼容
+[`operation::transform::FilterDefinition`] 通过 fallible `try_new` 接收 `DataFusion` [`Expr`]，要求一个输入，
+并持久化 `DataFusion` Expr protobuf。Schema bind 通过 `DataFusion` 把表达式编译到精确 input Schema；
+最终类型不是 Boolean 或 `DataFusion` 无法规划
 都会在 Flow 创建 Store 前以结构化 [`operation::transform::FilterSchemaError`] 拒绝。output Schema
 与 input 完全相同。
 
@@ -216,7 +223,8 @@ kernel 对自定义 concrete type panic，随后才进行一次向量筛选。
 
 ## `operation::transform::Extend`
 
-[`operation::transform::ExtendDefinition`] 要求一个输入，并只持久化 `field_name + Expression`。
+[`operation::transform::ExtendDefinition`] 通过 fallible `try_new` 接收 `field_name + Expr`，要求一个输入，
+并只持久化 field name 与 `DataFusion` Expr protobuf。
 Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability；调用者不重复声明 Field/type，避免两套
 真相。output 依次保留所有 input `FieldRef` 与 Schema metadata，再追加一个 metadata 为空的新 Field；
 重复名称、`$dogpaddle.` 保留名称和非法派生 Schema 仍由统一 output Schema 校验拒绝。一次只追加一列，
@@ -293,7 +301,8 @@ derived input/output Schemas 不单独持久化；因此改变同一 tag/payload
 Schema 相关状态的 codec，仍是持久化 ABI 变化。Flow 根据声明创建实例，binding materialize 再按逻辑名
 取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
 旧格式兼容层的前提下破坏性调整已有 tag 对应的 schema，但必须同步更新 decoder、黄金字节、
-资源布局和 reopen 测试。格式稳定后，这类变化才需要新 tag、新版本或明确迁移。编码 tag 与
+资源布局和 reopen 测试；DataFusion Expr protobuf 的不兼容升级仍必须按上文 bump 外层 tag/version。
+格式稳定后，其他这类变化也需要新 tag、新版本或明确迁移。编码 tag 与
 decoder 表必须复用具体模块中的同一个 tag 常量。
 
 声明使用普通静态 Rust 值表达，不引入 Slot、Assembler、Factory registry 或位置 ABI。只有在
@@ -305,12 +314,13 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
 Schema 测试覆盖六个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
-以及 Project、Filter、Extend 对合法但不兼容 Schema 的结构化拒绝；runtime trace 统一覆盖完整 turn、
-commit、rollback、reopen、固定 output Schema/diff、Project/Extend 零拷贝、Filter 的空/全量选择及覆盖
-Null/bitmap/fixed/variable/List/Struct 全部 v1 layout family 的部分选择、
-完整 Kleene truth table、四种 scalar/array 双向 equality 与 null 传播、value-stack 静态上界、超过
-旧 1024 深度的迭代执行、携带混合 diff 的稳定重批和 Store 错误。Expression golden
-会经过 `decode → bind → materialize → turn` 检查 tag 到执行语义，而不仅是重编码。完整目录所有权、
+以及 Project、Filter、Extend 对合法但不兼容 Schema 的结构化拒绝；表达式测试覆盖 `DataFusion` protobuf
+编码失败、roundtrip 与精确版本 golden。runtime trace 统一覆盖完整 turn、commit、rollback、
+reopen、固定 output Schema/diff、Project/Extend 零拷贝、Filter 的空/全量选择及覆盖
+Null/bitmap/fixed/variable/List/Struct 全部 v1 layout family 的部分选择、DataFusion
+`create_physical_expr` 的 type/nullability、scalar/array evaluate 与 null 传播、
+携带混合 diff 的稳定重批和 Store 错误。Expression golden
+会经过 `decode → bind → materialize → turn` 检查 protobuf 到执行语义，而不仅是重编码。完整目录所有权、
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 

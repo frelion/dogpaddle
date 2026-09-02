@@ -36,7 +36,7 @@
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | Definition/Expression codec、精确 Schema bind/materialize、表达式 scalar/array 与 stack bound、Project/Extend 零拷贝、Filter 全部 Arrow v1 layout family/Kleene/null/混合 diff 重批、状态 commit/rollback/reopen | `operation_core` |
+| Operation | Definition 与 DataFusion Expr protobuf roundtrip、exact Schema bind/materialize、`create_physical_expr` 的 type/nullability 与 scalar/array evaluate、Project/Extend 零拷贝、Filter 全部 Arrow v1 layout family/null/混合 diff 重批、状态 commit/rollback/reopen | `operation_core` |
 | Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend 拒绝无建库副作用与 reopen 重绑定、Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
@@ -62,6 +62,12 @@
 3. 一个不复用生产算法的语义或互操作 oracle；
 4. malformed/corruption 拒绝且无 panic、无部分写入；
 5. 精确资源名、类型、size/codec 与失败后状态。
+
+Expression golden 直接冻结当前精确 pin 的 DataFusion Expr protobuf bytes，并继续经过
+`decode → exact Schema bind → materialize → turn`，验证 `create_physical_expr`、type/nullability 与
+scalar/array evaluate。该格式不承诺跨 DataFusion 版本兼容；升级 DataFusion、`datafusion-proto` 或
+Arrow 时必须重跑 proto roundtrip、build/open/reopen 和执行语义。若新版本不能兼容旧 payload，测试应随
+外层 Operation Definition tag/version 一起更新，并验证旧 Flow 被明确拒绝、重建后的 Flow 正常运行。
 
 Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理
 原子性。上层只重复自己的协议阶段、对象组合和 reopen 义务，不为每个 crate 复制 SIGKILL harness。

@@ -17,9 +17,10 @@ use std::num::NonZeroU64;
 
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
+    col, lit,
     operation::sink::DiscardDefinition,
     operation::source::SequenceSourceDefinition,
-    operation::transform::CountDefinition,
+    operation::transform::{CountDefinition, ExtendDefinition, FilterDefinition},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,23 +28,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let extend = factory.station(
+        "extend",
+        ExtendDefinition::try_new("is_seven", col("value").eq(lit(7_u64)))?,
+    );
+    let filter = factory.station(
+        "filter",
+        FilterDefinition::try_new(col("is_seven"))?,
+    );
     let count = factory.station("count", CountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     let capacity = NonZeroU64::new(64 * 1024 * 1024).unwrap();
     factory.output_capacity_bytes(source, capacity);
+    factory.output_capacity_bytes(extend, capacity);
+    factory.output_capacity_bytes(filter, capacity);
     factory.output_capacity_bytes(count, capacity);
-    factory.connect([source], count);
+    factory.connect([source], extend);
+    factory.connect([extend], filter);
+    factory.connect([filter], count);
     factory.connect([count], sink);
 
     let flow = factory.build()?;
     assert_eq!(
         flow.station_ids().collect::<Vec<_>>(),
-        ["source", "count", "sink"]
+        ["source", "extend", "filter", "count", "sink"]
     );
     drop(flow);
 
     let reopened = FlowFactory::open(&path)?;
-    assert_eq!(reopened.station_count(), 3);
+    assert_eq!(reopened.station_count(), 5);
     Ok(())
 }
 ```
@@ -58,6 +71,12 @@ output capacity，outputless Station 不得声明；重复、遗漏、类别不�
 传到 consumer 的对应有序 input port，并调用 Definition 的纯 bind；任一 Schema 拒绝都会带
 Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
 编码失败都不会创建目标目录。
+
+Filter/Extend 的 Definition 在 `station()` 之前已通过 fallible `try_new` 将 `DataFusion` `Expr` 编码为
+`DataFusion` protobuf；无法编码的表达式直接作为构造错误返回。表达式的字段解析、type、nullability、
+cast 和 `PhysicalExpr` 创建留在上述全图 bind 阶段，由 `DataFusion` 完成。`create_physical_expr` 假定
+logical coercion 已完成，而 Flow 不运行 logical/SQL planner，因此混合类型需要调用方显式 cast；失败同样不会创建
+目标目录。Project 仍使用严格递增的顶层字段索引。
 
 ## 持久化边界
 
@@ -82,6 +101,10 @@ Cell。每个 output capacity 直接保存在 Flow Definition 中；build/open �
 `Output` capability，不创建另一份 Station state。端口 Schema 一致性不依赖 Change codec 之外的
 Schema resource、fingerprint 或 registry：持久化 Definition 加上有序上游 Schema 在 reopen 时
 确定性重建同一 binding。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
+Filter/Extend 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
+build/open 都从 protobuf 还原 `Expr`，并针对 exact input Schema 重新调用 `create_physical_expr`。
+`DataFusion` 依赖与 Arrow 精确 pin；跨 `DataFusion` 版本不保证读取兼容，不兼容升级必须 bump 外层
+Operation Definition tag/version 并重建 Flow。
 
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
 显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
@@ -197,7 +220,8 @@ input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字�
 当前仍是开发期 v1；output capacity 直接成为新的 v1 Station Definition 布局，不解码旧布局。
 derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有序 input Schemas 的绑定语义
 属于 reopen ABI。编码、tag、绑定语义或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
-和 reopen 测试，不保留旧格式兼容层。
+和 reopen 测试，不保留旧格式兼容层。`DataFusion` `Expr` protobuf 的不兼容升级必须明确 bump 外层
+Operation Definition tag/version，并要求重建 Flow。
 
 ## 源码边界
 
@@ -225,6 +249,8 @@ retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。F
 intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 Count
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
+`DataFusion` 集成目前止于 Filter/Extend 的 `Expr` protobuf、physical expression planning 与向量化执行，
+不提供 SQL planner、catalog 或任意 `DataFusion` logical/physical plan 的 Flow 映射。
 
 ## 验证
 

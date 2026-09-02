@@ -5,16 +5,18 @@ use std::{
 
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_proto::bytes::Serializeable;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    BinaryOperator, DataInstances, DefinitionCodecError, Expression, Literal, OperationDefinition,
-    UnaryOperator, decode_definition, encode_definition,
+    DataInstances, DefinitionCodecError, Expr, OperationDefinition, Operator, ScalarValue, cast,
+    col, decode_definition, encode_definition, lit,
     operation::{
         Action, OperationInput,
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
         transform::{CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition},
     },
+    try_cast,
 };
 use dogpaddle_store::Store;
 
@@ -26,57 +28,46 @@ const EXTEND_V1: &str = include_str!("../fixtures/v1/extend_is_seven.hex");
 const FILTER_V1: &str = include_str!("../fixtures/v1/filter_complex_expression.hex");
 const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
 
-fn binary(operator: BinaryOperator, left: Expression, right: Expression) -> Expression {
-    Expression::binary(operator, left, right)
+fn length_prefixed_bytes(encoded: &[u8], length_offset: usize) -> &[u8] {
+    let length = usize::try_from(u32::from_be_bytes(
+        encoded[length_offset..length_offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let value_offset = length_offset + size_of::<u32>();
+    assert_eq!(value_offset + length, encoded.len());
+    &encoded[value_offset..]
 }
 
-fn complex_predicate() -> Expression {
-    let uint_match = binary(
-        BinaryOperator::Equal,
-        Expression::column(0),
-        Expression::literal(Literal::UInt64(Some(7))),
-    );
-    let signed_null = Expression::unary(
-        UnaryOperator::IsNull,
-        binary(
-            BinaryOperator::Equal,
-            Expression::literal(Literal::Int64(Some(-2))),
-            Expression::literal(Literal::Int64(None)),
-        ),
-    );
-    let utf8_null = Expression::unary(
-        UnaryOperator::IsNull,
-        binary(
-            BinaryOperator::NotEqual,
-            Expression::literal(Literal::Utf8(Some("x".to_owned()))),
-            Expression::literal(Literal::Utf8(None)),
-        ),
-    );
-    let boolean_null = Expression::unary(
-        UnaryOperator::IsNull,
-        binary(
-            BinaryOperator::Equal,
-            Expression::literal(Literal::Boolean(Some(true))),
-            Expression::literal(Literal::Boolean(None)),
-        ),
-    );
-    let nullable_or = Expression::unary(
-        UnaryOperator::IsNull,
-        binary(
-            BinaryOperator::Or,
-            Expression::literal(Literal::Boolean(None)),
-            Expression::literal(Literal::Boolean(Some(false))),
-        ),
-    );
-    let known_true = Expression::unary(
-        UnaryOperator::Not,
-        Expression::literal(Literal::Boolean(Some(false))),
-    );
-    let uint_null = Expression::unary(
-        UnaryOperator::IsNull,
-        Expression::literal(Literal::UInt64(None)),
-    );
+fn binary(operator: Operator, left: Expr, right: Expr) -> Expr {
+    match operator {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::And => left.and(right),
+        Operator::Or => left.or(right),
+        _ => panic!("test helper does not support {operator}"),
+    }
+}
+
+fn filter(predicate: Expr) -> FilterDefinition {
+    FilterDefinition::try_new(predicate).unwrap()
+}
+
+fn extend(field_name: &str, expression: Expr) -> ExtendDefinition {
+    ExtendDefinition::try_new(field_name, expression).unwrap()
+}
+
+fn complex_predicate() -> Expr {
+    let uint_match = binary(Operator::Eq, col("value"), lit(7_u64));
+    let signed_null = binary(Operator::Eq, lit(-2_i64), lit(ScalarValue::Int64(None))).is_null();
+    let utf8_null = binary(Operator::NotEq, lit("x"), lit(ScalarValue::Utf8(None))).is_null();
+    let boolean_null = binary(Operator::Eq, lit(true), lit(ScalarValue::Boolean(None))).is_null();
+    let nullable_or = binary(Operator::Or, lit(ScalarValue::Boolean(None)), lit(false)).is_null();
+    let known_true = !lit(false);
+    let uint_null = lit(ScalarValue::UInt64(None)).is_null();
     [
         signed_null,
         utf8_null,
@@ -86,9 +77,7 @@ fn complex_predicate() -> Expression {
         uint_null,
     ]
     .into_iter()
-    .fold(uint_match, |left, right| {
-        binary(BinaryOperator::And, left, right)
-    })
+    .fold(uint_match, |left, right| binary(Operator::And, left, right))
 }
 
 fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
@@ -97,19 +86,12 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
         (decode_hex(DISCARD_V1), Box::new(DiscardDefinition::new())),
         (
             decode_hex(EXTEND_V1),
-            Box::new(ExtendDefinition::new(
+            Box::new(extend(
                 "is_seven",
-                binary(
-                    BinaryOperator::Equal,
-                    Expression::column(0),
-                    Expression::literal(Literal::UInt64(Some(7))),
-                ),
+                binary(Operator::Eq, col("value"), lit(7_u64)),
             )),
         ),
-        (
-            decode_hex(FILTER_V1),
-            Box::new(FilterDefinition::new(complex_predicate())),
-        ),
+        (decode_hex(FILTER_V1), Box::new(filter(complex_predicate()))),
         (
             decode_hex(PROJECT_V1),
             Box::new(ProjectDefinition::new([0, 2])),
@@ -213,55 +195,6 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
             .output_schema()
             .is_none()
     );
-}
-
-#[test]
-fn deep_linear_expression_roundtrips_binds_and_executes_without_a_recursive_limit() {
-    let mut expression = Expression::literal(Literal::Boolean(Some(true)));
-    for _ in 0..2_048 {
-        expression = Expression::unary(UnaryOperator::Not, expression);
-    }
-    let encoded = encode_definition(&FilterDefinition::new(expression));
-    let decoded = decode_definition(&encoded).unwrap();
-    assert_eq!(encode_definition(decoded.as_ref()), encoded);
-
-    let schema = value_schema();
-    let mut data = DataInstances::new();
-    let operation = decoded
-        .bind(std::slice::from_ref(&schema))
-        .unwrap()
-        .materialize(&mut data)
-        .unwrap();
-    data.finish().unwrap();
-
-    let records = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(UInt64Array::from(vec![7]))],
-    )
-    .unwrap();
-    let input = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-    let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let Action::Complete(Some(output)) = operation
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
-        panic!("deep linear expression did not retain its true row");
-    };
-    assert_eq!(output.schema(), input.schema());
-    assert!(Arc::ptr_eq(
-        output.records().column(0),
-        input.records().column(0)
-    ));
-    assert_eq!(output.diffs().values(), input.diffs().values());
 }
 
 #[test]
@@ -395,107 +328,103 @@ fn definition_decoder_rejects_non_canonical_or_unknown_input() {
 }
 
 #[test]
-fn expression_decoder_rejects_bad_tags_stacks_scalars_and_utf8() {
-    let payload_offset = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
-    let simple = encode_definition(&FilterDefinition::new(Expression::literal(
-        Literal::Boolean(Some(true)),
-    )));
+fn expression_payloads_are_length_prefixed_canonical_datafusion_protobuf() {
+    let expressions = [
+        col("value").eq(lit(7_u64)),
+        !lit(false),
+        col("value").is_null(),
+        col("value").is_not_null(),
+        lit(1_i64).lt(lit(2_i64)),
+        lit(1_i64) + lit(2_i64),
+        cast(lit(1_i64), DataType::Utf8),
+        try_cast(lit("1"), DataType::Int64),
+    ];
 
-    let mut unknown_node = simple.clone();
-    unknown_node[payload_offset + 4] = u8::MAX;
-    assert!(matches!(
-        decode_definition(&unknown_node),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
+    for expression in expressions {
+        let protobuf = expression.to_bytes().unwrap();
+        let encoded = encode_definition(&filter(expression));
+        assert_eq!(
+            &encoded[DEFINITION_HEADER_LEN..DEFINITION_HEADER_LEN + size_of::<u32>()],
+            &u32::try_from(protobuf.len()).unwrap().to_be_bytes(),
+        );
+        assert_eq!(
+            length_prefixed_bytes(&encoded, DEFINITION_HEADER_LEN),
+            protobuf.as_ref()
+        );
 
-    let mut missing_unary_operand = simple.clone();
-    missing_unary_operand[payload_offset + 4] = 5;
-    assert!(matches!(
-        decode_definition(&missing_unary_operand),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
+        let decoded = decode_definition(&encoded).unwrap();
+        assert_eq!(encode_definition(decoded.as_ref()), encoded);
+    }
 
-    let mut unknown_unary = missing_unary_operand.clone();
-    unknown_unary[payload_offset + 5] = u8::MAX;
-    assert!(matches!(
-        decode_definition(&unknown_unary),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut non_canonical_presence = simple.clone();
-    non_canonical_presence[payload_offset + 5] = 2;
-    assert!(matches!(
-        decode_definition(&non_canonical_presence),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut non_canonical_boolean = simple;
-    non_canonical_boolean[payload_offset + 6] = 2;
-    assert!(matches!(
-        decode_definition(&non_canonical_boolean),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let utf8 = FilterDefinition::new(Expression::literal(Literal::Utf8(Some("x".to_owned()))));
-    let mut invalid_utf8 = encode_definition(&utf8);
-    invalid_utf8[payload_offset + 10] = u8::MAX;
-    assert!(matches!(
-        decode_definition(&invalid_utf8),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut oversized_utf8 = encode_definition(&utf8);
-    oversized_utf8[payload_offset + 6..payload_offset + 10]
-        .copy_from_slice(&((i32::MAX as u32) + 1).to_be_bytes());
-    assert!(matches!(
-        decode_definition(&oversized_utf8),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let equality = FilterDefinition::new(binary(
-        BinaryOperator::Equal,
-        Expression::literal(Literal::Boolean(Some(true))),
-        Expression::literal(Literal::Boolean(Some(false))),
-    ));
-    let mut unknown_binary = encode_definition(&equality);
-    *unknown_binary.last_mut().unwrap() = u8::MAX;
-    assert!(matches!(
-        decode_definition(&unknown_binary),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut extra_stack_value = encode_definition(&equality);
-    let last_node_tag = extra_stack_value.len() - 2;
-    extra_stack_value[last_node_tag] = 1;
-    extra_stack_value[last_node_tag + 1] = 0;
-    assert!(matches!(
-        decode_definition(&extra_stack_value),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut zero_count = encode_definition(&FilterDefinition::new(Expression::literal(
-        Literal::Boolean(Some(true)),
-    )));
-    zero_count[payload_offset..payload_offset + 4].copy_from_slice(&0_u32.to_be_bytes());
-    assert!(matches!(
-        decode_definition(&zero_count),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
-
-    let mut forged_count = encode_definition(&FilterDefinition::new(Expression::literal(
-        Literal::Boolean(Some(true)),
-    )));
-    forged_count[payload_offset..payload_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    let expression = col("value").eq(lit(7_u64));
+    let protobuf = expression.to_bytes().unwrap();
+    let encoded = encode_definition(&extend("is_seven", expression));
+    let name_length = usize::try_from(u32::from_be_bytes(
+        encoded[DEFINITION_HEADER_LEN..DEFINITION_HEADER_LEN + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let expression_length_offset = DEFINITION_HEADER_LEN + size_of::<u32>() + name_length;
     assert_eq!(
-        decode_definition(&forged_count).unwrap_err(),
+        &encoded[DEFINITION_HEADER_LEN + size_of::<u32>()..expression_length_offset],
+        b"is_seven"
+    );
+    assert_eq!(
+        length_prefixed_bytes(&encoded, expression_length_offset),
+        protobuf.as_ref()
+    );
+}
+
+#[test]
+fn expression_decoder_rejects_bad_lengths_malformed_and_noncanonical_protobuf() {
+    let canonical = encode_definition(&filter(lit(true)));
+    let protobuf = length_prefixed_bytes(&canonical, DEFINITION_HEADER_LEN).to_vec();
+    let wrap = |protobuf: &[u8]| {
+        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        encoded.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(protobuf);
+        encoded
+    };
+
+    let empty = wrap(&[]);
+    assert!(matches!(
+        decode_definition(&empty),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+
+    let malformed = wrap(&[u8::MAX]);
+    assert!(matches!(
+        decode_definition(&malformed),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+
+    let mut forged_length = canonical.clone();
+    forged_length[DEFINITION_HEADER_LEN..DEFINITION_HEADER_LEN + size_of::<u32>()]
+        .copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode_definition(&forged_length).unwrap_err(),
         DefinitionCodecError::Truncated
     );
 
-    let mut invalid_name = encode_definition(&ExtendDefinition::new(
-        "x",
-        Expression::literal(Literal::UInt64(Some(1))),
+    let mut trailing = canonical.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_definition(&trailing).unwrap_err(),
+        DefinitionCodecError::TrailingBytes
+    );
+
+    let mut protobuf_with_unknown_field = protobuf;
+    // Unknown protobuf field 127 with a canonical zero varint value.
+    protobuf_with_unknown_field.extend_from_slice(&[0xf8, 0x07, 0x00]);
+    let noncanonical = wrap(&protobuf_with_unknown_field);
+    assert!(matches!(
+        decode_definition(&noncanonical),
+        Err(DefinitionCodecError::InvalidPayload(_))
     ));
-    invalid_name[payload_offset + 4] = u8::MAX;
+
+    let mut invalid_name = encode_definition(&extend("x", lit(1_u64)));
+    invalid_name[DEFINITION_HEADER_LEN + size_of::<u32>()] = u8::MAX;
     assert!(matches!(
         decode_definition(&invalid_name),
         Err(DefinitionCodecError::InvalidPayload(_))
@@ -521,9 +450,7 @@ fn definition_decoder_never_panics_for_deterministic_arbitrary_bytes() {
 #[test]
 fn expression_decoder_never_panics_for_valid_header_arbitrary_payloads() {
     let payload_offset = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
-    let mut header = encode_definition(&FilterDefinition::new(Expression::literal(
-        Literal::Boolean(Some(true)),
-    )));
+    let mut header = encode_definition(&filter(lit(true)));
     header.truncate(payload_offset);
     let mut state = 0xbb67_ae85_84ca_a73b_u64;
     for length in 0..=256 {
