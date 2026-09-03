@@ -21,6 +21,7 @@ arrow-buffer = "=59.2.0"
 arrow-ipc = "=59.2.0"
 arrow-schema = "=59.2.0"
 arrow-select = "=59.2.0"
+blake3 = "=1.8.7"
 datafusion-common = { version = "=55.0.0", default-features = false }
 datafusion-expr = { version = "=55.0.0", default-features = false }
 datafusion-physical-expr = { version = "=55.0.0", default-features = false }
@@ -31,6 +32,7 @@ dogpaddle-operation = { path = "crates/operation" }
 dogpaddle-store = { path = "crates/store" }
 flatbuffers = { version = "=25.12.19", default-features = false }
 libmdbx = { version = "=0.6.6", default-features = false }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 thiserror = "=2.0.20"

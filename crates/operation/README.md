@@ -43,7 +43,8 @@ materialize closure；它不写 Store，也不进入持久化格式或运行态�
 Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Select 从同一个原始输入计算有序的完整输出列；
 `SchemaAlign` 从同一个原始输入计算有序字段，并显式声明名称、目标 nullability、Field metadata
 和 Schema metadata；`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意
-合法的单一输入且没有 output。无需额外的
+合法的单一输入且没有 output；`SqliteSink` 还把合法输入编译为确定的 `STRICT`
+表布局、绑定 SQL 和无损行编码。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
 Filter、Extend、Select 与 `SchemaAlign` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
@@ -152,7 +153,7 @@ output Change；filter 或 Sink 可以使用 `None`。
 具体算子错误类型；具体错误可以透明包装 `DataFusion` expression、Store、Arrow 或 Change source，调用方可以
 downcast 顶层算子错误并沿标准 error source chain 检查基础原因。
 由于 `Idle`、错误、Station output 容量拒绝或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
-Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂等提交协议，当前尚未定义。
+Store transaction 回滚的可观察副作用，除非像 `SqliteSink` 一样实现了专用的持久幂等提交协议。
 
 | action | 本 turn 写入与 output | 当前输入 |
 | --- | --- | --- |
@@ -165,7 +166,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 ## 内建算子能力与 conformance
 
-下表是当前九个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+下表是当前十个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
 Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
@@ -181,18 +182,21 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `UnionAll` (`8`) | Transform / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序；`Complete` | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
 | `SchemaAlign` (`9`) | Transform / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数；`Complete` | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
 | Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime/rollback/reopen；`operation_core` Definition codec、Flow sink workload |
+| `SqliteSink` (`10`) | Sink / 1 | 接受任意合法 Schema，另校验 `SQLite` 列名与列数；无 output | 按行序展开 diff multiplicity，每批至多 1024 个 mutation；中间 `Commit`，最终 `Complete(None)` | `sqlite_sink.next_id: Cell<u64>`、`sqlite_sink.pending: Cell<Vec<u8>>` | 不产生 output；按行生成 canonical/hash 和 `SQLite` 绑定值 | tag/payload、pending/canonical/hash golden，全部 v1 类型、批界、multiplicity/ID 预检、冲突/锁错误及 `SQLite` commit 后 MDBX rollback/reopen 重放；无独立 benchmark |
 
-所有九个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
+所有十个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
 `tests/correctness/{codec,definition,runtime}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
 无建库副作用、资源名、build/open/reopen、运行期 Schema guard 和事务重放由
-`dogpaddle-flow/tests/correctness` 所有。`operation_core` 的 Definition codec 覆盖全部九个算子；直接
+`dogpaddle-flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`
+外的九个算子；直接
 turn body/durable commit 只测 `SequenceSource` 与 `RunningEventCount`。`flow_runtime` 测
 source/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
 不因此获得虚构的微基准。
 
-稳定字节入口位于 `tests/fixtures/v1/`：每个 tag 一个 Definition fixture，其中事件计数与对齐分别为
-`running_event_count_definition.hex`、`schema_align_explicit.hex`；前者冻结当前 tag `2`。九个 decoded
-golden 都会重新 bind；Filter、Extend、Select、UnionAll 与 `SchemaAlign` 的 golden 还会
+稳定字节入口位于 `tests/fixtures/v1/`：每个 tag 一个 Definition fixture，其中事件计数、对齐与 `SQLite` Sink 分别为
+`running_event_count_definition.hex`、`schema_align_explicit.hex` 与 `sqlite_sink_output_events.hex`；它们分别冻结
+tag `2`、`9` 与 `10`。十个 decoded golden 都会重新 bind；Filter、Extend、Select、UnionAll 与
+`SchemaAlign` 的 golden 还会
 materialize/turn，其余算子的执行证据由 definition/runtime 分区独立覆盖。Flow manifest 的端到端基线为
 `dogpaddle-flow/tests/fixtures/v1/sequence_source_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
@@ -201,7 +205,7 @@ materialize/turn，其余算子的执行证据由 definition/runtime 分区独�
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
 的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 RunningEventCount、Project、Filter、
 Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
-Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
+Discard 与 `SqliteSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
 ## Definition 与持久化
@@ -385,9 +389,44 @@ exact common Schema；每个 turn 在转发前校验 runtime input，并以包�
 不声明 Operation data，也没有 output。物化后的 [`operation::sink::DiscardOperation`] 是零状态
 unit struct；它接受端口零上的完整 Change，并返回 `Action::Complete(None)`。输入完成仍由 Station 在同一事务中
 持久化 cursor；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
-Sink 的幂等提交协议仍需单独设计。
+Sink 仍需各自设计与目标系统匹配的幂等提交协议。
 
 Schema bind 接受任意合法的精确单一输入，并返回无 output 的 binding。
+
+## `operation::sink::SqliteSink`
+
+[`operation::sink::SqliteSinkDefinition`] 用 fallible `try_new` 接收绝对 UTF-8 `SQLite` 文件路径和目标
+表名。它拒绝相对路径、内存库、NUL、空表名与 `SQLite` 保留的 `sqlite_` 前缀；稳定 tag 为 `10`，
+payload 依次保存两个 `u32` big-endian 长度及对应 UTF-8 bytes。Definition 声明
+`sqlite_sink.next_id: Cell<u64>` 与 `sqlite_sink.pending: Cell<Vec<u8>>` 两项 Store 状态。bind 只针对
+精确 input Schema 编译表布局、SQL 和行编码器，不打开 `SQLite` 文件，也不创建表；连接延迟到物化
+Operation 的首个 turn。
+
+Schema 最多包含 1998 个顶层逻辑字段，允许零字段与空字段名；顶层名称不得包含 NUL，不得在 `SQLite`
+的 ASCII 大小写不敏感规则下重名或与 `$dogpaddle.id`、`$dogpaddle.hash` 冲突。目标表由 Sink 创建，
+包含递增且永不复用的 `INTEGER PRIMARY KEY` technical ID、16-byte BLAKE3 行 hash，以及全部逻辑列。
+表和 hash index 都使用确定的双引号转义标识符，所有数据值使用绑定参数。SQLite 映射无损保留当前
+`DogPaddle` v1 全部类型的原始语义：Boolean、有符号整数、`UInt8/16/32` 与 Date32 使用带范围
+约束的 `INTEGER`；Timestamp 使用 `INTEGER`；`UInt64`、`Float32/64` 与 Decimal128 分别使用
+big-endian 整数 bytes、IEEE 原始位与 128-bit two's-complement BLOB；Utf8 使用
+`TEXT COLLATE BINARY`；Binary、List、Struct 使用 BLOB；Null 字段始终写 NULL。非 nullable
+字段除 Null 外都有 `NOT NULL`。Timestamp 的 unit/timezone 与 Decimal128 的 precision/scale 属于
+已绑定 Schema，行值保留其底层原始值。
+
+[`operation::sink::SqliteSinkOperation`] 以 canonical 递归行编码计算
+`BLAKE3("dogpaddle.sqlite-row.v1\\0" || row)[..16]`。删除先按 hash 与 ID 升序读取候选，再在 Rust 中逐字段
+精确比较，所以 hash 碰撞不影响正确性，重复行固定删除最小 ID。每个持久批次最多包含 1024 个具体
+insert/delete，可跨越多个 Change 行；批内 overlay 保留事件顺序，因而同批先插入再删除与稳定重批
+具有相同结果。开始负 diff 前会验证完整剩余 multiplicity 可删除，开始正 diff 前会验证完整 ID 区间，
+包括 `i64::MIN` 和 ID 耗尽边界，不会先写出部分非法事件。
+
+初始化与每个 Apply 都使用版本化 `pending` 状态跨越 MDBX turn；Apply 在 `BEGIN IMMEDIATE` `SQLite`
+事务中严格按列表顺序执行，并在 `SQLite` commit 前把下一 continuation 写入尚未提交的 MDBX transaction。
+若 `SQLite` 已提交而外层 MDBX commit 丢失，重放会用同一组 technical ID 验证或补齐结果，因此最终
+效果恰好一次。Sink 不创建 `SQLite` 元数据表，也不保存整行 canonical bytes；首次初始化只接受不存在
+的目标表，初始化重放只接受完全相同且为空的布局，ready 状态发现表缺失或布局变化会报错。数据库
+文件本身可以预先存在。连接使用 5 秒 busy timeout 与 `synchronous=FULL`，不修改 journal/WAL 模式。
+该协议假定目标表只有此 Sink 写入，不支持外部修改 schema/数据、替换文件或恢复旧备份。
 
 ```rust,no_run
 use dogpaddle_operation::operation::{
@@ -477,7 +516,7 @@ happy-path 单测都不能替代这些答案。
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖九个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+Schema 测试覆盖十个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
 SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续
@@ -491,12 +530,16 @@ Null/bitmap/fixed/variable/List/Struct 全部既有 layout family 的部分选�
 Date32、无 timezone 的 Millisecond Timestamp 与 `Decimal128(10, 2)` 另有三个公共纵向测试：结构
 direct-copy、`SchemaAlign` 精确 cast/nullability 和 Filter 组合比较都先执行
 `encode → decode → re-encode → bind → materialize → turn`，再断言 buffer、diff 与行序；这不扩大为
-其他 temporal/decimal 运算承诺。完整目录所有权、
+其他 temporal/decimal 运算承诺。SQLite Sink 另外覆盖 Definition/pending/hash golden、全部当前 v1
+类型（含 Date32、全部 Timestamp 单位/timezone 与 Decimal128）及嵌套值、列边界与标识符、1024 批边界、
+multiplicity/ID 预检、`SQLite` 锁与 ID/完整性冲突，以及 `SQLite` 已提交但 MDBX
+transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。完整目录所有权、
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
-`operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 覆盖全部九个内建
-算子；活动事务内的一行 `turn` body，以及包含 begin、turn 和 durable commit 的完整事务，只直接测
+`operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 当前覆盖除
+`SqliteSink` 外的九个内建算子；活动事务内的一行 `turn` body，以及包含 begin、turn 和 durable commit
+的完整事务，只直接测
 `SequenceSource` 与 `RunningEventCount`。固定大小 Cell 的长稳
 归 Store 所有，因此当前不设置 Operation endurance。
 benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹，在 run plan 中声明

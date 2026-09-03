@@ -104,6 +104,12 @@ Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Selec
 已承诺/当前版本可规划但未承诺/明确拒绝的表达式矩阵以
 [`dogpaddle-operation`](../operation/README.md#表达式能力状态) 为准。
 
+`SqliteSink` 为 Flow 提供首个可查询终点。build/open 只完成 Schema、SQL 与行编码绑定，不打开
+`SQLite` 文件；首次收到输入后才初始化新的 `STRICT` 目标表。Sink 用自身 MDBX continuation 幂等
+覆盖 `SQLite` commit 与 Flow commit 之间的窗口。可直接运行
+[`sqlite_sink_live`](examples/sqlite_sink_live.rs)，端到端恢复证据位于
+[`tests/correctness/sqlite_sink.rs`](tests/correctness/sqlite_sink.rs)。
+
 ## 持久化边界
 
 每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成声明并稳定编码，再立即解码这份 canonical
@@ -276,7 +282,8 @@ retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。F
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 `RunningEventCount`
+intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或通用连接器协议；
+`SqliteSink` 只覆盖其独占本地目标表的专用幂等提交边界。内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 `DataFusion` 集成目前止于 Filter/Extend/Select/`SchemaAlign` 的 `Expr` protobuf、physical expression planning 与向量化执行，

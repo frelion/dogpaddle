@@ -20,6 +20,7 @@ thiserror.workspace = true
 [dev-dependencies]
 arrow-array.workspace = true
 dogpaddle-bench-protocol.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [[test]]

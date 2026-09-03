@@ -14,12 +14,14 @@ bench = false
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+blake3.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-proto.workspace = true
 dogpaddle-change.workspace = true
 dogpaddle-store.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

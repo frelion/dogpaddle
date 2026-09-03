@@ -12,8 +12,7 @@ use crate::{
     lit,
     operation::{
         Operation,
-        sink::DiscardDefinition,
-        sink::DiscardOperation,
+        sink::{DiscardDefinition, DiscardOperation, SqliteSinkDefinition},
         source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
@@ -80,7 +79,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 9] {
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 10] {
     [
         Box::new(SequenceSourceDefinition::new(0)),
         Box::new(RunningEventCountDefinition::new()),
@@ -99,6 +98,7 @@ fn builtin_definitions() -> [Box<dyn OperationDefinition>; 9] {
         ),
         Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         Box::new(DiscardDefinition::new()),
+        Box::new(SqliteSinkDefinition::try_new("/tmp/dogpaddle.sqlite", "events").unwrap()),
     ]
 }
 

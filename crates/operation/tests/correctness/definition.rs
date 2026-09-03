@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use arrow_array::UInt64Array;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_expr::{Volatility, create_udf, placeholder};
 use dogpaddle_change::{ProjectionError, SchemaError};
@@ -14,7 +15,10 @@ use dogpaddle_operation::{
     col, lit,
     operation::{
         Action, Operation, OperationInput,
-        sink::DiscardDefinition,
+        sink::{
+            DiscardDefinition, SqliteSinkDefinition, SqliteSinkDefinitionError,
+            SqliteSinkSchemaError,
+        },
         source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, ExtendSchemaError, FilterDefinition, FilterSchemaError,
@@ -210,6 +214,25 @@ fn definitions_expose_their_stable_public_contracts() {
 }
 
 #[test]
+fn sqlite_sink_definition_exposes_its_stable_public_contract() {
+    let sqlite =
+        SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events").unwrap();
+    assert_eq!(
+        sqlite.kind(),
+        OperationKind::Sink(std::num::NonZeroU32::MIN)
+    );
+    assert_eq!(
+        names(&sqlite),
+        ["sqlite_sink.next_id", "sqlite_sink.pending"]
+    );
+    assert_eq!(
+        sqlite.database_path(),
+        Path::new("/var/lib/dogpaddle/output.sqlite")
+    );
+    assert_eq!(sqlite.table_name(), "events");
+}
+
+#[test]
 fn definitions_bind_their_complete_logical_schema_contracts() {
     let source = SequenceSourceDefinition::new(42);
     let source_binding = bind(&source, &[]).unwrap();
@@ -336,6 +359,184 @@ fn binding_rejects_wrong_arity_and_invalid_logical_input_schemas() {
                     current: actual_current,
                 }
             )) if (*actual_previous, *actual_current) == (previous, current)
+        ));
+    }
+}
+
+#[test]
+fn sqlite_sink_definition_rejects_non_persistent_paths_and_invalid_table_names() {
+    for (path, expected) in [
+        (
+            PathBuf::from(":memory:"),
+            SqliteSinkDefinitionError::InMemoryDatabase,
+        ),
+        (
+            PathBuf::from("relative.sqlite"),
+            SqliteSinkDefinitionError::DatabasePathNotAbsolute,
+        ),
+        (
+            PathBuf::from("/tmp/invalid\0.sqlite"),
+            SqliteSinkDefinitionError::DatabasePathContainsNul,
+        ),
+    ] {
+        assert_eq!(
+            SqliteSinkDefinition::try_new(path, "events").unwrap_err(),
+            expected
+        );
+    }
+
+    for (table, expected) in [
+        ("", SqliteSinkDefinitionError::EmptyTableName),
+        (
+            "invalid\0table",
+            SqliteSinkDefinitionError::TableNameContainsNul,
+        ),
+        (
+            "sqlite_events",
+            SqliteSinkDefinitionError::ReservedTableName,
+        ),
+        (
+            "SQLITE_EVENTS",
+            SqliteSinkDefinitionError::ReservedTableName,
+        ),
+    ] {
+        assert_eq!(
+            SqliteSinkDefinition::try_new("/tmp/output.sqlite", table).unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_sink_definition_rejects_a_non_utf8_database_path() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let path = PathBuf::from(OsString::from_vec(b"/tmp/invalid-\xff.sqlite".to_vec()));
+    assert_eq!(
+        SqliteSinkDefinition::try_new(path, "events").unwrap_err(),
+        SqliteSinkDefinitionError::DatabasePathNotUtf8
+    );
+}
+
+#[test]
+fn sqlite_sink_binding_accepts_zero_and_1998_logical_columns() {
+    let definition = SqliteSinkDefinition::try_new("/tmp/output.sqlite", "events").unwrap();
+    let empty = Arc::new(Schema::empty());
+    assert!(
+        bind(&definition, std::slice::from_ref(&empty))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let empty_name = Arc::new(Schema::new(vec![Field::new("", DataType::Utf8, true)]));
+    assert!(
+        bind(&definition, std::slice::from_ref(&empty_name))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let maximum = Arc::new(Schema::new(
+        (0..1_998)
+            .map(|index| Field::new(format!("field_{index}"), DataType::Null, true))
+            .collect::<Vec<_>>(),
+    ));
+    assert!(
+        bind(&definition, std::slice::from_ref(&maximum))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let temporal_and_decimal = Arc::new(Schema::new(vec![
+        Field::new("date", DataType::Date32, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
+            true,
+        ),
+        Field::new("amount", DataType::Decimal128(38, -4), false),
+    ]));
+    assert!(
+        bind(&definition, std::slice::from_ref(&temporal_and_decimal))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
+    let definition = SqliteSinkDefinition::try_new("/tmp/output.sqlite", "events").unwrap();
+
+    let too_many = Arc::new(Schema::new(
+        (0..1_999)
+            .map(|index| Field::new(format!("field_{index}"), DataType::Null, true))
+            .collect::<Vec<_>>(),
+    ));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&too_many))
+    else {
+        panic!("a SQLite sink with 1999 logical columns unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::TooManyColumns {
+            actual: 1_999,
+            maximum: 1_998,
+        })
+    ));
+
+    let nul = Arc::new(Schema::new(vec![Field::new(
+        "invalid\0name",
+        DataType::Utf8,
+        true,
+    )]));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&nul))
+    else {
+        panic!("a SQLite sink field containing NUL unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::FieldNameContainsNul { field: 0 })
+    ));
+
+    let duplicate = Arc::new(Schema::new(vec![
+        Field::new("Name", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&duplicate))
+    else {
+        panic!("ASCII case-insensitive SQLite field collision unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::CaseInsensitiveFieldCollision {
+            first: 0,
+            second: 1,
+        })
+    ));
+
+    for (name, expected_name) in [
+        ("$DOGPADDLE.ID", "$DOGPADDLE.ID"),
+        ("$DOGPADDLE.HASH", "$DOGPADDLE.HASH"),
+    ] {
+        let collision = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
+        let Err(OperationBindError::Rejected { source }) =
+            bind(&definition, std::slice::from_ref(&collision))
+        else {
+            panic!("SQLite technical field collision unexpectedly bound");
+        };
+        assert!(matches!(
+            source.downcast_ref::<SqliteSinkSchemaError>(),
+            Some(SqliteSinkSchemaError::TechnicalColumnCollision {
+                field: 0,
+                name,
+            }) if name == expected_name
         ));
     }
 }
@@ -801,4 +1002,34 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     };
     transaction.commit().unwrap();
     drop((source, count, project, discard));
+}
+
+#[test]
+fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() {
+    let fixture = TestStore::new();
+    let sqlite_path = fixture.path().with_extension("sqlite");
+    let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
+
+    let mut store = Store::create(fixture.path()).unwrap();
+    for (declaration, physical_name) in definition
+        .data()
+        .iter()
+        .zip(["sqlite-next-id", "sqlite-pending"])
+    {
+        declaration.create(&mut store, physical_name).unwrap();
+    }
+    assert!(!sqlite_path.exists());
+    drop(store);
+
+    let store = Store::open(fixture.path()).unwrap();
+    store.open_data::<Cell<u64>>("sqlite-next-id").unwrap();
+    store.open_data::<Cell<Vec<u8>>>("sqlite-pending").unwrap();
+    let operation = materialize(
+        &definition,
+        &[value_schema()],
+        &store,
+        &["sqlite-next-id", "sqlite-pending"],
+    );
+    assert!(!sqlite_path.exists());
+    drop(operation);
 }

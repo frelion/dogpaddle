@@ -10,7 +10,7 @@ use dogpaddle_operation::{
     ExpressionBindError, OperationBindError, OperationDefinition, ScalarValue, cast, col,
     encode_definition, lit,
     operation::{
-        sink::DiscardDefinition,
+        sink::{DiscardDefinition, SqliteSinkDefinition, SqliteSinkSchemaError},
         source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, FilterDefinition, FilterSchemaError, ProjectDefinition,
@@ -155,6 +155,29 @@ fn build_reports_schema_align_narrowing_without_creating_a_store() {
 }
 
 #[test]
+fn build_reports_sqlite_identifier_collisions_without_creating_either_database() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("sink.sqlite");
+    let select =
+        SelectDefinition::try_new([("Name", col("value")), ("name", col("value"))]).unwrap();
+
+    let Err(FlowError::Schema(error)) = build_select_sqlite_flow(&flow_path, &sqlite_path, select)
+    else {
+        panic!("SQLite-incompatible output Schema unexpectedly built");
+    };
+    assert_sqlite_identifier_collision(&error);
+    assert!(
+        !flow_path.exists(),
+        "Schema rejection created the Store path"
+    );
+    assert!(
+        !sqlite_path.exists(),
+        "Schema rejection created the SQLite database"
+    );
+}
+
+#[test]
 fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
@@ -294,6 +317,40 @@ fn open_rebinds_decoded_select_and_union_definitions() {
     };
     assert_union_schema_mismatch(&error, 1);
     assert_eq!(read_published_definition(&union_path), definition);
+}
+
+#[test]
+fn open_rebinds_the_decoded_sqlite_sink_input_before_opening_its_database() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("sink.sqlite");
+    let valid_select =
+        SelectDefinition::try_new([("Name", col("value")), ("Nome", col("value"))]).unwrap();
+    let invalid_select =
+        SelectDefinition::try_new([("Name", col("value")), ("name", col("value"))]).unwrap();
+    let valid_operation = encode_definition(&valid_select);
+    let invalid_operation = encode_definition(&invalid_select);
+    assert_eq!(valid_operation.len(), invalid_operation.len());
+    drop(build_select_sqlite_flow(&flow_path, &sqlite_path, valid_select).unwrap());
+
+    let mut definition = read_published_definition(&flow_path);
+    let offset = definition
+        .windows(valid_operation.len())
+        .position(|candidate| candidate == valid_operation)
+        .expect("published Flow contains the valid Select definition");
+    definition[offset..offset + valid_operation.len()].copy_from_slice(&invalid_operation);
+    rewrite_checksum(&mut definition);
+    replace_published_definition(&flow_path, &definition);
+
+    let Err(FlowError::Schema(error)) = FlowFactory::open(&flow_path) else {
+        panic!("open did not rebind the SQLite-incompatible output Schema");
+    };
+    assert_sqlite_identifier_collision(&error);
+    assert_eq!(read_published_definition(&flow_path), definition);
+    assert!(
+        !sqlite_path.exists(),
+        "failed open eagerly created the SQLite database"
+    );
 }
 
 #[test]
@@ -645,6 +702,39 @@ fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
         Some(UnionAllSchemaError::InputSchemaMismatch { input: actual, .. })
             if *actual == input
     ));
+}
+
+fn assert_sqlite_identifier_collision(error: &FlowSchemaError) {
+    assert_eq!(error.station_id(), "sqlite");
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("SQLite identifier collision returned the wrong binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::CaseInsensitiveFieldCollision {
+            first: 0,
+            second: 1,
+        })
+    ));
+}
+
+fn build_select_sqlite_flow(
+    flow_path: &std::path::Path,
+    sqlite_path: &std::path::Path,
+    select: SelectDefinition,
+) -> Result<dogpaddle_flow::Flow, FlowError> {
+    let mut factory = FlowFactory::new(flow_path);
+    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let select = factory.station("select", select);
+    let sqlite = factory.station(
+        "sqlite",
+        SqliteSinkDefinition::try_new(sqlite_path, "events").unwrap(),
+    );
+    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(select, CAPACITY);
+    factory.connect([source], select);
+    factory.connect([select], sqlite);
+    factory.build()
 }
 
 fn replace_published_definition(path: &std::path::Path, definition: &[u8]) {

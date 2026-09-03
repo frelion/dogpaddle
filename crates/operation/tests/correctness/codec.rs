@@ -14,7 +14,7 @@ use dogpaddle_operation::{
     col, decode_definition, encode_definition, lit,
     operation::{
         Action, OperationInput,
-        sink::DiscardDefinition,
+        sink::{DiscardDefinition, SqliteSinkDefinition},
         source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
@@ -36,6 +36,7 @@ const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
 const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
+const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
 
@@ -173,6 +174,13 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
             decode_hex(UNION_ALL_V1),
             Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         ),
+        (
+            decode_hex(SQLITE_SINK_V1),
+            Box::new(
+                SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events")
+                    .unwrap(),
+            ),
+        ),
     ]
 }
 
@@ -208,6 +216,30 @@ fn every_builtin_definition_has_stable_v1_golden_bytes() {
         assert_eq!(decoded.kind(), definition.kind());
         assert_eq!(encode_definition(decoded.as_ref()), golden);
     }
+}
+
+#[test]
+fn sqlite_sink_payload_is_two_big_endian_length_prefixed_utf8_strings() {
+    let encoded = encode_definition(
+        &SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events").unwrap(),
+    );
+    let path = b"/var/lib/dogpaddle/output.sqlite";
+    let table = b"events";
+    let path_length_offset = DEFINITION_HEADER_LEN;
+    let path_offset = path_length_offset + size_of::<u32>();
+    let table_length_offset = path_offset + path.len();
+    let table_offset = table_length_offset + size_of::<u32>();
+
+    assert_eq!(
+        &encoded[path_length_offset..path_offset],
+        &u32::try_from(path.len()).unwrap().to_be_bytes()
+    );
+    assert_eq!(&encoded[path_offset..table_length_offset], path);
+    assert_eq!(
+        &encoded[table_length_offset..table_offset],
+        &u32::try_from(table.len()).unwrap().to_be_bytes()
+    );
+    assert_eq!(&encoded[table_offset..], table);
 }
 
 #[test]
@@ -305,6 +337,15 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
     let discard = decode_definition(&decode_hex(DISCARD_V1)).unwrap();
     assert!(
         discard
+            .bind(std::slice::from_ref(&arbitrary))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let sqlite = decode_definition(&decode_hex(SQLITE_SINK_V1)).unwrap();
+    assert!(
+        sqlite
             .bind(std::slice::from_ref(&arbitrary))
             .unwrap()
             .output_schema()
@@ -800,6 +841,87 @@ fn union_all_decoder_rejects_zero_input_count() {
         decode_definition(&zero),
         Err(DefinitionCodecError::InvalidPayload(_))
     ));
+}
+
+#[test]
+fn sqlite_sink_decoder_rejects_invalid_lengths_strings_and_paths() {
+    let canonical = decode_hex(SQLITE_SINK_V1);
+    let path_length_offset = DEFINITION_HEADER_LEN;
+    let path_length = usize::try_from(u32::from_be_bytes(
+        canonical[path_length_offset..path_length_offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let path_offset = path_length_offset + size_of::<u32>();
+    let table_length_offset = path_offset + path_length;
+    let table_offset = table_length_offset + size_of::<u32>();
+
+    let mut forged_path_length = canonical.clone();
+    forged_path_length[path_length_offset..path_offset].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode_definition(&forged_path_length).unwrap_err(),
+        DefinitionCodecError::Truncated
+    );
+
+    let mut forged_table_length = canonical.clone();
+    forged_table_length[table_length_offset..table_offset].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode_definition(&forged_table_length).unwrap_err(),
+        DefinitionCodecError::Truncated
+    );
+
+    for invalid_utf8_offset in [path_offset, table_offset] {
+        let mut invalid_utf8 = canonical.clone();
+        invalid_utf8[invalid_utf8_offset] = u8::MAX;
+        assert!(matches!(
+            decode_definition(&invalid_utf8),
+            Err(DefinitionCodecError::InvalidPayload(_))
+        ));
+    }
+
+    let wrap = |path: &[u8], table: &[u8]| {
+        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        encoded.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(path);
+        encoded.extend_from_slice(&u32::try_from(table.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(table);
+        encoded
+    };
+    for invalid in [
+        wrap(b"relative.sqlite", b"events"),
+        wrap(b":memory:", b"events"),
+        wrap(b"/tmp/invalid\0.sqlite", b"events"),
+        wrap(b"/tmp/output.sqlite", b""),
+        wrap(b"/tmp/output.sqlite", b"bad\0table"),
+        wrap(b"/tmp/output.sqlite", b"SQLITE_reserved"),
+    ] {
+        assert!(matches!(
+            decode_definition(&invalid),
+            Err(DefinitionCodecError::InvalidPayload(_))
+        ));
+    }
+}
+
+#[test]
+fn sqlite_sink_decoder_never_panics_for_valid_header_arbitrary_payloads() {
+    let mut header = decode_hex(SQLITE_SINK_V1);
+    header.truncate(DEFINITION_HEADER_LEN);
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    for length in 0..=256 {
+        let mut input = header.clone();
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            input.push(state.to_le_bytes()[0]);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&input)));
+        assert!(
+            result.is_ok(),
+            "SQLiteSink decoder panicked for payload length {length}"
+        );
+    }
 }
 
 #[test]

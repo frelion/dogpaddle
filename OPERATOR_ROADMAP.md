@@ -47,9 +47,10 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | Transform | Select | 有序多表达式完整输出 | 保留为基础无状态算子 |
 | Transform | SchemaAlign | 显式完整 Schema 重塑 | 已完成基础结构对齐；不做隐式 coercion |
 | Transform | UnionAll | exact Schema 多输入原样合并 | 保留为基础多输入算子 |
+| Sink | SqliteSink | 将差分流幂等物化到独占的 SQLite 表 | 已完成首个本地外部副作用 Sink |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前九个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
@@ -193,7 +194,7 @@ canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规
 | --- | --- | --- | --- |
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
-| 2 | 打通真实 Source/Sink | Ingress、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
+| 2（进行中） | 打通真实 Source/Sink | SqliteSink、Ingress、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
 | 3 | 建立关系状态原语 | relation state、arrangement、Consolidate、Distinct | 后续状态关系算子的共同基座 |
 | 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
@@ -204,7 +205,7 @@ canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规
 
 ## 阶段 0：固化现有算子契约
 
-**状态：本轮完成。** 当前九个内建算子的同结构能力表、公共证据索引和新增算子 checklist 位于
+**状态：本轮完成。** 阶段 0/1 的九个基础算子及后续内建算子的同结构能力表、公共证据索引和新增算子 checklist 位于
 [`crates/operation/README.md`](crates/operation/README.md)。
 
 ### 目标
@@ -370,6 +371,13 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 消除只能依靠 SequenceSource 和 Discard 验证 Flow 的限制，用真实 Arrow Change 打穿输入、变换、
 结果订阅和当前关系查询。
 
+### 已完成：SqliteSink
+
+`SqliteSink` 是首个本地外部副作用 Sink：它为精确 input Schema 创建并独占一个 SQLite `STRICT`
+表，以 MDBX 中的版本化具体 mutation 批次覆盖 SQLite commit 与 MDBX commit 之间的失败窗口。
+它不引入 SQLite 元数据表；在目标表未被外部修改、数据库文件未被替换或恢复的约束下，重放保持
+最终结果恰好一次。通用 ingress、结果订阅与关系 snapshot 仍属于本阶段后续工作。
+
 ### IngressSource
 
 新增引擎受控的通用输入算子。候选运行 API：
@@ -423,10 +431,11 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 - 明确权重大于一时 snapshot 如何表达重复；
 - 提供稳定、有界、可继续的只读 snapshot。
 
-### 外部副作用 Sink
+### 其他外部副作用 Sink
 
-不在本阶段直接执行网络或文件副作用。先定义 outbox/幂等提交边界，再在阶段 7 引入具体连接器。
-Operation `turn` 内不得执行无法随 Store transaction 回滚的可观察副作用。
+`SqliteSink` 已用持久化具体 mutation 批次定义了第一个专用幂等提交边界。后续网络、文件和远程
+数据库连接器仍须先选择 outbox、幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法
+由该协议重放或验证的可观察副作用。
 
 ### 退出标准
 
@@ -720,8 +729,8 @@ RebuildRequired
 5. 外部副作用 Sink。
 
 外部 Source 明确 external offset、ingestion identity 和 committed Change 的映射；外部 Sink 使用
-outbox、幂等 key 或明确的两阶段提交协议。不能把网络成功与 MDBX commit 之间的空隙留给具体 Sink
-自行解释。
+outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 已用持久化 mutation 批次覆盖本地 SQLite
+commit 与 MDBX commit 的空隙；其他连接器不能把对应空隙留给具体 Sink 自行解释。
 
 ### 可观测性
 
@@ -851,8 +860,8 @@ IngressSource
 → snapshot / reopen
 ```
 
-这是最优先的新能力。没有真实 Source 和可查询 Sink，复杂算子只能在测试 fixture 中自证，任何上层
-用户 API 也无法形成真正闭环。
+这是最优先的新能力。虽然 `SqliteSink` 已提供可查询终点，但没有真实 Source 和应用可消费的通用
+结果边界，复杂算子仍主要依靠测试 fixture 自证，上层用户 API 也无法形成完整闭环。
 
 ### 里程碑 C：关系状态到 Aggregate
 

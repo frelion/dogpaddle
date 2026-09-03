@@ -36,8 +36,8 @@
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 九个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp(ms)/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard、RunningEventCount 状态 commit/rollback/reopen | `operation_core` |
-| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp(ms)/Decimal128 完整结构/表达式链两次 reopen；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | 十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
+| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。
@@ -69,7 +69,7 @@ scalar/array evaluate。该格式不承诺跨 DataFusion 版本兼容；升级 D
 Arrow 时必须更新当前 golden，并重跑 proto roundtrip、build/open/reopen 和执行语义。旧数据库直接
 删除并重建；测试不约束旧 payload 或旧 manifest 的行为。
 
-阶段 0/1 的算子 conformance 使用同一证据形状，不按算子复制测试框架：codec 分区冻结九个 tag、
+内建算子的 conformance 使用同一证据形状，不按算子复制测试框架：codec 分区冻结十个 tag、
 canonical payload 与损坏拒绝，definition 分区覆盖 kind/arity/data 和 exact Schema 成功/拒绝，runtime
 分区覆盖 Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖纯失败无目录副作用、
 稳定资源名、build/open/reopen 和运行期 Schema guard。RunningEventCount 的公共 API 与 data 资源名
@@ -93,6 +93,14 @@ Decimal128 value 证据独立于表达式算术：`Change::try_new`、full decod
 decode 递归拒绝任意 non-null slot 的 `|unscaled| >= 10^precision`，包括被 null List/Struct 祖先
 遮蔽但物理存在的 non-null child；未选择字段的 value 不读取也不验证。测试同时覆盖顶层与嵌套、
 构造与 codec 错误，不把这条 representability invariant 扩展为舍入或算术语义。
+
+SQLite Sink 同时冻结 tag 10 Definition payload、版本化 pending bytes、canonical row 与 128-bit hash。
+其恢复矩阵必须模拟 SQLite commit 成功后丢弃同一 turn 的 MDBX transaction，再 reopen 并重放
+初始化、insert、delete 与完整 1024 项批次；目标表最终结果必须恰好一次，旧 pending 和 Flow claim
+只能在外层 commit 后前进。锁、ID/完整性冲突或 SQLite commit 失败必须保留旧状态，解除故障后可以继续。
+布局证据还覆盖零/1998/1999 列、标识符转义和冲突、全部 Arrow v1 类型、嵌套/nullable/浮点 bit pattern、
+hash 碰撞、重复行最小 ID、正负 multiplicity、`i64::MIN`、ID 耗尽与稳定重批。Flow build/open 不得
+打开 SQLite 或创建目标表；首次运行才允许初始化。
 
 Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理
 原子性。上层只重复自己的协议阶段、对象组合和 reopen 义务，不为每个 crate 复制 SIGKILL harness。
