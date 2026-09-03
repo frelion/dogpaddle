@@ -17,41 +17,42 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 2;
-const COUNT: DataName<Cell<u64>> = DataName::new("count");
+const COUNT: DataName<Cell<u64>> = DataName::new("running_event_count.count");
 const DATA: &[DataDeclaration] = &[COUNT.declaration()];
 
-/// Pure definition of a running count operation.
+/// Pure definition of a running event-count operation.
 ///
 /// The operation counts ordered input rows independently of their diff values
-/// and emits each updated count as an insertion event.
+/// and emits each updated count as an insertion event. It is an observation
+/// transform, not a relational cardinality aggregate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CountDefinition {
+pub struct RunningEventCountDefinition {
     _private: (),
 }
 
-/// Materialized running count operation.
+/// Materialized running event-count operation.
 ///
 /// This value stores only its persistent count. It never retains its definition
 /// or begins, commits, or stores a transaction.
-pub struct CountOperation {
+pub struct RunningEventCountOperation {
     count: Cell<u64>,
 }
 
-/// Count-specific failure during one [`CountOperation`] turn.
+/// Running-event-count failure during one [`RunningEventCountOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum CountError {
+pub enum RunningEventCountError {
     /// The input Operation was called without a Change.
-    #[error("count requires one input Change")]
+    #[error("running event count requires one input Change")]
     MissingInput,
-    /// Count only accepts its definition's first input port.
-    #[error("count does not accept input port {port}")]
+    /// `RunningEventCount` only accepts its definition's first input port.
+    #[error("running event count does not accept input port {port}")]
     InvalidInputPort {
         /// Rejected zero-based port index.
         port: usize,
     },
     /// The durable count plus the input row count cannot be represented by [`u64`].
-    #[error("count overflow")]
+    #[error("running event count overflow")]
     Overflow,
 }
 
@@ -59,15 +60,15 @@ pub enum CountError {
     clippy::new_without_default,
     reason = "definitions keep one explicit construction path"
 )]
-impl CountDefinition {
-    /// Creates a running count definition.
+impl RunningEventCountDefinition {
+    /// Creates a running event-count definition.
     #[must_use]
     pub const fn new() -> Self {
         Self { _private: () }
     }
 }
 
-impl SealedDefinition for CountDefinition {
+impl SealedDefinition for RunningEventCountDefinition {
     fn bind_schemas(
         &self,
         _input_schemas: &[SchemaRef],
@@ -76,13 +77,13 @@ impl SealedDefinition for CountDefinition {
             Some(output_schema()),
             |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
                 let count = data.take(&COUNT)?;
-                Ok(Box::new(CountOperation::new(count)))
+                Ok(Box::new(RunningEventCountOperation::new(count)))
             },
         ))
     }
 }
 
-impl OperationDefinition for CountDefinition {
+impl OperationDefinition for RunningEventCountDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Transform(NonZeroU32::MIN)
     }
@@ -98,29 +99,32 @@ impl OperationDefinition for CountDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-impl CountOperation {
-    /// Creates a Count operation from its durable count.
+impl RunningEventCountOperation {
+    /// Creates a running event-count operation from its durable count.
     #[must_use]
     pub const fn new(count: Cell<u64>) -> Self {
         Self { count }
     }
 }
 
-impl Operation for CountOperation {
+impl Operation for RunningEventCountOperation {
     fn turn(
         &self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
-        let input = input.ok_or(CountError::MissingInput)?;
+        let input = input.ok_or(RunningEventCountError::MissingInput)?;
         if input.port != 0 {
-            return Err(CountError::InvalidInputPort { port: input.port }.into());
+            return Err(RunningEventCountError::InvalidInputPort { port: input.port }.into());
         }
 
         let mut count = self.count.access(access)?;
         let current = count.get()?.unwrap_or_default();
-        let rows = u64::try_from(input.change.num_rows()).map_err(|_| CountError::Overflow)?;
-        let final_count = current.checked_add(rows).ok_or(CountError::Overflow)?;
+        let rows =
+            u64::try_from(input.change.num_rows()).map_err(|_| RunningEventCountError::Overflow)?;
+        let final_count = current
+            .checked_add(rows)
+            .ok_or(RunningEventCountError::Overflow)?;
         let first = current
             .checked_add(1)
             .expect("nonempty Change fitting the count has a first value");
@@ -154,7 +158,7 @@ pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     if payload.is_empty() {
-        Ok(Box::new(CountDefinition::new()))
+        Ok(Box::new(RunningEventCountDefinition::new()))
     } else {
         Err(DefinitionCodecError::TrailingBytes)
     }

@@ -16,8 +16,8 @@ use crate::{
         sink::DiscardOperation,
         source::SequenceSourceDefinition,
         transform::{
-            CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition,
-            SelectDefinition, UnionAllDefinition,
+            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -80,14 +80,23 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 8] {
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 9] {
     [
         Box::new(SequenceSourceDefinition::new(0)),
-        Box::new(CountDefinition::new()),
+        Box::new(RunningEventCountDefinition::new()),
         Box::new(ProjectDefinition::new([0])),
         Box::new(FilterDefinition::try_new(lit(true)).unwrap()),
         Box::new(ExtendDefinition::try_new("copy", col("value")).unwrap()),
         Box::new(SelectDefinition::try_new([("copy", col("value"))]).unwrap()),
+        Box::new(
+            SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
+                "copy",
+                col("value"),
+                false,
+            )
+            .unwrap()])
+            .unwrap(),
+        ),
         Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         Box::new(DiscardDefinition::new()),
     ]

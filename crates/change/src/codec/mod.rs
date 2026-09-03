@@ -58,9 +58,10 @@ pub fn decode_change(encoded: &[u8]) -> Result<Change, CodecError> {
 /// copied into owned Arrow memory and decoded. The returned value is an
 /// ordinary [`Change`], not a lazy view over `encoded`.
 ///
-/// Value-level invariants of unselected field bodies, such as UTF-8 contents or
-/// nested offsets, cannot be validated without reading those bodies. Use
-/// [`decode_change`] when every logical field must be fully validated.
+/// Value-level invariants of unselected field bodies, such as UTF-8 contents,
+/// nested offsets, or Decimal128 precision, cannot be validated without reading
+/// those bodies. Use [`decode_change`] when every logical field must be fully
+/// validated.
 ///
 /// # Errors
 ///

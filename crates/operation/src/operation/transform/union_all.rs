@@ -29,8 +29,12 @@ pub struct UnionAllDefinition {
 }
 
 /// Materialized stateless `UNION ALL` operation.
+///
+/// This value stores its input count and the exact common input Schema bound by
+/// its Definition. It owns no persistent Store data.
 pub struct UnionAllOperation {
     input_count: usize,
+    input_schema: SchemaRef,
 }
 
 /// `UnionAll`-specific failure while binding exact input Schemas.
@@ -63,6 +67,16 @@ pub enum UnionAllError {
         port: usize,
         /// Number of input ports accepted by this operation.
         input_count: usize,
+    },
+    /// Runtime input differs from the exact common Schema used during binding.
+    #[error("union-all input {port} Schema differs from its bound Schema")]
+    InputSchemaMismatch {
+        /// Zero-based port carrying the mismatched Change.
+        port: usize,
+        /// Exact common Schema required by the binding.
+        expected: SchemaRef,
+        /// Schema supplied by the runtime Change.
+        actual: SchemaRef,
     },
 }
 
@@ -100,10 +114,14 @@ impl SealedDefinition for UnionAllDefinition {
 
         let input_count = usize::try_from(self.input_count.get())
             .expect("a UnionAll u32 input count fits supported Arrow targets");
+        let input_schema = Arc::clone(output_schema);
         Ok(OperationBinding::new(
             Some(Arc::clone(output_schema)),
             move |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(UnionAllOperation { input_count }))
+                Ok(Box::new(UnionAllOperation {
+                    input_count,
+                    input_schema,
+                }))
             },
         ))
     }
@@ -138,6 +156,15 @@ impl Operation for UnionAllOperation {
             return Err(UnionAllError::InvalidInputPort {
                 port: input.port,
                 input_count: self.input_count,
+            }
+            .into());
+        }
+        let actual_schema = input.change.schema();
+        if actual_schema.as_ref() != self.input_schema.as_ref() {
+            return Err(UnionAllError::InputSchemaMismatch {
+                port: input.port,
+                expected: Arc::clone(&self.input_schema),
+                actual: actual_schema,
             }
             .into());
         }

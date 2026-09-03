@@ -10,7 +10,7 @@ use dogpaddle_operation::{
     OperationKind,
     operation::{
         Action, Operation, OperationError, OperationInput, sink::DiscardDefinition,
-        source::SequenceSourceDefinition, transform::CountDefinition,
+        source::SequenceSourceDefinition, transform::RunningEventCountDefinition,
     },
 };
 use dogpaddle_store::{
@@ -619,7 +619,7 @@ fn source_count_sink(source_capacity: NonZeroU64, count_capacity: NonZeroU64) ->
     let root = tempfile::tempdir().unwrap();
     let mut builder = FlowFactory::new(root.path().join("flow"));
     let source = builder.station("source", SequenceSourceDefinition::new(0));
-    let count = builder.station("count", CountDefinition::new());
+    let count = builder.station("count", RunningEventCountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.output_capacity_bytes(source, source_capacity);
     builder.output_capacity_bytes(count, count_capacity);

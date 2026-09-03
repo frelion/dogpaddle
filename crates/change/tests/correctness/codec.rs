@@ -1,22 +1,79 @@
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, StructArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray, RecordBatch,
+    RecordBatchOptions, StringArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array, types::Date32Type,
 };
 use arrow_buffer::NullBuffer;
-use arrow_ipc::reader::StreamReader;
+use arrow_ipc::{
+    MetadataVersion,
+    reader::StreamReader,
+    writer::{IpcWriteOptions, StreamWriter},
+};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{
-    Change, ChangeProjection, MAX_NESTING_DEPTH, decode_change, decode_change_projected,
-    encode_change,
+    Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, decode_change,
+    decode_change_projected, encode_change,
 };
 
 use super::support::{assert_change_eq, fixture_hex, hex, representative_change};
 
 const KIND_KEY: &str = "dogpaddle.kind";
 const VERSION_KEY: &str = "dogpaddle.change.version";
+
+fn temporal_decimal_change() -> Change {
+    let decimal = Decimal128Array::from(vec![
+        Some(-99_999_999_999_999_999_999_999_999_999_999_999_999_i128),
+        Some(0),
+        Some(99_999_999_999_999_999_999_999_999_999_999_999_999_i128),
+        None,
+    ])
+    .with_precision_and_scale(38, 6)
+    .unwrap();
+    let negative_scale = Decimal128Array::from(vec![Some(-9999), Some(-1), Some(9999), None])
+        .with_precision_and_scale(4, -2)
+        .unwrap();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Date32Array::from(vec![
+            Some(i32::MIN),
+            Some(-1),
+            Some(0),
+            None,
+        ])),
+        Arc::new(TimestampSecondArray::from(vec![
+            Some(i64::MIN),
+            Some(-1),
+            Some(0),
+            None,
+        ])),
+        Arc::new(
+            TimestampMillisecondArray::from(vec![Some(i64::MAX), Some(1), Some(0), None])
+                .with_timezone("+00:00"),
+        ),
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![Some(i64::MIN), Some(-1), Some(0), None])
+                .with_timezone("+08:00"),
+        ),
+        Arc::new(
+            TimestampNanosecondArray::from(vec![Some(i64::MAX), Some(1), Some(0), None])
+                .with_timezone("America/Los_Angeles"),
+        ),
+        Arc::new(decimal),
+        Arc::new(negative_scale),
+    ];
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            Field::new(format!("field-{index}"), column.data_type().clone(), true)
+        })
+        .collect::<Vec<_>>();
+    let records = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2])).unwrap()
+}
 
 #[test]
 fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
@@ -72,6 +129,92 @@ fn sliced_representative_change_stream_has_stable_golden_bytes() {
 
     let encoded = encode_change(&change).unwrap();
     assert_eq!(hex(&encoded), expected);
+}
+
+#[test]
+fn temporal_and_decimal_stream_has_stable_bytes_and_standard_arrow_interop() {
+    let change = temporal_decimal_change();
+    let encoded = encode_change(&change).unwrap();
+    let expected = fixture_hex(include_str!(
+        "../fixtures/v1/temporal_and_decimal_change.hex"
+    ));
+    assert_eq!(hex(&encoded), expected);
+    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+
+    for selection in [
+        vec![],
+        vec![0],
+        vec![1, 2, 3, 4],
+        vec![5, 6],
+        (0..7).collect(),
+    ] {
+        let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
+        assert_change_eq(
+            &decode_change_projected(&encoded, &projection).unwrap(),
+            &change.try_project(&projection).unwrap(),
+        );
+    }
+
+    let mut reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
+    let physical = reader.next().unwrap().unwrap();
+    for (index, expected) in change.records().columns().iter().enumerate() {
+        assert_eq!(physical.column(index + 1).to_data(), expected.to_data());
+    }
+    assert!(reader.next().is_none());
+}
+
+#[test]
+fn decimal128_value_overflow_is_rejected_by_full_and_selected_but_not_unselected_decode() {
+    let amount = Field::new("amount", DataType::Decimal128(2, -1), true);
+    let tail = Field::new("tail", DataType::UInt64, false);
+    let logical_schema = Arc::new(Schema::new(vec![amount.clone(), tail.clone()]));
+    let physical_schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("$dogpaddle.diff", DataType::Int64, false),
+            amount,
+            tail,
+        ],
+        HashMap::from([
+            (KIND_KEY.to_owned(), "change".to_owned()),
+            (VERSION_KEY.to_owned(), "1".to_owned()),
+        ]),
+    ));
+    let invalid_amount = Decimal128Array::from(vec![Some(99), Some(100), None])
+        .with_precision_and_scale(2, -1)
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&physical_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, -1, 2])),
+            Arc::new(invalid_amount),
+            Arc::new(UInt64Array::from(vec![7, 8, 9])),
+        ],
+    )
+    .unwrap();
+    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5).unwrap();
+    let mut writer =
+        StreamWriter::try_new_with_options(Vec::new(), &physical_schema, options).unwrap();
+    writer.write(&batch).unwrap();
+    let encoded = writer.into_inner().unwrap();
+
+    assert_decimal_value_error(&decode_change(&encoded));
+    let select_amount = ChangeProjection::try_new(Arc::clone(&logical_schema), [0]).unwrap();
+    assert_decimal_value_error(&decode_change_projected(&encoded, &select_amount));
+
+    let select_tail = ChangeProjection::try_new(logical_schema, [1]).unwrap();
+    let decoded = decode_change_projected(&encoded, &select_tail).unwrap();
+    assert_eq!(decoded.diffs().values(), &[1, -1, 2]);
+    assert_eq!(decoded.schema().field(0).name(), "tail");
+    assert_eq!(
+        decoded
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values(),
+        &[7, 8, 9]
+    );
 }
 
 #[test]
@@ -288,6 +431,47 @@ fn maximum_mixed_nesting_preserves_nested_metadata_in_full_and_projected_decodes
 }
 
 #[test]
+fn temporal_and_decimal_types_round_trip_inside_complete_nested_subtrees() {
+    let dates = ListArray::from_iter_primitive::<Date32Type, _, _>([
+        Some(vec![Some(-1), Some(0)]),
+        None,
+        Some(vec![Some(1)]),
+    ]);
+    let occurred_at =
+        TimestampNanosecondArray::from(vec![Some(-1), None, Some(1)]).with_timezone("UTC");
+    let amount = Decimal128Array::from(vec![Some(-12_345), None, Some(67_890)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let occurred_at_field = Arc::new(Field::new(
+        "occurred_at",
+        occurred_at.data_type().clone(),
+        true,
+    ));
+    let amount_field = Arc::new(Field::new("amount", amount.data_type().clone(), true));
+    let object = StructArray::from(vec![
+        (occurred_at_field, Arc::new(occurred_at) as ArrayRef),
+        (amount_field, Arc::new(amount) as ArrayRef),
+    ]);
+    let columns: Vec<ArrayRef> = vec![Arc::new(dates), Arc::new(object)];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("dates", columns[0].data_type().clone(), true),
+        Field::new("object", columns[1].data_type().clone(), true),
+    ]));
+    let records = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1, 1])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+
+    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+    for selection in [vec![0], vec![1]] {
+        let projection = ChangeProjection::try_new(Arc::clone(&schema), selection).unwrap();
+        assert_change_eq(
+            &decode_change_projected(&encoded, &projection).unwrap(),
+            &change.try_project(&projection).unwrap(),
+        );
+    }
+}
+
+#[test]
 fn zero_logical_columns_keep_their_non_zero_row_count() {
     let options = RecordBatchOptions::new().with_row_count(Some(2));
     let records =
@@ -348,4 +532,17 @@ fn nullable_struct_parent_masks_nulls_in_a_non_nullable_child() {
     let empty = decode_change_projected(&encoded, &empty).unwrap();
     assert_eq!(empty.num_rows(), 2);
     assert_eq!(empty.diffs().values(), &[1, 1]);
+}
+
+fn assert_decimal_value_error(result: &Result<Change, CodecError>) {
+    assert!(matches!(
+        result,
+        Err(CodecError::Change(ChangeError::InvalidDecimal128Value {
+            field,
+            index: 1,
+            value: 100,
+            precision: 2,
+            scale: -1,
+        })) if field == "amount"
+    ));
 }

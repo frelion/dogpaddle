@@ -26,8 +26,13 @@ impl<'a> DataTypeLayout<'a> {
             DataType::Boolean => Some(Self::Bitmap),
             DataType::Int8 | DataType::UInt8 => Some(Self::FixedWidth(1)),
             DataType::Int16 | DataType::UInt16 => Some(Self::FixedWidth(2)),
-            DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(Self::FixedWidth(4)),
-            DataType::Int64 | DataType::UInt64 | DataType::Float64 => Some(Self::FixedWidth(8)),
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => {
+                Some(Self::FixedWidth(4))
+            }
+            DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => {
+                Some(Self::FixedWidth(8))
+            }
+            DataType::Decimal128(_, _) => Some(Self::FixedWidth(16)),
             DataType::Utf8 | DataType::Binary => Some(Self::VariableWidth),
             DataType::List(child) => Some(Self::List(child)),
             DataType::Struct(fields) => Some(Self::Struct(fields)),
@@ -99,6 +104,25 @@ pub enum SchemaError {
         /// The unsupported Arrow type.
         data_type: DataType,
     },
+    /// A Decimal128 field has precision or scale outside the stable v1 range.
+    #[error(
+        "invalid Decimal128 precision {precision} and scale {scale} at field {field:?}; precision must be 1..=38 and a positive scale cannot exceed precision"
+    )]
+    InvalidDecimal128 {
+        /// Dot-separated diagnostic path to the field.
+        field: String,
+        /// Declared decimal precision.
+        precision: u8,
+        /// Declared decimal scale.
+        scale: i8,
+    },
+    /// A Timestamp uses an empty timezone string, which Arrow IPC cannot
+    /// distinguish from an absent timezone.
+    #[error("empty Timestamp timezone at field {field:?}; use no timezone for a naive timestamp")]
+    EmptyTimestampTimezone {
+        /// Dot-separated diagnostic path to the field.
+        field: String,
+    },
     /// Nested Lists or Structs exceed the stable depth limit.
     #[error("schema nesting exceeds the maximum depth of {max_depth}")]
     NestingTooDeep {
@@ -130,6 +154,22 @@ fn validate_field(field: &Field, path: &str, depth: usize) -> Result<(), SchemaE
         });
     }
     validate_metadata(field.metadata(), path)?;
+    if let DataType::Decimal128(precision, scale) = field.data_type()
+        && !valid_decimal128_parameters(*precision, *scale)
+    {
+        return Err(SchemaError::InvalidDecimal128 {
+            field: path.to_owned(),
+            precision: *precision,
+            scale: *scale,
+        });
+    }
+    if let DataType::Timestamp(_, Some(timezone)) = field.data_type()
+        && timezone.is_empty()
+    {
+        return Err(SchemaError::EmptyTimestampTimezone {
+            field: path.to_owned(),
+        });
+    }
     match DataTypeLayout::classify(field.data_type()) {
         Some(DataTypeLayout::List(child)) => {
             let nested = enter_container(depth)?;
@@ -145,6 +185,10 @@ fn validate_field(field: &Field, path: &str, depth: usize) -> Result<(), SchemaE
             data_type: field.data_type().clone(),
         }),
     }
+}
+
+pub(crate) const fn valid_decimal128_parameters(precision: u8, scale: i8) -> bool {
+    precision > 0 && precision <= 38 && (scale <= 0 || scale <= precision.cast_signed())
 }
 
 fn validate_metadata(metadata: &HashMap<String, String>, owner: &str) -> Result<(), SchemaError> {

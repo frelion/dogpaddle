@@ -7,17 +7,18 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, BinaryArray, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-    UInt64Array, types::Int64Type,
+    ArrayRef, BinaryArray, Date32Array, Decimal128Array, Int64Array, ListArray, RecordBatch,
+    StringArray, StructArray, TimestampNanosecondArray, UInt64Array, types::Int64Type,
 };
 use arrow_ipc::{
-    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, DictionaryEncoding,
+    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Date as IpcDate, DateArgs,
+    DateUnit as IpcDateUnit, Decimal as IpcDecimal, DecimalArgs, DictionaryEncoding,
     DictionaryEncodingArgs, Endianness, Field as IpcField, FieldArgs, FieldNode,
     FloatingPoint as IpcFloatingPoint, FloatingPointArgs, Int as IpcInt, IntArgs,
     LargeUtf8 as IpcLargeUtf8, LargeUtf8Args, List as IpcList, ListArgs, Message as IpcMessage,
     MessageArgs, MessageHeader, MetadataVersion, Null as IpcNull, NullArgs, Precision,
     RecordBatch as IpcRecordBatch, RecordBatchArgs, Schema as IpcSchema, SchemaArgs,
-    Type as IpcType,
+    TimeUnit as IpcTimeUnit, Timestamp as IpcTimestamp, TimestampArgs, Type as IpcType,
     reader::StreamReader,
     writer::{IpcWriteOptions, StreamWriter},
 };
@@ -80,6 +81,26 @@ fn layout_change() -> Change {
     ]));
     let records = RecordBatch::try_new(schema, columns).unwrap();
     Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap()
+}
+
+fn extended_fixed_width_change() -> Change {
+    let date = Arc::new(Date32Array::from(vec![Some(-1), None])) as ArrayRef;
+    let timestamp =
+        Arc::new(TimestampNanosecondArray::from(vec![Some(-1), None]).with_timezone("UTC"))
+            as ArrayRef;
+    let decimal = Arc::new(
+        Decimal128Array::from(vec![Some(-12_345), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap(),
+    ) as ArrayRef;
+    let columns = vec![date, timestamp, decimal];
+    let fields = ["date", "timestamp", "decimal"]
+        .into_iter()
+        .zip(&columns)
+        .map(|(name, column)| Field::new(name, column.data_type().clone(), true))
+        .collect::<Vec<_>>();
+    let records = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap()
 }
 
 fn assert_change_eq(actual: &Change, expected: &Change) {
@@ -226,6 +247,16 @@ fn big_endian_schema_stream() -> Vec<u8> {
 
 #[derive(Clone, Copy, Debug)]
 enum MalformedSchemaCase {
+    Date64,
+    DateMissingTable,
+    DateUnknownUnit,
+    DecimalBitWidth,
+    DecimalMissingTable,
+    DecimalPrecisionDoesNotFit,
+    DecimalPrecisionTooWide,
+    DecimalPrecisionZero,
+    DecimalScaleDoesNotFit,
+    DecimalScaleGreaterThanPrecision,
     Dictionary,
     FloatMissingTable,
     HalfFloat,
@@ -234,10 +265,47 @@ enum MalformedSchemaCase {
     ListMissingChildren,
     ListTwoChildren,
     NestingTooDeep,
+    TimestampEmptyTimezone,
+    TimestampMissingTable,
+    TimestampUnknownUnit,
     UnsupportedType,
 }
 
 const MALFORMED_SCHEMA_CASES: &[(MalformedSchemaCase, &str)] = &[
+    (MalformedSchemaCase::Date64, "only DAY is supported"),
+    (
+        MalformedSchemaCase::DateMissingTable,
+        "Exactly one of union discriminant",
+    ),
+    (MalformedSchemaCase::DateUnknownUnit, "unsupported unit"),
+    (
+        MalformedSchemaCase::DecimalBitWidth,
+        "only 128 is supported",
+    ),
+    (
+        MalformedSchemaCase::DecimalMissingTable,
+        "Exactly one of union discriminant",
+    ),
+    (
+        MalformedSchemaCase::DecimalPrecisionDoesNotFit,
+        "does not fit u8",
+    ),
+    (
+        MalformedSchemaCase::DecimalPrecisionTooWide,
+        "invalid precision 39",
+    ),
+    (
+        MalformedSchemaCase::DecimalPrecisionZero,
+        "invalid precision 0",
+    ),
+    (
+        MalformedSchemaCase::DecimalScaleDoesNotFit,
+        "does not fit i8",
+    ),
+    (
+        MalformedSchemaCase::DecimalScaleGreaterThanPrecision,
+        "invalid precision 2 and scale 3",
+    ),
     (MalformedSchemaCase::Dictionary, "dictionary encoding"),
     (
         MalformedSchemaCase::FloatMissingTable,
@@ -260,6 +328,18 @@ const MALFORMED_SCHEMA_CASES: &[(MalformedSchemaCase, &str)] = &[
     (
         MalformedSchemaCase::NestingTooDeep,
         "Nested table depth limit reached",
+    ),
+    (
+        MalformedSchemaCase::TimestampEmptyTimezone,
+        "empty timezone",
+    ),
+    (
+        MalformedSchemaCase::TimestampMissingTable,
+        "Exactly one of union discriminant",
+    ),
+    (
+        MalformedSchemaCase::TimestampUnknownUnit,
+        "unsupported unit",
     ),
     (
         MalformedSchemaCase::UnsupportedType,
@@ -303,6 +383,122 @@ fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
         current
     } else {
         let (type_type, type_, children, dictionary) = match case {
+            MalformedSchemaCase::Date64 => {
+                let data_type = IpcDate::create(
+                    &mut builder,
+                    &DateArgs {
+                        unit: IpcDateUnit::MILLISECOND,
+                    },
+                );
+                (IpcType::Date, Some(data_type.as_union_value()), None, None)
+            }
+            MalformedSchemaCase::DateMissingTable => (IpcType::Date, None, None, None),
+            MalformedSchemaCase::DateUnknownUnit => {
+                let data_type = IpcDate::create(
+                    &mut builder,
+                    &DateArgs {
+                        unit: IpcDateUnit(7),
+                    },
+                );
+                (IpcType::Date, Some(data_type.as_union_value()), None, None)
+            }
+            MalformedSchemaCase::DecimalBitWidth => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: 38,
+                        scale: 0,
+                        bitWidth: 256,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::DecimalMissingTable => (IpcType::Decimal, None, None, None),
+            MalformedSchemaCase::DecimalPrecisionDoesNotFit => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: i32::MAX,
+                        scale: 0,
+                        bitWidth: 128,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::DecimalPrecisionTooWide => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: 39,
+                        scale: 0,
+                        bitWidth: 128,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::DecimalPrecisionZero => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: 0,
+                        scale: 0,
+                        bitWidth: 128,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::DecimalScaleDoesNotFit => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: 38,
+                        scale: i32::MAX,
+                        bitWidth: 128,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::DecimalScaleGreaterThanPrecision => {
+                let data_type = IpcDecimal::create(
+                    &mut builder,
+                    &DecimalArgs {
+                        precision: 2,
+                        scale: 3,
+                        bitWidth: 128,
+                    },
+                );
+                (
+                    IpcType::Decimal,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
             MalformedSchemaCase::Dictionary => {
                 let data_type = IpcNull::create(&mut builder, &NullArgs::default());
                 let dictionary =
@@ -364,6 +560,38 @@ fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
                     IpcType::List,
                     Some(data_type.as_union_value()),
                     Some(children),
+                    None,
+                )
+            }
+            MalformedSchemaCase::TimestampEmptyTimezone => {
+                let timezone = builder.create_string("");
+                let data_type = IpcTimestamp::create(
+                    &mut builder,
+                    &TimestampArgs {
+                        unit: IpcTimeUnit::MILLISECOND,
+                        timezone: Some(timezone),
+                    },
+                );
+                (
+                    IpcType::Timestamp,
+                    Some(data_type.as_union_value()),
+                    None,
+                    None,
+                )
+            }
+            MalformedSchemaCase::TimestampMissingTable => (IpcType::Timestamp, None, None, None),
+            MalformedSchemaCase::TimestampUnknownUnit => {
+                let data_type = IpcTimestamp::create(
+                    &mut builder,
+                    &TimestampArgs {
+                        unit: IpcTimeUnit(7),
+                        timezone: None,
+                    },
+                );
+                (
+                    IpcType::Timestamp,
+                    Some(data_type.as_union_value()),
+                    None,
                     None,
                 )
             }
@@ -782,6 +1010,23 @@ fn both_decoders_validate_all_unselected_batch_metadata() {
         invalid_non_nullable,
         out_of_body,
     ] {
+        assert_both_invalid_encoding(&malformed, &projection);
+    }
+}
+
+#[test]
+fn temporal_and_decimal_buffer_widths_are_validated_even_when_unselected() {
+    let change = extended_fixed_width_change();
+    let encoded = encode_change(&change).unwrap();
+    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
+
+    for name in ["date", "timestamp", "decimal"] {
+        let malformed = corrupt_layout(&encoded, |parsed, layout, _, buffers| {
+            let index = field_layout(parsed, layout, name).buffers.start + 1;
+            let descriptor = buffers[index];
+            buffers[index] = IpcBuffer::new(descriptor.offset(), descriptor.length() - 1);
+            0
+        });
         assert_both_invalid_encoding(&malformed, &projection);
     }
 }

@@ -1,22 +1,24 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
-    StructArray, UInt64Array, types::Int64Type,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int32Array,
+    Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMillisecondArray,
+    UInt64Array, types::Int64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use dogpaddle_change::{Change, ChangeProjection, ProjectionError};
 use dogpaddle_operation::{
     DataInstances, Expr, ExpressionError, OperationDefinition, Operator, ScalarValue, cast, col,
-    lit,
+    decode_definition, encode_definition, lit,
     operation::{
         Action, Operation, OperationInput,
         sink::{DiscardError, DiscardOperation},
         source::{SequenceSourceError, SequenceSourceOperation},
         transform::{
-            CountError, CountOperation, ExtendDefinition, ExtendError, FilterDefinition,
-            FilterError, ProjectError, ProjectOperation, SelectDefinition, SelectError,
-            UnionAllDefinition, UnionAllError,
+            ExtendDefinition, ExtendError, FilterDefinition, FilterError, ProjectDefinition,
+            ProjectError, ProjectOperation, RunningEventCountError, RunningEventCountOperation,
+            SchemaAlignDefinition, SchemaAlignError, SchemaAlignField, SelectDefinition,
+            SelectError, UnionAllDefinition, UnionAllError,
         },
     },
     try_cast,
@@ -26,8 +28,12 @@ use dogpaddle_store::{Cell, Store, StoreError};
 use super::support::TestStore;
 
 fn change(diffs: &[i64]) -> Change {
+    change_with_field_name("input", diffs)
+}
+
+fn change_with_field_name(field_name: &str, diffs: &[i64]) -> Change {
     let schema = Arc::new(Schema::new(vec![Field::new(
-        "input",
+        field_name,
         DataType::UInt64,
         false,
     )]));
@@ -63,6 +69,56 @@ fn stateless_operation(
         .unwrap();
     data.finish().unwrap();
     operation
+}
+
+fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change) -> Change {
+    let encoded = encode_definition(definition);
+    let decoded = decode_definition(&encoded).unwrap();
+    assert_eq!(encode_definition(decoded.as_ref()), encoded);
+    let operation = stateless_operation(decoded.as_ref(), input.schema());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("round-tripped stateless Operation did not complete with output");
+    };
+    output
+}
+
+fn temporal_and_decimal_change() -> Change {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("date", DataType::Date32, false),
+        Field::new(
+            "occurred_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("amount", DataType::Decimal128(10, 2), true),
+    ]));
+    let records = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1_000),
+                Some(2_000),
+                None,
+                Some(2_500),
+                Some(4_000),
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(100), None, Some(300), Some(400), Some(500)])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+    Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2, 3])).unwrap()
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +168,7 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let position = store.create_data::<Cell<u64>>("position").unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
     let source = SequenceSourceOperation::new(41, position);
-    let transform = CountOperation::new(count);
+    let transform = RunningEventCountOperation::new(count);
     let sink = DiscardOperation;
     let input = change(&[2, -1]);
     let mut transactions = store.into_transactions();
@@ -152,7 +208,7 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let source =
         SequenceSourceOperation::new(41, store.open_data::<Cell<u64>>("position").unwrap());
     let count_state = store.open_data::<Cell<u64>>("count").unwrap();
-    let transform = CountOperation::new(count_state.clone());
+    let transform = RunningEventCountOperation::new(count_state.clone());
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
@@ -192,7 +248,7 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
         u64::MAX - 1,
         store.create_data::<Cell<u64>>("position").unwrap(),
     );
-    let count = CountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
+    let count = RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
     let sink = DiscardOperation;
     let input = change(&[1]);
     let mut transactions = store.into_transactions();
@@ -228,8 +284,8 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
 
     let count_error = count.turn(None, transaction.access()).unwrap_err();
     assert!(matches!(
-        count_error.downcast_ref::<CountError>(),
-        Some(CountError::MissingInput)
+        count_error.downcast_ref::<RunningEventCountError>(),
+        Some(RunningEventCountError::MissingInput)
     ));
     let count_error = count
         .turn(
@@ -241,8 +297,8 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
         )
         .unwrap_err();
     assert!(matches!(
-        count_error.downcast_ref::<CountError>(),
-        Some(CountError::InvalidInputPort { port: 1 })
+        count_error.downcast_ref::<RunningEventCountError>(),
+        Some(RunningEventCountError::InvalidInputPort { port: 1 })
     ));
 
     let sink_error = sink.turn(None, transaction.access()).unwrap_err();
@@ -741,6 +797,195 @@ fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
 }
 
 #[test]
+fn temporal_and_decimal_direct_columns_cross_project_select_and_extend_after_codec_roundtrip() {
+    let input = temporal_and_decimal_change();
+    let schema = input.schema();
+
+    let projected = roundtripped_output(&ProjectDefinition::new([0, 1, 2]), &input);
+    assert_eq!(projected.schema(), schema);
+    for index in 0..3 {
+        assert!(Arc::ptr_eq(
+            projected.records().column(index),
+            input.records().column(index)
+        ));
+    }
+    assert_eq!(
+        projected.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+
+    let select_definition = SelectDefinition::try_new([
+        ("selected_amount", col("amount")),
+        ("selected_date", col("date")),
+        ("selected_time", col("occurred_at")),
+    ])
+    .unwrap();
+    let selected = roundtripped_output(&select_definition, &input);
+    assert_eq!(
+        selected
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (
+                field.name().as_str(),
+                field.data_type(),
+                field.is_nullable()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("selected_amount", &DataType::Decimal128(10, 2), true),
+            ("selected_date", &DataType::Date32, false),
+            (
+                "selected_time",
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]
+    );
+    for (output, input_index) in [(0, 2), (1, 0), (2, 1)] {
+        assert!(Arc::ptr_eq(
+            selected.records().column(output),
+            input.records().column(input_index)
+        ));
+    }
+    assert_eq!(
+        selected.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+
+    for (source, copy, input_index) in [
+        ("date", "date_copy", 0),
+        ("occurred_at", "occurred_at_copy", 1),
+        ("amount", "amount_copy", 2),
+    ] {
+        let definition = ExtendDefinition::try_new(copy, col(source)).unwrap();
+        let extended = roundtripped_output(&definition, &input);
+        assert_eq!(extended.schema().field(3).name(), copy);
+        assert_eq!(
+            extended.schema().field(3).data_type(),
+            schema.field(input_index).data_type()
+        );
+        assert_eq!(
+            extended.schema().field(3).is_nullable(),
+            schema.field(input_index).is_nullable()
+        );
+        assert!(Arc::ptr_eq(
+            extended.records().column(3),
+            input.records().column(input_index)
+        ));
+        assert_eq!(
+            extended.diffs().values().as_ptr(),
+            input.diffs().values().as_ptr()
+        );
+    }
+}
+
+#[test]
+fn temporal_and_decimal_schema_align_executes_explicit_casts_after_codec_roundtrip() {
+    let input = temporal_and_decimal_change();
+    let align_definition = SchemaAlignDefinition::try_new([
+        SchemaAlignField::try_new("aligned_date", col("date"), true).unwrap(),
+        SchemaAlignField::try_new("aligned_time", col("occurred_at"), true).unwrap(),
+        SchemaAlignField::try_new("aligned_amount", col("amount"), true).unwrap(),
+        SchemaAlignField::try_new("date_days", cast(col("date"), DataType::Int32), false).unwrap(),
+        SchemaAlignField::try_new(
+            "time_millis",
+            cast(col("occurred_at"), DataType::Int64),
+            true,
+        )
+        .unwrap(),
+        SchemaAlignField::try_new(
+            "amount_rescaled",
+            cast(col("amount"), DataType::Decimal128(12, 3)),
+            true,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let aligned = roundtripped_output(&align_definition, &input);
+    for index in 0..3 {
+        assert!(Arc::ptr_eq(
+            aligned.records().column(index),
+            input.records().column(index)
+        ));
+        assert!(aligned.schema().field(index).is_nullable());
+    }
+    assert_eq!(aligned.schema().field(3).data_type(), &DataType::Int32);
+    assert!(!aligned.schema().field(3).is_nullable());
+    assert_eq!(aligned.schema().field(4).data_type(), &DataType::Int64);
+    assert!(aligned.schema().field(4).is_nullable());
+    assert_eq!(
+        aligned.schema().field(5).data_type(),
+        &DataType::Decimal128(12, 3)
+    );
+    assert!(aligned.schema().field(5).is_nullable());
+    let date_days = aligned
+        .records()
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(date_days.values(), &[0, 1, 2, 3, 4]);
+    let time_millis = aligned
+        .records()
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        time_millis.iter().collect::<Vec<_>>(),
+        [Some(1_000), Some(2_000), None, Some(2_500), Some(4_000)]
+    );
+    let amount_rescaled = aligned
+        .records()
+        .column(5)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(
+        amount_rescaled.iter().collect::<Vec<_>>(),
+        [Some(1_000), None, Some(3_000), Some(4_000), Some(5_000)]
+    );
+    assert_eq!(
+        aligned.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+}
+
+#[test]
+fn temporal_and_decimal_filter_comparisons_preserve_selected_order_after_codec_roundtrip() {
+    let input = temporal_and_decimal_change();
+    let predicate = col("date")
+        .gt_eq(lit(ScalarValue::Date32(Some(0))))
+        .and(col("occurred_at").lt(lit(ScalarValue::TimestampMillisecond(Some(3_000), None))))
+        .and(col("amount").not_eq(lit(ScalarValue::Decimal128(Some(300), 10, 2))));
+    let filter_definition = FilterDefinition::try_new(predicate).unwrap();
+    let filtered = roundtripped_output(&filter_definition, &input);
+    assert_eq!(filtered.diffs().values(), &[1, -2]);
+    let dates = filtered
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    assert_eq!(dates.values(), &[0, 3]);
+    let times = filtered
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    assert_eq!(times.values(), &[1_000, 2_500]);
+    let amounts = filtered
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(amounts.values(), &[100, 400]);
+}
+
+#[test]
 fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt64, false),
@@ -790,7 +1035,156 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
 }
 
 #[test]
-fn empty_select_preserves_input_row_count_and_diffs() {
+fn schema_align_applies_explicit_schema_and_shares_direct_columns_and_diffs() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 20, 30])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+        ],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
+    let definition = SchemaAlignDefinition::try_new_with_metadata(
+        [
+            SchemaAlignField::try_new_with_metadata(
+                "renamed_label",
+                col("label"),
+                true,
+                HashMap::from([("role".to_owned(), "label".to_owned())]),
+            )
+            .unwrap(),
+            SchemaAlignField::try_new("signed_id", cast(col("id"), DataType::Int64), true).unwrap(),
+            SchemaAlignField::try_new("original_id", col("id"), false).unwrap(),
+        ],
+        HashMap::from([("normalized".to_owned(), "v1".to_owned())]),
+    )
+    .unwrap();
+    let operation = stateless_operation(&definition, Arc::clone(&schema));
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("SchemaAlign did not complete with one output Change");
+    };
+    assert_eq!(output.schema().metadata().get("normalized").unwrap(), "v1");
+    assert_eq!(output.schema().field(0).name(), "renamed_label");
+    assert_eq!(
+        output.schema().field(0).metadata().get("role").unwrap(),
+        "label"
+    );
+    assert_eq!(output.schema().field(1).data_type(), &DataType::Int64);
+    assert!(output.schema().field(1).is_nullable());
+    assert!(!output.schema().field(2).is_nullable());
+    assert!(Arc::ptr_eq(
+        output.records().column(0),
+        input.records().column(1)
+    ));
+    assert!(Arc::ptr_eq(
+        output.records().column(2),
+        input.records().column(0)
+    ));
+    assert_eq!(
+        output.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+    let signed = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(signed.values(), &[10, 20, 30]);
+}
+
+#[test]
+fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
+    let input = change(&[1, -1, 2]);
+    let definition = SchemaAlignDefinition::try_new([]).unwrap();
+    let operation = stateless_operation(&definition, input.schema());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("empty SchemaAlign did not complete with one output Change");
+    };
+    assert_eq!(output.num_rows(), input.num_rows());
+    assert!(output.schema().fields().is_empty());
+    assert!(output.records().columns().is_empty());
+    assert_eq!(
+        output.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+
+    let drifted = change_with_field_name("other", &[1, -1, 2]);
+    let error = operation
+        .turn(Some(turn_input(&drifted)), transaction.access())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::InputSchemaMismatch)
+    ));
+}
+
+#[test]
+fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
+    let input = change(&[1]);
+    let definition =
+        SchemaAlignDefinition::try_new([
+            SchemaAlignField::try_new("renamed", col("input"), false).unwrap()
+        ])
+        .unwrap();
+    let operation = stateless_operation(&definition, input.schema());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let error = operation.turn(None, transaction.access()).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::MissingInput)
+    ));
+    let error = operation
+        .turn(
+            Some(OperationInput {
+                port: 1,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::InvalidInputPort { port: 1 })
+    ));
+
+    let drifted = change_with_field_name("other", &[1]);
+    let error = operation
+        .turn(Some(turn_input(&drifted)), transaction.access())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::InputSchemaMismatch)
+    ));
+}
+
+#[test]
+fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let input = change(&[1, -1, 2]);
     let definition = SelectDefinition::try_new(std::iter::empty::<(&str, Expr)>()).unwrap();
     let operation = stateless_operation(&definition, input.schema());
@@ -812,6 +1206,15 @@ fn empty_select_preserves_input_row_count_and_diffs() {
         output.diffs().values().as_ptr(),
         input.diffs().values().as_ptr()
     );
+
+    let drifted = change_with_field_name("other", &[1, -1, 2]);
+    let error = operation
+        .turn(Some(turn_input(&drifted)), transaction.access())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SelectError>(),
+        Some(SelectError::InputSchemaMismatch)
+    ));
 }
 
 #[test]
@@ -873,6 +1276,28 @@ fn union_all_forwards_every_legal_port_without_copying() {
             input.diffs().values().as_ptr()
         );
     }
+
+    let drifted = change_with_field_name("other", &[1, -1, 2]);
+    let error = operation
+        .turn(
+            Some(OperationInput {
+                port: 1,
+                change: &drifted,
+            }),
+            transaction.access(),
+        )
+        .unwrap_err();
+    let Some(UnionAllError::InputSchemaMismatch {
+        port,
+        expected,
+        actual,
+    }) = error.downcast_ref::<UnionAllError>()
+    else {
+        panic!("UnionAll accepted a runtime Schema that differs from its binding");
+    };
+    assert_eq!(*port, 1);
+    assert_eq!(expected.as_ref(), input.schema().as_ref());
+    assert_eq!(actual.as_ref(), drifted.schema().as_ref());
 }
 
 #[test]
@@ -1210,6 +1635,141 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     assert_eq!(parsed.iter().collect::<Vec<_>>(), [Some(10), None]);
 }
 
+fn structural_trace(
+    definition: &dyn OperationDefinition,
+    port: usize,
+    rows: &[(u64, u64, i64)],
+    batches: &[usize],
+) -> Vec<(Vec<u64>, i64)> {
+    assert_eq!(batches.iter().sum::<usize>(), rows.len());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("left", DataType::UInt64, false),
+        Field::new("right", DataType::UInt64, false),
+    ]));
+    let input_schemas = (0..definition.kind().input_count())
+        .map(|_| Arc::clone(&schema))
+        .collect::<Vec<_>>();
+    let mut data = DataInstances::new();
+    let operation = definition
+        .bind(&input_schemas)
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let mut trace = Vec::new();
+    let mut start = 0;
+
+    for &batch_rows in batches {
+        let batch = &rows[start..start + batch_rows];
+        let records = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(batch.iter().map(|row| row.0))),
+                Arc::new(UInt64Array::from_iter_values(batch.iter().map(|row| row.1))),
+            ],
+        )
+        .unwrap();
+        let input = Change::try_new(
+            records,
+            Int64Array::from_iter_values(batch.iter().map(|row| row.2)),
+        )
+        .unwrap();
+        let transaction = transactions.begin().unwrap();
+        let Action::Complete(Some(output)) = operation
+            .turn(
+                Some(OperationInput {
+                    port,
+                    change: &input,
+                }),
+                transaction.access(),
+            )
+            .unwrap()
+        else {
+            panic!("structural Operation returned the wrong action");
+        };
+        for row in 0..output.num_rows() {
+            let values = output
+                .records()
+                .columns()
+                .iter()
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .value(row)
+                })
+                .collect();
+            trace.push((values, output.diffs().value(row)));
+        }
+        transaction.commit().unwrap();
+        start += batch_rows;
+    }
+    trace
+}
+
+#[test]
+fn project_select_and_schema_align_preserve_flattened_records_and_diffs_across_rebatching() {
+    let rows = [(1, 10, 1), (2, 20, -1), (3, 30, 2), (4, 40, -2)];
+    let cases: [(&str, Box<dyn OperationDefinition>); 3] = [
+        ("Project", Box::new(ProjectDefinition::new([1]))),
+        (
+            "Select",
+            Box::new(
+                SelectDefinition::try_new([
+                    ("right", col("right")),
+                    ("next", col("left") + lit(1_u64)),
+                ])
+                .unwrap(),
+            ),
+        ),
+        (
+            "SchemaAlign",
+            Box::new(
+                SchemaAlignDefinition::try_new([
+                    SchemaAlignField::try_new("right", col("right"), false).unwrap(),
+                    SchemaAlignField::try_new("left", col("left"), true).unwrap(),
+                ])
+                .unwrap(),
+            ),
+        ),
+    ];
+
+    for (name, definition) in cases {
+        let expected = structural_trace(definition.as_ref(), 0, &rows, &[rows.len()]);
+        for batches in [&[1, 3][..], &[2, 1, 1], &[1, 1, 1, 1]] {
+            assert_eq!(
+                structural_trace(definition.as_ref(), 0, &rows, batches),
+                expected,
+                "{name} changed its flattened trace after rebatching"
+            );
+        }
+    }
+}
+
+#[test]
+fn union_all_preserves_each_port_subsequence_across_rebatching() {
+    let definition = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
+    let ports = [
+        (0, &[(1, 10, 1), (2, 20, -1), (3, 30, 2)][..]),
+        (1, &[(101, 110, -2), (102, 120, 3), (103, 130, 1)][..]),
+    ];
+
+    for (port, rows) in ports {
+        let expected = structural_trace(&definition, port, rows, &[rows.len()]);
+        for batches in [&[1, 2][..], &[2, 1], &[1, 1, 1]] {
+            assert_eq!(
+                structural_trace(&definition, port, rows, batches),
+                expected,
+                "UnionAll changed port {port}'s flattened subsequence after rebatching"
+            );
+        }
+    }
+}
+
 fn predicate_change(values: &[u64], keep: &[Option<bool>], diffs: &[i64]) -> Change {
     assert_eq!(values.len(), keep.len());
     assert_eq!(values.len(), diffs.len());
@@ -1365,11 +1925,12 @@ fn filter_and_extend_are_rebatch_invariant() {
     }
 }
 
-fn count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
+fn running_event_count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
     assert_eq!(batches.iter().sum::<usize>(), diffs.len());
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
-    let operation = CountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
+    let operation =
+        RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
     let mut transactions = store.into_transactions();
     let mut output = Vec::new();
     let mut start = 0;
@@ -1390,17 +1951,17 @@ fn count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
 }
 
 #[test]
-fn count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
+fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let diffs = [1, 1, 1, -1, 1];
     let expected = [1, 2, 3, 4, 5];
     for batches in [&[5][..], &[2, 3], &[1, 1, 1, 1, 1]] {
-        assert_eq!(count_trace(&diffs, batches), expected);
+        assert_eq!(running_event_count_trace(&diffs, batches), expected);
     }
 
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let state = store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = CountOperation::new(state.clone());
+    let operation = RunningEventCountOperation::new(state.clone());
     let input = change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
@@ -1417,8 +1978,8 @@ fn count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
         .turn(Some(turn_input(&input)), transaction.access())
         .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<CountError>(),
-        Some(CountError::Overflow)
+        error.downcast_ref::<RunningEventCountError>(),
+        Some(RunningEventCountError::Overflow)
     ));
     assert_eq!(
         state.access(transaction.access()).unwrap().get().unwrap(),
@@ -1428,7 +1989,7 @@ fn count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 }
 
 #[test]
-fn count_preserves_persisted_bytes_when_state_codec_is_wrong() {
+fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let fixture = TestStore::new();
     let persisted = "not-a-u64".to_owned();
     let mut store = Store::create(fixture.path()).unwrap();
@@ -1445,7 +2006,7 @@ fn count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let operation = CountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
+    let operation = RunningEventCountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let change = change(&[1]);

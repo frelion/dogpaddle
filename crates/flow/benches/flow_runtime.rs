@@ -13,7 +13,8 @@ use dogpaddle_bench_protocol::{
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
@@ -355,8 +356,10 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
         Scenario::Chain { station_count } => (1..station_count - 1)
             .map(|index| {
                 store
-                    .open_data::<Cell<u64>>(&format!("station/{index:08x}/operation/count"))
-                    .expect("open Count state to validate runtime work counts")
+                    .open_data::<Cell<u64>>(&format!(
+                        "station/{index:08x}/operation/running_event_count.count"
+                    ))
+                    .expect("open RunningEventCount state to validate runtime work counts")
             })
             .collect::<Vec<_>>(),
         Scenario::Sink | Scenario::CapacityPressure | Scenario::Fanout { .. } => Vec::new(),
@@ -408,11 +411,11 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
         assert_eq!(
             count
                 .access(transaction.access())
-                .expect("access Count state to validate committed turns")
+                .expect("access RunningEventCount state to validate committed turns")
                 .get()
-                .expect("read Count state to validate committed turns"),
+                .expect("read RunningEventCount state to validate committed turns"),
             Some(completed_rounds),
-            "durable Count state must match committed Count turns"
+            "durable RunningEventCount state must match committed turns"
         );
     }
     if let Some(output) = capacity_output {
@@ -476,7 +479,10 @@ fn chain_factory(
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
     factory.output_capacity_bytes(previous, output_capacity_bytes);
     for index in 1..station_count - 1 {
-        let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
+        let current = factory.station(
+            format!("count-{index:08x}"),
+            RunningEventCountDefinition::new(),
+        );
         factory.output_capacity_bytes(current, output_capacity_bytes);
         factory.connect([previous], current);
         previous = current;

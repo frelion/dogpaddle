@@ -2,7 +2,8 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, StationRef, TopologyError};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
@@ -72,7 +73,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
             }
         }
         InvalidCase::NonSourceRoot => {
-            let count = builder.station("count", CountDefinition::new());
+            let count = builder.station("count", RunningEventCountDefinition::new());
             let sink = builder.station("sink", DiscardDefinition::new());
             builder.connect([count], sink);
             TopologyError::RootIsNotSource("count".to_owned())
@@ -107,7 +108,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         InvalidCase::SinkFeedsStation => {
             let source = builder.station("source", SequenceSourceDefinition::new(0));
             let sink = builder.station("sink", DiscardDefinition::new());
-            let count = builder.station("count", CountDefinition::new());
+            let count = builder.station("count", RunningEventCountDefinition::new());
             let terminal = builder.station("terminal", DiscardDefinition::new());
             builder.connect([source], sink);
             builder.connect([sink], count);
@@ -120,7 +121,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         InvalidCase::ForeignConnection => {
             let foreign = foreign_source(root);
             builder.station("own-source", SequenceSourceDefinition::new(0));
-            let count = builder.station("count", CountDefinition::new());
+            let count = builder.station("count", RunningEventCountDefinition::new());
             builder.connect([foreign], count);
             TopologyError::ForeignStationRef(foreign)
         }
@@ -132,7 +133,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         InvalidCase::SourcesTwice => {
             let first = builder.station("first", SequenceSourceDefinition::new(0));
             let second = builder.station("second", SequenceSourceDefinition::new(1));
-            let count = builder.station("count", CountDefinition::new());
+            let count = builder.station("count", RunningEventCountDefinition::new());
             builder.connect([first], count);
             builder.connect([second], count);
             TopologyError::SourcesAlreadySet("count".to_owned())

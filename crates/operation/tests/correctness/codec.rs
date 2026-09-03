@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     num::NonZeroU32,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -16,8 +17,8 @@ use dogpaddle_operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
         transform::{
-            CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition,
-            SelectDefinition, UnionAllDefinition,
+            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
     try_cast,
@@ -26,11 +27,13 @@ use dogpaddle_store::Store;
 
 use super::support::{TestStore, decode_hex};
 
-const COUNT_V1: &str = include_str!("../fixtures/v1/count_definition.hex");
+const RUNNING_EVENT_COUNT_V1: &str =
+    include_str!("../fixtures/v1/running_event_count_definition.hex");
 const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
 const EXTEND_V1: &str = include_str!("../fixtures/v1/extend_is_seven.hex");
 const FILTER_V1: &str = include_str!("../fixtures/v1/filter_complex_expression.hex");
 const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
+const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
@@ -46,6 +49,29 @@ fn length_prefixed_bytes(encoded: &[u8], length_offset: usize) -> &[u8] {
     let value_offset = length_offset + size_of::<u32>();
     assert_eq!(value_offset + length, encoded.len());
     &encoded[value_offset..]
+}
+
+fn skip_length_prefixed(encoded: &[u8], offset: &mut usize) {
+    let length = usize::try_from(u32::from_be_bytes(
+        encoded[*offset..*offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    *offset += size_of::<u32>() + length;
+}
+
+fn skip_metadata(encoded: &[u8], offset: &mut usize) {
+    let count = u32::from_be_bytes(
+        encoded[*offset..*offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+    *offset += size_of::<u32>();
+    for _ in 0..count {
+        skip_length_prefixed(encoded, offset);
+        skip_length_prefixed(encoded, offset);
+    }
 }
 
 fn binary(operator: Operator, left: Expr, right: Expr) -> Expr {
@@ -74,6 +100,30 @@ fn select() -> SelectDefinition {
     .unwrap()
 }
 
+fn schema_align() -> SchemaAlignDefinition {
+    SchemaAlignDefinition::try_new_with_metadata(
+        [
+            SchemaAlignField::try_new_with_metadata(
+                "renamed",
+                col("value"),
+                true,
+                HashMap::from([
+                    ("z".to_owned(), "last".to_owned()),
+                    ("a".to_owned(), "first".to_owned()),
+                ]),
+            )
+            .unwrap(),
+            SchemaAlignField::try_new("signed", cast(col("value"), DataType::Int64), false)
+                .unwrap(),
+        ],
+        HashMap::from([
+            ("version".to_owned(), "1".to_owned()),
+            ("owner".to_owned(), "test".to_owned()),
+        ]),
+    )
+    .unwrap()
+}
+
 fn complex_predicate() -> Expr {
     let uint_match = binary(Operator::Eq, col("value"), lit(7_u64));
     let signed_null = binary(Operator::Eq, lit(-2_i64), lit(ScalarValue::Int64(None))).is_null();
@@ -96,7 +146,10 @@ fn complex_predicate() -> Expr {
 
 fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
     vec![
-        (decode_hex(COUNT_V1), Box::new(CountDefinition::new())),
+        (
+            decode_hex(RUNNING_EVENT_COUNT_V1),
+            Box::new(RunningEventCountDefinition::new()),
+        ),
         (decode_hex(DISCARD_V1), Box::new(DiscardDefinition::new())),
         (
             decode_hex(EXTEND_V1),
@@ -115,6 +168,7 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
             Box::new(SequenceSourceDefinition::new(42)),
         ),
         (decode_hex(SELECT_V1), Box::new(select())),
+        (decode_hex(SCHEMA_ALIGN_V1), Box::new(schema_align())),
         (
             decode_hex(UNION_ALL_V1),
             Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
@@ -165,7 +219,7 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
     );
 
     let arbitrary = arbitrary_schema();
-    let count = decode_definition(&decode_hex(COUNT_V1)).unwrap();
+    let count = decode_definition(&decode_hex(RUNNING_EVENT_COUNT_V1)).unwrap();
     assert_eq!(
         count
             .bind(std::slice::from_ref(&arbitrary))
@@ -213,6 +267,28 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
     ]));
     assert_eq!(
         select
+            .bind(std::slice::from_ref(&value_schema()))
+            .unwrap()
+            .output_schema(),
+        Some(&expected)
+    );
+
+    let schema_align = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
+    let expected = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("renamed", DataType::UInt64, true).with_metadata(HashMap::from([
+                ("a".to_owned(), "first".to_owned()),
+                ("z".to_owned(), "last".to_owned()),
+            ])),
+            Field::new("signed", DataType::Int64, false),
+        ],
+        HashMap::from([
+            ("owner".to_owned(), "test".to_owned()),
+            ("version".to_owned(), "1".to_owned()),
+        ]),
+    ));
+    assert_eq!(
+        schema_align
             .bind(std::slice::from_ref(&value_schema()))
             .unwrap()
             .output_schema(),
@@ -397,6 +473,64 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
 }
 
 #[test]
+fn decoded_schema_align_golden_reconstructs_its_runtime_semantics() {
+    let schema = value_schema();
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(UInt64Array::from(vec![7, 8, 7]))],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let definition = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
+    let mut data = DataInstances::new();
+    let operation = definition
+        .bind(std::slice::from_ref(&schema))
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let Action::Complete(Some(aligned)) = operation
+        .turn(
+            Some(OperationInput {
+                port: 0,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap()
+    else {
+        panic!("decoded SchemaAlign did not emit its expected fields");
+    };
+    assert_eq!(aligned.schema().metadata().get("owner").unwrap(), "test");
+    assert_eq!(aligned.schema().field(0).name(), "renamed");
+    assert!(aligned.schema().field(0).is_nullable());
+    assert_eq!(
+        aligned.schema().field(0).metadata().get("a").unwrap(),
+        "first"
+    );
+    assert!(Arc::ptr_eq(
+        aligned.records().column(0),
+        input.records().column(0)
+    ));
+    let signed = aligned
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(signed.values(), &[7, 8, 7]);
+    assert_eq!(
+        aligned.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+}
+
+#[test]
 fn every_truncated_golden_prefix_is_rejected() {
     for (golden, _) in golden_cases() {
         for length in 0..golden.len() {
@@ -412,7 +546,7 @@ fn every_truncated_golden_prefix_is_rejected() {
 
 #[test]
 fn definition_decoder_rejects_non_canonical_or_unknown_input() {
-    let count = decode_hex(COUNT_V1);
+    let count = decode_hex(RUNNING_EVENT_COUNT_V1);
     assert_eq!(
         decode_definition(b"short").unwrap_err(),
         DefinitionCodecError::Truncated
@@ -574,6 +708,84 @@ fn select_decoder_rejects_a_forged_count_and_invalid_field_name_without_panickin
     invalid_utf8[first_name_offset] = u8::MAX;
     assert!(matches!(
         decode_definition(&invalid_utf8),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn schema_align_encoding_canonicalizes_metadata_and_rejects_noncanonical_payloads() {
+    let canonical = encode_definition(&schema_align());
+    let reversed_input_order = SchemaAlignDefinition::try_new_with_metadata(
+        [
+            SchemaAlignField::try_new_with_metadata(
+                "renamed",
+                col("value"),
+                true,
+                [
+                    ("z".to_owned(), "last".to_owned()),
+                    ("a".to_owned(), "first".to_owned()),
+                ],
+            )
+            .unwrap(),
+            SchemaAlignField::try_new("signed", cast(col("value"), DataType::Int64), false)
+                .unwrap(),
+        ],
+        [
+            ("version".to_owned(), "1".to_owned()),
+            ("owner".to_owned(), "test".to_owned()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(encode_definition(&reversed_input_order), canonical);
+
+    let mut offset = DEFINITION_HEADER_LEN;
+    let field_count = u32::from_be_bytes(
+        canonical[offset..offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+    offset += size_of::<u32>();
+    let mut first_nullable = None;
+    for field in 0..field_count {
+        skip_length_prefixed(&canonical, &mut offset);
+        skip_length_prefixed(&canonical, &mut offset);
+        if field == 0 {
+            first_nullable = Some(offset);
+        }
+        offset += 1;
+        skip_metadata(&canonical, &mut offset);
+    }
+
+    let mut invalid_nullability = canonical.clone();
+    invalid_nullability[first_nullable.unwrap()] = 2;
+    assert!(matches!(
+        decode_definition(&invalid_nullability),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+
+    let schema_metadata_count_offset = offset;
+    let metadata_count = u32::from_be_bytes(
+        canonical[offset..offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(metadata_count, 2);
+    offset += size_of::<u32>();
+    let first_start = offset;
+    skip_length_prefixed(&canonical, &mut offset);
+    skip_length_prefixed(&canonical, &mut offset);
+    let first_end = offset;
+    let second_start = offset;
+    skip_length_prefixed(&canonical, &mut offset);
+    skip_length_prefixed(&canonical, &mut offset);
+    let second_end = offset;
+
+    let mut unsorted = canonical[..schema_metadata_count_offset + size_of::<u32>()].to_vec();
+    unsorted.extend_from_slice(&canonical[second_start..second_end]);
+    unsorted.extend_from_slice(&canonical[first_start..first_end]);
+    unsorted.extend_from_slice(&canonical[second_end..]);
+    assert!(matches!(
+        decode_definition(&unsorted),
         Err(DefinitionCodecError::InvalidPayload(_))
     ));
 }

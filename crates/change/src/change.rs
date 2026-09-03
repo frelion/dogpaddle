@@ -1,5 +1,7 @@
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_array::{
+    Array, Decimal128Array, Int64Array, ListArray, RecordBatch, StructArray, make_array,
+};
+use arrow_schema::{DataType, Field, SchemaRef};
 use thiserror::Error;
 
 use crate::{
@@ -29,10 +31,12 @@ impl Change {
     /// # Errors
     ///
     /// Returns `ChangeError` when the change is empty, row counts differ,
-    /// a diff is null or zero, or the record schema is unsupported.
+    /// a diff is null or zero, the record schema is unsupported, or a non-null
+    /// Decimal128 physical slot exceeds its field's declared precision.
     pub fn try_new(records: RecordBatch, diffs: Int64Array) -> Result<Self, ChangeError> {
-        let change = Self::try_new_with_validated_schema(records, diffs)?;
+        let change = Self::try_new_shape(records, diffs)?;
         validate_schema(change.records.schema_ref())?;
+        validate_decimal128_values(&change.records)?;
         Ok(change)
     }
 
@@ -40,6 +44,12 @@ impl Change {
         records: RecordBatch,
         diffs: Int64Array,
     ) -> Result<Self, ChangeError> {
+        let change = Self::try_new_shape(records, diffs)?;
+        validate_decimal128_values(&change.records)?;
+        Ok(change)
+    }
+
+    fn try_new_shape(records: RecordBatch, diffs: Int64Array) -> Result<Self, ChangeError> {
         if records.num_rows() == 0 {
             return Err(ChangeError::Empty);
         }
@@ -166,6 +176,22 @@ pub enum ChangeError {
         /// Zero-based row index.
         index: usize,
     },
+    /// A non-null Decimal128 physical slot exceeds its field's precision.
+    #[error(
+        "Decimal128 value {value} at field {field:?} physical slot {index} does not fit precision {precision} and scale {scale}"
+    )]
+    InvalidDecimal128Value {
+        /// Dot-separated diagnostic path to the Decimal128 field.
+        field: String,
+        /// Zero-based slot in the local physical Decimal128 child array.
+        index: usize,
+        /// Rejected unscaled signed integer value.
+        value: i128,
+        /// Declared Decimal128 precision.
+        precision: u8,
+        /// Declared Decimal128 scale.
+        scale: i8,
+    },
     /// A requested slice is outside the change.
     #[error("slice starting at {offset} with length {length} is outside a {rows}-row change")]
     SliceOutOfBounds {
@@ -179,4 +205,86 @@ pub enum ChangeError {
     /// The logical record schema is invalid.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+}
+
+fn validate_decimal128_values(records: &RecordBatch) -> Result<(), ChangeError> {
+    for (field, array) in records.schema_ref().fields().iter().zip(records.columns()) {
+        validate_decimal128_array(field, array.as_ref(), field.name())?;
+    }
+    Ok(())
+}
+
+fn validate_decimal128_array(
+    field: &Field,
+    array: &dyn Array,
+    path: &str,
+) -> Result<(), ChangeError> {
+    match field.data_type() {
+        DataType::Decimal128(precision, scale) => {
+            let canonical;
+            let decimal = if let Some(decimal) = array.as_any().downcast_ref::<Decimal128Array>() {
+                decimal
+            } else {
+                canonical = make_array(array.to_data());
+                canonical
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("make_array canonicalizes an Arrow Decimal128 array")
+            };
+            let limit = 10_i128.pow(u32::from(*precision));
+            for (index, value) in decimal.iter().enumerate() {
+                if let Some(value) = value
+                    && !(-limit < value && value < limit)
+                {
+                    return Err(ChangeError::InvalidDecimal128Value {
+                        field: path.to_owned(),
+                        index,
+                        value,
+                        precision: *precision,
+                        scale: *scale,
+                    });
+                }
+            }
+        }
+        DataType::List(child) => {
+            let canonical;
+            let list = if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+                list
+            } else {
+                canonical = make_array(array.to_data());
+                canonical
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("make_array canonicalizes an Arrow List array")
+            };
+            let offsets = list.value_offsets();
+            let start = usize::try_from(offsets[0])
+                .expect("an Arrow ListArray has non-negative validated offsets");
+            let end = usize::try_from(offsets[offsets.len() - 1])
+                .expect("an Arrow ListArray has non-negative validated offsets");
+            let values = list.values().slice(start, end - start);
+            validate_decimal128_array(child, values.as_ref(), &join_path(path, child.name()))?;
+        }
+        DataType::Struct(fields) => {
+            let canonical;
+            let structure = if let Some(structure) = array.as_any().downcast_ref::<StructArray>() {
+                structure
+            } else {
+                canonical = make_array(array.to_data());
+                canonical
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("make_array canonicalizes an Arrow Struct array")
+            };
+            for (child, array) in fields.iter().zip(structure.columns()) {
+                validate_decimal128_array(child, array.as_ref(), &join_path(path, child.name()))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    format!("{parent}.{child}")
 }

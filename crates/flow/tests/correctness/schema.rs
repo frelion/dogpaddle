@@ -1,18 +1,25 @@
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    collections::HashMap,
+    num::{NonZeroU32, NonZeroU64},
+};
 
+use arrow_schema::{DataType, TimeUnit};
 use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
 use dogpaddle_operation::{
-    ExpressionBindError, OperationBindError, OperationDefinition, col, encode_definition, lit,
+    ExpressionBindError, OperationBindError, OperationDefinition, ScalarValue, cast, col,
+    encode_definition, lit,
     operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
         transform::{
-            CountDefinition, ExtendDefinition, FilterDefinition, FilterSchemaError,
-            ProjectDefinition, ProjectSchemaError, SelectDefinition, SelectSchemaError,
+            ExtendDefinition, FilterDefinition, FilterSchemaError, ProjectDefinition,
+            ProjectSchemaError, RunningEventCountDefinition, SchemaAlignDefinition,
+            SchemaAlignField, SchemaAlignSchemaError, SelectDefinition, SelectSchemaError,
             UnionAllDefinition, UnionAllSchemaError,
         },
     },
+    try_cast,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
@@ -99,7 +106,7 @@ fn build_reports_select_and_union_schema_rejections_without_store_side_effects()
     let mut factory = FlowFactory::new(&union_path);
     let left = factory.station("left", SequenceSourceDefinition::new(0));
     let right_source = factory.station("right-source", SequenceSourceDefinition::new(0));
-    let right = factory.station("right", CountDefinition::new());
+    let right = factory.station("right", RunningEventCountDefinition::new());
     let union = factory.station(
         "union",
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
@@ -119,6 +126,31 @@ fn build_reports_select_and_union_schema_rejections_without_store_side_effects()
     assert!(
         !union_path.exists(),
         "UnionAll rejection created the Store path"
+    );
+}
+
+#[test]
+fn build_reports_schema_align_narrowing_without_creating_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("schema-align");
+    let align = SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
+        "value",
+        try_cast(col("value"), DataType::Int64),
+        false,
+    )
+    .unwrap()])
+    .unwrap();
+    let error = build_schema_error(&path, "schema-align", align);
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("nullable-to-non-null SchemaAlign returned the wrong binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SchemaAlignSchemaError>(),
+        Some(SchemaAlignSchemaError::NullabilityNarrowing { field: 0 })
+    ));
+    assert!(
+        !path.exists(),
+        "SchemaAlign rejection created the Store path"
     );
 }
 
@@ -278,7 +310,7 @@ fn select_and_repeated_input_union_run_across_reopen() {
         "union",
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
     );
-    let count = factory.station("count", CountDefinition::new());
+    let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     for station in [source, select, union, count] {
         factory.output_capacity_bytes(station, CAPACITY);
@@ -305,7 +337,9 @@ fn select_and_repeated_input_union_run_across_reopen() {
     let union_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000002/state").unwrap();
     let union_output: AppendLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
-    let count: Cell<u64> = store.open_data("station/00000003/operation/count").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000003/operation/running_event_count.count")
+        .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let access = transaction.access();
@@ -335,7 +369,7 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     );
     let filter = factory.station("filter", FilterDefinition::try_new(col("keep")).unwrap());
     let project = factory.station("project", ProjectDefinition::new([0]));
-    let count = factory.station("count", CountDefinition::new());
+    let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     for station in [source, extend, filter, project, count] {
         factory.output_capacity_bytes(station, CAPACITY);
@@ -369,12 +403,172 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     let _filter_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000002/state").unwrap();
     let _filter_output: AppendLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
-    let count: Cell<u64> = store.open_data("station/00000004/operation/count").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000004/operation/running_event_count.count")
+        .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
         count.access(transaction.access()).unwrap().get().unwrap(),
         Some(1)
+    );
+}
+
+#[test]
+fn schema_align_runs_and_reopens_with_explicit_schema_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 1));
+    let align = factory.station(
+        "schema-align",
+        SchemaAlignDefinition::try_new_with_metadata(
+            [
+                SchemaAlignField::try_new_with_metadata(
+                    "renamed",
+                    col("value"),
+                    true,
+                    HashMap::from([("role".to_owned(), "identifier".to_owned())]),
+                )
+                .unwrap(),
+                SchemaAlignField::try_new("text", cast(col("value"), DataType::Utf8), false)
+                    .unwrap(),
+            ],
+            HashMap::from([("normalized".to_owned(), "v1".to_owned())]),
+        )
+        .unwrap(),
+    );
+    let count = factory.station("count", RunningEventCountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [source, align, count] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([source], align);
+    factory.connect([align], count);
+    factory.connect([count], sink);
+    drop(factory.build().unwrap());
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut reached_idle = false;
+    for _ in 0..4 {
+        if flow.advance().unwrap() == AdvanceOutcome::Idle {
+            reached_idle = true;
+            break;
+        }
+    }
+    assert!(reached_idle, "finite SchemaAlign Flow did not become idle");
+    drop(flow);
+
+    let store = Store::open(&path).unwrap();
+    let _align_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let align_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000002/operation/running_event_count.count")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        align_output
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        2..2
+    );
+    assert_eq!(
+        count.access(transaction.access()).unwrap().get().unwrap(),
+        Some(2)
+    );
+}
+
+#[test]
+fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.station("source", SequenceSourceDefinition::new(1));
+    let align = factory.station(
+        "schema-align",
+        SchemaAlignDefinition::try_new([
+            SchemaAlignField::try_new(
+                "event_date",
+                cast(cast(col("value"), DataType::Int32), DataType::Date32),
+                false,
+            )
+            .unwrap(),
+            SchemaAlignField::try_new(
+                "event_time",
+                cast(
+                    cast(col("value"), DataType::Int64),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                ),
+                false,
+            )
+            .unwrap(),
+            SchemaAlignField::try_new(
+                "amount",
+                cast(col("value"), DataType::Decimal128(10, 2)),
+                false,
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+    );
+    let project = factory.station("project", ProjectDefinition::new([0, 1, 2]));
+    let select = factory.station(
+        "select",
+        SelectDefinition::try_new([
+            ("date", col("event_date")),
+            ("time", col("event_time")),
+            ("amount", col("amount")),
+        ])
+        .unwrap(),
+    );
+    let predicate = col("date")
+        .gt_eq(lit(ScalarValue::Date32(Some(0))))
+        .and(col("time").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(0), None))))
+        .and(col("amount").gt(lit(ScalarValue::Decimal128(Some(0), 10, 2))));
+    let extend = factory.station(
+        "extend",
+        ExtendDefinition::try_new("keep", predicate).unwrap(),
+    );
+    let filter = factory.station("filter", FilterDefinition::try_new(col("keep")).unwrap());
+    let count = factory.station("count", RunningEventCountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [source, align, project, select, extend, filter, count] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([source], align);
+    factory.connect([align], project);
+    factory.connect([project], select);
+    factory.connect([select], extend);
+    factory.connect([extend], filter);
+    factory.connect([filter], count);
+    factory.connect([count], sink);
+
+    let mut flow = factory.build().unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    for _ in 0..2 {
+        let mut reopened = FlowFactory::open(&path).unwrap();
+        assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+
+    let store = Store::open(&path).unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000006/operation/running_event_count.count")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        count.access(transaction.access()).unwrap().get().unwrap(),
+        Some(3)
     );
 }
 
@@ -385,7 +579,7 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     let mut factory = FlowFactory::new(&path);
     let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX));
     let project = factory.station("project", ProjectDefinition::new([]));
-    let count = factory.station("count", CountDefinition::new());
+    let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     for station in [source, project, count] {
         factory.output_capacity_bytes(station, CAPACITY);
@@ -414,7 +608,9 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     let _project_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000001/state").unwrap();
     let _project_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
-    let count: Cell<u64> = store.open_data("station/00000002/operation/count").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000002/operation/running_event_count.count")
+        .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(

@@ -2,16 +2,19 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{
-    Endianness, Field as IpcField, Message, MessageHeader, MetadataVersion, Precision,
-    RecordBatch as IpcRecordBatch, Schema as IpcSchema, Type as IpcType, root_as_message,
+    DateUnit as IpcDateUnit, Endianness, Field as IpcField, Message, MessageHeader,
+    MetadataVersion, Precision, RecordBatch as IpcRecordBatch, Schema as IpcSchema,
+    TimeUnit as IpcTimeUnit, Type as IpcType, root_as_message,
     writer::{IpcWriteOptions, StreamWriter},
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use super::CodecError;
 use crate::{
     change::Change,
-    schema::{MAX_NESTING_DEPTH, RESERVED_METADATA_PREFIX, validate_schema},
+    schema::{
+        MAX_NESTING_DEPTH, RESERVED_METADATA_PREFIX, valid_decimal128_parameters, validate_schema,
+    },
 };
 
 const DIFF_FIELD_NAME: &str = "$dogpaddle.diff";
@@ -133,6 +136,9 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
         IpcType::Bool => DataType::Boolean,
         IpcType::Int => parse_integer_type(field)?,
         IpcType::FloatingPoint => parse_floating_type(field)?,
+        IpcType::Date => parse_date_type(field)?,
+        IpcType::Timestamp => parse_timestamp_type(field)?,
+        IpcType::Decimal => parse_decimal_type(field)?,
         IpcType::Binary => DataType::Binary,
         IpcType::Utf8 => DataType::Utf8,
         IpcType::List => {
@@ -173,6 +179,77 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
 
     Ok(Field::new(name, data_type, field.nullable())
         .with_metadata(parse_metadata(field.custom_metadata())))
+}
+
+fn parse_date_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+    let name = field.name().unwrap_or_default();
+    let date = field.type_as_date().ok_or_else(|| {
+        CodecError::invalid(format!("Date field {name:?} has no Date type table"))
+    })?;
+    match date.unit() {
+        IpcDateUnit::DAY => Ok(DataType::Date32),
+        unit => Err(CodecError::invalid(format!(
+            "Date field {name:?} has unsupported unit {unit:?}; only DAY is supported"
+        ))),
+    }
+}
+
+fn parse_timestamp_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+    let name = field.name().unwrap_or_default();
+    let timestamp = field.type_as_timestamp().ok_or_else(|| {
+        CodecError::invalid(format!(
+            "Timestamp field {name:?} has no Timestamp type table"
+        ))
+    })?;
+    let unit = match timestamp.unit() {
+        IpcTimeUnit::SECOND => TimeUnit::Second,
+        IpcTimeUnit::MILLISECOND => TimeUnit::Millisecond,
+        IpcTimeUnit::MICROSECOND => TimeUnit::Microsecond,
+        IpcTimeUnit::NANOSECOND => TimeUnit::Nanosecond,
+        unit => {
+            return Err(CodecError::invalid(format!(
+                "Timestamp field {name:?} has unsupported unit {unit:?}"
+            )));
+        }
+    };
+    let timezone = timestamp.timezone();
+    if timezone.is_some_and(str::is_empty) {
+        return Err(CodecError::invalid(format!(
+            "Timestamp field {name:?} has an empty timezone; use no timezone for a naive timestamp"
+        )));
+    }
+    Ok(DataType::Timestamp(unit, timezone.map(Into::into)))
+}
+
+fn parse_decimal_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+    let name = field.name().unwrap_or_default();
+    let decimal = field.type_as_decimal().ok_or_else(|| {
+        CodecError::invalid(format!("Decimal field {name:?} has no Decimal type table"))
+    })?;
+    if decimal.bitWidth() != 128 {
+        return Err(CodecError::invalid(format!(
+            "Decimal field {name:?} has unsupported bit width {}; only 128 is supported",
+            decimal.bitWidth()
+        )));
+    }
+    let precision = u8::try_from(decimal.precision()).map_err(|_| {
+        CodecError::invalid(format!(
+            "Decimal128 field {name:?} precision {} does not fit u8",
+            decimal.precision()
+        ))
+    })?;
+    let scale = i8::try_from(decimal.scale()).map_err(|_| {
+        CodecError::invalid(format!(
+            "Decimal128 field {name:?} scale {} does not fit i8",
+            decimal.scale()
+        ))
+    })?;
+    if !valid_decimal128_parameters(precision, scale) {
+        return Err(CodecError::invalid(format!(
+            "Decimal128 field {name:?} has invalid precision {precision} and scale {scale}; precision must be 1..=38 and a positive scale cannot exceed precision"
+        )));
+    }
+    Ok(DataType::Decimal128(precision, scale))
 }
 
 fn parse_integer_type(field: IpcField<'_>) -> Result<DataType, CodecError> {

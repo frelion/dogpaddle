@@ -37,14 +37,16 @@ Sink 必须没有 output。一个 Definition 可以在不同 Flow 中绑定不�
 绑定必须是纯且确定的：相同持久化 tag、payload 和有序 input Schemas 必须得到相同语义。结果是
 短生命周期、只能消费一次的 `OperationBinding`，可携带 Schema 相关的已编译执行信息及最终
 materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceSource` 固定
-输出 `{ value: UInt64 non-null }`；Count 接受任意合法的单一输入并固定输出
+输出 `{ value: UInt64 non-null }`；`RunningEventCount` 接受任意合法的单一输入并固定输出
 `{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
 并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
 Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Select 从同一个原始输入计算有序的完整输出列；
-`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意合法的单一输入且没有 output。无需额外的
+`SchemaAlign` 从同一个原始输入计算有序字段，并显式声明名称、目标 nullability、Field metadata
+和 Schema metadata；`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意
+合法的单一输入且没有 output。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
-Filter、Extend 与 Select 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
+Filter、Extend、Select 与 `SchemaAlign` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
 [`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
 builder。需要按 Arrow 字段名逐字引用时使用 [`ident`]；[`col`] 保留 `DataFusion` 自身的大小写正规化和
 multipart identifier 解析规则。Definition 的 `try_new` 立即使用 `datafusion-proto` 编码 `Expr`，无法编码时返回构造错误；
@@ -55,29 +57,74 @@ Schema 交给 `DataFusion` `create_physical_expr`；表达式的字段解析、t
 运行期 `evaluate` 全部由 `DataFusion` 定义。该 API 假定 logical coercion 已完成，而本 crate 不运行
 logical/SQL planner，因此不会额外插入隐式 cast；混合类型表达式需要调用方显式 [`cast`]。binding 只保存 exact input Schema、physical expression 和
 派生 output 属性；open 从 protobuf 还原 `Expr` 后重新完成同一过程。DogPaddle 继续负责完整 Schema
-guard、Filter/Extend/Select 的 output Schema 约束，以及 records/diffs 的 Change 语义。
+guard、Filter/Extend/Select/SchemaAlign 的 output Schema 约束，以及 records/diffs 的 Change 语义。
 
 这份 protobuf 是版本绑定的持久格式，不承诺跨 `DataFusion` 版本兼容。工作区精确 pin 相互匹配的
 `DataFusion`、`datafusion-proto` 与 Arrow；升级必须审查 proto roundtrip、physical planning 和执行语义。
-若新版本不能兼容旧 payload，必须 bump 外层 Operation Definition tag/version 并重建 Flow，不在同一
-版本内猜测或迁移旧表达式。DataFusion 的采用不等于引入 SQL 层。
+当前仍是开发期格式；升级依赖后只维护新的 canonical payload 与证据，旧数据库直接删除并重建，
+不承诺兼容、猜测或迁移旧表达式。DataFusion 的采用不等于引入 SQL 层。
+
+### Arrow 类型边界
+
+Change v1 的稳定 Schema/IPC 传输集合现为 Null、Boolean、全部 8/16/32/64 位整数、Float32/64、
+Utf8、Binary、Date32、Timestamp、Decimal128、List 和 Struct。Timestamp 支持 Second、Millisecond、
+Microsecond、Nanosecond 四种单位与可选非空 timezone；Decimal128 precision 为 `1..=38`，正 scale
+不超过 precision，负 scale 按 Arrow 类型保留。`Change::try_new`、全量解码和被选择字段的投影解码
+还会递归要求每个 Decimal128 non-null slot 满足 `|unscaled| < 10^precision`；祖先 List/Struct null
+不豁免物理 non-null child，未选择字段不读取或验证 value。Project、UnionAll 及表达式直接列路径继续按 exact
+Schema 搬运这些字段，不能据此推导任意 `DataFusion` kernel 都已成为产品能力。
+
+Date32、Timestamp 与 Decimal128 在 Change 层拥有 Schema validation、完整/选择性 IPC、标准 Arrow
+reader 互操作、嵌套/投影和损坏拒绝。Operation 层进一步承诺一个精确纵向切片：Date32、无 timezone
+的 Millisecond Timestamp、`Decimal128(10, 2)` 可经 Project、Select 和 Extend 直接复制；
+`SchemaAlign` 覆盖这些直接列、nullability 放宽、Date32 → Int32、Timestamp(Millisecond) → Int64 和
+`Decimal128(10, 2)` → `Decimal128(12, 3)` 的显式 cast；Filter 覆盖三类字段与同类型 literal 的组合
+比较。三组公共测试都经过 Definition `encode → decode → re-encode → bind → materialize → turn`，
+并检查 buffer/diff/顺序。Flow 还覆盖
+`SequenceSource → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard`
+的 build、运行和两次 reopen。
+
+上述范围不承诺其他 Timestamp unit/timezone、跨类型转换、时间运算、Decimal 算术或舍入。
+LargeUtf8、LargeBinary、FixedSizeBinary 等尚未进入 Change v1，因而在统一 Schema guard 被明确拒绝，
+留给后续基于真实 workload 扩展。
+
+### 表达式能力状态
+
+能力按证据而不是按 `DataFusion` API 面积划分。这里的“已承诺”要求一个精确 operator/type 组合能
+canonical protobuf roundtrip、针对 exact input Schema bind、完成 scalar/array evaluate，并进入真实
+Operation 与 Flow 的 build/open/reopen 纵向证据；它不自动扩展到同一 operator 的其他 Arrow 类型组合。
+
+| 状态 | 当前范围 | 调用者应如何理解 |
+| --- | --- | --- |
+| 已承诺 | exact 列引用；Boolean 列作为 Filter predicate；`UInt64` 列与同类型 literal 的 equality；`UInt64 → Utf8` 显式 cast；以及上节精确列出的 Date32/Timestamp(Millisecond, no timezone)/Decimal128 direct-copy、同类型比较与 `SchemaAlign` cast 组合 | 只依赖这些已走通持久 Flow 的精确组合；混合类型仍由调用方显式 cast |
+| `DataFusion` 可规划、DogPaddle 未承诺 | 已有 Operation 级执行证据但尚无对应完整 Flow 纵向证据的 Boolean `and/or/not`、`is_null`、代表性 scalar/array `eq/not_eq`、整数加法与 `Utf8 → Int64` `try_cast`；只有 protobuf roundtrip 证据的 `is_not_null`；其他算术/比较、`between`/alias、内建函数、复杂嵌套表达式；未列出的 Timestamp unit/timezone、时间/Decimal 运算和其他 temporal/decimal cast | 当前 pin 上能构造、bind 甚至执行仍不构成持久产品契约；补齐精确 Flow build/open/reopen 证据后才能进入上一行 |
+| 明确拒绝 | 不能逐字 canonical protobuf roundtrip 的 Expr；缺失/歧义字段或 `DataFusion` 无法 physical-plan 的表达式；Filter 的非 Boolean 结果；隐式类型 coercion；`SchemaAlign` 的 nullable → non-null 收窄；运行期 input Schema 漂移 | 分别在 Definition 构造、纯 bind 或 turn 边界返回结构化错误，不创建资源或提交部分进展 |
+
+时间、随机、UDF、session variable 或外部 registry 依赖目前没有确定、可恢复的执行上下文，因此不在
+已承诺集合。当前实现若不能编码或规划会按上表拒绝；即使某个表达式碰巧能由固定版本 `DataFusion`
+规划，也仍属于“未承诺”，直到增加显式准入规则和完整持久化证据。
 
 ```rust
 use std::num::NonZeroU32;
 use arrow_schema::DataType;
 use dogpaddle_operation::{ScalarValue, cast, col, ident, lit, try_cast};
 use dogpaddle_operation::operation::transform::{
-    ExtendDefinition, FilterDefinition, SelectDefinition, UnionAllDefinition,
+    ExtendDefinition, FilterDefinition, SchemaAlignDefinition, SchemaAlignField,
+    SelectDefinition, UnionAllDefinition,
 };
 
 let is_seven = col("value").eq(lit(7_u64));
 let extend = ExtendDefinition::try_new("is_seven", is_seven.clone()).unwrap();
 let filter = FilterDefinition::try_new(is_seven).unwrap();
 let select = SelectDefinition::try_new([("value", col("value"))]).unwrap();
+let align = SchemaAlignDefinition::try_new([
+    SchemaAlignField::try_new("id", cast(col("value"), DataType::Int64), true).unwrap(),
+]).unwrap();
 let union = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
 assert_eq!(extend.field_name(), "is_seven");
 assert_eq!(filter.predicate(), extend.expression());
 assert_eq!(select.fields().len(), 1);
+assert_eq!(align.fields().len(), 1);
 assert_eq!(union.input_count().get(), 2);
 
 let typed_null = lit(ScalarValue::Utf8(None));
@@ -116,9 +163,44 @@ Store transaction 回滚的可观察副作用；外部 Sink 需要独立的幂�
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
 
+## 内建算子能力与 conformance
+
+下表是当前九个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
+`DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
+索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
+
+| 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据与性能 workload |
+| --- | --- | --- | --- | --- | --- | --- |
+| `SequenceSource` (`1`) | Source / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Idle` | `sequence_source.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` source body/commit |
+| `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow/rollback/reopen/重批；`operation_core` `RunningEventCount` body/commit、`flow_runtime` chain |
+| Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
+| Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
+| Extend (`6`) | Transform / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变，`Complete` | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
+| Select (`7`) | Transform / 1 | 同一原始 input 上的有序 `name + Expr` 完整输出 | 行序和 diff 不变；空 Select 保留行数；`Complete` | 无 | 直接列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、空/非空 runtime Schema guard、别名隔离、temporal/decimal 选择/重排、reopen/重批；Definition codec，无独立 turn benchmark |
+| `UnionAll` (`8`) | Transform / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序；`Complete` | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
+| `SchemaAlign` (`9`) | Transform / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数；`Complete` | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
+| Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime/rollback/reopen；`operation_core` Definition codec、Flow sink workload |
+
+所有九个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
+`tests/correctness/{codec,definition,runtime}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
+无建库副作用、资源名、build/open/reopen、运行期 Schema guard 和事务重放由
+`dogpaddle-flow/tests/correctness` 所有。`operation_core` 的 Definition codec 覆盖全部九个算子；直接
+turn body/durable commit 只测 `SequenceSource` 与 `RunningEventCount`。`flow_runtime` 测
+source/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
+不因此获得虚构的微基准。
+
+稳定字节入口位于 `tests/fixtures/v1/`：每个 tag 一个 Definition fixture，其中事件计数与对齐分别为
+`running_event_count_definition.hex`、`schema_align_explicit.hex`；前者冻结当前 tag `2`。九个 decoded
+golden 都会重新 bind；Filter、Extend、Select、UnionAll 与 `SchemaAlign` 的 golden 还会
+materialize/turn，其余算子的执行证据由 definition/runtime 分区独立覆盖。Flow manifest 的端到端基线为
+`dogpaddle-flow/tests/fixtures/v1/sequence_source_running_event_count_discard.hex`。这些文件名只帮助定位
+证据；契约仍由公共测试断言和上表语义定义。
+
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count、Project、Filter、Extend、Select 和 `UnionAll`，`sink` 包含
+的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 RunningEventCount、Project、Filter、
+Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
 Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
@@ -183,21 +265,25 @@ Schema bind 不接收输入，并固定完整 output Schema 为一个 non-null `
 
 它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
 
-## `operation::transform::Count`
+## `operation::transform::RunningEventCount`
 
-[`operation::transform::CountDefinition`] 要求一个输入。每成功推进一次，
-[`operation::transform::CountOperation`] 按输入行序计算事件数量：每一行恰好令直接持有的
+[`operation::transform::RunningEventCountDefinition`] 要求一个输入。每成功推进一次，
+[`operation::transform::RunningEventCountOperation`] 按输入行序计算事件数量：每一行恰好令直接持有的
 唯一字段 `Cell<u64>` 加一，输入 diff 的符号和数值不改变“一个有序事件”的计数。每个已处理输入行输出
 一个 non-null `UInt64` `count`，diff 固定为 `+1`；因此它是插入式的运行计数事件流，不是维护
 单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
-[`operation::transform::CountError::Overflow`]。Count 显式声明为携带一个输入的
+[`operation::transform::RunningEventCountError::Overflow`]。`RunningEventCount` 显式声明为携带一个输入的
 [`OperationKind::Transform`]；拓扑位置不会把它隐式变成 Sink，因此完整 Flow 必须把它连接到
 一个下游 Sink。
 
-Count 只声明 `count: Cell<u64>`。当前实现每个 turn 一次处理完整 Change，并返回
+`RunningEventCount` 只声明 `running_event_count.count: Cell<u64>`，当前 Definition tag 为 `2`，output
+字段为 `count`；公共 Rust API、逻辑 data 名与 Flow 路径同时采用清晰名称，资源为
+`station/{index:08x}/operation/running_event_count.count`。不提供旧名称 alias、旧资源 fallback 或
+迁移逻辑；旧版本创建的数据库直接删除并按当前 Definition 重建，不承诺或测试旧 manifest 的兼容
+行为。当前实现每个 turn 一次处理完整 Change，并返回
 `Action::Complete(Some(_))`；它在写状态前预检整批行数，若最终值无法用 `u64` 表示，则返回 overflow，
 整个 turn 不产生部分进展。协议允许其他 Operation 用声明的持久化状态在多个 `Commit` turn 中处理
-同一 Change，这不是 Count 必须采用的实现策略。
+同一 Change，这不是 `RunningEventCount` 必须采用的实现策略。
 
 Schema bind 接受任意合法的精确单一输入，并固定完整 output Schema 为一个 non-null `UInt64`
 `count` 字段。
@@ -252,14 +338,44 @@ Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability�
 顺序、类型和 nullability 由声明与 `DataFusion` 唯一决定，并保留 input Schema metadata。空 Select 合法，
 仍保留输入行数和 diff。
 
-[`operation::transform::SelectOperation`] 不声明 Store data，只保存编译后的表达式和 output Schema。
-每个 turn 一次求值所有列并返回 `Action::Complete(Some(_))`；直接列引用和 diff 与输入共享 Arrow buffer。
+[`operation::transform::SelectOperation`] 不声明 Store data，只保存 binding 的 exact input/output
+Schema 和编译后的表达式，并在任何表达式求值前检查 runtime input；因此空 Select
+也会以 [`operation::transform::SelectError::InputSchemaMismatch`] 拒绝 Schema drift，不会产生 output
+或持久写入。每个合法 turn 一次求值所有列并返回 `Action::Complete(Some(_))`；直接列引用和 diff
+与输入共享 Arrow buffer。
+
+## `operation::transform::SchemaAlign`
+
+[`operation::transform::SchemaAlignDefinition`] 是显式、可持久化的完整 Schema 重塑算子，要求一个
+输入。它接收有序 [`operation::transform::SchemaAlignField`]；每个目标字段独立声明名称、`Expr`、
+目标 nullability 与可选 Field metadata，Definition 另行声明完整 Schema metadata。每个表达式都
+绑定到同一个原始 input Schema，因此选择、改名和重排由字段顺序与列引用表达；空字段列表合法并
+保留输入行数和 diff。Field/Schema metadata 的输入顺序不影响按 key 排序的 canonical 编码；重复
+key 在构造期返回结构化错误，不采用 silent last-wins。tag 固定为 `9`。
+
+目标字段类型只由绑定后的表达式推导，不再保存第二份 `DataType` 真相。需要类型转换时，调用方必须
+在 Expr 中显式使用 [`cast`] 或 [`try_cast`]；`SchemaAlign` 不猜测转换，也不插入隐式 coercion。
+目标 nullability 可以等于表达式推导值，也可以把 non-null 显式放宽为 nullable；将 nullable 表达式
+声明为 non-null 会在纯 bind 阶段以
+[`operation::transform::SchemaAlignSchemaError::NullabilityNarrowing`] 拒绝。重复/保留字段名、保留
+metadata key 和其他非法 output Schema 继续由统一 `DogPaddle` Schema guard 拒绝。
+
+[`operation::transform::SchemaAlignOperation`] 不声明 Store data，只保存 exact-Schema-bound 表达式与
+input/output Schema。它在任何表达式求值前检查 runtime input，所以空 `SchemaAlign` 同样会以
+[`operation::transform::SchemaAlignError::InputSchemaMismatch`] 拒绝 Schema drift，不产生 output 或
+持久写入。每个合法 turn 计算完整 output，保持行序并共享 diff；直接列引用继续共享原
+`ArrayRef`，cast 等派生结果按 `DataFusion` 语义分配。它不排序、不去重、不 consolidation，也不修改
+diff。`UnionAll` 与未来 Join 仍然只接受 exact Schema；所有上层 API 若需要共同结构，都应显式插入
+`SchemaAlign` 或生成等价的已声明变换。
 
 ## `operation::transform::UnionAll`
 
 [`operation::transform::UnionAllDefinition`] 只接收非零 input count。bind 要求所有有序输入与 input 0
 具有完全相同的 logical Schema，并以该 Schema 作为 output；不做 cast、对齐或字段名推断。
-[`operation::transform::UnionAllOperation`] 不声明 Store data，按收到的端口原样 clone 完整 Change，
+[`operation::transform::UnionAllOperation`] 不声明 Store data，只保存 input count 与 binding 得到的
+exact common Schema；每个 turn 在转发前校验 runtime input，并以包含 port、expected 和 actual Schema
+的 [`operation::transform::UnionAllError::InputSchemaMismatch`] 拒绝漂移，不产生 output 或持久写入。
+合法输入按收到的端口原样 clone 完整 Change，
 因此保持该端口的行序、diff 和 Arrow buffer。它与 SQL `UNION ALL` 一样不定义跨输入顺序；端口间
 交织由 Station 统一调度，可随上游分批和可用性变化。需要业务级总序时应另建显式排序或 barrier 语义。
 
@@ -327,33 +443,61 @@ Definition 或提供回到 Definition 的 getter，也不再为每个算子增�
 逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE` 共同决定持久化 schema。
 derived input/output Schemas 不单独持久化；因此改变同一 tag/payload 对同一输入的绑定结果，或改变
 Schema 相关状态的 codec，仍是持久化 ABI 变化。Flow 根据声明创建实例，binding materialize 再按逻辑名
-取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，允许在不保留
-旧格式兼容层的前提下破坏性调整已有 tag 对应的 schema，但必须同步更新 decoder、黄金字节、
-资源布局和 reopen 测试；DataFusion Expr protobuf 的不兼容升级仍必须按上文 bump 外层 tag/version。
-格式稳定后，其他这类变化也需要新 tag、新版本或明确迁移。编码 tag 与
-decoder 表必须复用具体模块中的同一个 tag 常量。
+取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，可以直接调整
+当前 tag 对应的 schema，但必须同步更新当前 decoder、黄金字节、资源布局和 reopen 测试。旧数据库
+直接删除并重建，不维护旧版专用 decoder、迁移或兼容分支，也不测试旧库行为；未来若明确发布稳定格式，再另行
+定义版本政策。编码 tag 与 decoder 表必须复用具体模块中的同一个 tag 常量。
 
 声明使用普通静态 Rust 值表达，不引入 Slot、Assembler、Factory registry 或位置 ABI。只有在
 出现稳定且机械的声明样板后，才考虑用很薄的 `macro_rules!` 生成声明常量；宏不得生成算子
 主体、Schema bind、materialize、codec 或运行逻辑。
 
+### 新增算子 checklist
+
+一个新算子只有逐项关闭下面七类契约，才进入上面的能力表；“DataFusion/Arrow 已支持”或存在一个
+happy-path 单测都不能替代这些答案。
+
+- **语义**：写清 kind/arity、逐事件规则、diff/重复/顺序、跨端口顺序、稳定重批和同一 Change
+  跨 `Commit` 重放的不变量；维护关系状态时另行定义 weight、负前缀、overflow 与 zero cleanup。
+- **Schema**：定义有序 exact inputs 到唯一 output 的纯映射，覆盖每一种合法但不兼容输入的结构化
+  拒绝，以及 output/input 运行期 Schema drift 的整 turn 回滚。
+- **持久化**：分配唯一 tag，冻结 canonical payload/golden/truncation；声明完整逻辑 data 名、collection、
+  codec 与 `Small`/`Large`，证明 build/open/reopen 的精确资源布局。开发期破坏性变更直接更新当前
+  基线，删除旧数据库并重建，不留旧 API、旧版专用 decoder、资源名兼容分支或旧库行为测试。
+- **事务与 Action**：明确 `Idle`/`Commit`/`Complete`，证明 Operation state、output、cursor、active 和
+  reclaim 全旧或全新；错误、背压、commit 失败和 reopen 都不能多应用或跳过输入。
+- **内存与类型**：声明哪些列/diff 共享 buffer、哪些 kernel 分配；新增 Arrow 类型同步覆盖 Change
+  validation、full/projected IPC、标准 reader、malformed 与相关表达式/算子。
+- **公共证据**：在单一 `correctness` target 中提供 Definition roundtrip、bind/materialize/turn、错误、
+  rollback、重批和 reopen；Flow 组合根拥有纯失败无建库副作用、runtime guard 与资源装配证据。
+- **性能与文档**：只有真实 workload 需要独立 benchmark 时才增加稳定 Plan；否则接入现有组合
+  workload。同步 Rustdoc、crate README、根能力边界、`TESTING.md` 和路线图。
+
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖八个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
-以及 Project、Filter、Extend、Select、UnionAll 对合法但不兼容 Schema 的结构化拒绝；表达式测试覆盖 `DataFusion` protobuf
+Schema 测试覆盖九个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
+`SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
+SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续
+覆盖相同 guard 与既有 evaluate 语义；表达式测试覆盖 `DataFusion` protobuf
 编码失败、roundtrip 与精确版本 golden。runtime trace 统一覆盖完整 turn、commit、rollback、
 reopen、固定 output Schema/diff、Project/Extend/Select 零拷贝、UnionAll 多端口原样转发、Filter 的空/全量选择及覆盖
-Null/bitmap/fixed/variable/List/Struct 全部 v1 layout family 的部分选择、DataFusion
+Null/bitmap/fixed/variable/List/Struct 全部既有 layout family 的部分选择、DataFusion
 `create_physical_expr` 的 type/nullability、scalar/array evaluate 与 null 传播、
 携带混合 diff 的稳定重批和 Store 错误。Expression golden
-会经过 `decode → bind → materialize → turn` 检查 protobuf 到执行语义，而不仅是重编码。完整目录所有权、
+会经过 `decode → bind → materialize → turn` 检查 protobuf 到执行语义，而不仅是重编码。
+Date32、无 timezone 的 Millisecond Timestamp 与 `Decimal128(10, 2)` 另有三个公共纵向测试：结构
+direct-copy、`SchemaAlign` 精确 cast/nullability 和 Filter 组合比较都先执行
+`encode → decode → re-encode → bind → materialize → turn`，再断言 buffer、diff 与行序；这不扩大为
+其他 temporal/decimal 运算承诺。完整目录所有权、
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
-`operation_core` 是本 crate 唯一的 release benchmark，分别测 Definition encode/decode、活动事务
-内的一行 `turn` body，以及包含 begin、turn 和 durable commit 的完整事务。固定大小 Cell 的长稳
+`operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 覆盖全部九个内建
+算子；活动事务内的一行 `turn` body，以及包含 begin、turn 和 durable commit 的完整事务，只直接测
+`SequenceSource` 与 `RunningEventCount`。固定大小 Cell 的长稳
 归 Store 所有，因此当前不设置 Operation endurance。
 benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹，在 run plan 中声明
 稳定 series，并让 raw sample 只引用紧凑 case ID；统一 artifact 派生 `operations/s` 等人类统计，machine
@@ -361,7 +505,7 @@ consumer 可由 raw `elapsed_ns / operations` 无损派生 per-operation 耗时�
 `SampleStore`；`SampleStore` 在所属场景或 durable 样本校验后立即释放，
 不积累到 run root 最终 drop。
 相邻 `operation_core.plan.json` 由 `cargo xtask bench-plan-check` 在不创建 Store fixture 的情况下
-验证 smoke/reference 两档冻结 Plan。
+验证 smoke/reference 两档冻结 Plan；当前分别为 22 和 30 个 case。
 smoke 默认使用临时目录，正式回归必须选择 `reference` profile 并显式指定固定文件系统目录；
 环境变量和 typed JSONL 输出协议以根目录
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md) 为准。

@@ -38,9 +38,11 @@ pub struct SelectDefinition {
 
 /// Materialized exact-Schema-bound expression projection.
 ///
-/// This value owns only its compiled expressions and exact output Schema. It
-/// owns no persistent Store data and retains no Definition.
+/// This value owns only its exact input Schema, compiled expressions, and
+/// exact output Schema. It owns no persistent Store data and retains no
+/// Definition.
 pub struct SelectOperation {
+    input_schema: SchemaRef,
     expressions: Box<[BoundExpression]>,
     output_schema: SchemaRef,
 }
@@ -97,6 +99,9 @@ pub enum SelectError {
         /// Rejected zero-based port index.
         port: usize,
     },
+    /// Runtime input differs from the exact Schema used during binding.
+    #[error("select input schema differs from its bound schema")]
+    InputSchemaMismatch,
     /// One bound expression could not evaluate against the input batch.
     #[error("Select field {field} expression evaluation failed")]
     Expression {
@@ -189,11 +194,13 @@ impl SealedDefinition for SelectDefinition {
             output_fields,
             input_schema.metadata().clone(),
         ));
+        let materialized_input_schema = Arc::clone(input_schema);
         let materialized_schema = Arc::clone(&output_schema);
         Ok(OperationBinding::new(
             Some(output_schema),
             move |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
                 Ok(Box::new(SelectOperation {
+                    input_schema: materialized_input_schema,
                     expressions: expressions.into_boxed_slice(),
                     output_schema: materialized_schema,
                 }))
@@ -238,6 +245,9 @@ impl Operation for SelectOperation {
         let input = input.ok_or(SelectError::MissingInput)?;
         if input.port != 0 {
             return Err(SelectError::InvalidInputPort { port: input.port }.into());
+        }
+        if input.change.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(SelectError::InputSchemaMismatch.into());
         }
 
         let columns = self

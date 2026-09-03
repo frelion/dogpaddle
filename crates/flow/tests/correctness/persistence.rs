@@ -2,7 +2,8 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{
     AppendLog, Cell, OrderedMap, ReadTransactionAccess, Small, Store, StoreError,
@@ -12,8 +13,8 @@ use super::support::{
     build_source_sink_and_read_definition, fixture_bytes, read_published_definition,
 };
 
-const V1_SEQUENCE_COUNT_DISCARD: &str =
-    include_str!("../fixtures/v1/sequence_source_count_discard.hex");
+const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
+    include_str!("../fixtures/v1/sequence_source_running_event_count_discard.hex");
 
 #[derive(Clone, Copy)]
 enum ResourceFault {
@@ -29,7 +30,7 @@ fn build_publishes_the_stable_v1_definition_bytes() {
     build_chain(&path);
     assert_eq!(
         read_published_definition(&path),
-        fixture_bytes(V1_SEQUENCE_COUNT_DISCARD)
+        fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD)
     );
 }
 
@@ -45,6 +46,9 @@ fn build_uses_the_stable_resource_layout_and_input_origins() {
         store.open_data("station/00000001/state").unwrap(),
         store.open_data("station/00000002/state").unwrap(),
     ];
+    let _running_event_count: Cell<u64> = store
+        .open_data("station/00000001/operation/running_event_count.count")
+        .unwrap();
     assert!(matches!(
         store.open_data::<AppendLog<Vec<u8>>>("station/00000002/output"),
         Err(StoreError::DataNotFound(name)) if name == "station/00000002/output"
@@ -152,7 +156,7 @@ fn open_rejects_an_unpublished_build() {
 fn build_chain(path: &Path) {
     let mut builder = FlowFactory::new(path);
     let source = builder.station("source", SequenceSourceDefinition::new(7));
-    let count = builder.station("count", CountDefinition::new());
+    let count = builder.station("count", RunningEventCountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.connect([source], count);
     builder.connect([count], sink);

@@ -7,7 +7,8 @@ use std::{
 use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 
 const BENCHMARK: &str = "flow_lifecycle";
@@ -131,7 +132,10 @@ fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
     let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
     factory.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..station_count - 1 {
-        let current = factory.station(format!("count-{index:08x}"), CountDefinition::new());
+        let current = factory.station(
+            format!("count-{index:08x}"),
+            RunningEventCountDefinition::new(),
+        );
         factory.output_capacity_bytes(current, OUTPUT_CAPACITY_BYTES);
         factory.connect([previous], current);
         previous = current;

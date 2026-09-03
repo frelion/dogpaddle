@@ -6,6 +6,7 @@ use std::{
 use arrow_array::UInt64Array;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::metadata::FieldMetadata;
+use datafusion_expr::{Volatility, create_udf, placeholder};
 use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_operation::{
     DataDeclaration, DataInstances, Expr, ExpressionBindError, ExpressionDefinitionError,
@@ -16,9 +17,11 @@ use dogpaddle_operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
         transform::{
-            CountDefinition, ExtendDefinition, ExtendSchemaError, FilterDefinition,
-            FilterSchemaError, ProjectDefinition, ProjectSchemaError, SelectDefinition,
-            SelectSchemaError, UnionAllDefinition, UnionAllSchemaError,
+            ExtendDefinition, ExtendSchemaError, FilterDefinition, FilterSchemaError,
+            ProjectDefinition, ProjectSchemaError, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignField,
+            SchemaAlignFieldError, SchemaAlignSchemaError, SelectDefinition, SelectSchemaError,
+            UnionAllDefinition, UnionAllSchemaError,
         },
     },
     try_cast,
@@ -101,6 +104,10 @@ fn extend(field_name: &str, expression: Expr) -> ExtendDefinition {
     ExtendDefinition::try_new(field_name, expression).unwrap()
 }
 
+fn align(fields: impl IntoIterator<Item = SchemaAlignField>) -> SchemaAlignDefinition {
+    SchemaAlignDefinition::try_new(fields).unwrap()
+}
+
 #[test]
 fn definitions_expose_their_stable_public_contracts() {
     let source = SequenceSourceDefinition::new(42);
@@ -108,12 +115,12 @@ fn definitions_expose_their_stable_public_contracts() {
     assert_eq!(source.start(), 42);
     assert_eq!(names(&source), ["sequence_source.position"]);
 
-    let count = CountDefinition::new();
+    let count = RunningEventCountDefinition::new();
     assert_eq!(
         count.kind(),
         OperationKind::Transform(std::num::NonZeroU32::MIN)
     );
-    assert_eq!(names(&count), ["count"]);
+    assert_eq!(names(&count), ["running_event_count.count"]);
 
     let project = ProjectDefinition::new([0, 2]);
     assert_eq!(
@@ -158,6 +165,34 @@ fn definitions_expose_their_stable_public_contracts() {
     );
     assert!(names(&select).is_empty());
 
+    let align_expression = cast(col("id"), DataType::Int64);
+    let align_field = SchemaAlignField::try_new_with_metadata(
+        "renamed",
+        align_expression.clone(),
+        true,
+        HashMap::from([("role".to_owned(), "identifier".to_owned())]),
+    )
+    .unwrap();
+    let align = SchemaAlignDefinition::try_new_with_metadata(
+        [align_field],
+        HashMap::from([("owner".to_owned(), "test".to_owned())]),
+    )
+    .unwrap();
+    assert_eq!(
+        align.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::MIN)
+    );
+    let field = align.fields().next().unwrap();
+    assert_eq!(field.name(), "renamed");
+    assert_eq!(field.expression(), &align_expression);
+    assert!(field.is_nullable());
+    assert_eq!(
+        field.metadata().collect::<Vec<_>>(),
+        [("role", "identifier")]
+    );
+    assert_eq!(align.metadata().collect::<Vec<_>>(), [("owner", "test")]);
+    assert!(names(&align).is_empty());
+
     let union = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
     assert_eq!(
         union.kind(),
@@ -185,7 +220,7 @@ fn definitions_bind_their_complete_logical_schema_contracts() {
         DataType::Utf8,
         true,
     )]));
-    let count = CountDefinition::new();
+    let count = RunningEventCountDefinition::new();
     let count_binding = bind(&count, std::slice::from_ref(&arbitrary_input)).unwrap();
     assert_eq!(count_binding.output_schema(), Some(&count_schema()));
 
@@ -208,6 +243,31 @@ fn definitions_bind_their_complete_logical_schema_contracts() {
         Field::new("message_missing", DataType::Boolean, false),
     ]));
     assert_eq!(extend_binding.output_schema(), Some(&expected_extend));
+
+    let align = SchemaAlignDefinition::try_new_with_metadata(
+        [
+            SchemaAlignField::try_new_with_metadata(
+                "message_copy",
+                col("message"),
+                true,
+                HashMap::from([("meaning".to_owned(), "copied".to_owned())]),
+            )
+            .unwrap(),
+            SchemaAlignField::try_new("id_as_i64", cast(col("id"), DataType::Int64), true).unwrap(),
+        ],
+        HashMap::from([("aligned".to_owned(), "true".to_owned())]),
+    )
+    .unwrap();
+    let align_binding = bind(&align, std::slice::from_ref(&project_input)).unwrap();
+    let expected_align = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("message_copy", DataType::Utf8, true)
+                .with_metadata(HashMap::from([("meaning".to_owned(), "copied".to_owned())])),
+            Field::new("id_as_i64", DataType::Int64, true),
+        ],
+        HashMap::from([("aligned".to_owned(), "true".to_owned())]),
+    ));
+    assert_eq!(align_binding.output_schema(), Some(&expected_align));
 
     let discard = DiscardDefinition::new();
     assert!(
@@ -235,7 +295,7 @@ fn binding_rejects_wrong_arity_and_invalid_logical_input_schemas() {
         false,
     )]));
     assert!(matches!(
-        bind(&CountDefinition::new(), &[invalid]),
+        bind(&RunningEventCountDefinition::new(), &[invalid]),
         Err(OperationBindError::InvalidInputSchema { input: 0, .. })
     ));
 
@@ -310,6 +370,99 @@ fn expression_binding_delegates_planning_errors_and_enforces_filter_results() {
 }
 
 #[test]
+fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
+    let input = project_input_schema();
+    let missing = align([SchemaAlignField::try_new("missing", col("missing"), true).unwrap()]);
+    let Err(OperationBindError::Rejected { source }) = bind(&missing, std::slice::from_ref(&input))
+    else {
+        panic!("SchemaAlign missing-column expression unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SchemaAlignSchemaError>(),
+        Some(SchemaAlignSchemaError::Expression {
+            field: 0,
+            source: ExpressionBindError::DataFusion(_),
+        })
+    ));
+
+    let narrowed = align([SchemaAlignField::try_new("message", col("message"), false).unwrap()]);
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&narrowed, std::slice::from_ref(&input))
+    else {
+        panic!("SchemaAlign nullable-to-non-null field unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SchemaAlignSchemaError>(),
+        Some(SchemaAlignSchemaError::NullabilityNarrowing { field: 0 })
+    ));
+
+    let widened = align([SchemaAlignField::try_new("id", col("id"), true).unwrap()]);
+    assert!(
+        bind(&widened, std::slice::from_ref(&input))
+            .unwrap()
+            .output_schema()
+            .unwrap()
+            .field(0)
+            .is_nullable()
+    );
+
+    let duplicate = align([
+        SchemaAlignField::try_new("same", col("id"), false).unwrap(),
+        SchemaAlignField::try_new("same", col("score"), false).unwrap(),
+    ]);
+    assert!(matches!(
+        bind(&duplicate, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::DuplicateField { ref name, .. }
+        }) if name == "same"
+    ));
+
+    let reserved_metadata = SchemaAlignDefinition::try_new_with_metadata(
+        [SchemaAlignField::try_new("id", col("id"), false).unwrap()],
+        HashMap::from([("dogpaddle.private".to_owned(), "x".to_owned())]),
+    )
+    .unwrap();
+    assert!(matches!(
+        bind(&reserved_metadata, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::ReservedMetadataKey { ref key, .. }
+        }) if key == "dogpaddle.private"
+    ));
+}
+
+#[test]
+fn schema_align_rejects_duplicate_metadata_keys_at_construction() {
+    let field_error = SchemaAlignField::try_new_with_metadata(
+        "id",
+        col("id"),
+        false,
+        [
+            ("role".to_owned(), "first".to_owned()),
+            ("role".to_owned(), "second".to_owned()),
+        ],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        field_error,
+        SchemaAlignFieldError::DuplicateMetadataKey { ref key } if key == "role"
+    ));
+
+    let field = SchemaAlignField::try_new("id", col("id"), false).unwrap();
+    let definition_error = SchemaAlignDefinition::try_new_with_metadata(
+        [field],
+        [
+            ("owner".to_owned(), "first".to_owned()),
+            ("owner".to_owned(), "second".to_owned()),
+        ],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        definition_error,
+        SchemaAlignDefinitionError::DuplicateMetadataKey { ref key } if key == "owner"
+    ));
+}
+
+#[test]
 fn expression_constructors_accept_exactly_round_tripping_datafusion_exprs() {
     for expression in [
         lit(1_i32),
@@ -338,6 +491,43 @@ fn expression_constructor_rejects_a_non_round_tripping_datafusion_expr() {
     assert!(matches!(
         FilterDefinition::try_new(expression),
         Err(ExpressionDefinitionError::NonRoundTrip)
+    ));
+}
+
+#[test]
+fn expression_boundaries_reject_external_registry_variables_and_unbound_parameters() {
+    let external = create_udf(
+        "external_identity",
+        vec![DataType::UInt64],
+        DataType::UInt64,
+        Volatility::Volatile,
+        Arc::new(|arguments| Ok(arguments[0].clone())),
+    );
+    assert!(matches!(
+        FilterDefinition::try_new(external.call(vec![col("id")])),
+        Err(ExpressionDefinitionError::DataFusion(_))
+    ));
+
+    let variable = Expr::ScalarVariable(
+        Arc::new(Field::new("session.value", DataType::Utf8, true)),
+        vec!["session".to_owned(), "value".to_owned()],
+    );
+    assert!(matches!(
+        FilterDefinition::try_new(variable),
+        Err(ExpressionDefinitionError::DataFusion(_))
+    ));
+
+    let parameter = extend("parameter", placeholder("$1"));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&parameter, std::slice::from_ref(&project_input_schema()))
+    else {
+        panic!("unbound expression parameter unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<ExtendSchemaError>(),
+        Some(ExtendSchemaError::Expression(
+            ExpressionBindError::DataFusion(_)
+        ))
     ));
 }
 
@@ -526,7 +716,7 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
 
     let fixture = TestStore::new();
     let source_definition = SequenceSourceDefinition::new(42);
-    let count_definition = CountDefinition::new();
+    let running_event_count_definition = RunningEventCountDefinition::new();
     let project_definition = ProjectDefinition::new([0]);
     let discard_definition = DiscardDefinition::new();
 
@@ -534,7 +724,7 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     source_definition.data()[0]
         .create(&mut store, "source-position")
         .unwrap();
-    count_definition.data()[0]
+    running_event_count_definition.data()[0]
         .create(&mut store, "count")
         .unwrap();
     drop(store);
@@ -542,7 +732,12 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     let store = Store::open(fixture.path()).unwrap();
     let source_position = store.open_data::<Cell<u64>>("source-position").unwrap();
     let source = materialize(&source_definition, &[], &store, &["source-position"]);
-    let count = materialize(&count_definition, &[value_schema()], &store, &["count"]);
+    let count = materialize(
+        &running_event_count_definition,
+        &[value_schema()],
+        &store,
+        &["count"],
+    );
     let project = materialize(&project_definition, &[value_schema()], &store, &[]);
     let discard = materialize(&discard_definition, &[value_schema()], &store, &[]);
     let mut transactions = store.into_transactions();
@@ -576,7 +771,7 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
         )
         .unwrap()
     else {
-        panic!("materialized Count did not complete one input with output");
+        panic!("materialized RunningEventCount did not complete one input with output");
     };
     assert_eq!(count_output.num_rows(), 1);
     let Action::Complete(Some(project_output)) = project

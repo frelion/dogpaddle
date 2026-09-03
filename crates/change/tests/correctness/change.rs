@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, Int64Array, ListArray, RecordBatch, StructArray, UInt64Array,
+};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, ChangeError, decode_change, encode_change};
 
 use super::support::{
@@ -45,6 +49,127 @@ fn change_rejects_invalid_shape_and_accepts_the_complete_diff_range() {
 fn change_preserves_duplicates_event_order_and_negative_prefixes() {
     let expected = [(7, -1), (7, 1), (8, 2), (7, -1)];
     assert_eq!(events(&event_change(&expected)), expected);
+}
+
+#[test]
+fn change_validates_decimal128_values_against_precision_and_preserves_negative_scale() {
+    let valid = Decimal128Array::from(vec![Some(-99), Some(99), None])
+        .with_precision_and_scale(2, -2)
+        .unwrap();
+    assert!(decimal_change(Arc::new(valid)).is_ok());
+
+    for value in [-100, 100] {
+        let invalid = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(2, -2)
+            .unwrap();
+        assert!(matches!(
+            decimal_change(Arc::new(invalid)),
+            Err(ChangeError::InvalidDecimal128Value {
+                ref field,
+                index: 0,
+                value: actual,
+                precision: 2,
+                scale: -2,
+            }) if field == "amount" && actual == value
+        ));
+    }
+}
+
+#[test]
+fn decimal128_validation_uses_the_local_slice_and_physical_child_validity() {
+    let source = Arc::new(
+        Decimal128Array::from(vec![Some(100), Some(-99), Some(99), Some(-100)])
+            .with_precision_and_scale(2, 0)
+            .unwrap(),
+    ) as ArrayRef;
+    assert!(decimal_change(source.slice(1, 2)).is_ok());
+    assert!(matches!(
+        decimal_change(source.slice(1, 3)),
+        Err(ChangeError::InvalidDecimal128Value {
+            ref field,
+            index: 2,
+            value: -100,
+            precision: 2,
+            scale: 0,
+        }) if field == "amount"
+    ));
+
+    let item = Arc::new(Field::new("item", DataType::Decimal128(2, 0), false));
+    let list_source = Arc::new(ListArray::new(
+        Arc::clone(&item),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2, 3, 4])),
+        Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(1), Some(2), Some(-100)])
+                .with_precision_and_scale(2, 0)
+                .unwrap(),
+        ),
+        None,
+    )) as ArrayRef;
+    assert!(single_column_change("amounts", list_source.slice(1, 2)).is_ok());
+    assert!(matches!(
+        single_column_change("amounts", list_source.slice(1, 3)),
+        Err(ChangeError::InvalidDecimal128Value {
+            ref field,
+            index: 2,
+            value: -100,
+            precision: 2,
+            scale: 0,
+        }) if field == "amounts.item"
+    ));
+
+    let list = ListArray::new(
+        Arc::clone(&item),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2])),
+        Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(1)])
+                .with_precision_and_scale(2, 0)
+                .unwrap(),
+        ),
+        Some(NullBuffer::from(vec![false, true])),
+    );
+    let list_schema = Arc::new(Schema::new(vec![Field::new(
+        "amounts",
+        list.data_type().clone(),
+        true,
+    )]));
+    let list_records = RecordBatch::try_new(list_schema, vec![Arc::new(list)]).unwrap();
+    assert!(matches!(
+        Change::try_new(list_records, Int64Array::from(vec![1, 1])),
+        Err(ChangeError::InvalidDecimal128Value {
+            ref field,
+            index: 0,
+            value: 100,
+            precision: 2,
+            scale: 0,
+        }) if field == "amounts.item"
+    ));
+
+    let amount = Arc::new(Field::new("amount", DataType::Decimal128(2, 0), false));
+    let object = StructArray::new(
+        vec![Arc::clone(&amount)].into(),
+        vec![Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(1)])
+                .with_precision_and_scale(2, 0)
+                .unwrap(),
+        )],
+        Some(NullBuffer::from(vec![false, true])),
+    );
+    let object_schema = Arc::new(Schema::new(vec![Field::new(
+        "object",
+        object.data_type().clone(),
+        true,
+    )]));
+    let object_records = RecordBatch::try_new(object_schema, vec![Arc::new(object)]).unwrap();
+    assert!(matches!(
+        Change::try_new(object_records, Int64Array::from(vec![1, 1])),
+        Err(ChangeError::InvalidDecimal128Value {
+            ref field,
+            index: 0,
+            value: 100,
+            precision: 2,
+            scale: 0,
+        }) if field == "object.amount"
+    ));
 }
 
 #[test]
@@ -121,4 +246,19 @@ fn stable_rebatching_preserves_the_flattened_event_sequence() {
         assert_eq!(start, expected.len());
         assert_eq!(actual, expected);
     }
+}
+
+fn decimal_change(array: ArrayRef) -> Result<Change, ChangeError> {
+    single_column_change("amount", array)
+}
+
+fn single_column_change(name: &str, array: ArrayRef) -> Result<Change, ChangeError> {
+    let rows = array.len();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        name,
+        array.data_type().clone(),
+        true,
+    )]));
+    let records = RecordBatch::try_new(schema, vec![array]).unwrap();
+    Change::try_new(records, Int64Array::from(vec![1; rows]))
 }

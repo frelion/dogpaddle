@@ -34,10 +34,10 @@
 
 | 所有者 | 公共正确性重点 | benchmark target |
 | --- | --- | --- |
-| Change | Schema、Change、Projection、IPC golden/interop/malformed | `change_core`、`change_codec` |
+| Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | Definition 与 DataFusion Expr protobuf roundtrip、exact Schema bind/materialize、`create_physical_expr` 的 type/nullability 与 scalar/array evaluate、Project/Extend/Select 零拷贝、Filter 全部 Arrow v1 layout family/null/混合 diff 重批、UnionAll 多端口原样转发、状态 commit/rollback/reopen | `operation_core` |
-| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/UnionAll 拒绝无建库副作用与 reopen 重绑定、Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | 九个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp(ms)/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard、RunningEventCount 状态 commit/rollback/reopen | `operation_core` |
+| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp(ms)/Decimal128 完整结构/表达式链两次 reopen；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。
@@ -66,8 +66,33 @@
 Expression golden 直接冻结当前精确 pin 的 DataFusion Expr protobuf bytes，并继续经过
 `decode → exact Schema bind → materialize → turn`，验证 `create_physical_expr`、type/nullability 与
 scalar/array evaluate。该格式不承诺跨 DataFusion 版本兼容；升级 DataFusion、`datafusion-proto` 或
-Arrow 时必须重跑 proto roundtrip、build/open/reopen 和执行语义。若新版本不能兼容旧 payload，测试应随
-外层 Operation Definition tag/version 一起更新，并验证旧 Flow 被明确拒绝、重建后的 Flow 正常运行。
+Arrow 时必须更新当前 golden，并重跑 proto roundtrip、build/open/reopen 和执行语义。旧数据库直接
+删除并重建；测试不约束旧 payload 或旧 manifest 的行为。
+
+阶段 0/1 的算子 conformance 使用同一证据形状，不按算子复制测试框架：codec 分区冻结九个 tag、
+canonical payload 与损坏拒绝，definition 分区覆盖 kind/arity/data 和 exact Schema 成功/拒绝，runtime
+分区覆盖 Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖纯失败无目录副作用、
+稳定资源名、build/open/reopen 和运行期 Schema guard。RunningEventCount 的公共 API 与 data 资源名
+采用当前简化基线：Definition tag 为 `2`，逻辑 data 名为 `running_event_count.count`。不保留旧 API
+alias、资源路径 fallback 或迁移；正确性不约束旧库行为，只证明当前 golden、当前资源布局和当前
+数据库的 build/open/reopen，旧数据库直接删除后重建。
+
+SchemaAlign 的最低专用证据为 tag `9` golden、metadata canonical 编码与重复 key 构造拒绝、所有
+表达式绑定同一原始 input、显式 `cast`/`try_cast`、non-null → nullable 放宽、nullable → non-null 纯拒绝、空字段 output、
+直接列与 diff 共享，以及 Flow reopen。表达式断言必须标明“已承诺”“DataFusion 当前可规划但未承诺”
+或“明确拒绝”；只有第一类可以进入用户 API 能力。Date32/Timestamp/Decimal128 首先由 Change 的
+Schema/IPC/interop/malformed 轨道证明稳定传输；Operation 再用三个公共测试分别证明 direct-copy、
+SchemaAlign 精确 cast/nullability 与 Filter 组合比较，且每个都走
+`encode → decode → re-encode → bind → materialize → turn` 并核对 buffer/diff/顺序。Flow 组合根证明
+`source → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard` 在 build 与
+两次 reopen 后最终 count 为 `3`。这一承诺严格限于 Date32、无 timezone 的 Millisecond Timestamp、
+`Decimal128(10, 2)` 及测试中的 cast/comparison；其他时间/Decimal 运算、unit/timezone、舍入或 cast
+不能从中推导。
+
+Decimal128 value 证据独立于表达式算术：`Change::try_new`、full decode 和选中该字段的 projected
+decode 递归拒绝任意 non-null slot 的 `|unscaled| >= 10^precision`，包括被 null List/Struct 祖先
+遮蔽但物理存在的 non-null child；未选择字段的 value 不读取也不验证。测试同时覆盖顶层与嵌套、
+构造与 codec 错误，不把这条 representability invariant 扩展为舍入或算术语义。
 
 Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理
 原子性。上层只重复自己的协议阶段、对象组合和 reopen 义务，不为每个 crate 复制 SIGKILL harness。

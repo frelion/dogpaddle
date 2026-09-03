@@ -30,10 +30,17 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
 - **有序 Arrow 批量差分**：`dogpaddle-change` 提供 `Change = RecordBatch + Int64Array`，逐行绑定
   记录与非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
-  完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
-- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、零拷贝顶层 Project、
-  接收 DataFusion `Expr` 的 Filter、Extend 与多列表达式 Select、精确 Schema 的 UnionAll，以及无输出 Discard Sink。
-  Filter/Extend/Select 直接用 `datafusion-proto` 持久化表达式；build/open 通过 DataFusion
+  完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。稳定类型集合包含
+  Date32、四种时间单位且 timezone 为可选非空字符串的 Timestamp，以及 Decimal128；LargeUtf8、
+  LargeBinary、FixedSizeBinary 等尚未纳入 v1。`Change::try_new`、全量解码及被选择字段的投影解码会
+  递归验证每个 Decimal128 non-null slot 满足 `|unscaled| < 10^precision`；祖先 List/Struct 为 null
+  不豁免物理存在的 non-null child，未选择字段则不读取或验证 value。Operation/Flow 进一步验证了 Date32、无 timezone 的
+  Millisecond Timestamp 和 `Decimal128(10, 2)` 经结构算子、显式 cast、同类型组合比较及两次 reopen
+  的受限纵向路径；这不泛化为其他时间/Decimal 运算。
+- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 RunningEventCount、零拷贝顶层 Project、
+  接收 DataFusion `Expr` 的 Filter、Extend、多列表达式 Select 与显式 SchemaAlign、精确 Schema 的
+  UnionAll，以及无输出 Discard Sink。RunningEventCount 每观察一行事件加一，不按 diff 维护关系
+  cardinality；它不是 Aggregate。Filter/Extend/Select/SchemaAlign 直接用 `datafusion-proto` 持久化表达式；build/open 通过 DataFusion
   `create_physical_expr` 完成类型、nullability、cast 与向量化执行；当前不运行 logical coercion，混合类型需显式 cast。DogPaddle 不维护第二套
   表达式语言，也不因此引入 SQL 层。build/open 会先从 canonical Definition
   产生一次性的 Schema binding，再为有状态算子创建
@@ -92,7 +99,7 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 `Idle`/`Commit`/`Complete` action。只要尚未 `Complete`，下一 turn（包括 reopen
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
-表达式链路及 `SequenceSource → Select → UnionAll → Count → Discard` 多输入轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
+表达式链路及 `SequenceSource → Select → UnionAll → RunningEventCount → Discard` 多输入轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
 没有任何 consumer 的 output，per-output retained-byte 高水位会让缓慢 consumer 自然向上游传播
 背压。每个 output 在 build/open 时已经绑定一个精确 logical Schema；算子输出在编码前、持久化
 entry 在首次 intake 解码后还会再次校验，Schema 违例均不会提交本 turn 的状态或 cursor。
@@ -105,8 +112,18 @@ DataFusion 当前提供表达式 API、protobuf 和向量化执行；仓库仍�
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。
 
+算子路线的阶段 0/1 已落成当前基线：九个内建算子共用 Definition/bind/materialize/turn/reopen
+conformance，事件计数公共名明确为 RunningEventCount，SchemaAlign 显式表达选择、改名、重排、
+cast/nullability 与 metadata，Change 增加 Date32/Timestamp/Decimal128 传输证据，Operation/Flow
+增加上述精确 operator/type 纵向证据，并把表达式分成
+“已承诺、当前 DataFusion 可规划但未承诺、明确拒绝”三类。`RunningEventCount` 当前 tag 为 `2`，
+并使用新的公共 API、data 名与资源路径。不提供旧名称 alias、资源 fallback 或迁移；旧版本数据库
+直接删除并按当前基线重建，不承诺或测试旧 manifest 的兼容行为。阶段 2 及以后才处理真实 Ingress/Result/Materialize、
+关系状态、Aggregate、Join、时间语义和运行产品化；SQL 只是未来可选的上层适配器之一。
+
 ## 深入阅读
 
+- [算子与执行内核分阶段路线、语义边界与退出标准](OPERATOR_ROADMAP.md)
 - [Flow 构建、磁盘布局与当前边界](crates/flow/README.md)
 - [Arrow Change 与自描述 IPC Stream](crates/change/README.md)
 - [Operation Definition 与实例约束](crates/operation/README.md)

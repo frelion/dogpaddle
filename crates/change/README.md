@@ -38,10 +38,20 @@ assert_eq!(change.num_rows(), 2);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-当前递归支持 Null、Boolean、整数、Float32/Float64、Utf8、Binary、List 和 Struct；其他尚未
-定义稳定语义的 Arrow 类型会被拒绝。字段顺序、名称、类型、nullability 和 metadata 都属于
-Schema identity；同一 Schema 或 Struct 作用域内不允许重名，List/Struct 最多嵌套 60 层。
-`$dogpaddle.` 字段名和 `dogpaddle.` Schema/Field metadata key 是保留命名空间。
+当前递归支持 Null、Boolean、整数、Float32/Float64、Utf8、Binary、Date32、Timestamp、
+Decimal128、List 和 Struct；其他尚未定义稳定语义的 Arrow 类型会被拒绝。Timestamp 支持
+Second、Millisecond、Microsecond 和 Nanosecond 四种单位，并把可选 timezone 字符串原样作为
+Schema identity 保存；无时区使用 `None`，空 timezone 字符串因无法由 Arrow IPC 与 `None` 稳定
+区分而被拒绝，Change 层不解释其他时区内容。Decimal128 的 precision 必须在 1..=38，正
+scale 不能大于 precision，负 scale 依照 Arrow 类型契约保留；每个自身为 non-null 的物理
+Decimal128 slot，其 unscaled `i128` 必须严格位于 `(-10^precision, 10^precision)`。该检查递归进入
+List/Struct，并只看 Decimal child array 自己的局部 validity：祖先 List/Struct 为 null 不会豁免一个
+物理上仍为 non-null 的 child slot。Array 切片只审计当前局部 slice；List 进一步只审计当前 offsets
+首尾覆盖的 child 区间。Change 层不定义舍入或算术语义。
+
+字段顺序、名称、类型、nullability 和 metadata 都属于 Schema identity；同一 Schema 或 Struct
+作用域内不允许重名，List/Struct 最多嵌套 60 层。`$dogpaddle.` 字段名和 `dogpaddle.`
+Schema/Field metadata key 是保留命名空间。
 
 ## 投影
 
@@ -83,10 +93,13 @@ assert_eq!(in_memory.records(), from_ipc.records());
 
 内存投影只重组 Schema 和 `ArrayRef`，共享原 Arrow buffer。选择性 IPC 解码先校验内嵌 Schema、
 完整 framing，以及所有无需读取 payload 就能判断的 field node 和 buffer descriptor，再只复制
-并解码 diff 与所选字段；结果是普通 owned `Change`，不借用日志 entry 或事务。
+并解码 diff 与所选字段；如果所选 Decimal128 value buffer 的标准 IPC 8 字节对齐不足以满足
+Rust 原生 16 字节对齐，Arrow 会只为该 buffer 再建立一份对齐副本。结果是普通 owned `Change`，
+不借用日志 entry 或事务。
 
-未选字段的 descriptor 仍必须合法，但其 UTF-8 内容、List offsets 等值级约束不会被读取或
-验证；需要完整审计时使用 `decode_change`。投影减少 `Change` codec 对 Arrow body 的访问、
+未选字段的 descriptor 仍必须合法，但其 UTF-8 内容、List offsets、Decimal128 value precision 等
+值级约束不会被读取或验证；所选字段会递归验证这些约束，需要完整审计时使用 `decode_change`。
+投影减少 `Change` codec 对 Arrow body 的访问、
 解码和 owned allocation，不改变写入内容、entry 大小或 `ScanLimit` 计费，也不保证 MDBX、
 操作系统或存储设备产生字段级物理 I/O。
 

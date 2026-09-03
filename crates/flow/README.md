@@ -20,7 +20,10 @@ use dogpaddle_operation::{
     col, lit,
     operation::sink::DiscardDefinition,
     operation::source::SequenceSourceDefinition,
-    operation::transform::{CountDefinition, ExtendDefinition, FilterDefinition},
+    operation::transform::{
+        ExtendDefinition, FilterDefinition, RunningEventCountDefinition,
+        SchemaAlignDefinition, SchemaAlignField,
+    },
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,27 +39,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "filter",
         FilterDefinition::try_new(col("is_seven"))?,
     );
-    let count = factory.station("count", CountDefinition::new());
+    let align = factory.station(
+        "align",
+        SchemaAlignDefinition::try_new([
+            SchemaAlignField::try_new("event", col("value"), true)?,
+        ])?,
+    );
+    let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     let capacity = NonZeroU64::new(64 * 1024 * 1024).unwrap();
     factory.output_capacity_bytes(source, capacity);
     factory.output_capacity_bytes(extend, capacity);
     factory.output_capacity_bytes(filter, capacity);
+    factory.output_capacity_bytes(align, capacity);
     factory.output_capacity_bytes(count, capacity);
     factory.connect([source], extend);
     factory.connect([extend], filter);
-    factory.connect([filter], count);
+    factory.connect([filter], align);
+    factory.connect([align], count);
     factory.connect([count], sink);
 
     let flow = factory.build()?;
     assert_eq!(
         flow.station_ids().collect::<Vec<_>>(),
-        ["source", "extend", "filter", "count", "sink"]
+        ["source", "extend", "filter", "align", "count", "sink"]
     );
     drop(flow);
 
     let reopened = FlowFactory::open(&path)?;
-    assert_eq!(reopened.station_count(), 5);
+    assert_eq!(reopened.station_count(), 6);
     Ok(())
 }
 ```
@@ -72,11 +83,26 @@ output capacity，outputless Station 不得声明；重复、遗漏、类别不�
 Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
 编码失败都不会创建目标目录。
 
-Filter/Extend/Select 的 Definition 在 `station()` 之前已通过 fallible `try_new` 将 `DataFusion` `Expr` 编码为
+Filter/Extend/Select/`SchemaAlign` 的 Definition 在 `station()` 之前已通过 fallible 构造入口将
+`DataFusion` `Expr` 编码为
 `DataFusion` protobuf；无法编码的表达式直接作为构造错误返回。表达式的字段解析、type、nullability、
 cast 和 `PhysicalExpr` 创建留在上述全图 bind 阶段，由 `DataFusion` 完成。`create_physical_expr` 假定
 logical coercion 已完成，而 Flow 不运行 logical/SQL planner，因此混合类型需要调用方显式 cast；失败同样不会创建
-目标目录。Project 仍使用严格递增的顶层字段索引；UnionAll 只要求其所有输入具有完全相同的 Schema。
+目标目录。`SchemaAlign` 的每个目标字段显式声明名称、Expr、目标 nullability 与 Field metadata，并
+显式声明 Schema metadata；metadata 输入顺序不影响 canonical 编码，重复 key 在构造期拒绝。字段类型
+只从 Expr 推导，nullable → non-null 收窄在纯 bind 阶段拒绝。
+Project 仍使用严格递增的顶层字段索引；UnionAll 只要求其所有输入具有完全相同的 Schema，不执行
+隐式对齐。
+
+Change v1 现可稳定承载 Date32、四种单位且 timezone 为可选非空字符串的 Timestamp，以及 precision
+`1..=38` 的 Decimal128。Change 构造、全量解码和被选择字段的投影解码递归验证每个 Decimal128
+non-null slot 的 `|unscaled| < 10^precision`；祖先 List/Struct null 不豁免物理 non-null child，
+未选择字段不读取或验证 value。Operation/Flow 已有一个受限纵向证据：Date32、无 timezone 的 Millisecond
+Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Select、Extend、Filter 同类型
+组合比较与 `RunningEventCount` 到 Discard；真实 Flow 在 build 后运行，并跨两次 reopen 继续得到
+最终 count `3`。这不承诺其他 Timestamp unit/timezone、时间/Decimal 运算、舍入或任意跨类型 cast。
+已承诺/当前版本可规划但未承诺/明确拒绝的表达式矩阵以
+[`dogpaddle-operation`](../operation/README.md#表达式能力状态) 为准。
 
 ## 持久化边界
 
@@ -101,10 +127,10 @@ Cell。每个 output capacity 直接保存在 Flow Definition 中；build/open �
 `Output` capability，不创建另一份 Station state。端口 Schema 一致性不依赖 Change codec 之外的
 Schema resource、fingerprint 或 registry：持久化 Definition 加上有序上游 Schema 在 reopen 时
 确定性重建同一 binding。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
-Filter/Extend/Select 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
+Filter/Extend/Select/`SchemaAlign` 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
 build/open 都从 protobuf 还原 `Expr`，并针对 exact input Schema 重新调用 `create_physical_expr`。
-`DataFusion` 依赖与 Arrow 精确 pin；跨 `DataFusion` 版本不保证读取兼容，不兼容升级必须 bump 外层
-Operation Definition tag/version 并重建 Flow。
+`DataFusion` 依赖与 Arrow 精确 pin；跨 `DataFusion` 版本不保证读取兼容。不兼容升级只更新当前
+Operation Definition 基线并重建 Flow；旧数据库直接删除，不承诺兼容或迁移旧 payload。
 
 Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所有权时以 consuming `split`
 显式获得同环境的 `ReadTransactions`，Flow 长期持有返回的读写两种能力。`ReadTransactions` 不可
@@ -214,16 +240,17 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 - Station input cursor key：`input/{input_index:08x}/cursor`
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
-- Count 状态：`station/{index:08x}/operation/count`
-- Project、Filter、Extend、Select 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
+- `RunningEventCount` 状态：`station/{index:08x}/operation/running_event_count.count`
+- Project、Filter、Extend、Select、`SchemaAlign` 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
-当前仍是开发期 v1；output capacity 直接成为新的 v1 Station Definition 布局，不解码旧布局。
+当前仍是开发期 v1；output capacity 直接属于当前 Station Definition 布局。
 derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有序 input Schemas 的绑定语义
-属于 reopen ABI。编码、tag、绑定语义或资源布局可以破坏性调整，但每次调整必须同步更新黄金字节、布局
-和 reopen 测试，不保留旧格式兼容层。`DataFusion` `Expr` protobuf 的不兼容升级必须明确 bump 外层
-Operation Definition tag/version，并要求重建 Flow。
+属于 reopen ABI。`RunningEventCount` 当前 tag 为 `2`，并使用新的 API、逻辑 data 名与资源路径。
+不提供旧名称 alias、资源路径 fallback 或迁移；旧数据库直接删除并按当前 Definition
+重建。编码、tag、绑定语义或资源布局可以在开发期直接调整，但每次调整必须同步更新当前黄金字节、
+布局和 reopen 测试。`DataFusion` `Expr` protobuf 的不兼容升级同样只更新当前基线并重建数据库。
 
 ## 源码边界
 
@@ -245,13 +272,14 @@ state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和�
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实表达式链路与 `SequenceSource → Select → UnionAll → Count → Discard` 多输入 DAG 可以按拓扑逐轮推进并在 reopen
+`Flow::advance`，真实表达式链路与 `SequenceSource → Select → UnionAll → RunningEventCount → Discard`
+多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 Count
+intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
-`DataFusion` 集成目前止于 Filter/Extend/Select 的 `Expr` protobuf、physical expression planning 与向量化执行，
+`DataFusion` 集成目前止于 Filter/Extend/Select/`SchemaAlign` 的 `Expr` protobuf、physical expression planning 与向量化执行，
 不提供 SQL planner、catalog 或任意 `DataFusion` logical/physical plan 的 Flow 映射。
 
 ## 验证
@@ -267,7 +295,7 @@ cargo bench -p dogpaddle-flow --bench flow_runtime
 
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
 `open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
-或运行时吞吐。`flow_runtime` 则测预先构建的 source/sink、Count chain、fan-out 和 capacity-pressure
+或运行时吞吐。`flow_runtime` 则测预先构建的 source/sink、`RunningEventCount` chain、fan-out 和 capacity-pressure
 Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。`run` plan 保存静态 work counts，
 machine sample 只保留总 `elapsed_ns` 和 raw `round_latencies_ns`；统一 reporter 从这些 raw
 值重建 round p50/p95/p99，以及 advances/s、committed Station turns/s 和 input completions/s。

@@ -41,9 +41,7 @@ fn schema_rejects_representative_types_outside_the_v1_subset() {
         DataType::LargeUtf8,
         DataType::LargeBinary,
         DataType::FixedSizeBinary(16),
-        DataType::Date32,
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
-        DataType::Decimal128(10, 2),
+        DataType::Date64,
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
     ];
 
@@ -57,6 +55,63 @@ fn schema_rejects_representative_types_outside_the_v1_subset() {
             }) if field == "value" && rejected == data_type
         ));
     }
+}
+
+#[test]
+fn schema_accepts_date32_all_timestamp_units_and_valid_decimal128_parameters() {
+    let supported = [
+        DataType::Date32,
+        DataType::Timestamp(TimeUnit::Second, None),
+        DataType::Timestamp(TimeUnit::Millisecond, Some("+08:00".into())),
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("America/Los_Angeles".into())),
+        DataType::Decimal128(1, 0),
+        DataType::Decimal128(38, 38),
+        DataType::Decimal128(38, -128),
+    ];
+
+    for data_type in supported {
+        let schema = Schema::new(vec![Field::new("value", data_type, true)]);
+        assert_eq!(validate_schema(&schema), Ok(()));
+    }
+}
+
+#[test]
+fn schema_rejects_invalid_decimal128_parameters_at_the_exact_nested_path() {
+    for (precision, scale) in [(0, 0), (39, 0), (2, 3)] {
+        let schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Decimal128(precision, scale),
+                true,
+            ))),
+            true,
+        )]);
+        assert!(matches!(
+            validate_schema(&schema),
+            Err(SchemaError::InvalidDecimal128 {
+                field,
+                precision: rejected_precision,
+                scale: rejected_scale,
+            }) if field == "items.item"
+                && rejected_precision == precision
+                && rejected_scale == scale
+        ));
+    }
+}
+
+#[test]
+fn schema_rejects_an_empty_timestamp_timezone_without_normalizing_identity() {
+    let schema = Schema::new(vec![Field::new(
+        "occurred_at",
+        DataType::Timestamp(TimeUnit::Millisecond, Some("".into())),
+        true,
+    )]);
+    assert!(matches!(
+        validate_schema(&schema),
+        Err(SchemaError::EmptyTimestampTimezone { field }) if field == "occurred_at"
+    ));
 }
 
 #[test]

@@ -5,7 +5,7 @@ use dogpaddle_operation::{
     operation::{
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
-        transform::{CountDefinition, UnionAllDefinition},
+        transform::{RunningEventCountDefinition, UnionAllDefinition},
     },
 };
 use dogpaddle_store::StoreError;
@@ -26,8 +26,8 @@ fn source(start: u64) -> SequenceSourceDefinition {
     SequenceSourceDefinition::new(start)
 }
 
-fn count() -> CountDefinition {
-    CountDefinition::new()
+fn count() -> RunningEventCountDefinition {
+    RunningEventCountDefinition::new()
 }
 
 fn discard() -> DiscardDefinition {

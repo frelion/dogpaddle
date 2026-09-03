@@ -1,18 +1,22 @@
 //! Definition codec and persistent Operation-turn benchmark protocol.
 
-use std::{hint::black_box, path::Path, sync::Arc, time::Duration};
+use std::{hint::black_box, num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_bench_protocol::{BenchmarkProfile, CaseId, Plan, Run};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, decode_definition, encode_definition,
+    OperationDefinition, col, decode_definition, encode_definition, lit,
     operation::{
         Operation, OperationInput,
         sink::DiscardDefinition,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
-        transform::{CountDefinition, CountOperation},
+        transform::{
+            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
+            RunningEventCountOperation, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
+        },
     },
 };
 use dogpaddle_store::{Cell, Store, Transactions};
@@ -24,10 +28,10 @@ mod support;
 const BENCHMARK: &str = "operation_core";
 const SEQUENCE_START: u64 = 1_000_000;
 
-struct CountFixture {
+struct RunningEventCountFixture {
     transactions: Transactions,
     state: Cell<u64>,
-    operation: CountOperation,
+    operation: RunningEventCountOperation,
     input: Change,
     expected: Option<u64>,
 }
@@ -40,26 +44,26 @@ struct SequenceFixture {
 }
 
 struct CodecPlan {
-    operation: &'static str,
+    definition: Box<dyn OperationDefinition>,
     encode: CaseId,
     decode: CaseId,
 }
 
 struct TurnPlan {
     turns: usize,
-    count_body: CaseId,
+    running_event_count_body: CaseId,
     sequence_body: CaseId,
-    count_durable: CaseId,
+    running_event_count_durable: CaseId,
     sequence_durable: CaseId,
 }
 
-impl CountFixture {
+impl RunningEventCountFixture {
     fn create(path: &Path) -> Self {
-        let mut store = Store::create(path).expect("create Count benchmark store");
+        let mut store = Store::create(path).expect("create RunningEventCount benchmark store");
         let state = store
-            .create_data::<Cell<u64>>("count")
-            .expect("create Count benchmark state");
-        let operation = CountOperation::new(state.clone());
+            .create_data::<Cell<u64>>("running_event_count.count")
+            .expect("create RunningEventCount benchmark state");
+        let operation = RunningEventCountOperation::new(state.clone());
         Self {
             transactions: store.into_transactions(),
             state,
@@ -73,18 +77,18 @@ impl CountFixture {
         let transaction = self
             .transactions
             .begin()
-            .expect("begin Count validation transaction");
+            .expect("begin RunningEventCount validation transaction");
         let access = transaction.access();
         let actual = self
             .state
             .access(access)
-            .expect("access Count state for validation")
+            .expect("access RunningEventCount state for validation")
             .get()
-            .expect("read Count state for validation");
+            .expect("read RunningEventCount state for validation");
         assert_eq!(actual, self.expected);
         transaction
             .commit()
-            .expect("commit Count validation transaction");
+            .expect("commit RunningEventCount validation transaction");
     }
 }
 
@@ -125,10 +129,10 @@ fn main() {
     let profile = BenchmarkProfile::from_environment();
     let config = Config::for_profile(profile);
     let mut plan = Plan::new(profile, config.fields());
-    let codec = ["count", "discard", "sequence"]
+    let codec = codec_definitions()
         .into_iter()
-        .map(|operation| CodecPlan {
-            operation,
+        .map(|(operation, definition)| CodecPlan {
+            definition,
             encode: plan.case(case(
                 operation,
                 "definition_encode",
@@ -152,8 +156,8 @@ fn main() {
         .iter()
         .map(|&turns| TurnPlan {
             turns,
-            count_body: plan.case(case(
-                "count",
+            running_event_count_body: plan.case(case(
+                "running_event_count",
                 "turn_rollback_body",
                 operation_count(turns, config.body_transactions),
                 config.body_transactions,
@@ -168,8 +172,8 @@ fn main() {
                 turns,
                 config.samples,
             )),
-            count_durable: plan.case(case(
-                "count",
+            running_event_count_durable: plan.case(case(
+                "running_event_count",
                 "turn_durable_transaction",
                 operation_count(turns, config.durable_transactions),
                 config.durable_transactions,
@@ -193,9 +197,19 @@ fn main() {
     }
     benchmark_definition_codec(&config, &codec, &mut run);
     for planned in turns {
-        benchmark_count_body(&config, &mut run, planned.turns, planned.count_body);
+        benchmark_running_event_count_body(
+            &config,
+            &mut run,
+            planned.turns,
+            planned.running_event_count_body,
+        );
         benchmark_sequence_body(&config, &mut run, planned.turns, planned.sequence_body);
-        benchmark_count_durable(&config, &mut run, planned.turns, planned.count_durable);
+        benchmark_running_event_count_durable(
+            &config,
+            &mut run,
+            planned.turns,
+            planned.running_event_count_durable,
+        );
         benchmark_sequence_durable(&config, &mut run, planned.turns, planned.sequence_durable);
     }
     assert!(
@@ -209,26 +223,19 @@ fn main() {
 }
 
 fn benchmark_definition_codec(config: &Config, plan: &[CodecPlan], run: &mut Run) {
-    let definitions: [(&str, Box<dyn OperationDefinition>); 3] = [
-        ("count", Box::new(CountDefinition::new())),
-        ("discard", Box::new(DiscardDefinition::new())),
-        (
-            "sequence",
-            Box::new(SequenceSourceDefinition::new(SEQUENCE_START)),
-        ),
-    ];
-
-    for ((operation, definition), planned) in definitions.into_iter().zip(plan) {
-        assert_eq!(operation, planned.operation);
-        let encoded = encode_definition(definition.as_ref());
+    for planned in plan {
+        let encoded = encode_definition(planned.definition.as_ref());
         assert_eq!(
             encode_definition(decode_definition(&encoded).unwrap().as_ref()),
             encoded
         );
 
-        measure_encode(definition.as_ref(), config.codec_warmup_operations());
+        measure_encode(
+            planned.definition.as_ref(),
+            config.codec_warmup_operations(),
+        );
         let durations = (0..config.samples)
-            .map(|_| measure_encode(definition.as_ref(), config.codec_operations))
+            .map(|_| measure_encode(planned.definition.as_ref(), config.codec_operations))
             .collect();
         record(run, planned.encode, durations);
 
@@ -240,12 +247,55 @@ fn benchmark_definition_codec(config: &Config, plan: &[CodecPlan], run: &mut Run
     }
 }
 
-fn benchmark_count_body(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
-    let sample_store = SampleStore::new(run, &format!("count-body-{turns}"));
-    let mut fixture = CountFixture::create(sample_store.path());
-    measure_count_body(&mut fixture, turns, config.warmup_transactions);
+fn codec_definitions() -> [(&'static str, Box<dyn OperationDefinition>); 9] {
+    [
+        ("discard", Box::new(DiscardDefinition::new())),
+        (
+            "extend",
+            Box::new(ExtendDefinition::try_new("copy", col("input")).unwrap()),
+        ),
+        (
+            "filter",
+            Box::new(FilterDefinition::try_new(col("input").eq(lit(0_u64))).unwrap()),
+        ),
+        ("project", Box::new(ProjectDefinition::new([0]))),
+        (
+            "running_event_count",
+            Box::new(RunningEventCountDefinition::new()),
+        ),
+        (
+            "schema_align",
+            Box::new(
+                SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
+                    "copy",
+                    col("input"),
+                    false,
+                )
+                .unwrap()])
+                .unwrap(),
+            ),
+        ),
+        (
+            "select",
+            Box::new(SelectDefinition::try_new([("copy", col("input"))]).unwrap()),
+        ),
+        (
+            "sequence",
+            Box::new(SequenceSourceDefinition::new(SEQUENCE_START)),
+        ),
+        (
+            "union_all",
+            Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        ),
+    ]
+}
+
+fn benchmark_running_event_count_body(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
+    let sample_store = SampleStore::new(run, &format!("running-event-count-body-{turns}"));
+    let mut fixture = RunningEventCountFixture::create(sample_store.path());
+    measure_running_event_count_body(&mut fixture, turns, config.warmup_transactions);
     let durations = (0..config.samples)
-        .map(|_| measure_count_body(&mut fixture, turns, config.body_transactions))
+        .map(|_| measure_running_event_count_body(&mut fixture, turns, config.body_transactions))
         .collect();
     record(run, case, durations);
 }
@@ -260,18 +310,26 @@ fn benchmark_sequence_body(config: &Config, run: &mut Run, turns: usize, case: C
     record(run, case, durations);
 }
 
-fn benchmark_count_durable(config: &Config, run: &mut Run, turns: usize, case: CaseId) {
+fn benchmark_running_event_count_durable(
+    config: &Config,
+    run: &mut Run,
+    turns: usize,
+    case: CaseId,
+) {
     {
-        let warmup_store = SampleStore::new(run, &format!("count-durable-{turns}-warmup"));
-        let mut warmup = CountFixture::create(warmup_store.path());
-        measure_count_durable(&mut warmup, turns, config.warmup_transactions);
+        let warmup_store =
+            SampleStore::new(run, &format!("running-event-count-durable-{turns}-warmup"));
+        let mut warmup = RunningEventCountFixture::create(warmup_store.path());
+        measure_running_event_count_durable(&mut warmup, turns, config.warmup_transactions);
     }
     let durations = (0..config.samples)
         .map(|sample| {
-            let sample_store =
-                SampleStore::new(run, &format!("count-durable-{turns}-sample-{sample}"));
-            let mut fixture = CountFixture::create(sample_store.path());
-            measure_count_durable(&mut fixture, turns, config.durable_transactions)
+            let sample_store = SampleStore::new(
+                run,
+                &format!("running-event-count-durable-{turns}-sample-{sample}"),
+            );
+            let mut fixture = RunningEventCountFixture::create(sample_store.path());
+            measure_running_event_count_durable(&mut fixture, turns, config.durable_transactions)
         })
         .collect();
     record(run, case, durations);
@@ -331,13 +389,17 @@ fn definition_signature(definition: &dyn OperationDefinition) -> usize {
         .wrapping_add(definition.data().len())
 }
 
-fn measure_count_body(fixture: &mut CountFixture, turns: usize, transactions: usize) -> Duration {
+fn measure_running_event_count_body(
+    fixture: &mut RunningEventCountFixture,
+    turns: usize,
+    transactions: usize,
+) -> Duration {
     let mut total = Duration::ZERO;
     for _ in 0..transactions {
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin Count rollback transaction");
+            .expect("begin RunningEventCount rollback transaction");
         let access = transaction.access();
         let input = OperationInput {
             port: 0,
@@ -349,7 +411,7 @@ fn measure_count_body(fixture: &mut CountFixture, turns: usize, transactions: us
                 fixture
                     .operation
                     .turn(Some(input), access)
-                    .expect("run Count rollback workload"),
+                    .expect("run RunningEventCount rollback workload"),
             );
         }
         let elapsed = started.elapsed();
@@ -389,8 +451,8 @@ fn measure_sequence_body(
     total
 }
 
-fn measure_count_durable(
-    fixture: &mut CountFixture,
+fn measure_running_event_count_durable(
+    fixture: &mut RunningEventCountFixture,
     turns: usize,
     transactions: usize,
 ) -> Duration {
@@ -400,7 +462,7 @@ fn measure_count_durable(
         let transaction = fixture
             .transactions
             .begin()
-            .expect("begin Count durable transaction");
+            .expect("begin RunningEventCount durable transaction");
         let access = transaction.access();
         let input = OperationInput {
             port: 0,
@@ -411,19 +473,19 @@ fn measure_count_durable(
                 fixture
                     .operation
                     .turn(Some(input), access)
-                    .expect("run Count durable workload"),
+                    .expect("run RunningEventCount durable workload"),
             );
         }
         transaction
             .commit()
-            .expect("commit Count durable transaction");
+            .expect("commit RunningEventCount durable transaction");
     }
     let elapsed = started.elapsed();
     let expected = fixture
         .expected
         .unwrap_or_default()
         .checked_add(u64::try_from(operations).expect("operation count fits u64"))
-        .expect("Count durable fixture does not overflow");
+        .expect("RunningEventCount durable fixture does not overflow");
     fixture.expected = Some(expected);
     fixture.validate();
     elapsed
@@ -480,8 +542,9 @@ fn one_row_change() -> Change {
         false,
     )]));
     let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![0]))])
-        .expect("build Count benchmark input batch");
-    Change::try_new(records, Int64Array::from(vec![1])).expect("build Count benchmark input Change")
+        .expect("build RunningEventCount benchmark input batch");
+    Change::try_new(records, Int64Array::from(vec![1]))
+        .expect("build RunningEventCount benchmark input Change")
 }
 
 fn operation_count(turns: usize, transactions: usize) -> usize {

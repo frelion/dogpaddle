@@ -84,9 +84,13 @@ fn decode_record_batch(
     schema: SchemaRef,
 ) -> Result<RecordBatch, CodecError> {
     let dictionaries = HashMap::<i64, ArrayRef>::new();
+    // IPC guarantees eight-byte alignment, while Decimal128 has a sixteen-byte
+    // native alignment on supported Rust targets. Let Arrow copy only a
+    // selected buffer whose IPC offset is insufficiently aligned; all already
+    // aligned buffers remain shared with `body` and validation stays enabled.
     Ok(
         RecordBatchDecoder::try_new(body, batch, schema, &dictionaries, &MetadataVersion::V5)?
-            .with_require_alignment(true)
+            .with_require_alignment(false)
             .read_record_batch()?,
     )
 }

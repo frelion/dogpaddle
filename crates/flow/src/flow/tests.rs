@@ -1,7 +1,8 @@
 use std::num::NonZeroU64;
 
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, Store};
 
@@ -12,8 +13,8 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let first_target = builder.station("first-target", CountDefinition::new());
-    let second_target = builder.station("second-target", CountDefinition::new());
+    let first_target = builder.station("first-target", RunningEventCountDefinition::new());
+    let second_target = builder.station("second-target", RunningEventCountDefinition::new());
     let second_source = builder.station("second-source", SequenceSourceDefinition::new(0));
     let first_source = builder.station("first-source", SequenceSourceDefinition::new(0));
     let first_sink = builder.station("first-sink", DiscardDefinition::new());

@@ -2,7 +2,8 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+    sink::DiscardDefinition, source::SequenceSourceDefinition,
+    transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
@@ -14,7 +15,7 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
     let chain_source = builder.station("chain-source", SequenceSourceDefinition::new(u64::MAX - 1));
-    let count = builder.station("count", CountDefinition::new());
+    let count = builder.station("count", RunningEventCountDefinition::new());
     let chain_sink = builder.station("chain-sink", DiscardDefinition::new());
     let fanout_source = builder.station("fanout-source", SequenceSourceDefinition::new(u64::MAX));
     let first_sink = builder.station("first-fanout-sink", DiscardDefinition::new());
@@ -64,7 +65,9 @@ fn assert_completed_state(path: &Path) {
             .open_data("station/00000003/operation/sequence_source.position")
             .unwrap(),
     ];
-    let count: Cell<u64> = store.open_data("station/00000001/operation/count").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000001/operation/running_event_count.count")
+        .unwrap();
     let outputs: [AppendLog<Vec<u8>>; 3] = [
         store.open_data("station/00000000/output").unwrap(),
         store.open_data("station/00000001/output").unwrap(),
@@ -126,7 +129,7 @@ fn build_and_open_support_many_station_output_logs() {
     let mut previous = builder.station("source", SequenceSourceDefinition::new(0));
     builder.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..OUTPUT_STATION_COUNT {
-        let current = builder.station(format!("count-{index}"), CountDefinition::new());
+        let current = builder.station(format!("count-{index}"), RunningEventCountDefinition::new());
         builder.output_capacity_bytes(current, OUTPUT_CAPACITY_BYTES);
         builder.connect([previous], current);
         previous = current;
