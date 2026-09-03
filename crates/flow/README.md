@@ -72,11 +72,11 @@ output capacity，outputless Station 不得声明；重复、遗漏、类别不�
 Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
 编码失败都不会创建目标目录。
 
-Filter/Extend 的 Definition 在 `station()` 之前已通过 fallible `try_new` 将 `DataFusion` `Expr` 编码为
+Filter/Extend/Select 的 Definition 在 `station()` 之前已通过 fallible `try_new` 将 `DataFusion` `Expr` 编码为
 `DataFusion` protobuf；无法编码的表达式直接作为构造错误返回。表达式的字段解析、type、nullability、
 cast 和 `PhysicalExpr` 创建留在上述全图 bind 阶段，由 `DataFusion` 完成。`create_physical_expr` 假定
 logical coercion 已完成，而 Flow 不运行 logical/SQL planner，因此混合类型需要调用方显式 cast；失败同样不会创建
-目标目录。Project 仍使用严格递增的顶层字段索引。
+目标目录。Project 仍使用严格递增的顶层字段索引；UnionAll 只要求其所有输入具有完全相同的 Schema。
 
 ## 持久化边界
 
@@ -101,7 +101,7 @@ Cell。每个 output capacity 直接保存在 Flow Definition 中；build/open �
 `Output` capability，不创建另一份 Station state。端口 Schema 一致性不依赖 Change codec 之外的
 Schema resource、fingerprint 或 registry：持久化 Definition 加上有序上游 Schema 在 reopen 时
 确定性重建同一 binding。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
-Filter/Extend 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
+Filter/Extend/Select 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
 build/open 都从 protobuf 还原 `Expr`，并针对 exact input Schema 重新调用 `create_physical_expr`。
 `DataFusion` 依赖与 Arrow 精确 pin；跨 `DataFusion` 版本不保证读取兼容，不兼容升级必须 bump 外层
 Operation Definition tag/version 并重建 Flow。
@@ -170,8 +170,10 @@ event ID。Station 可以为了吞吐稳定地合并或切分物理批次，但�
 逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；active input 既是未完成
 输入的 durable port，又在没有未完成输入时规定从哪个端口开始循环寻找下一个可用物理 Change，
 不声称还原跨上游事件发生时间。只有 `Complete` 才把 cursor 推进到下一个 offset。Operation 的
-展平 output 事件序列和最终业务状态必须同时对稳定重批及同一 Change 的重复 `Commit` turn 切分保持不变；
-需要业务级跨端口顺序时，必须另行引入逻辑 ingress、barrier 或窗口语义。
+展平 output 事件序列和最终业务状态必须同时对稳定重批及同一 Change 的重复 `Commit` turn 切分保持不变。
+显式跨端口无序的 `UnionAll` 只保持各端口内部事件顺序和最终关系状态；跨端口交织由上述 durable
+Station schedule 决定，可随上游分批和可用性变化。需要业务级跨端口总序时，必须另行引入逻辑
+ingress、barrier、窗口或排序语义。
 
 每个 producer output 在已提交的事务边界都维持 `head == min(all consumer edge cursors)`；build 时
 所有值都是 `0`，open 会拒绝不满足该等式或 cursor 落在 `[head, tail]` 之外的运行状态。一次 Complete
@@ -213,7 +215,7 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - Count 状态：`station/{index:08x}/operation/count`
-- Project、Filter 和 Extend 不声明 Operation data，只使用通用 Station state 和 output
+- Project、Filter、Extend、Select 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
@@ -243,13 +245,13 @@ state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和�
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实 `SequenceSource → Extend → Filter → Project → Count → Discard` DAG 可以按拓扑逐轮推进并在 reopen
+`Flow::advance`，真实表达式链路与 `SequenceSource → Select → UnionAll → Count → Discard` 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
 intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或外部副作用协议；内建 Count
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
-`DataFusion` 集成目前止于 Filter/Extend 的 `Expr` protobuf、physical expression planning 与向量化执行，
+`DataFusion` 集成目前止于 Filter/Extend/Select 的 `Expr` protobuf、physical expression planning 与向量化执行，
 不提供 SQL planner、catalog 或任意 `DataFusion` logical/physical plan 的 Flow 映射。
 
 ## 验证

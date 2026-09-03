@@ -19,6 +19,11 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     ),
     (transform::filter::TAG, transform::filter::decode_definition),
     (transform::extend::TAG, transform::extend::decode_definition),
+    (transform::select::TAG, transform::select::decode_definition),
+    (
+        transform::union_all::TAG,
+        transform::union_all::decode_definition,
+    ),
     (sink::discard::TAG, sink::discard::decode_definition),
 ];
 

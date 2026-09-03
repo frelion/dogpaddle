@@ -31,9 +31,9 @@ DogPaddle 是一个用 Rust 构建的嵌入式、持久化流计算引擎。它�
   记录与非 null、非零 diff，并以行位置表达事件顺序；每个持久化 Change 都是内嵌物理 Schema、
   恰好一个 RecordBatch 的完整自描述 Arrow IPC Stream。Schema 绑定的顶层投影允许同一份
   完整编码按消费者需求只物化所需列，内存投影则直接共享原 Arrow buffer。
-- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、Schema-sensitive 的
-  零拷贝顶层 Project、接收 DataFusion `Expr` 的 Filter 与单列 Extend，以及无输出 Discard Sink。
-  Filter/Extend 直接用 `datafusion-proto` 持久化表达式；build/open 通过 DataFusion
+- **真实定义与状态物化**：当前包含零输入 SequenceSource、一元事件 Count、零拷贝顶层 Project、
+  接收 DataFusion `Expr` 的 Filter、Extend 与多列表达式 Select、精确 Schema 的 UnionAll，以及无输出 Discard Sink。
+  Filter/Extend/Select 直接用 `datafusion-proto` 持久化表达式；build/open 通过 DataFusion
   `create_physical_expr` 完成类型、nullability、cast 与向量化执行；当前不运行 logical coercion，混合类型需显式 cast。DogPaddle 不维护第二套
   表达式语言，也不因此引入 SQL 层。build/open 会先从 canonical Definition
   产生一次性的 Schema binding，再为有状态算子创建
@@ -92,15 +92,15 @@ output/input capability 装配、Arrow `Change`、自描述 Stream 编码和 `Ap
 `Idle`/`Commit`/`Complete` action。只要尚未 `Complete`，下一 turn（包括 reopen
 之后）必须收到相同 `(port, offset, bytes)` 的完整 Change；片段内 continuation 由 Operation 存进
 自己声明的状态。`Flow::advance` 已能按稳定拓扑 schedule 执行真实的
-`SequenceSource → Extend → Filter → Project → Count → Discard` 轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
+表达式链路及 `SequenceSource → Select → UnionAll → Count → Discard` 多输入轮次，并在 Complete 事务内安全释放上游前缀。拓扑已经拒绝
 没有任何 consumer 的 output，per-output retained-byte 高水位会让缓慢 consumer 自然向上游传播
 背压。每个 output 在 build/open 时已经绑定一个精确 logical Schema；算子输出在编码前、持久化
 entry 在首次 intake 解码后还会再次校验，Schema 违例均不会提交本 turn 的状态或 cursor。
 尚未实现持续运行的 `Flow::start`、中断控制或外部 Sink 的幂等协议。
 该高水位不计算 MDBX page、Operation state 或 decoded cache，也允许空日志容纳一条 oversize，
-因此不是磁盘或内存硬配额。Operation 的展平
-output 事件序列与最终业务状态必须同时不受稳定重批和 input-retaining `Commit` turn 切分影响；
-比较的每种物理分批都必须能用声明的 Arrow input/output 类型表示。
+因此不是磁盘或内存硬配额。单输入 Operation 的展平 output 事件序列与最终业务状态必须同时不受
+稳定重批和 input-retaining `Commit` turn 切分影响；`UnionAll` 保持各输入内部顺序与最终关系，
+但与 SQL 一样不承诺跨输入顺序。比较的每种物理分批都必须能用声明的 Arrow input/output 类型表示。
 DataFusion 当前提供表达式 API、protobuf 和向量化执行；仓库仍没有最终用户二进制、SQL、连接器或
 分布式调度。一个 Store
 路径同一时刻只能由一个活动 Flow 打开；外部副作用的幂等协议将在运行层设计时确定。

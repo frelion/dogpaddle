@@ -3,7 +3,9 @@ use std::num::{NonZeroU32, NonZeroU64};
 use dogpaddle_operation::{
     OperationDefinition, OperationKind,
     operation::{
-        sink::DiscardDefinition, source::SequenceSourceDefinition, transform::CountDefinition,
+        sink::DiscardDefinition,
+        source::SequenceSourceDefinition,
+        transform::{CountDefinition, UnionAllDefinition},
     },
 };
 use dogpaddle_store::StoreError;
@@ -99,6 +101,9 @@ fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
 fn finish_rejects_forbidden_or_excess_inputs() {
     assert_input_count(finish_with_target(source(0), 1), 0, 1);
     assert_input_count(finish_with_target(count(), 2), 1, 2);
+    let union = || UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
+    assert_input_count(finish_with_target(union(), 1), 2, 1);
+    assert_input_count(finish_with_target(union(), 3), 2, 3);
     assert_input_count(finish_with_target(discard(), 2), 1, 2);
 }
 

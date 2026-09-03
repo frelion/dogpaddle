@@ -16,8 +16,10 @@ binding 装配运行实例。方向严格单向：`Definition → OperationBindi
 batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须依次观察输入事件，并按
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
 独立定义的窗口、barrier 或 flush 信号，Operation 的展平输出事件序列和最终业务状态必须在稳定
-合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Commit` turn 而改变；物理
-Change 边界和 turn 边界都不能被算子当成业务事件。这个比较域要求每种分批的输入和对应输出都能
+合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Commit` turn 而改变。显式声明
+跨端口无序的多输入关系算子只保持每个端口的事件子序列和最终关系状态；当前 `UnionAll` 的跨端口
+交织由 Station 调度，可能随分批变化。除此之外，物理 Change 边界和 turn 边界都不能被算子当成
+业务事件。这个比较域要求每种分批的输入和对应输出都能
 由其声明的 Arrow 类型物理表示；例如不能要求 `Utf8` offset 已溢出的单个 `RecordBatch` 成功构造。
 
 ## Schema 绑定
@@ -38,10 +40,11 @@ materialize closure；它不写 Store，也不进入持久化格式或运行态�
 输出 `{ value: UInt64 non-null }`；Count 接受任意合法的单一输入并固定输出
 `{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
 并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
-Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Discard 接受任意合法的单一输入且没有 output。无需额外的
+Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Select 从同一个原始输入计算有序的完整输出列；
+`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意合法的单一输入且没有 output。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
-Filter 与 Extend 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
+Filter、Extend 与 Select 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
 [`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
 builder。需要按 Arrow 字段名逐字引用时使用 [`ident`]；[`col`] 保留 `DataFusion` 自身的大小写正规化和
 multipart identifier 解析规则。Definition 的 `try_new` 立即使用 `datafusion-proto` 编码 `Expr`，无法编码时返回构造错误；
@@ -52,7 +55,7 @@ Schema 交给 `DataFusion` `create_physical_expr`；表达式的字段解析、t
 运行期 `evaluate` 全部由 `DataFusion` 定义。该 API 假定 logical coercion 已完成，而本 crate 不运行
 logical/SQL planner，因此不会额外插入隐式 cast；混合类型表达式需要调用方显式 [`cast`]。binding 只保存 exact input Schema、physical expression 和
 派生 output 属性；open 从 protobuf 还原 `Expr` 后重新完成同一过程。DogPaddle 继续负责完整 Schema
-guard、Filter/Extend 的 output Schema 约束，以及 records/diffs 的 Change 语义。
+guard、Filter/Extend/Select 的 output Schema 约束，以及 records/diffs 的 Change 语义。
 
 这份 protobuf 是版本绑定的持久格式，不承诺跨 `DataFusion` 版本兼容。工作区精确 pin 相互匹配的
 `DataFusion`、`datafusion-proto` 与 Arrow；升级必须审查 proto roundtrip、physical planning 和执行语义。
@@ -60,15 +63,22 @@ guard、Filter/Extend 的 output Schema 约束，以及 records/diffs 的 Change
 版本内猜测或迁移旧表达式。DataFusion 的采用不等于引入 SQL 层。
 
 ```rust
+use std::num::NonZeroU32;
 use arrow_schema::DataType;
 use dogpaddle_operation::{ScalarValue, cast, col, ident, lit, try_cast};
-use dogpaddle_operation::operation::transform::{ExtendDefinition, FilterDefinition};
+use dogpaddle_operation::operation::transform::{
+    ExtendDefinition, FilterDefinition, SelectDefinition, UnionAllDefinition,
+};
 
 let is_seven = col("value").eq(lit(7_u64));
 let extend = ExtendDefinition::try_new("is_seven", is_seven.clone()).unwrap();
 let filter = FilterDefinition::try_new(is_seven).unwrap();
+let select = SelectDefinition::try_new([("value", col("value"))]).unwrap();
+let union = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
 assert_eq!(extend.field_name(), "is_seven");
 assert_eq!(filter.predicate(), extend.expression());
+assert_eq!(select.fields().len(), 1);
+assert_eq!(union.input_count().get(), 2);
 
 let typed_null = lit(ScalarValue::Utf8(None));
 let strict_text = cast(col("value"), DataType::Utf8);
@@ -108,7 +118,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count、Project、Filter 和 Extend，`sink` 包含
+的终点算子。当前 `source` 包含 `SequenceSource`，`transform` 包含 Count、Project、Filter、Extend、Select 和 `UnionAll`，`sink` 包含
 Discard。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
@@ -235,6 +245,24 @@ Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability�
 若表达式只是 Column，新列本身也与源列共享同一 ArrayRef。结果保持行序并返回
 `Action::Complete(Some(_))`。
 
+## `operation::transform::Select`
+
+[`operation::transform::SelectDefinition`] 通过 fallible `try_new` 接收有序的 `name + Expr` 集合。
+每个表达式都独立绑定到同一个原始 input Schema，不能引用同一 Select 中新建的别名；输出只包含声明的列，
+顺序、类型和 nullability 由声明与 `DataFusion` 唯一决定，并保留 input Schema metadata。空 Select 合法，
+仍保留输入行数和 diff。
+
+[`operation::transform::SelectOperation`] 不声明 Store data，只保存编译后的表达式和 output Schema。
+每个 turn 一次求值所有列并返回 `Action::Complete(Some(_))`；直接列引用和 diff 与输入共享 Arrow buffer。
+
+## `operation::transform::UnionAll`
+
+[`operation::transform::UnionAllDefinition`] 只接收非零 input count。bind 要求所有有序输入与 input 0
+具有完全相同的 logical Schema，并以该 Schema 作为 output；不做 cast、对齐或字段名推断。
+[`operation::transform::UnionAllOperation`] 不声明 Store data，按收到的端口原样 clone 完整 Change，
+因此保持该端口的行序、diff 和 Arrow buffer。它与 SQL `UNION ALL` 一样不定义跨输入顺序；端口间
+交织由 Station 统一调度，可随上游分批和可用性变化。需要业务级总序时应另建显式排序或 barrier 语义。
+
 ## `operation::sink::Discard`
 
 [`operation::sink::DiscardDefinition`] 显式声明为携带一个输入的 [`OperationKind::Sink`]，
@@ -313,10 +341,10 @@ decoder 表必须复用具体模块中的同一个 tag 常量。
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
 `correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖六个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
-以及 Project、Filter、Extend 对合法但不兼容 Schema 的结构化拒绝；表达式测试覆盖 `DataFusion` protobuf
+Schema 测试覆盖八个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+以及 Project、Filter、Extend、Select、UnionAll 对合法但不兼容 Schema 的结构化拒绝；表达式测试覆盖 `DataFusion` protobuf
 编码失败、roundtrip 与精确版本 golden。runtime trace 统一覆盖完整 turn、commit、rollback、
-reopen、固定 output Schema/diff、Project/Extend 零拷贝、Filter 的空/全量选择及覆盖
+reopen、固定 output Schema/diff、Project/Extend/Select 零拷贝、UnionAll 多端口原样转发、Filter 的空/全量选择及覆盖
 Null/bitmap/fixed/variable/List/Struct 全部 v1 layout family 的部分选择、DataFusion
 `create_physical_expr` 的 type/nullability、scalar/array evaluate 与 null 传播、
 携带混合 diff 的稳定重批和 Store 错误。Expression golden

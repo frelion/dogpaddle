@@ -36,8 +36,8 @@
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | Definition 与 DataFusion Expr protobuf roundtrip、exact Schema bind/materialize、`create_physical_expr` 的 type/nullability 与 scalar/array evaluate、Project/Extend 零拷贝、Filter 全部 Arrow v1 layout family/null/混合 diff 重批、状态 commit/rollback/reopen | `operation_core` |
-| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend 拒绝无建库副作用与 reopen 重绑定、Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | Definition 与 DataFusion Expr protobuf roundtrip、exact Schema bind/materialize、`create_physical_expr` 的 type/nullability 与 scalar/array evaluate、Project/Extend/Select 零拷贝、Filter 全部 Arrow v1 layout family/null/混合 diff 重批、UnionAll 多端口原样转发、状态 commit/rollback/reopen | `operation_core` |
+| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/UnionAll 拒绝无建库副作用与 reopen 重绑定、Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。

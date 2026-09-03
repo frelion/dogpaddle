@@ -15,7 +15,8 @@ use dogpaddle_operation::{
         source::{SequenceSourceError, SequenceSourceOperation},
         transform::{
             CountError, CountOperation, ExtendDefinition, ExtendError, FilterDefinition,
-            FilterError, ProjectError, ProjectOperation,
+            FilterError, ProjectError, ProjectOperation, SelectDefinition, SelectError,
+            UnionAllDefinition, UnionAllError,
         },
     },
     try_cast,
@@ -737,6 +738,203 @@ fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
         });
         assert!(schema_mismatch);
     }
+}
+
+#[test]
+fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 20, 30])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+        ],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
+    let definition =
+        SelectDefinition::try_new([("copied", col("label")), ("next", col("id") + lit(1_u64))])
+            .unwrap();
+    let operation = stateless_operation(&definition, Arc::clone(&schema));
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("Select did not complete with one output Change");
+    };
+    assert_eq!(output.schema().field(0).name(), "copied");
+    assert_eq!(output.schema().field(1).name(), "next");
+    assert!(Arc::ptr_eq(
+        output.records().column(0),
+        input.records().column(1)
+    ));
+    assert_eq!(
+        output.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+    let next = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(next.values(), &[11, 21, 31]);
+}
+
+#[test]
+fn empty_select_preserves_input_row_count_and_diffs() {
+    let input = change(&[1, -1, 2]);
+    let definition = SelectDefinition::try_new(std::iter::empty::<(&str, Expr)>()).unwrap();
+    let operation = stateless_operation(&definition, input.schema());
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let Action::Complete(Some(output)) = operation
+        .turn(Some(turn_input(&input)), transaction.access())
+        .unwrap()
+    else {
+        panic!("empty Select did not complete with one output Change");
+    };
+    assert_eq!(output.num_rows(), input.num_rows());
+    assert!(output.schema().fields().is_empty());
+    assert!(output.records().columns().is_empty());
+    assert_eq!(
+        output.diffs().values().as_ptr(),
+        input.diffs().values().as_ptr()
+    );
+}
+
+#[test]
+fn union_all_forwards_every_legal_port_without_copying() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let input = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1, -1, 2]),
+    )
+    .unwrap();
+    let definition = UnionAllDefinition::new(std::num::NonZeroU32::new(3).unwrap());
+    let mut data = DataInstances::new();
+    let operation = (&definition as &dyn OperationDefinition)
+        .bind(&[input.schema(), input.schema(), input.schema()])
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    for port in 0..3 {
+        let Action::Complete(Some(output)) = operation
+            .turn(
+                Some(OperationInput {
+                    port,
+                    change: &input,
+                }),
+                transaction.access(),
+            )
+            .unwrap()
+        else {
+            panic!("UnionAll did not forward input port {port}");
+        };
+        assert_eq!(output.schema(), input.schema());
+        assert_eq!(output.num_rows(), input.num_rows());
+        assert!(
+            output
+                .records()
+                .columns()
+                .iter()
+                .zip(input.records().columns())
+                .all(|(output, input)| Arc::ptr_eq(output, input))
+        );
+        assert_eq!(
+            output.diffs().values().as_ptr(),
+            input.diffs().values().as_ptr()
+        );
+    }
+}
+
+#[test]
+fn select_and_union_all_reject_missing_and_invalid_ports() {
+    let input = change(&[1]);
+    let select = stateless_operation(
+        &SelectDefinition::try_new([("input", col("input"))]).unwrap(),
+        input.schema(),
+    );
+    let union_definition = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
+    let mut data = DataInstances::new();
+    let union = (&union_definition as &dyn OperationDefinition)
+        .bind(&[input.schema(), input.schema()])
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let error = select.turn(None, transaction.access()).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SelectError>(),
+        Some(SelectError::MissingInput)
+    ));
+    let error = select
+        .turn(
+            Some(OperationInput {
+                port: 1,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SelectError>(),
+        Some(SelectError::InvalidInputPort { port: 1 })
+    ));
+
+    let error = union.turn(None, transaction.access()).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<UnionAllError>(),
+        Some(UnionAllError::MissingInput)
+    ));
+    let error = union
+        .turn(
+            Some(OperationInput {
+                port: 2,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<UnionAllError>(),
+        Some(UnionAllError::InvalidInputPort {
+            port: 2,
+            input_count: 2,
+        })
+    ));
 }
 
 #[test]

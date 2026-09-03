@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use dogpaddle_change::{ProjectionError, SchemaError};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
@@ -9,7 +9,8 @@ use dogpaddle_operation::{
         source::SequenceSourceDefinition,
         transform::{
             CountDefinition, ExtendDefinition, FilterDefinition, FilterSchemaError,
-            ProjectDefinition, ProjectSchemaError,
+            ProjectDefinition, ProjectSchemaError, SelectDefinition, SelectSchemaError,
+            UnionAllDefinition, UnionAllSchemaError,
         },
     },
 };
@@ -71,6 +72,54 @@ fn build_reports_filter_and_extend_schema_rejections_without_store_side_effects(
             source: SchemaError::DuplicateField { name, .. }
         } if name == "value"
     ));
+}
+
+#[test]
+fn build_reports_select_and_union_schema_rejections_without_store_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+
+    let select_path = root.path().join("select");
+    let error = build_schema_error(
+        &select_path,
+        "select",
+        SelectDefinition::try_new([("copy", col("other"))]).unwrap(),
+    );
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("invalid Select returned the wrong binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SelectSchemaError>(),
+        Some(SelectSchemaError::Expression {
+            field: 0,
+            source: ExpressionBindError::DataFusion(_),
+        })
+    ));
+
+    let union_path = root.path().join("union");
+    let mut factory = FlowFactory::new(&union_path);
+    let left = factory.station("left", SequenceSourceDefinition::new(0));
+    let right_source = factory.station("right-source", SequenceSourceDefinition::new(0));
+    let right = factory.station("right", CountDefinition::new());
+    let union = factory.station(
+        "union",
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+    );
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [left, right_source, right, union] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([right_source], right);
+    factory.connect([left, right], union);
+    factory.connect([union], sink);
+
+    let Err(FlowError::Schema(error)) = factory.build() else {
+        panic!("schema-incompatible UnionAll Flow unexpectedly built");
+    };
+    assert_union_schema_mismatch(&error, 1);
+    assert!(
+        !union_path.exists(),
+        "UnionAll rejection created the Store path"
+    );
 }
 
 #[test]
@@ -145,6 +194,133 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
             source: SchemaError::DuplicateField { name, .. }
         } if name == "value"
     ));
+}
+
+#[test]
+fn open_rebinds_decoded_select_and_union_definitions() {
+    let root = tempfile::tempdir().unwrap();
+
+    let select_path = root.path().join("select");
+    build_and_replace_operation(
+        &select_path,
+        "select",
+        SelectDefinition::try_new([("copy", col("value"))]).unwrap(),
+        &SelectDefinition::try_new([("copy", col("other"))]).unwrap(),
+    );
+    let Err(FlowError::Schema(error)) = FlowFactory::open(&select_path) else {
+        panic!("open did not rebind the decoded schema-incompatible Select");
+    };
+    assert_eq!(error.station_id(), "select");
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("invalid Select returned the wrong open binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SelectSchemaError>(),
+        Some(SelectSchemaError::Expression {
+            field: 0,
+            source: ExpressionBindError::DataFusion(_),
+        })
+    ));
+
+    let union_path = root.path().join("union");
+    let valid_select = SelectDefinition::try_new([("a", col("value"))]).unwrap();
+    let invalid_select = SelectDefinition::try_new([("b", col("value"))]).unwrap();
+    let valid_operation = encode_definition(&valid_select);
+    let invalid_operation = encode_definition(&invalid_select);
+    assert_eq!(valid_operation.len(), invalid_operation.len());
+
+    let mut factory = FlowFactory::new(&union_path);
+    let left_source = factory.station("left-source", SequenceSourceDefinition::new(0));
+    let left = factory.station("left", valid_select.clone());
+    let right_source = factory.station("right-source", SequenceSourceDefinition::new(0));
+    let right = factory.station("right", valid_select);
+    let union = factory.station(
+        "union",
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+    );
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [left_source, left, right_source, right, union] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([left_source], left);
+    factory.connect([right_source], right);
+    factory.connect([left, right], union);
+    factory.connect([union], sink);
+    drop(factory.build().unwrap());
+
+    let mut definition = read_published_definition(&union_path);
+    let offset = definition
+        .windows(valid_operation.len())
+        .rposition(|candidate| candidate == valid_operation)
+        .expect("published Flow contains the second Select definition");
+    definition[offset..offset + valid_operation.len()].copy_from_slice(&invalid_operation);
+    rewrite_checksum(&mut definition);
+    replace_published_definition(&union_path, &definition);
+
+    let Err(FlowError::Schema(error)) = FlowFactory::open(&union_path) else {
+        panic!("open did not rebind the decoded schema-incompatible UnionAll");
+    };
+    assert_union_schema_mismatch(&error, 1);
+    assert_eq!(read_published_definition(&union_path), definition);
+}
+
+#[test]
+fn select_and_repeated_input_union_run_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let select = factory.station(
+        "select",
+        SelectDefinition::try_new([("is_max", col("value").eq(lit(u64::MAX)))]).unwrap(),
+    );
+    let union = factory.station(
+        "union",
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+    );
+    let count = factory.station("count", CountDefinition::new());
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [source, select, union, count] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([source], select);
+    factory.connect([select, select], union);
+    factory.connect([union], count);
+    factory.connect([count], sink);
+    drop(factory.build().unwrap());
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = FlowFactory::open(&path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    drop(flow);
+
+    let store = Store::open(&path).unwrap();
+    let _select_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000001/state").unwrap();
+    let select_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let union_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
+        store.open_data("station/00000002/state").unwrap();
+    let union_output: AppendLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
+    let count: Cell<u64> = store.open_data("station/00000003/operation/count").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    let access = transaction.access();
+    assert_eq!(count.access(access).unwrap().get().unwrap(), Some(2));
+    assert_eq!(
+        select_output.access(access).unwrap().bounds().unwrap(),
+        1..1
+    );
+    assert_eq!(union_output.access(access).unwrap().bounds().unwrap(), 2..2);
+    let state = union_state.access(access).unwrap();
+    for input in 0..2_u32 {
+        let key = format!("input/{input:08x}/cursor").into_bytes();
+        let cursor = state.get(&key).unwrap().unwrap();
+        assert_eq!(u64::from_be_bytes(cursor.try_into().unwrap()), 1);
+    }
 }
 
 #[test]
@@ -260,6 +436,18 @@ fn assert_project_field_rejection(error: &FlowSchemaError) {
                 fields: 1
             }
         ))
+    ));
+}
+
+fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
+    assert_eq!(error.station_id(), "union");
+    let OperationBindError::Rejected { source } = error.operation_error() else {
+        panic!("UnionAll returned a non-concrete Schema binding error");
+    };
+    assert!(matches!(
+        source.downcast_ref::<UnionAllSchemaError>(),
+        Some(UnionAllSchemaError::InputSchemaMismatch { input: actual, .. })
+            if *actual == input
     ));
 }
 

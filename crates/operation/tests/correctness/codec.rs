@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
@@ -14,7 +15,10 @@ use dogpaddle_operation::{
         Action, OperationInput,
         sink::DiscardDefinition,
         source::SequenceSourceDefinition,
-        transform::{CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition},
+        transform::{
+            CountDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition,
+            SelectDefinition, UnionAllDefinition,
+        },
     },
     try_cast,
 };
@@ -27,7 +31,9 @@ const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
 const EXTEND_V1: &str = include_str!("../fixtures/v1/extend_is_seven.hex");
 const FILTER_V1: &str = include_str!("../fixtures/v1/filter_complex_expression.hex");
 const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
+const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
+const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
 
 fn length_prefixed_bytes(encoded: &[u8], length_offset: usize) -> &[u8] {
@@ -58,6 +64,14 @@ fn filter(predicate: Expr) -> FilterDefinition {
 
 fn extend(field_name: &str, expression: Expr) -> ExtendDefinition {
     ExtendDefinition::try_new(field_name, expression).unwrap()
+}
+
+fn select() -> SelectDefinition {
+    SelectDefinition::try_new([
+        ("renamed", col("value")),
+        ("next", col("value") + lit(1_u64)),
+    ])
+    .unwrap()
 }
 
 fn complex_predicate() -> Expr {
@@ -99,6 +113,11 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
         (
             decode_hex(SEQUENCE_V1),
             Box::new(SequenceSourceDefinition::new(42)),
+        ),
+        (decode_hex(SELECT_V1), Box::new(select())),
+        (
+            decode_hex(UNION_ALL_V1),
+            Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         ),
     ]
 }
@@ -187,6 +206,26 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
         Some(&expected)
     );
 
+    let select = decode_definition(&decode_hex(SELECT_V1)).unwrap();
+    let expected = Arc::new(Schema::new(vec![
+        Field::new("renamed", DataType::UInt64, false),
+        Field::new("next", DataType::UInt64, false),
+    ]));
+    assert_eq!(
+        select
+            .bind(std::slice::from_ref(&value_schema()))
+            .unwrap()
+            .output_schema(),
+        Some(&expected)
+    );
+
+    let union_all = decode_definition(&decode_hex(UNION_ALL_V1)).unwrap();
+    let union_inputs = [value_schema(), value_schema()];
+    assert_eq!(
+        union_all.bind(&union_inputs).unwrap().output_schema(),
+        Some(&value_schema())
+    );
+
     let discard = decode_definition(&decode_hex(DISCARD_V1)).unwrap();
     assert!(
         discard
@@ -198,7 +237,7 @@ fn every_decoded_builtin_golden_reconstructs_its_schema_binding() {
 }
 
 #[test]
-fn expression_goldens_reconstruct_their_persisted_runtime_semantics() {
+fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     let schema = value_schema();
     let records = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -271,6 +310,89 @@ fn expression_goldens_reconstruct_their_persisted_runtime_semantics() {
     assert_eq!(
         values.iter().collect::<Vec<_>>(),
         [Some(true), Some(false), Some(true)]
+    );
+}
+
+#[test]
+fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
+    let schema = value_schema();
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(UInt64Array::from(vec![7, 8, 7]))],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
+    let fixture = TestStore::new();
+    let store = Store::create(fixture.path()).unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+
+    let select = decode_definition(&decode_hex(SELECT_V1)).unwrap();
+    let mut data = DataInstances::new();
+    let select = select
+        .bind(std::slice::from_ref(&schema))
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let Action::Complete(Some(selected)) = select
+        .turn(
+            Some(OperationInput {
+                port: 0,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap()
+    else {
+        panic!("decoded Select did not emit its expected fields");
+    };
+    assert_eq!(selected.schema().field(0).name(), "renamed");
+    assert_eq!(selected.schema().field(1).name(), "next");
+    let renamed = selected
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let next = selected
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(renamed.values(), &[7, 8, 7]);
+    assert_eq!(next.values(), &[8, 9, 8]);
+    assert_eq!(selected.diffs().values(), &[1, -1, 2]);
+
+    let union_all = decode_definition(&decode_hex(UNION_ALL_V1)).unwrap();
+    let mut data = DataInstances::new();
+    let union_inputs = [Arc::clone(&schema), Arc::clone(&schema)];
+    let union_all = union_all
+        .bind(&union_inputs)
+        .unwrap()
+        .materialize(&mut data)
+        .unwrap();
+    data.finish().unwrap();
+    let Action::Complete(Some(forwarded)) = union_all
+        .turn(
+            Some(OperationInput {
+                port: 1,
+                change: &input,
+            }),
+            transaction.access(),
+        )
+        .unwrap()
+    else {
+        panic!("decoded UnionAll did not forward its input Change");
+    };
+    assert!(Arc::ptr_eq(
+        input.records().column(0),
+        forwarded.records().column(0)
+    ));
+    assert_eq!(
+        input.diffs().values().as_ptr(),
+        forwarded.diffs().values().as_ptr()
     );
 }
 
@@ -427,6 +549,43 @@ fn expression_decoder_rejects_bad_lengths_malformed_and_noncanonical_protobuf() 
     invalid_name[DEFINITION_HEADER_LEN + size_of::<u32>()] = u8::MAX;
     assert!(matches!(
         decode_definition(&invalid_name),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn select_decoder_rejects_a_forged_count_and_invalid_field_name_without_panicking() {
+    let canonical = encode_definition(&select());
+
+    let mut forged_count = canonical[..DEFINITION_HEADER_LEN + size_of::<u32>()].to_vec();
+    forged_count[DEFINITION_HEADER_LEN..].copy_from_slice(&u32::MAX.to_be_bytes());
+    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&forged_count)));
+    assert!(
+        result.is_ok(),
+        "Select decoder panicked for a forged field count"
+    );
+    assert_eq!(
+        result.unwrap().unwrap_err(),
+        DefinitionCodecError::Truncated
+    );
+
+    let mut invalid_utf8 = canonical.clone();
+    let first_name_offset = DEFINITION_HEADER_LEN + size_of::<u32>() * 2;
+    invalid_utf8[first_name_offset] = u8::MAX;
+    assert!(matches!(
+        decode_definition(&invalid_utf8),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn union_all_decoder_rejects_zero_input_count() {
+    let canonical = encode_definition(&UnionAllDefinition::new(NonZeroU32::new(2).unwrap()));
+
+    let mut zero = canonical.clone();
+    zero[DEFINITION_HEADER_LEN..].copy_from_slice(&0_u32.to_be_bytes());
+    assert!(matches!(
+        decode_definition(&zero),
         Err(DefinitionCodecError::InvalidPayload(_))
     ));
 }

@@ -17,7 +17,8 @@ use dogpaddle_operation::{
         source::SequenceSourceDefinition,
         transform::{
             CountDefinition, ExtendDefinition, ExtendSchemaError, FilterDefinition,
-            FilterSchemaError, ProjectDefinition, ProjectSchemaError,
+            FilterSchemaError, ProjectDefinition, ProjectSchemaError, SelectDefinition,
+            SelectSchemaError, UnionAllDefinition, UnionAllSchemaError,
         },
     },
     try_cast,
@@ -140,6 +141,30 @@ fn definitions_expose_their_stable_public_contracts() {
     assert_eq!(extend.field_name(), "message_missing");
     assert_eq!(extend.expression(), &extend_expression);
     assert!(names(&extend).is_empty());
+
+    let select_expressions = [
+        ("score", col("score")),
+        ("missing", col("message").is_null()),
+    ];
+    let select = SelectDefinition::try_new(select_expressions.clone()).unwrap();
+    assert_eq!(
+        select.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::MIN)
+    );
+    assert!(
+        select.fields().eq(select_expressions
+            .iter()
+            .map(|(name, expression)| (*name, expression)))
+    );
+    assert!(names(&select).is_empty());
+
+    let union = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
+    assert_eq!(
+        union.kind(),
+        OperationKind::Transform(std::num::NonZeroU32::new(2).unwrap())
+    );
+    assert_eq!(union.input_count().get(), 2);
+    assert!(names(&union).is_empty());
 
     let discard = DiscardDefinition::new();
     assert_eq!(
@@ -389,6 +414,109 @@ fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
             source: SchemaError::ReservedFieldName { ref name, .. }
         }) if name == "$dogpaddle.internal"
     ));
+}
+
+#[test]
+fn select_binds_ordered_independent_expressions_and_preserves_schema_metadata() {
+    let metadata = HashMap::from([("owner".to_owned(), "test".to_owned())]);
+    let input = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("message", DataType::Utf8, true),
+        ],
+        metadata.clone(),
+    ));
+    let definition = SelectDefinition::try_new([
+        ("missing", col("message").is_null()),
+        ("copied", col("message")),
+        ("id", col("id")),
+    ])
+    .unwrap();
+
+    let binding = bind(&definition, std::slice::from_ref(&input)).unwrap();
+    let output = binding.output_schema().unwrap();
+    assert_eq!(output.metadata(), &metadata);
+    assert_eq!(output.fields().len(), 3);
+    assert_eq!(
+        output.field(0),
+        &Field::new("missing", DataType::Boolean, false)
+    );
+    assert_eq!(output.field(1), &Field::new("copied", DataType::Utf8, true));
+    assert_eq!(output.field(2), &Field::new("id", DataType::UInt64, false));
+    assert!(
+        output
+            .fields()
+            .iter()
+            .all(|field| field.metadata().is_empty())
+    );
+}
+
+#[test]
+fn select_reports_expression_context_and_rejects_invalid_output_names_centrally() {
+    let input = project_input_schema();
+    let alias_reference = SelectDefinition::try_new([
+        ("derived_alias", col("id")),
+        ("uses_alias", col("derived_alias")),
+    ])
+    .unwrap();
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&alias_reference, std::slice::from_ref(&input))
+    else {
+        panic!("Select expression unexpectedly referenced an earlier output alias");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SelectSchemaError>(),
+        Some(SelectSchemaError::Expression {
+            field: 1,
+            source: ExpressionBindError::DataFusion(_),
+        })
+    ));
+
+    let duplicate =
+        SelectDefinition::try_new([("same", col("id")), ("same", col("score"))]).unwrap();
+    assert!(matches!(
+        bind(&duplicate, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::DuplicateField { ref name, .. }
+        }) if name == "same"
+    ));
+
+    let reserved = SelectDefinition::try_new([("$dogpaddle.internal", col("id"))]).unwrap();
+    assert!(matches!(
+        bind(&reserved, std::slice::from_ref(&input)),
+        Err(OperationBindError::InvalidOutputSchema {
+            source: SchemaError::ReservedFieldName { ref name, .. }
+        }) if name == "$dogpaddle.internal"
+    ));
+}
+
+#[test]
+fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
+    let definition = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
+    let expected = value_schema();
+    let mismatched = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        true,
+    )]));
+
+    let Err(OperationBindError::Rejected { source }) = bind(
+        &definition,
+        &[Arc::clone(&expected), Arc::clone(&mismatched)],
+    ) else {
+        panic!("mismatched UnionAll input unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<UnionAllSchemaError>(),
+        Some(UnionAllSchemaError::InputSchemaMismatch {
+            input: 1,
+            expected: actual_expected,
+            actual,
+        }) if actual_expected == &expected && actual == &mismatched
+    ));
+
+    let binding = bind(&definition, &[Arc::clone(&expected), Arc::clone(&expected)]).unwrap();
+    assert_eq!(binding.output_schema(), Some(&expected));
 }
 
 #[test]
