@@ -1,0 +1,28 @@
+[package]
+name = "dogpaddle-debezium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+exclude = ["bridge/target"]
+autotests = false
+autobenches = false
+
+[lib]
+bench = false
+
+[dependencies]
+crc32fast.workspace = true
+jni.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[lints]
+workspace = true

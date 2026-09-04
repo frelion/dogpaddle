@@ -1,0 +1,4 @@
+dogpaddle.debezium.distribution=1
+bridge.protocol=1
+debezium.version=3.6.2.Final
+kafka.connect.version=4.3.0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D1 process-level acceptance test against a real PostgreSQL logical slot."""
+"""Black-box recovery gate for the product Debezium runtime and PostgreSQL."""
 
 from __future__ import annotations
 
@@ -177,11 +177,7 @@ class Host:
                 return item
 
     def error(self, command: str, message_fragment: str) -> Response:
-        response = self.request(
-            command,
-            lambda body: body.get("kind") == "error",
-            timeout=30.0,
-        )
+        response = self.request(command, lambda body: body.get("kind") == "error")
         message = response.body.get("message")
         require(
             isinstance(message, str) and message_fragment in message,
@@ -192,23 +188,19 @@ class Host:
     def start(self) -> Response:
         return self.request(
             "start",
-            lambda body: body.get("kind") in {"state", "status"}
-            and str(body.get("state", "")).upper() in {"READY", "RUNNING"},
+            lambda body: body.get("kind") == "state"
+            and body.get("state") == "running",
             timeout=60.0,
         )
 
     def status(self) -> Response:
-        return self.request(
-            "status",
-            lambda body: body.get("kind") == "status",
-            timeout=10.0,
-        )
+        return self.request("status", lambda body: body.get("kind") == "status")
 
-    def poll(self) -> Response:
+    def poll(self, timeout_ms: int = 1_000) -> Response:
         return self.request(
-            "poll",
+            f"poll {timeout_ms}",
             lambda body: body.get("kind") in {"delivery", "idle"},
-            timeout=30.0,
+            timeout=max(30.0, timeout_ms / 1_000 + 10.0),
         )
 
     def delivery(self, timeout: float = 30.0) -> Response:
@@ -219,26 +211,27 @@ class Host:
                 return response
         raise GateFailure("timeout waiting for a delivery")
 
+    def save(self) -> Response:
+        return self.request("save", lambda body: body.get("kind") == "saved")
+
     def ack(self, token: int) -> Response:
         return self.request(
             f"ack {token}",
             lambda body: body.get("kind") == "ack" and body.get("token") == token,
-            timeout=30.0,
+            timeout=60.0,
         )
 
-    def stop(self, timeout_ms: int | None = None) -> Response:
-        command = "stop" if timeout_ms is None else f"stop {timeout_ms}"
+    def stop(self) -> Response:
         return self.request(
-            command,
-            lambda body: body.get("kind") in {"state", "status"}
-            and str(body.get("state", "")).upper() == "STOPPED",
+            "stop",
+            lambda body: body.get("kind") == "state" and body.get("state") == "stopped",
             timeout=60.0,
         )
 
     def close(self) -> None:
         if self._process.poll() is None:
             try:
-                self.request("quit", lambda body: body.get("kind") == "bye", timeout=10.0)
+                self.request("quit", lambda body: body.get("kind") == "bye", timeout=40.0)
             except (BrokenPipeError, GateFailure):
                 self._process.terminate()
         try:
@@ -276,53 +269,18 @@ def wait_slot(pg: Pg, active: bool) -> Slot:
 
 
 def stable_confirmed_flush(pg: Pg, hold_seconds: float) -> Slot:
-    """Require the slot's acknowledged LSN to stay unchanged for a full hold."""
     first = pg.slot()
     time.sleep(hold_seconds)
     second = pg.slot()
     require(
         first.active_count == 1 and second.active_count == 1,
-        "replication slot became inactive while establishing the LSN baseline",
+        "replication slot became inactive during the observation window",
     )
     require(
         first.confirmed_flush == second.confirmed_flush,
-        "confirmed_flush_lsn was not stable before the unacknowledged test",
+        "confirmed_flush_lsn changed without ACK",
     )
     return second
-
-
-def read_offset_file(path: Path) -> bytes:
-    return path.read_bytes() if path.is_file() else b""
-
-
-def digest(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def require_process_identity(
-    response: Response,
-    expected_jvm_id: str | None = None,
-) -> str:
-    body = response.body
-    jvm_id = body.get("jvm_id")
-    java_process_id = body.get("java_process_id")
-    rust_process_id = body.get("rust_process_id")
-    require(isinstance(jvm_id, str) and jvm_id, "status has no JVM identity")
-    require(
-        isinstance(java_process_id, int) and java_process_id > 0,
-        "status has no Java process ID",
-    )
-    require(
-        isinstance(rust_process_id, int) and rust_process_id > 0,
-        "status has no Rust process ID",
-    )
-    require(
-        java_process_id == rust_process_id,
-        "Java and Rust do not report the same OS process",
-    )
-    if expected_jvm_id is not None:
-        require(jvm_id == expected_jvm_id, "a fresh JVM was created during Engine restart")
-    return jvm_id
 
 
 def require_connector_fixture(path: Path) -> dict[str, Any]:
@@ -340,22 +298,32 @@ def require_connector_fixture(path: Path) -> dict[str, Any]:
         configuration.get("lsn.flush.mode") == "connector",
         "D1 runner requires lsn.flush.mode=connector",
     )
-    require(
-        configuration.get("offset.storage")
-        == "org.apache.kafka.connect.storage.FileOffsetBackingStore",
-        "D1 runner requires FileOffsetBackingStore",
+    offset_keys = sorted(
+        key for key in configuration if key == "offset" or key.startswith("offset.")
     )
-    require(
-        configuration.get("offset.storage.file.filename") == "/state/offsets.dat",
-        "D1 runner and host disagree about the offset file path",
-    )
+    require(not offset_keys, f"Java offset-store properties remain in the fixture: {offset_keys!r}")
     return configuration
+
+
+def checkpoint_bytes(delivery: dict[str, Any]) -> bytes:
+    encoded = delivery.get("checkpoint")
+    require(isinstance(encoded, str) and encoded, "delivery has no opaque checkpoint")
+    try:
+        decoded = bytes.fromhex(encoded)
+    except ValueError as error:
+        raise GateFailure("delivery checkpoint is not lowercase hexadecimal") from error
+    require(encoded == decoded.hex(), "delivery checkpoint is not canonical lowercase hexadecimal")
+    require(
+        delivery.get("checkpoint_bytes") == len(decoded),
+        "checkpoint_bytes does not match the opaque checkpoint",
+    )
+    return decoded
 
 
 def business_events(delivery: dict[str, Any]) -> list[dict[str, Any]]:
     events = delivery.get("events")
     require(isinstance(events, list), "delivery.events is not an array")
-    require(delivery.get("event_count") == len(events), "event_count does not match events")
+    require(delivery.get("record_count") == len(events), "record_count does not match events")
     selected: list[dict[str, Any]] = []
     for event in events:
         require(isinstance(event, dict), "delivery contains a non-object event")
@@ -381,22 +349,13 @@ def event_ids(delivery: dict[str, Any]) -> list[int]:
     return result
 
 
-def postgres_committable_lsn(delivery: dict[str, Any]) -> int:
-    """Extract the connector's PG commit frontier only for this black-box oracle."""
-    offset = delivery.get("offset")
-    require(isinstance(offset, dict), "delivery offset is not an object")
-    lsn = offset.get("lsn_commit", offset.get("lsn"))
-    require(
-        isinstance(lsn, (int, str)) and str(lsn).isdigit(),
-        f"delivery offset has no numeric PostgreSQL commit frontier: {lsn!r}",
-    )
-    return int(lsn)
-
-
 def replay_semantics(delivery: dict[str, Any]) -> str:
-    """Compare source identity and row meaning, excluding run-local metadata."""
+    """Compare decoded records while excluding only Engine-run metadata."""
     projected_events: list[dict[str, Any]] = []
-    for event in delivery["events"]:
+    events = delivery.get("events")
+    require(isinstance(events, list), "delivery.events is not an array")
+    for event in events:
+        require(isinstance(event, dict), "delivery contains a non-object event")
         headers = event.get("headers")
         if isinstance(headers, list):
             headers = [
@@ -407,24 +366,15 @@ def replay_semantics(delivery: dict[str, Any]) -> str:
                     and header.get("key") == "__debezium.context.runId"
                 )
             ]
-        projected = {
+        projected: dict[str, Any] = {
             "topic": event.get("topic"),
             "kafka_partition": event.get("kafka_partition"),
-            # SourceRecord.timestamp is connector-supplied, not part of the
-            # source partition/offset identity, and may be regenerated.
-            "partition": event.get("partition"),
-            "offset": event.get("offset"),
             "key": event.get("key"),
-            # runId deliberately identifies one Engine run, so it changes on
-            # replay. Every other Connect header remains part of the oracle.
             "headers": headers,
         }
         value = event.get("value")
         if isinstance(value, dict) and isinstance(value.get("payload"), dict):
             payload = dict(value["payload"])
-            # Debezium regenerates the envelope processing timestamps when the
-            # same WAL event is decoded by a fresh Engine. They are not source
-            # identity; source.ts_* and the complete source offset remain.
             payload.pop("ts_ms", None)
             payload.pop("ts_us", None)
             payload.pop("ts_ns", None)
@@ -432,26 +382,13 @@ def replay_semantics(delivery: dict[str, Any]) -> str:
         else:
             projected["value"] = value
         projected_events.append(projected)
-    return canonical_json(
-        {
-            "partition": delivery["partition"],
-            "offset": delivery["offset"],
-            "events": projected_events,
-        }
-    )
+    return canonical_json(projected_events)
 
 
-def assert_complete_position(delivery: dict[str, Any]) -> None:
-    partition = delivery.get("partition")
-    offset = delivery.get("offset")
-    require(isinstance(partition, dict) and partition, "delivery has no source partition")
-    require(isinstance(offset, dict) and offset, "delivery has no source offset")
-    events = delivery["events"]
-    require(partition == events[0].get("partition"), "envelope partition is not the first event partition")
-    require(offset == events[-1].get("offset"), "envelope offset is not the final event offset")
-    for event in events:
-        require(isinstance(event.get("partition"), dict) and event["partition"], "event partition is incomplete")
-        require(isinstance(event.get("offset"), dict) and event["offset"], "event offset is incomplete")
+def require_delivery(delivery: Response, expected_ids: list[int]) -> bytes:
+    require(delivery.body.get("protocol") == 2, "unexpected diagnostic protocol")
+    require(event_ids(delivery.body) == expected_ids, f"expected IDs {expected_ids!r}")
+    return checkpoint_bytes(delivery.body)
 
 
 def report(gate: str, **evidence: Any) -> None:
@@ -459,50 +396,26 @@ def report(gate: str, **evidence: Any) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    connector_configuration = require_connector_fixture(args.connector_fixture)
+    require_connector_fixture(args.connector_fixture)
     pg = Pg(args.pg_port)
     pg.reset()
-    offset_file = args.state_dir / "offsets.dat"
-    if offset_file.exists():
-        offset_file.unlink()
+    checkpoint_path = args.state_dir / "checkpoint.bin"
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
 
     host = Host(args.host_command, args.artifacts_dir / "host.stderr.log")
     try:
-        unsafe_configuration = dict(connector_configuration)
-        unsafe_configuration["lsn.flush.mode"] = "connector_and_driver"
-        unsafe_path = args.state_dir / "unsafe-lsn.json"
-        unsafe_path.write_text(canonical_json(unsafe_configuration), encoding="utf-8")
-        unsafe_error = host.error(
-            "create /state/unsafe-lsn.json",
-            "requires lsn.flush.mode=connector",
-        )
-        created_after_error = host.status()
-        require(
-            str(created_after_error.body.get("state", "")).upper() == "CREATED",
-            "a rejected configuration poisoned the original created handle",
-        )
-        report(
-            "unsafe PostgreSQL configuration fails through JNI without poisoning the host",
-            error=unsafe_error.body.get("message"),
-        )
-
         first_start = host.start()
-        jvm_id = require_process_identity(first_start)
-        report(
-            "Rust and the embedded JVM share one OS process",
-            java_process_id=first_start.body["java_process_id"],
-            rust_process_id=first_start.body["rust_process_id"],
-            jvm_id=jvm_id,
+        require(
+            first_start.body.get("resumed_checkpoint_bytes") == 0,
+            "first Engine resumed a checkpoint",
         )
-        initial_slot = wait_slot(pg, active=True)
+        wait_slot(pg, active=True)
         idle = host.poll()
-        require(idle.body.get("kind") == "idle", "poll timeout was not reported as idle")
-        report("poll timeout is an idle result")
-        hold_seconds = args.flush_interval_ms * args.flush_intervals / 1000.0
-        stable_slot = stable_confirmed_flush(pg, hold_seconds)
-        baseline = stable_slot.confirmed_flush
-        report("single active consumer after start", slot=initial_slot.__dict__)
+        require(idle.body.get("kind") == "idle", "ordinary poll timeout did not return idle")
 
+        hold_seconds = args.flush_interval_ms * args.flush_intervals / 1_000
+        baseline = stable_confirmed_flush(pg, hold_seconds).confirmed_flush
         pg.execute(
             "BEGIN; "
             "INSERT INTO public.d1_events(id, tx_seq, payload) VALUES "
@@ -510,315 +423,199 @@ def run(args: argparse.Namespace) -> None:
             "COMMIT;"
         )
         first = host.delivery()
-        assert_complete_position(first.body)
-        require(
-            postgres_committable_lsn(first.body) > baseline,
-            "first delivery did not move beyond the slot baseline",
-        )
-        require(event_ids(first.body) == [101, 102, 103], "multi-row transaction order changed")
+        first_checkpoint = require_delivery(first, [101, 102, 103])
         report(
-            "multi-row transaction order and complete position",
+            "ordinary timeout leaves the connector usable",
             ids=event_ids(first.body),
-            partition=first.body["partition"],
-            offset=first.body["offset"],
+            checkpoint_bytes=len(first_checkpoint),
         )
 
         first_token = int(first.body["token"])
-        offset_before_first_ack = read_offset_file(offset_file)
-        host.error("poll 1 1", "exceeding poll maxBytes=1")
-        host.error(f"ack {first_token + 1}", "does not match outstanding token")
-        status_after_wrong_token = host.status()
-        require(
-            status_after_wrong_token.body.get("outstanding") is True,
-            "wrong ACK hid outstanding state",
-        )
-        require(
-            status_after_wrong_token.body.get("token") == first_token,
-            "wrong ACK changed the token",
-        )
-        after_rejections = host.delivery()
-        require(
-            after_rejections.raw == first.raw,
-            "max-bytes or wrong-token rejection changed the outstanding delivery",
-        )
-        report(
-            "bounded poll and wrong-token errors preserve the outstanding delivery",
-            token=first_token,
-        )
-
-        pg.execute(
-            "INSERT INTO public.d1_events(id, tx_seq, payload) VALUES (201, 1, 'blocked');"
-        )
-        time.sleep(hold_seconds)
-        held_slot = pg.slot()
-        require(
-            held_slot.confirmed_flush == baseline,
-            "confirmed_flush_lsn advanced while the first delivery was unacknowledged",
-        )
-        require(
-            read_offset_file(offset_file) == offset_before_first_ack,
-            "file offset store changed while the first delivery was unacknowledged",
-        )
+        host.error(f"ack {first_token}", "checkpoint must be saved before ACK")
         repeats = [host.delivery(), host.delivery(), host.delivery()]
-        for repeated in repeats:
-            require(repeated.raw == first.raw, "outstanding delivery was not byte-for-byte stable")
-        require(pg.slot().confirmed_flush == baseline, "repeated polls advanced confirmed_flush_lsn")
+        require(
+            all(repeated.raw == first.raw for repeated in repeats),
+            "dropping Delivery changed its records, checkpoint, or host-local token",
+        )
+        held = stable_confirmed_flush(pg, hold_seconds)
+        require(held.confirmed_flush == baseline, "an unacknowledged Delivery advanced PostgreSQL")
         report(
-            "unacknowledged delivery survives multiple configured observation intervals",
-            observation_intervals=args.flush_intervals,
-            interval_ms=args.flush_interval_ms,
+            "dropped Delivery re-polls with identical bytes and checkpoint",
+            token=first_token,
+            observations=len(repeats) + 1,
+            checkpoint_sha256=hashlib.sha256(first_checkpoint).hexdigest(),
             confirmed_flush=baseline,
-            offset_file_sha256=digest(offset_before_first_ack),
-        )
-        report("single outstanding delivery backpressure", token=first.body["token"])
-
-        host.ack(first_token)
-        after_first_ack = wait_until(
-            "confirmed_flush_lsn to advance after ACK",
-            pg.slot,
-            lambda slot: slot.confirmed_flush > baseline,
-        )
-        report(
-            "ACK advances confirmed_flush_lsn",
-            before=baseline,
-            after=after_first_ack.confirmed_flush,
-        )
-        offset_after_first_ack = wait_until(
-            "file offset store to change after the first ACK",
-            lambda: read_offset_file(offset_file),
-            lambda value: value != offset_before_first_ack,
-        )
-        report(
-            "ACK advances the standard file offset store",
-            before_sha256=digest(offset_before_first_ack),
-            after_sha256=digest(offset_after_first_ack),
         )
 
-        second = host.delivery()
-        second_token = int(second.body["token"])
-        require(second_token != first_token, "a later delivery reused the first token")
-        require(event_ids(second.body) == [201], "later batch was lost or reordered after ACK")
-        assert_complete_position(second.body)
-        require(
-            after_first_ack.confirmed_flush < postgres_committable_lsn(second.body),
-            "the first ACK advanced PostgreSQL through the still-unacknowledged second delivery",
-        )
-        require(
-            pg.slot().confirmed_flush == after_first_ack.confirmed_flush,
-            "the second delivery advanced PostgreSQL before its ACK",
-        )
-        host.error(f"ack {first_token}", "does not match outstanding token")
-        status_after_stale_ack = host.status()
-        require(
-            status_after_stale_ack.body.get("outstanding") is True,
-            "stale ACK hid outstanding state",
-        )
-        require(
-            status_after_stale_ack.body.get("token") == second_token,
-            "stale ACK changed the delivery",
-        )
-        require(
-            host.delivery().raw == second.raw,
-            "stale ACK changed the outstanding delivery bytes",
-        )
-        offset_before_second_ack = read_offset_file(offset_file)
-        host.ack(second_token)
-        after_second_ack = wait_until(
-            "second ACK to reach PostgreSQL",
-            pg.slot,
-            lambda slot: slot.confirmed_flush > after_first_ack.confirmed_flush,
-        )
-        offset_after_second_ack = wait_until(
-            "file offset store to change after the second ACK",
-            lambda: read_offset_file(offset_file),
-            lambda value: value != offset_before_second_ack,
-        )
-        host.error(f"ack {second_token}", "no outstanding delivery")
-        status_after_repeated_ack = host.status()
-        require(
-            status_after_repeated_ack.body.get("outstanding") is False,
-            "repeated ACK reported a phantom outstanding delivery",
-        )
-        report(
-            "stale and repeated ACK tokens fail closed",
-            stale_token=first_token,
-            accepted_token=second_token,
-            confirmed_flush=after_second_ack.confirmed_flush,
-            offset_file_sha256=digest(offset_after_second_ack),
-        )
-
-        saved_partition = second.body["partition"]
-        saved_offset = second.body["offset"]
-        old_pid = pg.slot().active_pid
         host.stop()
         wait_slot(pg, active=False)
-        pg.execute(
-            "INSERT INTO public.d1_events(id, tx_seq, payload) VALUES (301, 1, 'after restart');"
-        )
-        second_start = host.start()
-        require_process_identity(second_start, jvm_id)
-        restarted_slot = wait_slot(pg, active=True)
-        require(restarted_slot.active_count == 1, "restart created more than one active slot consumer")
-        recovered = host.delivery()
+        require(not checkpoint_path.exists(), "unsaved Delivery unexpectedly created a checkpoint")
         require(
-            event_ids(recovered.body) == [301],
-            "combined file-offset/slot restart replayed an ACKed batch",
-        )
-        require(recovered.body["partition"] == saved_partition, "source partition changed after recovery")
-        require(recovered.body["offset"] != saved_offset, "source offset did not advance after recovery")
-        assert_complete_position(recovered.body)
-        report(
-            "stock FileOffsetBackingStore and persistent slot restart witness",
-            partition=saved_partition,
-            previous_offset=saved_offset,
-            recovered_offset=recovered.body["offset"],
-        )
-        report(
-            "stop/start single active consumer",
-            previous_pid=old_pid,
-            restarted_pid=restarted_slot.active_pid,
-            active_count=restarted_slot.active_count,
-            jvm_id=jvm_id,
+            pg.slot().confirmed_flush == baseline,
+            "stop acknowledged the outstanding unsaved Delivery",
         )
 
-        before_unacked_restart = pg.slot().confirmed_flush
+        replay_start = host.start()
         require(
-            before_unacked_restart < postgres_committable_lsn(recovered.body),
-            "the recovered delivery was already acknowledged before restart testing",
+            replay_start.body.get("resumed_checkpoint_bytes") == 0,
+            "fresh Engine unexpectedly resumed a checkpoint",
         )
-        recovered_token = int(recovered.body["token"])
-        unacked_semantics = replay_semantics(recovered.body)
-        offset_before_unacked_stop = read_offset_file(offset_file)
-        stop_started = time.monotonic()
-        stop_result = host.request(
-            "stop 0",
-            lambda body: body.get("kind") == "error"
-            or (
-                body.get("kind") in {"state", "status"}
-                and str(body.get("state", "")).upper() == "STOPPED"
-            ),
-            timeout=5.0,
-        )
-        if stop_result.body.get("kind") == "error":
-            message = stop_result.body.get("message")
-            require(
-                isinstance(message, str) and "did not stop within PT0S" in message,
-                f"zero-deadline stop returned an unexpected error: {message!r}",
-            )
-        stop_error_elapsed_ms = round((time.monotonic() - stop_started) * 1000)
+        wait_slot(pg, active=True)
+        replayed_first = host.delivery()
+        replayed_first_checkpoint = require_delivery(replayed_first, [101, 102, 103])
         require(
-            stop_error_elapsed_ms < 5_000,
-            "zero-deadline stop did not return a bounded error",
+            replayed_first_checkpoint == first_checkpoint,
+            "fresh Engine changed the replay candidate checkpoint",
         )
-        stopped_status = wait_until(
-            "asynchronous stop to finish after its deadline",
-            host.status,
-            lambda response: str(response.body.get("state", "")).upper() == "STOPPED",
-            timeout=30.0,
+        require(
+            replay_semantics(replayed_first.body) == replay_semantics(first.body),
+            "fresh Engine did not replay the unsaved, unacknowledged batch",
         )
-        require_process_identity(stopped_status, jvm_id)
+        report(
+            "fresh Engine without a saved checkpoint replays the batch",
+            previous_token=first_token,
+            replay_token=replayed_first.body["token"],
+        )
+
+        saved_first = host.save()
+        require(
+            checkpoint_path.read_bytes() == checkpoint_bytes(replayed_first.body),
+            "saved candidate changed",
+        )
+        require(
+            saved_first.body.get("checkpoint_bytes") == checkpoint_path.stat().st_size,
+            "save response has the wrong checkpoint size",
+        )
+        before_candidate_stop = pg.slot().confirmed_flush
+        host.stop()
         wait_slot(pg, active=False)
         require(
-            pg.slot().confirmed_flush == before_unacked_restart,
-            "graceful stop ACKed an outstanding delivery",
+            pg.slot().confirmed_flush == before_candidate_stop == baseline,
+            "saving a pre-ACK checkpoint or stopping acknowledged its batch",
         )
+
+        pg.execute(
+            "INSERT INTO public.d1_events(id, tx_seq, payload) VALUES (201, 1, 'after candidate');"
+        )
+        candidate_start = host.start()
         require(
-            read_offset_file(offset_file) == offset_before_unacked_stop,
-            "stopping persisted the unacknowledged delivery offset",
+            candidate_start.body.get("resumed_checkpoint_bytes")
+            == checkpoint_path.stat().st_size,
+            "fresh Engine did not load the opaque checkpoint",
         )
-        report(
-            "stop deadline is bounded and shutdown completes asynchronously",
-            elapsed_ms=stop_error_elapsed_ms,
-            immediate_outcome=(
-                "timeout" if stop_result.body.get("kind") == "error" else "stopped"
-            ),
-        )
-        third_start = host.start()
-        require_process_identity(third_start, jvm_id)
         wait_slot(pg, active=True)
-        replayed = host.delivery()
-        replayed_token = int(replayed.body["token"])
-        require(
-            replayed_token != recovered_token,
-            "a fresh Engine handle reused an earlier delivery token",
-        )
-        replayed_semantics = replay_semantics(replayed.body)
-        (args.artifacts_dir / "unacknowledged-before-restart.json").write_text(
-            unacked_semantics + "\n", encoding="utf-8"
-        )
-        (args.artifacts_dir / "unacknowledged-after-restart.json").write_text(
-            replayed_semantics + "\n", encoding="utf-8"
-        )
-        require(replayed_semantics == unacked_semantics, "unacknowledged delivery changed across restart")
-        host.error(f"ack {recovered_token}", "does not match outstanding token")
-        status_after_restart_stale_ack = host.status()
-        require(
-            status_after_restart_stale_ack.body.get("token") == replayed_token,
-            "cross-handle stale ACK changed the new outstanding token",
-        )
-        require(
-            host.delivery().raw == replayed.raw,
-            "cross-handle stale ACK changed the replayed delivery",
-        )
-        require(
-            read_offset_file(offset_file) == offset_before_unacked_stop,
-            "fresh Engine persisted the replay before ACK",
-        )
-        host.ack(replayed_token)
-        wait_until(
-            "replayed delivery ACK to advance PostgreSQL",
-            pg.slot,
-            lambda slot: slot.confirmed_flush > before_unacked_restart,
-        )
-        offset_after_replay_ack = wait_until(
-            "file offset store to change after replay ACK",
-            lambda: read_offset_file(offset_file),
-            lambda value: value != offset_before_unacked_stop,
-        )
+        after_candidate = host.delivery()
+        require_delivery(after_candidate, [201])
+        confirmed_before_candidate_ack = stable_confirmed_flush(
+            pg, hold_seconds
+        ).confirmed_flush
         report(
-            "unacknowledged stop/start replay",
-            offset=replayed.body["offset"],
-            previous_token=recovered_token,
-            replay_token=replayed_token,
-            offset_file_sha256=digest(offset_after_replay_ack),
+            "saved pre-ACK checkpoint alone skips the taken-over batch",
+            skipped_ids=[101, 102, 103],
+            next_ids=event_ids(after_candidate.body),
+            postgres_confirmed_flush=confirmed_before_candidate_ack,
         )
 
-        final_stop = host.stop()
-        require_process_identity(final_stop, jvm_id)
+        host.save()
+        after_candidate_token = int(after_candidate.body["token"])
+        host.ack(after_candidate_token)
+        lsn_at_ack_return = pg.slot().confirmed_flush
+        post_ack_poll = host.poll()
+        require(
+            post_ack_poll.body.get("kind") == "idle",
+            "post-ACK source poll unexpectedly produced a delivery",
+        )
+        host.stop()
+        after_candidate_ack = wait_slot(pg, active=False)
+        require(
+            after_candidate_ack.confirmed_flush > confirmed_before_candidate_ack,
+            "the accepted PostgreSQL position was not eventually flushed by the next poll/stop",
+        )
+        report(
+            "durable checkpoint precedes ACK and PostgreSQL flush is eventual",
+            token=after_candidate_token,
+            confirmed_flush_before=confirmed_before_candidate_ack,
+            confirmed_flush_at_ack_return=lsn_at_ack_return,
+            confirmed_flush_after=after_candidate_ack.confirmed_flush,
+            observation_boundary="next source poll plus graceful stop",
+        )
+        accepted_restart = host.start()
+        require(
+            accepted_restart.body.get("resumed_checkpoint_bytes")
+            == checkpoint_path.stat().st_size,
+            "post-ACK Engine did not resume the accepted checkpoint",
+        )
+        wait_slot(pg, active=True)
+
+        pg.execute(
+            "INSERT INTO public.d1_events(id, tx_seq, payload) VALUES (301, 1, 'stop outstanding');"
+        )
+        before_stop = host.delivery()
+        before_stop_checkpoint = require_delivery(before_stop, [301])
+        before_stop_semantics = replay_semantics(before_stop.body)
+        saved_checkpoint = checkpoint_path.read_bytes()
+        confirmed_before_stop = pg.slot().confirmed_flush
+        time.sleep(hold_seconds)
+        require(
+            pg.slot().confirmed_flush == confirmed_before_stop,
+            "outstanding batch advanced before stop",
+        )
+        host.stop()
+        wait_slot(pg, active=False)
+        require(
+            checkpoint_path.read_bytes() == saved_checkpoint,
+            "stop saved an outstanding checkpoint",
+        )
+        require(
+            pg.slot().confirmed_flush == confirmed_before_stop,
+            "stop acknowledged the outstanding batch",
+        )
+
+        final_start = host.start()
+        require(
+            final_start.body.get("resumed_checkpoint_bytes") == len(saved_checkpoint),
+            "final Engine did not resume the last accepted checkpoint",
+        )
+        wait_slot(pg, active=True)
+        after_stop = host.delivery()
+        after_stop_checkpoint = require_delivery(after_stop, [301])
+        require(
+            after_stop_checkpoint == before_stop_checkpoint,
+            "stop/restart changed the replay candidate checkpoint",
+        )
+        require(
+            replay_semantics(after_stop.body) == before_stop_semantics,
+            "stop changed the outstanding source semantics",
+        )
+        report(
+            "stop with an outstanding Delivery does not ACK it",
+            previous_token=before_stop.body["token"],
+            replay_token=after_stop.body["token"],
+            checkpoint_sha256=hashlib.sha256(after_stop_checkpoint).hexdigest(),
+        )
+
+        host.save()
+        host.ack(int(after_stop.body["token"]))
+        final_lsn_at_ack_return = pg.slot().confirmed_flush
+        host.stop()
         final_slot = wait_slot(pg, active=False)
-        report("clean stop", slot=final_slot.__dict__)
+        require(
+            final_slot.confirmed_flush > confirmed_before_stop,
+            "graceful stop did not eventually flush the final ACKed position",
+        )
 
-        missing_connector = dict(connector_configuration)
-        missing_connector["name"] = "dogpaddle-debezium-d1-missing-connector"
-        missing_connector["connector.class"] = (
-            "dev.dogpaddle.experiments.MissingD1Connector"
+        files = sorted(
+            str(path.relative_to(args.state_dir))
+            for path in args.state_dir.rglob("*")
+            if path.is_file()
         )
-        missing_path = args.state_dir / "missing-connector.json"
-        missing_path.write_text(canonical_json(missing_connector), encoding="utf-8")
-        create_result = host.request(
-            "create /state/missing-connector.json",
-            lambda body: body.get("kind") in {"state", "error"},
-            timeout=30.0,
-        )
-        if create_result.body.get("kind") == "error":
-            connector_failure = create_result
-        else:
-            connector_failure = host.error("start 10000", "engine did not start")
-        require(
-            "MissingD1Connector" in str(connector_failure.body.get("message", "")),
-            "missing connector failure did not retain its cause",
-        )
-        status_after_connector_failure = host.status()
-        require_process_identity(status_after_connector_failure, jvm_id)
-        require(
-            str(status_after_connector_failure.body.get("state", "")).upper()
-            in {"STOPPED", "FAILED"},
-            "connector failure left the handle in an unstable state",
-        )
+        require(files == ["checkpoint.bin"], f"unexpected Java or host state files: {files!r}")
         report(
-            "connector class-loading failure is structured and contained",
-            state=status_after_connector_failure.body.get("state"),
-            error=connector_failure.body.get("message"),
+            "opaque Rust checkpoint is the only durable offset truth",
+            files=files,
+            checkpoint_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+            confirmed_flush_at_ack_return=final_lsn_at_ack_return,
+            final_confirmed_flush=final_slot.confirmed_flush,
         )
     finally:
         host.close()
@@ -850,7 +647,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     try:
         run(parse_args())
-    except (GateFailure, subprocess.CalledProcessError) as error:
+    except (GateFailure, OSError, subprocess.CalledProcessError) as error:
         print(canonical_json({"result": "FAIL", "error": str(error)}), file=sys.stderr)
         return 1
     return 0

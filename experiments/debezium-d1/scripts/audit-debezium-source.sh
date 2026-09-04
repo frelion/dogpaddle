@@ -6,6 +6,8 @@ readonly DEBEZIUM_COMMIT="02810e25b19c04e5095b2b6fbbdcbae549a69f19"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 experiment_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
+product_bridge_source="$repo_dir/crates/debezium/bridge/src"
 audit_root="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-audit.XXXXXX")"
 trap 'rm -rf -- "$audit_root"' EXIT
 
@@ -78,27 +80,47 @@ require_source \
   "$pg_source" \
   'the PostgreSQL commit callback advances the replication stream LSN'
 
-if find "$experiment_dir/bridge/src" -type f -path '*/io/debezium/*' -print -quit | rg --quiet .; then
+if find "$product_bridge_source" -type f -path '*/io/debezium/*' -print -quit | rg --quiet .; then
   echo 'FAIL local Debezium class shadowing: found source below io/debezium' >&2
   exit 1
 fi
-echo 'PASS the experiment does not copy or shadow io.debezium classes'
+echo 'PASS the product bridge does not copy or shadow io.debezium classes'
 
 if rg --glob '*.java' --quiet \
   '^[[:space:]]*package[[:space:]]+io[.]debezium([.;])' \
-  "$experiment_dir/bridge/src"; then
+  "$product_bridge_source"; then
   echo 'FAIL local Debezium class shadowing: found an io.debezium package declaration' >&2
   exit 1
 fi
-echo 'PASS no Java source declares an io.debezium package'
+echo 'PASS no product Java source declares an io.debezium package'
 
 if rg --glob '*.java' --quiet \
   'System[.]load(Library)?[(]|RegisterNatives|[[:space:]]native[[:space:]]+[A-Za-z_$][A-Za-z0-9_.$<>?, \[\]]*[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*[(]' \
-  "$experiment_dir/bridge/src"; then
+  "$product_bridge_source"; then
   echo 'FAIL Java-to-Rust callback boundary: found native loading or a native method' >&2
   exit 1
 fi
-echo 'PASS the Java bridge declares no native callback into Rust'
+echo 'PASS the product Java bridge declares no native callback into Rust'
+
+if [[ -d "$experiment_dir/bridge/src" ]] \
+  && find "$experiment_dir/bridge/src" -type f -print -quit | rg --quiet .; then
+  echo 'FAIL the D1 fixture still owns Java bridge source' >&2
+  exit 1
+fi
+echo 'PASS the D1 fixture owns no Java bridge source'
+
+if [[ -e "$experiment_dir/bridge/pom.xml" ]]; then
+  echo 'FAIL the D1 fixture still owns a Maven distribution manifest' >&2
+  exit 1
+fi
+echo 'PASS the D1 fixture owns no Maven distribution or dependency manifest'
+
+if rg --fixed-strings --quiet 'jni =' "$experiment_dir/host/Cargo.toml" \
+  || rg --fixed-strings --quiet 'mod bridge;' "$experiment_dir/host/src"; then
+  echo 'FAIL the D1 host still owns a JNI boundary' >&2
+  exit 1
+fi
+echo 'PASS the D1 host reaches JNI only through dogpaddle-debezium'
 
 if ! rg --fixed-strings --line-regexp --quiet \
   'unsafe_code = "forbid"' \

@@ -7,6 +7,9 @@ readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 experiment_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
+runtime_bundle="$repo_dir/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu"
+host_binary="$experiment_dir/host/target/release/dogpaddle-debezium-d1-host"
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-state.XXXXXX")"
 artifacts_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-artifacts.XXXXXX")"
 owns_postgres=0
@@ -49,7 +52,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in podman psql python3 cargo git rg unzip flock; do
+for command in podman psql python3 cargo git rg flock id; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "missing required command: $command" >&2
     exit 1
@@ -88,6 +91,18 @@ if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_netwo
 fi
 
 "$script_dir/audit-debezium-source.sh"
+podman run --rm \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --env HOME=/tmp/dogpaddle-maven \
+  --env MAVEN_CONFIG=/tmp/dogpaddle-maven/.m2 \
+  --env MAVEN_OPTS=-Duser.home=/tmp/dogpaddle-maven \
+  --volume "$repo_dir:/workspace:Z" \
+  --volume "$repo_dir/target/debezium-maven-cache:/tmp/dogpaddle-maven/.m2:Z" \
+  --workdir /workspace \
+  --entrypoint /bin/bash \
+  "$MAVEN_IMAGE" \
+  crates/debezium/scripts/build-distribution.sh
 "$script_dir/build.sh"
 
 owns_postgres=1
@@ -125,11 +140,21 @@ python3 "$experiment_dir/tests/d1_blackbox.py" \
   -- \
   podman run --rm --interactive \
     --network host \
-    --volume "$experiment_dir/host/target/release/dogpaddle-debezium-d1-host:/opt/d1/host:ro,Z" \
-    --volume "$experiment_dir/bridge/target:/opt/d1/bridge:ro,Z" \
+    --env PATH=/nonexistent \
+    --env JAVA_HOME=/nonexistent \
+    --env JDK_HOME=/nonexistent \
+    --env JAVA_TOOL_OPTIONS= \
+    --env JDK_JAVA_OPTIONS= \
+    --env _JAVA_OPTIONS= \
+    --env LD_LIBRARY_PATH= \
+    --env DYLD_LIBRARY_PATH= \
+    --env DYLD_FALLBACK_LIBRARY_PATH= \
+    --volume "$host_binary:/opt/d1/host:ro,Z" \
+    --volume "$runtime_bundle:/opt/d1/bundle:ro,Z" \
     --volume "$experiment_dir/tests/fixtures/connector.json:/opt/d1/connector.json:ro,Z" \
     --volume "$state_dir:/state:Z" \
     --entrypoint /opt/d1/host \
     "$MAVEN_IMAGE" \
-    --bridge-jar /opt/d1/bridge/debezium-d1-bridge-0.1.0.jar \
-    --config /opt/d1/connector.json
+    --bundle /opt/d1/bundle \
+    --config /opt/d1/connector.json \
+    --checkpoint /state/checkpoint.bin

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237"
-
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 experiment_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
+product_crate_dir="$repo_dir/crates/debezium"
+runtime_distribution="$product_crate_dir/bridge/target/distribution"
+runtime_bundle="$product_crate_dir/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu"
+host_binary="$experiment_dir/host/target/release/dogpaddle-debezium-d1-host"
 
 cargo fmt \
   --manifest-path "$experiment_dir/host/Cargo.toml" \
@@ -24,21 +27,18 @@ cargo build \
   --release \
   --manifest-path "$experiment_dir/host/Cargo.toml"
 
-podman run --rm \
-  --volume "$experiment_dir/bridge:/workspace:Z" \
-  --workdir /workspace \
-  "$MAVEN_IMAGE" \
-  mvn --batch-mode --no-transfer-progress clean package
+"$product_crate_dir/scripts/build-runtime-bundle.sh" x86_64-unknown-linux-gnu
 
-if unzip -Z1 "$experiment_dir/bridge/target/debezium-d1-bridge-0.1.0.jar" \
-  | rg '^io/debezium/' >/dev/null; then
-  echo 'bridge artifact must not contain copied or shadowed io.debezium classes' >&2
-  exit 1
-fi
+test -x "$host_binary"
+test -f "$runtime_distribution/MANIFEST"
+test -f "$runtime_distribution/SHA256SUMS"
+test -f "$runtime_distribution/bom.json"
+test -f "$runtime_distribution/lib/dogpaddle-debezium-bridge.jar"
+test -f "$runtime_distribution/lib/debezium-connector-postgres-3.6.2.Final.jar"
+test -f "$runtime_bundle/runtime/lib/server/libjvm.so"
+test -f "$runtime_bundle/runtime-sbom.json"
+test -f "$runtime_bundle/debezium/lib/debezium-connector-postgres-3.6.2.Final.jar"
 
-test -x "$experiment_dir/host/target/release/dogpaddle-debezium-d1-host"
-test -f "$experiment_dir/bridge/target/debezium-d1-bridge-0.1.0.jar"
-test -d "$experiment_dir/bridge/target/dependency"
-
-echo 'PASS bridge artifact contains no io.debezium classes'
-echo 'PASS Rust host format, tests, Clippy, and release build'
+echo "PASS D1 consumes the product-built PostgreSQL distribution unchanged"
+echo "PASS D1 uses the pinned self-contained Java runtime bundle"
+echo "PASS Rust host format, tests, Clippy, and release build"
