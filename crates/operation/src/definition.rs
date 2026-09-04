@@ -231,18 +231,27 @@ impl OperationBinding {
         self.output_schema.as_ref()
     }
 
-    /// Consumes this binding and injects its named typed data instances.
+    /// Consumes this binding and its named typed data instances.
     ///
     /// # Errors
     ///
-    /// Returns [`MaterializeError`] when the supplied instances do not match
-    /// the persistent Definition's declared data schema.
+    /// Returns [`MaterializeError`] when the supplied instances are missing,
+    /// have the wrong class, or remain unconsumed after assembly.
     #[doc(hidden)]
     pub fn materialize(
         self,
-        data: &mut DataInstances,
+        mut data: DataInstances,
     ) -> Result<Box<dyn Operation>, MaterializeError> {
-        (self.materialize)(data)
+        let operation = (self.materialize)(&mut data)?;
+        data.finish()?;
+        Ok(operation)
+    }
+
+    pub(crate) fn without_data<O>(output_schema: Option<SchemaRef>, operation: O) -> Self
+    where
+        O: Operation,
+    {
+        Self::new(output_schema, move |_data| Ok(Box::new(operation)))
     }
 }
 
@@ -324,8 +333,7 @@ impl DataInstances {
     /// # Errors
     ///
     /// Returns [`MaterializeError::UnexpectedData`] for the first unconsumed name.
-    #[doc(hidden)]
-    pub fn finish(self) -> Result<(), MaterializeError> {
+    pub(crate) fn finish(self) -> Result<(), MaterializeError> {
         self.remaining.into_keys().next().map_or(Ok(()), |name| {
             Err(MaterializeError::UnexpectedData { name })
         })

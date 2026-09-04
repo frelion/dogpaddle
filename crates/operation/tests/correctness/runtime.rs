@@ -61,21 +61,19 @@ fn stateless_operation(
     definition: &dyn OperationDefinition,
     input_schema: arrow_schema::SchemaRef,
 ) -> Box<dyn Operation> {
-    let mut data = DataInstances::new();
-    let operation = definition
+    let data = DataInstances::new();
+    definition
         .bind(&[input_schema])
         .unwrap()
-        .materialize(&mut data)
-        .unwrap();
-    data.finish().unwrap();
-    operation
+        .materialize(data)
+        .unwrap()
 }
 
 fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change) -> Change {
     let encoded = encode_definition(definition);
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(encode_definition(decoded.as_ref()), encoded);
-    let operation = stateless_operation(decoded.as_ref(), input.schema());
+    let mut operation = stateless_operation(decoded.as_ref(), input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -167,9 +165,9 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
-    let source = SequenceSourceOperation::new(41, position);
-    let transform = RunningEventCountOperation::new(count);
-    let sink = DiscardOperation;
+    let mut source = SequenceSourceOperation::new(41, position);
+    let mut transform = RunningEventCountOperation::new(count);
+    let mut sink = DiscardOperation;
     let input = change(&[2, -1]);
     let mut transactions = store.into_transactions();
 
@@ -205,10 +203,10 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let source =
+    let mut source =
         SequenceSourceOperation::new(41, store.open_data::<Cell<u64>>("position").unwrap());
     let count_state = store.open_data::<Cell<u64>>("count").unwrap();
-    let transform = RunningEventCountOperation::new(count_state.clone());
+    let mut transform = RunningEventCountOperation::new(count_state.clone());
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     assert_eq!(
@@ -244,12 +242,13 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
 fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
-    let source = SequenceSourceOperation::new(
+    let mut source = SequenceSourceOperation::new(
         u64::MAX - 1,
         store.create_data::<Cell<u64>>("position").unwrap(),
     );
-    let count = RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
-    let sink = DiscardOperation;
+    let mut count =
+        RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
+    let mut sink = DiscardOperation;
     let input = change(&[1]);
     let mut transactions = store.into_transactions();
 
@@ -346,7 +345,8 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
 #[test]
 fn project_input_protocol_errors_are_exact() {
     let input = change(&[1]);
-    let project = ProjectOperation::new(ChangeProjection::try_new(input.schema(), [0]).unwrap());
+    let mut project =
+        ProjectOperation::new(ChangeProjection::try_new(input.schema(), [0]).unwrap());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -376,7 +376,7 @@ fn project_input_protocol_errors_are_exact() {
         DataType::UInt64,
         false,
     )]));
-    let mismatched =
+    let mut mismatched =
         ProjectOperation::new(ChangeProjection::try_new(expected_schema, [0]).unwrap());
     let error = mismatched
         .turn(Some(turn_input(&input)), transaction.access())
@@ -402,7 +402,7 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
-    let operation = ProjectOperation::new(ChangeProjection::try_new(schema, [1]).unwrap());
+    let mut operation = ProjectOperation::new(ChangeProjection::try_new(schema, [1]).unwrap());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -463,7 +463,7 @@ fn filter_keeps_only_true_rows_with_the_same_order_records_and_diffs() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2])).unwrap();
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
@@ -559,7 +559,7 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 2, 3, 4])).unwrap();
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
@@ -607,7 +607,7 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
 
-    let all_true = stateless_operation(
+    let mut all_true = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
@@ -627,7 +627,7 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     );
 
     for predicate in [lit(false), lit(ScalarValue::Boolean(None))] {
-        let operation = stateless_operation(
+        let mut operation = stateless_operation(
             &FilterDefinition::try_new(predicate).unwrap(),
             input.schema(),
         );
@@ -658,7 +658,7 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     let expression = col("flag")
         .and(lit(ScalarValue::Boolean(None)))
         .or(col("label").is_null());
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &ExtendDefinition::try_new("selected", expression).unwrap(),
         Arc::clone(&schema),
     );
@@ -698,7 +698,7 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
         [None, Some(true), None]
     );
 
-    let copy = stateless_operation(
+    let mut copy = stateless_operation(
         &ExtendDefinition::try_new("label_copy", col("label")).unwrap(),
         Arc::clone(&schema),
     );
@@ -717,11 +717,11 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
 #[test]
 fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
     let input = change(&[1]);
-    let filter = stateless_operation(
+    let mut filter = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
-    let extend = stateless_operation(
+    let mut extend = stateless_operation(
         &ExtendDefinition::try_new("copy", col("input")).unwrap(),
         input.schema(),
     );
@@ -777,7 +777,7 @@ fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    for operation in [&filter, &extend] {
+    for operation in [&mut filter, &mut extend] {
         let error = operation
             .turn(Some(turn_input(&drifted)), transaction.access())
             .unwrap_err();
@@ -1003,7 +1003,7 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
     let definition =
         SelectDefinition::try_new([("copied", col("label")), ("next", col("id") + lit(1_u64))])
             .unwrap();
-    let operation = stateless_operation(&definition, Arc::clone(&schema));
+    let mut operation = stateless_operation(&definition, Arc::clone(&schema));
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1064,7 +1064,7 @@ fn schema_align_applies_explicit_schema_and_shares_direct_columns_and_diffs() {
         HashMap::from([("normalized".to_owned(), "v1".to_owned())]),
     )
     .unwrap();
-    let operation = stateless_operation(&definition, Arc::clone(&schema));
+    let mut operation = stateless_operation(&definition, Arc::clone(&schema));
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1110,7 +1110,7 @@ fn schema_align_applies_explicit_schema_and_shares_direct_columns_and_diffs() {
 fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
     let input = change(&[1, -1, 2]);
     let definition = SchemaAlignDefinition::try_new([]).unwrap();
-    let operation = stateless_operation(&definition, input.schema());
+    let mut operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1148,7 +1148,7 @@ fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
             SchemaAlignField::try_new("renamed", col("input"), false).unwrap()
         ])
         .unwrap();
-    let operation = stateless_operation(&definition, input.schema());
+    let mut operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1187,7 +1187,7 @@ fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
 fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let input = change(&[1, -1, 2]);
     let definition = SelectDefinition::try_new(std::iter::empty::<(&str, Expr)>()).unwrap();
-    let operation = stateless_operation(&definition, input.schema());
+    let mut operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1236,13 +1236,12 @@ fn union_all_forwards_every_legal_port_without_copying() {
     )
     .unwrap();
     let definition = UnionAllDefinition::new(std::num::NonZeroU32::new(3).unwrap());
-    let mut data = DataInstances::new();
-    let operation = (&definition as &dyn OperationDefinition)
+    let data = DataInstances::new();
+    let mut operation = (&definition as &dyn OperationDefinition)
         .bind(&[input.schema(), input.schema(), input.schema()])
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1303,18 +1302,17 @@ fn union_all_forwards_every_legal_port_without_copying() {
 #[test]
 fn select_and_union_all_reject_missing_and_invalid_ports() {
     let input = change(&[1]);
-    let select = stateless_operation(
+    let mut select = stateless_operation(
         &SelectDefinition::try_new([("input", col("input"))]).unwrap(),
         input.schema(),
     );
     let union_definition = UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap());
-    let mut data = DataInstances::new();
-    let union = (&union_definition as &dyn OperationDefinition)
+    let data = DataInstances::new();
+    let mut union = (&union_definition as &dyn OperationDefinition)
         .bind(&[input.schema(), input.schema()])
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1393,7 +1391,7 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
     let transaction = transactions.begin().unwrap();
 
     for (name, expression, expected) in kleene_cases() {
-        let operation = stateless_operation(
+        let mut operation = stateless_operation(
             &ExtendDefinition::try_new(name, expression).unwrap(),
             Arc::clone(&schema),
         );
@@ -1521,7 +1519,7 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
                 comparison(operator, col(column), lit(literal.clone())),
                 comparison(operator, lit(literal.clone()), col(column)),
             ] {
-                let operation = stateless_operation(
+                let mut operation = stateless_operation(
                     &ExtendDefinition::try_new("result", expression).unwrap(),
                     Arc::clone(&schema),
                 );
@@ -1548,7 +1546,7 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
         (Operator::Eq, [Some(true), Some(true), None]),
         (Operator::NotEq, [Some(false), Some(false), None]),
     ] {
-        let operation = stateless_operation(
+        let mut operation = stateless_operation(
             &ExtendDefinition::try_new(
                 "array_result",
                 comparison(operator, col("boolean"), col("boolean")),
@@ -1595,7 +1593,7 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     let transaction = transactions.begin().unwrap();
 
     let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &ExtendDefinition::try_new("greater", predicate).unwrap(),
         Arc::clone(&schema),
     );
@@ -1616,7 +1614,7 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         [Some(false), Some(true)]
     );
 
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &ExtendDefinition::try_new("parsed", try_cast(col("text"), DataType::Int64)).unwrap(),
         Arc::clone(&schema),
     );
@@ -1649,13 +1647,12 @@ fn structural_trace(
     let input_schemas = (0..definition.kind().input_count())
         .map(|_| Arc::clone(&schema))
         .collect::<Vec<_>>();
-    let mut data = DataInstances::new();
-    let operation = definition
+    let data = DataInstances::new();
+    let mut operation = definition
         .bind(&input_schemas)
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1796,7 +1793,8 @@ fn filter_trace(
 ) -> Vec<(u64, i64)> {
     assert_eq!(batches.iter().sum::<usize>(), values.len());
     let schema = predicate_change(&values[..1], &keep[..1], &diffs[..1]).schema();
-    let operation = stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
+    let mut operation =
+        stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -1845,7 +1843,7 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
         DataType::UInt64,
         false,
     )]));
-    let operation = stateless_operation(
+    let mut operation = stateless_operation(
         &ExtendDefinition::try_new("seven", col("value").eq(lit(7_u64))).unwrap(),
         Arc::clone(&schema),
     );
@@ -1929,7 +1927,7 @@ fn running_event_count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
     assert_eq!(batches.iter().sum::<usize>(), diffs.len());
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
-    let operation =
+    let mut operation =
         RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
     let mut transactions = store.into_transactions();
     let mut output = Vec::new();
@@ -1961,7 +1959,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let state = store.create_data::<Cell<u64>>("count").unwrap();
-    let operation = RunningEventCountOperation::new(state.clone());
+    let mut operation = RunningEventCountOperation::new(state.clone());
     let input = change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
@@ -2006,7 +2004,8 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let operation = RunningEventCountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
+    let mut operation =
+        RunningEventCountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let change = change(&[1]);

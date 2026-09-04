@@ -368,13 +368,12 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     let transaction = transactions.begin().unwrap();
 
     let filter = decode_definition(&decode_hex(FILTER_V1)).unwrap();
-    let mut data = DataInstances::new();
-    let filter = filter
+    let data = DataInstances::new();
+    let mut filter = filter
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let Action::Complete(Some(filtered)) = filter
         .turn(
             Some(OperationInput {
@@ -397,13 +396,12 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     assert_eq!(filtered.diffs().values(), &[1, 2]);
 
     let extend = decode_definition(&decode_hex(EXTEND_V1)).unwrap();
-    let mut data = DataInstances::new();
-    let extend = extend
+    let data = DataInstances::new();
+    let mut extend = extend
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let Action::Complete(Some(extended)) = extend
         .turn(
             Some(OperationInput {
@@ -445,13 +443,12 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
     let transaction = transactions.begin().unwrap();
 
     let select = decode_definition(&decode_hex(SELECT_V1)).unwrap();
-    let mut data = DataInstances::new();
-    let select = select
+    let data = DataInstances::new();
+    let mut select = select
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let Action::Complete(Some(selected)) = select
         .turn(
             Some(OperationInput {
@@ -483,14 +480,13 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
     assert_eq!(selected.diffs().values(), &[1, -1, 2]);
 
     let union_all = decode_definition(&decode_hex(UNION_ALL_V1)).unwrap();
-    let mut data = DataInstances::new();
+    let data = DataInstances::new();
     let union_inputs = [Arc::clone(&schema), Arc::clone(&schema)];
-    let union_all = union_all
+    let mut union_all = union_all
         .bind(&union_inputs)
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let Action::Complete(Some(forwarded)) = union_all
         .turn(
             Some(OperationInput {
@@ -528,13 +524,12 @@ fn decoded_schema_align_golden_reconstructs_its_runtime_semantics() {
     let transaction = transactions.begin().unwrap();
 
     let definition = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
-    let mut data = DataInstances::new();
-    let operation = definition
+    let data = DataInstances::new();
+    let mut operation = definition
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(&mut data)
+        .materialize(data)
         .unwrap();
-    data.finish().unwrap();
     let Action::Complete(Some(aligned)) = operation
         .turn(
             Some(OperationInput {

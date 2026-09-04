@@ -437,6 +437,17 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 数据库连接器仍须先选择 outbox、幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法
 由该协议重放或验证的可观察副作用。
 
+远端数据库接入遵守以下最小边界，不提前建立通用 SQL Sink 框架：
+
+- Definition 只持久化逻辑 destination key 和非敏感行为配置，不持久化密码、token 或完整 secret DSN；
+- 第一个远端 Sink 落地时，由宿主在 build/open 的 materialize 边界显式注入 destination resolver；
+  Schema bind 继续保持纯函数，Operation 不读取全局环境变量或进程级单例；
+- 当前同步 `turn(&mut self)` 会独占该 Operation，并让外部提交发生在 Flow 的 MDBX 写事务期间；
+  第一版远端客户端必须有明确的连接和请求超时。若真实 workload 证明需要异步或事务外 I/O，先扩展
+  Flow 的提交协议，不能把后台任务或第二套状态机藏进具体 Sink；
+- SQLite、PostgreSQL 与 MySQL 各自保留专用 DDL、DML、锁和重放实现。只有第二个实现证明行身份或
+  配置注入语义完全相同时，才提取对应的小型公共组件。
+
 ### 退出标准
 
 公共 API 使用真实订单 Change 完成：

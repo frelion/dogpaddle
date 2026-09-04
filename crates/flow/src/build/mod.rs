@@ -140,11 +140,14 @@ impl FlowFactory {
         let topology = resolve_topology(&definition);
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
+        let station_ids = definition
+            .stations()
+            .iter()
+            .map(|station| station.id().to_owned())
+            .collect();
 
         let mut store = Store::create(&path)?;
         let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
-        let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-            store.create_data(codec::FLOW_STATE_DATA_NAME)?;
         let station_parts = definition
             .stations()
             .iter()
@@ -168,7 +171,7 @@ impl FlowFactory {
 
         Ok(Flow::from_parts(
             path,
-            definition,
+            station_ids,
             assembled.stations,
             assembled.topology,
             transactions,
@@ -214,8 +217,7 @@ fn create_station_part(
         data.insert(declaration.create(store, &physical_name)?)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(&mut data)?;
-    data.finish()?;
+    let operation = binding.materialize(data)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => store
             .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))

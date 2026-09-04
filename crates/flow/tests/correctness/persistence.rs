@@ -40,7 +40,6 @@ fn build_uses_the_stable_resource_layout_and_input_origins() {
     let path = root.path().join("flow");
     build_chain(&path);
     let store = Store::open(&path).unwrap();
-    let _flow_state: OrderedMap<Vec<u8>, Vec<u8>, Small> = store.open_data("flow/state").unwrap();
     let states: [OrderedMap<Vec<u8>, Vec<u8>, Small>; 3] = [
         store.open_data("station/00000000/state").unwrap(),
         store.open_data("station/00000001/state").unwrap(),
@@ -106,9 +105,6 @@ fn open_classifies_each_required_station_resource_fault() {
 fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault) {
     let mut store = Store::create(path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    store
-        .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("flow/state")
-        .unwrap();
     store
         .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("station/00000000/state")
         .unwrap();

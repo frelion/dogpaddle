@@ -11,7 +11,6 @@ use crate::{
     definition::{DataName, Sealed},
     lit,
     operation::{
-        Operation,
         sink::{DiscardDefinition, DiscardOperation, SqliteSinkDefinition},
         source::SequenceSourceDefinition,
         transform::{
@@ -54,12 +53,7 @@ impl Sealed for TestDefinition {
             TestBinding::UnexpectedOutput => Some(valid_schema()),
             TestBinding::InvalidOutput => Some(invalid_schema()),
         };
-        Ok(OperationBinding::new(
-            output,
-            |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(DiscardOperation))
-            },
-        ))
+        Ok(OperationBinding::without_data(output, DiscardOperation))
     }
 }
 
@@ -218,7 +212,7 @@ fn data_instances_reject_duplicate_names() {
 }
 
 #[test]
-fn data_instances_reject_missing_and_unconsumed_names() {
+fn data_instances_reject_missing_names_and_materialization_rejects_unconsumed_names() {
     let mut missing = DataInstances::new();
     let Err(error) = missing.take(&COUNT) else {
         panic!("missing data instance unexpectedly resolved");
@@ -233,10 +227,11 @@ fn data_instances_reject_missing_and_unconsumed_names() {
         .unwrap();
     let mut unconsumed = DataInstances::new();
     unconsumed.insert(count).unwrap();
-    assert_eq!(
-        unconsumed.finish().unwrap_err(),
-        MaterializeError::UnexpectedData { name: "count" }
-    );
+    let binding = OperationBinding::without_data(None, DiscardOperation);
+    let Err(error) = binding.materialize(unconsumed) else {
+        panic!("binding unexpectedly accepted an unconsumed data instance");
+    };
+    assert_eq!(error, MaterializeError::UnexpectedData { name: "count" });
 }
 
 #[test]

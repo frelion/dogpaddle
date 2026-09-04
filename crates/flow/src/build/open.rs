@@ -15,10 +15,11 @@ use super::{FlowFactory, StationDefinition, codec, schema, validate_data_declara
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
     ///
-    /// The definition is read first, then the Store is reopened so every
-    /// declared data object can be opened before the Store is frozen into
-    /// transaction capability. One read-only snapshot then checks the definition
-    /// again and validates every output frontier before the Flow is returned.
+    /// One setup-phase read-only snapshot reads the definition while preserving
+    /// the same Store for opening every declared data object. After setup is
+    /// frozen into runtime transaction capabilities, another read-only snapshot
+    /// checks the definition again and validates every output frontier before the
+    /// Flow is returned.
     ///
     /// # Errors
     ///
@@ -27,18 +28,19 @@ impl FlowFactory {
     /// or required station resources are invalid.
     pub fn open(path: impl AsRef<Path>) -> Result<Flow, FlowError> {
         let path = path.as_ref().to_path_buf();
-        let definition_bytes = read_published_definition(&path)?;
+        let store = Store::open(&path)?;
+        let published = open_definition_cell(&store)?;
+        let definition_bytes = read_published_definition(&store, &published)?;
         let definition = codec::decode(&definition_bytes)?;
         let topology = resolve_topology(&definition);
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
+        let station_ids = definition
+            .stations()
+            .iter()
+            .map(|station| station.id().to_owned())
+            .collect();
 
-        let store = Store::open(&path)?;
-        let published = open_definition_cell(&store)?;
-        let _flow_state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
-            &store,
-            codec::FLOW_STATE_DATA_NAME,
-        )?;
         let station_parts = definition
             .stations()
             .iter()
@@ -66,7 +68,7 @@ impl FlowFactory {
 
         Ok(Flow::from_parts(
             path,
-            definition,
+            station_ids,
             assembled.stations,
             assembled.topology,
             transactions,
@@ -75,11 +77,11 @@ impl FlowFactory {
     }
 }
 
-fn read_published_definition(path: &Path) -> Result<Vec<u8>, FlowError> {
-    let store = Store::open(path)?;
-    let definition = open_definition_cell(&store)?;
-    let (_, reads) = store.into_transactions().split();
-    let transaction = reads.begin()?;
+fn read_published_definition(
+    store: &Store,
+    definition: &Cell<Vec<u8>>,
+) -> Result<Vec<u8>, FlowError> {
+    let transaction = store.read_transaction()?;
     let definition = definition.read(transaction.access())?;
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
@@ -110,8 +112,7 @@ fn open_station_part(
         data.insert(instance)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(&mut data)?;
-    data.finish()?;
+    let operation = binding.materialize(data)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);

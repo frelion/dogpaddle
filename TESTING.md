@@ -37,7 +37,7 @@
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
 | Operation | 十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
-| Flow | build/open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：没有独立长稳状态的 crate 不建立 endurance target。

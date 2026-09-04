@@ -11,7 +11,11 @@ mod row {
     use arrow_schema::{DataType, Field, Schema};
     use rusqlite::{Connection, params_from_iter, types::Value};
 
-    use super::super::row::{RowCodec, column_definition, quote_identifier};
+    use super::super::{
+        definition::SqliteSinkSchemaError,
+        row::RowCodec,
+        target::{column_definition, quote_identifier},
+    };
 
     #[test]
     fn validates_names_and_builds_strict_column_definitions() {
@@ -32,12 +36,25 @@ mod row {
         let definitions = schema
             .fields()
             .iter()
-            .map(|field| column_definition(field))
+            .map(|field| column_definition(field).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(definitions[0], "\"\" BLOB CHECK(\"\" IS NULL)");
         assert!(definitions[1].contains("TEXT COLLATE BINARY"));
         assert!(definitions[2].contains("length(\"unsigned\") = 8"));
         assert_eq!(codec.schema().as_ref(), schema.as_ref());
+    }
+
+    #[test]
+    fn an_unmapped_future_type_returns_a_schema_error_instead_of_panicking() {
+        let field = Field::new("future", DataType::LargeUtf8, false);
+
+        assert_eq!(
+            column_definition(&field),
+            Err(SqliteSinkSchemaError::UnsupportedType {
+                field: "future".to_owned(),
+                data_type: DataType::LargeUtf8,
+            })
+        );
     }
 
     #[test]
@@ -281,7 +298,7 @@ mod row {
                     schema
                         .fields()
                         .iter()
-                        .map(|field| column_definition(field))
+                        .map(|field| column_definition(field).unwrap())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -842,7 +859,8 @@ mod runtime {
     use tempfile::TempDir;
 
     use super::super::{
-        runtime::{SqliteSinkCompiled, SqliteSinkError, SqliteSinkOperation},
+        error::SqliteSinkError,
+        runtime::{SqliteSinkCompiled, SqliteSinkOperation},
         state::{Continuation, MAX_TECHNICAL_ID, MutationKind, PendingState, Position},
     };
     use crate::operation::{Action, Operation, OperationError, OperationInput};
@@ -871,7 +889,8 @@ mod runtime {
             let pending = store
                 .create_data::<Cell<Vec<u8>>>("sqlite_sink.pending")
                 .unwrap();
-            let compiled = SqliteSinkCompiled::new(sqlite_path.clone(), TABLE.to_owned(), schema);
+            let compiled =
+                SqliteSinkCompiled::try_new(sqlite_path.clone(), TABLE.to_owned(), schema).unwrap();
             let operation =
                 SqliteSinkOperation::new_bound(compiled, next_id.clone(), pending.clone());
             let transactions = store.into_transactions();
@@ -903,7 +922,8 @@ mod runtime {
             let pending = store
                 .open_data::<Cell<Vec<u8>>>("sqlite_sink.pending")
                 .unwrap();
-            let compiled = SqliteSinkCompiled::new(sqlite_path.clone(), TABLE.to_owned(), schema);
+            let compiled =
+                SqliteSinkCompiled::try_new(sqlite_path.clone(), TABLE.to_owned(), schema).unwrap();
             let operation =
                 SqliteSinkOperation::new_bound(compiled, next_id.clone(), pending.clone());
             let transactions = store.into_transactions();

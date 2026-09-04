@@ -8,9 +8,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, ExpressionError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
+    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
@@ -119,11 +118,9 @@ impl SealedDefinition for FilterDefinition {
                 actual: predicate.output_type().clone(),
             }));
         }
-        Ok(OperationBinding::new(
+        Ok(OperationBinding::without_data(
             Some(Arc::clone(input_schema)),
-            move |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(FilterOperation { predicate }))
-            },
+            FilterOperation { predicate },
         ))
     }
 }
@@ -148,7 +145,7 @@ impl OperationDefinition for FilterDefinition {
 
 impl Operation for FilterOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

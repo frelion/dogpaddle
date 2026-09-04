@@ -44,7 +44,7 @@ impl Flow {
     pub fn advance(&mut self) -> Result<AdvanceOutcome, FlowRunError> {
         let mut outcome = AdvanceOutcome::Idle;
         for &index in &self.topology.schedule {
-            let station_id = self.definition.stations()[index].id();
+            let station_id = &self.station_ids[index];
             let station_outcome = self.stations[index]
                 .advance(&self.reads, &mut self.transactions)
                 .map_err(|source| FlowRunError::new(station_id, source))?;

@@ -35,6 +35,7 @@ use dogpaddle_store::{Cell, Store};
 use super::support::TestStore;
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+fn assert_send_static<T: Send + 'static>() {}
 
 fn names(definition: &dyn OperationDefinition) -> Vec<&'static str> {
     definition
@@ -56,13 +57,11 @@ fn materialize(
         data.insert(declaration.open(store, physical_name).unwrap())
             .unwrap();
     }
-    let operation = definition
+    definition
         .bind(input_schemas)
         .unwrap()
-        .materialize(&mut data)
-        .unwrap();
-    data.finish().unwrap();
-    operation
+        .materialize(data)
+        .unwrap()
 }
 
 fn bind(
@@ -912,7 +911,7 @@ fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
 
 #[test]
 fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
-    assert_send_sync_static::<Box<dyn Operation>>();
+    assert_send_static::<Box<dyn Operation>>();
     assert_send_sync_static::<Box<dyn OperationDefinition>>();
 
     let fixture = TestStore::new();
@@ -932,15 +931,15 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
 
     let store = Store::open(fixture.path()).unwrap();
     let source_position = store.open_data::<Cell<u64>>("source-position").unwrap();
-    let source = materialize(&source_definition, &[], &store, &["source-position"]);
-    let count = materialize(
+    let mut source = materialize(&source_definition, &[], &store, &["source-position"]);
+    let mut count = materialize(
         &running_event_count_definition,
         &[value_schema()],
         &store,
         &["count"],
     );
-    let project = materialize(&project_definition, &[value_schema()], &store, &[]);
-    let discard = materialize(&discard_definition, &[value_schema()], &store, &[]);
+    let mut project = materialize(&project_definition, &[value_schema()], &store, &[]);
+    let mut discard = materialize(&discard_definition, &[value_schema()], &store, &[]);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let Action::Commit(Some(output)) = source.turn(None, transaction.access()).unwrap() else {

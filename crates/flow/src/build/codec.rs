@@ -13,7 +13,6 @@ const FORMAT_VERSION: u16 = 1;
 pub(super) const CHECKSUM_LENGTH: usize = size_of::<u32>();
 const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
 pub(crate) const DEFINITION_DATA_NAME: &str = "flow/definition";
-pub(crate) const FLOW_STATE_DATA_NAME: &str = "flow/state";
 
 /// Failure while encoding or decoding a durable Flow definition.
 #[derive(Debug, Error, Eq, PartialEq)]

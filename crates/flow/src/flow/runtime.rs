@@ -2,10 +2,7 @@ use std::path::{Path, PathBuf};
 
 use dogpaddle_store::{ReadTransactions, Transactions};
 
-use crate::{
-    build::{FlowDefinition, StationDefinition},
-    station::Station,
-};
+use crate::station::Station;
 
 pub(crate) struct RuntimeTopology {
     pub(crate) schedule: Vec<usize>,
@@ -17,10 +14,11 @@ pub(crate) struct RuntimeTopology {
 /// transactions. During scheduling it lends the read capability to Station
 /// intake and the write capability to one Station's processing phase. A
 /// Station cannot retain either transaction-start capability across calls.
-/// The definition and data object set were frozen by a successful build.
+/// The definition and data object set were frozen by a successful build. Only
+/// lightweight Station IDs remain after runtime assembly.
 pub struct Flow {
     path: PathBuf,
-    pub(super) definition: FlowDefinition,
+    pub(super) station_ids: Box<[String]>,
     pub(super) stations: Vec<Station>,
     pub(super) topology: RuntimeTopology,
     pub(super) transactions: Transactions,
@@ -30,15 +28,20 @@ pub struct Flow {
 impl Flow {
     pub(crate) fn from_parts(
         path: PathBuf,
-        definition: FlowDefinition,
+        station_ids: Vec<String>,
         stations: Vec<Station>,
         topology: RuntimeTopology,
         transactions: Transactions,
         reads: ReadTransactions,
     ) -> Self {
+        assert_eq!(
+            station_ids.len(),
+            stations.len(),
+            "runtime Station IDs must align with assembled Stations"
+        );
         Self {
             path,
-            definition,
+            station_ids: station_ids.into_boxed_slice(),
             stations,
             topology,
             transactions,
@@ -55,13 +58,13 @@ impl Flow {
     /// Returns the number of stations in declaration order.
     #[must_use]
     pub fn station_count(&self) -> usize {
-        self.definition.stations().len()
+        self.station_ids.len()
     }
 
     /// Iterates over stable station IDs in declaration order.
     #[must_use]
     pub fn station_ids(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.definition.stations().iter().map(StationDefinition::id)
+        self.station_ids.iter().map(String::as_str)
     }
 
     #[cfg(test)]

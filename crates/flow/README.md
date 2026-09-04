@@ -114,17 +114,17 @@ Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Selec
 
 每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成声明并稳定编码，再立即解码这份 canonical
 manifest；拓扑解析、Schema 绑定和后续资源布局都只使用将要持久化的 Definition，而不依赖调用方
-原始 Rust 对象的额外状态。全部纯校验成功后，build 才为 Flow 和每个 Station 各声明一个
-持久化 state map，按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个具有外部
-output 的 Station 创建一个 output log，最后提交 manifest Cell 作为构建完成
-标记。Operation Definition 返回稳定的“逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
+原始 Rust 对象的额外状态。全部纯校验成功后，build 才为每个 Station 声明一个持久化 state map，
+按 Operation Definition 的逻辑数据名声明全部状态空间，并为每个具有外部 output 的 Station
+创建一个 output log，最后提交 manifest Cell 作为构建完成标记。Operation Definition 返回稳定的
+“逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
 build/open 通路负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称
 交给先前 Schema bind 产生的一次性 `OperationBinding` 装配 Operation。数据实例绑定不依赖声明
 顺序，具体算子不接触 Store、底层句柄或物理布局。
 
-Flow definition Cell 固定使用共享布局；Flow state map 和 Station state map 显式声明为
-`Small`。Flow state map 保留生命周期状态；Station state map 保存运行期 Station 状态，并为每个
-input 保存下一条未处理 Change 的 offset；有输入的 Station 还保存循环查找的 active input。
+Flow definition Cell 固定使用共享布局；Station state map 显式声明为 `Small`，保存运行期
+Station 状态，并为每个 input 保存下一条未处理 Change 的 offset；有输入的 Station 还保存循环查找的
+active input。
 `build()` 在发布 manifest 的同一事务中把 active input 和全部 cursor 显式初始化为 `0`，不存在
 “缺失时从当前 log head 开始”的隐式恢复。output 是
 `AppendLog<Vec<u8>>`；每个 value 保存一个内嵌 Schema 的完整 Change IPC Stream，不另建 Schema
@@ -230,9 +230,9 @@ Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory:
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
-`FlowFactory::open()` 先读取、解码并重新校验 manifest，再解析拓扑并纯重建全部 Schema bindings；
-只有成功后才重新打开全部数据对象和 output，最后按
-source ID 重新注入 inputs、装配 Station；第二次 Definition 读取和所有 output frontier 校验共享
+`FlowFactory::open()` 在一次 Store setup 生命周期中读取、解码并重新校验 manifest，再解析拓扑并
+纯重建全部 Schema bindings；只有成功后才用同一个 Store 打开其余数据对象和 output，最后按
+source ID 重新注入 inputs、装配 Station。第二次 Definition 读取和所有 output frontier 校验共享
 同一个 RO snapshot，不启动或提交写事务。open 不扫描全部 backlog；合法 IPC 中与绑定不一致的
 Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用方不需要重新提交 Definition。
 
@@ -240,7 +240,6 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
 
 - Flow manifest：`flow/definition`
-- Flow 状态：`flow/state`
 - Station 状态：`station/{index:08x}/state`
 - Station active input key：`input/active`
 - Station input cursor key：`input/{input_index:08x}/cursor`
@@ -261,8 +260,9 @@ derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有�
 ## 源码边界
 
 `FlowFactory` 负责声明、纯拓扑校验、稳定编码以及 build/open 时的资源装配；运行态 `Flow` 只持有
-已装配 Station、确定性 schedule 和分离的事务启动能力。私有 `build/schema.rs` 只负责拓扑序
-Schema 传播和 Definition bind，不创建资源或进入运行调度；Station 是 crate 私有的单轮执行壳，拥有
+Station ID、已装配 Station、确定性 schedule 和分离的事务启动能力，不保留完整 Definition。私有
+`build/schema.rs` 只负责拓扑序 Schema 传播和 Definition bind，不创建资源或进入运行调度；Station
+是 crate 私有的单轮执行壳，拥有
 输入 claim 与 output retention，但不接收 Store、不知道物理 placement 或稳定资源名。Flow 作为
 Operation 与 Store 的组合根，通过单一公共 `correctness` target 验证资源布局、重新物化和运行
 协议，不再建立重复的集成 package。具体目录 ownership 与私有实现约束见仓库 `AGENTS.md`；fixture、

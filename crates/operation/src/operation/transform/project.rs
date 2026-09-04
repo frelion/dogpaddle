@@ -6,8 +6,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     definition::Sealed as SealedDefinition,
     operation::{Action, Operation, OperationError, OperationInput},
 };
@@ -103,11 +103,9 @@ impl SealedDefinition for ProjectDefinition {
             |source| -> OperationSchemaError { Box::new(ProjectSchemaError::Projection(source)) },
         )?;
         let output_schema = projection.output_schema();
-        Ok(OperationBinding::new(
+        Ok(OperationBinding::without_data(
             Some(output_schema),
-            move |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(ProjectOperation::new(projection)))
-            },
+            ProjectOperation::new(projection),
         ))
     }
 }
@@ -145,7 +143,7 @@ impl ProjectOperation {
 
 impl Operation for ProjectOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

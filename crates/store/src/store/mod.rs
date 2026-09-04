@@ -35,6 +35,10 @@ pub struct DataHandle {
 }
 
 /// Owns one durable store during named data object setup.
+///
+/// Setup code may create or open data objects and borrow a short-lived
+/// read-only snapshot with [`Store::read_transaction`]. Entering runtime still
+/// consumes this value with [`Store::into_transactions`].
 pub struct Store {
     database: Database<NoWriteMap>,
     token: u64,

@@ -40,7 +40,7 @@ pub enum Action {
 pub type OperationError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Runtime parent trait implemented by every materialized operation.
-pub trait Operation: Send + Sync + 'static {
+pub trait Operation: Send + 'static {
     /// Executes one turn in an existing transaction.
     ///
     /// A source receives `None`. An input Operation receives exactly one
@@ -63,6 +63,9 @@ pub trait Operation: Send + Sync + 'static {
     /// the caller's enclosing commit. Implementations must therefore avoid
     /// non-transactional observable side effects inside `turn`; those require a
     /// separate idempotency protocol beyond this Store transaction contract.
+    /// The mutable receiver may cache ephemeral runtime resources, but every
+    /// fact that can affect replay semantics or cross-turn continuation must
+    /// remain in declared durable data.
     ///
     /// # Errors
     ///
@@ -70,7 +73,7 @@ pub trait Operation: Send + Sync + 'static {
     /// the transaction on any error and, when an input was offered, offer the
     /// same complete Change on the same port again on a later turn.
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError>;

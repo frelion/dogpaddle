@@ -5,8 +5,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     operation::{Action, Operation, OperationError, OperationInput},
@@ -115,13 +115,11 @@ impl SealedDefinition for UnionAllDefinition {
         let input_count = usize::try_from(self.input_count.get())
             .expect("a UnionAll u32 input count fits supported Arrow targets");
         let input_schema = Arc::clone(output_schema);
-        Ok(OperationBinding::new(
+        Ok(OperationBinding::without_data(
             Some(Arc::clone(output_schema)),
-            move |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(UnionAllOperation {
-                    input_count,
-                    input_schema,
-                }))
+            UnionAllOperation {
+                input_count,
+                input_schema,
             },
         ))
     }
@@ -147,7 +145,7 @@ impl OperationDefinition for UnionAllDefinition {
 
 impl Operation for UnionAllOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

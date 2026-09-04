@@ -19,6 +19,52 @@ fn write_pair(
 }
 
 #[test]
+fn setup_snapshot_reads_an_opened_cell_without_consuming_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+
+    {
+        let mut store = Store::create(&path).unwrap();
+        let definition = store.create_data::<Cell<u64>>("definition").unwrap();
+        let state = store.create_data::<Cell<u64>>("state").unwrap();
+        let mut transactions = store.into_transactions();
+        let transaction = transactions.begin().unwrap();
+        definition
+            .access(transaction.access())
+            .unwrap()
+            .set(&41)
+            .unwrap();
+        state
+            .access(transaction.access())
+            .unwrap()
+            .set(&42)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let definition = store.open_data::<Cell<u64>>("definition").unwrap();
+    {
+        let transaction = store.read_transaction().unwrap();
+        assert_eq!(
+            definition
+                .read(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(41)
+        );
+    }
+
+    let state = store.open_data::<Cell<u64>>("state").unwrap();
+    let transaction = store.read_transaction().unwrap();
+    assert_eq!(
+        state.read(transaction.access()).unwrap().get().unwrap(),
+        Some(42)
+    );
+}
+
+#[test]
 fn read_snapshot_coexists_with_the_unique_writer_and_remains_stable() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();

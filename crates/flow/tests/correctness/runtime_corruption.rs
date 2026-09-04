@@ -149,7 +149,7 @@ fn publish_pending_input(path: &Path, encoded: Option<&[u8]>, shift_head: bool) 
     let transaction = transactions.begin().unwrap();
     let encoded = encoded.map_or_else(
         || {
-            let operation = SequenceSourceOperation::new(u64::MAX, position.clone());
+            let mut operation = SequenceSourceOperation::new(u64::MAX, position.clone());
             let Action::Commit(Some(change)) = operation.turn(None, transaction.access()).unwrap()
             else {
                 panic!("final source did not commit one Change");

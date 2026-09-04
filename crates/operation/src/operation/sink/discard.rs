@@ -5,8 +5,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     definition::Sealed as SealedDefinition,
     operation::{Action, Operation, OperationError, OperationInput},
 };
@@ -58,12 +58,7 @@ impl SealedDefinition for DiscardDefinition {
         &self,
         _input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::new(
-            None,
-            |_data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(DiscardOperation))
-            },
-        ))
+        Ok(OperationBinding::without_data(None, DiscardOperation))
     }
 }
 
@@ -85,7 +80,7 @@ impl OperationDefinition for DiscardDefinition {
 
 impl Operation for DiscardOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

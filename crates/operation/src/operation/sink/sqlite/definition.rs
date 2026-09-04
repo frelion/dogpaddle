@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use dogpaddle_store::Cell;
 use thiserror::Error;
 
@@ -109,6 +109,14 @@ pub enum SqliteSinkSchemaError {
         /// Zero-based index of the later conflicting top-level field.
         second: usize,
     },
+    /// A future `DogPaddle` type reached `SQLite` before its storage mapping existed.
+    #[error("SQLite sink has no storage mapping for field {field:?} with type {data_type}")]
+    UnsupportedType {
+        /// Name of the unsupported top-level field.
+        field: String,
+        /// Arrow type without a `SQLite` v1 representation.
+        data_type: DataType,
+    },
 }
 
 impl SqliteSinkDefinition {
@@ -159,11 +167,12 @@ impl SealedDefinition for SqliteSinkDefinition {
         validate_input_schema(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
 
-        let compiled = SqliteSinkCompiled::new(
+        let compiled = SqliteSinkCompiled::try_new(
             self.database_path.clone(),
             self.table_name.clone(),
             Arc::clone(input_schema),
-        );
+        )
+        .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         Ok(OperationBinding::new(
             None,
             move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {

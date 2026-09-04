@@ -120,7 +120,7 @@ impl ScriptedOperation {
 
 impl Operation for ScriptedOperation {
     fn turn(
-        &self,
+        &mut self,
         _input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

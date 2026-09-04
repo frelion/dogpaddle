@@ -104,7 +104,7 @@ impl SequenceSourceOperation {
 
 impl Operation for SequenceSourceOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

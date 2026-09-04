@@ -112,64 +112,6 @@ pub(super) enum RowError {
     LengthOverflow,
 }
 
-pub(super) fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-pub(super) fn column_definition(field: &Field) -> String {
-    let name = quote_identifier(field.name());
-    if matches!(field.data_type(), DataType::Null) {
-        return format!("{name} BLOB CHECK({name} IS NULL)");
-    }
-
-    let (storage, check) = match field.data_type() {
-        DataType::Boolean => (
-            "INTEGER",
-            format!("typeof({name}) = 'integer' AND {name} IN (0, 1)"),
-        ),
-        DataType::Int8 => ("INTEGER", integer_range(&name, i8::MIN, i8::MAX)),
-        DataType::Int16 => ("INTEGER", integer_range(&name, i16::MIN, i16::MAX)),
-        DataType::Int32 | DataType::Date32 => ("INTEGER", integer_range(&name, i32::MIN, i32::MAX)),
-        DataType::Int64 | DataType::Timestamp(_, _) => {
-            ("INTEGER", format!("typeof({name}) = 'integer'"))
-        }
-        DataType::UInt8 => ("INTEGER", unsigned_range(&name, u8::MAX)),
-        DataType::UInt16 => ("INTEGER", unsigned_range(&name, u16::MAX)),
-        DataType::UInt32 => ("INTEGER", unsigned_range(&name, u32::MAX)),
-        DataType::UInt64 | DataType::Float64 => ("BLOB", blob_check(&name, Some(8))),
-        DataType::Float32 => ("BLOB", blob_check(&name, Some(4))),
-        DataType::Decimal128(_, _) => ("BLOB", blob_check(&name, Some(16))),
-        DataType::Utf8 => ("TEXT COLLATE BINARY", format!("typeof({name}) = 'text'")),
-        DataType::Binary | DataType::List(_) | DataType::Struct(_) => {
-            ("BLOB", blob_check(&name, None))
-        }
-        DataType::Null => unreachable!("handled above"),
-        other => unreachable!("Operation binding rejected unsupported Arrow type {other}"),
-    };
-    let nullability = if field.is_nullable() {
-        format!(" CHECK({name} IS NULL OR ({check}))")
-    } else {
-        format!(" NOT NULL CHECK({check})")
-    };
-    format!("{name} {storage}{nullability}")
-}
-
-fn integer_range<T: std::fmt::Display>(name: &str, min: T, max: T) -> String {
-    format!("typeof({name}) = 'integer' AND {name} BETWEEN {min} AND {max}")
-}
-
-fn unsigned_range<T: std::fmt::Display>(name: &str, max: T) -> String {
-    format!("typeof({name}) = 'integer' AND {name} BETWEEN 0 AND {max}")
-}
-
-fn blob_check(name: &str, length: Option<usize>) -> String {
-    if let Some(length) = length {
-        format!("typeof({name}) = 'blob' AND length({name}) = {length}")
-    } else {
-        format!("typeof({name}) = 'blob'")
-    }
-}
-
 fn encode_value(
     field: &Field,
     array: &dyn Array,

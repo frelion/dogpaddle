@@ -109,7 +109,7 @@ impl RunningEventCountOperation {
 
 impl Operation for RunningEventCountOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {

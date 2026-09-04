@@ -1,12 +1,37 @@
 use std::sync::Arc;
 
-use libmdbx::{NoWriteMap, RW, Transaction as MdbxTransaction};
+use libmdbx::{Database, NoWriteMap, RW, Transaction as MdbxTransaction};
 
 use super::{
-    DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Transaction,
+    DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, Transaction,
     TransactionAccess, Transactions,
 };
 use crate::StoreError;
+
+impl Store {
+    /// Begins a short-lived read-only snapshot during data object setup.
+    ///
+    /// The snapshot borrows this Store rather than exposing an owned
+    /// transaction-start capability. After it is dropped, the same Store may
+    /// continue opening data objects before being consumed with
+    /// [`Store::into_transactions`]. The returned [`ReadTransaction`] has no
+    /// write or commit authority.
+    ///
+    /// ```compile_fail
+    /// use dogpaddle_store::{ReadTransaction, Store, StoreError};
+    ///
+    /// fn export_snapshot(store: &Store) -> Result<ReadTransaction<'static>, StoreError> {
+    ///     store.read_transaction()
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when MDBX cannot begin the read-only transaction.
+    pub fn read_transaction(&self) -> Result<ReadTransaction<'_>, StoreError> {
+        begin_read_transaction(&self.database, self.token)
+    }
+}
 
 impl Transactions {
     /// Splits this owned capability into write and read-only capabilities.
@@ -81,16 +106,22 @@ impl ReadTransactions {
     ///
     /// Returns an error when MDBX cannot begin the read-only transaction.
     pub fn begin(&self) -> Result<ReadTransaction<'_>, StoreError> {
-        Ok(ReadTransaction {
-            mdbx: self
-                .database
-                .begin_ro_txn()
-                .map_err(|error| StoreError::storage("begin read transaction", error))?,
-            store_token: self.store_token,
-            poisoned: std::cell::Cell::new(false),
-            _thread_bound: std::marker::PhantomData,
-        })
+        begin_read_transaction(&self.database, self.store_token)
     }
+}
+
+fn begin_read_transaction(
+    database: &Database<NoWriteMap>,
+    store_token: u64,
+) -> Result<ReadTransaction<'_>, StoreError> {
+    Ok(ReadTransaction {
+        mdbx: database
+            .begin_ro_txn()
+            .map_err(|error| StoreError::storage("begin read transaction", error))?,
+        store_token,
+        poisoned: std::cell::Cell::new(false),
+        _thread_bound: std::marker::PhantomData,
+    })
 }
 
 impl Transaction<'_> {

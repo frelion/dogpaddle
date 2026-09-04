@@ -1,191 +1,52 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
+    path::PathBuf,
 };
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_store::{Cell, TransactionAccess};
-use rusqlite::{
-    Connection, OpenFlags, ToSql, Transaction, TransactionBehavior, params, params_from_iter,
-    types::ValueRef,
-};
-use thiserror::Error;
 
 use super::{
-    TECHNICAL_HASH, TECHNICAL_ID,
-    row::{EncodedRow, RowCodec, RowError, column_definition, quote_identifier},
+    definition::SqliteSinkSchemaError,
+    error::{SqliteSinkError, invalid_state, pending_mismatch},
+    row::{EncodedRow, RowCodec},
     state::{
         Continuation, MAX_MUTATIONS_PER_BATCH, MAX_TECHNICAL_ID, Mutation, MutationKind,
-        PendingState, PendingStateCodecError, Position,
+        PendingState, Position,
     },
+    target::SqliteTarget,
 };
 use crate::operation::{Action, Operation, OperationError, OperationInput};
 
 const FIRST_TECHNICAL_ID: u64 = 1;
 const EXHAUSTED_TECHNICAL_ID: u64 = MAX_TECHNICAL_ID + 1;
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Materialized exact-Schema-bound `SQLite` relation sink.
 ///
-/// The operation owns only its compiled SQL/value plan, lazily opened `SQLite`
-/// connection, and the two Store cells declared by its persistent definition.
+/// The operation owns a logical row codec, one lazily opened target, and the two
+/// Store cells declared by its persistent definition.
 pub struct SqliteSinkOperation {
-    database_path: PathBuf,
     row_codec: RowCodec,
-    sql: SqlPlan,
+    target: SqliteTarget,
     next_id: Cell<u64>,
     pending: Cell<Vec<u8>>,
-    connection: Mutex<Option<Connection>>,
 }
 
 /// Pure Schema- and destination-bound plan captured before Store materialization.
 pub(super) struct SqliteSinkCompiled {
-    database_path: PathBuf,
     row_codec: RowCodec,
-    sql: SqlPlan,
-}
-
-/// SQLiteSink-specific failure during one operation turn.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum SqliteSinkError {
-    /// The sink was called without an input Change.
-    #[error("SQLite sink requires one input Change")]
-    MissingInput,
-    /// `SQLiteSink` only accepts its definition's first input port.
-    #[error("SQLite sink does not accept input port {port}")]
-    InvalidInputPort {
-        /// Rejected zero-based port index.
-        port: usize,
-    },
-    /// A direct caller supplied a Schema different from the bound Schema.
-    #[error("SQLite sink input Schema differs from its bound Schema")]
-    InputSchemaMismatch {
-        /// Exact Schema fixed during binding.
-        expected: SchemaRef,
-        /// Schema supplied by this turn.
-        actual: SchemaRef,
-    },
-    /// The lazily held `SQLite` connection mutex was poisoned by a panic.
-    #[error("SQLite sink connection mutex is poisoned")]
-    ConnectionPoisoned,
-    /// The persistent next-ID and pending-state cells contradict each other.
-    #[error("SQLite sink persistent state is invalid: {message}")]
-    InvalidState {
-        /// Stable diagnostic for the rejected state.
-        message: String,
-    },
-    /// A retained Change does not agree with its persistent batch position.
-    #[error("SQLite sink pending batch does not match its retained Change: {message}")]
-    PendingInputMismatch {
-        /// Stable diagnostic for the mismatch.
-        message: String,
-    },
-    /// A logical row could not be encoded exactly.
-    #[error("SQLite sink row processing failed: {message}")]
-    Row {
-        /// Stable diagnostic from the private row codec.
-        message: String,
-    },
-    /// The target table or its reserved index already exists on first use.
-    #[error("SQLite sink target object {name:?} already exists")]
-    TargetExists {
-        /// Existing `SQLite` object name.
-        name: String,
-    },
-    /// A previously initialized target table or index is missing.
-    #[error("SQLite sink target object {name:?} is missing")]
-    TargetMissing {
-        /// Missing `SQLite` object name.
-        name: String,
-    },
-    /// A target object differs from the exact layout created by this sink.
-    #[error("SQLite sink target object {name:?} has an incompatible layout")]
-    TargetLayoutMismatch {
-        /// Incompatible `SQLite` object name.
-        name: String,
-    },
-    /// Initialization replay found rows in a table that should still be empty.
-    #[error("SQLite sink target table {table:?} is not empty during initialization")]
-    TargetNotEmpty {
-        /// Target table name.
-        table: String,
-    },
-    /// The target contains an ID outside the sink-owned positive ID range.
-    #[error("SQLite sink target contains invalid technical ID {id}")]
-    InvalidStoredTechnicalId {
-        /// Invalid stored ID.
-        id: i64,
-    },
-    /// The target contains an ID not below the durable next-ID frontier.
-    #[error("SQLite sink target technical ID {id} is not below next ID {next_id}")]
-    TechnicalIdFrontierMismatch {
-        /// Observed target ID.
-        id: u64,
-        /// Durable next unallocated ID.
-        next_id: u64,
-    },
-    /// A positive multiplicity cannot fit in the remaining technical-ID space.
-    #[error("SQLite sink technical IDs are exhausted at {next_id}; {needed} IDs are required")]
-    TechnicalIdExhausted {
-        /// Current next unallocated ID.
-        next_id: u64,
-        /// Complete remaining multiplicity that must be admitted atomically.
-        needed: u64,
-    },
-    /// A negative multiplicity has fewer exact physical rows than required.
-    #[error(
-        "SQLite sink cannot retract row {row_index}: {needed} instances are required but only {available} exist"
-    )]
-    MissingRetraction {
-        /// Change row containing the invalid negative difference.
-        row_index: u64,
-        /// Complete remaining multiplicity requested by the event.
-        needed: u64,
-        /// Exact matching instances visible after earlier mutations in the batch.
-        available: u64,
-    },
-    /// An idempotent insert found the same ID attached to another logical row.
-    #[error("SQLite sink technical ID {id} belongs to a different logical row")]
-    TechnicalIdConflict {
-        /// Conflicting technical ID.
-        id: u64,
-    },
-    /// A prepared delete found its ID attached to another logical row.
-    #[error("SQLite sink delete ID {id} belongs to a different logical row")]
-    DeleteRowMismatch {
-        /// Mismatched technical ID.
-        id: u64,
-    },
-    /// `SQLite` returned a mutation count impossible for a primary-key operation.
-    #[error("SQLite sink {operation} for ID {id} changed {actual} rows, expected {expected}")]
-    UnexpectedMutationCount {
-        /// Operation being checked.
-        operation: &'static str,
-        /// Technical ID used by the mutation.
-        id: u64,
-        /// Required affected-row count.
-        expected: usize,
-        /// Reported affected-row count.
-        actual: usize,
-    },
-    /// `SQLite` rejected connection setup, schema inspection, or row mutation.
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    target: SqliteTarget,
 }
 
 impl SqliteSinkCompiled {
-    pub(super) fn new(database_path: PathBuf, table_name: String, input_schema: SchemaRef) -> Self {
+    pub(super) fn try_new(
+        database_path: PathBuf,
+        table_name: String,
+        input_schema: SchemaRef,
+    ) -> Result<Self, SqliteSinkSchemaError> {
         let row_codec = RowCodec::new_validated(input_schema);
-        let sql = SqlPlan::new(table_name, &row_codec);
-        Self {
-            database_path,
-            row_codec,
-            sql,
-        }
+        let target = SqliteTarget::try_new(database_path, table_name, &row_codec)?;
+        Ok(Self { row_codec, target })
     }
 }
 
@@ -196,17 +57,15 @@ impl SqliteSinkOperation {
         pending: Cell<Vec<u8>>,
     ) -> Self {
         Self {
-            database_path: compiled.database_path,
             row_codec: compiled.row_codec,
-            sql: compiled.sql,
+            target: compiled.target,
             next_id,
             pending,
-            connection: Mutex::new(None),
         }
     }
 
     fn turn_inner(
-        &self,
+        &mut self,
         input: OperationInput<'_>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
@@ -231,20 +90,9 @@ impl SqliteSinkOperation {
             .transpose()
             .map_err(OperationError::from)?;
 
-        let mut connection_slot = self
-            .connection
-            .lock()
-            .map_err(|_| SqliteSinkError::ConnectionPoisoned)?;
-        if connection_slot.is_none() {
-            *connection_slot = Some(open_connection(&self.database_path)?);
-        }
-        let connection = connection_slot
-            .as_mut()
-            .expect("the SQLite connection was initialized above");
-
         match (next_id, pending) {
-            (None, None) => self.prepare_initialization(connection, access),
-            (None, Some(PendingState::Initialize)) => self.apply_initialization(connection, access),
+            (None, None) => self.prepare_initialization(access),
+            (None, Some(PendingState::Initialize)) => self.apply_initialization(access),
             (None, Some(_)) => Err(invalid_state(
                 "pending row work exists before the target is initialized",
             )
@@ -255,21 +103,20 @@ impl SqliteSinkOperation {
             .into()),
             (Some(next_id), pending) => {
                 validate_next_id(next_id)?;
-                self.verify_ready_target(connection, next_id)?;
+                self.target.verify_ready(next_id)?;
                 match pending {
                     None => {
                         let start = first_position(input.change);
-                        self.prepare_batch(connection, input.change, access, next_id, start)
+                        self.prepare_batch(input.change, access, next_id, start)
                     }
                     Some(PendingState::Prepare { position }) => {
-                        self.prepare_batch(connection, input.change, access, next_id, position)
+                        self.prepare_batch(input.change, access, next_id, position)
                     }
                     Some(PendingState::Apply {
                         start_position,
                         continuation,
                         mutations,
                     }) => self.apply_batch(
-                        connection,
                         input.change,
                         access,
                         next_id,
@@ -286,86 +133,29 @@ impl SqliteSinkOperation {
     }
 
     fn prepare_initialization(
-        &self,
-        connection: &Connection,
+        &mut self,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
-        for name in [&self.sql.table_name, &self.sql.index_name] {
-            if object_exists(connection, name).map_err(SqliteSinkError::from)? {
-                return Err(SqliteSinkError::TargetExists { name: name.clone() }.into());
-            }
-        }
+        self.target.require_absent()?;
         set_pending(&self.pending, access, &PendingState::Initialize)?;
         Ok(Action::Commit(None))
     }
 
     fn apply_initialization(
-        &self,
-        connection: &mut Connection,
+        &mut self,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(SqliteSinkError::from)?;
-        if !object_exists(&transaction, &self.sql.table_name).map_err(SqliteSinkError::from)? {
-            if object_exists(&transaction, &self.sql.index_name).map_err(SqliteSinkError::from)? {
-                return Err(SqliteSinkError::TargetLayoutMismatch {
-                    name: self.sql.index_name.clone(),
-                }
-                .into());
-            }
-            transaction
-                .execute(&self.sql.create_table, [])
-                .map_err(SqliteSinkError::from)?;
-            transaction
-                .execute(&self.sql.create_index, [])
-                .map_err(SqliteSinkError::from)?;
-        }
-        require_exact_layout(&transaction, &self.sql)?;
-        if technical_id_bounds(&transaction, &self.sql).map_err(SqliteSinkError::from)?
-            != (None, None)
-        {
-            return Err(SqliteSinkError::TargetNotEmpty {
-                table: self.sql.table_name.clone(),
-            }
-            .into());
-        }
+        let transaction = self.target.begin()?;
+        transaction.initialize()?;
 
         self.next_id.access(access)?.set(&FIRST_TECHNICAL_ID)?;
         self.pending.access(access)?.clear()?;
-        transaction.commit().map_err(SqliteSinkError::from)?;
+        transaction.commit()?;
         Ok(Action::Commit(None))
     }
 
-    fn verify_ready_target(
-        &self,
-        connection: &Connection,
-        next_id: u64,
-    ) -> Result<(), SqliteSinkError> {
-        require_exact_layout(connection, &self.sql)?;
-
-        let (minimum, maximum) = technical_id_bounds(connection, &self.sql)?;
-        if let Some(minimum) = minimum
-            && minimum <= 0
-        {
-            return Err(SqliteSinkError::InvalidStoredTechnicalId { id: minimum });
-        }
-        if let Some(maximum) = maximum {
-            let maximum = u64::try_from(maximum)
-                .expect("the minimum-ID check proves every stored ID is positive");
-            if maximum >= next_id {
-                return Err(SqliteSinkError::TechnicalIdFrontierMismatch {
-                    id: maximum,
-                    next_id,
-                });
-            }
-        }
-        Ok(())
-    }
-
     fn prepare_batch(
-        &self,
-        connection: &Connection,
+        &mut self,
         change: &Change,
         access: TransactionAccess<'_>,
         next_id: u64,
@@ -417,7 +207,6 @@ impl SqliteSinkOperation {
                 }
                 MutationKind::Delete => {
                     let selected = self.select_delete_ids(
-                        connection,
                         entry,
                         position.row_index,
                         position.remaining,
@@ -460,8 +249,7 @@ impl SqliteSinkOperation {
     }
 
     fn select_delete_ids(
-        &self,
-        connection: &Connection,
+        &mut self,
         overlay: &OverlayRow,
         row_index: u64,
         needed: u64,
@@ -473,33 +261,14 @@ impl SqliteSinkOperation {
         let scan_target = required_database.max(take);
         let selected_capacity = usize::try_from(take)
             .expect("one selected deletion count is bounded by the batch limit");
-        let mut selected_database = Vec::with_capacity(selected_capacity);
-        let mut database_count = 0_u64;
+        let matching = self.target.matching_ids(
+            &overlay.encoded,
+            &overlay.selected_deletes,
+            scan_target,
+            selected_capacity,
+        )?;
 
-        let mut statement = connection.prepare_cached(&self.sql.select_by_hash)?;
-        let mut rows = statement.query(params![overlay.encoded.hash.as_slice()])?;
-        while database_count < scan_target {
-            let Some(row) = rows.next()? else {
-                break;
-            };
-            let id: i64 = row.get(0)?;
-            if id <= 0 {
-                return Err(SqliteSinkError::InvalidStoredTechnicalId { id });
-            }
-            let id = u64::try_from(id).expect("a positive SQLite INTEGER fits u64");
-            if overlay.selected_deletes.contains(&id) {
-                continue;
-            }
-            if !overlay.encoded.matches(row, 1)? {
-                continue;
-            }
-            database_count += 1;
-            if selected_database.len() < selected_capacity {
-                selected_database.push(id);
-            }
-        }
-
-        let available = database_count.saturating_add(pending_insert_count);
+        let available = matching.count.saturating_add(pending_insert_count);
         if available < needed {
             return Err(SqliteSinkError::MissingRetraction {
                 row_index,
@@ -508,20 +277,15 @@ impl SqliteSinkOperation {
             });
         }
 
-        let mut selected = selected_database;
+        let mut selected = matching.selected;
         let remaining = selected_capacity - selected.len();
         selected.extend(overlay.pending_inserts.iter().copied().take(remaining));
         debug_assert_eq!(selected.len(), selected_capacity);
         Ok(selected)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the durable Apply tuple is kept explicit at the transaction boundary"
-    )]
     fn apply_batch(
-        &self,
-        connection: &mut Connection,
+        &mut self,
         change: &Change,
         access: TransactionAccess<'_>,
         next_id: u64,
@@ -530,28 +294,8 @@ impl SqliteSinkOperation {
         mutations: &[Mutation],
     ) -> Result<Action, OperationError> {
         validate_apply_for_change(change, next_id, start_position, continuation, mutations)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(SqliteSinkError::from)?;
-        for row_mutations in mutations.chunk_by(|left, right| left.row_index == right.row_index) {
-            let row_index = usize::try_from(row_mutations[0].row_index).map_err(|_| {
-                pending_mismatch("mutation row index cannot be represented by usize")
-            })?;
-            let encoded = self
-                .row_codec
-                .encode_row(change.records(), row_index)
-                .map_err(SqliteSinkError::from)?;
-            for mutation in row_mutations {
-                match mutation.kind {
-                    MutationKind::Insert => {
-                        self.apply_insert(&transaction, mutation.technical_id, &encoded)?;
-                    }
-                    MutationKind::Delete => {
-                        self.apply_delete(&transaction, mutation.technical_id, &encoded)?;
-                    }
-                }
-            }
-        }
+        let transaction = self.target.begin()?;
+        transaction.apply(&self.row_codec, change, mutations)?;
 
         let action = match continuation {
             Continuation::Done => {
@@ -563,88 +307,14 @@ impl SqliteSinkOperation {
                 Action::Commit(None)
             }
         };
-        transaction.commit().map_err(SqliteSinkError::from)?;
+        transaction.commit()?;
         Ok(action)
-    }
-
-    fn apply_insert(
-        &self,
-        transaction: &Transaction<'_>,
-        technical_id: u64,
-        encoded: &EncodedRow,
-    ) -> Result<(), SqliteSinkError> {
-        let id = technical_id_as_i64(technical_id)?;
-        let technical_values = [&id as &dyn ToSql, &encoded.hash as &dyn ToSql];
-        let values = technical_values
-            .into_iter()
-            .chain(encoded.values.iter().map(|value| value as &dyn ToSql));
-        let actual = transaction
-            .prepare_cached(&self.sql.insert)?
-            .execute(params_from_iter(values))?;
-        if actual == 1 {
-            return Ok(());
-        }
-        if actual != 0 {
-            return Err(SqliteSinkError::UnexpectedMutationCount {
-                operation: "insert",
-                id: technical_id,
-                expected: 1,
-                actual,
-            });
-        }
-        match self.row_by_id_matches(transaction, id, encoded)? {
-            Some(true) => Ok(()),
-            Some(false) | None => Err(SqliteSinkError::TechnicalIdConflict { id: technical_id }),
-        }
-    }
-
-    fn apply_delete(
-        &self,
-        transaction: &Transaction<'_>,
-        technical_id: u64,
-        encoded: &EncodedRow,
-    ) -> Result<(), SqliteSinkError> {
-        let id = technical_id_as_i64(technical_id)?;
-        match self.row_by_id_matches(transaction, id, encoded)? {
-            None => return Ok(()),
-            Some(false) => {
-                return Err(SqliteSinkError::DeleteRowMismatch { id: technical_id });
-            }
-            Some(true) => {}
-        }
-        let actual = transaction.execute(&self.sql.delete_by_id, params![id])?;
-        if actual == 1 {
-            Ok(())
-        } else {
-            Err(SqliteSinkError::UnexpectedMutationCount {
-                operation: "delete",
-                id: technical_id,
-                expected: 1,
-                actual,
-            })
-        }
-    }
-
-    fn row_by_id_matches(
-        &self,
-        transaction: &Transaction<'_>,
-        id: i64,
-        encoded: &EncodedRow,
-    ) -> Result<Option<bool>, SqliteSinkError> {
-        let mut statement = transaction.prepare_cached(&self.sql.select_by_id)?;
-        let mut rows = statement.query(params![id])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let matches =
-            stored_hash_matches(row.get_ref(0)?, &encoded.hash) && encoded.matches(row, 1)?;
-        Ok(Some(matches))
     }
 }
 
 impl Operation for SqliteSinkOperation {
     fn turn(
-        &self,
+        &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
     ) -> Result<Action, OperationError> {
@@ -667,165 +337,6 @@ impl OverlayRow {
             selected_deletes: HashSet::new(),
         }
     }
-}
-
-struct SqlPlan {
-    table_name: String,
-    index_name: String,
-    create_table: String,
-    create_index: String,
-    insert: String,
-    select_by_hash: String,
-    select_by_id: String,
-    delete_by_id: String,
-    technical_id_bounds: String,
-}
-
-impl SqlPlan {
-    fn new(table_name: String, row_codec: &RowCodec) -> Self {
-        let quoted_table = quote_identifier(&table_name);
-        let index_name = format!("$dogpaddle.hash_index.{table_name}");
-        let quoted_index = quote_identifier(&index_name);
-        let quoted_id = quote_identifier(TECHNICAL_ID);
-        let quoted_hash = quote_identifier(TECHNICAL_HASH);
-
-        let mut definitions = vec![
-            format!("{quoted_id} INTEGER PRIMARY KEY"),
-            format!(
-                "{quoted_hash} BLOB NOT NULL CHECK(typeof({quoted_hash}) = 'blob' AND length({quoted_hash}) = 16)"
-            ),
-        ];
-        definitions.extend(
-            row_codec
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| column_definition(field)),
-        );
-        let create_table = format!(
-            "CREATE TABLE {quoted_table} ({}) STRICT",
-            definitions.join(", ")
-        );
-        let create_index = format!("CREATE INDEX {quoted_index} ON {quoted_table}({quoted_hash})");
-
-        let mut columns = vec![quoted_id.clone(), quoted_hash.clone()];
-        let logical_columns = row_codec
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| quote_identifier(field.name()))
-            .collect::<Vec<_>>();
-        columns.extend(logical_columns.iter().cloned());
-        let placeholders = (1..=columns.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let insert = format!(
-            "INSERT INTO {quoted_table} ({}) VALUES ({placeholders}) ON CONFLICT({quoted_id}) DO NOTHING",
-            columns.join(", ")
-        );
-
-        let logical = logical_columns.join(", ");
-        let select_by_hash = if logical.is_empty() {
-            format!(
-                "SELECT {quoted_id} FROM {quoted_table} WHERE {quoted_hash} = ?1 ORDER BY {quoted_id}"
-            )
-        } else {
-            format!(
-                "SELECT {quoted_id}, {logical} FROM {quoted_table} WHERE {quoted_hash} = ?1 ORDER BY {quoted_id}"
-            )
-        };
-        let select_by_id = if logical.is_empty() {
-            format!("SELECT {quoted_hash} FROM {quoted_table} WHERE {quoted_id} = ?1")
-        } else {
-            format!("SELECT {quoted_hash}, {logical} FROM {quoted_table} WHERE {quoted_id} = ?1")
-        };
-        let delete_by_id = format!("DELETE FROM {quoted_table} WHERE {quoted_id} = ?1");
-        let technical_id_bounds =
-            format!("SELECT MIN({quoted_id}), MAX({quoted_id}) FROM {quoted_table}");
-
-        Self {
-            table_name,
-            index_name,
-            create_table,
-            create_index,
-            insert,
-            select_by_hash,
-            select_by_id,
-            delete_by_id,
-            technical_id_bounds,
-        }
-    }
-}
-
-fn open_connection(path: &Path) -> Result<Connection, SqliteSinkError> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let connection = Connection::open_with_flags(path, flags)?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
-    Ok(connection)
-}
-
-fn object_exists(connection: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1 COLLATE NOCASE)",
-        params![name],
-        |row| row.get(0),
-    )
-}
-
-fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), SqliteSinkError> {
-    let mut statement = connection.prepare_cached(
-        "SELECT type, name, sql FROM sqlite_schema \
-         WHERE tbl_name = ?1 COLLATE NOCASE \
-         AND type IN ('table', 'index', 'trigger') \
-         ORDER BY type COLLATE BINARY, name COLLATE BINARY",
-    )?;
-    let mut rows = statement.query(params![&sql.table_name])?;
-    let mut found_table = false;
-    let mut found_index = false;
-    while let Some(row) = rows.next()? {
-        let object_type: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let definition: Option<String> = row.get(2)?;
-        match object_type.as_str() {
-            "table" if name == sql.table_name => {
-                found_table = true;
-                if definition.as_deref() != Some(sql.create_table.as_str()) {
-                    return Err(SqliteSinkError::TargetLayoutMismatch { name });
-                }
-            }
-            "index" if name == sql.index_name => {
-                found_index = true;
-                if definition.as_deref() != Some(sql.create_index.as_str()) {
-                    return Err(SqliteSinkError::TargetLayoutMismatch { name });
-                }
-            }
-            _ => return Err(SqliteSinkError::TargetLayoutMismatch { name }),
-        }
-    }
-    if !found_table {
-        return Err(SqliteSinkError::TargetMissing {
-            name: sql.table_name.clone(),
-        });
-    }
-    if !found_index {
-        return Err(SqliteSinkError::TargetMissing {
-            name: sql.index_name.clone(),
-        });
-    }
-    Ok(())
-}
-
-fn technical_id_bounds(
-    connection: &Connection,
-    sql: &SqlPlan,
-) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
-    connection.query_row(&sql.technical_id_bounds, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })
 }
 
 fn set_pending(
@@ -1043,42 +554,4 @@ fn validate_apply_for_change(
         ));
     }
     Ok(())
-}
-
-fn technical_id_as_i64(technical_id: u64) -> Result<i64, SqliteSinkError> {
-    i64::try_from(technical_id).map_err(|_| {
-        invalid_state(format!(
-            "technical ID {technical_id} cannot be represented by SQLite INTEGER"
-        ))
-    })
-}
-
-fn stored_hash_matches(actual: ValueRef<'_>, expected: &[u8; 16]) -> bool {
-    matches!(actual, ValueRef::Blob(bytes) if bytes == expected)
-}
-
-fn invalid_state(message: impl Into<String>) -> SqliteSinkError {
-    SqliteSinkError::InvalidState {
-        message: message.into(),
-    }
-}
-
-fn pending_mismatch(message: impl Into<String>) -> SqliteSinkError {
-    SqliteSinkError::PendingInputMismatch {
-        message: message.into(),
-    }
-}
-
-impl From<PendingStateCodecError> for SqliteSinkError {
-    fn from(error: PendingStateCodecError) -> Self {
-        invalid_state(error.to_string())
-    }
-}
-
-impl From<RowError> for SqliteSinkError {
-    fn from(error: RowError) -> Self {
-        Self::Row {
-            message: error.to_string(),
-        }
-    }
 }

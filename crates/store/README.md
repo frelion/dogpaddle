@@ -8,7 +8,8 @@
 
 Store 将资源装配与运行时访问分离：
 
-- `Store` 创建或打开全部具名数据对象；进入运行期前，其所有权会被消费；
+- `Store` 创建或打开全部具名数据对象，也能在装配期借用一个短期只读 snapshot；进入运行期前，
+  其所有权会被消费；
 - `Cell<T>`、`OrderedMap<K, V, SIZE>` 与 `AppendLog<T>` 是 collection 的完整能力，可以产生
   完整的事务级读写 Access；
 - `ReadOnly<C>` 由完整 collection 显式单向衰减得到，长期移除该 handle 的写权限；
@@ -122,18 +123,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-重新打开时必须声明同一个完整数据类型：
+重新打开时必须声明同一个完整数据类型。装配期读取直接借用当前 `Store`，snapshot 结束后仍可
+继续打开其他数据对象，最终再把同一个 Store 消费为运行期事务能力：
 
 ```rust,no_run
-use dogpaddle_store::{Cell, Store};
+use dogpaddle_store::{Cell, Large, OrderedMap, Store};
 
 # fn open() -> Result<(), Box<dyn std::error::Error>> {
 let store = Store::open("./dogpaddle-store-data")?;
 let counter = store.open_data::<Cell<u64>>("counter")?;
-let (_, read_transactions) = store.into_transactions().split();
-let transaction = read_transactions.begin()?;
-let access = transaction.access();
-assert_eq!(counter.read(access)?.get()?, Some(1));
+{
+    let transaction = store.read_transaction()?;
+    assert_eq!(counter.read(transaction.access())?.get()?, Some(1));
+}
+let _users = store.open_data::<OrderedMap<u64, String, Large>>("users")?;
+let _transactions = store.into_transactions();
 # Ok(())
 # }
 ```
@@ -186,6 +190,10 @@ Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，�
 `read` 也返回同一组类型。
 
 ## 事务与扫描语义
+
+`Store::read_transaction(&self)` 只在装配期提供一个绑定于 Store 借用期的活动只读 snapshot；它
+不会导出可长期持有的事务启动能力，也没有写入或 commit 权限。snapshot 被丢弃后，同一个
+`Store` 仍可继续 `open_data`，然后按正常边界进入运行期。
 
 `Store::into_transactions()` 只发生一次，并产生唯一、不可克隆的写能力 `Transactions`。运行
 协调者集中持有它；`begin(&mut self)` 返回的 Transaction guard 在存活期间独占借用该能力，

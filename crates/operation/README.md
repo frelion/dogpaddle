@@ -218,7 +218,8 @@ input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位�
 source/sink 与 output 属性。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
 此前 Schema bind 产生的 `OperationBinding::materialize`。binding 只按名称取得已经创建或打开的
-`Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store。
+`Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store；物化会消费整组实例，
+并拒绝缺失、类型错误或未被 binding 取走的多余资源。
 
 collection 只暴露真实存在的布局选择：`Cell<T>` 永远使用共享空间；`OrderedMap` 的 `Small`
 形式共享底层物理空间，`Large` 形式拥有独立物理空间。Size 属于支持选择的具名数据对象的
@@ -249,7 +250,8 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 类型不匹配会返回错误而不是 panic。类型擦除不会进入运行实例、事务访问路径或持久化格式。
 
 物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
-`Box<dyn operation::Operation>`，并通过同一个 `turn` 分派运行。Schema binding 只在 build/open
+`Box<dyn operation::Operation>`，并通过同一个可变 `turn` 分派运行；运行实例只要求 `Send`，调度方
+在一次 turn 期间持有其独占可变访问。Schema binding 只在 build/open
 期间连接 Definition 与实例；运行 trait 和具体运行类型都不反向保存或暴露 Definition，Flow
 已经从持久 Definition 获得 kind、资源声明和端口 Schema。
 Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化运行实例；开放可注入 Flow 的
@@ -439,7 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = tempfile::tempdir()?;
     let mut store = Store::create(root.path().join("store"))?;
     let position = store.create_data::<Cell<u64>>("position")?;
-    let operation = SequenceSourceOperation::new(42, position);
+    let mut operation = SequenceSourceOperation::new(42, position);
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin()?;
