@@ -160,22 +160,29 @@ flush；健康运行时预期在下一次 poll 开头或 stop 执行并最终观
 但这不属于 ACK success。generic task commit failure 也可能由 Engine 内部转成非抛出结果。
 因此 checkpoint 是恢复正确性边界，外部 progress lag 另作运行监控与真实 connector gate。
 D2 先建立独立 Debezium runtime 与 pre-ACK checkpoint，D3 再围绕这个已经稳定的交付面建立
-generic durable ingress。
+durable ingress，即 checkpoint 与 Station output 的原子持久交接，不是独立存储层或公共 API。
 
 D3 及以后的提交规则由统一 Operation 协议表达：
 
-1. `Operation::turn(None)` 在没有活动 MDBX 写事务时主动 poll，并返回一个线性
+1. `Operation::turn(None)` 在没有活动 MDBX 写事务时主动 poll 并转换，返回一个线性
    `PreparedTurn`；
-2. Station 开启写事务，`PreparedTurn::apply` 把 accepted checkpoint、pending payload，以及 D3
-   经故障矩阵证明必需的最小 replay receipt 原子写入 MDBX；
-3. Station 完成 Operation state 与 output 协调并 commit 后，才消费 prepared turn 返回的
+2. Station 开启写事务，`PreparedTurn::apply` 保存 accepted checkpoint 并返回可选 Change；
+   Station 在同一事务中完成 output append；
+3. Station commit 后，才消费 prepared turn 返回的
    `AfterCommit` 来 ACK Java bridge；rollback、背压、错误或 commit 失败都只 Drop，不 ACK；
-4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建；
-5. IngressSource 在后续普通 turn 中同时清除 pending 并写 Station output。
+4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建。
+
+2026-09-05 收缩：不再另建公共 IngressSource；PostgresSource 唯一的
+`postgres_source.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，复用其
+versioned framing/checksum，不加 Source envelope 或持久化 pending。原 `postgres_source.state`
+的 pending 布局属于未发布的开发期格式，旧 Flow 必须重建，不提供 alias、兼容读取或迁移。
+不保存额外 receipt：未提交只重投，已提交但 ACK 不确定必须 fail-stop 并从 checkpoint 恢复，
+因而不使用 checkpoint 判断批次身份。这个实现不改变后续第二 connector 才提取共性的原则。
 
 `AfterCommit` 失败发生在本地提交之后，不能伪装成 rollback。该运行态 Station 必须 fail-stop，
 Flow reopen 后再从已提交 checkpoint 恢复。Flow 不公开 `ingest` 或 connector-specific 调度入口；
-初始化、poll、durable stage、ACK 与 pending output 都由 Operation 自己的跨 turn 状态机表达。
+初始化、poll、转换与 ACK 都由 Operation 的统一 turn 协议表达。PostgresSource 以零超时 poll，
+只表示不等待数据，不表示整个 turn 非阻塞：connector 启动和 ACK 仍是有界同步调用。
 
 不使用 Java 本地 offset 文件作为 fallback、加速缓存或双写副本，因为崩溃后无法
 可靠判定它与 MDBX 哪个更新。Rust/Flow 把 offset 当作 opaque bytes，不从 PG LSN 或其他
@@ -199,7 +206,7 @@ fresh Engine 恢复；D4 才交付 PostgreSQL Source definition、catalog/identi
 - JVM 创建与共享；
 - runtime、linear Delivery 与 start/poll/ack/stop；
 - owned delivery envelope 的外层协议；
-- durable ingress 的 accepted/pending/duplicate/backpressure 语义；
+- checkpoint/output 原子提交、未 ACK 重投与 backpressure 的交接语义；
 - Flow/Station 的事务和调度边界。
 
 D7 必须用第二个 connector 证明这一分界，然后才能宣称存在稳定的多 Source 架构。
@@ -278,7 +285,7 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 
 这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和 consumer frontier，并要求
 Java/connector 获得 Flow 的写事务能力。外部 delivery 必须由普通 Source Operation 的 prepared
-turn 先写入 D3 durable ingress，commit 后 ACK，再由后续 turn 输出。
+turn 保存 checkpoint 并返回 Change，由 Station 在同一事务中追加 output，commit 后再 ACK。
 
 ## 后续决策
 

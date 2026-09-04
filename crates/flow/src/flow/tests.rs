@@ -69,7 +69,7 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     assert_eq!(flow.topology.schedule, [2, 3, 0, 1, 4, 5]);
     drop(flow);
 
-    let reopened = FlowFactory::open(path).unwrap();
+    let reopened = FlowFactory::new(path).open().unwrap();
     assert_eq!(reopened.topology.schedule, [2, 3, 0, 1, 4, 5]);
 }
 
@@ -92,7 +92,7 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
     assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut reopened = FlowFactory::open(&path).unwrap();
+    let mut reopened = FlowFactory::new(&path).open().unwrap();
     reopened.topology.schedule = vec![0, 1];
     assert_eq!(
         reopened.advance().unwrap(),

@@ -1,5 +1,10 @@
 use std::{
-    any::Any, collections::BTreeMap, error::Error, fmt::Debug, marker::PhantomData, num::NonZeroU32,
+    any::{Any, TypeId},
+    collections::BTreeMap,
+    error::Error,
+    fmt::Debug,
+    marker::PhantomData,
+    num::NonZeroU32,
 };
 
 use arrow_schema::SchemaRef;
@@ -7,6 +12,7 @@ use dogpaddle_change::{SchemaError, validate_schema};
 use dogpaddle_store::{Store, StoreData, StoreError};
 use thiserror::Error;
 
+use crate::RuntimeResource;
 use crate::operation::Operation;
 
 mod private {
@@ -28,7 +34,9 @@ type ErasedData = Box<dyn Any + Send + Sync>;
 type CreateFn = fn(&mut Store, &str) -> Result<ErasedData, StoreError>;
 type OpenFn = fn(&Store, &str) -> Result<ErasedData, StoreError>;
 type MaterializeFn = Box<
-    dyn FnOnce(&mut DataInstances) -> Result<Box<dyn Operation>, MaterializeError> + Send + 'static,
+    dyn FnOnce(&mut DataInstances, RuntimeResource) -> Result<Box<dyn Operation>, MaterializeError>
+        + Send
+        + 'static,
 >;
 
 /// Type-erased Schema rejection from one concrete Operation definition.
@@ -46,6 +54,7 @@ pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
 #[doc(hidden)]
 pub struct OperationBinding {
     output_schema: Option<SchemaRef>,
+    runtime_type: Option<TypeId>,
     materialize: MaterializeFn,
 }
 
@@ -220,8 +229,35 @@ impl OperationBinding {
     {
         Self {
             output_schema,
-            materialize: Box::new(materialize),
+            runtime_type: None,
+            materialize: Box::new(move |data, _resource| materialize(data)),
         }
+    }
+
+    pub(crate) fn with_resource<R, F>(output_schema: Option<SchemaRef>, materialize: F) -> Self
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut DataInstances, R) -> Result<Box<dyn Operation>, MaterializeError>
+            + Send
+            + 'static,
+    {
+        Self {
+            output_schema,
+            runtime_type: Some(TypeId::of::<R>()),
+            materialize: Box::new(move |data, resource| materialize(data, resource.take()?)),
+        }
+    }
+
+    /// Checks the resource's presence and exact type without accessing it.
+    ///
+    /// This check can run before Store creation; it does not initialize external
+    /// clients or resolve credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns a materialization error for a missing, unexpected, or wrong-type resource.
+    pub fn validate_resource(&self, resource: &RuntimeResource) -> Result<(), MaterializeError> {
+        resource.validate(self.runtime_type)
     }
 
     /// Returns the exact logical output Schema, or `None` for a Sink binding.
@@ -231,18 +267,21 @@ impl OperationBinding {
         self.output_schema.as_ref()
     }
 
-    /// Consumes this binding and its named typed data instances.
+    /// Consumes this binding, its named typed data instances, and its runtime resource.
     ///
     /// # Errors
     ///
     /// Returns [`MaterializeError`] when the supplied instances are missing,
-    /// have the wrong class, or remain unconsumed after assembly.
+    /// have the wrong class, or remain unconsumed after assembly; also rejects
+    /// a missing, unexpected, or wrong-type runtime resource.
     #[doc(hidden)]
     pub fn materialize(
         self,
         mut data: DataInstances,
+        resource: RuntimeResource,
     ) -> Result<Box<dyn Operation>, MaterializeError> {
-        let operation = (self.materialize)(&mut data)?;
+        self.validate_resource(&resource)?;
+        let operation = (self.materialize)(&mut data, resource)?;
         data.finish()?;
         Ok(operation)
     }
@@ -397,6 +436,15 @@ where
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MaterializeError {
+    /// The Operation requires an ephemeral resource that was not supplied.
+    #[error("operation runtime resource was not provided")]
+    MissingRuntimeResource,
+    /// The supplied ephemeral resource has the wrong Rust type.
+    #[error("operation runtime resource has the wrong type")]
+    WrongRuntimeResource,
+    /// A self-contained Operation was given an unused ephemeral resource.
+    #[error("operation does not accept a runtime resource")]
+    UnexpectedRuntimeResource,
     /// A logical resource appears more than once in a schema or instance set.
     #[error("operation data {name:?} appears more than once")]
     DuplicateData {

@@ -253,8 +253,9 @@ fn benchmark_scenario(run: &mut Run, config: &Config, scenario: Scenario, case: 
     if scenario.is_capacity_pressure() {
         drop(flow);
         seed_capacity_backlog(&path, capacity_backlog_entries(config));
-        flow =
-            FlowFactory::open(&path).expect("reopen capacity-pressure runtime benchmark fixture");
+        flow = FlowFactory::new(&path)
+            .open()
+            .expect("reopen capacity-pressure runtime benchmark fixture");
     }
 
     run_rounds(&mut flow, config.warmup_rounds);

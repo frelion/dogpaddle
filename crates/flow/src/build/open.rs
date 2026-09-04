@@ -1,6 +1,4 @@
-use std::path::Path;
-
-use dogpaddle_operation::{DataInstances, OperationBinding};
+use dogpaddle_operation::{DataInstances, OperationBinding, RuntimeResource};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
 
 use crate::{
@@ -10,7 +8,9 @@ use crate::{
     station::StationParts,
 };
 
-use super::{FlowFactory, StationDefinition, codec, schema, validate_data_declarations};
+use super::{
+    FlowFactory, StationDefinition, bind_resources, codec, schema, validate_data_declarations,
+};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
@@ -25,9 +25,17 @@ impl FlowFactory {
     ///
     /// Returns [`FlowError::IncompleteBuild`] when no complete definition was
     /// published, or another [`FlowError`] when the Store, definition, topology,
-    /// or required station resources are invalid.
-    pub fn open(path: impl AsRef<Path>) -> Result<Flow, FlowError> {
-        let path = path.as_ref().to_path_buf();
+    /// or required station resources are invalid. Returns
+    /// [`FlowError::OpenWithDefinition`] if this factory also declares topology
+    /// or output capacities; open accepts only the path and runtime resources.
+    pub fn open(self) -> Result<Flow, FlowError> {
+        if !self.stations.is_empty()
+            || !self.connections.is_empty()
+            || !self.output_capacities.is_empty()
+        {
+            return Err(FlowError::OpenWithDefinition);
+        }
+        let path = self.path;
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
         let definition_bytes = read_published_definition(&store, &published)?;
@@ -35,6 +43,7 @@ impl FlowFactory {
         let topology = resolve_topology(&definition);
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
+        let resources = bind_resources(&definition, &bindings, self.resources)?;
         let station_ids = definition
             .stations()
             .iter()
@@ -46,7 +55,10 @@ impl FlowFactory {
             .iter()
             .enumerate()
             .zip(bindings)
-            .map(|((index, station), binding)| open_station_part(&store, index, station, binding))
+            .zip(resources)
+            .map(|(((index, station), binding), resource)| {
+                open_station_part(&store, index, station, binding, resource)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let (transactions, reads) = store.into_transactions().split();
         let assembled = assemble_stations(topology, station_parts);
@@ -99,6 +111,7 @@ fn open_station_part(
     index: usize,
     station: &StationDefinition,
     binding: OperationBinding,
+    resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
     let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
         store,
@@ -112,7 +125,7 @@ fn open_station_part(
         data.insert(instance)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(data)?;
+    let operation = binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);

@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     drop(flow);
 
-    let reopened = FlowFactory::open(&path)?;
+    let reopened = FlowFactory::new(&path).open()?;
     assert_eq!(reopened.station_count(), 6);
     Ok(())
 }
@@ -82,6 +82,39 @@ output capacity，outputless Station 不得声明；重复、遗漏、类别不�
 传到 consumer 的对应有序 input port，并调用 Definition 的纯 bind；任一 Schema 拒绝都会带
 Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
 编码失败都不会创建目标目录。
+
+### 外部算子的运行配置
+
+`FlowFactory::resource(station_id, value)` 为指定 Station 装配一个拥有型、非持久的运行资源。
+Flow 只按 ID 路由，不知道具体 connector 类型；Operation binding 在 Store 创建前检查精确资源类型。
+缺失、错误类型、重复或多余资源都会报错，错误不会打印资源内容。普通算子不接收资源。
+
+build/open 统一从 `FlowFactory::new(path)` 进入。open 使用磁盘中的 Definition，不接受重新声明
+Station/连接/容量；只需重新传入临时配置。没有保留旧的 static open 兼容入口。
+
+```no_run
+use dogpaddle_flow::FlowFactory;
+use dogpaddle_operation::operation::source::PostgresSourceConfig;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let config = PostgresSourceConfig::new_unencrypted(
+    "/opt/dogpaddle-debezium", "127.0.0.1", 5432, "shop", "cdc",
+    std::env::var("CDC_PASSWORD")?,
+)?;
+let mut factory = FlowFactory::new("./shop-flow");
+factory.resource("orders", config)?;
+let mut flow = factory.open()?;
+flow.advance()?;
+# Ok(())
+# }
+```
+
+`PostgresSource` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、不连接 PG、
+不启动 JVM；初始化、poll、转换、ACK 仍全在 Operation 内，通过通用 turn 协议完成。
+checkpoint 与 Station output 在同一事务提交，背压同时回滚且不 ACK，不另存 pending。
+poll 不等待数据；宿主在整轮 Idle 或持续 Backpressured 时自行安排等待，避免忙轮询。
+它只输出完整 Change，Flow 没有 `ingest`、PG 专用分支或另一套调度状态。
+完整真实 PG→SQLite 与进程恢复示例见 `examples/postgres_cdc.rs`，显式验收命令见根目录 TESTING.md。
 
 Filter/Extend/Select/`SchemaAlign` 的 Definition 在 `station()` 之前已通过 fallible 构造入口将
 `DataFusion` `Expr` 编码为
@@ -235,19 +268,20 @@ DAG 分量仍获得本轮 turn。fan-out 共享一份 output log 和 capacity，
 `u64::MAX` 后稳定返回 `Action::Idle`，因此即使进程在最终 source commit 后退出，重开后的 schedule 仍会
 继续排空下游。
 
-Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
+Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::new(path).open()` 返回
 `IncompleteBuild`；
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 
-`FlowFactory::open()` 在一次 Store setup 生命周期中读取、解码并重新校验 manifest，再解析拓扑并
+`FlowFactory::new(path).open()` 在一次 Store setup 生命周期中读取、解码并重新校验 manifest，再解析拓扑并
 纯重建全部 Schema bindings；只有成功后才用同一个 Store 打开其余数据对象和 output，最后按
 source ID 重新注入 inputs、装配 Station。第二次 Definition 读取和所有 output frontier 校验共享
 同一个 RO snapshot，不启动或提交写事务。open 不扫描全部 backlog；合法 IPC 中与绑定不一致的
 Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用方不需要重新提交 Definition。
 
-当前磁盘格式使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
-和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局或通用序列化框架。以下名称是兼容性边界：
+当前磁盘格式的外层使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
+和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局。具体 Operation payload 有各自的固定编码：
+例如表达式使用 pinned protobuf，PostgresSource 使用 canonical JSON。以下名称是兼容性边界：
 
 - Flow manifest：`flow/definition`
 - Station 状态：`station/{index:08x}/state`

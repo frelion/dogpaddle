@@ -21,11 +21,16 @@ thiserror.workspace = true
 arrow-array.workspace = true
 dogpaddle-bench-protocol.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [[test]]
 name = "correctness"
 path = "tests/correctness.rs"
+
+[[example]]
+name = "postgres_cdc"
+path = "examples/postgres_cdc.rs"
 
 [[bench]]
 name = "flow_lifecycle"

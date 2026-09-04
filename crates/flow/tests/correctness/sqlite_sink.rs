@@ -92,7 +92,7 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
         !sqlite_path.exists(),
         "Flow build eagerly created the SQLite database"
     );
-    drop(FlowFactory::open(&flow_path).unwrap());
+    drop(FlowFactory::new(&flow_path).open().unwrap());
     assert!(
         !sqlite_path.exists(),
         "Flow open eagerly created the SQLite database"
@@ -102,7 +102,7 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
     publish_source_change(&flow_path, &encoded_change);
 
     for round in 1..=6 {
-        let mut flow = FlowFactory::open(&flow_path).unwrap();
+        let mut flow = FlowFactory::new(&flow_path).open().unwrap();
         assert_eq!(
             flow.advance().unwrap(),
             AdvanceOutcome::Progressed,

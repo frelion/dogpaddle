@@ -11,6 +11,7 @@ const FORMAT_VERSION: u16 = 1;
 pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
 
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
+    (source::postgres::TAG, source::postgres::decode_definition),
     (source::sequence::TAG, source::sequence::decode_definition),
     (
         transform::running_event_count::TAG,

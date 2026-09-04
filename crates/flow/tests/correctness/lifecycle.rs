@@ -44,11 +44,11 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     );
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
     drop(flow);
@@ -114,9 +114,12 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     builder.connect([source], sink);
     let flow = builder.build().unwrap();
 
-    assert!(matches!(FlowFactory::open(&path), Err(FlowError::Store(_))));
+    assert!(matches!(
+        FlowFactory::new(&path).open(),
+        Err(FlowError::Store(_))
+    ));
     drop(flow);
-    assert!(FlowFactory::open(&path).is_ok());
+    assert!(FlowFactory::new(&path).open().is_ok());
 }
 
 #[test]
@@ -141,7 +144,7 @@ fn build_and_open_support_many_station_output_logs() {
     assert_eq!(flow.station_count(), OUTPUT_STATION_COUNT + 1);
     drop(flow);
     assert_eq!(
-        FlowFactory::open(path).unwrap().station_count(),
+        FlowFactory::new(path).open().unwrap().station_count(),
         OUTPUT_STATION_COUNT + 1
     );
 }

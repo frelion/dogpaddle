@@ -370,7 +370,7 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     let mut filter = filter
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let Action::Complete(Some(filtered)) = commit_ready(
         filter.as_mut(),
@@ -397,7 +397,7 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     let mut extend = extend
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let Action::Complete(Some(extended)) = commit_ready(
         extend.as_mut(),
@@ -441,7 +441,7 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
     let mut select = select
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let Action::Complete(Some(selected)) = commit_ready(
         select.as_mut(),
@@ -478,7 +478,7 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
     let mut union_all = union_all
         .bind(&union_inputs)
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let Action::Complete(Some(forwarded)) = commit_ready(
         union_all.as_mut(),
@@ -518,7 +518,7 @@ fn decoded_schema_align_golden_reconstructs_its_runtime_semantics() {
     let mut operation = definition
         .bind(std::slice::from_ref(&schema))
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let Action::Complete(Some(aligned)) = commit_ready(
         operation.as_mut(),

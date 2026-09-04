@@ -37,7 +37,7 @@
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
+| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十一个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
 | Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
@@ -54,6 +54,35 @@ pinned PostgreSQL gate 最后只经公共 Rust API 证明同进程运行、unack
 Engine restore 与 eventual LSN。确定性 connector 不进入正式 distribution 或 runtime archive，也不代替
 真实 PostgreSQL 证据。
 四层证据必须分别报告，只有全部通过才满足 D2 exit。
+
+## PostgreSQL Source 的显式验收
+
+Operation 公共 `correctness/postgres.rs` 拥有 tag11 canonical JSON golden、声明布局、exact Schema、
+临时资源类型/脱敏、初始化与 checkpoint 恢复/回滚/reopen 不启动外部资源，以及损坏 checkpoint
+拒绝；源码同目录 `tests.rs` 只拥有私有 Connect JSON 转换及大文本/binary/null 的稳定重批。
+checkpoint codec 本身归 Debezium，不维护另一套 Source 编码。Flow 公共 `correctness/postgres.rs` 拥有资源
+缺失/错误/重复/多余的无目录副作用、准确 Station ID、Schema 拒绝、build/open 与资源布局。
+
+真实 Engine 与 PG 不进入普通 Cargo gate。显式执行：
+
+```sh
+python3 tools/check_postgres_cdc.py \
+  --bundle /absolute/path/to/dogpaddle-debezium-runtime-aarch64-apple-darwin \
+  --postgres-bin /absolute/path/to/postgresql/bin \
+  --keep
+```
+
+需要 Python 3.9+、本机 PostgreSQL 15+ 的 `initdb/pg_ctl/postgres/psql` 和匹配 target 的已构建 runtime
+payload。脚本创建独占临时 cluster、随机 loopback 端口和测试表/slot/publication，不连接已有服务；
+无论成败都停止它自己的 cluster。`--keep` 或失败保留目录和日志，成功且无 `--keep` 才删除本次 fixture。
+
+`crates/flow/examples/postgres_cdc.rs` 是公共 API JSONL host：Flow 模式证明 PG→SQLite 的完整
+insert/update/delete、类型映射与进程 reopen；直接 Operation+Store 模式验证 checkpoint/output
+单次原子提交、rollback/背压时二者均不变、提交后 ACK 前退出，以及 checkpoint-only fresh Engine。
+2050 行单 PG 事务跨越 1024 条批量边界，首批提交后 ACK 前退出并 reopen，后继 witness 验证完整
+事件顺序且无重漏。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
+接口，也不是第二套运行层。结果必须报告实际 PG/Rust/runtime 版本；本机 PG17 证据不能冒充既有
+Linux digest-pinned PG16.15 D1/D2 gate，D5 的长稳、fencing、升级与发布门仍独立开放。
 
 ## Change + Store 的最小接缝
 
@@ -82,7 +111,7 @@ scalar/array evaluate。该格式不承诺跨 DataFusion 版本兼容；升级 D
 Arrow 时必须更新当前 golden，并重跑 proto roundtrip、build/open/reopen 和执行语义。旧数据库直接
 删除并重建；测试不约束旧 payload 或旧 manifest 的行为。
 
-内建算子的 conformance 使用同一证据形状，不按算子复制测试框架：codec 分区冻结十个 tag、
+内建算子的 conformance 使用同一证据形状，不按算子复制测试框架：codec/postgres 分区冻结十一个 tag、
 canonical payload 与损坏拒绝，definition 分区覆盖 kind/arity/data 和 exact Schema 成功/拒绝，runtime
 分区覆盖线性 turn、Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖提交前
 completion 丢弃、提交后执行、post-commit fail-stop、纯失败无目录副作用、

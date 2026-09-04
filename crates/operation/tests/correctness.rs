@@ -2,6 +2,8 @@
 mod codec;
 #[path = "correctness/definition.rs"]
 mod definition;
+#[path = "correctness/postgres.rs"]
+mod postgres;
 #[path = "correctness/protocol.rs"]
 mod protocol;
 #[path = "correctness/runtime.rs"]

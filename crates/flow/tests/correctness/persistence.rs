@@ -76,7 +76,7 @@ fn open_classifies_each_required_station_resource_fault() {
     ] {
         let path = root.path().join(name);
         publish_faulty_resources(&path, &definition, fault);
-        let Err(error) = FlowFactory::open(&path) else {
+        let Err(error) = FlowFactory::new(&path).open() else {
             panic!("case {name} unexpectedly opened");
         };
         match fault {
@@ -144,7 +144,7 @@ fn open_rejects_an_unpublished_build() {
         .unwrap();
     drop(store);
     assert!(matches!(
-        FlowFactory::open(path),
+        FlowFactory::new(path).open(),
         Err(FlowError::IncompleteBuild)
     ));
 }

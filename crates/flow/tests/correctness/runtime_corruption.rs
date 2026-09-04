@@ -45,7 +45,7 @@ fn open_rejects_missing_malformed_and_out_of_range_cursors_without_writes() {
         publish_pending_input(&path, None, shift_head);
         write_sink_state(&path, CURSOR, value);
         let before = durable_input_state(&path);
-        let Err(error) = FlowFactory::open(&path) else {
+        let Err(error) = FlowFactory::new(&path).open() else {
             panic!("case {case} unexpectedly opened");
         };
         assert!(matches!(
@@ -71,7 +71,7 @@ fn advance_rejects_every_invalid_active_input_without_writes() {
         publish_pending_input(&path, None, false);
         write_sink_state(&path, ACTIVE, value);
         let before = durable_input_state(&path);
-        let mut flow = FlowFactory::open(&path).unwrap();
+        let mut flow = FlowFactory::new(&path).open().unwrap();
         let error = flow.advance().unwrap_err();
         assert_eq!(
             (error.station_id(), error.to_string().as_str()),
@@ -88,7 +88,7 @@ fn advance_rejects_an_invalid_encoded_change_without_writes() {
     let path = root.path().join("flow");
     publish_pending_input(&path, Some(b"not an Arrow IPC stream"), false);
     let before = durable_input_state(&path);
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     let error = flow.advance().unwrap_err();
     assert_eq!(error.station_id(), "sink");
     assert!(
@@ -108,7 +108,7 @@ fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
     publish_pending_input(&path, Some(&encoded), false);
     let before = durable_input_state(&path);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     let error = flow.advance().unwrap_err();
     assert_eq!(error.station_id(), "sink");
     assert!(

@@ -1,11 +1,13 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{DataInstances, MaterializeError, OperationBinding, OperationDefinition};
+use dogpaddle_operation::{
+    DataInstances, MaterializeError, OperationBinding, OperationDefinition, RuntimeResource,
+};
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
 use crate::{
@@ -33,14 +35,15 @@ static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Declaring stations, output capacities, and connections is side-effect free.
 /// [`FlowFactory::build`] validates the complete graph before creating the Store
 /// at the target path.
-/// [`FlowFactory::open`] directly restores an already-built Flow without
-/// creating a factory instance.
+/// [`FlowFactory::open`] restores an already-built Flow using only the path and
+/// any explicitly supplied runtime resources.
 pub struct FlowFactory {
     path: PathBuf,
     token: u64,
     stations: Vec<StationDefinition>,
     connections: Vec<(Vec<StationRef>, StationRef)>,
     output_capacities: Vec<(StationRef, NonZeroU64)>,
+    resources: BTreeMap<String, RuntimeResource>,
 }
 
 /// Temporary reference to a station declared in one [`FlowFactory`].
@@ -54,7 +57,7 @@ pub struct StationRef {
 }
 
 impl FlowFactory {
-    /// Starts a side-effect-free definition for a new persistent Flow.
+    /// Starts a side-effect-free factory for building or opening a persistent Flow.
     ///
     /// # Panics
     ///
@@ -69,7 +72,30 @@ impl FlowFactory {
             stations: Vec::new(),
             connections: Vec::new(),
             output_capacities: Vec::new(),
+            resources: BTreeMap::new(),
         }
+    }
+
+    /// Supplies one ephemeral resource to a Station, for either build or open.
+    ///
+    /// Resources are moved into Operations during assembly and never persisted.
+    /// Flow does not inspect their values or initialize external clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the same Station is assigned more than one resource.
+    pub fn resource<R: Send + 'static>(
+        &mut self,
+        station_id: impl Into<String>,
+        resource: R,
+    ) -> Result<&mut Self, FlowError> {
+        let station_id = station_id.into();
+        if self.resources.contains_key(&station_id) {
+            return Err(FlowError::DuplicateRuntimeResource { station_id });
+        }
+        self.resources
+            .insert(station_id, RuntimeResource::new(resource));
+        Ok(self)
     }
 
     /// Declares one station containing exactly one concrete operation definition.
@@ -129,10 +155,12 @@ impl FlowFactory {
     ///
     /// # Errors
     ///
-    /// Returns a [`FlowError`] for an invalid topology, unencodable definition,
-    /// occupied path, or Store failure. A Store failure after path creation can
-    /// leave an incomplete build that [`FlowFactory::open`] refuses to open.
-    pub fn build(self) -> Result<Flow, FlowError> {
+    /// Returns a [`FlowError`] for an invalid topology, Schema or runtime resource,
+    /// unencodable definition, occupied path, or Store failure. A Store failure
+    /// after path creation can leave an incomplete build that [`FlowFactory::open`]
+    /// refuses to open.
+    pub fn build(mut self) -> Result<Flow, FlowError> {
+        let resources = std::mem::take(&mut self.resources);
         let path = self.path.clone();
         let declared_definition = self.finish_definition()?;
         let definition_bytes = codec::encode(&declared_definition)?;
@@ -140,6 +168,7 @@ impl FlowFactory {
         let topology = resolve_topology(&definition);
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
+        let resources = bind_resources(&definition, &bindings, resources)?;
         let station_ids = definition
             .stations()
             .iter()
@@ -153,8 +182,9 @@ impl FlowFactory {
             .iter()
             .enumerate()
             .zip(bindings)
-            .map(|((index, station), binding)| {
-                create_station_part(&mut store, index, station, binding)
+            .zip(resources)
+            .map(|(((index, station), binding), resource)| {
+                create_station_part(&mut store, index, station, binding, resource)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (mut transactions, reads) = store.into_transactions().split();
@@ -189,6 +219,28 @@ impl FlowFactory {
     }
 }
 
+fn bind_resources(
+    definition: &FlowDefinition,
+    bindings: &[OperationBinding],
+    mut resources: BTreeMap<String, RuntimeResource>,
+) -> Result<Vec<RuntimeResource>, FlowError> {
+    let mut bound = Vec::with_capacity(bindings.len());
+    for (station, binding) in definition.stations().iter().zip(bindings) {
+        let resource = resources.remove(station.id()).unwrap_or_default();
+        binding
+            .validate_resource(&resource)
+            .map_err(|source| FlowError::RuntimeResource {
+                station_id: station.id().to_owned(),
+                source,
+            })?;
+        bound.push(resource);
+    }
+    if let Some(station_id) = resources.into_keys().next() {
+        return Err(FlowError::UnknownRuntimeResource { station_id });
+    }
+    Ok(bound)
+}
+
 fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), MaterializeError> {
     for station in definition.stations() {
         let mut names = BTreeSet::new();
@@ -207,6 +259,7 @@ fn create_station_part(
     index: usize,
     station: &StationDefinition,
     binding: OperationBinding,
+    resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.create_data(&codec::station_state_name(index))?;
@@ -217,7 +270,7 @@ fn create_station_part(
         data.insert(declaration.create(store, &physical_name)?)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(data)?;
+    let operation = binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => store
             .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))

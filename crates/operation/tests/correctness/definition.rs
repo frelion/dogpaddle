@@ -60,7 +60,7 @@ fn materialize(
     definition
         .bind(input_schemas)
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap()
 }
 

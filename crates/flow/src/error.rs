@@ -12,6 +12,30 @@ use crate::{
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FlowError {
+    /// Opening uses the durable Definition, never declarations on the factory.
+    #[error("opening a flow does not accept station, connection, or capacity declarations")]
+    OpenWithDefinition,
+    /// A Station received more than one ephemeral resource.
+    #[error("station {station_id:?} has more than one runtime resource")]
+    DuplicateRuntimeResource {
+        /// Stable Station ID supplied by the caller.
+        station_id: String,
+    },
+    /// A resource targets a Station absent from the durable graph.
+    #[error("runtime resource targets unknown station {station_id:?}")]
+    UnknownRuntimeResource {
+        /// Unknown Station ID supplied by the caller.
+        station_id: String,
+    },
+    /// An Operation's ephemeral resource is absent or has the wrong type.
+    #[error("station {station_id:?} runtime resource is invalid: {source}")]
+    RuntimeResource {
+        /// Stable Station ID requiring the resource.
+        station_id: String,
+        /// Exact resource mismatch without exposing its contents.
+        #[source]
+        source: MaterializeError,
+    },
     /// The declared topology is invalid.
     #[error(transparent)]
     Topology(#[from] TopologyError),

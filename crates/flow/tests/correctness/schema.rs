@@ -203,7 +203,7 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     rewrite_checksum(&mut definition);
     replace_published_definition(&path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&path).open() else {
         panic!("open did not rebind the decoded schema-incompatible Project");
     };
     assert_project_field_rejection(&error);
@@ -218,7 +218,7 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
     let valid_filter = FilterDefinition::try_new(col("value").is_null()).unwrap();
     let invalid_filter = FilterDefinition::try_new(col("other").is_null()).unwrap();
     build_and_replace_operation(&filter_path, "filter", valid_filter, &invalid_filter);
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&filter_path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&filter_path).open() else {
         panic!("open did not rebind the decoded schema-incompatible Filter");
     };
     assert_eq!(error.station_id(), "filter");
@@ -239,7 +239,7 @@ fn open_rebinds_decoded_filter_and_extend_definitions() {
         ExtendDefinition::try_new("other", col("value")).unwrap(),
         &ExtendDefinition::try_new("value", col("value")).unwrap(),
     );
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&extend_path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&extend_path).open() else {
         panic!("open did not rebind the decoded schema-incompatible Extend");
     };
     assert_eq!(error.station_id(), "extend");
@@ -262,7 +262,7 @@ fn open_rebinds_decoded_select_and_union_definitions() {
         SelectDefinition::try_new([("copy", col("value"))]).unwrap(),
         &SelectDefinition::try_new([("copy", col("other"))]).unwrap(),
     );
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&select_path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&select_path).open() else {
         panic!("open did not rebind the decoded schema-incompatible Select");
     };
     assert_eq!(error.station_id(), "select");
@@ -312,7 +312,7 @@ fn open_rebinds_decoded_select_and_union_definitions() {
     rewrite_checksum(&mut definition);
     replace_published_definition(&union_path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&union_path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&union_path).open() else {
         panic!("open did not rebind the decoded schema-incompatible UnionAll");
     };
     assert_union_schema_mismatch(&error, 1);
@@ -342,7 +342,7 @@ fn open_rebinds_the_decoded_sqlite_sink_input_before_opening_its_database() {
     rewrite_checksum(&mut definition);
     replace_published_definition(&flow_path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::open(&flow_path) else {
+    let Err(FlowError::Schema(error)) = FlowFactory::new(&flow_path).open() else {
         panic!("open did not rebind the SQLite-incompatible output Schema");
     };
     assert_sqlite_identifier_collision(&error);
@@ -378,11 +378,11 @@ fn select_and_repeated_input_union_run_across_reopen() {
     factory.connect([count], sink);
     drop(factory.build().unwrap());
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
     drop(flow);
@@ -438,11 +438,11 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     factory.connect([count], sink);
     drop(factory.build().unwrap());
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     let mut reached_idle = false;
     for _ in 0..4 {
         if flow.advance().unwrap() == AdvanceOutcome::Idle {
@@ -505,11 +505,11 @@ fn schema_align_runs_and_reopens_with_explicit_schema_contract() {
     factory.connect([count], sink);
     drop(factory.build().unwrap());
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     let mut reached_idle = false;
     for _ in 0..4 {
         if flow.advance().unwrap() == AdvanceOutcome::Idle {
@@ -613,7 +613,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     drop(flow);
 
     for _ in 0..2 {
-        let mut reopened = FlowFactory::open(&path).unwrap();
+        let mut reopened = FlowFactory::new(&path).open().unwrap();
         assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
     }
 
@@ -646,11 +646,11 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     factory.connect([count], sink);
     drop(factory.build().unwrap());
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = FlowFactory::open(&path).unwrap();
+    let mut flow = FlowFactory::new(&path).open().unwrap();
     let mut reached_idle = false;
     for _ in 0..4 {
         if flow.advance().unwrap() == AdvanceOutcome::Idle {

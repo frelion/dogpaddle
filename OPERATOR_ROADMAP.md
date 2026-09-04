@@ -40,6 +40,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | 类别 | 算子 | 当前角色 | 路线判断 |
 | --- | --- | --- | --- |
 | Source | SequenceSource | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
+| Source | PostgresSource | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
@@ -50,7 +51,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | Sink | SqliteSink | 将差分流幂等物化到独占的 SQLite 表 | 已完成首个本地外部副作用 Sink |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十一个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
@@ -194,7 +195,7 @@ canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规
 | --- | --- | --- | --- |
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
-| 2（进行中） | 打通真实 Source/Sink | SqliteSink、Ingress、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
+| 2（进行中） | 打通真实 Source/Sink | PostgresSource、SqliteSink、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
 | 3 | 建立关系状态原语 | relation state、arrangement、Consolidate、Distinct | 后续状态关系算子的共同基座 |
 | 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
@@ -378,9 +379,10 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 它不引入 SQLite 元数据表；在目标表未被外部修改、数据库文件未被替换或恢复的约束下，重放保持
 最终结果恰好一次。通用 ingress、结果订阅与关系 snapshot 仍属于本阶段后续工作。
 
-### IngressSource
+### 已有试点：PostgresSource
 
-新增引擎受控的通用输入算子。运行协议已经落在所有 Operation 共用的唯一入口上：
+首个外部输入是具体的固定 Schema 单表 PostgreSQL CDC Source，不提前抽象公共 IngressSource。
+运行协议已经落在所有 Operation 共用的唯一入口上：
 
 ```text
 turn(None)
@@ -391,26 +393,27 @@ turn(None)
 ```
 
 零输入 Source 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
-Flow 继续唯一持有写事务启动能力，
-连接器不得绕过 Operation/Station 打开第二个 writer。IngressSource 在事务外 `turn(None)` 中 poll，
-在线性 prepared turn 中原子写入 durable pending payload、幂等 identity 和 accepted checkpoint，
-并只在该事务成功后通过 `AfterCommit` ACK 外部 delivery；rollback、背压或 commit 失败只丢弃
-completion。后续 turn 仍通过 `Action::Commit` 输出，pending 清除与 Station output append 同事务。
+Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/Station 打开第二个 writer。
+PostgresSource 在事务外 `turn(None)` 中以零超时 poll 并转换；`apply` 保存 checkpoint，
+通过 `Action::Commit` 返回可选 Change，由 Station 在同一事务中追加 output。
+只有该事务成功后才通过 `AfterCommit` ACK；rollback、背压或 commit 失败不推进 checkpoint/output，
+只丢弃 completion。零超时只表示 poll 不等待数据，connector 启动和 ACK 仍同步且有界。
 不新增 `Flow::ingest`、Source 专用 hook 或外部 coordinator。这一提交边界的具体 D0–D7 实施顺序见
 [`DEBEZIUM_ROADMAP.md`](DEBEZIUM_ROADMAP.md)。
 
-Ingress 至少定义：
+当前边界：
 
 - 不可变 exact logical Schema；
-- 每个 delivery 携带一个完整、非空 Change，或仅推进 checkpoint 而不伪造空 Change；
-- 有界 durable pending、单 delivery 大小限制和 backpressure；
-- 可持久、可重试的 ingestion identity；
-- 重复 identity 的幂等结果；
+- 每个 delivery 转换为一个完整、非空 Change，或仅推进 checkpoint 而不伪造空 Change；
+- 唯一 `postgres_source.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
+  不加 Source envelope，也不保存 pending；
+- 有界 delivery 和 Station output capacity；背压时不 ACK，由 D2 保留并重投；
+- checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
 - Schema mismatch、编码或 commit 失败零部分写入；
-- reopen 后继续接收；
-- opaque external checkpoint 与 ingestion identity 的明确映射。
+- reopen 从已提交 checkpoint 继续接收。
 
-第一版只需要可靠本地 ingress API，不直接耦合 Kafka、数据库或文件连接器。
+原 `postgres_source.state` 的 pending 布局属于未发布的开发期格式；旧 Flow 必须重建，不提供
+alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独确定幂等身份，不反向扩展当前 Source 协议。
 
 ### 有限 Source
 
@@ -464,7 +467,7 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 公共 API 使用真实订单 Change 完成：
 
 ```text
-IngressSource
+PostgresSource
 → Filter/Extend/Select
 → ResultLogSink
 → MaterializeSink
@@ -472,7 +475,7 @@ IngressSource
 → result/snapshot verification
 ```
 
-必须覆盖插入、用旧记录 `-1` 加新记录 `+1` 表达的更新、删除、重复 ingestion identity、背压、
+必须覆盖插入、用旧记录 `-1` 加新记录 `+1` 表达的更新、删除、未 ACK delivery 重投、背压、
 Schema drift、负权重前缀、fan-out 慢消费者和 reopen。完整端到端测试不使用 SequenceSource 或
 Discard。
 
@@ -742,15 +745,16 @@ RebuildRequired
 
 ### 外部 Source/Sink 协议
 
-建议连接器顺序：
+已有 PostgreSQL CDC 与 SqliteSink 试点；后续候选包括：
 
 1. 本地 API/AppendLog ingress；
 2. 文件 snapshot；
 3. Kafka；
-4. 数据库 CDC；
-5. 外部副作用 Sink。
+4. 其他数据库 CDC；
+5. 其他外部副作用 Sink。
 
-外部 Source 明确 external offset、ingestion identity 和 committed Change 的映射；外部 Sink 使用
+外部 Source 明确 external checkpoint 与 committed Change 的原子提交边界；只有来源确实提供
+独立重试 identity 时才另行定义其幂等协议，不以 checkpoint 冒充 identity。外部 Sink 使用
 outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 已用持久化 mutation 批次覆盖本地 SQLite
 commit 与 MDBX commit 的空隙；其他连接器不能把对应空隙留给具体 Sink 自行解释。
 
@@ -875,15 +879,16 @@ commit 与 MDBX commit 的空隙；其他连接器不能把对应空隙留给具
 ### 里程碑 B：真实数据闭环
 
 ```text
-IngressSource
+PostgresSource
 → Filter/Extend/Select
 → ResultLogSink
 → MaterializeSink
 → snapshot / reopen
 ```
 
-这是最优先的新能力。虽然 `SqliteSink` 已提供可查询终点，但没有真实 Source 和应用可消费的通用
-结果边界，复杂算子仍主要依靠测试 fixture 自证，上层用户 API 也无法形成完整闭环。
+这是最优先的新能力。`PostgresSource` 已提供固定 Schema 单表持续 CDC 试点，`SqliteSink` 已提供
+可查询终点；初始全量、发布加固和应用可消费的通用结果边界仍待实施。复杂算子仍主要依靠
+测试 fixture 自证，上层用户 API 也尚未形成完整闭环。
 
 ### 里程碑 C：关系状态到 Aggregate
 
@@ -903,7 +908,7 @@ Join 的全部状态问题。
 以下尚未解决的问题必须在对应阶段开始前关闭，不能由单个算子临时决定。RunningEventCount 的
 命名，以及 Date32/Timestamp/Decimal128 的第一版 Change 边界，已经在阶段 0/1 关闭：
 
-- Ingress identity 的作用域是 input、Flow、connector partition 还是全局？
+- 未来本地输入 API 的幂等 identity 作用域是 input、Flow 还是全局？这不要求把 connector checkpoint 当作 identity。
 - ResultLog consumer 是 Definition 的静态一部分，还是运行期动态注册？
 - Materialize 如何稳定编码完整 Record key、weight 和分页 continuation？
 - Relation state/arrangement 哪些能力属于内部共享实现，哪些值得成为公共算子？

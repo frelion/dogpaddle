@@ -114,14 +114,16 @@ fn measure_fresh_build(run: &Run, station_count: usize) -> Duration {
     let elapsed = started.elapsed();
     validate_flow(&flow, &path, station_count);
     drop(flow);
-    let reopened = FlowFactory::open(&path).expect("reopen freshly built benchmark Flow");
+    let reopened = FlowFactory::new(&path)
+        .open()
+        .expect("reopen freshly built benchmark Flow");
     validate_flow(&reopened, &path, station_count);
     elapsed
 }
 
 fn measure_reopen(path: &Path, station_count: usize) -> Duration {
     let started = std::time::Instant::now();
-    let flow = FlowFactory::open(path).expect("open benchmark Flow");
+    let flow = FlowFactory::new(path).open().expect("open benchmark Flow");
     let elapsed = started.elapsed();
     validate_flow(&flow, path, station_count);
     elapsed

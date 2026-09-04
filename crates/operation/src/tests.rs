@@ -12,7 +12,10 @@ use crate::{
     lit,
     operation::{
         sink::{DiscardDefinition, DiscardOperation, SqliteSinkDefinition},
-        source::SequenceSourceDefinition,
+        source::{
+            PostgresColumn, PostgresSourceDefinition, PostgresSourceSpec, PostgresType,
+            SequenceSourceDefinition,
+        },
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
             SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
@@ -73,8 +76,23 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 10] {
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 11] {
     [
+        Box::new(
+            PostgresSourceDefinition::try_new(PostgresSourceSpec {
+                engine_name: "events".into(),
+                database: "shop".into(),
+                schema: "public".into(),
+                table: "events".into(),
+                slot: "events".into(),
+                publication: "events".into(),
+                system_identifier: "1".into(),
+                database_oid: 1,
+                table_oid: 1,
+                columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
+            })
+            .unwrap(),
+        ),
         Box::new(SequenceSourceDefinition::new(0)),
         Box::new(RunningEventCountDefinition::new()),
         Box::new(ProjectDefinition::new([0])),
@@ -228,7 +246,7 @@ fn data_instances_reject_missing_names_and_materialization_rejects_unconsumed_na
     let mut unconsumed = DataInstances::new();
     unconsumed.insert(count).unwrap();
     let binding = OperationBinding::without_data(None, DiscardOperation);
-    let Err(error) = binding.materialize(unconsumed) else {
+    let Err(error) = binding.materialize(unconsumed, crate::RuntimeResource::none()) else {
         panic!("binding unexpectedly accepted an unconsumed data instance");
     };
     assert_eq!(error, MaterializeError::UnexpectedData { name: "count" });

@@ -41,7 +41,7 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 
 | Source | Transform | Sink |
 | --- | --- | --- |
-| `SequenceSource` | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `Discard` |
+| `SequenceSource` · `PostgresSource`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `Discard` |
 
 `SQLiteSink` 首次收到输入后延迟初始化普通 `STRICT` 表，不引入额外 SQLite 元数据表。
 它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
@@ -50,15 +50,17 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 CDC 基础设施已经有独立的 `dogpaddle-debezium` 产品 crate：它在 Rust 进程内运行 stock
 Debezium Engine，以 connector-neutral 的 `start/poll/ack/stop` 和 opaque pre-ACK checkpoint
 隔离 JNI。Linux GNU 与 macOS 的 x86_64/aarch64 自包含 bundle 随附固定 Temurin JRE，运行时不依赖
-系统 Java；PostgreSQL 是真实连接器验收 fixture，还不是 Flow 中的生产 Source Operation。
+系统 Java。`PostgresSource` 已接到同一 Operation 协议：单表、固定 Schema 的 WAL 事件转换为
+Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pending 中转。
+运行配置显式装配，密码不进入 Definition。
+这是持续 CDC 试点，不是生产发布承诺；[使用与边界](crates/operation/README.md#postgresql-source-试点)。
 
 ## 当前边界
 
 - DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
 - 运行由宿主反复调用 `Flow::advance` 驱动；尚无 `Flow::start`、后台 runner 或中断控制。
-- Operation 集合目前封闭，唯一内建 Source 是 `SequenceSource`；统一 turn 协议已经支持事务外准备、
-  事务内状态提交与提交后 completion，但 Debezium runtime 尚未通过 D3/D4 durable ingress、运行资源
-  装配与行到 `Change` 的映射成为生产输入连接器。
+- Operation 集合目前封闭。`PostgresSource` 暂不包含初始全量、多表路由、在线 Schema evolution、TLS
+  配置或跨 Flow fencing；首个关系物化链路须从空表和匹配的 slot 起点开始。生产加固仍属于 D5。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
 - `SQLiteSink` 只创建并独占新目标表；尚无 PostgreSQL、MySQL 或通用外部 Sink。
 - 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。

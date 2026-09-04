@@ -190,7 +190,7 @@ fn stateless_operation(
     definition
         .bind(&[input_schema])
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap()
 }
 
@@ -1361,7 +1361,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
     let mut operation = (&definition as &dyn OperationDefinition)
         .bind(&[input.schema(), input.schema(), input.schema()])
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
@@ -1429,7 +1429,7 @@ fn select_and_union_all_reject_missing_and_invalid_ports() {
     let mut union = (&union_definition as &dyn OperationDefinition)
         .bind(&[input.schema(), input.schema()])
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
@@ -1772,7 +1772,7 @@ fn structural_trace(
     let mut operation = definition
         .bind(&input_schemas)
         .unwrap()
-        .materialize(data)
+        .materialize(data, dogpaddle_operation::RuntimeResource::none())
         .unwrap();
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
