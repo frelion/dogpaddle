@@ -9,8 +9,8 @@
 截至 2026-09-04，D0 与 D1 已完成，D1 结论为 **GREEN**；可重复证据见
 [`experiments/debezium-d1/D1_REPORT.md`](experiments/debezium-d1/D1_REPORT.md)。D1 已由 owner
 合并。多 agent 对抗审查随后将原 D2/D3 重排：先把 Debezium 做成独立、窄小的产品组件，
-再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 正在
-`codex/debezium-runtime-d2` 开发。
+再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 的实现与验收记录见
+[PR #12](https://github.com/frelion/dogpaddle/pull/12)；合并后由 GitHub #5 自动关闭。
 
 ## 目标与成功定义
 
