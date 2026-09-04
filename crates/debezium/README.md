@@ -87,49 +87,95 @@ checkpoint alone is sufficient for every connector.
 
 ## Runtime and packaging
 
-One OS process has at most one `HotSpot` JVM. Reopening the same canonical
-distribution reuses it only when the validated manifest and JAR fingerprint
-are unchanged; another path or changed contents fail explicitly. The
-distribution layout is:
+`DebeziumRuntime::open` accepts the root of a self-contained, platform-specific
+bundle. It loads `libjvm` by its validated absolute path; it never searches
+`PATH`, `JAVA_HOME`, `JDK_HOME`, or a system Java installation. One OS process
+still has at most one `HotSpot` JVM. Reopening the same canonical bundle reuses it
+only when the validated contents are unchanged; a different path or contents
+fail explicitly. `DogPaddle` must be the first and only JVM initializer during
+process startup; another JNI component must neither initialize a JVM first nor
+race `open`.
 
 ```text
-distribution/
+dogpaddle-debezium-runtime-<target>/
 ├── MANIFEST
 ├── SHA256SUMS
-├── bom.json
-├── THIRD-PARTY-NOTICES.md
-└── lib/
-    ├── dogpaddle-debezium-bridge.jar
-    └── pinned runtime dependency JARs...
+├── runtime-sbom.json
+├── TEMURIN-NOTICE.md
+├── runtime/              # pinned Eclipse Temurin JRE
+├── debezium/             # bridge, connector and dependency JARs
+└── bin/                  # optional native host executable(s)
 ```
 
-Treat that directory as immutable after `DebeziumRuntime::open`. Before the JVM
-starts, the runtime checks the exact pinned manifest, requires an exact
-checksum-listed set of regular JAR files, verifies every SHA-256 digest, and
-performs a bridge-protocol handshake. These checks catch incomplete, mixed, or
-corrupted bundles; they are not a signature or a substitute for artifact
-provenance.
+Before starting the JVM, the runtime verifies the exact bundle manifest,
+platform target, complete regular-file inventory and every SHA-256 digest. It
+then validates the nested Debezium distribution and performs the bridge
+protocol handshake. Install the bundle in a directory that untrusted users
+cannot modify and treat it as immutable from before `open` until process exit;
+the JVM and classloader necessarily reopen validated paths later. These checks
+fail closed on incomplete, mixed or corrupted bundles; they do not replace
+release signing or artifact provenance.
 
-`MANIFEST`, `SHA256SUMS`, and `lib/` are required at runtime. The official
-builder additionally emits `bom.json` and `THIRD-PARTY-NOTICES.md` as review
-material for the development bundle.
+The builder currently supports exactly:
 
-`cargo build` never invokes Maven, downloads Java artifacts, or requires a JDK
-at compile time. The Java bridge has its own pinned build under `bridge/`; its
-distribution and real-connector gates are explicit commands. JARs and JDKs are
-not committed to the repository.
+- `x86_64-unknown-linux-gnu`;
+- `aarch64-unknown-linux-gnu`;
+- `x86_64-apple-darwin`;
+- `aarch64-apple-darwin`.
 
-Build and test the pinned Java distribution with:
+Linux means GNU/glibc, not musl or Alpine. The macOS archives are unsigned
+development artifacts. Public macOS distribution still requires a Developer
+ID signature and Apple notarization; that release gate belongs to D5.
+The native bundle CI currently proves Ubuntu 24.04 and macOS 15. A lower
+glibc/macOS deployment baseline and the native host's complete dynamic-library
+closure are D5 release decisions, not broader compatibility claims in D2.
+
+Normal `cargo build`, `cargo test` and `cargo xtask check` never invoke Maven,
+download Java artifacts or require a local Java installation. Building a
+bundle is an explicit release/development action. First build the pinned Java
+distribution:
 
 ```bash
 crates/debezium/scripts/build-distribution.sh
 ```
 
-The script runs Maven in a digest-pinned JDK container, emits the `CycloneDX`
-SBOM and checksums beside the bundle, and rejects a bridge JAR that shadows any
-`io.debezium` class. The `PostgreSQL` pilot fixture consumes that distribution
-through this crate's public Rust API; it does not carry another JNI host or
-offset file.
+The default Maven mode is `auto`: it prefers a running Podman or Docker engine
+with the digest-pinned Maven/JDK image and otherwise uses local `mvn` plus a
+JDK. Select the path explicitly with `DOGPADDLE_MAVEN_MODE=container` or
+`DOGPADDLE_MAVEN_MODE=local`. The build runs the Java component tests, emits
+the nested Debezium `CycloneDX` BOM and checksums, and rejects a bridge JAR that
+shadows any `io.debezium` class.
+
+Then assemble a runtime-only archive for one supported target:
+
+```bash
+crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
+```
+
+An application can place its already-built native executable in the same
+archive without changing the runtime format:
+
+```bash
+crates/debezium/scripts/build-runtime-bundle.sh \
+  x86_64-unknown-linux-gnu \
+  target/release/my-host \
+  my-host
+```
+
+The script downloads the exact checksum-pinned Temurin JRE and its upstream
+`CycloneDX` SBOM, verifies the JRE release metadata, validates the complete
+nested distribution, rejects a native host for the wrong OS/architecture,
+normalizes the runtime tree, preserves notices, and emits
+`.tar.gz` plus an archive checksum under `bridge/target/bundles/`. This
+explicit bundle step requires `curl`, `tar`, Python 3, and either `sha256sum`
+or `shasum`; none is a runtime dependency. This
+repository does not yet contain `DogPaddle`'s final application binary, so the
+runtime-only archive and optional-host form are the reusable packaging
+mechanism rather than a claim that a final CLI has shipped.
+
+The `PostgreSQL` D1 fixture packages its Rust host through this same optional
+`bin/` path and runs it against the bundled JVM. It does not carry another JNI
+host, Java bridge, offset store, or system-Java fallback.
 
 The runtime currently fixes one task, one outstanding delivery, ordered batch
 handling, no Debezium SMTs, and a caller-selected encoded delivery bound. These
@@ -148,7 +194,8 @@ reuse the same Engine name immediately must stop explicitly first.
 ## Version boundary
 
 The current bridge pins Debezium `3.6.2.Final`, Kafka Connect `4.3.0`, Java 17
-bytecode, a JDK 21 runtime baseline, and `jni-rs` `0.22.4`. Offset conversion,
-checkpoint framing, bridge framing, and ACK behavior are version-reviewed
-boundaries. Upgrades require preview-versus-actual, restore, JNI, and real
-connector regression gates.
+bytecode, Eclipse Temurin JRE `21.0.12.1+1`, and `jni-rs` `0.22.4`. Offset
+conversion, checkpoint framing, bridge framing, JVM bundle layout and ACK
+behavior are version-reviewed boundaries. Upgrades require
+preview-versus-actual, restore, JNI, native-platform bundle and real connector
+regression gates.

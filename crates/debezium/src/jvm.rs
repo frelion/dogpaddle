@@ -7,8 +7,8 @@ use jni::objects::{JByteArray, Reference};
 use jni::{InitArgsBuilder, JValue, JavaVM, jni_sig, jni_str};
 use serde::Deserialize;
 
+use crate::bundle::Bundle;
 use crate::connector::Connector;
-use crate::distribution::Distribution;
 use crate::{Checkpoint, ConnectorConfig, Error, ErrorKind};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -20,29 +20,32 @@ static JVM_HOST: OnceLock<Mutex<Option<Arc<JvmHost>>>> = OnceLock::new();
 
 /// A cloneable reference to `DogPaddle`'s process-wide embedded JVM.
 ///
-/// The first successful call to [`DebeziumRuntime::open`] fixes the JVM
-/// distribution for the process. Opening the same canonical distribution
-/// again reuses that JVM only when its validated contents are unchanged;
-/// opening a different distribution fails explicitly.
+/// The first successful call to [`DebeziumRuntime::open`] fixes the
+/// self-contained runtime bundle for the process. Opening the same canonical
+/// bundle again reuses that JVM only when all validated contents are unchanged;
+/// opening a different bundle fails explicitly. `DogPaddle` must be the first
+/// and only JVM initializer during process startup; another JNI component must
+/// not race [`DebeziumRuntime::open`] or initialize a JVM before it.
 #[derive(Clone)]
 pub struct DebeziumRuntime {
     host: Arc<JvmHost>,
 }
 
 impl DebeziumRuntime {
-    /// Opens a validated Debezium distribution and starts or reuses the
-    /// process-wide JVM.
+    /// Opens a validated, self-contained Debezium bundle and starts or reuses
+    /// its process-wide JVM.
     ///
-    /// `distribution` must contain `lib/dogpaddle-debezium-bridge.jar` and all
-    /// pinned runtime dependency JARs. The host JVM is located by `jni-rs`,
-    /// normally through `JAVA_HOME`.
+    /// `bundle` must contain the pinned platform-specific Temurin runtime under
+    /// `runtime/` and the pinned Java bridge and dependencies under
+    /// `debezium/`. No system Java installation or `JAVA_HOME` fallback is
+    /// consulted.
     ///
     /// # Errors
     ///
-    /// Returns an error when the distribution is invalid, the JVM cannot be
-    /// started, or another distribution already initialized the process JVM.
-    pub fn open(distribution: impl AsRef<Path>) -> Result<Self, Error> {
-        let distribution = Distribution::open(distribution.as_ref())?;
+    /// Returns an error when the bundle is invalid, the bundled JVM cannot be
+    /// started, or another bundle already initialized the process JVM.
+    pub fn open(bundle: impl AsRef<Path>) -> Result<Self, Error> {
+        let bundle = Bundle::open(bundle.as_ref())?;
         let slot = JVM_HOST.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().map_err(|_| {
             Error::new(
@@ -52,14 +55,15 @@ impl DebeziumRuntime {
         })?;
 
         if let Some(host) = guard.as_ref() {
-            if host.distribution_root != distribution.root()
-                || host.distribution_fingerprint != *distribution.fingerprint()
+            if host.bundle_root != bundle.root()
+                || host.bundle_fingerprint != *bundle.fingerprint()
+                || host.jvm_library != bundle.jvm_library()
             {
                 return Err(Error::new(
                     ErrorKind::JvmConfigurationConflict,
                     format!(
-                        "the process JVM is already bound to Debezium distribution {}",
-                        host.distribution_root.display()
+                        "the process JVM is already bound to Debezium runtime bundle {}",
+                        host.bundle_root.display()
                     ),
                 ));
             }
@@ -68,7 +72,7 @@ impl DebeziumRuntime {
             });
         }
 
-        let host = Arc::new(JvmHost::launch(&distribution)?);
+        let host = Arc::new(JvmHost::launch(&bundle)?);
         *guard = Some(Arc::clone(&host));
         Ok(Self { host })
     }
@@ -131,20 +135,21 @@ impl std::fmt::Debug for DebeziumRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DebeziumRuntime")
-            .field("distribution", &self.host.distribution_root)
+            .field("bundle", &self.host.bundle_root)
             .finish_non_exhaustive()
     }
 }
 
 pub(crate) struct JvmHost {
     vm: JavaVM,
-    distribution_root: PathBuf,
-    distribution_fingerprint: [u8; 32],
+    bundle_root: PathBuf,
+    bundle_fingerprint: [u8; 32],
+    jvm_library: PathBuf,
 }
 
 impl JvmHost {
-    fn launch(distribution: &Distribution) -> Result<Self, Error> {
-        let classpath_option = format!("-Djava.class.path={}", distribution.classpath());
+    fn launch(bundle: &Bundle) -> Result<Self, Error> {
+        let classpath_option = format!("-Djava.class.path={}", bundle.distribution().classpath());
         let arguments = InitArgsBuilder::new()
             .option(classpath_option)
             .option("-Dfile.encoding=UTF-8")
@@ -157,22 +162,33 @@ impl JvmHost {
                     "cannot construct embedded JVM options",
                 )
             })?;
-        let vm = JavaVM::new(arguments).map_err(|_| {
+        if JavaVM::singleton().is_ok() {
+            return Err(Error::new(
+                ErrorKind::JvmConfigurationConflict,
+                "a JVM was initialized before the Debezium runtime bundle",
+            ));
+        }
+        let jvm_library = bundle.jvm_library().to_path_buf();
+        let vm = JavaVM::with_libjvm(arguments, || Ok(&jvm_library)).map_err(|error| {
             Error::new(
                 ErrorKind::JvmStartup,
-                "cannot start embedded JVM; verify JAVA_HOME and the supported JDK",
+                format!(
+                    "cannot start the JVM from bundled library {}: {error}",
+                    jvm_library.display()
+                ),
             )
         })?;
         let host = Self {
             vm,
-            distribution_root: distribution.root().to_path_buf(),
-            distribution_fingerprint: *distribution.fingerprint(),
+            bundle_root: bundle.root().to_path_buf(),
+            bundle_fingerprint: *bundle.fingerprint(),
+            jvm_library,
         };
-        host.validate_bridge_protocol()?;
+        host.validate_bridge_and_runtime()?;
         Ok(host)
     }
 
-    fn validate_bridge_protocol(&self) -> Result<(), Error> {
+    fn validate_bridge_and_runtime(&self) -> Result<(), Error> {
         let version = self
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<i32> {
@@ -182,18 +198,25 @@ impl JvmHost {
                     jni_sig!("()I"),
                     &[],
                 )?;
-                result.into_int()
+                let version = result.into_int()?;
+                environment.call_static_method(
+                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                    jni_str!("verifyRuntime"),
+                    jni_sig!("()V"),
+                    &[],
+                )?;
+                Ok(version)
             })
             .map_err(|_| {
                 Error::new(
                     ErrorKind::JvmStartup,
-                    "embedded JVM cannot load the pinned Debezium bridge; restart the process after fixing the distribution",
+                    "embedded JVM cannot load the pinned Debezium bridge or required charset, timezone, TLS and DNS resources; restart the process after fixing the runtime bundle",
                 )
             })?;
         if version != BRIDGE_PROTOCOL_VERSION {
             return Err(Error::new(
                 ErrorKind::Protocol,
-                "embedded Debezium bridge protocol is not supported; restart the process with the pinned distribution",
+                "embedded Debezium bridge protocol is not supported; restart the process with the pinned runtime bundle",
             ));
         }
         Ok(())

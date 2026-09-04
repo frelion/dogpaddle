@@ -383,13 +383,13 @@ fn main() {
 
 fn run() -> Result<(), HostError> {
     let arguments = Arguments::parse(env::args_os())?;
-    validate_directory(&arguments.distribution, "Debezium distribution")?;
+    validate_directory(&arguments.bundle, "Debezium runtime bundle")?;
     validate_file(&arguments.config, "connector configuration")?;
     if let Some(parent) = arguments.checkpoint.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let runtime = DebeziumRuntime::open(&arguments.distribution)?;
+    let runtime = DebeziumRuntime::open(&arguments.bundle)?;
     let configuration = Configuration::load(&arguments.config)?;
     let mut session = Session::new(
         runtime,

@@ -29,9 +29,7 @@ const REQUIRED_JARS: &[&str] = &[
 ];
 
 pub(crate) struct Distribution {
-    root: PathBuf,
     classpath: String,
-    fingerprint: [u8; 32],
 }
 
 impl Distribution {
@@ -98,24 +96,11 @@ impl Distribution {
             .map_err(|_| invalid("Debezium JAR paths cannot form a JVM classpath"))?
             .into_string()
             .map_err(|_| invalid("Debezium distribution path must be valid UTF-8"))?;
-        let fingerprint = fingerprint(&expected);
-        Ok(Self {
-            root,
-            classpath,
-            fingerprint,
-        })
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
+        Ok(Self { classpath })
     }
 
     pub(crate) fn classpath(&self) -> &str {
         &self.classpath
-    }
-
-    pub(crate) const fn fingerprint(&self) -> &[u8; 32] {
-        &self.fingerprint
     }
 }
 
@@ -207,22 +192,6 @@ fn read_bounded_regular_file(
         return Err(invalid(invalid_message.to_owned()));
     }
     Ok(contents)
-}
-
-fn fingerprint(checksums: &BTreeMap<String, [u8; 32]>) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"dogpaddle.debezium.distribution.fingerprint.v1\0");
-    digest.update(EXPECTED_MANIFEST.as_bytes());
-    for (name, checksum) in checksums {
-        digest.update(
-            u64::try_from(name.len())
-                .expect("validated distribution JAR names fit in u64")
-                .to_be_bytes(),
-        );
-        digest.update(name.as_bytes());
-        digest.update(checksum);
-    }
-    digest.finalize().into()
 }
 
 fn read_jars(library_dir: &Path) -> Result<Vec<PathBuf>, Error> {

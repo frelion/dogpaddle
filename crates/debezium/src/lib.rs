@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod bundle;
 mod checkpoint;
 mod config;
 mod connector;

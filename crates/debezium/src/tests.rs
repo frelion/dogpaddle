@@ -4,6 +4,7 @@ use std::fs;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::bundle::{Bundle, expected_manifest};
 use crate::config::ConnectorConfig;
 use crate::distribution::Distribution;
 use crate::jvm::decode_status;
@@ -18,6 +19,152 @@ const FIXTURE_JARS: &[&str] = &[
     "dogpaddle-debezium-bridge.jar",
     "slf4j-simple-1.7.36.jar",
 ];
+
+#[test]
+fn bundle_requires_the_exact_checksum_verified_file_set() {
+    let directory = fake_bundle();
+    let bundle = Bundle::open(directory.path()).unwrap();
+
+    assert_eq!(bundle.root(), directory.path().canonicalize().unwrap());
+    assert!(
+        bundle
+            .distribution()
+            .classpath()
+            .contains("dogpaddle-debezium-bridge.jar")
+    );
+    assert!(bundle.jvm_library().ends_with(expected_jvm_relative_path()));
+
+    fs::write(
+        directory.path().join(expected_jvm_relative_path()),
+        b"corrupt JVM",
+    )
+    .unwrap();
+    assert_eq!(
+        Bundle::open(directory.path()).err().unwrap().kind(),
+        ErrorKind::InvalidDistribution
+    );
+}
+
+#[test]
+fn bundle_rejects_unlisted_and_non_regular_entries() {
+    let unlisted = fake_bundle();
+    fs::write(unlisted.path().join("runtime/unlisted"), b"unlisted").unwrap();
+    assert!(Bundle::open(unlisted.path()).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let linked = fake_bundle();
+        let library = linked.path().join(expected_jvm_relative_path());
+        fs::rename(&library, linked.path().join("runtime/real-libjvm")).unwrap();
+        symlink("../../real-libjvm", &library).unwrap();
+        assert!(Bundle::open(linked.path()).is_err());
+    }
+}
+
+#[test]
+fn bundle_manifest_is_bound_to_the_current_target_and_temurin_release() {
+    let directory = fake_bundle();
+    let manifest = expected_manifest().unwrap().replace(
+        "java.runtime.version=21.0.12.1+1",
+        "java.runtime.version=21",
+    );
+    fs::write(directory.path().join("MANIFEST"), manifest).unwrap();
+    write_bundle_checksums(directory.path());
+
+    let error = Bundle::open(directory.path()).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
+    assert!(error.to_string().contains("MANIFEST"));
+}
+
+#[test]
+fn bundle_checksums_reject_non_canonical_paths_and_order() {
+    let traversal = fake_bundle();
+    fs::write(
+        traversal.path().join("SHA256SUMS"),
+        concat!(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "  runtime/../MANIFEST\n",
+        ),
+    )
+    .unwrap();
+    assert!(Bundle::open(traversal.path()).is_err());
+
+    let unsorted = fake_bundle();
+    let mut lines = fs::read_to_string(unsorted.path().join("SHA256SUMS"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    lines.swap(0, 1);
+    fs::write(
+        unsorted.path().join("SHA256SUMS"),
+        format!("{}\n", lines.join("\n")),
+    )
+    .unwrap();
+    assert!(Bundle::open(unsorted.path()).is_err());
+}
+
+#[test]
+fn bundle_fingerprint_tracks_the_runtime_and_debezium_together() {
+    let directory = fake_bundle();
+    let original = *Bundle::open(directory.path()).unwrap().fingerprint();
+
+    fs::write(
+        directory.path().join(expected_jvm_relative_path()),
+        b"replacement JVM",
+    )
+    .unwrap();
+    write_bundle_checksums(directory.path());
+
+    let replacement = *Bundle::open(directory.path()).unwrap().fingerprint();
+    assert_ne!(original, replacement);
+}
+
+#[test]
+fn bundle_accepts_an_exactly_checksummed_optional_binary_directory() {
+    let directory = fake_bundle();
+    fs::create_dir(directory.path().join("bin")).unwrap();
+    fs::write(directory.path().join("bin/dogpaddle"), b"fixture host").unwrap();
+    write_bundle_checksums(directory.path());
+
+    assert!(Bundle::open(directory.path()).is_ok());
+}
+
+#[test]
+fn bundle_requires_runtime_security_legal_and_distribution_evidence() {
+    let required = [
+        "runtime-sbom.json",
+        "TEMURIN-NOTICE.md",
+        "runtime/NOTICE",
+        "runtime/release",
+        "runtime/bin/java",
+        "runtime/lib/modules",
+        "runtime/lib/security/cacerts",
+        "runtime/lib/tzdb.dat",
+        "runtime/legal/java.base/LICENSE",
+        "debezium/bom.json",
+        "debezium/THIRD-PARTY-NOTICES.md",
+    ];
+
+    for relative in required {
+        let directory = fake_bundle();
+        fs::remove_file(directory.path().join(relative)).unwrap();
+        write_bundle_checksums(directory.path());
+
+        let error = Bundle::open(directory.path()).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidDistribution, "{relative}");
+        assert!(error.to_string().contains(relative), "{relative}: {error}");
+    }
+
+    let empty = fake_bundle();
+    fs::write(empty.path().join("runtime/NOTICE"), []).unwrap();
+    write_bundle_checksums(empty.path());
+    let error = Bundle::open(empty.path()).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
+    assert!(error.to_string().contains("empty: runtime/NOTICE"));
+}
 
 #[test]
 fn resume_checkpoint_must_fit_inside_the_delivery_bound() {
@@ -38,10 +185,6 @@ fn resume_checkpoint_must_fit_inside_the_delivery_bound() {
 fn distribution_requires_an_exact_checksum_verified_jar_set() {
     let directory = fake_distribution();
     let distribution = Distribution::open(directory.path()).unwrap();
-    assert_eq!(
-        distribution.root(),
-        directory.path().canonicalize().unwrap()
-    );
     assert!(
         distribution
             .classpath()
@@ -62,22 +205,6 @@ fn distribution_rejects_an_unlisted_jar_before_jvm_startup() {
     fs::write(directory.path().join("lib/shadow.jar"), b"shadow").unwrap();
 
     assert!(Distribution::open(directory.path()).is_err());
-}
-
-#[test]
-fn distribution_fingerprint_tracks_verified_jar_contents() {
-    let directory = fake_distribution();
-    let original = *Distribution::open(directory.path()).unwrap().fingerprint();
-
-    fs::write(
-        directory.path().join("lib/dogpaddle-debezium-bridge.jar"),
-        b"replacement bridge",
-    )
-    .unwrap();
-    write_fake_checksums(directory.path());
-
-    let replacement = *Distribution::open(directory.path()).unwrap().fingerprint();
-    assert_ne!(original, replacement);
 }
 
 #[test]
@@ -263,10 +390,15 @@ fn delivery_decoder_applies_bounds_before_copying_nested_frames() {
 
 fn fake_distribution() -> TempDir {
     let directory = tempfile::tempdir().unwrap();
-    let library = directory.path().join("lib");
+    write_fake_distribution(directory.path());
+    directory
+}
+
+fn write_fake_distribution(root: &std::path::Path) {
+    let library = root.join("lib");
     fs::create_dir(&library).unwrap();
     fs::write(
-        directory.path().join("MANIFEST"),
+        root.join("MANIFEST"),
         concat!(
             "dogpaddle.debezium.distribution=1\n",
             "bridge.protocol=1\n",
@@ -275,13 +407,91 @@ fn fake_distribution() -> TempDir {
         ),
     )
     .unwrap();
+    fs::write(root.join("bom.json"), b"{}\n").unwrap();
+    fs::write(root.join("THIRD-PARTY-NOTICES.md"), b"fixture notices\n").unwrap();
 
     for name in FIXTURE_JARS {
         let contents = format!("fixture:{name}");
         fs::write(library.join(name), &contents).unwrap();
     }
-    write_fake_checksums(directory.path());
+    write_fake_checksums(root);
+}
+
+fn fake_bundle() -> TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::create_dir(root.join("debezium")).unwrap();
+    fs::create_dir_all(root.join(expected_jvm_relative_path()).parent().unwrap()).unwrap();
+    write_fake_distribution(&root.join("debezium"));
+    fs::write(root.join("MANIFEST"), expected_manifest().unwrap()).unwrap();
+    fs::write(root.join("runtime-sbom.json"), b"{}\n").unwrap();
+    fs::write(root.join("TEMURIN-NOTICE.md"), b"fixture notice\n").unwrap();
+    fs::write(root.join(expected_jvm_relative_path()), b"fixture JVM").unwrap();
+    fs::create_dir_all(root.join("runtime/bin")).unwrap();
+    fs::create_dir_all(root.join("runtime/lib/security")).unwrap();
+    fs::create_dir_all(root.join("runtime/legal/java.base")).unwrap();
+    fs::write(root.join("runtime/NOTICE"), b"fixture runtime notice\n").unwrap();
+    fs::write(root.join("runtime/release"), b"JAVA_VERSION=fixture\n").unwrap();
+    fs::write(root.join("runtime/bin/java"), b"fixture Java launcher\n").unwrap();
+    fs::write(root.join("runtime/lib/modules"), b"fixture module image\n").unwrap();
+    fs::write(root.join("runtime/lib/security/cacerts"), b"fixture CAs\n").unwrap();
+    fs::write(root.join("runtime/lib/tzdb.dat"), b"fixture time zones\n").unwrap();
+    fs::write(
+        root.join("runtime/legal/java.base/LICENSE"),
+        b"fixture runtime license\n",
+    )
+    .unwrap();
+    write_bundle_checksums(root);
     directory
+}
+
+fn expected_jvm_relative_path() -> &'static std::path::Path {
+    if cfg!(target_os = "macos") {
+        std::path::Path::new("runtime/lib/server/libjvm.dylib")
+    } else {
+        std::path::Path::new("runtime/lib/server/libjvm.so")
+    }
+}
+
+fn write_bundle_checksums(root: &std::path::Path) {
+    let mut paths = Vec::new();
+    collect_fixture_files(root, root, &mut paths);
+    paths.sort();
+    let mut checksums = String::new();
+    for relative in paths {
+        if relative == "SHA256SUMS" {
+            continue;
+        }
+        let digest = Sha256::digest(fs::read(root.join(&relative)).unwrap());
+        for byte in digest {
+            write!(&mut checksums, "{byte:02x}").unwrap();
+        }
+        writeln!(&mut checksums, "  {relative}").unwrap();
+    }
+    fs::write(root.join("SHA256SUMS"), checksums).unwrap();
+}
+
+fn collect_fixture_files(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    paths: &mut Vec<String>,
+) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            collect_fixture_files(root, &entry.path(), paths);
+        } else {
+            paths.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
+        }
+    }
 }
 
 fn write_fake_checksums(root: &std::path::Path) {

@@ -1,0 +1,241 @@
+name: Debezium runtime bundles
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/debezium-runtime.yml"
+      - "crates/debezium/**"
+      - "experiments/debezium-d1/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/debezium-runtime.yml"
+      - "crates/debezium/**"
+      - "experiments/debezium-d1/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debezium-runtime-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  bundle:
+    name: Bundle ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Restore and save Maven cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.m2/repository
+          key: debezium-maven-v1-${{ hashFiles('crates/debezium/bridge/pom.xml') }}
+
+      - name: Restore and save Cargo cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: debezium-cargo-v1-${{ matrix.target }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            debezium-cargo-v1-${{ matrix.target }}-1.96-
+
+      - name: Show native build toolchain
+        run: rustc --version --verbose && cargo --version --verbose && java -version && mvn --version
+
+      - name: Build and test the Java distribution natively
+        env:
+          DOGPADDLE_MAVEN_MODE: local
+        run: crates/debezium/scripts/build-distribution.sh
+
+      - name: Reject a corrupted custom distribution before downloading a runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          broken="$RUNNER_TEMP/corrupt Debezium distribution"
+          cp -R crates/debezium/bridge/target/distribution "$broken"
+          printf 'corrupt\n' >"$broken/lib/dogpaddle-debezium-bridge.jar"
+          if DOGPADDLE_DEBEZIUM_DISTRIBUTION="$broken" \
+            crates/debezium/scripts/build-runtime-bundle.sh "$TARGET" \
+            >"$RUNNER_TEMP/corrupt-distribution.log" 2>&1; then
+            echo 'bundle builder accepted a corrupted Debezium distribution' >&2
+            exit 1
+          fi
+          grep -F 'checksum does not match' "$RUNNER_TEMP/corrupt-distribution.log"
+
+      - name: Build the native public-API probe
+        run: >-
+          cargo build --locked --release
+          -p dogpaddle-debezium --example bundled_runtime_probe
+
+      - name: Reject a native host for the other architecture
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) wrong_target=aarch64-unknown-linux-gnu ;;
+            aarch64-unknown-linux-gnu) wrong_target=x86_64-unknown-linux-gnu ;;
+            x86_64-apple-darwin) wrong_target=aarch64-apple-darwin ;;
+            aarch64-apple-darwin) wrong_target=x86_64-apple-darwin ;;
+          esac
+          if crates/debezium/scripts/build-runtime-bundle.sh \
+            "$wrong_target" \
+            target/release/examples/bundled_runtime_probe \
+            bundled_runtime_probe \
+            >"$RUNNER_TEMP/wrong-architecture.log" 2>&1; then
+            echo 'bundle builder accepted a native host for the wrong architecture' >&2
+            exit 1
+          fi
+          grep -F 'architecture does not match' "$RUNNER_TEMP/wrong-architecture.log"
+
+      - name: Assemble the self-contained probe bundle
+        run: >-
+          crates/debezium/scripts/build-runtime-bundle.sh
+          "${{ matrix.target }}"
+          target/release/examples/bundled_runtime_probe
+          bundled_runtime_probe
+
+      - name: Inspect the native JVM dependency closure
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bundle="crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-$TARGET"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            readelf --file-header "$bundle/runtime/lib/server/libjvm.so"
+            ldd "$bundle/runtime/lib/server/libjvm.so" | tee "$RUNNER_TEMP/libjvm-ldd.log"
+            if grep -F 'not found' "$RUNNER_TEMP/libjvm-ldd.log"; then
+              echo 'bundled libjvm has an unresolved native dependency' >&2
+              exit 1
+            fi
+          else
+            file "$bundle/runtime/lib/server/libjvm.dylib"
+            otool -L "$bundle/runtime/lib/server/libjvm.dylib"
+          fi
+
+      - name: Verify the archived bundle after relocation without system Java
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bundle_name="dogpaddle-debezium-runtime-$TARGET"
+          bundles_dir="$GITHUB_WORKSPACE/crates/debezium/bridge/target/bundles"
+          archive="$bundles_dir/$bundle_name.tar.gz"
+          checksum="$archive.sha256"
+
+          (
+            cd "$bundles_dir"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --check "$(basename "$checksum")"
+            else
+              shasum -a 256 --check "$(basename "$checksum")"
+            fi
+          )
+
+          staging="$bundles_dir/$bundle_name"
+          test -d "$staging"
+          rm -rf -- "$staging"
+
+          relocated_parent="$RUNNER_TEMP/DogPaddle runtime smoke $TARGET"
+          mkdir -p -- "$relocated_parent"
+          tar -xzf "$archive" -C "$relocated_parent"
+          relocated_bundle="$relocated_parent/$bundle_name"
+
+          test -x "$relocated_bundle/runtime/bin/java"
+          test -x "$relocated_bundle/bin/bundled_runtime_probe"
+          "$relocated_bundle/runtime/bin/java" -version
+
+          empty_path="$RUNNER_TEMP/dogpaddle-empty-path-$TARGET"
+          missing_java="$RUNNER_TEMP/dogpaddle-missing-java-$TARGET"
+          mkdir -p -- "$empty_path"
+          unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS
+          PATH="$empty_path" \
+          JAVA_HOME="$missing_java" \
+          JDK_HOME="$missing_java" \
+          LD_LIBRARY_PATH= \
+          DYLD_LIBRARY_PATH= \
+          DYLD_FALLBACK_LIBRARY_PATH= \
+            "$relocated_bundle/bin/bundled_runtime_probe"
+
+      - name: Assemble the runtime-only artifact
+        run: crates/debezium/scripts/build-runtime-bundle.sh "${{ matrix.target }}"
+
+      - name: Reject test executables from the runtime artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bundle_name="dogpaddle-debezium-runtime-$TARGET"
+          bundles_dir="$GITHUB_WORKSPACE/crates/debezium/bridge/target/bundles"
+          archive="$bundles_dir/$bundle_name.tar.gz"
+          checksum="$archive.sha256"
+
+          archive_listing="$(tar -tzf "$archive")"
+          if grep -F "/bin/bundled_runtime_probe" <<<"$archive_listing"; then
+            echo 'runtime artifact unexpectedly contains the CI probe' >&2
+            exit 1
+          fi
+          (
+            cd "$bundles_dir"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --check "$(basename "$checksum")"
+            else
+              shasum -a 256 --check "$(basename "$checksum")"
+            fi
+          )
+
+      - name: Upload the runtime-only bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dogpaddle-debezium-runtime-${{ matrix.target }}
+          path: |
+            crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-${{ matrix.target }}.tar.gz
+            crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

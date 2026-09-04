@@ -10,7 +10,8 @@
 [`experiments/debezium-d1/D1_REPORT.md`](experiments/debezium-d1/D1_REPORT.md)。D1 已由 owner
 合并。多 agent 对抗审查随后将原 D2/D3 重排：先把 Debezium 做成独立、窄小的产品组件，
 再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 的实现与验收记录见
-[PR #12](https://github.com/frelion/dogpaddle/pull/12)；合并后由 GitHub #5 自动关闭。
+[PR #12](https://github.com/frelion/dogpaddle/pull/12)；其中 runtime 又收紧为携带固定 Temurin JRE、
+不回退系统 Java 的四平台自包含 bundle。合并后由 GitHub #5 自动关闭。
 
 ## 目标与成功定义
 
@@ -31,18 +32,21 @@ WAL，而是同时满足：
 | --- | --- |
 | 宿主 | Rust 是主进程与生命周期协调者；Java 不反向调用 Flow |
 | JVM | 每个 OS 进程至多一个内嵌 HotSpot JVM，多个 connector engine 共享 |
+| 发布形态 | 一个原生进程、一个自包含目录归档；显式加载 bundle 内 `libjvm`，不依赖系统 Java |
 | Debezium | 使用上游 stock Debezium Engine 和公开 SPI，不 fork、不替换内部类 |
 | 边界 | Rust 通过窄公共 API 主动 `start/poll/ack/stop`；JNI handle、token 与 status 仅属私有实现 |
 | 持久真相 | D3 起 MDBX 保存 opaque connector partition/offset；Java 文件不是第二份 durable offset |
 | 试点 | PostgreSQL 是第一个 connector 试点，不是通用 API 的特例 |
 | Snapshot | 初始 snapshot/generation 单独放在 D6；D1–D5 先证明持续流与恢复 |
 
-D1 的固定试验基线是 Debezium `3.6.2.Final`、JDK 21 和 `jni-rs` `0.22.x`
+D1/D2 的固定试验基线是 Debezium `3.6.2.Final`、Temurin JRE `21.0.12.1+1` 和 `jni-rs` `0.22.x`
 Invocation API。这是可重复基线，不是“自动跟随 latest”策略；产品升级规则在 D5 验证。
 
 ## 术语与责任
 
 - **JVM host**：Rust 中创建并保持进程级 `JavaVM` 的部分。
+- **runtime bundle**：绑定一个原生 target 的完整目录，包含 Temurin JRE、Debezium
+  distribution、manifest/checksum/SBOM/notice，并可选包含宿主 `bin/`。
 - **Java bridge**：极薄的 connector-neutral Java 封装；在 Java 线程上运行 stock Engine，
   并向 Rust 提供有界、拥有型字节交付。
 - **Connector**：`dogpaddle-debezium` 暴露的线性 Rust 生命周期对象；它可以启动和轮询
@@ -78,18 +82,20 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 
 ## 版本、构建与许可证策略
 
-- D1 精确锁定 Debezium `3.6.2.Final`、`jni-rs 0.22.4`、Java 17 bytecode、Temurin
-  `21.0.9+10`/Maven `3.9.11` linux/amd64 镜像 digest，以及 PostgreSQL 16 fixture digest；
-  完整值记录在 D1 README 与 lockfile 中。
-- JAR 与 JDK 不提交进 Git。Rust 依赖由 Cargo.lock 固定；Java 依赖由 POM/BOM 中的精确版本和
-  digest-pinned 构建镜像解析，成品 bundle 再生成完整 checksum 与 SBOM。stock Debezium 源码
-  审计同时锁定 tag 和 commit；这里不虚构仓库里并不存在的 Maven lockfile。
+- D1/D2 精确锁定 Debezium `3.6.2.Final`、Kafka Connect `4.3.0`、`jni-rs 0.22.4`、
+  Java 17 bytecode 和发行时 Eclipse Temurin JRE `21.0.12.1+1`；PostgreSQL 16 fixture、
+  container Maven/JDK 镜像、Temurin 四平台 archive 与 SBOM 都以 digest 或 SHA-256 锁定。
+- JAR 与 JRE 不提交进 Git。Rust 依赖由 Cargo.lock 固定；Java 依赖由 POM/BOM 中的精确版本
+  解析，发行脚本校验上游 Temurin archive/SBOM，并为完整 bundle 生成 checksum。stock Debezium
+  源码审计同时锁定 tag 和 commit；这里不虚构仓库里并不存在的 Maven lockfile。
 - 不自动跟随 Debezium、Kafka Connect、JDK、JNI 或 connector 版本。任一升级都必须单独 PR，
   重跑 source audit、bridge/JNI、offset/ACK、真实 connector 与 crash/reopen gate。
-- D1 只记录依赖物料规模与主许可证，不构成发布包。D2 的开发/验收 bundle 必须生成完整
-  transitive SBOM、保存 artifact checksum，并原样保留每个 JAR 内的 license/NOTICE；D2 bundle
-  不对外发布。正式许可证义务审查、顶层 notices、CVE 与升级 rehearsal 统一作为 D5 发布门，
-  不能把“生成了 SBOM”写成已经完成法律或安全审查。
+- D2 自包含 bundle 支持 Linux GNU 与 macOS 的 x86_64/aarch64 四个 target；运行时显式加载
+  bundle 内 `libjvm`，没有 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java fallback。Linux 不承诺
+  musl/Alpine。普通 Cargo gate 不下载 Java；bundle 是独立的显式构建。
+- D2 的开发/验收 bundle 生成 Debezium transitive SBOM，保存 Temurin 上游 SBOM、artifact checksum、
+  runtime notices 与源码引用。它们是审查输入，不等于正式许可证或安全审查。macOS 开发包目前
+  未签名；Developer ID 签名、notarization、CVE 与升级 rehearsal 统一属于 D5 发布门。
 
 ## 阶段总览
 
@@ -97,7 +103,7 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 | --- | --- | --- | --- |
 | D0 | [#4](https://github.com/frelion/dogpaddle/issues/4) | 契约是什么 | 关键决策、非目标、门槛和风险已冻结 |
 | D1 | [#3](https://github.com/frelion/dogpaddle/issues/3) | stock Engine 是否可控 | Rust 能在同进程稳定 start/poll/ack/stop 原版 Engine |
-| D2 | [#5](https://github.com/frelion/dogpaddle/issues/5) | 原型如何成为简单可靠的产品 runtime | 独立 crate 用 pre-ACK 完整 checkpoint 封住 Debezium/JNI |
+| D2 | [#5](https://github.com/frelion/dogpaddle/issues/5) | 原型如何成为简单可靠的产品 runtime | 独立 crate 与自包含 bundle 用 pre-ACK 完整 checkpoint 封住 Debezium/JNI |
 | D3 | [#6](https://github.com/frelion/dogpaddle/issues/6) | 外部 delivery 如何安全进入 Flow | 最小 generic durable ingress 关闭 MDBX/ACK 事务窗口 |
 | D4 | [#7](https://github.com/frelion/dogpaddle/issues/7) | PostgreSQL 行如何变成 Change | 固定 Schema 单表 WAL 试点正确表达 insert/update/delete |
 | D5 | [#8](https://github.com/frelion/dogpaddle/issues/8) | 是否能发布 | crash、fencing、背压、升级、安全和长稳证据齐备 |
@@ -226,7 +232,7 @@ PostgreSQL 代码分支；D2 的参考发行包会包含 PostgreSQL connector，
 D2 的目标公开调用面为：
 
 ```rust,ignore
-let runtime = DebeziumRuntime::open(distribution)?;
+let runtime = DebeziumRuntime::open(bundle_root)?;
 let mut connector = runtime.start(config, resume_checkpoint.as_ref())?;
 loop {
     if should_stop() {
@@ -247,7 +253,13 @@ handle、token、status、JNI、Java object 和 classpath 列表全部是私有�
 
 ### 交付
 
-- 进程级单例 JVM：相同 canonical path 与已验证内容指纹才复用，路径或内容变化显式冲突；
+- 进程级单例 JVM：相同 canonical bundle path 与已验证内容指纹才复用，路径或内容变化显式冲突；
+- 自包含 runtime bundle：固定的 Temurin JRE `21.0.12.1+1`、Debezium distribution、严格
+  manifest/checksum、Debezium/Temurin SBOM 与 notices；`DebeziumRuntime::open(bundle_root)` 只加载
+  其中的 `libjvm`，绝不回退到系统 Java；
+- 四个原生 target：Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64；同一构建器既可生成
+  runtime-only archive，也可把调用方提供的原生 host 放入可选 `bin/`。仓库尚无最终主产品
+  executable，因此后者只是通用装配机制；
 - connector-neutral Java bridge，只有一个 outstanding batch，无 Java→Rust callback；
 - `ConnectorConfig` 只做 secret-safe properties 容器，runtime 强制单 task、ordered、always
   commit、自有 offset store，并拒绝 SMT/predicate 与调用方 offset store；
@@ -264,9 +276,10 @@ handle、token、status、JNI、Java object 和 classpath 列表全部是私有�
 - versioned、bounded binary delivery wire，记录原始 SourceRecord 顺序，并以 schemas-enabled
   Kafka Connect JSON bytes 表达 key/value/header data；
 - start failure 清理、stop deadline、outstanding abort、显式 dispose，以及私有诊断；
-- Maven/JDK 独立构建出的 `distribution/lib/*.jar`；普通 Cargo gate 不调用 Maven、不联网、
-  编译时不要求 JDK；
-- D1 PostgreSQL fixture 改成只通过本 crate public API 驱动真实 connector。
+- Maven/JDK 独立构建出的 `debezium/lib/*.jar`；普通 Cargo gate 不调用 Maven、不联网、
+  编译和测试时不要求 JDK；distribution builder 支持显式 local/container Maven 模式；
+- D1 PostgreSQL fixture 改成只通过本 crate public API 驱动真实 connector，并把 host 放进
+  Linux x86_64 bundle 后使用 bundled JVM 运行。
 
 Checkpoint 是“完整 connector offset-store image”，不是 delivery identity。一个 connector 可能
 合法地让多个事件共享 position，durable ingress 不得拿 checkpoint 冒充事件 ID。MySQL 等
@@ -285,12 +298,16 @@ connector 还需要 schema history；D2 不把 offset checkpoint 夸成所有 co
 - startup failure/timeout、running stop timeout、重复 stop 与 reclaim 有组件证据；
 - D1 的真实 PostgreSQL 顺序、ACK 前 LSN 不推进、ACK 后 eventual LSN、unacked replay 和
   restart gate 改走 product API；
-- `cargo xtask check` 在没有 Java artifact 的普通 Rust 环境保持通过；Java/PG gate 显式运行。
+- `cargo xtask check` 在没有 Java artifact 的普通 Rust 环境保持通过；Java/PG gate 显式运行；
+- Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个原生 runner 都从归档重新解压到含空格的
+  路径，在清空 Java 相关环境和系统 PATH 后完成 public-API JVM/bridge handshake；
+- 真实 PostgreSQL 恢复矩阵继续由 Linux x86_64 D1 gate 所有，不用四个平台复制数据库 fixture。
 
 ### 退出条件
 
-从干净 checkout 可以分别运行普通 Rust gate 与 pinned Java/真实 PostgreSQL gate。fresh Engine
-只靠调用方保存的 pre-ACK checkpoint 恢复，不存在 Java offset 文件；D1 不再拥有第二份 JVM/JNI
+从干净 checkout 可以分别运行普通 Rust gate、自包含四平台 bundle gate 与 pinned Java/真实
+PostgreSQL gate。fresh Engine 只靠调用方保存的 pre-ACK checkpoint 恢复，不存在 Java offset 文件；
+D1 不再拥有第二份 JVM/JNI
 host runtime、bridge、delivery codec 或生命周期实现，它只保留调用公共 API 的黑盒 CLI。未达到
 checkpoint 独立恢复前，只能称 D2 foundation，不能进入 D3。
 
@@ -298,7 +315,7 @@ checkpoint 独立恢复前，只能称 D2 foundation，不能进入 D3。
 
 - `OffsetStorageWriter` 是 Kafka Connect public class，但属于精确版本绑定的 runtime API；升级
   必须重审 preview/actual 等价性，不能承诺跨任意 Connect 版本恢复；
-- HotSpot 通常不能在同一进程 destroy/recreate，首次初始化必须在启动 JVM 前完成 distribution 校验；
+- HotSpot 通常不能在同一进程 destroy/recreate，首次初始化必须在启动 JVM 前完成完整 bundle 校验；
 - JVM fatal error 会终止 Rust 宿主，没有 sidecar 隔离；
 - class-loader、日志、TLS/native library、发布体积、JDK 与多平台成为产品负担；
 - Debezium startup phase 的 shutdown 行为复杂，不能把 D1 的一次性 worker 原样升级；
@@ -425,6 +442,7 @@ Snapshot、在线 DDL 和第二 connector 仍非目标。
 - 指标与诊断：JVM/Engine 状态、poll/ACK latency、outstanding bytes、accepted/emitted
   checkpoint、backpressure 源头、slot/WAL lag；
 - secret redaction、TLS 边界、JDK/JAR provenance、license/SBOM/CVE 流程；
+- macOS Developer ID 签名、notarization 与发布验证；Linux/macOS 正式支持矩阵及升级归档；
 - 精确版本升级流程：旧 opaque offset fixture、bridge envelope、Definition/state golden、
   上游 Debezium connector 兼容性评审。
 

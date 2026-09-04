@@ -8,6 +8,7 @@ readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 experiment_dir="$(cd -- "$script_dir/.." && pwd)"
 repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
+runtime_bundle="$repo_dir/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu"
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-state.XXXXXX")"
 artifacts_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-artifacts.XXXXXX")"
 owns_postgres=0
@@ -126,12 +127,20 @@ python3 "$experiment_dir/tests/d1_blackbox.py" \
   -- \
   podman run --rm --interactive \
     --network host \
-    --volume "$experiment_dir/host/target/release/dogpaddle-debezium-d1-host:/opt/d1/host:ro,Z" \
-    --volume "$repo_dir/crates/debezium/bridge/target/distribution:/opt/d1/distribution:ro,Z" \
+    --env PATH=/nonexistent \
+    --env JAVA_HOME=/nonexistent \
+    --env JDK_HOME=/nonexistent \
+    --env JAVA_TOOL_OPTIONS= \
+    --env JDK_JAVA_OPTIONS= \
+    --env _JAVA_OPTIONS= \
+    --env LD_LIBRARY_PATH= \
+    --env DYLD_LIBRARY_PATH= \
+    --env DYLD_FALLBACK_LIBRARY_PATH= \
+    --volume "$runtime_bundle:/opt/d1/bundle:ro,Z" \
     --volume "$experiment_dir/tests/fixtures/connector.json:/opt/d1/connector.json:ro,Z" \
     --volume "$state_dir:/state:Z" \
-    --entrypoint /opt/d1/host \
+    --entrypoint /opt/d1/bundle/bin/dogpaddle-debezium-d1-host \
     "$MAVEN_IMAGE" \
-    --distribution /opt/d1/distribution \
+    --bundle /opt/d1/bundle \
     --config /opt/d1/connector.json \
     --checkpoint /state/checkpoint.bin

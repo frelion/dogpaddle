@@ -1,8 +1,16 @@
 package dev.dogpaddle.debezium;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.net.ssl.TrustManagerFactory;
 
 /** The connector-neutral, pull-based JNI surface used by the Rust runtime. */
 public final class DebeziumBridge {
@@ -16,6 +24,18 @@ public final class DebeziumBridge {
     /** Returns the JNI and wire protocol version without creating a connector. */
     public static int protocolVersion() {
         return 1;
+    }
+
+    /** Verifies the bundled runtime resources required by connector operation. */
+    public static void verifyRuntime() throws GeneralSecurityException, UnknownHostException {
+        if (!"UTF-8".equals(StandardCharsets.UTF_8.name())) {
+            throw new IllegalStateException("UTF-8 charset is unavailable");
+        }
+        ZoneId.of("Asia/Shanghai").getRules().getOffset(Instant.EPOCH);
+        TrustManagerFactory trustManagers = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm());
+        trustManagers.init((KeyStore) null);
+        InetAddress.getByName("localhost");
     }
 
     /** Creates a stopped connector from JSON properties and an optional checkpoint. */

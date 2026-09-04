@@ -11,7 +11,7 @@ pub(crate) const DEFAULT_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Arguments {
-    pub(crate) distribution: PathBuf,
+    pub(crate) bundle: PathBuf,
     pub(crate) config: PathBuf,
     pub(crate) checkpoint: PathBuf,
     pub(crate) max_delivery_bytes: usize,
@@ -21,7 +21,7 @@ impl Arguments {
     pub(crate) fn parse(values: impl IntoIterator<Item = OsString>) -> Result<Self, HostError> {
         let mut values = values.into_iter();
         let _program = values.next();
-        let mut distribution = None;
+        let mut bundle = None;
         let mut config = None;
         let mut checkpoint = None;
         let mut max_delivery_bytes = None;
@@ -38,7 +38,7 @@ impl Arguments {
                 ))
             })?;
             match option.to_str() {
-                Some("--distribution") => distribution = Some(PathBuf::from(value)),
+                Some("--bundle") => bundle = Some(PathBuf::from(value)),
                 Some("--config") => config = Some(PathBuf::from(value)),
                 Some("--checkpoint") => checkpoint = Some(PathBuf::from(value)),
                 Some("--max-delivery-bytes") => {
@@ -63,9 +63,8 @@ impl Arguments {
         }
 
         Ok(Self {
-            distribution: distribution.ok_or_else(|| {
-                HostError::Usage(format!("--distribution is required\n{}", usage()))
-            })?,
+            bundle: bundle
+                .ok_or_else(|| HostError::Usage(format!("--bundle is required\n{}", usage())))?,
             config: config
                 .ok_or_else(|| HostError::Usage(format!("--config is required\n{}", usage())))?,
             checkpoint: checkpoint.ok_or_else(|| {
@@ -172,7 +171,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: dogpaddle-debezium-d1-host --distribution PATH --config PATH \\
+    "usage: dogpaddle-debezium-d1-host --bundle PATH --config PATH \\
      --checkpoint PATH [--max-delivery-bytes BYTES]"
         .to_owned()
 }
@@ -203,8 +202,8 @@ mod tests {
         let arguments = Arguments::parse(
             [
                 "host",
-                "--distribution",
-                "distribution",
+                "--bundle",
+                "bundle",
                 "--config",
                 "connector.json",
                 "--checkpoint",
@@ -216,7 +215,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(arguments.distribution, PathBuf::from("distribution"));
+        assert_eq!(arguments.bundle, PathBuf::from("bundle"));
         assert_eq!(arguments.config, PathBuf::from("connector.json"));
         assert_eq!(arguments.checkpoint, PathBuf::from("checkpoint.bin"));
         assert_eq!(arguments.max_delivery_bytes, 4096);

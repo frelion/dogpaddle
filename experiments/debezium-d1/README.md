@@ -2,8 +2,10 @@
 
 D1 is the real PostgreSQL fixture for the product `dogpaddle-debezium` crate.
 It no longer owns a Java bridge or a JNI host implementation. The small Rust
-JSONL host depends on the product crate, and the runner consumes the product-built
-Debezium distribution unchanged.
+JSONL host depends on the product crate. The build places that host, the
+product-built Debezium distribution and the pinned Temurin runtime in one
+self-contained Linux x86_64 bundle; the runner starts the host from `bin/` and
+the product loads only that bundle's JVM.
 
 The gate answers one narrow question:
 
@@ -20,7 +22,7 @@ evolution, transaction-framing, or Arrow mapping claim.
 The fixture exercises only the public Rust surface:
 
 ```text
-DebeziumRuntime::open(distribution)
+DebeziumRuntime::open(bundle_root)
   -> DebeziumRuntime::start(config, optional_checkpoint)
   -> Connector::poll(timeout)
   -> Delivery::{records, checkpoint}
@@ -62,7 +64,11 @@ store and restores it solely from `Checkpoint`.
 - Kafka Connect `4.3.0`.
 - PostgreSQL `16.15`, using `pgoutput`, one publication, and one persistent
   logical replication slot.
-- Java 17 bytecode on the pinned Eclipse Temurin JDK 21 Maven image.
+- Java 17 bridge bytecode; Eclipse Temurin JRE `21.0.12.1+1` inside the runtime
+  bundle. The separate container Maven/JDK image is only a build tool.
+- Linux GNU x86_64 runtime. The four-platform JVM/bridge smoke matrix is owned
+  by the separate `Debezium runtime bundles` workflow; the real PostgreSQL
+  fixture is intentionally not duplicated on macOS or Linux arm64.
 - `snapshot.mode=no_data` and `lsn.flush.mode=connector`.
 
 `connector_and_driver` remains forbidden because pgjdbc automatic LSN
@@ -80,14 +86,18 @@ The command performs, in order:
 
 1. an audit of the exact upstream Debezium commit path;
 2. Rust format, unit tests, Clippy, and a release host build;
-3. the product crate's own bridge tests and distribution build, including its
-   manifest, checksums, SBOM, and PostgreSQL connector;
-4. a disposable real PostgreSQL black-box recovery matrix.
+3. the product crate's own bridge tests and distribution build;
+4. a self-contained bundle containing the D1 host, pinned Temurin runtime,
+   PostgreSQL connector, manifests, checksums, SBOMs and notices;
+5. a disposable real PostgreSQL black-box recovery matrix run with the bundle's
+   host and JVM.
 
 Required local tools are Rust 1.96 or newer with Clippy, Podman with a working
-Compose provider, `git`, `psql`, Python 3, `rg`, `unzip`, and `flock`. Network
-access is needed for the pinned source audit and Maven dependencies. Port
-`55432` must be free.
+Compose provider, `git`, `psql`, Python 3, `curl`, `tar`, `rg`, `unzip`, and
+`flock`. Network access is needed for the pinned source audit, Maven dependencies
+and checksum-pinned Temurin assets. A host JDK or `JAVA_HOME` is not a runtime
+requirement; D1's Maven build runs in the pinned container. Port `55432` must be
+free.
 
 The runner owns an exclusive fixture lock and refuses to overwrite an existing
 Compose project. Set `D1_KEEP_ARTIFACTS=1` to retain the sole checkpoint and
@@ -113,6 +123,9 @@ The real connector run must prove all of these:
 8. Rows written by one multi-row transaction retain their source order.
 9. `/state/checkpoint.bin` is the only state file; no
    `FileOffsetBackingStore` or other Java offset file exists.
+10. The executable is launched from the assembled bundle and
+    `DebeziumRuntime::open` validates and explicitly loads its bundled `libjvm`;
+    it does not select Java from the container environment.
 
 Within one live connector, byte-for-byte stability includes the opaque
 checkpoint and every encoded key, value, and header. Across a fresh Engine, the
@@ -146,6 +159,11 @@ The audit also checks that the product bridge does not copy or shadow
 `io.debezium.*`, declares no Java-to-Rust native callback, and that the D1
 fixture itself contains neither Java bridge source nor a direct `jni`
 dependency.
+
+The product's native CI separately relocates each Linux/macOS x86_64/aarch64
+archive and completes the same public runtime handshake with an empty `PATH`
+and invalid Java home variables. That is the direct no-system-Java proof; this
+D1 fixture owns the deeper real PostgreSQL recovery proof.
 
 ## Fixture lifecycle
 

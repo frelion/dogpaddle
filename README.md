@@ -1,6 +1,7 @@
 # DogPaddle
 
 [![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
+[![Debezium runtime bundles](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml)
 
 **把可恢复的数据流，嵌进 Rust 进程。**
 
@@ -45,11 +46,17 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
 在 Sink 独占目标表且数据库未被外部修改或替换的前提下，重放不会重复最终结果。
 
+CDC 基础设施已经有独立的 `dogpaddle-debezium` 产品 crate：它在 Rust 进程内运行 stock
+Debezium Engine，以 connector-neutral 的 `start/poll/ack/stop` 和 opaque pre-ACK checkpoint
+隔离 JNI。Linux GNU 与 macOS 的 x86_64/aarch64 自包含 bundle 随附固定 Temurin JRE，运行时不依赖
+系统 Java；PostgreSQL 是真实连接器验收 fixture，还不是 Flow 中的生产 Source Operation。
+
 ## 当前边界
 
 - DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
 - 运行由宿主反复调用 `Flow::advance` 驱动；尚无 `Flow::start`、后台 runner 或中断控制。
-- Operation 集合目前封闭，唯一内建 Source 是 `SequenceSource`，尚无生产输入连接器。
+- Operation 集合目前封闭，唯一内建 Source 是 `SequenceSource`；Debezium runtime 尚未通过 D3/D4
+  durable ingress 与行到 `Change` 的映射成为生产输入连接器。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
 - `SQLiteSink` 只创建并独占新目标表；尚无 PostgreSQL、MySQL 或通用外部 Sink。
 - 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。
@@ -59,7 +66,7 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 - [算子路线与语义边界](OPERATOR_ROADMAP.md)
 - [Debezium Source D0–D7 路线图](DEBEZIUM_ROADMAP.md)
 - [ADR-0001：在 Rust 宿主中嵌入 Debezium Engine](docs/adr/0001-embed-debezium-engine.md)
-- [Debezium：进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
+- [Debezium：自包含进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
 - [Flow：构建、运行与恢复](crates/flow/README.md)
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)

@@ -161,14 +161,14 @@ fn checkpoint_rejects_non_canonical_bounds_and_blank_bindings() {
 }
 
 #[test]
-fn runtime_rejects_an_incomplete_distribution_before_starting_a_jvm() {
+fn runtime_rejects_a_legacy_jar_directory_without_a_bundled_jvm() {
     let directory = tempdir().unwrap();
     fs::create_dir(directory.path().join("lib")).unwrap();
 
     let error = DebeziumRuntime::open(directory.path()).unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
-    assert!(error.to_string().contains("MANIFEST"));
+    assert!(error.to_string().contains("unexpected top-level entry"));
 }
 
 fn checkpoint_bytes(

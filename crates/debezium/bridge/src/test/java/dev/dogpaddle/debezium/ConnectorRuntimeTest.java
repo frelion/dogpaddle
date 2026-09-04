@@ -16,6 +16,11 @@ class ConnectorRuntimeTest {
     }
 
     @Test
+    void required_runtime_resources_are_available() throws Exception {
+        DebeziumBridge.verifyRuntime();
+    }
+
+    @Test
     void create_rejects_a_delivery_bound_below_the_protocol_minimum() {
         byte[] configuration = ("{\"name\":\"minimum-bound\","
                 + "\"connector.class\":\"example.MissingConnector\"}")

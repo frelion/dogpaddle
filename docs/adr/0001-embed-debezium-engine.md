@@ -35,7 +35,7 @@ offset 与故障恢复，会同时承担 connector 协议和 Dataflow 事务两�
 DogPaddle 采用以下组合：
 
 > **Rust host + 每进程单例内嵌 HotSpot JVM + stock Debezium Engine +
-> Rust pull/ack 薄 Java bridge。PostgreSQL 只是第一个试点。**
+> Rust pull/ack 薄 Java bridge + 自包含平台 bundle。PostgreSQL 只是第一个试点。**
 
 ### 1. Rust 是宿主与最终协调者
 
@@ -63,15 +63,33 @@ handle，但不为每个 Source 创建 JVM。
 
 - JVM options；
 - class path 和 bridge/JAR 版本；
-- JDK/HotSpot 运行时边界。
+- bundle canonical path、完整内容指纹与目标平台；
+- Temurin/HotSpot 运行时边界。
 
 后续初始化请求必须兼容，否则返回明确错误，不启动第二 JVM。不把 HotSpot
 destroy/recreate 当成正常恢复机制；所有 Engine 在进程退出前应尽力 stop，JVM 由进程
-终止回收。
+终止回收。DogPaddle 必须是进程启动期第一个且唯一的 JVM 初始化者；其他 JNI 组件不得先行
+初始化 JVM，也不得与 `DebeziumRuntime::open` 并发竞争初始化。这是 HotSpot Invocation API
+的进程级边界，不通过 DogPaddle 内部锁伪装成跨 crate 的全局互斥。
 
-D1 的可重复基线为 Java 17 bytecode、JDK 21 runtime 和 `jni-rs` `0.22.x`
-Invocation API。DogPaddle 自有 Rust 代码不写 `unsafe`；JNI 底层的安全责任留在经审查的依赖中。运行时不长期保存
-thread-local `JNIEnv`，线程按 JNI 库的安全 API attach/detach。
+D1/D2 的可重复基线为 Java 17 bytecode、Eclipse Temurin JRE
+`21.0.12.1+1` 和 `jni-rs` `0.22.x` Invocation API。DogPaddle 自有 Rust
+代码不写 `unsafe`；JNI 底层的安全责任留在经审查的依赖中。运行时不长期保存 thread-local
+`JNIEnv`，线程按 JNI 库的安全 API attach/detach。
+
+`DebeziumRuntime::open` 接受一个绑定原生 target 的自包含 bundle root。目录包含
+`runtime/` 下的 Temurin JRE、`debezium/` 下的 bridge/connector JAR，以及严格的
+manifest、完整 SHA-256 inventory、SBOM 和 notices；调用方还可在可选 `bin/` 中随包携带
+自己的原生宿主。运行时只从已验证的绝对路径加载 bundle 内 `libjvm`，不搜索 `PATH`，也没有
+`JAVA_HOME`、`JDK_HOME` 或系统 Java fallback。bundle 必须在 `open` 前安装到非受信用户不可写
+的目录，并从 `open` 到进程结束保持不变；完整性校验不取代发布签名，也不能阻止同一权限主体在
+校验后替换 JVM 或 JAR 路径。
+
+D2 构建器支持 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
+`x86_64-apple-darwin` 和 `aarch64-apple-darwin`。Linux 支持边界是 GNU/glibc，不含
+musl/Alpine。仓库目前没有最终 DogPaddle 主产品 executable，因此交付的是 runtime-only
+archive 和可选宿主装配机制，不虚构一个尚不存在的 CLI。macOS 开发 archive 未签名；正式
+Developer ID 签名与 Apple notarization 是 D5 发布门。
 
 ### 3. 使用 stock Debezium Engine
 
@@ -202,6 +220,7 @@ Rust snapshot reader 属于新架构决策，需要后续 ADR，不由 D6 实现
 
 - 复用 Debezium 的 connector 生态和上游维护；
 - 无 sidecar 部署和独立控制面，保留 DogPaddle 的嵌入式产品形态；
+- 运行用户无需预装 Java 或配置 `JAVA_HOME`，应用与 JVM/connector 依赖可作为同一归档部署；
 - Rust pull 使 MDBX transaction 与 JNI/Java 线程之间没有重入调用；
 - 延迟 ACK 与 durable ingress 可用少量状态机覆盖崩溃窗口；
 - connector-neutral bridge 为 D7 第二 Source 留出真实复用路径；
@@ -209,11 +228,12 @@ Rust snapshot reader 属于新架构决策，需要后续 ADR，不由 D6 实现
 
 ### 负面结果与代价
 
-- 宿主需要 JDK/HotSpot，发布体积、启动时间和常驻内存显著上升；
+- 每个平台归档都携带 JRE/HotSpot，发布体积、启动时间和常驻内存显著上升；
+- Linux GNU 与 macOS 的双架构需要原生构建/验收；macOS 正式发布还需要签名与 notarization；
 - JNI 引入跨语言错误、线程 attach、reference 和 class-loader 生命周期；
 - HotSpot fatal error 可使整个 Rust 进程退出，没有 sidecar 故障隔离；
 - JVM options/class path 是进程级配置，不能由不同 Flow 独立更改；
-- Java bridge、JAR 依赖树、license、SBOM 和 CVE 升级成为 DogPaddle 的发布责任；
+- Java bridge、JAR/JRE 依赖树、license、SBOM 和 CVE 升级成为 DogPaddle 的发布责任；
 - 单 outstanding delivery 优先正确性而非最大吞吐，后续优化必须以等价故障证据为前提；
 - PostgreSQL 试点仍需要自行实现 Connect Schema/Value 到 Arrow `Change` 的精确映射。
 
@@ -266,6 +286,6 @@ Source Operation 输出。
 - D7 的第二 connector 选择；
 - 在真实性能证据前，是否从单 outstanding delivery 扩展为有序多 delivery pipeline。
 
-这些选择不得改变本 ADR 已冻结的四个核心事实：Rust host、单 HotSpot JVM、
-stock Debezium Engine、Rust pull/ack bridge。如果后续证据要求改变它们，应以新 ADR
-取代本决策，而不回写历史。
+这些选择不得改变本 ADR 已冻结的核心事实：Rust host、单 HotSpot JVM、stock Debezium
+Engine、Rust pull/ack bridge，以及不回退到系统 Java 的自包含 runtime bundle。如果后续证据
+要求改变它们，应以新 ADR 取代本决策，而不回写历史。

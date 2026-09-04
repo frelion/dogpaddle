@@ -35,7 +35,7 @@
 | 所有者 | 正确性所有权 | benchmark target |
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
-| Debezium | secret-safe config、distribution/JVM singleton、owned delivery binary、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；真实 PostgreSQL gate 独立运行 | 不适用 |
+| Debezium | secret-safe config、自包含 bundle/nested distribution/JVM singleton、owned delivery binary、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 native bundle 与真实 PostgreSQL gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
 | Operation | 十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
 | Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
@@ -45,10 +45,11 @@
 占用与 WAL retention 由 D5 pinned gate 所有。
 
 Debezium 的这一行是分层所有权，不表示所有行为都塞进 Rust 公共 correctness target：offline Rust
-gate 证明 config、distribution preflight、checkpoint/delivery codec 与 Rustdoc；Java component gate
-证明 Engine handler、preview/actual、ACK 与 lifecycle 状态机；pinned PostgreSQL gate 最后只经公共
-Rust API 证明同进程运行、unacked replay、checkpoint-only fresh Engine restore 与 eventual LSN。
-三层证据必须分别报告，只有全部通过才满足 D2 exit。
+gate 证明 config、bundle 与 nested distribution preflight、target/checksum/malformed 拒绝、
+checkpoint/delivery codec 与 Rustdoc；Java component gate 证明 Engine handler、preview/actual、ACK
+与 lifecycle 状态机；四个 native runner 证明 bundle 内 JVM/bridge 可在没有系统 Java 的环境中启动；
+pinned PostgreSQL gate 最后只经公共 Rust API 证明同进程运行、unacked replay、checkpoint-only fresh
+Engine restore 与 eventual LSN。四层证据必须分别报告，只有全部通过才满足 D2 exit。
 
 ## Change + Store 的最小接缝
 
@@ -177,10 +178,26 @@ cargo test -p dogpaddle-change-store-integration
 cargo bench -p dogpaddle-flow --bench flow_runtime
 ```
 
-`dogpaddle-debezium` 的普通 Rust gate 属于上述 workspace check，不能调用 Maven、联网或要求
-本机存在 JDK。Java bridge、artifact audit 与真实 PostgreSQL connector 使用单独的 pinned gate；
-该 gate 必须构建 `crates/debezium/bridge`，并通过产品 crate 的 public Rust API 驱动 D1 fixture。
-两条 gate 都通过才构成 D2 证据。
+`dogpaddle-debezium` 的普通 Rust gate 属于上述 workspace check，不能调用 Maven、下载 Java
+artifact、联网或要求本机存在 JDK。Java 与 bundle gate 是显式命令：
+
+```bash
+DOGPADDLE_MAVEN_MODE=container crates/debezium/scripts/build-distribution.sh
+crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
+experiments/debezium-d1/scripts/run.sh
+```
+
+`build-distribution.sh` 也支持 `DOGPADDLE_MAVEN_MODE=local`，供已有 Maven/JDK 的原生 CI runner
+使用。`Debezium runtime bundles` workflow 在 Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64
+四个原生 runner 上构建 Java distribution、原生 Rust probe 和对应 bundle。每个 runner 删除装配目录，
+把 archive 解压到含空格的新路径，清空 Java 相关环境、动态库搜索路径和系统 `PATH`，再经
+`DebeziumRuntime::open(bundle_root)` 完成 JVM/bridge handshake；随后只上传不含 probe 的
+runtime-only archive。
+
+真实 PostgreSQL 顺序、ACK、replay、checkpoint restore 与 eventual LSN 矩阵仍由 Linux x86_64
+D1 gate 独立拥有。D1 将 Rust host 放入同一个自包含 bundle 的 `bin/`，并用 bundle 内 JVM 运行；
+它不依赖系统 Java。普通 Rust、Java component、四平台 bundle 和 D1 PostgreSQL gate 都通过才构成
+D2 证据。
 
 ## 新增或删除测试
 
