@@ -12,12 +12,13 @@ DogPaddle 是一个为 Rust 应用设计的嵌入式 Dataflow 引擎。它用 Ar
 
 无需独立服务、控制面或流处理集群。
 
-![真实运行的 Flow 与 SQLite 只读查询](docs/assets/sqlite-sink-live.gif)
+![PostgreSQL CDC 经 DogPaddle 落入 SQLite](docs/assets/postgres-cdc-live.gif)
 
-*真实 PTY 录制：左侧运行公共 API Flow，右侧用只读 `sqlite3` 查看 `SQLiteSink`
-持续落库；450 ms 停顿仅用于演示。*
+*真实进程录制：左侧写入 PostgreSQL，中间运行 `PostgresSource → SqliteSink` Flow，右侧用只读
+`sqlite3` 查看 `SqliteSink` 的结果；停顿仅用于演示。*
 
-[查看并运行示例](crates/flow/examples/sqlite_sink_live.rs)
+[查看 Flow host](crates/flow/examples/postgres_cdc.rs) ·
+[重新生成录屏](tools/record_postgres_cdc_live.sh)
 
 ## 为什么是 DogPaddle
 
@@ -75,6 +76,7 @@ Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pen
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
 - [Store：MDBX 事务与集合](crates/store/README.md)
-- [重新生成真实录屏](tools/record_sqlite_sink_live.sh)
+- [重新生成 PostgreSQL CDC 录屏](tools/record_postgres_cdc_live.sh)
+- [重新生成 SQLite Sink 录屏](tools/record_sqlite_sink_live.sh)
 - [SQLiteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
 - [正确性与性能测试](TESTING.md)
