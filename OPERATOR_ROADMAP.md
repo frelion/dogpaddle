@@ -387,18 +387,21 @@ flow.ingest("orders", ingestion_id, change)?;
 ```
 
 Flow 当前唯一持有写事务启动能力，连接器不得绕过 Flow 打开第二个 writer。ingest 应由 Flow 协调，
-原子完成 input append、幂等 identity 和必要的 checkpoint 状态。
+原子完成 durable pending payload、幂等 identity 和 accepted checkpoint 状态。连接器只能在
+该事务成功后 ACK 外部 delivery；IngressSource 随后仍通过普通 `turn(None)` 输出，
+pending 清除与 Station output append 同事务。这一提交边界的具体 D0–D7 实施顺序见
+[`DEBEZIUM_ROADMAP.md`](DEBEZIUM_ROADMAP.md)。
 
 Ingress 至少定义：
 
 - 不可变 exact logical Schema；
-- 每次提交一个完整、非空 Change；
-- retained-byte capacity 和 backpressure；
+- 每个 delivery 携带一个完整、非空 Change，或仅推进 checkpoint 而不伪造空 Change；
+- 有界 durable pending、单 delivery 大小限制和 backpressure；
 - 可持久、可重试的 ingestion identity；
 - 重复 identity 的幂等结果；
 - Schema mismatch、编码或 commit 失败零部分写入；
 - reopen 后继续接收；
-- 未来 external offset 与 ingestion identity 的映射位置。
+- opaque external checkpoint 与 ingestion identity 的明确映射。
 
 第一版只需要可靠本地 ingress API，不直接耦合 Kafka、数据库或文件连接器。
 

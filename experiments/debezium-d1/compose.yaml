@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: quay.io/debezium/postgres:16@sha256:114cbe1e4f38055e83c9b567a7e0988fb80837b8eb500203b25c0f784a075b92
+    environment:
+      POSTGRES_DB: dogpaddle_d1
+      POSTGRES_USER: dogpaddle_d1
+      POSTGRES_PASSWORD: dogpaddle_d1
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_connections=64
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U dogpaddle_d1 -d dogpaddle_d1
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - d1-postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00-d1.sql:ro,Z
+
+volumes:
+  d1-postgres-data:
