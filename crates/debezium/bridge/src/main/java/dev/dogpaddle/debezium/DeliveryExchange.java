@@ -1,11 +1,9 @@
 package dev.dogpaddle.debezium;
 
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import org.apache.kafka.connect.source.SourceRecord;
 
 /** A single outstanding delivery with an ACK decision made by the Rust host. */
 final class DeliveryExchange {
@@ -14,41 +12,13 @@ final class DeliveryExchange {
         ABORT
     }
 
-    record Snapshot(Long token, int recordCount) {
-        boolean hasOutstanding() {
-            return token != null;
-        }
-    }
-
     static final class Delivery {
-        private final long token;
-        private final List<SourceRecord> records;
-        private final OffsetStoreRegistry.PreparedCheckpoint checkpoint;
         private final byte[] encoded;
         private final CompletableFuture<Decision> decision = new CompletableFuture<>();
         private final CompletableFuture<Void> settled = new CompletableFuture<>();
 
-        Delivery(
-                long token,
-                List<SourceRecord> records,
-                OffsetStoreRegistry.PreparedCheckpoint checkpoint,
-                byte[] encoded) {
-            this.token = token;
-            this.records = List.copyOf(records);
-            this.checkpoint = checkpoint;
-            this.encoded = encoded.clone();
-        }
-
-        long token() {
-            return token;
-        }
-
-        List<SourceRecord> records() {
-            return records;
-        }
-
-        OffsetStoreRegistry.PreparedCheckpoint checkpoint() {
-            return checkpoint;
+        Delivery(byte[] encoded) {
+            this.encoded = encoded;
         }
 
         byte[] encoded() {
@@ -59,18 +29,14 @@ final class DeliveryExchange {
     private Delivery outstanding;
     private boolean closed;
 
-    synchronized Delivery install(
-            long token,
-            List<SourceRecord> records,
-            OffsetStoreRegistry.PreparedCheckpoint checkpoint,
-            byte[] encoded) throws InterruptedException {
+    synchronized Delivery install(byte[] encoded) throws InterruptedException {
         while (outstanding != null && !closed) {
             wait();
         }
         if (closed) {
             throw new InterruptedException("delivery exchange is stopping");
         }
-        outstanding = new Delivery(token, records, checkpoint, encoded);
+        outstanding = new Delivery(encoded);
         notifyAll();
         return outstanding;
     }
@@ -84,7 +50,7 @@ final class DeliveryExchange {
             wait(millis, nanos);
             remainingNanos = deadline - System.nanoTime();
         }
-        return outstanding;
+        return closed ? null : outstanding;
     }
 
     Decision awaitDecision(Delivery delivery) throws InterruptedException {
@@ -96,7 +62,7 @@ final class DeliveryExchange {
         }
     }
 
-    boolean ack(long token, long timeoutMillis) {
+    boolean ack(long timeoutMillis) {
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("ACK timeout must be non-negative");
         }
@@ -107,10 +73,6 @@ final class DeliveryExchange {
             delivery = outstanding;
             if (delivery == null) {
                 throw new IllegalStateException("there is no outstanding delivery");
-            }
-            if (delivery.token != token) {
-                throw new IllegalArgumentException(
-                        "ACK token " + token + " does not match the outstanding delivery");
             }
             if (!delivery.decision.complete(Decision.ACK)) {
                 throw new IllegalStateException("delivery has already been decided");
@@ -141,12 +103,6 @@ final class DeliveryExchange {
             }
             throw new IllegalStateException("Debezium failed while acknowledging delivery", cause);
         }
-    }
-
-    synchronized Snapshot snapshot() {
-        return outstanding == null
-                ? new Snapshot(null, 0)
-                : new Snapshot(outstanding.token, outstanding.records.size());
     }
 
     synchronized void close() {

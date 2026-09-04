@@ -31,10 +31,9 @@ class ConnectorRuntimeTest {
                 () -> ConnectorRuntime.create(
                         configuration,
                         null,
-                        DeliveryCodec.MINIMUM_MAXIMUM_BYTES - 1,
-                        () -> 1));
+                        DeliveryCodec.MINIMUM_MAXIMUM_BYTES - 1));
 
-        assertEquals("maximum delivery bytes must be at least 76", error.getMessage());
+        assertEquals("maximum delivery bytes must be at least 68", error.getMessage());
     }
 
     @Test
@@ -45,9 +44,9 @@ class ConnectorRuntimeTest {
 
         IllegalArgumentException empty = assertThrows(
                 IllegalArgumentException.class,
-                () -> ConnectorRuntime.create(configuration, null, 96, () -> 1));
+                () -> ConnectorRuntime.create(configuration, null, 88));
         assertEquals(
-                "maximum delivery bytes must be at least 97 for the initial checkpoint",
+                "maximum delivery bytes must be at least 89 for the initial checkpoint",
                 empty.getMessage());
 
         Checkpoint restored = new Checkpoint(
@@ -61,7 +60,7 @@ class ConnectorRuntimeTest {
         IllegalArgumentException existing = assertThrows(
                 IllegalArgumentException.class,
                 () -> ConnectorRuntime.create(
-                        configuration, checkpoint, required - 1, () -> 1));
+                        configuration, checkpoint, required - 1));
         assertEquals(
                 "maximum delivery bytes must be at least " + required
                         + " for the initial checkpoint",
@@ -74,7 +73,7 @@ class ConnectorRuntimeTest {
                 + ReclamationTestConnector.class.getName() + "\"}")
                 .getBytes(StandardCharsets.UTF_8);
         ConnectorRuntime runtime = ConnectorRuntime.create(
-                configuration, null, 1024, () -> 1);
+                configuration, null, 1024);
         try {
             IllegalStateException created = assertThrows(
                     IllegalStateException.class,
@@ -101,9 +100,9 @@ class ConnectorRuntimeTest {
         CountDownLatch release = new CountDownLatch(1);
         ShutdownWorker delayed = new ShutdownWorker("delayed-shutdown", release::await);
 
-        assertFalse(delayed.await(0));
+        assertFalse(delayed.awaitUntil(System.nanoTime(), 0));
         release.countDown();
-        assertTrue(delayed.await(Long.MAX_VALUE));
+        assertTrue(delayed.awaitUntil(System.nanoTime(), Long.MAX_VALUE));
 
         ShutdownWorker failed = new ShutdownWorker(
                 "failed-shutdown",
@@ -112,7 +111,7 @@ class ConnectorRuntimeTest {
                 });
         IllegalStateException error = assertThrows(
                 IllegalStateException.class,
-                () -> failed.await(Long.MAX_VALUE));
+                () -> failed.awaitUntil(System.nanoTime(), Long.MAX_VALUE));
         assertEquals("shutdown failed", error.getMessage());
     }
 }

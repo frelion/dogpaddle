@@ -2,10 +2,10 @@
 
 D1 is the real PostgreSQL fixture for the product `dogpaddle-debezium` crate.
 It no longer owns a Java bridge or a JNI host implementation. The small Rust
-JSONL host depends on the product crate. The build places that host, the
-product-built Debezium distribution and the pinned Temurin runtime in one
-self-contained Linux x86_64 bundle; the runner starts the host from `bin/` and
-the product loads only that bundle's JVM.
+JSONL host depends on the product crate and is built separately from the
+reusable Linux x86_64 runtime payload, which contains the product Debezium
+distribution and pinned Temurin JRE. The runner mounts both read-only into one
+process, and the product loads only the payload's JVM.
 
 The gate answers one narrow question:
 
@@ -65,7 +65,8 @@ store and restores it solely from `Checkpoint`.
 - PostgreSQL `16.15`, using `pgoutput`, one publication, and one persistent
   logical replication slot.
 - Java 17 bridge bytecode; Eclipse Temurin JRE `21.0.12.1+1` inside the runtime
-  bundle. The separate container Maven/JDK image is only a build tool.
+  payload. The D1 runner invokes the product's unchanged local-only distribution
+  builder inside its digest-pinned Maven/JDK image.
 - Linux GNU x86_64 runtime. The four-platform JVM/bridge smoke matrix is owned
   by the separate `Debezium runtime bundles` workflow; the real PostgreSQL
   fixture is intentionally not duplicated on macOS or Linux arm64.
@@ -85,19 +86,21 @@ experiments/debezium-d1/scripts/run.sh
 The command performs, in order:
 
 1. an audit of the exact upstream Debezium commit path;
-2. Rust format, unit tests, Clippy, and a release host build;
-3. the product crate's own bridge tests and distribution build;
-4. a self-contained bundle containing the D1 host, pinned Temurin runtime,
-   PostgreSQL connector, manifests, checksums, SBOMs and notices;
-5. a disposable real PostgreSQL black-box recovery matrix run with the bundle's
-   host and JVM.
+2. the product bridge tests and distribution build in the pinned Maven/JDK
+   image;
+3. Rust format, unit tests, Clippy, and a release host build;
+4. a self-contained runtime payload containing pinned Temurin, the PostgreSQL
+   connector, manifests, SBOMs and notices;
+5. a disposable real PostgreSQL black-box recovery matrix using the separately
+   built host and payload in one process.
 
 Required local tools are Rust 1.96 or newer with Clippy, Podman with a working
-Compose provider, `git`, `psql`, Python 3, `curl`, `tar`, `rg`, `unzip`, and
-`flock`. Network access is needed for the pinned source audit, Maven dependencies
-and checksum-pinned Temurin assets. A host JDK or `JAVA_HOME` is not a runtime
-requirement; D1's Maven build runs in the pinned container. Port `55432` must be
-free.
+Compose provider, `git`, `psql`, Python 3, `curl`, `tar`, `rg`, `flock`, and
+`sha256sum` or `shasum`. Network access is needed for the pinned source audit,
+Maven dependencies and checksum-pinned Temurin assets. No host JDK, Maven or
+`unzip` is required. Connector invocation clears Java-related environment and
+loader paths, so the image's Java cannot replace the payload runtime. Port
+`55432` must be free.
 
 The runner owns an exclusive fixture lock and refuses to overwrite an existing
 Compose project. Set `D1_KEEP_ARTIFACTS=1` to retain the sole checkpoint and
@@ -123,9 +126,9 @@ The real connector run must prove all of these:
 8. Rows written by one multi-row transaction retain their source order.
 9. `/state/checkpoint.bin` is the only state file; no
    `FileOffsetBackingStore` or other Java offset file exists.
-10. The executable is launched from the assembled bundle and
-    `DebeziumRuntime::open` validates and explicitly loads its bundled `libjvm`;
-    it does not select Java from the container environment.
+10. The executable and runtime payload are mounted separately;
+    `DebeziumRuntime::open` validates the payload and explicitly loads its
+    contained `libjvm`, not Java from the container environment.
 
 Within one live connector, byte-for-byte stability includes the opaque
 checkpoint and every encoded key, value, and header. Across a fresh Engine, the

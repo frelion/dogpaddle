@@ -15,8 +15,8 @@ import org.apache.kafka.connect.source.SourceRecord;
 final class DeliveryCodec implements AutoCloseable {
     static final byte[] MAGIC = "DPDBDV01".getBytes(StandardCharsets.US_ASCII);
     static final int VERSION = 1;
-    static final int MINIMUM_MAXIMUM_BYTES = 76;
-    static final int MINIMUM_BYTES_EXCLUDING_CHECKPOINT = 48;
+    static final int MINIMUM_MAXIMUM_BYTES = 68;
+    static final int MINIMUM_BYTES_EXCLUDING_CHECKPOINT = 40;
 
     private static final int CHECKSUM_BYTES = Integer.BYTES;
 
@@ -29,13 +29,9 @@ final class DeliveryCodec implements AutoCloseable {
     }
 
     byte[] encode(
-            long token,
             byte[] checkpoint,
             List<SourceRecord> records,
             int maximumBytes) {
-        if (token <= 0) {
-            throw new IllegalArgumentException("delivery token must be positive");
-        }
         if (checkpoint == null) {
             throw new IllegalArgumentException("delivery checkpoint must not be null");
         }
@@ -51,7 +47,6 @@ final class DeliveryCodec implements AutoCloseable {
             DataOutputStream output = new DataOutputStream(bytes);
             output.write(MAGIC);
             output.writeShort(VERSION);
-            output.writeLong(token);
             writeRequiredBytes(output, checkpoint);
             output.writeInt(records.size());
             for (SourceRecord record : records) {
@@ -174,15 +169,15 @@ final class DeliveryCodec implements AutoCloseable {
         return new DeliveryTooLarge(maximumBytes);
     }
 
-    static String failureKind(Throwable error) {
+    static boolean isTooLarge(Throwable error) {
         Throwable current = error;
         while (current != null) {
             if (current instanceof DeliveryTooLarge) {
-                return "delivery_too_large";
+                return true;
             }
             current = current.getCause();
         }
-        return null;
+        return false;
     }
 
     private static final class BoundedBytes extends ByteArrayOutputStream {

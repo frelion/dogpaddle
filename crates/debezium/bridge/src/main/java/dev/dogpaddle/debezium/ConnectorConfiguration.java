@@ -12,6 +12,7 @@ import java.util.Properties;
 /** Parses connector properties and owns all engine-critical configuration. */
 final class ConnectorConfiguration {
     private static final String OFFSET_STORE = DogPaddleOffsetBackingStore.class.getName();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Properties properties;
     private final String engineName;
@@ -24,10 +25,10 @@ final class ConnectorConfiguration {
         this.connectorClass = connectorClass;
     }
 
-    static ConnectorConfiguration parse(byte[] json, ObjectMapper mapper) {
+    static ConnectorConfiguration parse(byte[] json) {
         final JsonNode root;
         try {
-            root = mapper.readTree(json);
+            root = MAPPER.readTree(json);
         }
         catch (IOException error) {
             throw new IllegalArgumentException("connector configuration is not valid JSON", error);

@@ -71,27 +71,26 @@ class ReclamationTest {
         String firstName = "running-isolation-first";
         String secondName = "running-isolation-second";
         ReclamationTestConnector.Control firstControl =
-                ReclamationTestConnector.install(firstName, false, false);
+                ReclamationTestConnector.install(firstName, false, false, false);
         ReclamationTestConnector.Control secondControl =
-                ReclamationTestConnector.install(secondName, false, false);
+                ReclamationTestConnector.install(secondName, false, false, false);
         long first = 0;
         long second = 0;
         try {
             first = create(firstName);
             second = create(secondName);
-            DebeziumBridge.start(first);
-            DebeziumBridge.start(second);
-            awaitRunning(first, firstControl);
-            awaitRunning(second, secondControl);
+            assertTrue(DebeziumBridge.start(first, LIFECYCLE_TIMEOUT_MILLIS));
+            assertTrue(DebeziumBridge.start(second, LIFECYCLE_TIMEOUT_MILLIS));
+            awaitRunning(firstControl);
+            awaitRunning(secondControl);
 
             assertTrue(DebeziumBridge.stop(first, LIFECYCLE_TIMEOUT_MILLIS));
             DebeziumBridge.dispose(first);
             long disposedFirst = first;
             assertThrows(
                     IllegalArgumentException.class,
-                    () -> DebeziumBridge.status(disposedFirst));
+                    () -> DebeziumBridge.failureKind(disposedFirst));
 
-            assertStatus(second, "running", true);
             assertNull(DebeziumBridge.poll(second, 0));
             assertTrue(DebeziumBridge.stop(second, LIFECYCLE_TIMEOUT_MILLIS));
             DebeziumBridge.dispose(second);
@@ -119,15 +118,17 @@ class ReclamationTest {
             throws Exception {
         String name = "startup-failure-reclamation";
         ReclamationTestConnector.Control control =
-                ReclamationTestConnector.install(name, true, false);
+                ReclamationTestConnector.install(name, true, false, false);
         long failed = 0;
         long replacement = 0;
         try {
             failed = create(name);
-            DebeziumBridge.start(failed);
-
-            awaitStatus(failed, "failed", false);
-            assertTrue(status(failed).contains("deliberate connector startup failure"));
+            long failedHandle = failed;
+            IllegalStateException error = assertThrows(
+                    IllegalStateException.class,
+                    () -> DebeziumBridge.start(
+                            failedHandle, LIFECYCLE_TIMEOUT_MILLIS));
+            assertTrue(error.getMessage().contains("deliberate connector startup failure"));
 
             DebeziumBridge.abandon(failed);
             awaitReclaimed(failed);
@@ -152,20 +153,56 @@ class ReclamationTest {
     }
 
     @Test
+    void startup_timeout_can_be_abandoned_and_releases_the_engine_name()
+            throws Exception {
+        String name = "startup-timeout-reclamation";
+        ReclamationTestConnector.Control control =
+                ReclamationTestConnector.install(name, false, true, false);
+        long timedOut = 0;
+        long replacement = 0;
+        try {
+            timedOut = create(name);
+            assertFalse(DebeziumBridge.start(timedOut, 0));
+
+            DebeziumBridge.abandon(timedOut);
+            control.releaseStartup();
+            awaitReclaimed(timedOut);
+
+            replacement = create(name);
+            assertTrue(DebeziumBridge.stop(replacement, 0));
+            DebeziumBridge.dispose(replacement);
+        }
+        finally {
+            control.releaseStartup();
+            control.releaseTaskStop();
+            try {
+                cleanup(timedOut);
+            }
+            finally {
+                try {
+                    cleanup(replacement);
+                }
+                finally {
+                    ReclamationTestConnector.uninstall(name, control);
+                }
+            }
+        }
+    }
+
+    @Test
     void running_stop_timeout_is_retryable_and_repeated_stop_succeeds()
             throws Exception {
         String name = "running-stop-retry";
         ReclamationTestConnector.Control control =
-                ReclamationTestConnector.install(name, false, true);
+                ReclamationTestConnector.install(name, false, false, true);
         long handle = 0;
         try {
             handle = create(name);
-            DebeziumBridge.start(handle);
-            awaitRunning(handle, control);
+            assertTrue(DebeziumBridge.start(handle, LIFECYCLE_TIMEOUT_MILLIS));
+            awaitRunning(control);
 
             assertFalse(DebeziumBridge.stop(handle, 0));
             assertTrue(control.awaitTaskStopStarted(LIFECYCLE_TIMEOUT_MILLIS));
-            assertStatus(handle, "stopping", true);
 
             control.releaseTaskStop();
             assertTrue(DebeziumBridge.stop(handle, LIFECYCLE_TIMEOUT_MILLIS));
@@ -195,7 +232,7 @@ class ReclamationTest {
                 + TimeUnit.MILLISECONDS.toNanos(LIFECYCLE_TIMEOUT_MILLIS);
         while (System.nanoTime() < deadline) {
             try {
-                DebeziumBridge.status(handle);
+                DebeziumBridge.failureKind(handle);
             }
             catch (IllegalArgumentException expected) {
                 assertDoesNotThrow(() -> DebeziumBridge.dispose(handle));
@@ -203,40 +240,11 @@ class ReclamationTest {
             }
             Thread.sleep(5);
         }
-        assertThrows(IllegalArgumentException.class, () -> DebeziumBridge.status(handle));
+        assertThrows(IllegalArgumentException.class, () -> DebeziumBridge.failureKind(handle));
     }
 
-    private static void awaitRunning(
-            long handle, ReclamationTestConnector.Control control) throws Exception {
+    private static void awaitRunning(ReclamationTestConnector.Control control) throws Exception {
         assertTrue(control.awaitPollStarted(LIFECYCLE_TIMEOUT_MILLIS));
-        awaitStatus(handle, "running", true);
-    }
-
-    private static void awaitStatus(long handle, String state, boolean threadAlive)
-            throws InterruptedException {
-        long deadline = System.nanoTime()
-                + TimeUnit.MILLISECONDS.toNanos(LIFECYCLE_TIMEOUT_MILLIS);
-        while (System.nanoTime() < deadline) {
-            String observed = status(handle);
-            if (observed.contains("\"state\":\"" + state + "\"")
-                    && observed.contains("\"engine_thread_alive\":" + threadAlive)) {
-                return;
-            }
-            Thread.sleep(5);
-        }
-        assertStatus(handle, state, threadAlive);
-    }
-
-    private static void assertStatus(long handle, String state, boolean threadAlive) {
-        String observed = status(handle);
-        assertTrue(observed.contains("\"state\":\"" + state + "\""), observed);
-        assertTrue(
-                observed.contains("\"engine_thread_alive\":" + threadAlive),
-                observed);
-    }
-
-    private static String status(long handle) {
-        return new String(DebeziumBridge.status(handle), StandardCharsets.UTF_8);
     }
 
     private static void cleanup(long handle) throws InterruptedException {

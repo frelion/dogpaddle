@@ -4,7 +4,6 @@ mod bundle;
 mod checkpoint;
 mod config;
 mod connector;
-mod distribution;
 mod error;
 mod jvm;
 mod protocol;

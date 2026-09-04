@@ -1,14 +1,10 @@
 # dogpaddle-debezium
 
 `dogpaddle-debezium` embeds the stock Debezium Engine in `DogPaddle`'s Rust
-process and presents it as a small pull/ACK library. Its Rust API, checkpoint
-protocol, and Java bridge are connector-neutral: they know how to run an Engine
-and preserve Kafka Connect offsets, but they do not know Arrow, `Change`, MDBX,
-Operation, Flow, or connector-specific position types. The reference D2 bundle
-includes the `PostgreSQL` connector as its first real pilot; that packaging
-choice does not introduce a `PostgreSQL` branch into the runtime.
-
-The intended call sequence is:
+process and exposes a small connector-neutral pull/ACK API. It knows Debezium
+and Kafka Connect offsets, but not Arrow, `Change`, MDBX, Operation, Flow, or a
+connector-specific position type. `PostgreSQL` is only the first connector in the
+reference distribution.
 
 ```no_run
 use std::time::Duration;
@@ -42,160 +38,124 @@ connector.stop(Duration::from_secs(30))?;
 # }
 ```
 
-`Delivery` is a linear guard. Its records and checkpoint are ordinary owned
-Rust allocations, while its lifetime reserves exclusive access to the
-connector. `ack` consumes the guard. Dropping it never acknowledges anything;
-the same outstanding delivery can be polled again.
+`Delivery<'_>` is the outstanding-delivery capability. Its records and
+checkpoint are owned Rust allocations, but its lifetime exclusively borrows
+the connector. `ack(self)` consumes it; dropping it does not ACK, and the next
+poll returns the same outstanding bytes. There is no separate delivery token.
 
 ## Durability boundary
 
-Before Java exposes a delivery, it uses Kafka Connect's public
-`OffsetStorageWriter` with the exact offset converters used by Debezium 3.6.2
-to preview every `SourceRecord` partition/offset in the batch. It merges that
-raw delta with the complete accepted in-memory offset map and returns the
-candidate map as a versioned [`Checkpoint`](Checkpoint). Only after the caller
-has made both records and checkpoint durable does `Delivery::ack` let Debezium
-call its real `RecordCommitter`. The actual backing-store bytes must equal the
-preview.
+Before exposing a delivery, the bridge previews every record's Kafka Connect
+partition/offset with the same `OffsetStorageWriter` and converters used by the
+Engine. It merges that delta with the complete accepted offset map and returns
+the candidate map as an opaque, versioned [`Checkpoint`](Checkpoint). The
+caller must make both records and checkpoint durable before ACK. The bridge
+then runs the real Debezium committer and requires its actual offset-store
+update to equal the preview.
 
-The checkpoint is bound to the stable Engine `name` and connector class. It is
-opaque to Rust and can contain multiple Kafka Connect source partitions. It is
-an offset-store image, not a delivery ID and not a `PostgreSQL` LSN.
-`Checkpoint::from_bytes` is for reopening bytes previously emitted by this
-exact bridge protocol, not for synthesizing connector offsets by hand.
+The checkpoint is bound to the stable Engine name and connector class. It can
+contain multiple source partitions; it is neither a delivery ID nor a
+`PostgreSQL` LSN. Keep the Engine name stable across restart and never reuse it
+for another logical source. A fresh Engine restores only from checkpoint bytes;
+the bridge does not maintain a Java offset file.
 
-The Engine `name` is therefore durable source identity, not a display label.
-Keep it stable across restarts and never reuse it for a different database,
-replication slot, or logical source. Starting with a checkpoint whose name or
-connector class differs fails before an Engine is created.
+ACK success means that the Engine handler settled and the offset-store image
+matched. It does not mean that every connector has synchronously published an
+external progress marker. With Debezium 3.6.2, `PostgreSQL` may expose
+`confirmed_flush_lsn` during a later poll or stop. That lag is a WAL-retention
+and monitoring concern covered by the real-connector gate, not part of the
+durability decision.
 
-An ACK proves that Debezium's handler settled and that the runtime's actual
-Kafka Connect offset-store write exactly matched the checkpoint returned before
-the ACK. It does not promise that every connector has synchronously published
-its own external progress marker. In Debezium 3.6.2, `PostgreSQL` schedules its
-`confirmed_flush_lsn` update from `SourceTask.commit()`; a healthy task is
-expected to perform and eventually expose the flush at the beginning of a
-subsequent poll (or during stop). That observation is not part of ACK success.
-Generic Debezium task commit failures may also be reported internally rather
-than thrown through the Engine handler. The persisted checkpoint remains the
-recovery boundary; lag in connector-specific external progress is an
-operational/WAL-retention concern and is covered by the real-connector gate.
+Some connectors also need durable schema history. The `PostgreSQL` pilot does
+not; this crate does not claim that offsets alone restore every connector.
 
-Some Debezium connectors also require durable schema history. The first
-`PostgreSQL` pilot does not; this crate does not yet claim that its offset
-checkpoint alone is sufficient for every connector.
+## Runtime bundle
 
-## Runtime and packaging
-
-`DebeziumRuntime::open` accepts the root of a self-contained, platform-specific
-bundle. It loads `libjvm` by its validated absolute path; it never searches
-`PATH`, `JAVA_HOME`, `JDK_HOME`, or a system Java installation. One OS process
-still has at most one `HotSpot` JVM. Reopening the same canonical bundle reuses it
-only when the validated contents are unchanged; a different path or contents
-fail explicitly. `DogPaddle` must be the first and only JVM initializer during
-process startup; another JNI component must neither initialize a JVM first nor
-race `open`.
+`DebeziumRuntime::open` accepts one platform-specific runtime payload and loads
+its contained `libjvm` by validated absolute path. It never searches `PATH`,
+`JAVA_HOME`, `JDK_HOME`, or a system Java installation. One process has at most
+one `HotSpot` JVM; reopening the same canonical bundle path reuses it, while a
+different path fails.
 
 ```text
 dogpaddle-debezium-runtime-<target>/
 ├── MANIFEST
-├── SHA256SUMS
 ├── runtime-sbom.json
 ├── TEMURIN-NOTICE.md
 ├── runtime/              # pinned Eclipse Temurin JRE
-├── debezium/             # bridge, connector and dependency JARs
-└── bin/                  # optional native host executable(s)
+└── debezium/             # bridge, connector and dependency JARs
 ```
 
-Before starting the JVM, the runtime verifies the exact bundle manifest,
-platform target, complete regular-file inventory and every SHA-256 digest. It
-then validates the nested Debezium distribution and performs the bridge
-protocol handshake. Install the bundle in a directory that untrusted users
-cannot modify and treat it as immutable from before `open` until process exit;
-the JVM and classloader necessarily reopen validated paths later. These checks
-fail closed on incomplete, mixed or corrupted bundles; they do not replace
-release signing or artifact provenance.
+`open` checks the exact target manifest, Temurin release metadata, required
+runtime/security/legal resources, the nested distribution's exact JAR set and
+hashes, and that `libjvm` resolves inside the bundle. It deliberately does not
+traverse and hash the whole JRE on every process start. The emitted archive
+digest and a trusted, immutable installation are the integrity boundary;
+runtime preflight is not release signing or provenance verification. Install
+the extracted payload where untrusted users cannot modify it and keep it
+unchanged until process exit.
 
-The builder currently supports exactly:
+Supported payload targets are:
 
 - `x86_64-unknown-linux-gnu`;
 - `aarch64-unknown-linux-gnu`;
 - `x86_64-apple-darwin`;
 - `aarch64-apple-darwin`.
 
-Linux means GNU/glibc, not musl or Alpine. The macOS archives are unsigned
-development artifacts. Public macOS distribution still requires a Developer
-ID signature and Apple notarization; that release gate belongs to D5.
-The native bundle CI currently proves Ubuntu 24.04 and macOS 15. A lower
-glibc/macOS deployment baseline and the native host's complete dynamic-library
-closure are D5 release decisions, not broader compatibility claims in D2.
+Linux means GNU/glibc, not musl or Alpine. The current CI proves Ubuntu 24.04
+and macOS 15. macOS archives are unsigned development artifacts; deployment
+baselines, native dependency closure, signing and notarization remain D5 work.
 
-Normal `cargo build`, `cargo test` and `cargo xtask check` never invoke Maven,
-download Java artifacts or require a local Java installation. Building a
-bundle is an explicit release/development action. First build the pinned Java
-distribution:
+Normal Cargo gates never invoke Maven, download Java artifacts, or require a
+JDK. Bundle construction is explicit. First use a local JDK and Maven to build
+and test the pinned Java distribution:
 
 ```bash
 crates/debezium/scripts/build-distribution.sh
 ```
 
-The default Maven mode is `auto`: it prefers a running Podman or Docker engine
-with the digest-pinned Maven/JDK image and otherwise uses local `mvn` plus a
-JDK. Select the path explicitly with `DOGPADDLE_MAVEN_MODE=container` or
-`DOGPADDLE_MAVEN_MODE=local`. The build runs the Java component tests, emits
-the nested Debezium `CycloneDX` BOM and checksums, and rejects a bridge JAR that
-shadows any `io.debezium` class.
-
-Then assemble a runtime-only archive for one supported target:
+Then build one runtime payload:
 
 ```bash
 crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
 ```
 
-An application can place its already-built native executable in the same
-archive without changing the runtime format:
+The second script verifies checksum-pinned Temurin assets, normalizes the JRE,
+adds the Java distribution and notices, and emits a `.tar.gz` plus its digest
+under `bridge/target/bundles/`. It requires `curl`, `tar`, Python 3 with secure
+tar extraction filters, and `sha256sum` or `shasum`.
 
-```bash
-crates/debezium/scripts/build-runtime-bundle.sh \
-  x86_64-unknown-linux-gnu \
-  target/release/my-host \
-  my-host
-```
+The payload intentionally contains no native host or `bin/` packaging contract.
+`DogPaddle`'s future release packager will combine the real application
+executable with this reusable runtime payload. The D1 `PostgreSQL` gate already
+keeps its diagnostic host separate and mounts both into one test process.
 
-The script downloads the exact checksum-pinned Temurin JRE and its upstream
-`CycloneDX` SBOM, verifies the JRE release metadata, validates the complete
-nested distribution, rejects a native host for the wrong OS/architecture,
-normalizes the runtime tree, preserves notices, and emits
-`.tar.gz` plus an archive checksum under `bridge/target/bundles/`. This
-explicit bundle step requires `curl`, `tar`, Python 3, and either `sha256sum`
-or `shasum`; none is a runtime dependency. This
-repository does not yet contain `DogPaddle`'s final application binary, so the
-runtime-only archive and optional-host form are the reusable packaging
-mechanism rather than a claim that a final CLI has shipped.
+## Runtime constraints
 
-The `PostgreSQL` D1 fixture packages its Rust host through this same optional
-`bin/` path and runs it against the bundled JVM. It does not carry another JNI
-host, Java bridge, offset store, or system-Java fallback.
+The private JNI surface is synchronous: `start(handle, timeout)` either reaches
+polling or fails, while poll, ACK and stop have explicit deadlines. Java
+exceptions carry ordinary failures; the narrow `failureKind(handle)` query only
+distinguishes an oversized delivery after a failed poll. There is no status
+JSON protocol. The development-v1 delivery wire (`DPDBDV01`, version `1`)
+contains only the checkpoint and ordered records; linear Rust borrowing supplies
+the outstanding capability. This layout replaces the earlier unshipped v1
+bytes without compatibility or migration; rebuild old development bundles and
+discard saved test fixtures.
 
-The runtime currently fixes one task, one outstanding delivery, ordered batch
-handling, no Debezium SMTs, and a caller-selected encoded delivery bound. These
-are correctness constraints, not a generic Source framework. The bound limits
-the completed bridge frame copied over JNI and is checked before Rust allocates
-it; it is not a total JVM heap quota because Kafka Connect conversion can first
-materialize individual field values. Size the JVM independently and treat a
-too-large delivery as a terminal connector error that requires reconfiguration
-and restart.
+The runtime fixes one task, one outstanding delivery, ordered batches, no SMTs,
+and a caller-selected encoded-delivery bound. The bound limits the completed
+frame copied over JNI, not total JVM heap use. An oversized delivery is a
+terminal connector error requiring reconfiguration and restart.
 
-Call `Connector::stop` for deterministic shutdown and handle its deadline.
-Dropping a `Delivery` never ACKs it. Dropping a `Connector` starts best-effort,
-non-blocking cleanup so Rust destructors cannot hang; applications that need to
-reuse the same Engine name immediately must stop explicitly first.
+Use `Connector::stop` for deterministic shutdown. Dropping a connector starts
+best-effort non-blocking cleanup; a caller that must reuse the same Engine name
+immediately should stop it explicitly.
 
 ## Version boundary
 
-The current bridge pins Debezium `3.6.2.Final`, Kafka Connect `4.3.0`, Java 17
+The bridge pins Debezium `3.6.2.Final`, Kafka Connect `4.3.0`, Java 17
 bytecode, Eclipse Temurin JRE `21.0.12.1+1`, and `jni-rs` `0.22.4`. Offset
-conversion, checkpoint framing, bridge framing, JVM bundle layout and ACK
-behavior are version-reviewed boundaries. Upgrades require
-preview-versus-actual, restore, JNI, native-platform bundle and real connector
-regression gates.
+conversion, checkpoint framing, delivery wire, JNI commands, bundle layout and
+ACK semantics are reviewed version boundaries. Upgrades require
+preview-versus-actual, restore, native-bundle and real-connector regression
+gates.

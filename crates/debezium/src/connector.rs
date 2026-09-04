@@ -171,10 +171,7 @@ impl Connector {
     /// Returns an error for an invalid duration, connector failure, malformed
     /// bridge response, or use after stop or an uncertain ACK.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<Delivery<'_>>, Error> {
-        self.ensure_usable()?;
-        let handle = self.handle.ok_or_else(|| {
-            Error::new(ErrorKind::ConnectorFailed, "connector has already stopped")
-        })?;
+        let handle = self.usable_handle()?;
         let polled = self.host.poll(handle, timeout, self.max_delivery_bytes);
         let Some(bytes) = (match polled {
             Ok(bytes) => bytes,
@@ -209,7 +206,6 @@ impl Connector {
         }
         Ok(Some(Delivery {
             connector: self,
-            token: decoded.token,
             checkpoint: decoded.checkpoint,
             records: decoded.records,
         }))
@@ -235,32 +231,24 @@ impl Connector {
         Ok(())
     }
 
-    fn acknowledge(&mut self, token: i64) -> Result<(), Error> {
-        self.ensure_usable()?;
-        let handle = self.handle.ok_or_else(|| {
-            Error::new(ErrorKind::ConnectorFailed, "connector has already stopped")
-        })?;
-        if let Err(error) = self.host.ack(handle, token, ACK_TIMEOUT) {
+    fn acknowledge(&mut self) -> Result<(), Error> {
+        let handle = self.usable_handle()?;
+        if let Err(error) = self.host.ack(handle, ACK_TIMEOUT) {
             self.poisoned = true;
             return Err(error);
         }
         Ok(())
     }
 
-    fn ensure_usable(&self) -> Result<(), Error> {
+    fn usable_handle(&self) -> Result<i64, Error> {
         if self.poisoned {
             return Err(Error::new(
                 ErrorKind::ConnectorFailed,
                 "connector is unusable after an uncertain ACK or bridge protocol failure; stop it and restart from the persisted checkpoint",
             ));
         }
-        if self.handle.is_none() {
-            return Err(Error::new(
-                ErrorKind::ConnectorFailed,
-                "connector has already stopped",
-            ));
-        }
-        Ok(())
+        self.handle
+            .ok_or_else(|| Error::new(ErrorKind::ConnectorFailed, "connector has already stopped"))
     }
 }
 
@@ -280,7 +268,6 @@ impl Drop for Connector {
 #[must_use = "dropping a delivery leaves it unacknowledged"]
 pub struct Delivery<'connector> {
     connector: &'connector mut Connector,
-    token: i64,
     checkpoint: Checkpoint,
     records: Box<[Record]>,
 }
@@ -312,7 +299,7 @@ impl Delivery<'_> {
     /// outstanding batch or its actual offset state differs from the pre-ACK
     /// checkpoint.
     pub fn ack(self) -> Result<(), Error> {
-        self.connector.acknowledge(self.token)
+        self.connector.acknowledge()
     }
 }
 

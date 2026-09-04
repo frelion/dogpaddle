@@ -14,7 +14,6 @@ bench = false
 [dependencies]
 crc32fast.workspace = true
 jni.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 

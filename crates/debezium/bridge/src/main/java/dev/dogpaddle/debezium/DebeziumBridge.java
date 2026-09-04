@@ -15,8 +15,10 @@ import javax.net.ssl.TrustManagerFactory;
 /** The connector-neutral, pull-based JNI surface used by the Rust runtime. */
 public final class DebeziumBridge {
     private static final AtomicLong NEXT_HANDLE = new AtomicLong(1);
-    private static final AtomicLong NEXT_DELIVERY_TOKEN = new AtomicLong(1);
     private static final Map<Long, ConnectorRuntime> RUNTIMES = new ConcurrentHashMap<>();
+
+    static final int FAILURE_NONE = 0;
+    static final int FAILURE_DELIVERY_TOO_LARGE = 1;
 
     private DebeziumBridge() {
     }
@@ -47,17 +49,16 @@ public final class DebeziumBridge {
         ConnectorRuntime runtime = ConnectorRuntime.create(
                 configurationJson,
                 checkpoint,
-                maximumDeliveryBytes,
-                DebeziumBridge::nextDeliveryToken);
+                maximumDeliveryBytes);
         if (RUNTIMES.putIfAbsent(handle, runtime) != null) {
             throw new IllegalStateException("connector handle collision");
         }
         return handle;
     }
 
-    /** Starts a connector handle exactly once. */
-    public static void start(long handle) {
-        runtime(handle).start();
+    /** Starts a connector handle exactly once and waits for polling to begin. */
+    public static boolean start(long handle, long timeoutMillis) {
+        return runtime(handle).start(timeoutMillis);
     }
 
     /** Returns one encoded delivery or {@code null} on an ordinary timeout. */
@@ -66,13 +67,13 @@ public final class DebeziumBridge {
     }
 
     /**
-     * Acknowledges the exact outstanding delivery token.
+     * Acknowledges the outstanding delivery.
      *
      * @return {@code true} after the handler and offset commit settle, or
      *         {@code false} when only the supplied deadline expires
      */
-    public static boolean ack(long handle, long token, long timeoutMillis) {
-        return runtime(handle).ack(token, timeoutMillis);
+    public static boolean ack(long handle, long timeoutMillis) {
+        return runtime(handle).ack(timeoutMillis);
     }
 
     /**
@@ -104,13 +105,9 @@ public final class DebeziumBridge {
         }
     }
 
-    /** Returns UTF-8 JSON diagnostics for startup and error reporting. */
-    public static byte[] status(long handle) {
-        return runtime(handle).status();
-    }
-
-    static long nextDeliveryToken() {
-        return nextPositive(NEXT_DELIVERY_TOKEN, "delivery token");
+    /** Returns the stable failure classification for a connector handle. */
+    public static int failureKind(long handle) {
+        return runtime(handle).failureKind();
     }
 
     static long nextPositive(AtomicLong sequence, String description) {

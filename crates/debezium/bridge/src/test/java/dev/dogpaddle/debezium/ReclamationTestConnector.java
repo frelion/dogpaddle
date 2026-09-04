@@ -8,6 +8,8 @@ import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.source.SourceConnector;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
 
 /** A controllable connector used only by bridge lifecycle tests. */
 public final class ReclamationTestConnector extends SourceConnector {
@@ -21,6 +23,7 @@ public final class ReclamationTestConnector extends SourceConnector {
     public void start(Map<String, String> properties) {
         controlName = properties.get("name");
         Control control = control(controlName);
+        control.awaitStartupRelease();
         if (control.failStartup) {
             throw new IllegalStateException("deliberate connector startup failure");
         }
@@ -28,7 +31,7 @@ public final class ReclamationTestConnector extends SourceConnector {
 
     @Override
     public Class<? extends Task> taskClass() {
-        return ReclamationTestTask.class;
+        return TestTask.class;
     }
 
     @Override
@@ -50,8 +53,9 @@ public final class ReclamationTestConnector extends SourceConnector {
         return "test";
     }
 
-    static Control install(String name, boolean failStartup, boolean blockTaskStop) {
-        Control control = new Control(failStartup, blockTaskStop);
+    static Control install(
+            String name, boolean failStartup, boolean blockStartup, boolean blockTaskStop) {
+        Control control = new Control(failStartup, blockStartup, blockTaskStop);
         if (CONTROLS.putIfAbsent(name, control) != null) {
             throw new IllegalStateException("test control already exists for " + name);
         }
@@ -76,10 +80,12 @@ public final class ReclamationTestConnector extends SourceConnector {
         private final boolean failStartup;
         private final CountDownLatch pollStarted = new CountDownLatch(1);
         private final CountDownLatch taskStopStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseStartup;
         private final CountDownLatch releaseTaskStop;
 
-        private Control(boolean failStartup, boolean blockTaskStop) {
+        private Control(boolean failStartup, boolean blockStartup, boolean blockTaskStop) {
             this.failStartup = failStartup;
+            releaseStartup = new CountDownLatch(blockStartup ? 1 : 0);
             releaseTaskStop = new CountDownLatch(blockTaskStop ? 1 : 0);
         }
 
@@ -99,11 +105,27 @@ public final class ReclamationTestConnector extends SourceConnector {
             taskStopStarted.countDown();
         }
 
+        void awaitStartupRelease() {
+            await(releaseStartup);
+        }
+
         void awaitTaskStopRelease() {
+            await(releaseTaskStop);
+        }
+
+        void releaseStartup() {
+            releaseStartup.countDown();
+        }
+
+        void releaseTaskStop() {
+            releaseTaskStop.countDown();
+        }
+
+        private static void await(CountDownLatch latch) {
             boolean interrupted = false;
             while (true) {
                 try {
-                    releaseTaskStop.await();
+                    latch.await();
                     break;
                 }
                 catch (InterruptedException error) {
@@ -114,9 +136,33 @@ public final class ReclamationTestConnector extends SourceConnector {
                 Thread.currentThread().interrupt();
             }
         }
+    }
 
-        void releaseTaskStop() {
-            releaseTaskStop.countDown();
+    /** Public because Kafka Connect creates task classes reflectively. */
+    public static final class TestTask extends SourceTask {
+        private Control control;
+
+        @Override
+        public String version() {
+            return "test";
+        }
+
+        @Override
+        public void start(Map<String, String> properties) {
+            control = ReclamationTestConnector.control(properties.get(CONTROL_NAME));
+        }
+
+        @Override
+        public List<SourceRecord> poll() throws InterruptedException {
+            control.pollStarted();
+            Thread.sleep(Long.MAX_VALUE);
+            return List.of();
+        }
+
+        @Override
+        public void stop() {
+            control.taskStopStarted();
+            control.awaitTaskStopRelease();
         }
     }
 }

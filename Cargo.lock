@@ -1131,7 +1131,6 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "jni",
- "serde",
  "serde_json",
  "sha2",
  "tempfile",

@@ -3,7 +3,6 @@ package dev.dogpaddle.debezium;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 import java.util.stream.Stream;
@@ -12,8 +11,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 class ConnectorConfigurationTest {
-    private final ObjectMapper mapper = new ObjectMapper();
-
     @Test
     void configuration_forces_the_bridge_owned_engine_settings() {
         ConnectorConfiguration configuration = parse(
@@ -82,6 +79,6 @@ class ConnectorConfigurationTest {
     }
 
     private ConnectorConfiguration parse(String json) {
-        return ConnectorConfiguration.parse(json.getBytes(StandardCharsets.UTF_8), mapper);
+        return ConnectorConfiguration.parse(json.getBytes(StandardCharsets.UTF_8));
     }
 }

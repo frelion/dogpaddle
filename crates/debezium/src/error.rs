@@ -4,8 +4,8 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// The runtime distribution is missing or malformed.
-    InvalidDistribution,
+    /// The self-contained runtime bundle is missing or malformed.
+    InvalidBundle,
     /// A process JVM already exists with incompatible settings.
     JvmConfigurationConflict,
     /// Connector properties are incomplete or reserved by the runtime.

@@ -5,7 +5,7 @@ use crate::checkpoint::MAX_BINDING_BYTES;
 use crate::{Checkpoint, Error, ErrorKind};
 
 const DEFAULT_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
-const DELIVERY_BYTES_OUTSIDE_CHECKPOINT: usize = 48;
+const DELIVERY_BYTES_OUTSIDE_CHECKPOINT: usize = 40;
 const EMPTY_CHECKPOINT_FIXED_BYTES: usize = 26;
 
 /// Connector-neutral properties for one embedded Debezium Engine.

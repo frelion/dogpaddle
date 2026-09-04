@@ -22,12 +22,8 @@ final class OffsetStoreRegistry {
     private OffsetStoreRegistry() {
     }
 
-    static Entry register(String engineName, String connectorClass, Checkpoint checkpoint) {
-        Checkpoint initial = checkpoint == null
-                ? new Checkpoint(engineName, connectorClass, Map.of())
-                : checkpoint;
-        initial.requireBinding(engineName, connectorClass);
-        Entry created = new Entry(initial);
+    static Entry register(String engineName, Checkpoint checkpoint) {
+        Entry created = new Entry(checkpoint);
         if (ENTRIES.putIfAbsent(engineName, created) != null) {
             throw new IllegalArgumentException(
                     "a Debezium engine named '" + engineName + "' already exists");
@@ -53,7 +49,6 @@ final class OffsetStoreRegistry {
 
     static final class Entry {
         private Checkpoint current;
-        private long version;
         private boolean attached;
         private boolean started;
         private PreparedCheckpoint expectedCommit;
@@ -103,7 +98,6 @@ final class OffsetStoreRegistry {
                     current.engineName(), records);
             Checkpoint candidate = current.merge(delta);
             return new PreparedCheckpoint(
-                    version,
                     Collections.unmodifiableMap(new TreeMap<>(delta)),
                     candidate,
                     CheckpointCodec.encode(candidate));
@@ -113,9 +107,6 @@ final class OffsetStoreRegistry {
             requireStarted();
             if (expectedCommit != null) {
                 throw new IllegalStateException("an offset commit is already armed");
-            }
-            if (prepared.baseVersion() != version) {
-                throw new IllegalStateException("offset checkpoint became stale before ACK");
             }
             Checkpoint recalculated = current.merge(prepared.delta());
             if (!recalculated.equals(prepared.checkpoint())) {
@@ -136,16 +127,12 @@ final class OffsetStoreRegistry {
                 throw new IllegalStateException(
                         "Debezium offset write differs from the pre-ACK checkpoint preview");
             }
-            if (version != expected.baseVersion()) {
-                throw new IllegalStateException("offset checkpoint changed during ACK");
-            }
             Checkpoint candidate = current.merge(actual);
             if (!candidate.equals(expected.checkpoint())) {
                 throw new IllegalStateException(
                         "Debezium offset write produced a different complete checkpoint");
             }
             current = candidate;
-            version = Math.incrementExact(version);
             expectedCommit = null;
         }
 
@@ -160,8 +147,7 @@ final class OffsetStoreRegistry {
                 throw new IllegalStateException(
                         "Debezium did not commit the pre-ACK checkpoint");
             }
-            long expectedVersion = Math.incrementExact(prepared.baseVersion());
-            if (version != expectedVersion || !current.equals(prepared.checkpoint())) {
+            if (!current.equals(prepared.checkpoint())) {
                 throw new IllegalStateException(
                         "Debezium committed a different checkpoint than the pre-ACK preview");
             }
@@ -218,18 +204,8 @@ final class OffsetStoreRegistry {
     }
 
     record PreparedCheckpoint(
-            long baseVersion,
             Map<RawBytes, RawBytes> delta,
             Checkpoint checkpoint,
             byte[] encoded) {
-
-        PreparedCheckpoint {
-            encoded = encoded.clone();
-        }
-
-        @Override
-        public byte[] encoded() {
-            return encoded.clone();
-        }
     }
 }

@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237"
-
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 crate_dir="$(cd -- "$script_dir/.." && pwd)"
 bridge_dir="$crate_dir/bridge"
 distribution_dir="$bridge_dir/target/distribution"
 
-for command in awk cp dirname grep id mkdir rm unzip; do
+for command in awk cp dirname grep jar java mkdir mvn rm; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "missing required command: $command" >&2
     exit 1
@@ -28,77 +26,11 @@ sha256_file() {
   fi
 }
 
-run_local_maven() {
-  local executable="${DOGPADDLE_MAVEN_EXECUTABLE:-mvn}"
-  if ! command -v "$executable" >/dev/null 2>&1; then
-    echo "missing Maven executable: $executable" >&2
-    exit 1
-  fi
-  if ! command -v java >/dev/null 2>&1; then
-    echo 'a JDK is required to build the Java bridge locally' >&2
-    exit 1
-  fi
-  "$executable" --version
-  (
-    cd -- "$bridge_dir"
-    "$executable" --batch-mode --no-transfer-progress clean package
-  )
-}
-
-run_container_maven() {
-  local engine="$1"
-  local volume="$bridge_dir:/workspace:Z"
-  local host_uid
-  local host_gid
-  local -a ownership_args
-  host_uid="$(id -u)"
-  host_gid="$(id -g)"
-  ownership_args=(--user "$host_uid:$host_gid")
-  if [[ "$engine" == "podman" ]]; then
-    if [[ "$(podman info --format '{{.Host.Security.Rootless}}')" == "true" ]]; then
-      ownership_args=(--userns=keep-id --user "$host_uid:$host_gid")
-    fi
-  fi
-  "$engine" run --rm \
-    "${ownership_args[@]}" \
-    --env HOME=/tmp/dogpaddle-maven-home \
-    --env MAVEN_CONFIG=/tmp/dogpaddle-maven-home/.m2 \
-    --volume "$volume" \
-    --workdir /workspace \
-    "$MAVEN_IMAGE" \
-    sh -eu -c \
-    'mkdir -p "$HOME/.m2/repository" && exec mvn --batch-mode --no-transfer-progress -Dmaven.repo.local="$HOME/.m2/repository" clean package'
-}
-
-maven_mode="${DOGPADDLE_MAVEN_MODE:-auto}"
-case "$maven_mode" in
-  local)
-    run_local_maven
-    ;;
-  container)
-    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-      run_container_maven podman
-    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      run_container_maven docker
-    else
-      echo 'DOGPADDLE_MAVEN_MODE=container requires a running Podman or Docker engine' >&2
-      exit 1
-    fi
-    ;;
-  auto)
-    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-      run_container_maven podman
-    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      run_container_maven docker
-    else
-      run_local_maven
-    fi
-    ;;
-  *)
-    echo "unsupported DOGPADDLE_MAVEN_MODE: $maven_mode" >&2
-    exit 1
-    ;;
-esac
+mvn --version
+(
+  cd -- "$bridge_dir"
+  mvn --batch-mode --no-transfer-progress clean package
+)
 
 rm -rf -- "$distribution_dir"
 mkdir -p -- "$distribution_dir/lib"
@@ -114,12 +46,13 @@ cp -- "$bridge_dir/target/bom.json" "$distribution_dir/bom.json"
 
 (
   cd -- "$distribution_dir"
+  export LC_ALL=C
   for jar in lib/*.jar; do
     printf '%s  %s\n' "$(sha256_file "$jar")" "$jar"
   done
 ) >"$distribution_dir/SHA256SUMS"
 
-if unzip -Z1 "$distribution_dir/lib/dogpaddle-debezium-bridge.jar" \
+if jar tf "$distribution_dir/lib/dogpaddle-debezium-bridge.jar" \
   | grep '^io/debezium/' >/dev/null; then
   echo 'bridge artifact must not contain copied or shadowed io.debezium classes' >&2
   exit 1

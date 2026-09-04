@@ -9,9 +9,9 @@
 截至 2026-09-04，D0 与 D1 已完成，D1 结论为 **GREEN**；可重复证据见
 [`experiments/debezium-d1/D1_REPORT.md`](experiments/debezium-d1/D1_REPORT.md)。D1 已由 owner
 合并。多 agent 对抗审查随后将原 D2/D3 重排：先把 Debezium 做成独立、窄小的产品组件，
-再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 的实现与验收记录见
-[PR #12](https://github.com/frelion/dogpaddle/pull/12)；其中 runtime 又收紧为携带固定 Temurin JRE、
-不回退系统 Java 的四平台自包含 bundle。合并后由 GitHub #5 自动关闭。
+再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。尚未合并的 D2 实现与验收
+记录见 [PR #12](https://github.com/frelion/dogpaddle/pull/12)；其中 runtime 又收紧为携带固定
+Temurin JRE、不回退系统 Java 的四平台 payload。合并后由 GitHub #5 自动关闭。
 
 ## 目标与成功定义
 
@@ -32,9 +32,9 @@ WAL，而是同时满足：
 | --- | --- |
 | 宿主 | Rust 是主进程与生命周期协调者；Java 不反向调用 Flow |
 | JVM | 每个 OS 进程至多一个内嵌 HotSpot JVM，多个 connector engine 共享 |
-| 发布形态 | 一个原生进程、一个自包含目录归档；显式加载 bundle 内 `libjvm`，不依赖系统 Java |
+| 发布形态 | 一个原生进程；D2 交付可复用 runtime payload，最终 packager 再与应用 executable 组合 |
 | Debezium | 使用上游 stock Debezium Engine 和公开 SPI，不 fork、不替换内部类 |
-| 边界 | Rust 通过窄公共 API 主动 `start/poll/ack/stop`；JNI handle、token 与 status 仅属私有实现 |
+| 边界 | Rust 通过窄公共 API 主动 `start/poll/ack/stop`；JNI handle 与 Java bridge 仅属私有实现 |
 | 持久真相 | D3 起 MDBX 保存 opaque connector partition/offset；Java 文件不是第二份 durable offset |
 | 试点 | PostgreSQL 是第一个 connector 试点，不是通用 API 的特例 |
 | Snapshot | 初始 snapshot/generation 单独放在 D6；D1–D5 先证明持续流与恢复 |
@@ -45,16 +45,16 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 ## 术语与责任
 
 - **JVM host**：Rust 中创建并保持进程级 `JavaVM` 的部分。
-- **runtime bundle**：绑定一个原生 target 的完整目录，包含 Temurin JRE、Debezium
-  distribution、manifest/checksum/SBOM/notice，并可选包含宿主 `bin/`。
+- **runtime payload**：绑定一个原生 target 的目录，包含 Temurin JRE、Debezium distribution、
+  target manifest、SBOM 与 notices；不定义宿主 executable 或 `bin/` 布局。
 - **Java bridge**：极薄的 connector-neutral Java 封装；在 Java 线程上运行 stock Engine，
   并向 Rust 提供有界、拥有型字节交付。
 - **Connector**：`dogpaddle-debezium` 暴露的线性 Rust 生命周期对象；它可以启动和轮询
   Engine，但不知道 Flow 或 MDBX。
 - **durable ingress**：外部世界与 Flow 事务之间的持久交接点。
 - **connector**：PostgreSQL、MySQL 等 Debezium 数据源实现；不等于 JVM 或 bridge。
-- **delivery**：可被单独 ACK 的一个批次，含 records 与 ACK 前候选 checkpoint；Java token
-  只是 run-local 私有能力，不是 durable ID。每个 connector 同时至多一个 outstanding delivery。
+- **delivery**：可被单独 ACK 的一个批次，含 records 与 ACK 前候选 checkpoint。线性 Rust
+  `Delivery` 是唯一 outstanding capability；每个 connector 同时至多一个。
 
 ## 不可破坏的跨阶段边界
 
@@ -83,16 +83,16 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 ## 版本、构建与许可证策略
 
 - D1/D2 精确锁定 Debezium `3.6.2.Final`、Kafka Connect `4.3.0`、`jni-rs 0.22.4`、
-  Java 17 bytecode 和发行时 Eclipse Temurin JRE `21.0.12.1+1`；PostgreSQL 16 fixture、
-  container Maven/JDK 镜像、Temurin 四平台 archive 与 SBOM 都以 digest 或 SHA-256 锁定。
+  Java 17 bytecode 和发行时 Eclipse Temurin JRE `21.0.12.1+1`；PostgreSQL 16 fixture、Temurin
+  四平台 archive 与 SBOM 都以 digest 或 SHA-256 锁定。Java distribution 只用本机 Maven/JDK 构建。
 - JAR 与 JRE 不提交进 Git。Rust 依赖由 Cargo.lock 固定；Java 依赖由 POM/BOM 中的精确版本
-  解析，发行脚本校验上游 Temurin archive/SBOM，并为完整 bundle 生成 checksum。stock Debezium
+  解析，发行脚本校验上游 Temurin archive/SBOM 并为输出 archive 生成 digest。stock Debezium
   源码审计同时锁定 tag 和 commit；这里不虚构仓库里并不存在的 Maven lockfile。
 - 不自动跟随 Debezium、Kafka Connect、JDK、JNI 或 connector 版本。任一升级都必须单独 PR，
   重跑 source audit、bridge/JNI、offset/ACK、真实 connector 与 crash/reopen gate。
-- D2 自包含 bundle 支持 Linux GNU 与 macOS 的 x86_64/aarch64 四个 target；运行时显式加载
-  bundle 内 `libjvm`，没有 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java fallback。Linux 不承诺
-  musl/Alpine。普通 Cargo gate 不下载 Java；bundle 是独立的显式构建。
+- D2 runtime payload 支持 Linux GNU 与 macOS 的 x86_64/aarch64 四个 target；运行时显式加载
+  payload 内 `libjvm`，没有 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java fallback。Linux 不承诺
+  musl/Alpine。普通 Cargo gate 不下载 Java；payload 是独立的显式构建。
 - D2 的开发/验收 bundle 生成 Debezium transitive SBOM，保存 Temurin 上游 SBOM、artifact checksum、
   runtime notices 与源码引用。它们是审查输入，不等于正式许可证或安全审查。macOS 开发包目前
   未签名；Developer ID 签名、notarization、CVE 与升级 rehearsal 统一属于 D5 发布门。
@@ -154,54 +154,33 @@ D1 report 和 Git 中，不再形成第二套产品实现。
 ### 边界
 
 D1 被接受时是隔离在 `experiments/debezium-d1/` 中的可行性试验，不依赖 DogPaddle Change、Store、
-Operation 或 Flow，不进入产品 crate。它使用 `snapshot.mode=no_data`；缺省使用
-`MemoryOffsetBackingStore`，也可为黑盒试验显式透传 `FileOffsetBackingStore` 配置。两者
-都只用来证明 stock Engine 可控，**不声明 DogPaddle 进程重启恢复**。
+Operation 或 Flow，不进入产品 crate。它只用 `snapshot.mode=no_data` 证明 stock Engine 可控，
+**不声明 DogPaddle 进程重启恢复**。迁移后的 fixture 不再拥有 offset store，只用产品 checkpoint。
 
 ### 历史交付
 
-- `experiments/debezium-d1/bridge/`：Maven 管理的薄 Java bridge，使用 stock Debezium
-  `3.6.2.Final`，生成 Java 17 bytecode，以 JDK 21 作为固定运行基线；
-- `experiments/debezium-d1/host/`：独立 Cargo host，使用 `jni-rs` `0.22.x`
-  Invocation API 创建 JVM；
-- connector-neutral 静态 API：
+最初的隔离 spike 用私有 handle、token 和 status 证明 stock Engine 的 pull/ACK 方向可行；这些
+接口没有成为产品契约。完成 D2 重用后，D1 只保留独立 Rust JSONL host 与可重复 PostgreSQL
+fixture，全部 Engine/JNI/offset 逻辑都来自 `dogpaddle-debezium`。host 会生成一个仅供黑盒命令
+配对的 run-local diagnostic token；它不进入产品 API 或 delivery wire，也不是 durable ID。
 
-  ```text
-  create(config_bytes) -> handle
-  start(handle)
-  poll(handle, timeout, max_bytes) -> owned_bytes | timeout | status
-  ack(handle, token)
-  status(handle)
-  stop(handle, deadline)
-  ```
-
-  D1 的精确 JNI 形状为 `create([B)J`、`start(J)V`、`poll(JJI)[B`、
-  `ack(JJ)V`、`stop(JJ)V` 和 `status(J)[B`；
-
-- 版本化的 D1 诊断 envelope，不丢字段地携带 PostgreSQL `SourceRecord` 的 source
-  partition、source offset、key、value 和 schema；其中 partition/offset 的 JSON 值只用于
-  可行性观测，并不是 D2 所需的完整 opaque checkpoint；
-- 可重复的 PostgreSQL fixture 与黑盒命令。
-
-Java bridge 在 Engine callback 内只写入有界队列；Rust 主动 poll。每个 connector 至多一个
-outstanding delivery，只有 Rust `ack` 后 bridge 才对该批执行
-`RecordCommitter.markProcessed` 与 `markBatchFinished`：JNI `ack` 只发信号，实际 committer
-调用仍在原 Engine callback 线程上按顺序完成。D1 使用 `OffsetCommitPolicy.always()`；
-PostgreSQL fixture 只允许 connector 自身控制 LSN flush，因此设置 `lsn.flush.mode=connector`。
+bridge 在 Engine callback 中只保留一个 delivery；Rust 主动 poll，显式 ACK 后才在原 callback
+线程执行 `RecordCommitter.markProcessed` 与 `markBatchFinished`。fixture 使用
+`OffsetCommitPolicy.always()` 与 `lsn.flush.mode=connector`。
 
 ### 验收
 
 - 黑盒证明 Rust host 和 JVM 处于同一 OS 进程，未启动 Java sidecar；
-- 一个 JVM 可顺序创建、启动和停止 Engine handle，状态可观察；
+- 一个 JVM 可顺序创建、启动和停止 Engine handle；
 - `poll` timeout 是正常无数据结果，不是失败；返回字节在 JNI 调用后仍完全属于 Rust；
-- 未 ACK 的 delivery 保持稳定 token，且 bridge 不交付后续 batch；
-- ACK 后才可观察下一批，重复/错误 token 返回结构化错误；
-- ACK 前 PostgreSQL `confirmed_flush_lsn` 与标准 file offset bytes 都不变；ACK 允许 offset
-  commit，随后一次 poll/stop 才使 PostgreSQL connector 执行已安排的 LSN flush，黑盒最终观察到二者推进；
-  fresh Engine + 同一 persistent slot 的组合 restart witness 跳过已 ACK 记录，但不宣称 file
-  store 被单独隔离证明，更不宣称捕获的 JSON offset 能注入新 Engine；
+- 未 ACK 的 delivery 重 poll 时 records/checkpoint 不变，且 bridge 不交付后续 batch；host-local
+  diagnostic token 也稳定，但从不穿过产品边界；
+- ACK 后才可观察下一批；
+- ACK 前 PostgreSQL `confirmed_flush_lsn` 与 fixture 的 accepted checkpoint 都不变；ACK 允许
+  offset commit，随后一次 poll/stop 才使 connector 执行已安排的 LSN flush；fresh Engine 只从
+  opaque checkpoint 恢复，不读取 Java offset 文件；
 - `max_bytes`、单槽有界交付和 `stop` deadline 都可黑盒触发，失败不变成 hang；
-- Java exception、危险配置和 connector class 加载失败可转换为稳定状态/错误，不越过 JNI 边界崩溃；
+- Java exception、危险配置和 connector class 加载失败可转换为稳定错误，不越过 JNI 边界崩溃；
 - 同一 OS 进程 ID 与 JVM identity 可观察，并在 fresh Engine handle 间保持不变。
 
 ### 退出条件
@@ -217,8 +196,7 @@ PostgreSQL fixture 只允许 connector 自身控制 LSN flush，因此设置 `ls
 - Debezium 批次语义无法支持一个 outstanding 和延迟 ACK；
 - delivery 大于 `max_bytes` 时的前进规则不明；
 - D1 JSON 会合并某些 Java 数值运行类型，不能直接升级为跨 connector 的 opaque offset codec；
-- 试验误把 `MemoryOffsetBackingStore` 或显式 `FileOffsetBackingStore` 的行为当成
-  DogPaddle/MDBX 恢复保证。
+- 试验 checkpoint 文件只是未来 MDBX transaction 的替身，不能被误当成 D3 恢复保证。
 
 ## D2：Product Debezium runtime 与 pre-ACK checkpoint
 
@@ -249,17 +227,19 @@ connector.stop(deadline)?;
 
 `Delivery` 是借用 `&mut Connector` 控制权的线性 guard，但 records 与 checkpoint 都是 JNI
 返回后完全属于 Rust 的 owned allocations。Drop 绝不自动 ACK；`ack(self)` 消耗 capability。
-handle、token、status、JNI、Java object 和 classpath 列表全部是私有实现。
+handle、JNI、Java object 和 classpath 列表全部是私有实现；产品协议没有 delivery token 或
+status JSON。
 
 ### 交付
 
-- 进程级单例 JVM：相同 canonical bundle path 与已验证内容指纹才复用，路径或内容变化显式冲突；
-- 自包含 runtime bundle：固定的 Temurin JRE `21.0.12.1+1`、Debezium distribution、严格
-  manifest/checksum、Debezium/Temurin SBOM 与 notices；`DebeziumRuntime::open(bundle_root)` 只加载
-  其中的 `libjvm`，绝不回退到系统 Java；
-- 四个原生 target：Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64；同一构建器既可生成
-  runtime-only archive，也可把调用方提供的原生 host 放入可选 `bin/`。仓库尚无最终主产品
-  executable，因此后者只是通用装配机制；
+- 进程级单例 JVM：相同 canonical payload path 才复用，不同路径显式冲突；
+- runtime payload：固定 Temurin JRE `21.0.12.1+1`、Debezium distribution、target manifest、
+  Debezium/Temurin SBOM 与 notices；`DebeziumRuntime::open(bundle_root)` 只加载其中的 `libjvm`，
+  绝不回退系统 Java；
+- `open` 校验 target manifest、JRE release/关键资源、nested JAR 精确集合与 hash，以及 `libjvm`
+  路径 containment；它不遍历重哈希整棵 JRE。archive digest 与可信只读安装是完整性边界；
+- Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个 payload；D2 不定义 host/`bin` 布局，
+  最终应用 release packager 以后再组合 executable 与 runtime；
 - connector-neutral Java bridge，只有一个 outstanding batch，无 Java→Rust callback；
 - `ConnectorConfig` 只做 secret-safe properties 容器，runtime 强制单 task、ordered、always
   commit、自有 offset store，并拒绝 SMT/predicate 与调用方 offset store；
@@ -273,13 +253,19 @@ handle、token、status、JNI、Java object 和 classpath 列表全部是私有�
 - ACK success 精确表示 handler 已 settle 且 backing-store image 已匹配，不冒充 connector-specific
   外部 progress 已同步发布；健康的 PostgreSQL task 预期在后续 poll/stop 执行已安排的 flush，
   真实 fixture 只把 eventual observation 当运维证据，绝不把它纳入 ACK success；
-- versioned、bounded binary delivery wire，记录原始 SourceRecord 顺序，并以 schemas-enabled
-  Kafka Connect JSON bytes 表达 key/value/header data；
-- start failure 清理、stop deadline、outstanding abort、显式 dispose，以及私有诊断；
+- bounded development-v1 delivery wire（`DPDBDV01`、u16 version `1`），无 token，记录原始
+  SourceRecord 顺序，并以 schemas-enabled Kafka Connect JSON bytes 表达 key/value/header data；
+- 同步 `start(handle, timeout)`、有 deadline 的 poll/ACK/stop、start failure 清理、outstanding
+  abort 与显式 dispose；普通错误由 Java exception 表达，`failureKind` 只分类 delivery-too-large；
 - Maven/JDK 独立构建出的 `debezium/lib/*.jar`；普通 Cargo gate 不调用 Maven、不联网、
-  编译和测试时不要求 JDK；distribution builder 支持显式 local/container Maven 模式；
-- D1 PostgreSQL fixture 改成只通过本 crate public API 驱动真实 connector，并把 host 放进
-  Linux x86_64 bundle 后使用 bundled JVM 运行。
+  编译和测试时不要求 JDK；distribution builder 只使用本机 Maven/JDK；
+- CI 在 Ubuntu 只构建测试一次 Java distribution，四个原生 runner 下载同一产物后分别组装、
+  relocate 并探测对应 runtime payload；
+- D1 PostgreSQL fixture 只通过本 crate public API 驱动真实 connector，并将 host 与 Linux
+  x86_64 runtime payload 分别挂载到同一个测试进程。
+
+当前 delivery 布局仍是开发期 v1：删除 token 直接替换旧 `DPDBDV01` bytes，不提供兼容、迁移或
+双解码。旧 development bundle 与 fixture 直接删除重建。
 
 Checkpoint 是“完整 connector offset-store image”，不是 delivery identity。一个 connector 可能
 合法地让多个事件共享 position，durable ingress 不得拿 checkpoint 冒充事件 ID。MySQL 等
@@ -315,7 +301,7 @@ checkpoint 独立恢复前，只能称 D2 foundation，不能进入 D3。
 
 - `OffsetStorageWriter` 是 Kafka Connect public class，但属于精确版本绑定的 runtime API；升级
   必须重审 preview/actual 等价性，不能承诺跨任意 Connect 版本恢复；
-- HotSpot 通常不能在同一进程 destroy/recreate，首次初始化必须在启动 JVM 前完成完整 bundle 校验；
+- HotSpot 通常不能在同一进程 destroy/recreate，首次初始化必须在启动 JVM 前完成 runtime preflight；
 - JVM fatal error 会终止 Rust 宿主，没有 sidecar 隔离；
 - class-loader、日志、TLS/native library、发布体积、JDK 与多平台成为产品负担；
 - Debezium startup phase 的 shutdown 行为复杂，不能把 D1 的一次性 worker 原样升级；
@@ -345,7 +331,7 @@ Debezium、connector config 和外部 I/O 都不进入 Operation turn，也不�
 Rust adapter 忽略的 source record，不伪造空 Change。v1 只允许一个 durable pending slot。
 
 在 D2 的线性 Delivery 与“ACK 不确定即从已持久 checkpoint 重启”语义下，D3 必须重新证明
-到底需要保存多少 delivery receipt；不能沿用 JVM token，也不能假定 checkpoint 对每批唯一。
+到底需要保存多少 delivery receipt；不能臆造 JVM token，也不能假定 checkpoint 对每批唯一。
 
 ### 验收
 
@@ -530,7 +516,7 @@ D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一
 ### 验收
 
 - Flow、Station 和 Store 不出现 PostgreSQL/MySQL connector 枚举、类型分支或特殊事务路径；
-- 单 JVM 同时运行两种 connector engine，其 handle、queue、offset、status 和 stop 互相隔离；
+- 单 JVM 同时运行两种 connector engine，其 handle、queue、offset、failure 和 stop 互相隔离；
 - 第二 connector 经过同一 `poll → durable ingest → ACK → Operation output` 故障矩阵；
 - connector-specific Schema/type/snapshot/fencing 规则保留在各自模块中；
 - 新抽取的公共组件由 PostgreSQL 和第二 connector 的公共测试共同所有。

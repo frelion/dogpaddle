@@ -6,8 +6,6 @@ use tempfile::TempDir;
 
 use crate::bundle::{Bundle, expected_manifest};
 use crate::config::ConnectorConfig;
-use crate::distribution::Distribution;
-use crate::jvm::decode_status;
 use crate::protocol::decode_delivery;
 use crate::{Checkpoint, ErrorKind};
 
@@ -21,115 +19,37 @@ const FIXTURE_JARS: &[&str] = &[
 ];
 
 #[test]
-fn bundle_requires_the_exact_checksum_verified_file_set() {
+fn bundle_opens_the_pinned_runtime_and_exact_jar_set() {
     let directory = fake_bundle();
     let bundle = Bundle::open(directory.path()).unwrap();
 
     assert_eq!(bundle.root(), directory.path().canonicalize().unwrap());
-    assert!(
-        bundle
-            .distribution()
-            .classpath()
-            .contains("dogpaddle-debezium-bridge.jar")
-    );
+    assert!(bundle.classpath().contains("dogpaddle-debezium-bridge.jar"));
     assert!(bundle.jvm_library().ends_with(expected_jvm_relative_path()));
-
-    fs::write(
-        directory.path().join(expected_jvm_relative_path()),
-        b"corrupt JVM",
-    )
-    .unwrap();
-    assert_eq!(
-        Bundle::open(directory.path()).err().unwrap().kind(),
-        ErrorKind::InvalidDistribution
-    );
 }
 
 #[test]
-fn bundle_rejects_unlisted_and_non_regular_entries() {
-    let unlisted = fake_bundle();
-    fs::write(unlisted.path().join("runtime/unlisted"), b"unlisted").unwrap();
-    assert!(Bundle::open(unlisted.path()).is_err());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-
-        let linked = fake_bundle();
-        let library = linked.path().join(expected_jvm_relative_path());
-        fs::rename(&library, linked.path().join("runtime/real-libjvm")).unwrap();
-        symlink("../../real-libjvm", &library).unwrap();
-        assert!(Bundle::open(linked.path()).is_err());
-    }
-}
-
-#[test]
-fn bundle_manifest_is_bound_to_the_current_target_and_temurin_release() {
+fn bundle_manifest_and_runtime_release_are_compatibility_boundaries() {
     let directory = fake_bundle();
     let manifest = expected_manifest().unwrap().replace(
         "java.runtime.version=21.0.12.1+1",
         "java.runtime.version=21",
     );
     fs::write(directory.path().join("MANIFEST"), manifest).unwrap();
-    write_bundle_checksums(directory.path());
 
     let error = Bundle::open(directory.path()).err().unwrap();
-    assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
+    assert_eq!(error.kind(), ErrorKind::InvalidBundle);
     assert!(error.to_string().contains("MANIFEST"));
-}
 
-#[test]
-fn bundle_checksums_reject_non_canonical_paths_and_order() {
-    let traversal = fake_bundle();
-    fs::write(
-        traversal.path().join("SHA256SUMS"),
-        concat!(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "  runtime/../MANIFEST\n",
-        ),
-    )
-    .unwrap();
-    assert!(Bundle::open(traversal.path()).is_err());
-
-    let unsorted = fake_bundle();
-    let mut lines = fs::read_to_string(unsorted.path().join("SHA256SUMS"))
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.swap(0, 1);
-    fs::write(
-        unsorted.path().join("SHA256SUMS"),
-        format!("{}\n", lines.join("\n")),
-    )
-    .unwrap();
-    assert!(Bundle::open(unsorted.path()).is_err());
-}
-
-#[test]
-fn bundle_fingerprint_tracks_the_runtime_and_debezium_together() {
     let directory = fake_bundle();
-    let original = *Bundle::open(directory.path()).unwrap().fingerprint();
-
     fs::write(
-        directory.path().join(expected_jvm_relative_path()),
-        b"replacement JVM",
+        directory.path().join("runtime/release"),
+        runtime_release().replace("21.0.12.1+1", "21"),
     )
     .unwrap();
-    write_bundle_checksums(directory.path());
-
-    let replacement = *Bundle::open(directory.path()).unwrap().fingerprint();
-    assert_ne!(original, replacement);
-}
-
-#[test]
-fn bundle_accepts_an_exactly_checksummed_optional_binary_directory() {
-    let directory = fake_bundle();
-    fs::create_dir(directory.path().join("bin")).unwrap();
-    fs::write(directory.path().join("bin/dogpaddle"), b"fixture host").unwrap();
-    write_bundle_checksums(directory.path());
-
-    assert!(Bundle::open(directory.path()).is_ok());
+    let error = Bundle::open(directory.path()).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidBundle);
+    assert!(error.to_string().contains("SEMANTIC_VERSION"));
 }
 
 #[test]
@@ -151,26 +71,24 @@ fn bundle_requires_runtime_security_legal_and_distribution_evidence() {
     for relative in required {
         let directory = fake_bundle();
         fs::remove_file(directory.path().join(relative)).unwrap();
-        write_bundle_checksums(directory.path());
 
         let error = Bundle::open(directory.path()).err().unwrap();
-        assert_eq!(error.kind(), ErrorKind::InvalidDistribution, "{relative}");
+        assert_eq!(error.kind(), ErrorKind::InvalidBundle, "{relative}");
         assert!(error.to_string().contains(relative), "{relative}: {error}");
     }
 
     let empty = fake_bundle();
     fs::write(empty.path().join("runtime/NOTICE"), []).unwrap();
-    write_bundle_checksums(empty.path());
     let error = Bundle::open(empty.path()).err().unwrap();
-    assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
-    assert!(error.to_string().contains("empty: runtime/NOTICE"));
+    assert_eq!(error.kind(), ErrorKind::InvalidBundle);
+    assert!(error.to_string().contains("runtime/NOTICE"));
 }
 
 #[test]
 fn resume_checkpoint_must_fit_inside_the_delivery_bound() {
     let config = ConnectorConfig::new("e", "c")
         .unwrap()
-        .max_delivery_bytes(76)
+        .max_delivery_bytes(68)
         .unwrap();
     let bytes = checkpoint_bytes("e", "c", &[(b"key", &[0; 32])]);
     let checkpoint = Checkpoint::from_bytes(bytes).unwrap();
@@ -182,62 +100,20 @@ fn resume_checkpoint_must_fit_inside_the_delivery_bound() {
 }
 
 #[test]
-fn distribution_requires_an_exact_checksum_verified_jar_set() {
-    let directory = fake_distribution();
-    let distribution = Distribution::open(directory.path()).unwrap();
-    assert!(
-        distribution
-            .classpath()
-            .contains("dogpaddle-debezium-bridge.jar")
-    );
-
+fn bundle_rejects_a_corrupt_or_unlisted_distribution_jar() {
+    let directory = fake_bundle();
     fs::write(
-        directory.path().join("lib/dogpaddle-debezium-bridge.jar"),
+        directory
+            .path()
+            .join("debezium/lib/dogpaddle-debezium-bridge.jar"),
         b"corrupt",
     )
     .unwrap();
-    assert!(Distribution::open(directory.path()).is_err());
-}
+    assert!(Bundle::open(directory.path()).is_err());
 
-#[test]
-fn distribution_rejects_an_unlisted_jar_before_jvm_startup() {
-    let directory = fake_distribution();
-    fs::write(directory.path().join("lib/shadow.jar"), b"shadow").unwrap();
-
-    assert!(Distribution::open(directory.path()).is_err());
-}
-
-#[test]
-fn distribution_rejects_non_regular_or_oversized_metadata_files() {
-    let oversized = fake_distribution();
-    fs::write(oversized.path().join("MANIFEST"), vec![b'x'; 1024 * 1024]).unwrap();
-    assert!(Distribution::open(oversized.path()).is_err());
-
-    let non_regular = fake_distribution();
-    let manifest = non_regular.path().join("MANIFEST");
-    fs::remove_file(&manifest).unwrap();
-    fs::create_dir(&manifest).unwrap();
-    assert!(Distribution::open(non_regular.path()).is_err());
-}
-
-#[test]
-fn bridge_status_maps_only_the_stable_delivery_size_code() {
-    let too_large = decode_status(
-        br#"{"protocol":1,"kind":"status","state":"failed","failure_kind":"delivery_too_large"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        too_large.reported_error_kind(ErrorKind::ConnectorFailed),
-        ErrorKind::DeliveryTooLarge
-    );
-
-    let ordinary =
-        decode_status(br#"{"protocol":1,"kind":"status","state":"failed","failure_kind":null}"#)
-            .unwrap();
-    assert_eq!(
-        ordinary.reported_error_kind(ErrorKind::ConnectorFailed),
-        ErrorKind::ConnectorFailed
-    );
+    let directory = fake_bundle();
+    fs::write(directory.path().join("debezium/lib/shadow.jar"), b"shadow").unwrap();
+    assert!(Bundle::open(directory.path()).is_err());
 }
 
 #[test]
@@ -261,11 +137,10 @@ fn delivery_decoder_preserves_all_fields_and_source_order() {
             headers: &[],
         },
     ];
-    let bytes = delivery_bytes(9, &checkpoint, &records);
+    let bytes = delivery_bytes(&checkpoint, &records);
 
     let decoded = decode_delivery(&bytes, bytes.len()).unwrap();
 
-    assert_eq!(decoded.token, 9);
     assert_eq!(decoded.checkpoint.as_bytes(), checkpoint);
     assert_eq!(decoded.records.len(), 2);
     assert_eq!(decoded.records[0].topic(), Some("orders"));
@@ -288,28 +163,24 @@ fn delivery_decoder_preserves_all_fields_and_source_order() {
 #[test]
 fn delivery_wire_matches_the_java_bridge_golden() {
     let bytes = decode_hex(concat!(
-        "44504442445630310001000000000000002a0000003344504442435030310001",
-        "00000008656e67696e652d61000000116578616d706c652e436f6e6e656374",
-        "6f720000000033b0f2210000000200000005746f7069630100000001010000",
-        "00000000000a0000003f7b22736368656d61223a7b2274797065223a227374",
-        "72696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f61",
-        "64223a226669727374227d0000003f7b22736368656d61223a7b2274797065",
-        "223a22737472696e67222c226f7074696f6e616c223a66616c73657d2c2270",
-        "61796c6f6164223a226669727374227d0000000100000007617474656d7074",
-        "000000387b22736368656d61223a7b2274797065223a22696e743332222c22",
-        "6f7074696f6e616c223a66616c73657d2c227061796c6f6164223a337d0000",
-        "0005746f706963010000000201000000000000000b000000407b2273636865",
-        "6d61223a7b2274797065223a22737472696e67222c226f7074696f6e616c22",
-        "3a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000040",
-        "7b22736368656d61223a7b2274797065223a22737472696e67222c226f7074",
-        "696f6e616c223a66616c73657d2c227061796c6f6164223a227365636f6e",
-        "64227d00000000903264ff",
+        "44504442445630310001000000334450444243503031000100000008656e67696e652d61",
+        "000000116578616d706c652e436f6e6e6563746f720000000033b0f22100000002000000",
+        "05746f706963010000000101000000000000000a0000003f7b22736368656d61223a7b22",
+        "74797065223a22737472696e67222c226f7074696f6e616c223a66616c73657d2c227061",
+        "796c6f6164223a226669727374227d0000003f7b22736368656d61223a7b227479706522",
+        "3a22737472696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164",
+        "223a226669727374227d0000000100000007617474656d7074000000387b22736368656d",
+        "61223a7b2274797065223a22696e743332222c226f7074696f6e616c223a66616c73657d",
+        "2c227061796c6f6164223a337d00000005746f706963010000000201000000000000000b",
+        "000000407b22736368656d61223a7b2274797065223a22737472696e67222c226f707469",
+        "6f6e616c223a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000040",
+        "7b22736368656d61223a7b2274797065223a22737472696e67222c226f7074696f6e616c",
+        "223a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000000f6e0afee",
     ));
 
     let decoded = decode_delivery(&bytes, bytes.len()).unwrap();
 
-    assert_eq!(bytes.len(), 476);
-    assert_eq!(decoded.token, 42);
+    assert_eq!(bytes.len(), 468);
     assert_eq!(
         decoded.checkpoint.as_bytes(),
         checkpoint_bytes("engine-a", "example.Connector", &[])
@@ -340,14 +211,14 @@ fn delivery_decoder_rejects_corruption_and_non_canonical_framing() {
     let checkpoint = checkpoint_bytes("engine", "connector", &[]);
     let record = EncodedRecord::empty();
 
-    let mut corrupt = delivery_bytes(1, &checkpoint, &[record]);
+    let mut corrupt = delivery_bytes(&checkpoint, &[record]);
     corrupt[12] ^= 1;
     assert_eq!(
         decode_delivery(&corrupt, corrupt.len()).unwrap_err().kind(),
         ErrorKind::Protocol
     );
 
-    let mut trailing = delivery_bytes(1, &checkpoint, &[record]);
+    let mut trailing = delivery_bytes(&checkpoint, &[record]);
     trailing.truncate(trailing.len() - size_of::<u32>());
     trailing.push(0);
     append_checksum(&mut trailing);
@@ -358,7 +229,7 @@ fn delivery_decoder_rejects_corruption_and_non_canonical_framing() {
         ErrorKind::Protocol
     );
 
-    let empty = delivery_bytes(1, &checkpoint, &[]);
+    let empty = delivery_bytes(&checkpoint, &[]);
     assert_eq!(
         decode_delivery(&empty, empty.len()).unwrap_err().kind(),
         ErrorKind::Protocol
@@ -368,7 +239,7 @@ fn delivery_decoder_rejects_corruption_and_non_canonical_framing() {
 #[test]
 fn delivery_decoder_applies_bounds_before_copying_nested_frames() {
     let checkpoint = checkpoint_bytes("engine", "connector", &[]);
-    let bytes = delivery_bytes(1, &checkpoint, &[EncodedRecord::empty()]);
+    let bytes = delivery_bytes(&checkpoint, &[EncodedRecord::empty()]);
     assert_eq!(
         decode_delivery(&bytes, bytes.len() - 1).unwrap_err().kind(),
         ErrorKind::DeliveryTooLarge
@@ -377,7 +248,6 @@ fn delivery_decoder_applies_bounds_before_copying_nested_frames() {
     let mut oversized_checkpoint = Vec::new();
     oversized_checkpoint.extend_from_slice(b"DPDBDV01");
     oversized_checkpoint.extend_from_slice(&1_u16.to_be_bytes());
-    oversized_checkpoint.extend_from_slice(&1_i64.to_be_bytes());
     oversized_checkpoint.extend_from_slice(&(64_u32 * 1024 * 1024 + 1).to_be_bytes());
     append_checksum(&mut oversized_checkpoint);
     assert_eq!(
@@ -386,12 +256,6 @@ fn delivery_decoder_applies_bounds_before_copying_nested_frames() {
             .kind(),
         ErrorKind::Protocol
     );
-}
-
-fn fake_distribution() -> TempDir {
-    let directory = tempfile::tempdir().unwrap();
-    write_fake_distribution(directory.path());
-    directory
 }
 
 fn write_fake_distribution(root: &std::path::Path) {
@@ -431,7 +295,7 @@ fn fake_bundle() -> TempDir {
     fs::create_dir_all(root.join("runtime/lib/security")).unwrap();
     fs::create_dir_all(root.join("runtime/legal/java.base")).unwrap();
     fs::write(root.join("runtime/NOTICE"), b"fixture runtime notice\n").unwrap();
-    fs::write(root.join("runtime/release"), b"JAVA_VERSION=fixture\n").unwrap();
+    fs::write(root.join("runtime/release"), runtime_release()).unwrap();
     fs::write(root.join("runtime/bin/java"), b"fixture Java launcher\n").unwrap();
     fs::write(root.join("runtime/lib/modules"), b"fixture module image\n").unwrap();
     fs::write(root.join("runtime/lib/security/cacerts"), b"fixture CAs\n").unwrap();
@@ -441,8 +305,43 @@ fn fake_bundle() -> TempDir {
         b"fixture runtime license\n",
     )
     .unwrap();
-    write_bundle_checksums(root);
     directory
+}
+
+fn runtime_release() -> String {
+    let (os_name, os_arch, libc) = if cfg!(target_os = "macos") {
+        (
+            "Darwin",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+            "default",
+        )
+    } else {
+        (
+            "Linux",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+            "gnu",
+        )
+    };
+    format!(
+        concat!(
+            "IMPLEMENTOR=\"Eclipse Adoptium\"\n",
+            "SEMANTIC_VERSION=\"21.0.12.1+1\"\n",
+            "IMAGE_TYPE=\"JRE\"\n",
+            "JVM_VARIANT=\"Hotspot\"\n",
+            "OS_NAME=\"{}\"\n",
+            "OS_ARCH=\"{}\"\n",
+            "LIBC=\"{}\"\n",
+        ),
+        os_name, os_arch, libc
+    )
 }
 
 fn expected_jvm_relative_path() -> &'static std::path::Path {
@@ -450,47 +349,6 @@ fn expected_jvm_relative_path() -> &'static std::path::Path {
         std::path::Path::new("runtime/lib/server/libjvm.dylib")
     } else {
         std::path::Path::new("runtime/lib/server/libjvm.so")
-    }
-}
-
-fn write_bundle_checksums(root: &std::path::Path) {
-    let mut paths = Vec::new();
-    collect_fixture_files(root, root, &mut paths);
-    paths.sort();
-    let mut checksums = String::new();
-    for relative in paths {
-        if relative == "SHA256SUMS" {
-            continue;
-        }
-        let digest = Sha256::digest(fs::read(root.join(&relative)).unwrap());
-        for byte in digest {
-            write!(&mut checksums, "{byte:02x}").unwrap();
-        }
-        writeln!(&mut checksums, "  {relative}").unwrap();
-    }
-    fs::write(root.join("SHA256SUMS"), checksums).unwrap();
-}
-
-fn collect_fixture_files(
-    root: &std::path::Path,
-    directory: &std::path::Path,
-    paths: &mut Vec<String>,
-) {
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            collect_fixture_files(root, &entry.path(), paths);
-        } else {
-            paths.push(
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .replace(std::path::MAIN_SEPARATOR, "/"),
-            );
-        }
     }
 }
 
@@ -530,11 +388,10 @@ impl EncodedRecord<'_> {
     }
 }
 
-fn delivery_bytes(token: i64, checkpoint: &[u8], records: &[EncodedRecord<'_>]) -> Vec<u8> {
+fn delivery_bytes(checkpoint: &[u8], records: &[EncodedRecord<'_>]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"DPDBDV01");
     bytes.extend_from_slice(&1_u16.to_be_bytes());
-    bytes.extend_from_slice(&token.to_be_bytes());
     push_u32_bytes(&mut bytes, checkpoint);
     bytes.extend_from_slice(&u32::try_from(records.len()).unwrap().to_be_bytes());
     for record in records {

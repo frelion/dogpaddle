@@ -46,8 +46,7 @@ final class CheckpointCodec {
                     throw new IllegalArgumentException("checkpoint offset key must not be empty");
                 }
                 if (entry.getKey().size() > MAX_ENTRY_BYTES
-                        || (entry.getValue() != null
-                                && entry.getValue().size() > MAX_ENTRY_BYTES)) {
+                        || entry.getValue().size() > MAX_ENTRY_BYTES) {
                     throw new IllegalArgumentException(
                             "checkpoint offset entry exceeds " + MAX_ENTRY_BYTES + " bytes");
                 }

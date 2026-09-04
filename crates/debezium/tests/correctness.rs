@@ -55,13 +55,13 @@ fn connector_configuration_enforces_checkpoint_and_java_delivery_bounds() {
     assert!(
         ConnectorConfig::new("e", "c")
             .unwrap()
-            .max_delivery_bytes(75)
+            .max_delivery_bytes(67)
             .is_err()
     );
     assert!(
         ConnectorConfig::new("e", "c")
             .unwrap()
-            .max_delivery_bytes(76)
+            .max_delivery_bytes(68)
             .is_ok()
     );
     assert!(
@@ -167,8 +167,8 @@ fn runtime_rejects_a_legacy_jar_directory_without_a_bundled_jvm() {
 
     let error = DebeziumRuntime::open(directory.path()).unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::InvalidDistribution);
-    assert!(error.to_string().contains("unexpected top-level entry"));
+    assert_eq!(error.kind(), ErrorKind::InvalidBundle);
+    assert!(error.to_string().contains("MANIFEST"));
 }
 
 fn checkpoint_bytes(

@@ -1,17 +1,16 @@
 package dev.dogpaddle.debezium;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.debezium.embedded.Connect;
 import io.debezium.engine.DebeziumEngine;
 import io.debezium.engine.RecordChangeEvent;
 import io.debezium.engine.format.ChangeEventFormat;
 import io.debezium.engine.spi.OffsetCommitPolicy;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.LongSupplier;
 import org.apache.kafka.connect.source.SourceRecord;
 
 /** Owns one Debezium Engine and its single-delivery ACK protocol. */
@@ -26,10 +25,9 @@ final class ConnectorRuntime {
         DISPOSED
     }
 
-    private final ObjectMapper mapper = new ObjectMapper();
     private final DeliveryCodec codec = new DeliveryCodec();
     private final DeliveryExchange exchange = new DeliveryExchange();
-    private final LongSupplier nextToken;
+    private final CompletableFuture<Void> startup = new CompletableFuture<>();
     private final AtomicReference<State> state = new AtomicReference<>(State.CREATED);
     private final ConnectorConfiguration configuration;
     private final OffsetStoreRegistry.Entry offsets;
@@ -38,27 +36,18 @@ final class ConnectorRuntime {
     private final int maximumDeliveryBytes;
 
     private volatile Thread engineThread;
-    private volatile String completionMessage;
     private volatile Throwable failure;
-    private volatile long lastAckToken;
     private boolean abandonStarted;
 
     private ConnectorRuntime(
             ConnectorConfiguration configuration,
             Checkpoint checkpoint,
-            int maximumDeliveryBytes,
-            LongSupplier nextToken) {
-        if (maximumDeliveryBytes < DeliveryCodec.MINIMUM_MAXIMUM_BYTES) {
-            throw new IllegalArgumentException(
-                    "maximum delivery bytes must be at least "
-                            + DeliveryCodec.MINIMUM_MAXIMUM_BYTES);
-        }
+            int maximumDeliveryBytes) {
         this.configuration = configuration;
         this.maximumDeliveryBytes = maximumDeliveryBytes;
-        this.nextToken = nextToken;
         try {
             this.offsets = OffsetStoreRegistry.register(
-                    configuration.engineName(), configuration.connectorClass(), checkpoint);
+                    configuration.engineName(), checkpoint);
         }
         catch (Throwable error) {
             codec.close();
@@ -89,7 +78,9 @@ final class ConnectorRuntime {
             builder.using(new DebeziumEngine.ConnectorCallback() {
                 @Override
                 public void pollingStarted() {
-                    state.compareAndSet(State.STARTING, State.RUNNING);
+                    if (state.compareAndSet(State.STARTING, State.RUNNING)) {
+                        startup.complete(null);
+                    }
                 }
 
                 @Override
@@ -113,16 +104,14 @@ final class ConnectorRuntime {
     static ConnectorRuntime create(
             byte[] configurationJson,
             byte[] checkpointBytes,
-            int maximumDeliveryBytes,
-            LongSupplier nextToken) {
+            int maximumDeliveryBytes) {
         if (maximumDeliveryBytes < DeliveryCodec.MINIMUM_MAXIMUM_BYTES) {
             throw new IllegalArgumentException(
                     "maximum delivery bytes must be at least "
                             + DeliveryCodec.MINIMUM_MAXIMUM_BYTES);
         }
-        ObjectMapper mapper = new ObjectMapper();
         ConnectorConfiguration configuration =
-                ConnectorConfiguration.parse(configurationJson, mapper);
+                ConnectorConfiguration.parse(configurationJson);
         Checkpoint checkpoint = checkpointBytes == null
                 ? new Checkpoint(
                         configuration.engineName(), configuration.connectorClass(), java.util.Map.of())
@@ -139,21 +128,53 @@ final class ConnectorRuntime {
                     "maximum delivery bytes must be at least " + connectorMinimum
                             + " for the initial checkpoint");
         }
-        return new ConnectorRuntime(
-                configuration, checkpoint, maximumDeliveryBytes, nextToken);
+        return new ConnectorRuntime(configuration, checkpoint, maximumDeliveryBytes);
     }
 
-    synchronized void start() {
-        if (!state.compareAndSet(State.CREATED, State.STARTING)) {
-            throw new IllegalStateException(
-                    "connector can only start once; current state is " + stateName());
+    boolean start(long timeoutMillis) {
+        if (timeoutMillis < 0) {
+            throw new IllegalArgumentException("startup timeout must be non-negative");
         }
-        Thread thread = new Thread(
-                this::runEngine,
-                "dogpaddle-debezium-engine-" + configuration.engineName());
-        thread.setDaemon(false);
-        engineThread = thread;
-        thread.start();
+        synchronized (this) {
+            if (!state.compareAndSet(State.CREATED, State.STARTING)) {
+                throw new IllegalStateException(
+                        "connector can only start once; current state is " + stateName());
+            }
+            Thread thread = new Thread(
+                    this::runEngine,
+                    "dogpaddle-debezium-engine-" + configuration.engineName());
+            thread.setDaemon(false);
+            engineThread = thread;
+            thread.start();
+        }
+        try {
+            startup.get(timeoutMillis, TimeUnit.MILLISECONDS);
+            State observed = state.get();
+            if (observed != State.RUNNING) {
+                throw new IllegalStateException(
+                        "Debezium connector stopped during startup; current state is "
+                                + stateName(),
+                        failure);
+            }
+            return true;
+        }
+        catch (TimeoutException error) {
+            return false;
+        }
+        catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("connector startup interrupted", error);
+        }
+        catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error fatal) {
+                throw fatal;
+            }
+            throw new IllegalStateException("Debezium connector startup failed", cause);
+        }
     }
 
     byte[] poll(long timeoutMillis) {
@@ -180,13 +201,9 @@ final class ConnectorRuntime {
         }
     }
 
-    boolean ack(long token, long timeoutMillis) {
+    boolean ack(long timeoutMillis) {
         requireNotDisposed();
-        boolean settled = exchange.ack(token, timeoutMillis);
-        if (settled) {
-            lastAckToken = token;
-        }
-        return settled;
+        return exchange.ack(timeoutMillis);
     }
 
     boolean stop(long timeoutMillis) {
@@ -201,11 +218,6 @@ final class ConnectorRuntime {
                 throw new IllegalStateException("connector is disposed");
             }
             if (observed == State.STOPPED) {
-                Thread thread = engineThread;
-                if (!shutdownWorker.hasStarted()
-                        && (thread == null || !thread.isAlive())) {
-                    return true;
-                }
                 exchange.close();
             }
             else if (observed == State.CREATED) {
@@ -262,48 +274,10 @@ final class ConnectorRuntime {
         return state.get() == State.DISPOSED;
     }
 
-    byte[] status() {
-        DeliveryExchange.Snapshot exchangeSnapshot = exchange.snapshot();
-        ObjectNode root = mapper.createObjectNode();
-        root.put("protocol", 1);
-        root.put("kind", "status");
-        root.put("state", stateName());
-        root.put("outstanding", exchangeSnapshot.hasOutstanding());
-        root.put("record_count", exchangeSnapshot.recordCount());
-        if (exchangeSnapshot.token() == null) {
-            root.putNull("token");
-        }
-        else {
-            root.put("token", exchangeSnapshot.token());
-        }
-        root.put("last_ack_token", lastAckToken);
-        Thread thread = engineThread;
-        root.put("engine_thread_alive", thread != null && thread.isAlive());
-        if (completionMessage == null) {
-            root.putNull("message");
-        }
-        else {
-            root.put("message", completionMessage);
-        }
-        if (failure == null) {
-            root.putNull("error");
-        }
-        else {
-            root.put("error", describe(failure));
-        }
-        String failureKind = DeliveryCodec.failureKind(failure);
-        if (failureKind == null) {
-            root.putNull("failure_kind");
-        }
-        else {
-            root.put("failure_kind", failureKind);
-        }
-        try {
-            return mapper.writeValueAsBytes(root);
-        }
-        catch (JsonProcessingException error) {
-            throw new IllegalStateException("cannot encode runtime status", error);
-        }
+    int failureKind() {
+        return DeliveryCodec.isTooLarge(failure)
+                ? DebeziumBridge.FAILURE_DELIVERY_TOO_LARGE
+                : DebeziumBridge.FAILURE_NONE;
     }
 
     private void handleBatch(
@@ -322,11 +296,8 @@ final class ConnectorRuntime {
         }
 
         OffsetStoreRegistry.PreparedCheckpoint prepared = offsets.preview(records);
-        long token = nextToken.getAsLong();
-        byte[] encoded = codec.encode(
-                token, prepared.encoded(), records, maximumDeliveryBytes);
-        DeliveryExchange.Delivery delivery = exchange.install(
-                token, records, prepared, encoded);
+        byte[] encoded = codec.encode(prepared.encoded(), records, maximumDeliveryBytes);
+        DeliveryExchange.Delivery delivery = exchange.install(encoded);
 
         Throwable deliveryFailure = null;
         try {
@@ -334,7 +305,10 @@ final class ConnectorRuntime {
                 return;
             }
             offsets.arm(prepared);
-            markBatchProcessed(events, committer);
+            for (RecordChangeEvent<SourceRecord> event : events) {
+                committer.markProcessed(event);
+            }
+            committer.markBatchFinished();
             // Debezium's markBatchFinished may internally turn a failed store
             // Future into a non-throwing "not committed" result. ACK is only
             // successful after our backing store observed the exact preview.
@@ -350,28 +324,19 @@ final class ConnectorRuntime {
         }
     }
 
-    static <R> void markBatchProcessed(
-            List<R> records, DebeziumEngine.RecordCommitter<R> committer)
-            throws InterruptedException {
-        for (R record : records) {
-            committer.markProcessed(record);
-        }
-        committer.markBatchFinished();
-    }
-
     private void runEngine() {
         try {
             engine.run();
         }
         catch (Throwable error) {
-            failure = error;
-            completionMessage = "engine thread failed";
-            state.set(State.FAILED);
+            fail(error);
         }
         finally {
             state.updateAndGet(current -> current == State.FAILED
                     ? current
                     : State.STOPPED);
+            startup.completeExceptionally(new IllegalStateException(
+                    "Debezium connector stopped before polling began", failure));
             // Publish the terminal state before waking a timed poll, so a
             // wake-up caused by shutdown can never look like ordinary idle.
             exchange.close();
@@ -404,8 +369,8 @@ final class ConnectorRuntime {
         }
         if (cleanupFailure != null) {
             failure = cleanupFailure;
-            completionMessage = "abandoned connector cleanup failed";
             state.compareAndSet(State.STOPPING, State.FAILED);
+            startup.completeExceptionally(cleanupFailure);
         }
     }
 
@@ -438,11 +403,15 @@ final class ConnectorRuntime {
     }
 
     private void completed(boolean success, String message, Throwable error) {
-        completionMessage = message;
         if (!success) {
-            failure = error == null ? new IllegalStateException(message) : error;
-            state.set(State.FAILED);
+            fail(error == null ? new IllegalStateException(message) : error);
         }
+    }
+
+    private void fail(Throwable error) {
+        failure = error;
+        state.set(State.FAILED);
+        startup.completeExceptionally(error);
     }
 
     private void requireNotDisposed() {
@@ -464,10 +433,5 @@ final class ConnectorRuntime {
 
     private String stateName() {
         return state.get().name().toLowerCase(java.util.Locale.ROOT);
-    }
-
-    private static String describe(Throwable error) {
-        String message = error.getMessage();
-        return error.getClass().getName() + (message == null ? "" : ": " + message);
     }
 }

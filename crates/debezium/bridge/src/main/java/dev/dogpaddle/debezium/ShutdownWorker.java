@@ -32,18 +32,6 @@ final class ShutdownWorker {
         created.start();
     }
 
-    synchronized boolean hasStarted() {
-        return thread != null;
-    }
-
-    boolean await(long timeoutMillis) {
-        if (timeoutMillis < 0) {
-            throw new IllegalArgumentException("shutdown timeout must be non-negative");
-        }
-        return awaitUntil(
-                System.nanoTime(), TimeUnit.MILLISECONDS.toNanos(timeoutMillis));
-    }
-
     boolean awaitUntil(long startedAt, long timeoutNanos) {
         if (timeoutNanos < 0) {
             throw new IllegalArgumentException("shutdown timeout must be non-negative");

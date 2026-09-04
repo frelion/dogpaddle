@@ -23,7 +23,8 @@ class OffsetPreviewerTest {
     void reflectively_constructed_store_attaches_through_the_public_worker_config() {
         String engineName = "configured-store";
         OffsetStoreRegistry.Entry entry = OffsetStoreRegistry.register(
-                engineName, "example.Connector", null);
+                engineName,
+                new Checkpoint(engineName, "example.Connector", Map.of()));
         DogPaddleOffsetBackingStore store = new DogPaddleOffsetBackingStore();
         try {
             store.configure(new EmbeddedWorkerConfig(new HashMap<>(Map.of(

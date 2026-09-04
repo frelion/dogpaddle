@@ -8,7 +8,6 @@ const CHECKSUM_BYTES: usize = size_of::<u32>();
 
 #[derive(Debug)]
 pub(crate) struct DecodedDelivery {
-    pub(crate) token: i64,
     pub(crate) checkpoint: Checkpoint,
     pub(crate) records: Box<[Record]>,
 }
@@ -42,16 +41,6 @@ pub(crate) fn decode_delivery(
     }
     if input.u16().map_err(as_protocol)? != VERSION {
         return Err(protocol("delivery version is not supported"));
-    }
-    let token = i64::from_be_bytes(
-        input
-            .take(size_of::<i64>())
-            .map_err(as_protocol)?
-            .try_into()
-            .map_err(|_| protocol("delivery token is truncated"))?,
-    );
-    if token <= 0 {
-        return Err(protocol("delivery token must be positive"));
     }
     let checkpoint = Checkpoint::from_bytes(take_u32_bytes_bounded(
         &mut input,
@@ -92,7 +81,6 @@ pub(crate) fn decode_delivery(
     }
 
     Ok(DecodedDelivery {
-        token,
         checkpoint,
         records: records.into_boxed_slice(),
     })
