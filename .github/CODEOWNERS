@@ -12,6 +12,7 @@
 # Product and cross-product ownership boundaries.
 /crates/change/ @frelion
 /crates/store/ @frelion
+/crates/debezium/ @frelion
 /crates/operation/ @frelion
 /crates/flow/ @frelion
 /integration-tests/ @frelion

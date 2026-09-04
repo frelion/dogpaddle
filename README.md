@@ -59,6 +59,7 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 - [算子路线与语义边界](OPERATOR_ROADMAP.md)
 - [Debezium Source D0–D7 路线图](DEBEZIUM_ROADMAP.md)
 - [ADR-0001：在 Rust 宿主中嵌入 Debezium Engine](docs/adr/0001-embed-debezium-engine.md)
+- [Debezium：进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
 - [Flow：构建、运行与恢复](crates/flow/README.md)
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)

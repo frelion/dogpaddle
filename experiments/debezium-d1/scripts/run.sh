@@ -7,6 +7,7 @@ readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 experiment_dir="$(cd -- "$script_dir/.." && pwd)"
+repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-state.XXXXXX")"
 artifacts_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-artifacts.XXXXXX")"
 owns_postgres=0
@@ -126,10 +127,11 @@ python3 "$experiment_dir/tests/d1_blackbox.py" \
   podman run --rm --interactive \
     --network host \
     --volume "$experiment_dir/host/target/release/dogpaddle-debezium-d1-host:/opt/d1/host:ro,Z" \
-    --volume "$experiment_dir/bridge/target:/opt/d1/bridge:ro,Z" \
+    --volume "$repo_dir/crates/debezium/bridge/target/distribution:/opt/d1/distribution:ro,Z" \
     --volume "$experiment_dir/tests/fixtures/connector.json:/opt/d1/connector.json:ro,Z" \
     --volume "$state_dir:/state:Z" \
     --entrypoint /opt/d1/host \
     "$MAVEN_IMAGE" \
-    --bridge-jar /opt/d1/bridge/debezium-d1-bridge-0.1.0.jar \
-    --config /opt/d1/connector.json
+    --distribution /opt/d1/distribution \
+    --config /opt/d1/connector.json \
+    --checkpoint /state/checkpoint.bin

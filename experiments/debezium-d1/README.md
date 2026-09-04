@@ -1,126 +1,139 @@
-# Debezium D1 black-box gate
+# Debezium D1 product black-box gate
 
-This experiment answers one narrow question before PostgreSQL CDC is allowed
-to enter DogPaddle's product crates:
+D1 is the real PostgreSQL fixture for the product `dogpaddle-debezium` crate.
+It no longer owns a Java bridge or a JNI host implementation. The small Rust
+JSONL host depends on the product crate, and the runner consumes the product-built
+Debezium distribution unchanged.
 
-> Can the unmodified Debezium 3.6.2 PostgreSQL connector, embedded in the
-> process through its public Engine API, keep PostgreSQL's acknowledged LSN
-> behind an application-controlled acknowledgement?
+The gate answers one narrow question:
 
-It is deliberately a WAL-only, one-table pilot. It does not implement a
-DogPaddle Operation and it does not make snapshot, schema evolution, or
-transaction-atomicity claims.
+> Can a caller persist the product runtime's opaque pre-ACK checkpoint, ACK
+> only after taking durable ownership, and recover correctly with no competing
+> Java offset file?
+
+This remains a WAL-only, one-table PostgreSQL pilot. It is not yet a
+DogPaddle Source Operation, does not use MDBX, and makes no snapshot, schema
+evolution, transaction-framing, or Arrow mapping claim.
+
+## Boundary under test
+
+The fixture exercises only the public Rust surface:
+
+```text
+DebeziumRuntime::open(distribution)
+  -> DebeziumRuntime::start(config, optional_checkpoint)
+  -> Connector::poll(timeout)
+  -> Delivery::{records, checkpoint}
+  -> Delivery::ack()
+  -> Connector::stop(timeout)
+```
+
+The host copies record bytes and the opaque `Checkpoint` only to render
+diagnostic JSON. A returned `Delivery` then falls out of scope without ACK;
+polling again must yield the same records and checkpoint. The JSON `token` is
+allocated by this test host and is run-local. It is not a product delivery ID
+and is never passed through the product boundary.
+
+The host protocol deliberately splits durability from acknowledgement:
+
+1. `poll` observes a delivery and its pre-ACK checkpoint.
+2. `save` atomically replaces `/state/checkpoint.bin` with those opaque bytes.
+3. `ack TOKEN` re-polls the same product `Delivery`, verifies its bytes and
+   checkpoint are unchanged, and consumes `Delivery::ack()`.
+4. `stop` never ACKs an outstanding delivery.
+
+`Delivery::ack()` settles the exact Kafka Connect offset-store update. It does
+not promise that PostgreSQL's `confirmed_flush_lsn` has already changed when
+the Rust call returns: Debezium's Engine can defer the connector task commit,
+and Debezium 3.6.2 does not surface every `SourceTask.commit()` failure through
+`markBatchFinished`. D1 therefore observes PostgreSQL advancement only after a
+subsequent source poll and/or graceful stop. This is eventual WAL-retention
+feedback, not part of DogPaddle's durability decision.
+
+The flat checkpoint file is a fixture stand-in for the future MDBX transaction.
+It is the only durable accepted-offset truth. The connector fixture contains no
+`offset.*` property; the product bridge owns its in-memory Kafka Connect offset
+store and restores it solely from `Checkpoint`.
 
 ## Pinned environment
 
 - Debezium `3.6.2.Final`, upstream commit
   `02810e25b19c04e5095b2b6fbbdcbae549a69f19`.
-- PostgreSQL `16.15` (Debian build `16.15-1.pgdg12+2`), from the multi-arch
-  `quay.io/debezium/postgres:16` image pinned at manifest digest
-  `sha256:114cbe1e4f38055e83c9b567a7e0988fb80837b8eb500203b25c0f784a075b92`,
-  and configured with `wal_level=logical`.
-- Eclipse Temurin OpenJDK `21.0.9+10` and Maven `3.9.11` from the linux/amd64
-  Maven image pinned at
-  `sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237`.
-- `pgoutput`, one publication, one persistent replication slot.
-- `snapshot.mode=no_data`.
-- Kafka Connect's public `FileOffsetBackingStore` for the restart witness.
-- `lsn.flush.mode=connector`; `connector_and_driver` is forbidden because it
-  enables pgjdbc automatic LSN flushing.
+- Kafka Connect `4.3.0`.
+- PostgreSQL `16.15`, using `pgoutput`, one publication, and one persistent
+  logical replication slot.
+- Java 17 bytecode on the pinned Eclipse Temurin JDK 21 Maven image.
+- `snapshot.mode=no_data` and `lsn.flush.mode=connector`.
 
-The connector configuration sets `offset.flush.interval.ms=500`; the
-unacknowledged test holds a delivery for four such wall-clock periods. Because
-the handler is deliberately blocked before `markBatchFinished`, this is an
-observation window, not a claim that four offset-store flush attempts occurred.
+`connector_and_driver` remains forbidden because pgjdbc automatic LSN
+flushing would bypass the application ACK boundary.
 
-## One-command gate
+## Run the gate
 
-From the repository root, run:
+From the repository root:
 
 ```bash
 experiments/debezium-d1/scripts/run.sh
 ```
 
-The command audits the exact Debezium source revision, builds and tests the
-Java bridge in the pinned Maven/JDK container, runs Rust format, tests, Clippy,
-and the release build, creates a disposable PostgreSQL volume, and executes the
-process-level JSONL runner. It exits non-zero on the first failed gate.
+The command performs, in order:
 
-The host needs Rust 1.96 or newer with Clippy, Podman with a working Compose
-provider, `git`, `psql`, Python 3, `rg`, `unzip`, and `flock`; network access is
-needed to fetch the pinned source and Maven dependencies. Port `55432` must be
-available on loopback. The runner takes an exclusive fixture lock and refuses
-to delete or replace an existing Compose project with the same name. Its
-cleanup failure is itself a failed run.
+1. an audit of the exact upstream Debezium commit path;
+2. Rust format, unit tests, Clippy, and a release host build;
+3. the product crate's own bridge tests and distribution build, including its
+   manifest, checksums, SBOM, and PostgreSQL connector;
+4. a disposable real PostgreSQL black-box recovery matrix.
 
-Set `D1_KEEP_ARTIFACTS=1` to retain the file offset store and host stderr log
-printed by the cleanup hook, or `D1_KEEP_POSTGRES=1` to leave the fixture
-running for inspection.
+Required local tools are Rust 1.96 or newer with Clippy, Podman with a working
+Compose provider, `git`, `psql`, Python 3, `rg`, `unzip`, and `flock`. Network
+access is needed for the pinned source audit and Maven dependencies. Port
+`55432` must be free.
+
+The runner owns an exclusive fixture lock and refuses to overwrite an existing
+Compose project. Set `D1_KEEP_ARTIFACTS=1` to retain the sole checkpoint and
+stderr log, or `D1_KEEP_POSTGRES=1` to retain PostgreSQL.
 
 ## Required exit gates
 
-The black-box runner must prove all of the following against a real PostgreSQL
-slot:
+The real connector run must prove all of these:
 
-1. Holding a delivery unacknowledged across at least three configured
-   wall-clock observation intervals changes neither `confirmed_flush_lsn` nor
-   the standard file offset bytes.
-2. Acknowledging that delivery advances both `confirmed_flush_lsn` and the file
-   offset bytes.
-3. A fresh Engine using the same `FileOffsetBackingStore` and persistent
-   PostgreSQL slot skips ACKed rows and delivers later rows. This is a combined
-   restart witness: it does not isolate the client file from the server-side
-   slot, and does not prove that captured JSON offsets can initialize an Engine.
-4. Rows written by one multi-row PostgreSQL transaction retain their source
-   order.
-5. Exactly one delivery is outstanding: repeated polls before ACK cannot expose
-   a later batch, and the outstanding token and bytes remain identical.
-6. Rust and HotSpot report the same OS process ID; fresh Engine handles retain
-   one JVM identity, and stop/start leaves at most one active slot consumer.
-7. A too-small `max_bytes`, wrong token, repeated token, and stale cross-handle
-   token all fail closed; a poll timeout is ordinary idle.
-8. On a running Engine, a zero stop deadline returns promptly (either already
-   stopped or with a timeout) while a one-shot daemon worker finishes
-   `engine.close()` and the Engine-thread join; shutdown failure is observable.
-9. An unsafe PostgreSQL configuration and a missing connector class become
-   structured host errors without crossing JNI or crashing the process.
-10. Stopping with an outstanding delivery does not ACK it; a fresh handle
-    replays the same source semantics under a new globally monotonic token.
+1. A normal poll timeout returns idle, and a later PostgreSQL transaction is
+   still delivered.
+2. Dropping the borrowed `Delivery` and polling again returns identical
+   record bytes and checkpoint; no implicit ACK occurs.
+3. An unsaved, unacknowledged batch is replayed by a fresh Engine.
+4. Saving the batch's candidate checkpoint before ACK, stopping without ACK,
+   and starting a fresh Engine from that checkpoint skips the taken-over batch.
+5. `ack` is rejected until the exact candidate checkpoint is durable.
+6. After explicit ACK, a subsequent source poll and/or graceful stop eventually
+   advances PostgreSQL `confirmed_flush_lsn`; ACK return alone is not treated
+   as a synchronous PostgreSQL flush guarantee.
+7. Stopping with another outstanding delivery neither saves nor ACKs it; a
+   fresh Engine from the last accepted checkpoint replays it.
+8. Rows written by one multi-row transaction retain their source order.
+9. `/state/checkpoint.bin` is the only state file; no
+   `FileOffsetBackingStore` or other Java offset file exists.
 
-Byte-for-byte stability applies while an Engine handle remains alive. Across a
-fresh Engine, the replay oracle deliberately excludes three kinds of run-local
-metadata: the outer `SourceRecord.timestamp`, the envelope's top-level
-`ts_ms`/`ts_us`/`ts_ns`, and the `__debezium.context.runId` header. It still
-compares the complete source partition/offset, Connect schemas, keys, rows,
-all metadata actually emitted in the source block (including PostgreSQL
-`txId`), and every other header. The fixture disables Debezium's separate
-transaction-metadata records, so D1 makes no claim about them. A product
-delivery ID must not hash the full serialized envelope.
-
-The D1 JSON is diagnostic. Key/value/header data use Kafka Connect's
-`JsonConverter` with schemas enabled and explicit null preservation. Source
-partition/offset maps preserve every PostgreSQL field used by this gate, but
-JSON does not distinguish every Java numeric runtime type. D3 must define a
-typed, opaque, connector-neutral encoding and restore it through a public
-offset-store SPI; this JSON must not be treated as that production codec.
-
-Any failure is a D1 red result. In particular, increasing the flush interval is
-not an acceptable remedy for an LSN that advances without ACK.
+Within one live connector, byte-for-byte stability includes the opaque
+checkpoint and every encoded key, value, and header. Across a fresh Engine, the
+replay oracle excludes only outer `SourceRecord.timestamp`, the envelope's
+processing `ts_ms`/`ts_us`/`ts_ns`, and the
+`__debezium.context.runId` header. The JSON remains diagnostic and is not a
+product protocol.
 
 ## Source audit
 
-Run:
+Run the audit independently with:
 
 ```bash
 experiments/debezium-d1/scripts/audit-debezium-source.sh
 ```
 
-The audit clones the exact upstream tag and checks the public commit path that
-the black-box test is intended to validate:
+It pins the upstream tag and verifies the public path:
 
 ```text
 RecordCommitter.markProcessed
-  -> OffsetStorageWriter.offset(complete partition, complete offset)
+  -> OffsetStorageWriter.offset
 RecordCommitter.markBatchFinished
   -> OffsetCommitPolicy
   -> offset-store flush
@@ -129,40 +142,21 @@ RecordCommitter.markBatchFinished
   -> replicationStream.flushLsn
 ```
 
-In Debezium 3.6.2, elapsed time alone does not add an unprocessed record to the
-offset writer. The black-box test remains mandatory because this source reading
-does not prove runtime configuration, pgjdbc behavior, shutdown behavior, or
-future-version behavior.
+The audit also checks that the product bridge does not copy or shadow
+`io.debezium.*`, declares no Java-to-Rust native callback, and that the D1
+fixture itself contains neither Java bridge source nor a direct `jni`
+dependency.
 
-The source and build gates also reject any local Java source declaring an
-`io.debezium.*` package and any bridge JAR containing `io/debezium/**` classes.
-That makes “stock” mechanically checkable rather than relying on directory
-layout or manual review.
+## Fixture lifecycle
 
-## PostgreSQL fixture
-
-The fixture is intentionally local and disposable. Start it with:
-
-```bash
-podman compose \
-  --project-name dogpaddle-debezium-d1 \
-  --file experiments/debezium-d1/compose.yaml \
-  up --detach postgres
-```
-
-It listens only on `127.0.0.1:55432`. Remove the scoped test
-database and volume with:
+PostgreSQL listens only on `127.0.0.1:55432`. To remove an intentionally
+retained fixture:
 
 ```bash
 experiments/debezium-d1/scripts/clean.sh
 ```
 
-The executable black-box runner and host are kept outside `crates/`: passing
-D1 is evidence for the architecture decision, not a product implementation,
-an isolated `FileOffsetBackingStore` recovery proof, or a claim about future
-MDBX-backed recovery. Direct opaque-offset injection belongs to D3.
-
-The accepted 2026-09-04 run and its exact observations are recorded in
+The current evidence and remaining boundaries are recorded in
 [`D1_REPORT.md`](D1_REPORT.md).
 
 ## References

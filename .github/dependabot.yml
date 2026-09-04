@@ -19,3 +19,9 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: maven
+    directory: /crates/debezium/bridge
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

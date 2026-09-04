@@ -39,9 +39,9 @@ DogPaddle 采用以下组合：
 
 ### 1. Rust 是宿主与最终协调者
 
-Rust 进程创建 JVM，拥有 Flow、Store、SourceDriver 和 connector handle 的生命周期。
-Java 只负责运行 Debezium Engine、缓冲一个有界 delivery，并在 Rust 明确 ACK 后通知
-Debezium `RecordCommitter`。
+Rust 进程创建 JVM，拥有 Flow、Store 和 connector 生命周期。
+Java 只负责运行 Debezium Engine、保留一个 outstanding delivery、把最终 encoded frame 限在
+配置大小内，并在 Rust 明确 ACK 后通知 Debezium `RecordCommitter`。
 
 Rust 保留以下权威：
 
@@ -91,7 +91,7 @@ SourceRecord envelope、connector 与故障恢复验收，不使用浮动 latest
 
 ### 4. Java bridge 只提供 Rust pull/ack API
 
-bridge 是 connector-neutral 静态 API：
+D1 bridge 的 connector-neutral 私有 JNI API 是：
 
 ```text
 create(config_bytes) -> handle
@@ -106,11 +106,14 @@ D1 对应的精确 JNI 形状是 `create([B)J`、`start(J)V`、`poll(JJI)[B`、
 `ack(JJ)V`、`stop(JJ)V` 与 `status(J)[B`。生产版本可以对 envelope 做版本化演进，
 但不能改变 pull/ack 方向或单 outstanding 契约。
 
-该 API 的语义是：
+这些 handle、token 和 status 只用于 D1 观测与产品内部实现；D2 的 Rust public API 收敛为
+`DebeziumRuntime::open`、`runtime.start`、`Connector::poll`、线性 `Delivery::ack(self)` 与
+`Connector::stop`，不向应用暴露 JNI 状态机。其语义是：
 
 - `create` 只创建独立 handle，不把 Java object reference 暴露给连接器代码；
 - `start` 启动该 handle 的 Engine 工作线程；
-- Engine callback 只把完整批次封装到有界 Java 队列；
+- Engine callback 只保留一个完整批次并编码成有界 frame；这个 wire 上限不等于 Engine 批次或
+  Kafka Connect JSON 转换过程的 JVM heap 硬配额；
 - `poll` 由 Rust 主动调用，timeout 表示当前无数据，返回值是 Rust 拥有的字节；
 - 每个 handle 同时至多有一个 outstanding delivery；
 - 未收到正确 token 的 `ack` 前，bridge 不交付下一批；
@@ -126,7 +129,7 @@ D1 对应的精确 JNI 形状是 `create([B)J`、`start(J)V`、`poll(JJI)[B`、
 
 D1 诊断 envelope 需不丢字段地保留 PostgreSQL `SourceRecord` 的 source partition、source
 offset、key、value 和 schema，用来验证 bridge 可控性；其 JSON 表达不承诺区分任意 connector
-offset 中所有 Java 数值运行类型。产品的 type-injective opaque wire encoding 在 D3 固化，
+offset 中所有 Java 数值运行类型。产品的完整 opaque checkpoint 与 binary delivery 在 D2 固化，
 并必须继续满足版本化、owned bytes、有界大小与 connector-neutral。
 
 ### 5. MDBX 是 durable offset 唯一真相
@@ -134,14 +137,21 @@ offset 中所有 Java 数值运行类型。产品的 type-injective opaque wire 
 D1 缺省使用 `MemoryOffsetBackingStore`，并允许试验显式透传
 `FileOffsetBackingStore`；它们都不构成 DogPaddle 的重启恢复声明。D1 使用
 `OffsetCommitPolicy.always()`，PostgreSQL fixture 设置 `lsn.flush.mode=connector`，以保持
-ACK 和 connector LSN flush 的可观察控制。D2 先建立 generic durable ingress，D3 才将
-Debezium opaque partition/offset 与它集成。
+ACK 和 connector LSN flush 的可观察控制。这里的 ACK success 只证明 Engine handler 已 settle
+且实际 Kafka Connect offset-store image 与 ACK 前 checkpoint 一致，不承诺 connector-specific
+外部 progress 已同步发布。Debezium 3.6.2 的 PostgreSQL task 在 `SourceTask.commit()` 中安排
+flush；健康运行时预期在下一次 poll 开头或 stop 执行并最终观察到 `confirmed_flush_lsn` 推进，
+但这不属于 ACK success。generic task commit failure 也可能由 Engine 内部转成非抛出结果。
+因此 checkpoint 是恢复正确性边界，外部 progress lag 另作运行监控与真实 connector gate。
+D2 先建立独立 Debezium runtime 与 pre-ACK checkpoint，D3 再围绕这个已经稳定的交付面建立
+generic durable ingress。
 
 D3 及以后的提交规则是：
 
 1. Rust poll 到一个 delivery；
-2. `Flow::ingest` 把 accepted checkpoint、delivery identity 和 pending payload 原子写入 MDBX；
-3. 只有 commit 成功，或 MDBX 已经记录相同 delivery，Rust 才 ACK Java bridge；
+2. `Flow::ingest` 把 accepted checkpoint、pending payload，以及 D3 经故障矩阵证明必需的最小
+   replay receipt 原子写入 MDBX；
+3. 只有 commit 成功，或 MDBX 已精确验证同一 durable ingress 状态，Rust 才 ACK Java bridge；
 4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建；
 5. IngressSource 在一个后续 MDBX transaction 中同时清除 pending 并写 Station output。
 
@@ -151,7 +161,9 @@ connector-specific 字段推导通用顺序。
 
 ### 6. PostgreSQL 只是第一个试点
 
-PostgreSQL connector 在 D4 中验证 bridge、opaque offset、durable ingress 和 `Change` 转换。
+PostgreSQL connector 在 D2 中只作为真实 fixture 验证 generic bridge、pre-ACK checkpoint 与
+fresh Engine 恢复；D4 才交付 PostgreSQL Source definition、catalog/identity 规则、固定 Schema
+转换、durable ingress/Flow 组合和 `Change` 语义。
 以下内容可以是 PostgreSQL-specific：
 
 - connection/publication/slot/table 配置；
@@ -163,7 +175,7 @@ PostgreSQL connector 在 D4 中验证 bridge、opaque offset、durable ingress �
 以下内容不得是 PostgreSQL-specific：
 
 - JVM 创建与共享；
-- bridge handle 与 start/poll/ack/status/stop；
+- runtime、linear Delivery 与 start/poll/ack/stop；
 - owned delivery envelope 的外层协议；
 - durable ingress 的 accepted/pending/duplicate/backpressure 语义；
 - Flow/Station 的事务和调度边界。
@@ -240,15 +252,15 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 ### 让 Debezium 直接写 Station output
 
 这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和 consumer frontier，并要求
-Java/driver 获得 Flow 的写事务能力。外部 delivery 必须先通过 D2 durable ingress，再由普通
+Java/connector 获得 Flow 的写事务能力。外部 delivery 必须先通过 D3 durable ingress，再由普通
 Source Operation 输出。
 
 ## 后续决策
 
 本 ADR 不冻结以下细节，它们由对应阶段的证据决定：
 
-- D3 产品 delivery envelope 的具体 binary encoding；
-- SourceDriver 最终是由 `Flow` 直接持有，还是由同进程 runner 在 Flow 外协调；
+- D2 之后 binary delivery/checkpoint 的版本演进方式；
+- D3 之后是否真的需要由第二个实现证明的通用 driver trait；
 - PostgreSQL 多表是每表 Engine、单 Engine 路由，还是更高层组合；
 - D6 使用 stock Debezium snapshot 还是需要独立 Rust snapshot reader；
 - D7 的第二 connector 选择；
