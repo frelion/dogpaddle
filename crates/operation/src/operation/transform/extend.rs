@@ -12,7 +12,7 @@ use crate::{
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 6;
@@ -176,8 +176,8 @@ impl OperationDefinition for ExtendDefinition {
     }
 }
 
-impl Operation for ExtendOperation {
-    fn turn(
+impl TransactionalOperation for ExtendOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

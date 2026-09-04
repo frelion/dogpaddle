@@ -37,8 +37,8 @@
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
-| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
+| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：D2 不建立 Criterion benchmark；真实 connector 的长稳、资源
@@ -84,7 +84,8 @@ Arrow 时必须更新当前 golden，并重跑 proto roundtrip、build/open/reop
 
 内建算子的 conformance 使用同一证据形状，不按算子复制测试框架：codec 分区冻结十个 tag、
 canonical payload 与损坏拒绝，definition 分区覆盖 kind/arity/data 和 exact Schema 成功/拒绝，runtime
-分区覆盖 Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖纯失败无目录副作用、
+分区覆盖线性 turn、Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖提交前
+completion 丢弃、提交后执行、post-commit fail-stop、纯失败无目录副作用、
 稳定资源名、build/open/reopen 和运行期 Schema guard。RunningEventCount 的公共 API 与 data 资源名
 采用当前简化基线：Definition tag 为 `2`，逻辑 data 名为 `running_event_count.count`。不保留旧 API
 alias、资源路径 fallback 或迁移；正确性不约束旧库行为，只证明当前 golden、当前资源布局和当前

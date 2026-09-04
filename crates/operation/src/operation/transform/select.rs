@@ -12,7 +12,7 @@ use crate::{
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 7;
@@ -233,8 +233,8 @@ impl OperationDefinition for SelectDefinition {
     }
 }
 
-impl Operation for SelectOperation {
-    fn turn(
+impl TransactionalOperation for SelectOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

@@ -1,6 +1,10 @@
 use std::{
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
-    sync::Arc,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
@@ -9,13 +13,13 @@ use dogpaddle_change::{Change, encode_change};
 use dogpaddle_operation::{
     OperationKind,
     operation::{
-        Action, Operation, OperationError, OperationInput, sink::DiscardDefinition,
-        source::SequenceSourceDefinition, transform::RunningEventCountDefinition,
+        Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+        sink::DiscardDefinition, source::SequenceSourceDefinition,
+        transform::RunningEventCountDefinition,
     },
 };
 use dogpaddle_store::{
-    AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, Store, StoreError, TransactionAccess,
-    Transactions,
+    AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, Store, StoreError, Transactions,
 };
 
 use crate::{
@@ -90,14 +94,23 @@ impl MultiInputFixture {
 }
 
 enum ScriptResult {
+    TurnIdle,
     Action(Action),
     Error,
+}
+
+#[derive(Clone)]
+struct ScriptedAfterCommit {
+    runs: Arc<AtomicUsize>,
+    fails: bool,
+    panics: bool,
 }
 
 struct ScriptedOperation {
     write: Option<(State, Vec<u8>)>,
     poison_with: Option<(State, tempfile::TempDir)>,
     result: ScriptResult,
+    after_commit: Option<ScriptedAfterCommit>,
 }
 
 impl ScriptedOperation {
@@ -106,6 +119,16 @@ impl ScriptedOperation {
             write: None,
             poison_with: None,
             result: ScriptResult::Action(action),
+            after_commit: None,
+        }
+    }
+
+    fn idle_before_transaction(state: State, value: &[u8]) -> Self {
+        Self {
+            write: Some((state, value.to_vec())),
+            poison_with: None,
+            result: ScriptResult::TurnIdle,
+            after_commit: None,
         }
     }
 
@@ -114,29 +137,85 @@ impl ScriptedOperation {
             write: Some((state, value.to_vec())),
             poison_with: None,
             result,
+            after_commit: None,
         }
+    }
+
+    fn with_after_commit(mut self, runs: Arc<AtomicUsize>, fails: bool) -> Self {
+        self.after_commit = Some(ScriptedAfterCommit {
+            runs,
+            fails,
+            panics: false,
+        });
+        self
+    }
+
+    fn with_panicking_after_commit(mut self, runs: Arc<AtomicUsize>) -> Self {
+        self.after_commit = Some(ScriptedAfterCommit {
+            runs,
+            fails: false,
+            panics: true,
+        });
+        self
     }
 }
 
 impl Operation for ScriptedOperation {
-    fn turn(
-        &mut self,
-        _input: Option<OperationInput<'_>>,
-        access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        if let Some((state, value)) = &self.write {
-            state.access(access)?.put(&b"attempt".to_vec(), value)?;
+    fn turn<'turn>(
+        &'turn mut self,
+        _input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
+        if matches!(self.result, ScriptResult::TurnIdle) {
+            return Ok(Turn::Idle);
         }
-        if let Some((foreign, _)) = &self.poison_with {
-            assert!(matches!(
-                foreign.access(access),
-                Err(StoreError::WrongStore)
-            ));
-        }
-        match &self.result {
-            ScriptResult::Action(action) => Ok(action.clone()),
-            ScriptResult::Error => Err(std::io::Error::other("planned turn failure").into()),
-        }
+
+        let write = self.write.clone();
+        let poison_with = self
+            .poison_with
+            .as_ref()
+            .map(|(foreign, _root)| foreign.clone());
+        let result = match &self.result {
+            ScriptResult::TurnIdle => unreachable!("handled before preparing a transaction"),
+            ScriptResult::Action(action) => Ok(repeat_action(action)),
+            ScriptResult::Error => Err(()),
+        };
+        let after_commit = self.after_commit.clone();
+        Ok(Turn::ready(move |access| {
+            if let Some((state, value)) = &write {
+                state.access(access)?.put(&b"attempt".to_vec(), value)?;
+            }
+            if let Some(foreign) = &poison_with {
+                assert!(matches!(
+                    foreign.access(access),
+                    Err(StoreError::WrongStore)
+                ));
+            }
+            let action = result.map_err(|()| {
+                OperationError::from(std::io::Error::other("planned turn failure"))
+            })?;
+            let after_commit = after_commit.map_or_else(AfterCommit::none, |script| {
+                AfterCommit::new(move || {
+                    script.runs.fetch_add(1, Ordering::Relaxed);
+                    assert!(!script.panics, "planned after-commit panic");
+                    if script.fails {
+                        Err(PostCommitError::new(std::io::Error::other(
+                            "planned after-commit failure",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
+            Ok((action, after_commit))
+        }))
+    }
+}
+
+fn repeat_action(action: &Action) -> Action {
+    match action {
+        Action::Idle => Action::Idle,
+        Action::Commit(output) => Action::Commit(output.clone()),
+        Action::Complete(output) => Action::Complete(output.clone()),
     }
 }
 
@@ -310,6 +389,229 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
         (1, 1..2, 1..2)
     );
     assert_eq!(claim_id(&fixture.stations[1]), Some((0, 1)));
+}
+
+#[test]
+fn turn_idle_skips_the_transactional_body() {
+    let mut fixture = source_sink(1, NonZeroU64::MAX);
+    let state = fixture.stations[0].inbox.state().clone();
+    fixture.stations[0].operation = Box::new(ScriptedOperation::idle_before_transaction(
+        state.clone(),
+        b"must-not-run",
+    ));
+
+    assert_eq!(fixture.step(0), AdvanceOutcome::Idle);
+    assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+    assert_eq!(fixture.bounds(0), 0..0);
+}
+
+#[test]
+fn after_commit_runs_once_per_successful_store_commit() {
+    let mut fixture = source_sink(1, NonZeroU64::MAX);
+    let state = fixture.stations[0].inbox.state().clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.stations[0].operation = Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"committed",
+            ScriptResult::Action(Action::Commit(None)),
+        )
+        .with_after_commit(Arc::clone(&runs), false),
+    );
+
+    assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions).as_deref(),
+        Some(b"committed".as_slice())
+    );
+
+    assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn after_commit_panic_leaves_the_station_needing_reopen() {
+    let mut fixture = multi_input_station(Action::Idle);
+    assert_eq!(fixture.step(), AdvanceOutcome::Progressed);
+    assert_eq!(claim_id(&fixture.station), Some((1, 0)));
+    let state = fixture.station.inbox.state().clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.station.operation = Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"committed-before-panic",
+            ScriptResult::Action(Action::Complete(None)),
+        )
+        .with_panicking_after_commit(Arc::clone(&runs)),
+    );
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = fixture.station.process(&mut fixture.transactions);
+    }));
+    assert!(panic.is_err());
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions).as_deref(),
+        Some(b"committed-before-panic".as_slice())
+    );
+    assert_eq!((fixture.active(), fixture.cursor(1)), (0, 1));
+    assert_eq!(fixture.bounds(1), 1..1);
+    assert_eq!(claim_id(&fixture.station), Some((1, 0)));
+
+    let error = fixture
+        .station
+        .process(&mut fixture.transactions)
+        .unwrap_err();
+    assert!(error.requires_reopen());
+    assert!(matches!(error, StationError::NeedsReopen));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+    let reopened = reopen_multi_input(fixture, Action::Complete(None));
+    reopened.station.ensure_runnable().unwrap();
+    assert_eq!(claim_id(&reopened.station), None);
+}
+
+#[test]
+fn after_commit_is_abandoned_for_idle_apply_error_commit_error_and_backpressure() {
+    {
+        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let state = fixture.stations[0].inbox.state().clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        fixture.stations[0].operation = Box::new(
+            ScriptedOperation::writing(
+                state.clone(),
+                b"action-idle",
+                ScriptResult::Action(Action::Idle),
+            )
+            .with_after_commit(Arc::clone(&runs), false),
+        );
+
+        assert_eq!(fixture.step(0), AdvanceOutcome::Idle);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+    }
+
+    {
+        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let state = fixture.stations[0].inbox.state().clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        fixture.stations[0].operation = Box::new(
+            ScriptedOperation::writing(state.clone(), b"operation-error", ScriptResult::Error)
+                .with_after_commit(Arc::clone(&runs), false),
+        );
+
+        assert!(matches!(
+            fixture.try_step(0),
+            Err(StationError::Operation(_))
+        ));
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+    }
+
+    {
+        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let state = fixture.stations[0].inbox.state().clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        fixture.stations[0].operation = Box::new(
+            poisoned_script(&state, b"commit-error", Action::Commit(None))
+                .with_after_commit(Arc::clone(&runs), false),
+        );
+
+        assert!(matches!(
+            fixture.try_step(0),
+            Err(StationError::Store(StoreError::TransactionPoisoned))
+        ));
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+    }
+
+    {
+        let mut fixture = source_sink(1, NonZeroU64::MIN);
+        assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
+        let state = fixture.stations[0].inbox.state().clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        fixture.stations[0].operation = Box::new(
+            ScriptedOperation::writing(
+                state.clone(),
+                b"backpressured",
+                ScriptResult::Action(Action::Commit(Some(change(&[9])))),
+            )
+            .with_after_commit(Arc::clone(&runs), false),
+        );
+
+        assert_eq!(fixture.step(0), AdvanceOutcome::Backpressured);
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+        assert_eq!(fixture.bounds(0), 0..1);
+    }
+}
+
+#[test]
+fn after_commit_failure_preserves_the_commit_and_clears_the_completed_claim() {
+    let mut fixture = multi_input_station(Action::Idle);
+    assert_eq!(fixture.step(), AdvanceOutcome::Progressed);
+    assert_eq!(claim_id(&fixture.station), Some((1, 0)));
+    let state = fixture.station.inbox.state().clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.station.operation = Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"committed-before-failure",
+            ScriptResult::Action(Action::Complete(None)),
+        )
+        .with_after_commit(Arc::clone(&runs), true),
+    );
+
+    let first_error = fixture
+        .station
+        .process(&mut fixture.transactions)
+        .unwrap_err();
+    assert!(first_error.requires_reopen());
+    let StationError::AfterCommit { source } = first_error else {
+        panic!("first failure did not retain its after-commit source");
+    };
+    assert_eq!(source.to_string(), "planned after-commit failure");
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions).as_deref(),
+        Some(b"committed-before-failure".as_slice())
+    );
+    assert_eq!((fixture.active(), fixture.cursor(1)), (0, 1));
+    assert_eq!(fixture.bounds(1), 1..1);
+    assert_eq!(claim_id(&fixture.station), None);
+
+    let process_error = fixture
+        .station
+        .process(&mut fixture.transactions)
+        .unwrap_err();
+    assert!(process_error.requires_reopen());
+    assert!(matches!(process_error, StationError::NeedsReopen));
+
+    let transaction = fixture.transactions.begin().unwrap();
+    fixture.station.inbox.ports()[0]
+        .output()
+        .log()
+        .access(transaction.access())
+        .unwrap()
+        .append(&encode_change(&change(&[8])).unwrap())
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(fixture.bounds(0), 0..1);
+
+    let advance_error = fixture.try_step().unwrap_err();
+    assert!(advance_error.requires_reopen());
+    assert!(matches!(advance_error, StationError::NeedsReopen));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.cursor(0), 0);
+    assert_eq!(fixture.bounds(0), 0..1);
+    assert_eq!(claim_id(&fixture.station), None);
+
+    let mut reopened = reopen_multi_input(fixture, Action::Complete(None));
+    assert_eq!(reopened.step(), AdvanceOutcome::Progressed);
+    assert_eq!((reopened.active(), reopened.cursor(0)), (1, 1));
+    assert_eq!(reopened.bounds(0), 1..1);
+    assert_eq!(claim_id(&reopened.station), None);
 }
 
 #[test]

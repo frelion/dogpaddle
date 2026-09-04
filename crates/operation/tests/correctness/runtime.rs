@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int32Array,
@@ -11,7 +17,7 @@ use dogpaddle_operation::{
     DataInstances, Expr, ExpressionError, OperationDefinition, Operator, ScalarValue, cast, col,
     decode_definition, encode_definition, lit,
     operation::{
-        Action, Operation, OperationInput,
+        Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
         sink::{DiscardError, DiscardOperation},
         source::{SequenceSourceError, SequenceSourceOperation},
         transform::{
@@ -25,7 +31,126 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store, StoreError};
 
-use super::support::TestStore;
+use super::support::{TestStore, commit_ready, rollback_ready};
+
+#[test]
+fn post_commit_error_accepts_an_already_erased_operation_error() {
+    let source: OperationError = Box::new(std::io::Error::other("erased failure"));
+    assert_eq!(PostCommitError::from(source).to_string(), "erased failure");
+}
+
+struct BorrowedDeliveryConnector {
+    acknowledgements: Arc<AtomicUsize>,
+}
+
+impl BorrowedDeliveryConnector {
+    fn poll(&mut self) -> BorrowedDelivery<'_> {
+        BorrowedDelivery { connector: self }
+    }
+}
+
+struct BorrowedDelivery<'connector> {
+    connector: &'connector mut BorrowedDeliveryConnector,
+}
+
+impl BorrowedDelivery<'_> {
+    fn ack(self) {
+        self.connector
+            .acknowledgements
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct BorrowedDeliverySource {
+    accepted: Cell<u64>,
+    connector: BorrowedDeliveryConnector,
+}
+
+impl Operation for BorrowedDeliverySource {
+    fn turn<'turn>(
+        &'turn mut self,
+        input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
+        assert!(input.is_none());
+        let accepted = self.accepted.clone();
+        let delivery = self.connector.poll();
+        Ok(Turn::ready(move |access| {
+            accepted.access(access)?.set(&7)?;
+            Ok((
+                Action::Commit(None),
+                AfterCommit::new(move || {
+                    delivery.ack();
+                    Ok(())
+                }),
+            ))
+        }))
+    }
+}
+
+#[test]
+fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() {
+    let fixture = TestStore::new();
+    let mut store = Store::create(fixture.path()).unwrap();
+    let accepted = store.create_data::<Cell<u64>>("accepted").unwrap();
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let mut operation = BorrowedDeliverySource {
+        accepted: accepted.clone(),
+        connector: BorrowedDeliveryConnector {
+            acknowledgements: Arc::clone(&acknowledgements),
+        },
+    };
+    let mut transactions = store.into_transactions();
+
+    {
+        let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
+            panic!("delivery source did not prepare its polled delivery");
+        };
+        let transaction = transactions.begin().unwrap();
+        let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap()
+        else {
+            panic!("delivery source did not stage its checkpoint");
+        };
+        drop(transaction);
+        drop(after_commit);
+    }
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    {
+        let transaction = transactions.begin().unwrap();
+        assert_eq!(
+            accepted
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            None
+        );
+        transaction.commit().unwrap();
+    }
+
+    let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
+        panic!("delivery source did not prepare the replayed delivery");
+    };
+    let transaction = transactions.begin().unwrap();
+    let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap() else {
+        panic!("delivery source did not stage its replayed checkpoint");
+    };
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    transaction.commit().unwrap();
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    after_commit.run().unwrap();
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 1);
+
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        accepted
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(7)
+    );
+    transaction.commit().unwrap();
+}
 
 fn change(diffs: &[i64]) -> Change {
     change_with_field_name("input", diffs)
@@ -77,11 +202,12 @@ fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change) -> 
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("round-tripped stateless Operation did not complete with output");
     };
     output
@@ -172,33 +298,33 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let mut transactions = store.into_transactions();
 
     for commit in [false, true] {
-        let transaction = transactions.begin().unwrap();
+        let source_action = if commit {
+            commit_ready(&mut source, None, &mut transactions)
+        } else {
+            rollback_ready(&mut source, None, &mut transactions)
+        }
+        .unwrap();
         assert_eq!(
-            output_values(
-                source.turn(None, transaction.access()).unwrap(),
-                ExpectedAction::Commit,
-                "value",
-            ),
+            output_values(source_action, ExpectedAction::Commit, "value"),
             [41]
         );
+        let transform_action = if commit {
+            commit_ready(&mut transform, Some(turn_input(&input)), &mut transactions)
+        } else {
+            rollback_ready(&mut transform, Some(turn_input(&input)), &mut transactions)
+        }
+        .unwrap();
         assert_eq!(
-            output_values(
-                transform
-                    .turn(Some(turn_input(&input)), transaction.access())
-                    .unwrap(),
-                ExpectedAction::Complete,
-                "count",
-            ),
+            output_values(transform_action, ExpectedAction::Complete, "count"),
             [1, 2]
         );
-        assert!(matches!(
-            sink.turn(Some(turn_input(&input)), transaction.access())
-                .unwrap(),
-            Action::Complete(None)
-        ));
-        if commit {
-            transaction.commit().unwrap();
+        let sink_action = if commit {
+            commit_ready(&mut sink, Some(turn_input(&input)), &mut transactions)
+        } else {
+            rollback_ready(&mut sink, Some(turn_input(&input)), &mut transactions)
         }
+        .unwrap();
+        assert!(matches!(sink_action, Action::Complete(None)));
     }
     drop(transactions);
 
@@ -208,10 +334,9 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let count_state = store.open_data::<Cell<u64>>("count").unwrap();
     let mut transform = RunningEventCountOperation::new(count_state.clone());
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
     assert_eq!(
         output_values(
-            source.turn(None, transaction.access()).unwrap(),
+            commit_ready(&mut source, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -219,14 +344,13 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     );
     assert_eq!(
         output_values(
-            transform
-                .turn(Some(turn_input(&input)), transaction.access())
-                .unwrap(),
+            commit_ready(&mut transform, Some(turn_input(&input)), &mut transactions,).unwrap(),
             ExpectedAction::Complete,
             "count",
         ),
         [3, 4]
     );
+    let transaction = transactions.begin().unwrap();
     assert_eq!(
         count_state
             .access(transaction.access())
@@ -253,89 +377,82 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     let mut transactions = store.into_transactions();
 
     for expected in [u64::MAX - 1, u64::MAX] {
-        let transaction = transactions.begin().unwrap();
         assert_eq!(
             output_values(
-                source.turn(None, transaction.access()).unwrap(),
+                commit_ready(&mut source, None, &mut transactions).unwrap(),
                 ExpectedAction::Commit,
                 "value",
             ),
             [expected]
         );
-        transaction.commit().unwrap();
     }
     for _ in 0..2 {
-        let transaction = transactions.begin().unwrap();
         assert!(matches!(
-            source.turn(None, transaction.access()).unwrap(),
+            rollback_ready(&mut source, None, &mut transactions).unwrap(),
             Action::Idle
         ));
     }
 
-    let transaction = transactions.begin().unwrap();
-    let source_error = source
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap_err();
+    let source_error =
+        rollback_ready(&mut source, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
         source_error.downcast_ref::<SequenceSourceError>(),
         Some(SequenceSourceError::UnexpectedInput)
     ));
 
-    let count_error = count.turn(None, transaction.access()).unwrap_err();
+    let count_error = rollback_ready(&mut count, None, &mut transactions).unwrap_err();
     assert!(matches!(
         count_error.downcast_ref::<RunningEventCountError>(),
         Some(RunningEventCountError::MissingInput)
     ));
-    let count_error = count
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let count_error = rollback_ready(
+        &mut count,
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         count_error.downcast_ref::<RunningEventCountError>(),
         Some(RunningEventCountError::InvalidInputPort { port: 1 })
     ));
 
-    let sink_error = sink.turn(None, transaction.access()).unwrap_err();
+    let sink_error = rollback_ready(&mut sink, None, &mut transactions).unwrap_err();
     assert!(matches!(
         sink_error.downcast_ref::<DiscardError>(),
         Some(DiscardError::MissingInput)
     ));
-    let sink_error = sink
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let sink_error = rollback_ready(
+        &mut sink,
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         sink_error.downcast_ref::<DiscardError>(),
         Some(DiscardError::InvalidInputPort { port: 1 })
     ));
 
-    drop(transaction);
     drop(transactions);
     let foreign_root = tempfile::tempdir().unwrap();
     let foreign = Store::create(foreign_root.path().join("foreign")).unwrap();
     let mut foreign_transactions = foreign.into_transactions();
-    let transaction = foreign_transactions.begin().unwrap();
-    let error = source.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(&mut source, None, &mut foreign_transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::WrongStore)
     ));
-    drop(transaction);
-
-    let transaction = foreign_transactions.begin().unwrap();
-    let error = count
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap_err();
+    let error = rollback_ready(
+        &mut count,
+        Some(turn_input(&input)),
+        &mut foreign_transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::WrongStore)
@@ -350,22 +467,20 @@ fn project_input_protocol_errors_are_exact() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let missing = project.turn(None, transaction.access()).unwrap_err();
+    let missing = rollback_ready(&mut project, None, &mut transactions).unwrap_err();
     assert!(matches!(
         missing.downcast_ref::<ProjectError>(),
         Some(ProjectError::MissingInput)
     ));
-    let invalid_port = project
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let invalid_port = rollback_ready(
+        &mut project,
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         invalid_port.downcast_ref::<ProjectError>(),
         Some(ProjectError::InvalidInputPort { port: 1 })
@@ -378,9 +493,8 @@ fn project_input_protocol_errors_are_exact() {
     )]));
     let mut mismatched =
         ProjectOperation::new(ChangeProjection::try_new(expected_schema, [0]).unwrap());
-    let error = mismatched
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap_err();
+    let error =
+        rollback_ready(&mut mismatched, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectError>(),
         Some(ProjectError::Projection(ProjectionError::SchemaMismatch))
@@ -406,11 +520,8 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
         panic!("Project did not complete with one output Change");
     };
@@ -470,12 +581,12 @@ fn filter_keeps_only_true_rows_with_the_same_order_records_and_diffs() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("Filter did not complete with a partial output Change");
     };
     assert_eq!(output.schema(), schema);
@@ -566,12 +677,12 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("Filter did not produce its partial heterogeneous output");
     };
     assert_eq!(output.schema(), schema);
@@ -605,16 +716,16 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     let mut all_true = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
-    let Action::Complete(Some(output)) = all_true
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        all_true.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("all-true Filter did not retain its complete input");
     };
     assert!(Arc::ptr_eq(
@@ -632,9 +743,12 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
             input.schema(),
         );
         assert!(matches!(
-            operation
-                .turn(Some(turn_input(&input)), transaction.access())
-                .unwrap(),
+            commit_ready(
+                operation.as_mut(),
+                Some(turn_input(&input)),
+                &mut transactions,
+            )
+            .unwrap(),
             Action::Complete(None)
         ));
     }
@@ -665,12 +779,12 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("Extend did not complete with one output Change");
     };
     assert_eq!(output.schema().fields().len(), 3);
@@ -702,9 +816,8 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
         &ExtendDefinition::try_new("label_copy", col("label")).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(copied)) = copy
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
+    let Action::Complete(Some(copied)) =
+        commit_ready(copy.as_mut(), Some(turn_input(&input)), &mut transactions).unwrap()
     else {
         panic!("column-copy Extend did not complete");
     };
@@ -728,40 +841,38 @@ fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let error = filter.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(filter.as_mut(), None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<FilterError>(),
         Some(FilterError::MissingInput)
     ));
-    let error = filter
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        filter.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<FilterError>(),
         Some(FilterError::InvalidInputPort { port: 1 })
     ));
-    let error = extend.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(extend.as_mut(), None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ExtendError>(),
         Some(ExtendError::MissingInput)
     ));
-    let error = extend
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        extend.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ExtendError>(),
         Some(ExtendError::InvalidInputPort { port: 1 })
@@ -778,9 +889,12 @@ fn filter_and_extend_reject_protocol_errors_and_runtime_schema_drift() {
     )
     .unwrap();
     for operation in [&mut filter, &mut extend] {
-        let error = operation
-            .turn(Some(turn_input(&drifted)), transaction.access())
-            .unwrap_err();
+        let error = rollback_ready(
+            operation.as_mut(),
+            Some(turn_input(&drifted)),
+            &mut transactions,
+        )
+        .unwrap_err();
         let schema_mismatch = error.downcast_ref::<FilterError>().is_some_and(|error| {
             matches!(
                 error,
@@ -1007,12 +1121,12 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("Select did not complete with one output Change");
     };
     assert_eq!(output.schema().field(0).name(), "copied");
@@ -1068,12 +1182,12 @@ fn schema_align_applies_explicit_schema_and_shares_direct_columns_and_diffs() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("SchemaAlign did not complete with one output Change");
     };
     assert_eq!(output.schema().metadata().get("normalized").unwrap(), "v1");
@@ -1114,12 +1228,12 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("empty SchemaAlign did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), input.num_rows());
@@ -1131,9 +1245,12 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
     );
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
-    let error = operation
-        .turn(Some(turn_input(&drifted)), transaction.access())
-        .unwrap_err();
+    let error = rollback_ready(
+        operation.as_mut(),
+        Some(turn_input(&drifted)),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SchemaAlignError>(),
         Some(SchemaAlignError::InputSchemaMismatch)
@@ -1152,31 +1269,32 @@ fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let error = operation.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SchemaAlignError>(),
         Some(SchemaAlignError::MissingInput)
     ));
-    let error = operation
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        operation.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SchemaAlignError>(),
         Some(SchemaAlignError::InvalidInputPort { port: 1 })
     ));
 
     let drifted = change_with_field_name("other", &[1]);
-    let error = operation
-        .turn(Some(turn_input(&drifted)), transaction.access())
-        .unwrap_err();
+    let error = rollback_ready(
+        operation.as_mut(),
+        Some(turn_input(&drifted)),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SchemaAlignError>(),
         Some(SchemaAlignError::InputSchemaMismatch)
@@ -1191,12 +1309,12 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("empty Select did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), input.num_rows());
@@ -1208,9 +1326,12 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     );
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
-    let error = operation
-        .turn(Some(turn_input(&drifted)), transaction.access())
-        .unwrap_err();
+    let error = rollback_ready(
+        operation.as_mut(),
+        Some(turn_input(&drifted)),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SelectError>(),
         Some(SelectError::InputSchemaMismatch)
@@ -1245,19 +1366,16 @@ fn union_all_forwards_every_legal_port_without_copying() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     for port in 0..3 {
-        let Action::Complete(Some(output)) = operation
-            .turn(
-                Some(OperationInput {
-                    port,
-                    change: &input,
-                }),
-                transaction.access(),
-            )
-            .unwrap()
-        else {
+        let Action::Complete(Some(output)) = commit_ready(
+            operation.as_mut(),
+            Some(OperationInput {
+                port,
+                change: &input,
+            }),
+            &mut transactions,
+        )
+        .unwrap() else {
             panic!("UnionAll did not forward input port {port}");
         };
         assert_eq!(output.schema(), input.schema());
@@ -1277,15 +1395,15 @@ fn union_all_forwards_every_legal_port_without_copying() {
     }
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
-    let error = operation
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &drifted,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        operation.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &drifted,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     let Some(UnionAllError::InputSchemaMismatch {
         port,
         expected,
@@ -1316,41 +1434,39 @@ fn select_and_union_all_reject_missing_and_invalid_ports() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
-    let error = select.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(select.as_mut(), None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SelectError>(),
         Some(SelectError::MissingInput)
     ));
-    let error = select
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        select.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<SelectError>(),
         Some(SelectError::InvalidInputPort { port: 1 })
     ));
 
-    let error = union.turn(None, transaction.access()).unwrap_err();
+    let error = rollback_ready(union.as_mut(), None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<UnionAllError>(),
         Some(UnionAllError::MissingInput)
     ));
-    let error = union
-        .turn(
-            Some(OperationInput {
-                port: 2,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap_err();
+    let error = rollback_ready(
+        union.as_mut(),
+        Some(OperationInput {
+            port: 2,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<UnionAllError>(),
         Some(UnionAllError::InvalidInputPort {
@@ -1388,17 +1504,17 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     for (name, expression, expected) in kleene_cases() {
         let mut operation = stateless_operation(
             &ExtendDefinition::try_new(name, expression).unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) = operation
-            .turn(Some(turn_input(&input)), transaction.access())
-            .unwrap()
-        else {
+        let Action::Complete(Some(output)) = commit_ready(
+            operation.as_mut(),
+            Some(turn_input(&input)),
+            &mut transactions,
+        )
+        .unwrap() else {
             panic!("Boolean expression Extend returned the wrong action");
         };
         let actual = output
@@ -1502,7 +1618,6 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
     let operands = [
         ("boolean", ScalarValue::Boolean(Some(true))),
         ("signed", ScalarValue::Int64(Some(-2))),
@@ -1523,10 +1638,12 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
                     &ExtendDefinition::try_new("result", expression).unwrap(),
                     Arc::clone(&schema),
                 );
-                let Action::Complete(Some(output)) = operation
-                    .turn(Some(turn_input(&input)), transaction.access())
-                    .unwrap()
-                else {
+                let Action::Complete(Some(output)) = commit_ready(
+                    operation.as_mut(),
+                    Some(turn_input(&input)),
+                    &mut transactions,
+                )
+                .unwrap() else {
                     panic!("comparison Extend returned the wrong action");
                 };
                 let actual = output
@@ -1554,10 +1671,12 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
             .unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) = operation
-            .turn(Some(turn_input(&input)), transaction.access())
-            .unwrap()
-        else {
+        let Action::Complete(Some(output)) = commit_ready(
+            operation.as_mut(),
+            Some(turn_input(&input)),
+            &mut transactions,
+        )
+        .unwrap() else {
             panic!("array comparison Extend returned the wrong action");
         };
         let actual = output
@@ -1590,17 +1709,17 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
     let mut operation = stateless_operation(
         &ExtendDefinition::try_new("greater", predicate).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("arithmetic expression did not produce an output");
     };
     let greater = output
@@ -1618,10 +1737,12 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         &ExtendDefinition::try_new("parsed", try_cast(col("text"), DataType::Int64)).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap()
-    else {
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("try-cast expression did not produce an output");
     };
     let parsed = output
@@ -1674,17 +1795,15 @@ fn structural_trace(
             Int64Array::from_iter_values(batch.iter().map(|row| row.2)),
         )
         .unwrap();
-        let transaction = transactions.begin().unwrap();
-        let Action::Complete(Some(output)) = operation
-            .turn(
-                Some(OperationInput {
-                    port,
-                    change: &input,
-                }),
-                transaction.access(),
-            )
-            .unwrap()
-        else {
+        let Action::Complete(Some(output)) = commit_ready(
+            operation.as_mut(),
+            Some(OperationInput {
+                port,
+                change: &input,
+            }),
+            &mut transactions,
+        )
+        .unwrap() else {
             panic!("structural Operation returned the wrong action");
         };
         for row in 0..output.num_rows() {
@@ -1702,7 +1821,6 @@ fn structural_trace(
                 .collect();
             trace.push((values, output.diffs().value(row)));
         }
-        transaction.commit().unwrap();
         start += batch_rows;
     }
     trace
@@ -1806,10 +1924,12 @@ fn filter_trace(
             &keep[start..start + rows],
             &diffs[start..start + rows],
         );
-        let transaction = transactions.begin().unwrap();
-        match operation
-            .turn(Some(turn_input(&input)), transaction.access())
-            .unwrap()
+        match commit_ready(
+            operation.as_mut(),
+            Some(turn_input(&input)),
+            &mut transactions,
+        )
+        .unwrap()
         {
             Action::Complete(Some(change)) => {
                 let values = change
@@ -1829,7 +1949,6 @@ fn filter_trace(
             Action::Complete(None) => {}
             Action::Idle | Action::Commit(_) => panic!("Filter returned the wrong action"),
         }
-        transaction.commit().unwrap();
         start += rows;
     }
     output
@@ -1865,11 +1984,12 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
             Int64Array::from(diffs[start..start + rows].to_vec()),
         )
         .unwrap();
-        let transaction = transactions.begin().unwrap();
-        let Action::Complete(Some(change)) = operation
-            .turn(Some(turn_input(&input)), transaction.access())
-            .unwrap()
-        else {
+        let Action::Complete(Some(change)) = commit_ready(
+            operation.as_mut(),
+            Some(turn_input(&input)),
+            &mut transactions,
+        )
+        .unwrap() else {
             panic!("Extend returned the wrong action");
         };
         let derived = change
@@ -1893,7 +2013,6 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
                 .zip(change.diffs().values().iter().copied())
                 .map(|((value, derived), diff)| (value, derived, diff)),
         );
-        transaction.commit().unwrap();
         start += rows;
     }
     output
@@ -1934,15 +2053,11 @@ fn running_event_count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
     let mut start = 0;
     for &rows in batches {
         let input = change(&diffs[start..start + rows]);
-        let transaction = transactions.begin().unwrap();
         output.extend(output_values(
-            operation
-                .turn(Some(turn_input(&input)), transaction.access())
-                .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
             ExpectedAction::Complete,
             "count",
         ));
-        transaction.commit().unwrap();
         start += rows;
     }
     output
@@ -1971,14 +2086,13 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
             .unwrap();
         transaction.commit().unwrap();
     }
-    let transaction = transactions.begin().unwrap();
-    let error = operation
-        .turn(Some(turn_input(&input)), transaction.access())
-        .unwrap_err();
+    let error =
+        rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<RunningEventCountError>(),
         Some(RunningEventCountError::Overflow)
     ));
+    let transaction = transactions.begin().unwrap();
     assert_eq!(
         state.access(transaction.access()).unwrap().get().unwrap(),
         Some(u64::MAX - 1)
@@ -2007,16 +2121,13 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let mut operation =
         RunningEventCountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
     let change = change(&[1]);
-    let error = operation
-        .turn(Some(turn_input(&change)), transaction.access())
-        .unwrap_err();
+    let error =
+        rollback_ready(&mut operation, Some(turn_input(&change)), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::Codec(_))
     ));
-    drop(transaction);
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();

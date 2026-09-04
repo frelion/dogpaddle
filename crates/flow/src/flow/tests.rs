@@ -1,12 +1,50 @@
-use std::num::NonZeroU64;
+use std::{
+    num::NonZeroU64,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use dogpaddle_operation::operation::{
+    Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
     sink::DiscardDefinition, source::SequenceSourceDefinition,
     transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, Store};
 
-use crate::build::FlowFactory;
+use crate::{build::FlowFactory, error::FlowRunError, station::StationError};
+
+struct FailingAfterCommit {
+    runs: Arc<AtomicUsize>,
+}
+
+impl Operation for FailingAfterCommit {
+    fn turn<'turn>(
+        &'turn mut self,
+        input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
+        assert!(input.is_none());
+        let runs = Arc::clone(&self.runs);
+        Ok(Turn::ready(move |_access| {
+            Ok((
+                Action::Commit(None),
+                AfterCommit::new(move || {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    Err(PostCommitError::new(std::io::Error::other(
+                        "planned after-commit failure",
+                    )))
+                }),
+            ))
+        }))
+    }
+}
+
+#[test]
+fn precommit_flow_errors_do_not_require_reopen() {
+    let error = FlowRunError::new("source", StationError::UnexpectedOutput);
+    assert!(!error.requires_reopen());
+}
 
 #[test]
 fn build_and_open_derive_a_stable_layered_topological_schedule() {
@@ -103,5 +141,65 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
                 .unwrap(),
         ),
         (Some(0), 0..1, Some(1), 0..2)
+    );
+}
+
+#[test]
+fn advance_preflights_every_station_before_earlier_stations_can_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let first_source = builder.station("first-source", SequenceSourceDefinition::new(0));
+    let first_sink = builder.station("first-sink", DiscardDefinition::new());
+    let failed_source = builder.station("failed-source", SequenceSourceDefinition::new(0));
+    let failed_sink = builder.station("failed-sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(first_source, NonZeroU64::MAX);
+    builder.output_capacity_bytes(failed_source, NonZeroU64::MAX);
+    builder.connect([first_source], first_sink);
+    builder.connect([failed_source], failed_sink);
+    let mut flow = builder.build().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    flow.stations[2].replace_operation(Box::new(FailingAfterCommit {
+        runs: Arc::clone(&runs),
+    }));
+
+    let first_error = flow.advance().unwrap_err();
+    assert_eq!(first_error.station_id(), "failed-source");
+    assert!(first_error.requires_reopen());
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+    let preflight_error = flow.advance().unwrap_err();
+    assert_eq!(preflight_error.station_id(), "failed-source");
+    assert!(preflight_error.requires_reopen());
+    assert!(
+        preflight_error
+            .to_string()
+            .contains("station must be reopened after a post-commit failure")
+    );
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    drop(flow);
+
+    let store = Store::open(path).unwrap();
+    let first_position: Cell<u64> = store
+        .open_data("station/00000000/operation/sequence_source.position")
+        .unwrap();
+    let first_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        first_position
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        first_output
+            .access(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap(),
+        0..1
     );
 }

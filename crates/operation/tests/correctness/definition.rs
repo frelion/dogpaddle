@@ -32,7 +32,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store};
 
-use super::support::TestStore;
+use super::support::{TestStore, commit_ready};
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 fn assert_send_static<T: Send + 'static>() {}
@@ -941,8 +941,9 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     let mut project = materialize(&project_definition, &[value_schema()], &store, &[]);
     let mut discard = materialize(&discard_definition, &[value_schema()], &store, &[]);
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let Action::Commit(Some(output)) = source.turn(None, transaction.access()).unwrap() else {
+    let Action::Commit(Some(output)) =
+        commit_ready(source.as_mut(), None, &mut transactions).unwrap()
+    else {
         panic!("materialized SequenceSource did not commit one output Change");
     };
     assert_eq!(output.num_rows(), 1);
@@ -954,52 +955,51 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
         .unwrap();
     assert_eq!(values.value(0), 42);
     assert_eq!(
-        source_position
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap(),
+        {
+            let transaction = transactions.begin().unwrap();
+            source_position
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap()
+        },
         Some(42)
     );
-    let Action::Complete(Some(count_output)) = count
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &output,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(count_output)) = commit_ready(
+        count.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &output,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("materialized RunningEventCount did not complete one input with output");
     };
     assert_eq!(count_output.num_rows(), 1);
-    let Action::Complete(Some(project_output)) = project
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &output,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(project_output)) = commit_ready(
+        project.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &output,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("materialized Project did not complete with one output Change");
     };
     assert_eq!(project_output.schema(), output.schema());
-    let Action::Complete(None) = discard
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &output,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(None) = commit_ready(
+        discard.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &output,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("materialized Discard did not complete one input without output");
     };
-    transaction.commit().unwrap();
     drop((source, count, project, discard));
 }
 

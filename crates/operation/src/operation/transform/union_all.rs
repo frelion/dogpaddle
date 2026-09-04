@@ -9,7 +9,7 @@ use crate::{
     OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 8;
@@ -143,8 +143,8 @@ impl OperationDefinition for UnionAllDefinition {
     }
 }
 
-impl Operation for UnionAllOperation {
-    fn turn(
+impl TransactionalOperation for UnionAllOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

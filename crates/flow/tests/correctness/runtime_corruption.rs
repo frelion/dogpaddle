@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    Action, Operation,
+    Action, Operation, Turn,
     sink::DiscardDefinition,
     source::{SequenceSourceDefinition, SequenceSourceOperation},
 };
@@ -146,32 +146,45 @@ fn publish_pending_input(path: &Path, encoded: Option<&[u8]>, shift_head: bool) 
         .unwrap();
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let encoded = encoded.map_or_else(
-        || {
+    match encoded {
+        None => {
             let mut operation = SequenceSourceOperation::new(u64::MAX, position.clone());
-            let Action::Commit(Some(change)) = operation.turn(None, transaction.access()).unwrap()
+            let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
+                panic!("final source did not prepare one turn");
+            };
+            let transaction = transactions.begin().unwrap();
+            let (Action::Commit(Some(change)), after_commit) =
+                prepared.apply(transaction.access()).unwrap()
             else {
                 panic!("final source did not commit one Change");
             };
-            encode_change(&change).unwrap()
-        },
-        |encoded| {
+            let encoded = encode_change(&change).unwrap();
+            let mut output = output.access(transaction.access()).unwrap();
+            assert_eq!(output.append(&encoded).unwrap(), 0);
+            if shift_head {
+                assert_eq!(output.append(&encoded).unwrap(), 1);
+                assert_eq!(output.truncate_before(1, NonZeroUsize::MIN).unwrap(), 1);
+            }
+            transaction.commit().unwrap();
+            after_commit.run().unwrap();
+        }
+        Some(encoded) => {
+            let encoded = encoded.to_vec();
+            let transaction = transactions.begin().unwrap();
             position
                 .access(transaction.access())
                 .unwrap()
                 .set(&u64::MAX)
                 .unwrap();
-            encoded.to_vec()
-        },
-    );
-    let mut output = output.access(transaction.access()).unwrap();
-    assert_eq!(output.append(&encoded).unwrap(), 0);
-    if shift_head {
-        assert_eq!(output.append(&encoded).unwrap(), 1);
-        assert_eq!(output.truncate_before(1, NonZeroUsize::MIN).unwrap(), 1);
+            let mut output = output.access(transaction.access()).unwrap();
+            assert_eq!(output.append(&encoded).unwrap(), 0);
+            if shift_head {
+                assert_eq!(output.append(&encoded).unwrap(), 1);
+                assert_eq!(output.truncate_before(1, NonZeroUsize::MIN).unwrap(), 1);
+            }
+            transaction.commit().unwrap();
+        }
     }
-    transaction.commit().unwrap();
 }
 
 fn write_sink_state(path: &Path, key: &[u8], value: Option<Vec<u8>>) {

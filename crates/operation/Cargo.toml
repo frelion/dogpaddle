@@ -32,6 +32,10 @@ tempfile.workspace = true
 name = "correctness"
 path = "tests/correctness.rs"
 
+[[example]]
+name = "queue_source"
+path = "examples/queue_source.rs"
+
 [[bench]]
 name = "operation_core"
 path = "benches/operation_core.rs"

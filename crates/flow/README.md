@@ -164,16 +164,18 @@ Claim 保存该 entry 的 port、AppendLog offset 和完整 owned Change；它�
 内存副本。IPC 解码完成后，`intake` 必须先把 Change 的完整 logical Schema 与该 input 共享的
 `Output` Schema 精确比较，匹配后才能安装 Claim；Schema 不匹配不会 pin、推进 cursor 或产生其他
 持久化写入。Claim 存在时 `intake` 不访问 Store。重开 Flow 时 Claim 为空，并根据 active input 与对应 cursor
-重建同一输入。零输入 Source 没有 Claim，但仍由相同的 Station 路径调用 `turn(None, ...)`；没有
+重建同一输入。零输入 Source 没有 Claim，但仍由相同的 Station 路径调用 `turn(None)`；没有
 Source 专用 outcome 或事务路径。没有 output 的 Sink 不能被其他 Station 作为 source。
 
-`process(&mut Transactions)` 为每次 Operation 调用开始并持有唯一写事务。有输入 Operation 每次只
-接收端口、一个完整 `Change` 和不能提交的 `TransactionAccess`，不会看到 `AppendLog` offset、
-cursor 或 Station 运行元数据；Source 在同一入口收到 `None`。已有 Claim 会直接提供给 Operation，
-Station 不在每个 turn 前另开读事务重校验 active input 和 cursor；需要消费该 Claim 时，验证与状态
-迁移一起进入原子 Complete 事务。
+`process(&mut Transactions)` 先在没有活动写事务时调用 `Operation::turn`。有输入 Operation 每次只
+接收端口和一个完整 borrowed `Change`，不会看到 `AppendLog` offset、cursor 或 Station 运行元数据；
+Source 在同一入口收到 `None`。`Turn::Idle` 直接结束，不开启写事务；`Turn::Ready` 携带一个只能
+消费一次的 `PreparedTurn`，Station 此时才开始唯一写事务，并只把不能提交的
+`TransactionAccess` 交给其 `apply`。已有 Claim 会直接提供给 Operation，Station 不在每个 turn 前
+另开读事务重校验 active input 和 cursor；需要消费该 Claim 时，验证与状态迁移一起进入原子
+Complete 事务。
 
-Operation 只返回三个 `Action`：`Idle` 丢弃本次事务，因而不发布 output、不保存 Operation 写入，
+prepared turn 只返回三个 `Action`：`Idle` 丢弃本次事务，因而不发布 output、不保存 Operation 写入，
 也不改变当前 Claim；`Commit(output)` 提交 Operation 状态与可选 output，但保留已经提供的 Claim；
 `Complete(output)` 只用于有输入的 turn，并声明该完整 Change 已处理。Source 的成功 turn 使用
 `Commit`，input-free Operation 返回 `Complete` 是协议错误。Complete 会在同一事务中验证 Claim 的
@@ -182,6 +184,14 @@ active input 轮转和必要的上游物理回收；只有外层 commit 成功�
 append、Station state、retention 或 commit 错误都会回滚本次事务并保留 durable identity 与 Claim。
 Operation 返回 output 时，Station 在 IPC 编码和 capacity 判定之前先按同样的精确规则校验其
 logical Schema；不匹配是协议错误，整个 turn 的 Operation 状态、output 与输入进展全部回滚。
+
+`PreparedTurn::apply` 还可返回一个 `AfterCommit`。Station 只在上述事务成功提交后消费它；
+`Action::Idle`、协议错误、Schema 错误、背压、Store 错误或 commit 失败都只丢弃 completion，绝不
+调用。外部 ACK 等不能回滚的确认动作只允许放在这个阶段。若 completion 失败，本地提交仍然有效，
+已完成输入的内存 Claim 仍会清除；错误通过 `FlowRunError::requires_reopen()` 明确标记，当前运行态
+Station 随即 fail-stop，必须 reopen Flow 后从 durable state 恢复。
+普通提交前 `OperationError` 不设置该标记；Operation 必须保持同一运行实例可从未改变的 durable
+state 重试，或在下一 turn 自行重建失败的临时资源。
 
 Operation 在调用前不会因 output 已达到水位而被跳过，因为 Station 尚不知道本次是否产生 output
 以及编码后大小。没有 output 的 `Commit` 即使日志已经达到水位也可以正常提交；有 output 时
@@ -222,7 +232,7 @@ Complete 内联回收有提交就返回 `Progressed`；整轮没有提交、但�
 `Backpressured`；既无提交也无容量拒绝才返回 `Idle`。背压不会提前终止 schedule，所以下游和其他
 DAG 分量仍获得本轮 turn。fan-out 共享一份 output log 和 capacity，最慢 consumer 的 cursor 会有意
 阻塞整个 producer；各下游独立持有的 decoded Claim 不计入该容量。SequenceSource 提交
-`u64::MAX` 后稳定返回 `Idle`，因此即使进程在最终 source commit 后退出，重开后的 schedule 仍会
+`u64::MAX` 后稳定返回 `Action::Idle`，因此即使进程在最终 source commit 后退出，重开后的 schedule 仍会
 继续排空下游。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::open()` 返回
@@ -274,7 +284,8 @@ Operation 与 Store 的组合根，通过单一公共 `correctness` target 验�
 本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Inbox 独占的
 state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和可重建的确定性拓扑 schedule。
 输入准备已能通过 RO snapshot 从 active input 循环查找、durable pin 并幂等准备至多一个带来源
-身份的 Claim；`process` 已支持 `Action::{Idle, Commit, Complete}`，Complete 在同一写事务中
+身份的 Claim；`process` 已支持事务外 `Operation::turn`、线性 `PreparedTurn`、事务内
+`Action::{Idle, Commit, Complete}` 与仅在提交成功后运行的 `AfterCommit`，Complete 在同一写事务中
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
@@ -282,8 +293,9 @@ retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。F
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。尚未实现 `Flow::start`、中断控制或通用连接器协议；
-`SqliteSink` 只覆盖其独占本地目标表的专用幂等提交边界。内建 `RunningEventCount`
+intake 还会在事务提交前后两侧兜底校验。通用 Operation 调度协议已能安全承接事务外初始化/poll、
+durable state 写入与提交后确认，但尚未实现 `Flow::start`、中断控制、运行资源注入或具体 Debezium
+Source；`SqliteSink` 只覆盖其独占本地目标表的专用幂等提交边界。内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 `DataFusion` 集成目前止于 Filter/Extend/Select/`SchemaAlign` 的 `Expr` protobuf、physical expression planning 与向量化执行，

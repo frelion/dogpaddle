@@ -13,7 +13,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, Operation, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -107,8 +107,8 @@ impl RunningEventCountOperation {
     }
 }
 
-impl Operation for RunningEventCountOperation {
-    fn turn(
+impl TransactionalOperation for RunningEventCountOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,

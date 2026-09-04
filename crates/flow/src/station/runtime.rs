@@ -4,7 +4,7 @@ use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationKind,
-    operation::{Action, Operation, OperationInput},
+    operation::{Action, Operation, OperationInput, Turn},
 };
 use dogpaddle_store::{
     AppendLog, OrderedMap, ReadTransactionAccess, ReadTransactions, Small, StoreError,
@@ -32,6 +32,7 @@ pub(crate) struct Station {
     pub(super) operation: Box<dyn Operation>,
     pub(super) inbox: Inbox,
     pub(super) output: Option<Arc<Output>>,
+    needs_reopen: bool,
 }
 
 impl Station {
@@ -40,6 +41,7 @@ impl Station {
         reads: &ReadTransactions,
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
+        self.ensure_runnable()?;
         let pinned = self.inbox.intake(reads, transactions)?;
         let outcome = self.process(transactions)?;
         if pinned {
@@ -53,40 +55,71 @@ impl Station {
         &mut self,
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
+        self.ensure_runnable()?;
         if !self.inbox.is_input_free() && self.inbox.claim().is_none() {
             return Ok(AdvanceOutcome::Idle);
         }
 
-        let transaction = transactions.begin()?;
-        let access = transaction.access();
-        let input = self.inbox.claim().map(|claim| OperationInput {
-            port: claim.port(),
-            change: claim.change(),
-        });
-        let action = self.operation.turn(input, access)?;
-        let (output, completes_input) = match action {
-            Action::Idle => return Ok(AdvanceOutcome::Idle),
-            Action::Commit(output) => (output, false),
-            Action::Complete(output) => {
-                if self.inbox.is_input_free() {
-                    return Err(StationError::OperationCompletedWithoutInput);
+        let (completes_input, after_commit) = {
+            let input = self.inbox.claim().map(|claim| OperationInput {
+                port: claim.port(),
+                change: claim.change(),
+            });
+            let prepared = match self.operation.turn(input)? {
+                Turn::Idle => return Ok(AdvanceOutcome::Idle),
+                Turn::Ready(prepared) => prepared,
+            };
+
+            let transaction = transactions.begin()?;
+            let access = transaction.access();
+            let (action, after_commit) = prepared.apply(access)?;
+            let (output, completes_input) = match action {
+                Action::Idle => return Ok(AdvanceOutcome::Idle),
+                Action::Commit(output) => (output, false),
+                Action::Complete(output) => {
+                    if self.inbox.is_input_free() {
+                        return Err(StationError::OperationCompletedWithoutInput);
+                    }
+                    (output, true)
                 }
-                (output, true)
+            };
+
+            if !append_output(self.output.as_deref(), output, access)? {
+                return Ok(AdvanceOutcome::Backpressured);
             }
+            if completes_input {
+                self.inbox.complete(access)?;
+            }
+            transaction.commit()?;
+
+            (completes_input, after_commit)
         };
 
-        if !append_output(self.output.as_deref(), output, access)? {
-            return Ok(AdvanceOutcome::Backpressured);
-        }
-        if completes_input {
-            self.inbox.complete(access)?;
-        }
-        transaction.commit()?;
-
+        // Arm before calling user code: unwinding must also prevent reuse.
+        self.needs_reopen = true;
+        let after_commit_result = after_commit.run();
+        // The completion may borrow the input, so release it before the Claim.
         if completes_input {
             self.inbox.clear_claim();
         }
+        if let Err(source) = after_commit_result {
+            return Err(StationError::AfterCommit { source });
+        }
+        self.needs_reopen = false;
         Ok(AdvanceOutcome::Progressed)
+    }
+
+    pub(crate) fn ensure_runnable(&self) -> Result<(), StationError> {
+        if self.needs_reopen {
+            Err(StationError::NeedsReopen)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_operation(&mut self, operation: Box<dyn Operation>) {
+        self.operation = operation;
     }
 
     pub(crate) fn validate_output(
@@ -172,6 +205,7 @@ impl StationParts {
             operation: self.operation,
             inbox: Inbox::new(self.state, inputs),
             output,
+            needs_reopen: false,
         }
     }
 }

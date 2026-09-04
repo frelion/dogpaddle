@@ -8,7 +8,7 @@ use crate::{
     DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
     definition::Sealed as SealedDefinition,
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 3;
@@ -78,8 +78,8 @@ impl OperationDefinition for DiscardDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-impl Operation for DiscardOperation {
-    fn turn(
+impl TransactionalOperation for DiscardOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

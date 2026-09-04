@@ -138,28 +138,72 @@ assert!(ExtendDefinition::try_new("nullable_text", nullable_text).is_ok());
 assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 ```
 
-运行时 [`operation::Operation`] trait 提供统一、object-safe 的 `turn`。零输入 Source 与其他
-Operation 走同一个调用协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed
-Change，以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 `AppendLog`
-offset。
+## Operation 运行协议
 
-turn 返回 [`operation::Action`]：`Idle` 表示没有可提交进展，调用方必须回滚该 turn 的全部写入；
-`Commit` 提交 Operation 状态和可选 output，但不完成当前输入，下一 turn 仍收到同一端口、同一日志
-offset 和逐字节相同的完整 Change。零输入 Source 也用 `Commit` 表示一次成功 turn。`Complete` 才在
-同一事务中提交 Operation 状态、可选 output 和当前输入完成。两种提交动作都至多产生一个 owned
+运行时 [`operation::Operation`] trait 只有一个统一、object-safe 的 `turn`。零输入 Source 与其他
+Operation 走同一个协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed Change，
+以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 `AppendLog` offset、
+Transaction 或事务启动能力。
+
+一次 turn 明确分成三个线性阶段：
+
+1. `Operation::turn` 在没有活动写事务时运行。它可以检查内存状态、惰性初始化资源或执行一次有界
+   poll，但不能确认外部工作或提前推进任何影响重放的事实。返回 [`operation::Turn::Idle`] 时调用方
+   不开启事务；返回 `Turn::Ready` 时得到一个只能消费一次的 [`operation::PreparedTurn`]。
+2. `PreparedTurn::apply` 只在调用方持有的 Store 写事务内运行，只收到不能提交的
+   `TransactionAccess`，并返回 [`operation::Action`] 与 [`operation::AfterCommit`]。这一阶段的写入
+   必须能随事务完整回滚。
+3. 调用方完成 output、input 与 Operation state 的原子提交后才消费 `AfterCommit`；其他所有路径
+   只丢弃它。外部 delivery ACK 等不可回滚动作只能放在这里，绝不能放进 `Drop`。
+
+`turn` 函数体现在执行；`Turn::ready` 和 `AfterCommit::new` 只是保存闭包，分别等到事务内和提交后
+再执行。`apply(self)` 与 `run(self)` 消费各自的值，保证每个闭包至多执行一次；执行时机由 Station
+保证。它们不自动提供外部系统的恰好一次语义，恢复仍依赖已提交的持久状态与连接器的重放契约。
+
+`Action::Idle` 表示没有可提交进展，调用方必须回滚 prepared turn 的全部写入；`Commit` 提交
+Operation 状态和可选 output，但不完成当前输入，下一 turn 仍收到同一端口、同一日志 offset 和
+逐字节相同的完整 Change。零输入 Source 也用 `Commit` 表示一次成功 turn。`Complete` 才在同一
+事务中提交 Operation 状态、可选 output 和当前输入完成。两种提交动作都至多产生一个 owned
 output Change；filter 或 Sink 可以使用 `None`。
+
 跨 turn continuation 必须放在 Operation 自己通过 Definition 声明的持久化 Store 状态中，不能
-隐藏在 Station。具体错误统一擦除为标准 boxed [`operation::OperationError`]：算子语义错误保留
-具体算子错误类型；具体错误可以透明包装 `DataFusion` expression、Store、Arrow 或 Change source，调用方可以
-downcast 顶层算子错误并沿标准 error source chain 检查基础原因。
-由于 `Idle`、错误、Station output 容量拒绝或外层 commit 失败都会导致 turn 重放，Operation 不得在 `turn` 内直接执行无法随
-Store transaction 回滚的可观察副作用，除非像 `SqliteSink` 一样实现了专用的持久幂等提交协议。
+隐藏在 Station；运行实例可以保存由该持久状态重建的临时资源。`turn` 或 `apply` 的提交前错误统一
+擦除为 [`operation::OperationError`]，提交后的 callback 错误则使用独立的
+[`operation::PostCommitError`]，明确表示本地事务已经无法回滚。Flow 遇到后者会停止该运行态
+Station，要求 reopen 后从已提交状态恢复。`SqliteSink` 已有的 `SQLite`→`MDBX` 幂等协议仍保留在其
+prepared turn 内，不为统一形式强行改成提交后写 `SQLite`。
+
+因为当前只有 post-commit error 携带“必须 reopen”的语义，`turn` 或 `apply` 返回普通
+`OperationError` 时，同一个运行实例必须仍可从未改变的 durable state 重试。若 poll 或其他准备工作
+发现临时 driver 已 poisoned，Operation 必须在返回错误前重置它，或把自身切换为下一 turn 会重建
+driver 的内存状态，不能把隐藏的 needs-reopen 要求留给 Flow 猜测。
 
 | action | 本 turn 写入与 output | 当前输入 |
 | --- | --- | --- |
 | `Idle` | 全部回滚 | 有输入时保持不变 |
 | `Commit(output)` | 提交 | 有输入时保留，下一 turn 完整重放 |
 | `Complete(output)` | 提交 | 完成，调用方才可推进 |
+
+### 完整例子：从队列拉取并恢复
+
+先读 [`QueueSource`](examples/support/queue_source.rs) 的 `turn`：`client: None` 时在事务中读取
+checkpoint，提交后建立临时 client；之后在事务外 poll，在事务中保存 checkpoint 和返回 output，
+提交后才 ACK。算子本身不持有事务启动能力。
+
+再读 [`queue_source` 的调用代码](examples/queue_source.rs)，或直接运行：
+
+```sh
+cargo run -p dogpaddle-operation --example queue_source
+```
+
+示例先提交 `10`，关闭 Store 和 Operation，重新打开后继续提交 `20、30`。它用固定队列模拟可按
+checkpoint 恢复的外部服务；独立调用代码把 output IPC 与 checkpoint 原子写入 Store。生产 Flow
+由 Station 负责事务、Schema guard、容量和输入进展。示例没有可装入 Flow 的 Definition，也不是
+已交付的 Debezium Source。
+
+`correctness/protocol.rs` 直接复用同一份算子代码，覆盖初始化回滚、未 ACK 重放，以及第二条记录
+在本地提交前或提交后丢失运行态，再 reopen 的完整输出序列。测试中的 Drop 用于模拟这些恢复边界，
+不代替未来真实连接器的进程崩溃验收。
 
 下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
 collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
@@ -173,7 +217,7 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 
 | 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据与性能 workload |
 | --- | --- | --- | --- | --- | --- | --- |
-| `SequenceSource` (`1`) | Source / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Idle` | `sequence_source.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` source body/commit |
+| `SequenceSource` (`1`) | Source / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_source.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` source body/commit |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow/rollback/reopen/重批；`operation_core` `RunningEventCount` body/commit、`flow_runtime` chain |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
 | Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
@@ -251,7 +295,7 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 
 物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
 `Box<dyn operation::Operation>`，并通过同一个可变 `turn` 分派运行；运行实例只要求 `Send`，调度方
-在一次 turn 期间持有其独占可变访问。Schema binding 只在 build/open
+在从准备到提交后 completion 结束的整个 turn 期间持有其独占可变访问。Schema binding 只在 build/open
 期间连接 Definition 与实例；运行 trait 和具体运行类型都不反向保存或暴露 Definition，Flow
 已经从持久 Definition 获得 kind、资源声明和端口 Schema。
 Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化运行实例；开放可注入 Flow 的
@@ -263,7 +307,7 @@ Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化
 [`operation::source::SequenceSourceOperation`] 只持有复制出的 `start: u64` 和直接的
 `Cell<u64>` position；首次产生 `start`，随后根据最后一次已提交的值逐一递增。每个 turn 产生一行，输出固定为一个
 non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
-后续 turn 返回 `Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
+后续 turn 的 `apply` 返回 `Action::Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
 Change。每次产生值的 turn 返回 `Action::Commit(Some(_))`；Station 不为
 Source 建立另一套 outcome 或事务路径。它声明自己产生输出。
 
@@ -430,51 +474,17 @@ insert/delete，可跨越多个 Change 行；批内 overlay 保留事件顺序�
 文件本身可以预先存在。连接使用 5 秒 busy timeout 与 `synchronous=FULL`，不修改 journal/WAL 模式。
 该协议假定目标表只有此 Sink 写入，不支持外部修改 schema/数据、替换文件或恢复旧备份。
 
-```rust,no_run
-use dogpaddle_operation::operation::{
-    Action, Operation,
-    source::SequenceSourceOperation,
-};
-use dogpaddle_store::{Cell, Store};
-
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = tempfile::tempdir()?;
-    let mut store = Store::create(root.path().join("store"))?;
-    let position = store.create_data::<Cell<u64>>("position")?;
-    let mut operation = SequenceSourceOperation::new(42, position);
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin()?;
-    let action = operation.turn(None, transaction.access())?;
-    assert!(matches!(
-        action,
-        Action::Commit(Some(_))
-    ));
-    transaction.commit()?;
-    Ok(())
-}
-```
-
-Operation 业务逻辑不接收、开始、提交或保存 Transaction。Flow 长期持有事务启动能力；
-Station 的输入准备先用只读事务选择上游日志 entry，必要时再用独立短写事务 durable-pin active
-input；它不推进 cursor，也不调用 Operation。进入 process 阶段后，Station 开始并持有读写
-Transaction，只把不能提交的
-`TransactionAccess` 交给 Operation。Operation 可以用自己持有的 `Cell` 或
-`OrderedMap` 直接读写持久化状态。输入中的 `port` 只表达 Definition 中的端口位置，不是 Change
-identity。Station 在同一写事务中协调 Operation 状态、output 和输入进展：`Commit` 提交前两者但不
-推进 offset，`Complete` 才同时推进 offset，`Idle` 或错误则回滚。只要输入尚未 `Complete`，后续
-turn 必须重放相同的完整 Change；Operation 把片段内 continuation 保存在自己声明的状态中。因此
-Flow 不需要知道算子的业务数据结构，Operation 也不能控制事务边界。
-
 ## 扩展约束
 
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
 模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
 `Operation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec、纯 Schema bind 与一次性物化逻辑；公共 decoder 表只增加一条
-`tag → decode function` 记录。运行实例只直接保存执行所需的标量参数与 collection，不能保存
-Definition 或提供回到 Definition 的 getter，也不再为每个算子增加只包裹字段的 `OperationData`
-类型。Flow 的 build/open 不应出现具体算子分支。
+`tag → decode function` 记录。运行实例可以保存执行参数、已装配 collection 与可由持久状态重建的
+临时运行资源，但不能保存 Definition、Transaction 或事务启动能力，也不能提供回到 Definition 的
+getter；不再为每个算子增加只包裹字段的 `OperationData` 类型。需要事务外工作的算子直接实现
+`Operation::turn` 并返回线性 `PreparedTurn`；完全事务型的内建算子共用 crate 内部的零额外分配
+适配路径。Flow 的 build/open 不应出现具体算子分支。
 
 分类模块只负责容纳多个具体算子并重导出它们的公共类型，不拥有或重导出分类级的单一 tag
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一
@@ -505,8 +515,9 @@ happy-path 单测都不能替代这些答案。
 - **持久化**：分配唯一 tag，冻结 canonical payload/golden/truncation；声明完整逻辑 data 名、collection、
   codec 与 `Small`/`Large`，证明 build/open/reopen 的精确资源布局。开发期破坏性变更直接更新当前
   基线，删除旧数据库并重建，不留旧 API、旧版专用 decoder、资源名兼容分支或旧库行为测试。
-- **事务与 Action**：明确 `Idle`/`Commit`/`Complete`，证明 Operation state、output、cursor、active 和
-  reclaim 全旧或全新；错误、背压、commit 失败和 reopen 都不能多应用或跳过输入。
+- **turn 协议与事务**：明确 `Turn::Idle`、prepared `Action::{Idle, Commit, Complete}` 与可选
+  `AfterCommit`，证明 Operation state、output、cursor、active 和 reclaim 全旧或全新；错误、背压、
+  commit 失败和 reopen 都不能多应用或跳过输入，提交前任何路径不得运行 completion。
 - **内存与类型**：声明哪些列/diff 共享 buffer、哪些 kernel 分配；新增 Arrow 类型同步覆盖 Change
   validation、full/projected IPC、标准 reader、malformed 与相关表达式/算子。
 - **公共证据**：在单一 `correctness` target 中提供 Definition roundtrip、bind/materialize/turn、错误、
@@ -517,7 +528,8 @@ happy-path 单测都不能替代这些答案。
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
-`correctness` target，按 codec、definition 与 runtime 分区。Definition v1 使用版本化黄金字节约束，
+`correctness` target，按 codec、definition、protocol 与 runtime 分区。protocol 直接验证上述队列
+例子的恢复状态机，runtime 覆盖内建算子与 borrowed delivery 的提交时序。Definition v1 使用版本化黄金字节约束，
 Schema 测试覆盖十个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
@@ -540,9 +552,10 @@ transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。�
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 当前覆盖除
-`SqliteSink` 外的九个内建算子；活动事务内的一行 `turn` body，以及包含 begin、turn 和 durable commit
-的完整事务，只直接测
-`SequenceSource` 与 `RunningEventCount`。固定大小 Cell 的长稳
+`SqliteSink` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
+durable commit 的完整事务，只直接测 `SequenceSource` 与 `RunningEventCount`。这两个 case 利用
+crate 内部完全事务型适配器的结构性空 completion 保留既有 turns-per-transaction 口径，不适用于
+带事务外准备或 `AfterCommit` 的 Operation。固定大小 Cell 的长稳
 归 Store 所有，因此当前不设置 Operation endurance。
 benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹，在 run plan 中声明
 稳定 series，并让 raw sample 只引用紧凑 case ID；统一 artifact 派生 `operations/s` 等人类统计，machine

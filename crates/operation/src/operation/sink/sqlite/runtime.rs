@@ -17,7 +17,7 @@ use super::{
     },
     target::SqliteTarget,
 };
-use crate::operation::{Action, Operation, OperationError, OperationInput};
+use crate::operation::{Action, OperationError, OperationInput, TransactionalOperation};
 
 const FIRST_TECHNICAL_ID: u64 = 1;
 const EXHAUSTED_TECHNICAL_ID: u64 = MAX_TECHNICAL_ID + 1;
@@ -312,8 +312,8 @@ impl SqliteSinkOperation {
     }
 }
 
-impl Operation for SqliteSinkOperation {
-    fn turn(
+impl TransactionalOperation for SqliteSinkOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,

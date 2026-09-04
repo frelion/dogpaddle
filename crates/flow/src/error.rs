@@ -81,4 +81,15 @@ impl FlowRunError {
     pub fn station_id(&self) -> &str {
         &self.station_id
     }
+
+    /// Returns whether this runtime must be reopened before scheduling can
+    /// continue.
+    ///
+    /// This is true both for the originating post-commit callback failure and
+    /// for later calls rejected by the runtime's fail-stop guard. Stations
+    /// earlier in the originating scheduling round may already have committed.
+    #[must_use]
+    pub fn requires_reopen(&self) -> bool {
+        self.source.requires_reopen()
+    }
 }

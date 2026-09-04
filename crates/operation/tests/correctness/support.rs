@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use dogpaddle_operation::operation::{
+    Action, AfterCommit, Operation, OperationError, OperationInput, Turn,
+};
+use dogpaddle_store::{TransactionAccess, Transactions};
 use tempfile::TempDir;
 
 pub struct TestStore {
@@ -17,6 +21,55 @@ impl TestStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn apply_ready<'turn>(
+    turn: Turn<'turn>,
+    access: TransactionAccess<'_>,
+) -> Result<(Action, AfterCommit<'turn>), OperationError> {
+    match turn {
+        Turn::Ready(prepared) => prepared.apply(access),
+        Turn::Idle => panic!("a transactional built-in Operation returned an outer idle turn"),
+    }
+}
+
+pub fn commit_ready<O>(
+    operation: &mut O,
+    input: Option<OperationInput<'_>>,
+    transactions: &mut Transactions,
+) -> Result<Action, OperationError>
+where
+    O: Operation + ?Sized,
+{
+    let turn = operation.turn(input)?;
+    let transaction = transactions.begin()?;
+    let (action, after_commit) = apply_ready(turn, transaction.access())?;
+    if matches!(&action, Action::Idle) {
+        drop(transaction);
+        drop(after_commit);
+        return Ok(action);
+    }
+    transaction.commit()?;
+    after_commit
+        .run()
+        .map_err(|error| Box::new(error) as OperationError)?;
+    Ok(action)
+}
+
+pub fn rollback_ready<O>(
+    operation: &mut O,
+    input: Option<OperationInput<'_>>,
+    transactions: &mut Transactions,
+) -> Result<Action, OperationError>
+where
+    O: Operation + ?Sized,
+{
+    let turn = operation.turn(input)?;
+    let transaction = transactions.begin()?;
+    let (action, after_commit) = apply_ready(turn, transaction.access())?;
+    drop(transaction);
+    drop(after_commit);
+    Ok(action)
 }
 
 pub fn decode_hex(encoded: &str) -> Vec<u8> {

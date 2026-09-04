@@ -13,7 +13,7 @@ use crate::{
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 5;
@@ -143,8 +143,8 @@ impl OperationDefinition for FilterDefinition {
     }
 }
 
-impl Operation for FilterOperation {
-    fn turn(
+impl TransactionalOperation for FilterOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

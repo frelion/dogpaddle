@@ -25,7 +25,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::Store;
 
-use super::support::{TestStore, decode_hex};
+use super::support::{TestStore, commit_ready, decode_hex};
 
 const RUNNING_EVENT_COUNT_V1: &str =
     include_str!("../fixtures/v1/running_event_count_definition.hex");
@@ -365,8 +365,6 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     let filter = decode_definition(&decode_hex(FILTER_V1)).unwrap();
     let data = DataInstances::new();
     let mut filter = filter
@@ -374,16 +372,15 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
         .unwrap()
         .materialize(data)
         .unwrap();
-    let Action::Complete(Some(filtered)) = filter
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(filtered)) = commit_ready(
+        filter.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("decoded complex Filter did not emit its expected rows");
     };
     let values = filtered
@@ -402,16 +399,15 @@ fn decoded_filter_and_extend_goldens_reconstruct_their_runtime_semantics() {
         .unwrap()
         .materialize(data)
         .unwrap();
-    let Action::Complete(Some(extended)) = extend
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(extended)) = commit_ready(
+        extend.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("decoded Extend did not append its expected field");
     };
     assert_eq!(extended.schema().field(1).name(), "is_seven");
@@ -440,8 +436,6 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     let select = decode_definition(&decode_hex(SELECT_V1)).unwrap();
     let data = DataInstances::new();
     let mut select = select
@@ -449,16 +443,15 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
         .unwrap()
         .materialize(data)
         .unwrap();
-    let Action::Complete(Some(selected)) = select
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(selected)) = commit_ready(
+        select.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("decoded Select did not emit its expected fields");
     };
     assert_eq!(selected.schema().field(0).name(), "renamed");
@@ -487,16 +480,15 @@ fn decoded_select_and_union_goldens_reconstruct_their_runtime_semantics() {
         .unwrap()
         .materialize(data)
         .unwrap();
-    let Action::Complete(Some(forwarded)) = union_all
-        .turn(
-            Some(OperationInput {
-                port: 1,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(forwarded)) = commit_ready(
+        union_all.as_mut(),
+        Some(OperationInput {
+            port: 1,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("decoded UnionAll did not forward its input Change");
     };
     assert!(Arc::ptr_eq(
@@ -521,8 +513,6 @@ fn decoded_schema_align_golden_reconstructs_its_runtime_semantics() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-
     let definition = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
     let data = DataInstances::new();
     let mut operation = definition
@@ -530,16 +520,15 @@ fn decoded_schema_align_golden_reconstructs_its_runtime_semantics() {
         .unwrap()
         .materialize(data)
         .unwrap();
-    let Action::Complete(Some(aligned)) = operation
-        .turn(
-            Some(OperationInput {
-                port: 0,
-                change: &input,
-            }),
-            transaction.access(),
-        )
-        .unwrap()
-    else {
+    let Action::Complete(Some(aligned)) = commit_ready(
+        operation.as_mut(),
+        Some(OperationInput {
+            port: 0,
+            change: &input,
+        }),
+        &mut transactions,
+    )
+    .unwrap() else {
         panic!("decoded SchemaAlign did not emit its expected fields");
     };
     assert_eq!(aligned.schema().metadata().get("owner").unwrap(), "test");

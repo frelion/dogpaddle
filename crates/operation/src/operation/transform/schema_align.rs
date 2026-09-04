@@ -12,7 +12,7 @@ use crate::{
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 9;
@@ -388,8 +388,8 @@ impl OperationDefinition for SchemaAlignDefinition {
     }
 }
 
-impl Operation for SchemaAlignOperation {
-    fn turn(
+impl TransactionalOperation for SchemaAlignOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         _access: TransactionAccess<'_>,

@@ -140,7 +140,7 @@ Java exception 传递普通失败；`failureKind` 只在 poll 失败后区分 de
 - `stop` 有 deadline，超时返回错误而不无界阻塞 Rust 宿主。
 
 不存在 Java→Rust callback、Rust function pointer、跨 JNI 边界的借用 buffer，也不在 Java 线程上
-重入 `Flow::advance` 或 `Flow::ingest`。这是安全和可控性决策，不是一个可随 connector
+重入 `Flow::advance` 或 Operation。Rust 只在 `Operation::turn` 的事务外阶段主动 poll。这是安全和可控性决策，不是一个可随 connector
 改变的优化选项。
 
 D1 JSONL host 仍会为黑盒命令生成 run-local diagnostic token；它只配对测试命令，不穿过产品
@@ -162,14 +162,20 @@ flush；健康运行时预期在下一次 poll 开头或 stop 执行并最终观
 D2 先建立独立 Debezium runtime 与 pre-ACK checkpoint，D3 再围绕这个已经稳定的交付面建立
 generic durable ingress。
 
-D3 及以后的提交规则是：
+D3 及以后的提交规则由统一 Operation 协议表达：
 
-1. Rust poll 到一个 delivery；
-2. `Flow::ingest` 把 accepted checkpoint、pending payload，以及 D3 经故障矩阵证明必需的最小
-   replay receipt 原子写入 MDBX；
-3. 只有 commit 成功，或 MDBX 已精确验证同一 durable ingress 状态，Rust 才 ACK Java bridge；
+1. `Operation::turn(None)` 在没有活动 MDBX 写事务时主动 poll，并返回一个线性
+   `PreparedTurn`；
+2. Station 开启写事务，`PreparedTurn::apply` 把 accepted checkpoint、pending payload，以及 D3
+   经故障矩阵证明必需的最小 replay receipt 原子写入 MDBX；
+3. Station 完成 Operation state 与 output 协调并 commit 后，才消费 prepared turn 返回的
+   `AfterCommit` 来 ACK Java bridge；rollback、背压、错误或 commit 失败都只 Drop，不 ACK；
 4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建；
-5. IngressSource 在一个后续 MDBX transaction 中同时清除 pending 并写 Station output。
+5. IngressSource 在后续普通 turn 中同时清除 pending 并写 Station output。
+
+`AfterCommit` 失败发生在本地提交之后，不能伪装成 rollback。该运行态 Station 必须 fail-stop，
+Flow reopen 后再从已提交 checkpoint 恢复。Flow 不公开 `ingest` 或 connector-specific 调度入口；
+初始化、poll、durable stage、ACK 与 pending output 都由 Operation 自己的跨 turn 状态机表达。
 
 不使用 Java 本地 offset 文件作为 fallback、加速缓存或双写副本，因为崩溃后无法
 可靠判定它与 MDBX 哪个更新。Rust/Flow 把 offset 当作 opaque bytes，不从 PG LSN 或其他
@@ -271,15 +277,15 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 ### 让 Debezium 直接写 Station output
 
 这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和 consumer frontier，并要求
-Java/connector 获得 Flow 的写事务能力。外部 delivery 必须先通过 D3 durable ingress，再由普通
-Source Operation 输出。
+Java/connector 获得 Flow 的写事务能力。外部 delivery 必须由普通 Source Operation 的 prepared
+turn 先写入 D3 durable ingress，commit 后 ACK，再由后续 turn 输出。
 
 ## 后续决策
 
 本 ADR 不冻结以下细节，它们由对应阶段的证据决定：
 
 - 正式稳定发布后 binary delivery/checkpoint 的版本演进方式；开发期 v1 直接破坏性重建；
-- D3 之后是否真的需要由第二个实现证明的通用 driver trait；
+- 是否真的需要由第二个实现证明的通用 driver trait；统一 Operation turn 协议本身不要求它；
 - PostgreSQL 多表是每表 Engine、单 Engine 路由，还是更高层组合；
 - D6 使用 stock Debezium snapshot 还是需要独立 Rust snapshot reader；
 - D7 的第二 connector 选择；

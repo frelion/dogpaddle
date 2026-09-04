@@ -132,12 +132,12 @@ Flow 运行层
 
 ### 5. 事务与失败契约
 
-- `Idle` 回滚本 turn 全部写入；
+- `Turn::Idle` 不开启写事务，prepared `Action::Idle` 回滚本 turn 全部写入；
 - `Commit` 只提交 continuation 与可选 output，不完成输入；
 - `Complete` 原子提交状态、可选 output、cursor、active rotation 和 reclaim；
 - output capacity 拒绝回滚整个 turn 并保持输入 identity；
 - codec、overflow、Schema、Store 或 commit 错误不留下部分业务状态；
-- 外部副作用只通过另行定义的幂等提交协议执行。
+- 外部确认只在本地提交后通过 `AfterCommit` 执行；必须提前发生的外部副作用另行定义持久幂等协议。
 
 ### 6. 持久化契约
 
@@ -380,16 +380,23 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 
 ### IngressSource
 
-新增引擎受控的通用输入算子。候选运行 API：
+新增引擎受控的通用输入算子。运行协议已经落在所有 Operation 共用的唯一入口上：
 
-```rust,ignore
-flow.ingest("orders", ingestion_id, change)?;
+```text
+turn(None)
+├─ Idle → 直接返回，不开事务
+└─ Ready(prepared) → 开事务 → apply
+   ├─ Action::Idle / 错误 / 背压 → 丢弃事务与 AfterCommit
+   └─ Action::Commit + output 已接纳 → commit → AfterCommit
 ```
 
-Flow 当前唯一持有写事务启动能力，连接器不得绕过 Flow 打开第二个 writer。ingest 应由 Flow 协调，
-原子完成 durable pending payload、幂等 identity 和 accepted checkpoint 状态。连接器只能在
-该事务成功后 ACK 外部 delivery；IngressSource 随后仍通过普通 `turn(None)` 输出，
-pending 清除与 Station output append 同事务。这一提交边界的具体 D0–D7 实施顺序见
+零输入 Source 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
+Flow 继续唯一持有写事务启动能力，
+连接器不得绕过 Operation/Station 打开第二个 writer。IngressSource 在事务外 `turn(None)` 中 poll，
+在线性 prepared turn 中原子写入 durable pending payload、幂等 identity 和 accepted checkpoint，
+并只在该事务成功后通过 `AfterCommit` ACK 外部 delivery；rollback、背压或 commit 失败只丢弃
+completion。后续 turn 仍通过 `Action::Commit` 输出，pending 清除与 Station output append 同事务。
+不新增 `Flow::ingest`、Source 专用 hook 或外部 coordinator。这一提交边界的具体 D0–D7 实施顺序见
 [`DEBEZIUM_ROADMAP.md`](DEBEZIUM_ROADMAP.md)。
 
 Ingress 至少定义：
@@ -445,9 +452,10 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 - Definition 只持久化逻辑 destination key 和非敏感行为配置，不持久化密码、token 或完整 secret DSN；
 - 第一个远端 Sink 落地时，由宿主在 build/open 的 materialize 边界显式注入 destination resolver；
   Schema bind 继续保持纯函数，Operation 不读取全局环境变量或进程级单例；
-- 当前同步 `turn(&mut self)` 会独占该 Operation，并让外部提交发生在 Flow 的 MDBX 写事务期间；
-  第一版远端客户端必须有明确的连接和请求超时。若真实 workload 证明需要异步或事务外 I/O，先扩展
-  Flow 的提交协议，不能把后台任务或第二套状态机藏进具体 Sink；
+- 当前同步的 `turn → apply → AfterCommit` 全程独占该 Operation：事务外准备属于 `turn`，
+  本地提交后的确认属于 `AfterCommit`。若远端提交必须通过专用幂等协议放在 `apply` 内，它仍会占用
+  MDBX writer，因此第一版客户端必须有明确的连接和请求超时。若真实 workload 证明需要异步执行，
+  先扩展调度协议，不能把后台任务或第二套状态机藏进具体 Sink；
 - SQLite、PostgreSQL 与 MySQL 各自保留专用 DDL、DML、锁和重放实现。只有第二个实现证明行身份或
   配置注入语义完全相同时，才提取对应的小型公共组件。
 

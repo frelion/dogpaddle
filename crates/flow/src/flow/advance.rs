@@ -36,12 +36,23 @@ impl Flow {
     /// Selecting a non-active input durably pins that port before its Operation
     /// turn. That pin counts as progress even if the Operation is idle; a later
     /// turn with the already-pinned input can then report idle normally.
+    /// An Operation prepares its turn without an active write transaction. A
+    /// ready turn is applied once inside a transaction, and any post-commit
+    /// completion runs only after that transaction commits.
     ///
     /// # Errors
     ///
-    /// Returns [`FlowRunError`] with the stable Station ID when intake,
-    /// or processing returns an error.
+    /// Returns [`FlowRunError`] with the stable Station ID when intake or
+    /// processing fails. [`FlowRunError::requires_reopen`] identifies failures
+    /// after which this runtime cannot safely continue scheduling.
     pub fn advance(&mut self) -> Result<AdvanceOutcome, FlowRunError> {
+        for &index in &self.topology.schedule {
+            let station_id = &self.station_ids[index];
+            self.stations[index]
+                .ensure_runnable()
+                .map_err(|source| FlowRunError::new(station_id, source))?;
+        }
+
         let mut outcome = AdvanceOutcome::Idle;
         for &index in &self.topology.schedule {
             let station_id = &self.station_ids[index];

@@ -863,7 +863,7 @@ mod runtime {
         runtime::{SqliteSinkCompiled, SqliteSinkOperation},
         state::{Continuation, MAX_TECHNICAL_ID, MutationKind, PendingState, Position},
     };
-    use crate::operation::{Action, Operation, OperationError, OperationInput};
+    use crate::operation::{Action, Operation, OperationError, OperationInput, Turn};
 
     const TABLE: &str = "materialized";
 
@@ -939,40 +939,47 @@ mod runtime {
         }
 
         fn committed_turn(&mut self, change: &Change) -> Action {
-            let transaction = self.transactions.begin().unwrap();
-            let action = self
+            let Turn::Ready(turn) = self
                 .operation
-                .turn(
-                    Some(OperationInput { port: 0, change }),
-                    transaction.access(),
-                )
-                .unwrap();
+                .turn(Some(OperationInput { port: 0, change }))
+                .unwrap()
+            else {
+                panic!("SQLite Sink returned an outer idle turn");
+            };
+            let transaction = self.transactions.begin().unwrap();
+            let (action, after_commit) = turn.apply(transaction.access()).unwrap();
             transaction.commit().unwrap();
+            after_commit.run().unwrap();
             action
         }
 
         fn rolled_back_turn(&mut self, change: &Change) -> Action {
-            let transaction = self.transactions.begin().unwrap();
-            let action = self
+            let Turn::Ready(turn) = self
                 .operation
-                .turn(
-                    Some(OperationInput { port: 0, change }),
-                    transaction.access(),
-                )
-                .unwrap();
+                .turn(Some(OperationInput { port: 0, change }))
+                .unwrap()
+            else {
+                panic!("SQLite Sink returned an outer idle turn");
+            };
+            let transaction = self.transactions.begin().unwrap();
+            let (action, after_commit) = turn.apply(transaction.access()).unwrap();
             drop(transaction);
+            drop(after_commit);
             action
         }
 
         fn failed_turn(&mut self, change: &Change) -> OperationError {
-            let transaction = self.transactions.begin().unwrap();
-            let error = self
+            let Turn::Ready(turn) = self
                 .operation
-                .turn(
-                    Some(OperationInput { port: 0, change }),
-                    transaction.access(),
-                )
-                .unwrap_err();
+                .turn(Some(OperationInput { port: 0, change }))
+                .unwrap()
+            else {
+                panic!("SQLite Sink returned an outer idle turn");
+            };
+            let transaction = self.transactions.begin().unwrap();
+            let Err(error) = turn.apply(transaction.access()) else {
+                panic!("SQLite Sink unexpectedly applied a failing turn");
+            };
             drop(transaction);
             error
         }

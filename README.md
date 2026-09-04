@@ -56,8 +56,9 @@ Debezium Engine，以 connector-neutral 的 `start/poll/ack/stop` 和 opaque pre
 
 - DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
 - 运行由宿主反复调用 `Flow::advance` 驱动；尚无 `Flow::start`、后台 runner 或中断控制。
-- Operation 集合目前封闭，唯一内建 Source 是 `SequenceSource`；Debezium runtime 尚未通过 D3/D4
-  durable ingress 与行到 `Change` 的映射成为生产输入连接器。
+- Operation 集合目前封闭，唯一内建 Source 是 `SequenceSource`；统一 turn 协议已经支持事务外准备、
+  事务内状态提交与提交后 completion，但 Debezium runtime 尚未通过 D3/D4 durable ingress、运行资源
+  装配与行到 `Change` 的映射成为生产输入连接器。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
 - `SQLiteSink` 只创建并独占新目标表；尚无 PostgreSQL、MySQL 或通用外部 Sink。
 - 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。

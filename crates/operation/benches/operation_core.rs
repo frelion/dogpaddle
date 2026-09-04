@@ -9,7 +9,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, col, decode_definition, encode_definition, lit,
     operation::{
-        Operation, OperationInput,
+        Action, Operation, OperationError, OperationInput, Turn,
         sink::DiscardDefinition,
         source::{SequenceSourceDefinition, SequenceSourceOperation},
         transform::{
@@ -19,7 +19,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Store, Transactions};
+use dogpaddle_store::{Cell, Store, TransactionAccess, Transactions};
 
 use support::{Config, SampleStore, case, record};
 
@@ -389,6 +389,26 @@ fn definition_signature(definition: &dyn OperationDefinition) -> usize {
         .wrapping_add(definition.data().len())
 }
 
+fn apply_transactional_turn(
+    turn: Result<Turn<'_>, OperationError>,
+    access: TransactionAccess<'_>,
+) -> Action {
+    let Turn::Ready(turn) = turn.expect("prepare transactional Operation benchmark turn") else {
+        panic!("a transactional benchmark Operation returned an outer idle turn");
+    };
+    let (action, after_commit) = turn
+        .apply(access)
+        .expect("apply transactional Operation benchmark turn");
+    // Both benchmarked runtime types use the crate's TransactionalOperation
+    // adapter: its outer turn is structurally inert and its completion empty.
+    // This benchmark alone may therefore call turn after begin and release the
+    // completion here to preserve its turns-per-transaction workload. An
+    // effectful Operation must prepare before begin and run its completion only
+    // after Store commit.
+    drop(after_commit);
+    action
+}
+
 fn measure_running_event_count_body(
     fixture: &mut RunningEventCountFixture,
     turns: usize,
@@ -407,12 +427,10 @@ fn measure_running_event_count_body(
         };
         let started = std::time::Instant::now();
         for _ in 0..turns {
-            black_box(
-                fixture
-                    .operation
-                    .turn(Some(input), access)
-                    .expect("run RunningEventCount rollback workload"),
-            );
+            black_box(apply_transactional_turn(
+                fixture.operation.turn(Some(input)),
+                access,
+            ));
         }
         let elapsed = started.elapsed();
         total = total.checked_add(elapsed).expect("body duration fits");
@@ -436,12 +454,10 @@ fn measure_sequence_body(
         let access = transaction.access();
         let started = std::time::Instant::now();
         for _ in 0..turns {
-            black_box(
-                fixture
-                    .operation
-                    .turn(None, access)
-                    .expect("run Sequence rollback workload"),
-            );
+            black_box(apply_transactional_turn(
+                fixture.operation.turn(None),
+                access,
+            ));
         }
         let elapsed = started.elapsed();
         total = total.checked_add(elapsed).expect("body duration fits");
@@ -469,12 +485,10 @@ fn measure_running_event_count_durable(
             change: &fixture.input,
         };
         for _ in 0..turns {
-            black_box(
-                fixture
-                    .operation
-                    .turn(Some(input), access)
-                    .expect("run RunningEventCount durable workload"),
-            );
+            black_box(apply_transactional_turn(
+                fixture.operation.turn(Some(input)),
+                access,
+            ));
         }
         transaction
             .commit()
@@ -505,12 +519,10 @@ fn measure_sequence_durable(
             .expect("begin Sequence durable transaction");
         let access = transaction.access();
         for _ in 0..turns {
-            black_box(
-                fixture
-                    .operation
-                    .turn(None, access)
-                    .expect("run Sequence durable workload"),
-            );
+            black_box(apply_transactional_turn(
+                fixture.operation.turn(None),
+                access,
+            ));
         }
         transaction
             .commit()

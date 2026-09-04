@@ -60,27 +60,30 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 
 ## 不可破坏的跨阶段边界
 
-1. `Operation::turn` 不执行 poll、ACK、连网、JVM 启动或其他无法随 MDBX 回滚的副作用。
-2. 外部 Source 仍经普通 Source Operation 的 `turn(None, ...)` 和 `Action::Commit` 输出；
-   不新建 Source 专用 Station 调度协议。
+1. `Operation::turn` 在没有活动 MDBX 写事务时运行，可以惰性初始化资源、连网或执行一次有界
+   poll；它不得 ACK、确认外部工作或提前推进影响重放的事实。事务内工作由线性
+   `PreparedTurn::apply` 承接，外部确认只能放在 commit 后消费的 `AfterCommit`。
+2. 外部 Source 与其他 Operation 仍使用同一个 `turn → PreparedTurn → Action → AfterCommit`
+   协议；不新建 Source 专用 Station 调度协议或 Flow 运行入口。
 3. Flow 长期唯一持有 `Transactions`；Station、Operation、bridge 和 Java 线程都不得保存
    事务启动能力。
 4. `FlowFactory::build/open` 继续先 canonical decode、全图 Schema bind，再创建或打开资源；
    它们不连接数据库、不启动 JVM、不解析 secret。
-5. 外部 delivery 只能在 durable ingress commit 后 ACK。Ingress 中待输出的 payload 与
-   accepted checkpoint 必须原子持久。
+5. 外部 delivery 只能由对应 prepared turn 的 `AfterCommit` 在 durable ingress commit 后 ACK。
+   Ingress 中待输出的 payload 与 accepted checkpoint 必须原子持久；prepared turn 在 rollback、
+   背压或 commit 失败时被丢弃，绝不 ACK。
 6. IngressSource 清除 pending 与 Station output append 在同一写事务中；输出 Schema
    失配、容量拒绝或 commit 失败都保留 pending。
 7. MDBX 是 accepted connector offset 的唯一 durable 真相。Java 侧 offset store 只是 Engine 运行适配，
    必须能从 MDBX 的 opaque bytes 重建。
 8. Definition 只持久精确 Schema、非敏感 source identity 和行为配置；密码、token
-   和完整 secret DSN 只属于运行期 coordinator。
+   和完整 secret DSN 只属于未来装配到运行 Operation 的临时资源。
 9. Java bridge 不向 Rust 借用 `SourceRecord`、`ByteBuffer` 或 JNI local reference；`poll` 返回
    版本化的 owned bytes。
 10. 不为第一个 PostgreSQL connector 引入 Flow/Station 中的 connector enum、PG 分支或动态
     Store catalog 旁路。
-11. D2 不提前发明 generation、lease 或通用 SourceDriver；并发 connector fencing 在 D5、snapshot
-    generation 在 D6 分别以真实需求落地。
+11. D2/D3 不提前发明 generation、lease、通用 SourceDriver 或 runtime coordinator；并发 connector
+    fencing 在 D5、snapshot generation 在 D6 分别以真实需求落地。
 
 ## 版本、构建与许可证策略
 
@@ -323,23 +326,43 @@ host runtime、bridge、delivery codec 或生命周期实现，它只保留调�
 - Debezium 的 generic task commit failure 可能被 Engine 内部转成非抛出结果；backing-store
   checkpoint 仍可精确验证，但 connector-specific external progress 必须独立监控和验收。
 
-## D3：Generic durable ingress
+## D3：Generic Operation turn 与 durable ingress
 
 ### 边界
 
-D3 只改造 DogPaddle 的持久输入边界，使用纯 Rust scripted delivery producer 先验证，再连接 D2。JNI、JDK、
-Debezium、connector config 和外部 I/O 都不进入 Operation turn，也不进入 Flow build/open。
+D3 先扩展所有 Operation 共用的 turn 协议，再在这个协议上实现持久输入。协议不是流数据专用：任何
+需要“事务外准备 → 事务内状态变更 → 提交后副作用”的 Source、Transform 或 Sink 都使用同一个
+模型。JNI、JDK、Debezium 和 connector config 仍不进入 Flow build/open；具体 Debezium 适配留给 D4。
 
-### 交付
+### 已完成：统一 Operation 协议
+
+- `Operation::turn(input)` 在事务外执行，返回 `Turn::Idle` 或只能消费一次的 `PreparedTurn`；
+- Station 取得 ready turn 后才开始写事务，并把不能提交的 `TransactionAccess` 交给
+  `PreparedTurn::apply`；
+- `apply` 仍只返回既有 `Action::{Idle, Commit, Complete}`，不新增 poll/ACK/ingest action；
+- `apply` 可同时返回一个 `AfterCommit`；Station 只有在 Operation state、output 与适用时的输入完成
+  全部提交后才运行它，其他路径只 Drop；
+- `AfterCommit` 失败是明确的 post-commit error：本地提交保持有效，已完成 Claim 清理，当前运行态
+  Station fail-stop，reopen 后从 durable state 恢复；
+- 普通 `OperationError` 仍是可重试的提交前错误；Operation 必须自行重置或在下一 turn 重建 poisoned
+  临时 driver，不能隐式要求 Flow reopen；
+- 完全事务型的现有算子通过 crate 内部适配继续保持直接实现与零额外 turn heap allocation。
+
+这使 Operation 可以用自身状态机表达初始化。例如首个 turn 在 prepared transaction 中读取 durable
+checkpoint，并在提交后的内存 completion 中进入 ready 状态；下一 turn 再在事务外启动或 poll
+driver。无需 `restore/start/poll/ack` 多套方法，也无需 Flow 知道 Operation 当前处于哪个阶段。
+完整可运行的队列示例与同代码恢复测试见 [Operation 运行协议](crates/operation/README.md#operation-运行协议)。
+
+### 后续交付：IngressSource
 
 - 一个固定 exact output Schema、走普通 `turn(None)` 的 `IngressSourceDefinition`；
-- 窄 `Flow::ingest` 与 resume-state 读取 API；
 - 一个 versioned state cell，原子保存 accepted opaque checkpoint、最小重复接纳凭据以及至多
   一个 canonical pending Change；
-- `Accepted`、精确 `Duplicate`、`Backpressured` 与明确 conflict/error；
-- pending clear 与 Station output append 的同事务组合；
-- Flow 外的薄 coordinator，按 `poll → convert → ingest commit → Delivery::ack` 执行，且 JNI
-  调用期间没有 active MDBX transaction。
+- Operation 内的最小状态机，在事务外执行 `poll/convert`，prepared transaction 内完成 durable
+  acceptance，并以 `AfterCommit` 消费式 ACK；
+- pending clear 与 Station output append 继续由普通 `turn(None)` 在同一事务中完成；
+- 运行资源的显式装配边界；它不进入 `DataInstances`，不让 Flow 枚举 connector，也不在 build/open
+  启动 JVM 或解析 secret。
 
 一个 delivery 可以产生一个非空 `Change`，也可只推进 checkpoint；后者用于 heartbeat 或被
 Rust adapter 忽略的 source record，不伪造空 Change。v1 只允许一个 durable pending slot。
@@ -349,21 +372,24 @@ Rust adapter 忽略的 source record，不伪造空 Change。v1 只允许一个 
 
 ### 验收
 
-- exact Schema mismatch、超限与 codec 错误在写事务前失败，无 durable side effect；
+- `Turn::Idle` 不开启写事务；prepared turn 与 completion 都只能消费一次；
+- `Action::Idle`、exact Schema mismatch、超限、codec/Operation 错误、背压与 commit 失败都不运行
+  `AfterCommit`；
 - accepted checkpoint、最小 receipt 与 optional pending payload 同一写事务提交；
-- 只有 `Accepted` 或经精确验证的 `Duplicate` 才允许 ACK；Backpressured/error 不 ACK；
+- 只有 commit 成功后才允许 ACK；rollback/backpressure/error 不 ACK；
 - IngressSource 通过普通 `turn(None)` 输出；pending clear 与 output append 同事务；
 - output capacity、Schema guard、Operation error 和 commit failure 都保留 pending；
 - ingest commit 后、output 前 reopen 仍输出一次；output commit 后 reopen 不再重复；
 - checkpoint-only delivery 只推进 resume state；
 - build/open 保持纯 binding、失败无目录副作用，definition/state/resource layout 有 golden；
-- scripted delivery producer 覆盖每个 crash/commit 窗口，随后 D2 runtime 运行相同端到端故障矩阵。
+- scripted Operation 覆盖准备、rollback、commit、AfterCommit 和 reopen 窗口，随后 D2 runtime 运行
+  相同端到端故障矩阵。
 
 ### 退出条件
 
 `dogpaddle-flow` 的单一 public correctness target 证明全部行为。Store 和 Change 不含 connector
-知识，Station claim/cursor/output-retention 契约不变；bridge/connector 永远看不到 Store handle
-或 transaction starter。
+知识，Station claim/cursor/output-retention 契约不变；bridge/connector 永远看不到 Store handle、
+Transaction 或 transaction starter，Flow 也不增加 `ingest` API。
 
 ### 主要风险
 
@@ -371,7 +397,8 @@ Rust adapter 忽略的 source record，不伪造空 Change。v1 只允许一个 
 - 用不唯一的 checkpoint 代替 delivery receipt；
 - 在 shared `Cell<Vec<u8>>` 中无上限保存 batch；
 - 为“少一次写”而直接写 Station output，绕开 Operation 与 retention；
-- 在 MDBX transaction 内跨 JNI ACK，制造不可恢复的外部副作用。
+- 在 MDBX transaction 内跨 JNI poll/ACK，制造长事务或不可恢复的外部副作用；
+- AfterCommit 错误后继续调用同一运行态 Operation，而不是 fail-stop 并从 durable state reopen。
 
 ## D4：PostgreSQL connector pilot 与 fixed-Schema conversion
 

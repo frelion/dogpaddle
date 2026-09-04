@@ -1,6 +1,6 @@
 use arrow_schema::SchemaRef;
 use dogpaddle_change::CodecError as ChangeCodecError;
-use dogpaddle_operation::operation::OperationError;
+use dogpaddle_operation::operation::{OperationError, PostCommitError};
 use dogpaddle_store::StoreError;
 use thiserror::Error;
 
@@ -10,6 +10,13 @@ pub(crate) enum StationError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Operation(#[from] OperationError),
+    #[error("operation failed after its Store transaction committed: {source}")]
+    AfterCommit {
+        #[source]
+        source: PostCommitError,
+    },
+    #[error("station must be reopened after a post-commit failure")]
+    NeedsReopen,
     #[error("station input {input} contains an invalid Change: {source}")]
     InvalidInputChange {
         input: usize,
@@ -73,4 +80,10 @@ pub(crate) enum StationError {
     RetentionHeadMismatch { head: u64, minimum: u64 },
     #[error("output retention truncated to {actual} instead of target {target}")]
     RetentionTruncateMismatch { target: u64, actual: u64 },
+}
+
+impl StationError {
+    pub(crate) const fn requires_reopen(&self) -> bool {
+        matches!(self, Self::AfterCommit { .. } | Self::NeedsReopen)
+    }
 }

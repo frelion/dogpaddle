@@ -10,7 +10,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Action, Operation, OperationError, OperationInput},
+    operation::{Action, Operation, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -102,8 +102,8 @@ impl SequenceSourceOperation {
     }
 }
 
-impl Operation for SequenceSourceOperation {
-    fn turn(
+impl TransactionalOperation for SequenceSourceOperation {
+    fn apply(
         &mut self,
         input: Option<OperationInput<'_>>,
         access: TransactionAccess<'_>,
