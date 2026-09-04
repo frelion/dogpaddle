@@ -3,7 +3,8 @@
 - **Decision:** GREEN
 - **Revalidated:** 2026-09-04 (Asia/Shanghai)
 - **Roadmap:** [GitHub #2](https://github.com/frelion/dogpaddle/issues/2)
-- **D2 ledger:** [GitHub #5](https://github.com/frelion/dogpaddle/issues/5)
+- **D2:** GREEN; [PR #12](https://github.com/frelion/dogpaddle/pull/12) merged and
+  [GitHub #5](https://github.com/frelion/dogpaddle/issues/5) closed
 
 ## Result
 
@@ -57,6 +58,13 @@ formatting, Clippy, release build, runtime-payload construction and real
 PostgreSQL gate. It consumed the product-built distribution unchanged. The
 distribution pins Debezium `3.6.2.Final`, Kafka Connect `4.3.0`, and bridge
 protocol `1`; the payload pins Eclipse Temurin JRE `21.0.12.1+1`.
+
+The repository now makes this same full matrix a continuous gate through the
+`Debezium PostgreSQL recovery` workflow. It runs on relevant pull requests and
+`main` changes, weekly, and by manual dispatch on Ubuntu 24.04; artifact upload
+runs after success or failure and retains whatever environment record, fixture
+state and logs were produced. This does not change the accepted run facts
+recorded below.
 
 Native bundle CI validates the archive digest before extraction. D1 exercises
 target manifest/JRE release checks, critical runtime resources, the exact nested
@@ -176,12 +184,20 @@ connector.
 
 The real PostgreSQL fixture owns Linux GNU x86_64 only. A separate native CI
 matrix builds and relocates runtime-only bundles on Linux GNU and macOS,
-x86_64/aarch64, then completes the public JVM/bridge handshake with an empty
-system `PATH` and invalid Java home variables. Those macOS artifacts are
-unsigned development bundles; Developer ID signing and notarization remain a
-D5 release responsibility. The repository also has no final DogPaddle product
-executable yet. D2 therefore ships only a reusable runtime payload; a future
-release packager will combine it with the actual application.
+x86_64/aarch64, then drives
+`open -> start -> poll(position 1) -> drop/redeliver -> ack -> stop ->
+checkpoint-only restart -> poll(position 2 witness) -> ack -> stop`
+through the public Rust API with an empty system `PATH` and invalid Java home
+variables. It also validates the owned record projection and pre-ACK
+checkpoint, then proves the fresh connector continues from the accepted
+position before producing its next record. Its deterministic connector is
+built in a separate Maven probe project and injected only into the relocated
+test copy; it is not shipped in the product distribution or runtime archive
+and does not stand in for the real PostgreSQL fixture. Those macOS artifacts
+are unsigned development bundles; Developer ID signing and notarization remain
+a D5 release responsibility. The repository also has no final DogPaddle
+product executable yet. D2 therefore ships only a reusable runtime payload; a
+future release packager will combine it with the actual application.
 
 The record key/value/header bytes are schemas-enabled Kafka Connect JSON. That
 is a connector-neutral owned transport representation, but it is not yet the

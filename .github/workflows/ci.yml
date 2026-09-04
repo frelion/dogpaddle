@@ -105,5 +105,8 @@ jobs:
           restore-keys: |
             cargo-v1-${{ runner.os }}-1.96-
 
+      - name: Validate every benchmark plan
+        run: cargo xtask bench-plan-check
+
       - name: Execute every discovered benchmark target
         run: cargo xtask bench-smoke

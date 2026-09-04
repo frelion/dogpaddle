@@ -102,13 +102,21 @@ Supported payload targets are:
 - `x86_64-apple-darwin`;
 - `aarch64-apple-darwin`.
 
-Linux means GNU/glibc, not musl or Alpine. The current CI proves Ubuntu 24.04
-and macOS 15. macOS archives are unsigned development artifacts; deployment
-baselines, native dependency closure, signing and notarization remain D5 work.
+Linux means GNU/glibc, not musl or Alpine. The `Debezium runtime bundles`
+workflow uses native Ubuntu 24.04 and macOS 15 runners for all four targets.
+After relocating each archive to a path containing spaces, it removes access
+to system Java and exercises the full public lifecycle:
+`open -> start -> poll(position 1) -> drop/redeliver -> ack -> stop ->
+checkpoint-only restart -> poll(position 2 witness) -> ack -> stop`.
+The probe also checks the owned topic, partition, timestamp, key, value,
+headers and pre-ACK checkpoint, and proves that the fresh connector restores
+the accepted position before producing the next witness. macOS
+archives are unsigned development artifacts; deployment baselines, native
+dependency closure, signing and notarization remain D5 work.
 
 Normal Cargo gates never invoke Maven, download Java artifacts, or require a
 JDK. Bundle construction is explicit. First use a local JDK and Maven to build
-and test the pinned Java distribution:
+and test the pinned Java distribution and the separate test-only connector:
 
 ```bash
 crates/debezium/scripts/build-distribution.sh
@@ -127,8 +135,24 @@ tar extraction filters, and `sha256sum` or `shasum`.
 
 The payload intentionally contains no native host or `bin/` packaging contract.
 `DogPaddle`'s future release packager will combine the real application
-executable with this reusable runtime payload. The D1 `PostgreSQL` gate already
-keeps its diagnostic host separate and mounts both into one test process.
+executable with this reusable runtime payload. The lifecycle workflow builds a
+deterministic connector from the separate `bridge/probe/` Maven project.
+`scripts/install-lifecycle-probe.sh` injects it only into the relocated test
+copy, and `examples/bundled_runtime_probe.rs` drives the Rust API; neither the
+product distribution nor the uploaded runtime archive contains that connector
+or host. The D1 `PostgreSQL` gate keeps its diagnostic host separate and mounts
+both into one test process.
+
+The independent `Debezium PostgreSQL recovery` workflow runs
+`experiments/debezium-d1/scripts/run.sh` on Ubuntu 24.04 for relevant pull
+requests and `main` changes, on a weekly schedule, and on manual dispatch. It
+owns the real connector matrix: idle recovery, drop/redelivery, unacknowledged
+restart replay, checkpoint-only takeover, durable-before-ACK, eventual
+`confirmed_flush_lsn`, outstanding-stop replay, row order, absence of a Java
+offset file, and payload-JVM isolation. Artifact upload runs on both success
+and failure and includes whatever environment, retained fixture state and logs
+were produced. This Linux `PostgreSQL` gate is kept
+separate from the deterministic four-platform lifecycle probe.
 
 ## Runtime constraints
 

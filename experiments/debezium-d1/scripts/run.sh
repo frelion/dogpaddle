@@ -10,6 +10,7 @@ experiment_dir="$(cd -- "$script_dir/.." && pwd)"
 repo_dir="$(cd -- "$experiment_dir/../.." && pwd)"
 runtime_bundle="$repo_dir/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu"
 host_binary="$experiment_dir/host/target/release/dogpaddle-debezium-d1-host"
+maven_cache="$repo_dir/target/debezium-maven-cache"
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-state.XXXXXX")"
 artifacts_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-d1-artifacts.XXXXXX")"
 owns_postgres=0
@@ -91,6 +92,7 @@ if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_netwo
 fi
 
 "$script_dir/audit-debezium-source.sh"
+mkdir -p -- "$maven_cache"
 podman run --rm \
   --userns=keep-id \
   --user "$(id -u):$(id -g)" \
@@ -98,7 +100,7 @@ podman run --rm \
   --env MAVEN_CONFIG=/tmp/dogpaddle-maven/.m2 \
   --env MAVEN_OPTS=-Duser.home=/tmp/dogpaddle-maven \
   --volume "$repo_dir:/workspace:Z" \
-  --volume "$repo_dir/target/debezium-maven-cache:/tmp/dogpaddle-maven/.m2:Z" \
+  --volume "$maven_cache:/tmp/dogpaddle-maven/.m2:Z" \
   --workdir /workspace \
   --entrypoint /bin/bash \
   "$MAVEN_IMAGE" \

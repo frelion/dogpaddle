@@ -5,8 +5,9 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 crate_dir="$(cd -- "$script_dir/.." && pwd)"
 bridge_dir="$crate_dir/bridge"
 distribution_dir="$bridge_dir/target/distribution"
+probe_dir="$bridge_dir/target/lifecycle-probe"
 
-for command in awk cp dirname grep jar java mkdir mvn rm; do
+for command in awk cp dirname find grep jar java mkdir mvn rm; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "missing required command: $command" >&2
     exit 1
@@ -31,6 +32,10 @@ mvn --version
   cd -- "$bridge_dir"
   mvn --batch-mode --no-transfer-progress clean package
 )
+(
+  cd -- "$bridge_dir/probe"
+  mvn --batch-mode --no-transfer-progress clean package
+)
 
 rm -rf -- "$distribution_dir"
 mkdir -p -- "$distribution_dir/lib"
@@ -43,6 +48,12 @@ cp -- \
   "$bridge_dir/distribution/THIRD-PARTY-NOTICES.md" \
   "$distribution_dir/THIRD-PARTY-NOTICES.md"
 cp -- "$bridge_dir/target/bom.json" "$distribution_dir/bom.json"
+
+rm -rf -- "$probe_dir"
+mkdir -p -- "$probe_dir"
+cp -- \
+  "$bridge_dir/probe/target/dogpaddle-debezium-lifecycle-probe.jar" \
+  "$probe_dir/dogpaddle-debezium-lifecycle-probe.jar"
 
 (
   cd -- "$distribution_dir"
@@ -57,6 +68,16 @@ if jar tf "$distribution_dir/lib/dogpaddle-debezium-bridge.jar" \
   echo 'bridge artifact must not contain copied or shadowed io.debezium classes' >&2
   exit 1
 fi
+if jar tf "$distribution_dir/lib/dogpaddle-debezium-bridge.jar" \
+  | grep '^dev/dogpaddle/debezium/probe/' >/dev/null; then
+  echo 'bridge artifact must not contain the lifecycle probe connector' >&2
+  exit 1
+fi
+if ! jar tf "$probe_dir/dogpaddle-debezium-lifecycle-probe.jar" \
+  | grep '^dev/dogpaddle/debezium/probe/LifecycleProbeConnector.class$' >/dev/null; then
+  echo 'lifecycle probe artifact is missing its connector class' >&2
+  exit 1
+fi
 
 test -s "$distribution_dir/SHA256SUMS"
 test -s "$distribution_dir/bom.json"
@@ -66,5 +87,11 @@ test -f "$distribution_dir/lib/connect-runtime-4.3.0.jar"
 test -f "$distribution_dir/lib/debezium-embedded-3.6.2.Final.jar"
 test -f "$distribution_dir/lib/debezium-connector-postgres-3.6.2.Final.jar"
 test -f "$distribution_dir/lib/slf4j-simple-1.7.36.jar"
+test -s "$probe_dir/dogpaddle-debezium-lifecycle-probe.jar"
+if find "$distribution_dir" -name '*lifecycle-probe*' -print | grep . >/dev/null; then
+  echo 'lifecycle probe connector must remain outside the product distribution' >&2
+  exit 1
+fi
 
 echo "PASS Java bridge tests and pinned PostgreSQL distribution: $distribution_dir"
+echo "PASS separate lifecycle probe connector: $probe_dir"

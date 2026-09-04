@@ -67,7 +67,7 @@ store and restores it solely from `Checkpoint`.
 - Java 17 bridge bytecode; Eclipse Temurin JRE `21.0.12.1+1` inside the runtime
   payload. The D1 runner invokes the product's unchanged local-only distribution
   builder inside its digest-pinned Maven/JDK image.
-- Linux GNU x86_64 runtime. The four-platform JVM/bridge smoke matrix is owned
+- Linux GNU x86_64 runtime. The four-platform public lifecycle matrix is owned
   by the separate `Debezium runtime bundles` workflow; the real PostgreSQL
   fixture is intentionally not duplicated on macOS or Linux arm64.
 - `snapshot.mode=no_data` and `lsn.flush.mode=connector`.
@@ -105,6 +105,14 @@ loader paths, so the image's Java cannot replace the payload runtime. Port
 The runner owns an exclusive fixture lock and refuses to overwrite an existing
 Compose project. Set `D1_KEEP_ARTIFACTS=1` to retain the sole checkpoint and
 stderr log, or `D1_KEEP_POSTGRES=1` to retain PostgreSQL.
+
+The `Debezium PostgreSQL recovery` GitHub workflow runs this same command on
+Ubuntu 24.04 for relevant pull requests and `main` changes, once each week,
+and on manual dispatch. It installs the fixture tools and pinned Rust
+toolchain, keeps the Maven/JDK build inside the digest-pinned image, and
+always uploads the artifact directory with whatever environment record,
+checkpoint/state and logs were produced. The workflow does not introduce a
+shorter CI-only PostgreSQL matrix.
 
 ## Required exit gates
 
@@ -164,9 +172,16 @@ fixture itself contains neither Java bridge source nor a direct `jni`
 dependency.
 
 The product's native CI separately relocates each Linux/macOS x86_64/aarch64
-archive and completes the same public runtime handshake with an empty `PATH`
-and invalid Java home variables. That is the direct no-system-Java proof; this
-D1 fixture owns the deeper real PostgreSQL recovery proof.
+archive and, with an empty `PATH` and invalid Java home variables, drives
+`open -> start -> poll(position 1) -> drop/redeliver -> ack -> stop ->
+checkpoint-only restart -> poll(position 2 witness) -> ack -> stop`
+through the public Rust API. It validates the owned record projection and
+candidate checkpoint, then proves the fresh connector continues from the
+accepted position before producing its next record. The deterministic
+connector is injected only into that relocated test copy; it is absent from
+the product distribution and uploaded archive. That matrix is the direct
+four-platform no-system-Java lifecycle proof; this D1 fixture owns the deeper
+real PostgreSQL recovery proof.
 
 ## Fixture lifecycle
 

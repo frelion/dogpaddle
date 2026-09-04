@@ -35,7 +35,7 @@
 | 所有者 | 正确性所有权 | benchmark target |
 | --- | --- | --- |
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
-| Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 runtime 与真实 PostgreSQL gate 独立运行 | 不适用 |
+| Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
 | Operation | 十个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放 | `operation_core` |
 | Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink 拒绝无建库副作用与 reopen 重绑定；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、Commit/Complete、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
@@ -47,8 +47,12 @@
 Debezium 的这一行是分层所有权，不表示所有行为都塞进 Rust 公共 correctness target：offline Rust
 gate 证明 config、target manifest、JRE 关键资源、nested JAR closure、checkpoint/delivery codec 与
 Rustdoc；Java component gate 证明 Engine handler、preview/actual、ACK 与 lifecycle；四个 native runner
-证明 bundle 内 JVM/bridge 可在没有系统 Java 的环境中启动；pinned PostgreSQL gate 最后只经公共
-Rust API 证明同进程运行、unacked replay、checkpoint-only fresh Engine restore 与 eventual LSN。
+用只存在于临时解包目录的确定性 connector，在没有系统 Java 的环境中经公共 API 证明
+`open → start → poll(position 1) → Drop/原样重投 → ack → stop → checkpoint-only 重启 →
+poll(position 2 witness) → ack → stop`、owned record 投影、pre-ACK checkpoint 和从已接受位置继续；
+pinned PostgreSQL gate 最后只经公共 Rust API 证明同进程运行、unacked replay、checkpoint-only fresh
+Engine restore 与 eventual LSN。确定性 connector 不进入正式 distribution 或 runtime archive，也不代替
+真实 PostgreSQL 证据。
 四层证据必须分别报告，只有全部通过才满足 D2 exit。
 
 ## Change + Store 的最小接缝
@@ -187,17 +191,29 @@ crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
 experiments/debezium-d1/scripts/run.sh
 ```
 
-`build-distribution.sh` 只使用本机 Maven 与 JDK。`Debezium runtime bundles` workflow 在 Ubuntu
-上构建并测试一次 Java distribution；Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个原生
+`build-distribution.sh` 只使用本机 Maven 与 JDK。
+[`Debezium runtime bundles`](.github/workflows/debezium-runtime.yml) workflow 在 Ubuntu
+上构建并测试一次 Java distribution，同时单独构建 test-only lifecycle connector；
+Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个原生
 runner 下载同一产物，再分别构建 Rust probe 和 runtime payload。每个 runner 将 archive 解压到含
-空格的新路径，清空 Java 相关环境、动态库搜索路径和系统 `PATH`，再经
-`DebeziumRuntime::open(bundle_root)` 完成 JVM/bridge handshake。runtime payload 不包含 probe 或
-其他宿主 executable。
+空格的新路径，用 `crates/debezium/scripts/install-lifecycle-probe.sh` 把
+`crates/debezium/bridge/probe/` 产出的确定性 connector 只注入该临时副本并重算
+`debezium/SHA256SUMS`，然后清空 Java 相关环境、动态库搜索路径和系统 `PATH`，经
+`crates/debezium/examples/bundled_runtime_probe.rs` 与公共 API 完成
+`open → start → poll(position 1) → Drop/原样重投 → ack → stop → checkpoint-only 重启 →
+poll(position 2 witness) → ack → stop`。它同时校验 topic、partition、timestamp、key、value、headers
+和 pre-ACK checkpoint，并以第二条确定性记录证明新 Connector 从已接受位置继续而不是重放第一条。
+上传的 runtime archive 不包含 probe connector、Rust probe
+或其他宿主 executable。
 
 真实 PostgreSQL 顺序、ACK、replay、checkpoint restore 与 eventual LSN 矩阵仍由 Linux x86_64
 D1 gate 独立拥有。D1 分别只读挂载 Rust diagnostic host 与 runtime payload，并用 payload 内 JVM
-在同一进程运行；它不依赖系统 Java。普通 Rust、Java component、四平台 bundle 和 D1 PostgreSQL
-gate 都通过才构成 D2 证据。
+在同一进程运行；它不依赖系统 Java。
+[`Debezium PostgreSQL recovery`](.github/workflows/debezium-postgres.yml) workflow 在相关 PR、
+`main` 变更、每周定时与手动触发时，于 Ubuntu 24.04 直接运行
+`experiments/debezium-d1/scripts/run.sh`；它无论成功还是失败都执行 artifact 上传，其中包含当次
+已产生的环境、checkpoint/fixture 状态与日志。
+普通 Rust、Java component、四平台 bundle lifecycle 和 D1 PostgreSQL gate 都通过才构成 D2 证据。
 
 ## 新增或删除测试
 

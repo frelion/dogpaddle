@@ -6,12 +6,14 @@
 [`ADR-0001`](docs/adr/0001-embed-debezium-engine.md)，通用算子路线见
 [`OPERATOR_ROADMAP.md`](OPERATOR_ROADMAP.md)。
 
-截至 2026-09-04，D0 与 D1 已完成，D1 结论为 **GREEN**；可重复证据见
+截至 2026-09-04，D0–D2 已完成，结论为 **GREEN**；D1 的可重复黑盒证据见
 [`experiments/debezium-d1/D1_REPORT.md`](experiments/debezium-d1/D1_REPORT.md)。D1 已由 owner
 合并。多 agent 对抗审查随后将原 D2/D3 重排：先把 Debezium 做成独立、窄小的产品组件，
-再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。尚未合并的 D2 实现与验收
-记录见 [PR #12](https://github.com/frelion/dogpaddle/pull/12)；其中 runtime 又收紧为携带固定
-Temurin JRE、不回退系统 Java 的四平台 payload。合并后由 GitHub #5 自动关闭。
+再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 实现与验收记录已由
+[PR #12](https://github.com/frelion/dogpaddle/pull/12) 合并，
+[GitHub #5](https://github.com/frelion/dogpaddle/issues/5) 随后关闭；runtime 收紧为携带固定
+Temurin JRE、不回退系统 Java 的四平台 payload。D3–D7 仍保持开放，不因 D2
+完成而提前声明 durable ingress、`Change` 转换或可发布性。
 
 ## 目标与成功定义
 
@@ -99,16 +101,16 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 
 ## 阶段总览
 
-| 阶段 | GitHub | 主问题 | 交付后的可信结论 |
-| --- | --- | --- | --- |
-| D0 | [#4](https://github.com/frelion/dogpaddle/issues/4) | 契约是什么 | 关键决策、非目标、门槛和风险已冻结 |
-| D1 | [#3](https://github.com/frelion/dogpaddle/issues/3) | stock Engine 是否可控 | Rust 能在同进程稳定 start/poll/ack/stop 原版 Engine |
-| D2 | [#5](https://github.com/frelion/dogpaddle/issues/5) | 原型如何成为简单可靠的产品 runtime | 独立 crate 与自包含 bundle 用 pre-ACK 完整 checkpoint 封住 Debezium/JNI |
-| D3 | [#6](https://github.com/frelion/dogpaddle/issues/6) | 外部 delivery 如何安全进入 Flow | 最小 generic durable ingress 关闭 MDBX/ACK 事务窗口 |
-| D4 | [#7](https://github.com/frelion/dogpaddle/issues/7) | PostgreSQL 行如何变成 Change | 固定 Schema 单表 WAL 试点正确表达 insert/update/delete |
-| D5 | [#8](https://github.com/frelion/dogpaddle/issues/8) | 是否能发布 | crash、fencing、背压、升级、安全和长稳证据齐备 |
-| D6 | [#9](https://github.com/frelion/dogpaddle/issues/9) | 初始全量如何接入 | snapshot/generation 以独立可恢复阶段与 WAL 无缝交接 |
-| D7 | [#10](https://github.com/frelion/dogpaddle/issues/10) | 架构是否真的通用 | 第二个 connector 重用同一套边界，再提取被证明的共性 |
+| 阶段 | GitHub | 状态 | 主问题 | 交付后的可信结论 |
+| --- | --- | --- | --- | --- |
+| D0 | [#4](https://github.com/frelion/dogpaddle/issues/4) | 已完成 | 契约是什么 | 关键决策、非目标、门槛和风险已冻结 |
+| D1 | [#3](https://github.com/frelion/dogpaddle/issues/3) | 已完成 | stock Engine 是否可控 | Rust 能在同进程稳定 start/poll/ack/stop 原版 Engine |
+| D2 | [#5](https://github.com/frelion/dogpaddle/issues/5) | 已完成 | 原型如何成为简单可靠的产品 runtime | 独立 crate 与自包含 bundle 用 pre-ACK 完整 checkpoint 封住 Debezium/JNI |
+| D3 | [#6](https://github.com/frelion/dogpaddle/issues/6) | 待实施 | 外部 delivery 如何安全进入 Flow | 最小 generic durable ingress 关闭 MDBX/ACK 事务窗口 |
+| D4 | [#7](https://github.com/frelion/dogpaddle/issues/7) | 待实施 | PostgreSQL 行如何变成 Change | 固定 Schema 单表 WAL 试点正确表达 insert/update/delete |
+| D5 | [#8](https://github.com/frelion/dogpaddle/issues/8) | 待实施 | 是否能发布 | crash、fencing、背压、升级、安全和长稳证据齐备 |
+| D6 | [#9](https://github.com/frelion/dogpaddle/issues/9) | 待实施 | 初始全量如何接入 | snapshot/generation 以独立可恢复阶段与 WAL 无缝交接 |
+| D7 | [#10](https://github.com/frelion/dogpaddle/issues/10) | 待实施 | 架构是否真的通用 | 第二个 connector 重用同一套边界，再提取被证明的共性 |
 
 D2 依赖 D1 已证明的控制边界；D3 只围绕 D2 已稳定的 public API 建持久交接。D4 依赖
 D2 与 D3，D5 依赖 D4。D6 故意晚于持续 CDC 的发布加固；D7 不允许因为“未来也许复用”
@@ -198,16 +200,16 @@ bridge 在 Engine callback 中只保留一个 delivery；Rust 主动 poll，显�
 - D1 JSON 会合并某些 Java 数值运行类型，不能直接升级为跨 connector 的 opaque offset codec；
 - 试验 checkpoint 文件只是未来 MDBX transaction 的替身，不能被误当成 D3 恢复保证。
 
-## D2：Product Debezium runtime 与 pre-ACK checkpoint
+## D2：Product Debezium runtime 与 pre-ACK checkpoint（已完成）
 
 ### 边界
 
-D2 将 D1 的控制原型重做成独立 `dogpaddle-debezium` 产品 crate。它的 Rust API 与 Java
+D2 已将 D1 的控制原型重做成独立 `dogpaddle-debezium` 产品 crate。它的 Rust API 与 Java
 bridge 只依赖通用 Engine/Kafka Connect 契约，不依赖 Change、Store、Operation、Flow，也没有
-PostgreSQL 代码分支；D2 的参考发行包会包含 PostgreSQL connector，作为第一个真实试点。
+PostgreSQL 代码分支；D2 的参考发行包包含 PostgreSQL connector，作为第一个真实试点。
 它不创建通用 `SourceDriver` trait，也不定义行到 Arrow 的映射或 snapshot。
 
-D2 的目标公开调用面为：
+D2 冻结的公开调用面为：
 
 ```rust,ignore
 let runtime = DebeziumRuntime::open(bundle_root)?;
@@ -259,8 +261,10 @@ status JSON。
   abort 与显式 dispose；普通错误由 Java exception 表达，`failureKind` 只分类 delivery-too-large；
 - Maven/JDK 独立构建出的 `debezium/lib/*.jar`；普通 Cargo gate 不调用 Maven、不联网、
   编译和测试时不要求 JDK；distribution builder 只使用本机 Maven/JDK；
-- CI 在 Ubuntu 只构建测试一次 Java distribution，四个原生 runner 下载同一产物后分别组装、
-  relocate 并探测对应 runtime payload；
+- CI 在 Ubuntu 只构建测试一次 Java distribution，同时单独构建 test-only lifecycle connector；
+  四个原生 runner 下载同一产物后分别组装、
+  relocate 并经 Rust public API 探测对应 runtime payload 的完整 connector 生命周期；可确定产生记录的
+  probe connector 只在 CI 解包后注入临时 payload，不进入正式 distribution 或 runtime archive；
 - D1 PostgreSQL fixture 只通过本 crate public API 驱动真实 connector，并将 host 与 Linux
   x86_64 runtime payload 分别挂载到同一个测试进程。
 
@@ -286,16 +290,26 @@ connector 还需要 schema history；D2 不把 offset checkpoint 夸成所有 co
   restart gate 改走 product API；
 - `cargo xtask check` 在没有 Java artifact 的普通 Rust 环境保持通过；Java/PG gate 显式运行；
 - Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个原生 runner 都从归档重新解压到含空格的
-  路径，在清空 Java 相关环境和系统 PATH 后完成 public-API JVM/bridge handshake；
-- 真实 PostgreSQL 恢复矩阵继续由 Linux x86_64 D1 gate 所有，不用四个平台复制数据库 fixture。
+  路径，在清空 Java 相关环境和系统 PATH 后完成
+  `open → start → poll(position 1) → Drop/原样重投 → ack → stop → checkpoint-only 重启 →
+  poll(position 2 witness) → ack → stop`，并核对 owned record 投影和 pre-ACK checkpoint，确认新
+  Connector 从已接受位置继续而不是重放第一条；
+- 真实 PostgreSQL 恢复矩阵继续由 Linux x86_64 D1 gate 所有，不用四个平台复制数据库 fixture；
+  它由独立
+  [`Debezium PostgreSQL recovery`](.github/workflows/debezium-postgres.yml) workflow 在相关 PR、
+  `main` 变更、每周定时与手动触发时执行，成败都保留诊断产物。
 
-### 退出条件
+### 退出条件（已满足）
 
 从干净 checkout 可以分别运行普通 Rust gate、自包含四平台 bundle gate 与 pinned Java/真实
 PostgreSQL gate。fresh Engine 只靠调用方保存的 pre-ACK checkpoint 恢复，不存在 Java offset 文件；
 D1 不再拥有第二份 JVM/JNI
-host runtime、bridge、delivery codec 或生命周期实现，它只保留调用公共 API 的黑盒 CLI。未达到
-checkpoint 独立恢复前，只能称 D2 foundation，不能进入 D3。
+host runtime、bridge、delivery codec 或生命周期实现，它只保留调用公共 API 的黑盒 CLI。
+[PR #12](https://github.com/frelion/dogpaddle/pull/12) 的合并与
+[GitHub #5](https://github.com/frelion/dogpaddle/issues/5) 的关闭记录了 D2 接受；四平台 runtime lifecycle
+由 [`Debezium runtime bundles`](.github/workflows/debezium-runtime.yml)、Linux 真实 PostgreSQL recovery 由
+[`Debezium PostgreSQL recovery`](.github/workflows/debezium-postgres.yml) 分层持续执行，不将前者的
+确定性 probe 当成后者的数据库证据。
 
 ### 主要风险
 

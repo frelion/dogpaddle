@@ -45,20 +45,41 @@ jobs:
       - name: Restore and save Maven cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: ~/.m2/repository
-          key: debezium-maven-v1-${{ hashFiles('crates/debezium/bridge/pom.xml') }}
+          path: target/debezium-maven-cache
+          key: debezium-maven-v2-${{ hashFiles('crates/debezium/bridge/pom.xml', 'crates/debezium/bridge/probe/pom.xml') }}
 
-      - name: Show Java build toolchain
-        run: java -version && mvn --version
-
-      - name: Build and test the Java distribution
-        run: crates/debezium/scripts/build-distribution.sh
+      - name: Build and test the Java distribution in the pinned Maven image
+        run: |
+          set -euo pipefail
+          maven_image="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237"
+          maven_home="$GITHUB_WORKSPACE/target/debezium-maven-cache"
+          mkdir -p -- "$maven_home"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/dogpaddle-maven \
+            --env MAVEN_CONFIG=/tmp/dogpaddle-maven/.m2 \
+            --env MAVEN_OPTS=-Duser.home=/tmp/dogpaddle-maven \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$maven_home:/tmp/dogpaddle-maven/.m2" \
+            --workdir /workspace \
+            --entrypoint /bin/bash \
+            "$maven_image" \
+            crates/debezium/scripts/build-distribution.sh
 
       - name: Upload the Java distribution
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dogpaddle-debezium-java-distribution
           path: crates/debezium/bridge/target/distribution
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload the test-only lifecycle probe connector
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dogpaddle-debezium-lifecycle-probe
+          path: crates/debezium/bridge/target/lifecycle-probe/dogpaddle-debezium-lifecycle-probe.jar
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -96,6 +117,12 @@ jobs:
           name: dogpaddle-debezium-java-distribution
           path: crates/debezium/bridge/target/distribution
 
+      - name: Download the test-only lifecycle probe connector
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dogpaddle-debezium-lifecycle-probe
+          path: crates/debezium/bridge/target/lifecycle-probe
+
       - name: Restore and save Cargo cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -119,7 +146,7 @@ jobs:
       - name: Assemble the self-contained runtime bundle
         run: crates/debezium/scripts/build-runtime-bundle.sh "${{ matrix.target }}"
 
-      - name: Verify the archived bundle after relocation without system Java
+      - name: Verify the relocated bundle through the public lifecycle without system Java
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -145,6 +172,11 @@ jobs:
           tar -xzf "$archive" -C "$relocated_parent"
           relocated_bundle="$relocated_parent/$bundle_name"
           probe="$GITHUB_WORKSPACE/target/release/examples/bundled_runtime_probe"
+          probe_connector="$GITHUB_WORKSPACE/crates/debezium/bridge/target/lifecycle-probe/dogpaddle-debezium-lifecycle-probe.jar"
+
+          crates/debezium/scripts/install-lifecycle-probe.sh \
+            "$relocated_bundle" \
+            "$probe_connector"
 
           empty_path="$RUNNER_TEMP/dogpaddle-empty-path-$TARGET"
           missing_java="$RUNNER_TEMP/dogpaddle-missing-java-$TARGET"

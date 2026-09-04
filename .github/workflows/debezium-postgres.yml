@@ -1,0 +1,145 @@
+name: Debezium PostgreSQL recovery
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/debezium-postgres.yml"
+      - ".cargo/**"
+      - "crates/debezium/**"
+      - "experiments/debezium-d1/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/debezium-postgres.yml"
+      - ".cargo/**"
+      - "crates/debezium/**"
+      - "experiments/debezium-d1/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debezium-postgres-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  D1_ARTIFACT_ROOT: ${{ github.workspace }}/d1-artifacts
+  D1_KEEP_ARTIFACTS: "1"
+  D1_KEEP_POSTGRES: "1"
+  PODMAN_COMPOSE_PROVIDER: /usr/bin/podman-compose
+  RUST_BACKTRACE: "1"
+
+jobs:
+  recovery:
+    name: PostgreSQL checkpoint and ACK recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create artifact directory
+        run: |
+          mkdir -p -- "$D1_ARTIFACT_ROOT"
+          printf 'D1 workflow setup started\n' >"$D1_ARTIFACT_ROOT/setup-started.log"
+
+      - name: Install the fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            fuse-overlayfs \
+            podman \
+            podman-compose \
+            postgresql-client \
+            ripgrep \
+            slirp4netns \
+            uidmap
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
+
+      - name: Restore and save D1 build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debezium-maven-cache
+            target/debezium-runtime-downloads
+            experiments/debezium-d1/host/target
+          key: debezium-d1-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'experiments/debezium-d1/host/Cargo.lock', 'crates/debezium/bridge/pom.xml', 'crates/debezium/bridge/probe/pom.xml', 'crates/debezium/runtime-assets/*.tsv') }}
+          restore-keys: |
+            debezium-d1-v1-${{ runner.os }}-1.96-
+
+      - name: Record the fixture environment
+        run: |
+          exec > >(tee "$D1_ARTIFACT_ROOT/environment.log") 2>&1
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo clippy --version
+          podman --version
+          podman info
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+          command -v newuidmap
+          command -v newgidmap
+          rg "^$(id --user --name):[0-9]+:[0-9]+$" /etc/subuid
+          rg "^$(id --user --name):[0-9]+:[0-9]+$" /etc/subgid
+          test -x "$PODMAN_COMPOSE_PROVIDER"
+          podman compose version
+          podman compose --file experiments/debezium-d1/compose.yaml config
+          psql --version
+          python3 --version
+
+      - name: Run the real PostgreSQL recovery gate
+        env:
+          TMPDIR: ${{ env.D1_ARTIFACT_ROOT }}
+        run: |
+          set -o pipefail
+          experiments/debezium-d1/scripts/run.sh \
+            2>&1 | tee "$D1_ARTIFACT_ROOT/d1-gate.log"
+
+      - name: Capture PostgreSQL diagnostics
+        if: always()
+        continue-on-error: true
+        run: |
+          podman compose \
+            --project-name dogpaddle-debezium-d1 \
+            --file experiments/debezium-d1/compose.yaml \
+            ps --all >"$D1_ARTIFACT_ROOT/postgres-status.log" 2>&1 || true
+          podman compose \
+            --project-name dogpaddle-debezium-d1 \
+            --file experiments/debezium-d1/compose.yaml \
+            logs --no-color postgres >"$D1_ARTIFACT_ROOT/postgres.log" 2>&1 || true
+
+      - name: Remove the PostgreSQL fixture
+        if: always()
+        env:
+          TMPDIR: ${{ env.D1_ARTIFACT_ROOT }}
+        run: |
+          set -o pipefail
+          experiments/debezium-d1/scripts/clean.sh \
+            2>&1 | tee "$D1_ARTIFACT_ROOT/cleanup.log"
+
+      - name: Upload D1 checkpoints and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debezium-postgres-${{ github.run_id }}-${{ github.run_attempt }}
+          path: d1-artifacts/
+          if-no-files-found: error
+          retention-days: 14
