@@ -88,71 +88,71 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("sink.sqlite");
     drop(build_sqlite_flow(&flow_path, &sqlite_path));
-    assert!(
-        !sqlite_path.exists(),
-        "Flow build eagerly created the SQLite database"
-    );
     drop(FlowFactory::new(&flow_path).open().unwrap());
-    assert!(
-        !sqlite_path.exists(),
-        "Flow open eagerly created the SQLite database"
-    );
+    assert!(!sqlite_path.exists(), "build/open must not create SQLite");
 
     let encoded_change = encode_change(&multiplicity_change(7, 1_025)).unwrap();
     publish_source_change(&flow_path, &encoded_change);
+    let mut prepared = None;
 
-    for round in 1..=6 {
+    // Stop after the target transaction, before local settlement; reopen must
+    // replay the same fixed IDs without allocating or deleting another row.
+    for replay in 0..3 {
         let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-        assert_eq!(
-            flow.advance().unwrap(),
-            AdvanceOutcome::Progressed,
-            "round {round}"
-        );
+        for _ in 0..16 {
+            assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+            if sqlite_rows(&sqlite_path) == Some(1_024) {
+                break;
+            }
+        }
         drop(flow);
-
-        if round == 1 {
-            assert!(sqlite_path.is_file());
-            assert_eq!(sqlite_object_count(&sqlite_path), 0);
-        }
-        if round == 2 {
-            assert_eq!(sqlite_object_count(&sqlite_path), 2);
-            assert_eq!(sqlite_row_count(&sqlite_path), 0);
-        }
-
+        assert_eq!(sqlite_rows(&sqlite_path), Some(1_024), "replay {replay}");
         let snapshot = sink_snapshot(&flow_path);
-        if round < 6 {
-            assert_eq!(snapshot.cursor, Some(0), "round {round}");
-            assert_eq!(snapshot.output_bounds, 0..1, "round {round}");
-            assert_eq!(
-                snapshot.encoded_entry.as_deref(),
-                Some(encoded_change.as_slice()),
-                "round {round} did not retain the complete input Change"
-            );
-        } else {
-            assert_eq!(snapshot.cursor, Some(1));
-            assert_eq!(snapshot.output_bounds, 1..1);
-            assert_eq!(snapshot.encoded_entry, None);
-        }
-
-        let expected = match round {
-            1 => (None, true, None),
-            2 => (Some(1), false, Some(0)),
-            3 => (Some(1_025), true, Some(0)),
-            4 => (Some(1_025), true, Some(1_024)),
-            5 => (Some(1_026), true, Some(1_024)),
-            6 => (Some(1_026), false, Some(1_025)),
-            _ => unreachable!(),
-        };
+        assert_eq!(snapshot.cursor, Some(0));
+        assert_eq!(snapshot.output_bounds, 0..1);
         assert_eq!(
-            (
-                snapshot.next_id,
-                snapshot.has_pending,
-                sqlite_rows(&sqlite_path)
-            ),
-            expected,
-            "round {round}"
+            snapshot.encoded_entry.as_deref(),
+            Some(encoded_change.as_slice())
         );
+        assert!(snapshot.state.is_some());
+        if replay == 0 {
+            prepared = snapshot.state;
+        } else {
+            assert_eq!(snapshot.state, prepared);
+        }
     }
+
+    let mut flow = FlowFactory::new(&flow_path).open().unwrap();
+    let mut outcome = AdvanceOutcome::Progressed;
+    for _ in 0..16 {
+        outcome = flow.advance().unwrap();
+        if outcome == AdvanceOutcome::Idle {
+            break;
+        }
+    }
+    assert_eq!(outcome, AdvanceOutcome::Idle);
+    drop(flow);
+
+    let snapshot = sink_snapshot(&flow_path);
+    assert_eq!(snapshot.cursor, Some(1));
+    assert_eq!(snapshot.output_bounds, 1..1);
+    assert_eq!(snapshot.encoded_entry, None);
+    assert_ne!(snapshot.state, prepared);
+    let connection = sqlite_connection(&sqlite_path);
+    let rows = connection
+        .prepare("SELECT \"$dogpaddle.id\", value FROM events ORDER BY \"$dogpaddle.id\"")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, decode_u64_blob(row.get(1)?)))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows, (1..=1_025).map(|id| (id, 7)).collect::<Vec<_>>());
+
+    let mut reopened = FlowFactory::new(&flow_path).open().unwrap();
+    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
+    assert_eq!(sqlite_rows(&sqlite_path), Some(1_025));
 }
 
 fn build_sqlite_flow(flow_path: &Path, sqlite_path: &Path) -> dogpaddle_flow::Flow {
@@ -207,8 +207,7 @@ struct SinkSnapshot {
     cursor: Option<u64>,
     output_bounds: Range<u64>,
     encoded_entry: Option<Vec<u8>>,
-    next_id: Option<u64>,
-    has_pending: bool,
+    state: Option<Vec<u8>>,
 }
 
 fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
@@ -216,11 +215,8 @@ fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
         store.open_data("station/00000001/state").unwrap();
-    let next_id: Cell<u64> = store
-        .open_data("station/00000001/operation/sqlite_sink.next_id")
-        .unwrap();
-    let pending: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/sqlite_sink.pending")
+    let sink_state: Cell<Vec<u8>> = store
+        .open_data("station/00000001/operation/relation_sink.state")
         .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
@@ -248,8 +244,7 @@ fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
         cursor,
         output_bounds,
         encoded_entry,
-        next_id: next_id.access(access).unwrap().get().unwrap(),
-        has_pending: pending.access(access).unwrap().get().unwrap().is_some(),
+        state: sink_state.access(access).unwrap().get().unwrap(),
     }
 }
 

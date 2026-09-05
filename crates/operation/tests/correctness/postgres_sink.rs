@@ -85,7 +85,7 @@ fn postgres_sink_declares_one_state_cell_and_exact_runtime_resource() {
             .iter()
             .map(dogpaddle_operation::DataDeclaration::name)
             .collect::<Vec<_>>(),
-        ["postgres_sink.state"]
+        ["relation_sink.state"]
     );
 
     let binding = (&definition as &dyn OperationDefinition)
@@ -183,7 +183,7 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
 }
 
 #[test]
-fn postgres_sink_build_materialize_and_abandoned_first_turn_do_not_connect() {
+fn postgres_sink_restores_offline_then_checks_target_before_publishing_initialization() {
     let store_root = TestStore::new();
     let definition = definition();
     let mut store = Store::create(store_root.path()).unwrap();
@@ -198,8 +198,9 @@ fn postgres_sink_build_materialize_and_abandoned_first_turn_do_not_connect() {
 
     // The endpoint is deliberately unreachable and names another database.
     // Binding, Store construction, materialization, turn preparation, and
-    // transaction application must not inspect or contact PostgreSQL; only a
-    // successfully run completion may validate and connect to the target.
+    // transaction application and first completion only restore local state.
+    // The next transaction-free turn checks the target before publishing any
+    // initialization intent.
     let mut operation = (&definition as &dyn OperationDefinition)
         .bind(&[input_schema()])
         .unwrap()
@@ -242,14 +243,25 @@ fn postgres_sink_build_materialize_and_abandoned_first_turn_do_not_connect() {
         }))
         .unwrap()
     else {
-        panic!("a fresh PostgreSQL sink did not prepare initialization");
+        panic!("a fresh PostgreSQL sink did not prepare local restoration");
     };
     let transaction = transactions.begin().unwrap();
     let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap() else {
-        panic!("a fresh PostgreSQL sink did not persist initialization");
+        panic!("a fresh PostgreSQL sink did not commit local restoration");
     };
     transaction.commit().unwrap();
-    drop(completion);
+    completion.run().unwrap();
+
+    let Err(error) = operation.turn(Some(OperationInput {
+        port: 0,
+        change: &change,
+    })) else {
+        panic!("a mismatched target was accepted before initialization");
+    };
+    assert!(matches!(
+        error.downcast_ref::<PostgresSinkError>(),
+        Some(PostgresSinkError::DatabaseMismatch)
+    ));
 
     let transaction = transactions.begin().unwrap();
     assert!(
@@ -258,7 +270,7 @@ fn postgres_sink_build_materialize_and_abandoned_first_turn_do_not_connect() {
             .unwrap()
             .get()
             .unwrap()
-            .is_some()
+            .is_none()
     );
     transaction.commit().unwrap();
 }

@@ -1,4 +1,4 @@
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::DataType;
 use thiserror::Error;
 
 /// Failure while validating a `PostgreSQL` relation sink's bound Arrow Schema.
@@ -108,61 +108,17 @@ pub enum PostgresSinkError {
     /// Initialization replay found target data that cannot belong to initialization.
     #[error("PostgreSQL sink target is not empty during initialization replay")]
     TargetNotEmpty,
-    /// Target technical IDs do not agree with the durable allocation frontier.
-    #[error("PostgreSQL sink target technical ID {id} is not below next ID {next_id}")]
-    TechnicalIdFrontierMismatch {
-        /// Largest observed target technical ID.
-        id: u64,
-        /// Durable next unallocated ID.
-        next_id: u64,
-    },
-    /// Target receipts do not agree with the durable delivery frontier.
-    #[error(
-        "PostgreSQL sink target delivery {delivery} is not below next delivery {next_delivery}"
-    )]
-    DeliveryFrontierMismatch {
-        /// Largest observed target delivery sequence.
-        delivery: u64,
-        /// Durable next unallocated delivery sequence.
-        next_delivery: u64,
-    },
-    /// A receipt exists for the delivery sequence with different immutable content.
-    #[error("PostgreSQL sink delivery {delivery} was previously committed with another payload")]
-    DeliveryConflict {
-        /// Conflicting delivery sequence.
-        delivery: u64,
-    },
     /// A batch is structurally invalid.
     #[error("invalid PostgreSQL sink batch: {message}")]
     InvalidBatch {
         /// Stable validation diagnostic.
         message: String,
     },
-    /// A retained Change does not have the Schema captured during binding.
-    #[error("PostgreSQL sink input Schema differs from its bound Schema")]
-    InputSchemaMismatch {
-        /// Exact Schema fixed during binding.
-        expected: SchemaRef,
-        /// Schema supplied during execution.
-        actual: SchemaRef,
-    },
     /// A logical Arrow row could not be encoded exactly.
     #[error("PostgreSQL sink row processing failed: {message}")]
     Row {
         /// Stable row diagnostic.
         message: String,
-    },
-    /// A prepared insert reused a target technical ID.
-    #[error("PostgreSQL sink technical ID {id} already exists")]
-    TechnicalIdConflict {
-        /// Conflicting technical ID.
-        id: u64,
-    },
-    /// A prepared delete did not match exactly one physical row.
-    #[error("PostgreSQL sink delete ID {id} did not match its expected logical row")]
-    DeleteRowMismatch {
-        /// Mismatched technical ID.
-        id: u64,
     },
     /// `PostgreSQL` rejected a connection, catalog read, or target transaction.
     #[error("PostgreSQL sink {stage} failed (SQLSTATE {sqlstate})")]
@@ -171,6 +127,12 @@ pub enum PostgresSinkError {
         stage: &'static str,
         /// Five-character `PostgreSQL` error code, when available.
         sqlstate: String,
+    },
+    /// A complete connection or database operation exceeded its client deadline.
+    #[error("PostgreSQL sink {stage} timed out")]
+    Timeout {
+        /// Stable operation stage that exceeded its deadline.
+        stage: &'static str,
     },
 }
 
@@ -192,11 +154,18 @@ pub(super) fn invalid_batch(message: impl Into<String>) -> PostgresSinkError {
     }
 }
 
-pub(super) fn database_error(stage: &'static str, error: &postgres::Error) -> PostgresSinkError {
+pub(super) fn database_error(
+    stage: &'static str,
+    error: &tokio_postgres::Error,
+) -> PostgresSinkError {
     PostgresSinkError::Database {
         stage,
         sqlstate: error
             .code()
             .map_or_else(|| "unavailable".to_owned(), |code| code.code().to_owned()),
     }
+}
+
+pub(super) const fn timeout(stage: &'static str) -> PostgresSinkError {
+    PostgresSinkError::Timeout { stage }
 }

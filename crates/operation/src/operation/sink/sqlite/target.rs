@@ -1,40 +1,56 @@
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_change::Change;
-use rusqlite::{
-    Connection, OpenFlags, ToSql, Transaction, TransactionBehavior, params, params_from_iter,
-    types::ValueRef,
-};
+use rusqlite::{Connection, OpenFlags, ToSql, TransactionBehavior, params, params_from_iter};
 
 use super::{
     TECHNICAL_HASH, TECHNICAL_ID,
     definition::SqliteSinkSchemaError,
     error::SqliteSinkError,
     row::{EncodedRow, RowCodec},
-    state::{Mutation, MutationKind},
+};
+use crate::operation::{
+    OperationError,
+    sink::relation::{Batch, Lookup, Matches, RelationTarget},
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Lazily opened `SQLite` destination and its Schema-bound SQL.
-pub(super) struct SqliteTarget {
+pub(crate) struct SqliteTarget {
     database_path: PathBuf,
+    row_codec: RowCodec,
     sql: SqlPlan,
     connection: Option<Connection>,
+    verified: bool,
 }
 
 impl SqliteTarget {
     pub(super) fn try_new(
         database_path: PathBuf,
         table_name: String,
-        row_codec: &RowCodec,
+        input_schema: SchemaRef,
     ) -> Result<Self, SqliteSinkSchemaError> {
+        let row_codec = RowCodec::new_validated(input_schema);
+        let sql = SqlPlan::try_new(table_name, &row_codec)?;
         Ok(Self {
             database_path,
-            sql: SqlPlan::try_new(table_name, row_codec)?,
+            row_codec,
+            sql,
             connection: None,
+            verified: false,
         })
+    }
+
+    pub(super) fn encode_row(
+        &self,
+        change: &Change,
+        row_index: usize,
+    ) -> Result<EncodedRow, SqliteSinkError> {
+        self.row_codec
+            .encode_row(change.records(), row_index)
+            .map_err(SqliteSinkError::from)
     }
 
     pub(super) fn require_absent(&mut self) -> Result<(), SqliteSinkError> {
@@ -47,65 +63,124 @@ impl SqliteTarget {
         Ok(())
     }
 
-    pub(super) fn verify_ready(&mut self, next_id: u64) -> Result<(), SqliteSinkError> {
+    fn verify_ready(&mut self) -> Result<(), SqliteSinkError> {
+        if self.verified {
+            return Ok(());
+        }
         let (connection, sql) = self.parts()?;
         require_exact_layout(connection, sql)?;
 
-        let (minimum, maximum) = technical_id_bounds(connection, sql)?;
-        if let Some(minimum) = minimum
-            && minimum <= 0
-        {
-            return Err(SqliteSinkError::InvalidStoredTechnicalId { id: minimum });
-        }
-        if let Some(maximum) = maximum {
-            let maximum = u64::try_from(maximum)
-                .expect("the minimum-ID check proves every stored ID is positive");
-            if maximum >= next_id {
-                return Err(SqliteSinkError::TechnicalIdFrontierMismatch {
-                    id: maximum,
-                    next_id,
-                });
-            }
-        }
+        self.verified = true;
         Ok(())
     }
 
-    pub(super) fn matching_ids(
+    fn matching_ids(
         &mut self,
         encoded: &EncodedRow,
-        excluded: &HashSet<u64>,
         scan_limit: u64,
         select_limit: usize,
-    ) -> Result<MatchingIds, SqliteSinkError> {
+    ) -> Result<Matches, SqliteSinkError> {
         let (connection, sql) = self.parts()?;
-        let mut selected = Vec::with_capacity(select_limit);
-        let mut count = 0_u64;
-        let mut statement = connection.prepare_cached(&sql.select_by_hash)?;
-        let mut rows = statement.query(params![encoded.hash.as_slice()])?;
-        while count < scan_limit {
-            let Some(row) = rows.next()? else {
-                break;
-            };
+        let select_limit = i64::try_from(select_limit).expect("the bounded batch limit fits i64");
+        let mut values = std::iter::once(&encoded.hash as &dyn ToSql)
+            .chain(encoded.values.iter().map(|value| value as &dyn ToSql))
+            .collect::<Vec<_>>();
+        let count_limit = i64::try_from(scan_limit).unwrap_or(i64::MAX);
+        values.push(&select_limit);
+        let mut statement = connection.prepare_cached(&sql.select_matching_ids)?;
+        let mut rows = statement.query(values.as_slice())?;
+        let mut selected = Vec::new();
+        while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             if id <= 0 {
                 return Err(SqliteSinkError::InvalidStoredTechnicalId { id });
             }
             let id = u64::try_from(id).expect("a positive SQLite INTEGER fits u64");
-            if excluded.contains(&id) || !encoded.matches(row, 1)? {
-                continue;
-            }
-            count += 1;
-            if selected.len() < select_limit {
-                selected.push(id);
-            }
+            selected.push(id);
         }
-        Ok(MatchingIds { count, selected })
+        let selected_count = u64::try_from(selected.len()).expect("the bounded result fits u64");
+        let count = if selected_count == select_limit.unsigned_abs() && scan_limit > selected_count
+        {
+            *values.last_mut().expect("the limit parameter was appended") = &count_limit;
+            let count = connection
+                .prepare_cached(&sql.count_matches)?
+                .query_row(values.as_slice(), |row| row.get::<_, i64>(0))?;
+            u64::try_from(count).expect("SQLite COUNT returns a nonnegative integer")
+        } else {
+            selected_count
+        };
+        Ok(Matches {
+            count,
+            ids: selected,
+        })
     }
 
-    pub(super) fn begin(&mut self) -> Result<SqliteTargetTransaction<'_>, SqliteSinkError> {
+    pub(super) fn initialize(&mut self) -> Result<(), SqliteSinkError> {
         let (connection, sql) = self.parts()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(SqliteTargetTransaction { transaction, sql })
+        if !object_exists(&transaction, &sql.table_name)? {
+            if object_exists(&transaction, &sql.index_name)? {
+                return Err(SqliteSinkError::TargetLayoutMismatch {
+                    name: sql.index_name.clone(),
+                });
+            }
+            transaction.execute(&sql.create_table, [])?;
+            transaction.execute(&sql.create_index, [])?;
+        }
+        require_exact_layout(&transaction, sql)?;
+        if transaction.query_row(&sql.has_rows, [], |row| row.get::<_, bool>(0))? {
+            return Err(SqliteSinkError::TargetNotEmpty {
+                table: sql.table_name.clone(),
+            });
+        }
+        transaction.commit()?;
+        self.verified = true;
+        Ok(())
+    }
+
+    fn write(&mut self, change: &Change, batch: &Batch) -> Result<(), SqliteSinkError> {
+        self.verify_ready()?;
+        let mut inserts = Vec::new();
+        for group in batch
+            .inserts
+            .chunk_by(|left, right| left.row_index == right.row_index)
+        {
+            let row_index = usize::try_from(group[0].row_index).map_err(|_| {
+                super::error::invalid_batch("mutation row index cannot be represented by usize")
+            })?;
+            let ids = group
+                .iter()
+                .map(|insert| technical_id_as_i64(insert.technical_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            inserts.push((ids, self.encode_row(change, row_index)?));
+        }
+        let deletes = batch
+            .deletes
+            .iter()
+            .map(|id| technical_id_as_i64(*id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (connection, sql) = self.parts()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (ids, encoded) in &inserts {
+            let mut statement = transaction.prepare_cached(&sql.insert)?;
+            for id in ids {
+                let values = [id as &dyn ToSql, &encoded.hash as &dyn ToSql]
+                    .into_iter()
+                    .chain(encoded.values.iter().map(|value| value as &dyn ToSql));
+                statement.execute(params_from_iter(values))?;
+            }
+        }
+        if !deletes.is_empty() {
+            let placeholders = std::iter::repeat_n("?", deletes.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete = format!("{}({placeholders})", sql.delete_prefix);
+            transaction
+                .prepare_cached(&delete)?
+                .execute(params_from_iter(deletes))?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn parts(&mut self) -> Result<(&mut Connection, &SqlPlan), SqliteSinkError> {
@@ -113,6 +188,7 @@ impl SqliteTarget {
             database_path,
             sql,
             connection,
+            ..
         } = self;
         if connection.is_none() {
             *connection = Some(open_connection(database_path)?);
@@ -126,128 +202,33 @@ impl SqliteTarget {
     }
 }
 
-pub(super) struct MatchingIds {
-    pub(super) count: u64,
-    pub(super) selected: Vec<u64>,
-}
-
-/// One external transaction whose commit remains last in the operation turn.
-pub(super) struct SqliteTargetTransaction<'connection> {
-    transaction: Transaction<'connection>,
-    sql: &'connection SqlPlan,
-}
-
-impl SqliteTargetTransaction<'_> {
-    pub(super) fn initialize(&self) -> Result<(), SqliteSinkError> {
-        if !object_exists(&self.transaction, &self.sql.table_name)? {
-            if object_exists(&self.transaction, &self.sql.index_name)? {
-                return Err(SqliteSinkError::TargetLayoutMismatch {
-                    name: self.sql.index_name.clone(),
-                });
-            }
-            self.transaction.execute(&self.sql.create_table, [])?;
-            self.transaction.execute(&self.sql.create_index, [])?;
-        }
-        require_exact_layout(&self.transaction, self.sql)?;
-        if technical_id_bounds(&self.transaction, self.sql)? != (None, None) {
-            return Err(SqliteSinkError::TargetNotEmpty {
-                table: self.sql.table_name.clone(),
-            });
-        }
-        Ok(())
+impl RelationTarget for SqliteTarget {
+    fn require_absent(&mut self) -> Result<(), OperationError> {
+        Self::require_absent(self).map_err(OperationError::from)
     }
 
-    pub(super) fn apply(
-        &self,
-        row_codec: &RowCodec,
-        change: &Change,
-        mutations: &[Mutation],
-    ) -> Result<(), SqliteSinkError> {
-        for row_mutations in mutations.chunk_by(|left, right| left.row_index == right.row_index) {
-            let row_index = usize::try_from(row_mutations[0].row_index).map_err(|_| {
-                super::error::pending_mismatch("mutation row index cannot be represented by usize")
-            })?;
-            let encoded = row_codec.encode_row(change.records(), row_index)?;
-            for mutation in row_mutations {
-                match mutation.kind {
-                    MutationKind::Insert => {
-                        self.apply_insert(mutation.technical_id, &encoded)?;
-                    }
-                    MutationKind::Delete => {
-                        self.apply_delete(mutation.technical_id, &encoded)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+    fn initialize(&mut self) -> Result<(), OperationError> {
+        Self::initialize(self).map_err(OperationError::from)
     }
 
-    pub(super) fn commit(self) -> Result<(), SqliteSinkError> {
-        self.transaction.commit().map_err(SqliteSinkError::from)
-    }
-
-    fn apply_insert(&self, technical_id: u64, encoded: &EncodedRow) -> Result<(), SqliteSinkError> {
-        let id = technical_id_as_i64(technical_id)?;
-        let technical_values = [&id as &dyn ToSql, &encoded.hash as &dyn ToSql];
-        let values = technical_values
-            .into_iter()
-            .chain(encoded.values.iter().map(|value| value as &dyn ToSql));
-        let actual = self
-            .transaction
-            .prepare_cached(&self.sql.insert)?
-            .execute(params_from_iter(values))?;
-        if actual == 1 {
-            return Ok(());
-        }
-        if actual != 0 {
-            return Err(SqliteSinkError::UnexpectedMutationCount {
-                operation: "insert",
-                id: technical_id,
-                expected: 1,
-                actual,
-            });
-        }
-        match self.row_by_id_matches(id, encoded)? {
-            Some(true) => Ok(()),
-            Some(false) | None => Err(SqliteSinkError::TechnicalIdConflict { id: technical_id }),
-        }
-    }
-
-    fn apply_delete(&self, technical_id: u64, encoded: &EncodedRow) -> Result<(), SqliteSinkError> {
-        let id = technical_id_as_i64(technical_id)?;
-        match self.row_by_id_matches(id, encoded)? {
-            None => return Ok(()),
-            Some(false) => return Err(SqliteSinkError::DeleteRowMismatch { id: technical_id }),
-            Some(true) => {}
-        }
-        let actual = self
-            .transaction
-            .execute(&self.sql.delete_by_id, params![id])?;
-        if actual == 1 {
-            Ok(())
-        } else {
-            Err(SqliteSinkError::UnexpectedMutationCount {
-                operation: "delete",
-                id: technical_id,
-                expected: 1,
-                actual,
+    fn lookup(
+        &mut self,
+        input: &Change,
+        requests: &[Lookup],
+    ) -> Result<Vec<Matches>, OperationError> {
+        self.verify_ready()?;
+        requests
+            .iter()
+            .map(|request| {
+                let encoded = self.encode_row(input, request.row_index)?;
+                self.matching_ids(&encoded, request.needed, request.take)
+                    .map_err(OperationError::from)
             })
-        }
+            .collect()
     }
 
-    fn row_by_id_matches(
-        &self,
-        id: i64,
-        encoded: &EncodedRow,
-    ) -> Result<Option<bool>, SqliteSinkError> {
-        let mut statement = self.transaction.prepare_cached(&self.sql.select_by_id)?;
-        let mut rows = statement.query(params![id])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            stored_hash_matches(row.get_ref(0)?, &encoded.hash) && encoded.matches(row, 1)?,
-        ))
+    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
+        self.write(input, batch).map_err(OperationError::from)
     }
 }
 
@@ -257,10 +238,10 @@ struct SqlPlan {
     create_table: String,
     create_index: String,
     insert: String,
-    select_by_hash: String,
-    select_by_id: String,
-    delete_by_id: String,
-    technical_id_bounds: String,
+    select_matching_ids: String,
+    count_matches: String,
+    delete_prefix: String,
+    has_rows: String,
 }
 
 impl SqlPlan {
@@ -303,24 +284,24 @@ impl SqlPlan {
             columns.join(", ")
         );
 
-        let logical = logical_columns.join(", ");
-        let select_by_hash = if logical.is_empty() {
-            format!(
-                "SELECT {quoted_id} FROM {quoted_table} WHERE {quoted_hash} = ?1 ORDER BY {quoted_id}"
-            )
-        } else {
-            format!(
-                "SELECT {quoted_id}, {logical} FROM {quoted_table} WHERE {quoted_hash} = ?1 ORDER BY {quoted_id}"
-            )
-        };
-        let select_by_id = if logical.is_empty() {
-            format!("SELECT {quoted_hash} FROM {quoted_table} WHERE {quoted_id} = ?1")
-        } else {
-            format!("SELECT {quoted_hash}, {logical} FROM {quoted_table} WHERE {quoted_id} = ?1")
-        };
-        let delete_by_id = format!("DELETE FROM {quoted_table} WHERE {quoted_id} = ?1");
-        let technical_id_bounds =
-            format!("SELECT MIN({quoted_id}), MAX({quoted_id}) FROM {quoted_table}");
+        let row_columns = std::iter::once(quoted_hash)
+            .chain(logical_columns)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row_placeholders = (1..columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let predicate = format!("({row_columns}) IS ({row_placeholders})");
+        let limit = columns.len();
+        let select_matching_ids = format!(
+            "SELECT {quoted_id} FROM {quoted_table} WHERE {predicate} ORDER BY {quoted_id} LIMIT ?{limit}"
+        );
+        let count_matches = format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM {quoted_table} WHERE {predicate} LIMIT ?{limit})"
+        );
+        let delete_prefix = format!("DELETE FROM {quoted_table} WHERE {quoted_id} IN ");
+        let has_rows = format!("SELECT EXISTS(SELECT 1 FROM {quoted_table} LIMIT 1)");
 
         Ok(Self {
             table_name,
@@ -328,10 +309,10 @@ impl SqlPlan {
             create_table,
             create_index,
             insert,
-            select_by_hash,
-            select_by_id,
-            delete_by_id,
-            technical_id_bounds,
+            select_matching_ids,
+            count_matches,
+            delete_prefix,
+            has_rows,
         })
     }
 }
@@ -460,23 +441,10 @@ fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), Sq
     Ok(())
 }
 
-fn technical_id_bounds(
-    connection: &Connection,
-    sql: &SqlPlan,
-) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
-    connection.query_row(&sql.technical_id_bounds, [], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })
-}
-
 fn technical_id_as_i64(technical_id: u64) -> Result<i64, SqliteSinkError> {
     i64::try_from(technical_id).map_err(|_| {
-        super::error::invalid_state(format!(
+        super::error::invalid_batch(format!(
             "technical ID {technical_id} cannot be represented by SQLite INTEGER"
         ))
     })
-}
-
-fn stored_hash_matches(actual: ValueRef<'_>, expected: &[u8; 16]) -> bool {
-    matches!(actual, ValueRef::Blob(bytes) if bytes == expected)
 }

@@ -11,11 +11,11 @@ use dogpaddle_operation::{
         transform::SelectDefinition,
     },
 };
-use dogpaddle_store::{Cell, Store, StoreError};
+use dogpaddle_store::{Cell, Store};
 
 const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024).unwrap();
 const SINK: &str = "postgres";
-const STATE: &str = "station/00000001/operation/postgres_sink.state";
+const STATE: &str = "station/00000001/operation/relation_sink.state";
 
 fn config() -> PostgresSinkConfig {
     PostgresSinkConfig::new_unencrypted("127.0.0.1", 1, "database", "writer", "secret-not-durable")
@@ -123,13 +123,6 @@ fn postgres_sink_build_and_reopen_are_offline_and_use_one_stable_state_cell() {
 
     let store = Store::open(&path).unwrap();
     let state: Cell<Vec<u8>> = store.open_data(STATE).unwrap();
-    assert!(matches!(
-        store.open_data::<Cell<Vec<u8>>>(
-            "station/00000001/operation/postgres_sink.pending"
-        ),
-        Err(StoreError::DataNotFound(name))
-            if name == "station/00000001/operation/postgres_sink.pending"
-    ));
     let transaction = store.read_transaction().unwrap();
     assert!(
         state

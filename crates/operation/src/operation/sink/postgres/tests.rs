@@ -1,16 +1,24 @@
-use std::sync::Arc;
+use std::{
+    net::TcpListener,
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
-use arrow_array::{ArrayRef, Float32Array, Float64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    ArrayRef, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch, StringArray,
+    StructArray, UInt64Array, types::Int64Type,
+};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::{
-    super::relation::{Continuation, MAX_TECHNICAL_ID, Mutation, MutationKind, Position},
-    PostgresSinkConfig, PostgresTargetSpec,
+    PostgresSinkConfig, PostgresSinkError, PostgresTargetSpec,
+    config::validate_absence_snapshot,
     row::{PostgresRowCodec, PostgresValue},
     schema::PostgresLayout,
-    state::{PostgresSinkState, PostgresSinkStateCodecError},
     target::{SqlPlan, quote_identifier},
 };
+use crate::operation::sink::relation::encode_canonical;
 
 fn spec(table: &str) -> PostgresTargetSpec {
     PostgresTargetSpec::try_new("sink_1", "database", "Target Schema", table, "1", 2).unwrap()
@@ -19,7 +27,7 @@ fn spec(table: &str) -> PostgresTargetSpec {
 #[test]
 fn runtime_config_debug_redacts_the_password() {
     let config = PostgresSinkConfig::new_unencrypted(
-        "localhost",
+        "127.0.0.1",
         5432,
         "database",
         "writer",
@@ -30,6 +38,69 @@ fn runtime_config_debug_redacts_the_password() {
 
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("visible-secret"));
+}
+
+#[test]
+fn runtime_config_rejects_dns_names_to_keep_connect_deadlines_bounded() {
+    assert!(matches!(
+        PostgresSinkConfig::new_unencrypted(
+            "localhost",
+            5432,
+            "database",
+            "writer",
+            "secret",
+        ),
+        Err(PostgresSinkError::InvalidConfig { message })
+            if message == "host must be a numeric IPv4 or IPv6 address"
+    ));
+}
+
+#[test]
+fn a_peer_that_accepts_tcp_but_never_handshakes_hits_the_connect_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release, released) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        released.recv().unwrap();
+    });
+    let config =
+        PostgresSinkConfig::new_unencrypted("127.0.0.1", port, "database", "writer", "secret")
+            .unwrap();
+
+    let result = config.connect_with_timeout(Duration::from_millis(100));
+    release.send(()).unwrap();
+    peer.join().unwrap();
+
+    assert!(matches!(
+        result,
+        Err(PostgresSinkError::Timeout { stage: "connect" })
+    ));
+}
+
+#[test]
+fn absence_snapshot_rejects_missing_schema_class_and_table_row_type() {
+    let target = spec("target");
+
+    assert!(matches!(
+        validate_absence_snapshot(&target, false, None, false),
+        Err(PostgresSinkError::TargetMissing { name }) if name == "Target Schema"
+    ));
+    assert!(matches!(
+        validate_absence_snapshot(
+            &target,
+            true,
+            Some("$dogpaddle.hash.sink_1".to_owned()),
+            false,
+        ),
+        Err(PostgresSinkError::TargetExists { name })
+            if name == "$dogpaddle.hash.sink_1"
+    ));
+    assert!(matches!(
+        validate_absence_snapshot(&target, true, None, true),
+        Err(PostgresSinkError::TargetExists { name }) if name == "target"
+    ));
+    assert!(validate_absence_snapshot(&target, true, None, false).is_ok());
 }
 
 #[test]
@@ -53,10 +124,7 @@ fn identifiers_are_quoted_as_independent_postgresql_components() {
             .initialize
             .contains("CREATE INDEX \"Target Schema\".\"$dogpaddle.hash.sink_1\"")
     );
-    assert!(
-        plan.mutation_statement(MutationKind::Insert, 1)
-            .contains("\"odd\"\"column\"")
-    );
+    assert!(plan.insert_statement(1).contains("\"odd\"\"column\""));
     assert!(!plan.initialize.contains("\"Target Schema.odd.table\""));
 }
 
@@ -101,50 +169,104 @@ fn row_codec_preserves_unsigned_and_float_bit_patterns() {
 }
 
 #[test]
-fn matching_and_batched_mutations_bind_exact_typed_values() {
+fn row_codec_uses_shared_canonical_bytes_for_nested_values() {
+    let item = Arc::new(Field::new("item", DataType::Int64, true));
+    let flag = Arc::new(Field::new("flag", DataType::Boolean, false));
+    let label = Arc::new(Field::new("label", DataType::Utf8, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("items", DataType::List(Arc::clone(&item)), false),
+        Field::new(
+            "object",
+            DataType::Struct(vec![Arc::clone(&flag), Arc::clone(&label)].into()),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
+                vec![Some(7), None, Some(-2)],
+            )])) as ArrayRef,
+            Arc::new(StructArray::from(vec![
+                (flag, Arc::new(BooleanArray::from(vec![true])) as ArrayRef),
+                (
+                    label,
+                    Arc::new(StringArray::from(vec![Some("nested\0value")])) as ArrayRef,
+                ),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let encoded = PostgresRowCodec::new(PostgresLayout::try_new(Arc::clone(&schema)).unwrap())
+        .encode_row(&batch, 0)
+        .unwrap();
+    let expected = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, array)| {
+            let mut bytes = Vec::new();
+            encode_canonical(field, array.as_ref(), 0, field.name(), &mut bytes).unwrap();
+            PostgresValue::Bytes(Some(bytes))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(encoded.values, expected);
+}
+
+#[test]
+fn matching_and_batched_writes_bind_exact_typed_values() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Utf8, true),
     ]));
-    let layout = PostgresLayout::try_new(schema).unwrap();
-    let plan = SqlPlan::new(&spec("target"), &layout);
+    let plan = SqlPlan::new(&spec("target"), &PostgresLayout::try_new(schema).unwrap());
+    let lookup = plan.lookup_statement(2);
 
     assert!(
-        plan.select_matching
-            .contains("\"a\" IS NOT DISTINCT FROM $2")
+        lookup
+            .contains("target.\"a\" = request.c0 OR (target.\"a\" IS NULL AND request.c0 IS NULL)")
     );
     assert!(
-        plan.select_matching
-            .contains("\"b\" IS NOT DISTINCT FROM $3")
+        lookup
+            .contains("target.\"b\" = request.c1 OR (target.\"b\" IS NULL AND request.c1 IS NULL)")
     );
-    assert!(plan.select_matching.contains("<> ALL($4::bigint[])"));
-    assert!(plan.select_matching.ends_with("LIMIT $5"));
-    assert!(
-        plan.count_matching
-            .starts_with("SELECT count(*) FROM (SELECT 1 ")
+    assert!(lookup.contains("(0, $1::bigint, $2::bigint, $3::bytea, $4::bigint, $5::bytea), (1, $6::bigint, $7::bigint, $8::bytea, $9::bigint, $10::bytea)"));
+    assert!(lookup.contains("LIMIT request.needed"));
+    assert!(lookup.contains("LIMIT request.take"));
+    assert!(lookup.contains("request.needed > request.take"));
+    assert!(lookup.ends_with("ORDER BY request.n"));
+    assert!(!lookup.contains("excluded"));
+
+    assert_eq!(
+        plan.delete,
+        "DELETE FROM ONLY \"Target Schema\".\"target\" WHERE \"$dogpaddle.id\" = ANY($1::bigint[])"
     );
-    assert!(plan.count_matching.ends_with("LIMIT $5) AS matches"));
-    let delete = plan.mutation_statement(MutationKind::Delete, 2);
-    assert!(delete.contains("($1::bigint, $2::bytea, $3::bigint, $4::bytea), ($5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
-    assert!(delete.contains("target.\"a\" IS NOT DISTINCT FROM expected.\"a\""));
-    assert!(delete.contains("target.\"b\" IS NOT DISTINCT FROM expected.\"b\""));
-    assert!(delete.ends_with("RETURNING target.\"$dogpaddle.id\""));
-    let insert = plan.mutation_statement(MutationKind::Insert, 2);
-    assert!(insert.contains("$8::bytea) ON CONFLICT"));
+    let insert = plan.insert_statement(2);
+    assert!(insert.contains("($1::bigint, $2::bytea, $3::bigint, $4::bytea), ($5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
+    assert!(insert.ends_with("ON CONFLICT (\"$dogpaddle.id\") DO NOTHING"));
+    assert!(!insert.contains("RETURNING"));
 }
 
 #[test]
-fn mutation_statements_handle_empty_and_wide_schemas_within_parameter_limits() {
+fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
     let empty = SqlPlan::new(
         &spec("empty"),
         &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
     );
-    assert_eq!(empty.mutation_batch_size(), 1024);
+    assert_eq!(empty.insert_batch_size(), 1024);
+    assert_eq!(empty.lookup_batch_size(), 1024);
     assert!(
         empty
-            .mutation_statement(MutationKind::Delete, 1)
+            .insert_statement(1)
             .contains("($1::bigint, $2::bytea)")
     );
+    assert!(
+        empty
+            .lookup_statement(1)
+            .contains("(0, $1::bigint, $2::bigint, $3::bytea)")
+    );
+
     let fields = (0..1_598)
         .map(|index| Field::new(format!("f{index}"), DataType::Int64, true))
         .collect::<Vec<_>>();
@@ -152,10 +274,29 @@ fn mutation_statements_handle_empty_and_wide_schemas_within_parameter_limits() {
         &spec("wide"),
         &PostgresLayout::try_new(Arc::new(Schema::new(fields))).unwrap(),
     );
-    assert_eq!(wide.mutation_batch_size(), 40);
-    let statement = wide.mutation_statement(MutationKind::Insert, 40);
-    assert!(statement.contains("$64000::bigint)"));
-    assert!(!statement.contains("$64001"));
+    assert_eq!(wide.insert_batch_size(), 40);
+    assert_eq!(wide.lookup_batch_size(), 40);
+    let insert = wide.insert_statement(40);
+    assert!(insert.contains("$64000::bigint)"));
+    assert!(!insert.contains("$64001"));
+    let lookup = wide.lookup_statement(40);
+    assert!(lookup.contains("$64040::bigint)"));
+    assert!(!lookup.contains("$64041"));
+}
+
+#[test]
+fn layout_owns_only_the_target_and_two_indexes() {
+    let target = spec("target");
+    assert_eq!(
+        target.object_names(),
+        ["target", "$dogpaddle.hash.sink_1", "$dogpaddle.pk.sink_1",]
+    );
+    let plan = SqlPlan::new(
+        &target,
+        &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
+    );
+    assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
+    assert!(plan.initialize.contains("dogpaddle.postgres-relation.v2:"));
 }
 
 #[test]
@@ -178,272 +319,4 @@ fn row_codec_preserves_the_complete_utf8_domain_as_bytes() {
         encoded.values,
         [PostgresValue::Bytes(Some(b"before\0after".to_vec()))]
     );
-}
-
-#[test]
-fn sink_state_v1_golden_bytes_round_trip() {
-    let cases = [
-        (PostgresSinkState::Initialize, vec![0, 1, 0]),
-        (
-            PostgresSinkState::Ready {
-                next_delivery: 2,
-                next_id: 3,
-                position: None,
-            },
-            vec![
-                0, 1, 1, // version and Ready
-                0, 0, 0, 0, 0, 0, 0, 2, // next delivery
-                0, 0, 0, 0, 0, 0, 0, 3, // next technical ID
-                0, // no retained-Change position
-            ],
-        ),
-        (
-            PostgresSinkState::Ready {
-                next_delivery: 4,
-                next_id: 5,
-                position: Some(Position {
-                    row_index: 6,
-                    remaining: 7,
-                }),
-            },
-            vec![
-                0, 1, 1, // version and Ready
-                0, 0, 0, 0, 0, 0, 0, 4, // next delivery
-                0, 0, 0, 0, 0, 0, 0, 5, // next technical ID
-                1, // position follows
-                0, 0, 0, 0, 0, 0, 0, 6, // row
-                0, 0, 0, 0, 0, 0, 0, 7, // remaining
-            ],
-        ),
-        (
-            prepared_state(),
-            vec![
-                0, 1, 2, // version and Prepared
-                0, 0, 0, 0, 0, 0, 0, 7, // delivery
-                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, // digest
-                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
-                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0, 0, 0, 0, 0, 0, 0,
-                9, // next technical ID before
-                0, 0, 0, 0, 0, 0, 0, 2, // start row
-                0, 0, 0, 0, 0, 0, 0, 2, // start remaining
-                0, // Done
-                0, 2, // mutation count
-                0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 9, // insert
-                0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 10, // insert
-            ],
-        ),
-    ];
-
-    for (state, golden) in cases {
-        assert_eq!(state.encode().unwrap(), golden);
-        assert_eq!(PostgresSinkState::decode(&golden).unwrap(), state);
-    }
-}
-
-#[test]
-fn every_truncated_prepared_state_prefix_is_rejected() {
-    let encoded = prepared_state().encode().unwrap();
-
-    for length in 0..encoded.len() {
-        assert_eq!(
-            PostgresSinkState::decode(&encoded[..length]),
-            Err(PostgresSinkStateCodecError::Truncated),
-            "accepted prefix of length {length}"
-        );
-    }
-}
-
-#[test]
-fn sink_state_decoder_rejects_unknown_tags_versions_and_trailing_bytes() {
-    assert_eq!(
-        PostgresSinkState::decode(&[0, 2, 0]),
-        Err(PostgresSinkStateCodecError::UnsupportedVersion(2))
-    );
-    assert_eq!(
-        PostgresSinkState::decode(&[0, 1, 3]),
-        Err(PostgresSinkStateCodecError::UnknownStateTag(3))
-    );
-    assert_eq!(
-        PostgresSinkState::decode(&[0, 1, 0, 0]),
-        Err(PostgresSinkStateCodecError::TrailingBytes)
-    );
-
-    let mut ready = PostgresSinkState::Ready {
-        next_delivery: 1,
-        next_id: 1,
-        position: None,
-    }
-    .encode()
-    .unwrap();
-    *ready.last_mut().unwrap() = 2;
-    assert_eq!(
-        PostgresSinkState::decode(&ready),
-        Err(PostgresSinkStateCodecError::UnknownPositionTag(2))
-    );
-
-    let mut prepared = prepared_state().encode().unwrap();
-    prepared[67] = 2;
-    assert_eq!(
-        PostgresSinkState::decode(&prepared),
-        Err(PostgresSinkStateCodecError::UnknownContinuationTag(2))
-    );
-    let mut prepared = prepared_state().encode().unwrap();
-    prepared[70] = 2;
-    assert_eq!(
-        PostgresSinkState::decode(&prepared),
-        Err(PostgresSinkStateCodecError::UnknownMutationKindTag(2))
-    );
-}
-
-#[test]
-fn sink_state_rejects_invalid_frontiers_mutations_and_continuations() {
-    let invalid = [
-        (
-            PostgresSinkState::Ready {
-                next_delivery: 0,
-                next_id: 1,
-                position: None,
-            },
-            PostgresSinkStateCodecError::InvalidNextDelivery(0),
-        ),
-        (
-            PostgresSinkState::Ready {
-                next_delivery: 1,
-                next_id: MAX_TECHNICAL_ID + 2,
-                position: None,
-            },
-            PostgresSinkStateCodecError::InvalidNextId(MAX_TECHNICAL_ID + 2),
-        ),
-        (
-            prepared_with_delivery(
-                0,
-                9,
-                Position {
-                    row_index: 2,
-                    remaining: 2,
-                },
-                Continuation::Done,
-                vec![insert(2, 9), insert(2, 10)],
-            ),
-            PostgresSinkStateCodecError::InvalidDelivery(0),
-        ),
-        (
-            prepared_with(
-                0,
-                Position {
-                    row_index: 2,
-                    remaining: 1,
-                },
-                Continuation::Done,
-                vec![insert(2, 1)],
-            ),
-            PostgresSinkStateCodecError::InvalidNextId(0),
-        ),
-        (
-            prepared_with(
-                9,
-                Position {
-                    row_index: 2,
-                    remaining: 2,
-                },
-                Continuation::Done,
-                vec![insert(2, 10), insert(2, 11)],
-            ),
-            PostgresSinkStateCodecError::InsertRangeStartMismatch,
-        ),
-        (
-            prepared_with(
-                9,
-                Position {
-                    row_index: 2,
-                    remaining: 1,
-                },
-                Continuation::Done,
-                vec![delete(2, 9), insert(3, 9)],
-            ),
-            PostgresSinkStateCodecError::DeleteBeforeInsert,
-        ),
-        (
-            prepared_with(
-                9,
-                Position {
-                    row_index: 2,
-                    remaining: 2,
-                },
-                Continuation::Done,
-                vec![insert(2, 9)],
-            ),
-            PostgresSinkStateCodecError::InvalidContinuation,
-        ),
-        (
-            prepared_with(
-                9,
-                Position {
-                    row_index: 2,
-                    remaining: 1,
-                },
-                Continuation::Done,
-                vec![delete(2, 1), delete(3, 1)],
-            ),
-            PostgresSinkStateCodecError::DuplicateDeleteId,
-        ),
-    ];
-
-    for (state, expected) in invalid {
-        assert_eq!(state.validate(), Err(expected));
-    }
-}
-
-fn prepared_state() -> PostgresSinkState {
-    prepared_with(
-        9,
-        Position {
-            row_index: 2,
-            remaining: 2,
-        },
-        Continuation::Done,
-        vec![insert(2, 9), insert(2, 10)],
-    )
-}
-
-fn prepared_with(
-    next_id_before: u64,
-    start_position: Position,
-    continuation: Continuation,
-    mutations: Vec<Mutation>,
-) -> PostgresSinkState {
-    prepared_with_delivery(7, next_id_before, start_position, continuation, mutations)
-}
-
-fn prepared_with_delivery(
-    delivery: u64,
-    next_id_before: u64,
-    start_position: Position,
-    continuation: Continuation,
-    mutations: Vec<Mutation>,
-) -> PostgresSinkState {
-    PostgresSinkState::Prepared {
-        delivery,
-        digest: [0xab; 32],
-        next_id_before,
-        start_position,
-        continuation,
-        mutations,
-    }
-}
-
-const fn insert(row_index: u64, technical_id: u64) -> Mutation {
-    Mutation {
-        kind: MutationKind::Insert,
-        row_index,
-        technical_id,
-    }
-}
-
-const fn delete(row_index: u64, technical_id: u64) -> Mutation {
-    Mutation {
-        kind: MutationKind::Delete,
-        row_index,
-        technical_id,
-    }
 }

@@ -54,12 +54,12 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 
 `PostgresSource → PostgresSink` 已形成首条 PostgreSQL 到 PostgreSQL 的持续增量链路。Source 借助
 进程内 `dogpaddle-debezium` 从单表 WAL 捕获固定 Schema 事件，并在 checkpoint 与 Station output
-同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，每个 Prepared 批次把 receipt
-与 mutation 放在同一个 PostgreSQL 事务中，使提交窗口可在 reopen 后重放收敛。Definition 只保存
-非敏感 spec，连接配置与密码只在 build/open 时作为运行资源注入。
+同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，与 SQLite 共用固定 ID 的
+幂等批次：先持久化具体工作，再批量 insert-ignore、按 ID delete，提交窗口可在 reopen 后重放。Definition 只保存
+非敏感 spec，numeric IP、端口与凭据只在 build/open 时作为运行资源注入。
 现有验收覆盖大批 insert/delete、提交前后进程终止与恢复，以及同一个 PG 数据库的完整往返；
-PG Sink 按顺序批量写入，最多保留一条当前确认记录。目标列优先保留 Arrow 精确值，不是源表原生
-SQL 类型的原样镜像；也不承诺整个源事务在目标侧原子可见。
+Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建回执表。目标列优先保留 Arrow 精确值，
+不是源表原生 SQL 类型的原样镜像；不承诺目标 WAL 事件顺序或整个源事务在目标侧原子可见。
 这是无初始快照、无 TLS 与在线 Schema evolution 的试点；
 [Source 使用与边界](crates/operation/README.md#postgresql-source-试点) ·
 [Sink 使用与边界](crates/operation/README.md#operationsinkpostgressink)。
@@ -71,7 +71,7 @@ SQL 类型的原样镜像；也不承诺整个源事务在目标侧原子可见�
   最近处理结果和是否需要 reopen。尚无 `Flow::start`、后台 runner 或中断控制。
 - Operation 集合目前封闭。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
-- PostgreSQL 增量链路尚无初始全量、多表路由、TLS、在线 Schema evolution 或跨 Flow fencing；
+- PostgreSQL 增量链路尚无初始全量、多表路由、TLS、DNS endpoint、在线 Schema evolution 或跨 Flow fencing；
   要物化完整关系，源表须在 slot 起点为空并从该起点开始写入。`PostgresSink` 只创建并独占新目标表，
   不支持 target spec 跨 Flow 接管/共享、外部改表/改数据或数据库替换恢复；生产加固仍属于 D5。
 - `SqliteSink` 同样只创建并独占新目标表；尚无 MySQL 或通用外部 Sink。

@@ -37,7 +37,7 @@
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十二个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；SqliteSink 全部 v1 类型的 canonical row/hash、具体 mutation 批次及跨 SQLite/MDBX commit 的幂等重放；PostgresSink 的 tag12、非敏感资源边界、唯一 state 与 Prepared/receipt 协议 | `operation_core` |
+| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十二个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；关系 Sink 共享的 canonical row/hash、固定 ID 批次、唯一 state 和跨目标数据库/MDBX commit 的幂等重放；SQLite 全部 v1 类型；PostgresSink 的 tag12 与非敏感资源边界 | `operation_core` |
 | Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink/PostgresSink 拒绝无建库副作用与 reopen 重绑定；PostgresSource/PostgresSink 精确运行资源；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
@@ -81,7 +81,7 @@ insert/update/delete、类型映射与进程 reopen；直接 Operation+Store 模
 单次原子提交、rollback/背压时二者均不变、提交后 ACK 前退出，以及 checkpoint-only fresh Engine。
 2050 行单 PG 事务跨越 1024 条批量边界，首批提交后 ACK 前退出并 reopen，后继 witness 验证完整
 事件顺序且无重漏。`flow-pg` 模式再证明同一个 PG 实例、同一个 database 内的 Source→PG Sink：
-2050 行跨批、首批 PG 已提交而本地仍 Prepared 时进程终止、reopen、update/delete 与后继 witness，
+2050 行跨批、首批 PG 已提交而本地仍 Prepared 时进程终止、reopen 后技术 ID 不变、update/delete 与后继 witness，
 publication 只包含源表，目标不会反馈进源。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
 接口，也不是第二套运行层。结果必须报告实际 PG/Rust/runtime 版本；本机 PG17 证据不能冒充既有
 Linux digest-pinned PG16.15 D1/D2 gate，D5 的长稳、fencing、升级与发布门仍独立开放。
@@ -89,11 +89,13 @@ Linux digest-pinned PG16.15 D1/D2 gate，D5 的长稳、fencing、升级与发�
 ## PostgreSQL Sink 的显式验收
 
 Operation 公共 `correctness/postgres_sink.rs` 冻结 tag12 canonical JSON、非敏感 Definition、Sink/1
-kind、唯一 `postgres_sink.state: Cell<Vec<u8>>`、exact Schema/target spec、精确
+kind、唯一 `relation_sink.state: Cell<Vec<u8>>`、exact Schema/target spec、精确
 `PostgresSinkConfig` 资源类型，以及首 turn rollback/丢弃 completion 不访问目标。Flow 公共
 `correctness/postgres_sink.rs` 拥有缺失/错误资源的无目录副作用、准确 Station ID、Schema 纯拒绝，
-以及 build/open 离线装配和稳定 state 资源路径。源码同目录 `tests.rs` 拥有版本化 Initialize/Ready/
-Prepared state codec 与 target SQL/row 编码的私有不变量。
+以及 build/open 离线装配和稳定 state 资源路径。共享 `sink/relation/tests.rs` 拥有版本化 Initialize/Ready/
+Prepared state codec、批量规划与恢复的私有不变量；各数据库同目录 `tests.rs` 拥有 target SQL/类型映射。
+PostgreSQL 私有测试还以静默 TCP peer 锁住完整握手 deadline，并覆盖缺失 schema、已有 `pg_class`、
+同名 `pg_type` 与 nested List/Struct canonical `bytea`。
 
 普通 Cargo gate 不启动或连接 PostgreSQL。显式本机 gate 执行：
 
@@ -106,16 +108,21 @@ python3 tools/check_postgres_sink.py \
 `SequenceSource → PostgresSink` Flow host，以及 Operation 所有的 `postgres_sink_recovery` 公共协议
 host。只创建 loopback 临时 cluster、Flow 和 Store，不连接已有服务，无论成败都停止自己的 cluster。
 
-- Flow：目标锁超时使 receipt/data 整笔回滚、AfterCommit fail-stop、reopen；PG 已提交而 MDBX
-  仍 Prepared 时再次杀进程。最终三个 UInt64 最大值区间内的记录精确各出现一次，只留 receipt 3。
+- Flow：目标锁超时使目标事务整笔回滚、AfterCommit fail-stop、reopen；PG 已提交而 MDBX
+  仍 Prepared 时再次杀进程。最终三个 UInt64 最大值区间内的记录精确各出现一次，技术 ID 不变。
 - Operation：16,385 重复行跨 1024 上限插入及完整撤回；Prepared 提交而 PG 尚未写入、PG 已写入而
   MDBX 尚未结算两个窗口；prepare/settlement rollback；不足额和非法负前缀拒绝无部分效果；普通
-  planning error 后同一运行实例重试；最小 ID 匹配和交替正负事件。
+  planning error 后同一运行实例重试；最小 ID 匹配和交替正负事件。同批插入后删除同一 ID，
+  PG 提交后杀进程，reopen 重放全部 insert/delete 后仍为空表。
 - PG 参数类型与边界：NULL、嵌入 NUL 的 Utf8、UInt64 最大值、NaN payload、负零、各标量存储
   family，reopen 后精确撤回；零列与 1598 列，宽表按参数上限拆成同一事务内的小语句。
-- 实际服务端 statement 日志锁住工作量：16,385 insert/delete 各 17 条批量 SQL，混合事件另各
-  2 条；大额撤回各只做一次完整 admission count，所有 turn 后最多一条 live receipt。打印运行耗时
-  只为诊断，不是吞吐 benchmark，也不把逻辑 receipt 数量当作 PG 文件大小的硬上限。
+- 实际服务端 statement 日志锁住批量执行：16,385 insert/delete 的完整恢复场景加混合批次重放，
+  合计 20 条 INSERT、21 条 DELETE。另以 1,000 条不同记录的 `-old,+new` 交错更新，证明只需
+  2 条批量匹配 SELECT、2 条 INSERT、2 条 DELETE，目标值与技术 ID 精确吻合；1598 列的 80 行插入
+  按参数上限拆成 2 条语句。
+- 大额负事件的首次足额检查与 continuation 不重复检查，由共享规划测试证明。PG 查询把完整计数
+  放在条件分支中，不能按 SQL 文本出现 `count` 的次数推断实际扫描次数。运行耗时只用于诊断，
+  上述 statement 数量不是吞吐或延迟 benchmark。
 
 `.github/workflows/debezium-postgres.yml` 在产品 crate 或两份 gate 脚本变动时，先运行原 digest-pinned
 D1/D2 gate，再复用其 native runtime payload 执行 Source、同 PG 往返和 Sink gate；native server 为
@@ -175,20 +182,24 @@ decode 递归拒绝任意 non-null slot 的 `|unscaled| >= 10^precision`，包�
 遮蔽但物理存在的 non-null child；未选择字段的 value 不读取也不验证。测试同时覆盖顶层与嵌套、
 构造与 codec 错误，不把这条 representability invariant 扩展为舍入或算术语义。
 
-SQLite Sink 同时冻结 tag 10 Definition payload、版本化 pending bytes、canonical row 与 128-bit hash。
-其恢复矩阵必须模拟 SQLite commit 成功后丢弃同一 turn 的 MDBX transaction，再 reopen 并重放
-初始化、insert、delete 与完整 1024 项批次；目标表最终结果必须恰好一次，旧 pending 和 Flow claim
-只能在外层 commit 后前进。锁、ID/完整性冲突或 SQLite commit 失败必须保留旧状态，解除故障后可以继续。
+关系 Sink 共同冻结唯一 `relation_sink.state` 的 Initialize/Ready/Prepared bytes、canonical row 与
+128-bit hash。Prepared 只保存 ID 分配上界、插入行位置与固定 ID、删除 ID 和 continuation，不复制
+完整输入、不保存 delivery/digest、不依赖远端回执。恢复矩阵必须覆盖 MDBX 已持久化 Prepared 但目标
+未提交，以及目标已提交但 MDBX 未结算两个窗口；初始化与批量 insert/delete 均可重放。全部目标 I/O
+必须在 MDBX 写事务外；丢弃 apply transaction 不执行 completion，AfterCommit error/panic 必须 fail-stop/reopen。
+两个目标提交间不能重新匹配删除 ID 或重新分配插入 ID；只有 MDBX 结算才推进 continuation 或完成 Flow claim。
+每批最多 1024 个动作，输入前缀验证保序，目标事务统一先插入再删除，不承诺目标 WAL 的逐条物理顺序。
+
+SQLite Sink 另冻结 tag 10 Definition payload 与目标布局。
 布局证据还覆盖零/1998/1999 列、标识符转义和冲突、全部 Arrow v1 类型、嵌套/nullable/浮点 bit pattern、
 hash 碰撞、重复行最小 ID、正负 multiplicity、`i64::MIN`、ID 耗尽与稳定重批。Flow build/open 不得
 打开 SQLite 或创建目标表；首次运行才允许初始化。
 
-PostgreSQL Sink 同时冻结 tag12 canonical JSON、唯一版本化 state Cell，以及每个 Prepared intent 的
-delivery/digest/frontier/continuation/mutations。离线测试必须证明 Definition 不持久化 runtime secret、
+PostgreSQL Sink 另冻结 tag12 canonical JSON、exact Schema 与精确运行资源类型。
+离线测试必须证明 Definition 不持久化 runtime secret、
 resource/Schema 错误先于建库、build/open 不访问 PG、rollback 或丢弃 `AfterCommit` 不产生远端动作。
-真实 gate 必须在 PG receipt 与 mutations 同事务提交、MDBX 仍停在 Prepared 的窗口杀死进程，并证明
-reopen 对相同 delivery 只验证 receipt 而不重复应用。单批上限固定为 1024；新 delivery 原子替换
-已结算的旧 receipt，始终只保留最新一行。扩展类型或故障点时应增强同一脚本，而不是在普通 Cargo gate
+真实 gate 必须在 PG 批次事务提交、MDBX 仍停在 Prepared 的窗口杀死进程，证明 reopen 对相同 ID
+重发幂等 INSERT/DELETE 后结果不变。扩展类型或故障点时应增强同一脚本，而不是在普通 Cargo gate
 偷偷依赖本机服务。
 
 Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理

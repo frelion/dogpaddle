@@ -79,7 +79,7 @@ impl Host {
         }
         Ok(Self {
             operation: binding.materialize(data, RuntimeResource::new(config))?,
-            state: store.open_data("postgres_sink.state")?,
+            state: store.open_data("relation_sink.state")?,
             transactions: store.into_transactions(),
         })
     }
@@ -135,6 +135,24 @@ fn fixture(scenario: &str, stage: &str) -> Result<Change, OperationError> {
             let records = RecordBatch::try_from_iter([(
                 "value",
                 Arc::new(UInt64Array::from(values)) as ArrayRef,
+            )])?;
+            return Ok(Change::try_new(records, Int64Array::from(diffs))?);
+        }
+        "updates" => {
+            let (values, diffs) = match stage {
+                "seed" => ((0..1_000).collect::<Vec<i64>>(), vec![1; 1_000]),
+                "update" => (
+                    (0..1_000)
+                        .flat_map(|value| [value, value + 1_000])
+                        .collect(),
+                    [-1, 1].repeat(1_000),
+                ),
+                "withdraw" => ((1_000..2_000).collect(), vec![-1; 1_000]),
+                _ => return Err("unknown updates fixture".into()),
+            };
+            let records = RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(values)) as ArrayRef,
             )])?;
             return Ok(Change::try_new(records, Int64Array::from(diffs))?);
         }
@@ -251,7 +269,8 @@ fn main() -> Result<(), OperationError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let [mode, path, port, scenario] = args.as_slice() else {
         return Err(
-            "usage: postgres_sink_recovery <build|open> PATH PORT <bulk|types|wide|empty>".into(),
+            "usage: postgres_sink_recovery <build|open> PATH PORT <bulk|updates|types|wide|empty>"
+                .into(),
         );
     };
     let mut host = Host::open(mode, &PathBuf::from(path), port.parse()?, scenario)?;

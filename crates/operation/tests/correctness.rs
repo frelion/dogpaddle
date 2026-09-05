@@ -10,5 +10,7 @@ mod postgres_sink;
 mod protocol;
 #[path = "correctness/runtime.rs"]
 mod runtime;
+#[path = "correctness/sqlite_sink.rs"]
+mod sqlite_sink;
 #[path = "correctness/support.rs"]
 mod support;

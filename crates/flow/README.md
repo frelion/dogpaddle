@@ -148,13 +148,15 @@ Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Selec
 [`tests/correctness/sqlite_sink.rs`](tests/correctness/sqlite_sink.rs)。
 
 `PostgresSink` 是单输入、无 output 的 `PostgreSQL` exact relation 终点。Definition 只保存非敏感
-target spec，host/user/password 随 `PostgresSinkConfig` 在 build/open 时注入；build/open 对 PG 目标
-不做 I/O，只完成 Schema/resource 装配与 Store 生命周期。运行时先把至多 1024 个具体 mutation 作为 Prepared intent
-提交到 `postgres_sink.state`，随后才在 `AfterCommit` 中用一个 `PostgreSQL` 事务原子写入一行
-delivery receipt 和全部 mutation；下一 turn 返回 `Commit` continuation 或 `Complete`。PG commit
-后进程退出会从 Prepared 重投，并由 receipt 验证已经应用的同一 delivery。目标对象由 Sink 独占且
+target spec，numeric IP、端口与凭据随 `PostgresSinkConfig` 在 build/open 时注入；build/open 对 PG 目标
+不做 I/O，只完成 Schema/resource 装配与 Store 生命周期。它与 `SQLite` 共用一个关系 Sink 内核：
+先把至多 1024 个具体 mutation 作为 Prepared 批次提交到 `relation_sink.state`，随后才在
+`AfterCommit` 中用一个目标事务先批量 insert-ignore、再按固定 ID delete；下一 turn 返回
+`Commit` continuation 或 `Complete`。目标已提交但本地未结算时，reopen 重投同一组 ID，
+不需要回执表。只保证批次提交后的关系，不保证目标 WAL 事件顺序。目标对象由 Sink 独占且
 Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端 marker 只是 ownership/layout-version
-标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
+标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。连接和每个数据库工作单元有 5 秒
+client deadline；DNS endpoint、TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
 `tools/check_postgres_sink.py`。
 
 ## 运行状态
@@ -330,8 +332,7 @@ JSON。以下名称是兼容性边界：
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - `RunningEventCount` 状态：`station/{index:08x}/operation/running_event_count.count`
 - `PostgresSource` checkpoint：`station/{index:08x}/operation/postgres_source.checkpoint`
-- `SqliteSink` 状态：`station/{index:08x}/operation/sqlite_sink.next_id` 与 `station/{index:08x}/operation/sqlite_sink.pending`
-- `PostgresSink` 状态：`station/{index:08x}/operation/postgres_sink.state`
+- `SqliteSink` / `PostgresSink` 状态：`station/{index:08x}/operation/relation_sink.state`
 - Project、Filter、Extend、Select、`SchemaAlign` 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active

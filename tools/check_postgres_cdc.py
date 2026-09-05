@@ -21,8 +21,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 PASSWORD = "gate-secret-must-not-be-persisted"
@@ -300,11 +301,15 @@ class Fixture:
             prefix = rows()
             if prefix != expected[:len(prefix)] or len(prefix) > 1024:
                 raise RuntimeError("same-PG target is not the bounded first prefix")
-            # This round just committed the first PG delivery. No next round
+            prefix_ids = self.sql('SELECT id, "$dogpaddle.id" FROM public.roundtrip_target ORDER BY id')
+            # This round just committed the first PG batch. No next round
             # settles its Prepared state before the context kills the host.
         until("same-PG crash releases its slot", lambda: not self.active(table))
         with self.host("flow-pg", table, 2) as host:
             drive(host, lambda: rows() == expected, "same-PG full suffix replays exactly once")
+            if self.sql('SELECT id, "$dogpaddle.id" FROM public.roundtrip_target '
+                        f'WHERE id <= {len(prefix)} ORDER BY id') != prefix_ids:
+                raise RuntimeError("same-PG replay reassigned committed technical IDs")
             self.sql(f"BEGIN; UPDATE {table} SET payload = 'updated' WHERE id <= 10; "
                      f"DELETE FROM {table} WHERE id BETWEEN 11 AND 20; "
                      f"INSERT INTO {table} VALUES (2051, 2051, 'after-reopen'); COMMIT")
@@ -312,8 +317,6 @@ class Fixture:
                         for row_id, seq, payload in expected if not 11 <= row_id <= 20]
             expected.append((2051, 2051, "after-reopen"))
             drive(host, lambda: rows() == expected, "same-PG update/delete and recovery witness")
-            if self.sql('SELECT count(*) FROM public."$dogpaddle.receipt.roundtrip_sink"') != "1":
-                raise RuntimeError("same-PG receipts did not stay bounded")
             if self.sql(f"SELECT tablename FROM pg_publication_tables WHERE pubname = '{table}_pub'") != table:
                 raise RuntimeError("publication includes more than the source table")
         print("PASS same PostgreSQL instance/database CDC -> PG sink: 2050-row split, "
@@ -388,6 +391,8 @@ def main() -> None:
     print(f"isolated fixture: {root}", flush=True)
     fixture = Fixture(root, pg_bin, bundle, repo / "target" / "debug" / "examples" / "postgres_cdc")
     data, started, passed = root / "data", False, False
+    failure: Optional[BaseException] = None
+    stopped = False
     try:
         run([str(pg_bin / "initdb"), "-D", str(data), "-U", "dogpaddle_gate", "--auth=trust", "--no-instructions", "--locale=C", "-E", "UTF8"])
         options = f"-h 127.0.0.1 -p {fixture.port} -k {root} -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8"
@@ -399,14 +404,29 @@ def main() -> None:
         fixture.postgres_roundtrip_gate()
         fixture.check_no_password()
         passed = True
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        if started or (data / "postmaster.pid").exists():
-            run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "immediate", "-w", "stop"])
-        if passed and not args.keep:
+        try:
+            if started or (data / "postmaster.pid").exists():
+                run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "immediate", "-w", "stop"])
+            stopped = True
+        except BaseException as error:
+            print(
+                "failed to stop the isolated PostgreSQL cluster; a process may still be "
+                f"running and the fixture is retained at {root}",
+                file=os.sys.stderr,
+            )
+            traceback.print_exception(type(error), error, error.__traceback__, file=os.sys.stderr)
+            if failure is None:
+                raise
+        if passed and stopped and not args.keep:
             shutil.rmtree(root)
             print("removed this run's temporary cluster and logs")
         else:
-            print(f"stopped fixture and logs retained at {root}")
+            state = "stopped fixture" if stopped else "fixture"
+            print(f"{state} and logs retained at {root}", file=os.sys.stderr)
 
 
 if __name__ == "__main__":

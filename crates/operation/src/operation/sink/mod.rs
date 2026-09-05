@@ -8,10 +8,9 @@ pub(crate) mod sqlite;
 
 pub use discard::{DiscardDefinition, DiscardError, DiscardOperation};
 pub use postgres::{
-    PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError, PostgresSinkOperation,
-    PostgresSinkSchemaError, PostgresTargetSpec,
+    PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError, PostgresSinkSchemaError,
+    PostgresTargetSpec,
 };
 pub use sqlite::{
-    SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkError, SqliteSinkOperation,
-    SqliteSinkSchemaError,
+    SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkError, SqliteSinkSchemaError,
 };

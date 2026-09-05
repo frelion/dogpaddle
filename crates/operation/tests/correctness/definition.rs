@@ -220,10 +220,7 @@ fn sqlite_sink_definition_exposes_its_stable_public_contract() {
         sqlite.kind(),
         OperationKind::Sink(std::num::NonZeroU32::MIN)
     );
-    assert_eq!(
-        names(&sqlite),
-        ["sqlite_sink.next_id", "sqlite_sink.pending"]
-    );
+    assert_eq!(names(&sqlite), ["relation_sink.state"]);
     assert_eq!(
         sqlite.database_path(),
         Path::new("/var/lib/dogpaddle/output.sqlite")
@@ -1010,25 +1007,16 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
 
     let mut store = Store::create(fixture.path()).unwrap();
-    for (declaration, physical_name) in definition
-        .data()
-        .iter()
-        .zip(["sqlite-next-id", "sqlite-pending"])
-    {
-        declaration.create(&mut store, physical_name).unwrap();
-    }
+    assert_eq!(definition.data().len(), 1);
+    definition.data()[0]
+        .create(&mut store, "sqlite-state")
+        .unwrap();
     assert!(!sqlite_path.exists());
     drop(store);
 
     let store = Store::open(fixture.path()).unwrap();
-    store.open_data::<Cell<u64>>("sqlite-next-id").unwrap();
-    store.open_data::<Cell<Vec<u8>>>("sqlite-pending").unwrap();
-    let operation = materialize(
-        &definition,
-        &[value_schema()],
-        &store,
-        &["sqlite-next-id", "sqlite-pending"],
-    );
+    store.open_data::<Cell<Vec<u8>>>("sqlite-state").unwrap();
+    let operation = materialize(&definition, &[value_schema()], &store, &["sqlite-state"]);
     assert!(!sqlite_path.exists());
     drop(operation);
 }

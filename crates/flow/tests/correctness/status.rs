@@ -65,7 +65,8 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
                 assert!(output.retained_bytes > output.capacity_bytes);
             }
         }
-        if outcome == AdvanceOutcome::Progressed
+        if !saw_pressure_with_progress
+            && outcome == AdvanceOutcome::Progressed
             && statuses
                 .iter()
                 .any(|station| station.last_outcome == Some(AdvanceOutcome::Backpressured))

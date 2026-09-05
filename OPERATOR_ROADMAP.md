@@ -420,24 +420,26 @@ alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独�
 
 `PostgresSink`（tag `12`）把一个单输入 exact relation 物化到独占的固定 Schema PostgreSQL 目标，
 沿用 `FlowFactory::resource` 与 `Flow::advance`，不增加 Flow 专用方法。Definition 只保存 canonical、
-非敏感 `PostgresTargetSpec`；宿主在 build/open 时注入具体 `PostgresSinkConfig`。target discovery 是
-build 前显式的只读 catalog 操作，Definition/bind/materialize 与 Flow build/open 本身不访问 PG。
+非敏感 `PostgresTargetSpec`；宿主在 build/open 时注入具体 `PostgresSinkConfig`。当前配置只接受 numeric
+IPv4/IPv6，连接握手和每个数据库工作单元都有 5 秒 client deadline。target discovery 是 build 前
+显式的只读 catalog 操作，Definition/bind/materialize 与 Flow build/open 本身不访问 PG。
 
-唯一 Operation data 是 `postgres_sink.state: Cell<Vec<u8>>`。Ready turn 在 MDBX 事务外匹配关系行并
-规划至多 1024 个具体 mutation，apply 先持久化 Prepared intent；只有本地 commit 成功后，
-`AfterCommit` 才在一个 PG 事务中原子写入该 delivery 的一行 receipt 与全部 mutation。下一 turn
-把 state 结算回 Ready：有 continuation 时 `Commit`，该 Change 结束时 `Complete`。PG 已提交但结算
-前崩溃会从 Prepared 重投；相同 sequence 的 receipt 必须有相同 digest/mutation count，因而不会重复应用。
+SQLite 与 PG 共用 `relation_sink.state: Cell<Vec<u8>>` 和固定 ID 的批次协议。Ready turn 在
+MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；apply 先持久化 Prepared，
+`AfterCommit` 才在一个目标事务中先 insert-ignore、再按 ID delete。下一 turn 结算 Ready：
+有 continuation 时 `Commit`，该 Change 结束时 `Complete`。目标已提交但结算前崩溃时原样重投
+同一组 ID；无需 receipt、delivery sequence 或 digest，也不重投已结算的旧批次。
 
-该试点要求 Sink 独占其目标表、receipt 表、索引与约束，Schema 固定，外部不得改表、改数据或替换/
+该试点要求 Sink 独占其目标表、索引与约束，Schema 固定，外部不得改表、改数据或替换/
 恢复数据库，同一 target spec 不得被其他 Flow 接管或共享。远端 marker 只标识 ownership/layout
 版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；当前没有 TLS 或在线 Schema evolution。普通 Cargo gate 离线，显式本机
-`tools/check_postgres_sink.py` 当前证明初始化、三个 insert delivery、每 delivery 一行 receipt，以及
-“PG 已提交/MDBX 仍 Prepared”窗口的进程重开，不把尚未覆盖的 delete、长稳或性能写成已完成。
+`tools/check_postgres_sink.py` 覆盖初始化、大批 insert/delete、混合插删重放、宽 Schema、
+1000 条不同记录的交错更新与“PG 已提交/MDBX 仍 Prepared”窗口的进程重开。SQL 次数证据见
+`TESTING.md`；尚无 Sink 独立吞吐或长稳 benchmark。
 
-`SqliteSink` 与 `PostgresSink` 只共享 crate 私有的 relation position、technical-ID、continuation 和
-批次校验机械；各自的 state codec、DDL/DML、锁与恢复协议仍然专用。没有公共通用 Sink trait、
-backend enum、plugin registry 或 ORM 抽象。
+两种 Definition 直接装配共享运行内核，数据库适配只负责目标检查、初始化、精确匹配和原子写入。
+没有公共通用 Sink trait、backend enum、plugin registry 或 ORM 抽象。旧 runtime/state 与兼容出口
+直接删除；旧 Flow 和目标重建。
 
 ### 有限 Source
 
@@ -470,8 +472,8 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 
 ### 其他外部副作用 Sink
 
-`SqliteSink` 已用持久化具体 mutation 批次覆盖本地 SQLite/MDBX 窗口；`PostgresSink` 已用 durable
-Prepared intent 和 PG receipt 覆盖远端提交窗口。后续网络、文件和数据库连接器仍须先选择 outbox、
+`SqliteSink` 与 `PostgresSink` 已用同一固定 ID Prepared 批次覆盖目标/MDBX 提交窗口。
+后续网络、文件和数据库连接器仍须先选择 outbox、
 幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法由该协议重放或验证的可观察副作用。
 
 远端数据库接入遵守以下最小边界，不提前建立通用 SQL Sink 框架：
@@ -778,9 +780,8 @@ RebuildRequired
 
 外部 Source 明确 external checkpoint 与 committed Change 的原子提交边界；只有来源确实提供
 独立重试 identity 时才另行定义其幂等协议，不以 checkpoint 冒充 identity。外部 Sink 使用
-outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 已用持久化 mutation 批次覆盖本地 SQLite
-commit 与 MDBX commit 的空隙；`PostgresSink` 已用 Prepared intent、每 delivery 一行 receipt 与
-原子 PG mutation transaction 覆盖远端窗口。其他连接器不能把对应空隙留给具体 Sink 自行解释。
+outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 与 `PostgresSink` 已共用固定 ID 的持久化
+Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能把对应空隙留给具体 Sink 自行解释。
 
 ### 可观测性
 

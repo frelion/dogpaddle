@@ -6,32 +6,28 @@ use std::{
 };
 
 use arrow_schema::{DataType, SchemaRef};
-use dogpaddle_store::Cell;
 use thiserror::Error;
 
-use super::{
-    TECHNICAL_HASH, TECHNICAL_ID,
-    runtime::{SqliteSinkCompiled, SqliteSinkOperation},
-};
+use super::{TECHNICAL_HASH, TECHNICAL_ID, target::SqliteTarget};
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
-    definition::{DataName, Sealed as SealedDefinition},
-    operation::Operation,
+    definition::Sealed as SealedDefinition,
+    operation::{
+        Operation,
+        sink::relation::{DATA, RelationalSink, STATE},
+    },
 };
 
 pub(crate) const TAG: u16 = 10;
 const MAX_LOGICAL_COLUMNS: usize = 1_998;
-const NEXT_ID: DataName<Cell<u64>> = DataName::new("sqlite_sink.next_id");
-const PENDING: DataName<Cell<Vec<u8>>> = DataName::new("sqlite_sink.pending");
-const DATA: &[DataDeclaration] = &[NEXT_ID.declaration(), PENDING.declaration()];
 
 /// Pure definition of a sink that materializes its input relation in `SQLite`.
 ///
 /// The definition only stores the absolute database path and target table
 /// name. Binding is pure, and neither opens the database nor creates the table;
-/// those effects begin on the materialized operation's first turn.
+/// those effects are deferred to lazy runtime initialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqliteSinkDefinition {
     database_path: PathBuf,
@@ -167,19 +163,20 @@ impl SealedDefinition for SqliteSinkDefinition {
         validate_input_schema(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
 
-        let compiled = SqliteSinkCompiled::try_new(
+        let target = SqliteTarget::try_new(
             self.database_path.clone(),
             self.table_name.clone(),
             Arc::clone(input_schema),
         )
         .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        let schema = Arc::clone(input_schema);
         Ok(OperationBinding::new(
             None,
             move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                let next_id = data.take(&NEXT_ID)?;
-                let pending = data.take(&PENDING)?;
-                Ok(Box::new(SqliteSinkOperation::new_bound(
-                    compiled, next_id, pending,
+                Ok(Box::new(RelationalSink::new(
+                    schema,
+                    target,
+                    data.take(&STATE)?,
                 )))
             },
         ))

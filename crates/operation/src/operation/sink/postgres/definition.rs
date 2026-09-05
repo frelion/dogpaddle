@@ -1,25 +1,25 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_store::Cell;
 
 use super::{
     config::{PostgresSinkConfig, PostgresTargetSpec},
     error::{PostgresSinkError, invalid_spec},
-    runtime::PostgresSinkOperation,
     schema::PostgresLayout,
+    target::PostgresTarget,
 };
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
-    definition::{DataName, Sealed},
-    operation::Operation,
+    definition::Sealed,
+    operation::{
+        Operation,
+        sink::relation::{DATA, RelationalSink, STATE},
+    },
 };
 
 pub(crate) const TAG: u16 = 12;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
-const STATE: DataName<Cell<Vec<u8>>> = DataName::new("postgres_sink.state");
-const DATA: &[DataDeclaration] = &[STATE.declaration()];
 
 /// Pure definition of a sink that materializes its input relation in `PostgreSQL`.
 ///
@@ -75,12 +75,8 @@ impl Sealed for PostgresSinkDefinition {
                   config|
                   -> Result<Box<dyn Operation>, MaterializeError> {
                 let state = data.take(&STATE)?;
-                Ok(Box::new(PostgresSinkOperation::new_bound(
-                    target,
-                    input_schema,
-                    state,
-                    config,
-                )))
+                let target = PostgresTarget::new_bound(config, target, Arc::clone(&input_schema));
+                Ok(Box::new(RelationalSink::new(input_schema, target, state)))
             },
         ))
     }
