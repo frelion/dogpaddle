@@ -9,30 +9,30 @@ use crate::operation::{
 };
 
 use super::{
-    PostgresSourceConfig, PostgresSourceError, PostgresSourceSpec, convert::convert_records,
+    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanSpec, convert::convert_records,
 };
 
-/// One materialized `PostgreSQL` source with reconstructible connector resources.
+/// One materialized `PostgreSQL` CDC Scan with reconstructible connector resources.
 ///
 /// Durable state belongs to its declared Store cell; constructing this runtime
 /// opens neither `PostgreSQL` nor the Debezium bundle.
-pub struct PostgresSourceOperation {
-    spec: PostgresSourceSpec,
+pub struct PostgresCdcScanOperation {
+    spec: PostgresCdcScanSpec,
     output_schema: SchemaRef,
     checkpoint: Cell<Vec<u8>>,
-    config: PostgresSourceConfig,
+    config: PostgresCdcScanConfig,
     restored: bool,
     resume: Option<Checkpoint>,
     connector: Option<Connector>,
     restart_connector: bool,
 }
 
-impl PostgresSourceOperation {
+impl PostgresCdcScanOperation {
     pub(super) fn new_bound(
-        spec: PostgresSourceSpec,
+        spec: PostgresCdcScanSpec,
         output_schema: SchemaRef,
         checkpoint: Cell<Vec<u8>>,
-        config: PostgresSourceConfig,
+        config: PostgresCdcScanConfig,
     ) -> Self {
         Self {
             spec,
@@ -54,7 +54,9 @@ impl PostgresSourceOperation {
                 .get()?
                 .map(Checkpoint::from_bytes)
                 .transpose()
-                .map_err(|_| PostgresSourceError::InvalidState("source checkpoint is invalid"))?;
+                .map_err(|_| {
+                    PostgresCdcScanError::InvalidState("CDC scan checkpoint is invalid")
+                })?;
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
@@ -67,13 +69,15 @@ impl PostgresSourceOperation {
     }
 }
 
-impl Operation for PostgresSourceOperation {
+impl Operation for PostgresCdcScanOperation {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
         if input.is_some() {
-            return Err(PostgresSourceError::new("PostgreSQL source does not accept input").into());
+            return Err(
+                PostgresCdcScanError::new("PostgreSQL CDC scan does not accept input").into(),
+            );
         }
 
         // The first turn only restores durable state. Opening a JVM or PostgreSQL
@@ -97,7 +101,7 @@ impl Operation for PostgresSourceOperation {
         self.restart_connector = true;
         // Waiting for data must not delay unrelated Stations in Flow's schedule.
         let polled = connector.poll(Duration::ZERO).map_err(|error| {
-            PostgresSourceError::new(format!("Debezium poll failed ({:?})", error.kind()))
+            PostgresCdcScanError::new(format!("Debezium poll failed ({:?})", error.kind()))
         })?;
         self.restart_connector = false;
         let Some(delivery) = polled else {
@@ -123,7 +127,7 @@ impl Operation for PostgresSourceOperation {
                 AfterCommit::new(move || {
                     *resume = Some(delivery.checkpoint().clone());
                     delivery.ack().map_err(|error| {
-                        PostCommitError::new(PostgresSourceError::new(format!(
+                        PostCommitError::new(PostgresCdcScanError::new(format!(
                             "Debezium ACK failed ({:?})",
                             error.kind()
                         )))

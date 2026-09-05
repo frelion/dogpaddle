@@ -11,8 +11,8 @@ use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     Action, Operation, Turn,
+    scan::{SequenceScanDefinition, SequenceScanOperation},
     sink::DiscardDefinition,
-    source::{SequenceSourceDefinition, SequenceSourceOperation},
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, ScanLimit, Small, Store, StoreError};
 
@@ -21,7 +21,7 @@ const CURSOR: &[u8] = b"input/00000000/cursor";
 
 #[derive(Debug, Eq, PartialEq)]
 struct DurableInputState {
-    source_position: Option<u64>,
+    scan_position: Option<u64>,
     active: Option<Vec<u8>>,
     cursor: Option<Vec<u8>>,
     output_bounds: Range<u64>,
@@ -51,7 +51,7 @@ fn open_rejects_missing_malformed_and_out_of_range_cursors_without_writes() {
         assert!(matches!(
             error,
             FlowError::InvalidRuntimeState { station_id, reason: actual }
-                if station_id == "source" && actual == reason
+                if station_id == "scan" && actual == reason
         ));
         assert_eq!(durable_input_state(&path), before, "case {case}");
     }
@@ -134,29 +134,29 @@ fn count_change(value: u64) -> Change {
 
 fn publish_pending_input(path: &Path, encoded: Option<&[u8]>, shift_head: bool) {
     let mut builder = FlowFactory::new(path);
-    let source = builder.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let scan = builder.station("scan", SequenceScanDefinition::new(u64::MAX));
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, NonZeroU64::MAX);
-    builder.connect([source], sink);
+    builder.output_capacity_bytes(scan, NonZeroU64::MAX);
+    builder.connect([scan], sink);
     drop(builder.build().unwrap());
 
     let store = Store::open(path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
+        .open_data("station/00000000/operation/sequence_scan.position")
         .unwrap();
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let mut transactions = store.into_transactions();
     match encoded {
         None => {
-            let mut operation = SequenceSourceOperation::new(u64::MAX, position.clone());
+            let mut operation = SequenceScanOperation::new(u64::MAX, position.clone());
             let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
-                panic!("final source did not prepare one turn");
+                panic!("final scan did not prepare one turn");
             };
             let transaction = transactions.begin().unwrap();
             let (Action::Commit(Some(change)), after_commit) =
                 prepared.apply(transaction.access()).unwrap()
             else {
-                panic!("final source did not commit one Change");
+                panic!("final scan did not commit one Change");
             };
             let encoded = encode_change(&change).unwrap();
             let mut output = output.access(transaction.access()).unwrap();
@@ -204,7 +204,7 @@ fn write_sink_state(path: &Path, key: &[u8], value: Option<Vec<u8>>) {
 fn durable_input_state(path: &Path) -> DurableInputState {
     let store = Store::open(path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
+        .open_data("station/00000000/operation/sequence_scan.position")
         .unwrap();
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
@@ -212,7 +212,7 @@ fn durable_input_state(path: &Path) -> DurableInputState {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let access = transaction.access();
-    let source_position = position.access(access).unwrap().get().unwrap();
+    let scan_position = position.access(access).unwrap().get().unwrap();
     let state = state.access(access).unwrap();
     let active = state.get(&ACTIVE.to_vec()).unwrap();
     let cursor = state.get(&CURSOR.to_vec()).unwrap();
@@ -230,7 +230,7 @@ fn durable_input_state(path: &Path) -> DurableInputState {
         )
         .unwrap();
     DurableInputState {
-        source_position,
+        scan_position,
         active,
         cursor,
         output_bounds,

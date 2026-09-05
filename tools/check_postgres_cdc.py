@@ -218,7 +218,7 @@ class Fixture:
                 raise RuntimeError("rejected truncate changed the SQLite relation")
         print("PASS real Flow -> SQLite type mappings, null transition, unchanged TOAST, update/delete, truncate rejection and process-kill/reopen")
 
-    def source_gate(self) -> None:
+    def scan_gate(self) -> None:
         table = "direct_events"
         self.create_table(table)
 
@@ -233,15 +233,15 @@ class Fixture:
             return True
 
         with self.host("direct", table, 1) as host:
-            drive(host, lambda: self.active(table), "direct Source starts")
+            drive(host, lambda: self.active(table), "direct Scan starts")
             self.sql(f"INSERT INTO {table} VALUES (10, 10, 'before-ack')")
             until("actual delivery rollback", lambda: rejected_delivery(host, "rollback"))
             if host.request("read")["rows"]:
-                raise RuntimeError("rolled-back Source emitted durable output")
+                raise RuntimeError("rolled-back Scan emitted durable output")
             until("same delivery commits checkpoint and output before ACK", lambda: crash_after_output(host))
             if host.process.wait(timeout=15) != 74:
                 raise RuntimeError("crash window did not terminate with the expected code")
-        until("crashed Source releases its slot", lambda: not self.active(table))
+        until("crashed Scan releases its slot", lambda: not self.active(table))
         with self.host("direct", table, 2) as host:
             if host.request("read") != {"kind": "rows", "rows": [[1, 10, 10, "before-ack"]],
                                         "checkpoint_present": True}:
@@ -251,13 +251,13 @@ class Fixture:
                 raise RuntimeError(f"first turn did not only restore the checkpoint: {restored}")
             if self.active(table):
                 raise RuntimeError("checkpoint restoration unexpectedly connected to PostgreSQL")
-            drive(host, lambda: self.active(table), "reopened Source restores checkpoint")
+            drive(host, lambda: self.active(table), "reopened Scan restores checkpoint")
             self.sql(f"INSERT INTO {table} VALUES (20, 20, 'after-reopen')")
             until("full output rejects checkpoint and output together",
                   lambda: rejected_delivery(host, "backpressure"))
             if host.request("read")["rows"] != [[1, 10, 10, "before-ack"]]:
                 raise RuntimeError("backpressure changed durable output")
-        until("backpressured Source releases its slot", lambda: not self.active(table))
+        until("backpressured Scan releases its slot", lambda: not self.active(table))
         with self.host("direct", table, 3) as host:
             if host.request("read")["rows"] != [[1, 10, 10, "before-ack"]]:
                 raise RuntimeError("backpressured output became durable despite rollback")
@@ -278,7 +278,7 @@ class Fixture:
             expected.append([1, 30, 30, "last-witness"])
             drive(host, lambda: host.request("read")["rows"] == expected,
                   "successor witnesses ordered replay without duplicates")
-        print("PASS real Source atomic checkpoint/output commit, rollback, pre-ACK process exit, backpressure replay and witness")
+        print("PASS real Scan atomic checkpoint/output commit, rollback, pre-ACK process exit, backpressure replay and witness")
 
     def postgres_roundtrip_gate(self) -> None:
         table = "roundtrip_events"
@@ -318,7 +318,7 @@ class Fixture:
             expected.append((2051, 2051, "after-reopen"))
             drive(host, lambda: rows() == expected, "same-PG update/delete and recovery witness")
             if self.sql(f"SELECT tablename FROM pg_publication_tables WHERE pubname = '{table}_pub'") != table:
-                raise RuntimeError("publication includes more than the source table")
+                raise RuntimeError("publication includes more than the captured table")
         print("PASS same PostgreSQL instance/database CDC -> PG sink: 2050-row split, "
               "PG-committed/Prepared crash, exact recovery, update/delete and new witness")
 
@@ -328,7 +328,7 @@ class Fixture:
         count = 2050  # Exceeds two configured max.batch.size=1024 deliveries.
         expected = [[1, row, row, f"row-{row}"] for row in range(1, count + 1)]
         with self.host("direct", table, 1) as host:
-            drive(host, lambda: self.active(table), "split-transaction Source starts")
+            drive(host, lambda: self.active(table), "split-transaction Scan starts")
             self.sql(f"BEGIN; INSERT INTO {table} SELECT value, value, 'row-' || value "
                      f"FROM generate_series(1, {count}) AS value ORDER BY value; COMMIT")
             until("first partial transaction delivery commits before ACK", lambda: crash_after_output(host))
@@ -360,8 +360,8 @@ class Fixture:
 
     def check_no_password(self) -> None:
         needle = PASSWORD.encode()
-        for directory in [self.root / "flow_events" / "flow", self.root / "direct_events" / "source",
-                          self.root / "chunked_events" / "source", self.root / "roundtrip_events" / "flow"]:
+        for directory in [self.root / "flow_events" / "flow", self.root / "direct_events" / "scan",
+                          self.root / "chunked_events" / "scan", self.root / "roundtrip_events" / "flow"]:
             for path in directory.rglob("*"):
                 if not path.is_file():
                     continue
@@ -399,7 +399,7 @@ def main() -> None:
         run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(root / "postgres.log"), "-o", options, "-w", "start"])
         started = True
         fixture.flow_gate()
-        fixture.source_gate()
+        fixture.scan_gate()
         fixture.split_transaction_gate()
         fixture.postgres_roundtrip_gate()
         fixture.check_no_password()

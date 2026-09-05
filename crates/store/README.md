@@ -182,7 +182,7 @@ transaction.commit()?;
 ```
 
 衰减不会撤销装配者仍然持有的完整 alias；它保证的是只收到 `ReadOnly<C>` 的组件无法在 safe
-Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，因此多个下游可以安全地
+Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，因此多个 consumers 可以安全地
 共享同一个输入 collection。当前白名单是：`Cell` 的 `get`，`OrderedMap` 的 `get/scan`，以及
 `AppendLog` 的 `bounds/scan`。它与只读事务是两个正交约束：`ReadOnly<C>::access` 可在一个写
 事务中提供受限读取，`ReadOnly<C>::read` 则绑定真正的只读 snapshot；两条路径统一返回没有
@@ -277,12 +277,12 @@ truncate。它既能
 
 一个 scan 在调用 callback 前先验证选中 offset 连续。callback 的任意错误都会毒化事务，
 避免已经写入部分输出后仍被提交；第一项无法装入 byte limit 的 `ItemTooLarge` 仍是可增大
-limit 后重试的软错误。`AppendLogScan::next_offset` 可直接持久化为下游 next-unread cursor，
+limit 后重试的软错误。`AppendLogScan::next_offset` 可直接持久化为 consumer 的 next-unread cursor，
 `caught_up` 表示本批已经追到 scan 开始时捕获的 tail。
 
 `truncate_before(target, max_items)` 只删除 `target` 以下且当前仍保留的连续前缀，并限制单次
 删除条数。删除过程通过 MDBX cursor 读取 value length，不复制或解码 value；entry 删除、head
-推进和 retained-byte 扣账处于同一个 MDBX 事务。调用方应以所有下游 cursor 的最小值作为
+推进和 retained-byte 扣账处于同一个 MDBX 事务。调用方应以所有 consumer cursor 的最小值作为
 target，并分批提交 GC。
 
 持久布局固定为一个独立表：空 key 保存 24 字节 big-endian

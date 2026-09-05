@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
 
-use super::PostgresSourceError;
+use super::PostgresCdcScanError;
 
 /// One supported, lossless `PostgreSQL`-to-Arrow column mapping.
 ///
@@ -44,7 +44,7 @@ pub enum PostgresType {
     },
 }
 
-/// A column in the source table's fixed, ordered logical schema.
+/// A column in the captured table's fixed, ordered logical schema.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresColumn {
@@ -54,7 +54,7 @@ pub struct PostgresColumn {
 }
 
 impl PostgresColumn {
-    /// Describes a column; source binding validates the complete schema.
+    /// Describes a column; Scan binding validates the complete schema.
     #[must_use]
     pub fn new(name: impl Into<String>, data_type: PostgresType, nullable: bool) -> Self {
         Self {
@@ -119,9 +119,9 @@ impl PostgresType {
     }
 }
 
-pub(super) fn compile(columns: &[PostgresColumn]) -> Result<SchemaRef, PostgresSourceError> {
+pub(super) fn compile(columns: &[PostgresColumn]) -> Result<SchemaRef, PostgresCdcScanError> {
     if columns.is_empty() || columns.len() > 1_600 {
-        return Err(PostgresSourceError::InvalidDefinition(
+        return Err(PostgresCdcScanError::InvalidDefinition(
             "table must have between 1 and 1600 columns".into(),
         ));
     }
@@ -131,7 +131,7 @@ pub(super) fn compile(columns: &[PostgresColumn]) -> Result<SchemaRef, PostgresS
             || column.name.contains('\0')
             || !names.insert(column.name.as_str())
         {
-            return Err(PostgresSourceError::InvalidDefinition(
+            return Err(PostgresCdcScanError::InvalidDefinition(
                 "column names must be nonempty, NUL-free, and unique".into(),
             ));
         }
@@ -140,7 +140,7 @@ pub(super) fn compile(columns: &[PostgresColumn]) -> Result<SchemaRef, PostgresS
                 || scale < 0
                 || !u8::try_from(scale).is_ok_and(|scale| scale <= precision))
         {
-            return Err(PostgresSourceError::InvalidDefinition(
+            return Err(PostgresCdcScanError::InvalidDefinition(
                 "numeric requires 1 <= precision <= 38 and 0 <= scale <= precision".into(),
             ));
         }
@@ -152,6 +152,6 @@ pub(super) fn compile(columns: &[PostgresColumn]) -> Result<SchemaRef, PostgresS
             .collect::<Vec<_>>(),
     ));
     dogpaddle_change::validate_schema(&schema)
-        .map_err(|error| PostgresSourceError::InvalidDefinition(error.to_string()))?;
+        .map_err(|error| PostgresCdcScanError::InvalidDefinition(error.to_string()))?;
     Ok(schema)
 }

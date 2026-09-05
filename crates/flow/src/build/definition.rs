@@ -12,7 +12,7 @@ pub(crate) struct StationDefinition {
     pub(super) id: String,
     pub(super) operation: Box<dyn OperationDefinition>,
     pub(super) output_capacity_bytes: Option<NonZeroU64>,
-    pub(super) sources: Vec<String>,
+    pub(super) inputs: Vec<String>,
 }
 
 impl FlowDefinition {
@@ -31,7 +31,7 @@ impl StationDefinition {
             id,
             operation,
             output_capacity_bytes: None,
-            sources: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -48,8 +48,8 @@ impl StationDefinition {
             .expect("an Operation input count fits usize")
     }
 
-    pub(crate) fn is_source(&self) -> bool {
-        self.operation.kind().is_source()
+    pub(crate) fn is_scan(&self) -> bool {
+        self.operation.kind().is_scan()
     }
 
     pub(crate) fn is_sink(&self) -> bool {
@@ -64,7 +64,7 @@ impl StationDefinition {
         self.output_capacity_bytes
     }
 
-    pub(crate) fn sources(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.sources.iter().map(String::as_str)
+    pub(crate) fn inputs(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.inputs.iter().map(String::as_str)
     }
 }

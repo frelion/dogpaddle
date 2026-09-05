@@ -14,7 +14,7 @@ The gate answers one narrow question:
 > Java offset file?
 
 This remains a WAL-only, one-table PostgreSQL pilot. It is not yet a
-DogPaddle Source Operation, does not use MDBX, and makes no snapshot, schema
+DogPaddle Scan Operation, does not use MDBX, and makes no snapshot, schema
 evolution, transaction-framing, or Arrow mapping claim.
 
 ## Boundary under test

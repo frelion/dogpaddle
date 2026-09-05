@@ -2,7 +2,7 @@
 
 - **状态**：Accepted
 - **日期**：2026-09-04
-- **范围**：DogPaddle 外部 CDC Source 的进程、JVM、Engine 与 JNI bridge 模型
+- **范围**：DogPaddle 外部 CDC Scan 的进程、JVM、Engine 与 JNI bridge 模型
 - **路线**：[`DEBEZIUM_ROADMAP.md`](../../DEBEZIUM_ROADMAP.md)
 - **决策来源**：[GitHub #2](https://github.com/frelion/dogpaddle/issues/2)
 
@@ -14,11 +14,11 @@ DogPaddle 是嵌入 Rust 应用进程的持久 Dataflow 引擎。现有运行模
 - `Flow` 唯一持有 MDBX 写事务启动能力；
 - Station 只在一次调用期间借用读写能力；
 - `Operation::turn` 可因 `Idle`、错误、output 背压或外层 commit 失败而重放；
-- Source 与其他 Operation 使用同一 `turn`，只以 `None` 表示零输入；
+- Scan 与其他 Operation 使用同一 `turn`，只以 `None` 表示零输入；
 - build/open 需要从 canonical Definition 纯粹地重建 Schema binding 和运行资源；
 - 工作区禁止 DogPaddle 代码使用 `unsafe`。
 
-第一个生产 Source 需要 PostgreSQL CDC。直接在 Rust 中重写 `pgoutput`、snapshot、Schema、
+第一个生产 Scan 需要 PostgreSQL CDC。直接在 Rust 中重写 `pgoutput`、snapshot、Schema、
 offset 与故障恢复，会同时承担 connector 协议和 Dataflow 事务两类复杂度。Debezium 已经
 提供成熟、开源且覆盖多数据源的 connector 实现，并通过 Debezium Engine API 支持嵌入。
 
@@ -57,7 +57,7 @@ Java 线程不直接调用 Flow、不开始 MDBX transaction，也不改变 Stat
 ### 2. 一个 OS 进程至多创建一个 HotSpot JVM
 
 JVM host 是进程级单例。多个 Flow 或 connector 可在同一 JVM 中拥有独立 Debezium Engine
-handle，但不为每个 Source 创建 JVM。
+handle，但不为每个 Scan 创建 JVM。
 
 第一次成功初始化会固定：
 
@@ -172,16 +172,16 @@ D3 及以后的提交规则由统一 Operation 协议表达：
    `AfterCommit` 来 ACK Java bridge；rollback、背压、错误或 commit 失败都只 Drop，不 ACK；
 4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建。
 
-2026-09-05 收缩：不再另建公共 IngressSource；PostgresSource 唯一的
-`postgres_source.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，复用其
-versioned framing/checksum，不加 Source envelope 或持久化 pending。原 `postgres_source.state`
+2026-09-05 收缩：不再另建公共 IngressScan；PostgresCdcScan 唯一的
+`postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，复用其
+versioned framing/checksum，不加额外 envelope 或持久化 pending。原 `postgres_source.state`
 的 pending 布局属于未发布的开发期格式，旧 Flow 必须重建，不提供 alias、兼容读取或迁移。
 不保存额外 receipt：未提交只重投，已提交但 ACK 不确定必须 fail-stop 并从 checkpoint 恢复，
 因而不使用 checkpoint 判断批次身份。这个实现不改变后续第二 connector 才提取共性的原则。
 
 `AfterCommit` 失败发生在本地提交之后，不能伪装成 rollback。该运行态 Station 必须 fail-stop，
 Flow reopen 后再从已提交 checkpoint 恢复。Flow 不公开 `ingest` 或 connector-specific 调度入口；
-初始化、poll、转换与 ACK 都由 Operation 的统一 turn 协议表达。PostgresSource 以零超时 poll，
+初始化、poll、转换与 ACK 都由 Operation 的统一 turn 协议表达。PostgresCdcScan 以零超时 poll，
 只表示不等待数据，不表示整个 turn 非阻塞：connector 启动和 ACK 仍是有界同步调用。
 
 不使用 Java 本地 offset 文件作为 fallback、加速缓存或双写副本，因为崩溃后无法
@@ -191,7 +191,7 @@ connector-specific 字段推导通用顺序。
 ### 6. PostgreSQL 只是第一个试点
 
 PostgreSQL connector 在 D2 中只作为真实 fixture 验证 generic bridge、pre-ACK checkpoint 与
-fresh Engine 恢复；D4 才交付 PostgreSQL Source definition、catalog/identity 规则、固定 Schema
+fresh Engine 恢复；D4 才交付 PostgreSQL CDC Scan definition、catalog/identity 规则、固定 Schema
 转换、durable ingress/Flow 组合和 `Change` 语义。
 以下内容可以是 PostgreSQL-specific：
 
@@ -209,7 +209,7 @@ fresh Engine 恢复；D4 才交付 PostgreSQL Source definition、catalog/identi
 - checkpoint/output 原子提交、未 ACK 重投与 backpressure 的交接语义；
 - Flow/Station 的事务和调度边界。
 
-D7 必须用第二个 connector 证明这一分界，然后才能宣称存在稳定的多 Source 架构。
+D7 必须用第二个 connector 证明这一分界，然后才能宣称存在稳定的多 Scan 架构。
 
 ### 7. Snapshot 不与持续 CDC 首版绑定
 
@@ -235,7 +235,7 @@ Rust snapshot reader 属于新架构决策，需要后续 ADR，不由 D6 实现
   组合为一个用户归档；
 - Rust pull 使 MDBX transaction 与 JNI/Java 线程之间没有重入调用；
 - 延迟 ACK 与 durable ingress 可用少量状态机覆盖崩溃窗口；
-- connector-neutral bridge 为 D7 第二 Source 留出真实复用路径；
+- connector-neutral bridge 为 D7 第二 Scan 留出真实复用路径；
 - 使用 stock Engine 避免长期跟随 Debezium 内部类变化。
 
 ### 负面结果与代价
@@ -284,7 +284,7 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 ### 让 Debezium 直接写 Station output
 
 这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和 consumer frontier，并要求
-Java/connector 获得 Flow 的写事务能力。外部 delivery 必须由普通 Source Operation 的 prepared
+Java/connector 获得 Flow 的写事务能力。外部 delivery 必须由普通 Scan Operation 的 prepared
 turn 保存 checkpoint 并返回 Change，由 Station 在同一事务中追加 output，commit 后再 ACK。
 
 ## 后续决策

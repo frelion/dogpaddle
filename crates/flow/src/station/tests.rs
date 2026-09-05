@@ -14,7 +14,7 @@ use dogpaddle_operation::{
     OperationKind,
     operation::{
         Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
-        sink::DiscardDefinition, source::SequenceSourceDefinition,
+        scan::SequenceScanDefinition, sink::DiscardDefinition,
         transform::RunningEventCountDefinition,
     },
 };
@@ -240,7 +240,7 @@ fn input_state_keys_and_values_keep_the_v1_encoding() {
 
 #[test]
 fn assembly_shares_each_unified_output_with_its_input_ports() {
-    let fixture = source_count_sink(NonZeroU64::MAX, NonZeroU64::MAX);
+    let fixture = scan_count_sink(NonZeroU64::MAX, NonZeroU64::MAX);
     assert!(fixture.stations[0].inbox.ports().is_empty());
     assert_eq!(fixture.stations[1].inbox.ports().len(), 1);
     assert_eq!(fixture.stations[2].inbox.ports().len(), 1);
@@ -304,7 +304,7 @@ fn claim_trace_preserves_durable_identity_across_commit_pin_cache_loss_and_reope
 
 #[test]
 fn action_matrix_commits_exactly_the_allowed_effects() {
-    let mut fixture = source_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
+    let mut fixture = scan_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
     assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
     let state = fixture.stations[1].inbox.state().clone();
 
@@ -393,7 +393,7 @@ fn action_matrix_commits_exactly_the_allowed_effects() {
 
 #[test]
 fn turn_idle_skips_the_transactional_body() {
-    let mut fixture = source_sink(1, NonZeroU64::MAX);
+    let mut fixture = scan_sink(1, NonZeroU64::MAX);
     let state = fixture.stations[0].inbox.state().clone();
     fixture.stations[0].operation = Box::new(ScriptedOperation::idle_before_transaction(
         state.clone(),
@@ -407,7 +407,7 @@ fn turn_idle_skips_the_transactional_body() {
 
 #[test]
 fn after_commit_runs_once_per_successful_store_commit() {
-    let mut fixture = source_sink(1, NonZeroU64::MAX);
+    let mut fixture = scan_sink(1, NonZeroU64::MAX);
     let state = fixture.stations[0].inbox.state().clone();
     let runs = Arc::new(AtomicUsize::new(0));
     fixture.stations[0].operation = Box::new(
@@ -475,7 +475,7 @@ fn after_commit_panic_leaves_the_station_needing_reopen() {
 #[test]
 fn after_commit_is_abandoned_for_idle_apply_error_commit_error_and_backpressure() {
     {
-        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let mut fixture = scan_sink(1, NonZeroU64::MAX);
         let state = fixture.stations[0].inbox.state().clone();
         let runs = Arc::new(AtomicUsize::new(0));
         fixture.stations[0].operation = Box::new(
@@ -493,7 +493,7 @@ fn after_commit_is_abandoned_for_idle_apply_error_commit_error_and_backpressure(
     }
 
     {
-        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let mut fixture = scan_sink(1, NonZeroU64::MAX);
         let state = fixture.stations[0].inbox.state().clone();
         let runs = Arc::new(AtomicUsize::new(0));
         fixture.stations[0].operation = Box::new(
@@ -510,7 +510,7 @@ fn after_commit_is_abandoned_for_idle_apply_error_commit_error_and_backpressure(
     }
 
     {
-        let mut fixture = source_sink(1, NonZeroU64::MAX);
+        let mut fixture = scan_sink(1, NonZeroU64::MAX);
         let state = fixture.stations[0].inbox.state().clone();
         let runs = Arc::new(AtomicUsize::new(0));
         fixture.stations[0].operation = Box::new(
@@ -527,7 +527,7 @@ fn after_commit_is_abandoned_for_idle_apply_error_commit_error_and_backpressure(
     }
 
     {
-        let mut fixture = source_sink(1, NonZeroU64::MIN);
+        let mut fixture = scan_sink(1, NonZeroU64::MIN);
         assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
         let state = fixture.stations[0].inbox.state().clone();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -616,7 +616,7 @@ fn after_commit_failure_preserves_the_commit_and_clears_the_completed_claim() {
 
 #[test]
 fn output_schema_mismatch_precedes_backpressure_and_rolls_back_the_turn() {
-    let mut fixture = source_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
+    let mut fixture = scan_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
     assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
     let state = fixture.stations[1].inbox.state().clone();
 
@@ -820,7 +820,7 @@ fn duplicate_edges_share_one_output_but_acknowledge_independently() {
 
 #[test]
 fn illegal_actions_roll_back_operation_state_and_claim_effects() {
-    let mut sink = source_sink(1, NonZeroU64::MAX);
+    let mut sink = scan_sink(1, NonZeroU64::MAX);
     assert_eq!(sink.step(0), AdvanceOutcome::Progressed);
     let state = sink.stations[1].inbox.state().clone();
     set_script(
@@ -837,20 +837,20 @@ fn illegal_actions_roll_back_operation_state_and_claim_effects() {
     assert_eq!((sink.cursor(1, 0), sink.bounds(0)), (0, 0..1));
     assert_eq!(claim_id(&sink.stations[1]), Some((0, 0)));
 
-    let mut source = source_sink(1, NonZeroU64::MAX);
-    let state = source.stations[0].inbox.state().clone();
+    let mut scan = scan_sink(1, NonZeroU64::MAX);
+    let state = scan.stations[0].inbox.state().clone();
     set_script(
-        &mut source.stations[0],
+        &mut scan.stations[0],
         &state,
-        b"source-complete",
+        b"scan-complete",
         Action::Complete(None),
     );
     assert!(matches!(
-        source.try_step(0),
+        scan.try_step(0),
         Err(StationError::OperationCompletedWithoutInput)
     ));
-    assert_eq!(read_attempt(&state, &mut source.transactions), None);
-    assert_eq!(source.bounds(0), 0..0);
+    assert_eq!(read_attempt(&state, &mut scan.transactions), None);
+    assert_eq!(scan.bounds(0), 0..0);
 }
 
 #[test]
@@ -895,7 +895,7 @@ fn failed_outer_commits_preserve_claim_and_roll_back_every_durable_effect() {
 
 #[test]
 fn completing_an_oversize_entry_restores_empty_log_admission() {
-    let mut fixture = source_sink(1, NonZeroU64::MIN);
+    let mut fixture = scan_sink(1, NonZeroU64::MIN);
     assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
     assert_eq!(fixture.step(0), AdvanceOutcome::Backpressured);
     assert_eq!(fixture.bounds(0), 0..1);
@@ -905,27 +905,27 @@ fn completing_an_oversize_entry_restores_empty_log_admission() {
     assert_eq!(fixture.bounds(0), 1..2);
 }
 
-fn source_sink(consumer_count: usize, source_capacity: NonZeroU64) -> RuntimeFixture {
+fn scan_sink(consumer_count: usize, scan_capacity: NonZeroU64) -> RuntimeFixture {
     let root = tempfile::tempdir().unwrap();
     let mut builder = FlowFactory::new(root.path().join("flow"));
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
-    builder.output_capacity_bytes(source, source_capacity);
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
+    builder.output_capacity_bytes(scan, scan_capacity);
     for index in 0..consumer_count {
         let sink = builder.station(format!("sink-{index}"), DiscardDefinition::new());
-        builder.connect([source], sink);
+        builder.connect([scan], sink);
     }
     fixture(root, builder.build().unwrap())
 }
 
-fn source_count_sink(source_capacity: NonZeroU64, count_capacity: NonZeroU64) -> RuntimeFixture {
+fn scan_count_sink(scan_capacity: NonZeroU64, count_capacity: NonZeroU64) -> RuntimeFixture {
     let root = tempfile::tempdir().unwrap();
     let mut builder = FlowFactory::new(root.path().join("flow"));
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
     let count = builder.station("count", RunningEventCountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, source_capacity);
+    builder.output_capacity_bytes(scan, scan_capacity);
     builder.output_capacity_bytes(count, count_capacity);
-    builder.connect([source], count);
+    builder.connect([scan], count);
     builder.connect([count], sink);
     fixture(root, builder.build().unwrap())
 }
@@ -938,25 +938,25 @@ fn duplicate_input_station() -> MultiInputFixture {
     raw_station(&[0, 0], &[0], Action::Complete(None))
 }
 
-fn raw_station(sources: &[usize], populated: &[usize], action: Action) -> MultiInputFixture {
-    raw_station_with_change(sources, populated, action, &change(&[7]))
+fn raw_station(inputs: &[usize], populated: &[usize], action: Action) -> MultiInputFixture {
+    raw_station_with_change(inputs, populated, action, &change(&[7]))
 }
 
 fn raw_station_with_change(
-    sources: &[usize],
+    inputs: &[usize],
     populated: &[usize],
     action: Action,
     populated_change: &Change,
 ) -> MultiInputFixture {
-    let output_count = sources.iter().copied().max().unwrap() + 1;
+    let output_count = inputs.iter().copied().max().unwrap() + 1;
     let schemas = std::iter::repeat_with(value_schema)
         .take(output_count)
         .collect::<Vec<_>>();
-    raw_station_with_change_and_schemas(sources, populated, action, populated_change, &schemas)
+    raw_station_with_change_and_schemas(inputs, populated, action, populated_change, &schemas)
 }
 
 fn raw_station_with_change_and_schemas(
-    sources: &[usize],
+    inputs: &[usize],
     populated: &[usize],
     action: Action,
     populated_change: &Change,
@@ -966,7 +966,7 @@ fn raw_station_with_change_and_schemas(
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
     let state = store.create_data::<State>("state").unwrap();
-    let output_count = sources.iter().copied().max().unwrap() + 1;
+    let output_count = inputs.iter().copied().max().unwrap() + 1;
     assert_eq!(output_schemas.len(), output_count);
     let outputs = (0..output_count)
         .map(|index| {
@@ -975,20 +975,20 @@ fn raw_station_with_change_and_schemas(
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let parts = station_parts(state.clone(), sources.len(), action);
+    let parts = station_parts(state.clone(), inputs.len(), action);
     let (mut transactions, reads) = store.into_transactions().split();
     let transaction = transactions.begin().unwrap();
     parts.initialize_input_state(transaction.access()).unwrap();
     let encoded = encode_change(populated_change).unwrap();
-    for source in populated {
-        outputs[*source]
+    for input in populated {
+        outputs[*input]
             .access(transaction.access())
             .unwrap()
             .append(&encoded)
             .unwrap();
     }
     transaction.commit().unwrap();
-    let station = finish_station_with_schemas(parts, &state, &outputs, sources, output_schemas);
+    let station = finish_station_with_schemas(parts, &state, &outputs, inputs, output_schemas);
     MultiInputFixture {
         _root: root,
         transactions,
@@ -1035,48 +1035,48 @@ fn station_parts(state: State, input_count: usize, action: Action) -> StationPar
     )
 }
 
-fn finish_station(parts: StationParts, state: &State, logs: &[Log], sources: &[usize]) -> Station {
+fn finish_station(parts: StationParts, state: &State, logs: &[Log], inputs: &[usize]) -> Station {
     let schemas = std::iter::repeat_with(value_schema)
         .take(logs.len())
         .collect::<Vec<_>>();
-    finish_station_with_schemas(parts, state, logs, sources, &schemas)
+    finish_station_with_schemas(parts, state, logs, inputs, &schemas)
 }
 
 fn finish_station_with_schemas(
     parts: StationParts,
     state: &State,
     logs: &[Log],
-    sources: &[usize],
+    inputs: &[usize],
     output_schemas: &[Arc<Schema>],
 ) -> Station {
     assert_eq!(output_schemas.len(), logs.len());
     let outputs = logs
         .iter()
         .enumerate()
-        .map(|(source, log)| {
+        .map(|(input, log)| {
             Arc::new(Output::new(
                 log.clone(),
                 NonZeroU64::MAX,
-                Arc::clone(&output_schemas[source]),
-                sources
+                Arc::clone(&output_schemas[input]),
+                inputs
                     .iter()
                     .enumerate()
-                    .filter(|(_, candidate)| **candidate == source)
+                    .filter(|(_, candidate)| **candidate == input)
                     .map(|(input, _)| ConsumerCursor::new(ReadOnly::new(state.clone()), input))
                     .collect(),
             ))
         })
         .collect::<Vec<_>>();
     let mut slots = vec![0; outputs.len()];
-    let inputs = sources
+    let input_ports = inputs
         .iter()
-        .map(|source| {
-            let port = outputs[*source].port(slots[*source]);
-            slots[*source] += 1;
+        .map(|input| {
+            let port = outputs[*input].port(slots[*input]);
+            slots[*input] += 1;
             port
         })
         .collect();
-    parts.finish(inputs, None)
+    parts.finish(input_ports, None)
 }
 
 fn fixture(root: tempfile::TempDir, flow: Flow) -> RuntimeFixture {

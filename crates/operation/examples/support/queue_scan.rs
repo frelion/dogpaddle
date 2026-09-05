@@ -13,12 +13,12 @@ use dogpaddle_store::Cell;
 const RECORDS: &[u64] = &[10, 20, 30];
 
 /// Only the checkpoint is durable; reopening starts with no client.
-pub(super) struct QueueSource {
+pub(super) struct QueueScan {
     checkpoint: Cell<u64>,
     client: Option<QueueClient>,
 }
 
-impl QueueSource {
+impl QueueScan {
     pub(super) fn new(checkpoint: Cell<u64>) -> Self {
         Self {
             checkpoint,
@@ -27,13 +27,13 @@ impl QueueSource {
     }
 }
 
-impl Operation for QueueSource {
+impl Operation for QueueScan {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
         if input.is_some() {
-            return Err("queue source does not accept input".into());
+            return Err("queue scan does not accept input".into());
         }
 
         // First turn: recover from Store. Publish the memory cache only after commit.

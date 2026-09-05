@@ -37,8 +37,8 @@
 | Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
 | Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
 | Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueSource 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十二个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；关系 Sink 共享的 canonical row/hash、固定 ID 批次、唯一 state 和跨目标数据库/MDBX commit 的幂等重放；SQLite 全部 v1 类型；PostgresSink 的 tag12 与非敏感资源边界 | `operation_core` |
-| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink/PostgresSink 拒绝无建库副作用与 reopen 重绑定；PostgresSource/PostgresSink 精确运行资源；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
+| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueScan 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十二个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；关系 Sink 共享的 canonical row/hash、固定 ID 批次、唯一 state 和跨目标数据库/MDBX commit 的幂等重放；SQLite 全部 v1 类型；PostgresSink 的 tag12 与非敏感资源边界 | `operation_core` |
+| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink/PostgresSink 拒绝无建库副作用与 reopen 重绑定；PostgresCdcScan/PostgresSink 精确运行资源；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
 | Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
 
 “不适用”不通过空 target 表示：D2 不建立 Criterion benchmark；真实 connector 的长稳、资源
@@ -55,12 +55,12 @@ Engine restore 与 eventual LSN。确定性 connector 不进入正式 distributi
 真实 PostgreSQL 证据。
 四层证据必须分别报告，只有全部通过才满足 D2 exit。
 
-## PostgreSQL Source 的显式验收
+## PostgreSQL CDC Scan 的显式验收
 
-Operation 公共 `correctness/postgres.rs` 拥有 tag11 canonical JSON golden、声明布局、exact Schema、
+Operation 公共 `correctness/postgres_cdc.rs` 拥有 tag11 canonical JSON golden、声明布局、exact Schema、
 临时资源类型/脱敏、初始化与 checkpoint 恢复/回滚/reopen 不启动外部资源，以及损坏 checkpoint
 拒绝；源码同目录 `tests.rs` 只拥有私有 Connect JSON 转换及大文本/binary/null 的稳定重批。
-checkpoint codec 本身归 Debezium，不维护另一套 Source 编码。Flow 公共 `correctness/postgres.rs` 拥有资源
+checkpoint codec 本身归 Debezium，不维护另一套 Scan 编码。Flow 公共 `correctness/postgres_cdc_scan.rs` 拥有资源
 缺失/错误/重复/多余的无目录副作用、准确 Station ID、Schema 拒绝、build/open 与资源布局。
 
 真实 Engine 与 PG 不进入普通 Cargo gate。显式执行：
@@ -80,7 +80,7 @@ payload。脚本创建独占临时 cluster、随机 loopback 端口和测试表/
 insert/update/delete、类型映射与进程 reopen；直接 Operation+Store 模式验证 checkpoint/output
 单次原子提交、rollback/背压时二者均不变、提交后 ACK 前退出，以及 checkpoint-only fresh Engine。
 2050 行单 PG 事务跨越 1024 条批量边界，首批提交后 ACK 前退出并 reopen，后继 witness 验证完整
-事件顺序且无重漏。`flow-pg` 模式再证明同一个 PG 实例、同一个 database 内的 Source→PG Sink：
+事件顺序且无重漏。`flow-pg` 模式再证明同一个 PG 实例、同一个 database 内的 Scan→PG Sink：
 2050 行跨批、首批 PG 已提交而本地仍 Prepared 时进程终止、reopen 后技术 ID 不变、update/delete 与后继 witness，
 publication 只包含源表，目标不会反馈进源。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
 接口，也不是第二套运行层。结果必须报告实际 PG/Rust/runtime 版本；本机 PG17 证据不能冒充既有
@@ -105,7 +105,7 @@ python3 tools/check_postgres_sink.py \
 ```
 
 脚本需要 Python 3.9+ 与本机 PostgreSQL 15+ 的 `initdb/pg_ctl/postgres/psql`，并自行构建公共
-`SequenceSource → PostgresSink` Flow host，以及 Operation 所有的 `postgres_sink_recovery` 公共协议
+`SequenceScan → PostgresSink` Flow host，以及 Operation 所有的 `postgres_sink_recovery` 公共协议
 host。只创建 loopback 临时 cluster、Flow 和 Store，不连接已有服务，无论成败都停止自己的 cluster。
 
 - Flow：目标锁超时使目标事务整笔回滚、AfterCommit fail-stop、reopen；PG 已提交而 MDBX
@@ -125,7 +125,7 @@ host。只创建 loopback 临时 cluster、Flow 和 Store，不连接已有服�
   上述 statement 数量不是吞吐或延迟 benchmark。
 
 `.github/workflows/debezium-postgres.yml` 在产品 crate 或两份 gate 脚本变动时，先运行原 digest-pinned
-D1/D2 gate，再复用其 native runtime payload 执行 Source、同 PG 往返和 Sink gate；native server 为
+D1/D2 gate，再复用其 native runtime payload 执行 Scan、同 PG 往返和 Sink gate；native server 为
 Ubuntu 包提供的 PG16，输出实际版本，不混同 pinned container 的证据。普通 Cargo gate 仍离线。
 上述不代表 TLS、初始 snapshot、在线 Schema evolution、fencing 或生产长稳已经验收。
 
@@ -172,7 +172,7 @@ SchemaAlign 的最低专用证据为 tag `9` golden、metadata canonical 编码�
 Schema/IPC/interop/malformed 轨道证明稳定传输；Operation 再用三个公共测试分别证明 direct-copy、
 SchemaAlign 精确 cast/nullability 与 Filter 组合比较，且每个都走
 `encode → decode → re-encode → bind → materialize → turn` 并核对 buffer/diff/顺序。Flow 组合根证明
-`source → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard` 在 build 与
+`SequenceScan → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard` 在 build 与
 两次 reopen 后最终 count 为 `3`。这一承诺严格限于 Date32、无 timezone 的 Millisecond Timestamp、
 `Decimal128(10, 2)` 及测试中的 cast/comparison；其他时间/Decimal 运算、unit/timezone、舍入或 cast
 不能从中推导。

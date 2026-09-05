@@ -8,7 +8,7 @@ use super::support::{fixture_bytes, publish_definition, rewrite_checksum};
 const FLOW_MAGIC: &[u8] = b"dogpaddle.flow\0";
 const OPERATION_MAGIC: &[u8] = b"dogpaddle.operation\0";
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
-    include_str!("../fixtures/v1/sequence_source_running_event_count_discard.hex");
+    include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
 
 #[test]
 fn open_reports_semantic_errors_after_a_valid_checksum() {
@@ -24,8 +24,8 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     );
 
     let mut integrity_damage = original.clone();
-    let source = find_first(&integrity_damage, b"source");
-    integrity_damage[source] ^= 1;
+    let scan = find_first(&integrity_damage, b"scan");
+    integrity_damage[scan] ^= 1;
     assert_eq!(
         definition_error(root.path(), "integrity", &integrity_damage),
         FlowDefinitionError::IntegrityMismatch
@@ -58,23 +58,23 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     );
 
     let mut invalid_utf8 = original.clone();
-    let source_id = find_first(&invalid_utf8, b"source");
-    invalid_utf8[source_id] = 0xff;
+    let scan_id = find_first(&invalid_utf8, b"scan");
+    invalid_utf8[scan_id] = 0xff;
     rewrite_checksum(&mut invalid_utf8);
     assert_eq!(
         definition_error(root.path(), "invalid-utf8", &invalid_utf8),
         FlowDefinitionError::InvalidUtf8
     );
 
-    let mut unknown_source = original.clone();
-    let source_reference = find_last(&unknown_source, b"source");
-    unknown_source[source_reference..source_reference + 6].copy_from_slice(b"ghost!");
-    rewrite_checksum(&mut unknown_source);
+    let mut unknown_input = original.clone();
+    let input_reference = find_last(&unknown_input, b"scan");
+    unknown_input[input_reference..input_reference + 4].copy_from_slice(b"void");
+    rewrite_checksum(&mut unknown_input);
     assert_eq!(
-        definition_error(root.path(), "unknown-source", &unknown_source),
-        FlowDefinitionError::UnknownSource {
+        definition_error(root.path(), "unknown-input", &unknown_input),
+        FlowDefinitionError::UnknownInput {
             station: "count".to_owned(),
-            source_id: "ghost!".to_owned(),
+            input_id: "void".to_owned(),
         }
     );
 

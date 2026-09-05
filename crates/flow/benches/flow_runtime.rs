@@ -13,8 +13,7 @@ use dogpaddle_bench_protocol::{
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition,
-    transform::RunningEventCountDefinition,
+    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
@@ -137,9 +136,9 @@ impl Scenario {
 
     const fn topology_name(self) -> &'static str {
         match self {
-            Self::Sink | Self::CapacityPressure => "source_sink",
+            Self::Sink | Self::CapacityPressure => "scan_sink",
             Self::Chain { .. } => "count_chain",
-            Self::Fanout { .. } => "source_fanout_sinks",
+            Self::Fanout { .. } => "scan_fanout_sinks",
         }
     }
 
@@ -305,16 +304,16 @@ fn seed_capacity_backlog(path: &Path, entries: usize) {
     let store = Store::open(path).expect("open Flow Store to seed capacity backlog");
     let output: AppendLog<Vec<u8>> = store
         .open_data("station/00000000/output")
-        .expect("open source output to seed capacity backlog");
+        .expect("open scan output to seed capacity backlog");
     let mut transactions = store.into_transactions();
     let transaction = transactions
         .begin()
         .expect("begin capacity backlog seed transaction");
     let offsets = output
         .access(transaction.access())
-        .expect("access source output to seed capacity backlog")
+        .expect("access scan output to seed capacity backlog")
         .append_batch(&values)
-        .expect("seed source output capacity backlog");
+        .expect("seed scan output capacity backlog");
     assert_eq!(
         offsets,
         0..u64::try_from(entries).expect("backlog fits u64")
@@ -342,8 +341,8 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
         u64::try_from(completed_rounds).expect("Flow runtime completed round count fits u64");
     let store = Store::open(path).expect("open Flow Store to validate runtime work counts");
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
-        .expect("open source position to validate runtime work counts");
+        .open_data("station/00000000/operation/sequence_scan.position")
+        .expect("open scan position to validate runtime work counts");
     let input_states = (1..scenario.station_count())
         .map(|index| {
             store
@@ -368,17 +367,17 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
     let capacity_output = scenario.is_capacity_pressure().then(|| {
         store
             .open_data::<AppendLog<Vec<u8>>>("station/00000000/output")
-            .expect("open source output to validate capacity backlog")
+            .expect("open scan output to validate capacity backlog")
     });
     let mut transactions = store.into_transactions();
     let transaction = transactions
         .begin()
         .expect("begin runtime work-count validation transaction");
-    let source_position = position
+    let scan_position = position
         .access(transaction.access())
-        .expect("access source position to validate runtime work counts")
+        .expect("access scan position to validate runtime work counts")
         .get()
-        .expect("read source position to validate runtime work counts");
+        .expect("read scan position to validate runtime work counts");
     let expected_position = if scenario.is_capacity_pressure() {
         None
     } else {
@@ -389,8 +388,8 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
         )
     };
     assert_eq!(
-        source_position, expected_position,
-        "durable source position must match committed source turns"
+        scan_position, expected_position,
+        "durable scan position must match committed scan turns"
     );
     let cursor_key = b"input/00000000/cursor".to_vec();
     for state in &input_states {
@@ -426,9 +425,9 @@ fn validate_durable_work(path: &Path, scenario: Scenario, completed_rounds: usiz
         assert_eq!(
             output
                 .access(transaction.access())
-                .expect("access source output to validate capacity backlog")
+                .expect("access scan output to validate capacity backlog")
                 .bounds()
-                .expect("read source output bounds to validate capacity backlog"),
+                .expect("read scan output bounds to validate capacity backlog"),
             completed_rounds..tail,
             "capacity-pressure backlog must retain exactly one entry"
         );
@@ -464,10 +463,10 @@ fn scenario_factory(path: &Path, scenario: Scenario) -> FlowFactory {
 
 fn sink_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(source, output_capacity_bytes);
-    factory.connect([source], sink);
+    factory.output_capacity_bytes(scan, output_capacity_bytes);
+    factory.connect([scan], sink);
     factory
 }
 
@@ -477,7 +476,7 @@ fn chain_factory(
     output_capacity_bytes: NonZeroU64,
 ) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
+    let mut previous = factory.station("scan", SequenceScanDefinition::new(0));
     factory.output_capacity_bytes(previous, output_capacity_bytes);
     for index in 1..station_count - 1 {
         let current = factory.station(
@@ -495,11 +494,11 @@ fn chain_factory(
 
 fn fanout_factory(path: &Path, consumers: usize, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
-    factory.output_capacity_bytes(source, output_capacity_bytes);
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
+    factory.output_capacity_bytes(scan, output_capacity_bytes);
     for index in 0..consumers {
         let sink = factory.station(format!("sink-{index:08x}"), DiscardDefinition::new());
-        factory.connect([source], sink);
+        factory.connect([scan], sink);
     }
     factory
 }

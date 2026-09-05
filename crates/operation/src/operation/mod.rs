@@ -3,8 +3,8 @@ use std::{error::Error, fmt};
 use dogpaddle_change::Change;
 use dogpaddle_store::TransactionAccess;
 
+pub mod scan;
 pub mod sink;
-pub mod source;
 pub mod transform;
 
 /// One complete input Change borrowed for an Operation turn.
@@ -218,7 +218,7 @@ impl<'turn> Turn<'turn> {
 pub trait Operation: Send + 'static {
     /// Produces one bounded turn while no Store write transaction is active.
     ///
-    /// A source receives `None`. An input Operation receives exactly one
+    /// A Scan receives `None`. An input Operation receives exactly one
     /// complete Change. This phase may prepare bounded external work, but it
     /// must not confirm that work or advance any replay-sensitive fact before
     /// the returned prepared turn commits.

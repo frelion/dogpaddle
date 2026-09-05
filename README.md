@@ -15,7 +15,7 @@ DogPaddle 是一个为 Rust 应用设计的嵌入式 Dataflow 引擎。它用 Ar
 ![同一个 PostgreSQL 内经 DogPaddle 持续增量同步](docs/assets/postgres-cdc-live.gif)
 
 *真实进程录制：左侧向同一个 PostgreSQL 的 `source.orders` 写入 INSERT、UPDATE、DELETE；中间运行
-`PostgresSource → PostgresSink`，从 WAL 捕获增量并以 Arrow Change 持久推进；右侧从
+`PostgresCdcScan → PostgresSink`，从 WAL 捕获增量并以 Arrow Change 持久推进；右侧从
 `target.orders` 查询同步结果。中途强制终止并重新打开 Flow host 后，后续变更继续到达目标。
 publication 只包含 `source.orders`，写回不会形成 CDC 回环。停顿仅用于演示；该链路不执行初始快照。*
 
@@ -44,15 +44,15 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 
 当前共有 12 个内建算子，全部沿用同一套 Definition、Schema binding、Operation turn 与 Flow 调度协议。
 
-| Source | Transform | Sink |
+| Scan | Transform | Sink |
 | --- | --- | --- |
-| `SequenceSource` · `PostgresSource`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `PostgresSink`（试点） · `Discard` |
+| `SequenceScan` · `PostgresCdcScan`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `PostgresSink`（试点） · `Discard` |
 
 `SqliteSink` 首次收到输入后延迟初始化普通 `STRICT` 表，不引入额外 SQLite 元数据表。
 它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
 在 Sink 独占目标表且数据库未被外部修改或替换的前提下，重放不会重复最终结果。
 
-`PostgresSource → PostgresSink` 已形成首条 PostgreSQL 到 PostgreSQL 的持续增量链路。Source 借助
+`PostgresCdcScan → PostgresSink` 已形成首条 PostgreSQL 到 PostgreSQL 的持续增量链路。CDC Scan 借助
 进程内 `dogpaddle-debezium` 从单表 WAL 捕获固定 Schema 事件，并在 checkpoint 与 Station output
 同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，与 SQLite 共用固定 ID 的
 幂等批次：先持久化具体工作，再批量 insert-ignore、按 ID delete，提交窗口可在 reopen 后重放。Definition 只保存
@@ -61,7 +61,7 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建回执表。目标列优先保留 Arrow 精确值，
 不是源表原生 SQL 类型的原样镜像；不承诺目标 WAL 事件顺序或整个源事务在目标侧原子可见。
 这是无初始快照、无 TLS 与在线 Schema evolution 的试点；
-[Source 使用与边界](crates/operation/README.md#postgresql-source-试点) ·
+[PostgreSQL CDC Scan 使用与边界](crates/operation/README.md#postgresql-cdc-scan-试点) ·
 [Sink 使用与边界](crates/operation/README.md#operationsinkpostgressink)。
 
 ## 当前边界
@@ -80,7 +80,7 @@ Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建
 ## 深入阅读
 
 - [算子路线与语义边界](OPERATOR_ROADMAP.md)
-- [Debezium Source D0–D7 路线图](DEBEZIUM_ROADMAP.md)
+- [Debezium Scan D0–D7 路线图](DEBEZIUM_ROADMAP.md)
 - [ADR-0001：在 Rust 宿主中嵌入 Debezium Engine](docs/adr/0001-embed-debezium-engine.md)
 - [Debezium：自包含进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
 - [Flow：构建、运行与恢复](crates/flow/README.md)

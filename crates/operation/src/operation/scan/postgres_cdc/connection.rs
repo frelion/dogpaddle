@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf, time::Duration};
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime};
 use postgres::{Client, Config, GenericClient, NoTls};
 
-use super::{PostgresColumn, PostgresSourceError, PostgresSourceSpec, PostgresType, schema};
+use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType, schema};
 
 const CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
@@ -13,7 +13,7 @@ const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 /// This pilot explicitly uses unencrypted `PostgreSQL` connections. Use it only
 /// over a trusted local network or an independently secured tunnel. It is never
 /// encoded into an Operation or Flow Definition; supply it again when opening.
-pub struct PostgresSourceConfig {
+pub struct PostgresCdcScanConfig {
     runtime_bundle: PathBuf,
     host: String,
     port: u16,
@@ -22,7 +22,7 @@ pub struct PostgresSourceConfig {
     password: String,
 }
 
-impl PostgresSourceConfig {
+impl PostgresCdcScanConfig {
     /// Creates runtime configuration without connecting or opening the bundle.
     ///
     /// `PostgreSQL` TLS is disabled for both discovery and Debezium streaming.
@@ -38,7 +38,7 @@ impl PostgresSourceConfig {
         database: impl Into<String>,
         user: impl Into<String>,
         password: impl Into<String>,
-    ) -> Result<Self, PostgresSourceError> {
+    ) -> Result<Self, PostgresCdcScanError> {
         let config = Self {
             runtime_bundle: runtime_bundle.into(),
             host: host.into(),
@@ -48,7 +48,7 @@ impl PostgresSourceConfig {
             password: password.into(),
         };
         if !config.runtime_bundle.is_absolute() || port == 0 {
-            return Err(PostgresSourceError::new(
+            return Err(PostgresCdcScanError::new(
                 "PostgreSQL runtime requires an absolute bundle path and nonzero port",
             ));
         }
@@ -57,7 +57,7 @@ impl PostgresSourceConfig {
             .any(|value| value.trim().is_empty() || value.contains('\0'))
             || config.password.contains('\0')
         {
-            return Err(PostgresSourceError::new(
+            return Err(PostgresCdcScanError::new(
                 "invalid PostgreSQL connection fields",
             ));
         }
@@ -87,7 +87,7 @@ impl PostgresSourceConfig {
         table: &str,
         slot: &str,
         publication: &str,
-    ) -> Result<PostgresSourceSpec, PostgresSourceError> {
+    ) -> Result<PostgresCdcScanSpec, PostgresCdcScanError> {
         let mut client = self.connect()?;
         let mut transaction = client
             .build_transaction()
@@ -111,9 +111,9 @@ impl PostgresSourceConfig {
 
     pub(super) fn start(
         &self,
-        expected: &PostgresSourceSpec,
+        expected: &PostgresCdcScanSpec,
         checkpoint: Option<&Checkpoint>,
-    ) -> Result<Connector, PostgresSourceError> {
+    ) -> Result<Connector, PostgresCdcScanError> {
         let actual = self.discover(
             &expected.engine_name,
             &expected.schema,
@@ -122,24 +122,24 @@ impl PostgresSourceConfig {
             &expected.publication,
         )?;
         if &actual != expected {
-            return Err(PostgresSourceError::new(
-                "PostgreSQL source identity or logical schema changed",
+            return Err(PostgresCdcScanError::new(
+                "PostgreSQL CDC scan identity or logical schema changed",
             ));
         }
         let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
-            PostgresSourceError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
+            PostgresCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
         })?;
         runtime
             .start(self.connector_config(expected)?, checkpoint)
             .map_err(|error| {
-                PostgresSourceError::new(format!(
+                PostgresCdcScanError::new(format!(
                     "Debezium connector start failed ({:?})",
                     error.kind()
                 ))
             })
     }
 
-    fn connect(&self) -> Result<Client, PostgresSourceError> {
+    fn connect(&self) -> Result<Client, PostgresCdcScanError> {
         Config::new()
             .host(&self.host)
             .port(self.port)
@@ -160,21 +160,23 @@ impl PostgresSourceConfig {
         table: &str,
         slot: &str,
         publication: &str,
-    ) -> Result<PostgresSourceSpec, PostgresSourceError> {
+    ) -> Result<PostgresCdcScanSpec, PostgresCdcScanError> {
         let identity = client.query_one(
             "SELECT s.system_identifier::text, d.oid FROM pg_catalog.pg_control_system() s CROSS JOIN pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()", &[])
             .map_err(|error| catalog_error("read cluster identity", &error))?;
         let relation = client.query_opt(
             "SELECT c.oid, c.relkind::text, c.relpersistence::text, c.relreplident::text, c.relispartition FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2", &[&table_schema, &table])
             .map_err(|error| catalog_error("read table identity", &error))?
-            .ok_or_else(|| PostgresSourceError::new("PostgreSQL source table does not exist"))?;
+            .ok_or_else(|| {
+                PostgresCdcScanError::new("PostgreSQL CDC captured table does not exist")
+            })?;
         if relation.get::<_, String>(1) != "r"
             || relation.get::<_, String>(2) != "p"
             || relation.get::<_, String>(3) != "f"
             || relation.get::<_, bool>(4)
         {
-            return Err(PostgresSourceError::new(
-                "PostgreSQL source requires a permanent nonpartition table with REPLICA IDENTITY FULL",
+            return Err(PostgresCdcScanError::new(
+                "PostgreSQL CDC scan requires a permanent nonpartition table with REPLICA IDENTITY FULL",
             ));
         }
         let table_oid: u32 = relation.get(0);
@@ -184,8 +186,8 @@ impl PostgresSourceConfig {
         let mut columns = Vec::with_capacity(rows.len());
         for row in rows {
             if !row.get::<_, String>(4).is_empty() {
-                return Err(PostgresSourceError::new(
-                    "generated PostgreSQL source columns are unsupported",
+                return Err(PostgresCdcScanError::new(
+                    "generated PostgreSQL CDC scan columns are unsupported",
                 ));
             }
             columns.push(PostgresColumn::new(
@@ -197,7 +199,7 @@ impl PostgresSourceConfig {
         schema::compile(&columns)?;
         validate_publication(client, publication, table_schema, table, &columns)?;
         validate_slot(client, slot, &self.database)?;
-        Ok(PostgresSourceSpec {
+        Ok(PostgresCdcScanSpec {
             engine_name: engine_name.to_owned(),
             database: self.database.clone(),
             schema: table_schema.to_owned(),
@@ -213,11 +215,11 @@ impl PostgresSourceConfig {
 
     fn connector_config(
         &self,
-        spec: &PostgresSourceSpec,
-    ) -> Result<ConnectorConfig, PostgresSourceError> {
+        spec: &PostgresCdcScanSpec,
+    ) -> Result<ConnectorConfig, PostgresCdcScanError> {
         let mut config = ConnectorConfig::new(&spec.engine_name, CONNECTOR_CLASS)
             .and_then(|config| config.max_delivery_bytes(MAX_DELIVERY_BYTES))
-            .map_err(|_| PostgresSourceError::new("invalid PostgreSQL connector identity"))?;
+            .map_err(|_| PostgresCdcScanError::new("invalid PostgreSQL connector identity"))?;
         let port = self.port.to_string();
         // Definition identifiers are restricted to lowercase ASCII and '_'.
         let include = format!("{}\\.{}", spec.schema, spec.table);
@@ -253,17 +255,17 @@ impl PostgresSourceConfig {
             ("event.processing.failure.handling.mode", "fail"),
         ] {
             config = config.property(key, value).map_err(|_| {
-                PostgresSourceError::new("invalid fixed PostgreSQL connector configuration")
+                PostgresCdcScanError::new("invalid fixed PostgreSQL connector configuration")
             })?;
         }
         Ok(config)
     }
 }
 
-impl fmt::Debug for PostgresSourceConfig {
+impl fmt::Debug for PostgresCdcScanConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PostgresSourceConfig")
+            .debug_struct("PostgresCdcScanConfig")
             .field("runtime_bundle", &self.runtime_bundle)
             .field("host", &self.host)
             .field("port", &self.port)
@@ -280,12 +282,12 @@ fn validate_publication(
     table_schema: &str,
     table: &str,
     columns: &[PostgresColumn],
-) -> Result<(), PostgresSourceError> {
+) -> Result<(), PostgresCdcScanError> {
     let row = client.query_opt(
         "SELECT p.pubinsert AND p.pubupdate AND p.pubdelete AND p.pubtruncate, t.attnames::text[], t.rowfilter IS NULL FROM pg_catalog.pg_publication p JOIN pg_catalog.pg_publication_tables t ON t.pubname = p.pubname WHERE p.pubname = $1 AND t.schemaname = $2 AND t.tablename = $3",
         &[&publication, &table_schema, &table])
         .map_err(|error| catalog_error("read publication", &error))?
-        .ok_or_else(|| PostgresSourceError::new("existing PostgreSQL publication does not include the source table"))?;
+        .ok_or_else(|| PostgresCdcScanError::new("existing PostgreSQL publication does not include the captured table"))?;
     let actual_columns: Vec<String> = row.get(1);
     if !row.get::<_, bool>(0)
         || !row.get::<_, bool>(2)
@@ -294,7 +296,7 @@ fn validate_publication(
             .map(String::as_str)
             .eq(columns.iter().map(PostgresColumn::name))
     {
-        return Err(PostgresSourceError::new(
+        return Err(PostgresCdcScanError::new(
             "PostgreSQL publication must include all columns and insert/update/delete/truncate without a row filter",
         ));
     }
@@ -305,21 +307,25 @@ fn validate_slot(
     client: &mut impl GenericClient,
     slot: &str,
     database: &str,
-) -> Result<(), PostgresSourceError> {
+) -> Result<(), PostgresCdcScanError> {
     let row = client.query_opt(
         "SELECT plugin = 'pgoutput' AND slot_type = 'logical' AND database = $2 AND NOT temporary AND NOT active AND wal_status IN ('reserved', 'extended') AND NOT two_phase FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
         &[&slot, &database])
         .map_err(|error| catalog_error("read replication slot", &error))?
-        .ok_or_else(|| PostgresSourceError::new("PostgreSQL source requires an existing pgoutput replication slot"))?;
+        .ok_or_else(|| {
+            PostgresCdcScanError::new(
+                "PostgreSQL CDC scan requires an existing pgoutput replication slot",
+            )
+        })?;
     if row.get::<_, Option<bool>>(0) != Some(true) {
-        return Err(PostgresSourceError::new(
+        return Err(PostgresCdcScanError::new(
             "PostgreSQL replication slot is active, incompatible, or no longer retains its WAL",
         ));
     }
     Ok(())
 }
 
-fn column_type(oid: u32, modifier: i32) -> Result<PostgresType, PostgresSourceError> {
+fn column_type(oid: u32, modifier: i32) -> Result<PostgresType, PostgresCdcScanError> {
     Ok(match oid {
         16 => PostgresType::Boolean,
         21 => PostgresType::Int16,
@@ -334,28 +340,29 @@ fn column_type(oid: u32, modifier: i32) -> Result<PostgresType, PostgresSourceEr
         1184 => PostgresType::TimestampTz,
         1700 if modifier >= 4 => {
             let modifier = u32::try_from(modifier - 4)
-                .map_err(|_| PostgresSourceError::new("invalid PostgreSQL numeric modifier"))?;
+                .map_err(|_| PostgresCdcScanError::new("invalid PostgreSQL numeric modifier"))?;
             let precision = u8::try_from(modifier >> 16).map_err(|_| {
-                PostgresSourceError::new("PostgreSQL numeric precision exceeds Decimal128")
+                PostgresCdcScanError::new("PostgreSQL numeric precision exceeds Decimal128")
             })?;
             // PostgreSQL numeric scale occupies a signed 11-bit field.
             let scale = i32::try_from(modifier & 0x7ff)
-                .map_err(|_| PostgresSourceError::new("invalid PostgreSQL numeric scale"))?;
+                .map_err(|_| PostgresCdcScanError::new("invalid PostgreSQL numeric scale"))?;
             let scale = if scale >= 1024 { scale - 2048 } else { scale };
-            let scale = i8::try_from(scale)
-                .map_err(|_| PostgresSourceError::new("PostgreSQL numeric scale is unsupported"))?;
+            let scale = i8::try_from(scale).map_err(|_| {
+                PostgresCdcScanError::new("PostgreSQL numeric scale is unsupported")
+            })?;
             PostgresType::Numeric { precision, scale }
         }
         _ => {
-            return Err(PostgresSourceError::new(format!(
+            return Err(PostgresCdcScanError::new(format!(
                 "unsupported PostgreSQL column type OID {oid}"
             )));
         }
     })
 }
 
-fn catalog_error(stage: &str, error: &postgres::Error) -> PostgresSourceError {
-    PostgresSourceError::new(format!(
+fn catalog_error(stage: &str, error: &postgres::Error) -> PostgresCdcScanError {
+    PostgresCdcScanError::new(format!(
         "PostgreSQL {stage} failed (SQLSTATE {})",
         error
             .code()

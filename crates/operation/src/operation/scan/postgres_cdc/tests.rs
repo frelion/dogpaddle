@@ -6,7 +6,7 @@ use base64::{Engine as _, prelude::BASE64_STANDARD};
 use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
-use super::{PostgresColumn, PostgresSourceError, PostgresType, convert::convert_values, schema};
+use super::{PostgresCdcScanError, PostgresColumn, PostgresType, convert::convert_values, schema};
 
 fn column(data_type: PostgresType) -> PostgresColumn {
     PostgresColumn::new("value", data_type, true)
@@ -45,7 +45,7 @@ fn envelope(columns: &[PostgresColumn], op: &str, before: Value, after: Value) -
 fn convert(
     columns: &[PostgresColumn],
     events: &[Value],
-) -> Result<Option<Change>, PostgresSourceError> {
+) -> Result<Option<Change>, PostgresCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
@@ -69,7 +69,7 @@ fn inserted(columns: &[PostgresColumn], row: Value) -> Change {
 }
 
 #[test]
-fn postgres_conversion_preserves_insert_update_delete_event_order() {
+fn postgres_cdc_conversion_preserves_insert_update_delete_event_order() {
     let columns = [column(PostgresType::Int64)];
     let events = [
         envelope(&columns, "c", Value::Null, json!({"value":1})),
@@ -101,7 +101,7 @@ fn postgres_conversion_preserves_insert_update_delete_event_order() {
 }
 
 #[test]
-fn postgres_conversion_preserves_large_text_binary_and_nulls_across_rebatching() {
+fn postgres_cdc_conversion_preserves_large_text_binary_and_nulls_across_rebatching() {
     let columns = [
         PostgresColumn::new("text", PostgresType::Text, true),
         PostgresColumn::new("binary", PostgresType::Bytea, true),
@@ -141,7 +141,7 @@ fn postgres_conversion_preserves_large_text_binary_and_nulls_across_rebatching()
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn postgres_conversion_preserves_every_supported_type_and_null() {
+fn postgres_cdc_conversion_preserves_every_supported_type_and_null() {
     let columns = [
         PostgresColumn::new("boolean", PostgresType::Boolean, true),
         PostgresColumn::new("small", PostgresType::Int16, true),
@@ -287,7 +287,7 @@ fn postgres_conversion_preserves_every_supported_type_and_null() {
 }
 
 #[test]
-fn postgres_numeric_decodes_signed_big_endian_bytes_without_rounding() {
+fn postgres_cdc_numeric_decodes_signed_big_endian_bytes_without_rounding() {
     let columns = [column(PostgresType::Numeric {
         precision: 4,
         scale: 2,
@@ -326,7 +326,7 @@ fn postgres_numeric_decodes_signed_big_endian_bytes_without_rounding() {
 }
 
 #[test]
-fn postgres_conversion_rejects_row_schema_drift_and_incomplete_images() {
+fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
     let columns = [PostgresColumn::new("value", PostgresType::Int64, false)];
     let valid = envelope(&columns, "u", json!({"value":1}), json!({"value":2}));
     let mut cases = Vec::new();
@@ -372,7 +372,7 @@ fn postgres_conversion_rejects_row_schema_drift_and_incomplete_images() {
 }
 
 #[test]
-fn postgres_conversion_rejects_snapshot_truncate_and_wrong_source() {
+fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
     let columns = [column(PostgresType::Int64)];
     for operation in ["r", "t", "m", "unknown"] {
         assert!(
@@ -396,7 +396,7 @@ fn postgres_conversion_rejects_snapshot_truncate_and_wrong_source() {
 }
 
 #[test]
-fn postgres_streaming_accepts_the_bridges_null_snapshot_marker() {
+fn postgres_cdc_streaming_accepts_the_bridges_null_snapshot_marker() {
     let columns = [column(PostgresType::Int64)];
     for marker in [Value::Null, json!(false), json!("false")] {
         let mut event = envelope(&columns, "c", Value::Null, json!({"value":1}));
@@ -419,7 +419,7 @@ fn postgres_streaming_accepts_the_bridges_null_snapshot_marker() {
 }
 
 #[test]
-fn postgres_conversion_accepts_only_identified_control_records() {
+fn postgres_cdc_conversion_accepts_only_identified_control_records() {
     let columns = [column(PostgresType::Int64)];
     let heartbeat = serde_json::to_vec(&json!({"schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},"payload":{"ts_ms":123}})).unwrap();
     let convert_control = |topic, value| {
@@ -453,7 +453,7 @@ fn postgres_conversion_accepts_only_identified_control_records() {
 }
 
 #[test]
-fn postgres_conversion_rejects_overflow_special_temporal_and_toast_values() {
+fn postgres_cdc_conversion_rejects_overflow_special_temporal_and_toast_values() {
     for (data_type, value) in [
         (PostgresType::Int16, json!(32768)),
         (PostgresType::Int32, json!(2_147_483_648_u64)),
@@ -494,7 +494,7 @@ fn postgres_conversion_rejects_overflow_special_temporal_and_toast_values() {
 }
 
 #[test]
-fn postgres_float_preserves_signed_zero_nan_and_infinities() {
+fn postgres_cdc_float_preserves_signed_zero_nan_and_infinities() {
     for data_type in [PostgresType::Float32, PostgresType::Float64] {
         let columns = [column(data_type)];
         for (value, expected) in [

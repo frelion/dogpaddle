@@ -15,11 +15,11 @@ use dogpaddle_operation::{
     col, lit,
     operation::{
         Action, Operation, OperationInput,
+        scan::SequenceScanDefinition,
         sink::{
             DiscardDefinition, SqliteSinkDefinition, SqliteSinkDefinitionError,
             SqliteSinkSchemaError,
         },
-        source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, ExtendSchemaError, FilterDefinition, FilterSchemaError,
             ProjectDefinition, ProjectSchemaError, RunningEventCountDefinition,
@@ -113,10 +113,10 @@ fn align(fields: impl IntoIterator<Item = SchemaAlignField>) -> SchemaAlignDefin
 
 #[test]
 fn definitions_expose_their_stable_public_contracts() {
-    let source = SequenceSourceDefinition::new(42);
-    assert_eq!(source.kind(), OperationKind::Source);
-    assert_eq!(source.start(), 42);
-    assert_eq!(names(&source), ["sequence_source.position"]);
+    let scan = SequenceScanDefinition::new(42);
+    assert_eq!(scan.kind(), OperationKind::Scan);
+    assert_eq!(scan.start(), 42);
+    assert_eq!(names(&scan), ["sequence_scan.position"]);
 
     let count = RunningEventCountDefinition::new();
     assert_eq!(
@@ -230,9 +230,9 @@ fn sqlite_sink_definition_exposes_its_stable_public_contract() {
 
 #[test]
 fn definitions_bind_their_complete_logical_schema_contracts() {
-    let source = SequenceSourceDefinition::new(42);
-    let source_binding = bind(&source, &[]).unwrap();
-    assert_eq!(source_binding.output_schema(), Some(&value_schema()));
+    let scan = SequenceScanDefinition::new(42);
+    let scan_binding = bind(&scan, &[]).unwrap();
+    assert_eq!(scan_binding.output_schema(), Some(&value_schema()));
 
     let arbitrary_input = Arc::new(Schema::new(vec![Field::new(
         "message",
@@ -299,9 +299,9 @@ fn definitions_bind_their_complete_logical_schema_contracts() {
 
 #[test]
 fn binding_rejects_wrong_arity_and_invalid_logical_input_schemas() {
-    let source = SequenceSourceDefinition::new(42);
+    let scan = SequenceScanDefinition::new(42);
     assert!(matches!(
-        bind(&source, &[value_schema()]),
+        bind(&scan, &[value_schema()]),
         Err(OperationBindError::InputCount {
             expected: 0,
             actual: 1
@@ -912,14 +912,14 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     assert_send_sync_static::<Box<dyn OperationDefinition>>();
 
     let fixture = TestStore::new();
-    let source_definition = SequenceSourceDefinition::new(42);
+    let scan_definition = SequenceScanDefinition::new(42);
     let running_event_count_definition = RunningEventCountDefinition::new();
     let project_definition = ProjectDefinition::new([0]);
     let discard_definition = DiscardDefinition::new();
 
     let mut store = Store::create(fixture.path()).unwrap();
-    source_definition.data()[0]
-        .create(&mut store, "source-position")
+    scan_definition.data()[0]
+        .create(&mut store, "scan-position")
         .unwrap();
     running_event_count_definition.data()[0]
         .create(&mut store, "count")
@@ -927,8 +927,8 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     drop(store);
 
     let store = Store::open(fixture.path()).unwrap();
-    let source_position = store.open_data::<Cell<u64>>("source-position").unwrap();
-    let mut source = materialize(&source_definition, &[], &store, &["source-position"]);
+    let scan_position = store.open_data::<Cell<u64>>("scan-position").unwrap();
+    let mut scan = materialize(&scan_definition, &[], &store, &["scan-position"]);
     let mut count = materialize(
         &running_event_count_definition,
         &[value_schema()],
@@ -939,9 +939,9 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     let mut discard = materialize(&discard_definition, &[value_schema()], &store, &[]);
     let mut transactions = store.into_transactions();
     let Action::Commit(Some(output)) =
-        commit_ready(source.as_mut(), None, &mut transactions).unwrap()
+        commit_ready(scan.as_mut(), None, &mut transactions).unwrap()
     else {
-        panic!("materialized SequenceSource did not commit one output Change");
+        panic!("materialized SequenceScan did not commit one output Change");
     };
     assert_eq!(output.num_rows(), 1);
     let values = output
@@ -954,7 +954,7 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     assert_eq!(
         {
             let transaction = transactions.begin().unwrap();
-            source_position
+            scan_position
                 .access(transaction.access())
                 .unwrap()
                 .get()
@@ -997,7 +997,7 @@ fn declarations_create_reopen_and_materialize_their_exact_data_classes() {
     .unwrap() else {
         panic!("materialized Discard did not complete one input without output");
     };
-    drop((source, count, project, discard));
+    drop((scan, count, project, discard));
 }
 
 #[test]

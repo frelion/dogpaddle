@@ -4,16 +4,16 @@ use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
     MaterializeError,
     operation::{
-        sink::DiscardDefinition,
-        source::{
-            PostgresColumn, PostgresSourceConfig, PostgresSourceDefinition, PostgresSourceSpec,
-            PostgresType, SequenceSourceDefinition,
+        scan::{
+            PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn,
+            PostgresType, SequenceScanDefinition,
         },
+        sink::DiscardDefinition,
     },
 };
 
-fn config() -> PostgresSourceConfig {
-    PostgresSourceConfig::new_unencrypted(
+fn config() -> PostgresCdcScanConfig {
+    PostgresCdcScanConfig::new_unencrypted(
         "/nonexistent/runtime",
         "127.0.0.1",
         1,
@@ -25,7 +25,7 @@ fn config() -> PostgresSourceConfig {
 }
 
 fn factory(path: &Path, field: &str) -> FlowFactory {
-    let definition = PostgresSourceDefinition::try_new(PostgresSourceSpec {
+    let definition = PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
         engine_name: "orders".into(),
         database: "shop".into(),
         schema: "public".into(),
@@ -39,15 +39,15 @@ fn factory(path: &Path, field: &str) -> FlowFactory {
     })
     .unwrap();
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("pg", definition);
+    let scan = factory.station("pg", definition);
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.connect([source], sink);
-    factory.output_capacity_bytes(source, NonZeroU64::new(1024).unwrap());
+    factory.connect([scan], sink);
+    factory.output_capacity_bytes(scan, NonZeroU64::new(1024).unwrap());
     factory
 }
 
 #[test]
-fn postgres_resource_errors_are_station_scoped_and_precede_store_creation() {
+fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creation() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let Err(FlowError::RuntimeResource {
@@ -88,7 +88,7 @@ fn postgres_resource_errors_are_station_scoped_and_precede_store_creation() {
 }
 
 #[test]
-fn postgres_schema_failure_is_pure_and_identifies_the_station() {
+fn postgres_cdc_scan_schema_failure_is_pure_and_identifies_the_station() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = factory(&path, "$dogpaddle.reserved");
@@ -101,7 +101,7 @@ fn postgres_schema_failure_is_pure_and_identifies_the_station() {
 }
 
 #[test]
-fn postgres_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
+fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = factory(&path, "id");
@@ -124,7 +124,7 @@ fn postgres_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     let store = dogpaddle_store::Store::open(&path).unwrap();
     let definition: dogpaddle_store::Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let state: dogpaddle_store::Cell<Vec<u8>> = store
-        .open_data("station/00000000/operation/postgres_source.checkpoint")
+        .open_data("station/00000000/operation/postgres_cdc_scan.checkpoint")
         .unwrap();
     let transaction = store.read_transaction().unwrap();
     let bytes = definition
@@ -153,15 +153,15 @@ fn open_rejects_new_topology_and_self_contained_operations_reject_resources() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut open = FlowFactory::new(&path);
-    open.station("source", SequenceSourceDefinition::new(0));
+    open.station("scan", SequenceScanDefinition::new(0));
     assert!(matches!(open.open(), Err(FlowError::OpenWithDefinition)));
     assert!(!path.exists());
     let mut build = FlowFactory::new(&path);
-    let source = build.station("source", SequenceSourceDefinition::new(0));
+    let scan = build.station("scan", SequenceScanDefinition::new(0));
     let sink = build.station("sink", DiscardDefinition::new());
-    build.output_capacity_bytes(source, NonZeroU64::new(1024).unwrap());
-    build.connect([source], sink);
-    build.resource("source", config()).unwrap();
+    build.output_capacity_bytes(scan, NonZeroU64::new(1024).unwrap());
+    build.connect([scan], sink);
+    build.resource("scan", config()).unwrap();
     assert!(matches!(
         build.build(),
         Err(FlowError::RuntimeResource {

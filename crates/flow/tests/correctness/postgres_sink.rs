@@ -4,10 +4,10 @@ use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::{
     MaterializeError, OperationBindError, col,
     operation::{
+        scan::SequenceScanDefinition,
         sink::{
             PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkSchemaError, PostgresTargetSpec,
         },
-        source::SequenceSourceDefinition,
         transform::SelectDefinition,
     },
 };
@@ -30,10 +30,10 @@ fn definition() -> PostgresSinkDefinition {
 
 fn factory(path: &Path) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let sink = factory.station(SINK, definition());
-    factory.output_capacity_bytes(source, CAPACITY);
-    factory.connect([source], sink);
+    factory.output_capacity_bytes(scan, CAPACITY);
+    factory.connect([scan], sink);
     factory
 }
 
@@ -72,15 +72,15 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
     let path = root.path().join("flow");
     let invalid_name = "x".repeat(64);
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let select = factory.station(
         "select",
         SelectDefinition::try_new([(invalid_name.clone(), col("value"))]).unwrap(),
     );
     let sink = factory.station(SINK, definition());
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(select, CAPACITY);
-    factory.connect([source], select);
+    factory.connect([scan], select);
     factory.connect([select], sink);
     factory.resource(SINK, config()).unwrap();
 

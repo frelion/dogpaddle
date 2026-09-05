@@ -114,7 +114,7 @@ paired speedup 是每一对 scalar/batch 耗时比的中位数，不一定等于
 因此不能把独立中位数的商包装成稳定收益。这个例子也说明为什么报告必须保留 paired ratio。
 
 这组数据只证明“一个 AppendLog collection、一个包含 10k records 的事务”。它没有测量任何
-Flow Source，也没有证明任意上层 batch 都会获得相同比例。
+Flow Scan，也没有证明任意上层 batch 都会获得相同比例。
 
 ### Prefix GC
 
@@ -285,7 +285,7 @@ durable overwrite 也出现约 0.8–2.7 ms/事务的整轮变化。这个波动
 - 可以说：固定宽度 value 的 committed hot get 可以避免临时 `Vec`，Cell 实测约降低 17% 延迟。
 - 可以说：OrderedMap 的 bounded Cow visitor 在同形 64 B full scan A/B 中稳定改善 23%–30%。
 - 可以说：warm committed wide-value scan 中，只读少数字段时 projection 可跳过完整业务对象物化。
-- 不可以说：Flow、Source 或 Station 吞吐已经提高相同比例；本报告没有测这些上层策略。
+- 不可以说：Flow、Scan 或 Station 吞吐已经提高相同比例；本报告没有测这些上层策略。
 - 不可以说：1 KiB/8 KiB durable append 已稳定变快；配对结果不支持。
 - 不可以说：OrderedMap scan 是零拷贝；它仍保留有界私有 Cow 页，dirty page 也可能物化。
 - 不可以说：所有 `StoreValue` 都会更快；返回 `Vec`/`String` 时仍需拥有结果。

@@ -10,8 +10,8 @@ use dogpaddle_operation::{
     ExpressionBindError, OperationBindError, OperationDefinition, ScalarValue, cast, col,
     encode_definition, lit,
     operation::{
+        scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition, SqliteSinkSchemaError},
-        source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, FilterDefinition, FilterSchemaError, ProjectDefinition,
             ProjectSchemaError, RunningEventCountDefinition, SchemaAlignDefinition,
@@ -32,12 +32,12 @@ fn build_reports_the_exact_project_schema_rejection_without_creating_a_store() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let project = factory.station("project", ProjectDefinition::new([1]));
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(project, CAPACITY);
-    factory.connect([source], project);
+    factory.connect([scan], project);
     factory.connect([project], sink);
 
     let Err(FlowError::Schema(error)) = factory.build() else {
@@ -104,18 +104,18 @@ fn build_reports_select_and_union_schema_rejections_without_store_side_effects()
 
     let union_path = root.path().join("union");
     let mut factory = FlowFactory::new(&union_path);
-    let left = factory.station("left", SequenceSourceDefinition::new(0));
-    let right_source = factory.station("right-source", SequenceSourceDefinition::new(0));
+    let left = factory.station("left", SequenceScanDefinition::new(0));
+    let right_scan = factory.station("right-scan", SequenceScanDefinition::new(0));
     let right = factory.station("right", RunningEventCountDefinition::new());
     let union = factory.station(
         "union",
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
     );
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [left, right_source, right, union] {
+    for station in [left, right_scan, right, union] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([right_source], right);
+    factory.connect([right_scan], right);
     factory.connect([left, right], union);
     factory.connect([union], sink);
 
@@ -182,12 +182,12 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let project = factory.station("project", ProjectDefinition::new([0]));
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(project, CAPACITY);
-    factory.connect([source], project);
+    factory.connect([scan], project);
     factory.connect([project], sink);
     drop(factory.build().unwrap());
 
@@ -285,20 +285,20 @@ fn open_rebinds_decoded_select_and_union_definitions() {
     assert_eq!(valid_operation.len(), invalid_operation.len());
 
     let mut factory = FlowFactory::new(&union_path);
-    let left_source = factory.station("left-source", SequenceSourceDefinition::new(0));
+    let left_scan = factory.station("left-scan", SequenceScanDefinition::new(0));
     let left = factory.station("left", valid_select.clone());
-    let right_source = factory.station("right-source", SequenceSourceDefinition::new(0));
+    let right_scan = factory.station("right-scan", SequenceScanDefinition::new(0));
     let right = factory.station("right", valid_select);
     let union = factory.station(
         "union",
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
     );
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [left_source, left, right_source, right, union] {
+    for station in [left_scan, left, right_scan, right, union] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([left_source], left);
-    factory.connect([right_source], right);
+    factory.connect([left_scan], left);
+    factory.connect([right_scan], right);
     factory.connect([left, right], union);
     factory.connect([union], sink);
     drop(factory.build().unwrap());
@@ -358,7 +358,7 @@ fn select_and_repeated_input_union_run_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX));
     let select = factory.station(
         "select",
         SelectDefinition::try_new([("is_max", col("value").eq(lit(u64::MAX)))]).unwrap(),
@@ -369,10 +369,10 @@ fn select_and_repeated_input_union_run_across_reopen() {
     );
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [source, select, union, count] {
+    for station in [scan, select, union, count] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([source], select);
+    factory.connect([scan], select);
     factory.connect([select, select], union);
     factory.connect([union], count);
     factory.connect([count], sink);
@@ -419,7 +419,7 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 1));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX - 1));
     let extend = factory.station(
         "extend",
         ExtendDefinition::try_new("keep", col("value").eq(lit(u64::MAX - 1))).unwrap(),
@@ -428,10 +428,10 @@ fn extend_filter_project_chain_runs_and_reopens_with_derived_schemas() {
     let project = factory.station("project", ProjectDefinition::new([0]));
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [source, extend, filter, project, count] {
+    for station in [scan, extend, filter, project, count] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([source], extend);
+    factory.connect([scan], extend);
     factory.connect([extend], filter);
     factory.connect([filter], project);
     factory.connect([project], count);
@@ -476,7 +476,7 @@ fn schema_align_runs_and_reopens_with_explicit_schema_contract() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 1));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX - 1));
     let align = factory.station(
         "schema-align",
         SchemaAlignDefinition::try_new_with_metadata(
@@ -497,10 +497,10 @@ fn schema_align_runs_and_reopens_with_explicit_schema_contract() {
     );
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [source, align, count] {
+    for station in [scan, align, count] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([source], align);
+    factory.connect([scan], align);
     factory.connect([align], count);
     factory.connect([count], sink);
     drop(factory.build().unwrap());
@@ -548,7 +548,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(1));
+    let scan = factory.station("scan", SequenceScanDefinition::new(1));
     let align = factory.station(
         "schema-align",
         SchemaAlignDefinition::try_new([
@@ -597,10 +597,10 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     let filter = factory.station("filter", FilterDefinition::try_new(col("keep")).unwrap());
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [source, align, project, select, extend, filter, count] {
+    for station in [scan, align, project, select, extend, filter, count] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([source], align);
+    factory.connect([scan], align);
     factory.connect([align], project);
     factory.connect([project], select);
     factory.connect([select], extend);
@@ -634,14 +634,14 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX));
     let project = factory.station("project", ProjectDefinition::new([]));
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
-    for station in [source, project, count] {
+    for station in [scan, project, count] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
-    factory.connect([source], project);
+    factory.connect([scan], project);
     factory.connect([project], count);
     factory.connect([count], sink);
     drop(factory.build().unwrap());
@@ -724,15 +724,15 @@ fn build_select_sqlite_flow(
     select: SelectDefinition,
 ) -> Result<dogpaddle_flow::Flow, FlowError> {
     let mut factory = FlowFactory::new(flow_path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let select = factory.station("select", select);
     let sqlite = factory.station(
         "sqlite",
         SqliteSinkDefinition::try_new(sqlite_path, "events").unwrap(),
     );
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(select, CAPACITY);
-    factory.connect([source], select);
+    factory.connect([scan], select);
     factory.connect([select], sqlite);
     factory.build()
 }
@@ -755,12 +755,12 @@ where
     D: OperationDefinition,
 {
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let operation = factory.station(station_id, definition);
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(operation, CAPACITY);
-    factory.connect([source], operation);
+    factory.connect([scan], operation);
     factory.connect([operation], sink);
     let Err(FlowError::Schema(error)) = factory.build() else {
         panic!("schema-incompatible Flow did not return FlowError::Schema");
@@ -779,12 +779,12 @@ where
     assert_eq!(valid_operation.len(), invalid_operation.len());
 
     let mut factory = FlowFactory::new(path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let operation = factory.station(station_id, valid);
     let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(source, CAPACITY);
+    factory.output_capacity_bytes(scan, CAPACITY);
     factory.output_capacity_bytes(operation, CAPACITY);
-    factory.connect([source], operation);
+    factory.connect([scan], operation);
     factory.connect([operation], sink);
     drop(factory.build().unwrap());
 

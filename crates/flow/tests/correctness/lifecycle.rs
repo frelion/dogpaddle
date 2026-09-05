@@ -2,8 +2,7 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition,
-    transform::RunningEventCountDefinition,
+    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
 
@@ -14,29 +13,29 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let chain_source = builder.station("chain-source", SequenceSourceDefinition::new(u64::MAX - 1));
+    let chain_scan = builder.station("chain-scan", SequenceScanDefinition::new(u64::MAX - 1));
     let count = builder.station("count", RunningEventCountDefinition::new());
     let chain_sink = builder.station("chain-sink", DiscardDefinition::new());
-    let fanout_source = builder.station("fanout-source", SequenceSourceDefinition::new(u64::MAX));
+    let fanout_scan = builder.station("fanout-scan", SequenceScanDefinition::new(u64::MAX));
     let first_sink = builder.station("first-fanout-sink", DiscardDefinition::new());
     let second_sink = builder.station("second-fanout-sink", DiscardDefinition::new());
-    for station in [chain_source, count, fanout_source] {
+    for station in [chain_scan, count, fanout_scan] {
         builder.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
     }
-    builder.connect([chain_source], count);
+    builder.connect([chain_scan], count);
     builder.connect([count], chain_sink);
-    builder.connect([fanout_source], first_sink);
-    builder.connect([fanout_source], second_sink);
+    builder.connect([fanout_scan], first_sink);
+    builder.connect([fanout_scan], second_sink);
     let flow = builder.build().unwrap();
     assert_eq!(
         (flow.path(), flow.station_ids().collect::<Vec<_>>()),
         (
             path.as_path(),
             vec![
-                "chain-source",
+                "chain-scan",
                 "count",
                 "chain-sink",
-                "fanout-source",
+                "fanout-scan",
                 "first-fanout-sink",
                 "second-fanout-sink",
             ]
@@ -59,10 +58,10 @@ fn assert_completed_state(path: &Path) {
     let store = Store::open(path).unwrap();
     let positions: [Cell<u64>; 2] = [
         store
-            .open_data("station/00000000/operation/sequence_source.position")
+            .open_data("station/00000000/operation/sequence_scan.position")
             .unwrap(),
         store
-            .open_data("station/00000003/operation/sequence_source.position")
+            .open_data("station/00000003/operation/sequence_scan.position")
             .unwrap(),
     ];
     let count: Cell<u64> = store
@@ -108,10 +107,10 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let source = builder.station("source", SequenceSourceDefinition::new(0));
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    builder.connect([source], sink);
+    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
+    builder.connect([scan], sink);
     let flow = builder.build().unwrap();
 
     assert!(matches!(
@@ -129,7 +128,7 @@ fn build_and_open_support_many_station_output_logs() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let mut previous = builder.station("source", SequenceSourceDefinition::new(0));
+    let mut previous = builder.station("scan", SequenceScanDefinition::new(0));
     builder.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..OUTPUT_STATION_COUNT {
         let current = builder.station(format!("count-{index}"), RunningEventCountDefinition::new());

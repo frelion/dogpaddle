@@ -1,4 +1,4 @@
-//! Run with `cargo run -p dogpaddle-operation --example queue_source`.
+//! Run with `cargo run -p dogpaddle-operation --example queue_scan`.
 //!
 //! This standalone caller demonstrates Operation + Store. Production Flow uses
 //! Station for transactions, Schema guards, capacity, and input completion.
@@ -8,10 +8,10 @@ use dogpaddle_change::encode_change;
 use dogpaddle_operation::operation::{Action, Operation, OperationError, Turn};
 use dogpaddle_store::{AppendLog, Cell, Store};
 
-#[path = "support/queue_source.rs"]
-mod queue_source;
+#[path = "support/queue_scan.rs"]
+mod queue_scan;
 
-use queue_source::QueueSource;
+use queue_scan::QueueScan;
 
 fn main() -> Result<(), OperationError> {
     let root = tempfile::tempdir()?;
@@ -25,13 +25,13 @@ fn main() -> Result<(), OperationError> {
     // emit 20 and 30, then observe Idle. No runtime client survives the reopen.
     for turns in [2, 4] {
         let store = Store::open(&path)?;
-        let mut source = QueueSource::new(store.open_data("checkpoint")?);
+        let mut scan = QueueScan::new(store.open_data("checkpoint")?);
         let output: AppendLog<Vec<u8>> = store.open_data("output")?;
         let mut transactions = store.into_transactions();
         println!("opened Store with a fresh Operation");
 
         for _ in 0..turns {
-            let Turn::Ready(prepared) = source.turn(None)? else {
+            let Turn::Ready(prepared) = scan.turn(None)? else {
                 println!("idle: no records left");
                 break;
             };
@@ -52,7 +52,7 @@ fn main() -> Result<(), OperationError> {
                         .ok_or("unexpected example Schema")?;
                     Some(values.value(0))
                 }
-                Action::Complete(_) => return Err("a source cannot complete an input".into()),
+                Action::Complete(_) => return Err("a Scan cannot complete an input".into()),
             };
             transaction.commit()?;
             after_commit.run()?;

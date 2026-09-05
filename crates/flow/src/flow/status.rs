@@ -13,7 +13,7 @@ pub struct StationStatus {
     /// aggregate's progress precedence. None means unvisited or failed.
     /// This is an observation of that call, not a prediction of the next one.
     pub last_outcome: Option<AdvanceOutcome>,
-    /// Durably selected input port; None for a Source.
+    /// Durably selected input port; None for a Scan.
     pub active_input: Option<usize>,
     /// Consumer positions in declared input-port order.
     pub inputs: Vec<InputStatus>,
@@ -21,12 +21,12 @@ pub struct StationStatus {
     pub output: Option<OutputStatus>,
 }
 
-/// One input edge's position in complete Changes, not rows or source events.
+/// One input edge's position in complete Changes, not rows or input events.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputStatus {
-    /// Next upstream log offset to complete.
+    /// Next input log offset to complete.
     pub cursor: u64,
-    /// Upstream log's exclusive tail; `tail - cursor` is this edge's backlog.
+    /// Input log's exclusive tail; `tail - cursor` is this edge's backlog.
     pub tail: u64,
 }
 

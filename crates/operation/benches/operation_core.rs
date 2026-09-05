@@ -10,8 +10,8 @@ use dogpaddle_operation::{
     OperationDefinition, col, decode_definition, encode_definition, lit,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
+        scan::{SequenceScanDefinition, SequenceScanOperation},
         sink::DiscardDefinition,
-        source::{SequenceSourceDefinition, SequenceSourceOperation},
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
             RunningEventCountOperation, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
@@ -39,7 +39,7 @@ struct RunningEventCountFixture {
 struct SequenceFixture {
     transactions: Transactions,
     state: Cell<u64>,
-    operation: SequenceSourceOperation,
+    operation: SequenceScanOperation,
     expected: Option<u64>,
 }
 
@@ -98,7 +98,7 @@ impl SequenceFixture {
         let state = store
             .create_data::<Cell<u64>>("position")
             .expect("create Sequence benchmark state");
-        let operation = SequenceSourceOperation::new(SEQUENCE_START, state.clone());
+        let operation = SequenceScanOperation::new(SEQUENCE_START, state.clone());
         Self {
             transactions: store.into_transactions(),
             state,
@@ -281,7 +281,7 @@ fn codec_definitions() -> [(&'static str, Box<dyn OperationDefinition>); 9] {
         ),
         (
             "sequence",
-            Box::new(SequenceSourceDefinition::new(SEQUENCE_START)),
+            Box::new(SequenceScanDefinition::new(SEQUENCE_START)),
         ),
         (
             "union_all",

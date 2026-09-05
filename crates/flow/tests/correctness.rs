@@ -4,8 +4,8 @@ mod lifecycle;
 mod malformed;
 #[path = "correctness/persistence.rs"]
 mod persistence;
-#[path = "correctness/postgres.rs"]
-mod postgres;
+#[path = "correctness/postgres_cdc_scan.rs"]
+mod postgres_cdc_scan;
 #[path = "correctness/postgres_sink.rs"]
 mod postgres_sink;
 #[path = "correctness/runtime_corruption.rs"]

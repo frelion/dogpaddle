@@ -1,4 +1,4 @@
-//! Transform operations that consume upstream records and produce derived records.
+//! Transform operations that consume input records and produce derived records.
 
 pub(crate) mod extend;
 pub(crate) mod filter;

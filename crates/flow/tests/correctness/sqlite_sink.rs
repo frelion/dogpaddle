@@ -7,8 +7,8 @@ use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::{
     col, lit,
     operation::{
+        scan::SequenceScanDefinition,
         sink::SqliteSinkDefinition,
-        source::SequenceSourceDefinition,
         transform::{ExtendDefinition, FilterDefinition, SelectDefinition},
     },
 };
@@ -24,14 +24,14 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("sink.sqlite");
-    let source_start = u64::MAX - 2;
+    let scan_start = u64::MAX - 2;
 
-    // SequenceSource becomes idle after u64::MAX, so this emits exactly three rows.
+    // SequenceScan becomes idle after u64::MAX, so this emits exactly three rows.
     let mut factory = FlowFactory::new(&flow_path);
-    let source = factory.station("source", SequenceSourceDefinition::new(source_start));
+    let scan = factory.station("scan", SequenceScanDefinition::new(scan_start));
     let extend = factory.station(
         "extend",
-        ExtendDefinition::try_new("offset", col("value") - lit(source_start)).unwrap(),
+        ExtendDefinition::try_new("offset", col("value") - lit(scan_start)).unwrap(),
     );
     let filter = factory.station(
         "filter",
@@ -39,17 +39,17 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
     );
     let select = factory.station(
         "select",
-        SelectDefinition::try_new([("source_value", col("value")), ("offset", col("offset"))])
+        SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
             .unwrap(),
     );
     let sqlite = factory.station(
         "sqlite",
         SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap(),
     );
-    for station in [source, extend, filter, select] {
+    for station in [scan, extend, filter, select] {
         factory.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
     }
-    factory.connect([source], extend);
+    factory.connect([scan], extend);
     factory.connect([extend], filter);
     factory.connect([filter], select);
     factory.connect([select], sqlite);
@@ -79,7 +79,7 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
     let rows = sqlite_u64_rows(&sqlite_path);
     assert_eq!(rows, [(1, u64::MAX - 1, 1, 16), (2, u64::MAX, 2, 16),]);
     println!("advance outcomes: {outcomes:?}");
-    println!("SQLite rows (technical_id, source_value, offset, hash_bytes): {rows:?}");
+    println!("SQLite rows (technical_id, scan_value, offset, hash_bytes): {rows:?}");
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
     assert!(!sqlite_path.exists(), "build/open must not create SQLite");
 
     let encoded_change = encode_change(&multiplicity_change(7, 1_025)).unwrap();
-    publish_source_change(&flow_path, &encoded_change);
+    publish_scan_change(&flow_path, &encoded_change);
     let mut prepared = None;
 
     // Stop after the target transaction, before local settlement; reopen must
@@ -157,13 +157,13 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
 
 fn build_sqlite_flow(flow_path: &Path, sqlite_path: &Path) -> dogpaddle_flow::Flow {
     let mut factory = FlowFactory::new(flow_path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX));
     let sink = factory.station(
         "sqlite",
         SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
     );
-    factory.output_capacity_bytes(source, OUTPUT_CAPACITY_BYTES);
-    factory.connect([source], sink);
+    factory.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
+    factory.connect([scan], sink);
     factory.build().unwrap()
 }
 
@@ -178,10 +178,10 @@ fn multiplicity_change(value: u64, diff: i64) -> Change {
     Change::try_new(records, Int64Array::from(vec![diff])).unwrap()
 }
 
-fn publish_source_change(flow_path: &Path, encoded_change: &[u8]) {
+fn publish_scan_change(flow_path: &Path, encoded_change: &[u8]) {
     let store = Store::open(flow_path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_source.position")
+        .open_data("station/00000000/operation/sequence_scan.position")
         .unwrap();
     let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let mut transactions = store.into_transactions();
@@ -268,18 +268,18 @@ fn sqlite_u64_rows(sqlite_path: &Path) -> Vec<(i64, u64, u64, i64)> {
     let connection = sqlite_connection(sqlite_path);
     let mut statement = connection
         .prepare(
-            "SELECT \"$dogpaddle.id\", \"source_value\", \"offset\", \
+            "SELECT \"$dogpaddle.id\", \"scan_value\", \"offset\", \
                     length(\"$dogpaddle.hash\") \
              FROM \"events\" ORDER BY \"$dogpaddle.id\"",
         )
         .unwrap();
     statement
         .query_map([], |row| {
-            let source_value: Vec<u8> = row.get(1)?;
+            let scan_value: Vec<u8> = row.get(1)?;
             let offset: Vec<u8> = row.get(2)?;
             Ok((
                 row.get(0)?,
-                decode_u64_blob(source_value),
+                decode_u64_blob(scan_value),
                 decode_u64_blob(offset),
                 row.get(3)?,
             ))

@@ -11,13 +11,13 @@ use crate::{
     definition::{DataName, Sealed},
     lit,
     operation::{
+        scan::{
+            PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn, PostgresType,
+            SequenceScanDefinition,
+        },
         sink::{
             DiscardDefinition, DiscardOperation, PostgresSinkDefinition, PostgresTargetSpec,
             SqliteSinkDefinition,
-        },
-        source::{
-            PostgresColumn, PostgresSourceDefinition, PostgresSourceSpec, PostgresType,
-            SequenceSourceDefinition,
         },
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
@@ -82,7 +82,7 @@ impl OperationDefinition for TestDefinition {
 fn builtin_definitions() -> [Box<dyn OperationDefinition>; 12] {
     [
         Box::new(
-            PostgresSourceDefinition::try_new(PostgresSourceSpec {
+            PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
                 engine_name: "events".into(),
                 database: "shop".into(),
                 schema: "public".into(),
@@ -96,7 +96,7 @@ fn builtin_definitions() -> [Box<dyn OperationDefinition>; 12] {
             })
             .unwrap(),
         ),
-        Box::new(SequenceSourceDefinition::new(0)),
+        Box::new(SequenceScanDefinition::new(0)),
         Box::new(RunningEventCountDefinition::new()),
         Box::new(ProjectDefinition::new([0])),
         Box::new(FilterDefinition::try_new(lit(true)).unwrap()),
@@ -138,7 +138,7 @@ fn invalid_schema() -> SchemaRef {
 #[test]
 fn final_binding_entrypoint_enforces_every_common_output_invariant() {
     let rejected = TestDefinition {
-        kind: OperationKind::Source,
+        kind: OperationKind::Scan,
         binding: TestBinding::Rejected,
     };
     assert!(matches!(
@@ -147,7 +147,7 @@ fn final_binding_entrypoint_enforces_every_common_output_invariant() {
     ));
 
     let missing = TestDefinition {
-        kind: OperationKind::Source,
+        kind: OperationKind::Scan,
         binding: TestBinding::MissingOutput,
     };
     assert!(matches!(
@@ -165,7 +165,7 @@ fn final_binding_entrypoint_enforces_every_common_output_invariant() {
     ));
 
     let invalid = TestDefinition {
-        kind: OperationKind::Source,
+        kind: OperationKind::Scan,
         binding: TestBinding::InvalidOutput,
     };
     assert!(matches!(

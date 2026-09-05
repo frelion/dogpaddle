@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::SqliteSinkDefinition, source::SequenceSourceDefinition,
+    scan::SequenceScanDefinition, sink::SqliteSinkDefinition,
     transform::RunningEventCountDefinition,
 };
 
@@ -12,15 +12,15 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
     let path = root.path().join("flow");
     let sqlite = root.path().join("sink.sqlite");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(u64::MAX - 3));
+    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX - 3));
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station(
         "sink",
         SqliteSinkDefinition::try_new(&sqlite, "events").unwrap(),
     );
-    factory.connect([source], count);
+    factory.connect([scan], count);
     factory.connect([count], sink);
-    for station in [source, count] {
+    for station in [scan, count] {
         factory.output_capacity_bytes(station, NonZeroU64::MIN);
     }
     let mut flow = factory.build().unwrap();
@@ -30,7 +30,7 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
             .iter()
             .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
-        ["source", "count", "sink"]
+        ["scan", "count", "sink"]
     );
     assert!(
         initial

@@ -3,15 +3,15 @@ use dogpaddle_change::{Change, decode_change, encode_change};
 use dogpaddle_operation::operation::{Action, Operation, Turn};
 use dogpaddle_store::{AppendLog, Cell, ScanLimit, Store, StoreError, Transactions};
 
-#[path = "../../examples/support/queue_source.rs"]
-mod queue_source;
+#[path = "../../examples/support/queue_scan.rs"]
+mod queue_scan;
 
-use queue_source::QueueSource;
+use queue_scan::QueueScan;
 
 use super::support::{TestStore, rollback_ready};
 
 struct QueueFixture {
-    source: QueueSource,
+    scan: QueueScan,
     checkpoint: Cell<u64>,
     output: AppendLog<Vec<u8>>,
     transactions: Transactions,
@@ -28,7 +28,7 @@ impl QueueFixture {
     fn from_store(store: Store) -> Self {
         let checkpoint: Cell<u64> = store.open_data("checkpoint").unwrap();
         Self {
-            source: QueueSource::new(checkpoint.clone()),
+            scan: QueueScan::new(checkpoint.clone()),
             checkpoint,
             output: store.open_data("output").unwrap(),
             transactions: store.into_transactions(),
@@ -36,7 +36,7 @@ impl QueueFixture {
     }
 
     fn commit(&mut self) -> Action {
-        let Turn::Ready(prepared) = self.source.turn(None).unwrap() else {
+        let Turn::Ready(prepared) = self.scan.turn(None).unwrap() else {
             return Action::Idle;
         };
         let transaction = self.transactions.begin().unwrap();
@@ -51,7 +51,7 @@ impl QueueFixture {
                     .unwrap();
             }
             Action::Commit(None) => {}
-            Action::Complete(_) => panic!("a source cannot complete an input"),
+            Action::Complete(_) => panic!("a Scan cannot complete an input"),
         }
         transaction.commit().unwrap();
         after_commit.run().unwrap();
@@ -67,7 +67,7 @@ impl QueueFixture {
             .get()
             .unwrap();
         let mut values = Vec::new();
-        let scan = self
+        let batch = self
             .output
             .access(transaction.access())
             .unwrap()
@@ -81,7 +81,7 @@ impl QueueFixture {
                 },
             )
             .unwrap();
-        assert!(scan.caught_up);
+        assert!(batch.caught_up);
         transaction.commit().unwrap();
         (checkpoint, values)
     }
@@ -112,9 +112,9 @@ fn queue_initialization_is_published_only_after_commit() {
     let mut fixture = QueueFixture::create(root.path());
 
     // Neither abandoning preparation nor rolling back application initializes it.
-    drop(fixture.source.turn(None).unwrap());
+    drop(fixture.scan.turn(None).unwrap());
     assert!(matches!(
-        rollback_ready(&mut fixture.source, None, &mut fixture.transactions).unwrap(),
+        rollback_ready(&mut fixture.scan, None, &mut fixture.transactions).unwrap(),
         Action::Commit(None)
     ));
     assert!(matches!(fixture.commit(), Action::Commit(None)));
@@ -130,7 +130,7 @@ fn queue_replays_unacknowledged_work_then_advances_in_order() {
     assert!(matches!(fixture.commit(), Action::Commit(None)));
 
     for _ in 0..2 {
-        let action = rollback_ready(&mut fixture.source, None, &mut fixture.transactions).unwrap();
+        let action = rollback_ready(&mut fixture.scan, None, &mut fixture.transactions).unwrap();
         assert_eq!(emitted(action), 10);
         assert_eq!(fixture.durable_state(), (None, vec![]));
     }
@@ -138,7 +138,7 @@ fn queue_replays_unacknowledged_work_then_advances_in_order() {
     for expected in [10, 20, 30] {
         assert_eq!(emitted(fixture.commit()), expected);
     }
-    assert!(matches!(fixture.source.turn(None).unwrap(), Turn::Idle));
+    assert!(matches!(fixture.scan.turn(None).unwrap(), Turn::Idle));
     assert_eq!(fixture.durable_state(), (Some(3), vec![10, 20, 30]));
 }
 
@@ -151,7 +151,7 @@ fn queue_reopen_recovers_on_both_sides_of_commit_before_ack() {
         assert_eq!(emitted(fixture.commit()), 10);
 
         {
-            let Turn::Ready(prepared) = fixture.source.turn(None).unwrap() else {
+            let Turn::Ready(prepared) = fixture.scan.turn(None).unwrap() else {
                 panic!("second record was not available");
             };
             let transaction = fixture.transactions.begin().unwrap();
@@ -189,7 +189,7 @@ fn queue_reopen_recovers_on_both_sides_of_commit_before_ack() {
             assert_eq!(emitted(reopened.commit()), 20);
         }
         assert_eq!(emitted(reopened.commit()), 30);
-        assert!(matches!(reopened.source.turn(None).unwrap(), Turn::Idle));
+        assert!(matches!(reopened.scan.turn(None).unwrap(), Turn::Idle));
         assert_eq!(reopened.durable_state(), (Some(3), vec![10, 20, 30]));
     }
 }

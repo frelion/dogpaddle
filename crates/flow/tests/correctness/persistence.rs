@@ -2,19 +2,18 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition,
-    transform::RunningEventCountDefinition,
+    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{
     AppendLog, Cell, OrderedMap, ReadTransactionAccess, Small, Store, StoreError,
 };
 
 use super::support::{
-    build_source_sink_and_read_definition, fixture_bytes, read_published_definition,
+    build_scan_sink_and_read_definition, fixture_bytes, read_published_definition,
 };
 
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
-    include_str!("../fixtures/v1/sequence_source_running_event_count_discard.hex");
+    include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
 
 #[derive(Clone, Copy)]
 enum ResourceFault {
@@ -68,7 +67,7 @@ fn build_uses_the_stable_resource_layout_and_input_origins() {
 #[test]
 fn open_classifies_each_required_station_resource_fault() {
     let root = tempfile::tempdir().unwrap();
-    let definition = build_source_sink_and_read_definition(&root.path().join("complete"));
+    let definition = build_scan_sink_and_read_definition(&root.path().join("complete"));
     for (name, fault) in [
         ("missing-output", ResourceFault::MissingOutput),
         ("missing-position", ResourceFault::MissingPosition),
@@ -88,7 +87,7 @@ fn open_classifies_each_required_station_resource_fault() {
             ResourceFault::MissingPosition => assert!(matches!(
                 error,
                 FlowError::MissingResource { name }
-                    if name == "station/00000000/operation/sequence_source.position"
+                    if name == "station/00000000/operation/sequence_scan.position"
             )),
             ResourceFault::WrongOutputSize => assert!(matches!(
                 error,
@@ -121,7 +120,7 @@ fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault
     }
     if !matches!(fault, ResourceFault::MissingPosition) {
         store
-            .create_data::<Cell<u64>>("station/00000000/operation/sequence_source.position")
+            .create_data::<Cell<u64>>("station/00000000/operation/sequence_scan.position")
             .unwrap();
     }
     let mut transactions = store.into_transactions();
@@ -151,12 +150,12 @@ fn open_rejects_an_unpublished_build() {
 
 fn build_chain(path: &Path) {
     let mut builder = FlowFactory::new(path);
-    let source = builder.station("source", SequenceSourceDefinition::new(7));
+    let scan = builder.station("scan", SequenceScanDefinition::new(7));
     let count = builder.station("count", RunningEventCountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([source], count);
+    builder.connect([scan], count);
     builder.connect([count], sink);
-    builder.output_capacity_bytes(source, NonZeroU64::new(1_024).unwrap());
+    builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
     builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
     drop(builder.build().unwrap());
 }

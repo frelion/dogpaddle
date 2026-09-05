@@ -20,19 +20,19 @@ use dogpaddle_operation::{
     DataInstances, OperationDefinition, RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
+        scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
         sink::{PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
-        source::{PostgresSourceConfig, PostgresSourceDefinition},
     },
 };
 use dogpaddle_store::{AppendLog, Cell, ScanLimit, Store, Transactions};
 use serde_json::{Value, json};
 
-const SOURCE_CHECKPOINT: &str = "postgres_source.checkpoint";
+const SCAN_CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
 
 struct Options {
     mode: String,
     root: PathBuf,
-    config: PostgresSourceConfig,
+    config: PostgresCdcScanConfig,
     table: String,
     slot: String,
     publication: String,
@@ -48,7 +48,7 @@ impl Options {
                     .into(),
             );
         };
-        let config = PostgresSourceConfig::new_unencrypted(
+        let config = PostgresCdcScanConfig::new_unencrypted(
             bundle,
             "127.0.0.1",
             port.parse()?,
@@ -67,8 +67,8 @@ impl Options {
         })
     }
 
-    fn definition(&self) -> Result<PostgresSourceDefinition, OperationError> {
-        Ok(PostgresSourceDefinition::try_new(self.config.discover(
+    fn definition(&self) -> Result<PostgresCdcScanDefinition, OperationError> {
+        Ok(PostgresCdcScanDefinition::try_new(self.config.discover(
             &format!("dogpaddle_gate_{}", self.table),
             "public",
             &self.table,
@@ -82,7 +82,7 @@ fn main() -> Result<(), OperationError> {
     let options = Options::read()?;
     let mut runner = match options.mode.as_str() {
         "flow" | "flow-pg" => Runner::Flow(open_flow(options)?),
-        "direct" => Runner::Direct(DirectSource::open(options)?),
+        "direct" => Runner::Direct(DirectScan::open(options)?),
         _ => return Err("mode must be flow, flow-pg or direct".into()),
     };
     respond(&json!({"kind": "ready"}))?;
@@ -112,7 +112,7 @@ fn respond(response: &Value) -> Result<(), OperationError> {
 
 enum Runner {
     Flow(Flow),
-    Direct(DirectSource),
+    Direct(DirectScan),
 }
 
 impl Runner {
@@ -121,11 +121,10 @@ impl Runner {
             (Self::Flow(flow), "advance") => {
                 Ok(json!({"kind": "advance", "outcome": format!("{:?}", flow.advance()?)}))
             }
-            (Self::Direct(source), "read") => source.read(),
-            (
-                Self::Direct(source),
-                "advance" | "rollback" | "crash-before-ack" | "backpressure",
-            ) => source.advance(command),
+            (Self::Direct(scan), "read") => scan.read(),
+            (Self::Direct(scan), "advance" | "rollback" | "crash-before-ack" | "backpressure") => {
+                scan.advance(command)
+            }
             _ => Err("unsupported gate command".into()),
         }
     }
@@ -152,7 +151,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
         }
         return Ok(factory.open()?);
     }
-    let source = factory.station("pg", options.definition()?);
+    let scan = factory.station("pg", options.definition()?);
     let sink = if let Some(config) = &sink_config {
         let target = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
         factory.station("sink", PostgresSinkDefinition::try_new(target)?)
@@ -163,8 +162,8 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
         )
     };
     // One retained entry at a time, with the normal empty-log oversize rule.
-    factory.output_capacity_bytes(source, NonZeroU64::MIN);
-    factory.connect([source], sink);
+    factory.output_capacity_bytes(scan, NonZeroU64::MIN);
+    factory.connect([scan], sink);
     factory.resource("pg", options.config)?;
     if let Some(config) = sink_config {
         factory.resource("sink", config)?;
@@ -172,16 +171,16 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
     Ok(factory.build()?)
 }
 
-struct DirectSource {
-    source: Box<dyn Operation>,
+struct DirectScan {
+    scan: Box<dyn Operation>,
     checkpoint: Cell<Vec<u8>>,
     output: AppendLog<Vec<u8>>,
     transactions: Transactions,
 }
 
-impl DirectSource {
+impl DirectScan {
     fn open(options: Options) -> Result<Self, OperationError> {
-        let path = options.root.join("source");
+        let path = options.root.join("scan");
         if !path.exists() {
             Self::create(&path, &options.definition()?)?;
         }
@@ -202,8 +201,8 @@ impl DirectSource {
             data.insert(declaration.open(&store, declaration.name())?)?;
         }
         Ok(Self {
-            source: binding.materialize(data, RuntimeResource::new(options.config))?,
-            checkpoint: store.open_data(SOURCE_CHECKPOINT)?,
+            scan: binding.materialize(data, RuntimeResource::new(options.config))?,
+            checkpoint: store.open_data(SCAN_CHECKPOINT)?,
             output: store.open_data("output")?,
             transactions: store.into_transactions(),
         })
@@ -227,7 +226,7 @@ impl DirectSource {
     }
 
     fn advance(&mut self, command: &str) -> Result<Value, OperationError> {
-        let Turn::Ready(prepared) = self.source.turn(None)? else {
+        let Turn::Ready(prepared) = self.scan.turn(None)? else {
             return Ok(json!({"kind": "idle"}));
         };
         let transaction = self.transactions.begin()?;
@@ -260,7 +259,7 @@ impl DirectSource {
                 true
             }
             Action::Commit(None) => false,
-            Action::Complete(_) => return Err("a Source cannot complete an input".into()),
+            Action::Complete(_) => return Err("a Scan cannot complete an input".into()),
         };
         if backpressured || (command == "rollback" && has_output) {
             drop(completion);

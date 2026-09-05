@@ -3,8 +3,8 @@ use dogpaddle_operation::{
     decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
-        source::{
-            PostgresColumn, PostgresSourceConfig, PostgresSourceDefinition, PostgresSourceSpec,
+        scan::{
+            PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn,
             PostgresType,
         },
     },
@@ -14,8 +14,8 @@ use std::path::Path;
 
 use super::support::decode_hex;
 
-fn definition() -> PostgresSourceDefinition {
-    PostgresSourceDefinition::try_new(PostgresSourceSpec {
+fn definition() -> PostgresCdcScanDefinition {
+    PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
         engine_name: "orders".into(),
         database: "shop".into(),
         schema: "public".into(),
@@ -30,8 +30,8 @@ fn definition() -> PostgresSourceDefinition {
     .unwrap()
 }
 
-fn config() -> PostgresSourceConfig {
-    PostgresSourceConfig::new_unencrypted(
+fn config() -> PostgresCdcScanConfig {
+    PostgresCdcScanConfig::new_unencrypted(
         "/nonexistent/dogpaddle-runtime",
         "127.0.0.1",
         1,
@@ -43,9 +43,9 @@ fn config() -> PostgresSourceConfig {
 }
 
 #[test]
-fn postgres_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
+fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     let definition = definition();
-    assert_eq!(definition.kind(), OperationKind::Source);
+    assert_eq!(definition.kind(), OperationKind::Scan);
     let bytes = encode_definition(&definition);
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0b".to_vec();
     expected.extend_from_slice(br#"{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]}"#);
@@ -58,7 +58,7 @@ fn postgres_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
             .iter()
             .map(dogpaddle_operation::DataDeclaration::name)
             .collect::<Vec<_>>(),
-        ["postgres_source.checkpoint"]
+        ["postgres_cdc_scan.checkpoint"]
     );
     let binding = decoded.bind(&[]).unwrap();
     let output = binding.output_schema().unwrap();
@@ -76,7 +76,7 @@ fn postgres_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
 }
 
 #[test]
-fn postgres_materialization_requires_one_exact_runtime_resource() {
+fn postgres_cdc_materialization_requires_one_exact_runtime_resource() {
     let definition = definition();
     let binding = (&definition as &dyn OperationDefinition).bind(&[]).unwrap();
     assert!(matches!(
@@ -95,7 +95,7 @@ fn postgres_materialization_requires_one_exact_runtime_resource() {
 }
 
 struct Fixture {
-    source: Box<dyn Operation>,
+    scan: Box<dyn Operation>,
     checkpoint: Cell<Vec<u8>>,
     transactions: Transactions,
 }
@@ -117,12 +117,12 @@ impl Fixture {
                 .unwrap();
         }
         Self {
-            source: definition
+            scan: definition
                 .bind(&[])
                 .unwrap()
                 .materialize(data, RuntimeResource::new(config()))
                 .unwrap(),
-            checkpoint: store.open_data("postgres_source.checkpoint").unwrap(),
+            checkpoint: store.open_data("postgres_cdc_scan.checkpoint").unwrap(),
             transactions: store.into_transactions(),
         }
     }
@@ -138,7 +138,7 @@ impl Fixture {
     }
 
     fn restore(&mut self, commit: bool) -> Result<(), OperationError> {
-        let Turn::Ready(prepared) = self.source.turn(None)? else {
+        let Turn::Ready(prepared) = self.scan.turn(None)? else {
             panic!("expected prepared work");
         };
         let transaction = self.transactions.begin()?;
@@ -167,7 +167,7 @@ impl Fixture {
     }
 }
 
-// The connector-neutral D2 golden is stored verbatim, without a Source envelope.
+// The connector-neutral D2 golden is stored verbatim, without an extra envelope.
 // These tests only restore its framing; connector binding is checked at start.
 fn checkpoint() -> Vec<u8> {
     decode_hex(concat!(
@@ -178,13 +178,13 @@ fn checkpoint() -> Vec<u8> {
 }
 
 #[test]
-fn postgres_initialization_and_reopen_do_not_start_external_resources() {
+fn postgres_cdc_initialization_and_reopen_do_not_start_external_resources() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state");
     drop(Fixture::create(&path));
     for _ in 0..2 {
         let mut fixture = Fixture::open(Store::open(&path).unwrap());
-        drop(fixture.source.turn(None).unwrap());
+        drop(fixture.scan.turn(None).unwrap());
         // Rollback cannot publish initialized memory state or start the JVM.
         for _ in 0..2 {
             fixture.restore(false).unwrap();
@@ -195,7 +195,7 @@ fn postgres_initialization_and_reopen_do_not_start_external_resources() {
 }
 
 #[test]
-fn postgres_restores_opaque_checkpoint_across_rollback_and_reopen_without_external_io() {
+fn postgres_cdc_restores_opaque_checkpoint_across_rollback_and_reopen_without_external_io() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state");
     let mut fixture = Fixture::create(&path);
@@ -204,7 +204,7 @@ fn postgres_restores_opaque_checkpoint_across_rollback_and_reopen_without_extern
     drop(fixture);
     for _ in 0..2 {
         let mut fixture = Fixture::open(Store::open(&path).unwrap());
-        drop(fixture.source.turn(None).unwrap());
+        drop(fixture.scan.turn(None).unwrap());
         for _ in 0..2 {
             fixture.restore(false).unwrap();
             assert_eq!(fixture.durable_checkpoint(), Some(initial.clone()));
@@ -215,7 +215,7 @@ fn postgres_restores_opaque_checkpoint_across_rollback_and_reopen_without_extern
 }
 
 #[test]
-fn postgres_restore_rejects_corrupt_checkpoint_without_initializing() {
+fn postgres_cdc_restore_rejects_corrupt_checkpoint_without_initializing() {
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::create(&root.path().join("state"));
     let valid = checkpoint();
@@ -241,7 +241,7 @@ fn postgres_restore_rejects_corrupt_checkpoint_without_initializing() {
 }
 
 #[test]
-fn postgres_schema_rejects_unsupported_precision_and_invalid_columns() {
+fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
     let column = |data_type| PostgresColumn::new("id", data_type, false);
     for columns in [
         vec![],
@@ -271,23 +271,23 @@ fn postgres_schema_rejects_unsupported_precision_and_invalid_columns() {
     ] {
         let mut spec = definition().spec().clone();
         spec.columns = columns;
-        if let Ok(definition) = PostgresSourceDefinition::try_new(spec) {
+        if let Ok(definition) = PostgresCdcScanDefinition::try_new(spec) {
             assert!((&definition as &dyn OperationDefinition).bind(&[]).is_err());
         }
     }
 }
 
 #[test]
-fn postgres_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_setup() {
+fn postgres_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_setup() {
     let debug = format!("{:?}", config());
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("do-not-persist-this-password"));
     assert!(
-        PostgresSourceConfig::new_unencrypted("relative", "host", 5432, "db", "user", "password")
+        PostgresCdcScanConfig::new_unencrypted("relative", "host", 5432, "db", "user", "password")
             .is_err()
     );
     assert!(
-        PostgresSourceConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password")
+        PostgresCdcScanConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password")
             .is_err()
     );
 }

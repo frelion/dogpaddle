@@ -28,7 +28,7 @@ const DEFAULT_ENTRIES: usize = 10_000;
 const DEFAULT_COMMITS: usize = 1_000;
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_RECORD_BYTES: &[usize] = &[128, 1_024, 8_192];
-const DEFAULT_SOURCE_BATCH_ITEMS: &[usize] = &[1, 64, 1_024];
+const DEFAULT_APPEND_BATCH_ITEMS: &[usize] = &[1, 64, 1_024];
 const DEFAULT_STATION_RECORD_BYTES: usize = 1_024;
 const DEFAULT_STATION_BATCH_ITEMS: usize = 1_024;
 const DEFAULT_GC_ITEMS: usize = 1_024;
@@ -43,7 +43,7 @@ struct AppendConfiguration<'a> {
     commits: usize,
     samples: usize,
     record_sizes: &'a [usize],
-    source_batches: &'a [usize],
+    append_batches: &'a [usize],
     station_record_bytes: usize,
     station_batch_items: usize,
     gc_items: usize,
@@ -58,7 +58,7 @@ impl AppendConfiguration<'static> {
                 commits: 1,
                 samples: 1,
                 record_sizes: &[16, 64],
-                source_batches: &[1, 2],
+                append_batches: &[1, 2],
                 station_record_bytes: 16,
                 station_batch_items: 1,
                 gc_items: 1,
@@ -69,7 +69,7 @@ impl AppendConfiguration<'static> {
                 commits: DEFAULT_COMMITS,
                 samples: DEFAULT_SAMPLES,
                 record_sizes: DEFAULT_RECORD_BYTES,
-                source_batches: DEFAULT_SOURCE_BATCH_ITEMS,
+                append_batches: DEFAULT_APPEND_BATCH_ITEMS,
                 station_record_bytes: DEFAULT_STATION_RECORD_BYTES,
                 station_batch_items: DEFAULT_STATION_BATCH_ITEMS,
                 gc_items: DEFAULT_GC_ITEMS,
@@ -87,7 +87,7 @@ fn main() {
         commits,
         samples,
         record_sizes,
-        source_batches,
+        append_batches,
         station_record_bytes,
         station_batch_items,
         gc_items,
@@ -98,7 +98,7 @@ fn main() {
     assert!(station_batch_items > 0 && gc_items > 0);
     assert!(station_record_bytes >= RECORD_HEADER_BYTES);
     assert!(record_sizes.iter().all(|size| *size >= RECORD_HEADER_BYTES));
-    assert!(source_batches.iter().all(|size| *size > 0));
+    assert!(append_batches.iter().all(|size| *size > 0));
     assert!(readers.iter().all(|count| *count > 0));
     let mut plan = Plan::new(profile, configuration_fields(&config));
     let mut cases = benchmark_plan(&mut plan, &config);
@@ -117,7 +117,7 @@ fn main() {
         station_batch_items,
         record_sizes,
     );
-    benchmark_durable_source(&mut run, &mut cases, &bench_root, &config);
+    benchmark_durable_appends(&mut run, &mut cases, &bench_root, &config);
     benchmark_station_transactions(&mut run, &mut cases, &bench_root, &config);
     cases.finish();
     run.finish(|| {});
@@ -136,7 +136,7 @@ fn configuration_fields(config: &AppendConfiguration<'_>) -> Fields {
         fields.insert(name, value);
     }
     fields.insert("record_bytes", config.record_sizes);
-    fields.insert("source_batch_items", config.source_batches);
+    fields.insert("append_batch_items", config.append_batches);
     fields.insert("readers", config.readers);
     fields
         .with("execution", "single_thread")
@@ -147,7 +147,7 @@ fn configuration_fields(config: &AppendConfiguration<'_>) -> Fields {
 fn benchmark_plan(plan: &mut Plan, config: &AppendConfiguration<'_>) -> FrozenCases {
     let mut cases = FrozenCases::new();
     plan_record_widths(plan, &mut cases, config);
-    plan_durable_source(plan, &mut cases, config);
+    plan_durable_appends(plan, &mut cases, config);
     plan_station_transactions(plan, &mut cases, config);
     cases
 }
@@ -204,8 +204,12 @@ fn plan_record_widths(plan: &mut Plan, cases: &mut FrozenCases, config: &AppendC
     }
 }
 
-fn plan_durable_source(plan: &mut Plan, cases: &mut FrozenCases, config: &AppendConfiguration<'_>) {
-    for &batch_items in config.source_batches {
+fn plan_durable_appends(
+    plan: &mut Plan,
+    cases: &mut FrozenCases,
+    config: &AppendConfiguration<'_>,
+) {
+    for &batch_items in config.append_batches {
         let measured_entries = config
             .entries
             .min(config.commits.saturating_mul(batch_items));
@@ -213,7 +217,7 @@ fn plan_durable_source(plan: &mut Plan, cases: &mut FrozenCases, config: &Append
         cases.single(
             plan,
             LogCase::new(
-                format!("source append b{batch_items} ({transactions} tx)"),
+                format!("durable append b{batch_items} ({transactions} tx)"),
                 measured_entries,
                 config.station_record_bytes,
                 transactions,
@@ -289,7 +293,7 @@ fn plan_station_transactions(
         cases.single(
             plan,
             LogCase::new(
-                format!("downstream replay x{reader_count} ({reader_transactions} tx)"),
+                format!("consumer replay x{reader_count} ({reader_transactions} tx)"),
                 deliveries,
                 config.station_record_bytes,
                 reader_transactions,
@@ -376,7 +380,7 @@ fn benchmark_record_widths(
     }
 }
 
-fn benchmark_durable_source(
+fn benchmark_durable_appends(
     run: &mut Run,
     plan: &mut FrozenCases,
     bench_root: &BenchRoot,
@@ -385,14 +389,14 @@ fn benchmark_durable_source(
     let entries = config.entries;
     let record_bytes = config.station_record_bytes;
     let records = make_records(entries, record_bytes);
-    for &batch_items in config.source_batches {
+    for &batch_items in config.append_batches {
         let measured_entries = entries.min(config.commits.saturating_mul(batch_items));
         let transactions = measured_entries.div_ceil(batch_items);
         report_log(
             run,
             plan,
             &LogCase::new(
-                format!("source append b{batch_items} ({transactions} tx)"),
+                format!("durable append b{batch_items} ({transactions} tx)"),
                 measured_entries,
                 record_bytes,
                 transactions,
@@ -454,7 +458,7 @@ fn benchmark_station_transactions(
             run,
             plan,
             &LogCase::new(
-                format!("downstream replay x{reader_count} ({reader_transactions} tx)"),
+                format!("consumer replay x{reader_count} ({reader_transactions} tx)"),
                 deliveries,
                 record_bytes,
                 reader_transactions,

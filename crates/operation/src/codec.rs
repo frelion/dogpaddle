@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     OperationDefinition,
-    operation::{sink, source, transform},
+    operation::{scan, sink, transform},
 };
 
 const MAGIC: &[u8] = b"dogpaddle.operation\0";
@@ -11,8 +11,11 @@ const FORMAT_VERSION: u16 = 1;
 pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
 
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
-    (source::postgres::TAG, source::postgres::decode_definition),
-    (source::sequence::TAG, source::sequence::decode_definition),
+    (
+        scan::postgres_cdc::TAG,
+        scan::postgres_cdc::decode_definition,
+    ),
+    (scan::sequence::TAG, scan::sequence::decode_definition),
     (
         transform::running_event_count::TAG,
         transform::running_event_count::decode_definition,

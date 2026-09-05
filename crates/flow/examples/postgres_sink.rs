@@ -13,12 +13,12 @@ use std::{
 
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
+    scan::SequenceScanDefinition,
     sink::{PostgresSinkConfig, PostgresSinkDefinition},
-    source::SequenceSourceDefinition,
 };
 use serde_json::json;
 
-const SOURCE_ID: &str = "sequence";
+const SCAN_ID: &str = "sequence";
 const SINK_ID: &str = "postgres";
 const TARGET_SINK_ID: &str = "gate_sink";
 const TARGET_TABLE: &str = "events";
@@ -87,10 +87,10 @@ fn main() -> Result<(), GateError> {
 fn build_flow(path: &Path, config: PostgresSinkConfig) -> Result<Flow, GateError> {
     let target = config.discover_target(TARGET_SINK_ID, "public", TARGET_TABLE)?;
     let mut factory = FlowFactory::new(path);
-    let source = factory.station(SOURCE_ID, SequenceSourceDefinition::new(FIRST_VALUE));
+    let scan = factory.station(SCAN_ID, SequenceScanDefinition::new(FIRST_VALUE));
     let sink = factory.station(SINK_ID, PostgresSinkDefinition::try_new(target)?);
-    factory.output_capacity_bytes(source, NonZeroU64::MAX);
-    factory.connect([source], sink);
+    factory.output_capacity_bytes(scan, NonZeroU64::MAX);
+    factory.connect([scan], sink);
     factory.resource(SINK_ID, config)?;
     Ok(factory.build()?)
 }

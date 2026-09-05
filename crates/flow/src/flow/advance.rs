@@ -26,9 +26,9 @@ impl AdvanceOutcome {
 impl Flow {
     /// Runs one bounded scheduling round in deterministic topological order.
     ///
-    /// Every Station receives at most one turn. An upstream Station's committed
-    /// output is therefore visible to downstream intake later in the same
-    /// round, while an unbounded source cannot monopolize the call. Completing
+    /// Every Station receives at most one turn. An input Station's committed
+    /// output is therefore visible to its consumers later in the same
+    /// round, while an unbounded Scan cannot monopolize the call. Completing
     /// an input advances its consumer frontier and, when all consumers have
     /// completed the physical head, reclaims that one entry in the same
     /// transaction. Backpressure never short-circuits the remaining schedule.

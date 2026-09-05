@@ -1,4 +1,4 @@
-//! Sink operations that consume records without producing downstream output.
+//! Sink operations that consume records without producing output.
 
 mod relation;
 

@@ -42,7 +42,7 @@ pub enum FlowError {
     /// The durable Flow definition cannot be encoded or decoded.
     #[error(transparent)]
     Definition(#[from] FlowDefinitionError),
-    /// One Station rejected the exact Schemas supplied by its upstreams.
+    /// One Station rejected the exact Schemas supplied through its inputs.
     #[error(transparent)]
     Schema(#[from] FlowSchemaError),
     /// Store creation, lookup, transaction, or persistence failed.

@@ -3,8 +3,8 @@ use std::num::{NonZeroU32, NonZeroU64};
 use dogpaddle_operation::{
     OperationDefinition, OperationKind,
     operation::{
+        scan::SequenceScanDefinition,
         sink::DiscardDefinition,
-        source::SequenceSourceDefinition,
         transform::{RunningEventCountDefinition, UnionAllDefinition},
     },
 };
@@ -22,8 +22,8 @@ use super::{
     validate::{validate_acyclic, validate_connections},
 };
 
-fn source(start: u64) -> SequenceSourceDefinition {
-    SequenceSourceDefinition::new(start)
+fn scan(start: u64) -> SequenceScanDefinition {
+    SequenceScanDefinition::new(start)
 }
 
 fn count() -> RunningEventCountDefinition {
@@ -58,21 +58,18 @@ fn declare_output_capacities(builder: &mut FlowFactory) {
     }
 }
 
-fn finish_with_target<D>(
-    operation: D,
-    upstream_count: usize,
-) -> Result<FlowDefinition, TopologyError>
+fn finish_with_target<D>(operation: D, input_count: usize) -> Result<FlowDefinition, TopologyError>
 where
     D: OperationDefinition,
 {
     let mut builder = factory();
     let has_output = operation.kind().has_output();
-    let upstreams = (0..upstream_count)
-        .map(|index| builder.station(format!("source-{index}"), source(index as u64)))
+    let inputs = (0..input_count)
+        .map(|index| builder.station(format!("scan-{index}"), scan(index as u64)))
         .collect::<Vec<_>>();
     let target = builder.station("target", operation);
-    if !upstreams.is_empty() {
-        builder.connect(upstreams, target);
+    if !inputs.is_empty() {
+        builder.connect(inputs, target);
     }
     if has_output {
         let sink = builder.station("sink", discard());
@@ -83,23 +80,23 @@ where
 }
 
 #[test]
-fn connection_validation_preserves_n_ary_order_and_repeated_sources() {
+fn connection_validation_preserves_n_ary_order_and_repeated_inputs() {
     let mut builder = factory();
-    let first = builder.station("first", source(1));
-    let second = builder.station("second", source(2));
+    let first = builder.station("first", scan(1));
+    let second = builder.station("second", scan(2));
     let target = builder.station("target", count());
     builder.connect([second, first, second], target);
 
-    let sources =
+    let inputs =
         validate_connections(builder.token, &builder.stations, &builder.connections).unwrap();
 
-    assert_eq!(sources[target.index].as_deref(), Some([1, 0, 1].as_slice()));
-    assert_eq!(validate_acyclic(builder.stations.len(), &sources), Ok(()));
+    assert_eq!(inputs[target.index].as_deref(), Some([1, 0, 1].as_slice()));
+    assert_eq!(validate_acyclic(builder.stations.len(), &inputs), Ok(()));
 }
 
 #[test]
 fn finish_rejects_forbidden_or_excess_inputs() {
-    assert_input_count(finish_with_target(source(0), 1), 0, 1);
+    assert_input_count(finish_with_target(scan(0), 1), 0, 1);
     assert_input_count(finish_with_target(count(), 2), 1, 2);
     let union = || UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
     assert_input_count(finish_with_target(union(), 1), 2, 1);
@@ -151,7 +148,7 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                         if parents[index].is_some() {
                             builder.station(id, count())
                         } else {
-                            builder.station(id, source(index as u64))
+                            builder.station(id, scan(index as u64))
                         }
                     })
                     .collect::<Vec<_>>();
@@ -185,29 +182,29 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                             expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
                             "{graph}: declaration order changed"
                         );
-                        for (target, station) in
+                        for (station_index, station) in
                             definition.stations.iter().take(station_count).enumerate()
                         {
-                            let expected_kind = parents[target]
-                                .map_or(OperationKind::Source, |_| {
+                            let expected_kind = parents[station_index]
+                                .map_or(OperationKind::Scan, |_| {
                                     OperationKind::Transform(NonZeroU32::MIN)
                                 });
                             assert_eq!(station.operation().kind(), expected_kind, "{graph}");
-                            let expected_sources = parents[target]
+                            let expected_inputs = parents[station_index]
                                 .map(|parent| vec![station_id(parent)])
                                 .unwrap_or_default();
                             assert_eq!(
-                                station.sources, expected_sources,
-                                "{graph}: source order changed for target {target}"
+                                station.inputs, expected_inputs,
+                                "{graph}: input order changed for station {station_index}"
                             );
                         }
                         for (&leaf, station) in
                             leaves.iter().zip(&definition.stations[station_count..])
                         {
                             assert_eq!(
-                                station.sources,
+                                station.inputs,
                                 [station_id(leaf)],
-                                "{graph}: sink source changed for leaf {leaf}"
+                                "{graph}: sink input changed for leaf {leaf}"
                             );
                         }
                     }
@@ -279,21 +276,21 @@ fn station_id(index: usize) -> String {
 
 fn codec_definition() -> FlowDefinition {
     let mut builder = factory();
-    let source = builder.station("source", source(7));
+    let scan = builder.station("scan", scan(7));
     let count = builder.station("count", count());
     let sink = builder.station("sink", discard());
-    builder.connect([source], count);
+    builder.connect([scan], count);
     builder.connect([count], sink);
     declare_output_capacities(&mut builder);
     builder.finish_definition().unwrap()
 }
 
-fn codec_definition_with_ids(source_id: &str, count_id: &str) -> FlowDefinition {
+fn codec_definition_with_ids(scan_id: &str, count_id: &str) -> FlowDefinition {
     let mut builder = factory();
-    let source = builder.station(source_id, source(7));
+    let scan = builder.station(scan_id, scan(7));
     let count = builder.station(count_id, count());
     let sink = builder.station("sink", discard());
-    builder.connect([source], count);
+    builder.connect([scan], count);
     builder.connect([count], sink);
     declare_output_capacities(&mut builder);
     builder.finish_definition().unwrap()
@@ -304,7 +301,7 @@ fn decoder_round_trips_a_large_chain() {
     const STATION_COUNT: usize = 4_096;
 
     let mut builder = factory();
-    let mut previous = builder.station("station-0000", source(0));
+    let mut previous = builder.station("station-0000", scan(0));
     for index in 1..STATION_COUNT {
         let current = builder.station(format!("station-{index:04}"), count());
         builder.connect([previous], current);
@@ -324,19 +321,18 @@ fn decoder_round_trips_a_large_chain() {
 #[test]
 fn decoder_validates_capacity_against_the_decoded_operation_category() {
     let mut missing = encode(&codec_definition()).unwrap();
-    let source_start = missing
+    let scan_start = missing
         .windows(7_u64.to_be_bytes().len())
         .position(|window| window == 7_u64.to_be_bytes())
         .unwrap();
-    let source_capacity = source_start + size_of::<u64>();
-    missing[source_capacity..source_capacity + size_of::<u64>()]
-        .copy_from_slice(&0_u64.to_be_bytes());
+    let scan_capacity = scan_start + size_of::<u64>();
+    missing[scan_capacity..scan_capacity + size_of::<u64>()].copy_from_slice(&0_u64.to_be_bytes());
     let checksum_offset = missing.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&missing[..checksum_offset]);
     missing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
     assert_eq!(
         decode(&missing).unwrap_err(),
-        FlowDefinitionError::Topology(TopologyError::MissingOutputCapacity("source".to_owned()))
+        FlowDefinitionError::Topology(TopologyError::MissingOutputCapacity("scan".to_owned()))
     );
 
     let mut unexpected = encode(&codec_definition()).unwrap();
@@ -357,18 +353,18 @@ fn decoder_validates_capacity_against_the_decoded_operation_category() {
 }
 
 #[test]
-fn decoder_validates_all_station_ids_before_resolving_sources() {
+fn decoder_validates_all_station_ids_before_resolving_inputs() {
     let mut encoded = encode(&codec_definition_with_ids("first", "other")).unwrap();
     let duplicate = encoded
         .windows(b"other".len())
         .position(|window| window == b"other")
         .unwrap();
     encoded[duplicate..duplicate + b"first".len()].copy_from_slice(b"first");
-    let source_reference = encoded
+    let input_reference = encoded
         .windows(b"first".len())
         .rposition(|window| window == b"first")
         .unwrap();
-    encoded[source_reference..source_reference + b"ghost".len()].copy_from_slice(b"ghost");
+    encoded[input_reference..input_reference + b"ghost".len()].copy_from_slice(b"ghost");
     let checksum_offset = encoded.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&encoded[..checksum_offset]);
     encoded[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());

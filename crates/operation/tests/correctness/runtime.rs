@@ -18,8 +18,8 @@ use dogpaddle_operation::{
     decode_definition, encode_definition, lit,
     operation::{
         Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+        scan::{SequenceScanError, SequenceScanOperation},
         sink::{DiscardError, DiscardOperation},
-        source::{SequenceSourceError, SequenceSourceOperation},
         transform::{
             ExtendDefinition, ExtendError, FilterDefinition, FilterError, ProjectDefinition,
             ProjectError, ProjectOperation, RunningEventCountError, RunningEventCountOperation,
@@ -61,12 +61,12 @@ impl BorrowedDelivery<'_> {
     }
 }
 
-struct BorrowedDeliverySource {
+struct BorrowedDeliveryScan {
     accepted: Cell<u64>,
     connector: BorrowedDeliveryConnector,
 }
 
-impl Operation for BorrowedDeliverySource {
+impl Operation for BorrowedDeliveryScan {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
@@ -93,7 +93,7 @@ fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() 
     let mut store = Store::create(fixture.path()).unwrap();
     let accepted = store.create_data::<Cell<u64>>("accepted").unwrap();
     let acknowledgements = Arc::new(AtomicUsize::new(0));
-    let mut operation = BorrowedDeliverySource {
+    let mut operation = BorrowedDeliveryScan {
         accepted: accepted.clone(),
         connector: BorrowedDeliveryConnector {
             acknowledgements: Arc::clone(&acknowledgements),
@@ -103,12 +103,12 @@ fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() 
 
     {
         let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
-            panic!("delivery source did not prepare its polled delivery");
+            panic!("delivery Scan did not prepare its polled delivery");
         };
         let transaction = transactions.begin().unwrap();
         let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap()
         else {
-            panic!("delivery source did not stage its checkpoint");
+            panic!("delivery Scan did not stage its checkpoint");
         };
         drop(transaction);
         drop(after_commit);
@@ -128,11 +128,11 @@ fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() 
     }
 
     let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
-        panic!("delivery source did not prepare the replayed delivery");
+        panic!("delivery Scan did not prepare the replayed delivery");
     };
     let transaction = transactions.begin().unwrap();
     let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap() else {
-        panic!("delivery source did not stage its replayed checkpoint");
+        panic!("delivery Scan did not stage its replayed checkpoint");
     };
     assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
     transaction.commit().unwrap();
@@ -291,21 +291,21 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     let mut store = Store::create(fixture.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
-    let mut source = SequenceSourceOperation::new(41, position);
+    let mut scan = SequenceScanOperation::new(41, position);
     let mut transform = RunningEventCountOperation::new(count);
     let mut sink = DiscardOperation;
     let input = change(&[2, -1]);
     let mut transactions = store.into_transactions();
 
     for commit in [false, true] {
-        let source_action = if commit {
-            commit_ready(&mut source, None, &mut transactions)
+        let scan_action = if commit {
+            commit_ready(&mut scan, None, &mut transactions)
         } else {
-            rollback_ready(&mut source, None, &mut transactions)
+            rollback_ready(&mut scan, None, &mut transactions)
         }
         .unwrap();
         assert_eq!(
-            output_values(source_action, ExpectedAction::Commit, "value"),
+            output_values(scan_action, ExpectedAction::Commit, "value"),
             [41]
         );
         let transform_action = if commit {
@@ -329,14 +329,14 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let mut source =
-        SequenceSourceOperation::new(41, store.open_data::<Cell<u64>>("position").unwrap());
+    let mut scan =
+        SequenceScanOperation::new(41, store.open_data::<Cell<u64>>("position").unwrap());
     let count_state = store.open_data::<Cell<u64>>("count").unwrap();
     let mut transform = RunningEventCountOperation::new(count_state.clone());
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
-            commit_ready(&mut source, None, &mut transactions).unwrap(),
+            commit_ready(&mut scan, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -363,10 +363,10 @@ fn builtins_follow_one_stateful_action_trace_across_reopen() {
 }
 
 #[test]
-fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
+fn builtin_input_protocol_errors_and_scan_boundary_are_exact() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
-    let mut source = SequenceSourceOperation::new(
+    let mut scan = SequenceScanOperation::new(
         u64::MAX - 1,
         store.create_data::<Cell<u64>>("position").unwrap(),
     );
@@ -379,7 +379,7 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     for expected in [u64::MAX - 1, u64::MAX] {
         assert_eq!(
             output_values(
-                commit_ready(&mut source, None, &mut transactions).unwrap(),
+                commit_ready(&mut scan, None, &mut transactions).unwrap(),
                 ExpectedAction::Commit,
                 "value",
             ),
@@ -388,16 +388,16 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     }
     for _ in 0..2 {
         assert!(matches!(
-            rollback_ready(&mut source, None, &mut transactions).unwrap(),
+            rollback_ready(&mut scan, None, &mut transactions).unwrap(),
             Action::Idle
         ));
     }
 
-    let source_error =
-        rollback_ready(&mut source, Some(turn_input(&input)), &mut transactions).unwrap_err();
+    let scan_error =
+        rollback_ready(&mut scan, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
-        source_error.downcast_ref::<SequenceSourceError>(),
-        Some(SequenceSourceError::UnexpectedInput)
+        scan_error.downcast_ref::<SequenceScanError>(),
+        Some(SequenceScanError::UnexpectedInput)
     ));
 
     let count_error = rollback_ready(&mut count, None, &mut transactions).unwrap_err();
@@ -442,7 +442,7 @@ fn builtin_input_protocol_errors_and_source_boundary_are_exact() {
     let foreign_root = tempfile::tempdir().unwrap();
     let foreign = Store::create(foreign_root.path().join("foreign")).unwrap();
     let mut foreign_transactions = foreign.into_transactions();
-    let error = rollback_ready(&mut source, None, &mut foreign_transactions).unwrap_err();
+    let error = rollback_ready(&mut scan, None, &mut foreign_transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::WrongStore)

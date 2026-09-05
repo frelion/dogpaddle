@@ -11,33 +11,33 @@ use crate::{
 };
 
 use super::{
-    PostgresColumn, PostgresSourceConfig, PostgresSourceError, PostgresSourceOperation, schema,
+    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, PostgresColumn, schema,
 };
 
 pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
-const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("postgres_source.checkpoint");
+const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("postgres_cdc_scan.checkpoint");
 static DATA: [DataDeclaration; 1] = [CHECKPOINT.declaration()];
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
 /// The runtime verifies this identity against `PostgreSQL` before starting its
 /// connector. Reusing an engine name, publication, or slot for another live
-/// source is unsupported. The source does not create or delete those objects.
+/// Scan is unsupported. The Scan does not create or delete those objects.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PostgresSourceSpec {
+pub struct PostgresCdcScanSpec {
     /// Stable Debezium engine name, also used as its topic prefix.
     pub engine_name: String,
     /// `PostgreSQL` database name.
     pub database: String,
-    /// Source table's schema name.
+    /// Captured table's schema name.
     pub schema: String,
-    /// Source table name.
+    /// Captured table name.
     pub table: String,
     /// Pre-created, exclusively owned logical replication slot.
     pub slot: String,
-    /// Pre-created publication containing the complete source table.
+    /// Pre-created publication containing the complete captured table.
     pub publication: String,
     /// `PostgreSQL` cluster system identifier, preserved as decimal text.
     pub system_identifier: String,
@@ -49,46 +49,46 @@ pub struct PostgresSourceSpec {
     pub columns: Vec<PostgresColumn>,
 }
 
-/// Fixed-Schema, single-table `PostgreSQL` source using only continuous WAL CDC.
+/// Fixed-Schema, single-table `PostgreSQL` Scan using only continuous WAL CDC.
 ///
 /// Credentials and runtime bundle paths are supplied separately through
-/// [`PostgresSourceConfig`]. Construction, binding, build, and open perform no
+/// [`PostgresCdcScanConfig`]. Construction, binding, build, and open perform no
 /// `PostgreSQL` or JVM I/O. Initial snapshots and online Schema evolution are not
 /// supported by this version.
 #[derive(Clone, Debug)]
-pub struct PostgresSourceDefinition {
-    spec: PostgresSourceSpec,
+pub struct PostgresCdcScanDefinition {
+    spec: PostgresCdcScanSpec,
 }
 
-impl PostgresSourceDefinition {
-    /// Freezes a non-sensitive source specification as a persistent definition.
+impl PostgresCdcScanDefinition {
+    /// Freezes a non-sensitive Scan specification as a persistent definition.
     ///
-    /// Obtain the specification with [`PostgresSourceConfig::discover`] before
+    /// Obtain the specification with [`PostgresCdcScanConfig::discover`] before
     /// constructing a Flow. Runtime checks also protect manually supplied specs.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid identifiers or an oversized specification.
-    pub fn try_new(spec: PostgresSourceSpec) -> Result<Self, PostgresSourceError> {
+    pub fn try_new(spec: PostgresCdcScanSpec) -> Result<Self, PostgresCdcScanError> {
         validate(&spec)?;
         Ok(Self { spec })
     }
 
-    /// Returns the frozen, non-sensitive source specification.
+    /// Returns the frozen, non-sensitive Scan specification.
     #[must_use]
-    pub const fn spec(&self) -> &PostgresSourceSpec {
+    pub const fn spec(&self) -> &PostgresCdcScanSpec {
         &self.spec
     }
 }
 
-impl Sealed for PostgresSourceDefinition {
+impl Sealed for PostgresCdcScanDefinition {
     fn bind_schemas(&self, _: &[SchemaRef]) -> Result<OperationBinding, OperationSchemaError> {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
-        Ok(OperationBinding::with_resource::<PostgresSourceConfig, _>(
+        Ok(OperationBinding::with_resource::<PostgresCdcScanConfig, _>(
             Some(Arc::clone(&output)),
             move |data, config| {
-                Ok(Box::new(PostgresSourceOperation::new_bound(
+                Ok(Box::new(PostgresCdcScanOperation::new_bound(
                     spec,
                     output,
                     data.take(&CHECKPOINT)?,
@@ -99,9 +99,9 @@ impl Sealed for PostgresSourceDefinition {
     }
 }
 
-impl OperationDefinition for PostgresSourceDefinition {
+impl OperationDefinition for PostgresCdcScanDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Source
+        OperationKind::Scan
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -114,7 +114,7 @@ impl OperationDefinition for PostgresSourceDefinition {
 
     fn encode_payload(&self, output: &mut Vec<u8>) {
         // Only structs, enums, and ordered columns: serde field order is canonical.
-        output.extend(serde_json::to_vec(&self.spec).expect("source spec is JSON-serializable"));
+        output.extend(serde_json::to_vec(&self.spec).expect("scan spec is JSON-serializable"));
     }
 }
 
@@ -122,12 +122,12 @@ pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     let invalid =
-        || DefinitionCodecError::InvalidPayload("invalid PostgreSQL source specification");
+        || DefinitionCodecError::InvalidPayload("invalid PostgreSQL CDC scan specification");
     if payload.len() > MAX_DEFINITION_BYTES {
         return Err(invalid());
     }
     let spec = serde_json::from_slice(payload).map_err(|_| invalid())?;
-    let definition = PostgresSourceDefinition::try_new(spec).map_err(|_| invalid())?;
+    let definition = PostgresCdcScanDefinition::try_new(spec).map_err(|_| invalid())?;
     let mut canonical = Vec::new();
     definition.encode_payload(&mut canonical);
     if canonical != payload {
@@ -136,8 +136,8 @@ pub(crate) fn decode_definition(
     Ok(Box::new(definition))
 }
 
-fn validate(spec: &PostgresSourceSpec) -> Result<(), PostgresSourceError> {
-    let invalid = |message: &str| PostgresSourceError::InvalidDefinition(message.to_owned());
+fn validate(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError> {
+    let invalid = |message: &str| PostgresCdcScanError::InvalidDefinition(message.to_owned());
     for value in [
         &spec.engine_name,
         &spec.schema,
@@ -175,11 +175,11 @@ fn validate(spec: &PostgresSourceSpec) -> Result<(), PostgresSourceError> {
         return Err(invalid("pilot tables require between 1 and 1600 columns"));
     }
     if serde_json::to_vec(spec)
-        .map_err(|_| invalid("cannot encode source specification"))?
+        .map_err(|_| invalid("cannot encode scan specification"))?
         .len()
         > MAX_DEFINITION_BYTES
     {
-        return Err(invalid("source specification exceeds 1 MiB"));
+        return Err(invalid("scan specification exceeds 1 MiB"));
     }
     Ok(())
 }

@@ -20,7 +20,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
 3. 失败、背压、重放和进程重开是否保持同一业务结果；
-4. Source、Transform 和 Sink 是否足以承载真实数据闭环；
+4. Scan、Transform 和 Sink 是否足以承载真实数据闭环；
 5. 上层 API 能否只做解析、类型检查和 lowering，而不补救底层语义。
 
 ## 当前基线
@@ -39,8 +39,8 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 
 | 类别 | 算子 | 当前角色 | 路线判断 |
 | --- | --- | --- | --- |
-| Source | SequenceSource | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
-| Source | PostgresSource | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
+| Scan | SequenceScan | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
+| Scan | PostgresCdcScan | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
@@ -69,7 +69,7 @@ conformance，而不是让某个上层 API 反向定义运行内核。
           │ 解析、类型检查、优化、lowering
           ▼
 算子组合层
-├── Source Definitions
+├── Scan Definitions
 ├── Transform Definitions
 ├── Sink Definitions
 └── exact Schema / data declarations
@@ -101,7 +101,7 @@ Flow 运行层
 
 ### 1. 结构契约
 
-- 明确声明 `Source`、`Transform(nonzero arity)` 或 `Sink(nonzero arity)`；
+- 明确声明 `Scan`、`Transform(nonzero arity)` 或 `Sink(nonzero arity)`；
 - 明确是否有 output；
 - 明确每个输入端口的含义和跨端口顺序契约；
 - 明确全部持久化 data class、逻辑名称、collection、codec 和 Size；
@@ -186,8 +186,8 @@ Station state。
 
 ### 上层 API 不成为持久化真相
 
-Rust Builder、SQL 或其他接口可以保存自己的源描述，用于解释、重新编译和诊断；运行时恢复仍基于
-canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规则变化导致语义不兼容，
+Rust Builder、SQL 或其他接口可以保存自己的 scan 描述，用于解释、重新编译和诊断；未来 SQL 以
+`FROM postgres_cdc` 引用命名 scan。运行时恢复仍基于 canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规则变化导致语义不兼容，
 明确要求重建，不让运行层猜测。
 
 ## 阶段总览
@@ -196,7 +196,7 @@ canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规
 | --- | --- | --- | --- |
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
-| 2（进行中） | 打通真实 Source/Sink | PostgresSource、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
+| 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
 | 3 | 建立关系状态原语 | relation state、arrangement、Consolidate、Distinct | 后续状态关系算子的共同基座 |
 | 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
@@ -315,7 +315,7 @@ Operation 层已针对 Date32、无 timezone 的 Millisecond Timestamp 和 `Deci
 公共纵向测试：Project/Select/Extend direct-copy，SchemaAlign 的 nullability 放宽及 Date32 → Int32、
 Timestamp(ms) → Int64、Decimal128 `(10, 2) → (12, 3)` 显式 cast，以及 Filter 对三类同类型 literal
 的组合比较。它们全部经过 `encode → decode → re-encode → bind → materialize → turn`，并检查
-buffer/diff/顺序。Flow 再覆盖 source → SchemaAlign → Project → Select → Extend → Filter →
+buffer/diff/顺序。Flow 再覆盖 SequenceScan → SchemaAlign → Project → Select → Extend → Filter →
 RunningEventCount → Discard 的 build、运行与两次 reopen，最终 count 为 `3`。
 
 这组证据只承诺上述 operator/type 组合，不承诺其他 Timestamp unit/timezone、时间运算、Decimal
@@ -366,11 +366,11 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 - buffer sharing 优化有身份或底层 buffer 证据；
 - 无状态算子对稳定重批保持声明的展平输出。
 
-## 阶段 2：真实 Source 与 Sink
+## 阶段 2：真实 Scan 与 Sink
 
 ### 目标
 
-消除只能依靠 SequenceSource 和 Discard 验证 Flow 的限制，用真实 Arrow Change 打穿输入、变换、
+消除只能依靠 SequenceScan 和 Discard 验证 Flow 的限制，用真实 Arrow Change 打穿输入、变换、
 结果订阅和当前关系查询。
 
 ### 已完成：SqliteSink
@@ -380,9 +380,9 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 它不引入 SQLite 元数据表；在目标表未被外部修改、数据库文件未被替换或恢复的约束下，重放保持
 最终结果恰好一次。通用 ingress、结果订阅与关系 snapshot 仍属于本阶段后续工作。
 
-### 已有试点：PostgresSource
+### 已有试点：PostgresCdcScan
 
-首个外部输入是具体的固定 Schema 单表 PostgreSQL CDC Source，不提前抽象公共 IngressSource。
+首个外部输入是具体的固定 Schema 单表 PostgreSQL CDC Scan，不提前抽象公共 IngressScan。
 运行协议已经落在所有 Operation 共用的唯一入口上：
 
 ```text
@@ -393,28 +393,28 @@ turn(None)
    └─ Action::Commit + output 已接纳 → commit → AfterCommit
 ```
 
-零输入 Source 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
+零输入 Scan 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
 Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/Station 打开第二个 writer。
-PostgresSource 在事务外 `turn(None)` 中以零超时 poll 并转换；`apply` 保存 checkpoint，
+PostgresCdcScan 在事务外 `turn(None)` 中以零超时 poll 并转换；`apply` 保存 checkpoint，
 通过 `Action::Commit` 返回可选 Change，由 Station 在同一事务中追加 output。
 只有该事务成功后才通过 `AfterCommit` ACK；rollback、背压或 commit 失败不推进 checkpoint/output，
 只丢弃 completion。零超时只表示 poll 不等待数据，connector 启动和 ACK 仍同步且有界。
-不新增 `Flow::ingest`、Source 专用 hook 或外部 coordinator。这一提交边界的具体 D0–D7 实施顺序见
+不新增 `Flow::ingest`、Scan 专用 hook 或外部 coordinator。这一提交边界的具体 D0–D7 实施顺序见
 [`DEBEZIUM_ROADMAP.md`](DEBEZIUM_ROADMAP.md)。
 
 当前边界：
 
 - 不可变 exact logical Schema；
 - 每个 delivery 转换为一个完整、非空 Change，或仅推进 checkpoint 而不伪造空 Change；
-- 唯一 `postgres_source.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
-  不加 Source envelope，也不保存 pending；
+- 唯一 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
+  不加额外 envelope，也不保存 pending；
 - 有界 delivery 和 Station output capacity；背压时不 ACK，由 D2 保留并重投；
 - checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
 - Schema mismatch、编码或 commit 失败零部分写入；
 - reopen 从已提交 checkpoint 继续接收。
 
 原 `postgres_source.state` 的 pending 布局属于未发布的开发期格式；旧 Flow 必须重建，不提供
-alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独确定幂等身份，不反向扩展当前 Source 协议。
+alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独确定幂等身份，不反向扩展当前 Scan 协议。
 
 ### 已有试点：PostgresSink
 
@@ -441,10 +441,10 @@ MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；app
 没有公共通用 Sink trait、backend enum、plugin registry 或 ORM 抽象。旧 runtime/state 与兼容出口
 直接删除；旧 Flow 和目标重建。
 
-### 有限 Source
+### 有限 Scan
 
-根据测试和嵌入式任务需求，可增加显式结束的 `ValuesSource` 或 bounded source。结束必须是独立、
-可恢复的协议事实，不能用暂时没有输入的 `Idle` 代替。SequenceSource 继续作为简单生成源；若要承担
+根据测试和嵌入式任务需求，可增加显式结束的 `ValuesScan` 或 bounded Scan。结束必须是独立、
+可恢复的协议事实，不能用暂时没有输入的 `Idle` 代替。SequenceScan 继续作为简单生成器；若要承担
 范围生成，应显式增加终点而不是依赖 `u64::MAX`。
 
 ### ResultLogSink
@@ -492,7 +492,7 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 公共 API 使用真实订单 Change 完成：
 
 ```text
-PostgresSource
+PostgresCdcScan
 → Filter/Extend/Select
 → ResultLogSink
 → MaterializeSink
@@ -501,7 +501,7 @@ PostgresSource
 ```
 
 必须覆盖插入、用旧记录 `-1` 加新记录 `+1` 表达的更新、删除、未 ACK delivery 重投、背压、
-Schema drift、负权重前缀、fan-out 慢消费者和 reopen。完整端到端测试不使用 SequenceSource 或
+Schema drift、负权重前缀、fan-out 慢消费者和 reopen。完整端到端测试不使用 SequenceScan 或
 Discard。
 
 ## 阶段 3：关系状态原语
@@ -737,7 +737,7 @@ data/control input，同时保持普通 Change 路径简单。
 
 ### 退出标准
 
-- 有限 source 拥有真正 completion，不依赖 Idle；
+- 有限 Scan 拥有真正 completion，不依赖 Idle；
 - barrier 多输入对齐、reopen 和 backpressure 有独立状态模型；
 - TopK/Window 输出在声明的比较域内对重批稳定；
 - window cleanup 与 output/cursor 同事务或拥有明确的可恢复协议；
@@ -768,9 +768,9 @@ RebuildRequired
 增加 start、cancel、graceful stop、status、bounded completion 和可恢复删除。状态机必须区分“当前无
 输入”“输出受压”“用户停止”“有限任务完成”和“不可恢复失败”。
 
-### 外部 Source/Sink 协议
+### 外部 Scan/Sink 协议
 
-已有 `PostgresSource` CDC、`SqliteSink` 与 `PostgresSink` 试点；后续候选包括：
+已有 `PostgresCdcScan`、`SqliteSink` 与 `PostgresSink` 试点；后续候选包括：
 
 1. 本地 API/AppendLog ingress；
 2. 文件 snapshot；
@@ -778,7 +778,7 @@ RebuildRequired
 4. 其他数据库 CDC；
 5. 其他外部副作用 Sink。
 
-外部 Source 明确 external checkpoint 与 committed Change 的原子提交边界；只有来源确实提供
+外部 Scan 明确 external checkpoint 与 committed Change 的原子提交边界；只有来源确实提供
 独立重试 identity 时才另行定义其幂等协议，不以 checkpoint 冒充 identity。外部 Sink 使用
 outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 与 `PostgresSink` 已共用固定 ID 的持久化
 Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能把对应空隙留给具体 Sink 自行解释。
@@ -860,7 +860,7 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 - 至少两个不同风格的上层适配器能构造并 reopen 同一语义的 Flow；
 - 上层错误能定位到用户计划节点，运行错误能映射回该节点；
 - Definition 和 capability/version 足以判断 reopen 或 `RebuildRequired`；
-- 外部 Source/Sink crash/retry 有端到端证据；
+- 外部 Scan/Sink crash/retry 有端到端证据；
 - lifecycle、observability、资源删除和磁盘压力行为可预测；
 - correctness、benchmark smoke、reference 和 endurance 均通过既定协议。
 
@@ -904,13 +904,13 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 ### 里程碑 B：真实数据闭环
 
 ```text
-PostgresSource
+PostgresCdcScan
 → Filter/Extend/Select
 → SqliteSink / PostgresSink
 → crash / reopen
 ```
 
-真实 Source 到专用关系 Sink 的闭环已经存在：`PostgresSource` 提供固定 Schema 单表持续 CDC，
+真实 Scan 到专用关系 Sink 的闭环已经存在：`PostgresCdcScan` 提供固定 Schema 单表持续 CDC，
 `SqliteSink` 与 `PostgresSink` 提供可查询终点。初始全量、发布加固、ResultLog/Materialize 和应用可消费的
 通用结果边界仍待实施。复杂算子仍主要依靠
 测试 fixture 自证，上层用户 API 也尚未形成完整闭环。
@@ -951,11 +951,11 @@ Join 的全部状态问题。
 
 只有同时满足以下条件，算子与执行内核才进入稳定接口评估：
 
-- 基础无状态、结构、真实 Source/Sink、Materialize、Distinct、Aggregate 和至少 Inner Join 有完整证据；
+- 基础无状态、结构、真实 Scan/Sink、Materialize、Distinct、Aggregate 和至少 Inner Join 有完整证据；
 - Change 的 diff、顺序、重复和重批语义在所有算子族中一致；
 - 关系状态统一处理 weight、负前缀、overflow、zero cleanup 和 reopen；
 - exact Schema 对齐、实用 Date/Timestamp/Decimal 类型和表达式能力矩阵可用；
-- Source checkpoint 与外部 Sink 幂等提交边界可用；
+- Scan checkpoint 与外部 Sink 幂等提交边界可用；
 - Flow start/cancel/stop/status/reopen/delete 生命周期完整；
 - corruption、crash、backpressure、磁盘压力和不兼容升级行为可预测；
 - 代表性 workload 有 smoke、reference 和 endurance 证据；

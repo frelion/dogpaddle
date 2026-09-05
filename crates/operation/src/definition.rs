@@ -92,34 +92,37 @@ pub(crate) struct DataName<D> {
 /// Complete structural kind explicitly declared by an Operation definition.
 ///
 /// The kind combines the Operation's nominal role with its input arity so that
-/// a source cannot declare inputs and an input-consuming Operation cannot
+/// a Scan cannot declare inputs and an input-consuming Operation cannot
 /// declare zero inputs. It is supplied by the concrete Operation rather than
 /// inferred from topology position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OperationKind {
-    /// Produces records without consuming upstream input.
-    Source,
-    /// Consumes upstream records and produces downstream records.
+    /// Produces records without consuming input.
+    ///
+    /// This structural role does not encode exhaustion. A Scan may return
+    /// [`crate::operation::Turn::Idle`] temporarily or forever.
+    Scan,
+    /// Consumes input records and produces output records.
     Transform(NonZeroU32),
-    /// Consumes upstream records without producing downstream output.
+    /// Consumes input records without producing output.
     Sink(NonZeroU32),
 }
 
 impl OperationKind {
-    /// Returns the exact number of ordered upstream inputs.
+    /// Returns the exact number of ordered inputs.
     #[must_use]
     pub const fn input_count(self) -> u32 {
         match self {
-            Self::Source => 0,
+            Self::Scan => 0,
             Self::Transform(count) | Self::Sink(count) => count.get(),
         }
     }
 
-    /// Returns whether this kind is a source.
+    /// Returns whether this kind is a Scan.
     #[must_use]
-    pub const fn is_source(self) -> bool {
-        matches!(self, Self::Source)
+    pub const fn is_scan(self) -> bool {
+        matches!(self, Self::Scan)
     }
 
     /// Returns whether this kind is a sink.
@@ -128,10 +131,10 @@ impl OperationKind {
         matches!(self, Self::Sink(_))
     }
 
-    /// Returns whether this kind owns a downstream output stream.
+    /// Returns whether this kind owns an output stream.
     #[must_use]
     pub const fn has_output(self) -> bool {
-        matches!(self, Self::Source | Self::Transform(_))
+        matches!(self, Self::Scan | Self::Transform(_))
     }
 }
 
@@ -170,7 +173,7 @@ impl dyn OperationDefinition + '_ {
     /// A successful binding validates all input-specific rules, fixes the
     /// Operation's exact output Schema when it has one, and owns any compiled
     /// Schema-dependent execution information. The input slice is ordered by
-    /// the Definition's zero-based ports. Source definitions receive an empty
+    /// the Definition's zero-based ports. Scan definitions receive an empty
     /// slice.
     ///
     /// The binding may depend only on the persistent Definition and supplied
@@ -499,7 +502,7 @@ pub enum OperationBindError {
         #[source]
         source: OperationSchemaError,
     },
-    /// A Source or Transform failed to bind its required output Schema.
+    /// A Scan or Transform failed to bind its required output Schema.
     #[error("operation kind requires an output schema but its binding has none")]
     MissingOutput,
     /// A Sink binding incorrectly declared an output Schema.

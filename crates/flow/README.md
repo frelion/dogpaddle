@@ -2,7 +2,7 @@
 
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
 `Flow` 只表示运行态，不承担声明、构建或打开职责。Station 当前是 crate 内部的一对一 Operation
-容器；它读取所包裹 Definition 显式声明的 `OperationKind`，向 Flow 提供 source、sink、输入数量
+容器；它读取所包裹 Definition 显式声明的 `OperationKind`，向 Flow 提供 Scan、Sink、输入数量
 和 output 属性，并在 build/open 时沿拓扑传递精确 logical Arrow Schema。Flow 不枚举具体算子；未来一个 Station 包裹多个 Operation 时，只需在 Station
 内部归纳这些属性，不必改变 Flow 的拓扑接口。
 
@@ -19,7 +19,7 @@ use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
     col, lit,
     operation::sink::DiscardDefinition,
-    operation::source::SequenceSourceDefinition,
+    operation::scan::SequenceScanDefinition,
     operation::transform::{
         ExtendDefinition, FilterDefinition, RunningEventCountDefinition,
         SchemaAlignDefinition, SchemaAlignField,
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let extend = factory.station(
         "extend",
         ExtendDefinition::try_new("is_seven", col("value").eq(lit(7_u64)))?,
@@ -48,12 +48,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     let capacity = NonZeroU64::new(64 * 1024 * 1024).unwrap();
-    factory.output_capacity_bytes(source, capacity);
+    factory.output_capacity_bytes(scan, capacity);
     factory.output_capacity_bytes(extend, capacity);
     factory.output_capacity_bytes(filter, capacity);
     factory.output_capacity_bytes(align, capacity);
     factory.output_capacity_bytes(count, capacity);
-    factory.connect([source], extend);
+    factory.connect([scan], extend);
     factory.connect([extend], filter);
     factory.connect([filter], align);
     factory.connect([align], count);
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flow = factory.build()?;
     assert_eq!(
         flow.station_ids().collect::<Vec<_>>(),
-        ["source", "extend", "filter", "align", "count", "sink"]
+        ["scan", "extend", "filter", "align", "count", "sink"]
     );
     drop(flow);
 
@@ -72,10 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Station ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。连接保留 source 顺序，允许
-fan-out 和重复 source；连接数量必须与 Station 对外声明的输入数量完全一致，整个拓扑
-必须是 DAG。所有入度为零的起点必须是 Source Station，所有出度为零的终点必须是 Sink Station；
-Sink 没有 output，不能作为其他 Station 的上游。允许多个 Source、多个 Sink 和多个互不连接的
+Station ID 必须非空、不能包含 NUL，并且在一条 Flow 内唯一。连接保留 input 顺序，允许
+fan-out 和重复 input；连接数量必须与 Station 对外声明的输入数量完全一致，整个拓扑
+必须是 DAG。所有入度为零的起点必须是 Scan Station，所有出度为零的终点必须是 Sink Station；
+Sink 没有 output，不能作为其他 Station 的 input。允许多个 Scan、多个 Sink 和多个互不连接的
 合法 DAG 分量。每个 `OperationKind::has_output()` 为 true 的 Station 必须且只能声明一次非零
 output capacity，outputless Station 不得声明；重复、遗漏、类别不匹配或 foreign `StationRef` 都在
 纯校验阶段失败。拓扑解析后，Flow 还按确定性拓扑顺序把每个 producer 的精确 output Schema
@@ -94,10 +94,10 @@ Station/连接/容量；只需重新传入临时配置。没有保留旧的 stat
 
 ```no_run
 use dogpaddle_flow::FlowFactory;
-use dogpaddle_operation::operation::source::PostgresSourceConfig;
+use dogpaddle_operation::operation::scan::PostgresCdcScanConfig;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-let config = PostgresSourceConfig::new_unencrypted(
+let config = PostgresCdcScanConfig::new_unencrypted(
     "/opt/dogpaddle-debezium", "127.0.0.1", 5432, "shop", "cdc",
     std::env::var("CDC_PASSWORD")?,
 )?;
@@ -113,7 +113,7 @@ flow.advance()?;
 改变 `FlowFactory`、`Flow::advance` 或 Station 协议，也没有引入通用 Sink trait、ORM 或 backend registry。
 它的 `discover_target` 由调用方在 build 前显式执行，并会进行只读 `PostgreSQL` catalog I/O。
 
-`PostgresSource` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、不连接 PG、
+`PostgresCdcScan` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、不连接 PG、
 不启动 JVM；初始化、poll、转换、ACK 仍全在 Operation 内，通过通用 turn 协议完成。
 checkpoint 与 Station output 在同一事务提交，背压同时回滚且不 ACK，不另存 pending。
 poll 不等待数据；宿主在整轮 Idle 或持续 Backpressured 时自行安排等待，避免忙轮询。
@@ -204,7 +204,7 @@ active input。
 Cell。每个 output capacity 直接保存在 Flow Definition 中；build/open 都把它、对应 output log、
 完整 consumer frontier 和绑定得到的精确 logical Schema 装配成同一个不可失配的运行期
 `Output` capability，不创建另一份 Station state。端口 Schema 一致性不依赖 Change codec 之外的
-Schema resource、fingerprint 或 registry：持久化 Definition 加上有序上游 Schema 在 reopen 时
+Schema resource、fingerprint 或 registry：持久化 Definition 加上有序 input Schema 在 reopen 时
 确定性重建同一 binding。运行层只能使用已经声明的 map 和日志，不能动态新增数据空间。
 Filter/Extend/Select/`SchemaAlign` 的 manifest payload 直接包含 `DataFusion` `Expr` protobuf，但不持久化 `PhysicalExpr`。
 build/open 都从 protobuf 还原 `Expr`，并针对 exact input Schema 重新调用 `create_physical_expr`。
@@ -219,11 +219,11 @@ Store 随后被转换为唯一的 `Transactions`；build/open 在取得完整所
 split 出 owned reader。拓扑和资源目录都没有运行期修改入口。
 
 资源创建和 Station 装配分成两遍。Schema binding 在两遍之前已对全图完成。第一遍按声明顺序创建或打开全部 state、Operation data 和
-output；第二遍先从每个 target state 派生各 consumer edge 的只读 cursor capability，再把每个
+output；第二遍先从每个 consumer Station state 派生各 input edge 的只读 cursor capability，再把每个
 producer 的 output log、capacity、精确 Schema 和完整 consumer frontier 绑定成唯一、不可错配的 output capability。
-producer append、capacity 判定与所有下游 intake、frontier 校验和物理回收必须引用同一 capability，
+producer append、capacity 判定与所有 consumer intake、frontier 校验和物理回收必须引用同一 capability，
 不得分别持有可独立替换的日志或 retention handle；每条 input edge 只补充自己的 consumer slot。
-声明顺序不必是拓扑顺序，fan-out 仍共享同一个物理日志与保留边界。Station 不知道上下游 Station ID，
+声明顺序不必是拓扑顺序，fan-out 仍共享同一个物理日志与保留边界。Station 不知道相连的 Station ID，
 只拥有 Operation、带固定 capacity 的可选 output capability，以及统一拥有 state、有序 ports 与至多
 一个 owned `Claim` 的 `Inbox`。
 装配还从已验证 Definition 派生唯一运行期 schedule：先按拓扑层次排列，同一层按 Station 声明
@@ -237,12 +237,12 @@ Claim 保存该 entry 的 port、AppendLog offset 和完整 owned Change；它�
 内存副本。IPC 解码完成后，`intake` 必须先把 Change 的完整 logical Schema 与该 input 共享的
 `Output` Schema 精确比较，匹配后才能安装 Claim；Schema 不匹配不会 pin、推进 cursor 或产生其他
 持久化写入。Claim 存在时 `intake` 不访问 Store。重开 Flow 时 Claim 为空，并根据 active input 与对应 cursor
-重建同一输入。零输入 Source 没有 Claim，但仍由相同的 Station 路径调用 `turn(None)`；没有
-Source 专用 outcome 或事务路径。没有 output 的 Sink 不能被其他 Station 作为 source。
+重建同一输入。零输入 Scan 没有 Claim，但仍由相同的 Station 路径调用 `turn(None)`；没有
+Scan 专用 outcome 或事务路径。没有 output 的 Sink 不能被其他 Station 作为 input。
 
 `process(&mut Transactions)` 先在没有活动写事务时调用 `Operation::turn`。有输入 Operation 每次只
 接收端口和一个完整 borrowed `Change`，不会看到 `AppendLog` offset、cursor 或 Station 运行元数据；
-Source 在同一入口收到 `None`。`Turn::Idle` 直接结束，不开启写事务；`Turn::Ready` 携带一个只能
+Scan 在同一入口收到 `None`。`Turn::Idle` 直接结束，不开启写事务；`Turn::Ready` 携带一个只能
 消费一次的 `PreparedTurn`，Station 此时才开始唯一写事务，并只把不能提交的
 `TransactionAccess` 交给其 `apply`。已有 Claim 会直接提供给 Operation，Station 不在每个 turn 前
 另开读事务重校验 active input 和 cursor；需要消费该 Claim 时，验证与状态迁移一起进入原子
@@ -250,10 +250,10 @@ Complete 事务。
 
 prepared turn 只返回三个 `Action`：`Idle` 丢弃本次事务，因而不发布 output、不保存 Operation 写入，
 也不改变当前 Claim；`Commit(output)` 提交 Operation 状态与可选 output，但保留已经提供的 Claim；
-`Complete(output)` 只用于有输入的 turn，并声明该完整 Change 已处理。Source 的成功 turn 使用
+`Complete(output)` 只用于有输入的 turn，并声明该完整 Change 已处理。Scan 的成功 turn 使用
 `Commit`，input-free Operation 返回 `Complete` 是协议错误。Complete 会在同一事务中验证 Claim 的
 port/offset 与 durable active input/cursor 相同，然后提交 Operation 状态、可选 output、cursor 推进、
-active input 轮转和必要的上游物理回收；只有外层 commit 成功后才清除 Claim。任何 Operation、编码、
+active input 轮转和必要的 input log 物理回收；只有外层 commit 成功后才清除 Claim。任何 Operation、编码、
 append、Station state、retention 或 commit 错误都会回滚本次事务并保留 durable identity 与 Claim。
 Operation 返回 output 时，Station 在 IPC 编码和 capacity 判定之前先按同样的精确规则校验其
 logical Schema；不匹配是协议错误，整个 turn 的 Operation 状态、output 与输入进展全部回滚。
@@ -269,7 +269,7 @@ state 重试，或在下一 turn 自行重建失败的临时资源。
 Operation 在调用前不会因 output 已达到水位而被跳过，因为 Station 尚不知道本次是否产生 output
 以及编码后大小。没有 output 的 `Commit` 即使日志已经达到水位也可以正常提交；有 output 时
 Station 先完成 Change 编码，再调用 `AppendLog` 的 capacity-aware append。非空日志追加后超过
-capacity 会正常返回背压而非错误：本次 Operation 写事务整体回滚，Source position、`Commit`
+capacity 会正常返回背压而非错误：本次 Operation 写事务整体回滚，Scan position、`Commit`
 continuation、`Complete` cursor/active 都不前进，Claim 与 durable identity 保留，下一 turn 重新执行
 Operation。物理空日志按 `head == tail` 判断并允许一条 oversize entry，避免单个合法 Change 永久
 无法前进。这是一项 per-output soft high watermark，不是 MDBX 文件大小或进程内存硬配额。
@@ -284,17 +284,17 @@ durable active input、各 input cursor 和可丢弃重建的 owned Claim。
 event ID。Station 可以为了吞吐稳定地合并或切分物理批次，但变换前后展平的输入事件序列必须
 逐项相同，也不能隐式 consolidation。不同输入边的 offset 彼此不可比较；active input 既是未完成
 输入的 durable port，又在没有未完成输入时规定从哪个端口开始循环寻找下一个可用物理 Change，
-不声称还原跨上游事件发生时间。只有 `Complete` 才把 cursor 推进到下一个 offset。Operation 的
+不声称还原跨 input 的事件发生时间。只有 `Complete` 才把 cursor 推进到下一个 offset。Operation 的
 展平 output 事件序列和最终业务状态必须同时对稳定重批及同一 Change 的重复 `Commit` turn 切分保持不变。
 显式跨端口无序的 `UnionAll` 只保持各端口内部事件顺序和最终关系状态；跨端口交织由上述 durable
-Station schedule 决定，可随上游分批和可用性变化。需要业务级跨端口总序时，必须另行引入逻辑
+Station schedule 决定，可随各 input 的分批和可用性变化。需要业务级跨端口总序时，必须另行引入逻辑
 ingress、barrier、窗口或排序语义。
 
 每个 producer output 在已提交的事务边界都维持 `head == min(all consumer edge cursors)`；build 时
 所有值都是 `0`，open 会拒绝不满足该等式或 cursor 落在 `[head, tail]` 之外的运行状态。一次 Complete
 只把当前 edge cursor 从 `offset` 推进到 `offset + 1`。在旧等式成立时，所有 cursor 都不小于 head，
 所以新的最小值只能仍是 head 或成为 `head + 1`：前者不回收，后者在同一 Complete 事务中调用一次
-`truncate_before` 并精确删除 head entry。重复 source edge 各有独立 cursor 和 consumer slot，全部
+`truncate_before` 并精确删除 head entry。重复 input edge 各有独立 cursor 和 consumer slot，全部
 参与最小值；最慢 consumer 因而继续保护共享 entry。cursor advance、active rotation、物理 head 和
 `AppendLog` retained-byte 账本要么一起提交，要么一起回滚，不存在独立回收 phase、补偿轮次或回收 debt。
 open 只把这些 retention 不变量违例报告为 `InvalidRuntimeState`；底层 Store 访问失败继续保留为结构化
@@ -302,11 +302,11 @@ open 只把这些 retention 不变量违例报告为 `InvalidRuntimeState`；底
 
 `Flow::advance` 聚合为 `Progressed > Backpressured > Idle`：任一 Operation、durable input pin 或
 Complete 内联回收有提交就返回 `Progressed`；整轮没有提交、但至少一个实际 output 被容量拒绝时返回
-`Backpressured`；既无提交也无容量拒绝才返回 `Idle`。背压不会提前终止 schedule，所以下游和其他
+`Backpressured`；既无提交也无容量拒绝才返回 `Idle`。背压不会提前终止 schedule，所以 consumers 和其他
 DAG 分量仍获得本轮 turn。fan-out 共享一份 output log 和 capacity，最慢 consumer 的 cursor 会有意
-阻塞整个 producer；各下游独立持有的 decoded Claim 不计入该容量。SequenceSource 提交
-`u64::MAX` 后稳定返回 `Action::Idle`，因此即使进程在最终 source commit 后退出，重开后的 schedule 仍会
-继续排空下游。
+阻塞整个 producer；各 consumer 独立持有的 decoded Claim 不计入该容量。SequenceScan 提交
+`u64::MAX` 后稳定返回 `Action::Idle`，因此即使进程在最终 scan commit 后退出，重开后的 schedule 仍会
+继续通过 consumers 排空已提交 output。
 
 Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::new(path).open()` 返回
 `IncompleteBuild`；
@@ -315,13 +315,13 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 
 `FlowFactory::new(path).open()` 在一次 Store setup 生命周期中读取、解码并重新校验 manifest，再解析拓扑并
 纯重建全部 Schema bindings；只有成功后才用同一个 Store 打开其余数据对象和 output，最后按
-source ID 重新注入 inputs、装配 Station。第二次 Definition 读取和所有 output frontier 校验共享
+input ID 重新注入 inputs、装配 Station。第二次 Definition 读取和所有 output frontier 校验共享
 同一个 RO snapshot，不启动或提交写事务。open 不扫描全部 backlog；合法 IPC 中与绑定不一致的
 Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用方不需要重新提交 Definition。
 
 当前磁盘格式的外层使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局。具体 Operation payload 有各自的固定编码：
-例如表达式使用 pinned protobuf，tag11 `PostgresSource` 与 tag12 `PostgresSink` 使用各自的 canonical
+例如表达式使用 pinned protobuf，tag11 `PostgresCdcScan` 与 tag12 `PostgresSink` 使用各自的 canonical
 JSON。以下名称是兼容性边界：
 
 - Flow manifest：`flow/definition`
@@ -329,13 +329,13 @@ JSON。以下名称是兼容性边界：
 - Station active input key：`input/active`
 - Station input cursor key：`input/{input_index:08x}/cursor`
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
-- `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
+- `SequenceScan` 位置：`station/{index:08x}/operation/sequence_scan.position`
 - `RunningEventCount` 状态：`station/{index:08x}/operation/running_event_count.count`
-- `PostgresSource` checkpoint：`station/{index:08x}/operation/postgres_source.checkpoint`
+- `PostgresCdcScan` checkpoint：`station/{index:08x}/operation/postgres_cdc_scan.checkpoint`
 - `SqliteSink` / `PostgresSink` 状态：`station/{index:08x}/operation/relation_sink.state`
 - Project、Filter、Extend、Select、`SchemaAlign` 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
-`index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
+`index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 input 列表中的端口顺序。active
 input value 固定为 4 字节 big-endian `u32`，cursor value 固定为 8 字节 big-endian `u64 offset`。
 当前仍是开发期 v1；output capacity 直接属于当前 Station Definition 布局。
 derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有序 input Schemas 的绑定语义
@@ -366,11 +366,11 @@ state/inputs、Station 可选的统一 Output、稳定 active input/cursor 和�
 原子协调 Operation continuation、output、active、cursor 与至多一个 head entry 的物理回收，
 运行期持续维护 `head == min(consumer cursors)`。每个 output Station 还拥有持久化
 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实表达式链路与 `SequenceSource → Select → UnionAll → RunningEventCount → Discard`
+`Flow::advance`，真实表达式链路与 `SequenceScan → Select → UnionAll → RunningEventCount → Discard`
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
-自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。运行资源注入、具体 `PostgresSource` 与 `PostgresSink` 已沿
+自然反压 producer。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
+intake 还会在事务提交前后两侧兜底校验。运行资源注入、具体 `PostgresCdcScan` 与 `PostgresSink` 已沿
 通用 Operation 调度协议承接事务外初始化/poll、durable state 写入与提交后确认；`SqliteSink` 与
 `PostgresSink` 分别实现自己的目标专用幂等提交边界。尚未实现 `Flow::start` 或中断控制。内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
@@ -394,7 +394,7 @@ python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql
 
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
 `open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
-或运行时吞吐。`flow_runtime` 则测预先构建的 source/sink、`RunningEventCount` chain、fan-out 和 capacity-pressure
+或运行时吞吐。`flow_runtime` 则测预先构建的 scan/sink、`RunningEventCount` chain、fan-out 和 capacity-pressure
 Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。`run` plan 保存静态 work counts，
 machine sample 只保留总 `elapsed_ns` 和 raw `round_latencies_ns`；统一 reporter 从这些 raw
 值重建 round p50/p95/p99，以及 advances/s、committed Station turns/s 和 input completions/s。

@@ -14,8 +14,8 @@ use dogpaddle_operation::{
     col, decode_definition, encode_definition, lit,
     operation::{
         Action, OperationInput,
+        scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition},
-        source::SequenceSourceDefinition,
         transform::{
             ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
             SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
@@ -35,7 +35,7 @@ const FILTER_V1: &str = include_str!("../fixtures/v1/filter_complex_expression.h
 const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
 const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
-const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_source_start_42.hex");
+const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_scan_start_42.hex");
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
@@ -166,7 +166,7 @@ fn golden_cases() -> Vec<(Vec<u8>, Box<dyn OperationDefinition>)> {
         ),
         (
             decode_hex(SEQUENCE_V1),
-            Box::new(SequenceSourceDefinition::new(42)),
+            Box::new(SequenceScanDefinition::new(42)),
         ),
         (decode_hex(SELECT_V1), Box::new(select())),
         (decode_hex(SCHEMA_ALIGN_V1), Box::new(schema_align())),

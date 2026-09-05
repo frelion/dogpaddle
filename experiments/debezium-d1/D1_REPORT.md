@@ -32,7 +32,7 @@ development-v1 `DPDBDV01` delivery has no token; the token printed by this
 fixture is allocated only by the JSONL host.
 
 This closes the old D1-to-product gap. The same real connector fixture now
-exercises the reusable D2 runtime boundary that future source integrations will
+exercises the reusable D2 runtime boundary that future Scan integrations will
 call.
 
 ## Reproduction
@@ -176,7 +176,7 @@ It also mechanically rejects:
 
 ## Remaining boundaries
 
-D1 remains a focused fixture, not a production Source Operation. Its durable
+D1 remains a focused fixture, not a production Scan Operation. Its durable
 file is only a crash-safe stand-in for the D3 MDBX transaction. It does not yet
 prove Flow backpressure integration, Arrow `Change` mapping, snapshots, schema
 evolution, transaction framing, auxiliary schema-history state, or a second

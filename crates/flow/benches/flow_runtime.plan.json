@@ -1,1 +1,1 @@
-{"benchmark":"flow_runtime","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":4,"observations":0,"encoded_bytes":2812,"digest":"27c9eb8b318d622f7b360fdfcf5daad7"},"reference":{"cases":7,"observations":0,"encoded_bytes":4102,"digest":"b08ac6c63615c30aa014fd264beb96b7"}}
+{"benchmark":"flow_runtime","algorithm":"fnv1a-128-canonical-json-v1","smoke":{"cases":4,"observations":0,"encoded_bytes":2800,"digest":"312caf6592b36e4a23dfc7a5fe5ef727"},"reference":{"cases":7,"observations":0,"encoded_bytes":4086,"digest":"7cdf4710c183a9eeb73db80fe06896b7"}}

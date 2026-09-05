@@ -22,7 +22,7 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 业务事件。这个比较域要求每种分批的输入和对应输出都能
 由其声明的 Arrow 类型物理表示；例如不能要求 `Utf8` offset 已溢出的单个 `RecordBatch` 成功构造。
 
-外部 Source 返回普通 `Change`，由 Station 完成 Schema/capacity 校验与日志追加；自身 checkpoint
+外部 Scan 返回普通 `Change`，由 Station 完成 Schema/capacity 校验与日志追加；自身 checkpoint
 与 output 同事务提交即可，不需要另设持久 payload 中转，也不能绕过 Station 直接访问 output。
 
 ## Schema 绑定
@@ -31,15 +31,15 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 `$dogpaddle.diff` 字段。字段名称、顺序、类型、nullability、嵌套结构以及 Schema/Field metadata
 都属于匹配内容；它不是“需要哪些列”的局部约束，也不是每个 Change 可以变化的动态类型。
 
-[`OperationDefinition`] 的统一 `bind` 入口接收按端口顺序排列的 `SchemaRef`：Source 收到空 slice，Transform
+[`OperationDefinition`] 的统一 `bind` 入口接收按端口顺序排列的 `SchemaRef`：Scan 收到空 slice，Transform
 和 Sink 收到恰好由 [`OperationKind`] 声明的数量。绑定先验证每个输入都是合法 `DogPaddle` logical
-Schema，再由具体 Definition 接受或拒绝，并为 Source/Transform 返回唯一、完整的 output Schema；
+Schema，再由具体 Definition 接受或拒绝，并为 Scan/Transform 返回唯一、完整的 output Schema；
 Sink 必须没有 output。一个 Definition 可以在不同 Flow 中绑定不同输入，但同一次 Flow build/open
 完成后，每条 output 只对应一个精确 Schema。
 
 绑定必须是纯且确定的：相同持久化 tag、payload 和有序 input Schemas 必须得到相同语义。结果是
 短生命周期、只能消费一次的 `OperationBinding`，可携带 Schema 相关的已编译执行信息及最终
-materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceSource` 固定
+materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceScan` 固定
 输出 `{ value: UInt64 non-null }`；`RunningEventCount` 接受任意合法的单一输入并固定输出
 `{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
 并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
@@ -86,7 +86,7 @@ reader 互操作、嵌套/投影和损坏拒绝。Operation 层进一步承诺�
 `Decimal128(10, 2)` → `Decimal128(12, 3)` 的显式 cast；Filter 覆盖三类字段与同类型 literal 的组合
 比较。三组公共测试都经过 Definition `encode → decode → re-encode → bind → materialize → turn`，
 并检查 buffer/diff/顺序。Flow 还覆盖
-`SequenceSource → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard`
+`SequenceScan → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard`
 的 build、运行和两次 reopen。
 
 上述范围不承诺其他 Timestamp unit/timezone、跨类型转换、时间运算、Decimal 算术或舍入。
@@ -145,11 +145,11 @@ assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 ## Operation 运行协议
 
 运行资源与持久 Data 分开装配：`OperationBinding::materialize(data, resource)` 消费一个可选的
-[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL` Source 与 Sink 分别传拥有型配置。
+[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL` Scan 与 Sink 分别传拥有型配置。
 binding 先验证其精确 Rust 类型，Flow 在创建 Store 前完成全图检查。这里没有全局 registry、
 connector enum 或启动回调；资源只在 materialize 时 move 进 Operation，外部初始化仍由 turn 完成。
 
-运行时 [`operation::Operation`] trait 只有一个统一、object-safe 的 `turn`。零输入 Source 与其他
+运行时 [`operation::Operation`] trait 只有一个统一、object-safe 的 `turn`。零输入 Scan 与其他
 Operation 走同一个协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed Change，
 以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 `AppendLog` offset、
 Transaction 或事务启动能力。
@@ -171,7 +171,7 @@ Transaction 或事务启动能力。
 
 `Action::Idle` 表示没有可提交进展，调用方必须回滚 prepared turn 的全部写入；`Commit` 提交
 Operation 状态和可选 output，但不完成当前输入，下一 turn 仍收到同一端口、同一日志 offset 和
-逐字节相同的完整 Change。零输入 Source 也用 `Commit` 表示一次成功 turn。`Complete` 才在同一
+逐字节相同的完整 Change。零输入 Scan 也用 `Commit` 表示一次成功 turn。`Complete` 才在同一
 事务中提交 Operation 状态、可选 output 和当前输入完成。两种提交动作都至多产生一个 owned
 output Change；filter 或 Sink 可以使用 `None`。
 
@@ -195,20 +195,20 @@ driver 的内存状态，不能把隐藏的 needs-reopen 要求留给 Flow 猜�
 
 ### 完整例子：从队列拉取并恢复
 
-先读 [`QueueSource`](examples/support/queue_source.rs) 的 `turn`：`client: None` 时在事务中读取
+先读 [`QueueScan`](examples/support/queue_scan.rs) 的 `turn`：`client: None` 时在事务中读取
 checkpoint，提交后建立临时 client；之后在事务外 poll，在事务中保存 checkpoint 和返回 output，
 提交后才 ACK。算子本身不持有事务启动能力。
 
-再读 [`queue_source` 的调用代码](examples/queue_source.rs)，或直接运行：
+再读 [`queue_scan` 的调用代码](examples/queue_scan.rs)，或直接运行：
 
 ```sh
-cargo run -p dogpaddle-operation --example queue_source
+cargo run -p dogpaddle-operation --example queue_scan
 ```
 
 示例先提交 `10`，关闭 Store 和 Operation，重新打开后继续提交 `20、30`。它用固定队列模拟可按
 checkpoint 恢复的外部服务；独立调用代码把 output IPC 与 checkpoint 原子写入 Store。生产 Flow
 由 Station 负责事务、Schema guard、容量和输入进展。示例没有可装入 Flow 的 Definition，也不是
-已交付的 Debezium Source。
+已交付的 Debezium Scan。
 
 `correctness/protocol.rs` 直接复用同一份算子代码，覆盖初始化回滚、未 ACK 重放，以及第二条记录
 在本地提交前或提交后丢失运行态，再 reopen 的完整输出序列。测试中的 Drop 用于模拟这些恢复边界，
@@ -226,8 +226,8 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 
 | 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据与性能 workload |
 | --- | --- | --- | --- | --- | --- | --- |
-| `SequenceSource` (`1`) | Source / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_source.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` source body/commit |
-| `PostgresSource` (`11`) | Source / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_source.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Source 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
+| `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` scan body/commit |
+| `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow/rollback/reopen/重批；`operation_core` `RunningEventCount` body/commit、`flow_runtime` chain |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
 | Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
@@ -240,38 +240,41 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `tools/check_postgres_sink.py` |
 
 所有十二个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
-`tests/correctness/{codec,definition,postgres,postgres_sink,protocol,runtime,sqlite_sink}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
+`tests/correctness/{codec,definition,postgres_cdc,postgres_sink,protocol,runtime,sqlite_sink}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
 无建库副作用、资源名、build/open/reopen、运行期 Schema guard 和事务重放由
-`crates/flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`、`PostgresSource`
+`crates/flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`、`PostgresCdcScan`
 与 `PostgresSink` 外的九个算子；直接
-turn body/durable commit 只测 `SequenceSource` 与 `RunningEventCount`。`flow_runtime` 测
-source/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
+turn body/durable commit 只测 `SequenceScan` 与 `RunningEventCount`。`flow_runtime` 测
+scan/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
 不因此获得虚构的微基准。
 
 前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别内联在
-`tests/correctness/postgres.rs` 与 `tests/correctness/postgres_sink.rs`。其中事件计数、对齐与 `SQLite` Sink 的 fixture 分别为
+`tests/correctness/postgres_cdc.rs` 与 `tests/correctness/postgres_sink.rs`。其中事件计数、对齐与 `SQLite` Sink 的 fixture 分别为
 `running_event_count_definition.hex`、`schema_align_explicit.hex` 与 `sqlite_sink_output_events.hex`；它们分别冻结
 tag `2`、`9` 与 `10`。codec 分区十个 decoded golden 都会重新 bind，两个 postgres 分区独立覆盖 tag11/tag12；Filter、Extend、Select、UnionAll 与
 `SchemaAlign` 的 golden 还会
 materialize/turn，其余算子的执行证据由 definition/runtime 分区独立覆盖。Flow manifest 的端到端基线为
-`crates/flow/tests/fixtures/v1/sequence_source_running_event_count_discard.hex`。这些文件名只帮助定位
+`crates/flow/tests/fixtures/v1/sequence_scan_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
 
-运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
-保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `source` 包含 `SequenceSource` 与 `PostgresSource`，`transform` 包含 RunningEventCount、Project、Filter、
+运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`scan`
+保存零输入且拥有 output 的 Scan 算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
+的终点算子。当前 `scan` 包含 `SequenceScan` 与 `PostgresCdcScan`，`transform` 包含 RunningEventCount、Project、Filter、
 Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
 Discard、`SqliteSink` 与 `PostgresSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
+
+Scan 是结构角色，不要求底层一定存在一张可遍历的表。当前协议不表达 EOS：Scan 可以暂时
+`Turn::Idle`，耗尽后也可以永远 `Turn::Idle`；需要流完成语义时应另行扩展协议。
 
 ## Definition 与持久化
 
 具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 要求每个具体算子手动返回
 [`OperationKind`]，并以 `{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。
-`OperationKind::Source` 固定为零输入，Transform 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
-input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位置推断：Source、Transform 和 Sink
+`OperationKind::Scan` 固定为零输入，Transform 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
+input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位置推断：Scan、Transform 和 Sink
 分别声明自己在数据流中的结构语义；Station 读取所包裹 Definition 的 kind，再向 Flow 提供自己的
-source/sink 与 output 属性。Flow 负责生成完整
+Scan/Sink 角色与 output 属性。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
 此前 Schema bind 产生的 `OperationBinding::materialize`。binding 只按名称取得已经创建或打开的
 `Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store；物化会消费整组实例，
@@ -285,14 +288,14 @@ collection 只暴露真实存在的布局选择：`Cell<T>` 永远使用共享�
 ```rust
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, decode_definition, encode_definition,
-    operation::source::SequenceSourceDefinition,
+    operation::scan::SequenceScanDefinition,
 };
 
-let source = SequenceSourceDefinition::new(10);
-assert_eq!(source.kind(), OperationKind::Source);
-assert_eq!(source.kind().input_count(), 0);
+let scan = SequenceScanDefinition::new(10);
+assert_eq!(scan.kind(), OperationKind::Scan);
+assert_eq!(scan.kind().input_count(), 0);
 
-let encoded = encode_definition(&source);
+let encoded = encode_definition(&scan);
 let decoded = decode_definition(&encoded).unwrap();
 assert_eq!(encode_definition(decoded.as_ref()), encoded);
 ```
@@ -313,11 +316,11 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化运行实例；开放可注入 Flow 的
 第三方算子仍需另行设计 tag 分配、decoder 注册和运行错误边界。
 
-## `PostgreSQL` Source 试点
+## `PostgreSQL` CDC Scan 试点
 
-[`operation::source::PostgresSourceDefinition`]（tag `11`）只描述一个数据库中的一张固定 Schema 表。
-先用 [`operation::source::PostgresSourceConfig::discover`] 显式查询 catalog，再把得到的
-`PostgresSourceSpec` 固化成 Definition；build/open/bind 不连 PG、不启动 JVM。配置由宿主构造并在
+[`operation::scan::PostgresCdcScanDefinition`]（tag `11`）只描述一个数据库中的一张固定 Schema 表。
+先用 [`operation::scan::PostgresCdcScanConfig::discover`] 显式查询 catalog，再把得到的
+`PostgresCdcScanSpec` 固化成 Definition；build/open/bind 不连 PG、不启动 JVM。配置由宿主构造并在
 每次打开时重新装配，不自动读取环境变量、配置文件或全局 secret registry。
 
 持久 Definition 保存 engine/topic 名、数据库/表/slot/publication 身份、cluster system identifier、
@@ -325,8 +328,8 @@ database/table OID 和有序列声明，不含密码、用户名、host 或 runt
 字段顺序的 canonical JSON；未知字段、重复字段、非 canonical 字节与超过 1 MiB 的 payload 被拒绝。
 试点 engine/schema/table/slot/publication 名仅允许 1–63 个小写 ASCII 字母、数字和下划线。
 
-算子只声明 `postgres_source.checkpoint: Cell<Vec<u8>>`，原样保存 D2 opaque checkpoint bytes；
-其版本、校验和与边界校验由 D2 拥有，不增加 Source envelope。Cell 缺值表示首次运行，空或损坏的
+算子只声明 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>`，原样保存 D2 opaque checkpoint bytes；
+其版本、校验和与边界校验由 D2 拥有，不增加额外 envelope。Cell 缺值表示首次运行，空或损坏的
 bytes 是错误。没有 pending payload，数据只由 Station 编码一次并写入 output。单次 encoded
 delivery 最多 16 MiB；这不是 JVM/Rust 总内存或 WAL 磁盘硬配额。
 
@@ -345,7 +348,7 @@ delivery 最多 16 MiB；这不是 JVM/Rust 总内存或 WAL 磁盘硬配额。
 
 不增加 delivery receipt 或用 checkpoint 充当批次 ID：回滚没有 ACK，D2 原样重投 outstanding；
 checkpoint/output 已提交但 ACK 不确定时禁止复用旧运行态，从已提交 checkpoint 启动 fresh Engine；
-已经落盘的 output 由正常下游路径继续消费。checkpoint-only heartbeat 返回 `Commit(None)`，不制造
+已经落盘的 output 由相连的 consumer 继续消费。checkpoint-only heartbeat 返回 `Commit(None)`，不制造
 空 Change。零超时 poll 只表示不等待数据，connector 启动及 ACK 仍是有界同步调用；宿主应在
 整轮 Idle 或持续 Backpressured 时安排等待，避免忙轮询。
 
@@ -353,8 +356,8 @@ checkpoint/output 已提交但 ACK 不确定时禁止复用旧运行态，从已
 完整 Schema/值校验及必要的 Arrow buffer 写入仍保留。普通测试证明行为，不宣称 CDC 吞吐基线。
 
 insert 输出 `+after`，delete 输出 `-before`，update 按顺序输出 `-before, +after`。只接受完整旧行、
-精确列 Schema 和正确 source/topic；不排序、不抵消，不把 Debezium delivery 当成 `PostgreSQL` 事务边界。
-不承诺一个源事务的所有行在下游原子可见。
+精确列 Schema 和正确 Debezium metadata/topic；不排序、不抵消，不把 Debezium delivery 当成 `PostgreSQL` 事务边界。
+不承诺一个捕获事务的所有行作为单个 Change 原子可见。
 
 | `PostgreSQL` | Arrow | 试点约束 |
 | --- | --- | --- |
@@ -388,19 +391,19 @@ snapshot、TLS 配置、跨实例 fencing、自动变更外部资源或 graceful
 完整宿主示例在 `crates/flow/examples/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
 进程恢复由 `tools/check_postgres_cdc.py` 显式验收，见根目录 TESTING.md。
 
-## `operation::source::SequenceSource`
+## `operation::scan::SequenceScan`
 
-[`operation::source::SequenceSourceDefinition`] 是零输入源，记录首个 `u64` 值。物化后的
-[`operation::source::SequenceSourceOperation`] 只持有复制出的 `start: u64` 和直接的
+[`operation::scan::SequenceScanDefinition`] 是零输入 Scan，记录首个 `u64` 值。物化后的
+[`operation::scan::SequenceScanOperation`] 只持有复制出的 `start: u64` 和直接的
 `Cell<u64>` position；首次产生 `start`，随后根据最后一次已提交的值逐一递增。每个 turn 产生一行，输出固定为一个
 non-null `UInt64` `value` 字段，所有 diff 都是 `+1`。包含 `u64::MAX` 的最后一批可以成功提交，
-后续 turn 的 `apply` 返回 `Action::Idle`，不再写 position 或产生 output，使 Flow 仍能调度下游并排空已经提交的
+后续 turn 的 `apply` 返回 `Action::Idle`，不再写 position 或产生 output，使 Flow 仍能调度 consumers 并排空已经提交的
 Change。每次产生值的 turn 返回 `Action::Commit(Some(_))`；Station 不为
-Source 建立另一套 outcome 或事务路径。它声明自己产生输出。
+Scan 建立另一套 outcome 或事务路径。它声明自己产生输出。
 
 Schema bind 不接收输入，并固定完整 output Schema 为一个 non-null `UInt64` `value` 字段。
 
-它声明一个逻辑数据名 `sequence_source.position`，由 Flow 解析为稳定 Station 资源名。
+它声明一个逻辑数据名 `sequence_scan.position`，由 Flow 解析为稳定 Station 资源名。
 
 ## `operation::transform::RunningEventCount`
 
@@ -411,7 +414,7 @@ Schema bind 不接收输入，并固定完整 output Schema 为一个 non-null `
 单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
 [`operation::transform::RunningEventCountError::Overflow`]。`RunningEventCount` 显式声明为携带一个输入的
 [`OperationKind::Transform`]；拓扑位置不会把它隐式变成 Sink，因此完整 Flow 必须把它连接到
-一个下游 Sink。
+一个 Sink。
 
 `RunningEventCount` 只声明 `running_event_count.count: Cell<u64>`，当前 Definition tag 为 `2`，output
 字段为 `count`；公共 Rust API、逻辑 data 名与 Flow 路径同时采用清晰名称，资源为
@@ -514,7 +517,7 @@ exact common Schema；每个 turn 在转发前校验 runtime input，并以包�
 的 [`operation::transform::UnionAllError::InputSchemaMismatch`] 拒绝漂移，不产生 output 或持久写入。
 合法输入按收到的端口原样 clone 完整 Change，
 因此保持该端口的行序、diff 和 Arrow buffer。它与 SQL `UNION ALL` 一样不定义跨输入顺序；端口间
-交织由 Station 统一调度，可随上游分批和可用性变化。需要业务级总序时应另建显式排序或 barrier 语义。
+交织由 Station 统一调度，可随各 input 的分批和可用性变化。需要业务级总序时应另建显式排序或 barrier 语义。
 
 ## `operation::sink::Discard`
 
@@ -602,7 +605,7 @@ Definition、bind、materialize 与 Flow build/open 均不联网，无 `PostgreS
 最多 1598 个逻辑字段，字段名须能逐字表示，不能与技术列或精确小写系统列冲突。
 列数上限不保证任意宽行均可写入，仍受 PG tuple/page 限制。Boolean 与可无损表示的整数使用
 带约束标量，Date32/Timestamp 使用原始整数；Utf8（含 NUL）、Binary、List、Struct 使用 `bytea`，
-`UInt64`、浮点、Decimal128 使用定长 `bytea`。这是无损关系存储，不是源表 DDL 镜像；
+`UInt64`、浮点、Decimal128 使用定长 `bytea`。这是无损关系存储，不是输入表 DDL 镜像；
 普通不含 NUL 的文本可用 `convert_from(column, 'UTF8')` 查询。无隐式转换、额外视图、TLS
 或在线 Schema evolution。
 
@@ -612,7 +615,7 @@ Definition、bind、materialize 与 Flow build/open 均不联网，无 `PostgreS
 
 ## 扩展约束
 
-新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
+新增内建 Operation 时，在 `operation/scan`、`operation/transform` 或 `operation/sink`
 模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
 `Operation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec、纯 Schema bind 与一次性物化逻辑；公共 decoder 表只增加一条
@@ -664,7 +667,7 @@ happy-path 单测都不能替代这些答案。
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
-`correctness` target，按 `codec`、`definition`、`postgres`、`postgres_sink`、`protocol`、`runtime` 与 `sqlite_sink` 分区。protocol 直接验证上述队列
+`correctness` target，按 `codec`、`definition`、`postgres_cdc`、`postgres_sink`、`protocol`、`runtime` 与 `sqlite_sink` 分区。protocol 直接验证上述队列
 例子的恢复状态机，runtime 覆盖内建算子与 borrowed delivery 的提交时序。Definition v1 使用版本化黄金字节约束，
 Schema 测试覆盖十二个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
@@ -690,8 +693,8 @@ tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state C
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 当前覆盖除
-`SqliteSink`、`PostgresSource`、`PostgresSink` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
-durable commit 的完整事务，只直接测 `SequenceSource` 与 `RunningEventCount`。这两个 case 利用
+`SqliteSink`、`PostgresCdcScan`、`PostgresSink` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
+durable commit 的完整事务，只直接测 `SequenceScan` 与 `RunningEventCount`。这两个 case 利用
 crate 内部完全事务型适配器的结构性空 completion 保留既有 turns-per-transaction 口径，不适用于
 带事务外准备或 `AfterCommit` 的 Operation。固定大小 Cell 的长稳
 归 Store 所有，因此当前不设置 Operation endurance。

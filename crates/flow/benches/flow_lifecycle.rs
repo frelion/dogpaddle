@@ -7,8 +7,7 @@ use std::{
 use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
-    sink::DiscardDefinition, source::SequenceSourceDefinition,
-    transform::RunningEventCountDefinition,
+    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 
 const BENCHMARK: &str = "flow_lifecycle";
@@ -131,7 +130,7 @@ fn measure_reopen(path: &Path, station_count: usize) -> Duration {
 
 fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let mut previous = factory.station("source", SequenceSourceDefinition::new(0));
+    let mut previous = factory.station("scan", SequenceScanDefinition::new(0));
     factory.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..station_count - 1 {
         let current = factory.station(
@@ -151,7 +150,7 @@ fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
     assert_eq!(flow.path(), path);
     assert_eq!(flow.station_count(), station_count);
     let mut ids = flow.station_ids();
-    assert_eq!(ids.next(), Some("source"));
+    assert_eq!(ids.next(), Some("scan"));
     for index in 1..station_count - 1 {
         let expected = format!("count-{index:08x}");
         assert_eq!(ids.next(), Some(expected.as_str()));

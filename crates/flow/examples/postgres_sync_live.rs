@@ -14,20 +14,20 @@ use std::{
 
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
+    scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
     sink::{PostgresSinkConfig, PostgresSinkDefinition},
-    source::{PostgresSourceConfig, PostgresSourceDefinition},
 };
 use serde_json::json;
 
-const SOURCE_ID: &str = "source";
+const SCAN_ID: &str = "scan";
 const SINK_ID: &str = "target";
 const DATABASE: &str = "postgres";
-const SOURCE_SCHEMA: &str = "source";
+const CAPTURED_SCHEMA: &str = "source";
 const TARGET_SCHEMA: &str = "target";
 const TABLE: &str = "orders";
 const SLOT: &str = "orders_slot";
 const PUBLICATION: &str = "orders_publication";
-const SOURCE_ENGINE: &str = "readme_source";
+const SCAN_ENGINE: &str = "readme_scan";
 const TARGET_SINK_ID: &str = "readme_sink";
 
 type DemoError = Box<dyn Error>;
@@ -55,14 +55,14 @@ impl Options {
         })
     }
 
-    fn source_config(&self) -> Result<PostgresSourceConfig, DemoError> {
-        Ok(PostgresSourceConfig::new_unencrypted(
+    fn scan_config(&self) -> Result<PostgresCdcScanConfig, DemoError> {
+        Ok(PostgresCdcScanConfig::new_unencrypted(
             &self.runtime_bundle,
             "127.0.0.1",
             self.port,
             DATABASE,
             "dogpaddle_demo",
-            env::var("DOGPADDLE_SOURCE_PASSWORD")?,
+            env::var("DOGPADDLE_SCAN_PASSWORD")?,
         )?)
     }
 
@@ -101,10 +101,10 @@ fn main() -> Result<(), DemoError> {
 }
 
 fn build_flow(options: &Options) -> Result<Flow, DemoError> {
-    let source_config = options.source_config()?;
-    let source = PostgresSourceDefinition::try_new(source_config.discover(
-        SOURCE_ENGINE,
-        SOURCE_SCHEMA,
+    let scan_config = options.scan_config()?;
+    let scan = PostgresCdcScanDefinition::try_new(scan_config.discover(
+        SCAN_ENGINE,
+        CAPTURED_SCHEMA,
         TABLE,
         SLOT,
         PUBLICATION,
@@ -117,21 +117,21 @@ fn build_flow(options: &Options) -> Result<Flow, DemoError> {
     )?)?;
 
     let mut factory = FlowFactory::new(&options.flow_path);
-    let source_station = factory.station(SOURCE_ID, source);
+    let scan_station = factory.station(SCAN_ID, scan);
     let sink_station = factory.station(SINK_ID, sink);
     factory.output_capacity_bytes(
-        source_station,
+        scan_station,
         NonZeroU64::new(1024 * 1024).expect("one MiB is nonzero"),
     );
-    factory.connect([source_station], sink_station);
-    factory.resource(SOURCE_ID, source_config)?;
+    factory.connect([scan_station], sink_station);
+    factory.resource(SCAN_ID, scan_config)?;
     factory.resource(SINK_ID, sink_config)?;
     Ok(factory.build()?)
 }
 
 fn open_flow(options: &Options) -> Result<Flow, DemoError> {
     let mut factory = FlowFactory::new(&options.flow_path);
-    factory.resource(SOURCE_ID, options.source_config()?)?;
+    factory.resource(SCAN_ID, options.scan_config()?)?;
     factory.resource(SINK_ID, options.sink_config()?)?;
     Ok(factory.open()?)
 }

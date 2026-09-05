@@ -38,13 +38,13 @@ pub(super) fn bind_operations(
 
     for &station in topology.schedule() {
         let input_schemas = topology
-            .sources(station)
+            .inputs(station)
             .iter()
-            .map(|&source| {
-                bindings[source]
+            .map(|&input| {
+                bindings[input]
                     .as_ref()
                     .and_then(OperationBinding::output_schema)
-                    .expect("a scheduled, validated upstream must have a bound output Schema")
+                    .expect("a scheduled, validated input must have a bound output Schema")
                     .clone()
             })
             .collect::<Vec<_>>();

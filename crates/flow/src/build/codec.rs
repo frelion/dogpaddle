@@ -27,19 +27,19 @@ pub enum FlowDefinitionError {
     /// The Flow definition format version is unsupported.
     #[error("unsupported flow definition format version {0}")]
     UnsupportedVersion(u16),
-    /// A station or source ID is not valid UTF-8.
+    /// A station or input ID is not valid UTF-8.
     #[error("flow definition contains an invalid UTF-8 station ID")]
     InvalidUtf8,
     /// A length cannot be represented by the durable format.
     #[error("{0} is too large for the flow definition format")]
     LengthOverflow(&'static str),
-    /// A source ID does not identify a declared station.
-    #[error("station {station:?} references unknown source {source_id:?}")]
-    UnknownSource {
-        /// Station containing the invalid source reference.
+    /// An input ID does not identify a declared station.
+    #[error("station {station:?} references unknown input {input_id:?}")]
+    UnknownInput {
+        /// Station containing the invalid input reference.
         station: String,
-        /// Missing source ID.
-        source_id: String,
+        /// Missing input ID.
+        input_id: String,
     },
     /// One operation definition is invalid or unsupported.
     #[error(transparent)]
@@ -85,11 +85,11 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
                 .map_or(0, NonZeroU64::get)
                 .to_be_bytes(),
         );
-        let source_count = u32::try_from(station.sources().len())
-            .map_err(|_| FlowDefinitionError::LengthOverflow("source count"))?;
-        encoded.extend_from_slice(&source_count.to_be_bytes());
-        for source in station.sources() {
-            encode_string(&mut encoded, source, "source ID")?;
+        let input_count = u32::try_from(station.inputs().len())
+            .map_err(|_| FlowDefinitionError::LengthOverflow("input count"))?;
+        encoded.extend_from_slice(&input_count.to_be_bytes());
+        for input in station.inputs() {
+            encode_string(&mut encoded, input, "input ID")?;
         }
     }
     let checksum = crc32(&encoded);
@@ -131,16 +131,16 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
         let id = cursor.read_string()?;
         let operation = decode_definition(cursor.read_bytes()?)?;
         let output_capacity_bytes = NonZeroU64::new(cursor.read_u64()?);
-        let source_count = cursor.read_u32()?;
-        let mut sources = Vec::new();
-        for _ in 0..source_count {
-            sources.push(cursor.read_string()?);
+        let input_count = cursor.read_u32()?;
+        let mut inputs = Vec::new();
+        for _ in 0..input_count {
+            inputs.push(cursor.read_string()?);
         }
         stations.push(StationDefinition {
             id,
             operation,
             output_capacity_bytes,
-            sources,
+            inputs,
         });
     }
     if !cursor.is_empty() {
@@ -154,7 +154,7 @@ fn validate_definition(
     stations: Vec<StationDefinition>,
 ) -> Result<FlowDefinition, FlowDefinitionError> {
     validate_station_ids(&stations)?;
-    let sources_by_target = {
+    let inputs_by_station = {
         let ids = stations
             .iter()
             .enumerate()
@@ -163,17 +163,17 @@ fn validate_definition(
         stations
             .iter()
             .map(|station| {
-                if station.sources.is_empty() {
+                if station.inputs.is_empty() {
                     return Ok(None);
                 }
                 station
-                    .sources
+                    .inputs
                     .iter()
-                    .map(|source| {
-                        ids.get(source.as_str()).copied().ok_or_else(|| {
-                            FlowDefinitionError::UnknownSource {
+                    .map(|input| {
+                        ids.get(input.as_str()).copied().ok_or_else(|| {
+                            FlowDefinitionError::UnknownInput {
                                 station: station.id.clone(),
-                                source_id: source.clone(),
+                                input_id: input.clone(),
                             }
                         })
                     })
@@ -182,7 +182,7 @@ fn validate_definition(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    validate_decoded_topology(&stations, &sources_by_target)?;
+    validate_decoded_topology(&stations, &inputs_by_station)?;
     Ok(FlowDefinition::new(stations))
 }
 

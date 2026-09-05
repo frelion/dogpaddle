@@ -116,16 +116,16 @@ impl FlowFactory {
         reference
     }
 
-    /// Declares the target's complete, ordered source list.
+    /// Declares a Station's complete, ordered input list.
     ///
-    /// Call this exactly once for operations with inputs. Zero-input sources do
+    /// Call this exactly once for operations with inputs. Scans do
     /// not need a connection. Input order is preserved in the durable definition.
-    pub fn connect<I>(&mut self, sources: I, target: StationRef) -> &mut Self
+    pub fn connect<I>(&mut self, inputs: I, station: StationRef) -> &mut Self
     where
         I: IntoIterator<Item = StationRef>,
     {
         self.connections
-            .push((sources.into_iter().collect(), target));
+            .push((inputs.into_iter().collect(), station));
         self
     }
 

@@ -282,7 +282,7 @@ tmux select-pane -t "$left"
     start_host() {
         local mode="$1"
         local number="$2"
-        DOGPADDLE_SOURCE_PASSWORD=recording-secret-not-persisted \
+        DOGPADDLE_SCAN_PASSWORD=recording-secret-not-persisted \
         DOGPADDLE_TARGET_PASSWORD=recording-secret-not-persisted \
             "$binary" "$mode" "$flow_path" "$bundle" "$port" \
             <"$host_input" >"$host_output" \
@@ -410,7 +410,7 @@ tmux select-pane -t "$left"
     status 'source.orders'
     status '    │ WAL / pgoutput'
     status '    ▼ Arrow Change'
-    status 'PostgresSource → PostgresSink'
+    status 'PostgresCdcScan → PostgresSink'
     status '    │ stable IDs + batched writes'
     status '    ▼'
     status 'target.orders'

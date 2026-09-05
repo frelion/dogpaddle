@@ -381,33 +381,33 @@ pub(super) fn measure_readers(
             let transaction = fixture
                 .transactions
                 .begin()
-                .expect("begin downstream transaction");
+                .expect("begin consumer transaction");
             let mut station_state = fixture.reader_states[reader]
                 .access(transaction.access())
-                .expect("access downstream station state");
+                .expect("access consumer station state");
             let cursor = station_state
                 .get(&CURSOR_KEY.to_vec())
-                .expect("read downstream cursor")
+                .expect("read consumer cursor")
                 .map(decode_cursor)
-                .expect("seeded downstream cursor");
+                .expect("seeded consumer cursor");
             let input = fixture
                 .input
                 .access(transaction.access())
-                .expect("access downstream input log");
+                .expect("access consumer input log");
             let scan = input
                 .scan(cursor, scan_limit(record_bytes, batch_items), |entry| {
                     checksum = checksum.wrapping_add(entry.project(decode_diff)?);
                     deliveries += 1;
                     Ok::<(), StoreError>(())
                 })
-                .expect("scan downstream input");
+                .expect("scan consumer input");
             station_state
                 .put(
                     &CURSOR_KEY.to_vec(),
                     &scan.next_offset.to_be_bytes().to_vec(),
                 )
-                .expect("advance downstream cursor");
-            transaction.commit().expect("commit downstream transaction");
+                .expect("advance consumer cursor");
+            transaction.commit().expect("commit consumer transaction");
             if scan.caught_up {
                 *done = true;
                 active -= 1;

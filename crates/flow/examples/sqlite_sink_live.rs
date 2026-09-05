@@ -5,8 +5,8 @@ use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
     cast, col, lit,
     operation::{
+        scan::SequenceScanDefinition,
         sink::SqliteSinkDefinition,
-        source::SequenceSourceDefinition,
         transform::{ExtendDefinition, FilterDefinition, SelectDefinition},
     },
 };
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let sqlite_path = root.join("events.sqlite");
 
     let mut factory = FlowFactory::new(&flow_path);
-    let source = factory.station("source", SequenceSourceDefinition::new(0));
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let extend = factory.station(
         "extend",
         ExtendDefinition::try_new("number", cast(col("value"), DataType::Int64))?,
@@ -64,10 +64,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         SqliteSinkDefinition::try_new(&sqlite_path, "even_squares")?,
     );
 
-    for station in [source, extend, filter, select] {
+    for station in [scan, extend, filter, select] {
         factory.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
     }
-    factory.connect([source], extend);
+    factory.connect([scan], extend);
     factory.connect([extend], filter);
     factory.connect([filter], select);
     factory.connect([select], sink);

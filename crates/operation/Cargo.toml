@@ -41,8 +41,8 @@ name = "correctness"
 path = "tests/correctness.rs"
 
 [[example]]
-name = "queue_source"
-path = "examples/queue_source.rs"
+name = "queue_scan"
+path = "examples/queue_scan.rs"
 
 [[example]]
 name = "postgres_sink_recovery"

@@ -1,4 +1,4 @@
-# DogPaddle Debezium Source 路线图
+# DogPaddle Debezium Scan 路线图
 
 本文固化 DogPaddle 引入 Debezium Engine 的 D0–D7 实施顺序、阶段边界和通过门槛。
 它是 [GitHub #2](https://github.com/frelion/dogpaddle/issues/2) 的仓库内路线基线，不表示尚未通过验收的能力已经交付。
@@ -16,8 +16,8 @@ Temurin JRE、不回退系统 Java 的四平台 payload。D3–D7 仍保持开�
 完成而提前声明 durable ingress、`Change` 转换或可发布性。
 
 2026-09-05 实现补充：统一 turn 协议之后，D3 的持久交接与 D4 的转换收敛到一个具体
-`PostgresSource`，不再单独公开通用 IngressSource。已有固定 Schema、只读 discovery、运行资源装配、
-checkpoint 与 Station output 同事务提交、commit 后 ACK 的实现；不再保存 Source pending。
+`PostgresCdcScan`，不再单独公开通用 IngressScan。已有固定 Schema、只读 discovery、运行资源装配、
+checkpoint 与 Station output 同事务提交、commit 后 ACK 的实现；不再保存 Scan pending。
 真实本机验收使用 `tools/check_postgres_cdc.py`。
 这不等于关闭 D3/D4 的全部阶段验收，也不改变 D5 发布、D6 snapshot 和 D7 第二 connector 的开放状态。
 
@@ -70,25 +70,25 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 1. `Operation::turn` 在没有活动 MDBX 写事务时运行，可以惰性初始化资源、连网或执行一次有界
    poll；它不得 ACK、确认外部工作或提前推进影响重放的事实。事务内工作由线性
    `PreparedTurn::apply` 承接，外部确认只能放在 commit 后消费的 `AfterCommit`。
-2. 外部 Source 与其他 Operation 仍使用同一个 `turn → PreparedTurn → Action → AfterCommit`
-   协议；不新建 Source 专用 Station 调度协议或 Flow 运行入口。
+2. 外部 Scan 与其他 Operation 仍使用同一个 `turn → PreparedTurn → Action → AfterCommit`
+   协议；不新建 Scan 专用 Station 调度协议或 Flow 运行入口。
 3. Flow 长期唯一持有 `Transactions`；Station、Operation、bridge 和 Java 线程都不得保存
    事务启动能力。
 4. `FlowFactory::build/open` 继续先 canonical decode、全图 Schema bind，再创建或打开资源；
    它们不连接数据库、不启动 JVM、不解析 secret。
 5. 外部 delivery 只能由对应 prepared turn 的 `AfterCommit` 在 checkpoint 与 Station output
    同事务 commit 后 ACK；rollback、背压或 commit 失败只丢弃 completion，绝不 ACK。
-6. PostgresSource 不保存 pending 或直接访问 output log；`apply` 返回 Change，由 Station 追加。
+6. PostgresCdcScan 不保存 pending 或直接访问 output log；`apply` 返回 Change，由 Station 追加。
    输出 Schema 失配、容量拒绝或 commit 失败都不推进 checkpoint/output，未 ACK 的 delivery 由 D2 重投。
 7. MDBX 是 accepted connector offset 的唯一 durable 真相。Java 侧 offset store 只是 Engine 运行适配，
    必须能从 MDBX 的 opaque bytes 重建。
-8. Definition 只持久精确 Schema、非敏感 source identity 和行为配置；密码、token
+8. Definition 只持久精确 Schema、非敏感 scan identity 和行为配置；密码、token
    和完整 secret DSN 只属于未来装配到运行 Operation 的临时资源。
 9. Java bridge 不向 Rust 借用 `SourceRecord`、`ByteBuffer` 或 JNI local reference；`poll` 返回
    版本化的 owned bytes。
 10. 不为第一个 PostgreSQL connector 引入 Flow/Station 中的 connector enum、PG 分支或动态
     Store catalog 旁路。
-11. D2/D3 不提前发明 generation、lease、通用 SourceDriver 或 runtime coordinator；并发 connector
+11. D2/D3 不提前发明 generation、lease、通用 ScanDriver 或 runtime coordinator；并发 connector
     fencing 在 D5、snapshot generation 在 D6 分别以真实需求落地。
 
 ## 版本、构建与许可证策略
@@ -216,7 +216,7 @@ bridge 在 Engine callback 中只保留一个 delivery；Rust 主动 poll，显�
 D2 已将 D1 的控制原型重做成独立 `dogpaddle-debezium` 产品 crate。它的 Rust API 与 Java
 bridge 只依赖通用 Engine/Kafka Connect 契约，不依赖 Change、Store、Operation、Flow，也没有
 PostgreSQL 代码分支；D2 的参考发行包包含 PostgreSQL connector，作为第一个真实试点。
-它不创建通用 `SourceDriver` trait，也不定义行到 Arrow 的映射或 snapshot。
+它不创建通用 `ScanDriver` trait，也不定义行到 Arrow 的映射或 snapshot。
 
 D2 冻结的公开调用面为：
 
@@ -337,9 +337,9 @@ host runtime、bridge、delivery codec 或生命周期实现，它只保留调�
 ### 边界
 
 D3 先扩展所有 Operation 共用的 turn 协议，再在这个协议上实现持久输入。协议不是流数据专用：任何
-需要“事务外准备 → 事务内状态变更 → 提交后副作用”的 Source、Transform 或 Sink 都使用同一个
+需要“事务外准备 → 事务内状态变更 → 提交后副作用”的 Scan、Transform 或 Sink 都使用同一个
 模型。Flow build/open 不解析 connector config，不调用 JNI、JDK 或 Debezium；它只把不透明的
-运行资源装配进 Operation，具体 Debezium 适配属于 D4 的 Source 实现。
+运行资源装配进 Operation，具体 Debezium 适配属于 D4 的 Scan 实现。
 
 ### 已完成：统一 Operation 协议
 
@@ -360,14 +360,14 @@ checkpoint，并在提交后的内存 completion 中进入 ready 状态；下一
 driver。无需 `restore/start/poll/ack` 多套方法，也无需 Flow 知道 Operation 当前处于哪个阶段。
 完整可运行的队列示例与同代码恢复测试见 [Operation 运行协议](crates/operation/README.md#operation-运行协议)。
 
-### 当前实现：PostgresSource 内部的持久交接
+### 当前实现：PostgresCdcScan 内部的持久交接
 
-- 一个固定 exact output Schema、走普通 `turn(None)` 的 `PostgresSourceDefinition`；
-- 唯一 `postgres_source.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
-  复用 D2 的 versioned framing/checksum，不加 Source envelope；
+- 一个固定 exact output Schema、走普通 `turn(None)` 的 `PostgresCdcScanDefinition`；
+- 唯一 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
+  复用 D2 的 versioned framing/checksum，不加额外 envelope；
 - Operation 在事务外执行零超时 `poll/convert`，`apply` 保存 checkpoint 并返回可选 Change，
   Station 在同一事务追加 output，提交后以 `AfterCommit` 消费式 ACK；
-- 不保存 Source pending，不增加交接 turn；零超时只让 poll 不等待数据，启动和 ACK 仍同步且有界；
+- 不保存 Scan pending，不增加交接 turn；零超时只让 poll 不等待数据，启动和 ACK 仍同步且有界；
 - 运行资源的显式装配边界；它不进入 `DataInstances`，不让 Flow 枚举 connector，也不在 build/open
   启动 JVM 或解析 secret。
 
@@ -388,7 +388,7 @@ ACK 不确定立即 fail-stop 并以持久 checkpoint 重启。因此不需要�
   `AfterCommit`；
 - accepted checkpoint 与可选 Station output 同一写事务提交；
 - 只有 commit 成功后才允许 ACK；rollback/backpressure/error 不 ACK；
-- PostgresSource 通过普通 `turn(None)` 返回 Change，由 Station 完成 output append；
+- PostgresCdcScan 通过普通 `turn(None)` 返回 Change，由 Station 完成 output append；
 - output capacity、Schema guard、Operation error 和 commit failure 都不推进 checkpoint/output；
 - commit 前崩溃重投未接纳 delivery；commit 后、ACK 前崩溃从 checkpoint 恢复，不重复已接纳 output；
 - checkpoint-only delivery 只推进 resume state；
@@ -427,7 +427,7 @@ Arrow Schema，不处理在线 DDL/schema evolution。
 
 ### 交付
 
-- PostgreSQL Source 的非敏感持久 definition：database/source identity、publication/slot/table
+- PostgreSQL CDC Scan 的非敏感持久 definition：database/scan identity、publication/slot/table
   identity、精确 Arrow Schema 和转换选项；
 - 在 `FlowFactory` 之前运行的显式 discovery/planning API，把 PostgreSQL catalog 结果固化为
   Definition；build/open/bind 不查询 PostgreSQL；
@@ -453,10 +453,10 @@ DogPaddle 不能伪造完整 `-1` 记录；在有独立状态重建设计之前�
 
 ### 退出条件
 
-一个不使用 `SequenceSource` 的真实 Flow 能执行
+一个不使用 `SequenceScan` 的真实 Flow 能执行
 
 ```text
-PostgreSQL CDC → PostgresSource → Transform → SqliteSink → drop/reopen
+PostgreSQL CDC → PostgresCdcScan → Transform → SqliteSink → drop/reopen
 ```
 
 并由 PostgreSQL 源表变更与 SQLite 最终关系共同校验 insert/update/delete。所有支持类型、
@@ -495,7 +495,7 @@ Snapshot、在线 DDL 和第二 connector 仍非目标。
 
 - 在每个持久或外部副作用前后强制 kill/restart，不丢失已 ACK payload，最终关系不重复；
 - 第二个驱动者不能抢占已活动 identity，过期 generation/lease 的 ACK 被拒绝；
-- 长时间下游背压时内存受控，WAL lag 可观察，解压后按原顺序追平；
+- 长时间 consumer 背压时内存受控，WAL lag 可观察，解压后按原顺序追平；
 - PostgreSQL 重启、断网、认证失效、slot 丢失、JVM exception 和 stop timeout 有稳定分类；
 - 并发多 Flow/connector 长稳测试没有 deadlock、JNI local/global reference 泄漏或无界队列增长；
 - 对锁定版本的升级 rehearsal 明确得出“可直接 reopen”或“必须重建”，不猜测迁移。
@@ -503,7 +503,7 @@ Snapshot、在线 DDL 和第二 connector 仍非目标。
 ### 退出条件
 
 持续 CDC 的 correctness、fault-injection、长稳、性能基线、运维手册、支持平台与依赖物料表
-同时完成。在此之前不宣称 PostgreSQL Source 可用于生产；在 D6 之前明确标注
+同时完成。在此之前不宣称 PostgreSQL CDC Scan 可用于生产；在 D6 之前明确标注
 “不包含初始全量”。
 
 ### 主要风险
@@ -545,8 +545,8 @@ snapshot/WAL 交接和 DogPaddle 恢复语义，才另立 ADR 评估“Rust 读 
 
 ### 退出条件
 
-大表、并发写、全部阶段崩溃和下游长时背压的模型/端到端验收通过；文档能明确
-说明 generation 从哪个 PostgreSQL 一致性位置产生、哪个 durable 事实将 Source 切换为
+大表、并发写、全部阶段崩溃和 consumer 长时背压的模型/端到端验收通过；文档能明确
+说明 generation 从哪个 PostgreSQL 一致性位置产生、哪个 durable 事实将 Scan 切换为
 Streaming。
 
 ### 主要风险
@@ -560,7 +560,7 @@ Streaming。
 
 ### 边界
 
-D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一个“支持所有 Source”的
+D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一个“支持所有 Scan”的
 抽象。具体 connector 在 D5 后根据用户价值与 fixture 成本选择；MySQL 是自然候选，
 但 D0 不冻结它。
 
@@ -584,7 +584,7 @@ D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一
 
 第二 connector 在不更改 Flow/Station 核心契约、不 fork Debezium、不增加 sidecar 的前提下
 达到与 PostgreSQL streaming pilot 同级的 correctness/reopen 证据。到此才能宣称 Debezium
-路径是多 Source 架构，而不是“恰好能跑 PostgreSQL”。
+路径是多 Scan 架构，而不是“恰好能跑 PostgreSQL”。
 
 ### 主要风险
 
@@ -612,6 +612,6 @@ D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一
 - 在 Rust 中重写 PostgreSQL logical replication 协议以取代 Debezium；
 - D1 就承诺 durable recovery，D4 就承诺 initial snapshot；
 - 动态 Schema evolution、DDL migration 或一条 Station 中的多 Schema 数据流；
-- 跨 PostgreSQL 与 MDBX 的分布式事务或 exactly-once 上游提交宣称；
+- 跨 PostgreSQL 与 MDBX 的分布式事务或 exactly-once connector offset commit 宣称；
 - 在第二 connector 之前发布稳定的通用 connector 插件 ABI；
 - 通过 fork Debezium、复制 RisingWave 的内部 class override 或自维护 Java CDC 引擎换取短期便利。

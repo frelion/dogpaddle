@@ -2,8 +2,8 @@
 mod codec;
 #[path = "correctness/definition.rs"]
 mod definition;
-#[path = "correctness/postgres.rs"]
-mod postgres;
+#[path = "correctness/postgres_cdc.rs"]
+mod postgres_cdc;
 #[path = "correctness/postgres_sink.rs"]
 mod postgres_sink;
 #[path = "correctness/protocol.rs"]

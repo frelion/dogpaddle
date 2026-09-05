@@ -11,7 +11,7 @@ use dogpaddle_change::Change;
 use dogpaddle_debezium::Record;
 use serde_json::{Map, Value};
 
-use super::{PostgresColumn, PostgresSourceError, PostgresType};
+use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
 
 type Row = Map<String, Value>;
 
@@ -22,7 +22,7 @@ pub(super) fn convert_records(
     table_schema: &str,
     table: &str,
     records: &[Record],
-) -> Result<Option<Change>, PostgresSourceError> {
+) -> Result<Option<Change>, PostgresCdcScanError> {
     convert_values(
         columns,
         output_schema,
@@ -44,7 +44,7 @@ pub(super) fn convert_values<'a>(
     table_schema: &str,
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
-) -> Result<Option<Change>, PostgresSourceError> {
+) -> Result<Option<Change>, PostgresCdcScanError> {
     let table_topic = format!("{topic_prefix}.{table_schema}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
     let mut rows = Vec::new();
@@ -71,7 +71,7 @@ pub(super) fn convert_values<'a>(
             .get_mut("payload")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| invalid("missing object field payload"))?;
-        validate_source(payload, table_schema, table)?;
+        validate_metadata(payload, table_schema, table)?;
         let before = payload
             .remove("before")
             .ok_or_else(|| invalid("missing before"))?;
@@ -106,30 +106,30 @@ pub(super) fn convert_values<'a>(
     Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
 }
 
-fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, PostgresSourceError> {
+fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, PostgresCdcScanError> {
     value
         .get(field)
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("missing object field {field}")))
 }
 
-fn validate_source(
+fn validate_metadata(
     payload: &Row,
     table_schema: &str,
     table: &str,
-) -> Result<(), PostgresSourceError> {
-    let source = payload
+) -> Result<(), PostgresCdcScanError> {
+    let metadata = payload
         .get("source")
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid("missing source metadata"))?;
+        .ok_or_else(|| invalid("missing Debezium CDC metadata"))?;
     for (field, expected) in [
         ("schema", table_schema),
         ("table", table),
         ("connector", "postgresql"),
     ] {
-        if source.get(field).and_then(Value::as_str) != Some(expected) {
+        if metadata.get(field).and_then(Value::as_str) != Some(expected) {
             return Err(invalid(format!(
-                "source metadata does not match configured {field}"
+                "Debezium CDC metadata does not match configured {field}"
             )));
         }
     }
@@ -137,18 +137,18 @@ fn validate_source(
     // unset. Our bridge disables default substitution, so Connect JSON uses
     // null here. Snapshot operations are independently rejected by the op guard.
     if !matches!(
-        source.get("snapshot"),
+        metadata.get("snapshot"),
         Some(Value::Null | Value::Bool(false))
-    ) && source.get("snapshot").and_then(Value::as_str) != Some("false")
+    ) && metadata.get("snapshot").and_then(Value::as_str) != Some("false")
     {
         return Err(invalid(
-            "source metadata does not identify a non-snapshot record",
+            "Debezium CDC metadata does not identify a non-snapshot record",
         ));
     }
     Ok(())
 }
 
-fn validate_envelope(columns: &[PostgresColumn], schema: &Row) -> Result<(), PostgresSourceError> {
+fn validate_envelope(columns: &[PostgresColumn], schema: &Row) -> Result<(), PostgresCdcScanError> {
     if schema.get("type").and_then(Value::as_str) != Some("struct") {
         return Err(invalid("envelope schema must be a struct"));
     }
@@ -213,7 +213,7 @@ fn validate_envelope(columns: &[PostgresColumn], schema: &Row) -> Result<(), Pos
     Ok(())
 }
 
-fn validate_heartbeat(schema: &Row, payload: &Row) -> Result<(), PostgresSourceError> {
+fn validate_heartbeat(schema: &Row, payload: &Row) -> Result<(), PostgresCdcScanError> {
     let fields = schema
         .get("fields")
         .and_then(Value::as_array)
@@ -235,10 +235,10 @@ fn validate_heartbeat(schema: &Row, payload: &Row) -> Result<(), PostgresSourceE
     Ok(())
 }
 
-fn complete_row(columns: &[PostgresColumn], value: Value) -> Result<Row, PostgresSourceError> {
+fn complete_row(columns: &[PostgresColumn], value: Value) -> Result<Row, PostgresCdcScanError> {
     let Value::Object(row) = value else {
         return Err(invalid(
-            "missing complete row image; the source table requires REPLICA IDENTITY FULL",
+            "missing complete row image; the captured table requires REPLICA IDENTITY FULL",
         ));
     };
     if row.len() != columns.len() {
@@ -264,7 +264,7 @@ fn column_values<'a, T>(
     column: &PostgresColumn,
     rows: &'a [Row],
     parse: impl Fn(&'a Value) -> Option<T>,
-) -> Result<Vec<Option<T>>, PostgresSourceError> {
+) -> Result<Vec<Option<T>>, PostgresCdcScanError> {
     rows.iter()
         .map(|row| {
             let value = &row[column.name()];
@@ -282,7 +282,7 @@ fn column_values<'a, T>(
         .collect()
 }
 
-fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, PostgresSourceError> {
+fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, PostgresCdcScanError> {
     Ok(match column.data_type() {
         PostgresType::Boolean => Arc::new(BooleanArray::from(column_values(
             column,
@@ -389,6 +389,6 @@ fn parse_decimal(value: &Value, precision: u8) -> Option<i128> {
     (unscaled.unsigned_abs() < 10_u128.pow(u32::from(precision))).then_some(unscaled)
 }
 
-fn invalid(message: impl Into<String>) -> PostgresSourceError {
-    PostgresSourceError::InvalidRecord(message.into())
+fn invalid(message: impl Into<String>) -> PostgresCdcScanError {
+    PostgresCdcScanError::InvalidRecord(message.into())
 }
