@@ -4,6 +4,7 @@ members = [
     "crates/debezium",
     "crates/flow",
     "crates/operation",
+    "crates/sql",
     "crates/store",
     "integration-tests/change-store",
     "system-tests/debezium-runtime/host",
@@ -32,13 +33,16 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 crc32fast = "=1.5.0"
 datafusion-common = { version = "=55.0.0", default-features = false }
 datafusion-expr = { version = "=55.0.0", default-features = false }
+datafusion-optimizer = { version = "=55.0.0", default-features = false }
 datafusion-physical-expr = { version = "=55.0.0", default-features = false }
 datafusion-proto = { version = "=55.0.0", default-features = false }
+datafusion-sql = { version = "=55.0.0", default-features = false }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-debezium = { path = "crates/debezium" }
 dogpaddle-flow = { path = "crates/flow" }
 dogpaddle-operation = { path = "crates/operation" }
 dogpaddle-perf-context = { path = "test-support/perf-context" }
+dogpaddle-sql = { path = "crates/sql" }
 dogpaddle-store = { path = "crates/store" }
 flatbuffers = { version = "=25.12.19", default-features = false }
 libmdbx = { version = "=0.6.6", default-features = false }

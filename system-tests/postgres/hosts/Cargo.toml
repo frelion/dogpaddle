@@ -26,12 +26,19 @@ path = "src/bin/postgres_sink_recovery.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "postgres_sql"
+path = "src/bin/postgres_sql.rs"
+test = false
+bench = false
+
 [dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
 dogpaddle-change.workspace = true
 dogpaddle-flow.workspace = true
 dogpaddle-operation.workspace = true
+dogpaddle-sql.workspace = true
 dogpaddle-store.workspace = true
 serde_json.workspace = true
 

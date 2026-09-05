@@ -7,15 +7,16 @@
 ## 产品方向
 
 DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、持久化、可恢复、可组合的
-数据流算子与运行内核。未来用户可以通过不同上层接口构造同一套底层 Flow，例如：
+数据流算子与运行内核。用户可以通过不同上层接口构造同一套底层 Flow，例如：
 
 - 直接 Rust Builder；
+- 已交付基础范围的 SQL；
 - 面向常见数据任务的声明式 Pipeline API；
 - DataFrame 风格 API；
-- SQL；
 - 由其他应用或语言编译得到的持久化计划。
 
-这些接口都是候选适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。路线首先回答：
+这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 先用现有
+无状态算子证明这条分层路径，其余接口仍是候选。路线首先回答：
 
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
@@ -56,14 +57,21 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
+当前 `dogpaddle-sql` 接受一条直接的 `INSERT INTO sqlite/postgres/discard(...) Query`，Scan 直接写成
+`FROM sequence/postgres_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，只把 TableScan、
+Projection、Filter、非递归 CTE 与 `UNION ALL` lowering 为现有 Definition DAG。SQL 不建立 DogPaddle
+Table、View、catalog、独立状态或执行层；Join、Aggregate、Distinct、Sort、Limit 和 Window 尚无对应
+底层算子，必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
+这份磁盘 Definition 为恢复真相，SQL 变更要求新路径或显式重建。
+
 ## 目标分层
 
 ```text
 可选用户接口层
 ├── Rust Builder
+├── SQL（基础范围已交付）
 ├── Pipeline DSL
 ├── DataFrame API
-├── SQL
 └── 其他语言或应用适配器
           │
           │ 解析、类型检查、优化、lowering
@@ -186,9 +194,10 @@ Station state。
 
 ### 上层 API 不成为持久化真相
 
-Rust Builder、SQL 或其他接口可以保存自己的 scan 描述，用于解释、重新编译和诊断；未来 SQL 以
-`FROM postgres_cdc` 引用命名 scan。运行时恢复仍基于 canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规则变化导致语义不兼容，
-明确要求重建，不让运行层猜测。
+Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解释、重新编译和诊断；SQL v1 直接以
+`FROM postgres_cdc(...)` 声明 Scan，并以 `INSERT INTO postgres/sqlite(...)` 声明 Sink。运行时恢复仍
+基于 canonical Flow/Operation Definition。若接口版本或 lowering 规则变化导致语义不兼容，明确要求
+重建，不让运行层猜测。
 
 ## 阶段总览
 
@@ -837,17 +846,17 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 能力目录不能成为第二套可绕过 `OperationDefinition::bind` 的校验入口；最终真相仍是 Definition 的
 统一 binding。
 
-### 上层 API 候选
+### 上层 API
 
-| 候选接口 | 主要价值 | 与内核的关系 |
+| 接口 | 状态与主要价值 | 与内核的关系 |
 | --- | --- | --- |
 | Rust Builder | 最直接、类型化、最早可交付 | 直接组装 Definition DAG |
+| SQL | 基础 v1 已交付；单文件表达常见逐行变换 | DataFusion logical plan lowering 为同一 DAG |
 | Pipeline DSL | 面向固定数据任务，配置友好 | 编译为同一 DAG |
 | DataFrame API | 适合程序化关系变换 | 解析表达式并 lowering |
-| SQL | 适合熟悉关系查询的用户 | parser/catalog/planner 后 lowering |
 | 其他语言绑定 | 扩大嵌入范围 | 调用稳定 plan/build/run API |
 
-任何候选接口都不得：
+任何接口都不得：
 
 - 在接口层另存一套运行状态；
 - 绕过 exact Schema binding；
@@ -945,7 +954,8 @@ Join 的全部状态问题。
 - bounded Sort、持续 TopK 和 Window 各自的完成及 retention 边界是什么？
 - 多个 Flow 是否共享输入日志或 arrangement；若共享，由哪个组合根拥有 retention？
 - 何时引入 partition/exchange，而不破坏唯一 writer 和确定性提交？
-- 哪个上层 API 最先产品化，以及它需要哪些只读 capability/introspection？
+- SQL 在 Join、Aggregate、Window 等底层算子完成后扩展到哪些语法，以及何时需要只读
+  capability/introspection？
 
 ## 内核稳定准入定义
 
@@ -962,5 +972,5 @@ Join 的全部状态问题。
 - 至少两个不同的用户接口候选只通过公共 Definition/Flow 能力构建同一内核；
 - 所有跨版本不兼容都被明确拒绝或拥有经过测试的迁移路径。
 
-在此之前，内核可以持续增加算子和承载实验性上层接口，但不为 SQL、DataFrame 或任何单一 API
-提前冻结不合适的抽象。
+在此之前，内核可以持续增加算子和承载基础或实验性的上层接口；也不能让 SQL v1、DataFrame 或
+任何单一 API 反向冻结不合适的内核抽象。

@@ -29,6 +29,45 @@ publication 只包含 `source.orders`，写回不会形成 CDC 回环。停顿�
 - **Arrow + DataFusion**：Arrow 承载批量差分，DataFusion 执行类型化、向量化表达式。
 - **推进权留给应用**：每次 `Flow::advance` 只做有界工作，应用决定运行节奏，慢消费者自然形成软背压。
 
+## 一个 SQL 文件定义完整 Flow
+
+`dogpaddle-sql` 把一条 `INSERT ... SELECT` 编译为现有 Scan、Transform、Sink 和持久化 Flow，
+不引入 Table、View、Catalog 或另一套运行层：
+
+```sql
+INSERT INTO sqlite(
+    path => env('DOGPADDLE_SQLITE_PATH'),
+    table => 'even_squares'
+)
+WITH numbers AS (
+    SELECT value FROM sequence(start => 0)
+)
+SELECT value AS number, value * value AS square
+FROM numbers
+WHERE value % 2 = 0;
+```
+
+```rust
+use dogpaddle_sql::SqlProgram;
+
+let program = SqlProgram::read("flow.sql")?;
+let mut flow = program.build("./flow-state")?;
+flow.advance()?;
+
+drop(flow);
+let mut reopened = program.open("./flow-state")?;
+reopened.advance()?;
+```
+
+Scan endpoint 是 `sequence`、`postgres_cdc`；Sink endpoint 是 `sqlite`、`postgres`、`discard`。
+参数只接受 `name => value`，值为单引号字符串、非负整数或 `env('NAME')`。v1 支持投影、过滤、
+非递归 CTE、派生查询、cast、case 与 `UNION ALL`；Join、Aggregate、Distinct、Sort、Limit、Window、
+子查询表达式和 planner 会忽略的 SQL modifier 都在创建 Store 前拒绝。
+
+`build` 使用 DataFusion 做名称解析和类型 coercion，再 lowering 为 canonical Flow Definition；`open`
+只恢复磁盘中的 Definition，并从当前 SQL 取得端点运行资源。修改 SQL 不会更新已有 Flow，必须换 state
+path 或删除旧 Flow 与独占 Sink 目标后重建。凭据可由 `env` 注入且不写入 Definition。
+
 ## 立即体验
 
 ```sh
@@ -70,6 +109,8 @@ Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建
 - 运行由宿主反复调用 `Flow::advance` 驱动；`Flow::status` 可只读查看各 Station 的游标、积压、容量、
   最近处理结果和是否需要 reopen。尚无 `Flow::start`、后台 runner 或中断控制。
 - Operation 集合目前封闭。
+- SQL v1 只接受一条直接写入一个 Sink endpoint 的 `INSERT ... SELECT`；没有 DDL、Catalog、查询结果返回
+  或自动运行循环。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
 - PostgreSQL 增量链路尚无初始全量、多表路由、TLS、DNS endpoint、在线 Schema evolution 或跨 Flow fencing；
   要物化完整关系，源表须在 slot 起点为空并从该起点开始写入。`PostgresSink` 只创建并独占新目标表，
@@ -84,11 +125,13 @@ Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建
 - [ADR-0001：在 Rust 宿主中嵌入 Debezium Engine](docs/adr/0001-embed-debezium-engine.md)
 - [Debezium：自包含进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
 - [Flow：构建、运行与恢复](crates/flow/README.md)
+- [SQL：单文件语法、lowering 与 reopen](crates/sql/README.md)
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
 - [Store：MDBX 事务与集合](crates/store/README.md)
 - [重新生成 PostgreSQL 增量同步录屏](docs/tools/record_postgres_cdc_live.sh)
 - [PostgreSQL Sink 真实验收](system-tests/postgres/check_sink.py)
+- [SQL PostgreSQL 真实恢复验收](system-tests/postgres/check_sql.py)
 - [重新生成 SQLite Sink 录屏](docs/tools/record_sqlite_sink_live.sh)
 - [SqliteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
 - [Java、Debezium 与 PostgreSQL 系统验收](system-tests/README.md)

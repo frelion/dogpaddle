@@ -20,6 +20,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 - Store 拥有事务、能力边界、集合布局、分页、容量、reopen 和 crash consistency。
 - Operation 拥有 Operation + Store：Definition、稳定 tag/payload、bind、materialize、运行协议、状态和算子语义。
 - Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、资源装配、调度、claim、背压、回收、fail-stop、status 和 reopen。
+- SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering 和 SQL 层 reopen。
 - Debezium 拥有 connector-neutral runtime、bundle、checkpoint、delivery 和 ACK 生命周期。
 - Change 与 Store 的外部组合只由 `integration-tests/change-store/` 证明。
 
@@ -41,6 +42,12 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个�
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
 Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 status 证据必须保留。
+
+### SQL
+
+SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,build,open}` 验证产品契约。证据覆盖全部 v1 endpoint、严格 `name => value`、环境变量脱敏与 build/open 前置解析；别名、qualified column、隐式 cast、CASE、TRY_CAST、CTE fan-out、多 Scan 与 `UNION ALL` lowering；普通表和全部未支持节点在创建 Flow 路径前拒绝。AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
+
+Sequence→SQLite 公共链路验证固定 Station ID、64 MiB output capacity、结果与 diff 经 Sink 的最终关系、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。真实 PostgreSQL gate 另外覆盖 `postgres_cdc → Filter/Select → postgres`、目标提交后本地结算前终止和 reopen 幂等重投。
 
 ### 私有测试拆分
 
@@ -121,6 +128,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```bash
 cargo test -p dogpaddle-store --test correctness transaction::
 cargo test -p dogpaddle-flow --test correctness runtime_corruption::
+cargo test -p dogpaddle-sql --test correctness
 cargo test -p dogpaddle-change-store-integration
 ```
 
@@ -147,6 +155,9 @@ python3 system-tests/postgres/check_cdc.py \
   --postgres-bin /absolute/path/to/postgresql/bin
 python3 system-tests/postgres/check_sink.py \
   --postgres-bin /absolute/path/to/postgresql/bin
+python3 system-tests/postgres/check_sql.py \
+  --bundle /absolute/path/to/runtime-bundle \
+  --postgres-bin /absolute/path/to/postgresql/bin
 ```
 
 `system-tests/debezium-postgres/host` 是独立 Cargo workspace 和 lockfile，只依赖 Debezium crate，作为真实外部消费者。它不进入根 workspace。脚本接口固定为：
@@ -161,11 +172,11 @@ scripts/clean.sh
 `crates/debezium/scripts/audit-upstream-contract.sh` 只在 pin 升级时由升级者显式执行，不属于 D1 的
 `check.sh`、`run.sh` 或日常 CI workflow。
 
-根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink 和 Sink recovery 三个 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 使用。
-两个 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的全部 release bins；CI 传入
+根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink、Sink recovery 和 SQL 四个 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 使用。
+PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。
 
-PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。
+PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink、SQL 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。
 
 ## 新增或删除验证
 

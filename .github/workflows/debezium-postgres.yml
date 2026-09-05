@@ -159,8 +159,9 @@ jobs:
           install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_cdc" "$stage/postgres_cdc"
           install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_sink" "$stage/postgres_sink"
           install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_sink_recovery" "$stage/postgres_sink_recovery"
+          install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_sql" "$stage/postgres_sql"
           tar -czf "$GITHUB_WORKSPACE/target/postgres-system-hosts.tar.gz" \
-            -C "$stage" postgres_cdc postgres_sink postgres_sink_recovery
+            -C "$stage" postgres_cdc postgres_sink postgres_sink_recovery postgres_sql
 
       - name: Upload the native hosts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -334,10 +335,64 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  sql:
+    name: PostgreSQL SQL recovery
+    needs: [build-linux-runtime, build-native-hosts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the SQL artifact directory
+        run: |
+          mkdir -p -- "$RUNNER_TEMP/sql-artifacts"
+          printf 'SQL scenario setup started\n' >"$RUNNER_TEMP/sql-artifacts/setup.log"
+
+      - name: Install PostgreSQL 16
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16 postgresql-16
+
+      - name: Download the Linux runtime and D1 host
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debezium-postgres-linux
+          path: ${{ runner.temp }}/linux-artifact
+
+      - name: Download the native PostgreSQL hosts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgres-system-hosts
+          path: ${{ runner.temp }}/native-artifact
+
+      - name: Run the SQL recovery scenario
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/linux-artifact/debezium-postgres-linux.tar.gz" -C "$RUNNER_TEMP/linux-artifact"
+          tar -xzf "$RUNNER_TEMP/native-artifact/postgres-system-hosts.tar.gz" -C "$RUNNER_TEMP/native-artifact"
+          python3 system-tests/postgres/check_sql.py \
+            --bundle "$RUNNER_TEMP/linux-artifact/bundle" \
+            --host "$RUNNER_TEMP/native-artifact/postgres_sql" \
+            --postgres-bin /usr/lib/postgresql/16/bin \
+            --artifacts-dir "$RUNNER_TEMP/sql-artifacts/scenario" \
+            2>&1 | tee "$RUNNER_TEMP/sql-artifacts/run.log"
+
+      - name: Upload the complete SQL logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debezium-postgres-sql-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sql-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
   summary:
     name: PostgreSQL engine, scan and sink recovery
     if: always()
-    needs: [d1, cdc, sink]
+    needs: [d1, cdc, sink, sql]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every recovery scenario
@@ -345,7 +400,9 @@ jobs:
           D1_RESULT: ${{ needs.d1.result }}
           CDC_RESULT: ${{ needs.cdc.result }}
           SINK_RESULT: ${{ needs.sink.result }}
+          SQL_RESULT: ${{ needs.sql.result }}
         run: |
           test "$D1_RESULT" = success
           test "$CDC_RESULT" = success
           test "$SINK_RESULT" = success
+          test "$SQL_RESULT" = success

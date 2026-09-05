@@ -1,0 +1,34 @@
+[package]
+name = "dogpaddle-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+autotests = false
+autobenches = false
+autoexamples = false
+
+[lib]
+bench = false
+
+[dependencies]
+arrow-schema.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-optimizer.workspace = true
+datafusion-sql.workspace = true
+dogpaddle-flow.workspace = true
+dogpaddle-operation.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[lints]
+workspace = true

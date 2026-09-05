@@ -1,4 +1,4 @@
-"""Small process and PostgreSQL-fixture primitives for the two PG gates.
+"""Small process and PostgreSQL-fixture primitives for the PostgreSQL gates.
 
 This module deliberately knows nothing about DogPaddle host protocols, SQL
 oracles, or scenario state.  D1 is a separate fixture and does not import it.
