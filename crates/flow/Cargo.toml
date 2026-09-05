@@ -36,6 +36,10 @@ path = "examples/postgres_cdc.rs"
 name = "postgres_sink"
 path = "examples/postgres_sink.rs"
 
+[[example]]
+name = "postgres_sync_live"
+path = "examples/postgres_sync_live.rs"
+
 [[bench]]
 name = "flow_lifecycle"
 path = "benches/flow_lifecycle.rs"

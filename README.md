@@ -12,12 +12,14 @@ DogPaddle 是一个为 Rust 应用设计的嵌入式 Dataflow 引擎。它用 Ar
 
 无需独立服务、控制面或流处理集群。
 
-![PostgreSQL CDC 经 DogPaddle 落入 SQLite](docs/assets/postgres-cdc-live.gif)
+![同一个 PostgreSQL 内经 DogPaddle 持续增量同步](docs/assets/postgres-cdc-live.gif)
 
-*真实进程录制：左侧写入 PostgreSQL，中间运行 `PostgresSource → SqliteSink` Flow，右侧用只读
-`sqlite3` 查看 `SqliteSink` 的结果；停顿仅用于演示。*
+*真实进程录制：左侧向同一个 PostgreSQL 的 `source.orders` 写入 INSERT、UPDATE、DELETE；中间运行
+`PostgresSource → PostgresSink`，从 WAL 捕获增量并以 Arrow Change 持久推进；右侧从
+`target.orders` 查询同步结果。中途强制终止并重新打开 Flow host 后，后续变更继续到达目标。
+publication 只包含 `source.orders`，写回不会形成 CDC 回环。停顿仅用于演示；该链路不执行初始快照。*
 
-[查看 Flow host](crates/flow/examples/postgres_cdc.rs) ·
+[查看演示 Flow](crates/flow/examples/postgres_sync_live.rs) ·
 [重新生成录屏](tools/record_postgres_cdc_live.sh)
 
 ## 为什么是 DogPaddle
@@ -50,29 +52,25 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
 在 Sink 独占目标表且数据库未被外部修改或替换的前提下，重放不会重复最终结果。
 
-`PostgresSink` 用同一套 Flow API 把单输入 exact relation 物化到独占的固定 Schema PostgreSQL
-目标。Definition 只保存非敏感 target spec，连接配置在 build/open 时以运行资源注入；每个至多
-1024 项的持久 Prepared 批次在 `AfterCommit` 中把一行 receipt 与全部 mutation 提交到同一 PG
-事务，下一 turn 再以 `Complete` 完成输入或以 `Commit` 保存 continuation。这里没有公共通用 Sink
-trait 或 ORM 抽象。
-
-CDC 基础设施已经有独立的 `dogpaddle-debezium` 产品 crate：它在 Rust 进程内运行 stock
-Debezium Engine，以 connector-neutral 的 `start/poll/ack/stop` 和 opaque pre-ACK checkpoint
-隔离 JNI。Linux GNU 与 macOS 的 x86_64/aarch64 自包含 bundle 随附固定 Temurin JRE，运行时不依赖
-系统 Java。`PostgresSource` 已接到同一 Operation 协议：单表、固定 Schema 的 WAL 事件转换为
-Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pending 中转。
-运行配置显式装配，密码不进入 Definition。
-这是持续 CDC 试点，不是生产发布承诺；[使用与边界](crates/operation/README.md#postgresql-source-试点)。
+`PostgresSource → PostgresSink` 已形成首条 PostgreSQL 到 PostgreSQL 的持续增量链路。Source 借助
+进程内 `dogpaddle-debezium` 从单表 WAL 捕获固定 Schema 事件，并在 checkpoint 与 Station output
+同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，每个 Prepared 批次把 receipt
+与 mutation 放在同一个 PostgreSQL 事务中，使提交窗口可在 reopen 后重放收敛。Definition 只保存
+非敏感 spec，连接配置与密码只在 build/open 时作为运行资源注入。
+这是无初始快照、无 TLS 与在线 Schema evolution 的试点；
+[Source 使用与边界](crates/operation/README.md#postgresql-source-试点) ·
+[Sink 使用与边界](crates/operation/README.md#operationsinkpostgressink)。
 
 ## 当前边界
 
 - DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
 - 运行由宿主反复调用 `Flow::advance` 驱动；尚无 `Flow::start`、后台 runner 或中断控制。
-- Operation 集合目前封闭。`PostgresSource` 暂不包含初始全量、多表路由、在线 Schema evolution、TLS
-  配置或跨 Flow fencing；首个关系物化链路须从空表和匹配的 slot 起点开始。生产加固仍属于 D5。
+- Operation 集合目前封闭。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
-- `SqliteSink` 与 `PostgresSink` 都只创建并独占新目标表；后者不支持 TLS、在线 Schema evolution、
-  target spec 的跨 Flow 接管/共享、外部改表/改数据或数据库替换恢复。尚无 MySQL 或通用外部 Sink。
+- PostgreSQL 增量链路尚无初始全量、多表路由、TLS、在线 Schema evolution 或跨 Flow fencing；
+  要物化完整关系，源表须在 slot 起点为空并从该起点开始写入。`PostgresSink` 只创建并独占新目标表，
+  不支持 target spec 跨 Flow 接管/共享、外部改表/改数据或数据库替换恢复；生产加固仍属于 D5。
+- `SqliteSink` 同样只创建并独占新目标表；尚无 MySQL 或通用外部 Sink。
 - 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。
 
 ## 深入阅读
@@ -85,7 +83,7 @@ Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pen
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
 - [Store：MDBX 事务与集合](crates/store/README.md)
-- [重新生成 PostgreSQL CDC 录屏](tools/record_postgres_cdc_live.sh)
+- [重新生成 PostgreSQL 增量同步录屏](tools/record_postgres_cdc_live.sh)
 - [PostgreSQL Sink 真实验收](tools/check_postgres_sink.py)
 - [重新生成 SQLite Sink 录屏](tools/record_sqlite_sink_live.sh)
 - [SqliteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
