@@ -6,6 +6,8 @@ mod malformed;
 mod persistence;
 #[path = "correctness/postgres.rs"]
 mod postgres;
+#[path = "correctness/postgres_sink.rs"]
+mod postgres_sink;
 #[path = "correctness/runtime_corruption.rs"]
 mod runtime_corruption;
 #[path = "correctness/schema.rs"]

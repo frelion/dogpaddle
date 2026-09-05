@@ -11,7 +11,10 @@ use crate::{
     definition::{DataName, Sealed},
     lit,
     operation::{
-        sink::{DiscardDefinition, DiscardOperation, SqliteSinkDefinition},
+        sink::{
+            DiscardDefinition, DiscardOperation, PostgresSinkDefinition, PostgresTargetSpec,
+            SqliteSinkDefinition,
+        },
         source::{
             PostgresColumn, PostgresSourceDefinition, PostgresSourceSpec, PostgresType,
             SequenceSourceDefinition,
@@ -76,7 +79,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 11] {
+fn builtin_definitions() -> [Box<dyn OperationDefinition>; 12] {
     [
         Box::new(
             PostgresSourceDefinition::try_new(PostgresSourceSpec {
@@ -110,6 +113,12 @@ fn builtin_definitions() -> [Box<dyn OperationDefinition>; 11] {
         ),
         Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         Box::new(DiscardDefinition::new()),
+        Box::new(
+            PostgresSinkDefinition::try_new(
+                PostgresTargetSpec::try_new("events", "shop", "public", "events", "1", 1).unwrap(),
+            )
+            .unwrap(),
+        ),
         Box::new(SqliteSinkDefinition::try_new("/tmp/dogpaddle.sqlite", "events").unwrap()),
     ]
 }

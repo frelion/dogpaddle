@@ -109,6 +109,10 @@ flow.advance()?;
 # }
 ```
 
+`PostgresSinkConfig` 也通过同一个 `resource(station_id, value)` 入口装配。增加 `PostgresSink` 没有
+改变 `FlowFactory`、`Flow::advance` 或 Station 协议，也没有引入通用 Sink trait、ORM 或 backend registry。
+它的 `discover_target` 由调用方在 build 前显式执行，并会进行只读 `PostgreSQL` catalog I/O。
+
 `PostgresSource` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、不连接 PG、
 不启动 JVM；初始化、poll、转换、ACK 仍全在 Operation 内，通过通用 turn 协议完成。
 checkpoint 与 Station output 在同一事务提交，背压同时回滚且不 ACK，不另存 pending。
@@ -142,6 +146,16 @@ Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Selec
 覆盖 `SQLite` commit 与 Flow commit 之间的窗口。可直接运行
 [`sqlite_sink_live`](examples/sqlite_sink_live.rs)，端到端恢复证据位于
 [`tests/correctness/sqlite_sink.rs`](tests/correctness/sqlite_sink.rs)。
+
+`PostgresSink` 是单输入、无 output 的 `PostgreSQL` exact relation 终点。Definition 只保存非敏感
+target spec，host/user/password 随 `PostgresSinkConfig` 在 build/open 时注入；build/open 对 PG 目标
+不做 I/O，只完成 Schema/resource 装配与 Store 生命周期。运行时先把至多 1024 个具体 mutation 作为 Prepared intent
+提交到 `postgres_sink.state`，随后才在 `AfterCommit` 中用一个 `PostgreSQL` 事务原子写入一行
+delivery receipt 和全部 mutation；下一 turn 返回 `Commit` continuation 或 `Complete`。PG commit
+后进程退出会从 Prepared 重投，并由 receipt 验证已经应用的同一 delivery。目标对象由 Sink 独占且
+Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端 marker 只是 ownership/layout-version
+标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
+`tools/check_postgres_sink.py`。
 
 ## 持久化边界
 
@@ -281,7 +295,8 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 
 当前磁盘格式的外层使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag
 和 IEEE `CRC32` 完整性校验，不依赖 Rust enum 布局。具体 Operation payload 有各自的固定编码：
-例如表达式使用 pinned protobuf，PostgresSource 使用 canonical JSON。以下名称是兼容性边界：
+例如表达式使用 pinned protobuf，tag11 `PostgresSource` 与 tag12 `PostgresSink` 使用各自的 canonical
+JSON。以下名称是兼容性边界：
 
 - Flow manifest：`flow/definition`
 - Station 状态：`station/{index:08x}/state`
@@ -290,6 +305,9 @@ Schema 会在对应 entry 首次 intake 时被拒绝且不推进 cursor。调用
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceSource` 位置：`station/{index:08x}/operation/sequence_source.position`
 - `RunningEventCount` 状态：`station/{index:08x}/operation/running_event_count.count`
+- `PostgresSource` checkpoint：`station/{index:08x}/operation/postgres_source.checkpoint`
+- `SqliteSink` 状态：`station/{index:08x}/operation/sqlite_sink.next_id` 与 `station/{index:08x}/operation/sqlite_sink.pending`
+- `PostgresSink` 状态：`station/{index:08x}/operation/postgres_sink.state`
 - Project、Filter、Extend、Select、`SchemaAlign` 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
 `index` 是 Station 声明顺序，`input_index` 是该 Station 持久化 source 列表中的端口顺序。active
@@ -327,9 +345,9 @@ retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。F
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压上游。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。通用 Operation 调度协议已能安全承接事务外初始化/poll、
-durable state 写入与提交后确认，但尚未实现 `Flow::start`、中断控制、运行资源注入或具体 Debezium
-Source；`SqliteSink` 只覆盖其独占本地目标表的专用幂等提交边界。内建 `RunningEventCount`
+intake 还会在事务提交前后两侧兜底校验。运行资源注入、具体 `PostgresSource` 与 `PostgresSink` 已沿
+通用 Operation 调度协议承接事务外初始化/poll、durable state 写入与提交后确认；`SqliteSink` 与
+`PostgresSink` 分别实现自己的目标专用幂等提交边界。尚未实现 `Flow::start` 或中断控制。内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn
 continuation。
 `DataFusion` 集成目前止于 Filter/Extend/Select/`SchemaAlign` 的 `Expr` protobuf、physical expression planning 与向量化执行，
@@ -344,6 +362,9 @@ cargo clippy -p dogpaddle-flow --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-flow --no-deps
 cargo bench -p dogpaddle-flow --bench flow_lifecycle
 cargo bench -p dogpaddle-flow --bench flow_runtime
+
+# 需要独立临时 PostgreSQL，参数见根目录 TESTING.md
+python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql/bin
 ```
 
 `flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed

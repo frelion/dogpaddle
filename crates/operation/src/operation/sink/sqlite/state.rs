@@ -2,8 +2,9 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
-pub(super) const MAX_MUTATIONS_PER_BATCH: usize = 1024;
-pub(super) const MAX_TECHNICAL_ID: u64 = i64::MAX.unsigned_abs();
+pub(super) use super::super::relation::{
+    Continuation, MAX_MUTATIONS_PER_BATCH, MAX_TECHNICAL_ID, Mutation, MutationKind, Position,
+};
 
 const FORMAT_VERSION: u16 = 1;
 const INITIALIZE_TAG: u8 = 0;
@@ -13,35 +14,6 @@ const DONE_TAG: u8 = 0;
 const POSITION_TAG: u8 = 1;
 const INSERT_TAG: u8 = 0;
 const DELETE_TAG: u8 = 1;
-
-/// Durable position within the complete Change retained by the owning Station.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Position {
-    pub(super) row_index: u64,
-    pub(super) remaining: u64,
-}
-
-/// Work that follows an applied `SQLite` mutation batch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Continuation {
-    Done,
-    Position(Position),
-}
-
-/// One concrete physical-row mutation selected during preparation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Mutation {
-    pub(super) kind: MutationKind,
-    pub(super) row_index: u64,
-    pub(super) technical_id: u64,
-}
-
-/// Direction of one concrete physical-row mutation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum MutationKind {
-    Insert,
-    Delete,
-}
 
 /// Durable `SQLite` sink continuation stored independently of the Station claim.
 #[derive(Clone, Debug, Eq, PartialEq)]

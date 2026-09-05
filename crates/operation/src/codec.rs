@@ -33,6 +33,7 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
         transform::schema_align::decode_definition,
     ),
     (sink::discard::TAG, sink::discard::decode_definition),
+    (sink::postgres::TAG, sink::postgres::decode_definition),
     (sink::sqlite::TAG, sink::sqlite::decode_definition),
 ];
 

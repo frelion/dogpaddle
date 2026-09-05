@@ -49,9 +49,10 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | Transform | SchemaAlign | 显式完整 Schema 重塑 | 已完成基础结构对齐；不做隐式 coercion |
 | Transform | UnionAll | exact Schema 多输入原样合并 | 保留为基础多输入算子 |
 | Sink | SqliteSink | 将差分流幂等物化到独占的 SQLite 表 | 已完成首个本地外部副作用 Sink |
+| Sink | PostgresSink | 将单输入 exact relation 幂等物化到独占的固定 Schema PostgreSQL 表 | 已有远端试点；TLS、在线演进与发布门仍待实施 |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十一个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十二个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
@@ -195,7 +196,7 @@ canonical Flow/Operation Definition。若接口版本、catalog 或 lowering 规
 | --- | --- | --- | --- |
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
-| 2（进行中） | 打通真实 Source/Sink | PostgresSource、SqliteSink、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
+| 2（进行中） | 打通真实 Source/Sink | PostgresSource、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Source/Sink 的真实数据闭环 |
 | 3 | 建立关系状态原语 | relation state、arrangement、Consolidate、Distinct | 后续状态关系算子的共同基座 |
 | 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
@@ -415,6 +416,29 @@ PostgresSource 在事务外 `turn(None)` 中以零超时 poll 并转换；`apply
 原 `postgres_source.state` 的 pending 布局属于未发布的开发期格式；旧 Flow 必须重建，不提供
 alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独确定幂等身份，不反向扩展当前 Source 协议。
 
+### 已有试点：PostgresSink
+
+`PostgresSink`（tag `12`）把一个单输入 exact relation 物化到独占的固定 Schema PostgreSQL 目标，
+沿用 `FlowFactory::resource` 与 `Flow::advance`，不增加 Flow 专用方法。Definition 只保存 canonical、
+非敏感 `PostgresTargetSpec`；宿主在 build/open 时注入具体 `PostgresSinkConfig`。target discovery 是
+build 前显式的只读 catalog 操作，Definition/bind/materialize 与 Flow build/open 本身不访问 PG。
+
+唯一 Operation data 是 `postgres_sink.state: Cell<Vec<u8>>`。Ready turn 在 MDBX 事务外匹配关系行并
+规划至多 1024 个具体 mutation，apply 先持久化 Prepared intent；只有本地 commit 成功后，
+`AfterCommit` 才在一个 PG 事务中原子写入该 delivery 的一行 receipt 与全部 mutation。下一 turn
+把 state 结算回 Ready：有 continuation 时 `Commit`，该 Change 结束时 `Complete`。PG 已提交但结算
+前崩溃会从 Prepared 重投；相同 sequence 的 receipt 必须有相同 digest/mutation count，因而不会重复应用。
+
+该试点要求 Sink 独占其目标表、receipt 表、索引与约束，Schema 固定，外部不得改表、改数据或替换/
+恢复数据库，同一 target spec 不得被其他 Flow 接管或共享。远端 marker 只标识 ownership/layout
+版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；当前没有 TLS 或在线 Schema evolution。普通 Cargo gate 离线，显式本机
+`tools/check_postgres_sink.py` 当前证明初始化、三个 insert delivery、每 delivery 一行 receipt，以及
+“PG 已提交/MDBX 仍 Prepared”窗口的进程重开，不把尚未覆盖的 delete、长稳或性能写成已完成。
+
+`SqliteSink` 与 `PostgresSink` 只共享 crate 私有的 relation position、technical-ID、continuation 和
+批次校验机械；各自的 state codec、DDL/DML、锁与恢复协议仍然专用。没有公共通用 Sink trait、
+backend enum、plugin registry 或 ORM 抽象。
+
 ### 有限 Source
 
 根据测试和嵌入式任务需求，可增加显式结束的 `ValuesSource` 或 bounded source。结束必须是独立、
@@ -446,21 +470,20 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 
 ### 其他外部副作用 Sink
 
-`SqliteSink` 已用持久化具体 mutation 批次定义了第一个专用幂等提交边界。后续网络、文件和远程
-数据库连接器仍须先选择 outbox、幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法
-由该协议重放或验证的可观察副作用。
+`SqliteSink` 已用持久化具体 mutation 批次覆盖本地 SQLite/MDBX 窗口；`PostgresSink` 已用 durable
+Prepared intent 和 PG receipt 覆盖远端提交窗口。后续网络、文件和数据库连接器仍须先选择 outbox、
+幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法由该协议重放或验证的可观察副作用。
 
 远端数据库接入遵守以下最小边界，不提前建立通用 SQL Sink 框架：
 
 - Definition 只持久化逻辑 destination key 和非敏感行为配置，不持久化密码、token 或完整 secret DSN；
-- 第一个远端 Sink 落地时，由宿主在 build/open 的 materialize 边界显式注入 destination resolver；
+- 当前 `PostgresSink` 由宿主在 build/open 的 materialize 边界显式注入具体 `PostgresSinkConfig`；
   Schema bind 继续保持纯函数，Operation 不读取全局环境变量或进程级单例；
 - 当前同步的 `turn → apply → AfterCommit` 全程独占该 Operation：事务外准备属于 `turn`，
-  本地提交后的确认属于 `AfterCommit`。若远端提交必须通过专用幂等协议放在 `apply` 内，它仍会占用
-  MDBX writer，因此第一版客户端必须有明确的连接和请求超时。若真实 workload 证明需要异步执行，
+  本地提交后的幂等远端 delivery 属于 `AfterCommit`。连接和请求必须有明确超时；若真实 workload 证明需要异步执行，
   先扩展调度协议，不能把后台任务或第二套状态机藏进具体 Sink；
-- SQLite、PostgreSQL 与 MySQL 各自保留专用 DDL、DML、锁和重放实现。只有第二个实现证明行身份或
-  配置注入语义完全相同时，才提取对应的小型公共组件。
+- SQLite 与 PostgreSQL 只共享已经由两个实现证明相同的 crate 私有 relation mechanics；各 backend
+  保留专用 DDL、DML、锁和重放实现。当前不建立公共 Sink trait、backend registry 或 ORM。
 
 ### 退出标准
 
@@ -745,7 +768,7 @@ RebuildRequired
 
 ### 外部 Source/Sink 协议
 
-已有 PostgreSQL CDC 与 SqliteSink 试点；后续候选包括：
+已有 `PostgresSource` CDC、`SqliteSink` 与 `PostgresSink` 试点；后续候选包括：
 
 1. 本地 API/AppendLog ingress；
 2. 文件 snapshot；
@@ -756,7 +779,8 @@ RebuildRequired
 外部 Source 明确 external checkpoint 与 committed Change 的原子提交边界；只有来源确实提供
 独立重试 identity 时才另行定义其幂等协议，不以 checkpoint 冒充 identity。外部 Sink 使用
 outbox、幂等 key 或明确的两阶段提交协议。`SqliteSink` 已用持久化 mutation 批次覆盖本地 SQLite
-commit 与 MDBX commit 的空隙；其他连接器不能把对应空隙留给具体 Sink 自行解释。
+commit 与 MDBX commit 的空隙；`PostgresSink` 已用 Prepared intent、每 delivery 一行 receipt 与
+原子 PG mutation transaction 覆盖远端窗口。其他连接器不能把对应空隙留给具体 Sink 自行解释。
 
 ### 可观测性
 
@@ -881,13 +905,13 @@ commit 与 MDBX commit 的空隙；其他连接器不能把对应空隙留给具
 ```text
 PostgresSource
 → Filter/Extend/Select
-→ ResultLogSink
-→ MaterializeSink
-→ snapshot / reopen
+→ SqliteSink / PostgresSink
+→ crash / reopen
 ```
 
-这是最优先的新能力。`PostgresSource` 已提供固定 Schema 单表持续 CDC 试点，`SqliteSink` 已提供
-可查询终点；初始全量、发布加固和应用可消费的通用结果边界仍待实施。复杂算子仍主要依靠
+真实 Source 到专用关系 Sink 的闭环已经存在：`PostgresSource` 提供固定 Schema 单表持续 CDC，
+`SqliteSink` 与 `PostgresSink` 提供可查询终点。初始全量、发布加固、ResultLog/Materialize 和应用可消费的
+通用结果边界仍待实施。复杂算子仍主要依靠
 测试 fixture 自证，上层用户 API 也尚未形成完整闭环。
 
 ### 里程碑 C：关系状态到 Aggregate

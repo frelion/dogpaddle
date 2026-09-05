@@ -32,6 +32,10 @@ path = "tests/correctness.rs"
 name = "postgres_cdc"
 path = "examples/postgres_cdc.rs"
 
+[[example]]
+name = "postgres_sink"
+path = "examples/postgres_sink.rs"
+
 [[bench]]
 name = "flow_lifecycle"
 path = "benches/flow_lifecycle.rs"

@@ -47,7 +47,8 @@ Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability�
 `SchemaAlign` 从同一个原始输入计算有序字段，并显式声明名称、目标 nullability、Field metadata
 和 Schema metadata；`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意
 合法的单一输入且没有 output；`SqliteSink` 还把合法输入编译为确定的 `STRICT`
-表布局、绑定 SQL 和无损行编码。无需额外的
+表布局、绑定 SQL 和无损行编码；`PostgresSink` 把单一 exact relation 输入绑定为固定的 `PostgreSQL`
+表布局与参数化语句。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
 Filter、Extend、Select 与 `SchemaAlign` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
@@ -144,7 +145,7 @@ assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 ## Operation 运行协议
 
 运行资源与持久 Data 分开装配：`OperationBinding::materialize(data, resource)` 消费一个可选的
-[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL` Source 传拥有型配置。
+[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL` Source 与 Sink 分别传拥有型配置。
 binding 先验证其精确 Rust 类型，Flow 在创建 Store 前完成全图检查。这里没有全局 registry、
 connector enum 或启动回调；资源只在 materialize 时 move 进 Operation，外部初始化仍由 turn 完成。
 
@@ -218,7 +219,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 ## 内建算子能力与 conformance
 
-下表是当前十一个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+下表是当前十二个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
 Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
@@ -236,30 +237,31 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `SchemaAlign` (`9`) | Transform / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数；`Complete` | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
 | Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime/rollback/reopen；`operation_core` Definition codec、Flow sink workload |
 | `SqliteSink` (`10`) | Sink / 1 | 接受任意合法 Schema，另校验 `SQLite` 列名与列数；无 output | 按行序展开 diff multiplicity，每批至多 1024 个 mutation；中间 `Commit`，最终 `Complete(None)` | `sqlite_sink.next_id: Cell<u64>`、`sqlite_sink.pending: Cell<Vec<u8>>` | 不产生 output；按行生成 canonical/hash 和 `SQLite` 绑定值 | tag/payload、pending/canonical/hash golden，全部 v1 类型、批界、multiplicity/ID 预检、冲突/锁错误及 `SQLite` commit 后 MDBX rollback/reopen 重放；无独立 benchmark |
+| `PostgresSink` (`12`) | Sink / 1 | 单一 exact relation；校验 `PostgreSQL` 列名、系统列与列数；无 output | 每批至多 1024 个 mutation；持久 `Prepared` 后由 `AfterCommit` 原子提交 receipt + mutations，下一 turn `Commit` continuation 或 `Complete(None)` | `postgres_sink.state: Cell<Vec<u8>>` | 不产生 output；按行生成 canonical/hash 和参数值 | tag12 canonical JSON、非敏感 Definition、资源/Schema/布局、state codec；普通 gate 离线，真实 PG 恢复由 `tools/check_postgres_sink.py` 验收 |
 
-所有十一个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
-`tests/correctness/{codec,definition,postgres,protocol,runtime}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
+所有十二个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
+`tests/correctness/{codec,definition,postgres,postgres_sink,protocol,runtime}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
 无建库副作用、资源名、build/open/reopen、运行期 Schema guard 和事务重放由
-`dogpaddle-flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`、`PostgresSource`
-外的九个算子；直接
+`crates/flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`、`PostgresSource`
+与 `PostgresSink` 外的九个算子；直接
 turn body/durable commit 只测 `SequenceSource` 与 `RunningEventCount`。`flow_runtime` 测
 source/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
 不因此获得虚构的微基准。
 
-前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 的完整 canonical JSON golden 内联在
-`tests/correctness/postgres.rs`。其中事件计数、对齐与 `SQLite` Sink 的 fixture 分别为
+前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别内联在
+`tests/correctness/postgres.rs` 与 `tests/correctness/postgres_sink.rs`。其中事件计数、对齐与 `SQLite` Sink 的 fixture 分别为
 `running_event_count_definition.hex`、`schema_align_explicit.hex` 与 `sqlite_sink_output_events.hex`；它们分别冻结
-tag `2`、`9` 与 `10`。codec 分区十个 decoded golden 都会重新 bind，postgres 分区独立覆盖 tag11；Filter、Extend、Select、UnionAll 与
+tag `2`、`9` 与 `10`。codec 分区十个 decoded golden 都会重新 bind，两个 postgres 分区独立覆盖 tag11/tag12；Filter、Extend、Select、UnionAll 与
 `SchemaAlign` 的 golden 还会
 materialize/turn，其余算子的执行证据由 definition/runtime 分区独立覆盖。Flow manifest 的端到端基线为
-`dogpaddle-flow/tests/fixtures/v1/sequence_source_running_event_count_discard.hex`。这些文件名只帮助定位
+`crates/flow/tests/fixtures/v1/sequence_source_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`source`
 保存无上游输入的源算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
 的终点算子。当前 `source` 包含 `SequenceSource` 与 `PostgresSource`，`transform` 包含 RunningEventCount、Project、Filter、
 Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
-Discard 与 `SqliteSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
+Discard、`SqliteSink` 与 `PostgresSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
 ## Definition 与持久化
@@ -559,6 +561,57 @@ insert/delete，可跨越多个 Change 行；批内 overlay 保留事件顺序�
 文件本身可以预先存在。连接使用 5 秒 busy timeout 与 `synchronous=FULL`，不修改 journal/WAL 模式。
 该协议假定目标表只有此 Sink 写入，不支持外部修改 schema/数据、替换文件或恢复旧备份。
 
+## `operation::sink::PostgresSink`
+
+[`operation::sink::PostgresSinkDefinition`]（tag `12`）是单输入、无 output 的 exact relation Sink。
+调用方先用 [`operation::sink::PostgresSinkConfig::discover_target`] 检查目标 schema 和待创建对象，
+再把返回的非敏感 [`operation::sink::PostgresTargetSpec`] 固化进 canonical JSON Definition。spec 只含
+sink ID、database/schema/table 与 cluster/database identity；host、port、user、password 留在拥有型
+`PostgresSinkConfig`，每次 build/open 通过既有 `FlowFactory::resource` 路径注入。Definition 构造、
+bind、materialize 与 Flow build/open 均不联网；`Flow::advance` 才执行远端工作，且没有 `PostgreSQL`
+专用 Flow 方法。
+
+一个 `PostgresTargetSpec` 只能归属一个持久化 Flow/Sink；公共 `try_new` 只是离线构造入口，不表示可以
+接管或共享已有目标。PG object comment 中的 marker 只是 ownership/layout-version 标记，不是另一份
+Arrow Schema fingerprint，也不承诺检测契约外的任意 catalog 篡改。精确 logical Schema 仍由持久化
+Flow Definition 的 binding 与每次运行时 Schema guard 保证。
+
+Definition 只声明 `postgres_sink.state: Cell<Vec<u8>>`。这个版本化 Cell 保存 Initialize、Ready 或一个
+完整 Prepared intent：delivery sequence、payload digest、分配前 technical-ID frontier、Change 内位置、
+continuation 与至多 1024 个具体 insert/delete mutation。它不保存连接、ORM entity、完整行副本或
+另一套 Station input 状态。
+
+运行时按同一个 `turn → apply → AfterCommit` 协议推进：
+
+1. 首次 turn 只从 Cell 恢复并持久化 Initialize；本地 commit 后的 `AfterCommit` 才创建或验证空目标，
+   下一 turn 再把 Ready 持久化。
+2. Ready 的 `turn` 在 MDBX 事务外验证目标、匹配撤回行并按输入顺序规划至多 1024 个 mutation；
+   `apply` 只把 Prepared intent 写入 Cell 并返回 `Commit(None)`。
+3. Prepared 已随 MDBX 提交后，`AfterCommit` 在一个 `PostgreSQL` 事务中写入该 delivery 的唯一 receipt
+   行和全部 mutation。receipt 保存 sequence、digest 与 mutation count；相同 intent 重投只验证这行，
+   不重复修改目标。
+4. 下一 turn 才把 durable state 结算回 Ready：仍有 continuation 时返回 `Commit(None)` 并保留同一
+   Change，批次结束时返回 `Complete(None)`。若进程在 PG commit 后、结算前退出，reopen 从 Prepared
+   重投；每个成功 delivery 永久对应一行 receipt。
+
+普通目标查询失败会丢弃临时 client 并允许同一 durable state 重试；`AfterCommit` 失败发生在本地
+commit 之后，因而由 Flow fail-stop 并要求 reopen。远端查询和提交都不占用 MDBX 写事务。
+
+存储映射优先保留 Arrow 原始语义，而不是伪装成自然 SQL model：Boolean 与可无损表示的整数使用
+带约束标量，Date32/Timestamp 使用原始整数；Utf8（包括 NUL）、Binary、List 与 Struct 使用变长
+`bytea`，`UInt64`、浮点与 Decimal128 使用定长 `bytea` 保存精确位模式。
+
+目标表、receipt 表、索引与约束由该 Sink 独占并保持固定的生成式 PG 存储布局。Schema 最多 1598 个顶层
+字段；字段名须能被 `PostgreSQL` 逐字表示，且不得与 Sink technical columns 或精确小写系统列冲突。
+当前不支持 TLS、在线 Schema evolution、外部改表/改数据、数据库替换或恢复；运行中的这些变化不
+属于恢复协议。实现保持 `PostgreSQL` 专用，不提供公共通用 Sink trait、backend enum、插件 registry
+或 ORM 层。它与 `SqliteSink` 只共享 crate 私有的 relation position、technical-ID、continuation 与
+批次校验机械；DDL、DML、state codec 和恢复协议分别实现。
+
+普通 Cargo gate 完全离线，覆盖 tag12、Schema/resource/layout、state codec，以及初始化 completion
+被提交或丢弃的协议边界；真实 `PostgreSQL` 初始化、Prepared 提交、insert、receipt 重放和 crash recovery 由
+`python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql/bin` 显式验收，详见根目录 `TESTING.md`。
+
 ## 扩展约束
 
 新增内建 Operation 时，在 `operation/source`、`operation/transform` 或 `operation/sink`
@@ -613,9 +666,9 @@ happy-path 单测都不能替代这些答案。
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
-`correctness` target，按 codec、definition、postgres、protocol 与 runtime 分区。protocol 直接验证上述队列
+`correctness` target，按 `codec`、`definition`、`postgres`、`postgres_sink`、`protocol` 与 `runtime` 分区。protocol 直接验证上述队列
 例子的恢复状态机，runtime 覆盖内建算子与 borrowed delivery 的提交时序。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖十一个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+Schema 测试覆盖十二个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
 SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续
@@ -632,12 +685,14 @@ direct-copy、`SchemaAlign` 精确 cast/nullability 和 Filter 组合比较都�
 其他 temporal/decimal 运算承诺。`SQLite` Sink 另外覆盖 Definition/pending/hash golden、全部当前 v1
 类型（含 Date32、全部 Timestamp 单位/timezone 与 Decimal128）及嵌套值、列边界与标识符、1024 批边界、
 multiplicity/ID 预检、`SQLite` 锁与 ID/完整性冲突，以及 `SQLite` 已提交但 MDBX
-transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。完整目录所有权、
+transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。`PostgresSink` 的离线公共证据覆盖
+tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state Cell、Schema/spec 拒绝，以及
+首 turn rollback 或丢弃 completion 不连接目标；当前真实 insert、receipt 与 crash recovery witness 由显式脚本所有。完整目录所有权、
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 `operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 当前覆盖除
-`SqliteSink`、`PostgresSource` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
+`SqliteSink`、`PostgresSource`、`PostgresSink` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
 durable commit 的完整事务，只直接测 `SequenceSource` 与 `RunningEventCount`。这两个 case 利用
 crate 内部完全事务型适配器的结构性空 completion 保留既有 turns-per-transaction 口径，不适用于
 带事务外准备或 `AfterCommit` 的 Operation。固定大小 Cell 的长稳

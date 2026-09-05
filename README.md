@@ -40,13 +40,21 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 
 ## 已实现
 
+当前共有 12 个内建算子，全部沿用同一套 Definition、Schema binding、Operation turn 与 Flow 调度协议。
+
 | Source | Transform | Sink |
 | --- | --- | --- |
-| `SequenceSource` · `PostgresSource`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `Discard` |
+| `SequenceSource` · `PostgresSource`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `PostgresSink`（试点） · `Discard` |
 
-`SQLiteSink` 首次收到输入后延迟初始化普通 `STRICT` 表，不引入额外 SQLite 元数据表。
+`SqliteSink` 首次收到输入后延迟初始化普通 `STRICT` 表，不引入额外 SQLite 元数据表。
 它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
 在 Sink 独占目标表且数据库未被外部修改或替换的前提下，重放不会重复最终结果。
+
+`PostgresSink` 用同一套 Flow API 把单输入 exact relation 物化到独占的固定 Schema PostgreSQL
+目标。Definition 只保存非敏感 target spec，连接配置在 build/open 时以运行资源注入；每个至多
+1024 项的持久 Prepared 批次在 `AfterCommit` 中把一行 receipt 与全部 mutation 提交到同一 PG
+事务，下一 turn 再以 `Complete` 完成输入或以 `Commit` 保存 continuation。这里没有公共通用 Sink
+trait 或 ORM 抽象。
 
 CDC 基础设施已经有独立的 `dogpaddle-debezium` 产品 crate：它在 Rust 进程内运行 stock
 Debezium Engine，以 connector-neutral 的 `start/poll/ack/stop` 和 opaque pre-ACK checkpoint
@@ -63,7 +71,8 @@ Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pen
 - Operation 集合目前封闭。`PostgresSource` 暂不包含初始全量、多表路由、在线 Schema evolution、TLS
   配置或跨 Flow fencing；首个关系物化链路须从空表和匹配的 slot 起点开始。生产加固仍属于 D5。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
-- `SQLiteSink` 只创建并独占新目标表；尚无 PostgreSQL、MySQL 或通用外部 Sink。
+- `SqliteSink` 与 `PostgresSink` 都只创建并独占新目标表；后者不支持 TLS、在线 Schema evolution、
+  target spec 的跨 Flow 接管/共享、外部改表/改数据或数据库替换恢复。尚无 MySQL 或通用外部 Sink。
 - 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。
 
 ## 深入阅读
@@ -77,6 +86,7 @@ Change，checkpoint 与 Station output 同事务落盘后才 ACK，不另存 pen
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
 - [Store：MDBX 事务与集合](crates/store/README.md)
 - [重新生成 PostgreSQL CDC 录屏](tools/record_postgres_cdc_live.sh)
+- [PostgreSQL Sink 真实验收](tools/check_postgres_sink.py)
 - [重新生成 SQLite Sink 录屏](tools/record_sqlite_sink_live.sh)
-- [SQLiteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
+- [SqliteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
 - [正确性与性能测试](TESTING.md)

@@ -11,16 +11,18 @@ use super::{
     definition::SqliteSinkSchemaError,
     error::{SqliteSinkError, invalid_state, pending_mismatch},
     row::{EncodedRow, RowCodec},
-    state::{
-        Continuation, MAX_MUTATIONS_PER_BATCH, MAX_TECHNICAL_ID, Mutation, MutationKind,
-        PendingState, Position,
-    },
+    state::PendingState,
     target::SqliteTarget,
 };
-use crate::operation::{Action, OperationError, OperationInput, TransactionalOperation};
-
-const FIRST_TECHNICAL_ID: u64 = 1;
-const EXHAUSTED_TECHNICAL_ID: u64 = MAX_TECHNICAL_ID + 1;
+use crate::operation::{
+    Action, OperationError, OperationInput, TransactionalOperation,
+    sink::relation::{
+        Continuation, FIRST_TECHNICAL_ID, MAX_MUTATIONS_PER_BATCH, Mutation, MutationKind,
+        Position, RelationError, advance_position, ensure_id_capacity, first_position,
+        position_index, validate_apply_for_change, validate_batch_boundary, validate_next_id,
+        validate_position_for_change,
+    },
+};
 /// Materialized exact-Schema-bound `SQLite` relation sink.
 ///
 /// The operation owns a logical row codec, one lazily opened target, and the two
@@ -102,7 +104,7 @@ impl SqliteSinkOperation {
             )
             .into()),
             (Some(next_id), pending) => {
-                validate_next_id(next_id)?;
+                validate_next_id(next_id).map_err(map_relation_error)?;
                 self.target.verify_ready(next_id)?;
                 match pending {
                     None => {
@@ -161,15 +163,15 @@ impl SqliteSinkOperation {
         next_id: u64,
         start_position: Position,
     ) -> Result<Action, OperationError> {
-        validate_position_for_change(change, start_position)?;
-        validate_batch_boundary(change, start_position)?;
+        validate_position_for_change(change, start_position).map_err(map_relation_error)?;
+        validate_batch_boundary(change, start_position).map_err(map_relation_error)?;
         let mut position = start_position;
         let mut next_id_after = next_id;
         let mut mutations = Vec::with_capacity(MAX_MUTATIONS_PER_BATCH);
         let mut overlay = HashMap::<Vec<u8>, OverlayRow>::new();
 
         let continuation = loop {
-            let row_index = position_index(change, position)?;
+            let row_index = position_index(change, position).map_err(map_relation_error)?;
             let diff = change.diffs().value(row_index);
             let kind = if diff > 0 {
                 MutationKind::Insert
@@ -191,7 +193,8 @@ impl SqliteSinkOperation {
 
             match kind {
                 MutationKind::Insert => {
-                    ensure_id_capacity(next_id_after, position.remaining)?;
+                    ensure_id_capacity(next_id_after, position.remaining)
+                        .map_err(map_relation_error)?;
                     for _ in 0..take {
                         let technical_id = next_id_after;
                         next_id_after = next_id_after
@@ -225,7 +228,7 @@ impl SqliteSinkOperation {
                 }
             }
 
-            match advance_position(change, position, take)? {
+            match advance_position(change, position, take).map_err(map_relation_error)? {
                 Continuation::Done => break Continuation::Done,
                 Continuation::Position(next) => {
                     position = next;
@@ -293,7 +296,8 @@ impl SqliteSinkOperation {
         continuation: Continuation,
         mutations: &[Mutation],
     ) -> Result<Action, OperationError> {
-        validate_apply_for_change(change, next_id, start_position, continuation, mutations)?;
+        validate_apply_for_change(change, next_id, start_position, continuation, mutations)
+            .map_err(map_relation_error)?;
         let transaction = self.target.begin()?;
         transaction.apply(&self.row_codec, change, mutations)?;
 
@@ -353,205 +357,14 @@ fn decode_pending(encoded: &[u8]) -> Result<PendingState, SqliteSinkError> {
     PendingState::decode(encoded).map_err(SqliteSinkError::from)
 }
 
-fn validate_next_id(next_id: u64) -> Result<(), SqliteSinkError> {
-    if (FIRST_TECHNICAL_ID..=EXHAUSTED_TECHNICAL_ID).contains(&next_id) {
-        Ok(())
-    } else {
-        Err(invalid_state(format!(
+fn map_relation_error(error: RelationError) -> SqliteSinkError {
+    match error {
+        RelationError::InvalidNextId { next_id } => invalid_state(format!(
             "next technical ID {next_id} is outside 1..=i64::MAX+1"
-        )))
-    }
-}
-
-fn ensure_id_capacity(next_id: u64, needed: u64) -> Result<(), SqliteSinkError> {
-    let available = EXHAUSTED_TECHNICAL_ID.saturating_sub(next_id);
-    if needed <= available {
-        Ok(())
-    } else {
-        Err(SqliteSinkError::TechnicalIdExhausted { next_id, needed })
-    }
-}
-
-fn first_position(change: &Change) -> Position {
-    let diff = change.diffs().value(0);
-    Position {
-        row_index: 0,
-        remaining: diff.unsigned_abs(),
-    }
-}
-
-fn position_index(change: &Change, position: Position) -> Result<usize, SqliteSinkError> {
-    let row_index = usize::try_from(position.row_index)
-        .map_err(|_| pending_mismatch("row index cannot be represented by usize"))?;
-    if row_index >= change.num_rows() {
-        return Err(pending_mismatch(format!(
-            "row index {} is outside a {}-row Change",
-            position.row_index,
-            change.num_rows()
-        )));
-    }
-    Ok(row_index)
-}
-
-fn validate_position_for_change(
-    change: &Change,
-    position: Position,
-) -> Result<(), SqliteSinkError> {
-    if position.remaining == 0 {
-        return Err(pending_mismatch("position has zero remaining multiplicity"));
-    }
-    let row_index = position_index(change, position)?;
-    let magnitude = change.diffs().value(row_index).unsigned_abs();
-    if position.remaining > magnitude {
-        return Err(pending_mismatch(format!(
-            "position remainder {} exceeds row {} magnitude {magnitude}",
-            position.remaining, position.row_index
-        )));
-    }
-    Ok(())
-}
-
-fn validate_batch_boundary(change: &Change, position: Position) -> Result<(), SqliteSinkError> {
-    let row_index = position_index(change, position)?;
-    let batch_size = u64::try_from(MAX_MUTATIONS_PER_BATCH)
-        .expect("the fixed SQLite mutation batch size fits u64");
-    let mut consumed_modulo = 0_u64;
-    for index in 0..row_index {
-        consumed_modulo = (consumed_modulo
-            + change.diffs().value(index).unsigned_abs() % batch_size)
-            % batch_size;
-    }
-    let row_magnitude = change.diffs().value(row_index).unsigned_abs();
-    consumed_modulo =
-        (consumed_modulo + (row_magnitude - position.remaining) % batch_size) % batch_size;
-    if consumed_modulo == 0 {
-        Ok(())
-    } else {
-        Err(pending_mismatch(
-            "position is not aligned to a stable 1024-mutation batch boundary",
-        ))
-    }
-}
-
-fn advance_position(
-    change: &Change,
-    position: Position,
-    consumed: u64,
-) -> Result<Continuation, SqliteSinkError> {
-    if consumed == 0 || consumed > position.remaining {
-        return Err(pending_mismatch("batch consumed an invalid multiplicity"));
-    }
-    if consumed < position.remaining {
-        return Ok(Continuation::Position(Position {
-            row_index: position.row_index,
-            remaining: position.remaining - consumed,
-        }));
-    }
-    let next_row = position
-        .row_index
-        .checked_add(1)
-        .ok_or_else(|| pending_mismatch("row index overflow"))?;
-    let next_index = usize::try_from(next_row)
-        .map_err(|_| pending_mismatch("row index cannot be represented by usize"))?;
-    if next_index == change.num_rows() {
-        return Ok(Continuation::Done);
-    }
-    if next_index > change.num_rows() {
-        return Err(pending_mismatch("row position advanced beyond the Change"));
-    }
-    Ok(Continuation::Position(Position {
-        row_index: next_row,
-        remaining: change.diffs().value(next_index).unsigned_abs(),
-    }))
-}
-
-fn validate_apply_for_change(
-    change: &Change,
-    next_id: u64,
-    start_position: Position,
-    continuation: Continuation,
-    mutations: &[Mutation],
-) -> Result<(), SqliteSinkError> {
-    // `decode_pending` has already checked the batch's self-contained structural
-    // invariants. This pass only relates it to the retained Change and ID frontier.
-    validate_position_for_change(change, start_position)?;
-    validate_batch_boundary(change, start_position)?;
-    let insert_count = u64::try_from(
-        mutations
-            .iter()
-            .filter(|mutation| mutation.kind == MutationKind::Insert)
-            .count(),
-    )
-    .expect("the bounded mutation count fits u64");
-    let reserved_start = if insert_count == 0 {
-        None
-    } else {
-        Some(
-            next_id
-                .checked_sub(insert_count)
-                .filter(|first| *first >= FIRST_TECHNICAL_ID)
-                .ok_or_else(|| {
-                    pending_mismatch("prepared insert count exceeds the durable ID frontier")
-                })?,
-        )
-    };
-    let mut actual = Continuation::Position(start_position);
-    let mut last_insert_id = None;
-    for (mutation_index, mutation) in mutations.iter().enumerate() {
-        let Continuation::Position(position) = actual else {
-            return Err(pending_mismatch("mutations continue after the Change ends"));
-        };
-        let row_index = position_index(change, position)?;
-        if mutation.row_index != position.row_index {
-            return Err(pending_mismatch(
-                "mutation row does not match the flattened position",
-            ));
+        )),
+        RelationError::TechnicalIdExhausted { next_id, needed } => {
+            SqliteSinkError::TechnicalIdExhausted { next_id, needed }
         }
-        let expected_kind = if change.diffs().value(row_index) > 0 {
-            MutationKind::Insert
-        } else {
-            MutationKind::Delete
-        };
-        if mutation.kind != expected_kind {
-            return Err(pending_mismatch(
-                "mutation kind disagrees with the row difference",
-            ));
-        }
-        if mutation.technical_id >= next_id {
-            return Err(pending_mismatch(
-                "prepared mutation ID is not below the durable next-ID frontier",
-            ));
-        }
-        match mutation.kind {
-            MutationKind::Insert => {
-                last_insert_id = Some(mutation.technical_id);
-            }
-            MutationKind::Delete => {
-                if reserved_start.is_some_and(|first| mutation.technical_id >= first)
-                    && last_insert_id.is_none_or(|last| mutation.technical_id > last)
-                {
-                    return Err(pending_mismatch(
-                        "a mutation deletes a newly allocated ID before inserting it",
-                    ));
-                }
-            }
-        }
-        actual = advance_position(change, position, 1)?;
-        if actual == Continuation::Done && mutation_index + 1 != mutations.len() {
-            return Err(pending_mismatch("mutations continue after the Change ends"));
-        }
+        RelationError::InputMismatch { message } => pending_mismatch(message),
     }
-    if actual != continuation {
-        return Err(pending_mismatch(
-            "stored continuation differs from the flattened mutation sequence",
-        ));
-    }
-    if let Some(last_insert_id) = last_insert_id
-        && last_insert_id.checked_add(1) != Some(next_id)
-    {
-        return Err(pending_mismatch(
-            "prepared insert range does not end at the durable next-ID frontier",
-        ));
-    }
-    Ok(())
 }

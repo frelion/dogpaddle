@@ -4,6 +4,8 @@ mod codec;
 mod definition;
 #[path = "correctness/postgres.rs"]
 mod postgres;
+#[path = "correctness/postgres_sink.rs"]
+mod postgres_sink;
 #[path = "correctness/protocol.rs"]
 mod protocol;
 #[path = "correctness/runtime.rs"]
