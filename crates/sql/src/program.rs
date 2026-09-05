@@ -142,7 +142,10 @@ impl VisitorMut for ScanCollector {
         &mut self,
         table_factor: &mut TableFactor,
     ) -> ControlFlow<Self::Break> {
-        let TableFactor::Table { name, args, .. } = table_factor else {
+        let TableFactor::Table {
+            name, alias, args, ..
+        } = table_factor
+        else {
             return ControlFlow::Continue(());
         };
         let Some(arguments) = args else {
@@ -154,11 +157,24 @@ impl VisitorMut for ScanCollector {
         };
         match ScanEndpoint::parse(name, arguments) {
             Ok(scan) => {
+                let Some(relation_name) = name.0.last().and_then(|part| part.as_ident()).cloned()
+                else {
+                    self.error = Some(SqlError::invalid(
+                        "a scan function name must be one identifier",
+                    ));
+                    return ControlFlow::Break(());
+                };
                 let index = self.scans.len();
                 self.scans.push(scan);
                 *name = ObjectName::from(Ident::new(internal_scan_name(index)));
-                if let TableFactor::Table { args, .. } = table_factor {
-                    *args = None;
+                *args = None;
+                if alias.is_none() {
+                    *alias = Some(TableAlias {
+                        explicit: false,
+                        name: relation_name,
+                        columns: Vec::new(),
+                        at: None,
+                    });
                 }
                 ControlFlow::Continue(())
             }

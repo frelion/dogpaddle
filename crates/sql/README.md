@@ -30,15 +30,22 @@ flow.advance()?;
 
 [`SqlProgram::build`](SqlProgram::build) discovers external schemas and targets,
 uses `DataFusion` to bind SQL expressions, lowers the supported streaming subset
-to `DogPaddle` Operations, and builds the Flow. [`SqlProgram::open`](SqlProgram::open)
+to `DogPaddle` Operations, preserves the analyzed projection and `UNION ALL`
+Schema with `SchemaAlign`, and builds the Flow. [`SqlProgram::open`](SqlProgram::open)
 loads topology and schemas from the persisted Flow and injects only the runtime
 resources declared by the SQL program.
 
 The relational subset is intentionally small: table scans, filters, projections,
 derived queries, non-recursive CTEs, `UNION ALL`, casts, `TRY_CAST`, and `CASE`.
+An unaliased scan can be qualified by its function name, such as
+`sequence.value`. Every declared scan must reach the query result so that
+`build` and `open` require the same runtime resources.
 Aggregation, joins, sorting, limits, distinct, windows, ordinary tables,
 subqueries in expressions, table sampling, hints, row locks, function
 registries, and `DataFusion` physical execution are outside V1.
 
 Run the offline contract with `cargo test -p dogpaddle-sql --test correctness`.
-`system-tests/postgres/check_sql.py` is the explicit real-PostgreSQL recovery gate.
+Its `SQLite` result matrix covers expression values, exact target columns,
+coercion, CTE behavior, `UNION ALL`, and reopen. Every new logical-plan lowering
+needs a result-level case here. `system-tests/postgres/check_sql.py` is the
+explicit real-PostgreSQL recovery gate.

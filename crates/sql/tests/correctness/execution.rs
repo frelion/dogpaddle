@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use dogpaddle_flow::AdvanceOutcome;
+use dogpaddle_flow::{AdvanceOutcome, Flow};
 use dogpaddle_sql::SqlProgram;
 use rusqlite::{Connection, OpenFlags};
 
@@ -8,25 +8,66 @@ const TABLE: &str = "selected_numbers";
 const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[test]
-fn derived_query_executes_qualified_case_and_try_cast_expressions() {
+fn projection_executes_qualified_coerced_expressions_into_sqlite() {
     let root = tempfile::tempdir().unwrap();
-    let program = SqlProgram::parse(
-        "INSERT INTO discard() \
-         SELECT CASE \
-                    WHEN derived.value >= 7 \
-                    THEN TRY_CAST(derived.value AS VARCHAR) \
-                    ELSE CAST('small' AS VARCHAR) \
-                END AS label \
+    let sqlite_path = root.path().join("expressions.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'expressions') \
+         SELECT \
+             CASE \
+                 WHEN derived.value = 18446744073709551614 THEN CAST('first' AS VARCHAR) \
+                 ELSE TRY_CAST(derived.value AS VARCHAR) \
+             END AS label, \
+             TRY_CAST(\
+                 CASE \
+                     WHEN derived.value = 18446744073709551614 THEN 'invalid' \
+                     ELSE '7' \
+                 END \
+                 AS BIGINT\
+             ) AS parsed, \
+             CAST(derived.value AS DECIMAL(20, 0)) \
+                 - CAST(18446744073709551614 AS DECIMAL(20, 0)) AS ordinal \
          FROM (\
-             SELECT scan.value \
-             FROM sequence(start => 7) AS scan\
+             SELECT sequence.value \
+             FROM sequence(start => 18446744073709551614)\
          ) AS derived \
-         WHERE derived.value = 7",
-    )
+         WHERE derived.value >= CAST(18446744073709551614 AS DECIMAL(20, 0))",
+        sql_string(&sqlite_path)
+    ))
     .unwrap();
 
     let mut flow = program.build(root.path().join("flow")).unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let mut statement = connection
+        .prepare("SELECT label, parsed, ordinal FROM expressions")
+        .unwrap();
+    let mut rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                decode_i128(row.get::<_, Vec<u8>>(2)?),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        rows,
+        [
+            ("18446744073709551615".to_owned(), Some(7), 1),
+            ("first".to_owned(), None, 0),
+        ]
+    );
+    assert_eq!(sqlite_column(&connection, "expressions", "label").0, "TEXT");
+    assert_eq!(
+        sqlite_column(&connection, "expressions", "parsed"),
+        ("INTEGER".to_owned(), false)
+    );
 }
 
 #[test]
@@ -48,6 +89,71 @@ fn union_all_keeps_distinct_scan_stations() {
         .filter_map(|station| station.id.starts_with("sql/scan/").then_some(station.id))
         .collect::<Vec<_>>();
     assert_eq!(scan_ids, ["sql/scan/00000000", "sql/scan/00000001"]);
+}
+
+#[test]
+fn union_all_preserves_common_name_type_nullability_and_multiplicity() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("union.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'union_values') \
+         SELECT CAST(value AS DECIMAL(20, 0)) AS \"amount.value\" \
+         FROM sequence(start => 18446744073709551614) \
+         UNION ALL \
+         SELECT \
+             CASE \
+                 WHEN value = 18446744073709551614 THEN NULL \
+                 ELSE value \
+             END AS ignored_name \
+         FROM sequence(start => 18446744073709551614)",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
+
+    let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = program.open(&flow_path).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    assert_eq!(
+        sqlite_column(&connection, "union_values", "amount.value"),
+        ("BLOB".to_owned(), false)
+    );
+    let mut statement = connection
+        .prepare("SELECT \"amount.value\" FROM union_values")
+        .unwrap();
+    let mut values = statement
+        .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .unwrap()
+        .map(|value| value.unwrap().map(decode_i128))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        [
+            None,
+            Some(i128::from(u64::MAX - 1)),
+            Some(i128::from(u64::MAX)),
+            Some(i128::from(u64::MAX)),
+        ]
+    );
+
+    let mut flow = program.open(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    drop(flow);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM union_values", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        4
+    );
 }
 
 #[test]
@@ -156,7 +262,7 @@ fn sql_string(path: &Path) -> String {
 }
 
 fn sqlite_values(path: &Path) -> Vec<u64> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let connection = sqlite(path);
     let mut statement = connection
         .prepare(&format!("SELECT number FROM {TABLE}"))
         .unwrap();
@@ -174,4 +280,44 @@ fn sqlite_values(path: &Path) -> Vec<u64> {
         .collect::<Vec<_>>();
     values.sort_unstable();
     values
+}
+
+fn advance_to_idle(flow: &mut Flow) {
+    for _ in 0..128 {
+        if flow.advance().unwrap() == AdvanceOutcome::Idle {
+            return;
+        }
+    }
+    panic!("SQL Flow did not become idle within 128 advances");
+}
+
+fn sqlite(path: &Path) -> Connection {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+}
+
+fn sqlite_column(connection: &Connection, table: &str, column: &str) -> (String, bool) {
+    connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .unwrap()
+        .find_map(|row| {
+            let (name, data_type, not_null) = row.unwrap();
+            (name == column).then_some((data_type, not_null))
+        })
+        .expect("SQLite target column exists")
+}
+
+fn decode_i128(value: Vec<u8>) -> i128 {
+    i128::from_be_bytes(
+        value
+            .try_into()
+            .expect("DogPaddle stores Decimal128 as a sixteen-byte SQLite blob"),
+    )
 }

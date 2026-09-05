@@ -1,9 +1,9 @@
 use std::{collections::HashMap, num::NonZeroU32, num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use datafusion_common::{DataFusionError, TableReference, config::ConfigOptions};
+use datafusion_common::{Column, DFSchema, DataFusionError, TableReference, config::ConfigOptions};
 use datafusion_expr::{
-    AggregateUDF, HigherOrderUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF,
+    AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF,
     expr_rewriter::unnormalize_col,
 };
 use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
@@ -12,7 +12,9 @@ use datafusion_sql::sqlparser::ast::Statement;
 use dogpaddle_flow::{FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition,
-    operation::transform::{FilterDefinition, SelectDefinition, UnionAllDefinition},
+    operation::transform::{
+        FilterDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
+    },
 };
 
 use crate::{
@@ -146,7 +148,9 @@ pub(crate) fn lower_query(
     };
     let input = lowerer.lower(plan)?;
     if lowerer.scans.iter().any(Option::is_some) {
-        return Err(SqlError::invalid("the query contains an unused scan"));
+        return Err(SqlError::invalid(
+            "every declared scan must be reachable from the query result",
+        ));
     }
     Ok((factory, input))
 }
@@ -177,19 +181,30 @@ impl Lowerer<'_> {
                     .cloned()
                     .zip(projection.schema.fields())
                     .map(|(expression, field)| {
-                        (
+                        SchemaAlignField::try_new_with_metadata(
                             field.name().to_owned(),
                             unnormalize_col(expression.unalias()),
+                            field.is_nullable(),
+                            field.metadata().clone(),
                         )
-                    });
-                let definition = SelectDefinition::try_new(fields).map_err(SqlError::endpoint)?;
+                        .map_err(SqlError::endpoint)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let definition = SchemaAlignDefinition::try_new_with_metadata(
+                    fields,
+                    projection.schema.metadata().clone(),
+                )
+                .map_err(SqlError::endpoint)?;
                 Ok(self.add_transform(input, definition))
             }
             LogicalPlan::Union(union) => {
                 let inputs = union
                     .inputs
                     .iter()
-                    .map(|input| self.lower(input))
+                    .map(|plan| {
+                        let input = self.lower(plan)?;
+                        self.align_union_input(input, plan.schema(), union.schema.as_ref())
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let input_count = u32::try_from(inputs.len())
                     .ok()
@@ -240,6 +255,40 @@ impl Lowerer<'_> {
         self.factory.output_capacity_bytes(station, OUTPUT_CAPACITY);
         self.scan_stations.insert(source.index, station);
         Ok(station)
+    }
+
+    fn align_union_input(
+        &mut self,
+        input: StationRef,
+        input_schema: &DFSchema,
+        union_schema: &DFSchema,
+    ) -> Result<StationRef, SqlError> {
+        if input_schema.as_arrow() == union_schema.as_arrow() {
+            return Ok(input);
+        }
+        if input_schema.fields().len() != union_schema.fields().len() {
+            return Err(SqlError::invalid(
+                "DataFusion produced incompatible UNION ALL field counts",
+            ));
+        }
+        let fields = input_schema
+            .fields()
+            .iter()
+            .zip(union_schema.fields())
+            .map(|(source, target)| {
+                SchemaAlignField::try_new_with_metadata(
+                    target.name().to_owned(),
+                    Expr::Column(Column::new_unqualified(source.name())),
+                    target.is_nullable(),
+                    target.metadata().clone(),
+                )
+                .map_err(SqlError::endpoint)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let definition =
+            SchemaAlignDefinition::try_new_with_metadata(fields, union_schema.metadata().clone())
+                .map_err(SqlError::endpoint)?;
+        Ok(self.add_transform(input, definition))
     }
 
     fn add_transform<D>(&mut self, input: StationRef, definition: D) -> StationRef

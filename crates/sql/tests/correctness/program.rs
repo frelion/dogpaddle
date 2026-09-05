@@ -224,6 +224,56 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
 }
 
 #[test]
+fn invalid_plan_shapes_fail_without_creating_a_flow() {
+    let queries = [
+        ("query without a scan", "SELECT 1"),
+        (
+            "cross join",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan, \
+                  sequence(start => 0) AS right_scan",
+        ),
+        (
+            "union field count",
+            "SELECT value FROM sequence(start => 0) \
+             UNION ALL \
+             SELECT value, value FROM sequence(start => 0)",
+        ),
+        (
+            "union incompatible types",
+            "SELECT value FROM sequence(start => 0) \
+             UNION ALL \
+             SELECT value = 0 FROM sequence(start => 0)",
+        ),
+        (
+            "duplicate output field",
+            "SELECT value AS duplicate, value AS duplicate FROM sequence(start => 0)",
+        ),
+        (
+            "reserved output field",
+            "SELECT value AS \"$dogpaddle.diff\" FROM sequence(start => 0)",
+        ),
+        (
+            "unreachable scan",
+            "WITH \
+                 unused AS (SELECT value FROM sequence(start => 0)), \
+                 used AS (SELECT value FROM sequence(start => 1)) \
+             SELECT value FROM used",
+        ),
+    ];
+
+    let root = tempfile::tempdir().unwrap();
+    for (index, (case, query)) in queries.into_iter().enumerate() {
+        let flow_path = root.path().join(format!("invalid-plan-{index}"));
+        let sql = format!("INSERT INTO discard() {query}");
+        if let Ok(program) = SqlProgram::parse(&sql) {
+            assert!(program.build(&flow_path).is_err(), "built {case}");
+        }
+        assert!(!flow_path.exists(), "{case} created a Flow path");
+    }
+}
+
+#[test]
 fn ignored_sql_modifiers_are_rejected_before_creating_a_flow() {
     let queries = [
         (
@@ -245,6 +295,14 @@ fn ignored_sql_modifiers_are_rejected_before_creating_a_flow() {
         (
             "limit all",
             "SELECT value FROM sequence(start => 0) LIMIT ALL",
+        ),
+        (
+            "offset",
+            "SELECT value FROM sequence(start => 0) OFFSET 1 ROW",
+        ),
+        (
+            "fetch",
+            "SELECT value FROM sequence(start => 0) FETCH FIRST 1 ROW ONLY",
         ),
         (
             "materialized CTE",

@@ -45,9 +45,9 @@ Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 statu
 
 ### SQL
 
-SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,build,open}` 验证产品契约。证据覆盖全部 v1 endpoint、严格 `name => value`、环境变量脱敏与 build/open 前置解析；别名、qualified column、隐式 cast、CASE、TRY_CAST、CTE fan-out、多 Scan 与 `UNION ALL` lowering；普通表和全部未支持节点在创建 Flow 路径前拒绝。AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
+SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,build,open}` 验证产品契约。护栏分四层：parser/endpoint 参数契约；所有拒绝路径不创建 Flow；Sequence→SQLite 的结果与精确目标列结构；真实 PostgreSQL 的端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
-Sequence→SQLite 公共链路验证固定 Station ID、64 MiB output capacity、结果与 diff 经 Sink 的最终关系、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。真实 PostgreSQL gate 另外覆盖 `postgres_cdc → Filter/Select → postgres`、目标提交后本地结算前终止和 reopen 幂等重投。
+SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义；不得只断言 build 或一次 advance 成功。不可达 Scan 声明必须与其他拒绝路径一样证明不创建 Flow。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL gate另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 reopen 幂等重投。
 
 ### 私有测试拆分
 

@@ -200,21 +200,31 @@ INSERT INTO postgres(
     schema => 'target',
     table => 'events'
 )
-SELECT id, tx_seq, payload
-FROM postgres_cdc(
-    engine_name => 'sql_gate_scan',
-    runtime_bundle => '{bundle}',
-    host => '127.0.0.1',
-    port => {self.port},
-    database => 'postgres',
-    user => 'dogpaddle_gate',
-    password => env('DOGPADDLE_SQL_GATE_PASSWORD'),
-    schema => 'source',
-    table => 'events',
-    slot => 'events_slot',
-    publication => 'events_publication'
+WITH even_events AS (
+    SELECT id, tx_seq, payload
+    FROM postgres_cdc(
+        engine_name => 'sql_gate_scan',
+        runtime_bundle => '{bundle}',
+        host => '127.0.0.1',
+        port => {self.port},
+        database => 'postgres',
+        user => 'dogpaddle_gate',
+        password => env('DOGPADDLE_SQL_GATE_PASSWORD'),
+        schema => 'source',
+        table => 'events',
+        slot => 'events_slot',
+        publication => 'events_publication'
+    )
+    WHERE tx_seq % 2 = 0
 )
-WHERE tx_seq % 2 = 0;
+SELECT id, tx_seq, payload
+FROM even_events
+WHERE tx_seq % 4 = 0
+UNION ALL
+SELECT id, tx_seq,
+       CASE WHEN tx_seq % 4 = 2 THEN payload ELSE NULL END AS payload
+FROM even_events
+WHERE tx_seq % 4 = 2;
 """,
             encoding="utf-8",
         )
@@ -339,8 +349,9 @@ WHERE tx_seq % 2 = 0;
                 raise RuntimeError("CDC publication captured the SQL sink target")
 
         print(
-            "PASS SQL postgres_cdc -> WHERE/SELECT -> postgres build, filtered "
-            "updates, PG-committed/Prepared crash, idempotent reopen, and successor"
+            "PASS SQL postgres_cdc -> CTE/filter/nullable UNION ALL -> postgres "
+            "build, filtered updates, PG-committed/Prepared crash, idempotent "
+            "reopen, and successor"
         )
 
 
