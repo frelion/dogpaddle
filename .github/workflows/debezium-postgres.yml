@@ -1,11 +1,12 @@
-name: Debezium PostgreSQL recovery
+name: PostgreSQL recovery
 
 on:
   pull_request:
     paths:
       - ".github/workflows/debezium-postgres.yml"
       - ".cargo/**"
-      - "crates/debezium/**"
+      - "crates/**"
+      - "tools/check_postgres_*.py"
       - "experiments/debezium-d1/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -15,7 +16,8 @@ on:
     paths:
       - ".github/workflows/debezium-postgres.yml"
       - ".cargo/**"
-      - "crates/debezium/**"
+      - "crates/**"
+      - "tools/check_postgres_*.py"
       - "experiments/debezium-d1/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -43,9 +45,9 @@ env:
 
 jobs:
   recovery:
-    name: PostgreSQL checkpoint and ACK recovery
+    name: PostgreSQL engine, source and sink recovery
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,6 +67,7 @@ jobs:
             podman \
             podman-compose \
             postgresql-client \
+            postgresql-16 \
             ripgrep \
             slirp4netns \
             uidmap
@@ -82,6 +85,7 @@ jobs:
             target/debezium-maven-cache
             target/debezium-runtime-downloads
             experiments/debezium-d1/host/target
+            target/debug
           key: debezium-d1-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'experiments/debezium-d1/host/Cargo.lock', 'crates/debezium/bridge/pom.xml', 'crates/debezium/bridge/probe/pom.xml', 'crates/debezium/runtime-assets/*.tsv') }}
           restore-keys: |
             debezium-d1-v1-${{ runner.os }}-1.96-
@@ -113,6 +117,25 @@ jobs:
           experiments/debezium-d1/scripts/run.sh \
             2>&1 | tee "$D1_ARTIFACT_ROOT/d1-gate.log"
 
+      - name: Run the native Source and same-database PG roundtrip gates
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          python3 tools/check_postgres_cdc.py \
+            --bundle "$GITHUB_WORKSPACE/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu" \
+            --postgres-bin /usr/lib/postgresql/16/bin \
+            2>&1 | tee "$D1_ARTIFACT_ROOT/source-gate.log"
+
+      - name: Run the native Sink recovery and batching gate
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          python3 tools/check_postgres_sink.py \
+            --postgres-bin /usr/lib/postgresql/16/bin \
+            2>&1 | tee "$D1_ARTIFACT_ROOT/sink-gate.log"
+
       - name: Capture PostgreSQL diagnostics
         if: always()
         continue-on-error: true
@@ -140,6 +163,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: debezium-postgres-${{ github.run_id }}-${{ github.run_attempt }}
-          path: d1-artifacts/
+          path: |
+            d1-artifacts/
+            ${{ runner.temp }}/dogpaddle-pg-cdc-*/**/*.log
           if-no-files-found: error
           retention-days: 14

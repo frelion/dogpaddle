@@ -383,8 +383,17 @@ fn plan_batch(
                 }
             }
             MutationKind::Delete => {
-                let selected =
-                    select_delete_ids(target, entry, position.row_index, position.remaining, take)?;
+                // Admit the entire negative event once, before any part is
+                // visible. A durable within-row continuation proves admission;
+                // subsequent batches only need their own IDs. The target is
+                // exclusively owned, so no other writer can consume the rest.
+                let needed = if position.remaining == change.diffs().value(row_index).unsigned_abs()
+                {
+                    position.remaining
+                } else {
+                    take
+                };
+                let selected = select_delete_ids(target, entry, position.row_index, needed, take)?;
                 for technical_id in selected {
                     if !entry.pending_inserts.remove(&technical_id) {
                         entry.selected_deletes.insert(technical_id);

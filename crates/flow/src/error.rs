@@ -63,17 +63,17 @@ pub enum FlowError {
         /// Stable Store data object name that could not be opened.
         name: String,
     },
-    /// Published runtime frontiers violate the output-retention invariant.
+    /// Published runtime positions or output-retention frontiers are invalid.
     #[error("station {station_id:?} has invalid runtime state: {reason}")]
     InvalidRuntimeState {
-        /// Stable producer Station ID whose output retention is invalid.
+        /// Stable Station ID whose runtime state is invalid.
         station_id: String,
-        /// Concrete invariant violation detected while reopening.
+        /// Concrete invariant violation detected while opening or inspecting.
         reason: String,
     },
 }
 
-pub(crate) fn retention_open_error(station_id: &str, source: StationError) -> FlowError {
+pub(crate) fn runtime_state_error(station_id: &str, source: StationError) -> FlowError {
     match source {
         StationError::Store(source) => FlowError::Store(source),
         source => FlowError::InvalidRuntimeState {

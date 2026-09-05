@@ -20,7 +20,7 @@ use dogpaddle_operation::{
     DataInstances, OperationDefinition, RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
-        sink::SqliteSinkDefinition,
+        sink::{PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
         source::{PostgresSourceConfig, PostgresSourceDefinition},
     },
 };
@@ -36,6 +36,7 @@ struct Options {
     table: String,
     slot: String,
     publication: String,
+    port: u16,
 }
 
 impl Options {
@@ -43,7 +44,8 @@ impl Options {
         let args = env::args().skip(1).collect::<Vec<_>>();
         let [mode, root, bundle, port, table, slot, publication] = args.as_slice() else {
             return Err(
-                "usage: postgres_cdc <flow|direct> ROOT BUNDLE PORT TABLE SLOT PUBLICATION".into(),
+                "usage: postgres_cdc <flow|flow-pg|direct> ROOT BUNDLE PORT TABLE SLOT PUBLICATION"
+                    .into(),
             );
         };
         let config = PostgresSourceConfig::new_unencrypted(
@@ -61,6 +63,7 @@ impl Options {
             table: table.clone(),
             slot: slot.clone(),
             publication: publication.clone(),
+            port: port.parse()?,
         })
     }
 
@@ -78,9 +81,9 @@ impl Options {
 fn main() -> Result<(), OperationError> {
     let options = Options::read()?;
     let mut runner = match options.mode.as_str() {
-        "flow" => Runner::Flow(open_flow(options)?),
+        "flow" | "flow-pg" => Runner::Flow(open_flow(options)?),
         "direct" => Runner::Direct(DirectSource::open(options)?),
-        _ => return Err("mode must be flow or direct".into()),
+        _ => return Err("mode must be flow, flow-pg or direct".into()),
     };
     respond(&json!({"kind": "ready"}))?;
     for command in io::stdin().lock().lines() {
@@ -131,19 +134,41 @@ impl Runner {
 fn open_flow(options: Options) -> Result<Flow, OperationError> {
     let flow_path = options.root.join("flow");
     let mut factory = FlowFactory::new(&flow_path);
+    let sink_config = if options.mode == "flow-pg" {
+        Some(PostgresSinkConfig::new_unencrypted(
+            "127.0.0.1",
+            options.port,
+            "postgres",
+            "dogpaddle_gate",
+            env::var("DOGPADDLE_GATE_PASSWORD")?,
+        )?)
+    } else {
+        None
+    };
     if flow_path.exists() {
         factory.resource("pg", options.config)?;
+        if let Some(config) = sink_config {
+            factory.resource("sink", config)?;
+        }
         return Ok(factory.open()?);
     }
     let source = factory.station("pg", options.definition()?);
-    let sink = factory.station(
-        "sqlite",
-        SqliteSinkDefinition::try_new(options.root.join("sink.sqlite"), "events")?,
-    );
+    let sink = if let Some(config) = &sink_config {
+        let target = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
+        factory.station("sink", PostgresSinkDefinition::try_new(target)?)
+    } else {
+        factory.station(
+            "sqlite",
+            SqliteSinkDefinition::try_new(options.root.join("sink.sqlite"), "events")?,
+        )
+    };
     // One retained entry at a time, with the normal empty-log oversize rule.
     factory.output_capacity_bytes(source, NonZeroU64::MIN);
     factory.connect([source], sink);
     factory.resource("pg", options.config)?;
+    if let Some(config) = sink_config {
+        factory.resource("sink", config)?;
+    }
     Ok(factory.build()?)
 }
 

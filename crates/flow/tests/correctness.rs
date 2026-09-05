@@ -14,6 +14,8 @@ mod runtime_corruption;
 mod schema;
 #[path = "correctness/sqlite_sink.rs"]
 mod sqlite_sink;
+#[path = "correctness/status.rs"]
+mod status;
 #[path = "correctness/support.rs"]
 mod support;
 #[path = "correctness/validation.rs"]

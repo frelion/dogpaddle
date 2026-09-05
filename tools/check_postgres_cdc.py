@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit native PostgreSQL -> DogPaddle -> SQLite recovery gate (Python 3.9+).
+"""Native PostgreSQL CDC -> DogPaddle -> SQLite/PostgreSQL gates (Python 3.9+).
 
 Only an initdb-owned temporary cluster is used; existing databases and services
 are never contacted. Supply the already built, target-matched runtime payload.
@@ -279,6 +279,46 @@ class Fixture:
                   "successor witnesses ordered replay without duplicates")
         print("PASS real Source atomic checkpoint/output commit, rollback, pre-ACK process exit, backpressure replay and witness")
 
+    def postgres_roundtrip_gate(self) -> None:
+        table = "roundtrip_events"
+        self.create_table(table)
+
+        def rows() -> list[tuple[int, int, str]]:
+            if self.sql("SELECT to_regclass('public.roundtrip_target') IS NOT NULL") != "t":
+                return []
+            values = self.sql("SELECT id, tx_seq, convert_from(payload, 'UTF8') "
+                              "FROM public.roundtrip_target ORDER BY id")
+            return [(int(row_id), int(seq), payload) for row_id, seq, payload in
+                    (line.split('|') for line in values.splitlines())]
+
+        expected = [(index, index, f"row-{index}") for index in range(1, 2051)]
+        with self.host("flow-pg", table, 1) as host:
+            drive(host, lambda: self.active(table), "same-PostgreSQL Flow starts")
+            self.sql(f"INSERT INTO {table} SELECT value, value, 'row-' || value "
+                     "FROM generate_series(1, 2050) AS value ORDER BY value")
+            drive(host, lambda: bool(rows()), "first PG sink batch commits")
+            prefix = rows()
+            if prefix != expected[:len(prefix)] or len(prefix) > 1024:
+                raise RuntimeError("same-PG target is not the bounded first prefix")
+            # This round just committed the first PG delivery. No next round
+            # settles its Prepared state before the context kills the host.
+        until("same-PG crash releases its slot", lambda: not self.active(table))
+        with self.host("flow-pg", table, 2) as host:
+            drive(host, lambda: rows() == expected, "same-PG full suffix replays exactly once")
+            self.sql(f"BEGIN; UPDATE {table} SET payload = 'updated' WHERE id <= 10; "
+                     f"DELETE FROM {table} WHERE id BETWEEN 11 AND 20; "
+                     f"INSERT INTO {table} VALUES (2051, 2051, 'after-reopen'); COMMIT")
+            expected = [(row_id, seq, "updated" if row_id <= 10 else payload)
+                        for row_id, seq, payload in expected if not 11 <= row_id <= 20]
+            expected.append((2051, 2051, "after-reopen"))
+            drive(host, lambda: rows() == expected, "same-PG update/delete and recovery witness")
+            if self.sql('SELECT count(*) FROM public."$dogpaddle.receipt.roundtrip_sink"') != "1":
+                raise RuntimeError("same-PG receipts did not stay bounded")
+            if self.sql(f"SELECT tablename FROM pg_publication_tables WHERE pubname = '{table}_pub'") != table:
+                raise RuntimeError("publication includes more than the source table")
+        print("PASS same PostgreSQL instance/database CDC -> PG sink: 2050-row split, "
+              "PG-committed/Prepared crash, exact recovery, update/delete and new witness")
+
     def split_transaction_gate(self) -> None:
         table = "chunked_events"
         self.create_table(table)
@@ -318,7 +358,7 @@ class Fixture:
     def check_no_password(self) -> None:
         needle = PASSWORD.encode()
         for directory in [self.root / "flow_events" / "flow", self.root / "direct_events" / "source",
-                          self.root / "chunked_events" / "source"]:
+                          self.root / "chunked_events" / "source", self.root / "roundtrip_events" / "flow"]:
             for path in directory.rglob("*"):
                 if not path.is_file():
                     continue
@@ -356,6 +396,7 @@ def main() -> None:
         fixture.flow_gate()
         fixture.source_gate()
         fixture.split_transaction_gate()
+        fixture.postgres_roundtrip_gate()
         fixture.check_no_password()
         passed = True
     finally:

@@ -42,6 +42,10 @@ path = "tests/correctness.rs"
 name = "queue_source"
 path = "examples/queue_source.rs"
 
+[[example]]
+name = "postgres_sink_recovery"
+path = "examples/postgres_sink_recovery.rs"
+
 [[bench]]
 name = "operation_core"
 path = "benches/operation_core.rs"

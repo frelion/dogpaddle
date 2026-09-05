@@ -11,4 +11,4 @@ pub use build::{
     TopologyError,
 };
 pub use error::{FlowError, FlowRunError};
-pub use flow::{AdvanceOutcome, Flow};
+pub use flow::{AdvanceOutcome, Flow, InputStatus, OutputStatus, StationStatus};

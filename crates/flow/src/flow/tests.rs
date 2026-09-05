@@ -168,6 +168,15 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
     assert!(first_error.requires_reopen());
     assert_eq!(runs.load(Ordering::Relaxed), 1);
 
+    let statuses = flow.status().unwrap();
+    assert!(statuses[2].needs_reopen);
+    assert!(statuses[2].last_outcome.is_none());
+    assert!(
+        statuses[1].last_outcome.is_none(),
+        "later Stations were not visited"
+    );
+    assert_eq!(statuses[0].output.as_ref().unwrap().tail, 1);
+
     let preflight_error = flow.advance().unwrap_err();
     assert_eq!(preflight_error.station_id(), "failed-source");
     assert!(preflight_error.requires_reopen());
@@ -177,6 +186,12 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
             .contains("station must be reopened after a post-commit failure")
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert!(
+        flow.status()
+            .unwrap()
+            .iter()
+            .all(|station| station.last_outcome.is_none())
+    );
     drop(flow);
 
     let store = Store::open(path).unwrap();

@@ -157,6 +157,30 @@ Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端
 标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
 `tools/check_postgres_sink.py`。
 
+## 运行状态
+
+`Flow::status()` 按声明顺序返回 `Vec<StationStatus>`：每个 Station 的 ID、durable active input、各
+input cursor/tail、output head/tail/retained bytes/capacity，以及最近一次调度的处理结果和 fail-stop
+标记。全部持久计数来自同一个短 RO snapshot，不解码 Change、不调用 Operation、不连接外部系统，
+不启动写事务；即使 Flow 需要 reopen 也能查询。
+
+```no_run
+# fn inspect(flow: &dogpaddle_flow::Flow) -> Result<(), dogpaddle_flow::FlowError> {
+for station in flow.status()? {
+    println!("{}: {:?}, reopen={}", station.id, station.last_outcome, station.needs_reopen);
+    for (port, input) in station.inputs.iter().enumerate() {
+        println!("  input {port}: {} Changes waiting", input.tail - input.cursor);
+    }
+}
+# Ok(())
+# }
+```
+
+`last_outcome` 保留实际处理的 Backpressured，不受整轮 `Progressed` 或该 Station 的 durable pin
+覆盖；它只描述最近那一轮，不预测下一轮。未执行或失败的 Station 为 None，reopen 后全部为 None。
+backlog 单位是完整 Change 而非行数；capacity 仍是允许空日志单条 oversize 的软水位，不是硬内存上限。
+这不是指标历史库或后台监控线程。
+
 ## 持久化边界
 
 每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成声明并稳定编码，再立即解码这份 canonical

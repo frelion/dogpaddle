@@ -337,9 +337,9 @@ tmux select-pane -t "$left"
         "${target_check[@]}" -c \
             "SELECT COALESCE(string_agg(id::text || ':' || convert_from(status, 'UTF8'), ',' ORDER BY id, \"\$dogpaddle.id\"), '') FROM target.orders;"
     }
-    receipt_count() {
+    receipt_frontier() {
         "${target_check[@]}" -c \
-            'SELECT count(*) FROM target."$dogpaddle.receipt.readme_sink";'
+            'SELECT COALESCE(max("$dogpaddle.delivery"), 0) FROM target."$dogpaddle.receipt.readme_sink";'
     }
     wait_for_source() {
         local expected="$1"
@@ -442,8 +442,8 @@ tmux select-pane -t "$left"
     show_target
     sleep 1.0
 
-    receipts_before="$(receipt_count)"
-    if [[ -z "$receipts_before" ]] || (( receipts_before < 1 )); then
+    delivery_before="$(receipt_frontier)"
+    if [[ -z "$delivery_before" ]] || (( delivery_before < 1 )); then
         echo "target receipt was not committed before restart" >&2
         exit 1
     fi
@@ -461,7 +461,7 @@ tmux select-pane -t "$left"
     host_request advance
     host_request advance
     wait_for_slot
-    if [[ "$(target_state)" != '1:paid' || "$(receipt_count)" != "$receipts_before" ]]; then
+    if [[ "$(target_state)" != '1:paid' || "$(receipt_frontier)" != "$delivery_before" ]]; then
         echo "target changed while replaying the prepared delivery" >&2
         exit 1
     fi
@@ -473,7 +473,7 @@ tmux select-pane -t "$left"
     drive_until '1:paid,3:live'
     host_request advance
     if [[ "$(target_state)" != '1:paid,3:live' ]] \
-        || (( $(receipt_count) <= receipts_before )); then
+        || (( $(receipt_frontier) <= delivery_before )); then
         echo "post-restart witness did not converge" >&2
         exit 1
     fi

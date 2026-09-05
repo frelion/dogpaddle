@@ -68,10 +68,15 @@ fn main() -> Result<(), GateError> {
     respond(&json!({"kind": "ready", "mode": mode}))?;
     for command in io::stdin().lock().lines() {
         match command?.as_str() {
-            "advance" => respond(&json!({
-                "kind": "advance",
-                "outcome": format!("{:?}", flow.advance()?),
-            }))?,
+            "advance" => {
+                let response = match flow.advance() {
+                    Ok(outcome) => json!({"kind": "advance", "outcome": format!("{outcome:?}")}),
+                    Err(error) => {
+                        json!({"kind": "error", "message": error.to_string(), "requires_reopen": error.requires_reopen()})
+                    }
+                };
+                respond(&response)?;
+            }
             "quit" => break,
             _ => return Err("unsupported gate command".into()),
         }

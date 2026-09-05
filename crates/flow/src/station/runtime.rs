@@ -11,7 +11,7 @@ use dogpaddle_store::{
     TransactionAccess, Transactions,
 };
 
-use crate::flow::AdvanceOutcome;
+use crate::flow::{AdvanceOutcome, StationStatus};
 
 use super::{
     input::{
@@ -33,6 +33,7 @@ pub(crate) struct Station {
     pub(super) inbox: Inbox,
     pub(super) output: Option<Arc<Output>>,
     needs_reopen: bool,
+    last_outcome: Option<AdvanceOutcome>,
 }
 
 impl Station {
@@ -44,6 +45,7 @@ impl Station {
         self.ensure_runnable()?;
         let pinned = self.inbox.intake(reads, transactions)?;
         let outcome = self.process(transactions)?;
+        self.last_outcome = Some(outcome);
         if pinned {
             Ok(AdvanceOutcome::Progressed)
         } else {
@@ -115,6 +117,30 @@ impl Station {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn clear_outcome(&mut self) {
+        self.last_outcome = None;
+    }
+
+    pub(crate) fn status(
+        &self,
+        id: &str,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<StationStatus, StationError> {
+        let (active_input, inputs) = self.inbox.status(access)?;
+        Ok(StationStatus {
+            id: id.to_owned(),
+            needs_reopen: self.needs_reopen,
+            last_outcome: self.last_outcome,
+            active_input,
+            inputs,
+            output: self
+                .output
+                .as_ref()
+                .map(|output| output.status(access))
+                .transpose()?,
+        })
     }
 
     #[cfg(test)]
@@ -206,6 +232,7 @@ impl StationParts {
             inbox: Inbox::new(self.state, inputs),
             output,
             needs_reopen: false,
+            last_outcome: None,
         }
     }
 }

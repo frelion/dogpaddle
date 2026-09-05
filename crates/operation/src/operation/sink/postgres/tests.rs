@@ -53,7 +53,10 @@ fn identifiers_are_quoted_as_independent_postgresql_components() {
             .initialize
             .contains("CREATE INDEX \"Target Schema\".\"$dogpaddle.hash.sink_1\"")
     );
-    assert!(plan.insert_row.contains("\"odd\"\"column\""));
+    assert!(
+        plan.mutation_statement(MutationKind::Insert, 1)
+            .contains("\"odd\"\"column\"")
+    );
     assert!(!plan.initialize.contains("\"Target Schema.odd.table\""));
 }
 
@@ -98,7 +101,7 @@ fn row_codec_preserves_unsigned_and_float_bit_patterns() {
 }
 
 #[test]
-fn matching_and_delete_use_distinct_correct_parameter_offsets() {
+fn matching_and_batched_mutations_bind_exact_typed_values() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Utf8, true),
@@ -114,9 +117,45 @@ fn matching_and_delete_use_distinct_correct_parameter_offsets() {
         plan.select_matching
             .contains("\"b\" IS NOT DISTINCT FROM $3")
     );
-    assert!(plan.select_matching.ends_with("LIMIT $4"));
-    assert!(plan.delete_exact.contains("\"a\" IS NOT DISTINCT FROM $3"));
-    assert!(plan.delete_exact.contains("\"b\" IS NOT DISTINCT FROM $4"));
+    assert!(plan.select_matching.contains("<> ALL($4::bigint[])"));
+    assert!(plan.select_matching.ends_with("LIMIT $5"));
+    assert!(
+        plan.count_matching
+            .starts_with("SELECT count(*) FROM (SELECT 1 ")
+    );
+    assert!(plan.count_matching.ends_with("LIMIT $5) AS matches"));
+    let delete = plan.mutation_statement(MutationKind::Delete, 2);
+    assert!(delete.contains("($1::bigint, $2::bytea, $3::bigint, $4::bytea), ($5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
+    assert!(delete.contains("target.\"a\" IS NOT DISTINCT FROM expected.\"a\""));
+    assert!(delete.contains("target.\"b\" IS NOT DISTINCT FROM expected.\"b\""));
+    assert!(delete.ends_with("RETURNING target.\"$dogpaddle.id\""));
+    let insert = plan.mutation_statement(MutationKind::Insert, 2);
+    assert!(insert.contains("$8::bytea) ON CONFLICT"));
+}
+
+#[test]
+fn mutation_statements_handle_empty_and_wide_schemas_within_parameter_limits() {
+    let empty = SqlPlan::new(
+        &spec("empty"),
+        &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
+    );
+    assert_eq!(empty.mutation_batch_size(), 1024);
+    assert!(
+        empty
+            .mutation_statement(MutationKind::Delete, 1)
+            .contains("($1::bigint, $2::bytea)")
+    );
+    let fields = (0..1_598)
+        .map(|index| Field::new(format!("f{index}"), DataType::Int64, true))
+        .collect::<Vec<_>>();
+    let wide = SqlPlan::new(
+        &spec("wide"),
+        &PostgresLayout::try_new(Arc::new(Schema::new(fields))).unwrap(),
+    );
+    assert_eq!(wide.mutation_batch_size(), 40);
+    let statement = wide.mutation_statement(MutationKind::Insert, 40);
+    assert!(statement.contains("$64000::bigint)"));
+    assert!(!statement.contains("$64001"));
 }
 
 #[test]

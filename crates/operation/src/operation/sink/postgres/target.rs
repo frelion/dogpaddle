@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt::Write as _, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
-use postgres::{Client, GenericClient, IsolationLevel, Statement, types::ToSql};
+use postgres::{Client, GenericClient, IsolationLevel, types::ToSql};
 
 use crate::operation::sink::relation::{MAX_MUTATIONS_PER_BATCH, Mutation, MutationKind};
 
@@ -193,15 +193,18 @@ impl PostgresTarget {
         scan_limit: u64,
         select_limit: usize,
     ) -> Result<MatchingIds, PostgresSinkError> {
-        if select_limit > usize::try_from(scan_limit).unwrap_or(usize::MAX) {
+        if select_limit > MAX_MUTATIONS_PER_BATCH
+            || select_limit > usize::try_from(scan_limit).unwrap_or(usize::MAX)
+        {
             return Err(invalid_batch("selection limit exceeds scan limit"));
         }
-        let excluded_count = u64::try_from(excluded.len())
-            .map_err(|_| invalid_batch("excluded target ID set is too large"))?;
-        let query_limit = scan_limit
-            .checked_add(excluded_count)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| invalid_batch("matching-row scan limit exceeds PostgreSQL bigint"))?;
+        let scan_limit = i64::try_from(scan_limit)
+            .map_err(|_| invalid_batch("matching-row scan limit exceeds PostgreSQL bigint"))?;
+        let selection_limit = i64::try_from(select_limit).expect("the batch limit fits i64");
+        let excluded = excluded
+            .iter()
+            .map(|id| positive_i64(*id, "excluded technical ID"))
+            .collect::<Result<Vec<_>, _>>()?;
         self.with_client(|client, spec, sql, _, layout_verified| {
             if !*layout_verified {
                 require_owned_layout(client, spec, sql)?;
@@ -209,7 +212,7 @@ impl PostgresTarget {
             }
             let hash = encoded.hash.to_vec();
             let mut parameters: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(encoded.values.len() + 2);
+                Vec::with_capacity(encoded.values.len() + 3);
             parameters.push(&hash);
             parameters.extend(
                 encoded
@@ -217,11 +220,11 @@ impl PostgresTarget {
                     .iter()
                     .map(super::row::PostgresValue::as_parameter),
             );
-            parameters.push(&query_limit);
+            parameters.push(&excluded);
+            parameters.push(&selection_limit);
             let rows = client
                 .query(&sql.select_matching, &parameters)
                 .map_err(|error| database_error("select exact target rows", &error))?;
-            let mut count = 0_u64;
             let mut selected = Vec::with_capacity(select_limit);
             for row in rows {
                 let raw_id: i64 = row.get(0);
@@ -229,17 +232,25 @@ impl PostgresTarget {
                     u64::try_from(raw_id).map_err(|_| PostgresSinkError::TargetLayoutMismatch {
                         name: sql.table_name.clone(),
                     })?;
-                if id == 0 || excluded.contains(&id) {
-                    continue;
+                if id == 0 {
+                    return Err(invalid_batch("target technical ID must be positive"));
                 }
-                count += 1;
-                if selected.len() < select_limit {
-                    selected.push(id);
-                }
-                if count == scan_limit {
-                    break;
-                }
+                selected.push(id);
             }
+            // A large negative event must be admitted in full before deleting
+            // any of it. Count on the server; never transfer its entire ID set.
+            let count = if selected.len() == select_limit && scan_limit > selection_limit {
+                *parameters
+                    .last_mut()
+                    .expect("the limit parameter is present") = &scan_limit;
+                let count: i64 = client
+                    .query_one(&sql.count_matching, &parameters)
+                    .map_err(|error| database_error("count exact target rows", &error))?
+                    .get(0);
+                u64::try_from(count).map_err(|_| invalid_batch("negative matching-row count"))?
+            } else {
+                u64::try_from(selected.len()).expect("the batch limit fits u64")
+            };
             Ok(MatchingIds { count, selected })
         })
     }
@@ -337,15 +348,19 @@ impl PostgresTarget {
                 ));
             }
 
-            let insert_row = transaction
-                .prepare(&sql.insert_row)
-                .map_err(|error| database_error("prepare target insert", &error))?;
-            let delete_exact = transaction
-                .prepare(&sql.delete_exact)
-                .map_err(|error| database_error("prepare target delete", &error))?;
-            for mutation in &encoded {
-                apply_mutation(&mut transaction, &insert_row, &delete_exact, mutation)?;
+            // Group only adjacent mutations of the same kind. In particular,
+            // an insert followed by its withdrawal must remain in that order.
+            for run in encoded.chunk_by(|left, right| left.kind == right.kind) {
+                for batch in run.chunks(sql.mutation_batch_size()) {
+                    apply_mutations(&mut transaction, sql, batch)?;
+                }
             }
+            // Preparing this delivery required settling its predecessor in
+            // MDBX. Only this receipt can ever be replayed; retire predecessors
+            // atomically with the new receipt and mutations, not in a GC phase.
+            transaction
+                .execute(&sql.retire_receipts, &[&sequence])
+                .map_err(|error| database_error("retire settled receipts", &error))?;
             transaction
                 .commit()
                 .map_err(|error| database_error("commit delivery", &error))?;
@@ -500,52 +515,46 @@ fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn apply_mutation(
+fn apply_mutations(
     transaction: &mut postgres::Transaction<'_>,
-    insert_row: &Statement,
-    delete_exact: &Statement,
-    mutation: &EncodedMutation,
+    sql: &SqlPlan,
+    mutations: &[EncodedMutation],
 ) -> Result<(), PostgresSinkError> {
-    let hash = mutation.row.hash.to_vec();
+    let kind = mutations[0].kind;
+    let statement = sql.mutation_statement(kind, mutations.len());
+    let hashes = mutations
+        .iter()
+        .map(|mutation| mutation.row.hash.as_slice())
+        .collect::<Vec<_>>();
     let mut parameters: Vec<&(dyn ToSql + Sync)> =
-        Vec::with_capacity(mutation.row.values.len() + 2);
-    parameters.push(&mutation.technical_id);
-    parameters.push(&hash);
-    parameters.extend(
-        mutation
-            .row
-            .values
-            .iter()
-            .map(super::row::PostgresValue::as_parameter),
-    );
-    match mutation.kind {
-        MutationKind::Insert => {
-            let count = transaction
-                .execute(insert_row, &parameters)
-                .map_err(|error| database_error("insert target row", &error))?;
-            if count == 1 {
-                Ok(())
-            } else {
-                Err(PostgresSinkError::TechnicalIdConflict {
-                    id: u64::try_from(mutation.technical_id)
-                        .expect("encoded technical IDs are positive"),
-                })
-            }
-        }
-        MutationKind::Delete => {
-            let count = transaction
-                .execute(delete_exact, &parameters)
-                .map_err(|error| database_error("delete exact target row", &error))?;
-            if count == 1 {
-                Ok(())
-            } else {
-                Err(PostgresSinkError::DeleteRowMismatch {
-                    id: u64::try_from(mutation.technical_id)
-                        .expect("encoded technical IDs are positive"),
-                })
-            }
+        Vec::with_capacity(mutations.len() * sql.parameter_types.len());
+    for (mutation, hash) in mutations.iter().zip(&hashes) {
+        parameters.push(&mutation.technical_id);
+        parameters.push(hash);
+        parameters.extend(
+            mutation
+                .row
+                .values
+                .iter()
+                .map(super::row::PostgresValue::as_parameter),
+        );
+    }
+    let changed = transaction
+        .query(&statement, &parameters)
+        .map_err(|error| database_error("apply target mutations", &error))?
+        .iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<HashSet<_>>();
+    for mutation in mutations {
+        if !changed.contains(&mutation.technical_id) {
+            let id = u64::try_from(mutation.technical_id).expect("encoded IDs are positive");
+            return Err(match kind {
+                MutationKind::Insert => PostgresSinkError::TechnicalIdConflict { id },
+                MutationKind::Delete => PostgresSinkError::DeleteRowMismatch { id },
+            });
         }
     }
+    Ok(())
 }
 
 fn positive_i64(value: u64, label: &'static str) -> Result<i64, PostgresSinkError> {
@@ -602,9 +611,14 @@ pub(super) struct SqlPlan {
     marker: String,
     pub(super) initialize: String,
     pub(super) select_matching: String,
-    pub(super) insert_row: String,
-    pub(super) delete_exact: String,
+    pub(super) count_matching: String,
+    insert_prefix: String,
+    insert_suffix: String,
+    delete_prefix: String,
+    delete_suffix: String,
+    parameter_types: Vec<&'static str>,
     insert_receipt: String,
+    retire_receipts: String,
     select_receipt: String,
     receipt_frontier: String,
     frontiers: String,
@@ -728,15 +742,8 @@ impl SqlPlan {
             .collect::<Vec<_>>();
         let mut all_names = vec![quoted_id.clone(), quoted_hash.clone()];
         all_names.extend(logical_names.iter().cloned());
-        let placeholders = (1..=all_names.len())
-            .map(|index| format!("${index}"))
-            .collect::<Vec<_>>();
-        let insert_row = format!(
-            "INSERT INTO {target} ({}) VALUES ({}) \
-             ON CONFLICT ({quoted_id}) DO NOTHING",
-            all_names.join(", "),
-            placeholders.join(", ")
-        );
+        let insert_prefix = format!("INSERT INTO {target} ({}) VALUES ", all_names.join(", "));
+        let insert_suffix = format!(" ON CONFLICT ({quoted_id}) DO NOTHING RETURNING {quoted_id}");
         let matching_exact = logical_names
             .iter()
             .enumerate()
@@ -747,26 +754,39 @@ impl SqlPlan {
         } else {
             format!(" AND {}", matching_exact.join(" AND "))
         };
-        let deleting_exact = logical_names
+        let deleting_exact = all_names
             .iter()
             .enumerate()
-            .map(|(index, name)| format!("{name} IS NOT DISTINCT FROM ${}", index + 3))
+            .map(|(index, name)| {
+                let comparison = if index < 2 {
+                    "="
+                } else {
+                    "IS NOT DISTINCT FROM"
+                };
+                format!("target.{name} {comparison} expected.{name}")
+            })
             .collect::<Vec<_>>();
-        let deleting_exact_suffix = if deleting_exact.is_empty() {
-            String::new()
-        } else {
-            format!(" AND {}", deleting_exact.join(" AND "))
-        };
-        let limit_parameter = layout.columns().len() + 2;
+        let excluded_parameter = layout.columns().len() + 2;
+        let limit_parameter = excluded_parameter + 1;
+        let matching = format!(
+            "FROM ONLY {target} WHERE {quoted_hash} = $1{matching_exact_suffix} \
+             AND {quoted_id} <> ALL(${excluded_parameter}::bigint[])"
+        );
         let select_matching = format!(
-            "SELECT {quoted_id} FROM ONLY {target} \
-             WHERE {quoted_hash} = $1{matching_exact_suffix} \
+            "SELECT {quoted_id} {matching} \
              ORDER BY {quoted_id} LIMIT ${limit_parameter}"
         );
-        let delete_exact = format!(
-            "DELETE FROM ONLY {target} \
-             WHERE {quoted_id} = $1 AND {quoted_hash} = $2{deleting_exact_suffix}"
+        let count_matching = format!(
+            "SELECT count(*) FROM (SELECT 1 {matching} LIMIT ${limit_parameter}) AS matches"
         );
+        let delete_prefix = format!("DELETE FROM ONLY {target} AS target USING (VALUES ");
+        let delete_suffix = format!(
+            ") AS expected ({}) WHERE {} RETURNING target.{quoted_id}",
+            all_names.join(", "),
+            deleting_exact.join(" AND ")
+        );
+        let mut parameter_types = vec!["bigint", "bytea"];
+        parameter_types.extend(layout.columns().iter().map(|column| column.storage().sql()));
         let insert_receipt = format!(
             "INSERT INTO {receipt} ({quoted_delivery}, {quoted_digest}, {quoted_count}) \
              VALUES ($1, $2, $3) ON CONFLICT ({quoted_delivery}) DO NOTHING"
@@ -775,6 +795,7 @@ impl SqlPlan {
             "SELECT {quoted_digest}, {quoted_count} FROM ONLY {receipt} \
              WHERE {quoted_delivery} = $1"
         );
+        let retire_receipts = format!("DELETE FROM ONLY {receipt} WHERE {quoted_delivery} < $1");
         let receipt_frontier = format!("SELECT MAX({quoted_delivery}) FROM ONLY {receipt}");
         let frontiers = format!(
             "SELECT (SELECT MAX({quoted_id}) FROM ONLY {target}), \
@@ -791,14 +812,50 @@ impl SqlPlan {
             marker,
             initialize,
             select_matching,
-            insert_row,
-            delete_exact,
+            count_matching,
+            insert_prefix,
+            insert_suffix,
+            delete_prefix,
+            delete_suffix,
+            parameter_types,
             insert_receipt,
+            retire_receipts,
             select_receipt,
             receipt_frontier,
             frontiers,
             target_empty,
         }
+    }
+
+    pub(super) fn mutation_batch_size(&self) -> usize {
+        // PostgreSQL's Bind message carries a u16 parameter count. Wide
+        // Schemas split into smaller statements within the same transaction.
+        (usize::from(u16::MAX) / self.parameter_types.len()).min(MAX_MUTATIONS_PER_BATCH)
+    }
+
+    pub(super) fn mutation_statement(&self, kind: MutationKind, rows: usize) -> String {
+        assert!((1..=self.mutation_batch_size()).contains(&rows));
+        let (prefix, suffix) = match kind {
+            MutationKind::Insert => (&self.insert_prefix, &self.insert_suffix),
+            MutationKind::Delete => (&self.delete_prefix, &self.delete_suffix),
+        };
+        let mut statement = prefix.clone();
+        for row in 0..rows {
+            if row != 0 {
+                statement.push_str(", ");
+            }
+            statement.push('(');
+            for (column, sql_type) in self.parameter_types.iter().enumerate() {
+                if column != 0 {
+                    statement.push_str(", ");
+                }
+                let index = row * self.parameter_types.len() + column + 1;
+                write!(statement, "${index}::{sql_type}").expect("writing SQL cannot fail");
+            }
+            statement.push(')');
+        }
+        statement.push_str(suffix);
+        statement
     }
 }
 

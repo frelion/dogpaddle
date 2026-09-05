@@ -3,7 +3,7 @@ use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, Stor
 
 use crate::{
     assembly::{assemble_stations, resolve_topology},
-    error::{FlowError, retention_open_error},
+    error::{FlowError, runtime_state_error},
     flow::Flow,
     station::StationParts,
 };
@@ -74,7 +74,7 @@ impl FlowFactory {
             {
                 station
                     .validate_output(transaction.access())
-                    .map_err(|source| retention_open_error(station_definition.id(), source))?;
+                    .map_err(|source| runtime_state_error(station_definition.id(), source))?;
             }
         }
 

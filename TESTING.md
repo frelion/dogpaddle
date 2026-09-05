@@ -80,7 +80,9 @@ payload。脚本创建独占临时 cluster、随机 loopback 端口和测试表/
 insert/update/delete、类型映射与进程 reopen；直接 Operation+Store 模式验证 checkpoint/output
 单次原子提交、rollback/背压时二者均不变、提交后 ACK 前退出，以及 checkpoint-only fresh Engine。
 2050 行单 PG 事务跨越 1024 条批量边界，首批提交后 ACK 前退出并 reopen，后继 witness 验证完整
-事件顺序且无重漏。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
+事件顺序且无重漏。`flow-pg` 模式再证明同一个 PG 实例、同一个 database 内的 Source→PG Sink：
+2050 行跨批、首批 PG 已提交而本地仍 Prepared 时进程终止、reopen、update/delete 与后继 witness，
+publication 只包含源表，目标不会反馈进源。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
 接口，也不是第二套运行层。结果必须报告实际 PG/Rust/runtime 版本；本机 PG17 证据不能冒充既有
 Linux digest-pinned PG16.15 D1/D2 gate，D5 的长稳、fencing、升级与发布门仍独立开放。
 
@@ -101,12 +103,24 @@ python3 tools/check_postgres_sink.py \
 ```
 
 脚本需要 Python 3.9+ 与本机 PostgreSQL 15+ 的 `initdb/pg_ctl/postgres/psql`，并自行构建公共
-`SequenceSource → PostgresSink` host。它只创建 loopback 临时 cluster 和 Flow，不连接已有服务，
-无论成败都停止自己的 cluster。当前 witness 写入三个 `UInt64` 正 diff：第一笔 PG receipt/row 已
-提交而 MDBX 仍为 Prepared 时杀死 host，随后 reopen 重投并排空；最终必须恰有三行目标记录及
-连续且唯一的 receipt `1..=3`，每个 delivery 一行、一个 mutation。该 gate 证明初始化、insert、
-receipt 幂等重放和这一精确 crash window，不宣称 delete、吞吐、TLS、在线 Schema evolution 或
-生产长稳已经验收。
+`SequenceSource → PostgresSink` Flow host，以及 Operation 所有的 `postgres_sink_recovery` 公共协议
+host。只创建 loopback 临时 cluster、Flow 和 Store，不连接已有服务，无论成败都停止自己的 cluster。
+
+- Flow：目标锁超时使 receipt/data 整笔回滚、AfterCommit fail-stop、reopen；PG 已提交而 MDBX
+  仍 Prepared 时再次杀进程。最终三个 UInt64 最大值区间内的记录精确各出现一次，只留 receipt 3。
+- Operation：16,385 重复行跨 1024 上限插入及完整撤回；Prepared 提交而 PG 尚未写入、PG 已写入而
+  MDBX 尚未结算两个窗口；prepare/settlement rollback；不足额和非法负前缀拒绝无部分效果；普通
+  planning error 后同一运行实例重试；最小 ID 匹配和交替正负事件。
+- PG 参数类型与边界：NULL、嵌入 NUL 的 Utf8、UInt64 最大值、NaN payload、负零、各标量存储
+  family，reopen 后精确撤回；零列与 1598 列，宽表按参数上限拆成同一事务内的小语句。
+- 实际服务端 statement 日志锁住工作量：16,385 insert/delete 各 17 条批量 SQL，混合事件另各
+  2 条；大额撤回各只做一次完整 admission count，所有 turn 后最多一条 live receipt。打印运行耗时
+  只为诊断，不是吞吐 benchmark，也不把逻辑 receipt 数量当作 PG 文件大小的硬上限。
+
+`.github/workflows/debezium-postgres.yml` 在产品 crate 或两份 gate 脚本变动时，先运行原 digest-pinned
+D1/D2 gate，再复用其 native runtime payload 执行 Source、同 PG 往返和 Sink gate；native server 为
+Ubuntu 包提供的 PG16，输出实际版本，不混同 pinned container 的证据。普通 Cargo gate 仍离线。
+上述不代表 TLS、初始 snapshot、在线 Schema evolution、fencing 或生产长稳已经验收。
 
 ## Change + Store 的最小接缝
 
@@ -173,12 +187,17 @@ PostgreSQL Sink 同时冻结 tag12 canonical JSON、唯一版本化 state Cell�
 delivery/digest/frontier/continuation/mutations。离线测试必须证明 Definition 不持久化 runtime secret、
 resource/Schema 错误先于建库、build/open 不访问 PG、rollback 或丢弃 `AfterCommit` 不产生远端动作。
 真实 gate 必须在 PG receipt 与 mutations 同事务提交、MDBX 仍停在 Prepared 的窗口杀死进程，并证明
-reopen 对相同 delivery 只验证 receipt 而不重复应用。单批上限固定为 1024；每个成功 delivery 恰有
-一行 receipt。扩展 gate 到 delete、更多类型或故障点时，应增强同一脚本，而不是在普通 Cargo gate
+reopen 对相同 delivery 只验证 receipt 而不重复应用。单批上限固定为 1024；新 delivery 原子替换
+已结算的旧 receipt，始终只保留最新一行。扩展类型或故障点时应增强同一脚本，而不是在普通 Cargo gate
 偷偷依赖本机服务。
 
 Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理
 原子性。上层只重复自己的协议阶段、对象组合和 reopen 义务，不为每个 crate 复制 SIGKILL harness。
+
+Flow 公共 `correctness/status.rs` 证明只读 status 不启动外部资源、不推进游标，单一 snapshot 的
+input/output counters 一致，能看到整轮 Progressed 下的 Station Backpressured，并在 reopen 后
+保留 durable counters、清除内存 outcome。已有 fail-stop 私有故障测试同时验证 status 仍可读、
+下一轮预检失败不会保留上一轮 outcome。
 
 ## Benchmark 协议
 

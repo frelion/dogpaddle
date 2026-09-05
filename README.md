@@ -57,6 +57,9 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，每个 Prepared 批次把 receipt
 与 mutation 放在同一个 PostgreSQL 事务中，使提交窗口可在 reopen 后重放收敛。Definition 只保存
 非敏感 spec，连接配置与密码只在 build/open 时作为运行资源注入。
+现有验收覆盖大批 insert/delete、提交前后进程终止与恢复，以及同一个 PG 数据库的完整往返；
+PG Sink 按顺序批量写入，最多保留一条当前确认记录。目标列优先保留 Arrow 精确值，不是源表原生
+SQL 类型的原样镜像；也不承诺整个源事务在目标侧原子可见。
 这是无初始快照、无 TLS 与在线 Schema evolution 的试点；
 [Source 使用与边界](crates/operation/README.md#postgresql-source-试点) ·
 [Sink 使用与边界](crates/operation/README.md#operationsinkpostgressink)。
@@ -64,7 +67,8 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
 ## 当前边界
 
 - DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
-- 运行由宿主反复调用 `Flow::advance` 驱动；尚无 `Flow::start`、后台 runner 或中断控制。
+- 运行由宿主反复调用 `Flow::advance` 驱动；`Flow::status` 可只读查看各 Station 的游标、积压、容量、
+  最近处理结果和是否需要 reopen。尚无 `Flow::start`、后台 runner 或中断控制。
 - Operation 集合目前封闭。
 - 一个 Store 路径同一时刻只允许一个活动 Flow。
 - PostgreSQL 增量链路尚无初始全量、多表路由、TLS、在线 Schema evolution 或跨 Flow fencing；

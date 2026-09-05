@@ -12,6 +12,7 @@ use dogpaddle_store::{
 };
 
 use super::protocol::StationError;
+use crate::flow::{InputStatus, OutputStatus};
 
 pub(super) const ACTIVE_INPUT_KEY: &[u8] = b"input/active";
 pub(super) const CURSOR_ORIGIN: u64 = 0;
@@ -80,6 +81,48 @@ impl Claim {
 }
 
 impl Inbox {
+    pub(super) fn status(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<(Option<usize>, Vec<InputStatus>), StationError> {
+        if self.ports.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let state = self.state.read(access)?;
+        let active = state
+            .get(&ACTIVE_INPUT_KEY.to_vec())?
+            .ok_or(StationError::MissingActiveInput)?;
+        let active = decode_active_input(&active).ok_or(StationError::MalformedActiveInput)?;
+        if active >= self.ports.len() {
+            return Err(StationError::ActiveInputOutOfRange {
+                input: active,
+                input_count: self.ports.len(),
+            });
+        }
+        let inputs = self
+            .ports
+            .iter()
+            .map(|port| {
+                let cursor = port.output.consumers[port.consumer_slot]
+                    .read_snapshot(port.consumer_slot, access)?;
+                let bounds = port.output.log.read(access)?.bounds()?;
+                if cursor < bounds.start || cursor > bounds.end {
+                    return Err(StationError::ConsumerCursorOutOfRange {
+                        consumer: port.consumer_slot,
+                        offset: cursor,
+                        head: bounds.start,
+                        tail: bounds.end,
+                    });
+                }
+                Ok(InputStatus {
+                    cursor,
+                    tail: bounds.end,
+                })
+            })
+            .collect::<Result<Vec<_>, StationError>>()?;
+        Ok((Some(active), inputs))
+    }
+
     pub(super) const fn new(
         state: OrderedMap<Vec<u8>, Vec<u8>, Small>,
         ports: Vec<InputPort>,
@@ -200,6 +243,20 @@ impl ConsumerCursor {
 }
 
 impl Output {
+    pub(super) fn status(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<OutputStatus, StationError> {
+        let log = self.log.read(access)?;
+        let bounds = log.bounds()?;
+        Ok(OutputStatus {
+            head: bounds.start,
+            tail: bounds.end,
+            retained_bytes: log.retained_bytes()?,
+            capacity_bytes: self.capacity_bytes.get(),
+        })
+    }
+
     pub(super) fn new(
         log: AppendLog<Vec<u8>>,
         capacity_bytes: NonZeroU64,

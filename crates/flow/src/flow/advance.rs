@@ -46,6 +46,9 @@ impl Flow {
     /// processing fails. [`FlowRunError::requires_reopen`] identifies failures
     /// after which this runtime cannot safely continue scheduling.
     pub fn advance(&mut self) -> Result<AdvanceOutcome, FlowRunError> {
+        for station in &mut self.stations {
+            station.clear_outcome();
+        }
         for &index in &self.topology.schedule {
             let station_id = &self.station_ids[index];
             self.stations[index]

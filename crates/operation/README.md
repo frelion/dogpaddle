@@ -592,7 +592,15 @@ continuation 与至多 1024 个具体 insert/delete mutation。它不保存连�
    不重复修改目标。
 4. 下一 turn 才把 durable state 结算回 Ready：仍有 continuation 时返回 `Commit(None)` 并保留同一
    Change，批次结束时返回 `Complete(None)`。若进程在 PG commit 后、结算前退出，reopen 从 Prepared
-   重投；每个成功 delivery 永久对应一行 receipt。
+   重投。能够准备下一批，已证明上一批在 MDBX 完成结算；因此新批次的 PG 事务同时删除旧 receipt，
+   始终只保留最后一批的确认记录，不另设清理任务或保留历史流水。
+
+连续同类 mutation 使用参数化多行 INSERT 或 DELETE USING VALUES，按原事件顺序执行；不会把整批
+先按 insert/delete 重排。宽 Schema 按 PG 的 65,535 参数上限进一步拆分语句，仍在同一个 PG 事务内。
+撤回只返回本批需要的至多 1024 个 ID，并按最小 technical ID 选择。大额负 diff 在第一部分落地前
+由服务端计数校验完整数量，后续从已有 durable continuation 继续，不重复扫描剩余总量。
+计数仍可能扫描大量匹配行，受 statement timeout 约束；1024 是 mutation/返回 ID 数量界限，不是
+整条 SQL、输入 Change、单行大小或内存总量的硬上限。
 
 普通目标查询失败会丢弃临时 client 并允许同一 durable state 重试；`AfterCommit` 失败发生在本地
 commit 之后，因而由 Flow fail-stop 并要求 reopen。远端查询和提交都不占用 MDBX 写事务。
@@ -600,16 +608,20 @@ commit 之后，因而由 Flow fail-stop 并要求 reopen。远端查询和提�
 存储映射优先保留 Arrow 原始语义，而不是伪装成自然 SQL model：Boolean 与可无损表示的整数使用
 带约束标量，Date32/Timestamp 使用原始整数；Utf8（包括 NUL）、Binary、List 与 Struct 使用变长
 `bytea`，`UInt64`、浮点与 Decimal128 使用定长 `bytea` 保存精确位模式。
+因此目标是无损关系存储，不是源表 DDL 的原样镜像；不能直接按原生 text/numeric/timestamp 使用
+这些列。普通无 NUL 文本可用 `convert_from(column, 'UTF8')` 查询（含 NUL 时 PG text 无法表示）。
+当前不提供隐式类型转换或额外可查询视图。
 
 目标表、receipt 表、索引与约束由该 Sink 独占并保持固定的生成式 PG 存储布局。Schema 最多 1598 个顶层
 字段；字段名须能被 `PostgreSQL` 逐字表示，且不得与 Sink technical columns 或精确小写系统列冲突。
+列数上限不保证任意宽行都能写入，仍受 PG 本身的 tuple/page 和字段大小限制。
 当前不支持 TLS、在线 Schema evolution、外部改表/改数据、数据库替换或恢复；运行中的这些变化不
 属于恢复协议。实现保持 `PostgreSQL` 专用，不提供公共通用 Sink trait、backend enum、插件 registry
 或 ORM 层。它与 `SqliteSink` 只共享 crate 私有的 relation position、technical-ID、continuation 与
 批次校验机械；DDL、DML、state codec 和恢复协议分别实现。
 
 普通 Cargo gate 完全离线，覆盖 tag12、Schema/resource/layout、state codec，以及初始化 completion
-被提交或丢弃的协议边界；真实 `PostgreSQL` 初始化、Prepared 提交、insert、receipt 重放和 crash recovery 由
+被提交或丢弃的协议边界；真实 `PostgreSQL` 大批 insert/delete、精确值匹配、参数上限、receipt 回收和提交前后恢复由
 `python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql/bin` 显式验收，详见根目录 `TESTING.md`。
 
 ## 扩展约束
@@ -687,7 +699,7 @@ direct-copy、`SchemaAlign` 精确 cast/nullability 和 Filter 组合比较都�
 multiplicity/ID 预检、`SQLite` 锁与 ID/完整性冲突，以及 `SQLite` 已提交但 MDBX
 transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。`PostgresSink` 的离线公共证据覆盖
 tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state Cell、Schema/spec 拒绝，以及
-首 turn rollback 或丢弃 completion 不连接目标；当前真实 insert、receipt 与 crash recovery witness 由显式脚本所有。完整目录所有权、
+首 turn rollback 或丢弃 completion 不连接目标；真实批量读写、receipt 与 crash recovery witness 由显式脚本所有。完整目录所有权、
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 

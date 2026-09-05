@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit SequenceSource -> PostgreSQL sink crash/reopen gate (Python 3.9+).
+"""Native PostgreSQL sink correctness and crash/reopen gate (Python 3.9+).
 
 The gate initializes and owns a temporary loopback-only PostgreSQL cluster. It
 never discovers or contacts an existing server, and ordinary Cargo gates only
@@ -34,11 +34,12 @@ def run(command: list[str], *, cwd: Optional[Path] = None,
 
 
 class Host:
-    def __init__(self, binary: Path, mode: str, flow: Path, port: int, log: Path) -> None:
+    def __init__(self, binary: Path, mode: str, flow: Path, port: int, log: Path,
+                 scenario: Optional[str] = None) -> None:
         self.stderr = log.open("w", encoding="utf-8")
         try:
             self.process = subprocess.Popen(
-                [str(binary), mode, str(flow), str(port)],
+                [str(binary), mode, str(flow), str(port)] + ([scenario] if scenario else []),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
                 text=True, bufsize=1,
                 env=dict(os.environ, DOGPADDLE_GATE_PASSWORD=PASSWORD),
@@ -81,13 +82,16 @@ class Host:
         return response
 
     def advance(self) -> str:
-        assert self.process.stdin is not None
-        self.process.stdin.write("advance\n")
-        self.process.stdin.flush()
-        response = self.receive()
+        response = self.command("advance")
         if response.get("kind") != "advance":
             raise RuntimeError(f"unexpected host response: {response}")
         return str(response["outcome"])
+
+    def command(self, command: str) -> dict[str, Any]:
+        assert self.process.stdin is not None
+        self.process.stdin.write(command + "\n")
+        self.process.stdin.flush()
+        return self.receive()
 
     def kill(self) -> None:
         if self.process.poll() is None:
@@ -132,7 +136,8 @@ class Gate:
         socket_dir = self.root / "socket"
         socket_dir.mkdir()
         options = (f"-h 127.0.0.1 -p {self.port} -k {socket_dir} "
-                   "-c fsync=on -c synchronous_commit=on")
+                   "-c fsync=on -c synchronous_commit=on "
+                   "-c log_statement=all -c log_parameter_max_length=0")
         run([str(self.pg_bin / "pg_ctl"), "-D", str(self.data),
              "-l", str(self.root / "postgres.log"), "-o", options,
              "-w", "start"])
@@ -189,6 +194,38 @@ class Gate:
 
     def run_gate(self) -> None:
         with self.host("build", 1) as host:
+            host.advance()  # initialize the target
+            host.advance()  # settle Initialize -> Ready
+            # A conflicting lock makes the actual PG transaction fail after its
+            # receipt INSERT but before its target INSERT. Releasing it does not
+            # make the fail-stopped Flow reusable; only reopen may replay intent.
+            with subprocess.Popen(
+                [*self.psql, "-c", "BEGIN; LOCK TABLE public.events IN ACCESS EXCLUSIVE MODE; "
+                 "SELECT pg_sleep(60); ROLLBACK"],
+                env=dict(self.pg_env, PGAPPNAME="dogpaddle_gate_lock"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ) as locker:
+                try:
+                    deadline = time.monotonic() + 15
+                    while self.sql("SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a "
+                                   "ON a.pid=l.pid WHERE a.application_name='dogpaddle_gate_lock' "
+                                   "AND l.relation='public.events'::regclass AND l.granted)") != "t":
+                        if locker.poll() is not None or time.monotonic() >= deadline:
+                            raise RuntimeError("fixture lock was not acquired")
+                        time.sleep(0.02)
+                    failure = host.command("advance")
+                    assert failure.get("requires_reopen") is True, failure
+                    retry = host.command("advance")
+                    assert retry.get("requires_reopen") is True, retry
+                    assert "station must be reopened" in retry["message"], retry
+                finally:
+                    self.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                             "WHERE application_name='dogpaddle_gate_lock'")
+                    locker.wait(timeout=5)
+            assert self.rows() == [] and self.receipts() == [], "failed PG transaction partially committed"
+            host.kill()
+
+        with self.host("open", 2) as host:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 host.advance()
@@ -205,7 +242,7 @@ class Gate:
             else:
                 raise RuntimeError("timed out waiting for the first target delivery")
 
-        with self.host("open", 2) as host:
+        with self.host("open", 3) as host:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 outcome = host.advance()
@@ -218,15 +255,124 @@ class Gate:
         expected_rows = list(enumerate(EXPECTED, start=1))
         if rows != expected_rows:
             raise RuntimeError(f"target UInt64 rows differ: {rows}")
-        if [item[0] for item in receipts] != [1, 2, 3]:
-            raise RuntimeError(f"receipt sequence is not contiguous and unique: {receipts}")
+        if [item[0] for item in receipts] != [3]:
+            raise RuntimeError(f"only the last receipt should remain: {receipts}")
         if any(len(digest) != 64 or count != 1 for _, digest, count in receipts):
             raise RuntimeError(f"receipt payload differs: {receipts}")
-        print("PASS crash at externally committed/local Prepared boundary; reopen produced "
-              "exactly three big-endian UInt64 rows and receipts 1..3 once")
+        print("PASS target transaction failure rolls back receipt/data and fail-stops Flow; "
+              "crash at externally committed/local Prepared boundary; reopen produced "
+              "exactly three big-endian UInt64 rows and retained only receipt 3")
+
+    def direct_host(self, binary: Path, mode: str, scenario: str, session: int) -> Host:
+        return Host(binary, mode, self.root / scenario, self.port,
+                    self.root / f"host-{scenario}-{session}.log", scenario)
+
+    def direct_state(self, scenario: str) -> tuple[int, str]:
+        rows = int(self.sql(f'SELECT count(*) FROM public."{scenario}"'))
+        receipts = self.sql(
+            'SELECT "$dogpaddle.delivery", encode("$dogpaddle.digest", \'hex\'), '
+            '"$dogpaddle.mutations" '
+            f'FROM public."$dogpaddle.receipt.gate_{scenario}"'
+        )
+        if len(receipts.splitlines()) > 1:
+            raise RuntimeError(f"settled receipts accumulated: {receipts}")
+        return rows, receipts
+
+    def drain(self, host: Host, scenario: str, stage: str) -> None:
+        for _ in range(100):
+            response = host.command(f"advance {stage}")
+            if response.get("kind") != "advance":
+                raise RuntimeError(f"{scenario}/{stage}: {response}")
+            self.direct_state(scenario)
+            if response["outcome"] == "Complete":
+                return
+        raise RuntimeError(f"{scenario}/{stage} did not complete within 100 turns")
+
+    def run_operation_gate(self, binary: Path) -> None:
+        started = time.monotonic()
+        with self.direct_host(binary, "build", "bulk", 1) as host:
+            for _ in range(2):  # initialize, then settle initialization
+                assert host.command("advance seed") == {"kind": "advance", "outcome": "Commit"}
+            assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
+            assert self.direct_state("bulk") == (0, "")
+            assert host.command("prepare-only seed") == {"kind": "prepared"}
+            assert self.direct_state("bulk") == (0, "")
+            host.kill()
+
+        with self.direct_host(binary, "open", "bulk", 2) as host:
+            assert host.command("advance seed")["outcome"] == "Commit"
+            first = self.direct_state("bulk")
+            assert first[0] == 1024
+            assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
+            assert self.direct_state("bulk") == first
+            host.kill()
+
+        with self.direct_host(binary, "open", "bulk", 3) as host:
+            assert host.command("advance seed")["outcome"] == "Commit"
+            assert self.direct_state("bulk") == first  # replay cannot insert twice
+            self.drain(host, "bulk", "seed")
+            seeded = self.direct_state("bulk")
+            assert seeded[0] == 16_385
+            assert self.sql('SELECT min("$dogpaddle.id"), max("$dogpaddle.id") FROM public.bulk') == "1|16385"
+            response = host.command("advance missing")
+            assert response["kind"] == "error" and "only 16385 exist" in response["message"], response
+            assert self.direct_state("bulk") == seeded
+            # The ordinary planning error above must not poison this instance.
+            assert host.command("advance withdraw")["outcome"] == "Commit"
+            deleted = self.direct_state("bulk")
+            assert deleted[0] == 16_385 - 1024
+            assert self.sql('SELECT min("$dogpaddle.id") FROM public.bulk') == "1025"
+            host.kill()
+
+        with self.direct_host(binary, "open", "bulk", 4) as host:
+            assert host.command("advance withdraw")["outcome"] == "Commit"  # replay Prepared
+            assert self.direct_state("bulk") == deleted
+            assert host.command("rollback withdraw") == {"kind": "rollback", "unchanged": True}
+            host.kill()
+
+        with self.direct_host(binary, "open", "bulk", 5) as host:
+            assert host.command("advance withdraw")["outcome"] == "Commit"
+            assert self.direct_state("bulk") == deleted  # replay cannot delete twice
+            self.drain(host, "bulk", "withdraw")
+            assert self.direct_state("bulk")[0] == 0
+            self.drain(host, "bulk", "mixed")
+            empty = self.direct_state("bulk")
+            assert empty[0] == 0
+            response = host.command("advance invalid-prefix")
+            assert response["kind"] == "error" and "only 0 exist" in response["message"], response
+            assert self.direct_state("bulk") == empty
+
+        for scenario, rows in (("types", 2), ("wide", 80), ("empty", 2)):
+            with self.direct_host(binary, "build", scenario, 1) as host:
+                self.drain(host, scenario, "seed")
+                assert self.direct_state(scenario)[0] == rows
+                if scenario == "types":
+                    assert self.sql('SELECT encode(u64, \'hex\'), encode(f32, \'hex\'), '
+                                    'encode(f64, \'hex\'), encode(text, \'hex\') '
+                                    'FROM public.types WHERE u64 IS NOT NULL') == (
+                                        "ffffffffffffffff|7f800123|8000000000000000|6265666f7265006166746572")
+            with self.direct_host(binary, "open", scenario, 2) as host:
+                self.drain(host, scenario, "withdraw")
+                assert self.direct_state(scenario)[0] == 0
+
+        # This is actual server execution evidence, not timing-sensitive unit
+        # testing: 16,385 inserts/deletes use 17 statements each, plus 2 mixed
+        # runs. Whole-event counts run once per admission, not once per batch.
+        log = (self.root / "postgres.log").read_text(encoding="utf-8")
+        inserts = log.count('INSERT INTO "public"."bulk" (')
+        deletes = log.count('DELETE FROM ONLY "public"."bulk" AS target USING')
+        counts = log.count('SELECT count(*) FROM (SELECT 1 FROM ONLY "public"."bulk"')
+        assert (inserts, deletes, counts) == (19, 19, 2), (inserts, deletes, counts)
+        assert log.count('INSERT INTO "public"."wide" (') == 2
+        print(f"PASS 16,385-row insert/retract, both commit crash windows, rollback, "
+              f"negative-prefix rejection, ordered mixed events, NULL/bit-exact values, "
+              f"empty/1,598-column schemas; {inserts} INSERT/{deletes} DELETE statements, "
+              f"{counts} admission counts, at most one receipt ({time.monotonic() - started:.2f}s)")
 
 
 def main() -> None:
+    if not __debug__:
+        raise RuntimeError("this correctness gate requires assertions; run Python without -O")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--postgres-bin", type=Path,
                         default=Path("/opt/homebrew/bin"))
@@ -240,9 +386,12 @@ def main() -> None:
     print(run(["rustc", "--version"]))
     subprocess.run(["cargo", "build", "--locked", "-p", "dogpaddle-flow",
                     "--example", "postgres_sink"], cwd=repo, check=True)
+    subprocess.run(["cargo", "build", "--locked", "-p", "dogpaddle-operation",
+                    "--example", "postgres_sink_recovery"], cwd=repo, check=True)
     metadata = json.loads(run(["cargo", "metadata", "--no-deps",
                                "--format-version", "1"], cwd=repo))
     binary = Path(metadata["target_directory"]) / "debug" / "examples" / "postgres_sink"
+    operation_binary = binary.with_name("postgres_sink_recovery")
 
     with tempfile.TemporaryDirectory(prefix="dogpaddle-pg-sink-") as directory:
         root = Path(directory)
@@ -250,10 +399,11 @@ def main() -> None:
         try:
             gate.start()
             gate.run_gate()
+            gate.run_operation_gate(operation_binary)
         except BaseException:
-            for log in (root / "postgres.log", root / "host-1.log", root / "host-2.log"):
+            for log in [root / "postgres.log", *sorted(root.glob("host-*.log"))]:
                 if log.exists():
-                    print(f"--- {log.name} ---\n{log.read_text(encoding='utf-8')}",
+                    print(f"--- {log.name} (last 16 KiB) ---\n{log.read_text(encoding='utf-8')[-16384:]}",
                           file=os.sys.stderr)
             raise
         finally:

@@ -11,7 +11,7 @@ use dogpaddle_operation::{
 use dogpaddle_store::StoreError;
 
 use crate::{
-    error::{FlowError, retention_open_error},
+    error::{FlowError, runtime_state_error},
     station::StationError,
 };
 
@@ -385,8 +385,8 @@ fn checksum_uses_the_stable_ieee_crc32_algorithm() {
 }
 
 #[test]
-fn retention_open_error_preserves_store_error_classification() {
-    let error = retention_open_error(
+fn runtime_state_error_preserves_store_error_classification() {
+    let error = runtime_state_error(
         "producer",
         StationError::Store(StoreError::CorruptAppendLog {
             reason: "test corruption",
@@ -402,8 +402,8 @@ fn retention_open_error_preserves_store_error_classification() {
 }
 
 #[test]
-fn retention_open_error_maps_an_invariant_to_runtime_state() {
-    let error = retention_open_error(
+fn runtime_state_error_maps_an_invariant_to_runtime_state() {
+    let error = runtime_state_error(
         "producer",
         StationError::RetentionHeadMismatch {
             head: 3,
