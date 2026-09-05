@@ -20,7 +20,7 @@ DogPaddle 是一个为 Rust 应用设计的嵌入式 Dataflow 引擎。它用 Ar
 publication 只包含 `source.orders`，写回不会形成 CDC 回环。停顿仅用于演示；该链路不执行初始快照。*
 
 [查看演示 Flow](crates/flow/examples/postgres_sync_live.rs) ·
-[重新生成录屏](tools/record_postgres_cdc_live.sh)
+[重新生成录屏](docs/tools/record_postgres_cdc_live.sh)
 
 ## 为什么是 DogPaddle
 
@@ -38,7 +38,7 @@ sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
   'SELECT "$dogpaddle.id" AS id, number, square FROM even_squares ORDER BY id;'
 ```
 
-需要 Rust 1.96+ 与 `sqlite3` 命令行。
+需要仓库固定的 Rust 1.96 与 `sqlite3` 命令行。
 
 ## 已实现
 
@@ -87,8 +87,9 @@ Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建
 - [Change：Arrow 差分与 IPC](crates/change/README.md)
 - [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
 - [Store：MDBX 事务与集合](crates/store/README.md)
-- [重新生成 PostgreSQL 增量同步录屏](tools/record_postgres_cdc_live.sh)
-- [PostgreSQL Sink 真实验收](tools/check_postgres_sink.py)
-- [重新生成 SQLite Sink 录屏](tools/record_sqlite_sink_live.sh)
+- [重新生成 PostgreSQL 增量同步录屏](docs/tools/record_postgres_cdc_live.sh)
+- [PostgreSQL Sink 真实验收](system-tests/postgres/check_sink.py)
+- [重新生成 SQLite Sink 录屏](docs/tools/record_sqlite_sink_live.sh)
 - [SqliteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
+- [Java、Debezium 与 PostgreSQL 系统验收](system-tests/README.md)
 - [正确性与性能测试](TESTING.md)

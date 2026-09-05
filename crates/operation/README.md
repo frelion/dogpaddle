@@ -224,36 +224,33 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
 
-| 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据与性能 workload |
+| 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值/rollback/reopen；`operation_core` scan body/commit |
+| `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
 | `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
-| `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow/rollback/reopen/重批；`operation_core` `RunningEventCount` body/commit、`flow_runtime` chain |
+| `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
 | Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
 | Extend (`6`) | Transform / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变，`Complete` | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
 | Select (`7`) | Transform / 1 | 同一原始 input 上的有序 `name + Expr` 完整输出 | 行序和 diff 不变；空 Select 保留行数；`Complete` | 无 | 直接列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、空/非空 runtime Schema guard、别名隔离、temporal/decimal 选择/重排、reopen/重批；Definition codec，无独立 turn benchmark |
 | `UnionAll` (`8`) | Transform / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序；`Complete` | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
 | `SchemaAlign` (`9`) | Transform / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数；`Complete` | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
-| Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime/rollback/reopen；`operation_core` Definition codec、Flow sink workload |
+| Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime、rollback、reopen |
 | `SqliteSink` (`10`) | Sink / 1 | 校验 `SQLite` 列名与列数；无 output | 共享固定 ID 批次协议，每批至多 1024 操作，目标提交后结算 continuation 或 `Complete` | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 `SQLite` 值 | tag/payload、state/hash golden、全部 v1 类型、批界、非负前缀、rollback/reopen；无独立 benchmark |
-| `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `tools/check_postgres_sink.py` |
+| `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `system-tests/postgres/check_sink.py` |
 
-所有十二个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径，并由
-`tests/correctness/{codec,definition,postgres_cdc,postgres_sink,protocol,runtime,sqlite_sink}.rs` 作为 Operation 公共证据入口；完整 Flow 的纯失败
-无建库副作用、资源名、build/open/reopen、运行期 Schema guard 和事务重放由
-`crates/flow/tests/correctness` 所有。`operation_core` 的 Definition codec 当前覆盖除 `SqliteSink`、`PostgresCdcScan`
-与 `PostgresSink` 外的九个算子；直接
-turn body/durable commit 只测 `SequenceScan` 与 `RunningEventCount`。`flow_runtime` 测
-scan/sink、RunningEventCount chain、fan-out 和 capacity pressure。其他算子没有独立计时场景，
-不因此获得虚构的微基准。
+所有十二个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
+`tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
+materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol` 与 `metamorphic`
+只保留跨算子契约。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
+和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
+真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 
-前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别内联在
-`tests/correctness/postgres_cdc.rs` 与 `tests/correctness/postgres_sink.rs`。其中事件计数、对齐与 `SQLite` Sink 的 fixture 分别为
-`running_event_count_definition.hex`、`schema_align_explicit.hex` 与 `sqlite_sink_output_events.hex`；它们分别冻结
-tag `2`、`9` 与 `10`。codec 分区十个 decoded golden 都会重新 bind，两个 postgres 分区独立覆盖 tag11/tag12；Filter、Extend、Select、UnionAll 与
-`SchemaAlign` 的 golden 还会
-materialize/turn，其余算子的执行证据由 definition/runtime 分区独立覆盖。Flow manifest 的端到端基线为
+前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别由
+`tests/correctness/postgres_cdc_scan.rs` 与 `tests/correctness/postgres_sink.rs` 拥有。其中事件计数、对齐与
+`SQLite` Sink 的 fixture 分别为 `running_event_count_definition.hex`、`schema_align_explicit.hex` 与
+`sqlite_sink_output_events.hex`，冻结 tag `2`、`9` 与 `10`。每个算子文件会自行完成 decode、bind、
+materialize 与运行证据。Flow manifest 的端到端基线为
 `crates/flow/tests/fixtures/v1/sequence_scan_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
 
@@ -388,8 +385,8 @@ publication/pgoutput slot 由用户预先创建并独占，不自动创建、更
 不支持数组/domain/JSON/UUID 等未列出的 PG 类型，也不支持多表路由、在线 Schema evolution、初始
 snapshot、TLS 配置、跨实例 fencing、自动变更外部资源或 graceful stop API；这些不由额外抽象提前实现。
 
-完整宿主示例在 `crates/flow/examples/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
-进程恢复由 `tools/check_postgres_cdc.py` 显式验收，见根目录 TESTING.md。
+完整宿主在 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
+进程恢复由 `system-tests/postgres/check_cdc.py` 显式验收，见根目录 TESTING.md。
 
 ## `operation::scan::SequenceScan`
 
@@ -610,7 +607,7 @@ Definition、bind、materialize 与 Flow build/open 均不联网，无 `PostgreS
 或在线 Schema evolution。
 
 普通 Cargo gate 离线；真实 PG 批量匹配/写入、宽 Schema、精确类型与进程崩溃恢复由
-`python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql/bin` 验证，
+`system-tests/postgres/check_sink.py` 配合已经构建的两个 host 验证，
 完整范围见根目录 `TESTING.md`。
 
 ## 扩展约束
@@ -661,20 +658,21 @@ happy-path 单测都不能替代这些答案。
   validation、full/projected IPC、标准 reader、malformed 与相关表达式/算子。
 - **公共证据**：在单一 `correctness` target 中提供 Definition roundtrip、bind/materialize/turn、错误、
   rollback、重批和 reopen；Flow 组合根拥有纯失败无建库副作用、runtime guard 与资源装配证据。
-- **性能与文档**：只有真实 workload 需要独立 benchmark 时才增加稳定 Plan；否则接入现有组合
+- **性能与文档**：只有真实 workload 需要独立 benchmark 时才增加 owner 自有 target；否则接入现有组合
   workload。同步 Rustdoc、crate README、根能力边界、`TESTING.md` 和路线图。
 
 ## 测试与性能
 
 私有 decoder registry 和类型擦除不变量由源码白盒测试拥有；全部公开行为合并在单一
-`correctness` target，按 `codec`、`definition`、`postgres_cdc`、`postgres_sink`、`protocol`、`runtime` 与 `sqlite_sink` 分区。protocol 直接验证上述队列
-例子的恢复状态机，runtime 覆盖内建算子与 borrowed delivery 的提交时序。Definition v1 使用版本化黄金字节约束，
-Schema 测试覆盖十二个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+`correctness` target。`definition_codec`、`expression`、`protocol`、`metamorphic` 只拥有横切契约，
+其余文件按每个具体算子纵向覆盖 literal golden、kind/data、bind、materialize、turn 与 reopen。
+`protocol` 直接验证上述队列例子的恢复状态机和 borrowed delivery 提交时序。Definition v1 使用版本化黄金字节约束，
+各算子 Schema 证据覆盖十二个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
 SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续
 覆盖相同 guard 与既有 evaluate 语义；表达式测试覆盖 `DataFusion` protobuf
-编码失败、roundtrip 与精确版本 golden。runtime trace 统一覆盖完整 turn、commit、rollback、
+编码失败、roundtrip 与精确版本 golden。各算子 runtime 证据覆盖完整 turn、commit、rollback、
 reopen、固定 output Schema/diff、Project/Extend/Select 零拷贝、UnionAll 多端口原样转发、Filter 的空/全量选择及覆盖
 Null/bitmap/fixed/variable/List/Struct 全部既有 layout family 的部分选择、DataFusion
 `create_physical_expr` 的 type/nullability、scalar/array evaluate 与 null 传播、
@@ -692,22 +690,9 @@ tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state C
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
-`operation_core` 是本 crate 唯一的 release benchmark：Definition encode/decode 当前覆盖除
-`SqliteSink`、`PostgresCdcScan`、`PostgresSink` 外的九个内建算子；一行事务型 `turn + apply` body，以及包含 begin、turn、apply 和
-durable commit 的完整事务，只直接测 `SequenceScan` 与 `RunningEventCount`。这两个 case 利用
-crate 内部完全事务型适配器的结构性空 completion 保留既有 turns-per-transaction 口径，不适用于
-带事务外准备或 `AfterCommit` 的 Operation。固定大小 Cell 的长稳
-归 Store 所有，因此当前不设置 Operation endurance。
-benchmark 使用工作区的 `dogpaddle-bench-protocol` 严格解析配置、采集主机指纹，在 run plan 中声明
-稳定 series，并让 raw sample 只引用紧凑 case ID；统一 artifact 派生 `operations/s` 等人类统计，machine
-consumer 可由 raw `elapsed_ns / operations` 无损派生 per-operation 耗时，不重复保存。Operation 本地 support 仍拥有 workload 字段、计时/oracle 和
-`SampleStore`；`SampleStore` 在所属场景或 durable 样本校验后立即释放，
-不积累到 run root 最终 drop。
-相邻 `operation_core.plan.json` 由 `cargo xtask bench-plan-check` 在不创建 Store fixture 的情况下
-验证 smoke/reference 两档冻结 Plan；当前分别为 22 和 30 个 case。
-smoke 默认使用临时目录，正式回归必须选择 `reference` profile 并显式指定固定文件系统目录；
-环境变量和 typed JSONL 输出协议以根目录
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md) 为准。
+Operation 不提供独立 benchmark。Definition codec 与一行算子 body 的微小计时不能代表真实事务、
+调度或持久化成本；相关性能由 Flow、Store 和跨 crate seam 的 owner workload 测量。完整性能所有权
+见根目录 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 ## 验证命令
 
@@ -716,8 +701,4 @@ cargo test -p dogpaddle-operation
 cargo test -p dogpaddle-operation --test correctness
 cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
-cargo bench -p dogpaddle-operation --bench operation_core
-
-# PR benchmark protocol smoke
-cargo xtask bench-smoke
 ```

@@ -1,6 +1,7 @@
 //! CDC-oriented append, replay, projection, forwarding, fan-out, and GC scenarios.
 
-use dogpaddle_bench_protocol::{BenchmarkProfile, Fields, Plan, Run};
+use dogpaddle_perf_context::PerformanceProfile;
+use serde_json::json;
 
 mod support;
 
@@ -20,8 +21,10 @@ use measure::{
     measure_project_scan, measure_readers, measure_steady_window,
 };
 use oracle::{chunked_gc_transactions, make_records};
-use report::{FrozenCases, LogCase, LogPair, report_log, report_log_mode_pair, report_log_pair};
-use support::BenchRoot;
+use report::{
+    LogCase, LogPair, report_log, report_log_mode_pair, report_log_pair, validate_pair_schedule,
+};
+use support::{BenchRoot, StoreRun};
 
 const BENCHMARK: &str = "append_log";
 const DEFAULT_ENTRIES: usize = 10_000;
@@ -51,12 +54,12 @@ struct AppendConfiguration<'a> {
 }
 
 impl AppendConfiguration<'static> {
-    const fn for_profile(profile: BenchmarkProfile) -> Self {
+    const fn for_profile(profile: PerformanceProfile) -> Self {
         match profile {
-            BenchmarkProfile::Smoke => Self {
+            PerformanceProfile::Smoke => Self {
                 entries: 3,
                 commits: 1,
-                samples: 1,
+                samples: 4,
                 record_sizes: &[16, 64],
                 append_batches: &[1, 2],
                 station_record_bytes: 16,
@@ -64,7 +67,7 @@ impl AppendConfiguration<'static> {
                 gc_items: 1,
                 readers: &[1, 2],
             },
-            BenchmarkProfile::Reference => Self {
+            PerformanceProfile::Reference => Self {
                 entries: DEFAULT_ENTRIES,
                 commits: DEFAULT_COMMITS,
                 samples: DEFAULT_SAMPLES,
@@ -80,7 +83,10 @@ impl AppendConfiguration<'static> {
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
+    if !std::env::args_os().any(|argument| argument == "--bench") {
+        return;
+    }
+    let profile = PerformanceProfile::from_environment();
     let config = AppendConfiguration::for_profile(profile);
     let AppendConfiguration {
         entries,
@@ -100,223 +106,41 @@ fn main() {
     assert!(record_sizes.iter().all(|size| *size >= RECORD_HEADER_BYTES));
     assert!(append_batches.iter().all(|size| *size > 0));
     assert!(readers.iter().all(|count| *count > 0));
-    let mut plan = Plan::new(profile, configuration_fields(&config));
-    let mut cases = benchmark_plan(&mut plan, &config);
-    let mut run = Run::persistent(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
-        return;
-    }
-    let bench_root = BenchRoot::new(&run);
+    validate_pair_schedule(samples);
+    let run = StoreRun::new(
+        BENCHMARK,
+        profile,
+        &json!({
+            "entries": config.entries,
+            "commits_cap": config.commits,
+            "samples": config.samples,
+            "record_bytes": config.record_sizes,
+            "append_batch_items": config.append_batches,
+            "station_record_bytes": config.station_record_bytes,
+            "station_batch_items": config.station_batch_items,
+            "gc_items": config.gc_items,
+            "readers": config.readers,
+            "execution": "single_thread",
+            "cache": "warm",
+            "mdbx_sync_mode": "durable",
+        }),
+    );
+    let bench_root = BenchRoot::new(run.root());
     benchmark_record_widths(
-        &mut run,
-        &mut cases,
+        &run,
         &bench_root,
         entries,
         samples,
         station_batch_items,
         record_sizes,
     );
-    benchmark_durable_appends(&mut run, &mut cases, &bench_root, &config);
-    benchmark_station_transactions(&mut run, &mut cases, &bench_root, &config);
-    cases.finish();
-    run.finish(|| {});
-}
-
-fn configuration_fields(config: &AppendConfiguration<'_>) -> Fields {
-    let mut fields = Fields::new();
-    for (name, value) in [
-        ("entries", config.entries),
-        ("commits_cap", config.commits),
-        ("samples", config.samples),
-        ("station_record_bytes", config.station_record_bytes),
-        ("station_batch_items", config.station_batch_items),
-        ("gc_items", config.gc_items),
-    ] {
-        fields.insert(name, value);
-    }
-    fields.insert("record_bytes", config.record_sizes);
-    fields.insert("append_batch_items", config.append_batches);
-    fields.insert("readers", config.readers);
-    fields
-        .with("execution", "single_thread")
-        .with("cache", "warm")
-        .with("mdbx_sync_mode", "durable")
-}
-
-fn benchmark_plan(plan: &mut Plan, config: &AppendConfiguration<'_>) -> FrozenCases {
-    let mut cases = FrozenCases::new();
-    plan_record_widths(plan, &mut cases, config);
-    plan_durable_appends(plan, &mut cases, config);
-    plan_station_transactions(plan, &mut cases, config);
-    cases
-}
-
-fn plan_record_widths(plan: &mut Plan, cases: &mut FrozenCases, config: &AppendConfiguration<'_>) {
-    for &record_bytes in config.record_sizes {
-        cases.single(
-            plan,
-            LogCase::new(
-                "bulk append pre-encoded, one tx",
-                config.entries,
-                record_bytes,
-                1,
-            ),
-            config.samples,
-        );
-        cases.pair(
-            plan,
-            LogPair::variants(
-                format!("record_bytes={record_bytes}"),
-                LogCase::new(
-                    "append scalar body, rollback",
-                    config.entries,
-                    record_bytes,
-                    1,
-                ),
-                "append batch body, rollback",
-            ),
-            config.samples,
-        );
-        cases.pair(
-            plan,
-            LogPair::variants(
-                format!("record_bytes={record_bytes}"),
-                LogCase::new(
-                    "append scalar, one durable tx",
-                    config.entries,
-                    record_bytes,
-                    1,
-                ),
-                "append batch, one durable tx",
-            ),
-            config.samples,
-        );
-        cases.pair(
-            plan,
-            LogPair::modes(
-                format!("scan decode record_bytes={record_bytes}"),
-                LogCase::new("scan project diff", config.entries, record_bytes, 1),
-                "scan full decode",
-            ),
-            config.samples,
-        );
-    }
-}
-
-fn plan_durable_appends(
-    plan: &mut Plan,
-    cases: &mut FrozenCases,
-    config: &AppendConfiguration<'_>,
-) {
-    for &batch_items in config.append_batches {
-        let measured_entries = config
-            .entries
-            .min(config.commits.saturating_mul(batch_items));
-        let transactions = measured_entries.div_ceil(batch_items);
-        cases.single(
-            plan,
-            LogCase::new(
-                format!("durable append b{batch_items} ({transactions} tx)"),
-                measured_entries,
-                config.station_record_bytes,
-                transactions,
-            ),
-            config.samples,
-        );
-    }
-}
-
-fn plan_station_transactions(
-    plan: &mut Plan,
-    cases: &mut FrozenCases,
-    config: &AppendConfiguration<'_>,
-) {
-    let transactions = config.entries.div_ceil(config.station_batch_items);
-    cases.single(
-        plan,
-        LogCase::new(
-            format!("station count project ({transactions} tx)"),
-            config.entries,
-            config.station_record_bytes,
-            transactions,
-        ),
-        config.samples,
-    );
-    cases.single(
-        plan,
-        LogCase::new(
-            format!("station raw pass-through ({transactions} tx)"),
-            config.entries,
-            config.station_record_bytes,
-            transactions,
-        ),
-        config.samples,
-    );
-    cases.pair(
-        plan,
-        LogPair::modes(
-            format!(
-                "station filter 50% record_bytes={}",
-                config.station_record_bytes
-            ),
-            LogCase::new(
-                format!("station filter 50% project ({transactions} tx)"),
-                config.entries,
-                config.station_record_bytes,
-                transactions,
-            ),
-            format!("station filter 50% decode ({transactions} tx)"),
-        ),
-        config.samples,
-    );
-    let steady_transactions = config.entries.div_ceil(config.station_batch_items)
-        + chunked_gc_transactions(config.entries, config.station_batch_items, config.gc_items);
-    cases.single(
-        plan,
-        LogCase::new(
-            format!("steady append + GC ({steady_transactions} tx)"),
-            config.entries,
-            config.station_record_bytes,
-            steady_transactions,
-        ),
-        config.samples,
-    );
-    for &reader_count in config.readers {
-        let deliveries = config
-            .entries
-            .checked_mul(reader_count)
-            .expect("benchmark delivery count fits in usize");
-        let reader_transactions = transactions
-            .checked_mul(reader_count)
-            .expect("benchmark transaction count fits in usize");
-        cases.single(
-            plan,
-            LogCase::new(
-                format!("consumer replay x{reader_count} ({reader_transactions} tx)"),
-                deliveries,
-                config.station_record_bytes,
-                reader_transactions,
-            ),
-            config.samples,
-        );
-    }
-    let gc_transactions = config.entries.div_ceil(config.gc_items);
-    cases.single(
-        plan,
-        LogCase::new(
-            format!("prefix GC b{} ({gc_transactions} tx)", config.gc_items),
-            config.entries,
-            config.station_record_bytes,
-            gc_transactions,
-        ),
-        config.samples,
-    );
+    benchmark_durable_appends(&run, &bench_root, &config);
+    benchmark_station_transactions(&run, &bench_root, &config);
+    run.finish();
 }
 
 fn benchmark_record_widths(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
@@ -329,14 +153,12 @@ fn benchmark_record_widths(
 
         report_log(
             run,
-            plan,
             &LogCase::new("bulk append pre-encoded, one tx", entries, record_bytes, 1),
             samples,
             || measure_append(bench_root, &encoded, entries),
         );
         report_log_pair(
             run,
-            plan,
             &LogPair::variants(
                 format!("record_bytes={record_bytes}"),
                 LogCase::new("append scalar body, rollback", entries, record_bytes, 1),
@@ -348,7 +170,6 @@ fn benchmark_record_widths(
         );
         report_log_pair(
             run,
-            plan,
             &LogPair::variants(
                 format!("record_bytes={record_bytes}"),
                 LogCase::new("append scalar, one durable tx", entries, record_bytes, 1),
@@ -362,7 +183,6 @@ fn benchmark_record_widths(
         let mut fixture = LogFixture::populated(bench_root, entries, record_bytes, 0);
         report_log_mode_pair(
             run,
-            plan,
             &LogPair::modes(
                 format!("scan decode record_bytes={record_bytes}"),
                 LogCase::new("scan project diff", entries, record_bytes, 1),
@@ -381,8 +201,7 @@ fn benchmark_record_widths(
 }
 
 fn benchmark_durable_appends(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     config: &AppendConfiguration<'_>,
 ) {
@@ -394,7 +213,6 @@ fn benchmark_durable_appends(
         let transactions = measured_entries.div_ceil(batch_items);
         report_log(
             run,
-            plan,
             &LogCase::new(
                 format!("durable append b{batch_items} ({transactions} tx)"),
                 measured_entries,
@@ -415,8 +233,7 @@ fn benchmark_durable_appends(
 }
 
 fn benchmark_station_transactions(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     config: &AppendConfiguration<'_>,
 ) {
@@ -430,13 +247,12 @@ fn benchmark_station_transactions(
         ..
     } = *config;
     let transactions = entries.div_ceil(batch_items);
-    benchmark_station_filters(run, plan, bench_root, config, transactions);
+    benchmark_station_filters(run, bench_root, config, transactions);
 
     let steady_transactions =
         entries.div_ceil(batch_items) + chunked_gc_transactions(entries, batch_items, gc_items);
     report_log(
         run,
-        plan,
         &LogCase::new(
             format!("steady append + GC ({steady_transactions} tx)"),
             entries,
@@ -456,7 +272,6 @@ fn benchmark_station_transactions(
             .expect("benchmark transaction count fits in usize");
         report_log(
             run,
-            plan,
             &LogCase::new(
                 format!("consumer replay x{reader_count} ({reader_transactions} tx)"),
                 deliveries,
@@ -471,7 +286,6 @@ fn benchmark_station_transactions(
     let gc_transactions = entries.div_ceil(gc_items);
     report_log(
         run,
-        plan,
         &LogCase::new(
             format!("prefix GC b{gc_items} ({gc_transactions} tx)"),
             entries,
@@ -484,8 +298,7 @@ fn benchmark_station_transactions(
 }
 
 fn benchmark_station_filters(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     config: &AppendConfiguration<'_>,
     transactions: usize,
@@ -496,7 +309,6 @@ fn benchmark_station_filters(
     let batch_items = config.station_batch_items;
     report_log(
         run,
-        plan,
         &LogCase::new(
             format!("station count project ({transactions} tx)"),
             entries,
@@ -508,7 +320,6 @@ fn benchmark_station_filters(
     );
     report_log(
         run,
-        plan,
         &LogCase::new(
             format!("station raw pass-through ({transactions} tx)"),
             entries,
@@ -530,7 +341,6 @@ fn benchmark_station_filters(
     let decoded = format!("station filter 50% decode ({transactions} tx)");
     report_log_mode_pair(
         run,
-        plan,
         &LogPair::modes(
             format!("station filter 50% record_bytes={record_bytes}"),
             LogCase::new(projected, entries, record_bytes, transactions),

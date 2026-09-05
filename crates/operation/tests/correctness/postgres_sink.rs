@@ -55,15 +55,24 @@ fn input_change() -> Change {
     Change::try_new(records, Int64Array::from(vec![1])).unwrap()
 }
 
-#[test]
-fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
-    let encoded = encode_definition(&definition());
+fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0c".to_vec();
     expected.extend_from_slice(br#"{"sink_id":"orders_sink","database":"shop","schema":"public","table":"orders_materialized","system_identifier":"123456789","database_oid":42}"#);
+    expected
+}
+
+#[test]
+fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
+    let definition = definition();
+    assert_eq!(definition.persistence_tag(), 12);
+    assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
+    let encoded = encode_definition(&definition);
+    let expected = literal_definition_bytes();
     assert_eq!(encoded, expected);
 
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Sink(NonZeroU32::MIN));
+    assert_eq!(decoded.persistence_tag(), 12);
     assert_eq!(encode_definition(decoded.as_ref()), encoded);
     let printable = String::from_utf8(encoded.clone()).unwrap();
     for secret in [PASSWORD, "127.0.0.1", "sink_user"] {
@@ -73,6 +82,79 @@ fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
     let mut noncanonical = encoded;
     noncanonical.push(b' ');
     assert!(decode_definition(&noncanonical).is_err());
+}
+
+#[test]
+fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io() {
+    // Shared relation state v1, Ready(next_id = 1, no continuation).
+    let ready = vec![1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+    let store_root = TestStore::new();
+    let definition = definition();
+    let mut store = Store::create(store_root.path()).unwrap();
+    definition.data()[0]
+        .create(&mut store, "physical-state")
+        .unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin().unwrap();
+    state
+        .access(transaction.access())
+        .unwrap()
+        .set(&ready)
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(transactions);
+
+    for _ in 0..2 {
+        let store = Store::open(store_root.path()).unwrap();
+        let decoded = decode_definition(&literal_definition_bytes()).unwrap();
+        let mut data = DataInstances::new();
+        data.insert(decoded.data()[0].open(&store, "physical-state").unwrap())
+            .unwrap();
+        let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+        let mut operation = decoded
+            .bind(&[input_schema()])
+            .unwrap()
+            .materialize(data, RuntimeResource::new(config()))
+            .unwrap();
+        let mut transactions = store.into_transactions();
+        let input = input_change();
+        let Turn::Ready(prepared) = operation
+            .turn(Some(OperationInput {
+                port: 0,
+                change: &input,
+            }))
+            .unwrap()
+        else {
+            panic!("reopened PostgreSQL sink did not prepare state restoration");
+        };
+        let transaction = transactions.begin().unwrap();
+        let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap()
+        else {
+            panic!("reopened PostgreSQL sink did not decode its Ready state");
+        };
+        drop(transaction);
+        drop(completion); // Running it would perform target I/O; rollback must not.
+
+        let transaction = transactions.begin().unwrap();
+        assert_eq!(
+            state.access(transaction.access()).unwrap().get().unwrap(),
+            Some(ready.clone())
+        );
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
+fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
+    let encoded = encode_definition(&definition());
+    for length in 0..encoded.len() {
+        assert!(
+            decode_definition(&encoded[..length]).is_err(),
+            "accepted truncated PostgreSQL sink definition prefix {length}/{}",
+            encoded.len()
+        );
+    }
 }
 
 #[test]

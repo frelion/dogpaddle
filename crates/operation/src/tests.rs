@@ -79,47 +79,69 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [Box<dyn OperationDefinition>; 12] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 12] {
     [
-        Box::new(
-            PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
-                engine_name: "events".into(),
-                database: "shop".into(),
-                schema: "public".into(),
-                table: "events".into(),
-                slot: "events".into(),
-                publication: "events".into(),
-                system_identifier: "1".into(),
-                database_oid: 1,
-                table_oid: 1,
-                columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
-            })
-            .unwrap(),
+        (1, Box::new(SequenceScanDefinition::new(0))),
+        (2, Box::new(RunningEventCountDefinition::new())),
+        (3, Box::new(DiscardDefinition::new())),
+        (4, Box::new(ProjectDefinition::new([0]))),
+        (5, Box::new(FilterDefinition::try_new(lit(true)).unwrap())),
+        (
+            6,
+            Box::new(ExtendDefinition::try_new("copy", col("value")).unwrap()),
         ),
-        Box::new(SequenceScanDefinition::new(0)),
-        Box::new(RunningEventCountDefinition::new()),
-        Box::new(ProjectDefinition::new([0])),
-        Box::new(FilterDefinition::try_new(lit(true)).unwrap()),
-        Box::new(ExtendDefinition::try_new("copy", col("value")).unwrap()),
-        Box::new(SelectDefinition::try_new([("copy", col("value"))]).unwrap()),
-        Box::new(
-            SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
-                "copy",
-                col("value"),
-                false,
-            )
-            .unwrap()])
-            .unwrap(),
+        (
+            7,
+            Box::new(SelectDefinition::try_new([("copy", col("value"))]).unwrap()),
         ),
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
-        Box::new(DiscardDefinition::new()),
-        Box::new(
-            PostgresSinkDefinition::try_new(
-                PostgresTargetSpec::try_new("events", "shop", "public", "events", "1", 1).unwrap(),
-            )
-            .unwrap(),
+        (
+            8,
+            Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
         ),
-        Box::new(SqliteSinkDefinition::try_new("/tmp/dogpaddle.sqlite", "events").unwrap()),
+        (
+            9,
+            Box::new(
+                SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
+                    "copy",
+                    col("value"),
+                    false,
+                )
+                .unwrap()])
+                .unwrap(),
+            ),
+        ),
+        (
+            10,
+            Box::new(SqliteSinkDefinition::try_new("/tmp/dogpaddle.sqlite", "events").unwrap()),
+        ),
+        (
+            11,
+            Box::new(
+                PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
+                    engine_name: "events".into(),
+                    database: "shop".into(),
+                    schema: "public".into(),
+                    table: "events".into(),
+                    slot: "events".into(),
+                    publication: "events".into(),
+                    system_identifier: "1".into(),
+                    database_oid: 1,
+                    table_oid: 1,
+                    columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
+                })
+                .unwrap(),
+            ),
+        ),
+        (
+            12,
+            Box::new(
+                PostgresSinkDefinition::try_new(
+                    PostgresTargetSpec::try_new("events", "shop", "public", "events", "1", 1)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+        ),
     ]
 }
 
@@ -179,7 +201,10 @@ fn decoder_registry_exactly_matches_builtins() {
     let definitions = builtin_definitions();
     let expected_tags = definitions
         .iter()
-        .map(|definition| definition.persistence_tag())
+        .map(|(expected_tag, definition)| {
+            assert_eq!(definition.persistence_tag(), *expected_tag);
+            *expected_tag
+        })
         .collect::<HashSet<_>>();
     assert_eq!(
         expected_tags.len(),

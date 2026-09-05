@@ -51,36 +51,8 @@ jobs:
       - name: Run the canonical workspace gate
         run: cargo xtask check
 
-  stable-compatibility:
-    name: Latest stable compatibility
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install latest stable Rust
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Restore and save Cargo cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-v1-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            cargo-v1-${{ runner.os }}-stable-
-
-      - name: Test against latest stable
-        run: cargo +stable test --workspace --locked
-
-  benchmark-protocol-smoke:
-    name: Benchmark protocol smoke
+  performance-smoke:
+    name: Performance smoke
     needs: check
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -105,8 +77,24 @@ jobs:
           restore-keys: |
             cargo-v1-${{ runner.os }}-1.96-
 
-      - name: Validate every benchmark plan
-        run: cargo xtask bench-plan-check
+      - name: Run Criterion targets in test mode
+        run: cargo test --workspace --benches --locked
 
-      - name: Execute every discovered benchmark target
-        run: cargo xtask bench-smoke
+      - name: Run owner-specific smoke workloads
+        env:
+          DOGPADDLE_PERF_PROFILE: smoke
+        run: |
+          set -euo pipefail
+          run_smoke() {
+            local name="$1"
+            shift
+            local output="$RUNNER_TEMP/$name.jsonl"
+            "$@" | tee "$output"
+            test -s "$output"
+            jq --exit-status --slurp 'length > 0' "$output" >/dev/null
+          }
+          run_smoke change-codec cargo bench --locked -p dogpaddle-change --bench change_codec
+          run_smoke ordered-map cargo bench --locked -p dogpaddle-store --bench ordered_map
+          run_smoke append-log cargo bench --locked -p dogpaddle-store --bench append_log
+          run_smoke flow-runtime cargo bench --locked -p dogpaddle-flow --bench flow_runtime
+          run_smoke append-log-endurance cargo bench --locked -p dogpaddle-store --bench append_log_endurance

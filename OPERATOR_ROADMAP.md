@@ -249,7 +249,7 @@ Rust Builder、SQL 或其他接口可以保存自己的 scan 描述，用于解�
 - 每个内建算子都有同结构的产品规格和公共验证索引；
 - 名称不再暗示未实现的关系语义；
 - decoder registry、tag 唯一性、golden、build/open/reopen 和 runtime traces 全部通过；
-- `cargo xtask check`、`cargo xtask bench-plan-check` 和相关 smoke benchmark 通过；
+- `cargo xtask check`、Criterion test mode 和 owner-specific smoke benchmark 通过；
 - 后续新增算子可以复制流程和证据模板，而不复制某个具体算子实现。
 
 ## 阶段 1：基础无状态与结构算子族
@@ -433,7 +433,7 @@ MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；app
 该试点要求 Sink 独占其目标表、索引与约束，Schema 固定，外部不得改表、改数据或替换/
 恢复数据库，同一 target spec 不得被其他 Flow 接管或共享。远端 marker 只标识 ownership/layout
 版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；当前没有 TLS 或在线 Schema evolution。普通 Cargo gate 离线，显式本机
-`tools/check_postgres_sink.py` 覆盖初始化、大批 insert/delete、混合插删重放、宽 Schema、
+`system-tests/postgres/check_sink.py` 覆盖初始化、大批 insert/delete、混合插删重放、宽 Schema、
 1000 条不同记录的交错更新与“PG 已提交/MDBX 仍 Prepared”窗口的进程重开。SQL 次数证据见
 `TESTING.md`；尚无 Sink 独立吞吐或长稳 benchmark。
 

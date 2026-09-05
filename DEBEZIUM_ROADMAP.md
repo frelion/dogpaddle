@@ -7,7 +7,7 @@
 [`OPERATOR_ROADMAP.md`](OPERATOR_ROADMAP.md)。
 
 截至 2026-09-04，D0–D2 已完成，结论为 **GREEN**；D1 的可重复黑盒证据见
-[`experiments/debezium-d1/D1_REPORT.md`](experiments/debezium-d1/D1_REPORT.md)。D1 已由 owner
+[`system-tests/debezium-postgres/REPORT.md`](system-tests/debezium-postgres/REPORT.md)。D1 已由 owner
 合并。多 agent 对抗审查随后将原 D2/D3 重排：先把 Debezium 做成独立、窄小的产品组件，
 再围绕已经稳定的 delivery/checkpoint API 建 MDBX durable ingress。D2 实现与验收记录已由
 [PR #12](https://github.com/frelion/dogpaddle/pull/12) 合并，
@@ -18,7 +18,7 @@ Temurin JRE、不回退系统 Java 的四平台 payload。D3–D7 仍保持开�
 2026-09-05 实现补充：统一 turn 协议之后，D3 的持久交接与 D4 的转换收敛到一个具体
 `PostgresCdcScan`，不再单独公开通用 IngressScan。已有固定 Schema、只读 discovery、运行资源装配、
 checkpoint 与 Station output 同事务提交、commit 后 ACK 的实现；不再保存 Scan pending。
-真实本机验收使用 `tools/check_postgres_cdc.py`。
+真实本机验收使用 `system-tests/postgres/check_cdc.py`。
 这不等于关闭 D3/D4 的全部阶段验收，也不改变 D5 发布、D6 snapshot 和 D7 第二 connector 的开放状态。
 
 ## 目标与成功定义
@@ -164,7 +164,7 @@ D1 report 和 Git 中，不再形成第二套产品实现。
 
 ### 边界
 
-D1 被接受时是隔离在 `experiments/debezium-d1/` 中的可行性试验，不依赖 DogPaddle Change、Store、
+D1 被接受时是隔离的可行性试验，当前可重复 gate 位于 `system-tests/debezium-postgres/`，不依赖 DogPaddle Change、Store、
 Operation 或 Flow，不进入产品 crate。它只用 `snapshot.mode=no_data` 证明 stock Engine 可控，
 **不声明 DogPaddle 进程重启恢复**。迁移后的 fixture 不再拥有 offset store，只用产品 checkpoint。
 

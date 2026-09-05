@@ -12,9 +12,5 @@ name = "dogpaddle-xtask"
 path = "src/main.rs"
 bench = false
 
-[dependencies]
-dogpaddle-bench-protocol.workspace = true
-serde_json.workspace = true
-
 [lints]
 workspace = true

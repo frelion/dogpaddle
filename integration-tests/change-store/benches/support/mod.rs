@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use dogpaddle_bench_protocol::Run;
 use dogpaddle_change::{Change, decode_change};
+use dogpaddle_perf_context::RunRoot;
 use dogpaddle_store::CodecError as StoreCodecError;
 use tempfile::TempDir;
 
@@ -11,7 +11,7 @@ pub(crate) struct SampleStore {
 }
 
 impl SampleStore {
-    pub(crate) fn new(run: &Run, scenario: &str) -> Self {
+    pub(crate) fn new(run: &RunRoot, scenario: &str) -> Self {
         let root = run.sample(scenario);
         let store = root.path().join("store");
         Self { _root: root, store }

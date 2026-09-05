@@ -1,53 +1,55 @@
-# dogpaddle-change 性能协议
+# dogpaddle-change 性能口径
 
-本文件只定义 Change 单体 benchmark 的 workload、计时边界和配置。统一的环境/profile
-规则、typed JSONL、统计与 reference 比较协议见[根目录测试协议](../../TESTING.md)。机械协议由内部
-crate `dogpaddle-bench-protocol` 提供；Change benchmark 仍在本地拥有 Arrow fixture、结果 oracle、
-尺寸预检和五种 codec case 的交错顺序。
+Change 自己拥有 Arrow fixture、工作量、预热、正确性 oracle 和输出字段。共享的
+`dogpaddle-perf-context` 只提供 profile、运行目录、主机信息和 release-build 检查。
 
-## 工作负载
+## `change_core` — Criterion
 
-| 名称 | Schema 形状 | 主要问题 |
-| --- | --- | --- |
-| `diff_only` | 零 logical column | 每个完整 Stream 的固定成本 |
-| `narrow_fixed` | `UInt64 + Int64` | 固定宽度 rows/s |
-| `wide_projectable` | `id + Binary + tail` | 跳过宽 payload 的收益 |
-| `mixed_nullable` | Bool、Float64、Utf8、Binary、Null | bitmap、offset 与值校验 |
-| `nested` | List 与 Struct | 递归 layout 和完整子树 |
-| `sliced` | 非零 Arrow offset 的 `id + Binary + tail` | sliced buffer 的编码和选择性解码 |
+六种 fixture（diff-only、narrow fixed、wide projectable、mixed nullable、nested、sliced）分别测量：
 
-`smoke` 只测 4 rows/Change 和 16 B 宽 payload；`reference` 分别测 1、64、1024、16384
-rows/Change 和 1 KiB 宽 payload。该矩阵刻意不覆盖全部
-Arrow 类型，因为类型全集属于正确性测试，性能测试只选择不同成本原型。
+- `Change::try_new`；
+- `ChangeProjection::try_new`；
+- `Change::try_slice`；
+- `Change::try_project`。
 
-`change_core` 测量 `Change::try_new`、`ChangeProjection::try_new`、`try_slice` 和 `try_project`。
-只有逐行验证 diff 的 `try_new` 报告 rows/s；Schema 绑定、切片和零复制投影只报告每次操作延迟，
-不把未扫描的行数或编码字节伪装成吞吐。
+构造输入、projection、slice 参数和独立结果验证都在计时外。Criterion 原生 raw samples 与 estimates
+位于 `RunRoot/criterion/`，相邻 `criterion-context.json` 记录 profile、host、固定 workload 和 encoded
+bytes。该 target 设置 `test = true`，Cargo test mode 自动使用最小 smoke fixture。
 
-`change_codec` 测量 `encode_change`、`decode_change`，以及 diff-only、narrow、identity
-`decode_change_projected`。projection 在计时外创建，所有 decode 使用同一份预编码字节。每个
-case 在正式采样前独立预热；随后以 sample 为外层循环交错执行并轮换首个 case，保留同一 sample
-index 下可配对的原始结果。结果等价验证位于计时外。
+## `change_codec` — 五路旋转 runner
 
-## 配置
+同一 fixture 的五个 case 在每个 sample 内执行一次，并逐 sample 轮换首个 case：
 
-benchmark 只有 `smoke` 与 `reference` 两套代码内固定矩阵，不接受逐维覆盖。快速协议检查：
+1. encode；
+2. full decode；
+3. diff-only projected decode；
+4. narrow projected decode；
+5. identity projected decode。
+
+这样保留同一 sample 下的配对关系，同时分散固定顺序和热度偏差。所有 projection、预编码字节、独立
+oracle 和 warm-up 在计时外。stdout 逐行输出 owner-specific JSONL：context、fixture、包含五个有序
+measurement 的 paired sample、completion；stderr 只输出进度。失败前已 flush 的样本仍然可用。
+
+`smoke` 使用 4 rows/Change 和 16-byte 宽 payload；`reference` 使用 1、64、1024、16384 rows/Change、
+1 KiB 宽 payload及 9 次旋转 sample。类型全集属于 correctness，这里只选不同成本形状。
+
+## 运行
 
 ```bash
-DOGPADDLE_BENCH_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_codec
+cargo test --locked -p dogpaddle-change --bench change_core
+DOGPADDLE_PERF_PROFILE=smoke \
+cargo bench --locked -p dogpaddle-change --bench change_codec
 ```
 
-正式 reference 使用 `DOGPADDLE_BENCH_PROFILE=reference`；Change 不落盘，因此不要求 root。
+正式 reference：
 
-输出保留 rows/Change、changes/sample 和逐样本耗时；每个 fixture 的 encoded bytes/Change 作为一条
-独立 raw observation 保存，避免把 fixture facts 重复写进每个 sample。统一 reporter 从验证后的
-artifact 派生 min/median/p95 与 operations/s。它们是 warm single-thread CPU 数量级，不是 Store、磁盘或 Flow 吞吐。
-真实持久化路径由 `dogpaddle-change-store-integration` 独立测量。
+```bash
+DOGPADDLE_PERF_PROFILE=reference \
+DOGPADDLE_PERF_ROOT=/absolute/reference-root \
+cargo bench --locked -p dogpaddle-change --bench change_codec
+```
 
-stdout 的机器流由单一 `Record` 枚举生成：自包含 `run` 先声明稳定 series、精确样本数与静态 work
-facts，随后是只含 case ID、index、elapsed 的 raw `sample`，最后是 `completion`。统计只由统一
-reporter 从验证后的 raw artifact 派生。启动时仍由 Change fixture 用 checked arithmetic 预检尺寸，并在分配
-前拒绝超过 Arrow i32 offset 容量的 Binary、Utf8 或 List 配置。
-
-相邻的 `change_core.plan.json` 与 `change_codec.plan.json` 分别冻结 smoke/reference 的纯 Plan
-fingerprint；`cargo xtask bench-plan-check` 不构造 Arrow fixture 即可验证两档矩阵。
+Change 不要求持久化 fixture，但仍通过统一的绝对 reference root 保存运行上下文。真实
+Change + AppendLog 成本由 `integration-tests/change-store` 单独测量。不存在 plan、fingerprint、中央
+validator 或跨 target 结果 schema；不同 baseline epoch 的结果不可直接比较。全局规则见
+[`TESTING.md`](../../TESTING.md)。

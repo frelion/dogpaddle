@@ -10,6 +10,16 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: cargo
+    directory: /system-tests/debezium-postgres/host
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      d1-host-rust-dependencies:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -22,6 +32,12 @@ updates:
 
   - package-ecosystem: maven
     directory: /crates/debezium/bridge
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: maven
+    directory: /system-tests/debezium-runtime/probe
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

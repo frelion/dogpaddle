@@ -6,6 +6,7 @@ rust-version.workspace = true
 readme = "README.md"
 autotests = false
 autobenches = false
+autoexamples = false
 
 [lib]
 bench = false
@@ -15,7 +16,9 @@ libmdbx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-dogpaddle-bench-protocol.workspace = true
+criterion.workspace = true
+dogpaddle-perf-context.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [[test]]
@@ -32,7 +35,7 @@ test = false
 name = "cell"
 path = "benches/cell.rs"
 harness = false
-test = false
+test = true
 
 [[bench]]
 name = "append_log"

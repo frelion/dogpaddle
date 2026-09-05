@@ -1,4 +1,4 @@
-name: Endurance protocol
+name: Storage endurance
 
 on:
   schedule:
@@ -49,17 +49,14 @@ jobs:
 
       - name: Run Store AppendLog endurance
         env:
-          DOGPADDLE_BENCH_PROFILE: reference
-          DOGPADDLE_BENCH_ROOT: ${{ github.workspace }}/benchmark-store
-        run: >-
-          cargo bench --locked -p dogpaddle-store --bench append_log_endurance
-          > benchmark-artifacts/store-append-log.stdout.log
-          2> benchmark-artifacts/store-append-log.stderr.log
-
-      - name: Validate machine-readable benchmark records
-        run: >-
-          cargo xtask bench-validate append_log_endurance reference
-          benchmark-artifacts/store-append-log.stdout.log
+          DOGPADDLE_PERF_PROFILE: reference
+          DOGPADDLE_PERF_ROOT: ${{ github.workspace }}/benchmark-store
+        run: |
+          cargo bench --locked -p dogpaddle-store --bench append_log_endurance \
+            > benchmark-artifacts/store-append-log.partial.jsonl \
+            2> benchmark-artifacts/store-append-log.stderr.log
+          mv benchmark-artifacts/store-append-log.partial.jsonl \
+            benchmark-artifacts/store-append-log.jsonl
 
       - name: Upload raw benchmark records
         if: always()

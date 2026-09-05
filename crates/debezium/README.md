@@ -136,17 +136,20 @@ tar extraction filters, and `sha256sum` or `shasum`.
 The payload intentionally contains no native host or `bin/` packaging contract.
 `DogPaddle`'s future release packager will combine the real application
 executable with this reusable runtime payload. The lifecycle workflow builds a
-deterministic connector from the separate `bridge/probe/` Maven project.
-`scripts/install-lifecycle-probe.sh` injects it only into the relocated test
-copy, and `examples/bundled_runtime_probe.rs` drives the Rust API; neither the
+deterministic connector from the separate
+`system-tests/debezium-runtime/probe/` Maven project.
+`system-tests/debezium-runtime/probe/install.sh` injects it only into the
+relocated test copy, and
+`system-tests/debezium-runtime/host/src/bin/bundled_runtime_probe.rs`
+drives the Rust API; neither the
 product distribution nor the uploaded runtime archive contains that connector
 or host. The D1 `PostgreSQL` gate keeps its diagnostic host separate and mounts
 both into one test process.
 
-The independent `Debezium PostgreSQL recovery` workflow runs
-`experiments/debezium-d1/scripts/run.sh` on Ubuntu 24.04 for relevant pull
-requests and `main` changes, on a weekly schedule, and on manual dispatch. It
-owns the real connector matrix: idle recovery, drop/redelivery, unacknowledged
+The independent `Debezium PostgreSQL recovery` workflow builds the Linux
+runtime and D1 host once, then runs
+`system-tests/debezium-postgres/scripts/run.sh` with those artifacts on Ubuntu
+24.04. It owns the real connector matrix: idle recovery, drop/redelivery, unacknowledged
 restart replay, checkpoint-only takeover, durable-before-ACK, eventual
 `confirmed_flush_lsn`, outstanding-stop replay, row order, absence of a Java
 offset file, and payload-JVM isolation. Artifact upload runs on both success

@@ -23,16 +23,16 @@ manifest 关闭自动 target 发现，只声明：
 ```bash
 cargo test -p dogpaddle-change-store-integration --test correctness
 cargo clippy -p dogpaddle-change-store-integration --all-targets -- -D warnings
-cargo bench -p dogpaddle-change-store-integration --bench change_append_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change-store-integration --bench change_append_log
 ```
 
 正确性只保留两个不能由产品 crate 单独推出的接缝 witness：完整和投影 Change 在 entry
 transaction 结束后仍然 owned；坏 Change poison 同一事务并回滚已经发生的 forwarding/cursor
 写入。稳定重批归 Change/Operation，分页、计费、truncate、reopen 和物理长稳归 Store。
 
-benchmark 只读取两个统一环境变量：`DOGPADDLE_BENCH_PROFILE=smoke|reference` 和
-`DOGPADDLE_BENCH_ROOT=/absolute/path`。smoke 未设置 root 时使用临时目录；reference 必须指定
+benchmark 只读取两个统一环境变量：`DOGPADDLE_PERF_PROFILE=smoke|reference` 和
+`DOGPADDLE_PERF_ROOT=/absolute/path`。profile 必填；smoke 未设置 root 时使用临时目录，reference 必须指定
 固定绝对目录。规模由 profile 唯一决定，不存在 target-specific 参数矩阵。
 
-详细覆盖、计时边界和固定 profile 见根目录 [`TESTING.md`](../../TESTING.md)；历史性能说明见
+详细覆盖、计时边界和固定 profile 见根目录 [`TESTING.md`](../../TESTING.md)；owner 性能说明见
 [`PERFORMANCE.md`](./PERFORMANCE.md)。

@@ -1,130 +1,183 @@
+//! Criterion measurements for Flow's durable build and warm-open lifecycle.
+
 use std::{
-    num::{NonZeroU64, NonZeroUsize},
+    fs,
+    num::NonZeroU64,
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
+use criterion::{BenchmarkId, Criterion, SamplingMode};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
+use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
+use serde_json::json;
+use tempfile::TempDir;
 
 const BENCHMARK: &str = "flow_lifecycle";
 const SMOKE_STATION_COUNTS: &[usize] = &[2, 3];
 const REFERENCE_STATION_COUNTS: &[usize] = &[2, 64, 1_024];
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
+#[derive(Clone, Copy)]
 struct Config {
-    station_counts: Vec<usize>,
-    samples: usize,
-    warmups: usize,
+    station_counts: &'static [usize],
+    sample_size: usize,
+    warm_up_time: Duration,
+    measurement_time: Duration,
 }
 
 impl Config {
-    fn for_profile(profile: dogpaddle_bench_protocol::BenchmarkProfile) -> Self {
-        let (station_counts, samples, warmups) = match profile {
-            dogpaddle_bench_protocol::BenchmarkProfile::Smoke => (SMOKE_STATION_COUNTS, 1, 1),
-            dogpaddle_bench_protocol::BenchmarkProfile::Reference => {
-                (REFERENCE_STATION_COUNTS, 9, 2)
-            }
-        };
-        assert!(station_counts.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(station_counts.iter().all(|count| *count >= 2));
-        Self {
-            station_counts: station_counts.to_vec(),
-            samples,
-            warmups,
+    const fn for_profile(profile: PerformanceProfile) -> Self {
+        match profile {
+            PerformanceProfile::Smoke => Self {
+                station_counts: SMOKE_STATION_COUNTS,
+                sample_size: 10,
+                warm_up_time: Duration::from_millis(20),
+                measurement_time: Duration::from_secs(1),
+            },
+            PerformanceProfile::Reference => Self {
+                station_counts: REFERENCE_STATION_COUNTS,
+                sample_size: 30,
+                warm_up_time: Duration::from_secs(2),
+                measurement_time: Duration::from_secs(5),
+            },
         }
     }
 
-    fn fields(&self) -> Fields {
-        Fields::new()
-            .with("station_counts", &self.station_counts)
-            .with("samples", self.samples)
-            .with("warmups", self.warmups)
-            .with("scope", "build_open_runtime_excluded")
-            .with("validation", "outside_timing")
-            .with("mdbx_sync_mode", "durable")
+    fn validate(self) {
+        assert!(
+            self.station_counts.windows(2).all(|pair| pair[0] < pair[1]),
+            "Flow lifecycle Station counts must be strictly increasing"
+        );
+        assert!(
+            self.station_counts.iter().all(|count| *count >= 2),
+            "Flow lifecycle requires a Source and Sink"
+        );
     }
+}
+
+struct LifecycleRun {
+    root: RunRoot,
+}
+
+impl LifecycleRun {
+    fn new(profile: PerformanceProfile, config: Config) -> Self {
+        if is_cargo_bench() {
+            require_release_build(BENCHMARK);
+        }
+        let root = RunRoot::for_profile(BENCHMARK, profile);
+        let context = json!({
+            "benchmark": BENCHMARK,
+            "runner": "criterion",
+            "criterion_version": "0.8.2",
+            "profile": profile,
+            "result_directory": root.path().display().to_string(),
+            "host": HostEnvironment::collect(Some(root.filesystem_root())),
+            "configuration": {
+                "station_counts": config.station_counts,
+                "sample_size": config.sample_size,
+                "sampling_mode": "flat",
+                "warm_up_time_ns": nanos(config.warm_up_time),
+                "measurement_time_ns": nanos(config.measurement_time),
+                "output_capacity_bytes": OUTPUT_CAPACITY_BYTES.get(),
+                "scenarios": ["fresh_durable_build", "warm_reopen"],
+                "timing_scope": "FlowFactory::build_or_FlowFactory::open_only",
+                "fixture_and_validation": "outside_timing",
+                "fresh_build_oracle": "validate_then_reopen_and_validate_outside_timing",
+                "execution": "single_thread",
+                "mdbx_sync_mode": "durable",
+            },
+        });
+        let encoded = serde_json::to_vec_pretty(&context)
+            .expect("serialize Flow lifecycle Criterion context");
+        fs::write(root.path().join("criterion-context.json"), encoded)
+            .expect("write Flow lifecycle Criterion context");
+        Self { root }
+    }
+
+    fn sample(&self, scenario: &str) -> TempDir {
+        self.root.sample(scenario)
+    }
+}
+
+fn criterion_configuration(config: Config, output_directory: &Path) -> Criterion {
+    Criterion::default()
+        .sample_size(config.sample_size)
+        .warm_up_time(config.warm_up_time)
+        .measurement_time(config.measurement_time)
+        .without_plots()
+        .output_directory(output_directory)
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
+    let profile = PerformanceProfile::for_benchmark();
     let config = Config::for_profile(profile);
-    let mut plan = Plan::new(profile, config.fields());
-    let cases = config
-        .station_counts
-        .iter()
-        .map(|&station_count| {
-            (
-                station_count,
-                plan.case(case("fresh_durable_build", station_count, config.samples)),
-                plan.case(case("warm_reopen", station_count, config.samples)),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut run = Run::persistent(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
-        return;
-    }
-    for (station_count, build, reopen) in cases {
-        for _ in 0..config.warmups {
-            measure_fresh_build(&run, station_count);
-        }
-        run.samples(build, |run| {
-            Measurement::new(measure_fresh_build(run, station_count))
-        });
+    config.validate();
+    let run = LifecycleRun::new(profile, config);
+    let mut criterion = criterion_configuration(config, run.root.path()).configure_from_args();
+    lifecycle(&mut criterion, &run, config);
+    criterion.final_summary();
+}
 
-        let fixture = run.sample("flow-reopen");
+fn lifecycle(criterion: &mut Criterion, run: &LifecycleRun, config: Config) {
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.sampling_mode(SamplingMode::Flat);
+
+    for &station_count in config.station_counts {
+        group.bench_function(
+            BenchmarkId::new("fresh_durable_build", station_count),
+            |bencher| {
+                bencher
+                    .iter_custom(|iterations| measure_fresh_build(run, station_count, iterations));
+            },
+        );
+
+        let fixture = run.sample(&format!("warm-reopen-{station_count}"));
         let path = fixture.path().join("flow");
         let flow = linear_factory(&path, station_count)
             .build()
-            .expect("build reopen benchmark fixture");
+            .expect("build warm-reopen benchmark fixture");
         validate_flow(&flow, &path, station_count);
         drop(flow);
-        for _ in 0..=config.warmups {
-            measure_reopen(&path, station_count);
-        }
-        run.samples(reopen, |_| {
-            Measurement::new(measure_reopen(&path, station_count))
+        group.bench_function(BenchmarkId::new("warm_reopen", station_count), |bencher| {
+            bencher.iter_custom(|iterations| measure_reopen(&path, station_count, iterations));
         });
     }
-    run.finish(|| {});
+
+    group.finish();
 }
 
-fn case(scenario: &str, station_count: usize, samples: usize) -> CaseSpec {
-    CaseSpec::new(
-        format!("{scenario}/stations={station_count}"),
-        NonZeroUsize::new(samples).unwrap(),
-        Fields::new()
-            .with("station_count", station_count)
-            .with("operations", 1_usize),
-    )
-}
-
-fn measure_fresh_build(run: &Run, station_count: usize) -> Duration {
-    let sample = run.sample("flow-build");
-    let path = sample.path().join("flow");
-    let factory = linear_factory(&path, station_count);
-    let started = std::time::Instant::now();
-    let flow = factory.build().expect("build benchmark Flow");
-    let elapsed = started.elapsed();
-    validate_flow(&flow, &path, station_count);
-    drop(flow);
-    let reopened = FlowFactory::new(&path)
-        .open()
-        .expect("reopen freshly built benchmark Flow");
-    validate_flow(&reopened, &path, station_count);
+fn measure_fresh_build(run: &LifecycleRun, station_count: usize, iterations: u64) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iterations {
+        let fixture = run.sample(&format!("fresh-build-{station_count}"));
+        let path = fixture.path().join("flow");
+        let factory = linear_factory(&path, station_count);
+        let started = Instant::now();
+        let flow = factory.build().expect("build benchmark Flow");
+        elapsed = checked_add(elapsed, started.elapsed());
+        validate_flow(&flow, &path, station_count);
+        drop(flow);
+        let reopened = FlowFactory::new(&path)
+            .open()
+            .expect("reopen freshly built benchmark Flow");
+        validate_flow(&reopened, &path, station_count);
+    }
     elapsed
 }
 
-fn measure_reopen(path: &Path, station_count: usize) -> Duration {
-    let started = std::time::Instant::now();
-    let flow = FlowFactory::new(path).open().expect("open benchmark Flow");
-    let elapsed = started.elapsed();
-    validate_flow(&flow, path, station_count);
+fn measure_reopen(path: &Path, station_count: usize, iterations: u64) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iterations {
+        let factory = FlowFactory::new(path);
+        let started = Instant::now();
+        let flow = factory.open().expect("open benchmark Flow");
+        elapsed = checked_add(elapsed, started.elapsed());
+        validate_flow(&flow, path, station_count);
+    }
     elapsed
 }
 
@@ -157,4 +210,18 @@ fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
     }
     assert_eq!(ids.next(), Some("sink"));
     assert_eq!(ids.next(), None);
+}
+
+fn is_cargo_bench() -> bool {
+    std::env::args_os().any(|argument| argument == "--bench")
+}
+
+fn checked_add(total: Duration, elapsed: Duration) -> Duration {
+    total
+        .checked_add(elapsed)
+        .expect("Flow lifecycle measured duration fits Duration")
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("Flow lifecycle duration fits u64 nanoseconds")
 }

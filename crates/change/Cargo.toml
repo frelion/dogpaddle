@@ -6,6 +6,7 @@ rust-version.workspace = true
 readme = "README.md"
 autotests = false
 autobenches = false
+autoexamples = false
 
 [lib]
 bench = false
@@ -19,7 +20,9 @@ flatbuffers.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-dogpaddle-bench-protocol.workspace = true
+criterion.workspace = true
+dogpaddle-perf-context.workspace = true
+serde_json.workspace = true
 
 [[test]]
 name = "correctness"
@@ -29,7 +32,7 @@ path = "tests/correctness.rs"
 name = "change_core"
 path = "benches/change_core.rs"
 harness = false
-test = false
+test = true
 
 [[bench]]
 name = "change_codec"

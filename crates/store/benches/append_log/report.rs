@@ -1,8 +1,8 @@
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::time::Duration;
 
-use dogpaddle_bench_protocol::{
-    CaseId, CaseSpec, Fields, Measurement, PairSchedule, PairVariant, Plan, Run,
-};
+use serde_json::json;
+
+use super::support::{PairVariant, StoreRun, measure_pair};
 
 #[derive(Debug, PartialEq)]
 pub(super) struct LogCase {
@@ -27,23 +27,10 @@ impl LogCase {
         }
     }
 
-    fn spec(&self, variant: &str, samples: usize) -> CaseSpec {
-        CaseSpec::new(
-            format!(
-                "{}::{variant}::records={}::record_bytes={}::transactions={}",
-                self.workload, self.records, self.record_bytes, self.transactions
-            ),
-            NonZeroUsize::new(samples).expect("benchmark has samples"),
-            Fields::new()
-                .with("variant", variant)
-                .with("operations", self.records)
-                .with("transactions", self.transactions)
-                .with(
-                    "logical_bytes",
-                    self.records
-                        .checked_mul(self.record_bytes)
-                        .expect("benchmark logical byte count fits in usize"),
-                ),
+    fn series(&self, variant: &str) -> String {
+        format!(
+            "{}::{variant}::records={}::record_bytes={}::transactions={}",
+            self.workload, self.records, self.record_bytes, self.transactions
         )
     }
 }
@@ -55,24 +42,6 @@ pub(super) struct LogPair {
     second_workload: String,
     first_data: &'static str,
     second_data: &'static str,
-}
-
-enum Planned {
-    Single {
-        case: LogCase,
-        samples: usize,
-        id: CaseId,
-    },
-    Pair {
-        pair: LogPair,
-        samples: usize,
-        first: CaseId,
-        second: CaseId,
-    },
-}
-
-pub(super) struct FrozenCases {
-    cases: VecDeque<Planned>,
 }
 
 impl LogPair {
@@ -121,91 +90,20 @@ impl LogPair {
     }
 }
 
-impl FrozenCases {
-    pub(super) const fn new() -> Self {
-        Self {
-            cases: VecDeque::new(),
-        }
-    }
-
-    pub(super) fn single(&mut self, plan: &mut Plan, case: LogCase, samples: usize) {
-        let id = plan.case(case.spec("default", samples));
-        self.cases.push_back(Planned::Single { case, samples, id });
-    }
-
-    pub(super) fn pair(&mut self, plan: &mut Plan, pair: LogPair, samples: usize) {
-        let second_case = pair.second();
-        let (first, second) = plan.pair(
-            pair.identity(),
-            pair.first.spec(pair.first_data, samples),
-            second_case.spec(pair.second_data, samples),
-        );
-        self.cases.push_back(Planned::Pair {
-            pair,
-            samples,
-            first,
-            second,
-        });
-    }
-
-    pub(super) fn finish(self) {
-        assert!(
-            self.cases.is_empty(),
-            "all frozen AppendLog benchmark cases are consumed"
-        );
-    }
-
-    fn take_single(&mut self, expected: &LogCase, samples: usize) -> CaseId {
-        let Planned::Single {
-            case,
-            samples: planned_samples,
-            id,
-        } = self
-            .cases
-            .pop_front()
-            .expect("missing frozen AppendLog benchmark case")
-        else {
-            panic!("frozen AppendLog plan expected a paired case")
-        };
-        assert_eq!(&case, expected);
-        assert_eq!(planned_samples, samples);
-        id
-    }
-
-    fn take_pair(&mut self, expected: &LogPair, samples: usize) -> (CaseId, CaseId) {
-        let Planned::Pair {
-            pair,
-            samples: planned_samples,
-            first,
-            second,
-        } = self
-            .cases
-            .pop_front()
-            .expect("missing frozen AppendLog benchmark pair")
-        else {
-            panic!("frozen AppendLog plan expected an ordinary case")
-        };
-        assert_eq!(&pair, expected);
-        assert_eq!(planned_samples, samples);
-        (first, second)
-    }
-}
-
 pub(super) fn report_log(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     case: &LogCase,
     samples: usize,
     mut measure: impl FnMut() -> Duration,
 ) {
     measure();
-    let id = plan.take_single(case, samples);
-    run.samples(id, |_| Measurement::new(measure()));
+    for sample in 0..samples {
+        emit(run, case, "default", sample, measure(), None);
+    }
 }
 
 pub(super) fn report_log_pair(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     pair: &LogPair,
     samples: usize,
     mut first: impl FnMut() -> Duration,
@@ -213,35 +111,90 @@ pub(super) fn report_log_pair(
 ) {
     first();
     second();
-    report_pair(run, plan, pair, samples, |variant| match variant {
+    report_pair(run, pair, samples, |variant| match variant {
         PairVariant::First => first(),
         PairVariant::Second => second(),
     });
 }
 
 pub(super) fn report_log_mode_pair(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     pair: &LogPair,
     samples: usize,
     mut measure: impl FnMut(bool) -> Duration,
 ) {
     measure(false);
     measure(true);
-    report_pair(run, plan, pair, samples, |variant| {
+    report_pair(run, pair, samples, |variant| {
         measure(matches!(variant, PairVariant::Second))
     });
 }
 
 fn report_pair(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     pair: &LogPair,
     samples: usize,
     mut measure: impl FnMut(PairVariant) -> Duration,
 ) {
-    let (first, second) = plan.take_pair(pair, samples);
-    run.paired(first, second, PairSchedule::Counterbalanced, |variant| {
-        Measurement::new(measure(variant))
-    });
+    let second = pair.second();
+    for sample in 0..samples {
+        let ab = pair_is_ab(sample);
+        let (first_elapsed, second_elapsed) = measure_pair(ab, &mut measure);
+        let order = if ab { "ab" } else { "ba" };
+        emit(
+            run,
+            &pair.first,
+            pair.first_data,
+            sample,
+            first_elapsed,
+            Some((&pair.identity(), order)),
+        );
+        emit(
+            run,
+            &second,
+            pair.second_data,
+            sample,
+            second_elapsed,
+            Some((&pair.identity(), order)),
+        );
+    }
+}
+
+pub(super) fn validate_pair_schedule(samples: usize) {
+    assert!(
+        samples >= 4,
+        "AB/BA/BA/AB measurement requires at least four samples"
+    );
+    assert_eq!(
+        [pair_is_ab(0), pair_is_ab(1), pair_is_ab(2), pair_is_ab(3),],
+        [true, false, false, true]
+    );
+}
+
+const fn pair_is_ab(sample: usize) -> bool {
+    matches!(sample % 4, 0 | 3)
+}
+
+fn emit(
+    run: &StoreRun,
+    case: &LogCase,
+    variant: &str,
+    sample: usize,
+    elapsed: Duration,
+    pair: Option<(&str, &str)>,
+) {
+    run.sample(
+        &case.series(variant),
+        sample,
+        elapsed,
+        &json!({
+            "variant": variant,
+            "pair": pair.map(|value| value.0),
+            "order": pair.map(|value| value.1),
+            "operations": case.records,
+            "transactions": case.transactions,
+            "logical_bytes": case.records.checked_mul(case.record_bytes).unwrap(),
+            "record_bytes": case.record_bytes,
+        }),
+    );
 }

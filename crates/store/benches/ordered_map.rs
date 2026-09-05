@@ -1,7 +1,8 @@
 //! Scenario benchmarks for both physical forms of `OrderedMap`.
 
-use dogpaddle_bench_protocol::{BenchmarkProfile, Fields, Plan, Run};
+use dogpaddle_perf_context::PerformanceProfile;
 use dogpaddle_store::{Large, ScanDirection, Small};
+use serde_json::json;
 
 mod support;
 
@@ -20,8 +21,8 @@ use measure::{
     measure_hot_overwrite_rollback, measure_point_get, measure_primitive_scan, measure_scan,
     measure_single_put_commits, measure_station_steps, measure_vec_scan,
 };
-use report::{BenchmarkCase, FrozenCases, report_mode_pair, report_size_pair};
-use support::BenchRoot;
+use report::{BenchmarkCase, report_mode_pair, report_size_pair, validate_pair_schedule};
+use support::{BenchRoot, StoreRun};
 
 const BENCHMARK: &str = "ordered_map";
 const DEFAULT_ENTRIES: usize = 100_000;
@@ -66,18 +67,18 @@ enum ScanKind {
 }
 
 impl Config {
-    const fn for_profile(profile: BenchmarkProfile) -> Self {
+    const fn for_profile(profile: PerformanceProfile) -> Self {
         match profile {
-            BenchmarkProfile::Smoke => Self {
+            PerformanceProfile::Smoke => Self {
                 entries: 4,
                 commits: 1,
-                samples: 1,
+                samples: 2,
                 background_namespaces: 1,
                 scan_items: 2,
                 scan_bytes: 16_384,
                 wide_scan_entries: 2,
             },
-            BenchmarkProfile::Reference => Self {
+            PerformanceProfile::Reference => Self {
                 entries: DEFAULT_ENTRIES,
                 commits: DEFAULT_COMMITS,
                 samples: DEFAULT_SAMPLES,
@@ -91,7 +92,10 @@ impl Config {
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
+    if !std::env::args_os().any(|argument| argument == "--bench") {
+        return;
+    }
+    let profile = PerformanceProfile::from_environment();
     let config = Config::for_profile(profile);
     let Config {
         entries,
@@ -111,125 +115,49 @@ fn main() {
             && scan_bytes > 0
             && wide_scan_entries > 0
     );
-    let mut plan = Plan::new(profile, configuration_fields(&config));
-    let mut cases = benchmark_plan(&mut plan, &config);
-    let mut run = Run::persistent(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
-        return;
-    }
-    let bench_root = BenchRoot::new(&run);
+    validate_pair_schedule(samples);
+    let run = StoreRun::new(
+        BENCHMARK,
+        profile,
+        &json!({
+            "entries": config.entries,
+            "value_bytes": VALUE_BYTES,
+            "wide_scan_entries": config.wide_scan_entries,
+            "wide_value_bytes": WIDE_VALUE_BYTES,
+            "commits": config.commits,
+            "samples": config.samples,
+            "background_namespaces": config.background_namespaces,
+            "scan_items": config.scan_items,
+            "scan_bytes": config.scan_bytes,
+            "random_seed": RANDOM_SEED,
+            "execution": "single_thread",
+            "cache": "warm",
+            "mdbx_sync_mode": "durable",
+        }),
+    );
+    let bench_root = BenchRoot::new(run.root());
     let scan = ScanLimits {
         items: scan_items,
         bytes: scan_bytes,
     };
 
-    benchmark_isolated(&mut run, &mut cases, &bench_root, entries, samples, scan);
-    benchmark_scan_decoding(
-        &mut run,
-        &mut cases,
-        &bench_root,
-        entries,
-        wide_scan_entries,
-        samples,
-        scan,
-    );
+    benchmark_isolated(&run, &bench_root, entries, samples, scan);
+    benchmark_scan_decoding(&run, &bench_root, entries, wide_scan_entries, samples, scan);
     benchmark_mixed(
-        &mut run,
-        &mut cases,
+        &run,
         &bench_root,
         entries,
         samples,
         background_namespaces,
         scan,
     );
-    benchmark_station_steps(&mut run, &mut cases, &bench_root, commits, samples);
-    benchmark_durable_overwrite(&mut run, &mut cases, &bench_root, commits, samples);
-    cases.finish();
-    run.finish(|| {});
-}
-
-fn configuration_fields(config: &Config) -> Fields {
-    let mut fields = Fields::new();
-    for (name, value) in [
-        ("entries", config.entries),
-        ("value_bytes", VALUE_BYTES),
-        ("wide_scan_entries", config.wide_scan_entries),
-        ("wide_value_bytes", WIDE_VALUE_BYTES),
-        ("commits", config.commits),
-        ("samples", config.samples),
-        ("background_namespaces", config.background_namespaces),
-        ("scan_items", config.scan_items),
-        ("scan_bytes", config.scan_bytes),
-    ] {
-        fields.insert(name, value);
-    }
-    fields.insert("random_seed", RANDOM_SEED);
-    fields
-        .with("execution", "single_thread")
-        .with("cache", "warm")
-        .with("mdbx_sync_mode", "durable")
-}
-
-fn benchmark_plan(plan: &mut Plan, config: &Config) -> FrozenCases {
-    let mut cases = FrozenCases::new();
-    let entries = config.entries;
-    let samples = config.samples;
-    cases.size(
-        plan,
-        map_case("byte map bulk put + commit", entries),
-        samples,
-    );
-    cases.size(plan, map_case("bulk put + commit", entries), samples);
-    cases.size(plan, map_case("hot byte map point get", entries), samples);
-    cases.size(plan, map_case("hot byte map asc scan", entries), samples);
-    cases.size(plan, map_case("hot byte map desc scan", entries), samples);
-    cases.size(plan, map_case("hot point get", entries), samples);
-    cases.size(plan, map_case("hot ascending scan", entries), samples);
-    cases.size(plan, map_case("hot descending scan", entries), samples);
-    cases.mode(plan, map_case("narrow asc scan Small", entries), samples);
-    cases.mode(plan, map_case("narrow asc scan Large", entries), samples);
-    cases.size(plan, map_case("hot overwrite + rollback", entries), samples);
-    cases.size(
-        plan,
-        primitive_case("primitive asc full scan", entries),
-        samples,
-    );
-    cases.mode(
-        plan,
-        wide_case("wide asc scan Small", config.wide_scan_entries),
-        samples,
-    );
-    cases.mode(
-        plan,
-        wide_case("wide asc scan Large", config.wide_scan_entries),
-        samples,
-    );
-    cases.size(plan, map_case("mixed hot point get", entries), samples);
-    cases.size(plan, map_case("mixed hot ascending scan", entries), samples);
-    cases.size(
-        plan,
-        map_case("mixed hot descending scan", entries),
-        samples,
-    );
-    for operations_per_step in [1, 8, 64] {
-        cases.size(
-            plan,
-            station_case(config.commits, operations_per_step),
-            samples,
-        );
-    }
-    cases.size(
-        plan,
-        transactional_map_case("durable overwrite commit", config.commits),
-        samples,
-    );
-    cases
+    benchmark_station_steps(&run, &bench_root, commits, samples);
+    benchmark_durable_overwrite(&run, &bench_root, commits, samples);
+    run.finish();
 }
 
 fn benchmark_scan_decoding(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     entries: usize,
     wide_entries: usize,
@@ -240,7 +168,6 @@ fn benchmark_scan_decoding(
     let mut large_primitive = ScanFixture::<u64, Large>::populated(bench_root, entries, &0x5a);
     report_size_pair(
         run,
-        plan,
         &primitive_case("primitive asc full scan", entries),
         samples,
         || measure_primitive_scan(&mut small_primitive, entries, scan.items, scan.bytes),
@@ -254,7 +181,6 @@ fn benchmark_scan_decoding(
         ScanFixture::<Vec<u8>, Large>::populated(bench_root, wide_entries, &wide_value);
     report_mode_pair(
         run,
-        plan,
         &wide_case("wide asc scan Small", wide_entries),
         samples,
         &mut small_wide,
@@ -281,7 +207,6 @@ fn benchmark_scan_decoding(
     );
     report_mode_pair(
         run,
-        plan,
         &wide_case("wide asc scan Large", wide_entries),
         samples,
         &mut large_wide,
@@ -309,8 +234,7 @@ fn benchmark_scan_decoding(
 }
 
 fn benchmark_isolated(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
@@ -318,7 +242,6 @@ fn benchmark_isolated(
 ) {
     report_size_pair(
         run,
-        plan,
         &map_case("byte map bulk put + commit", entries),
         samples,
         || measure_byte_map_bulk_put::<Small>(bench_root, entries),
@@ -326,20 +249,18 @@ fn benchmark_isolated(
     );
     report_size_pair(
         run,
-        plan,
         &map_case("bulk put + commit", entries),
         samples,
         || measure_bulk_put::<Small>(bench_root, entries),
         || measure_bulk_put::<Large>(bench_root, entries),
     );
 
-    benchmark_byte_map(run, plan, bench_root, entries, samples, scan);
+    benchmark_byte_map(run, bench_root, entries, samples, scan);
 
     let mut small = Fixture::<Small>::populated_typed(bench_root, entries);
     let mut large = Fixture::<Large>::populated_typed(bench_root, entries);
     report_size_pair(
         run,
-        plan,
         &map_case("hot point get", entries),
         samples,
         || measure_point_get(&mut small, entries),
@@ -347,7 +268,6 @@ fn benchmark_isolated(
     );
     report_scan_pair(
         run,
-        plan,
         &ScanWorkload {
             case: map_case("hot ascending scan", entries),
             direction: ScanDirection::Ascending,
@@ -360,7 +280,6 @@ fn benchmark_isolated(
     );
     report_scan_pair(
         run,
-        plan,
         &ScanWorkload {
             case: map_case("hot descending scan", entries),
             direction: ScanDirection::Descending,
@@ -371,10 +290,9 @@ fn benchmark_isolated(
         samples,
         scan,
     );
-    benchmark_narrow_scan_modes(run, plan, &mut small, &mut large, entries, samples, scan);
+    benchmark_narrow_scan_modes(run, &mut small, &mut large, entries, samples, scan);
     report_size_pair(
         run,
-        plan,
         &map_case("hot overwrite + rollback", entries),
         samples,
         || {
@@ -389,8 +307,7 @@ fn benchmark_isolated(
 }
 
 fn benchmark_byte_map(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
@@ -400,7 +317,6 @@ fn benchmark_byte_map(
     let mut large = Fixture::<Large>::populated_bytes(bench_root, entries);
     report_size_pair(
         run,
-        plan,
         &map_case("hot byte map point get", entries),
         samples,
         || measure_byte_map_point_get(&mut small, entries),
@@ -412,7 +328,6 @@ fn benchmark_byte_map(
     ] {
         report_scan_pair(
             run,
-            plan,
             &ScanWorkload {
                 case: map_case(name, entries),
                 direction,
@@ -427,8 +342,7 @@ fn benchmark_byte_map(
 }
 
 fn benchmark_narrow_scan_modes(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     small: &mut Fixture<Small>,
     large: &mut Fixture<Large>,
     entries: usize,
@@ -437,7 +351,6 @@ fn benchmark_narrow_scan_modes(
 ) {
     report_mode_pair(
         run,
-        plan,
         &map_case("narrow asc scan Small", entries),
         samples,
         small,
@@ -464,7 +377,6 @@ fn benchmark_narrow_scan_modes(
     );
     report_mode_pair(
         run,
-        plan,
         &map_case("narrow asc scan Large", entries),
         samples,
         large,
@@ -491,17 +403,10 @@ fn benchmark_narrow_scan_modes(
     );
 }
 
-fn benchmark_station_steps(
-    run: &mut Run,
-    plan: &mut FrozenCases,
-    bench_root: &BenchRoot,
-    steps: usize,
-    samples: usize,
-) {
+fn benchmark_station_steps(run: &StoreRun, bench_root: &BenchRoot, steps: usize, samples: usize) {
     for operations_per_step in [1, 8, 64] {
         report_size_pair(
             run,
-            plan,
             &station_case(steps, operations_per_step),
             samples,
             || {
@@ -517,15 +422,13 @@ fn benchmark_station_steps(
 }
 
 fn benchmark_durable_overwrite(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     commits: usize,
     samples: usize,
 ) {
     report_size_pair(
         run,
-        plan,
         &transactional_map_case("durable overwrite commit", commits),
         samples,
         || {
@@ -540,8 +443,7 @@ fn benchmark_durable_overwrite(
 }
 
 fn benchmark_mixed(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     bench_root: &BenchRoot,
     entries: usize,
     samples: usize,
@@ -560,7 +462,6 @@ fn benchmark_mixed(
     );
     report_size_pair(
         run,
-        plan,
         &map_case("mixed hot point get", entries),
         samples,
         || measure_point_get(&mut small, entries),
@@ -568,7 +469,6 @@ fn benchmark_mixed(
     );
     report_scan_pair(
         run,
-        plan,
         &ScanWorkload {
             case: map_case("mixed hot ascending scan", entries),
             direction: ScanDirection::Ascending,
@@ -581,7 +481,6 @@ fn benchmark_mixed(
     );
     report_scan_pair(
         run,
-        plan,
         &ScanWorkload {
             case: map_case("mixed hot descending scan", entries),
             direction: ScanDirection::Descending,
@@ -595,8 +494,7 @@ fn benchmark_mixed(
 }
 
 fn report_scan_pair<SmallSize, LargeSize>(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     workload: &ScanWorkload,
     fixtures: (&mut Fixture<SmallSize>, &mut Fixture<LargeSize>),
     entries: usize,
@@ -606,7 +504,6 @@ fn report_scan_pair<SmallSize, LargeSize>(
     let (small, large) = fixtures;
     report_size_pair(
         run,
-        plan,
         &workload.case,
         samples,
         || match workload.kind {

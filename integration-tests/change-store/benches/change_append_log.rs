@@ -1,35 +1,42 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use std::{hint::black_box, num::NonZeroUsize, path::Path, time::Duration};
+use std::{
+    fs,
+    hint::black_box,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use arrow_array::UInt64Array;
-use dogpaddle_bench_protocol::{
-    BenchmarkProfile, CaseId, CaseSpec, Fields, Measurement, Plan, Run,
-};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use dogpaddle_change::{Change, ChangeProjection, decode_change_projected};
 use dogpaddle_change_store_integration::{
     EncodedChanges, heterogeneous_pages_fixture, order_checksum, projectable_fixture,
 };
+use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{
     AppendLog, Cell, CodecError as StoreCodecError, ScanLimit, Store, StoreError,
 };
+use serde_json::json;
 
 use support::{SampleStore, decode_entry};
 
 const BENCHMARK: &str = "change_append_log";
 
+#[derive(Clone, Copy)]
 struct Config {
     rows_per_change: usize,
     changes_per_transaction: usize,
-    transactions_per_sample: usize,
+    transactions_per_iteration: usize,
     payload_bytes: usize,
-    samples: usize,
-    warmups: usize,
+    sample_size: usize,
+    warm_up_time: Duration,
+    measurement_time: Duration,
     max_working_set_bytes: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScenarioMeasurement {
     elapsed: Duration,
     pages: usize,
@@ -37,60 +44,45 @@ struct ScenarioMeasurement {
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
-    let config = Config::load(profile);
-    let mut plan = Plan::new(profile, configuration(&config));
-    let append = plan.case(scenario_case(
-        &config,
-        "append_durable",
-        "heterogeneous_pages",
-    ));
-    let full_replay = plan.case(scenario_case(&config, "full_replay", "heterogeneous_pages"));
-    let projected_replay = plan.case(scenario_case(&config, "projected_replay", "projectable"));
-    let consumer = plan.case(scenario_case(
-        &config,
-        "consumer_durable",
-        "heterogeneous_pages",
-    ));
-    let mut run = Run::persistent(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
-        return;
+    let profile = PerformanceProfile::for_benchmark();
+    if is_cargo_bench() {
+        require_release_build(BENCHMARK);
     }
-    run_scenario(&mut run, &config, append, |run| {
-        measure_append(run, &config)
-    });
-    run_scenario(&mut run, &config, full_replay, |run| {
-        measure_full_replay(run, &config)
-    });
-    run_scenario(&mut run, &config, projected_replay, |run| {
-        measure_projected_replay(run, &config)
-    });
-    run_scenario(&mut run, &config, consumer, |run| {
-        measure_consumer(run, &config)
-    });
-    run.finish(|| {});
+    let config = Config::for_profile(profile);
+    let root = RunRoot::for_profile(BENCHMARK, profile);
+    write_context(&root, profile, config);
+    let mut criterion = Criterion::default()
+        .sample_size(config.sample_size)
+        .warm_up_time(config.warm_up_time)
+        .measurement_time(config.measurement_time)
+        .without_plots()
+        .output_directory(&root.path().join("criterion"))
+        .configure_from_args();
+    benchmark(&mut criterion, &root, config);
+    criterion.final_summary();
 }
 
 impl Config {
-    fn load(profile: BenchmarkProfile) -> Self {
+    fn for_profile(profile: PerformanceProfile) -> Self {
         let config = match profile {
-            BenchmarkProfile::Smoke => Self {
+            PerformanceProfile::Smoke => Self {
                 rows_per_change: 8,
                 changes_per_transaction: 2,
-                transactions_per_sample: 2,
+                transactions_per_iteration: 2,
                 payload_bytes: 16,
-                samples: 1,
-                warmups: 1,
+                sample_size: 10,
+                warm_up_time: Duration::from_millis(20),
+                measurement_time: Duration::from_millis(50),
                 max_working_set_bytes: 64 * 1_024 * 1_024,
             },
-            BenchmarkProfile::Reference => Self {
+            PerformanceProfile::Reference => Self {
                 rows_per_change: 1_024,
                 changes_per_transaction: 32,
-                transactions_per_sample: 8,
+                transactions_per_iteration: 8,
                 payload_bytes: 256,
-                samples: 15,
-                warmups: 3,
+                sample_size: 15,
+                warm_up_time: Duration::from_secs(3),
+                measurement_time: Duration::from_secs(5),
                 max_working_set_bytes: 512 * 1_024 * 1_024,
             },
         };
@@ -100,64 +92,74 @@ impl Config {
 
     fn total_changes(&self) -> usize {
         self.changes_per_transaction
-            .checked_mul(self.transactions_per_sample)
+            .checked_mul(self.transactions_per_iteration)
             .expect("benchmark Change count fits usize")
     }
 }
 
-fn configuration(config: &Config) -> Fields {
-    Fields::new()
-        .with("fixtures", ["heterogeneous_pages", "projectable"])
-        .with("rows_per_change", config.rows_per_change)
-        .with("changes_per_transaction", config.changes_per_transaction)
-        .with("transactions_per_sample", config.transactions_per_sample)
-        .with("payload_bytes", config.payload_bytes)
-        .with("samples", config.samples)
-        .with("warmups", config.warmups)
-        .with("max_working_set_bytes", config.max_working_set_bytes)
-        .with("fixture_and_validation", "outside_timing")
-        .with("mdbx_sync_mode", "durable")
+fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(config.total_changes()).expect("Change count fits u64"),
+    ));
+    group.bench_function(
+        BenchmarkId::new("append_durable", config.total_changes()),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                measure_iterations(iterations, || measure_append(root, &config))
+            });
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("full_replay", config.total_changes()),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                measure_iterations(iterations, || measure_full_replay(root, &config))
+            });
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("projected_replay", config.total_changes()),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                measure_iterations(iterations, || measure_projected_replay(root, &config))
+            });
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("consumer_durable", config.total_changes()),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                measure_iterations(iterations, || measure_consumer(root, &config))
+            });
+        },
+    );
+    group.finish();
 }
 
-fn run_scenario(
-    run: &mut Run,
-    config: &Config,
-    case: CaseId,
-    mut measure: impl FnMut(&Run) -> ScenarioMeasurement,
-) {
-    for _ in 0..config.warmups {
-        black_box(measure(run));
+fn measure_iterations(
+    iterations: u64,
+    mut measure: impl FnMut() -> ScenarioMeasurement,
+) -> Duration {
+    let mut elapsed = Duration::ZERO;
+    let mut oracle = None;
+    for _ in 0..iterations {
+        let measurement = measure();
+        let actual_oracle = (measurement.pages, measurement.checksum);
+        if let Some(expected) = oracle {
+            assert_eq!(
+                actual_oracle, expected,
+                "benchmark oracle changed between iterations"
+            );
+        } else {
+            oracle = Some(actual_oracle);
+        }
+        black_box(actual_oracle);
+        elapsed = elapsed
+            .checked_add(measurement.elapsed)
+            .expect("benchmark elapsed duration fits Duration");
     }
-    run.samples(case, |run| {
-        let result = measure(run);
-        Measurement::with_fields(
-            result.elapsed,
-            Fields::new()
-                .with("observed_pages", result.pages)
-                .with("result_checksum", result.checksum),
-        )
-    });
-}
-
-fn scenario_case(config: &Config, scenario: &'static str, fixture: &'static str) -> CaseSpec {
-    CaseSpec::new(
-        scenario,
-        NonZeroUsize::new(config.samples).unwrap(),
-        scenario_fields(config, fixture),
-    )
-}
-
-fn scenario_fields(config: &Config, fixture: &'static str) -> Fields {
-    Fields::new()
-        .with("fixture", fixture)
-        .with("rows_per_change", config.rows_per_change)
-        .with("changes_per_transaction", config.changes_per_transaction)
-        .with("transactions_per_sample", config.transactions_per_sample)
-        .with("changes_per_sample", config.total_changes())
-        .with("operations", config.total_changes())
-        .with("transactions", config.transactions_per_sample)
-        .with("payload_bytes", config.payload_bytes)
-        .with("validation", "outside_timing")
+    elapsed
 }
 
 fn representative_workload(config: &Config) -> EncodedChanges {
@@ -173,14 +175,14 @@ fn representative_workload(config: &Config) -> EncodedChanges {
     workload
 }
 
-fn measure_append(run: &Run, config: &Config) -> ScenarioMeasurement {
+fn measure_append(run: &RunRoot, config: &Config) -> ScenarioMeasurement {
     let workload = representative_workload(config);
     let sample = SampleStore::new(run, "append");
     let mut store = Store::create(sample.path()).unwrap();
     let log: AppendLog<Vec<u8>> = store.create_data("changes").unwrap();
     let mut transactions = store.into_transactions();
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     for batch in workload.encoded.chunks(config.changes_per_transaction) {
         let transaction = transactions.begin().unwrap();
         log.access(transaction.access())
@@ -194,12 +196,12 @@ fn measure_append(run: &Run, config: &Config) -> ScenarioMeasurement {
     validate_log(sample.path(), "changes", &workload.encoded);
     ScenarioMeasurement {
         elapsed,
-        pages: config.transactions_per_sample,
+        pages: config.transactions_per_iteration,
         checksum: workload.order_checksum(),
     }
 }
 
-fn measure_full_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
+fn measure_full_replay(run: &RunRoot, config: &Config) -> ScenarioMeasurement {
     let workload = representative_workload(config);
     let sample = SampleStore::new(run, "full-replay");
     seed_log(sample.path(), "changes", &workload.encoded);
@@ -210,7 +212,7 @@ fn measure_full_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (pages, checksum) = scan_decoded(
         &access,
         workload.encoded.len(),
@@ -230,7 +232,7 @@ fn measure_full_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
     }
 }
 
-fn measure_projected_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
+fn measure_projected_replay(run: &RunRoot, config: &Config) -> ScenarioMeasurement {
     let fixtures = (0..config.total_changes())
         .map(|index| {
             projectable_fixture(
@@ -266,7 +268,7 @@ fn measure_projected_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin().unwrap();
     let access = log.access(transaction.access()).unwrap();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (pages, checksum) = scan_decoded(
         &access,
         encoded.len(),
@@ -286,7 +288,7 @@ fn measure_projected_replay(run: &Run, config: &Config) -> ScenarioMeasurement {
     }
 }
 
-fn measure_consumer(run: &Run, config: &Config) -> ScenarioMeasurement {
+fn measure_consumer(run: &RunRoot, config: &Config) -> ScenarioMeasurement {
     let workload = representative_workload(config);
     let sample = SampleStore::new(run, "consumer");
     let mut store = Store::create(sample.path()).unwrap();
@@ -304,7 +306,7 @@ fn measure_consumer(run: &Run, config: &Config) -> ScenarioMeasurement {
         transaction.commit().unwrap();
     }
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut offset = 0_u64;
     let mut pages = 0_usize;
     let mut checksum = 0_u64;
@@ -465,4 +467,56 @@ fn change_checksum(change: &Change) -> u64 {
 
 const fn mix(state: u64, value: u64) -> u64 {
     (state ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
+    let context = json!({
+        "benchmark": BENCHMARK,
+        "runner": "criterion",
+        "criterion_version": "0.8.2",
+        "profile": profile,
+        "result_directory": root.path().display().to_string(),
+        "host": HostEnvironment::collect(Some(root.filesystem_root())),
+        "configuration": {
+            "fixtures": ["heterogeneous_pages", "projectable"],
+            "rows_per_change": config.rows_per_change,
+            "changes_per_transaction": config.changes_per_transaction,
+            "transactions_per_iteration": config.transactions_per_iteration,
+            "changes_per_iteration": config.total_changes(),
+            "payload_bytes": config.payload_bytes,
+            "sample_size": config.sample_size,
+            "warm_up_time_ns": nanos(config.warm_up_time),
+            "measurement_time_ns": nanos(config.measurement_time),
+            "max_working_set_bytes": config.max_working_set_bytes,
+            "scenarios": [
+                "append_durable",
+                "full_replay",
+                "projected_replay",
+                "consumer_durable"
+            ],
+            "timing_scope": {
+                "append_durable": "transaction begin, append, and durable commit",
+                "full_replay": "paged AppendLog scan, full IPC decode, and checksum",
+                "projected_replay": "paged AppendLog scan, projected IPC decode, and checksum",
+                "consumer_durable": "transaction begin, input decode, raw output append, cursor update, and durable commit"
+            },
+            "fixture_and_validation": "outside_timing",
+            "execution": "single_thread",
+            "mdbx_sync_mode": "durable"
+        },
+    });
+    fs::write(
+        root.path().join("criterion-context.json"),
+        serde_json::to_vec_pretty(&context).expect("serialize Change + Store Criterion context"),
+    )
+    .expect("write Change + Store Criterion context");
+}
+
+fn is_cargo_bench() -> bool {
+    std::env::args_os().any(|argument| argument == "--bench")
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos())
+        .expect("Change + Store benchmark duration fits u64 nanoseconds")
 }

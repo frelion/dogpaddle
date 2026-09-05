@@ -1,261 +1,112 @@
-# DogPaddle 测试协议
+# DogPaddle 验证规范
 
-测试的目标不是覆盖实现行，而是用最少的独立证据锁住公共语义、持久格式、事务边界和性能口径。
-同一行为只保留一个最强所有者；测试辅助代码不得发展成第二套产品模型。
+DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边界或性能口径的证据。验证代码按产品所有权组织，不按 runner、实验阶段或历史入口组织；Git 历史是旧基础设施的唯一存档。
 
-## 四条证据轨道
+## 五类验证
 
-| 轨道 | 回答的问题 | 主要手段 |
-| --- | --- | --- |
-| 公共契约 | 调用者能否观察到承诺的行为与错误？ | `tests/correctness`、真实公共 API、失败后状态断言 |
-| 模型与变形 | 大量组合是否符合一个独立、可读的 oracle？ | 固定 seed、小模型、稳定重批、穷举小图 |
-| 格式与损坏 | 稳定字节能否互操作、重开并安全拒绝损坏？ | golden/raw layout、标准 reader、truncation、no-panic |
-| 事务与恢复 | commit、rollback、poison、进程死亡后是否只出现全旧或全新？ | 真实 MDBX、reopen、Store 层 SIGKILL、Flow 阶段恢复 |
+1. `crates/<owner>/src/**/tests.rs`：必须访问私有状态的单元测试、故障注入和独立算法 oracle。
+2. `crates/<owner>/tests/correctness.rs`：该产品 crate 唯一的公共测试 target，领域文件位于相邻的 `tests/correctness/`。
+3. `integration-tests/<seam>/`：仅用于没有产品组合根的 sibling seam。当前只有 `integration-tests/change-store/`。
+4. `system-tests/`：依赖真实 Java、Debezium 或 PostgreSQL 的系统验收。
+5. `crates/<owner>/benches/`：由 workload owner 直接拥有的 benchmark。
 
-性能测试是第五条独立轨道：它只测已经由 correctness 证明有效的 workload，不替代任何行为断言。
+不存在通用实验框架。准备合并的实验必须归入 correctness、system test 或 benchmark；否则留在临时分支。
 
-## 所有权
+产品 manifest 关闭自动 test、bench 和 example 发现，并显式声明保留的 target。产品 library 设置 `bench = false`。测试不得为了 fixture 扩张产品 API，也不得建立跨产品的测试 DSL、通用算子案例表或第二套运行模型。
 
-- `src/**/tests.rs` 只保存必须访问私有状态的不变量、错误注入和独立算法 oracle。能用公共 API
-  证明的行为必须放到公共 target。
-- 每个产品 crate 只有一个显式公共 target：`tests/correctness.rs`，领域文件位于
-  `tests/correctness/`。
-- Operation + Store 的组合由 Operation 拥有；Flow + Operation + Change + Store 的组合由 Flow
-  拥有。
-- Change 与 Store 是刻意独立的 sibling；它们唯一的外部接缝位于不可发布的
-  `integration-tests/change-store/`。
-- benchmark fixture、oracle 与计时边界归 workload 所有者。共享
-  `test-support/bench-protocol/` 只拥有 profile、运行目录、主机指纹、typed JSONL、统计和完成记录。
+## 证据所有权
 
-产品 manifest 关闭自动 test/bench 发现，显式声明 target；产品 library 设置 `bench = false`。
-测试不得为了注入 fixture 扩张产品 API，也不得引入万能 Store trait、persona DSL 或跨 crate test-utils。
+- Change 拥有 Schema、Change、Projection、Arrow IPC 字节格式、互操作、损坏拒绝和稳定事件顺序。
+- Store 拥有事务、能力边界、集合布局、分页、容量、reopen 和 crash consistency。
+- Operation 拥有 Operation + Store：Definition、稳定 tag/payload、bind、materialize、运行协议、状态和算子语义。
+- Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、资源装配、调度、claim、背压、回收、fail-stop、status 和 reopen。
+- Debezium 拥有 connector-neutral runtime、bundle、checkpoint、delivery 和 ACK 生命周期。
+- Change 与 Store 的外部组合只由 `integration-tests/change-store/` 证明。
 
-## 证据所有权与目标矩阵
+能通过公共 API 证明的行为不得留在白盒测试中。删除测试前必须指出更低层或更靠近 owner 的替代证据；测试数量和代码行数不是正确性指标。
 
-| 所有者 | 正确性所有权 | benchmark target |
-| --- | --- | --- |
-| Change | Schema、Change、Projection、IPC golden/interop/malformed；Date32、四种 Timestamp unit/timezone；Decimal128 的 full/projected/nested/标准 reader 与递归 value invariant | `change_core`、`change_codec` |
-| Debezium | secret-safe config、runtime bundle/JVM singleton、owned delivery、opaque checkpoint golden/malformed/multi-partition restore、linear ACK、preview/actual offset 等价、handle lifecycle；四平台 public lifecycle 与真实 PostgreSQL recovery gate 独立运行 | 不适用 |
-| Store | capability、事务、布局、集合、分页、容量、SIGKILL | `cell`、`ordered_map`、`append_log`、`append_log_endurance` |
-| Operation | 统一 `turn → PreparedTurn → AfterCommit` 协议及 borrowed linear delivery 跨事务证据；可运行 QueueScan 示例共用代码的初始化回滚、未 ACK 重放、提交前后 reopen 完整输出序列；十二个内建 Definition、tag/golden、exact Schema bind/materialize；DataFusion Expr protobuf 与已承诺 operator/type evaluate；Project/Extend/Select/SchemaAlign 共享、空 Select/SchemaAlign runtime Schema guard、Filter null/混合 diff 重批；Date32/Timestamp/Decimal128 的 direct-copy、精确 cast 与组合比较；UnionAll 多端口/runtime Schema guard；RunningEventCount 状态 commit/rollback/reopen；关系 Sink 共享的 canonical row/hash、固定 ID 批次、唯一 state 和跨目标数据库/MDBX commit 的幂等重放；SQLite 全部 v1 类型；PostgresSink 的 tag12 与非敏感资源边界 | `operation_core` |
-| Flow | build、单次 Store setup 的 open、拓扑 Schema 传播、Project/Filter/Extend/Select/SchemaAlign/UnionAll/SqliteSink/PostgresSink 拒绝无建库副作用与 reopen 重绑定；PostgresCdcScan/PostgresSink 精确运行资源；Date32/Timestamp/Decimal128 完整结构/表达式链两次 reopen；SQLite 表延迟初始化及端到端恢复；Claim 重放、Schema 违例回滚、`Turn::Idle`、Commit/Complete、AfterCommit commit-only 执行与 error/panic fail-stop/reopen、背压、reclaim、腐败状态 | `flow_lifecycle`、`flow_runtime` |
-| Change + Store | full/projected owned entry decode、decode poison 后 forwarding/cursor 回滚 | `change_append_log` |
+### Operation
 
-“不适用”不通过空 target 表示：D2 不建立 Criterion benchmark；真实 connector 的长稳、资源
-占用与 WAL retention 由 D5 pinned gate 所有。
+Operation 的公共测试采用垂直所有权：每个内建算子各有一个文件，自己拥有 literal golden、kind、data declaration、bind、materialize、runtime 和 reopen 证据。跨算子文件只保留：
 
-Debezium 的这一行是分层所有权，不表示所有行为都塞进 Rust 公共 correctness target：offline Rust
-gate 证明 config、target manifest、JRE 关键资源、nested JAR closure、checkpoint/delivery codec 与
-Rustdoc；Java component gate 证明 Engine handler、preview/actual、ACK 与 lifecycle；四个 native runner
-用只存在于临时解包目录的确定性 connector，在没有系统 Java 的环境中经公共 API 证明
-`open → start → poll(position 1) → Drop/原样重投 → ack → stop → checkpoint-only 重启 →
-poll(position 2 witness) → ack → stop`、owned record 投影、pre-ACK checkpoint 和从已接受位置继续；
-pinned PostgreSQL gate 最后只经公共 Rust API 证明同进程运行、unacked replay、checkpoint-only fresh
-Engine restore 与 eventual LSN。确定性 connector 不进入正式 distribution 或 runtime archive，也不代替
-真实 PostgreSQL 证据。
-四层证据必须分别报告，只有全部通过才满足 D2 exit。
+- `definition_codec`：外层 envelope、unknown tag 和通用损坏拒绝；
+- `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
+- `protocol`：`turn -> PreparedTurn -> AfterCommit` 与事务协议；
+- `metamorphic`：稳定重批和独立模型。
 
-## PostgreSQL CDC Scan 的显式验收
+生产 decoder registry、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 registry 反向生成期望值。
 
-Operation 公共 `correctness/postgres_cdc.rs` 拥有 tag11 canonical JSON golden、声明布局、exact Schema、
-临时资源类型/脱敏、初始化与 checkpoint 恢复/回滚/reopen 不启动外部资源，以及损坏 checkpoint
-拒绝；源码同目录 `tests.rs` 只拥有私有 Connect JSON 转换及大文本/binary/null 的稳定重批。
-checkpoint codec 本身归 Debezium，不维护另一套 Scan 编码。Flow 公共 `correctness/postgres_cdc_scan.rs` 拥有资源
-缺失/错误/重复/多余的无目录副作用、准确 Station ID、Schema 拒绝、build/open 与资源布局。
+### Flow
 
-真实 Engine 与 PG 不进入普通 Cargo gate。显式执行：
+Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
-```sh
-python3 tools/check_postgres_cdc.py \
-  --bundle /absolute/path/to/dogpaddle-debezium-runtime-aarch64-apple-darwin \
-  --postgres-bin /absolute/path/to/postgresql/bin \
-  --keep
-```
+Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 status 证据必须保留。
 
-需要 Python 3.9+、本机 PostgreSQL 15+ 的 `initdb/pg_ctl/postgres/psql` 和匹配 target 的已构建 runtime
-payload。脚本创建独占临时 cluster、随机 loopback 端口和测试表/slot/publication，不连接已有服务；
-无论成败都停止它自己的 cluster。`--keep` 或失败保留目录和日志，成功且无 `--keep` 才删除本次 fixture。
+### 私有测试拆分
 
-`crates/flow/examples/postgres_cdc.rs` 是公共 API JSONL host：Flow 模式证明 PG→SQLite 的完整
-insert/update/delete、类型映射与进程 reopen；直接 Operation+Store 模式验证 checkpoint/output
-单次原子提交、rollback/背压时二者均不变、提交后 ACK 前退出，以及 checkpoint-only fresh Engine。
-2050 行单 PG 事务跨越 1024 条批量边界，首批提交后 ACK 前退出并 reopen，后继 witness 验证完整
-事件顺序且无重漏。`flow-pg` 模式再证明同一个 PG 实例、同一个 database 内的 Scan→PG Sink：
-2050 行跨批、首批 PG 已提交而本地仍 Prepared 时进程终止、reopen 后技术 ID 不变、update/delete 与后继 witness，
-publication 只包含源表，目标不会反馈进源。上述均为 correctness 验收，不是吞吐或延迟 benchmark。它不是产品故障注入
-接口，也不是第二套运行层。结果必须报告实际 PG/Rust/runtime 版本；本机 PG17 证据不能冒充既有
-Linux digest-pinned PG16.15 D1/D2 gate，D5 的长稳、fencing、升级与发布门仍独立开放。
+每个源码模块目录只有一个 `tests.rs` 入口。超大模块可在同目录的 `tests/` 下按完整领域拆分；不要按每个生产源码文件建立镜像目录。当前较大的分区为：
 
-## PostgreSQL Sink 的显式验收
+- Station：`support`、`layout`、`claim`、`transaction`、`completion`；
+- Change codec：`support`、`schema`、`projection`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
+- SQLite Sink：`row`、`target`。
 
-Operation 公共 `correctness/postgres_sink.rs` 冻结 tag12 canonical JSON、非敏感 Definition、Sink/1
-kind、唯一 `relation_sink.state: Cell<Vec<u8>>`、exact Schema/target spec、精确
-`PostgresSinkConfig` 资源类型，以及首 turn rollback/丢弃 completion 不访问目标。Flow 公共
-`correctness/postgres_sink.rs` 拥有缺失/错误资源的无目录副作用、准确 Station ID、Schema 纯拒绝，
-以及 build/open 离线装配和稳定 state 资源路径。共享 `sink/relation/tests.rs` 拥有版本化 Initialize/Ready/
-Prepared state codec、批量规划与恢复的私有不变量；各数据库同目录 `tests.rs` 拥有 target SQL/类型映射。
-PostgreSQL 私有测试还以静默 TCP peer 锁住完整握手 deadline，并覆盖缺失 schema、已有 `pg_class`、
-同名 `pg_type` 与 nested List/Struct canonical `bytea`。
+## 正确性证据准入
 
-普通 Cargo gate 不启动或连接 PostgreSQL。显式本机 gate 执行：
+每个持久化协议至少具有：
 
-```sh
-python3 tools/check_postgres_sink.py \
-  --postgres-bin /absolute/path/to/postgresql/bin
-```
+1. literal golden 或独立 raw-layout 断言；
+2. decode、open 和 reopen；
+3. 不复用生产算法的语义或互操作 oracle；
+4. malformed/corruption 拒绝，无 panic、无部分写入；
+5. 精确资源名、类型、Size/codec 和失败后状态。
 
-脚本需要 Python 3.9+ 与本机 PostgreSQL 15+ 的 `initdb/pg_ctl/postgres/psql`，并自行构建公共
-`SequenceScan → PostgresSink` Flow host，以及 Operation 所有的 `postgres_sink_recovery` 公共协议
-host。只创建 loopback 临时 cluster、Flow 和 Store，不连接已有服务，无论成败都停止自己的 cluster。
+持久化定义或布局变更必须同时覆盖成功构建、纯校验失败无文件副作用、不完整构建、稳定编码、资源布局和重新打开。项目不识别、迁移或兼容未发布的旧格式；旧数据库直接删除并重建。
 
-- Flow：目标锁超时使目标事务整笔回滚、AfterCommit fail-stop、reopen；PG 已提交而 MDBX
-  仍 Prepared 时再次杀进程。最终三个 UInt64 最大值区间内的记录精确各出现一次，技术 ID 不变。
-- Operation：16,385 重复行跨 1024 上限插入及完整撤回；Prepared 提交而 PG 尚未写入、PG 已写入而
-  MDBX 尚未结算两个窗口；prepare/settlement rollback；不足额和非法负前缀拒绝无部分效果；普通
-  planning error 后同一运行实例重试；最小 ID 匹配和交替正负事件。同批插入后删除同一 ID，
-  PG 提交后杀进程，reopen 重放全部 insert/delete 后仍为空表。
-- PG 参数类型与边界：NULL、嵌入 NUL 的 Utf8、UInt64 最大值、NaN payload、负零、各标量存储
-  family，reopen 后精确撤回；零列与 1598 列，宽表按参数上限拆成同一事务内的小语句。
-- 实际服务端 statement 日志锁住批量执行：16,385 insert/delete 的完整恢复场景加混合批次重放，
-  合计 20 条 INSERT、21 条 DELETE。另以 1,000 条不同记录的 `-old,+new` 交错更新，证明只需
-  2 条批量匹配 SELECT、2 条 INSERT、2 条 DELETE，目标值与技术 ID 精确吻合；1598 列的 80 行插入
-  按参数上限拆成 2 条语句。
-- 大额负事件的首次足额检查与 continuation 不重复检查，由共享规划测试证明。PG 查询把完整计数
-  放在条件分支中，不能按 SQL 文本出现 `count` 的次数推断实际扫描次数。运行耗时只用于诊断，
-  上述 statement 数量不是吞吐或延迟 benchmark。
+普通 correctness 测试不得依赖 wall-clock 断言、系统 Java 或外部 PostgreSQL。没有覆盖率或代码行数 CI 阈值。
 
-`.github/workflows/debezium-postgres.yml` 在产品 crate 或两份 gate 脚本变动时，先运行原 digest-pinned
-D1/D2 gate，再复用其 native runtime payload 执行 Scan、同 PG 往返和 Sink gate；native server 为
-Ubuntu 包提供的 PG16，输出实际版本，不混同 pinned container 的证据。普通 Cargo gate 仍离线。
-上述不代表 TLS、初始 snapshot、在线 Schema evolution、fencing 或生产长稳已经验收。
+## 性能所有权
 
-## Change + Store 的最小接缝
+`test-support/perf-context/` 只提供：
 
-组合包只保留两个不能由 Change 与 Store 各自的证明组合推出的 witness：
+- `PerformanceProfile`；
+- `RunRoot`；
+- `HostEnvironment`；
+- `require_release_build`。
 
-1. nested、variable-width、非零 Arrow slice offset 的 full/projected decode 在 entry transaction
-   结束后仍然 owned；
-2. corrupt Change decode poison 同一 Store transaction，并回滚已经发生的 forwarding/cursor 写入。
+共享层不得拥有 case、plan、registry、scheduler、统一结果 schema、validator 或 report。每个 owner 自己定义 workload、seed、预热、正确性断言和结果字段。
 
-稳定重批属于 Change/Operation；AppendLog paging、计费、truncate、reopen、crash 和 endurance
-属于 Store。组合包不得重建这些矩阵。
+| Target | Runner 与必须保留的口径 |
+| --- | --- |
+| `change_core` | Criterion |
+| `change_codec` | Change 自有五路旋转 runner |
+| `cell` | Criterion |
+| `ordered_map` | Store 自有 AB/BA paired runner |
+| `append_log` | Store 自有 AB/BA/BA/AB counterbalanced runner |
+| `append_log_endurance` | Store 自有 streaming runner |
+| `flow_lifecycle` | Criterion |
+| `flow_runtime` | Flow 自有逐采样 `advance` latency trace |
+| `change_append_log` | Criterion |
 
-## 持久化变更的最低证据
+自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。配对 benchmark 不得由两个独立 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出；endurance 必须流式写出样本。
 
-每个稳定协议至少需要：
+Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode；自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
-1. 写侧 golden 或独立 raw layout 断言；
-2. 读侧 decode/open/reopen；
-3. 一个不复用生产算法的语义或互操作 oracle；
-4. malformed/corruption 拒绝且无 panic、无部分写入；
-5. 精确资源名、类型、size/codec 与失败后状态。
+性能环境只有两个入口：
 
-Expression golden 直接冻结当前精确 pin 的 DataFusion Expr protobuf bytes，并继续经过
-`decode → exact Schema bind → materialize → turn`，验证 `create_physical_expr`、type/nullability 与
-scalar/array evaluate。该格式不承诺跨 DataFusion 版本兼容；升级 DataFusion、`datafusion-proto` 或
-Arrow 时必须更新当前 golden，并重跑 proto roundtrip、build/open/reopen 和执行语义。旧数据库直接
-删除并重建；测试不约束旧 payload 或旧 manifest 的行为。
+- `DOGPADDLE_PERF_PROFILE=smoke|reference`：必填；
+- `DOGPADDLE_PERF_ROOT=/absolute/path`：reference 必填且必须是绝对固定目录，smoke 可省略。
 
-内建算子的 conformance 使用同一证据形状，不按算子复制测试框架：codec/postgres/postgres_sink 分区冻结十二个 tag、
-canonical payload 与损坏拒绝，definition 分区覆盖 kind/arity/data 和 exact Schema 成功/拒绝，runtime
-分区覆盖线性 turn、Action、diff/顺序、buffer sharing、错误与重批，Flow 组合根再覆盖提交前
-completion 丢弃、提交后执行、post-commit fail-stop、纯失败无目录副作用、
-稳定资源名、build/open/reopen 和运行期 Schema guard。RunningEventCount 的公共 API 与 data 资源名
-采用当前简化基线：Definition tag 为 `2`，逻辑 data 名为 `running_event_count.count`。不保留旧 API
-alias、资源路径 fallback 或迁移；正确性不约束旧库行为，只证明当前 golden、当前资源布局和当前
-数据库的 build/open/reopen，旧数据库直接删除后重建。
+fixture、seed、预热和结果校验必须位于计时外。全部 runner 记录 profile、rustc、CPU、OS、git revision/dirty state 和实际结果目录。reference baseline 以采集提交为 epoch；不同 epoch、代码、rustc、机器、profile、文件系统或 workload 的数字不可直接比较。
 
-SchemaAlign 的最低专用证据为 tag `9` golden、metadata canonical 编码与重复 key 构造拒绝、所有
-表达式绑定同一原始 input、显式 `cast`/`try_cast`、non-null → nullable 放宽、nullable → non-null 纯拒绝、空字段 output、
-直接列与 diff 共享，以及 Flow reopen。表达式断言必须标明“已承诺”“DataFusion 当前可规划但未承诺”
-或“明确拒绝”；只有第一类可以进入用户 API 能力。Date32/Timestamp/Decimal128 首先由 Change 的
-Schema/IPC/interop/malformed 轨道证明稳定传输；Operation 再用三个公共测试分别证明 direct-copy、
-SchemaAlign 精确 cast/nullability 与 Filter 组合比较，且每个都走
-`encode → decode → re-encode → bind → materialize → turn` 并核对 buffer/diff/顺序。Flow 组合根证明
-`SequenceScan → SchemaAlign → Project → Select → Extend → Filter → RunningEventCount → Discard` 在 build 与
-两次 reopen 后最终 count 为 `3`。这一承诺严格限于 Date32、无 timezone 的 Millisecond Timestamp、
-`Decimal128(10, 2)` 及测试中的 cast/comparison；其他时间/Decimal 运算、unit/timezone、舍入或 cast
-不能从中推导。
+## 标准命令
 
-Decimal128 value 证据独立于表达式算术：`Change::try_new`、full decode 和选中该字段的 projected
-decode 递归拒绝任意 non-null slot 的 `|unscaled| >= 10^precision`，包括被 null List/Struct 祖先
-遮蔽但物理存在的 non-null child；未选择字段的 value 不读取也不验证。测试同时覆盖顶层与嵌套、
-构造与 codec 错误，不把这条 representability invariant 扩展为舍入或算术语义。
-
-关系 Sink 共同冻结唯一 `relation_sink.state` 的 Initialize/Ready/Prepared bytes、canonical row 与
-128-bit hash。Prepared 只保存 ID 分配上界、插入行位置与固定 ID、删除 ID 和 continuation，不复制
-完整输入、不保存 delivery/digest、不依赖远端回执。恢复矩阵必须覆盖 MDBX 已持久化 Prepared 但目标
-未提交，以及目标已提交但 MDBX 未结算两个窗口；初始化与批量 insert/delete 均可重放。全部目标 I/O
-必须在 MDBX 写事务外；丢弃 apply transaction 不执行 completion，AfterCommit error/panic 必须 fail-stop/reopen。
-两个目标提交间不能重新匹配删除 ID 或重新分配插入 ID；只有 MDBX 结算才推进 continuation 或完成 Flow claim。
-每批最多 1024 个动作，输入前缀验证保序，目标事务统一先插入再删除，不承诺目标 WAL 的逐条物理顺序。
-
-SQLite Sink 另冻结 tag 10 Definition payload 与目标布局。
-布局证据还覆盖零/1998/1999 列、标识符转义和冲突、全部 Arrow v1 类型、嵌套/nullable/浮点 bit pattern、
-hash 碰撞、重复行最小 ID、正负 multiplicity、`i64::MIN`、ID 耗尽与稳定重批。Flow build/open 不得
-打开 SQLite 或创建目标表；首次运行才允许初始化。
-
-PostgreSQL Sink 另冻结 tag12 canonical JSON、exact Schema 与精确运行资源类型。
-离线测试必须证明 Definition 不持久化 runtime secret、
-resource/Schema 错误先于建库、build/open 不访问 PG、rollback 或丢弃 `AfterCommit` 不产生远端动作。
-真实 gate 必须在 PG 批次事务提交、MDBX 仍停在 Prepared 的窗口杀死进程，证明 reopen 对相同 ID
-重发幂等 INSERT/DELETE 后结果不变。扩展类型或故障点时应增强同一脚本，而不是在普通 Cargo gate
-偷偷依赖本机服务。
-
-Store 层用一组多对象 transaction、drop/poison、snapshot、read-your-writes 与 SIGKILL 测试证明物理
-原子性。上层只重复自己的协议阶段、对象组合和 reopen 义务，不为每个 crate 复制 SIGKILL harness。
-
-Flow 公共 `correctness/status.rs` 证明只读 status 不启动外部资源、不推进游标，单一 snapshot 的
-input/output counters 一致，能看到整轮 Progressed 下的 Station Backpressured，并在 reopen 后
-保留 durable counters、清除内存 outcome。已有 fail-stop 私有故障测试同时验证 status 仍可读、
-下一轮预检失败不会保留上一轮 outcome。
-
-## Benchmark 协议
-
-全部 10 个 target 是独立 release 进程，只有两个统一设置：
-
-- `DOGPADDLE_BENCH_PROFILE=smoke|reference`：选择 owner 内固定、不可拼出非法组合的规模。
-- `DOGPADDLE_BENCH_ROOT=/absolute/path`：reference 的固定文件系统根；smoke 默认使用临时目录。
-
-不接受逐维环境变量。fixture、seed、预热、结果 oracle 和文件清理必须位于计时外。普通测试禁止
-wall-clock 断言。持久化 reference 必须报告实际文件系统路径；所有 target 报告 rustc、OS/kernel、
-CPU、Cargo profile、git revision/dirty state 和实际配置。
-
-stdout 的 machine records 使用唯一的 typed JSONL `Record` 枚举。每个 target 必须依次产生：
-
-1. 一个 `run`，声明环境、配置、按稳定 series 排序的完整 cases/observations 及各自精确数量；
-2. 只携带紧凑 plan ID、连续 index 和 raw facts 的 `sample | observation`；
-3. 唯一且位于末尾的 `completion`。
-
-通用 validator 拒绝未知字段、非法 label、错误 identity/profile、非 canonical plan、越界或乱序 ID、
-缺失/重复/额外记录，以及 completion 后的任何 machine record；它不解释 owner payload。
-每个 target 邻接的 `<target>.plan.json` 另外冻结 smoke/reference 两档纯 Plan 的 case/observation 数量、
-canonical byte length 与稳定 128-bit fingerprint。正常执行不读取 golden，而是消费预先冻结的同一组
-plan IDs；`finish` 因而能拒绝漏跑。`cargo xtask bench-plan-check` 从 Cargo metadata 发现全部 target，
-只构造两档 Plan、不创建 fixture 或开始计时，再与独立 golden 比较。`cargo xtask bench-smoke` 逐进程
-真实执行 smoke workload，并同时验证 smoke golden 与完整输出；新增 target 不维护第二份 target 清单。
-
-常规 benchmark 的 machine stream 只保留原始样本，进程内人类表格报告派生统计；pair/side 属于
-run plan，两个 case 的相同 sample index 无损表达一一对应关系。Operation 的 per-operation 耗时由
-`elapsed_ns / operations` 派生；Flow runtime 的总耗时、速率和分位数由 sample `elapsed_ns`、静态 work
-counts 与 `round_latencies_ns` 派生，不重复写回 machine fields。AppendLog 长稳的 append/truncate
-事务也是普通 duration cases；checkpoint observations 保留状态与文件大小，terminal observations 只补充
-raw samples 无法导出的 wall elapsed 和最终 reopen checksum，其精确数量均在 run plan 中声明。
-p50/p95/p99/max、吞吐、peak 和 tail spread 均从这些 raw facts 派生并显示在人类 summary。正式前后
-对比只能使用相同代码协议版本、rustc、机器、profile、文件系统和 workload；不设置机器相关的 CI
-wall-clock 阈值。
-
-## Canonical gates
-
-本地和 pinned MSRV CI：
+唯一工作区入口：
 
 ```bash
 cargo xtask check
-cargo xtask bench-plan-check
-cargo xtask bench-smoke
 ```
 
-`cargo xtask check` 依次运行：
+它等价于：
 
 ```bash
 cargo fmt --all -- --check
@@ -265,56 +116,64 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```
 
-CI 另用最新 stable 运行一次 debug workspace tests，证明前向兼容。常用定向命令：
+常用定向 correctness 命令：
 
 ```bash
 cargo test -p dogpaddle-store --test correctness transaction::
 cargo test -p dogpaddle-flow --test correctness runtime_corruption::
 cargo test -p dogpaddle-change-store-integration
-cargo bench -p dogpaddle-flow --bench flow_runtime
 ```
 
-`dogpaddle-debezium` 的普通 Rust gate 属于上述 workspace check，不能调用 Maven、下载 Java
-artifact、联网或要求本机存在 JDK。Java 与 bundle gate 是显式命令：
+性能 test mode 与 smoke：
 
 ```bash
-crates/debezium/scripts/build-distribution.sh
-crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
-experiments/debezium-d1/scripts/run.sh
+cargo test --workspace --benches --locked
+
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench change_codec
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log_endurance
 ```
 
-`build-distribution.sh` 只使用本机 Maven 与 JDK。
-[`Debezium runtime bundles`](.github/workflows/debezium-runtime.yml) workflow 在 Ubuntu
-上构建并测试一次 Java distribution，同时单独构建 test-only lifecycle connector；
-Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个原生
-runner 下载同一产物，再分别构建 Rust probe 和 runtime payload。每个 runner 将 archive 解压到含
-空格的新路径，用 `crates/debezium/scripts/install-lifecycle-probe.sh` 把
-`crates/debezium/bridge/probe/` 产出的确定性 connector 只注入该临时副本并重算
-`debezium/SHA256SUMS`，然后清空 Java 相关环境、动态库搜索路径和系统 `PATH`，经
-`crates/debezium/examples/bundled_runtime_probe.rs` 与公共 API 完成
-`open → start → poll(position 1) → Drop/原样重投 → ack → stop → checkpoint-only 重启 →
-poll(position 2 witness) → ack → stop`。它同时校验 topic、partition、timestamp、key、value、headers
-和 pre-ACK checkpoint，并以第二条确定性记录证明新 Connector 从已接受位置继续而不是重放第一条。
-上传的 runtime archive 不包含 probe connector、Rust probe
-或其他宿主 executable。
+## 系统验收
 
-真实 PostgreSQL 顺序、ACK、replay、checkpoint restore 与 eventual LSN 矩阵仍由 Linux x86_64
-D1 gate 独立拥有。D1 分别只读挂载 Rust diagnostic host 与 runtime payload，并用 payload 内 JVM
-在同一进程运行；它不依赖系统 Java。
-[`Debezium PostgreSQL recovery`](.github/workflows/debezium-postgres.yml) workflow 在相关 PR、
-`main` 变更、每周定时与手动触发时，于 Ubuntu 24.04 直接运行
-`experiments/debezium-d1/scripts/run.sh`；它无论成功还是失败都执行 artifact 上传，其中包含当次
-已产生的环境、checkpoint/fixture 状态与日志。
-普通 Rust、Java component、四平台 bundle lifecycle 和 D1 PostgreSQL gate 都通过才构成 D2 证据。
+普通 Cargo gate 保持离线。真实系统入口为：
 
-## 新增或删除测试
+```bash
+system-tests/debezium-postgres/scripts/check.sh
+python3 system-tests/postgres/check_cdc.py \
+  --bundle /absolute/path/to/runtime-bundle \
+  --postgres-bin /absolute/path/to/postgresql/bin
+python3 system-tests/postgres/check_sink.py \
+  --postgres-bin /absolute/path/to/postgresql/bin
+```
 
-新增测试前依次问：
+`system-tests/debezium-postgres/host` 是独立 Cargo workspace 和 lockfile，只依赖 Debezium crate，作为真实外部消费者。它不进入根 workspace。脚本接口固定为：
 
-1. 它锁住了哪个尚无证据的公共承诺或故障边界？
-2. 最强所有者是谁？能否扩展现有 fixture/table/property，而不是新建 framework？
-3. expected 是否独立于被测实现？失败时能否定位到一个契约？
-4. 如果它只是更弱测试的重复，是否应替换旧测试而不是叠加？
+```text
+scripts/check.sh
+scripts/run.sh --bundle ABSOLUTE_PATH --host ABSOLUTE_PATH [--artifacts-dir ABSOLUTE_PATH]
+scripts/clean.sh
+```
 
-代码重构后，若公共 correctness 已经更强地蕴含某个白盒 witness，应删除白盒版本。golden、独立
-model、malformed/no-panic、真实 reopen/crash 和 compile-fail capability 证据不能仅为减少数量而删除。
+`check.sh` 完成本机全流程；`run.sh` 只运行已有产物，不构建、不下载。Debezium/JRE 上游源码字符串审计通过
+`crates/debezium/scripts/audit-upstream-contract.sh` 只在 pin 升级时由升级者显式执行，不属于 D1 的
+`check.sh`、`run.sh` 或日常 CI workflow。
+
+根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink 和 Sink recovery 三个 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 使用。
+两个 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的全部 release bins；CI 传入
+`--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。
+
+PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。
+
+## 新增或删除验证
+
+提交前回答：
+
+1. 它锁住了哪个尚无证据的当前承诺或故障边界？
+2. 最强 owner 是谁，能否扩展现有领域文件？
+3. expected 是否独立于被测实现，失败能否定位到一个契约？
+4. 它若只是更弱证据的重复，是否应替换旧测试？
+
+golden、独立 model、malformed/no-panic、真实 reopen/crash 和 capability 证据不能仅为减少数量而删除。反之，无法归类或没有独立 claim 的验证不得进入主仓库。

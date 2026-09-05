@@ -8,6 +8,7 @@
 /rust-toolchain.toml @frelion
 /tools/ @frelion
 /test-support/ @frelion
+/system-tests/ @frelion
 
 # Product and cross-product ownership boundaries.
 /crates/change/ @frelion

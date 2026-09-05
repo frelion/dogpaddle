@@ -6,6 +6,7 @@ rust-version.workspace = true
 readme = "README.md"
 autotests = false
 autobenches = false
+autoexamples = false
 
 [lib]
 bench = false
@@ -33,7 +34,6 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
-dogpaddle-bench-protocol.workspace = true
 tempfile.workspace = true
 
 [[test]]
@@ -43,16 +43,6 @@ path = "tests/correctness.rs"
 [[example]]
 name = "queue_scan"
 path = "examples/queue_scan.rs"
-
-[[example]]
-name = "postgres_sink_recovery"
-path = "examples/postgres_sink_recovery.rs"
-
-[[bench]]
-name = "operation_core"
-path = "benches/operation_core.rs"
-harness = false
-test = false
 
 [lints]
 workspace = true

@@ -1,20 +1,26 @@
-//! Arrow IPC encoding and full or selective decoding scenarios for `Change`.
+//! Owner-local rotating JSONL measurements for Change's Arrow IPC codec.
 
-use std::{hint::black_box, sync::Arc};
+use std::{
+    hint::black_box,
+    io::{self, BufWriter, Write},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use dogpaddle_bench_protocol::{BenchmarkProfile, CaseId, Plan, Run};
 use dogpaddle_change::{
     Change, ChangeProjection, decode_change, decode_change_projected, encode_change,
 };
+use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
+use serde_json::{Value, json};
 
-use support::{
-    fixture::{Fixture, fixtures},
-    runner::{Config, FixturePlan, Timed, plan_fixtures, record, timed},
-};
+use support::fixture::{DEFAULT_WORKLOADS, Fixture, fixtures, validate_dimensions};
 
 mod support;
 
 const BENCHMARK: &str = "change_codec";
+const RECORD_SCHEMA: &str = "dogpaddle.change-codec.v1";
+const SMOKE_ROWS: &[usize] = &[4];
+const REFERENCE_ROWS: &[usize] = &[1, 64, 1_024, 16_384];
 const SCENARIOS: &[&str] = &[
     "encode",
     "decode_full",
@@ -22,6 +28,43 @@ const SCENARIOS: &[&str] = &[
     "decode_narrow",
     "decode_identity",
 ];
+
+struct Config {
+    rows: &'static [usize],
+    payload_bytes: usize,
+    samples: usize,
+    target_rows: usize,
+    max_changes: usize,
+    workloads: Vec<String>,
+}
+
+impl Config {
+    fn for_profile(profile: PerformanceProfile) -> Self {
+        let (rows, payload_bytes, samples, target_rows, max_changes) = match profile {
+            PerformanceProfile::Smoke => (SMOKE_ROWS, 16, 1, 4, 1),
+            PerformanceProfile::Reference => (REFERENCE_ROWS, 1_024, 9, 65_536, 1_024),
+        };
+        let workloads = DEFAULT_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_owned())
+            .collect::<Vec<_>>();
+        for &rows in rows {
+            validate_dimensions(rows, payload_bytes, &workloads);
+        }
+        Self {
+            rows,
+            payload_bytes,
+            samples,
+            target_rows,
+            max_changes,
+            workloads,
+        }
+    }
+
+    fn iterations(&self, rows: usize) -> usize {
+        self.target_rows.div_ceil(rows).clamp(1, self.max_changes)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum CodecMode<'fixture> {
@@ -31,10 +74,15 @@ enum CodecMode<'fixture> {
 }
 
 struct CodecCase<'fixture> {
-    id: CaseId,
+    scenario: &'static str,
     mode: CodecMode<'fixture>,
-    warm_checksum: Option<u64>,
-    measurements: Vec<Timed>,
+    warm_checksum: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Timed {
+    elapsed: Duration,
+    checksum: u64,
 }
 
 impl CodecMode<'_> {
@@ -50,38 +98,71 @@ impl CodecMode<'_> {
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
-    let config = Config::load(profile);
-    let mut plan = Plan::new(profile, config.fields());
-    let plans = plan_fixtures(&mut plan, &config, SCENARIOS);
-    let mut run = Run::memory(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
+    if !std::env::args_os().any(|argument| argument == "--bench") {
         return;
     }
-    let mut plans = plans.iter();
-    for &rows in &config.rows {
+    require_release_build(BENCHMARK);
+    let profile = PerformanceProfile::from_environment();
+    let config = Config::for_profile(profile);
+    let root = RunRoot::for_profile(BENCHMARK, profile);
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    emit(
+        &mut output,
+        &json!({
+            "schema": RECORD_SCHEMA,
+            "record": "context",
+            "benchmark": BENCHMARK,
+            "profile": profile,
+            "result_directory": root.path().display().to_string(),
+            "host": HostEnvironment::collect(Some(root.filesystem_root())),
+            "configuration": {
+                "rows_per_change": config.rows,
+                "payload_bytes": config.payload_bytes,
+                "samples_per_fixture": config.samples,
+                "target_rows_per_sample": config.target_rows,
+                "max_changes_per_sample": config.max_changes,
+                "workloads": config.workloads,
+                "scenarios": SCENARIOS,
+                "execution": "single_thread",
+                "cache": "warm",
+                "validation": "outside_timing",
+                "sample_order": "five_way_rotating_first",
+            },
+        }),
+    );
+
+    let mut fixture_count = 0_usize;
+    let mut sample_count = 0_usize;
+    for &rows in config.rows {
         for fixture in fixtures(rows, config.payload_bytes, &config.workloads) {
-            benchmark_fixture(
-                &config,
-                &fixture,
-                plans.next().expect("one frozen plan per Change fixture"),
-                &mut run,
+            eprintln!(
+                "{BENCHMARK}: workload={} rows={rows} samples={}",
+                fixture.name, config.samples
             );
+            sample_count += benchmark_fixture(&config, &fixture, &mut output);
+            fixture_count += 1;
         }
     }
-    assert!(
-        plans.next().is_none(),
-        "all Change fixture plans are consumed"
+    emit(
+        &mut output,
+        &json!({
+            "schema": RECORD_SCHEMA,
+            "record": "complete",
+            "benchmark": BENCHMARK,
+            "profile": profile,
+            "fixtures": fixture_count,
+            "paired_samples": sample_count,
+        }),
     );
-    run.finish(|| {});
+    output.flush().expect("flush Change codec JSONL");
+    eprintln!("{BENCHMARK}: complete fixtures={fixture_count} paired_samples={sample_count}");
 }
 
-fn benchmark_fixture(config: &Config, fixture: &Fixture, plan: &FixturePlan, run: &mut Run) {
+fn benchmark_fixture(config: &Config, fixture: &Fixture, output: &mut impl Write) -> usize {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
     let encoded = encode_change(&fixture.change).expect("encode valid benchmark fixture");
-    plan.observe(run, fixture, encoded.len());
     let schema = fixture.change.schema();
     let diff_only = ChangeProjection::try_new(Arc::clone(&schema), [])
         .expect("construct diff-only benchmark projection");
@@ -92,59 +173,70 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, plan: &FixturePlan, run
         .expect("construct identity benchmark projection");
 
     validate_fixture(fixture, &encoded, &diff_only, &narrow, &identity);
-    let mut cases = vec![
-        CodecCase {
-            id: plan.case("encode"),
-            mode: CodecMode::Encode(&fixture.change),
-            warm_checksum: None,
-            measurements: Vec::with_capacity(config.samples),
-        },
-        CodecCase {
-            id: plan.case("decode_full"),
-            mode: CodecMode::DecodeFull(&encoded),
-            warm_checksum: None,
-            measurements: Vec::with_capacity(config.samples),
-        },
-        CodecCase {
-            id: plan.case("decode_diff_only"),
-            mode: CodecMode::DecodeProjected(&encoded, &diff_only),
-            warm_checksum: None,
-            measurements: Vec::with_capacity(config.samples),
-        },
-        CodecCase {
-            id: plan.case("decode_narrow"),
-            mode: CodecMode::DecodeProjected(&encoded, &narrow),
-            warm_checksum: None,
-            measurements: Vec::with_capacity(config.samples),
-        },
-        CodecCase {
-            id: plan.case("decode_identity"),
-            mode: CodecMode::DecodeProjected(&encoded, &identity),
-            warm_checksum: None,
-            measurements: Vec::with_capacity(config.samples),
-        },
-    ];
+    emit(
+        output,
+        &json!({
+            "schema": RECORD_SCHEMA,
+            "record": "fixture",
+            "workload": fixture.name,
+            "rows_per_change": rows,
+            "operations_per_measurement": iterations,
+            "encoded_bytes_per_change": encoded.len(),
+            "narrow_fields": fixture.narrow_fields,
+        }),
+    );
 
-    // Warm every case independently before collecting paired samples. Rotating
-    // the first case in each sample avoids consistently favouring one mode.
-    for case in &mut cases {
-        let warm = case.mode.measure(iterations);
-        black_box(warm.checksum);
-        case.warm_checksum = Some(warm.checksum);
-    }
+    let modes = [
+        CodecMode::Encode(&fixture.change),
+        CodecMode::DecodeFull(&encoded),
+        CodecMode::DecodeProjected(&encoded, &diff_only),
+        CodecMode::DecodeProjected(&encoded, &narrow),
+        CodecMode::DecodeProjected(&encoded, &identity),
+    ];
+    let cases = SCENARIOS
+        .iter()
+        .zip(modes)
+        .map(|(&scenario, mode)| {
+            let warm = mode.measure(iterations);
+            black_box(warm.checksum);
+            CodecCase {
+                scenario,
+                mode,
+                warm_checksum: warm.checksum,
+            }
+        })
+        .collect::<Vec<_>>();
+
     let case_count = cases.len();
     for sample in 0..config.samples {
+        let mut measurements = Vec::with_capacity(case_count);
         for position in 0..case_count {
             let index = (sample + position) % case_count;
-            let measurement = cases[index].mode.measure(iterations);
-            assert_eq!(measurement.checksum, cases[index].warm_checksum.unwrap());
-            cases[index].measurements.push(measurement);
+            let case = &cases[index];
+            let measurement = case.mode.measure(iterations);
+            assert_eq!(measurement.checksum, case.warm_checksum);
+            measurements.push(json!({
+                "scenario": case.scenario,
+                "execution_position": position,
+                "elapsed_ns": nanos(measurement.elapsed),
+                "checksum": measurement.checksum,
+            }));
         }
+        emit(
+            output,
+            &json!({
+                "schema": RECORD_SCHEMA,
+                "record": "sample",
+                "workload": fixture.name,
+                "rows_per_change": rows,
+                "operations": iterations,
+                "sample": sample,
+                "first_scenario": cases[sample % case_count].scenario,
+                "measurements": measurements,
+            }),
+        );
     }
-
-    for case in cases {
-        record(run, case.id, &case.measurements);
-    }
+    config.samples
 }
 
 fn validate_fixture(
@@ -205,4 +297,29 @@ fn decoded_checksum(change: &Change) -> u64 {
     rows.wrapping_mul(31)
         .wrapping_add(columns.wrapping_mul(17))
         .wrapping_add(first_diff)
+}
+
+fn timed(iterations: usize, mut operation: impl FnMut() -> u64) -> Timed {
+    let mut checksum = 0_u64;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        checksum = checksum.wrapping_add(operation());
+    }
+    black_box(checksum);
+    Timed {
+        elapsed: started.elapsed(),
+        checksum,
+    }
+}
+
+fn emit(output: &mut impl Write, record: &Value) {
+    serde_json::to_writer(&mut *output, record).expect("serialize Change codec JSONL record");
+    output
+        .write_all(b"\n")
+        .expect("write Change codec JSONL record terminator");
+    output.flush().expect("flush Change codec JSONL record");
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("Change codec duration fits u64 nanoseconds")
 }

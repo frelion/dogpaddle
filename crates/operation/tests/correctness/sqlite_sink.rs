@@ -1,18 +1,353 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, RuntimeResource, decode_definition, encode_definition,
+    DataInstances, DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
+    RuntimeResource, decode_definition, encode_definition,
     operation::{
-        Action, Operation, OperationError, OperationInput, Turn, sink::SqliteSinkDefinition,
+        Action, Operation, OperationError, OperationInput, Turn,
+        sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
     },
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
-use super::support::{TestStore, commit_ready, rollback_ready};
+use super::support::{
+    TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
+    rollback_ready, value_schema,
+};
+
+const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+
+#[test]
+fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
+    let sqlite =
+        SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events").unwrap();
+    let decoded = assert_literal_definition(
+        &sqlite,
+        SQLITE_SINK_V1,
+        10,
+        OperationKind::Sink(std::num::NonZeroU32::MIN),
+    );
+    assert_eq!(data_names(&sqlite), ["relation_sink.state"]);
+    assert_eq!(
+        sqlite.database_path(),
+        Path::new("/var/lib/dogpaddle/output.sqlite")
+    );
+    assert_eq!(sqlite.table_name(), "events");
+    assert!(
+        decoded
+            .bind(&[value_schema()])
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let encoded = encode_definition(&sqlite);
+    let path = b"/var/lib/dogpaddle/output.sqlite";
+    let table = b"events";
+    let path_length_offset = DEFINITION_HEADER_LEN;
+    let path_offset = path_length_offset + size_of::<u32>();
+    let table_length_offset = path_offset + path.len();
+    let table_offset = table_length_offset + size_of::<u32>();
+    assert_eq!(
+        &encoded[path_length_offset..path_offset],
+        &u32::try_from(path.len()).unwrap().to_be_bytes()
+    );
+    assert_eq!(&encoded[path_offset..table_length_offset], path);
+    assert_eq!(
+        &encoded[table_length_offset..table_offset],
+        &u32::try_from(table.len()).unwrap().to_be_bytes()
+    );
+    assert_eq!(&encoded[table_offset..], table);
+}
+
+#[test]
+fn sqlite_sink_decoder_rejects_invalid_lengths_strings_and_paths() {
+    let canonical = decode_hex(SQLITE_SINK_V1);
+    let path_length_offset = DEFINITION_HEADER_LEN;
+    let path_length = usize::try_from(u32::from_be_bytes(
+        canonical[path_length_offset..path_length_offset + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let path_offset = path_length_offset + size_of::<u32>();
+    let table_length_offset = path_offset + path_length;
+    let table_offset = table_length_offset + size_of::<u32>();
+
+    let mut forged_path_length = canonical.clone();
+    forged_path_length[path_length_offset..path_offset].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode_definition(&forged_path_length).unwrap_err(),
+        DefinitionCodecError::Truncated
+    );
+
+    let mut forged_table_length = canonical.clone();
+    forged_table_length[table_length_offset..table_offset].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode_definition(&forged_table_length).unwrap_err(),
+        DefinitionCodecError::Truncated
+    );
+
+    for invalid_utf8_offset in [path_offset, table_offset] {
+        let mut invalid_utf8 = canonical.clone();
+        invalid_utf8[invalid_utf8_offset] = u8::MAX;
+        assert!(matches!(
+            decode_definition(&invalid_utf8),
+            Err(DefinitionCodecError::InvalidPayload(_))
+        ));
+    }
+
+    let wrap = |path: &[u8], table: &[u8]| {
+        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        encoded.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(path);
+        encoded.extend_from_slice(&u32::try_from(table.len()).unwrap().to_be_bytes());
+        encoded.extend_from_slice(table);
+        encoded
+    };
+    for invalid in [
+        wrap(b"relative.sqlite", b"events"),
+        wrap(b":memory:", b"events"),
+        wrap(b"/tmp/invalid\0.sqlite", b"events"),
+        wrap(b"/tmp/output.sqlite", b""),
+        wrap(b"/tmp/output.sqlite", b"bad\0table"),
+        wrap(b"/tmp/output.sqlite", b"SQLITE_reserved"),
+    ] {
+        assert!(matches!(
+            decode_definition(&invalid),
+            Err(DefinitionCodecError::InvalidPayload(_))
+        ));
+    }
+}
+
+#[test]
+fn sqlite_sink_decoder_never_panics_for_valid_header_arbitrary_payloads() {
+    let mut header = decode_hex(SQLITE_SINK_V1);
+    header.truncate(DEFINITION_HEADER_LEN);
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    for length in 0..=256 {
+        let mut input = header.clone();
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            input.push(state.to_le_bytes()[0]);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&input)));
+        assert!(
+            result.is_ok(),
+            "SQLiteSink decoder panicked for payload length {length}"
+        );
+    }
+}
+
+#[test]
+fn sqlite_sink_definition_rejects_non_persistent_paths_and_invalid_table_names() {
+    for (path, expected) in [
+        (
+            PathBuf::from(":memory:"),
+            SqliteSinkDefinitionError::InMemoryDatabase,
+        ),
+        (
+            PathBuf::from("relative.sqlite"),
+            SqliteSinkDefinitionError::DatabasePathNotAbsolute,
+        ),
+        (
+            PathBuf::from("/tmp/invalid\0.sqlite"),
+            SqliteSinkDefinitionError::DatabasePathContainsNul,
+        ),
+    ] {
+        assert_eq!(
+            SqliteSinkDefinition::try_new(path, "events").unwrap_err(),
+            expected
+        );
+    }
+
+    for (table, expected) in [
+        ("", SqliteSinkDefinitionError::EmptyTableName),
+        (
+            "invalid\0table",
+            SqliteSinkDefinitionError::TableNameContainsNul,
+        ),
+        (
+            "sqlite_events",
+            SqliteSinkDefinitionError::ReservedTableName,
+        ),
+        (
+            "SQLITE_EVENTS",
+            SqliteSinkDefinitionError::ReservedTableName,
+        ),
+    ] {
+        assert_eq!(
+            SqliteSinkDefinition::try_new("/tmp/output.sqlite", table).unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_sink_definition_rejects_a_non_utf8_database_path() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let path = PathBuf::from(OsString::from_vec(b"/tmp/invalid-\xff.sqlite".to_vec()));
+    assert_eq!(
+        SqliteSinkDefinition::try_new(path, "events").unwrap_err(),
+        SqliteSinkDefinitionError::DatabasePathNotUtf8
+    );
+}
+
+#[test]
+fn sqlite_sink_binding_accepts_zero_and_1998_logical_columns() {
+    let definition = SqliteSinkDefinition::try_new("/tmp/output.sqlite", "events").unwrap();
+    let empty = Arc::new(Schema::empty());
+    assert!(
+        bind(&definition, std::slice::from_ref(&empty))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let empty_name = Arc::new(Schema::new(vec![Field::new("", DataType::Utf8, true)]));
+    assert!(
+        bind(&definition, std::slice::from_ref(&empty_name))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let maximum = Arc::new(Schema::new(
+        (0..1_998)
+            .map(|index| Field::new(format!("field_{index}"), DataType::Null, true))
+            .collect::<Vec<_>>(),
+    ));
+    assert!(
+        bind(&definition, std::slice::from_ref(&maximum))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+
+    let temporal_and_decimal = Arc::new(Schema::new(vec![
+        Field::new("date", DataType::Date32, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
+            true,
+        ),
+        Field::new("amount", DataType::Decimal128(38, -4), false),
+    ]));
+    assert!(
+        bind(&definition, std::slice::from_ref(&temporal_and_decimal))
+            .unwrap()
+            .output_schema()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
+    let definition = SqliteSinkDefinition::try_new("/tmp/output.sqlite", "events").unwrap();
+
+    let too_many = Arc::new(Schema::new(
+        (0..1_999)
+            .map(|index| Field::new(format!("field_{index}"), DataType::Null, true))
+            .collect::<Vec<_>>(),
+    ));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&too_many))
+    else {
+        panic!("a SQLite sink with 1999 logical columns unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::TooManyColumns {
+            actual: 1_999,
+            maximum: 1_998,
+        })
+    ));
+
+    let nul = Arc::new(Schema::new(vec![Field::new(
+        "invalid\0name",
+        DataType::Utf8,
+        true,
+    )]));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&nul))
+    else {
+        panic!("a SQLite sink field containing NUL unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::FieldNameContainsNul { field: 0 })
+    ));
+
+    let duplicate = Arc::new(Schema::new(vec![
+        Field::new("Name", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let Err(OperationBindError::Rejected { source }) =
+        bind(&definition, std::slice::from_ref(&duplicate))
+    else {
+        panic!("ASCII case-insensitive SQLite field collision unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<SqliteSinkSchemaError>(),
+        Some(SqliteSinkSchemaError::CaseInsensitiveFieldCollision {
+            first: 0,
+            second: 1,
+        })
+    ));
+
+    for (name, expected_name) in [
+        ("$DOGPADDLE.ID", "$DOGPADDLE.ID"),
+        ("$DOGPADDLE.HASH", "$DOGPADDLE.HASH"),
+    ] {
+        let collision = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
+        let Err(OperationBindError::Rejected { source }) =
+            bind(&definition, std::slice::from_ref(&collision))
+        else {
+            panic!("SQLite technical field collision unexpectedly bound");
+        };
+        assert!(matches!(
+            source.downcast_ref::<SqliteSinkSchemaError>(),
+            Some(SqliteSinkSchemaError::TechnicalColumnCollision {
+                field: 0,
+                name,
+            }) if name == expected_name
+        ));
+    }
+}
+
+#[test]
+fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() {
+    let fixture = TestStore::new();
+    let sqlite_path = fixture.path().with_extension("sqlite");
+    let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
+
+    let mut store = Store::create(fixture.path()).unwrap();
+    assert_eq!(definition.data().len(), 1);
+    definition.data()[0]
+        .create(&mut store, "sqlite-state")
+        .unwrap();
+    assert!(!sqlite_path.exists());
+    drop(store);
+
+    let store = Store::open(fixture.path()).unwrap();
+    store.open_data::<Cell<Vec<u8>>>("sqlite-state").unwrap();
+    let operation = materialize(&definition, &[value_schema()], &store, &["sqlite-state"]);
+    assert!(!sqlite_path.exists());
+    drop(operation);
+}
 
 struct Fixture {
     root: TestStore,

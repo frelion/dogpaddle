@@ -6,8 +6,9 @@ on:
       - ".github/workflows/debezium-postgres.yml"
       - ".cargo/**"
       - "crates/**"
-      - "tools/check_postgres_*.py"
-      - "experiments/debezium-d1/**"
+      - "system-tests/debezium-postgres/**"
+      - "system-tests/debezium-runtime/**"
+      - "system-tests/postgres/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -17,8 +18,9 @@ on:
       - ".github/workflows/debezium-postgres.yml"
       - ".cargo/**"
       - "crates/**"
-      - "tools/check_postgres_*.py"
-      - "experiments/debezium-d1/**"
+      - "system-tests/debezium-postgres/**"
+      - "system-tests/debezium-runtime/**"
+      - "system-tests/postgres/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -37,45 +39,23 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "10"
   CARGO_TERM_COLOR: always
-  D1_ARTIFACT_ROOT: ${{ github.workspace }}/d1-artifacts
-  D1_KEEP_ARTIFACTS: "1"
-  D1_KEEP_POSTGRES: "1"
-  PODMAN_COMPOSE_PROVIDER: /usr/bin/podman-compose
   RUST_BACKTRACE: "1"
 
 jobs:
-  recovery:
-    name: PostgreSQL engine, scan and sink recovery
+  build-linux-runtime:
+    name: Build Linux runtime and D1 host
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Create artifact directory
-        run: |
-          mkdir -p -- "$D1_ARTIFACT_ROOT"
-          printf 'D1 workflow setup started\n' >"$D1_ARTIFACT_ROOT/setup-started.log"
-
-      - name: Install the fixture tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            fuse-overlayfs \
-            podman \
-            podman-compose \
-            postgresql-client \
-            postgresql-16 \
-            ripgrep \
-            slirp4netns \
-            uidmap
-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
 
-      - name: Restore and save D1 build caches
+      - name: Restore and save build caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -84,87 +64,288 @@ jobs:
             ~/.cargo/git/db
             target/debezium-maven-cache
             target/debezium-runtime-downloads
-            experiments/debezium-d1/host/target
-            target/debug
-          key: debezium-d1-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'experiments/debezium-d1/host/Cargo.lock', 'crates/debezium/bridge/pom.xml', 'crates/debezium/bridge/probe/pom.xml', 'crates/debezium/runtime-assets/*.tsv') }}
+            system-tests/debezium-postgres/host/target
+          key: debezium-postgres-linux-v1-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'system-tests/debezium-postgres/host/Cargo.lock', 'crates/debezium/bridge/pom.xml', 'crates/debezium/runtime-assets/*.tsv') }}
           restore-keys: |
-            debezium-d1-v1-${{ runner.os }}-1.96-
+            debezium-postgres-linux-v1-1.96-
 
-      - name: Record the fixture environment
+      - name: Build the Java distribution in the pinned Maven image
         run: |
-          exec > >(tee "$D1_ARTIFACT_ROOT/environment.log") 2>&1
-          rustc --version --verbose
-          cargo --version --verbose
-          cargo clippy --version
-          podman --version
-          podman info
-          test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
-          command -v newuidmap
-          command -v newgidmap
-          rg "^$(id --user --name):[0-9]+:[0-9]+$" /etc/subuid
-          rg "^$(id --user --name):[0-9]+:[0-9]+$" /etc/subgid
-          test -x "$PODMAN_COMPOSE_PROVIDER"
-          podman compose version
-          podman compose --file experiments/debezium-d1/compose.yaml config
-          psql --version
-          python3 --version
+          set -euo pipefail
+          maven_image="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237"
+          maven_home="$GITHUB_WORKSPACE/target/debezium-maven-cache"
+          mkdir -p -- "$maven_home"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/dogpaddle-maven \
+            --env MAVEN_CONFIG=/tmp/dogpaddle-maven/.m2 \
+            --env MAVEN_OPTS=-Duser.home=/tmp/dogpaddle-maven \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$maven_home:/tmp/dogpaddle-maven/.m2" \
+            --workdir /workspace \
+            --entrypoint /bin/bash \
+            "$maven_image" \
+            -c 'set -euo pipefail; crates/debezium/scripts/build-distribution.sh'
 
-      - name: Run the real PostgreSQL recovery gate
+      - name: Build the independent D1 host
+        run: |
+          cargo fmt --manifest-path system-tests/debezium-postgres/host/Cargo.toml -- --check
+          cargo test --locked --manifest-path system-tests/debezium-postgres/host/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path system-tests/debezium-postgres/host/Cargo.toml -- -D warnings
+          cargo build --locked --release --manifest-path system-tests/debezium-postgres/host/Cargo.toml
+
+      - name: Assemble the Linux runtime bundle
+        run: crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
+
+      - name: Stage the Linux artifacts
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/target/debezium-postgres-linux"
+          mkdir -p -- "$stage"
+          cp -R -- \
+            "$GITHUB_WORKSPACE/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu" \
+            "$stage/bundle"
+          install -m 0755 \
+            "$GITHUB_WORKSPACE/system-tests/debezium-postgres/host/target/release/dogpaddle-debezium-d1-host" \
+            "$stage/d1-host"
+          tar -czf "$GITHUB_WORKSPACE/target/debezium-postgres-linux.tar.gz" \
+            -C "$stage" bundle d1-host
+
+      - name: Upload the Linux runtime and D1 host
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debezium-postgres-linux
+          path: target/debezium-postgres-linux.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-native-hosts:
+    name: Build native PostgreSQL hosts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
+
+      - name: Restore and save Cargo cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: debezium-postgres-hosts-v1-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            debezium-postgres-hosts-v1-1.96-
+
+      - name: Build and lint the native hosts
+        run: |
+          cargo fmt -p dogpaddle-postgres-system-hosts -- --check
+          cargo clippy --locked -p dogpaddle-postgres-system-hosts --all-targets -- -D warnings
+          cargo build --locked --release -p dogpaddle-postgres-system-hosts --bins
+
+      - name: Stage the native hosts
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/target/postgres-system-hosts"
+          mkdir -p -- "$stage"
+          install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_cdc" "$stage/postgres_cdc"
+          install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_sink" "$stage/postgres_sink"
+          install -m 0755 "$GITHUB_WORKSPACE/target/release/postgres_sink_recovery" "$stage/postgres_sink_recovery"
+          tar -czf "$GITHUB_WORKSPACE/target/postgres-system-hosts.tar.gz" \
+            -C "$stage" postgres_cdc postgres_sink postgres_sink_recovery
+
+      - name: Upload the native hosts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-system-hosts
+          path: target/postgres-system-hosts.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  d1:
+    name: Debezium PostgreSQL black-box recovery
+    needs: build-linux-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the D1 artifact directory
+        run: |
+          mkdir -p -- "$RUNNER_TEMP/d1-artifacts"
+          printf 'D1 scenario setup started\n' >"$RUNNER_TEMP/d1-artifacts/setup.log"
+
+      - name: Install the D1 fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse-overlayfs podman podman-compose postgresql-client slirp4netns uidmap
+
+      - name: Download the Linux runtime and D1 host
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debezium-postgres-linux
+          path: ${{ runner.temp }}/linux-artifact
+
+      - name: Prepare the D1 scenario inputs
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/linux-artifact/debezium-postgres-linux.tar.gz" -C "$RUNNER_TEMP/linux-artifact"
+          podman pull quay.io/debezium/postgres:16@sha256:114cbe1e4f38055e83c9b567a7e0988fb80837b8eb500203b25c0f784a075b92
+          podman compose --file system-tests/debezium-postgres/compose.yaml config \
+            >"$RUNNER_TEMP/d1-artifacts/compose-config.log"
+
+      - name: Run the D1 scenario
         env:
-          TMPDIR: ${{ env.D1_ARTIFACT_ROOT }}
+          PODMAN_COMPOSE_PROVIDER: /usr/bin/podman-compose
         run: |
           set -o pipefail
-          experiments/debezium-d1/scripts/run.sh \
-            2>&1 | tee "$D1_ARTIFACT_ROOT/d1-gate.log"
+          system-tests/debezium-postgres/scripts/run.sh \
+            --bundle "$RUNNER_TEMP/linux-artifact/bundle" \
+            --host "$RUNNER_TEMP/linux-artifact/d1-host" \
+            --artifacts-dir "$RUNNER_TEMP/d1-artifacts/scenario" \
+            2>&1 | tee "$RUNNER_TEMP/d1-artifacts/run.log"
 
-      - name: Run the native Scan and same-database PG roundtrip gates
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          set -o pipefail
-          python3 tools/check_postgres_cdc.py \
-            --bundle "$GITHUB_WORKSPACE/crates/debezium/bridge/target/bundles/dogpaddle-debezium-runtime-x86_64-unknown-linux-gnu" \
-            --postgres-bin /usr/lib/postgresql/16/bin \
-            2>&1 | tee "$D1_ARTIFACT_ROOT/scan-gate.log"
-
-      - name: Run the native Sink recovery and batching gate
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          set -o pipefail
-          python3 tools/check_postgres_sink.py \
-            --postgres-bin /usr/lib/postgresql/16/bin \
-            2>&1 | tee "$D1_ARTIFACT_ROOT/sink-gate.log"
-
-      - name: Capture PostgreSQL diagnostics
+      - name: Remove the D1 fixture
         if: always()
         continue-on-error: true
-        run: |
-          podman compose \
-            --project-name dogpaddle-debezium-d1 \
-            --file experiments/debezium-d1/compose.yaml \
-            ps --all >"$D1_ARTIFACT_ROOT/postgres-status.log" 2>&1 || true
-          podman compose \
-            --project-name dogpaddle-debezium-d1 \
-            --file experiments/debezium-d1/compose.yaml \
-            logs --no-color postgres >"$D1_ARTIFACT_ROOT/postgres.log" 2>&1 || true
-
-      - name: Remove the PostgreSQL fixture
-        if: always()
         env:
-          TMPDIR: ${{ env.D1_ARTIFACT_ROOT }}
-        run: |
-          set -o pipefail
-          experiments/debezium-d1/scripts/clean.sh \
-            2>&1 | tee "$D1_ARTIFACT_ROOT/cleanup.log"
+          PODMAN_COMPOSE_PROVIDER: /usr/bin/podman-compose
+        run: system-tests/debezium-postgres/scripts/clean.sh >>"$RUNNER_TEMP/d1-artifacts/cleanup.log" 2>&1
 
-      - name: Upload D1 checkpoints and logs
+      - name: Upload the complete D1 logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: debezium-postgres-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            d1-artifacts/
-            ${{ runner.temp }}/dogpaddle-pg-cdc-*/**/*.log
+          name: debezium-postgres-d1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d1-artifacts/
           if-no-files-found: error
           retention-days: 14
+
+  cdc:
+    name: PostgreSQL CDC and scan recovery
+    needs: [build-linux-runtime, build-native-hosts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the CDC artifact directory
+        run: |
+          mkdir -p -- "$RUNNER_TEMP/cdc-artifacts"
+          printf 'CDC scenario setup started\n' >"$RUNNER_TEMP/cdc-artifacts/setup.log"
+
+      - name: Install PostgreSQL 16
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16 postgresql-16
+
+      - name: Download the Linux runtime and D1 host
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debezium-postgres-linux
+          path: ${{ runner.temp }}/linux-artifact
+
+      - name: Download the native PostgreSQL hosts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgres-system-hosts
+          path: ${{ runner.temp }}/native-artifact
+
+      - name: Run the CDC and scan scenario
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/linux-artifact/debezium-postgres-linux.tar.gz" -C "$RUNNER_TEMP/linux-artifact"
+          tar -xzf "$RUNNER_TEMP/native-artifact/postgres-system-hosts.tar.gz" -C "$RUNNER_TEMP/native-artifact"
+          python3 system-tests/postgres/check_cdc.py \
+            --bundle "$RUNNER_TEMP/linux-artifact/bundle" \
+            --host "$RUNNER_TEMP/native-artifact/postgres_cdc" \
+            --postgres-bin /usr/lib/postgresql/16/bin \
+            --artifacts-dir "$RUNNER_TEMP/cdc-artifacts/scenario" \
+            2>&1 | tee "$RUNNER_TEMP/cdc-artifacts/run.log"
+
+      - name: Upload the complete CDC logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debezium-postgres-cdc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cdc-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  sink:
+    name: PostgreSQL sink recovery
+    needs: build-native-hosts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the Sink artifact directory
+        run: |
+          mkdir -p -- "$RUNNER_TEMP/sink-artifacts"
+          printf 'Sink scenario setup started\n' >"$RUNNER_TEMP/sink-artifacts/setup.log"
+
+      - name: Install PostgreSQL 16
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16 postgresql-16
+
+      - name: Download the native PostgreSQL hosts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: postgres-system-hosts
+          path: ${{ runner.temp }}/native-artifact
+
+      - name: Run the Sink recovery scenario
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/native-artifact/postgres-system-hosts.tar.gz" -C "$RUNNER_TEMP/native-artifact"
+          python3 system-tests/postgres/check_sink.py \
+            --host "$RUNNER_TEMP/native-artifact/postgres_sink" \
+            --recovery-host "$RUNNER_TEMP/native-artifact/postgres_sink_recovery" \
+            --postgres-bin /usr/lib/postgresql/16/bin \
+            --artifacts-dir "$RUNNER_TEMP/sink-artifacts/scenario" \
+            2>&1 | tee "$RUNNER_TEMP/sink-artifacts/run.log"
+
+      - name: Upload the complete Sink logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debezium-postgres-sink-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sink-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    name: PostgreSQL engine, scan and sink recovery
+    if: always()
+    needs: [d1, cdc, sink]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every recovery scenario
+        env:
+          D1_RESULT: ${{ needs.d1.result }}
+          CDC_RESULT: ${{ needs.cdc.result }}
+          SINK_RESULT: ${{ needs.sink.result }}
+        run: |
+          test "$D1_RESULT" = success
+          test "$CDC_RESULT" = success
+          test "$SINK_RESULT" = success

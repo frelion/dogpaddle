@@ -1,0 +1,22 @@
+[package]
+name = "dogpaddle-debezium-runtime-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+autobins = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "bundled_runtime_probe"
+path = "src/bin/bundled_runtime_probe.rs"
+test = false
+bench = false
+
+[dependencies]
+dogpaddle-debezium.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,8 +1,8 @@
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::time::Duration;
 
-use dogpaddle_bench_protocol::{
-    CaseId, CaseSpec, Fields, Measurement, PairSchedule, PairVariant, Plan, Run,
-};
+use serde_json::json;
+
+use super::support::{PairVariant, StoreRun, measure_pair};
 
 #[derive(Debug, PartialEq)]
 pub(super) struct BenchmarkCase {
@@ -10,24 +10,6 @@ pub(super) struct BenchmarkCase {
     operations: usize,
     transactions: usize,
     logical_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PairKind {
-    Size,
-    Mode,
-}
-
-struct PlannedPair {
-    case: BenchmarkCase,
-    samples: usize,
-    kind: PairKind,
-    first: CaseId,
-    second: CaseId,
-}
-
-pub(super) struct FrozenCases {
-    pairs: VecDeque<PlannedPair>,
 }
 
 impl BenchmarkCase {
@@ -47,84 +29,13 @@ impl BenchmarkCase {
         }
     }
 
-    fn spec(&self, variant: &str, samples: usize) -> CaseSpec {
-        CaseSpec::new(
-            format!("{}::{variant}", self.workload),
-            NonZeroUsize::new(samples).expect("benchmark has samples"),
-            Fields::new()
-                .with("variant", variant)
-                .with("operations", self.operations)
-                .with("transactions", self.transactions)
-                .with("logical_bytes", self.logical_bytes),
-        )
-    }
-}
-
-impl FrozenCases {
-    pub(super) const fn new() -> Self {
-        Self {
-            pairs: VecDeque::new(),
-        }
-    }
-
-    pub(super) fn size(&mut self, plan: &mut Plan, case: BenchmarkCase, samples: usize) {
-        self.declare(plan, case, samples, PairKind::Size, "Small", "Large");
-    }
-
-    pub(super) fn mode(&mut self, plan: &mut Plan, case: BenchmarkCase, samples: usize) {
-        self.declare(plan, case, samples, PairKind::Mode, "Full", "Projected");
-    }
-
-    pub(super) fn finish(self) {
-        assert!(
-            self.pairs.is_empty(),
-            "all frozen OrderedMap benchmark pairs are consumed"
-        );
-    }
-
-    fn declare(
-        &mut self,
-        plan: &mut Plan,
-        case: BenchmarkCase,
-        samples: usize,
-        kind: PairKind,
-        first_variant: &str,
-        second_variant: &str,
-    ) {
-        let (first, second) = plan.pair(
-            &case.workload,
-            case.spec(first_variant, samples),
-            case.spec(second_variant, samples),
-        );
-        self.pairs.push_back(PlannedPair {
-            case,
-            samples,
-            kind,
-            first,
-            second,
-        });
-    }
-
-    fn take(
-        &mut self,
-        expected_case: &BenchmarkCase,
-        expected_samples: usize,
-        expected_kind: PairKind,
-    ) -> (CaseId, CaseId) {
-        let planned = self
-            .pairs
-            .pop_front()
-            .expect("missing frozen OrderedMap benchmark pair");
-        assert_eq!(&planned.case, expected_case);
-        assert_eq!(planned.samples, expected_samples);
-        assert_eq!(planned.kind, expected_kind);
-        (planned.first, planned.second)
+    fn series(&self, variant: &str) -> String {
+        format!("{}::{variant}", self.workload)
     }
 }
 
 pub(super) fn report_size_pair(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     case: &BenchmarkCase,
     samples: usize,
     mut small: impl FnMut() -> Duration,
@@ -132,18 +43,22 @@ pub(super) fn report_size_pair(
 ) {
     small();
     large();
-    let (first, second) = plan.take(case, samples, PairKind::Size);
-    run.paired(first, second, PairSchedule::Alternating, |variant| {
-        Measurement::new(match variant {
+    report_pair(
+        run,
+        case,
+        "size",
+        "Small",
+        "Large",
+        samples,
+        |variant| match variant {
             PairVariant::First => small(),
             PairVariant::Second => large(),
-        })
-    });
+        },
+    );
 }
 
 pub(super) fn report_mode_pair<T>(
-    run: &mut Run,
-    plan: &mut FrozenCases,
+    run: &StoreRun,
     case: &BenchmarkCase,
     samples: usize,
     fixture: &mut T,
@@ -152,11 +67,60 @@ pub(super) fn report_mode_pair<T>(
 ) {
     full(fixture);
     projected(fixture);
-    let (first, second) = plan.take(case, samples, PairKind::Mode);
-    run.paired(first, second, PairSchedule::Alternating, |variant| {
-        Measurement::new(match variant {
+    report_pair(
+        run,
+        case,
+        "mode",
+        "Full",
+        "Projected",
+        samples,
+        |variant| match variant {
             PairVariant::First => full(fixture),
             PairVariant::Second => projected(fixture),
-        })
-    });
+        },
+    );
+}
+
+fn report_pair(
+    run: &StoreRun,
+    case: &BenchmarkCase,
+    pair_kind: &str,
+    first_variant: &str,
+    second_variant: &str,
+    samples: usize,
+    mut measure: impl FnMut(PairVariant) -> Duration,
+) {
+    for sample in 0..samples {
+        let ab = pair_is_ab(sample);
+        let (first, second) = measure_pair(ab, &mut measure);
+        let order = if ab { "ab" } else { "ba" };
+        for (variant, elapsed) in [(first_variant, first), (second_variant, second)] {
+            run.sample(
+                &case.series(variant),
+                sample,
+                elapsed,
+                &json!({
+                    "pair": case.workload,
+                    "pair_kind": pair_kind,
+                    "order": order,
+                    "variant": variant,
+                    "operations": case.operations,
+                    "transactions": case.transactions,
+                    "logical_bytes": case.logical_bytes,
+                }),
+            );
+        }
+    }
+}
+
+pub(super) fn validate_pair_schedule(samples: usize) {
+    assert!(
+        samples >= 2,
+        "AB/BA measurement requires at least two samples"
+    );
+    assert_eq!([pair_is_ab(0), pair_is_ab(1)], [true, false]);
+}
+
+const fn pair_is_ab(sample: usize) -> bool {
+    sample.is_multiple_of(2)
 }

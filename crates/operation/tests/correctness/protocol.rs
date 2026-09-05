@@ -1,6 +1,13 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use arrow_array::UInt64Array;
 use dogpaddle_change::{Change, decode_change, encode_change};
-use dogpaddle_operation::operation::{Action, Operation, Turn};
+use dogpaddle_operation::operation::{
+    Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+};
 use dogpaddle_store::{AppendLog, Cell, ScanLimit, Store, StoreError, Transactions};
 
 #[path = "../../examples/support/queue_scan.rs"]
@@ -9,6 +16,125 @@ mod queue_scan;
 use queue_scan::QueueScan;
 
 use super::support::{TestStore, rollback_ready};
+
+#[test]
+fn post_commit_error_accepts_an_already_erased_operation_error() {
+    let source: OperationError = Box::new(std::io::Error::other("erased failure"));
+    assert_eq!(PostCommitError::from(source).to_string(), "erased failure");
+}
+
+struct BorrowedDeliveryConnector {
+    acknowledgements: Arc<AtomicUsize>,
+}
+
+impl BorrowedDeliveryConnector {
+    fn poll(&mut self) -> BorrowedDelivery<'_> {
+        BorrowedDelivery { connector: self }
+    }
+}
+
+struct BorrowedDelivery<'connector> {
+    connector: &'connector mut BorrowedDeliveryConnector,
+}
+
+impl BorrowedDelivery<'_> {
+    fn ack(self) {
+        self.connector
+            .acknowledgements
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct BorrowedDeliveryScan {
+    accepted: Cell<u64>,
+    connector: BorrowedDeliveryConnector,
+}
+
+impl Operation for BorrowedDeliveryScan {
+    fn turn<'turn>(
+        &'turn mut self,
+        input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
+        assert!(input.is_none());
+        let accepted = self.accepted.clone();
+        let delivery = self.connector.poll();
+        Ok(Turn::ready(move |access| {
+            accepted.access(access)?.set(&7)?;
+            Ok((
+                Action::Commit(None),
+                AfterCommit::new(move || {
+                    delivery.ack();
+                    Ok(())
+                }),
+            ))
+        }))
+    }
+}
+
+#[test]
+fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() {
+    let fixture = TestStore::new();
+    let mut store = Store::create(fixture.path()).unwrap();
+    let accepted = store.create_data::<Cell<u64>>("accepted").unwrap();
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let mut operation = BorrowedDeliveryScan {
+        accepted: accepted.clone(),
+        connector: BorrowedDeliveryConnector {
+            acknowledgements: Arc::clone(&acknowledgements),
+        },
+    };
+    let mut transactions = store.into_transactions();
+
+    {
+        let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
+            panic!("delivery Scan did not prepare its polled delivery");
+        };
+        let transaction = transactions.begin().unwrap();
+        let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap()
+        else {
+            panic!("delivery Scan did not stage its checkpoint");
+        };
+        drop(transaction);
+        drop(after_commit);
+    }
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    {
+        let transaction = transactions.begin().unwrap();
+        assert_eq!(
+            accepted
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            None
+        );
+        transaction.commit().unwrap();
+    }
+
+    let Turn::Ready(prepared) = operation.turn(None).unwrap() else {
+        panic!("delivery Scan did not prepare the replayed delivery");
+    };
+    let transaction = transactions.begin().unwrap();
+    let (Action::Commit(None), after_commit) = prepared.apply(transaction.access()).unwrap() else {
+        panic!("delivery Scan did not stage its replayed checkpoint");
+    };
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    transaction.commit().unwrap();
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+    after_commit.run().unwrap();
+    assert_eq!(acknowledgements.load(Ordering::Relaxed), 1);
+
+    let transaction = transactions.begin().unwrap();
+    assert_eq!(
+        accepted
+            .access(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(7)
+    );
+    transaction.commit().unwrap();
+}
 
 struct QueueFixture {
     scan: QueueScan,

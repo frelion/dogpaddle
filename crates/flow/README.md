@@ -118,7 +118,7 @@ flow.advance()?;
 checkpoint 与 Station output 在同一事务提交，背压同时回滚且不 ACK，不另存 pending。
 poll 不等待数据；宿主在整轮 Idle 或持续 Backpressured 时自行安排等待，避免忙轮询。
 它只输出完整 Change，Flow 没有 `ingest`、PG 专用分支或另一套调度状态。
-完整真实 PG→SQLite 与进程恢复示例见 `examples/postgres_cdc.rs`，显式验收命令见根目录 TESTING.md。
+完整真实 PG→SQLite 与进程恢复 host 见 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`，显式验收命令见根目录 TESTING.md。
 
 Filter/Extend/Select/`SchemaAlign` 的 Definition 在 `station()` 之前已通过 fallible 构造入口将
 `DataFusion` `Expr` 编码为
@@ -157,7 +157,7 @@ target spec，numeric IP、端口与凭据随 `PostgresSinkConfig` 在 build/ope
 Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端 marker 只是 ownership/layout-version
 标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。连接和每个数据库工作单元有 5 秒
 client deadline；DNS endpoint、TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
-`tools/check_postgres_sink.py`。
+`system-tests/postgres/check_sink.py`。
 
 ## 运行状态
 
@@ -385,19 +385,21 @@ cargo test -p dogpaddle-flow
 cargo test -p dogpaddle-flow --test correctness
 cargo clippy -p dogpaddle-flow --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-flow --no-deps
-cargo bench -p dogpaddle-flow --bench flow_lifecycle
-cargo bench -p dogpaddle-flow --bench flow_runtime
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-flow --bench flow_lifecycle
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-flow --bench flow_runtime
 
-# 需要独立临时 PostgreSQL，参数见根目录 TESTING.md
-python3 tools/check_postgres_sink.py --postgres-bin /absolute/path/to/postgresql/bin
+# 需要独立临时 PostgreSQL；脚本会构建系统验收 host
+python3 system-tests/postgres/check_sink.py --postgres-bin /absolute/path/to/postgresql/bin
 ```
 
-`flow_lifecycle` 只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm committed
-`open`，按 Station 数量逐轴扩展。它不报告 rows/s，也不声称代表实际 Station processing
-或运行时吞吐。`flow_runtime` 则测预先构建的 scan/sink、`RunningEventCount` chain、fan-out 和 capacity-pressure
-Flow 的连续 `advance` 轮次，fixture、预热和结果校验都在计时外。`run` plan 保存静态 work counts，
-machine sample 只保留总 `elapsed_ns` 和 raw `round_latencies_ns`；统一 reporter 从这些 raw
-值重建 round p50/p95/p99，以及 advances/s、committed Station turns/s 和 input completions/s。
-相邻 `.plan.json` 由 `cargo xtask bench-plan-check` 在不构建 Flow fixture 的情况下验证 smoke/reference
-Plan。正式结果必须在显式 reference 文件系统上保留逐样本 JSONL；配置与输出协议见工作区
+`flow_lifecycle` 使用 Criterion，只测当前确实存在的低频 lifecycle：fresh durable `build` 与 warm
+committed `open`，按 Station 数量扩展。它不报告 rows/s，也不声称代表 Station processing 或运行时
+吞吐。Criterion 原生 artifacts 与环境上下文都写入同一个 `RunRoot`。
+
+`flow_runtime` 是 Flow 自有 JSONL runner，测预先构建的 scan/sink、`RunningEventCount` chain、fan-out
+和 capacity-pressure Flow。预热只推进并断言 outcome，不计时也不输出；随后保留每一次采样
+`advance` 的原始 latency、outcome、静态 work counts 和场景末 durable oracle。每条记录随产生立即写出，
+stderr 只报告人类进度。fixture、输出和结果校验不进入 `Flow::advance` 的计时区间。不存在中央 plan、
+fingerprint、validator 或跨 target schema。
+正式结果必须在显式 `DOGPADDLE_PERF_ROOT` reference 文件系统上保留；配置与输出规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

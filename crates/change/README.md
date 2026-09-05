@@ -139,8 +139,8 @@ diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
 cargo test -p dogpaddle-change
 cargo clippy -p dogpaddle-change --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-change --no-deps
-cargo bench -p dogpaddle-change --bench change_core
-cargo bench -p dogpaddle-change --bench change_codec
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_core
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_codec
 ```
 
 正确性分层、fixture 所有权和负向测试口径见工作区

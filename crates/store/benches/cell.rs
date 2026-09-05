@@ -1,15 +1,17 @@
 //! Hot-access and durable-update scenarios for `Cell`.
 
-use std::{hint::black_box, num::NonZeroUsize, time::Duration};
+use std::{hint::black_box, time::Duration};
 
-use dogpaddle_bench_protocol::{BenchmarkProfile, CaseSpec, Fields, Measurement, Plan, Run};
+use criterion::{BenchmarkId, Criterion, Throughput};
+use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{Cell, Store, Transactions};
+use serde_json::json;
 use tempfile::TempDir;
 
 const BENCHMARK: &str = "cell";
 const DEFAULT_READS: usize = 100_000;
 const DEFAULT_COMMITS: usize = 1_000;
-const DEFAULT_SAMPLES: usize = 9;
+const DEFAULT_SAMPLES: usize = 10;
 
 struct Fixture {
     transactions: Transactions,
@@ -24,25 +26,18 @@ struct Config {
     samples: usize,
 }
 
-#[derive(Clone, Copy)]
-struct SampleWork {
-    operations: usize,
-    transactions: usize,
-    logical_bytes: usize,
-}
-
 impl Fixture {
-    fn populated(run: &Run) -> Self {
-        let root = run.sample("cell");
+    fn populated(root: &RunRoot) -> Self {
+        let sample = root.sample("cell");
         let mut store =
-            Store::create(root.path().join("store")).expect("create cell benchmark store");
+            Store::create(sample.path().join("store")).expect("create cell benchmark store");
         let cell = store
             .create_data::<Cell<u64>>("cell")
             .expect("create benchmark cell");
         let mut fixture = Self {
             transactions: store.into_transactions(),
             cell,
-            _root: root,
+            _root: sample,
         };
         let transaction = fixture
             .transactions
@@ -60,14 +55,14 @@ impl Fixture {
 }
 
 impl Config {
-    const fn for_profile(profile: BenchmarkProfile) -> Self {
+    const fn for_profile(profile: PerformanceProfile) -> Self {
         match profile {
-            BenchmarkProfile::Smoke => Self {
+            PerformanceProfile::Smoke => Self {
                 reads: 1,
                 commits: 1,
-                samples: 1,
+                samples: 10,
             },
-            BenchmarkProfile::Reference => Self {
+            PerformanceProfile::Reference => Self {
                 reads: DEFAULT_READS,
                 commits: DEFAULT_COMMITS,
                 samples: DEFAULT_SAMPLES,
@@ -77,57 +72,56 @@ impl Config {
 }
 
 fn main() {
-    let profile = BenchmarkProfile::from_environment();
-    let Config {
-        reads,
-        commits,
-        samples,
-    } = Config::for_profile(profile);
-    let mut fields = Fields::new();
-    for (name, value) in [("reads", reads), ("commits", commits), ("samples", samples)] {
-        fields.insert(name, value);
+    let profile = PerformanceProfile::for_benchmark();
+    if std::env::args_os().any(|argument| argument == "--bench") {
+        require_release_build(BENCHMARK);
     }
-    let mut plan = Plan::new(
-        profile,
-        fields
-            .with("execution", "single_thread")
-            .with("cache", "warm")
-            .with("validation", "outside_timing")
-            .with("mdbx_sync_mode", "durable"),
+    let config = Config::for_profile(profile);
+    let root = RunRoot::for_profile(BENCHMARK, profile);
+    write_context(&root, profile, config);
+    let mut criterion = Criterion::default()
+        .sample_size(config.samples)
+        .output_directory(&root.path().join("criterion"))
+        .configure_from_args();
+    benchmark(&mut criterion, &root, config);
+    criterion.final_summary();
+}
+
+fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(config.reads).expect("read count fits u64"),
+    ));
+    let mut fixture = Fixture::populated(root);
+    group.bench_function(
+        BenchmarkId::new("hot_get_one_tx", config.reads),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    elapsed += measure_get(&mut fixture, config.reads);
+                }
+                elapsed
+            });
+        },
     );
-    let get = plan.case(case(
-        "hot get, one tx",
-        SampleWork {
-            operations: reads,
-            transactions: 1,
-            logical_bytes: 8 * reads,
-        },
-        samples,
-    ));
-    let update = plan.case(case(
-        "read + update + commit",
-        SampleWork {
-            operations: commits,
-            transactions: commits,
-            logical_bytes: 16 * commits,
-        },
-        samples,
-    ));
-    let mut run = Run::persistent(BENCHMARK, plan);
-    if run.is_plan_only() {
-        run.emit_plan();
-        return;
-    }
 
-    let mut fixture = Fixture::populated(&run);
-    measure_get(&mut fixture, reads);
-    run.samples(get, |_| Measurement::new(measure_get(&mut fixture, reads)));
-
-    measure_updates(&mut Fixture::populated(&run), commits);
-    run.samples(update, |run| {
-        Measurement::new(measure_updates(&mut Fixture::populated(run), commits))
-    });
-    run.finish(|| {});
+    group.throughput(Throughput::Elements(
+        u64::try_from(config.commits).expect("commit count fits u64"),
+    ));
+    group.bench_function(
+        BenchmarkId::new("read_update_commit", config.commits),
+        |bencher| {
+            bencher.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    elapsed += measure_updates(&mut Fixture::populated(root), config.commits);
+                }
+                elapsed
+            });
+        },
+    );
+    group.finish();
 }
 
 fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
@@ -195,14 +189,25 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
     elapsed
 }
 
-fn case(workload: &str, work: SampleWork, samples: usize) -> CaseSpec {
-    CaseSpec::new(
-        workload,
-        NonZeroUsize::new(samples).unwrap(),
-        Fields::new()
-            .with("variant", "Cell")
-            .with("operations", work.operations)
-            .with("transactions", work.transactions)
-            .with("logical_bytes", work.logical_bytes),
+fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
+    let context = json!({
+        "benchmark": BENCHMARK,
+        "profile": profile,
+        "result_directory": root.path().display().to_string(),
+        "host": HostEnvironment::collect(Some(root.filesystem_root())),
+        "configuration": {
+            "reads": config.reads,
+            "commits": config.commits,
+            "samples": config.samples,
+            "execution": "single_thread",
+            "cache": "warm",
+            "validation": "outside_timing",
+            "mdbx_sync_mode": "durable",
+        },
+    });
+    std::fs::write(
+        root.path().join("context.json"),
+        serde_json::to_vec_pretty(&context).expect("serialize Cell performance context"),
     )
+    .expect("write Cell performance context");
 }

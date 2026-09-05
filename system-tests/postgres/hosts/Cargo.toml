@@ -1,0 +1,39 @@
+[package]
+name = "dogpaddle-postgres-system-hosts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+autobins = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "postgres_cdc"
+path = "src/bin/postgres_cdc.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "postgres_sink"
+path = "src/bin/postgres_sink.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "postgres_sink_recovery"
+path = "src/bin/postgres_sink_recovery.rs"
+test = false
+bench = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+dogpaddle-change.workspace = true
+dogpaddle-flow.workspace = true
+dogpaddle-operation.workspace = true
+dogpaddle-store.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

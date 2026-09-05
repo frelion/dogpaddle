@@ -320,19 +320,13 @@ cargo test -p dogpaddle-store --test correctness scan::
 
 ## 性能
 
-PR 中统一通过工作区 smoke runner 实际执行缩小后的 benchmark 协议：
-
-```bash
-cargo xtask bench-smoke
-```
-
 Store 仍有四个按数据对象与运行目的隔离的 release 入口，供单场景诊断和固定 reference 测量：
 
 ```bash
-cargo bench -p dogpaddle-store --bench cell
-cargo bench -p dogpaddle-store --bench ordered_map
-cargo bench -p dogpaddle-store --bench append_log
-cargo bench -p dogpaddle-store --bench append_log_endurance
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench cell
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench ordered_map
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench append_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench append_log_endurance
 ```
 
 按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
@@ -340,6 +334,6 @@ cargo bench -p dogpaddle-store --bench append_log_endurance
 [`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/PERFORMANCE.md)。
 普通 target 覆盖各 collection 的独立与组合事务；`append_log_endurance` 单独观察长期前缀回收、
 页复用、尾延迟和实际文件占用。所有规模由 `smoke` 或 `reference` profile 固定，fixture、预热和
-结果 oracle 位于计时外。正式 reference 必须同时设置绝对路径 `DOGPADDLE_BENCH_ROOT`；机器记录、
+结果 oracle 位于计时外。正式 reference 必须同时设置绝对路径 `DOGPADDLE_PERF_ROOT`；机器记录、
 工作负载、统计口径与目录所有权见
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

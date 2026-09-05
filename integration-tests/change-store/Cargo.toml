@@ -7,6 +7,7 @@ publish = false
 readme = "README.md"
 autotests = false
 autobenches = false
+autoexamples = false
 
 [lib]
 doc = false
@@ -22,7 +23,9 @@ dogpaddle-store.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
-dogpaddle-bench-protocol.workspace = true
+criterion.workspace = true
+dogpaddle-perf-context.workspace = true
+serde_json.workspace = true
 
 [[test]]
 name = "correctness"
@@ -35,4 +38,4 @@ workspace = true
 name = "change_append_log"
 path = "benches/change_append_log.rs"
 harness = false
-test = false
+test = true

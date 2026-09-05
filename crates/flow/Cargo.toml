@@ -6,6 +6,7 @@ rust-version.workspace = true
 readme = "README.md"
 autotests = false
 autobenches = false
+autoexamples = false
 
 [lib]
 bench = false
@@ -19,7 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true
-dogpaddle-bench-protocol.workspace = true
+criterion.workspace = true
+dogpaddle-perf-context.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -29,22 +31,18 @@ name = "correctness"
 path = "tests/correctness.rs"
 
 [[example]]
-name = "postgres_cdc"
-path = "examples/postgres_cdc.rs"
-
-[[example]]
-name = "postgres_sink"
-path = "examples/postgres_sink.rs"
-
-[[example]]
 name = "postgres_sync_live"
 path = "examples/postgres_sync_live.rs"
+
+[[example]]
+name = "sqlite_sink_live"
+path = "examples/sqlite_sink_live.rs"
 
 [[bench]]
 name = "flow_lifecycle"
 path = "benches/flow_lifecycle.rs"
 harness = false
-test = false
+test = true
 
 [[bench]]
 name = "flow_runtime"
