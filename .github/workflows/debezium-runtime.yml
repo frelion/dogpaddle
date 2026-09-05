@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
 
       - name: Restore and save Maven cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/debezium-maven-cache
           key: debezium-maven-v2-${{ hashFiles('crates/debezium/bridge/pom.xml', 'crates/debezium/bridge/probe/pom.xml') }}
@@ -124,7 +124,7 @@ jobs:
           path: crates/debezium/bridge/target/lifecycle-probe
 
       - name: Restore and save Cargo cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
