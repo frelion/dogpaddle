@@ -30,5 +30,13 @@ tempfile.workspace = true
 name = "correctness"
 path = "tests/correctness.rs"
 
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"
+
+[[example]]
+name = "postgres_etl_live"
+path = "examples/postgres_etl_live.rs"
+
 [lints]
 workspace = true

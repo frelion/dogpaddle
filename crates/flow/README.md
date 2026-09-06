@@ -143,9 +143,9 @@ Timestamp 和 `Decimal128(10, 2)` 经显式 `SchemaAlign` cast、Project、Selec
 
 `SqliteSink` 为 Flow 提供首个可查询终点。build/open 只完成 Schema、SQL 与行编码绑定，不打开
 `SQLite` 文件；首次收到输入后才初始化新的 `STRICT` 目标表。Sink 用自身 MDBX continuation 幂等
-覆盖 `SQLite` commit 与 Flow commit 之间的窗口。可直接运行
-[`sqlite_sink_live`](examples/sqlite_sink_live.rs)，端到端恢复证据位于
-[`tests/correctness/sqlite_sink.rs`](tests/correctness/sqlite_sink.rs)。
+覆盖 `SQLite` commit 与 Flow commit 之间的窗口。面向产品的可运行入口是
+[`dogpaddle-sql` quickstart](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/quickstart.rs)，Flow 级端到端恢复证据位于
+[`tests/correctness/sqlite_sink.rs`](https://github.com/frelion/dogpaddle/blob/main/crates/flow/tests/correctness/sqlite_sink.rs)。
 
 `PostgresSink` 是单输入、无 output 的 `PostgreSQL` exact relation 终点。Definition 只保存非敏感
 target spec，numeric IP、端口与凭据随 `PostgresSinkConfig` 在 build/open 时注入；build/open 对 PG 目标
@@ -157,7 +157,8 @@ target spec，numeric IP、端口与凭据随 `PostgresSinkConfig` 在 build/ope
 Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端 marker 只是 ownership/layout-version
 标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。连接和每个数据库工作单元有 5 秒
 client deadline；DNS endpoint、TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
-`system-tests/postgres/check_sink.py`。
+`system-tests/postgres/check_sink.py`。面向产品的同库 `PostgreSQL` CDC → 多段 SQL ETL → `PostgreSQL` 示例是
+[`postgres_etl.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/postgres_etl.sql)。
 
 ## 运行状态
 

@@ -4,48 +4,119 @@
 [![Debezium runtime bundles](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml)
 [![Debezium PostgreSQL recovery](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml)
 
-**把可恢复的数据流，嵌进 Rust 进程。**
+**业务照常写 PostgreSQL。DogPaddle 读取 WAL，用一份 SQL 实时完成 ETL，再写回同一个 PostgreSQL。**
 
-DogPaddle 是一个为 Rust 应用设计的嵌入式 Dataflow 引擎。它用 Arrow 和 DataFusion 处理数据，
-并把静态 Flow、消费进度与算子状态保存在本地事务 Store 中。应用重启后，可以从已提交位置
-重新打开并继续推进。
+![同一个 PostgreSQL 内经一份 SQL 完成实时 ETL](docs/assets/postgres-etl-live.gif)
 
-无需独立服务、控制面或流处理集群。
+*真实进程录制：左侧是业务源表 `sales.orders`，中间运行仓库中的 `postgres_etl.sql`，右侧是同一
+PostgreSQL 实例、同一个 `postgres` 数据库内的 `analytics.order_insights`。源表的 `INSERT`、`UPDATE` 和
+`DELETE` 会经过计算、筛选、分类与分流合并，实时改变目标关系；宿主被 `SIGKILL` 后用同一 state
+重新打开，已提交结果不重复，后续变化继续到达。录制从空源表和新 slot 起步；当前试点不做初始快照。*
 
-![同一个 PostgreSQL 内经 DogPaddle 持续增量同步](docs/assets/postgres-cdc-live.gif)
+[查看完整 SQL](crates/sql/examples/postgres_etl.sql) ·
+[查看录屏宿主](crates/sql/examples/postgres_etl_live.rs) ·
+[重新生成真实录屏](docs/tools/record_postgres_etl_live.sh) ·
+[查看 PostgreSQL 系统验收](system-tests/postgres/check_sql.py)
 
-*真实进程录制：左侧向同一个 PostgreSQL 的 `source.orders` 写入 INSERT、UPDATE、DELETE；中间运行
-`PostgresCdcScan → PostgresSink`，从 WAL 捕获增量并以 Arrow Change 持久推进；右侧从
-`target.orders` 查询同步结果。中途强制终止并重新打开 Flow host 后，后续变更继续到达目标。
-publication 只包含 `source.orders`，写回不会形成 CDC 回环。停顿仅用于演示；该链路不执行初始快照。*
+这条链路只需要一个 PostgreSQL：后端继续维护自己的源表，DogPaddle 通过进程内 Debezium/JRE
+运行时捕获 WAL，并独占维护另一个 schema 中的派生表。业务代码不需要双写，也不需要部署独立的
+流处理服务、控制面或集群。
 
-[查看演示 Flow](crates/flow/examples/postgres_sync_live.rs) ·
-[重新生成录屏](docs/tools/record_postgres_cdc_live.sh)
+```text
+backend writes
+      │
+      ▼
+sales.orders ── WAL / postgres_cdc ──▶ CTE / CAST / arithmetic / CASE / WHERE
+   (same PostgreSQL)                                      │
+                                                         ▼
+                                           analytics.order_insights
+                                              (same PostgreSQL)
+```
 
-## 为什么是 DogPaddle
+一条 `INSERT INTO ... SELECT ...` 就是完整 Flow：Scan、转换和 Sink 都在同一个 SQL 文件里。
+DataFusion 负责 SQL 名称与类型分析，Arrow 承载变化批次，MDBX 保存 canonical Flow、游标和算子状态；
+应用通过很小的 Rust API 控制构建、推进和恢复。
 
-- **状态随 Flow 持久化**：拓扑、游标与算子进度统一保存在本地 MDBX，重启后从已提交位置继续。
-- **先验证，再落盘**：完整 DAG 和 Arrow Schema 通过后才创建资源；不完整构建不会被打开为 Flow。
-- **Arrow + DataFusion**：Arrow 承载批量差分，DataFusion 执行类型化、向量化表达式。
-- **推进权留给应用**：每次 `Flow::advance` 只做有界工作，应用决定运行节奏，慢消费者自然形成软背压。
+## 快速上手
 
-## 一个 SQL 文件定义完整 Flow
+准备仓库固定的 Rust 1.96 和 `sqlite3` 命令行，然后在仓库根目录运行：
 
-`dogpaddle-sql` 把一条 `INSERT ... SELECT` 编译为现有 Scan、Transform、Sink 和持久化 Flow，
-不引入 Table、View、Catalog 或另一套运行层：
+```sh
+demo_dir="$(mktemp -d /tmp/dogpaddle-demo.XXXXXX)"
+export DOGPADDLE_QUICKSTART_SQLITE="$demo_dir/results.sqlite"
+
+cargo run --locked -q -p dogpaddle-sql --example quickstart -- \
+  build crates/sql/examples/quickstart.sql "$demo_dir/flow" 12 0
+
+sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
+  'SELECT "$dogpaddle.id" AS id, number, square, size FROM even_squares ORDER BY id;'
+```
+
+第一次运行会得到 `0, 2, 4, 6, 8`。现在用同一份 SQL 和同一个 state 目录恢复：
+
+```sh
+cargo run --locked -q -p dogpaddle-sql --example quickstart -- \
+  open crates/sql/examples/quickstart.sql "$demo_dir/flow" 6 0
+
+sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
+  'SELECT "$dogpaddle.id" AS id, number, square, size FROM even_squares ORDER BY id;'
+```
+
+结果会继续增加 `10` 和 `12`。`sequence` 是持续 Scan；quickstart 宿主按参数执行有限轮
+`Flow::advance` 后主动退出，以便直接看到恢复行为。实际应用自行决定推进频率和停止时机。
+
+![一份 SQL 构建并恢复 DogPaddle Flow](docs/assets/sql-quickstart.gif)
+
+*这个本地 quickstart 只依赖 SQLite：先 `build`，再用同一份 SQL 和 state `open`；恢复后继续写入，
+已有结果没有重复。*
+
+[查看 quickstart SQL](crates/sql/examples/quickstart.sql) ·
+[查看 quickstart 宿主](crates/sql/examples/quickstart.rs) ·
+[重新生成 quickstart 录屏](docs/tools/record_sql_quickstart.sh)
+
+## 一个文件就是一条完整 Flow
+
+quickstart 使用的文件没有 Pipeline DDL、Table、View、Catalog 或旁路配置：
 
 ```sql
+-- One statement defines Scan -> Transform -> Sink.
 INSERT INTO sqlite(
-    path => env('DOGPADDLE_SQLITE_PATH'),
+    path => env('DOGPADDLE_QUICKSTART_SQLITE'),
     table => 'even_squares'
 )
 WITH numbers AS (
-    SELECT value FROM sequence(start => 0)
+    SELECT CAST(sequence.value AS BIGINT) AS number
+    FROM sequence(start => 0)
 )
-SELECT value AS number, value * value AS square
+SELECT
+    number,
+    number * number AS square,
+    CASE WHEN number >= 10 THEN 'large' ELSE 'small' END AS size
 FROM numbers
-WHERE value % 2 = 0;
+WHERE number % 2 = 0;
 ```
+
+这条语句直接形成：
+
+```text
+sequence(...)  →  CTE / CAST / WHERE / CASE  →  sqlite(...)
+     Scan                    Transform                 Sink
+```
+
+`build` 先完成 DataFusion 分析、全图 Schema binding 和拓扑校验，再创建 canonical Flow。
+`open` 从磁盘恢复已经提交的 Definition、进度和算子状态，并注入当前运行需要的连接资源。
+凭据可以通过 `env('NAME')` 读取，错误不会打印解析后的秘密。
+
+## 为什么是 DogPaddle
+
+- **SQL 直接描述数据去向**：一个文件覆盖 Scan、转换和 Sink，Rust 宿主只负责生命周期。
+- **恢复是 Flow 的基本语义**：Flow Definition 持久保存；游标与算子进度按提交边界恢复，外部 Sink
+  通过可重放状态收敛。
+- **先验证，再落盘**：SQL、DAG 和 Arrow Schema 全部通过后才创建 state 目录。
+- **Arrow + DataFusion**：变化以 Arrow 批次流动，表达式使用 DataFusion 的类型与向量执行语义。
+- **运行节奏属于应用**：一次 `Flow::advance` 只做有界工作，慢消费者通过持久输出形成软背压。
+
+Rust 中的宿主接口保持很小：
 
 ```rust
 use dogpaddle_sql::SqlProgram;
@@ -55,84 +126,49 @@ let mut flow = program.build("./flow-state")?;
 flow.advance()?;
 
 drop(flow);
-let mut reopened = program.open("./flow-state")?;
-reopened.advance()?;
+let mut flow = program.open("./flow-state")?;
+flow.advance()?;
 ```
 
-Scan endpoint 是 `sequence`、`postgres_cdc`；Sink endpoint 是 `sqlite`、`postgres`、`discard`。
-参数只接受 `name => value`，值为单引号字符串、非负整数或 `env('NAME')`。v1 支持投影、过滤、
-非递归 CTE、派生查询、cast、case 与 `UNION ALL`；Join、Aggregate、Distinct、Sort、Limit、Window、
-子查询表达式和 planner 会忽略的 SQL modifier 都在创建 Store 前拒绝。
+## 当前能力
 
-`build` 使用 DataFusion 做名称解析和类型 coercion，再 lowering 为 canonical Flow Definition；`open`
-只恢复磁盘中的 Definition，并从当前 SQL 取得端点运行资源。修改 SQL 不会更新已有 Flow，必须换 state
-path 或删除旧 Flow 与独占 Sink 目标后重建。凭据可由 `env` 注入且不写入 Definition。
+| 层 | 已实现 |
+| --- | --- |
+| SQL Scan | `sequence(...)`、`postgres_cdc(...)`（试点） |
+| SQL Transform | `SELECT`、`WHERE`、字段别名、非递归 CTE、派生查询、`CAST`、`TRY_CAST`、`CASE`、`UNION ALL` |
+| SQL Sink | `sqlite(...)`、`postgres(...)`（试点）、`discard()` |
+| 运行与恢复 | canonical Flow Definition、持久游标、算子状态、软背压、`Flow::status`、build/open/reopen |
+| 数据模型 | Arrow Schema、批量差分 Change、完整自描述 Arrow IPC Stream |
 
-## 立即体验
-
-```sh
-demo_dir="$(mktemp -d /tmp/dogpaddle-demo.XXXXXX)"
-cargo run --locked -q -p dogpaddle-flow --example sqlite_sink_live -- "$demo_dir" 10 0
-sqlite3 -readonly -header -column "$demo_dir/events.sqlite" \
-  'SELECT "$dogpaddle.id" AS id, number, square FROM even_squares ORDER BY id;'
-```
-
-需要仓库固定的 Rust 1.96 与 `sqlite3` 命令行。
-
-## 已实现
-
-当前共有 12 个内建算子，全部沿用同一套 Definition、Schema binding、Operation turn 与 Flow 调度协议。
-
-| Scan | Transform | Sink |
-| --- | --- | --- |
-| `SequenceScan` · `PostgresCdcScan`（试点） | `RunningEventCount` · `Project` · `Filter` · `Extend` · `Select` · `SchemaAlign` · `UnionAll` | `SqliteSink` · `PostgresSink`（试点） · `Discard` |
-
-`SqliteSink` 首次收到输入后延迟初始化普通 `STRICT` 表，不引入额外 SQLite 元数据表。
-它支持 DogPaddle v1 的全部数据类型，并为 SQLite 与 MDBX 之间的提交窗口保存可重放批次；
-在 Sink 独占目标表且数据库未被外部修改或替换的前提下，重放不会重复最终结果。
-
-`PostgresCdcScan → PostgresSink` 已形成首条 PostgreSQL 到 PostgreSQL 的持续增量链路。CDC Scan 借助
-进程内 `dogpaddle-debezium` 从单表 WAL 捕获固定 Schema 事件，并在 checkpoint 与 Station output
-同事务提交后才 ACK；Sink 将 exact relation 物化到独占的新目标表，与 SQLite 共用固定 ID 的
-幂等批次：先持久化具体工作，再批量 insert-ignore、按 ID delete，提交窗口可在 reopen 后重放。Definition 只保存
-非敏感 spec，numeric IP、端口与凭据只在 build/open 时作为运行资源注入。
-现有验收覆盖大批 insert/delete、提交前后进程终止与恢复，以及同一个 PG 数据库的完整往返；
-Sink 按输入顺序校验关系变化，目标事务内先插后删，不创建回执表。目标列优先保留 Arrow 精确值，
-不是源表原生 SQL 类型的原样镜像；不承诺目标 WAL 事件顺序或整个源事务在目标侧原子可见。
-这是无初始快照、无 TLS 与在线 Schema evolution 的试点；
-[PostgreSQL CDC Scan 使用与边界](crates/operation/README.md#postgresql-cdc-scan-试点) ·
-[Sink 使用与边界](crates/operation/README.md#operationsinkpostgressink)。
+底层目前有 12 个内建 Operation：`SequenceScan`、`PostgresCdcScan`、`RunningEventCount`、
+`Project`、`Filter`、`Extend`、`Select`、`SchemaAlign`、`UnionAll`、`SqliteSink`、
+`PostgresSink` 和 `Discard`。新增 SQL 能力通过明确的 LogicalPlan lowering 映射到这些 Operation，
+运行仍由同一套 Flow 协议负责。
 
 ## 当前边界
 
-- DogPaddle 目前仍是早期引擎内核，优先打磨持久化、恢复和 Schema 边界。
-- 运行由宿主反复调用 `Flow::advance` 驱动；`Flow::status` 可只读查看各 Station 的游标、积压、容量、
-  最近处理结果和是否需要 reopen。尚无 `Flow::start`、后台 runner 或中断控制。
-- Operation 集合目前封闭。
-- SQL v1 只接受一条直接写入一个 Sink endpoint 的 `INSERT ... SELECT`；没有 DDL、Catalog、查询结果返回
+- DogPaddle 仍是早期引擎内核，持久化和恢复已有系统验收，生产加固仍在进行。
+- SQL v1 是明确受限的 streaming SQL 子集。Join、Aggregate、普通 `UNION`、Distinct、Sort、Limit、
+  Window、表达式子查询和依赖函数 registry 的函数会在创建 state 目录前被拒绝。
+- 一个 SQL 文件只接受一条直接写入一个 Sink 的 `INSERT ... SELECT`；没有 DDL、Catalog、查询结果返回
   或自动运行循环。
-- 一个 Store 路径同一时刻只允许一个活动 Flow。
-- PostgreSQL 增量链路尚无初始全量、多表路由、TLS、DNS endpoint、在线 Schema evolution 或跨 Flow fencing；
-  要物化完整关系，源表须在 slot 起点为空并从该起点开始写入。`PostgresSink` 只创建并独占新目标表，
-  不支持 target spec 跨 Flow 接管/共享、外部改表/改数据或数据库替换恢复；生产加固仍属于 D5。
-- `SqliteSink` 同样只创建并独占新目标表；尚无 MySQL 或通用外部 Sink。
-- 当前是开发期 v1，持久格式显式版本化并经过 golden 测试，但不提供跨版本迁移承诺。
+- `open` 以磁盘中的 canonical Flow Definition 为准。修改 SQL 不会热更新已有 Flow；拓扑变更需要新的
+  state 目录，并为独占 Sink 使用新的目标。
+- 一个 state 路径同一时刻只允许一个活动 Flow。SQLite 和 PostgreSQL Sink 都独占自己创建的目标表。
+- PostgreSQL 试点必须从空源表和匹配的新 slot 起点开始；它没有初始全量，不能直接接管已有数据的
+  非空业务表。目前也没有多表路由、TLS、DNS endpoint、在线 Schema evolution 或跨 Flow fencing。
+- `PostgresSink` 创建并独占无损 Arrow 关系表，不镜像源表 DDL；当前文本值按 bytes 保存，所以示例
+  查询使用 `convert_from(...)`。完整约束见 [Operation 文档](crates/operation/README.md)。
+- 当前持久格式经过 golden 与 reopen 测试，但开发期 v1 不提供跨版本迁移承诺。
 
 ## 深入阅读
 
+- [SQL：语法、生命周期与可运行 quickstart](crates/sql/README.md)
+- [Flow：构建、运行与恢复](crates/flow/README.md)
+- [Operation：算子、Schema 绑定与外部端点](crates/operation/README.md)
+- [Change：Arrow 差分与 IPC](crates/change/README.md)
+- [Store：MDBX 事务与集合](crates/store/README.md)
+- [Debezium：自包含进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
 - [算子路线与语义边界](OPERATOR_ROADMAP.md)
 - [Debezium Scan D0–D7 路线图](DEBEZIUM_ROADMAP.md)
-- [ADR-0001：在 Rust 宿主中嵌入 Debezium Engine](docs/adr/0001-embed-debezium-engine.md)
-- [Debezium：自包含进程内 Engine 与 pre-ACK checkpoint](crates/debezium/README.md)
-- [Flow：构建、运行与恢复](crates/flow/README.md)
-- [SQL：单文件语法、lowering 与 reopen](crates/sql/README.md)
-- [Change：Arrow 差分与 IPC](crates/change/README.md)
-- [Operation：定义、Schema 绑定与执行](crates/operation/README.md)
-- [Store：MDBX 事务与集合](crates/store/README.md)
-- [重新生成 PostgreSQL 增量同步录屏](docs/tools/record_postgres_cdc_live.sh)
-- [PostgreSQL Sink 真实验收](system-tests/postgres/check_sink.py)
-- [SQL PostgreSQL 真实恢复验收](system-tests/postgres/check_sql.py)
-- [重新生成 SQLite Sink 录屏](docs/tools/record_sqlite_sink_live.sh)
-- [SqliteSink 端到端测试](crates/flow/tests/correctness/sqlite_sink.rs)
-- [Java、Debezium 与 PostgreSQL 系统验收](system-tests/README.md)
-- [正确性与性能测试](TESTING.md)
+- [正确性、系统验收与性能测试](TESTING.md)

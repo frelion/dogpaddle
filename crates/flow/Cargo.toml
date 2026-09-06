@@ -30,14 +30,6 @@ tempfile.workspace = true
 name = "correctness"
 path = "tests/correctness.rs"
 
-[[example]]
-name = "postgres_sync_live"
-path = "examples/postgres_sync_live.rs"
-
-[[example]]
-name = "sqlite_sink_live"
-path = "examples/sqlite_sink_live.rs"
-
 [[bench]]
 name = "flow_lifecycle"
 path = "benches/flow_lifecycle.rs"

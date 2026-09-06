@@ -1,6 +1,16 @@
 use dogpaddle_sql::{SqlError, SqlProgram};
 
 #[test]
+fn bundled_sql_examples_parse_through_the_public_file_api() {
+    for file in ["quickstart.sql", "postgres_etl.sql"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(file);
+        SqlProgram::read(path).unwrap();
+    }
+}
+
+#[test]
 fn parse_accepts_every_v1_scan_and_sink_endpoint() {
     let postgres = r"
         INSERT INTO postgres(

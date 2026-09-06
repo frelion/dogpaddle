@@ -60,7 +60,7 @@ if [[ "${1:-}" != "--session" ]]; then
     recording_root=""
     asset_staging=""
     data=""
-    output="$repository/docs/assets/postgres-cdc-live.gif"
+    output="$repository/docs/assets/postgres-etl-live.gif"
     started=false
     recorder_pid=""
 
@@ -92,12 +92,12 @@ if [[ "${1:-}" != "--session" ]]; then
     trap cleanup_recording EXIT
     trap abort_recording HUP INT TERM
 
-    recording_root="$(mktemp -d /tmp/dogpaddle-postgres-sync.XXXXXX)"
-    asset_staging="$(mktemp -d "$repository/docs/assets/.postgres-cdc-live.XXXXXX")"
+    recording_root="$(mktemp -d /tmp/dogpaddle-postgres-etl.XXXXXX)"
+    asset_staging="$(mktemp -d "$repository/docs/assets/.postgres-etl-live.XXXXXX")"
     raw_cast="$recording_root/raw.cast"
     clean_cast="$recording_root/clean.cast"
     data="$recording_root/data"
-    staged_output="$asset_staging/postgres-cdc-live.gif"
+    staged_output="$asset_staging/postgres-etl-live.gif"
     port="$(python3 - <<'PY'
 import socket
 
@@ -108,7 +108,7 @@ PY
     )"
 
     cd "$repository"
-    cargo build -q --locked -p dogpaddle-flow --example postgres_sync_live
+    cargo build -q --locked -p dogpaddle-sql --example postgres_etl_live
     "$postgres_bin/initdb" -D "$data" -U dogpaddle_demo --auth=trust \
         --no-instructions --locale=C -E UTF8 >/dev/null
     pg_options="-h 127.0.0.1 -p $port -k $recording_root -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4 -c fsync=on -c synchronous_commit=on"
@@ -120,7 +120,7 @@ PY
     psql_setup=("$postgres_bin/psql" -X -w -q -h 127.0.0.1 -p "$port" \
         -U dogpaddle_demo -d postgres -v ON_ERROR_STOP=1)
     "${psql_setup[@]}" -c \
-        "CREATE SCHEMA source; CREATE SCHEMA target; CREATE TABLE source.orders (id BIGINT PRIMARY KEY, status TEXT NOT NULL); ALTER TABLE source.orders REPLICA IDENTITY FULL; CREATE PUBLICATION orders_publication FOR TABLE source.orders;" \
+        "CREATE SCHEMA sales; CREATE SCHEMA analytics; CREATE TABLE sales.orders (order_id BIGINT PRIMARY KEY, customer TEXT NOT NULL, region TEXT NOT NULL, status TEXT NOT NULL, quantity INTEGER NOT NULL, unit_price_cents BIGINT NOT NULL, discount_pct INTEGER NOT NULL); ALTER TABLE sales.orders REPLICA IDENTITY FULL; CREATE PUBLICATION orders_publication FOR TABLE sales.orders;" \
         >/dev/null
     "${psql_setup[@]}" -c \
         "SELECT pg_create_logical_replication_slot('orders_slot', 'pgoutput');" \
@@ -132,7 +132,7 @@ PY
     export DOGPADDLE_RECORD_PORT="$port"
     record_command="/bin/zsh ${(q)script_path} --session"
     TERM=xterm-256color asciinema record -q --headless --overwrite --return \
-        --window-size 144x30 --command "$record_command" "$raw_cast" &
+        --window-size 168x34 --command "$record_command" "$raw_cast" &
     recorder_pid=$!
     if ! wait "$recorder_pid"; then
         recorder_pid=""
@@ -150,7 +150,7 @@ source, destination = sys.argv[1:]
 after_success = False
 finished = False
 tail = ""
-success_marker = "SAME PG SYNC RESUMED"
+success_marker = "SQL ETL RESUMED"
 prompt_marker = "dst> "
 with open(source, encoding="utf-8") as input_file, open(
     destination, "w", encoding="utf-8"
@@ -175,7 +175,7 @@ if not finished:
     raise SystemExit("recording ended before the final PostgreSQL result")
 PY
     agg --quiet --font-size 15 --line-height 1.15 --theme github-dark \
-        --fps-cap 10 --idle-time-limit 0.8 --last-frame-duration 2 \
+        --fps-cap 10 --idle-time-limit 1.2 --last-frame-duration 2 \
         --select 1.5..100% \
         "$clean_cast" "$staged_output"
     if ! stop_postgres; then
@@ -192,12 +192,13 @@ recording_root="${DOGPADDLE_RECORD_ROOT:?missing recording root}"
 bundle="${DOGPADDLE_RECORD_BUNDLE:?missing runtime bundle}"
 postgres_bin="${DOGPADDLE_RECORD_POSTGRES_BIN:?missing PostgreSQL binaries}"
 port="${DOGPADDLE_RECORD_PORT:?missing PostgreSQL port}"
-binary="$repository/target/debug/examples/postgres_sync_live"
+binary="$repository/target/debug/examples/postgres_etl_live"
+sql_path="$repository/crates/sql/examples/postgres_etl.sql"
 flow_path="$recording_root/flow"
 host_input="$recording_root/host.in"
 host_output="$recording_root/host.out"
 status_input="$recording_root/status.in"
-session="dogpaddle-postgres-sync-$$"
+session="dogpaddle-postgres-etl-$$"
 driver_pid=""
 
 mkfifo "$host_input" "$host_output" "$status_input"
@@ -227,21 +228,20 @@ source_check=("$postgres_bin/psql" -X -w -Atq -h 127.0.0.1 -p "$port" \
 target_check=("$postgres_bin/psql" -X -w -Atq -h 127.0.0.1 -p "$port" \
     -U dogpaddle_demo -d postgres -v ON_ERROR_STOP=1)
 
-left="$(tmux new-session -d -s "$session" -x 144 -y 30 -P -F '#{pane_id}' \
+left="$(tmux new-session -d -s "$session" -x 168 -y 34 -P -F '#{pane_id}' \
     -c "$repository" "${(q)origin_psql[@]}")"
-middle="$(tmux split-window -h -p 66 -t "$left" -P -F '#{pane_id}' -c "$repository" \
+middle="$(tmux split-window -h -p 69 -t "$left" -P -F '#{pane_id}' -c "$repository" \
     "/bin/bash -c 'while IFS= read -r line; do printf \"%s\\n\" \"\$line\"; done < ${(q)status_input}'")"
-right="$(tmux split-window -h -p 50 -t "$middle" -P -F '#{pane_id}' -c "$repository" \
+right="$(tmux split-window -h -p 45 -t "$middle" -P -F '#{pane_id}' -c "$repository" \
     "${(q)target_psql[@]}")"
-tmux select-layout -t "$session" even-horizontal >/dev/null
 tmux set-option -t "$session" status off
 tmux set-option -t "$session" remain-on-exit on
 tmux set-option -t "$session" pane-border-status top
 tmux set-option -t "$session" pane-border-format \
     '#[fg=colour39,bold] #{pane_title} #[default]'
-tmux select-pane -t "$left" -T 'POSTGRESQL / source.orders'
-tmux select-pane -t "$middle" -T 'DOGPADDLE / durable Flow'
-tmux select-pane -t "$right" -T 'SAME PG / target.orders'
+tmux select-pane -t "$left" -T 'POSTGRESQL / sales.orders'
+tmux select-pane -t "$middle" -T 'DOGPADDLE SQL / live ETL'
+tmux select-pane -t "$right" -T 'POSTGRESQL / analytics.order_insights'
 tmux select-pane -t "$left"
 
 (
@@ -282,9 +282,11 @@ tmux select-pane -t "$left"
     start_host() {
         local mode="$1"
         local number="$2"
-        DOGPADDLE_SCAN_PASSWORD=recording-secret-not-persisted \
-        DOGPADDLE_TARGET_PASSWORD=recording-secret-not-persisted \
-            "$binary" "$mode" "$flow_path" "$bundle" "$port" \
+        DOGPADDLE_POSTGRES_ETL_BUNDLE="$bundle" \
+        DOGPADDLE_POSTGRES_ETL_PORT="$port" \
+        DOGPADDLE_POSTGRES_ETL_USER=dogpaddle_demo \
+        DOGPADDLE_POSTGRES_ETL_PASSWORD=recording-secret-not-persisted \
+            "$binary" "$mode" "$sql_path" "$flow_path" \
             <"$host_input" >"$host_output" \
             2>"$recording_root/flow-$number.log" 3>&- 4>&- 5>&- &
         host_pid=$!
@@ -301,6 +303,24 @@ tmux select-pane -t "$left"
             echo "unexpected Flow host response: $host_response" >&2
             exit 1
         fi
+    }
+    sink_has_backlog() {
+        python3 - "$host_response" <<'PY'
+import json
+import sys
+
+sink = json.loads(sys.argv[1])["sink"]
+raise SystemExit(0 if sink["cursor"] < sink["tail"] else 1)
+PY
+    }
+    sink_is_caught_up() {
+        python3 - "$host_response" <<'PY'
+import json
+import sys
+
+sink = json.loads(sys.argv[1])["sink"]
+raise SystemExit(0 if sink["cursor"] == sink["tail"] else 1)
+PY
     }
     slot_is_active() {
         [[ "$("${source_check[@]}" -c "SELECT active FROM pg_replication_slots WHERE slot_name='orders_slot'")" == t ]]
@@ -328,18 +348,28 @@ tmux select-pane -t "$left"
     }
     source_state() {
         "${source_check[@]}" -c \
-            "SELECT COALESCE(string_agg(id::text || ':' || status, ',' ORDER BY id), '') FROM source.orders;"
+            "SELECT COALESCE(string_agg(order_id::text || ':' || customer || ':' || region || ':' || status || ':' || quantity::text || ':' || unit_price_cents::text || ':' || discount_pct::text, ',' ORDER BY order_id), '') FROM sales.orders;"
     }
     target_state() {
-        if [[ "$("${target_check[@]}" -c "SELECT to_regclass('target.orders') IS NOT NULL")" != t ]]; then
+        if [[ "$("${target_check[@]}" -c "SELECT to_regclass('analytics.order_insights') IS NOT NULL")" != t ]]; then
             return 0
         fi
         "${target_check[@]}" -c \
-            "SELECT COALESCE(string_agg(id::text || ':' || convert_from(status, 'UTF8'), ',' ORDER BY id, \"\$dogpaddle.id\"), '') FROM target.orders;"
+            "SELECT COALESCE(string_agg(order_id::text || ':' || convert_from(customer, 'UTF8') || ':' || convert_from(market, 'UTF8') || ':' || gross_cents::text || ':' || net_cents::text || ':' || convert_from(lane, 'UTF8') || ':' || CASE WHEN attention IS NULL THEN '<null>' ELSE convert_from(attention, 'UTF8') END, ',' ORDER BY order_id, \"\$dogpaddle.id\"), '') FROM analytics.order_insights;"
     }
     target_ids() {
         "${target_check[@]}" -c \
-            "SELECT COALESCE(string_agg(\"\$dogpaddle.id\"::text, ',' ORDER BY \"\$dogpaddle.id\"), '') FROM target.orders;"
+            "SELECT COALESCE(string_agg(\"\$dogpaddle.id\"::text, ',' ORDER BY \"\$dogpaddle.id\"), '') FROM analytics.order_insights;"
+    }
+    target_id() {
+        "${target_check[@]}" -c \
+            "SELECT \"\$dogpaddle.id\" FROM analytics.order_insights WHERE order_id=$1;"
+    }
+    attention_is_nullable() {
+        local value
+        value="$("${target_check[@]}" -c \
+            "SELECT is_nullable FROM information_schema.columns WHERE table_schema='analytics' AND table_name='order_insights' AND column_name='attention'")"
+        [[ "$value" == YES ]]
     }
     wait_for_source() {
         local expected="$1"
@@ -375,17 +405,47 @@ tmux select-pane -t "$left"
         tmux send-keys -t "$left" C-l
         tmux send-keys -t "$left" -l 'INSERT INTO orders VALUES'
         tmux send-keys -t "$left" Enter
-        tmux send-keys -t "$left" -l "  (1,'new'), (2,'queued')"
+        tmux send-keys -t "$left" -l \
+            " (101,'Acme','cn-east','new',3,5000,10),"
+        tmux send-keys -t "$left" Enter
+        tmux send-keys -t "$left" -l \
+            " (102,'Orbit','eu-west','paid',2,4000,0),"
+        tmux send-keys -t "$left" Enter
+        tmux send-keys -t "$left" -l \
+            " (103,'Nova','cn-south','paid',4,8000,25)"
         tmux send-keys -t "$left" -H 3b
         tmux send-keys -t "$left" Enter
     }
     show_target() {
         tmux send-keys -t "$right" C-l
-        tmux send-keys -t "$right" -l "SELECT id,convert_from(status,'UTF8')"
+        tmux send-keys -t "$right" -l 'SELECT order_id id,'
         tmux send-keys -t "$right" Enter
-        tmux send-keys -t "$right" -l '  AS status FROM orders ORDER BY id'
+        tmux send-keys -t "$right" -l \
+            " convert_from(market,'UTF8') market,"
+        tmux send-keys -t "$right" Enter
+        tmux send-keys -t "$right" -l ' net_cents net,'
+        tmux send-keys -t "$right" Enter
+        tmux send-keys -t "$right" -l \
+            " convert_from(lane,'UTF8') lane,"
+        tmux send-keys -t "$right" Enter
+        tmux send-keys -t "$right" -l \
+            " CASE WHEN attention IS NULL THEN '-'"
+        tmux send-keys -t "$right" Enter
+        tmux send-keys -t "$right" -l \
+            " ELSE convert_from(attention,'UTF8') END attention"
+        tmux send-keys -t "$right" Enter
+        tmux send-keys -t "$right" -l 'FROM order_insights ORDER BY id'
         tmux send-keys -t "$right" -H 3b
         tmux send-keys -t "$right" Enter
+    }
+    show_sql_range() {
+        local first="$1"
+        local last="$2"
+        status $'\033[2J\033[H'
+        status "$ sed -n '${first},${last}p' crates/sql/examples/postgres_etl.sql"
+        while IFS= read -r line; do
+            status "$line"
+        done < <(sed -n "${first},${last}p" "$sql_path")
     }
 
     sleep 0.8
@@ -397,53 +457,87 @@ tmux select-pane -t "$left"
     tmux send-keys -t "$right" Enter
     tmux send-keys -t "$right" -l "\\set PROMPT2 '...> '"
     tmux send-keys -t "$right" Enter
-    tmux send-keys -t "$left" -l 'SET search_path=source'
+    tmux send-keys -t "$left" -l 'SET search_path=sales'
     tmux send-keys -t "$left" -H 3b
     tmux send-keys -t "$left" Enter
-    tmux send-keys -t "$right" -l 'SET search_path=target'
+    tmux send-keys -t "$right" -l 'SET search_path=analytics'
     tmux send-keys -t "$right" -H 3b
     tmux send-keys -t "$right" Enter
     sleep 0.2
     tmux send-keys -t "$left" C-l
     tmux send-keys -t "$right" C-l
-    status $'\033[38;5;245mone PostgreSQL · WAL-only · no snapshot\033[0m'
-    status 'source.orders'
-    status '    │ WAL / pgoutput'
-    status '    ▼ Arrow Change'
-    status 'PostgresCdcScan → PostgresSink'
-    status '    │ stable IDs + batched writes'
+    sql_first=1
+    sql_total="$(wc -l < "$sql_path")"
+    while (( sql_first <= sql_total )); do
+        sql_last=$(( sql_first + 23 ))
+        if (( sql_last > sql_total )); then
+            sql_last="$sql_total"
+        fi
+        show_sql_range "$sql_first" "$sql_last"
+        sleep 1.1
+        sql_first=$(( sql_last + 1 ))
+    done
+
+    status $'\033[2J\033[H\033[1;38;5;45mONE SQL FILE → LIVE ETL\033[0m'
+    status $'\033[38;5;245mone PostgreSQL · same database · WAL-only\033[0m'
+    status 'sales.orders'
+    status '    │ postgres_cdc(...) / Arrow Change'
     status '    ▼'
-    status 'target.orders'
+    status 'CAST → multiply/divide → CASE → WHERE'
+    status '    │ CTE fan-out / UNION ALL'
+    status '    ▼'
+    status 'postgres(analytics.order_insights)'
     status ''
-    status 'opening durable Flow...'
+    status 'RUN postgres_etl.sql  [build]'
     start_host build 1
     wait_for_slot
+    success 'SQL compiled into a durable Flow'
     success 'WAL stream connected'
     sleep 0.7
 
+    initial_source='101:Acme:cn-east:new:3:5000:10,102:Orbit:eu-west:paid:2:4000:0,103:Nova:cn-south:paid:4:8000:25'
+    initial_target='103:Nova:China:32000:24000:standard:regional'
     run_initial_insert
-    wait_for_source '1:new,2:queued'
-    drive_until '1:new,2:queued'
-    success 'INSERT ×2 synced'
+    wait_for_source "$initial_source"
+    drive_until "$initial_target"
+    if ! attention_is_nullable; then
+        echo "UNION ALL did not preserve the nullable attention Schema" >&2
+        exit 1
+    fi
+    success 'INSERT: filtered, priced, classified'
+    show_target
+    sleep 1.2
+
+    paid_source='101:Acme:cn-east:paid:3:5000:10,102:Orbit:eu-west:paid:2:4000:0,103:Nova:cn-south:paid:4:8000:25'
+    paid_target='101:Acme:China:15000:13500:standard:regional,103:Nova:China:32000:24000:standard:regional'
+    run_source "UPDATE orders SET status='paid' WHERE order_id=101"
+    wait_for_source "$paid_source"
+    drive_until "$paid_target"
+    success 'UPDATE: pending order now qualifies'
+    show_target
+    sleep 1.2
+
+    repriced_source='101:Acme:cn-east:paid:3:5000:10,102:Orbit:eu-west:paid:2:4000:0,103:Nova:cn-south:paid:6:8000:0'
+    repriced_target='101:Acme:China:15000:13500:standard:regional,103:Nova:China:48000:48000:priority:regional'
+    run_source 'UPDATE orders SET quantity=6, discount_pct=0 WHERE order_id=103'
+    wait_for_source "$repriced_source"
+    drive_until "$repriced_target"
+    success 'UPDATE: net amount and lane recalculated'
+    show_target
+    sleep 1.2
+
+    deleted_source='102:Orbit:eu-west:paid:2:4000:0,103:Nova:cn-south:paid:6:8000:0'
+    deleted_target='103:Nova:China:48000:48000:priority:regional'
+    run_source 'DELETE FROM orders WHERE order_id=101'
+    wait_for_source "$deleted_source"
+    drive_until "$deleted_target"
+    success 'DELETE: transformed result retracted'
     show_target
     sleep 1.1
-
-    run_source "UPDATE orders SET status='paid' WHERE id=1"
-    wait_for_source '1:paid,2:queued'
-    drive_until '1:paid,2:queued'
-    success 'UPDATE synced'
-    show_target
-    sleep 1.1
-
-    run_source 'DELETE FROM orders WHERE id=2'
-    wait_for_source '1:paid'
-    drive_until '1:paid'
-    success 'DELETE synced'
-    show_target
-    sleep 1.0
 
     ids_before="$(target_ids)"
-    if [[ -z "$ids_before" ]]; then
+    id_before="$(target_id 103)"
+    if [[ -z "$ids_before" || -z "$id_before" ]] || ! sink_has_backlog; then
         echo "target row was not committed before restart" >&2
         exit 1
     fi
@@ -456,32 +550,45 @@ tmux select-pane -t "$left"
     status $'\033[38;5;214m● Flow host stopped (SIGKILL)\033[0m'
     sleep 0.8
 
+    status 'RUN postgres_etl.sql  [open same state]'
     start_host open 2
     status $'\033[38;5;45m↻ reopened from durable Flow state\033[0m'
     host_request advance
+    if ! sink_has_backlog; then
+        echo "reopen did not restore the unsettled sink input" >&2
+        exit 1
+    fi
     host_request advance
+    if ! sink_is_caught_up; then
+        echo "reopen did not settle the replayed sink input" >&2
+        exit 1
+    fi
     wait_for_slot
-    if [[ "$(target_state)" != '1:paid' || "$(target_ids)" != "$ids_before" ]]; then
+    if [[ "$(target_state)" != "$deleted_target" || "$(target_ids)" != "$ids_before" \
+        || "$(target_id 103)" != "$id_before" ]]; then
         echo "target data or stable IDs changed while replaying the prepared batch" >&2
         exit 1
     fi
-    success 'committed batch recovered without duplicates'
+    success 'committed result recovered without duplicates'
     sleep 0.9
 
-    run_source "INSERT INTO orders VALUES(3,'live')"
-    wait_for_source '1:paid,3:live'
-    drive_until '1:paid,3:live'
+    resumed_source='102:Orbit:eu-west:paid:2:4000:0,103:Nova:cn-south:paid:6:8000:0,104:Kestrel:us-west:paid:5:10000:20'
+    resumed_target='103:Nova:China:48000:48000:priority:regional,104:Kestrel:Global:50000:40000:priority:review'
+    run_source "INSERT INTO orders VALUES(104,'Kestrel','us-west','paid',5,10000,20)"
+    wait_for_source "$resumed_source"
+    drive_until "$resumed_target"
     host_request advance
-    if [[ "$(target_state)" != '1:paid,3:live' ]] \
-        || [[ "$(target_ids)" == "$ids_before" ]]; then
+    if [[ "$(target_state)" != "$resumed_target" ]] \
+        || [[ "$(target_ids)" == "$ids_before" ]] \
+        || [[ "$(target_id 103)" != "$id_before" ]]; then
         echo "post-restart witness did not converge" >&2
         exit 1
     fi
-    success 'new WAL change synced after reopen'
+    success 'new row transformed after reopen'
     show_target
     sleep 1.0
     status ''
-    status $'\033[1;38;5;78mSAME PG SYNC RESUMED\033[0m'
+    status $'\033[1;38;5;78mSQL ETL RESUMED\033[0m'
     tmux send-keys -t "$right" Enter
     sleep 1.5
 ) &

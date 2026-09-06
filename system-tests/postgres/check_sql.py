@@ -42,14 +42,16 @@ def until(description: str, observe: Callable[[], bool]) -> None:
 
 class Host:
     def __init__(self, binary: Path, mode: str, sql: Path, flow: Path,
-                 log: Path) -> None:
+                 log: Path, environment: dict[str, str]) -> None:
         self.stderr = log.open("w", encoding="utf-8")
         try:
+            host_environment = dict(os.environ)
+            host_environment.update(environment)
             self.process = subprocess.Popen(
                 [str(binary), mode, str(sql), str(flow)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
                 text=True, bufsize=1,
-                env=dict(os.environ, DOGPADDLE_SQL_GATE_PASSWORD=PASSWORD),
+                env=host_environment,
             )
         except BaseException:
             self.stderr.close()
@@ -124,12 +126,21 @@ class Gate:
         self.bundle, self.binary = bundle, binary
         self.cluster = cluster
         self.flow = root / "flow"
-        self.program = root / "pipeline.sql"
+        repository = Path(__file__).resolve().parents[2]
+        self.program = (
+            repository / "crates/sql/examples/postgres_etl.sql"
+        ).resolve(strict=True)
         self.port = cluster.port
         self.pg_env = dict(os.environ, PGPASSWORD=PASSWORD)
         self.psql = [str(pg_bin / "psql"), "-X", "-h", "127.0.0.1",
                      "-p", str(self.port), "-U", "dogpaddle_gate",
                      "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-At"]
+        self.host_environment = {
+            "DOGPADDLE_POSTGRES_ETL_BUNDLE": str(bundle),
+            "DOGPADDLE_POSTGRES_ETL_PORT": str(self.port),
+            "DOGPADDLE_POSTGRES_ETL_USER": "dogpaddle_gate",
+            "DOGPADDLE_POSTGRES_ETL_PASSWORD": PASSWORD,
+        }
 
     def start(self) -> None:
         password_file = self.root / "password"
@@ -177,88 +188,83 @@ class Gate:
 
     def prepare(self) -> None:
         self.sql(
-            "CREATE SCHEMA source; CREATE SCHEMA target; "
-            "CREATE TABLE source.events ("
-            "id BIGINT PRIMARY KEY, tx_seq INTEGER NOT NULL, payload TEXT NOT NULL); "
-            "ALTER TABLE source.events REPLICA IDENTITY FULL; "
-            "CREATE PUBLICATION events_publication FOR TABLE source.events"
+            "CREATE SCHEMA sales; CREATE SCHEMA analytics; "
+            "CREATE TABLE sales.orders ("
+            "order_id BIGINT PRIMARY KEY, customer TEXT NOT NULL, "
+            "region TEXT NOT NULL, status TEXT NOT NULL, "
+            "quantity INTEGER NOT NULL, unit_price_cents BIGINT NOT NULL, "
+            "discount_pct INTEGER NOT NULL); "
+            "ALTER TABLE sales.orders REPLICA IDENTITY FULL; "
+            "CREATE PUBLICATION orders_publication FOR TABLE sales.orders"
         )
         self.sql(
             "SELECT * FROM pg_create_logical_replication_slot("
-            "'events_slot', 'pgoutput')"
-        )
-        bundle = str(self.bundle).replace("'", "''")
-        self.program.write_text(
-            f"""-- One SQL file defines scan, transforms, and sink.
-INSERT INTO postgres(
-    sink_id => 'sql_gate_sink',
-    host => '127.0.0.1',
-    port => {self.port},
-    database => 'postgres',
-    user => 'dogpaddle_gate',
-    password => env('DOGPADDLE_SQL_GATE_PASSWORD'),
-    schema => 'target',
-    table => 'events'
-)
-WITH even_events AS (
-    SELECT id, tx_seq, payload
-    FROM postgres_cdc(
-        engine_name => 'sql_gate_scan',
-        runtime_bundle => '{bundle}',
-        host => '127.0.0.1',
-        port => {self.port},
-        database => 'postgres',
-        user => 'dogpaddle_gate',
-        password => env('DOGPADDLE_SQL_GATE_PASSWORD'),
-        schema => 'source',
-        table => 'events',
-        slot => 'events_slot',
-        publication => 'events_publication'
-    )
-    WHERE tx_seq % 2 = 0
-)
-SELECT id, tx_seq, payload
-FROM even_events
-WHERE tx_seq % 4 = 0
-UNION ALL
-SELECT id, tx_seq,
-       CASE WHEN tx_seq % 4 = 2 THEN payload ELSE NULL END AS payload
-FROM even_events
-WHERE tx_seq % 4 = 2;
-""",
-            encoding="utf-8",
+            "'orders_slot', 'pgoutput')"
         )
 
     def slot_active(self) -> bool:
         return self.sql(
             "SELECT active FROM pg_replication_slots "
-            "WHERE slot_name = 'events_slot'"
+            "WHERE slot_name = 'orders_slot'"
         ) == "t"
 
-    def rows(self) -> list[tuple[int, int, int, str]]:
-        if self.sql("SELECT to_regclass('target.events') IS NOT NULL") != "t":
+    def rows(self) -> list[tuple[int, int, str, str, int, int, str,
+                               Optional[str]]]:
+        if self.sql(
+            "SELECT to_regclass('analytics.order_insights') IS NOT NULL"
+        ) != "t":
             return []
         values = self.sql(
-            'SELECT "$dogpaddle.id", id, tx_seq, convert_from(payload, \'UTF8\') '
-            'FROM target.events ORDER BY id'
+            'SELECT "$dogpaddle.id", order_id, '
+            "convert_from(customer, 'UTF8'), convert_from(market, 'UTF8'), "
+            "gross_cents, net_cents, convert_from(lane, 'UTF8'), "
+            "attention IS NULL, COALESCE(convert_from(attention, 'UTF8'), '') "
+            "FROM analytics.order_insights ORDER BY order_id"
         )
         if not values:
             return []
-        return [
-            (int(technical_id), int(row_id), int(tx_seq), payload)
-            for technical_id, row_id, tx_seq, payload in
-            (line.split("|", 3) for line in values.splitlines())
-        ]
+        rows = []
+        for line in values.splitlines():
+            (technical_id, order_id, customer, market, gross_cents,
+             net_cents, lane, attention_is_null, attention) = line.split("|", 8)
+            if attention_is_null not in {"t", "f"}:
+                raise RuntimeError(
+                    f"invalid PostgreSQL NULL marker: {attention_is_null}"
+                )
+            if attention_is_null == "t" and attention:
+                raise RuntimeError("NULL attention unexpectedly has a value")
+            rows.append((
+                int(technical_id),
+                int(order_id),
+                customer,
+                market,
+                int(gross_cents),
+                int(net_cents),
+                lane,
+                None if attention_is_null == "t" else attention,
+            ))
+        return rows
+
+    def logical_rows(self) -> list[tuple[int, str, str, int, int, str,
+                                        Optional[str]]]:
+        return [row[1:] for row in self.rows()]
+
+    def technical_ids(self) -> dict[int, int]:
+        rows = self.rows()
+        ids = {row[1]: row[0] for row in rows}
+        if len(ids) != len(rows):
+            raise RuntimeError("target contains duplicate logical order IDs")
+        return ids
 
     def target_insert_count(self) -> int:
         log = (self.root / "postgres.log").read_text(
             encoding="utf-8", errors="replace"
         )
-        return log.count('INSERT INTO "target"."events" (')
+        return log.count('INSERT INTO "analytics"."order_insights" (')
 
     def host(self, mode: str, session: int) -> Host:
         return Host(self.binary, mode, self.program, self.flow,
-                    self.root / f"host-{session}.log")
+                    self.root / f"host-{session}.log", self.host_environment)
 
     def drive(self, host: Host, description: str,
               done: Callable[[], bool]) -> None:
@@ -280,30 +286,55 @@ WHERE tx_seq % 4 = 2;
         until(description, settled)
 
     def run_gate(self) -> None:
-        first = [(1, 2, 2, "even")]
+        first = [
+            (103, "Nova", "China", 32_000, 24_000, "standard", "regional"),
+            (104, "Kite", "Global", 50_000, 40_000, "priority", "review"),
+        ]
         with self.host("build", 1) as host:
             self.drive(host, "SQL CDC connector starts", self.slot_active)
             self.sql(
-                "INSERT INTO source.events VALUES "
-                "(1, 1, 'odd'), (2, 2, 'even')"
+                "INSERT INTO sales.orders VALUES "
+                "(101, 'Acme', 'cn-east', 'new', 3, 5000, 10), "
+                "(102, 'Orbit', 'eu-west', 'paid', 2, 4000, 0), "
+                "(103, 'Nova', 'cn-south', 'paid', 4, 8000, 25), "
+                "(104, 'Kite', 'us-west', 'paid', 5, 10000, 20)"
             )
 
             def first_target_commit() -> bool:
                 response = host.advance()
-                rows = self.rows()
+                rows = self.logical_rows()
                 sink = response["sink"]
-                if rows and (
+                if len(rows) != len(set(rows)) or not set(rows).issubset(first):
+                    raise RuntimeError(f"invalid partial ETL target relation: {rows}")
+                if rows != first:
+                    return False
+                if (
                     response["outcome"] != "Progressed"
                     or sink["cursor"] >= sink["tail"]
-                    or rows != first
                 ):
-                    raise RuntimeError(f"invalid first filtered target batch: {rows}")
-                return rows == first
+                    raise RuntimeError(
+                        "first ETL result was not observed at the Prepared crash point"
+                    )
+                return True
 
-            until("first filtered target batch commits", first_target_commit)
+            until("first multi-stage ETL result commits", first_target_commit)
+            first_rows = self.rows()
+            first_ids = self.technical_ids()
+            if (
+                set(first_ids) != {103, 104}
+                or len(set(first_ids.values())) != len(first_ids)
+            ):
+                raise RuntimeError(f"invalid initial technical IDs: {first_ids}")
             first_insert_count = self.target_insert_count()
             if first_insert_count == 0:
                 raise RuntimeError("PostgreSQL did not log the first target INSERT")
+            if self.sql(
+                "SELECT is_nullable FROM information_schema.columns "
+                "WHERE table_schema = 'analytics' "
+                "AND table_name = 'order_insights' "
+                "AND column_name = 'attention'"
+            ) != "YES":
+                raise RuntimeError("UNION common Schema did not widen attention")
             # The target write committed during the command above. No next Flow
             # round settles its durable Prepared state before this process exit.
             host.kill()
@@ -314,44 +345,123 @@ WHERE tx_seq % 4 = 2;
             if (
                 replay["outcome"] != "Progressed"
                 or replay["sink"]["cursor"] >= replay["sink"]["tail"]
-                or self.rows() != first
+                or self.rows() != first_rows
             ):
-                raise RuntimeError("Prepared replay duplicated or changed the first target row")
+                raise RuntimeError("Prepared replay duplicated or changed the ETL result")
             until(
                 "Prepared target INSERT is replayed",
                 lambda: self.target_insert_count() > first_insert_count,
             )
             self.drive(host, "reopened SQL CDC connector starts", self.slot_active)
             self.settle(host, "reopened Flow settles")
-            if self.rows() != first:
-                raise RuntimeError("settling Prepared replay changed the target relation")
+            if self.rows() != first_rows or self.technical_ids() != first_ids:
+                raise RuntimeError(
+                    "settling Prepared replay changed rows or stable technical IDs"
+                )
 
             self.sql(
-                "BEGIN; "
-                "UPDATE source.events SET tx_seq = 4, payload = 'became-even' WHERE id = 1; "
-                "UPDATE source.events SET tx_seq = 3, payload = 'became-odd' WHERE id = 2; "
-                "INSERT INTO source.events VALUES (3, 6, 'after-reopen'); "
-                "COMMIT"
+                "UPDATE sales.orders SET status = 'paid' WHERE order_id = 101"
             )
-            expected = [
-                (2, 1, 4, "became-even"),
-                (3, 3, 6, "after-reopen"),
+            entered = [
+                (101, "Acme", "China", 15_000, 13_500, "standard", "regional"),
+                *first,
             ]
-            self.drive(host, "filtered updates reach the PostgreSQL sink",
-                       lambda: self.rows() == expected)
-            self.settle(host, "updated Flow settles")
-            if self.rows() != expected:
-                raise RuntimeError("settling the updated Flow changed its target rows")
+            self.drive(
+                host,
+                "an update makes a previously filtered order qualify",
+                lambda: self.logical_rows() == entered,
+            )
+            self.settle(host, "newly qualified order settles")
+            if self.logical_rows() != entered:
+                raise RuntimeError("settling changed the newly qualified result")
+            entered_ids = self.technical_ids()
+            if (
+                entered_ids[103] != first_ids[103]
+                or entered_ids[104] != first_ids[104]
+                or entered_ids[101] in first_ids.values()
+            ):
+                raise RuntimeError(
+                    f"unrelated rows changed identity after qualifying update: {entered_ids}"
+                )
+
+            self.sql(
+                "UPDATE sales.orders SET quantity = 6, discount_pct = 0 "
+                "WHERE order_id = 103"
+            )
+            repriced = [
+                entered[0],
+                (103, "Nova", "China", 48_000, 48_000, "priority", "regional"),
+                entered[2],
+            ]
+            self.drive(
+                host,
+                "arithmetic and CASE results change after repricing",
+                lambda: self.logical_rows() == repriced,
+            )
+            self.settle(host, "repriced order settles")
+            if self.logical_rows() != repriced:
+                raise RuntimeError("settling changed the repriced result")
+            repriced_ids = self.technical_ids()
+            if (
+                repriced_ids[101] != entered_ids[101]
+                or repriced_ids[104] != entered_ids[104]
+                or repriced_ids[103] <= max(entered_ids.values())
+            ):
+                raise RuntimeError(
+                    f"repricing did not replace exactly one stable relation row: {repriced_ids}"
+                )
+
+            self.sql("DELETE FROM sales.orders WHERE order_id = 104")
+            deleted = repriced[:2]
+            self.drive(
+                host,
+                "deleting a source order retracts its Global result",
+                lambda: self.logical_rows() == deleted,
+            )
+            self.settle(host, "source deletion settles")
+            if self.logical_rows() != deleted:
+                raise RuntimeError("settling changed the source deletion result")
+            if self.technical_ids() != {
+                101: repriced_ids[101],
+                103: repriced_ids[103],
+            }:
+                raise RuntimeError("source deletion changed an unrelated technical ID")
+
+            self.sql(
+                "INSERT INTO sales.orders VALUES "
+                "(105, 'Lumen', 'us-west', 'paid', 2, 7000, 0)"
+            )
+            final = [
+                *deleted,
+                (105, "Lumen", "Global", 14_000, 14_000, "standard", None),
+            ]
+            self.drive(
+                host,
+                "a successor INSERT reaches the Global UNION ALL branch",
+                lambda: self.logical_rows() == final,
+            )
+            self.settle(host, "successor INSERT settles")
+            if self.logical_rows() != final:
+                raise RuntimeError("settling changed the successor INSERT result")
+            final_ids = self.technical_ids()
+            if (
+                final_ids[101] != repriced_ids[101]
+                or final_ids[103] != repriced_ids[103]
+                or final_ids[105] <= max(repriced_ids.values())
+            ):
+                raise RuntimeError(
+                    f"successor INSERT changed existing IDs or reused the frontier: {final_ids}"
+                )
             if self.sql(
                 "SELECT schemaname || '.' || tablename FROM pg_publication_tables "
-                "WHERE pubname = 'events_publication'"
-            ) != "source.events":
+                "WHERE pubname = 'orders_publication'"
+            ) != "sales.orders":
                 raise RuntimeError("CDC publication captured the SQL sink target")
 
         print(
-            "PASS SQL postgres_cdc -> CTE/filter/nullable UNION ALL -> postgres "
-            "build, filtered updates, PG-committed/Prepared crash, idempotent "
-            "reopen, and successor"
+            "PASS checked-in SQL postgres_cdc -> four CTEs/arithmetic/CASE/filter/"
+            "nullable UNION ALL -> postgres build, INSERT/UPDATE/DELETE, "
+            "PG-committed/Prepared crash, idempotent reopen, and successor"
         )
 
 

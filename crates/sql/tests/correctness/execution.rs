@@ -8,6 +8,52 @@ const TABLE: &str = "selected_numbers";
 const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[test]
+fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("quickstart.sqlite");
+    let sql = include_str!("../../examples/quickstart.sql").replace(
+        "env('DOGPADDLE_QUICKSTART_SQLITE')",
+        &format!("'{}'", sql_string(&sqlite_path)),
+    );
+    let program = SqlProgram::parse(&sql).unwrap();
+
+    let mut flow = program.build(&flow_path).unwrap();
+    for _ in 0..12 {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    drop(flow);
+    assert_eq!(
+        quickstart_rows(&sqlite_path),
+        [
+            (0, 0, "small".to_owned()),
+            (2, 4, "small".to_owned()),
+            (4, 16, "small".to_owned()),
+            (6, 36, "small".to_owned()),
+            (8, 64, "small".to_owned()),
+        ]
+    );
+
+    let mut flow = program.open(&flow_path).unwrap();
+    for _ in 0..6 {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    drop(flow);
+    assert_eq!(
+        quickstart_rows(&sqlite_path),
+        [
+            (0, 0, "small".to_owned()),
+            (2, 4, "small".to_owned()),
+            (4, 16, "small".to_owned()),
+            (6, 36, "small".to_owned()),
+            (8, 64, "small".to_owned()),
+            (10, 100, "large".to_owned()),
+            (12, 144, "large".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn projection_executes_qualified_coerced_expressions_into_sqlite() {
     let root = tempfile::tempdir().unwrap();
     let sqlite_path = root.path().join("expressions.sqlite");
@@ -280,6 +326,17 @@ fn sqlite_values(path: &Path) -> Vec<u64> {
         .collect::<Vec<_>>();
     values.sort_unstable();
     values
+}
+
+fn quickstart_rows(path: &Path) -> Vec<(i64, i64, String)> {
+    let connection = sqlite(path);
+    connection
+        .prepare("SELECT number, square, size FROM even_squares ORDER BY number")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn advance_to_idle(flow: &mut Flow) {
