@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly MAVEN_IMAGE="docker.io/library/maven@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237"
-readonly POSTGRES_IMAGE="quay.io/debezium/postgres:16@sha256:114cbe1e4f38055e83c9b567a7e0988fb80837b8eb500203b25c0f784a075b92"
+readonly POSTGRES_IMAGE="quay.io/debezium/postgres:16@sha256:342eac26cb35f22e2f3a4ee3e112d0007643f9e028a3432c7a941be562c4d867"
 
 if [[ "$#" -ne 0 ]]; then
   echo 'usage: check.sh' >&2
