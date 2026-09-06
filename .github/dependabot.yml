@@ -35,9 +35,18 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      bridge-build-and-test-dependencies:
+        patterns:
+          - "org.apache.maven.plugins:*"
+          - "org.junit.jupiter:*"
 
   - package-ecosystem: maven
     directory: /system-tests/debezium-runtime/probe
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      probe-build-dependencies:
+        patterns:
+          - "org.apache.maven.plugins:*"
