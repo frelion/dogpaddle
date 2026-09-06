@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -43,7 +44,9 @@ def until(description: str, observe: Callable[[], bool]) -> None:
 
 class Host:
     def __init__(self, binary: Path, mode: str, sql: Path, flow: Path,
-                 log: Path, environment: dict[str, str]) -> None:
+                 log: Path, environment: dict[str, str],
+                 record: Callable[[str, str], None]) -> None:
+        self.record = record
         self.stderr = log.open("w", encoding="utf-8")
         try:
             host_environment = dict(os.environ)
@@ -54,6 +57,10 @@ class Host:
                 text=True, bufsize=1,
                 env=host_environment,
             )
+            self.record("command", shlex.join([
+                str(binary), mode, str(sql), str(flow),
+            ]))
+            self.record("process", f"started pid={self.process.pid}")
         except BaseException:
             self.stderr.close()
             raise
@@ -62,6 +69,7 @@ class Host:
         self.reader.start()
         try:
             ready = self.receive()
+            self.record("stdout", json.dumps(ready))
             if ready != {"kind": "ready", "mode": mode}:
                 raise RuntimeError(f"unexpected host startup: {ready}")
         except BaseException:
@@ -99,6 +107,7 @@ class Host:
         self.process.stdin.write("advance\n")
         self.process.stdin.flush()
         response = self.receive()
+        self.record("advance", json.dumps(response))
         if response.get("kind") == "error":
             raise RuntimeError(response["message"])
         if response.get("kind") != "advance":
@@ -108,6 +117,9 @@ class Host:
     def kill(self) -> None:
         if self.process.poll() is None:
             self.process.kill()
+            self.record("signal", f"SIGKILL sent to pid={self.process.pid}")
+            code = self.process.wait(timeout=15)
+            self.record("process", f"pid={self.process.pid} exited: returncode={code}")
         self.process.wait(timeout=15)
 
     def close(self) -> None:
@@ -129,6 +141,9 @@ class Gate:
         self.cluster = cluster
         self.capture_trace = capture_trace
         self.scenes: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.updates: list[dict[str, Any]] = []
+        self.started = time.monotonic()
         self.flow = root / "flow"
         repository = Path(__file__).resolve().parents[2]
         self.program = (
@@ -187,8 +202,21 @@ class Gate:
     def stop(self) -> None:
         self.cluster.stop()
 
-    def sql(self, statement: str) -> str:
-        return run([*self.psql, "-c", statement], env=self.pg_env)
+    def record(self, kind: str, text: str) -> None:
+        if self.capture_trace:
+            self.events.append({
+                "at": round(time.monotonic() - self.started, 3),
+                "kind": kind,
+                "text": text,
+            })
+
+    def sql(self, statement: str, *, capture: bool = False) -> str:
+        if capture:
+            self.record("sql", statement)
+        result = run([*self.psql, "-c", statement], env=self.pg_env)
+        if capture:
+            self.record("stdout", result)
+        return result
 
     def prepare(self) -> None:
         self.sql(
@@ -199,11 +227,13 @@ class Gate:
             "quantity INTEGER NOT NULL, unit_price_cents BIGINT NOT NULL, "
             "discount_pct INTEGER NOT NULL); "
             "ALTER TABLE sales.orders REPLICA IDENTITY FULL; "
-            "CREATE PUBLICATION orders_publication FOR TABLE sales.orders"
+            "CREATE PUBLICATION orders_publication FOR TABLE sales.orders",
+            capture=True,
         )
         self.sql(
             "SELECT * FROM pg_create_logical_replication_slot("
-            "'orders_slot', 'pgoutput')"
+            "'orders_slot', 'pgoutput')",
+            capture=True,
         )
 
     def slot_active(self) -> bool:
@@ -319,6 +349,37 @@ class Gate:
             "source": self.source_rows(),
             "target": self.target_trace_rows(),
         })
+        self.record("phase", name)
+        # Record psql's own aligned output, not a table reconstructed by a renderer.
+        if name == "connected":
+            statement = (
+                "SELECT slot_name, plugin, active\n"
+                "FROM pg_replication_slots WHERE slot_name = 'orders_slot';"
+            )
+        else:
+            statement = (
+                'SELECT "$dogpaddle.id" AS rid, order_id, payable_cents AS cents,\n'
+                "       convert_from(fulfillment_center, 'UTF8') AS hub,\n"
+                "       convert_from(handling_lane, 'UTF8') AS lane\n"
+                "FROM ops.fulfillment_queue ORDER BY order_id;"
+            )
+        self.record("query", statement)
+        result = subprocess.run(
+            [*self.psql[:-1], "-P", "pager=off", "-c", statement],
+            env=self.pg_env, capture_output=True, text=True, check=True, timeout=60,
+        )
+        self.record("table", result.stdout.rstrip("\n"))
+
+    def record_target_deletes(self) -> None:
+        if self.capture_trace:
+            lines = (self.root / "postgres.log").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            deletes = [
+                line for line in lines
+                if 'DELETE FROM ONLY "ops"."fulfillment_queue" ' in line
+            ]
+            self.record("postgres-log", "\n".join(deletes[-2:]))
 
     def target_delete_count(self) -> int:
         log = (self.root / "postgres.log").read_text(
@@ -328,7 +389,8 @@ class Gate:
 
     def host(self, mode: str, session: int) -> Host:
         return Host(self.binary, mode, self.program, self.flow,
-                    self.root / f"host-{session}.log", self.host_environment)
+                    self.root / f"host-{session}.log", self.host_environment,
+                    self.record)
 
     def drive(self, host: Host, description: str,
               done: Callable[[], bool]) -> None:
@@ -348,6 +410,92 @@ class Gate:
             return True
 
         until(description, settled)
+
+    def continuous_updates(self, host: Host) -> None:
+        """Capture a bounded sequence, checked against native PostgreSQL SQL."""
+        statements = [
+            "UPDATE sales.orders SET status = 'new' WHERE order_id = 103",
+            "UPDATE sales.orders SET status = 'paid' WHERE order_id = 103",
+            "UPDATE sales.orders SET quantity = 3 WHERE order_id = 102",
+            "UPDATE sales.orders SET quantity = 12 WHERE order_id = 102",
+            "UPDATE sales.orders SET discount_pct = 50 WHERE order_id = 102",
+            "UPDATE sales.orders SET discount_pct = 85 WHERE order_id = 102",
+            "UPDATE sales.orders SET discount_pct = 0 WHERE order_id = 102",
+            "UPDATE sales.orders SET region = 'cn-east' WHERE order_id = 102",
+            "UPDATE sales.orders SET status = 'new' WHERE order_id = 102",
+            "UPDATE sales.orders SET status = 'paid' WHERE order_id = 102",
+            "UPDATE sales.orders SET unit_price_cents = 3000 WHERE order_id = 105",
+            "UPDATE sales.orders SET quantity = 4 WHERE order_id = 105",
+            "UPDATE sales.orders SET region = 'cn-south' WHERE order_id = 105",
+            "DELETE FROM sales.orders WHERE order_id = 104",
+            "INSERT INTO sales.orders VALUES (106, 'Atlas', 'cn-east', 'new', 2, 9000, 0)",
+            "UPDATE sales.orders SET status = 'paid' WHERE order_id = 106",
+            "UPDATE sales.orders SET quantity = 6 WHERE order_id = 106",
+            "UPDATE sales.orders SET discount_pct = 50 WHERE order_id = 106",
+            "UPDATE sales.orders SET region = 'us-west' WHERE order_id = 106",
+            "DELETE FROM sales.orders WHERE order_id = 103",
+            "UPDATE sales.orders SET discount_pct = 85 WHERE order_id = 106",
+            "UPDATE sales.orders SET discount_pct = 0 WHERE order_id = 106",
+            "INSERT INTO sales.orders VALUES (107, 'Vela', 'cn-south', 'paid', 1, 15000, 0)",
+            "UPDATE sales.orders SET quantity = 4 WHERE order_id = 107",
+            "UPDATE sales.orders SET status = 'new' WHERE order_id = 105",
+            "DELETE FROM sales.orders WHERE order_id = 102",
+            "UPDATE sales.orders SET status = 'paid' WHERE order_id = 105",
+            "DELETE FROM sales.orders WHERE order_id = 106",
+        ]
+        # This oracle executes in PostgreSQL, independently of DogPaddle's planner.
+        oracle = """
+            WITH amounts AS (
+                SELECT *, quantity::bigint * unit_price_cents AS subtotal_cents,
+                    quantity::bigint * unit_price_cents
+                    - quantity::bigint * unit_price_cents * discount_pct / 100
+                    AS payable_cents
+                FROM sales.orders
+            )
+            SELECT COALESCE(json_agg(expected), '[]'::json) FROM (
+                SELECT order_id, customer, subtotal_cents, payable_cents,
+                    CASE WHEN region IN ('cn-east', 'cn-south') THEN 'CN-HUB'
+                        ELSE 'GLOBAL-HUB' END AS fulfillment_center,
+                    CASE WHEN payable_cents >= 40000 THEN 'priority'
+                        ELSE 'standard' END AS handling_lane,
+                    CASE WHEN region IN ('cn-east', 'cn-south') THEN 'regional_route'
+                        WHEN payable_cents >= 40000 THEN 'export_review'
+                        ELSE NULL END AS handling_reason
+                FROM amounts WHERE status = 'paid' AND payable_cents >= 10000
+                ORDER BY order_id
+            ) AS expected
+        """
+        for index, statement in enumerate(statements):
+            source_before = self.source_rows()
+            target_before = self.target_trace_rows()
+            self.sql(statement, capture=True)
+            source_written = self.source_rows()
+            target_before_advance = self.target_trace_rows()
+            if target_before_advance != target_before:
+                raise RuntimeError("continuous target changed without a host advance")
+            expected = json.loads(self.sql(oracle))
+
+            def matches() -> bool:
+                return [
+                    {key: value for key, value in row.items() if key != "rid"}
+                    for row in self.target_trace_rows()
+                ] == expected
+
+            self.drive(host, f"continuous SQL update {index + 1}", matches)
+            self.settle(host, f"continuous SQL update {index + 1} settles")
+            if not matches() or self.source_rows() != source_written:
+                raise RuntimeError("continuous SQL result changed during settlement")
+            target_after = self.target_trace_rows()
+            self.technical_ids()  # Reject duplicate order identities independently.
+            self.updates.append({
+                "sql": statement,
+                "at": round(time.monotonic() - self.started, 3),
+                "source_before": source_before,
+                "source_after": source_written,
+                "target_before": target_before,
+                "target_before_advance": target_before_advance,
+                "target_after": target_after,
+            })
 
     def run_gate(self) -> list[dict[str, Any]]:
         inserted = [
@@ -377,10 +525,11 @@ class Gate:
             self.capture("connected")
 
             self.sql(
-                "INSERT INTO sales.orders VALUES "
-                "(101, 'Acme', 'cn-east', 'new', 3, 5000, 10), "
-                "(102, 'Orbit', 'eu-west', 'paid', 2, 4000, 0), "
-                "(103, 'Nova', 'cn-south', 'paid', 4, 8000, 25)"
+                "INSERT INTO sales.orders VALUES\n"
+                "(101, 'Acme', 'cn-east', 'new', 3, 5000, 10),\n"
+                "(102, 'Orbit', 'eu-west', 'paid', 2, 4000, 0),\n"
+                "(103, 'Nova', 'cn-south', 'paid', 4, 8000, 25)",
+                capture=True,
             )
             self.drive(
                 host,
@@ -405,7 +554,8 @@ class Gate:
             self.capture("inserted")
 
             self.sql(
-                "UPDATE sales.orders SET status = 'paid' WHERE order_id = 101"
+                "UPDATE sales.orders SET status = 'paid' WHERE order_id = 101",
+                capture=True,
             )
             self.drive(
                 host,
@@ -424,7 +574,8 @@ class Gate:
 
             self.sql(
                 "UPDATE sales.orders SET quantity = 6, discount_pct = 0 "
-                "WHERE order_id = 103"
+                "WHERE order_id = 103",
+                capture=True,
             )
             self.drive(
                 host,
@@ -443,7 +594,7 @@ class Gate:
             self.capture("repriced")
 
             delete_count_before = self.target_delete_count()
-            self.sql("DELETE FROM sales.orders WHERE order_id = 101")
+            self.sql("DELETE FROM sales.orders WHERE order_id = 101", capture=True)
             if self.logical_rows() != repriced:
                 raise RuntimeError("target changed before the Flow advanced deletion")
 
@@ -464,6 +615,7 @@ class Gate:
                     raise RuntimeError(
                         "deletion was not observed at the Prepared crash point"
                     )
+                self.record("boundary", json.dumps(response))
                 return True
 
             until("fulfillment deletion commits", deletion_target_commit)
@@ -477,6 +629,7 @@ class Gate:
             if crash_delete_count <= delete_count_before:
                 raise RuntimeError("PostgreSQL did not log the target deletion")
             self.capture("deleted")
+            self.record_target_deletes()
             # PostgreSQL has committed the delete, while the durable Sink cursor
             # still points at the same input. Kill before its settlement turn.
             host.kill()
@@ -499,6 +652,8 @@ class Gate:
                 "Prepared target DELETE is replayed",
                 lambda: self.target_delete_count() > crash_delete_count,
             )
+            self.record("replay", json.dumps(replay))
+            self.record_target_deletes()
             self.drive(host, "reopened SQL CDC connector starts", self.slot_active)
             self.settle(host, "reopened Flow settles")
             if self.rows() != crashed_rows or self.technical_ids() != crashed_ids:
@@ -508,8 +663,9 @@ class Gate:
             self.capture("recovered")
 
             self.sql(
-                "INSERT INTO sales.orders VALUES "
-                "(104, 'Kestrel', 'us-west', 'paid', 5, 10000, 20)"
+                "INSERT INTO sales.orders VALUES\n"
+                "(104, 'Kestrel', 'us-west', 'paid', 5, 10000, 20)",
+                capture=True,
             )
             resumed = [
                 *after_delete,
@@ -534,8 +690,9 @@ class Gate:
             self.capture("resumed")
 
             self.sql(
-                "INSERT INTO sales.orders VALUES "
-                "(105, 'Lumen', 'us-west', 'paid', 2, 7000, 0)"
+                "INSERT INTO sales.orders VALUES\n"
+                "(105, 'Lumen', 'us-west', 'paid', 2, 7000, 0)",
+                capture=True,
             )
             final = [
                 *resumed,
@@ -562,6 +719,8 @@ class Gate:
                 "WHERE pubname = 'orders_publication'"
             ) != "sales.orders":
                 raise RuntimeError("CDC publication captured the SQL sink target")
+            if self.capture_trace:
+                self.continuous_updates(host)
 
         expected_scenes = [
             "connected", "inserted", "paid", "repriced",
@@ -616,7 +775,7 @@ def resolve_host(parser: argparse.ArgumentParser, supplied: Optional[Path]) -> P
     return binary
 
 
-def write_trace(path: Path, scenes: list[dict[str, Any]]) -> Path:
+def write_trace(path: Path, gate: Gate, scenes: list[dict[str, Any]]) -> Path:
     destination = path.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Optional[Path] = None
@@ -630,7 +789,15 @@ def write_trace(path: Path, scenes: list[dict[str, Any]]) -> Path:
             delete=False,
         ) as output:
             temporary = Path(output.name)
-            json.dump({"scenes": scenes}, output, indent=2)
+            json.dump({
+                "version": 3,
+                "passed": True,
+                "program": gate.program.read_text(encoding="utf-8"),
+                "connection": f"127.0.0.1:{gate.port}/postgres",
+                "events": gate.events,
+                "scenes": scenes,
+                "updates": gate.updates,
+            }, output, indent=2)
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
@@ -662,7 +829,7 @@ def main() -> None:
     parser.add_argument(
         "--trace-output",
         type=Path,
-        help="atomically write real fulfillment scene data after the gate passes",
+        help="atomically write SQL, host I/O, crash evidence and snapshots after success",
     )
     parser.add_argument(
         "--keep",
@@ -726,7 +893,7 @@ def main() -> None:
             print(f"fixture retained at {root}", file=os.sys.stderr)
 
     if args.trace_output is not None:
-        trace_path = write_trace(args.trace_output, scenes)
+        trace_path = write_trace(args.trace_output, gate, scenes)
         print(f"fulfillment trace: {trace_path}")
     print(
         "PASS checked-in fulfillment SQL: postgres_cdc -> subtotal/discount/"

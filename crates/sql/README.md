@@ -29,8 +29,12 @@ postgres_cdc ──▶ subtotal ──▶ discount ──▶ eligibility ──�
 ```
 
 订单从 `new` 更新为 `paid` 后会进入队列；数量或折扣变化会实时重算金额和优先级；删除源订单会撤回
-目标结果。真实录屏还会在目标提交后强杀宿主，再通过同一份 SQL 和 state `open`，验证恢复不会复制
-结果或改变稳定 ID。可用
+目标结果。[无声持续演示](https://github.com/frelion/dogpaddle/blob/main/docs/assets/fulfillment-continuous.mp4)
+固定展示源表、完整 `fulfillment.sql` 文件和目标表，连续执行 28 次真实新增、修改和删除。
+中间从读写端点到最后一行 SQL 全程可见，无省略或滚动。
+付款状态、数量、价格、折扣与地区反复变化，可以持续观察筛选、金额重算、优先级和路由变化。
+视频的呈现间隔经过编辑，每次完整结果均与 PostgreSQL 原生 SQL 核对。
+可用
 [`record_fulfillment_demo.sh`](https://github.com/frelion/dogpaddle/blob/main/docs/tools/record_fulfillment_demo.sh)
 在本机真实 `PostgreSQL` 上重新生成：
 
@@ -39,6 +43,10 @@ docs/tools/record_fulfillment_demo.sh \
   --bundle /absolute/path/to/runtime-bundle \
   --postgres-bin /absolute/path/to/postgresql/bin
 ```
+
+命令生成无声视频与封面，并将完整 SQL、原始时间戳和执行输出保存在 `target/demo/`。
+环境要求和证据说明见
+[录制说明](https://github.com/frelion/dogpaddle/blob/main/docs/demo/README.md)。
 
 当前 `PostgreSQL` 试点从空源表和匹配的新 slot 起点开始，不执行已有数据的初始快照。
 `PostgresSink` 创建并独占无损 Arrow 关系表，不镜像源表 DDL；文本值当前按 bytes 保存，查询时使用

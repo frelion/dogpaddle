@@ -59,27 +59,25 @@ for command in cargo python3 uv; do
     fi
 done
 
-staging="$(mktemp -d /tmp/dogpaddle-fulfillment-demo.XXXXXX)"
-trap 'rm -rf -- "$staging"' EXIT HUP INT TERM
-trace="$staging/trace.json"
+trace="$repository/target/demo/fulfillment-trace.json"
+transcript="$repository/target/demo/fulfillment-transcript.txt"
 poster="$repository/docs/assets/fulfillment-hero.png"
-video="$repository/target/demo/fulfillment-demo.mp4"
+video="$repository/docs/assets/fulfillment-continuous.mp4"
 
 cd "$repository"
 
-# The renderer never invents business rows. The real PostgreSQL gate must pass
-# and atomically publish all eight source/target snapshots first.
+# Publish only after the real gate passes. Preserve its raw evidence locally.
 python3 system-tests/postgres/check_sql.py \
     --bundle "$bundle" \
     --postgres-bin "$postgres_bin" \
     --trace-output "$trace"
 
-uv run --quiet --with 'playwright==1.60.0' playwright install chromium
 uv run --quiet --script docs/tools/render_fulfillment_demo.py \
     --trace "$trace" \
-    --html docs/demo/fulfillment.html \
     --poster "$poster" \
-    --video "$video"
+    --video "$video" \
+    --transcript "$transcript"
 
 echo "README poster: $poster"
-echo "upload-ready video: $video"
+echo "silent continuous video: $video"
+echo "raw evidence: $trace"
