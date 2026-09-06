@@ -20,8 +20,9 @@ use crate::{
             SqliteSinkDefinition,
         },
         transform::{
-            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            DistinctDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition,
+            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
         },
     },
 };
@@ -79,7 +80,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 12] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 13] {
     [
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
@@ -142,6 +143,7 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 12] {
                 .unwrap(),
             ),
         ),
+        (13, Box::new(DistinctDefinition::new())),
     ]
 }
 

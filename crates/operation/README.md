@@ -41,7 +41,8 @@ Sink 必须没有 output。一个 Definition 可以在不同 Flow 中绑定不�
 短生命周期、只能消费一次的 `OperationBinding`，可携带 Schema 相关的已编译执行信息及最终
 materialize closure；它不写 Store，也不进入持久化格式或运行态对象。目前 `SequenceScan` 固定
 输出 `{ value: UInt64 non-null }`；`RunningEventCount` 接受任意合法的单一输入并固定输出
-`{ count: UInt64 non-null }`；Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
+`{ count: UInt64 non-null }`；`Distinct` 接受一个任意合法的 exact input Schema 并原样作为 output；
+Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排，
 并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
 Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Select 从同一个原始输入计算有序的完整输出列；
 `SchemaAlign` 从同一个原始输入计算有序字段，并显式声明名称、目标 nullability、Field metadata
@@ -219,7 +220,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 ## 内建算子能力与 conformance
 
-下表是当前十二个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+下表是当前十三个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
 Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
@@ -229,6 +230,7 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
 | `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
+| `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMap<RowDigest, CollisionBucket, Large>` | 按输入行序选择边界事件并重建 diff | tag/layout、collision、边界、rollback、reopen、重批 |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
 | Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
 | Extend (`6`) | Transform / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变，`Complete` | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
@@ -239,30 +241,40 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `SqliteSink` (`10`) | Sink / 1 | 校验 `SQLite` 列名与列数；无 output | 共享固定 ID 批次协议，每批至多 1024 操作，目标提交后结算 continuation 或 `Complete` | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 `SQLite` 值 | tag/payload、state/hash golden、全部 v1 类型、批界、非负前缀、rollback/reopen；无独立 benchmark |
 | `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `system-tests/postgres/check_sink.py` |
 
-所有十二个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
+所有十三个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
 `tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
 materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol` 与 `metamorphic`
 只保留跨算子契约。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
 和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
 真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 
-前十个 tag 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别由
-`tests/correctness/postgres_cdc_scan.rs` 与 `tests/correctness/postgres_sink.rs` 拥有。其中事件计数、对齐与
-`SQLite` Sink 的 fixture 分别为 `running_event_count_definition.hex`、`schema_align_explicit.hex` 与
-`sqlite_sink_output_events.hex`，冻结 tag `2`、`9` 与 `10`。每个算子文件会自行完成 decode、bind、
+tag `1..=10` 与 tag `13` 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别由
+`tests/correctness/postgres_cdc_scan.rs` 与 `tests/correctness/postgres_sink.rs` 拥有。其中事件计数、对齐、
+`SQLite` Sink 与 Distinct 的 fixture 分别为 `running_event_count_definition.hex`、`schema_align_explicit.hex`、
+`sqlite_sink_output_events.hex` 与 `distinct_definition.hex`，冻结 tag `2`、`9`、`10` 与 `13`。每个算子文件会自行完成 decode、bind、
 materialize 与运行证据。Flow manifest 的端到端基线为
 `crates/flow/tests/fixtures/v1/sequence_scan_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`scan`
 保存零输入且拥有 output 的 Scan 算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `scan` 包含 `SequenceScan` 与 `PostgresCdcScan`，`transform` 包含 RunningEventCount、Project、Filter、
+的终点算子。当前 `scan` 包含 `SequenceScan` 与 `PostgresCdcScan`，`transform` 包含 RunningEventCount、Distinct、Project、Filter、
 Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
 Discard、`SqliteSink` 与 `PostgresSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
 Scan 是结构角色，不要求底层一定存在一张可遍历的表。当前协议不表达 EOS：Scan 可以暂时
 `Turn::Idle`，耗尽后也可以永远 `Turn::Idle`；需要流完成语义时应另行扩展协议。
+
+## 状态关系算子：Distinct
+
+`Distinct` 用一个 crate 私有的 `OrderedMap<RowDigest, CollisionBucket, Large>` 维护完整记录的正权重。
+256-bit BLAKE3 digest 只定位 collision bucket；记录是否相同始终比较 bucket 中的完整 canonical row，因此 hash 冲突不会合并记录。
+权重从零变为正数时输出 `+1`，从正数归零时输出 `-1`，其余变化不输出；负前缀和 overflow 使整个
+turn 回滚，归零记录和空 bucket 会被删除。
+
+更新严格遵循输入行序，不先合并同一 Change 内的事件，并对稳定重批和 reopen 保持相同语义。
+canonical row 保留浮点原始位模式，所以 `-0.0` 与 `+0.0` 是不同记录。
 
 ## Definition 与持久化
 
@@ -667,7 +679,7 @@ happy-path 单测都不能替代这些答案。
 `correctness` target。`definition_codec`、`expression`、`protocol`、`metamorphic` 只拥有横切契约，
 其余文件按每个具体算子纵向覆盖 literal golden、kind/data、bind、materialize、turn 与 reopen。
 `protocol` 直接验证上述队列例子的恢复状态机和 borrowed delivery 提交时序。Definition v1 使用版本化黄金字节约束，
-各算子 Schema 证据覆盖十二个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+各算子 Schema 证据覆盖十三个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
 SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续

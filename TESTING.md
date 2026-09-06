@@ -39,7 +39,7 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个�
 
 ### Flow
 
-Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
+Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
 Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 status 证据必须保留。
 
@@ -47,7 +47,7 @@ Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 statu
 
 SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,build,open}` 验证产品契约。护栏分四层：parser/endpoint 参数契约；所有拒绝路径不创建 Flow；Sequence→SQLite 的结果与精确目标列结构；真实 PostgreSQL 的端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
-SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义；不得只断言 build 或一次 advance 成功。不可达 Scan 声明必须与其他拒绝路径一样证明不创建 Flow。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL gate另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 reopen 幂等重投。
+SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言 build 或一次 advance 成功。Distinct witness 必须跨 drop/open，证明已经提交的权重状态会恢复且后续重复不会再次输出。不可达 Scan 声明必须与其他拒绝路径一样证明不创建 Flow。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL gate另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 reopen 幂等重投。
 
 `system-tests/postgres/check_sql.py --trace-output ...` 可在完整验收通过后导出该场景的 SQL、
 宿主 I/O、SIGKILL、PostgreSQL 重放日志和关系快照，供 [持续 ETL 演示](docs/demo/README.md) 排版。

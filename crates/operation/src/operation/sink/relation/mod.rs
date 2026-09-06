@@ -1,7 +1,6 @@
 //! One fixed-ID relation protocol shared by database sinks.
 
 mod plan;
-mod row;
 mod runtime;
 mod state;
 
@@ -11,7 +10,7 @@ use thiserror::Error;
 
 use crate::{DataDeclaration, definition::DataName, operation::OperationError};
 
-pub(crate) use row::{RowError, canonical_row, encode_canonical, row_hash};
+pub(crate) use crate::operation::relation::{RowError, canonical_row, encode_canonical, row_hash};
 pub(crate) use runtime::RelationalSink;
 
 pub(crate) const MAX_MUTATIONS_PER_BATCH: usize = 1024;

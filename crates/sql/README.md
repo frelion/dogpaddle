@@ -164,6 +164,7 @@ V1 端点：
 支持：
 
 - `SELECT`、`WHERE` 和字段别名
+- `SELECT DISTINCT`，按完整输出记录的 `DogPaddle` exact-row identity 去重
 - 非递归 CTE 与派生查询
 - `CAST`、`TRY_CAST`、`CASE`
 - 现有表达式执行层可接受的比较、布尔与算术表达式
@@ -172,15 +173,18 @@ V1 端点：
 在创建 state 目录前明确拒绝：
 
 - 普通表、Join、Aggregate 和普通 `UNION`
-- Distinct、Sort、Limit、Window、Values
+- `SELECT ALL`、`DISTINCT ON`、Sort、Limit、Window、Values
 - 递归 CTE、标量子查询和相关子查询
 - UDF、时间、随机数、session variable
 - 依赖 `DataFusion` function registry 的 scalar、aggregate 或 window 函数
 - 任何没有显式 lowering 的 `LogicalPlan` 节点
 
 `DataFusion` 负责 SQL 解析、名称解析和 type coercion；分析得到的显式表达式与精确 `Schema` 被 lower
-为现有 `Filter`、`Select`、`SchemaAlign` 和 `UnionAll` Operation。`DataFusion` 不执行 `Flow`，
+为现有 `Filter`、`SchemaAlign`、`UnionAll` 和 `Distinct` Operation。`DataFusion` 不执行 `Flow`，
 `DogPaddle` 也不维护第二套表达式 AST 或 SQL 执行引擎。
+
+全行去重沿用 `DogPaddle` 的 exact-row identity：null 使用 canonical 表示，浮点值按原始位模式区分，
+不应用外部数据库的 collation。
 
 ## 持久化与测试
 
@@ -194,7 +198,8 @@ cargo test -p dogpaddle-sql --test correctness
 ```
 
 测试直接编译并执行随 crate 发布的 `examples/quickstart.sql`，覆盖 build、SQLite 结果、drop/open
-和无重复恢复；完整 matrix 还覆盖参数错误、隐式 coercion、CTE fan-out、`UNION ALL` Schema 与拒绝路径。
+和无重复恢复；完整 matrix 还覆盖参数错误、隐式 coercion、CTE fan-out、`UNION ALL` Schema、
+`SELECT DISTINCT` 的最终结果与状态恢复，以及拒绝路径。
 真实 `PostgreSQL` CDC → SQL transforms → `PostgreSQL Sink` 的崩溃恢复 gate 位于
 [`system-tests/postgres/check_sql.py`](https://github.com/frelion/dogpaddle/blob/main/system-tests/postgres/check_sql.py)。
 工作区统一 gate 和数据规格见

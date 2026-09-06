@@ -1,4 +1,6 @@
-//! Exact row identity is independent of the target SQL representation.
+//! Exact row identity shared by stateful relational operations.
+
+use std::borrow::Cow;
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -7,6 +9,7 @@ use arrow_array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, TimeUnit};
+use dogpaddle_store::{CodecError, StoreKey};
 use thiserror::Error;
 
 use crate::operation::OperationError;
@@ -29,6 +32,30 @@ pub(crate) enum RowError {
     LengthOverflow,
 }
 
+/// Fixed-width lookup key for one exact canonical row.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RowDigest([u8; 32]);
+
+impl RowDigest {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl StoreKey for RowDigest {
+    fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.0)
+    }
+
+    fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        bytes
+            .as_ref()
+            .try_into()
+            .map(Self)
+            .map_err(|_| CodecError::new("invalid relation row digest length"))
+    }
+}
+
 pub(crate) fn canonical_row(batch: &RecordBatch, index: usize) -> Result<Vec<u8>, OperationError> {
     if index >= batch.num_rows() {
         return Err(Box::new(RowError::RowOutOfBounds {
@@ -44,12 +71,16 @@ pub(crate) fn canonical_row(batch: &RecordBatch, index: usize) -> Result<Vec<u8>
 }
 
 pub(crate) fn row_hash(bytes: &[u8]) -> [u8; 16] {
+    row_digest(bytes).as_bytes()[..16]
+        .try_into()
+        .expect("the truncated hash is exactly 16 bytes")
+}
+
+pub(crate) fn row_digest(bytes: &[u8]) -> RowDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"dogpaddle.relation-row.v1\0");
     hasher.update(bytes);
-    hasher.finalize().as_bytes()[..16]
-        .try_into()
-        .expect("the truncated hash is exactly 16 bytes")
+    RowDigest(*hasher.finalize().as_bytes())
 }
 
 #[allow(clippy::too_many_lines)]

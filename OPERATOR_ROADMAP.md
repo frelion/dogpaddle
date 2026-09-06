@@ -1,7 +1,7 @@
 # DogPaddle 算子与执行内核路线图
 
 本文定义 DogPaddle 算子体系和执行内核的演进阶段、语义边界、交付物与退出标准。
-它是实施路线；阶段 0/1 已完成的范围在本文明确标记，后续阶段中的候选算子或用户接口仍不表示
+它是实施路线；阶段 0/1 和阶段 3 的 Distinct 纵向切片已完成，后续阶段中的候选算子或用户接口仍不表示
 已经交付。当前精确能力以根目录 [`README.md`](README.md) 和各产品 crate 的 README 为准。
 
 ## 产品方向
@@ -15,8 +15,8 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 - DataFrame 风格 API；
 - 由其他应用或语言编译得到的持久化计划。
 
-这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 先用现有
-无状态算子证明这条分层路径，其余接口仍是候选。路线首先回答：
+这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 已用无状态算子和
+Distinct 证明这条分层路径，其余接口仍是候选。路线首先回答：
 
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
@@ -43,6 +43,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | Scan | SequenceScan | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
 | Scan | PostgresCdcScan | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
+| Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
 | Transform | Extend | 保留输入并追加一个表达式列 | 保留为基础无状态算子 |
@@ -53,14 +54,14 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 | Sink | PostgresSink | 将单输入 exact relation 幂等物化到独占的固定 Schema PostgreSQL 表 | 已有远端试点；TLS、在线演进与发布门仍待实施 |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十二个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十三个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
 当前 `dogpaddle-sql` 接受一条直接的 `INSERT INTO sqlite/postgres/discard(...) Query`，Scan 直接写成
-`FROM sequence/postgres_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，只把 TableScan、
-Projection、Filter、非递归 CTE 与 `UNION ALL` lowering 为现有 Definition DAG。SQL 不建立 DogPaddle
-Table、View、catalog、独立状态或执行层；Join、Aggregate、Distinct、Sort、Limit 和 Window 尚无对应
+`FROM sequence/postgres_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，把 TableScan、
+Projection、Filter、非递归 CTE、`SELECT DISTINCT` 与 `UNION ALL` lowering 为现有 Definition DAG。SQL 不建立 DogPaddle
+Table、View、catalog、独立状态或执行层；Join、Aggregate、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window 尚无对应
 底层算子，必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
 这份磁盘 Definition 为恢复真相，SQL 变更要求新路径或显式重建。
 
@@ -206,7 +207,7 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
 | 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
-| 3 | 建立关系状态原语 | relation state、arrangement、Consolidate、Distinct | 后续状态关系算子的共同基座 |
+| 3（已完成最小切片） | 建立精确行权重状态 | crate 私有 row digest、collision bucket、Distinct | 首个持久状态关系算子 |
 | 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
 | 6 | 引入有界、顺序与时间语义 | Barrier、TopK、Window、watermark | 明确承载完成、排序和时间计算 |
@@ -513,49 +514,29 @@ PostgresCdcScan
 Schema drift、负权重前缀、fan-out 慢消费者和 reopen。完整端到端测试不使用 SequenceScan 或
 Discard。
 
-## 阶段 3：关系状态原语
+## 阶段 3：精确行权重与 Distinct
+
+**状态：最小纵向切片已完成。**
 
 ### 目标
 
-为 Materialize、Distinct、Aggregate、Join 和后续 TopK 建立一个共享的关系状态设计，而不是让每个
-算子重新发明 Record key、weight、overflow 和负前缀规则。
+只实现 Distinct 真正需要的持久状态：按完整 canonical row 维护当前正权重。这里不增加 Store
+collection，不发布通用 relation trait，也不预先设计 Aggregate/Join 的 arrangement 或 continuation。
 
-### Relation state
+### 私有持久状态
 
-概念模型为：
+`distinct.weights` 是
+`OrderedMap<RowDigest, CollisionBucket, Large>`。256-bit BLAKE3 digest 只定位 bucket；完整
+canonical row bytes 才定义记录身份，所以不同 row 即使 digest 冲突也能共存并被精确比较。bucket
+以稳定格式保存唯一的 `(row, positive u64 weight)`；weight 归零时删除 row，bucket 归空时删除
+map entry。
 
-```text
-Record 或 Key → rows / integer weights / operator-specific state
-```
-
-Store 继续不依赖 Arrow。Operation 层定义稳定的 Record/Key/state codec，并使用具体的 Cell 或
-`OrderedMap<K, V, SIZE>`。只抽取多个真实算子都需要且语义完全一致的公共实现，不建立万能 Store trait
-或第二套动态 collection 系统。
-
-### Arrangement / Index
-
-为后续按 key 查找的算子提供持久 arrangement：
-
-- 一个 key 对应多个完整记录及各自权重；
-- exact key Schema 和 row Schema；
-- point lookup、有界 scan 和稳定 continuation；
-- 重复记录与非单位 diff；
-- zero-weight cleanup；
-- codec/version、reopen 和 corruption；
-- 独立模型验证。
-
-Arrangement 是否成为公共用户可见算子，应由两个以上实际消费者证明；它可以先作为 Operation 内部
-共享实现，不能为了未来可能复用而过早暴露公共抽象。
-
-### Consolidate
-
-显式合并等价记录的 diff，但不能偷偷改变普通 Change 或其他算子的语义。必须定义 consolidation
-作用域：一个输入 Change、显式 barrier 之间，还是持久关系的当前状态。不同作用域应是不同能力，
-不能共用含糊名称。
+canonical row 编码由现有关系 Sink 与 Distinct 共用，digest、bucket 和权重更新都留在 operation
+crate 私有模块。后续算子只复用真实证明相同的部分。
 
 ### Distinct
 
-按记录当前总权重实现：
+`Distinct` 是单输入、exact-Schema-preserving Transform，逐事件按输入行序更新权重：
 
 ```text
 0 → positive        输出 record, diff=+1
@@ -563,16 +544,16 @@ positive → positive 无输出
 positive → 0        输出 record, diff=-1
 ```
 
-导致负权重的输入报错并回滚。Distinct 的输出和状态必须对稳定重批、完整重放、背压及 reopen 保持
-契约。
+它不先合并同一 Change 中的重复记录。负前缀或 overflow 使整个 turn 回滚；状态、output 与 input
+completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 
-### 退出标准
+### 已完成结果
 
-- Materialize 和 Distinct 共享经过证明的 Record/weight 基础语义；
-- arrangement 支持 Aggregate/Join 所需的真实 key/row 访问模式；
-- 每个公共或内部稳定格式都有 codec golden 和 reopen；
-- 独立 multiset model 覆盖非单位 diff、重复、归零、负前缀和 overflow；
-- 任何关系状态更新都与 output 和 input completion 保持同事务原子性。
+- `Distinct` 以 tag `13`、空 payload 和唯一 `distinct.weights` 资源进入统一 bind/materialize/turn 路径；
+- collision bucket 使用完整 row 做最终比较，不把 hash 当记录身份；
+- codec、边界变化、负前缀/overflow、背压与 reopen 有对应 owner 证据；
+- SQL 只新增 `SELECT DISTINCT` lowering；普通 `UNION` 仍未支持；
+- Aggregate 与 Join 的专用状态等实现对应算子时再设计。
 
 ## 阶段 4：Aggregate 与多重集算子
 
@@ -924,18 +905,18 @@ PostgresCdcScan
 通用结果边界仍待实施。复杂算子仍主要依靠
 测试 fixture 自证，上层用户 API 也尚未形成完整闭环。
 
-### 里程碑 C：关系状态到 Aggregate
+### 里程碑 C：状态关系算子
 
 ```text
-Relation state
-→ Arrangement
-→ Distinct
+exact-row weights（已完成）
+→ Distinct（已完成）
 → Count/Sum Aggregate
 → Group Aggregate
+→ Inner Join
 ```
 
-先完成 Record key、weight、负前缀和 materialized oracle，再进入 Join；不要同时引入 Aggregate 和
-Join 的全部状态问题。
+已用 Distinct 证明 exact row、collision bucket、weight 和负前缀。Aggregate 与 Join 各自的
+按 key 访问、fan-out 和 continuation 等到对应算子时再设计。
 
 ## 开放决策
 
@@ -945,7 +926,7 @@ Join 的全部状态问题。
 - 未来本地输入 API 的幂等 identity 作用域是 input、Flow 还是全局？这不要求把 connector checkpoint 当作 identity。
 - ResultLog consumer 是 Definition 的静态一部分，还是运行期动态注册？
 - Materialize 如何稳定编码完整 Record key、weight 和分页 continuation？
-- Relation state/arrangement 哪些能力属于内部共享实现，哪些值得成为公共算子？
+- Join 的 keyed arrangement、fan-out 和有界 continuation 应该如何持久化？
 - Consolidate 的显式作用域是一个 Change、barrier 区间还是完整关系？
 - Aggregate 在同一事件序列中如何输出旧值撤回和新值插入，才能保持重批契约？
 - Date/Timestamp/Decimal 上哪些额外 DataFusion operator/type 组合值得补齐证据并加入已承诺集合？

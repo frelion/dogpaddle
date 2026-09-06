@@ -3,8 +3,8 @@ use std::{collections::HashMap, num::NonZeroU32, num::NonZeroU64, sync::Arc};
 use arrow_schema::SchemaRef;
 use datafusion_common::{Column, DFSchema, DataFusionError, TableReference, config::ConfigOptions};
 use datafusion_expr::{
-    AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF,
-    expr_rewriter::unnormalize_col,
+    AggregateUDF, Distinct as LogicalDistinct, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF,
+    TableSource, WindowUDF, expr_rewriter::unnormalize_col,
 };
 use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
@@ -13,7 +13,8 @@ use dogpaddle_flow::{FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
-        FilterDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
+        DistinctDefinition, FilterDefinition, SchemaAlignDefinition, SchemaAlignField,
+        UnionAllDefinition,
     },
 };
 
@@ -196,6 +197,10 @@ impl Lowerer<'_> {
                 )
                 .map_err(SqlError::endpoint)?;
                 Ok(self.add_transform(input, definition))
+            }
+            LogicalPlan::Distinct(LogicalDistinct::All(input)) => {
+                let input = self.lower(input)?;
+                Ok(self.add_transform(input, DistinctDefinition::new()))
             }
             LogicalPlan::Union(union) => {
                 let inputs = union

@@ -165,10 +165,6 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
             "SELECT value FROM sequence(start => 0) GROUP BY value",
         ),
         (
-            "distinct",
-            "SELECT DISTINCT value FROM sequence(start => 0)",
-        ),
-        (
             "sort",
             "SELECT value FROM sequence(start => 0) ORDER BY value",
         ),
@@ -286,6 +282,11 @@ fn invalid_plan_shapes_fail_without_creating_a_flow() {
 #[test]
 fn ignored_sql_modifiers_are_rejected_before_creating_a_flow() {
     let queries = [
+        ("select all", "SELECT ALL value FROM sequence(start => 0)"),
+        (
+            "distinct on",
+            "SELECT DISTINCT ON (value) value FROM sequence(start => 0)",
+        ),
         (
             "table sample",
             "SELECT value FROM sequence(start => 0) TABLESAMPLE SYSTEM (0)",

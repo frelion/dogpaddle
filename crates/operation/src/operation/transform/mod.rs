@@ -1,5 +1,6 @@
 //! Transform operations that consume input records and produce derived records.
 
+pub(crate) mod distinct;
 pub(crate) mod extend;
 pub(crate) mod filter;
 pub(crate) mod project;
@@ -8,6 +9,7 @@ pub(crate) mod schema_align;
 pub(crate) mod select;
 pub(crate) mod union_all;
 
+pub use distinct::{DistinctDefinition, DistinctError, DistinctOperation};
 pub use extend::{
     ExtendDefinition, ExtendDefinitionError, ExtendError, ExtendOperation, ExtendSchemaError,
 };

@@ -2,6 +2,8 @@
 mod binding;
 #[path = "correctness/definition.rs"]
 mod definition;
+#[path = "correctness/distinct.rs"]
+mod distinct;
 #[path = "correctness/lifecycle.rs"]
 mod lifecycle;
 #[path = "correctness/malformed.rs"]

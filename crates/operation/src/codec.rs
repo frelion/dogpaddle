@@ -17,6 +17,10 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     ),
     (scan::sequence::TAG, scan::sequence::decode_definition),
     (
+        transform::distinct::TAG,
+        transform::distinct::decode_definition,
+    ),
+    (
         transform::running_event_count::TAG,
         transform::running_event_count::decode_definition,
     ),

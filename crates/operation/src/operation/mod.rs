@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use dogpaddle_change::Change;
 use dogpaddle_store::TransactionAccess;
 
+pub(crate) mod relation;
 pub mod scan;
 pub mod sink;
 pub mod transform;

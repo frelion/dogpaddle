@@ -2,9 +2,9 @@ use std::{fs, ops::ControlFlow, path::Path};
 
 use datafusion_sql::sqlparser::{
     ast::{
-        Cte, Expr, GroupByExpr, Ident, ObjectName, Query, Select, SelectFlavor, SetExpr,
-        SetOperator, SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins,
-        VisitMut, VisitorMut, With,
+        Cte, Distinct as SelectDistinct, Expr, GroupByExpr, Ident, ObjectName, Query, Select,
+        SelectFlavor, SetExpr, SetOperator, SetQuantifier, TableAlias, TableAliasColumnDef,
+        TableFactor, TableWithJoins, VisitMut, VisitorMut, With,
     },
     dialect::GenericDialect,
     keywords::Keyword,
@@ -331,7 +331,7 @@ fn validate_select(select: &Select) -> Result<(), SqlError> {
             if expressions.is_empty() && modifiers.is_empty()
     );
     if !optimizer_hints.is_empty()
-        || distinct.is_some()
+        || !matches!(distinct, None | Some(SelectDistinct::Distinct))
         || select_modifiers.is_some()
         || top.is_some()
         || *top_before_distinct

@@ -2,6 +2,8 @@
 mod definition_codec;
 #[path = "correctness/discard.rs"]
 mod discard;
+#[path = "correctness/distinct.rs"]
+mod distinct;
 #[path = "correctness/expression.rs"]
 mod expression;
 #[path = "correctness/extend.rs"]

@@ -117,7 +117,40 @@ fn projection_executes_qualified_coerced_expressions_into_sqlite() {
 }
 
 #[test]
-fn union_all_keeps_distinct_scan_stations() {
+fn select_distinct_deduplicates_projected_rows_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("distinct.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'distinct_values') \
+         SELECT DISTINCT CAST(value % 2 AS BIGINT) AS value \
+         FROM sequence(start => 18446744073709551612)",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
+
+    let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = program.open(&flow_path).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let mut values = connection
+        .prepare("SELECT value FROM distinct_values")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    values.sort_unstable();
+    assert_eq!(values, [0, 1]);
+}
+
+#[test]
+fn union_all_keeps_separate_scan_stations() {
     let root = tempfile::tempdir().unwrap();
     let program = SqlProgram::parse(
         "INSERT INTO discard() \
