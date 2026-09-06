@@ -8,9 +8,10 @@
 
 ![同一个 PostgreSQL 内经一份 SQL 完成实时 ETL](docs/assets/postgres-etl-live.gif)
 
-*真实进程录制：左侧是业务源表 `sales.orders`，中间运行仓库中的 `postgres_etl.sql`，右侧是同一
-PostgreSQL 实例、同一个 `postgres` 数据库内的 `analytics.order_insights`。源表的 `INSERT`、`UPDATE` 和
-`DELETE` 会经过计算、筛选、分类与分流合并，实时改变目标关系；宿主被 `SIGKILL` 后用同一 state
+*真实进程录制：上方左侧是业务源表 `sales.orders` 的实际写入，上方右侧是同一 PostgreSQL 实例、
+同一个 `postgres` 数据库内的 `analytics.order_insights`，底部固定显示 `postgres_etl.sql` 的数据路径和
+当前阶段。源表的 `INSERT`、`UPDATE` 和 `DELETE` 会经过计算、筛选、分类与分流合并，实时改变目标关系；
+宿主被 `SIGKILL` 后用同一 state
 重新打开，已提交结果不重复，后续变化继续到达。录制从空源表和新 slot 起步；当前试点不做初始快照。*
 
 [查看完整 SQL](crates/sql/examples/postgres_etl.sql) ·
