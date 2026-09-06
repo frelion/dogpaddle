@@ -33,7 +33,7 @@ postgres_cdc ──▶ subtotal ──▶ discount ──▶ eligibility ──�
 固定展示源表、完整 `fulfillment.sql` 文件和目标表，连续执行 28 次真实新增、修改和删除。
 中间从读写端点到最后一行 SQL 全程可见，无省略或滚动。
 付款状态、数量、价格、折扣与地区反复变化，可以持续观察筛选、金额重算、优先级和路由变化。
-视频的呈现间隔经过编辑，每次完整结果均与 PostgreSQL 原生 SQL 核对。
+视频的呈现间隔经过编辑，每次完整结果均与 `PostgreSQL` 原生 SQL 核对。
 可用
 [`record_fulfillment_demo.sh`](https://github.com/frelion/dogpaddle/blob/main/docs/tools/record_fulfillment_demo.sh)
 在本机真实 `PostgreSQL` 上重新生成：
