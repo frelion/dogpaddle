@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real SQL frontend PostgreSQL CDC-to-PostgreSQL gate (Python 3.9+).
+"""Real same-PostgreSQL fulfillment queue gate (Python 3.9+).
 
 The gate owns one temporary loopback-only PostgreSQL cluster. Ordinary Cargo
 commands compile the Rust host but never run this script.
@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -121,14 +122,17 @@ class Host:
 
 class Gate:
     def __init__(self, root: Path, pg_bin: Path, bundle: Path,
-                 binary: Path, cluster: PostgresCluster) -> None:
+                 binary: Path, cluster: PostgresCluster,
+                 capture_trace: bool) -> None:
         self.root, self.pg_bin = root, pg_bin
         self.bundle, self.binary = bundle, binary
         self.cluster = cluster
+        self.capture_trace = capture_trace
+        self.scenes: list[dict[str, Any]] = []
         self.flow = root / "flow"
         repository = Path(__file__).resolve().parents[2]
         self.program = (
-            repository / "crates/sql/examples/postgres_etl.sql"
+            repository / "crates/sql/examples/fulfillment.sql"
         ).resolve(strict=True)
         self.port = cluster.port
         self.pg_env = dict(os.environ, PGPASSWORD=PASSWORD)
@@ -136,10 +140,10 @@ class Gate:
                      "-p", str(self.port), "-U", "dogpaddle_gate",
                      "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-At"]
         self.host_environment = {
-            "DOGPADDLE_POSTGRES_ETL_BUNDLE": str(bundle),
-            "DOGPADDLE_POSTGRES_ETL_PORT": str(self.port),
-            "DOGPADDLE_POSTGRES_ETL_USER": "dogpaddle_gate",
-            "DOGPADDLE_POSTGRES_ETL_PASSWORD": PASSWORD,
+            "DOGPADDLE_FULFILLMENT_BUNDLE": str(bundle),
+            "DOGPADDLE_FULFILLMENT_PORT": str(self.port),
+            "DOGPADDLE_FULFILLMENT_USER": "dogpaddle_gate",
+            "DOGPADDLE_FULFILLMENT_PASSWORD": PASSWORD,
         }
 
     def start(self) -> None:
@@ -188,7 +192,7 @@ class Gate:
 
     def prepare(self) -> None:
         self.sql(
-            "CREATE SCHEMA sales; CREATE SCHEMA analytics; "
+            "CREATE SCHEMA sales; CREATE SCHEMA ops; "
             "CREATE TABLE sales.orders ("
             "order_id BIGINT PRIMARY KEY, customer TEXT NOT NULL, "
             "region TEXT NOT NULL, status TEXT NOT NULL, "
@@ -208,44 +212,71 @@ class Gate:
             "WHERE slot_name = 'orders_slot'"
         ) == "t"
 
-    def rows(self) -> list[tuple[int, int, str, str, int, int, str,
-                               Optional[str]]]:
-        if self.sql(
-            "SELECT to_regclass('analytics.order_insights') IS NOT NULL"
-        ) != "t":
-            return []
+    def source_rows(self) -> list[dict[str, Any]]:
         values = self.sql(
-            'SELECT "$dogpaddle.id", order_id, '
-            "convert_from(customer, 'UTF8'), convert_from(market, 'UTF8'), "
-            "gross_cents, net_cents, convert_from(lane, 'UTF8'), "
-            "attention IS NULL, COALESCE(convert_from(attention, 'UTF8'), '') "
-            "FROM analytics.order_insights ORDER BY order_id"
+            "SELECT order_id, customer, region, status, quantity, "
+            "unit_price_cents, discount_pct "
+            "FROM sales.orders ORDER BY order_id"
         )
         if not values:
             return []
         rows = []
         for line in values.splitlines():
-            (technical_id, order_id, customer, market, gross_cents,
-             net_cents, lane, attention_is_null, attention) = line.split("|", 8)
-            if attention_is_null not in {"t", "f"}:
+            (order_id, customer, region, status, quantity,
+             unit_price_cents, discount_pct) = line.split("|", 6)
+            rows.append({
+                "order_id": int(order_id),
+                "customer": customer,
+                "region": region,
+                "status": status,
+                "quantity": int(quantity),
+                "unit_price_cents": int(unit_price_cents),
+                "discount_pct": int(discount_pct),
+            })
+        return rows
+
+    def rows(self) -> list[tuple[int, int, str, int, int, str, str,
+                               Optional[str]]]:
+        if self.sql(
+            "SELECT to_regclass('ops.fulfillment_queue') IS NOT NULL"
+        ) != "t":
+            return []
+        values = self.sql(
+            'SELECT "$dogpaddle.id", order_id, '
+            "convert_from(customer, 'UTF8'), subtotal_cents, payable_cents, "
+            "convert_from(fulfillment_center, 'UTF8'), "
+            "convert_from(handling_lane, 'UTF8'), handling_reason IS NULL, "
+            "COALESCE(convert_from(handling_reason, 'UTF8'), '') "
+            "FROM ops.fulfillment_queue ORDER BY order_id"
+        )
+        if not values:
+            return []
+        rows = []
+        for line in values.splitlines():
+            (technical_id, order_id, customer, subtotal_cents,
+             payable_cents, fulfillment_center, handling_lane,
+             reason_is_null, handling_reason) = line.split("|", 8)
+            if reason_is_null not in {"t", "f"}:
                 raise RuntimeError(
-                    f"invalid PostgreSQL NULL marker: {attention_is_null}"
+                    f"invalid PostgreSQL NULL marker: {reason_is_null}"
                 )
-            if attention_is_null == "t" and attention:
-                raise RuntimeError("NULL attention unexpectedly has a value")
+            if reason_is_null == "t" and handling_reason:
+                raise RuntimeError(
+                    "NULL handling_reason unexpectedly has a value"
+                )
             rows.append((
                 int(technical_id),
                 int(order_id),
                 customer,
-                market,
-                int(gross_cents),
-                int(net_cents),
-                lane,
-                None if attention_is_null == "t" else attention,
+                int(subtotal_cents),
+                int(payable_cents),
+                fulfillment_center,
+                handling_lane,
+                None if reason_is_null == "t" else handling_reason,
             ))
         return rows
 
-    def logical_rows(self) -> list[tuple[int, str, str, int, int, str,
+    def logical_rows(self) -> list[tuple[int, str, int, int, str, str,
                                         Optional[str]]]:
         return [row[1:] for row in self.rows()]
 
@@ -256,11 +287,44 @@ class Gate:
             raise RuntimeError("target contains duplicate logical order IDs")
         return ids
 
-    def target_insert_count(self) -> int:
+    def target_trace_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "rid": technical_id,
+                "order_id": order_id,
+                "customer": customer,
+                "subtotal_cents": subtotal_cents,
+                "payable_cents": payable_cents,
+                "fulfillment_center": fulfillment_center,
+                "handling_lane": handling_lane,
+                "handling_reason": handling_reason,
+            }
+            for (
+                technical_id,
+                order_id,
+                customer,
+                subtotal_cents,
+                payable_cents,
+                fulfillment_center,
+                handling_lane,
+                handling_reason,
+            ) in self.rows()
+        ]
+
+    def capture(self, name: str) -> None:
+        if not self.capture_trace:
+            return
+        self.scenes.append({
+            "name": name,
+            "source": self.source_rows(),
+            "target": self.target_trace_rows(),
+        })
+
+    def target_delete_count(self) -> int:
         log = (self.root / "postgres.log").read_text(
             encoding="utf-8", errors="replace"
         )
-        return log.count('INSERT INTO "analytics"."order_insights" (')
+        return log.count('DELETE FROM ONLY "ops"."fulfillment_queue" ')
 
     def host(self, mode: str, session: int) -> Host:
         return Host(self.binary, mode, self.program, self.flow,
@@ -285,172 +349,213 @@ class Gate:
 
         until(description, settled)
 
-    def run_gate(self) -> None:
-        first = [
-            (103, "Nova", "China", 32_000, 24_000, "standard", "regional"),
-            (104, "Kite", "Global", 50_000, 40_000, "priority", "review"),
+    def run_gate(self) -> list[dict[str, Any]]:
+        inserted = [
+            (
+                103, "Nova", 32_000, 24_000,
+                "CN-HUB", "standard", "regional_route",
+            ),
         ]
+        paid = [
+            (
+                101, "Acme", 15_000, 13_500,
+                "CN-HUB", "standard", "regional_route",
+            ),
+            *inserted,
+        ]
+        repriced = [
+            paid[0],
+            (
+                103, "Nova", 48_000, 48_000,
+                "CN-HUB", "priority", "regional_route",
+            ),
+        ]
+        after_delete = [repriced[1]]
+
         with self.host("build", 1) as host:
             self.drive(host, "SQL CDC connector starts", self.slot_active)
+            self.capture("connected")
+
             self.sql(
                 "INSERT INTO sales.orders VALUES "
                 "(101, 'Acme', 'cn-east', 'new', 3, 5000, 10), "
                 "(102, 'Orbit', 'eu-west', 'paid', 2, 4000, 0), "
-                "(103, 'Nova', 'cn-south', 'paid', 4, 8000, 25), "
-                "(104, 'Kite', 'us-west', 'paid', 5, 10000, 20)"
+                "(103, 'Nova', 'cn-south', 'paid', 4, 8000, 25)"
             )
-
-            def first_target_commit() -> bool:
-                response = host.advance()
-                rows = self.logical_rows()
-                sink = response["sink"]
-                if len(rows) != len(set(rows)) or not set(rows).issubset(first):
-                    raise RuntimeError(f"invalid partial ETL target relation: {rows}")
-                if rows != first:
-                    return False
-                if (
-                    response["outcome"] != "Progressed"
-                    or sink["cursor"] >= sink["tail"]
-                ):
-                    raise RuntimeError(
-                        "first ETL result was not observed at the Prepared crash point"
-                    )
-                return True
-
-            until("first multi-stage ETL result commits", first_target_commit)
-            first_rows = self.rows()
-            first_ids = self.technical_ids()
-            if (
-                set(first_ids) != {103, 104}
-                or len(set(first_ids.values())) != len(first_ids)
-            ):
-                raise RuntimeError(f"invalid initial technical IDs: {first_ids}")
-            first_insert_count = self.target_insert_count()
-            if first_insert_count == 0:
-                raise RuntimeError("PostgreSQL did not log the first target INSERT")
+            self.drive(
+                host,
+                "the first qualified order enters fulfillment",
+                lambda: self.logical_rows() == inserted,
+            )
+            self.settle(host, "initial fulfillment result settles")
+            if self.logical_rows() != inserted:
+                raise RuntimeError("settling changed the initial fulfillment result")
+            inserted_ids = self.technical_ids()
+            if inserted_ids != {103: 1}:
+                raise RuntimeError(f"invalid initial technical IDs: {inserted_ids}")
             if self.sql(
                 "SELECT is_nullable FROM information_schema.columns "
-                "WHERE table_schema = 'analytics' "
-                "AND table_name = 'order_insights' "
-                "AND column_name = 'attention'"
+                "WHERE table_schema = 'ops' "
+                "AND table_name = 'fulfillment_queue' "
+                "AND column_name = 'handling_reason'"
             ) != "YES":
-                raise RuntimeError("UNION common Schema did not widen attention")
-            # The target write committed during the command above. No next Flow
-            # round settles its durable Prepared state before this process exit.
-            host.kill()
-
-        until("killed SQL host releases its slot", lambda: not self.slot_active())
-        with self.host("open", 2) as host:
-            replay = host.advance()
-            if (
-                replay["outcome"] != "Progressed"
-                or replay["sink"]["cursor"] >= replay["sink"]["tail"]
-                or self.rows() != first_rows
-            ):
-                raise RuntimeError("Prepared replay duplicated or changed the ETL result")
-            until(
-                "Prepared target INSERT is replayed",
-                lambda: self.target_insert_count() > first_insert_count,
-            )
-            self.drive(host, "reopened SQL CDC connector starts", self.slot_active)
-            self.settle(host, "reopened Flow settles")
-            if self.rows() != first_rows or self.technical_ids() != first_ids:
                 raise RuntimeError(
-                    "settling Prepared replay changed rows or stable technical IDs"
+                    "UNION common Schema did not widen handling_reason"
                 )
+            self.capture("inserted")
 
             self.sql(
                 "UPDATE sales.orders SET status = 'paid' WHERE order_id = 101"
             )
-            entered = [
-                (101, "Acme", "China", 15_000, 13_500, "standard", "regional"),
-                *first,
-            ]
             self.drive(
                 host,
-                "an update makes a previously filtered order qualify",
-                lambda: self.logical_rows() == entered,
+                "a paid order becomes eligible for fulfillment",
+                lambda: self.logical_rows() == paid,
             )
-            self.settle(host, "newly qualified order settles")
-            if self.logical_rows() != entered:
-                raise RuntimeError("settling changed the newly qualified result")
-            entered_ids = self.technical_ids()
-            if (
-                entered_ids[103] != first_ids[103]
-                or entered_ids[104] != first_ids[104]
-                or entered_ids[101] in first_ids.values()
-            ):
+            self.settle(host, "paid order settles")
+            if self.logical_rows() != paid:
+                raise RuntimeError("settling changed the paid order result")
+            paid_ids = self.technical_ids()
+            if paid_ids != {101: 2, 103: 1}:
                 raise RuntimeError(
-                    f"unrelated rows changed identity after qualifying update: {entered_ids}"
+                    f"qualifying an order changed existing identity: {paid_ids}"
                 )
+            self.capture("paid")
 
             self.sql(
                 "UPDATE sales.orders SET quantity = 6, discount_pct = 0 "
                 "WHERE order_id = 103"
             )
-            repriced = [
-                entered[0],
-                (103, "Nova", "China", 48_000, 48_000, "priority", "regional"),
-                entered[2],
-            ]
             self.drive(
                 host,
-                "arithmetic and CASE results change after repricing",
+                "repricing promotes an order to priority",
                 lambda: self.logical_rows() == repriced,
             )
             self.settle(host, "repriced order settles")
             if self.logical_rows() != repriced:
                 raise RuntimeError("settling changed the repriced result")
             repriced_ids = self.technical_ids()
+            if repriced_ids != {101: 2, 103: 3}:
+                raise RuntimeError(
+                    "repricing did not replace exactly one relation row: "
+                    f"{repriced_ids}"
+                )
+            self.capture("repriced")
+
+            delete_count_before = self.target_delete_count()
+            self.sql("DELETE FROM sales.orders WHERE order_id = 101")
+            if self.logical_rows() != repriced:
+                raise RuntimeError("target changed before the Flow advanced deletion")
+
+            def deletion_target_commit() -> bool:
+                response = host.advance()
+                rows = self.logical_rows()
+                if rows != repriced and rows != after_delete:
+                    raise RuntimeError(
+                        f"invalid partial fulfillment deletion: {rows}"
+                    )
+                if rows != after_delete:
+                    return False
+                sink = response["sink"]
+                if (
+                    response["outcome"] != "Progressed"
+                    or sink["cursor"] >= sink["tail"]
+                ):
+                    raise RuntimeError(
+                        "deletion was not observed at the Prepared crash point"
+                    )
+                return True
+
+            until("fulfillment deletion commits", deletion_target_commit)
+            crashed_rows = self.rows()
+            crashed_ids = self.technical_ids()
+            if crashed_ids != {103: 3}:
+                raise RuntimeError(
+                    f"deletion changed the surviving technical ID: {crashed_ids}"
+                )
+            crash_delete_count = self.target_delete_count()
+            if crash_delete_count <= delete_count_before:
+                raise RuntimeError("PostgreSQL did not log the target deletion")
+            self.capture("deleted")
+            # PostgreSQL has committed the delete, while the durable Sink cursor
+            # still points at the same input. Kill before its settlement turn.
+            host.kill()
+
+        until("killed SQL host releases its slot", lambda: not self.slot_active())
+        self.capture("crashed")
+
+        with self.host("open", 2) as host:
+            replay = host.advance()
             if (
-                repriced_ids[101] != entered_ids[101]
-                or repriced_ids[104] != entered_ids[104]
-                or repriced_ids[103] <= max(entered_ids.values())
+                replay["outcome"] != "Progressed"
+                or replay["sink"]["cursor"] >= replay["sink"]["tail"]
+                or self.rows() != crashed_rows
+                or self.technical_ids() != crashed_ids
             ):
                 raise RuntimeError(
-                    f"repricing did not replace exactly one stable relation row: {repriced_ids}"
+                    "Prepared replay duplicated or changed the fulfillment queue"
                 )
+            until(
+                "Prepared target DELETE is replayed",
+                lambda: self.target_delete_count() > crash_delete_count,
+            )
+            self.drive(host, "reopened SQL CDC connector starts", self.slot_active)
+            self.settle(host, "reopened Flow settles")
+            if self.rows() != crashed_rows or self.technical_ids() != crashed_ids:
+                raise RuntimeError(
+                    "settling Prepared replay changed rows or stable technical IDs"
+                )
+            self.capture("recovered")
 
-            self.sql("DELETE FROM sales.orders WHERE order_id = 104")
-            deleted = repriced[:2]
+            self.sql(
+                "INSERT INTO sales.orders VALUES "
+                "(104, 'Kestrel', 'us-west', 'paid', 5, 10000, 20)"
+            )
+            resumed = [
+                *after_delete,
+                (
+                    104, "Kestrel", 50_000, 40_000,
+                    "GLOBAL-HUB", "priority", "export_review",
+                ),
+            ]
             self.drive(
                 host,
-                "deleting a source order retracts its Global result",
-                lambda: self.logical_rows() == deleted,
+                "a high-value global order enters export review",
+                lambda: self.logical_rows() == resumed,
             )
-            self.settle(host, "source deletion settles")
-            if self.logical_rows() != deleted:
-                raise RuntimeError("settling changed the source deletion result")
-            if self.technical_ids() != {
-                101: repriced_ids[101],
-                103: repriced_ids[103],
-            }:
-                raise RuntimeError("source deletion changed an unrelated technical ID")
+            self.settle(host, "resumed global order settles")
+            if self.logical_rows() != resumed:
+                raise RuntimeError("settling changed the resumed result")
+            resumed_ids = self.technical_ids()
+            if resumed_ids != {103: 3, 104: 4}:
+                raise RuntimeError(
+                    f"resuming changed an existing ID or reused one: {resumed_ids}"
+                )
+            self.capture("resumed")
 
             self.sql(
                 "INSERT INTO sales.orders VALUES "
                 "(105, 'Lumen', 'us-west', 'paid', 2, 7000, 0)"
             )
             final = [
-                *deleted,
-                (105, "Lumen", "Global", 14_000, 14_000, "standard", None),
+                *resumed,
+                (
+                    105, "Lumen", 14_000, 14_000,
+                    "GLOBAL-HUB", "standard", None,
+                ),
             ]
             self.drive(
                 host,
-                "a successor INSERT reaches the Global UNION ALL branch",
+                "a standard global order preserves nullable handling reason",
                 lambda: self.logical_rows() == final,
             )
-            self.settle(host, "successor INSERT settles")
+            self.settle(host, "nullable global order settles")
             if self.logical_rows() != final:
-                raise RuntimeError("settling changed the successor INSERT result")
+                raise RuntimeError("settling changed the nullable global result")
             final_ids = self.technical_ids()
-            if (
-                final_ids[101] != repriced_ids[101]
-                or final_ids[103] != repriced_ids[103]
-                or final_ids[105] <= max(repriced_ids.values())
-            ):
+            if final_ids != {103: 3, 104: 4, 105: 5}:
                 raise RuntimeError(
-                    f"successor INSERT changed existing IDs or reused the frontier: {final_ids}"
+                    f"final INSERT changed existing IDs or reused one: {final_ids}"
                 )
             if self.sql(
                 "SELECT schemaname || '.' || tablename FROM pg_publication_tables "
@@ -458,11 +563,15 @@ class Gate:
             ) != "sales.orders":
                 raise RuntimeError("CDC publication captured the SQL sink target")
 
-        print(
-            "PASS checked-in SQL postgres_cdc -> four CTEs/arithmetic/CASE/filter/"
-            "nullable UNION ALL -> postgres build, INSERT/UPDATE/DELETE, "
-            "PG-committed/Prepared crash, idempotent reopen, and successor"
-        )
+        expected_scenes = [
+            "connected", "inserted", "paid", "repriced",
+            "deleted", "crashed", "recovered", "resumed",
+        ]
+        if self.capture_trace and [
+            scene["name"] for scene in self.scenes
+        ] != expected_scenes:
+            raise RuntimeError("fulfillment trace scenes are incomplete")
+        return self.scenes
 
 
 def resolve_host(parser: argparse.ArgumentParser, supplied: Optional[Path]) -> Path:
@@ -507,6 +616,32 @@ def resolve_host(parser: argparse.ArgumentParser, supplied: Optional[Path]) -> P
     return binary
 
 
+def write_trace(path: Path, scenes: list[dict[str, Any]]) -> Path:
+    destination = path.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump({"scenes": scenes}, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
 def report_stop_failure(root: Path, error: BaseException) -> None:
     print(
         "failed to stop the isolated PostgreSQL cluster; a process may still be "
@@ -524,6 +659,11 @@ def main() -> None:
     parser.add_argument("--host", type=Path)
     parser.add_argument("--postgres-bin", type=Path, required=True)
     parser.add_argument("--artifacts-dir", type=Path)
+    parser.add_argument(
+        "--trace-output",
+        type=Path,
+        help="atomically write real fulfillment scene data after the gate passes",
+    )
     parser.add_argument(
         "--keep",
         action="store_true",
@@ -554,14 +694,18 @@ def main() -> None:
         raise RuntimeError(f"refusing to overwrite an existing SQL fixture: {root}")
     print(f"isolated fixture: {root}", flush=True)
     cluster = PostgresCluster(root, pg_bin, socket_directory=root / "socket")
-    gate = Gate(root, pg_bin, bundle, binary, cluster)
+    gate = Gate(
+        root, pg_bin, bundle, binary, cluster,
+        capture_trace=args.trace_output is not None,
+    )
     failure: Optional[BaseException] = None
     passed = False
     stopped = False
+    scenes: list[dict[str, Any]] = []
     try:
         gate.start()
         gate.prepare()
-        gate.run_gate()
+        scenes = gate.run_gate()
         passed = True
     except BaseException as error:
         failure = error
@@ -580,6 +724,15 @@ def main() -> None:
             print("removed the temporary PostgreSQL cluster and Flow")
         else:
             print(f"fixture retained at {root}", file=os.sys.stderr)
+
+    if args.trace_output is not None:
+        trace_path = write_trace(args.trace_output, scenes)
+        print(f"fulfillment trace: {trace_path}")
+    print(
+        "PASS checked-in fulfillment SQL: postgres_cdc -> subtotal/discount/"
+        "eligibility/routing -> PostgreSQL, INSERT/UPDATE/DELETE, nullable "
+        "UNION ALL, PG-committed crash, idempotent reopen, and stable IDs"
+    )
 
 
 if __name__ == "__main__":

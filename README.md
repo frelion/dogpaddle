@@ -1,42 +1,31 @@
 # DogPaddle
 
+**一份 SQL，把同一个 PostgreSQL 里的订单实时变成履约队列。**
+
+业务后端照常写 `sales.orders`。DogPaddle 读取 WAL，计算应付金额、筛选可履约订单、划分优先级并
+分配履约中心，再把 `ops.fulfillment_queue` 写回同一个数据库。业务代码无需双写。
+
+![DogPaddle 将 PostgreSQL 订单实时转换为履约队列](docs/assets/fulfillment-hero.png)
+
+**计价**　数量 × 单价并应用折扣　→　**准入**　`paid` 且应付金额 ≥ `$100`　→　
+**分级**　应付金额 ≥ `$400` 为 `priority`　→　**路由**　`cn-east / cn-south` 到 `CN-HUB`，
+其他地区到 `GLOBAL-HUB`
+
+https://github.com/user-attachments/assets/2b348985-6795-41dd-8c34-f302994cb385
+
+*30 秒真实 PostgreSQL 演示：`INSERT` 让订单进入队列，`UPDATE` 重算金额与优先级，`DELETE`
+撤回派生结果；目标写入后强杀宿主，再从同一 state 恢复。画面中的每张表都来自系统验收的实时查询；
+这次恢复没有重复结果，后续订单继续处理。*
+
+[查看完整 SQL](crates/sql/examples/fulfillment.sql) · [运行本地 Quickstart](#快速上手) ·
+[复现真实演示](#复现真实演示)
+
+> [!NOTE]
+> PostgreSQL 接入目前是早期试点：从空源表和新的 replication slot 开始，不包含已有数据的初始快照；
+> 生产加固仍在进行。
+
 [![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
-[![Debezium runtime bundles](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-runtime.yml)
 [![Debezium PostgreSQL recovery](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml)
-
-**业务照常写 PostgreSQL。DogPaddle 读取 WAL，用一份 SQL 实时完成 ETL，再写回同一个 PostgreSQL。**
-
-![同一个 PostgreSQL 内经一份 SQL 完成实时 ETL](docs/assets/postgres-etl-live.gif)
-
-*真实进程录制：上方左侧是业务源表 `sales.orders` 的实际写入，上方右侧是同一 PostgreSQL 实例、
-同一个 `postgres` 数据库内的 `analytics.order_insights`，底部固定显示 `postgres_etl.sql` 的数据路径和
-当前阶段。源表的 `INSERT`、`UPDATE` 和 `DELETE` 会经过计算、筛选、分类与分流合并，实时改变目标关系；
-宿主被 `SIGKILL` 后用同一 state
-重新打开，已提交结果不重复，后续变化继续到达。录制从空源表和新 slot 起步；当前试点不做初始快照。*
-
-[查看完整 SQL](crates/sql/examples/postgres_etl.sql) ·
-[查看录屏宿主](crates/sql/examples/postgres_etl_live.rs) ·
-[重新生成真实录屏](docs/tools/record_postgres_etl_live.sh) ·
-[查看 PostgreSQL 系统验收](system-tests/postgres/check_sql.py)
-
-这条链路只需要一个 PostgreSQL：后端继续维护自己的源表，DogPaddle 通过进程内 Debezium/JRE
-运行时捕获 WAL，并独占维护另一个 schema 中的派生表。业务代码不需要双写，也不需要部署独立的
-流处理服务、控制面或集群。
-
-```text
-backend writes
-      │
-      ▼
-sales.orders ── WAL / postgres_cdc ──▶ CTE / CAST / arithmetic / CASE / WHERE
-   (same PostgreSQL)                                      │
-                                                         ▼
-                                           analytics.order_insights
-                                              (same PostgreSQL)
-```
-
-一条 `INSERT INTO ... SELECT ...` 就是完整 Flow：Scan、转换和 Sink 都在同一个 SQL 文件里。
-DataFusion 负责 SQL 名称与类型分析，Arrow 承载变化批次，MDBX 保存 canonical Flow、游标和算子状态；
-应用通过很小的 Rust API 控制构建、推进和恢复。
 
 ## 快速上手
 
@@ -66,14 +55,8 @@ sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
 结果会继续增加 `10` 和 `12`。`sequence` 是持续 Scan；quickstart 宿主按参数执行有限轮
 `Flow::advance` 后主动退出，以便直接看到恢复行为。实际应用自行决定推进频率和停止时机。
 
-![一份 SQL 构建并恢复 DogPaddle Flow](docs/assets/sql-quickstart.gif)
-
-*这个本地 quickstart 只依赖 SQLite：先 `build`，再用同一份 SQL 和 state `open`；恢复后继续写入，
-已有结果没有重复。*
-
 [查看 quickstart SQL](crates/sql/examples/quickstart.sql) ·
-[查看 quickstart 宿主](crates/sql/examples/quickstart.rs) ·
-[重新生成 quickstart 录屏](docs/tools/record_sql_quickstart.sh)
+[查看 quickstart 宿主](crates/sql/examples/quickstart.rs)
 
 ## 一个文件就是一条完整 Flow
 
@@ -141,11 +124,6 @@ flow.advance()?;
 | 运行与恢复 | canonical Flow Definition、持久游标、算子状态、软背压、`Flow::status`、build/open/reopen |
 | 数据模型 | Arrow Schema、批量差分 Change、完整自描述 Arrow IPC Stream |
 
-底层目前有 12 个内建 Operation：`SequenceScan`、`PostgresCdcScan`、`RunningEventCount`、
-`Project`、`Filter`、`Extend`、`Select`、`SchemaAlign`、`UnionAll`、`SqliteSink`、
-`PostgresSink` 和 `Discard`。新增 SQL 能力通过明确的 LogicalPlan lowering 映射到这些 Operation，
-运行仍由同一套 Flow 协议负责。
-
 ## 当前边界
 
 - DogPaddle 仍是早期引擎内核，持久化和恢复已有系统验收，生产加固仍在进行。
@@ -161,6 +139,21 @@ flow.advance()?;
 - `PostgresSink` 创建并独占无损 Arrow 关系表，不镜像源表 DDL；当前文本值按 bytes 保存，所以示例
   查询使用 `convert_from(...)`。完整约束见 [Operation 文档](crates/operation/README.md)。
 - 当前持久格式经过 golden 与 reopen 测试，但开发期 v1 不提供跨版本迁移承诺。
+
+## 复现真实演示
+
+准备 `cargo`、Python 3.9+、`uv`、本机 PostgreSQL 可执行文件和已经构建的
+[固定版本 Debezium runtime bundle](crates/debezium/README.md#runtime-bundle)，然后运行：
+
+```sh
+docs/tools/record_fulfillment_demo.sh \
+  --bundle /absolute/path/to/runtime-bundle \
+  --postgres-bin /absolute/path/to/postgresql/bin
+```
+
+该命令先运行[真实 PostgreSQL 系统验收](system-tests/postgres/check_sql.py)，捕获八个 source/target
+快照；全部通过后才生成 README 海报和 `target/demo/fulfillment-demo.mp4`。渲染依赖由 `uv` 按固定版本
+安装，不进入 Rust 产品依赖；Linux 还需要 Chromium 的系统运行库。
 
 ## 深入阅读
 

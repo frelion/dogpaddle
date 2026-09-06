@@ -157,8 +157,9 @@ target spec，numeric IP、端口与凭据随 `PostgresSinkConfig` 在 build/ope
 Schema 固定；同一 target spec 不得由其他 Flow 接管或共享。远端 marker 只是 ownership/layout-version
 标记，精确 logical Schema 由 Flow binding 与运行时 guard 保证。连接和每个数据库工作单元有 5 秒
 client deadline；DNS endpoint、TLS、在线演进与外部修改不在当前协议内。真实验收见根目录 `TESTING.md` 的
-`system-tests/postgres/check_sink.py`。面向产品的同库 `PostgreSQL` CDC → 多段 SQL ETL → `PostgreSQL` 示例是
-[`postgres_etl.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/postgres_etl.sql)。
+`system-tests/postgres/check_sink.py`。面向产品的同库实时订单履约示例从 `sales.orders` 捕获 CDC，经过
+多段 SQL 转换后写入 `ops.fulfillment_queue`，完整程序见
+[`fulfillment.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/fulfillment.sql)。
 
 ## 运行状态
 

@@ -1,0 +1,936 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DogPaddle — Live fulfillment queue</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07110f;
+      --panel: rgba(12, 29, 25, 0.94);
+      --panel-2: rgba(16, 38, 32, 0.9);
+      --line: rgba(174, 229, 205, 0.14);
+      --muted: #8ca79c;
+      --text: #eaf7f1;
+      --mint: #65e5ac;
+      --cyan: #67dff4;
+      --amber: #ffc96b;
+      --red: #ff7182;
+      --violet: #b49bff;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 1440px;
+      height: 810px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(circle at 50% 18%, rgba(52, 219, 151, 0.09), transparent 36%),
+        linear-gradient(rgba(150, 219, 190, 0.028) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(150, 219, 190, 0.028) 1px, transparent 1px);
+      background-size: auto, 40px 40px, 40px 40px;
+      pointer-events: none;
+    }
+
+    .app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      padding: 26px 32px 24px;
+      display: grid;
+      grid-template-rows: 82px 1fr 102px;
+      gap: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand { display: flex; align-items: center; gap: 15px; }
+
+    .mark {
+      width: 46px;
+      height: 46px;
+      border: 1px solid rgba(101, 229, 172, 0.5);
+      border-radius: 14px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, rgba(101, 229, 172, 0.18), rgba(103, 223, 244, 0.04));
+      box-shadow: 0 0 34px rgba(101, 229, 172, 0.09);
+    }
+
+    .mark svg { width: 28px; height: 28px; }
+
+    .brand-name {
+      font-size: 23px;
+      font-weight: 750;
+      letter-spacing: -0.03em;
+    }
+
+    .brand-tag {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .headline { text-align: center; transform: translateX(-18px); }
+    .headline h1 { margin: 0; font-size: 28px; line-height: 1.1; letter-spacing: -0.035em; font-weight: 690; }
+    .headline h1 strong { color: var(--mint); font-weight: 720; }
+    .headline p { margin: 7px 0 0; color: #9bb6ab; font-size: 13px; }
+
+    .live-pill {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      height: 34px;
+      padding: 0 14px;
+      border: 1px solid rgba(101, 229, 172, 0.28);
+      border-radius: 999px;
+      background: rgba(101, 229, 172, 0.08);
+      color: #baf8d9;
+      font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.08em;
+    }
+
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--mint);
+      box-shadow: 0 0 12px var(--mint);
+      animation: breathe 1.8s ease-in-out infinite;
+    }
+
+    @keyframes breathe { 50% { opacity: .45; transform: scale(.8); } }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 390px 460px 1fr;
+      gap: 16px;
+      min-height: 0;
+    }
+
+    .panel {
+      position: relative;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(165deg, rgba(15, 34, 29, 0.97), rgba(9, 24, 20, 0.96));
+      overflow: hidden;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.18);
+    }
+
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(194, 244, 222, 0.2), transparent);
+    }
+
+    .panel-head {
+      height: 66px;
+      padding: 14px 17px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      color: var(--muted);
+      font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 7px;
+    }
+
+    .object-name {
+      font: 650 17px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #dff4eb;
+    }
+
+    .db-chip, .file-chip {
+      padding: 6px 9px;
+      border-radius: 8px;
+      color: #98b8aa;
+      background: rgba(255,255,255,.035);
+      border: 1px solid rgba(255,255,255,.07);
+      font: 650 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .table-head, .source-row {
+      display: grid;
+      grid-template-columns: 68px 56px 68px 84px 38px;
+      align-items: center;
+      column-gap: 5px;
+    }
+
+    .target-head, .target-row {
+      display: grid;
+      grid-template-columns: 92px 64px 96px 76px 1fr;
+      align-items: center;
+      column-gap: 7px;
+    }
+
+    .table-head, .target-head {
+      height: 38px;
+      padding: 0 16px;
+      color: #668276;
+      font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      border-bottom: 1px solid rgba(174, 229, 205, 0.08);
+    }
+
+    .rows { padding: 9px 10px; display: flex; flex-direction: column; gap: 7px; }
+
+    .source-row, .target-row {
+      position: relative;
+      min-height: 56px;
+      padding: 8px 7px;
+      border-radius: 11px;
+      background: rgba(255,255,255,.028);
+      border: 1px solid rgba(255,255,255,.052);
+      font: 570 13px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #cfe2da;
+      transition: border-color .35s, background .35s, opacity .35s, transform .35s;
+    }
+
+    .source-row.hot, .target-row.hot {
+      border-color: rgba(101,229,172,.72);
+      background: rgba(101,229,172,.09);
+      box-shadow: 0 0 26px rgba(101,229,172,.08);
+      animation: row-in .55s ease-out;
+    }
+
+    .source-row.warn, .target-row.warn {
+      border-color: rgba(255,201,107,.62);
+      background: rgba(255,201,107,.08);
+      animation: row-in .55s ease-out;
+    }
+
+    .source-row.remove, .target-row.remove {
+      border-color: rgba(255,113,130,.62);
+      background: rgba(255,113,130,.08);
+      opacity: .38;
+      text-decoration: line-through;
+    }
+
+    @keyframes row-in { from { transform: translateY(6px); opacity: .1; } }
+
+    .order-name { color: #f0fbf6; font-weight: 720; line-height: 1.2; }
+    .order-name small { display: block; margin-top: 4px; color: #789287; font-size: 11px; font-weight: 560; }
+    .status { font-size: 11px; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; }
+    .status.paid { color: var(--mint); }
+    .status.new { color: var(--amber); }
+    .dim { color: #8ea89c; }
+    .money { color: #f4fbf8; font-weight: 760; }
+
+    .row-note {
+      position: absolute;
+      right: 8px;
+      bottom: 5px;
+      padding: 3px 5px;
+      border-radius: 5px;
+      color: #7d998d;
+      background: #0a1714;
+      font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .05em;
+    }
+
+    .row-note.pass { color: var(--mint); }
+    .row-note.drop { color: var(--amber); }
+
+    .sql-panel {
+      background:
+        radial-gradient(circle at 50% 35%, rgba(103, 223, 244, 0.055), transparent 42%),
+        linear-gradient(165deg, rgba(14, 34, 29, 0.98), rgba(8, 22, 19, 0.98));
+    }
+
+    .pipeline-body { padding: 13px 14px 10px; }
+
+    .flow-meta {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+      margin-bottom: 10px;
+    }
+
+    .metric {
+      padding: 8px 9px;
+      border: 1px solid rgba(255,255,255,.06);
+      border-radius: 9px;
+      background: rgba(255,255,255,.025);
+    }
+
+    .metric strong { display: block; color: #dff1ea; font: 710 12px/1 ui-monospace, monospace; }
+    .metric span { display: block; margin-top: 4px; color: #6e8b7f; font: 650 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .07em; }
+
+    .rules { display: flex; flex-direction: column; gap: 7px; }
+
+    .rule {
+      position: relative;
+      min-height: 69px;
+      padding: 10px 12px 9px 49px;
+      border: 1px solid rgba(255,255,255,.065);
+      border-radius: 11px;
+      background: rgba(4, 14, 12, .46);
+      transition: all .35s ease;
+    }
+
+    .rule::after {
+      content: "";
+      position: absolute;
+      left: 23px;
+      top: 44px;
+      height: 34px;
+      width: 1px;
+      background: linear-gradient(var(--line), rgba(101,229,172,.25));
+    }
+
+    .rule:last-child::after { display: none; }
+
+    .rule.active {
+      border-color: rgba(103,223,244,.62);
+      background: rgba(103,223,244,.075);
+      box-shadow: 0 0 26px rgba(103,223,244,.06);
+      transform: translateX(3px);
+    }
+
+    .rule-num {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      width: 23px;
+      height: 23px;
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      color: #83a397;
+      background: rgba(255,255,255,.05);
+      font: 750 10px/1 ui-monospace, monospace;
+    }
+
+    .rule.active .rule-num { color: #041712; background: var(--cyan); }
+    .rule-label { color: #98b5a9; font: 700 11px/1 ui-monospace, monospace; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 7px; }
+    .rule code { color: #e6f5ef; font: 570 13px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+    .rule:last-child code { white-space: normal; }
+    .kw { color: #b99eff; }
+    .value { color: #ffd37f; }
+    .field { color: #7be7f8; }
+
+    .trace-chip {
+      position: absolute;
+      z-index: 4;
+      left: 10px;
+      top: 176px;
+      min-width: 54px;
+      height: 25px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      border: 1px solid rgba(101,229,172,.65);
+      color: #c8f9e1;
+      background: #0d2921;
+      box-shadow: 0 0 20px rgba(101,229,172,.18);
+      font: 750 11px/1 ui-monospace, monospace;
+      transform: translateY(var(--trace-y, 0));
+      transition: transform .7s cubic-bezier(.2,.8,.2,1), opacity .3s;
+    }
+
+    .target-summary {
+      height: 52px;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid rgba(174, 229, 205, 0.08);
+    }
+
+    .summary-number { color: var(--mint); font: 760 21px/1 ui-monospace, monospace; }
+    .summary-copy { color: #779488; font-size: 12px; line-height: 1.35; }
+    .same-db { margin-left: auto; color: #8ba89c; font: 650 11px/1 ui-monospace, monospace; }
+
+    .hub, .lane, .reason {
+      display: inline-flex;
+      width: max-content;
+      max-width: 100%;
+      padding: 4px 6px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 760;
+      letter-spacing: .02em;
+      white-space: nowrap;
+    }
+    .hub { color: #99eafa; background: rgba(103,223,244,.1); }
+    .lane.priority { color: #ffda91; background: rgba(255,201,107,.11); }
+    .lane.standard { color: #b3cec2; background: rgba(179,206,194,.08); }
+    .reason { color: #c6b9ff; background: rgba(180,155,255,.11); }
+
+    .empty-state {
+      height: 300px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: #5f7b70;
+      font: 560 11px/1.7 ui-monospace, monospace;
+    }
+    .empty-state span { display: block; color: #83a095; }
+
+    .recovery {
+      position: absolute;
+      z-index: 8;
+      inset: 67px 0 0;
+      display: none;
+      place-items: center;
+      background: rgba(5, 14, 12, .83);
+      backdrop-filter: blur(5px);
+    }
+    .recovery.visible { display: grid; }
+    .recovery-card {
+      width: 320px;
+      padding: 24px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,113,130,.5);
+      background: #101b19;
+      text-align: center;
+      box-shadow: 0 24px 60px rgba(0,0,0,.45);
+    }
+    .recovery.resumed .recovery-card { border-color: rgba(180,155,255,.62); }
+    .recovery-icon { font-size: 30px; margin-bottom: 12px; color: var(--red); }
+    .recovery.resumed .recovery-icon { color: var(--violet); animation: rotate .9s ease; }
+    @keyframes rotate { to { transform: rotate(360deg); } }
+    .recovery-title { font-size: 17px; font-weight: 760; }
+    .recovery-detail { color: #839f94; font: 550 12px/1.55 ui-monospace, monospace; margin-top: 8px; white-space: pre-line; }
+    .recovery-rid {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      padding: 9px 10px;
+      border: 1px solid rgba(180,155,255,.25);
+      border-radius: 9px;
+      background: rgba(180,155,255,.07);
+      color: #8ca79c;
+      font: 700 11px/1 ui-monospace, monospace;
+      text-align: left;
+    }
+    .recovery-rid.visible { display: flex; }
+    .recovery-rid strong { color: #d8d0ff; font-size: 13px; }
+    .recovery-rid em { color: var(--mint); font-style: normal; }
+
+    .story {
+      display: grid;
+      grid-template-columns: 170px 1fr 240px;
+      align-items: center;
+      gap: 20px;
+      padding: 15px 19px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(9, 25, 21, .95);
+      overflow: hidden;
+    }
+
+    .step-kicker { color: var(--mint); font: 750 11px/1 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; }
+    .step-count { margin-top: 9px; color: #748f84; font: 650 11px/1 ui-monospace, monospace; }
+    .event-title { font-size: 18px; font-weight: 720; letter-spacing: -.02em; }
+    .event-detail { margin-top: 6px; color: #90aa9f; font-size: 14px; }
+    .event-detail code { color: #cce4d9; font: 650 13px/1 ui-monospace, monospace; }
+
+    .timeline { position: relative; height: 28px; display: flex; align-items: center; }
+    .timeline-track { width: 100%; height: 4px; border-radius: 99px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .timeline-fill { height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--mint), var(--cyan)); box-shadow: 0 0 12px rgba(101,229,172,.35); }
+    .elapsed { position: absolute; right: 0; top: 20px; color: #627e73; font: 650 9px/1 ui-monospace, monospace; }
+
+    .flash {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      pointer-events: none;
+      opacity: 0;
+      background: rgba(101,229,172,.08);
+    }
+    .flash.go { animation: flash .55s ease-out; }
+    @keyframes flash { 25% { opacity: 1; } to { opacity: 0; } }
+
+    .trace-error {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      place-items: center;
+      background: rgba(5, 14, 12, .9);
+      backdrop-filter: blur(8px);
+    }
+    .trace-error.visible { display: grid; }
+    .trace-error-card {
+      width: 470px;
+      padding: 28px;
+      border: 1px solid rgba(255,113,130,.45);
+      border-radius: 16px;
+      background: #101b19;
+      box-shadow: 0 24px 70px rgba(0,0,0,.5);
+    }
+    .trace-error-card strong { display: block; color: #ffd6dc; font-size: 17px; }
+    .trace-error-card code { display: block; margin-top: 12px; color: #9fb9ae; font: 600 11px/1.6 ui-monospace, monospace; white-space: pre-wrap; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+    html.static-frame *, html.static-frame *::before, html.static-frame *::after {
+      animation: none !important;
+      transition: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none">
+            <path d="M7 9.5h10.8c4 0 7.2 3.2 7.2 7.2v0c0 4-3.2 7.3-7.2 7.3H7V9.5Z" stroke="#65e5ac" stroke-width="2"/>
+            <path d="M12 5v22M12 16h10" stroke="#dff9ec" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div><div class="brand-name">DogPaddle</div><div class="brand-tag">Streaming dataflow</div></div>
+      </div>
+      <div class="headline">
+        <h1>One SQL file. A <strong>live fulfillment queue.</strong></h1>
+        <p>Price, filter, prioritize, and route every PostgreSQL order as it changes.</p>
+      </div>
+      <div class="live-pill"><span class="live-dot"></span> LIVE · POSTGRESQL WAL</div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel source-panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Business backend writes</div><div class="object-name">sales.orders</div></div>
+          <div class="db-chip">POSTGRESQL</div>
+        </div>
+        <div class="table-head"><span>Order</span><span>Status</span><span>Region</span><span>Qty × price</span><span>Disc.</span></div>
+        <div class="rows" id="sourceRows"></div>
+      </section>
+
+      <section class="panel sql-panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Streaming transformation</div><div class="object-name">fulfillment.sql</div></div>
+          <div class="file-chip">1 FILE · 4 CTEs</div>
+        </div>
+        <div class="pipeline-body">
+          <div class="flow-meta">
+            <div class="metric"><strong>CDC</strong><span>scan</span></div>
+            <div class="metric"><strong>DURABLE</strong><span>recoverable</span></div>
+            <div class="metric"><strong>SQL</strong><span>DataFusion</span></div>
+          </div>
+          <div class="rules">
+            <div class="rule" data-rule="price"><div class="rule-num">01</div><div class="rule-label">Price</div><code><span class="field">payable</span> = subtotal − subtotal × discount%</code></div>
+            <div class="rule" data-rule="filter"><div class="rule-num">02</div><div class="rule-label">Qualify</div><code><span class="kw">WHERE</span> paid <span class="kw">AND</span> payable ≥ <span class="value">$100</span></code></div>
+            <div class="rule" data-rule="priority"><div class="rule-num">03</div><div class="rule-label">Prioritize</div><code>payable ≥ <span class="value">$400</span> → <span class="value">PRIORITY</span></code></div>
+            <div class="rule" data-rule="route"><div class="rule-num">04</div><div class="rule-label">Route · UNION ALL</div><code>cn-east/south → <span class="field">CN-HUB</span> · other → <span class="field">GLOBAL-HUB</span></code></div>
+          </div>
+        </div>
+        <div class="trace-chip" id="traceChip"></div>
+        <div class="recovery" id="recovery">
+          <div class="recovery-card"><div class="recovery-icon" id="recoveryIcon"></div><div class="recovery-title" id="recoveryTitle"></div><div class="recovery-detail" id="recoveryDetail"></div><div class="recovery-rid" id="recoveryRid"><span id="recoveryRidLabel"></span><strong id="recoveryRidValue"></strong><em id="recoveryRidStatus"></em></div></div>
+        </div>
+      </section>
+
+      <section class="panel target-panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">Operations team reads</div><div class="object-name">ops.fulfillment_queue</div></div>
+          <div class="db-chip">SAME DATABASE</div>
+        </div>
+        <div class="target-summary"><div class="summary-number" id="resultCount">0</div><div class="summary-copy">qualified orders<br/>ready for fulfillment</div><div class="same-db">↳ postgres</div></div>
+        <div class="target-head"><span>Order</span><span>Payable</span><span>Hub</span><span>Lane</span><span>Reason</span></div>
+        <div class="rows" id="targetRows"></div>
+      </section>
+    </main>
+
+    <footer class="story">
+      <div><div class="step-kicker" id="stepKicker">Live business event</div><div class="step-count" id="stepCount">STEP -- / --</div></div>
+      <div aria-live="polite"><div class="event-title" id="eventTitle">TRACE REQUIRED</div><div class="event-detail" id="eventDetail">Inject window.TRACE to render this demo.</div></div>
+      <div class="timeline"><div class="timeline-track"><div class="timeline-fill" id="timelineFill"></div></div><div class="elapsed" id="elapsed">--:-- / --:--</div></div>
+    </footer>
+  </div>
+  <div class="flash" id="flash"></div>
+  <div class="trace-error" id="traceError" role="alert"><div class="trace-error-card"><strong>DogPaddle demo trace is missing</strong><code id="traceErrorDetail">Set window.TRACE before this page runs, or call window.setDogPaddleTrace(trace).</code></div></div>
+
+  <script>
+    const DURATION = 31;
+    const SCENE_TIMES = {
+      connected: 0,
+      inserted: 3.4,
+      paid: 7.7,
+      repriced: 12,
+      deleted: 16.2,
+      crashed: 20.2,
+      recovered: 24.5,
+      resumed: 27.7
+    };
+    const SCENE_RULES = {
+      connected: '',
+      inserted: 'filter',
+      paid: 'filter',
+      repriced: 'priority',
+      deleted: 'route',
+      crashed: '',
+      recovered: '',
+      resumed: 'route'
+    };
+    const params = new URLSearchParams(location.search);
+    const requestedTime = params.has('t') ? Number(params.get('t')) : null;
+    const poster = params.get('poster') === '1';
+    const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const sourceRows = document.getElementById('sourceRows');
+    const targetRows = document.getElementById('targetRows');
+    const resultCount = document.getElementById('resultCount');
+    const eventTitle = document.getElementById('eventTitle');
+    const eventDetail = document.getElementById('eventDetail');
+    const stepCount = document.getElementById('stepCount');
+    const timelineFill = document.getElementById('timelineFill');
+    const elapsed = document.getElementById('elapsed');
+    const traceChip = document.getElementById('traceChip');
+    const recovery = document.getElementById('recovery');
+    const recoveryTitle = document.getElementById('recoveryTitle');
+    const recoveryDetail = document.getElementById('recoveryDetail');
+    const recoveryIcon = document.getElementById('recoveryIcon');
+    const recoveryRid = document.getElementById('recoveryRid');
+    const recoveryRidLabel = document.getElementById('recoveryRidLabel');
+    const recoveryRidValue = document.getElementById('recoveryRidValue');
+    const recoveryRidStatus = document.getElementById('recoveryRidStatus');
+    const traceError = document.getElementById('traceError');
+    const traceErrorDetail = document.getElementById('traceErrorDetail');
+    const flash = document.getElementById('flash');
+
+    let scenes = [];
+    let lastScene = -1;
+    let animationFrame = null;
+
+    function escapeHTML(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function safeTone(value) {
+      return ['hot', 'warn', 'remove'].includes(value) ? value : '';
+    }
+
+    function formatMoney(cents) {
+      const amount = Number(cents) / 100;
+      return Number.isInteger(amount) ? `$${amount}` : `$${amount.toFixed(2)}`;
+    }
+
+    function formatClock(seconds) {
+      const whole = Math.max(0, Math.floor(seconds));
+      return `${String(Math.floor(whole / 60)).padStart(2, '0')}:${String(whole % 60).padStart(2, '0')}`;
+    }
+
+    function rowsById(rows) {
+      return new Map(rows.map(row => [String(row.order_id), row]));
+    }
+
+    function rowChanged(before, after) {
+      return JSON.stringify(before) !== JSON.stringify(after);
+    }
+
+    function changedOrder(previous, current) {
+      const pairs = [
+        [previous?.target ?? [], current.target],
+        [previous?.source ?? [], current.source]
+      ];
+      for (const [beforeRows, afterRows] of pairs) {
+        const before = rowsById(beforeRows);
+        const after = rowsById(afterRows);
+        for (const row of afterRows) {
+          const old = before.get(String(row.order_id));
+          if (!old || rowChanged(old, row)) return row.order_id;
+        }
+        for (const row of beforeRows) {
+          if (!after.has(String(row.order_id))) return row.order_id;
+        }
+      }
+      return null;
+    }
+
+    function rowTone(row, previousRows) {
+      const old = rowsById(previousRows).get(String(row.order_id));
+      if (!old) return 'hot';
+      return rowChanged(old, row) ? 'warn' : '';
+    }
+
+    function payableCents(row) {
+      const subtotal = Number(row.quantity) * Number(row.unit_price_cents);
+      return subtotal - Math.trunc(subtotal * Number(row.discount_pct) / 100);
+    }
+
+    function sourceNote(row, scene, previous) {
+      const previousRow = rowsById(previous?.source ?? []).get(String(row.order_id));
+      const reachesTarget = scene.target.some(target => String(target.order_id) === String(row.order_id));
+      if (scene.name === 'resumed' && !previousRow) return ['new after recovery', 'pass'];
+      if (previousRow && previousRow.status !== row.status) return ['now qualifies', 'pass'];
+      if (previousRow && rowChanged(previousRow, row)) return ['repriced', 'pass'];
+      if (reachesTarget) return [String(row.status).toLowerCase() === 'paid' ? 'qualifies' : 'selected', 'pass'];
+      if (String(row.status).toLowerCase() !== 'paid') return ['unpaid · filtered', 'drop'];
+      return [`only ${formatMoney(payableCents(row))} · filtered`, 'drop'];
+    }
+
+    function sourceHTML(scene, previous) {
+      if (!scene.source.length) {
+        return '<div class="empty-state"><div>waiting on PostgreSQL WAL<span>INSERT · UPDATE · DELETE</span></div></div>';
+      }
+      return scene.source.map(row => {
+        const [note, noteTone] = sourceNote(row, scene, previous);
+        return `<div class="source-row ${safeTone(rowTone(row, previous?.source ?? []))}">
+          <span class="order-name">#${escapeHTML(row.order_id)}<small>${escapeHTML(row.customer)}</small></span>
+          <span class="status ${escapeHTML(String(row.status).toLowerCase())}">${escapeHTML(row.status)}</span>
+          <span class="dim">${escapeHTML(row.region)}</span>
+          <span><span class="money">${escapeHTML(row.quantity)}×${escapeHTML(formatMoney(row.unit_price_cents))}</span></span>
+          <span class="dim">${escapeHTML(row.discount_pct)}%</span>
+          <span class="row-note ${noteTone}">${escapeHTML(note)}</span>
+        </div>`;
+      }).join('');
+    }
+
+    function targetHTML(scene, previous) {
+      if (!scene.target.length) {
+        return '<div class="empty-state"><div>no qualified orders yet<span>results appear as source data changes</span></div></div>';
+      }
+      return scene.target.map(row => `<div class="target-row ${safeTone(rowTone(row, previous?.target ?? []))}">
+        <span class="order-name">#${escapeHTML(row.order_id)}<small>${escapeHTML(row.customer)}</small></span>
+        <span class="money">${escapeHTML(formatMoney(row.payable_cents))}</span>
+        <span class="hub">${escapeHTML(row.fulfillment_center)}</span>
+        <span class="lane ${escapeHTML(String(row.handling_lane).toLowerCase())}">${escapeHTML(row.handling_lane)}</span>
+        <span class="reason">${escapeHTML(row.handling_reason ?? '—')}</span>
+      </div>`).join('');
+    }
+
+    function sceneCopy(scene, previous, focus) {
+      const id = focus === null ? 'the order' : `#${focus}`;
+      const oldTarget = rowsById(previous?.target ?? []).get(String(focus));
+      const newTarget = rowsById(scene.target).get(String(focus));
+      const oldSource = rowsById(previous?.source ?? []).get(String(focus));
+      const newSource = rowsById(scene.source).get(String(focus));
+      switch (scene.name) {
+        case 'connected':
+          return ['Waiting for order changes', 'fulfillment.sql is compiled into a durable streaming flow.'];
+        case 'inserted':
+          return [
+            `Backend inserts ${scene.source.length} ordinary order rows`,
+            `${scene.target.length} ${scene.target.length === 1 ? 'order qualifies' : 'orders qualify'}; the rest are filtered by payment status or payable amount.`
+          ];
+        case 'paid':
+          return [
+            `Payment status changes: ${oldSource?.status ?? '—'} → ${newSource?.status ?? '—'}`,
+            `${id} crosses the qualification rule and enters the fulfillment queue.`
+          ];
+        case 'repriced':
+          return [
+            `${id} is repriced: ${formatMoney(oldTarget?.payable_cents)} → ${formatMoney(newTarget?.payable_cents)}`,
+            `Arithmetic is recomputed; CASE changes ${oldTarget?.handling_lane ?? 'the lane'} to ${newTarget?.handling_lane ?? 'the new lane'}.`
+          ];
+        case 'deleted':
+          return [
+            `Source order ${id} is deleted`,
+            'DogPaddle retracts its derived fulfillment row while unrelated target rows keep their rid.'
+          ];
+        case 'crashed':
+          return [
+            'Crash after PostgreSQL committed',
+            `${scene.target.length} committed target ${scene.target.length === 1 ? 'row remains' : 'rows remain'} visible while local completion is interrupted.`
+          ];
+        case 'recovered':
+          return [
+            'Open the same durable state',
+            'Pending work replays idempotently: no duplicate target rows and no lost work.'
+          ];
+        case 'resumed':
+          return [
+            `${id} flows after recovery`,
+            `${newTarget?.fulfillment_center ?? 'The target branch'} receives a ${String(newTarget?.handling_lane ?? 'new').toUpperCase()} order; the same SQL keeps running.`
+          ];
+        default:
+          return [scene.name, ''];
+      }
+    }
+
+    function ridEvidence(scene, previous) {
+      const before = rowsById(previous?.target ?? []);
+      const pairs = scene.target
+        .filter(row => before.has(String(row.order_id)))
+        .map(row => ({ row, old: before.get(String(row.order_id)) }));
+      if (!pairs.length) return null;
+      const stable = pairs.every(({ row, old }) => String(row.rid) === String(old.rid));
+      const first = pairs[0];
+      return {
+        stable,
+        label: `TARGET RID · #${first.row.order_id}`,
+        value: `${first.old.rid} → ${first.row.rid}${pairs.length > 1 ? ` · +${pairs.length - 1}` : ''}`
+      };
+    }
+
+    function renderRecovery(scene, previous) {
+      const visible = scene.name === 'crashed' || scene.name === 'recovered';
+      const resumed = scene.name === 'recovered';
+      recovery.classList.toggle('visible', visible);
+      recovery.classList.toggle('resumed', resumed);
+      if (!visible) {
+        recoveryRid.classList.remove('visible');
+        return;
+      }
+      recoveryIcon.textContent = resumed ? '↻' : '■';
+      recoveryTitle.textContent = resumed ? 'Durable flow reopened' : 'Process stopped after target commit';
+      recoveryDetail.textContent = resumed
+        ? 'same state · pending work replayed\n0 duplicates · 0 lost rows'
+        : 'SIGKILL · local completion still pending\ntarget rows remain committed';
+      const evidence = ridEvidence(scene, previous);
+      recoveryRid.classList.toggle('visible', !!evidence);
+      if (evidence) {
+        recoveryRidLabel.textContent = evidence.label;
+        recoveryRidValue.textContent = evidence.value;
+        recoveryRidStatus.textContent = evidence.stable ? 'STABLE' : 'CHANGED';
+      }
+    }
+
+    function sceneAt(time) {
+      let index = 0;
+      for (let i = 0; i < scenes.length; i += 1) {
+        if (time >= scenes[i].at) index = i;
+      }
+      return index;
+    }
+
+    function render(time) {
+      if (!scenes.length) return;
+      const t = Math.max(0, Math.min(DURATION, Number(time)));
+      const index = sceneAt(t);
+      const scene = scenes[index];
+      const previous = index > 0 ? scenes[index - 1] : null;
+      if (index !== lastScene) {
+        const focus = changedOrder(previous, scene);
+        const [title, detail] = sceneCopy(scene, previous, focus);
+        sourceRows.innerHTML = sourceHTML(scene, previous);
+        targetRows.innerHTML = targetHTML(scene, previous);
+        resultCount.textContent = scene.target.length;
+        eventTitle.textContent = title;
+        eventDetail.textContent = detail;
+        stepCount.textContent = `STEP ${String(index + 1).padStart(2, '0')} / ${String(scenes.length).padStart(2, '0')}`;
+        document.querySelectorAll('.rule').forEach(rule => {
+          rule.classList.toggle('active', rule.dataset.rule === scene.rule);
+        });
+        traceChip.textContent = focus === null ? '' : `#${focus}`;
+        traceChip.style.opacity = focus === null || !scene.rule ? '0' : '1';
+        const tracePosition = { price: 0, filter: 76, priority: 152, route: 228 };
+        traceChip.style.setProperty('--trace-y', `${tracePosition[scene.rule] ?? 0}px`);
+        renderRecovery(scene, previous);
+        if (!reducedMotion) {
+          flash.classList.remove('go');
+          void flash.offsetWidth;
+          flash.classList.add('go');
+        }
+        lastScene = index;
+      }
+      timelineFill.style.width = `${(t / DURATION) * 100}%`;
+      elapsed.textContent = `${formatClock(t)} / ${formatClock(DURATION)}`;
+    }
+
+    function validateTrace(trace) {
+      if (!trace || !Array.isArray(trace.scenes) || trace.scenes.length === 0) {
+        throw new Error('window.TRACE must contain a non-empty scenes array.');
+      }
+      const seen = new Set();
+      return trace.scenes.map(scene => {
+        if (!scene || typeof scene.name !== 'string' || !(scene.name in SCENE_TIMES)) {
+          throw new Error(`Unknown or missing scene name: ${scene?.name ?? 'undefined'}`);
+        }
+        if (seen.has(scene.name)) throw new Error(`Duplicate scene name: ${scene.name}`);
+        if (!Array.isArray(scene.source) || !Array.isArray(scene.target)) {
+          throw new Error(`Scene ${scene.name} must contain source and target arrays.`);
+        }
+        seen.add(scene.name);
+        return { ...scene, at: SCENE_TIMES[scene.name], rule: SCENE_RULES[scene.name] };
+      }).sort((left, right) => left.at - right.at);
+    }
+
+    function showTraceError(message) {
+      document.documentElement.dataset.demoState = 'error';
+      traceErrorDetail.textContent = message;
+      traceError.classList.add('visible');
+    }
+
+    function playTrace(trace) {
+      if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+      try {
+        scenes = validateTrace(trace);
+      } catch (error) {
+        scenes = [];
+        showTraceError(error.message);
+        return;
+      }
+      traceError.classList.remove('visible');
+      lastScene = -1;
+      if (requestedTime !== null && !Number.isFinite(requestedTime)) {
+        showTraceError('The ?t= value must be a finite number of seconds.');
+        return;
+      }
+      if (requestedTime !== null || poster || reducedMotion) {
+        document.documentElement.classList.add('static-frame');
+        render(requestedTime ?? DURATION);
+        document.documentElement.dataset.demoState = 'ready';
+        return;
+      }
+      render(0);
+      document.documentElement.dataset.demoState = 'ready';
+      const started = performance.now();
+      const tick = now => {
+        const time = (now - started) / 1000;
+        render(time);
+        if (time < DURATION) animationFrame = requestAnimationFrame(tick);
+      };
+      animationFrame = requestAnimationFrame(tick);
+    }
+
+    window.renderDogPaddle = render;
+    window.setDogPaddleTrace = trace => {
+      window.TRACE = trace;
+      playTrace(trace);
+    };
+    window.addEventListener('dogpaddle:trace', event => window.setDogPaddleTrace(event.detail));
+
+    if (window.TRACE) {
+      playTrace(window.TRACE);
+    } else {
+      showTraceError('Set window.TRACE before this page runs, or call window.setDogPaddleTrace(trace).');
+    }
+  </script>
+</body>
+</html>

@@ -3,31 +3,42 @@
 `dogpaddle-sql` 用一条 `INSERT INTO ... SELECT ...` 定义一条完整、可恢复的 `DogPaddle`
 `Flow`。`Scan`、转换和 `Sink` 全部在 SQL 文件中声明；它不引入 `Table`、`View`、`Catalog`、独立服务或另一套运行时。
 
-## 同一个 `PostgreSQL` 内的完整 ETL
+## 实时订单履约队列
 
 仓库中的
-[`postgres_etl.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/postgres_etl.sql)
-从 `sales.orders` 捕获 WAL，在四段 `CTE` 中完成类型转换、金额与折扣计算、业务筛选和分类，再通过
-`UNION ALL` 分流，将结果写入同一个 `PostgreSQL` `database` 的 `analytics.order_insights`：
+[`fulfillment.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/fulfillment.sql)
+持续读取业务后端写入 `sales.orders` 的 WAL，并把可履约订单写回同一个 `PostgreSQL` 数据库中的
+`ops.fulfillment_queue`。一条 SQL 完成四段业务转换：
+
+- 将数量统一为 `BIGINT`，计算 `subtotal_cents = quantity × unit_price_cents`。
+- 应用折扣，得到实际应付金额 `payable_cents`。
+- 只保留已付款且应付金额不少于 10000 cents 的订单；达到 40000 cents 时进入 `priority` 通道。
+- 用 `UNION ALL` 将 `cn-east` / `cn-south` 订单分配到 `CN-HUB`，其余地区分配到
+  `GLOBAL-HUB`；高价值全球订单标记 `export_review`。
 
 ```text
-backend ── INSERT / UPDATE / DELETE ──▶ sales.orders
-                                            │ WAL
-                                            ▼
-postgres_cdc ──▶ raw_orders ──▶ priced ──▶ enriched ──▶ qualified
-                                                               │ China / Global
-                                                               │ UNION ALL
-                                                               ▼
-                                                 analytics.order_insights
+business backend ── INSERT / UPDATE / DELETE ──▶ sales.orders
+                                                       │ WAL
+                                                       ▼
+postgres_cdc ──▶ subtotal ──▶ discount ──▶ eligibility ──▶ routing
+                                                            │
+                                              CN-HUB / GLOBAL-HUB
+                                                            │
+                                                            ▼
+                                                ops.fulfillment_queue
 ```
 
-`sales.orders` 和 `analytics.order_insights` 位于同一个 `postgres` 数据库。源表发生 `INSERT`、
-`UPDATE` 或 `DELETE` 时，目标关系持续收敛到转换后的结果。真实录屏还会在目标提交后
-强杀宿主，再通过同一份 SQL 和 state `open`，验证恢复不会复制结果。录屏使用的
-[`postgres_etl_live.rs`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/postgres_etl_live.rs)
-只调用本页所示公共 API；可用
-[`record_postgres_etl_live.sh`](https://github.com/frelion/dogpaddle/blob/main/docs/tools/record_postgres_etl_live.sh)
-在本机真实 `PostgreSQL` 上重新生成。
+订单从 `new` 更新为 `paid` 后会进入队列；数量或折扣变化会实时重算金额和优先级；删除源订单会撤回
+目标结果。真实录屏还会在目标提交后强杀宿主，再通过同一份 SQL 和 state `open`，验证恢复不会复制
+结果或改变稳定 ID。可用
+[`record_fulfillment_demo.sh`](https://github.com/frelion/dogpaddle/blob/main/docs/tools/record_fulfillment_demo.sh)
+在本机真实 `PostgreSQL` 上重新生成：
+
+```sh
+docs/tools/record_fulfillment_demo.sh \
+  --bundle /absolute/path/to/runtime-bundle \
+  --postgres-bin /absolute/path/to/postgresql/bin
+```
 
 当前 `PostgreSQL` 试点从空源表和匹配的新 slot 起点开始，不执行已有数据的初始快照。
 `PostgresSink` 创建并独占无损 Arrow 关系表，不镜像源表 DDL；文本值当前按 bytes 保存，查询时使用
@@ -37,7 +48,7 @@ postgres_cdc ──▶ raw_orders ──▶ priced ──▶ enriched ──▶ 
 
 仓库自带的
 [`quickstart.sql`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/quickstart.sql)
-从持续 `Sequence` 中选择偶数、计算平方并写入
+从持续的 `sequence(...)` Scan 中选择偶数、计算平方并写入
 `SQLite`：
 
 ```sql
@@ -81,10 +92,7 @@ cargo run --locked -q -p dogpaddle-sql --example quickstart -- \
 再次查询会看到新增的 `10`、`12`，已有行不重复。示例的最后两个参数分别是推进轮数和每轮延迟毫秒数。
 `sequence` 是持续 Scan，所以
 [`quickstart.rs`](https://github.com/frelion/dogpaddle/blob/main/crates/sql/examples/quickstart.rs)
-有意只执行有限轮；真实宿主同样通过 `Flow::advance` 控制运行节奏。首页的
-[演示录屏](https://github.com/frelion/dogpaddle/blob/main/docs/assets/sql-quickstart.gif) 由
-[`record_sql_quickstart.sh`](https://github.com/frelion/dogpaddle/blob/main/docs/tools/record_sql_quickstart.sh)
-使用这两个文件生成。
+有意只执行有限轮；真实宿主同样通过 `Flow::advance` 控制运行节奏。
 
 ## 嵌入 Rust
 
