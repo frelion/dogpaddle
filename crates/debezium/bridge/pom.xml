@@ -13,14 +13,22 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
         <debezium.version>3.6.2.Final</debezium.version>
-        <kafka.version>4.3.0</kafka.version>
-        <jackson.version>2.21.2</jackson.version>
+        <jackson-bom.version>2.21.6</jackson-bom.version>
         <junit.version>6.1.3</junit.version>
+        <!-- Must match the SLF4J API selected by the imported Debezium BOM. -->
         <slf4j.version>1.7.36</slf4j.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <!-- Keep this first so the security-patched 2.21 line wins for Jackson entries. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson-bom.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>io.debezium</groupId>
                 <artifactId>debezium-bom</artifactId>
@@ -42,26 +50,22 @@
             <artifactId>debezium-connector-postgres</artifactId>
             <scope>runtime</scope>
         </dependency>
-        <!-- Keep the Kafka Connect SPI used by the bridge explicit and pinned. -->
+        <!-- Keep the Kafka Connect SPI explicit; the Debezium BOM owns its version. -->
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>connect-api</artifactId>
-            <version>${kafka.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>connect-runtime</artifactId>
-            <version>${kafka.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>connect-json</artifactId>
-            <version>${kafka.version}</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>${jackson.version}</version>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>

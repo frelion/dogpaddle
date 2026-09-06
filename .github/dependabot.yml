@@ -40,6 +40,14 @@ updates:
         patterns:
           - "org.apache.maven.plugins:*"
           - "org.junit.jupiter:*"
+    ignore:
+      # Patch this line as a family; review minor and major upgrades with Debezium.
+      - dependency-name: "com.fasterxml.jackson:jackson-bom"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # The binding must match the SLF4J API selected by the Debezium BOM.
+      - dependency-name: "org.slf4j:slf4j-simple"
 
   - package-ecosystem: maven
     directory: /system-tests/debezium-runtime/probe
@@ -50,3 +58,6 @@ updates:
       probe-build-dependencies:
         patterns:
           - "org.apache.maven.plugins:*"
+    ignore:
+      # The probe must compile against the exact Kafka API in the runtime bundle.
+      - dependency-name: "org.apache.kafka:connect-api"
