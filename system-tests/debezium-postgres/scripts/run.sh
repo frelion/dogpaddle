@@ -151,7 +151,7 @@ owns_postgres=1
 podman compose \
   --project-name "$COMPOSE_PROJECT" \
   --file "$gate_dir/compose.yaml" \
-  up --detach --pull never postgres
+  up --detach postgres
 
 for _ in $(seq 1 30); do
   if PGPASSWORD=dogpaddle_d1 psql \
