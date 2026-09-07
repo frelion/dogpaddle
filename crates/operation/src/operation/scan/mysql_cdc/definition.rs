@@ -14,7 +14,7 @@ use crate::{
 
 use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlColumn, schema};
 
-pub(crate) const TAG: u16 = 14;
+pub(crate) const TAG: u16 = 15;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("mysql_cdc_scan.checkpoint");
 static DATA: [DataDeclaration; 1] = [CHECKPOINT.declaration()];

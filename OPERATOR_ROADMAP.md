@@ -1,8 +1,9 @@
 # DogPaddle 算子与执行内核路线图
 
 本文定义 DogPaddle 算子体系和执行内核的演进阶段、语义边界、交付物与退出标准。
-它是实施路线；阶段 0/1 和阶段 3 的 Distinct 纵向切片已完成，后续阶段中的候选算子或用户接口仍不表示
-已经交付。当前精确能力以根目录 [`README.md`](README.md) 和各产品 crate 的 README 为准。
+它是实施路线；阶段 0/1、阶段 3 的 Distinct 和阶段 4 的 grouped Aggregate 最小纵向切片已完成，
+后续候选算子或用户接口仍不表示已经交付。当前精确能力以根目录 [`README.md`](README.md) 和各产品
+crate 的 README 为准。
 
 ## 产品方向
 
@@ -15,8 +16,8 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 - DataFrame 风格 API；
 - 由其他应用或语言编译得到的持久化计划。
 
-这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 已用无状态算子和
-Distinct 证明这条分层路径，其余接口仍是候选。路线首先回答：
+这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 已用无状态算子、
+Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候选。路线首先回答：
 
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
@@ -42,8 +43,10 @@ Distinct 证明这条分层路径，其余接口仍是候选。路线首先回�
 | --- | --- | --- | --- |
 | Scan | SequenceScan | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
 | Scan | PostgresCdcScan | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
+| Scan | MySqlCdcScan | 固定 Schema 单表 binlog CDC，以预发布 tail origin 持续读取，checkpoint/output 同事务与 commit 后 ACK | 已有仅 tail 的具体试点；完整初始快照、TLS/fencing 与发布门仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
+| Transform | Aggregate | 按非空 group key 持续维护多个聚合结果 | 已完成阶段 4 最小纵向切片 |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
 | Transform | Extend | 保留输入并追加一个表达式列 | 保留为基础无状态算子 |
@@ -54,15 +57,16 @@ Distinct 证明这条分层路径，其余接口仍是候选。路线首先回�
 | Sink | PostgresSink | 将单输入 exact relation 幂等物化到独占的固定 Schema PostgreSQL 表 | 已有远端试点；TLS、在线演进与发布门仍待实施 |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十三个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十五个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
 当前 `dogpaddle-sql` 接受一条直接的 `INSERT INTO sqlite/postgres/discard(...) Query`，Scan 直接写成
-`FROM sequence/postgres_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，把 TableScan、
-Projection、Filter、非递归 CTE、`SELECT DISTINCT` 与 `UNION ALL` lowering 为现有 Definition DAG。SQL 不建立 DogPaddle
-Table、View、catalog、独立状态或执行层；Join、Aggregate、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window 尚无对应
-底层算子，必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
+`FROM sequence/postgres_cdc/mysql_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，把 TableScan、
+Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL` 与非空 `GROUP BY` lowering 为现有 Definition DAG。
+SQL 聚合支持 `COUNT/SUM/AVG/MIN/MAX` 和纯分组；SQL 不建立 DogPaddle Table、View、catalog、独立状态或执行层。
+Join、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
+必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
 这份磁盘 Definition 为恢复真相，SQL 变更要求新路径或显式重建。
 
 ## 目标分层
@@ -196,7 +200,7 @@ Station state。
 ### 上层 API 不成为持久化真相
 
 Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解释、重新编译和诊断；SQL v1 直接以
-`FROM postgres_cdc(...)` 声明 Scan，并以 `INSERT INTO postgres/sqlite(...)` 声明 Sink。运行时恢复仍
+`FROM postgres_cdc/mysql_cdc(...)` 声明 Scan，并以 `INSERT INTO postgres/sqlite(...)` 声明 Sink。运行时恢复仍
 基于 canonical Flow/Operation Definition。若接口版本或 lowering 规则变化导致语义不兼容，明确要求
 重建，不让运行层猜测。
 
@@ -206,9 +210,9 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 | --- | --- | --- | --- |
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
-| 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
+| 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、MySqlCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
 | 3（已完成最小切片） | 建立精确行权重状态 | crate 私有 row digest、collision bucket、Distinct | 首个持久状态关系算子 |
-| 4 | 完成 Aggregate 与多重集算子 | Count/Sum/Min/Max、Group、集合运算 | 可持续维护聚合关系 |
+| 4（已完成最小切片） | 完成 Aggregate 与多重集算子 | grouped COUNT/SUM/AVG/MIN/MAX；global/set ops/UDF 待续 | 可持续维护首个分组聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
 | 6 | 引入有界、顺序与时间语义 | Barrier、TopK、Window、watermark | 明确承载完成、排序和时间计算 |
 | 7 | 完成运行产品化与上层 API 就绪 | lifecycle、连接器协议、observability、capability catalog | 多种用户 API 可稳定构建同一内核 |
@@ -553,76 +557,73 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 - collision bucket 使用完整 row 做最终比较，不把 hash 当记录身份；
 - codec、边界变化、负前缀/overflow、背压与 reopen 有对应 owner 证据；
 - SQL 只新增 `SELECT DISTINCT` lowering；普通 `UNION` 仍未支持；
-- Aggregate 与 Join 的专用状态等实现对应算子时再设计。
+- Aggregate 已在阶段 4 建立自己的 group/admission/index state；Join 的专用状态仍按其语义另行设计。
 
 ## 阶段 4：Aggregate 与多重集算子
 
+**状态：grouped Aggregate 最小纵向切片已完成；global aggregate、多重集集合运算、聚合修饰符与 UDF
+仍未完成。**
+
 ### 目标
 
-实现真正按输入 diff 维护关系结果的 Aggregate。当前 RunningEventCount 不参与这一算子族。
+实现真正按输入 diff 维护关系结果的 Aggregate。RunningEventCount 不参与这一算子族。
 
-### 实现顺序
+### 已交付范围
 
-1. 无分组 `CountAggregate`；
-2. 按 key 分组的 Count；
-3. Sum；
-4. Min/Max；
-5. Average，由 Sum/Count 状态或独立 accumulator 明确定义；
-6. 多个 aggregate expression 共享同一 group state；
-7. 必要的多重集集合算子，如 UnionDistinct、Intersect、Except。
+- tag `14` 的单输入 Aggregate 要求非空 group expression，允许零个或多个 call；所有 group 和 call
+  在一个 Operation 中按声明顺序绑定、更新并共同构造一行输出。
+- 内建函数为 `COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX`。COUNT 输出 non-null `Int64`；
+  SUM 只接受 `Int64/UInt64` 并保持类型；AVG 对 `Int64/UInt64` 用 `i128/u128` 精确累计并输出 nullable
+  `Float64`；MIN/MAX 接受 non-float flat scalar 并输出 nullable 同类型。
+- group key 拒绝 Float32/Float64；global aggregate、grouping sets、aggregate
+  `DISTINCT/FILTER/ORDER BY/null treatment`、UDF 及上述范围外类型在创建 Flow 前拒绝。
 
 ### 状态模型
 
-一个 Aggregate Operation 应在同一 Station 中共同更新一个 group 的多个 accumulator：
+Aggregate 只声明三个资源：
 
 ```text
-GroupKey → {
-    input_weight,
-    count_state,
-    sum_state,
-    min/max multiset state,
-    ...
-}
+aggregate.groups   GroupDigest → full group + group ID + weight + call states
+aggregate.entries  (layout, group ID, tuple digest) → full tuple + weight
+aggregate.control  next group ID
 ```
 
-不要默认每个 aggregate 函数成为独立 Station，因为它们需要观察完全相同的输入序列并共同构造一行
-输出。
+`entries` 的 layout `0` 保存每个完整 canonical input row，是撤回前的 exact admission；其余 layout
+保存 Indexed reduction 的 canonical argument tuple。相同持久表达式 tuple 共享一个 layout，不按函数复制
+multiset。digest 只定位 collision bucket，完整 bytes 才定义 identity。
+
+私有静态 descriptor 唯一声明 function tag、arity、binding 与 reduction 形态：`Fold` 只操作每组有界小
+state，`Indexed` 只操作 argument tuple 和自己的小候选 state，二者都不接收 Store。COUNT/SUM/AVG 是 Fold；
+MIN/MAX 是 Indexed。当前极值撤回时，runtime 只扫描该 layout + group，按一次一个 digest collision bucket
+分页并只保留当前候选，不把整组 materialize 到内存。
 
 ### 输出变化
 
-当 group 结果从 `old_row` 变为 `new_row` 时，变化流至少需要表达：
+每个输入事件按行序处理。当 group 结果从 `old_row` 变为 `new_row` 时输出：
 
 ```text
 old_row, diff=-1
 new_row, diff=+1
 ```
 
-group 消失时撤回旧行；首次出现时插入新行。空输入、null、非单位 diff、overflow 和 accumulator
-类型都必须独立定义。
+group 消失时只撤回旧行，首次出现时只插入新行，结果未变不输出。null 和非单位 diff 由各 descriptor
+按同一 exact admission 解释；负 row 前缀或 arithmetic overflow 回滚整个 turn。
 
-同一 Change 内一个 group 可能更新多次。实现前必须固定展平 output 规则，不能简单按物理 batch
-只输出一个最终结果，否则稳定拆批或合批会改变业务事件序列。若希望引入 consolidation，需要使用
-阶段 3 的显式作用域或未来 barrier，而不是依赖 Change 边界。
+同一 Change 内一个 group 更新多次时逐事件发出上述变化，不按物理 batch 合并。group/call/index 状态、
+output 与 input completion 在同一事务提交；错误、背压和 reopen 保持同一完整输入。
 
 ### Min/Max 的特殊状态
 
-Min/Max 不能只保存一个标量；当前最值被撤回后需要找到下一项。必须维护带权重的有序 multiset，
-并验证：
+MIN/MAX 为每个 argument tuple 维护正权重；当前值撤回到零才触发上述分页重扫。null 不进入候选，
+zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema index。
 
-- 相同值重复插入和逐次撤回；
-- null 规则；
-- Float NaN 和排序规则；
-- zero-weight cleanup；
-- 大 group 的状态布局和 scan 成本。
+### 最小切片证据与剩余工作
 
-### 退出标准
-
-- Aggregate 对正负和非单位 diff 产生正确关系变化；
-- 分组和无分组的空关系/null 语义明确；
-- 同一输入事件序列的稳定重批得到契约一致的展平输出和最终状态；
-- replay、backpressure、overflow、corruption 和 reopen 均无部分状态；
-- 独立 multiset/aggregate oracle 不复用生产实现；
-- 大 group cardinality 和高更新频率拥有对应 benchmark。
+- owner correctness 已覆盖 tag/payload、三资源、bind/materialize、COUNT/SUM/AVG/MIN/MAX 的有序变化、
+  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后重扫；SQL 有跨 drop/open 的最终关系 witness、
+  纯分组 witness 及拒绝路径无目录副作用证据。
+- 尚需 global aggregate 的空关系语义、UnionDistinct/Intersect/Except、aggregate DISTINCT/FILTER/ORDER、
+  UDF 接入、更多类型，以及大 group cardinality/高更新频率 benchmark；这些不由当前最小切片暗示支持。
 
 ## 阶段 5：Join 算子族
 
@@ -910,13 +911,14 @@ PostgresCdcScan
 ```text
 exact-row weights（已完成）
 → Distinct（已完成）
-→ Count/Sum Aggregate
-→ Group Aggregate
+→ Group Aggregate：COUNT/SUM/AVG/MIN/MAX（最小切片已完成）
+→ Global Aggregate / multiset set ops / aggregate UDF
 → Inner Join
 ```
 
-已用 Distinct 证明 exact row、collision bucket、weight 和负前缀。Aggregate 与 Join 各自的
-按 key 访问、fan-out 和 continuation 等到对应算子时再设计。
+Distinct 提供共享的 canonical row、collision bucket 和 checked weight 原语；Aggregate 在其上新增私有
+group ID、exact admission、Fold/Indexed descriptor 和 argument-tuple layout。Join 的 keyed arrangement、fan-out
+和 continuation 仍按 Join 语义另行设计。
 
 ## 开放决策
 
@@ -928,14 +930,13 @@ exact-row weights（已完成）
 - Materialize 如何稳定编码完整 Record key、weight 和分页 continuation？
 - Join 的 keyed arrangement、fan-out 和有界 continuation 应该如何持久化？
 - Consolidate 的显式作用域是一个 Change、barrier 区间还是完整关系？
-- Aggregate 在同一事件序列中如何输出旧值撤回和新值插入，才能保持重批契约？
 - Date/Timestamp/Decimal 上哪些额外 DataFusion operator/type 组合值得补齐证据并加入已承诺集合？
 - 时间和随机表达式来自输入、持久执行上下文还是 control signal？
 - end-of-input/barrier 如何进入统一 Operation input protocol？
 - bounded Sort、持续 TopK 和 Window 各自的完成及 retention 边界是什么？
 - 多个 Flow 是否共享输入日志或 arrangement；若共享，由哪个组合根拥有 retention？
 - 何时引入 partition/exchange，而不破坏唯一 writer 和确定性提交？
-- SQL 在 Join、Aggregate、Window 等底层算子完成后扩展到哪些语法，以及何时需要只读
+- SQL 在 Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
   capability/introspection？
 
 ## 内核稳定准入定义

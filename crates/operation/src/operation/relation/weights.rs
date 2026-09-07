@@ -32,7 +32,7 @@ pub(crate) fn apply_weight(
     Ok(output_difference)
 }
 
-pub(super) fn update_bucket(
+pub(crate) fn update_bucket(
     bucket: &mut Option<CollisionBucket>,
     row: Vec<u8>,
     difference: i64,

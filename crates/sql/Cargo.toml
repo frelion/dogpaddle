@@ -15,6 +15,7 @@ bench = false
 arrow-schema.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
+datafusion-functions-aggregate.workspace = true
 datafusion-optimizer.workspace = true
 datafusion-sql.workspace = true
 dogpaddle-flow.workspace = true

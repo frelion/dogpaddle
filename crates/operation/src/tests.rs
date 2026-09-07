@@ -23,9 +23,9 @@ use crate::{
             SqliteSinkDefinition,
         },
         transform::{
-            DistinctDefinition, ExtendDefinition, FilterDefinition, ProjectDefinition,
-            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition,
+            AggregateCall, AggregateDefinition, DistinctDefinition, ExtendDefinition,
+            FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -83,7 +83,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 14] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
     [
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
@@ -149,6 +149,16 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 14] {
         (13, Box::new(DistinctDefinition::new())),
         (
             14,
+            Box::new(
+                AggregateDefinition::try_new(
+                    [("value", col("value"))],
+                    [("count", AggregateCall::count_all())],
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            15,
             Box::new(
                 MySqlCdcScanDefinition::from_bootstrap(
                     MySqlCdcScanSpec {

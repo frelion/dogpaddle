@@ -4,8 +4,10 @@ use arrow_schema::SchemaRef;
 use datafusion_common::{Column, DFSchema, DataFusionError, TableReference, config::ConfigOptions};
 use datafusion_expr::{
     AggregateUDF, Distinct as LogicalDistinct, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF,
-    TableSource, WindowUDF, expr_rewriter::unnormalize_col,
+    TableSource, WindowUDF, expr::AggregateFunction, expr_rewriter::unnormalize_col,
+    logical_plan::Aggregate, planner::ExprPlanner,
 };
+use datafusion_functions_aggregate::planner::AggregateFunctionPlanner;
 use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
@@ -13,13 +15,14 @@ use dogpaddle_flow::{FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
-        DistinctDefinition, FilterDefinition, SchemaAlignDefinition, SchemaAlignField,
-        UnionAllDefinition,
+        AggregateCall, AggregateDefinition, DistinctDefinition, FilterDefinition,
+        SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
     },
 };
 
 use crate::{
     SqlError,
+    aggregate::{lower as lower_builtin_aggregate, planning_builtins},
     endpoint::{BuiltScan, BuiltSink},
 };
 
@@ -48,6 +51,8 @@ impl TableSource for ScanSource {
 struct PlanningContext {
     options: ConfigOptions,
     sources: HashMap<String, Arc<ScanSource>>,
+    aggregates: HashMap<&'static str, Arc<AggregateUDF>>,
+    expression_planners: Vec<Arc<dyn ExprPlanner>>,
 }
 
 impl PlanningContext {
@@ -67,11 +72,21 @@ impl PlanningContext {
                 ))
             })
             .collect::<Result<_, SqlError>>()?;
-        Ok(Self { options, sources })
+        let aggregates = planning_builtins();
+        Ok(Self {
+            options,
+            sources,
+            aggregates,
+            expression_planners: vec![Arc::new(AggregateFunctionPlanner)],
+        })
     }
 }
 
 impl ContextProvider for PlanningContext {
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        &self.expression_planners
+    }
+
     fn get_table_source(
         &self,
         name: TableReference,
@@ -92,8 +107,8 @@ impl ContextProvider for PlanningContext {
         None
     }
 
-    fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
-        None
+    fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
+        self.aggregates.get(name).map(Arc::clone)
     }
 
     fn get_window_meta(&self, _name: &str) -> Option<Arc<WindowUDF>> {
@@ -117,7 +132,7 @@ impl ContextProvider for PlanningContext {
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        Vec::new()
+        self.aggregates.keys().map(ToString::to_string).collect()
     }
 
     fn udwf_names(&self) -> Vec<String> {
@@ -202,6 +217,7 @@ impl Lowerer<'_> {
                 let input = self.lower(input)?;
                 Ok(self.add_transform(input, DistinctDefinition::new()))
             }
+            LogicalPlan::Aggregate(aggregate) => self.lower_aggregate(aggregate),
             LogicalPlan::Union(union) => {
                 let inputs = union
                     .inputs
@@ -226,6 +242,39 @@ impl Lowerer<'_> {
                 plan.display()
             ))),
         }
+    }
+
+    fn lower_aggregate(&mut self, aggregate: &Aggregate) -> Result<StationRef, SqlError> {
+        if aggregate.group_expr.is_empty() {
+            return Err(SqlError::Unsupported("global aggregate".to_owned()));
+        }
+        if aggregate
+            .group_expr
+            .iter()
+            .any(|expression| matches!(expression, Expr::GroupingSet(_)))
+        {
+            return Err(SqlError::Unsupported("grouping set".to_owned()));
+        }
+
+        let input = self.lower(&aggregate.input)?;
+        let group_count = aggregate.group_expr.len();
+        let groups = aggregate
+            .group_expr
+            .iter()
+            .zip(&aggregate.schema.fields()[..group_count])
+            .map(|(expression, field)| {
+                (field.name().to_owned(), unnormalize_col(expression.clone()))
+            });
+        let calls = aggregate
+            .aggr_expr
+            .iter()
+            .zip(&aggregate.schema.fields()[group_count..])
+            .map(|(expression, field)| {
+                Ok((field.name().to_owned(), lower_aggregate_call(expression)?))
+            })
+            .collect::<Result<Vec<_>, SqlError>>()?;
+        let definition = AggregateDefinition::try_new(groups, calls).map_err(SqlError::endpoint)?;
+        Ok(self.add_transform(input, definition))
     }
 
     fn lower_scan(
@@ -319,6 +368,25 @@ impl Lowerer<'_> {
         self.factory.output_capacity_bytes(station, OUTPUT_CAPACITY);
         station
     }
+}
+
+fn lower_aggregate_call(expression: &Expr) -> Result<AggregateCall, SqlError> {
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = expression.clone().unalias()
+    else {
+        return Err(SqlError::invalid(
+            "DataFusion aggregate node contains a non-aggregate expression",
+        ));
+    };
+    if params.distinct
+        || params.filter.is_some()
+        || !params.order_by.is_empty()
+        || params.null_treatment.is_some()
+    {
+        return Err(SqlError::Unsupported("aggregate modifier".to_owned()));
+    }
+    let arguments = params.args.into_iter().map(unnormalize_col).collect();
+    lower_builtin_aggregate(func.name(), arguments)
+        .ok_or_else(|| SqlError::Unsupported(format!("aggregate function {}", func.name())))
 }
 
 pub(crate) fn add_sink(

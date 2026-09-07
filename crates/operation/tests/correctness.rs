@@ -1,3 +1,5 @@
+#[path = "correctness/aggregate.rs"]
+mod aggregate;
 #[path = "correctness/definition_codec.rs"]
 mod definition_codec;
 #[path = "correctness/discard.rs"]

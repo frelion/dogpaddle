@@ -27,7 +27,7 @@ fn config() -> MySqlCdcScanConfig {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01\0\x0e".to_vec();
+    let mut expected = b"dogpaddle.operation\0\0\x01\0\x0f".to_vec();
     expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_checkpoint":"RFBEQkNQMDEAAQAAAAZvcmRlcnMAAAAqaW8uZGViZXppdW0uY29ubmVjdG9yLm15c3FsLk15U3FsQ29ubmVjdG9yAAAAAQAAAAVteXNxbAAAAAMAAQK8UTFt"}"#);
     expected
 }
@@ -47,13 +47,13 @@ fn checkpoint() -> Vec<u8> {
 fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     let definition = definition();
     assert_eq!(definition.kind(), OperationKind::Scan);
-    assert_eq!(definition.persistence_tag(), 14);
+    assert_eq!(definition.persistence_tag(), 15);
     let bytes = encode_definition(definition.as_ref());
     let expected = literal_definition_bytes();
     assert_eq!(bytes, expected);
     let decoded = decode_definition(&bytes).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Scan);
-    assert_eq!(decoded.persistence_tag(), 14);
+    assert_eq!(decoded.persistence_tag(), 15);
     assert_eq!(encode_definition(decoded.as_ref()), bytes);
     assert_eq!(
         decoded
