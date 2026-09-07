@@ -1,6 +1,8 @@
 use std::{collections::HashSet, num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use base64::{Engine as _, prelude::BASE64_STANDARD};
+use dogpaddle_debezium::Checkpoint;
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
@@ -12,6 +14,7 @@ use crate::{
     lit,
     operation::{
         scan::{
+            MySqlCdcScanDefinition, MySqlCdcScanSpec, MySqlColumn, MySqlType,
             PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn, PostgresType,
             SequenceScanDefinition,
         },
@@ -80,7 +83,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 13] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 14] {
     [
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
@@ -144,7 +147,35 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 13] {
             ),
         ),
         (13, Box::new(DistinctDefinition::new())),
+        (
+            14,
+            Box::new(
+                MySqlCdcScanDefinition::from_bootstrap(
+                    MySqlCdcScanSpec {
+                        engine_name: "events".into(),
+                        database: "shop".into(),
+                        table: "events".into(),
+                        server_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
+                        table_id: 1,
+                        columns: vec![MySqlColumn::new("id", MySqlType::Int64, false)],
+                    },
+                    mysql_bootstrap_checkpoint("events"),
+                )
+                .unwrap(),
+            ),
+        ),
     ]
+}
+
+fn mysql_bootstrap_checkpoint(engine_name: &str) -> Checkpoint {
+    let bytes = BASE64_STANDARD
+        .decode(
+            "RFBEQkNQMDEAAQAAAAZldmVudHMAAAAqaW8uZGViZXppdW0uY29ubmVjdG9yLm15c3FsLk15U3FsQ29ubmVjdG9yAAAAAQAAAAEAAAAAAQCJwBWB",
+        )
+        .unwrap();
+    let checkpoint = Checkpoint::from_bytes(bytes).unwrap();
+    assert!(checkpoint.matches(engine_name, "io.debezium.connector.mysql.MySqlConnector"));
+    checkpoint
 }
 
 fn valid_schema() -> SchemaRef {

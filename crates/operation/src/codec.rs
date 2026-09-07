@@ -11,6 +11,7 @@ const FORMAT_VERSION: u16 = 1;
 pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
 
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
+    (scan::mysql_cdc::TAG, scan::mysql_cdc::decode_definition),
     (
         scan::postgres_cdc::TAG,
         scan::postgres_cdc::decode_definition,

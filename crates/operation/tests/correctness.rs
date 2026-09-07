@@ -12,6 +12,8 @@ mod extend;
 mod filter;
 #[path = "correctness/metamorphic.rs"]
 mod metamorphic;
+#[path = "correctness/mysql_cdc_scan.rs"]
+mod mysql_cdc_scan;
 #[path = "correctness/postgres_cdc_scan.rs"]
 mod postgres_cdc_scan;
 #[path = "correctness/postgres_sink.rs"]

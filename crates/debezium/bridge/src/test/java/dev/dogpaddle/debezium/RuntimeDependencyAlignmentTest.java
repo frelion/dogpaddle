@@ -25,4 +25,11 @@ class RuntimeDependencyAlignmentTest {
                 "org.slf4j.impl.SimpleLoggerFactory",
                 LoggerFactory.getILoggerFactory().getClass().getName());
     }
+
+    @Test
+    void mysql_connector_class_is_available() throws Exception {
+        assertEquals(
+                "io.debezium.connector.mysql.MySqlConnector",
+                Class.forName("io.debezium.connector.mysql.MySqlConnector").getName());
+    }
 }

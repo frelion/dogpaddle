@@ -44,10 +44,15 @@
             <groupId>io.debezium</groupId>
             <artifactId>debezium-embedded</artifactId>
         </dependency>
-        <!-- PostgreSQL is the first packaged pilot; bridge code stays neutral. -->
+        <!-- Product connectors are packaged together; bridge code stays neutral. -->
         <dependency>
             <groupId>io.debezium</groupId>
             <artifactId>debezium-connector-postgres</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-mysql</artifactId>
             <scope>runtime</scope>
         </dependency>
         <!-- Keep the Kafka Connect SPI explicit; the Debezium BOM owns its version. -->

@@ -25,6 +25,7 @@ datafusion-proto.workspace = true
 dogpaddle-change.workspace = true
 dogpaddle-debezium.workspace = true
 dogpaddle-store.workspace = true
+mysql.workspace = true
 postgres.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

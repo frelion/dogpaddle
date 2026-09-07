@@ -118,9 +118,8 @@ impl SqlProgram {
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
         let mut factory = FlowFactory::new(path);
         for (index, scan) in self.scans.iter().enumerate() {
-            if let Some(config) = scan.open_runtime_config()? {
-                factory.resource(scan_station_id(index), config)?;
-            }
+            let station_id = scan_station_id(index);
+            scan.install_open_runtime_resource(&mut factory, &station_id)?;
         }
         if let Some(config) = self.sink.open_runtime_config()? {
             factory.resource("sql/sink", config)?;

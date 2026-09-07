@@ -67,6 +67,7 @@ test -f "$distribution_dir/lib/connect-api-4.3.0.jar"
 test -f "$distribution_dir/lib/connect-json-4.3.0.jar"
 test -f "$distribution_dir/lib/connect-runtime-4.3.0.jar"
 test -f "$distribution_dir/lib/debezium-embedded-3.6.2.Final.jar"
+test -f "$distribution_dir/lib/debezium-connector-mysql-3.6.2.Final.jar"
 test -f "$distribution_dir/lib/debezium-connector-postgres-3.6.2.Final.jar"
 test -f "$distribution_dir/lib/slf4j-simple-1.7.36.jar"
 if find "$distribution_dir" -name '*lifecycle-probe*' -print | grep . >/dev/null; then
@@ -74,4 +75,4 @@ if find "$distribution_dir" -name '*lifecycle-probe*' -print | grep . >/dev/null
   exit 1
 fi
 
-echo "PASS Java bridge tests and pinned PostgreSQL distribution: $distribution_dir"
+echo "PASS Java bridge tests and pinned PostgreSQL/MySQL distribution: $distribution_dir"

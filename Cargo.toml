@@ -47,6 +47,7 @@ dogpaddle-store = { path = "crates/store" }
 flatbuffers = { version = "=25.12.19", default-features = false }
 libmdbx = { version = "=0.6.6", default-features = false }
 jni = { version = "=0.22.4", features = ["invocation"] }
+mysql = { version = "=28.0.2", default-features = false, features = ["minimal-rust"] }
 postgres = "=0.19.14"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
 serde = { version = "=1.0.229", features = ["derive"] }

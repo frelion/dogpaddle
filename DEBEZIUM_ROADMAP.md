@@ -19,7 +19,16 @@ Temurin JRE、不回退系统 Java 的四平台 payload。D3–D7 仍保持开�
 `PostgresCdcScan`，不再单独公开通用 IngressScan。已有固定 Schema、只读 discovery、运行资源装配、
 checkpoint 与 Station output 同事务提交、commit 后 ACK 的实现；不再保存 Scan pending。
 真实本机验收使用 `system-tests/postgres/check_cdc.py`。
-这不等于关闭 D3/D4 的全部阶段验收，也不改变 D5 发布、D6 snapshot 和 D7 第二 connector 的开放状态。
+这不等于关闭 D3/D4 的全部阶段验收，也不改变 D5 发布和 D6 snapshot 的开放状态。
+
+2026-09-07 实现补充：D7 已增加一个具体 `MySqlCdcScan`，没有改动 Flow、Station、Store 或 D2 的
+connector-neutral API。SQL build 在发布 Flow 前执行一次 `no_data` schema bootstrap，取得 Debezium 的
+native opaque seed checkpoint；该 seed 随 canonical Definition 原子发布。首次真实 runtime 与 reopen 都以
+`recovery` + `MemorySchemaHistory` 从 seed 或更新后的 checkpoint 重建固定 schema。成功 build 发布的是 bootstrap
+内部选择的 immutable binlog origin `P`。它消除 `P` 到首次 runtime ACK 的窗口，严格晚于 `P`、早于发布的
+DML 依赖 binlog 保留后重放；它不是调用 build 时刻的原子 source-write fence，`P` 之前的状态或 DML 仍不在
+CDC-only 合同内。没有初始表数据 snapshot，运行中 DDL 会拒绝且不 ACK。当前完成的是具体 Operation、bundle 与离线 correctness
+证据；真实 MySQL host/recovery gate 仍是 D7 的阶段验收，不提前宣称可发布。
 
 ## 目标与成功定义
 
@@ -119,7 +128,7 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
 | D4 | [#7](https://github.com/frelion/dogpaddle/issues/7) | 试点已实现，阶段验收开放 | PostgreSQL 行如何变成 Change | 固定 Schema 单表 WAL 试点正确表达 insert/update/delete |
 | D5 | [#8](https://github.com/frelion/dogpaddle/issues/8) | 待实施 | 是否能发布 | crash、fencing、背压、升级、安全和长稳证据齐备 |
 | D6 | [#9](https://github.com/frelion/dogpaddle/issues/9) | 待实施 | 初始全量如何接入 | snapshot/generation 以独立可恢复阶段与 WAL 无缝交接 |
-| D7 | [#10](https://github.com/frelion/dogpaddle/issues/10) | 待实施 | 架构是否真的通用 | 第二个 connector 重用同一套边界，再提取被证明的共性 |
+| D7 | [#10](https://github.com/frelion/dogpaddle/issues/10) | 试点已实现，阶段验收开放 | 架构是否真的通用 | MySQL 已重用同一套边界；真实 host/recovery 证据后才考虑被证明的共性 |
 
 D2 依赖 D1 已证明的控制边界；D3 只围绕 D2 已稳定的 public API 建持久交接。D4 依赖
 D2 与 D3，D5 依赖 D4。D6 故意晚于持续 CDC 的发布加固；D7 不允许因为“未来也许复用”
@@ -215,7 +224,7 @@ bridge 在 Engine callback 中只保留一个 delivery；Rust 主动 poll，显�
 
 D2 已将 D1 的控制原型重做成独立 `dogpaddle-debezium` 产品 crate。它的 Rust API 与 Java
 bridge 只依赖通用 Engine/Kafka Connect 契约，不依赖 Change、Store、Operation、Flow，也没有
-PostgreSQL 代码分支；D2 的参考发行包包含 PostgreSQL connector，作为第一个真实试点。
+PostgreSQL 代码分支；D2 的参考发行包包含 PostgreSQL 与 MySQL connector，bridge 仍不区分两者。
 它不创建通用 `ScanDriver` trait，也不定义行到 Arrow 的映射或 snapshot。
 
 D2 冻结的公开调用面为：
@@ -281,9 +290,10 @@ status JSON。
 双解码。旧 development bundle 与 fixture 直接删除重建。
 
 Checkpoint 是“完整 connector offset-store image”，不是 delivery identity。一个 connector 可能
-合法地让多个事件共享 position，durable ingress 不得拿 checkpoint 冒充事件 ID。MySQL 等
-connector 还需要 schema history；D2 不把 offset checkpoint 夸成所有 connector 的完整状态，
-第二 connector 接入时必须单独解决和证明附加 durable state。
+合法地让多个事件共享 position，durable ingress 不得拿 checkpoint 冒充事件 ID。D2 不把 offset
+checkpoint 夸成所有 connector 的完整状态：具体 `MySqlCdcScan` 在自己的固定-schema/no-DDL 合同下，以
+每次启动重建的 `MemorySchemaHistory` 配合同一个 checkpoint，而不是把 schema history 塞进 checkpoint。
+任何后续 connector 仍必须单独解决并证明其附加状态。
 
 ### 验收
 
@@ -560,31 +570,31 @@ Streaming。
 
 ### 边界
 
-D7 用第二个真实 Debezium connector 检验架构，而不是预先设计一个“支持所有 Scan”的
-抽象。具体 connector 在 D5 后根据用户价值与 fixture 成本选择；MySQL 是自然候选，
-但 D0 不冻结它。
+D7 现在用具体的 MySQL Debezium connector 检验架构，而不是预先设计一个“支持所有 Scan”的
+抽象。它保留自己的 schema/bootstrap/recovery 规则，不把 PostgreSQL 与 MySQL 压成共同的 Scan
+配置或运行状态；D5 发布门和真实 MySQL fixture 成本仍独立评估。
 
 ### 交付
 
-- 第二 connector 的固定 Schema streaming pilot 和端到端 fixture；
+- MySQL 的固定 Schema streaming pilot 已实现；端到端 fixture 仍待补齐；
 - 对 D1/D2 bridge/runtime、D3 ingress、connector lifecycle、opaque offset 与错误模型的原样复用证据；
-- PostgreSQL 与第二 connector 的 capability matrix，不用最小公分母隐藏差异；
-- 只对两个实现语义完全相同的小组件做重构；
+- PostgreSQL 与 MySQL 的 capability matrix，不用最小公分母隐藏差异；
+- 只对两个实现语义完全相同的小组件做重构；当前不因有两个 Scan 就抽取组件；
 - 如必须改变 ADR-0001，增加新 ADR 而不修改历史事实。
 
 ### 验收
 
-- Flow、Station 和 Store 不出现 PostgreSQL/MySQL connector 枚举、类型分支或特殊事务路径；
+- Flow、Station 和 Store 不出现 PostgreSQL/MySQL connector 枚举、类型分支或特殊事务路径（已由具体装配路径满足）；
 - 单 JVM 同时运行两种 connector engine，其 handle、queue、offset、failure 和 stop 互相隔离；
-- 第二 connector 经过同一 `poll → checkpoint/output commit → ACK` 故障矩阵；
-- connector-specific Schema/type/snapshot/fencing 规则保留在各自模块中；
-- 新抽取的公共组件由 PostgreSQL 和第二 connector 的公共测试共同所有。
+- MySQL 经过真实 `poll → checkpoint/output commit → ACK` 故障矩阵；
+- connector-specific Schema/type/snapshot/fencing 规则保留在各自模块中（已由各自 Scan 模块满足）；
+- 若抽取公共组件，它必须由 PostgreSQL 和 MySQL 的公共测试共同所有。
 
 ### 退出条件
 
-第二 connector 在不更改 Flow/Station 核心契约、不 fork Debezium、不增加 sidecar 的前提下
-达到与 PostgreSQL streaming pilot 同级的 correctness/reopen 证据。到此才能宣称 Debezium
-路径是多 Scan 架构，而不是“恰好能跑 PostgreSQL”。
+MySQL 在不更改 Flow/Station 核心契约、不 fork Debezium、不增加 sidecar 的前提下，经过真实 host 的
+预发布 seed、origin 到 Flow 发布之间的写入重放、runtime recovery、未 ACK 重放和崩溃恢复证据后，才达到
+PostgreSQL streaming pilot 同级。到此才能宣称 Debezium 路径是多 Scan 架构，而不是“恰好能跑 PostgreSQL”。
 
 ### 主要风险
 

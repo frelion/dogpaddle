@@ -40,6 +40,23 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
     ";
     SqlProgram::parse(postgres).unwrap();
 
+    let mysql = r"
+        INSERT INTO discard()
+        SELECT id, amount
+        FROM mysql_cdc(
+            engine_name => 'orders_mysql_scan',
+            runtime_bundle => '/opt/dogpaddle/debezium',
+            host => '127.0.0.1',
+            port => 3306,
+            database => 'app',
+            user => 'dogpaddle',
+            password => env('DOGPADDLE_SQL_TEST_PASSWORD'),
+            replication_client_id => 5401,
+            table => 'orders'
+        ) AS orders
+    ";
+    SqlProgram::parse(mysql).unwrap();
+
     SqlProgram::parse("INSERT INTO discard() SELECT value FROM sequence(start => 0)").unwrap();
 }
 
@@ -87,6 +104,15 @@ fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
         (
             "negative integer",
             "INSERT INTO discard() SELECT value FROM sequence(start => -1)",
+        ),
+        (
+            "overflowing MySQL replication client ID",
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                engine_name => 'orders_mysql_scan', \
+                runtime_bundle => '/opt/dogpaddle/debezium', host => '127.0.0.1', \
+                port => 3306, database => 'app', user => 'dogpaddle', password => 'secret', \
+                replication_client_id => 4294967296, table => 'orders'\
+            )",
         ),
         (
             "sink argument",
@@ -365,6 +391,15 @@ fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
                 host => '127.0.0.1', port => 5432, database => 'app', \
                 user => 'dogpaddle', password => 'secret', schema => 'public', \
                 table => 'events', slot => 'events_slot', publication => 'events_pub'\
+            )"
+        ),
+        format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                engine_name => env('{variable}'), \
+                runtime_bundle => '/tmp/dogpaddle-runtime', \
+                host => '127.0.0.1', port => 3306, database => 'app', \
+                user => 'dogpaddle', password => 'secret', \
+                replication_client_id => 5401, table => 'events'\
             )"
         ),
         format!(

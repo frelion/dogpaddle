@@ -155,9 +155,31 @@ V1 端点：
 | --- | --- | --- |
 | Scan | `sequence` | `start` |
 | Scan | `postgres_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `schema`, `table`, `slot`, `publication` |
+| Scan | `mysql_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `replication_client_id`, `table` |
 | Sink | `sqlite` | `path`, `table` |
 | Sink | `postgres` | `sink_id`, `host`, `port`, `database`, `user`, `password`, `schema`, `table` |
 | Sink | `discard` | 无 |
+
+`mysql_cdc` 是单表、固定 Schema 的连续 binlog Scan。`replication_client_id` 是非零 `u32`，必须在活跃的
+`MySQL` replication client 中保持唯一；它与源服务器 ID 无关。`SqlProgram::build` 会发现并冻结 source server
+UUID、`InnoDB` table identity 与完整逻辑 Schema，再执行一次短暂的 `no_data` schema bootstrap。该临时
+Debezium connector 完成其 schema-only snapshot、产生 native opaque seed checkpoint 后立即停止；seed 随 canonical Flow Definition 发布。
+因此**成功 build 是该 `mysql_cdc` source 唯一且不可变的 binlog origin**。`open` 只注入新的临时连接配置，
+不重写已持久化 Flow、不再 bootstrap 或选择新的起点。
+
+正常 runtime（第一次也是如此）从 seed 或较新的 durable checkpoint 以 `recovery` + `MemorySchemaHistory`
+启动。bootstrap 与 recovery 都固定 `snapshot.locking.mode=none`，不主动取得 Debezium snapshot read lock。
+但 logical origin 是 bootstrap 内部选取的 `P`，不是调用 `build` 的瞬间：严格晚于 `P`、但早于成功 build 的写入会从
+保留 binlog 重放；`P` 之前（包括 bootstrap 已开始、但尚未选定 `P` 时）的状态和写入则不在这个 CDC-only Scan 的
+合同内。`MySQL` 必须持续保留从 origin（随后从最新 durable checkpoint）可恢复的 binlog；位置过期时 recovery
+必须失败，而不是悄悄选取较晚位置。
+
+它不读取 origin 之前已有的表数据，也不建立自动 source-write fence。新 Flow 不能把运行中的任意 `MySQL` 表直接
+接到新空 sink 并期望完整镜像；内建关系 sink 也不支持预装外部 baseline。唯一完整空表部署顺序是让源表保持为空，
+成功 build 后才允许首次写入；无停写的初始全量接入属于未来 snapshot source。Schema 在 bootstrap 后的整个可恢复
+期间必须固定；v1 不支持在线 DDL、表数据 snapshot、TLS、unsigned/temporal/JSON 等未列出的源类型或跨实例 fencing。
+详细的类型和部署合同见
+`dogpaddle-operation` 的 `MySQL` CDC Scan 文档。
 
 ## Streaming SQL v1
 

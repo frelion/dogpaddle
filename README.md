@@ -9,10 +9,10 @@ DogPaddle 是一个嵌入 Rust 应用的流处理引擎。你用 SQL 指定数�
 订单删除后撤回对应结果。业务后端只需写订单表。
 
 ```text
-PostgreSQL 数据变化  →  SQL 筛选、计算、分流  →  PostgreSQL / SQLite 结果表
+PostgreSQL / MySQL 数据变化  →  SQL 筛选、计算、分流  →  PostgreSQL / SQLite 结果表
 ```
 
-目前适合本地实验和 Rust 应用集成验证。项目仍在早期开发，PostgreSQL 接入处于试点阶段。
+目前适合本地实验和 Rust 应用集成验证。项目仍在早期开发，PostgreSQL 与 MySQL 接入均处于试点阶段。
 
 [快速上手](#快速上手) · [嵌入 Rust 应用](#嵌入-rust-应用) · [当前支持什么](#当前支持什么) · [订单演示](#订单演示)
 
@@ -132,7 +132,7 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
 
 | 你想做的事 | 当前支持 |
 | --- | --- |
-| 读取数据 | 递增数字源；PostgreSQL 单表变更捕获（试点） |
+| 读取数据 | 递增数字源；PostgreSQL WAL / MySQL binlog 单表变更捕获（固定 Schema 试点） |
 | 筛选和计算 | `SELECT`、`WHERE`、算术与布尔表达式、`CASE`、`CAST`、`TRY_CAST` |
 | 组织查询 | 字段别名、非递归 CTE、派生查询、`SELECT DISTINCT`、`UNION ALL` |
 | 写入结果 | SQLite；PostgreSQL（试点）；丢弃输出 |
@@ -147,6 +147,14 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
 - **PostgreSQL 只处理接入后的变化。** 试点要求空源表和匹配的新 replication slot，
   预先配置 publication 和 FULL replica identity；没有已有数据的初始快照。目前不支持 TLS、
   DNS 地址、多表路由或运行中改表。详见 [外部端点文档](crates/operation/README.md)。
+- **MySQL 也只处理内部 binlog 起点之后的变化，不是初始镜像。** 构建会在发布 Flow 前一次性完成
+  schema bootstrap，并把不可变 binlog 起点 `P` 随 Definition 发布；成功构建后，`P` 才是该源唯一的
+  起点。这样消除了 `P` 到首次运行时 ACK 的意外窗口：严格晚于 `P`、但早于实际运行的写入会从保留的
+  binlog 恢复。它不能把调用 `build` 的时刻变成原子切点；`P` 之前（包括 bootstrap 已开始、但 Debezium
+  尚未取到 `P` 时）的状态和变化都不在 v1 合同内。v1 不读取已有表数据，也不建立自动写入栅栏；因此它
+  不支持把运行中的表接到新空 sink 后得到完整镜像。唯一完整空表部署顺序是让源表保持为空，成功构建后再
+  允许第一次写入；已运行的表或写入者需要未来的 snapshot source。它要求固定 Schema 和足够的 binlog
+  保留，不支持运行中 DDL、TLS 或未列出的源类型。详见 [外部端点文档](crates/operation/README.md)。
 - **结果表由 DogPaddle 独占。** SQLite / PostgreSQL 输出必须使用新目标表，不能接管已有表或
   与业务代码共同写入。PostgreSQL 结果表不复制源表结构，文本当前按 bytes 保存。
 - **恢复沿用原来的处理规则。** 修改 SQL 后请使用新进度目录和新目标表；`open` 不会更新已有流程。

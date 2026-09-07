@@ -46,7 +46,13 @@ impl Checkpoint {
         &self.bytes
     }
 
-    pub(crate) fn matches(&self, engine_name: &str, connector_class: &str) -> bool {
+    /// Returns whether this checkpoint belongs to one exact Debezium engine
+    /// name and connector implementation class.
+    ///
+    /// This compares only the stable binding carried by the opaque checkpoint;
+    /// it does not expose or interpret connector-specific source offsets.
+    #[must_use]
+    pub fn matches(&self, engine_name: &str, connector_class: &str) -> bool {
         self.engine_name.as_ref() == engine_name && self.connector_class.as_ref() == connector_class
     }
 }

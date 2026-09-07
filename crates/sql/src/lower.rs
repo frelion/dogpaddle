@@ -256,6 +256,10 @@ impl Lowerer<'_> {
                 self.factory.resource(&id, scan.config)?;
                 self.factory.station(&id, scan.definition)
             }
+            BuiltScan::MySqlCdc(scan) => {
+                self.factory.resource(&id, scan.config)?;
+                self.factory.station(&id, scan.definition)
+            }
         };
         self.factory.output_capacity_bytes(station, OUTPUT_CAPACITY);
         self.scan_stations.insert(source.index, station);
@@ -338,6 +342,7 @@ fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {
     let definition: &dyn OperationDefinition = match scan {
         BuiltScan::Sequence(definition) => definition,
         BuiltScan::PostgresCdc(scan) => &scan.definition,
+        BuiltScan::MySqlCdc(scan) => &scan.definition,
     };
     let binding = definition.bind(&[]).map_err(SqlError::endpoint)?;
     binding

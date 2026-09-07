@@ -3,7 +3,7 @@
 `dogpaddle-debezium` embeds the stock Debezium Engine in `DogPaddle`'s Rust
 process and exposes a small connector-neutral pull/ACK API. It knows Debezium
 and Kafka Connect offsets, but not Arrow, `Change`, MDBX, Operation, Flow, or a
-connector-specific position type. `PostgreSQL` is only the first connector in the
+connector-specific position type. `PostgreSQL` and `MySQL` are packaged in the
 reference distribution.
 
 ```no_run
@@ -66,8 +66,14 @@ external progress marker. With Debezium 3.6.2, `PostgreSQL` may expose
 and monitoring concern covered by the real-connector gate, not part of the
 durability decision.
 
-Some connectors also need durable schema history. The `PostgreSQL` pilot does
-not; this crate does not claim that offsets alone restore every connector.
+Some connectors also need schema history. The `PostgreSQL` pilot does not. The
+concrete `MySQL` Scan owns an immutable seed checkpoint produced by one
+pre-publication `no_data` bootstrap; every normal runtime then starts in
+`recovery` with that seed (or a newer durable checkpoint) and reconstructs
+transient `MemorySchemaHistory` from its fixed catalog. The seed, fixed-Schema
+and binlog-retention contracts belong to that Scan, not to this connector-neutral
+crate. This crate deliberately remains offset-only and does not claim that
+offsets alone restore every connector.
 
 ## Runtime bundle
 

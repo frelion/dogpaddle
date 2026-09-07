@@ -146,7 +146,8 @@ assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 ## Operation 运行协议
 
 运行资源与持久 Data 分开装配：`OperationBinding::materialize(data, resource)` 消费一个可选的
-[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL` Scan 与 Sink 分别传拥有型配置。
+[`RuntimeResource`]。普通算子传 `RuntimeResource::none()`；`PostgreSQL`/`MySQL` Scan 与
+`PostgreSQL` Sink 分别传拥有型配置。
 binding 先验证其精确 Rust 类型，Flow 在创建 Store 前完成全图检查。这里没有全局 registry、
 connector enum 或启动回调；资源只在 materialize 时 move 进 Operation，外部初始化仍由 turn 完成。
 
@@ -220,7 +221,7 @@ collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, S
 
 ## 内建算子能力与 conformance
 
-下表是当前十三个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+下表是当前十四个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
 Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
@@ -229,6 +230,7 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | --- | --- | --- | --- | --- | --- | --- |
 | `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
 | `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
+| `MySqlCdcScan` (`14`) | Scan / 0 | 固定单表受支持列 | 预发布一次性 bootstrap 固定 origin；运行时始终 recovery，事务外 poll，checkpoint 与 output 同事务提交后 ACK | `mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag14 golden、纯资源/Schema 校验、bootstrap origin/初始化/回滚/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
 | `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMap<RowDigest, CollisionBucket, Large>` | 按输入行序选择边界事件并重建 diff | tag/layout、collision、边界、rollback、reopen、重批 |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
@@ -241,15 +243,16 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `SqliteSink` (`10`) | Sink / 1 | 校验 `SQLite` 列名与列数；无 output | 共享固定 ID 批次协议，每批至多 1024 操作，目标提交后结算 continuation 或 `Complete` | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 `SQLite` 值 | tag/payload、state/hash golden、全部 v1 类型、批界、非负前缀、rollback/reopen；无独立 benchmark |
 | `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `system-tests/postgres/check_sink.py` |
 
-所有十三个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
+所有十四个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
 `tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
 materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol` 与 `metamorphic`
 只保留跨算子契约。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
 和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
 真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 
-tag `1..=10` 与 tag `13` 的稳定字节入口位于 `tests/fixtures/v1/`；tag11 与 tag12 的完整 canonical JSON golden 分别由
-`tests/correctness/postgres_cdc_scan.rs` 与 `tests/correctness/postgres_sink.rs` 拥有。其中事件计数、对齐、
+tag `1..=10` 与 tag `13` 的稳定字节入口位于 `tests/fixtures/v1/`；tag11、tag12 与 tag14 的完整 canonical JSON
+golden 分别由 `tests/correctness/postgres_cdc_scan.rs`、`tests/correctness/postgres_sink.rs` 与
+`tests/correctness/mysql_cdc_scan.rs` 拥有。其中事件计数、对齐、
 `SQLite` Sink 与 Distinct 的 fixture 分别为 `running_event_count_definition.hex`、`schema_align_explicit.hex`、
 `sqlite_sink_output_events.hex` 与 `distinct_definition.hex`，冻结 tag `2`、`9`、`10` 与 `13`。每个算子文件会自行完成 decode、bind、
 materialize 与运行证据。Flow manifest 的端到端基线为
@@ -258,7 +261,7 @@ materialize 与运行证据。Flow manifest 的端到端基线为
 
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`scan`
 保存零输入且拥有 output 的 Scan 算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
-的终点算子。当前 `scan` 包含 `SequenceScan` 与 `PostgresCdcScan`，`transform` 包含 RunningEventCount、Distinct、Project、Filter、
+的终点算子。当前 `scan` 包含 `SequenceScan`、`PostgresCdcScan` 与 `MySqlCdcScan`，`transform` 包含 RunningEventCount、Distinct、Project、Filter、
 Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
 Discard、`SqliteSink` 与 `PostgresSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
@@ -399,6 +402,53 @@ snapshot、TLS 配置、跨实例 fencing、自动变更外部资源或 graceful
 
 完整宿主在 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
 进程恢复由 `system-tests/postgres/check_cdc.py` 显式验收，见根目录 TESTING.md。
+
+## `MySQL` CDC Scan 试点
+
+[`operation::scan::MySqlCdcScanDefinition`]（tag `14`）是一个数据库中一张固定 Schema `InnoDB`
+表的连续 binlog Scan。正常入口是 [`operation::scan::MySqlCdcScanConfig::bootstrap_definition`]：它在
+发布 Flow 前读取 catalog，短暂启动一个 `snapshot.mode=no_data` 的 Debezium connector，完成其 schema-only
+snapshot 并取得原生 opaque checkpoint 后同步停止该 connector，并将 checkpoint 和 `MySqlCdcScanSpec` 冻结进 Definition。SQL 的
+`build` 把这一步作为 endpoint 的预发布准备；底层 `FlowFactory::build` 本身仍不连接 `MySQL`、不打开 JVM。
+运行配置含 runtime bundle、主机、凭据和唯一 replication client ID，只在每次 build/open 时显式注入，绝不进入
+Definition。
+
+这个 bootstrap 只执行 schema bootstrap，绝不读取表数据。它得到的 seed checkpoint 会与 canonical Flow
+Definition 一起发布；因此**成功 build 就定义了不可变的 binlog origin**。临时 bootstrap connector 已在发布前
+停止，正常运行期（包括第一次 open）绝不会再选择新的 `no_data` 起点，而是一律以
+`snapshot.mode=recovery` 和 `MemorySchemaHistory` 从 Definition seed 或更新后的 durable checkpoint 恢复。
+
+它只声明 `mysql_cdc_scan.checkpoint: Cell<Vec<u8>>`。该 Cell 原样保存 D2 opaque checkpoint；缺值不表示
+“重新首次启动”，而是回退到 Definition 中的 immutable seed；空或损坏 bytes 是错误。没有 pending payload、
+schema-history Cell、delivery receipt 或第二套 offset 格式：checkpoint 与可选 output 在同一 Station 事务中
+提交，成功后才 ACK Delivery。无数据、heartbeat 和可接受的控制记录可返回 `Commit(None)`，不制造空 Change；
+普通 poll 错误令下一个 turn 重建临时 connector，ACK 不确定则 fail-stop 并要求 reopen。
+
+bootstrap 与 recovery 都固定 `snapshot.locking.mode=none`；在已承诺固定 Schema、单个 `InnoDB` 表的前提下，它们不主动
+取得 Debezium snapshot read lock。这里的 origin 是 Debezium 在 bootstrap **内部**选取的 `P`，不是调用
+`build` 的瞬间，也不是自动写入栅栏：`P` 之后、Definition 发布前的写入会从保留 binlog 重放，但 `P` 之前
+（包括 bootstrap 已开始而 `P` 尚未选定时）的变化不会产生 Change。如果 build 失败，则没有已发布的 Flow 或
+可对外承诺的 origin。`MySQL` 必须保留从 seed（随后从最新 durable checkpoint）可恢复的 binlog，直到 Flow
+已安全推进；origin 或 checkpoint 过期是 recovery 失败，不能通过新的 bootstrap 静默跳过变化。
+
+它仍不是初始全量方案：origin 之前已有的行不会产生 Change。因而它不能把运行中的任意源表直接接到一个新空 sink，
+并承诺完整镜像；内建关系 sink 也不支持预装外部 baseline。唯一完整空表部署顺序是让源表保持为空，先成功 build，
+再允许首次写入。对已运行的表或写入者，v1 没有自动 source fence，也没有 table-data snapshot，必须等待未来的
+snapshot source。`MemorySchemaHistory` 每次 recovery 都从当前 catalog 重建，因此捕获
+database/table 在 bootstrap 后直到不再需要恢复时都必须保持固定 Schema；运行中 DDL 会在 converter 中拒绝并且
+不会 ACK。TRUNCATE 保持送入 converter 后拒绝，而不是让 Debezium 跳过。这不是 DDL monitor，也不支持在线
+Schema evolution、表数据 snapshot、多表路由、跨实例 fencing、自动外部资源变更或 graceful stop API。
+
+catalog discovery 需要 `log_bin=ON`、ROW binlog、FULL row image、`lower_case_table_names=0`、单个非分区
+`InnoDB` base table，且需要读取 `INFORMATION_SCHEMA.INNODB_TABLES` 的权限以冻结 table identity。只支持
+signed `tinyint`/`smallint`→`Int16`、`mediumint`/`int`→`Int32`、`bigint`→`Int64`、`double`→`Float64`、字符
+文本→`Utf8`、binary/blob→`Binary` 和 `decimal(p,s)`→`Decimal128`（`1 ≤ p ≤ 38`、`0 ≤ s ≤ p`）；unsigned、
+float、时间、JSON、enum/set、bit、空间、generated 与 invisible 列均在 discovery 拒绝。`new_unencrypted`
+对 catalog 与 Debezium 连接都强制关闭 TLS，只适用于受信网络或独立加密隧道，不是完整安全部署方案。
+
+离线正确性证据位于 `tests/correctness/mysql_cdc_scan.rs` 与 `MySQL` Scan 模块的 Connect JSON conversion
+测试。普通 Cargo gate 不启动 JDK、Debezium bundle 或 `MySQL`；部署前须显式构建 bundle，并在真实单表上验收
+预发布 bootstrap、origin 到成功 build 之间的写入重放、recovery 重开和 insert/update/delete。
 
 ## `operation::scan::SequenceScan`
 
@@ -679,7 +729,7 @@ happy-path 单测都不能替代这些答案。
 `correctness` target。`definition_codec`、`expression`、`protocol`、`metamorphic` 只拥有横切契约，
 其余文件按每个具体算子纵向覆盖 literal golden、kind/data、bind、materialize、turn 与 reopen。
 `protocol` 直接验证上述队列例子的恢复状态机和 borrowed delivery 提交时序。Definition v1 使用版本化黄金字节约束，
-各算子 Schema 证据覆盖十三个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
+各算子 Schema 证据覆盖十四个 built-in 的精确传播、decoded golden 再绑定、错误 arity、非法 logical Schema，
 以及 Project、Filter、Extend、Select、SchemaAlign、UnionAll 对合法但不兼容 Schema 的结构化拒绝；
 `SchemaAlign` 还覆盖 canonical metadata、显式 cast、nullability 放宽/收窄和空 output；空
 SchemaAlign/Select 都覆盖没有表达式可代为检查时的 runtime input Schema drift 拒绝，非空路径继续
