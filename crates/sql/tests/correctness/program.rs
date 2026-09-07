@@ -161,10 +161,6 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
              ON left_scan.value = right_scan.value",
         ),
         (
-            "aggregate",
-            "SELECT value FROM sequence(start => 0) GROUP BY value",
-        ),
-        (
             "sort",
             "SELECT value FROM sequence(start => 0) ORDER BY value",
         ),
@@ -225,6 +221,79 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
         if let Ok(program) = SqlProgram::parse(&sql) {
             assert!(program.build(&flow_path).is_err(), "built {case}");
         }
+        assert!(!flow_path.exists(), "{case} created a Flow path");
+    }
+}
+
+#[test]
+fn unsupported_aggregate_forms_fail_without_creating_a_flow() {
+    let queries = [
+        (
+            "global aggregate",
+            "SELECT COUNT(*) FROM sequence(start => 0)",
+        ),
+        (
+            "grouping sets",
+            "SELECT value, COUNT(*) FROM sequence(start => 0) \
+             GROUP BY GROUPING SETS ((value))",
+        ),
+        (
+            "aggregate distinct",
+            "SELECT value % 2, COUNT(DISTINCT value) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "aggregate filter",
+            "SELECT value % 2, COUNT(*) FILTER (WHERE value > 0) \
+             FROM sequence(start => 0) GROUP BY value % 2",
+        ),
+        (
+            "aggregate order",
+            "SELECT value % 2, COUNT(value ORDER BY value) \
+             FROM sequence(start => 0) GROUP BY value % 2",
+        ),
+        (
+            "unregistered aggregate",
+            "SELECT value % 2, MEDIAN(value) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "aggregate arity",
+            "SELECT value % 2, SUM(value, value) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "floating average",
+            "SELECT value % 2, AVG(CAST(value AS DOUBLE)) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "floating sum",
+            "SELECT value % 2, SUM(CAST(value AS DOUBLE)) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "floating group key",
+            "SELECT CAST(value AS DOUBLE), COUNT(*) FROM sequence(start => 0) \
+             GROUP BY CAST(value AS DOUBLE)",
+        ),
+        (
+            "floating minimum",
+            "SELECT value % 2, MIN(CAST(value AS DOUBLE)) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+        (
+            "floating maximum",
+            "SELECT value % 2, MAX(CAST(value AS DOUBLE)) FROM sequence(start => 0) \
+             GROUP BY value % 2",
+        ),
+    ];
+
+    let root = tempfile::tempdir().unwrap();
+    for (index, (case, query)) in queries.into_iter().enumerate() {
+        let flow_path = root.path().join(format!("aggregate-{index}"));
+        let program = SqlProgram::parse(&format!("INSERT INTO discard() {query}")).unwrap();
+        assert!(program.build(&flow_path).is_err(), "built {case}");
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
 }

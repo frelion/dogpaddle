@@ -5,13 +5,14 @@
 //! planning, type derivation, nullability, and evaluation belong to
 //! `DataFusion`.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion_common::{DFSchema, DataFusionError};
 use datafusion_expr::{
-    execution_props::ExecutionProps, physical_planning_context::PhysicalPlanningContext,
+    ExprSchemable, execution_props::ExecutionProps,
+    physical_planning_context::PhysicalPlanningContext,
 };
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_proto::bytes::Serializeable;
@@ -72,6 +73,7 @@ pub(crate) struct BoundExpression {
     physical: Arc<dyn PhysicalExpr>,
     output_type: DataType,
     output_nullable: bool,
+    output_metadata: HashMap<String, String>,
 }
 
 impl StoredExpression {
@@ -136,6 +138,12 @@ impl StoredExpression {
         input_schema: SchemaRef,
     ) -> Result<BoundExpression, ExpressionBindError> {
         let datafusion_schema = DFSchema::try_from(Arc::clone(&input_schema))?;
+        let output_metadata = self
+            .expression()
+            .to_field(&datafusion_schema)?
+            .1
+            .metadata()
+            .clone();
         let physical = create_physical_expr(
             self.expression(),
             &datafusion_schema,
@@ -150,6 +158,7 @@ impl StoredExpression {
             physical,
             output_type,
             output_nullable,
+            output_metadata,
         })
     }
 }
@@ -161,6 +170,10 @@ impl BoundExpression {
 
     pub(crate) const fn output_nullable(&self) -> bool {
         self.output_nullable
+    }
+
+    pub(crate) const fn output_metadata(&self) -> &HashMap<String, String> {
+        &self.output_metadata
     }
 
     pub(crate) fn evaluate(&self, records: &RecordBatch) -> Result<ArrayRef, ExpressionError> {

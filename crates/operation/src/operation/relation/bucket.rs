@@ -74,6 +74,14 @@ impl StoreValue for CollisionBucket {
     }
 }
 
+impl CollisionBucket {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = (&[u8], u64)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.row.as_slice(), entry.weight))
+    }
+}
+
 fn take<const N: usize>(remaining: &mut &[u8]) -> Result<[u8; N], CodecError> {
     let (value, trailing) = remaining
         .split_first_chunk::<N>()

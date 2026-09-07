@@ -135,13 +135,17 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
 | 读取数据 | 递增数字源；PostgreSQL 单表变更捕获（试点） |
 | 筛选和计算 | `SELECT`、`WHERE`、算术与布尔表达式、`CASE`、`CAST`、`TRY_CAST` |
 | 组织查询 | 字段别名、非递归 CTE、派生查询、`SELECT DISTINCT`、`UNION ALL` |
+| 分组聚合 | 非空 `GROUP BY`；`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；只分组不聚合 |
 | 写入结果 | SQLite；PostgreSQL（试点）；丢弃输出 |
 | 停止后继续 | 本地保存流程、处理进度和算子状态，重新打开后恢复 |
 
 开始接入前，需要了解这些边界：
 
-- **SQL 范围有限。** 每个文件只接受一条 `INSERT INTO ... SELECT ...`。暂不支持 Join、
-  聚合（如 `GROUP BY`）、`DISTINCT ON`、排序、Limit 或窗口，也不提供交互式查询结果。
+- **SQL 范围有限。** 每个文件只接受一条 `INSERT INTO ... SELECT ...`。暂不支持 Join、无分组的
+  全局聚合、grouping sets、聚合修饰符或 UDF，也不支持 `DISTINCT ON`、普通 `UNION`、排序、
+  Limit、窗口和交互式查询结果。
+- **聚合类型范围有限。** 分组字段不能包含浮点值；`SUM/AVG` 只接受 `Int64/UInt64`，`MIN/MAX`
+  只接受非浮点的扁平 DogPaddle scalar。`COUNT(*)` 和 `COUNT(expression)` 均可使用。
 - **去重采用精确记录身份。** `SELECT DISTINCT` 比较完整 canonical 记录；浮点值按
   原始位模式区分，因此 `-0.0` 与 `+0.0` 不会像常见 SQL / `DataFusion` 分组那样合并。
 - **PostgreSQL 只处理接入后的变化。** 试点要求空源表和匹配的新 replication slot，

@@ -325,10 +325,9 @@ fn validate_select(select: &Select) -> Result<(), SqlError> {
         value_table_mode,
         flavor,
     } = select;
-    let empty_group_by = matches!(
+    let plain_group_by = matches!(
         group_by,
-        GroupByExpr::Expressions(expressions, modifiers)
-            if expressions.is_empty() && modifiers.is_empty()
+        GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()
     );
     if !optimizer_hints.is_empty()
         || !matches!(distinct, None | Some(SelectDistinct::Distinct))
@@ -340,7 +339,7 @@ fn validate_select(select: &Select) -> Result<(), SqlError> {
         || !lateral_views.is_empty()
         || prewhere.is_some()
         || !connect_by.is_empty()
-        || !empty_group_by
+        || !plain_group_by
         || !cluster_by.is_empty()
         || !distribute_by.is_empty()
         || !sort_by.is_empty()

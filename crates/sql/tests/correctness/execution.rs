@@ -150,6 +150,104 @@ fn select_distinct_deduplicates_projected_rows_across_reopen() {
 }
 
 #[test]
+fn grouped_aggregates_update_one_relation_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("aggregates.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'aggregates') \
+         SELECT \
+             CAST(value % 2 AS BIGINT) AS parity, \
+             COUNT(*) AS row_count, \
+             COUNT(1) AS literal_count, \
+             COUNT(CASE WHEN value % 4 = 0 THEN value END) AS selected_count, \
+             SUM(CAST(value % 4 AS BIGINT)) AS total, \
+             SUM((value + CAST(0 AS BIGINT UNSIGNED)) % CAST(4 AS BIGINT UNSIGNED)) \
+                 AS unsigned_total, \
+             AVG(CAST(value % 4 AS BIGINT)) AS mean, \
+             AVG((value + CAST(0 AS BIGINT UNSIGNED)) % CAST(4 AS BIGINT UNSIGNED)) \
+                 AS unsigned_mean, \
+             MIN(CAST(value % 4 AS BIGINT)) AS minimum, \
+             MAX(CAST(value % 4 AS BIGINT)) AS maximum \
+         FROM sequence(start => 18446744073709551612) \
+         GROUP BY CAST(value % 2 AS BIGINT)",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
+
+    let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = program.open(&flow_path).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let rows = connection
+        .prepare(
+            "SELECT parity, row_count, literal_count, selected_count, total, unsigned_total, mean, unsigned_mean, minimum, maximum \
+             FROM aggregates ORDER BY parity",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                decode_u64(row.get::<_, Vec<u8>>(5)?),
+                decode_f64(row.get::<_, Vec<u8>>(6)?),
+                decode_f64(row.get::<_, Vec<u8>>(7)?),
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (0, 2, 2, 1, 2, 2, 1.0, 1.0, 0, 2),
+            (1, 2, 2, 0, 4, 4, 2.0, 2.0, 1, 3)
+        ]
+    );
+
+    let mut flow = program.open(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+}
+
+#[test]
+fn group_by_without_calls_emits_one_row_per_group() {
+    let root = tempfile::tempdir().unwrap();
+    let sqlite_path = root.path().join("groups.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'groups') \
+         SELECT CAST(value % 2 AS BIGINT) AS parity \
+         FROM sequence(start => 18446744073709551614) \
+         GROUP BY CAST(value % 2 AS BIGINT)",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
+
+    let mut flow = program.build(root.path().join("flow")).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let rows = connection
+        .prepare("SELECT parity FROM groups ORDER BY parity")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows, [0, 1]);
+}
+
+#[test]
 fn union_all_keeps_separate_scan_stations() {
     let root = tempfile::tempdir().unwrap();
     let program = SqlProgram::parse(
@@ -348,14 +446,7 @@ fn sqlite_values(path: &Path) -> Vec<u64> {
     let mut values = statement
         .query_map([], |row| row.get::<_, Vec<u8>>(0))
         .unwrap()
-        .map(|value| {
-            u64::from_be_bytes(
-                value
-                    .unwrap()
-                    .try_into()
-                    .expect("DogPaddle stores UInt64 as an eight-byte SQLite blob"),
-            )
-        })
+        .map(|value| decode_u64(value.unwrap()))
         .collect::<Vec<_>>();
     values.sort_unstable();
     values
@@ -410,4 +501,20 @@ fn decode_i128(value: Vec<u8>) -> i128 {
             .try_into()
             .expect("DogPaddle stores Decimal128 as a sixteen-byte SQLite blob"),
     )
+}
+
+fn decode_u64(value: Vec<u8>) -> u64 {
+    u64::from_be_bytes(
+        value
+            .try_into()
+            .expect("DogPaddle stores UInt64 as an eight-byte SQLite blob"),
+    )
+}
+
+fn decode_f64(value: Vec<u8>) -> f64 {
+    f64::from_bits(u64::from_be_bytes(
+        value
+            .try_into()
+            .expect("DogPaddle stores Float64 as an eight-byte SQLite blob"),
+    ))
 }

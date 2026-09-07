@@ -33,6 +33,7 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 crc32fast = "=1.5.1"
 datafusion-common = { version = "=55.0.0", default-features = false }
 datafusion-expr = { version = "=55.0.0", default-features = false }
+datafusion-functions-aggregate = { version = "=55.0.0", default-features = false }
 datafusion-optimizer = { version = "=55.0.0", default-features = false }
 datafusion-physical-expr = { version = "=55.0.0", default-features = false }
 datafusion-proto = { version = "=55.0.0", default-features = false }

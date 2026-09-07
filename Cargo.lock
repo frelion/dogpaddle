@@ -1469,6 +1469,7 @@ dependencies = [
  "arrow-schema",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-functions-aggregate",
  "datafusion-optimizer",
  "datafusion-sql",
  "dogpaddle-flow",

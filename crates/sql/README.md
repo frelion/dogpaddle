@@ -169,18 +169,25 @@ V1 端点：
 - `CAST`、`TRY_CAST`、`CASE`
 - 现有表达式执行层可接受的比较、布尔与算术表达式
 - `UNION ALL`
+- 非空 `GROUP BY`，以及 `COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；`SUM/AVG` 的参数在 v1
+  绑定后必须是 `Int64/UInt64`，只有分组字段而没有聚合调用也合法
 
 在创建 state 目录前明确拒绝：
 
-- 普通表、Join、Aggregate 和普通 `UNION`
+- 普通表、Join 和普通 `UNION`
 - `SELECT ALL`、`DISTINCT ON`、Sort、Limit、Window、Values
+- 无分组的全局 Aggregate、grouping sets 和聚合调用的 `DISTINCT`、`FILTER`、`ORDER BY`、null treatment
+- 包含 `Float32/Float64` 的分组字段
+- 聚合 Operation 尚未实现的参数类型，包括浮点 `SUM/AVG/MIN/MAX`
 - 递归 CTE、标量子查询和相关子查询
 - UDF、时间、随机数、session variable
 - 依赖 `DataFusion` function registry 的 scalar、aggregate 或 window 函数
 - 任何没有显式 lowering 的 `LogicalPlan` 节点
 
 `DataFusion` 负责 SQL 解析、名称解析和 type coercion；分析得到的显式表达式与精确 `Schema` 被 lower
-为现有 `Filter`、`SchemaAlign`、`UnionAll` 和 `Distinct` Operation。`DataFusion` 不执行 `Flow`，
+为现有 `Filter`、`SchemaAlign`、`UnionAll`、`Distinct` 和 `Aggregate` Operation。聚合函数只在 SQL
+规划时使用一张固定的逻辑描述表；`AVG` 保留整数参数并推导 `Float64` 输出，实际状态和计算完全属于
+`DogPaddle`。`DataFusion` 不执行 `Flow`，
 `DogPaddle` 也不维护第二套表达式 AST 或 SQL 执行引擎。
 
 全行去重沿用 `DogPaddle` 的 exact-row identity：null 使用 canonical 表示，浮点值按原始位模式区分，
