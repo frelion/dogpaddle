@@ -2,11 +2,11 @@
 
 `dogpaddle-operation` 提供具体、强类型的 Operation Definition、持久化 Data 和运行实例。
 Definition 是无副作用、可持久化的数据；它声明所需数据对象的稳定逻辑名、collection 类型
-及该 collection 真正需要的布局参数，也把有序、精确的输入 logical Arrow Schema 纯绑定为一个
+与键值类型，也把有序、精确的输入 logical Arrow Schema 纯绑定为一个
 一次性的编译结果。Flow 在 `build/open` 阶段先绑定完整拓扑，再创建或打开类型化对象，并消费
 binding 装配运行实例。方向严格单向：`Definition → OperationBinding → runtime Operation`；运行实例
-只保存执行参数和具体持久化 collection，不保留 Definition 或 binding。具体算子不接触 `Store`、
-`DataHandle` 或物理放置策略。
+只保存执行参数和具体持久化 collection，不保留 Definition 或 binding。具体算子不接触 `Store`
+或 `DataHandle`。
 
 ## 数据边界
 
@@ -65,7 +65,7 @@ Definition payload 直接保存 `DataFusion` Expr protobuf，不保存 `Physical
 Schema 交给 `DataFusion` `create_physical_expr`；表达式的字段解析、type、nullability、cast 与
 运行期 `evaluate` 全部由 `DataFusion` 定义。该 API 假定 logical coercion 已完成，而本 crate 不运行
 logical/SQL planner，因此不会额外插入隐式 cast；混合类型表达式需要调用方显式 [`cast`]。binding 只保存 exact input Schema、physical expression 和
-派生 output 属性；open 从 protobuf 还原 `Expr` 后重新完成同一过程。DogPaddle 继续负责完整 Schema
+派生 output 属性；open 从 protobuf 还原 `Expr` 后重新完成同一过程。`DogPaddle` 继续负责完整 Schema
 guard、Filter/Extend/Select/SchemaAlign 的 output Schema 约束，以及 records/diffs 的 Change 语义。
 
 这份 protobuf 是版本绑定的持久格式，不承诺跨 `DataFusion` 版本兼容。工作区精确 pin 相互匹配的
@@ -106,7 +106,7 @@ Operation 与 Flow 的 build/open/reopen 纵向证据；它不自动扩展到同
 | 状态 | 当前范围 | 调用者应如何理解 |
 | --- | --- | --- |
 | 已承诺 | exact 列引用；Boolean 列作为 Filter predicate；`UInt64` 列与同类型 literal 的 equality；`UInt64 → Utf8` 显式 cast；以及上节精确列出的 Date32/Timestamp(Millisecond, no timezone)/Decimal128 direct-copy、同类型比较与 `SchemaAlign` cast 组合 | 只依赖这些已走通持久 Flow 的精确组合；混合类型仍由调用方显式 cast |
-| `DataFusion` 可规划、DogPaddle 未承诺 | 已有 Operation 级执行证据但尚无对应完整 Flow 纵向证据的 Boolean `and/or/not`、`is_null`、代表性 scalar/array `eq/not_eq`、整数加法与 `Utf8 → Int64` `try_cast`；只有 protobuf roundtrip 证据的 `is_not_null`；其他算术/比较、`between`/alias、内建函数、复杂嵌套表达式；未列出的 Timestamp unit/timezone、时间/Decimal 运算和其他 temporal/decimal cast | 当前 pin 上能构造、bind 甚至执行仍不构成持久产品契约；补齐精确 Flow build/open/reopen 证据后才能进入上一行 |
+| `DataFusion` 可规划、`DogPaddle` 未承诺 | 已有 Operation 级执行证据但尚无对应完整 Flow 纵向证据的 Boolean `and/or/not`、`is_null`、代表性 scalar/array `eq/not_eq`、整数加法与 `Utf8 → Int64` `try_cast`；只有 protobuf roundtrip 证据的 `is_not_null`；其他算术/比较、`between`/alias、内建函数、复杂嵌套表达式；未列出的 Timestamp unit/timezone、时间/Decimal 运算和其他 temporal/decimal cast | 当前 pin 上能构造、bind 甚至执行仍不构成持久产品契约；补齐精确 Flow build/open/reopen 证据后才能进入上一行 |
 | 明确拒绝 | 不能逐字 canonical protobuf roundtrip 的 Expr；缺失/歧义字段或 `DataFusion` 无法 physical-plan 的表达式；Filter 的非 Boolean 结果；隐式类型 coercion；`SchemaAlign` 的 nullable → non-null 收窄；运行期 input Schema 漂移 | 分别在 Definition 构造、纯 bind 或 turn 边界返回结构化错误，不创建资源或提交部分进展 |
 
 时间、随机、UDF、session variable 或外部 registry 依赖目前没有确定、可恢复的执行上下文，因此不在
@@ -156,7 +156,7 @@ connector enum 或启动回调；资源只在 materialize 时 move 进 Operation
 
 运行时 [`operation::Operation`] trait 只有一个统一、object-safe 的 `turn`。零输入 Scan 与其他
 Operation 走同一个协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed Change，
-以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 `AppendLog` offset、
+以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 Subscription offset、
 Transaction 或事务启动能力。
 
 一次 turn 明确分成三个线性阶段：
@@ -219,8 +219,8 @@ checkpoint 恢复的外部服务；独立调用代码把 output IPC 与 checkpoi
 在本地提交前或提交后丢失运行态，再 reopen 的完整输出序列。测试中的 Drop 用于模拟这些恢复边界，
 不代替未来真实连接器的进程崩溃验收。
 
-下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、值类型，以及该
-collection 存在选择时的 `SIZE`，例如 `Cell<u64>` 或 `OrderedMap<u64, String, Large>`。
+下文所说的 data class 指一个完整的 Rust 持久化数据类型，包括 collection、键与值类型，例如
+`Cell<u64>`、`OrderedMap<u64, String>` 或 `PartitionedMultiset<Group, Value>`。
 
 ## 内建算子能力与 conformance
 
@@ -232,11 +232,11 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
-| `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 私有捕获初始快照与 heartbeat 前 WAL，封口后原子发布，再持续 CDC | `phase` + `checkpoint` + `bootstrap_spool` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag11 golden、三资源/容量、捕获/封口/回滚/reset/reopen；显式真实 PG 快照→CDC gate |
-| `MySqlCdcScan` (`15`) | Scan / 0 | 固定单表受支持列 | `initial_only` 私有捕获初始快照，封口后原子发布，再以 `recovery` 持续 CDC | `phase` + `checkpoint` + `bootstrap_spool` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag15 golden、三资源/容量、捕获/封口/回滚/reset/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
+| `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 私有捕获初始快照与 heartbeat 前 WAL，封口后原子发布，再持续 CDC | `phase` + `checkpoint` + `bootstrap_spool: Queue<Vec<u8>>` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag11 golden、三资源/容量、捕获/封口/回滚/reset/reopen；显式真实 PG 快照→CDC gate |
+| `MySqlCdcScan` (`15`) | Scan / 0 | 固定单表受支持列 | `initial_only` 私有捕获初始快照，封口后原子发布，再以 `recovery` 持续 CDC | `phase` + `checkpoint` + `bootstrap_spool: Queue<Vec<u8>>` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag15 golden、三资源/容量、捕获/封口/回滚/reset/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
-| `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMap<RowDigest, CollisionBucket, Large>` | 按输入行序选择边界事件并重建 diff | tag/layout、collision、边界、rollback、reopen、重批 |
-| `Aggregate` (`14`) | Transform / 1 | 非空 group fields 后接 calls；保留 Schema metadata 及 group Expr metadata | 按行序更新；新增/删除组输出 `+1/-1`，已有组结果变化输出旧 `-1`、新 `+1`；`Complete` | `aggregate.groups`、`aggregate.entries` 两个 `Large` map 与 `aggregate.control: Cell<u64>` | 按真实 output 一次建列；MIN/MAX 每页扫描一个 digest bucket | tag14 golden、layout/collision、组合函数、rollback、reopen、非单位 diff/重批 |
+| `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMultiset<Vec<u8>>` | 按输入行序选择边界事件并重建 diff | tag、完整 row key、边界、rollback、reopen、重批 |
+| `Aggregate` (`14`) | Transform / 1 | 非空 group fields 后接 calls；保留 Schema metadata 及 group Expr metadata | 按行序更新；新增/删除组输出 `+1/-1`，已有组结果变化输出旧 `-1`、新 `+1`；`Complete` | `aggregate.groups: OrderedMap`、`aggregate.entries: PartitionedMultiset`、`aggregate.control: Cell<u64>` | 按真实 output 一次建列；MIN/MAX 直接读取分区首尾 | tag14 golden、分区/排序、组合函数、rollback、reopen、非单位 diff/重批 |
 | Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
 | Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
 | Extend (`6`) | Transform / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变，`Complete` | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
@@ -275,10 +275,10 @@ Scan 是结构角色，不要求底层一定存在一张可遍历的表。当前
 
 ## 状态关系算子：Distinct
 
-`Distinct` 用一个 crate 私有的 `OrderedMap<RowDigest, CollisionBucket, Large>` 维护完整记录的正权重。
-256-bit BLAKE3 digest 只定位 collision bucket；记录是否相同始终比较 bucket 中的完整 canonical row，因此 hash 冲突不会合并记录。
+`Distinct` 用 `distinct.weights: OrderedMultiset<Vec<u8>>` 维护完整 canonical row 的正权重。完整行
+直接作为有序集合 key；缺失 key 表示权重 `0`，归零即删除。
 权重从零变为正数时输出 `+1`，从正数归零时输出 `-1`，其余变化不输出；负前缀和 overflow 使整个
-turn 回滚，归零记录和空 bucket 会被删除。
+turn 回滚。
 
 更新严格遵循输入行序，不先合并同一 Change 内的事件，并对稳定重批和 reopen 保持相同语义。
 canonical row 保留浮点原始位模式，所以 `-0.0` 与 `+0.0` 是不同记录。
@@ -289,29 +289,26 @@ canonical row 保留浮点原始位模式，所以 `-0.0` 与 `+0.0` 是不同�
 `name + AggregateCall` 一次绑定成一个单输入 Operation；调用列表可以为空，此时就是按 group key
 分组去重。`COUNT(*)`、`COUNT(expr)`、`SUM`、`AVG`、`MIN`、`MAX` 都通过 `AggregateCall`
 构造器进入同一条 Definition codec。函数 tag 与 binding 集中在一张 crate 私有 descriptor 表里，
-每个函数实现只选择两种稳定生命周期之一：可增量维护的 `Fold`，或需要持久索引补算的 `Indexed`。
-runtime 始终把完整 argument tuple 交给函数，因而以后增加多参数或自定义函数不需要改写 Host；新增内建函数只增加
-自己的模块和一条 descriptor 注册，不扩张公共函数枚举，也不让函数接触 Store。
+每个函数只选择可增量维护的 `Fold`，或由有序分区直接求首尾的 `Extrema`。函数实现不接触 Store。
 
 持久状态只有三个具名对象：
 
-- `aggregate.groups` 用 256-bit digest 定位 group collision bucket；bucket 保存完整 canonical group、
-  单调 group ID、正权重和各调用的小状态。digest 冲突时仍按完整 group bytes 精确区分。
-- `aggregate.entries` 使用固定宽 key `(layout ID, group ID, tuple digest)`；layout `0` 保存完整 input row，
-  在任何聚合更新前做 collision-safe 的精确行权重准入。其余 layout 只保存确实需要索引的完整 argument tuple，
-  相同 tuple 表达式可由多个 indexed 调用共享；bucket 仍保存完整 tuple 与正权重，NULL 也不会被 Host 丢弃。
+- `aggregate.groups: OrderedMap<Vec<u8>, GroupState>` 以完整 canonical group 为 key；value 保存单调
+  group ID、正 group weight 和各 Fold 调用的小状态。
+- `aggregate.entries: PartitionedMultiset<EntryPartition, Vec<u8>>`。layout `0` 的分区按完整 canonical
+  input row 做精确准入；其余分区按 `(layout ID, group ID)` 隔离一个 extrema expression 的有序
+  argument key。相同持久表达式共享 layout；NULL 不进入 extrema 分区。
 - `aggregate.control` 只分配单调、不复用的 group ID。
 
-所以 hash 从来不是等价性本身，只是找到保存完整值的 bucket。一次事件的 input admission、group weight、
+一次事件的 input admission、group weight、
 函数小状态、索引和 output 全在同一写事务中更新；负前缀、weight/result overflow 或其他错误回滚整个 turn。
 新组输出 `+1`，消失组输出 `-1`；已有组的结果确实变化时才按顺序输出旧行 `-1`、新行 `+1`，结果不变不输出。
 group output 保留 input Schema metadata 以及 `DataFusion` `Expr::to_field` 推导的 `Field` metadata，并使用定义给出的名称。
 
 `COUNT` 输出 non-null `Int64`。`SUM` 当前只接受 `Int64/UInt64`；`AVG` 对这两种整数用
 `i128/u128` 精确累计，最终一次转换为 nullable `Float64`。`MIN/MAX` 接受当前 flat、非浮点 scalar
-类型并缓存极值；删除当前极值时只在该 group/layout 的 key range 内分页重算，每页解码一个 digest collision bucket，
-处理后立即丢弃，绝不收集整组。合法的 Utf8/Binary 值没有人为长度上限，因此内存下界是一个最大值或 collision
-bucket，而不是固定 byte page。
+类型；数值用保持逻辑顺序的定长编码，Utf8/Binary 直接使用其字节。每次输出从对应分区读取首个或
+末个 key，因此删除当前极值不需要扫描整组，也不在 group state 中缓存第二份极值。
 
 当前明确拒绝全局聚合、浮点 group key、浮点 `SUM/AVG/MIN/MAX`、Decimal `SUM/AVG` 和嵌套
 `MIN/MAX`。这避免把 bit identity、NaN order 或历史相关的浮点累计误称为 SQL 语义；后续增加对应实现时再连同
@@ -327,13 +324,12 @@ input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位�
 Scan/Sink 角色与 output 属性。Flow 负责生成完整
 资源名，并调用声明携带的类型化 create/open 能力；得到的实例按逻辑名组成集合，再交给
 此前 Schema bind 产生的 `OperationBinding::materialize`。binding 只按名称取得已经创建或打开的
-`Cell<T>` 或 `OrderedMap<K, V, SIZE>`，声明顺序不参与绑定，也不接收 Store；物化会消费整组实例，
+`Cell<T>`、`OrderedMap<K, V>`、`OrderedMultiset<K>`、`PartitionedMultiset<P, K>` 或 `Queue<T>`，
+声明顺序不参与绑定，也不接收 Store；物化会消费整组实例，
 并拒绝缺失、类型错误或未被 binding 取走的多余资源。
 
-collection 只暴露真实存在的布局选择：`Cell<T>` 永远使用共享空间；`OrderedMap` 的 `Small`
-形式共享底层物理空间，`Large` 形式拥有独立物理空间。Size 属于支持选择的具名数据对象的
-静态 schema，而不是由 Flow 根据数据量猜测。Flow 只解释声明，不枚举具体算子或 collection
-类型。
+collection 类型及其键值 codec 是持久 schema。Flow 只解释声明，不枚举具体算子或 collection 类型；
+Store 负责资源的物理实现。
 
 ```rust
 use dogpaddle_operation::{
@@ -381,11 +377,11 @@ payload 是固定字段顺序的 canonical JSON；未知字段、重复字段、
 
 算子只声明 `postgres_cdc_scan.phase: Cell<u32>`、
 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 和
-`postgres_cdc_scan.bootstrap_spool: AppendLog<Vec<u8>>` 三个资源。checkpoint 原样保存 D2 opaque bytes，
+`postgres_cdc_scan.bootstrap_spool: Queue<Vec<u8>>` 三个资源。checkpoint 原样保存 D2 opaque bytes，
 不加 envelope，也不充当 delivery ID。spool 每个 entry 保存一个完整自描述 Change IPC Stream。
 `bootstrap_spool_bytes` 是硬逻辑上限，下一条必须满足
-`retained_bytes + 8-byte offset key + encoded IPC bytes <= bootstrap_spool_bytes`；空 spool 也不放行超限首条。
-它不是 MDBX 文件、MVCC、JVM/Rust 内存或 WAL 磁盘配额。
+`queued_bytes + 8-byte private sequence + encoded IPC bytes <= bootstrap_spool_bytes`；空 Queue 也不放行
+超限首条。它不是 Store、JVM/Rust 内存或 WAL 磁盘配额。
 
 此前开发期的单 checkpoint 布局已删除；旧 Flow 必须重建，不提供 alias、迁移或兼容读取。
 
@@ -394,12 +390,13 @@ payload 是固定字段顺序的 canonical JSON；未知字段、重复字段、
 1. `Fresh` 先在本地事务中发布 `Capturing`，再在事务外校验 source identity 并以
    `snapshot.mode=initial` 单线程启动快照。该阶段不产生公开 output。
 2. `Capturing` 每次取一个完整 delivery，将其所有记录按顺序转为一个 Change。有数据时将完整
-   IPC 追加到私有 spool，并将整个 delivery 的 candidate checkpoint 一起提交；仅提交后 ACK。
+   IPC `try_push` 到私有 Queue，并将整个 delivery 的 candidate checkpoint 一起提交；仅提交后 ACK。
 3. terminal heartbeat 将快照封口，其 checkpoint 成为 `Q`。非空表之前必须观察到 `snapshot=last`；
    空表可直接封口。`last` 与 heartbeat 之间可出现跨 delivery 的 insert/update/delete；terminal delivery 的
    完整记录序列也保留在 spool。
-4. `Publishing` 先停止 snapshot connector，然后每个 turn 在同一个 MDBX 事务中解码并截断一条
-   spool head、向 Station 追加 output。背压、Schema 失配或 commit 失败同时回滚出队和 output。
+4. `Publishing` 先停止 snapshot connector，然后每个 turn 在同一个 Store 事务中读取并
+   `pop_front` 一条 spool Change、向 Station 追加 output。背压、Schema 失配或 commit 失败同时回滚
+   dequeue 和 output。
 5. spool 排空与 `Streaming` phase 同事务提交。后续以 `snapshot.mode=no_data` 从 `Q` 恢复同一
    slot，稳态 delivery 仍以 checkpoint + 可选 output 同事务提交，提交后才 ACK。
 
@@ -457,20 +454,20 @@ slot 名在 discovery 和首次 snapshot 前必须不存在；随后由该 Flow/
 不连 MySQL、不打开 JVM。runtime bundle、主机、凭据和唯一 replication client ID 只作为运行资源注入。
 
 它只声明 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和
-`mysql_cdc_scan.bootstrap_spool: AppendLog<Vec<u8>>` 三个资源。Definition 另持久 spool 容量。checkpoint 是 D2
+`mysql_cdc_scan.bootstrap_spool: Queue<Vec<u8>>` 三个资源。Definition 另持久 spool 容量。checkpoint 是 D2
 opaque bytes，spool 每条是完整 Change IPC。开发期旧 Definition/单 checkpoint 布局必须重建，不迁移。
 
 状态为 `Fresh → Capturing → Publishing → Streaming`。`Fresh` 先持久化 `Capturing`，再以
 `snapshot.mode=initial_only`、`snapshot.locking.mode=minimal`、单线程启动一致全表快照。快照的 `r` 事件
 只写私有 spool，不产生公开 output。每个 delivery 的可选完整 Change IPC 和 candidate checkpoint 同事务提交，
 之后才 ACK。唯一且位于 delivery 末尾的 terminal heartbeat 将 checkpoint `Q` 与 `Publishing` 一起封口。
-`Publishing` 停止 snapshot connector，每个 turn 将一条 spool Change 的截断与 Station output append 同事务提交；
+`Publishing` 停止 snapshot connector，每个 turn 将一条 spool Change 的 dequeue 与 Station output append 同事务提交；
 背压或提交失败同时回滚两者。spool 排空后进入 `Streaming`，以 `snapshot.mode=recovery` 和
 `MemorySchemaHistory` 从 `Q` 继续 binlog，稳态仍以 checkpoint/output 同事务 + 提交后 ACK 运行。
 
 `Capturing` 期 checkpoint 不是部分快照 resume token。错误或 reopen 中断捕获后，必须停止 connector，进入
 `Resetting` 逐条清理 spool/checkpoint，再从 `Fresh` 重做完整快照。`Publishing`/`Streaming` reopen 不重做快照。
-`bootstrap_spool_bytes` 是 `retained + 8-byte offset + IPC` 的硬逻辑上限；超限 delivery 不提交、不 ACK，
+`bootstrap_spool_bytes` 是 `queued bytes + 8-byte private sequence + IPC` 的硬逻辑上限；超限 delivery 不提交、不 ACK，
 必须使用更大容量和新 state 目录重建。
 
 `minimal` locking 先以短时 global read lock 捕获 binlog 切点和 Schema，然后在 `InnoDB` consistent snapshot 中扫描行，
@@ -625,8 +622,8 @@ exact common Schema；每个 turn 在转发前校验 runtime input，并以包�
 
 [`operation::sink::DiscardDefinition`] 显式声明为携带一个输入的 [`OperationKind::Sink`]，
 不声明 Operation data，也没有 output。物化后的 [`operation::sink::DiscardOperation`] 是零状态
-unit struct；它接受端口零上的完整 Change，并返回 `Action::Complete(None)`。输入完成仍由 Station 在同一事务中
-持久化 cursor；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
+unit struct；它接受端口零上的完整 Change，并返回 `Action::Complete(None)`。Station 在同一事务中
+确认输入 Subscription；失败或回滚不会丢失输入。Discard 只提供一个无外部副作用的显式 Flow 终点，外部
 Sink 仍需各自设计与目标系统匹配的幂等提交协议。
 
 Schema bind 接受任意合法的精确单一输入，并返回无 output 的 binding。
@@ -655,7 +652,7 @@ Prepared 最多包含 1024 个具体操作：insert 是原 Change 的行索引�
 
 目标已提交但第 3 步未提交时，reopen 原样重投当前 Prepared。固定 ID 的重复插入和删除幂等；
 即使同一批先插入再删除同一个 ID，重复执行后仍为空。只有结算成功才能准备下一批，
-从不重投已结算的旧批次。目标 I/O 不占用 MDBX 写事务；`AfterCommit` 不确定时 fail-stop/reopen。
+从不重投已结算的旧批次。目标 I/O 不占用 Store 写事务；`AfterCommit` 不确定时 fail-stop/reopen。
 
 首次 turn 只恢复本地状态。新目标检查发生在发布 Initialize 之前；Initialize 提交后才建表，
 初始化重放只接受同布局的空目标。目标布局在初始化或重新连接时检查，不逐 turn 扫表、
@@ -732,7 +729,7 @@ getter；不再为每个算子增加只包裹字段的 `OperationData` 类型。
 分类内增加任意数量的算子都不会产生注册名称冲突。
 
 一个 Operation 的 tag、payload、显式 kind、有序 port 语义以及“有序 input Schemas → binding”规则，
-逻辑数据名称、类型化 collection、codec 和适用时的 `SIZE` 共同决定持久化 schema。
+逻辑数据名称、类型化 collection 和 codec 共同决定持久化 schema。
 derived input/output Schemas 不单独持久化；因此改变同一 tag/payload 对同一输入的绑定结果，或改变
 Schema 相关状态的 codec，仍是持久化 ABI 变化。Flow 根据声明创建实例，binding materialize 再按逻辑名
 取出；实例集合拒绝重复、缺失、错误 class 或未消费的资源。当前仍是开发期 v1，可以直接调整
@@ -753,11 +750,11 @@ happy-path 单测都不能替代这些答案。
   跨 `Commit` 重放的不变量；维护关系状态时另行定义 weight、负前缀、overflow 与 zero cleanup。
 - **Schema**：定义有序 exact inputs 到唯一 output 的纯映射，覆盖每一种合法但不兼容输入的结构化
   拒绝，以及 output/input 运行期 Schema drift 的整 turn 回滚。
-- **持久化**：分配唯一 tag，冻结 canonical payload/golden/truncation；声明完整逻辑 data 名、collection、
-  codec 与 `Small`/`Large`，证明 build/open/reopen 的精确资源布局。开发期破坏性变更直接更新当前
+- **持久化**：分配唯一 tag，冻结 canonical payload/golden/truncation；声明完整逻辑 data 名、collection
+  与 codec，证明 build/open/reopen 的精确资源布局。开发期破坏性变更直接更新当前
   基线，删除旧数据库并重建，不留旧 API、旧版专用 decoder、资源名兼容分支或旧库行为测试。
 - **turn 协议与事务**：明确 `Turn::Idle`、prepared `Action::{Idle, Commit, Complete}` 与可选
-  `AfterCommit`，证明 Operation state、output、cursor、active 和 reclaim 全旧或全新；错误、背压、
+  `AfterCommit`，证明 Operation state、output、Subscription acknowledgement 和多输入 active 全旧或全新；错误、背压、
   commit 失败和 reopen 都不能多应用或跳过输入，提交前任何路径不得运行 completion。
 - **内存与类型**：声明哪些列/diff 共享 buffer、哪些 kernel 分配；新增 Arrow 类型同步覆盖 Change
   validation、full/projected IPC、标准 reader、malformed 与相关表达式/算子。
@@ -788,7 +785,7 @@ direct-copy、`SchemaAlign` 精确 cast/nullability 和 Filter 组合比较都�
 `encode → decode → re-encode → bind → materialize → turn`，再断言 buffer、diff 与行序；这不扩大为
 其他 temporal/decimal 运算承诺。关系 Sink 另外覆盖 Definition/state/hash golden、全部当前 v1
 类型（含 Date32、全部 Timestamp 单位/timezone 与 Decimal128）及嵌套值、列边界与标识符、1024 批边界、
-multiplicity/ID 预检、主键重复与其他完整性错误的区分，以及 `SQLite` 已提交但 MDBX
+multiplicity/ID 预检、主键重复与其他完整性错误的区分，以及 `SQLite` 已提交但 Store
 transaction 丢失后的初始化、insert、delete 和整批 reopen 重放。`PostgresSink` 的离线公共证据覆盖
 tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state Cell、Schema/spec 拒绝，以及
 首 turn rollback 或丢弃 completion 不连接目标；真实批量读写与 crash recovery witness 由显式脚本所有。完整目录所有权、

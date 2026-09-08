@@ -15,7 +15,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{Cell, Store, StoreError, SubscribedLog};
 
 use super::support::{read_published_definition, rewrite_checksum};
 
@@ -241,30 +241,33 @@ fn select_and_repeated_input_union_run_across_reopen() {
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let _select_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let select_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
-    let union_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000002/state").unwrap();
-    let union_output: AppendLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
+    let select_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let union_active: Cell<u32> = store.open_data("station/00000002/active-input").unwrap();
+    let union_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
     let count: Cell<u64> = store
         .open_data("station/00000003/operation/running_event_count.count")
         .unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    assert!(matches!(
+        store.open_data::<Cell<u32>>("station/00000001/active-input"),
+        Err(StoreError::DataNotFound(name)) if name == "station/00000001/active-input"
+    ));
+    let transaction = store.read_transaction();
     let access = transaction.access();
-    assert_eq!(count.access(access).unwrap().get().unwrap(), Some(2));
-    assert_eq!(
-        select_output.access(access).unwrap().bounds().unwrap(),
-        1..1
-    );
-    assert_eq!(union_output.access(access).unwrap().bounds().unwrap(), 2..2);
-    let state = union_state.access(access).unwrap();
-    for input in 0..2_u32 {
-        let key = format!("input/{input:08x}/cursor").into_bytes();
-        let cursor = state.get(&key).unwrap().unwrap();
-        assert_eq!(u64::from_be_bytes(cursor.try_into().unwrap()), 1);
+    assert_eq!(count.read(access).unwrap().get().unwrap(), Some(2));
+    assert_eq!(union_active.read(access).unwrap().get().unwrap(), Some(0));
+    let select_status = select_output.writer().status(access).unwrap();
+    assert_eq!((select_status.head, select_status.tail), (1, 1));
+    for subscriber in 0..2 {
+        let status = select_output
+            .subscription(subscriber)
+            .status(access)
+            .unwrap();
+        assert_eq!((status.position, status.tail), (1, 1));
     }
+    let union_status = union_output.writer().status(access).unwrap();
+    assert_eq!((union_status.head, union_status.tail), (2, 2));
+    let count_input = union_output.subscription(0).status(access).unwrap();
+    assert_eq!((count_input.position, count_input.tail), (2, 2));
 }
 
 #[test]
@@ -346,7 +349,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
         .open_data("station/00000006/operation/running_event_count.count")
         .unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         count.access(transaction.access()).unwrap().get().unwrap(),
         Some(3)
@@ -386,18 +389,25 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let _project_state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
-    let _project_output: AppendLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let project_output: SubscribedLog<Vec<u8>> =
+        store.open_data("station/00000001/output").unwrap();
     let count: Cell<u64> = store
         .open_data("station/00000002/operation/running_event_count.count")
         .unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    assert!(matches!(
+        store.open_data::<Cell<u32>>("station/00000001/active-input"),
+        Err(StoreError::DataNotFound(name)) if name == "station/00000001/active-input"
+    ));
+    let transaction = store.read_transaction();
     assert_eq!(
-        count.access(transaction.access()).unwrap().get().unwrap(),
+        count.read(transaction.access()).unwrap().get().unwrap(),
         Some(1)
     );
+    let project_output = project_output
+        .writer()
+        .status(transaction.access())
+        .unwrap();
+    assert_eq!((project_output.head, project_output.tail), (1, 1));
 }
 
 fn assert_project_field_rejection(error: &FlowSchemaError) {
@@ -465,7 +475,7 @@ fn replace_published_definition(path: &std::path::Path, definition: &[u8]) {
     let store = Store::open(path).unwrap();
     let published: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     published
         .access(transaction.access())
         .unwrap()

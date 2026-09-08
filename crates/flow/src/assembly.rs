@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 
-use dogpaddle_store::ReadOnly;
-
 use crate::{
     build::FlowDefinition,
     flow::RuntimeTopology,
-    station::{ConsumerCursor, Station, StationParts},
+    station::{Station, StationParts},
 };
 
 pub(crate) struct AssembledFlow {
@@ -15,6 +13,8 @@ pub(crate) struct AssembledFlow {
 
 pub(crate) struct ResolvedTopology {
     inputs_by_station: Vec<Vec<usize>>,
+    subscriptions_by_station: Vec<Vec<u64>>,
+    subscriber_counts: Vec<u64>,
     schedule: Vec<usize>,
 }
 
@@ -40,9 +40,27 @@ pub(crate) fn resolve_topology(definition: &FlowDefinition) -> ResolvedTopology 
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut subscriber_counts = vec![0_u64; inputs_by_station.len()];
+    let subscriptions_by_station = inputs_by_station
+        .iter()
+        .map(|inputs| {
+            inputs
+                .iter()
+                .map(|producer| {
+                    let subscriber = subscriber_counts[*producer];
+                    subscriber_counts[*producer] = subscriber
+                        .checked_add(1)
+                        .expect("a materialized Flow cannot contain u64::MAX edges");
+                    subscriber
+                })
+                .collect()
+        })
+        .collect();
     let schedule = topological_schedule(&inputs_by_station);
     ResolvedTopology {
         inputs_by_station,
+        subscriptions_by_station,
+        subscriber_counts,
         schedule,
     }
 }
@@ -55,6 +73,10 @@ impl ResolvedTopology {
     pub(crate) fn schedule(&self) -> &[usize] {
         &self.schedule
     }
+
+    pub(crate) fn subscriber_count(&self, station: usize) -> u64 {
+        self.subscriber_counts[station]
+    }
 }
 
 pub(crate) fn assemble_stations(
@@ -63,43 +85,39 @@ pub(crate) fn assemble_stations(
 ) -> AssembledFlow {
     let ResolvedTopology {
         inputs_by_station,
+        subscriptions_by_station,
+        subscriber_counts: _,
         schedule,
     } = topology;
-    let mut consumers = std::iter::repeat_with(Vec::new)
-        .take(parts.len())
-        .collect::<Vec<_>>();
-    let mut consumer_slots = inputs_by_station
+    let subscriptions = inputs_by_station
         .iter()
-        .map(|inputs| Vec::with_capacity(inputs.len()))
+        .zip(&subscriptions_by_station)
+        .map(|(inputs, subscribers)| {
+            inputs
+                .iter()
+                .zip(subscribers)
+                .map(|(producer, subscriber)| parts[*producer].subscription(*subscriber))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
-    for (station, inputs) in inputs_by_station.iter().enumerate() {
-        for (port, input) in inputs.iter().copied().enumerate() {
-            consumer_slots[station].push(consumers[input].len());
-            consumers[input].push(ConsumerCursor::new(
-                ReadOnly::new(parts[station].state().clone()),
-                port,
-            ));
-        }
-    }
 
-    let outputs = consumers
-        .into_iter()
-        .enumerate()
-        .map(|(station, consumers)| parts[station].prepare_output(consumers))
+    let outputs = parts
+        .iter_mut()
+        .map(StationParts::prepare_output)
         .collect::<Vec<_>>();
     let inputs = inputs_by_station
         .iter()
-        .zip(consumer_slots)
-        .map(|(inputs, slots)| {
+        .zip(subscriptions)
+        .map(|(inputs, subscriptions)| {
             inputs
                 .iter()
                 .copied()
-                .zip(slots)
-                .map(|(input, slot)| {
+                .zip(subscriptions)
+                .map(|(input, subscription)| {
                     outputs[input]
                         .as_ref()
                         .expect("validated input Station must produce output")
-                        .port(slot)
+                        .port(subscription)
                 })
                 .collect::<Vec<_>>()
         })

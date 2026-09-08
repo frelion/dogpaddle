@@ -9,7 +9,7 @@ pub enum AdvanceOutcome {
     Idle,
     /// No Station committed progress, but at least one output was rejected by its capacity.
     Backpressured,
-    /// At least one Operation, durable input pin, or inline reclaim committed progress.
+    /// At least one Operation, durable input pin, or input completion committed progress.
     Progressed,
 }
 
@@ -29,9 +29,9 @@ impl Flow {
     /// Every Station receives at most one turn. An input Station's committed
     /// output is therefore visible to its consumers later in the same
     /// round, while an unbounded Scan cannot monopolize the call. Completing
-    /// an input advances its consumer frontier and, when all consumers have
-    /// completed the physical head, reclaims that one entry in the same
-    /// transaction. Backpressure never short-circuits the remaining schedule.
+    /// an input acknowledges its exact Subscription offset; Store atomically
+    /// advances that position and updates log retention accounting.
+    /// Backpressure never short-circuits the remaining schedule.
     /// Outcomes aggregate as `Progressed > Backpressured > Idle`.
     /// Selecting a non-active input durably pins that port before its Operation
     /// turn. That pin counts as progress even if the Operation is idle; a later

@@ -1,6 +1,10 @@
-use std::{cell::Cell as PoisonFlag, marker::PhantomData, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell as PoisonFlag, collections::BTreeMap, marker::PhantomData, rc::Rc, sync::Arc,
+};
 
-use libmdbx::{Database, NoWriteMap, RO, RW, Transaction as MdbxTransaction};
+use rocksdb::{
+    OptimisticTransactionDB as Database, SnapshotWithThreadMode, Transaction as RocksTransaction,
+};
 
 mod data;
 mod database;
@@ -9,29 +13,22 @@ mod transaction;
 pub(crate) use data::{DataAccess, ReadDataAccess, TransactionRef};
 pub use data::{ScanDirection, ScanLimit};
 
-// These two types are nominally `pub` so the sealed StoreData supertrait can
-// mention them. This module is private and the crate root reexports them only
-// as `pub(crate)`, so neither type is part of the external API.
-/// Physical placement of one logical data namespace.
+/// Persistent kind of one typed data namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DataPlacement {
-    /// Share the main B+Tree with other small data namespaces.
-    Shared,
-    /// Own a dedicated MDBX named table for large data.
-    Dedicated,
-}
-
-#[derive(Clone, Copy)]
-enum DataLocation {
-    Shared(u32),
-    Dedicated(u32),
+pub enum DataKind {
+    Cell,
+    OrderedMap,
+    OrderedMultiset,
+    PartitionedMultiset,
+    Queue,
+    SubscribedLog,
 }
 
 /// Locates one data object in a particular [`Store`].
 #[derive(Clone)]
 pub struct DataHandle {
     store_token: u64,
-    location: DataLocation,
+    data_id: u32,
 }
 
 /// Owns one durable store during named data object setup.
@@ -40,8 +37,10 @@ pub struct DataHandle {
 /// read-only snapshot with [`Store::read_transaction`]. Entering runtime still
 /// consumes this value with [`Store::into_transactions`].
 pub struct Store {
-    database: Database<NoWriteMap>,
+    database: Database,
     token: u64,
+    catalog: BTreeMap<String, (u32, DataKind)>,
+    next_data_id: u64,
 }
 
 /// Uniquely owns the runtime capability to begin Store write transactions.
@@ -52,8 +51,8 @@ pub struct Store {
 /// owner of transaction boundaries for this Store. It can be moved between
 /// threads while idle. Its owner may consume it with [`Transactions::split`]
 /// to derive read-only capabilities; a borrower cannot perform that split.
-/// Those read-only capabilities may keep the same Store environment open after
-/// this value is dropped.
+/// Those read-only capabilities may keep the same Store open after this value
+/// is dropped.
 ///
 /// ```compile_fail
 /// fn require_clone<T: Clone>() {}
@@ -65,19 +64,19 @@ pub struct Store {
 /// require_send::<dogpaddle_store::Transactions>();
 /// ```
 pub struct Transactions {
-    database: Arc<Database<NoWriteMap>>,
+    database: Arc<Database>,
     store_token: u64,
 }
 
 /// A shareable runtime capability for beginning read-only Store transactions.
 ///
 /// This capability is created by consuming [`Transactions`] with
-/// [`Transactions::split`] and shares the same MDBX environment without
-/// carrying write authority. Shared references may begin independent
-/// snapshots, including while the unique write capability remains alive. The
-/// value is intentionally not cloneable, so a borrower cannot retain
-/// transaction-start authority. It does not expose the Store catalog or allow
-/// data objects to be created or opened.
+/// [`Transactions::split`] and shares the same database without carrying
+/// write authority. Shared references may begin independent snapshots,
+/// including while the unique write capability remains alive. The value is
+/// intentionally not cloneable, so a borrower cannot retain transaction-start
+/// authority. It does not expose the Store catalog or allow data objects to be
+/// created or opened.
 ///
 /// ```compile_fail
 /// fn require_clone<T: Clone>() {}
@@ -91,7 +90,7 @@ pub struct Transactions {
 /// require_sync::<dogpaddle_store::ReadTransactions>();
 /// ```
 pub struct ReadTransactions {
-    database: Arc<Database<NoWriteMap>>,
+    database: Arc<Database>,
     store_token: u64,
 }
 
@@ -111,7 +110,7 @@ pub struct ReadTransactions {
 /// ```
 #[must_use = "dropping a transaction rolls back its changes"]
 pub struct Transaction<'database> {
-    mdbx: MdbxTransaction<'database, RW, NoWriteMap>,
+    inner: RocksTransaction<'database, Database>,
     store_token: u64,
     poisoned: PoisonFlag<bool>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -142,7 +141,7 @@ pub struct Transaction<'database> {
 /// ```
 #[must_use = "dropping a read transaction releases its snapshot"]
 pub struct ReadTransaction<'database> {
-    mdbx: MdbxTransaction<'database, RO, NoWriteMap>,
+    snapshot: SnapshotWithThreadMode<'database, Database>,
     store_token: u64,
     poisoned: PoisonFlag<bool>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -150,11 +149,10 @@ pub struct ReadTransaction<'database> {
 
 /// Borrows one active transaction only for typed data access.
 ///
-/// This capability can bind existing full or [`crate::ReadOnly`] collection
-/// handles to the transaction, but cannot begin or commit a transaction or
-/// access the Store catalog. The collection handle determines which methods
-/// the resulting access exposes. Copying this capability only copies a shared
-/// borrow; transaction ownership and commit authority remain unique.
+/// This capability binds typed collection handles to the transaction, but
+/// cannot begin or commit a transaction or access the Store catalog. Copying
+/// it only copies a shared borrow; transaction ownership and commit authority
+/// remain unique.
 ///
 /// ```compile_fail
 /// fn commit(access: dogpaddle_store::TransactionAccess<'_>) {
@@ -217,8 +215,4 @@ pub struct TransactionAccess<'transaction> {
 #[derive(Clone, Copy)]
 pub struct ReadTransactionAccess<'transaction> {
     transaction: &'transaction ReadTransaction<'transaction>,
-}
-
-fn dedicated_table_name(table_id: u32) -> String {
-    format!("d/{table_id:08x}")
 }

@@ -1,102 +1,39 @@
 use std::{hint::black_box, time::Duration};
 
-use dogpaddle_store::{
-    CodecError, OrderedMap, ScanDirection, ScanLimit, StoreData, StoreError, Transactions,
-};
+use dogpaddle_store::{CodecError, ScanDirection, ScanLimit, StoreError};
 
 use crate::{
     RANDOM_SEED, STATION_KEYS, VALUE_BYTES,
-    fixture::{ByteMap, Fixture, ScanFixture, StationFixture, TypedMap},
-    oracle::{
-        assert_station_map, expected_scan_checksum, expected_station_first_bytes,
-        read_station_cursor,
-    },
-    support::BenchRoot,
+    fixture::{MapFixture, StationFixture},
 };
 
-pub(super) fn measure_byte_map_bulk_put<SIZE>(bench_root: &BenchRoot, entries: usize) -> Duration
-where
-    ByteMap<SIZE>: StoreData,
-    TypedMap<SIZE>: StoreData,
-{
-    let mut fixture = Fixture::<SIZE>::empty(bench_root);
-    let value = vec![0x5a; VALUE_BYTES];
-    let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin byte map write transaction");
-    {
-        let mut bytes = fixture
-            .bytes
-            .access(transaction.access())
-            .expect("access byte map");
-        for key in 0..entries {
-            bytes
-                .put(&(key as u64).to_be_bytes().to_vec(), &value)
-                .expect("write byte map benchmark item");
-        }
-    }
-    transaction
-        .commit()
-        .expect("commit byte map benchmark writes");
-    let elapsed = started.elapsed();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin byte map write validation transaction");
-    let bytes = fixture
-        .bytes
-        .access(transaction.access())
-        .expect("access byte map for write validation");
-    let first = 0_u64.to_be_bytes().to_vec();
-    let last = u64::try_from(entries - 1)
-        .expect("entry count fits u64")
-        .to_be_bytes()
-        .to_vec();
-    assert_eq!(
-        bytes.get(&first).unwrap().as_deref(),
-        Some(value.as_slice())
-    );
-    assert_eq!(bytes.get(&last).unwrap().as_deref(), Some(value.as_slice()));
-    transaction
-        .commit()
-        .expect("finish byte map write validation transaction");
-    elapsed
+#[derive(Clone, Copy)]
+pub(super) enum EntryRead {
+    Owned,
+    Projected,
 }
 
-pub(super) fn measure_bulk_put<SIZE>(bench_root: &BenchRoot, entries: usize) -> Duration
-where
-    ByteMap<SIZE>: StoreData,
-    TypedMap<SIZE>: StoreData,
-{
-    let mut fixture = Fixture::<SIZE>::empty(bench_root);
+pub(super) fn measure_bulk_put(fixture: &mut MapFixture, entries: usize) -> Duration {
     let value = vec![0x5a; VALUE_BYTES];
     let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin write transaction");
+    let transaction = fixture.writes.begin();
     {
         let mut map = fixture
             .map
             .access(transaction.access())
-            .expect("access write map");
-        for key in 0..entries {
-            map.put(&(key as u64), &value)
-                .expect("write benchmark item");
+            .expect("access bulk-put map");
+        for key in 0..u64::try_from(entries).expect("entry count fits u64") {
+            map.put(&key, &value).expect("write benchmark entry");
         }
     }
-    transaction.commit().expect("commit benchmark writes");
+    transaction.commit().expect("commit bulk put");
     let elapsed = started.elapsed();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin map write validation transaction");
+
+    let snapshot = fixture.reads.begin();
     let map = fixture
         .map
-        .access(transaction.access())
-        .expect("access map for write validation");
+        .read(snapshot.access())
+        .expect("read bulk-put map");
     assert_eq!(map.get(&0).unwrap().as_deref(), Some(value.as_slice()));
     assert_eq!(
         map.get(&u64::try_from(entries - 1).expect("entry count fits u64"))
@@ -104,263 +41,83 @@ where
             .as_deref(),
         Some(value.as_slice())
     );
-    transaction
-        .commit()
-        .expect("finish map write validation transaction");
     elapsed
 }
 
-pub(super) fn measure_point_get<SIZE>(fixture: &mut Fixture<SIZE>, entries: usize) -> Duration {
+pub(super) fn measure_point_get(fixture: &MapFixture, operations: usize) -> Duration {
     let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin read transaction");
-    let map = fixture
-        .map
-        .access(transaction.access())
-        .expect("access read map");
-    let mut state = RANDOM_SEED;
-    let mut checksum = 0_usize;
-    for _ in 0..entries {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let key = state % entries as u64;
-        let value = map.get(&key).expect("read benchmark item").unwrap();
-        checksum = checksum.wrapping_add(usize::from(value[0]));
-    }
+    let checksum = {
+        let snapshot = fixture.reads.begin();
+        let map = fixture
+            .map
+            .read(snapshot.access())
+            .expect("read point-get map");
+        let key_count = u64::try_from(operations).expect("operation count fits u64");
+        let mut state = RANDOM_SEED;
+        let mut checksum = 0_usize;
+        for _ in 0..operations {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let value = map
+                .get(&(state % key_count))
+                .expect("read benchmark entry")
+                .expect("seeded benchmark entry");
+            checksum = checksum.wrapping_add(usize::from(value[0]));
+        }
+        checksum
+    };
     black_box(checksum);
-    transaction.commit().expect("finish read transaction");
     let elapsed = started.elapsed();
-    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
+    assert_eq!(checksum, operations.checked_mul(0x5a).unwrap());
     elapsed
 }
 
-pub(super) fn measure_byte_map_point_get<SIZE>(
-    fixture: &mut Fixture<SIZE>,
+pub(super) fn measure_scan(
+    fixture: &MapFixture,
     entries: usize,
-) -> Duration {
-    let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin byte map read transaction");
-    let bytes = fixture
-        .bytes
-        .access(transaction.access())
-        .expect("access byte map");
-    let mut state = RANDOM_SEED;
-    let mut checksum = 0_usize;
-    for _ in 0..entries {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let key = (state % entries as u64).to_be_bytes().to_vec();
-        let value = bytes.get(&key).expect("read byte map item").unwrap();
-        checksum = checksum.wrapping_add(usize::from(value[0]));
-    }
-    black_box(checksum);
-    transaction
-        .commit()
-        .expect("finish byte map read transaction");
-    let elapsed = started.elapsed();
-    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
-    elapsed
-}
-
-pub(super) fn measure_byte_map_scan<SIZE>(
-    fixture: &mut Fixture<SIZE>,
-    entries: usize,
-    scan_items: usize,
-    scan_bytes: usize,
     direction: ScanDirection,
+    limit: ScanLimit,
+    read: EntryRead,
 ) -> Duration {
     let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin byte map scan transaction");
-    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
-    let bytes = fixture
-        .bytes
-        .access(transaction.access())
-        .expect("access byte map scan");
-    let mut continuation = None;
-    let mut count = 0_usize;
-    let mut checksum = 0_usize;
-    loop {
-        let next = bytes
-            .scan(.., direction, continuation.as_ref(), limit, |entry| {
-                let (_, value) = entry.decode_owned()?;
-                count += 1;
-                checksum = checksum.wrapping_add(usize::from(value[0]));
-                Ok::<(), StoreError>(())
-            })
-            .expect("scan byte map benchmark page");
-        if let Some(next) = next {
-            continuation = Some(next);
-        } else {
-            break;
-        }
-    }
-    black_box(checksum);
-    transaction
-        .commit()
-        .expect("finish byte map scan transaction");
-    let elapsed = started.elapsed();
-    assert_eq!(count, entries);
-    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
-    elapsed
-}
-
-pub(super) fn measure_scan<SIZE>(
-    fixture: &mut Fixture<SIZE>,
-    entries: usize,
-    scan_items: usize,
-    scan_bytes: usize,
-    direction: ScanDirection,
-) -> Duration {
-    let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin scan transaction");
-    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
-    let mut count = 0_usize;
-    let mut checksum = 0_usize;
-    let map = fixture
-        .map
-        .access(transaction.access())
-        .expect("access scan map");
-    let mut continuation = None;
-    loop {
-        let next = map
-            .scan(.., direction, continuation.as_ref(), limit, |entry| {
-                let (_, value) = entry.decode_owned()?;
-                count += 1;
-                checksum = checksum.wrapping_add(usize::from(value[0]));
-                Ok::<(), StoreError>(())
-            })
-            .expect("scan benchmark page");
-        if let Some(next) = next {
-            continuation = Some(next);
-        } else {
-            break;
-        }
-    }
-    black_box(checksum);
-    transaction.commit().expect("finish scan transaction");
-    let elapsed = started.elapsed();
-    assert_eq!(count, entries);
-    assert_eq!(checksum, entries.checked_mul(0x5a).unwrap());
-    elapsed
-}
-
-pub(super) fn measure_primitive_scan<SIZE>(
-    fixture: &mut ScanFixture<u64, SIZE>,
-    entries: usize,
-    scan_items: usize,
-    scan_bytes: usize,
-) -> Duration {
-    let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin primitive scan transaction");
-    let map = fixture
-        .map
-        .access(transaction.access())
-        .expect("access primitive scan map");
-    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
-    let mut continuation = None;
-    let mut count = 0_usize;
-    let mut checksum = 0_u64;
-    loop {
-        let next = map
-            .scan(
-                ..,
-                ScanDirection::Ascending,
-                continuation.as_ref(),
-                limit,
-                |entry| {
-                    let (key, value) = entry.decode_owned()?;
-                    count += 1;
-                    checksum = checksum.wrapping_add(key ^ value);
-                    Ok::<(), StoreError>(())
-                },
-            )
-            .expect("scan primitive benchmark page");
-        if let Some(next) = next {
-            continuation = Some(next);
-        } else {
-            break;
-        }
-    }
-    black_box(checksum);
-    transaction
-        .commit()
-        .expect("finish primitive scan transaction");
-    let elapsed = started.elapsed();
-    assert_eq!(count, entries);
-    assert_eq!(checksum, expected_scan_checksum(entries, 0x5a));
-    elapsed
-}
-
-pub(super) fn measure_vec_scan<SIZE>(
-    transactions: &mut Transactions,
-    map: &OrderedMap<u64, Vec<u8>, SIZE>,
-    entries: usize,
-    scan_items: usize,
-    scan_bytes: usize,
-    project: bool,
-) -> Duration {
-    let started = std::time::Instant::now();
-    let transaction = transactions.begin().expect("begin vector scan transaction");
-    let map = map
-        .access(transaction.access())
-        .expect("access vector scan map");
-    let limit = ScanLimit::new(scan_items, scan_bytes).unwrap();
-    let mut continuation = None;
-    let mut count = 0_usize;
-    let mut checksum = 0_u64;
-    loop {
-        let next = map
-            .scan(
-                ..,
-                ScanDirection::Ascending,
-                continuation.as_ref(),
-                limit,
-                |entry| {
-                    let value = if project {
-                        entry.project(project_vec_checksum)?
-                    } else {
-                        let (key, value) = entry.decode_owned()?;
-                        key ^ u64::from(value[0])
+    let (count, checksum) = {
+        let snapshot = fixture.reads.begin();
+        let map = fixture.map.read(snapshot.access()).expect("read scan map");
+        let mut continuation = None;
+        let mut count = 0_usize;
+        let mut checksum = 0_u64;
+        loop {
+            let next = map
+                .scan(.., direction, continuation.as_ref(), limit, |entry| {
+                    let value = match read {
+                        EntryRead::Owned => {
+                            let (key, value) = entry.decode_owned()?;
+                            key ^ u64::from(value[0])
+                        }
+                        EntryRead::Projected => entry.project(project_checksum)?,
                     };
                     count += 1;
                     checksum = checksum.wrapping_add(value);
                     Ok::<(), StoreError>(())
-                },
-            )
-            .expect("scan wide benchmark page");
-        if let Some(next) = next {
-            continuation = Some(next);
-        } else {
-            break;
+                })
+                .expect("scan benchmark page");
+            if let Some(next) = next {
+                continuation = Some(next);
+            } else {
+                break;
+            }
         }
-    }
+        (count, checksum)
+    };
     black_box(checksum);
-    transaction
-        .commit()
-        .expect("finish vector scan transaction");
     let elapsed = started.elapsed();
     assert_eq!(count, entries);
-    assert_eq!(checksum, expected_scan_checksum(entries, 0x5a));
+    assert_eq!(checksum, expected_scan_checksum(entries));
     elapsed
 }
 
-fn project_vec_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
+fn project_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
     let key = u64::from_be_bytes(
         key.try_into()
             .map_err(|_| CodecError::new("invalid benchmark key"))?,
@@ -368,148 +125,152 @@ fn project_vec_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
     Ok(key ^ u64::from(value[0]))
 }
 
-pub(super) fn measure_station_steps<SIZE>(
-    fixture: &mut StationFixture<SIZE>,
+fn expected_scan_checksum(entries: usize) -> u64 {
+    (0..entries).fold(0_u64, |checksum, key| {
+        checksum
+            .wrapping_add(u64::try_from(key).expect("benchmark key fits u64") ^ u64::from(0x5a_u8))
+    })
+}
+
+pub(super) fn measure_station_steps(
+    fixture: &mut StationFixture,
     steps: usize,
     operations_per_step: usize,
-) -> Duration
-where
-    TypedMap<SIZE>: StoreData,
-{
-    let operations_per_step_u64 =
-        u64::try_from(operations_per_step).expect("station batch size fits in u64");
-    let station_keys = u64::try_from(STATION_KEYS).expect("station key count fits in u64");
-    let initial_cursor = read_station_cursor(fixture);
-    let expected_first_bytes =
-        expected_station_first_bytes(initial_cursor, steps, operations_per_step_u64, station_keys);
+) -> Duration {
+    let operations_per_step =
+        u64::try_from(operations_per_step).expect("station batch size fits u64");
+    let station_keys = u64::try_from(STATION_KEYS).expect("station key count fits u64");
+    let initial_step = read_station_step(fixture);
+    let expected = expected_station_values(initial_step, steps, operations_per_step, station_keys);
+
     let started = std::time::Instant::now();
     for _ in 0..steps {
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin station transaction");
-        let cursor = fixture
-            .cursor
+        let transaction = fixture.writes.begin();
+        let step = fixture
+            .step
             .access(transaction.access())
-            .expect("access station cursor")
+            .expect("access station step")
             .get()
-            .expect("read station cursor")
-            .expect("seeded station cursor");
+            .expect("read station step")
+            .expect("seeded station step");
         {
             let mut map = fixture
                 .map
                 .access(transaction.access())
                 .expect("access station map");
-            for offset in 0..operations_per_step_u64 {
-                let key = cursor
-                    .wrapping_mul(operations_per_step_u64)
-                    .wrapping_add(offset)
-                    % station_keys;
+            for offset in 0..operations_per_step {
+                let key =
+                    step.wrapping_mul(operations_per_step).wrapping_add(offset) % station_keys;
                 let mut value = map
                     .get(&key)
-                    .expect("read station item")
-                    .expect("seeded station item");
+                    .expect("read station entry")
+                    .expect("seeded station entry");
                 value[0] = value[0].wrapping_add(1);
-                map.put(&key, &value).expect("write station item");
+                map.put(&key, &value).expect("write station entry");
             }
         }
         fixture
-            .cursor
+            .step
             .access(transaction.access())
-            .expect("access station cursor")
-            .set(&cursor.wrapping_add(1))
-            .expect("advance station cursor");
-        transaction.commit().expect("commit station transaction");
+            .expect("access station step")
+            .set(&step.wrapping_add(1))
+            .expect("advance station step");
+        transaction.commit().expect("commit station step");
     }
     let elapsed = started.elapsed();
+
     assert_eq!(
-        read_station_cursor(fixture),
-        initial_cursor.wrapping_add(u64::try_from(steps).expect("step count fits u64"))
+        read_station_step(fixture),
+        initial_step.wrapping_add(u64::try_from(steps).expect("step count fits u64"))
     );
-    assert_station_map(fixture, &expected_first_bytes);
+    assert_station_map(fixture, &expected);
     elapsed
 }
 
-pub(super) fn measure_hot_overwrite_rollback<SIZE>(
-    fixture: &mut Fixture<SIZE>,
-    entries: usize,
-) -> Duration {
-    let value = vec![0xa5; VALUE_BYTES];
-    let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin overwrite transaction");
-    {
-        let mut map = fixture
-            .map
-            .access(transaction.access())
-            .expect("access overwrite map");
-        for key in 0..entries {
-            map.put(&(key as u64), &value)
-                .expect("overwrite benchmark item");
+fn read_station_step(fixture: &StationFixture) -> u64 {
+    let snapshot = fixture.reads.begin();
+    fixture
+        .step
+        .read(snapshot.access())
+        .expect("read station step")
+        .get()
+        .expect("decode station step")
+        .expect("seeded station step")
+}
+
+fn expected_station_values(
+    initial_step: u64,
+    steps: usize,
+    operations_per_step: u64,
+    station_keys: u64,
+) -> Vec<u8> {
+    let mut expected = vec![0x5a_u8; STATION_KEYS];
+    for step in 0..steps {
+        let step = initial_step.wrapping_add(u64::try_from(step).expect("station step fits u64"));
+        for offset in 0..operations_per_step {
+            let key = step.wrapping_mul(operations_per_step).wrapping_add(offset) % station_keys;
+            let key = usize::try_from(key).expect("station key fits usize");
+            expected[key] = expected[key].wrapping_add(1);
         }
     }
-    drop(transaction);
-    let elapsed = started.elapsed();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin rollback validation transaction");
-    let value = fixture
-        .map
-        .access(transaction.access())
-        .expect("access map for rollback validation")
-        .get(&0)
-        .expect("read rollback validation value")
-        .expect("seeded rollback validation value");
-    assert_eq!(value[0], 0x5a);
-    transaction
-        .commit()
-        .expect("finish rollback validation transaction");
-    elapsed
+    expected
 }
 
-pub(super) fn measure_single_put_commits<SIZE>(
-    fixture: &mut Fixture<SIZE>,
-    commits: usize,
-) -> Duration {
-    let started = std::time::Instant::now();
+fn assert_station_map(fixture: &StationFixture, expected: &[u8]) {
+    let snapshot = fixture.reads.begin();
+    let map = fixture
+        .map
+        .read(snapshot.access())
+        .expect("read station map");
+    for (key, expected_first) in expected
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, expected_first)| *expected_first != 0x5a)
+    {
+        let value = map
+            .get(&u64::try_from(key).expect("station key fits u64"))
+            .expect("read station entry")
+            .expect("seeded station entry");
+        assert_eq!(value.len(), VALUE_BYTES);
+        assert_eq!(value[0], expected_first);
+        assert!(value[1..].iter().all(|byte| *byte == 0x5a));
+    }
+}
+
+pub(super) fn measure_single_put_commits(fixture: &mut MapFixture, commits: usize) -> Duration {
     let mut encoded = vec![0x5a; VALUE_BYTES];
+    let started = std::time::Instant::now();
     for value in 0..commits {
-        encoded[..std::mem::size_of::<u64>()].copy_from_slice(&(value as u64).to_be_bytes());
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin single-put transaction");
+        encoded[..size_of::<u64>()].copy_from_slice(
+            &u64::try_from(value)
+                .expect("commit ordinal fits u64")
+                .to_be_bytes(),
+        );
+        let transaction = fixture.writes.begin();
         fixture
             .map
             .access(transaction.access())
-            .expect("access single-put map")
+            .expect("access hot map")
             .put(&0, &encoded)
-            .expect("write single-put value");
-        transaction.commit().expect("commit single-put transaction");
+            .expect("overwrite hot entry");
+        transaction.commit().expect("commit hot overwrite");
     }
     let elapsed = started.elapsed();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin durable overwrite validation transaction");
+
+    let snapshot = fixture.reads.begin();
     let actual = fixture
         .map
-        .access(transaction.access())
-        .expect("access durable overwrite validation map")
+        .read(snapshot.access())
+        .expect("read hot map")
         .get(&0)
-        .expect("read durable overwrite validation value")
-        .expect("durable overwrite value exists");
+        .expect("read hot entry")
+        .expect("hot entry exists");
     assert_eq!(
         &actual[..size_of::<u64>()],
         &u64::try_from(commits - 1)
             .expect("commit count fits u64")
             .to_be_bytes()
     );
-    transaction
-        .commit()
-        .expect("finish durable overwrite validation transaction");
     elapsed
 }

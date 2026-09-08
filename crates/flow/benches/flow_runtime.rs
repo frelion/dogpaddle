@@ -14,7 +14,7 @@ use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{Cell, Store, SubscribedLog, SubscribedLogWriter, Subscription};
 use serde_json::{Value, json};
 
 const BENCHMARK: &str = "flow_runtime";
@@ -66,8 +66,8 @@ struct DurableOracle {
     completed_advances: u64,
     expected_scan_position: Option<u64>,
     scan_position: Option<u64>,
-    expected_input_cursor: u64,
-    input_cursors: Vec<u64>,
+    expected_input_position: u64,
+    input_positions: Vec<u64>,
     expected_count_state: Option<u64>,
     count_states: Vec<Option<u64>>,
     expected_capacity_output_bounds: Option<[u64; 2]>,
@@ -76,9 +76,9 @@ struct DurableOracle {
 
 struct OracleResources {
     position: Cell<u64>,
-    input_states: Vec<OrderedMap<Vec<u8>, Vec<u8>, Small>>,
+    input_subscriptions: Vec<Subscription<Vec<u8>>>,
     count_states: Vec<Cell<u64>>,
-    capacity_output: Option<AppendLog<Vec<u8>>>,
+    capacity_output: Option<SubscribedLogWriter<Vec<u8>>>,
 }
 
 struct TraceRun {
@@ -132,13 +132,23 @@ impl OracleResources {
         let position = store
             .open_data("station/00000000/operation/sequence_scan.position")
             .expect("open scan position to validate runtime work counts");
-        let input_states = (1..scenario.station_count())
-            .map(|index| {
-                store
-                    .open_data(&format!("station/{index:08x}/state"))
-                    .expect("open Station state to validate runtime work counts")
-            })
-            .collect();
+        let input_subscriptions = match scenario {
+            Scenario::Sink | Scenario::CapacityPressure => {
+                vec![open_subscription(store, 0, 0)]
+            }
+            Scenario::Chain { station_count } => (0..station_count - 1)
+                .map(|producer| open_subscription(store, producer, 0))
+                .collect(),
+            Scenario::Fanout { consumers } => (0..consumers)
+                .map(|subscriber| {
+                    open_subscription(
+                        store,
+                        0,
+                        u64::try_from(subscriber).expect("fan-out subscriber index fits u64"),
+                    )
+                })
+                .collect(),
+        };
         let count_states = match scenario {
             Scenario::Chain { station_count } => (1..station_count - 1)
                 .map(|index| {
@@ -152,17 +162,25 @@ impl OracleResources {
             Scenario::Sink | Scenario::CapacityPressure | Scenario::Fanout { .. } => Vec::new(),
         };
         let capacity_output = scenario.is_capacity_pressure().then(|| {
-            store
+            let output: SubscribedLog<Vec<u8>> = store
                 .open_data("station/00000000/output")
-                .expect("open scan output to validate capacity backlog")
+                .expect("open scan output to validate capacity backlog");
+            output.writer()
         });
         Self {
             position,
-            input_states,
+            input_subscriptions,
             count_states,
             capacity_output,
         }
     }
+}
+
+fn open_subscription(store: &Store, producer: usize, subscriber: u64) -> Subscription<Vec<u8>> {
+    let output: SubscribedLog<Vec<u8>> = store
+        .open_data(&format!("station/{producer:08x}/output"))
+        .expect("open producer output to validate input progress");
+    output.subscription(subscriber)
 }
 
 impl DurableOracle {
@@ -177,9 +195,9 @@ impl DurableOracle {
         );
         self.scan_position == self.expected_scan_position
             && self
-                .input_cursors
+                .input_positions
                 .iter()
-                .all(|cursor| *cursor == self.expected_input_cursor)
+                .all(|position| *position == self.expected_input_position)
             && counts_match
             && self.capacity_output_bounds == self.expected_capacity_output_bounds
     }
@@ -291,7 +309,7 @@ impl TraceRun {
         run.emit(&json!({
             "record": "context",
             "benchmark": BENCHMARK,
-            "protocol": "flow_runtime_advance_trace_v1",
+            "protocol": "flow_runtime_advance_trace_v2",
             "profile": profile,
             "result_directory": run.root.path().display().to_string(),
             "host": host,
@@ -349,7 +367,7 @@ impl TraceRun {
             "completed_advances": oracle.completed_advances,
             "expected": {
                 "scan_position": oracle.expected_scan_position,
-                "input_cursor": oracle.expected_input_cursor,
+                "input_position": oracle.expected_input_position,
                 "count_state": oracle.expected_count_state,
                 "capacity_output_bounds": oracle.expected_capacity_output_bounds,
                 "advances": work.advances,
@@ -359,7 +377,7 @@ impl TraceRun {
             "actual": {
                 "scan_position": oracle.scan_position,
                 "input_station_indices": input_station_indices,
-                "input_cursors": oracle.input_cursors,
+                "input_positions": oracle.input_positions,
                 "count_station_indices": count_station_indices,
                 "count_states": oracle.count_states,
                 "capacity_output_bounds": oracle.capacity_output_bounds,
@@ -481,27 +499,34 @@ fn capacity_backlog_entries(config: &Config) -> usize {
 
 fn seed_capacity_backlog(path: &Path, entries: usize) {
     let change = encoded_fixture_change();
-    let values = std::iter::repeat_n(change, entries).collect::<Vec<_>>();
     let store = Store::open(path).expect("open Flow Store to seed capacity backlog");
-    let output: AppendLog<Vec<u8>> = store
+    let output: SubscribedLog<Vec<u8>> = store
         .open_data("station/00000000/output")
         .expect("open scan output to seed capacity backlog");
-    let mut transactions = store.into_transactions();
-    let transaction = transactions
-        .begin()
-        .expect("begin capacity backlog seed transaction");
-    let offsets = output
-        .access(transaction.access())
-        .expect("access scan output to seed capacity backlog")
-        .append_batch(&values)
-        .expect("seed scan output capacity backlog");
-    assert_eq!(
-        offsets,
-        0..u64::try_from(entries).expect("backlog fits u64")
-    );
+    let writer = output.writer();
+    let (mut transactions, reads) = store.into_transactions().split();
+    let transaction = transactions.begin();
+    for _ in 0..entries {
+        assert!(
+            writer
+                .try_append(&change, NonZeroU64::MAX, transaction.access())
+                .expect("seed scan output capacity backlog")
+        );
+    }
     transaction
         .commit()
         .expect("commit capacity backlog seed transaction");
+    let transaction = reads.begin();
+    let status = writer
+        .status(transaction.access())
+        .expect("read seeded scan output backlog");
+    assert_eq!(
+        (status.head, status.tail),
+        (
+            0,
+            u64::try_from(entries).expect("capacity backlog entry count fits u64")
+        )
+    );
 }
 
 fn encoded_fixture_change() -> Vec<u8> {
@@ -526,13 +551,10 @@ fn validate_durable_work(
         u64::try_from(completed_rounds).expect("Flow runtime completed round count fits u64");
     let store = Store::open(path).expect("open Flow Store to validate runtime work counts");
     let resources = OracleResources::open(&store, scenario);
-    let mut transactions = store.into_transactions();
-    let transaction = transactions
-        .begin()
-        .expect("begin runtime work-count validation transaction");
+    let transaction = store.read_transaction();
     let scan_position = resources
         .position
-        .access(transaction.access())
+        .read(transaction.access())
         .expect("access scan position to validate runtime work counts")
         .get()
         .expect("read scan position to validate runtime work counts");
@@ -549,34 +571,28 @@ fn validate_durable_work(
         scan_position, expected_position,
         "durable scan position must match committed scan turns"
     );
-    let cursor_key = b"input/00000000/cursor".to_vec();
-    let input_cursors = resources
-        .input_states
+    let input_positions = resources
+        .input_subscriptions
         .iter()
-        .map(|state| {
-            let encoded = state
-                .access(transaction.access())
-                .expect("access Station state to validate runtime input completions")
-                .get(&cursor_key)
-                .expect("read Station cursor to validate runtime input completions")
-                .expect("runtime input Station has a durable cursor");
-            let bytes = <[u8; size_of::<u64>()]>::try_from(encoded.as_slice())
-                .expect("runtime input cursor is a big-endian u64");
-            u64::from_be_bytes(bytes)
+        .map(|subscription| {
+            subscription
+                .status(transaction.access())
+                .expect("read durable input subscription position")
+                .position
         })
         .collect::<Vec<_>>();
     assert!(
-        input_cursors
+        input_positions
             .iter()
-            .all(|cursor| *cursor == completed_rounds),
-        "every durable cursor must match input completions"
+            .all(|position| *position == completed_rounds),
+        "every durable subscription position must match input completions"
     );
     let count_values = resources
         .count_states
         .iter()
         .map(|count| {
             count
-                .access(transaction.access())
+                .read(transaction.access())
                 .expect("access RunningEventCount state to validate committed turns")
                 .get()
                 .expect("read RunningEventCount state to validate committed turns")
@@ -589,12 +605,10 @@ fn validate_durable_work(
         "every durable RunningEventCount state must match committed turns"
     );
     let capacity_output_bounds = resources.capacity_output.map(|output| {
-        let bounds = output
-            .access(transaction.access())
-            .expect("access scan output to validate capacity backlog")
-            .bounds()
+        let status = output
+            .status(transaction.access())
             .expect("read scan output bounds to validate capacity backlog");
-        [bounds.start, bounds.end]
+        [status.head, status.tail]
     });
     let expected_capacity_output_bounds = scenario.is_capacity_pressure().then(|| {
         let tail = completed_rounds
@@ -610,8 +624,8 @@ fn validate_durable_work(
         completed_advances: completed_rounds,
         expected_scan_position: expected_position,
         scan_position,
-        expected_input_cursor: completed_rounds,
-        input_cursors,
+        expected_input_position: completed_rounds,
+        input_positions,
         expected_count_state: matches!(scenario, Scenario::Chain { .. })
             .then_some(completed_rounds),
         count_states: count_values,
@@ -739,18 +753,18 @@ fn configuration(config: &Config) -> Value {
         "input_retaining_commit_unavailable_reason":
             "sealed_definition_set_has_no_input_operation_that_returns_commit",
         "input_completion_unit":
-            "durable_input_cursor_frontier_advance_fanout_counts_each_edge",
+            "durable_subscription_position_advance_fanout_counts_each_edge",
         "committed_station_turn_unit":
-            "outer_station_transaction_committed_after_action_pin_and_reclaim_are_not_additional_turns",
+            "outer_station_transaction_committed_after_action_and_subscription_acknowledgement",
         "round_latency_scope": "one_complete_flow_advance_call",
         "raw_round_latencies": "one_advance_record_per_sampled_call",
         "raw_outcomes": "one_advance_record_per_sampled_call",
         "durable_oracle": "one_full_actual_and_expected_record_per_scenario",
-        "measurement_protocol": "owner_local_advance_trace_v1",
+        "measurement_protocol": "owner_local_advance_trace_v2",
         "fixtures": "built_once_outside_timing",
         "validation": "outside_timing",
         "execution": "single_thread",
-        "mdbx_sync_mode": "durable",
+        "rocksdb_wal_sync": true,
     })
 }
 

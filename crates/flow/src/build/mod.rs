@@ -8,7 +8,7 @@ use std::{
 use dogpaddle_operation::{
     DataInstances, MaterializeError, OperationBinding, OperationDefinition, RuntimeResource,
 };
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 use crate::{
     assembly::{assemble_stations, resolve_topology},
@@ -189,9 +189,9 @@ impl FlowFactory {
             .collect::<Result<Vec<_>, _>>()?;
         let (mut transactions, reads) = store.into_transactions().split();
         {
-            let transaction = transactions.begin()?;
-            for station in &station_parts {
-                station.initialize_input_state(transaction.access())?;
+            let transaction = transactions.begin();
+            for (index, station) in station_parts.iter().enumerate() {
+                station.initialize(topology.subscriber_count(index), transaction.access())?;
             }
             let mut published = published.access(transaction.access())?;
             published.set(&definition_bytes)?;
@@ -261,8 +261,9 @@ fn create_station_part(
     binding: OperationBinding,
     resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
-    let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.create_data(&codec::station_state_name(index))?;
+    let active = (station.inputs().len() > 1)
+        .then(|| store.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
+        .transpose()?;
     let definition = station.operation();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
@@ -273,7 +274,7 @@ fn create_station_part(
     let operation = binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => store
-            .create_data::<AppendLog<Vec<u8>>>(&codec::station_output_name(index))
+            .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
             .map(|log| Some((log, capacity, schema)))?,
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => {
@@ -281,7 +282,7 @@ fn create_station_part(
         }
     };
     Ok(StationParts::new(
-        state,
+        active,
         operation,
         definition.kind(),
         output,

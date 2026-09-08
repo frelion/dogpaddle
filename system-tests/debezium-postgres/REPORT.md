@@ -119,7 +119,7 @@ passed through the product API. The opaque connector-bound checkpoint plus the
 retained record payload form the recovery witness exercised here; D1 does not
 name either one a durable delivery identity. The minimum replay identity, if
 one is needed at all, remains a D3 fault-matrix decision rather than an
-`AppendLog` offset or a PostgreSQL-specific LSN exposed to Rust.
+a Store subscription offset or a PostgreSQL-specific LSN exposed to Rust.
 
 ## The ACK/LSN distinction
 
@@ -179,7 +179,7 @@ offset-store properties.
 ## Remaining boundaries
 
 D1 remains a focused fixture, not a production Scan Operation. Its durable
-file is only a crash-safe stand-in for the D3 MDBX transaction. It does not yet
+file is only a crash-safe stand-in for the D3 Store transaction. It does not yet
 prove Flow backpressure integration, Arrow `Change` mapping, snapshots, schema
 evolution, transaction framing, auxiliary schema-history state, or a second
 connector.
@@ -208,6 +208,6 @@ exclude only source-record processing timestamps and Debezium's run-id header;
 the checkpoint itself must remain byte-identical for the same offset state.
 
 The next milestone is D3: persist each delivery payload and candidate
-checkpoint atomically in MDBX, then call `Delivery::ack()` only after that
+checkpoint atomically in Store, then call `Delivery::ack()` only after that
 transaction commits. D3 should reuse this runtime as-is rather than introduce
 another Debezium or PostgreSQL-specific process boundary.

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use libmdbx::{Database, NoWriteMap, RW, Transaction as MdbxTransaction};
+use rocksdb::{
+    OptimisticTransactionDB as Database, OptimisticTransactionOptions,
+    Transaction as RocksTransaction, WriteOptions,
+};
 
 use super::{
     DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, Transaction,
@@ -18,17 +21,13 @@ impl Store {
     /// write or commit authority.
     ///
     /// ```compile_fail
-    /// use dogpaddle_store::{ReadTransaction, Store, StoreError};
+    /// use dogpaddle_store::{ReadTransaction, Store};
     ///
-    /// fn export_snapshot(store: &Store) -> Result<ReadTransaction<'static>, StoreError> {
+    /// fn export_snapshot(store: &Store) -> ReadTransaction<'static> {
     ///     store.read_transaction()
     /// }
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when MDBX cannot begin the read-only transaction.
-    pub fn read_transaction(&self) -> Result<ReadTransaction<'_>, StoreError> {
+    pub fn read_transaction(&self) -> ReadTransaction<'_> {
         begin_read_transaction(&self.database, self.token)
     }
 }
@@ -37,10 +36,9 @@ impl Transactions {
     /// Splits this owned capability into write and read-only capabilities.
     ///
     /// This consumes `self` and returns the same unique write capability
-    /// alongside a read-only capability over the same MDBX environment. A
-    /// caller that only borrows [`Transactions`] therefore cannot export a
-    /// transaction-start capability. The full owner may deliberately split
-    /// again after recovering the write capability from the returned pair.
+    /// alongside a read-only capability over the same database. A caller that
+    /// only borrows [`Transactions`] therefore cannot export a
+    /// transaction-start capability.
     ///
     /// ```compile_fail,E0507
     /// use dogpaddle_store::Transactions;
@@ -64,33 +62,23 @@ impl Transactions {
     /// While that guard remains live, another transaction cannot be started
     /// through it. Because [`Transactions`] is not cloneable, its owner is the
     /// sole coordinator of transaction boundaries for this Store.
-    /// Intentionally leaking the guard also leaks the underlying write
-    /// transaction and is outside the normal RAII lifecycle.
     ///
     /// ```compile_fail
-    /// use dogpaddle_store::{StoreError, Transactions};
+    /// use dogpaddle_store::Transactions;
     ///
-    /// fn begin_twice(transactions: &mut Transactions) -> Result<(), StoreError> {
-    ///     let first = transactions.begin()?;
-    ///     let second = transactions.begin()?;
+    /// fn begin_twice(transactions: &mut Transactions) {
+    ///     let first = transactions.begin();
+    ///     let second = transactions.begin();
     ///     drop((first, second));
-    ///     Ok(())
     /// }
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when MDBX cannot begin the write transaction.
-    pub fn begin(&mut self) -> Result<Transaction<'_>, StoreError> {
-        Ok(Transaction {
-            mdbx: self
-                .database
-                .begin_rw_txn()
-                .map_err(|error| StoreError::storage("begin transaction", error))?,
+    pub fn begin(&mut self) -> Transaction<'_> {
+        Transaction {
+            inner: begin_write_transaction(&self.database),
             store_token: self.store_token,
             poisoned: std::cell::Cell::new(false),
             _thread_bound: std::marker::PhantomData,
-        })
+        }
     }
 }
 
@@ -101,35 +89,22 @@ impl ReadTransactions {
     /// borrowers and the unique [`Transactions`] capability may remain active
     /// at the same time. The returned transaction contains no commit or write
     /// authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when MDBX cannot begin the read-only transaction.
-    pub fn begin(&self) -> Result<ReadTransaction<'_>, StoreError> {
+    pub fn begin(&self) -> ReadTransaction<'_> {
         begin_read_transaction(&self.database, self.store_token)
     }
 }
 
-fn begin_read_transaction(
-    database: &Database<NoWriteMap>,
-    store_token: u64,
-) -> Result<ReadTransaction<'_>, StoreError> {
-    Ok(ReadTransaction {
-        mdbx: database
-            .begin_ro_txn()
-            .map_err(|error| StoreError::storage("begin read transaction", error))?,
+fn begin_read_transaction(database: &Database, store_token: u64) -> ReadTransaction<'_> {
+    ReadTransaction {
+        snapshot: database.snapshot(),
         store_token,
         poisoned: std::cell::Cell::new(false),
         _thread_bound: std::marker::PhantomData,
-    })
+    }
 }
 
 impl Transaction<'_> {
     /// Borrows this transaction as a typed data-access capability.
-    ///
-    /// The returned value may be passed to existing [`crate::Cell`],
-    /// [`crate::OrderedMap`], and [`crate::AppendLog`] objects. It cannot
-    /// commit the transaction or create, open, or enumerate data objects.
     #[must_use]
     pub fn access(&self) -> TransactionAccess<'_> {
         TransactionAccess { transaction: self }
@@ -137,20 +112,18 @@ impl Transaction<'_> {
 
     /// Atomically commits all changes and consumes the transaction.
     ///
-    /// A successful return makes every change visible together. An error
-    /// means the transaction was aborted and none of its changes became
-    /// visible; callers never need to account for a partially committed write
-    /// transaction.
-    ///
     /// # Errors
     ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot commit it.
+    /// Returns an error when the transaction is poisoned or `RocksDB` cannot
+    /// commit it.
     pub fn commit(self) -> Result<(), StoreError> {
-        let Self { mdbx, poisoned, .. } = self;
+        let Self {
+            inner, poisoned, ..
+        } = self;
         if poisoned.get() {
             return Err(StoreError::TransactionPoisoned);
         }
-        commit_mdbx(mdbx)
+        commit_transaction(inner)
     }
 
     pub(super) fn record_result<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
@@ -189,9 +162,6 @@ impl Transaction<'_> {
 
 impl ReadTransaction<'_> {
     /// Borrows this snapshot as a typed read-only data-access capability.
-    ///
-    /// The returned value may be passed only to collection `read` methods. It
-    /// cannot write, commit, or escape this snapshot's lifetime.
     #[must_use]
     pub fn access(&self) -> ReadTransactionAccess<'_> {
         ReadTransactionAccess { transaction: self }
@@ -243,15 +213,24 @@ impl<'transaction> ReadTransactionAccess<'transaction> {
     }
 }
 
-pub(super) fn commit_mdbx(
-    transaction: MdbxTransaction<'_, RW, NoWriteMap>,
+pub(super) fn begin_write_transaction(database: &Database) -> RocksTransaction<'_, Database> {
+    let write_options = durable_write_options();
+    let mut transaction_options = OptimisticTransactionOptions::default();
+    transaction_options.set_snapshot(true);
+    database.transaction_opt(&write_options, &transaction_options)
+}
+
+pub(super) fn durable_write_options() -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.set_sync(true);
+    options.disable_wal(false);
+    options
+}
+
+pub(super) fn commit_transaction(
+    transaction: RocksTransaction<'_, Database>,
 ) -> Result<(), StoreError> {
-    match transaction.commit() {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(StoreError::storage(
-            "commit transaction",
-            "MDBX aborted a transaction marked with a prior error",
-        )),
-        Err(error) => Err(StoreError::storage("commit transaction", error)),
-    }
+    transaction
+        .commit()
+        .map_err(|error| StoreError::storage("commit transaction", error))
 }

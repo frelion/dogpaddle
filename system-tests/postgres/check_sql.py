@@ -400,7 +400,7 @@ class Gate:
             response = host.advance()
             if response["outcome"] != "Idle":
                 return False
-            if response["sink"]["cursor"] != response["sink"]["tail"]:
+            if response["sink"]["position"] != response["sink"]["tail"]:
                 raise RuntimeError("idle SQL sink still has an input backlog")
             return True
 
@@ -605,7 +605,7 @@ class Gate:
                 sink = response["sink"]
                 if (
                     response["outcome"] != "Progressed"
-                    or sink["cursor"] >= sink["tail"]
+                    or sink["position"] >= sink["tail"]
                 ):
                     raise RuntimeError(
                         "deletion was not observed at the Prepared crash point"
@@ -625,8 +625,8 @@ class Gate:
                 raise RuntimeError("PostgreSQL did not log the target deletion")
             self.capture("deleted")
             self.record_target_deletes()
-            # PostgreSQL has committed the delete, while the durable Sink cursor
-            # still points at the same input. Kill before its settlement turn.
+            # PostgreSQL has committed the delete, while the durable input
+            # Subscription still points at the same Change. Kill before settlement.
             host.kill()
 
         until("killed SQL host releases its slot", lambda: not self.slot_active())
@@ -636,7 +636,7 @@ class Gate:
             replay = host.advance()
             if (
                 replay["outcome"] != "Progressed"
-                or replay["sink"]["cursor"] >= replay["sink"]["tail"]
+                or replay["sink"]["position"] >= replay["sink"]["tail"]
                 or self.rows() != crashed_rows
                 or self.technical_ids() != crashed_ids
             ):

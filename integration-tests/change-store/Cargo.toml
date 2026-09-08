@@ -35,7 +35,7 @@ path = "tests/correctness.rs"
 workspace = true
 
 [[bench]]
-name = "change_append_log"
-path = "benches/change_append_log.rs"
+name = "change_subscribed_log"
+path = "benches/change_subscribed_log.rs"
 harness = false
 test = true

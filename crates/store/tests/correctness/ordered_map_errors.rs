@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use dogpaddle_store::{
-    CodecError, ScanDirection, ScanLimit, Small, Store, StoreError, StoreKey, StoreValue,
+    CodecError, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreValue,
 };
 
 use crate::support::{create_map, store_path};
@@ -35,11 +35,11 @@ impl StoreValue for BrokenKey {
 fn key_codec_errors_poison_the_transaction() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let safe = create_map::<u64, u64, Small>(&mut store, "safe").unwrap();
-    let broken = create_map::<BrokenKey, BrokenKey, Small>(&mut store, "broken").unwrap();
+    let safe = create_map::<u64, u64>(&mut store, "safe").unwrap();
+    let broken = create_map::<BrokenKey, BrokenKey>(&mut store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     safe.access(transaction.access())
         .unwrap()
         .put(&1, &1)
@@ -53,7 +53,7 @@ fn key_codec_errors_poison_the_transaction() {
         Err(StoreError::TransactionPoisoned)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         safe.access(transaction.access()).unwrap().get(&1).unwrap(),
         None
@@ -76,18 +76,18 @@ impl From<StoreError> for VisitError {
 fn visitor_errors_poison_and_roll_back_prior_store_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let source = create_map::<u64, u64, Small>(&mut store, "source").unwrap();
-    let output = create_map::<u64, u64, Small>(&mut store, "output").unwrap();
+    let source = create_map::<u64, u64>(&mut store, "source").unwrap();
+    let output = create_map::<u64, u64>(&mut store, "output").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut source = source.access(transaction.access()).unwrap();
         source.put(&1, &10).unwrap();
         source.put(&2, &20).unwrap();
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let source = source.access(transaction.access()).unwrap();
     let mut output_access = output.access(transaction.access()).unwrap();
     let result = source.scan(
@@ -110,7 +110,7 @@ fn visitor_errors_poison_and_roll_back_prior_store_writes() {
         Err(StoreError::TransactionPoisoned)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         output
             .access(transaction.access())
@@ -130,20 +130,20 @@ fn visitor_errors_poison_and_roll_back_prior_store_writes() {
 }
 
 #[test]
-fn swallowed_full_decode_errors_poison_clean_and_dirty_scans() {
+fn swallowed_full_decode_errors_poison_persisted_and_new_entries() {
     assert_swallowed_full_decode_error_poisons(false);
     assert_swallowed_full_decode_error_poisons(true);
 }
 
-fn assert_swallowed_full_decode_error_poisons(dirty: bool) {
+fn assert_swallowed_full_decode_error_poisons(write_in_scan_transaction: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_map::<u64, Vec<u8>, Small>(&mut store, "map").unwrap();
-    let typed = open_map::<u64, u64, Small>(&store, "map").unwrap();
+    let raw = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+    let typed = open_map::<u64, u64>(&store, "map").unwrap();
     let mut transactions = store.into_transactions();
 
-    if !dirty {
-        let transaction = transactions.begin().unwrap();
+    if !write_in_scan_transaction {
+        let transaction = transactions.begin();
         raw.access(transaction.access())
             .unwrap()
             .put(&1, &vec![0])
@@ -151,8 +151,8 @@ fn assert_swallowed_full_decode_error_poisons(dirty: bool) {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
-    if dirty {
+    let transaction = transactions.begin();
+    if write_in_scan_transaction {
         raw.access(transaction.access())
             .unwrap()
             .put(&1, &vec![0])
@@ -180,10 +180,10 @@ fn assert_swallowed_full_decode_error_poisons(dirty: bool) {
 fn swallowed_projection_errors_still_stop_the_scan_and_poison() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64, Small>(&mut store, "map").unwrap();
+    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         map.access(transaction.access())
             .unwrap()
             .put(&1, &1)
@@ -191,7 +191,7 @@ fn swallowed_projection_errors_still_stop_the_scan_and_poison() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     let result = access.scan(
         ..,
@@ -231,18 +231,18 @@ impl StoreKey for UndecodableKey {
 fn continuation_is_decoded_before_the_first_callback() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_map::<u64, u64, Small>(&mut store, "map").unwrap();
-    let malformed = open_map::<UndecodableKey, u64, Small>(&store, "map").unwrap();
+    let raw = create_map::<u64, u64>(&mut store, "map").unwrap();
+    let malformed = open_map::<UndecodableKey, u64>(&store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut raw = raw.access(transaction.access()).unwrap();
         raw.put(&1, &1).unwrap();
         raw.put(&2, &2).unwrap();
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = malformed.access(transaction.access()).unwrap();
     let mut visits = 0;
     let result = access.scan(

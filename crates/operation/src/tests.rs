@@ -5,7 +5,7 @@ use std::{
 };
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store};
 
 use crate::{
     DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
@@ -34,9 +34,8 @@ use crate::{
 
 const COUNT: DataName<Cell<u64>> = DataName::new("count");
 const STRING_COUNT: DataName<Cell<String>> = DataName::new("count");
-const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("count");
-const SMALL_STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Small>> = DataName::new("state");
-const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>, Large>> = DataName::new("state");
+const MAP_COUNT: DataName<OrderedMap<Vec<u8>, Vec<u8>>> = DataName::new("count");
+const STATE: DataName<OrderedMap<Vec<u8>, Vec<u8>>> = DataName::new("state");
 
 #[derive(Clone, Copy, Debug)]
 enum TestBinding {
@@ -275,7 +274,7 @@ fn data_instances_resolve_typed_objects_by_name_not_insertion_order() {
     instances.insert(count).unwrap();
 
     let _count: Cell<u64> = instances.take(&COUNT).unwrap();
-    let _state: OrderedMap<Vec<u8>, Vec<u8>, Large> = instances.take(&STATE).unwrap();
+    let _state: OrderedMap<Vec<u8>, Vec<u8>> = instances.take(&STATE).unwrap();
     instances.finish().unwrap();
 }
 
@@ -355,21 +354,4 @@ fn data_instances_reject_a_different_collection_with_the_same_layout() {
         panic!("cell unexpectedly materialized as an ordered map with the same layout");
     };
     assert_eq!(error, MaterializeError::WrongDataClass { name: "count" });
-}
-
-#[test]
-fn data_instances_reject_a_different_size_of_the_same_collection() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("store")).unwrap();
-    let state = SMALL_STATE
-        .declaration()
-        .create(&mut store, "physical-state")
-        .unwrap();
-    let mut instances = DataInstances::new();
-    instances.insert(state).unwrap();
-
-    let Err(error) = instances.take(&STATE) else {
-        panic!("small map unexpectedly materialized as the large data class");
-    };
-    assert_eq!(error, MaterializeError::WrongDataClass { name: "state" });
 }

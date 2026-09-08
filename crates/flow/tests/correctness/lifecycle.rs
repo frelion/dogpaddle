@@ -4,7 +4,7 @@ use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store};
+use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 
@@ -67,38 +67,34 @@ fn assert_completed_state(path: &Path) {
     let count: Cell<u64> = store
         .open_data("station/00000001/operation/running_event_count.count")
         .unwrap();
-    let outputs: [AppendLog<Vec<u8>>; 3] = [
+    let outputs: [SubscribedLog<Vec<u8>>; 3] = [
         store.open_data("station/00000000/output").unwrap(),
         store.open_data("station/00000001/output").unwrap(),
         store.open_data("station/00000003/output").unwrap(),
     ];
-    let fanout_states: [OrderedMap<Vec<u8>, Vec<u8>, Small>; 2] = [
-        store.open_data("station/00000004/state").unwrap(),
-        store.open_data("station/00000005/state").unwrap(),
-    ];
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = store.read_transaction();
     let access = transaction.access();
     assert_eq!(
-        positions.map(|position| position.access(access).unwrap().get().unwrap()),
+        positions.map(|position| position.read(access).unwrap().get().unwrap()),
         [Some(u64::MAX), Some(u64::MAX)]
     );
-    assert_eq!(count.access(access).unwrap().get().unwrap(), Some(2));
-    for (output, bounds) in outputs.iter().zip([2..2, 2..2, 1..1]) {
-        let output = output.access(access).unwrap();
+    assert_eq!(count.read(access).unwrap().get().unwrap(), Some(2));
+    for (output, position) in outputs.iter().zip([2, 2, 1]) {
+        let output = output.writer().status(access).unwrap();
         assert_eq!(
-            (output.bounds().unwrap(), output.retained_bytes().unwrap()),
-            (bounds, 0)
+            (output.head, output.tail, output.retained_bytes),
+            (position, position, 0)
         );
     }
-    for state in fanout_states {
-        let encoded = state
-            .access(access)
-            .unwrap()
-            .get(&b"input/00000000/cursor".to_vec())
-            .unwrap()
-            .unwrap();
-        assert_eq!(u64::from_be_bytes(encoded.try_into().unwrap()), 1);
+    let expected_positions: [&[u64]; 3] = [&[2], &[2], &[1, 1]];
+    for (output, positions) in outputs.iter().zip(expected_positions) {
+        for (subscriber, &expected) in positions.iter().enumerate() {
+            let status = output
+                .subscription(u64::try_from(subscriber).unwrap())
+                .status(access)
+                .unwrap();
+            assert_eq!((status.position, status.tail), (expected, expected));
+        }
     }
 }
 

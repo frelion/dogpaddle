@@ -5,7 +5,7 @@ use dogpaddle_operation::{
     decode_definition, encode_definition,
     operation::{Action, Operation, OperationError, Turn, scan::MySqlCdcScanConfig},
 };
-use dogpaddle_store::{Cell, Store, Transactions};
+use dogpaddle_store::{Cell, Queue, Store, Transactions};
 
 use super::support::decode_hex;
 
@@ -83,6 +83,18 @@ fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
 }
 
 #[test]
+fn mysql_cdc_bootstrap_spool_is_a_queue() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("state")).unwrap();
+    let definition = definition();
+    let spool = &definition.data()[2];
+    spool.create(&mut store, spool.name()).unwrap();
+    store
+        .open_data::<Queue<Vec<u8>>>("mysql_cdc_scan.bootstrap_spool")
+        .unwrap();
+}
+
+#[test]
 fn mysql_cdc_materialization_requires_one_exact_runtime_resource() {
     let definition = definition();
     let binding = definition.bind(&[]).unwrap();
@@ -138,7 +150,7 @@ impl Fixture {
     }
 
     fn set_checkpoint(&mut self, bytes: &[u8]) {
-        let transaction = self.transactions.begin().unwrap();
+        let transaction = self.transactions.begin();
         self.phase
             .access(transaction.access())
             .unwrap()
@@ -156,7 +168,7 @@ impl Fixture {
         let Turn::Ready(prepared) = self.scan.turn(None)? else {
             panic!("expected prepared work");
         };
-        let transaction = self.transactions.begin()?;
+        let transaction = self.transactions.begin();
         let (action, completion) = prepared.apply(transaction.access())?;
         assert!(matches!(action, Action::Commit(None)));
         if commit {
@@ -170,7 +182,7 @@ impl Fixture {
     }
 
     fn durable_checkpoint(&mut self) -> Option<Vec<u8>> {
-        let transaction = self.transactions.begin().unwrap();
+        let transaction = self.transactions.begin();
         let checkpoint = self
             .checkpoint
             .access(transaction.access())

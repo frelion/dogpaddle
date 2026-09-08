@@ -13,32 +13,22 @@ use dogpaddle_operation::{
     OperationKind,
     operation::{
         Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
-        scan::SequenceScanDefinition, sink::DiscardDefinition,
-        transform::RunningEventCountDefinition,
     },
 };
-use dogpaddle_store::{
-    AppendLog, OrderedMap, ReadOnly, ReadTransactions, Small, Store, StoreError, Transactions,
-};
+use dogpaddle_store::{Cell, ReadTransactions, Store, StoreError, SubscribedLog, Transactions};
 
-use crate::{
-    build::FlowFactory,
-    flow::{AdvanceOutcome, Flow},
-};
+use crate::flow::AdvanceOutcome;
 
-use super::super::{
-    ACTIVE_INPUT_KEY, ConsumerCursor, Output, Station, StationParts, cursor_key,
-    decode_active_input, decode_cursor, protocol::StationError,
-};
+use super::super::{Output, Station, StationParts, protocol::StationError};
 
-pub(super) type State = OrderedMap<Vec<u8>, Vec<u8>, Small>;
-pub(super) type Log = AppendLog<Vec<u8>>;
+pub(super) type State = Cell<Vec<u8>>;
 
 pub(super) struct RuntimeFixture {
     pub(super) _root: tempfile::TempDir,
     pub(super) transactions: Transactions,
     pub(super) reads: ReadTransactions,
     pub(super) stations: Vec<Station>,
+    pub(super) states: Vec<State>,
 }
 
 impl RuntimeFixture {
@@ -50,12 +40,23 @@ impl RuntimeFixture {
         self.try_step(station).unwrap()
     }
 
-    pub(super) fn cursor(&mut self, station: usize, input: usize) -> u64 {
-        read_cursor(&self.stations[station], &mut self.transactions, input)
+    pub(super) fn position(&self, station: usize, input: usize) -> u64 {
+        let transaction = self.reads.begin();
+        self.stations[station]
+            .status("test", transaction.access())
+            .unwrap()
+            .inputs[input]
+            .position
     }
 
-    pub(super) fn bounds(&mut self, station: usize) -> std::ops::Range<u64> {
-        output_bounds(&self.stations[station], &mut self.transactions)
+    pub(super) fn bounds(&self, station: usize) -> std::ops::Range<u64> {
+        let transaction = self.reads.begin();
+        let status = self.stations[station]
+            .status("test", transaction.access())
+            .unwrap()
+            .output
+            .unwrap();
+        status.head..status.tail
     }
 }
 
@@ -64,6 +65,9 @@ pub(super) struct MultiInputFixture {
     pub(super) transactions: Transactions,
     pub(super) reads: ReadTransactions,
     pub(super) station: Station,
+    pub(super) state: State,
+    inputs: Vec<usize>,
+    output_schemas: Vec<Arc<Schema>>,
 }
 
 impl MultiInputFixture {
@@ -75,19 +79,42 @@ impl MultiInputFixture {
         self.try_step().unwrap()
     }
 
-    pub(super) fn active(&mut self) -> usize {
-        read_active(&self.station, &mut self.transactions)
+    pub(super) fn active(&self) -> usize {
+        let transaction = self.reads.begin();
+        self.station
+            .status("test", transaction.access())
+            .unwrap()
+            .active_input
+            .unwrap()
     }
 
-    pub(super) fn cursor(&mut self, input: usize) -> u64 {
-        read_cursor(&self.station, &mut self.transactions, input)
+    pub(super) fn position(&self, input: usize) -> u64 {
+        let transaction = self.reads.begin();
+        self.station
+            .status("test", transaction.access())
+            .unwrap()
+            .inputs[input]
+            .position
     }
 
-    pub(super) fn bounds(&mut self, input: usize) -> std::ops::Range<u64> {
-        output_bounds_log(
-            self.station.inbox.ports()[input].output().log(),
-            &mut self.transactions,
-        )
+    pub(super) fn bounds(&self, input: usize) -> std::ops::Range<u64> {
+        let transaction = self.reads.begin();
+        let status = self.station.inbox.ports()[input]
+            .output()
+            .status(transaction.access())
+            .unwrap();
+        status.head..status.tail
+    }
+
+    pub(super) fn append(&mut self, input: usize, change: &Change) {
+        let transaction = self.transactions.begin();
+        assert!(
+            self.station.inbox.ports()[input]
+                .output()
+                .try_append(change, transaction.access())
+                .unwrap()
+        );
+        transaction.commit().unwrap();
     }
 }
 
@@ -180,7 +207,7 @@ impl Operation for ScriptedOperation {
         let after_commit = self.after_commit.clone();
         Ok(Turn::ready(move |access| {
             if let Some((state, value)) = &write {
-                state.access(access)?.put(&b"attempt".to_vec(), value)?;
+                state.access(access)?.set(value)?;
             }
             if let Some(foreign) = &poison_with {
                 assert!(matches!(
@@ -218,31 +245,153 @@ fn repeat_action(action: &Action) -> Action {
 }
 
 pub(super) fn scan_sink(consumer_count: usize, scan_capacity: NonZeroU64) -> RuntimeFixture {
-    let root = tempfile::tempdir().unwrap();
-    let mut builder = FlowFactory::new(root.path().join("flow"));
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    builder.output_capacity_bytes(scan, scan_capacity);
-    for index in 0..consumer_count {
-        let sink = builder.station(format!("sink-{index}"), DiscardDefinition::new());
-        builder.connect([scan], sink);
+    let mut inputs = vec![Vec::new()];
+    let mut actions = vec![Action::Commit(Some(change(&[0])))];
+    let mut outputs = vec![Some((scan_capacity, value_schema()))];
+    for _ in 0..consumer_count {
+        inputs.push(vec![0]);
+        actions.push(Action::Complete(None));
+        outputs.push(None);
     }
-    fixture(root, builder.build().unwrap())
+    runtime_fixture(&inputs, outputs, actions)
 }
 
 pub(super) fn scan_count_sink(
     scan_capacity: NonZeroU64,
     count_capacity: NonZeroU64,
 ) -> RuntimeFixture {
+    runtime_fixture(
+        &[Vec::new(), vec![0], vec![1]],
+        vec![
+            Some((scan_capacity, value_schema())),
+            Some((count_capacity, count_schema())),
+            None,
+        ],
+        vec![
+            Action::Commit(Some(change(&[0]))),
+            Action::Idle,
+            Action::Complete(None),
+        ],
+    )
+}
+
+fn runtime_fixture(
+    inputs_by_station: &[Vec<usize>],
+    outputs: Vec<Option<(NonZeroU64, Arc<Schema>)>>,
+    actions: Vec<Action>,
+) -> RuntimeFixture {
+    assert_eq!(inputs_by_station.len(), outputs.len());
+    assert_eq!(inputs_by_station.len(), actions.len());
     let root = tempfile::tempdir().unwrap();
-    let mut builder = FlowFactory::new(root.path().join("flow"));
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let count = builder.station("count", RunningEventCountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, scan_capacity);
-    builder.output_capacity_bytes(count, count_capacity);
-    builder.connect([scan], count);
-    builder.connect([count], sink);
-    fixture(root, builder.build().unwrap())
+    let mut store = Store::create(root.path().join("flow")).unwrap();
+    let states = (0..inputs_by_station.len())
+        .map(|station| {
+            store
+                .create_data::<State>(&format!("script-state-{station}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut parts = inputs_by_station
+        .iter()
+        .zip(outputs)
+        .zip(actions)
+        .enumerate()
+        .map(|(station, ((inputs, output), action))| {
+            let active = (inputs.len() > 1).then(|| {
+                store
+                    .create_data::<Cell<u32>>(&format!("active-{station}"))
+                    .unwrap()
+            });
+            let output = output.map(|(capacity, schema)| {
+                let log = store
+                    .create_data::<SubscribedLog<Vec<u8>>>(&format!("output-{station}"))
+                    .unwrap();
+                (log, capacity, schema)
+            });
+            StationParts::new(
+                active,
+                Box::new(ScriptedOperation::returning(action)),
+                operation_kind(inputs.len(), output.is_some()),
+                output,
+            )
+        })
+        .collect::<Vec<_>>();
+    let subscriber_counts = subscriber_counts(inputs_by_station);
+    let (mut transactions, reads) = store.into_transactions().split();
+    let transaction = transactions.begin();
+    for (part, subscribers) in parts.iter().zip(&subscriber_counts) {
+        part.initialize(*subscribers, transaction.access()).unwrap();
+    }
+    transaction.commit().unwrap();
+    let stations = assemble(&mut parts, inputs_by_station);
+    RuntimeFixture {
+        _root: root,
+        transactions,
+        reads,
+        stations,
+        states,
+    }
+}
+
+fn operation_kind(input_count: usize, has_output: bool) -> OperationKind {
+    match (input_count, has_output) {
+        (0, true) => OperationKind::Scan,
+        (0, false) => panic!("an input-free test Station must have output"),
+        (input_count, true) => {
+            OperationKind::Transform(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap())
+        }
+        (input_count, false) => {
+            OperationKind::Sink(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap())
+        }
+    }
+}
+
+fn subscriber_counts(inputs_by_station: &[Vec<usize>]) -> Vec<u64> {
+    let mut counts = vec![0_u64; inputs_by_station.len()];
+    for producer in inputs_by_station.iter().flatten() {
+        counts[*producer] += 1;
+    }
+    counts
+}
+
+fn assemble(parts: &mut Vec<StationParts>, inputs_by_station: &[Vec<usize>]) -> Vec<Station> {
+    let mut next_subscriber = vec![0_u64; parts.len()];
+    let subscriptions = inputs_by_station
+        .iter()
+        .map(|inputs| {
+            inputs
+                .iter()
+                .map(|producer| {
+                    let subscriber = next_subscriber[*producer];
+                    next_subscriber[*producer] += 1;
+                    parts[*producer].subscription(subscriber)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let outputs = parts
+        .iter_mut()
+        .map(StationParts::prepare_output)
+        .collect::<Vec<_>>();
+    let inputs = inputs_by_station
+        .iter()
+        .zip(subscriptions)
+        .map(|(producers, subscriptions)| {
+            producers
+                .iter()
+                .zip(subscriptions)
+                .map(|(producer, subscription)| {
+                    outputs[*producer].as_ref().unwrap().port(subscription)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    std::mem::take(parts)
+        .into_iter()
+        .zip(inputs)
+        .zip(outputs)
+        .map(|((part, inputs), output)| part.finish(inputs, output))
+        .collect()
 }
 
 pub(super) fn multi_input_station(action: Action) -> MultiInputFixture {
@@ -254,20 +403,15 @@ pub(super) fn duplicate_input_station() -> MultiInputFixture {
 }
 
 fn raw_station(inputs: &[usize], populated: &[usize], action: Action) -> MultiInputFixture {
-    raw_station_with_change(inputs, populated, action, &change(&[7]))
-}
-
-fn raw_station_with_change(
-    inputs: &[usize],
-    populated: &[usize],
-    action: Action,
-    populated_change: &Change,
-) -> MultiInputFixture {
-    let output_count = inputs.iter().copied().max().unwrap() + 1;
-    let schemas = std::iter::repeat_with(value_schema)
-        .take(output_count)
-        .collect::<Vec<_>>();
-    raw_station_with_change_and_schemas(inputs, populated, action, populated_change, &schemas)
+    raw_station_with_change_and_schemas(
+        inputs,
+        populated,
+        action,
+        &change(&[7]),
+        &std::iter::repeat_with(value_schema)
+            .take(inputs.iter().copied().max().unwrap() + 1)
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub(super) fn raw_station_with_change_and_schemas(
@@ -281,34 +425,50 @@ pub(super) fn raw_station_with_change_and_schemas(
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
     let state = store.create_data::<State>("state").unwrap();
+    let active = (inputs.len() > 1).then(|| store.create_data::<Cell<u32>>("active").unwrap());
     let output_count = inputs.iter().copied().max().unwrap() + 1;
     assert_eq!(output_schemas.len(), output_count);
-    let outputs = (0..output_count)
+    let logs = (0..output_count)
         .map(|index| {
             store
-                .create_data::<Log>(&format!("output-{index}"))
+                .create_data::<SubscribedLog<Vec<u8>>>(&format!("output-{index}"))
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let parts = station_parts(state.clone(), inputs.len(), action);
+    let parts = station_parts(active, inputs.len(), action);
+    let subscribers = {
+        let mut counts = vec![0_u64; output_count];
+        for input in inputs {
+            counts[*input] += 1;
+        }
+        counts
+    };
     let (mut transactions, reads) = store.into_transactions().split();
-    let transaction = transactions.begin().unwrap();
-    parts.initialize_input_state(transaction.access()).unwrap();
-    let encoded = encode_change(populated_change).unwrap();
-    for input in populated {
-        outputs[*input]
-            .access(transaction.access())
-            .unwrap()
-            .append(&encoded)
+    let transaction = transactions.begin();
+    parts.initialize(0, transaction.access()).unwrap();
+    for (log, subscribers) in logs.iter().zip(&subscribers) {
+        log.initialize(NonZeroU64::new(*subscribers).unwrap(), transaction.access())
             .unwrap();
     }
+    let encoded = encode_change(populated_change).unwrap();
+    for output in populated {
+        assert!(
+            logs[*output]
+                .writer()
+                .try_append(&encoded, NonZeroU64::MAX, transaction.access())
+                .unwrap()
+        );
+    }
     transaction.commit().unwrap();
-    let station = finish_station_with_schemas(parts, &state, &outputs, inputs, output_schemas);
+    let station = finish_station(parts, &logs, inputs, output_schemas);
     MultiInputFixture {
         _root: root,
         transactions,
         reads,
         station,
+        state,
+        inputs: inputs.to_vec(),
+        output_schemas: output_schemas.to_vec(),
     }
 }
 
@@ -318,90 +478,86 @@ pub(super) fn reopen_multi_input(fixture: MultiInputFixture, action: Action) -> 
         transactions,
         reads,
         station,
+        state: _,
+        inputs,
+        output_schemas,
     } = fixture;
     let path = root.path().join("flow");
     drop((transactions, reads, station));
     let store = Store::open(&path).unwrap();
     let state = store.open_data::<State>("state").unwrap();
-    let outputs = (0..2)
-        .map(|index| store.open_data::<Log>(&format!("output-{index}")).unwrap())
+    let active = (inputs.len() > 1).then(|| store.open_data::<Cell<u32>>("active").unwrap());
+    let logs = (0..output_schemas.len())
+        .map(|index| {
+            store
+                .open_data::<SubscribedLog<Vec<u8>>>(&format!("output-{index}"))
+                .unwrap()
+        })
         .collect::<Vec<_>>();
-    let station = finish_station(
-        station_parts(state.clone(), 2, action),
-        &state,
-        &outputs,
-        &[0, 1],
-    );
+    let subscribers = {
+        let mut counts = vec![0_u64; logs.len()];
+        for input in &inputs {
+            counts[*input] += 1;
+        }
+        counts
+    };
+    let parts = station_parts(active, inputs.len(), action);
+    let transaction = store.read_transaction();
+    parts.validate(0, transaction.access()).unwrap();
+    for (log, subscribers) in logs.iter().zip(&subscribers) {
+        log.validate(NonZeroU64::new(*subscribers).unwrap(), transaction.access())
+            .unwrap();
+    }
+    drop(transaction);
+    let station = finish_station(parts, &logs, &inputs, &output_schemas);
     let (transactions, reads) = store.into_transactions().split();
     MultiInputFixture {
         _root: root,
         transactions,
         reads,
         station,
+        state,
+        inputs,
+        output_schemas,
     }
 }
 
-fn station_parts(state: State, input_count: usize, action: Action) -> StationParts {
+fn station_parts(active: Option<Cell<u32>>, input_count: usize, action: Action) -> StationParts {
     StationParts::new(
-        state,
+        active,
         Box::new(ScriptedOperation::returning(action)),
         OperationKind::Sink(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap()),
         None,
     )
 }
 
-fn finish_station(parts: StationParts, state: &State, logs: &[Log], inputs: &[usize]) -> Station {
-    let schemas = std::iter::repeat_with(value_schema)
-        .take(logs.len())
-        .collect::<Vec<_>>();
-    finish_station_with_schemas(parts, state, logs, inputs, &schemas)
-}
-
-fn finish_station_with_schemas(
+fn finish_station(
     parts: StationParts,
-    state: &State,
-    logs: &[Log],
+    logs: &[SubscribedLog<Vec<u8>>],
     inputs: &[usize],
     output_schemas: &[Arc<Schema>],
 ) -> Station {
-    assert_eq!(output_schemas.len(), logs.len());
     let outputs = logs
         .iter()
-        .enumerate()
-        .map(|(input, log)| {
+        .zip(output_schemas)
+        .map(|(log, schema)| {
             Arc::new(Output::new(
-                log.clone(),
+                log.writer(),
                 NonZeroU64::MAX,
-                Arc::clone(&output_schemas[input]),
-                inputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| **candidate == input)
-                    .map(|(input, _)| ConsumerCursor::new(ReadOnly::new(state.clone()), input))
-                    .collect(),
+                Arc::clone(schema),
             ))
         })
         .collect::<Vec<_>>();
-    let mut slots = vec![0; outputs.len()];
+    let mut next_subscriber = vec![0_u64; outputs.len()];
     let input_ports = inputs
         .iter()
         .map(|input| {
-            let port = outputs[*input].port(slots[*input]);
-            slots[*input] += 1;
-            port
+            let subscriber = next_subscriber[*input];
+            next_subscriber[*input] += 1;
+            outputs[*input].port(logs[*input].subscription(subscriber))
         })
         .collect();
     parts.finish(input_ports, None)
-}
-
-fn fixture(root: tempfile::TempDir, flow: Flow) -> RuntimeFixture {
-    let (transactions, reads, stations) = flow.into_runtime_parts();
-    RuntimeFixture {
-        _root: root,
-        transactions,
-        reads,
-        stations,
-    }
 }
 
 pub(super) fn set_script(station: &mut Station, state: &State, value: &[u8], action: Action) {
@@ -409,7 +565,11 @@ pub(super) fn set_script(station: &mut Station, state: &State, value: &[u8], act
 }
 
 pub(super) fn set_result(station: &mut Station, state: &State, value: &[u8], result: ScriptResult) {
-    station.operation = Box::new(ScriptedOperation::writing(state.clone(), value, result));
+    station.replace_operation(Box::new(ScriptedOperation::writing(
+        state.clone(),
+        value,
+        result,
+    )));
 }
 
 pub(super) fn poisoned_script(state: &State, value: &[u8], action: Action) -> ScriptedOperation {
@@ -420,21 +580,6 @@ pub(super) fn poisoned_script(state: &State, value: &[u8], action: Action) -> Sc
         ScriptedOperation::writing(state.clone(), value, ScriptResult::Action(action));
     operation.poison_with = Some((foreign, root));
     operation
-}
-
-pub(super) fn cursor_vectors(consumers: usize, entries: usize) -> Vec<Vec<u64>> {
-    let radix = entries + 1;
-    (0..radix.pow(u32::try_from(consumers).unwrap()))
-        .map(|mut encoded| {
-            (0..consumers)
-                .map(|_| {
-                    let cursor = u64::try_from(encoded % radix).unwrap();
-                    encoded /= radix;
-                    cursor
-                })
-                .collect()
-        })
-        .collect()
 }
 
 pub(super) fn claim_id(station: &Station) -> Option<(usize, u64)> {
@@ -452,44 +597,9 @@ pub(super) fn claim_bytes(station: &Station) -> Vec<u8> {
     encode_change(station.inbox.cached_claim().unwrap().change()).unwrap()
 }
 
-fn read_active(station: &Station, transactions: &mut Transactions) -> usize {
-    let encoded = read_state(station.inbox.state(), transactions, ACTIVE_INPUT_KEY).unwrap();
-    decode_active_input(&encoded).unwrap()
-}
-
-fn read_cursor(station: &Station, transactions: &mut Transactions, input: usize) -> u64 {
-    let encoded = read_state(station.inbox.state(), transactions, &cursor_key(input)).unwrap();
-    decode_cursor(&encoded).unwrap()
-}
-
 pub(super) fn read_attempt(state: &State, transactions: &mut Transactions) -> Option<Vec<u8>> {
-    read_state(state, transactions, b"attempt")
-}
-
-pub(super) fn read_state(
-    state: &State,
-    transactions: &mut Transactions,
-    key: &[u8],
-) -> Option<Vec<u8>> {
-    let transaction = transactions.begin().unwrap();
-    state
-        .access(transaction.access())
-        .unwrap()
-        .get(&key.to_vec())
-        .unwrap()
-}
-
-fn output_bounds(station: &Station, transactions: &mut Transactions) -> std::ops::Range<u64> {
-    output_bounds_log(station.output.as_ref().unwrap().log(), transactions)
-}
-
-fn output_bounds_log(output: &Log, transactions: &mut Transactions) -> std::ops::Range<u64> {
-    let transaction = transactions.begin().unwrap();
-    output
-        .access(transaction.access())
-        .unwrap()
-        .bounds()
-        .unwrap()
+    let transaction = transactions.begin();
+    state.access(transaction.access()).unwrap().get().unwrap()
 }
 
 pub(super) fn change(values: &[u64]) -> Change {

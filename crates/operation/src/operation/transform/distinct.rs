@@ -4,7 +4,7 @@ use arrow_array::{BooleanArray, Int64Array};
 use arrow_schema::{ArrowError, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::{StoreError, TransactionAccess};
+use dogpaddle_store::{OrderedMultiset, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -13,12 +13,12 @@ use crate::{
     definition::{DataName, Sealed as SealedDefinition},
     operation::{
         Action, Operation, OperationError, OperationInput, TransactionalOperation,
-        relation::{RowWeightError, RowWeights, apply_weight, canonical_row},
+        relation::canonical_row,
     },
 };
 
 pub(crate) const TAG: u16 = 13;
-const WEIGHTS: DataName<RowWeights> = DataName::new("distinct.weights");
+const WEIGHTS: DataName<OrderedMultiset<Vec<u8>>> = DataName::new("distinct.weights");
 const DATA: &[DataDeclaration] = &[WEIGHTS.declaration()];
 
 /// Pure definition of an exact, order-preserving distinct operation.
@@ -38,7 +38,7 @@ pub struct DistinctDefinition {
 /// does not retain its Definition or begin, commit, or store a transaction.
 pub struct DistinctOperation {
     input_schema: SchemaRef,
-    weights: RowWeights,
+    weights: OrderedMultiset<Vec<u8>>,
 }
 
 /// Distinct-specific failure during one [`DistinctOperation`] turn.
@@ -72,16 +72,6 @@ pub enum DistinctError {
     /// The selected output violates the Change invariant.
     #[error(transparent)]
     Change(#[from] ChangeError),
-}
-
-impl From<RowWeightError> for DistinctError {
-    fn from(error: RowWeightError) -> Self {
-        match error {
-            RowWeightError::Store(source) => Self::Store(source),
-            RowWeightError::Negative => Self::NegativeWeight,
-            RowWeightError::Overflow => Self::WeightOverflow,
-        }
-    }
 }
 
 #[expect(
@@ -153,9 +143,14 @@ impl TransactionalOperation for DistinctOperation {
         let mut weights = self.weights.access(access).map_err(DistinctError::Store)?;
         for row_index in 0..input.change.num_rows() {
             let row = canonical_row(input.change.records(), row_index)?;
-            let output_difference =
-                apply_weight(&mut weights, row, input.change.diffs().value(row_index))
-                    .map_err(DistinctError::from)?;
+            let change = weights
+                .adjust(&row, input.change.diffs().value(row_index))
+                .map_err(map_weight_error)?;
+            let output_difference = match (change.before(), change.after()) {
+                (0, after) if after > 0 => Some(1),
+                (before, 0) if before > 0 => Some(-1),
+                _ => None,
+            };
             if let Some(difference) = output_difference {
                 selected.push(true);
                 output_diffs.push(difference);
@@ -176,6 +171,14 @@ impl TransactionalOperation for DistinctOperation {
         let output = Change::try_new(records, Int64Array::from(output_diffs))
             .map_err(DistinctError::Change)?;
         Ok(Action::Complete(Some(output)))
+    }
+}
+
+fn map_weight_error(error: StoreError) -> DistinctError {
+    match error {
+        StoreError::MultiplicityUnderflow => DistinctError::NegativeWeight,
+        StoreError::MultiplicityOverflow => DistinctError::WeightOverflow,
+        source => DistinctError::Store(source),
     }
 }
 

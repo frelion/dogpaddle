@@ -179,7 +179,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let input = change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         state
             .access(transaction.access())
             .unwrap()
@@ -193,7 +193,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
         error.downcast_ref::<RunningEventCountError>(),
         Some(RunningEventCountError::Overflow)
     ));
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         state.access(transaction.access()).unwrap().get().unwrap(),
         Some(u64::MAX - 1)
@@ -209,7 +209,7 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let raw = store.create_data::<Cell<String>>("count").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         raw.access(transaction.access())
             .unwrap()
             .set(&persisted)
@@ -234,7 +234,7 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let store = Store::open(fixture.path()).unwrap();
     let raw = store.open_data::<Cell<String>>("count").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         raw.access(transaction.access()).unwrap().get().unwrap(),
         Some(persisted)

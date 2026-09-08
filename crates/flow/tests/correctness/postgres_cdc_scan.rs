@@ -132,44 +132,47 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     let checkpoint: dogpaddle_store::Cell<Vec<u8>> = store
         .open_data("station/00000000/operation/postgres_cdc_scan.checkpoint")
         .unwrap();
-    let spool: dogpaddle_store::AppendLog<Vec<u8>> = store
+    let spool: dogpaddle_store::Queue<Vec<u8>> = store
         .open_data("station/00000000/operation/postgres_cdc_scan.bootstrap_spool")
         .unwrap();
-    let transaction = store.read_transaction().unwrap();
-    let bytes = definition
-        .read(transaction.access())
-        .unwrap()
-        .get()
-        .unwrap()
-        .unwrap();
-    assert!(
-        !bytes
-            .windows(b"secret-not-durable".len())
-            .any(|window| window == b"secret-not-durable")
-    );
-    assert!(
-        phase
+    {
+        let transaction = store.read_transaction();
+        let bytes = definition
             .read(transaction.access())
             .unwrap()
             .get()
             .unwrap()
-            .is_none()
-    );
-    assert!(
-        checkpoint
-            .read(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+        assert!(
+            !bytes
+                .windows(b"secret-not-durable".len())
+                .any(|window| window == b"secret-not-durable")
+        );
+        assert!(
+            phase
+                .read(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            checkpoint
+                .read(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
     assert!(
         spool
-            .read(transaction.access())
-            .unwrap()
-            .bounds()
+            .access(transaction.access())
             .unwrap()
             .is_empty()
+            .unwrap()
     );
 }
 

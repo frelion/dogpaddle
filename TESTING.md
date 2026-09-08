@@ -17,9 +17,9 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 ## 证据所有权
 
 - Change 拥有 Schema、Change、Projection、Arrow IPC 字节格式、互操作、损坏拒绝和稳定事件顺序。
-- Store 拥有事务、能力边界、集合布局、分页、容量、reopen 和 crash consistency。
+- Store 拥有事务、能力边界、集合布局、分页、容量、订阅位置与安全回收、reopen 和 crash consistency。
 - Operation 拥有 Operation + Store：Definition、稳定 tag/payload、bind、materialize、运行协议、状态和算子语义。
-- Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、资源装配、调度、claim、背压、回收、fail-stop、status 和 reopen。
+- Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、subscription 装配、调度、claim、背压、fail-stop、status 和 reopen。
 - SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering 和 SQL 层 reopen。
 - Debezium 拥有 connector-neutral runtime、bundle、checkpoint、delivery 和 ACK 生命周期。
 - Change 与 Store 的外部组合只由 `integration-tests/change-store/` 证明。
@@ -38,15 +38,15 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个�
 生产 decoder registry、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 registry 反向生成期望值。
 
 Aggregate 的 owner 文件必须证明 tag `14` 与 `aggregate.groups/entries/control` 三资源、完整 Definition
-roundtrip、精确 output Schema、exact-row admission 的整 turn rollback、Fold 与 Indexed 结果变化、MIN/MAX
-当前值撤回后的 index reopen/重扫，以及不变结果不产生冗余 output。函数 descriptor、argument tuple layout
-和 collision bucket codec 属于 Operation 私有实现，不在 Flow 或 SQL 复制 oracle。
+roundtrip、精确 output Schema、exact-row admission 的整 turn rollback、Fold 结果变化、分区有序索引的
+MIN/MAX 首尾选择与 reopen，以及不变结果不产生冗余 output。函数 descriptor、argument tuple framing
+和 group state codec 属于 Operation 私有实现，不在 Flow 或 SQL 复制 oracle。
 
 ### Flow
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
-Flow 独有的 runtime、事务、背压、claim、reclaim、fail-stop 和 status 证据必须保留。
+Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。
 
 ### SQL
 
@@ -63,7 +63,7 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 
 每个源码模块目录只有一个 `tests.rs` 入口。超大模块可在同目录的 `tests/` 下按完整领域拆分；不要按每个生产源码文件建立镜像目录。当前较大的分区为：
 
-- Station：`support`、`layout`、`claim`、`transaction`、`completion`；
+- Station：`support`、`claim`、`transaction`；
 - Change codec：`support`、`schema`、`projection`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
 - SQLite Sink：`row`、`target`。
 
@@ -75,7 +75,7 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 2. decode、open 和 reopen；
 3. 不复用生产算法的语义或互操作 oracle；
 4. malformed/corruption 拒绝，无 panic、无部分写入；
-5. 精确资源名、类型、Size/codec 和失败后状态。
+5. 精确资源名、collection kind、codec 和失败后状态。
 
 持久化定义或布局变更必须同时覆盖成功构建、纯校验失败无文件副作用、不完整构建、稳定编码、资源布局和重新打开。项目不识别、迁移或兼容未发布的旧格式；旧数据库直接删除并重建。
 
@@ -97,14 +97,12 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 | `change_core` | Criterion |
 | `change_codec` | Change 自有五路旋转 runner |
 | `cell` | Criterion |
-| `ordered_map` | Store 自有 AB/BA paired runner |
-| `append_log` | Store 自有 AB/BA/BA/AB counterbalanced runner |
-| `append_log_endurance` | Store 自有 streaming runner |
+| `ordered_map` | Criterion |
 | `flow_lifecycle` | Criterion |
 | `flow_runtime` | Flow 自有逐采样 `advance` latency trace |
-| `change_append_log` | Criterion |
+| `change_subscribed_log` | Criterion |
 
-自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。配对 benchmark 不得由两个独立 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出；endurance 必须流式写出样本。
+自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
 Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode；自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
@@ -150,9 +148,8 @@ cargo test --workspace --benches --locked
 
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench change_codec
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log_endurance
 ```
 
 ## 系统验收

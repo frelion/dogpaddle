@@ -11,7 +11,7 @@
 DogPaddle 是嵌入 Rust 应用进程的持久 Dataflow 引擎。现有运行模型有几个对 CDC 至关
 重要的约束：
 
-- `Flow` 唯一持有 MDBX 写事务启动能力；
+- `Flow` 唯一持有 Store 写事务启动能力；
 - Station 只在一次调用期间借用读写能力；
 - `Operation::turn` 可因 `Idle`、错误、output 背压或外层 commit 失败而重放；
 - Scan 与其他 Operation 使用同一 `turn`，只以 `None` 表示零输入；
@@ -26,7 +26,7 @@ offset 与故障恢复，会同时承担 connector 协议和 Dataflow 事务两�
 
 - 保留 DogPaddle 的 Rust 嵌入式产品模型；
 - 复用上游 Debezium connector，不自维护 CDC 引擎 fork；
-- 保持 MDBX 事务、背压和 reopen 语义；
+- 保持 Store 事务、背压和 reopen 语义；
 - 不把 PostgreSQL 特例写进 Flow/Station 核心；
 - 让 JNI 边界可测、有界，且不需要 Java 反向持有 Rust 地址。
 
@@ -46,13 +46,13 @@ Java 只负责运行 Debezium Engine、保留一个 outstanding delivery、把�
 Rust 保留以下权威：
 
 - 何时 poll；
-- 何时将 delivery 持久到 MDBX；
+- 何时将 delivery 持久到 Store；
 - 何时允许 ACK；
 - 何时运行 `Flow::advance`；
 - 何时 stop connector；
 - 哪份 offset 是恢复真相。
 
-Java 线程不直接调用 Flow、不开始 MDBX transaction，也不改变 Station 调度。
+Java 线程不直接调用 Flow、不开始 Store transaction，也不改变 Station 调度。
 
 ### 2. 一个 OS 进程至多创建一个 HotSpot JVM
 
@@ -148,7 +148,7 @@ API，也不属于 delivery identity。产品 development-v1 binary delivery 直
 `DPDBDV01`/u16 version `1` 的无-token 布局，携带完整 opaque checkpoint 与有序 records。旧的
 未发布 v1 bytes/bundle 直接重建，不提供兼容、迁移或双解码。
 
-### 5. MDBX 是 durable offset 唯一真相
+### 5. Store 是 durable offset 唯一真相
 
 D1 的早期 offset-store 试验不构成 DogPaddle 的重启恢复声明；迁移后的 fixture 只从产品
 checkpoint 恢复，没有 Java offset 文件。它使用 `OffsetCommitPolicy.always()` 与
@@ -164,13 +164,13 @@ durable ingress，即 checkpoint 与 Station output 的原子持久交接，不�
 
 D3 及以后的提交规则由统一 Operation 协议表达：
 
-1. `Operation::turn(None)` 在没有活动 MDBX 写事务时主动 poll 并转换，返回一个线性
+1. `Operation::turn(None)` 在没有活动 Store 写事务时主动 poll 并转换，返回一个线性
    `PreparedTurn`；
 2. Station 开启写事务，`PreparedTurn::apply` 保存 accepted checkpoint 并返回可选 Change；
    Station 在同一事务中完成 output append；
 3. Station commit 后，才消费 prepared turn 返回的
    `AfterCommit` 来 ACK Java bridge；rollback、背压、错误或 commit 失败都只 Drop，不 ACK；
-4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 MDBX accepted checkpoint 重建。
+4. Java Engine 的 offset store 可在进程内前进，但新进程必须由 Store accepted checkpoint 重建。
 
 2026-09-05 收缩：不再另建公共 IngressScan；PostgresCdcScan 唯一的
 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，复用其
@@ -185,7 +185,7 @@ Flow reopen 后再从已提交 checkpoint 恢复。Flow 不公开 `ingest` 或 c
 只表示不等待数据，不表示整个 turn 非阻塞：connector 启动和 ACK 仍是有界同步调用。
 
 不使用 Java 本地 offset 文件作为 fallback、加速缓存或双写副本，因为崩溃后无法
-可靠判定它与 MDBX 哪个更新。Rust/Flow 把 offset 当作 opaque bytes，不从 PG LSN 或其他
+可靠判定它与 Store 哪个更新。Rust/Flow 把 offset 当作 opaque bytes，不从 PG LSN 或其他
 connector-specific 字段推导通用顺序。
 
 ### 6. PostgreSQL 只是第一个试点
@@ -233,7 +233,7 @@ Rust snapshot reader 属于新架构决策，需要后续 ADR，不由 D6 实现
 - 无 sidecar 部署和独立控制面，保留 DogPaddle 的嵌入式产品形态；
 - 运行用户无需预装 Java 或配置 `JAVA_HOME`；最终 release packager 可将应用与 runtime payload
   组合为一个用户归档；
-- Rust pull 使 MDBX transaction 与 JNI/Java 线程之间没有重入调用；
+- Rust pull 使 Store transaction 与 JNI/Java 线程之间没有重入调用；
 - 延迟 ACK 与 durable ingress 可用少量状态机覆盖崩溃窗口；
 - connector-neutral bridge 为 D7 第二 Scan 留出真实复用路径；
 - 使用 stock Engine 避免长期跟随 Debezium 内部类变化。
@@ -268,7 +268,7 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 
 ### Java callback 直接推送给 Rust
 
-该模式需要 Java 保存 Rust callback/native pointer，容易出现悬垂引用、重入 MDBX transaction、
+该模式需要 Java 保存 Rust callback/native pointer，容易出现悬垂引用、重入 Store transaction、
 跨线程 panic/exception 和 stop 竞态，也与工作区禁止 `unsafe` 的方向冲突。
 
 ### Fork Debezium 或覆盖其内部类
@@ -283,7 +283,7 @@ HotSpot 不是按 Flow 隔离的轻量 runtime。多 JVM 会放大资源占用�
 
 ### 让 Debezium 直接写 Station output
 
-这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和 consumer frontier，并要求
+这会绕过 `Operation::turn`、Schema guard、capacity-aware append 和输入 acknowledgement，并要求
 Java/connector 获得 Flow 的写事务能力。外部 delivery 必须由普通 Scan Operation 的 prepared
 turn 保存 checkpoint 并返回 Change，由 Station 在同一事务中追加 output，commit 后再 ACK。
 

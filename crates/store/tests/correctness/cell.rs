@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use dogpaddle_store::{Cell, CodecError, OrderedMap, Small, Store, StoreError, StoreValue};
+use dogpaddle_store::{Cell, CodecError, Store, StoreError, StoreValue};
 
 use crate::support::{TestValue, store_path};
 
@@ -20,7 +20,7 @@ fn cell_state_transitions_and_custom_codec_survive_reopen() {
     let cell = create_cell::<TestValue>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let mut access = cell.access(transaction.access()).unwrap();
     assert_eq!(access.get().unwrap(), None);
     access.set(&TestValue(1)).unwrap();
@@ -37,7 +37,7 @@ fn cell_state_transitions_and_custom_codec_survive_reopen() {
     let store = Store::open(&path).unwrap();
     let cell = open_cell::<TestValue>(&store, "cell").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         cell.access(transaction.access()).unwrap().get().unwrap(),
         Some(TestValue(42))
@@ -70,13 +70,13 @@ impl StoreValue for OwnershipObservedValue {
 }
 
 #[test]
-fn dirty_cell_values_are_owned_for_decoding() {
+fn newly_written_cell_values_are_owned_for_decoding() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let cell = create_cell::<OwnershipObservedValue>(&mut store, "cell").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let mut access = cell.access(transaction.access()).unwrap();
     access
         .set(&OwnershipObservedValue {
@@ -107,7 +107,7 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
     let broken = create_cell::<BrokenValue>(&mut store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     safe.access(transaction.access()).unwrap().set(&99).unwrap();
     assert!(matches!(
         broken
@@ -121,7 +121,7 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
         Err(StoreError::TransactionPoisoned)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         safe.access(transaction.access()).unwrap().get().unwrap(),
         None
@@ -133,13 +133,11 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let safe = create_cell::<u64>(&mut store, "safe").unwrap();
-    let broken_data = store
-        .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("broken")
-        .unwrap();
+    let broken_data = create_cell::<Vec<u8>>(&mut store, "broken").unwrap();
     let broken = open_cell::<BrokenValue>(&store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     safe.access(transaction.access())
         .unwrap()
         .set(&100)
@@ -147,7 +145,7 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
     broken_data
         .access(transaction.access())
         .unwrap()
-        .put(&Vec::new(), &b"invalid".to_vec())
+        .set(&b"invalid".to_vec())
         .unwrap();
     assert!(matches!(
         broken.access(transaction.access()).unwrap().get(),
@@ -158,7 +156,7 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
         Err(StoreError::TransactionPoisoned)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         safe.access(transaction.access()).unwrap().get().unwrap(),
         None
@@ -167,7 +165,7 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
         broken_data
             .access(transaction.access())
             .unwrap()
-            .get(&Vec::new())
+            .get()
             .unwrap(),
         None
     );

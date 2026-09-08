@@ -6,43 +6,40 @@ Store 自己拥有 workload、fixture、seed、预热、正确性断言和结果
 
 ## Targets
 
-### `cell` — Criterion
+### `cell`
 
 - `hot_get_one_tx`：在一个事务中重复读取已预热的 `Cell<u64>`；
 - `read_update_commit`：每次 read-modify-write 都提交一个 durable transaction。
 
-Criterion 原生 raw samples 与 estimates 位于该次 `RunRoot` 的 `criterion/`，配置与环境写入相邻
-`context.json`。Cargo test mode 使用最小 smoke 配置，不执行正式测量。
+### `ordered_map`
 
-### `ordered_map` — owner paired runner
+这个 target 只测量当前唯一的 `OrderedMap<u64, Vec<u8>>`。场景分别回答：
 
-覆盖 Small/Large、primitive/typed/byte map、point get、bulk put、扫描解码、分页、Station-shaped
-事务与 durable overwrite。需要比较的两个 variant 在同一 fixture 条件下成对采样，样本顺序按
-AB/BA 轮换，不能用两次独立运行的 median 代替。
+- `bulk_put_commit`：一个 durable transaction 中顺序写入完整 map；
+- `point_get`：一个只读 snapshot 中按固定伪随机序列读取热 key；
+- `ascending_scan` / `descending_scan`：使用真实 item/byte limit 和 continuation 扫描完整 map；
+- `wide_scan_owned` / `wide_scan_projected`：比较 8 KiB value 的完整 owned decode 与只读取必要字节；
+- `station_step`：同一事务更新 `Cell` 与八个 map entry，呈现一个 durable Station step；
+- `durable_hot_overwrite`：每次提交覆盖同一个 key，单独呈现 WAL + sync commit 成本。
 
-### `append_log` — owner counterbalanced paired runner
-
-覆盖不同记录宽度的 append、batch append、投影/完整 decode、durable append、Station-shaped
-count/filter、fan-out readers、steady window 与 prefix GC。配对 case 按 AB/BA/BA/AB 循环，抵消固定
-顺序和热度偏差。AppendLog 自己验证 head/tail、记录内容、consumer cursor 与 GC 结果。
-
-### `append_log_endurance` — owner streaming runner
-
-在固定窗口中持续 append 和 bounded truncate，记录每个事务的原始 latency、定期 head/tail 与物理文件
-checkpoint，以及终止后的 reopen checksum。JSONL 随样本产生立即写入 stdout；进程失败时之前的样本
-仍可保留。它观察长期页复用与尾延迟，不设置 wall-clock gate。
+`OrderedMap` 只有一个物理实现，因此不运行形式配对或两套重复 fixture。这个 target 也不为编码表示、
+无关命名空间和事务失败路径复制同一组成本矩阵。底层 RocksDB 压力、compaction 与 endurance 应由
+专门实验拥有。
 
 ## 输出
 
-三个 owner runner 的 stdout 是各自定义的 JSONL；stderr 只用于人类进度和摘要。每次运行首先记录：
+两个 target 都使用 Criterion。原生 raw samples 与 estimates 写到该次 `RunRoot` 的
+`criterion/`，相邻 `context.json` 记录：
 
 - benchmark 与 `smoke|reference` profile；
-- 实际 workload 配置；
+- 实际 workload、scan limit 和固定随机种子；
 - rustc、OS/kernel、CPU、git revision 和 dirty state；
-- 结果文件系统与 MDBX durable 模式。
+- 结果文件系统；
+- RocksDB、WAL enabled 与 `sync=true` 的 durable write 模式。
 
-随后逐条输出原始 duration/checkpoint，最后输出完成记录。字段只属于当前 target，不形成跨 target ABI。
-fixture 创建、数据填充、预热和 oracle 都在计时区间外。
+fixture 创建、数据填充、预热和 oracle 位于计时外。`ordered_map` 的读场景使用真正的只读
+snapshot；写场景通过唯一 `Transactions` capability 提交。字段只属于当前 target，不形成跨
+target ABI。
 
 ## 运行
 
@@ -51,8 +48,6 @@ fixture 创建、数据填充、预热和 oracle 都在计时区间外。
 ```bash
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench cell
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench append_log_endurance
 ```
 
 正式 reference 必须指定固定的绝对目录：
@@ -60,8 +55,8 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench app
 ```bash
 DOGPADDLE_PERF_PROFILE=reference \
 DOGPADDLE_PERF_ROOT=/absolute/path/on/reference-filesystem \
-cargo bench --locked -p dogpaddle-store --bench append_log
+cargo bench --locked -p dogpaddle-store --bench ordered_map
 ```
 
-其余 target 同理。不同 baseline epoch、提交、rustc、机器、profile、文件系统或 workload 的结果不可
-直接比较。工作区分类和准入规则见根目录 [`TESTING.md`](../../TESTING.md)。
+不同 baseline epoch、提交、rustc、机器、profile、文件系统或 workload 的结果不可直接比较。工作区
+分类和准入规则见根目录 [`TESTING.md`](../../TESTING.md)。

@@ -384,14 +384,14 @@ fn checksum_uses_the_stable_ieee_crc32_algorithm() {
 fn runtime_state_error_preserves_store_error_classification() {
     let error = runtime_state_error(
         "producer",
-        StationError::Store(StoreError::CorruptAppendLog {
+        StationError::Store(StoreError::CorruptSubscribedLog {
             reason: "test corruption",
         }),
     );
 
     assert!(matches!(
         error,
-        FlowError::Store(StoreError::CorruptAppendLog {
+        FlowError::Store(StoreError::CorruptSubscribedLog {
             reason: "test corruption"
         })
     ));
@@ -399,18 +399,12 @@ fn runtime_state_error_preserves_store_error_classification() {
 
 #[test]
 fn runtime_state_error_maps_an_invariant_to_runtime_state() {
-    let error = runtime_state_error(
-        "producer",
-        StationError::RetentionHeadMismatch {
-            head: 3,
-            minimum: 4,
-        },
-    );
+    let error = runtime_state_error("union", StationError::MissingActiveInput);
 
     assert!(matches!(
         error,
         FlowError::InvalidRuntimeState { station_id, reason }
-            if station_id == "producer"
-                && reason == "output retention head 3 does not equal minimum consumer cursor 4"
+            if station_id == "union"
+                && reason == "station has inputs but no durable active input"
     ));
 }

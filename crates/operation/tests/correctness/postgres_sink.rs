@@ -96,7 +96,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         .unwrap();
     let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     state
         .access(transaction.access())
         .unwrap()
@@ -128,7 +128,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         else {
             panic!("reopened PostgreSQL sink did not prepare state restoration");
         };
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap()
         else {
             panic!("reopened PostgreSQL sink did not decode its Ready state");
@@ -136,7 +136,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         drop(transaction);
         drop(completion); // Running it would perform target I/O; rollback must not.
 
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         assert_eq!(
             state.access(transaction.access()).unwrap().get().unwrap(),
             Some(ready.clone())
@@ -195,7 +195,7 @@ fn postgres_sink_declares_one_state_cell_and_exact_runtime_resource() {
         .unwrap();
     let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         state.access(transaction.access()).unwrap().get().unwrap(),
         None
@@ -311,7 +311,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
         Action::Commit(None)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         state.access(transaction.access()).unwrap().get().unwrap(),
         None
@@ -327,7 +327,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     else {
         panic!("a fresh PostgreSQL sink did not prepare local restoration");
     };
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap() else {
         panic!("a fresh PostgreSQL sink did not commit local restoration");
     };
@@ -345,7 +345,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
         Some(PostgresSinkError::DatabaseMismatch)
     ));
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert!(
         state
             .access(transaction.access())

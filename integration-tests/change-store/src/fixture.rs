@@ -7,7 +7,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, ChangeProjection, encode_change};
 
-/// Logical Changes paired with the exact bytes stored in an `AppendLog`.
+/// Logical Changes paired with the exact bytes stored in a `SubscribedLog`.
 pub struct EncodedChanges {
     /// Changes in durable log order.
     pub changes: Vec<Change>,
@@ -23,21 +23,6 @@ impl EncodedChanges {
             .map(|change| encode_change(change).expect("encode fixture Change"))
             .collect();
         Self { changes, encoded }
-    }
-
-    /// Returns the exact item-key plus value-byte charge for a full scan.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the aggregate byte count exceeds `usize`.
-    #[must_use]
-    pub fn scan_bytes(&self) -> usize {
-        self.encoded.iter().fold(0_usize, |total, entry| {
-            total
-                .checked_add(size_of::<u64>())
-                .and_then(|value| value.checked_add(entry.len()))
-                .expect("fixture scan charge fits usize")
-        })
     }
 
     /// Returns an order-sensitive checksum of the exact encoded entries.
@@ -141,14 +126,14 @@ pub fn projectable_fixture(seed: u64, rows: usize, payload_bytes: usize) -> Proj
 /// Panics when fewer than two entries are requested, dimensions are zero, or
 /// fixture dimensions overflow.
 #[must_use]
-pub fn heterogeneous_pages_fixture(
+pub fn heterogeneous_changes_fixture(
     entries: usize,
     rows: usize,
     payload_bytes: usize,
 ) -> EncodedChanges {
     assert!(
         entries >= 2,
-        "heterogeneous paging needs at least two entries"
+        "heterogeneous workload needs at least two entries"
     );
     assert!(rows > 0, "a Change fixture must contain a row");
     assert!(payload_bytes > 0, "payload width must be non-zero");
@@ -218,9 +203,7 @@ pub fn assert_change_eq(actual: &Change, expected: &Change) {
     assert_eq!(actual.diffs(), expected.diffs());
 }
 
-/// Computes an order-sensitive checksum over exact persisted entries.
-#[must_use]
-pub fn order_checksum<I, B>(entries: I) -> u64
+fn order_checksum<I, B>(entries: I) -> u64
 where
     I: IntoIterator<Item = B>,
     B: AsRef<[u8]>,

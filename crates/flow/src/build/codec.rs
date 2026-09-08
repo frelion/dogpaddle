@@ -55,8 +55,8 @@ pub enum FlowDefinitionError {
     TrailingBytes,
 }
 
-pub(crate) fn station_state_name(index: usize) -> String {
-    format!("station/{index:08x}/state")
+pub(crate) fn station_active_input_name(index: usize) -> String {
+    format!("station/{index:08x}/active-input")
 }
 
 pub(crate) fn station_output_name(index: usize) -> String {

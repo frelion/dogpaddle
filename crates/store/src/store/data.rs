@@ -1,48 +1,18 @@
-use std::{
-    borrow::Cow,
-    ops::{Bound, RangeBounds},
-};
+use std::ops::{Bound, RangeBounds};
 
-use libmdbx::{
-    Cursor, NoWriteMap, ObjectLength, Table, Transaction as MdbxTransaction, TransactionKind,
-    WriteFlags,
-};
+use rocksdb::{DBAccess, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
 
-use super::{
-    DataHandle, DataLocation, DataPlacement, ReadTransaction, ReadTransactionAccess, Transaction,
-    TransactionAccess, dedicated_table_name,
-};
+use super::{DataHandle, ReadTransaction, ReadTransactionAccess, Transaction, TransactionAccess};
 use crate::StoreError;
 
-const DATA_DOMAIN: u8 = 3;
-const INLINE_PHYSICAL_KEY_BYTES: usize = 64;
+const DATA_DOMAIN: u8 = 2;
 
 type EncodedBound<'key> = (&'key [u8], bool);
-type ScanProbe<'txn> = (Cow<'txn, [u8]>, ObjectLength);
-type BorrowedEntry<'txn> = (Cow<'txn, [u8]>, Cow<'txn, [u8]>);
+type EncodedEntry = (Vec<u8>, Vec<u8>);
 
-pub(crate) struct BorrowedScanBatch<'transaction> {
-    pub(crate) items: Vec<BorrowedEntry<'transaction>>,
+pub(crate) struct ScanBatch {
+    pub(crate) items: Vec<EncodedEntry>,
     pub(crate) limited: bool,
-}
-
-enum PhysicalKey<'key> {
-    Borrowed(&'key [u8]),
-    Inline {
-        bytes: [u8; INLINE_PHYSICAL_KEY_BYTES],
-        len: usize,
-    },
-    Heap(Vec<u8>),
-}
-
-impl AsRef<[u8]> for PhysicalKey<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(key) => key,
-            Self::Inline { bytes, len } => &bytes[..*len],
-            Self::Heap(key) => key,
-        }
-    }
 }
 
 /// Direction of an ordered scan over encoded keys.
@@ -62,24 +32,15 @@ pub struct ScanLimit {
 }
 
 /// Transaction-bound access to one encoded key/value namespace.
-///
-/// This value cannot outlive its transaction. Collection implementations use
-/// it as their only raw storage capability.
 pub(crate) struct DataAccess<'transaction> {
     read: ReadDataAccess<'transaction>,
     transaction: &'transaction Transaction<'transaction>,
 }
 
 /// Read-only transaction-bound access to one encoded key/value namespace.
-///
-/// This is the single raw read core for both transaction kinds. Unlike
-/// [`DataAccess`], it has no mutation methods. Collection read-access types use
-/// it directly, while writable collection access composes it with the write
-/// authority stored by [`DataAccess`].
 pub(crate) struct ReadDataAccess<'transaction> {
     transaction: TransactionRef<'transaction>,
-    table: Table<'transaction>,
-    prefix: Option<[u8; 5]>,
+    prefix: [u8; 5],
 }
 
 /// Identifies the transaction that backs a read without exposing mutation.
@@ -120,19 +81,11 @@ impl ScanLimit {
 }
 
 impl DataHandle {
-    pub(crate) const fn placement(&self) -> DataPlacement {
-        match self.location {
-            DataLocation::Shared(_) => DataPlacement::Shared,
-            DataLocation::Dedicated(_) => DataPlacement::Dedicated,
-        }
-    }
-
     /// Binds this namespace through an active transaction's access capability.
     ///
     /// # Errors
     ///
-    /// Returns an error for a wrong-store handle, a poisoned transaction, or
-    /// when MDBX cannot open the underlying table.
+    /// Returns an error for a wrong-store handle or a poisoned transaction.
     pub(crate) fn access<'transaction>(
         &self,
         access: TransactionAccess<'transaction>,
@@ -146,14 +99,12 @@ impl DataHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error for a wrong-store handle, a poisoned transaction, or
-    /// when MDBX cannot open the underlying table.
+    /// Returns an error for a wrong-store handle or a poisoned transaction.
     pub(crate) fn read<'transaction>(
         &self,
         access: ReadTransactionAccess<'transaction>,
     ) -> Result<ReadDataAccess<'transaction>, StoreError> {
-        let transaction = access.transaction();
-        self.bind_read(TransactionRef::Read(transaction))
+        self.bind_read(TransactionRef::Read(access.transaction()))
     }
 
     fn bind_read<'transaction>(
@@ -161,218 +112,59 @@ impl DataHandle {
         transaction: TransactionRef<'transaction>,
     ) -> Result<ReadDataAccess<'transaction>, StoreError> {
         transaction.ensure_access(self)?;
-        let (table_name, prefix) = match self.location {
-            DataLocation::Shared(data_id) => (None, Some(data_prefix(data_id))),
-            DataLocation::Dedicated(table_id) => (Some(dedicated_table_name(table_id)), None),
-        };
-        let table = transaction.open_table(table_name.as_deref())?;
         Ok(ReadDataAccess {
             transaction,
-            table,
-            prefix,
+            prefix: data_prefix(self.data_id),
         })
     }
 }
 
 impl<'transaction> DataAccess<'transaction> {
-    /// Consumes this composed access and retains only its shared read core.
-    pub(crate) fn into_read(self) -> ReadDataAccess<'transaction> {
-        self.read
-    }
-
     /// Borrows the shared read core without transferring write authority.
     pub(crate) const fn as_read(&self) -> &ReadDataAccess<'transaction> {
         &self.read
     }
 
-    /// Reports whether `source` is this access's write transaction.
-    pub(crate) fn is_same_write_transaction(&self, source: TransactionRef<'_>) -> bool {
-        source.is_same_write_transaction(self.transaction)
-    }
-
-    /// Marks the transaction unusable when a collection-level hard operation fails.
-    ///
-    /// Custom collections use this for codec and invariant checks that happen
-    /// outside the raw data methods. The original result and error type are
-    /// preserved.
-    ///
-    /// # Errors
-    ///
-    /// Returns the original error after poisoning the transaction.
+    /// Marks the transaction unusable when a collection-level operation fails.
     pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
         self.read.poison_on_error(result)
     }
 
-    /// Reports whether an encoded key exists without copying its value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot read.
+    /// Reports whether an encoded key exists.
     pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
         self.read.contains_key(key)
     }
 
     /// Inserts or replaces an encoded value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot write.
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.transaction.ensure_healthy()?;
-        let key = physical_key(self.read.prefix.as_ref(), key);
+        let key = physical_key(self.read.prefix, key);
         self.transaction.record_result(
             self.transaction
-                .mdbx
-                .put(&self.read.table, key.as_ref(), value, WriteFlags::UPSERT)
+                .inner
+                .put(key, value)
                 .map_err(|error| StoreError::storage("write data", error)),
         )
     }
 
-    /// Appends encoded key/value pairs that are already in strict key order.
-    ///
-    /// A single cursor is retained for the whole input. `false` means MDBX
-    /// observed an existing or out-of-order key; callers decide which
-    /// collection invariant that violates.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when producing an entry fails, the transaction is
-    /// poisoned, or MDBX cannot write.
-    pub(crate) fn append_ordered<K, V>(
-        &mut self,
-        entries: impl IntoIterator<Item = Result<(K, V), StoreError>>,
-    ) -> Result<bool, StoreError>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        debug_assert!(self.read.prefix.is_none());
-        self.transaction.ensure_healthy()?;
-        self.transaction.poison_on_error((|| {
-            let mut cursor = self
-                .transaction
-                .mdbx
-                .cursor(&self.read.table)
-                .map_err(|error| StoreError::storage("open append cursor", error))?;
-            for entry in entries {
-                let (key, value) = entry?;
-                match cursor.put(
-                    key.as_ref(),
-                    value.as_ref(),
-                    WriteFlags::APPEND | WriteFlags::NO_OVERWRITE,
-                ) {
-                    Ok(()) => {}
-                    Err(libmdbx::Error::KeyExist | libmdbx::Error::KeyMismatch) => {
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(StoreError::storage("append data", error)),
-                }
-            }
-            Ok(true)
-        })())
-    }
-
-    /// Deletes an encoded key from this namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot delete.
+    /// Deletes an encoded key and reports whether it existed.
     pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
         self.transaction.ensure_healthy()?;
-        let key = physical_key(self.read.prefix.as_ref(), key);
+        if !self.read.contains_key(key)? {
+            return Ok(false);
+        }
+        let key = physical_key(self.read.prefix, key);
         self.transaction.record_result(
             self.transaction
-                .mdbx
-                .del(&self.read.table, key.as_ref(), None)
+                .inner
+                .delete(key)
+                .map(|()| true)
                 .map_err(|error| StoreError::storage("delete data", error)),
         )
     }
-
-    /// Deletes an exact ascending sequence of encoded keys with one cursor.
-    ///
-    /// `None` means the physical successor did not equal the next requested
-    /// key. `Some(bytes)` reports the encoded key-plus-value bytes actually
-    /// deleted without materializing any value. Deletion may already have
-    /// started on either failure path, so collection callers must propagate a
-    /// hard error before the transaction can commit.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction is poisoned or MDBX cannot seek
-    /// or delete.
-    pub(crate) fn delete_exact_keys<K>(
-        &mut self,
-        keys: impl IntoIterator<Item = K>,
-    ) -> Result<Option<u64>, StoreError>
-    where
-        K: AsRef<[u8]>,
-    {
-        debug_assert!(self.read.prefix.is_none());
-        self.transaction.ensure_healthy()?;
-        self.transaction.record_result((|| {
-            let mut keys = keys.into_iter().peekable();
-            let Some(first) = keys.peek() else {
-                return Ok(Some(0));
-            };
-            let mut cursor = self
-                .transaction
-                .mdbx
-                .cursor(&self.read.table)
-                .map_err(|error| StoreError::storage("open deletion cursor", error))?;
-            let mut current = cursor
-                .set_range::<Cow<'transaction, [u8]>, ObjectLength>(first.as_ref())
-                .map_err(|error| StoreError::storage("seek deletion cursor", error))?;
-            let mut deleted_bytes = 0_u64;
-
-            while let Some(expected) = keys.next() {
-                let Some((actual, value_length)) = current.take() else {
-                    return Ok(None);
-                };
-                if actual.as_ref() != expected.as_ref() {
-                    return Ok(None);
-                }
-                let key_bytes = u64::try_from(actual.len())
-                    .map_err(|_| StoreError::LogRetainedBytesExhausted)?;
-                let value_bytes = u64::try_from(*value_length)
-                    .map_err(|_| StoreError::LogRetainedBytesExhausted)?;
-                let item_bytes = key_bytes
-                    .checked_add(value_bytes)
-                    .ok_or(StoreError::LogRetainedBytesExhausted)?;
-                deleted_bytes = deleted_bytes
-                    .checked_add(item_bytes)
-                    .ok_or(StoreError::LogRetainedBytesExhausted)?;
-                drop(actual);
-                cursor
-                    .del(WriteFlags::CURRENT)
-                    .map_err(|error| StoreError::storage("delete cursor data", error))?;
-                if keys.peek().is_some() {
-                    // After deletion MDBX_GET_CURRENT already yields the
-                    // successor. Advancing with NEXT as well would skip it.
-                    current = cursor
-                        .get_current::<Cow<'transaction, [u8]>, ObjectLength>()
-                        .map_err(|error| StoreError::storage("advance deletion cursor", error))?;
-                }
-            }
-            Ok(Some(deleted_bytes))
-        })())
-    }
 }
 
-impl<'transaction> TransactionRef<'transaction> {
-    fn is_same_write_transaction(self, other: &Transaction<'_>) -> bool {
-        match self {
-            Self::Read(_) => false,
-            Self::Write(transaction) => std::ptr::eq(transaction, other),
-        }
-    }
-
-    pub(crate) fn poison(self) {
-        match self {
-            Self::Read(transaction) => transaction.poisoned.set(true),
-            Self::Write(transaction) => transaction.poisoned.set(true),
-        }
-    }
-
+impl TransactionRef<'_> {
     fn ensure_access(self, handle: &DataHandle) -> Result<(), StoreError> {
         match self {
             Self::Read(transaction) => transaction.ensure_access(handle),
@@ -401,18 +193,45 @@ impl<'transaction> TransactionRef<'transaction> {
         }
     }
 
-    fn open_table(self, name: Option<&str>) -> Result<Table<'transaction>, StoreError> {
+    fn get(self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.ensure_healthy()?;
         let result = match self {
-            Self::Read(transaction) => transaction.mdbx.open_table(name),
-            Self::Write(transaction) => transaction.mdbx.open_table(name),
+            Self::Read(transaction) => transaction.snapshot.get(key),
+            Self::Write(transaction) => transaction.inner.snapshot().get(key),
         }
-        .map_err(|error| StoreError::storage("open store table", error));
+        .map_err(|error| StoreError::storage("read data", error));
+        self.record_result(result)
+    }
+
+    fn scan<'key>(
+        self,
+        prefix: [u8; 5],
+        direction: ScanDirection,
+        lower: Option<&EncodedBound<'key>>,
+        upper: Option<&EncodedBound<'key>>,
+        limit: ScanLimit,
+    ) -> Result<ScanBatch, StoreError> {
+        self.ensure_healthy()?;
+        let result = match self {
+            Self::Read(transaction) => scan_data(
+                &transaction.snapshot,
+                prefix,
+                direction,
+                lower,
+                upper,
+                limit,
+            ),
+            Self::Write(transaction) => {
+                let snapshot = transaction.inner.snapshot();
+                scan_data(&snapshot, prefix, direction, lower, upper, limit)
+            }
+        };
         self.record_result(result)
     }
 }
 
 impl<'transaction> ReadDataAccess<'transaction> {
-    /// Reborrows the transaction source for a short-lived read entry.
+    /// Returns the transaction source used to poison a failed scan entry.
     pub(crate) const fn transaction_ref(&self) -> TransactionRef<'transaction> {
         self.transaction
     }
@@ -433,72 +252,34 @@ impl<'transaction> ReadDataAccess<'transaction> {
     }
 
     /// Reads an encoded value.
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Cow<'transaction, [u8]>>, StoreError> {
-        self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
-        let result = match self.transaction {
-            TransactionRef::Read(transaction) => transaction
-                .mdbx
-                .get::<Cow<'transaction, [u8]>>(&self.table, key.as_ref()),
-            TransactionRef::Write(transaction) => transaction
-                .mdbx
-                .get::<Cow<'transaction, [u8]>>(&self.table, key.as_ref()),
-        }
-        .map_err(|error| StoreError::storage("read data", error));
-        self.transaction.record_result(result)
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.transaction.get(&physical_key(self.prefix, key))
     }
 
-    /// Reports whether an encoded key exists without copying its value.
+    /// Reports whether an encoded key exists.
     pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
-        self.transaction.ensure_healthy()?;
-        let key = physical_key(self.prefix.as_ref(), key);
-        let result = match self.transaction {
-            TransactionRef::Read(transaction) => transaction
-                .mdbx
-                .get::<ObjectLength>(&self.table, key.as_ref()),
-            TransactionRef::Write(transaction) => transaction
-                .mdbx
-                .get::<ObjectLength>(&self.table, key.as_ref()),
-        }
-        .map(|value| value.is_some())
-        .map_err(|error| StoreError::storage("inspect data", error));
-        self.transaction.record_result(result)
+        self.get(key).map(|value| value.is_some())
     }
 
-    /// Reports whether this physical table contains no entries.
+    /// Reports whether this namespace contains no entries.
     pub(crate) fn is_physically_empty(&self) -> Result<bool, StoreError> {
-        debug_assert!(self.prefix.is_none());
-        self.transaction.ensure_healthy()?;
-        let result = match self.transaction {
-            TransactionRef::Read(transaction) => table_is_empty(&transaction.mdbx, &self.table),
-            TransactionRef::Write(transaction) => table_is_empty(&transaction.mdbx, &self.table),
+        let limit = ScanLimit {
+            max_items: 1,
+            max_bytes: usize::MAX,
         };
-        self.transaction.record_result(result)
+        self.transaction
+            .scan(self.prefix, ScanDirection::Ascending, None, None, limit)
+            .map(|batch| batch.items.is_empty())
     }
 
-    /// Scans encoded entries in ascending key order from `start`.
-    pub(crate) fn scan_borrowed_from(
-        &self,
-        start: &[u8],
-        limit: ScanLimit,
-    ) -> Result<BorrowedScanBatch<'transaction>, StoreError> {
-        debug_assert!(self.prefix.is_none());
-        self.scan_borrowed(
-            (Bound::Included(start), Bound::Unbounded),
-            ScanDirection::Ascending,
-            None,
-            limit,
-        )
-    }
-
-    /// Borrows one bounded batch of encoded entries in byte order.
-    pub(crate) fn scan_borrowed<'range, R>(
+    /// Owns one bounded page of encoded entries in byte order.
+    pub(crate) fn scan<'range, R>(
         &self,
         range: R,
         direction: ScanDirection,
         resume_after: Option<&[u8]>,
         limit: ScanLimit,
-    ) -> Result<BorrowedScanBatch<'transaction>, StoreError>
+    ) -> Result<ScanBatch, StoreError>
     where
         R: RangeBounds<&'range [u8]>,
     {
@@ -517,71 +298,69 @@ impl<'transaction> ReadDataAccess<'transaction> {
             ScanDirection::Ascending => (later_bound(declared_lower, resume), declared_upper),
             ScanDirection::Descending => (declared_lower, earlier_bound(declared_upper, resume)),
         };
-
-        self.transaction.ensure_healthy()?;
-        let result = match self.transaction {
-            TransactionRef::Read(transaction) => scan_data(
-                &transaction.mdbx,
-                &self.table,
-                self.prefix.as_ref(),
-                direction,
-                lower.as_ref(),
-                upper.as_ref(),
-                limit,
-            ),
-            TransactionRef::Write(transaction) => scan_data(
-                &transaction.mdbx,
-                &self.table,
-                self.prefix.as_ref(),
-                direction,
-                lower.as_ref(),
-                upper.as_ref(),
-                limit,
-            ),
-        };
-        self.transaction.record_result(result)
+        self.transaction.scan(
+            self.prefix,
+            direction,
+            lower.as_ref(),
+            upper.as_ref(),
+            limit,
+        )
     }
 }
 
-fn table_is_empty<K: TransactionKind>(
-    transaction: &MdbxTransaction<'_, K, NoWriteMap>,
-    table: &Table<'_>,
-) -> Result<bool, StoreError> {
-    let mut cursor = transaction
-        .cursor(table)
-        .map_err(|error| StoreError::storage("open data cursor", error))?;
-    cursor
-        .first::<(), ObjectLength>()
-        .map(|entry| entry.is_none())
-        .map_err(|error| StoreError::storage("inspect data table", error))
-}
-
-fn scan_data<'transaction, K: TransactionKind>(
-    transaction: &'transaction MdbxTransaction<'transaction, K, NoWriteMap>,
-    table: &Table<'transaction>,
-    prefix: Option<&[u8; 5]>,
+fn scan_data<D: DBAccess>(
+    snapshot: &SnapshotWithThreadMode<'_, D>,
+    prefix: [u8; 5],
     direction: ScanDirection,
     lower: Option<&EncodedBound<'_>>,
     upper: Option<&EncodedBound<'_>>,
     limit: ScanLimit,
-) -> Result<BorrowedScanBatch<'transaction>, StoreError> {
-    let mut cursor = transaction
-        .cursor(table)
-        .map_err(|error| StoreError::storage("open data cursor", error))?;
-    let mut current = seek_scan(&mut cursor, prefix, direction, lower, upper)?;
+) -> Result<ScanBatch, StoreError> {
+    let mut read_options = ReadOptions::default();
+    read_options.set_iterate_lower_bound(prefix.to_vec());
+    if direction == ScanDirection::Ascending {
+        read_options.set_iterate_upper_bound(prefix_successor(prefix));
+    }
+
+    let seek = match direction {
+        ScanDirection::Ascending => {
+            lower.map_or_else(|| prefix.to_vec(), |(key, _)| physical_key(prefix, key))
+        }
+        ScanDirection::Descending => upper.map_or_else(
+            || prefix_successor(prefix),
+            |(key, _)| physical_key(prefix, key),
+        ),
+    };
+    let rocks_direction = match direction {
+        ScanDirection::Ascending => Direction::Forward,
+        ScanDirection::Descending => Direction::Reverse,
+    };
     let mut items = Vec::new();
     let mut bytes = 0_usize;
 
-    while let Some((physical_key, value_length)) = current {
-        let Some(key) = logical_key(physical_key, prefix) else {
+    for item in snapshot.iterator_opt(IteratorMode::From(&seek, rocks_direction), read_options) {
+        let (physical_key, value) =
+            item.map_err(|error| StoreError::storage("scan data", error))?;
+        let Some(key) = physical_key.strip_prefix(&prefix) else {
+            if direction == ScanDirection::Descending {
+                continue;
+            }
             break;
         };
-        if !within_bounds(key.as_ref(), lower, upper) {
+        if !within_lower(key, lower) {
+            if direction == ScanDirection::Ascending {
+                continue;
+            }
             break;
         }
-
+        if !within_upper(key, upper) {
+            if direction == ScanDirection::Descending {
+                continue;
+            }
+            break;
+        }
         if items.len() == limit.max_items() {
-            return Ok(BorrowedScanBatch {
+            return Ok(ScanBatch {
                 items,
                 limited: true,
             });
@@ -589,7 +368,7 @@ fn scan_data<'transaction, K: TransactionKind>(
 
         let item_bytes = key
             .len()
-            .checked_add(*value_length)
+            .checked_add(value.len())
             .ok_or(StoreError::ItemTooLarge {
                 size: usize::MAX,
                 limit: limit.max_bytes(),
@@ -602,33 +381,16 @@ fn scan_data<'transaction, K: TransactionKind>(
                     limit: limit.max_bytes(),
                 });
             }
-            return Ok(BorrowedScanBatch {
+            return Ok(ScanBatch {
                 items,
                 limited: true,
             });
         }
-
-        // The probe reads only the value length. Materialize the value after
-        // admission so rejected oversized entries are never copied.
-        let ((), value) = cursor
-            .get_current::<(), Cow<'transaction, [u8]>>()
-            .map_err(|error| StoreError::storage("read scanned data", error))?
-            .ok_or_else(|| {
-                StoreError::storage("read scanned data", "MDBX cursor lost its position")
-            })?;
-        debug_assert_eq!(value.len(), *value_length);
-        let Some(next_bytes) = next_bytes else {
-            return Err(StoreError::ItemTooLarge {
-                size: usize::MAX,
-                limit: limit.max_bytes(),
-            });
-        };
-        bytes = next_bytes;
-        items.push((key, value));
-        current = move_scan(&mut cursor, direction)?;
+        bytes = next_bytes.expect("bounded sum was checked above");
+        items.push((key.to_vec(), value.into_vec()));
     }
 
-    Ok(BorrowedScanBatch {
+    Ok(ScanBatch {
         items,
         limited: false,
     })
@@ -639,130 +401,23 @@ fn data_prefix(data_id: u32) -> [u8; 5] {
     [DATA_DOMAIN, a, b, c, d]
 }
 
-fn physical_key<'key>(prefix: Option<&[u8; 5]>, logical_key: &'key [u8]) -> PhysicalKey<'key> {
-    match prefix {
-        Some(prefix) => {
-            if logical_key.len() <= INLINE_PHYSICAL_KEY_BYTES - prefix.len() {
-                let len = prefix.len() + logical_key.len();
-                let mut bytes = [0; INLINE_PHYSICAL_KEY_BYTES];
-                bytes[..prefix.len()].copy_from_slice(prefix);
-                bytes[prefix.len()..len].copy_from_slice(logical_key);
-                PhysicalKey::Inline { bytes, len }
-            } else {
-                let mut key = Vec::with_capacity(prefix.len() + logical_key.len());
-                key.extend_from_slice(prefix);
-                key.extend_from_slice(logical_key);
-                PhysicalKey::Heap(key)
-            }
+fn physical_key(prefix: [u8; 5], logical_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + logical_key.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(logical_key);
+    key
+}
+
+fn prefix_successor(prefix: [u8; 5]) -> Vec<u8> {
+    let mut successor = prefix.to_vec();
+    for byte in successor.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            return successor;
         }
-        None => PhysicalKey::Borrowed(logical_key),
+        *byte = 0;
     }
-}
-
-fn logical_key<'transaction>(
-    physical_key: Cow<'transaction, [u8]>,
-    prefix: Option<&[u8; 5]>,
-) -> Option<Cow<'transaction, [u8]>> {
-    let Some(prefix) = prefix else {
-        return Some(physical_key);
-    };
-    match physical_key {
-        Cow::Borrowed(key) => key.strip_prefix(prefix).map(Cow::Borrowed),
-        Cow::Owned(mut key) => {
-            if !key.starts_with(prefix) {
-                return None;
-            }
-            let logical_len = key.len() - prefix.len();
-            key.copy_within(prefix.len().., 0);
-            key.truncate(logical_len);
-            Some(Cow::Owned(key))
-        }
-    }
-}
-
-fn seek_scan<'txn, K: TransactionKind>(
-    cursor: &mut Cursor<'txn, K>,
-    prefix: Option<&[u8; 5]>,
-    direction: ScanDirection,
-    lower: Option<&EncodedBound<'_>>,
-    upper: Option<&EncodedBound<'_>>,
-) -> Result<Option<ScanProbe<'txn>>, StoreError> {
-    match direction {
-        ScanDirection::Ascending => match lower {
-            Some((key, inclusive)) => {
-                let seek = physical_key(prefix, key);
-                let mut item = cursor
-                    .set_range::<Cow<'txn, [u8]>, ObjectLength>(seek.as_ref())
-                    .map_err(|error| StoreError::storage("seek data scan", error))?;
-                if !inclusive
-                    && item
-                        .as_ref()
-                        .is_some_and(|(physical_key, _)| physical_key.as_ref() == seek.as_ref())
-                {
-                    item = move_scan(cursor, direction)?;
-                }
-                Ok(item)
-            }
-            None => match prefix {
-                Some(prefix) => cursor
-                    .set_range::<Cow<'txn, [u8]>, ObjectLength>(prefix)
-                    .map_err(|error| StoreError::storage("seek data scan", error)),
-                None => cursor
-                    .first::<Cow<'txn, [u8]>, ObjectLength>()
-                    .map_err(|error| StoreError::storage("seek data scan", error)),
-            },
-        },
-        ScanDirection::Descending => match upper {
-            Some((key, inclusive)) => {
-                let seek = physical_key(prefix, key);
-                seek_at_or_below(cursor, seek.as_ref(), *inclusive, direction)
-            }
-            None => match prefix {
-                Some(prefix) => {
-                    let successor = prefix_successor(prefix);
-                    seek_at_or_below(cursor, &successor, false, direction)
-                }
-                None => cursor
-                    .last::<Cow<'txn, [u8]>, ObjectLength>()
-                    .map_err(|error| StoreError::storage("seek data scan", error)),
-            },
-        },
-    }
-}
-
-fn seek_at_or_below<'txn, K: TransactionKind>(
-    cursor: &mut Cursor<'txn, K>,
-    seek: &[u8],
-    inclusive: bool,
-    direction: ScanDirection,
-) -> Result<Option<ScanProbe<'txn>>, StoreError> {
-    let item = cursor
-        .set_range::<Cow<'txn, [u8]>, ObjectLength>(seek)
-        .map_err(|error| StoreError::storage("seek data scan", error))?;
-    if inclusive
-        && item
-            .as_ref()
-            .is_some_and(|(physical_key, _)| physical_key.as_ref() == seek)
-    {
-        Ok(item)
-    } else if item.is_some() {
-        move_scan(cursor, direction)
-    } else {
-        cursor
-            .last::<Cow<'txn, [u8]>, ObjectLength>()
-            .map_err(|error| StoreError::storage("seek data scan", error))
-    }
-}
-
-fn move_scan<'txn, K: TransactionKind>(
-    cursor: &mut Cursor<'txn, K>,
-    direction: ScanDirection,
-) -> Result<Option<ScanProbe<'txn>>, StoreError> {
-    match direction {
-        ScanDirection::Ascending => cursor.next::<Cow<'txn, [u8]>, ObjectLength>(),
-        ScanDirection::Descending => cursor.prev::<Cow<'txn, [u8]>, ObjectLength>(),
-    }
-    .map_err(|error| StoreError::storage("advance data scan", error))
+    unreachable!("the data domain has a successor")
 }
 
 fn later_bound<'key>(
@@ -802,14 +457,6 @@ fn choose_bound<'key>(
     }
 }
 
-fn within_bounds(
-    key: &[u8],
-    lower: Option<&EncodedBound<'_>>,
-    upper: Option<&EncodedBound<'_>>,
-) -> bool {
-    within_lower(key, lower) && within_upper(key, upper)
-}
-
 fn within_lower(key: &[u8], lower: Option<&EncodedBound<'_>>) -> bool {
     lower.is_none_or(|(lower_key, inclusive)| match key.cmp(lower_key) {
         std::cmp::Ordering::Greater => true,
@@ -824,16 +471,4 @@ fn within_upper(key: &[u8], upper: Option<&EncodedBound<'_>>) -> bool {
         std::cmp::Ordering::Equal => *inclusive,
         std::cmp::Ordering::Greater => false,
     })
-}
-
-fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
-    let mut successor = prefix.to_vec();
-    for index in (0..successor.len()).rev() {
-        if successor[index] != u8::MAX {
-            successor[index] += 1;
-            successor.truncate(index + 1);
-            return successor;
-        }
-    }
-    Vec::new()
 }

@@ -1,38 +1,37 @@
 use std::fs;
 
-use dogpaddle_store::{Large, Small, Store, StoreError};
-use libmdbx::WriteFlags;
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreError};
 
-use crate::support::{ByteMap, create_byte_map, open_byte_map, raw_database, store_path};
+use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
 
 #[test]
-fn typed_open_rejects_a_different_durable_size() {
+fn typed_open_rejects_a_different_collection_kind() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    create_byte_map::<Small>(&mut store, "small").unwrap();
-    create_byte_map::<Large>(&mut store, "large").unwrap();
+    store.create_data::<Cell<u64>>("cell").unwrap();
+    create_byte_map(&mut store, "map").unwrap();
     drop(store);
 
     let store = Store::open(path).unwrap();
     assert!(matches!(
-        open_byte_map::<Large>(&store, "small"),
-        Err(StoreError::DataSizeMismatch {
+        store.open_data::<ByteMap>("cell"),
+        Err(StoreError::DataKindMismatch {
             name,
-            expected: "large",
-            actual: "small",
-        }) if name == "small"
+            expected: "ordered map",
+            actual: "cell",
+        }) if name == "cell"
     ));
     assert!(matches!(
-        open_byte_map::<Small>(&store, "large"),
-        Err(StoreError::DataSizeMismatch {
+        store.open_data::<Cell<u64>>("map"),
+        Err(StoreError::DataKindMismatch {
             name,
-            expected: "small",
-            actual: "large",
-        }) if name == "large"
+            expected: "cell",
+            actual: "ordered map",
+        }) if name == "map"
     ));
     assert!(matches!(
-        open_byte_map::<Small>(&store, "missing"),
+        open_byte_map(&store, "missing"),
         Err(StoreError::DataNotFound(name)) if name == "missing"
     ));
 }
@@ -63,134 +62,104 @@ fn opening_rejects_missing_and_partial_directories() {
 
     let partial = root.path().join("partial");
     fs::create_dir(&partial).unwrap();
-    assert!(matches!(
-        Store::open(&partial),
-        Err(StoreError::StoreNotFound(_))
-    ));
-    assert_eq!(fs::read_dir(&partial).unwrap().count(), 0);
+    let keep = partial.join("keep.txt");
+    fs::write(&keep, "keep").unwrap();
+    assert!(Store::open(&partial).is_err());
+    assert_eq!(fs::read_to_string(keep).unwrap(), "keep");
 }
 
 #[test]
-fn data_names_are_validated_and_unique_across_sizes() {
+fn data_names_are_validated_and_unique_across_collection_kinds() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
 
     for name in [String::new(), "bad\0name".to_owned(), "x".repeat(256)] {
         assert!(matches!(
-            store.create_data::<ByteMap<Small>>(&name),
+            store.create_data::<ByteMap>(&name),
             Err(StoreError::InvalidName { .. })
         ));
     }
 
-    create_byte_map::<Small>(&mut store, "data").unwrap();
+    create_byte_map(&mut store, "data").unwrap();
     assert!(matches!(
-        store.create_data::<ByteMap<Large>>("data"),
+        store.create_data::<Cell<Vec<u8>>>("data"),
         Err(StoreError::DataAlreadyExists(name)) if name == "data"
     ));
 }
 
 #[test]
-fn creation_writes_the_stable_store_marker_bytes() {
+fn catalog_reopens_named_collections_with_isolated_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    drop(Store::create(&path).unwrap());
+    let mut store = Store::create(&path).unwrap();
+    let left = create_byte_map(&mut store, "left").unwrap();
+    let right = create_byte_map(&mut store, "right").unwrap();
+    let marker = store.create_data::<Cell<u64>>("marker").unwrap();
+    let mut transactions = store.into_transactions();
 
-    let database = raw_database(&path);
-    let transaction = database.begin_ro_txn().unwrap();
-    let table = transaction.open_table(None).unwrap();
+    let transaction = transactions.begin();
+    left.access(transaction.access())
+        .unwrap()
+        .put(&b"key".to_vec(), &b"left".to_vec())
+        .unwrap();
+    right
+        .access(transaction.access())
+        .unwrap()
+        .put(&b"key".to_vec(), &b"right".to_vec())
+        .unwrap();
+    marker
+        .access(transaction.access())
+        .unwrap()
+        .set(&42)
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(transactions);
+
+    let store = Store::open(path).unwrap();
+    let left = open_byte_map(&store, "left").unwrap();
+    let right = open_byte_map(&store, "right").unwrap();
+    let marker = store.open_data::<Cell<u64>>("marker").unwrap();
+    let transaction = store.read_transaction();
     assert_eq!(
-        transaction.get::<Vec<u8>>(&table, &[0]).unwrap(),
-        Some(b"dogpaddle.store\0".to_vec())
+        left.read(transaction.access())
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"left".to_vec())
+    );
+    assert_eq!(
+        right
+            .read(transaction.access())
+            .unwrap()
+            .get(&b"key".to_vec())
+            .unwrap(),
+        Some(b"right".to_vec())
+    );
+    assert_eq!(
+        marker.read(transaction.access()).unwrap().get().unwrap(),
+        Some(42)
     );
 }
 
 #[test]
-fn opening_rejects_an_invalid_store_marker() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    drop(Store::create(&path).unwrap());
-
-    let database = raw_database(&path);
-    let transaction = database.begin_rw_txn().unwrap();
-    let table = transaction.open_table(None).unwrap();
-    transaction
-        .put(&table, [0], b"not-dogpaddle", WriteFlags::UPSERT)
-        .unwrap();
-    assert!(!transaction.commit().unwrap());
-    drop(database);
-
-    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
-}
-
-#[test]
-fn opening_rejects_a_corrupt_catalog_binding() {
+fn reopening_after_more_catalog_entries_keeps_existing_bindings() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    create_byte_map::<Small>(&mut store, "data").unwrap();
+    create_byte_map(&mut store, "first").unwrap();
     drop(store);
 
-    let database = raw_database(&path);
-    let transaction = database.begin_rw_txn().unwrap();
-    let table = transaction.open_table(None).unwrap();
-    let mut catalog_key = vec![2];
-    catalog_key.extend_from_slice(b"data");
-    transaction
-        .put(&table, &catalog_key, [9, 0, 0, 0, 0], WriteFlags::UPSERT)
-        .unwrap();
-    assert!(!transaction.commit().unwrap());
-    drop(database);
-
-    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
-}
-
-#[test]
-fn opening_rejects_duplicate_physical_catalog_bindings() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    create_byte_map::<Small>(&mut store, "left").unwrap();
-    create_byte_map::<Small>(&mut store, "right").unwrap();
+    let mut store = Store::open(&path).unwrap();
+    create_byte_map(&mut store, "second").unwrap();
     drop(store);
 
-    let database = raw_database(&path);
-    let transaction = database.begin_rw_txn().unwrap();
-    let table = transaction.open_table(None).unwrap();
-    let mut right_catalog_key = vec![2];
-    right_catalog_key.extend_from_slice(b"right");
-    transaction
-        .put(
-            &table,
-            &right_catalog_key,
-            [0, 0, 0, 0, 0],
-            WriteFlags::UPSERT,
-        )
+    let store = Store::open(path).unwrap();
+    store
+        .open_data::<OrderedMap<Vec<u8>, Vec<u8>>>("first")
         .unwrap();
-    assert!(!transaction.commit().unwrap());
-    drop(database);
-
-    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
-}
-
-#[test]
-fn opening_rejects_a_catalog_counter_behind_its_bindings() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    create_byte_map::<Small>(&mut store, "zero").unwrap();
-    create_byte_map::<Small>(&mut store, "one").unwrap();
-    drop(store);
-
-    let database = raw_database(&path);
-    let transaction = database.begin_rw_txn().unwrap();
-    let table = transaction.open_table(None).unwrap();
-    transaction
-        .put(&table, [1], 1_u32.to_be_bytes(), WriteFlags::UPSERT)
+    store
+        .open_data::<OrderedMap<Vec<u8>, Vec<u8>>>("second")
         .unwrap();
-    assert!(!transaction.commit().unwrap());
-    drop(database);
-
-    assert!(matches!(Store::open(&path), Err(StoreError::InvalidStore)));
 }
 
 #[cfg(unix)]

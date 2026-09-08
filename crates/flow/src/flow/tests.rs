@@ -10,7 +10,7 @@ use dogpaddle_operation::operation::{
     Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{AppendLog, Cell, Store};
+use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 use crate::{build::FlowFactory, error::FlowRunError, station::StationError};
 
@@ -110,36 +110,83 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
     let progressing_position: Cell<u64> = store
         .open_data("station/00000001/operation/sequence_scan.position")
         .unwrap();
-    let blocked_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let progressing_output: AppendLog<Vec<u8>> =
+    let blocked_output: SubscribedLog<Vec<u8>> =
+        store.open_data("station/00000000/output").unwrap();
+    let progressing_output: SubscribedLog<Vec<u8>> =
         store.open_data("station/00000001/output").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = store.read_transaction();
+    let blocked_output = blocked_output
+        .writer()
+        .status(transaction.access())
+        .unwrap();
+    let progressing_output = progressing_output
+        .writer()
+        .status(transaction.access())
+        .unwrap();
     assert_eq!(
         (
             blocked_position
-                .access(transaction.access())
+                .read(transaction.access())
                 .unwrap()
                 .get()
                 .unwrap(),
-            blocked_output
-                .access(transaction.access())
-                .unwrap()
-                .bounds()
-                .unwrap(),
+            (blocked_output.head, blocked_output.tail),
             progressing_position
-                .access(transaction.access())
+                .read(transaction.access())
                 .unwrap()
                 .get()
                 .unwrap(),
-            progressing_output
-                .access(transaction.access())
-                .unwrap()
-                .bounds()
-                .unwrap(),
+            (progressing_output.head, progressing_output.tail),
         ),
-        (Some(0), 0..1, Some(1), 0..2)
+        (Some(0), (0, 1), Some(1), (0, 2))
     );
+    assert!(blocked_output.retained_bytes > 0);
+    assert!(progressing_output.retained_bytes > blocked_output.retained_bytes);
+}
+
+#[test]
+fn fanout_retains_output_until_the_slowest_subscription_completes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut builder = FlowFactory::new(&path);
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
+    let first_sink = builder.station("first-sink", DiscardDefinition::new());
+    let slow_sink = builder.station("slow-sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(scan, NonZeroU64::MAX);
+    builder.connect([scan], first_sink);
+    builder.connect([scan], slow_sink);
+    let mut flow = builder.build().unwrap();
+
+    flow.topology.schedule = vec![0, 1];
+    assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
+    let pending = flow.status().unwrap();
+    let output = pending[0].output.as_ref().unwrap();
+    assert_eq!((output.head, output.tail), (0, 1));
+    assert!(output.retained_bytes > 0);
+    assert_eq!(
+        (pending[1].inputs[0].position, pending[2].inputs[0].position),
+        (1, 0)
+    );
+    drop(flow);
+
+    let mut reopened = FlowFactory::new(&path).open().unwrap();
+    let pending = reopened.status().unwrap();
+    assert_eq!(
+        (
+            pending[0].output.as_ref().unwrap().head,
+            pending[2].inputs[0].position
+        ),
+        (0, 0)
+    );
+    reopened.topology.schedule = vec![2];
+    assert_eq!(
+        reopened.advance().unwrap(),
+        super::AdvanceOutcome::Progressed
+    );
+    let caught_up = reopened.status().unwrap();
+    let output = caught_up[0].output.as_ref().unwrap();
+    assert_eq!((output.head, output.tail, output.retained_bytes), (1, 1, 0));
+    assert_eq!(caught_up[2].inputs[0].position, 1);
 }
 
 #[test]
@@ -181,7 +228,7 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
     assert!(
         preflight_error
             .to_string()
-            .contains("station must be reopened after a post-commit failure")
+            .contains("station must be reopened after an uncertain commit or post-commit failure")
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
     assert!(
@@ -196,23 +243,16 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
     let first_position: Cell<u64> = store
         .open_data("station/00000000/operation/sequence_scan.position")
         .unwrap();
-    let first_output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let first_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let transaction = store.read_transaction();
     assert_eq!(
         first_position
-            .access(transaction.access())
+            .read(transaction.access())
             .unwrap()
             .get()
             .unwrap(),
         Some(0)
     );
-    assert_eq!(
-        first_output
-            .access(transaction.access())
-            .unwrap()
-            .bounds()
-            .unwrap(),
-        0..1
-    );
+    let output = first_output.writer().status(transaction.access()).unwrap();
+    assert_eq!((output.head, output.tail), (0, 1));
 }

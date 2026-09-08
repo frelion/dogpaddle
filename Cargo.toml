@@ -46,7 +46,7 @@ dogpaddle-perf-context = { path = "test-support/perf-context" }
 dogpaddle-sql = { path = "crates/sql" }
 dogpaddle-store = { path = "crates/store" }
 flatbuffers = { version = "=25.12.19", default-features = false }
-libmdbx = { version = "=0.6.6", default-features = false }
+rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
 jni = { version = "=0.22.4", features = ["invocation"] }
 mysql = { version = "=28.0.2", default-features = false, features = ["minimal-rust"] }
 postgres = "=0.19.14"

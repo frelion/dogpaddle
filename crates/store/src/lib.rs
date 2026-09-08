@@ -8,22 +8,15 @@ mod store;
 
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
-    AppendLog, AppendLogAccess, AppendLogEntry, AppendLogReadAccess, AppendLogScan, Cell,
-    CellAccess, CellReadAccess, OrderedMap, OrderedMapAccess, OrderedMapEntry,
-    OrderedMapReadAccess, ReadOnly,
+    Cell, CellAccess, CellReadAccess, MultiplicityChange, MultisetEntry, MultisetPartition,
+    OrderedMap, OrderedMapAccess, OrderedMapEntry, OrderedMapReadAccess, OrderedMultiset,
+    OrderedMultisetAccess, OrderedMultisetReadAccess, PartitionedMultiset,
+    PartitionedMultisetAccess, PartitionedMultisetReadAccess, Queue, QueueAccess,
+    ReadMultisetPartition, SubscribedLog, SubscribedLogStatus, SubscribedLogWriter, Subscription,
+    SubscriptionStatus,
 };
 pub use data_class::StoreData;
 pub use error::StoreError;
-pub(crate) use store::{DataAccess, DataHandle, DataPlacement, ReadDataAccess, TransactionRef};
+pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess, TransactionRef};
 pub use store::{ReadTransaction, ReadTransactionAccess, ReadTransactions};
 pub use store::{ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions};
-
-/// Persistent size marker selecting shared physical storage for collections
-/// that support a size choice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Small;
-
-/// Persistent size marker selecting dedicated physical storage for collections
-/// that support a size choice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Large;

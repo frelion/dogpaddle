@@ -1,13 +1,9 @@
-use std::{
-    borrow::Cow,
-    path::{Path, PathBuf},
-};
+use std::{borrow::Cow, path::PathBuf};
 
-use dogpaddle_store::{CodecError, OrderedMap, Store, StoreData, StoreError, StoreKey, StoreValue};
-use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode};
+use dogpaddle_store::{CodecError, OrderedMap, Store, StoreError, StoreKey, StoreValue};
 use tempfile::TempDir;
 
-pub type ByteMap<SIZE> = OrderedMap<Vec<u8>, Vec<u8>, SIZE>;
+pub type ByteMap = OrderedMap<Vec<u8>, Vec<u8>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestValue(pub u64);
@@ -22,47 +18,21 @@ impl StoreValue for TestValue {
     }
 }
 
-pub fn create_byte_map<SIZE>(store: &mut Store, name: &str) -> Result<ByteMap<SIZE>, StoreError>
-where
-    ByteMap<SIZE>: StoreData,
-{
+pub fn create_byte_map(store: &mut Store, name: &str) -> Result<ByteMap, StoreError> {
     store.create_data(name)
 }
 
-pub fn open_byte_map<SIZE>(store: &Store, name: &str) -> Result<ByteMap<SIZE>, StoreError>
-where
-    ByteMap<SIZE>: StoreData,
-{
+pub fn open_byte_map(store: &Store, name: &str) -> Result<ByteMap, StoreError> {
     store.open_data(name)
 }
 
-pub fn create_map<K: StoreKey, V: StoreValue, SIZE>(
+pub fn create_map<K: StoreKey, V: StoreValue>(
     store: &mut Store,
     name: &str,
-) -> Result<OrderedMap<K, V, SIZE>, StoreError>
-where
-    OrderedMap<K, V, SIZE>: StoreData,
-{
+) -> Result<OrderedMap<K, V>, StoreError> {
     store.create_data(name)
 }
 
 pub fn store_path(root: &TempDir) -> PathBuf {
     root.path().join("store")
-}
-
-pub fn raw_database(path: &Path) -> Database<NoWriteMap> {
-    Database::<NoWriteMap>::open_with_options(
-        path,
-        DatabaseOptions {
-            permissions: Some(0o600),
-            max_tables: Some(u64::from(Store::LARGE_DATA_CAPACITY)),
-            exclusive: true,
-            mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .unwrap()
 }

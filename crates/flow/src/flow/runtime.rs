@@ -66,9 +66,4 @@ impl Flow {
     pub fn station_ids(&self) -> impl ExactSizeIterator<Item = &str> {
         self.station_ids.iter().map(String::as_str)
     }
-
-    #[cfg(test)]
-    pub(crate) fn into_runtime_parts(self) -> (Transactions, ReadTransactions, Vec<Station>) {
-        (self.transactions, self.reads, self.stations)
-    }
 }

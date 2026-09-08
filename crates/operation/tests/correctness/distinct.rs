@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{mem::size_of, num::NonZeroU32, sync::Arc};
 
 use arrow_array::{
     Float64Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array,
@@ -13,9 +13,7 @@ use dogpaddle_operation::{
         transform::{DistinctDefinition, DistinctError},
     },
 };
-use dogpaddle_store::{
-    Large, OrderedMap, ScanDirection, ScanLimit, Store, StoreError, Transactions,
-};
+use dogpaddle_store::{OrderedMultiset, Store, Transactions};
 
 use super::support::{
     TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
@@ -80,7 +78,7 @@ fn create_operation(
 }
 
 #[test]
-fn literal_definition_has_tag_13_exact_schema_and_one_weight_map() {
+fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
     let definition = DistinctDefinition::new();
     let decoded = assert_literal_definition(
         &definition,
@@ -269,7 +267,7 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
 }
 
 #[test]
-fn long_rows_are_not_used_as_store_keys() {
+fn long_canonical_rows_are_supported_as_exact_store_keys() {
     let input_schema = Arc::new(Schema::new(vec![Field::new(
         "label",
         DataType::Utf8,
@@ -299,6 +297,17 @@ fn long_rows_are_not_used_as_store_keys() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(labels.value(0), long);
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("weights").unwrap();
+    let transaction = store.read_transaction();
+    let weights = weights.read(transaction.access()).unwrap();
+    let mut canonical_row = Vec::with_capacity(1 + size_of::<u64>() + long.len());
+    canonical_row.push(1);
+    canonical_row.extend_from_slice(&u64::try_from(long.len()).unwrap().to_be_bytes());
+    canonical_row.extend_from_slice(long.as_bytes());
+    assert_eq!(weights.multiplicity(&canonical_row).unwrap(), 1);
 }
 
 #[test]
@@ -367,7 +376,7 @@ fn empty_logical_rows_keep_their_selected_row_count() {
 }
 
 #[test]
-fn zero_weight_removes_the_empty_bucket() {
+fn zero_weight_removes_the_exact_row_key() {
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root, &schema());
     let input = change(&[7, 7], &[3, -3]);
@@ -385,23 +394,10 @@ fn zero_weight_removes_the_empty_bucket() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let weights: OrderedMap<Vec<u8>, Vec<u8>, Large> = store.open_data("weights").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    let access = weights.access(transaction.access()).unwrap();
-    let mut count = 0;
-    access
-        .scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(1, 1024).unwrap(),
-            |_| {
-                count += 1;
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    transaction.commit().unwrap();
-    assert_eq!(count, 0);
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("weights").unwrap();
+    let transaction = store.read_transaction();
+    let weights = weights.read(transaction.access()).unwrap();
+    let mut canonical_row = vec![1];
+    canonical_row.extend_from_slice(&7_u64.to_be_bytes());
+    assert_eq!(weights.multiplicity(&canonical_row).unwrap(), 0);
 }

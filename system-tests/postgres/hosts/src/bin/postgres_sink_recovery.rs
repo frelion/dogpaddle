@@ -56,7 +56,7 @@ impl Host {
                 declaration.create(&mut store, declaration.name())?;
             }
             let mut transactions = store.into_transactions();
-            let transaction = transactions.begin()?;
+            let transaction = transactions.begin();
             saved.access(transaction.access())?.set(&encoded)?;
             transaction.commit()?;
         } else if mode != "open" {
@@ -65,7 +65,7 @@ impl Host {
         let store = Store::open(path)?;
         let saved: Cell<Vec<u8>> = store.open_data("definition")?;
         let definition = {
-            let snapshot = store.read_transaction()?;
+            let snapshot = store.read_transaction();
             decode_definition(
                 &saved
                     .read(snapshot.access())?
@@ -96,7 +96,7 @@ impl Host {
             // from apply/completion remain fatal in this small protocol host.
             Err(error) => return Ok(json!({"kind": "error", "message": error.to_string()})),
         };
-        let transaction = self.transactions.begin()?;
+        let transaction = self.transactions.begin();
         let before = self.state.access(transaction.access())?.get()?;
         let (action, completion) = prepared.apply(transaction.access())?;
         let action = match action {
@@ -107,7 +107,7 @@ impl Host {
         if command == "rollback" {
             drop(completion);
             drop(transaction);
-            let transaction = self.transactions.begin()?;
+            let transaction = self.transactions.begin();
             let unchanged = self.state.access(transaction.access())?.get()? == before;
             return Ok(json!({"kind": "rollback", "unchanged": unchanged}));
         }

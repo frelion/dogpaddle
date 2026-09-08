@@ -19,7 +19,7 @@ pub(super) fn read_published_definition(path: &Path) -> Vec<u8> {
     let store = Store::open(path).unwrap();
     let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     definition
         .access(transaction.access())
         .unwrap()
@@ -32,7 +32,7 @@ pub(super) fn publish_definition(path: &Path, encoded: &[u8]) {
     let mut store = Store::create(path).unwrap();
     let definition: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     definition
         .access(transaction.access())
         .unwrap()

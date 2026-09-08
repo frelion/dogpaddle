@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use dogpaddle_change::{Change, decode_change};
 use dogpaddle_perf_context::RunRoot;
-use dogpaddle_store::CodecError as StoreCodecError;
 use tempfile::TempDir;
 
 pub(crate) struct SampleStore {
@@ -22,6 +21,6 @@ impl SampleStore {
     }
 }
 
-pub(crate) fn decode_entry(encoded: &[u8]) -> Result<Change, StoreCodecError> {
-    decode_change(encoded).map_err(|error| StoreCodecError::new(error.to_string()))
+pub(crate) fn decode_entry(encoded: &[u8]) -> Change {
+    decode_change(encoded).expect("decode fixture Change")
 }

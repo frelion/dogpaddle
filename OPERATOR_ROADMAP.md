@@ -30,19 +30,24 @@ Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候�
 现有内核已经解决了后续算子最难事后补救的公共问题：
 
 - 完整、精确 logical Arrow Schema 的全图传播、绑定和运行期守卫；
-- Operation 状态、output、input cursor、active input 与 reclaim 的同事务提交；
+- Operation 状态、output、Subscription acknowledgement 与适用的多输入 active state 的同事务提交；
 - 背压、Operation 错误、commit 失败和 reopen 后的输入身份保持与完整重放；
 - 保留重复、事件顺序和非零正负 diff 的 `Change`；
 - 每个 Change 一个完整、自描述 Arrow IPC Stream 的稳定持久化边界；
 - Definition、Operation data class、资源布局和 reopen 的确定性装配；
-- 静态 DAG、fan-out、多输入端口与确定性有界调度。
+- 静态 DAG、fan-out、多输入端口与确定性有界调度；
+- RocksDB Store 的六种窄类型化结构，以及以 `SubscribedLog`/`Subscription` 表达的 output fan-out、
+  durable position、acknowledgement 和回收。
+
+当前 Flow 仍按确定性 schedule 顺序运行，唯一线性写事务 owner 仍由 Flow 持有；RocksDB 后端为未来
+并发演进保留空间，不表示本路线已经交付并发 Station 调度。
 
 当前内建算子为：
 
 | 类别 | 算子 | 当前角色 | 路线判断 |
 | --- | --- | --- | --- |
 | Scan | SequenceScan | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
-| Scan | PostgresCdcScan | 固定 Schema 单表全量快照 + WAL CDC，私有 spool 封口后原子发布 | 已有具体试点；TLS、跨实例 fencing 与在线 Schema evolution 仍待实施 |
+| Scan | PostgresCdcScan | 固定 Schema 单表全量快照 + WAL CDC，私有 Queue 封口后原子发布 | 已有具体试点；TLS、跨实例 fencing 与在线 Schema evolution 仍待实施 |
 | Scan | MySqlCdcScan | 固定 Schema 单表全量快照 + binlog CDC，terminal checkpoint 后 recovery | 已有具体试点；TLS、跨实例 fencing 与在线 Schema evolution 仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
@@ -93,7 +98,7 @@ Flow 运行层
 ├── build/open
 ├── deterministic bounded scheduling
 ├── backpressure
-├── claim/cursor/replay
+├── claim/subscription/replay
 └── transaction coordination
           │
           ├──► Change：Arrow records + ordered diffs + IPC
@@ -117,7 +122,7 @@ Flow 运行层
 - 明确声明 `Scan`、`Transform(nonzero arity)` 或 `Sink(nonzero arity)`；
 - 明确是否有 output；
 - 明确每个输入端口的含义和跨端口顺序契约；
-- 明确全部持久化 data class、逻辑名称、collection、codec 和 Size；
+- 明确全部持久化 data class、逻辑名称、collection 和 codec；
 - runtime Operation 不保存 Definition、Store 或事务启动能力。
 
 ### 2. Schema 契约
@@ -134,7 +139,7 @@ Flow 运行层
 - 明确重复记录如何处理；
 - 明确输入 diff 如何映射为输出 diff；
 - 明确是否维护关系权重，以及谁验证负权重前缀；
-- 不把 AppendLog offset 或物理 batch 边界当作业务 event ID；
+- 不把 Store 内部 sequence offset 或物理 batch 边界当作业务 event ID；
 - 不隐式排序、抵消、consolidation 或拆分业务事件。
 
 ### 4. 重批与 continuation 契约
@@ -149,7 +154,7 @@ Flow 运行层
 
 - `Turn::Idle` 不开启写事务，prepared `Action::Idle` 回滚本 turn 全部写入；
 - `Commit` 只提交 continuation 与可选 output，不完成输入；
-- `Complete` 原子提交状态、可选 output、cursor、active rotation 和 reclaim；
+- `Complete` 原子提交状态、可选 output、Subscription acknowledgement 与适用的 active rotation；
 - output capacity 拒绝回滚整个 turn 并保持输入 identity；
 - codec、overflow、Schema、Store 或 commit 错误不留下部分业务状态；
 - 外部确认只在本地提交后通过 `AfterCommit` 执行；必须提前发生的外部副作用另行定义持久幂等协议。
@@ -193,9 +198,10 @@ Arrow buffer。优化不能改变 Schema、diff、顺序或失败边界。
 
 ### 状态属于算子，协调属于 Flow
 
-Operation 只通过声明的 Cell/OrderedMap 等具体 data class 持有业务状态；Station/Flow 只协调输入
-identity、事务、output、cursor 和 retention。不能把 Aggregate、Join 或 Window continuation 隐藏在
-Station state。
+Operation 只通过声明的 `Cell`、`OrderedMap`、`OrderedMultiset`、`PartitionedMultiset`、`Queue` 等
+具体 data class 持有业务状态；Station/Flow 只协调内存 Claim、事务、output 和多输入 active state。
+每条 edge 的 durable position、acknowledgement 及由其触发的日志回收属于 Store 的 `Subscription`/
+`SubscribedLog` 契约。不能把 Aggregate、Join 或 Window continuation 隐藏在 Station state。
 
 ### 上层 API 不成为持久化真相
 
@@ -211,7 +217,7 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 | 0（已完成） | 固化算子产品契约 | RunningEventCount 命名、分类、conformance、能力矩阵 | 现有算子成为明确基线 |
 | 1（已完成基础范围） | 完成基础无状态/结构算子族 | SchemaAlign、Date/Timestamp/Decimal 传输、表达式状态矩阵 | 上层可可靠表达常见逐行变换 |
 | 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、MySqlCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
-| 3（已完成最小切片） | 建立精确行权重状态 | crate 私有 row digest、collision bucket、Distinct | 首个持久状态关系算子 |
+| 3（已完成最小切片） | 建立精确行权重状态 | `OrderedMultiset`、完整 canonical row identity、Distinct | 首个持久状态关系算子 |
 | 4（已完成最小切片） | 完成 Aggregate 与多重集算子 | grouped COUNT/SUM/AVG/MIN/MAX；global/set ops/UDF 待续 | 可持续维护首个分组聚合关系 |
 | 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
 | 6 | 引入有界、顺序与时间语义 | Barrier、TopK、Window、watermark | 明确承载完成、排序和时间计算 |
@@ -390,7 +396,7 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 ### 已完成：SqliteSink
 
 `SqliteSink` 是首个本地外部副作用 Sink：它为精确 input Schema 创建并独占一个 SQLite `STRICT`
-表，以 MDBX 中的版本化具体 mutation 批次覆盖 SQLite commit 与 MDBX commit 之间的失败窗口。
+表，以 Store 中的版本化具体 mutation 批次覆盖 SQLite commit 与 Store commit 之间的失败窗口。
 它不引入 SQLite 元数据表；在目标表未被外部修改、数据库文件未被替换或恢复的约束下，重放保持
 最终结果恰好一次。通用 ingress、结果订阅与关系 snapshot 仍属于本阶段后续工作。
 
@@ -404,18 +410,19 @@ turn(None)
 ├─ Idle → 直接返回，不开事务
 └─ Ready(prepared) → 开事务 → apply
    ├─ Action::Idle / 错误 / 背压 → 丢弃事务与 AfterCommit
-   └─ Action::Commit + output 已接纳 → commit → AfterCommit
+   └─ Action::Commit(Option<Change>) + phase 所需的 Queue/output 写入已接纳
+      → commit → AfterCommit
 ```
 
 零输入 Scan 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
 Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/Station 打开第二个 writer。
 两者按 `Fresh → Capturing → Publishing → Streaming` 推进。初始快照 delivery 先在事务外转换并
-编码为可选的完整 Change IPC，再把可选私有 spool entry、整个 delivery checkpoint 和 phase 在同一 MDBX 事务中提交；
-只有提交后才通过 `AfterCommit` ACK。terminal heartbeat 封口以后，每个 turn 从私有 spool 取一条 Change，
-并让出队与普通 Station output append 共用同一事务。因此下游背压、Schema mismatch 或 commit 失败既不会
+编码为可选的完整 Change IPC，再把可选私有 Queue item、整个 delivery checkpoint 和 phase 在同一 Store 事务中提交；
+只有提交后才通过 `AfterCommit` ACK。terminal heartbeat 封口以后，每个 turn 从私有 Queue 取一条 Change，
+并让 `pop_front` 与普通 Station output append 共用同一事务。因此下游背压、Schema mismatch 或 commit 失败既不会
 丢掉私有 entry，也不会暴露部分快照。最后一条出队和进入 `Streaming` 也在同一事务提交。
 
-`Capturing` 期崩溃不尝试从中间 checkpoint 续拍：`Resetting` 每个 turn 至多删除一条 spool entry，然后
+`Capturing` 期崩溃不尝试从中间 checkpoint 续拍：`Resetting` 每个 turn 至多 `pop_front` 一项，然后
 清除 checkpoint 并重新执行完整快照。PostgreSQL 在 reset 前还会于 Store 事务外删除由本 Scan 在 bootstrap
 创建的、inactive 且 identity 兼容的 source-owned slot；MySQL 没有同类服务端持久对象。`Publishing`/`Streaming` reopen
 不会重做快照。
@@ -424,8 +431,9 @@ Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/S
 
 - 不可变 exact logical Schema；
 - 每个 Scan 恰好声明 `phase: Cell<u32>`、`checkpoint: Cell<Vec<u8>>` 与
-  `bootstrap_spool: AppendLog<Vec<u8>>`；
-- 必填 `bootstrap_spool_bytes` 是 `retained + 8-byte offset + IPC` 的硬上限，空 spool 也不接纳超限首条；
+  `bootstrap_spool: Queue<Vec<u8>>`；
+- 必填 `bootstrap_spool_bytes` 是 Queue 按 `8-byte private sequence + IPC` 计费的硬上限，空 Queue
+  也不接纳超限首项；
 - PostgreSQL 用 `initial` 捕获已有行和 heartbeat 前 WAL，再从封口 checkpoint 以 `no_data` 继续同一 slot；
 - MySQL 8.4 用 `initial_only + minimal` 捕获一致全表快照，再从封口 checkpoint 以 `recovery` 继续 binlog；
 - 稳态 checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
@@ -444,7 +452,7 @@ IPv4/IPv6，连接握手和每个数据库工作单元都有 5 秒 client deadli
 显式的只读 catalog 操作，Definition/bind/materialize 与 Flow build/open 本身不访问 PG。
 
 SQLite 与 PG 共用 `relation_sink.state: Cell<Vec<u8>>` 和固定 ID 的批次协议。Ready turn 在
-MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；apply 先持久化 Prepared，
+Store 写事务外批量匹配关系行、规划至多 1024 个具体 mutation；apply 先持久化 Prepared，
 `AfterCommit` 才在一个目标事务中先 insert-ignore、再按 ID delete。下一 turn 结算 Ready：
 有 continuation 时 `Commit`，该 Change 结束时 `Complete`。目标已提交但结算前崩溃时原样重投
 同一组 ID；无需 receipt、delivery sequence 或 digest，也不重投已结算的旧批次。
@@ -453,7 +461,7 @@ MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；app
 恢复数据库，同一 target spec 不得被其他 Flow 接管或共享。远端 marker 只标识 ownership/layout
 版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；当前没有 TLS 或在线 Schema evolution。普通 Cargo gate 离线，显式本机
 `system-tests/postgres/check_sink.py` 覆盖初始化、大批 insert/delete、混合插删重放、宽 Schema、
-1000 条不同记录的交错更新与“PG 已提交/MDBX 仍 Prepared”窗口的进程重开。SQL 次数证据见
+1000 条不同记录的交错更新与“PG 已提交/Store 仍 Prepared”窗口的进程重开。SQL 次数证据见
 `TESTING.md`；尚无 Sink 独立吞吐或长稳 benchmark。
 
 两种 Definition 直接装配共享运行内核，数据库适配只负责目标检查、初始化、精确匹配和原子写入。
@@ -468,14 +476,11 @@ MDBX 事务外批量匹配关系行、规划至多 1024 个具体 mutation；app
 
 ### ResultLogSink
 
-持久保存输出 Change，并为客户端提供独立 consumer cursor：
-
-```rust,ignore
-let page = flow.result_log("result")?.read_from(cursor, limit)?;
-```
-
-它用于订阅变化、调试 diff、查询间转发和完整序列验证。动态 consumer 的注册、retention 和过期
-策略需要明确归属，不能绕过 producer 的完整 consumer frontier。
+持久保存输出 Change，并为客户端提供独立 Subscription。若交付这一能力，它直接建立在 Store
+`SubscribedLog` 的 writer、position、acknowledgement 和回收语义上，不在 Flow 中复制 consumer position
+或 retention state。它用于订阅变化、调试 diff、查询间转发和完整序列验证。当前 `SubscribedLog` 在初始化时
+固定 subscriber 数；动态 consumer 的注册、租约与过期必须先形成新的明确 Store 契约，不能由 ResultLog
+私自维护第二套 retention 状态。
 
 ### MaterializeSink
 
@@ -491,7 +496,7 @@ let page = flow.result_log("result")?.read_from(cursor, limit)?;
 
 ### 其他外部副作用 Sink
 
-`SqliteSink` 与 `PostgresSink` 已用同一固定 ID Prepared 批次覆盖目标/MDBX 提交窗口。
+`SqliteSink` 与 `PostgresSink` 已用同一固定 ID Prepared 批次覆盖目标/Store 提交窗口。
 后续网络、文件和数据库连接器仍须先选择 outbox、
 幂等 key 或明确的两阶段协议；Operation `turn` 内不得留下无法由该协议重放或验证的可观察副作用。
 
@@ -529,19 +534,18 @@ Discard。
 
 ### 目标
 
-只实现 Distinct 真正需要的持久状态：按完整 canonical row 维护当前正权重。这里不增加 Store
-collection，不发布通用 relation trait，也不预先设计 Aggregate/Join 的 arrangement 或 continuation。
+只实现 Distinct 真正需要的持久状态：按完整 canonical row 维护当前正权重。这里增加的
+`OrderedMultiset` 是通用 Store 数据结构，但不发布 relation trait，也不预先设计 Aggregate/Join 的
+arrangement 或 continuation。
 
-### 私有持久状态
+### 持久状态
 
-`distinct.weights` 是
-`OrderedMap<RowDigest, CollisionBucket, Large>`。256-bit BLAKE3 digest 只定位 bucket；完整
-canonical row bytes 才定义记录身份，所以不同 row 即使 digest 冲突也能共存并被精确比较。bucket
-以稳定格式保存唯一的 `(row, positive u64 weight)`；weight 归零时删除 row，bucket 归空时删除
-map entry。
+`distinct.weights` 是 `OrderedMultiset<Vec<u8>>`，key 直接使用完整 canonical row bytes，正 `u64`
+multiplicity 由 Store 维护；缺失表示零，checked signed adjustment 归零就删除 key。记录 identity 直接
+来自完整 bytes，不经过额外 hash 层。
 
-canonical row 编码由现有关系 Sink 与 Distinct 共用，digest、bucket 和权重更新都留在 operation
-crate 私有模块。后续算子只复用真实证明相同的部分。
+canonical row 编码与 diff 语义仍留在 operation crate 私有 relation 模块；Store 只提供通用的有序
+multiplicity。后续算子只复用真实证明相同的部分。
 
 ### Distinct
 
@@ -559,7 +563,7 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 ### 已完成结果
 
 - `Distinct` 以 tag `13`、空 payload 和唯一 `distinct.weights` 资源进入统一 bind/materialize/turn 路径；
-- collision bucket 使用完整 row 做最终比较，不把 hash 当记录身份；
+- 完整 canonical row 直接作为 `OrderedMultiset` key，不把 hash 当记录身份；
 - codec、边界变化、负前缀/overflow、背压与 reopen 有对应 owner 证据；
 - SQL 只新增 `SELECT DISTINCT` lowering；普通 `UNION` 仍未支持；
 - Aggregate 已在阶段 4 建立自己的 group/admission/index state；Join 的专用状态仍按其语义另行设计。
@@ -588,19 +592,18 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 Aggregate 只声明三个资源：
 
 ```text
-aggregate.groups   GroupDigest → full group + group ID + weight + call states
-aggregate.entries  (layout, group ID, tuple digest) → full tuple + weight
-aggregate.control  next group ID
+aggregate.groups   OrderedMap<canonical group, group ID + weight + Fold states>
+aggregate.entries  PartitionedMultiset<(layout, group ID), ordered entry key>
+aggregate.control  Cell<next group ID>
 ```
 
 `entries` 的 layout `0` 保存每个完整 canonical input row，是撤回前的 exact admission；其余 layout
-保存 Indexed reduction 的 canonical argument tuple。相同持久表达式 tuple 共享一个 layout，不按函数复制
-multiset。digest 只定位 collision bucket，完整 bytes 才定义 identity。
+保存 extrema 的有序 canonical argument key。相同持久表达式共享一个 layout，不按函数复制 multiset；
+partition 由 `layout + group ID` 定义，完整 bytes 直接定义 identity。
 
 私有静态 descriptor 唯一声明 function tag、arity、binding 与 reduction 形态：`Fold` 只操作每组有界小
-state，`Indexed` 只操作 argument tuple 和自己的小候选 state，二者都不接收 Store。COUNT/SUM/AVG 是 Fold；
-MIN/MAX 是 Indexed。当前极值撤回时，runtime 只扫描该 layout + group，按一次一个 digest collision bucket
-分页并只保留当前候选，不把整组 materialize 到内存。
+state，`Extrema` 只定义 argument key 的绑定与顺序，二者都不接收 Store。COUNT/SUM/AVG 是 Fold；
+MIN/MAX 通过对应 partition 的 `first`/`last` 直接取得当前极值，不再维护候选状态或分页重扫整组。
 
 ### 输出变化
 
@@ -619,13 +622,13 @@ output 与 input completion 在同一事务提交；错误、背压和 reopen �
 
 ### Min/Max 的特殊状态
 
-MIN/MAX 为每个 argument tuple 维护正权重；当前值撤回到零才触发上述分页重扫。null 不进入候选，
+MIN/MAX 为每个 argument key 维护正权重；当前值撤回到零后直接读取 partition 的新首项或末项。null 不进入候选，
 zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema index。
 
 ### 最小切片证据与剩余工作
 
 - owner correctness 已覆盖 tag/payload、三资源、bind/materialize、COUNT/SUM/AVG/MIN/MAX 的有序变化、
-  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后重扫；SQL 有跨 drop/open 的最终关系 witness、
+  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后有序极值读取；SQL 有跨 drop/open 的最终关系 witness、
   纯分组 witness 及拒绝路径无目录副作用证据。
 - 尚需 global aggregate 的空关系语义、UnionDistinct/Intersect/Except、aggregate DISTINCT/FILTER/ORDER、
   UDF 接入、更多类型，以及大 group cardinality/高更新频率 benchmark；这些不由当前最小切片暗示支持。
@@ -634,7 +637,8 @@ zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema i
 
 ### 目标
 
-在阶段 3 的 arrangement、weight invariant 和 materialized oracle 上实现多输入增量 Join。
+在阶段 3 已证明的完整行 weight invariant 和 materialized oracle 上独立设计多输入增量 Join。优先组合
+现有有序 Store 结构，但不假定 Distinct 或 Aggregate 已经提供 Join arrangement。
 
 ### 实现顺序
 
@@ -670,7 +674,8 @@ Outer Join 还要维护匹配数量：
 - 不依赖跨端口的物理交织；
 - 合法端口交织得到同一最终关系；
 - left/right identity 和 key Schema 持久化稳定；
-- Join state、output、当前输入 completion 和 reclaim 同事务提交；
+- Join state、output 与当前输入的 Subscription acknowledgement 同事务提交；日志回收由 Store 从
+  acknowledgement 派生；
 - 未完成输入完整重放不重复加入 Join state。
 
 ### 退出标准
@@ -712,7 +717,9 @@ data/control input，同时保持普通 Change 路径简单。
 - 无界流中的 `Limit` 必须说明达到数量后是否永久停止消费；
 - 持续 TopK 维护当前前 K 个关系项，输入变化时撤回旧成员并插入新成员；
 - 排序 key、null order、稳定 tie-break 和 Float NaN 必须确定；
-- TopK 状态和输出必须理解 diff，不能把当前物理 batch 当成全集。
+- TopK 状态和输出必须理解 diff，不能把当前物理 batch 当成全集；
+- 状态应先组合现有 `OrderedMap`/`PartitionedMultiset` 的有序 key、partition 与边界读取能力；只有真实
+  TopK 语义无法由它们直接表达时，才增加新的 Store collection。
 
 ### Window 与时间
 
@@ -736,7 +743,7 @@ data/control input，同时保持普通 Change 路径简单。
 - 有限 Scan 拥有真正 completion，不依赖 Idle；
 - barrier 多输入对齐、reopen 和 backpressure 有独立状态模型；
 - TopK/Window 输出在声明的比较域内对重批稳定；
-- window cleanup 与 output/cursor 同事务或拥有明确的可恢复协议；
+- window cleanup 与 output/Subscription acknowledgement 同事务或拥有明确的可恢复协议；
 - 时间、timezone、late data 和不兼容版本行为文档化并有公共证据。
 
 ## 阶段 7：运行产品化与上层 API 就绪
@@ -768,7 +775,7 @@ RebuildRequired
 
 已有 `PostgresCdcScan`、`SqliteSink` 与 `PostgresSink` 试点；后续候选包括：
 
-1. 本地 API/AppendLog ingress；
+1. 本地 API/Queue ingress；
 2. 文件 snapshot；
 3. Kafka；
 4. 其他数据库 CDC；
@@ -784,10 +791,10 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 至少暴露：
 
 - Flow/Station/Operation 状态与错误；
-- input cursor、active input、output head/tail；
+- input Subscription position、active input、output head/tail；
 - retained bytes、capacity 和 backlog；
 - backpressure 来源；
-- turn、commit、decode、evaluate、encode 和 reclaim 指标；
+- turn、commit、decode、evaluate、encode、Subscription acknowledgement 和日志回收指标；
 - Definition/tag/Schema/version；
 - Store 磁盘使用和 materialized state 大小。
 
@@ -849,7 +856,7 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 - 绕过 exact Schema binding；
 - 依赖未声明的 Store collection；
 - 用自己的 retry 规则改变 Operation Action 语义；
-- 把物理 batch、AppendLog offset 或 Station ID 暴露为业务事件 identity。
+- 把物理 batch、Store sequence offset 或 Station ID 暴露为业务事件 identity。
 
 ### 退出标准
 
@@ -869,11 +876,12 @@ Prepared 批次与目标原子事务覆盖提交空隙。其他连接器不能�
 3. **Definition golden**：tag、payload、truncation 和 canonical decode 有稳定证据。
 4. **Schema binding**：成功和每种合法但不兼容输入都有结构化结果。
 5. **纯失败无副作用**：binding、声明或拓扑失败不创建 Store 路径。
-6. **data layout**：资源名、collection、codec、Size、create/open/reopen 精确。
+6. **data layout**：资源名、collection、codec、create/open/reopen 精确。
 7. **runtime Schema guard**：错误 input 不安装 Claim，错误 output 回滚 turn。
 8. **稳定重批**：展平 input/output 和最终状态满足声明契约。
 9. **完整重放**：Idle、Commit、错误、背压、commit 失败和 reopen 不多应用或跳过输入。
-10. **事务原子性**：Operation state、output、cursor、active input 和 reclaim 全旧或全新。
+10. **事务原子性**：Operation state、output、Subscription acknowledgement 与适用的 active input
+    全旧或全新，日志回收由同一 Store 操作完成。
 11. **关系权重**：维护关系的算子拒绝非法负权重前缀并完整回滚。
 12. **损坏拒绝**：malformed Definition、Change、state 无 panic、无部分写入。
 13. **互操作**：Change 输出保持标准 Arrow IPC Stream；新增类型同步验证标准 reader。
@@ -921,9 +929,9 @@ exact-row weights（已完成）
 → Inner Join
 ```
 
-Distinct 提供共享的 canonical row、collision bucket 和 checked weight 原语；Aggregate 在其上新增私有
-group ID、exact admission、Fold/Indexed descriptor 和 argument-tuple layout。Join 的 keyed arrangement、fan-out
-和 continuation 仍按 Join 语义另行设计。
+Distinct 用完整 canonical row 与 `OrderedMultiset` 建立 checked weight 语义；Aggregate 组合
+`OrderedMap`、`PartitionedMultiset` 与 `Cell`，新增私有 group ID、exact admission、Fold/Extrema
+descriptor 和有序 argument layout。Join 的 keyed arrangement、fan-out 和 continuation 仍按 Join 语义另行设计。
 
 ## 开放决策
 
@@ -931,7 +939,8 @@ group ID、exact admission、Fold/Indexed descriptor 和 argument-tuple layout�
 命名，以及 Date32/Timestamp/Decimal128 的第一版 Change 边界，已经在阶段 0/1 关闭：
 
 - 未来本地输入 API 的幂等 identity 作用域是 input、Flow 还是全局？这不要求把 connector checkpoint 当作 identity。
-- ResultLog consumer 是 Definition 的静态一部分，还是运行期动态注册？
+- ResultLog 是否只使用 build 时固定的 `SubscribedLog` subscriptions；若要动态注册，租约、过期和回收
+  应如何扩展 Store 契约？
 - Materialize 如何稳定编码完整 Record key、weight 和分页 continuation？
 - Join 的 keyed arrangement、fan-out 和有界 continuation 应该如何持久化？
 - Consolidate 的显式作用域是一个 Change、barrier 区间还是完整关系？
@@ -939,7 +948,7 @@ group ID、exact admission、Fold/Indexed descriptor 和 argument-tuple layout�
 - 时间和随机表达式来自输入、持久执行上下文还是 control signal？
 - end-of-input/barrier 如何进入统一 Operation input protocol？
 - bounded Sort、持续 TopK 和 Window 各自的完成及 retention 边界是什么？
-- 多个 Flow 是否共享输入日志或 arrangement；若共享，由哪个组合根拥有 retention？
+- 多个 Flow 是否共享输入 `SubscribedLog` 或 arrangement；若共享，由哪个组合根声明 subscriptions 并拥有 retention？
 - 何时引入 partition/exchange，而不破坏唯一 writer 和确定性提交？
 - SQL 在 Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
   capability/introspection？

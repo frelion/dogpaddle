@@ -22,8 +22,8 @@ pub struct DiscardDefinition {
 
 /// Materialized sink that intentionally discards every input Change.
 ///
-/// Input completion remains durable because the owning Station commits its
-/// cursor in the same transaction as this Operation turn.
+/// Input completion remains durable because the owning Station acknowledges
+/// its Subscription in the same transaction as this Operation turn.
 pub struct DiscardOperation;
 
 /// Discard-specific failure during one [`DiscardOperation`] turn.

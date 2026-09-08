@@ -16,9 +16,12 @@ pub enum MySqlCdcScanError {
     /// An external resource or live catalog does not satisfy the Scan contract.
     #[error("MySQL CDC scan runtime failed: {0}")]
     InvalidRuntime(String),
-    /// Persisted Scan state is invalid or exceeds its explicit bound.
+    /// Persisted Scan state is invalid.
     #[error("invalid MySQL CDC scan state: {0}")]
     InvalidState(&'static str),
+    /// The complete initial snapshot cannot fit its configured private spool.
+    #[error("MySQL initial snapshot exceeds bootstrap_spool_bytes")]
+    BootstrapSpoolFull,
     /// A typed Arrow array or batch could not be constructed.
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),

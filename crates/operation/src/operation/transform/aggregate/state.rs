@@ -1,193 +1,95 @@
 use std::borrow::Cow;
 
-use dogpaddle_store::{Cell, CodecError, Large, OrderedMap, StoreKey, StoreValue};
+use dogpaddle_store::{Cell, CodecError, OrderedMap, PartitionedMultiset, StoreKey, StoreValue};
 
-use crate::operation::relation::{CollisionBucket, RowDigest};
-
-pub(super) type Groups = OrderedMap<RowDigest, GroupBucket, Large>;
-pub(super) type Entries = OrderedMap<EntryKey, CollisionBucket, Large>;
+pub(super) type Groups = OrderedMap<Vec<u8>, GroupState>;
+pub(super) type Entries = PartitionedMultiset<EntryPartition, Vec<u8>>;
 pub(super) type Control = Cell<u64>;
 
-const GROUP_BUCKET_VERSION: u8 = 1;
+const GROUP_STATE_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct GroupEntry {
-    pub(super) group: Vec<u8>,
+pub(super) struct GroupState {
     pub(super) id: u64,
     pub(super) weight: u64,
-    pub(super) calls: Vec<Vec<u8>>,
+    pub(super) folds: Vec<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct GroupBucket {
-    entries: Vec<GroupEntry>,
-}
-
-impl GroupBucket {
-    pub(super) fn one(entry: GroupEntry) -> Self {
-        Self {
-            entries: vec![entry],
-        }
-    }
-
-    pub(super) fn get_mut(&mut self, group: &[u8]) -> Option<&mut GroupEntry> {
-        self.entries
-            .binary_search_by(|entry| entry.group.as_slice().cmp(group))
-            .ok()
-            .map(|index| &mut self.entries[index])
-    }
-
-    pub(super) fn insert(&mut self, entry: GroupEntry) {
-        let index = self
-            .entries
-            .binary_search_by(|candidate| candidate.group.cmp(&entry.group))
-            .expect_err("the caller inserts a group absent from its digest bucket");
-        self.entries.insert(index, entry);
-    }
-
-    pub(super) fn remove(&mut self, group: &[u8]) {
-        let index = self
-            .entries
-            .binary_search_by(|entry| entry.group.as_slice().cmp(group))
-            .expect("the caller removes a group present in its digest bucket");
-        self.entries.remove(index);
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl StoreValue for GroupBucket {
+impl StoreValue for GroupState {
     fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
-        let count = u32::try_from(self.entries.len())
-            .map_err(|_| CodecError::new("aggregate group bucket has too many entries"))?;
-        if count == 0 {
-            return Err(CodecError::new("aggregate group bucket is empty"));
+        if self.weight == 0 {
+            return Err(CodecError::new("aggregate group has zero weight"));
         }
-
+        let count = u32::try_from(self.folds.len())
+            .map_err(|_| CodecError::new("aggregate group has too many fold states"))?;
         let mut encoded = Vec::new();
-        encoded.push(GROUP_BUCKET_VERSION);
+        encoded.push(GROUP_STATE_VERSION);
+        encoded.extend_from_slice(&self.id.to_be_bytes());
+        encoded.extend_from_slice(&self.weight.to_be_bytes());
         encoded.extend_from_slice(&count.to_be_bytes());
-        let mut previous: Option<&[u8]> = None;
-        for entry in &self.entries {
-            if entry.weight == 0 {
-                return Err(CodecError::new("aggregate group has zero weight"));
-            }
-            if previous.is_some_and(|previous| previous >= entry.group.as_slice()) {
-                return Err(CodecError::new(
-                    "aggregate group bucket is not canonically ordered",
-                ));
-            }
-            previous = Some(&entry.group);
-            put_bytes(&mut encoded, &entry.group)?;
-            encoded.extend_from_slice(&entry.id.to_be_bytes());
-            encoded.extend_from_slice(&entry.weight.to_be_bytes());
-            let calls = u32::try_from(entry.calls.len())
-                .map_err(|_| CodecError::new("aggregate group has too many call states"))?;
-            encoded.extend_from_slice(&calls.to_be_bytes());
-            for state in &entry.calls {
-                put_bytes(&mut encoded, state)?;
-            }
+        for state in &self.folds {
+            put_bytes(&mut encoded, state)?;
         }
         Ok(encoded)
     }
 
     fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
         let mut cursor = ValueCursor::new(bytes.as_ref());
-        if cursor.u8()? != GROUP_BUCKET_VERSION {
-            return Err(CodecError::new(
-                "unsupported aggregate group bucket version",
-            ));
+        if cursor.u8()? != GROUP_STATE_VERSION {
+            return Err(CodecError::new("unsupported aggregate group state version"));
+        }
+        let id = cursor.u64()?;
+        let weight = cursor.u64()?;
+        if weight == 0 {
+            return Err(CodecError::new("aggregate group has zero weight"));
         }
         let count = usize::try_from(cursor.u32()?)
-            .map_err(|_| CodecError::new("aggregate group count exceeds usize"))?;
-        if count == 0 {
-            return Err(CodecError::new("aggregate group bucket is empty"));
-        }
-
-        let mut entries = Vec::new();
+            .map_err(|_| CodecError::new("aggregate call count exceeds usize"))?;
+        let mut folds = Vec::with_capacity(count);
         for _ in 0..count {
-            let group = cursor.bytes()?.to_vec();
-            let id = cursor.u64()?;
-            let weight = cursor.u64()?;
-            if weight == 0 {
-                return Err(CodecError::new("aggregate group has zero weight"));
-            }
-            let call_count = usize::try_from(cursor.u32()?)
-                .map_err(|_| CodecError::new("aggregate call count exceeds usize"))?;
-            let mut calls = Vec::new();
-            for _ in 0..call_count {
-                calls.push(cursor.bytes()?.to_vec());
-            }
-            entries.push(GroupEntry {
-                group,
-                id,
-                weight,
-                calls,
-            });
+            folds.push(cursor.bytes()?.to_vec());
         }
         cursor.finish()?;
-        if !entries.windows(2).all(|pair| pair[0].group < pair[1].group) {
-            return Err(CodecError::new(
-                "aggregate group bucket is not canonically ordered",
-            ));
-        }
-        Ok(Self { entries })
+        Ok(Self { id, weight, folds })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct EntryKey {
+pub(super) struct EntryPartition {
     layout: u32,
     group: u64,
-    digest: [u8; 32],
 }
 
-impl EntryKey {
-    pub(super) fn new(layout: u32, group: u64, digest: RowDigest) -> Self {
-        Self {
-            layout,
-            group,
-            digest: *digest.as_bytes(),
-        }
-    }
-
-    pub(super) const fn first(layout: u32, group: u64) -> Self {
-        Self {
-            layout,
-            group,
-            digest: [0; 32],
-        }
-    }
-
-    pub(super) const fn last(layout: u32, group: u64) -> Self {
-        Self {
-            layout,
-            group,
-            digest: [u8::MAX; 32],
-        }
+impl EntryPartition {
+    pub(super) const fn new(layout: u32, group: u64) -> Self {
+        Self { layout, group }
     }
 }
 
-impl StoreKey for EntryKey {
+impl StoreKey for EntryPartition {
     fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
-        let mut encoded = [0_u8; 44];
+        let mut encoded = [0_u8; 12];
         encoded[..4].copy_from_slice(&self.layout.to_be_bytes());
-        encoded[4..12].copy_from_slice(&self.group.to_be_bytes());
-        encoded[12..].copy_from_slice(&self.digest);
+        encoded[4..].copy_from_slice(&self.group.to_be_bytes());
         Ok(encoded)
     }
 
     fn decode_key(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        let encoded: [u8; 44] = bytes
+        let encoded: [u8; 12] = bytes
             .as_ref()
             .try_into()
-            .map_err(|_| CodecError::new("invalid aggregate entry key length"))?;
+            .map_err(|_| CodecError::new("invalid aggregate entry partition length"))?;
         Ok(Self {
-            layout: u32::from_be_bytes(encoded[..4].try_into().expect("four-byte slice")),
-            group: u64::from_be_bytes(encoded[4..12].try_into().expect("eight-byte slice")),
-            digest: encoded[12..].try_into().expect("32-byte slice"),
+            layout: u32::from_be_bytes(
+                encoded[..4]
+                    .try_into()
+                    .expect("the slice has exactly four bytes"),
+            ),
+            group: u64::from_be_bytes(
+                encoded[4..]
+                    .try_into()
+                    .expect("the slice has exactly eight bytes"),
+            ),
         })
     }
 }
@@ -214,11 +116,11 @@ impl<'a> ValueCursor<'a> {
     }
 
     fn u32(&mut self) -> Result<u32, CodecError> {
-        Ok(u32::from_be_bytes(self.take::<4>()?))
+        Ok(u32::from_be_bytes(self.take()?))
     }
 
     fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.take::<8>()?))
+        Ok(u64::from_be_bytes(self.take()?))
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], CodecError> {
@@ -256,61 +158,38 @@ mod tests {
 
     use dogpaddle_store::{StoreKey, StoreValue};
 
-    use crate::operation::relation::RowDigest;
-
-    use super::{EntryKey, GroupBucket, GroupEntry};
-
-    const GROUP_BUCKET_LITERAL: &[u8] = concat!(
-        "\x01\x00\x00\x00\x02",
-        "\x00\x00\x00\x00\x00\x00\x00\x05first",
-        "\x00\x00\x00\x00\x00\x00\x00\x01",
-        "\x00\x00\x00\x00\x00\x00\x00\x01",
-        "\x00\x00\x00\x01",
-        "\x00\x00\x00\x00\x00\x00\x00\x01\x01",
-        "\x00\x00\x00\x00\x00\x00\x00\x06second",
-        "\x00\x00\x00\x00\x00\x00\x00\x02",
-        "\x00\x00\x00\x00\x00\x00\x00\x01",
-        "\x00\x00\x00\x01",
-        "\x00\x00\x00\x00\x00\x00\x00\x01\x02",
-    )
-    .as_bytes();
-
-    fn group(bytes: &[u8], id: u64) -> GroupEntry {
-        GroupEntry {
-            group: bytes.to_vec(),
-            id,
-            weight: 1,
-            calls: vec![vec![u8::try_from(id).unwrap()]],
-        }
-    }
+    use super::{EntryPartition, GroupState};
 
     #[test]
-    fn entry_key_is_fixed_width_and_group_bucket_resolves_full_byte_collisions() {
-        let digest = RowDigest::decode_key(Cow::Owned(vec![0x7f; 32])).unwrap();
-        let key = EntryKey::new(0x0102_0304, 0x0506_0708_090a_0b0c, digest);
-        let encoded_key = key.encode_key().unwrap();
-        assert_eq!(encoded_key.as_ref().len(), 44);
-        assert_eq!(&encoded_key.as_ref()[..4], &0x0102_0304_u32.to_be_bytes());
+    fn group_state_and_partition_round_trip() {
+        let state = GroupState {
+            id: 7,
+            weight: 3,
+            folds: vec![vec![1, 2], Vec::new()],
+        };
+        let encoded = state.encode_value().unwrap().as_ref().to_vec();
         assert_eq!(
-            &encoded_key.as_ref()[4..12],
-            &0x0506_0708_090a_0b0c_u64.to_be_bytes()
+            encoded,
+            [
+                1, // version
+                0, 0, 0, 0, 0, 0, 0, 7, // group ID
+                0, 0, 0, 0, 0, 0, 0, 3, // group weight
+                0, 0, 0, 2, // fold count
+                0, 0, 0, 0, 0, 0, 0, 2, 1, 2, // first fold
+                0, 0, 0, 0, 0, 0, 0, 0, // second fold
+            ]
         );
-        assert_eq!(&encoded_key.as_ref()[12..], &[0x7f; 32]);
         assert_eq!(
-            EntryKey::decode_key(Cow::Borrowed(encoded_key.as_ref())).unwrap(),
-            key
+            GroupState::decode_value(Cow::Borrowed(&encoded)).unwrap(),
+            state
         );
 
-        let mut bucket = GroupBucket::one(group(b"second", 2));
-        bucket.insert(group(b"first", 1));
-        assert_eq!(bucket.get_mut(b"first").unwrap().id, 1);
-        assert_eq!(bucket.get_mut(b"second").unwrap().id, 2);
-        let encoded_bucket = bucket.encode_value().unwrap().as_ref().to_vec();
-        assert_eq!(encoded_bucket, GROUP_BUCKET_LITERAL);
-        let decoded = GroupBucket::decode_value(Cow::Borrowed(&encoded_bucket)).unwrap();
-        assert_eq!(decoded, bucket);
-        bucket.remove(b"first");
-        assert!(bucket.get_mut(b"first").is_none());
-        assert_eq!(bucket.get_mut(b"second").unwrap().id, 2);
+        let partition = EntryPartition::new(5, 9);
+        let encoded = partition.encode_key().unwrap().as_ref().to_vec();
+        assert_eq!(encoded, [0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(
+            EntryPartition::decode_key(Cow::Borrowed(&encoded)).unwrap(),
+            partition
+        );
     }
 }

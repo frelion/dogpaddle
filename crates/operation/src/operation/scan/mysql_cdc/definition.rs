@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_store::{AppendLog, Cell};
+use dogpaddle_store::{Cell, Queue};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -16,8 +16,7 @@ pub(crate) const TAG: u16 = 15;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 const PHASE: DataName<Cell<u32>> = DataName::new("mysql_cdc_scan.phase");
 const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("mysql_cdc_scan.checkpoint");
-const BOOTSTRAP_SPOOL: DataName<AppendLog<Vec<u8>>> =
-    DataName::new("mysql_cdc_scan.bootstrap_spool");
+const BOOTSTRAP_SPOOL: DataName<Queue<Vec<u8>>> = DataName::new("mysql_cdc_scan.bootstrap_spool");
 static DATA: [DataDeclaration; 3] = [
     PHASE.declaration(),
     CHECKPOINT.declaration(),
@@ -66,8 +65,9 @@ impl MySqlCdcScanDefinition {
     /// Freezes a discovered source and its private bootstrap spool capacity.
     ///
     /// The capacity is an exact logical retained-byte ceiling: each encoded
-    /// Change contributes its full IPC byte length plus its eight-byte log
-    /// offset. It must hold the complete initial snapshot until publication.
+    /// Change contributes its full IPC byte length plus the queue's private
+    /// eight-byte sequence key. It must hold the complete initial snapshot
+    /// until publication.
     ///
     /// # Errors
     ///

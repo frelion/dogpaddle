@@ -2,7 +2,7 @@
 
 `dogpaddle-debezium` embeds the stock Debezium Engine in `DogPaddle`'s Rust
 process and exposes a small connector-neutral pull/ACK API. It knows Debezium
-and Kafka Connect offsets, but not Arrow, `Change`, MDBX, Operation, Flow, or a
+and Kafka Connect offsets, but not Arrow, `Change`, Store, Operation, Flow, or a
 connector-specific position type. `PostgreSQL` and `MySQL` are packaged in the
 reference distribution.
 

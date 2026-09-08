@@ -14,7 +14,7 @@ The gate answers one narrow question:
 > Java offset file?
 
 This remains a WAL-only, one-table PostgreSQL pilot. It is not yet a
-DogPaddle Scan Operation, does not use MDBX, and makes no snapshot, schema
+DogPaddle Scan Operation, does not use the DogPaddle Store, and makes no snapshot, schema
 evolution, transaction-framing, or Arrow mapping claim.
 
 ## Boundary under test
@@ -52,7 +52,7 @@ and Debezium 3.6.2 does not surface every `SourceTask.commit()` failure through
 subsequent source poll and/or graceful stop. This is eventual WAL-retention
 feedback, not part of DogPaddle's durability decision.
 
-The flat checkpoint file is a fixture stand-in for the future MDBX transaction.
+The flat checkpoint file is a fixture stand-in for a DogPaddle Store transaction.
 It is the only durable accepted-offset truth. The connector fixture contains no
 `offset.*` property; the product bridge owns its in-memory Kafka Connect offset
 store and restores it solely from `Checkpoint`.

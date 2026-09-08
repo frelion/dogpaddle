@@ -123,7 +123,7 @@ fn postgres_sink_build_and_reopen_are_offline_and_use_one_stable_state_cell() {
 
     let store = Store::open(&path).unwrap();
     let state: Cell<Vec<u8>> = store.open_data(STATE).unwrap();
-    let transaction = store.read_transaction().unwrap();
+    let transaction = store.read_transaction();
     assert!(
         state
             .read(transaction.access())

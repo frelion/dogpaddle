@@ -12,12 +12,11 @@ use dogpaddle_operation::{
         transform::{ExtendDefinition, FilterDefinition, SelectDefinition},
     },
 };
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, ScanLimit, Small, Store, StoreError};
+use dogpaddle_store::{Cell, Store, SubscribedLog};
 use rusqlite::{Connection, OpenFlags};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::MAX;
 const TABLE: &str = "events";
-const CURSOR: &[u8] = b"input/00000000/cursor";
 
 #[test]
 fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
@@ -108,7 +107,7 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
         drop(flow);
         assert_eq!(sqlite_rows(&sqlite_path), Some(1_024), "replay {replay}");
         let snapshot = sink_snapshot(&flow_path);
-        assert_eq!(snapshot.cursor, Some(0));
+        assert_eq!(snapshot.input_position, 0);
         assert_eq!(snapshot.output_bounds, 0..1);
         assert_eq!(
             snapshot.encoded_entry.as_deref(),
@@ -134,7 +133,7 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
     drop(flow);
 
     let snapshot = sink_snapshot(&flow_path);
-    assert_eq!(snapshot.cursor, Some(1));
+    assert_eq!(snapshot.input_position, 1);
     assert_eq!(snapshot.output_bounds, 1..1);
     assert_eq!(snapshot.encoded_entry, None);
     assert_ne!(snapshot.state, prepared);
@@ -183,28 +182,27 @@ fn publish_scan_change(flow_path: &Path, encoded_change: &[u8]) {
     let position: Cell<u64> = store
         .open_data("station/00000000/operation/sequence_scan.position")
         .unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let writer = output.writer();
+    let encoded_change = encoded_change.to_vec();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     position
         .access(transaction.access())
         .unwrap()
         .set(&u64::MAX)
         .unwrap();
-    assert_eq!(
-        output
-            .access(transaction.access())
+    assert!(
+        writer
+            .try_append(&encoded_change, NonZeroU64::MAX, transaction.access())
             .unwrap()
-            .append(&encoded_change.to_vec())
-            .unwrap(),
-        0
     );
     transaction.commit().unwrap();
 }
 
 #[derive(Debug)]
 struct SinkSnapshot {
-    cursor: Option<u64>,
+    input_position: u64,
     output_bounds: Range<u64>,
     encoded_entry: Option<Vec<u8>>,
     state: Option<Vec<u8>>,
@@ -212,39 +210,21 @@ struct SinkSnapshot {
 
 fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
     let store = Store::open(flow_path).unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let state: OrderedMap<Vec<u8>, Vec<u8>, Small> =
-        store.open_data("station/00000001/state").unwrap();
+    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let writer = output.writer();
+    let input = output.subscription(0);
     let sink_state: Cell<Vec<u8>> = store
         .open_data("station/00000001/operation/relation_sink.state")
         .unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = store.read_transaction();
     let access = transaction.access();
-    let cursor = state
-        .access(access)
-        .unwrap()
-        .get(&CURSOR.to_vec())
-        .unwrap()
-        .map(|encoded| u64::from_be_bytes(encoded.try_into().unwrap()));
-    let output = output.access(access).unwrap();
-    let output_bounds = output.bounds().unwrap();
-    let mut encoded_entry = None;
-    output
-        .scan(
-            output_bounds.start,
-            ScanLimit::new(1, usize::MAX).unwrap(),
-            |entry| {
-                encoded_entry = Some(entry.decode_owned()?);
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
+    let input_status = input.status(access).unwrap();
+    let output_status = writer.status(access).unwrap();
     SinkSnapshot {
-        cursor,
-        output_bounds,
-        encoded_entry,
-        state: sink_state.access(access).unwrap().get().unwrap(),
+        input_position: input_status.position,
+        output_bounds: output_status.head..output_status.tail,
+        encoded_entry: input.peek(access).unwrap().map(|(_, encoded)| encoded),
+        state: sink_state.read(access).unwrap().get().unwrap(),
     }
 }
 

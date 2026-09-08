@@ -1,228 +1,97 @@
-use dogpaddle_store::{Cell, OrderedMap, Small, Store, StoreData, StoreValue, Transactions};
+use dogpaddle_perf_context::RunRoot;
+use dogpaddle_store::{Cell, OrderedMap, ReadTransactions, Store, Transactions};
 use tempfile::TempDir;
 
-use crate::{STATION_KEYS, VALUE_BYTES, support::BenchRoot};
+use crate::{STATION_KEYS, VALUE_BYTES};
 
-pub(super) type ByteMap<SIZE> = OrderedMap<Vec<u8>, Vec<u8>, SIZE>;
-pub(super) type TypedMap<SIZE> = OrderedMap<u64, Vec<u8>, SIZE>;
+pub(super) type StateMap = OrderedMap<u64, Vec<u8>>;
 
-pub(super) struct Fixture<SIZE> {
-    pub(super) transactions: Transactions,
-    pub(super) bytes: ByteMap<SIZE>,
-    pub(super) map: TypedMap<SIZE>,
+pub(super) struct MapFixture {
+    pub(super) writes: Transactions,
+    pub(super) reads: ReadTransactions,
+    pub(super) map: StateMap,
     _root: TempDir,
 }
 
-pub(super) struct StationFixture<SIZE> {
-    pub(super) transactions: Transactions,
-    pub(super) cursor: Cell<u64>,
-    pub(super) map: TypedMap<SIZE>,
+pub(super) struct StationFixture {
+    pub(super) writes: Transactions,
+    pub(super) reads: ReadTransactions,
+    pub(super) step: Cell<u64>,
+    pub(super) map: StateMap,
     _root: TempDir,
 }
 
-pub(super) struct ScanFixture<V, SIZE> {
-    pub(super) transactions: Transactions,
-    pub(super) map: OrderedMap<u64, V, SIZE>,
-    _root: TempDir,
-}
-
-impl<SIZE> Fixture<SIZE>
-where
-    ByteMap<SIZE>: StoreData,
-    TypedMap<SIZE>: StoreData,
-{
-    pub(super) fn empty(bench_root: &BenchRoot) -> Self {
-        let root = bench_root.sample("ordered-map");
-        let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
+impl MapFixture {
+    pub(super) fn empty(root: &RunRoot, scenario: &str) -> Self {
+        let sample = root.sample(scenario);
+        let mut store = Store::create(sample.path().join("store")).expect("create benchmark store");
         let map = store
-            .create_data::<TypedMap<SIZE>>("map")
+            .create_data::<StateMap>("map")
             .expect("create benchmark map");
-        let bytes = store
-            .create_data::<ByteMap<SIZE>>("bytes")
-            .expect("create benchmark byte map");
+        let (writes, reads) = store.into_transactions().split();
         Self {
-            transactions: store.into_transactions(),
-            bytes,
+            writes,
+            reads,
             map,
-            _root: root,
+            _root: sample,
         }
     }
 
-    pub(super) fn populated_typed(bench_root: &BenchRoot, entries: usize) -> Self {
-        let mut fixture = Self::empty(bench_root);
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin seed transaction");
-        let mut map = fixture
-            .map
-            .access(transaction.access())
-            .expect("access seed map");
-        let value = vec![0x5a; VALUE_BYTES];
-        for key in 0..entries {
-            map.put(&(key as u64), &value).expect("seed benchmark map");
+    pub(super) fn populated(
+        root: &RunRoot,
+        scenario: &str,
+        entries: usize,
+        value_bytes: usize,
+    ) -> Self {
+        let mut fixture = Self::empty(root, scenario);
+        let value = vec![0x5a; value_bytes];
+        let transaction = fixture.writes.begin();
+        {
+            let mut map = fixture
+                .map
+                .access(transaction.access())
+                .expect("access benchmark seed map");
+            for key in 0..u64::try_from(entries).expect("entry count fits u64") {
+                map.put(&key, &value).expect("seed benchmark map");
+            }
         }
         transaction.commit().expect("commit benchmark seed");
         fixture
     }
-
-    pub(super) fn populated_bytes(bench_root: &BenchRoot, entries: usize) -> Self {
-        let mut fixture = Self::empty(bench_root);
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin byte map seed transaction");
-        let mut bytes = fixture
-            .bytes
-            .access(transaction.access())
-            .expect("access seed byte map");
-        let value = vec![0x5a; VALUE_BYTES];
-        for key in 0..entries {
-            bytes
-                .put(&(key as u64).to_be_bytes().to_vec(), &value)
-                .expect("seed benchmark byte map");
-        }
-        transaction
-            .commit()
-            .expect("commit benchmark byte map seed");
-        fixture
-    }
-
-    pub(super) fn populated_with_small_background(
-        bench_root: &BenchRoot,
-        entries: usize,
-        background_namespaces: usize,
-    ) -> Self {
-        let root = bench_root.sample("ordered-map-background");
-        let mut store = Store::create(root.path().join("store")).expect("create benchmark store");
-        let map = store
-            .create_data::<TypedMap<SIZE>>("target")
-            .expect("create target map");
-        let bytes = store
-            .create_data::<ByteMap<SIZE>>("target-bytes")
-            .expect("create target byte map");
-        let backgrounds = (0..background_namespaces)
-            .map(|index| {
-                store
-                    .create_data::<OrderedMap<u64, Vec<u8>, Small>>(&format!("background-{index}"))
-                    .expect("create background map")
-            })
-            .collect::<Vec<_>>();
-        let mut fixture = Self {
-            transactions: store.into_transactions(),
-            bytes,
-            map,
-            _root: root,
-        };
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin mixed seed transaction");
-        let value = vec![0x5a; VALUE_BYTES];
-        {
-            let mut target = fixture
-                .map
-                .access(transaction.access())
-                .expect("access target map");
-            for key in 0..entries {
-                target.put(&(key as u64), &value).expect("seed target map");
-            }
-        }
-        let entries_per_background = entries / background_namespaces;
-        let extra_entries = entries % background_namespaces;
-        for (index, background) in backgrounds.iter().enumerate() {
-            let mut background = background
-                .access(transaction.access())
-                .expect("access background map");
-            let background_entries = entries_per_background + usize::from(index < extra_entries);
-            for key in 0..background_entries {
-                background
-                    .put(&(key as u64), &value)
-                    .expect("seed background map");
-            }
-        }
-        transaction.commit().expect("commit mixed benchmark seed");
-        fixture
-    }
 }
 
-impl<SIZE> StationFixture<SIZE>
-where
-    TypedMap<SIZE>: StoreData,
-{
-    pub(super) fn populated(bench_root: &BenchRoot) -> Self {
-        let root = bench_root.sample("ordered-map-multi-collection");
-        let mut store = Store::create(root.path().join("store")).expect("create station store");
-        let cursor = store
-            .create_data::<Cell<u64>>("cursor")
-            .expect("create station cursor");
+impl StationFixture {
+    pub(super) fn populated(root: &RunRoot) -> Self {
+        let sample = root.sample("station");
+        let mut store = Store::create(sample.path().join("store")).expect("create station store");
+        let step = store
+            .create_data::<Cell<u64>>("step")
+            .expect("create station step");
         let map = store
-            .create_data::<TypedMap<SIZE>>("map")
+            .create_data::<StateMap>("map")
             .expect("create station map");
-        let mut fixture = Self {
-            transactions: store.into_transactions(),
-            cursor,
-            map,
-            _root: root,
-        };
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin station seed transaction");
-        fixture
-            .cursor
-            .access(transaction.access())
-            .expect("access station cursor")
+        let (mut writes, reads) = store.into_transactions().split();
+        let transaction = writes.begin();
+        step.access(transaction.access())
+            .expect("access station step")
             .set(&0)
-            .expect("seed station cursor");
+            .expect("seed station step");
         {
-            let mut map = fixture
-                .map
+            let mut map = map
                 .access(transaction.access())
-                .expect("access station map");
+                .expect("access station seed map");
             let value = vec![0x5a; VALUE_BYTES];
-            for key in 0..STATION_KEYS {
-                map.put(&(key as u64), &value).expect("seed station map");
+            for key in 0..u64::try_from(STATION_KEYS).expect("station key count fits u64") {
+                map.put(&key, &value).expect("seed station map");
             }
         }
         transaction.commit().expect("commit station seed");
-        fixture
-    }
-}
-
-impl<V: StoreValue, SIZE> ScanFixture<V, SIZE>
-where
-    OrderedMap<u64, V, SIZE>: StoreData,
-{
-    pub(super) fn populated(bench_root: &BenchRoot, entries: usize, value: &V) -> Self {
-        let root = bench_root.sample("ordered-map-scan");
-        let mut store =
-            Store::create(root.path().join("store")).expect("create scan benchmark store");
-        let map = store
-            .create_data::<OrderedMap<u64, V, SIZE>>("map")
-            .expect("create scan benchmark map");
-        let mut fixture = Self {
-            transactions: store.into_transactions(),
+        Self {
+            writes,
+            reads,
+            step,
             map,
-            _root: root,
-        };
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin scan benchmark seed transaction");
-        {
-            let mut map = fixture
-                .map
-                .access(transaction.access())
-                .expect("access scan benchmark seed map");
-            for key in 0..entries {
-                map.put(&(key as u64), value)
-                    .expect("seed scan benchmark map");
-            }
+            _root: sample,
         }
-        transaction
-            .commit()
-            .expect("commit scan benchmark seed transaction");
-        fixture
     }
 }

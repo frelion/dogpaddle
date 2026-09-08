@@ -105,7 +105,7 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
         rollback_ready(operation.as_mut(), None, &mut transactions).unwrap(),
         Action::Idle
     ));
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         position
             .access(transaction.access())

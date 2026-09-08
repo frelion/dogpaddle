@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_store::{AppendLog, Cell};
+use dogpaddle_store::{Cell, Queue};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,7 +18,7 @@ pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 const PHASE: DataName<Cell<u32>> = DataName::new("postgres_cdc_scan.phase");
 const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("postgres_cdc_scan.checkpoint");
-const BOOTSTRAP_SPOOL: DataName<AppendLog<Vec<u8>>> =
+const BOOTSTRAP_SPOOL: DataName<Queue<Vec<u8>>> =
     DataName::new("postgres_cdc_scan.bootstrap_spool");
 static DATA: [DataDeclaration; 3] = [
     PHASE.declaration(),

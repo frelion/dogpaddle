@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{borrow::Cow, marker::PhantomData};
 
 use crate::{
     DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, StoreError, StoreValue,
@@ -9,8 +9,8 @@ const CELL_KEY: &[u8] = &[];
 
 /// A named persistent cell holding one optional typed value.
 ///
-/// Cells always use shared physical storage because their cardinality is
-/// intrinsically bounded; callers do not choose a size class.
+/// A cell's cardinality is intrinsically bounded; callers choose no physical
+/// placement or size class.
 pub struct Cell<T> {
     data: DataHandle,
     _value: PhantomData<fn() -> T>,
@@ -81,14 +81,7 @@ impl<T: StoreValue> Cell<T> {
     }
 }
 
-impl<'transaction, T: StoreValue> CellAccess<'transaction, T> {
-    pub(crate) fn into_read(self) -> CellReadAccess<'transaction, T> {
-        CellReadAccess {
-            data: self.data.into_read(),
-            _value: PhantomData,
-        }
-    }
-
+impl<T: StoreValue> CellAccess<'_, T> {
     /// Reads the current value.
     ///
     /// # Errors
@@ -134,8 +127,12 @@ impl<T: StoreValue> CellReadAccess<'_, T> {
 
 fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, StoreError> {
     let encoded = data.get(CELL_KEY)?;
-    data.poison_on_error(encoded.map(T::decode_value).transpose())
-        .map_err(StoreError::from)
+    data.poison_on_error(
+        encoded
+            .map(|encoded| T::decode_value(Cow::Owned(encoded)))
+            .transpose(),
+    )
+    .map_err(StoreError::from)
 }
 
 impl<T> Clone for Cell<T> {

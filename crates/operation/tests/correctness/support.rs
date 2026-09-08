@@ -270,7 +270,7 @@ where
     O: Operation + ?Sized,
 {
     let turn = operation.turn(input)?;
-    let transaction = transactions.begin()?;
+    let transaction = transactions.begin();
     let (action, after_commit) = apply_ready(turn, transaction.access())?;
     if matches!(&action, Action::Idle) {
         drop(transaction);
@@ -293,7 +293,7 @@ where
     O: Operation + ?Sized,
 {
     let turn = operation.turn(input)?;
-    let transaction = transactions.begin()?;
+    let transaction = transactions.begin();
     let (action, after_commit) = apply_ready(turn, transaction.access())?;
     drop(transaction);
     drop(after_commit);

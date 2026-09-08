@@ -434,7 +434,7 @@ impl Fixture {
     }
 
     fn state(&mut self) -> Option<Vec<u8>> {
-        let transaction = self.transactions.begin().unwrap();
+        let transaction = self.transactions.begin();
         let state = self
             .state
             .access(transaction.access())
@@ -470,7 +470,7 @@ impl Fixture {
         let Turn::Ready(turn) = self.operation.turn(Some(input(change))).unwrap() else {
             panic!("relation sink unexpectedly returned Idle");
         };
-        let transaction = self.transactions.begin().unwrap();
+        let transaction = self.transactions.begin();
         let (action, completion) = turn.apply(transaction.access()).unwrap();
         transaction.commit().unwrap();
         drop(completion);

@@ -3,11 +3,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use dogpaddle_store::{
-    CodecError, ScanDirection, ScanLimit, Small, Store, StoreData, StoreError, StoreValue,
-};
+use dogpaddle_store::{CodecError, ScanDirection, ScanLimit, Store, StoreError, StoreValue};
 
-use crate::support::{ByteMap, create_byte_map, create_map, store_path};
+use crate::support::{create_byte_map, create_map, store_path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WideValue(Vec<u8>);
@@ -29,10 +27,10 @@ impl StoreValue for WideValue {
 fn projection_reads_logical_keys_and_fields_without_full_value_decode() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, WideValue, Small>(&mut store, "map").unwrap();
+    let map = create_map::<u64, WideValue>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for key in 1_u64..=2 {
             let mut value = vec![0xaa; 8_192];
@@ -43,7 +41,7 @@ fn projection_reads_logical_keys_and_fields_without_full_value_decode() {
     }
 
     FULL_VALUE_DECODES.store(0, Ordering::Relaxed);
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     let mut projected = Vec::new();
     let continuation = access
@@ -78,10 +76,10 @@ fn projection_reads_logical_keys_and_fields_without_full_value_decode() {
 fn callbacks_observe_the_admitted_page_while_mutating_the_source_map() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64, Small>(&mut store, "map").unwrap();
+    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for key in 1_u64..=3 {
             access.put(&key, &key).unwrap();
@@ -89,7 +87,7 @@ fn callbacks_observe_the_admitted_page_while_mutating_the_source_map() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let reader = map.access(transaction.access()).unwrap();
     let mut writer = map.access(transaction.access()).unwrap();
     let mut visited = Vec::new();
@@ -119,10 +117,10 @@ fn callbacks_observe_the_admitted_page_while_mutating_the_source_map() {
 fn later_pages_observe_source_updates_made_by_an_earlier_callback() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64, Small>(&mut store, "map").unwrap();
+    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for key in 1_u64..=3 {
             access.put(&key, &key).unwrap();
@@ -130,7 +128,7 @@ fn later_pages_observe_source_updates_made_by_an_earlier_callback() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let reader = map.access(transaction.access()).unwrap();
     let mut writer = map.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(1, 1_024).unwrap();
@@ -171,13 +169,6 @@ fn later_pages_observe_source_updates_made_by_an_earlier_callback() {
 
 #[test]
 fn byte_map_binary_keys_page_in_both_directions() {
-    assert_binary_key_pages::<Small>();
-}
-
-fn assert_binary_key_pages<SIZE>()
-where
-    ByteMap<SIZE>: StoreData,
-{
     let keys = [
         Vec::new(),
         vec![0],
@@ -192,10 +183,10 @@ where
 
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map::<SIZE>(&mut store, "data").unwrap();
+    let data = create_byte_map(&mut store, "data").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = data.access(transaction.access()).unwrap();
         for key in &keys {
             access.put(key, key).unwrap();
@@ -203,7 +194,7 @@ where
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = data.access(transaction.access()).unwrap();
     for key in &keys {
         assert_eq!(access.get(key).unwrap(), Some(key.clone()));

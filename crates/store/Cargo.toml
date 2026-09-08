@@ -12,7 +12,7 @@ autoexamples = false
 bench = false
 
 [dependencies]
-libmdbx.workspace = true
+rocksdb.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -29,25 +29,13 @@ path = "tests/correctness.rs"
 name = "ordered_map"
 path = "benches/ordered_map.rs"
 harness = false
-test = false
+test = true
 
 [[bench]]
 name = "cell"
 path = "benches/cell.rs"
 harness = false
 test = true
-
-[[bench]]
-name = "append_log"
-path = "benches/append_log.rs"
-harness = false
-test = false
-
-[[bench]]
-name = "append_log_endurance"
-path = "benches/append_log_endurance.rs"
-harness = false
-test = false
 
 [lints]
 workspace = true

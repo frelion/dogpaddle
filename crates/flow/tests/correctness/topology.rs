@@ -160,7 +160,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
     let mut store = Store::create(&path).unwrap();
     let sentinel: Cell<u64> = store.create_data("sentinel").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     sentinel
         .access(transaction.access())
         .unwrap()
@@ -184,7 +184,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
         Err(StoreError::DataNotFound(name)) if name == "flow/definition"
     ));
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         sentinel
             .access(transaction.access())

@@ -55,7 +55,7 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
         for (producer, consumer) in [(0, 1), (1, 2)] {
             let output = statuses[producer].output.as_ref().unwrap();
             let input = &statuses[consumer].inputs[0];
-            assert_eq!(output.head, input.cursor);
+            assert_eq!(output.head, input.position);
             assert_eq!(output.tail, input.tail);
             assert_eq!(output.capacity_bytes, 1);
             assert!(output.head <= output.tail);
@@ -92,6 +92,6 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
         station
             .inputs
             .iter()
-            .all(|input| input.cursor == input.tail)
+            .all(|input| input.position == input.tail)
     }));
 }

@@ -39,10 +39,7 @@ impl Fixture {
             cell,
             _root: sample,
         };
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin cell seed transaction");
+        let transaction = fixture.transactions.begin();
         fixture
             .cell
             .access(transaction.access())
@@ -126,10 +123,7 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
 
 fn measure_get(fixture: &mut Fixture, operations: usize) -> Duration {
     let started = std::time::Instant::now();
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin cell read transaction");
+    let transaction = fixture.transactions.begin();
     let cell = fixture
         .cell
         .access(transaction.access())
@@ -153,10 +147,7 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
     let mut expected = None;
     let started = std::time::Instant::now();
     for _ in 0..commits {
-        let transaction = fixture
-            .transactions
-            .begin()
-            .expect("begin cell update transaction");
+        let transaction = fixture.transactions.begin();
         let mut cell = fixture
             .cell
             .access(transaction.access())
@@ -172,10 +163,7 @@ fn measure_updates(fixture: &mut Fixture, commits: usize) -> Duration {
     }
     let elapsed = started.elapsed();
 
-    let transaction = fixture
-        .transactions
-        .begin()
-        .expect("begin cell validation transaction");
+    let transaction = fixture.transactions.begin();
     let actual = fixture
         .cell
         .access(transaction.access())
@@ -202,7 +190,10 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
             "execution": "single_thread",
             "cache": "warm",
             "validation": "outside_timing",
-            "mdbx_sync_mode": "durable",
+            "store": {
+                "engine": "RocksDB",
+                "write_mode": "WAL enabled, sync=true"
+            },
         },
     });
     std::fs::write(

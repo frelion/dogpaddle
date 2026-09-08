@@ -327,7 +327,7 @@ impl DataDeclaration {
     /// # Errors
     ///
     /// Returns a Store error when the physical resource is missing, has the
-    /// wrong placement, or cannot be opened.
+    /// wrong collection kind, or cannot be opened.
     #[doc(hidden)]
     pub fn open(&self, store: &Store, physical_name: &str) -> Result<DataInstance, StoreError> {
         (self.open)(store, physical_name).map(|data| DataInstance {

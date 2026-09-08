@@ -269,7 +269,7 @@ class Gate:
                 "retained_bytes": 0,
             }, drained
             assert drained["postgres"]["inputs"] == [
-                {"cursor": len(EXPECTED), "tail": len(EXPECTED)}
+                {"position": len(EXPECTED), "tail": len(EXPECTED)}
             ], drained
             assert drained["postgres"]["output"] is None
 
@@ -292,7 +292,7 @@ class Gate:
         print("PASS target transaction failure rolls back data and fail-stops Flow; "
               "crash at externally committed/local Prepared boundary; reopen produced "
               "exactly three big-endian UInt64 rows with unchanged IDs; input "
-              "head/tail/cursor=3/3/3 and retained_bytes=0; fourth reopen remained Idle")
+              "head/tail/position=3/3/3 and retained_bytes=0; fourth reopen remained Idle")
 
     def direct_host(self, binary: Path, mode: str, scenario: str, session: int) -> Host:
         return Host(binary, mode, self.root / scenario, self.port,

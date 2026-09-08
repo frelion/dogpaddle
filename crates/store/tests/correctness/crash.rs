@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    num::NonZeroU64,
     os::unix::process::ExitStatusExt,
     path::Path,
     process::{Command, ExitStatus},
@@ -8,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{AppendLog, Large, ScanLimit, Small, Store, StoreError};
+use dogpaddle_store::{Store, SubscribedLog};
 
 use crate::support::{create_byte_map, open_byte_map, store_path};
 
@@ -17,9 +18,14 @@ const WORKER_STORE: &str = "DOGPADDLE_CRASH_STORE";
 
 fn prepare(path: &Path) {
     let mut store = Store::create(path).unwrap();
-    create_byte_map::<Small>(&mut store, "small").unwrap();
-    create_byte_map::<Large>(&mut store, "large").unwrap();
-    store.create_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    create_byte_map(&mut store, "first").unwrap();
+    create_byte_map(&mut store, "second").unwrap();
+    let log = store.create_data::<SubscribedLog<Vec<u8>>>("log").unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    log.initialize(NonZeroU64::MIN, transaction.access())
+        .unwrap();
+    transaction.commit().unwrap();
 }
 
 fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
@@ -49,36 +55,22 @@ fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
 
 fn assert_values(path: &Path, expected: Option<&[u8]>) {
     let store = Store::open(path).unwrap();
-    let small = open_byte_map::<Small>(&store, "small").unwrap();
-    let large = open_byte_map::<Large>(&store, "large").unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let first = open_byte_map(&store, "first").unwrap();
+    let second = open_byte_map(&store, "second").unwrap();
+    let log = store.open_data::<SubscribedLog<Vec<u8>>>("log").unwrap();
+    let subscription = log.subscription(0);
+    let transaction = store.read_transaction();
+    let access = transaction.access();
     assert_eq!(
-        small
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
+        first.read(access).unwrap().get(&b"key".to_vec()).unwrap(),
         expected.map(<[u8]>::to_vec)
     );
-    let log = log.access(transaction.access()).unwrap();
-    let mut logged = Vec::new();
-    log.scan(0, ScanLimit::new(1, 1_024).unwrap(), |entry| {
-        logged.push(entry.decode_owned()?);
-        Ok::<(), StoreError>(())
-    })
-    .unwrap();
     assert_eq!(
-        logged,
-        expected.map(<[u8]>::to_vec).into_iter().collect::<Vec<_>>()
+        subscription.peek(access).unwrap(),
+        expected.map(|value| (0, value.to_vec()))
     );
     assert_eq!(
-        large
-            .access(transaction.access())
-            .unwrap()
-            .get(&b"key".to_vec())
-            .unwrap(),
+        second.read(access).unwrap().get(&b"key".to_vec()).unwrap(),
         expected.map(<[u8]>::to_vec)
     );
 }
@@ -106,25 +98,32 @@ fn crash_worker() {
     };
     let path = std::env::var_os(WORKER_STORE).expect("worker store path");
     let store = Store::open(path).unwrap();
-    let small = open_byte_map::<Small>(&store, "small").unwrap();
-    let large = open_byte_map::<Large>(&store, "large").unwrap();
-    let log = store.open_data::<AppendLog<Vec<u8>>>("log").unwrap();
+    let first = open_byte_map(&store, "first").unwrap();
+    let second = open_byte_map(&store, "second").unwrap();
+    let log = store
+        .open_data::<SubscribedLog<Vec<u8>>>("log")
+        .unwrap()
+        .writer();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    small
+    let transaction = transactions.begin();
+    first
         .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();
-    large
+    second
         .access(transaction.access())
         .unwrap()
         .put(&b"key".to_vec(), &b"committed".to_vec())
         .unwrap();
-    log.access(transaction.access())
+    assert!(
+        log.try_append(
+            &b"committed".to_vec(),
+            NonZeroU64::new(1_024).unwrap(),
+            transaction.access(),
+        )
         .unwrap()
-        .append(&b"committed".to_vec())
-        .unwrap();
+    );
 
     match scenario.as_str() {
         "before-commit" => kill_self(),

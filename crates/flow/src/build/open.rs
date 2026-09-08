@@ -1,5 +1,5 @@
 use dogpaddle_operation::{DataInstances, OperationBinding, RuntimeResource};
-use dogpaddle_store::{AppendLog, Cell, OrderedMap, Small, Store, StoreData, StoreError};
+use dogpaddle_store::{Cell, Store, StoreData, StoreError, SubscribedLog};
 
 use crate::{
     assembly::{assemble_stations, resolve_topology},
@@ -18,7 +18,7 @@ impl FlowFactory {
     /// One setup-phase read-only snapshot reads the definition while preserving
     /// the same Store for opening every declared data object. After setup is
     /// frozen into runtime transaction capabilities, another read-only snapshot
-    /// checks the definition again and validates every output frontier before the
+    /// checks the definition again and validates every output subscription before the
     /// Flow is returned.
     ///
     /// # Errors
@@ -61,22 +61,22 @@ impl FlowFactory {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (transactions, reads) = store.into_transactions().split();
-        let assembled = assemble_stations(topology, station_parts);
         {
-            let transaction = reads.begin()?;
+            let transaction = reads.begin();
             let published = published.read(transaction.access())?;
             let observed_definition = published.get()?.ok_or(FlowError::IncompleteBuild)?;
             if observed_definition != definition_bytes {
                 return Err(FlowError::DefinitionChangedDuringOpen);
             }
-            for (station_definition, station) in
-                definition.stations().iter().zip(assembled.stations.iter())
+            for (index, (station_definition, station)) in
+                definition.stations().iter().zip(&station_parts).enumerate()
             {
                 station
-                    .validate_output(transaction.access())
+                    .validate(topology.subscriber_count(index), transaction.access())
                     .map_err(|source| runtime_state_error(station_definition.id(), source))?;
             }
         }
+        let assembled = assemble_stations(topology, station_parts);
 
         Ok(Flow::from_parts(
             path,
@@ -93,7 +93,7 @@ fn read_published_definition(
     store: &Store,
     definition: &Cell<Vec<u8>>,
 ) -> Result<Vec<u8>, FlowError> {
-    let transaction = store.read_transaction()?;
+    let transaction = store.read_transaction();
     let definition = definition.read(transaction.access())?;
     definition.get()?.ok_or(FlowError::IncompleteBuild)
 }
@@ -113,10 +113,9 @@ fn open_station_part(
     binding: OperationBinding,
     resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
-    let state = open_required_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>(
-        store,
-        &codec::station_state_name(index),
-    )?;
+    let active = (station.inputs().len() > 1)
+        .then(|| open_required_data::<Cell<u32>>(store, &codec::station_active_input_name(index)))
+        .transpose()?;
     let definition = station.operation();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
@@ -130,7 +129,7 @@ fn open_station_part(
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);
             Some((
-                open_required_data::<AppendLog<Vec<u8>>>(store, &name)?,
+                open_required_data::<SubscribedLog<Vec<u8>>>(store, &name)?,
                 capacity,
                 schema,
             ))
@@ -141,7 +140,7 @@ fn open_station_part(
         }
     };
     Ok(StationParts::new(
-        state,
+        active,
         operation,
         definition.kind(),
         output,

@@ -7,7 +7,7 @@ use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::DistinctDefinition,
 };
-use dogpaddle_store::{AppendLog, Store};
+use dogpaddle_store::{Store, SubscribedLog};
 
 const DISTINCT_OUTPUT: &str = "station/00000001/output";
 
@@ -27,16 +27,14 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
 
     let blocker = encode_change(&value_change(41)).unwrap();
     let store = Store::open(&path).unwrap();
-    let output: AppendLog<Vec<u8>> = store.open_data(DISTINCT_OUTPUT).unwrap();
+    let output: SubscribedLog<Vec<u8>> = store.open_data(DISTINCT_OUTPUT).unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
-    assert_eq!(
+    let transaction = transactions.begin();
+    assert!(
         output
-            .access(transaction.access())
+            .writer()
+            .try_append(&blocker, NonZeroU64::MAX, transaction.access())
             .unwrap()
-            .append(&blocker)
-            .unwrap(),
-        0
     );
     transaction.commit().unwrap();
     drop(transactions);
@@ -49,7 +47,7 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
         Some(AdvanceOutcome::Backpressured)
     );
     assert_eq!(
-        (pressured[1].inputs[0].cursor, pressured[1].inputs[0].tail),
+        (pressured[1].inputs[0].position, pressured[1].inputs[0].tail),
         (0, 1)
     );
     assert_eq!(pressured[1].output.as_ref().unwrap().tail, 1);
@@ -59,7 +57,7 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
     let completed = reopened.status().unwrap();
     assert_eq!(
-        (completed[1].inputs[0].cursor, completed[1].inputs[0].tail),
+        (completed[1].inputs[0].position, completed[1].inputs[0].tail),
         (1, 1)
     );
     assert_eq!(completed[1].output.as_ref().unwrap().tail, 2);

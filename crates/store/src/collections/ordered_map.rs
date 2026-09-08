@@ -9,15 +9,10 @@ use crate::{
     ScanLimit, StoreError, StoreKey, StoreValue, TransactionAccess, TransactionRef,
 };
 
-type MapTypes<K, V, SIZE> = fn() -> (K, V, SIZE);
-
 /// A named persistent ordered map with typed keys and values.
-///
-/// `SIZE` explicitly selects shared [`crate::Small`] or dedicated
-/// [`crate::Large`] physical storage.
-pub struct OrderedMap<K, V, SIZE> {
+pub struct OrderedMap<K, V> {
     data: DataHandle,
-    _types: PhantomData<MapTypes<K, V, SIZE>>,
+    _types: PhantomData<fn() -> (K, V)>,
 }
 
 /// Transaction-bound access to an [`OrderedMap`].
@@ -44,10 +39,11 @@ pub struct OrderedMapReadAccess<'transaction, K, V> {
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-/// One temporarily borrowed encoded entry in an ordered-map scan.
+/// One transaction-bound encoded entry in an ordered-map scan.
 ///
 /// The entry can project only the encoded fields a caller needs or decode the
-/// complete owned `(K, V)` pair. Its encoding cannot escape the scan callback.
+/// complete owned `(K, V)` pair. The transaction binding cannot escape the scan
+/// callback.
 ///
 /// ```compile_fail
 /// use dogpaddle_store::{CodecError, OrderedMapEntry};
@@ -66,13 +62,13 @@ pub struct OrderedMapReadAccess<'transaction, K, V> {
 /// require_send::<dogpaddle_store::OrderedMapEntry<'static, u64, u64>>();
 /// ```
 pub struct OrderedMapEntry<'entry, K, V> {
-    encoded_key: Cow<'entry, [u8]>,
-    encoded_value: Cow<'entry, [u8]>,
+    encoded_key: Vec<u8>,
+    encoded_value: Vec<u8>,
     transaction: TransactionRef<'entry>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-impl<K: StoreKey, V: StoreValue, SIZE> OrderedMap<K, V, SIZE> {
+impl<K: StoreKey, V: StoreValue> OrderedMap<K, V> {
     pub(crate) fn from_handle(data: DataHandle) -> Self {
         Self {
             data,
@@ -113,14 +109,7 @@ impl<K: StoreKey, V: StoreValue, SIZE> OrderedMap<K, V, SIZE> {
     }
 }
 
-impl<'transaction, K: StoreKey, V: StoreValue> OrderedMapAccess<'transaction, K, V> {
-    pub(crate) fn into_read(self) -> OrderedMapReadAccess<'transaction, K, V> {
-        OrderedMapReadAccess {
-            data: self.data.into_read(),
-            _types: PhantomData,
-        }
-    }
-
+impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
     /// Reads one value.
     ///
     /// # Errors
@@ -169,7 +158,7 @@ impl<'transaction, K: StoreKey, V: StoreValue> OrderedMapAccess<'transaction, K,
     ///
     /// The complete page and its continuation are admitted before the first
     /// callback. Callbacks may therefore update other Store data in the same
-    /// transaction without interleaving business code with an MDBX cursor.
+    /// transaction without interleaving business code with a storage cursor.
     /// Updates to this map do not change entries already admitted for the
     /// current page, but may affect later pages.
     ///
@@ -249,8 +238,12 @@ fn read_map_value<K: StoreKey, V: StoreValue>(
         .poison_on_error(key.encode_key())
         .map_err(StoreError::from)?;
     let encoded = data.get(encoded_key.as_ref())?;
-    data.poison_on_error(encoded.map(V::decode_value).transpose())
-        .map_err(StoreError::from)
+    data.poison_on_error(
+        encoded
+            .map(|encoded| V::decode_value(Cow::Owned(encoded)))
+            .transpose(),
+    )
+    .map_err(StoreError::from)
 }
 
 fn scan_map<K: StoreKey, V: StoreValue, E>(
@@ -285,7 +278,7 @@ where
         .map_err(StoreError::from)
         .map_err(E::from)?;
     let raw = data
-        .scan_borrowed(
+        .scan(
             (borrow_bound(&lower), borrow_bound(&upper)),
             direction,
             continuation.as_ref().map(AsRef::as_ref),
@@ -298,7 +291,7 @@ where
             raw.items
                 .last()
                 .filter(|_| raw.limited)
-                .map(|(key, _)| K::decode_key(Cow::Borrowed(key.as_ref())))
+                .map(|(key, _)| K::decode_key(Cow::Owned(key.clone())))
                 .transpose(),
         )
         .map_err(StoreError::from)
@@ -320,8 +313,8 @@ where
 impl<K, V> OrderedMapEntry<'_, K, V> {
     /// Decodes a caller-selected projection from the encoded logical key and value.
     ///
-    /// Temporary borrowed views may be used inside `project`, but its returned
-    /// value cannot borrow either encoding.
+    /// `project` receives temporary slices, and its returned value cannot refer
+    /// to either encoding.
     ///
     /// # Errors
     ///
@@ -332,10 +325,7 @@ impl<K, V> OrderedMapEntry<'_, K, V> {
         project: impl for<'encoded> FnOnce(&'encoded [u8], &'encoded [u8]) -> Result<R, CodecError>,
     ) -> Result<R, StoreError> {
         self.transaction
-            .poison_on_error(project(
-                self.encoded_key.as_ref(),
-                self.encoded_value.as_ref(),
-            ))
+            .poison_on_error(project(&self.encoded_key, &self.encoded_value))
             .map_err(StoreError::from)
     }
 }
@@ -343,8 +333,7 @@ impl<K, V> OrderedMapEntry<'_, K, V> {
 impl<K: StoreKey, V: StoreValue> OrderedMapEntry<'_, K, V> {
     /// Fully decodes this entry into an owned key/value pair.
     ///
-    /// Consuming the entry lets owning codecs reuse an encoded buffer that MDBX
-    /// already materialized for a dirty page.
+    /// Consuming the entry lets owning codecs reuse its owned encoded buffer.
     ///
     /// # Errors
     ///
@@ -357,15 +346,19 @@ impl<K: StoreKey, V: StoreValue> OrderedMapEntry<'_, K, V> {
             transaction,
             _types: _,
         } = self;
-        let decoded: Result<(K, V), CodecError> =
-            (|| Ok((K::decode_key(encoded_key)?, V::decode_value(encoded_value)?)))();
+        let decoded: Result<(K, V), CodecError> = (|| {
+            Ok((
+                K::decode_key(Cow::Owned(encoded_key))?,
+                V::decode_value(Cow::Owned(encoded_value))?,
+            ))
+        })();
         transaction
             .poison_on_error(decoded)
             .map_err(StoreError::from)
     }
 }
 
-impl<K, V, SIZE> Clone for OrderedMap<K, V, SIZE> {
+impl<K, V> Clone for OrderedMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),

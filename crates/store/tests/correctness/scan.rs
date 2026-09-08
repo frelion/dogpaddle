@@ -1,9 +1,6 @@
 use std::{collections::BTreeMap, ops::Bound};
 
-use dogpaddle_store::{
-    Large, OrderedMap, OrderedMapAccess, ScanDirection, ScanLimit, Small, Store, StoreData,
-    StoreError,
-};
+use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, Store, StoreError};
 
 use crate::support::{create_map, store_path};
 
@@ -85,14 +82,6 @@ fn collect_pages(
 
 #[test]
 fn every_range_direction_and_page_size_matches_a_btree_model() {
-    assert_every_range_direction_and_page_size::<Small>();
-    assert_every_range_direction_and_page_size::<Large>();
-}
-
-fn assert_every_range_direction_and_page_size<SIZE>()
-where
-    OrderedMap<i64, String, SIZE>: StoreData,
-{
     let bounds = [
         Bound::Unbounded,
         Bound::Included(-10),
@@ -109,10 +98,10 @@ where
 
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<i64, String, SIZE>(&mut store, "map").unwrap();
+    let map = create_map::<i64, String>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for (key, value) in &model {
             access.put(key, value).unwrap();
@@ -120,7 +109,7 @@ where
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     for lower in &bounds {
         for upper in &bounds {
@@ -130,8 +119,7 @@ where
                     assert_eq!(
                         collect_pages(&access, *lower, *upper, direction, max_items, &expected,),
                         expected,
-                        "size={} lower={lower:?} upper={upper:?} direction={direction:?} max_items={max_items}",
-                        std::any::type_name::<SIZE>(),
+                        "lower={lower:?} upper={upper:?} direction={direction:?} max_items={max_items}",
                     );
                 }
             }
@@ -141,20 +129,12 @@ where
 
 #[test]
 fn byte_limits_and_continuations_are_exact() {
-    assert_byte_limits_and_continuations::<Small>();
-    assert_byte_limits_and_continuations::<Large>();
-}
-
-fn assert_byte_limits_and_continuations<SIZE>()
-where
-    OrderedMap<i64, String, SIZE>: StoreData,
-{
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<i64, String, SIZE>(&mut store, "map").unwrap();
+    let map = create_map::<i64, String>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for key in [-2, -1, 0] {
             access.put(&key, &format!("v{key}")).unwrap();
@@ -162,7 +142,7 @@ where
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     let mut first = Vec::new();
     let first_continuation = access
@@ -214,10 +194,10 @@ where
 fn continuation_outside_the_range_returns_no_items() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<i64, i64, Small>(&mut store, "map").unwrap();
+    let map = create_map::<i64, i64>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for key in -2..=2 {
             access.put(&key, &key).unwrap();
@@ -225,7 +205,7 @@ fn continuation_outside_the_range_returns_no_items() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(10, 1_024).unwrap();
     let mut visits = 0;
@@ -259,14 +239,14 @@ fn continuation_outside_the_range_returns_no_items() {
 }
 
 #[test]
-fn an_exact_page_stops_at_the_neighboring_small_namespace() {
+fn an_exact_page_stops_at_the_neighboring_namespace() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let first = create_map::<i64, i64, Small>(&mut store, "first").unwrap();
-    let second = create_map::<i64, i64, Small>(&mut store, "second").unwrap();
+    let first = create_map::<i64, i64>(&mut store, "first").unwrap();
+    let second = create_map::<i64, i64>(&mut store, "second").unwrap();
     let mut transactions = store.into_transactions();
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         first
             .access(transaction.access())
             .unwrap()
@@ -280,7 +260,7 @@ fn an_exact_page_stops_at_the_neighboring_small_namespace() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let limit = ScanLimit::new(1, 1_024).unwrap();
     let mut first_items = Vec::new();
     let first_continuation = first

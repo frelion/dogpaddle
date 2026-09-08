@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::ErrorKind,
     path::Path,
@@ -9,84 +9,50 @@ use std::{
     },
 };
 
-use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags, WriteFlags,
+use rocksdb::{
+    DBCompressionType, Direction, IteratorMode, OptimisticTransactionDB as Database, Options,
+    ReadOptions, SnapshotWithThreadMode,
 };
 
-use super::{
-    DataHandle, DataLocation, DataPlacement, Store, Transactions, dedicated_table_name,
-    transaction::commit_mdbx,
-};
+use super::{DataHandle, DataKind, Store, Transactions, transaction::durable_write_options};
 use crate::{StoreData, StoreError, data_class};
 
-const MDBX_DATA_FILE: &str = "mdbx.dat";
 const STORE_MARKER_KEY: &[u8] = &[0];
-const NEXT_ID_KEY: &[u8] = &[1];
-const NEXT_DEDICATED_KEY: &[u8] = &[4];
-const CATALOG_DOMAIN: u8 = 2;
-const STORE_MARKER: &[u8] = b"dogpaddle.store\0";
+const STORE_MARKER: &[u8] = b"dogpaddle.store.rocks.v1\0";
+const CATALOG_DOMAIN: u8 = 1;
 const MAX_NAME_BYTES: usize = 255;
-const MAX_DEDICATED_TABLES: u32 = 4_096;
-const SHARED_PLACEMENT: u8 = 0;
-const DEDICATED_PLACEMENT: u8 = 1;
+
+type Catalog = BTreeMap<String, (u32, DataKind)>;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
-    /// Maximum number of data objects that may use dedicated physical tables.
-    pub const LARGE_DATA_CAPACITY: u32 = MAX_DEDICATED_TABLES;
-
     /// Creates an empty store at a new path.
     ///
     /// # Errors
     ///
-    /// Returns an error when the path is occupied or MDBX cannot be initialized.
-    /// Initialization failure may leave a partial directory for the caller to inspect.
+    /// Returns an error when the path is occupied or `RocksDB` cannot be
+    /// initialized. Initialization failure may leave a partial directory for
+    /// the caller to inspect.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         fs::create_dir(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
+            if error.kind() == ErrorKind::AlreadyExists {
                 StoreError::PathExists(path.to_path_buf())
             } else {
                 StoreError::storage("create store directory", error)
             }
         })?;
 
-        let database = open_database(path)?;
-        let transaction = database
-            .begin_rw_txn()
-            .map_err(|error| StoreError::storage("begin store creation", error))?;
-        let table = transaction
-            .open_table(None)
-            .map_err(|error| StoreError::storage("open store table", error))?;
-        transaction
-            .put(
-                &table,
-                STORE_MARKER_KEY,
-                STORE_MARKER,
-                WriteFlags::NO_OVERWRITE,
-            )
+        let database = open_database(path, true)?;
+        database
+            .put_opt(STORE_MARKER_KEY, STORE_MARKER, &durable_write_options())
             .map_err(|error| StoreError::storage("write store marker", error))?;
-        transaction
-            .put(
-                &table,
-                NEXT_ID_KEY,
-                0_u32.to_be_bytes(),
-                WriteFlags::NO_OVERWRITE,
-            )
-            .map_err(|error| StoreError::storage("write store counter", error))?;
-        transaction
-            .put(
-                &table,
-                NEXT_DEDICATED_KEY,
-                0_u32.to_be_bytes(),
-                WriteFlags::NO_OVERWRITE,
-            )
-            .map_err(|error| StoreError::storage("write dedicated table counter", error))?;
-        commit_mdbx(transaction)?;
         Ok(Self {
             database,
             token: fresh_token(),
+            catalog: BTreeMap::new(),
+            next_data_id: 0,
         })
     }
 
@@ -98,38 +64,22 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         validate_store_path(path)?;
-        let database = open_database(path)?;
-        let transaction = database
-            .begin_ro_txn()
-            .map_err(|error| StoreError::storage("begin store validation", error))?;
-        let table = transaction
-            .open_table(None)
-            .map_err(|error| StoreError::storage("open store table", error))?;
-        let marker = transaction
-            .get::<Vec<u8>>(&table, STORE_MARKER_KEY)
+        let database = open_database(path, false)?;
+        let snapshot = database.snapshot();
+        let marker = snapshot
+            .get(STORE_MARKER_KEY)
             .map_err(|error| StoreError::storage("read store marker", error))?
             .ok_or(StoreError::InvalidStore)?;
         if marker != STORE_MARKER {
             return Err(StoreError::InvalidStore);
         }
-        let next_id = transaction
-            .get::<Vec<u8>>(&table, NEXT_ID_KEY)
-            .map_err(|error| StoreError::storage("read store counter", error))?
-            .ok_or(StoreError::InvalidStore)?;
-        let next_id = decode_u32(&next_id)?;
-        let next_dedicated = transaction
-            .get::<Vec<u8>>(&table, NEXT_DEDICATED_KEY)
-            .map_err(|error| StoreError::storage("read dedicated table counter", error))?
-            .ok_or(StoreError::InvalidStore)?;
-        let next_dedicated = decode_u32(&next_dedicated)?;
-        if next_dedicated > MAX_DEDICATED_TABLES {
-            return Err(StoreError::InvalidStore);
-        }
-        validate_catalog(&transaction, &table, next_id, next_dedicated)?;
-        drop(transaction);
+        let (catalog, next_data_id) = read_catalog(&snapshot)?;
+        drop(snapshot);
         Ok(Self {
             database,
             token: fresh_token(),
+            catalog,
+            next_data_id,
         })
     }
 
@@ -137,119 +87,55 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// The data class fixes or selects its durable physical placement. A
-    /// [`crate::Cell`] is always shared, an [`crate::AppendLog`] is always
-    /// dedicated, and an [`crate::OrderedMap`] uses its [`crate::Small`] or
-    /// [`crate::Large`] type parameter. At most [`Store::LARGE_DATA_CAPACITY`]
-    /// objects may use dedicated placement.
-    ///
-    /// Returns an error for an invalid or duplicate name, exhausted dedicated
-    /// capacity, or an MDBX failure.
+    /// Returns an error for an empty or duplicate name, exhausted namespace
+    /// identifiers, or a storage failure.
     pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
-        let handle = self.create_handle(name, data_class::placement::<D>())?;
+        let handle = self.create_handle(name, data_class::kind::<D>())?;
         Ok(data_class::from_handle(handle))
     }
 
-    fn create_handle(
-        &mut self,
-        name: &str,
-        placement: DataPlacement,
-    ) -> Result<DataHandle, StoreError> {
+    fn create_handle(&mut self, name: &str, kind: DataKind) -> Result<DataHandle, StoreError> {
         validate_name(name)?;
-        let transaction = self
-            .database
-            .begin_rw_txn()
-            .map_err(|error| StoreError::storage("begin data creation", error))?;
-        let table = transaction
-            .open_table(None)
-            .map_err(|error| StoreError::storage("open store table", error))?;
-        let catalog_key = catalog_key(name);
-        if transaction
-            .get::<Vec<u8>>(&table, &catalog_key)
-            .map_err(|error| StoreError::storage("read data catalog", error))?
-            .is_some()
-        {
+        if self.catalog.contains_key(name) {
             return Err(StoreError::DataAlreadyExists(name.to_owned()));
         }
-        let (location, counter_key, next) = match placement {
-            DataPlacement::Shared => {
-                let current = read_counter(&transaction, &table, NEXT_ID_KEY)?;
-                let next = current.checked_add(1).ok_or(StoreError::DataIdExhausted)?;
-                (DataLocation::Shared(current), NEXT_ID_KEY, next)
-            }
-            DataPlacement::Dedicated => {
-                let current = read_counter(&transaction, &table, NEXT_DEDICATED_KEY)?;
-                if current >= MAX_DEDICATED_TABLES {
-                    return Err(StoreError::LargeDataCapacityExhausted);
-                }
-                let next = current + 1;
-                transaction
-                    .create_table(Some(&dedicated_table_name(current)), TableFlags::empty())
-                    .map_err(|error| StoreError::storage("create dedicated data table", error))?;
-                (DataLocation::Dedicated(current), NEXT_DEDICATED_KEY, next)
-            }
-        };
-        transaction
-            .put(
-                &table,
-                &catalog_key,
-                encode_binding(location),
-                WriteFlags::NO_OVERWRITE,
+        let data_id = u32::try_from(self.next_data_id).map_err(|_| StoreError::DataIdExhausted)?;
+        self.database
+            .put_opt(
+                catalog_key(name),
+                encode_binding(data_id, kind),
+                &durable_write_options(),
             )
             .map_err(|error| StoreError::storage("write data catalog", error))?;
-        transaction
-            .put(&table, counter_key, next.to_be_bytes(), WriteFlags::UPSERT)
-            .map_err(|error| StoreError::storage("advance store counter", error))?;
-        commit_mdbx(transaction)?;
-        Ok(self.handle(location))
+        self.catalog.insert(name.to_owned(), (data_id, kind));
+        self.next_data_id += 1;
+        Ok(self.handle(data_id))
     }
 
     /// Opens one named typed data object.
     ///
     /// # Errors
     ///
-    /// Returns an error when the data object is missing, its durable placement
-    /// does not match `D`, or MDBX fails.
+    /// Returns an error when the data object is missing or belongs to another
+    /// collection kind.
     pub fn open_data<D: StoreData>(&self, name: &str) -> Result<D, StoreError> {
-        let handle = self.open_handle(name)?;
-        let expected = data_class::placement::<D>();
-        let actual = handle.placement();
+        validate_name(name)?;
+        let &(data_id, actual) = self
+            .catalog
+            .get(name)
+            .ok_or_else(|| StoreError::DataNotFound(name.to_owned()))?;
+        let expected = data_class::kind::<D>();
         if actual != expected {
-            return Err(StoreError::DataSizeMismatch {
+            return Err(StoreError::DataKindMismatch {
                 name: name.to_owned(),
-                expected: expected.size_name(),
-                actual: actual.size_name(),
+                expected: expected.name(),
+                actual: actual.name(),
             });
         }
-        Ok(data_class::from_handle(handle))
-    }
-
-    fn open_handle(&self, name: &str) -> Result<DataHandle, StoreError> {
-        validate_name(name)?;
-        let transaction = self
-            .database
-            .begin_ro_txn()
-            .map_err(|error| StoreError::storage("begin data lookup", error))?;
-        let table = transaction
-            .open_table(None)
-            .map_err(|error| StoreError::storage("open store table", error))?;
-        let binding = transaction
-            .get::<Vec<u8>>(&table, &catalog_key(name))
-            .map_err(|error| StoreError::storage("read data catalog", error))?
-            .ok_or_else(|| StoreError::DataNotFound(name.to_owned()))?;
-        let location = decode_binding(&binding)?;
-        if let DataLocation::Dedicated(table_id) = location {
-            transaction
-                .open_table(Some(&dedicated_table_name(table_id)))
-                .map_err(|error| StoreError::storage("open dedicated data table", error))?;
-        }
-        Ok(self.handle(location))
+        Ok(data_class::from_handle(self.handle(data_id)))
     }
 
     /// Ends data object setup and yields the unique runtime write capability.
-    ///
-    /// Its owner can subsequently derive a read-only runtime capability by
-    /// consuming it with [`Transactions::split`].
     #[must_use]
     pub fn into_transactions(self) -> Transactions {
         Transactions {
@@ -258,119 +144,99 @@ impl Store {
         }
     }
 
-    const fn handle(&self, location: DataLocation) -> DataHandle {
+    const fn handle(&self, data_id: u32) -> DataHandle {
         DataHandle {
             store_token: self.token,
-            location,
+            data_id,
         }
     }
 }
 
-impl DataPlacement {
-    const fn size_name(self) -> &'static str {
+impl DataKind {
+    const fn tag(self) -> u8 {
         match self {
-            Self::Shared => "small",
-            Self::Dedicated => "large",
+            Self::Cell => 1,
+            Self::OrderedMap => 2,
+            Self::OrderedMultiset => 4,
+            Self::PartitionedMultiset => 5,
+            Self::Queue => 6,
+            Self::SubscribedLog => 7,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Cell => "cell",
+            Self::OrderedMap => "ordered map",
+            Self::OrderedMultiset => "ordered multiset",
+            Self::PartitionedMultiset => "partitioned multiset",
+            Self::Queue => "queue",
+            Self::SubscribedLog => "subscribed log",
+        }
+    }
+
+    const fn decode(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Cell),
+            2 => Some(Self::OrderedMap),
+            4 => Some(Self::OrderedMultiset),
+            5 => Some(Self::PartitionedMultiset),
+            6 => Some(Self::Queue),
+            7 => Some(Self::SubscribedLog),
+            _ => None,
         }
     }
 }
 
-fn open_database(path: &Path) -> Result<Database<NoWriteMap>, StoreError> {
-    Database::<NoWriteMap>::open_with_options(
-        path,
-        DatabaseOptions {
-            permissions: Some(0o600),
-            max_tables: Some(u64::from(MAX_DEDICATED_TABLES)),
-            exclusive: true,
-            mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .map_err(|error| StoreError::storage("open MDBX environment", error))
+fn open_database(path: &Path, create: bool) -> Result<Database, StoreError> {
+    let mut options = Options::default();
+    options.create_if_missing(create);
+    options.set_error_if_exists(create);
+    options.set_compression_type(DBCompressionType::Lz4);
+    Database::open(&options, path).map_err(|error| StoreError::storage("open RocksDB", error))
 }
 
 fn validate_store_path(path: &Path) -> Result<(), StoreError> {
-    let directory = metadata(path, path, "inspect store directory")?;
-    if !directory.is_dir() {
-        return Err(StoreError::StoreNotFound(path.to_path_buf()));
-    }
-
-    let data_file = metadata(&path.join(MDBX_DATA_FILE), path, "inspect store data file")?;
-    if !data_file.is_file() {
-        return Err(StoreError::StoreNotFound(path.to_path_buf()));
-    }
-    Ok(())
-}
-
-fn metadata(
-    target: &Path,
-    store_path: &Path,
-    operation: &'static str,
-) -> Result<fs::Metadata, StoreError> {
-    fs::metadata(target).map_err(|error| {
+    let metadata = fs::metadata(path).map_err(|error| {
         if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
-            StoreError::StoreNotFound(store_path.to_path_buf())
+            StoreError::StoreNotFound(path.to_path_buf())
         } else {
-            StoreError::storage(operation, error)
+            StoreError::storage("inspect store directory", error)
         }
-    })
+    })?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(StoreError::StoreNotFound(path.to_path_buf()))
+    }
 }
 
-fn validate_catalog(
-    transaction: &libmdbx::Transaction<'_, libmdbx::RO, NoWriteMap>,
-    table: &libmdbx::Table<'_>,
-    next_id: u32,
-    next_dedicated: u32,
-) -> Result<(), StoreError> {
-    let mut cursor = transaction
-        .cursor(table)
-        .map_err(|error| StoreError::storage("open data catalog cursor", error))?;
-    let mut shared_ids = HashSet::new();
-    let mut dedicated_ids = HashSet::new();
-    let mut entry = cursor
-        .set_range::<Vec<u8>, Vec<u8>>(&[CATALOG_DOMAIN])
-        .map_err(|error| StoreError::storage("seek data catalog", error))?;
-
-    while let Some((key, binding)) = entry {
-        let [domain, name @ ..] = key.as_slice() else {
-            return Err(StoreError::InvalidStore);
-        };
-        if *domain != CATALOG_DOMAIN {
-            break;
-        }
+fn read_catalog(
+    snapshot: &SnapshotWithThreadMode<'_, Database>,
+) -> Result<(Catalog, u64), StoreError> {
+    let mut catalog = BTreeMap::new();
+    let mut data_ids = HashSet::new();
+    let mut next_data_id = 0_u64;
+    let mut options = ReadOptions::default();
+    options.set_iterate_upper_bound([CATALOG_DOMAIN + 1]);
+    for item in snapshot.iterator_opt(
+        IteratorMode::From(&[CATALOG_DOMAIN], Direction::Forward),
+        options,
+    ) {
+        let (key, value) = item.map_err(|error| StoreError::storage("read data catalog", error))?;
+        let name = key
+            .strip_prefix(&[CATALOG_DOMAIN])
+            .expect("the catalog iterator is bounded to its key domain");
         let name = std::str::from_utf8(name).map_err(|_| StoreError::InvalidStore)?;
         validate_name(name).map_err(|_| StoreError::InvalidStore)?;
-
-        let unique_and_allocated = match decode_binding(&binding)? {
-            DataLocation::Shared(id) => id < next_id && shared_ids.insert(id),
-            DataLocation::Dedicated(id) => id < next_dedicated && dedicated_ids.insert(id),
-        };
-        if !unique_and_allocated {
+        let (data_id, kind) = decode_binding(&value)?;
+        if !data_ids.insert(data_id) {
             return Err(StoreError::InvalidStore);
         }
-
-        entry = cursor
-            .next::<Vec<u8>, Vec<u8>>()
-            .map_err(|error| StoreError::storage("scan data catalog", error))?;
+        next_data_id = next_data_id.max(u64::from(data_id) + 1);
+        catalog.insert(name.to_owned(), (data_id, kind));
     }
-
-    let shared_count = u32::try_from(shared_ids.len()).map_err(|_| StoreError::InvalidStore)?;
-    let dedicated_count =
-        u32::try_from(dedicated_ids.len()).map_err(|_| StoreError::InvalidStore)?;
-    if shared_count != next_id || dedicated_count != next_dedicated {
-        return Err(StoreError::InvalidStore);
-    }
-    drop(cursor);
-
-    for id in dedicated_ids {
-        transaction
-            .open_table(Some(&dedicated_table_name(id)))
-            .map_err(|_| StoreError::InvalidStore)?;
-    }
-    Ok(())
+    Ok((catalog, next_data_id))
 }
 
 fn fresh_token() -> u64 {
@@ -396,47 +262,21 @@ fn validate_name(name: &str) -> Result<(), StoreError> {
 }
 
 fn catalog_key(name: &str) -> Vec<u8> {
-    let mut key = vec![CATALOG_DOMAIN];
+    let mut key = Vec::with_capacity(1 + name.len());
+    key.push(CATALOG_DOMAIN);
     key.extend_from_slice(name.as_bytes());
     key
 }
 
-fn decode_u32(bytes: &[u8]) -> Result<u32, StoreError> {
-    bytes
-        .try_into()
-        .map(u32::from_be_bytes)
-        .map_err(|_| StoreError::InvalidStore)
+fn encode_binding(data_id: u32, kind: DataKind) -> [u8; 5] {
+    let [a, b, c, d] = data_id.to_be_bytes();
+    [kind.tag(), a, b, c, d]
 }
 
-fn read_counter(
-    transaction: &libmdbx::Transaction<'_, libmdbx::RW, NoWriteMap>,
-    table: &libmdbx::Table<'_>,
-    key: &[u8],
-) -> Result<u32, StoreError> {
-    let bytes = transaction
-        .get::<Vec<u8>>(table, key)
-        .map_err(|error| StoreError::storage("read store counter", error))?
-        .ok_or(StoreError::InvalidStore)?;
-    decode_u32(&bytes)
-}
-
-fn encode_binding(location: DataLocation) -> [u8; 5] {
-    let (placement, id) = match location {
-        DataLocation::Shared(id) => (SHARED_PLACEMENT, id),
-        DataLocation::Dedicated(id) => (DEDICATED_PLACEMENT, id),
-    };
-    let [a, b, c, d] = id.to_be_bytes();
-    [placement, a, b, c, d]
-}
-
-fn decode_binding(bytes: &[u8]) -> Result<DataLocation, StoreError> {
-    let [placement, a, b, c, d] = bytes else {
+fn decode_binding(bytes: &[u8]) -> Result<(u32, DataKind), StoreError> {
+    let [tag, a, b, c, d] = bytes else {
         return Err(StoreError::InvalidStore);
     };
-    let id = u32::from_be_bytes([*a, *b, *c, *d]);
-    match *placement {
-        SHARED_PLACEMENT => Ok(DataLocation::Shared(id)),
-        DEDICATED_PLACEMENT if id < MAX_DEDICATED_TABLES => Ok(DataLocation::Dedicated(id)),
-        _ => Err(StoreError::InvalidStore),
-    }
+    let kind = DataKind::decode(*tag).ok_or(StoreError::InvalidStore)?;
+    Ok((u32::from_be_bytes([*a, *b, *c, *d]), kind))
 }

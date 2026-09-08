@@ -85,16 +85,15 @@ jobs:
           DOGPADDLE_PERF_PROFILE: smoke
         run: |
           set -euo pipefail
-          run_smoke() {
+          run_jsonl_smoke() {
             local name="$1"
             shift
             local output="$RUNNER_TEMP/$name.jsonl"
             "$@" | tee "$output"
             test -s "$output"
-            jq --exit-status --slurp 'length > 0' "$output" >/dev/null
+            python3 -c 'import json, pathlib, sys; [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]' "$output"
           }
-          run_smoke change-codec cargo bench --locked -p dogpaddle-change --bench change_codec
-          run_smoke ordered-map cargo bench --locked -p dogpaddle-store --bench ordered_map
-          run_smoke append-log cargo bench --locked -p dogpaddle-store --bench append_log
-          run_smoke flow-runtime cargo bench --locked -p dogpaddle-flow --bench flow_runtime
-          run_smoke append-log-endurance cargo bench --locked -p dogpaddle-store --bench append_log_endurance
+          run_jsonl_smoke change-codec cargo bench --locked -p dogpaddle-change --bench change_codec
+          cargo bench --locked -p dogpaddle-store --bench ordered_map
+          cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
+          run_jsonl_smoke flow-runtime cargo bench --locked -p dogpaddle-flow --bench flow_runtime

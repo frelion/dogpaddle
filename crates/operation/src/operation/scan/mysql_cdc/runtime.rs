@@ -1,13 +1,9 @@
-use std::{
-    num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
-    time::Duration,
-};
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{decode_change, encode_change};
 use dogpaddle_debezium::{Checkpoint, Connector};
-use dogpaddle_store::{AppendLog, Cell, CodecError as StoreCodecError, ScanLimit};
+use dogpaddle_store::{Cell, Queue};
 
 use crate::operation::{
     Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
@@ -23,7 +19,6 @@ const PUBLISHING: u32 = 2;
 const STREAMING: u32 = 3;
 const RESETTING: u32 = 4;
 const CONNECTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const LOG_OFFSET_BYTES: u64 = size_of::<u64>() as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -57,7 +52,7 @@ pub struct MySqlCdcScanOperation {
     output_schema: SchemaRef,
     phase_cell: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
-    bootstrap_spool: AppendLog<Vec<u8>>,
+    bootstrap_spool: Queue<Vec<u8>>,
     bootstrap_spool_bytes: NonZeroU64,
     config: MySqlCdcScanConfig,
     phase: Option<Phase>,
@@ -73,7 +68,7 @@ impl MySqlCdcScanOperation {
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
-        bootstrap_spool: AppendLog<Vec<u8>>,
+        bootstrap_spool: Queue<Vec<u8>>,
         bootstrap_spool_bytes: NonZeroU64,
         config: MySqlCdcScanConfig,
     ) -> Self {
@@ -112,8 +107,7 @@ impl MySqlCdcScanOperation {
                 )
                 .into());
             }
-            let bounds = self.bootstrap_spool.access(access)?.bounds()?;
-            let spool_empty = bounds.is_empty();
+            let spool_empty = self.bootstrap_spool.access(access)?.is_empty()?;
             match phase {
                 Phase::Fresh if checkpoint.is_some() || !spool_empty => {
                     return Err(MySqlCdcScanError::InvalidState(
@@ -189,14 +183,7 @@ impl MySqlCdcScanOperation {
     fn reset(&mut self) -> Turn<'_> {
         Turn::ready(move |access| {
             let mut spool = self.bootstrap_spool.access(access)?;
-            let bounds = spool.bounds()?;
-            let finished = if bounds.is_empty() {
-                true
-            } else {
-                let target = bounds.start + 1;
-                spool.truncate_before(target, NonZeroUsize::MIN)?;
-                target == bounds.end
-            };
+            let finished = spool.pop_front()?.is_none() || spool.is_empty()?;
             if finished {
                 self.checkpoint.access(access)?.clear()?;
                 self.phase_cell.access(access)?.clear()?;
@@ -273,8 +260,9 @@ impl MySqlCdcScanOperation {
         Ok(Turn::ready(move |access| {
             if let Some(encoded) = encoded_change {
                 let mut spool = spool.access(access)?;
-                require_bootstrap_capacity(spool.retained_bytes()?, encoded.len(), capacity)?;
-                spool.append(&encoded)?;
+                if !spool.try_push(&encoded, capacity)? {
+                    return Err(MySqlCdcScanError::BootstrapSpoolFull.into());
+                }
             }
             checkpoint.access(access)?.set(&durable_checkpoint)?;
             if complete {
@@ -303,8 +291,7 @@ impl MySqlCdcScanOperation {
         self.stop_connector("snapshot")?;
         Ok(Turn::ready(move |access| {
             let mut spool = self.bootstrap_spool.access(access)?;
-            let bounds = spool.bounds()?;
-            if bounds.is_empty() {
+            let Some(encoded) = spool.pop_front()? else {
                 self.phase_cell.access(access)?.set(&STREAMING)?;
                 return Ok((
                     Action::Commit(None),
@@ -313,30 +300,18 @@ impl MySqlCdcScanOperation {
                         Ok(())
                     }),
                 ));
-            }
+            };
 
-            let mut change = None;
-            spool.scan(
-                bounds.start,
-                ScanLimit::new(1, usize::MAX)?,
-                |entry| -> Result<(), MySqlCdcScanError> {
-                    change = Some(entry.project(|encoded| {
-                        decode_change(encoded)
-                            .map_err(|error| StoreCodecError::new(error.to_string()))
-                    })?);
-                    Ok(())
-                },
-            )?;
-            let change = change.expect("a non-empty spool scan returns its head entry");
+            let change = decode_change(&encoded).map_err(|_| {
+                MySqlCdcScanError::InvalidState("bootstrap spool Change is invalid")
+            })?;
             if change.records().schema().as_ref() != self.output_schema.as_ref() {
                 return Err(MySqlCdcScanError::InvalidState(
                     "bootstrap spool Change has the wrong schema",
                 )
                 .into());
             }
-            let next = bounds.start + 1;
-            spool.truncate_before(next, NonZeroUsize::MIN)?;
-            let finished = next == bounds.end;
+            let finished = spool.is_empty()?;
             if finished {
                 self.phase_cell.access(access)?.set(&STREAMING)?;
             }
@@ -441,27 +416,6 @@ impl Operation for MySqlCdcScanOperation {
     }
 }
 
-fn require_bootstrap_capacity(
-    retained: u64,
-    encoded_bytes: usize,
-    capacity: NonZeroU64,
-) -> Result<(), MySqlCdcScanError> {
-    let value_bytes = u64::try_from(encoded_bytes)
-        .ok()
-        .and_then(|bytes| bytes.checked_add(LOG_OFFSET_BYTES))
-        .ok_or_else(|| MySqlCdcScanError::new("bootstrap spool byte count overflowed"))?;
-    if retained
-        .checked_add(value_bytes)
-        .is_none_or(|bytes| bytes > capacity.get())
-    {
-        return Err(MySqlCdcScanError::new(format!(
-            "bootstrap spool capacity of {} bytes is exhausted; rebuild with a larger bootstrap_spool_bytes",
-            capacity.get()
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -469,7 +423,7 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
     use dogpaddle_change::{Change, encode_change};
-    use dogpaddle_store::{AppendLog, Cell, Store};
+    use dogpaddle_store::{Cell, Queue, Store};
 
     use super::*;
     use crate::operation::scan::{MySqlColumn, MySqlType};
@@ -506,11 +460,19 @@ mod tests {
         .unwrap()
     }
 
+    fn queue_capacity() -> NonZeroU64 {
+        NonZeroU64::new(u64::MAX).unwrap()
+    }
+
+    fn queued_bytes(value: &[u8]) -> u64 {
+        u64::try_from(value.len()).unwrap() + 8
+    }
+
     struct Fixture {
         operation: MySqlCdcScanOperation,
         phase: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
-        spool: AppendLog<Vec<u8>>,
+        spool: Queue<Vec<u8>>,
         transactions: dogpaddle_store::Transactions,
         _root: tempfile::TempDir,
     }
@@ -521,7 +483,7 @@ mod tests {
             let mut store = Store::create(root.path().join("store")).unwrap();
             let phase = store.create_data::<Cell<u32>>("phase").unwrap();
             let checkpoint = store.create_data::<Cell<Vec<u8>>>("checkpoint").unwrap();
-            let spool = store.create_data::<AppendLog<Vec<u8>>>("spool").unwrap();
+            let spool = store.create_data::<Queue<Vec<u8>>>("spool").unwrap();
             let columns = vec![MySqlColumn::new("id", MySqlType::Int64, false)];
             let schema = super::super::schema::compile(&columns).unwrap();
             let operation = MySqlCdcScanOperation::new_bound(
@@ -554,15 +516,15 @@ mod tests {
             let Turn::Ready(prepared) = self.operation.turn(None).unwrap() else {
                 panic!("expected prepared turn");
             };
-            let transaction = self.transactions.begin().unwrap();
+            let transaction = self.transactions.begin();
             let (action, completion) = prepared.apply(transaction.access()).unwrap();
             transaction.commit().unwrap();
             completion.run().unwrap();
             action
         }
 
-        fn durable(&mut self) -> (Option<u32>, Option<Vec<u8>>, std::ops::Range<u64>) {
-            let transaction = self.transactions.begin().unwrap();
+        fn durable(&mut self) -> (Option<u32>, Option<Vec<u8>>, u64) {
+            let transaction = self.transactions.begin();
             let result = (
                 self.phase
                     .access(transaction.access())
@@ -577,7 +539,7 @@ mod tests {
                 self.spool
                     .access(transaction.access())
                     .unwrap()
-                    .bounds()
+                    .queued_bytes()
                     .unwrap(),
             );
             transaction.commit().unwrap();
@@ -591,7 +553,7 @@ mod tests {
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.operation.phase, Some(Phase::Fresh));
         assert!(matches!(fixture.commit(), Action::Commit(None)));
-        assert_eq!(fixture.durable(), (Some(CAPTURING), None, 0..0));
+        assert_eq!(fixture.durable(), (Some(CAPTURING), None, 0));
     }
 
     #[test]
@@ -599,7 +561,7 @@ mod tests {
         let mut fixture = Fixture::create();
         let encoded =
             encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         fixture
             .phase
             .access(transaction.access())
@@ -613,16 +575,16 @@ mod tests {
             .set(&checkpoint().as_bytes().to_vec())
             .unwrap();
         let mut spool = fixture.spool.access(transaction.access()).unwrap();
-        spool.append(&encoded).unwrap();
-        spool.append(&encoded).unwrap();
+        assert!(spool.try_push(&encoded, queue_capacity()).unwrap());
+        assert!(spool.try_push(&encoded, queue_capacity()).unwrap());
         transaction.commit().unwrap();
 
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.durable().0, Some(RESETTING));
         fixture.commit();
-        assert_eq!(fixture.durable().2, 1..2);
+        assert_eq!(fixture.durable().2, queued_bytes(&encoded));
         fixture.commit();
-        assert_eq!(fixture.durable(), (None, None, 2..2));
+        assert_eq!(fixture.durable(), (None, None, 0));
         assert_eq!(fixture.operation.phase, Some(Phase::Fresh));
     }
 
@@ -631,28 +593,33 @@ mod tests {
         let mut fixture = Fixture::create();
         let encoded =
             encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         fixture
             .phase
             .access(transaction.access())
             .unwrap()
             .set(&CAPTURING)
             .unwrap();
-        fixture
-            .spool
-            .access(transaction.access())
-            .unwrap()
-            .append(&encoded)
-            .unwrap();
+        assert!(
+            fixture
+                .spool
+                .access(transaction.access())
+                .unwrap()
+                .try_push(&encoded, queue_capacity())
+                .unwrap()
+        );
         transaction.commit().unwrap();
 
         let Turn::Ready(prepared) = fixture.operation.turn(None).unwrap() else {
             panic!("expected restore");
         };
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         assert!(prepared.apply(transaction.access()).is_err());
         drop(transaction);
-        assert_eq!(fixture.durable(), (Some(CAPTURING), None, 0..1));
+        assert_eq!(
+            fixture.durable(),
+            (Some(CAPTURING), None, queued_bytes(&encoded))
+        );
     }
 
     #[test]
@@ -660,7 +627,7 @@ mod tests {
         let mut fixture = Fixture::create();
         let encoded =
             encode_change(&change(Arc::clone(&fixture.operation.output_schema), 9)).unwrap();
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         fixture
             .phase
             .access(transaction.access())
@@ -673,28 +640,30 @@ mod tests {
             .unwrap()
             .set(&checkpoint().as_bytes().to_vec())
             .unwrap();
-        fixture
-            .spool
-            .access(transaction.access())
-            .unwrap()
-            .append(&encoded)
-            .unwrap();
+        assert!(
+            fixture
+                .spool
+                .access(transaction.access())
+                .unwrap()
+                .try_push(&encoded, queue_capacity())
+                .unwrap()
+        );
         transaction.commit().unwrap();
         fixture.commit();
 
         let Turn::Ready(prepared) = fixture.operation.turn(None).unwrap() else {
             panic!("expected publish");
         };
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         let (action, completion) = prepared.apply(transaction.access()).unwrap();
         assert!(matches!(action, Action::Commit(Some(_))));
         drop(transaction);
         drop(completion);
-        assert_eq!(fixture.durable().2, 0..1);
+        assert_eq!(fixture.durable().2, queued_bytes(&encoded));
         assert_eq!(fixture.durable().0, Some(PUBLISHING));
 
         assert!(matches!(fixture.commit(), Action::Commit(Some(_))));
-        assert_eq!(fixture.durable().2, 1..1);
+        assert_eq!(fixture.durable().2, 0);
         assert_eq!(fixture.durable().0, Some(STREAMING));
     }
 
@@ -702,32 +671,26 @@ mod tests {
     fn bootstrap_spool_capacity_is_a_hard_limit_even_when_empty() {
         let mut fixture = Fixture::create();
         let encoded = [0; 9];
-        let transaction = fixture.transactions.begin().unwrap();
-        let error = require_bootstrap_capacity(
-            fixture
-                .spool
-                .access(transaction.access())
-                .unwrap()
-                .retained_bytes()
-                .unwrap(),
-            encoded.len(),
-            NonZeroU64::new(u64::try_from(encoded.len()).unwrap() + 7).unwrap(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("capacity"));
-        drop(transaction);
-        assert_eq!(fixture.durable().2, 0..0);
-
-        let transaction = fixture.transactions.begin().unwrap();
+        let transaction = fixture.transactions.begin();
         let mut spool = fixture.spool.access(transaction.access()).unwrap();
-        require_bootstrap_capacity(
-            spool.retained_bytes().unwrap(),
-            encoded.len(),
-            NonZeroU64::new(u64::try_from(encoded.len()).unwrap() + 8).unwrap(),
-        )
-        .unwrap();
-        spool.append(&encoded.to_vec()).unwrap();
+        assert!(
+            !spool
+                .try_push(
+                    &encoded.to_vec(),
+                    NonZeroU64::new(u64::try_from(encoded.len()).unwrap() + 7).unwrap(),
+                )
+                .unwrap()
+        );
+        assert!(spool.is_empty().unwrap());
+        assert!(
+            spool
+                .try_push(
+                    &encoded.to_vec(),
+                    NonZeroU64::new(u64::try_from(encoded.len()).unwrap() + 8).unwrap(),
+                )
+                .unwrap()
+        );
         transaction.commit().unwrap();
-        assert_eq!(fixture.durable().2, 0..1);
+        assert_eq!(fixture.durable().2, queued_bytes(&encoded));
     }
 }

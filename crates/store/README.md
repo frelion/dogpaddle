@@ -1,339 +1,263 @@
 # dogpaddle-store
 
-`dogpaddle-store` 是 `DogPaddle` 内部的事务状态层。它基于 MDBX 提供具名的类型化数据对象、
-原子事务和稳定编解码器，为 Flow 运行进度与 Operation 状态提供统一的持久化边界。该 crate
-是引擎实现模块，不是最终面向用户的通用存储产品。
+`dogpaddle-store` 是 `DogPaddle` 的事务状态层。它在 `RocksDB` 上提供具名、类型化的数据结构，
+让 Flow 和 Operation 只表达自己的持久状态与原子更新，不接触存储引擎、列族、物理 key 或
+压缩配置。
 
-## 能力分层
+这个 crate 的公共边界刻意很小：setup 阶段用 `Store` 声明或重新打开资源，运行阶段只保留
+类型化 handle、唯一写事务启动能力和只读 snapshot 启动能力。当前 Flow 仍顺序执行；切换到
+`RocksDB` 为更大的单机状态和未来并发留下空间，但这里没有引入并行 writer、后台调度或历史版本
+查询 API。
 
-Store 将资源装配与运行时访问分离：
+## 生命周期与事务
 
-- `Store` 创建或打开全部具名数据对象，也能在装配期借用一个短期只读 snapshot；进入运行期前，
-  其所有权会被消费；
-- `Cell<T>`、`OrderedMap<K, V, SIZE>` 与 `AppendLog<T>` 是 collection 的完整能力，可以产生
-  完整的事务级读写 Access；
-- `ReadOnly<C>` 由完整 collection 显式单向衰减得到，长期移除该 handle 的写权限；
-- `Transactions` 是唯一、不可克隆的运行期写事务启动能力；它可以在空闲时移动到其他线程，
-  也可以由完整 owner 消费式 `split`，但不暴露 catalog；
-- `ReadTransactions` 由 `Transactions::split` 显式产生，不可 clone、可以在线程间共享，并为
-  同一个 MDBX environment 开启彼此独立的只读 snapshot；
-- `Transaction` 持有一个原子提交边界，并在被丢弃时回滚；
-- `ReadTransaction` 持有一个没有提交能力的只读 snapshot，并在被丢弃时释放；
-- `TransactionAccess` 从活动 Transaction 临时借用，只允许已有类型化数据对象绑定访问；
-- `ReadTransactionAccess` 只能绑定 `CellReadAccess`、`OrderedMapReadAccess` 或
-  `AppendLogReadAccess`，类型层面没有写方法；
-- 完整的 `CellAccess`、`OrderedMapAccess` 与 `AppendLogAccess` 执行实际读写；
-  `ReadOnly<C>::access` 与 `ReadOnly<C>::read` 都统一返回对应的 `*ReadAccess`。
+`Store::create` 只接受尚不存在的目录；`Store::open` 校验已有数据库的 marker 与资源 catalog。
+资源只能在 `Store` 阶段通过 `create_data` 或 `open_data` 获得。`StoreData` 是 sealed trait，外部
+crate 不能绕过六种内建结构自造物理资源。
 
-底层数据句柄、物理放置和 MDBX 访问均为 crate 私有实现。集合不能脱离 `Store` 构造，调用方
-也不能绕过数据类型自行组合物理资源。
+进入运行期时，`Store::into_transactions` 消费 setup owner，产生不可克隆的 `Transactions`。
+`Transactions::begin(&mut self)` 开启一个写事务，因此同一个 owner 在类型层面一次只能持有一个
+活动写事务。`Transaction::commit` 使用 WAL 与同步写入原子提交；直接丢弃 transaction 会回滚。
+这条唯一写能力是当前顺序执行模型的明确边界，不是 `RocksDB` 并发能力的上限。
 
-## 数据结构决定物理布局
+`Transactions::split` 消费 owner，返回原来的唯一写能力和一个不可克隆、但 `Send + Sync` 的
+`ReadTransactions`。共享的 `&ReadTransactions` 可以各自调用 `begin()`，在本线程开启独立的稳定
+snapshot。snapshot 可以与 writer 同时存活：它持续看到开始时的已提交视图，之后开始的 snapshot
+才会看到新的 commit。活动的 `Transaction`、`ReadTransaction` 及其 access 都不能跨线程。
 
-只有确实存在两种合理规模的 collection 才暴露 `Size`。`Cell` 的基数永远至多为一，因此
-固定使用共享物理空间；`AppendLog` 为持续增长并分批回收的流数据而设计，因此固定使用独立
-物理表；只有 `OrderedMap` 可能很小，也可能随业务 key 增长，所以必须显式选择 `Small` 或
-`Large`：
+setup 阶段也可以直接调用 `Store::read_transaction()` 借用一个短期只读 snapshot；它结束后仍可
+继续打开资源。三个事务启动方法都是 infallible，存储错误在实际访问或提交时返回。
 
-```rust
-use dogpaddle_store::{AppendLog, Cell, Large, OrderedMap, Small};
+`TransactionAccess` 与 `ReadTransactionAccess` 是临时借用的装配能力。前者允许类型化结构产生
+读写 access，后者只能产生只读 access；两者都不能创建资源、开始事务或提交。一个 write
+transaction 内通过同一 `TransactionAccess` 修改的任意多个结构共享同一个原子边界。
 
-type Counter = Cell<u64>;
-type Cache = OrderedMap<u64, String, Small>;
-type Records = OrderedMap<u64, Vec<u8>, Large>;
-type Changes = AppendLog<Vec<u8>>;
-```
+## 六种数据结构
 
-`Size` 描述支持规模选择的具名对象的静态存储类别，不是运行时容量上限，也不会根据当前
-数据量自动改变：
+| 结构 | 适用状态 | 核心语义 |
+| --- | --- | --- |
+| `Cell<T>` | checkpoint、phase、计数器、小型控制状态 | 一个可缺省值；`get`、`set`、`clear` |
+| `OrderedMap<K, V>` | 按 key 定位或有序分页的状态 | `get`、`put`、`remove`，以及范围、方向、条目数和字节数都有界的 scan |
+| `OrderedMultiset<K>` | Distinct、精确 admission、带撤回的计数 | 缺失即 multiplicity `0`；`adjust` 做 checked signed 更新，归零即删除 |
+| `PartitionedMultiset<P, K>` | 每组独立的有序索引，例如 grouped MIN/MAX | 先选择 partition，再做 multiplicity、`adjust`、`first`、`last` 或有界 scan |
+| `Queue<T>` | 单一 owner 的持久 FIFO continuation 或私有 spool | 事务内 `try_push` 与 `pop_front`；硬字节容量；空队列没有持久 metadata |
+| `SubscribedLog<T>` | 一个 producer、固定多个 consumer 的 Flow output | setup 时固定 subscriber；writer 追加，subscription 只 peek/ack 自己的下一项，最慢订阅者决定逻辑保留范围 |
 
-- `Cell` 与 `Small` collection 共享主 B+Tree，适合数量较多、规模较小或频繁提交的状态；
-- `Large` map 与 `AppendLog` 使用独立的 MDBX named table，适合可能很大、热点或面向批处理的数据；
-- 单个 Store 最多包含 `Store::LARGE_DATA_CAPACITY` 个独立物理表对象。
+`Cell`、`OrderedMap`、`OrderedMultiset` 和 `PartitionedMultiset` 同时提供写事务 access 与只读
+transaction access。`Queue` 的读取就是消费，因此只绑定写事务。`SubscribedLog` 在 setup 时由
+完整 handle 初始化或校验，随后派生职责更窄的 `SubscribedLogWriter` 和 `Subscription`；writer
+不能确认消费，subscription 不能追加、跳过、倒退或截断。
 
-物理布局在创建时写入 catalog，之后属于该逻辑资源的持久化 schema。
-`Store::open_data::<D>` 会校验数据类型要求的布局；以 `Large` 打开实际为 `Small` 的资源，
-或用固定为共享布局的 `Cell` 打开 dedicated 资源，都会返回 `StoreError::DataSizeMismatch`。
+`Queue::try_push` 的容量是硬上限，空队列也不会接纳超限项。每项按完整编码 value 加私有八字节
+sequence key 计费；metadata 与 `RocksDB` 自身开销不计入。队列变空时删除 metadata 并重置私有
+sequence，这个编号从不暴露为业务身份。
 
-Store catalog 不记录或验证 `Cell`/`OrderedMap`/`AppendLog`、`K`、`V`、`T` 或 codec 类型。
-同一个物理布局下，调用方必须按照创建者定义的稳定 schema 重新打开数据。不要把 Rust
-`TypeId`、类型名或内存布局当作磁盘格式。
+`SubscribedLog::initialize` 必须在创建资源后恰好调用一次，并与拥有它的 durable definition 在
+同一事务发布。subscriber 是固定的稠密整数 `0..subscriber_count`。重新打开时用 `validate`
+核对定义派生出的数量，再从同一 setup handle 派生 writer 与 subscriptions。log offset 永不重置；
+每个 subscription 的 durable `position` 表示下一条待读项。`peek` 只读该项，`acknowledge` 只能确认
+这个精确 offset 并前进一步；position 与 retention accounting 在同一事务中更新。物理 key 的清理
+时机属于 Store 内部实现，不是 subscription 契约。
+
+Subscribed log 的 capacity 是防止 producer 因 backlog 无限增长而淹没磁盘的软上限：非空 backlog
+超限时 `try_append` 返回 `false` 且不写入；空 backlog 始终允许一条大项通过，避免单条合法消息
+永久阻塞。`retained_bytes` 同样按每项完整编码 value 加八字节 offset 计费。
 
 ## 完整示例
 
+下面的例子只使用公共 API，并把六种结构的更新放进真实事务边界：
+
 ```rust,no_run
+use std::{num::{NonZeroU64, NonZeroUsize}, path::Path};
+
 use dogpaddle_store::{
-    AppendLog, Cell, Large, OrderedMap, ScanDirection, ScanLimit, Store, StoreError,
+    Cell, OrderedMap, OrderedMultiset, PartitionedMultiset, Queue, ScanDirection,
+    ScanLimit, Store, StoreError, SubscribedLog,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut store = Store::create("./dogpaddle-store-data")?;
-    let counter = store.create_data::<Cell<u64>>("counter")?;
-    let users = store.create_data::<OrderedMap<u64, String, Large>>("users")?;
-    let changes = store.create_data::<AppendLog<Vec<u8>>>("changes")?;
+fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = Store::create(path)?;
+    let checkpoint = store.create_data::<Cell<u64>>("checkpoint")?;
+    let users = store.create_data::<OrderedMap<u64, String>>("users")?;
+    let distinct = store.create_data::<OrderedMultiset<Vec<u8>>>("distinct")?;
+    let extrema = store.create_data::<PartitionedMultiset<u64, i64>>("extrema")?;
+    let spool = store.create_data::<Queue<Vec<u8>>>("spool")?;
+    let output = store.create_data::<SubscribedLog<Vec<u8>>>("output")?;
 
-    let (mut transactions, read_transactions) = store.into_transactions().split();
+    let writer = output.writer();
+    let subscriber = output.subscription(0);
+    let (mut writes, reads) = store.into_transactions().split();
 
-    {
-        let transaction = transactions.begin()?;
-        let access = transaction.access();
-        let mut counter = counter.access(access)?;
-        let mut users = users.access(access)?;
-        let mut changes = changes.access(access)?;
+    // SubscribedLog 的固定订阅集合属于持久定义的一部分。
+    let transaction = writes.begin();
+    output.initialize(NonZeroU64::MIN, transaction.access())?;
+    transaction.commit()?;
 
-        counter.set(&1)?;
-        users.put(&42, &"Shiba".to_owned())?;
-        changes.append(&b"insert user 42".to_vec())?;
-        transaction.commit()?;
-    }
-
-    let transaction = read_transactions.begin()?;
+    let transaction = writes.begin();
     let access = transaction.access();
-    let counter = counter.read(access)?;
-    let users = users.read(access)?;
-    let changes = changes.read(access)?;
-    assert_eq!(counter.get()?, Some(1));
-    assert_eq!(users.get(&42)?.as_deref(), Some("Shiba"));
+    checkpoint.access(access)?.set(&1)?;
+    users.access(access)?.put(&42, &"Shiba".to_owned())?;
+    distinct.access(access)?.adjust(&b"row".to_vec(), 1)?;
+    extrema.access(access)?.partition(&7)?.adjust(&-3, 1)?;
+    assert!(spool
+        .access(access)?
+        .try_push(&b"private".to_vec(), NonZeroU64::new(1024).unwrap())?);
+    assert!(writer.try_append(
+        &b"public".to_vec(),
+        NonZeroU64::new(1024).unwrap(),
+        access,
+    )?);
+    transaction.commit()?;
 
-    let mut users_page = Vec::new();
-    let continuation = users.scan(
+    let snapshot = reads.begin();
+    let read = snapshot.access();
+    assert_eq!(checkpoint.read(read)?.get()?, Some(1));
+    assert_eq!(users.read(read)?.get(&42)?.as_deref(), Some("Shiba"));
+    assert_eq!(distinct.read(read)?.multiplicity(&b"row".to_vec())?, 1);
+    assert_eq!(
+        extrema
+            .read(read)?
+            .partition(&7)?
+            .first()?
+            .map(|entry| entry.key),
+        Some(-3),
+    );
+
+    let mut page = Vec::new();
+    let continuation = users.read(read)?.scan(
         ..,
-        ScanDirection::Descending,
+        ScanDirection::Ascending,
         None,
         ScanLimit::new(100, 1024 * 1024)?,
         |entry| -> Result<(), StoreError> {
-            users_page.push(entry.decode_owned()?);
+            page.push(entry.decode_owned()?);
             Ok(())
         },
     )?;
-    assert_eq!(users_page, vec![(42, "Shiba".to_owned())]);
+    assert_eq!(page, vec![(42, "Shiba".to_owned())]);
     assert_eq!(continuation, None);
-    let mut observed = Vec::new();
-    let scan = changes.scan(
-        0,
-        ScanLimit::new(100, 1024 * 1024)?,
-        |entry| -> Result<(), StoreError> {
-            observed.push((entry.offset(), entry.decode_owned()?));
-            Ok(())
-        },
-    )?;
-    assert_eq!(observed, vec![(0, b"insert user 42".to_vec())]);
-    assert!(scan.caught_up);
+
+    let next = subscriber.peek(read)?.expect("one committed output");
+    assert_eq!(next, (0, b"public".to_vec()));
+    assert_eq!(writer.status(read)?.retained_bytes, 8 + 6);
+    drop(snapshot);
+
+    let transaction = writes.begin();
+    assert_eq!(
+        spool.access(transaction.access())?.pop_front()?,
+        Some(b"private".to_vec()),
+    );
+    subscriber.acknowledge(next.0, transaction.access())?;
+    transaction.commit()?;
+
+    let snapshot = reads.begin();
+    assert!(subscriber.peek(snapshot.access())?.is_none());
+    let partition = extrema
+        .read(snapshot.access())?
+        .partition(&7)?
+        .scan(ScanDirection::Descending, NonZeroUsize::MIN)?;
+    assert_eq!(partition[0].multiplicity, 1);
     Ok(())
 }
 ```
 
-重新打开时必须声明同一个完整数据类型。装配期读取直接借用当前 `Store`，snapshot 结束后仍可
-继续打开其他数据对象，最终再把同一个 Store 消费为运行期事务能力：
+重新打开必须使用相同的资源名和完整 collection kind。Subscribed log 还要在 setup snapshot 中
+验证固定订阅数：
 
 ```rust,no_run
-use dogpaddle_store::{Cell, Large, OrderedMap, Store};
+use std::{num::NonZeroU64, path::Path};
 
-# fn open() -> Result<(), Box<dyn std::error::Error>> {
-let store = Store::open("./dogpaddle-store-data")?;
-let counter = store.open_data::<Cell<u64>>("counter")?;
-{
-    let transaction = store.read_transaction()?;
-    assert_eq!(counter.read(transaction.access())?.get()?, Some(1));
+use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
+
+fn reopen(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::open(path)?;
+    let checkpoint = store.open_data::<Cell<u64>>("checkpoint")?;
+    let _users = store.open_data::<OrderedMap<u64, String>>("users")?;
+    let output = store.open_data::<SubscribedLog<Vec<u8>>>("output")?;
+
+    {
+        let snapshot = store.read_transaction();
+        output.validate(NonZeroU64::MIN, snapshot.access())?;
+        assert_eq!(checkpoint.read(snapshot.access())?.get()?, Some(1));
+    }
+
+    let _writer = output.writer();
+    let _subscriber = output.subscription(0);
+    let _transactions = store.into_transactions();
+    Ok(())
 }
-let _users = store.open_data::<OrderedMap<u64, String, Large>>("users")?;
-let _transactions = store.into_transactions();
-# Ok(())
-# }
 ```
 
-`StoreData` 是 Store 泛型 create/open 使用的 sealed marker trait。它只由布局完整的内建
-collection 实现；一般业务代码不需要直接引用它。权限不属于持久化 schema：`ReadOnly<C>`
-不实现 `StoreData`，Store catalog 也不记录 capability。重新打开时总是先按完整 collection
-类型打开，再由运行期装配者重新衰减。
+## 编码与持久布局责任
 
-## 只读能力衰减
+Store 的持久契约包括数据库 marker、资源 catalog、每个资源的稳定 namespace、collection kind，
+以及各结构自己的 key framing、metadata 和计数编码。所有结构共享一个 `RocksDB` database；物理前缀、
+WAL、同步提交、LZ4 压缩和引擎句柄都不进入公共 API。调用方不选择物理存储类别或 column family，
+也不能取得裸 namespace。
 
-`ReadOnly::new` 消费一个完整 collection handle，并且不提供 `Deref`、`AsRef`、`Borrow`、
-`into_inner` 或任何能重新取得内部 handle 的 callback。需要同时保留完整能力时，装配者必须
-显式 clone，再衰减其中一个 clone：
+Catalog 只记录 collection kind，不记录 `K`、`V`、`T` 的 Rust 类型或 codec 版本。因此资源 owner
+必须把“稳定资源名 + 完整 collection 类型 + `StoreKey`/`StoreValue` 编码”当作自己的持久 schema。
+以另一种 value codec 打开同一个 `OrderedMap` 不会在 catalog 阶段被识别，第一次解码才会失败。
+`StoreKey` 编码必须 canonical、可逆、injective，并逐字节保持 Rust `Ord`；`StoreValue` 编码必须能
+跨进程重启稳定还原。内建 codec 覆盖 `Vec<u8>`、`String`、`u32`、`u64`、`i64`、`bool` 和 `()`。
 
-```rust,no_run
-use dogpaddle_store::{AppendLog, ReadOnly, ScanLimit, Store, StoreError};
+当前开发期格式不提供旧布局识别、迁移或兼容层。修改资源名、collection kind、codec、内部 framing
+或 metadata 就是在修改持久 ABI；应同步更新 owner 的 golden/raw-layout 与 reopen 证据，并要求旧
+Flow 删除后重建。
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut store = Store::create("./dogpaddle-read-only-example")?;
-let output = store.create_data::<AppendLog<Vec<u8>>>("changes")?;
-let input = ReadOnly::new(output.clone());
-let mut transactions = store.into_transactions();
+## 有序扫描
 
-let transaction = transactions.begin()?;
-let access = transaction.access();
-output.access(access)?.append(&b"change".to_vec())?;
+`OrderedMapAccess::scan` 和 `OrderedMapReadAccess::scan` 接受 `RangeBounds<K>`、升降序、排他的
+`resume_after` 与 `ScanLimit`。limit 同时约束一页的条目数和 encoded key + value 逻辑字节数。
+返回的 `Option<K>` 只在达到限制且范围内仍有下一项时出现；下一页复用相同 range/direction，并把
+它原样传回 `resume_after`。
 
-let mut observed = Vec::new();
-input.access(access)?.scan(
-    0,
-    ScanLimit::new(100, 1024 * 1024)?,
-    |entry| -> Result<(), StoreError> {
-        observed.push(entry.decode_owned()?);
-        Ok(())
-    },
-)?;
-assert_eq!(observed, vec![b"change".to_vec()]);
-transaction.commit()?;
-# Ok(())
-# }
-```
+Store 在调用第一个 visitor 前先准入整页并计算 continuation，不让业务 callback 与 `RocksDB` iterator
+交错。callback 可以修改同一事务中的其他数据；已准入的当前页保持不变，后续页看到下一次 scan
+时的事务状态。`OrderedMapEntry::decode_owned` 解码完整 `(K, V)`；`project` 让宽 value 场景只解析
+所需字节，projection 的返回值不能借用 entry 编码。
 
-衰减不会撤销装配者仍然持有的完整 alias；它保证的是只收到 `ReadOnly<C>` 的组件无法在 safe
-Rust 中升级能力。`ReadOnly<C>` 的 `Clone` 仍只产生 `ReadOnly<C>`，因此多个 consumers 可以安全地
-共享同一个输入 collection。当前白名单是：`Cell` 的 `get`，`OrderedMap` 的 `get/scan`，以及
-`AppendLog` 的 `bounds/scan`。它与只读事务是两个正交约束：`ReadOnly<C>::access` 可在一个写
-事务中提供受限读取，`ReadOnly<C>::read` 则绑定真正的只读 snapshot；两条路径统一返回没有
-写方法的 `CellReadAccess`、`OrderedMapReadAccess` 或 `AppendLogReadAccess`。完整 collection 的
-`read` 也返回同一组类型。
+第一条匹配项单独超过 byte limit 时返回 `StoreError::ItemTooLarge`。这是唯一可调整 limit 后在同一
+事务重试的 Store 错误，不会使事务中毒。`PartitionedMultiset` 的 scan 更窄：它只接受方向和非零
+最大条目数，并直接返回拥有型 `Vec<MultisetEntry<K>>`；`first` 与 `last` 是 Top-K/极值维护的常用
+单项路径。
 
-## 事务与扫描语义
+## 错误与事务中毒
 
-`Store::read_transaction(&self)` 只在装配期提供一个绑定于 Store 借用期的活动只读 snapshot；它
-不会导出可长期持有的事务启动能力，也没有写入或 commit 权限。snapshot 被丢弃后，同一个
-`Store` 仍可继续 `open_data`，然后按正常边界进入运行期。
+编码失败、解码失败、损坏的持久 metadata、wrong-store handle、`RocksDB` 访问失败、multiset
+underflow/overflow、非法 subscription acknowledgement 等硬错误都会使所属读或写 transaction
+中毒。之后的访问返回 `StoreError::TransactionPoisoned`，写 transaction 也不能提交；其全部 Store
+写入最终回滚。visitor 自己返回错误同样会毒化 scan 所属 transaction，因此 callback 不应执行
+无法随 Store 回滚的外部副作用。
 
-`Store::into_transactions()` 只发生一次，并产生唯一、不可克隆的写能力 `Transactions`。运行
-协调者集中持有它；`begin(&mut self)` 返回的 Transaction guard 在存活期间独占借用该能力，
-因此无法在前一 guard 被提交或丢弃前再次开始写事务。显式泄漏 guard 会同时泄漏底层写事务，
-不属于正常 RAII 生命周期。写能力本身可以在线程之间移动，但活动 Transaction 及其访问值仍然
-绑定在创建它们的线程。
+容量不足不是错误。`Queue::try_push` 或 `SubscribedLogWriter::try_append` 返回 `false` 时不写入、
+不中毒，调用方可以在同一 transaction 内选择背压、更新其他状态或正常提交。
 
-`Transactions::split(self)` 消费完整 owner，并把同一个唯一写能力与一个只读启动能力一起返回，
-不会创建第二个 MDBX environment。完整 owner 取回写能力后可以有意地再次授权；只拿到
-`&mut Transactions` 的 Station 无法消费它，因而不能 split 或导出 owned reader。返回的
-`ReadTransactions` 不可 clone、但为 `Send + Sync`；共享引用可以通过 `begin(&self)` 开启彼此
-独立的 `ReadTransaction`，借用方无法把事务启动能力留到借用期之外。只读 snapshot 可以和唯一
-写能力同时存活：它持续观察开始时的稳定视图，writer 的后续 commit 只对之后开始的 snapshot
-可见。活动 `ReadTransaction` 与 `ReadTransactionAccess` 仍然是线程绑定的；并发读取应在线程间
-共享启动能力的引用，再在线程内开始、读取并结束 snapshot，而不是把活动事务跨线程传递。
+`Cell`、map、multiset 和 `Queue` handle 可以 clone，但每次访问仍会校验它属于开启 transaction 的
+同一个 `Store`。`SubscribedLog` 通过 setup handle 派生所需的 writer 和 subscriptions。Access 借用
+活动 transaction，不能缓存到下一个 turn；transaction 的 owner 始终保留唯一的 commit 权力。
 
-丢弃事务会触发回滚。`Transaction` 没有显式中止方法，也不包含集合专用操作。调用
-`Transaction::access()` 会得到可复制但不能提交的 `TransactionAccess`；它只能让调用方已经
-持有的完整或 `ReadOnly` collection handle 创建事务级 Access。事务协调者因此可以保留当前
-Transaction 的所有权并把受限能力交给 Operation；Operation 无法开始或结束原子边界，也无法
-访问 Store catalog。通过同一能力创建的所有访问值共享事务快照，因此任意数量、任意固定或显式
-选择布局的数据对象都可以原子提交。
+## 验证与性能
 
-`TransactionAccess` 属于写事务，但它自身没有 commit 权限；一次原子工作可以用它同时读取 input
-并写入 state/output。静态 collection 权限仍由 handle 决定：完整 handle 的 `access` 绑定完整
-Access，`ReadOnly<C>::access` 则绑定对应的 `*ReadAccess`。`ReadTransactionAccess` 是更强的
-事务级衰减：无论调用方持有完整还是 `ReadOnly` collection，都只能通过 `read` 得到同一组
-`CellReadAccess`、`OrderedMapReadAccess` 或 `AppendLogReadAccess`。这些类型根本没有
-`set/put/remove/append/truncate` 方法，`ReadTransaction` 也没有 `commit`。
-
-两种 `TransactionAccess` 和所有 collection Access 都不能脱离所属事务；每个新事务都必须重新
-绑定，不能跨 Station 步骤缓存。能力及访问值仍然是线程绑定的，不能跨线程移动正在执行的事务。
-
-内置集合在同一个事务中毒边界内执行编解码。严重的编解码或存储失败会毒化事务，之后的操作
-以及提交返回 `TransactionPoisoned`；无法容纳单个扫描项的 `ItemTooLarge` 是可调整 scan
-limit 后重试的软错误，不会毒化事务。
-
-`StoreKey::decode_key` 与 `StoreValue::decode_value` 都接收 `Cow<'_, [u8]>`。只读 decoder 应从
-`as_ref()` 解析，确实需要拥有完整编码的类型应使用 `into_owned()`；两种 variant 表示相同的
-持久字节，codec 不得依赖某个 variant 必然出现。MDBX clean page 可以直接借用，dirty page
-则会安全地物化为 owned buffer。具体 variant 是性能行为，不是正确性契约。
-
-`OrderedMapAccess::scan` 支持有界范围、升序或降序、条目数与逻辑编码字节数双重限制。它先在
-Store 内完成当前页的范围判断、限额和续传 key 解码，释放 MDBX cursor，随后才把短生命周期的
-`OrderedMapEntry` 逐条交给 callback。因此 callback 可以修改同一事务中的 map，而当前已经准入
-的页保持不变；后续页则读取事务当时的状态。`entry.project` 可以只读取 key、diff 或少数列，
-`entry.decode_owned` 仅在确实需要完整业务对象时物化结果。返回的 `Option<K>` 是排他的续传 key：
-只有当前页达到限制且仍存在另一条匹配记录时才为 `Some`。下一页必须复用相同范围和方向，并把
-它作为 `resume_after` 传回；scan 不会为了判断续传而预读下一条 value。
-
-## `AppendLog` 语义
-
-`AppendLog` 的保留区间始终是 `[head, tail)`：`head` 是最早保留 offset，`tail` 是下一次
-append 使用的 offset。读取 cursor 同样表示“下一条尚未读取的 offset”，必须位于
-`head..=tail`；offset 永不重编号，也不会在前缀删除后复用。
-
-`append_batch(&[T])` 为一批值一次性分配连续 offset，并返回对应的半开区间。批量追加只读取和
-验证一次边界、复用一个 MDBX cursor，并在全部记录成功后只推进一次 metadata；空 slice 是
-不物化 metadata 的 no-op。任意编码、碰撞或存储失败都会毒化事务，已经写入的批内前缀不能
-单独提交。单条 `append` 与批量追加共享同一套持久化不变量。
-
-`retained_bytes()` 返回物理 `[head, tail)` 中所有 entry 的逻辑编码字节和：每项包含八字节
-offset key 与完整 encoded value，不包含 `AppendLog` metadata、MDBX page/index、MVCC 旧页或文件
-系统分配开销。`try_append(value, capacity)` 使用同一账本做准入：非空日志只有在追加后不超过
-capacity 时才写入，否则返回不毒化事务的 `Ok(None)`；空日志始终允许写入一项，因此单个超大
-entry 不会造成永久等待。该 capacity 是 backlog 高水位，不是 MDBX 文件大小硬配额。
-
-`AppendLogAccess::scan` 使用与 map 相同的 `ScanLimit`，每项按八字节 offset key 加完整编码
-value 计费。它不会预先构造完整的 `T`，而是把短生命周期的 `AppendLogEntry` 逐条交给
-callback：`project` 可以只解码 diff 或少数列，`decode_owned` 只在确实需要完整值时执行，
-`append_entry` 则能把相同 `T` 的编码原样写入同一事务中的另一个 log。Entry 不公开 MDBX
-借用或裸字节，也不能逃出 callback 或跨线程。
-
-作为输入时，`ReadOnly<AppendLog<T>>` 只公开 `bounds/retained_bytes/scan`，不能 append 或
-truncate。它既能
-通过 `access(TransactionAccess)` 参与包含其他写入的原子事务，也能通过
-`read(ReadTransactionAccess)` 绑定独立只读 snapshot。多个消费者可以 clone 同一份只读 handle
-并读取同一个物理日志。写事务中的只读 view 扫出的 entry 仍可原样转发给同一事务内自有的 output；
-真正只读 snapshot 的 entry 不携带这种写事务关联。各自的 next-unread offset 由上层分别持久化，
-不属于 `AppendLog` 或只读 capability。
-
-一个 scan 在调用 callback 前先验证选中 offset 连续。callback 的任意错误都会毒化事务，
-避免已经写入部分输出后仍被提交；第一项无法装入 byte limit 的 `ItemTooLarge` 仍是可增大
-limit 后重试的软错误。`AppendLogScan::next_offset` 可直接持久化为 consumer 的 next-unread cursor，
-`caught_up` 表示本批已经追到 scan 开始时捕获的 tail。
-
-`truncate_before(target, max_items)` 只删除 `target` 以下且当前仍保留的连续前缀，并限制单次
-删除条数。删除过程通过 MDBX cursor 读取 value length，不复制或解码 value；entry 删除、head
-推进和 retained-byte 扣账处于同一个 MDBX 事务。调用方应以所有 consumer cursor 的最小值作为
-target，并分批提交 GC。
-
-持久布局固定为一个独立表：空 key 保存 24 字节 big-endian
-`head || tail || retained_bytes`，八字节 big-endian offset key 保存 `T` 的稳定编码。全新且
-从未使用的空表可以没有 metadata；一旦使用，即使回收到空区间也保留单调的 head/tail，并把
-retained bytes 记为零。旧的 8 字节或 16 字节 metadata 不做迁移，按损坏拒绝。该布局和 `T` 的
-codec 都属于调用方需要稳定维护的持久化 schema。
-
-## 测试
-
-全部公共行为与持久化契约使用一个按语义分模块的外部正确性 target：
+Store 的公共 correctness target 覆盖事务、snapshot、六种结构、reopen、raw layout、损坏拒绝、
+中毒回滚和 SIGKILL crash consistency：
 
 ```bash
-cargo test -p dogpaddle-store --test correctness
-cargo test -p dogpaddle-store --doc
+cargo test -p dogpaddle-store --test correctness --locked -- --test-threads=1
 ```
 
-也可以直接过滤并运行单个测试区域：
+需要私有故障注入的 collection 单元测试随 library test 运行：
 
 ```bash
-cargo test -p dogpaddle-store --test correctness transaction::
-cargo test -p dogpaddle-store --test correctness scan::
+cargo test -p dogpaddle-store --lib --locked -- --test-threads=1
 ```
 
-该 target 会对 `OrderedMap` 的 `Small` 与 `Large` 形式运行相同的数据、事务与扫描语义，并
-通过 MDBX 持久化适配器锁定 `Cell` 的共享布局、`Small` map 的共享前缀、`Large` map 与
-`AppendLog` 的
-独立 named table。布局不匹配的 reopen、崩溃恢复、事务中毒和 codec 失败也有独立覆盖。目录
-中的 `capability` 模块验证衰减后仍读取同一物理对象、fan-out 与 reopen 后重新衰减；transaction
-模块验证旧只读 snapshot 与 writer 同时存在时保持稳定，并验证共享的读能力引用可在线程中独立
-开始 snapshot。写方法不可用、事务启动能力不可 clone、活动事务不能跨线程、不能恢复完整 handle
-且不能作为 `StoreData` 打开的静态边界由 Rustdoc compile-fail 测试锁定。测试目录所有权、模块
-职责和完整验证协议见工作区
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
-
-## 性能
-
-Store 仍有四个按数据对象与运行目的隔离的 release 入口，供单场景诊断和固定 reference 测量：
+完整工作区 gate、证据所有权和系统验收入口见 [`TESTING.md`](../../TESTING.md)。Store 只保留两个
+owner benchmark：`cell` 测 hot read 与 durable read-modify-write，`ordered_map` 测批量写、点读、
+有界正反向 scan、projection、Station 形状的原子更新和 durable hot overwrite。workload、fixture、
+结果字段与可比性规则见 [`PERFORMANCE.md`](PERFORMANCE.md)。快速 smoke：
 
 ```bash
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench cell
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench ordered_map
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench append_log
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-store --bench append_log_endurance
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench cell
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
 ```
-
-按 `Cell`、`Small OrderedMap`、`Large OrderedMap` 和 `AppendLog` 分别整理的本机基线、读法与
-设计结论见
-[`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/store/PERFORMANCE.md)。
-普通 target 覆盖各 collection 的独立与组合事务；`append_log_endurance` 单独观察长期前缀回收、
-页复用、尾延迟和实际文件占用。所有规模由 `smoke` 或 `reference` profile 固定，fixture、预热和
-结果 oracle 位于计时外。正式 reference 必须同时设置绝对路径 `DOGPADDLE_PERF_ROOT`；机器记录、
-工作负载、统计口径与目录所有权见
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。

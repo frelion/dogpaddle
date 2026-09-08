@@ -24,7 +24,7 @@ use dogpaddle_operation::{
         sink::{PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
     },
 };
-use dogpaddle_store::{AppendLog, Cell, ScanLimit, Store, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store, Transactions};
 use serde_json::{Value, json};
 
 const SCAN_CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
@@ -185,7 +185,8 @@ struct DirectScan {
     scan: Box<dyn Operation>,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
-    output: AppendLog<Vec<u8>>,
+    output: OrderedMap<u64, Vec<u8>>,
+    output_tail: Cell<u64>,
     transactions: Transactions,
 }
 
@@ -198,7 +199,7 @@ impl DirectScan {
         let store = Store::open(&path)?;
         let definition_cell: Cell<Vec<u8>> = store.open_data("definition")?;
         let definition = {
-            let snapshot = store.read_transaction()?;
+            let snapshot = store.read_transaction();
             decode_definition(
                 &definition_cell
                     .read(snapshot.access())?
@@ -216,6 +217,7 @@ impl DirectScan {
             phase: store.open_data(SCAN_PHASE)?,
             checkpoint: store.open_data(SCAN_CHECKPOINT)?,
             output: store.open_data("output")?,
+            output_tail: store.open_data("output-tail")?,
             transactions: store.into_transactions(),
         })
     }
@@ -229,9 +231,10 @@ impl DirectScan {
         for declaration in canonical.data() {
             let _ = declaration.create(&mut store, declaration.name())?;
         }
-        store.create_data::<AppendLog<Vec<u8>>>("output")?;
+        store.create_data::<OrderedMap<u64, Vec<u8>>>("output")?;
+        store.create_data::<Cell<u64>>("output-tail")?;
         let mut transactions = store.into_transactions();
-        let transaction = transactions.begin()?;
+        let transaction = transactions.begin();
         saved.access(transaction.access())?.set(&encoded)?;
         transaction.commit()?;
         Ok(())
@@ -241,10 +244,13 @@ impl DirectScan {
         let Turn::Ready(prepared) = self.scan.turn(None)? else {
             return Ok(json!({"kind": "idle"}));
         };
-        let transaction = self.transactions.begin()?;
+        let transaction = self.transactions.begin();
         let before = self.checkpoint.access(transaction.access())?.get()?;
-        let before_bounds = self.output.access(transaction.access())?.bounds()?;
-        let before_bytes = self.output.access(transaction.access())?.retained_bytes()?;
+        let before_tail = self
+            .output_tail
+            .access(transaction.access())?
+            .get()?
+            .unwrap_or(0);
         let (action, completion) = prepared.apply(transaction.access())?;
         let after = self.checkpoint.access(transaction.access())?.get()?;
         let checkpoint_present = after.is_some();
@@ -254,18 +260,16 @@ impl DirectScan {
         let has_output = match &action {
             Action::Idle => return Ok(json!({"kind": "idle"})),
             Action::Commit(Some(change)) => {
-                let capacity = if command == "backpressure" {
-                    NonZeroU64::MIN
-                } else {
-                    NonZeroU64::MAX
-                };
-                if self
-                    .output
-                    .access(transaction.access())?
-                    .try_append(&encode_change(change)?, capacity)?
-                    .is_none()
-                {
+                if command == "backpressure" && before_tail != 0 {
                     backpressured = true;
+                } else {
+                    self.output
+                        .access(transaction.access())?
+                        .put(&before_tail, &encode_change(change)?)?;
+                    let next = before_tail
+                        .checked_add(1)
+                        .ok_or("direct gate output tail is exhausted")?;
+                    self.output_tail.access(transaction.access())?.set(&next)?;
                 }
                 true
             }
@@ -275,12 +279,15 @@ impl DirectScan {
         if backpressured || (command == "rollback" && has_output) {
             drop(completion);
             drop(transaction);
-            let transaction = self.transactions.begin()?;
+            let transaction = self.transactions.begin();
             let checkpoint_unchanged =
                 before == self.checkpoint.access(transaction.access())?.get()?;
-            let output_unchanged = before_bounds
-                == self.output.access(transaction.access())?.bounds()?
-                && before_bytes == self.output.access(transaction.access())?.retained_bytes()?;
+            let output_unchanged = self
+                .output_tail
+                .access(transaction.access())?
+                .get()?
+                .unwrap_or(0)
+                == before_tail;
             return Ok(json!({
                 "kind": if backpressured { "backpressure" } else { "rollback" },
                 "output": has_output,
@@ -324,13 +331,16 @@ impl DirectScan {
     }
 
     fn read(&mut self) -> Result<Value, OperationError> {
-        let transaction = self.transactions.begin()?;
+        let transaction = self.transactions.begin();
         let mut rows = Vec::new();
-        let scanned = self.output.access(transaction.access())?.scan(
-            0,
+        let continuation = self.output.access(transaction.access())?.scan(
+            ..,
+            ScanDirection::Ascending,
+            None,
             ScanLimit::new(4096, usize::MAX)?,
             |entry| -> Result<(), OperationError> {
-                let change = decode_change(&entry.decode_owned()?)?;
+                let (_, encoded) = entry.decode_owned()?;
+                let change = decode_change(&encoded)?;
                 let columns = change.records().columns();
                 let ids = columns[0]
                     .as_any()
@@ -355,7 +365,7 @@ impl DirectScan {
                 Ok(())
             },
         )?;
-        if !scanned.caught_up {
+        if continuation.is_some() {
             return Err("gate output exceeded the bounded diagnostic scan".into());
         }
         let checkpoint_present = self

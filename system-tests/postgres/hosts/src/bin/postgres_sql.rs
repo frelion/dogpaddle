@@ -80,7 +80,7 @@ fn advance_response(
     Ok(json!({
         "kind": "advance",
         "outcome": format!("{outcome:?}"),
-        "sink": {"cursor": input.cursor, "tail": input.tail},
+        "sink": {"position": input.position, "tail": input.tail},
     }))
 }
 

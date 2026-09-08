@@ -63,7 +63,7 @@ pub enum FlowError {
         /// Stable Store data object name that could not be opened.
         name: String,
     },
-    /// Published runtime positions or output-retention frontiers are invalid.
+    /// Published subscription or output-retention state is invalid.
     #[error("station {station_id:?} has invalid runtime state: {reason}")]
     InvalidRuntimeState {
         /// Stable Station ID whose runtime state is invalid.
@@ -109,9 +109,10 @@ impl FlowRunError {
     /// Returns whether this runtime must be reopened before scheduling can
     /// continue.
     ///
-    /// This is true both for the originating post-commit callback failure and
-    /// for later calls rejected by the runtime's fail-stop guard. Stations
-    /// earlier in the originating scheduling round may already have committed.
+    /// This is true after a Store commit reports failure, after a post-commit
+    /// callback fails, and for later calls rejected by the runtime's fail-stop
+    /// guard. Stations earlier in the originating scheduling round may already
+    /// have committed.
     #[must_use]
     pub fn requires_reopen(&self) -> bool {
         self.source.requires_reopen()

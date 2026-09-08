@@ -16,7 +16,7 @@ pub enum PostgresCdcScanError {
     /// An external resource or live catalog does not satisfy the Scan contract.
     #[error("PostgreSQL CDC scan runtime failed: {0}")]
     InvalidRuntime(String),
-    /// Persisted Scan state is invalid or exceeds its explicit bound.
+    /// Persisted Scan state is invalid.
     #[error("invalid PostgreSQL CDC scan state: {0}")]
     InvalidState(&'static str),
     /// The complete initial snapshot cannot fit its configured private spool.

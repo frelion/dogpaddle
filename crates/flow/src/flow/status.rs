@@ -24,20 +24,20 @@ pub struct StationStatus {
 /// One input edge's position in complete Changes, not rows or input events.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputStatus {
-    /// Next input log offset to complete.
-    pub cursor: u64,
-    /// Input log's exclusive tail; `tail - cursor` is this edge's backlog.
+    /// Subscription position: the next input log offset to complete.
+    pub position: u64,
+    /// Input log's exclusive tail; `tail - position` is this edge's backlog.
     pub tail: u64,
 }
 
-/// Physical output retention, using Store's existing accounting.
+/// Output retention reported by Store's logical accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputStatus {
     /// First retained Change offset.
     pub head: u64,
     /// Exclusive Change tail; `tail - head` is the retained entry count.
     pub tail: u64,
-    /// Encoded entries and their offset keys, excluding MDBX overhead.
+    /// Encoded entries and their offset keys, excluding storage-engine overhead.
     pub retained_bytes: u64,
     /// Soft high watermark. An empty log may admit one oversized entry.
     pub capacity_bytes: u64,
@@ -55,7 +55,7 @@ impl Flow {
     ///
     /// Returns [`FlowError`] if Store access fails or a durable position is invalid.
     pub fn status(&self) -> Result<Vec<StationStatus>, FlowError> {
-        let snapshot = self.reads.begin()?;
+        let snapshot = self.reads.begin();
         self.station_ids
             .iter()
             .zip(&self.stations)

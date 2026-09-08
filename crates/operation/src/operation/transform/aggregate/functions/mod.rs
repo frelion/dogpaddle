@@ -10,6 +10,8 @@ mod count;
 mod extrema;
 mod sum;
 
+pub(super) use extrema::ExtremaDirection;
+
 pub(super) const COUNT_ALL: u16 = 1;
 pub(super) const COUNT: u16 = 2;
 pub(super) const SUM: u16 = 3;
@@ -36,7 +38,7 @@ pub(super) struct BoundReduction {
 
 pub(super) enum Reduction {
     Fold(Box<dyn Fold>),
-    Indexed(Box<dyn Indexed>),
+    Extrema(extrema::ExtremaDirection),
 }
 
 pub(super) trait Fold: Send {
@@ -51,32 +53,6 @@ pub(super) trait Fold: Send {
     ) -> Result<(), AggregateError>;
 
     fn output(&self, state: &[u8], group_weight: u64) -> Result<ScalarValue, AggregateError>;
-}
-
-pub(super) trait Indexed: Send {
-    fn empty(&self) -> Vec<u8>;
-
-    fn change(
-        &self,
-        state: &mut Vec<u8>,
-        values: &[ScalarValue],
-        encoded: &[u8],
-        presence: Option<i64>,
-    ) -> Result<bool, AggregateError>;
-
-    fn begin_scan(&self) -> Vec<u8>;
-
-    fn push(
-        &self,
-        scan: &mut Vec<u8>,
-        values: &[ScalarValue],
-        encoded: &[u8],
-        weight: u64,
-    ) -> Result<(), AggregateError>;
-
-    fn finish_scan(&self, state: &mut Vec<u8>, scan: Vec<u8>);
-
-    fn output(&self, state: &[u8]) -> Result<ScalarValue, AggregateError>;
 }
 
 const DESCRIPTORS: &[Descriptor] = &[

@@ -5,7 +5,7 @@ use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{
-    AppendLog, Cell, OrderedMap, ReadTransactionAccess, Small, Store, StoreError,
+    Cell, Store, StoreError, SubscribedLog, SubscribedLogStatus, SubscriptionStatus,
 };
 
 use super::support::{
@@ -19,7 +19,7 @@ const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
 enum ResourceFault {
     MissingOutput,
     MissingPosition,
-    WrongOutputSize,
+    WrongOutputKind,
 }
 
 #[test]
@@ -34,34 +34,50 @@ fn build_publishes_the_stable_v1_definition_bytes() {
 }
 
 #[test]
-fn build_uses_the_stable_resource_layout_and_input_origins() {
+fn build_uses_subscribed_outputs_and_only_materializes_multi_input_state() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     build_chain(&path);
     let store = Store::open(&path).unwrap();
-    let states: [OrderedMap<Vec<u8>, Vec<u8>, Small>; 3] = [
-        store.open_data("station/00000000/state").unwrap(),
-        store.open_data("station/00000001/state").unwrap(),
-        store.open_data("station/00000002/state").unwrap(),
+    let outputs: [SubscribedLog<Vec<u8>>; 2] = [
+        store.open_data("station/00000000/output").unwrap(),
+        store.open_data("station/00000001/output").unwrap(),
     ];
     let _running_event_count: Cell<u64> = store
         .open_data("station/00000001/operation/running_event_count.count")
         .unwrap();
     assert!(matches!(
-        store.open_data::<AppendLog<Vec<u8>>>("station/00000002/output"),
+        store.open_data::<SubscribedLog<Vec<u8>>>("station/00000002/output"),
         Err(StoreError::DataNotFound(name)) if name == "station/00000002/output"
     ));
-    let (_, reads) = store.into_transactions().split();
-    let transaction = reads.begin().unwrap();
-    assert_eq!(input_origin(&states[0], transaction.access()), (None, None));
-    assert_eq!(
-        input_origin(&states[1], transaction.access()),
-        (Some(vec![0; 4]), Some(vec![0; 8]))
-    );
-    assert_eq!(
-        input_origin(&states[2], transaction.access()),
-        (Some(vec![0; 4]), Some(vec![0; 8]))
-    );
+    for index in 0..3 {
+        let name = format!("station/{index:08x}/active-input");
+        assert!(matches!(
+            store.open_data::<Cell<u32>>(&name),
+            Err(StoreError::DataNotFound(actual)) if actual == name
+        ));
+    }
+    let transaction = store.read_transaction();
+    for output in outputs {
+        output
+            .validate(NonZeroU64::MIN, transaction.access())
+            .unwrap();
+        assert_eq!(
+            output.writer().status(transaction.access()).unwrap(),
+            SubscribedLogStatus {
+                head: 0,
+                tail: 0,
+                retained_bytes: 0,
+            }
+        );
+        assert_eq!(
+            output.subscription(0).status(transaction.access()).unwrap(),
+            SubscriptionStatus {
+                position: 0,
+                tail: 0,
+            }
+        );
+    }
 }
 
 #[test]
@@ -71,7 +87,7 @@ fn open_classifies_each_required_station_resource_fault() {
     for (name, fault) in [
         ("missing-output", ResourceFault::MissingOutput),
         ("missing-position", ResourceFault::MissingPosition),
-        ("wrong-output-size", ResourceFault::WrongOutputSize),
+        ("wrong-output-kind", ResourceFault::WrongOutputKind),
     ] {
         let path = root.path().join(name);
         publish_faulty_resources(&path, &definition, fault);
@@ -89,12 +105,12 @@ fn open_classifies_each_required_station_resource_fault() {
                 FlowError::MissingResource { name }
                     if name == "station/00000000/operation/sequence_scan.position"
             )),
-            ResourceFault::WrongOutputSize => assert!(matches!(
+            ResourceFault::WrongOutputKind => assert!(matches!(
                 error,
-                FlowError::Store(StoreError::DataSizeMismatch {
+                FlowError::Store(StoreError::DataKindMismatch {
                     name,
-                    expected: "large",
-                    actual: "small",
+                    expected: "subscribed log",
+                    actual: "cell",
                 }) if name == "station/00000000/output"
             )),
         }
@@ -104,27 +120,32 @@ fn open_classifies_each_required_station_resource_fault() {
 fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault) {
     let mut store = Store::create(path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    store
-        .create_data::<OrderedMap<Vec<u8>, Vec<u8>, Small>>("station/00000000/state")
-        .unwrap();
-    if !matches!(fault, ResourceFault::MissingOutput) {
-        if matches!(fault, ResourceFault::WrongOutputSize) {
+    let output = match fault {
+        ResourceFault::MissingOutput => None,
+        ResourceFault::WrongOutputKind => {
             store
                 .create_data::<Cell<Vec<u8>>>("station/00000000/output")
                 .unwrap();
-        } else {
-            store
-                .create_data::<AppendLog<Vec<u8>>>("station/00000000/output")
-                .unwrap();
+            None
         }
-    }
+        ResourceFault::MissingPosition => Some(
+            store
+                .create_data::<SubscribedLog<Vec<u8>>>("station/00000000/output")
+                .unwrap(),
+        ),
+    };
     if !matches!(fault, ResourceFault::MissingPosition) {
         store
             .create_data::<Cell<u64>>("station/00000000/operation/sequence_scan.position")
             .unwrap();
     }
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
+    if let Some(output) = output {
+        output
+            .initialize(NonZeroU64::MIN, transaction.access())
+            .unwrap();
+    }
     published
         .access(transaction.access())
         .unwrap()
@@ -158,15 +179,4 @@ fn build_chain(path: &Path) {
     builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
     builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
     drop(builder.build().unwrap());
-}
-
-fn input_origin(
-    state: &OrderedMap<Vec<u8>, Vec<u8>, Small>,
-    access: ReadTransactionAccess<'_>,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let state = state.read(access).unwrap();
-    (
-        state.get(&b"input/active".to_vec()).unwrap(),
-        state.get(&b"input/00000000/cursor".to_vec()).unwrap(),
-    )
 }

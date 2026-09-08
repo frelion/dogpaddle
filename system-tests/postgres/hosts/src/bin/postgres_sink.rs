@@ -85,7 +85,7 @@ fn main() -> Result<(), GateError> {
                         let inputs = station
                             .inputs
                             .into_iter()
-                            .map(|input| json!({"cursor": input.cursor, "tail": input.tail}))
+                            .map(|input| json!({"position": input.position, "tail": input.tail}))
                             .collect::<Vec<_>>();
                         let output = station.output.map(|output| {
                             json!({

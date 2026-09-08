@@ -1,6 +1,8 @@
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
@@ -70,6 +72,14 @@ fn create_operation(
     root: &TestStore,
     definition: &dyn OperationDefinition,
 ) -> (Box<dyn Operation>, Transactions) {
+    create_operation_for_schema(root, definition, input_schema())
+}
+
+fn create_operation_for_schema(
+    root: &TestStore,
+    definition: &dyn OperationDefinition,
+    schema: SchemaRef,
+) -> (Box<dyn Operation>, Transactions) {
     let mut store = Store::create(root.path()).unwrap();
     for (declaration, physical) in definition
         .data()
@@ -80,7 +90,7 @@ fn create_operation(
     }
     let operation = materialize(
         definition,
-        &[input_schema()],
+        &[schema],
         &store,
         &["groups", "entries", "control"],
     );
@@ -282,7 +292,7 @@ fn definition_binds_one_operation_and_three_private_data_objects() {
 }
 
 #[test]
-fn count_sum_average_and_indexed_extrema_follow_ordered_group_transitions() {
+fn count_sum_average_and_extrema_follow_ordered_group_transitions() {
     let root = TestStore::new();
     let definition = definition();
     let (mut operation, mut transactions) = create_operation(&root, &definition);
@@ -341,6 +351,235 @@ fn unchanged_extrema_do_not_emit_redundant_rows() {
     };
     assert_eq!(output.num_rows(), 1);
     assert_eq!(output.diffs().values(), &[1]);
+}
+
+#[test]
+fn extrema_order_signed_values_by_value() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+    let input = change(&["A", "A", "A"], &[Some(0), Some(-10), Some(5)], &[1, 1, 1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not emit extrema transitions");
+    };
+    let minimum = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let maximum = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let last = output.num_rows() - 1;
+    assert_eq!((minimum.value(last), maximum.value(last)), (-10, 5));
+
+    let retract = change(&["A"], &[Some(-10)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not replace its minimum");
+    };
+    let minimum = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let maximum = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(minimum.values(), &[-10, 0]);
+    assert_eq!(maximum.values(), &[5, 5]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
+}
+
+#[test]
+fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("department", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("bytes", DataType::Binary, true),
+    ]));
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min_text", AggregateCall::min(col("text"))),
+            ("max_text", AggregateCall::max(col("text"))),
+            ("min_bytes", AggregateCall::min(col("bytes"))),
+            ("max_bytes", AggregateCall::max(col("bytes"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) =
+        create_operation_for_schema(&root, &definition, Arc::clone(&schema));
+    let records = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "A", "A"])),
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("aa"),
+                Some("a"),
+                Some(""),
+            ])),
+            Arc::new(BinaryArray::from(vec![
+                None,
+                Some(b"aa".as_slice()),
+                Some(b"a".as_slice()),
+                Some(b"".as_slice()),
+            ])),
+        ],
+    )
+    .unwrap();
+    let input = Change::try_new(records, Int64Array::from(vec![1, 1, 1, 1])).unwrap();
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&input)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not emit byte extrema transitions");
+    };
+    let last = output.num_rows() - 1;
+    let min_text = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let max_text = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let min_bytes = output
+        .records()
+        .column(3)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    let max_bytes = output
+        .records()
+        .column(4)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(min_text.value(last), "");
+    assert_eq!(max_text.value(last), "aa");
+    assert_eq!(min_bytes.value(last), b"");
+    assert_eq!(max_bytes.value(last), b"aa");
+}
+
+#[test]
+fn extrema_multiplicity_and_group_partitions_are_independent() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("department", DataType::Utf8, false),
+        Field::new("identity", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) =
+        create_operation_for_schema(&root, &definition, Arc::clone(&schema));
+    let make_change =
+        |departments: Vec<&str>, identities: Vec<i64>, values: Vec<i64>, diffs: Vec<i64>| {
+            Change::try_new(
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(departments)),
+                        Arc::new(Int64Array::from(identities)),
+                        Arc::new(Int64Array::from(values)),
+                    ],
+                )
+                .unwrap(),
+                Int64Array::from(diffs),
+            )
+            .unwrap()
+        };
+
+    let initial = make_change(
+        vec!["A", "A", "B"],
+        vec![1, 2, 3],
+        vec![5, 5, 5],
+        vec![1, 1, 1],
+    );
+    commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    let retract_one = make_change(vec!["A"], vec![1], vec![5], vec![-1]);
+    assert!(matches!(
+        commit_ready(
+            operation.as_mut(),
+            Some(turn_input(&retract_one)),
+            &mut transactions,
+        )
+        .unwrap(),
+        Action::Complete(None)
+    ));
+
+    let extend_other_group = make_change(vec!["B"], vec![4], vec![7], vec![1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        operation.as_mut(),
+        Some(turn_input(&extend_other_group)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not update the independent group");
+    };
+    let departments = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let maximum = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        departments.iter().collect::<Vec<_>>(),
+        [Some("B"), Some("B")]
+    );
+    assert_eq!(maximum.values(), &[5, 7]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
 }
 
 #[test]
@@ -474,7 +713,10 @@ fn unsigned_sum_and_average_use_input_multiplicity() {
 fn exact_row_admission_rolls_back_the_whole_change() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("rows", AggregateCall::count_all())],
+        [
+            ("rows", AggregateCall::count_all()),
+            ("min", AggregateCall::min(col("value"))),
+        ],
     )
     .unwrap();
     let root = TestStore::new();
@@ -499,7 +741,7 @@ fn exact_row_admission_rolls_back_the_whole_change() {
         Some(AggregateError::NegativeWeight)
     ));
 
-    let retry = change(&["B"], &[Some(20)], &[1]);
+    let retry = change(&["B"], &[Some(30)], &[1]);
     let Action::Complete(Some(output)) = commit_ready(
         operation.as_mut(),
         Some(turn_input(&retry)),
@@ -509,6 +751,13 @@ fn exact_row_admission_rolls_back_the_whole_change() {
         panic!("rolled-back group leaked into durable state");
     };
     assert_eq!(output.diffs().values(), &[1]);
+    let minimum = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(minimum.values(), &[30]);
 }
 
 #[test]

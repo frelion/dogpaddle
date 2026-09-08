@@ -1,36 +1,29 @@
-use std::{ops::RangeInclusive, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
-use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, TransactionAccess};
+use dogpaddle_store::{PartitionedMultisetAccess, StoreError, TransactionAccess};
 
 use crate::{
     expression::BoundExpression,
     operation::{
         Action, OperationError, OperationInput, TransactionalOperation,
-        relation::{
-            CollisionBucket, RowWeightError, canonical_row, encode_canonical, row_digest,
-            update_bucket,
-        },
+        relation::{canonical_row, encode_canonical},
     },
 };
 
 use super::{
     AggregateError,
-    functions::{Fold, Indexed, apply_weight},
-    state::{Control, Entries, EntryKey, GroupBucket, GroupEntry, Groups},
-    value::scalars,
+    functions::{ExtremaDirection, Fold, apply_weight},
+    state::{Control, Entries, EntryPartition, GroupState, Groups},
+    value::{null, order_key, ordered_value},
 };
 
 const ADMISSION_LAYOUT: u32 = 0;
 
 /// Materialized exact grouped aggregate.
-///
-/// The runtime owns one group map, one unified entry map, and one group-ID
-/// cell. Function implementations receive bounded argument tuples and never
-/// receive Store access.
 pub struct AggregateOperation {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
@@ -44,26 +37,21 @@ pub struct AggregateOperation {
 
 pub(super) enum BoundCall {
     Fold {
+        state: usize,
         arguments: Box<[BoundExpression]>,
         reduction: Box<dyn Fold>,
     },
-    Indexed {
+    Extrema {
         layout: usize,
-        reduction: Box<dyn Indexed>,
+        direction: ExtremaDirection,
     },
 }
 
 pub(super) struct BoundLayout {
     pub(super) id: u32,
     pub(super) owner: usize,
-    pub(super) fields: Box<[Arc<Field>]>,
-    pub(super) expressions: Box<[BoundExpression]>,
-}
-
-struct IndexChange {
-    values: Vec<ScalarValue>,
-    encoded: Vec<u8>,
-    presence: Option<i64>,
+    pub(super) field: Arc<Field>,
+    pub(super) expression: BoundExpression,
 }
 
 struct OutputRows {
@@ -72,28 +60,26 @@ struct OutputRows {
 }
 
 impl BoundCall {
-    pub(super) fn fold(arguments: Box<[BoundExpression]>, reduction: Box<dyn Fold>) -> Self {
+    pub(super) fn fold(
+        state: usize,
+        arguments: Box<[BoundExpression]>,
+        reduction: Box<dyn Fold>,
+    ) -> Self {
         Self::Fold {
+            state,
             arguments,
             reduction,
         }
     }
 
-    pub(super) fn indexed(layout: usize, reduction: Box<dyn Indexed>) -> Self {
-        Self::Indexed { layout, reduction }
+    pub(super) const fn extrema(layout: usize, direction: ExtremaDirection) -> Self {
+        Self::Extrema { layout, direction }
     }
 
-    fn empty(&self) -> Vec<u8> {
+    fn initial_fold_state(&self) -> Option<Vec<u8>> {
         match self {
-            Self::Fold { reduction, .. } => reduction.empty(),
-            Self::Indexed { reduction, .. } => reduction.empty(),
-        }
-    }
-
-    fn output(&self, state: &[u8], group_weight: u64) -> Result<ScalarValue, AggregateError> {
-        match self {
-            Self::Fold { reduction, .. } => reduction.output(state, group_weight),
-            Self::Indexed { reduction, .. } => reduction.output(state),
+            Self::Fold { reduction, .. } => Some(reduction.empty()),
+            Self::Extrema { .. } => None,
         }
     }
 }
@@ -140,29 +126,28 @@ impl TransactionalOperation for AggregateOperation {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>(),
-                BoundCall::Indexed { .. } => Ok(Vec::new()),
+                BoundCall::Extrema { .. } => Ok(Vec::new()),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout_columns = self
             .layouts
             .iter()
             .map(|layout| {
-                layout
-                    .expressions
-                    .iter()
-                    .map(|expression| {
-                        expression.evaluate(records).map_err(|source| {
-                            AggregateError::AggregateExpression {
-                                aggregate: layout.owner,
-                                source,
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+                layout.expression.evaluate(records).map_err(|source| {
+                    AggregateError::AggregateExpression {
+                        aggregate: layout.owner,
+                        source,
+                    }
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let group_fields = &self.output_schema.fields()[..self.group_expressions.len()];
+        let fold_count = self
+            .calls
+            .iter()
+            .filter(|call| matches!(call, BoundCall::Fold { .. }))
+            .count();
         let mut output = OutputRows::new(self.output_schema.fields().len());
         let mut groups = self.groups.access(access)?;
         let mut entries = self.entries.access(access)?;
@@ -171,138 +156,106 @@ impl TransactionalOperation for AggregateOperation {
         for row in 0..input.change.num_rows() {
             let difference = input.change.diffs().value(row);
             let group = encode_tuple(group_fields, &group_columns, row)?;
-            let digest = row_digest(&group);
-            let mut bucket = groups.get(&digest)?;
-            let existed = bucket
-                .as_mut()
-                .and_then(|bucket| bucket.get_mut(&group))
-                .is_some();
-            if !existed {
+            let (existed, mut state) = if let Some(state) = groups.get(&group)? {
+                (true, state)
+            } else {
                 if difference < 0 {
                     return Err(AggregateError::NegativeWeight.into());
                 }
                 let id = control.get()?.unwrap_or(0);
                 let next = id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?;
                 control.set(&next)?;
-                let entry = GroupEntry {
-                    group: group.clone(),
-                    id,
-                    weight: 0,
-                    calls: self.calls.iter().map(BoundCall::empty).collect(),
-                };
-                if let Some(bucket) = bucket.as_mut() {
-                    bucket.insert(entry);
-                } else {
-                    bucket = Some(GroupBucket::one(entry));
-                }
+                (
+                    false,
+                    GroupState {
+                        id,
+                        weight: 0,
+                        folds: self
+                            .calls
+                            .iter()
+                            .filter_map(BoundCall::initial_fold_state)
+                            .collect(),
+                    },
+                )
+            };
+            if state.folds.len() != fold_count {
+                return Err(AggregateError::InvalidState.into());
             }
 
-            let remove_group;
-            {
-                let entry = bucket
-                    .as_mut()
-                    .and_then(|bucket| bucket.get_mut(&group))
-                    .expect("the current group was found or inserted");
-                if entry.calls.len() != self.calls.len() {
-                    return Err(AggregateError::InvalidState.into());
-                }
-                let old_weight = entry.weight;
-                let old_output = existed
-                    .then(|| call_output(&self.calls, &entry.calls, old_weight))
-                    .transpose()?;
-
-                let input_row = canonical_row(records, row)?;
-                update_entry(
-                    &mut entries,
-                    ADMISSION_LAYOUT,
-                    entry.id,
-                    input_row,
-                    difference,
-                )?;
-                entry.weight = apply_weight(entry.weight, difference)?;
-
-                let mut index_changes = Vec::with_capacity(self.layouts.len());
-                for (layout, columns) in self.layouts.iter().zip(&layout_columns) {
-                    let values = scalar_tuple(columns, row)?;
-                    let encoded = encode_tuple(&layout.fields, columns, row)?;
-                    let presence = update_entry(
+            let old_output = existed
+                .then(|| {
+                    call_output(
+                        &self.calls,
+                        &self.layouts,
+                        &state.folds,
+                        state.weight,
                         &mut entries,
-                        layout.id,
-                        entry.id,
-                        encoded.clone(),
-                        difference,
-                    )?;
-                    index_changes.push(IndexChange {
-                        values,
-                        encoded,
-                        presence,
-                    });
-                }
+                        state.id,
+                    )
+                })
+                .transpose()?;
 
-                for (aggregate, (call, state)) in
-                    self.calls.iter().zip(&mut entry.calls).enumerate()
-                {
-                    match call {
-                        BoundCall::Fold { reduction, .. } => {
-                            let values = scalar_tuple(&call_columns[aggregate], row)?;
-                            reduction.apply(state, &values, difference, entry.weight)?;
-                        }
-                        BoundCall::Indexed { layout, reduction } => {
-                            let change = &index_changes[*layout];
-                            if reduction.change(
-                                state,
-                                &change.values,
-                                &change.encoded,
-                                change.presence,
-                            )? {
-                                scan_layout(
-                                    &entries,
-                                    &self.layouts[*layout],
-                                    entry.id,
-                                    reduction.as_ref(),
-                                    state,
-                                )?;
-                            }
-                        }
-                    }
-                }
+            let input_row = canonical_row(records, row)?;
+            entries
+                .partition(&EntryPartition::new(ADMISSION_LAYOUT, state.id))?
+                .adjust(&input_row, difference)
+                .map(|_| ())
+                .map_err(map_weight_error)?;
+            state.weight = apply_weight(state.weight, difference)?;
 
-                if entry.weight == 0 {
-                    output.push(
-                        &group_columns,
-                        row,
-                        old_output.expect("an inserted group has positive weight"),
-                        -1,
-                    )?;
-                } else {
-                    let new_output = call_output(&self.calls, &entry.calls, entry.weight)?;
-                    match old_output {
-                        None => {
-                            output.push(&group_columns, row, new_output, 1)?;
-                        }
-                        Some(old_output) if old_output != new_output => {
-                            output.push(&group_columns, row, old_output, -1)?;
-                            output.push(&group_columns, row, new_output, 1)?;
-                        }
-                        Some(_) => {}
-                    }
+            for (layout, column) in self.layouts.iter().zip(&layout_columns) {
+                let value = ScalarValue::try_from_array(column.as_ref(), row)?;
+                if let Some(key) = order_key(&layout.field, &value)? {
+                    entries
+                        .partition(&EntryPartition::new(layout.id, state.id))?
+                        .adjust(&key, difference)
+                        .map(|_| ())
+                        .map_err(map_weight_error)?;
                 }
-                remove_group = entry.weight == 0;
             }
 
-            if remove_group {
-                let bucket = bucket.as_mut().expect("the current digest bucket exists");
-                bucket.remove(&group);
-                if bucket.is_empty() {
-                    groups.remove(&digest)?;
-                } else {
-                    groups.put(&digest, bucket)?;
+            for (aggregate, call) in self.calls.iter().enumerate() {
+                if let BoundCall::Fold {
+                    state: state_index,
+                    reduction,
+                    ..
+                } = call
+                {
+                    let call_state = state
+                        .folds
+                        .get_mut(*state_index)
+                        .ok_or(AggregateError::InvalidState)?;
+                    let values = scalar_tuple(&call_columns[aggregate], row)?;
+                    reduction.apply(call_state, &values, difference, state.weight)?;
                 }
-            } else {
-                groups.put(
-                    &digest,
-                    bucket.as_ref().expect("the current digest bucket exists"),
+            }
+
+            if state.weight == 0 {
+                output.push(
+                    &group_columns,
+                    row,
+                    old_output.expect("an existing group has positive weight"),
+                    -1,
                 )?;
+                groups.remove(&group)?;
+            } else {
+                let new_output = call_output(
+                    &self.calls,
+                    &self.layouts,
+                    &state.folds,
+                    state.weight,
+                    &mut entries,
+                    state.id,
+                )?;
+                match old_output {
+                    None => output.push(&group_columns, row, new_output, 1)?,
+                    Some(old_output) if old_output != new_output => {
+                        output.push(&group_columns, row, old_output, -1)?;
+                        output.push(&group_columns, row, new_output, 1)?;
+                    }
+                    Some(_) => {}
+                }
+                groups.put(&group, &state)?;
             }
         }
 
@@ -333,76 +286,45 @@ fn scalar_tuple(columns: &[ArrayRef], row: usize) -> Result<Vec<ScalarValue>, Ag
 
 fn call_output(
     calls: &[BoundCall],
-    states: &[Vec<u8>],
+    layouts: &[BoundLayout],
+    fold_states: &[Vec<u8>],
     group_weight: u64,
+    entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+    group: u64,
 ) -> Result<Vec<ScalarValue>, AggregateError> {
     calls
         .iter()
-        .zip(states)
-        .map(|(call, state)| call.output(state, group_weight))
+        .map(|call| match call {
+            BoundCall::Fold {
+                state, reduction, ..
+            } => reduction.output(
+                fold_states
+                    .get(*state)
+                    .ok_or(AggregateError::InvalidState)?,
+                group_weight,
+            ),
+            BoundCall::Extrema { layout, direction } => {
+                let layout = &layouts[*layout];
+                let partition = entries.partition(&EntryPartition::new(layout.id, group))?;
+                let entry = match direction {
+                    ExtremaDirection::Min => partition.first()?,
+                    ExtremaDirection::Max => partition.last()?,
+                };
+                entry.map_or_else(
+                    || null(layout.field.data_type()),
+                    |entry| ordered_value(&layout.field, &entry.key),
+                )
+            }
+        })
         .collect()
 }
 
-fn update_entry(
-    entries: &mut OrderedMapAccess<'_, EntryKey, CollisionBucket>,
-    layout: u32,
-    group: u64,
-    value: Vec<u8>,
-    difference: i64,
-) -> Result<Option<i64>, AggregateError> {
-    let key = EntryKey::new(layout, group, row_digest(&value));
-    let mut bucket = entries.get(&key)?;
-    let presence = update_bucket(&mut bucket, value, difference).map_err(map_weight_error)?;
-    if let Some(bucket) = bucket {
-        entries.put(&key, &bucket)?;
-    } else {
-        entries.remove(&key)?;
-    }
-    Ok(presence)
-}
-
-fn map_weight_error(error: RowWeightError) -> AggregateError {
+fn map_weight_error(error: StoreError) -> AggregateError {
     match error {
-        RowWeightError::Store(source) => AggregateError::Store(source),
-        RowWeightError::Negative => AggregateError::NegativeWeight,
-        RowWeightError::Overflow => AggregateError::ArithmeticOverflow,
+        StoreError::MultiplicityUnderflow => AggregateError::NegativeWeight,
+        StoreError::MultiplicityOverflow => AggregateError::ArithmeticOverflow,
+        source => AggregateError::Store(source),
     }
-}
-
-fn scan_layout(
-    entries: &OrderedMapAccess<'_, EntryKey, CollisionBucket>,
-    layout: &BoundLayout,
-    group: u64,
-    reduction: &dyn Indexed,
-    state: &mut Vec<u8>,
-) -> Result<(), AggregateError> {
-    let range: RangeInclusive<EntryKey> =
-        EntryKey::first(layout.id, group)..=EntryKey::last(layout.id, group);
-    let limit = ScanLimit::new(1, usize::MAX)?;
-    let mut resume = None;
-    let mut scan = reduction.begin_scan();
-    loop {
-        let next = entries.scan(
-            range.clone(),
-            ScanDirection::Ascending,
-            resume.as_ref(),
-            limit,
-            |entry| {
-                let (_, bucket) = entry.decode_owned()?;
-                for (encoded, weight) in bucket.rows() {
-                    let values = scalars(&layout.fields, encoded)?;
-                    reduction.push(&mut scan, &values, encoded, weight)?;
-                }
-                Ok::<(), AggregateError>(())
-            },
-        )?;
-        let Some(next) = next else {
-            break;
-        };
-        resume = Some(next);
-    }
-    reduction.finish_scan(state, scan);
-    Ok(())
 }
 
 impl OutputRows {

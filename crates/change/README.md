@@ -15,7 +15,7 @@ diff、零 diff 和不支持的 Schema。
 非空连续物理片段；没有输出时产生零个 `Change`。物理批次可以合并或切分，但重批前后展平的
 事件序列必须逐项相同。
 
-持久化后，`(AppendLog offset, Change row_index)` 只是当前分批下的单边遍历坐标，不是稳定
+持久化后，`(SubscribedLog entry offset, Change row_index)` 只是当前分批下的坐标，不是稳定
 event ID。`Change` 不携带应用前的关系状态，因此允许以负 diff 开头，也不判断一次撤回
 能否应用。事件生产者必须产生有效流；维护或物化关系的组件负责验证任意记录的应用前权重加
 已处理前缀累计 diff 不得为负，并在失败时回滚。
@@ -99,9 +99,9 @@ Rust 原生 16 字节对齐，Arrow 会只为该 buffer 再建立一份对齐副
 
 未选字段的 descriptor 仍必须合法，但其 UTF-8 内容、List offsets、Decimal128 value precision 等
 值级约束不会被读取或验证；所选字段会递归验证这些约束，需要完整审计时使用 `decode_change`。
-投影减少 `Change` codec 对 Arrow body 的访问、
-解码和 owned allocation，不改变写入内容、entry 大小或 `ScanLimit` 计费，也不保证 MDBX、
-操作系统或存储设备产生字段级物理 I/O。
+投影减少 `Change` codec 对 Arrow body 的访问、解码和 owned allocation，不改变写入内容、entry
+大小或运行层的 retained-byte 计费。它不承诺来自任何具体存储引擎的零拷贝读取，也不保证
+`RocksDB`、操作系统或存储设备产生字段级物理 I/O。
 
 ## 持久化编码
 
@@ -129,9 +129,10 @@ diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
 且不改变语义的 `FlatBuffer` 布局、默认值或 body padding 内容变体可能被接受；
 `encode_change` 的确定性输出及其黄金字节才是 `DogPaddle` 写入端的持久化基准。
 
-运行层可以用 `AppendLog<Vec<u8>>` 保存完整 Stream，每个日志 entry 恰好对应一个 Change；
-同一 entry 可供不同消费者独立投影。`dogpaddle-change` 不实现 Store collection，Store 也不
-依赖 Arrow。
+当前运行层用 `SubscribedLog<Vec<u8>>` 保存完整 Stream，每个日志 entry 恰好对应一个 Change。
+固定的消费者各自维护 durable position，可以对同一 entry 做不同投影；最慢消费者决定 entry
+何时回收。这些是 `RocksDB` Store 与 Flow 的职责：`dogpaddle-change` 不实现 Store collection，
+不依赖 Store，也不感知 offset、subscriber 或 retention；Store 同样不依赖 Arrow。
 
 ## 验证
 
@@ -147,5 +148,5 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_code
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)，Change 单体 benchmark
 的 workload 与结果解释见
 [`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/change/PERFORMANCE.md)。真实
-`Change + AppendLog<Vec<u8>>` 正确性和性能属于工作区下游
+`Change + SubscribedLog<Vec<u8>>` 正确性和性能属于工作区下游
 `integration-tests/change-store/`，不由本 crate 的测试依赖 Store。

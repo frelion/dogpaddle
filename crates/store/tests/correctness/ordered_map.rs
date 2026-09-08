@@ -6,38 +6,26 @@ mod scans;
 use std::borrow::Cow;
 
 use dogpaddle_store::{
-    CodecError, Large, OrderedMap, ScanDirection, ScanLimit, Small, Store, StoreData, StoreError,
-    StoreKey, StoreValue,
+    CodecError, OrderedMap, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreValue,
 };
 
 use crate::support::{TestValue, create_byte_map, create_map, store_path};
 
-fn open_map<K: StoreKey, V: StoreValue, SIZE>(
+fn open_map<K: StoreKey, V: StoreValue>(
     store: &Store,
     name: &str,
-) -> Result<OrderedMap<K, V, SIZE>, StoreError>
-where
-    OrderedMap<K, V, SIZE>: StoreData,
-{
+) -> Result<OrderedMap<K, V>, StoreError> {
     store.open_data(name)
 }
 
 #[test]
 fn ordered_map_point_operations_are_exact() {
-    assert_ordered_map_point_operations::<Small>();
-    assert_ordered_map_point_operations::<Large>();
-}
-
-fn assert_ordered_map_point_operations<SIZE>()
-where
-    OrderedMap<u64, String, SIZE>: StoreData,
-{
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, String, SIZE>(&mut store, "map").unwrap();
+    let map = create_map::<u64, String>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let mut access = map.access(transaction.access()).unwrap();
     assert_eq!(access.get(&7).unwrap(), None);
     access.put(&7, &"first".to_owned()).unwrap();
@@ -55,9 +43,9 @@ fn ordered_map_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
-    let map = create_map::<u64, TestValue, Large>(&mut store, "map").unwrap();
+    let map = create_map::<u64, TestValue>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     map.access(transaction.access())
         .unwrap()
         .put(&42, &TestValue(9))
@@ -66,9 +54,9 @@ fn ordered_map_survives_reopen() {
     drop(transactions);
 
     let store = Store::open(&path).unwrap();
-    let map = open_map::<u64, TestValue, Large>(&store, "map").unwrap();
+    let map = open_map::<u64, TestValue>(&store, "map").unwrap();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         map.access(transaction.access()).unwrap().get(&42).unwrap(),
         Some(TestValue(9))
@@ -89,9 +77,9 @@ impl StoreKey for TestKey {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct BorrowedKey(Vec<u8>);
+struct SliceKey(Vec<u8>);
 
-impl StoreKey for BorrowedKey {
+impl StoreKey for SliceKey {
     fn encode_key(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         Ok(self.0.as_slice())
     }
@@ -105,17 +93,17 @@ impl StoreKey for BorrowedKey {
 fn ordered_map_accepts_external_key_and_value_codecs() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<TestKey, TestValue, Small>(&mut store, "map").unwrap();
+    let map = create_map::<TestKey, TestValue>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     map.access(transaction.access())
         .unwrap()
         .put(&TestKey(3), &TestValue(4))
         .unwrap();
     transaction.commit().unwrap();
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     assert_eq!(
         map.access(transaction.access())
             .unwrap()
@@ -126,19 +114,19 @@ fn ordered_map_accepts_external_key_and_value_codecs() {
 }
 
 #[test]
-fn borrowed_key_codecs_support_points_ranges_and_continuations() {
+fn slice_backed_key_codecs_support_points_ranges_and_continuations() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<BorrowedKey, u64, Small>(&mut store, "map").unwrap();
+    let map = create_map::<SliceKey, u64>(&mut store, "map").unwrap();
     let mut transactions = store.into_transactions();
 
     let keys = [
-        BorrowedKey(b"a".to_vec()),
-        BorrowedKey(b"b".to_vec()),
-        BorrowedKey(b"c".to_vec()),
+        SliceKey(b"a".to_vec()),
+        SliceKey(b"b".to_vec()),
+        SliceKey(b"c".to_vec()),
     ];
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
         for (value, key) in keys.iter().enumerate() {
             access.put(key, &(value as u64)).unwrap();
@@ -146,7 +134,7 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     assert_eq!(access.get(&keys[1]).unwrap(), Some(1));
     let limit = ScanLimit::new(1, 1_024).unwrap();
@@ -183,12 +171,12 @@ fn borrowed_key_codecs_support_points_ranges_and_continuations() {
 fn data_objects_isolate_identical_keys() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let left = create_byte_map::<Small>(&mut store, "left").unwrap();
-    let right = create_byte_map::<Small>(&mut store, "right").unwrap();
+    let left = create_byte_map(&mut store, "left").unwrap();
+    let right = create_byte_map(&mut store, "right").unwrap();
     let mut transactions = store.into_transactions();
 
     {
-        let transaction = transactions.begin().unwrap();
+        let transaction = transactions.begin();
         let mut left = left.access(transaction.access()).unwrap();
         let mut right = right.access(transaction.access()).unwrap();
         left.put(&Vec::new(), &b"left-empty".to_vec()).unwrap();
@@ -198,7 +186,7 @@ fn data_objects_isolate_identical_keys() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin().unwrap();
+    let transaction = transactions.begin();
     let left = left.access(transaction.access()).unwrap();
     let right = right.access(transaction.access()).unwrap();
     assert_eq!(left.get(&Vec::new()).unwrap(), Some(b"left-empty".to_vec()));
