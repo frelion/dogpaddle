@@ -1,9 +1,7 @@
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use base64::{Engine as _, prelude::BASE64_STANDARD};
-use dogpaddle_debezium::Checkpoint;
-use dogpaddle_store::Cell;
+use dogpaddle_store::{AppendLog, Cell};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -16,8 +14,15 @@ use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlC
 
 pub(crate) const TAG: u16 = 15;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+const PHASE: DataName<Cell<u32>> = DataName::new("mysql_cdc_scan.phase");
 const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("mysql_cdc_scan.checkpoint");
-static DATA: [DataDeclaration; 1] = [CHECKPOINT.declaration()];
+const BOOTSTRAP_SPOOL: DataName<AppendLog<Vec<u8>>> =
+    DataName::new("mysql_cdc_scan.bootstrap_spool");
+static DATA: [DataDeclaration; 3] = [
+    PHASE.declaration(),
+    CHECKPOINT.declaration(),
+    BOOTSTRAP_SPOOL.declaration(),
+];
 
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
 
@@ -43,47 +48,39 @@ pub struct MySqlCdcScanSpec {
     pub columns: Vec<MySqlColumn>,
 }
 
-/// Fixed-Schema, single-table `MySQL` Scan using only continuous binlog CDC.
+/// Fixed-Schema, single-table `MySQL` snapshot and binlog CDC Scan.
 ///
 /// Credentials and runtime bundle paths are supplied separately through
-/// [`MySqlCdcScanConfig`]. Build and open perform no `MySQL` or JVM I/O. The
-/// configuration's [`MySqlCdcScanConfig::bootstrap_definition`] method creates
-/// a Definition only after it has obtained one exact pre-publication Debezium
-/// tail seed. The seed becomes durable when its canonical Flow Definition
-/// commits.
-/// Initial table-data snapshots and online Schema evolution are not supported;
-/// the runtime performs only its internal schema recovery.
-///
-/// That immutable cursor is atomically published with the Flow Definition and
-/// becomes the fallback when the mutable checkpoint Cell is empty. Every
-/// reopen uses the current catalog to reconstruct in-memory schema history, so
-/// DDL is unsupported throughout the retained-binlog recovery window.
+/// [`MySqlCdcScanConfig`]. Build and open perform no `MySQL` or JVM I/O. On its
+/// first advance the Scan captures a consistent full table snapshot into its
+/// private durable spool, publishes that spool, and then continues from the
+/// snapshot's sealed checkpoint. No source-write gate is required. Online
+/// Schema evolution is not supported.
 #[derive(Clone, Debug)]
 pub struct MySqlCdcScanDefinition {
     spec: MySqlCdcScanSpec,
-    bootstrap_checkpoint: Checkpoint,
+    bootstrap_spool_bytes: NonZeroU64,
 }
 
 impl MySqlCdcScanDefinition {
-    /// Freezes the verified pre-publication bootstrap result.
+    /// Freezes a discovered source and its private bootstrap spool capacity.
     ///
-    /// This is intentionally not public: matching a checkpoint's engine and
-    /// connector class cannot prove that its opaque offsets came from this
-    /// exact source table. Public callers must use
-    /// [`MySqlCdcScanConfig::bootstrap_definition`].
-    pub(crate) fn from_bootstrap(
+    /// The capacity is an exact logical retained-byte ceiling: each encoded
+    /// Change contributes its full IPC byte length plus its eight-byte log
+    /// offset. It must hold the complete initial snapshot until publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid source identity, invalid logical
+    /// columns, or an oversized persistent definition.
+    pub fn try_new(
         spec: MySqlCdcScanSpec,
-        bootstrap_checkpoint: Checkpoint,
+        bootstrap_spool_bytes: NonZeroU64,
     ) -> Result<Self, MySqlCdcScanError> {
         validate_spec(&spec)?;
-        if !bootstrap_checkpoint.matches(&spec.engine_name, CONNECTOR_CLASS) {
-            return Err(MySqlCdcScanError::InvalidDefinition(
-                "bootstrap checkpoint belongs to a different MySQL connector".to_owned(),
-            ));
-        }
         let definition = Self {
             spec,
-            bootstrap_checkpoint,
+            bootstrap_spool_bytes,
         };
         if encode(&definition)?.len() > MAX_DEFINITION_BYTES {
             return Err(MySqlCdcScanError::InvalidDefinition(
@@ -98,22 +95,30 @@ impl MySqlCdcScanDefinition {
     pub const fn spec(&self) -> &MySqlCdcScanSpec {
         &self.spec
     }
+
+    /// Returns the exact logical retained-byte limit of the bootstrap spool.
+    #[must_use]
+    pub const fn bootstrap_spool_bytes(&self) -> NonZeroU64 {
+        self.bootstrap_spool_bytes
+    }
 }
 
 impl Sealed for MySqlCdcScanDefinition {
     fn bind_schemas(&self, _: &[SchemaRef]) -> Result<OperationBinding, OperationSchemaError> {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
-        let bootstrap_checkpoint = self.bootstrap_checkpoint.clone();
+        let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
         Ok(OperationBinding::with_resource::<MySqlCdcScanConfig, _>(
             Some(Arc::clone(&output)),
             move |data, config| {
                 Ok(Box::new(MySqlCdcScanOperation::new_bound(
                     spec,
                     output,
+                    data.take(&PHASE)?,
                     data.take(&CHECKPOINT)?,
+                    data.take(&BOOTSTRAP_SPOOL)?,
+                    bootstrap_spool_bytes,
                     config,
-                    bootstrap_checkpoint,
                 )))
             },
         ))
@@ -147,12 +152,8 @@ pub(crate) fn decode_definition(
     }
     let payload: PersistentDefinition =
         serde_json::from_slice(payload_bytes).map_err(|_| invalid())?;
-    let checkpoint = BASE64_STANDARD
-        .decode(payload.bootstrap_checkpoint)
+    let definition = MySqlCdcScanDefinition::try_new(payload.spec, payload.bootstrap_spool_bytes)
         .map_err(|_| invalid())?;
-    let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(|_| invalid())?;
-    let definition =
-        MySqlCdcScanDefinition::from_bootstrap(payload.spec, checkpoint).map_err(|_| invalid())?;
     let mut canonical = Vec::new();
     definition.encode_payload(&mut canonical);
     if canonical != payload_bytes {
@@ -165,13 +166,13 @@ pub(crate) fn decode_definition(
 #[serde(deny_unknown_fields)]
 struct PersistentDefinition {
     spec: MySqlCdcScanSpec,
-    bootstrap_checkpoint: String,
+    bootstrap_spool_bytes: NonZeroU64,
 }
 
 fn encode(definition: &MySqlCdcScanDefinition) -> Result<Vec<u8>, MySqlCdcScanError> {
     serde_json::to_vec(&PersistentDefinition {
         spec: definition.spec.clone(),
-        bootstrap_checkpoint: BASE64_STANDARD.encode(definition.bootstrap_checkpoint.as_bytes()),
+        bootstrap_spool_bytes: definition.bootstrap_spool_bytes,
     })
     .map_err(|_| MySqlCdcScanError::InvalidDefinition("cannot encode scan definition".to_owned()))
 }
@@ -212,6 +213,8 @@ fn is_uuid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::super::MySqlType;
     use super::*;
 
@@ -226,39 +229,20 @@ mod tests {
         }
     }
 
-    fn checkpoint(engine_name: &str) -> Checkpoint {
-        let encoded = match engine_name {
-            "orders" => {
-                "RFBEQkNQMDEAAQAAAAZvcmRlcnMAAAAqaW8uZGViZXppdW0uY29ubmVjdG9yLm15c3FsLk15U3FsQ29ubmVjdG9yAAAAAQAAAAEAAAAAAQDCpe+v"
-            }
-            "other" => {
-                "RFBEQkNQMDEAAQAAAAVvdGhlcgAAACppby5kZWJleml1bS5jb25uZWN0b3IubXlzcWwuTXlTcWxDb25uZWN0b3IAAAABAAAAAQAAAAABADrK/00="
-            }
-            _ => unreachable!(),
-        };
-        Checkpoint::from_bytes(BASE64_STANDARD.decode(encoded).unwrap()).unwrap()
+    fn capacity() -> NonZeroU64 {
+        NonZeroU64::new(1024 * 1024).unwrap()
     }
 
     #[test]
-    fn bootstrap_checkpoint_must_match_the_definition_engine_and_mysql_connector() {
-        assert!(
-            MySqlCdcScanDefinition::from_bootstrap(spec("orders"), checkpoint("orders")).is_ok()
-        );
-        assert!(
-            MySqlCdcScanDefinition::from_bootstrap(spec("orders"), checkpoint("other")).is_err()
-        );
-    }
-
-    #[test]
-    fn bootstrap_checkpoint_is_canonical_definition_payload_and_survives_binding() {
-        let definition =
-            MySqlCdcScanDefinition::from_bootstrap(spec("orders"), checkpoint("orders")).unwrap();
+    fn spool_capacity_is_canonical_definition_payload_and_survives_binding() {
+        let definition = MySqlCdcScanDefinition::try_new(spec("orders"), capacity()).unwrap();
         let payload = encode(&definition).unwrap();
         let decoded = decode_definition(&payload).unwrap();
         assert_eq!(
             crate::encode_definition(decoded.as_ref()),
             crate::encode_definition(&definition)
         );
+        assert_eq!(definition.bootstrap_spool_bytes(), capacity());
     }
 
     #[test]
@@ -292,9 +276,7 @@ mod tests {
         ] {
             let mut candidate = spec("orders");
             candidate.columns = columns;
-            if let Ok(definition) =
-                MySqlCdcScanDefinition::from_bootstrap(candidate, checkpoint("orders"))
-            {
+            if let Ok(definition) = MySqlCdcScanDefinition::try_new(candidate, capacity()) {
                 assert!((&definition as &dyn OperationDefinition).bind(&[]).is_err());
             }
         }
@@ -305,9 +287,7 @@ mod tests {
             let mut candidate = spec("orders");
             candidate.server_uuid = server_uuid;
             candidate.table_id = table_id;
-            assert!(
-                MySqlCdcScanDefinition::from_bootstrap(candidate, checkpoint("orders")).is_err()
-            );
+            assert!(MySqlCdcScanDefinition::try_new(candidate, capacity()).is_err());
         }
     }
 }

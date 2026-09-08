@@ -10,23 +10,26 @@ use dogpaddle_operation::{
     },
 };
 use dogpaddle_store::{Cell, Store, Transactions};
-use std::path::Path;
+use std::{num::NonZeroU64, path::Path};
 
 use super::support::decode_hex;
 
 fn definition() -> PostgresCdcScanDefinition {
-    PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
-        engine_name: "orders".into(),
-        database: "shop".into(),
-        schema: "public".into(),
-        table: "orders".into(),
-        slot: "orders_slot".into(),
-        publication: "orders_pub".into(),
-        system_identifier: "123".into(),
-        database_oid: 42,
-        table_oid: 43,
-        columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
-    })
+    PostgresCdcScanDefinition::try_new(
+        PostgresCdcScanSpec {
+            engine_name: "orders".into(),
+            database: "shop".into(),
+            schema: "public".into(),
+            table: "orders".into(),
+            slot: "orders_slot".into(),
+            publication: "orders_pub".into(),
+            system_identifier: "123".into(),
+            database_oid: 42,
+            table_oid: 43,
+            columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
+        },
+        NonZeroU64::new(1_048_576).unwrap(),
+    )
     .unwrap()
 }
 
@@ -44,7 +47,7 @@ fn config() -> PostgresCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0b".to_vec();
-    expected.extend_from_slice(br#"{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]}"#);
+    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#);
     expected
 }
 
@@ -66,7 +69,11 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
             .iter()
             .map(dogpaddle_operation::DataDeclaration::name)
             .collect::<Vec<_>>(),
-        ["postgres_cdc_scan.checkpoint"]
+        [
+            "postgres_cdc_scan.phase",
+            "postgres_cdc_scan.checkpoint",
+            "postgres_cdc_scan.bootstrap_spool",
+        ]
     );
     let binding = decoded.bind(&[]).unwrap();
     let output = binding.output_schema().unwrap();
@@ -104,6 +111,7 @@ fn postgres_cdc_materialization_requires_one_exact_runtime_resource() {
 
 struct Fixture {
     scan: Box<dyn Operation>,
+    phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     transactions: Transactions,
 }
@@ -130,6 +138,7 @@ impl Fixture {
                 .unwrap()
                 .materialize(data, RuntimeResource::new(config()))
                 .unwrap(),
+            phase: store.open_data("postgres_cdc_scan.phase").unwrap(),
             checkpoint: store.open_data("postgres_cdc_scan.checkpoint").unwrap(),
             transactions: store.into_transactions(),
         }
@@ -137,6 +146,11 @@ impl Fixture {
 
     fn set_checkpoint(&mut self, bytes: &Vec<u8>) {
         let transaction = self.transactions.begin().unwrap();
+        self.phase
+            .access(transaction.access())
+            .unwrap()
+            .set(&2)
+            .unwrap();
         self.checkpoint
             .access(transaction.access())
             .unwrap()
@@ -176,12 +190,11 @@ impl Fixture {
 }
 
 // The connector-neutral D2 golden is stored verbatim, without an extra envelope.
-// These tests only restore its framing; connector binding is checked at start.
 fn checkpoint() -> Vec<u8> {
     decode_hex(concat!(
-        "4450444243503031000100000008656e67696e652d61",
-        "0000000b636f6e6e6563746f722e4100000002",
-        "0000000200ff000000020102000000017a00000001031ef7d5c2"
+        "44504442435030310001000000066f7264657273",
+        "00000032696f2e646562657a69756d2e636f6e6e6563746f722e706f737467726573716c2e",
+        "506f737467726573436f6e6e6563746f720000000051504dd9"
     ))
 }
 
@@ -279,7 +292,9 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
     ] {
         let mut spec = definition().spec().clone();
         spec.columns = columns;
-        if let Ok(definition) = PostgresCdcScanDefinition::try_new(spec) {
+        if let Ok(definition) =
+            PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap())
+        {
             assert!((&definition as &dyn OperationDefinition).bind(&[]).is_err());
         }
     }

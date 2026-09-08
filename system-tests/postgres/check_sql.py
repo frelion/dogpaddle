@@ -230,11 +230,6 @@ class Gate:
             "CREATE PUBLICATION orders_publication FOR TABLE sales.orders",
             capture=True,
         )
-        self.sql(
-            "SELECT * FROM pg_create_logical_replication_slot("
-            "'orders_slot', 'pgoutput')",
-            capture=True,
-        )
 
     def slot_active(self) -> bool:
         return self.sql(

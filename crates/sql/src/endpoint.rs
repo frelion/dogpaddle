@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, num::NonZeroU64, path::PathBuf};
 
 use datafusion_sql::sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArguments,
@@ -50,6 +50,14 @@ impl Parameter {
         self.resolve()?.parse().map_err(|_| {
             SqlError::invalid(format!(
                 "{endpoint} parameter {name:?} must resolve to an unsigned 64-bit integer"
+            ))
+        })
+    }
+
+    fn resolve_nonzero_u64(&self, endpoint: &str, name: &str) -> Result<NonZeroU64, SqlError> {
+        NonZeroU64::new(self.resolve_u64(endpoint, name)?).ok_or_else(|| {
+            SqlError::invalid(format!(
+                "{endpoint} parameter {name:?} must resolve to a nonzero unsigned 64-bit integer"
             ))
         })
     }
@@ -165,6 +173,7 @@ pub(crate) struct PostgresCdcEndpoint {
     table: Parameter,
     slot: Parameter,
     publication: Parameter,
+    bootstrap_spool_bytes: Parameter,
 }
 
 pub(crate) struct MySqlCdcEndpoint {
@@ -173,6 +182,7 @@ pub(crate) struct MySqlCdcEndpoint {
     connection: MySqlConnection,
     replication_client_id: Parameter,
     table: Parameter,
+    bootstrap_spool_bytes: Parameter,
 }
 
 pub(crate) enum ScanEndpoint {
@@ -214,92 +224,8 @@ impl ScanEndpoint {
                 )?);
                 Ok(Self::Sequence { start })
             }
-            Some("postgres_cdc") => {
-                let [
-                    engine_name,
-                    runtime_bundle,
-                    host,
-                    port,
-                    database,
-                    user,
-                    password,
-                    schema,
-                    table,
-                    slot,
-                    publication,
-                ] = exact_parameters(parse_arguments(
-                    "postgres_cdc",
-                    &arguments.args,
-                    &[
-                        string("engine_name"),
-                        string("runtime_bundle"),
-                        string("host"),
-                        u16_parameter("port"),
-                        string("database"),
-                        string("user"),
-                        string("password"),
-                        string("schema"),
-                        string("table"),
-                        string("slot"),
-                        string("publication"),
-                    ],
-                )?);
-                Ok(Self::PostgresCdc(Box::new(PostgresCdcEndpoint {
-                    engine_name,
-                    runtime_bundle,
-                    connection: PostgresConnection {
-                        host,
-                        port,
-                        database,
-                        user,
-                        password,
-                    },
-                    schema,
-                    table,
-                    slot,
-                    publication,
-                })))
-            }
-            Some("mysql_cdc") => {
-                let [
-                    engine_name,
-                    runtime_bundle,
-                    host,
-                    port,
-                    database,
-                    user,
-                    password,
-                    replication_client_id,
-                    table,
-                ] = exact_parameters(parse_arguments(
-                    "mysql_cdc",
-                    &arguments.args,
-                    &[
-                        string("engine_name"),
-                        string("runtime_bundle"),
-                        string("host"),
-                        u16_parameter("port"),
-                        string("database"),
-                        string("user"),
-                        string("password"),
-                        u32_parameter("replication_client_id"),
-                        string("table"),
-                    ],
-                )?);
-                Ok(Self::MySqlCdc(Box::new(MySqlCdcEndpoint {
-                    engine_name,
-                    runtime_bundle,
-                    connection: MySqlConnection {
-                        host,
-                        port,
-                        database,
-                        user,
-                        password,
-                    },
-                    replication_client_id,
-                    table,
-                })))
-            }
+            Some("postgres_cdc") => parse_postgres_cdc(arguments),
+            Some("mysql_cdc") => parse_mysql_cdc(arguments),
             _ => Err(SqlError::invalid(format!("unknown scan function {name}"))),
         }
     }
@@ -316,11 +242,14 @@ impl ScanEndpoint {
                 let table = endpoint.table.resolve()?;
                 let slot = endpoint.slot.resolve()?;
                 let publication = endpoint.publication.resolve()?;
+                let bootstrap_spool_bytes = endpoint
+                    .bootstrap_spool_bytes
+                    .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?;
                 let spec = config
                     .discover(&engine_name, &schema, &table, &slot, &publication)
                     .map_err(SqlError::endpoint)?;
-                let definition =
-                    PostgresCdcScanDefinition::try_new(spec).map_err(SqlError::endpoint)?;
+                let definition = PostgresCdcScanDefinition::try_new(spec, bootstrap_spool_bytes)
+                    .map_err(SqlError::endpoint)?;
                 Ok(BuiltScan::PostgresCdc(Box::new(BuiltPostgresCdcScan {
                     definition,
                     config,
@@ -332,8 +261,13 @@ impl ScanEndpoint {
                     .cdc_config(&endpoint.runtime_bundle, &endpoint.replication_client_id)?;
                 let engine_name = endpoint.engine_name.resolve()?;
                 let table = endpoint.table.resolve()?;
-                let definition = config
-                    .bootstrap_definition(&engine_name, &table)
+                let bootstrap_spool_bytes = endpoint
+                    .bootstrap_spool_bytes
+                    .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?;
+                let spec = config
+                    .discover(&engine_name, &table)
+                    .map_err(SqlError::endpoint)?;
+                let definition = MySqlCdcScanDefinition::try_new(spec, bootstrap_spool_bytes)
                     .map_err(SqlError::endpoint)?;
                 Ok(BuiltScan::MySqlCdc(Box::new(BuiltMySqlCdcScan {
                     definition,
@@ -360,6 +294,9 @@ impl ScanEndpoint {
                 let _ = endpoint.table.resolve()?;
                 let _ = endpoint.slot.resolve()?;
                 let _ = endpoint.publication.resolve()?;
+                let _ = endpoint
+                    .bootstrap_spool_bytes
+                    .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?;
                 factory.resource(station_id, config)?;
                 Ok(())
             }
@@ -369,11 +306,108 @@ impl ScanEndpoint {
                     .cdc_config(&endpoint.runtime_bundle, &endpoint.replication_client_id)?;
                 let _ = endpoint.engine_name.resolve()?;
                 let _ = endpoint.table.resolve()?;
+                let _ = endpoint
+                    .bootstrap_spool_bytes
+                    .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?;
                 factory.resource(station_id, config)?;
                 Ok(())
             }
         }
     }
+}
+
+fn parse_postgres_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
+    let [
+        engine_name,
+        runtime_bundle,
+        host,
+        port,
+        database,
+        user,
+        password,
+        schema,
+        table,
+        slot,
+        publication,
+        bootstrap_spool_bytes,
+    ] = exact_parameters(parse_arguments(
+        "postgres_cdc",
+        &arguments.args,
+        &[
+            string("engine_name"),
+            string("runtime_bundle"),
+            string("host"),
+            u16_parameter("port"),
+            string("database"),
+            string("user"),
+            string("password"),
+            string("schema"),
+            string("table"),
+            string("slot"),
+            string("publication"),
+            u64_parameter("bootstrap_spool_bytes"),
+        ],
+    )?);
+    Ok(ScanEndpoint::PostgresCdc(Box::new(PostgresCdcEndpoint {
+        engine_name,
+        runtime_bundle,
+        connection: PostgresConnection {
+            host,
+            port,
+            database,
+            user,
+            password,
+        },
+        schema,
+        table,
+        slot,
+        publication,
+        bootstrap_spool_bytes,
+    })))
+}
+
+fn parse_mysql_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
+    let [
+        engine_name,
+        runtime_bundle,
+        host,
+        port,
+        database,
+        user,
+        password,
+        replication_client_id,
+        table,
+        bootstrap_spool_bytes,
+    ] = exact_parameters(parse_arguments(
+        "mysql_cdc",
+        &arguments.args,
+        &[
+            string("engine_name"),
+            string("runtime_bundle"),
+            string("host"),
+            u16_parameter("port"),
+            string("database"),
+            string("user"),
+            string("password"),
+            u32_parameter("replication_client_id"),
+            string("table"),
+            u64_parameter("bootstrap_spool_bytes"),
+        ],
+    )?);
+    Ok(ScanEndpoint::MySqlCdc(Box::new(MySqlCdcEndpoint {
+        engine_name,
+        runtime_bundle,
+        connection: MySqlConnection {
+            host,
+            port,
+            database,
+            user,
+            password,
+        },
+        replication_client_id,
+        table,
+        bootstrap_spool_bytes,
+    })))
 }
 
 pub(crate) struct PostgresSinkEndpoint {

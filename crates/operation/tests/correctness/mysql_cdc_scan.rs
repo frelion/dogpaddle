@@ -28,7 +28,7 @@ fn config() -> MySqlCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0f".to_vec();
-    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_checkpoint":"RFBEQkNQMDEAAQAAAAZvcmRlcnMAAAAqaW8uZGViZXppdW0uY29ubmVjdG9yLm15c3FsLk15U3FsQ29ubmVjdG9yAAAAAQAAAAVteXNxbAAAAAMAAQK8UTFt"}"#);
+    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#);
     expected
 }
 
@@ -61,7 +61,11 @@ fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
             .iter()
             .map(dogpaddle_operation::DataDeclaration::name)
             .collect::<Vec<_>>(),
-        ["mysql_cdc_scan.checkpoint"]
+        [
+            "mysql_cdc_scan.phase",
+            "mysql_cdc_scan.checkpoint",
+            "mysql_cdc_scan.bootstrap_spool",
+        ]
     );
     let binding = decoded.bind(&[]).unwrap();
     let output = binding.output_schema().unwrap();
@@ -99,6 +103,7 @@ fn mysql_cdc_materialization_requires_one_exact_runtime_resource() {
 
 struct Fixture {
     scan: Box<dyn Operation>,
+    phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     transactions: Transactions,
 }
@@ -126,6 +131,7 @@ impl Fixture {
                 .unwrap()
                 .materialize(data, RuntimeResource::new(config()))
                 .unwrap(),
+            phase: store.open_data("mysql_cdc_scan.phase").unwrap(),
             checkpoint: store.open_data("mysql_cdc_scan.checkpoint").unwrap(),
             transactions: store.into_transactions(),
         }
@@ -133,6 +139,11 @@ impl Fixture {
 
     fn set_checkpoint(&mut self, bytes: &[u8]) {
         let transaction = self.transactions.begin().unwrap();
+        self.phase
+            .access(transaction.access())
+            .unwrap()
+            .set(&2)
+            .unwrap();
         self.checkpoint
             .access(transaction.access())
             .unwrap()

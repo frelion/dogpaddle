@@ -129,6 +129,26 @@ def crash_after_output(host: Host) -> bool:
     return True
 
 
+def crash_terminal_capture(host: Host) -> bool:
+    response = host.request("crash-terminal-capture")
+    if response["kind"] != "durable-terminal-capture":
+        return False
+    if response != {"kind": "durable-terminal-capture", "checkpoint_present": True,
+                    "commits": 1}:
+        raise RuntimeError(f"terminal capture did not durably seal before ACK: {response}")
+    return True
+
+
+def crash_partial_capture(host: Host) -> bool:
+    response = host.request("crash-partial-capture")
+    if response["kind"] != "durable-partial-capture":
+        return False
+    if response != {"kind": "durable-partial-capture", "checkpoint_present": True,
+                    "commits": 1}:
+        raise RuntimeError(f"partial capture did not durably spool before ACK: {response}")
+    return True
+
+
 class Fixture:
     def __init__(
         self, root: Path, pg_bin: Path, bundle: Path, binary: Path, port: int
@@ -149,7 +169,6 @@ class Fixture:
                  f"payload TEXT NOT NULL{extra}); "
                  f"ALTER TABLE public.{table} REPLICA IDENTITY FULL; "
                  f"CREATE PUBLICATION {table}_pub FOR TABLE public.{table}")
-        self.sql(f"SELECT * FROM pg_create_logical_replication_slot('{table}_slot', 'pgoutput')")
 
     def active(self, table: str) -> bool:
         return self.sql(f"SELECT active FROM pg_replication_slots WHERE slot_name = '{table}_slot'") == "t"
@@ -173,13 +192,13 @@ class Fixture:
         table = "flow_events"
         self.create_table(table, rich=True)
         toasted = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(400))
+        self.sql(f"INSERT INTO {table} VALUES (1, 1, '{toasted}', true, -123, 1.25, 2.5, -123.45, "
+                 "'1970-01-03', '1970-01-01 00:00:01.123456', "
+                 "'1970-01-01 08:00:01.123456+08', decode('0001ff','hex')); "
+                 f"INSERT INTO {table}(id,tx_seq,payload) VALUES (2,2,'beta')")
         with self.host("flow", table, 1) as host:
-            drive(host, lambda: self.active(table), "Flow connector starts")
-            self.sql(f"INSERT INTO {table} VALUES (1, 1, '{toasted}', true, -123, 1.25, 2.5, -123.45, "
-                     "'1970-01-03', '1970-01-01 00:00:01.123456', '1970-01-01 08:00:01.123456+08', "
-                     f"decode('0001ff','hex')); INSERT INTO {table}(id,tx_seq,payload) VALUES (2,2,'beta')")
             drive(host, lambda: self.sqlite_rows(table) == [(1, 1, toasted), (2, 2, "beta")],
-                  "ordered inserts reach SQLite")
+                  "pre-existing rows reach SQLite through the initial snapshot")
             with sqlite3.connect(self.root / table / "sink.sqlite") as connection:
                 values = connection.execute("SELECT flag,small,real_value,double_value,amount,day,stamp,instant,bytes "
                                             "FROM events WHERE id = 1").fetchone()
@@ -222,6 +241,7 @@ class Fixture:
     def scan_gate(self) -> None:
         table = "direct_events"
         self.create_table(table)
+        self.sql(f"INSERT INTO {table} VALUES (10, 10, 'pre-existing')")
 
         def rejected_delivery(host: Host, command: str) -> bool:
             response = host.request(command)
@@ -234,8 +254,19 @@ class Fixture:
             return True
 
         with self.host("direct", table, 1) as host:
-            drive(host, lambda: self.active(table), "direct Scan starts")
-            self.sql(f"INSERT INTO {table} VALUES (10, 10, 'before-ack')")
+            until("terminal snapshot delivery commits before ACK",
+                  lambda: crash_terminal_capture(host))
+            if host.process.wait(timeout=15) != 76:
+                raise RuntimeError("terminal snapshot crash window used the wrong exit code")
+        until("terminal-capture crash releases its slot", lambda: not self.active(table))
+        with self.host("direct", table, 2) as host:
+            if host.request("read") != {"kind": "rows", "rows": [],
+                                        "checkpoint_present": True}:
+                raise RuntimeError("sealed initial snapshot became public before Publishing")
+            restored = host.request("advance")
+            if restored != {"kind": "advance", "output": False,
+                            "checkpoint_present": True, "commits": 1}:
+                raise RuntimeError(f"Publishing restore touched the source or output: {restored}")
             until("actual delivery rollback", lambda: rejected_delivery(host, "rollback"))
             if host.request("read")["rows"]:
                 raise RuntimeError("rolled-back Scan emitted durable output")
@@ -243,8 +274,8 @@ class Fixture:
             if host.process.wait(timeout=15) != 74:
                 raise RuntimeError("crash window did not terminate with the expected code")
         until("crashed Scan releases its slot", lambda: not self.active(table))
-        with self.host("direct", table, 2) as host:
-            if host.request("read") != {"kind": "rows", "rows": [[1, 10, 10, "before-ack"]],
+        with self.host("direct", table, 3) as host:
+            if host.request("read") != {"kind": "rows", "rows": [[1, 10, 10, "pre-existing"]],
                                         "checkpoint_present": True}:
                 raise RuntimeError("output and checkpoint were not both durable before ACK")
             restored = host.request("advance")
@@ -256,13 +287,13 @@ class Fixture:
             self.sql(f"INSERT INTO {table} VALUES (20, 20, 'after-reopen')")
             until("full output rejects checkpoint and output together",
                   lambda: rejected_delivery(host, "backpressure"))
-            if host.request("read")["rows"] != [[1, 10, 10, "before-ack"]]:
+            if host.request("read")["rows"] != [[1, 10, 10, "pre-existing"]]:
                 raise RuntimeError("backpressure changed durable output")
         until("backpressured Scan releases its slot", lambda: not self.active(table))
-        with self.host("direct", table, 3) as host:
-            if host.request("read")["rows"] != [[1, 10, 10, "before-ack"]]:
+        with self.host("direct", table, 4) as host:
+            if host.request("read")["rows"] != [[1, 10, 10, "pre-existing"]]:
                 raise RuntimeError("backpressured output became durable despite rollback")
-            expected = [[1, 10, 10, "before-ack"], [1, 20, 20, "after-reopen"]]
+            expected = [[1, 10, 10, "pre-existing"], [1, 20, 20, "after-reopen"]]
 
             def replay() -> bool:
                 response = host.request("advance")
@@ -279,7 +310,40 @@ class Fixture:
             expected.append([1, 30, 30, "last-witness"])
             drive(host, lambda: host.request("read")["rows"] == expected,
                   "successor witnesses ordered replay without duplicates")
-        print("PASS real Scan atomic checkpoint/output commit, rollback, pre-ACK process exit, backpressure replay and witness")
+        print("PASS real Scan existing-row snapshot, terminal pre-ACK recovery, atomic publish rollback, streaming backpressure replay and witness")
+
+    def partial_snapshot_recovery_gate(self) -> None:
+        table = "snapshot_recovery"
+        self.create_table(table)
+        count = 2050
+        self.sql(f"INSERT INTO {table} SELECT value, value, 'row-' || value "
+                 f"FROM generate_series(1, {count}) AS value ORDER BY value")
+        expected = [[1, row, row, f"row-{row}"] for row in range(1, count + 1)]
+        with self.host("direct", table, 1) as host:
+            until("partial snapshot delivery commits before ACK",
+                  lambda: crash_partial_capture(host))
+            if host.process.wait(timeout=15) != 75:
+                raise RuntimeError("partial snapshot crash window used the wrong exit code")
+        until("partial-capture crash releases its slot", lambda: not self.active(table))
+        with self.host("direct", table, 2) as host:
+            state = host.request("read")
+            if state["rows"] or not state["checkpoint_present"]:
+                raise RuntimeError("partial initial snapshot escaped its private spool")
+
+            def republished() -> bool:
+                host.request("advance")
+                rows = host.request("read")["rows"]
+                if rows != expected[:len(rows)]:
+                    raise RuntimeError("restarted snapshot duplicated, reordered, or skipped a row")
+                return rows == expected
+
+            until("partial snapshot resets and republishes the complete source", republished)
+            drive(host, lambda: self.active(table), "restarted snapshot enters WAL streaming")
+            self.sql(f"INSERT INTO {table} VALUES ({count + 1}, {count + 1}, 'tail-witness')")
+            expected.append([1, count + 1, count + 1, "tail-witness"])
+            drive(host, lambda: host.request("read")["rows"] == expected,
+                  "tail continues after the restarted snapshot checkpoint")
+        print("PASS partial private snapshot crash resets slot/spool, republishes all existing rows once, then continues WAL")
 
     def postgres_roundtrip_gate(self) -> None:
         table = "roundtrip_events"
@@ -362,6 +426,7 @@ class Fixture:
     def check_no_password(self) -> None:
         needle = PASSWORD.encode()
         for directory in [self.root / "flow_events" / "flow", self.root / "direct_events" / "scan",
+                          self.root / "snapshot_recovery" / "scan",
                           self.root / "chunked_events" / "scan", self.root / "roundtrip_events" / "flow"]:
             for path in directory.rglob("*"):
                 if not path.is_file():
@@ -475,6 +540,7 @@ def main() -> None:
         )
         fixture.flow_gate()
         fixture.scan_gate()
+        fixture.partial_snapshot_recovery_gate()
         fixture.split_transaction_gate()
         fixture.postgres_roundtrip_gate()
         fixture.check_no_password()

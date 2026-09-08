@@ -22,8 +22,10 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 业务事件。这个比较域要求每种分批的输入和对应输出都能
 由其声明的 Arrow 类型物理表示；例如不能要求 `Utf8` offset 已溢出的单个 `RecordBatch` 成功构造。
 
-外部 Scan 返回普通 `Change`，由 Station 完成 Schema/capacity 校验与日志追加；自身 checkpoint
-与 output 同事务提交即可，不需要另设持久 payload 中转，也不能绕过 Station 直接访问 output。
+外部 Scan 返回普通 `Change`，由 Station 完成 Schema/capacity 校验与日志追加，不能绕过
+Station 直接访问 output。稳态 CDC 把 checkpoint 与 output 放在同一事务；PostgreSQL/MySQL
+初始快照则先把完整 IPC 写入各自的私有持久 spool，封口后再通过同一 Station
+output 逐条原子发布。这是两个具体 Scan 的启动状态，不引入通用 ingress 协议。
 
 ## Schema 绑定
 
@@ -230,8 +232,8 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | 算子（tag） | kind / arity | bind 后的 Schema | 行、diff 与 action | Operation data | buffer 行为 | 公共证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
-| `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 事务外 poll，checkpoint 与 output 同事务提交后 ACK | `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag11 golden、纯资源/Schema 校验、初始化/回滚/reopen；显式真实 PG→SQLite 与进程恢复 gate |
-| `MySqlCdcScan` (`15`) | Scan / 0 | 固定单表受支持列 | 预发布一次性 bootstrap 固定 origin；运行时始终 recovery，事务外 poll，checkpoint 与 output 同事务提交后 ACK | `mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` | 移出 JSON 行、借用文本构建 Arrow；Scan 不做 IPC 中转 | tag15 golden、纯资源/Schema 校验、bootstrap origin/初始化/回滚/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
+| `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 私有捕获初始快照与 heartbeat 前 WAL，封口后原子发布，再持续 CDC | `phase` + `checkpoint` + `bootstrap_spool` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag11 golden、三资源/容量、捕获/封口/回滚/reset/reopen；显式真实 PG 快照→CDC gate |
+| `MySqlCdcScan` (`15`) | Scan / 0 | 固定单表受支持列 | `initial_only` 私有捕获初始快照，封口后原子发布，再以 `recovery` 持续 CDC | `phase` + `checkpoint` + `bootstrap_spool` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag15 golden、三资源/容量、捕获/封口/回滚/reset/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
 | `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
 | `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMap<RowDigest, CollisionBucket, Large>` | 按输入行序选择边界事件并重建 diff | tag/layout、collision、边界、rollback、reopen、重批 |
 | `Aggregate` (`14`) | Transform / 1 | 非空 group fields 后接 calls；保留 Schema metadata 及 group Expr metadata | 按行序更新；新增/删除组输出 `+1/-1`，已有组结果变化输出旧 `-1`、新 `+1`；`Complete` | `aggregate.groups`、`aggregate.entries` 两个 `Large` map 与 `aggregate.control: Cell<u64>` | 按真实 output 一次建列；MIN/MAX 每页扫描一个 digest bucket | tag14 golden、layout/collision、组合函数、rollback、reopen、非单位 diff/重批 |
@@ -368,37 +370,47 @@ Operation 本身可以在外部实现，但 Flow 只从 sealed Definition 物化
 
 [`operation::scan::PostgresCdcScanDefinition`]（tag `11`）只描述一个数据库中的一张固定 Schema 表。
 先用 [`operation::scan::PostgresCdcScanConfig::discover`] 显式查询 catalog，再把得到的
-`PostgresCdcScanSpec` 固化成 Definition；build/open/bind 不连 PG、不启动 JVM。配置由宿主构造并在
-每次打开时重新装配，不自动读取环境变量、配置文件或全局 secret registry。
+`PostgresCdcScanSpec` 与必填的 `NonZeroU64 bootstrap_spool_bytes` 交给
+[`operation::scan::PostgresCdcScanDefinition::try_new`]。build/open/bind 不连 PG、不启动 JVM。
+配置由宿主构造并在每次打开时重新装配，不自动读取环境变量、配置文件或全局 secret registry。
 
 持久 Definition 保存 engine/topic 名、数据库/表/slot/publication 身份、cluster system identifier、
-database/table OID 和有序列声明，不含密码、用户名、host 或 runtime payload 路径。payload 是固定
-字段顺序的 canonical JSON；未知字段、重复字段、非 canonical 字节与超过 1 MiB 的 payload 被拒绝。
+database/table OID、有序列声明和 spool 容量，不含密码、用户名、host 或 runtime payload 路径。
+payload 是固定字段顺序的 canonical JSON；未知字段、重复字段、非 canonical 字节与超过 1 MiB 的 payload 被拒绝。
 试点 engine/schema/table/slot/publication 名仅允许 1–63 个小写 ASCII 字母、数字和下划线。
 
-算子只声明 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>`，原样保存 D2 opaque checkpoint bytes；
-其版本、校验和与边界校验由 D2 拥有，不增加额外 envelope。Cell 缺值表示首次运行，空或损坏的
-bytes 是错误。没有 pending payload，数据只由 Station 编码一次并写入 output。单次 encoded
-delivery 最多 16 MiB；这不是 JVM/Rust 总内存或 WAL 磁盘硬配额。
+算子只声明 `postgres_cdc_scan.phase: Cell<u32>`、
+`postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 和
+`postgres_cdc_scan.bootstrap_spool: AppendLog<Vec<u8>>` 三个资源。checkpoint 原样保存 D2 opaque bytes，
+不加 envelope，也不充当 delivery ID。spool 每个 entry 保存一个完整自描述 Change IPC Stream。
+`bootstrap_spool_bytes` 是硬逻辑上限，下一条必须满足
+`retained_bytes + 8-byte offset key + encoded IPC bytes <= bootstrap_spool_bytes`；空 spool 也不放行超限首条。
+它不是 MDBX 文件、MVCC、JVM/Rust 内存或 WAL 磁盘配额。
 
-此前开发期 `postgres_source.state` 的 pending 布局已删除，已有试点 Flow 必须重建，不提供迁移
-或兼容读取；缺少新 checkpoint 资源的旧 Flow 会拒绝 open，不会当作首次运行。
+此前开发期的单 checkpoint 布局已删除；旧 Flow 必须重建，不提供 alias、迁移或兼容读取。
 
-同一个 `turn(None)` 根据自己的状态推进：
+同一个 `turn(None)` 按 `Fresh → Capturing → Publishing → Streaming` 推进：
 
-1. 初次 turn 在短事务中读取 checkpoint，提交后发布可丢弃的内存缓存。
-2. 后续 turn 在事务外校验 PG 身份、惰性启动 connector，以零超时 poll 检查当前 delivery。
-   转换后返回 prepared turn；apply 写 checkpoint 并返回 `Commit(Some(change))`，由 Station
-   在同一事务追加 output。仅在 `AfterCommit` 中更新恢复位置缓存并消费 Delivery ACK。
-3. Schema/容量/commit 失败同时回滚 checkpoint 与 output，不 ACK；下一 turn 由 D2 重投该批。
-4. 无数据返回 `Turn::Idle`。普通 poll 错误会使下一 turn 重建临时 connector；ACK error/panic 则由
-   Station fail-stop，必须 reopen。
+1. `Fresh` 先在本地事务中发布 `Capturing`，再在事务外校验 source identity 并以
+   `snapshot.mode=initial` 单线程启动快照。该阶段不产生公开 output。
+2. `Capturing` 每次取一个完整 delivery，将其所有记录按顺序转为一个 Change。有数据时将完整
+   IPC 追加到私有 spool，并将整个 delivery 的 candidate checkpoint 一起提交；仅提交后 ACK。
+3. terminal heartbeat 将快照封口，其 checkpoint 成为 `Q`。非空表之前必须观察到 `snapshot=last`；
+   空表可直接封口。`last` 与 heartbeat 之间可出现跨 delivery 的 insert/update/delete；terminal delivery 的
+   完整记录序列也保留在 spool。
+4. `Publishing` 先停止 snapshot connector，然后每个 turn 在同一个 MDBX 事务中解码并截断一条
+   spool head、向 Station 追加 output。背压、Schema 失配或 commit 失败同时回滚出队和 output。
+5. spool 排空与 `Streaming` phase 同事务提交。后续以 `snapshot.mode=no_data` 从 `Q` 恢复同一
+   slot，稳态 delivery 仍以 checkpoint + 可选 output 同事务提交，提交后才 ACK。
 
-不增加 delivery receipt 或用 checkpoint 充当批次 ID：回滚没有 ACK，D2 原样重投 outstanding；
-checkpoint/output 已提交但 ACK 不确定时禁止复用旧运行态，从已提交 checkpoint 启动 fresh Engine；
-已经落盘的 output 由相连的 consumer 继续消费。checkpoint-only heartbeat 返回 `Commit(None)`，不制造
-空 Change。零超时 poll 只表示不等待数据，connector 启动及 ACK 仍是有界同步调用；宿主应在
-整轮 Idle 或持续 Backpressured 时安排等待，避免忙轮询。
+`Capturing` 中断时不从部分 checkpoint 恢复。reopen 或捕获错误必须先停止 connector，再在 Store 事务外
+仅删除兼容、非 active 的 source-owned slot，进入 `Resetting` 逐条清除 spool，最后清除 checkpoint/phase
+并回到 `Fresh`。不兼容或 active slot 会拒绝 reset。`Publishing` 和 `Streaming` 不删 slot、不重做快照。
+
+容量不足时当前 delivery 不提交、不 ACK，spool 不变；必须使用更大 `bootstrap_spool_bytes` 和新 state
+目录重建。容量必须容纳完整表快照与 terminal heartbeat 前的 WAL 重叠。普通 poll 错误会重建临时
+connector；ACK error/panic 由 Station fail-stop，必须 reopen。checkpoint-only heartbeat 不制造空 Change。
+零超时 poll 只表示不等待数据，connector 启动、停止及 ACK 仍是有界同步调用。
 
 转换移出 JSON 行并借用其中的文本构建 Arrow，避免整行深拷贝和中间 String 副本；JSON 解析、
 完整 Schema/值校验及必要的 Arrow buffer 写入仍保留。普通测试证明行为，不宣称 CDC 吞吐基线。
@@ -425,16 +437,13 @@ TLS；不把这个试点称为完整安全部署方案。使用专属 CDC 角色
 以及显式授予 `pg_control_system()` 的 EXECUTE 权限；无需因为该查询让业务角色成为 superuser。
 
 表必须是 permanent、非 partition 的普通表，`REPLICA IDENTITY FULL`，无 generated 列。
-publication/pgoutput slot 由用户预先创建并独占，不自动创建、更改或删除；publication 必须发布
-全部列与全部 insert/update/delete/truncate，不能有 row filter。TRUNCATE 会被明确拒绝，而非跳过。
-重新启动时校验 system/database/table identity、logical Schema、publication 与 slot 可用性。
-运行中的外部 DDL、publication/slot 修改、数据库恢复或替换不受支持；不是 DDL 监控器。
+publication 由用户预先创建，必须发布全部列与全部 insert/update/delete/truncate，不能有 row filter。
+slot 名在 discovery 和首次 snapshot 前必须不存在；随后由该 Flow/Scan 创建并独占，不能接管或共享已有 slot。
+`initial` 快照复制已有行，并从同一切点继续 WAL；无需空表或业务写入准入栅栏。TRUNCATE 明确拒绝。
+重启校验 system/database/table identity、logical Schema、publication 与 slot；运行中 DDL、publication/slot 修改或数据库替换不受支持。
 
-当前 `snapshot.mode=no_data`，没有初始全量。关系物化应在空表上建立匹配的 slot 起点，开始捕获后
-再写业务数据；不能把既有非空表直接接到空 `SQLite` 表并期望完整镜像。缺失旧值不能回查当前表猜测。
 字面值 `__debezium_unavailable_value` 在 text/bytea 中暂作保留值并拒绝，以免将缺失 TOAST 当作真实值。
-不支持数组/domain/JSON/UUID 等未列出的 PG 类型，也不支持多表路由、在线 Schema evolution、初始
-snapshot、TLS 配置、跨实例 fencing、自动变更外部资源或 graceful stop API；这些不由额外抽象提前实现。
+不支持未列出的 PG 类型、多表路由、在线 Schema evolution、TLS、跨实例 fencing、旧布局迁移或 graceful stop API。
 
 完整宿主在 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
 进程恢复由 `system-tests/postgres/check_cdc.py` 显式验收，见根目录 TESTING.md。
@@ -442,40 +451,38 @@ snapshot、TLS 配置、跨实例 fencing、自动变更外部资源或 graceful
 ## `MySQL` CDC Scan 试点
 
 [`operation::scan::MySqlCdcScanDefinition`]（tag `15`）是一个数据库中一张固定 Schema `InnoDB`
-表的连续 binlog Scan。正常入口是 [`operation::scan::MySqlCdcScanConfig::bootstrap_definition`]：它在
-发布 Flow 前读取 catalog，短暂启动一个 `snapshot.mode=no_data` 的 Debezium connector，完成其 schema-only
-snapshot 并取得原生 opaque checkpoint 后同步停止该 connector，并将 checkpoint 和 `MySqlCdcScanSpec` 冻结进 Definition。SQL 的
-`build` 把这一步作为 endpoint 的预发布准备；底层 `FlowFactory::build` 本身仍不连接 `MySQL`、不打开 JVM。
-运行配置含 runtime bundle、主机、凭据和唯一 replication client ID，只在每次 build/open 时显式注入，绝不进入
-Definition。
+表的完整初始快照 + 连续 binlog Scan。先用 [`operation::scan::MySqlCdcScanConfig::discover`] 读取 catalog
+并获取 `MySqlCdcScanSpec`，再与必填 `NonZeroU64 bootstrap_spool_bytes` 交给
+[`operation::scan::MySqlCdcScanDefinition::try_new`]。SQL build 完成 discovery；`FlowFactory::build/open`、构造和 bind
+不连 MySQL、不打开 JVM。runtime bundle、主机、凭据和唯一 replication client ID 只作为运行资源注入。
 
-这个 bootstrap 只执行 schema bootstrap，绝不读取表数据。它得到的 seed checkpoint 会与 canonical Flow
-Definition 一起发布；因此**成功 build 就定义了不可变的 binlog origin**。临时 bootstrap connector 已在发布前
-停止，正常运行期（包括第一次 open）绝不会再选择新的 `no_data` 起点，而是一律以
-`snapshot.mode=recovery` 和 `MemorySchemaHistory` 从 Definition seed 或更新后的 durable checkpoint 恢复。
+它只声明 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和
+`mysql_cdc_scan.bootstrap_spool: AppendLog<Vec<u8>>` 三个资源。Definition 另持久 spool 容量。checkpoint 是 D2
+opaque bytes，spool 每条是完整 Change IPC。开发期旧 Definition/单 checkpoint 布局必须重建，不迁移。
 
-它只声明 `mysql_cdc_scan.checkpoint: Cell<Vec<u8>>`。该 Cell 原样保存 D2 opaque checkpoint；缺值不表示
-“重新首次启动”，而是回退到 Definition 中的 immutable seed；空或损坏 bytes 是错误。没有 pending payload、
-schema-history Cell、delivery receipt 或第二套 offset 格式：checkpoint 与可选 output 在同一 Station 事务中
-提交，成功后才 ACK Delivery。无数据、heartbeat 和可接受的控制记录可返回 `Commit(None)`，不制造空 Change；
-普通 poll 错误令下一个 turn 重建临时 connector，ACK 不确定则 fail-stop 并要求 reopen。
+状态为 `Fresh → Capturing → Publishing → Streaming`。`Fresh` 先持久化 `Capturing`，再以
+`snapshot.mode=initial_only`、`snapshot.locking.mode=minimal`、单线程启动一致全表快照。快照的 `r` 事件
+只写私有 spool，不产生公开 output。每个 delivery 的可选完整 Change IPC 和 candidate checkpoint 同事务提交，
+之后才 ACK。唯一且位于 delivery 末尾的 terminal heartbeat 将 checkpoint `Q` 与 `Publishing` 一起封口。
+`Publishing` 停止 snapshot connector，每个 turn 将一条 spool Change 的截断与 Station output append 同事务提交；
+背压或提交失败同时回滚两者。spool 排空后进入 `Streaming`，以 `snapshot.mode=recovery` 和
+`MemorySchemaHistory` 从 `Q` 继续 binlog，稳态仍以 checkpoint/output 同事务 + 提交后 ACK 运行。
 
-bootstrap 与 recovery 都固定 `snapshot.locking.mode=none`；在已承诺固定 Schema、单个 `InnoDB` 表的前提下，它们不主动
-取得 Debezium snapshot read lock。这里的 origin 是 Debezium 在 bootstrap **内部**选取的 `P`，不是调用
-`build` 的瞬间，也不是自动写入栅栏：`P` 之后、Definition 发布前的写入会从保留 binlog 重放，但 `P` 之前
-（包括 bootstrap 已开始而 `P` 尚未选定时）的变化不会产生 Change。如果 build 失败，则没有已发布的 Flow 或
-可对外承诺的 origin。`MySQL` 必须保留从 seed（随后从最新 durable checkpoint）可恢复的 binlog，直到 Flow
-已安全推进；origin 或 checkpoint 过期是 recovery 失败，不能通过新的 bootstrap 静默跳过变化。
+`Capturing` 期 checkpoint 不是部分快照 resume token。错误或 reopen 中断捕获后，必须停止 connector，进入
+`Resetting` 逐条清理 spool/checkpoint，再从 `Fresh` 重做完整快照。`Publishing`/`Streaming` reopen 不重做快照。
+`bootstrap_spool_bytes` 是 `retained + 8-byte offset + IPC` 的硬逻辑上限；超限 delivery 不提交、不 ACK，
+必须使用更大容量和新 state 目录重建。
 
-它仍不是初始全量方案：origin 之前已有的行不会产生 Change。因而它不能把运行中的任意源表直接接到一个新空 sink，
-并承诺完整镜像；内建关系 sink 也不支持预装外部 baseline。唯一完整空表部署顺序是让源表保持为空，先成功 build，
-再允许首次写入。对已运行的表或写入者，v1 没有自动 source fence，也没有 table-data snapshot，必须等待未来的
-snapshot source。`MemorySchemaHistory` 每次 recovery 都从当前 catalog 重建，因此捕获
-database/table 在 bootstrap 后直到不再需要恢复时都必须保持固定 Schema；运行中 DDL 会在 converter 中拒绝并且
-不会 ACK。TRUNCATE 保持送入 converter 后拒绝，而不是让 Debezium 跳过。这不是 DDL monitor，也不支持在线
-Schema evolution、表数据 snapshot、多表路由、跨实例 fencing、自动外部资源变更或 graceful stop API。
+`minimal` locking 先以短时 global read lock 捕获 binlog 切点和 Schema，然后在 `InnoDB` consistent snapshot 中扫描行，
+普通写入可继续。部署角色应具有这个短锁所需权限，但不得授予 `LOCK TABLES`：如果 global lock 失败，
+Debezium 会在长表锁 fallback 之前失败。
 
-catalog discovery 需要 `log_bin=ON`、ROW binlog、FULL row image、`lower_case_table_names=0`、单个非分区
+`MySQL` 必须保留足以覆盖全表快照、私有 spool 排空、公开 output 背压和 recovery 追平的 binlog。过早
+`PURGE BINARY LOGS` 使 `Q` 失效时必须 fail closed，不会重做新快照或选择更晚起点。`MemorySchemaHistory`
+在 recovery 时从 catalog 重建，因此 Schema 在整个可恢复期间必须固定；DDL/TRUNCATE 拒绝且不 ACK。
+不支持在线 Schema evolution、多表路由、TLS、跨实例 fencing、旧格式迁移或 graceful stop API。
+
+catalog discovery 的验收版本为 `MySQL` 8.4，需要 `log_bin=ON`、ROW binlog、FULL row image、`lower_case_table_names=0`、单个非分区
 `InnoDB` base table，且需要读取 `INFORMATION_SCHEMA.INNODB_TABLES` 的权限以冻结 table identity。只支持
 signed `tinyint`/`smallint`→`Int16`、`mediumint`/`int`→`Int32`、`bigint`→`Int64`、`double`→`Float64`、字符
 文本→`Utf8`、binary/blob→`Binary` 和 `decimal(p,s)`→`Decimal128`（`1 ≤ p ≤ 38`、`0 ≤ s ≤ p`）；unsigned、
@@ -484,7 +491,7 @@ float、时间、JSON、enum/set、bit、空间、generated 与 invisible 列均
 
 离线正确性证据位于 `tests/correctness/mysql_cdc_scan.rs` 与 `MySQL` Scan 模块的 Connect JSON conversion
 测试。普通 Cargo gate 不启动 JDK、Debezium bundle 或 `MySQL`；部署前须显式构建 bundle，并在真实单表上验收
-预发布 bootstrap、origin 到成功 build 之间的写入重放、recovery 重开和 insert/update/delete。
+已有行快照、快照中并发写入、spool 背压、recovery 重开和 insert/update/delete。
 
 ## `operation::scan::SequenceScan`
 

@@ -14,13 +14,9 @@ use super::{MySqlCdcScanError, MySqlColumn, MySqlType};
 
 type Row = Map<String, Value>;
 
-/// Progress of the temporary `no_data` schema bootstrap.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BootstrapControl {
-    /// More snapshot schema controls must be acknowledged before the seed is usable.
-    Continuing,
-    /// The final snapshot schema control made the offset a completed seed.
-    Complete,
+pub(super) struct SnapshotDelivery {
+    pub(super) change: Option<Change>,
+    pub(super) complete: bool,
 }
 
 pub(super) fn convert_records(
@@ -43,42 +39,86 @@ pub(super) fn convert_records(
     )
 }
 
-/// Verifies one delivery from the temporary schema bootstrap.
-///
-/// The temporary connector uses one-record batches and disabled heartbeats.
-/// It must ACK only snapshot schema controls until the final control marks the
-/// snapshot complete; accepting a data record would let a later binlog offset
-/// skip an unpersisted table event.
-pub(super) fn validate_bootstrap_control(
-    records: &[Record],
+pub(super) fn convert_snapshot_records(
+    columns: &[MySqlColumn],
+    output_schema: SchemaRef,
     topic_prefix: &str,
-) -> Result<BootstrapControl, MySqlCdcScanError> {
-    let [record] = records else {
-        return Err(invalid(
-            "bootstrap must contain exactly one snapshot schema control record",
-        ));
-    };
-    validate_bootstrap_value(record.topic(), record.value(), topic_prefix)
+    database: &str,
+    table: &str,
+    records: &[Record],
+) -> Result<SnapshotDelivery, MySqlCdcScanError> {
+    convert_snapshot_values(
+        columns,
+        output_schema,
+        topic_prefix,
+        database,
+        table,
+        records
+            .iter()
+            .map(|record| (record.topic(), record.value())),
+    )
 }
 
-pub(super) fn validate_bootstrap_value(
-    topic: Option<&str>,
-    bytes: Option<&[u8]>,
+// The byte-level boundary also lets tests use actual Connect JSON without
+// exposing constructors for the runtime's owned Record capability.
+pub(super) fn convert_snapshot_values<'a>(
+    columns: &[MySqlColumn],
+    output_schema: SchemaRef,
     topic_prefix: &str,
-) -> Result<BootstrapControl, MySqlCdcScanError> {
-    if topic != Some(topic_prefix) {
-        return Err(invalid(
-            "bootstrap record has an unexpected schema-control topic",
-        ));
+    database: &str,
+    table: &str,
+    values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
+) -> Result<SnapshotDelivery, MySqlCdcScanError> {
+    let table_topic = format!("{topic_prefix}.{database}.{table}");
+    let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
+    let mut values = values.into_iter().peekable();
+    let mut rows = Vec::new();
+    let mut complete = false;
+    let mut observed = false;
+    while let Some((topic, bytes)) = values.next() {
+        observed = true;
+        let bytes = bytes.ok_or_else(|| invalid("snapshot record cannot be a tombstone"))?;
+        let mut value: Value = serde_json::from_slice(bytes)
+            .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
+        let schema = object_field(&value, "schema")?;
+        if topic == Some(heartbeat_topic.as_str()) {
+            if complete || values.peek().is_some() {
+                return Err(invalid(
+                    "snapshot completion heartbeat must be unique and last in its delivery",
+                ));
+            }
+            validate_heartbeat(schema, object_field(&value, "payload")?)?;
+            complete = true;
+            continue;
+        }
+        if topic != Some(table_topic.as_str()) {
+            return Err(invalid("snapshot record has an unexpected topic"));
+        }
+        validate_envelope(columns, schema)?;
+        let payload = value
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid("missing object field payload"))?;
+        validate_snapshot_metadata(payload, database, table)?;
+        let before = payload
+            .remove("before")
+            .ok_or_else(|| invalid("missing before"))?;
+        let after = payload
+            .remove("after")
+            .ok_or_else(|| invalid("missing after"))?;
+        if payload.get("op").and_then(Value::as_str) != Some("r") || !before.is_null() {
+            return Err(invalid("expected one initial snapshot read event"));
+        }
+        rows.push(complete_row(columns, after)?);
     }
-    let bytes = bytes.ok_or_else(|| invalid("bootstrap schema control cannot be a tombstone"))?;
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| invalid("bootstrap record is not valid schemas-enabled Connect JSON"))?;
-    bootstrap_schema_control(
-        object_field(&value, "schema")?,
-        object_field(&value, "payload")?,
-        topic_prefix,
-    )
+    if !observed {
+        return Err(invalid("snapshot delivery is empty"));
+    }
+    let diffs = vec![1; rows.len()];
+    Ok(SnapshotDelivery {
+        change: build_change(columns, output_schema, &rows, diffs)?,
+        complete,
+    })
 }
 
 // The byte-level boundary also lets tests use actual Connect JSON without
@@ -93,14 +133,10 @@ pub(super) fn convert_values<'a>(
 ) -> Result<Option<Change>, MySqlCdcScanError> {
     let table_topic = format!("{topic_prefix}.{database}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
-    let schema_topic = topic_prefix;
     let mut rows = Vec::new();
     let mut diffs = Vec::new();
     for (topic, bytes) in values {
-        if topic != Some(table_topic.as_str())
-            && topic != Some(heartbeat_topic.as_str())
-            && topic != Some(schema_topic)
-        {
+        if topic != Some(table_topic.as_str()) && topic != Some(heartbeat_topic.as_str()) {
             return Err(invalid("record has an unexpected topic"));
         }
         let Some(bytes) = bytes else {
@@ -114,10 +150,6 @@ pub(super) fn convert_values<'a>(
         let schema = object_field(&value, "schema")?;
         if topic == Some(heartbeat_topic.as_str()) {
             validate_heartbeat(schema, object_field(&value, "payload")?)?;
-            continue;
-        }
-        if topic == Some(schema_topic) {
-            validate_schema_snapshot(schema, object_field(&value, "payload")?, topic_prefix)?;
             continue;
         }
         validate_envelope(columns, schema)?;
@@ -149,69 +181,24 @@ pub(super) fn convert_values<'a>(
             _ => return Err(invalid("expected a streaming insert, update, or delete")),
         }
     }
+    build_change(columns, output_schema, &rows, diffs)
+}
+
+fn build_change(
+    columns: &[MySqlColumn],
+    output_schema: SchemaRef,
+    rows: &[Row],
+    diffs: Vec<i64>,
+) -> Result<Option<Change>, MySqlCdcScanError> {
     if rows.is_empty() {
         return Ok(None);
     }
     let arrays = columns
         .iter()
-        .map(|column| column_array(column, &rows))
+        .map(|column| column_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
     let records = RecordBatch::try_new(output_schema, arrays)?;
     Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
-}
-
-fn validate_schema_snapshot(
-    schema: &Row,
-    payload: &Row,
-    topic_prefix: &str,
-) -> Result<(), MySqlCdcScanError> {
-    let _ = bootstrap_schema_control(schema, payload, topic_prefix)?;
-    Ok(())
-}
-
-fn bootstrap_schema_control(
-    schema: &Row,
-    payload: &Row,
-    topic_prefix: &str,
-) -> Result<BootstrapControl, MySqlCdcScanError> {
-    if schema.get("type").and_then(Value::as_str) != Some("struct")
-        || schema.get("name").and_then(Value::as_str)
-            != Some("io.debezium.connector.mysql.SchemaChangeValue")
-        || payload.get("ts_ms").and_then(Value::as_i64).is_none()
-        || !matches!(
-            payload.get("databaseName"),
-            Some(Value::Null | Value::String(_))
-        )
-        || !matches!(
-            payload.get("schemaName"),
-            Some(Value::Null | Value::String(_))
-        )
-        || !matches!(payload.get("ddl"), Some(Value::Null | Value::String(_)))
-        || !payload.get("tableChanges").is_some_and(Value::is_array)
-    {
-        return Err(invalid("unexpected MySQL schema control record"));
-    }
-    let source = payload
-        .get("source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid("schema control record is missing source metadata"))?;
-    let snapshot = match source.get("snapshot").and_then(Value::as_str) {
-        Some("true") => BootstrapControl::Continuing,
-        Some("last") => BootstrapControl::Complete,
-        _ => {
-            return Err(invalid(
-                "schema control record is not an initial or recovery snapshot record",
-            ));
-        }
-    };
-    if source.get("connector").and_then(Value::as_str) != Some("mysql")
-        || source.get("name").and_then(Value::as_str) != Some(topic_prefix)
-    {
-        return Err(invalid(
-            "schema control record is not an initial or recovery snapshot record",
-        ));
-    }
-    Ok(snapshot)
 }
 
 fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, MySqlCdcScanError> {
@@ -219,6 +206,33 @@ fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, MySqlCdcSc
         .get(field)
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("missing object field {field}")))
+}
+
+fn validate_snapshot_metadata(
+    payload: &Row,
+    database: &str,
+    table: &str,
+) -> Result<(), MySqlCdcScanError> {
+    let metadata = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("missing Debezium snapshot metadata"))?;
+    for (field, expected) in [("db", database), ("table", table), ("connector", "mysql")] {
+        if metadata.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(invalid(format!(
+                "Debezium snapshot metadata does not match configured {field}"
+            )));
+        }
+    }
+    if !matches!(
+        metadata.get("snapshot").and_then(Value::as_str),
+        Some("true" | "last")
+    ) {
+        return Err(invalid(
+            "Debezium record is not part of the initial snapshot",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_metadata(payload: &Row, database: &str, table: &str) -> Result<(), MySqlCdcScanError> {

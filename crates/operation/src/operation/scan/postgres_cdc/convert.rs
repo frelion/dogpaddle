@@ -15,6 +15,33 @@ use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
 
 type Row = Map<String, Value>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct CaptureProgress {
+    saw_snapshot_row: bool,
+    snapshot_complete: bool,
+}
+
+pub(super) struct CapturedDelivery {
+    pub(super) change: Option<Change>,
+    pub(super) sealed: bool,
+    pub(super) next_progress: CaptureProgress,
+}
+
+enum ConversionMode {
+    Capture {
+        progress: CaptureProgress,
+        sealed: bool,
+    },
+    Streaming,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SnapshotMarker {
+    Snapshot,
+    Last,
+    Streaming,
+}
+
 pub(super) fn convert_records(
     columns: &[PostgresColumn],
     output_schema: SchemaRef,
@@ -35,6 +62,28 @@ pub(super) fn convert_records(
     )
 }
 
+pub(super) fn convert_capture_records(
+    columns: &[PostgresColumn],
+    output_schema: SchemaRef,
+    topic_prefix: &str,
+    table_schema: &str,
+    table: &str,
+    records: &[Record],
+    progress: CaptureProgress,
+) -> Result<CapturedDelivery, PostgresCdcScanError> {
+    convert_capture_values(
+        columns,
+        output_schema,
+        topic_prefix,
+        table_schema,
+        table,
+        records
+            .iter()
+            .map(|record| (record.topic(), record.value())),
+        progress,
+    )
+}
+
 // The byte-level boundary also lets tests use actual Connect JSON without
 // exposing constructors for the runtime's owned Record capability.
 pub(super) fn convert_values<'a>(
@@ -45,6 +94,50 @@ pub(super) fn convert_values<'a>(
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
 ) -> Result<Option<Change>, PostgresCdcScanError> {
+    Ok(convert_values_in_mode(
+        columns,
+        output_schema,
+        topic_prefix,
+        table_schema,
+        table,
+        values,
+        ConversionMode::Streaming,
+    )?
+    .change)
+}
+
+pub(super) fn convert_capture_values<'a>(
+    columns: &[PostgresColumn],
+    output_schema: SchemaRef,
+    topic_prefix: &str,
+    table_schema: &str,
+    table: &str,
+    values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
+    progress: CaptureProgress,
+) -> Result<CapturedDelivery, PostgresCdcScanError> {
+    convert_values_in_mode(
+        columns,
+        output_schema,
+        topic_prefix,
+        table_schema,
+        table,
+        values,
+        ConversionMode::Capture {
+            progress,
+            sealed: false,
+        },
+    )
+}
+
+fn convert_values_in_mode<'a>(
+    columns: &[PostgresColumn],
+    output_schema: SchemaRef,
+    topic_prefix: &str,
+    table_schema: &str,
+    table: &str,
+    values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
+    mut mode: ConversionMode,
+) -> Result<CapturedDelivery, PostgresCdcScanError> {
     let table_topic = format!("{topic_prefix}.{table_schema}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
     let mut rows = Vec::new();
@@ -54,16 +147,24 @@ pub(super) fn convert_values<'a>(
             return Err(invalid("record has an unexpected topic"));
         }
         let Some(bytes) = bytes else {
-            if topic == Some(table_topic.as_str()) {
-                continue;
-            }
-            return Err(invalid("heartbeat cannot be a tombstone"));
+            return Err(invalid("CDC records cannot be tombstones"));
         };
         let mut value: Value = serde_json::from_slice(bytes)
             .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
         let schema = object_field(&value, "schema")?;
         if topic == Some(heartbeat_topic.as_str()) {
             validate_heartbeat(schema, object_field(&value, "payload")?)?;
+            if let ConversionMode::Capture { progress, sealed } = &mut mode
+                && !*sealed
+            {
+                if progress.saw_snapshot_row && !progress.snapshot_complete {
+                    return Err(invalid(
+                        "snapshot heartbeat arrived before the last snapshot row",
+                    ));
+                }
+                progress.snapshot_complete = true;
+                *sealed = true;
+            }
             continue;
         }
         validate_envelope(columns, schema)?;
@@ -71,39 +172,72 @@ pub(super) fn convert_values<'a>(
             .get_mut("payload")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| invalid("missing object field payload"))?;
-        validate_metadata(payload, table_schema, table)?;
+        let marker = validate_metadata(payload, table_schema, table)?;
         let before = payload
             .remove("before")
             .ok_or_else(|| invalid("missing before"))?;
         let after = payload
             .remove("after")
             .ok_or_else(|| invalid("missing after"))?;
-        match payload.get("op").and_then(Value::as_str) {
-            Some("c") if before.is_null() => {
+        let operation = payload.get("op").and_then(Value::as_str);
+        let accepts_streaming = match &mode {
+            ConversionMode::Streaming => true,
+            ConversionMode::Capture { progress, .. } => progress.snapshot_complete,
+        };
+        match (operation, marker) {
+            (Some("r"), SnapshotMarker::Snapshot | SnapshotMarker::Last) if before.is_null() => {
+                let ConversionMode::Capture { progress, sealed } = &mut mode else {
+                    return Err(invalid("snapshot record arrived while streaming"));
+                };
+                if *sealed || progress.snapshot_complete {
+                    return Err(invalid("snapshot record arrived after snapshot completion"));
+                }
+                rows.push(complete_row(columns, after)?);
+                diffs.push(1);
+                progress.saw_snapshot_row = true;
+                if marker == SnapshotMarker::Last {
+                    progress.snapshot_complete = true;
+                }
+            }
+            (Some("c"), SnapshotMarker::Streaming) if accepts_streaming && before.is_null() => {
                 rows.push(complete_row(columns, after)?);
                 diffs.push(1);
             }
-            Some("u") => {
+            (Some("u"), SnapshotMarker::Streaming) if accepts_streaming => {
                 rows.push(complete_row(columns, before)?);
                 rows.push(complete_row(columns, after)?);
                 diffs.extend([-1, 1]);
             }
-            Some("d") if after.is_null() => {
+            (Some("d"), SnapshotMarker::Streaming) if accepts_streaming && after.is_null() => {
                 rows.push(complete_row(columns, before)?);
                 diffs.push(-1);
             }
-            _ => return Err(invalid("expected a streaming insert, update, or delete")),
+            _ => {
+                return Err(invalid(
+                    "record operation or snapshot marker is invalid for the current CDC phase",
+                ));
+            }
         }
     }
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let arrays = columns
-        .iter()
-        .map(|column| column_array(column, &rows))
-        .collect::<Result<Vec<_>, _>>()?;
-    let records = RecordBatch::try_new(output_schema, arrays)?;
-    Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
+    let change = if rows.is_empty() {
+        None
+    } else {
+        let arrays = columns
+            .iter()
+            .map(|column| column_array(column, &rows))
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = RecordBatch::try_new(output_schema, arrays)?;
+        Some(Change::try_new(records, Int64Array::from(diffs))?)
+    };
+    let (next_progress, sealed) = match mode {
+        ConversionMode::Capture { progress, sealed } => (progress, sealed),
+        ConversionMode::Streaming => (CaptureProgress::default(), false),
+    };
+    Ok(CapturedDelivery {
+        change,
+        sealed,
+        next_progress,
+    })
 }
 
 fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, PostgresCdcScanError> {
@@ -117,7 +251,7 @@ fn validate_metadata(
     payload: &Row,
     table_schema: &str,
     table: &str,
-) -> Result<(), PostgresCdcScanError> {
+) -> Result<SnapshotMarker, PostgresCdcScanError> {
     let metadata = payload
         .get("source")
         .and_then(Value::as_object)
@@ -133,19 +267,16 @@ fn validate_metadata(
             )));
         }
     }
-    // Debezium 3.6 SnapshotRecord.FALSE deliberately leaves the Struct field
-    // unset. Our bridge disables default substitution, so Connect JSON uses
-    // null here. Snapshot operations are independently rejected by the op guard.
-    if !matches!(
-        metadata.get("snapshot"),
-        Some(Value::Null | Value::Bool(false))
-    ) && metadata.get("snapshot").and_then(Value::as_str) != Some("false")
-    {
-        return Err(invalid(
-            "Debezium CDC metadata does not identify a non-snapshot record",
-        ));
+    match metadata.get("snapshot") {
+        Some(Value::Bool(true)) => Ok(SnapshotMarker::Snapshot),
+        Some(Value::String(value)) if value == "true" => Ok(SnapshotMarker::Snapshot),
+        Some(Value::String(value)) if value == "last" => Ok(SnapshotMarker::Last),
+        Some(Value::Null | Value::Bool(false)) => Ok(SnapshotMarker::Streaming),
+        Some(Value::String(value)) if value == "false" => Ok(SnapshotMarker::Streaming),
+        _ => Err(invalid(
+            "Debezium CDC metadata has an invalid snapshot marker",
+        )),
     }
-    Ok(())
 }
 
 fn validate_envelope(columns: &[PostgresColumn], schema: &Row) -> Result<(), PostgresCdcScanError> {

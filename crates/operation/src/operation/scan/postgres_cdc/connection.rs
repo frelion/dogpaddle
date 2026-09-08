@@ -5,8 +5,20 @@ use postgres::{Client, Config, GenericClient, NoTls};
 
 use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType, schema};
 
-const CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
+pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum SlotState {
+    Absent,
+    Streaming,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectorMode {
+    Snapshot,
+    Streaming,
+}
 
 /// Ephemeral `PostgreSQL` credentials and the installed Debezium runtime bundle.
 ///
@@ -67,14 +79,11 @@ impl PostgresCdcScanConfig {
     /// Discovers one preconfigured table before constructing a Flow Definition.
     ///
     /// Reads catalog metadata only. Requires a permanent ordinary table with
-    /// `REPLICA IDENTITY FULL`, a usable inactive `pgoutput` slot, and an
+    /// `REPLICA IDENTITY FULL`, an absent source-owned slot name, and an
     /// existing unfiltered publication of every column and mutation kind. No
-    /// table, publication, or slot is created or changed. The caller needs
-    /// `EXECUTE` on `pg_control_system()` as well as normal CDC permissions.
-    ///
-    /// The first checkpoint starts at the existing slot, without a data
-    /// snapshot. The caller must establish the matching initial relation; the
-    /// simplest setup creates the slot while the captured table is empty.
+    /// table, publication, or slot is created or changed during discovery. The
+    /// caller needs `EXECUTE` on `pg_control_system()` as well as normal CDC
+    /// and logical-slot creation permissions.
     ///
     /// # Errors
     ///
@@ -88,7 +97,138 @@ impl PostgresCdcScanConfig {
         slot: &str,
         publication: &str,
     ) -> Result<PostgresCdcScanSpec, PostgresCdcScanError> {
-        let mut client = self.connect()?;
+        self.inspect(
+            engine_name,
+            table_schema,
+            table,
+            slot,
+            publication,
+            SlotState::Absent,
+        )
+    }
+
+    pub(super) fn start_snapshot(
+        &self,
+        expected: &PostgresCdcScanSpec,
+    ) -> Result<Connector, PostgresCdcScanError> {
+        self.verify(expected, SlotState::Absent)?;
+        self.start(expected, ConnectorMode::Snapshot, None)
+    }
+
+    pub(super) fn start_streaming(
+        &self,
+        expected: &PostgresCdcScanSpec,
+        checkpoint: &Checkpoint,
+    ) -> Result<Connector, PostgresCdcScanError> {
+        self.verify(expected, SlotState::Streaming)?;
+        self.start(expected, ConnectorMode::Streaming, Some(checkpoint))
+    }
+
+    pub(super) fn drop_snapshot_slot(
+        &self,
+        expected: &PostgresCdcScanSpec,
+    ) -> Result<(), PostgresCdcScanError> {
+        let mut client = self.connect_management()?;
+        // Capture may have failed precisely because the table or publication
+        // drifted. Cleanup therefore binds only the immutable cluster/database
+        // identity and the complete slot identity checked below.
+        let identity = client
+            .query_one(
+                "SELECT s.system_identifier::text, d.oid FROM pg_catalog.pg_control_system() s CROSS JOIN pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()",
+                &[],
+            )
+            .map_err(|error| catalog_error("read cluster identity for reset", &error))?;
+        if identity.get::<_, String>(0).as_str() != expected.system_identifier.as_str()
+            || identity.get::<_, u32>(1) != expected.database_oid
+        {
+            return Err(PostgresCdcScanError::new(
+                "PostgreSQL bootstrap reset reached a different cluster or database",
+            ));
+        }
+        let Some(row) = client
+            .query_opt(
+                "SELECT plugin, slot_type, database, temporary, active, two_phase FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                &[&expected.slot],
+            )
+            .map_err(|error| catalog_error("read replication slot for reset", &error))?
+        else {
+            return Ok(());
+        };
+        if row.get::<_, String>(0) != "pgoutput"
+            || row.get::<_, String>(1) != "logical"
+            || row.get::<_, Option<String>>(2).as_deref() != Some(expected.database.as_str())
+            || row.get::<_, bool>(3)
+            || row.get::<_, bool>(4)
+            || row.get::<_, bool>(5)
+        {
+            return Err(PostgresCdcScanError::new(
+                "PostgreSQL bootstrap slot is active or incompatible",
+            ));
+        }
+        let rows = client
+            .query(
+                "SELECT pg_catalog.pg_drop_replication_slot($1)",
+                &[&expected.slot],
+            )
+            .map_err(|error| catalog_error("drop bootstrap replication slot", &error))?;
+        if rows.len() != 1 {
+            return Err(PostgresCdcScanError::new(
+                "PostgreSQL bootstrap slot drop returned an unexpected result",
+            ));
+        }
+        Ok(())
+    }
+
+    fn start(
+        &self,
+        expected: &PostgresCdcScanSpec,
+        mode: ConnectorMode,
+        checkpoint: Option<&Checkpoint>,
+    ) -> Result<Connector, PostgresCdcScanError> {
+        let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
+            PostgresCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
+        })?;
+        runtime
+            .start(self.connector_config(expected, mode)?, checkpoint)
+            .map_err(|error| {
+                PostgresCdcScanError::new(format!(
+                    "Debezium connector start failed ({:?})",
+                    error.kind()
+                ))
+            })
+    }
+
+    fn connect_read_only(&self) -> Result<Client, PostgresCdcScanError> {
+        self.connect("-c statement_timeout=5000 -c default_transaction_read_only=on")
+    }
+
+    fn connect_management(&self) -> Result<Client, PostgresCdcScanError> {
+        self.connect("-c statement_timeout=5000")
+    }
+
+    fn connect(&self, options: &str) -> Result<Client, PostgresCdcScanError> {
+        Config::new()
+            .host(&self.host)
+            .port(self.port)
+            .dbname(&self.database)
+            .user(&self.user)
+            .password(&self.password)
+            .connect_timeout(Duration::from_secs(5))
+            .options(options)
+            .connect(NoTls)
+            .map_err(|error| catalog_error("connect", &error))
+    }
+
+    fn inspect(
+        &self,
+        engine_name: &str,
+        table_schema: &str,
+        table: &str,
+        slot: &str,
+        publication: &str,
+        slot_state: SlotState,
+    ) -> Result<PostgresCdcScanSpec, PostgresCdcScanError> {
+        let mut client = self.connect_read_only()?;
         let mut transaction = client
             .build_transaction()
             .read_only(true)
@@ -102,6 +242,7 @@ impl PostgresCdcScanConfig {
             table,
             slot,
             publication,
+            slot_state,
         )?;
         transaction
             .commit()
@@ -109,49 +250,28 @@ impl PostgresCdcScanConfig {
         Ok(spec)
     }
 
-    pub(super) fn start(
+    fn verify(
         &self,
         expected: &PostgresCdcScanSpec,
-        checkpoint: Option<&Checkpoint>,
-    ) -> Result<Connector, PostgresCdcScanError> {
-        let actual = self.discover(
+        slot_state: SlotState,
+    ) -> Result<(), PostgresCdcScanError> {
+        let actual = self.inspect(
             &expected.engine_name,
             &expected.schema,
             &expected.table,
             &expected.slot,
             &expected.publication,
+            slot_state,
         )?;
         if &actual != expected {
             return Err(PostgresCdcScanError::new(
                 "PostgreSQL CDC scan identity or logical schema changed",
             ));
         }
-        let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
-            PostgresCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
-        })?;
-        runtime
-            .start(self.connector_config(expected)?, checkpoint)
-            .map_err(|error| {
-                PostgresCdcScanError::new(format!(
-                    "Debezium connector start failed ({:?})",
-                    error.kind()
-                ))
-            })
+        Ok(())
     }
 
-    fn connect(&self) -> Result<Client, PostgresCdcScanError> {
-        Config::new()
-            .host(&self.host)
-            .port(self.port)
-            .dbname(&self.database)
-            .user(&self.user)
-            .password(&self.password)
-            .connect_timeout(Duration::from_secs(5))
-            .options("-c statement_timeout=5000 -c default_transaction_read_only=on")
-            .connect(NoTls)
-            .map_err(|error| catalog_error("connect", &error))
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn read_spec(
         &self,
         client: &mut impl GenericClient,
@@ -160,6 +280,7 @@ impl PostgresCdcScanConfig {
         table: &str,
         slot: &str,
         publication: &str,
+        slot_state: SlotState,
     ) -> Result<PostgresCdcScanSpec, PostgresCdcScanError> {
         let identity = client.query_one(
             "SELECT s.system_identifier::text, d.oid FROM pg_catalog.pg_control_system() s CROSS JOIN pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()", &[])
@@ -198,7 +319,10 @@ impl PostgresCdcScanConfig {
         }
         schema::compile(&columns)?;
         validate_publication(client, publication, table_schema, table, &columns)?;
-        validate_slot(client, slot, &self.database)?;
+        match slot_state {
+            SlotState::Absent => validate_absent_slot(client, slot)?,
+            SlotState::Streaming => validate_streaming_slot(client, slot, &self.database)?,
+        }
         Ok(PostgresCdcScanSpec {
             engine_name: engine_name.to_owned(),
             database: self.database.clone(),
@@ -216,11 +340,20 @@ impl PostgresCdcScanConfig {
     fn connector_config(
         &self,
         spec: &PostgresCdcScanSpec,
+        mode: ConnectorMode,
     ) -> Result<ConnectorConfig, PostgresCdcScanError> {
         let mut config = ConnectorConfig::new(&spec.engine_name, CONNECTOR_CLASS)
             .and_then(|config| config.max_delivery_bytes(MAX_DELIVERY_BYTES))
             .map_err(|_| PostgresCdcScanError::new("invalid PostgreSQL connector identity"))?;
         let port = self.port.to_string();
+        let snapshot_mode = match mode {
+            ConnectorMode::Snapshot => "initial",
+            ConnectorMode::Streaming => "no_data",
+        };
+        let heartbeat_interval = match mode {
+            ConnectorMode::Snapshot => "1",
+            ConnectorMode::Streaming => "1000",
+        };
         // Definition identifiers are restricted to lowercase ASCII and '_'.
         let include = format!("{}\\.{}", spec.schema, spec.table);
         for (key, value) in [
@@ -237,14 +370,16 @@ impl PostgresCdcScanConfig {
             ("table.include.list", &include),
             ("publication.autocreate.mode", "disabled"),
             ("slot.drop.on.stop", "false"),
-            ("snapshot.mode", "no_data"),
+            ("snapshot.mode", snapshot_mode),
+            ("snapshot.max.threads", "1"),
+            ("lsn.flush.mode", "connector"),
             ("time.precision.mode", "microseconds"),
             ("decimal.handling.mode", "precise"),
             ("binary.handling.mode", "bytes"),
             ("tombstones.on.delete", "false"),
             ("provide.transaction.metadata", "false"),
             ("skipped.operations", "none"),
-            ("heartbeat.interval.ms", "1000"),
+            ("heartbeat.interval.ms", heartbeat_interval),
             ("max.batch.size", "1024"),
             ("max.queue.size", "2048"),
             ("max.queue.size.in.bytes", "16777216"),
@@ -303,7 +438,26 @@ fn validate_publication(
     Ok(())
 }
 
-fn validate_slot(
+fn validate_absent_slot(
+    client: &mut impl GenericClient,
+    slot: &str,
+) -> Result<(), PostgresCdcScanError> {
+    if client
+        .query_opt(
+            "SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .map_err(|error| catalog_error("read replication slot", &error))?
+        .is_some()
+    {
+        return Err(PostgresCdcScanError::new(
+            "PostgreSQL bootstrap requires its source-owned replication slot name to be absent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_streaming_slot(
     client: &mut impl GenericClient,
     slot: &str,
     database: &str,
@@ -314,7 +468,7 @@ fn validate_slot(
         .map_err(|error| catalog_error("read replication slot", &error))?
         .ok_or_else(|| {
             PostgresCdcScanError::new(
-                "PostgreSQL CDC scan requires an existing pgoutput replication slot",
+                "PostgreSQL CDC continuation requires its bootstrap pgoutput replication slot",
             )
         })?;
     if row.get::<_, Option<bool>>(0) != Some(true) {

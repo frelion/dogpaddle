@@ -113,9 +113,11 @@ flow.advance()?;
 改变 `FlowFactory`、`Flow::advance` 或 Station 协议，也没有引入通用 Sink trait、ORM 或 backend registry。
 它的 `discover_target` 由调用方在 build 前显式执行，并会进行只读 `PostgreSQL` catalog I/O。
 
-`PostgresCdcScan` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、不连接 PG、
-不启动 JVM；初始化、poll、转换、ACK 仍全在 Operation 内，通过通用 turn 协议完成。
-checkpoint 与 Station output 在同一事务提交，背压同时回滚且不 ACK，不另存 pending。
+`PostgresCdcScan`/`MySqlCdcScan` 的 discovery 由调用方在 build 之前显式执行。build/open 不解析 secret、
+不连接源库、不启动 JVM；快照、poll、转换、ACK 全在各自 concrete Operation 内完成。两者均持久
+`phase + checkpoint + bootstrap_spool`，按 `Fresh → Capturing → Publishing → Streaming` 先私有捕获完整初始快照，
+再逐条发布到普通 Station output。发布期 spool 出队与 output append 同事务；捕获中断后有界清理并重做完整快照。
+必填 `NonZeroU64 bootstrap_spool_bytes` 以 `retained + 8 + IPC` 硬限制私有 spool；超限 delivery 不 ACK，需以更大容量重建。
 poll 不等待数据；宿主在整轮 Idle 或持续 Backpressured 时自行安排等待，避免忙轮询。
 它只输出完整 Change，Flow 没有 `ingest`、PG 专用分支或另一套调度状态。
 完整真实 PG→SQLite 与进程恢复 host 见 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`，显式验收命令见根目录 TESTING.md。
@@ -333,7 +335,12 @@ JSON。以下名称是兼容性边界：
 - Station 输出：`station/{index:08x}/output`（仅限具有外部 output 的 Station）
 - `SequenceScan` 位置：`station/{index:08x}/operation/sequence_scan.position`
 - `RunningEventCount` 状态：`station/{index:08x}/operation/running_event_count.count`
+- `PostgresCdcScan` phase：`station/{index:08x}/operation/postgres_cdc_scan.phase`
 - `PostgresCdcScan` checkpoint：`station/{index:08x}/operation/postgres_cdc_scan.checkpoint`
+- `PostgresCdcScan` spool：`station/{index:08x}/operation/postgres_cdc_scan.bootstrap_spool`
+- `MySqlCdcScan` phase：`station/{index:08x}/operation/mysql_cdc_scan.phase`
+- `MySqlCdcScan` checkpoint：`station/{index:08x}/operation/mysql_cdc_scan.checkpoint`
+- `MySqlCdcScan` spool：`station/{index:08x}/operation/mysql_cdc_scan.bootstrap_spool`
 - `SqliteSink` / `PostgresSink` 状态：`station/{index:08x}/operation/relation_sink.state`
 - Project、Filter、Extend、Select、`SchemaAlign` 和 `UnionAll` 不声明 Operation data，只使用通用 Station state 和 output
 
@@ -372,7 +379,7 @@ retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。F
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压 producer。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer
-intake 还会在事务提交前后两侧兜底校验。运行资源注入、具体 `PostgresCdcScan` 与 `PostgresSink` 已沿
+intake 还会在事务提交前后两侧兜底校验。运行资源注入、具体 `PostgresCdcScan`、`MySqlCdcScan` 与 `PostgresSink` 已沿
 通用 Operation 调度协议承接事务外初始化/poll、durable state 写入与提交后确认；`SqliteSink` 与
 `PostgresSink` 分别实现自己的目标专用幂等提交边界。尚未实现 `Flow::start` 或中断控制。内建 `RunningEventCount`
 当前仍在一个 turn 中完整处理 Change，但协议已经允许其他 Operation 用自己的持久化状态跨 turn

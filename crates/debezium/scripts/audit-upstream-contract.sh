@@ -35,10 +35,15 @@ git -C "$audit_root/debezium" sparse-checkout set \
   debezium-api \
   debezium-embedded \
   debezium-connector-common \
+  debezium-connector-binlog \
+  debezium-connector-mysql \
   debezium-connector-postgres
 
 readonly async_engine="$audit_root/debezium/debezium-embedded/src/main/java/io/debezium/embedded/async/AsyncEmbeddedEngine.java"
+readonly relational_snapshot="$audit_root/debezium/debezium-connector-common/src/main/java/io/debezium/relational/RelationalSnapshotChangeEventSource.java"
+readonly binlog_snapshot="$audit_root/debezium/debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSnapshotChangeEventSource.java"
 readonly pg_config="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresConnectorConfig.java"
+readonly pg_task="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresConnectorTask.java"
 readonly pg_stream="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/connection/PostgresReplicationConnection.java"
 readonly pg_source="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java"
 
@@ -65,6 +70,18 @@ require_source \
   'task.commit();' \
   "$async_engine" \
   'a successful offset-store flush requests the connector commit callback'
+require_source \
+  'dispatcher.alwaysDispatchHeartbeatEvent(ctx.partition, ctx.offset);' \
+  "$relational_snapshot" \
+  'a completed relational snapshot emits an explicit terminal heartbeat'
+require_source \
+  'if (!connection.userHasPrivileges("LOCK TABLES")) {' \
+  "$binlog_snapshot" \
+  'the MySQL snapshot fails instead of silently using table locks without permission'
+require_source \
+  'if (snapshotter.shouldStream()) {' \
+  "$pg_task" \
+  'PostgreSQL creates a missing slot only for a snapshot mode that also streams'
 require_source \
   'CONNECTOR_AND_DRIVER("connector_and_driver")' \
   "$pg_config" \

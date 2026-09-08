@@ -42,8 +42,8 @@ Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候�
 | 类别 | 算子 | 当前角色 | 路线判断 |
 | --- | --- | --- | --- |
 | Scan | SequenceScan | 生成连续 `u64` 测试/系统事件 | 保留，但不代表通用 ingress |
-| Scan | PostgresCdcScan | 固定 Schema 单表 WAL CDC，checkpoint/output 同事务与 commit 后 ACK | 已有具体试点；snapshot、TLS/fencing 与发布门仍待实施 |
-| Scan | MySqlCdcScan | 固定 Schema 单表 binlog CDC，以预发布 tail origin 持续读取，checkpoint/output 同事务与 commit 后 ACK | 已有仅 tail 的具体试点；完整初始快照、TLS/fencing 与发布门仍待实施 |
+| Scan | PostgresCdcScan | 固定 Schema 单表全量快照 + WAL CDC，私有 spool 封口后原子发布 | 已有具体试点；TLS、跨实例 fencing 与在线 Schema evolution 仍待实施 |
+| Scan | MySqlCdcScan | 固定 Schema 单表全量快照 + binlog CDC，terminal checkpoint 后 recovery | 已有具体试点；TLS、跨实例 fencing 与在线 Schema evolution 仍待实施 |
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
 | Transform | Aggregate | 按非空 group key 持续维护多个聚合结果 | 已完成阶段 4 最小纵向切片 |
@@ -394,10 +394,10 @@ registry 的表达式在拥有确定性持久语义前不进入已承诺集合�
 它不引入 SQLite 元数据表；在目标表未被外部修改、数据库文件未被替换或恢复的约束下，重放保持
 最终结果恰好一次。通用 ingress、结果订阅与关系 snapshot 仍属于本阶段后续工作。
 
-### 已有试点：PostgresCdcScan
+### 已有试点：PostgresCdcScan 与 MySqlCdcScan
 
-首个外部输入是具体的固定 Schema 单表 PostgreSQL CDC Scan，不提前抽象公共 IngressScan。
-运行协议已经落在所有 Operation 共用的唯一入口上：
+两个外部输入都是具体的固定 Schema 单表 CDC Scan，不提前抽象公共 IngressScan 或 connector driver。
+它们沿所有 Operation 共用的唯一入口运行：
 
 ```text
 turn(None)
@@ -409,26 +409,31 @@ turn(None)
 
 零输入 Scan 返回 `Action::Complete` 仍是协议错误。上述事务协调只由 Station 执行，不成为应用 API。
 Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/Station 打开第二个 writer。
-PostgresCdcScan 在事务外 `turn(None)` 中以零超时 poll 并转换；`apply` 保存 checkpoint，
-通过 `Action::Commit` 返回可选 Change，由 Station 在同一事务中追加 output。
-只有该事务成功后才通过 `AfterCommit` ACK；rollback、背压或 commit 失败不推进 checkpoint/output，
-只丢弃 completion。零超时只表示 poll 不等待数据，connector 启动和 ACK 仍同步且有界。
-不新增 `Flow::ingest`、Scan 专用 hook 或外部 coordinator。这一提交边界的具体 D0–D7 实施顺序见
-[`DEBEZIUM_ROADMAP.md`](DEBEZIUM_ROADMAP.md)。
+两者按 `Fresh → Capturing → Publishing → Streaming` 推进。初始快照 delivery 先在事务外转换并
+编码为可选的完整 Change IPC，再把可选私有 spool entry、整个 delivery checkpoint 和 phase 在同一 MDBX 事务中提交；
+只有提交后才通过 `AfterCommit` ACK。terminal heartbeat 封口以后，每个 turn 从私有 spool 取一条 Change，
+并让出队与普通 Station output append 共用同一事务。因此下游背压、Schema mismatch 或 commit 失败既不会
+丢掉私有 entry，也不会暴露部分快照。最后一条出队和进入 `Streaming` 也在同一事务提交。
+
+`Capturing` 期崩溃不尝试从中间 checkpoint 续拍：`Resetting` 每个 turn 至多删除一条 spool entry，然后
+清除 checkpoint 并重新执行完整快照。PostgreSQL 在 reset 前还会于 Store 事务外删除由本 Scan 在 bootstrap
+创建的、inactive 且 identity 兼容的 source-owned slot；MySQL 没有同类服务端持久对象。`Publishing`/`Streaming` reopen
+不会重做快照。
 
 当前边界：
 
 - 不可变 exact logical Schema；
-- 每个 delivery 转换为一个完整、非空 Change，或仅推进 checkpoint 而不伪造空 Change；
-- 唯一 `postgres_cdc_scan.checkpoint: Cell<Vec<u8>>` 直接保存 D2 opaque checkpoint bytes，
-  不加额外 envelope，也不保存 pending；
-- 有界 delivery 和 Station output capacity；背压时不 ACK，由 D2 保留并重投；
-- checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
-- Schema mismatch、编码或 commit 失败零部分写入；
-- reopen 从已提交 checkpoint 继续接收。
+- 每个 Scan 恰好声明 `phase: Cell<u32>`、`checkpoint: Cell<Vec<u8>>` 与
+  `bootstrap_spool: AppendLog<Vec<u8>>`；
+- 必填 `bootstrap_spool_bytes` 是 `retained + 8-byte offset + IPC` 的硬上限，空 spool 也不接纳超限首条；
+- PostgreSQL 用 `initial` 捕获已有行和 heartbeat 前 WAL，再从封口 checkpoint 以 `no_data` 继续同一 slot；
+- MySQL 8.4 用 `initial_only + minimal` 捕获一致全表快照，再从封口 checkpoint 以 `recovery` 继续 binlog；
+- 稳态 checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
+- 不新增 `Flow::ingest`、Scan 专用 hook 或外部 coordinator。
 
-原 `postgres_source.state` 的 pending 布局属于未发布的开发期格式；旧 Flow 必须重建，不提供
-alias、兼容读取或迁移。未来本地输入 API 应按真实需求单独确定幂等身份，不反向扩展当前 Scan 协议。
+旧的单 checkpoint/tail-only 开发期布局必须重建，不提供 alias、兼容读取或迁移。PostgreSQL 真实 gate
+覆盖非空源、terminal ACK 前崩溃、2050 行部分快照 ACK 前崩溃、完整重拍只发布一次以及后续 WAL；
+MySQL 的普通 gate 保持离线，部署前还必须在真实 MySQL 上验证 snapshot 与 binlog retention。
 
 ### 已有试点：PostgresSink
 
@@ -901,8 +906,8 @@ PostgresCdcScan
 → crash / reopen
 ```
 
-真实 Scan 到专用关系 Sink 的闭环已经存在：`PostgresCdcScan` 提供固定 Schema 单表持续 CDC，
-`SqliteSink` 与 `PostgresSink` 提供可查询终点。初始全量、发布加固、ResultLog/Materialize 和应用可消费的
+真实 Scan 到专用关系 Sink 的闭环已经存在：`PostgresCdcScan` 与 `MySqlCdcScan` 均提供固定 Schema
+单表初始全量 + 持续 CDC，`SqliteSink` 与 `PostgresSink` 提供可查询终点。ResultLog/Materialize 和应用可消费的
 通用结果边界仍待实施。复杂算子仍主要依靠
 测试 fixture 自证，上层用户 API 也尚未形成完整闭环。
 

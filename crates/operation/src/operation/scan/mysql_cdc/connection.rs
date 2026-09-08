@@ -1,22 +1,13 @@
-use std::{
-    fmt,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime};
 use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
 
 use super::definition::{CONNECTOR_CLASS, validate_spec};
-use super::{
-    MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType,
-    convert::{BootstrapControl, validate_bootstrap_control},
-    schema,
-};
+use super::{MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType, schema};
 
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 type ColumnRow = (
     String,
     String,
@@ -94,12 +85,6 @@ impl MySqlCdcScanConfig {
     /// source object is created or changed. The replication client ID must be
     /// unique among active `MySQL` replication clients.
     ///
-    /// This is catalog-only discovery. Normal callers should use
-    /// [`Self::bootstrap_definition`], which also captures a pre-publication
-    /// CDC seed. It does not establish an initial relation: callers that need a
-    /// new sink to be a full mirror must keep the source empty through a
-    /// successful build, or use a future snapshot source.
-    ///
     /// # Errors
     ///
     /// Returns a redacted error for connection or catalog failures,
@@ -110,6 +95,18 @@ impl MySqlCdcScanConfig {
         table: &str,
     ) -> Result<MySqlCdcScanSpec, MySqlCdcScanError> {
         let mut connection = self.connect()?;
+        let binlog_status: Option<mysql::Row> = connection
+            .query_first("SHOW BINARY LOG STATUS")
+            .map_err(|_| catalog_error("read binary log status"))?;
+        let binlog_status = binlog_status
+            .ok_or_else(|| MySqlCdcScanError::new("MySQL binary log status is unavailable"))?;
+        let file = binlog_status.get::<String, _>(0).unwrap_or_default();
+        let position = binlog_status.get::<u64, _>(1).unwrap_or_default();
+        if file.is_empty() || position == 0 {
+            return Err(MySqlCdcScanError::new(
+                "MySQL binary log position is unavailable",
+            ));
+        }
         connection
             .query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .map_err(|_| catalog_error("set discovery isolation"))?;
@@ -130,46 +127,33 @@ impl MySqlCdcScanConfig {
         }
     }
 
-    /// Discovers one table and captures its pre-publication Debezium tail seed.
-    ///
-    /// This performs one short `no_data` Debezium snapshot outside Flow build.
-    /// It consumes only snapshot schema-control deliveries until their final
-    /// completion marker, confirms the completed checkpoint through the
-    /// bridge, stops and disposes that temporary connector, and embeds the
-    /// checkpoint into the returned Definition. The seed becomes durable only
-    /// when that canonical Definition is committed by a Flow build. A later
-    /// runtime then always starts in `recovery` mode from the Definition seed
-    /// or a newer checkpoint Cell value.
-    ///
-    /// The schema-only snapshot intentionally does not emit table rows. Its
-    /// native binlog position is the CDC origin, not an atomic cut at the start
-    /// of this method: changes at or before that position are outside this
-    /// Scan's contract. Changes strictly after it are replayed after
-    /// publication when the binlog remains retained.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for catalog discovery, bundle startup, an unexpected
-    /// snapshot delivery, an incomplete schema bootstrap, checkpoint
-    /// acknowledgement, or connector shutdown failure. No Flow has been
-    /// published when this method returns an error.
-    pub fn bootstrap_definition(
+    pub(super) fn start_snapshot(
         &self,
-        engine_name: &str,
-        table: &str,
-    ) -> Result<MySqlCdcScanDefinition, MySqlCdcScanError> {
-        let spec = self.discover(engine_name, table)?;
-        let checkpoint = self.bootstrap_checkpoint(&spec)?;
-        let observed = self.discover(engine_name, table)?;
-        if observed != spec {
+        expected: &MySqlCdcScanSpec,
+    ) -> Result<Connector, MySqlCdcScanError> {
+        let actual = self.discover(&expected.engine_name, &expected.table)?;
+        if &actual != expected {
             return Err(MySqlCdcScanError::new(
-                "MySQL CDC scan identity or logical schema changed during bootstrap",
+                "MySQL CDC scan identity or logical schema changed",
             ));
         }
-        MySqlCdcScanDefinition::from_bootstrap(spec, checkpoint)
+        let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
+            MySqlCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
+        })?;
+        runtime
+            .start(
+                self.connector_config(expected, ConnectorMode::Snapshot)?,
+                None,
+            )
+            .map_err(|error| {
+                MySqlCdcScanError::new(format!(
+                    "Debezium snapshot start failed ({:?})",
+                    error.kind()
+                ))
+            })
     }
 
-    pub(super) fn start(
+    pub(super) fn start_streaming(
         &self,
         expected: &MySqlCdcScanSpec,
         checkpoint: &Checkpoint,
@@ -194,73 +178,6 @@ impl MySqlCdcScanConfig {
                     error.kind()
                 ))
             })
-    }
-
-    fn bootstrap_checkpoint(
-        &self,
-        spec: &MySqlCdcScanSpec,
-    ) -> Result<Checkpoint, MySqlCdcScanError> {
-        let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
-            MySqlCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
-        })?;
-        let mut connector = runtime
-            .start(self.connector_config(spec, ConnectorMode::Bootstrap)?, None)
-            .map_err(|error| {
-                MySqlCdcScanError::new(format!(
-                    "Debezium bootstrap start failed ({:?})",
-                    error.kind()
-                ))
-            })?;
-
-        let checkpoint: Result<Checkpoint, MySqlCdcScanError> = (|| {
-            let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(MySqlCdcScanError::new(
-                        "Debezium bootstrap did not complete its schema snapshot within 30 seconds",
-                    ));
-                }
-                let delivery = match connector.poll(remaining) {
-                    Ok(Some(delivery)) => delivery,
-                    Ok(None) => {
-                        return Err(MySqlCdcScanError::new(
-                            "Debezium bootstrap did not complete its schema snapshot within 30 seconds",
-                        ));
-                    }
-                    Err(error) => {
-                        return Err(MySqlCdcScanError::new(format!(
-                            "Debezium bootstrap poll failed ({:?})",
-                            error.kind()
-                        )));
-                    }
-                };
-                let complete = matches!(
-                    validate_bootstrap_control(delivery.records(), &spec.engine_name)?,
-                    BootstrapControl::Complete
-                );
-                let checkpoint = delivery.checkpoint().clone();
-                delivery.ack().map_err(|error| {
-                    MySqlCdcScanError::new(format!(
-                        "Debezium bootstrap ACK failed ({:?})",
-                        error.kind()
-                    ))
-                })?;
-                if complete {
-                    return Ok(checkpoint);
-                }
-            }
-        })();
-        let stopped = connector.stop(BOOTSTRAP_TIMEOUT).map_err(|error| {
-            MySqlCdcScanError::new(format!(
-                "Debezium bootstrap stop failed ({:?})",
-                error.kind()
-            ))
-        });
-        match (checkpoint, stopped) {
-            (Ok(checkpoint), Ok(())) => Ok(checkpoint),
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        }
     }
 
     fn connect(&self) -> Result<Conn, MySqlCdcScanError> {
@@ -401,9 +318,9 @@ impl MySqlCdcScanConfig {
         let port = self.port.to_string();
         let replication_client_id = self.replication_client_id.to_string();
         let snapshot_mode = mode.snapshot_mode();
-        let (heartbeat_interval, batch_size, queue_size) = match mode {
-            ConnectorMode::Bootstrap => ("0", "1", "2"),
-            ConnectorMode::Recovery => ("1000", "1024", "2048"),
+        let heartbeat_interval = match mode {
+            ConnectorMode::Snapshot => "1",
+            ConnectorMode::Recovery => "1000",
         };
         // Definition identifiers are restricted to lowercase ASCII and '_'.
         let include = format!("^{}\\.{}$", spec.database, spec.table);
@@ -417,24 +334,17 @@ impl MySqlCdcScanConfig {
             ("topic.prefix", &spec.engine_name),
             ("database.include.list", &spec.database),
             ("table.include.list", &include),
-            // The temporary bootstrap prepares the pre-publication tail seed.
-            // Every materialized Scan starts in `recovery` only after a Flow
-            // Definition has durably published that seed, or a newer mutable
-            // checkpoint Cell value exists.
             ("snapshot.mode", snapshot_mode),
-            // This CDC-only pilot never reads table data. Fixed Schema lets
-            // its schema-only snapshots avoid deliberate MySQL read locks.
-            // That does not turn invocation time into a source-write fence:
-            // pre-origin state remains outside the CDC-only contract.
-            ("snapshot.locking.mode", "none"),
+            // Minimal locking obtains the binlog origin and schema under a
+            // short global read lock, then scans InnoDB from one consistent
+            // snapshot while ordinary writes continue.
+            ("snapshot.locking.mode", "minimal"),
+            ("snapshot.max.threads", "1"),
             (
                 "schema.history.internal",
                 "io.debezium.relational.history.MemorySchemaHistory",
             ),
-            // The temporary `no_data` bootstrap accepts only snapshot schema
-            // controls through its final completion marker. Runtime recovery
-            // rejects streaming DDL before it can be acknowledged.
-            ("include.schema.changes", "true"),
+            ("include.schema.changes", "false"),
             (
                 "schema.history.internal.store.only.captured.databases.ddl",
                 "true",
@@ -451,8 +361,8 @@ impl MySqlCdcScanConfig {
             ("provide.transaction.metadata", "false"),
             ("skipped.operations", "none"),
             ("heartbeat.interval.ms", heartbeat_interval),
-            ("max.batch.size", batch_size),
-            ("max.queue.size", queue_size),
+            ("max.batch.size", "1024"),
+            ("max.queue.size", "2048"),
             ("max.queue.size.in.bytes", "16777216"),
             ("poll.interval.ms", "100"),
             ("database.connectionTimeZone", "UTC"),
@@ -468,14 +378,14 @@ impl MySqlCdcScanConfig {
 
 #[derive(Clone, Copy)]
 enum ConnectorMode {
-    Bootstrap,
+    Snapshot,
     Recovery,
 }
 
 impl ConnectorMode {
     const fn snapshot_mode(self) -> &'static str {
         match self {
-            Self::Bootstrap => "no_data",
+            Self::Snapshot => "initial_only",
             Self::Recovery => "recovery",
         }
     }
@@ -545,8 +455,8 @@ mod tests {
     use super::ConnectorMode;
 
     #[test]
-    fn only_temporary_bootstrap_uses_no_data_snapshot_mode() {
-        assert_eq!(ConnectorMode::Bootstrap.snapshot_mode(), "no_data");
+    fn snapshot_then_recovery_are_the_only_connector_modes() {
+        assert_eq!(ConnectorMode::Snapshot.snapshot_mode(), "initial_only");
         assert_eq!(ConnectorMode::Recovery.snapshot_mode(), "recovery");
     }
 }

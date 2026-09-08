@@ -1,8 +1,10 @@
-use std::{collections::HashSet, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::HashSet,
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use base64::{Engine as _, prelude::BASE64_STANDARD};
-use dogpaddle_debezium::Checkpoint;
 use dogpaddle_store::{Cell, Large, OrderedMap, Small, Store};
 
 use crate::{
@@ -121,18 +123,21 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
         (
             11,
             Box::new(
-                PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
-                    engine_name: "events".into(),
-                    database: "shop".into(),
-                    schema: "public".into(),
-                    table: "events".into(),
-                    slot: "events".into(),
-                    publication: "events".into(),
-                    system_identifier: "1".into(),
-                    database_oid: 1,
-                    table_oid: 1,
-                    columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
-                })
+                PostgresCdcScanDefinition::try_new(
+                    PostgresCdcScanSpec {
+                        engine_name: "events".into(),
+                        database: "shop".into(),
+                        schema: "public".into(),
+                        table: "events".into(),
+                        slot: "events".into(),
+                        publication: "events".into(),
+                        system_identifier: "1".into(),
+                        database_oid: 1,
+                        table_oid: 1,
+                        columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
+                    },
+                    NonZeroU64::MIN,
+                )
                 .unwrap(),
             ),
         ),
@@ -160,7 +165,7 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
         (
             15,
             Box::new(
-                MySqlCdcScanDefinition::from_bootstrap(
+                MySqlCdcScanDefinition::try_new(
                     MySqlCdcScanSpec {
                         engine_name: "events".into(),
                         database: "shop".into(),
@@ -169,23 +174,12 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
                         table_id: 1,
                         columns: vec![MySqlColumn::new("id", MySqlType::Int64, false)],
                     },
-                    mysql_bootstrap_checkpoint("events"),
+                    NonZeroU64::MIN,
                 )
                 .unwrap(),
             ),
         ),
     ]
-}
-
-fn mysql_bootstrap_checkpoint(engine_name: &str) -> Checkpoint {
-    let bytes = BASE64_STANDARD
-        .decode(
-            "RFBEQkNQMDEAAQAAAAZldmVudHMAAAAqaW8uZGViZXppdW0uY29ubmVjdG9yLm15c3FsLk15U3FsQ29ubmVjdG9yAAAAAQAAAAEAAAAAAQCJwBWB",
-        )
-        .unwrap();
-    let checkpoint = Checkpoint::from_bytes(bytes).unwrap();
-    assert!(checkpoint.matches(engine_name, "io.debezium.connector.mysql.MySqlConnector"));
-    checkpoint
 }
 
 fn valid_schema() -> SchemaRef {

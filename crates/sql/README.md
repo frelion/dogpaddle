@@ -48,7 +48,7 @@ docs/tools/record_fulfillment_demo.sh \
 环境要求和证据说明见
 [录制说明](https://github.com/frelion/dogpaddle/blob/main/docs/demo/README.md)。
 
-当前 `PostgreSQL` 试点从空源表和匹配的新 slot 起点开始，不执行已有数据的初始快照。
+当前 `PostgreSQL` 试点会先快照已有数据，再从同一切点持续处理 WAL。slot 名首次启动前必须不存在，随后由 Scan 独占。
 `PostgresSink` 创建并独占无损 Arrow 关系表，不镜像源表 DDL；文本值当前按 bytes 保存，查询时使用
 `convert_from(...)`。
 
@@ -154,32 +154,25 @@ V1 端点：
 | 类型 | SQL 函数 | 必需参数 |
 | --- | --- | --- |
 | Scan | `sequence` | `start` |
-| Scan | `postgres_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `schema`, `table`, `slot`, `publication` |
-| Scan | `mysql_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `replication_client_id`, `table` |
+| Scan | `postgres_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `schema`, `table`, `slot`, `publication`, `bootstrap_spool_bytes` |
+| Scan | `mysql_cdc` | `engine_name`, `runtime_bundle`, `host`, `port`, `database`, `user`, `password`, `replication_client_id`, `table`, `bootstrap_spool_bytes` |
 | Sink | `sqlite` | `path`, `table` |
 | Sink | `postgres` | `sink_id`, `host`, `port`, `database`, `user`, `password`, `schema`, `table` |
 | Sink | `discard` | 无 |
 
-`mysql_cdc` 是单表、固定 Schema 的连续 binlog Scan。`replication_client_id` 是非零 `u32`，必须在活跃的
-`MySQL` replication client 中保持唯一；它与源服务器 ID 无关。`SqlProgram::build` 会发现并冻结 source server
-UUID、`InnoDB` table identity 与完整逻辑 Schema，再执行一次短暂的 `no_data` schema bootstrap。该临时
-Debezium connector 完成其 schema-only snapshot、产生 native opaque seed checkpoint 后立即停止；seed 随 canonical Flow Definition 发布。
-因此**成功 build 是该 `mysql_cdc` source 唯一且不可变的 binlog origin**。`open` 只注入新的临时连接配置，
-不重写已持久化 Flow、不再 bootstrap 或选择新的起点。
+`postgres_cdc` 和 `mysql_cdc` 都先把已有行捕获到私有持久 spool，完整封口后再逐条原子发布，然后持续 CDC。
+`PostgreSQL` 还会把 terminal heartbeat 前已经观察到的 WAL overlap 放进 spool；`MySQL` `initial_only` 期间的
+并发写入留在 binlog，发布完成后从封口 checkpoint 读取。`bootstrap_spool_bytes` 必填、必须是非零 `u64`，
+并持久在 Definition 中；它是 `retained + 8-byte offset + IPC` 的硬逻辑容量。快照期无公开 output；每个 delivery 的可选 IPC 与 candidate checkpoint
+提交后才 ACK。封口后 spool 出队与 Station output append 同事务，背压不会丢数据。容量不足时不 ACK，
+需要使用更大容量和新 state 目录重建。
 
-正常 runtime（第一次也是如此）从 seed 或较新的 durable checkpoint 以 `recovery` + `MemorySchemaHistory`
-启动。bootstrap 与 recovery 都固定 `snapshot.locking.mode=none`，不主动取得 Debezium snapshot read lock。
-但 logical origin 是 bootstrap 内部选取的 `P`，不是调用 `build` 的瞬间：严格晚于 `P`、但早于成功 build 的写入会从
-保留 binlog 重放；`P` 之前（包括 bootstrap 已开始、但尚未选定 `P` 时）的状态和写入则不在这个 CDC-only Scan 的
-合同内。`MySQL` 必须持续保留从 origin（随后从最新 durable checkpoint）可恢复的 binlog；位置过期时 recovery
-必须失败，而不是悄悄选取较晚位置。
-
-它不读取 origin 之前已有的表数据，也不建立自动 source-write fence。新 Flow 不能把运行中的任意 `MySQL` 表直接
-接到新空 sink 并期望完整镜像；内建关系 sink 也不支持预装外部 baseline。唯一完整空表部署顺序是让源表保持为空，
-成功 build 后才允许首次写入；无停写的初始全量接入属于未来 snapshot source。Schema 在 bootstrap 后的整个可恢复
-期间必须固定；v1 不支持在线 DDL、表数据 snapshot、TLS、unsigned/temporal/JSON 等未列出的源类型或跨实例 fencing。
-详细的类型和部署合同见
-`dogpaddle-operation` 的 `MySQL` CDC Scan 文档。
+`PostgreSQL` 要求预配置 publication 和首启前不存在、之后 source-owned/exclusive 的 slot 名；spool 必须容纳完整快照和
+terminal heartbeat 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minimal` 快照，terminal heartbeat 封口后以 `recovery`
+继续。`replication_client_id` 是唯一的非零 `u32`。`MySQL` 角色应具有短时 global read lock 权限但不授
+`LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 前失败。binlog 必须覆盖快照、私有 spool 排空、
+公开 output 背压与追平；过早 `PURGE` 会 fail closed。两个 source 都要求固定 Schema，不支持 TLS、在线 DDL、
+跨实例 fencing 或旧格式迁移。详细合同见 `dogpaddle-operation` 的 CDC Scan 文档。
 
 ## Streaming SQL v1
 

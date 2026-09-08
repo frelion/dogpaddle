@@ -6,7 +6,11 @@ use base64::{Engine as _, prelude::BASE64_STANDARD};
 use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
-use super::{PostgresCdcScanError, PostgresColumn, PostgresType, convert::convert_values, schema};
+use super::{
+    PostgresCdcScanError, PostgresColumn, PostgresType,
+    convert::{CaptureProgress, CapturedDelivery, convert_capture_values, convert_values},
+    schema,
+};
 
 fn column(data_type: PostgresType) -> PostgresColumn {
     PostgresColumn::new("value", data_type, true)
@@ -59,6 +63,46 @@ fn convert(
         bytes
             .iter()
             .map(|bytes| (Some("source.public.events"), Some(bytes.as_slice()))),
+    )
+}
+
+fn heartbeat() -> Value {
+    json!({
+        "schema":{
+            "type":"struct",
+            "name":"io.debezium.connector.common.Heartbeat",
+            "fields":[{"field":"ts_ms","type":"int64","optional":false}]
+        },
+        "payload":{"ts_ms":123}
+    })
+}
+
+fn snapshot(columns: &[PostgresColumn], marker: &str, row: Value) -> Value {
+    let mut event = envelope(columns, "r", Value::Null, row);
+    event["payload"]["source"]["snapshot"] = json!(marker);
+    event
+}
+
+fn capture(
+    columns: &[PostgresColumn],
+    events: &[(&str, Value)],
+    progress: CaptureProgress,
+) -> Result<CapturedDelivery, PostgresCdcScanError> {
+    let bytes = events
+        .iter()
+        .map(|(_, event)| serde_json::to_vec(event).unwrap())
+        .collect::<Vec<_>>();
+    convert_capture_values(
+        columns,
+        schema::compile(columns)?,
+        "source",
+        "public",
+        "events",
+        events
+            .iter()
+            .zip(&bytes)
+            .map(|((topic, _), bytes)| (Some(*topic), Some(bytes.as_slice()))),
+        progress,
     )
 }
 
@@ -419,6 +463,128 @@ fn postgres_cdc_streaming_accepts_the_bridges_null_snapshot_marker() {
 }
 
 #[test]
+fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_heartbeat_cutover() {
+    let columns = [column(PostgresType::Int64)];
+    let mut inserted_after_snapshot = envelope(&columns, "c", Value::Null, json!({"value":3}));
+    inserted_after_snapshot["payload"]["source"]["snapshot"] = Value::Null;
+    let first = capture(
+        &columns,
+        &[
+            (
+                "source.public.events",
+                snapshot(&columns, "true", json!({"value":1})),
+            ),
+            (
+                "source.public.events",
+                snapshot(&columns, "last", json!({"value":2})),
+            ),
+            ("source.public.events", inserted_after_snapshot),
+        ],
+        CaptureProgress::default(),
+    )
+    .unwrap();
+    assert!(!first.sealed);
+    let first_change = first.change.unwrap();
+    assert_eq!(first_change.diffs().values(), &[1, 1, 1]);
+    assert_eq!(
+        first_change
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[1, 2, 3]
+    );
+
+    let update = envelope(&columns, "u", json!({"value":3}), json!({"value":4}));
+    let delete = envelope(&columns, "d", json!({"value":4}), Value::Null);
+    let second = capture(
+        &columns,
+        &[
+            ("source.public.events", update),
+            ("__debezium-heartbeat.source", heartbeat()),
+            ("source.public.events", delete),
+        ],
+        first.next_progress,
+    )
+    .unwrap();
+    assert!(second.sealed);
+    let second_change = second.change.unwrap();
+    assert_eq!(second_change.diffs().values(), &[-1, 1, -1]);
+    assert_eq!(
+        second_change
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[3, 4, 4]
+    );
+}
+
+#[test]
+fn postgres_cdc_capture_uses_the_first_heartbeat_for_an_empty_snapshot() {
+    let columns = [column(PostgresType::Int64)];
+    let captured = capture(
+        &columns,
+        &[
+            ("__debezium-heartbeat.source", heartbeat()),
+            (
+                "source.public.events",
+                envelope(&columns, "c", Value::Null, json!({"value":1})),
+            ),
+        ],
+        CaptureProgress::default(),
+    )
+    .unwrap();
+    assert!(captured.sealed);
+    let change = captured.change.unwrap();
+    assert_eq!(change.diffs().values(), &[1]);
+}
+
+#[test]
+fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
+    let columns = [column(PostgresType::Int64)];
+    let incomplete = capture(
+        &columns,
+        &[
+            (
+                "source.public.events",
+                snapshot(&columns, "true", json!({"value":1})),
+            ),
+            ("__debezium-heartbeat.source", heartbeat()),
+        ],
+        CaptureProgress::default(),
+    );
+    assert!(incomplete.is_err());
+
+    let reopened = capture(
+        &columns,
+        &[
+            ("__debezium-heartbeat.source", heartbeat()),
+            (
+                "source.public.events",
+                snapshot(&columns, "last", json!({"value":1})),
+            ),
+        ],
+        CaptureProgress::default(),
+    );
+    assert!(reopened.is_err());
+
+    let streaming_before_last = capture(
+        &columns,
+        &[(
+            "source.public.events",
+            envelope(&columns, "c", Value::Null, json!({"value":1})),
+        )],
+        CaptureProgress::default(),
+    );
+    assert!(streaming_before_last.is_err());
+}
+
+#[test]
 fn postgres_cdc_conversion_accepts_only_identified_control_records() {
     let columns = [column(PostgresType::Int64)];
     let heartbeat = serde_json::to_vec(&json!({"schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},"payload":{"ts_ms":123}})).unwrap();
@@ -432,11 +598,7 @@ fn postgres_cdc_conversion_accepts_only_identified_control_records() {
             [(topic, value)],
         )
     };
-    assert!(
-        convert_control(Some("source.public.events"), None)
-            .unwrap()
-            .is_none()
-    );
+    assert!(convert_control(Some("source.public.events"), None).is_err());
     assert!(
         convert_control(
             Some("__debezium-heartbeat.source"),

@@ -35,7 +35,8 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
             schema => 'public',
             table => 'orders',
             slot => 'orders_slot',
-            publication => 'orders_publication'
+            publication => 'orders_publication',
+            bootstrap_spool_bytes => 1073741824
         ) AS orders
     ";
     SqlProgram::parse(postgres).unwrap();
@@ -52,7 +53,8 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
             user => 'dogpaddle',
             password => env('DOGPADDLE_SQL_TEST_PASSWORD'),
             replication_client_id => 5401,
-            table => 'orders'
+            table => 'orders',
+            bootstrap_spool_bytes => 1073741824
         ) AS orders
     ";
     SqlProgram::parse(mysql).unwrap();
@@ -111,7 +113,26 @@ fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
                 engine_name => 'orders_mysql_scan', \
                 runtime_bundle => '/opt/dogpaddle/debezium', host => '127.0.0.1', \
                 port => 3306, database => 'app', user => 'dogpaddle', password => 'secret', \
-                replication_client_id => 4294967296, table => 'orders'\
+                replication_client_id => 4294967296, table => 'orders', \
+                bootstrap_spool_bytes => 1073741824\
+            )",
+        ),
+        (
+            "missing PostgreSQL bootstrap spool capacity",
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                engine_name => 'orders_scan', runtime_bundle => '/opt/dogpaddle/debezium', \
+                host => '127.0.0.1', port => 5432, database => 'app', \
+                user => 'dogpaddle', password => 'secret', schema => 'public', \
+                table => 'orders', slot => 'orders_slot', publication => 'orders_publication'\
+            )",
+        ),
+        (
+            "missing MySQL bootstrap spool capacity",
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                engine_name => 'orders_mysql_scan', runtime_bundle => '/opt/dogpaddle/debezium', \
+                host => '127.0.0.1', port => 3306, database => 'app', \
+                user => 'dogpaddle', password => 'secret', replication_client_id => 5401, \
+                table => 'orders'\
             )",
         ),
         (
@@ -129,6 +150,33 @@ fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
 
     for (case, sql) in cases {
         assert!(SqlProgram::parse(sql).is_err(), "accepted {case}");
+    }
+}
+
+#[test]
+fn build_rejects_zero_bootstrap_spool_capacity_before_source_io() {
+    let root = tempfile::tempdir().unwrap();
+    let programs = [
+        "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+            engine_name => 'orders_scan', runtime_bundle => '/nonexistent/runtime', \
+            host => '127.0.0.1', port => 5432, database => 'app', user => 'dogpaddle', \
+            password => 'secret', schema => 'public', table => 'orders', \
+            slot => 'orders_slot', publication => 'orders_publication', \
+            bootstrap_spool_bytes => 0\
+        )",
+        "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+            engine_name => 'orders_scan', runtime_bundle => '/nonexistent/runtime', \
+            host => '127.0.0.1', port => 3306, database => 'app', user => 'dogpaddle', \
+            password => 'secret', replication_client_id => 5401, table => 'orders', \
+            bootstrap_spool_bytes => 0\
+        )",
+    ];
+
+    for (index, sql) in programs.iter().enumerate() {
+        let flow_path = root.path().join(format!("flow-{index}"));
+        let program = SqlProgram::parse(sql).unwrap();
+        assert!(program.build(&flow_path).is_err());
+        assert!(!flow_path.exists());
     }
 }
 
@@ -459,7 +507,8 @@ fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
                 runtime_bundle => '/tmp/dogpaddle-runtime', \
                 host => '127.0.0.1', port => 5432, database => 'app', \
                 user => 'dogpaddle', password => 'secret', schema => 'public', \
-                table => 'events', slot => 'events_slot', publication => 'events_pub'\
+                table => 'events', slot => 'events_slot', publication => 'events_pub', \
+                bootstrap_spool_bytes => 1073741824\
             )"
         ),
         format!(
@@ -468,7 +517,8 @@ fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
                 runtime_bundle => '/tmp/dogpaddle-runtime', \
                 host => '127.0.0.1', port => 3306, database => 'app', \
                 user => 'dogpaddle', password => 'secret', \
-                replication_client_id => 5401, table => 'events'\
+                replication_client_id => 5401, table => 'events', \
+                bootstrap_spool_bytes => 1073741824\
             )"
         ),
         format!(

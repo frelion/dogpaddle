@@ -28,6 +28,7 @@ use dogpaddle_store::{AppendLog, Cell, ScanLimit, Store, Transactions};
 use serde_json::{Value, json};
 
 const SCAN_CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
+const SCAN_PHASE: &str = "postgres_cdc_scan.phase";
 
 struct Options {
     mode: String,
@@ -68,13 +69,16 @@ impl Options {
     }
 
     fn definition(&self) -> Result<PostgresCdcScanDefinition, OperationError> {
-        Ok(PostgresCdcScanDefinition::try_new(self.config.discover(
-            &format!("dogpaddle_gate_{}", self.table),
-            "public",
-            &self.table,
-            &self.slot,
-            &self.publication,
-        )?)?)
+        Ok(PostgresCdcScanDefinition::try_new(
+            self.config.discover(
+                &format!("dogpaddle_gate_{}", self.table),
+                "public",
+                &self.table,
+                &self.slot,
+                &self.publication,
+            )?,
+            NonZeroU64::new(1024 * 1024 * 1024).unwrap(),
+        )?)
     }
 }
 
@@ -122,9 +126,15 @@ impl Runner {
                 Ok(json!({"kind": "advance", "outcome": format!("{:?}", flow.advance()?)}))
             }
             (Self::Direct(scan), "read") => scan.read(),
-            (Self::Direct(scan), "advance" | "rollback" | "crash-before-ack" | "backpressure") => {
-                scan.advance(command)
-            }
+            (
+                Self::Direct(scan),
+                "advance"
+                | "rollback"
+                | "crash-before-ack"
+                | "crash-partial-capture"
+                | "crash-terminal-capture"
+                | "backpressure",
+            ) => scan.advance(command),
             _ => Err("unsupported gate command".into()),
         }
     }
@@ -173,6 +183,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
 
 struct DirectScan {
     scan: Box<dyn Operation>,
+    phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     output: AppendLog<Vec<u8>>,
     transactions: Transactions,
@@ -202,6 +213,7 @@ impl DirectScan {
         }
         Ok(Self {
             scan: binding.materialize(data, RuntimeResource::new(options.config))?,
+            phase: store.open_data(SCAN_PHASE)?,
             checkpoint: store.open_data(SCAN_CHECKPOINT)?,
             output: store.open_data("output")?,
             transactions: store.into_transactions(),
@@ -234,11 +246,10 @@ impl DirectScan {
         let before_bounds = self.output.access(transaction.access())?.bounds()?;
         let before_bytes = self.output.access(transaction.access())?.retained_bytes()?;
         let (action, completion) = prepared.apply(transaction.access())?;
-        let checkpoint_present = self
-            .checkpoint
-            .access(transaction.access())?
-            .get()?
-            .is_some();
+        let after = self.checkpoint.access(transaction.access())?.get()?;
+        let checkpoint_present = after.is_some();
+        let checkpoint_changed = before != after;
+        let phase = self.phase.access(transaction.access())?.get()?;
         let mut backpressured = false;
         let has_output = match &action {
             Action::Idle => return Ok(json!({"kind": "idle"})),
@@ -279,8 +290,26 @@ impl DirectScan {
             }));
         }
         transaction.commit()?;
+        let capture_crash = match command {
+            "crash-partial-capture" => !has_output && checkpoint_changed && phase == Some(1),
+            "crash-terminal-capture" => !has_output && checkpoint_changed && phase == Some(2),
+            _ => false,
+        };
+        if capture_crash {
+            respond(&json!({
+                "kind": if phase == Some(1) {
+                    "durable-partial-capture"
+                } else {
+                    "durable-terminal-capture"
+                },
+                "checkpoint_present": checkpoint_present,
+                "commits": 1,
+            }))?;
+            process::exit(if phase == Some(1) { 75 } else { 76 });
+        }
         if command == "crash-before-ack" && has_output {
-            // Terminate a real process: neither Delivery nor connector is dropped.
+            // Terminate before post-commit completion. During streaming this
+            // also leaves the real Delivery unacknowledged.
             respond(&json!({
                 "kind": "durable-before-ack", "output": true,
                 "checkpoint_present": checkpoint_present, "commits": 1,

@@ -13,7 +13,8 @@ WITH raw_orders AS (
         engine_name => 'orders', runtime_bundle => env('DOGPADDLE_FULFILLMENT_BUNDLE'),
         host => '127.0.0.1', port => env('DOGPADDLE_FULFILLMENT_PORT'), database => 'postgres',
         user => env('DOGPADDLE_FULFILLMENT_USER'), password => env('DOGPADDLE_FULFILLMENT_PASSWORD'),
-        schema => 'sales', table => 'orders', slot => 'orders_slot', publication => 'orders_publication'
+        schema => 'sales', table => 'orders', slot => 'orders_slot', publication => 'orders_publication',
+        bootstrap_spool_bytes => 1073741824
     )
 ),
 priced AS (

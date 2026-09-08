@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{
     MySqlCdcScanError, MySqlColumn, MySqlType,
-    convert::{BootstrapControl, convert_values, validate_bootstrap_value},
+    convert::{convert_snapshot_values, convert_values},
     schema,
 };
 
@@ -67,18 +67,37 @@ fn convert(columns: &[MySqlColumn], events: &[Value]) -> Result<Option<Change>, 
     )
 }
 
-fn schema_snapshot(marker: &Value) -> Value {
+fn heartbeat() -> Value {
     json!({
-        "schema":{"type":"struct","name":"io.debezium.connector.mysql.SchemaChangeValue"},
-        "payload":{
-            "source":{"connector":"mysql","name":"source","db":"shop","table":"events","snapshot":marker},
-            "ts_ms":123,
-            "databaseName":"shop",
-            "schemaName":null,
-            "ddl":null,
-            "tableChanges":[],
-        },
+        "schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},
+        "payload":{"ts_ms":123},
     })
+}
+
+fn snapshot(
+    columns: &[MySqlColumn],
+    events: &[Value],
+) -> Result<super::convert::SnapshotDelivery, MySqlCdcScanError> {
+    let bytes = events
+        .iter()
+        .map(|event| serde_json::to_vec(event).unwrap())
+        .collect::<Vec<_>>();
+    convert_snapshot_values(
+        columns,
+        schema::compile(columns)?,
+        "source",
+        "shop",
+        "events",
+        bytes.iter().enumerate().map(|(index, bytes)| {
+            let topic =
+                if events[index]["schema"]["name"] == "io.debezium.connector.common.Heartbeat" {
+                    "__debezium-heartbeat.source"
+                } else {
+                    "source.shop.events"
+                };
+            (Some(topic), Some(bytes.as_slice()))
+        }),
+    )
 }
 
 #[test]
@@ -267,11 +286,7 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
     event["schema"]["fields"][0]["fields"][0]["parameters"]["scale"] = json!("3");
     assert!(convert(&columns, &[event]).is_err());
 
-    let heartbeat = serde_json::to_vec(&json!({
-        "schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},
-        "payload":{"ts_ms":123},
-    }))
-    .unwrap();
+    let heartbeat = serde_json::to_vec(&heartbeat()).unwrap();
     assert!(
         convert_values(
             &columns,
@@ -290,44 +305,28 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
 }
 
 #[test]
-fn mysql_cdc_bootstrap_accepts_only_one_snapshot_schema_control() {
-    for (marker, expected) in [
-        (json!("true"), BootstrapControl::Continuing),
-        (json!("last"), BootstrapControl::Complete),
-    ] {
-        let event = serde_json::to_vec(&schema_snapshot(&marker)).unwrap();
-        assert_eq!(
-            validate_bootstrap_value(Some("source"), Some(event.as_slice()), "source").unwrap(),
-            expected
-        );
-    }
-    for marker in [
-        Value::Null,
-        json!(true),
-        json!(false),
-        json!("false"),
-        json!("incremental"),
-    ] {
-        let event = serde_json::to_vec(&schema_snapshot(&marker)).unwrap();
-        assert!(
-            validate_bootstrap_value(Some("source"), Some(event.as_slice()), "source").is_err()
-        );
-    }
-    let mut wrong_source = schema_snapshot(&json!("last"));
-    wrong_source["payload"]["source"]["name"] = json!("other");
-    let wrong_source = serde_json::to_vec(&wrong_source).unwrap();
-    assert!(
-        validate_bootstrap_value(Some("source"), Some(wrong_source.as_slice()), "source").is_err()
-    );
-    let mut global = schema_snapshot(&json!("last"));
-    global["payload"]["source"]["db"] = json!("");
-    global["payload"]["source"]
-        .as_object_mut()
-        .unwrap()
-        .remove("table");
-    global["payload"]["databaseName"] = json!("");
-    let global = serde_json::to_vec(&global).unwrap();
-    assert!(validate_bootstrap_value(Some("source"), Some(global.as_slice()), "source").is_ok());
+fn mysql_cdc_snapshot_uses_a_terminal_last_heartbeat_and_supports_empty_tables() {
+    let columns = [column(MySqlType::Int64)];
+    let mut row = envelope(&columns, "r", Value::Null, json!({"value":7}));
+    row["payload"]["source"]["snapshot"] = json!("last");
+
+    let continuing = snapshot(&columns, std::slice::from_ref(&row)).unwrap();
+    assert!(!continuing.complete);
+    assert_eq!(continuing.change.unwrap().diffs().values(), &[1]);
+
+    let complete = snapshot(&columns, &[row.clone(), heartbeat()]).unwrap();
+    assert!(complete.complete);
+    assert_eq!(complete.change.unwrap().diffs().values(), &[1]);
+
+    let empty = snapshot(&columns, &[heartbeat()]).unwrap();
+    assert!(empty.complete);
+    assert!(empty.change.is_none());
+
+    assert!(snapshot(&columns, &[]).is_err());
+    assert!(snapshot(&columns, &[heartbeat(), row.clone()]).is_err());
+    assert!(snapshot(&columns, &[heartbeat(), heartbeat()]).is_err());
+    row["payload"]["source"]["snapshot"] = json!("false");
+    assert!(snapshot(&columns, &[row]).is_err());
 }
 
 #[test]

@@ -25,18 +25,21 @@ fn config() -> PostgresCdcScanConfig {
 }
 
 fn factory(path: &Path, field: &str) -> FlowFactory {
-    let definition = PostgresCdcScanDefinition::try_new(PostgresCdcScanSpec {
-        engine_name: "orders".into(),
-        database: "shop".into(),
-        schema: "public".into(),
-        table: "orders".into(),
-        slot: "orders_slot".into(),
-        publication: "orders_pub".into(),
-        system_identifier: "123".into(),
-        database_oid: 42,
-        table_oid: 43,
-        columns: vec![PostgresColumn::new(field, PostgresType::Int64, false)],
-    })
+    let definition = PostgresCdcScanDefinition::try_new(
+        PostgresCdcScanSpec {
+            engine_name: "orders".into(),
+            database: "shop".into(),
+            schema: "public".into(),
+            table: "orders".into(),
+            slot: "orders_slot".into(),
+            publication: "orders_pub".into(),
+            system_identifier: "123".into(),
+            database_oid: 42,
+            table_oid: 43,
+            columns: vec![PostgresColumn::new(field, PostgresType::Int64, false)],
+        },
+        NonZeroU64::new(1024 * 1024).unwrap(),
+    )
     .unwrap();
     let mut factory = FlowFactory::new(path);
     let scan = factory.station("pg", definition);
@@ -123,8 +126,14 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     drop(flow);
     let store = dogpaddle_store::Store::open(&path).unwrap();
     let definition: dogpaddle_store::Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
-    let state: dogpaddle_store::Cell<Vec<u8>> = store
+    let phase: dogpaddle_store::Cell<u32> = store
+        .open_data("station/00000000/operation/postgres_cdc_scan.phase")
+        .unwrap();
+    let checkpoint: dogpaddle_store::Cell<Vec<u8>> = store
         .open_data("station/00000000/operation/postgres_cdc_scan.checkpoint")
+        .unwrap();
+    let spool: dogpaddle_store::AppendLog<Vec<u8>> = store
+        .open_data("station/00000000/operation/postgres_cdc_scan.bootstrap_spool")
         .unwrap();
     let transaction = store.read_transaction().unwrap();
     let bytes = definition
@@ -139,12 +148,28 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
             .any(|window| window == b"secret-not-durable")
     );
     assert!(
-        state
+        phase
             .read(transaction.access())
             .unwrap()
             .get()
             .unwrap()
             .is_none()
+    );
+    assert!(
+        checkpoint
+            .read(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        spool
+            .read(transaction.access())
+            .unwrap()
+            .bounds()
+            .unwrap()
+            .is_empty()
     );
 }
 

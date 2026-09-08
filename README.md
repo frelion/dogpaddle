@@ -148,17 +148,17 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
   只接受非浮点的扁平 DogPaddle scalar。`COUNT(*)` 和 `COUNT(expression)` 均可使用。
 - **去重采用精确记录身份。** `SELECT DISTINCT` 比较完整 canonical 记录；浮点值按
   原始位模式区分，因此 `-0.0` 与 `+0.0` 不会像常见 SQL / `DataFusion` 分组那样合并。
-- **PostgreSQL 只处理接入后的变化。** 试点要求空源表和匹配的新 replication slot，
-  预先配置 publication 和 FULL replica identity；没有已有数据的初始快照。目前不支持 TLS、
-  DNS 地址、多表路由或运行中改表。详见 [外部端点文档](crates/operation/README.md)。
-- **MySQL 也只处理内部 binlog 起点之后的变化，不是初始镜像。** 构建会在发布 Flow 前一次性完成
-  schema bootstrap，并把不可变 binlog 起点 `P` 随 Definition 发布；成功构建后，`P` 才是该源唯一的
-  起点。这样消除了 `P` 到首次运行时 ACK 的意外窗口：严格晚于 `P`、但早于实际运行的写入会从保留的
-  binlog 恢复。它不能把调用 `build` 的时刻变成原子切点；`P` 之前（包括 bootstrap 已开始、但 Debezium
-  尚未取到 `P` 时）的状态和变化都不在 v1 合同内。v1 不读取已有表数据，也不建立自动写入栅栏；因此它
-  不支持把运行中的表接到新空 sink 后得到完整镜像。唯一完整空表部署顺序是让源表保持为空，成功构建后再
-  允许第一次写入；已运行的表或写入者需要未来的 snapshot source。它要求固定 Schema 和足够的 binlog
-  保留，不支持运行中 DDL、TLS 或未列出的源类型。详见 [外部端点文档](crates/operation/README.md)。
+- **PostgreSQL 会先复制已有数据，再持续处理 WAL 变化。** 试点要求预先配置 publication、
+  `REPLICA IDENTITY FULL` 和一个首次启动前必须不存在、之后由该 Scan 独占的 slot 名。初始快照在私有持久
+  spool 中完整封口后才对下游发布，因而无需要求源表为空或先停写。需要显式配置能容纳完整快照及
+  快照封口前 WAL 重叠的 `bootstrap_spool_bytes`。目前仍不支持 TLS、DNS 地址、多表路由或运行中改表。
+  详见 [外部端点文档](crates/operation/README.md)。
+- **MySQL 会先复制已有数据，再从同一快照切点继续 binlog CDC。** MySQL 8.4 试点使用
+  `initial_only` 和 `minimal` locking 取得一致快照，封口后从 terminal heartbeat 的 checkpoint 以
+  `recovery` 继续。快照也会先写入受 `bootstrap_spool_bytes` 限制的私有持久 spool，完整后再逐批发布。
+  binlog 必须覆盖初始快照、私有 spool 排空、公开 output 背压和追平的全部时间；过早 `PURGE`
+  会以错误终止，不会悄悄跳过数据。要求固定 Schema，不支持运行中 DDL、TLS 或未列出的源类型。
+  详见 [外部端点文档](crates/operation/README.md)。
 - **结果表由 DogPaddle 独占。** SQLite / PostgreSQL 输出必须使用新目标表，不能接管已有表或
   与业务代码共同写入。PostgreSQL 结果表不复制源表结构，文本当前按 bytes 保存。
 - **恢复沿用原来的处理规则。** 修改 SQL 后请使用新进度目录和新目标表；`open` 不会更新已有流程。
