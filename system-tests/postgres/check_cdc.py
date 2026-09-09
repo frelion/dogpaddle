@@ -228,7 +228,7 @@ class Fixture:
                 try:
                     host.request("advance")
                 except RuntimeError as error:
-                    if "expected a streaming insert, update, or delete" in str(error):
+                    if "record operation or snapshot marker is invalid for the current CDC phase" in str(error):
                         return True
                     raise
                 return False

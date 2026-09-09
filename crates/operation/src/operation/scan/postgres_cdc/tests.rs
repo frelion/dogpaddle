@@ -418,7 +418,7 @@ fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
 #[test]
 fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
     let columns = [column(PostgresType::Int64)];
-    for operation in ["r", "t", "m", "unknown"] {
+    for operation in ["r", "m", "unknown"] {
         assert!(
             convert(
                 &columns,
@@ -432,6 +432,15 @@ fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
             .is_err()
         );
     }
+    assert_eq!(
+        convert(
+            &columns,
+            &[envelope(&columns, "t", Value::Null, Value::Null)]
+        )
+        .unwrap_err()
+        .to_string(),
+        "invalid PostgreSQL CDC scan record: record operation or snapshot marker is invalid for the current CDC phase"
+    );
     for property in ["schema", "table", "connector", "snapshot"] {
         let mut event = envelope(&columns, "c", Value::Null, json!({"value":1}));
         event["payload"]["source"][property] = json!("wrong");
