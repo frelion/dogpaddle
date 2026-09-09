@@ -119,7 +119,7 @@ fn parse_schema(embedded: IpcSchema<'_>) -> Result<Schema, CodecError> {
         .iter()
         .map(|field| parse_field(field, 0))
         .collect::<Result<Vec<_>, _>>()?;
-    let metadata = parse_metadata(embedded.custom_metadata());
+    let metadata = parse_metadata(embedded.custom_metadata(), "Arrow Schema")?;
     Ok(Schema::new_with_metadata(fields, metadata))
 }
 
@@ -177,8 +177,12 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
         }
     };
 
-    Ok(Field::new(name, data_type, field.nullable())
-        .with_metadata(parse_metadata(field.custom_metadata())))
+    Ok(
+        Field::new(name, data_type, field.nullable()).with_metadata(parse_metadata(
+            field.custom_metadata(),
+            &format!("Arrow field {name:?}"),
+        )?),
+    )
 }
 
 fn parse_date_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
@@ -305,16 +309,28 @@ fn parse_metadata<'a>(
     metadata: Option<
         flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<arrow_ipc::KeyValue<'a>>>,
     >,
-) -> HashMap<String, String> {
+    owner: &str,
+) -> Result<HashMap<String, String>, CodecError> {
     let mut parsed = HashMap::new();
+    let mut previous: Option<&str> = None;
     if let Some(metadata) = metadata {
         for pair in metadata {
-            if let (Some(key), Some(value)) = (pair.key(), pair.value()) {
-                parsed.insert(key.to_owned(), value.to_owned());
+            let key = pair
+                .key()
+                .ok_or_else(|| CodecError::invalid(format!("{owner} metadata has no key")))?;
+            let value = pair.value().ok_or_else(|| {
+                CodecError::invalid(format!("{owner} metadata key {key:?} has no value"))
+            })?;
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(CodecError::invalid(format!(
+                    "{owner} metadata keys must be unique and strictly increasing"
+                )));
             }
+            parsed.insert(key.to_owned(), value.to_owned());
+            previous = Some(key);
         }
     }
-    parsed
+    Ok(parsed)
 }
 
 struct ParsedMessage<'encoded> {

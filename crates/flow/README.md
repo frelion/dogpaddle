@@ -309,8 +309,9 @@ DAG 分量仍获得本轮 turn。fan-out 共享一份 output log 和 capacity，
 `u64::MAX` 后稳定返回 `Action::Idle`，因此即使进程在最终 scan commit 后退出，重开后的 schedule 仍会
 继续通过 consumers 排空已提交 output。
 
-Store 目录和 catalog 已有效、但 manifest 尚未提交时，`FlowFactory::new(path).open()` 返回
-`IncompleteBuild`；
+Store 目录已有有效 marker、但原子 setup 尚未提交时，
+`FlowFactory::new(path).open()` 返回 `IncompleteBuild`；Flow build 在一个同步事务中同时发布
+完整 catalog、全部 collection 初始状态和 manifest，因此不会暴露只有部分资源的 catalog。
 manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果底层 `Store::create()` 本身只
 留下无效目录，则打开时保留相应 Store 错误，不把它误报成有效 Flow 的未完成构建。
 

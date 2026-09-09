@@ -170,7 +170,9 @@ polling or fails, while poll, ACK and stop have explicit deadlines. Java
 exceptions carry ordinary failures; the narrow `failureKind(handle)` query only
 distinguishes an oversized delivery after a failed poll. There is no status
 JSON protocol. The development-v1 delivery wire (`DPDBDV01`, version `1`)
-contains only the checkpoint and ordered records; linear Rust borrowing supplies
+contains only the checkpoint and ordered records. Connector-specific consumers
+can recognize Debezium notification records without extending the connector-neutral
+bridge API. Linear Rust borrowing supplies
 the outstanding capability. This layout replaces the earlier unshipped v1
 bytes without compatibility or migration; rebuild old development bundles and
 discard saved test fixtures.

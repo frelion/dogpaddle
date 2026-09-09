@@ -39,6 +39,19 @@ pub(super) fn decode(
     change_from_physical(physical, logical_schema)
 }
 
+pub(super) fn decode_owned(
+    encoded: &ArrowBuffer,
+    parsed: &ParsedChange<'_>,
+) -> Result<Change, CodecError> {
+    BatchLayout::parse(parsed)?;
+    let body_offset = (parsed.body.as_ptr() as usize)
+        .checked_sub(encoded.as_ptr() as usize)
+        .ok_or_else(|| CodecError::invalid("IPC body precedes its owned allocation"))?;
+    let body = encoded.slice_with_length(body_offset, parsed.body.len());
+    let physical = decode_record_batch(&body, parsed.batch, Arc::clone(&parsed.physical_schema))?;
+    change_from_physical(physical, Arc::clone(&parsed.logical_schema))
+}
+
 fn decode_complete(
     body: &[u8],
     batch: IpcRecordBatch<'_>,

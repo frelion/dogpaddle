@@ -322,6 +322,7 @@ impl MySqlCdcScanConfig {
             ConnectorMode::Snapshot => "1",
             ConnectorMode::Recovery => "1000",
         };
+        let notification_topic = format!("__dogpaddle-notification.{}", spec.engine_name);
         // Definition identifiers are restricted to lowercase ASCII and '_'.
         let include = format!("^{}\\.{}$", spec.database, spec.table);
         for (key, value) in [
@@ -371,6 +372,16 @@ impl MySqlCdcScanConfig {
             config = config.property(key, value).map_err(|_| {
                 MySqlCdcScanError::new("invalid fixed MySQL connector configuration")
             })?;
+        }
+        if matches!(mode, ConnectorMode::Snapshot) {
+            for (key, value) in [
+                ("notification.enabled.channels", "sink"),
+                ("notification.sink.topic.name", notification_topic.as_str()),
+            ] {
+                config = config.property(key, value).map_err(|_| {
+                    MySqlCdcScanError::new("invalid fixed MySQL connector configuration")
+                })?;
+            }
         }
         Ok(config)
     }

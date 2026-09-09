@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{decode_change, encode_change};
+use dogpaddle_change::{decode_change_owned, encode_change};
 use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
 
@@ -11,7 +11,7 @@ use crate::operation::{
 
 use super::{
     MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanSpec,
-    convert::{convert_records, convert_snapshot_records},
+    convert::{SnapshotProgress, convert_records, convert_snapshot_records},
 };
 
 const CAPTURING: u32 = 1;
@@ -60,6 +60,7 @@ pub struct MySqlCdcScanOperation {
     connector: Option<Connector>,
     snapshot_failed: bool,
     restart_connector: bool,
+    snapshot_progress: SnapshotProgress,
 }
 
 impl MySqlCdcScanOperation {
@@ -85,6 +86,7 @@ impl MySqlCdcScanOperation {
             connector: None,
             snapshot_failed: false,
             restart_connector: false,
+            snapshot_progress: SnapshotProgress::default(),
         }
     }
 
@@ -160,6 +162,7 @@ impl MySqlCdcScanOperation {
                 Action::Commit(None),
                 AfterCommit::new(move || {
                     self.phase = Some(Phase::Capturing);
+                    self.snapshot_progress = SnapshotProgress::default();
                     Ok(())
                 }),
             ))
@@ -174,6 +177,7 @@ impl MySqlCdcScanOperation {
                 AfterCommit::new(move || {
                     self.phase = Some(Phase::Resetting);
                     self.snapshot_failed = false;
+                    self.snapshot_progress = SnapshotProgress::default();
                     Ok(())
                 }),
             ))
@@ -234,6 +238,7 @@ impl MySqlCdcScanOperation {
             &self.spec.database,
             &self.spec.table,
             delivery.records(),
+            self.snapshot_progress,
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -249,6 +254,7 @@ impl MySqlCdcScanOperation {
             }
         };
         let complete = snapshot.complete;
+        let next_progress = snapshot.next_progress;
         let durable_checkpoint = delivery.checkpoint().as_bytes().to_vec();
         let resumed_checkpoint = delivery.checkpoint().clone();
         let spool = &self.bootstrap_spool;
@@ -257,6 +263,7 @@ impl MySqlCdcScanOperation {
         let phase_cell = &self.phase_cell;
         let phase = &mut self.phase;
         let resume = &mut self.resume;
+        let progress = &mut self.snapshot_progress;
         Ok(Turn::ready(move |access| {
             if let Some(encoded) = encoded_change {
                 let mut spool = spool.access(access)?;
@@ -280,6 +287,8 @@ impl MySqlCdcScanOperation {
                     *resume = Some(resumed_checkpoint);
                     if complete {
                         *phase = Some(Phase::Publishing);
+                    } else {
+                        *progress = next_progress;
                     }
                     Ok(())
                 }),
@@ -302,7 +311,7 @@ impl MySqlCdcScanOperation {
                 ));
             };
 
-            let change = decode_change(&encoded).map_err(|_| {
+            let change = decode_change_owned(encoded).map_err(|_| {
                 MySqlCdcScanError::InvalidState("bootstrap spool Change is invalid")
             })?;
             if change.records().schema().as_ref() != self.output_schema.as_ref() {

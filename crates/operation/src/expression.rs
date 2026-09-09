@@ -9,7 +9,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
-use datafusion_common::{DFSchema, DataFusionError};
+use datafusion_common::{
+    DFSchema, DataFusionError,
+    tree_node::{TreeNode, TreeNodeRecursion},
+};
 use datafusion_expr::{
     ExprSchemable, execution_props::ExecutionProps,
     physical_planning_context::PhysicalPlanningContext,
@@ -78,6 +81,9 @@ pub(crate) struct BoundExpression {
 
 impl StoredExpression {
     pub(crate) fn try_new(expression: Expr) -> Result<Self, ExpressionDefinitionError> {
+        if has_nondeterministic_protobuf_map(&expression) {
+            return Err(ExpressionDefinitionError::NonCanonical);
+        }
         let protobuf = expression.to_bytes()?;
         if u32::try_from(protobuf.len()).is_err() {
             return Err(ExpressionDefinitionError::TooLarge);
@@ -87,7 +93,6 @@ impl StoredExpression {
         if decoded != expression {
             return Err(ExpressionDefinitionError::NonRoundTrip);
         }
-
         let canonical = decoded.to_bytes()?;
         if canonical != protobuf {
             return Err(ExpressionDefinitionError::NonCanonical);
@@ -118,6 +123,11 @@ impl StoredExpression {
         let expression = Expr::from_bytes(protobuf).map_err(|_| {
             DefinitionCodecError::InvalidPayload("DataFusion expression protobuf is invalid")
         })?;
+        if has_nondeterministic_protobuf_map(&expression) {
+            return Err(DefinitionCodecError::InvalidPayload(
+                "DataFusion expression protobuf contains non-canonical map metadata",
+            ));
+        }
         let canonical = expression.to_bytes().map_err(|_| {
             DefinitionCodecError::InvalidPayload("DataFusion expression cannot be re-encoded")
         })?;
@@ -160,6 +170,78 @@ impl StoredExpression {
             output_nullable,
             output_metadata,
         })
+    }
+}
+
+// prost encodes `HashMap` fields in per-process hash iteration order. DataFusion
+// uses those fields for expression Field metadata and for nested Arrow Fields.
+// Keeping map-bearing expressions out of v1 preserves byte-stable Definition
+// encoding without adding a second expression format or partially reimplementing
+// DataFusion's protobuf schema.
+fn has_nondeterministic_protobuf_map(expression: &Expr) -> bool {
+    let mut found = false;
+    let _ = expression.apply(|expression| {
+        found = match expression {
+            Expr::Alias(alias) => alias
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_empty()),
+            Expr::ScalarVariable(field, _) | Expr::OuterReferenceColumn(field, _) => {
+                field_has_metadata(field)
+            }
+            Expr::Literal(value, metadata) => {
+                metadata
+                    .as_ref()
+                    .is_some_and(|metadata| !metadata.is_empty())
+                    || data_type_has_metadata(&value.data_type())
+            }
+            Expr::Cast(cast) => field_has_metadata(&cast.field),
+            Expr::TryCast(cast) => field_has_metadata(&cast.field),
+            Expr::Placeholder(placeholder) => {
+                placeholder.field.as_ref().is_some_and(field_has_metadata)
+            }
+            Expr::LambdaVariable(variable) => {
+                variable.field.as_ref().is_some_and(field_has_metadata)
+            }
+            // These embed a LogicalPlan protobuf. Its schemas and provider
+            // options contain additional protobuf map fields outside the
+            // scalar-expression tree that DogPaddle binds.
+            Expr::Exists { .. }
+            | Expr::InSubquery(_)
+            | Expr::SetComparison(_)
+            | Expr::ScalarSubquery(_) => true,
+            _ => false,
+        };
+        Ok::<_, DataFusionError>(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    found
+}
+
+fn field_has_metadata(field: &arrow_schema::FieldRef) -> bool {
+    !field.metadata().is_empty() || data_type_has_metadata(field.data_type())
+}
+
+fn data_type_has_metadata(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::List(field)
+        | DataType::ListView(field)
+        | DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => field_has_metadata(field),
+        DataType::Struct(fields) => fields.iter().any(field_has_metadata),
+        DataType::Union(fields, _) => fields.iter().any(|(_, field)| field_has_metadata(field)),
+        DataType::Dictionary(key, value) => {
+            data_type_has_metadata(key) || data_type_has_metadata(value)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            field_has_metadata(run_ends) || field_has_metadata(values)
+        }
+        _ => false,
     }
 }
 

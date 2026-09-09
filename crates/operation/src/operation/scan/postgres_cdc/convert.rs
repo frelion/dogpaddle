@@ -140,10 +140,15 @@ fn convert_values_in_mode<'a>(
 ) -> Result<CapturedDelivery, PostgresCdcScanError> {
     let table_topic = format!("{topic_prefix}.{table_schema}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
+    let notification_topic = format!("__dogpaddle-notification.{topic_prefix}");
     let mut rows = Vec::new();
     let mut diffs = Vec::new();
     for (topic, bytes) in values {
-        if topic != Some(table_topic.as_str()) && topic != Some(heartbeat_topic.as_str()) {
+        let is_notification = topic == Some(notification_topic.as_str());
+        if topic != Some(table_topic.as_str())
+            && topic != Some(heartbeat_topic.as_str())
+            && !(is_notification && matches!(mode, ConversionMode::Capture { .. }))
+        {
             return Err(invalid("record has an unexpected topic"));
         }
         let Some(bytes) = bytes else {
@@ -152,19 +157,12 @@ fn convert_values_in_mode<'a>(
         let mut value: Value = serde_json::from_slice(bytes)
             .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
         let schema = object_field(&value, "schema")?;
+        if is_notification {
+            apply_snapshot_notification(object_field(&value, "payload")?, &mut mode)?;
+            continue;
+        }
         if topic == Some(heartbeat_topic.as_str()) {
             validate_heartbeat(schema, object_field(&value, "payload")?)?;
-            if let ConversionMode::Capture { progress, sealed } = &mut mode
-                && !*sealed
-            {
-                if progress.saw_snapshot_row && !progress.snapshot_complete {
-                    return Err(invalid(
-                        "snapshot heartbeat arrived before the last snapshot row",
-                    ));
-                }
-                progress.snapshot_complete = true;
-                *sealed = true;
-            }
             continue;
         }
         validate_envelope(columns, schema)?;
@@ -240,11 +238,48 @@ fn convert_values_in_mode<'a>(
     })
 }
 
+fn apply_snapshot_notification(
+    payload: &Row,
+    mode: &mut ConversionMode,
+) -> Result<(), PostgresCdcScanError> {
+    if !validate_snapshot_notification(payload)? {
+        return Ok(());
+    }
+    let ConversionMode::Capture { progress, sealed } = mode else {
+        unreachable!("streaming notifications were rejected before parsing");
+    };
+    if *sealed {
+        return Err(invalid("snapshot completion notification is duplicated"));
+    }
+    if progress.saw_snapshot_row && !progress.snapshot_complete {
+        return Err(invalid(
+            "snapshot completed before Debezium marked the last snapshot row",
+        ));
+    }
+    progress.snapshot_complete = true;
+    *sealed = true;
+    Ok(())
+}
+
 fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, PostgresCdcScanError> {
     value
         .get(field)
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("missing object field {field}")))
+}
+
+fn validate_snapshot_notification(payload: &Row) -> Result<bool, PostgresCdcScanError> {
+    if payload.get("aggregate_type").and_then(Value::as_str) != Some("Initial Snapshot") {
+        return Err(invalid("unexpected Debezium notification aggregate"));
+    }
+    match payload.get("type").and_then(Value::as_str) {
+        Some("STARTED" | "IN_PROGRESS" | "TABLE_SCAN_COMPLETED") => Ok(false),
+        Some("COMPLETED") => Ok(true),
+        Some("ABORTED" | "SKIPPED") => Err(invalid(
+            "Debezium initial snapshot did not complete successfully",
+        )),
+        _ => Err(invalid("unexpected Debezium initial snapshot notification")),
+    }
 }
 
 fn validate_metadata(
@@ -441,17 +476,14 @@ fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, Postg
             rows,
             parse_float64,
         )?)),
-        PostgresType::Text => {
-            let values = column_values(column, rows, |value| {
-                let text = value.as_str()?;
-                (text != "__debezium_unavailable_value").then_some(text)
-            })?;
-            Arc::new(StringArray::from(values))
-        }
+        PostgresType::Text => Arc::new(StringArray::from(column_values(
+            column,
+            rows,
+            Value::as_str,
+        )?)),
         PostgresType::Bytea => {
             let values = column_values(column, rows, |value| {
-                let bytes = BASE64_STANDARD.decode(value.as_str()?).ok()?;
-                (bytes != b"__debezium_unavailable_value").then_some(bytes)
+                BASE64_STANDARD.decode(value.as_str()?).ok()
             })?;
             Arc::new(values.iter().map(Option::as_deref).collect::<BinaryArray>())
         }

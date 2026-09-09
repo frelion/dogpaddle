@@ -142,6 +142,52 @@ fn catalog_reopens_named_collections_with_isolated_data() {
 }
 
 #[test]
+fn staged_setup_publishes_catalog_and_initial_data_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let failed_path = root.path().join("failed");
+    let mut setup = Store::setup(&failed_path).unwrap();
+    let value = setup.create_data::<Cell<u64>>("value").unwrap();
+    assert!(matches!(
+        setup.commit(|access| {
+            value.access(access)?.set(&42)?;
+            Err(StoreError::InvalidScanLimit)
+        }),
+        Err(StoreError::InvalidScanLimit)
+    ));
+
+    let mut store = Store::open(&failed_path).unwrap();
+    assert!(matches!(
+        store.open_data::<Cell<u64>>("value"),
+        Err(StoreError::DataNotFound(name)) if name == "value"
+    ));
+    let value = store.create_data::<Cell<u64>>("value").unwrap();
+    let transactions = store.into_transactions();
+    let (_, reads) = transactions.split();
+    let transaction = reads.begin();
+    assert_eq!(
+        value.read(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
+
+    let complete_path = root.path().join("complete");
+    let mut setup = Store::setup(&complete_path).unwrap();
+    let value = setup.create_data::<Cell<u64>>("value").unwrap();
+    let initialized = value.clone();
+    let transactions = setup
+        .commit(|access| initialized.access(access)?.set(&42))
+        .unwrap();
+    drop(transactions);
+
+    let store = Store::open(complete_path).unwrap();
+    let value = store.open_data::<Cell<u64>>("value").unwrap();
+    let transaction = store.read_transaction();
+    assert_eq!(
+        value.read(transaction.access()).unwrap().get().unwrap(),
+        Some(42)
+    );
+}
+
+#[test]
 fn reopening_after_more_catalog_entries_keeps_existing_bindings() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);

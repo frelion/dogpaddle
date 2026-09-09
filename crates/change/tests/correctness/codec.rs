@@ -16,7 +16,7 @@ use arrow_ipc::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{
     Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, decode_change,
-    decode_change_projected, encode_change,
+    decode_change_owned, decode_change_projected, encode_change,
 };
 
 use super::support::{assert_change_eq, fixture_hex, hex, representative_change};
@@ -80,6 +80,7 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
     let change = representative_change();
     let encoded = encode_change(&change).unwrap();
     assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+    assert_change_eq(&decode_change_owned(encoded.clone()).unwrap(), &change);
 
     let mut reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
     let schema = reader.schema();
@@ -105,6 +106,32 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
         change.diffs()
     );
     assert!(reader.next().is_none());
+}
+
+#[test]
+fn owned_decode_reuses_an_aligned_primitive_ipc_allocation() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let records =
+        RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![7, 11, 13]))]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1, 1])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+    let allocation = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+
+    // An IPC body is eight-byte aligned relative to the allocation. A platform
+    // allocator may legally return a less-aligned Vec<u8>; Arrow's decoder
+    // copies only in that fallback case.
+    if allocation.start.is_multiple_of(align_of::<u64>()) {
+        let decoded = decode_change_owned(encoded).unwrap();
+        let values = decoded.records().column(0).to_data();
+        let values = &values.buffers()[0];
+        let values_range = values.as_ptr() as usize..values.as_ptr() as usize + values.len();
+        assert!(allocation.start <= values_range.start);
+        assert!(values_range.end <= allocation.end);
+    }
 }
 
 #[test]

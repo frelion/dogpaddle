@@ -14,7 +14,9 @@ use rocksdb::{
     ReadOptions, SnapshotWithThreadMode,
 };
 
-use super::{DataHandle, DataKind, Store, Transactions, transaction::durable_write_options};
+use super::{
+    CatalogMode, DataHandle, DataKind, Store, Transactions, transaction::durable_write_options,
+};
 use crate::{StoreData, StoreError, data_class};
 
 const STORE_MARKER_KEY: &[u8] = &[0];
@@ -53,7 +55,24 @@ impl Store {
             token: fresh_token(),
             catalog: BTreeMap::new(),
             next_data_id: 0,
+            catalog_mode: CatalogMode::Immediate,
         })
+    }
+
+    /// Creates a marker-only Store whose catalog remains staged until
+    /// [`StoreSetup::commit`](super::StoreSetup::commit) atomically publishes it
+    /// with initialized data.
+    ///
+    /// This is intended for owners, such as Flow, that build a complete typed
+    /// resource set before making any part of that set visible to reopen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Store::create`].
+    pub fn setup(path: impl AsRef<Path>) -> Result<super::StoreSetup, StoreError> {
+        let mut store = Self::create(path)?;
+        store.catalog_mode = CatalogMode::Staged;
+        Ok(super::StoreSetup { store })
     }
 
     /// Opens an existing store.
@@ -80,6 +99,7 @@ impl Store {
             token: fresh_token(),
             catalog,
             next_data_id,
+            catalog_mode: CatalogMode::Immediate,
         })
     }
 
@@ -88,27 +108,35 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error for an empty or duplicate name, exhausted namespace
-    /// identifiers, or a storage failure.
+    /// identifiers, or a storage failure. After a storage failure, the caller
+    /// must discard this setup owner because the catalog write outcome may be
+    /// indeterminate.
     pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
         let handle = self.create_handle(name, data_class::kind::<D>())?;
         Ok(data_class::from_handle(handle))
     }
 
     fn create_handle(&mut self, name: &str, kind: DataKind) -> Result<DataHandle, StoreError> {
-        validate_name(name)?;
-        if self.catalog.contains_key(name) {
-            return Err(StoreError::DataAlreadyExists(name.to_owned()));
-        }
-        let data_id = u32::try_from(self.next_data_id).map_err(|_| StoreError::DataIdExhausted)?;
-        self.database
-            .put_opt(
-                catalog_key(name),
-                encode_binding(data_id, kind),
-                &durable_write_options(),
-            )
-            .map_err(|error| StoreError::storage("write data catalog", error))?;
-        self.catalog.insert(name.to_owned(), (data_id, kind));
-        self.next_data_id += 1;
+        let database = &self.database;
+        let catalog_mode = self.catalog_mode;
+        let data_id = create_binding(
+            &mut self.catalog,
+            &mut self.next_data_id,
+            name,
+            kind,
+            |data_id| {
+                if catalog_mode == CatalogMode::Immediate {
+                    database
+                        .put_opt(
+                            catalog_key(name),
+                            encode_binding(data_id, kind),
+                            &durable_write_options(),
+                        )
+                        .map_err(|error| StoreError::storage("write data catalog", error))?;
+                }
+                Ok(())
+            },
+        )?;
         Ok(self.handle(data_id))
     }
 
@@ -150,6 +178,26 @@ impl Store {
             data_id,
         }
     }
+}
+
+fn create_binding(
+    catalog: &mut Catalog,
+    next_data_id: &mut u64,
+    name: &str,
+    kind: DataKind,
+    persist: impl FnOnce(u32) -> Result<(), StoreError>,
+) -> Result<u32, StoreError> {
+    validate_name(name)?;
+    if catalog.contains_key(name) {
+        return Err(StoreError::DataAlreadyExists(name.to_owned()));
+    }
+    let data_id = u32::try_from(*next_data_id).map_err(|_| StoreError::DataIdExhausted)?;
+    // Reserve before durable I/O. A failed write can have an indeterminate
+    // outcome, so this Store must never reuse the same physical namespace.
+    *next_data_id += 1;
+    persist(data_id)?;
+    catalog.insert(name.to_owned(), (data_id, kind));
+    Ok(data_id)
 }
 
 impl DataKind {
@@ -261,14 +309,14 @@ fn validate_name(name: &str) -> Result<(), StoreError> {
     })
 }
 
-fn catalog_key(name: &str) -> Vec<u8> {
+pub(super) fn catalog_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + name.len());
     key.push(CATALOG_DOMAIN);
     key.extend_from_slice(name.as_bytes());
     key
 }
 
-fn encode_binding(data_id: u32, kind: DataKind) -> [u8; 5] {
+pub(super) fn encode_binding(data_id: u32, kind: DataKind) -> [u8; 5] {
     let [a, b, c, d] = data_id.to_be_bytes();
     [kind.tag(), a, b, c, d]
 }
@@ -279,4 +327,35 @@ fn decode_binding(bytes: &[u8]) -> Result<(u32, DataKind), StoreError> {
     };
     let kind = DataKind::decode(*tag).ok_or(StoreError::InvalidStore)?;
     Ok((u32::from_be_bytes([*a, *b, *c, *d]), kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_catalog_write_reserves_the_attempted_namespace() {
+        let mut catalog = Catalog::new();
+        let mut next_data_id = 0;
+        let failure = create_binding(
+            &mut catalog,
+            &mut next_data_id,
+            "uncertain",
+            DataKind::Cell,
+            |_| Err(StoreError::storage("injected catalog write", "failure")),
+        );
+        assert!(matches!(failure, Err(StoreError::Storage { .. })));
+
+        let next = create_binding(
+            &mut catalog,
+            &mut next_data_id,
+            "next",
+            DataKind::Cell,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(next, 1);
+        assert_eq!(next_data_id, 2);
+        assert_eq!(catalog.get("next"), Some(&(1, DataKind::Cell)));
+    }
 }

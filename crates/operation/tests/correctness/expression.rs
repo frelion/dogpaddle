@@ -1,13 +1,14 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     panic::{AssertUnwindSafe, catch_unwind},
+    process::Command,
     sync::Arc,
 };
 
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion_common::metadata::FieldMetadata;
-use datafusion_expr::{Volatility, create_udf, placeholder};
+use datafusion_expr::{Volatility, create_udf, expr::Cast, placeholder};
 use datafusion_proto::bytes::Serializeable;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
@@ -38,6 +39,7 @@ fn extend(field_name: &str, expression: Expr) -> ExtendDefinition {
 }
 
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const MAP_EXPRESSION_PROBE: &str = "DOGPADDLE_MAP_EXPRESSION_PROBE";
 
 fn length_prefixed_bytes(encoded: &[u8], length_offset: usize) -> &[u8] {
     let length = usize::try_from(u32::from_be_bytes(
@@ -182,7 +184,7 @@ fn expression_constructors_accept_exactly_round_tripping_datafusion_exprs() {
 }
 
 #[test]
-fn expression_constructor_rejects_a_non_round_tripping_datafusion_expr() {
+fn expression_constructor_rejects_literal_metadata_that_uses_a_protobuf_map() {
     let expression = Expr::Literal(
         ScalarValue::Int64(Some(7)),
         Some(FieldMetadata::new(BTreeMap::from([(
@@ -193,8 +195,66 @@ fn expression_constructor_rejects_a_non_round_tripping_datafusion_expr() {
 
     assert!(matches!(
         FilterDefinition::try_new(expression),
-        Err(ExpressionDefinitionError::NonRoundTrip)
+        Err(ExpressionDefinitionError::NonCanonical)
     ));
+}
+
+fn map_bearing_cast() -> Expr {
+    let child = Arc::new(
+        Field::new("child", DataType::UInt64, true).with_metadata(HashMap::from([
+            ("alpha".to_owned(), "1".to_owned()),
+            ("beta".to_owned(), "2".to_owned()),
+            ("delta".to_owned(), "4".to_owned()),
+            ("gamma".to_owned(), "3".to_owned()),
+        ])),
+    );
+    Expr::Cast(Cast::new_from_field(
+        Box::new(col("value")),
+        Arc::new(Field::new(
+            "cast",
+            DataType::Struct(vec![child].into()),
+            true,
+        )),
+    ))
+}
+
+#[test]
+fn map_bearing_expression_is_rejected_consistently_across_processes() {
+    if let Some(path) = std::env::var_os(MAP_EXPRESSION_PROBE) {
+        assert!(matches!(
+            FilterDefinition::try_new(map_bearing_cast()),
+            Err(ExpressionDefinitionError::NonCanonical)
+        ));
+        assert!(matches!(
+            decode_definition(&std::fs::read(path).unwrap()),
+            Err(DefinitionCodecError::InvalidPayload(_))
+        ));
+        return;
+    }
+
+    let protobuf = map_bearing_cast().to_bytes().unwrap();
+    let canonical = encode_definition(&filter(lit(true)));
+    let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    encoded.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_be_bytes());
+    encoded.extend_from_slice(&protobuf);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("map-bearing.definition");
+    std::fs::write(&path, encoded).unwrap();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "expression::map_bearing_expression_is_rejected_consistently_across_processes",
+        ])
+        .env(MAP_EXPRESSION_PROBE, &path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "map-bearing expression child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

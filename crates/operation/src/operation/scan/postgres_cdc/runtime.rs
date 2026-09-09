@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{decode_change, encode_change};
+use dogpaddle_change::{decode_change_owned, encode_change};
 use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
 
@@ -330,7 +330,7 @@ impl PostgresCdcScanOperation {
                 ));
             };
 
-            let change = decode_change(&encoded).map_err(|_| {
+            let change = decode_change_owned(encoded).map_err(|_| {
                 PostgresCdcScanError::InvalidState("bootstrap spool Change is invalid")
             })?;
             if change.records().schema().as_ref() != self.output_schema.as_ref() {

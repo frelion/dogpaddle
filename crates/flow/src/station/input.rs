@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{Change, decode_change, encode_change};
+use dogpaddle_change::{Change, decode_change_owned, encode_change};
 use dogpaddle_store::{
     Cell, ReadTransactionAccess, ReadTransactions, SubscribedLogWriter, Subscription,
     TransactionAccess, Transactions,
@@ -150,26 +150,30 @@ impl Inbox {
         let Some(selected) = selected else {
             return Ok(false);
         };
-        let change = decode_change(&selected.encoded).map_err(|source| {
-            StationError::InvalidInputChange {
-                input: selected.port,
+        let EncodedClaim {
+            port,
+            offset,
+            encoded,
+        } = selected;
+        let change =
+            decode_change_owned(encoded).map_err(|source| StationError::InvalidInputChange {
+                input: port,
                 source,
-            }
-        })?;
+            })?;
         let actual = change.schema();
-        let expected = self.ports[selected.port].output.schema();
+        let expected = self.ports[port].output.schema();
         if !schemas_match(expected, &actual) {
             return Err(StationError::InputSchemaMismatch {
-                input: selected.port,
+                input: port,
                 expected: Arc::clone(expected),
                 actual,
             });
         }
-        let pinned = self.active.is_some() && selected.port != active;
+        let pinned = self.active.is_some() && port != active;
         if pinned {
             let transaction = transactions.begin();
             let selected_port =
-                u32::try_from(selected.port).expect("validated input count fits the Flow format");
+                u32::try_from(port).expect("validated input count fits the Flow format");
             self.active
                 .as_ref()
                 .expect("only a multi-input Inbox durably pins its active input")
@@ -180,8 +184,8 @@ impl Inbox {
                 .map_err(|source| StationError::Commit { source })?;
         }
         self.claim = Some(Claim {
-            port: selected.port,
-            offset: selected.offset,
+            port,
+            offset,
             change,
         });
         Ok(pinned)

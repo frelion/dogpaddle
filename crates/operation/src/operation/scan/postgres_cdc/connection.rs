@@ -393,6 +393,17 @@ impl PostgresCdcScanConfig {
                 PostgresCdcScanError::new("invalid fixed PostgreSQL connector configuration")
             })?;
         }
+        if matches!(mode, ConnectorMode::Snapshot) {
+            let notification_topic = format!("__dogpaddle-notification.{}", spec.engine_name);
+            for (key, value) in [
+                ("notification.enabled.channels", "sink"),
+                ("notification.sink.topic.name", notification_topic.as_str()),
+            ] {
+                config = config.property(key, value).map_err(|_| {
+                    PostgresCdcScanError::new("invalid fixed PostgreSQL connector configuration")
+                })?;
+            }
+        }
         Ok(config)
     }
 }

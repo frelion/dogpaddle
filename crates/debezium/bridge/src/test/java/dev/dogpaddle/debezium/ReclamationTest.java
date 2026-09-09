@@ -11,6 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 class ReclamationTest {
@@ -217,6 +218,34 @@ class ReclamationTest {
             finally {
                 ReclamationTestConnector.uninstall(name, control);
             }
+        }
+    }
+
+    @Test
+    void abandonment_keeps_ownership_after_close_failure_until_engine_exits()
+            throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        Thread engine = new Thread(() -> await(release), "eventually-stopped-engine");
+        engine.start();
+        AtomicBoolean reclaimed = new AtomicBoolean();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            var cleanup = executor.submit(() -> ConnectorRuntime.awaitTerminationAndReclaim(
+                    engine,
+                    () -> reclaimed.set(true),
+                    new IllegalStateException("close failed")));
+            assertFalse(cleanup.isDone());
+            assertFalse(reclaimed.get());
+
+            release.countDown();
+            Throwable failure = cleanup.get(LIFECYCLE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            assertTrue(reclaimed.get());
+            assertTrue(failure instanceof IllegalStateException);
+        }
+        finally {
+            release.countDown();
+            engine.join(LIFECYCLE_TIMEOUT_MILLIS);
+            executor.shutdownNow();
         }
     }
 

@@ -41,6 +41,37 @@ pub struct Store {
     token: u64,
     catalog: BTreeMap<String, (u32, DataKind)>,
     next_data_id: u64,
+    catalog_mode: CatalogMode,
+}
+
+/// Owns a new marker-only Store while its complete typed resource set is staged.
+///
+/// Dropping this capability before commit leaves a valid empty Store.
+/// [`StoreSetup::commit`] atomically publishes the staged catalog together
+/// with caller-provided collection initialization and consumes the capability
+/// on every outcome, including an indeterminate storage commit error.
+///
+/// Staged setup cannot inspect data or enter runtime without committing.
+///
+/// ```compile_fail
+/// let setup = dogpaddle_store::Store::setup("state")?;
+/// setup.read_transaction();
+/// # Ok::<(), dogpaddle_store::StoreError>(())
+/// ```
+///
+/// ```compile_fail
+/// let setup = dogpaddle_store::Store::setup("state")?;
+/// setup.into_transactions();
+/// # Ok::<(), dogpaddle_store::StoreError>(())
+/// ```
+pub struct StoreSetup {
+    store: Store,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CatalogMode {
+    Immediate,
+    Staged,
 }
 
 /// Uniquely owns the runtime capability to begin Store write transactions.

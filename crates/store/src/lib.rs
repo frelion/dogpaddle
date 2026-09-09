@@ -19,4 +19,6 @@ pub use data_class::StoreData;
 pub use error::StoreError;
 pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess};
 pub use store::{ReadTransaction, ReadTransactionAccess, ReadTransactions};
-pub use store::{ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions};
+pub use store::{
+    ScanDirection, ScanLimit, Store, StoreSetup, Transaction, TransactionAccess, Transactions,
+};

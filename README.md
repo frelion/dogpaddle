@@ -154,7 +154,8 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
   快照封口前 WAL 重叠的 `bootstrap_spool_bytes`。目前仍不支持 TLS、DNS 地址、多表路由或运行中改表。
   详见 [外部端点文档](crates/operation/README.md)。
 - **MySQL 会先复制已有数据，再从同一快照切点继续 binlog CDC。** MySQL 8.4 试点使用
-  `initial_only` 和 `minimal` locking 取得一致快照，封口后从 terminal heartbeat 的 checkpoint 以
+  `initial_only` 和 `minimal` locking 取得一致快照，封口后从 initial-snapshot completion
+  notification 的 checkpoint 以
   `recovery` 继续。快照也会先写入受 `bootstrap_spool_bytes` 限制的私有持久 spool，完整后再逐批发布。
   binlog 必须覆盖初始快照、私有 spool 排空、公开 output 背压和追平的全部时间；过早 `PURGE`
   会以错误终止，不会悄悄跳过数据。要求固定 Schema，不支持运行中 DDL、TLS 或未列出的源类型。

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{
     MySqlCdcScanError, MySqlColumn, MySqlType,
-    convert::{convert_snapshot_values, convert_values},
+    convert::{SnapshotProgress, convert_snapshot_values, convert_values},
     schema,
 };
 
@@ -74,9 +74,24 @@ fn heartbeat() -> Value {
     })
 }
 
+fn notification(kind: &str) -> Value {
+    json!({
+        "schema":{"type":"struct","name":"io.debezium.pipeline.notification.Notification"},
+        "payload":{"aggregate_type":"Initial Snapshot","type":kind},
+    })
+}
+
 fn snapshot(
     columns: &[MySqlColumn],
     events: &[Value],
+) -> Result<super::convert::SnapshotDelivery, MySqlCdcScanError> {
+    snapshot_after(columns, events, SnapshotProgress::default())
+}
+
+fn snapshot_after(
+    columns: &[MySqlColumn],
+    events: &[Value],
+    progress: SnapshotProgress,
 ) -> Result<super::convert::SnapshotDelivery, MySqlCdcScanError> {
     let bytes = events
         .iter()
@@ -89,14 +104,16 @@ fn snapshot(
         "shop",
         "events",
         bytes.iter().enumerate().map(|(index, bytes)| {
-            let topic =
-                if events[index]["schema"]["name"] == "io.debezium.connector.common.Heartbeat" {
-                    "__debezium-heartbeat.source"
-                } else {
-                    "source.shop.events"
-                };
+            let topic = match events[index]["schema"]["name"].as_str() {
+                Some("io.debezium.connector.common.Heartbeat") => "__debezium-heartbeat.source",
+                Some("io.debezium.pipeline.notification.Notification") => {
+                    "__dogpaddle-notification.source"
+                }
+                _ => "source.shop.events",
+            };
             (Some(topic), Some(bytes.as_slice()))
         }),
+        progress,
     )
 }
 
@@ -305,7 +322,7 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
 }
 
 #[test]
-fn mysql_cdc_snapshot_uses_a_terminal_last_heartbeat_and_supports_empty_tables() {
+fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
     let columns = [column(MySqlType::Int64)];
     let mut row = envelope(&columns, "r", Value::Null, json!({"value":7}));
     row["payload"]["source"]["snapshot"] = json!("last");
@@ -314,19 +331,59 @@ fn mysql_cdc_snapshot_uses_a_terminal_last_heartbeat_and_supports_empty_tables()
     assert!(!continuing.complete);
     assert_eq!(continuing.change.unwrap().diffs().values(), &[1]);
 
-    let complete = snapshot(&columns, &[row.clone(), heartbeat()]).unwrap();
+    let complete = snapshot_after(
+        &columns,
+        &[heartbeat(), notification("COMPLETED")],
+        continuing.next_progress,
+    )
+    .unwrap();
     assert!(complete.complete);
-    assert_eq!(complete.change.unwrap().diffs().values(), &[1]);
+    assert!(complete.change.is_none());
 
-    let empty = snapshot(&columns, &[heartbeat()]).unwrap();
+    let empty = snapshot(&columns, &[notification("COMPLETED")]).unwrap();
     assert!(empty.complete);
     assert!(empty.change.is_none());
 
-    assert!(snapshot(&columns, &[]).is_err());
-    assert!(snapshot(&columns, &[heartbeat(), row.clone()]).is_err());
-    assert!(snapshot(&columns, &[heartbeat(), heartbeat()]).is_err());
+    assert!(
+        !snapshot(&columns, &[heartbeat(), notification("STARTED")])
+            .unwrap()
+            .complete
+    );
+    assert!(snapshot(&columns, &[notification("COMPLETED"), row.clone()]).is_err());
+    assert!(
+        snapshot(
+            &columns,
+            &[notification("COMPLETED"), notification("COMPLETED")]
+        )
+        .is_err()
+    );
+    for kind in ["ABORTED", "SKIPPED", "UNKNOWN"] {
+        assert!(snapshot(&columns, &[notification(kind)]).is_err());
+    }
+    let mut malformed = notification("COMPLETED");
+    malformed["payload"]["aggregate_type"] = json!("Other");
+    assert!(snapshot(&columns, &[malformed]).is_err());
     row["payload"]["source"]["snapshot"] = json!("false");
     assert!(snapshot(&columns, &[row]).is_err());
+}
+
+#[test]
+fn mysql_cdc_snapshot_progress_crosses_delivery_boundaries() {
+    let columns = [column(MySqlType::Int64)];
+    let mut first_row = envelope(&columns, "r", Value::Null, json!({"value":1}));
+    first_row["payload"]["source"]["snapshot"] = json!("true");
+    let first = snapshot(&columns, &[first_row]).unwrap();
+    assert!(!first.complete);
+
+    assert!(snapshot_after(&columns, &[notification("COMPLETED")], first.next_progress,).is_err());
+
+    let mut last = envelope(&columns, "r", Value::Null, json!({"value":2}));
+    last["payload"]["source"]["snapshot"] = json!("last");
+    let second = snapshot_after(&columns, &[last], first.next_progress).unwrap();
+    let completed =
+        snapshot_after(&columns, &[notification("COMPLETED")], second.next_progress).unwrap();
+    assert!(completed.complete);
+    assert!(completed.change.is_none());
 }
 
 #[test]

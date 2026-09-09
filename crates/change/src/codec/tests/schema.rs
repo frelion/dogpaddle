@@ -4,10 +4,10 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
 use arrow_ipc::{
     Date as IpcDate, DateArgs, DateUnit as IpcDateUnit, Decimal as IpcDecimal, DecimalArgs,
     DictionaryEncoding, DictionaryEncodingArgs, Endianness, Field as IpcField, FieldArgs,
-    FloatingPoint as IpcFloatingPoint, FloatingPointArgs, Int as IpcInt, IntArgs,
-    LargeUtf8 as IpcLargeUtf8, LargeUtf8Args, List as IpcList, ListArgs, Message as IpcMessage,
-    MessageArgs, MessageHeader, MetadataVersion, Null as IpcNull, NullArgs, Precision,
-    Schema as IpcSchema, SchemaArgs, TimeUnit as IpcTimeUnit, Timestamp as IpcTimestamp,
+    FloatingPoint as IpcFloatingPoint, FloatingPointArgs, Int as IpcInt, IntArgs, KeyValue,
+    KeyValueArgs, LargeUtf8 as IpcLargeUtf8, LargeUtf8Args, List as IpcList, ListArgs,
+    Message as IpcMessage, MessageArgs, MessageHeader, MetadataVersion, Null as IpcNull, NullArgs,
+    Precision, Schema as IpcSchema, SchemaArgs, TimeUnit as IpcTimeUnit, Timestamp as IpcTimestamp,
     TimestampArgs, Type as IpcType, reader::StreamReader, writer::IpcWriteOptions,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -118,6 +118,60 @@ pub(super) const MALFORMED_SCHEMA_CASES: &[(MalformedSchemaCase, &str)] = &[
         "unsupported Arrow IPC type",
     ),
 ];
+
+fn metadata_schema_stream(entries: &[(Option<&str>, Option<&str>)]) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let metadata = entries
+        .iter()
+        .map(|(key, value)| {
+            let key = key.map(|key| builder.create_string(key));
+            let value = value.map(|value| builder.create_string(value));
+            KeyValue::create(&mut builder, &KeyValueArgs { key, value })
+        })
+        .collect::<Vec<_>>();
+    let metadata = builder.create_vector(&metadata);
+    let name = builder.create_string("$dogpaddle.diff");
+    let int = IpcInt::create(
+        &mut builder,
+        &IntArgs {
+            bitWidth: 64,
+            is_signed: true,
+        },
+    );
+    let field = IpcField::create(
+        &mut builder,
+        &FieldArgs {
+            name: Some(name),
+            nullable: false,
+            type_type: IpcType::Int,
+            type_: Some(int.as_union_value()),
+            ..FieldArgs::default()
+        },
+    );
+    let fields = builder.create_vector(&[field]);
+    let schema = IpcSchema::create(
+        &mut builder,
+        &SchemaArgs {
+            endianness: Endianness::Little,
+            fields: Some(fields),
+            custom_metadata: Some(metadata),
+            ..SchemaArgs::default()
+        },
+    );
+    let message = IpcMessage::create(
+        &mut builder,
+        &MessageArgs {
+            version: MetadataVersion::V5,
+            header_type: MessageHeader::Schema,
+            header: Some(schema.as_union_value()),
+            ..MessageArgs::default()
+        },
+    );
+    builder.finish(message, None);
+    let mut encoded = frame_ipc_message(builder.finished_data(), &[]);
+    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    encoded
+}
 
 #[expect(
     clippy::too_many_lines,
@@ -470,6 +524,25 @@ fn decoder_rejects_invalid_physical_schema_and_version_markers() {
     let schema = unit_physical_schema(unknown);
     let batch = unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![1]));
     assert_both_invalid_encoding(&encode_stream(&schema, &[batch]), &projection);
+}
+
+#[test]
+fn decoder_rejects_incomplete_duplicate_and_unsorted_metadata() {
+    let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
+    for entries in [
+        vec![(None, Some("change"))],
+        vec![(Some(KIND_KEY), None)],
+        vec![
+            (Some(KIND_KEY), Some("change")),
+            (Some(KIND_KEY), Some("change")),
+        ],
+        vec![
+            (Some(VERSION_KEY), Some("1")),
+            (Some(KIND_KEY), Some("change")),
+        ],
+    ] {
+        assert_both_invalid_encoding(&metadata_schema_stream(&entries), &projection);
+    }
 }
 
 #[test]

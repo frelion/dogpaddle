@@ -9,7 +9,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{SchemaError, validate_schema};
-use dogpaddle_store::{Store, StoreData, StoreError};
+use dogpaddle_store::{Store, StoreData, StoreError, StoreSetup};
 use thiserror::Error;
 
 use crate::RuntimeResource;
@@ -32,6 +32,7 @@ pub(crate) use private::Sealed;
 
 type ErasedData = Box<dyn Any + Send + Sync>;
 type CreateFn = fn(&mut Store, &str) -> Result<ErasedData, StoreError>;
+type CreateSetupFn = fn(&mut StoreSetup, &str) -> Result<ErasedData, StoreError>;
 type OpenFn = fn(&Store, &str) -> Result<ErasedData, StoreError>;
 type MaterializeFn = Box<
     dyn FnOnce(&mut DataInstances, RuntimeResource) -> Result<Box<dyn Operation>, MaterializeError>
@@ -68,6 +69,7 @@ pub struct OperationBinding {
 pub struct DataDeclaration {
     name: &'static str,
     create: CreateFn,
+    create_setup: CreateSetupFn,
     open: OpenFn,
 }
 
@@ -322,6 +324,23 @@ impl DataDeclaration {
         })
     }
 
+    /// Creates this declaration's concrete data object in an atomic Store setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Store error when the physical resource cannot be staged.
+    #[doc(hidden)]
+    pub fn create_setup(
+        &self,
+        setup: &mut StoreSetup,
+        physical_name: &str,
+    ) -> Result<DataInstance, StoreError> {
+        (self.create_setup)(setup, physical_name).map(|data| DataInstance {
+            name: self.name,
+            data,
+        })
+    }
+
     /// Opens this declaration's concrete data object.
     ///
     /// # Errors
@@ -406,6 +425,7 @@ where
             declaration: DataDeclaration {
                 name,
                 create: create::<D>,
+                create_setup: create_setup::<D>,
                 open: open::<D>,
             },
             _data: PhantomData,
@@ -422,6 +442,15 @@ where
     D: StoreData + Send + Sync + 'static,
 {
     store
+        .create_data::<D>(name)
+        .map(|data| Box::new(data) as ErasedData)
+}
+
+fn create_setup<D>(setup: &mut StoreSetup, name: &str) -> Result<ErasedData, StoreError>
+where
+    D: StoreData + Send + Sync + 'static,
+{
+    setup
         .create_data::<D>(name)
         .map(|data| Box::new(data) as ErasedData)
 }

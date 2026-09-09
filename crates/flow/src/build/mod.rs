@@ -145,8 +145,8 @@ impl FlowFactory {
     /// Pure topology validation and definition encoding finish before the Store
     /// path is created. The encoded bytes are decoded as the canonical durable
     /// Definition, all Operations are purely bound to exact Schemas, required
-    /// data objects are created, and the definition Cell is committed last as
-    /// the build-complete marker.
+    /// data objects are staged, and the complete catalog, initialized data, and
+    /// definition Cell are committed in one setup transaction.
     ///
     /// # Errors
     ///
@@ -169,8 +169,8 @@ impl FlowFactory {
             .map(|station| station.id().to_owned())
             .collect();
 
-        let mut store = Store::create(&path)?;
-        let published: Cell<Vec<u8>> = store.create_data(codec::DEFINITION_DATA_NAME)?;
+        let mut setup = Store::setup(&path)?;
+        let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;
         let station_parts = definition
             .stations()
             .iter()
@@ -178,19 +178,18 @@ impl FlowFactory {
             .zip(bindings)
             .zip(resources)
             .map(|(((index, station), binding), resource)| {
-                create_station_part(&mut store, index, station, binding, resource)
+                create_station_part(&mut setup, index, station, binding, resource)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut transactions, reads) = store.into_transactions().split();
-        {
-            let transaction = transactions.begin();
+        let transactions = setup.commit(|access| {
             for (index, station) in station_parts.iter().enumerate() {
-                station.initialize(topology.subscriber_count(index), transaction.access())?;
+                station.initialize(topology.subscriber_count(index), access)?;
             }
-            let mut published = published.access(transaction.access())?;
+            let mut published = published.access(access)?;
             published.set(&definition_bytes)?;
-            transaction.commit()?;
-        }
+            Ok(())
+        })?;
+        let (transactions, reads) = transactions.split();
         let assembled = assemble_stations(topology, station_parts);
 
         Ok(Flow::from_parts(
@@ -249,25 +248,25 @@ fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), Materia
 }
 
 fn create_station_part(
-    store: &mut Store,
+    setup: &mut dogpaddle_store::StoreSetup,
     index: usize,
     station: &StationDefinition,
     binding: OperationBinding,
     resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
     let active = (station.inputs().len() > 1)
-        .then(|| store.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
+        .then(|| setup.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
         .transpose()?;
     let definition = station.operation();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::station_operation_data_name(index, declaration.name());
-        data.insert(declaration.create(store, &physical_name)?)?;
+        data.insert(declaration.create_setup(setup, &physical_name)?)?;
     }
     let output_schema = binding.output_schema().cloned();
     let operation = binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
-        (Some(capacity), Some(schema)) => store
+        (Some(capacity), Some(schema)) => setup
             .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
             .map(|log| Some((log, capacity, schema)))?,
         (None, None) => None,

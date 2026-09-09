@@ -15,6 +15,16 @@
 资源只能在 `Store` 阶段通过 `create_data` 或 `open_data` 获得。`StoreData` 是 sealed trait，外部
 crate 不能绕过六种内建结构自造物理资源。
 
+直接通过 `Store::create_data` 发布单个 catalog binding 时，`StoreError::Storage` 是该 setup
+owner 的终止错误：底层同步写的结果可能不确定，调用方必须丢弃这个 `Store`，不能继续创建资源或
+进入运行期。实现仍会保留本次尝试的 namespace ID，作为误用时避免物理前缀复用的最后一道保护。
+
+需要一次声明完整资源集合的 owner 使用 `Store::setup` 获得窄化的 `StoreSetup`：资源 binding
+只在内存中暂存，`StoreSetup::commit` 把完整 catalog 与调用方提供的初始 collection state 放进
+同一个同步事务。commit 消费 setup capability，初始化或提交失败后都不能继续使用它。初始化闭包
+返回错误时事务确定回滚，磁盘上只有 Store marker、catalog 为空；底层 commit 返回存储错误时
+结果可能不确定，调用方必须通过 reopen 判定，或按产品策略删除并重建。
+
 进入运行期时，`Store::into_transactions` 消费 setup owner，产生不可克隆的 `Transactions`。
 `Transactions::begin(&mut self)` 开启一个写事务，因此同一个 owner 在类型层面一次只能持有一个
 活动写事务。`Transaction::commit` 使用 WAL 与同步写入原子提交；直接丢弃 transaction 会回滚。

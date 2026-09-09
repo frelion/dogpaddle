@@ -6,8 +6,9 @@ use rocksdb::{
 };
 
 use super::{
-    DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, Transaction,
-    TransactionAccess, Transactions,
+    DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, StoreSetup,
+    Transaction, TransactionAccess, Transactions,
+    database::{catalog_key, encode_binding},
 };
 use crate::StoreError;
 
@@ -29,6 +30,53 @@ impl Store {
     /// ```
     pub fn read_transaction(&self) -> ReadTransaction<'_> {
         begin_read_transaction(&self.database, self.token)
+    }
+}
+
+impl StoreSetup {
+    /// Creates one named typed data object in the staged catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or duplicate name or exhausted namespace
+    /// identifiers.
+    pub fn create_data<D: crate::StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
+        self.store.create_data(name)
+    }
+
+    /// Atomically publishes the staged catalog and caller-provided initial data,
+    /// then yields the unique runtime write capability.
+    ///
+    /// This consumes the setup capability whether initialization or commit
+    /// succeeds, so a failed or indeterminate commit cannot be continued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when initialization fails or `RocksDB` cannot commit
+    /// the complete setup transaction.
+    pub fn commit(
+        self,
+        initialize: impl FnOnce(TransactionAccess<'_>) -> Result<(), StoreError>,
+    ) -> Result<Transactions, StoreError> {
+        let store = self.store;
+        let transaction = Transaction {
+            inner: begin_write_transaction(&store.database),
+            store_token: store.token,
+            poisoned: std::cell::Cell::new(false),
+            _thread_bound: std::marker::PhantomData,
+        };
+        for (name, &(data_id, kind)) in &store.catalog {
+            transaction
+                .inner
+                .put(catalog_key(name), encode_binding(data_id, kind))
+                .map_err(|error| StoreError::storage("stage data catalog", error))?;
+        }
+        initialize(transaction.access())?;
+        transaction.commit()?;
+        Ok(Transactions {
+            database: Arc::new(store.database),
+            store_token: store.token,
+        })
     }
 }
 

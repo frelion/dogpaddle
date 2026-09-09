@@ -14,9 +14,16 @@ use super::{MySqlCdcScanError, MySqlColumn, MySqlType};
 
 type Row = Map<String, Value>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SnapshotProgress {
+    saw_snapshot_row: bool,
+    saw_last: bool,
+}
+
 pub(super) struct SnapshotDelivery {
     pub(super) change: Option<Change>,
     pub(super) complete: bool,
+    pub(super) next_progress: SnapshotProgress,
 }
 
 pub(super) fn convert_records(
@@ -46,6 +53,7 @@ pub(super) fn convert_snapshot_records(
     database: &str,
     table: &str,
     records: &[Record],
+    progress: SnapshotProgress,
 ) -> Result<SnapshotDelivery, MySqlCdcScanError> {
     convert_snapshot_values(
         columns,
@@ -56,6 +64,7 @@ pub(super) fn convert_snapshot_records(
         records
             .iter()
             .map(|record| (record.topic(), record.value())),
+        progress,
     )
 }
 
@@ -68,38 +77,49 @@ pub(super) fn convert_snapshot_values<'a>(
     database: &str,
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
+    progress: SnapshotProgress,
 ) -> Result<SnapshotDelivery, MySqlCdcScanError> {
     let table_topic = format!("{topic_prefix}.{database}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
-    let mut values = values.into_iter().peekable();
+    let notification_topic = format!("__dogpaddle-notification.{topic_prefix}");
     let mut rows = Vec::new();
+    let mut progress = progress;
     let mut complete = false;
-    let mut observed = false;
-    while let Some((topic, bytes)) = values.next() {
-        observed = true;
+    for (topic, bytes) in values {
         let bytes = bytes.ok_or_else(|| invalid("snapshot record cannot be a tombstone"))?;
         let mut value: Value = serde_json::from_slice(bytes)
             .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
         let schema = object_field(&value, "schema")?;
-        if topic == Some(heartbeat_topic.as_str()) {
-            if complete || values.peek().is_some() {
-                return Err(invalid(
-                    "snapshot completion heartbeat must be unique and last in its delivery",
-                ));
+        if topic == Some(notification_topic.as_str()) {
+            if validate_snapshot_notification(object_field(&value, "payload")?)? {
+                if complete {
+                    return Err(invalid("snapshot completion notification is duplicated"));
+                }
+                if progress.saw_snapshot_row && !progress.saw_last {
+                    return Err(invalid(
+                        "snapshot completed before Debezium marked the last snapshot row",
+                    ));
+                }
+                complete = true;
             }
+            continue;
+        }
+        if topic == Some(heartbeat_topic.as_str()) {
             validate_heartbeat(schema, object_field(&value, "payload")?)?;
-            complete = true;
             continue;
         }
         if topic != Some(table_topic.as_str()) {
             return Err(invalid("snapshot record has an unexpected topic"));
+        }
+        if complete || progress.saw_last {
+            return Err(invalid("snapshot record arrived after snapshot completion"));
         }
         validate_envelope(columns, schema)?;
         let payload = value
             .get_mut("payload")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| invalid("missing object field payload"))?;
-        validate_snapshot_metadata(payload, database, table)?;
+        let last = validate_snapshot_metadata(payload, database, table)?;
         let before = payload
             .remove("before")
             .ok_or_else(|| invalid("missing before"))?;
@@ -110,14 +130,16 @@ pub(super) fn convert_snapshot_values<'a>(
             return Err(invalid("expected one initial snapshot read event"));
         }
         rows.push(complete_row(columns, after)?);
-    }
-    if !observed {
-        return Err(invalid("snapshot delivery is empty"));
+        progress.saw_snapshot_row = true;
+        if last {
+            progress.saw_last = true;
+        }
     }
     let diffs = vec![1; rows.len()];
     Ok(SnapshotDelivery {
         change: build_change(columns, output_schema, &rows, diffs)?,
         complete,
+        next_progress: progress,
     })
 }
 
@@ -208,11 +230,25 @@ fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, MySqlCdcSc
         .ok_or_else(|| invalid(format!("missing object field {field}")))
 }
 
+fn validate_snapshot_notification(payload: &Row) -> Result<bool, MySqlCdcScanError> {
+    if payload.get("aggregate_type").and_then(Value::as_str) != Some("Initial Snapshot") {
+        return Err(invalid("unexpected Debezium notification aggregate"));
+    }
+    match payload.get("type").and_then(Value::as_str) {
+        Some("STARTED" | "IN_PROGRESS" | "TABLE_SCAN_COMPLETED") => Ok(false),
+        Some("COMPLETED") => Ok(true),
+        Some("ABORTED" | "SKIPPED") => Err(invalid(
+            "Debezium initial snapshot did not complete successfully",
+        )),
+        _ => Err(invalid("unexpected Debezium initial snapshot notification")),
+    }
+}
+
 fn validate_snapshot_metadata(
     payload: &Row,
     database: &str,
     table: &str,
-) -> Result<(), MySqlCdcScanError> {
+) -> Result<bool, MySqlCdcScanError> {
     let metadata = payload
         .get("source")
         .and_then(Value::as_object)
@@ -224,15 +260,13 @@ fn validate_snapshot_metadata(
             )));
         }
     }
-    if !matches!(
-        metadata.get("snapshot").and_then(Value::as_str),
-        Some("true" | "last")
-    ) {
+    let marker = metadata.get("snapshot").and_then(Value::as_str);
+    if !matches!(marker, Some("true" | "last")) {
         return Err(invalid(
             "Debezium record is not part of the initial snapshot",
         ));
     }
-    Ok(())
+    Ok(marker == Some("last"))
 }
 
 fn validate_metadata(payload: &Row, database: &str, table: &str) -> Result<(), MySqlCdcScanError> {

@@ -161,14 +161,15 @@ V1 端点：
 | Sink | `discard` | 无 |
 
 `postgres_cdc` 和 `mysql_cdc` 都先把已有行捕获到私有持久 spool，完整封口后再逐条原子发布，然后持续 CDC。
-`PostgreSQL` 还会把 terminal heartbeat 前已经观察到的 WAL overlap 放进 spool；`MySQL` `initial_only` 期间的
+`PostgreSQL` 还会把 initial-snapshot completion notification 前已经观察到的 WAL overlap 放进 spool；
+`MySQL` `initial_only` 期间的
 并发写入留在 binlog，发布完成后从封口 checkpoint 读取。`bootstrap_spool_bytes` 必填、必须是非零 `u64`，
 并持久在 Definition 中；它是 `retained + 8-byte offset + IPC` 的硬逻辑容量。快照期无公开 output；每个 delivery 的可选 IPC 与 candidate checkpoint
 提交后才 ACK。封口后 spool 出队与 Station output append 同事务，背压不会丢数据。容量不足时不 ACK，
 需要使用更大容量和新 state 目录重建。
 
 `PostgreSQL` 要求预配置 publication 和首启前不存在、之后 source-owned/exclusive 的 slot 名；spool 必须容纳完整快照和
-terminal heartbeat 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minimal` 快照，terminal heartbeat 封口后以 `recovery`
+completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minimal` 快照，completion notification 封口后以 `recovery`
 继续。`replication_client_id` 是唯一的非零 `u32`。`MySQL` 角色应具有短时 global read lock 权限但不授
 `LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 前失败。binlog 必须覆盖快照、私有 spool 排空、
 公开 output 背压与追平；过早 `PURGE` 会 fail closed。两个 source 都要求固定 Schema，不支持 TLS、在线 DDL、

@@ -106,6 +106,13 @@ fn capture(
     )
 }
 
+fn notification(kind: &str) -> Value {
+    json!({
+        "schema":{"type":"struct","name":"io.debezium.pipeline.notification.Notification"},
+        "payload":{"aggregate_type":"Initial Snapshot","type":kind},
+    })
+}
+
 fn inserted(columns: &[PostgresColumn], row: Value) -> Change {
     convert(columns, &[envelope(columns, "c", Value::Null, row)])
         .unwrap()
@@ -476,7 +483,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
     assert!(
         capture(
             &columns,
-            &[("__debezium-heartbeat.source", heartbeat())],
+            &[("__dogpaddle-notification.source", notification("COMPLETED"))],
             terminal.next_progress,
         )
         .unwrap()
@@ -505,7 +512,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
 }
 
 #[test]
-fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_heartbeat_cutover() {
+fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_completion_boundary() {
     let columns = [column(PostgresType::Int64)];
     let mut inserted_after_snapshot = envelope(&columns, "c", Value::Null, json!({"value":3}));
     inserted_after_snapshot["payload"]["source"]["snapshot"] = Value::Null;
@@ -546,6 +553,7 @@ fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_heartbeat_cutover
         &[
             ("source.public.events", update),
             ("__debezium-heartbeat.source", heartbeat()),
+            ("__dogpaddle-notification.source", notification("COMPLETED")),
             ("source.public.events", delete),
         ],
         first.next_progress,
@@ -567,12 +575,13 @@ fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_heartbeat_cutover
 }
 
 #[test]
-fn postgres_cdc_capture_uses_the_first_heartbeat_for_an_empty_snapshot() {
+fn postgres_cdc_capture_uses_explicit_completion_for_an_empty_snapshot() {
     let columns = [column(PostgresType::Int64)];
     let captured = capture(
         &columns,
         &[
             ("__debezium-heartbeat.source", heartbeat()),
+            ("__dogpaddle-notification.source", notification("COMPLETED")),
             (
                 "source.public.events",
                 envelope(&columns, "c", Value::Null, json!({"value":1})),
@@ -597,6 +606,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
                 snapshot(&columns, "true", json!({"value":1})),
             ),
             ("__debezium-heartbeat.source", heartbeat()),
+            ("__dogpaddle-notification.source", notification("COMPLETED")),
         ],
         CaptureProgress::default(),
     );
@@ -605,7 +615,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
     let reopened = capture(
         &columns,
         &[
-            ("__debezium-heartbeat.source", heartbeat()),
+            ("__dogpaddle-notification.source", notification("COMPLETED")),
             (
                 "source.public.events",
                 snapshot(&columns, "last", json!({"value":1})),
@@ -624,6 +634,45 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
         CaptureProgress::default(),
     );
     assert!(streaming_before_last.is_err());
+
+    let progress = capture(
+        &columns,
+        &[("__dogpaddle-notification.source", notification("STARTED"))],
+        CaptureProgress::default(),
+    )
+    .unwrap();
+    assert!(!progress.sealed);
+    for kind in ["ABORTED", "SKIPPED", "UNKNOWN"] {
+        assert!(
+            capture(
+                &columns,
+                &[("__dogpaddle-notification.source", notification(kind))],
+                CaptureProgress::default(),
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        capture(
+            &columns,
+            &[
+                ("__dogpaddle-notification.source", notification("COMPLETED")),
+                ("__dogpaddle-notification.source", notification("COMPLETED")),
+            ],
+            CaptureProgress::default(),
+        )
+        .is_err()
+    );
+    let mut malformed = notification("COMPLETED");
+    malformed["payload"]["aggregate_type"] = json!("Other");
+    assert!(
+        capture(
+            &columns,
+            &[("__dogpaddle-notification.source", malformed)],
+            CaptureProgress::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -654,10 +703,18 @@ fn postgres_cdc_conversion_accepts_only_identified_control_records() {
     assert!(convert_control(Some("source.public.events"), Some(heartbeat.as_slice())).is_err());
     assert!(convert_control(None, None).is_err());
     assert!(convert_control(Some("source.public.events"), Some(b"{}".as_slice())).is_err());
+    let notification = serde_json::to_vec(&notification("COMPLETED")).unwrap();
+    assert!(
+        convert_control(
+            Some("__dogpaddle-notification.source"),
+            Some(notification.as_slice())
+        )
+        .is_err()
+    );
 }
 
 #[test]
-fn postgres_cdc_conversion_rejects_overflow_special_temporal_and_toast_values() {
+fn postgres_cdc_conversion_rejects_overflow_and_special_temporal_values() {
     for (data_type, value) in [
         (PostgresType::Int16, json!(32768)),
         (PostgresType::Int32, json!(2_147_483_648_u64)),
@@ -678,11 +735,6 @@ fn postgres_cdc_conversion_rejects_overflow_special_temporal_and_toast_values() 
             PostgresType::TimestampTz,
             json!("1970-01-01T00:00:00.000000001Z"),
         ),
-        (PostgresType::Text, json!("__debezium_unavailable_value")),
-        (
-            PostgresType::Bytea,
-            json!(BASE64_STANDARD.encode(b"__debezium_unavailable_value")),
-        ),
         (PostgresType::Bytea, json!("bad base64")),
     ] {
         let columns = [column(data_type)];
@@ -692,6 +744,27 @@ fn postgres_cdc_conversion_rejects_overflow_special_temporal_and_toast_values() 
                 &[envelope(&columns, "c", Value::Null, json!({"value":value}))]
             )
             .is_err(),
+            "{data_type:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_cdc_preserves_values_that_equal_debeziums_default_toast_placeholder() {
+    for (data_type, value) in [
+        (PostgresType::Text, json!("__debezium_unavailable_value")),
+        (
+            PostgresType::Bytea,
+            json!(BASE64_STANDARD.encode(b"__debezium_unavailable_value")),
+        ),
+    ] {
+        let columns = [column(data_type)];
+        assert!(
+            convert(
+                &columns,
+                &[envelope(&columns, "c", Value::Null, json!({"value":value}))]
+            )
+            .is_ok(),
             "{data_type:?}"
         );
     }

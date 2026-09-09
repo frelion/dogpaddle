@@ -117,15 +117,17 @@ Arrow canonical EOS
 物理 Schema 的第零字段固定为非 null Int64 `$dogpaddle.diff`，后续字段原样保存 logical
 record Schema；Schema metadata 包含 `dogpaddle.kind = change` 和
 `dogpaddle.change.version = 1`。标准 Arrow reader 可以直接读取这条 Stream，`decode_change`
-也只凭单个 entry 的字节恢复完整 Change 和事件顺序。
+从借用字节完整解码，`decode_change_owned` 在调用方已经拥有编码时可让对齐的 Arrow body
+buffer 继续共享该分配；两者都只凭单个 entry 的字节恢复完整 Change 和事件顺序。
 
 writer 固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 在交给 Arrow
 前预检 message 长度和 entry 边界，并要求 V5、小端、无压缩、无 Schema feature、恰好一个
 batch、canonical EOS 且无尾随字节。Arrow IPC version、writer options、Schema marker、物理
 diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
 
-这里的 canonical 限定的是消息 framing、EOS 和 writer options，并不表示 decoder 会把输入重新
-编码后逐字节比较，也不要求每个逻辑 `Change` 只有一种可接受的字节表示。符合 Arrow framing
+这里的 canonical 限定的是消息 framing、EOS、writer options，以及 Schema/Field metadata key
+必须完整、唯一并按字节严格递增；decoder 不会把输入重新编码后逐字节比较，也不要求每个逻辑
+`Change` 只有一种可接受的字节表示。符合 Arrow framing
 且不改变语义的 `FlatBuffer` 布局、默认值或 body padding 内容变体可能被接受；
 `encode_change` 的确定性输出及其黄金字节才是 `DogPaddle` 写入端的持久化基准。
 

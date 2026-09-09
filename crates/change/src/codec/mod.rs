@@ -50,6 +50,25 @@ pub fn decode_change(encoded: &[u8]) -> Result<Change, CodecError> {
     decode_guarded(encoded, None)
 }
 
+/// Decodes one owned self-contained `DogPaddle` change.
+///
+/// This enforces the same complete validation as [`decode_change`]. When the
+/// IPC body already has suitable native alignment, decoded Arrow buffers keep
+/// the supplied allocation instead of first copying the complete body.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] under the same conditions as [`decode_change`].
+pub fn decode_change_owned(encoded: Vec<u8>) -> Result<Change, CodecError> {
+    ensure_little_endian_target()?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let encoded = arrow_buffer::Buffer::from(encoded);
+        let parsed = stream::parse(encoded.as_slice())?;
+        batch::decode_owned(&encoded, &parsed)
+    }))
+    .map_err(|_| CodecError::invalid("Arrow IPC decoding panicked"))?
+}
+
 /// Decodes selected top-level logical fields from one self-contained Change.
 ///
 /// The embedded Schema, stream framing, complete `RecordBatch` metadata, and

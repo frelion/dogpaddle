@@ -355,7 +355,39 @@ final class ConnectorRuntime {
             cleanupFailure = error;
         }
 
-        Thread thread = engineThread;
+        cleanupFailure = awaitTerminationAndReclaim(engineThread, reclaim, cleanupFailure);
+        if (cleanupFailure != null) {
+            failure = cleanupFailure;
+            state.compareAndSet(State.STOPPING, State.FAILED);
+            startup.completeExceptionally(cleanupFailure);
+        }
+    }
+
+    static Throwable awaitTerminationAndReclaim(
+            Thread thread, Runnable reclaim, Throwable cleanupFailure) {
+        boolean interrupted = false;
+        if (thread != null && thread != Thread.currentThread()) {
+            while (thread.isAlive()) {
+                try {
+                    // A failed close attempt does not prove that the engine thread
+                    // will remain alive. Keep ownership until termination so the
+                    // registry entry and converter resources are reclaimed once.
+                    thread.join();
+                }
+                catch (InterruptedException error) {
+                    interrupted = true;
+                    if (cleanupFailure == null) {
+                        cleanupFailure = error;
+                    }
+                    else {
+                        cleanupFailure.addSuppressed(error);
+                    }
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
         if (thread == null || !thread.isAlive()) {
             try {
                 reclaim.run();
@@ -367,11 +399,7 @@ final class ConnectorRuntime {
                 cleanupFailure = error;
             }
         }
-        if (cleanupFailure != null) {
-            failure = cleanupFailure;
-            state.compareAndSet(State.STOPPING, State.FAILED);
-            startup.completeExceptionally(cleanupFailure);
-        }
+        return cleanupFailure;
     }
 
     private void closeAndJoinEngine() throws Throwable {

@@ -71,7 +71,10 @@ guard、Filter/Extend/Select/SchemaAlign 的 output Schema 约束，以及 recor
 这份 protobuf 是版本绑定的持久格式，不承诺跨 `DataFusion` 版本兼容。工作区精确 pin 相互匹配的
 `DataFusion`、`datafusion-proto` 与 Arrow；升级必须审查 proto roundtrip、physical planning 和执行语义。
 当前仍是开发期格式；升级依赖后只维护新的 canonical payload 与证据，旧数据库直接删除并重建，
-不承诺兼容、猜测或迁移旧表达式。DataFusion 的采用不等于引入 SQL 层。
+不承诺兼容、猜测或迁移旧表达式。当前版本拒绝 Expr 自身携带的非空 metadata，包括 Alias、
+Literal、Cast、TryCast、Placeholder 和嵌套 Arrow Field metadata，因为 `DataFusion` protobuf 用
+无序 map 编码这些值，不能形成稳定的 Definition bytes。SchemaAlign 明确声明的 target
+Field/Schema metadata 不受此限制。DataFusion 的采用不等于引入 SQL 层。
 
 ### Arrow 类型边界
 
@@ -391,8 +394,9 @@ payload 是固定字段顺序的 canonical JSON；未知字段、重复字段、
    `snapshot.mode=initial` 单线程启动快照。该阶段不产生公开 output。
 2. `Capturing` 每次取一个完整 delivery，将其所有记录按顺序转为一个 Change。有数据时将完整
    IPC `try_push` 到私有 Queue，并将整个 delivery 的 candidate checkpoint 一起提交；仅提交后 ACK。
-3. terminal heartbeat 将快照封口，其 checkpoint 成为 `Q`。非空表之前必须观察到 `snapshot=last`；
-   空表可直接封口。`last` 与 heartbeat 之间可出现跨 delivery 的 insert/update/delete；terminal delivery 的
+3. Debezium initial-snapshot `COMPLETED` notification 作为普通有序 delivery record 将快照封口，
+   其 checkpoint 成为 `Q`。非空表之前必须观察到 `snapshot=last`；空表可直接封口。`last` 与
+   completion notification 之间可出现跨 delivery 的 insert/update/delete；terminal delivery 的
    完整记录序列也保留在 spool。
 4. `Publishing` 先停止 snapshot connector，然后每个 turn 在同一个 Store 事务中读取并
    `pop_front` 一条 spool Change、向 Station 追加 output。背压、Schema 失配或 commit 失败同时回滚
@@ -405,7 +409,7 @@ payload 是固定字段顺序的 canonical JSON；未知字段、重复字段、
 并回到 `Fresh`。不兼容或 active slot 会拒绝 reset。`Publishing` 和 `Streaming` 不删 slot、不重做快照。
 
 容量不足时当前 delivery 不提交、不 ACK，spool 不变；必须使用更大 `bootstrap_spool_bytes` 和新 state
-目录重建。容量必须容纳完整表快照与 terminal heartbeat 前的 WAL 重叠。普通 poll 错误会重建临时
+目录重建。容量必须容纳完整表快照与 completion notification 前的 WAL 重叠。普通 poll 错误会重建临时
 connector；ACK error/panic 由 Station fail-stop，必须 reopen。checkpoint-only heartbeat 不制造空 Change。
 零超时 poll 只表示不等待数据，connector 启动、停止及 ACK 仍是有界同步调用。
 
@@ -421,8 +425,8 @@ insert 输出 `+after`，delete 输出 `-before`，update 按顺序输出 `-befo
 | boolean | Boolean | 保留 nullability |
 | smallint / integer / bigint | Int16 / Int32 / Int64 | 范围检查，不经浮点转换 |
 | real / double precision | Float32 / Float64 | 包括 Connect 非有限值表示 |
-| text / varchar | Utf8 | 不包含 Debezium 缺值占位符 |
-| bytea | Binary | 解码 Connect base64；不包含缺值占位符 |
+| text / varchar | Utf8 | 逐字保留合法文本；`REPLICA IDENTITY FULL` 保证完整 TOAST 值 |
+| bytea | Binary | 解码 Connect base64；`REPLICA IDENTITY FULL` 保证完整 TOAST 值 |
 | date | Date32 | 有限且可表示的日期 |
 | timestamp | Timestamp(Microsecond, None) | 固定 microseconds 模式；拒绝 infinity |
 | timestamptz | Timestamp(Microsecond, UTC) | 有限、可解析的 RFC3339，拒绝亚微秒截断 |
@@ -439,7 +443,6 @@ slot 名在 discovery 和首次 snapshot 前必须不存在；随后由该 Flow/
 `initial` 快照复制已有行，并从同一切点继续 WAL；无需空表或业务写入准入栅栏。TRUNCATE 明确拒绝。
 重启校验 system/database/table identity、logical Schema、publication 与 slot；运行中 DDL、publication/slot 修改或数据库替换不受支持。
 
-字面值 `__debezium_unavailable_value` 在 text/bytea 中暂作保留值并拒绝，以免将缺失 TOAST 当作真实值。
 不支持未列出的 PG 类型、多表路由、在线 Schema evolution、TLS、跨实例 fencing、旧布局迁移或 graceful stop API。
 
 完整宿主在 `system-tests/postgres/hosts/src/bin/postgres_cdc.rs`；普通 Cargo 测试无需 Java/PG，真实端到端与
@@ -460,7 +463,8 @@ opaque bytes，spool 每条是完整 Change IPC。开发期旧 Definition/单 ch
 状态为 `Fresh → Capturing → Publishing → Streaming`。`Fresh` 先持久化 `Capturing`，再以
 `snapshot.mode=initial_only`、`snapshot.locking.mode=minimal`、单线程启动一致全表快照。快照的 `r` 事件
 只写私有 spool，不产生公开 output。每个 delivery 的可选完整 Change IPC 和 candidate checkpoint 同事务提交，
-之后才 ACK。唯一且位于 delivery 末尾的 terminal heartbeat 将 checkpoint `Q` 与 `Publishing` 一起封口。
+之后才 ACK。Debezium initial-snapshot `COMPLETED` notification 作为普通有序 delivery record，
+将 checkpoint `Q` 与 `Publishing` 一起封口。
 `Publishing` 停止 snapshot connector，每个 turn 将一条 spool Change 的 dequeue 与 Station output append 同事务提交；
 背压或提交失败同时回滚两者。spool 排空后进入 `Streaming`，以 `snapshot.mode=recovery` 和
 `MemorySchemaHistory` 从 `Q` 继续 binlog，稳态仍以 checkpoint/output 同事务 + 提交后 ACK 运行。
@@ -792,9 +796,10 @@ tag12 canonical/non-secret Definition、精确 runtime resource、唯一 state C
 测试矩阵和 fixture 规则见工作区
 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
-Operation 不提供独立 benchmark。Definition codec 与一行算子 body 的微小计时不能代表真实事务、
-调度或持久化成本；相关性能由 Flow、Store 和跨 crate seam 的 owner workload 测量。完整性能所有权
-见根目录 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
+Operation 通常不为 Definition codec 或一行算子 body 建立独立 benchmark，因为它们不能代表真实事务、
+调度或持久化成本；相关性能由 Flow、Store 和跨 crate seam 的 owner workload 测量。Aggregate extrema
+是例外：它以完整 turn、同步 Store commit 和状态恢复为 owner workload，专门测量分区首尾读取成本。
+完整性能所有权见根目录 [`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)。
 
 ## 验证命令
 

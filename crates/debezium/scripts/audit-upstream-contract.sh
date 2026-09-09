@@ -41,6 +41,8 @@ git -C "$audit_root/debezium" sparse-checkout set \
 
 readonly async_engine="$audit_root/debezium/debezium-embedded/src/main/java/io/debezium/embedded/async/AsyncEmbeddedEngine.java"
 readonly relational_snapshot="$audit_root/debezium/debezium-connector-common/src/main/java/io/debezium/relational/RelationalSnapshotChangeEventSource.java"
+readonly abstract_snapshot="$audit_root/debezium/debezium-connector-common/src/main/java/io/debezium/pipeline/source/AbstractSnapshotChangeEventSource.java"
+readonly sink_notification="$audit_root/debezium/debezium-connector-common/src/main/java/io/debezium/pipeline/notification/channels/SinkNotificationChannel.java"
 readonly binlog_snapshot="$audit_root/debezium/debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSnapshotChangeEventSource.java"
 readonly pg_config="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresConnectorConfig.java"
 readonly pg_task="$audit_root/debezium/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresConnectorTask.java"
@@ -71,9 +73,17 @@ require_source \
   "$async_engine" \
   'a successful offset-store flush requests the connector commit callback'
 require_source \
-  'dispatcher.alwaysDispatchHeartbeatEvent(ctx.partition, ctx.offset);' \
+  'ctx.offset.postSnapshotCompletion();' \
   "$relational_snapshot" \
-  'a completed relational snapshot emits an explicit terminal heartbeat'
+  'the relational snapshot marks its offset complete before returning'
+require_source \
+  'notificationService.initialSnapshotNotificationService().notifyCompleted(ctx.partition, ctx.offset);' \
+  "$abstract_snapshot" \
+  'snapshot completion notification carries the completed offset'
+require_source \
+  'offsets.getTheOnlyOffset().getOffset();' \
+  "$sink_notification" \
+  'the sink notification SourceRecord uses the supplied completed offset'
 require_source \
   'if (!connection.userHasPrivileges("LOCK TABLES")) {' \
   "$binlog_snapshot" \
