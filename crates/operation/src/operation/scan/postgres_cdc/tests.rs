@@ -37,7 +37,7 @@ fn envelope(columns: &[PostgresColumn], op: &str, before: Value, after: Value) -
             {"field":"after","type":"struct","optional":true,"fields":fields}
         ]},
         "payload":{
-            "source":{"connector":"postgresql","schema":"public","table":"events","snapshot":"false"},
+            "source":{"connector":"postgresql","schema":"public","table":"events","snapshot":null},
             "op":op
         }
     });
@@ -440,17 +440,50 @@ fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
 }
 
 #[test]
-fn postgres_cdc_streaming_accepts_the_bridges_null_snapshot_marker() {
+fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
     let columns = [column(PostgresType::Int64)];
-    for marker in [Value::Null, json!(false), json!("false")] {
-        let mut event = envelope(&columns, "c", Value::Null, json!({"value":1}));
-        event["payload"]["source"]["snapshot"] = marker;
-        assert!(convert(&columns, &[event]).unwrap().is_some());
+    for marker in ["true", "first"] {
+        let captured = capture(
+            &columns,
+            &[(
+                "source.public.events",
+                snapshot(&columns, marker, json!({"value":1})),
+            )],
+            CaptureProgress::default(),
+        )
+        .unwrap();
+        assert!(!captured.sealed);
+        assert!(captured.change.is_some());
     }
+    let terminal = capture(
+        &columns,
+        &[(
+            "source.public.events",
+            snapshot(&columns, "last", json!({"value":1})),
+        )],
+        CaptureProgress::default(),
+    )
+    .unwrap();
+    assert!(
+        capture(
+            &columns,
+            &[("__debezium-heartbeat.source", heartbeat())],
+            terminal.next_progress,
+        )
+        .unwrap()
+        .sealed
+    );
+
+    let mut streaming = envelope(&columns, "c", Value::Null, json!({"value":1}));
+    streaming["payload"]["source"]["snapshot"] = Value::Null;
+    assert!(convert(&columns, &[streaming]).unwrap().is_some());
+
     for marker in [
         json!(true),
-        json!("true"),
-        json!("last"),
+        json!(false),
+        json!("false"),
+        json!("first_in_data_collection"),
+        json!("last_in_data_collection"),
         json!("incremental"),
     ] {
         let mut event = envelope(&columns, "c", Value::Null, json!({"value":1}));

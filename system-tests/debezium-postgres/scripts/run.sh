@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly COMPOSE_PROJECT="dogpaddle-debezium-d1"
 readonly COMPOSE_NETWORK="dogpaddle-debezium-d1_default"
-readonly POSTGRES_IMAGE="quay.io/debezium/postgres:16@sha256:a2d10668dffca8c8434408ffeea1925ccd8ccb1faf633be3f911c8feccd82e14"
+readonly POSTGRES_IMAGE="docker.io/library/postgres:16.15@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 gate_dir="$(cd -- "$script_dir/.." && pwd)"

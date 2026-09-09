@@ -203,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           tar -xzf "$RUNNER_TEMP/linux-artifact/debezium-postgres-linux.tar.gz" -C "$RUNNER_TEMP/linux-artifact"
-          podman pull quay.io/debezium/postgres:16@sha256:a2d10668dffca8c8434408ffeea1925ccd8ccb1faf633be3f911c8feccd82e14
+          podman pull docker.io/library/postgres:16.15@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
           podman compose --file system-tests/debezium-postgres/compose.yaml config \
             >"$RUNNER_TEMP/d1-artifacts/compose-config.log"
 

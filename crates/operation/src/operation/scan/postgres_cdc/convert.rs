@@ -268,11 +268,11 @@ fn validate_metadata(
         }
     }
     match metadata.get("snapshot") {
-        Some(Value::Bool(true)) => Ok(SnapshotMarker::Snapshot),
-        Some(Value::String(value)) if value == "true" => Ok(SnapshotMarker::Snapshot),
+        Some(Value::String(value)) if matches!(value.as_str(), "true" | "first") => {
+            Ok(SnapshotMarker::Snapshot)
+        }
         Some(Value::String(value)) if value == "last" => Ok(SnapshotMarker::Last),
-        Some(Value::Null | Value::Bool(false)) => Ok(SnapshotMarker::Streaming),
-        Some(Value::String(value)) if value == "false" => Ok(SnapshotMarker::Streaming),
+        Some(Value::Null) => Ok(SnapshotMarker::Streaming),
         _ => Err(invalid(
             "Debezium CDC metadata has an invalid snapshot marker",
         )),
