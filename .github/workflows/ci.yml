@@ -21,9 +21,9 @@ env:
 
 jobs:
   check:
-    name: Workspace check (Rust 1.96)
+    name: Workspace check and performance smoke (Rust 1.96)
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,33 +51,11 @@ jobs:
       - name: Run the canonical workspace gate
         run: cargo xtask check
 
-  performance-smoke:
-    name: Performance smoke
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
-
-      - name: Restore Cargo cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            cargo-v1-${{ runner.os }}-1.96-
-
       - name: Run Criterion targets in test mode
         run: cargo test --workspace --benches --locked
+
+      - name: Compile Criterion targets once
+        run: cargo bench --workspace --no-run --locked
 
       - name: Run owner-specific smoke workloads
         env:
