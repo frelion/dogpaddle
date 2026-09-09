@@ -51,10 +51,10 @@ jobs:
       - name: Run the canonical workspace gate
         run: cargo xtask check
 
-  performance-store:
-    name: Performance smoke / ordered map
+  performance-smoke:
+    name: Performance smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,41 +76,21 @@ jobs:
           restore-keys: |
             cargo-v1-${{ runner.os }}-1.96-
 
-      - name: Run ordered-map smoke workload
-        env:
-          DOGPADDLE_PERF_PROFILE: smoke
-        run: cargo bench --locked -p dogpaddle-store --bench ordered_map
-
-  performance-other:
-    name: Performance smoke / other owners
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
-
-      - name: Restore Cargo cache
+      - name: Restore benchmark build cache
+        id: performance-bench-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
+          path: target/performance-smoke
+          key: perf-bench-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            cargo-v1-${{ runner.os }}-1.96-
+            perf-bench-v1-${{ runner.os }}-1.96-
 
       - name: Run Criterion targets in test mode
         run: cargo test --workspace --benches --locked
 
-      - name: Run other owner smoke workloads
+      - name: Run owner-specific smoke workloads
         env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance-smoke
           DOGPADDLE_PERF_PROFILE: smoke
         run: |
           set -euo pipefail
@@ -123,19 +103,13 @@ jobs:
             python3 -c 'import json, pathlib, sys; [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]' "$output"
           }
           run_jsonl_smoke change-codec cargo bench --locked -p dogpaddle-change --bench change_codec
+          cargo bench --locked -p dogpaddle-store --bench ordered_map
           cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
           run_jsonl_smoke flow-runtime cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 
-  performance-smoke:
-    name: Performance smoke
-    if: always()
-    needs: [performance-store, performance-other]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require every performance workload
-        env:
-          ORDERED_MAP_RESULT: ${{ needs.performance-store.result }}
-          OTHER_OWNERS_RESULT: ${{ needs.performance-other.result }}
-        run: |
-          test "$ORDERED_MAP_RESULT" = success
-          test "$OTHER_OWNERS_RESULT" = success
+      - name: Save benchmark build cache
+        if: steps.performance-bench-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/performance-smoke
+          key: perf-bench-v1-${{ runner.os }}-1.96-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
