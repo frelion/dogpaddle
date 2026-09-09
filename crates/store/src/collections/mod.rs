@@ -10,7 +10,7 @@ pub use multiset::{
     MultiplicityChange, MultisetEntry, OrderedMultiset, OrderedMultisetAccess,
     OrderedMultisetReadAccess,
 };
-pub use ordered_map::{OrderedMap, OrderedMapAccess, OrderedMapEntry, OrderedMapReadAccess};
+pub use ordered_map::{OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess};
 pub use partitioned_multiset::{
     MultisetPartition, PartitionedMultiset, PartitionedMultisetAccess,
     PartitionedMultisetReadAccess, ReadMultisetPartition,

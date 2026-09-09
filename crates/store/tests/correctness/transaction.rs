@@ -163,36 +163,33 @@ fn wrong_store_poison_stops_a_read_snapshot() {
 }
 
 #[test]
-fn read_scan_visitor_error_poisons_the_snapshot() {
+fn read_scan_decode_error_poisons_the_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let data = create_byte_map(&mut store, "data").unwrap();
+    let raw = create_byte_map(&mut store, "data").unwrap();
+    let typed = store
+        .open_data::<dogpaddle_store::OrderedMap<Vec<u8>, u64>>("data")
+        .unwrap();
     let (mut writes, reads) = store.into_transactions().split();
-    let key = b"key".to_vec();
-
-    {
-        let transaction = writes.begin();
-        data.access(transaction.access())
-            .unwrap()
-            .put(&key, &b"value".to_vec())
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = reads.begin();
-    let access = data.read(transaction.access()).unwrap();
+    let transaction = writes.begin();
+    raw.access(transaction.access())
+        .unwrap()
+        .put(&b"key".to_vec(), &vec![1])
+        .unwrap();
+    transaction.commit().unwrap();
+    let snapshot = reads.begin();
+    let access = typed.read(snapshot.access()).unwrap();
     assert!(matches!(
         access.scan(
             ..,
             ScanDirection::Ascending,
             None,
-            ScanLimit::new(1, 1_024).unwrap(),
-            |_| Err::<(), _>(StoreError::InvalidScanLimit),
+            ScanLimit::new(1, 1024).unwrap()
         ),
-        Err(StoreError::InvalidScanLimit)
+        Err(StoreError::Codec(_))
     ));
     assert!(matches!(
-        access.get(&key),
+        access.get(&b"key".to_vec()),
         Err(StoreError::TransactionPoisoned)
     ));
 }
@@ -364,21 +361,15 @@ fn scan_admission_errors_are_soft() {
 
     let transaction = transactions.begin();
     let mut access = data.access(transaction.access()).unwrap();
-    let mut visited = false;
     assert!(matches!(
         access.scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(1, 1).unwrap(),
-            |_| {
-                visited = true;
-                Ok::<(), StoreError>(())
-            },
         ),
         Err(StoreError::ItemTooLarge { .. })
     ));
-    assert!(!visited);
     access
         .put(&b"second".to_vec(), &b"still writable".to_vec())
         .unwrap();

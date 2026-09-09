@@ -104,6 +104,8 @@ jobs:
           }
           run_jsonl_smoke change-codec cargo bench --locked -p dogpaddle-change --bench change_codec
           cargo bench --locked -p dogpaddle-store --bench ordered_map
+          cargo bench --locked -p dogpaddle-store --bench subscribed_log
+          cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
           cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
           run_jsonl_smoke flow-runtime cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 

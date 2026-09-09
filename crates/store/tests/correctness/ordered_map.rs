@@ -138,8 +138,7 @@ fn slice_backed_key_codecs_support_points_ranges_and_continuations() {
     let access = map.access(transaction.access()).unwrap();
     assert_eq!(access.get(&keys[1]).unwrap(), Some(1));
     let limit = ScanLimit::new(1, 1_024).unwrap();
-    let mut ascending_items = Vec::new();
-    let ascending_continuation = access
+    let ascending = access
         .scan(
             (
                 std::ops::Bound::Included(&keys[0]),
@@ -148,23 +147,15 @@ fn slice_backed_key_codecs_support_points_ranges_and_continuations() {
             ScanDirection::Ascending,
             None,
             limit,
-            |entry| {
-                ascending_items.push(entry.decode_owned()?);
-                Ok::<(), StoreError>(())
-            },
         )
         .unwrap();
-    assert_eq!(ascending_items, vec![(keys[0].clone(), 0)]);
-    assert_eq!(ascending_continuation, Some(keys[0].clone()));
-    let mut descending_items = Vec::new();
-    let descending_continuation = access
-        .scan(.., ScanDirection::Descending, None, limit, |entry| {
-            descending_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
+    assert_eq!(ascending.entries, vec![(keys[0].clone(), 0)]);
+    assert_eq!(ascending.continuation, Some(keys[0].clone()));
+    let descending = access
+        .scan(.., ScanDirection::Descending, None, limit)
         .unwrap();
-    assert_eq!(descending_items, vec![(keys[2].clone(), 2)]);
-    assert_eq!(descending_continuation, Some(keys[2].clone()));
+    assert_eq!(descending.entries, vec![(keys[2].clone(), 2)]);
+    assert_eq!(descending.continuation, Some(keys[2].clone()));
 }
 
 #[test]

@@ -2,41 +2,35 @@ use datafusion_common::ScalarValue;
 
 use arrow_schema::DataType;
 
-use super::{
-    Binder, BoundReduction, Descriptor, Fold, Reduction, apply_weight, read_u64, write_u64,
-};
+use super::{BoundReduction, Descriptor, Fold, Reduction, apply_weight, read_u64, write_u64};
 use crate::operation::transform::aggregate::AggregateError;
 
 pub(super) const COUNT_ALL_DESCRIPTOR: Descriptor = Descriptor {
     tag: super::COUNT_ALL,
     arguments: 0,
-    bind: Binder::Infallible(bind_all),
+    bind: |_| {
+        Ok(BoundReduction {
+            reduction: Reduction::Fold(Box::new(CountAll)),
+            output_type: DataType::Int64,
+            nullable: false,
+        })
+    },
 };
 
 pub(super) const COUNT_DESCRIPTOR: Descriptor = Descriptor {
     tag: super::COUNT,
     arguments: 1,
-    bind: Binder::Infallible(bind_value),
+    bind: |_| {
+        Ok(BoundReduction {
+            reduction: Reduction::Fold(Box::new(Count)),
+            output_type: DataType::Int64,
+            nullable: false,
+        })
+    },
 };
 
 struct CountAll;
 struct Count;
-
-fn bind_all(_arguments: &[crate::expression::BoundExpression]) -> BoundReduction {
-    BoundReduction {
-        reduction: Reduction::Fold(Box::new(CountAll)),
-        output_type: DataType::Int64,
-        nullable: false,
-    }
-}
-
-fn bind_value(_arguments: &[crate::expression::BoundExpression]) -> BoundReduction {
-    BoundReduction {
-        reduction: Reduction::Fold(Box::new(Count)),
-        output_type: DataType::Int64,
-        nullable: false,
-    }
-}
 
 impl Fold for CountAll {
     fn empty(&self) -> Vec<u8> {

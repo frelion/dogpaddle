@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    num::NonZeroU64,
-};
+use std::{collections::HashSet, num::NonZeroU64};
 
 use thiserror::Error;
 
@@ -117,7 +114,7 @@ pub(super) fn finish_definition(
 pub(super) fn validate_decoded_topology(
     stations: &[StationDefinition],
     inputs_by_station: &[Option<Vec<usize>>],
-) -> Result<(), TopologyError> {
+) -> Result<Vec<usize>, TopologyError> {
     for (station, inputs) in inputs_by_station.iter().enumerate() {
         if inputs
             .as_ref()
@@ -126,8 +123,9 @@ pub(super) fn validate_decoded_topology(
             return Err(TopologyError::SelfLoop(stations[station].id.clone()));
         }
     }
-    validate_topology(stations, inputs_by_station)?;
-    validate_output_capacities(stations)
+    let schedule = validate_topology(stations, inputs_by_station)?;
+    validate_output_capacities(stations)?;
+    Ok(schedule)
 }
 
 fn apply_output_capacities(
@@ -169,11 +167,12 @@ fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), Topo
 fn validate_topology(
     stations: &[StationDefinition],
     inputs_by_station: &[Option<Vec<usize>>],
-) -> Result<(), TopologyError> {
-    validate_acyclic(stations.len(), inputs_by_station)?;
+) -> Result<Vec<usize>, TopologyError> {
+    let schedule = topological_schedule(inputs_by_station)?;
     validate_endpoints(stations, inputs_by_station)?;
     validate_input_counts(stations, inputs_by_station)?;
-    validate_inputs_have_output(stations, inputs_by_station)
+    validate_inputs_have_output(stations, inputs_by_station)?;
+    Ok(schedule)
 }
 
 fn validate_endpoints(
@@ -300,10 +299,10 @@ fn resolve_ref(
     }
 }
 
-pub(super) fn validate_acyclic(
-    station_count: usize,
+pub(super) fn topological_schedule(
     inputs_by_station: &[Option<Vec<usize>>],
-) -> Result<(), TopologyError> {
+) -> Result<Vec<usize>, TopologyError> {
+    let station_count = inputs_by_station.len();
     let mut indegrees = vec![0_usize; station_count];
     let mut consumers_by_station = vec![Vec::new(); station_count];
     for (station, inputs) in inputs_by_station.iter().enumerate() {
@@ -317,20 +316,25 @@ pub(super) fn validate_acyclic(
         .iter()
         .enumerate()
         .filter_map(|(station, indegree)| (*indegree == 0).then_some(station))
-        .collect::<VecDeque<_>>();
-    let mut visited = 0_usize;
-    while let Some(station) = ready.pop_front() {
-        visited += 1;
-        for consumer in &consumers_by_station[station] {
-            indegrees[*consumer] -= 1;
-            if indegrees[*consumer] == 0 {
-                ready.push_back(*consumer);
+        .collect::<Vec<_>>();
+    let mut schedule = Vec::with_capacity(station_count);
+    while !ready.is_empty() {
+        let mut next = Vec::new();
+        for station in ready {
+            schedule.push(station);
+            for consumer in &consumers_by_station[station] {
+                indegrees[*consumer] -= 1;
+                if indegrees[*consumer] == 0 {
+                    next.push(*consumer);
+                }
             }
         }
+        next.sort_unstable();
+        ready = next;
     }
 
-    if visited == station_count {
-        Ok(())
+    if schedule.len() == station_count {
+        Ok(schedule)
     } else {
         Err(TopologyError::Cycle)
     }

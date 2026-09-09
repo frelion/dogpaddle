@@ -316,8 +316,8 @@ manifest 已发布却缺少所声明资源时返回 `MissingResource`。如果�
 
 `FlowFactory::new(path).open()` 在一次 Store setup 生命周期中读取、解码并重新校验 manifest，再解析拓扑并
 纯重建全部 Schema bindings；只有成功后才用同一个 Store 打开其余数据对象和 output，最后按
-input ID 重新注入 inputs、装配 Station。第二次 Definition 读取、已有 active Cell 与 output log 校验共享
-同一个 RO snapshot，不启动或提交写事务。open 不扫描或解码全部 backlog；合法 IPC 中与绑定不一致的
+input ID 重新注入 inputs、装配 Station。Store 始终独占同一路径，Definition 只读取一次；已有 active Cell
+与 output log 在 setup 的同一个 RO snapshot 中校验，之后才消费 Store 获得运行期事务能力，不启动或提交写事务。open 不扫描或解码全部 backlog；合法 IPC 中与绑定不一致的
 Schema 会在对应 entry 首次 intake 时被拒绝且不 acknowledge。调用方不需要重新提交 Definition。
 
 当前磁盘格式的外层使用显式 magic、版本号、定长整数、sealed Operation Definition 集合的稳定 tag

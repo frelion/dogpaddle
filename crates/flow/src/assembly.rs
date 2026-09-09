@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use crate::{
-    build::FlowDefinition,
     flow::RuntimeTopology,
     station::{Station, StationParts},
 };
@@ -11,6 +8,7 @@ pub(crate) struct AssembledFlow {
     pub(crate) topology: RuntimeTopology,
 }
 
+#[derive(Debug)]
 pub(crate) struct ResolvedTopology {
     inputs_by_station: Vec<Vec<usize>>,
     subscriptions_by_station: Vec<Vec<u64>>,
@@ -18,27 +16,13 @@ pub(crate) struct ResolvedTopology {
     schedule: Vec<usize>,
 }
 
-pub(crate) fn resolve_topology(definition: &FlowDefinition) -> ResolvedTopology {
-    let indices = definition
-        .stations()
-        .iter()
-        .enumerate()
-        .map(|(index, station)| (station.id(), index))
-        .collect::<HashMap<_, _>>();
-    let inputs_by_station = definition
-        .stations()
-        .iter()
-        .map(|station| {
-            station
-                .inputs()
-                .map(|input| {
-                    indices
-                        .get(input)
-                        .copied()
-                        .expect("validated input ID must identify one Station")
-                })
-                .collect::<Vec<_>>()
-        })
+pub(crate) fn resolve_topology(
+    inputs_by_station: Vec<Option<Vec<usize>>>,
+    schedule: Vec<usize>,
+) -> ResolvedTopology {
+    let inputs_by_station = inputs_by_station
+        .into_iter()
+        .map(Option::unwrap_or_default)
         .collect::<Vec<_>>();
     let mut subscriber_counts = vec![0_u64; inputs_by_station.len()];
     let subscriptions_by_station = inputs_by_station
@@ -56,7 +40,6 @@ pub(crate) fn resolve_topology(definition: &FlowDefinition) -> ResolvedTopology 
                 .collect()
         })
         .collect();
-    let schedule = topological_schedule(&inputs_by_station);
     ResolvedTopology {
         inputs_by_station,
         subscriptions_by_station,
@@ -133,41 +116,4 @@ pub(crate) fn assemble_stations(
         stations,
         topology: RuntimeTopology { schedule },
     }
-}
-
-fn topological_schedule(inputs_by_station: &[Vec<usize>]) -> Vec<usize> {
-    let mut indegrees = inputs_by_station.iter().map(Vec::len).collect::<Vec<_>>();
-    let mut consumers_by_station = vec![Vec::new(); inputs_by_station.len()];
-    for (station, inputs) in inputs_by_station.iter().enumerate() {
-        for input in inputs {
-            consumers_by_station[*input].push(station);
-        }
-    }
-
-    let mut ready = indegrees
-        .iter()
-        .enumerate()
-        .filter_map(|(station, indegree)| (*indegree == 0).then_some(station))
-        .collect::<Vec<_>>();
-    let mut schedule = Vec::with_capacity(inputs_by_station.len());
-    while !ready.is_empty() {
-        let mut next = Vec::new();
-        for station in ready {
-            schedule.push(station);
-            for consumer in &consumers_by_station[station] {
-                indegrees[*consumer] -= 1;
-                if indegrees[*consumer] == 0 {
-                    next.push(*consumer);
-                }
-            }
-        }
-        next.sort_unstable();
-        ready = next;
-    }
-    assert_eq!(
-        schedule.len(),
-        inputs_by_station.len(),
-        "validated Flow definition must remain acyclic during assembly"
-    );
-    schedule
 }

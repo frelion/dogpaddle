@@ -97,7 +97,9 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 | `change_core` | Criterion |
 | `change_codec` | Change 自有五路旋转 runner |
 | `cell` | Criterion |
-| `ordered_map` | Criterion |
+| `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、重复 MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
+| `ordered_map` | Criterion；完整 owned-page 扫描 |
+| `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
 | `flow_runtime` | Flow 自有逐采样 `advance` latency trace |
 | `change_subscribed_log` | Criterion |
@@ -148,6 +150,8 @@ cargo test --workspace --benches --locked
 
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench change_codec
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```

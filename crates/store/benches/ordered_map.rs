@@ -14,7 +14,7 @@ mod measure;
 
 use fixture::{MapFixture, StationFixture};
 use measure::{
-    EntryRead, measure_bulk_put, measure_point_get, measure_scan, measure_single_put_commits,
+    measure_bulk_put, measure_point_get, measure_scan, measure_single_put_commits,
     measure_station_steps,
 };
 
@@ -119,13 +119,7 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
         group.bench_function(BenchmarkId::new(name, config.entries), |bencher| {
             bencher.iter_custom(|iterations| {
                 measure_iterations(iterations, || {
-                    measure_scan(
-                        &fixture,
-                        config.entries,
-                        direction,
-                        scan_limit,
-                        EntryRead::Owned,
-                    )
+                    measure_scan(&fixture, config.entries, direction, scan_limit)
                 })
             });
         });
@@ -133,11 +127,9 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
 
     group.throughput(elements(config.wide_entries));
     let wide = MapFixture::populated(root, "wide", config.wide_entries, WIDE_VALUE_BYTES);
-    for (name, read) in [
-        ("wide_scan_owned", EntryRead::Owned),
-        ("wide_scan_projected", EntryRead::Projected),
-    ] {
-        group.bench_function(BenchmarkId::new(name, config.wide_entries), |bencher| {
+    group.bench_function(
+        BenchmarkId::new("wide_scan", config.wide_entries),
+        |bencher| {
             bencher.iter_custom(|iterations| {
                 measure_iterations(iterations, || {
                     measure_scan(
@@ -145,12 +137,11 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
                         config.wide_entries,
                         ScanDirection::Ascending,
                         scan_limit,
-                        read,
                     )
                 })
             });
-        });
-    }
+        },
+    );
 
     group.throughput(elements(config.commits));
     group.bench_function(
@@ -228,8 +219,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
                 "point_get",
                 "ascending_scan",
                 "descending_scan",
-                "wide_scan_owned",
-                "wide_scan_projected",
+                "wide_scan",
                 "station_step",
                 "durable_hot_overwrite"
             ]

@@ -221,10 +221,8 @@ impl TransactionalOperation for AggregateOperation {
                     ..
                 } = call
                 {
-                    let call_state = state
-                        .folds
-                        .get_mut(*state_index)
-                        .ok_or(AggregateError::InvalidState)?;
+                    // The persisted count was checked above; binding assigns dense indices.
+                    let call_state = &mut state.folds[*state_index];
                     let values = scalar_tuple(&call_columns[aggregate], row)?;
                     reduction.apply(call_state, &values, difference, state.weight)?;
                 }
@@ -297,12 +295,7 @@ fn call_output(
         .map(|call| match call {
             BoundCall::Fold {
                 state, reduction, ..
-            } => reduction.output(
-                fold_states
-                    .get(*state)
-                    .ok_or(AggregateError::InvalidState)?,
-                group_weight,
-            ),
+            } => reduction.output(&fold_states[*state], group_weight),
             BoundCall::Extrema { layout, direction } => {
                 let layout = &layouts[*layout];
                 let partition = entries.partition(&EntryPartition::new(layout.id, group))?;

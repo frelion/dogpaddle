@@ -39,7 +39,6 @@ impl Station {
         reads: &ReadTransactions,
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
-        self.ensure_runnable()?;
         let pinned = match self.inbox.intake(reads, transactions) {
             Ok(pinned) => pinned,
             Err(error) => {

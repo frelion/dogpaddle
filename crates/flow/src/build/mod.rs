@@ -10,12 +10,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
-use crate::{
-    assembly::{assemble_stations, resolve_topology},
-    error::FlowError,
-    flow::Flow,
-    station::StationParts,
-};
+use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
 
 pub(crate) mod codec;
 mod definition;
@@ -164,8 +159,7 @@ impl FlowFactory {
         let path = self.path.clone();
         let declared_definition = self.finish_definition()?;
         let definition_bytes = codec::encode(&declared_definition)?;
-        let definition = codec::decode(&definition_bytes)?;
-        let topology = resolve_topology(&definition);
+        let (definition, topology) = codec::decode(&definition_bytes)?;
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
         let resources = bind_resources(&definition, &bindings, resources)?;

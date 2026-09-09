@@ -48,31 +48,28 @@ fn collect_pages(
     let mut items = Vec::new();
     let mut continuation = None;
     for _ in 0..100 {
-        let mut page = Vec::new();
-        let next = access
+        let page = access
             .scan(
                 (lower, upper),
                 direction,
                 continuation.as_ref(),
                 ScanLimit::new(max_items, 4_096).unwrap(),
-                |entry| {
-                    page.push(entry.decode_owned()?);
-                    Ok::<(), StoreError>(())
-                },
             )
             .unwrap();
-        assert!(page.len() <= max_items);
-        assert_eq!(page, expected[items.len()..items.len() + page.len()]);
-        let has_more = items.len() + page.len() < expected.len();
-        assert_eq!(next.is_some(), has_more);
-
-        if let Some(next) = next {
-            assert_eq!(page.last().map(|(key, _)| key), Some(&next));
-            assert!(!page.is_empty());
+        assert!(page.entries.len() <= max_items);
+        assert_eq!(
+            page.entries,
+            expected[items.len()..items.len() + page.entries.len()]
+        );
+        let has_more = items.len() + page.entries.len() < expected.len();
+        assert_eq!(page.continuation.is_some(), has_more);
+        if let Some(next) = page.continuation {
+            assert_eq!(page.entries.last().map(|(key, _)| key), Some(&next));
+            assert!(!page.entries.is_empty());
             continuation = Some(next);
-            items.extend(page);
+            items.extend(page.entries);
         } else {
-            items.extend(page);
+            items.extend(page.entries);
             assert_eq!(items.len(), expected.len());
             return items;
         }
@@ -144,44 +141,32 @@ fn byte_limits_and_continuations_are_exact() {
 
     let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
-    let mut first = Vec::new();
-    let first_continuation = access
+    let first = access
         .scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(10, 22).unwrap(),
-            |entry| {
-                first.push(entry.decode_owned()?);
-                Ok::<(), StoreError>(())
-            },
         )
         .unwrap();
-    assert_eq!(first, vec![(-2, "v-2".into()), (-1, "v-1".into())]);
-    assert_eq!(first_continuation, Some(-1));
-    let mut second = Vec::new();
-    let second_continuation = access
+    assert_eq!(first.entries, vec![(-2, "v-2".into()), (-1, "v-1".into())]);
+    assert_eq!(first.continuation, Some(-1));
+    let second = access
         .scan(
             ..,
             ScanDirection::Ascending,
-            first_continuation.as_ref(),
+            first.continuation.as_ref(),
             ScanLimit::new(10, 22).unwrap(),
-            |entry| {
-                second.push(entry.decode_owned()?);
-                Ok::<(), StoreError>(())
-            },
         )
         .unwrap();
-    assert_eq!(second, vec![(0, "v0".into())]);
-    assert_eq!(second_continuation, None);
-
+    assert_eq!(second.entries, vec![(0, "v0".into())]);
+    assert_eq!(second.continuation, None);
     assert!(matches!(
         access.scan(
             ..,
             ScanDirection::Ascending,
             None,
-            ScanLimit::new(10, 10).unwrap(),
-            |_| Ok::<(), StoreError>(()),
+            ScanLimit::new(10, 10).unwrap()
         ),
         Err(StoreError::ItemTooLarge {
             size: 11,
@@ -208,34 +193,21 @@ fn continuation_outside_the_range_returns_no_items() {
     let transaction = transactions.begin();
     let access = map.access(transaction.access()).unwrap();
     let limit = ScanLimit::new(10, 1_024).unwrap();
-    let mut visits = 0;
-    let ascending = access
-        .scan(
-            (Bound::Included(-1), Bound::Included(1)),
-            ScanDirection::Ascending,
-            Some(&9),
-            limit,
-            |_| {
-                visits += 1;
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    let descending = access
-        .scan(
-            (Bound::Included(-1), Bound::Included(1)),
-            ScanDirection::Descending,
-            Some(&-9),
-            limit,
-            |_| {
-                visits += 1;
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    assert_eq!(visits, 0);
-    assert_eq!(ascending, None);
-    assert_eq!(descending, None);
+    for (direction, resume) in [
+        (ScanDirection::Ascending, 9),
+        (ScanDirection::Descending, -9),
+    ] {
+        let page = access
+            .scan(
+                (Bound::Included(-1), Bound::Included(1)),
+                direction,
+                Some(&resume),
+                limit,
+            )
+            .unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.continuation, None);
+    }
 }
 
 #[test]
@@ -262,27 +234,18 @@ fn an_exact_page_stops_at_the_neighboring_namespace() {
 
     let transaction = transactions.begin();
     let limit = ScanLimit::new(1, 1_024).unwrap();
-    let mut first_items = Vec::new();
-    let first_continuation = first
+    let first_page = first
         .access(transaction.access())
         .unwrap()
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            first_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
+        .scan(.., ScanDirection::Ascending, None, limit)
         .unwrap();
-    let mut second_items = Vec::new();
-    let second_continuation = second
+    let second_page = second
         .access(transaction.access())
         .unwrap()
-        .scan(.., ScanDirection::Descending, None, limit, |entry| {
-            second_items.push(entry.decode_owned()?);
-            Ok::<(), StoreError>(())
-        })
+        .scan(.., ScanDirection::Descending, None, limit)
         .unwrap();
-
-    assert_eq!(first_items, vec![(1, 1)]);
-    assert_eq!(first_continuation, None);
-    assert_eq!(second_items, vec![(2, 2)]);
-    assert_eq!(second_continuation, None);
+    assert_eq!(first_page.entries, vec![(1, 1)]);
+    assert_eq!(first_page.continuation, None);
+    assert_eq!(second_page.entries, vec![(2, 2)]);
+    assert_eq!(second_page.continuation, None);
 }

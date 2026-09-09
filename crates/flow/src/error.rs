@@ -54,9 +54,6 @@ pub enum FlowError {
     /// A Store exists, but no complete Flow definition was published.
     #[error("flow build is incomplete")]
     IncompleteBuild,
-    /// The definition changed between the two phases of opening the Flow.
-    #[error("flow definition changed while it was being opened")]
-    DefinitionChangedDuringOpen,
     /// A published definition references a required resource that is absent.
     #[error("published flow is missing required resource {name:?}")]
     MissingResource {

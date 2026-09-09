@@ -35,7 +35,14 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+dogpaddle-perf-context.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "aggregate_extrema"
+harness = false
+test = true
 
 [[test]]
 name = "correctness"

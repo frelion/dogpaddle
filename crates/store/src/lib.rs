@@ -9,7 +9,7 @@ mod store;
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
     Cell, CellAccess, CellReadAccess, MultiplicityChange, MultisetEntry, MultisetPartition,
-    OrderedMap, OrderedMapAccess, OrderedMapEntry, OrderedMapReadAccess, OrderedMultiset,
+    OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess, OrderedMultiset,
     OrderedMultisetAccess, OrderedMultisetReadAccess, PartitionedMultiset,
     PartitionedMultisetAccess, PartitionedMultisetReadAccess, Queue, QueueAccess,
     ReadMultisetPartition, SubscribedLog, SubscribedLogStatus, SubscribedLogWriter, Subscription,
@@ -17,6 +17,6 @@ pub use collections::{
 };
 pub use data_class::StoreData;
 pub use error::StoreError;
-pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess, TransactionRef};
+pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess};
 pub use store::{ReadTransaction, ReadTransactionAccess, ReadTransactions};
 pub use store::{ScanDirection, ScanLimit, Store, Transaction, TransactionAccess, Transactions};

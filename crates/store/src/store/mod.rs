@@ -10,7 +10,7 @@ mod data;
 mod database;
 mod transaction;
 
-pub(crate) use data::{DataAccess, ReadDataAccess, TransactionRef};
+pub(crate) use data::{DataAccess, ReadDataAccess};
 pub use data::{ScanDirection, ScanLimit};
 
 /// Persistent kind of one typed data namespace.

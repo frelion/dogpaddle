@@ -37,5 +37,11 @@ path = "benches/cell.rs"
 harness = false
 test = true
 
+[[bench]]
+name = "subscribed_log"
+path = "benches/subscribed_log.rs"
+harness = false
+test = true
+
 [lints]
 workspace = true

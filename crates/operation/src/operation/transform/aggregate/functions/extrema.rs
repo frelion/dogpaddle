@@ -1,4 +1,4 @@
-use super::{Binder, BoundReduction, Descriptor, Reduction, unsupported};
+use super::{BoundReduction, Descriptor, Reduction, unsupported};
 use crate::{
     expression::BoundExpression,
     operation::transform::aggregate::{AggregateSchemaError, value::indexable},
@@ -7,13 +7,13 @@ use crate::{
 pub(super) const MIN_DESCRIPTOR: Descriptor = Descriptor {
     tag: super::MIN,
     arguments: 1,
-    bind: Binder::Fallible(bind_min),
+    bind: bind_min,
 };
 
 pub(super) const MAX_DESCRIPTOR: Descriptor = Descriptor {
     tag: super::MAX,
     arguments: 1,
-    bind: Binder::Fallible(bind_max),
+    bind: bind_max,
 };
 
 #[derive(Clone, Copy)]

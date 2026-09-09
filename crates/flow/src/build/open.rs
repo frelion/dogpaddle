@@ -2,7 +2,7 @@ use dogpaddle_operation::{DataInstances, OperationBinding, RuntimeResource};
 use dogpaddle_store::{Cell, Store, StoreData, StoreError, SubscribedLog};
 
 use crate::{
-    assembly::{assemble_stations, resolve_topology},
+    assembly::assemble_stations,
     error::{FlowError, runtime_state_error},
     flow::Flow,
     station::StationParts,
@@ -15,11 +15,10 @@ use super::{
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
     ///
-    /// One setup-phase read-only snapshot reads the definition while preserving
-    /// the same Store for opening every declared data object. After setup is
-    /// frozen into runtime transaction capabilities, another read-only snapshot
-    /// checks the definition again and validates every output subscription before the
-    /// Flow is returned.
+    /// Setup reads the definition and opens every declared data object using
+    /// the same exclusively owned Store. A read-only snapshot then validates
+    /// active inputs and output subscriptions before setup is frozen into
+    /// runtime transaction capabilities.
     ///
     /// # Errors
     ///
@@ -39,8 +38,7 @@ impl FlowFactory {
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
         let definition_bytes = read_published_definition(&store, &published)?;
-        let definition = codec::decode(&definition_bytes)?;
-        let topology = resolve_topology(&definition);
+        let (definition, topology) = codec::decode(&definition_bytes)?;
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
         let resources = bind_resources(&definition, &bindings, self.resources)?;
@@ -60,14 +58,8 @@ impl FlowFactory {
                 open_station_part(&store, index, station, binding, resource)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (transactions, reads) = store.into_transactions().split();
         {
-            let transaction = reads.begin();
-            let published = published.read(transaction.access())?;
-            let observed_definition = published.get()?.ok_or(FlowError::IncompleteBuild)?;
-            if observed_definition != definition_bytes {
-                return Err(FlowError::DefinitionChangedDuringOpen);
-            }
+            let transaction = store.read_transaction();
             for (index, (station_definition, station)) in
                 definition.stations().iter().zip(&station_parts).enumerate()
             {
@@ -76,6 +68,7 @@ impl FlowFactory {
                     .map_err(|source| runtime_state_error(station_definition.id(), source))?;
             }
         }
+        let (transactions, reads) = store.into_transactions().split();
         let assembled = assemble_stations(topology, station_parts);
 
         Ok(Flow::from_parts(

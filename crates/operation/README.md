@@ -804,3 +804,13 @@ cargo test -p dogpaddle-operation --test correctness
 cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 ```
+
+### Aggregate extrema benchmark
+
+`DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema`
+运行同组非极值的高 multiplicity 更新、最小值撤回/恢复和八组重复 MIN/MAX。每次迭代
+包含两次完整 Operation turn/apply、同步 Store commit 与 AfterCommit；fixture、seed、
+输出 oracle 和 teardown 不计时。输入始终恢复到同一逻辑关系，输出在每次迭代后校验。
+reference 使用同一 workload、更长采样窗口，并要求绝对 `DOGPADDLE_PERF_ROOT`；
+结果目录保留 Criterion raw samples 和主机、提交及 workload context。此 target 不测
+Flow 调度，也不把 smoke 数字当作性能基线。

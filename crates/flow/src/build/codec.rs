@@ -3,6 +3,8 @@ use std::{collections::HashMap, num::NonZeroU64};
 use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
 
+use crate::assembly::{ResolvedTopology, resolve_topology};
+
 use super::{
     definition::{FlowDefinition, StationDefinition},
     validate::{TopologyError, validate_decoded_topology, validate_station_ids},
@@ -97,7 +99,9 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
     Ok(encoded)
 }
 
-pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionError> {
+pub(crate) fn decode(
+    encoded: &[u8],
+) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
     if encoded.len() < MAGIC.len() {
         return Err(FlowDefinitionError::Truncated);
     }
@@ -152,7 +156,7 @@ pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionErr
 
 fn validate_definition(
     stations: Vec<StationDefinition>,
-) -> Result<FlowDefinition, FlowDefinitionError> {
+) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
     validate_station_ids(&stations)?;
     let inputs_by_station = {
         let ids = stations
@@ -182,8 +186,9 @@ fn validate_definition(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    validate_decoded_topology(&stations, &inputs_by_station)?;
-    Ok(FlowDefinition::new(stations))
+    let schedule = validate_decoded_topology(&stations, &inputs_by_station)?;
+    let topology = resolve_topology(inputs_by_station, schedule);
+    Ok((FlowDefinition::new(stations), topology))
 }
 
 fn encode_string(

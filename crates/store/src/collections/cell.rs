@@ -24,8 +24,7 @@ pub struct CellAccess<'transaction, T> {
 
 /// A read-only transaction-bound view of a [`Cell`].
 ///
-/// This view can originate from either an active [`crate::Transaction`] or
-/// [`crate::ReadTransaction`]. It has no `set` or `clear` method and cannot
+/// This view borrows an active [`crate::ReadTransaction`]. It has no `set` or `clear` method and cannot
 /// outlive that transaction.
 ///
 /// ```compile_fail

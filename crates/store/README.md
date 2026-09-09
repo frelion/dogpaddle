@@ -123,19 +123,14 @@ fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         Some(-3),
     );
 
-    let mut page = Vec::new();
-    let continuation = users.read(read)?.scan(
+    let page = users.read(read)?.scan(
         ..,
         ScanDirection::Ascending,
         None,
         ScanLimit::new(100, 1024 * 1024)?,
-        |entry| -> Result<(), StoreError> {
-            page.push(entry.decode_owned()?);
-            Ok(())
-        },
     )?;
-    assert_eq!(page, vec![(42, "Shiba".to_owned())]);
-    assert_eq!(continuation, None);
+    assert_eq!(page.entries, vec![(42, "Shiba".to_owned())]);
+    assert_eq!(page.continuation, None);
 
     let next = subscriber.peek(read)?.expect("one committed output");
     assert_eq!(next, (0, b"public".to_vec()));
@@ -209,13 +204,13 @@ Flow 删除后重建。
 
 `OrderedMapAccess::scan` 和 `OrderedMapReadAccess::scan` 接受 `RangeBounds<K>`、升降序、排他的
 `resume_after` 与 `ScanLimit`。limit 同时约束一页的条目数和 encoded key + value 逻辑字节数。
-返回的 `Option<K>` 只在达到限制且范围内仍有下一项时出现；下一页复用相同 range/direction，并把
-它原样传回 `resume_after`。
+返回的 `OrderedMapPage<K, V>` 包含完整解码的 `entries` 和可选 `continuation`。continuation 是本页
+最后一个 key，只在范围内仍有下一项时出现；下一页使用相同 range/direction，并把它传给
+`resume_after`。准入与解码在返回前完成，错误不会交付半页数据。
 
-Store 在调用第一个 visitor 前先准入整页并计算 continuation，不让业务 callback 与 `RocksDB` iterator
-交错。callback 可以修改同一事务中的其他数据；已准入的当前页保持不变，后续页看到下一次 scan
-时的事务状态。`OrderedMapEntry::decode_owned` 解码完整 `(K, V)`；`project` 让宽 value 场景只解析
-所需字节，projection 的返回值不能借用 entry 编码。
+page 拥有全部数据，可以在 transaction 或 Store 关闭后继续使用。调用方拿到页面后自行遍历；修改
+同一写事务中的 map 不会改变当前页，后续页读取该事务当时的状态。Store 不再提供 visitor 或 encoded
+entry projection，页面解码错误仍使所属事务中毒，页面返回后的业务错误由调用方决定如何处理事务。
 
 第一条匹配项单独超过 byte limit 时返回 `StoreError::ItemTooLarge`。这是唯一可调整 limit 后在同一
 事务重试的 Store 错误，不会使事务中毒。`PartitionedMultiset` 的 scan 更窄：它只接受方向和非零
@@ -227,8 +222,7 @@ Store 在调用第一个 visitor 前先准入整页并计算 continuation，不�
 编码失败、解码失败、损坏的持久 metadata、wrong-store handle、`RocksDB` 访问失败、multiset
 underflow/overflow、非法 subscription acknowledgement 等硬错误都会使所属读或写 transaction
 中毒。之后的访问返回 `StoreError::TransactionPoisoned`，写 transaction 也不能提交；其全部 Store
-写入最终回滚。visitor 自己返回错误同样会毒化 scan 所属 transaction，因此 callback 不应执行
-无法随 Store 回滚的外部副作用。
+写入最终回滚。
 
 容量不足不是错误。`Queue::try_push` 或 `SubscribedLogWriter::try_append` 返回 `false` 时不写入、
 不中毒，调用方可以在同一 transaction 内选择背压、更新其他状态或正常提交。
@@ -254,7 +248,8 @@ cargo test -p dogpaddle-store --lib --locked -- --test-threads=1
 
 完整工作区 gate、证据所有权和系统验收入口见 [`TESTING.md`](../../TESTING.md)。Store 只保留两个
 owner benchmark：`cell` 测 hot read 与 durable read-modify-write，`ordered_map` 测批量写、点读、
-有界正反向 scan、projection、Station 形状的原子更新和 durable hot overwrite。workload、fixture、
+有界正反向 owned-page scan、Station 形状的原子更新和 durable hot overwrite。`subscribed_log` 增加
+大 payload status/消费及慢订阅者 backlog 跨 reopen 的有界 churn。workload、fixture、
 结果字段与可比性规则见 [`PERFORMANCE.md`](PERFORMANCE.md)。快速 smoke：
 
 ```bash

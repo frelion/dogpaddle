@@ -192,11 +192,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
                 reason: "queued-byte metadata is smaller than the front entry",
             });
         };
-        if !self.data.delete(&key)? {
-            return self.fail(StoreError::CorruptQueue {
-                reason: "the front entry disappeared during removal",
-            });
-        }
+        self.data.erase(&key)?;
 
         let head = metadata.head + 1;
         if head == metadata.tail {
@@ -205,7 +201,8 @@ impl<T: StoreValue> QueueAccess<'_, T> {
                     reason: "an empty queue has a non-zero byte count",
                 });
             }
-            if !self.data.delete(METADATA_KEY)? || !self.data.as_read().is_physically_empty()? {
+            self.data.erase(METADATA_KEY)?;
+            if !self.data.as_read().is_physically_empty()? {
                 return self.fail(StoreError::CorruptQueue {
                     reason: "entries exist outside the queued range",
                 });

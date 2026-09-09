@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    CodecError, DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanDirection,
-    ScanLimit, StoreError, StoreKey, StoreValue, TransactionAccess, TransactionRef,
+    DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanDirection, ScanLimit,
+    StoreError, StoreKey, StoreValue, TransactionAccess,
 };
 
 /// A named persistent ordered map with typed keys and values.
@@ -23,8 +23,7 @@ pub struct OrderedMapAccess<'transaction, K, V> {
 
 /// A read-only transaction-bound view of an [`OrderedMap`].
 ///
-/// This view can originate from either an active [`crate::Transaction`] or
-/// [`crate::ReadTransaction`]. It exposes point reads and scans, but no
+/// This view borrows an active [`crate::ReadTransaction`]. It exposes point reads and scans, but no
 /// insertion or removal API, and cannot outlive the originating transaction.
 ///
 /// ```compile_fail
@@ -39,33 +38,17 @@ pub struct OrderedMapReadAccess<'transaction, K, V> {
     _types: PhantomData<fn() -> (K, V)>,
 }
 
-/// One transaction-bound encoded entry in an ordered-map scan.
+/// One fully decoded, owned page from an ordered-map scan.
 ///
-/// The entry can project only the encoded fields a caller needs or decode the
-/// complete owned `(K, V)` pair. The transaction binding cannot escape the scan
-/// callback.
-///
-/// ```compile_fail
-/// use dogpaddle_store::{CodecError, OrderedMapEntry};
-///
-/// fn escape<'entry>(entry: OrderedMapEntry<'entry, u64, Vec<u8>>) -> &'entry [u8] {
-///     entry
-///         .project(|_key, value| Ok::<_, CodecError>(value))
-///         .unwrap()
-/// }
-/// ```
-///
-/// The entry remains bound to its transaction and thread.
-///
-/// ```compile_fail
-/// fn require_send<T: Send>() {}
-/// require_send::<dogpaddle_store::OrderedMapEntry<'static, u64, u64>>();
-/// ```
-pub struct OrderedMapEntry<'entry, K, V> {
-    encoded_key: Vec<u8>,
-    encoded_value: Vec<u8>,
-    transaction: TransactionRef<'entry>,
-    _types: PhantomData<fn() -> (K, V)>,
+/// The page does not borrow the map or transaction. Both entries and the
+/// continuation are decoded before the scan returns successfully.
+#[derive(Debug, Eq, PartialEq)]
+pub struct OrderedMapPage<K, V> {
+    /// Entries in the requested key order.
+    pub entries: Vec<(K, V)>,
+    /// The last returned key, present only when another matching entry exists.
+    /// Pass it as `resume_after` for the next page with the same range and direction.
+    pub continuation: Option<K>,
 }
 
 impl<K: StoreKey, V: StoreValue> OrderedMap<K, V> {
@@ -149,84 +132,57 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
         self.data.delete(encoded_key.as_ref())
     }
 
-    /// Visits one bounded page in an ordered key range.
+    /// Returns one fully decoded page in an ordered key range.
     ///
-    /// `resume_after` is the last key visited by a previous page and is always
-    /// excluded. The returned key is the current page's last visited key, and
-    /// is present only when another matching entry exists; pass it back as the
-    /// next page's `resume_after`.
-    ///
-    /// The complete page and its continuation are admitted before the first
-    /// callback. Callbacks may therefore update other Store data in the same
-    /// transaction without interleaving business code with a storage cursor.
-    /// Updates to this map do not change entries already admitted for the
-    /// current page, but may affect later pages.
-    ///
-    /// Callbacks should keep non-store side effects out of the transaction: a
-    /// later callback failure poisons and rolls back Store writes, but cannot
-    /// undo external effects.
+    /// `resume_after` excludes the last key of the preceding page. The limit
+    /// bounds the entry count and logical encoded key-plus-value bytes.
+    /// The owned page remains unchanged by later writes; subsequent scans see
+    /// those writes when using the same write transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when bound encoding, storage access, continuation or
-    /// entry decoding fails, the first matching entry exceeds the byte limit,
-    /// or the visitor fails. A visitor error poisons the transaction. If the
-    /// visitor swallows an entry decoding error, the scan stops with
-    /// [`StoreError::TransactionPoisoned`].
-    pub fn scan<E>(
+    /// Encoding, decoding and storage failures poison the transaction. No
+    /// partial page is returned. If the first matching entry exceeds the byte
+    /// limit, returns [`StoreError::ItemTooLarge`] without poisoning, allowing
+    /// another scan with a larger limit.
+    pub fn scan(
         &self,
         range: impl RangeBounds<K>,
         direction: ScanDirection,
         resume_after: Option<&K>,
         limit: ScanLimit,
-        visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
-    ) -> Result<Option<K>, E>
-    where
-        E: From<StoreError>,
-    {
-        scan_map(
-            self.data.as_read(),
-            range,
-            direction,
-            resume_after,
-            limit,
-            visit,
-        )
+    ) -> Result<OrderedMapPage<K, V>, StoreError> {
+        scan_map(self.data.as_read(), range, direction, resume_after, limit)
     }
 }
 
 impl<K: StoreKey, V: StoreValue> OrderedMapReadAccess<'_, K, V> {
-    /// Reads one value visible to the originating transaction.
+    /// Returns one value visible to this snapshot.
     ///
     /// # Errors
     ///
-    /// Returns an error when key encoding, storage access, or value decoding fails.
+    /// Returns an error when key encoding, storage access or decoding fails.
     pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
         read_map_value(&self.data, key)
     }
 
-    /// Visits one bounded page through this read-only view.
+    /// Returns one fully decoded, owned page visible to this snapshot.
     ///
-    /// Range, continuation, admission, and callback semantics match
-    /// [`OrderedMapAccess::scan`].
+    /// Range, continuation and admission semantics match [`OrderedMapAccess::scan`].
     ///
     /// # Errors
     ///
-    /// Returns an error when bound encoding, storage access, continuation or
-    /// entry decoding fails, the first matching entry exceeds the byte limit,
-    /// or the visitor fails.
-    pub fn scan<E>(
+    /// Encoding, decoding and storage failures poison the snapshot. A first
+    /// entry exceeding the byte limit returns [`StoreError::ItemTooLarge`]
+    /// without poisoning it. No partial page is returned.
+    pub fn scan(
         &self,
         range: impl RangeBounds<K>,
         direction: ScanDirection,
         resume_after: Option<&K>,
         limit: ScanLimit,
-        visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
-    ) -> Result<Option<K>, E>
-    where
-        E: From<StoreError>,
-    {
-        scan_map(&self.data, range, direction, resume_after, limit, visit)
+    ) -> Result<OrderedMapPage<K, V>, StoreError> {
+        scan_map(&self.data, range, direction, resume_after, limit)
     }
 }
 
@@ -246,116 +202,52 @@ fn read_map_value<K: StoreKey, V: StoreValue>(
     .map_err(StoreError::from)
 }
 
-fn scan_map<K: StoreKey, V: StoreValue, E>(
+fn scan_map<K: StoreKey, V: StoreValue>(
     data: &ReadDataAccess<'_>,
     range: impl RangeBounds<K>,
     direction: ScanDirection,
     resume_after: Option<&K>,
     limit: ScanLimit,
-    mut visit: impl for<'entry> FnMut(OrderedMapEntry<'entry, K, V>) -> Result<(), E>,
-) -> Result<Option<K>, E>
-where
-    E: From<StoreError>,
-{
-    let lower = data
-        .poison_on_error(match range.start_bound() {
-            Bound::Included(key) => key.encode_key().map(Bound::Included),
-            Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
-            Bound::Unbounded => Ok(Bound::Unbounded),
-        })
-        .map_err(StoreError::from)
-        .map_err(E::from)?;
-    let upper = data
-        .poison_on_error(match range.end_bound() {
-            Bound::Included(key) => key.encode_key().map(Bound::Included),
-            Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
-            Bound::Unbounded => Ok(Bound::Unbounded),
-        })
-        .map_err(StoreError::from)
-        .map_err(E::from)?;
-    let continuation = data
-        .poison_on_error(resume_after.map(StoreKey::encode_key).transpose())
-        .map_err(StoreError::from)
-        .map_err(E::from)?;
-    let raw = data
-        .scan(
-            (borrow_bound(&lower), borrow_bound(&upper)),
-            direction,
-            continuation.as_ref().map(AsRef::as_ref),
-            limit,
-        )
-        .map_err(E::from)?;
-    debug_assert!(!raw.limited || !raw.items.is_empty());
-    let continuation = data
-        .poison_on_error(
-            raw.items
-                .last()
-                .filter(|_| raw.limited)
-                .map(|(key, _)| K::decode_key(Cow::Owned(key.clone())))
-                .transpose(),
-        )
-        .map_err(StoreError::from)
-        .map_err(E::from)?;
-
-    for (encoded_key, encoded_value) in raw.items {
-        let entry = OrderedMapEntry {
-            encoded_key,
-            encoded_value,
-            transaction: data.transaction_ref(),
-            _types: PhantomData,
-        };
-        data.poison_on_error(visit(entry))?;
-        data.ensure_healthy().map_err(E::from)?;
-    }
-    Ok(continuation)
-}
-
-impl<K, V> OrderedMapEntry<'_, K, V> {
-    /// Decodes a caller-selected projection from the encoded logical key and value.
-    ///
-    /// `project` receives temporary slices, and its returned value cannot refer
-    /// to either encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Codec`] when the projection rejects the encoding
-    /// and poisons the entry's transaction.
-    pub fn project<R>(
-        &self,
-        project: impl for<'encoded> FnOnce(&'encoded [u8], &'encoded [u8]) -> Result<R, CodecError>,
-    ) -> Result<R, StoreError> {
-        self.transaction
-            .poison_on_error(project(&self.encoded_key, &self.encoded_value))
-            .map_err(StoreError::from)
-    }
-}
-
-impl<K: StoreKey, V: StoreValue> OrderedMapEntry<'_, K, V> {
-    /// Fully decodes this entry into an owned key/value pair.
-    ///
-    /// Consuming the entry lets owning codecs reuse its owned encoded buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either encoding is invalid and poisons the entry's
-    /// transaction.
-    pub fn decode_owned(self) -> Result<(K, V), StoreError> {
-        let Self {
-            encoded_key,
-            encoded_value,
-            transaction,
-            _types: _,
-        } = self;
-        let decoded: Result<(K, V), CodecError> = (|| {
-            Ok((
-                K::decode_key(Cow::Owned(encoded_key))?,
-                V::decode_value(Cow::Owned(encoded_value))?,
-            ))
-        })();
-        transaction
-            .poison_on_error(decoded)
-            .map_err(StoreError::from)
-    }
+) -> Result<OrderedMapPage<K, V>, StoreError> {
+    let lower = data.poison_on_error(match range.start_bound() {
+        Bound::Included(key) => key.encode_key().map(Bound::Included),
+        Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    })?;
+    let upper = data.poison_on_error(match range.end_bound() {
+        Bound::Included(key) => key.encode_key().map(Bound::Included),
+        Bound::Excluded(key) => key.encode_key().map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    })?;
+    let resume = data.poison_on_error(resume_after.map(StoreKey::encode_key).transpose())?;
+    let raw = data.scan(
+        (borrow_bound(&lower), borrow_bound(&upper)),
+        direction,
+        resume.as_ref().map(AsRef::as_ref),
+        limit,
+    )?;
+    let continuation = data.poison_on_error(
+        raw.items
+            .last()
+            .filter(|_| raw.limited)
+            .map(|(key, _)| K::decode_key(Cow::Borrowed(key)))
+            .transpose(),
+    )?;
+    let entries = data.poison_on_error(
+        raw.items
+            .into_iter()
+            .map(|(key, value)| {
+                Ok::<_, crate::CodecError>((
+                    K::decode_key(Cow::Owned(key))?,
+                    V::decode_value(Cow::Owned(value))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>(),
+    )?;
+    Ok(OrderedMapPage {
+        entries,
+        continuation,
+    })
 }
 
 impl<K, V> Clone for OrderedMap<K, V> {

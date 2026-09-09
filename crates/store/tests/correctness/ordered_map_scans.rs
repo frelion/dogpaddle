@@ -1,170 +1,104 @@
-use std::{
-    borrow::Cow,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-use dogpaddle_store::{CodecError, ScanDirection, ScanLimit, Store, StoreError, StoreValue};
-
 use crate::support::{create_byte_map, create_map, store_path};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WideValue(Vec<u8>);
-
-static FULL_VALUE_DECODES: AtomicUsize = AtomicUsize::new(0);
-
-impl StoreValue for WideValue {
-    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
-        Ok(self.0.as_slice())
-    }
-
-    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        FULL_VALUE_DECODES.fetch_add(1, Ordering::Relaxed);
-        Ok(Self(bytes.into_owned()))
-    }
-}
+use dogpaddle_store::{ScanDirection, ScanLimit, Store, StoreError};
 
 #[test]
-fn projection_reads_logical_keys_and_fields_without_full_value_decode() {
+fn owned_page_survives_writes_commit_and_store_close() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, WideValue>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
+    let map = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+    let mut writes = store.into_transactions();
+    let page = {
+        let transaction = writes.begin();
         let mut access = map.access(transaction.access()).unwrap();
-        for key in 1_u64..=2 {
-            let mut value = vec![0xaa; 8_192];
-            value[..8].copy_from_slice(&(key * 10).to_be_bytes());
-            access.put(&key, &WideValue(value)).unwrap();
+        for key in 1..=3 {
+            access
+                .put(&key, &vec![u8::try_from(key).unwrap(); 8192])
+                .unwrap();
         }
-        transaction.commit().unwrap();
-    }
-
-    FULL_VALUE_DECODES.store(0, Ordering::Relaxed);
-    let transaction = transactions.begin();
-    let access = map.access(transaction.access()).unwrap();
-    let mut projected = Vec::new();
-    let continuation = access
-        .scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(10, 32_768).unwrap(),
-            |entry| {
-                projected.push(entry.project(|key, value| {
-                    let key = u64::from_be_bytes(
-                        key.try_into()
-                            .map_err(|_| CodecError::new("invalid projected key"))?,
-                    );
-                    let field = u64::from_be_bytes(
-                        value[..8]
-                            .try_into()
-                            .map_err(|_| CodecError::new("invalid projected field"))?,
-                    );
-                    Ok((key, field))
-                })?);
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    assert_eq!(projected, vec![(1, 10), (2, 20)]);
-    assert_eq!(continuation, None);
-    assert_eq!(FULL_VALUE_DECODES.load(Ordering::Relaxed), 0);
-}
-
-#[test]
-fn callbacks_observe_the_admitted_page_while_mutating_the_source_map() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
-        let mut access = map.access(transaction.access()).unwrap();
-        for key in 1_u64..=3 {
-            access.put(&key, &key).unwrap();
-        }
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin();
-    let reader = map.access(transaction.access()).unwrap();
-    let mut writer = map.access(transaction.access()).unwrap();
-    let mut visited = Vec::new();
-    let continuation = reader
-        .scan(
-            ..,
-            ScanDirection::Ascending,
-            None,
-            ScanLimit::new(10, 1_024).unwrap(),
-            |entry| {
-                let (key, value) = entry.decode_owned()?;
-                if key == 1 {
-                    assert!(writer.remove(&2)?);
-                }
-                visited.push((key, value));
-                Ok::<(), StoreError>(())
-            },
-        )
-        .unwrap();
-    assert_eq!(visited, vec![(1, 1), (2, 2), (3, 3)]);
-    assert_eq!(continuation, None);
-    assert_eq!(writer.get(&2).unwrap(), None);
-    transaction.commit().unwrap();
-}
-
-#[test]
-fn later_pages_observe_source_updates_made_by_an_earlier_callback() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
-        let mut access = map.access(transaction.access()).unwrap();
-        for key in 1_u64..=3 {
-            access.put(&key, &key).unwrap();
-        }
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin();
-    let reader = map.access(transaction.access()).unwrap();
-    let mut writer = map.access(transaction.access()).unwrap();
-    let limit = ScanLimit::new(1, 1_024).unwrap();
-    let mut first_page = Vec::new();
-    let continuation = reader
-        .scan(.., ScanDirection::Ascending, None, limit, |entry| {
-            first_page.push(entry.decode_owned()?);
-            assert!(writer.remove(&2)?);
-            writer.put(&4, &4)?;
-            Ok::<(), StoreError>(())
-        })
-        .unwrap();
-    let mut remaining = Vec::new();
-    let mut continuation = continuation;
-    loop {
-        let next = reader
+        let page = access
             .scan(
                 ..,
                 ScanDirection::Ascending,
-                continuation.as_ref(),
-                limit,
-                |entry| {
-                    remaining.push(entry.decode_owned()?);
-                    Ok::<(), StoreError>(())
-                },
+                None,
+                ScanLimit::new(3, 32_768).unwrap(),
             )
             .unwrap();
-        if next.is_none() {
+        access.remove(&2).unwrap();
+        access.put(&3, &vec![9]).unwrap();
+        transaction.commit().unwrap();
+        page
+    };
+    drop(writes);
+    assert_eq!(
+        page.entries,
+        (1..=3)
+            .map(|key| (key, vec![u8::try_from(key).unwrap(); 8192]))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(page.continuation, None);
+}
+
+#[test]
+fn later_pages_observe_source_updates_after_an_owned_page() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
+    let mut writes = store.into_transactions();
+    let transaction = writes.begin();
+    let mut access = map.access(transaction.access()).unwrap();
+    for key in 1..=3 {
+        access.put(&key, &key).unwrap();
+    }
+    let limit = ScanLimit::new(1, 1024).unwrap();
+    let first = access
+        .scan(.., ScanDirection::Ascending, None, limit)
+        .unwrap();
+    assert_eq!(first.entries, vec![(1, 1)]);
+    assert_eq!(first.continuation, Some(1));
+    access.remove(&2).unwrap();
+    access.put(&4, &4).unwrap();
+    let mut continuation = first.continuation;
+    let mut remaining = Vec::new();
+    loop {
+        let page = access
+            .scan(.., ScanDirection::Ascending, continuation.as_ref(), limit)
+            .unwrap();
+        remaining.extend(page.entries);
+        continuation = page.continuation;
+        if continuation.is_none() {
             break;
         }
-        continuation = next;
     }
-
-    assert_eq!(first_page, vec![(1, 1)]);
     assert_eq!(remaining, vec![(3, 3), (4, 4)]);
     transaction.commit().unwrap();
+}
+
+#[test]
+fn owned_read_page_survives_snapshot_and_store_close() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let map = create_map::<u64, String>(&mut store, "map").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    let transaction = writes.begin();
+    map.access(transaction.access())
+        .unwrap()
+        .put(&1, &"owned".to_owned())
+        .unwrap();
+    transaction.commit().unwrap();
+    let page = {
+        let snapshot = reads.begin();
+        map.read(snapshot.access())
+            .unwrap()
+            .scan(
+                ..,
+                ScanDirection::Ascending,
+                None,
+                ScanLimit::new(1, 1024).unwrap(),
+            )
+            .unwrap()
+    };
+    drop((reads, writes));
+    assert_eq!(page.entries, vec![(1, "owned".to_owned())]);
 }
 
 #[test]
@@ -211,19 +145,16 @@ fn byte_map_binary_keys_page_in_both_directions() {
         let mut actual = Vec::new();
         let mut continuation = None;
         loop {
-            let mut page = Vec::new();
-            let next = access
+            let result = access
                 .scan(
                     ..,
                     direction,
                     continuation.as_ref(),
                     ScanLimit::new(1, 1_024).unwrap(),
-                    |entry| {
-                        page.push(entry.decode_owned()?);
-                        Ok::<(), StoreError>(())
-                    },
                 )
                 .unwrap();
+            let page = result.entries;
+            let next = result.continuation;
             assert!(page.len() <= 1);
             assert_eq!(page, expected[actual.len()..actual.len() + page.len()]);
             let has_more = actual.len() + page.len() < expected.len();

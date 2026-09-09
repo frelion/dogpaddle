@@ -19,7 +19,7 @@ use super::{
     FlowDefinitionError, FlowFactory, StationRef, TopologyError,
     codec::{CHECKSUM_LENGTH, crc32, decode, encode},
     definition::FlowDefinition,
-    validate::{validate_acyclic, validate_connections},
+    validate::{topological_schedule, validate_connections},
 };
 
 fn scan(start: u64) -> SequenceScanDefinition {
@@ -91,7 +91,7 @@ fn connection_validation_preserves_n_ary_order_and_repeated_inputs() {
         validate_connections(builder.token, &builder.stations, &builder.connections).unwrap();
 
     assert_eq!(inputs[target.index].as_deref(), Some([1, 0, 1].as_slice()));
-    assert_eq!(validate_acyclic(builder.stations.len(), &inputs), Ok(()));
+    assert_eq!(topological_schedule(&inputs), Ok(vec![0, 1, 2]));
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn decoder_round_trips_a_large_chain() {
     declare_output_capacities(&mut builder);
     let encoded = encode(&builder.finish_definition().unwrap()).unwrap();
 
-    let decoded = decode(&encoded).unwrap();
+    let (decoded, _) = decode(&encoded).unwrap();
 
     assert_eq!(decoded.stations().len(), STATION_COUNT + 1);
     assert_eq!(encode(&decoded).unwrap(), encoded);

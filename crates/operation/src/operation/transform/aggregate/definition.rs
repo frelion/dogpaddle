@@ -250,8 +250,7 @@ impl AggregateDefinition {
                 .map_err(|source| -> OperationSchemaError {
                     Box::new(AggregateSchemaError::AggregateExpression { aggregate, source })
                 })?;
-            let bound = function
-                .bind(&arguments)
+            let bound = (function.bind)(&arguments)
                 .map_err(|error| Box::new(error) as OperationSchemaError)?;
             output_fields.push(Arc::new(Field::new(
                 &call.name,

@@ -22,12 +22,7 @@ pub(super) const MAX: u16 = 6;
 pub(super) struct Descriptor {
     pub(super) tag: u16,
     pub(super) arguments: usize,
-    pub(super) bind: Binder,
-}
-
-pub(super) enum Binder {
-    Infallible(fn(&[BoundExpression]) -> BoundReduction),
-    Fallible(fn(&[BoundExpression]) -> Result<BoundReduction, AggregateSchemaError>),
+    pub(super) bind: fn(&[BoundExpression]) -> Result<BoundReduction, AggregateSchemaError>,
 }
 
 pub(super) struct BoundReduction {
@@ -66,18 +61,6 @@ const DESCRIPTORS: &[Descriptor] = &[
 
 pub(super) fn descriptor(tag: u16) -> Option<&'static Descriptor> {
     DESCRIPTORS.iter().find(|descriptor| descriptor.tag == tag)
-}
-
-impl Descriptor {
-    pub(super) fn bind(
-        &self,
-        arguments: &[BoundExpression],
-    ) -> Result<BoundReduction, AggregateSchemaError> {
-        match self.bind {
-            Binder::Infallible(bind) => Ok(bind(arguments)),
-            Binder::Fallible(bind) => bind(arguments),
-        }
-    }
 }
 
 pub(super) fn argument_field(expression: &BoundExpression) -> Field {

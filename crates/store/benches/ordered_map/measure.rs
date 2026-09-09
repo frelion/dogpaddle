@@ -1,17 +1,11 @@
 use std::{hint::black_box, time::Duration};
 
-use dogpaddle_store::{CodecError, ScanDirection, ScanLimit, StoreError};
+use dogpaddle_store::{ScanDirection, ScanLimit};
 
 use crate::{
     RANDOM_SEED, STATION_KEYS, VALUE_BYTES,
     fixture::{MapFixture, StationFixture},
 };
-
-#[derive(Clone, Copy)]
-pub(super) enum EntryRead {
-    Owned,
-    Projected,
-}
 
 pub(super) fn measure_bulk_put(fixture: &mut MapFixture, entries: usize) -> Duration {
     let value = vec![0x5a; VALUE_BYTES];
@@ -78,7 +72,6 @@ pub(super) fn measure_scan(
     entries: usize,
     direction: ScanDirection,
     limit: ScanLimit,
-    read: EntryRead,
 ) -> Duration {
     let started = std::time::Instant::now();
     let (count, checksum) = {
@@ -88,20 +81,14 @@ pub(super) fn measure_scan(
         let mut count = 0_usize;
         let mut checksum = 0_u64;
         loop {
-            let next = map
-                .scan(.., direction, continuation.as_ref(), limit, |entry| {
-                    let value = match read {
-                        EntryRead::Owned => {
-                            let (key, value) = entry.decode_owned()?;
-                            key ^ u64::from(value[0])
-                        }
-                        EntryRead::Projected => entry.project(project_checksum)?,
-                    };
-                    count += 1;
-                    checksum = checksum.wrapping_add(value);
-                    Ok::<(), StoreError>(())
-                })
+            let page = map
+                .scan(.., direction, continuation.as_ref(), limit)
                 .expect("scan benchmark page");
+            for (key, value) in page.entries {
+                count += 1;
+                checksum = checksum.wrapping_add(key ^ u64::from(value[0]));
+            }
+            let next = page.continuation;
             if let Some(next) = next {
                 continuation = Some(next);
             } else {
@@ -115,14 +102,6 @@ pub(super) fn measure_scan(
     assert_eq!(count, entries);
     assert_eq!(checksum, expected_scan_checksum(entries));
     elapsed
-}
-
-fn project_checksum(key: &[u8], value: &[u8]) -> Result<u64, CodecError> {
-    let key = u64::from_be_bytes(
-        key.try_into()
-            .map_err(|_| CodecError::new("invalid benchmark key"))?,
-    );
-    Ok(key ^ u64::from(value[0]))
 }
 
 fn expected_scan_checksum(entries: usize) -> u64 {

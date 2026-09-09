@@ -1,6 +1,6 @@
 use std::ops::{Bound, RangeBounds};
 
-use rocksdb::{DBAccess, Direction, IteratorMode, ReadOptions, SnapshotWithThreadMode};
+use rocksdb::{DBAccess, ReadOptions, SnapshotWithThreadMode};
 
 use super::{DataHandle, ReadTransaction, ReadTransactionAccess, Transaction, TransactionAccess};
 use crate::StoreError;
@@ -149,16 +149,21 @@ impl<'transaction> DataAccess<'transaction> {
 
     /// Deletes an encoded key and reports whether it existed.
     pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool, StoreError> {
-        self.transaction.ensure_healthy()?;
         if !self.read.contains_key(key)? {
             return Ok(false);
         }
+        self.erase(key)?;
+        Ok(true)
+    }
+
+    /// Deletes an encoded key without reading its previous value.
+    pub(crate) fn erase(&mut self, key: &[u8]) -> Result<(), StoreError> {
+        self.transaction.ensure_healthy()?;
         let key = physical_key(self.read.prefix, key);
         self.transaction.record_result(
             self.transaction
                 .inner
                 .delete(key)
-                .map(|()| true)
                 .map_err(|error| StoreError::storage("delete data", error)),
         )
     }
@@ -203,6 +208,32 @@ impl TransactionRef<'_> {
         self.record_result(result)
     }
 
+    fn value_len(self, key: &[u8]) -> Result<Option<usize>, StoreError> {
+        self.ensure_healthy()?;
+        let result = match self {
+            Self::Read(transaction) => transaction
+                .snapshot
+                .get_pinned(key)
+                .map(|value| value.map(|value| value.len())),
+            Self::Write(transaction) => transaction
+                .inner
+                .snapshot()
+                .get_pinned(key)
+                .map(|value| value.map(|value| value.len())),
+        }
+        .map_err(|error| StoreError::storage("read data length", error));
+        self.record_result(result)
+    }
+
+    fn is_physically_empty(self, prefix: [u8; 5]) -> Result<bool, StoreError> {
+        self.ensure_healthy()?;
+        let result = match self {
+            Self::Read(transaction) => namespace_is_empty(&transaction.snapshot, prefix),
+            Self::Write(transaction) => namespace_is_empty(&transaction.inner.snapshot(), prefix),
+        };
+        self.record_result(result)
+    }
+
     fn scan<'key>(
         self,
         prefix: [u8; 5],
@@ -230,17 +261,7 @@ impl TransactionRef<'_> {
     }
 }
 
-impl<'transaction> ReadDataAccess<'transaction> {
-    /// Returns the transaction source used to poison a failed scan entry.
-    pub(crate) const fn transaction_ref(&self) -> TransactionRef<'transaction> {
-        self.transaction
-    }
-
-    /// Verifies that no earlier hard operation has poisoned the transaction.
-    pub(crate) fn ensure_healthy(&self) -> Result<(), StoreError> {
-        self.transaction.ensure_healthy()
-    }
-
+impl ReadDataAccess<'_> {
     /// Marks the transaction unusable when a collection-level operation fails.
     pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
         self.transaction.poison_on_error(result)
@@ -258,18 +279,17 @@ impl<'transaction> ReadDataAccess<'transaction> {
 
     /// Reports whether an encoded key exists.
     pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
-        self.get(key).map(|value| value.is_some())
+        self.value_len(key).map(|length| length.is_some())
+    }
+
+    /// Reads the exact encoded value length without constructing an owned payload buffer.
+    pub(crate) fn value_len(&self, key: &[u8]) -> Result<Option<usize>, StoreError> {
+        self.transaction.value_len(&physical_key(self.prefix, key))
     }
 
     /// Reports whether this namespace contains no entries.
     pub(crate) fn is_physically_empty(&self) -> Result<bool, StoreError> {
-        let limit = ScanLimit {
-            max_items: 1,
-            max_bytes: usize::MAX,
-        };
-        self.transaction
-            .scan(self.prefix, ScanDirection::Ascending, None, None, limit)
-            .map(|batch| batch.items.is_empty())
+        self.transaction.is_physically_empty(self.prefix)
     }
 
     /// Owns one bounded page of encoded entries in byte order.
@@ -308,6 +328,20 @@ impl<'transaction> ReadDataAccess<'transaction> {
     }
 }
 
+fn namespace_is_empty<D: DBAccess>(
+    snapshot: &SnapshotWithThreadMode<'_, D>,
+    prefix: [u8; 5],
+) -> Result<bool, StoreError> {
+    let mut options = ReadOptions::default();
+    options.set_iterate_upper_bound(prefix_successor(prefix));
+    let mut iterator = snapshot.raw_iterator_opt(options);
+    iterator.seek(prefix);
+    iterator
+        .status()
+        .map_err(|error| StoreError::storage("inspect data namespace", error))?;
+    Ok(!iterator.valid())
+}
+
 fn scan_data<D: DBAccess>(
     snapshot: &SnapshotWithThreadMode<'_, D>,
     prefix: [u8; 5],
@@ -331,30 +365,32 @@ fn scan_data<D: DBAccess>(
             |(key, _)| physical_key(prefix, key),
         ),
     };
-    let rocks_direction = match direction {
-        ScanDirection::Ascending => Direction::Forward,
-        ScanDirection::Descending => Direction::Reverse,
-    };
+    let mut iterator = snapshot.raw_iterator_opt(read_options);
+    match direction {
+        ScanDirection::Ascending => iterator.seek(&seek),
+        ScanDirection::Descending => iterator.seek_for_prev(&seek),
+    }
     let mut items = Vec::new();
     let mut bytes = 0_usize;
 
-    for item in snapshot.iterator_opt(IteratorMode::From(&seek, rocks_direction), read_options) {
-        let (physical_key, value) =
-            item.map_err(|error| StoreError::storage("scan data", error))?;
+    while let Some(physical_key) = iterator.key() {
         let Some(key) = physical_key.strip_prefix(&prefix) else {
             if direction == ScanDirection::Descending {
+                iterator.prev();
                 continue;
             }
             break;
         };
         if !within_lower(key, lower) {
             if direction == ScanDirection::Ascending {
+                iterator.next();
                 continue;
             }
             break;
         }
         if !within_upper(key, upper) {
             if direction == ScanDirection::Descending {
+                iterator.prev();
                 continue;
             }
             break;
@@ -366,6 +402,7 @@ fn scan_data<D: DBAccess>(
             });
         }
 
+        let value = iterator.value().expect("a valid iterator has a value");
         let item_bytes = key
             .len()
             .checked_add(value.len())
@@ -387,8 +424,16 @@ fn scan_data<D: DBAccess>(
             });
         }
         bytes = next_bytes.expect("bounded sum was checked above");
-        items.push((key.to_vec(), value.into_vec()));
+        items.push((key.to_vec(), value.to_vec()));
+        match direction {
+            ScanDirection::Ascending => iterator.next(),
+            ScanDirection::Descending => iterator.prev(),
+        }
     }
+
+    iterator
+        .status()
+        .map_err(|error| StoreError::storage("scan data", error))?;
 
     Ok(ScanBatch {
         items,
@@ -471,4 +516,112 @@ fn within_upper(key: &[u8], upper: Option<&EncodedBound<'_>>) -> bool {
         std::cmp::Ordering::Equal => *inclusive,
         std::cmp::Ordering::Greater => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OrderedMap, Store};
+
+    #[test]
+    fn pinned_lengths_and_presence_observe_snapshots_and_pending_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        store
+            .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("data")
+            .unwrap();
+        let handle = DataHandle {
+            store_token: store.token,
+            data_id: 0,
+        };
+        let (mut writes, reads) = store.into_transactions().split();
+
+        let transaction = writes.begin();
+        let mut data = handle.access(transaction.access()).unwrap();
+        assert!(data.as_read().is_physically_empty().unwrap());
+        data.put(b"key", &[1; 32]).unwrap();
+        assert_eq!(data.as_read().value_len(b"key").unwrap(), Some(32));
+        assert!(data.contains_key(b"key").unwrap());
+        assert!(!data.as_read().is_physically_empty().unwrap());
+        transaction.commit().unwrap();
+
+        let snapshot = reads.begin();
+        let old = handle.read(snapshot.access()).unwrap();
+        let transaction = writes.begin();
+        let mut data = handle.access(transaction.access()).unwrap();
+        data.put(b"key", &[]).unwrap();
+        assert_eq!(data.as_read().value_len(b"key").unwrap(), Some(0));
+        assert!(data.contains_key(b"key").unwrap());
+        assert_eq!(old.value_len(b"key").unwrap(), Some(32));
+        data.erase(b"key").unwrap();
+        assert_eq!(data.as_read().value_len(b"key").unwrap(), None);
+        assert!(!data.contains_key(b"key").unwrap());
+        assert!(data.as_read().is_physically_empty().unwrap());
+        transaction.commit().unwrap();
+
+        assert_eq!(old.value_len(b"key").unwrap(), Some(32));
+        assert!(old.contains_key(b"key").unwrap());
+        let current = reads.begin();
+        let data = handle.read(current.access()).unwrap();
+        assert_eq!(data.value_len(b"key").unwrap(), None);
+        assert!(!data.contains_key(b"key").unwrap());
+        assert!(data.is_physically_empty().unwrap());
+    }
+
+    #[test]
+    fn raw_scan_admits_only_matching_entries_and_preserves_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        store
+            .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("data")
+            .unwrap();
+        let handle = DataHandle {
+            store_token: store.token,
+            data_id: 0,
+        };
+        let mut writes = store.into_transactions();
+        let transaction = writes.begin();
+        let mut data = handle.access(transaction.access()).unwrap();
+        data.put(b"a", b"x").unwrap();
+        data.put(b"b", &vec![0; 1024 * 1024]).unwrap();
+        data.put(b"c", b"y").unwrap();
+        let data = data.as_read();
+        for (direction, range, expected) in [
+            (
+                ScanDirection::Ascending,
+                (Bound::Unbounded, Bound::Excluded(b"b".as_slice())),
+                (b"a".to_vec(), b"x".to_vec()),
+            ),
+            (
+                ScanDirection::Descending,
+                (Bound::Excluded(b"b".as_slice()), Bound::Unbounded),
+                (b"c".to_vec(), b"y".to_vec()),
+            ),
+        ] {
+            let page = data
+                .scan(range, direction, None, ScanLimit::new(1, 2).unwrap())
+                .unwrap();
+            assert_eq!(page.items, vec![expected.clone()]);
+            assert!(!page.limited);
+            let page = data
+                .scan(.., direction, None, ScanLimit::new(1, 2).unwrap())
+                .unwrap();
+            assert_eq!(page.items, vec![expected]);
+            assert!(page.limited);
+            let byte_limited = data
+                .scan(.., direction, None, ScanLimit::new(2, 2).unwrap())
+                .unwrap();
+            assert_eq!(byte_limited.items, page.items);
+            assert!(byte_limited.limited);
+            assert!(matches!(
+                data.scan(
+                    ..,
+                    direction,
+                    Some(page.items[0].0.as_slice()),
+                    ScanLimit::new(1, 2).unwrap(),
+                ),
+                Err(StoreError::ItemTooLarge { .. })
+            ));
+        }
+    }
 }

@@ -60,158 +60,61 @@ fn key_codec_errors_poison_the_transaction() {
     );
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum VisitError {
-    Store,
-    Business,
-}
-
-impl From<StoreError> for VisitError {
-    fn from(_error: StoreError) -> Self {
-        Self::Store
-    }
-}
-
 #[test]
-fn visitor_errors_poison_and_roll_back_prior_store_writes() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let source = create_map::<u64, u64>(&mut store, "source").unwrap();
-    let output = create_map::<u64, u64>(&mut store, "output").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
-        let mut source = source.access(transaction.access()).unwrap();
-        source.put(&1, &10).unwrap();
-        source.put(&2, &20).unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin();
-    let source = source.access(transaction.access()).unwrap();
-    let mut output_access = output.access(transaction.access()).unwrap();
-    let result = source.scan(
-        ..,
-        ScanDirection::Ascending,
-        None,
-        ScanLimit::new(10, 1_024).unwrap(),
-        |entry| {
-            let (key, value) = entry.decode_owned()?;
-            output_access.put(&key, &value)?;
-            if key == 2 {
-                return Err(VisitError::Business);
-            }
-            Ok(())
-        },
-    );
-    assert_eq!(result, Err(VisitError::Business));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-
-    let transaction = transactions.begin();
-    assert_eq!(
-        output
+fn failed_page_decode_poisons_and_rolls_back_prior_writes() {
+    for write_in_scan_transaction in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(store_path(&root)).unwrap();
+        let raw = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+        let typed = open_map::<u64, u64>(&store, "map").unwrap();
+        let marker = create_map::<u64, u64>(&mut store, "marker").unwrap();
+        let mut writes = store.into_transactions();
+        if !write_in_scan_transaction {
+            let transaction = writes.begin();
+            let mut raw = raw.access(transaction.access()).unwrap();
+            raw.put(&1, &10_u64.to_be_bytes().to_vec()).unwrap();
+            raw.put(&2, &vec![0]).unwrap();
+            transaction.commit().unwrap();
+        }
+        let transaction = writes.begin();
+        marker
             .access(transaction.access())
             .unwrap()
-            .get(&1)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        output
-            .access(transaction.access())
-            .unwrap()
-            .get(&2)
-            .unwrap(),
-        None
-    );
-}
-
-#[test]
-fn swallowed_full_decode_errors_poison_persisted_and_new_entries() {
-    assert_swallowed_full_decode_error_poisons(false);
-    assert_swallowed_full_decode_error_poisons(true);
-}
-
-fn assert_swallowed_full_decode_error_poisons(write_in_scan_transaction: bool) {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
-    let typed = open_map::<u64, u64>(&store, "map").unwrap();
-    let mut transactions = store.into_transactions();
-
-    if !write_in_scan_transaction {
-        let transaction = transactions.begin();
-        raw.access(transaction.access())
-            .unwrap()
-            .put(&1, &vec![0])
+            .put(&1, &42)
             .unwrap();
-        transaction.commit().unwrap();
+        if write_in_scan_transaction {
+            let mut raw = raw.access(transaction.access()).unwrap();
+            raw.put(&1, &10_u64.to_be_bytes().to_vec()).unwrap();
+            raw.put(&2, &vec![0]).unwrap();
+        }
+        let access = typed.access(transaction.access()).unwrap();
+        assert!(matches!(
+            access.scan(
+                ..,
+                ScanDirection::Ascending,
+                None,
+                ScanLimit::new(10, 1024).unwrap()
+            ),
+            Err(StoreError::Codec(_))
+        ));
+        assert!(matches!(
+            access.get(&1),
+            Err(StoreError::TransactionPoisoned)
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+        let transaction = writes.begin();
+        assert_eq!(
+            marker
+                .access(transaction.access())
+                .unwrap()
+                .get(&1)
+                .unwrap(),
+            None
+        );
     }
-
-    let transaction = transactions.begin();
-    if write_in_scan_transaction {
-        raw.access(transaction.access())
-            .unwrap()
-            .put(&1, &vec![0])
-            .unwrap();
-    }
-    let access = typed.access(transaction.access()).unwrap();
-    let result = access.scan(
-        ..,
-        ScanDirection::Ascending,
-        None,
-        ScanLimit::new(10, 1_024).unwrap(),
-        |entry| {
-            assert!(entry.decode_owned().is_err());
-            Ok::<(), StoreError>(())
-        },
-    );
-    assert!(matches!(result, Err(StoreError::TransactionPoisoned)));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
-}
-
-#[test]
-fn swallowed_projection_errors_still_stop_the_scan_and_poison() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let map = create_map::<u64, u64>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
-        map.access(transaction.access())
-            .unwrap()
-            .put(&1, &1)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let transaction = transactions.begin();
-    let access = map.access(transaction.access()).unwrap();
-    let result = access.scan(
-        ..,
-        ScanDirection::Ascending,
-        None,
-        ScanLimit::new(10, 1_024).unwrap(),
-        |entry| {
-            assert!(
-                entry
-                    .project(|_, _| Err::<(), _>(CodecError::new("projection failure")))
-                    .is_err()
-            );
-            Ok::<(), StoreError>(())
-        },
-    );
-    assert!(matches!(result, Err(StoreError::TransactionPoisoned)));
-    assert!(matches!(
-        transaction.commit(),
-        Err(StoreError::TransactionPoisoned)
-    ));
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -228,7 +131,7 @@ impl StoreKey for UndecodableKey {
 }
 
 #[test]
-fn continuation_is_decoded_before_the_first_callback() {
+fn malformed_keys_fail_the_whole_page_and_poison() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let raw = create_map::<u64, u64>(&mut store, "map").unwrap();
@@ -244,19 +147,13 @@ fn continuation_is_decoded_before_the_first_callback() {
 
     let transaction = transactions.begin();
     let access = malformed.access(transaction.access()).unwrap();
-    let mut visits = 0;
     let result = access.scan(
         ..,
         ScanDirection::Ascending,
         None,
         ScanLimit::new(1, 1_024).unwrap(),
-        |_| {
-            visits += 1;
-            Ok::<(), StoreError>(())
-        },
     );
     assert!(matches!(result, Err(StoreError::Codec(_))));
-    assert_eq!(visits, 0);
     assert!(matches!(
         transaction.commit(),
         Err(StoreError::TransactionPoisoned)

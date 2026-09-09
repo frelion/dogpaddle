@@ -179,7 +179,7 @@ pub(super) fn adjust_encoded(
     };
     let after = data.poison_on_error(after)?;
     if after == 0 {
-        data.delete(encoded_key)?;
+        data.erase(encoded_key)?;
     } else {
         data.put(encoded_key, &after.to_be_bytes())?;
     }

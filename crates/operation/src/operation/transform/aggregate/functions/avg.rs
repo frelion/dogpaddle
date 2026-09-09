@@ -1,7 +1,7 @@
 use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 
-use super::{Binder, BoundReduction, Descriptor, Fold, Reduction, apply_weight, unsupported};
+use super::{BoundReduction, Descriptor, Fold, Reduction, apply_weight, unsupported};
 use crate::{
     expression::BoundExpression,
     operation::transform::aggregate::{AggregateError, AggregateSchemaError},
@@ -10,7 +10,7 @@ use crate::{
 pub(super) const DESCRIPTOR: Descriptor = Descriptor {
     tag: super::AVG,
     arguments: 1,
-    bind: Binder::Fallible(bind),
+    bind,
 };
 
 enum Average {

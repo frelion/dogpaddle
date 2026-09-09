@@ -333,40 +333,38 @@ impl DirectScan {
     fn read(&mut self) -> Result<Value, OperationError> {
         let transaction = self.transactions.begin();
         let mut rows = Vec::new();
-        let continuation = self.output.access(transaction.access())?.scan(
+        let page = self.output.access(transaction.access())?.scan(
             ..,
             ScanDirection::Ascending,
             None,
             ScanLimit::new(4096, usize::MAX)?,
-            |entry| -> Result<(), OperationError> {
-                let (_, encoded) = entry.decode_owned()?;
-                let change = decode_change(&encoded)?;
-                let columns = change.records().columns();
-                let ids = columns[0]
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or("id is not int64")?;
-                let sequences = columns[1]
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or("tx_seq is not int32")?;
-                let payloads = columns[2]
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or("payload is not text")?;
-                for row in 0..change.num_rows() {
-                    rows.push(json!([
-                        change.diffs().value(row),
-                        ids.value(row),
-                        sequences.value(row),
-                        payloads.value(row)
-                    ]));
-                }
-                Ok(())
-            },
         )?;
-        if continuation.is_some() {
+        if page.continuation.is_some() {
             return Err("gate output exceeded the bounded diagnostic scan".into());
+        }
+        for (_, encoded) in page.entries {
+            let change = decode_change(&encoded)?;
+            let columns = change.records().columns();
+            let ids = columns[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or("id is not int64")?;
+            let sequences = columns[1]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or("tx_seq is not int32")?;
+            let payloads = columns[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("payload is not text")?;
+            for row in 0..change.num_rows() {
+                rows.push(json!([
+                    change.diffs().value(row),
+                    ids.value(row),
+                    sequences.value(row),
+                    payloads.value(row)
+                ]));
+            }
         }
         let checkpoint_present = self
             .checkpoint

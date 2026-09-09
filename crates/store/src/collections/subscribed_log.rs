@@ -186,7 +186,7 @@ impl<T: StoreValue> SubscribedLogWriter<T> {
         let mut data = self.data.access(access)?;
         let metadata = read_metadata(data.as_read())?;
         let encoded = data.poison_on_error(value.encode_value().map_err(StoreError::from))?;
-        let item_bytes = match encoded_item_bytes(encoded.as_ref()) {
+        let item_bytes = match encoded_item_bytes(encoded.as_ref().len()) {
             Ok(bytes) => bytes,
             Err(error) => return fail(data.as_read(), error),
         };
@@ -299,14 +299,7 @@ impl<T: StoreValue> Subscription<T> {
         let metadata = read_metadata(data.as_read())?;
         let positions = read_positions(data.as_read(), metadata)?;
         let index = subscriber_index(metadata, self.subscriber, data.as_read())?;
-        let Some(&actual) = positions.get(index) else {
-            return fail(
-                data.as_read(),
-                StoreError::CorruptSubscribedLog {
-                    reason: "a subscriber position is missing from the validated set",
-                },
-            );
-        };
+        let actual = positions[index];
         if actual != expected_offset {
             return fail(
                 data.as_read(),
@@ -326,28 +319,20 @@ impl<T: StoreValue> Subscription<T> {
                 },
             );
         }
-        let Some(next) = actual.checked_add(1) else {
-            return fail(
-                data.as_read(),
-                StoreError::CorruptSubscribedLog {
-                    reason: "a subscription position before the tail has no successor",
-                },
-            );
-        };
-        let encoded =
+        let next = actual + 1;
+        let encoded_len =
             data.as_read()
-                .get(&entry_key(actual))?
+                .value_len(&entry_key(actual))?
                 .ok_or(StoreError::CorruptSubscribedLog {
                     reason: "the acknowledged entry is missing",
                 });
-        let encoded = data.as_read().record_result(encoded)?;
-        let frontiers = acknowledgement_frontiers(&positions, index, next);
-        let (old_head, new_head) = data.as_read().record_result(frontiers)?;
+        let encoded_len = data.as_read().record_result(encoded_len)?;
+        let (old_head, new_head) = acknowledgement_frontiers(&positions, index, next);
         validate_retention(data.as_read(), metadata, old_head)?;
         let retained_bytes = if new_head == old_head {
             None
         } else {
-            let item_bytes = match encoded_item_bytes(encoded.as_ref()) {
+            let item_bytes = match encoded_item_bytes(encoded_len) {
                 Ok(bytes) => bytes,
                 Err(error) => return fail(data.as_read(), error),
             };
@@ -372,14 +357,7 @@ impl<T: StoreValue> Subscription<T> {
 
         data.put(&position_key(self.subscriber), &next.to_be_bytes())?;
         if let Some(retained_bytes) = retained_bytes {
-            if !data.delete(&entry_key(old_head))? {
-                return fail(
-                    data.as_read(),
-                    StoreError::CorruptSubscribedLog {
-                        reason: "the retention-front entry disappeared during acknowledgement",
-                    },
-                );
-            }
+            data.erase(&entry_key(old_head))?;
             write_metadata(
                 &mut data,
                 Metadata {
@@ -424,14 +402,6 @@ fn read_metadata(data: &ReadDataAccess<'_>) -> Result<Metadata, StoreError> {
 }
 
 fn write_metadata(data: &mut DataAccess<'_>, metadata: Metadata) -> Result<(), StoreError> {
-    if !metadata.is_valid() {
-        return fail(
-            data.as_read(),
-            StoreError::CorruptSubscribedLog {
-                reason: "an update would write invalid log metadata",
-            },
-        );
-    }
     data.put(METADATA_KEY, &encode_metadata(metadata))
 }
 
@@ -500,25 +470,14 @@ fn read_positions(data: &ReadDataAccess<'_>, metadata: Metadata) -> Result<Vec<u
     data.record_result(positions)
 }
 
-fn acknowledgement_frontiers(
-    positions: &[u64],
-    subscriber: usize,
-    next: u64,
-) -> Result<(u64, u64), StoreError> {
-    let old_head = positions.iter().copied().min();
-    let new_head = positions
+fn acknowledgement_frontiers(positions: &[u64], subscriber: usize, next: u64) -> (u64, u64) {
+    // The decoded subscriber set is non-empty and `subscriber` is in range.
+    positions
         .iter()
         .enumerate()
-        .map(
-            |(index, position)| {
-                if index == subscriber { next } else { *position }
-            },
-        )
-        .min();
-    old_head
-        .zip(new_head)
-        .ok_or(StoreError::CorruptSubscribedLog {
-            reason: "a subscribed log has no subscriber positions",
+        .fold((next, next), |(old_head, new_head), (index, &position)| {
+            let updated = if index == subscriber { next } else { position };
+            (old_head.min(position), new_head.min(updated))
         })
 }
 
@@ -628,8 +587,8 @@ fn validate_retention(
     Ok(())
 }
 
-fn encoded_item_bytes(encoded: &[u8]) -> Result<u64, StoreError> {
-    u64::try_from(encoded.len())
+fn encoded_item_bytes(encoded_len: usize) -> Result<u64, StoreError> {
+    u64::try_from(encoded_len)
         .ok()
         .and_then(|bytes| bytes.checked_add(OFFSET_BYTES))
         .ok_or(StoreError::SubscribedLogRetainedBytesExhausted)
