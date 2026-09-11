@@ -101,6 +101,11 @@ fn finish_rejects_forbidden_or_excess_inputs() {
     let union = || UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
     assert_input_count(finish_with_target(union(), 1), 2, 1);
     assert_input_count(finish_with_target(union(), 3), 2, 3);
+    assert_input_count(
+        finish_with_target(UnionAllDefinition::new(NonZeroU32::MAX), 1),
+        usize::try_from(u32::MAX).unwrap(),
+        1,
+    );
     assert_input_count(finish_with_target(discard(), 2), 1, 2);
 }
 
@@ -140,90 +145,119 @@ fn finish_matches_an_exhaustive_small_unary_graph_oracle() {
                 let graph = format!(
                     "station_count={station_count}, count_mask={count_mask:#b}, parents={parents:?}"
                 );
-
-                let mut builder = factory();
-                let references = (0..station_count)
-                    .map(|index| {
-                        let id = station_id(index);
-                        if parents[index].is_some() {
-                            builder.station(id, count())
-                        } else {
-                            builder.station(id, scan(index as u64))
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                for &target in &count_targets {
-                    builder.connect([references[parents[target].unwrap()]], references[target]);
-                }
-                let leaves = (0..station_count)
-                    .filter(|candidate| !parents.contains(&Some(*candidate)))
-                    .collect::<Vec<_>>();
-                for &leaf in &leaves {
-                    let sink = builder.station(format!("sink-{leaf}"), discard());
-                    builder.connect([references[leaf]], sink);
-                }
-                declare_output_capacities(&mut builder);
-
-                match expected {
-                    UnaryGraphClass::Acyclic => {
-                        let definition = builder
-                            .finish_definition()
-                            .unwrap_or_else(|error| panic!("{graph}: rejected with {error:?}"));
-                        let expected_ids = (0..station_count)
-                            .map(station_id)
-                            .chain(leaves.iter().map(|leaf| format!("sink-{leaf}")))
-                            .collect::<Vec<_>>();
-                        assert_eq!(
-                            definition
-                                .stations
-                                .iter()
-                                .map(|station| station.id.as_str())
-                                .collect::<Vec<_>>(),
-                            expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-                            "{graph}: declaration order changed"
-                        );
-                        for (station_index, station) in
-                            definition.stations.iter().take(station_count).enumerate()
-                        {
-                            let expected_kind = parents[station_index]
-                                .map_or(OperationKind::Scan, |_| {
-                                    OperationKind::Transform(NonZeroU32::MIN)
-                                });
-                            assert_eq!(station.operation().kind(), expected_kind, "{graph}");
-                            let expected_inputs = parents[station_index]
-                                .map(|parent| vec![station_id(parent)])
-                                .unwrap_or_default();
-                            assert_eq!(
-                                station.inputs, expected_inputs,
-                                "{graph}: input order changed for station {station_index}"
-                            );
-                        }
-                        for (&leaf, station) in
-                            leaves.iter().zip(&definition.stations[station_count..])
-                        {
-                            assert_eq!(
-                                station.inputs,
-                                [station_id(leaf)],
-                                "{graph}: sink input changed for leaf {leaf}"
-                            );
-                        }
-                    }
-                    UnaryGraphClass::SelfLoop(target) => assert_eq!(
-                        builder.finish_definition().unwrap_err(),
-                        TopologyError::SelfLoop(station_id(target)),
-                        "{graph}: direct cycle classification changed"
-                    ),
-                    UnaryGraphClass::Cycle => assert_eq!(
-                        builder.finish_definition().unwrap_err(),
-                        TopologyError::Cycle,
-                        "{graph}: indirect cycle classification changed"
-                    ),
-                }
+                assert_unary_graph(station_count, &count_targets, &parents, expected, &graph);
             }
         }
     }
 
     assert_eq!(visited, EXPECTED_GRAPH_COUNT);
+}
+
+fn assert_unary_graph(
+    station_count: usize,
+    count_targets: &[usize],
+    parents: &[Option<usize>],
+    expected: UnaryGraphClass,
+    graph: &str,
+) {
+    let (builder, leaves) = unary_graph_factory(station_count, count_targets, parents);
+    match expected {
+        UnaryGraphClass::Acyclic => {
+            let definition = builder
+                .finish_definition()
+                .unwrap_or_else(|error| panic!("{graph}: rejected with {error:?}"));
+            assert_acyclic_unary_graph(&definition, station_count, parents, &leaves, graph);
+        }
+        UnaryGraphClass::SelfLoop(target) => assert_eq!(
+            builder.finish_definition().unwrap_err(),
+            TopologyError::SelfLoop(station_id(target)),
+            "{graph}: direct cycle classification changed"
+        ),
+        UnaryGraphClass::Cycle => assert_eq!(
+            builder.finish_definition().unwrap_err(),
+            TopologyError::Cycle,
+            "{graph}: indirect cycle classification changed"
+        ),
+    }
+}
+
+fn unary_graph_factory(
+    station_count: usize,
+    count_targets: &[usize],
+    parents: &[Option<usize>],
+) -> (FlowFactory, Vec<usize>) {
+    let mut builder = factory();
+    let references = (0..station_count)
+        .map(|index| {
+            let id = station_id(index);
+            if parents[index].is_some() {
+                builder.station(id, count())
+            } else {
+                builder.station(id, scan(index as u64))
+            }
+        })
+        .collect::<Vec<_>>();
+    for &target in count_targets {
+        builder.connect([references[parents[target].unwrap()]], references[target]);
+    }
+    let leaves = (0..station_count)
+        .filter(|candidate| !parents.contains(&Some(*candidate)))
+        .collect::<Vec<_>>();
+    for &leaf in &leaves {
+        let sink = builder.station(format!("sink-{leaf}"), discard());
+        builder.connect([references[leaf]], sink);
+    }
+    declare_output_capacities(&mut builder);
+    (builder, leaves)
+}
+
+fn assert_acyclic_unary_graph(
+    definition: &FlowDefinition,
+    station_count: usize,
+    parents: &[Option<usize>],
+    leaves: &[usize],
+    graph: &str,
+) {
+    let expected_ids = (0..station_count)
+        .map(station_id)
+        .chain(leaves.iter().map(|leaf| format!("sink-{leaf}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        definition
+            .stations
+            .iter()
+            .map(|station| station.id.as_str())
+            .collect::<Vec<_>>(),
+        expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "{graph}: declaration order changed"
+    );
+    for (station_index, station) in definition.stations.iter().take(station_count).enumerate() {
+        let expected_kind = parents[station_index].map_or(OperationKind::Scan, |_| {
+            OperationKind::Transform(NonZeroU32::MIN)
+        });
+        assert_eq!(station.core().kind(), expected_kind, "{graph}");
+        let expected_inputs = parents[station_index]
+            .map(|parent| vec![station_id(parent)])
+            .unwrap_or_default();
+        assert_eq!(
+            station.inputs().collect::<Vec<_>>(),
+            expected_inputs
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "{graph}: input order changed for station {station_index}"
+        );
+    }
+    for (&leaf, station) in leaves.iter().zip(&definition.stations[station_count..]) {
+        assert_eq!(
+            station.inputs().collect::<Vec<_>>(),
+            [station_id(leaf)]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "{graph}: sink input changed for leaf {leaf}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,13 +354,32 @@ fn decoder_round_trips_a_large_chain() {
 
 #[test]
 fn decoder_validates_capacity_against_the_decoded_operation_category() {
-    let mut missing = encode(&codec_definition()).unwrap();
-    let scan_start = missing
+    let encoded = encode(&codec_definition()).unwrap();
+    let scan_start = encoded
         .windows(7_u64.to_be_bytes().len())
         .position(|window| window == 7_u64.to_be_bytes())
         .unwrap();
-    let scan_capacity = scan_start + size_of::<u64>();
-    missing[scan_capacity..scan_capacity + size_of::<u64>()].copy_from_slice(&0_u64.to_be_bytes());
+    let scan_output = scan_start + size_of::<u64>() + size_of::<u32>();
+
+    let mut invalid_presence = encoded.clone();
+    invalid_presence[scan_output] = 2;
+    rewrite_internal_checksum(&mut invalid_presence);
+    assert_eq!(
+        decode(&invalid_presence).unwrap_err(),
+        FlowDefinitionError::InvalidOutputPresence(2)
+    );
+
+    let mut zero_capacity = encoded.clone();
+    zero_capacity[scan_output + 1..scan_output + 1 + size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_be_bytes());
+    rewrite_internal_checksum(&mut zero_capacity);
+    assert_eq!(
+        decode(&zero_capacity).unwrap_err(),
+        FlowDefinitionError::ZeroOutputCapacity
+    );
+
+    let mut missing = encoded.clone();
+    missing.splice(scan_output..scan_output + 13, [0]);
     let checksum_offset = missing.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&missing[..checksum_offset]);
     missing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
@@ -336,13 +389,15 @@ fn decoder_validates_capacity_against_the_decoded_operation_category() {
     );
 
     let mut unexpected = encode(&codec_definition()).unwrap();
-    let sink_operation = unexpected
-        .windows(b"dogpaddle.operation\0".len())
-        .rposition(|window| window == b"dogpaddle.operation\0")
+    let sink_input = unexpected
+        .windows(b"count".len())
+        .rposition(|window| window == b"count")
         .unwrap();
-    let sink_capacity = sink_operation + 24;
-    unexpected[sink_capacity..sink_capacity + size_of::<u64>()]
-        .copy_from_slice(&1_u64.to_be_bytes());
+    let sink_output = sink_input + b"count".len() + size_of::<u32>();
+    let encoded_output = std::iter::once(1)
+        .chain(NonZeroU64::MIN.get().to_be_bytes())
+        .chain(0_u32.to_be_bytes());
+    unexpected.splice(sink_output..=sink_output, encoded_output);
     let checksum_offset = unexpected.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&unexpected[..checksum_offset]);
     unexpected[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
@@ -350,6 +405,12 @@ fn decoder_validates_capacity_against_the_decoded_operation_category() {
         decode(&unexpected).unwrap_err(),
         FlowDefinitionError::Topology(TopologyError::UnexpectedOutputCapacity("sink".to_owned()))
     );
+}
+
+fn rewrite_internal_checksum(encoded: &mut [u8]) {
+    let checksum_offset = encoded.len() - CHECKSUM_LENGTH;
+    let checksum = crc32(&encoded[..checksum_offset]);
+    encoded[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
 }
 
 #[test]

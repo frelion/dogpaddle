@@ -3,7 +3,7 @@ use std::{num::NonZeroU64, sync::Arc};
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationKind,
+    InlineBinding,
     operation::{Action, Operation, OperationInput, Turn},
 };
 use dogpaddle_store::{
@@ -15,18 +15,18 @@ use crate::flow::{AdvanceOutcome, StationStatus};
 
 use super::{
     input::{Inbox, InputPort, Output},
+    program::StationProgram,
     protocol::StationError,
 };
 
 pub(crate) struct StationParts {
     active: Option<Cell<u32>>,
-    operation: Box<dyn Operation>,
-    kind: OperationKind,
+    program: StationProgram,
     output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
 }
 
 pub(crate) struct Station {
-    pub(super) operation: Box<dyn Operation>,
+    program: StationProgram,
     pub(super) inbox: Inbox,
     pub(super) output: Option<Arc<Output>>,
     needs_reopen: bool,
@@ -66,12 +66,52 @@ impl Station {
             return Ok(AdvanceOutcome::Idle);
         }
 
+        let claim = self.inbox.claim();
+        let (input_pipelines, core, output_pipeline) = self.program.parts_mut();
+        let transformed_input = if let Some(claim) = claim {
+            let input = input_pipelines
+                .get_mut(claim.port())
+                .expect("an offered Claim has a validated input port");
+            let Some(change) = input.apply_borrowed(claim.change()).map_err(|error| {
+                StationError::InlineInput {
+                    input: claim.port(),
+                    stage: error.stage,
+                    source: error.source,
+                }
+            })?
+            else {
+                let transaction = transactions.begin();
+                self.inbox.complete(transaction.access())?;
+                if let Err(source) = transaction.commit() {
+                    self.needs_reopen = true;
+                    return Err(StationError::Commit { source });
+                }
+                self.inbox.clear_claim();
+                return Ok(AdvanceOutcome::Progressed);
+            };
+            if let Some(expected) = input.output_schema() {
+                let actual = change.as_ref().schema();
+                if expected.as_ref() != actual.as_ref() {
+                    return Err(StationError::InputSchemaMismatch {
+                        input: claim.port(),
+                        expected: Arc::clone(expected),
+                        actual,
+                    });
+                }
+            }
+            Some((claim.port(), change))
+        } else {
+            None
+        };
+
         let (completes_input, after_commit) = {
-            let input = self.inbox.claim().map(|claim| OperationInput {
-                port: claim.port(),
-                change: claim.change(),
-            });
-            let prepared = match self.operation.turn(input)? {
+            let input = transformed_input
+                .as_ref()
+                .map(|(port, change)| OperationInput {
+                    port: *port,
+                    change: change.as_ref(),
+                });
+            let prepared = match core.turn(input)? {
                 Turn::Idle => return Ok(AdvanceOutcome::Idle),
                 Turn::Ready(prepared) => prepared,
             };
@@ -90,6 +130,17 @@ impl Station {
                 }
             };
 
+            let output = output
+                .map(|change| {
+                    output_pipeline.apply_owned(change).map_err(|error| {
+                        StationError::InlineOutput {
+                            stage: error.stage,
+                            source: error.source,
+                        }
+                    })
+                })
+                .transpose()?
+                .flatten();
             if !append_output(self.output.as_deref(), output, access)? {
                 return Ok(AdvanceOutcome::Backpressured);
             }
@@ -152,7 +203,7 @@ impl Station {
 
     #[cfg(test)]
     pub(crate) fn replace_operation(&mut self, operation: Box<dyn Operation>) {
-        self.operation = operation;
+        self.program.replace_core(operation);
     }
 }
 
@@ -172,13 +223,13 @@ impl StationParts {
     pub(crate) fn new(
         active: Option<Cell<u32>>,
         operation: Box<dyn Operation>,
-        kind: OperationKind,
+        input_pipelines: Vec<Vec<InlineBinding>>,
+        output_pipeline: Vec<InlineBinding>,
         output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
     ) -> Self {
         Self {
             active,
-            operation,
-            kind,
+            program: StationProgram::new(operation, input_pipelines, output_pipeline),
             output,
         }
     }
@@ -213,8 +264,7 @@ impl StationParts {
                 .read(access)?
                 .get()?
                 .ok_or(StationError::MissingActiveInput)?;
-            let input_count = usize::try_from(self.kind.input_count())
-                .expect("an Operation input count fits usize");
+            let input_count = self.program.input_count();
             let active = usize::try_from(active).expect("u32 fits usize on supported targets");
             if active >= input_count {
                 return Err(StationError::ActiveInputOutOfRange {
@@ -252,20 +302,15 @@ impl StationParts {
     pub(crate) fn finish(self, inputs: Vec<InputPort>, output: Option<Arc<Output>>) -> Station {
         assert_eq!(
             inputs.len(),
-            usize::try_from(self.kind.input_count()).expect("an Operation input count fits usize"),
+            self.program.input_count(),
             "station input capabilities must match its operation definition"
-        );
-        assert_eq!(
-            output.is_some(),
-            self.kind.has_output(),
-            "station output capability must match its operation definition"
         );
         assert!(
             self.output.is_none(),
             "station output must be moved exactly once during assembly"
         );
         Station {
-            operation: self.operation,
+            program: self.program,
             inbox: Inbox::new(self.active, inputs),
             output,
             needs_reopen: false,

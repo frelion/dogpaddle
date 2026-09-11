@@ -55,6 +55,27 @@ Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability�
 表布局与参数化语句。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
+## Inline 执行能力
+
+[`InlineOperationDefinition`] 是与普通 [`OperationDefinition`] 分开的 sealed capability。目前只有
+Project、Filter、Extend、Select 和 `SchemaAlign` 明确实现它。调用方消费具体 Definition 的
+`try_into_inline` 得到 opaque [`InlineDefinition`]；不能根据 `data()` 为空推断，因为 `UnionAll`、
+Discard 等无 Store data 的算子也不满足单输入纯变换协议。
+
+[`InlineDefinition::bind`] 只接收一个 exact input Schema，产生运行期、非持久的 [`InlineBinding`]。binding
+保存派生 output Schema 和编译后的执行 kernel，并直接对一个完整 Change 同步返回零或一个 Change；
+这里没有 Store data、[`RuntimeResource`] 或第二个 materialize 阶段，也不能产生 `Idle`、`Commit`、
+continuation 或 `AfterCommit`。五个算子的普通 Operation adapter 与 inline
+路径调用同一份 exact-Schema-bound 执行实现，因此字段、metadata、NULL、行序和 diff 语义没有第二份
+实现。
+
+inline capability 要求具体 Definition instance 可重放：不增加行数，保持所选事件的相对顺序和原始
+diff，并且展平事件流在合法重批后不变。表达式树只接受 row-local scalar 构造和 `Immutable` scalar
+function；`Stable`、`Volatile`、placeholder、subquery、aggregate/window、unnest、外部引用及无法证明
+为 row-local 的构造在 `try_into_inline` 时拒绝。`encode_inline_definition` 和
+`decode_inline_definition` 使用普通 Operation 的同一 tag/payload 和完整外层字节，但专用 decoder
+只接受这五个 capability tag，并在 decode 后重新检查 instance eligibility。
+
 Filter、Extend、Select、`SchemaAlign` 与 `Aggregate` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
 [`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
 builder。需要按 Arrow 字段名逐字引用时使用 [`ident`]；[`col`] 保留 `DataFusion` 自身的大小写正规化和
@@ -253,7 +274,8 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 所有十五个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
 `tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
 materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol` 与 `metamorphic`
-只保留跨算子契约。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
+只保留跨算子契约；`correctness/inline.rs` 证明 capability registry、普通/inline codec 同字节、共享
+runtime 语义、空输出、Schema guard 和五算子组合的重批同态。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
 和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
 真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 

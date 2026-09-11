@@ -40,6 +40,26 @@ pub enum Action {
 /// Type-erased failure before one prepared Operation turn commits.
 pub type OperationError = Box<dyn Error + Send + Sync + 'static>;
 
+/// One exact-Schema-bound transform that can execute inside a Station pipeline.
+///
+/// Each call consumes one complete logical input Change and immediately emits
+/// zero or one complete output Change. Implementations are sealed at the
+/// definition layer and must be deterministic for identical inputs, retry-safe
+/// after errors, non-expanding, order-preserving, difference-preserving, and
+/// homomorphic over rebatching. They cannot access Store transactions, runtime
+/// resources, continuations, external effects, timers, or control messages.
+pub(crate) trait InlineTransform: Send + 'static {
+    /// Applies this transform without opening or accessing a Store transaction.
+    ///
+    /// `None` represents an empty logical output stream for this input Change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the concrete deterministic evaluation failure. The transform
+    /// remains safe to call again with the same input.
+    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError>;
+}
+
 /// Failure after one prepared Operation turn has committed.
 ///
 /// This phase is deliberately distinct from [`OperationError`]: the local

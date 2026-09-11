@@ -8,11 +8,13 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
+    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
+    definition::{InlineSealed, Sealed as SealedDefinition},
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 6;
@@ -119,20 +121,12 @@ impl ExtendDefinition {
     pub fn expression(&self) -> &Expr {
         self.expression.expression()
     }
-}
 
-impl SealedDefinition for ExtendDefinition {
-    fn bind_schemas(
+    fn bind_operation(
         &self,
-        input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
-        let input_schema = input_schemas
-            .first()
-            .expect("the final binding entrypoint enforces Extend input arity");
-        let expression = self.expression.bind(Arc::clone(input_schema)).map_err(
-            |source| -> OperationSchemaError { Box::new(ExtendSchemaError::Expression(source)) },
-        )?;
-
+        input_schema: &SchemaRef,
+    ) -> Result<(SchemaRef, ExtendOperation), ExtendSchemaError> {
+        let expression = self.expression.bind(Arc::clone(input_schema))?;
         let mut fields = input_schema.fields().iter().cloned().collect::<Vec<_>>();
         fields.push(Arc::new(Field::new(
             &self.field_name,
@@ -143,14 +137,45 @@ impl SealedDefinition for ExtendDefinition {
             fields,
             input_schema.metadata().clone(),
         ));
-        let materialized_schema = Arc::clone(&output_schema);
+        let operation = ExtendOperation {
+            expression,
+            output_schema: Arc::clone(&output_schema),
+        };
+        Ok((output_schema, operation))
+    }
+}
+
+impl SealedDefinition for ExtendDefinition {
+    fn bind_schemas(
+        &self,
+        input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        let input_schema = input_schemas
+            .first()
+            .expect("the final binding entrypoint enforces Extend input arity");
+        let (output_schema, operation) = self
+            .bind_operation(input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         Ok(OperationBinding::without_data(
             Some(output_schema),
-            ExtendOperation {
-                expression,
-                output_schema: materialized_schema,
-            },
+            operation,
         ))
+    }
+}
+
+impl InlineSealed for ExtendDefinition {
+    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
+        self.expression.ensure_inline_eligible(0)
+    }
+
+    fn bind_inline_schema(
+        &self,
+        input_schema: SchemaRef,
+    ) -> Result<InlineBinding, OperationSchemaError> {
+        let (output_schema, operation) = self
+            .bind_operation(&input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        Ok(InlineBinding::new(output_schema, operation))
     }
 }
 
@@ -176,6 +201,22 @@ impl OperationDefinition for ExtendDefinition {
     }
 }
 
+impl InlineTransform for ExtendOperation {
+    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+        let computed = self
+            .expression
+            .evaluate(input.records())
+            .map_err(ExtendError::Expression)?;
+        let mut columns = input.records().columns().to_vec();
+        columns.push(computed);
+        let records = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
+            .map_err(ExtendError::Arrow)?;
+        let output =
+            Change::try_new(records, input.diffs().clone()).map_err(ExtendError::Change)?;
+        Ok(Some(output))
+    }
+}
+
 impl TransactionalOperation for ExtendOperation {
     fn apply(
         &mut self,
@@ -187,23 +228,25 @@ impl TransactionalOperation for ExtendOperation {
             return Err(ExtendError::InvalidInputPort { port: input.port }.into());
         }
 
-        let computed = self
-            .expression
-            .evaluate(input.change.records())
-            .map_err(ExtendError::Expression)?;
-        let mut columns = input.change.records().columns().to_vec();
-        columns.push(computed);
-        let records = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
-            .map_err(ExtendError::Arrow)?;
-        let output =
-            Change::try_new(records, input.change.diffs().clone()).map_err(ExtendError::Change)?;
-        Ok(Action::Complete(Some(output)))
+        InlineTransform::apply(self, input.change).map(Action::Complete)
     }
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    decode_extend(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
+}
+
+pub(crate) fn decode_inline_definition(
+    payload: &[u8],
+) -> Result<InlineDefinition, DefinitionCodecError> {
+    decode_extend(payload)?
+        .try_into_inline()
+        .map_err(DefinitionCodecError::InlineIneligible)
+}
+
+fn decode_extend(payload: &[u8]) -> Result<ExtendDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let name_length = usize::try_from(cursor.read_u32()?)
         .map_err(|_| DefinitionCodecError::InvalidPayload("Extend field-name length is invalid"))?;
@@ -213,8 +256,8 @@ pub(crate) fn decode_definition(
         .to_owned();
     let expression = StoredExpression::decode(&mut cursor)?;
     cursor.finish()?;
-    Ok(Box::new(ExtendDefinition {
+    Ok(ExtendDefinition {
         field_name,
         expression,
-    }))
+    })
 }

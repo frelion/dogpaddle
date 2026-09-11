@@ -15,8 +15,9 @@ use dogpaddle_flow::{Flow, FlowFactory};
 
 use crate::{
     SqlError,
+    compiler::scan_station_id,
     endpoint::{ScanEndpoint, SinkEndpoint},
-    lower::{add_sink, internal_scan_name, lower_query, plan, scan_station_id},
+    lower::{internal_scan_name, lower_query, plan},
 };
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
@@ -100,9 +101,10 @@ impl SqlProgram {
             .map(ScanEndpoint::build)
             .collect::<Result<Vec<_>, _>>()?;
         let logical_plan = plan(self.query.clone(), &scans)?;
-        let (mut factory, output) = lower_query(FlowFactory::new(path), &logical_plan, scans)?;
+        let factory = FlowFactory::new(path);
+        let query = lower_query(&logical_plan, scans)?;
         let sink = self.sink.build()?;
-        add_sink(&mut factory, output, sink)?;
+        let factory = query.emit(factory, sink)?;
         factory.build().map_err(Into::into)
     }
 

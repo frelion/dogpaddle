@@ -10,6 +10,19 @@ pub(crate) enum StationError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Operation(#[from] OperationError),
+    #[error("station input {input} inline stage {stage} failed: {source}")]
+    InlineInput {
+        input: usize,
+        stage: usize,
+        #[source]
+        source: OperationError,
+    },
+    #[error("station output inline stage {stage} failed: {source}")]
+    InlineOutput {
+        stage: usize,
+        #[source]
+        source: OperationError,
+    },
     #[error("Store commit failed; station must be reopened: {source}")]
     Commit {
         #[source]
@@ -29,7 +42,7 @@ pub(crate) enum StationError {
         source: ChangeCodecError,
     },
     #[error(
-        "station input {input} Schema does not match its bound output: expected {expected:?}, actual {actual:?}"
+        "station input {input} Schema does not match its binding: expected {expected:?}, actual {actual:?}"
     )]
     InputSchemaMismatch {
         input: usize,

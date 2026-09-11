@@ -2,7 +2,9 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
+    scan::SequenceScanDefinition,
+    sink::DiscardDefinition,
+    transform::{ProjectDefinition, RunningEventCountDefinition},
 };
 use dogpaddle_store::{
     Cell, Store, StoreError, SubscribedLog, SubscribedLogStatus, SubscriptionStatus,
@@ -14,6 +16,7 @@ use super::support::{
 
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
+const V1_INLINE_PIPELINES: &str = include_str!("../fixtures/v1/inline_pipelines.hex");
 
 #[derive(Clone, Copy)]
 enum ResourceFault {
@@ -30,6 +33,17 @@ fn build_publishes_the_stable_v1_definition_bytes() {
     assert_eq!(
         read_published_definition(&path),
         fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD)
+    );
+}
+
+#[test]
+fn build_publishes_non_empty_input_and_output_pipelines_in_stable_order() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    build_inline_chain(&path);
+    assert_eq!(
+        read_published_definition(&path),
+        fixture_bytes(V1_INLINE_PIPELINES)
     );
 }
 
@@ -178,5 +192,31 @@ fn build_chain(path: &Path) {
     builder.connect([count], sink);
     builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
     builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
+    drop(builder.build().unwrap());
+}
+
+fn build_inline_chain(path: &Path) {
+    let mut builder = FlowFactory::new(path);
+    let scan = builder.station("scan", SequenceScanDefinition::new(7));
+    let count = builder.station("count", RunningEventCountDefinition::new());
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.connect([scan], count);
+    builder.connect([count], sink);
+    builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
+    builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
+    builder
+        .inline_output(scan, ProjectDefinition::new([0]))
+        .unwrap();
+    builder
+        .inline_input(count, 0, ProjectDefinition::new([]))
+        .unwrap();
+    builder
+        .inline_output(count, ProjectDefinition::new([0]))
+        .unwrap()
+        .inline_output(count, ProjectDefinition::new([]))
+        .unwrap();
+    builder
+        .inline_input(sink, 0, ProjectDefinition::new([]))
+        .unwrap();
     drop(builder.build().unwrap());
 }

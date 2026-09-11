@@ -40,7 +40,7 @@ test = true
 name = "flow_runtime"
 path = "benches/flow_runtime.rs"
 harness = false
-test = false
+test = true
 
 [lints]
 workspace = true

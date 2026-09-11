@@ -10,7 +10,7 @@ use dogpaddle_store::{Cell, OrderedMap, Store};
 use crate::{
     DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
-    codec::DECODERS,
+    codec::{DECODERS, INLINE_DECODERS},
     col,
     definition::{DataName, Sealed},
     lit,
@@ -252,6 +252,21 @@ fn decoder_registry_exactly_matches_builtins() {
         registered_tags.len(),
         DECODERS.len(),
         "duplicate decoder tag"
+    );
+    assert_eq!(registered_tags, expected_tags);
+}
+
+#[test]
+fn inline_decoder_registry_exactly_matches_the_sealed_capability_set() {
+    let expected_tags = HashSet::from([4, 5, 6, 7, 9]);
+    let registered_tags = INLINE_DECODERS
+        .iter()
+        .map(|(tag, _)| *tag)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        registered_tags.len(),
+        INLINE_DECODERS.len(),
+        "duplicate inline decoder tag"
     );
     assert_eq!(registered_tags, expected_tags);
 }

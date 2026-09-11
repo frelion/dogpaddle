@@ -8,6 +8,8 @@ mod distinct;
 mod lifecycle;
 #[path = "correctness/malformed.rs"]
 mod malformed;
+#[path = "correctness/pipeline.rs"]
+mod pipeline;
 #[path = "correctness/postgres_cdc_scan.rs"]
 mod postgres_cdc_scan;
 #[path = "correctness/postgres_sink.rs"]

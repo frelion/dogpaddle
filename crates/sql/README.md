@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 | --- | --- |
 | `SqlProgram::parse(sql)` | 纯解析一段 UTF-8 SQL；不访问文件、网络或环境变量 |
 | `SqlProgram::read(path)` | 读取并解析一个 UTF-8 SQL 文件 |
-| `SqlProgram::build(state_path)` | 解析端点参数、发现外部 `Schema`/目标、分析 SQL、lower 为 `Operation` DAG 并创建 `Flow` |
+| `SqlProgram::build(state_path)` | 解析端点参数、发现外部 `Schema`/目标、lower 为 logical DAG、自动划分 Station 并创建 `Flow` |
 | `SqlProgram::open(state_path)` | 从 state 目录恢复 canonical `Flow`，并注入 SQL 中声明的运行连接资源 |
 
 `open` 不重新编译或替换已持久化拓扑。请用构建时的同一份 SQL 恢复；修改查询或端点身份后，使用新的
@@ -206,6 +206,24 @@ completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minima
 `DogPaddle`。`DataFusion` 不执行 `Flow`，
 `DogPaddle` 也不维护第二套表达式 AST 或 SQL 执行引擎。
 
+### 自动装配 Station
+
+`build` 先把 `DataFusion` plan lower 为 SQL crate 私有的 logical arena，再用一套确定性规则划分物理
+Station。Scan、Sink、状态算子、多输入算子和不满足 inline capability 的具体纯算子实例都是 core；
+每个 core 优先吸收其后方最大的一段单 consumer 纯链作为 output pipeline。fan-out 之前保留一条
+共享 durable output，分支各自的纯链则装到下游 core 的对应 input pipeline。若一个共享纯节点既不能
+被上游吸收、又有多个 consumer，它会成为一个有 durable output 的 adapter core，随后继续应用同一
+规则。当前 SQL 会把符合实例级重放安全检查的 Filter 和 `SchemaAlign` 作为纯候选；SQL projection
+本来就 lower 为 `SchemaAlign`。
+
+这套划分不枚举 Flow 内部类型，也不改变 logical Operation 的顺序。重复引用同一 CTE 时仍复用一个
+Scan identity；多输入端口顺序保持 `DataFusion` logical plan 的顺序。保留下来的 transform Station ID
+按 logical postorder 稠密编号，每个实际 output 仍使用固定 64 MiB capacity。被 inline 的逻辑步骤不
+创建空壳 Station、SubscribedLog 或 Subscription。
+
+最终物理分组直接写进当前 v1 Flow Definition。`open` 只恢复磁盘中的 core 与 pipelines，不重新执行
+装配策略；编译规则变化或 SQL 变化都要求使用新 state 目录或删除旧库重建，不保留旧布局兼容路径。
+
 全行去重沿用 `DogPaddle` 的 exact-row identity：null 使用 canonical 表示，浮点值按原始位模式区分，
 不应用外部数据库的 collation。
 
@@ -220,8 +238,10 @@ SQL 文本和 `DataFusion` `LogicalPlan` 不写入磁盘。state 目录中的 ca
 cargo test -p dogpaddle-sql --test correctness
 ```
 
-测试直接编译并执行随 crate 发布的 `examples/quickstart.sql`，覆盖 build、SQLite 结果、drop/open
-和无重复恢复；完整 matrix 还覆盖参数错误、隐式 coercion、CTE fan-out、`UNION ALL` Schema、
+测试直接编译并执行随 crate 发布的 `examples/quickstart.sql`，覆盖两 Station 的融合物理计划、build、
+`SQLite` 结果、drop/open 和无重复恢复；完整 matrix 还覆盖参数错误、隐式 coercion、CTE fan-out、
+确定性 Definition golden、分支 input pipeline、
+`UNION ALL` Schema、
 `SELECT DISTINCT` 的最终结果与状态恢复，以及拒绝路径。
 真实 `PostgreSQL` CDC → SQL transforms → `PostgreSQL Sink` 的崩溃恢复 gate 位于
 [`system-tests/postgres/check_sql.py`](https://github.com/frelion/dogpaddle/blob/main/system-tests/postgres/check_sql.py)。

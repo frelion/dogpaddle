@@ -1,9 +1,16 @@
-use std::panic::catch_unwind;
+use std::{num::NonZeroU64, panic::catch_unwind};
 
 use dogpaddle_flow::{FlowDefinitionError, FlowError, FlowFactory};
-use dogpaddle_operation::DefinitionCodecError;
+use dogpaddle_operation::{
+    DefinitionCodecError,
+    operation::{
+        scan::SequenceScanDefinition, sink::DiscardDefinition, transform::ProjectDefinition,
+    },
+};
 
-use super::support::{fixture_bytes, publish_definition, rewrite_checksum};
+use super::support::{
+    fixture_bytes, publish_definition, read_published_definition, rewrite_checksum,
+};
 
 const FLOW_MAGIC: &[u8] = b"dogpaddle.flow\0";
 const OPERATION_MAGIC: &[u8] = b"dogpaddle.operation\0";
@@ -50,11 +57,11 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
 
     let mut unsupported_version = original.clone();
     let version = FLOW_MAGIC.len();
-    unsupported_version[version..version + 2].copy_from_slice(&2_u16.to_be_bytes());
+    unsupported_version[version..version + 2].copy_from_slice(&u16::MAX.to_be_bytes());
     rewrite_checksum(&mut unsupported_version);
     assert_eq!(
         definition_error(root.path(), "unsupported-version", &unsupported_version),
-        FlowDefinitionError::UnsupportedVersion(2)
+        FlowDefinitionError::UnsupportedVersion(u16::MAX)
     );
 
     let mut invalid_utf8 = original.clone();
@@ -85,7 +92,10 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     rewrite_checksum(&mut unknown_operation);
     assert_eq!(
         definition_error(root.path(), "unknown-operation", &unknown_operation),
-        FlowDefinitionError::Operation(DefinitionCodecError::UnknownTag(99))
+        FlowDefinitionError::CoreOperation {
+            station_id: "scan".to_owned(),
+            source: DefinitionCodecError::UnknownTag(99),
+        }
     );
 
     let mut truncated_operation = original;
@@ -95,7 +105,10 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     rewrite_checksum(&mut truncated_operation);
     assert_eq!(
         definition_error(root.path(), "truncated-operation", &truncated_operation),
-        FlowDefinitionError::Operation(DefinitionCodecError::Truncated)
+        FlowDefinitionError::CoreOperation {
+            station_id: "scan".to_owned(),
+            source: DefinitionCodecError::Truncated,
+        }
     );
 }
 
@@ -151,6 +164,41 @@ fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
             "malformed definition {name} returned non-definition error: {error:?}"
         );
     }
+}
+
+#[test]
+fn open_locates_a_non_inline_operation_inside_an_output_pipeline() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let mut factory = FlowFactory::new(&source);
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(scan, NonZeroU64::MIN);
+    factory.connect([scan], sink);
+    factory
+        .inline_output(scan, ProjectDefinition::new([0]))
+        .unwrap();
+    drop(factory.build().unwrap());
+
+    let mut encoded = read_published_definition(&source);
+    let inline_operation = encoded
+        .windows(OPERATION_MAGIC.len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == OPERATION_MAGIC).then_some(index))
+        .nth(1)
+        .unwrap();
+    let tag = inline_operation + OPERATION_MAGIC.len() + size_of::<u16>();
+    encoded[tag..tag + size_of::<u16>()].copy_from_slice(&3_u16.to_be_bytes());
+    rewrite_checksum(&mut encoded);
+
+    assert_eq!(
+        definition_error(root.path(), "not-inline-capable", &encoded),
+        FlowDefinitionError::InlineOutputOperation {
+            station_id: "scan".to_owned(),
+            stage: 0,
+            source: DefinitionCodecError::NotInlineCapable(3),
+        }
+    );
 }
 
 fn open_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowError {

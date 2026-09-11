@@ -1536,6 +1536,7 @@ name = "dogpaddle-sql"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "blake3",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions-aggregate",
@@ -1543,6 +1544,7 @@ dependencies = [
  "datafusion-sql",
  "dogpaddle-flow",
  "dogpaddle-operation",
+ "dogpaddle-store",
  "rusqlite",
  "serde_json",
  "tempfile",

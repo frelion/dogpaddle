@@ -1,4 +1,4 @@
-use dogpaddle_operation::{DataInstances, OperationBinding, RuntimeResource};
+use dogpaddle_operation::{DataInstances, RuntimeResource};
 use dogpaddle_store::{Cell, Store, StoreData, StoreError, SubscribedLog};
 
 use crate::{
@@ -25,12 +25,15 @@ impl FlowFactory {
     /// Returns [`FlowError::IncompleteBuild`] when no complete definition was
     /// published, or another [`FlowError`] when the Store, definition, topology,
     /// or required station resources are invalid. Returns
-    /// [`FlowError::OpenWithDefinition`] if this factory also declares topology
-    /// or output capacities; open accepts only the path and runtime resources.
+    /// [`FlowError::OpenWithDefinition`] if this factory also declares topology,
+    /// output capacities, or inline pipelines; open accepts only the path and
+    /// runtime resources.
     pub fn open(self) -> Result<Flow, FlowError> {
         if !self.stations.is_empty()
             || !self.connections.is_empty()
             || !self.output_capacities.is_empty()
+            || !self.input_inline.is_empty()
+            || !self.output_inline.is_empty()
         {
             return Err(FlowError::OpenWithDefinition);
         }
@@ -103,13 +106,13 @@ fn open_station_part(
     store: &Store,
     index: usize,
     station: &StationDefinition,
-    binding: OperationBinding,
+    binding: schema::StationBinding,
     resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
     let active = (station.inputs().len() > 1)
         .then(|| open_required_data::<Cell<u32>>(store, &codec::station_active_input_name(index)))
         .transpose()?;
-    let definition = station.operation();
+    let definition = station.core();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::station_operation_data_name(index, declaration.name());
@@ -117,7 +120,8 @@ fn open_station_part(
         data.insert(instance)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(data, resource)?;
+    let (core_binding, input_bindings, output_bindings) = binding.into_parts();
+    let operation = core_binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);
@@ -135,7 +139,8 @@ fn open_station_part(
     Ok(StationParts::new(
         active,
         operation,
-        definition.kind(),
+        input_bindings,
+        output_bindings,
         output,
     ))
 }

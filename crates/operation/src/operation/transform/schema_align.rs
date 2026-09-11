@@ -8,11 +8,13 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
+    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
+    definition::{InlineSealed, Sealed as SealedDefinition},
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 9;
@@ -301,28 +303,20 @@ impl SchemaAlignDefinition {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
     }
-}
 
-impl SealedDefinition for SchemaAlignDefinition {
-    fn bind_schemas(
+    fn bind_operation(
         &self,
-        input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
-        let input_schema = input_schemas
-            .first()
-            .expect("the final binding entrypoint enforces SchemaAlign input arity");
+        input_schema: &SchemaRef,
+    ) -> Result<(SchemaRef, SchemaAlignOperation), SchemaAlignSchemaError> {
         let mut expressions = Vec::with_capacity(self.fields.len());
         let mut output_fields = Vec::with_capacity(self.fields.len());
         for (field, target) in self.fields.iter().enumerate() {
-            let expression = target.expression.bind(Arc::clone(input_schema)).map_err(
-                |source| -> OperationSchemaError {
-                    Box::new(SchemaAlignSchemaError::Expression { field, source })
-                },
-            )?;
+            let expression = target
+                .expression
+                .bind(Arc::clone(input_schema))
+                .map_err(|source| SchemaAlignSchemaError::Expression { field, source })?;
             if expression.output_nullable() && !target.nullable {
-                return Err(Box::new(SchemaAlignSchemaError::NullabilityNarrowing {
-                    field,
-                }));
+                return Err(SchemaAlignSchemaError::NullabilityNarrowing { field });
             }
             output_fields.push(Arc::new(
                 Field::new(
@@ -348,16 +342,49 @@ impl SealedDefinition for SchemaAlignDefinition {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         ));
-        let materialized_input_schema = Arc::clone(input_schema);
-        let materialized_schema = Arc::clone(&output_schema);
+        let operation = SchemaAlignOperation {
+            input_schema: Arc::clone(input_schema),
+            expressions: expressions.into_boxed_slice(),
+            output_schema: Arc::clone(&output_schema),
+        };
+        Ok((output_schema, operation))
+    }
+}
+
+impl SealedDefinition for SchemaAlignDefinition {
+    fn bind_schemas(
+        &self,
+        input_schemas: &[SchemaRef],
+    ) -> Result<OperationBinding, OperationSchemaError> {
+        let input_schema = input_schemas
+            .first()
+            .expect("the final binding entrypoint enforces SchemaAlign input arity");
+        let (output_schema, operation) = self
+            .bind_operation(input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         Ok(OperationBinding::without_data(
             Some(output_schema),
-            SchemaAlignOperation {
-                input_schema: materialized_input_schema,
-                expressions: expressions.into_boxed_slice(),
-                output_schema: materialized_schema,
-            },
+            operation,
         ))
+    }
+}
+
+impl InlineSealed for SchemaAlignDefinition {
+    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
+        for (field, target) in self.fields.iter().enumerate() {
+            target.expression.ensure_inline_eligible(field)?;
+        }
+        Ok(())
+    }
+
+    fn bind_inline_schema(
+        &self,
+        input_schema: SchemaRef,
+    ) -> Result<InlineBinding, OperationSchemaError> {
+        let (output_schema, operation) = self
+            .bind_operation(&input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        Ok(InlineBinding::new(output_schema, operation))
     }
 }
 
@@ -388,6 +415,32 @@ impl OperationDefinition for SchemaAlignDefinition {
     }
 }
 
+impl InlineTransform for SchemaAlignOperation {
+    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+        if input.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(SchemaAlignError::InputSchemaMismatch.into());
+        }
+
+        let columns = self
+            .expressions
+            .iter()
+            .enumerate()
+            .map(|(field, expression)| {
+                expression
+                    .evaluate(input.records())
+                    .map_err(|source| SchemaAlignError::Expression { field, source })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(input.num_rows()));
+        let records =
+            RecordBatch::try_new_with_options(Arc::clone(&self.output_schema), columns, &options)
+                .map_err(SchemaAlignError::Arrow)?;
+        let output =
+            Change::try_new(records, input.diffs().clone()).map_err(SchemaAlignError::Change)?;
+        Ok(Some(output))
+    }
+}
+
 impl TransactionalOperation for SchemaAlignOperation {
     fn apply(
         &mut self,
@@ -398,33 +451,27 @@ impl TransactionalOperation for SchemaAlignOperation {
         if input.port != 0 {
             return Err(SchemaAlignError::InvalidInputPort { port: input.port }.into());
         }
-        if input.change.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(SchemaAlignError::InputSchemaMismatch.into());
-        }
 
-        let columns = self
-            .expressions
-            .iter()
-            .enumerate()
-            .map(|(field, expression)| {
-                expression
-                    .evaluate(input.change.records())
-                    .map_err(|source| SchemaAlignError::Expression { field, source })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(input.change.num_rows()));
-        let records =
-            RecordBatch::try_new_with_options(Arc::clone(&self.output_schema), columns, &options)
-                .map_err(SchemaAlignError::Arrow)?;
-        let output = Change::try_new(records, input.change.diffs().clone())
-            .map_err(SchemaAlignError::Change)?;
-        Ok(Action::Complete(Some(output)))
+        InlineTransform::apply(self, input.change).map(Action::Complete)
     }
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    decode_schema_align(payload)
+        .map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
+}
+
+pub(crate) fn decode_inline_definition(
+    payload: &[u8],
+) -> Result<InlineDefinition, DefinitionCodecError> {
+    decode_schema_align(payload)?
+        .try_into_inline()
+        .map_err(DefinitionCodecError::InlineIneligible)
+}
+
+fn decode_schema_align(payload: &[u8]) -> Result<SchemaAlignDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let field_count = cursor.read_u32()?;
     let mut fields = Vec::new();
@@ -450,10 +497,10 @@ pub(crate) fn decode_definition(
     }
     let metadata = decode_metadata(&mut cursor, "SchemaAlign Schema metadata is invalid")?;
     cursor.finish()?;
-    Ok(Box::new(SchemaAlignDefinition {
+    Ok(SchemaAlignDefinition {
         fields: fields.into_boxed_slice(),
         metadata,
-    }))
+    })
 }
 
 #[derive(Clone)]

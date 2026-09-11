@@ -86,7 +86,7 @@ fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
     assert!(
         error
             .to_string()
-            .contains("station input 0 Schema does not match its bound output")
+            .contains("station input 0 Schema does not match its binding")
     );
     drop(flow);
 

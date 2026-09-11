@@ -12,6 +12,8 @@ mod expression;
 mod extend;
 #[path = "correctness/filter.rs"]
 mod filter;
+#[path = "correctness/inline.rs"]
+mod inline;
 #[path = "correctness/metamorphic.rs"]
 mod metamorphic;
 #[path = "correctness/mysql_cdc_scan.rs"]

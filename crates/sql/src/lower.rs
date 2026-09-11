@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU32, num::NonZeroU64, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion_common::{Column, DFSchema, DataFusionError, TableReference, config::ConfigOptions};
@@ -11,7 +11,6 @@ use datafusion_functions_aggregate::planner::AggregateFunctionPlanner;
 use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
-use dogpaddle_flow::{FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
@@ -23,18 +22,9 @@ use dogpaddle_operation::{
 use crate::{
     SqlError,
     aggregate::{lower as lower_builtin_aggregate, planning_builtins},
-    endpoint::{BuiltScan, BuiltSink},
+    compiler::{LogicalArena, LogicalNodeId, LogicalOperator, LogicalQuery, TransformDefinition},
+    endpoint::BuiltScan,
 };
-
-const OUTPUT_CAPACITY: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).expect("64 MiB is nonzero");
-
-pub(crate) fn scan_station_id(index: usize) -> String {
-    format!("sql/scan/{index:08x}")
-}
-
-fn transform_station_id(index: usize) -> String {
-    format!("sql/transform/{index:08x}")
-}
 
 #[derive(Debug)]
 struct ScanSource {
@@ -152,34 +142,31 @@ pub(crate) fn plan(
 }
 
 pub(crate) fn lower_query(
-    mut factory: FlowFactory,
     plan: &LogicalPlan,
     scans: Vec<BuiltScan>,
-) -> Result<(FlowFactory, StationRef), SqlError> {
+) -> Result<LogicalQuery, SqlError> {
     let mut lowerer = Lowerer {
-        factory: &mut factory,
+        arena: LogicalArena::default(),
         scans: scans.into_iter().map(Some).collect(),
-        scan_stations: HashMap::new(),
-        next_transform: 0,
+        scan_nodes: HashMap::new(),
     };
-    let input = lowerer.lower(plan)?;
+    let output = lowerer.lower(plan)?;
     if lowerer.scans.iter().any(Option::is_some) {
         return Err(SqlError::invalid(
             "every declared scan must be reachable from the query result",
         ));
     }
-    Ok((factory, input))
+    Ok(LogicalQuery::new(lowerer.arena, output))
 }
 
-struct Lowerer<'a> {
-    factory: &'a mut FlowFactory,
+struct Lowerer {
+    arena: LogicalArena,
     scans: Vec<Option<BuiltScan>>,
-    scan_stations: HashMap<usize, StationRef>,
-    next_transform: usize,
+    scan_nodes: HashMap<usize, LogicalNodeId>,
 }
 
-impl Lowerer<'_> {
-    fn lower(&mut self, plan: &LogicalPlan) -> Result<StationRef, SqlError> {
+impl Lowerer {
+    fn lower(&mut self, plan: &LogicalPlan) -> Result<LogicalNodeId, SqlError> {
         match plan {
             LogicalPlan::TableScan(scan) => self.lower_scan(scan),
             LogicalPlan::Filter(filter) => {
@@ -187,7 +174,7 @@ impl Lowerer<'_> {
                 let definition =
                     FilterDefinition::try_new(unnormalize_col(filter.predicate.clone()))
                         .map_err(SqlError::endpoint)?;
-                Ok(self.add_transform(input, definition))
+                Ok(self.add_transform([input], definition))
             }
             LogicalPlan::Projection(projection) => {
                 let input = self.lower(&projection.input)?;
@@ -211,11 +198,11 @@ impl Lowerer<'_> {
                     projection.schema.metadata().clone(),
                 )
                 .map_err(SqlError::endpoint)?;
-                Ok(self.add_transform(input, definition))
+                Ok(self.add_transform([input], definition))
             }
             LogicalPlan::Distinct(LogicalDistinct::All(input)) => {
                 let input = self.lower(input)?;
-                Ok(self.add_transform(input, DistinctDefinition::new()))
+                Ok(self.add_transform([input], DistinctDefinition::new()))
             }
             LogicalPlan::Aggregate(aggregate) => self.lower_aggregate(aggregate),
             LogicalPlan::Union(union) => {
@@ -232,9 +219,7 @@ impl Lowerer<'_> {
                     .and_then(NonZeroU32::new)
                     .ok_or_else(|| SqlError::invalid("UNION ALL has too many inputs"))?;
                 let definition = UnionAllDefinition::new(input_count);
-                let station = self.new_transform(definition);
-                self.factory.connect(inputs, station);
-                Ok(station)
+                Ok(self.add_transform(inputs, definition))
             }
             LogicalPlan::SubqueryAlias(alias) => self.lower(&alias.input),
             _ => Err(SqlError::Unsupported(format!(
@@ -244,7 +229,7 @@ impl Lowerer<'_> {
         }
     }
 
-    fn lower_aggregate(&mut self, aggregate: &Aggregate) -> Result<StationRef, SqlError> {
+    fn lower_aggregate(&mut self, aggregate: &Aggregate) -> Result<LogicalNodeId, SqlError> {
         if aggregate.group_expr.is_empty() {
             return Err(SqlError::Unsupported("global aggregate".to_owned()));
         }
@@ -274,13 +259,13 @@ impl Lowerer<'_> {
             })
             .collect::<Result<Vec<_>, SqlError>>()?;
         let definition = AggregateDefinition::try_new(groups, calls).map_err(SqlError::endpoint)?;
-        Ok(self.add_transform(input, definition))
+        Ok(self.add_transform([input], definition))
     }
 
     fn lower_scan(
         &mut self,
         scan: &datafusion_expr::logical_plan::TableScan,
-    ) -> Result<StationRef, SqlError> {
+    ) -> Result<LogicalNodeId, SqlError> {
         if scan.projection.is_some() || !scan.filters.is_empty() || scan.fetch.is_some() {
             return Err(SqlError::invalid(
                 "DataFusion embedded projection, filter, or fetch in a scan",
@@ -290,37 +275,31 @@ impl Lowerer<'_> {
             .source
             .downcast_ref::<ScanSource>()
             .ok_or_else(|| SqlError::invalid("logical plan contains a foreign table source"))?;
-        if let Some(station) = self.scan_stations.get(&source.index) {
-            return Ok(*station);
+        if let Some(node) = self.scan_nodes.get(&source.index) {
+            return Ok(*node);
         }
         let built = self
             .scans
             .get_mut(source.index)
             .and_then(Option::take)
             .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
-        let id = scan_station_id(source.index);
-        let station = match built {
-            BuiltScan::Sequence(definition) => self.factory.station(&id, definition),
-            BuiltScan::PostgresCdc(scan) => {
-                self.factory.resource(&id, scan.config)?;
-                self.factory.station(&id, scan.definition)
-            }
-            BuiltScan::MySqlCdc(scan) => {
-                self.factory.resource(&id, scan.config)?;
-                self.factory.station(&id, scan.definition)
-            }
-        };
-        self.factory.output_capacity_bytes(station, OUTPUT_CAPACITY);
-        self.scan_stations.insert(source.index, station);
-        Ok(station)
+        let node = self.arena.push(
+            [],
+            LogicalOperator::Scan {
+                source_index: source.index,
+                definition: built,
+            },
+        );
+        self.scan_nodes.insert(source.index, node);
+        Ok(node)
     }
 
     fn align_union_input(
         &mut self,
-        input: StationRef,
+        input: LogicalNodeId,
         input_schema: &DFSchema,
         union_schema: &DFSchema,
-    ) -> Result<StationRef, SqlError> {
+    ) -> Result<LogicalNodeId, SqlError> {
         if input_schema.as_arrow() == union_schema.as_arrow() {
             return Ok(input);
         }
@@ -346,27 +325,16 @@ impl Lowerer<'_> {
         let definition =
             SchemaAlignDefinition::try_new_with_metadata(fields, union_schema.metadata().clone())
                 .map_err(SqlError::endpoint)?;
-        Ok(self.add_transform(input, definition))
+        Ok(self.add_transform([input], definition))
     }
 
-    fn add_transform<D>(&mut self, input: StationRef, definition: D) -> StationRef
+    fn add_transform<I, D>(&mut self, inputs: I, definition: D) -> LogicalNodeId
     where
-        D: OperationDefinition,
+        I: IntoIterator<Item = LogicalNodeId>,
+        D: Into<TransformDefinition>,
     {
-        let station = self.new_transform(definition);
-        self.factory.connect([input], station);
-        station
-    }
-
-    fn new_transform<D>(&mut self, definition: D) -> StationRef
-    where
-        D: OperationDefinition,
-    {
-        let id = transform_station_id(self.next_transform);
-        self.next_transform += 1;
-        let station = self.factory.station(id, definition);
-        self.factory.output_capacity_bytes(station, OUTPUT_CAPACITY);
-        station
+        self.arena
+            .push(inputs, LogicalOperator::Transform(definition.into()))
     }
 }
 
@@ -387,23 +355,6 @@ fn lower_aggregate_call(expression: &Expr) -> Result<AggregateCall, SqlError> {
     let arguments = params.args.into_iter().map(unnormalize_col).collect();
     lower_builtin_aggregate(func.name(), arguments)
         .ok_or_else(|| SqlError::Unsupported(format!("aggregate function {}", func.name())))
-}
-
-pub(crate) fn add_sink(
-    factory: &mut FlowFactory,
-    input: StationRef,
-    sink: BuiltSink,
-) -> Result<(), SqlError> {
-    let station = match sink {
-        BuiltSink::Postgres { definition, config } => {
-            factory.resource("sql/sink", config)?;
-            factory.station("sql/sink", definition)
-        }
-        BuiltSink::Sqlite(definition) => factory.station("sql/sink", definition),
-        BuiltSink::Discard(definition) => factory.station("sql/sink", definition),
-    };
-    factory.connect([input], station);
-    Ok(())
 }
 
 fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {

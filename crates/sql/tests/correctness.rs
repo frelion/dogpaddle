@@ -1,3 +1,5 @@
+#[path = "correctness/compiler.rs"]
+mod compiler;
 #[path = "correctness/execution.rs"]
 mod execution;
 #[path = "correctness/program.rs"]

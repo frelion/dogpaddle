@@ -9,11 +9,13 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
+    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
+    definition::{InlineSealed, Sealed as SealedDefinition},
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 5;
@@ -100,6 +102,19 @@ impl FilterDefinition {
     pub fn predicate(&self) -> &Expr {
         self.predicate.expression()
     }
+
+    fn bind_operation(
+        &self,
+        input_schema: &SchemaRef,
+    ) -> Result<FilterOperation, FilterSchemaError> {
+        let predicate = self.predicate.bind(Arc::clone(input_schema))?;
+        if predicate.output_type() != &DataType::Boolean {
+            return Err(FilterSchemaError::PredicateType {
+                actual: predicate.output_type().clone(),
+            });
+        }
+        Ok(FilterOperation { predicate })
+    }
 }
 
 impl SealedDefinition for FilterDefinition {
@@ -110,18 +125,29 @@ impl SealedDefinition for FilterDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Filter input arity");
-        let predicate = self.predicate.bind(Arc::clone(input_schema)).map_err(
-            |source| -> OperationSchemaError { Box::new(FilterSchemaError::Expression(source)) },
-        )?;
-        if predicate.output_type() != &DataType::Boolean {
-            return Err(Box::new(FilterSchemaError::PredicateType {
-                actual: predicate.output_type().clone(),
-            }));
-        }
+        let operation = self
+            .bind_operation(input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         Ok(OperationBinding::without_data(
             Some(Arc::clone(input_schema)),
-            FilterOperation { predicate },
+            operation,
         ))
+    }
+}
+
+impl InlineSealed for FilterDefinition {
+    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
+        self.predicate.ensure_inline_eligible(0)
+    }
+
+    fn bind_inline_schema(
+        &self,
+        input_schema: SchemaRef,
+    ) -> Result<InlineBinding, OperationSchemaError> {
+        let operation = self
+            .bind_operation(&input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        Ok(InlineBinding::new(input_schema, operation))
     }
 }
 
@@ -143,6 +169,40 @@ impl OperationDefinition for FilterDefinition {
     }
 }
 
+impl InlineTransform for FilterOperation {
+    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+        let predicate = self
+            .predicate
+            .evaluate(input.records())
+            .map_err(FilterError::Expression)?;
+        let predicate = predicate
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or(FilterError::PredicateArray)?;
+        let selected = predicate.true_count();
+        if selected == 0 {
+            return Ok(None);
+        }
+        if selected == input.num_rows() {
+            return Ok(Some(input.clone()));
+        }
+
+        let filter = FilterBuilder::new(predicate).optimize().build();
+        let canonical = canonical_record_batch(input.records()).map_err(FilterError::Arrow)?;
+        let records = filter
+            .filter_record_batch(&canonical)
+            .map_err(FilterError::Arrow)?;
+        let diffs = filter.filter(input.diffs()).map_err(FilterError::Arrow)?;
+        let diffs = diffs
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or(FilterError::DifferenceArray)?
+            .clone();
+        let output = Change::try_new(records, diffs).map_err(FilterError::Change)?;
+        Ok(Some(output))
+    }
+}
+
 impl TransactionalOperation for FilterOperation {
     fn apply(
         &mut self,
@@ -154,38 +214,7 @@ impl TransactionalOperation for FilterOperation {
             return Err(FilterError::InvalidInputPort { port: input.port }.into());
         }
 
-        let predicate = self
-            .predicate
-            .evaluate(input.change.records())
-            .map_err(FilterError::Expression)?;
-        let predicate = predicate
-            .as_any()
-            .downcast_ref::<arrow_array::BooleanArray>()
-            .ok_or(FilterError::PredicateArray)?;
-        let selected = predicate.true_count();
-        if selected == 0 {
-            return Ok(Action::Complete(None));
-        }
-        if selected == input.change.num_rows() {
-            return Ok(Action::Complete(Some(input.change.clone())));
-        }
-
-        let filter = FilterBuilder::new(predicate).optimize().build();
-        let canonical =
-            canonical_record_batch(input.change.records()).map_err(FilterError::Arrow)?;
-        let records = filter
-            .filter_record_batch(&canonical)
-            .map_err(FilterError::Arrow)?;
-        let diffs = filter
-            .filter(input.change.diffs())
-            .map_err(FilterError::Arrow)?;
-        let diffs = diffs
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or(FilterError::DifferenceArray)?
-            .clone();
-        let output = Change::try_new(records, diffs).map_err(FilterError::Change)?;
-        Ok(Action::Complete(Some(output)))
+        InlineTransform::apply(self, input.change).map(Action::Complete)
     }
 }
 
@@ -202,8 +231,20 @@ fn canonical_record_batch(records: &RecordBatch) -> Result<RecordBatch, ArrowErr
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    decode_filter(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
+}
+
+pub(crate) fn decode_inline_definition(
+    payload: &[u8],
+) -> Result<InlineDefinition, DefinitionCodecError> {
+    decode_filter(payload)?
+        .try_into_inline()
+        .map_err(DefinitionCodecError::InlineIneligible)
+}
+
+fn decode_filter(payload: &[u8]) -> Result<FilterDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let predicate = StoredExpression::decode(&mut cursor)?;
     cursor.finish()?;
-    Ok(Box::new(FilterDefinition { predicate }))
+    Ok(FilterDefinition { predicate })
 }

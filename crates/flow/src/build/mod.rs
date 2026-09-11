@@ -6,7 +6,8 @@ use std::{
 };
 
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationBinding, OperationDefinition, RuntimeResource,
+    DataInstances, InlineDefinition, InlineEligibilityError, InlineOperationDefinition,
+    MaterializeError, OperationDefinition, RuntimeResource,
 };
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
@@ -38,6 +39,8 @@ pub struct FlowFactory {
     stations: Vec<StationDefinition>,
     connections: Vec<(Vec<StationRef>, StationRef)>,
     output_capacities: Vec<(StationRef, NonZeroU64)>,
+    input_inline: Vec<(StationRef, usize, InlineDefinition)>,
+    output_inline: Vec<(StationRef, InlineDefinition)>,
     resources: BTreeMap<String, RuntimeResource>,
 }
 
@@ -67,6 +70,8 @@ impl FlowFactory {
             stations: Vec::new(),
             connections: Vec::new(),
             output_capacities: Vec::new(),
+            input_inline: Vec::new(),
+            output_inline: Vec::new(),
             resources: BTreeMap::new(),
         }
     }
@@ -93,7 +98,7 @@ impl FlowFactory {
         Ok(self)
     }
 
-    /// Declares one station containing exactly one concrete operation definition.
+    /// Declares one station with one durable core Operation.
     ///
     /// The returned reference belongs to this factory and is used by
     /// [`FlowFactory::connect`] and [`FlowFactory::output_capacity_bytes`]. The
@@ -109,6 +114,55 @@ impl FlowFactory {
         self.stations
             .push(StationDefinition::new(id.into(), Box::new(definition)));
         reference
+    }
+
+    /// Appends one pure transform to a Station input port.
+    ///
+    /// Stages run in declaration order after the durable input is decoded and
+    /// before the core Operation receives it. They create no Store data,
+    /// subscription, output log, or transaction boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this concrete definition is not deterministic and
+    /// replay-safe for inline execution. Station ownership and port validity are
+    /// checked with the complete topology during [`Self::build`].
+    pub fn inline_input<D>(
+        &mut self,
+        station: StationRef,
+        port: usize,
+        definition: D,
+    ) -> Result<&mut Self, InlineEligibilityError>
+    where
+        D: InlineOperationDefinition,
+    {
+        let definition = definition.try_into_inline()?;
+        self.input_inline.push((station, port, definition));
+        Ok(self)
+    }
+
+    /// Appends one pure transform before a Station's durable output boundary.
+    ///
+    /// Stages run in declaration order on each output emitted by the core
+    /// Operation. They share the core turn and create no intermediate durable
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this concrete definition is not deterministic and
+    /// replay-safe for inline execution. Station ownership and output validity
+    /// are checked with the complete topology during [`Self::build`].
+    pub fn inline_output<D>(
+        &mut self,
+        station: StationRef,
+        definition: D,
+    ) -> Result<&mut Self, InlineEligibilityError>
+    where
+        D: InlineOperationDefinition,
+    {
+        let definition = definition.try_into_inline()?;
+        self.output_inline.push((station, definition));
+        Ok(self)
     }
 
     /// Declares a Station's complete, ordered input list.
@@ -208,19 +262,21 @@ impl FlowFactory {
             self.stations,
             &self.connections,
             &self.output_capacities,
+            self.input_inline,
+            self.output_inline,
         )
     }
 }
-
 fn bind_resources(
     definition: &FlowDefinition,
-    bindings: &[OperationBinding],
+    bindings: &[schema::StationBinding],
     mut resources: BTreeMap<String, RuntimeResource>,
 ) -> Result<Vec<RuntimeResource>, FlowError> {
     let mut bound = Vec::with_capacity(bindings.len());
     for (station, binding) in definition.stations().iter().zip(bindings) {
         let resource = resources.remove(station.id()).unwrap_or_default();
         binding
+            .core()
             .validate_resource(&resource)
             .map_err(|source| FlowError::RuntimeResource {
                 station_id: station.id().to_owned(),
@@ -237,7 +293,7 @@ fn bind_resources(
 fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), MaterializeError> {
     for station in definition.stations() {
         let mut names = BTreeSet::new();
-        for declaration in station.operation().data() {
+        for declaration in station.core().data() {
             let name = declaration.name();
             if !names.insert(name) {
                 return Err(MaterializeError::DuplicateData { name });
@@ -251,20 +307,21 @@ fn create_station_part(
     setup: &mut dogpaddle_store::StoreSetup,
     index: usize,
     station: &StationDefinition,
-    binding: OperationBinding,
+    binding: schema::StationBinding,
     resource: RuntimeResource,
 ) -> Result<StationParts, FlowError> {
     let active = (station.inputs().len() > 1)
         .then(|| setup.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
         .transpose()?;
-    let definition = station.operation();
+    let definition = station.core();
     let mut data = DataInstances::new();
     for declaration in definition.data() {
         let physical_name = codec::station_operation_data_name(index, declaration.name());
         data.insert(declaration.create_setup(setup, &physical_name)?)?;
     }
     let output_schema = binding.output_schema().cloned();
-    let operation = binding.materialize(data, resource)?;
+    let (core_binding, input_bindings, output_bindings) = binding.into_parts();
+    let operation = core_binding.materialize(data, resource)?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => setup
             .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
@@ -277,7 +334,8 @@ fn create_station_part(
     Ok(StationParts::new(
         active,
         operation,
-        definition.kind(),
+        input_bindings,
+        output_bindings,
         output,
     ))
 }

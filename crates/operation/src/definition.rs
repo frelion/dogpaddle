@@ -2,23 +2,23 @@ use std::{
     any::{Any, TypeId},
     collections::BTreeMap,
     error::Error,
-    fmt::Debug,
+    fmt::{self, Debug},
     marker::PhantomData,
     num::NonZeroU32,
 };
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{SchemaError, validate_schema};
+use dogpaddle_change::{Change, SchemaError, validate_schema};
 use dogpaddle_store::{Store, StoreData, StoreError, StoreSetup};
 use thiserror::Error;
 
 use crate::RuntimeResource;
-use crate::operation::Operation;
+use crate::operation::{InlineTransform, Operation};
 
 mod private {
     use arrow_schema::SchemaRef;
 
-    use super::{OperationBinding, OperationSchemaError};
+    use super::{InlineBinding, InlineEligibilityError, OperationBinding, OperationSchemaError};
 
     pub trait Sealed {
         fn bind_schemas(
@@ -26,9 +26,18 @@ mod private {
             input_schemas: &[SchemaRef],
         ) -> Result<OperationBinding, OperationSchemaError>;
     }
+
+    pub trait InlineSealed {
+        fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError>;
+
+        fn bind_inline_schema(
+            &self,
+            input_schema: SchemaRef,
+        ) -> Result<InlineBinding, OperationSchemaError>;
+    }
 }
 
-pub(crate) use private::Sealed;
+pub(crate) use private::{InlineSealed, Sealed};
 
 type ErasedData = Box<dyn Any + Send + Sync>;
 type CreateFn = fn(&mut Store, &str) -> Result<ErasedData, StoreError>;
@@ -57,6 +66,27 @@ pub struct OperationBinding {
     output_schema: Option<SchemaRef>,
     runtime_type: Option<TypeId>,
     materialize: MaterializeFn,
+}
+
+/// An opaque definition admitted to a Station's inline pipeline.
+///
+/// This wrapper is intentionally distinct from [`OperationDefinition`]. Only
+/// definitions that implement the sealed [`InlineOperationDefinition`]
+/// capability can create it, so callers cannot infer inline safety from an
+/// operation's lack of persistent data.
+pub struct InlineDefinition {
+    erased: Box<dyn InlineOperationDefinition>,
+}
+
+/// One executable binding of an [`InlineDefinition`] to an exact input Schema.
+///
+/// The binding owns both the derived output Schema and the compiled transform.
+/// Flow retains it directly in the Station program; inline execution has no
+/// Store or runtime-resource materialization phase.
+#[doc(hidden)]
+pub struct InlineBinding {
+    output_schema: SchemaRef,
+    transform: Box<dyn InlineTransform>,
 }
 
 /// One stable logical data name paired with its erased typed data class.
@@ -167,6 +197,100 @@ pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
     /// Appends this definition's variant-specific persistent payload.
     #[doc(hidden)]
     fn encode_payload(&self, output: &mut Vec<u8>);
+}
+
+/// Sealed capability implemented only by definitions safe for inline execution.
+///
+/// An inline definition is a deterministic, retry-safe, single-input transform
+/// that preserves input order and differences, emits at most one output row
+/// for each input row, and owns no Store data, runtime resource, continuation,
+/// external effect, or transaction protocol. Its bound runtime must reject an
+/// input whose Schema differs from the exact Schema used during binding.
+/// Eligibility is checked from the concrete definition instance rather than inferred from
+/// [`OperationDefinition::data`].
+pub trait InlineOperationDefinition: OperationDefinition + private::InlineSealed {
+    /// Validates this concrete definition and erases it as an inline definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InlineEligibilityError`] when an expression observes stable,
+    /// volatile, or otherwise non-row-local state and therefore cannot be
+    /// replayed safely inside a Station pipeline.
+    fn try_into_inline(self) -> Result<InlineDefinition, InlineEligibilityError>
+    where
+        Self: Sized,
+    {
+        private::InlineSealed::ensure_inline_eligible(&self)?;
+        Ok(InlineDefinition {
+            erased: Box::new(self),
+        })
+    }
+}
+
+impl<D> InlineOperationDefinition for D where D: OperationDefinition + private::InlineSealed {}
+
+impl fmt::Debug for InlineDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&self.erased, formatter)
+    }
+}
+
+impl InlineDefinition {
+    /// Purely binds this definition to one exact logical input Schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InlineBindError`] when the input or derived output violates
+    /// the Change Schema contract, or when the concrete transform rejects the
+    /// exact input Schema.
+    pub fn bind(&self, input_schema: SchemaRef) -> Result<InlineBinding, InlineBindError> {
+        validate_schema(&input_schema)
+            .map_err(|source| InlineBindError::InvalidInputSchema { source })?;
+        let binding = self
+            .erased
+            .bind_inline_schema(input_schema)
+            .map_err(|source| InlineBindError::Rejected { source })?;
+        validate_schema(&binding.output_schema)
+            .map_err(|source| InlineBindError::InvalidOutputSchema { source })?;
+        Ok(binding)
+    }
+
+    pub(crate) fn as_operation_definition(&self) -> &dyn OperationDefinition {
+        self.erased.as_ref()
+    }
+}
+
+impl InlineBinding {
+    pub(crate) fn new<T>(output_schema: SchemaRef, transform: T) -> Self
+    where
+        T: InlineTransform,
+    {
+        Self {
+            output_schema,
+            transform: Box::new(transform),
+        }
+    }
+
+    /// Returns the exact logical output Schema.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+
+    /// Applies the exact-Schema-bound transform without a Store transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the concrete deterministic evaluation failure. The binding
+    /// remains safe to call again with the same input.
+    #[doc(hidden)]
+    pub fn apply(
+        &mut self,
+        input: &Change,
+    ) -> Result<Option<Change>, crate::operation::OperationError> {
+        self.transform.apply(input)
+    }
 }
 
 impl dyn OperationDefinition + '_ {
@@ -539,6 +663,67 @@ pub enum OperationBindError {
     UnexpectedOutput,
     /// The bound logical output Schema violates the Change Schema contract.
     #[error("operation output schema is invalid: {source}")]
+    InvalidOutputSchema {
+        /// Concrete logical Schema validation failure.
+        #[source]
+        source: SchemaError,
+    },
+}
+
+/// Reason a concrete Operation definition cannot run as an inline transform.
+#[derive(Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InlineEligibilityError {
+    /// One scalar function can vary between otherwise identical retries.
+    #[error(
+        "inline expression {expression} calls stable function {function:?}; only immutable functions are replay-safe"
+    )]
+    StableFunction {
+        /// Zero-based expression ordinal in the concrete definition.
+        expression: usize,
+        /// `DataFusion` function name.
+        function: String,
+    },
+    /// One scalar function can vary between evaluations.
+    #[error(
+        "inline expression {expression} calls volatile function {function:?}; only immutable functions are replay-safe"
+    )]
+    VolatileFunction {
+        /// Zero-based expression ordinal in the concrete definition.
+        expression: usize,
+        /// `DataFusion` function name.
+        function: String,
+    },
+    /// The expression contains a construct that is not a row-local scalar computation.
+    #[error("inline expression {expression} contains unsupported {kind}")]
+    UnsupportedExpression {
+        /// Zero-based expression ordinal in the concrete definition.
+        expression: usize,
+        /// Stable name of the rejected expression construct.
+        kind: &'static str,
+    },
+}
+
+/// Failure while binding one inline definition to an exact logical input Schema.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InlineBindError {
+    /// The supplied logical input Schema violates the Change Schema contract.
+    #[error("inline operation input schema is invalid: {source}")]
+    InvalidInputSchema {
+        /// Concrete logical Schema validation failure.
+        #[source]
+        source: SchemaError,
+    },
+    /// The concrete inline operation rejected the otherwise valid input Schema.
+    #[error("inline operation rejected its input schema: {source}")]
+    Rejected {
+        /// Operation-specific structured Schema failure.
+        #[source]
+        source: OperationSchemaError,
+    },
+    /// The derived logical output Schema violates the Change Schema contract.
+    #[error("inline operation output schema is invalid: {source}")]
     InvalidOutputSchema {
         /// Concrete logical Schema validation failure.
         #[source]

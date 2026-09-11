@@ -1,5 +1,5 @@
 use std::{
-    num::{NonZeroU32, NonZeroU64},
+    num::NonZeroU64,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -10,7 +10,7 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_operation::{
-    OperationKind,
+    InlineBinding, InlineOperationDefinition,
     operation::{
         Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
     },
@@ -275,13 +275,61 @@ pub(super) fn scan_count_sink(
     )
 }
 
+pub(super) fn scan_count_sink_with_output_pipeline(
+    scan_capacity: NonZeroU64,
+    count_capacity: NonZeroU64,
+    output_pipeline: Vec<InlineBinding>,
+    output_schema: Arc<Schema>,
+) -> RuntimeFixture {
+    runtime_fixture_with_output_pipelines(
+        &[Vec::new(), vec![0], vec![1]],
+        vec![
+            Some((scan_capacity, value_schema())),
+            Some((count_capacity, output_schema)),
+            None,
+        ],
+        vec![
+            Action::Commit(Some(change(&[0]))),
+            Action::Idle,
+            Action::Complete(None),
+        ],
+        vec![Vec::new(), output_pipeline, Vec::new()],
+    )
+}
+
+pub(super) fn inline_binding<D>(
+    definition: D,
+    input_schema: &Arc<Schema>,
+) -> (InlineBinding, Arc<Schema>)
+where
+    D: InlineOperationDefinition,
+{
+    let definition = definition.try_into_inline().unwrap();
+    let binding = definition.bind(Arc::clone(input_schema)).unwrap();
+    let output_schema = Arc::clone(binding.output_schema());
+    (binding, output_schema)
+}
+
 fn runtime_fixture(
     inputs_by_station: &[Vec<usize>],
     outputs: Vec<Option<(NonZeroU64, Arc<Schema>)>>,
     actions: Vec<Action>,
 ) -> RuntimeFixture {
+    let output_pipelines = std::iter::repeat_with(Vec::new)
+        .take(inputs_by_station.len())
+        .collect();
+    runtime_fixture_with_output_pipelines(inputs_by_station, outputs, actions, output_pipelines)
+}
+
+fn runtime_fixture_with_output_pipelines(
+    inputs_by_station: &[Vec<usize>],
+    outputs: Vec<Option<(NonZeroU64, Arc<Schema>)>>,
+    actions: Vec<Action>,
+    output_pipelines: Vec<Vec<InlineBinding>>,
+) -> RuntimeFixture {
     assert_eq!(inputs_by_station.len(), outputs.len());
     assert_eq!(inputs_by_station.len(), actions.len());
+    assert_eq!(inputs_by_station.len(), output_pipelines.len());
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("flow")).unwrap();
     let states = (0..inputs_by_station.len())
@@ -295,8 +343,9 @@ fn runtime_fixture(
         .iter()
         .zip(outputs)
         .zip(actions)
+        .zip(output_pipelines)
         .enumerate()
-        .map(|(station, ((inputs, output), action))| {
+        .map(|(station, (((inputs, output), action), output_pipeline))| {
             let active = (inputs.len() > 1).then(|| {
                 store
                     .create_data::<Cell<u32>>(&format!("active-{station}"))
@@ -308,10 +357,14 @@ fn runtime_fixture(
                     .unwrap();
                 (log, capacity, schema)
             });
+            let input_pipelines = std::iter::repeat_with(Vec::new)
+                .take(inputs.len())
+                .collect();
             StationParts::new(
                 active,
                 Box::new(ScriptedOperation::returning(action)),
-                operation_kind(inputs.len(), output.is_some()),
+                input_pipelines,
+                output_pipeline,
                 output,
             )
         })
@@ -330,19 +383,6 @@ fn runtime_fixture(
         reads,
         stations,
         states,
-    }
-}
-
-fn operation_kind(input_count: usize, has_output: bool) -> OperationKind {
-    match (input_count, has_output) {
-        (0, true) => OperationKind::Scan,
-        (0, false) => panic!("an input-free test Station must have output"),
-        (input_count, true) => {
-            OperationKind::Transform(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap())
-        }
-        (input_count, false) => {
-            OperationKind::Sink(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap())
-        }
     }
 }
 
@@ -421,6 +461,43 @@ pub(super) fn raw_station_with_change_and_schemas(
     populated_change: &Change,
     output_schemas: &[Arc<Schema>],
 ) -> MultiInputFixture {
+    let input_pipelines = std::iter::repeat_with(Vec::new)
+        .take(inputs.len())
+        .collect();
+    raw_station_with_program(
+        inputs,
+        populated,
+        populated_change,
+        output_schemas,
+        input_pipelines,
+        Box::new(ScriptedOperation::returning(action)),
+    )
+}
+
+pub(super) fn single_input_station_with_pipeline(
+    populated_change: &Change,
+    input_pipeline: Vec<InlineBinding>,
+    operation: Box<dyn Operation>,
+) -> MultiInputFixture {
+    raw_station_with_program(
+        &[0],
+        &[0],
+        populated_change,
+        &[populated_change.schema()],
+        vec![input_pipeline],
+        operation,
+    )
+}
+
+fn raw_station_with_program(
+    inputs: &[usize],
+    populated: &[usize],
+    populated_change: &Change,
+    output_schemas: &[Arc<Schema>],
+    input_pipelines: Vec<Vec<InlineBinding>>,
+    operation: Box<dyn Operation>,
+) -> MultiInputFixture {
+    assert_eq!(input_pipelines.len(), inputs.len());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
@@ -435,7 +512,7 @@ pub(super) fn raw_station_with_change_and_schemas(
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let parts = station_parts(active, inputs.len(), action);
+    let parts = StationParts::new(active, operation, input_pipelines, Vec::new(), None);
     let subscribers = {
         let mut counts = vec![0_u64; output_count];
         for input in inputs {
@@ -526,7 +603,8 @@ fn station_parts(active: Option<Cell<u32>>, input_count: usize, action: Action) 
     StationParts::new(
         active,
         Box::new(ScriptedOperation::returning(action)),
-        OperationKind::Sink(NonZeroU32::new(u32::try_from(input_count).unwrap()).unwrap()),
+        std::iter::repeat_with(Vec::new).take(input_count).collect(),
+        Vec::new(),
         None,
     )
 }

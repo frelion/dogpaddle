@@ -6,10 +6,11 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DataDeclaration, DefinitionCodecError, InlineBinding, InlineDefinition, InlineEligibilityError,
+    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
-    definition::Sealed as SealedDefinition,
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    definition::{InlineSealed, Sealed as SealedDefinition},
+    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
 };
 
 pub(crate) const TAG: u16 = 4;
@@ -86,6 +87,18 @@ impl ProjectDefinition {
     pub const fn field_indices(&self) -> &[u32] {
         &self.field_indices
     }
+
+    fn bind_operation(
+        &self,
+        input_schema: &SchemaRef,
+    ) -> Result<(SchemaRef, ProjectOperation), ProjectSchemaError> {
+        let field_indices = self.field_indices.iter().map(|&index| {
+            usize::try_from(index).expect("a Project u32 field index fits supported Arrow targets")
+        });
+        let projection = ChangeProjection::try_new(input_schema.clone(), field_indices)?;
+        let output_schema = projection.output_schema();
+        Ok((output_schema, ProjectOperation::new(projection)))
+    }
 }
 
 impl SealedDefinition for ProjectDefinition {
@@ -96,17 +109,29 @@ impl SealedDefinition for ProjectDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Project input arity");
-        let field_indices = self.field_indices.iter().map(|&index| {
-            usize::try_from(index).expect("a Project u32 field index fits supported Arrow targets")
-        });
-        let projection = ChangeProjection::try_new(input_schema.clone(), field_indices).map_err(
-            |source| -> OperationSchemaError { Box::new(ProjectSchemaError::Projection(source)) },
-        )?;
-        let output_schema = projection.output_schema();
+        let (output_schema, operation) = self
+            .bind_operation(input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         Ok(OperationBinding::without_data(
             Some(output_schema),
-            ProjectOperation::new(projection),
+            operation,
         ))
+    }
+}
+
+impl InlineSealed for ProjectDefinition {
+    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
+        Ok(())
+    }
+
+    fn bind_inline_schema(
+        &self,
+        input_schema: SchemaRef,
+    ) -> Result<InlineBinding, OperationSchemaError> {
+        let (output_schema, operation) = self
+            .bind_operation(&input_schema)
+            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        Ok(InlineBinding::new(output_schema, operation))
     }
 }
 
@@ -141,6 +166,18 @@ impl ProjectOperation {
     }
 }
 
+impl InlineTransform for ProjectOperation {
+    fn apply(
+        &mut self,
+        input: &dogpaddle_change::Change,
+    ) -> Result<Option<dogpaddle_change::Change>, OperationError> {
+        input
+            .try_project(&self.projection)
+            .map(Some)
+            .map_err(|source| ProjectError::Projection(source).into())
+    }
+}
+
 impl TransactionalOperation for ProjectOperation {
     fn apply(
         &mut self,
@@ -152,17 +189,26 @@ impl TransactionalOperation for ProjectOperation {
             return Err(ProjectError::InvalidInputPort { port: input.port }.into());
         }
 
-        let output = input
-            .change
-            .try_project(&self.projection)
-            .map_err(ProjectError::Projection)?;
-        Ok(Action::Complete(Some(output)))
+        InlineTransform::apply(self, input.change).map(Action::Complete)
     }
+}
+
+pub(crate) fn decode_inline_definition(
+    payload: &[u8],
+) -> Result<InlineDefinition, DefinitionCodecError> {
+    let definition = decode_project(payload)?;
+    definition
+        .try_into_inline()
+        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+    decode_project(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
+}
+
+fn decode_project(payload: &[u8]) -> Result<ProjectDefinition, DefinitionCodecError> {
     let (encoded_count, remaining) = payload
         .split_first_chunk::<4>()
         .ok_or(DefinitionCodecError::Truncated)?;
@@ -184,5 +230,5 @@ pub(crate) fn decode_definition(
                 .expect("Project index chunks have a fixed encoded width"),
         )
     });
-    Ok(Box::new(ProjectDefinition::new(field_indices)))
+    Ok(ProjectDefinition::new(field_indices))
 }

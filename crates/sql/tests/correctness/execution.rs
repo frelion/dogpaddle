@@ -19,6 +19,14 @@ fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
     let program = SqlProgram::parse(&sql).unwrap();
 
     let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(
+        flow.status()
+            .unwrap()
+            .iter()
+            .map(|station| station.id.as_str())
+            .collect::<Vec<_>>(),
+        ["sql/scan/00000000", "sql/sink"]
+    );
     for _ in 0..12 {
         assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     }
@@ -259,6 +267,19 @@ fn union_all_keeps_separate_scan_stations() {
     .unwrap();
 
     let flow = program.build(root.path().join("flow")).unwrap();
+    assert_eq!(
+        flow.status()
+            .unwrap()
+            .iter()
+            .map(|station| station.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "sql/scan/00000000",
+            "sql/scan/00000001",
+            "sql/transform/00000000",
+            "sql/sink",
+        ]
+    );
     let scan_ids = flow
         .status()
         .unwrap()
@@ -348,16 +369,12 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     assert!(!sqlite_path.exists());
 
     let status = flow.status().unwrap();
-    let expected_ids = std::iter::once("sql/scan/00000000".to_owned())
-        .chain((0..status.len() - 2).map(|index| format!("sql/transform/{index:08x}")))
-        .chain(std::iter::once("sql/sink".to_owned()))
-        .collect::<Vec<_>>();
     assert_eq!(
         status
             .iter()
-            .map(|station| station.id.clone())
+            .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
-        expected_ids
+        ["sql/scan/00000000", "sql/transform/00000000", "sql/sink",]
     );
     assert_eq!(
         status
@@ -378,6 +395,15 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     drop(flow);
 
     let mut reopened = read.open(&flow_path).unwrap();
+    assert_eq!(
+        reopened
+            .status()
+            .unwrap()
+            .iter()
+            .map(|station| station.id.as_str())
+            .collect::<Vec<_>>(),
+        ["sql/scan/00000000", "sql/transform/00000000", "sql/sink",]
+    );
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         let outcome = reopened.advance().unwrap();

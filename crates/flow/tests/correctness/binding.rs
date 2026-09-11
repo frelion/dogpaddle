@@ -412,7 +412,7 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
 
 fn assert_project_field_rejection(error: &FlowSchemaError) {
     assert_eq!(error.station_id(), "project");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
         panic!("Project returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -428,7 +428,7 @@ fn assert_project_field_rejection(error: &FlowSchemaError) {
 
 fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
     assert_eq!(error.station_id(), "union");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
         panic!("UnionAll returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -440,7 +440,7 @@ fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
 
 fn assert_sqlite_identifier_collision(error: &FlowSchemaError) {
     assert_eq!(error.station_id(), "sqlite");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
         panic!("SQLite identifier collision returned the wrong binding error");
     };
     assert!(matches!(

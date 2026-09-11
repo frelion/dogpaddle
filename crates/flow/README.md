@@ -1,10 +1,11 @@
 # dogpaddle-flow
 
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
-`Flow` 只表示运行态，不承担声明、构建或打开职责。Station 当前是 crate 内部的一对一 Operation
-容器；它读取所包裹 Definition 显式声明的 `OperationKind`，向 Flow 提供 Scan、Sink、输入数量
-和 output 属性，并在 build/open 时沿拓扑传递精确 logical Arrow Schema。Flow 不枚举具体算子；未来一个 Station 包裹多个 Operation 时，只需在 Station
-内部归纳这些属性，不必改变 Flow 的拓扑接口。
+`Flow` 只表示运行态，不承担声明、构建或打开职责。每个 Station 是一个持久化与事务边界，内部
+包含恰好一个 core Operation，并可在每个 input port 和 core output 上附加有序的纯 inline
+pipeline。Station 从 core Definition 得到 Scan、Sink、输入数量、状态和 output 属性，再把 inline
+stages 的 Schema 变化归纳为 Station 的最终端口 Schema。Flow 不枚举具体算子，拓扑仍只连接
+Station。
 
 ## 构建 Flow
 
@@ -31,43 +32,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.station("scan", SequenceScanDefinition::new(0));
-    let extend = factory.station(
-        "extend",
-        ExtendDefinition::try_new("is_seven", col("value").eq(lit(7_u64)))?,
-    );
-    let filter = factory.station(
-        "filter",
-        FilterDefinition::try_new(col("is_seven"))?,
-    );
-    let align = factory.station(
-        "align",
-        SchemaAlignDefinition::try_new([
-            SchemaAlignField::try_new("event", col("value"), true)?,
-        ])?,
-    );
     let count = factory.station("count", RunningEventCountDefinition::new());
     let sink = factory.station("sink", DiscardDefinition::new());
     let capacity = NonZeroU64::new(64 * 1024 * 1024).unwrap();
     factory.output_capacity_bytes(scan, capacity);
-    factory.output_capacity_bytes(extend, capacity);
-    factory.output_capacity_bytes(filter, capacity);
-    factory.output_capacity_bytes(align, capacity);
     factory.output_capacity_bytes(count, capacity);
-    factory.connect([scan], extend);
-    factory.connect([extend], filter);
-    factory.connect([filter], align);
-    factory.connect([align], count);
+    factory.inline_output(
+        scan,
+        ExtendDefinition::try_new("is_seven", col("value").eq(lit(7_u64)))?,
+    )?;
+    factory.inline_output(scan, FilterDefinition::try_new(col("is_seven"))?)?;
+    factory.inline_output(
+        scan,
+        SchemaAlignDefinition::try_new([
+            SchemaAlignField::try_new("event", col("value"), true)?,
+        ])?,
+    )?;
+    factory.connect([scan], count);
     factory.connect([count], sink);
 
     let flow = factory.build()?;
     assert_eq!(
         flow.station_ids().collect::<Vec<_>>(),
-        ["scan", "extend", "filter", "align", "count", "sink"]
+        ["scan", "count", "sink"]
     );
     drop(flow);
 
     let reopened = FlowFactory::new(&path).open()?;
-    assert_eq!(reopened.station_count(), 6);
+    assert_eq!(reopened.station_count(), 3);
     Ok(())
 }
 ```
@@ -82,6 +74,14 @@ output capacity，outputless Station 不得声明；重复、遗漏、类别不�
 传到 consumer 的对应有序 input port，并调用 Definition 的纯 bind；任一 Schema 拒绝都会带
 Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation data 声明校验或 manifest
 编码失败都不会创建目标目录。
+
+`inline_input(station, port, definition)` 把纯变换追加到一个 core input 之前；
+`inline_output(station, definition)` 把纯变换追加到 core output 与持久化日志之间。两者都保持调用
+顺序，只接受 sealed `InlineOperationDefinition`。当前可 inline 的算子是 Project、Filter、Extend、
+Select 与 `SchemaAlign`；具体 Definition 还必须通过确定性与重放安全检查。它们不声明 Store data，
+不创建 output log、Subscription 或额外事务。非法 port、Scan input、Sink output 和 foreign
+`StationRef` 会在 build 的纯校验阶段、Store 创建前失败。需要恢复隔离、独立 backlog 或背压缓冲时，
+调用方直接把该变换声明为普通 Station。
 
 ### 外部算子的运行配置
 
@@ -194,13 +194,18 @@ backlog 单位是完整 Change 而非行数；capacity 仍是允许空日志单�
 
 每条 Flow 独占一个 Store。`FlowFactory::build()` 先完成声明并稳定编码，再立即解码这份 canonical
 manifest；拓扑解析、Schema 绑定和后续资源布局都只使用将要持久化的 Definition，而不依赖调用方
-原始 Rust 对象的额外状态。全部纯校验成功后，build 才按 Operation Definition 的逻辑数据名创建
+原始 Rust 对象的额外状态。全部纯校验成功后，build 才按 core Operation Definition 的逻辑数据名创建
 状态，并为每个具有 output 的 Station 创建一个 `SubscribedLog<Vec<u8>>`，最后提交 manifest Cell
 作为构建完成标记。Operation Definition 返回稳定的
 “逻辑名称 → 完整数据类型”声明；`FlowFactory` 的
 build/open 通路负责完整资源名，并通过 Store 将每项声明创建或打开为具体实例，再按逻辑名称
 交给先前 Schema bind 产生的一次性 `OperationBinding` 装配 Operation。数据实例绑定不依赖声明
 顺序，具体算子不接触 Store、底层句柄或物理布局。
+
+当前 v1 manifest 为每个 Station 编码 core Definition、每个 input port 的 producer 与 inline
+pipeline，以及可选 output capacity 与 output inline pipeline。inline 顺序属于持久语义；open
+严格恢复磁盘中的分组，不重新运行装配策略。旧布局数据库直接删除重建，没有旧 decoder、迁移器或
+兼容分支。
 
 零输入和单输入 Station 不创建 Station 自有状态。只有多输入 Station 创建一个 `Cell<u32>`，记录下一次
 轮询从哪个端口开始；build 在发布 manifest 的同一事务中将它初始化为 `0`。每个 output log 同时
@@ -228,7 +233,8 @@ split 出 owned reader。拓扑和资源目录都没有运行期修改入口。
 Schema binding 先对全图完成，随后按声明顺序创建或打开必要的多输入 active Cell、Operation data 和 output。
 拓扑为每个 input edge 确定 producer 与 subscriber ID；装配时从 producer log 派生对应
 `Subscription`，再把 writer、capacity 与精确 Schema 唯一移入共享 `Output`。声明顺序不必是
-拓扑顺序，fan-out 仍共享同一个物理 log。Station 不知道相连的 Station ID，只拥有 Operation、
+拓扑顺序，fan-out 仍共享同一个物理 log。Station 不知道相连的 Station ID，只拥有由一个 core 与
+纯 inline pipelines 组成的 program、
 可选 `Output`，以及带可选 active Cell、有序 ports 与至多一个 owned `Claim` 的 `Inbox`。
 装配还从已验证 Definition 派生唯一运行期 schedule：先按拓扑层次排列，同一层按 Station 声明
 顺序排列。build/open 得到相同结果，不需要持久化 schedule。
@@ -245,8 +251,10 @@ IPC 解码完成后，`intake` 先把 Change 的完整 logical Schema 与该 inp
 重建同一输入。零输入 Scan 没有 Claim，但仍由相同 Station 路径调用 `turn(None)`；没有 Scan 专用
 outcome 或事务路径。没有 output 的 Sink 不能被其他 Station 作为 input。
 
-`process(&mut Transactions)` 先在没有活动写事务时调用 `Operation::turn`。有输入 Operation 每次只
-接收端口和一个完整 borrowed `Change`，不会看到 Subscription offset 或 Station 运行元数据；
+`process(&mut Transactions)` 先在没有活动写事务时运行当前 port 的 input pipeline。若某个 Filter
+删掉整份 Change，Station 用一个短事务只提交 Subscription acknowledgement 与多输入 active 轮转，
+core 不会被调用。否则 core 每次只接收端口和变换后的完整 borrowed `Change`，不会看到
+Subscription offset 或 Station 运行元数据；
 Scan 在同一入口收到 `None`。`Turn::Idle` 直接结束，不开启写事务；`Turn::Ready` 携带一个只能
 消费一次的 `PreparedTurn`，Station 此时才开始唯一写事务，并只把不能提交的
 `TransactionAccess` 交给其 `apply`。已有 Claim 会直接提供给 Operation，不在每个 turn 前重新读取
@@ -259,9 +267,14 @@ prepared turn 只返回三个 `Action`：`Idle` 丢弃本次事务，因而不�
 port，并以 Claim 携带的 expected offset 调用 `Subscription::acknowledge`，同时提交 Operation 状态、
 可选 output 和多输入 active 轮转；Subscription 会验证该 offset 正是当前位置。只有外层 commit
 成功后才清除 Claim。日志位置和共享保留完全由 `SubscribedLog` 维护。
-任何 Operation、编码、append、active、Subscription 或 commit 错误都会回滚本次事务并保留 Claim。
+任何提交前的 Operation、编码、append、active 或 Subscription 错误都会回滚本次事务并保留 Claim。
+commit failure 的持久结果可能不确定；Station 会丢弃 `AfterCommit` 并立即 fail-stop，reopen 后以 Store
+中的 durable state 判断该 turn 是否已经提交。
 Operation 返回 output 时，Station 在 IPC 编码和 capacity 判定之前先按同样的精确规则校验其
 logical Schema；不匹配是协议错误，整个 turn 的 Operation 状态、output 与输入进展全部回滚。
+core 产生的 output 在同一写事务内依次经过 output pipeline，最终结果才进入 Station output log；
+中间 Change 不编码为 IPC，也不写入 RocksDB。output pipeline 删除结果时仍按 core 的 Action 提交
+core 状态和适用的 input acknowledgement。
 
 `PreparedTurn::apply` 还可返回一个 `AfterCommit`。Station 只在上述事务成功提交后消费它；
 `Action::Idle`、协议错误、Schema 错误、背压、Store 错误或 commit 失败都只丢弃 completion，绝不
@@ -279,8 +292,8 @@ continuation、`Complete` acknowledgement/active 都不前进，Claim 保留，�
 物理空日志允许一条 oversize entry，避免单个合法 Change 永久无法前进。这是一项 per-output soft
 high watermark，不是 Store 文件大小或进程内存硬配额。
 
-只要当前输入尚未 `Complete`，无论前一 turn 是 `Idle`、`Commit`、错误、output append 失败、commit
-失败还是进程重开，下一次调用都必须收到同一 `(port, offset, bytes)` 所标识的完整 Change；这要求
+只要 durable state 中的当前输入尚未 `Complete`，无论前一 turn 是 `Idle`、`Commit`、提交前错误、
+output append 失败还是进程重开，下一次调用都必须收到同一 `(port, offset, bytes)` 所标识的完整 Change；这要求
 同一日志 entry 的原始字节不变，不要求重新解码后拥有相同内存地址。Change 内部的处理位置属于
 Operation continuation，必须存入该 Operation 通过 Definition 声明的 Store 状态；`Inbox` 只拥有
 可选 active Cell、各 input Subscription 和可丢弃重建的 owned Claim。
@@ -355,7 +368,7 @@ derived edge Schema 不单独持久化，但相同 Operation tag/payload 与有�
 `FlowFactory` 负责声明、纯拓扑校验、稳定编码以及 build/open 时的资源装配；运行态 `Flow` 只持有
 Station ID、已装配 Station、确定性 schedule 和分离的事务启动能力，不保留完整 Definition。私有
 `build/schema.rs` 只负责拓扑序 Schema 传播和 Definition bind，不创建资源或进入运行调度；Station
-是 crate 私有的单轮执行壳，拥有
+是 crate 私有的单轮执行壳，拥有一个 core、纯 input/output pipelines、
 输入 claim 与 output capability，但不接收 Store、不知道稳定资源名。Flow 作为
 Operation 与 Store 的组合根，通过单一公共 `correctness` target 验证资源布局、重新物化和运行
 协议，不再建立重复的集成 package。具体目录 ownership 与私有实现约束见仓库 `AGENTS.md`；fixture、
@@ -364,14 +377,14 @@ Operation 与 Store 的组合根，通过单一公共 `correctness` target 验�
 
 ## 当前边界
 
-本阶段完成定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Inbox 独占的
+本阶段完成 Station program 的定义、持久化 `build/open`、Flow 对分离读写事务启动能力的所有权，以及 Inbox 独占的
 可选多输入 active Cell 与 input Subscriptions、Station 可选的统一 Output 和可重建的确定性拓扑
 schedule。输入准备通过 RO snapshot 从当前端口循环查找、在多输入时 durable pin，并幂等准备至多一个带来源
 身份的 Claim；`process` 已支持事务外 `Operation::turn`、线性 `PreparedTurn`、事务内
 `Action::{Idle, Commit, Complete}` 与仅在提交成功后运行的 `AfterCommit`，Complete 在同一写事务中
 原子协调 Operation continuation、output、active 与 Subscription acknowledgement。每个 output Station
 拥有持久化 retained-byte 高水位，容量拒绝会按强重放协议回滚完整 turn。Flow 已公开有界的
-`Flow::advance`，真实表达式链路与 `SequenceScan → Select → UnionAll → RunningEventCount → Discard`
+`Flow::advance`，真实 inline 表达式链路与 `SequenceScan → Select → UnionAll → RunningEventCount → Discard`
 多输入 DAG 可以按拓扑逐轮推进并在 reopen
 后续跑。端点校验已经排除完全没有 consumer 的 output，缓慢或停滞 consumer 会通过物理日志水位
 自然反压 producer。端口已经在 build/open 时绑定完整精确 Schema，运行期 producer append 与 consumer

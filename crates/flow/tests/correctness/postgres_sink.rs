@@ -88,7 +88,7 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
         panic!("PostgreSQL-incompatible field name unexpectedly bound");
     };
     assert_eq!(error.station_id(), SINK);
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
         panic!("PostgreSQL field-name rejection returned the wrong binding error");
     };
     assert!(matches!(

@@ -14,14 +14,14 @@ use datafusion_common::{
     tree_node::{TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::{
-    ExprSchemable, execution_props::ExecutionProps,
+    ExprSchemable, Volatility, execution_props::ExecutionProps,
     physical_planning_context::PhysicalPlanningContext,
 };
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_proto::bytes::Serializeable;
 use thiserror::Error;
 
-use crate::{DefinitionCodecError, codec::PayloadCursor};
+use crate::{DefinitionCodecError, InlineEligibilityError, codec::PayloadCursor};
 
 pub use datafusion_common::ScalarValue;
 pub use datafusion_expr::{Expr, Operator, cast, col, ident, lit, try_cast};
@@ -171,6 +171,89 @@ impl StoredExpression {
             output_metadata,
         })
     }
+
+    pub(crate) fn ensure_inline_eligible(
+        &self,
+        expression_index: usize,
+    ) -> Result<(), InlineEligibilityError> {
+        let mut rejection = None;
+        let _ = self.expression().apply(|expression| {
+            rejection = inline_expression_rejection(expression, expression_index);
+            Ok::<_, DataFusionError>(if rejection.is_some() {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        });
+        rejection.map_or(Ok(()), Err)
+    }
+}
+
+fn inline_expression_rejection(
+    expression: &Expr,
+    expression_index: usize,
+) -> Option<InlineEligibilityError> {
+    if let Expr::ScalarFunction(function) = expression {
+        return match function.func.signature().volatility {
+            Volatility::Immutable => None,
+            Volatility::Stable => Some(InlineEligibilityError::StableFunction {
+                expression: expression_index,
+                function: function.name().to_owned(),
+            }),
+            Volatility::Volatile => Some(InlineEligibilityError::VolatileFunction {
+                expression: expression_index,
+                function: function.name().to_owned(),
+            }),
+        };
+    }
+    unsupported_inline_expression_kind(expression).map(|kind| {
+        InlineEligibilityError::UnsupportedExpression {
+            expression: expression_index,
+            kind,
+        }
+    })
+}
+
+fn unsupported_inline_expression_kind(expression: &Expr) -> Option<&'static str> {
+    match expression {
+        Expr::ScalarVariable(_, _) => Some("scalar variable"),
+        Expr::AggregateFunction(_) => Some("aggregate function"),
+        Expr::WindowFunction(_) => Some("window function"),
+        Expr::Exists { .. } => Some("EXISTS subquery"),
+        Expr::InSubquery(_) => Some("IN subquery"),
+        Expr::SetComparison(_) => Some("set-comparison subquery"),
+        Expr::ScalarSubquery(_) => Some("scalar subquery"),
+        #[expect(deprecated)]
+        Expr::Wildcard { .. } => Some("wildcard"),
+        Expr::GroupingSet(_) => Some("grouping set"),
+        Expr::Placeholder(_) => Some("placeholder"),
+        Expr::OuterReferenceColumn(_, _) => Some("outer reference"),
+        Expr::Unnest(_) => Some("row-expanding unnest"),
+        Expr::HigherOrderFunction(_) => Some("higher-order function"),
+        Expr::Lambda(_) | Expr::LambdaVariable(_) => Some("lambda"),
+        Expr::Alias(_)
+        | Expr::Column(_)
+        | Expr::Literal(_, _)
+        | Expr::BinaryExpr(_)
+        | Expr::Like(_)
+        | Expr::SimilarTo(_)
+        | Expr::Not(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::Negative(_)
+        | Expr::Between(_)
+        | Expr::Case(_)
+        | Expr::Cast(_)
+        | Expr::TryCast(_)
+        | Expr::ScalarFunction(_)
+        | Expr::InList(_) => None,
+    }
 }
 
 // prost encodes `HashMap` fields in per-process hash iteration order. DataFusion
@@ -266,5 +349,57 @@ impl BoundExpression {
             .evaluate(records)?
             .into_array_of_size(records.num_rows())
             .map_err(ExpressionError::DataFusion)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::DataType;
+    use datafusion_expr::{Volatility, create_udf};
+
+    use super::{InlineEligibilityError, col, inline_expression_rejection};
+
+    fn function_expression(name: &str, volatility: Volatility) -> super::Expr {
+        create_udf(
+            name,
+            vec![DataType::UInt64],
+            DataType::UInt64,
+            volatility,
+            Arc::new(|arguments| Ok(arguments[0].clone())),
+        )
+        .call(vec![col("value")])
+    }
+
+    #[test]
+    fn inline_expression_requires_immutable_scalar_functions() {
+        assert_eq!(
+            inline_expression_rejection(
+                &function_expression("stable_identity", Volatility::Stable),
+                2,
+            ),
+            Some(InlineEligibilityError::StableFunction {
+                expression: 2,
+                function: "stable_identity".to_owned(),
+            })
+        );
+        assert_eq!(
+            inline_expression_rejection(
+                &function_expression("volatile_identity", Volatility::Volatile),
+                3,
+            ),
+            Some(InlineEligibilityError::VolatileFunction {
+                expression: 3,
+                function: "volatile_identity".to_owned(),
+            })
+        );
+        assert_eq!(
+            inline_expression_rejection(
+                &function_expression("immutable_identity", Volatility::Immutable),
+                4,
+            ),
+            None
+        );
     }
 }

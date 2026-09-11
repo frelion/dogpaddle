@@ -23,6 +23,8 @@ dogpaddle-operation.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
+dogpaddle-store.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

@@ -101,12 +101,14 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 | `ordered_map` | Criterion；完整 owned-page 扫描 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
-| `flow_runtime` | Flow 自有逐采样 `advance` latency trace |
+| `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含同一 Project→Extend→Filter→Select→SchemaAlign 纯链的独立 Station 与 fused pipeline 对照 |
 | `change_subscribed_log` | Criterion |
 
 自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
-Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode；自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
+Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime` 的自有 runner 同样设置 `test = true`，test mode 自动选择小规模 smoke 并执行完整结构与 durable oracle；其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
+
+`flow_runtime` 的纯链对照固定使用相同的 SequenceScan→Project→Extend→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局是 7 个 Station、6 个 durable output log 和 6 条 input edge；fused 布局把五个纯 transform 放入 Scan 的 output pipeline，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。这些 commit 与 append 是 Flow 协议层的语义计数，不是 RocksDB 内部计数。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration 或历史累计 IPC bytes，JSONL context 必须把两项记为 unavailable，不能用均摊延迟或当前 retained bytes 冒充。
 
 性能环境只有两个入口：
 

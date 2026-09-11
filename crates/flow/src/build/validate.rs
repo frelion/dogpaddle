@@ -1,10 +1,11 @@
 use std::{collections::HashSet, num::NonZeroU64};
 
+use dogpaddle_operation::InlineDefinition;
 use thiserror::Error;
 
 use super::{
     StationRef,
-    definition::{FlowDefinition, StationDefinition},
+    definition::{FlowDefinition, InputDefinition, StationDefinition},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,21 @@ pub enum TopologyError {
     /// A Station's output capacity was declared more than once.
     #[error("output capacity for station {0:?} was already set")]
     OutputCapacityAlreadySet(String),
+    /// An inline input stage targets a port outside the core Operation's arity.
+    #[error(
+        "station {station:?} inline input port {port} is outside its {input_count} core inputs"
+    )]
+    InlineInputPortOutOfRange {
+        /// Station containing the invalid pipeline declaration.
+        station: String,
+        /// Invalid zero-based input port.
+        port: usize,
+        /// Exact input arity of the core Operation.
+        input_count: usize,
+    },
+    /// An inline output stage was declared on an outputless core Operation.
+    #[error("outputless station {0:?} cannot declare an inline output stage")]
+    InlineOutputOnSink(String),
 }
 
 pub(super) fn finish_definition(
@@ -89,10 +105,14 @@ pub(super) fn finish_definition(
     mut stations: Vec<StationDefinition>,
     connections: &[(Vec<StationRef>, StationRef)],
     output_capacities: &[(StationRef, NonZeroU64)],
+    input_inline: Vec<(StationRef, usize, InlineDefinition)>,
+    output_inline: Vec<(StationRef, InlineDefinition)>,
 ) -> Result<FlowDefinition, TopologyError> {
     validate_station_ids(&stations)?;
     let mut inputs_by_station = validate_connections(token, &stations, connections)?;
     validate_topology(&stations, &inputs_by_station)?;
+    let mut input_inline = collect_input_inline(token, &stations, input_inline)?;
+    apply_output_inline(token, &mut stations, output_inline)?;
     apply_output_capacities(token, &mut stations, output_capacities)?;
 
     let station_ids = stations
@@ -104,11 +124,62 @@ pub(super) fn finish_definition(
             .take()
             .unwrap_or_default()
             .into_iter()
-            .map(|input| station_ids[input].clone())
+            .enumerate()
+            .map(|(port, input)| {
+                InputDefinition::new(
+                    station_ids[input].clone(),
+                    std::mem::take(&mut input_inline[index][port]),
+                )
+            })
             .collect();
     }
 
     Ok(FlowDefinition::new(stations))
+}
+
+fn collect_input_inline(
+    token: u64,
+    stations: &[StationDefinition],
+    declarations: Vec<(StationRef, usize, InlineDefinition)>,
+) -> Result<Vec<Vec<Vec<InlineDefinition>>>, TopologyError> {
+    let mut pipelines = stations
+        .iter()
+        .map(|station| {
+            std::iter::repeat_with(Vec::new)
+                .take(station.input_count())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (reference, port, definition) in declarations {
+        let station = resolve_ref(token, stations.len(), reference)?;
+        let input_count = pipelines[station].len();
+        let pipeline = pipelines[station].get_mut(port).ok_or_else(|| {
+            TopologyError::InlineInputPortOutOfRange {
+                station: stations[station].id.clone(),
+                port,
+                input_count,
+            }
+        })?;
+        pipeline.push(definition);
+    }
+    Ok(pipelines)
+}
+
+fn apply_output_inline(
+    token: u64,
+    stations: &mut [StationDefinition],
+    declarations: Vec<(StationRef, InlineDefinition)>,
+) -> Result<(), TopologyError> {
+    for (reference, definition) in declarations {
+        let station = resolve_ref(token, stations.len(), reference)?;
+        if !stations[station].has_output() {
+            return Err(TopologyError::InlineOutputOnSink(
+                stations[station].id.clone(),
+            ));
+        }
+        stations[station].output_inline.push(definition);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_decoded_topology(
