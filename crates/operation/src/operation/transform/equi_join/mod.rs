@@ -12,31 +12,77 @@ mod definition;
 mod runtime;
 mod state;
 
-pub use definition::InnerEquiJoinDefinition;
+pub use definition::EquiJoinDefinition;
 pub(crate) use definition::{TAG, decode_definition};
-pub use runtime::InnerEquiJoinOperation;
+pub use runtime::EquiJoinOperation;
 
-/// Failure while constructing a persistent [`InnerEquiJoinDefinition`].
+/// Relational output semantics of an equality join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EquiJoinKind {
+    /// Emits every matching left/right pair with multiplied multiplicity.
+    Inner,
+    /// Emits left rows that have at least one right match.
+    LeftSemi,
+    /// Emits left rows that have no right match.
+    LeftAnti,
+    /// Also retains unmatched left rows, filling right fields with NULL.
+    LeftOuter,
+    /// Also retains unmatched rows from either side, filling the other side with NULL.
+    FullOuter,
+}
+
+impl EquiJoinKind {
+    const fn left_only(self) -> bool {
+        matches!(self, Self::LeftSemi | Self::LeftAnti)
+    }
+
+    const fn preserves(self, port: usize) -> bool {
+        matches!(self, Self::FullOuter) || matches!((self, port), (Self::LeftOuter, 0))
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Inner => 0,
+            Self::LeftSemi => 1,
+            Self::LeftAnti => 2,
+            Self::LeftOuter => 3,
+            Self::FullOuter => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Inner),
+            1 => Some(Self::LeftSemi),
+            2 => Some(Self::LeftAnti),
+            3 => Some(Self::LeftOuter),
+            4 => Some(Self::FullOuter),
+            _ => None,
+        }
+    }
+}
+
+/// Failure while constructing a persistent [`EquiJoinDefinition`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum InnerEquiJoinDefinitionError {
+pub enum EquiJoinDefinitionError {
     /// At least one equality key pair is required.
-    #[error("inner equi-join requires at least one key pair")]
+    #[error("equi-join requires at least one key pair")]
     EmptyKeys,
     /// A stable Definition count cannot represent all supplied values.
-    #[error("inner equi-join definition has too many {kind}")]
+    #[error("equi-join definition has too many {kind}")]
     TooMany {
         /// The collection whose count overflowed the stable format.
         kind: &'static str,
     },
     /// An output name cannot fit the stable Definition format.
-    #[error("inner equi-join output name {output} is too long")]
+    #[error("equi-join output name {output} is too long")]
     OutputNameTooLong {
         /// Zero-based output name.
         output: usize,
     },
     /// One key expression cannot be persisted canonically.
-    #[error("inner equi-join {side} key expression {key} cannot be persisted")]
+    #[error("equi-join {side} key expression {key} cannot be persisted")]
     KeyExpression {
         /// Zero-based key pair.
         key: usize,
@@ -47,7 +93,7 @@ pub enum InnerEquiJoinDefinitionError {
         source: ExpressionDefinitionError,
     },
     /// Join keys must be immutable because a paged turn evaluates them again after reopen.
-    #[error("inner equi-join {side} key expression {key} is not immutable")]
+    #[error("equi-join {side} key expression {key} is not immutable")]
     NonImmutableKey {
         /// Zero-based key pair.
         key: usize,
@@ -56,12 +102,12 @@ pub enum InnerEquiJoinDefinitionError {
     },
 }
 
-/// Inner equi-join rejection while binding two exact input Schemas.
+/// Equality join rejection while binding two exact input Schemas.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum InnerEquiJoinSchemaError {
+pub enum EquiJoinSchemaError {
     /// One key expression cannot bind to its own input Schema.
-    #[error("inner equi-join {side} key expression {key} cannot bind")]
+    #[error("equi-join {side} key expression {key} cannot bind")]
     KeyExpression {
         /// Zero-based key pair.
         key: usize,
@@ -72,7 +118,7 @@ pub enum InnerEquiJoinSchemaError {
         source: ExpressionBindError,
     },
     /// Both expressions in one equality pair must have the same exact type.
-    #[error("inner equi-join key {key} has different types: left {left}, right {right}")]
+    #[error("equi-join key {key} has different types: left {left}, right {right}")]
     KeyTypeMismatch {
         /// Zero-based key pair.
         key: usize,
@@ -82,44 +128,47 @@ pub enum InnerEquiJoinSchemaError {
         right: DataType,
     },
     /// v1 admits only flat non-floating equality keys.
-    #[error("inner equi-join key {key} has unsupported type {data_type}")]
+    #[error("equi-join key {key} has unsupported type {data_type}")]
     UnsupportedKeyType {
         /// Zero-based key pair.
         key: usize,
         /// Rejected exact type.
         data_type: DataType,
     },
-    /// One stable name is required for every left field followed by every right field.
-    #[error("inner equi-join requires {expected} output names but received {actual}")]
+    /// One stable name is required for every field emitted by the selected Join kind.
+    #[error("equi-join requires {expected} output names but received {actual}")]
     OutputNameCount {
-        /// Exact number of source fields.
+        /// Exact number of fields emitted by the selected Join kind.
         expected: usize,
         /// Supplied name count.
         actual: usize,
     },
+    /// An input field cannot be represented as a typed NULL for outer output.
+    #[error("equi-join cannot construct NULL padding")]
+    NullPadding(#[source] DataFusionError),
 }
 
-/// Failure during one [`InnerEquiJoinOperation`] turn.
+/// Failure during one [`EquiJoinOperation`] turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum InnerEquiJoinError {
+pub enum EquiJoinError {
     /// The runtime requires one complete input Change.
-    #[error("inner equi-join requires input")]
+    #[error("equi-join requires input")]
     MissingInput,
     /// Only the two bound input ports are valid.
-    #[error("inner equi-join does not accept input port {port}")]
+    #[error("equi-join does not accept input port {port}")]
     InvalidInputPort {
         /// Rejected zero-based port.
         port: usize,
     },
     /// Runtime input differs from the exact Schema bound for its port.
-    #[error("inner equi-join input {port} Schema differs from its bound Schema")]
+    #[error("equi-join input {port} Schema differs from its bound Schema")]
     InputSchemaMismatch {
         /// Input port whose Schema drifted.
         port: usize,
     },
     /// One bound key expression failed while preparing the Claim.
-    #[error("inner equi-join key expression {key} failed for input {port}")]
+    #[error("equi-join key expression {key} failed for input {port}")]
     KeyExpression {
         /// Offered input port.
         port: usize,
@@ -130,19 +179,25 @@ pub enum InnerEquiJoinError {
         source: ExpressionError,
     },
     /// Applying a difference would make one exact input row negative.
-    #[error("inner equi-join input would make an exact row weight negative")]
+    #[error("equi-join input would make an exact row weight negative")]
     NegativeWeight,
     /// An exact input row's durable multiplicity cannot represent an adjustment.
-    #[error("inner equi-join row weight overflow")]
+    #[error("equi-join row weight overflow")]
     WeightOverflow,
-    /// Multiplying an input difference by an opposite multiplicity exceeds `i64`.
-    #[error("inner equi-join output difference overflow")]
+    /// The number of distinct rows under one key cannot be represented.
+    #[error("equi-join key row count overflow")]
+    KeyCountOverflow,
+    /// Persisted key counts disagree with an exact row removal.
+    #[error("equi-join key row count underflow")]
+    KeyCountUnderflow,
+    /// A matched-pair difference or an existence/NULL-row correction exceeds `i64`.
+    #[error("equi-join output difference overflow")]
     OutputDifferenceOverflow,
     /// Durable continuation is inconsistent with the pinned input Claim.
-    #[error("inner equi-join continuation is invalid: {0}")]
+    #[error("equi-join continuation is invalid: {0}")]
     InvalidContinuation(&'static str),
     /// Exact canonical row encoding or decoding failed.
-    #[error("inner equi-join canonical row processing failed")]
+    #[error("equi-join canonical row processing failed")]
     CanonicalRow {
         /// Concrete private row-codec failure.
         #[source]

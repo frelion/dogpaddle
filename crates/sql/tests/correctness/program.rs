@@ -63,11 +63,24 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
 }
 
 #[test]
-fn parse_accepts_inner_equality_join_conjunctions() {
-    for keyword in ["JOIN", "INNER JOIN"] {
+fn parse_accepts_the_equality_join_family() {
+    for (keyword, selected) in [
+        ("JOIN", "left_scan.value"),
+        ("INNER JOIN", "left_scan.value"),
+        ("LEFT JOIN", "left_scan.value"),
+        ("LEFT OUTER JOIN", "left_scan.value"),
+        ("RIGHT JOIN", "right_scan.value"),
+        ("RIGHT OUTER JOIN", "right_scan.value"),
+        ("FULL JOIN", "left_scan.value"),
+        ("FULL OUTER JOIN", "right_scan.value"),
+        ("LEFT SEMI JOIN", "left_scan.value"),
+        ("LEFT ANTI JOIN", "left_scan.value"),
+        ("RIGHT SEMI JOIN", "right_scan.value"),
+        ("RIGHT ANTI JOIN", "right_scan.value"),
+    ] {
         SqlProgram::parse(&format!(
             "INSERT INTO discard() \
-             SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+             SELECT {selected} AS selected_value \
              FROM sequence(start => 0) AS left_scan \
              {keyword} sequence(start => 1) AS right_scan \
              ON left_scan.value + 1 = right_scan.value \
@@ -78,14 +91,21 @@ fn parse_accepts_inner_equality_join_conjunctions() {
 }
 
 #[test]
-fn parse_rejects_join_types_constraints_and_residuals_outside_v1() {
+fn parse_accepts_an_inner_residual_after_an_equality_key() {
+    SqlProgram::parse(
+        "INSERT INTO discard() \
+         SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => 0) AS left_scan \
+         JOIN sequence(start => 1) AS right_scan \
+         ON left_scan.value = right_scan.value \
+         AND left_scan.value + right_scan.value > 0",
+    )
+    .unwrap();
+}
+
+#[test]
+fn parse_rejects_join_constraints_and_conditions_outside_the_family() {
     let queries = [
-        (
-            "left join",
-            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
-             LEFT JOIN sequence(start => 1) AS right_scan \
-             ON left_scan.value = right_scan.value",
-        ),
         (
             "using",
             "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
@@ -108,10 +128,22 @@ fn parse_rejects_join_types_constraints_and_residuals_outside_v1() {
              ON left_scan.value < right_scan.value",
         ),
         (
-            "residual",
+            "left outer residual",
             "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
-             JOIN sequence(start => 1) AS right_scan \
+             LEFT JOIN sequence(start => 1) AS right_scan \
              ON left_scan.value = right_scan.value AND left_scan.value > 0",
+        ),
+        (
+            "left semi residual",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             LEFT SEMI JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value = right_scan.value AND left_scan.value > 0",
+        ),
+        (
+            "right anti residual",
+            "SELECT right_scan.value FROM sequence(start => 0) AS left_scan \
+             RIGHT ANTI JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value = right_scan.value AND right_scan.value > 0",
         ),
     ];
 
@@ -443,6 +475,25 @@ fn invalid_plan_shapes_fail_without_creating_a_flow() {
              FROM sequence(start => 0) AS left_scan \
              JOIN sequence(start => 1) AS right_scan \
              ON left_scan.value = left_scan.value",
+        ),
+        (
+            "correlated exists",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             WHERE EXISTS (\
+                 SELECT right_scan.value \
+                 FROM sequence(start => 1) AS right_scan \
+                 WHERE right_scan.value = left_scan.value\
+             )",
+        ),
+        (
+            "in subquery",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             WHERE left_scan.value IN (\
+                 SELECT right_scan.value \
+                 FROM sequence(start => 1) AS right_scan\
+             )",
         ),
         (
             "union field count",

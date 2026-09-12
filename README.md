@@ -126,7 +126,7 @@ flow.advance()?; // 重启后继续
 
 DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运行循环。
 完整可运行代码见 [quickstart.rs](crates/sql/examples/quickstart.rs)，
-接口说明见 [SQL 文档](crates/sql/README.md#嵌入-rust)。
+接口说明见 [SQL 文档](crates/sql/README.md#3-buildadvanceopen)。
 
 ## 当前支持什么
 
@@ -135,15 +135,16 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
 | 读取数据 | 递增数字源；PostgreSQL WAL / MySQL binlog 单表变更捕获（固定 Schema 试点） |
 | 筛选和计算 | `SELECT`、`WHERE`、算术与布尔表达式、`CASE`、`CAST`、`TRY_CAST` |
 | 组织查询 | 字段别名、非递归 CTE、派生查询、`SELECT DISTINCT`、`UNION ALL` |
-| 关联数据 | `JOIN` / `INNER JOIN ... ON` 的跨输入等值条件，包括显式转换和行内表达式键 |
+| 关联数据 | `INNER`、`LEFT`、`RIGHT`、`FULL OUTER`、`LEFT/RIGHT SEMI`、`LEFT/RIGHT ANTI JOIN ... ON` 的等值连接 |
 | 分组聚合 | 非空 `GROUP BY`；`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；只分组不聚合 |
 | 写入结果 | SQLite；PostgreSQL（试点）；丢弃输出 |
 | 停止后继续 | 本地保存流程、处理进度和算子状态，重新打开后恢复 |
 
 开始接入前，需要了解这些边界：
 
-- **SQL 范围有限。** 每个文件只接受一条 `INSERT INTO ... SELECT ...`。Join 当前只支持 `JOIN` / `INNER JOIN ... ON`
-  的非空跨输入等值合取；不支持外连接、Cross/Natural/Using Join、非等值或 residual。暂不支持无分组的
+- **SQL 范围有限。** 每个文件只接受一条 `INSERT INTO ... SELECT ...`。Join 必须至少包含一个跨输入
+  等值条件；`INNER JOIN` 还能追加 residual 谓词，其他 Join 只接受等值合取。不支持 Cross/Natural/Using
+  Join 或纯非等值 Join。暂不支持无分组的
   全局聚合、grouping sets、聚合修饰符或 UDF，也不支持 `DISTINCT ON`、普通 `UNION`、排序、
   Limit、窗口和交互式查询结果。
 - **聚合类型范围有限。** 分组字段不能包含浮点值；`SUM/AVG` 只接受 `Int64/UInt64`，`MIN/MAX`

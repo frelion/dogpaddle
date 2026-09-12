@@ -25,7 +25,7 @@ fn physical_compiler_keeps_the_canonical_flow_definition() {
 }
 
 #[test]
-fn inner_join_is_a_transform_head_with_an_atomic_projection_tail() {
+fn inner_join_residual_and_projection_are_fused_into_one_transform_station() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let program = SqlProgram::parse(
@@ -34,7 +34,8 @@ fn inner_join_is_a_transform_head_with_an_atomic_projection_tail() {
          FROM sequence(start => 0) AS left_scan \
          INNER JOIN sequence(start => 1) AS right_scan \
          ON left_scan.value + 1 = right_scan.value \
-         AND left_scan.value = right_scan.value - 1",
+         AND left_scan.value = right_scan.value - 1 \
+         AND left_scan.value + right_scan.value > 0",
     )
     .unwrap();
 
@@ -87,6 +88,22 @@ fn lowering_rebinds_qualified_columns_across_self_and_nested_joins() {
          JOIN (numbers AS second \
                JOIN numbers AS third ON second.value = third.value) \
          ON first.value = second.value",
+        "SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => 0) AS left_scan \
+         RIGHT OUTER JOIN sequence(start => 1) AS right_scan \
+         ON left_scan.value + 1 = right_scan.value",
+        "SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => 0) AS left_scan \
+         FULL OUTER JOIN sequence(start => 1) AS right_scan \
+         ON left_scan.value = right_scan.value",
+        "SELECT right_scan.value AS right_value \
+         FROM sequence(start => 0) AS left_scan \
+         RIGHT SEMI JOIN sequence(start => 1) AS right_scan \
+         ON left_scan.value + 1 = right_scan.value",
+        "SELECT left_scan.value AS left_value \
+         FROM sequence(start => 0) AS left_scan \
+         LEFT ANTI JOIN sequence(start => 1) AS right_scan \
+         ON left_scan.value = right_scan.value",
     ];
 
     let root = tempfile::tempdir().unwrap();

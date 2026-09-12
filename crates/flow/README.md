@@ -11,8 +11,8 @@
 
 ### 1. 数据沿 Station 之间的持久队列移动
 
-DogPaddle 传递的基本单位是 `Change`：一个 Arrow `RecordBatch` 加上每行的增减权重。Station
-之间的连接都经过 producer 在 RocksDB 中的持久输出；同一 Station 内的 Operation 直接传递内存中的
+`DogPaddle` 传递的基本单位是 `Change`：一个 Arrow `RecordBatch` 加上每行的增减权重。Station
+之间的连接都经过 producer 在 `RocksDB` 中的持久输出；同一 Station 内的 Operation 直接传递内存中的
 `Change`。一个输出分叉时，下游共享这份日志，但各自保存读取位置。
 
 ```text
@@ -42,7 +42,7 @@ DogPaddle 传递的基本单位是 `Change`：一个 Arrow `RecordBatch` 加上�
 1. 从某个输入队列查看下一条完整 `Change`，解码并放进内存。这个尚未确认的输入称为
    **Claim**，意思是“本 Station 当前正在处理的那一条输入”。
 2. 首 Operation 在没有写事务时准备工作。如果暂时无事可做，直接返回 `Idle`。
-3. Flow 开启一笔 RocksDB 写事务，执行首 Operation 已准备好的工作，再依次执行 Station 内的尾部 Operation。
+3. Flow 开启一笔 `RocksDB` 写事务，执行首 Operation 已准备好的工作，再依次执行 Station 内的尾部 Operation。
 4. 把最后一个 Operation 的输出追加到 Station 的持久队列。
 5. 如果首 Operation 已完整处理输入，在同一事务中推进输入队列的订阅位置。
 6. 提交成功后，才执行外部 ACK 等 `AfterCommit` 动作。
@@ -104,7 +104,7 @@ Operation 后面。`FlowFactory::append` 只接受单输入 atomic transform。
 
 ## 最小公共 API
 
-下面的 Flow 只有两个 Station。`numbers` 内含 SequenceScan 和 Filter，`sink` 独占：
+下面的 Flow 只有两个 Station。`numbers` 内含 `SequenceScan` 和 Filter，`sink` 独占：
 
 ```rust,no_run
 use std::num::NonZeroU64;

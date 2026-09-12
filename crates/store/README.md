@@ -1,8 +1,8 @@
 # dogpaddle-store
 
-`dogpaddle-store` 是 DogPaddle 的本地事务状态层。它把 RocksDB 包装成少量具名、类型化的数据结构，
+`dogpaddle-store` 是 `DogPaddle` 的本地事务状态层。它把 `RocksDB` 包装成少量具名、类型化的数据结构，
 上层只需要表达“保存一个计数”“更新一张有序表”“发布一条消息”，不需要接触 column family、物理 key
-或 RocksDB 句柄。
+或 `RocksDB` 句柄。
 
 第一次阅读时先记住一句话：**先声明所有持久资源，再用同一笔事务更新任意多个资源。**
 
@@ -88,11 +88,11 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - snapshot 只看见它开始时已经提交的数据，后续提交由新的 snapshot 看见。
 - transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 进一步约定只在当前 turn 内使用它们。
 
-这套类型不是为了模拟 RocksDB 的全部能力，而是让上层代码很难绕过 DogPaddle 的事务边界。
+这套类型不是为了模拟 `RocksDB` 的全部能力，而是让上层代码很难绕过 `DogPaddle` 的事务边界。
 
 ## 六种持久数据结构
 
-| 结构 | 用一句话理解 | DogPaddle 中的典型用途 |
+| 结构 | 用一句话理解 | `DogPaddle` 中的典型用途 |
 | --- | --- | --- |
 | `Cell<T>` | 一个可缺省的值 | checkpoint、phase、计数器 |
 | `OrderedMap<K, V>` | 可点查、增删和有序分页的 map | 分组状态、业务索引 |
@@ -103,7 +103,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 
 `StoreData` 是 sealed trait；产品代码只能使用这些结构，不能绕过 catalog 自造新的物理布局。
 
-### Queue 与 SubscribedLog 的区别
+### Queue 与 `SubscribedLog` 的区别
 
 两者都保存有序数据，但用途不同：
 
@@ -113,7 +113,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
   决定数据何时可以回收。
 
 `Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。
-`SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 RocksDB 自身开销。
+`SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 `RocksDB` 自身开销。
 
 `SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
 接受一个超大 entry，避免单条合法消息永久卡住。容量不足不是 Store 错误，也不会使事务中毒。
@@ -211,7 +211,7 @@ Store catalog 记录资源名、collection kind 和独立 namespace，但不知�
 ```
 
 `StoreKey` 编码必须 canonical、可逆、无碰撞，并按字节保持 Rust `Ord`；`StoreValue` 编码必须能在重启后稳定还原。
-所有结构共享一个启用 LZ4 的默认 column family，物理前缀、namespace、压缩设置和 RocksDB 句柄都不对外暴露。
+所有结构共享一个启用 LZ4 的默认 column family，物理前缀、namespace、压缩设置和 `RocksDB` 句柄都不对外暴露。
 
 当前是开发期 v1。修改资源名、collection kind、codec、key framing 或 metadata 就是修改持久 ABI；同步更新布局和
 reopen 测试，然后删除旧 Flow 重建，不增加旧格式迁移或兼容分支。

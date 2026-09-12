@@ -25,8 +25,8 @@ use crate::{
             SqliteSinkDefinition,
         },
         transform::{
-            AggregateCall, AggregateDefinition, DistinctDefinition, ExtendDefinition,
-            FilterDefinition, InnerEquiJoinDefinition, ProjectDefinition,
+            AggregateCall, AggregateDefinition, DistinctDefinition, EquiJoinDefinition,
+            EquiJoinKind, ExtendDefinition, FilterDefinition, ProjectDefinition,
             RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
             UnionAllDefinition,
         },
@@ -186,8 +186,13 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 16] {
     ]
 }
 
-fn join_definition() -> InnerEquiJoinDefinition {
-    InnerEquiJoinDefinition::try_new([(col("value"), col("value"))], ["left", "right"]).unwrap()
+fn join_definition() -> EquiJoinDefinition {
+    EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
+        [(col("value"), col("value"))],
+        ["left", "right"],
+    )
+    .unwrap()
 }
 
 fn valid_schema() -> SchemaRef {

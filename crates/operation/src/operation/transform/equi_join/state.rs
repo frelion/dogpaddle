@@ -1,9 +1,64 @@
 use std::borrow::Cow;
 
-use dogpaddle_store::{Cell, CodecError, PartitionedMultiset, StoreValue};
+use dogpaddle_store::{Cell, CodecError, OrderedMap, PartitionedMultiset, StoreValue};
+
+use super::EquiJoinError;
 
 pub(super) type Rows = PartitionedMultiset<Vec<u8>, Vec<u8>>;
 pub(super) type Continuation = Cell<JoinContinuation>;
+pub(super) type Counts = OrderedMap<Vec<u8>, KeyCounts>;
+
+/// Positive distinct rows per side; a missing key represents two zero counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct KeyCounts(pub(super) [u64; 2]);
+
+impl KeyCounts {
+    pub(super) fn adjust(
+        &mut self,
+        port: usize,
+        before: u64,
+        after: u64,
+    ) -> Result<(), EquiJoinError> {
+        if before == 0 && after > 0 {
+            self.0[port] = self.0[port]
+                .checked_add(1)
+                .ok_or(EquiJoinError::KeyCountOverflow)?;
+        } else if before > 0 && after == 0 {
+            self.0[port] = self.0[port]
+                .checked_sub(1)
+                .ok_or(EquiJoinError::KeyCountUnderflow)?;
+        }
+        Ok(())
+    }
+
+    pub(super) const fn is_empty(self) -> bool {
+        self.0[0] == 0 && self.0[1] == 0
+    }
+}
+
+impl StoreValue for KeyCounts {
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        if self.is_empty() {
+            return Err(CodecError::new(
+                "empty equi-join key counts must be removed",
+            ));
+        }
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&self.0[0].to_be_bytes());
+        bytes[8..].copy_from_slice(&self.0[1].to_be_bytes());
+        Ok(bytes)
+    }
+
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        let mut cursor = Cursor::new(bytes.as_ref());
+        let counts = Self([cursor.u64()?, cursor.u64()?]);
+        cursor.finish()?;
+        if counts.is_empty() {
+            return Err(CodecError::new("empty equi-join key counts must be absent"));
+        }
+        Ok(counts)
+    }
+}
 
 const VERSION: u8 = 1;
 
@@ -36,7 +91,7 @@ impl StoreValue for JoinContinuation {
             Some(resume) => {
                 encoded.push(1);
                 let length = u64::try_from(resume.len())
-                    .map_err(|_| CodecError::new("inner join continuation key is too long"))?;
+                    .map_err(|_| CodecError::new("equi-join continuation key is too long"))?;
                 encoded.extend_from_slice(&length.to_be_bytes());
                 encoded.extend_from_slice(resume);
             }
@@ -48,30 +103,30 @@ impl StoreValue for JoinContinuation {
         let mut cursor = Cursor::new(bytes.as_ref());
         if cursor.u8()? != VERSION {
             return Err(CodecError::new(
-                "unsupported inner join continuation version",
+                "unsupported equi-join continuation version",
             ));
         }
         let port = cursor.u8()?;
         if port > 1 {
-            return Err(CodecError::new("inner join continuation port is invalid"));
+            return Err(CodecError::new("equi-join continuation port is invalid"));
         }
         let phase = match cursor.u8()? {
             0 => Phase::Probe,
             1 => Phase::Emit,
-            _ => return Err(CodecError::new("inner join continuation phase is invalid")),
+            _ => return Err(CodecError::new("equi-join continuation phase is invalid")),
         };
         let row = cursor.u64()?;
         let resume_after = match cursor.u8()? {
             0 => None,
             1 => {
                 let length = usize::try_from(cursor.u64()?).map_err(|_| {
-                    CodecError::new("inner join continuation key length exceeds usize")
+                    CodecError::new("equi-join continuation key length exceeds usize")
                 })?;
                 Some(cursor.bytes(length)?.to_vec())
             }
             _ => {
                 return Err(CodecError::new(
-                    "inner join continuation key marker is invalid",
+                    "equi-join continuation key marker is invalid",
                 ));
             }
         };
@@ -106,7 +161,7 @@ impl<'a> Cursor<'a> {
         let (bytes, remaining) = self
             .remaining
             .split_at_checked(length)
-            .ok_or_else(|| CodecError::new("inner join continuation is truncated"))?;
+            .ok_or_else(|| CodecError::new("equi-join continuation is truncated"))?;
         self.remaining = remaining;
         Ok(bytes)
     }
@@ -115,7 +170,7 @@ impl<'a> Cursor<'a> {
         let (bytes, remaining) = self
             .remaining
             .split_first_chunk::<N>()
-            .ok_or_else(|| CodecError::new("inner join continuation is truncated"))?;
+            .ok_or_else(|| CodecError::new("equi-join continuation is truncated"))?;
         self.remaining = remaining;
         Ok(*bytes)
     }
@@ -124,9 +179,7 @@ impl<'a> Cursor<'a> {
         if self.remaining.is_empty() {
             Ok(())
         } else {
-            Err(CodecError::new(
-                "inner join continuation has trailing bytes",
-            ))
+            Err(CodecError::new("equi-join continuation has trailing bytes"))
         }
     }
 }
@@ -134,6 +187,51 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_counts_codec_is_fixed_width_and_empty_counts_are_absent() {
+        let counts = KeyCounts([7, u64::MAX]);
+        let encoded = counts.encode_value().unwrap().as_ref().to_vec();
+        assert_eq!(
+            encoded,
+            [7_u64.to_be_bytes(), u64::MAX.to_be_bytes()].concat()
+        );
+        assert_eq!(
+            KeyCounts::decode_value(Cow::Borrowed(&encoded)).unwrap(),
+            counts
+        );
+        for length in 0..16 {
+            assert!(KeyCounts::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(KeyCounts::decode_value(Cow::Borrowed(&trailing)).is_err());
+        assert!(KeyCounts::decode_value(Cow::Borrowed(&[0; 16])).is_err());
+        assert!(KeyCounts::default().encode_value().is_err());
+    }
+
+    #[test]
+    fn key_counts_track_distinct_membership_without_summing_weights() {
+        let mut counts = KeyCounts::default();
+        counts.adjust(0, 0, u64::MAX).unwrap();
+        counts.adjust(0, 0, u64::MAX).unwrap();
+        counts.adjust(1, 0, 1).unwrap();
+        assert_eq!(counts, KeyCounts([2, 1]));
+        counts.adjust(0, u64::MAX, 1).unwrap();
+        assert_eq!(counts, KeyCounts([2, 1]));
+        counts.adjust(0, 1, 0).unwrap();
+        counts.adjust(0, u64::MAX, 0).unwrap();
+        counts.adjust(1, 1, 0).unwrap();
+        assert!(counts.is_empty());
+        assert!(matches!(
+            counts.adjust(0, 1, 0),
+            Err(EquiJoinError::KeyCountUnderflow)
+        ));
+        assert!(matches!(
+            KeyCounts([u64::MAX, 0]).adjust(0, 0, 1),
+            Err(EquiJoinError::KeyCountOverflow)
+        ));
+    }
 
     #[test]
     fn continuation_codec_is_strict_and_round_trips_empty_resume_key() {

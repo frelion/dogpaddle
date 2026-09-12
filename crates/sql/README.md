@@ -1,6 +1,6 @@
 # dogpaddle-sql
 
-`dogpaddle-sql` 是 DogPaddle 最上层的编译入口：它把一条受限的
+`dogpaddle-sql` 是 `DogPaddle` 最上层的编译入口：它把一条受限的
 `INSERT INTO sink(...) <query>` 编译成 `dogpaddle-flow` 已有的 Operation 和 Station，然后返回普通
 `Flow`。它不执行另一套 SQL 引擎，也不引入 Table、View、Catalog 或后台服务。
 
@@ -55,8 +55,8 @@ FlowFactory
 持久化 Flow
 ```
 
-DataFusion 只负责 SQL 解析、列解析和 type coercion（把兼容类型改写为明确的 cast）。它不会执行查询。
-SQL crate 把认可的 LogicalPlan 节点逐个 lower（翻译）为 `dogpaddle-operation` 的 Definition；真正执行
+`DataFusion` 只负责 SQL 解析、列解析和 type coercion（把兼容类型改写为明确的 cast）。它不会执行查询。
+SQL crate 把认可的 `LogicalPlan` 节点逐个 lower（翻译）为 `dogpaddle-operation` 的 Definition；真正执行
 仍由 `Flow::advance()` 完成。
 
 ### 2. 自动装配和融合规则
@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 `Flow::advance()` 每次执行一轮有界调度。它不会永久占住当前线程；宿主决定循环、等待、停止和重启节奏。
 
-磁盘中稳定编码的 Flow Definition 是恢复时的拓扑真相。SQL 文本、DataFusion LogicalPlan 和临时
+磁盘中稳定编码的 Flow Definition 是恢复时的拓扑真相。SQL 文本、DataFusion `LogicalPlan` 和临时
 Operation DAG 都不持久化。`open` 不重新编译查询，也不比较当前 Program 与磁盘中的查询、融合结果或
 非敏感 endpoint 身份；当前 Program 只是按 endpoint 次序提供临时运行资源。传错 Program 时，一部分
 声明可能被忽略，也可能因资源数量或类型不匹配而失败，不能把 `open` 当作身份校验。
@@ -198,7 +198,7 @@ SELECT ...
 普通 Station 输出，然后继续 CDC。`bootstrap_spool_bytes` 是必填的非零 `u64`；容量不足时当前
 delivery 不会 ACK，需要用更大容量和新状态目录重建。
 
-PostgreSQL CDC 的 spool 必须容纳完整快照及封口前观察到的 WAL 重叠；它要求预先创建 publication，
+`PostgreSQL` CDC 的 spool 必须容纳完整快照及封口前观察到的 WAL 重叠；它要求预先创建 publication，
 并使用首启前不存在、之后由该 Scan 独占的 slot。MySQL 的 spool 必须容纳完整快照，并发变化留在
 binlog 中，发布后再从封口位置继续；`replication_client_id` 必须是唯一的非零值，binlog 必须覆盖快照
 和追平期间。两个源当前都要求固定
@@ -213,40 +213,43 @@ Schema，不支持 TLS 或在线 DDL。更完整的 connector、快照和 Sink �
 - `CAST`、`TRY_CAST`、`CASE`，以及当前表达式层可绑定的比较、布尔和算术表达式；
 - `SELECT DISTINCT`；
 - `UNION ALL`；
-- `JOIN` / `INNER JOIN ... ON`，条件必须是一个或多个跨左右输入的等值表达式；
+- `JOIN` / `INNER JOIN`、`LEFT` / `RIGHT` / `FULL [OUTER] JOIN`，以及
+  `LEFT` / `RIGHT SEMI`、`LEFT` / `RIGHT ANTI JOIN`；
 - 非空 `GROUP BY`，以及 `COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；只有分组字段而没有聚合调用也合法。
 
-Join 的复合键只要一个分量为 `NULL` 就不匹配。v1 Join key 必须是两侧精确同类型、可 canonical 编码的
-扁平非浮点值。`SUM/AVG` 参数必须绑定为 `Int64` 或 `UInt64`；分组字段不能包含 `Float32/Float64`。
-`SELECT DISTINCT` 使用 DogPaddle 完整行 identity，浮点值按原始位模式区分。
+每个 Join 必须至少有一个跨左右输入的等值条件。`INNER JOIN` 允许把其他 `ON` 条件作为 fused Filter
+处理；Outer、Semi 和 Anti 只接受等值合取。Right Join 在 lowering 时交换输入，复用 Left 语义，再以
+同一 Station 内的 `SchemaAlign` 恢复 SQL 字段顺序。复合键只要一个分量为 `NULL` 就不匹配。v1 Join key
+必须是两侧精确同类型、可 canonical 编码的扁平非浮点值。`SUM/AVG` 参数必须绑定为 `Int64` 或 `UInt64`；分组字段不能包含 `Float32/Float64`。
+`SELECT DISTINCT` 使用 `DogPaddle` 完整行 identity，浮点值按原始位模式区分。
 
 在创建状态目录前会拒绝：
 
-- 普通表、外连接、Cross/Natural/Using Join、非等值 Join、不能化为等值合取的剩余条件和普通 `UNION`；
+- 普通表、Cross/Natural/Using Join、纯非等值 Join、Outer/Semi/Anti 的 residual 和普通 `UNION`；
 - `SELECT ALL`、`DISTINCT ON`、Sort、Limit、Window 和 Values；
 - 无分组的全局 Aggregate、grouping sets，以及聚合调用的 `DISTINCT`、`FILTER`、`ORDER BY` 和 null treatment；
 - 递归 CTE、标量或相关子查询、UDF、时间函数、随机函数和 session variable；
-- 没有明确 lowering 的其他 DataFusion LogicalPlan 节点。
+- 没有明确 lowering 的其他 `DataFusion` `LogicalPlan` 节点。
 
 SQL v1 有意只接受能准确映射到现有增量 Operation 的计划。具体类型和表达式矩阵以
 [`dogpaddle-operation`](../operation/README.md#表达式边界) 为准。
 
 ## 一个更真实的例子
 
-[`examples/fulfillment.sql`](examples/fulfillment.sql) 持续读取 PostgreSQL `sales.orders` 的 WAL，计算
-订单金额和折扣，筛选已付款订单，通过 `UNION ALL` 分配履约中心，再写入 PostgreSQL
+[`examples/fulfillment.sql`](examples/fulfillment.sql) 持续读取 `PostgreSQL` `sales.orders` 的 WAL，计算
+订单金额和折扣，筛选已付款订单，通过 `UNION ALL` 分配履约中心，再写入 `PostgreSQL`
 `ops.fulfillment_queue`。这个例子展示了三件事：
 
 - 多段 CTE 只是 SQL 的可读结构；能安全串联的转换仍会融合进同一 Station；
 - `UNION ALL` 和分叉会形成真实的持久边界；
-- CDC 和 PostgreSQL Sink 的连接配置在 build/open 时注入，恢复进度在 Flow 状态目录中。
+- CDC 和 `PostgreSQL` Sink 的连接配置在 build/open 时注入，恢复进度在 Flow 状态目录中。
 
-该程序的本机 PostgreSQL 崩溃恢复验收由根目录 `system-tests/postgres/check_sql.py` 执行。
+该程序的本机 `PostgreSQL` 崩溃恢复验收由根目录 `system-tests/postgres/check_sql.py` 执行。
 
 ## 从哪里开始读源码
 
 1. [`src/program.rs`](src/program.rs)：`SqlProgram` 的 parse/read/build/open 生命周期。
-2. [`src/lower.rs`](src/lower.rs)：DataFusion 规划，以及每种受支持节点如何变成 Operation。
+2. [`src/lower.rs`](src/lower.rs)：`DataFusion` 规划，以及每种受支持节点如何变成 Operation。
 3. [`src/compiler.rs`](src/compiler.rs)：临时 Operation DAG 和完整的 Station 融合规则。
 4. [`src/endpoint.rs`](src/endpoint.rs)：endpoint 参数、环境变量和运行资源。
 5. [`src/aggregate.rs`](src/aggregate.rs)：SQL 聚合名称到 Aggregate Operation 的唯一描述表。
@@ -262,5 +265,5 @@ cargo test -p dogpaddle-sql --doc
 ```
 
 correctness suite 覆盖 quickstart 的 build/open、确定性 Flow Definition、CTE 分叉、Station 融合、
-Join 后缀融合、Union、Distinct、Aggregate、参数错误和拒绝路径。真实 PostgreSQL CDC → SQL →
-PostgreSQL Sink gate 及全工作区规则见 [`TESTING.md`](../../TESTING.md)。
+五种底层 Join 语义、Right 改写、Inner residual 融合、Union、Distinct、Aggregate、参数错误和拒绝路径。真实 `PostgreSQL` CDC → SQL →
+`PostgreSQL` Sink gate 及全工作区规则见 [`TESTING.md`](../../TESTING.md)。

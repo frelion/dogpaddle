@@ -4,7 +4,7 @@ use dogpaddle_flow::{FlowError, FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition, OperationKind,
     operation::transform::{
-        AggregateDefinition, DistinctDefinition, FilterDefinition, InnerEquiJoinDefinition,
+        AggregateDefinition, DistinctDefinition, EquiJoinDefinition, FilterDefinition,
         SchemaAlignDefinition, UnionAllDefinition,
     },
 };
@@ -94,7 +94,7 @@ pub(crate) enum TransformDefinition {
     Aggregate(AggregateDefinition),
     Distinct(DistinctDefinition),
     Filter(FilterDefinition),
-    InnerEquiJoin(InnerEquiJoinDefinition),
+    EquiJoin(EquiJoinDefinition),
     SchemaAlign(SchemaAlignDefinition),
     UnionAll(UnionAllDefinition),
 }
@@ -117,9 +117,9 @@ impl From<FilterDefinition> for TransformDefinition {
     }
 }
 
-impl From<InnerEquiJoinDefinition> for TransformDefinition {
-    fn from(definition: InnerEquiJoinDefinition) -> Self {
-        Self::InnerEquiJoin(definition)
+impl From<EquiJoinDefinition> for TransformDefinition {
+    fn from(definition: EquiJoinDefinition) -> Self {
+        Self::EquiJoin(definition)
     }
 }
 
@@ -163,7 +163,7 @@ impl TransformDefinition {
             Self::Aggregate(definition) => definition,
             Self::Distinct(definition) => definition,
             Self::Filter(definition) => definition,
-            Self::InnerEquiJoin(definition) => definition,
+            Self::EquiJoin(definition) => definition,
             Self::SchemaAlign(definition) => definition,
             Self::UnionAll(definition) => definition,
         }
@@ -186,7 +186,7 @@ impl TransformDefinition {
             Self::Aggregate(definition) => factory.append(station, definition),
             Self::Distinct(definition) => factory.append(station, definition),
             Self::Filter(definition) => factory.append(station, definition),
-            Self::InnerEquiJoin(definition) => factory.append(station, definition),
+            Self::EquiJoin(definition) => factory.append(station, definition),
             Self::SchemaAlign(definition) => factory.append(station, definition),
             Self::UnionAll(definition) => factory.append(station, definition),
         }
@@ -302,7 +302,7 @@ impl TransformDefinition {
             Self::Aggregate(definition) => factory.station(id, definition),
             Self::Distinct(definition) => factory.station(id, definition),
             Self::Filter(definition) => factory.station(id, definition),
-            Self::InnerEquiJoin(definition) => factory.station(id, definition),
+            Self::EquiJoin(definition) => factory.station(id, definition),
             Self::SchemaAlign(definition) => factory.station(id, definition),
             Self::UnionAll(definition) => factory.station(id, definition),
         }

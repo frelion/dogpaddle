@@ -7,7 +7,7 @@ start → poll → 持久化 records + checkpoint → ack → poll → … → s
 ```
 
 这个 crate 只负责 Debezium、Kafka Connect records 和 offset。它不知道 Arrow、`Change`、Store、Operation
-或 Flow，也不把 PostgreSQL LSN、MySQL binlog position 等 connector 私有位置暴露给上层。
+或 Flow，也不把 `PostgreSQL` LSN、MySQL binlog position 等 connector 私有位置暴露给上层。
 
 ## 一批数据如何经过它
 
@@ -106,7 +106,7 @@ ACK 结果不确定时，Connector 会被标记为不可继续使用。调用方
 
 ## Checkpoint 为什么在 ACK 前产生
 
-Debezium 通常在处理完成时才写 offset，但 DogPaddle 必须先把“数据”和“读到哪里”放进自己的事务。
+Debezium 通常在处理完成时才写 offset，但 `DogPaddle` 必须先把“数据”和“读到哪里”放进自己的事务。
 Java bridge 因此新建一个 `OffsetStorageWriter`、只捕获写入的内存 store 和同规则的 Kafka Connect
 `JsonConverter`，预演当前批次会产生的原始 offset delta：
 
@@ -122,12 +122,12 @@ Checkpoint 绑定稳定的 engine name 和 connector class，可能包含多个 
 和 schema-history 责任仍由上层 Operation 保证。恢复时只读取显式传入的 checkpoint，不使用 Java offset 文件。
 
 ACK 成功表示 Engine handler 和 offset-store image 已经结算，不保证每个 connector 的外部进度标记立刻可见。
-例如 Debezium PostgreSQL 的 `confirmed_flush_lsn` 可能在后续 poll 或 stop 才推进；这是 WAL 保留和监控问题，
+例如 Debezium `PostgreSQL` 的 `confirmed_flush_lsn` 可能在后续 poll 或 stop 才推进；这是 WAL 保留和监控问题，
 不改变“records + checkpoint 先持久化”的正确性边界。
 
 ## Runtime bundle 与 JVM
 
-`DebeziumRuntime::open` 只接受 DogPaddle 构建的、平台对应的 runtime payload：
+`DebeziumRuntime::open` 只接受 `DogPaddle` 构建的、平台对应的 runtime payload：
 
 ```text
 dogpaddle-debezium-runtime-<target>/
@@ -141,9 +141,9 @@ dogpaddle-debezium-runtime-<target>/
 `open` 校验 target、Temurin release、必要运行文件、JAR 清单与 hash，并通过 bundle 内的绝对路径加载
 `libjvm`。它不会搜索 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java。
 
-一个进程最多只有一个 HotSpot JVM。再次打开同一个 canonical bundle path 会复用它；尝试打开另一个 bundle
+一个进程最多只有一个 `HotSpot` JVM。再次打开同一个 canonical bundle path 会复用它；尝试打开另一个 bundle
 会明确失败。`DebeziumRuntime` 被丢弃不会卸载 JVM：进程级 `OnceLock` 会让它存活到进程结束，也不能重新配置。
-DogPaddle 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
+`DogPaddle` 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
 bundle 必须在整个进程生命周期内保持不可修改，并安装在不受非信任用户写入的位置。
 
 支持的 payload target：
@@ -156,7 +156,7 @@ bundle 必须在整个进程生命周期内保持不可修改，并安装在不�
 Linux 目标要求 GNU/glibc，不支持 musl 或 Alpine。macOS archive 当前是未签名的开发产物；发布签名、
 notarization 和完整 native dependency closure 不属于这个 crate 当前的交付承诺。
 
-payload 只包含可复用的 Java runtime 与 Debezium distribution，不包含 DogPaddle executable 或测试 host；
+payload 只包含可复用的 Java runtime 与 Debezium distribution，不包含 `DogPaddle` executable 或测试 host；
 最终发布包由上层打包流程组合两者。
 
 ## 运行边界
@@ -176,7 +176,7 @@ payload 只包含可复用的 Java runtime 与 Debezium distribution，不包含
 `ConnectorConfig::max_delivery_bytes` 限制一次完成后跨 JNI 复制的编码 frame，默认 16 MiB。它不限制 JVM heap、
 connector 内部队列或数据库日志占用。单个 delivery 超限是终止性 connector 错误，需要调整配置并重启。
 
-Connector properties 中与 task、offset、commit、converter、SMT 和 DogPaddle 协议相关的 key 由 runtime 保留，
+Connector properties 中与 task、offset、commit、converter、SMT 和 `DogPaddle` 协议相关的 key 由 runtime 保留，
 调用方不能覆盖。错误只包含 runtime 控制的上下文，不回显 property value，避免泄露密码。
 
 应显式调用 `Connector::stop` 做确定性关闭。Drop 只请求 best-effort 后台清理，不等待 connector shutdown 和
@@ -187,8 +187,8 @@ engine name 注销完成；需要立即复用同一名字时必须先成功 stop
 这个 crate 只保存 offset，并不声称 offset 足以恢复所有 Debezium connector。需要 schema history 或额外启动协议的
 细节由具体 Operation 拥有：
 
-- PostgreSQL 试点不需要 schema history。
-- MySQL Scan 在公开数据前生成固定 seed checkpoint，普通运行以 `recovery` 模式从 seed 或更新的 checkpoint
+- `PostgreSQL` 试点不需要 schema history。
+- `MySQL` Scan 在公开数据前生成固定 seed checkpoint，普通运行以 `recovery` 模式从 seed 或更新的 checkpoint
   重建临时 `MemorySchemaHistory`。
 
 固定 Schema、binlog/WAL 保留、初始快照、通知记录和重置策略都属于
@@ -220,7 +220,7 @@ crates/debezium/scripts/build-runtime-bundle.sh x86_64-unknown-linux-gnu
 ```
 
 runtime bundle workflow 会在四个平台上验证完整生命周期：open、start、poll、丢弃后重投、ACK、stop、
-checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-tests/debezium-runtime/`；真实 PostgreSQL
+checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-tests/debezium-runtime/`；真实 `PostgreSQL`
 恢复矩阵由独立的 `system-tests/debezium-postgres/scripts/run.sh` 拥有。完整入口见
 [`TESTING.md`](../../TESTING.md)。
 

@@ -1,6 +1,6 @@
 # dogpaddle-operation
 
-这个 crate 定义 DogPaddle 的算子：数据从哪里来、如何变化、最后写到哪里。
+这个 crate 定义 `DogPaddle` 的算子：数据从哪里来、如何变化、最后写到哪里。
 
 第一次读代码时，可以先把一次查询看成下面这条链：
 
@@ -70,7 +70,7 @@ assert_eq!(binding.output_schema(), Some(&input));
 ```
 
 正常使用时不需要手工 materialize；`FlowFactory::build/open` 会完成这条路径。分阶段的价值在于：
-Schema 或运行资源不合法时，不会先创建一半 RocksDB 资源；reopen 也能从持久 Definition 和状态
+Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；reopen 也能从持久 Definition 和状态
 重新得到同一个执行实例。
 
 ## Schema 在这里意味着什么
@@ -82,8 +82,8 @@ Schema 或运行资源不合法时，不会先创建一半 RocksDB 资源；reop
 
 - Filter 要求谓词输出 Boolean，并保持输入 Schema。
 - Select 从同一个输入计算一组有序输出列。
-- UnionAll 要求所有输入 Schema 完全相同。
-- InnerEquiJoin 分别绑定左右键，要求每对键具有相同类型。
+- `UnionAll` 要求所有输入 Schema 完全相同。
+- `EquiJoin` 分别绑定左右键，要求每对键具有相同类型；具体 kind 决定输出列和 outer nullability。
 - Sink 检查目标系统能否无损表示全部输入列，并且没有输出 Schema。
 
 运行时收到的 `Change` 仍会与绑定时 Schema 比较。这样，磁盘 Definition、编译好的表达式和真实
@@ -108,14 +108,14 @@ Scan、Transform、Sink 是容易理解的业务角色；`OperationKind` 进一�
 首 Operation  ──>  Atomic  ──>  Atomic  ──> ...
 ```
 
-首项可以是 Scan、AtomicTransform 或 TurnTransform；后面只能追加单输入 AtomicTransform。
+首项可以是 Scan、AtomicTransform 或 TurnTransform；后面只能追加单输入 `AtomicTransform`。
 Station 内没有第二张拓扑图，中间结果也不写日志。最后一个 Operation 的输出才进入 Station 的
 持久日志。Exclusive 和 Sink 单独装配，所以外部副作用或必须固定结果的计算不会被错误地融合。
 
 具体 Definition 实例自己声明 kind。Filter、Extend、Select、SchemaAlign 和 Aggregate 会根据表达式
 分类：可重放的逐行 immutable 表达式可以成为 Atomic；仍受支持但需要单独边界的实例成为 Exclusive，
-其他表达式会在构造或 bind 时被拒绝。InnerEquiJoin 的 key 必须是 immutable；不满足时直接拒绝，
-不会退化成 Exclusive。`InnerEquiJoin` 是两输入 TurnTransform，可以分页完成一个输入，再把每一页
+其他表达式会在构造或 bind 时被拒绝。EquiJoin 的 key 必须是 immutable；不满足时直接拒绝，
+不会退化成 Exclusive。`EquiJoin` 是两输入 TurnTransform，可以分页完成一个输入，再把每一页
 交给后面的 Atomic 算子。
 
 ## 一次 Station 是怎样运行的
@@ -123,7 +123,7 @@ Station 内没有第二张拓扑图，中间结果也不写日志。最后一个
 假设 Station 是：
 
 ```text
-InnerEquiJoin ──> Filter ──> Project
+EquiJoin ──> Filter ──> Project
 ```
 
 运行时大致发生这些事：
@@ -196,7 +196,7 @@ Definition 通过稳定逻辑名称声明自己需要的持久数据，例如：
 ```text
 sequence_scan.position: Cell<u64>
 distinct.weights: OrderedMultiset<Vec<u8>>
-inner_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
+equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
 ```
 
 Flow 在路径中加入 Station 和 Operation 序号，然后统一创建或打开这些对象。具体算子只得到
@@ -204,7 +204,7 @@ Flow 在路径中加入 Station 和 Operation 序号，然后统一创建或打�
 缺失、类型错误和多余的数据实例。
 
 某些外部算子的密码、网络访问参数和临时客户端配置属于 `RuntimeResource`。它们每次 build/open 由
-调用方重新注入，不进入 Store；非敏感 source/target identity、固定 Schema 和 SQLite 路径等稳定信息
+调用方重新注入，不进入 Store；非敏感 source/target identity、固定 Schema 和 `SQLite` 路径等稳定信息
 仍保存在 Definition。资源使用精确 Rust 类型匹配；普通算子必须收到空资源。只有 Station 首项可以
 获得运行资源，因此可融合的 Atomic 尾项始终是纯粹的本地计算。
 
@@ -232,9 +232,9 @@ MIN/MAX 把候选值放进有序分区，直接读第一个或最后一个值。
 v1 要求至少一个分组表达式，且分组键不能包含浮点值。COUNT 可以统计受支持表达式的 non-null 值，
 包括浮点列；SUM/AVG 只接受整数，MIN/MAX 只接受扁平非浮点值。不支持 global aggregate 和嵌套 MIN/MAX。
 
-### InnerEquiJoin：左右各一本按连接键分类的账本
+### EquiJoin：一套状态覆盖五种关系语义
 
-`InnerEquiJoin` 维护：
+`EquiJoin` 维护：
 
 ```text
 left_rows[join key]  = 左侧完整行及各自权重
@@ -244,10 +244,19 @@ right_rows[join key] = 右侧完整行及各自权重
 左侧来一行时，它查右侧同 key 的所有行，输出 diff 为“输入 diff × 对侧权重”的组合；右侧输入
 完全对称。复合 key 任一分量为 NULL 时不匹配，但原行仍进入本侧账本，以便以后精确撤回。
 
+Definition 用 `EquiJoinKind` 选择 `Inner`、`LeftSemi`、`LeftAnti`、`LeftOuter` 或 `FullOuter`。
+Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 nullability。除 Inner 外，运行时再维护
+一份 `key_counts`，只记录每个 key 在左右各有多少种不同完整行：它用来识别“第一个匹配出现”和
+“最后一个匹配消失”，从而精确撤回或补回 null-extended row。重复行权重仍只保存在左右 row state，
+不会膨胀这份计数。
+
 热点 key 可能产生非常大的结果，所以 Join 用持久 continuation 分页：Probe 先验证这批输入的全部
 匹配都能安全计算，Emit 再分页产生真正输出。一个输入 Change 完成前，Station 固定当前端口；reopen
-可以从已提交页继续。分页限制单页工作量，但不限制整个 Join 关系的磁盘大小，也无法消除连接结果
-本身的高 fan-out 成本。
+可以从已提交页继续。`TURN_ITEMS` 和 `TURN_BYTES` 当前以 256 项和 4 MiB 作为常规单 turn 的工作软预算；
+若首个 Store item 自身更大，空 turn 会单独处理它以保证继续前进。这两个预算不限制完整 Claim 的瞬态
+内存：Station 已持有整个输入 Change，EquiJoin 还会为整批建立 row、value 和 key 的 `PreparedClaim`
+缓存，因此峰值至少是 `O(Claim)`，也可能超过 4 MiB。分页同样不限制整个 Join 关系的磁盘大小，无法
+消除连接结果本身的高 fan-out 成本。
 
 ## 内建算子索引
 
@@ -265,13 +274,13 @@ right_rows[join key] = 右侧完整行及各自权重
 | `Select` (7) | Atomic 或 Exclusive / 1 | 从同一输入计算完整有序输出列 | 无 |
 | `UnionAll` (8) | Atomic / N | 原样转发 Schema 完全相同的各端口 Change | 无 |
 | `SchemaAlign` (9) | Atomic 或 Exclusive / 1 | 显式产生目标字段与 metadata | 无 |
-| `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 SQLite STRICT 表 | `relation_sink.state: Cell<Vec<u8>>` |
-| `PostgresCdcScan` (11) | Scan / 0 | PostgreSQL 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 PostgreSQL | `relation_sink.state: Cell<Vec<u8>>` |
+| `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 `SQLite` STRICT 表 | `relation_sink.state: Cell<Vec<u8>>` |
+| `PostgresCdcScan` (11) | Scan / 0 | `PostgreSQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
+| `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 `PostgreSQL` | `relation_sink.state: Cell<Vec<u8>>` |
 | `Distinct` (13) | Atomic / 1 | 把任意正权重关系变成集合边界变化 | `distinct.weights: OrderedMultiset` |
 | `Aggregate` (14) | Atomic 或 Exclusive / 1 | 增量维护非空分组聚合 | groups、entries、control |
-| `MySqlCdcScan` (15) | Scan / 0 | MySQL 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `InnerEquiJoin` (16) | Turn / 2 | 增量维护两输入内等值连接 | left rows、right rows、continuation |
+| `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
+| `EquiJoin` (16) | Turn / 2 | 增量维护 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 另有 key counts |
 
 源码按业务角色放在 [`operation/scan/`](src/operation/scan/)、
 [`operation/transform/`](src/operation/transform/) 和
@@ -280,12 +289,12 @@ right_rows[join key] = 右侧完整行及各自权重
 
 ## 表达式边界
 
-Filter、Extend、Select、SchemaAlign、Aggregate 和 InnerEquiJoin 直接接收 DataFusion `Expr`。
+Filter、Extend、Select、SchemaAlign、Aggregate 和 `EquiJoin` 直接接收 `DataFusion` `Expr`。
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
-字段名逐字引用；`col` 使用 DataFusion 自己的 identifier 规则。
+字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
 
 Definition 构造时立即把表达式编码并解码为 canonical protobuf；bind 时再针对 exact input Schema
-生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 DataFusion 提供。
+生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 `DataFusion` 提供。
 Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要显式 `cast`。
 
 当前产品证据覆盖以下纵向切片：
@@ -293,19 +302,19 @@ Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要�
 | 状态 | 能力 |
 | --- | --- |
 | 已承诺 | 精确列引用、Boolean predicate、`UInt64` 同类型 equality、`UInt64 → Utf8` 显式 cast |
-| 已承诺的时间/Decimal 切片 | Date32、无 timezone 的 Millisecond Timestamp、`Decimal128(10,2)` 的直接复制、同类型比较，以及 SchemaAlign 中已测试的显式 cast |
-| DataFusion 可能支持但 DogPaddle 尚未承诺 | 未经 Definition codec、exact bind、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
+| 已承诺的时间/Decimal 切片 | Date32、无 timezone 的 Millisecond Timestamp、`Decimal128(10,2)` 的直接复制、同类型比较，以及 `SchemaAlign` 中已测试的显式 cast |
+| `DataFusion` 可能支持但 `DogPaddle` 尚未承诺 | 未经 Definition codec、exact bind、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
 | 明确拒绝 | 无法 canonical protobuf roundtrip、字段缺失或歧义、Filter 非 Boolean、隐式 coercion、运行时 Schema 漂移 |
 
 只有逐行 immutable scalar 表达式可以融合。Stable、Volatile、placeholder、subquery、
 aggregate/window、unnest 和外部引用等实例需要独立持久边界，或在构造/bind 时被拒绝。
 
-Expr protobuf 与精确 pin 的 DataFusion 版本绑定。升级 DataFusion 时必须审查 roundtrip、physical
+Expr protobuf 与精确 pin 的 `DataFusion` 版本绑定。升级 `DataFusion` 时必须审查 roundtrip、physical
 planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库直接删除重建。
 
 ## 外部端点边界
 
-PostgreSQL CDC Scan 会把初始快照和封口前观察到的 WAL 重叠写入私有
+`PostgreSQL` CDC Scan 会把初始快照和封口前观察到的 WAL 重叠写入私有
 `bootstrap_spool: Queue<Vec<u8>>`，因此 spool 必须容纳两者。MySQL Scan 的 spool 只保存完整快照；
 并发变化留在 binlog，binlog 必须覆盖快照、发布和追平阶段。封口后，两者都把 spool 逐条发布到
 Station output，再进入持续流阶段。spool 容量是硬限制；超限的 delivery 不提交也不 ACK。
@@ -313,11 +322,11 @@ Station output，再进入持续流阶段。spool 容量是硬限制；超限的
 两个 CDC Scan 都固定单表 Schema，运行中不支持在线 DDL、TLS 或跨实例 fencing。捕获阶段 reopen
 会清理未完成快照并从头再做，不从半个快照继续。
 
-SQLite 与 PostgreSQL Sink 共用关系写入协议：先在 Store 中持久化至多 1024 个具体 mutation，
+`SQLite` 与 `PostgreSQL` Sink 共用关系写入协议：先在 Store 中持久化至多 1024 个具体 mutation，
 提交后在目标数据库的一个事务中按稳定 `$dogpaddle.id` 幂等执行，下一 turn 再结算输入。目标已经
 提交而本地尚未结算时会重投当前批次。
 
-SQLite Sink 只接受新的非保留目标表和绝对 UTF-8 文件路径。PostgreSQL Sink 要求调用方每次注入
+`SQLite` Sink 只接受新的非保留目标表和绝对 UTF-8 文件路径。PostgreSQL Sink 要求调用方每次注入
 连接配置，Definition 只保存 discovery 得到的非敏感 target spec；当前不支持 DNS endpoint、TLS、
 共享目标或在线 Schema evolution。真实数据库限制和恢复证据见对应 correctness 与 system test。
 
@@ -330,7 +339,7 @@ SQLite Sink 只接受新的非保留目标表和绝对 UTF-8 文件路径。Post
 ```
 
 tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
-GroupState 与 JoinContinuation 等状态 codec、collection 的 key/value codec，以及 Flow 加上的
+`GroupState` 与 `JoinContinuation` 等状态 codec、collection 的 key/value codec，以及 Flow 加上的
 Station/Operation 序号路径共同构成当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash 还是
 远端布局 ABI。decoder 表在
 [`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
@@ -346,7 +355,7 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 建议先读最小的 [`Project`](src/operation/transform/project.rs)，再读带状态的
 [`Distinct`](src/operation/transform/distinct.rs)；需要分页时读
-[`InnerEquiJoin`](src/operation/transform/inner_join/)，需要外部恢复协议时读
+[`EquiJoin`](src/operation/transform/equi_join/)，需要外部恢复协议时读
 [`queue_scan`](examples/support/queue_scan.rs)。
 
 新增实现应依次完成：
@@ -373,8 +382,8 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 - Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
   [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
 
-`Aggregate` 的 MIN/MAX 有 owner benchmark；其他组合性能由真正拥有 workload 的 Flow、Store 或
-Change + Store target 负责。
+`Aggregate` 的 MIN/MAX 与 `EquiJoin` 的 match/presence transition 各有 owner benchmark；其他组合
+性能由真正拥有 workload 的 Flow、Store 或 Change + Store target 负责。
 
 ```bash
 cargo test -p dogpaddle-operation
@@ -382,6 +391,7 @@ cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 cargo test -p dogpaddle-operation --benches
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
 ```
 
 全工作区测试所有权和性能口径见 [`TESTING.md`](../../TESTING.md)。

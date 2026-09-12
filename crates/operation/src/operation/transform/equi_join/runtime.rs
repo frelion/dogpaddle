@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    InnerEquiJoinError,
-    state::{Continuation, JoinContinuation, Phase, Rows},
+    EquiJoinError, EquiJoinKind,
+    state::{Continuation, Counts, JoinContinuation, KeyCounts, Phase, Rows},
 };
 
 const TURN_ITEMS: usize = 256;
@@ -34,25 +34,43 @@ pub(super) struct BoundKeyPair {
     pub(super) right: BoundKey,
 }
 
-/// Materialized, exact-Schema inner equality join.
+/// Materialized, exact-Schema equality join.
 ///
 /// The runtime keeps both input relations in private durable multisets. A
 /// durable continuation first validates every match for the pinned input
 /// Change, then emits bounded pages. This makes output-difference overflow and
 /// corrupt stored rows fail before any page from that Change is published.
-pub struct InnerEquiJoinOperation {
-    input_schemas: [SchemaRef; 2],
-    output_schema: SchemaRef,
-    keys: Box<[BoundKeyPair]>,
-    left_rows: Rows,
-    right_rows: Rows,
-    continuation: Continuation,
-    prepared: Option<PreparedClaim>,
+pub struct EquiJoinOperation {
+    pub(super) kind: EquiJoinKind,
+    pub(super) input_schemas: [SchemaRef; 2],
+    pub(super) output_schema: SchemaRef,
+    pub(super) keys: Box<[BoundKeyPair]>,
+    pub(super) nulls: [Vec<ScalarValue>; 2],
+    pub(super) left_rows: Rows,
+    pub(super) right_rows: Rows,
+    pub(super) continuation: Continuation,
+    pub(super) key_counts: Option<Counts>,
+    pub(super) prepared: Option<PreparedClaim>,
 }
 
-struct PreparedClaim {
+pub(super) struct PreparedClaim {
     port: usize,
     rows: Vec<PreparedRow>,
+    effects: Option<Vec<RowEffect>>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum KeyTransition {
+    #[default]
+    None,
+    First,
+    Last,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RowEffect {
+    matched: bool,
+    transition: KeyTransition,
 }
 
 struct PreparedRow {
@@ -94,32 +112,13 @@ impl BoundKeyPair {
     }
 }
 
-impl InnerEquiJoinOperation {
-    pub(super) fn new_bound(
-        input_schemas: [SchemaRef; 2],
-        output_schema: SchemaRef,
-        keys: Box<[BoundKeyPair]>,
-        left_rows: Rows,
-        right_rows: Rows,
-        continuation: Continuation,
-    ) -> Self {
-        Self {
-            input_schemas,
-            output_schema,
-            keys,
-            left_rows,
-            right_rows,
-            continuation,
-            prepared: None,
-        }
-    }
-
-    fn validate_input(&self, input: OperationInput<'_>) -> Result<(), InnerEquiJoinError> {
+impl EquiJoinOperation {
+    fn validate_input(&self, input: OperationInput<'_>) -> Result<(), EquiJoinError> {
         if input.port >= self.input_schemas.len() {
-            return Err(InnerEquiJoinError::InvalidInputPort { port: input.port });
+            return Err(EquiJoinError::InvalidInputPort { port: input.port });
         }
         if input.change.schema().as_ref() != self.input_schemas[input.port].as_ref() {
-            return Err(InnerEquiJoinError::InputSchemaMismatch { port: input.port });
+            return Err(EquiJoinError::InputSchemaMismatch { port: input.port });
         }
         Ok(())
     }
@@ -134,7 +133,7 @@ impl InnerEquiJoinOperation {
                 pair.for_port(input.port)
                     .expression
                     .evaluate(records)
-                    .map_err(|source| InnerEquiJoinError::KeyExpression {
+                    .map_err(|source| EquiJoinError::KeyExpression {
                         port: input.port,
                         key,
                         source,
@@ -145,7 +144,7 @@ impl InnerEquiJoinOperation {
         let mut rows = Vec::with_capacity(input.change.num_rows());
         for index in 0..input.change.num_rows() {
             let row = canonical_row(records, index)
-                .map_err(|source| InnerEquiJoinError::CanonicalRow { source })?;
+                .map_err(|source| EquiJoinError::CanonicalRow { source })?;
             let values = records
                 .columns()
                 .iter()
@@ -157,7 +156,7 @@ impl InnerEquiJoinOperation {
                 let bound = pair.for_port(input.port);
                 matchable &= !column.is_null(index);
                 encode_canonical(&bound.field, column.as_ref(), index, "key", &mut key).map_err(
-                    |source| InnerEquiJoinError::CanonicalRow {
+                    |source| EquiJoinError::CanonicalRow {
                         source: Box::new(source),
                     },
                 )?;
@@ -173,20 +172,20 @@ impl InnerEquiJoinOperation {
         Ok(PreparedClaim {
             port: input.port,
             rows,
+            effects: None,
         })
     }
 
     fn apply_claim(
         &self,
-        claim: &PreparedClaim,
+        claim: &mut PreparedClaim,
         access: TransactionAccess<'_>,
-    ) -> Result<Action, InnerEquiJoinError> {
+    ) -> Result<Action, EquiJoinError> {
         let mut continuation = self.continuation.access(access)?;
         let mut state = if let Some(state) = continuation.get()? {
             Self::validate_continuation(claim, &state)?;
             state
         } else {
-            self.preflight_admission(claim, access)?;
             JoinContinuation {
                 port: u8::try_from(claim.port).expect("the two validated Join ports fit in a byte"),
                 phase: Phase::Probe,
@@ -194,13 +193,27 @@ impl InnerEquiJoinOperation {
                 resume_after: None,
             }
         };
+        if claim.effects.is_none() {
+            // Probe has not changed either relation. Emit has committed only
+            // earlier rows, so reopen simulates the still-unapplied suffix.
+            let start = match state.phase {
+                Phase::Probe => 0,
+                Phase::Emit => usize::try_from(state.row)
+                    .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?,
+            };
+            claim.effects = Some(self.preflight_admission(claim, start, access)?);
+        }
 
         let mut budget = TurnBudget::new();
         let mut output = OutputRows::new(self.output_schema.fields().len());
         loop {
             let row_index = usize::try_from(state.row)
-                .map_err(|_| InnerEquiJoinError::InvalidContinuation("row exceeds usize"))?;
+                .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?;
             let row = &claim.rows[row_index];
+            let effect = claim
+                .effects
+                .as_ref()
+                .expect("the Claim has been preflighted")[row_index];
             if !budget.can_start(row) {
                 continuation.set(&state)?;
                 return Ok(Action::Commit(output.finish(&self.output_schema)?));
@@ -208,6 +221,7 @@ impl InnerEquiJoinOperation {
             let Some(page) = self.scan_matches(
                 claim.port,
                 row,
+                effect,
                 state.resume_after.as_ref(),
                 &budget,
                 access,
@@ -216,17 +230,20 @@ impl InnerEquiJoinOperation {
                 continuation.set(&state)?;
                 return Ok(Action::Commit(output.finish(&self.output_schema)?));
             };
-            if !budget.can_accept(row, &page.entries) {
+            let work = self.output_work(claim.port, row, effect, &page.entries);
+            if !budget.can_accept(work) {
                 continuation.set(&state)?;
                 return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
             match state.phase {
-                Phase::Probe => self.validate_output_page(claim.port, row, &page.entries)?,
+                Phase::Probe => {
+                    self.validate_output_page(claim.port, row, effect, &page.entries)?;
+                }
                 Phase::Emit => {
-                    self.append_output_page(claim.port, row, &page.entries, &mut output)?;
+                    self.append_output_page(claim.port, row, effect, &page.entries, &mut output)?;
                 }
             }
-            budget.charge(row, &page.entries);
+            budget.charge(work);
 
             if let Some(resume_after) = page.continuation {
                 state.resume_after = Some(resume_after);
@@ -273,11 +290,19 @@ impl InnerEquiJoinOperation {
     fn preflight_admission(
         &self,
         claim: &PreparedClaim,
+        start: usize,
         access: TransactionAccess<'_>,
-    ) -> Result<(), InnerEquiJoinError> {
+    ) -> Result<Vec<RowEffect>, EquiJoinError> {
         let mut shadow = HashMap::<(&[u8], &[u8]), u64>::new();
+        let mut key_shadow = HashMap::<&[u8], KeyCounts>::new();
+        let counts = self
+            .key_counts
+            .as_ref()
+            .map(|counts| counts.access(access))
+            .transpose()?;
         let mut own_rows = self.rows(claim.port).access(access)?;
-        for row in &claim.rows {
+        let mut effects = vec![RowEffect::default(); claim.rows.len()];
+        for (row, effect) in claim.rows[start..].iter().zip(&mut effects[start..]) {
             let identity = (row.key.as_slice(), row.row.as_slice());
             let weight = match shadow.entry(identity) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -286,31 +311,51 @@ impl InnerEquiJoinOperation {
                     entry.insert(current)
                 }
             };
-            *weight = adjusted_weight(*weight, row.difference)?;
+            let before = *weight;
+            *weight = adjusted_weight(before, row.difference)?;
+            effect.matched = row.matchable;
+            if row.matchable
+                && let Some(counts) = &counts
+            {
+                let counts = match key_shadow.entry(&row.key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(counts.get(&row.key)?.unwrap_or_default())
+                    }
+                };
+                let key_before = counts.0[claim.port];
+                effect.matched &= counts.0[1 - claim.port] > 0;
+                counts.adjust(claim.port, before, *weight)?;
+                effect.transition = match (key_before == 0, counts.0[claim.port] == 0) {
+                    (true, false) => KeyTransition::First,
+                    (false, true) => KeyTransition::Last,
+                    _ => KeyTransition::None,
+                };
+            }
         }
-        Ok(())
+        Ok(effects)
     }
 
     fn validate_continuation(
         claim: &PreparedClaim,
         state: &JoinContinuation,
-    ) -> Result<(), InnerEquiJoinError> {
+    ) -> Result<(), EquiJoinError> {
         if usize::from(state.port) != claim.port {
-            return Err(InnerEquiJoinError::InvalidContinuation(
+            return Err(EquiJoinError::InvalidContinuation(
                 "port differs from the pinned input",
             ));
         }
         let row = usize::try_from(state.row)
             .ok()
             .filter(|row| *row < claim.rows.len())
-            .ok_or(InnerEquiJoinError::InvalidContinuation(
+            .ok_or(EquiJoinError::InvalidContinuation(
                 "row is outside the pinned input",
             ))?;
         if state.resume_after.is_none() {
             return Ok(());
         }
         if !claim.rows[row].matchable {
-            return Err(InnerEquiJoinError::InvalidContinuation(
+            return Err(EquiJoinError::InvalidContinuation(
                 "NULL key has an opposite-row cursor",
             ));
         }
@@ -321,11 +366,15 @@ impl InnerEquiJoinOperation {
         &self,
         port: usize,
         row: &PreparedRow,
+        effect: RowEffect,
         resume_after: Option<&Vec<u8>>,
         budget: &TurnBudget,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<MultisetPage<Vec<u8>>>, InnerEquiJoinError> {
-        if !row.matchable {
+    ) -> Result<Option<MultisetPage<Vec<u8>>>, EquiJoinError> {
+        if !effect.matched
+            || (self.kind.left_only()
+                && (port == 0 || matches!(effect.transition, KeyTransition::None)))
+        {
             return Ok(Some(MultisetPage {
                 entries: Vec::new(),
                 continuation: None,
@@ -333,7 +382,10 @@ impl InnerEquiJoinOperation {
         }
         let mut opposite = self.rows(1 - port).access(access)?;
         let partition = opposite.partition(&row.key)?;
-        let max_items = budget.max_scan_items(row);
+        let expanded =
+            self.kind.preserves(1 - port) && !matches!(effect.transition, KeyTransition::None);
+        let repeats_input = !(self.kind.left_only() && port == 1);
+        let max_items = budget.max_scan_items(row, expanded, repeats_input);
         let max_bytes = budget.scan_bytes();
         let limit =
             ScanLimit::new(max_items, max_bytes).expect("positive Join page limits are valid");
@@ -357,10 +409,11 @@ impl InnerEquiJoinOperation {
         &self,
         port: usize,
         input: &PreparedRow,
+        effect: RowEffect,
         matches: &[MultisetEntry<Vec<u8>>],
-    ) -> Result<(), InnerEquiJoinError> {
+    ) -> Result<(), EquiJoinError> {
         let mut output = OutputRows::new(self.output_schema.fields().len());
-        self.append_output_page(port, input, matches, &mut output)?;
+        self.append_output_page(port, input, effect, matches, &mut output)?;
         output.finish(&self.output_schema).map(|_| ())
     }
 
@@ -368,27 +421,101 @@ impl InnerEquiJoinOperation {
         &self,
         port: usize,
         input: &PreparedRow,
+        effect: RowEffect,
         matches: &[MultisetEntry<Vec<u8>>],
         output: &mut OutputRows,
-    ) -> Result<(), InnerEquiJoinError> {
+    ) -> Result<(), EquiJoinError> {
+        if self.kind.left_only() {
+            return self.append_existence_output(port, input, effect, matches, output);
+        }
+        if matches.is_empty() && !effect.matched && self.kind.preserves(port) {
+            self.append_padded(port, &input.values, input.difference, output);
+        }
         let opposite_schema = &self.input_schemas[1 - port];
         for matched in matches {
             let opposite =
                 decode_canonical_row(opposite_schema, &matched.key).map_err(|source| {
-                    InnerEquiJoinError::CanonicalRow {
+                    EquiJoinError::CanonicalRow {
                         source: Box::new(source),
                     }
                 })?;
-            let difference = i128::from(input.difference) * i128::from(matched.multiplicity);
-            let difference = i64::try_from(difference)
-                .map_err(|_| InnerEquiJoinError::OutputDifferenceOverflow)?;
+            let difference =
+                output_difference(i128::from(input.difference) * i128::from(matched.multiplicity))?;
+            // A match and its NULL-row correction share one cursor position
+            // and transaction, including when both have identical values.
+            if self.kind.preserves(1 - port) && matches!(effect.transition, KeyTransition::First) {
+                self.append_padded(
+                    1 - port,
+                    &opposite,
+                    output_difference(-i128::from(matched.multiplicity))?,
+                    output,
+                );
+            }
             if port == 0 {
                 output.push(&input.values, &opposite, difference);
             } else {
                 output.push(&opposite, &input.values, difference);
             }
+            if self.kind.preserves(1 - port) && matches!(effect.transition, KeyTransition::Last) {
+                self.append_padded(
+                    1 - port,
+                    &opposite,
+                    output_difference(i128::from(matched.multiplicity))?,
+                    output,
+                );
+            }
         }
         Ok(())
+    }
+
+    fn append_existence_output(
+        &self,
+        port: usize,
+        input: &PreparedRow,
+        effect: RowEffect,
+        matches: &[MultisetEntry<Vec<u8>>],
+        output: &mut OutputRows,
+    ) -> Result<(), EquiJoinError> {
+        let semi = self.kind == EquiJoinKind::LeftSemi;
+        if port == 0 {
+            if effect.matched == semi {
+                output.push(&input.values, &[], input.difference);
+            }
+            return Ok(());
+        }
+        let sign = match effect.transition {
+            KeyTransition::First => 1_i128,
+            KeyTransition::Last => -1,
+            KeyTransition::None => return Ok(()),
+        } * if semi { 1 } else { -1 };
+        for matched in matches {
+            let left =
+                decode_canonical_row(&self.input_schemas[0], &matched.key).map_err(|source| {
+                    EquiJoinError::CanonicalRow {
+                        source: Box::new(source),
+                    }
+                })?;
+            output.push(
+                &left,
+                &[],
+                output_difference(sign * i128::from(matched.multiplicity))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn append_padded(
+        &self,
+        port: usize,
+        values: &[ScalarValue],
+        difference: i64,
+        output: &mut OutputRows,
+    ) {
+        if port == 0 {
+            output.push(values, &self.nulls[1], difference);
+        } else {
+            output.push(&self.nulls[0], values, difference);
+        }
     }
 
     fn adjust_own_row(
@@ -396,13 +523,50 @@ impl InnerEquiJoinOperation {
         port: usize,
         row: &PreparedRow,
         access: TransactionAccess<'_>,
-    ) -> Result<(), InnerEquiJoinError> {
-        self.rows(port)
+    ) -> Result<(), EquiJoinError> {
+        let change = self
+            .rows(port)
             .access(access)?
             .partition(&row.key)?
             .adjust(&row.row, row.difference)
-            .map(|_| ())
-            .map_err(map_weight_error)
+            .map_err(map_weight_error)?;
+        if row.matchable
+            && let Some(counts) = &self.key_counts
+            && (change.before() == 0) != (change.after() == 0)
+        {
+            let mut counts = counts.access(access)?;
+            let mut value = counts.get(&row.key)?.unwrap_or_default();
+            value.adjust(port, change.before(), change.after())?;
+            if value.is_empty() {
+                counts.remove(&row.key)?;
+            } else {
+                counts.put(&row.key, &value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn output_work(
+        &self,
+        port: usize,
+        row: &PreparedRow,
+        effect: RowEffect,
+        matches: &[MultisetEntry<Vec<u8>>],
+    ) -> (usize, usize) {
+        let repeats_input = !(self.kind.left_only() && port == 1);
+        let (mut items, mut bytes) = TurnBudget::work(row, matches, repeats_input);
+        if matches.is_empty() && self.kind.preserves(port) && !effect.matched {
+            bytes = bytes.saturating_add(self.nulls[1 - port].len());
+        } else if self.kind.preserves(1 - port) && !matches!(effect.transition, KeyTransition::None)
+        {
+            items = items.saturating_add(matches.len());
+            for matched in matches {
+                bytes = bytes
+                    .saturating_add(matched.key.len())
+                    .saturating_add(self.nulls[port].len());
+            }
+        }
+        (items, bytes)
     }
 
     fn rows(&self, port: usize) -> &Rows {
@@ -428,9 +592,16 @@ impl TurnBudget {
             && row.row.len().saturating_add(row.key.len()).max(1) <= self.remaining_bytes()
     }
 
-    fn max_scan_items(&self, row: &PreparedRow) -> usize {
-        let by_own_row = self.own_row_bytes() / row.row.len().max(1);
-        self.remaining_items().min(by_own_row.max(1))
+    fn max_scan_items(&self, row: &PreparedRow, expanded: bool, repeats_input: bool) -> usize {
+        let by_own_row = if repeats_input {
+            self.own_row_bytes() / row.row.len().max(1)
+        } else {
+            usize::MAX
+        };
+        let per_match = if expanded { 2 } else { 1 };
+        (self.remaining_items() / per_match)
+            .max(1)
+            .min(by_own_row.max(1))
     }
 
     fn scan_bytes(&self) -> usize {
@@ -453,29 +624,31 @@ impl TurnBudget {
         self.items == 0
     }
 
-    fn charge(&mut self, row: &PreparedRow, matches: &[MultisetEntry<Vec<u8>>]) {
-        let (items, bytes) = Self::work(row, matches);
+    fn charge(&mut self, (items, bytes): (usize, usize)) {
         self.items = self.items.saturating_add(items);
         self.bytes = self.bytes.saturating_add(bytes);
     }
 
-    fn can_accept(&self, row: &PreparedRow, matches: &[MultisetEntry<Vec<u8>>]) -> bool {
+    fn can_accept(&self, (items, bytes): (usize, usize)) -> bool {
         if self.is_empty() {
             return true;
         }
-        let (items, bytes) = Self::work(row, matches);
         self.items.saturating_add(items) <= TURN_ITEMS
             && self.bytes.saturating_add(bytes) <= TURN_BYTES
     }
 
-    fn work(row: &PreparedRow, matches: &[MultisetEntry<Vec<u8>>]) -> (usize, usize) {
+    fn work(
+        row: &PreparedRow,
+        matches: &[MultisetEntry<Vec<u8>>],
+        repeats_input: bool,
+    ) -> (usize, usize) {
         let items = matches.len().max(1);
         let bytes = if matches.is_empty() {
             row.row.len().saturating_add(row.key.len())
         } else {
             matches.iter().fold(row.key.len(), |bytes, matched| {
                 bytes
-                    .saturating_add(row.row.len())
+                    .saturating_add(if repeats_input { row.row.len() } else { 0 })
                     .saturating_add(matched.key.len())
             })
         };
@@ -487,23 +660,22 @@ impl TurnBudget {
     }
 }
 
-impl TurnOperation for InnerEquiJoinOperation {
+impl TurnOperation for EquiJoinOperation {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
-        let input =
-            input.ok_or_else(|| Box::new(InnerEquiJoinError::MissingInput) as OperationError)?;
+        let input = input.ok_or_else(|| Box::new(EquiJoinError::MissingInput) as OperationError)?;
         self.validate_input(input)?;
         if self.prepared.is_none() {
             self.prepared = Some(self.prepare_claim(input)?);
         }
-        let claim = self
+        let mut claim = self
             .prepared
             .take()
             .expect("the prepared Join Claim was initialized above");
         Ok(Turn::ready(move |access| {
-            let action = self.apply_claim(&claim, access)?;
+            let action = self.apply_claim(&mut claim, access)?;
             let complete = matches!(&action, Action::Complete(_));
             self.prepared = Some(claim);
             let after_commit = if complete {
@@ -519,27 +691,31 @@ impl TurnOperation for InnerEquiJoinOperation {
     }
 }
 
-fn adjusted_weight(weight: u64, difference: i64) -> Result<u64, InnerEquiJoinError> {
+fn adjusted_weight(weight: u64, difference: i64) -> Result<u64, EquiJoinError> {
     if difference > 0 {
         weight
             .checked_add(difference.unsigned_abs())
-            .ok_or(InnerEquiJoinError::WeightOverflow)
+            .ok_or(EquiJoinError::WeightOverflow)
     } else {
         weight
             .checked_sub(difference.unsigned_abs())
-            .ok_or(InnerEquiJoinError::NegativeWeight)
+            .ok_or(EquiJoinError::NegativeWeight)
     }
 }
 
-fn persistent_row(row: usize) -> Result<u64, InnerEquiJoinError> {
-    u64::try_from(row).map_err(|_| InnerEquiJoinError::InvalidContinuation("input row exceeds u64"))
+fn output_difference(difference: i128) -> Result<i64, EquiJoinError> {
+    i64::try_from(difference).map_err(|_| EquiJoinError::OutputDifferenceOverflow)
 }
 
-fn map_weight_error(error: StoreError) -> InnerEquiJoinError {
+fn persistent_row(row: usize) -> Result<u64, EquiJoinError> {
+    u64::try_from(row).map_err(|_| EquiJoinError::InvalidContinuation("input row exceeds u64"))
+}
+
+fn map_weight_error(error: StoreError) -> EquiJoinError {
     match error {
-        StoreError::MultiplicityUnderflow => InnerEquiJoinError::NegativeWeight,
-        StoreError::MultiplicityOverflow => InnerEquiJoinError::WeightOverflow,
-        source => InnerEquiJoinError::Store(source),
+        StoreError::MultiplicityUnderflow => EquiJoinError::NegativeWeight,
+        StoreError::MultiplicityOverflow => EquiJoinError::WeightOverflow,
+        source => EquiJoinError::Store(source),
     }
 }
 
@@ -559,7 +735,7 @@ impl OutputRows {
         self.differences.push(difference);
     }
 
-    fn finish(self, schema: &SchemaRef) -> Result<Option<Change>, InnerEquiJoinError> {
+    fn finish(self, schema: &SchemaRef) -> Result<Option<Change>, EquiJoinError> {
         if self.differences.is_empty() {
             return Ok(None);
         }

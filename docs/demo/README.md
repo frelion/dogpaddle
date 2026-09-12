@@ -14,7 +14,7 @@
 ## 录制
 
 需要 Rust 1.96、Python 3.9+、`uv`、本机 PostgreSQL 可执行文件，以及
-[固定版本的 Debezium runtime bundle](../../crates/debezium/README.md#runtime-bundle)。
+[固定版本的 Debezium runtime bundle](../../crates/debezium/README.md#runtime-bundle-与-jvm)。
 macOS 使用系统 Menlo 和 Hiragino Sans GB；Linux 使用 DejaVu Sans Mono 或 Liberation Mono，
 加 Noto Sans CJK。画面和视频编码只使用 Pillow 与 FFmpeg。
 

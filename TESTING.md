@@ -28,7 +28,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 ### Operation
 
-Operation 的公共测试采用垂直所有权：每个内建算子各有一个文件，自己拥有 literal golden、kind、data declaration、bind、materialize、runtime 和 reopen 证据。跨算子文件只保留：
+Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、kind、data declaration、bind、materialize、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
 
 - `definition_codec`：外层 envelope、unknown tag 和通用损坏拒绝；
 - `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
@@ -42,6 +42,12 @@ roundtrip、精确 output Schema、exact-row admission 的整 turn rollback、Fo
 MIN/MAX 首尾选择与 reopen，以及不变结果不产生冗余 output。函数 descriptor、argument tuple framing
 和 group state codec 属于 Operation 私有实现，不在 Flow 或 SQL 复制 oracle。
 
+EquiJoin 的 owner 文件必须用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 与 FullOuter，
+并证明 tag `16` 的 kind payload、Inner 三资源与其余 kind 四资源、NULL key、重复权重、同一 Claim 内的
+presence 往返、outer nullability、正负 diff 边界、分页 rollback 和 Probe/Emit reopen。SQL 只证明
+Right Join 的 swap + SchemaAlign、Inner residual 的 Atomic 尾链，以及每种新增 LogicalPlan lowering
+至少一个最终关系 witness，不复制 Join 状态机。
+
 ### Flow
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
@@ -54,18 +60,24 @@ SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,r
 
 SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言 build 或一次 advance 成功。Distinct witness 必须跨 drop/open，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/open；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 reopen 幂等重投；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 reopen 会丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
 
+Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 reopen；
+Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 必须证明 `EquiJoin → SchemaAlign → Filter`
+仍在一个 Transform Station；Outer/Semi/Anti residual、Cross/Natural/Using、纯非等值和同侧 equality 必须在创建 Flow 前拒绝。
+
 `system-tests/postgres/check_sql.py --trace-output ...` 可在完整验收通过后导出该场景的 SQL、
 宿主 I/O、SIGKILL、PostgreSQL 重放日志和关系快照，供 [持续 ETL 演示](docs/demo/README.md) 排版。
 启用 trace 时，还会追加 28 次有界连续源表变更，每次完整目标关系与原生 PostgreSQL SQL oracle
 核对，并记录推进前后快照。断言与故障边界仍由 SQL 系统验收拥有；视频间隔不作为性能证据。
 
-### 私有测试拆分
+### 测试分卷
 
 每个源码模块目录只有一个 `tests.rs` 入口。超大模块可在同目录的 `tests/` 下按完整领域拆分；不要按每个生产源码文件建立镜像目录。当前较大的分区为：
 
 - Station：`support`、`claim`、`transaction`；
 - Change codec：`support`、`schema`、`projection`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
 - SQLite Sink：`row`、`target`。
+- EquiJoin correctness：`family` 拥有五种关系语义与持久恢复，`inner_runtime` 拥有 Inner 热路径及 Join
+  分页/预算分支；literal golden 只在 `family`。
 
 ## 正确性证据准入
 
@@ -98,6 +110,7 @@ SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE�
 | `change_codec` | Change 自有五路旋转 runner |
 | `cell` | Criterion |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、重复 MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
+| `equi_join` | Operation 自有 Criterion：Inner first/last match、Semi 稳定与 first/last presence、Full Outer first/last transition；两个完整 Claim 的 Probe/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
 | `ordered_map` | Criterion；完整 owned-page 扫描 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
@@ -154,6 +167,7 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench ch
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```

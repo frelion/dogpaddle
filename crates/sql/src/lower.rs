@@ -19,10 +19,10 @@ use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
 use dogpaddle_operation::{
-    OperationDefinition,
+    OperationDefinition, OperationKind,
     operation::transform::{
-        AggregateCall, AggregateDefinition, DistinctDefinition, FilterDefinition,
-        InnerEquiJoinDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
+        AggregateCall, AggregateDefinition, DistinctDefinition, EquiJoinDefinition, EquiJoinKind,
+        FilterDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
     },
 };
 
@@ -172,6 +172,15 @@ struct LoweredRelation {
     physical_schema: SchemaRef,
 }
 
+type EquiJoinKey = (Expr, Expr);
+
+struct OrientedJoin {
+    kind: EquiJoinKind,
+    inputs: [LoweredRelation; 2],
+    keys: Vec<EquiJoinKey>,
+    source_order: Vec<usize>,
+}
+
 struct Lowerer {
     arena: LogicalArena,
     scans: Vec<Option<BuiltScan>>,
@@ -252,48 +261,26 @@ impl Lowerer {
     }
 
     fn lower_join(&mut self, join: &Join) -> Result<LoweredRelation, SqlError> {
-        if join.join_type != JoinType::Inner
-            || join.join_constraint != JoinConstraint::On
+        if join.join_constraint != JoinConstraint::On
             || join.null_equality != NullEquality::NullEqualsNothing
             || join.null_aware
         {
             return Err(SqlError::Unsupported("join type or semantics".to_owned()));
         }
 
-        let left = self.lower(&join.left)?;
-        let right = self.lower(&join.right)?;
-        let mut keys = Vec::with_capacity(join.on.len() + usize::from(join.filter.is_some()));
-        for (left_key, right_key) in &join.on {
-            keys.push(normalize_join_key(
-                left_key,
-                right_key,
-                join.left.schema(),
-                join.right.schema(),
-            )?);
-        }
-        if let Some(filter) = &join.filter {
-            for predicate in split_conjunction_owned(filter.clone()) {
-                let Expr::BinaryExpr(BinaryExpr {
-                    left: left_key,
-                    op: Operator::Eq,
-                    right: right_key,
-                }) = predicate
-                else {
-                    return Err(unsupported_join_condition());
-                };
-                keys.push(normalize_join_key(
-                    &left_key,
-                    &right_key,
-                    join.left.schema(),
-                    join.right.schema(),
-                )?);
-            }
-        }
-        if keys.is_empty() {
+        let (logical_keys, residuals) = collect_join_condition(join)?;
+        if logical_keys.is_empty() {
             return Err(unsupported_join_condition());
         }
+        if join.join_type != JoinType::Inner && !residuals.is_empty() {
+            return Err(SqlError::Unsupported(
+                "outer, semi, and anti JOIN residual predicates".to_owned(),
+            ));
+        }
 
-        let keys = keys
+        let left = self.lower(&join.left)?;
+        let right = self.lower(&join.right)?;
+        let keys = logical_keys
             .into_iter()
             .map(|(left_key, right_key)| {
                 Ok((
@@ -302,16 +289,33 @@ impl Lowerer {
                 ))
             })
             .collect::<Result<Vec<_>, SqlError>>()?;
-        let output_count = left
-            .physical_schema
-            .fields()
-            .len()
-            .checked_add(right.physical_schema.fields().len())
-            .ok_or_else(|| SqlError::invalid("JOIN output field count exceeds usize"))?;
-        let output_names = (0..output_count).map(internal_join_field_name);
-        let definition =
-            InnerEquiJoinDefinition::try_new(keys, output_names).map_err(SqlError::endpoint)?;
-        self.add_transform([left, right], definition)
+        let OrientedJoin {
+            kind,
+            inputs,
+            keys,
+            source_order,
+        } = orient_join(join.join_type, left, right, keys)?;
+        let output_count = source_order.len();
+        let definition = EquiJoinDefinition::try_new(
+            kind,
+            keys,
+            (0..output_count).map(internal_join_field_name),
+        )
+        .map_err(SqlError::endpoint)?;
+        let joined = self.add_transform(inputs, definition)?;
+        let joined = self.align_join_output(joined, join.schema.as_ref(), &source_order)?;
+
+        let Some(residual) = residuals.into_iter().reduce(Expr::and) else {
+            return Ok(joined);
+        };
+        let residual = rewrite_columns(residual, join.schema.as_ref(), &joined.physical_schema)?;
+        let filter = FilterDefinition::try_new(residual).map_err(SqlError::endpoint)?;
+        if !matches!(filter.kind(), OperationKind::AtomicTransform(_)) {
+            return Err(SqlError::Unsupported(
+                "INNER JOIN residual predicate that cannot be fused".to_owned(),
+            ));
+        }
+        self.add_transform([joined], filter)
     }
 
     fn lower_aggregate(&mut self, aggregate: &Aggregate) -> Result<LoweredRelation, SqlError> {
@@ -432,6 +436,43 @@ impl Lowerer {
         self.add_transform([input], definition)
     }
 
+    fn align_join_output(
+        &mut self,
+        input: LoweredRelation,
+        join_schema: &DFSchema,
+        source_order: &[usize],
+    ) -> Result<LoweredRelation, SqlError> {
+        if source_order.len() != join_schema.fields().len()
+            || source_order
+                .iter()
+                .any(|source| *source >= input.physical_schema.fields().len())
+        {
+            return Err(SqlError::invalid(
+                "DataFusion JOIN Schema and physical output shape diverged",
+            ));
+        }
+        let fields = source_order
+            .iter()
+            .zip(join_schema.fields())
+            .enumerate()
+            .map(|(index, (source, target))| {
+                SchemaAlignField::try_new_with_metadata(
+                    internal_join_field_name(index),
+                    Expr::Column(Column::new_unqualified(
+                        input.physical_schema.field(*source).name(),
+                    )),
+                    target.is_nullable(),
+                    target.metadata().clone(),
+                )
+                .map_err(SqlError::endpoint)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let definition =
+            SchemaAlignDefinition::try_new_with_metadata(fields, join_schema.metadata().clone())
+                .map_err(SqlError::endpoint)?;
+        self.add_transform([input], definition)
+    }
+
     fn add_transform<I, D>(&mut self, inputs: I, definition: D) -> Result<LoweredRelation, SqlError>
     where
         I: IntoIterator<Item = LoweredRelation>,
@@ -485,6 +526,111 @@ fn lower_aggregate_call(
         .collect::<Result<Vec<_>, _>>()?;
     lower_builtin_aggregate(func.name(), arguments)
         .ok_or_else(|| SqlError::Unsupported(format!("aggregate function {}", func.name())))
+}
+
+fn collect_join_condition(join: &Join) -> Result<(Vec<EquiJoinKey>, Vec<Expr>), SqlError> {
+    let mut keys = Vec::with_capacity(join.on.len() + usize::from(join.filter.is_some()));
+    for (left_key, right_key) in &join.on {
+        keys.push(normalize_join_key(
+            left_key,
+            right_key,
+            join.left.schema(),
+            join.right.schema(),
+        )?);
+    }
+
+    let mut residuals = Vec::new();
+    if let Some(filter) = &join.filter {
+        for predicate in split_conjunction_owned(filter.clone()) {
+            let key = match &predicate {
+                Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op: Operator::Eq,
+                    right,
+                }) => find_valid_equijoin_key_pair(
+                    left,
+                    right,
+                    join.left.schema(),
+                    join.right.schema(),
+                )?,
+                _ => None,
+            };
+            if let Some(key) = key {
+                keys.push(key);
+            } else {
+                residuals.push(predicate);
+            }
+        }
+    }
+    Ok((keys, residuals))
+}
+
+fn orient_join(
+    join_type: JoinType,
+    left: LoweredRelation,
+    right: LoweredRelation,
+    keys: Vec<EquiJoinKey>,
+) -> Result<OrientedJoin, SqlError> {
+    let left_count = left.physical_schema.fields().len();
+    let right_count = right.physical_schema.fields().len();
+    let oriented = match join_type {
+        JoinType::Inner => OrientedJoin {
+            kind: EquiJoinKind::Inner,
+            inputs: [left, right],
+            keys,
+            source_order: (0..left_count + right_count).collect(),
+        },
+        JoinType::Left => OrientedJoin {
+            kind: EquiJoinKind::LeftOuter,
+            inputs: [left, right],
+            keys,
+            source_order: (0..left_count + right_count).collect(),
+        },
+        JoinType::Full => OrientedJoin {
+            kind: EquiJoinKind::FullOuter,
+            inputs: [left, right],
+            keys,
+            source_order: (0..left_count + right_count).collect(),
+        },
+        JoinType::LeftSemi => OrientedJoin {
+            kind: EquiJoinKind::LeftSemi,
+            inputs: [left, right],
+            keys,
+            source_order: (0..left_count).collect(),
+        },
+        JoinType::LeftAnti => OrientedJoin {
+            kind: EquiJoinKind::LeftAnti,
+            inputs: [left, right],
+            keys,
+            source_order: (0..left_count).collect(),
+        },
+        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+            let (kind, output_count) = match join_type {
+                JoinType::Right => (EquiJoinKind::LeftOuter, left_count + right_count),
+                JoinType::RightSemi => (EquiJoinKind::LeftSemi, right_count),
+                JoinType::RightAnti => (EquiJoinKind::LeftAnti, right_count),
+                _ => unreachable!("the outer match selected a right-preserving JOIN"),
+            };
+            let source_order = if join_type == JoinType::Right {
+                (right_count..right_count + left_count)
+                    .chain(0..right_count)
+                    .collect()
+            } else {
+                (0..output_count).collect()
+            };
+            OrientedJoin {
+                kind,
+                inputs: [right, left],
+                keys: keys
+                    .into_iter()
+                    .map(|(left, right)| (right, left))
+                    .collect(),
+                source_order,
+            }
+        }
+        _ => return Err(SqlError::Unsupported("join type or semantics".to_owned())),
+    };
+    Ok(oriented)
 }
 
 fn normalize_join_key(

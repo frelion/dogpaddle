@@ -45,6 +45,11 @@ name = "aggregate_extrema"
 harness = false
 test = true
 
+[[bench]]
+name = "equi_join"
+harness = false
+test = true
+
 [[test]]
 name = "correctness"
 path = "tests/correctness.rs"

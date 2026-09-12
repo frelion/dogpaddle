@@ -366,12 +366,26 @@ fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
         if join.global {
             return Err(SqlError::Unsupported("join modifier".to_owned()));
         }
-        let (JoinOperator::Join(JoinConstraint::On(condition))
-        | JoinOperator::Inner(JoinConstraint::On(condition))) = &join.join_operator
-        else {
-            return Err(SqlError::Unsupported("join type or constraint".to_owned()));
-        };
-        validate_join_condition(condition)?;
+        match &join.join_operator {
+            JoinOperator::Join(JoinConstraint::On(condition))
+            | JoinOperator::Inner(JoinConstraint::On(condition)) => {
+                validate_inner_join_condition(condition)?;
+            }
+            JoinOperator::Left(JoinConstraint::On(condition))
+            | JoinOperator::LeftOuter(JoinConstraint::On(condition))
+            | JoinOperator::Right(JoinConstraint::On(condition))
+            | JoinOperator::RightOuter(JoinConstraint::On(condition))
+            | JoinOperator::FullOuter(JoinConstraint::On(condition))
+            | JoinOperator::LeftSemi(JoinConstraint::On(condition))
+            | JoinOperator::RightSemi(JoinConstraint::On(condition))
+            | JoinOperator::LeftAnti(JoinConstraint::On(condition))
+            | JoinOperator::RightAnti(JoinConstraint::On(condition)) => {
+                validate_join_condition(condition)?;
+            }
+            _ => {
+                return Err(SqlError::Unsupported("join type or constraint".to_owned()));
+            }
+        }
         validate_table_factor(&join.relation)?;
     }
     Ok(())
@@ -417,6 +431,32 @@ fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
             validate_table(table_with_joins)
         }
         _ => Err(SqlError::Unsupported("table modifier".to_owned())),
+    }
+}
+
+fn validate_inner_join_condition(condition: &Expr) -> Result<(), SqlError> {
+    fn contains_equality_conjunct(condition: &Expr) -> bool {
+        match condition {
+            Expr::Nested(condition) => contains_equality_conjunct(condition),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => contains_equality_conjunct(left) || contains_equality_conjunct(right),
+            Expr::BinaryOp {
+                op: BinaryOperator::Eq,
+                ..
+            } => true,
+            _ => false,
+        }
+    }
+
+    if contains_equality_conjunct(condition) {
+        Ok(())
+    } else {
+        Err(SqlError::Unsupported(
+            "INNER JOIN requires an equality conjunct".to_owned(),
+        ))
     }
 }
 

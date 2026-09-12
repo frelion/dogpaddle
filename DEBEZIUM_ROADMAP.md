@@ -380,7 +380,7 @@ D3 先扩展所有 Operation 共用的 turn 协议，再在这个协议上实现
 这使 Operation 可以用自身状态机表达初始化。例如首个 turn 在 prepared transaction 中读取 durable
 checkpoint，并在提交后的内存 completion 中进入 ready 状态；下一 turn 再在事务外启动或 poll
 driver。无需 `restore/start/poll/ack` 多套方法，也无需 Flow 知道 Operation 当前处于哪个阶段。
-完整可运行的队列示例与同代码恢复测试见 [Operation 运行协议](crates/operation/README.md#operation-运行协议)。
+完整可运行的队列示例与同代码恢复测试见 [Operation 运行协议](crates/operation/README.md#两种运行接口)。
 
 ### 当前实现：具体 CDC Scan 内部的持久交接
 

@@ -7,9 +7,9 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition},
         transform::{
-            ExtendDefinition, FilterDefinition, InnerEquiJoinDefinition, ProjectDefinition,
-            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition,
+            EquiJoinDefinition, EquiJoinKind, ExtendDefinition, FilterDefinition,
+            ProjectDefinition, RunningEventCountDefinition, SchemaAlignDefinition,
+            SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -346,7 +346,8 @@ fn turn_transform_can_head_an_atomic_tail_but_cannot_be_appended() {
     let left = factory.station("left", SequenceScanDefinition::new(0));
     let right = factory.station("right", SequenceScanDefinition::new(0));
     let join_definition = || {
-        InnerEquiJoinDefinition::try_new(
+        EquiJoinDefinition::try_new(
+            EquiJoinKind::Inner,
             [(col("value"), col("value"))],
             ["left_value", "right_value"],
         )

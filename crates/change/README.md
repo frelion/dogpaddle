@@ -1,6 +1,6 @@
 # dogpaddle-change
 
-这个 crate 定义 DogPaddle 中流动的数据。第一次读代码时，只需要先记住一句话：
+这个 crate 定义 `DogPaddle` 中流动的数据。第一次读代码时，只需要先记住一句话：
 
 > 一个 `Change` 是一批**有顺序的增删行**。
 
@@ -14,7 +14,7 @@
 | 2 | 7 | Alice | `-1` | 撤回一份 |
 
 如果此前权重为零，依次应用这三个事件后，记录的权重是 `2`。diff 可以大于一，因为
-DogPaddle 维护的是带整数权重的关系，而不只是普通的插入和删除消息。
+`DogPaddle` 维护的是带整数权重的关系，而不只是普通的插入和删除消息。
 
 ## 最小用法
 
@@ -47,7 +47,7 @@ assert_eq!(change.diffs().value(0), 1);
 - 至少有一行；Operation 没有输出时返回 `None`，不构造空 `Change`。
 - 记录和 diff 行数相同。
 - diff 不为 null，也不为零。
-- 记录使用 DogPaddle v1 支持的精确 Schema。
+- 记录使用 `DogPaddle` v1 支持的精确 Schema。
 
 `Change` 不检查撤回是否合法。例如第一条事件就是 `-1`，仍然可以构造 `Change`。它不知道
 应用前的关系状态；`Distinct`、`Aggregate`、Join 和 Sink 等真正维护关系的组件会检查权重不能
@@ -143,7 +143,7 @@ assert_eq!(in_memory.records(), from_ipc.records());
 
 内存投影只重组 Schema 和 `ArrayRef`，不会复制选中的 Arrow 数据。选择性 IPC 解码会跳过未选字段
 的值区，但仍验证整个消息结构以及字段和 buffer 描述。它减少解码和分配，不会改变已经写入的
-日志大小，也不承诺 RocksDB 或设备层面的字段级 I/O。未选字段的 UTF-8、List offset、Decimal
+日志大小，也不承诺 `RocksDB` 或设备层面的字段级 I/O。未选字段的 UTF-8、List offset、Decimal
 value 等值级约束不会被读取和验证；需要审计全部内容时使用 [`decode_change`]。
 
 ## 在系统中的位置
@@ -156,7 +156,7 @@ Store     ──只保存──────> Vec<u8>
 
 这个 crate 不依赖 Operation、Flow 或 Store。反过来，Operation 用内存中的 `Change` 表达输入输出；
 Flow 把它编码后放入持久日志；Store 看到的只是字节。这个依赖方向让 Arrow 数据契约不需要知道
-事务、拓扑、subscriber 或 RocksDB key。
+事务、拓扑、subscriber 或 `RocksDB` key。
 
 ## 持久化格式
 
@@ -170,7 +170,7 @@ RecordBatch message/body（恰好一个非空 batch）
 canonical EOS
 ```
 
-没有额外的 DogPaddle envelope，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
+没有额外的 `DogPaddle` envelope，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
 Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff 和顺序。调用方已经拥有编码
 字节时，[`decode_change_owned`] 可以继续共享满足对齐要求的 Arrow body 分配。
 
@@ -178,7 +178,7 @@ Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff
 Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.version = 1`。
 
 写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝错误 marker、
-大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 DogPaddle Schema。writer options、
+大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle` Schema。writer options、
 物理 diff 布局、允许的 Arrow 类型和行序都是 v1 持久化边界。
 
 canonical 约束 framing、EOS、writer options，以及有序且唯一的 metadata key；decoder 不要求把

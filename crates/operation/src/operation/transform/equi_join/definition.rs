@@ -1,6 +1,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{Schema, SchemaRef};
+use datafusion_common::ScalarValue;
 
 use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, Expr, MaterializeError, OperationBinding,
@@ -11,20 +12,27 @@ use crate::{
 };
 
 use super::{
-    InnerEquiJoinDefinitionError, InnerEquiJoinSchemaError, key_type_supported,
-    runtime::{BoundKey, BoundKeyPair, InnerEquiJoinOperation},
-    state::{Continuation, Rows},
+    EquiJoinDefinitionError, EquiJoinKind, EquiJoinSchemaError, key_type_supported,
+    runtime::{BoundKey, BoundKeyPair, EquiJoinOperation},
+    state::{Continuation, Counts, Rows},
 };
 
 pub(crate) const TAG: u16 = 16;
 
-const LEFT_ROWS: DataName<Rows> = DataName::new("inner_join.left_rows");
-const RIGHT_ROWS: DataName<Rows> = DataName::new("inner_join.right_rows");
-const CONTINUATION: DataName<Continuation> = DataName::new("inner_join.continuation");
-const DATA: &[DataDeclaration] = &[
+const LEFT_ROWS: DataName<Rows> = DataName::new("equi_join.left_rows");
+const RIGHT_ROWS: DataName<Rows> = DataName::new("equi_join.right_rows");
+const CONTINUATION: DataName<Continuation> = DataName::new("equi_join.continuation");
+const KEY_COUNTS: DataName<Counts> = DataName::new("equi_join.key_counts");
+const INNER_DATA: &[DataDeclaration] = &[
     LEFT_ROWS.declaration(),
     RIGHT_ROWS.declaration(),
     CONTINUATION.declaration(),
+];
+const COUNTED_DATA: &[DataDeclaration] = &[
+    LEFT_ROWS.declaration(),
+    RIGHT_ROWS.declaration(),
+    CONTINUATION.declaration(),
+    KEY_COUNTS.declaration(),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,30 +41,36 @@ struct StoredKeyPair {
     right: StoredExpression,
 }
 
-/// Pure definition of a two-input inner equality join.
+/// Pure definition of a two-input equality join.
 ///
 /// Port `0` is permanently the left relation and port `1` is the right
 /// relation. Keys are evaluated in declaration order. The output always
-/// contains every left field followed by every right field; `output_names`
+/// contains left fields only for Semi/Anti, and every left field followed by
+/// every right field for Inner/Outer; `output_names`
 /// supplies the unique physical names required by a `DogPaddle` Schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InnerEquiJoinDefinition {
+pub struct EquiJoinDefinition {
+    kind: EquiJoinKind,
     keys: Box<[StoredKeyPair]>,
     output_names: Box<[String]>,
 }
 
-impl InnerEquiJoinDefinition {
-    /// Creates an inner equality join with immutable ordered key pairs.
+impl EquiJoinDefinition {
+    /// Creates an equality join with immutable ordered key pairs.
     ///
     /// Output-name cardinality and uniqueness depend on the eventual exact
     /// input Schemas and are validated by the [`OperationDefinition`] binding entrypoint.
     ///
     /// # Errors
     ///
-    /// Returns [`InnerEquiJoinDefinitionError`] when there are no keys, a
+    /// Returns [`EquiJoinDefinitionError`] when there are no keys, a
     /// stable count or name length overflows, or an expression is not an
     /// immutable canonical `DataFusion` expression.
-    pub fn try_new<K, N, S>(keys: K, output_names: N) -> Result<Self, InnerEquiJoinDefinitionError>
+    pub fn try_new<K, N, S>(
+        kind: EquiJoinKind,
+        keys: K,
+        output_names: N,
+    ) -> Result<Self, EquiJoinDefinitionError>
     where
         K: IntoIterator<Item = (Expr, Expr)>,
         N: IntoIterator<Item = S>,
@@ -70,7 +84,7 @@ impl InnerEquiJoinDefinition {
             stored_keys.push(StoredKeyPair { left, right });
         }
         if stored_keys.is_empty() {
-            return Err(InnerEquiJoinDefinitionError::EmptyKeys);
+            return Err(EquiJoinDefinitionError::EmptyKeys);
         }
 
         let mut names = Vec::new();
@@ -78,14 +92,21 @@ impl InnerEquiJoinDefinition {
             ensure_count(output, "output names")?;
             let name = name.into();
             if u32::try_from(name.len()).is_err() {
-                return Err(InnerEquiJoinDefinitionError::OutputNameTooLong { output });
+                return Err(EquiJoinDefinitionError::OutputNameTooLong { output });
             }
             names.push(name);
         }
         Ok(Self {
+            kind,
             keys: stored_keys.into_boxed_slice(),
             output_names: names.into_boxed_slice(),
         })
+    }
+
+    /// Returns the relational output semantics.
+    #[must_use]
+    pub const fn join_kind(&self) -> EquiJoinKind {
+        self.kind
     }
 
     /// Returns ordered left/right key expressions.
@@ -96,14 +117,14 @@ impl InnerEquiJoinDefinition {
             .map(|key| (key.left.expression(), key.right.expression()))
     }
 
-    /// Returns physical output names in fixed left-then-right field order.
+    /// Returns physical output names, left-only for Semi/Anti and left-then-right otherwise.
     #[must_use]
     pub fn output_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.output_names.iter().map(String::as_str)
     }
 }
 
-impl SealedDefinition for InnerEquiJoinDefinition {
+impl SealedDefinition for EquiJoinDefinition {
     fn bind_schemas(
         &self,
         input_schemas: &[SchemaRef],
@@ -111,13 +132,14 @@ impl SealedDefinition for InnerEquiJoinDefinition {
         let [left_schema, right_schema] = input_schemas else {
             unreachable!("the final binding entrypoint enforces Join input arity")
         };
-        let expected_names = left_schema
-            .fields()
-            .len()
-            .checked_add(right_schema.fields().len())
-            .expect("two valid Arrow Schema field counts fit usize");
+        let expected_names = left_schema.fields().len()
+            + if self.kind.left_only() {
+                0
+            } else {
+                right_schema.fields().len()
+            };
         if self.output_names.len() != expected_names {
-            return Err(Box::new(InnerEquiJoinSchemaError::OutputNameCount {
+            return Err(Box::new(EquiJoinSchemaError::OutputNameCount {
                 expected: expected_names,
                 actual: self.output_names.len(),
             }));
@@ -127,7 +149,7 @@ impl SealedDefinition for InnerEquiJoinDefinition {
         for (key, stored) in self.keys.iter().enumerate() {
             let left = stored.left.bind(Arc::clone(left_schema)).map_err(
                 |source| -> OperationSchemaError {
-                    Box::new(InnerEquiJoinSchemaError::KeyExpression {
+                    Box::new(EquiJoinSchemaError::KeyExpression {
                         key,
                         side: "left",
                         source,
@@ -136,7 +158,7 @@ impl SealedDefinition for InnerEquiJoinDefinition {
             )?;
             let right = stored.right.bind(Arc::clone(right_schema)).map_err(
                 |source| -> OperationSchemaError {
-                    Box::new(InnerEquiJoinSchemaError::KeyExpression {
+                    Box::new(EquiJoinSchemaError::KeyExpression {
                         key,
                         side: "right",
                         source,
@@ -144,14 +166,14 @@ impl SealedDefinition for InnerEquiJoinDefinition {
                 },
             )?;
             if left.output_type() != right.output_type() {
-                return Err(Box::new(InnerEquiJoinSchemaError::KeyTypeMismatch {
+                return Err(Box::new(EquiJoinSchemaError::KeyTypeMismatch {
                     key,
                     left: left.output_type().clone(),
                     right: right.output_type().clone(),
                 }));
             }
             if !key_type_supported(left.output_type()) {
-                return Err(Box::new(InnerEquiJoinSchemaError::UnsupportedKeyType {
+                return Err(Box::new(EquiJoinSchemaError::UnsupportedKeyType {
                     key,
                     data_type: left.output_type().clone(),
                 }));
@@ -162,40 +184,67 @@ impl SealedDefinition for InnerEquiJoinDefinition {
             });
         }
 
-        let output_fields = left_schema
-            .fields()
-            .iter()
-            .chain(right_schema.fields())
-            .zip(&self.output_names)
-            .map(|(field, name)| Arc::new(field.as_ref().clone().with_name(name)))
-            .collect::<Vec<_>>();
+        let mut output_fields = Vec::with_capacity(expected_names);
+        let mut nulls = [Vec::new(), Vec::new()];
+        for (port, schema) in input_schemas.iter().enumerate() {
+            if port == 1 && self.kind.left_only() {
+                break;
+            }
+            let pad = self.kind.preserves(1 - port);
+            for field in schema.fields() {
+                let name = &self.output_names[output_fields.len()];
+                let mut output = field.as_ref().clone().with_name(name);
+                if pad {
+                    output = output.with_nullable(true);
+                    nulls[port].push(ScalarValue::try_from(field.data_type()).map_err(
+                        |source| -> OperationSchemaError {
+                            Box::new(EquiJoinSchemaError::NullPadding(source))
+                        },
+                    )?);
+                }
+                output_fields.push(Arc::new(output));
+            }
+        }
         let output_schema = Arc::new(Schema::new(output_fields));
         let runtime_left_schema = Arc::clone(left_schema);
         let runtime_right_schema = Arc::clone(right_schema);
         let runtime_output_schema = Arc::clone(&output_schema);
+        let kind = self.kind;
         Ok(OperationBinding::turn(
             Some(output_schema),
-            move |data: &mut DataInstances| -> Result<InnerEquiJoinOperation, MaterializeError> {
-                Ok(InnerEquiJoinOperation::new_bound(
-                    [runtime_left_schema, runtime_right_schema],
-                    runtime_output_schema,
-                    bound_keys.into_boxed_slice(),
-                    data.take(&LEFT_ROWS)?,
-                    data.take(&RIGHT_ROWS)?,
-                    data.take(&CONTINUATION)?,
-                ))
+            move |data: &mut DataInstances| -> Result<EquiJoinOperation, MaterializeError> {
+                Ok(EquiJoinOperation {
+                    kind,
+                    input_schemas: [runtime_left_schema, runtime_right_schema],
+                    output_schema: runtime_output_schema,
+                    keys: bound_keys.into_boxed_slice(),
+                    nulls,
+                    left_rows: data.take(&LEFT_ROWS)?,
+                    right_rows: data.take(&RIGHT_ROWS)?,
+                    continuation: data.take(&CONTINUATION)?,
+                    key_counts: if kind == EquiJoinKind::Inner {
+                        None
+                    } else {
+                        Some(data.take(&KEY_COUNTS)?)
+                    },
+                    prepared: None,
+                })
             },
         ))
     }
 }
 
-impl OperationDefinition for InnerEquiJoinDefinition {
+impl OperationDefinition for EquiJoinDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::TurnTransform(NonZeroU32::new(2).expect("inner equi-join has two inputs"))
+        OperationKind::TurnTransform(NonZeroU32::new(2).expect("equi-join has two inputs"))
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
-        DATA
+        if self.kind == EquiJoinKind::Inner {
+            INNER_DATA
+        } else {
+            COUNTED_DATA
+        }
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -203,6 +252,7 @@ impl OperationDefinition for InnerEquiJoinDefinition {
     }
 
     fn encode_payload(&self, output: &mut Vec<u8>) {
+        output.push(self.kind.code());
         put_count(output, self.keys.len());
         for key in &self.keys {
             key.left.encode(output);
@@ -220,10 +270,13 @@ pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
+    let kind = EquiJoinKind::from_code(cursor.read_bytes(1)?[0]).ok_or(
+        DefinitionCodecError::InvalidPayload("equi-join kind is invalid"),
+    )?;
     let key_count = cursor.read_u32()?;
     if key_count == 0 {
         return Err(DefinitionCodecError::InvalidPayload(
-            "inner equi-join key list is empty",
+            "equi-join key list is empty",
         ));
     }
     let mut keys = Vec::new();
@@ -236,16 +289,17 @@ pub(crate) fn decode_definition(
     let mut output_names = Vec::new();
     for _ in 0..output_count {
         let length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("inner equi-join output name length is invalid")
+            DefinitionCodecError::InvalidPayload("equi-join output name length is invalid")
         })?;
         let name = cursor.read_bytes(length)?;
         let name = std::str::from_utf8(name).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("inner equi-join output name is invalid UTF-8")
+            DefinitionCodecError::InvalidPayload("equi-join output name is invalid UTF-8")
         })?;
         output_names.push(name.to_owned());
     }
     cursor.finish()?;
-    Ok(Box::new(InnerEquiJoinDefinition {
+    Ok(Box::new(EquiJoinDefinition {
+        kind,
         keys: keys.into_boxed_slice(),
         output_names: output_names.into_boxed_slice(),
     }))
@@ -255,11 +309,11 @@ fn store_key(
     expression: Expr,
     key: usize,
     side: &'static str,
-) -> Result<StoredExpression, InnerEquiJoinDefinitionError> {
+) -> Result<StoredExpression, EquiJoinDefinitionError> {
     let expression = StoredExpression::try_new(expression)
-        .map_err(|source| InnerEquiJoinDefinitionError::KeyExpression { key, side, source })?;
+        .map_err(|source| EquiJoinDefinitionError::KeyExpression { key, side, source })?;
     if !expression.is_atomic() {
-        return Err(InnerEquiJoinDefinitionError::NonImmutableKey { key, side });
+        return Err(EquiJoinDefinitionError::NonImmutableKey { key, side });
     }
     Ok(expression)
 }
@@ -268,24 +322,24 @@ fn decode_key(cursor: &mut PayloadCursor<'_>) -> Result<StoredExpression, Defini
     let expression = StoredExpression::decode(cursor)?;
     if !expression.is_atomic() {
         return Err(DefinitionCodecError::InvalidPayload(
-            "inner equi-join key expression is not immutable",
+            "equi-join key expression is not immutable",
         ));
     }
     Ok(expression)
 }
 
-fn ensure_count(index: usize, kind: &'static str) -> Result<(), InnerEquiJoinDefinitionError> {
+fn ensure_count(index: usize, kind: &'static str) -> Result<(), EquiJoinDefinitionError> {
     index
         .checked_add(1)
         .and_then(|count| u32::try_from(count).ok())
         .map(|_| ())
-        .ok_or(InnerEquiJoinDefinitionError::TooMany { kind })
+        .ok_or(EquiJoinDefinitionError::TooMany { kind })
 }
 
 fn put_count(output: &mut Vec<u8>, count: usize) {
     output.extend_from_slice(
         &u32::try_from(count)
-            .expect("InnerEquiJoinDefinition construction bounds persistent counts")
+            .expect("EquiJoinDefinition construction bounds persistent counts")
             .to_be_bytes(),
     );
 }

@@ -1,27 +1,23 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    Expr, MaterializeError, OperationBindError, OperationDefinition, OperationKind, col,
+    Expr, MaterializeError, OperationBindError, OperationDefinition, col,
     operation::{
         Action, Operation, OperationError, OperationInput,
         transform::{
-            InnerEquiJoinDefinition, InnerEquiJoinDefinitionError, InnerEquiJoinError,
-            InnerEquiJoinSchemaError,
+            EquiJoinDefinition, EquiJoinDefinitionError, EquiJoinError, EquiJoinKind,
+            EquiJoinSchemaError,
         },
     },
 };
 use dogpaddle_store::{PartitionedMultiset, Store, Transactions};
 
-use super::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, data_names, materialize,
-    rollback_ready,
-};
+use crate::support::{TestStore, bind, commit_ready, materialize, rollback_ready};
 
 const PHYSICAL_DATA: [&str; 3] = ["left-rows", "right-rows", "continuation"];
-const INNER_JOIN_V1: &str = include_str!("../fixtures/v1/inner_equi_join_id.hex");
 type OutputRow = (Option<u64>, String, Option<u64>, i64, i64);
 
 fn left_schema() -> SchemaRef {
@@ -46,8 +42,9 @@ fn right_schema() -> SchemaRef {
     ))
 }
 
-fn definition() -> InnerEquiJoinDefinition {
-    InnerEquiJoinDefinition::try_new(
+fn definition() -> EquiJoinDefinition {
+    EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "left_label", "right_fk", "right_amount"],
     )
@@ -177,29 +174,9 @@ fn output_rows(outputs: &[Change]) -> Vec<OutputRow> {
 }
 
 #[test]
-fn definition_binds_fixed_left_then_right_output_and_exact_data() {
+fn inner_binding_preserves_field_metadata_and_requires_named_data() {
     let definition = definition();
-    let decoded = assert_literal_definition(
-        &definition,
-        INNER_JOIN_V1,
-        16,
-        OperationKind::TurnTransform(NonZeroU32::new(2).unwrap()),
-    );
-    assert_eq!(
-        data_names(&definition),
-        [
-            "inner_join.left_rows",
-            "inner_join.right_rows",
-            "inner_join.continuation"
-        ]
-    );
-    assert_eq!(definition.keys().len(), 1);
-    assert_eq!(
-        definition.output_names().collect::<Vec<_>>(),
-        ["left_id", "left_label", "right_fk", "right_amount"]
-    );
-
-    let binding = bind(decoded.as_ref(), &[left_schema(), right_schema()]).unwrap();
+    let binding = bind(&definition, &[left_schema(), right_schema()]).unwrap();
     let output = binding.output_schema().unwrap();
     assert_eq!(
         output
@@ -220,7 +197,7 @@ fn definition_binds_fixed_left_then_right_output_and_exact_data() {
     assert!(matches!(
         result,
         Err(MaterializeError::MissingData {
-            name: "inner_join.left_rows"
+            name: "equi_join.left_rows"
         })
     ));
 }
@@ -228,11 +205,16 @@ fn definition_binds_fixed_left_then_right_output_and_exact_data() {
 #[test]
 fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
     assert!(matches!(
-        InnerEquiJoinDefinition::try_new(std::iter::empty::<(Expr, Expr)>(), ["value"]),
-        Err(InnerEquiJoinDefinitionError::EmptyKeys)
+        EquiJoinDefinition::try_new(
+            EquiJoinKind::Inner,
+            std::iter::empty::<(Expr, Expr)>(),
+            ["value"]
+        ),
+        Err(EquiJoinDefinitionError::EmptyKeys)
     ));
 
-    let mismatched = InnerEquiJoinDefinition::try_new(
+    let mismatched = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("id"), col("amount"))],
         ["left_id", "left_label", "right_fk", "right_amount"],
     )
@@ -243,8 +225,8 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         panic!("mismatched Join key types unexpectedly bound")
     };
     assert!(matches!(
-        source.downcast_ref::<InnerEquiJoinSchemaError>(),
-        Some(InnerEquiJoinSchemaError::KeyTypeMismatch { key: 0, .. })
+        source.downcast_ref::<EquiJoinSchemaError>(),
+        Some(EquiJoinSchemaError::KeyTypeMismatch { key: 0, .. })
     ));
 
     let floats = Arc::new(Schema::new(vec![Field::new(
@@ -252,26 +234,31 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         DataType::Float64,
         false,
     )]));
-    let unsupported =
-        InnerEquiJoinDefinition::try_new([(col("key"), col("key"))], ["left_key", "right_key"])
-            .unwrap();
+    let unsupported = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
+        [(col("key"), col("key"))],
+        ["left_key", "right_key"],
+    )
+    .unwrap();
     let Err(OperationBindError::Rejected { source }) =
         bind(&unsupported, &[Arc::clone(&floats), floats])
     else {
         panic!("floating Join key unexpectedly bound")
     };
     assert!(matches!(
-        source.downcast_ref::<InnerEquiJoinSchemaError>(),
-        Some(InnerEquiJoinSchemaError::UnsupportedKeyType { key: 0, .. })
+        source.downcast_ref::<EquiJoinSchemaError>(),
+        Some(EquiJoinSchemaError::UnsupportedKeyType { key: 0, .. })
     ));
 
     let wrong_count =
-        InnerEquiJoinDefinition::try_new([(col("id"), col("fk"))], ["only_one"]).unwrap();
+        EquiJoinDefinition::try_new(EquiJoinKind::Inner, [(col("id"), col("fk"))], ["only_one"])
+            .unwrap();
     assert!(matches!(
         bind(&wrong_count, &[left_schema(), right_schema()]),
         Err(OperationBindError::Rejected { .. })
     ));
-    let duplicate_names = InnerEquiJoinDefinition::try_new(
+    let duplicate_names = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["same", "same", "third", "fourth"],
     )
@@ -336,8 +323,8 @@ fn runtime_rejects_missing_invalid_port_and_exact_schema_drift() {
         panic!("inner join accepted a missing input");
     };
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::MissingInput)
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::MissingInput)
     ));
 
     let input = left_change(vec![Some(1)], vec!["left"], vec![1]);
@@ -351,8 +338,8 @@ fn runtime_rejects_missing_invalid_port_and_exact_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::InvalidInputPort { port: 2 })
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::InvalidInputPort { port: 2 })
     ));
 
     let drifted = right_change(vec![Some(1)], vec![10], vec![1]);
@@ -366,8 +353,8 @@ fn runtime_rejects_missing_invalid_port_and_exact_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::InputSchemaMismatch { port: 0 })
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::InputSchemaMismatch { port: 0 })
     ));
 }
 
@@ -386,8 +373,8 @@ fn whole_claim_admission_rejects_negative_prefix_without_partial_state() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::NegativeWeight)
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::NegativeWeight)
     ));
 
     let retract = left_change(vec![Some(7)], vec!["same"], vec![-1]);
@@ -401,8 +388,8 @@ fn whole_claim_admission_rejects_negative_prefix_without_partial_state() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::NegativeWeight)
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::NegativeWeight)
     ));
 }
 
@@ -447,8 +434,8 @@ fn rolled_back_emit_page_replays_and_adjusts_the_input_once() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::NegativeWeight)
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::NegativeWeight)
     ));
 }
 
@@ -490,8 +477,8 @@ fn state_and_output_weight_overflow_fail_before_emission() {
         )
         .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<InnerEquiJoinError>(),
-            Some(InnerEquiJoinError::WeightOverflow)
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::WeightOverflow)
         ));
     }
 
@@ -532,8 +519,8 @@ fn state_and_output_weight_overflow_fail_before_emission() {
         )
         .unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<InnerEquiJoinError>(),
-            Some(InnerEquiJoinError::OutputDifferenceOverflow)
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::OutputDifferenceOverflow)
         ));
     }
 }
@@ -550,7 +537,8 @@ fn composite_variable_width_keys_keep_component_boundaries() {
         Field::new("y", DataType::Utf8, false),
         Field::new("right_value", DataType::Utf8, false),
     ]));
-    let definition = InnerEquiJoinDefinition::try_new(
+    let definition = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("a"), col("x")), (col("b"), col("y"))],
         ["a", "b", "left_value", "x", "y", "right_value"],
     )
@@ -813,8 +801,8 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<InnerEquiJoinError>(),
-        Some(InnerEquiJoinError::NegativeWeight)
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::NegativeWeight)
     ));
 }
 
@@ -828,7 +816,8 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
         Field::new("fk", DataType::UInt64, false),
         Field::new("ordinal", DataType::UInt64, false),
     ]));
-    let definition = InnerEquiJoinDefinition::try_new(
+    let definition = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "payload", "right_fk", "ordinal"],
     )
@@ -884,6 +873,96 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
 }
 
 #[test]
+fn semi_and_anti_presence_budget_does_not_repeat_the_unemitted_driving_row() {
+    const MATCHES: usize = 32;
+    const PRESENCE_DATA: [&str; 4] = ["left-rows", "right-rows", "continuation", "key-counts"];
+
+    let left = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("value", DataType::UInt64, false),
+    ]));
+    let right = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let left_input = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&left),
+            vec![
+                Arc::new(UInt64Array::from(vec![7; MATCHES])),
+                Arc::new(UInt64Array::from(
+                    (0..u64::try_from(MATCHES).unwrap()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1; MATCHES]),
+    )
+    .unwrap();
+    // This row exceeds the half-turn scan budget. Semi/Anti output only the
+    // matched left rows, so its payload must not be charged once per match.
+    let payload = "x".repeat(2_200_000);
+    let right_change = |difference| {
+        Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&right),
+                vec![
+                    Arc::new(UInt64Array::from(vec![7])),
+                    Arc::new(StringArray::from(vec![payload.as_str()])),
+                ],
+            )
+            .unwrap(),
+            Int64Array::from(vec![difference]),
+        )
+        .unwrap()
+    };
+    let insert = right_change(1);
+    let retract = right_change(-1);
+
+    for (kind, insert_difference, retract_difference) in [
+        (EquiJoinKind::LeftSemi, 1, -1),
+        (EquiJoinKind::LeftAnti, -1, 1),
+    ] {
+        let definition = EquiJoinDefinition::try_new(
+            kind,
+            [(col("key"), col("key"))],
+            ["left_key", "left_value"],
+        )
+        .unwrap();
+        let root = TestStore::new();
+        let mut store = Store::create(root.path()).unwrap();
+        for (declaration, physical) in definition.data().iter().zip(PRESENCE_DATA) {
+            declaration.create(&mut store, physical).unwrap();
+        }
+        let mut operation = materialize(
+            &definition,
+            &[Arc::clone(&left), Arc::clone(&right)],
+            &store,
+            &PRESENCE_DATA,
+        );
+        let mut transactions = store.into_transactions();
+        run_claim(&mut operation, &mut transactions, 0, &left_input).unwrap();
+
+        for (input, expected_difference) in
+            [(&insert, insert_difference), (&retract, retract_difference)]
+        {
+            let (outputs, turns) =
+                run_claim_with_turns(&mut operation, &mut transactions, 1, input).unwrap();
+            assert_eq!(turns, 1, "{kind:?} repeated the right driving row budget");
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].num_rows(), MATCHES);
+            assert!(
+                outputs[0]
+                    .diffs()
+                    .values()
+                    .iter()
+                    .all(|difference| *difference == expected_difference)
+            );
+        }
+    }
+}
+
+#[test]
 fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
     let left = Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt64, false),
@@ -893,7 +972,8 @@ fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
         Field::new("fk", DataType::UInt64, false),
         Field::new("payload", DataType::Utf8, false),
     ]));
-    let definition = InnerEquiJoinDefinition::try_new(
+    let definition = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "ordinal", "right_fk", "payload"],
     )

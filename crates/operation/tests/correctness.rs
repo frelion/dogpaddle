@@ -8,14 +8,14 @@ mod definition_codec;
 mod discard;
 #[path = "correctness/distinct.rs"]
 mod distinct;
+#[path = "correctness/equi_join.rs"]
+mod equi_join;
 #[path = "correctness/expression.rs"]
 mod expression;
 #[path = "correctness/extend.rs"]
 mod extend;
 #[path = "correctness/filter.rs"]
 mod filter;
-#[path = "correctness/inner_join.rs"]
-mod inner_join;
 #[path = "correctness/metamorphic.rs"]
 mod metamorphic;
 #[path = "correctness/mysql_cdc_scan.rs"]
