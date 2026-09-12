@@ -6,11 +6,10 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, InlineBinding, InlineDefinition, InlineEligibilityError,
-    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
+    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
-    definition::{InlineSealed, Sealed as SealedDefinition},
-    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
+    definition::Sealed as SealedDefinition,
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 4;
@@ -48,9 +47,6 @@ pub enum ProjectSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProjectError {
-    /// The input Operation was called without a Change.
-    #[error("project requires one input Change")]
-    MissingInput,
     /// Project only accepts its Definition's first input port.
     #[error("project does not accept input port {port}")]
     InvalidInputPort {
@@ -112,32 +108,16 @@ impl SealedDefinition for ProjectDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data(
-            Some(output_schema),
+        Ok(OperationBinding::without_data_atomic(
+            output_schema,
             operation,
         ))
     }
 }
 
-impl InlineSealed for ProjectDefinition {
-    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
-        Ok(())
-    }
-
-    fn bind_inline_schema(
-        &self,
-        input_schema: SchemaRef,
-    ) -> Result<InlineBinding, OperationSchemaError> {
-        let (output_schema, operation) = self
-            .bind_operation(&input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(InlineBinding::new(output_schema, operation))
-    }
-}
-
 impl OperationDefinition for ProjectDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -166,40 +146,21 @@ impl ProjectOperation {
     }
 }
 
-impl InlineTransform for ProjectOperation {
+impl AtomicOperation for ProjectOperation {
     fn apply(
         &mut self,
-        input: &dogpaddle_change::Change,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
     ) -> Result<Option<dogpaddle_change::Change>, OperationError> {
+        if input.port != 0 {
+            return Err(ProjectError::InvalidInputPort { port: input.port }.into());
+        }
         input
+            .change
             .try_project(&self.projection)
             .map(Some)
             .map_err(|source| ProjectError::Projection(source).into())
     }
-}
-
-impl TransactionalOperation for ProjectOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(ProjectError::MissingInput)?;
-        if input.port != 0 {
-            return Err(ProjectError::InvalidInputPort { port: input.port }.into());
-        }
-
-        InlineTransform::apply(self, input.change).map(Action::Complete)
-    }
-}
-
-pub(crate) fn decode_inline_definition(
-    payload: &[u8],
-) -> Result<InlineDefinition, DefinitionCodecError> {
-    let definition = decode_project(payload)?;
-    definition
-        .try_into_inline()
-        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 pub(crate) fn decode_definition(

@@ -12,10 +12,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::Sealed,
-    operation::{
-        Operation,
-        sink::relation::{DATA, RelationalSink, STATE},
-    },
+    operation::sink::relation::{DATA, RelationalSink, STATE},
 };
 
 pub(crate) const TAG: u16 = 12;
@@ -69,14 +66,18 @@ impl Sealed for PostgresSinkDefinition {
 
         let target = self.target.clone();
         let input_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::with_resource::<PostgresSinkConfig, _>(
+        Ok(OperationBinding::turn_with_resource::<
+            PostgresSinkConfig,
+            _,
+            _,
+        >(
             None,
             move |data: &mut DataInstances,
                   config|
-                  -> Result<Box<dyn Operation>, MaterializeError> {
+                  -> Result<RelationalSink<PostgresTarget>, MaterializeError> {
                 let state = data.take(&STATE)?;
                 let target = PostgresTarget::new_bound(config, target, Arc::clone(&input_schema));
-                Ok(Box::new(RelationalSink::new(input_schema, target, state)))
+                Ok(RelationalSink::new(input_schema, target, state))
             },
         ))
     }

@@ -50,21 +50,16 @@ fn runtime_completes_input_and_rejects_missing_or_invalid_ports() {
         .materialize(DataInstances::new(), RuntimeResource::none())
         .unwrap();
     assert!(matches!(
-        commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap(),
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
         Action::Complete(None)
     ));
-    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
+    let error = rollback_ready(&mut operation, None, &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<DiscardError>(),
         Some(DiscardError::MissingInput)
     ));
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -86,12 +81,7 @@ fn runtime_completes_input_and_rejects_missing_or_invalid_ports() {
         .materialize(DataInstances::new(), RuntimeResource::none())
         .unwrap();
     assert!(matches!(
-        commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap(),
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
         Action::Complete(None)
     ));
 }

@@ -2,23 +2,23 @@ use std::{
     any::{Any, TypeId},
     collections::BTreeMap,
     error::Error,
-    fmt::{self, Debug},
+    fmt::Debug,
     marker::PhantomData,
     num::NonZeroU32,
 };
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{Change, SchemaError, validate_schema};
+use dogpaddle_change::{SchemaError, validate_schema};
 use dogpaddle_store::{Store, StoreData, StoreError, StoreSetup};
 use thiserror::Error;
 
 use crate::RuntimeResource;
-use crate::operation::{InlineTransform, Operation};
+use crate::operation::{AtomicOperation, Operation, TurnOperation, exclusive_turn};
 
 mod private {
     use arrow_schema::SchemaRef;
 
-    use super::{InlineBinding, InlineEligibilityError, OperationBinding, OperationSchemaError};
+    use super::{OperationBinding, OperationSchemaError};
 
     pub trait Sealed {
         fn bind_schemas(
@@ -26,28 +26,35 @@ mod private {
             input_schemas: &[SchemaRef],
         ) -> Result<OperationBinding, OperationSchemaError>;
     }
-
-    pub trait InlineSealed {
-        fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError>;
-
-        fn bind_inline_schema(
-            &self,
-            input_schema: SchemaRef,
-        ) -> Result<InlineBinding, OperationSchemaError>;
-    }
 }
 
-pub(crate) use private::{InlineSealed, Sealed};
+pub(crate) use private::Sealed;
 
 type ErasedData = Box<dyn Any + Send + Sync>;
 type CreateFn = fn(&mut Store, &str) -> Result<ErasedData, StoreError>;
 type CreateSetupFn = fn(&mut StoreSetup, &str) -> Result<ErasedData, StoreError>;
 type OpenFn = fn(&Store, &str) -> Result<ErasedData, StoreError>;
-type MaterializeFn = Box<
-    dyn FnOnce(&mut DataInstances, RuntimeResource) -> Result<Box<dyn Operation>, MaterializeError>
+type AtomicMaterializeFn = Box<
+    dyn FnOnce(&mut DataInstances) -> Result<Box<dyn AtomicOperation>, MaterializeError>
         + Send
         + 'static,
 >;
+type TurnMaterializeFn = Box<
+    dyn FnOnce(
+            &mut DataInstances,
+            RuntimeResource,
+        ) -> Result<Box<dyn TurnOperation>, MaterializeError>
+        + Send
+        + 'static,
+>;
+
+enum Materializer {
+    Atomic(AtomicMaterializeFn),
+    Turn {
+        runtime_type: Option<TypeId>,
+        materialize: TurnMaterializeFn,
+    },
+}
 
 /// Type-erased Schema rejection from one concrete Operation definition.
 ///
@@ -64,29 +71,7 @@ pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
 #[doc(hidden)]
 pub struct OperationBinding {
     output_schema: Option<SchemaRef>,
-    runtime_type: Option<TypeId>,
-    materialize: MaterializeFn,
-}
-
-/// An opaque definition admitted to a Station's inline pipeline.
-///
-/// This wrapper is intentionally distinct from [`OperationDefinition`]. Only
-/// definitions that implement the sealed [`InlineOperationDefinition`]
-/// capability can create it, so callers cannot infer inline safety from an
-/// operation's lack of persistent data.
-pub struct InlineDefinition {
-    erased: Box<dyn InlineOperationDefinition>,
-}
-
-/// One executable binding of an [`InlineDefinition`] to an exact input Schema.
-///
-/// The binding owns both the derived output Schema and the compiled transform.
-/// Flow retains it directly in the Station program; inline execution has no
-/// Store or runtime-resource materialization phase.
-#[doc(hidden)]
-pub struct InlineBinding {
-    output_schema: SchemaRef,
-    transform: Box<dyn InlineTransform>,
+    materializer: Materializer,
 }
 
 /// One stable logical data name paired with its erased typed data class.
@@ -135,8 +120,10 @@ pub enum OperationKind {
     /// This structural role does not encode exhaustion. A Scan may return
     /// [`crate::operation::Turn::Idle`] temporarily or forever.
     Scan,
-    /// Consumes input records and produces output records.
-    Transform(NonZeroU32),
+    /// Completely consumes one input Change inside the Station transaction.
+    AtomicTransform(NonZeroU32),
+    /// Owns a full turn and must be the sole Operation in its Station.
+    ExclusiveTransform(NonZeroU32),
     /// Consumes input records without producing output.
     Sink(NonZeroU32),
 }
@@ -147,7 +134,9 @@ impl OperationKind {
     pub const fn input_count(self) -> u32 {
         match self {
             Self::Scan => 0,
-            Self::Transform(count) | Self::Sink(count) => count.get(),
+            Self::AtomicTransform(count) | Self::ExclusiveTransform(count) | Self::Sink(count) => {
+                count.get()
+            }
         }
     }
 
@@ -163,10 +152,19 @@ impl OperationKind {
         matches!(self, Self::Sink(_))
     }
 
+    /// Returns whether this Operation can be followed by another Operation in one transaction.
+    #[must_use]
+    pub const fn is_atomic(self) -> bool {
+        matches!(self, Self::AtomicTransform(_))
+    }
+
     /// Returns whether this kind owns an output stream.
     #[must_use]
     pub const fn has_output(self) -> bool {
-        matches!(self, Self::Scan | Self::Transform(_))
+        matches!(
+            self,
+            Self::Scan | Self::AtomicTransform(_) | Self::ExclusiveTransform(_)
+        )
     }
 }
 
@@ -197,100 +195,6 @@ pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
     /// Appends this definition's variant-specific persistent payload.
     #[doc(hidden)]
     fn encode_payload(&self, output: &mut Vec<u8>);
-}
-
-/// Sealed capability implemented only by definitions safe for inline execution.
-///
-/// An inline definition is a deterministic, retry-safe, single-input transform
-/// that preserves input order and differences, emits at most one output row
-/// for each input row, and owns no Store data, runtime resource, continuation,
-/// external effect, or transaction protocol. Its bound runtime must reject an
-/// input whose Schema differs from the exact Schema used during binding.
-/// Eligibility is checked from the concrete definition instance rather than inferred from
-/// [`OperationDefinition::data`].
-pub trait InlineOperationDefinition: OperationDefinition + private::InlineSealed {
-    /// Validates this concrete definition and erases it as an inline definition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InlineEligibilityError`] when an expression observes stable,
-    /// volatile, or otherwise non-row-local state and therefore cannot be
-    /// replayed safely inside a Station pipeline.
-    fn try_into_inline(self) -> Result<InlineDefinition, InlineEligibilityError>
-    where
-        Self: Sized,
-    {
-        private::InlineSealed::ensure_inline_eligible(&self)?;
-        Ok(InlineDefinition {
-            erased: Box::new(self),
-        })
-    }
-}
-
-impl<D> InlineOperationDefinition for D where D: OperationDefinition + private::InlineSealed {}
-
-impl fmt::Debug for InlineDefinition {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Debug::fmt(&self.erased, formatter)
-    }
-}
-
-impl InlineDefinition {
-    /// Purely binds this definition to one exact logical input Schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InlineBindError`] when the input or derived output violates
-    /// the Change Schema contract, or when the concrete transform rejects the
-    /// exact input Schema.
-    pub fn bind(&self, input_schema: SchemaRef) -> Result<InlineBinding, InlineBindError> {
-        validate_schema(&input_schema)
-            .map_err(|source| InlineBindError::InvalidInputSchema { source })?;
-        let binding = self
-            .erased
-            .bind_inline_schema(input_schema)
-            .map_err(|source| InlineBindError::Rejected { source })?;
-        validate_schema(&binding.output_schema)
-            .map_err(|source| InlineBindError::InvalidOutputSchema { source })?;
-        Ok(binding)
-    }
-
-    pub(crate) fn as_operation_definition(&self) -> &dyn OperationDefinition {
-        self.erased.as_ref()
-    }
-}
-
-impl InlineBinding {
-    pub(crate) fn new<T>(output_schema: SchemaRef, transform: T) -> Self
-    where
-        T: InlineTransform,
-    {
-        Self {
-            output_schema,
-            transform: Box::new(transform),
-        }
-    }
-
-    /// Returns the exact logical output Schema.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn output_schema(&self) -> &SchemaRef {
-        &self.output_schema
-    }
-
-    /// Applies the exact-Schema-bound transform without a Store transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns the concrete deterministic evaluation failure. The binding
-    /// remains safe to call again with the same input.
-    #[doc(hidden)]
-    pub fn apply(
-        &mut self,
-        input: &Change,
-    ) -> Result<Option<Change>, crate::operation::OperationError> {
-        self.transform.apply(input)
-    }
 }
 
 impl dyn OperationDefinition + '_ {
@@ -345,35 +249,60 @@ impl dyn OperationDefinition + '_ {
             }
             (false, None) => {}
         }
-        Ok(binding)
+        binding
+            .restrict_to(kind)
+            .ok_or(OperationBindError::ExecutionKind)
     }
 }
 
 impl OperationBinding {
-    pub(crate) fn new<F>(output_schema: Option<SchemaRef>, materialize: F) -> Self
+    pub(crate) fn atomic<F, O>(output_schema: SchemaRef, materialize: F) -> Self
     where
-        F: FnOnce(&mut DataInstances) -> Result<Box<dyn Operation>, MaterializeError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DataInstances) -> Result<O, MaterializeError> + Send + 'static,
+        O: AtomicOperation,
     {
         Self {
-            output_schema,
-            runtime_type: None,
-            materialize: Box::new(move |data, _resource| materialize(data)),
+            output_schema: Some(output_schema),
+            materializer: Materializer::Atomic(Box::new(move |data| {
+                materialize(data).map(|operation| Box::new(operation) as Box<dyn AtomicOperation>)
+            })),
         }
     }
 
-    pub(crate) fn with_resource<R, F>(output_schema: Option<SchemaRef>, materialize: F) -> Self
+    pub(crate) fn turn<F, O>(output_schema: Option<SchemaRef>, materialize: F) -> Self
     where
-        R: Send + 'static,
-        F: FnOnce(&mut DataInstances, R) -> Result<Box<dyn Operation>, MaterializeError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DataInstances) -> Result<O, MaterializeError> + Send + 'static,
+        O: TurnOperation,
     {
         Self {
             output_schema,
-            runtime_type: Some(TypeId::of::<R>()),
-            materialize: Box::new(move |data, resource| materialize(data, resource.take()?)),
+            materializer: Materializer::Turn {
+                runtime_type: None,
+                materialize: Box::new(move |data, _resource| {
+                    materialize(data).map(|operation| Box::new(operation) as Box<dyn TurnOperation>)
+                }),
+            },
+        }
+    }
+
+    pub(crate) fn turn_with_resource<R, F, O>(
+        output_schema: Option<SchemaRef>,
+        materialize: F,
+    ) -> Self
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut DataInstances, R) -> Result<O, MaterializeError> + Send + 'static,
+        O: TurnOperation,
+    {
+        Self {
+            output_schema,
+            materializer: Materializer::Turn {
+                runtime_type: Some(TypeId::of::<R>()),
+                materialize: Box::new(move |data, resource| {
+                    materialize(data, resource.take()?)
+                        .map(|operation| Box::new(operation) as Box<dyn TurnOperation>)
+                }),
+            },
         }
     }
 
@@ -386,7 +315,10 @@ impl OperationBinding {
     ///
     /// Returns a materialization error for a missing, unexpected, or wrong-type resource.
     pub fn validate_resource(&self, resource: &RuntimeResource) -> Result<(), MaterializeError> {
-        resource.validate(self.runtime_type)
+        match &self.materializer {
+            Materializer::Atomic(_) => resource.validate(None),
+            Materializer::Turn { runtime_type, .. } => resource.validate(*runtime_type),
+        }
     }
 
     /// Returns the exact logical output Schema, or `None` for a Sink binding.
@@ -408,18 +340,53 @@ impl OperationBinding {
         self,
         mut data: DataInstances,
         resource: RuntimeResource,
-    ) -> Result<Box<dyn Operation>, MaterializeError> {
+    ) -> Result<Operation, MaterializeError> {
         self.validate_resource(&resource)?;
-        let operation = (self.materialize)(&mut data, resource)?;
+        let operation = match self.materializer {
+            Materializer::Atomic(materialize) => Operation::Atomic(materialize(&mut data)?),
+            Materializer::Turn { materialize, .. } => {
+                Operation::Turn(materialize(&mut data, resource)?)
+            }
+        };
         data.finish()?;
         Ok(operation)
     }
 
-    pub(crate) fn without_data<O>(output_schema: Option<SchemaRef>, operation: O) -> Self
+    pub(crate) fn without_data_atomic<O>(output_schema: SchemaRef, operation: O) -> Self
     where
-        O: Operation,
+        O: AtomicOperation,
     {
-        Self::new(output_schema, move |_data| Ok(Box::new(operation)))
+        Self::atomic(output_schema, move |_data| Ok(operation))
+    }
+
+    pub(crate) fn without_data_turn<O>(output_schema: Option<SchemaRef>, operation: O) -> Self
+    where
+        O: TurnOperation,
+    {
+        Self::turn(output_schema, move |_data| Ok(operation))
+    }
+
+    fn restrict_to(self, kind: OperationKind) -> Option<Self> {
+        let materializer = match (kind, self.materializer) {
+            (OperationKind::AtomicTransform(_), materializer @ Materializer::Atomic(_))
+            | (
+                OperationKind::Scan | OperationKind::ExclusiveTransform(_) | OperationKind::Sink(_),
+                materializer @ Materializer::Turn { .. },
+            ) => materializer,
+            (OperationKind::ExclusiveTransform(_), Materializer::Atomic(materialize)) => {
+                Materializer::Turn {
+                    runtime_type: None,
+                    materialize: Box::new(move |data, _resource| {
+                        materialize(data).map(exclusive_turn)
+                    }),
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            output_schema: self.output_schema,
+            materializer,
+        })
     }
 }
 
@@ -668,65 +635,7 @@ pub enum OperationBindError {
         #[source]
         source: SchemaError,
     },
-}
-
-/// Reason a concrete Operation definition cannot run as an inline transform.
-#[derive(Debug, Error, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum InlineEligibilityError {
-    /// One scalar function can vary between otherwise identical retries.
-    #[error(
-        "inline expression {expression} calls stable function {function:?}; only immutable functions are replay-safe"
-    )]
-    StableFunction {
-        /// Zero-based expression ordinal in the concrete definition.
-        expression: usize,
-        /// `DataFusion` function name.
-        function: String,
-    },
-    /// One scalar function can vary between evaluations.
-    #[error(
-        "inline expression {expression} calls volatile function {function:?}; only immutable functions are replay-safe"
-    )]
-    VolatileFunction {
-        /// Zero-based expression ordinal in the concrete definition.
-        expression: usize,
-        /// `DataFusion` function name.
-        function: String,
-    },
-    /// The expression contains a construct that is not a row-local scalar computation.
-    #[error("inline expression {expression} contains unsupported {kind}")]
-    UnsupportedExpression {
-        /// Zero-based expression ordinal in the concrete definition.
-        expression: usize,
-        /// Stable name of the rejected expression construct.
-        kind: &'static str,
-    },
-}
-
-/// Failure while binding one inline definition to an exact logical input Schema.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum InlineBindError {
-    /// The supplied logical input Schema violates the Change Schema contract.
-    #[error("inline operation input schema is invalid: {source}")]
-    InvalidInputSchema {
-        /// Concrete logical Schema validation failure.
-        #[source]
-        source: SchemaError,
-    },
-    /// The concrete inline operation rejected the otherwise valid input Schema.
-    #[error("inline operation rejected its input schema: {source}")]
-    Rejected {
-        /// Operation-specific structured Schema failure.
-        #[source]
-        source: OperationSchemaError,
-    },
-    /// The derived logical output Schema violates the Change Schema contract.
-    #[error("inline operation output schema is invalid: {source}")]
-    InvalidOutputSchema {
-        /// Concrete logical Schema validation failure.
-        #[source]
-        source: SchemaError,
-    },
+    /// The concrete binding does not implement the execution capability declared by its kind.
+    #[error("operation binding execution capability does not match its declared kind")]
+    ExecutionKind,
 }

@@ -1,6 +1,6 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
-use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError, TopologyError};
 use dogpaddle_operation::{
     col, lit,
     operation::{
@@ -18,7 +18,7 @@ use rusqlite::{Connection, OpenFlags};
 const CAPACITY: NonZeroU64 = NonZeroU64::MAX;
 
 #[test]
-fn output_pipeline_runs_five_pure_stages_in_one_station_across_reopen() {
+fn five_atomic_transforms_run_in_one_station_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("sink.sqlite");
@@ -26,32 +26,28 @@ fn output_pipeline_runs_five_pure_stages_in_one_station_across_reopen() {
 
     let mut factory = FlowFactory::new(&flow_path);
     let scan = factory.station("scan", SequenceScanDefinition::new(start));
-    let sink = factory.station(
-        "sqlite",
-        SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap(),
-    );
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.connect([scan], sink);
+    factory.append(scan, ProjectDefinition::new([0])).unwrap();
     factory
-        .inline_output(scan, ProjectDefinition::new([0]))
-        .unwrap()
-        .inline_output(
+        .append(
             scan,
             ExtendDefinition::try_new("offset", col("value") - lit(start)).unwrap(),
         )
-        .unwrap()
-        .inline_output(
+        .unwrap();
+    factory
+        .append(
             scan,
             FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap(),
         )
-        .unwrap()
-        .inline_output(
+        .unwrap();
+    factory
+        .append(
             scan,
             SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
                 .unwrap(),
         )
-        .unwrap()
-        .inline_output(
+        .unwrap();
+    factory
+        .append(
             scan,
             SchemaAlignDefinition::try_new([
                 SchemaAlignField::try_new("scan_value", col("scan_value"), false).unwrap(),
@@ -60,6 +56,12 @@ fn output_pipeline_runs_five_pure_stages_in_one_station_across_reopen() {
             .unwrap(),
         )
         .unwrap();
+    let sink = factory.station(
+        "sqlite",
+        SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap(),
+    );
+    factory.output_capacity_bytes(scan, CAPACITY);
+    factory.connect([scan], sink);
 
     let mut flow = factory.build().unwrap();
     assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["scan", "sqlite"]);
@@ -92,11 +94,11 @@ fn output_pipeline_runs_five_pure_stages_in_one_station_across_reopen() {
 
     let store = Store::open(&flow_path).unwrap();
     let _: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let _: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/relation_sink.state")
+        .open_data("station/00000001/operation/00000000/relation_sink.state")
         .unwrap();
     let transaction = store.read_transaction();
     let status = output.writer().status(transaction.access()).unwrap();
@@ -104,54 +106,47 @@ fn output_pipeline_runs_five_pure_stages_in_one_station_across_reopen() {
 }
 
 #[test]
-fn dropped_input_commits_only_ack_before_the_stateful_core_sees_a_later_change() {
+fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX - 1));
-    let count = factory.station("count", RunningEventCountDefinition::new());
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.output_capacity_bytes(count, CAPACITY);
-    factory.connect([scan], count);
-    factory.connect([count], sink);
+    let compute = factory.station("compute", SequenceScanDefinition::new(u64::MAX - 1));
     factory
-        .inline_input(
-            count,
-            0,
+        .append(
+            compute,
             FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
         )
         .unwrap();
+    factory
+        .append(compute, RunningEventCountDefinition::new())
+        .unwrap();
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(compute, CAPACITY);
+    factory.connect([compute], sink);
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let count: Cell<u64> = store
-        .open_data("station/00000001/operation/running_event_count.count")
+    let position: Cell<u64> = store
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
-    let scan_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let count_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .unwrap();
+    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let transaction = store.read_transaction();
+    assert_eq!(
+        position.read(transaction.access()).unwrap().get().unwrap(),
+        Some(u64::MAX)
+    );
     assert_eq!(
         count.read(transaction.access()).unwrap().get().unwrap(),
         Some(1)
     );
     assert_eq!(
-        scan_output
-            .subscription(0)
-            .status(transaction.access())
-            .unwrap()
-            .position,
-        2
-    );
-    assert_eq!(
-        count_output
-            .writer()
-            .status(transaction.access())
-            .unwrap()
-            .tail,
+        output.writer().status(transaction.access()).unwrap().tail,
         1
     );
     drop(transaction);
@@ -162,25 +157,95 @@ fn dropped_input_commits_only_ack_before_the_stateful_core_sees_a_later_change()
 }
 
 #[test]
-fn dropped_multi_input_rotates_the_durable_active_port() {
+fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("rollback");
+    let mut factory = FlowFactory::new(&path);
+    let compute = factory.station("compute", SequenceScanDefinition::new(u64::MAX));
+    factory
+        .append(compute, RunningEventCountDefinition::new())
+        .unwrap();
+    factory
+        .append(compute, RunningEventCountDefinition::new())
+        .unwrap();
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(compute, CAPACITY);
+    factory.connect([compute], sink);
+    drop(factory.build().unwrap());
+
+    let store = Store::open(&path).unwrap();
+    let second: Cell<u64> = store
+        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    second
+        .access(transaction.access())
+        .unwrap()
+        .set(&u64::MAX)
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(transactions);
+
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    let error = flow.advance().unwrap_err();
+    assert_eq!(error.station_id(), "compute");
+    assert!(!error.requires_reopen());
+    drop(flow);
+
+    let store = Store::open(&path).unwrap();
+    let position: Cell<u64> = store
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
+        .unwrap();
+    let first: Cell<u64> = store
+        .open_data("station/00000000/operation/00000001/running_event_count.count")
+        .unwrap();
+    let second: Cell<u64> = store
+        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .unwrap();
+    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
+    let transaction = store.read_transaction();
+    assert_eq!(
+        position.read(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
+    assert_eq!(
+        first.read(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
+    assert_eq!(
+        second.read(transaction.access()).unwrap().get().unwrap(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        output.writer().status(transaction.access()).unwrap().tail,
+        0
+    );
+}
+
+#[test]
+fn a_multi_input_head_preserves_ports_before_its_atomic_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let left = factory.station("left", SequenceScanDefinition::new(u64::MAX));
+    let left = factory.station("left", SequenceScanDefinition::new(u64::MAX - 1));
     let right = factory.station("right", SequenceScanDefinition::new(u64::MAX));
     let union = factory.station(
         "union",
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
     );
+    factory
+        .append(
+            union,
+            FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
+        )
+        .unwrap();
     let sink = factory.station("sink", DiscardDefinition::new());
     for station in [left, right, union] {
         factory.output_capacity_bytes(station, CAPACITY);
     }
     factory.connect([left, right], union);
     factory.connect([union], sink);
-    factory
-        .inline_input(union, 0, FilterDefinition::try_new(lit(false)).unwrap())
-        .unwrap();
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
@@ -194,7 +259,7 @@ fn dropped_multi_input_rotates_the_durable_active_port() {
     let transaction = store.read_transaction();
     assert_eq!(
         active.read(transaction.access()).unwrap().get().unwrap(),
-        Some(0)
+        Some(1)
     );
     assert_eq!(
         left_output
@@ -202,7 +267,7 @@ fn dropped_multi_input_rotates_the_durable_active_port() {
             .status(transaction.access())
             .unwrap()
             .position,
-        1
+        2
     );
     assert_eq!(
         right_output
@@ -218,102 +283,58 @@ fn dropped_multi_input_rotates_the_durable_active_port() {
             .status(transaction.access())
             .unwrap()
             .tail,
-        1
+        2
     );
-    drop(transaction);
-    drop(store);
-
-    let mut reopened = FlowFactory::new(&path).open().unwrap();
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
 }
 
 #[test]
-fn inline_binding_errors_report_direction_port_and_stage_without_creating_store() {
+fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
     let root = tempfile::tempdir().unwrap();
-    let input_path = root.path().join("input");
-    let mut input = FlowFactory::new(&input_path);
-    let scan = input.station("scan", SequenceScanDefinition::new(0));
-    let sink = input.station("sink", DiscardDefinition::new());
-    input.output_capacity_bytes(scan, CAPACITY);
-    input.connect([scan], sink);
-    input
-        .inline_input(sink, 0, ProjectDefinition::new([1]))
-        .unwrap();
-    let Err(FlowError::Schema(FlowSchemaError::InlineInput {
-        station_id,
-        port,
-        stage,
-        source: _,
-    })) = input.build()
-    else {
-        panic!("invalid input inline Schema unexpectedly built");
-    };
-    assert_eq!((station_id.as_str(), port, stage), ("sink", 0, 0));
-    assert!(!input_path.exists());
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
+    factory.append(scan, ProjectDefinition::new([0])).unwrap();
+    factory.append(scan, ProjectDefinition::new([1])).unwrap();
+    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.output_capacity_bytes(scan, CAPACITY);
+    factory.connect([scan], sink);
 
-    let output_path = root.path().join("output");
-    let mut output = FlowFactory::new(&output_path);
-    let scan = output.station("scan", SequenceScanDefinition::new(0));
-    let sink = output.station("sink", DiscardDefinition::new());
-    output.output_capacity_bytes(scan, CAPACITY);
-    output.connect([scan], sink);
-    output
-        .inline_output(scan, ProjectDefinition::new([0]))
-        .unwrap()
-        .inline_output(scan, ProjectDefinition::new([1]))
-        .unwrap();
-    let Err(FlowError::Schema(FlowSchemaError::InlineOutput {
+    let Err(FlowError::Schema(FlowSchemaError::Operation {
         station_id,
-        stage,
+        operation,
         source: _,
-    })) = output.build()
+    })) = factory.build()
     else {
-        panic!("invalid output inline Schema unexpectedly built");
+        panic!("invalid intermediate Schema unexpectedly built");
     };
-    assert_eq!((station_id.as_str(), stage), ("scan", 1));
-    assert!(!output_path.exists());
+    assert_eq!((station_id.as_str(), operation), ("scan", 2));
+    assert!(!path.exists());
 }
 
 #[test]
-fn inline_topology_rejects_invalid_ports_and_sink_outputs_without_side_effects() {
-    let root = tempfile::tempdir().unwrap();
-    let input_path = root.path().join("port");
-    let mut input = FlowFactory::new(&input_path);
-    let scan = input.station("scan", SequenceScanDefinition::new(0));
-    let sink = input.station("sink", DiscardDefinition::new());
-    input.output_capacity_bytes(scan, CAPACITY);
-    input.connect([scan], sink);
-    input
-        .inline_input(sink, 1, ProjectDefinition::new([0]))
-        .unwrap();
-    assert!(matches!(
-        input.build(),
-        Err(FlowError::Topology(
-            dogpaddle_flow::TopologyError::InlineInputPortOutOfRange {
-                station,
-                port: 1,
-                input_count: 1,
-            }
-        )) if station == "sink"
-    ));
-    assert!(!input_path.exists());
+fn append_rejects_non_atomic_operations_without_mutating_the_station() {
+    let mut factory = FlowFactory::new("");
+    let scan = factory.station("scan", SequenceScanDefinition::new(0));
+    assert_eq!(
+        factory
+            .append(scan, SequenceScanDefinition::new(1))
+            .err()
+            .unwrap(),
+        TopologyError::InvalidAppendedOperation {
+            station: "scan".to_owned(),
+            operation: 1,
+        }
+    );
+    factory.append(scan, ProjectDefinition::new([0])).unwrap();
 
-    let output_path = root.path().join("sink-output");
-    let mut output = FlowFactory::new(&output_path);
-    let scan = output.station("scan", SequenceScanDefinition::new(0));
-    let sink = output.station("sink", DiscardDefinition::new());
-    output.output_capacity_bytes(scan, CAPACITY);
-    output.connect([scan], sink);
-    output
-        .inline_output(sink, ProjectDefinition::new([0]))
-        .unwrap();
-    assert!(matches!(
-        output.build(),
-        Err(FlowError::Topology(
-            dogpaddle_flow::TopologyError::InlineOutputOnSink(station)
-        )) if station == "sink"
-    ));
-    assert!(!output_path.exists());
+    let sink = factory.station("sink", DiscardDefinition::new());
+    assert_eq!(
+        factory
+            .append(sink, ProjectDefinition::new([0]))
+            .err()
+            .unwrap(),
+        TopologyError::StationCannotBeExtended("sink".to_owned())
+    );
 }
 
 fn run_until_idle(flow: &mut dogpaddle_flow::Flow) {

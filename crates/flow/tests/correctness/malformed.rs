@@ -92,8 +92,9 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     rewrite_checksum(&mut unknown_operation);
     assert_eq!(
         definition_error(root.path(), "unknown-operation", &unknown_operation),
-        FlowDefinitionError::CoreOperation {
+        FlowDefinitionError::Operation {
             station_id: "scan".to_owned(),
+            operation: 0,
             source: DefinitionCodecError::UnknownTag(99),
         }
     );
@@ -105,8 +106,9 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     rewrite_checksum(&mut truncated_operation);
     assert_eq!(
         definition_error(root.path(), "truncated-operation", &truncated_operation),
-        FlowDefinitionError::CoreOperation {
+        FlowDefinitionError::Operation {
             station_id: "scan".to_owned(),
+            operation: 0,
             source: DefinitionCodecError::Truncated,
         }
     );
@@ -167,7 +169,7 @@ fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
 }
 
 #[test]
-fn open_locates_a_non_inline_operation_inside_an_output_pipeline() {
+fn open_locates_an_invalid_operation_inside_a_station_program() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let mut factory = FlowFactory::new(&source);
@@ -175,28 +177,26 @@ fn open_locates_a_non_inline_operation_inside_an_output_pipeline() {
     let sink = factory.station("sink", DiscardDefinition::new());
     factory.output_capacity_bytes(scan, NonZeroU64::MIN);
     factory.connect([scan], sink);
-    factory
-        .inline_output(scan, ProjectDefinition::new([0]))
-        .unwrap();
+    factory.append(scan, ProjectDefinition::new([0])).unwrap();
     drop(factory.build().unwrap());
 
     let mut encoded = read_published_definition(&source);
-    let inline_operation = encoded
+    let second_operation = encoded
         .windows(OPERATION_MAGIC.len())
         .enumerate()
         .filter_map(|(index, bytes)| (bytes == OPERATION_MAGIC).then_some(index))
         .nth(1)
         .unwrap();
-    let tag = inline_operation + OPERATION_MAGIC.len() + size_of::<u16>();
-    encoded[tag..tag + size_of::<u16>()].copy_from_slice(&3_u16.to_be_bytes());
+    let tag = second_operation + OPERATION_MAGIC.len() + size_of::<u16>();
+    encoded[tag..tag + size_of::<u16>()].copy_from_slice(&99_u16.to_be_bytes());
     rewrite_checksum(&mut encoded);
 
     assert_eq!(
-        definition_error(root.path(), "not-inline-capable", &encoded),
-        FlowDefinitionError::InlineOutputOperation {
+        definition_error(root.path(), "invalid-second-operation", &encoded),
+        FlowDefinitionError::Operation {
             station_id: "scan".to_owned(),
-            stage: 0,
-            source: DefinitionCodecError::NotInlineCapable(3),
+            operation: 1,
+            source: DefinitionCodecError::UnknownTag(99),
         }
     );
 }

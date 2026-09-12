@@ -10,7 +10,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Action, Operation, OperationError, OperationInput, TransactionalOperation},
+    operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
@@ -66,11 +66,11 @@ impl SealedDefinition for SequenceScanDefinition {
         _input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
         let start = self.start;
-        Ok(OperationBinding::new(
+        Ok(OperationBinding::turn(
             Some(output_schema()),
-            move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+            move |data: &mut DataInstances| -> Result<SequenceScanOperation, MaterializeError> {
                 let position = data.take(&POSITION)?;
-                Ok(Box::new(SequenceScanOperation::new(start, position)))
+                Ok(SequenceScanOperation::new(start, position))
             },
         ))
     }
@@ -102,30 +102,30 @@ impl SequenceScanOperation {
     }
 }
 
-impl TransactionalOperation for SequenceScanOperation {
-    fn apply(
-        &mut self,
+impl TurnOperation for SequenceScanOperation {
+    fn turn<'turn>(
+        &'turn mut self,
         input: Option<OperationInput<'_>>,
-        access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
+    ) -> Result<Turn<'turn>, OperationError> {
         if input.is_some() {
             return Err(SequenceScanError::UnexpectedInput.into());
         }
+        Ok(Turn::ready(move |access: TransactionAccess<'_>| {
+            let mut position = self.position.access(access)?;
+            let next = match position.get()? {
+                Some(previous) => {
+                    let Some(next) = previous.checked_add(1) else {
+                        return Ok((Action::Idle, AfterCommit::none()));
+                    };
+                    next
+                }
+                None => self.start,
+            };
+            let output = uint64_change(vec![next])?;
 
-        let mut position = self.position.access(access)?;
-        let next = match position.get()? {
-            Some(previous) => {
-                let Some(next) = previous.checked_add(1) else {
-                    return Ok(Action::Idle);
-                };
-                next
-            }
-            None => self.start,
-        };
-        let output = uint64_change(vec![next])?;
-
-        position.set(&next)?;
-        Ok(Action::Commit(Some(output)))
+            position.set(&next)?;
+            Ok((Action::Commit(Some(output)), AfterCommit::none()))
+        }))
     }
 }
 

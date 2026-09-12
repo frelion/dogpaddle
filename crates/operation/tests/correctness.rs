@@ -1,5 +1,7 @@
 #[path = "correctness/aggregate.rs"]
 mod aggregate;
+#[path = "correctness/atomic.rs"]
+mod atomic;
 #[path = "correctness/definition_codec.rs"]
 mod definition_codec;
 #[path = "correctness/discard.rs"]
@@ -12,8 +14,6 @@ mod expression;
 mod extend;
 #[path = "correctness/filter.rs"]
 mod filter;
-#[path = "correctness/inline.rs"]
-mod inline;
 #[path = "correctness/metamorphic.rs"]
 mod metamorphic;
 #[path = "correctness/mysql_cdc_scan.rs"]

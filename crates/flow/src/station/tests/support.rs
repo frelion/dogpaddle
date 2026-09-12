@@ -9,13 +9,13 @@ use std::{
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, encode_change};
-use dogpaddle_operation::{
-    InlineBinding, InlineOperationDefinition,
-    operation::{
-        Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
-    },
+use dogpaddle_operation::operation::{
+    Action, AfterCommit, AtomicOperation, Operation, OperationError, OperationInput,
+    PostCommitError, Turn, TurnOperation,
 };
-use dogpaddle_store::{Cell, ReadTransactions, Store, StoreError, SubscribedLog, Transactions};
+use dogpaddle_store::{
+    Cell, ReadTransactions, Store, StoreError, SubscribedLog, TransactionAccess, Transactions,
+};
 
 use crate::flow::AdvanceOutcome;
 
@@ -138,6 +138,31 @@ pub(super) struct ScriptedOperation {
     after_commit: Option<ScriptedAfterCommit>,
 }
 
+pub(super) struct FailingAtomic {
+    state: State,
+    value: Vec<u8>,
+}
+
+impl FailingAtomic {
+    pub(super) fn new(state: State, value: &[u8]) -> Self {
+        Self {
+            state,
+            value: value.to_vec(),
+        }
+    }
+}
+
+impl AtomicOperation for FailingAtomic {
+    fn apply(
+        &mut self,
+        _input: OperationInput<'_>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        self.state.access(access)?.set(&self.value)?;
+        Err(std::io::Error::other("planned atomic tail failure").into())
+    }
+}
+
 impl ScriptedOperation {
     pub(super) fn returning(action: Action) -> Self {
         Self {
@@ -185,7 +210,7 @@ impl ScriptedOperation {
     }
 }
 
-impl Operation for ScriptedOperation {
+impl TurnOperation for ScriptedOperation {
     fn turn<'turn>(
         &'turn mut self,
         _input: Option<OperationInput<'turn>>,
@@ -275,61 +300,13 @@ pub(super) fn scan_count_sink(
     )
 }
 
-pub(super) fn scan_count_sink_with_output_pipeline(
-    scan_capacity: NonZeroU64,
-    count_capacity: NonZeroU64,
-    output_pipeline: Vec<InlineBinding>,
-    output_schema: Arc<Schema>,
-) -> RuntimeFixture {
-    runtime_fixture_with_output_pipelines(
-        &[Vec::new(), vec![0], vec![1]],
-        vec![
-            Some((scan_capacity, value_schema())),
-            Some((count_capacity, output_schema)),
-            None,
-        ],
-        vec![
-            Action::Commit(Some(change(&[0]))),
-            Action::Idle,
-            Action::Complete(None),
-        ],
-        vec![Vec::new(), output_pipeline, Vec::new()],
-    )
-}
-
-pub(super) fn inline_binding<D>(
-    definition: D,
-    input_schema: &Arc<Schema>,
-) -> (InlineBinding, Arc<Schema>)
-where
-    D: InlineOperationDefinition,
-{
-    let definition = definition.try_into_inline().unwrap();
-    let binding = definition.bind(Arc::clone(input_schema)).unwrap();
-    let output_schema = Arc::clone(binding.output_schema());
-    (binding, output_schema)
-}
-
 fn runtime_fixture(
     inputs_by_station: &[Vec<usize>],
     outputs: Vec<Option<(NonZeroU64, Arc<Schema>)>>,
     actions: Vec<Action>,
 ) -> RuntimeFixture {
-    let output_pipelines = std::iter::repeat_with(Vec::new)
-        .take(inputs_by_station.len())
-        .collect();
-    runtime_fixture_with_output_pipelines(inputs_by_station, outputs, actions, output_pipelines)
-}
-
-fn runtime_fixture_with_output_pipelines(
-    inputs_by_station: &[Vec<usize>],
-    outputs: Vec<Option<(NonZeroU64, Arc<Schema>)>>,
-    actions: Vec<Action>,
-    output_pipelines: Vec<Vec<InlineBinding>>,
-) -> RuntimeFixture {
     assert_eq!(inputs_by_station.len(), outputs.len());
     assert_eq!(inputs_by_station.len(), actions.len());
-    assert_eq!(inputs_by_station.len(), output_pipelines.len());
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("flow")).unwrap();
     let states = (0..inputs_by_station.len())
@@ -343,9 +320,8 @@ fn runtime_fixture_with_output_pipelines(
         .iter()
         .zip(outputs)
         .zip(actions)
-        .zip(output_pipelines)
         .enumerate()
-        .map(|(station, (((inputs, output), action), output_pipeline))| {
+        .map(|(station, ((inputs, output), action))| {
             let active = (inputs.len() > 1).then(|| {
                 store
                     .create_data::<Cell<u32>>(&format!("active-{station}"))
@@ -357,14 +333,10 @@ fn runtime_fixture_with_output_pipelines(
                     .unwrap();
                 (log, capacity, schema)
             });
-            let input_pipelines = std::iter::repeat_with(Vec::new)
-                .take(inputs.len())
-                .collect();
             StationParts::new(
                 active,
-                Box::new(ScriptedOperation::returning(action)),
-                input_pipelines,
-                output_pipeline,
+                inputs.len(),
+                vec![turn_operation(ScriptedOperation::returning(action))],
                 output,
             )
         })
@@ -461,31 +433,12 @@ pub(super) fn raw_station_with_change_and_schemas(
     populated_change: &Change,
     output_schemas: &[Arc<Schema>],
 ) -> MultiInputFixture {
-    let input_pipelines = std::iter::repeat_with(Vec::new)
-        .take(inputs.len())
-        .collect();
     raw_station_with_program(
         inputs,
         populated,
         populated_change,
         output_schemas,
-        input_pipelines,
-        Box::new(ScriptedOperation::returning(action)),
-    )
-}
-
-pub(super) fn single_input_station_with_pipeline(
-    populated_change: &Change,
-    input_pipeline: Vec<InlineBinding>,
-    operation: Box<dyn Operation>,
-) -> MultiInputFixture {
-    raw_station_with_program(
-        &[0],
-        &[0],
-        populated_change,
-        &[populated_change.schema()],
-        vec![input_pipeline],
-        operation,
+        turn_operation(ScriptedOperation::returning(action)),
     )
 }
 
@@ -494,10 +447,8 @@ fn raw_station_with_program(
     populated: &[usize],
     populated_change: &Change,
     output_schemas: &[Arc<Schema>],
-    input_pipelines: Vec<Vec<InlineBinding>>,
-    operation: Box<dyn Operation>,
+    operation: Operation,
 ) -> MultiInputFixture {
-    assert_eq!(input_pipelines.len(), inputs.len());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut store = Store::create(&path).unwrap();
@@ -512,7 +463,7 @@ fn raw_station_with_program(
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let parts = StationParts::new(active, operation, input_pipelines, Vec::new(), None);
+    let parts = StationParts::new(active, inputs.len(), vec![operation], None);
     let subscribers = {
         let mut counts = vec![0_u64; output_count];
         for input in inputs {
@@ -602,9 +553,8 @@ pub(super) fn reopen_multi_input(fixture: MultiInputFixture, action: Action) -> 
 fn station_parts(active: Option<Cell<u32>>, input_count: usize, action: Action) -> StationParts {
     StationParts::new(
         active,
-        Box::new(ScriptedOperation::returning(action)),
-        std::iter::repeat_with(Vec::new).take(input_count).collect(),
-        Vec::new(),
+        input_count,
+        vec![turn_operation(ScriptedOperation::returning(action))],
         None,
     )
 }
@@ -648,6 +598,10 @@ pub(super) fn set_result(station: &mut Station, state: &State, value: &[u8], res
         value,
         result,
     )));
+}
+
+pub(super) fn turn_operation(operation: ScriptedOperation) -> Operation {
+    Operation::Turn(Box::new(operation))
 }
 
 pub(super) fn poisoned_script(state: &State, value: &[u8], action: Action) -> ScriptedOperation {

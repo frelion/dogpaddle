@@ -1,9 +1,6 @@
 use std::{collections::HashMap, num::NonZeroU64};
 
-use dogpaddle_operation::{
-    InlineDefinition, decode_definition, decode_inline_definition, encode_definition,
-    encode_inline_definition,
-};
+use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
 
 use crate::assembly::{ResolvedTopology, resolve_topology};
@@ -52,37 +49,13 @@ pub enum FlowDefinitionError {
         /// Missing input ID.
         input_id: String,
     },
-    /// A Station's durable core Operation definition is invalid or unsupported.
-    #[error("station {station_id:?} core definition is invalid: {source}")]
-    CoreOperation {
-        /// Stable ID of the Station containing the core.
+    /// One Operation definition is invalid or unsupported.
+    #[error("station {station_id:?} operation {operation} definition is invalid: {source}")]
+    Operation {
+        /// Stable ID of the Station containing the Operation.
         station_id: String,
-        /// Operation codec failure.
-        #[source]
-        source: dogpaddle_operation::DefinitionCodecError,
-    },
-    /// An input pipeline Operation definition is invalid or unsupported.
-    #[error(
-        "station {station_id:?} input {port} inline stage {stage} definition is invalid: {source}"
-    )]
-    InlineInputOperation {
-        /// Stable ID of the Station containing the stage.
-        station_id: String,
-        /// Zero-based input port.
-        port: usize,
-        /// Zero-based stage ordinal in the input pipeline.
-        stage: usize,
-        /// Operation codec failure.
-        #[source]
-        source: dogpaddle_operation::DefinitionCodecError,
-    },
-    /// An output pipeline Operation definition is invalid or unsupported.
-    #[error("station {station_id:?} output inline stage {stage} definition is invalid: {source}")]
-    InlineOutputOperation {
-        /// Stable ID of the Station containing the stage.
-        station_id: String,
-        /// Zero-based stage ordinal in the output pipeline.
-        stage: usize,
+        /// Zero-based Operation ordinal.
+        operation: usize,
         /// Operation codec failure.
         #[source]
         source: dogpaddle_operation::DefinitionCodecError,
@@ -106,8 +79,12 @@ pub(crate) fn station_output_name(index: usize) -> String {
     format!("station/{index:08x}/output")
 }
 
-pub(crate) fn station_operation_data_name(index: usize, logical_name: &str) -> String {
-    format!("station/{index:08x}/operation/{logical_name}")
+pub(crate) fn station_operation_data_name(
+    station: usize,
+    operation: usize,
+    logical_name: &str,
+) -> String {
+    format!("station/{station:08x}/operation/{operation:08x}/{logical_name}")
 }
 
 pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {
@@ -120,24 +97,23 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
 
     for station in definition.stations() {
         encode_string(&mut encoded, station.id(), "station ID")?;
-        let operation = encode_definition(station.core());
-        encode_bytes(&mut encoded, &operation, "operation definition")?;
+        let operation_count = u32::try_from(station.operations().len())
+            .map_err(|_| FlowDefinitionError::LengthOverflow("operation count"))?;
+        encoded.extend_from_slice(&operation_count.to_be_bytes());
+        for operation in station.operations() {
+            let operation = encode_definition(operation.as_ref());
+            encode_bytes(&mut encoded, &operation, "operation definition")?;
+        }
         let input_count = u32::try_from(station.inputs().len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("input count"))?;
         encoded.extend_from_slice(&input_count.to_be_bytes());
         for input in station.input_definitions() {
             encode_string(&mut encoded, input.station_id(), "input ID")?;
-            encode_inline_pipeline(&mut encoded, input.inline())?;
         }
         if let Some(capacity) = station.output_capacity_bytes() {
             encoded.push(1);
             encoded.extend_from_slice(&capacity.get().to_be_bytes());
-            encode_inline_pipeline(&mut encoded, station.output_inline())?;
         } else {
-            assert!(
-                station.output_inline().is_empty(),
-                "an outputless Station cannot encode an output pipeline"
-            );
             encoded.push(0);
         }
     }
@@ -180,52 +156,38 @@ pub(crate) fn decode(
     let mut stations = Vec::new();
     for _ in 0..station_count {
         let id = cursor.read_string()?;
-        let core = decode_definition(cursor.read_bytes()?).map_err(|source| {
-            FlowDefinitionError::CoreOperation {
-                station_id: id.clone(),
-                source,
-            }
-        })?;
+        let operation_count = cursor.read_u32()?;
+        let mut operations = Vec::new();
+        for operation in 0..operation_count {
+            let operation =
+                usize::try_from(operation).expect("a u32 Operation ordinal fits supported targets");
+            operations.push(decode_definition(cursor.read_bytes()?).map_err(|source| {
+                FlowDefinitionError::Operation {
+                    station_id: id.clone(),
+                    operation,
+                    source,
+                }
+            })?);
+        }
         let input_count = cursor.read_u32()?;
         let mut inputs = Vec::new();
-        for port in 0..input_count {
-            inputs.push(InputDefinition::new(
-                cursor.read_string()?,
-                decode_inline_pipeline(&mut cursor, |stage, source| {
-                    FlowDefinitionError::InlineInputOperation {
-                        station_id: id.clone(),
-                        port: usize::try_from(port)
-                            .expect("a u32 input port fits supported targets"),
-                        stage,
-                        source,
-                    }
-                })?,
-            ));
+        for _ in 0..input_count {
+            inputs.push(InputDefinition::new(cursor.read_string()?));
         }
-        let (output_capacity_bytes, output_inline) = match cursor.read_u8()? {
-            0 => (None, Vec::new()),
+        let output_capacity_bytes = match cursor.read_u8()? {
+            0 => None,
             1 => {
                 let capacity = NonZeroU64::new(cursor.read_u64()?)
                     .ok_or(FlowDefinitionError::ZeroOutputCapacity)?;
-                (
-                    Some(capacity),
-                    decode_inline_pipeline(&mut cursor, |stage, source| {
-                        FlowDefinitionError::InlineOutputOperation {
-                            station_id: id.clone(),
-                            stage,
-                            source,
-                        }
-                    })?,
-                )
+                Some(capacity)
             }
             presence => return Err(FlowDefinitionError::InvalidOutputPresence(presence)),
         };
         stations.push(StationDefinition {
             id,
-            core,
+            operations,
             output_capacity_bytes,
             inputs,
-            output_inline,
         });
     }
     if !cursor.is_empty() {
@@ -270,39 +232,6 @@ fn validate_definition(
     let schedule = validate_decoded_topology(&stations, &inputs_by_station)?;
     let topology = resolve_topology(inputs_by_station, schedule);
     Ok((FlowDefinition::new(stations), topology))
-}
-
-fn encode_inline_pipeline(
-    encoded: &mut Vec<u8>,
-    definitions: &[InlineDefinition],
-) -> Result<(), FlowDefinitionError> {
-    let count = u32::try_from(definitions.len())
-        .map_err(|_| FlowDefinitionError::LengthOverflow("inline stage count"))?;
-    encoded.extend_from_slice(&count.to_be_bytes());
-    for definition in definitions {
-        let definition = encode_inline_definition(definition);
-        encode_bytes(encoded, &definition, "inline operation definition")?;
-    }
-    Ok(())
-}
-
-fn decode_inline_pipeline<F>(
-    cursor: &mut Cursor<'_>,
-    map_error: F,
-) -> Result<Vec<InlineDefinition>, FlowDefinitionError>
-where
-    F: Fn(usize, dogpaddle_operation::DefinitionCodecError) -> FlowDefinitionError,
-{
-    let count = cursor.read_u32()?;
-    let mut definitions = Vec::new();
-    for stage in 0..count {
-        let stage = usize::try_from(stage).expect("a u32 stage ordinal fits supported targets");
-        definitions.push(
-            decode_inline_definition(cursor.read_bytes()?)
-                .map_err(|source| map_error(stage, source))?,
-        );
-    }
-    Ok(definitions)
 }
 
 fn encode_string(

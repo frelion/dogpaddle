@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    InlineDefinition, InlineEligibilityError, OperationDefinition,
+    OperationDefinition,
     operation::{scan, sink, transform},
 };
 
@@ -9,7 +9,6 @@ const MAGIC: &[u8] = b"dogpaddle.operation\0";
 const FORMAT_VERSION: u16 = 1;
 
 pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
-pub(crate) type InlineDecodeFn = fn(&[u8]) -> Result<InlineDefinition, DefinitionCodecError>;
 
 pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     (scan::mysql_cdc::TAG, scan::mysql_cdc::decode_definition),
@@ -50,29 +49,6 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
     (sink::sqlite::TAG, sink::sqlite::decode_definition),
 ];
 
-pub(crate) const INLINE_DECODERS: &[(u16, InlineDecodeFn)] = &[
-    (
-        transform::project::TAG,
-        transform::project::decode_inline_definition,
-    ),
-    (
-        transform::filter::TAG,
-        transform::filter::decode_inline_definition,
-    ),
-    (
-        transform::extend::TAG,
-        transform::extend::decode_inline_definition,
-    ),
-    (
-        transform::select::TAG,
-        transform::select::decode_inline_definition,
-    ),
-    (
-        transform::schema_align::TAG,
-        transform::schema_align::decode_inline_definition,
-    ),
-];
-
 /// Versioned operation-definition encoding failure.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
@@ -89,12 +65,6 @@ pub enum DefinitionCodecError {
     /// The operation variant tag is unknown to this binary.
     #[error("unknown operation definition tag {0}")]
     UnknownTag(u16),
-    /// The tag names a known Operation that does not implement inline execution.
-    #[error("operation definition tag {0} is not inline-capable")]
-    NotInlineCapable(u16),
-    /// The payload is valid for a normal Operation but unsafe to replay inline.
-    #[error("operation definition is not eligible for inline execution: {0}")]
-    InlineIneligible(#[source] InlineEligibilityError),
     /// A known operation variant contains a non-canonical persistent payload.
     #[error("operation definition payload is invalid: {0}")]
     InvalidPayload(&'static str),
@@ -118,16 +88,6 @@ pub fn encode_definition(definition: &dyn OperationDefinition) -> Vec<u8> {
     encoded
 }
 
-/// Encodes an inline definition using the normal Operation tag and payload.
-///
-/// The result is byte-for-byte identical to encoding the originating concrete
-/// definition with [`encode_definition`]. The separate entrypoint preserves the
-/// inline capability after type erasure.
-#[must_use]
-pub fn encode_inline_definition(definition: &InlineDefinition) -> Vec<u8> {
-    encode_definition(definition.as_operation_definition())
-}
-
 /// Decodes one definition from `DogPaddle`'s versioned binary format.
 ///
 /// # Errors
@@ -143,28 +103,6 @@ pub fn decode_definition(
         .find_map(|(registered, decoder)| (*registered == tag).then_some(*decoder))
         .ok_or(DefinitionCodecError::UnknownTag(tag))?;
     decoder(payload)
-}
-
-/// Decodes and validates one inline-capable Operation definition.
-///
-/// # Errors
-///
-/// Returns [`DefinitionCodecError::NotInlineCapable`] for a known normal
-/// Operation without the sealed inline capability, and
-/// [`DefinitionCodecError::InlineIneligible`] when the concrete payload uses a
-/// non-replay-safe expression.
-pub fn decode_inline_definition(encoded: &[u8]) -> Result<InlineDefinition, DefinitionCodecError> {
-    let (tag, payload) = decode_header(encoded)?;
-    let decoder = INLINE_DECODERS
-        .iter()
-        .find_map(|(registered, decoder)| (*registered == tag).then_some(*decoder));
-    match decoder {
-        Some(decoder) => decoder(payload),
-        None if DECODERS.iter().any(|(registered, _)| *registered == tag) => {
-            Err(DefinitionCodecError::NotInlineCapable(tag))
-        }
-        None => Err(DefinitionCodecError::UnknownTag(tag)),
-    }
 }
 
 fn decode_header(encoded: &[u8]) -> Result<(u16, &[u8]), DefinitionCodecError> {

@@ -300,7 +300,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     );
     assert!(matches!(
         rollback_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(OperationInput {
                 port: 0,
                 change: &change,

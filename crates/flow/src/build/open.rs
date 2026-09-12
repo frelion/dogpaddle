@@ -26,14 +26,11 @@ impl FlowFactory {
     /// published, or another [`FlowError`] when the Store, definition, topology,
     /// or required station resources are invalid. Returns
     /// [`FlowError::OpenWithDefinition`] if this factory also declares topology,
-    /// output capacities, or inline pipelines; open accepts only the path and
-    /// runtime resources.
+    /// or output capacities; open accepts only the path and runtime resources.
     pub fn open(self) -> Result<Flow, FlowError> {
         if !self.stations.is_empty()
             || !self.connections.is_empty()
             || !self.output_capacities.is_empty()
-            || !self.input_inline.is_empty()
-            || !self.output_inline.is_empty()
         {
             return Err(FlowError::OpenWithDefinition);
         }
@@ -112,16 +109,32 @@ fn open_station_part(
     let active = (station.inputs().len() > 1)
         .then(|| open_required_data::<Cell<u32>>(store, &codec::station_active_input_name(index)))
         .transpose()?;
-    let definition = station.core();
-    let mut data = DataInstances::new();
-    for declaration in definition.data() {
-        let physical_name = codec::station_operation_data_name(index, declaration.name());
-        let instance = require_resource(&physical_name, declaration.open(store, &physical_name))?;
-        data.insert(instance)?;
-    }
     let output_schema = binding.output_schema().cloned();
-    let (core_binding, input_bindings, output_bindings) = binding.into_parts();
-    let operation = core_binding.materialize(data, resource)?;
+    let mut resource = Some(resource);
+    let operations = station
+        .operations()
+        .iter()
+        .zip(binding.into_operations())
+        .enumerate()
+        .map(|(operation, (definition, binding))| {
+            let mut data = DataInstances::new();
+            for declaration in definition.data() {
+                let physical_name =
+                    codec::station_operation_data_name(index, operation, declaration.name());
+                let instance =
+                    require_resource(&physical_name, declaration.open(store, &physical_name))?;
+                data.insert(instance)?;
+            }
+            let resource = if operation == 0 {
+                resource
+                    .take()
+                    .expect("the first Operation uniquely owns the Station resource")
+            } else {
+                RuntimeResource::default()
+            };
+            binding.materialize(data, resource).map_err(FlowError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);
@@ -138,9 +151,8 @@ fn open_station_part(
     };
     Ok(StationParts::new(
         active,
-        operation,
-        input_bindings,
-        output_bindings,
+        station.input_count(),
+        operations,
         output,
     ))
 }

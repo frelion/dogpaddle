@@ -71,7 +71,7 @@ fn change(departments: &[&str], values: &[Option<i64>], diffs: &[i64]) -> Change
 fn create_operation(
     root: &TestStore,
     definition: &dyn OperationDefinition,
-) -> (Box<dyn Operation>, Transactions) {
+) -> (Operation, Transactions) {
     create_operation_for_schema(root, definition, input_schema())
 }
 
@@ -79,7 +79,7 @@ fn create_operation_for_schema(
     root: &TestStore,
     definition: &dyn OperationDefinition,
     schema: SchemaRef,
-) -> (Box<dyn Operation>, Transactions) {
+) -> (Operation, Transactions) {
     let mut store = Store::create(root.path()).unwrap();
     for (declaration, physical) in definition
         .data()
@@ -236,12 +236,7 @@ fn aggregate_trace(events: &[(&str, Option<i64>, i64)], batches: &[usize]) -> Ve
             &batch.iter().map(|event| event.2).collect::<Vec<_>>(),
         );
         append_output(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&input)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
             &mut output,
         );
         start += rows;
@@ -256,9 +251,12 @@ fn definition_binds_one_operation_and_three_private_data_objects() {
         &definition,
         AGGREGATE_V1,
         14,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
-    assert_eq!(definition.kind(), OperationKind::Transform(NonZeroU32::MIN));
+    assert_eq!(
+        definition.kind(),
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
+    );
     assert_eq!(definition.persistence_tag(), 14);
     assert_eq!(
         data_names(&definition),
@@ -301,12 +299,9 @@ fn count_sum_average_and_extrema_follow_ordered_group_transitions() {
         &[Some(10), Some(20), None, Some(10), Some(20), None],
         &[1, 1, 1, -1, -1, -1],
     );
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Aggregate did not emit its group transitions");
     };
 
@@ -341,12 +336,9 @@ fn unchanged_extrema_do_not_emit_redundant_rows() {
         &[Some(10), Some(20), Some(20)],
         &[1, 1, -1],
     );
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Aggregate did not emit the new group");
     };
     assert_eq!(output.num_rows(), 1);
@@ -366,12 +358,9 @@ fn extrema_order_signed_values_by_value() {
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root, &definition);
     let input = change(&["A", "A", "A"], &[Some(0), Some(-10), Some(5)], &[1, 1, 1]);
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Aggregate did not emit extrema transitions");
     };
     let minimum = output
@@ -391,7 +380,7 @@ fn extrema_order_signed_values_by_value() {
 
     let retract = change(&["A"], &[Some(-10)], &[-1]);
     let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&retract)),
         &mut transactions,
     )
@@ -455,12 +444,9 @@ fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, 1, 1])).unwrap();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Aggregate did not emit byte extrema transitions");
     };
     let last = output.num_rows() - 1;
@@ -536,7 +522,7 @@ fn extrema_multiplicity_and_group_partitions_are_independent() {
         vec![1, 1, 1],
     );
     commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&initial)),
         &mut transactions,
     )
@@ -545,7 +531,7 @@ fn extrema_multiplicity_and_group_partitions_are_independent() {
     let retract_one = make_change(vec!["A"], vec![1], vec![5], vec![-1]);
     assert!(matches!(
         commit_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(turn_input(&retract_one)),
             &mut transactions,
         )
@@ -555,7 +541,7 @@ fn extrema_multiplicity_and_group_partitions_are_independent() {
 
     let extend_other_group = make_change(vec!["B"], vec![4], vec![7], vec![1]);
     let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&extend_other_group)),
         &mut transactions,
     )
@@ -625,12 +611,9 @@ fn empty_call_list_groups_rows_without_redundant_updates() {
         &[Some(10), Some(20), Some(10), Some(20)],
         &[2, 1, -2, -1],
     );
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("group-only Aggregate did not emit presence transitions");
     };
     let groups = output
@@ -682,12 +665,9 @@ fn unsigned_sum_and_average_use_input_multiplicity() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![2, 1])).unwrap();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("unsigned Aggregate did not emit output");
     };
     let sums = output
@@ -723,7 +703,7 @@ fn exact_row_admission_rolls_back_the_whole_change() {
     let (mut operation, mut transactions) = create_operation(&root, &definition);
     let initial = change(&["A"], &[Some(10)], &[1]);
     commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&initial)),
         &mut transactions,
     )
@@ -731,7 +711,7 @@ fn exact_row_admission_rolls_back_the_whole_change() {
 
     let invalid = change(&["B", "A"], &[Some(20), Some(11)], &[1, -1]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&invalid)),
         &mut transactions,
     )
@@ -742,12 +722,9 @@ fn exact_row_admission_rolls_back_the_whole_change() {
     ));
 
     let retry = change(&["B"], &[Some(30)], &[1]);
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&retry)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&retry)), &mut transactions).unwrap()
+    else {
         panic!("rolled-back group leaked into durable state");
     };
     assert_eq!(output.diffs().values(), &[1]);
@@ -771,7 +748,7 @@ fn count_overflow_rolls_back_the_whole_turn() {
     let (mut operation, mut transactions) = create_operation(&root, &definition);
     let initial = change(&["A"], &[Some(10)], &[i64::MAX]);
     commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&initial)),
         &mut transactions,
     )
@@ -779,7 +756,7 @@ fn count_overflow_rolls_back_the_whole_turn() {
 
     let overflow = change(&["A"], &[Some(10)], &[1]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&overflow)),
         &mut transactions,
     )
@@ -791,7 +768,7 @@ fn count_overflow_rolls_back_the_whole_turn() {
 
     let retract = change(&["A"], &[Some(10)], &[-i64::MAX]);
     let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&retract)),
         &mut transactions,
     )
@@ -820,7 +797,7 @@ fn decoded_definition_reopens_group_and_index_state() {
     let (mut operation, mut transactions) = create_operation(&root, &definition);
     let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
     commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&initial)),
         &mut transactions,
     )
@@ -838,7 +815,7 @@ fn decoded_definition_reopens_group_and_index_state() {
     let mut transactions = store.into_transactions();
     let retract_min = change(&["A"], &[Some(10)], &[-1]);
     let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&retract_min)),
         &mut transactions,
     )

@@ -13,7 +13,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{Action, Operation, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 2;
@@ -35,6 +35,7 @@ pub struct RunningEventCountDefinition {
 /// This value stores only its persistent count. It never retains its definition
 /// or begins, commits, or stores a transaction.
 pub struct RunningEventCountOperation {
+    input_schema: SchemaRef,
     count: Cell<u64>,
 }
 
@@ -42,15 +43,15 @@ pub struct RunningEventCountOperation {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunningEventCountError {
-    /// The input Operation was called without a Change.
-    #[error("running event count requires one input Change")]
-    MissingInput,
     /// `RunningEventCount` only accepts its definition's first input port.
     #[error("running event count does not accept input port {port}")]
     InvalidInputPort {
         /// Rejected zero-based port index.
         port: usize,
     },
+    /// Runtime input differs from the exact Schema used during binding.
+    #[error("running event count input schema differs from its bound schema")]
+    InputSchemaMismatch,
     /// The durable count plus the input row count cannot be represented by [`u64`].
     #[error("running event count overflow")]
     Overflow,
@@ -71,13 +72,14 @@ impl RunningEventCountDefinition {
 impl SealedDefinition for RunningEventCountDefinition {
     fn bind_schemas(
         &self,
-        _input_schemas: &[SchemaRef],
+        input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::new(
-            Some(output_schema()),
-            |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+        let input_schema = Arc::clone(&input_schemas[0]);
+        Ok(OperationBinding::atomic(
+            output_schema(),
+            move |data: &mut DataInstances| -> Result<RunningEventCountOperation, MaterializeError> {
                 let count = data.take(&COUNT)?;
-                Ok(Box::new(RunningEventCountOperation::new(count)))
+                Ok(RunningEventCountOperation::new(input_schema, count))
             },
         ))
     }
@@ -85,7 +87,7 @@ impl SealedDefinition for RunningEventCountDefinition {
 
 impl OperationDefinition for RunningEventCountDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -102,20 +104,25 @@ impl OperationDefinition for RunningEventCountDefinition {
 impl RunningEventCountOperation {
     /// Creates a running event-count operation from its durable count.
     #[must_use]
-    pub const fn new(count: Cell<u64>) -> Self {
-        Self { count }
+    pub const fn new(input_schema: SchemaRef, count: Cell<u64>) -> Self {
+        Self {
+            input_schema,
+            count,
+        }
     }
 }
 
-impl TransactionalOperation for RunningEventCountOperation {
+impl AtomicOperation for RunningEventCountOperation {
     fn apply(
         &mut self,
-        input: Option<OperationInput<'_>>,
+        input: OperationInput<'_>,
         access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(RunningEventCountError::MissingInput)?;
+    ) -> Result<Option<Change>, OperationError> {
         if input.port != 0 {
             return Err(RunningEventCountError::InvalidInputPort { port: input.port }.into());
+        }
+        if input.change.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(RunningEventCountError::InputSchemaMismatch.into());
         }
 
         let mut count = self.count.access(access)?;
@@ -132,7 +139,7 @@ impl TransactionalOperation for RunningEventCountOperation {
         let output = uint64_change(values)?;
 
         count.set(&final_count)?;
-        Ok(Action::Complete(Some(output)))
+        Ok(Some(output))
     }
 }
 

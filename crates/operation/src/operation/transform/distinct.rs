@@ -11,10 +11,7 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::{DataName, Sealed as SealedDefinition},
-    operation::{
-        Action, Operation, OperationError, OperationInput, TransactionalOperation,
-        relation::canonical_row,
-    },
+    operation::{AtomicOperation, OperationError, OperationInput, relation::canonical_row},
 };
 
 pub(crate) const TAG: u16 = 13;
@@ -45,9 +42,6 @@ pub struct DistinctOperation {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DistinctError {
-    /// The input Operation was called without a Change.
-    #[error("distinct requires one input Change")]
-    MissingInput,
     /// Distinct only accepts its Definition's first input port.
     #[error("distinct does not accept input port {port}")]
     InvalidInputPort {
@@ -95,14 +89,14 @@ impl SealedDefinition for DistinctDefinition {
             .first()
             .expect("the final binding entrypoint enforces Distinct input arity");
         let runtime_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::new(
-            Some(Arc::clone(input_schema)),
-            move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
+        Ok(OperationBinding::atomic(
+            Arc::clone(input_schema),
+            move |data: &mut DataInstances| -> Result<DistinctOperation, MaterializeError> {
                 let weights = data.take(&WEIGHTS)?;
-                Ok(Box::new(DistinctOperation {
+                Ok(DistinctOperation {
                     input_schema: runtime_schema,
                     weights,
-                }))
+                })
             },
         ))
     }
@@ -110,7 +104,7 @@ impl SealedDefinition for DistinctDefinition {
 
 impl OperationDefinition for DistinctDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -124,13 +118,12 @@ impl OperationDefinition for DistinctDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-impl TransactionalOperation for DistinctOperation {
+impl AtomicOperation for DistinctOperation {
     fn apply(
         &mut self,
-        input: Option<OperationInput<'_>>,
+        input: OperationInput<'_>,
         access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(DistinctError::MissingInput)?;
+    ) -> Result<Option<Change>, OperationError> {
         if input.port != 0 {
             return Err(DistinctError::InvalidInputPort { port: input.port }.into());
         }
@@ -160,7 +153,7 @@ impl TransactionalOperation for DistinctOperation {
         }
 
         if output_diffs.is_empty() {
-            return Ok(Action::Complete(None));
+            return Ok(None);
         }
         let records = if output_diffs.len() == input.change.num_rows() {
             input.change.records().clone()
@@ -170,7 +163,7 @@ impl TransactionalOperation for DistinctOperation {
         };
         let output = Change::try_new(records, Int64Array::from(output_diffs))
             .map_err(DistinctError::Change)?;
-        Ok(Action::Complete(Some(output)))
+        Ok(Some(output))
     }
 }
 

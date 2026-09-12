@@ -9,13 +9,11 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
-    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
-    definition::{InlineSealed, Sealed as SealedDefinition},
+    definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 5;
@@ -57,9 +55,6 @@ pub enum FilterSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FilterError {
-    /// The input Operation was called without a Change.
-    #[error("filter requires one input Change")]
-    MissingInput,
     /// Filter only accepts its Definition's first input port.
     #[error("filter does not accept input port {port}")]
     InvalidInputPort {
@@ -128,32 +123,20 @@ impl SealedDefinition for FilterDefinition {
         let operation = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data(
-            Some(Arc::clone(input_schema)),
+        Ok(OperationBinding::without_data_atomic(
+            Arc::clone(input_schema),
             operation,
         ))
     }
 }
 
-impl InlineSealed for FilterDefinition {
-    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
-        self.predicate.ensure_inline_eligible(0)
-    }
-
-    fn bind_inline_schema(
-        &self,
-        input_schema: SchemaRef,
-    ) -> Result<InlineBinding, OperationSchemaError> {
-        let operation = self
-            .bind_operation(&input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(InlineBinding::new(input_schema, operation))
-    }
-}
-
 impl OperationDefinition for FilterDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        if self.predicate.is_atomic() {
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
+        } else {
+            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
+        }
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -169,8 +152,16 @@ impl OperationDefinition for FilterDefinition {
     }
 }
 
-impl InlineTransform for FilterOperation {
-    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+impl AtomicOperation for FilterOperation {
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        if input.port != 0 {
+            return Err(FilterError::InvalidInputPort { port: input.port }.into());
+        }
+        let input = input.change;
         let predicate = self
             .predicate
             .evaluate(input.records())
@@ -203,21 +194,6 @@ impl InlineTransform for FilterOperation {
     }
 }
 
-impl TransactionalOperation for FilterOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(FilterError::MissingInput)?;
-        if input.port != 0 {
-            return Err(FilterError::InvalidInputPort { port: input.port }.into());
-        }
-
-        InlineTransform::apply(self, input.change).map(Action::Complete)
-    }
-}
-
 fn canonical_record_batch(records: &RecordBatch) -> Result<RecordBatch, ArrowError> {
     let columns = records
         .columns()
@@ -232,14 +208,6 @@ pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     decode_filter(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-pub(crate) fn decode_inline_definition(
-    payload: &[u8],
-) -> Result<InlineDefinition, DefinitionCodecError> {
-    decode_filter(payload)?
-        .try_into_inline()
-        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 fn decode_filter(payload: &[u8]) -> Result<FilterDefinition, DefinitionCodecError> {

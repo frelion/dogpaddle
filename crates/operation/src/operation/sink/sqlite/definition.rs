@@ -14,10 +14,7 @@ use crate::{
     OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    operation::{
-        Operation,
-        sink::relation::{DATA, RelationalSink, STATE},
-    },
+    operation::sink::relation::{DATA, RelationalSink, STATE},
 };
 
 pub(crate) const TAG: u16 = 10;
@@ -170,14 +167,14 @@ impl SealedDefinition for SqliteSinkDefinition {
         )
         .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         let schema = Arc::clone(input_schema);
-        Ok(OperationBinding::new(
+        Ok(OperationBinding::turn(
             None,
-            move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(RelationalSink::new(
+            move |data: &mut DataInstances| -> Result<RelationalSink<SqliteTarget>, MaterializeError> {
+                Ok(RelationalSink::new(
                     schema,
                     target,
                     data.take(&STATE)?,
-                )))
+                ))
             },
         ))
     }

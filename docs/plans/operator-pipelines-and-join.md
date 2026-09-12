@@ -3,7 +3,7 @@
 状态：提案  
 日期：2026-09-11
 
-Station pipeline 与 SQL deterministic grouping 已经直接落入当前 v1：一个 Station 包含恰好一个 core Operation，并可在各输入端口和 core output 上组合纯 inline transforms。其 canonical 设计、事务语义、装配规则和验证证据统一记录在
+线性 Station 与 SQL deterministic grouping 已经直接落入当前 v1：一个 Station 保存一个非空、有序的普通 Operation 列表，列表共享事务且只持久化最终输出。其 canonical 设计、事务语义、装配规则和验证证据统一记录在
 [`station-pipelines-and-durable-boundaries.md`](station-pipelines-and-durable-boundaries.md)。本文只说明 Join 的后续语义、状态和实施顺序。
 
 ## 目标与决策
@@ -14,7 +14,7 @@ Station pipeline 与 SQL deterministic grouping 已经直接落入当前 v1：�
 ... JOIN right ON normalize(left.a) = right.b
 ```
 
-不需要先创建 helper Extend，也不产生只为 key 计算服务的中间持久日志。Join 是 Station core；现有 SQL grouping 可以继续把其前后的合格纯变换装入 input/output pipeline。
+不需要先创建 helper Extend，也不产生只为 key 计算服务的中间持久日志。需要跨 turn continuation 的 Join 作为独占 Station；若未来证明它能完整消费一个 Change，则可作为多输入 Atomic 位于 Station 首项并吸收后续单输入 Atomic。
 
 当前决策是：
 
@@ -81,7 +81,7 @@ LoweredRelation {
 }
 ```
 
-表达式先按 logical qualifier/ordinal 解析，再改写为对应输入侧的唯一物理字段。Join Definition 保存显式 output mapping；Join 后的 projection 继续由 SchemaAlign 表达，并可由现有 grouping 装入 Join output pipeline。
+表达式先按 logical qualifier/ordinal 解析，再改写为对应输入侧的唯一物理字段。Join Definition 保存显式 output mapping；Join 后的 projection 继续由 SchemaAlign 表达，并可由现有 grouping 追加到 Join 所在 Station。
 
 对 `JOIN ... ON ...`，SQL lowering 按以下顺序工作：
 
@@ -244,4 +244,4 @@ owner benchmark 在 fixture 构造和结果校验位于计时外的前提下记�
 - 不在第一版共享或跨 Flow 持有 arrangement；
 - 不让 open 依据新统计或 planner 重新选择 physical grouping；
 - 不开放没有确定性和 replay 契约的函数；
-- 不把 Join 的多输入状态机与 Station pipeline 协议合并成第二套执行引擎。
+- 不把 Join 的多输入状态机与 Station 线性执行协议合并成第二套执行引擎。

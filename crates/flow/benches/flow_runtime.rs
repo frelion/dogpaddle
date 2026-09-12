@@ -147,7 +147,7 @@ impl Config {
 impl OracleResources {
     fn open(store: &Store, scenario: Scenario) -> Self {
         let position = store
-            .open_data("station/00000000/operation/sequence_scan.position")
+            .open_data("station/00000000/operation/00000000/sequence_scan.position")
             .expect("open scan position to validate runtime work counts");
         let input_subscriptions = match scenario {
             Scenario::Sink | Scenario::CapacityPressure => {
@@ -175,7 +175,7 @@ impl OracleResources {
                 .map(|index| {
                     store
                         .open_data(&format!(
-                            "station/{index:08x}/operation/running_event_count.count"
+                            "station/{index:08x}/operation/00000000/running_event_count.count"
                         ))
                         .expect("open RunningEventCount state to validate runtime work counts")
                 })
@@ -363,7 +363,7 @@ impl Scenario {
         }
     }
 
-    const fn inline_stage_count(self) -> usize {
+    const fn fused_tail_operation_count(self) -> usize {
         if matches!(self, Self::FusedPureChain) {
             PURE_CHAIN_TRANSFORM_COUNT
         } else {
@@ -382,7 +382,7 @@ impl Scenario {
     const fn execution_layout(self) -> &'static str {
         match self {
             Self::UnfusedPureChain => "standalone_stations",
-            Self::FusedPureChain => "scan_output_pipeline",
+            Self::FusedPureChain => "linear_station_program",
             Self::Sink | Self::CapacityPressure | Self::Chain { .. } | Self::Fanout { .. } => {
                 "station_cores"
             }
@@ -869,16 +869,16 @@ fn fused_pure_chain_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> F
     factory.output_capacity_bytes(scan, output_capacity_bytes);
     factory.connect([scan], sink);
     factory
-        .inline_output(scan, pure_chain_project())
-        .expect("inline pure-chain Project")
-        .inline_output(scan, pure_chain_extend())
-        .expect("inline pure-chain Extend")
-        .inline_output(scan, pure_chain_filter())
-        .expect("inline pure-chain Filter")
-        .inline_output(scan, pure_chain_select())
-        .expect("inline pure-chain Select")
-        .inline_output(scan, pure_chain_schema_align())
-        .expect("inline pure-chain SchemaAlign");
+        .append(scan, pure_chain_project())
+        .expect("append pure-chain Project")
+        .append(scan, pure_chain_extend())
+        .expect("append pure-chain Extend")
+        .append(scan, pure_chain_filter())
+        .expect("append pure-chain Filter")
+        .append(scan, pure_chain_select())
+        .expect("append pure-chain Select")
+        .append(scan, pure_chain_schema_align())
+        .expect("append pure-chain SchemaAlign");
     factory
 }
 
@@ -1011,7 +1011,7 @@ fn scenario_context(scenario: Scenario) -> Value {
         "execution_layout": scenario.execution_layout(),
         "logical_operation_count": scenario.logical_operation_count(),
         "fusible_transform_count": scenario.fusible_transform_count(),
-        "inline_stage_count": scenario.inline_stage_count(),
+        "fused_tail_operation_count": scenario.fused_tail_operation_count(),
         "semantic_committed_station_turns_per_progressed_advance":
             scenario.committed_station_turns_per_advance(),
         "ipc_change_appends_per_progressed_advance":

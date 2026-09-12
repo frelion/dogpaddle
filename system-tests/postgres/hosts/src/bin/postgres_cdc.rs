@@ -22,6 +22,7 @@ use dogpaddle_operation::{
         Action, Operation, OperationError, Turn,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
         sink::{PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
+        transform::DistinctDefinition,
     },
 };
 use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store, Transactions};
@@ -171,6 +172,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
             SqliteSinkDefinition::try_new(options.root.join("sink.sqlite"), "events")?,
         )
     };
+    factory.append(scan, DistinctDefinition::new())?;
     // One retained entry at a time, with the normal empty-log oversize rule.
     factory.output_capacity_bytes(scan, NonZeroU64::MIN);
     factory.connect([scan], sink);
@@ -182,7 +184,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
 }
 
 struct DirectScan {
-    scan: Box<dyn Operation>,
+    scan: Operation,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     output: OrderedMap<u64, Vec<u8>>,

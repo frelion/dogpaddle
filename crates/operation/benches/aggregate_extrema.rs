@@ -25,7 +25,7 @@ use tempfile::TempDir;
 const BENCHMARK: &str = "aggregate_extrema";
 
 struct Fixture {
-    operation: Box<dyn Operation>,
+    operation: Operation,
     transactions: Transactions,
     _root: TempDir,
 }

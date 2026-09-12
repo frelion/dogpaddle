@@ -2,10 +2,7 @@ use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
-use dogpaddle_operation::{
-    InlineBinding,
-    operation::{Action, Operation, OperationInput, Turn},
-};
+use dogpaddle_operation::operation::{Action, Operation, OperationInput, Turn};
 use dogpaddle_store::{
     Cell, ReadTransactionAccess, ReadTransactions, StoreError, SubscribedLog, Subscription,
     TransactionAccess, Transactions,
@@ -66,60 +63,30 @@ impl Station {
             return Ok(AdvanceOutcome::Idle);
         }
 
-        let claim = self.inbox.claim();
-        let (input_pipelines, core, output_pipeline) = self.program.parts_mut();
-        let transformed_input = if let Some(claim) = claim {
-            let input = input_pipelines
-                .get_mut(claim.port())
-                .expect("an offered Claim has a validated input port");
-            let Some(change) = input.apply_borrowed(claim.change()).map_err(|error| {
-                StationError::InlineInput {
-                    input: claim.port(),
-                    stage: error.stage,
-                    source: error.source,
-                }
-            })?
-            else {
-                let transaction = transactions.begin();
-                self.inbox.complete(transaction.access())?;
-                if let Err(source) = transaction.commit() {
-                    self.needs_reopen = true;
-                    return Err(StationError::Commit { source });
-                }
-                self.inbox.clear_claim();
-                return Ok(AdvanceOutcome::Progressed);
-            };
-            if let Some(expected) = input.output_schema() {
-                let actual = change.as_ref().schema();
-                if expected.as_ref() != actual.as_ref() {
-                    return Err(StationError::InputSchemaMismatch {
-                        input: claim.port(),
-                        expected: Arc::clone(expected),
-                        actual,
-                    });
-                }
-            }
-            Some((claim.port(), change))
-        } else {
-            None
-        };
-
         let (completes_input, after_commit) = {
-            let input = transformed_input
-                .as_ref()
-                .map(|(port, change)| OperationInput {
-                    port: *port,
-                    change: change.as_ref(),
-                });
-            let prepared = match core.turn(input)? {
+            let input = self.inbox.claim().map(|claim| OperationInput {
+                port: claim.port(),
+                change: claim.change(),
+            });
+            let (head, tail) = self.program.operations_mut();
+            let prepared = match head.turn(input).map_err(|source| StationError::Operation {
+                operation: 0,
+                source,
+            })? {
                 Turn::Idle => return Ok(AdvanceOutcome::Idle),
                 Turn::Ready(prepared) => prepared,
             };
 
             let transaction = transactions.begin();
             let access = transaction.access();
-            let (action, after_commit) = prepared.apply(access)?;
-            let (output, completes_input) = match action {
+            let (action, after_commit) =
+                prepared
+                    .apply(access)
+                    .map_err(|source| StationError::Operation {
+                        operation: 0,
+                        source,
+                    })?;
+            let (mut output, completes_input) = match action {
                 Action::Idle => return Ok(AdvanceOutcome::Idle),
                 Action::Commit(output) => (output, false),
                 Action::Complete(output) => {
@@ -129,18 +96,17 @@ impl Station {
                     (output, true)
                 }
             };
-
-            let output = output
-                .map(|change| {
-                    output_pipeline.apply_owned(change).map_err(|error| {
-                        StationError::InlineOutput {
-                            stage: error.stage,
-                            source: error.source,
-                        }
-                    })
-                })
-                .transpose()?
-                .flatten();
+            for (operation, atomic) in tail.iter_mut().enumerate() {
+                let Some(change) = output.as_ref() else {
+                    break;
+                };
+                output = atomic
+                    .apply(OperationInput { port: 0, change }, access)
+                    .map_err(|source| StationError::Operation {
+                        operation: operation + 1,
+                        source,
+                    })?;
+            }
             if !append_output(self.output.as_deref(), output, access)? {
                 return Ok(AdvanceOutcome::Backpressured);
             }
@@ -202,8 +168,19 @@ impl Station {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_operation(&mut self, operation: Box<dyn Operation>) {
-        self.program.replace_core(operation);
+    pub(crate) fn replace_operation(
+        &mut self,
+        operation: Box<dyn dogpaddle_operation::operation::TurnOperation>,
+    ) {
+        self.program.replace_head(Operation::Turn(operation));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_tail(
+        &mut self,
+        tail: Vec<Box<dyn dogpaddle_operation::operation::AtomicOperation>>,
+    ) {
+        self.program.replace_tail(tail);
     }
 }
 
@@ -222,14 +199,13 @@ fn append_output(
 impl StationParts {
     pub(crate) fn new(
         active: Option<Cell<u32>>,
-        operation: Box<dyn Operation>,
-        input_pipelines: Vec<Vec<InlineBinding>>,
-        output_pipeline: Vec<InlineBinding>,
+        input_count: usize,
+        operations: Vec<Operation>,
         output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
     ) -> Self {
         Self {
             active,
-            program: StationProgram::new(operation, input_pipelines, output_pipeline),
+            program: StationProgram::new(input_count, operations),
             output,
         }
     }

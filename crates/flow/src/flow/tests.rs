@@ -7,7 +7,7 @@ use std::{
 };
 
 use dogpaddle_operation::operation::{
-    Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+    Action, AfterCommit, OperationError, OperationInput, PostCommitError, Turn, TurnOperation,
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{Cell, Store, SubscribedLog};
@@ -18,7 +18,7 @@ struct FailingAfterCommit {
     runs: Arc<AtomicUsize>,
 }
 
-impl Operation for FailingAfterCommit {
+impl TurnOperation for FailingAfterCommit {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
@@ -105,10 +105,10 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
 
     let store = Store::open(path).unwrap();
     let blocked_position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let progressing_position: Cell<u64> = store
-        .open_data("station/00000001/operation/sequence_scan.position")
+        .open_data("station/00000001/operation/00000000/sequence_scan.position")
         .unwrap();
     let blocked_output: SubscribedLog<Vec<u8>> =
         store.open_data("station/00000000/output").unwrap();
@@ -241,7 +241,7 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
 
     let store = Store::open(path).unwrap();
     let first_position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let first_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let transaction = store.read_transaction();

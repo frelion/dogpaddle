@@ -4,7 +4,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, decode_definition,
     operation::{
-        OperationInput,
+        Operation, OperationInput,
         transform::{
             RunningEventCountDefinition, RunningEventCountError, RunningEventCountOperation,
         },
@@ -13,8 +13,9 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, Store, StoreError};
 
 use super::support::{
-    ExpectedAction, TestStore, assert_literal_definition, bind, change, commit_ready, count_schema,
-    data_names, decode_hex, materialize, output_values, rollback_ready, turn_input, value_schema,
+    ExpectedAction, TestStore, assert_literal_definition, bind, change, change_with_field_name,
+    commit_ready, count_schema, data_names, decode_hex, materialize, output_values, rollback_ready,
+    turn_input, value_schema,
 };
 
 const RUNNING_EVENT_COUNT_V1: &str =
@@ -31,7 +32,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
         &definition,
         RUNNING_EVENT_COUNT_V1,
         2,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(data_names(&definition), ["running_event_count.count"]);
     assert_eq!(
@@ -56,16 +57,13 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
 fn runtime_rejects_missing_invalid_port_and_foreign_store() {
     let root = TestStore::new();
     let mut store = Store::create(root.path()).unwrap();
-    let mut operation =
-        RunningEventCountOperation::new(store.create_data::<Cell<u64>>("count").unwrap());
-    let input = change(&[1]);
+    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
+        value_schema(),
+        store.create_data::<Cell<u64>>("count").unwrap(),
+    )));
+    let input = value_change(&[1]);
     let mut transactions = store.into_transactions();
 
-    let error = rollback_ready(&mut operation, None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<RunningEventCountError>(),
-        Some(RunningEventCountError::MissingInput)
-    ));
     let error = rollback_ready(
         &mut operation,
         Some(OperationInput {
@@ -107,14 +105,9 @@ fn running_event_count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
     let mut output = Vec::new();
     let mut start = 0;
     for &rows in batches {
-        let input = change(&diffs[start..start + rows]);
+        let input = value_change(&diffs[start..start + rows]);
         output.extend(output_values(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&input)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
             ExpectedAction::Complete,
             "count",
         ));
@@ -137,15 +130,10 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     decoded.data()[0].create(&mut store, "count").unwrap();
     let mut operation = materialize(decoded.as_ref(), &[value_schema()], &store, &["count"]);
     let mut transactions = store.into_transactions();
-    let first = change(&[1, -1]);
+    let first = value_change(&[1, -1]);
     assert_eq!(
         output_values(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&first)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&first)), &mut transactions,).unwrap(),
             ExpectedAction::Complete,
             "count",
         ),
@@ -157,15 +145,10 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let decoded = decoded_definition();
     let mut operation = materialize(decoded.as_ref(), &[value_schema()], &store, &["count"]);
     let mut transactions = store.into_transactions();
-    let second = change(&[1]);
+    let second = value_change(&[1]);
     assert_eq!(
         output_values(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&second)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&second)), &mut transactions,).unwrap(),
             ExpectedAction::Complete,
             "count",
         ),
@@ -175,8 +158,11 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
     let state = store.create_data::<Cell<u64>>("count").unwrap();
-    let mut operation = RunningEventCountOperation::new(state.clone());
-    let input = change(&[1, 1]);
+    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
+        value_schema(),
+        state.clone(),
+    )));
+    let input = value_change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin();
@@ -219,10 +205,12 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let mut operation =
-        RunningEventCountOperation::new(store.open_data::<Cell<u64>>("count").unwrap());
+    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
+        value_schema(),
+        store.open_data::<Cell<u64>>("count").unwrap(),
+    )));
     let mut transactions = store.into_transactions();
-    let change = change(&[1]);
+    let change = value_change(&[1]);
     let error =
         rollback_ready(&mut operation, Some(turn_input(&change)), &mut transactions).unwrap_err();
     assert!(matches!(
@@ -239,4 +227,37 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
         raw.access(transaction.access()).unwrap().get().unwrap(),
         Some(persisted)
     );
+}
+
+#[test]
+fn runtime_rejects_schema_drift_before_touching_state() {
+    let fixture = TestStore::new();
+    let definition = RunningEventCountDefinition::new();
+    let mut store = Store::create(fixture.path()).unwrap();
+    definition.data()[0].create(&mut store, "count").unwrap();
+    let state = store.open_data::<Cell<u64>>("count").unwrap();
+    let mut operation = materialize(&definition, &[value_schema()], &store, &["count"]);
+    let mismatched = change(&[1]);
+    let mut transactions = store.into_transactions();
+
+    let error = rollback_ready(
+        &mut operation,
+        Some(turn_input(&mismatched)),
+        &mut transactions,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<RunningEventCountError>(),
+        Some(RunningEventCountError::InputSchemaMismatch)
+    ));
+    let transaction = transactions.begin();
+    assert_eq!(
+        state.access(transaction.access()).unwrap().get().unwrap(),
+        None
+    );
+    transaction.commit().unwrap();
+}
+
+fn value_change(diffs: &[i64]) -> dogpaddle_change::Change {
+    change_with_field_name("value", diffs)
 }

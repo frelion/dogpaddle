@@ -15,7 +15,7 @@ use dogpaddle_store::{Cell, Store};
 
 const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024).unwrap();
 const SINK: &str = "postgres";
-const STATE: &str = "station/00000001/operation/relation_sink.state";
+const STATE: &str = "station/00000001/operation/00000000/relation_sink.state";
 
 fn config() -> PostgresSinkConfig {
     PostgresSinkConfig::new_unencrypted("127.0.0.1", 1, "database", "writer", "secret-not-durable")
@@ -88,7 +88,7 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
         panic!("PostgreSQL-incompatible field name unexpectedly bound");
     };
     assert_eq!(error.station_id(), SINK);
-    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
+    let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("PostgreSQL field-name rejection returned the wrong binding error");
     };
     assert!(matches!(

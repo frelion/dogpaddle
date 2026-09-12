@@ -61,10 +61,7 @@ fn append_action(action: Action, rows: &mut Vec<(u64, i64)>) {
     }
 }
 
-fn create_operation(
-    root: &TestStore,
-    input_schema: &SchemaRef,
-) -> (Box<dyn Operation>, Transactions) {
+fn create_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation, Transactions) {
     let definition = DistinctDefinition::new();
     let mut store = Store::create(root.path()).unwrap();
     definition.data()[0].create(&mut store, "weights").unwrap();
@@ -84,7 +81,7 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
         &definition,
         DISTINCT_V1,
         13,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(data_names(&definition), ["distinct.weights"]);
     let input = schema();
@@ -119,12 +116,7 @@ fn distinct_trace(events: &[(u64, i64)], batches: &[usize]) -> Vec<(u64, i64)> {
             &batch.iter().map(|event| event.1).collect::<Vec<_>>(),
         );
         append_action(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&input)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
             &mut trace,
         );
         start += rows;
@@ -162,7 +154,7 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
         let (mut operation, mut transactions) = create_operation(&root, &schema());
         let invalid = change(&[20, 99], &[1, -1]);
         let error = rollback_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(turn_input(&invalid)),
             &mut transactions,
         )
@@ -175,12 +167,7 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
         let retry = change(&[20], &[1]);
         let mut output = Vec::new();
         append_action(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&retry)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&retry)), &mut transactions).unwrap(),
             &mut output,
         );
         assert_eq!(output, [(20, 1)]);
@@ -191,17 +178,12 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
         let (mut operation, mut transactions) = create_operation(&root, &schema());
         for diff in [i64::MAX, i64::MAX] {
             let input = change(&[7], &[diff]);
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&input)),
-                &mut transactions,
-            )
-            .unwrap();
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap();
         }
 
         let invalid = change(&[20, 7], &[1, 2]);
         let error = rollback_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(turn_input(&invalid)),
             &mut transactions,
         )
@@ -214,12 +196,7 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
         let retry = change(&[20], &[1]);
         let mut output = Vec::new();
         append_action(
-            commit_ready(
-                operation.as_mut(),
-                Some(turn_input(&retry)),
-                &mut transactions,
-            )
-            .unwrap(),
+            commit_ready(&mut operation, Some(turn_input(&retry)), &mut transactions).unwrap(),
             &mut output,
         );
         assert_eq!(output, [(20, 1)]);
@@ -237,12 +214,7 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
     let first = change(&[7, 8], &[2, 1]);
     let mut output = Vec::new();
     append_action(
-        commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&first)),
-            &mut transactions,
-        )
-        .unwrap(),
+        commit_ready(&mut operation, Some(turn_input(&first)), &mut transactions).unwrap(),
         &mut output,
     );
     assert_eq!(output, [(7, 1), (8, 1)]);
@@ -255,12 +227,7 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
     let second = change(&[7, 8, 7], &[-1, -1, -1]);
     let mut output = Vec::new();
     append_action(
-        commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&second)),
-            &mut transactions,
-        )
-        .unwrap(),
+        commit_ready(&mut operation, Some(turn_input(&second)), &mut transactions).unwrap(),
         &mut output,
     );
     assert_eq!(output, [(8, -1), (7, -1)]);
@@ -282,12 +249,9 @@ fn long_canonical_rows_are_supported_as_exact_store_keys() {
     let input = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root, &input_schema);
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Distinct did not emit the new row");
     };
     let labels = output
@@ -326,12 +290,9 @@ fn signed_float_zeroes_are_distinct_exact_rows() {
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, -1, -1])).unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root, &input_schema);
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Distinct did not emit both signed-zero lifecycles");
     };
     let output_values = output
@@ -363,12 +324,9 @@ fn empty_logical_rows_keep_their_selected_row_count() {
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, -1, -1])).unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root, &input_schema);
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Distinct did not emit both empty-row boundaries");
     };
     assert_eq!(output.num_rows(), 2);
@@ -382,12 +340,7 @@ fn zero_weight_removes_the_exact_row_key() {
     let input = change(&[7, 7], &[3, -3]);
     let mut output = Vec::new();
     append_action(
-        commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap(),
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
         &mut output,
     );
     assert_eq!(output, [(7, 1), (7, -1)]);

@@ -85,7 +85,7 @@ pub fn materialize(
     input_schemas: &[SchemaRef],
     store: &Store,
     physical_names: &[&str],
-) -> Box<dyn Operation> {
+) -> Operation {
     assert_eq!(definition.data().len(), physical_names.len());
     let mut data = DataInstances::new();
     for (declaration, physical_name) in definition.data().iter().zip(physical_names) {
@@ -180,7 +180,7 @@ pub const fn turn_input(change: &Change) -> OperationInput<'_> {
 pub fn stateless_operation(
     definition: &dyn OperationDefinition,
     input_schema: SchemaRef,
-) -> Box<dyn Operation> {
+) -> Operation {
     definition
         .bind(&[input_schema])
         .unwrap()
@@ -196,12 +196,9 @@ pub fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change)
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(input)), &mut transactions).unwrap()
+    else {
         panic!("round-tripped stateless Operation did not complete with output");
     };
     output
@@ -261,14 +258,11 @@ fn apply_ready<'turn>(
     }
 }
 
-pub fn commit_ready<O>(
-    operation: &mut O,
+pub fn commit_ready(
+    operation: &mut Operation,
     input: Option<OperationInput<'_>>,
     transactions: &mut Transactions,
-) -> Result<Action, OperationError>
-where
-    O: Operation + ?Sized,
-{
+) -> Result<Action, OperationError> {
     let turn = operation.turn(input)?;
     let transaction = transactions.begin();
     let (action, after_commit) = apply_ready(turn, transaction.access())?;
@@ -284,14 +278,11 @@ where
     Ok(action)
 }
 
-pub fn rollback_ready<O>(
-    operation: &mut O,
+pub fn rollback_ready(
+    operation: &mut Operation,
     input: Option<OperationInput<'_>>,
     transactions: &mut Transactions,
-) -> Result<Action, OperationError>
-where
-    O: Operation + ?Sized,
-{
+) -> Result<Action, OperationError> {
     let turn = operation.turn(input)?;
     let transaction = transactions.begin();
     let (action, after_commit) = apply_ready(turn, transaction.access())?;

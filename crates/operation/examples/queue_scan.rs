@@ -5,7 +5,7 @@
 
 use arrow_array::UInt64Array;
 use dogpaddle_change::encode_change;
-use dogpaddle_operation::operation::{Action, Operation, OperationError, Turn};
+use dogpaddle_operation::operation::{Action, OperationError, Turn, TurnOperation};
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 #[path = "support/queue_scan.rs"]

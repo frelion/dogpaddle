@@ -245,7 +245,7 @@ fn select_and_repeated_input_union_run_across_reopen() {
     let union_active: Cell<u32> = store.open_data("station/00000002/active-input").unwrap();
     let union_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000003/operation/running_event_count.count")
+        .open_data("station/00000003/operation/00000000/running_event_count.count")
         .unwrap();
     assert!(matches!(
         store.open_data::<Cell<u32>>("station/00000001/active-input"),
@@ -346,7 +346,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
 
     let store = Store::open(&path).unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000006/operation/running_event_count.count")
+        .open_data("station/00000006/operation/00000000/running_event_count.count")
         .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
@@ -392,7 +392,7 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     let project_output: SubscribedLog<Vec<u8>> =
         store.open_data("station/00000001/output").unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000002/operation/running_event_count.count")
+        .open_data("station/00000002/operation/00000000/running_event_count.count")
         .unwrap();
     assert!(matches!(
         store.open_data::<Cell<u32>>("station/00000001/active-input"),
@@ -412,7 +412,7 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
 
 fn assert_project_field_rejection(error: &FlowSchemaError) {
     assert_eq!(error.station_id(), "project");
-    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
+    let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("Project returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -428,7 +428,7 @@ fn assert_project_field_rejection(error: &FlowSchemaError) {
 
 fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
     assert_eq!(error.station_id(), "union");
-    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
+    let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("UnionAll returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -440,7 +440,7 @@ fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
 
 fn assert_sqlite_identifier_collision(error: &FlowSchemaError) {
     assert_eq!(error.station_id(), "sqlite");
-    let Some(OperationBindError::Rejected { source }) = error.operation_error() else {
+    let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("SQLite identifier collision returned the wrong binding error");
     };
     assert!(matches!(

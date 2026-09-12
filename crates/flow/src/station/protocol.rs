@@ -8,18 +8,9 @@ use thiserror::Error;
 pub(crate) enum StationError {
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error(transparent)]
-    Operation(#[from] OperationError),
-    #[error("station input {input} inline stage {stage} failed: {source}")]
-    InlineInput {
-        input: usize,
-        stage: usize,
-        #[source]
-        source: OperationError,
-    },
-    #[error("station output inline stage {stage} failed: {source}")]
-    InlineOutput {
-        stage: usize,
+    #[error("operation {operation} failed: {source}")]
+    Operation {
+        operation: usize,
         #[source]
         source: OperationError,
     },

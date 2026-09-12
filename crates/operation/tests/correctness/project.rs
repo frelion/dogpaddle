@@ -47,7 +47,7 @@ fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
         &definition,
         PROJECT_V1,
         4,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(definition.field_indices(), [0, 2]);
     assert!(data_names(&definition).is_empty());
@@ -94,7 +94,7 @@ fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
 }
 
 #[test]
-fn project_input_protocol_errors_are_exact() {
+fn project_rejects_invalid_port_and_schema_drift() {
     let input = project_change();
     let mut project = decoded_definition()
         .bind(&[input.schema()])
@@ -104,13 +104,8 @@ fn project_input_protocol_errors_are_exact() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let missing = rollback_ready(project.as_mut(), None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        missing.downcast_ref::<ProjectError>(),
-        Some(ProjectError::MissingInput)
-    ));
     let invalid_port = rollback_ready(
-        project.as_mut(),
+        &mut project,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -124,12 +119,8 @@ fn project_input_protocol_errors_are_exact() {
     ));
 
     let drifted = change(&[1]);
-    let error = rollback_ready(
-        project.as_mut(),
-        Some(turn_input(&drifted)),
-        &mut transactions,
-    )
-    .unwrap_err();
+    let error =
+        rollback_ready(&mut project, Some(turn_input(&drifted)), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectError>(),
         Some(ProjectError::Projection(ProjectionError::SchemaMismatch))
@@ -147,12 +138,9 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Project did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), 2);
@@ -177,12 +165,9 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
         .unwrap()
         .materialize(DataInstances::new(), RuntimeResource::none())
         .unwrap();
-    let Action::Complete(Some(reopened_output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(reopened_output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("reopened Project did not complete with one output Change");
     };
     assert_eq!(reopened_output.diffs(), input.diffs());

@@ -40,24 +40,28 @@ pub enum Action {
 /// Type-erased failure before one prepared Operation turn commits.
 pub type OperationError = Box<dyn Error + Send + Sync + 'static>;
 
-/// One exact-Schema-bound transform that can execute inside a Station pipeline.
+/// A transform that completely consumes one Change inside the caller's transaction.
 ///
-/// Each call consumes one complete logical input Change and immediately emits
-/// zero or one complete output Change. Implementations are sealed at the
-/// definition layer and must be deterministic for identical inputs, retry-safe
-/// after errors, non-expanding, order-preserving, difference-preserving, and
-/// homomorphic over rebatching. They cannot access Store transactions, runtime
-/// resources, continuations, external effects, timers, or control messages.
-pub(crate) trait InlineTransform: Send + 'static {
-    /// Applies this transform without opening or accessing a Store transaction.
+/// An atomic operation may update its declared Store data and may emit any
+/// complete output Change, including one with a different row count or diff
+/// sequence. It cannot retain a continuation, perform an external effect, or
+/// produce post-commit work. If this operation or a later operation in the same
+/// Station fails, all replay-sensitive changes must be recoverable by rolling
+/// back the supplied transaction.
+pub trait AtomicOperation: Send + 'static {
+    /// Applies the complete input inside an existing Store transaction.
     ///
     /// `None` represents an empty logical output stream for this input Change.
     ///
     /// # Errors
     ///
-    /// Returns the concrete deterministic evaluation failure. The transform
-    /// remains safe to call again with the same input.
-    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError>;
+    /// Returns a failure that requires the caller to roll back the transaction.
+    /// The operation must remain safe to call again from unchanged durable state.
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError>;
 }
 
 /// Failure after one prepared Operation turn has committed.
@@ -153,9 +157,9 @@ type PreparedApply<'turn> = Box<
 >;
 
 enum PreparedTurnInner<'turn> {
-    Transactional {
-        operation: &'turn mut dyn TransactionalOperation,
-        input: Option<OperationInput<'turn>>,
+    Atomic {
+        operation: &'turn mut dyn AtomicOperation,
+        input: OperationInput<'turn>,
     },
     Custom(PreparedApply<'turn>),
 }
@@ -169,12 +173,9 @@ pub struct PreparedTurn<'turn> {
 }
 
 impl<'turn> PreparedTurn<'turn> {
-    fn transactional(
-        operation: &'turn mut dyn TransactionalOperation,
-        input: Option<OperationInput<'turn>>,
-    ) -> Self {
+    fn atomic(operation: &'turn mut dyn AtomicOperation, input: OperationInput<'turn>) -> Self {
         Self {
-            inner: PreparedTurnInner::Transactional { operation, input },
+            inner: PreparedTurnInner::Atomic { operation, input },
         }
     }
 
@@ -197,9 +198,9 @@ impl<'turn> PreparedTurn<'turn> {
         access: TransactionAccess<'_>,
     ) -> Result<(Action, AfterCommit<'turn>), OperationError> {
         match self.inner {
-            PreparedTurnInner::Transactional { operation, input } => {
-                let action = operation.apply(input, access)?;
-                Ok((action, AfterCommit::none()))
+            PreparedTurnInner::Atomic { operation, input } => {
+                let output = operation.apply(input, access)?;
+                Ok((Action::Complete(output), AfterCommit::none()))
             }
             PreparedTurnInner::Custom(apply) => apply(access),
         }
@@ -235,8 +236,8 @@ impl<'turn> Turn<'turn> {
     }
 }
 
-/// Runtime parent trait implemented by every materialized operation.
-pub trait Operation: Send + 'static {
+/// Runtime protocol for an operation that owns a complete Station turn.
+pub trait TurnOperation: Send + 'static {
     /// Produces one bounded turn while no Store write transaction is active.
     ///
     /// A Scan receives `None`. An input Operation receives exactly one
@@ -274,22 +275,67 @@ pub trait Operation: Send + 'static {
     ) -> Result<Turn<'turn>, OperationError>;
 }
 
-pub(crate) trait TransactionalOperation: Send + 'static {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError>;
+/// One materialized operation with its statically validated execution capability.
+pub enum Operation {
+    /// A complete-Change transform that can participate in a linear Station transaction.
+    Atomic(Box<dyn AtomicOperation>),
+    /// An operation that owns the full turn and post-commit protocol.
+    Turn(Box<dyn TurnOperation>),
 }
 
-impl<O> Operation for O
-where
-    O: TransactionalOperation,
-{
+impl Operation {
+    /// Produces one bounded turn, adapting an atomic head into a completed input turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the concrete preparation failure, or a protocol error when an
+    /// atomic transform is invoked without an input.
+    pub fn turn<'turn>(
+        &'turn mut self,
+        input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
+        match self {
+            Self::Atomic(operation) => {
+                let input = input.ok_or_else(|| {
+                    Box::new(AtomicInputRequired) as Box<dyn Error + Send + Sync + 'static>
+                })?;
+                Ok(Turn::Ready(PreparedTurn::atomic(operation.as_mut(), input)))
+            }
+            Self::Turn(operation) => operation.turn(input),
+        }
+    }
+}
+
+pub(crate) fn exclusive_turn(operation: Box<dyn AtomicOperation>) -> Box<dyn TurnOperation> {
+    Box::new(ExclusiveAtomic { operation })
+}
+
+#[derive(Debug)]
+struct AtomicInputRequired;
+
+impl fmt::Display for AtomicInputRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("atomic transform requires one complete input Change")
+    }
+}
+
+impl Error for AtomicInputRequired {}
+
+struct ExclusiveAtomic {
+    operation: Box<dyn AtomicOperation>,
+}
+
+impl TurnOperation for ExclusiveAtomic {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
-        Ok(Turn::Ready(PreparedTurn::transactional(self, input)))
+        let input = input.ok_or_else(|| {
+            Box::new(AtomicInputRequired) as Box<dyn Error + Send + Sync + 'static>
+        })?;
+        Ok(Turn::Ready(PreparedTurn::atomic(
+            self.operation.as_mut(),
+            input,
+        )))
     }
 }

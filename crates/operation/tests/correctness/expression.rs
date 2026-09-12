@@ -506,12 +506,9 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
             &ExtendDefinition::try_new(name, expression).unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) = commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap() else {
+        let Action::Complete(Some(output)) =
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        else {
             panic!("Boolean expression Extend returned the wrong action");
         };
         let actual = output
@@ -568,12 +565,10 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
                     &ExtendDefinition::try_new("result", expression).unwrap(),
                     Arc::clone(&schema),
                 );
-                let Action::Complete(Some(output)) = commit_ready(
-                    operation.as_mut(),
-                    Some(turn_input(&input)),
-                    &mut transactions,
-                )
-                .unwrap() else {
+                let Action::Complete(Some(output)) =
+                    commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions)
+                        .unwrap()
+                else {
                     panic!("comparison Extend returned the wrong action");
                 };
                 let actual = output
@@ -601,12 +596,9 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
             .unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) = commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap() else {
+        let Action::Complete(Some(output)) =
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        else {
             panic!("array comparison Extend returned the wrong action");
         };
         let actual = output
@@ -644,12 +636,9 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         &ExtendDefinition::try_new("greater", predicate).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("arithmetic expression did not produce an output");
     };
     let greater = output
@@ -667,12 +656,9 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         &ExtendDefinition::try_new("parsed", try_cast(col("text"), DataType::Int64)).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("try-cast expression did not produce an output");
     };
     let parsed = output

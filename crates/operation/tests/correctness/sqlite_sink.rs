@@ -352,7 +352,7 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
 struct Fixture {
     root: TestStore,
     definition: Vec<u8>,
-    operation: Box<dyn Operation>,
+    operation: Operation,
     state: Cell<Vec<u8>>,
     transactions: Transactions,
 }
@@ -447,7 +447,7 @@ impl Fixture {
 
     fn try_commit(&mut self, change: &Change) -> Result<Action, OperationError> {
         commit_ready(
-            self.operation.as_mut(),
+            &mut self.operation,
             Some(input(change)),
             &mut self.transactions,
         )
@@ -459,7 +459,7 @@ impl Fixture {
 
     fn rollback(&mut self, change: &Change) -> Action {
         rollback_ready(
-            self.operation.as_mut(),
+            &mut self.operation,
             Some(input(change)),
             &mut self.transactions,
         )

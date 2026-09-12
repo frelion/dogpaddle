@@ -85,7 +85,7 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
         &definition,
         SCHEMA_ALIGN_V1,
         9,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert!(data_names(&definition).is_empty());
     let fields = definition.fields().collect::<Vec<_>>();
@@ -125,12 +125,9 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(aligned)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(aligned)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("decoded SchemaAlign did not emit its expected fields");
     };
     assert!(Arc::ptr_eq(
@@ -154,12 +151,9 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     let decoded = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
     let mut operation = stateless_operation(decoded.as_ref(), input.schema());
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_aligned)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(reopened_aligned)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("reopened SchemaAlign did not emit its expected fields");
     };
     assert_eq!(
@@ -460,12 +454,9 @@ fn schema_align_applies_explicit_schema_and_shares_direct_columns_and_diffs() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("SchemaAlign did not complete with one output Change");
     };
     assert_eq!(output.schema().metadata().get("normalized").unwrap(), "v1");
@@ -506,12 +497,9 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("empty SchemaAlign did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), input.num_rows());
@@ -524,7 +512,7 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&drifted)),
         &mut transactions,
     )
@@ -536,7 +524,7 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
 }
 
 #[test]
-fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
+fn schema_align_rejects_invalid_port_and_schema_drift() {
     let input = change(&[1]);
     let definition =
         SchemaAlignDefinition::try_new([
@@ -547,13 +535,8 @@ fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::MissingInput)
-    ));
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -568,7 +551,7 @@ fn schema_align_rejects_missing_invalid_port_and_schema_drift() {
 
     let drifted = change_with_field_name("other", &[1]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&drifted)),
         &mut transactions,
     )

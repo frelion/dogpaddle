@@ -6,7 +6,7 @@ use super::{
     Continuation, FIRST_TECHNICAL_ID, Position, RelationTarget, first_position, invalid, plan,
     state::State,
 };
-use crate::operation::{Action, AfterCommit, Operation, OperationError, OperationInput, Turn};
+use crate::operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation};
 
 pub(crate) struct RelationalSink<T> {
     schema: SchemaRef,
@@ -81,7 +81,7 @@ impl<T: RelationTarget> RelationalSink<T> {
     }
 }
 
-impl<T: RelationTarget> Operation for RelationalSink<T> {
+impl<T: RelationTarget> TurnOperation for RelationalSink<T> {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,

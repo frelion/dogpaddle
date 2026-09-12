@@ -8,13 +8,11 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
-    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
-    definition::{InlineSealed, Sealed as SealedDefinition},
+    definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 9;
@@ -134,9 +132,6 @@ pub enum SchemaAlignSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SchemaAlignError {
-    /// The Operation was called without an input Change.
-    #[error("schema align requires one input Change")]
-    MissingInput,
     /// `SchemaAlign` only accepts its Definition's first input port.
     #[error("schema align does not accept input port {port}")]
     InvalidInputPort {
@@ -246,6 +241,10 @@ impl SchemaAlignField {
 }
 
 impl SchemaAlignDefinition {
+    fn is_atomic(&self) -> bool {
+        self.fields.iter().all(|field| field.expression.is_atomic())
+    }
+
     /// Creates an alignment with empty output Schema metadata.
     ///
     /// An empty output field collection is valid and preserves the input row
@@ -362,35 +361,20 @@ impl SealedDefinition for SchemaAlignDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data(
-            Some(output_schema),
+        Ok(OperationBinding::without_data_atomic(
+            output_schema,
             operation,
         ))
     }
 }
 
-impl InlineSealed for SchemaAlignDefinition {
-    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
-        for (field, target) in self.fields.iter().enumerate() {
-            target.expression.ensure_inline_eligible(field)?;
-        }
-        Ok(())
-    }
-
-    fn bind_inline_schema(
-        &self,
-        input_schema: SchemaRef,
-    ) -> Result<InlineBinding, OperationSchemaError> {
-        let (output_schema, operation) = self
-            .bind_operation(&input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(InlineBinding::new(output_schema, operation))
-    }
-}
-
 impl OperationDefinition for SchemaAlignDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        if self.is_atomic() {
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
+        } else {
+            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
+        }
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -415,8 +399,16 @@ impl OperationDefinition for SchemaAlignDefinition {
     }
 }
 
-impl InlineTransform for SchemaAlignOperation {
-    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+impl AtomicOperation for SchemaAlignOperation {
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        if input.port != 0 {
+            return Err(SchemaAlignError::InvalidInputPort { port: input.port }.into());
+        }
+        let input = input.change;
         if input.schema().as_ref() != self.input_schema.as_ref() {
             return Err(SchemaAlignError::InputSchemaMismatch.into());
         }
@@ -441,34 +433,11 @@ impl InlineTransform for SchemaAlignOperation {
     }
 }
 
-impl TransactionalOperation for SchemaAlignOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(SchemaAlignError::MissingInput)?;
-        if input.port != 0 {
-            return Err(SchemaAlignError::InvalidInputPort { port: input.port }.into());
-        }
-
-        InlineTransform::apply(self, input.change).map(Action::Complete)
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     decode_schema_align(payload)
         .map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-pub(crate) fn decode_inline_definition(
-    payload: &[u8],
-) -> Result<InlineDefinition, DefinitionCodecError> {
-    decode_schema_align(payload)?
-        .try_into_inline()
-        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 fn decode_schema_align(payload: &[u8]) -> Result<SchemaAlignDefinition, DefinitionCodecError> {

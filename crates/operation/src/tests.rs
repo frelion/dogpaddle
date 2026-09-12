@@ -10,7 +10,7 @@ use dogpaddle_store::{Cell, OrderedMap, Store};
 use crate::{
     DataDeclaration, DataInstances, MaterializeError, OperationBindError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
-    codec::{DECODERS, INLINE_DECODERS},
+    codec::DECODERS,
     col,
     definition::{DataName, Sealed},
     lit,
@@ -64,7 +64,10 @@ impl Sealed for TestDefinition {
             TestBinding::UnexpectedOutput => Some(valid_schema()),
             TestBinding::InvalidOutput => Some(invalid_schema()),
         };
-        Ok(OperationBinding::without_data(output, DiscardOperation))
+        Ok(OperationBinding::without_data_turn(
+            output,
+            DiscardOperation,
+        ))
     }
 }
 
@@ -257,21 +260,6 @@ fn decoder_registry_exactly_matches_builtins() {
 }
 
 #[test]
-fn inline_decoder_registry_exactly_matches_the_sealed_capability_set() {
-    let expected_tags = HashSet::from([4, 5, 6, 7, 9]);
-    let registered_tags = INLINE_DECODERS
-        .iter()
-        .map(|(tag, _)| *tag)
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        registered_tags.len(),
-        INLINE_DECODERS.len(),
-        "duplicate inline decoder tag"
-    );
-    assert_eq!(registered_tags, expected_tags);
-}
-
-#[test]
 fn data_instances_resolve_typed_objects_by_name_not_insertion_order() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
@@ -330,7 +318,7 @@ fn data_instances_reject_missing_names_and_materialization_rejects_unconsumed_na
         .unwrap();
     let mut unconsumed = DataInstances::new();
     unconsumed.insert(count).unwrap();
-    let binding = OperationBinding::without_data(None, DiscardOperation);
+    let binding = OperationBinding::without_data_turn(None, DiscardOperation);
     let Err(error) = binding.materialize(unconsumed, crate::RuntimeResource::none()) else {
         panic!("binding unexpectedly accepted an unconsumed data instance");
     };

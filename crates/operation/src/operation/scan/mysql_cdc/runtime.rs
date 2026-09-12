@@ -6,7 +6,7 @@ use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
 
 use crate::operation::{
-    Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+    Action, AfterCommit, OperationError, OperationInput, PostCommitError, Turn, TurnOperation,
 };
 
 use super::{
@@ -402,7 +402,7 @@ impl MySqlCdcScanOperation {
     }
 }
 
-impl Operation for MySqlCdcScanOperation {
+impl TurnOperation for MySqlCdcScanOperation {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,

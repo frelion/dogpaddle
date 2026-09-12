@@ -1,6 +1,6 @@
 use std::{collections::HashSet, num::NonZeroU64};
 
-use dogpaddle_operation::InlineDefinition;
+use dogpaddle_operation::{OperationDefinition, OperationKind};
 use thiserror::Error;
 
 use super::{
@@ -83,21 +83,20 @@ pub enum TopologyError {
     /// A Station's output capacity was declared more than once.
     #[error("output capacity for station {0:?} was already set")]
     OutputCapacityAlreadySet(String),
-    /// An inline input stage targets a port outside the core Operation's arity.
-    #[error(
-        "station {station:?} inline input port {port} is outside its {input_count} core inputs"
-    )]
-    InlineInputPortOutOfRange {
-        /// Station containing the invalid pipeline declaration.
+    /// A decoded Station contains no Operation.
+    #[error("station {0:?} contains no operation")]
+    EmptyOperationList(String),
+    /// The current final Operation requires a Station boundary.
+    #[error("station {0:?} cannot append another operation")]
+    StationCannotBeExtended(String),
+    /// Only a single-input atomic transform can follow another Operation.
+    #[error("station {station:?} operation {operation} must be a single-input atomic transform")]
+    InvalidAppendedOperation {
+        /// Station containing the invalid Operation.
         station: String,
-        /// Invalid zero-based input port.
-        port: usize,
-        /// Exact input arity of the core Operation.
-        input_count: usize,
+        /// Zero-based Operation ordinal.
+        operation: usize,
     },
-    /// An inline output stage was declared on an outputless core Operation.
-    #[error("outputless station {0:?} cannot declare an inline output stage")]
-    InlineOutputOnSink(String),
 }
 
 pub(super) fn finish_definition(
@@ -105,14 +104,11 @@ pub(super) fn finish_definition(
     mut stations: Vec<StationDefinition>,
     connections: &[(Vec<StationRef>, StationRef)],
     output_capacities: &[(StationRef, NonZeroU64)],
-    input_inline: Vec<(StationRef, usize, InlineDefinition)>,
-    output_inline: Vec<(StationRef, InlineDefinition)>,
 ) -> Result<FlowDefinition, TopologyError> {
     validate_station_ids(&stations)?;
+    validate_station_programs(&stations)?;
     let mut inputs_by_station = validate_connections(token, &stations, connections)?;
     validate_topology(&stations, &inputs_by_station)?;
-    let mut input_inline = collect_input_inline(token, &stations, input_inline)?;
-    apply_output_inline(token, &mut stations, output_inline)?;
     apply_output_capacities(token, &mut stations, output_capacities)?;
 
     let station_ids = stations
@@ -124,60 +120,68 @@ pub(super) fn finish_definition(
             .take()
             .unwrap_or_default()
             .into_iter()
-            .enumerate()
-            .map(|(port, input)| {
-                InputDefinition::new(
-                    station_ids[input].clone(),
-                    std::mem::take(&mut input_inline[index][port]),
-                )
-            })
+            .map(|input| InputDefinition::new(station_ids[input].clone()))
             .collect();
     }
 
     Ok(FlowDefinition::new(stations))
 }
 
-fn collect_input_inline(
-    token: u64,
-    stations: &[StationDefinition],
-    declarations: Vec<(StationRef, usize, InlineDefinition)>,
-) -> Result<Vec<Vec<Vec<InlineDefinition>>>, TopologyError> {
-    let mut pipelines = stations
-        .iter()
-        .map(|station| {
-            std::iter::repeat_with(Vec::new)
-                .take(station.input_count())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    for (reference, port, definition) in declarations {
-        let station = resolve_ref(token, stations.len(), reference)?;
-        let input_count = pipelines[station].len();
-        let pipeline = pipelines[station].get_mut(port).ok_or_else(|| {
-            TopologyError::InlineInputPortOutOfRange {
-                station: stations[station].id.clone(),
-                port,
-                input_count,
-            }
-        })?;
-        pipeline.push(definition);
-    }
-    Ok(pipelines)
-}
-
-fn apply_output_inline(
+pub(super) fn append_operation(
     token: u64,
     stations: &mut [StationDefinition],
-    declarations: Vec<(StationRef, InlineDefinition)>,
+    reference: StationRef,
+    definition: Box<dyn OperationDefinition>,
 ) -> Result<(), TopologyError> {
-    for (reference, definition) in declarations {
-        let station = resolve_ref(token, stations.len(), reference)?;
-        if !stations[station].has_output() {
-            return Err(TopologyError::InlineOutputOnSink(
-                stations[station].id.clone(),
-            ));
+    let station = resolve_ref(token, stations.len(), reference)?;
+    let station_id = stations[station].id.clone();
+    let last = stations[station]
+        .operations
+        .last()
+        .expect("a declared Station starts with one Operation");
+    if !matches!(
+        last.kind(),
+        OperationKind::Scan | OperationKind::AtomicTransform(_)
+    ) {
+        return Err(TopologyError::StationCannotBeExtended(station_id));
+    }
+    if !matches!(
+        definition.kind(),
+        OperationKind::AtomicTransform(count) if count.get() == 1
+    ) {
+        return Err(TopologyError::InvalidAppendedOperation {
+            station: station_id,
+            operation: stations[station].operations.len(),
+        });
+    }
+    stations[station].operations.push(definition);
+    Ok(())
+}
+
+fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), TopologyError> {
+    for station in stations {
+        let Some((first, tail)) = station.operations.split_first() else {
+            return Err(TopologyError::EmptyOperationList(station.id.clone()));
+        };
+        if !tail.is_empty()
+            && !matches!(
+                first.kind(),
+                OperationKind::Scan | OperationKind::AtomicTransform(_)
+            )
+        {
+            return Err(TopologyError::StationCannotBeExtended(station.id.clone()));
         }
-        stations[station].output_inline.push(definition);
+        for (operation, definition) in tail.iter().enumerate() {
+            if !matches!(
+                definition.kind(),
+                OperationKind::AtomicTransform(count) if count.get() == 1
+            ) {
+                return Err(TopologyError::InvalidAppendedOperation {
+                    station: station.id.clone(),
+                    operation: operation + 1,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -186,6 +190,7 @@ pub(super) fn validate_decoded_topology(
     stations: &[StationDefinition],
     inputs_by_station: &[Option<Vec<usize>>],
 ) -> Result<Vec<usize>, TopologyError> {
+    validate_station_programs(stations)?;
     for (station, inputs) in inputs_by_station.iter().enumerate() {
         if inputs
             .as_ref()

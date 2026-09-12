@@ -152,7 +152,7 @@ fn publish_pending_input(path: &Path, encoded: &[u8]) {
 
     let store = Store::open(path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let writer = output.writer();
@@ -175,7 +175,7 @@ fn publish_pending_input(path: &Path, encoded: &[u8]) {
 fn durable_input_state(path: &Path) -> DurableInputState {
     let store = Store::open(path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let writer = output.writer();

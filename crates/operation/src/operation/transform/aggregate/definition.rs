@@ -8,7 +8,6 @@ use crate::{
     codec::PayloadCursor,
     definition::{DataName, Sealed as SealedDefinition},
     expression::StoredExpression,
-    operation::Operation,
 };
 
 use super::{
@@ -165,6 +164,14 @@ impl AggregateDefinition {
             calls: stored_calls.into_boxed_slice(),
         })
     }
+
+    fn is_atomic(&self) -> bool {
+        self.groups.iter().all(|group| group.expression.is_atomic())
+            && self
+                .calls
+                .iter()
+                .all(|call| call.arguments.iter().all(StoredExpression::is_atomic))
+    }
 }
 
 impl SealedDefinition for AggregateDefinition {
@@ -185,10 +192,9 @@ impl SealedDefinition for AggregateDefinition {
         ));
         let runtime_input = Arc::clone(input_schema);
         let runtime_output = Arc::clone(&output_schema);
-        Ok(OperationBinding::new(
-            Some(output_schema),
-            move |data: &mut DataInstances| -> Result<Box<dyn Operation>, MaterializeError> {
-                Ok(Box::new(AggregateOperation {
+        let materialize =
+            move |data: &mut DataInstances| -> Result<AggregateOperation, MaterializeError> {
+                Ok(AggregateOperation {
                     input_schema: runtime_input,
                     output_schema: runtime_output,
                     group_expressions,
@@ -197,9 +203,9 @@ impl SealedDefinition for AggregateDefinition {
                     groups: data.take(&GROUPS)?,
                     entries: data.take(&ENTRIES)?,
                     control: data.take(&CONTROL)?,
-                }))
-            },
-        ))
+                })
+            };
+        Ok(OperationBinding::atomic(output_schema, materialize))
     }
 }
 
@@ -318,7 +324,11 @@ fn indexed_layout(
 
 impl OperationDefinition for AggregateDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        if self.is_atomic() {
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
+        } else {
+            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
+        }
     }
 
     fn data(&self) -> &'static [DataDeclaration] {

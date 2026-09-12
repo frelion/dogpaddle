@@ -47,7 +47,7 @@ fn literal_definition_reconstructs_expression_binding_and_runtime() {
         &definition,
         EXTEND_V1,
         6,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(definition.field_name(), "is_seven");
     assert_eq!(definition.expression(), &expression);
@@ -74,12 +74,9 @@ fn literal_definition_reconstructs_expression_binding_and_runtime() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(extended)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(extended)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("decoded Extend did not append its expected field");
     };
     let values = extended
@@ -98,12 +95,9 @@ fn literal_definition_reconstructs_expression_binding_and_runtime() {
     let decoded = decode_definition(&decode_hex(EXTEND_V1)).unwrap();
     let mut operation = stateless_operation(decoded.as_ref(), input.schema());
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_extended)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(reopened_extended)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("reopened Extend did not append its expected field");
     };
     let values = reopened_extended
@@ -202,7 +196,7 @@ fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
 }
 
 #[test]
-fn runtime_rejects_missing_invalid_port_and_schema_drift() {
+fn runtime_rejects_invalid_port_and_schema_drift() {
     let input = change(&[1]);
     let mut operation = stateless_operation(
         &ExtendDefinition::try_new("copy", col("input")).unwrap(),
@@ -211,13 +205,8 @@ fn runtime_rejects_missing_invalid_port_and_schema_drift() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<ExtendError>(),
-        Some(ExtendError::MissingInput)
-    ));
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -232,7 +221,7 @@ fn runtime_rejects_missing_invalid_port_and_schema_drift() {
 
     let drifted = change_with_field_name("renamed", &[1]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&drifted)),
         &mut transactions,
     )
@@ -268,12 +257,9 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Extend did not complete with one output Change");
     };
     assert_eq!(output.schema().fields().len(), 3);
@@ -306,7 +292,7 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
         Arc::clone(&schema),
     );
     let Action::Complete(Some(copied)) =
-        commit_ready(copy.as_mut(), Some(turn_input(&input)), &mut transactions).unwrap()
+        commit_ready(&mut copy, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
         panic!("column-copy Extend did not complete");
     };

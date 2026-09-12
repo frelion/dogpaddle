@@ -1,7 +1,7 @@
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, decode_definition,
     operation::{
-        Action, OperationInput,
+        Action, Operation, OperationInput,
         scan::{SequenceScanDefinition, SequenceScanError, SequenceScanOperation},
     },
 };
@@ -31,7 +31,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
-            commit_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+            commit_ready(&mut operation, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -45,7 +45,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
-            commit_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+            commit_ready(&mut operation, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -73,7 +73,7 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
-            rollback_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+            rollback_ready(&mut operation, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -81,7 +81,7 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     );
     assert_eq!(
         output_values(
-            commit_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+            commit_ready(&mut operation, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
@@ -95,14 +95,14 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
-            commit_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+            commit_ready(&mut operation, None, &mut transactions).unwrap(),
             ExpectedAction::Commit,
             "value",
         ),
         [u64::MAX]
     );
     assert!(matches!(
-        rollback_ready(operation.as_mut(), None, &mut transactions).unwrap(),
+        rollback_ready(&mut operation, None, &mut transactions).unwrap(),
         Action::Idle
     ));
     let transaction = transactions.begin();
@@ -122,7 +122,7 @@ fn runtime_rejects_input_and_a_foreign_store() {
     let root = TestStore::new();
     let mut store = Store::create(root.path()).unwrap();
     let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let mut operation = SequenceScanOperation::new(0, position);
+    let mut operation = Operation::Turn(Box::new(SequenceScanOperation::new(0, position)));
     let input = change(&[1]);
     let mut transactions = store.into_transactions();
     let error = rollback_ready(

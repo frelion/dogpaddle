@@ -8,7 +8,7 @@ use crate::{
     DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
     definition::Sealed as SealedDefinition,
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
 pub(crate) const TAG: u16 = 3;
@@ -58,7 +58,7 @@ impl SealedDefinition for DiscardDefinition {
         &self,
         _input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::without_data(None, DiscardOperation))
+        Ok(OperationBinding::without_data_turn(None, DiscardOperation))
     }
 }
 
@@ -78,18 +78,18 @@ impl OperationDefinition for DiscardDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-impl TransactionalOperation for DiscardOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
+impl TurnOperation for DiscardOperation {
+    fn turn<'turn>(
+        &'turn mut self,
+        input: Option<OperationInput<'turn>>,
+    ) -> Result<Turn<'turn>, OperationError> {
         let input = input.ok_or(DiscardError::MissingInput)?;
         if input.port != 0 {
             return Err(DiscardError::InvalidInputPort { port: input.port }.into());
         }
-
-        Ok(Action::Complete(None))
+        Ok(Turn::ready(|_access: TransactionAccess<'_>| {
+            Ok((Action::Complete(None), AfterCommit::none()))
+        }))
     }
 }
 

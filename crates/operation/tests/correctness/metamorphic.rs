@@ -59,7 +59,7 @@ fn structural_trace(
         )
         .unwrap();
         let Action::Complete(Some(output)) = commit_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(OperationInput {
                 port,
                 change: &input,
@@ -187,13 +187,7 @@ fn filter_trace(
             &keep[start..start + rows],
             &diffs[start..start + rows],
         );
-        match commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap()
-        {
+        match commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap() {
             Action::Complete(Some(change)) => {
                 let values = change
                     .records()
@@ -247,12 +241,9 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
             Int64Array::from(diffs[start..start + rows].to_vec()),
         )
         .unwrap();
-        let Action::Complete(Some(change)) = commit_ready(
-            operation.as_mut(),
-            Some(turn_input(&input)),
-            &mut transactions,
-        )
-        .unwrap() else {
+        let Action::Complete(Some(change)) =
+            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        else {
             panic!("Extend returned the wrong action");
         };
         let derived = change

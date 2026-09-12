@@ -127,13 +127,13 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     let store = dogpaddle_store::Store::open(&path).unwrap();
     let definition: dogpaddle_store::Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let phase: dogpaddle_store::Cell<u32> = store
-        .open_data("station/00000000/operation/postgres_cdc_scan.phase")
+        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.phase")
         .unwrap();
     let checkpoint: dogpaddle_store::Cell<Vec<u8>> = store
-        .open_data("station/00000000/operation/postgres_cdc_scan.checkpoint")
+        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.checkpoint")
         .unwrap();
     let spool: dogpaddle_store::Queue<Vec<u8>> = store
-        .open_data("station/00000000/operation/postgres_cdc_scan.bootstrap_spool")
+        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.bootstrap_spool")
         .unwrap();
     {
         let transaction = store.read_transaction();

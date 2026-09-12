@@ -91,9 +91,6 @@ pub enum AggregateSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AggregateError {
-    /// Aggregate was called without its input Change.
-    #[error("aggregate requires one input Change")]
-    MissingInput,
     /// Aggregate only accepts its first input port.
     #[error("aggregate does not accept input port {port}")]
     InvalidInputPort {

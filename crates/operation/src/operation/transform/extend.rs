@@ -8,13 +8,11 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
-    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
-    definition::{InlineSealed, Sealed as SealedDefinition},
+    definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 6;
@@ -66,9 +64,6 @@ pub enum ExtendDefinitionError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExtendError {
-    /// The input Operation was called without a Change.
-    #[error("extend requires one input Change")]
-    MissingInput,
     /// Extend only accepts its Definition's first input port.
     #[error("extend does not accept input port {port}")]
     InvalidInputPort {
@@ -156,32 +151,20 @@ impl SealedDefinition for ExtendDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data(
-            Some(output_schema),
+        Ok(OperationBinding::without_data_atomic(
+            output_schema,
             operation,
         ))
     }
 }
 
-impl InlineSealed for ExtendDefinition {
-    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
-        self.expression.ensure_inline_eligible(0)
-    }
-
-    fn bind_inline_schema(
-        &self,
-        input_schema: SchemaRef,
-    ) -> Result<InlineBinding, OperationSchemaError> {
-        let (output_schema, operation) = self
-            .bind_operation(&input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(InlineBinding::new(output_schema, operation))
-    }
-}
-
 impl OperationDefinition for ExtendDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        if self.expression.is_atomic() {
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
+        } else {
+            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
+        }
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -201,8 +184,16 @@ impl OperationDefinition for ExtendDefinition {
     }
 }
 
-impl InlineTransform for ExtendOperation {
-    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+impl AtomicOperation for ExtendOperation {
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        if input.port != 0 {
+            return Err(ExtendError::InvalidInputPort { port: input.port }.into());
+        }
+        let input = input.change;
         let computed = self
             .expression
             .evaluate(input.records())
@@ -217,33 +208,10 @@ impl InlineTransform for ExtendOperation {
     }
 }
 
-impl TransactionalOperation for ExtendOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(ExtendError::MissingInput)?;
-        if input.port != 0 {
-            return Err(ExtendError::InvalidInputPort { port: input.port }.into());
-        }
-
-        InlineTransform::apply(self, input.change).map(Action::Complete)
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     decode_extend(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-pub(crate) fn decode_inline_definition(
-    payload: &[u8],
-) -> Result<InlineDefinition, DefinitionCodecError> {
-    decode_extend(payload)?
-        .try_into_inline()
-        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 fn decode_extend(payload: &[u8]) -> Result<ExtendDefinition, DefinitionCodecError> {

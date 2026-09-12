@@ -16,7 +16,7 @@ use super::support::{
 
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
-const V1_INLINE_PIPELINES: &str = include_str!("../fixtures/v1/inline_pipelines.hex");
+const V1_STATION_OPERATIONS: &str = include_str!("../fixtures/v1/station_operations.hex");
 
 #[derive(Clone, Copy)]
 enum ResourceFault {
@@ -37,13 +37,13 @@ fn build_publishes_the_stable_v1_definition_bytes() {
 }
 
 #[test]
-fn build_publishes_non_empty_input_and_output_pipelines_in_stable_order() {
+fn build_publishes_multiple_operations_in_stable_order() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    build_inline_chain(&path);
+    build_multi_operation_station(&path);
     assert_eq!(
         read_published_definition(&path),
-        fixture_bytes(V1_INLINE_PIPELINES)
+        fixture_bytes(V1_STATION_OPERATIONS)
     );
 }
 
@@ -58,7 +58,7 @@ fn build_uses_subscribed_outputs_and_only_materializes_multi_input_state() {
         store.open_data("station/00000001/output").unwrap(),
     ];
     let _running_event_count: Cell<u64> = store
-        .open_data("station/00000001/operation/running_event_count.count")
+        .open_data("station/00000001/operation/00000000/running_event_count.count")
         .unwrap();
     assert!(matches!(
         store.open_data::<SubscribedLog<Vec<u8>>>("station/00000002/output"),
@@ -117,7 +117,7 @@ fn open_classifies_each_required_station_resource_fault() {
             ResourceFault::MissingPosition => assert!(matches!(
                 error,
                 FlowError::MissingResource { name }
-                    if name == "station/00000000/operation/sequence_scan.position"
+                    if name == "station/00000000/operation/00000000/sequence_scan.position"
             )),
             ResourceFault::WrongOutputKind => assert!(matches!(
                 error,
@@ -150,7 +150,7 @@ fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault
     };
     if !matches!(fault, ResourceFault::MissingPosition) {
         store
-            .create_data::<Cell<u64>>("station/00000000/operation/sequence_scan.position")
+            .create_data::<Cell<u64>>("station/00000000/operation/00000000/sequence_scan.position")
             .unwrap();
     }
     let mut transactions = store.into_transactions();
@@ -195,28 +195,16 @@ fn build_chain(path: &Path) {
     drop(builder.build().unwrap());
 }
 
-fn build_inline_chain(path: &Path) {
+fn build_multi_operation_station(path: &Path) {
     let mut builder = FlowFactory::new(path);
     let scan = builder.station("scan", SequenceScanDefinition::new(7));
-    let count = builder.station("count", RunningEventCountDefinition::new());
     let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([scan], count);
-    builder.connect([count], sink);
+    builder.append(scan, ProjectDefinition::new([0])).unwrap();
+    builder
+        .append(scan, RunningEventCountDefinition::new())
+        .unwrap();
+    builder.append(scan, ProjectDefinition::new([0])).unwrap();
+    builder.connect([scan], sink);
     builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
-    builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
-    builder
-        .inline_output(scan, ProjectDefinition::new([0]))
-        .unwrap();
-    builder
-        .inline_input(count, 0, ProjectDefinition::new([]))
-        .unwrap();
-    builder
-        .inline_output(count, ProjectDefinition::new([0]))
-        .unwrap()
-        .inline_output(count, ProjectDefinition::new([]))
-        .unwrap();
-    builder
-        .inline_input(sink, 0, ProjectDefinition::new([]))
-        .unwrap();
     drop(builder.build().unwrap());
 }

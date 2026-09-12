@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use dogpaddle_operation::{InlineDefinition, OperationDefinition};
+use dogpaddle_operation::OperationDefinition;
 
 #[derive(Debug)]
 pub(crate) struct FlowDefinition {
@@ -10,16 +10,14 @@ pub(crate) struct FlowDefinition {
 #[derive(Debug)]
 pub(crate) struct StationDefinition {
     pub(super) id: String,
-    pub(super) core: Box<dyn OperationDefinition>,
+    pub(super) operations: Vec<Box<dyn OperationDefinition>>,
     pub(super) output_capacity_bytes: Option<NonZeroU64>,
     pub(super) inputs: Vec<InputDefinition>,
-    pub(super) output_inline: Vec<InlineDefinition>,
 }
 
 #[derive(Debug)]
 pub(crate) struct InputDefinition {
     pub(super) station_id: String,
-    pub(super) inline: Vec<InlineDefinition>,
 }
 
 impl FlowDefinition {
@@ -33,13 +31,12 @@ impl FlowDefinition {
 }
 
 impl StationDefinition {
-    pub(super) fn new(id: String, core: Box<dyn OperationDefinition>) -> Self {
+    pub(super) fn new(id: String, operation: Box<dyn OperationDefinition>) -> Self {
         Self {
             id,
-            core,
+            operations: vec![operation],
             output_capacity_bytes: None,
             inputs: Vec::new(),
-            output_inline: Vec::new(),
         }
     }
 
@@ -47,25 +44,36 @@ impl StationDefinition {
         &self.id
     }
 
-    pub(crate) fn core(&self) -> &dyn OperationDefinition {
-        self.core.as_ref()
+    pub(crate) fn operations(&self) -> &[Box<dyn OperationDefinition>] {
+        &self.operations
+    }
+
+    pub(crate) fn first_operation(&self) -> &dyn OperationDefinition {
+        self.operations
+            .first()
+            .expect("a validated Station program is nonempty")
+            .as_ref()
     }
 
     pub(crate) fn input_count(&self) -> usize {
-        usize::try_from(self.core.kind().input_count())
+        usize::try_from(self.first_operation().kind().input_count())
             .expect("an Operation input count fits usize")
     }
 
     pub(crate) fn is_scan(&self) -> bool {
-        self.core.kind().is_scan()
+        self.first_operation().kind().is_scan()
     }
 
     pub(crate) fn is_sink(&self) -> bool {
-        self.core.kind().is_sink()
+        self.first_operation().kind().is_sink()
     }
 
     pub(crate) fn has_output(&self) -> bool {
-        self.core.kind().has_output()
+        self.operations
+            .last()
+            .expect("a validated Station program is nonempty")
+            .kind()
+            .has_output()
     }
 
     pub(crate) const fn output_capacity_bytes(&self) -> Option<NonZeroU64> {
@@ -79,22 +87,14 @@ impl StationDefinition {
     pub(crate) fn input_definitions(&self) -> &[InputDefinition] {
         &self.inputs
     }
-
-    pub(crate) fn output_inline(&self) -> &[InlineDefinition] {
-        &self.output_inline
-    }
 }
 
 impl InputDefinition {
-    pub(super) const fn new(station_id: String, inline: Vec<InlineDefinition>) -> Self {
-        Self { station_id, inline }
+    pub(super) const fn new(station_id: String) -> Self {
+        Self { station_id }
     }
 
     pub(crate) fn station_id(&self) -> &str {
         &self.station_id
-    }
-
-    pub(crate) fn inline(&self) -> &[InlineDefinition] {
-        &self.inline
     }
 }

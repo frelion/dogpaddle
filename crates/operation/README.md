@@ -55,26 +55,22 @@ Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability�
 表布局与参数化语句。无需额外的
 `Any/Exact` 约束 DSL、Schema registry 或 fingerprint。
 
-## Inline 执行能力
+## 原子 Transform
 
-[`InlineOperationDefinition`] 是与普通 [`OperationDefinition`] 分开的 sealed capability。目前只有
-Project、Filter、Extend、Select 和 `SchemaAlign` 明确实现它。调用方消费具体 Definition 的
-`try_into_inline` 得到 opaque [`InlineDefinition`]；不能根据 `data()` 为空推断，因为 `UnionAll`、
-Discard 等无 Store data 的算子也不满足单输入纯变换协议。
+[`operation::AtomicOperation`] 表示能在调用方的一次 Store 事务中完整消费一个 Change 的 Transform。
+它可以读写自己声明的持久 Data、增加输出行或改变 diff，但不能保留跨 turn continuation、执行外部
+副作用或产生 `AfterCommit`。同一 Station 中后续 Operation、最终 output 或 commit 失败时，当前
+Operation 的全部重放相关变化必须能随事务回滚。
 
-[`InlineDefinition::bind`] 只接收一个 exact input Schema，产生运行期、非持久的 [`InlineBinding`]。binding
-保存派生 output Schema 和编译后的执行 kernel，并直接对一个完整 Change 同步返回零或一个 Change；
-这里没有 Store data、[`RuntimeResource`] 或第二个 materialize 阶段，也不能产生 `Idle`、`Commit`、
-continuation 或 `AfterCommit`。五个算子的普通 Operation adapter 与 inline
-路径调用同一份 exact-Schema-bound 执行实现，因此字段、metadata、NULL、行序和 diff 语义没有第二份
-实现。
+资格由具体 Definition instance 显式写入 [`OperationKind`]。Project、`RunningEventCount`、Distinct、
+`UnionAll` 恒为 `AtomicTransform`；Filter、Extend、Select、`SchemaAlign` 与 Aggregate 还检查全部
+持久表达式。表达式树只接受 row-local scalar 构造和 `Immutable` scalar function；`Stable`、
+`Volatile`、placeholder、subquery、aggregate/window、unnest、外部引用等实例声明为
+`ExclusiveTransform`，继续使用相同 Schema binding 和执行 kernel，但必须独占 Station。
 
-inline capability 要求具体 Definition instance 可重放：不增加行数，保持所选事件的相对顺序和原始
-diff，并且展平事件流在合法重批后不变。表达式树只接受 row-local scalar 构造和 `Immutable` scalar
-function；`Stable`、`Volatile`、placeholder、subquery、aggregate/window、unnest、外部引用及无法证明
-为 row-local 的构造在 `try_into_inline` 时拒绝。`encode_inline_definition` 和
-`decode_inline_definition` 使用普通 Operation 的同一 tag/payload 和完整外层字节，但专用 decoder
-只接受这五个 capability tag，并在 decode 后重新检查 instance eligibility。
+这里没有第二套 Definition、binding 或 codec。所有 Transform 的 `bind_schemas` 都产生同一种 atomic
+kernel；统一 `OperationDefinition::bind` 根据 kind 保留为 `Operation::Atomic`，或把不合格实例包装为
+`Operation::Turn`。因此 eligibility、持久化字节和运行语义只有一个来源。
 
 Filter、Extend、Select、`SchemaAlign` 与 `Aggregate` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
 [`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
@@ -178,14 +174,15 @@ assert!(ExtendDefinition::try_new("copy", exact_arrow_name).is_ok());
 binding 先验证其精确 Rust 类型，Flow 在创建 Store 前完成全图检查。这里没有全局 registry、
 connector enum 或启动回调；资源只在 materialize 时 move 进 Operation，外部初始化仍由 turn 完成。
 
-运行时 [`operation::Operation`] trait 只有一个统一、object-safe 的 `turn`。零输入 Scan 与其他
-Operation 走同一个协议，只是收到 `None`；Transform 与 Sink 每次收到一个完整 borrowed Change，
-以及它在 Definition 有序输入中的 `usize` 端口序号。Operation 不接收 Subscription offset、
-Transaction 或事务启动能力。
+运行时 [`operation::Operation`] 是带执行能力的 enum：`Atomic` 保存
+`Box<dyn AtomicOperation>`，`Turn` 保存 `Box<dyn TurnOperation>`。Scan、Sink 与独占 Transform 使用
+完整 `TurnOperation::turn` 协议；Atomic Transform 直接在 Station 已开启的事务中调用
+`AtomicOperation::apply`。当 Atomic Transform 独占 Station 或位于首位时，`Operation::turn` 将它适配
+为 `Action::Complete`。Operation 不接收 Subscription offset、Transaction 或事务启动能力。
 
 一次 turn 明确分成三个线性阶段：
 
-1. `Operation::turn` 在没有活动写事务时运行。它可以检查内存状态、惰性初始化资源或执行一次有界
+1. `TurnOperation::turn` 或 `Operation::turn` 在没有活动写事务时运行。它可以检查内存状态、惰性初始化资源或执行一次有界
    poll，但不能确认外部工作或提前推进任何影响重放的事实。返回 [`operation::Turn::Idle`] 时调用方
    不开启事务；返回 `Turn::Ready` 时得到一个只能消费一次的 [`operation::PreparedTurn`]。
 2. `PreparedTurn::apply` 只在调用方持有的 Store 写事务内运行，只收到不能提交的
@@ -258,24 +255,24 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | `SequenceScan` (`1`) | Scan / 0 | 固定 `value: UInt64 non-null` | 每 turn 一行、diff `+1`、`Commit`；耗尽后 `Action::Idle` | `sequence_scan.position: Cell<u64>` | 新建 output | golden、bind、末值、rollback、reopen |
 | `PostgresCdcScan` (`11`) | Scan / 0 | 固定单表受支持列 | 私有捕获初始快照与 heartbeat 前 WAL，封口后原子发布，再持续 CDC | `phase` + `checkpoint` + `bootstrap_spool: Queue<Vec<u8>>` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag11 golden、三资源/容量、捕获/封口/回滚/reset/reopen；显式真实 PG 快照→CDC gate |
 | `MySqlCdcScan` (`15`) | Scan / 0 | 固定单表受支持列 | `initial_only` 私有捕获初始快照，封口后原子发布，再以 `recovery` 持续 CDC | `phase` + `checkpoint` + `bootstrap_spool: Queue<Vec<u8>>` | 捕获期每个完整 Change 编码一次；发布期逐条解码 | tag15 golden、三资源/容量、捕获/封口/回滚/reset/reopen、Connect JSON schema-control/type 转换；bundle 与真实 `MySQL` 验收显式运行 |
-| `RunningEventCount` (`2`) | Transform / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1`，`Complete` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
-| `Distinct` (`13`) | Transform / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1`，`Complete` | `distinct.weights: OrderedMultiset<Vec<u8>>` | 按输入行序选择边界事件并重建 diff | tag、完整 row key、边界、rollback、reopen、重批 |
-| `Aggregate` (`14`) | Transform / 1 | 非空 group fields 后接 calls；保留 Schema metadata 及 group Expr metadata | 按行序更新；新增/删除组输出 `+1/-1`，已有组结果变化输出旧 `-1`、新 `+1`；`Complete` | `aggregate.groups: OrderedMap`、`aggregate.entries: PartitionedMultiset`、`aggregate.control: Cell<u64>` | 按真实 output 一次建列；MIN/MAX 直接读取分区首尾 | tag14 golden、分区/排序、组合函数、rollback、reopen、非单位 diff/重批 |
-| Project (`4`) | Transform / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变，`Complete` | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
-| Filter (`5`) | Transform / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删 `Complete(None)` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
-| Extend (`6`) | Transform / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变，`Complete` | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
-| Select (`7`) | Transform / 1 | 同一原始 input 上的有序 `name + Expr` 完整输出 | 行序和 diff 不变；空 Select 保留行数；`Complete` | 无 | 直接列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、空/非空 runtime Schema guard、别名隔离、temporal/decimal 选择/重排、reopen/重批；Definition codec，无独立 turn benchmark |
-| `UnionAll` (`8`) | Transform / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序；`Complete` | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
-| `SchemaAlign` (`9`) | Transform / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数；`Complete` | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
+| `RunningEventCount` (`2`) | `AtomicTransform` / 1 | 任意 → `count: UInt64 non-null` | 按输入行序每行加一，忽略输入 diff 数值，输出 diff `+1` | `running_event_count.count: Cell<u64>` | 新建 count，保持行序 | tag `2` golden、bind、overflow、rollback、reopen、重批 |
+| `Distinct` (`13`) | `AtomicTransform` / 1 | output exact input | 按行序更新完整记录权重；只在 `0 ↔ positive` 时输出 `+1/-1` | `distinct.weights: OrderedMultiset<Vec<u8>>` | 按输入行序选择边界事件并重建 diff | tag、完整 row key、边界、rollback、reopen、重批 |
+| `Aggregate` (`14`) | `Atomic/ExclusiveTransform` / 1 | 非空 group fields 后接 calls；保留 Schema metadata 及 group Expr metadata | 按行序更新；新增/删除组输出 `+1/-1`，已有组结果变化输出旧 `-1`、新 `+1` | `aggregate.groups: OrderedMap`、`aggregate.entries: PartitionedMultiset`、`aggregate.control: Cell<u64>` | 按真实 output 一次建列；MIN/MAX 直接读取分区首尾 | tag14 golden、分区/排序、组合函数、rollback、reopen、非单位 diff/重批 |
+| Project (`4`) | `AtomicTransform` / 1 | 严格递增顶层索引；保留所选 Field 与 Schema metadata | 行序和 diff 不变 | 无 | 所选列与 diff 共享 | golden、合法/拒绝 bind、空投影、runtime/reopen/重批、temporal/decimal 直接列；Definition codec，无独立 turn benchmark |
+| Filter (`5`) | `Atomic/ExclusiveTransform` / 1 | Boolean Expr；output exact input | 仅保留 non-null true，records/diffs 同步筛选；全删返回 `None` | 无 | 全选共享；部分选择由 Arrow filter 分配 | Expr golden、bind/evaluate、null/Kleene、全部 layout family、Date32/Timestamp(ms)/Decimal 同类型组合比较、reopen/重批；Definition codec，无独立 turn benchmark |
+| Extend (`6`) | `Atomic/ExclusiveTransform` / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变 | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
+| Select (`7`) | `Atomic/ExclusiveTransform` / 1 | 同一原始 input 上的有序 `name + Expr` 完整输出 | 行序和 diff 不变；空 Select 保留行数 | 无 | 直接列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、空/非空 runtime Schema guard、别名隔离、temporal/decimal 选择/重排、reopen/重批；Definition codec，无独立 turn benchmark |
+| `UnionAll` (`8`) | `AtomicTransform` / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序 | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
+| `SchemaAlign` (`9`) | `Atomic/ExclusiveTransform` / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数 | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
 | Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime、rollback、reopen |
 | `SqliteSink` (`10`) | Sink / 1 | 校验 `SQLite` 列名与列数；无 output | 共享固定 ID 批次协议，每批至多 1024 操作，目标提交后结算 continuation 或 `Complete` | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 `SQLite` 值 | tag/payload、state/hash golden、全部 v1 类型、批界、非负前缀、rollback/reopen；无独立 benchmark |
 | `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `system-tests/postgres/check_sink.py` |
 
 所有十五个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
 `tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
-materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol` 与 `metamorphic`
-只保留跨算子契约；`correctness/inline.rs` 证明 capability registry、普通/inline codec 同字节、共享
-runtime 语义、空输出、Schema guard 和五算子组合的重批同态。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
+materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol`、`atomic` 与 `metamorphic`
+只保留跨算子契约；`correctness/atomic.rs` 证明实例级 kind、全部表达式 owner 的资格归纳和直接 atomic
+执行。完整 Flow 的纯失败无建库副作用、资源名、build/open/reopen、运行期 Schema guard
 和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
 真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 
@@ -343,7 +340,7 @@ group output 保留 input Schema metadata 以及 `DataFusion` `Expr::to_field` �
 
 具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 要求每个具体算子手动返回
 [`OperationKind`]，并以 `{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。
-`OperationKind::Scan` 固定为零输入，Transform 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
+`OperationKind::Scan` 固定为零输入，`AtomicTransform`、`ExclusiveTransform` 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
 input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位置推断：Scan、Transform 和 Sink
 分别声明自己在数据流中的结构语义；Station 读取所包裹 Definition 的 kind，再向 Flow 提供自己的
 Scan/Sink 角色与 output 属性。Flow 负责生成完整
@@ -538,15 +535,14 @@ Schema bind 不接收输入，并固定完整 output Schema 为一个 non-null `
 一个 non-null `UInt64` `count`，diff 固定为 `+1`；因此它是插入式的运行计数事件流，不是维护
 单例关系的 cardinality aggregate。未写入的 count Cell 解释为 `0`，溢出返回
 [`operation::transform::RunningEventCountError::Overflow`]。`RunningEventCount` 显式声明为携带一个输入的
-[`OperationKind::Transform`]；拓扑位置不会把它隐式变成 Sink，因此完整 Flow 必须把它连接到
+[`OperationKind::AtomicTransform`]；拓扑位置不会把它隐式变成 Sink，因此完整 Flow 必须把它连接到
 一个 Sink。
 
 `RunningEventCount` 只声明 `running_event_count.count: Cell<u64>`，当前 Definition tag 为 `2`，output
 字段为 `count`；公共 Rust API、逻辑 data 名与 Flow 路径同时采用清晰名称，资源为
-`station/{index:08x}/operation/running_event_count.count`。不提供旧名称 alias、旧资源 fallback 或
+`station/{index:08x}/operation/{operation_index:08x}/running_event_count.count`。不提供旧名称 alias、旧资源 fallback 或
 迁移逻辑；旧版本创建的数据库直接删除并按当前 Definition 重建，不承诺或测试旧 manifest 的兼容
-行为。当前实现每个 turn 一次处理完整 Change，并返回
-`Action::Complete(Some(_))`；它在写状态前预检整批行数，若最终值无法用 `u64` 表示，则返回 overflow，
+行为。当前实现每次 `apply` 处理完整 Change，并返回 `Some(_)`；它在写状态前预检整批行数，若最终值无法用 `u64` 表示，则返回 overflow，
 整个 turn 不产生部分进展。协议允许其他 Operation 用声明的持久化状态在多个 `Commit` turn 中处理
 同一 Change，这不是 `RunningEventCount` 必须采用的实现策略。
 
@@ -562,8 +558,7 @@ Schema bind 接受任意合法的精确单一输入，并固定完整 output Sch
 [`operation::transform::ProjectSchemaError`] 拒绝。
 
 [`operation::transform::ProjectOperation`] 不声明 Store data，只保留 binding 编译出的
-`ChangeProjection`。每个 turn 对完整 Change 做保持行序和 diff 的顶层投影，并返回
-`Action::Complete(Some(_))`；所选 Arrow Array buffer 与输入共享，不复制列数据。Definition 的字段
+`ChangeProjection`。每次 `apply` 对完整 Change 做保持行序和 diff 的顶层投影，并返回 `Some(_)`；所选 Arrow Array buffer 与输入共享，不复制列数据。Definition 的字段
 索引数量和每个索引使用稳定 big-endian `u32` 编码，tag/payload 与 input Schema 一起决定 reopen 后
 重建的精确 output Schema。
 
@@ -575,9 +570,9 @@ Schema bind 接受任意合法的精确单一输入，并固定完整 output Sch
 都会在 Flow 创建 Store 前以结构化 [`operation::transform::FilterSchemaError`] 拒绝。output Schema
 与 input 完全相同。
 
-[`operation::transform::FilterOperation`] 不声明 Store data。每个 turn 只保留 predicate 为 non-null
+[`operation::transform::FilterOperation`] 不声明 Store data。每次 `apply` 只保留 predicate 为 non-null
 `true` 的行；`false` 和 null 都删除，同一个 Arrow filter predicate 同时筛选 records 与 diff，因而
-相对事件顺序和每个保留事件的 diff 不变。没有行被选中时返回 `Action::Complete(None)`，因为空
+相对事件顺序和每个保留事件的 diff 不变。没有行被选中时返回 `None`，因为空
 Change 不可表示；全部选中时直接 clone Change 并共享全部 buffer。部分筛选前只把可能的第三方 Arrow
 Array wrapper 通过 `to_data/make_array` 规范为标准 Array class（底层 buffer 仍共享），避免 Arrow
 kernel 对自定义 concrete type panic，随后才进行一次向量筛选。
@@ -592,9 +587,9 @@ Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability�
 多列通过串联多个 Extend 明确表达，不引入同一算子内部的列依赖顺序。
 
 [`operation::transform::ExtendOperation`] 不声明 Store data，只保存 exact-Schema-bound private plan 和
-最终 output Schema。每个 turn 共享全部 input `ArrayRef` 与 diff buffer，只为真正计算出的列分配数据；
+最终 output Schema。每次 `apply` 共享全部 input `ArrayRef` 与 diff buffer，只为真正计算出的列分配数据；
 若表达式只是 Column，新列本身也与源列共享同一 ArrayRef。结果保持行序并返回
-`Action::Complete(Some(_))`。
+`Some(_)`。
 
 ## `operation::transform::Select`
 
@@ -606,7 +601,7 @@ Schema bind 从表达式唯一推导新增字段的 `DataType` 和 nullability�
 [`operation::transform::SelectOperation`] 不声明 Store data，只保存 binding 的 exact input/output
 Schema 和编译后的表达式，并在任何表达式求值前检查 runtime input；因此空 Select
 也会以 [`operation::transform::SelectError::InputSchemaMismatch`] 拒绝 Schema drift，不会产生 output
-或持久写入。每个合法 turn 一次求值所有列并返回 `Action::Complete(Some(_))`；直接列引用和 diff
+或持久写入。每次合法 `apply` 一次求值所有列并返回 `Some(_)`；直接列引用和 diff
 与输入共享 Arrow buffer。
 
 ## `operation::transform::SchemaAlign`
@@ -741,14 +736,14 @@ Definition、bind、materialize 与 Flow build/open 均不联网，无 `PostgreS
 ## 扩展约束
 
 新增内建 Operation 时，在 `operation/scan`、`operation/transform` 或 `operation/sink`
-模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 和运行态
-`Operation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
+模块中加入 Definition 和运行实例，实现 sealed `OperationDefinition` 以及运行态
+`AtomicOperation` 或 `TurnOperation`，手动声明包含精确输入数量的 [`OperationKind`]，并声明唯一稳定 tag、逻辑资源名、
 类型化 collection class、payload codec、纯 Schema bind 与一次性物化逻辑；公共 decoder 表只增加一条
 `tag → decode function` 记录。运行实例可以保存执行参数、已装配 collection 与可由持久状态重建的
 临时运行资源，但不能保存 Definition、Transaction 或事务启动能力，也不能提供回到 Definition 的
 getter；不再为每个算子增加只包裹字段的 `OperationData` 类型。需要事务外工作的算子直接实现
-`Operation::turn` 并返回线性 `PreparedTurn`；完全事务型的内建算子共用 crate 内部的零额外分配
-适配路径。Flow 的 build/open 不应出现具体算子分支。
+`TurnOperation::turn` 并返回线性 `PreparedTurn`；完整处理一个 Change 的 Transform 实现
+`AtomicOperation::apply`。Flow 的 build/open 不应出现具体算子分支。
 
 分类模块只负责容纳多个具体算子并重导出它们的公共类型，不拥有或重导出分类级的单一 tag
 或 decoder。tag 与 decoder 始终属于具体算子模块，decoder 表按具体模块路径注册，因此同一

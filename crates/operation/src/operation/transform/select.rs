@@ -8,13 +8,11 @@ use thiserror::Error;
 
 use crate::{
     DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, InlineBinding, InlineDefinition, InlineEligibilityError,
-    InlineOperationDefinition, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
-    definition::{InlineSealed, Sealed as SealedDefinition},
+    definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
-    operation::{Action, InlineTransform, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 7;
@@ -91,9 +89,6 @@ pub enum SelectSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SelectError {
-    /// The input Operation was called without a Change.
-    #[error("select requires one input Change")]
-    MissingInput,
     /// Select only accepts its Definition's first input port.
     #[error("select does not accept input port {port}")]
     InvalidInputPort {
@@ -166,6 +161,10 @@ impl SelectDefinition {
             .map(|field| (field.name.as_str(), field.expression.expression()))
     }
 
+    fn is_atomic(&self) -> bool {
+        self.fields.iter().all(|field| field.expression.is_atomic())
+    }
+
     fn bind_operation(
         &self,
         input_schema: &SchemaRef,
@@ -209,35 +208,20 @@ impl SealedDefinition for SelectDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data(
-            Some(output_schema),
+        Ok(OperationBinding::without_data_atomic(
+            output_schema,
             operation,
         ))
     }
 }
 
-impl InlineSealed for SelectDefinition {
-    fn ensure_inline_eligible(&self) -> Result<(), InlineEligibilityError> {
-        for (field, selected) in self.fields.iter().enumerate() {
-            selected.expression.ensure_inline_eligible(field)?;
-        }
-        Ok(())
-    }
-
-    fn bind_inline_schema(
-        &self,
-        input_schema: SchemaRef,
-    ) -> Result<InlineBinding, OperationSchemaError> {
-        let (output_schema, operation) = self
-            .bind_operation(&input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(InlineBinding::new(output_schema, operation))
-    }
-}
-
 impl OperationDefinition for SelectDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(NonZeroU32::MIN)
+        if self.is_atomic() {
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
+        } else {
+            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
+        }
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -262,8 +246,16 @@ impl OperationDefinition for SelectDefinition {
     }
 }
 
-impl InlineTransform for SelectOperation {
-    fn apply(&mut self, input: &Change) -> Result<Option<Change>, OperationError> {
+impl AtomicOperation for SelectOperation {
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        if input.port != 0 {
+            return Err(SelectError::InvalidInputPort { port: input.port }.into());
+        }
+        let input = input.change;
         if input.schema().as_ref() != self.input_schema.as_ref() {
             return Err(SelectError::InputSchemaMismatch.into());
         }
@@ -288,33 +280,10 @@ impl InlineTransform for SelectOperation {
     }
 }
 
-impl TransactionalOperation for SelectOperation {
-    fn apply(
-        &mut self,
-        input: Option<OperationInput<'_>>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(SelectError::MissingInput)?;
-        if input.port != 0 {
-            return Err(SelectError::InvalidInputPort { port: input.port }.into());
-        }
-
-        InlineTransform::apply(self, input.change).map(Action::Complete)
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
     decode_select(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-pub(crate) fn decode_inline_definition(
-    payload: &[u8],
-) -> Result<InlineDefinition, DefinitionCodecError> {
-    decode_select(payload)?
-        .try_into_inline()
-        .map_err(DefinitionCodecError::InlineIneligible)
 }
 
 fn decode_select(payload: &[u8]) -> Result<SelectDefinition, DefinitionCodecError> {

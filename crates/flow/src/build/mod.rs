@@ -5,10 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{
-    DataInstances, InlineDefinition, InlineEligibilityError, InlineOperationDefinition,
-    MaterializeError, OperationDefinition, RuntimeResource,
-};
+use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition, RuntimeResource};
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
@@ -39,8 +36,6 @@ pub struct FlowFactory {
     stations: Vec<StationDefinition>,
     connections: Vec<(Vec<StationRef>, StationRef)>,
     output_capacities: Vec<(StationRef, NonZeroU64)>,
-    input_inline: Vec<(StationRef, usize, InlineDefinition)>,
-    output_inline: Vec<(StationRef, InlineDefinition)>,
     resources: BTreeMap<String, RuntimeResource>,
 }
 
@@ -70,8 +65,6 @@ impl FlowFactory {
             stations: Vec::new(),
             connections: Vec::new(),
             output_capacities: Vec::new(),
-            input_inline: Vec::new(),
-            output_inline: Vec::new(),
             resources: BTreeMap::new(),
         }
     }
@@ -98,7 +91,7 @@ impl FlowFactory {
         Ok(self)
     }
 
-    /// Declares one station with one durable core Operation.
+    /// Declares one Station with the first Operation in its linear program.
     ///
     /// The returned reference belongs to this factory and is used by
     /// [`FlowFactory::connect`] and [`FlowFactory::output_capacity_bytes`]. The
@@ -116,52 +109,30 @@ impl FlowFactory {
         reference
     }
 
-    /// Appends one pure transform to a Station input port.
+    /// Appends one single-input atomic transform to a Station.
     ///
-    /// Stages run in declaration order after the durable input is decoded and
-    /// before the core Operation receives it. They create no Store data,
-    /// subscription, output log, or transaction boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this concrete definition is not deterministic and
-    /// replay-safe for inline execution. Station ownership and port validity are
-    /// checked with the complete topology during [`Self::build`].
-    pub fn inline_input<D>(
-        &mut self,
-        station: StationRef,
-        port: usize,
-        definition: D,
-    ) -> Result<&mut Self, InlineEligibilityError>
-    where
-        D: InlineOperationDefinition,
-    {
-        let definition = definition.try_into_inline()?;
-        self.input_inline.push((station, port, definition));
-        Ok(self)
-    }
-
-    /// Appends one pure transform before a Station's durable output boundary.
-    ///
-    /// Stages run in declaration order on each output emitted by the core
-    /// Operation. They share the core turn and create no intermediate durable
-    /// state.
+    /// Appended Operations execute in declaration order inside the Station's
+    /// transaction and only the final result reaches its durable output.
     ///
     /// # Errors
     ///
-    /// Returns an error when this concrete definition is not deterministic and
-    /// replay-safe for inline execution. Station ownership and output validity
-    /// are checked with the complete topology during [`Self::build`].
-    pub fn inline_output<D>(
+    /// Returns an error if `station` belongs to another factory, the existing
+    /// program ends in an exclusive Operation, or `definition` is not a
+    /// single-input atomic transform. Failure leaves the Station unchanged.
+    pub fn append<D>(
         &mut self,
         station: StationRef,
         definition: D,
-    ) -> Result<&mut Self, InlineEligibilityError>
+    ) -> Result<&mut Self, TopologyError>
     where
-        D: InlineOperationDefinition,
+        D: OperationDefinition,
     {
-        let definition = definition.try_into_inline()?;
-        self.output_inline.push((station, definition));
+        validate::append_operation(
+            self.token,
+            &mut self.stations,
+            station,
+            Box::new(definition),
+        )?;
         Ok(self)
     }
 
@@ -262,8 +233,6 @@ impl FlowFactory {
             self.stations,
             &self.connections,
             &self.output_capacities,
-            self.input_inline,
-            self.output_inline,
         )
     }
 }
@@ -275,13 +244,16 @@ fn bind_resources(
     let mut bound = Vec::with_capacity(bindings.len());
     for (station, binding) in definition.stations().iter().zip(bindings) {
         let resource = resources.remove(station.id()).unwrap_or_default();
-        binding
-            .core()
-            .validate_resource(&resource)
-            .map_err(|source| FlowError::RuntimeResource {
-                station_id: station.id().to_owned(),
-                source,
-            })?;
+        for (operation, operation_binding) in binding.operations().iter().enumerate() {
+            let empty = RuntimeResource::default();
+            let operation_resource = if operation == 0 { &resource } else { &empty };
+            operation_binding
+                .validate_resource(operation_resource)
+                .map_err(|source| FlowError::RuntimeResource {
+                    station_id: station.id().to_owned(),
+                    source,
+                })?;
+        }
         bound.push(resource);
     }
     if let Some(station_id) = resources.into_keys().next() {
@@ -292,11 +264,13 @@ fn bind_resources(
 
 fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), MaterializeError> {
     for station in definition.stations() {
-        let mut names = BTreeSet::new();
-        for declaration in station.core().data() {
-            let name = declaration.name();
-            if !names.insert(name) {
-                return Err(MaterializeError::DuplicateData { name });
+        for operation in station.operations() {
+            let mut names = BTreeSet::new();
+            for declaration in operation.data() {
+                let name = declaration.name();
+                if !names.insert(name) {
+                    return Err(MaterializeError::DuplicateData { name });
+                }
             }
         }
     }
@@ -313,15 +287,30 @@ fn create_station_part(
     let active = (station.inputs().len() > 1)
         .then(|| setup.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
         .transpose()?;
-    let definition = station.core();
-    let mut data = DataInstances::new();
-    for declaration in definition.data() {
-        let physical_name = codec::station_operation_data_name(index, declaration.name());
-        data.insert(declaration.create_setup(setup, &physical_name)?)?;
-    }
     let output_schema = binding.output_schema().cloned();
-    let (core_binding, input_bindings, output_bindings) = binding.into_parts();
-    let operation = core_binding.materialize(data, resource)?;
+    let mut resource = Some(resource);
+    let operations = station
+        .operations()
+        .iter()
+        .zip(binding.into_operations())
+        .enumerate()
+        .map(|(operation, (definition, binding))| {
+            let mut data = DataInstances::new();
+            for declaration in definition.data() {
+                let physical_name =
+                    codec::station_operation_data_name(index, operation, declaration.name());
+                data.insert(declaration.create_setup(setup, &physical_name)?)?;
+            }
+            let resource = if operation == 0 {
+                resource
+                    .take()
+                    .expect("the first Operation uniquely owns the Station resource")
+            } else {
+                RuntimeResource::default()
+            };
+            binding.materialize(data, resource).map_err(FlowError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => setup
             .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
@@ -333,9 +322,8 @@ fn create_station_part(
     };
     Ok(StationParts::new(
         active,
-        operation,
-        input_bindings,
-        output_bindings,
+        station.input_count(),
+        operations,
         output,
     ))
 }

@@ -138,6 +138,7 @@ fn select_distinct_deduplicates_projected_rows_across_reopen() {
     .unwrap();
 
     let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
@@ -184,6 +185,7 @@ fn grouped_aggregates_update_one_relation_across_reopen() {
     .unwrap();
 
     let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
@@ -374,7 +376,13 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
             .iter()
             .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
-        ["sql/scan/00000000", "sql/transform/00000000", "sql/sink",]
+        [
+            "sql/scan/00000000",
+            "sql/transform/00000000",
+            "sql/transform/00000001",
+            "sql/transform/00000002",
+            "sql/sink",
+        ]
     );
     assert_eq!(
         status
@@ -402,7 +410,13 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
             .iter()
             .map(|station| station.id.as_str())
             .collect::<Vec<_>>(),
-        ["sql/scan/00000000", "sql/transform/00000000", "sql/sink",]
+        [
+            "sql/scan/00000000",
+            "sql/transform/00000000",
+            "sql/transform/00000001",
+            "sql/transform/00000002",
+            "sql/sink",
+        ]
     );
     let mut outcomes = Vec::new();
     for _ in 0..64 {
@@ -432,6 +446,14 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     let mut reopened = replacement.open(&flow_path).unwrap();
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
     assert!(!replacement_path.exists());
+}
+
+fn station_ids(flow: &Flow) -> Vec<String> {
+    flow.status()
+        .unwrap()
+        .into_iter()
+        .map(|station| station.id)
+        .collect()
 }
 
 fn sqlite_program(sqlite_path: &Path) -> String {

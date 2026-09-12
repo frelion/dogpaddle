@@ -6,7 +6,7 @@ use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
 
 use crate::operation::{
-    Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+    Action, AfterCommit, OperationError, OperationInput, PostCommitError, Turn, TurnOperation,
 };
 
 use super::{
@@ -437,7 +437,7 @@ impl PostgresCdcScanOperation {
     }
 }
 
-impl Operation for PostgresCdcScanOperation {
+impl TurnOperation for PostgresCdcScanOperation {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,

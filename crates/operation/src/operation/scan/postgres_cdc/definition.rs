@@ -120,20 +120,21 @@ impl Sealed for PostgresCdcScanDefinition {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
         let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
-        Ok(OperationBinding::with_resource::<PostgresCdcScanConfig, _>(
-            Some(Arc::clone(&output)),
-            move |data, config| {
-                Ok(Box::new(PostgresCdcScanOperation::new_bound(
-                    spec,
-                    output,
-                    data.take(&PHASE)?,
-                    data.take(&CHECKPOINT)?,
-                    data.take(&BOOTSTRAP_SPOOL)?,
-                    config,
-                    bootstrap_spool_bytes,
-                )))
-            },
-        ))
+        Ok(OperationBinding::turn_with_resource::<
+            PostgresCdcScanConfig,
+            _,
+            _,
+        >(Some(Arc::clone(&output)), move |data, config| {
+            Ok(PostgresCdcScanOperation::new_bound(
+                spec,
+                output,
+                data.take(&PHASE)?,
+                data.take(&CHECKPOINT)?,
+                data.take(&BOOTSTRAP_SPOOL)?,
+                config,
+                bootstrap_spool_bytes,
+            ))
+        }))
     }
 }
 

@@ -9,7 +9,7 @@ use dogpaddle_store::{PartitionedMultisetAccess, StoreError, TransactionAccess};
 use crate::{
     expression::BoundExpression,
     operation::{
-        Action, OperationError, OperationInput, TransactionalOperation,
+        AtomicOperation, OperationError, OperationInput,
         relation::{canonical_row, encode_canonical},
     },
 };
@@ -84,17 +84,16 @@ impl BoundCall {
     }
 }
 
-impl TransactionalOperation for AggregateOperation {
+impl AtomicOperation for AggregateOperation {
     #[expect(
         clippy::too_many_lines,
         reason = "one loop keeps each ordered input event and its atomic state transition together"
     )]
     fn apply(
         &mut self,
-        input: Option<OperationInput<'_>>,
+        input: OperationInput<'_>,
         access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(AggregateError::MissingInput)?;
+    ) -> Result<Option<Change>, OperationError> {
         if input.port != 0 {
             return Err(AggregateError::InvalidInputPort { port: input.port }.into());
         }
@@ -257,7 +256,7 @@ impl TransactionalOperation for AggregateOperation {
             }
         }
 
-        Ok(Action::Complete(output.finish(&self.output_schema)?))
+        Ok(output.finish(&self.output_schema)?)
     }
 }
 

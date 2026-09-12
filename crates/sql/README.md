@@ -208,20 +208,19 @@ completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minima
 
 ### 自动装配 Station
 
-`build` 先把 `DataFusion` plan lower 为 SQL crate 私有的 logical arena，再用一套确定性规则划分物理
-Station。Scan、Sink、状态算子、多输入算子和不满足 inline capability 的具体纯算子实例都是 core；
-每个 core 优先吸收其后方最大的一段单 consumer 纯链作为 output pipeline。fan-out 之前保留一条
-共享 durable output，分支各自的纯链则装到下游 core 的对应 input pipeline。若一个共享纯节点既不能
-被上游吸收、又有多个 consumer，它会成为一个有 durable output 的 adapter core，随后继续应用同一
-规则。当前 SQL 会把符合实例级重放安全检查的 Filter 和 `SchemaAlign` 作为纯候选；SQL projection
-本来就 lower 为 `SchemaAlign`。
+`build` 先把 `DataFusion` plan lower 为 SQL crate 私有的 logical arena，再按确定性 postorder 直接装配
+Flow。一个单输入 atomic transform 只有在其直接 producer 恰好只有一条消费边、producer 仍是所属
+Station 的末项且该 Station 允许追加时，才进入同一 Station；连续满足条件的 Operation 构成最大线性
+program。Scan 可以作为 program 首项，多输入 atomic transform 可以新建 Station 后吸收单输入后缀；
+Sink 和不满足 atomic capability 的 transform 始终独占 Station。
 
-这套划分不枚举 Flow 内部类型，也不改变 logical Operation 的顺序。重复引用同一 CTE 时仍复用一个
-Scan identity；多输入端口顺序保持 `DataFusion` logical plan 的顺序。保留下来的 transform Station ID
-按 logical postorder 稠密编号，每个实际 output 仍使用固定 64 MiB capacity。被 inline 的逻辑步骤不
-创建空壳 Station、SubscribedLog 或 Subscription。
+fan-out 始终保留 producer 的 durable output，每个分支从新的 Station 开始。同一个 producer 重复接入
+多输入 Operation 的不同端口时，每个端口都计作一条消费边。这套规则不枚举 Flow 内部类型，也不改变
+logical Operation 的顺序。重复引用同一 CTE 时仍复用一个 Scan identity；多输入端口顺序保持
+`DataFusion` logical plan 的顺序。只有实际新建的 transform Station 才按 postorder 稠密编号，每个实际
+output 仍使用固定 64 MiB capacity；同一 Station 中间结果不创建 `SubscribedLog` 或 `Subscription`。
 
-最终物理分组直接写进当前 v1 Flow Definition。`open` 只恢复磁盘中的 core 与 pipelines，不重新执行
+最终线性分组直接写进当前 v1 Flow Definition。`open` 只恢复磁盘中的 Station programs，不重新执行
 装配策略；编译规则变化或 SQL 变化都要求使用新 state 目录或删除旧库重建，不保留旧布局兼容路径。
 
 全行去重沿用 `DogPaddle` 的 exact-row identity：null 使用 canonical 表示，浮点值按原始位模式区分，
@@ -240,7 +239,7 @@ cargo test -p dogpaddle-sql --test correctness
 
 测试直接编译并执行随 crate 发布的 `examples/quickstart.sql`，覆盖两 Station 的融合物理计划、build、
 `SQLite` 结果、drop/open 和无重复恢复；完整 matrix 还覆盖参数错误、隐式 coercion、CTE fan-out、
-确定性 Definition golden、分支 input pipeline、
+确定性 Definition golden、分支持久化边界、
 `UNION ALL` Schema、
 `SELECT DISTINCT` 的最终结果与状态恢复，以及拒绝路径。
 真实 `PostgreSQL` CDC → SQL transforms → `PostgreSQL Sink` 的崩溃恢复 gate 位于

@@ -108,20 +108,21 @@ impl Sealed for MySqlCdcScanDefinition {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
         let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
-        Ok(OperationBinding::with_resource::<MySqlCdcScanConfig, _>(
-            Some(Arc::clone(&output)),
-            move |data, config| {
-                Ok(Box::new(MySqlCdcScanOperation::new_bound(
-                    spec,
-                    output,
-                    data.take(&PHASE)?,
-                    data.take(&CHECKPOINT)?,
-                    data.take(&BOOTSTRAP_SPOOL)?,
-                    bootstrap_spool_bytes,
-                    config,
-                )))
-            },
-        ))
+        Ok(OperationBinding::turn_with_resource::<
+            MySqlCdcScanConfig,
+            _,
+            _,
+        >(Some(Arc::clone(&output)), move |data, config| {
+            Ok(MySqlCdcScanOperation::new_bound(
+                spec,
+                output,
+                data.take(&PHASE)?,
+                data.take(&CHECKPOINT)?,
+                data.take(&BOOTSTRAP_SPOOL)?,
+                bootstrap_spool_bytes,
+                config,
+            ))
+        }))
     }
 }
 

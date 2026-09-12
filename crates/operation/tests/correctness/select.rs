@@ -42,7 +42,7 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
         &definition,
         SELECT_V1,
         7,
-        OperationKind::Transform(NonZeroU32::MIN),
+        OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     let expected_fields = [
         ("renamed", col("value")),
@@ -66,12 +66,9 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(selected)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(selected)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("decoded Select did not emit its expected fields");
     };
     assert_eq!(selected.schema().field(0).name(), "renamed");
@@ -97,12 +94,9 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     let decoded = decode_definition(&decode_hex(SELECT_V1)).unwrap();
     let mut operation = stateless_operation(decoded.as_ref(), input.schema());
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_selected)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(reopened_selected)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("reopened Select did not emit its expected fields");
     };
     let renamed = reopened_selected
@@ -222,7 +216,7 @@ fn select_reports_expression_context_and_rejects_invalid_output_names_centrally(
 }
 
 #[test]
-fn runtime_rejects_missing_and_invalid_ports() {
+fn runtime_rejects_invalid_ports() {
     let input = change(&[1]);
     let mut operation = stateless_operation(
         &SelectDefinition::try_new([("input", col("input"))]).unwrap(),
@@ -231,13 +225,8 @@ fn runtime_rejects_missing_and_invalid_ports() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<SelectError>(),
-        Some(SelectError::MissingInput)
-    ));
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -273,12 +262,9 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("Select did not complete with one output Change");
     };
     assert_eq!(output.schema().field(0).name(), "copied");
@@ -308,12 +294,9 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) = commit_ready(
-        operation.as_mut(),
-        Some(turn_input(&input)),
-        &mut transactions,
-    )
-    .unwrap() else {
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    else {
         panic!("empty Select did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), input.num_rows());
@@ -326,7 +309,7 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(turn_input(&drifted)),
         &mut transactions,
     )

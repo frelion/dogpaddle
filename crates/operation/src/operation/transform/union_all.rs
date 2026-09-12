@@ -9,7 +9,7 @@ use crate::{
     OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    operation::{Action, OperationError, OperationInput, TransactionalOperation},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 8;
@@ -57,9 +57,6 @@ pub enum UnionAllSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum UnionAllError {
-    /// The operation was called without a Change.
-    #[error("union-all requires one input Change")]
-    MissingInput,
     /// The supplied port is outside the Definition's ordered inputs.
     #[error("union-all does not accept input port {port}; it has {input_count} inputs")]
     InvalidInputPort {
@@ -115,8 +112,8 @@ impl SealedDefinition for UnionAllDefinition {
         let input_count = usize::try_from(self.input_count.get())
             .expect("a UnionAll u32 input count fits supported Arrow targets");
         let input_schema = Arc::clone(output_schema);
-        Ok(OperationBinding::without_data(
-            Some(Arc::clone(output_schema)),
+        Ok(OperationBinding::without_data_atomic(
+            Arc::clone(output_schema),
             UnionAllOperation {
                 input_count,
                 input_schema,
@@ -127,7 +124,7 @@ impl SealedDefinition for UnionAllDefinition {
 
 impl OperationDefinition for UnionAllDefinition {
     fn kind(&self) -> OperationKind {
-        OperationKind::Transform(self.input_count)
+        OperationKind::AtomicTransform(self.input_count)
     }
 
     fn data(&self) -> &'static [DataDeclaration] {
@@ -143,13 +140,12 @@ impl OperationDefinition for UnionAllDefinition {
     }
 }
 
-impl TransactionalOperation for UnionAllOperation {
+impl AtomicOperation for UnionAllOperation {
     fn apply(
         &mut self,
-        input: Option<OperationInput<'_>>,
+        input: OperationInput<'_>,
         _access: TransactionAccess<'_>,
-    ) -> Result<Action, OperationError> {
-        let input = input.ok_or(UnionAllError::MissingInput)?;
+    ) -> Result<Option<dogpaddle_change::Change>, OperationError> {
         if input.port >= self.input_count {
             return Err(UnionAllError::InvalidInputPort {
                 port: input.port,
@@ -167,7 +163,7 @@ impl TransactionalOperation for UnionAllOperation {
             .into());
         }
 
-        Ok(Action::Complete(Some(input.change.clone())))
+        Ok(Some(input.change.clone()))
     }
 }
 

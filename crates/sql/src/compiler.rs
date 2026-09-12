@@ -1,8 +1,8 @@
 use std::num::NonZeroU64;
 
-use dogpaddle_flow::{FlowFactory, StationRef};
+use dogpaddle_flow::{FlowError, FlowFactory, StationRef};
 use dogpaddle_operation::{
-    InlineOperationDefinition, OperationDefinition,
+    OperationDefinition, OperationKind,
     operation::transform::{
         AggregateDefinition, DistinctDefinition, FilterDefinition, SchemaAlignDefinition,
         UnionAllDefinition,
@@ -40,8 +40,7 @@ impl LogicalQuery {
         sink: BuiltSink,
     ) -> Result<FlowFactory, SqlError> {
         self.arena.push([self.output], LogicalOperator::Sink(sink));
-        let core_plans = plan_partition(&self.arena.nodes);
-        emit_partition(self.arena, core_plans, factory)
+        emit_arena(self.arena, factory)
     }
 }
 
@@ -138,274 +137,127 @@ impl LogicalOperator {
         }
     }
 
-    fn is_inline_candidate(&self) -> bool {
-        matches!(self, Self::Transform(definition) if definition.is_inline_candidate())
+    fn allows_append(&self) -> bool {
+        match self {
+            Self::Scan { .. } => true,
+            Self::Transform(definition) => definition.kind().is_atomic(),
+            Self::Sink(_) => false,
+        }
+    }
+
+    fn has_output(&self) -> bool {
+        !matches!(self, Self::Sink(_))
     }
 }
 
 impl TransformDefinition {
-    fn input_count(&self) -> usize {
-        let definition: &dyn OperationDefinition = match self {
+    fn definition(&self) -> &dyn OperationDefinition {
+        match self {
             Self::Aggregate(definition) => definition,
             Self::Distinct(definition) => definition,
             Self::Filter(definition) => definition,
             Self::SchemaAlign(definition) => definition,
             Self::UnionAll(definition) => definition,
+        }
+    }
+
+    fn kind(&self) -> OperationKind {
+        self.definition().kind()
+    }
+
+    fn input_count(&self) -> usize {
+        usize::try_from(self.kind().input_count()).expect("an Operation input count fits usize")
+    }
+
+    fn is_append_candidate(&self) -> bool {
+        self.kind().is_atomic() && self.input_count() == 1
+    }
+
+    fn append(self, factory: &mut FlowFactory, station: StationRef) -> Result<(), SqlError> {
+        match self {
+            Self::Aggregate(definition) => factory.append(station, definition),
+            Self::Distinct(definition) => factory.append(station, definition),
+            Self::Filter(definition) => factory.append(station, definition),
+            Self::SchemaAlign(definition) => factory.append(station, definition),
+            Self::UnionAll(definition) => factory.append(station, definition),
+        }
+        .map(|_| ())
+        .map_err(|error| SqlError::Flow(FlowError::from(error)))
+    }
+}
+
+fn consumer_counts(nodes: &[LogicalNode]) -> Vec<usize> {
+    let mut counts = vec![0; nodes.len()];
+    for node in nodes {
+        for input in &node.inputs {
+            counts[input.0] += 1;
+        }
+    }
+    counts
+}
+
+fn emit_arena(arena: LogicalArena, mut factory: FlowFactory) -> Result<FlowFactory, SqlError> {
+    let consumer_counts = consumer_counts(&arena.nodes);
+    let node_count = arena.nodes.len();
+    let mut references = vec![None; node_count];
+    let mut station_tail = vec![false; node_count];
+    let mut station_allows_append = vec![false; node_count];
+    let mut next_transform = 0;
+    for (index, node) in arena.nodes.into_iter().enumerate() {
+        let append_input = match &node.operator {
+            LogicalOperator::Transform(definition) if definition.is_append_candidate() => {
+                let [input] = node.inputs.as_slice() else {
+                    unreachable!("an append candidate has exactly one input")
+                };
+                (consumer_counts[input.0] == 1
+                    && station_tail[input.0]
+                    && station_allows_append[input.0])
+                    .then_some(*input)
+            }
+            _ => None,
         };
-        usize::try_from(definition.kind().input_count())
-            .expect("an Operation input count fits usize")
-    }
-
-    fn is_inline_candidate(&self) -> bool {
-        match self {
-            Self::Filter(definition) => definition.clone().try_into_inline().is_ok(),
-            Self::SchemaAlign(definition) => definition.clone().try_into_inline().is_ok(),
-            Self::Aggregate(_) | Self::Distinct(_) | Self::UnionAll(_) => false,
-        }
-    }
-
-    fn emit_inline_input(
-        self,
-        factory: &mut FlowFactory,
-        station: StationRef,
-        port: usize,
-    ) -> Result<(), SqlError> {
-        match self {
-            Self::Filter(definition) => factory.inline_input(station, port, definition),
-            Self::SchemaAlign(definition) => factory.inline_input(station, port, definition),
-            Self::Aggregate(_) | Self::Distinct(_) | Self::UnionAll(_) => {
-                unreachable!("only an inline-capable transform can be assigned to a pipeline")
-            }
-        }
-        .map(|_| ())
-        .map_err(SqlError::endpoint)
-    }
-
-    fn emit_inline_output(
-        self,
-        factory: &mut FlowFactory,
-        station: StationRef,
-    ) -> Result<(), SqlError> {
-        match self {
-            Self::Filter(definition) => factory.inline_output(station, definition),
-            Self::SchemaAlign(definition) => factory.inline_output(station, definition),
-            Self::Aggregate(_) | Self::Distinct(_) | Self::UnionAll(_) => {
-                unreachable!("only an inline-capable transform can be assigned to a pipeline")
-            }
-        }
-        .map(|_| ())
-        .map_err(SqlError::endpoint)
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct InputRoute {
-    producer: LogicalNodeId,
-    stages: Vec<LogicalNodeId>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct CorePlan {
-    inputs: Vec<InputRoute>,
-    output: Vec<LogicalNodeId>,
-}
-
-fn plan_partition(nodes: &[LogicalNode]) -> Vec<Option<CorePlan>> {
-    let consumers = consumers(nodes);
-    let inline = nodes
-        .iter()
-        .map(|node| node.operator.is_inline_candidate())
-        .collect::<Vec<_>>();
-    // Scans, sinks, stateful or multi-input transforms, and ineligible unary
-    // transforms establish durable cores. Each core first absorbs its maximal
-    // one-consumer pure chain into its output. A remaining pure fan-out node
-    // becomes a durable adapter core; every other pure chain belongs to one
-    // downstream input port.
-    let mut is_core = inline
-        .iter()
-        .map(|candidate| !candidate)
-        .collect::<Vec<_>>();
-    let mut output_owner = vec![None; nodes.len()];
-    let mut output_stages = std::iter::repeat_with(Vec::new)
-        .take(nodes.len())
-        .collect::<Vec<_>>();
-    plan_output_pipelines(
-        nodes,
-        &consumers,
-        &inline,
-        &mut is_core,
-        &mut output_owner,
-        &mut output_stages,
-    );
-    plan_core_pipelines(nodes, &is_core, &output_owner, output_stages)
-}
-
-fn plan_core_pipelines(
-    nodes: &[LogicalNode],
-    is_core: &[bool],
-    output_owner: &[Option<LogicalNodeId>],
-    mut output_stages: Vec<Vec<LogicalNodeId>>,
-) -> Vec<Option<CorePlan>> {
-    let mut core_plans = std::iter::repeat_with(|| None)
-        .take(nodes.len())
-        .collect::<Vec<_>>();
-    for (index, node) in nodes.iter().enumerate() {
-        if !is_core[index] {
+        if let Some(input) = append_input {
+            let reference =
+                references[input.0].expect("an appended Operation's Station precedes it");
+            let LogicalOperator::Transform(definition) = node.operator else {
+                unreachable!("only a Transform can be appended")
+            };
+            definition.append(&mut factory, reference)?;
+            station_tail[input.0] = false;
+            station_tail[index] = true;
+            station_allows_append[index] = true;
+            references[index] = Some(reference);
             continue;
         }
+
         let inputs = node
             .inputs
             .iter()
-            .map(|input| trace_input(nodes, is_core, output_owner, *input))
-            .collect();
-        core_plans[index] = Some(CorePlan {
-            inputs,
-            output: std::mem::take(&mut output_stages[index]),
-        });
-    }
-    core_plans
-}
-
-fn consumers(nodes: &[LogicalNode]) -> Vec<Vec<LogicalNodeId>> {
-    let mut consumers = std::iter::repeat_with(Vec::new)
-        .take(nodes.len())
-        .collect::<Vec<_>>();
-    for (consumer, node) in nodes.iter().enumerate() {
-        for input in &node.inputs {
-            consumers[input.0].push(LogicalNodeId(consumer));
-        }
-    }
-    consumers
-}
-
-fn plan_output_pipelines(
-    nodes: &[LogicalNode],
-    consumers: &[Vec<LogicalNodeId>],
-    inline: &[bool],
-    is_core: &mut [bool],
-    output_owner: &mut [Option<LogicalNodeId>],
-    output_stages: &mut [Vec<LogicalNodeId>],
-) {
-    for node in 0..nodes.len() {
-        if !inline[node] {
-            continue;
-        }
-        let input = nodes[node].inputs[0];
-        let owner = if consumers[input.0].len() == 1 {
-            if is_core[input.0] {
-                Some(input)
-            } else {
-                output_owner[input.0]
-            }
-        } else {
-            None
-        };
-        if let Some(owner) = owner {
-            output_owner[node] = Some(owner);
-            output_stages[owner.0].push(LogicalNodeId(node));
-        } else if consumers[node].len() > 1 {
-            is_core[node] = true;
-        }
-    }
-}
-
-fn trace_input(
-    nodes: &[LogicalNode],
-    is_core: &[bool],
-    output_owner: &[Option<LogicalNodeId>],
-    start: LogicalNodeId,
-) -> InputRoute {
-    let mut current = start;
-    let mut stages = Vec::new();
-    let producer = loop {
-        if is_core[current.0] {
-            break current;
-        }
-        if let Some(owner) = output_owner[current.0] {
-            break owner;
-        }
-        stages.push(current);
-        let [input] = nodes[current.0].inputs.as_slice() else {
-            unreachable!("an inline logical node has exactly one input")
-        };
-        current = *input;
-    };
-    stages.reverse();
-    InputRoute { producer, stages }
-}
-
-fn emit_partition(
-    arena: LogicalArena,
-    mut core_plans: Vec<Option<CorePlan>>,
-    mut factory: FlowFactory,
-) -> Result<FlowFactory, SqlError> {
-    // Every definition remains in its logical node until this final pass takes
-    // it exactly once as either a core or an inline stage.
-    let mut nodes = arena.nodes.into_iter().map(Some).collect::<Vec<_>>();
-    let mut references = vec![None; nodes.len()];
-    let mut next_transform = 0;
-    for index in 0..nodes.len() {
-        let Some(core_plan) = core_plans[index].take() else {
-            continue;
-        };
-        let node = nodes[index]
-            .take()
-            .expect("a logical node can belong to only one Station");
-        let inputs = core_plan
-            .inputs
-            .iter()
-            .map(|input| {
-                references[input.producer.0].expect("a physical producer precedes its consumer")
-            })
+            .map(|input| references[input.0].expect("a producer Station precedes its consumer"))
             .collect::<Vec<_>>();
-        let (id, has_output) = match &node.operator {
-            LogicalOperator::Scan { source_index, .. } => (scan_station_id(*source_index), true),
+        let id = match &node.operator {
+            LogicalOperator::Scan { source_index, .. } => scan_station_id(*source_index),
             LogicalOperator::Transform(_) => {
                 let id = transform_station_id(next_transform);
                 next_transform += 1;
-                (id, true)
+                id
             }
-            LogicalOperator::Sink(_) => ("sql/sink".to_owned(), false),
+            LogicalOperator::Sink(_) => "sql/sink".to_owned(),
         };
+        let allows_append = node.operator.allows_append();
+        let has_output = node.operator.has_output();
         let reference = node.operator.emit(&mut factory, &id)?;
-        for (port, input) in core_plan.inputs.into_iter().enumerate() {
-            for stage in input.stages {
-                take_inline_transform(&mut nodes, stage).emit_inline_input(
-                    &mut factory,
-                    reference,
-                    port,
-                )?;
-            }
-        }
-        for stage in core_plan.output {
-            take_inline_transform(&mut nodes, stage).emit_inline_output(&mut factory, reference)?;
-        }
         if has_output {
             factory.output_capacity_bytes(reference, OUTPUT_CAPACITY);
         }
         if !inputs.is_empty() {
             factory.connect(inputs, reference);
         }
+        station_tail[index] = true;
+        station_allows_append[index] = allows_append;
         references[index] = Some(reference);
     }
-    assert!(
-        nodes.into_iter().all(|node| node.is_none()),
-        "every logical node must belong to exactly one Station"
-    );
     Ok(factory)
-}
-
-fn take_inline_transform(
-    nodes: &mut [Option<LogicalNode>],
-    stage: LogicalNodeId,
-) -> TransformDefinition {
-    let node = nodes[stage.0]
-        .take()
-        .expect("an inline stage can belong to only one pipeline");
-    let LogicalOperator::Transform(definition) = node.operator else {
-        unreachable!("only a transform can be assigned to an inline pipeline")
-    };
-    definition
 }
 
 impl LogicalOperator {
@@ -502,107 +354,56 @@ mod tests {
     }
 
     #[test]
-    fn partition_preserves_postorder_and_shared_core_inputs() {
-        let mut arena = LogicalArena::default();
-        let scan = arena.push(
-            [],
-            LogicalOperator::Scan {
-                source_index: 3,
-                definition: BuiltScan::Sequence(SequenceScanDefinition::new(7)),
-            },
-        );
-        let left = arena.push(
-            [scan],
-            LogicalOperator::Transform(TransformDefinition::Distinct(DistinctDefinition::new())),
-        );
-        let right = arena.push(
-            [scan],
-            LogicalOperator::Transform(TransformDefinition::Distinct(DistinctDefinition::new())),
-        );
-        let union = arena.push(
-            [left, right],
-            LogicalOperator::Transform(TransformDefinition::UnionAll(UnionAllDefinition::new(
-                NonZeroU32::new(2).unwrap(),
-            ))),
-        );
-        let plans = plan_with_discard(&mut arena, union);
-
-        assert_eq!(core_indices(&plans), [0, 1, 2, 3, 4]);
-        assert_eq!(core(&plans, left).inputs, [route(scan, [])]);
-        assert_eq!(core(&plans, right).inputs, [route(scan, [])]);
-        assert_eq!(
-            core(&plans, union).inputs,
-            [route(left, []), route(right, [])]
-        );
-        assert_eq!(core(&plans, LogicalNodeId(4)).inputs, [route(union, [])]);
-    }
-
-    #[test]
-    fn partition_fuses_linear_output_and_fanout_input_pipelines() {
-        let mut linear = LogicalArena::default();
-        let scan = sequence(&mut linear);
-        let first = filter(&mut linear, scan);
-        let second = filter(&mut linear, first);
-        let plans = plan_with_discard(&mut linear, second);
-
-        assert_eq!(core_indices(&plans), [0, 3]);
-        assert_eq!(core(&plans, scan).output, [first, second]);
-        assert_eq!(core(&plans, LogicalNodeId(3)).inputs, [route(scan, [])]);
-
-        let mut fanout = LogicalArena::default();
-        let scan = sequence(&mut fanout);
-        let left = filter(&mut fanout, scan);
-        let right = filter(&mut fanout, scan);
-        let union = fanout.push(
-            [left, right],
-            LogicalOperator::Transform(TransformDefinition::UnionAll(UnionAllDefinition::new(
-                NonZeroU32::new(2).unwrap(),
-            ))),
-        );
-        let plans = plan_with_discard(&mut fanout, union);
-
-        assert_eq!(core_indices(&plans), [0, 3, 4]);
-        assert!(core(&plans, scan).output.is_empty());
-        assert_eq!(
-            core(&plans, union).inputs,
-            [route(scan, [left]), route(scan, [right])]
-        );
-        assert_eq!(core(&plans, LogicalNodeId(4)).inputs, [route(union, [])]);
-    }
-
-    #[test]
-    fn partition_promotes_an_unowned_shared_transform_to_an_adapter_core() {
+    fn assembly_keeps_fanout_branches_and_multi_input_heads_durable() {
         let mut arena = LogicalArena::default();
         let scan = sequence(&mut arena);
-        let shared = filter(&mut arena, scan);
         let left = arena.push(
-            [shared],
+            [scan],
             LogicalOperator::Transform(TransformDefinition::Distinct(DistinctDefinition::new())),
         );
         let right = arena.push(
-            [shared],
+            [scan],
             LogicalOperator::Transform(TransformDefinition::Distinct(DistinctDefinition::new())),
         );
         let union = arena.push(
-            [left, right, scan],
+            [left, right],
             LogicalOperator::Transform(TransformDefinition::UnionAll(UnionAllDefinition::new(
-                NonZeroU32::new(3).unwrap(),
+                NonZeroU32::new(2).unwrap(),
             ))),
         );
-        let plans = plan_with_discard(&mut arena, union);
+        let tail = filter(&mut arena, union);
 
-        assert_eq!(core_indices(&plans), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(core(&plans, shared).inputs, [route(scan, [])]);
-        assert_eq!(core(&plans, left).inputs, [route(shared, [])]);
-        assert_eq!(core(&plans, right).inputs, [route(shared, [])]);
         assert_eq!(
-            core(&plans, union).inputs,
-            [route(left, []), route(right, []), route(scan, [])]
+            station_ids(arena, tail),
+            [
+                "sql/scan/00000000",
+                "sql/transform/00000000",
+                "sql/transform/00000001",
+                "sql/transform/00000002",
+                "sql/sink",
+            ]
         );
     }
 
     #[test]
-    fn partition_keeps_a_shared_pure_tail_on_its_producer_output() {
+    fn assembly_fuses_the_maximal_linear_atomic_chain() {
+        let mut arena = LogicalArena::default();
+        let scan = sequence(&mut arena);
+        let first = filter(&mut arena, scan);
+        let distinct = arena.push(
+            [first],
+            LogicalOperator::Transform(TransformDefinition::Distinct(DistinctDefinition::new())),
+        );
+        let second = filter(&mut arena, distinct);
+
+        assert_eq!(
+            station_ids(arena, second),
+            ["sql/scan/00000000", "sql/sink"]
+        );
+    }
+
+    #[test]
+    fn assembly_keeps_a_shared_atomic_tail_on_its_producer_station() {
         let mut arena = LogicalArena::default();
         let scan = sequence(&mut arena);
         let shared = filter(&mut arena, scan);
@@ -620,59 +421,60 @@ mod tests {
                 NonZeroU32::new(2).unwrap(),
             ))),
         );
-        let plans = plan_with_discard(&mut arena, union);
 
-        assert_eq!(core_indices(&plans), [0, 2, 3, 4, 5]);
-        assert_eq!(core(&plans, scan).output, [shared]);
-        assert_eq!(core(&plans, left).inputs, [route(scan, [])]);
-        assert_eq!(core(&plans, right).inputs, [route(scan, [])]);
+        assert_eq!(
+            station_ids(arena, union),
+            [
+                "sql/scan/00000000",
+                "sql/transform/00000000",
+                "sql/transform/00000001",
+                "sql/transform/00000002",
+                "sql/sink",
+            ]
+        );
     }
 
     #[test]
-    fn partition_keeps_an_ineligible_pure_definition_as_a_core() {
+    fn consumer_count_counts_repeated_input_edges() {
         let mut arena = LogicalArena::default();
         let scan = sequence(&mut arena);
-        let parameter = arena.push(
-            [scan],
-            LogicalOperator::Transform(TransformDefinition::Filter(
-                FilterDefinition::try_new(placeholder("$1")).unwrap(),
-            )),
+        arena.push(
+            [scan, scan],
+            LogicalOperator::Transform(TransformDefinition::UnionAll(UnionAllDefinition::new(
+                NonZeroU32::new(2).unwrap(),
+            ))),
         );
-        let plans = plan_with_discard(&mut arena, parameter);
 
-        assert_eq!(core_indices(&plans), [0, 1, 2]);
-        assert!(core(&plans, scan).output.is_empty());
-        assert_eq!(core(&plans, parameter).inputs, [route(scan, [])]);
+        assert_eq!(consumer_counts(&arena.nodes), [2, 0]);
     }
 
-    fn plan_with_discard(arena: &mut LogicalArena, output: LogicalNodeId) -> Vec<Option<CorePlan>> {
+    #[test]
+    fn ineligible_expression_is_an_exclusive_transform() {
+        let definition =
+            TransformDefinition::Filter(FilterDefinition::try_new(placeholder("$1")).unwrap());
+
+        assert_eq!(
+            definition.kind(),
+            OperationKind::ExclusiveTransform(NonZeroU32::new(1).unwrap())
+        );
+        assert!(!definition.is_append_candidate());
+    }
+
+    fn station_ids(mut arena: LogicalArena, output: LogicalNodeId) -> Vec<String> {
         arena.push(
             [output],
             LogicalOperator::Sink(BuiltSink::Discard(DiscardDefinition::new())),
         );
-        plan_partition(&arena.nodes)
-    }
-
-    fn core(plans: &[Option<CorePlan>], node: LogicalNodeId) -> &CorePlan {
-        plans[node.0].as_ref().unwrap()
-    }
-
-    fn core_indices(plans: &[Option<CorePlan>]) -> Vec<usize> {
-        plans
+        let root = tempfile::tempdir().unwrap();
+        let factory = emit_arena(arena, FlowFactory::new(root.path().join("flow"))).unwrap();
+        factory
+            .build()
+            .unwrap()
+            .status()
+            .unwrap()
             .iter()
-            .enumerate()
-            .filter_map(|(index, plan)| plan.as_ref().map(|_| index))
+            .map(|station| station.id.clone())
             .collect()
-    }
-
-    fn route(
-        producer: LogicalNodeId,
-        stages: impl IntoIterator<Item = LogicalNodeId>,
-    ) -> InputRoute {
-        InputRoute {
-            producer,
-            stages: stages.into_iter().collect(),
-        }
     }
 
     fn sequence(arena: &mut LogicalArena) -> LogicalNodeId {

@@ -17,10 +17,10 @@ fn physical_compiler_keeps_the_canonical_flow_definition() {
     drop(program.build(&path).unwrap());
     let definition = read_definition(&path);
 
-    assert_eq!(definition.len(), 777);
+    assert_eq!(definition.len(), 907);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "235a2894ab2686559d4774ff2f5d7ae37b0cc6ff0d433d9d9b0052e414baa232"
+        "7252265dfc5dedc3ef43bd53652d751d2d473e9782159671835531ef69597559"
     );
 }
 

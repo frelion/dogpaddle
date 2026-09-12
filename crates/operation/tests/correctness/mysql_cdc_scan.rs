@@ -114,7 +114,7 @@ fn mysql_cdc_materialization_requires_one_exact_runtime_resource() {
 }
 
 struct Fixture {
-    scan: Box<dyn Operation>,
+    scan: Operation,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     transactions: Transactions,

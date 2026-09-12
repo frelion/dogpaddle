@@ -7,6 +7,7 @@ use arrow_array::UInt64Array;
 use dogpaddle_change::{Change, encode_change};
 use dogpaddle_operation::operation::{
     Action, AfterCommit, Operation, OperationError, OperationInput, PostCommitError, Turn,
+    TurnOperation,
 };
 use dogpaddle_store::{
     Cell, ReadTransactions, Store, SubscribedLog, SubscribedLogWriter, Transactions,
@@ -52,7 +53,7 @@ struct BorrowedDeliveryScan {
     connector: BorrowedDeliveryConnector,
 }
 
-impl Operation for BorrowedDeliveryScan {
+impl TurnOperation for BorrowedDeliveryScan {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
@@ -139,7 +140,7 @@ fn a_borrowed_delivery_crosses_the_transaction_and_is_only_acked_after_commit() 
 }
 
 struct QueueFixture {
-    scan: QueueScan,
+    scan: Operation,
     checkpoint: Cell<u64>,
     output: SubscribedLogWriter<Vec<u8>>,
     transactions: Transactions,
@@ -174,7 +175,7 @@ impl QueueFixture {
         let output = output.writer();
         let (transactions, reads) = store.into_transactions().split();
         Self {
-            scan: QueueScan::new(checkpoint.clone()),
+            scan: Operation::Turn(Box::new(QueueScan::new(checkpoint.clone()))),
             checkpoint,
             output,
             transactions,

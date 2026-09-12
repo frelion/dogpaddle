@@ -13,9 +13,7 @@ use crate::{
 #[non_exhaustive]
 pub enum FlowError {
     /// Opening uses the durable Definition, never declarations on the factory.
-    #[error(
-        "opening a flow does not accept station, connection, capacity, or inline pipeline declarations"
-    )]
+    #[error("opening a flow does not accept station, connection, or capacity declarations")]
     OpenWithDefinition,
     /// A Station received more than one ephemeral resource.
     #[error("station {station_id:?} has more than one runtime resource")]

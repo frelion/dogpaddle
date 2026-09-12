@@ -210,13 +210,13 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 基于 canonical Flow/Operation Definition。若接口版本或 lowering 规则变化导致语义不兼容，明确要求
 重建，不让运行层猜测。
 
-### 当前执行内核：Station pipeline
+### 当前执行内核：线性多 Operation Station
 
-逻辑纯算子与持久化 Station 已解耦：一个 Station 保持恰好一个 core Operation，并在每个输入端口和
-core output 上组合可证明可重放的纯 inline pipeline，只让最终边界进入 `SubscribedLog`。Project、
-Filter、Extend、Select 与 SchemaAlign 共用 standalone/inline kernel；Flow build/open 持久并恢复
-当前 v1 物理分组，不提供旧布局兼容路径。SQL build 先生成私有 logical arena，再按单 consumer
-纯链、fan-out 与 core 边界确定性自动装配 Station；open 不重新分组。最终不变量、Definition 形状、
+一个 Station 保存非空、有序的普通 Operation 列表，并在一个事务中执行首项和全部 Atomic 尾项，
+只让最终边界进入 `SubscribedLog`。Atomic 可以拥有关系状态、增加输出行或改变 diff；Scan 可以作为
+首项，Sink 和需要跨 turn 的 Exclusive Transform 必须独占。Flow build/open 持久并恢复当前 v1
+物理分组，不提供旧布局兼容路径。SQL build 先生成私有 logical arena，再按 Operation 身份、直接
+consumer edge 数量和 fan-out 边界确定性装配最大合法线性 Station；open 不重新分组。最终不变量、Definition 形状、
 事务/`AfterCommit` 规则和验证矩阵见
 [`docs/plans/station-pipelines-and-durable-boundaries.md`](docs/plans/station-pipelines-and-durable-boundaries.md)。
 
@@ -645,9 +645,10 @@ zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema i
 
 ## 阶段 5：Join 算子族
 
-Join key expression、双边状态、有界 fan-out，以及 Join 与 Station 内无状态流水线的分层提案见
+Join key expression、双边状态、有界 fan-out，以及 Join 与现有线性多 Operation Station 的边界见
 [`docs/plans/operator-pipelines-and-join.md`](docs/plans/operator-pipelines-and-join.md)。该提案把 logical operation、
-physical Station 和 arrangement 视为不同层次，Join 的实现不依赖先完成通用融合。
+physical Station 和 arrangement 视为不同层次；Join 作为多输入 Station 的首 Operation，并直接接入已经完成的
+原子尾链装配机制。
 
 ### 目标
 

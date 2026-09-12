@@ -6,7 +6,7 @@ use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{
-    Action, AfterCommit, Operation, OperationError, OperationInput, Turn,
+    Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation,
 };
 use dogpaddle_store::Cell;
 
@@ -27,7 +27,7 @@ impl QueueScan {
     }
 }
 
-impl Operation for QueueScan {
+impl TurnOperation for QueueScan {
     fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,

@@ -1,102 +1,48 @@
-use std::borrow::Cow;
+use dogpaddle_operation::operation::{AtomicOperation, Operation};
 
-use arrow_schema::SchemaRef;
-use dogpaddle_change::Change;
-use dogpaddle_operation::{
-    InlineBinding,
-    operation::{Operation, OperationError},
-};
-
-/// The executable contents of one Station.
-///
-/// A program keeps exactly one core Operation and zero or more pure inline
-/// stages around it without changing the Flow topology or Station transaction
-/// boundary.
+/// The executable linear Operation sequence inside one Station.
 pub(crate) struct StationProgram {
-    core: Box<dyn Operation>,
-    inputs: Vec<InlinePipeline>,
-    output: InlinePipeline,
+    input_count: usize,
+    head: Operation,
+    tail: Vec<Box<dyn AtomicOperation>>,
 }
 
 impl StationProgram {
-    pub(crate) fn new(
-        core: Box<dyn Operation>,
-        inputs: Vec<Vec<InlineBinding>>,
-        output: Vec<InlineBinding>,
-    ) -> Self {
+    pub(crate) fn new(input_count: usize, operations: Vec<Operation>) -> Self {
+        let mut operations = operations.into_iter();
+        let head = operations
+            .next()
+            .expect("a validated Station program is nonempty");
+        let tail = operations
+            .map(|operation| match operation {
+                Operation::Atomic(operation) => operation,
+                Operation::Turn(_) => {
+                    unreachable!("a validated Station tail contains only atomic Operations")
+                }
+            })
+            .collect();
         Self {
-            core,
-            inputs: inputs.into_iter().map(InlinePipeline::new).collect(),
-            output: InlinePipeline::new(output),
+            input_count,
+            head,
+            tail,
         }
     }
 
     pub(crate) const fn input_count(&self) -> usize {
-        self.inputs.len()
+        self.input_count
     }
 
-    pub(crate) fn parts_mut(
-        &mut self,
-    ) -> (
-        &mut [InlinePipeline],
-        &mut dyn Operation,
-        &mut InlinePipeline,
-    ) {
-        (&mut self.inputs, self.core.as_mut(), &mut self.output)
+    pub(crate) fn operations_mut(&mut self) -> (&mut Operation, &mut [Box<dyn AtomicOperation>]) {
+        (&mut self.head, &mut self.tail)
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_core(&mut self, core: Box<dyn Operation>) {
-        self.core = core;
-    }
-}
-
-pub(crate) struct InlinePipeline {
-    stages: Vec<InlineBinding>,
-}
-
-impl InlinePipeline {
-    fn new(stages: Vec<InlineBinding>) -> Self {
-        Self { stages }
+    pub(crate) fn replace_head(&mut self, operation: Operation) {
+        self.head = operation;
     }
 
-    pub(crate) fn apply_borrowed<'input>(
-        &mut self,
-        input: &'input Change,
-    ) -> Result<Option<Cow<'input, Change>>, InlinePipelineError> {
-        self.apply(Cow::Borrowed(input))
+    #[cfg(test)]
+    pub(crate) fn replace_tail(&mut self, tail: Vec<Box<dyn AtomicOperation>>) {
+        self.tail = tail;
     }
-
-    pub(crate) fn apply_owned(
-        &mut self,
-        input: Change,
-    ) -> Result<Option<Change>, InlinePipelineError> {
-        self.apply(Cow::Owned(input))
-            .map(|output| output.map(Cow::into_owned))
-    }
-
-    pub(crate) fn output_schema(&self) -> Option<&SchemaRef> {
-        self.stages.last().map(InlineBinding::output_schema)
-    }
-
-    fn apply<'input>(
-        &mut self,
-        mut current: Cow<'input, Change>,
-    ) -> Result<Option<Cow<'input, Change>>, InlinePipelineError> {
-        for (stage, transform) in self.stages.iter_mut().enumerate() {
-            let Some(output) = transform
-                .apply(current.as_ref())
-                .map_err(|source| InlinePipelineError { stage, source })?
-            else {
-                return Ok(None);
-            };
-            current = Cow::Owned(output);
-        }
-        Ok(Some(current))
-    }
-}
-
-pub(crate) struct InlinePipelineError {
-    pub(crate) stage: usize,
-    pub(crate) source: OperationError,
 }

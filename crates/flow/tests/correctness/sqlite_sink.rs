@@ -180,7 +180,7 @@ fn multiplicity_change(value: u64, diff: i64) -> Change {
 fn publish_scan_change(flow_path: &Path, encoded_change: &[u8]) {
     let store = Store::open(flow_path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/sequence_scan.position")
+        .open_data("station/00000000/operation/00000000/sequence_scan.position")
         .unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let writer = output.writer();
@@ -214,7 +214,7 @@ fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
     let writer = output.writer();
     let input = output.subscription(0);
     let sink_state: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/relation_sink.state")
+        .open_data("station/00000001/operation/00000000/relation_sink.state")
         .unwrap();
     let transaction = store.read_transaction();
     let access = transaction.access();

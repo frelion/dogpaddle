@@ -58,14 +58,14 @@ fn assert_completed_state(path: &Path) {
     let store = Store::open(path).unwrap();
     let positions: [Cell<u64>; 2] = [
         store
-            .open_data("station/00000000/operation/sequence_scan.position")
+            .open_data("station/00000000/operation/00000000/sequence_scan.position")
             .unwrap(),
         store
-            .open_data("station/00000003/operation/sequence_scan.position")
+            .open_data("station/00000003/operation/00000000/sequence_scan.position")
             .unwrap(),
     ];
     let count: Cell<u64> = store
-        .open_data("station/00000001/operation/running_event_count.count")
+        .open_data("station/00000001/operation/00000000/running_event_count.count")
         .unwrap();
     let outputs: [SubscribedLog<Vec<u8>>; 3] = [
         store.open_data("station/00000000/output").unwrap(),

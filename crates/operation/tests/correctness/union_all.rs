@@ -78,7 +78,7 @@ fn literal_definition_preserves_arity_binding_and_data_contract() {
         &definition,
         UNION_ALL_V1,
         8,
-        OperationKind::Transform(NonZeroU32::new(2).unwrap()),
+        OperationKind::AtomicTransform(NonZeroU32::new(2).unwrap()),
     );
     assert_eq!(definition.input_count().get(), 2);
     assert!(data_names(&definition).is_empty());
@@ -128,7 +128,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
     let mut transactions = store.into_transactions();
     for port in 0..2 {
         let Action::Complete(Some(output)) = commit_ready(
-            operation.as_mut(),
+            &mut operation,
             Some(OperationInput {
                 port,
                 change: &input,
@@ -143,7 +143,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &drifted,
@@ -175,7 +175,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
         )
         .unwrap();
     let Action::Complete(Some(reopened_output)) = commit_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 1,
             change: &input,
@@ -203,13 +203,8 @@ fn runtime_rejects_missing_and_invalid_ports() {
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(operation.as_mut(), None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<UnionAllError>(),
-        Some(UnionAllError::MissingInput)
-    ));
     let error = rollback_ready(
-        operation.as_mut(),
+        &mut operation,
         Some(OperationInput {
             port: 2,
             change: &input,

@@ -233,9 +233,9 @@ fn assert_acyclic_unary_graph(
     );
     for (station_index, station) in definition.stations.iter().take(station_count).enumerate() {
         let expected_kind = parents[station_index].map_or(OperationKind::Scan, |_| {
-            OperationKind::Transform(NonZeroU32::MIN)
+            OperationKind::AtomicTransform(NonZeroU32::MIN)
         });
-        assert_eq!(station.core().kind(), expected_kind, "{graph}");
+        assert_eq!(station.first_operation().kind(), expected_kind, "{graph}");
         let expected_inputs = parents[station_index]
             .map(|parent| vec![station_id(parent)])
             .unwrap_or_default();
@@ -353,6 +353,28 @@ fn decoder_round_trips_a_large_chain() {
 }
 
 #[test]
+fn decoder_rejects_empty_and_non_atomic_station_tails() {
+    let mut empty = codec_definition();
+    empty.stations[0].operations.clear();
+    assert_eq!(
+        decode(&encode(&empty).unwrap()).unwrap_err(),
+        FlowDefinitionError::Topology(TopologyError::EmptyOperationList("scan".to_owned()))
+    );
+
+    let mut invalid_tail = codec_definition();
+    invalid_tail.stations[0]
+        .operations
+        .push(Box::new(discard()));
+    assert_eq!(
+        decode(&encode(&invalid_tail).unwrap()).unwrap_err(),
+        FlowDefinitionError::Topology(TopologyError::InvalidAppendedOperation {
+            station: "scan".to_owned(),
+            operation: 1,
+        })
+    );
+}
+
+#[test]
 fn decoder_validates_capacity_against_the_decoded_operation_category() {
     let encoded = encode(&codec_definition()).unwrap();
     let scan_start = encoded
@@ -379,7 +401,7 @@ fn decoder_validates_capacity_against_the_decoded_operation_category() {
     );
 
     let mut missing = encoded.clone();
-    missing.splice(scan_output..scan_output + 13, [0]);
+    missing.splice(scan_output..scan_output + 9, [0]);
     let checksum_offset = missing.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&missing[..checksum_offset]);
     missing[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
@@ -393,10 +415,8 @@ fn decoder_validates_capacity_against_the_decoded_operation_category() {
         .windows(b"count".len())
         .rposition(|window| window == b"count")
         .unwrap();
-    let sink_output = sink_input + b"count".len() + size_of::<u32>();
-    let encoded_output = std::iter::once(1)
-        .chain(NonZeroU64::MIN.get().to_be_bytes())
-        .chain(0_u32.to_be_bytes());
+    let sink_output = sink_input + b"count".len();
+    let encoded_output = std::iter::once(1).chain(NonZeroU64::MIN.get().to_be_bytes());
     unexpected.splice(sink_output..=sink_output, encoded_output);
     let checksum_offset = unexpected.len() - CHECKSUM_LENGTH;
     let checksum = crc32(&unexpected[..checksum_offset]);

@@ -29,7 +29,7 @@ use dogpaddle_store::{Cell, Store, Transactions};
 use serde_json::{Value, json};
 
 struct Host {
-    operation: Box<dyn Operation>,
+    operation: Operation,
     state: Cell<Vec<u8>>,
     transactions: Transactions,
 }
