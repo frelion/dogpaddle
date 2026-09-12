@@ -1,24 +1,22 @@
 # dogpaddle-change
 
-`dogpaddle-change` 定义 `DogPaddle` 各执行层共享的有序 Arrow 变化契约。它不依赖 Flow、
-Operation 或 Store：Operation 消费和产生 `Change`，Flow 负责路由与持久化，Store 只保存
-不透明字节。
+这个 crate 定义 DogPaddle 中流动的数据。第一次读代码时，只需要先记住一句话：
 
-## Change
+> 一个 `Change` 是一批**有顺序的增删行**。
 
-`Change` 把一个 Arrow `RecordBatch` 与一列 `Int64` diff 按行配对。第 `i` 个 diff 是第 `i`
-行记录的权重变化；正数增加权重，负数撤回权重。构造时拒绝空 Change、行数不一致、null
-diff、零 diff 和不支持的 Schema。
+它用 Arrow `RecordBatch` 保存数据列，再用一列 `Int64` 保存每行的变化量。正数表示增加，
+负数表示撤回。
 
-`Change` 没有事件时间，有稳定事件顺序，允许重复且不做 consolidation。行位置属于语义；
-`Change` 本身、其 codec 和运行层都不能排序或隐式抵消事件。一个 `Change` 是有序变化流的
-非空连续物理片段；没有输出时产生零个 `Change`。物理批次可以合并或切分，但重批前后展平的
-事件序列必须逐项相同。
+| 行位置 | `id` | `name` | diff | 含义 |
+| ---: | ---: | --- | ---: | --- |
+| 0 | 7 | Alice | `+1` | 增加一份这条记录 |
+| 1 | 7 | Alice | `+2` | 再增加两份 |
+| 2 | 7 | Alice | `-1` | 撤回一份 |
 
-持久化后，`(SubscribedLog entry offset, Change row_index)` 只是当前分批下的坐标，不是稳定
-event ID。`Change` 不携带应用前的关系状态，因此允许以负 diff 开头，也不判断一次撤回
-能否应用。事件生产者必须产生有效流；维护或物化关系的组件负责验证任意记录的应用前权重加
-已处理前缀累计 diff 不得为负，并在失败时回滚。
+如果此前权重为零，依次应用这三个事件后，记录的权重是 `2`。diff 可以大于一，因为
+DogPaddle 维护的是带整数权重的关系，而不只是普通的插入和删除消息。
+
+## 最小用法
 
 ```rust
 use std::sync::Arc;
@@ -27,37 +25,89 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 
-let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+let schema = Arc::new(Schema::new(vec![Field::new(
+    "name",
+    DataType::Utf8,
+    false,
+)]));
 let records = RecordBatch::try_new(
     schema,
-    vec![Arc::new(StringArray::from(vec!["A", "A"]))],
+    vec![Arc::new(StringArray::from(vec!["Alice", "Alice"]))],
 )?;
+
 let change = Change::try_new(records, Int64Array::from(vec![1, -1]))?;
 
 assert_eq!(change.num_rows(), 2);
+assert_eq!(change.diffs().value(0), 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-当前递归支持 Null、Boolean、整数、Float32/Float64、Utf8、Binary、Date32、Timestamp、
-Decimal128、List 和 Struct；其他尚未定义稳定语义的 Arrow 类型会被拒绝。Timestamp 支持
-Second、Millisecond、Microsecond 和 Nanosecond 四种单位，并把可选 timezone 字符串原样作为
-Schema identity 保存；无时区使用 `None`，空 timezone 字符串因无法由 Arrow IPC 与 `None` 稳定
-区分而被拒绝，Change 层不解释其他时区内容。Decimal128 的 precision 必须在 1..=38，正
-scale 不能大于 precision，负 scale 依照 Arrow 类型契约保留；每个自身为 non-null 的物理
-Decimal128 slot，其 unscaled `i128` 必须严格位于 `(-10^precision, 10^precision)`。该检查递归进入
-List/Struct，并只看 Decimal child array 自己的局部 validity：祖先 List/Struct 为 null 不会豁免一个
-物理上仍为 non-null 的 child slot。Array 切片只审计当前局部 slice；List 进一步只审计当前 offsets
-首尾覆盖的 child 区间。Change 层不定义舍入或算术语义。
+构造成功后有四个保证：
 
-字段顺序、名称、类型、nullability 和 metadata 都属于 Schema identity；同一 Schema 或 Struct
-作用域内不允许重名，List/Struct 最多嵌套 60 层。`$dogpaddle.` 字段名和 `dogpaddle.`
-Schema/Field metadata key 是保留命名空间。
+- 至少有一行；Operation 没有输出时返回 `None`，不构造空 `Change`。
+- 记录和 diff 行数相同。
+- diff 不为 null，也不为零。
+- 记录使用 DogPaddle v1 支持的精确 Schema。
 
-## 投影
+`Change` 不检查撤回是否合法。例如第一条事件就是 `-1`，仍然可以构造 `Change`。它不知道
+应用前的关系状态；`Distinct`、`Aggregate`、Join 和 Sink 等真正维护关系的组件会检查权重不能
+降到零以下，并在失败时回滚整个事务。
 
-`ChangeProjection` 是绑定到精确 logical Schema 的顶层删列计划。字段索引必须严格递增，不能
-重排或复制列；空投影与全量投影都合法。物理 `$dogpaddle.diff` 不属于逻辑索引且始终保留，
-选择 List 或 Struct 时选择其完整子树，当前不做嵌套字段裁剪。
+## 顺序为什么属于语义
+
+下面两批数据的最终净变化都是零，但它们不是同一个事件序列：
+
+```text
+A +1, A -1
+A -1, A +1
+```
+
+第二个序列可能在第一步就因非法撤回而失败。因此 `Change` 不排序、不去重，也不把相同记录的
+diff 提前相加。Operation 必须从第零行开始依次观察。
+
+如果只比较一条合法事件流展平后的关系结果，大批次可以拆成多个 `Change`，多个小批次也可以合并，
+前提是行与 diff 的顺序完全相同。但 `Change` 同时是一次事务、确认和重试的输入单位；重批会改变哪些
+前缀可以先提交，遇到非法撤回等错误时也会改变失败边界，因此运行层不能静默重批后声称事务行为不变。
+日志 offset 加行号只是当前分批方式下的位置，不能当作长期稳定的事件 ID。
+
+`Change` 也没有事件时间、watermark、来源 offset 或已物化关系。它只回答：这批记录按什么顺序，
+各自增加或撤回多少。
+
+## Schema 是完整契约
+
+`Change::schema()` 返回记录列的 logical Arrow Schema。物理 diff 列不在这个 Schema 中。字段的
+顺序、名称、类型、nullability、嵌套结构以及 Schema/Field metadata 都参与 identity；这些内容
+有任何不同，就是不同的 Schema。
+
+当前 v1 支持：
+
+| 类别 | 类型 |
+| --- | --- |
+| 标量 | Null、Boolean、8/16/32/64 位有符号与无符号整数、Float32、Float64 |
+| 字节与文本 | Utf8、Binary |
+| 时间与数值 | Date32、四种精度的 Timestamp、Decimal128 |
+| 嵌套 | List、Struct，最多嵌套 60 层 |
+
+同一个 Schema 或 Struct 作用域内不能有重名字段。以 `$dogpaddle.` 开头的字段名和以
+`dogpaddle.` 开头的 metadata key 留给物理协议使用。
+
+Timestamp 保留可选 timezone 字符串，但拒绝空字符串；`None` 表示无时区。Decimal128 precision
+必须在 `1..=38`，正 scale 不能超过 precision。构造和完整解码还会检查每个 non-null 物理值确实
+落在声明的 precision 内。这一层只验证表示是否合法，不定义时区换算、舍入或算术规则。
+
+需要只验证 Schema 时，调用 [`validate_schema`]。
+
+## 两种轻量操作
+
+### 切片
+
+`try_slice(offset, length)` 产生一个保持顺序的非空子段，并共享原来的 Arrow buffer。它适合把
+一批工作切成更小的内存视图；长度为零或越界会返回错误。
+
+### 顶层投影
+
+[`ChangeProjection`] 绑定到一个精确输入 Schema，只能按原顺序保留一部分顶层字段。索引必须
+严格递增，所以它不能重排或复制列。空投影合法：结果仍保留原行数和 diff，只是没有记录列。
 
 ```rust
 use std::sync::Arc;
@@ -91,52 +141,66 @@ assert_eq!(in_memory.records(), from_ipc.records());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-内存投影只重组 Schema 和 `ArrayRef`，共享原 Arrow buffer。选择性 IPC 解码先校验内嵌 Schema、
-完整 framing，以及所有无需读取 payload 就能判断的 field node 和 buffer descriptor，再只复制
-并解码 diff 与所选字段；如果所选 Decimal128 value buffer 的标准 IPC 8 字节对齐不足以满足
-Rust 原生 16 字节对齐，Arrow 会只为该 buffer 再建立一份对齐副本。结果是普通 owned `Change`，
-不借用日志 entry 或事务。
+内存投影只重组 Schema 和 `ArrayRef`，不会复制选中的 Arrow 数据。选择性 IPC 解码会跳过未选字段
+的值区，但仍验证整个消息结构以及字段和 buffer 描述。它减少解码和分配，不会改变已经写入的
+日志大小，也不承诺 RocksDB 或设备层面的字段级 I/O。未选字段的 UTF-8、List offset、Decimal
+value 等值级约束不会被读取和验证；需要审计全部内容时使用 [`decode_change`]。
 
-未选字段的 descriptor 仍必须合法，但其 UTF-8 内容、List offsets、Decimal128 value precision 等
-值级约束不会被读取或验证；所选字段会递归验证这些约束，需要完整审计时使用 `decode_change`。
-投影减少 `Change` codec 对 Arrow body 的访问、解码和 owned allocation，不改变写入内容、entry
-大小或运行层的 retained-byte 计费。它不承诺来自任何具体存储引擎的零拷贝读取，也不保证
-`RocksDB`、操作系统或存储设备产生字段级物理 I/O。
-
-## 持久化编码
-
-每个 Change 编码为一个标准、完整、自描述的 Arrow IPC Stream，不增加 `DogPaddle` envelope、
-外部 Schema、fingerprint 或 segment：
+## 在系统中的位置
 
 ```text
-Arrow Schema message（$dogpaddle.diff + logical fields + format metadata）
-Arrow RecordBatch message/body（恰好一个非空 batch）
-Arrow canonical EOS
+Operation ──产生/消费──> Change
+Flow      ──编码并路由──> 每条 Station output log
+Store     ──只保存──────> Vec<u8>
 ```
 
-物理 Schema 的第零字段固定为非 null Int64 `$dogpaddle.diff`，后续字段原样保存 logical
-record Schema；Schema metadata 包含 `dogpaddle.kind = change` 和
-`dogpaddle.change.version = 1`。标准 Arrow reader 可以直接读取这条 Stream，`decode_change`
-从借用字节完整解码，`decode_change_owned` 在调用方已经拥有编码时可让对齐的 Arrow body
-buffer 继续共享该分配；两者都只凭单个 entry 的字节恢复完整 Change 和事件顺序。
+这个 crate 不依赖 Operation、Flow 或 Store。反过来，Operation 用内存中的 `Change` 表达输入输出；
+Flow 把它编码后放入持久日志；Store 看到的只是字节。这个依赖方向让 Arrow 数据契约不需要知道
+事务、拓扑、subscriber 或 RocksDB key。
 
-writer 固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 在交给 Arrow
-前预检 message 长度和 entry 边界，并要求 V5、小端、无压缩、无 Schema feature、恰好一个
-batch、canonical EOS 且无尾随字节。Arrow IPC version、writer options、Schema marker、物理
-diff 布局、允许的 Arrow 类型和行序都是持久化兼容性边界。
+## 持久化格式
 
-这里的 canonical 限定的是消息 framing、EOS、writer options，以及 Schema/Field metadata key
-必须完整、唯一并按字节严格递增；decoder 不会把输入重新编码后逐字节比较，也不要求每个逻辑
-`Change` 只有一种可接受的字节表示。符合 Arrow framing
-且不改变语义的 `FlatBuffer` 布局、默认值或 body padding 内容变体可能被接受；
-`encode_change` 的确定性输出及其黄金字节才是 `DogPaddle` 写入端的持久化基准。
+[`encode_change`] 把每个 `Change` 写成一条完整、自描述的标准 Arrow IPC Stream：
 
-当前运行层用 `SubscribedLog<Vec<u8>>` 保存完整 Stream，每个日志 entry 恰好对应一个 Change。
-固定的消费者各自维护 durable position，可以对同一 entry 做不同投影；最慢消费者决定 entry
-何时回收。这些是 `RocksDB` Store 与 Flow 的职责：`dogpaddle-change` 不实现 Store collection，
-不依赖 Store，也不感知 offset、subscriber 或 retention；Store 同样不依赖 Arrow。
+```text
+Schema message
+  └─ $dogpaddle.diff: non-null Int64
+  └─ 所有 logical fields
+RecordBatch message/body（恰好一个非空 batch）
+canonical EOS
+```
 
-## 验证
+没有额外的 DogPaddle envelope，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
+Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff 和顺序。调用方已经拥有编码
+字节时，[`decode_change_owned`] 可以继续共享满足对齐要求的 Arrow body 分配。
+
+物理 Schema 的第零字段固定为 non-null Int64 `$dogpaddle.diff`，随后是完整 logical fields；
+Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.version = 1`。
+
+写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝错误 marker、
+大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 DogPaddle Schema。writer options、
+物理 diff 布局、允许的 Arrow 类型和行序都是 v1 持久化边界。
+
+canonical 约束 framing、EOS、writer options，以及有序且唯一的 metadata key；decoder 不要求把
+输入重新编码后逐字节相等。`encode_change` 的确定性输出和 golden bytes 是写入端基准。
+
+这是开发期 v1。修改物理 diff 布局、Schema marker、writer options、允许类型或解码规则时，应同步更新
+golden 和 reopen 证据并重建旧 Flow，不增加旧格式迁移或兼容分支。
+
+运行时每个日志 entry 恰好保存一个完整 Change Stream。多个订阅者可以对同一 entry 使用不同投影，
+最慢订阅者决定 entry 何时回收；这些属于 Flow 和 Store 的职责。
+
+## 从哪里继续读
+
+建议按这个顺序：
+
+1. [`src/change.rs`](src/change.rs)：核心不变量、切片和投影入口。
+2. [`src/schema.rs`](src/schema.rs)：v1 Schema 边界。
+3. [`src/projection.rs`](src/projection.rs)：精确 Schema 绑定的顶层投影。
+4. [`src/codec/`](src/codec/)：一条 Change 如何变成 Arrow IPC Stream。
+5. [`tests/correctness/`](tests/correctness/)：构造、Schema、投影和损坏输入的公共证据。
+
+## 验证与性能
 
 ```bash
 cargo test -p dogpaddle-change
@@ -146,9 +210,6 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_core
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_codec
 ```
 
-正确性分层、fixture 所有权和负向测试口径见工作区
-[`TESTING.md`](https://github.com/frelion/dogpaddle/blob/main/TESTING.md)，Change 单体 benchmark
-的 workload 与结果解释见
-[`PERFORMANCE.md`](https://github.com/frelion/dogpaddle/blob/main/crates/change/PERFORMANCE.md)。真实
-`Change + SubscribedLog<Vec<u8>>` 正确性和性能属于工作区下游
-`integration-tests/change-store/`，不由本 crate 的测试依赖 Store。
+工作区测试分层见 [`TESTING.md`](../../TESTING.md)，Change 单体 benchmark 的 workload 与结果解释见
+[`PERFORMANCE.md`](PERFORMANCE.md)。真实的 `Change + SubscribedLog<Vec<u8>>` 接缝由
+[`integration-tests/change-store/`](../../integration-tests/change-store/) 从公共 API 验证。

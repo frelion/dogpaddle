@@ -14,7 +14,7 @@ PostgreSQL / MySQL 数据变化  →  SQL 筛选、计算、分流  →  Postgre
 
 目前适合本地实验和 Rust 应用集成验证。项目仍在早期开发，PostgreSQL 与 MySQL 接入均处于试点阶段。
 
-[快速上手](#快速上手) · [嵌入 Rust 应用](#嵌入-rust-应用) · [当前支持什么](#当前支持什么) · [订单演示](#订单演示)
+[快速上手](#快速上手) · [嵌入 Rust 应用](#嵌入-rust-应用) · [当前支持什么](#当前支持什么) · [订单演示](#订单演示) · [技术文档](#文档)
 
 [![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
 [![PostgreSQL 恢复测试](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml)
@@ -184,8 +184,10 @@ DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运�
 
 ## 文档
 
-- **使用：** [SQL 语法与端点参数](crates/sql/README.md) · [Flow 运行与恢复](crates/flow/README.md)
-- **实现：** [算子与数据库接入](crates/operation/README.md) · [Arrow 数据模型](crates/change/README.md) ·
-  [事务存储](crates/store/README.md) · [Debezium runtime](crates/debezium/README.md)
+- **第一次读源码：** [Flow 的十分钟运行骨架](crates/flow/README.md) ·
+  [Operation 的构建与执行](crates/operation/README.md) · [Change 数据模型](crates/change/README.md) ·
+  [Store 事务状态](crates/store/README.md)
+- **产品入口：** [SQL 编译与智能装配](crates/sql/README.md) ·
+  [Debezium 拉取与恢复](crates/debezium/README.md)
 - **开发：** [构建、测试与性能验证](TESTING.md) · [算子路线图](OPERATOR_ROADMAP.md) ·
   [Debezium 接入路线图](DEBEZIUM_ROADMAP.md)

@@ -1,271 +1,241 @@
 # dogpaddle-store
 
-`dogpaddle-store` 是 `DogPaddle` 的事务状态层。它在 `RocksDB` 上提供具名、类型化的数据结构，
-让 Flow 和 Operation 只表达自己的持久状态与原子更新，不接触存储引擎、列族、物理 key 或
-压缩配置。
+`dogpaddle-store` 是 DogPaddle 的本地事务状态层。它把 RocksDB 包装成少量具名、类型化的数据结构，
+上层只需要表达“保存一个计数”“更新一张有序表”“发布一条消息”，不需要接触 column family、物理 key
+或 RocksDB 句柄。
 
-这个 crate 的公共边界刻意很小：setup 阶段用 `Store` 声明或重新打开资源，运行阶段只保留
-类型化 handle、唯一写事务启动能力和只读 snapshot 启动能力。当前 Flow 仍顺序执行；切换到
-`RocksDB` 为更大的单机状态和未来并发留下空间，但这里没有引入并行 writer、后台调度或历史版本
-查询 API。
+第一次阅读时先记住一句话：**先声明所有持久资源，再用同一笔事务更新任意多个资源。**
 
-## 生命周期与事务
+## 一条状态更新如何发生
 
-`Store::create` 只接受尚不存在的目录；`Store::open` 校验已有数据库的 marker 与资源 catalog。
-资源只能在 `Store` 阶段通过 `create_data` 或 `open_data` 获得。`StoreData` 是 sealed trait，外部
-crate 不能绕过六种内建结构自造物理资源。
+以一个同时更新计数和结果表的算子为例：
 
-直接通过 `Store::create_data` 发布单个 catalog binding 时，`StoreError::Storage` 是该 setup
-owner 的终止错误：底层同步写的结果可能不确定，调用方必须丢弃这个 `Store`，不能继续创建资源或
-进入运行期。实现仍会保留本次尝试的 namespace ID，作为误用时避免物理前缀复用的最后一道保护。
+```text
+创建或打开 Store
+    ↓
+取得 Cell<u64> 和 OrderedMap<u64, String> handle
+    ↓
+开始一笔写事务
+    ↓
+修改两个结构
+    ↓
+commit：两个修改一起可见；丢弃事务：两个修改一起回滚
+```
 
-需要一次声明完整资源集合的 owner 使用 `Store::setup` 获得窄化的 `StoreSetup`：资源 binding
-只在内存中暂存，`StoreSetup::commit` 把完整 catalog 与调用方提供的初始 collection state 放进
-同一个同步事务。commit 消费 setup capability，初始化或提交失败后都不能继续使用它。初始化闭包
-返回错误时事务确定回滚，磁盘上只有 Store marker、catalog 为空；底层 commit 返回存储错误时
-结果可能不确定，调用方必须通过 reopen 判定，或按产品策略删除并重建。
-
-进入运行期时，`Store::into_transactions` 消费 setup owner，产生不可克隆的 `Transactions`。
-`Transactions::begin(&mut self)` 开启一个写事务，因此同一个 owner 在类型层面一次只能持有一个
-活动写事务。`Transaction::commit` 使用 WAL 与同步写入原子提交；直接丢弃 transaction 会回滚。
-这条唯一写能力是当前顺序执行模型的明确边界，不是 `RocksDB` 并发能力的上限。
-
-`Transactions::split` 消费 owner，返回原来的唯一写能力和一个不可克隆、但 `Send + Sync` 的
-`ReadTransactions`。共享的 `&ReadTransactions` 可以各自调用 `begin()`，在本线程开启独立的稳定
-snapshot。snapshot 可以与 writer 同时存活：它持续看到开始时的已提交视图，之后开始的 snapshot
-才会看到新的 commit。活动的 `Transaction`、`ReadTransaction` 及其 access 都不能跨线程。
-
-setup 阶段也可以直接调用 `Store::read_transaction()` 借用一个短期只读 snapshot；它结束后仍可
-继续打开资源。三个事务启动方法都是 infallible，存储错误在实际访问或提交时返回。
-
-`TransactionAccess` 与 `ReadTransactionAccess` 是临时借用的装配能力。前者允许类型化结构产生
-读写 access，后者只能产生只读 access；两者都不能创建资源、开始事务或提交。一个 write
-transaction 内通过同一 `TransactionAccess` 修改的任意多个结构共享同一个原子边界。
-
-## 六种数据结构
-
-| 结构 | 适用状态 | 核心语义 |
-| --- | --- | --- |
-| `Cell<T>` | checkpoint、phase、计数器、小型控制状态 | 一个可缺省值；`get`、`set`、`clear` |
-| `OrderedMap<K, V>` | 按 key 定位或有序分页的状态 | `get`、`put`、`remove`，以及范围、方向、条目数和字节数都有界的 scan |
-| `OrderedMultiset<K>` | Distinct、精确 admission、带撤回的计数 | 缺失即 multiplicity `0`；`adjust` 做 checked signed 更新，归零即删除 |
-| `PartitionedMultiset<P, K>` | 每组独立的有序索引，例如 grouped MIN/MAX | 先选择 partition，再做 multiplicity、`adjust`、`first`、`last` 或有界 scan |
-| `Queue<T>` | 单一 owner 的持久 FIFO continuation 或私有 spool | 事务内 `try_push` 与 `pop_front`；硬字节容量；空队列没有持久 metadata |
-| `SubscribedLog<T>` | 一个 producer、固定多个 consumer 的 Flow output | setup 时固定 subscriber；writer 追加，subscription 只 peek/ack 自己的下一项，最慢订阅者决定逻辑保留范围 |
-
-`Cell`、`OrderedMap`、`OrderedMultiset` 和 `PartitionedMultiset` 同时提供写事务 access 与只读
-transaction access。`Queue` 的读取就是消费，因此只绑定写事务。`SubscribedLog` 在 setup 时由
-完整 handle 初始化或校验，随后派生职责更窄的 `SubscribedLogWriter` 和 `Subscription`；writer
-不能确认消费，subscription 不能追加、跳过、倒退或截断。
-
-`Queue::try_push` 的容量是硬上限，空队列也不会接纳超限项。每项按完整编码 value 加私有八字节
-sequence key 计费；metadata 与 `RocksDB` 自身开销不计入。队列变空时删除 metadata 并重置私有
-sequence，这个编号从不暴露为业务身份。
-
-`SubscribedLog::initialize` 必须在创建资源后恰好调用一次，并与拥有它的 durable definition 在
-同一事务发布。subscriber 是固定的稠密整数 `0..subscriber_count`。重新打开时用 `validate`
-核对定义派生出的数量，再从同一 setup handle 派生 writer 与 subscriptions。log offset 永不重置；
-每个 subscription 的 durable `position` 表示下一条待读项。`peek` 只读该项，`acknowledge` 只能确认
-这个精确 offset 并前进一步；position 与 retention accounting 在同一事务中更新。物理 key 的清理
-时机属于 Store 内部实现，不是 subscription 契约。
-
-Subscribed log 的 capacity 是防止 producer 因 backlog 无限增长而淹没磁盘的软上限：非空 backlog
-超限时 `try_append` 返回 `false` 且不写入；空 backlog 始终允许一条大项通过，避免单条合法消息
-永久阻塞。`retained_bytes` 同样按每项完整编码 value 加八字节 offset 计费。
-
-## 完整示例
-
-下面的例子只使用公共 API，并把六种结构的更新放进真实事务边界：
+对应的最小公共 API 是：
 
 ```rust,no_run
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
-use dogpaddle_store::{
-    Cell, OrderedMap, OrderedMultiset, PartitionedMultiset, Queue, ScanDirection,
-    ScanLimit, Store, StoreError, SubscribedLog,
-};
+use dogpaddle_store::{Cell, OrderedMap, Store};
 
-fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn initialize(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::create(path)?;
     let checkpoint = store.create_data::<Cell<u64>>("checkpoint")?;
     let users = store.create_data::<OrderedMap<u64, String>>("users")?;
-    let distinct = store.create_data::<OrderedMultiset<Vec<u8>>>("distinct")?;
-    let extrema = store.create_data::<PartitionedMultiset<u64, i64>>("extrema")?;
-    let spool = store.create_data::<Queue<Vec<u8>>>("spool")?;
-    let output = store.create_data::<SubscribedLog<Vec<u8>>>("output")?;
+    let mut transactions = store.into_transactions();
 
-    let writer = output.writer();
-    let subscriber = output.subscription(0);
-    let (mut writes, reads) = store.into_transactions().split();
-
-    // SubscribedLog 的固定订阅集合属于持久定义的一部分。
-    let transaction = writes.begin();
-    output.initialize(NonZeroU64::MIN, transaction.access())?;
-    transaction.commit()?;
-
-    let transaction = writes.begin();
+    let transaction = transactions.begin();
     let access = transaction.access();
     checkpoint.access(access)?.set(&1)?;
     users.access(access)?.put(&42, &"Shiba".to_owned())?;
-    distinct.access(access)?.adjust(&b"row".to_vec(), 1)?;
-    extrema.access(access)?.partition(&7)?.adjust(&-3, 1)?;
-    assert!(spool
-        .access(access)?
-        .try_push(&b"private".to_vec(), NonZeroU64::new(1024).unwrap())?);
-    assert!(writer.try_append(
-        &b"public".to_vec(),
-        NonZeroU64::new(1024).unwrap(),
-        access,
-    )?);
     transaction.commit()?;
+    Ok(())
+}
 
-    let snapshot = reads.begin();
+fn inspect(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::open(path)?;
+    let checkpoint = store.open_data::<Cell<u64>>("checkpoint")?;
+    let users = store.open_data::<OrderedMap<u64, String>>("users")?;
+
+    let snapshot = store.read_transaction();
     let read = snapshot.access();
     assert_eq!(checkpoint.read(read)?.get()?, Some(1));
     assert_eq!(users.read(read)?.get(&42)?.as_deref(), Some("Shiba"));
-    assert_eq!(distinct.read(read)?.multiplicity(&b"row".to_vec())?, 1);
-    assert_eq!(
-        extrema
-            .read(read)?
-            .partition(&7)?
-            .first()?
-            .map(|entry| entry.key),
-        Some(-3),
-    );
-
-    let page = users.read(read)?.scan(
-        ..,
-        ScanDirection::Ascending,
-        None,
-        ScanLimit::new(100, 1024 * 1024)?,
-    )?;
-    assert_eq!(page.entries, vec![(42, "Shiba".to_owned())]);
-    assert_eq!(page.continuation, None);
-
-    let next = subscriber.peek(read)?.expect("one committed output");
-    assert_eq!(next, (0, b"public".to_vec()));
-    assert_eq!(writer.status(read)?.retained_bytes, 8 + 6);
-    drop(snapshot);
-
-    let transaction = writes.begin();
-    assert_eq!(
-        spool.access(transaction.access())?.pop_front()?,
-        Some(b"private".to_vec()),
-    );
-    subscriber.acknowledge(next.0, transaction.access())?;
-    transaction.commit()?;
-
-    let snapshot = reads.begin();
-    assert!(subscriber.peek(snapshot.access())?.is_none());
-    let partition = extrema
-        .read(snapshot.access())?
-        .partition(&7)?
-        .scan(
-            ScanDirection::Descending,
-            None,
-            ScanLimit::new(1, 1024)?,
-        )?;
-    assert_eq!(partition.entries[0].multiplicity, 1);
     Ok(())
 }
 ```
 
-重新打开必须使用相同的资源名和完整 collection kind。Subscribed log 还要在 setup snapshot 中
-验证固定订阅数：
+`Cell` 和 `OrderedMap` 是可以长期保存的 handle；`access` 只是当前事务的临时借用凭证。handle 不能开始或
+提交事务，因此 collection 代码无法偷偷改变事务边界。
+
+## 两个生命周期
+
+Store 刻意把生命周期分成两段：
+
+| 阶段 | 做什么 | 主要类型 |
+| --- | --- | --- |
+| setup | 创建或打开具名资源，固定资源类型和名字 | `Store`、`StoreSetup` |
+| runtime | 读取和更新已经声明的资源 | `Transactions`、`ReadTransactions` |
+
+普通使用可以调用 `Store::create` / `Store::open`，再逐个 `create_data` / `open_data`。Flow 构建时需要一次
+发布完整资源集合，因此使用 `Store::setup`：资源先暂存在 setup 中，最后由 `StoreSetup::commit` 把 catalog、
+初始状态和 Flow Definition 放进同一笔同步事务。
+
+`StoreSetup` 不是普通 `Store`：它不能读取或打开资源，也不能直接进入 runtime。`commit` 无论成功、初始化失败，
+还是遇到结果不确定的底层提交错误，都会消费这个 setup owner；不能在失败后继续追加资源。未 commit 就丢弃时，
+磁盘只留下一个可重新打开的 marker-only 空 Store。
+
+`Store::into_transactions` 结束 setup，返回唯一的写事务启动能力。调用 `split` 后得到两种能力：
+
+```text
+Transactions       → begin() → Transaction       → TransactionAccess
+ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
+```
+
+- `Transactions` 不可克隆，并且 `begin(&mut self)` 需要独占借用；当前运行模型因此一次只有一个 writer。
+- `ReadTransactions` 不可克隆但可以共享；每次 `begin()` 得到一个稳定的只读 snapshot。
+- snapshot 只看见它开始时已经提交的数据，后续提交由新的 snapshot 看见。
+- transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 进一步约定只在当前 turn 内使用它们。
+
+这套类型不是为了模拟 RocksDB 的全部能力，而是让上层代码很难绕过 DogPaddle 的事务边界。
+
+## 六种持久数据结构
+
+| 结构 | 用一句话理解 | DogPaddle 中的典型用途 |
+| --- | --- | --- |
+| `Cell<T>` | 一个可缺省的值 | checkpoint、phase、计数器 |
+| `OrderedMap<K, V>` | 可点查、增删和有序分页的 map | 分组状态、业务索引 |
+| `OrderedMultiset<K>` | `K → 正 u64 份数`，归零即删除 | Distinct、关系行权重 |
+| `PartitionedMultiset<P, K>` | 每个 `P` 下有一棵独立的 multiset | Aggregate 极值、Join 的 key 分区 |
+| `Queue<T>` | 没有独立读取游标、pop 即删除的持久 FIFO | 私有 continuation、CDC 快照 spool |
+| `SubscribedLog<T>` | 一个 producer、固定多个独立 consumer 的日志 | Station 之间的持久输出 |
+
+`StoreData` 是 sealed trait；产品代码只能使用这些结构，不能绕过 catalog 自造新的物理布局。
+
+### Queue 与 SubscribedLog 的区别
+
+两者都保存有序数据，但用途不同：
+
+- `Queue` 的读取就是删除，没有 consumer cursor。它可以 clone，因此调用方必须自己保证只有一个协调者消费；
+  容量是硬上限，空队列也拒绝超大项。
+- `SubscribedLog` 允许多个 consumer 分别读取。每个 subscription 保存自己的下一条位置，最慢的 consumer
+  决定数据何时可以回收。
+
+`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。
+`SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 RocksDB 自身开销。
+
+`SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
+接受一个超大 entry，避免单条合法消息永久卡住。容量不足不是 Store 错误，也不会使事务中毒。
+
+两种容量都由 owner 在每次 `try_push` / `try_append` 时传入，不保存进 collection metadata；同一资源的 owner
+应稳定使用同一策略值。Queue 变空后私有 sequence 可以重置，SubscribedLog 的公开 offset 则单调递增且不复用。
+
+Flow 正是用 `SubscribedLog<Vec<u8>>` 连接 Station：producer 追加一个完整 Change，各 consumer 用自己的
+`Subscription::peek` 读取，并在处理结果提交的同一笔事务里 `acknowledge` 精确 offset。
+
+完整 log handle 只在 setup 使用。新日志必须先以非零 subscriber 数初始化；reopen 时先验证同一个数量，再派生
+职责更窄的 writer 和 subscriptions：
 
 ```rust,no_run
 use std::{num::NonZeroU64, path::Path};
 
-use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
+use dogpaddle_store::{Store, SubscribedLog};
 
-fn reopen(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn build(path: &Path) -> Result<(), dogpaddle_store::StoreError> {
+    let mut setup = Store::setup(path)?;
+    let log = setup.create_data::<SubscribedLog<Vec<u8>>>("output")?;
+    let _transactions = setup.commit(|access| {
+        log.initialize(NonZeroU64::MIN, access)
+    })?;
+    let _writer = log.writer();
+    let _consumer = log.subscription(0);
+    Ok(())
+}
+
+fn reopen(path: &Path) -> Result<(), dogpaddle_store::StoreError> {
     let store = Store::open(path)?;
-    let checkpoint = store.open_data::<Cell<u64>>("checkpoint")?;
-    let _users = store.open_data::<OrderedMap<u64, String>>("users")?;
-    let output = store.open_data::<SubscribedLog<Vec<u8>>>("output")?;
-
-    {
-        let snapshot = store.read_transaction();
-        output.validate(NonZeroU64::MIN, snapshot.access())?;
-        assert_eq!(checkpoint.read(snapshot.access())?.get()?, Some(1));
-    }
-
-    let _writer = output.writer();
-    let _subscriber = output.subscription(0);
-    let _transactions = store.into_transactions();
+    let log = store.open_data::<SubscribedLog<Vec<u8>>>("output")?;
+    let snapshot = store.read_transaction();
+    log.validate(NonZeroU64::MIN, snapshot.access())?;
+    drop(snapshot);
+    let _writer = log.writer();
+    let _consumer = log.subscription(0);
     Ok(())
 }
 ```
 
-## 编码与持久布局责任
+`peek` 返回下一条精确 offset 和 owned、已解码的值，不推进位置。`acknowledge` 只接受该 subscription 当前的
+精确 offset；通常应与消费结果和业务状态放在同一笔写事务。
 
-Store 的持久契约包括数据库 marker、资源 catalog、每个资源的稳定 namespace、collection kind，
-以及各结构自己的 key framing、metadata 和计数编码。所有结构共享一个 `RocksDB` database；物理前缀、
-WAL、同步提交、LZ4 压缩和引擎句柄都不进入公共 API。调用方不选择物理存储类别或 column family，
-也不能取得裸 namespace。
+## 有序分页
 
-Catalog 只记录 collection kind，不记录 `K`、`V`、`T` 的 Rust 类型或 codec 版本。因此资源 owner
-必须把“稳定资源名 + 完整 collection 类型 + `StoreKey`/`StoreValue` 编码”当作自己的持久 schema。
-以另一种 value codec 打开同一个 `OrderedMap` 不会在 catalog 阶段被识别，第一次解码才会失败。
-`StoreKey` 编码必须 canonical、可逆、injective，并逐字节保持 Rust `Ord`；`StoreValue` 编码必须能
-跨进程重启稳定还原。内建 codec 覆盖 `Vec<u8>`、`String`、`u32`、`u64`、`i64`、`bool` 和 `()`。
+`OrderedMap`、`OrderedMultiset` 和 `PartitionedMultiset` 的 scan 同时限制条目数和编码后的逻辑字节数。
+返回页拥有已经解码的 entries，以及可选的排他 `continuation`；页面不借用事务，可以在事务结束后继续遍历。
 
-当前开发期格式不提供旧布局识别、迁移或兼容层。修改资源名、collection kind、codec、内部 framing
-或 metadata 就是在修改持久 ABI；应同步更新 owner 的 golden/raw-layout 与 reopen 证据，并要求旧
-Flow 删除后重建。
+```rust,no_run
+# use dogpaddle_store::{OrderedMap, ScanDirection, ScanLimit, Store};
+# fn read(store: &Store, users: &OrderedMap<u64, String>) -> Result<(), dogpaddle_store::StoreError> {
+let snapshot = store.read_transaction();
+let page = users.read(snapshot.access())?.scan(
+    ..,
+    ScanDirection::Ascending,
+    None,
+    ScanLimit::new(100, 1024 * 1024)?,
+)?;
+for (id, name) in page.entries {
+    println!("{id}: {name}");
+}
+let next = page.continuation;
+# let _ = next;
+# Ok(())
+# }
+```
 
-## 有序扫描
+Store 在返回前完成准入、复制和完整解码；错误不会交付半页。第一项单独超过 byte limit 时返回
+`StoreError::ItemTooLarge`，调用方可以在同一事务中提高 limit 后重试。其他 codec 或存储错误会使事务中毒。
 
-`OrderedMapAccess::scan` 和 `OrderedMapReadAccess::scan` 接受 `RangeBounds<K>`、升降序、排他的
-`resume_after` 与 `ScanLimit`。limit 同时约束一页的条目数和 encoded key + value 逻辑字节数。
-返回的 `OrderedMapPage<K, V>` 包含完整解码的 `entries` 和可选 `continuation`。continuation 是本页
-最后一个 key，只在范围内仍有下一项时出现；下一页使用相同 range/direction，并把它传给
-`resume_after`。准入与解码在返回前完成，错误不会交付半页数据。
+## 提交、错误与恢复
 
-page 拥有全部数据，可以在 transaction 或 Store 关闭后继续使用。调用方拿到页面后自行遍历；修改
-同一写事务中的 map 不会改变当前页，后续页读取该事务当时的状态。Store 不再提供 visitor 或 encoded
-entry projection，页面解码错误仍使所属事务中毒，页面返回后的业务错误由调用方决定如何处理事务。
+写事务使用 WAL 并同步提交。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
+全部回滚。
 
-第一条匹配项单独超过 byte limit 时返回 `StoreError::ItemTooLarge`。这是唯一可调整 limit 后在同一
-事务重试的 Store 错误，不会使事务中毒。`PartitionedMultiset` 的 scan 只省略范围参数；它接受方向、
-排他的 `resume_after` 与同一个 `ScanLimit`，并把 partition framing、key 和 multiplicity 的编码字节
-计入 byte limit，返回拥有型 `MultisetPage<K>`。`first` 与 `last` 是
-Top-K/极值维护的常用单项路径。
+以下错误会使当前事务中毒：编码或解码失败、损坏的 metadata、使用另一个 Store 的 handle、RocksDB 访问失败、
+multiset underflow/overflow，以及非法 subscription acknowledgement。之后的访问返回
+`StoreError::TransactionPoisoned`，写事务不能提交。
 
-## 错误与事务中毒
+底层 commit 返回存储错误时，结果可能不确定。setup owner 必须丢弃当前对象，再通过 reopen 判断；Flow 运行期
+则进入 fail-stop，并要求重新打开 Flow。Store 不用额外日志去猜测一次不确定提交的结果。
 
-编码失败、解码失败、损坏的持久 metadata、wrong-store handle、`RocksDB` 访问失败、multiset
-underflow/overflow、非法 subscription acknowledgement 等硬错误都会使所属读或写 transaction
-中毒。之后的访问返回 `StoreError::TransactionPoisoned`，写 transaction 也不能提交；其全部 Store
-写入最终回滚。
+`Cell`、Map、Multiset 和 `Queue` handle 可以 clone，但每次访问都会检查它属于当前事务所在的 Store。
+完整 `SubscribedLog` setup handle、writer 和 subscription 都不可 clone；应在 setup 时各派生一次并 move 给唯一 owner。
+writer 不能确认消费，subscription 不能追加，两者也不能取得 commit 权力。
 
-容量不足不是错误。`Queue::try_push` 或 `SubscribedLogWriter::try_append` 返回 `false` 时不写入、
-不中毒，调用方可以在同一 transaction 内选择背压、更新其他状态或正常提交。
+## 持久格式由谁负责
 
-`Cell`、map、multiset 和 `Queue` handle 可以 clone，但每次访问仍会校验它属于开启 transaction 的
-同一个 `Store`。`SubscribedLog` 通过 setup handle 派生所需的 writer 和 subscriptions。Access 借用
-活动 transaction，不能缓存到下一个 turn；transaction 的 owner 始终保留唯一的 commit 权力。
+Store catalog 记录资源名、collection kind 和独立 namespace，但不知道 `K`、`V`、`T` 的 Rust 类型。
+因此资源 owner 必须把下面三项一起视为持久 schema：
+
+```text
+稳定资源名 + collection 类型 + StoreKey / StoreValue codec
+```
+
+`StoreKey` 编码必须 canonical、可逆、无碰撞，并按字节保持 Rust `Ord`；`StoreValue` 编码必须能在重启后稳定还原。
+所有结构共享一个启用 LZ4 的默认 column family，物理前缀、namespace、压缩设置和 RocksDB 句柄都不对外暴露。
+
+当前是开发期 v1。修改资源名、collection kind、codec、key framing 或 metadata 就是修改持久 ABI；同步更新布局和
+reopen 测试，然后删除旧 Flow 重建，不增加旧格式迁移或兼容分支。
+
+## 读代码的顺序
+
+1. [`src/store/mod.rs`](src/store/mod.rs)：`Store`、事务和 access 类型。
+2. [`src/store/transaction.rs`](src/store/transaction.rs)：snapshot、commit 与中毒规则。
+3. [`src/collections/`](src/collections/)：六种结构的公共语义。
+4. [`src/store/data.rs`](src/store/data.rs)：catalog、namespace 和底层读写入口。
+5. [`src/codec.rs`](src/codec.rs)：稳定 key/value 编码契约。
 
 ## 验证与性能
 
-Store 的公共 correctness target 覆盖事务、snapshot、六种结构、reopen、raw layout、损坏拒绝、
-中毒回滚和 SIGKILL crash consistency：
+公共 correctness target 覆盖事务、snapshot、六种结构、reopen、raw layout、损坏拒绝、中毒回滚和 SIGKILL
+crash consistency：
 
 ```bash
 cargo test -p dogpaddle-store --test correctness --locked -- --test-threads=1
-```
-
-需要私有故障注入的 collection 单元测试随 library test 运行：
-
-```bash
 cargo test -p dogpaddle-store --lib --locked -- --test-threads=1
 ```
 
-完整工作区 gate、证据所有权和系统验收入口见 [`TESTING.md`](../../TESTING.md)。Store 只保留两个
-owner benchmark：`cell` 测 hot read 与 durable read-modify-write，`ordered_map` 测批量写、点读、
-有界正反向 owned-page scan、Station 形状的原子更新和 durable hot overwrite。`subscribed_log` 增加
-大 payload status/消费及慢订阅者 backlog 跨 reopen 的有界 churn。workload、fixture、
-结果字段与可比性规则见 [`PERFORMANCE.md`](PERFORMANCE.md)。快速 smoke：
+完整工作区 gate 见 [`TESTING.md`](../../TESTING.md)。benchmark 的 workload 和解释见
+[`PERFORMANCE.md`](PERFORMANCE.md)：
 
 ```bash
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench cell
