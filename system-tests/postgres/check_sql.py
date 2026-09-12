@@ -155,10 +155,15 @@ class Gate:
                      "-p", str(self.port), "-U", "dogpaddle_gate",
                      "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-At"]
         self.host_environment = {
-            "DOGPADDLE_FULFILLMENT_BUNDLE": str(bundle),
-            "DOGPADDLE_FULFILLMENT_PORT": str(self.port),
-            "DOGPADDLE_FULFILLMENT_USER": "dogpaddle_gate",
-            "DOGPADDLE_FULFILLMENT_PASSWORD": PASSWORD,
+            "DOGPADDLE_DEBEZIUM_RUNTIME": str(bundle),
+            "DOGPADDLE_FULFILLMENT_SOURCE": (
+                f"postgresql://dogpaddle_gate:{PASSWORD}@127.0.0.1:"
+                f"{self.port}/postgres"
+            ),
+            "DOGPADDLE_FULFILLMENT_TARGET": (
+                f"postgresql://dogpaddle_gate:{PASSWORD}@127.0.0.1:"
+                f"{self.port}/postgres"
+            ),
         }
 
     def start(self) -> None:
@@ -233,8 +238,9 @@ class Gate:
 
     def slot_active(self) -> bool:
         return self.sql(
-            "SELECT active FROM pg_replication_slots "
-            "WHERE slot_name = 'orders_slot'"
+            "SELECT count(*) = 1 AND bool_and(active) "
+            "FROM pg_replication_slots "
+            "WHERE plugin = 'pgoutput' AND database = current_database()"
         ) == "t"
 
     def source_rows(self) -> list[dict[str, Any]]:
@@ -349,7 +355,7 @@ class Gate:
         if name == "connected":
             statement = (
                 "SELECT slot_name, plugin, active\n"
-                "FROM pg_replication_slots WHERE slot_name = 'orders_slot';"
+                "FROM pg_replication_slots WHERE plugin = 'pgoutput';"
             )
         else:
             statement = (
@@ -515,7 +521,7 @@ class Gate:
         ]
         after_delete = [repriced[1]]
 
-        with self.host("build", 1) as host:
+        with self.host("first", 1) as host:
             self.drive(host, "SQL CDC connector starts", self.slot_active)
             self.capture("connected")
 
@@ -632,7 +638,7 @@ class Gate:
         until("killed SQL host releases its slot", lambda: not self.slot_active())
         self.capture("crashed")
 
-        with self.host("open", 2) as host:
+        with self.host("restart", 2) as host:
             replay = host.advance()
             if (
                 replay["outcome"] != "Progressed"

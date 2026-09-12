@@ -1,20 +1,16 @@
 -- Turn paid orders into a live fulfillment queue in the same PostgreSQL database.
 INSERT INTO postgres(
-    sink_id => 'fulfillment_queue', host => '127.0.0.1',
-    port => env('DOGPADDLE_FULFILLMENT_PORT'), database => 'postgres',
-    user => env('DOGPADDLE_FULFILLMENT_USER'), password => env('DOGPADDLE_FULFILLMENT_PASSWORD'),
-    schema => 'ops', table => 'fulfillment_queue'
+    connection => env('DOGPADDLE_FULFILLMENT_TARGET'),
+    table => 'ops.fulfillment_queue'
 )
 WITH raw_orders AS (
     SELECT order_id, customer, region, status,
         CAST(quantity AS BIGINT) AS quantity, unit_price_cents,
         CAST(discount_pct AS BIGINT) AS discount_pct
     FROM postgres_cdc(
-        engine_name => 'orders', runtime_bundle => env('DOGPADDLE_FULFILLMENT_BUNDLE'),
-        host => '127.0.0.1', port => env('DOGPADDLE_FULFILLMENT_PORT'), database => 'postgres',
-        user => env('DOGPADDLE_FULFILLMENT_USER'), password => env('DOGPADDLE_FULFILLMENT_PASSWORD'),
-        schema => 'sales', table => 'orders', slot => 'orders_slot', publication => 'orders_publication',
-        bootstrap_spool_bytes => 1073741824
+        connection => env('DOGPADDLE_FULFILLMENT_SOURCE'),
+        table => 'sales.orders',
+        publication => 'orders_publication'
     )
 ),
 priced AS (

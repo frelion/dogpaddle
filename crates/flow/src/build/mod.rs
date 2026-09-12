@@ -33,6 +33,7 @@ static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 pub struct FlowFactory {
     path: PathBuf,
     token: u64,
+    owner_identity: Option<[u8; 32]>,
     stations: Vec<StationDefinition>,
     connections: Vec<(Vec<StationRef>, StationRef)>,
     output_capacities: Vec<(StationRef, NonZeroU64)>,
@@ -62,11 +63,23 @@ impl FlowFactory {
         Self {
             path: path.as_ref().to_path_buf(),
             token,
+            owner_identity: None,
             stations: Vec::new(),
             connections: Vec::new(),
             output_capacities: Vec::new(),
             resources: BTreeMap::new(),
         }
+    }
+
+    /// Sets the opaque identity of the owner that declares or expects this Flow.
+    ///
+    /// Build persists this value inside the immutable Flow definition. Open
+    /// requires an exact match before binding Operations or runtime resources.
+    /// A factory whose owner identity is unset only matches a definition built
+    /// without one.
+    pub fn owner_identity(&mut self, identity: [u8; 32]) -> &mut Self {
+        self.owner_identity = Some(identity);
+        self
     }
 
     /// Supplies one ephemeral resource to a Station, for either build or open.
@@ -229,6 +242,7 @@ impl FlowFactory {
 
     fn finish_definition(self) -> Result<FlowDefinition, TopologyError> {
         validate::finish_definition(
+            self.owner_identity,
             self.token,
             self.stations,
             &self.connections,

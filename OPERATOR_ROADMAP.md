@@ -72,8 +72,8 @@ conformance，而不是让某个上层 API 反向定义运行内核。
 Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL`、非空 `GROUP BY` 与 EquiJoin family lowering 为现有 Definition DAG。
 SQL 聚合支持 `COUNT/SUM/AVG/MIN/MAX` 和纯分组；SQL 不建立 DogPaddle Table、View、catalog、独立状态或执行层。
 SQL Join 支持 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti；每个 Join 至少有一个跨输入等值 key，Inner residual 作为同 Station Atomic Filter，其他 kind 只接受等值合取。Cross/Natural/Using Join、纯非等值 Join、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
-必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
-这份磁盘 Definition 为恢复真相，SQL 变更要求新路径或显式重建。
+必须在建库前拒绝。`SqlProgram::start` 在状态路径缺失时持久化 canonical Flow Definition，已有路径则先
+校验 Program identity 再以磁盘 Definition 恢复；任何恢复失败都不回退构建。SQL 语义变更要求新路径。
 
 ## 目标分层
 
@@ -216,8 +216,9 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 一个 Station 保存非空、有序的普通 Operation 列表，并在一个事务中执行首项和全部 Atomic 尾项，
 只让最终边界进入 `SubscribedLog`。Atomic 可以拥有关系状态、增加输出行或改变 diff；Scan 和需要 durable continuation 的 TurnTransform 可以作为
 首项，Sink 和 Exclusive Transform 必须独占。Flow build/open 持久并恢复当前 v1
-物理分组，不提供旧布局兼容路径。SQL build 先生成私有 logical arena，再按 Operation 身份、直接
-consumer edge 数量和 fan-out 边界确定性装配最大合法线性 Station；open 不重新分组。最终不变量、Definition 形状、
+物理分组，不提供旧布局兼容路径。SQL `start` 只在状态路径缺失时生成私有 logical arena，再按 Operation
+身份、直接 consumer edge 数量和 fan-out 边界确定性装配最大合法线性 Station；已有状态以 Program identity
+校验后直接恢复，不重新分组。最终不变量、Definition 形状、
 事务/`AfterCommit` 规则和验证矩阵见
 [`docs/plans/station-pipelines-and-durable-boundaries.md`](docs/plans/station-pipelines-and-durable-boundaries.md)。
 
@@ -444,8 +445,8 @@ Flow 继续唯一持有写事务启动能力，连接器不得绕过 Operation/S
 - 不可变 exact logical Schema；
 - 每个 Scan 恰好声明 `phase: Cell<u32>`、`checkpoint: Cell<Vec<u8>>` 与
   `bootstrap_spool: Queue<Vec<u8>>`；
-- 必填 `bootstrap_spool_bytes` 是 Queue 按 `8-byte private sequence + IPC` 计费的硬上限，空 Queue
-  也不接纳超限首项；
+- Operation Definition 中的非零 `bootstrap_spool_bytes` 是 Queue 按 `8-byte private sequence + IPC` 计费的
+  硬上限，空 Queue 也不接纳超限首项；SQL endpoint 省略时写入 1 GiB；
 - PostgreSQL 用 `initial` 捕获已有行和 heartbeat 前 WAL，再从封口 checkpoint 以 `no_data` 继续同一 slot；
 - MySQL 8.4 用 `initial_only + minimal` 捕获一致全表快照，再从封口 checkpoint 以 `recovery` 继续 binlog；
 - 稳态 checkpoint 与 output 原子提交，ACK 不确定则 fail-stop/reopen，不把 checkpoint 当 delivery ID；
@@ -640,7 +641,7 @@ zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema i
 ### 最小切片证据与剩余工作
 
 - owner correctness 已覆盖 tag/payload、三资源、bind/materialize、COUNT/SUM/AVG/MIN/MAX 的有序变化、
-  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后有序极值读取；SQL 有跨 drop/open 的最终关系 witness、
+  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后有序极值读取；SQL 有跨 drop/start 的最终关系 witness、
   纯分组 witness 及拒绝路径无目录副作用证据。
 - 尚需 global aggregate 的空关系语义、UnionDistinct/Intersect/Except、aggregate DISTINCT/FILTER/ORDER、
   UDF 接入、更多类型，以及大 group cardinality/高更新频率 benchmark；这些不由当前最小切片暗示支持。
@@ -710,7 +711,7 @@ EquiJoin 已验证：
 - NULL key、unmatched/matched 状态、负前缀与 overflow；
 - 有界分页、backpressure、reopen 和 corruption；
 - 五种底层 kind 的独立关系 oracle、outer nullability、同一 Claim 内 presence 往返；
-- SQL qualified column、同名字段、key expression、Right swap、Inner residual、确定性 Station grouping 和 build/open。
+- SQL qualified column、同名字段、key expression、Right swap、Inner residual、确定性 Station grouping 和 drop/start 恢复。
 
 Operation 仍保持纯 equi，不把 residual 放进 Join 状态机。SQL 只对 Inner residual 使用等价的 fused Filter；
 Outer/Semi/Anti residual、Cross/Natural/Using、非等值 Join、共享 arrangement 和成本型 join order 留给

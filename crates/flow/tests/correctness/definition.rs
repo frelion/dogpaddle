@@ -17,6 +17,7 @@ use super::support::{
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
 const V1_STATION_OPERATIONS: &str = include_str!("../fixtures/v1/station_operations.hex");
+const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 
 #[derive(Clone, Copy)]
 enum ResourceFault {
@@ -37,7 +38,7 @@ fn build_publishes_the_stable_v1_definition_bytes() {
 }
 
 #[test]
-fn build_publishes_multiple_operations_in_stable_order() {
+fn build_publishes_owner_identity_and_multiple_operations_in_stable_order() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     build_multi_operation_station(&path);
@@ -197,6 +198,7 @@ fn build_chain(path: &Path) {
 
 fn build_multi_operation_station(path: &Path) {
     let mut builder = FlowFactory::new(path);
+    builder.owner_identity(OWNER_IDENTITY);
     let scan = builder.station("scan", SequenceScanDefinition::new(7));
     let sink = builder.station("sink", DiscardDefinition::new());
     builder.append(scan, ProjectDefinition::new([0])).unwrap();

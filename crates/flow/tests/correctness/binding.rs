@@ -20,6 +20,7 @@ use dogpaddle_store::{Cell, Store, StoreError, SubscribedLog};
 use super::support::{read_published_definition, rewrite_checksum};
 
 const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024 * 1_024).unwrap();
+const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 
 #[test]
 fn build_reports_the_exact_project_schema_rejection_without_creating_a_store() {
@@ -99,6 +100,7 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
+    factory.owner_identity(OWNER_IDENTITY);
     let scan = factory.station("scan", SequenceScanDefinition::new(0));
     let project = factory.station("project", ProjectDefinition::new([0]));
     let sink = factory.station("sink", DiscardDefinition::new());
@@ -120,7 +122,14 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     rewrite_checksum(&mut definition);
     replace_published_definition(&path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::new(&path).open() else {
+    assert!(matches!(
+        FlowFactory::new(&path).open(),
+        Err(FlowError::OwnerIdentityMismatch)
+    ));
+
+    let mut open = FlowFactory::new(&path);
+    open.owner_identity(OWNER_IDENTITY);
+    let Err(FlowError::Schema(error)) = open.open() else {
         panic!("open did not rebind the decoded schema-incompatible Project");
     };
     assert_project_field_rejection(&error);

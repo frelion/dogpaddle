@@ -13,6 +13,7 @@ bench = false
 
 [dependencies]
 arrow-schema.workspace = true
+blake3.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-functions-aggregate.workspace = true
@@ -20,10 +21,11 @@ datafusion-optimizer.workspace = true
 datafusion-sql.workspace = true
 dogpaddle-flow.workspace = true
 dogpaddle-operation.workspace = true
+percent-encoding.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-blake3.workspace = true
 dogpaddle-store.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true

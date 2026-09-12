@@ -31,7 +31,7 @@ use dogpaddle_debezium::{ConnectorConfig, DebeziumRuntime};
 # fn persist_atomically(_: &[dogpaddle_debezium::Record], _: &[u8]) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
 # fn should_stop() -> bool { true }
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-let runtime = DebeziumRuntime::open("/opt/dogpaddle-debezium")?;
+let runtime = DebeziumRuntime::open("/opt/dogpaddle/libexec/dogpaddle/debezium")?;
 // 这里只演示控制流；真实 PostgreSQL connector 还需要数据库、表、slot 等属性。
 let config = ConnectorConfig::new(
     "orders",
@@ -141,6 +141,11 @@ dogpaddle-debezium-runtime-<target>/
 `open` 校验 target、Temurin release、必要运行文件、JAR 清单与 hash，并通过 bundle 内的绝对路径加载
 `libjvm`。它不会搜索 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java。
 
+产品 archive 把这份 payload 安装在 `<archive>/libexec/dogpaddle/debezium`，与
+`<archive>/bin/dogpaddle` 组成同一个发布物。SQL 用户不传 runtime 路径；`dogpaddle run` 从 executable
+向上定位安装根。源码树和系统测试可以用绝对路径环境变量 `DOGPADDLE_DEBEZIUM_RUNTIME` 覆盖默认位置，
+生产安装沿用 archive 布局即可。这个定位规则属于产品 SQL 层；`DebeziumRuntime::open` 本身仍只接受显式路径。
+
 一个进程最多只有一个 `HotSpot` JVM。再次打开同一个 canonical bundle path 会复用它；尝试打开另一个 bundle
 会明确失败。`DebeziumRuntime` 被丢弃不会卸载 JVM：进程级 `OnceLock` 会让它存活到进程结束，也不能重新配置。
 `DogPaddle` 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
@@ -156,8 +161,8 @@ bundle 必须在整个进程生命周期内保持不可修改，并安装在不�
 Linux 目标要求 GNU/glibc，不支持 musl 或 Alpine。macOS archive 当前是未签名的开发产物；发布签名、
 notarization 和完整 native dependency closure 不属于这个 crate 当前的交付承诺。
 
-payload 只包含可复用的 Java runtime 与 Debezium distribution，不包含 `DogPaddle` executable 或测试 host；
-最终发布包由上层打包流程组合两者。
+payload 本身仍只包含可复用的 Java runtime 与 Debezium distribution，不包含 `DogPaddle` executable 或测试
+host；产品 archive 在固定 `bin/` 与 `libexec/` 布局中组合两者。
 
 ## 运行边界
 

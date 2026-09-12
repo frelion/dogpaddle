@@ -152,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | API | 作用 |
 | --- | --- |
 | `new(path)` | 指定这条 Flow 独占的状态目录 |
+| `owner_identity(identity)` | 设置不透明的 32 字节 owner 身份；build 持久化，open 必须精确匹配 |
 | `station(id, definition)` | 创建 Station，并放入首 Operation |
 | `append(station, definition)` | 在现有 Station 末尾追加单输入 atomic transform |
 | `connect(inputs, station)` | 按顺序连接 Station 的全部输入端口 |
@@ -191,7 +192,7 @@ use dogpaddle_operation::operation::scan::PostgresCdcScanConfig;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let config = PostgresCdcScanConfig::new_unencrypted(
-    "/opt/dogpaddle-debezium",
+    "/opt/dogpaddle/libexec/dogpaddle/debezium",
     "127.0.0.1",
     5432,
     "shop",
@@ -206,9 +207,11 @@ flow.advance()?;
 # }
 ```
 
-`open` 从磁盘读取 Station 拓扑、Operation 顺序、定义和容量，重新做相同的 Schema 绑定，打开所有已声明
-状态并装配运行对象。它不会接受另一份拓扑声明，也不会重新决定如何融合。凭据、进程内 connector 等
-runtime resource 不写入磁盘，必须按 Station ID 再次注入。
+`open` 从磁盘读取 owner identity、Station 拓扑、Operation 顺序、定义和容量。若 Factory 设置了
+`owner_identity`，它必须与磁盘中的值精确相同；未设置的 Factory 只接受同样未设置 owner 的 Flow。
+比较发生在 Schema binding、资源打开和 Operation materialize 之前。随后 Flow 才重新做相同的 Schema
+绑定，打开全部状态并装配运行对象。它不会接受另一份拓扑声明，也不会重新决定如何融合。凭据、
+进程内 connector 等 runtime resource 不写入磁盘，必须按 Station ID 再次注入。
 
 当前 v1 不读取旧布局、不迁移旧数据库。修改定义、拓扑或融合结果后，应删除旧状态或使用新目录。
 
@@ -216,7 +219,7 @@ runtime resource 不写入磁盘，必须按 Station ID 再次注入。
 
 一条 Flow 的持久状态由四部分组成：
 
-- canonical Flow Definition：Station ID、有序 Operation Definition、输入 Station ID 和输出容量；
+- canonical Flow Definition：可选的不透明 owner identity、Station ID、有序 Operation Definition、输入 Station ID 和输出容量；
 - 每个 Operation 自己声明的数据，例如计数、Join 两侧关系或 CDC checkpoint；
 - 每个 Station 最终输出的 `SubscribedLog` 及每条下游边的订阅位置；
 - 多输入 Station 当前固定的输入端口。
@@ -269,7 +272,9 @@ backlog 的单位是完整 `Change`，不是行数。输出容量限制的是持
 6. [`src/assembly.rs`](src/assembly.rs)：已验证 Definition 如何变成运行期 Station。
 7. [`src/build/codec.rs`](src/build/codec.rs) 与 [`src/build/open.rs`](src/build/open.rs)：持久格式和恢复路径。
 
-Flow 只实现装配、拓扑、调度和事务边界，不枚举具体算子，也不包含 SQL planner。算子语义见
+Flow 只实现装配、拓扑、调度和事务边界，不枚举具体算子，也不包含 SQL planner。SQL 层用 owner identity
+阻止另一份 Program 打开已有状态，并以 `SqlProgram::start` 统一选择首次构建或恢复；Flow 不解释这 32
+字节的含义。算子语义见
 [`dogpaddle-operation`](../operation/README.md)，底层集合和事务见
 [`dogpaddle-store`](../store/README.md)，SQL 自动装配见 [`dogpaddle-sql`](../sql/README.md)。
 

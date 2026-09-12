@@ -35,6 +35,9 @@ pub enum FlowDefinitionError {
     /// A length cannot be represented by the durable format.
     #[error("{0} is too large for the flow definition format")]
     LengthOverflow(&'static str),
+    /// The owner-identity presence discriminator is outside the canonical domain.
+    #[error("flow definition contains invalid owner identity presence {0}")]
+    InvalidOwnerIdentityPresence(u8),
     /// The output-presence discriminator is outside the canonical domain.
     #[error("flow definition contains invalid output presence {0}")]
     InvalidOutputPresence(u8),
@@ -93,6 +96,12 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
     let mut encoded = Vec::new();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    if let Some(identity) = definition.owner_identity() {
+        encoded.push(1);
+        encoded.extend_from_slice(&identity);
+    } else {
+        encoded.push(0);
+    }
     encoded.extend_from_slice(&station_count.to_be_bytes());
 
     for station in definition.stations() {
@@ -131,7 +140,9 @@ pub(crate) fn decode(
     if &encoded[..MAGIC.len()] != MAGIC {
         return Err(FlowDefinitionError::InvalidMagic);
     }
-    if encoded.len() < MAGIC.len() + size_of::<u16>() + size_of::<u32>() + CHECKSUM_LENGTH {
+    if encoded.len()
+        < MAGIC.len() + size_of::<u16>() + size_of::<u8>() + size_of::<u32>() + CHECKSUM_LENGTH
+    {
         return Err(FlowDefinitionError::Truncated);
     }
 
@@ -152,6 +163,13 @@ pub(crate) fn decode(
         return Err(FlowDefinitionError::UnsupportedVersion(version));
     }
 
+    let owner_identity = match cursor.read_u8()? {
+        0 => None,
+        1 => Some(cursor.take::<32>()?),
+        presence => {
+            return Err(FlowDefinitionError::InvalidOwnerIdentityPresence(presence));
+        }
+    };
     let station_count = cursor.read_u32()?;
     let mut stations = Vec::new();
     for _ in 0..station_count {
@@ -194,10 +212,11 @@ pub(crate) fn decode(
         return Err(FlowDefinitionError::TrailingBytes);
     }
 
-    validate_definition(stations)
+    validate_definition(owner_identity, stations)
 }
 
 fn validate_definition(
+    owner_identity: Option<[u8; 32]>,
     stations: Vec<StationDefinition>,
 ) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
     validate_station_ids(&stations)?;
@@ -231,7 +250,7 @@ fn validate_definition(
     };
     let schedule = validate_decoded_topology(&stations, &inputs_by_station)?;
     let topology = resolve_topology(inputs_by_station, schedule);
-    Ok((FlowDefinition::new(stations), topology))
+    Ok((FlowDefinition::new(owner_identity, stations), topology))
 }
 
 fn encode_string(

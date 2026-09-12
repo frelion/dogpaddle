@@ -25,7 +25,7 @@ impl Options {
     fn read() -> Result<Self, HostError> {
         let args = env::args().skip(1).collect::<Vec<_>>();
         let [mode, sql_path, flow_path] = args.as_slice() else {
-            return Err("usage: postgres_sql <build|open> SQL_FILE FLOW_PATH".into());
+            return Err("usage: postgres_sql <first|restart> SQL_FILE FLOW_PATH".into());
         };
         Ok(Self {
             mode: mode.clone(),
@@ -38,11 +38,10 @@ impl Options {
 fn main() -> Result<(), HostError> {
     let options = Options::read()?;
     let program = SqlProgram::read(&options.sql_path)?;
-    let mut flow = match options.mode.as_str() {
-        "build" => program.build(&options.flow_path)?,
-        "open" => program.open(&options.flow_path)?,
-        _ => return Err("mode must be build or open".into()),
-    };
+    if !matches!(options.mode.as_str(), "first" | "restart") {
+        return Err("mode must be first or restart".into());
+    }
+    let mut flow = program.start(&options.flow_path)?;
 
     respond(&json!({"kind": "ready", "mode": options.mode}))?;
     for command in io::stdin().lock().lines() {

@@ -1,24 +1,21 @@
-use std::{fs, ops::ControlFlow, path::Path};
+use std::{fs, path::Path};
 
 use datafusion_sql::sqlparser::{
-    ast::{
-        BinaryOperator, Cte, Distinct as SelectDistinct, Expr, GroupByExpr, Ident, JoinConstraint,
-        JoinOperator, ObjectName, Query, Select, SelectFlavor, SetExpr, SetOperator, SetQuantifier,
-        TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, VisitMut, VisitorMut, With,
-    },
+    ast::Query,
     dialect::GenericDialect,
-    keywords::Keyword,
-    parser::Parser,
-    tokenizer::{Token, TokenWithSpan},
+    tokenizer::{Token, Tokenizer},
 };
 use dogpaddle_flow::{Flow, FlowFactory};
 
 use crate::{
     SqlError,
-    compiler::scan_station_id,
-    endpoint::{ScanEndpoint, SinkEndpoint},
-    lower::{internal_scan_name, lower_query, plan},
+    assembly::{OUTPUT_CAPACITY_BYTES, scan_station_id},
+    endpoint::{ScanEndpoint, SinkEndpoint, resolve_debezium_runtime},
+    plan::{lower_query, plan},
+    syntax,
 };
+
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1";
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
 pub struct SqlProgram {
@@ -36,40 +33,8 @@ impl SqlProgram {
     /// subset, any outer statement other than direct `INSERT INTO sink(...) Query`,
     /// or malformed endpoint parameters.
     pub fn parse(sql: &str) -> Result<Self, SqlError> {
-        let dialect = GenericDialect {};
-        let mut parser = Parser::new(&dialect).try_with_sql(sql)?;
-        parser.expect_keyword(Keyword::INSERT)?;
-        parser.expect_keyword(Keyword::INTO)?;
-        let sink = match parser.parse_expr()? {
-            Expr::Function(function) => SinkEndpoint::parse(&function)?,
-            _ => {
-                return Err(SqlError::invalid(
-                    "INSERT INTO requires a sink function call",
-                ));
-            }
-        };
-        let mut query = *parser.parse_query()?;
-        let _ = parser.consume_token(&Token::SemiColon);
-        if parser.peek_token().token != Token::EOF {
-            return Err(SqlError::invalid(
-                "a SQL file must contain exactly one INSERT statement",
-            ));
-        }
-        if contains_limit_all(&parser.into_tokens()) {
-            return Err(SqlError::Unsupported("LIMIT".to_owned()));
-        }
-        validate_query(&query)?;
-
-        let mut collector = ScanCollector::default();
-        let _ = query.visit(&mut collector);
-        if let Some(error) = collector.error {
-            return Err(error);
-        }
-        Ok(Self {
-            sink,
-            query,
-            scans: collector.scans,
-        })
+        let (sink, query, scans) = syntax::parse(sql)?;
+        Ok(Self { sink, query, scans })
     }
 
     /// Reads and parses one UTF-8 SQL file.
@@ -87,417 +52,257 @@ impl SqlProgram {
         Self::parse(&sql)
     }
 
-    /// Discovers external Schemas and targets, lowers the query, and builds a Flow.
+    /// Starts this program from new or existing durable state.
     ///
     /// # Errors
     ///
-    /// Returns an error for an unresolved environment parameter, failed
-    /// discovery, unsupported relational plan, invalid Operation binding, or
-    /// Flow construction failure.
-    pub fn build(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
+    /// Returns an error when endpoint parameters cannot be resolved, a new
+    /// program cannot be planned or discovered, existing state is incomplete
+    /// or belongs to another program, or the underlying Flow cannot start.
+    pub fn start(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
+        let supplied_path = path.as_ref();
+        let program = self.resolved()?;
+        let identity = program.identity()?;
+        let runtime_bundle = program
+            .scans
+            .iter()
+            .any(ScanEndpoint::needs_debezium)
+            .then(resolve_debezium_runtime)
+            .transpose()?;
+        let (path, exists) = resolve_state_path(supplied_path)?;
+        if exists {
+            program.open_existing(&path, identity, runtime_bundle.as_deref())
+        } else {
+            program.build_new(&path, identity, runtime_bundle.as_deref())
+        }
+    }
+
+    fn resolved(&self) -> Result<Self, SqlError> {
+        Ok(Self {
+            sink: self.sink.resolved()?,
+            query: self.query.clone(),
+            scans: self
+                .scans
+                .iter()
+                .map(ScanEndpoint::resolved)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn build_new(
+        &self,
+        path: &Path,
+        identity: [u8; 32],
+        runtime_bundle: Option<&Path>,
+    ) -> Result<Flow, SqlError> {
         let scans = self
             .scans
             .iter()
-            .map(ScanEndpoint::build)
+            .enumerate()
+            .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle))
             .collect::<Result<Vec<_>, _>>()?;
         let logical_plan = plan(self.query.clone(), &scans)?;
-        let factory = FlowFactory::new(path);
+        let mut factory = FlowFactory::new(path);
+        factory.owner_identity(identity);
         let query = lower_query(&logical_plan, scans)?;
-        let sink = self.sink.build()?;
+        let sink = self.sink.build(&identity, path)?;
         let factory = query.emit(factory, sink)?;
         factory.build().map_err(Into::into)
     }
 
-    /// Reopens a built Flow using only endpoint runtime resources from this program.
-    ///
-    /// Persisted topology, expressions, Schemas, and non-sensitive endpoint
-    /// identities come from the Flow definition stored at `path`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for any unresolved environment parameter, invalid
-    /// runtime configuration, or Flow open failure.
-    pub fn open(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
+    fn open_existing(
+        &self,
+        path: &Path,
+        identity: [u8; 32],
+        runtime_bundle: Option<&Path>,
+    ) -> Result<Flow, SqlError> {
         let mut factory = FlowFactory::new(path);
+        factory.owner_identity(identity);
         for (index, scan) in self.scans.iter().enumerate() {
             let station_id = scan_station_id(index);
-            scan.install_open_runtime_resource(&mut factory, &station_id)?;
+            scan.install_open_runtime_resource(&mut factory, &station_id, runtime_bundle)?;
         }
         if let Some(config) = self.sink.open_runtime_config()? {
             factory.resource("sql/sink", config)?;
         }
         factory.open().map_err(Into::into)
     }
-}
 
-#[derive(Default)]
-struct ScanCollector {
-    scans: Vec<ScanEndpoint>,
-    error: Option<SqlError>,
-}
-
-impl VisitorMut for ScanCollector {
-    type Break = ();
-
-    fn pre_visit_table_factor(
-        &mut self,
-        table_factor: &mut TableFactor,
-    ) -> ControlFlow<Self::Break> {
-        let TableFactor::Table {
-            name, alias, args, ..
-        } = table_factor
-        else {
-            return ControlFlow::Continue(());
-        };
-        let Some(arguments) = args else {
-            if is_internal_scan_reference(name) {
-                self.error = Some(SqlError::invalid("reserved SQL relation name"));
-                return ControlFlow::Break(());
-            }
-            return ControlFlow::Continue(());
-        };
-        match ScanEndpoint::parse(name, arguments) {
-            Ok(scan) => {
-                let Some(relation_name) = name.0.last().and_then(|part| part.as_ident()).cloned()
-                else {
-                    self.error = Some(SqlError::invalid(
-                        "a scan function name must be one identifier",
-                    ));
-                    return ControlFlow::Break(());
-                };
-                let index = self.scans.len();
-                self.scans.push(scan);
-                *name = ObjectName::from(Ident::new(internal_scan_name(index)));
-                *args = None;
-                if alias.is_none() {
-                    *alias = Some(TableAlias {
-                        explicit: false,
-                        name: relation_name,
-                        columns: Vec::new(),
-                        at: None,
-                    });
-                }
-                ControlFlow::Continue(())
-            }
-            Err(error) => {
-                self.error = Some(error);
-                ControlFlow::Break(())
-            }
+    fn identity(&self) -> Result<[u8; 32], SqlError> {
+        let mut encoded = Vec::new();
+        write_identity_bytes(&mut encoded, IDENTITY_DOMAIN);
+        write_identity_bytes(&mut encoded, canonical_query(&self.query).as_bytes());
+        encoded.extend_from_slice(&OUTPUT_CAPACITY_BYTES.to_be_bytes());
+        let scan_count = u64::try_from(self.scans.len()).expect("a Vec length fits in u64");
+        encoded.extend_from_slice(&scan_count.to_be_bytes());
+        for scan in &self.scans {
+            scan.write_identity(&mut encoded)?;
         }
+        self.sink.write_identity(&mut encoded)?;
+        Ok(*blake3::hash(&encoded).as_bytes())
     }
 }
 
-fn is_internal_scan_reference(name: &ObjectName) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .is_some_and(|identifier| {
-            let value = if identifier.quote_style.is_none() {
-                identifier.value.to_ascii_lowercase()
-            } else {
-                identifier.value.clone()
-            };
-            value.starts_with("__dogpaddle_sql_scan_")
-        })
-}
-
-fn contains_limit_all(tokens: &[TokenWithSpan]) -> bool {
-    let mut previous_was_limit = false;
-    for token in tokens {
-        if matches!(token.token, Token::Whitespace(_) | Token::EOF) {
-            continue;
-        }
-        if previous_was_limit
-            && matches!(&token.token, Token::Word(word) if word.keyword == Keyword::ALL)
+fn canonical_query(query: &Query) -> String {
+    let rendered = query.to_string();
+    let mut tokenizer = Tokenizer::new(&GenericDialect, &rendered);
+    let mut tokens = tokenizer
+        .tokenize()
+        .expect("a rendered SQL AST must tokenize again");
+    for token in &mut tokens {
+        if let Token::Word(word) = token
+            && word.quote_style.is_none()
         {
-            return true;
+            word.value.make_ascii_lowercase();
         }
-        previous_was_limit =
-            matches!(&token.token, Token::Word(word) if word.keyword == Keyword::LIMIT);
     }
-    false
+    tokens.into_iter().map(|token| token.to_string()).collect()
 }
 
-fn validate_query(query: &Query) -> Result<(), SqlError> {
-    let Query {
-        with,
-        body,
-        order_by,
-        limit_clause,
-        fetch,
-        locks,
-        for_clause,
-        settings,
-        format_clause,
-        pipe_operators,
-    } = query;
-    if order_by.is_some()
-        || limit_clause.is_some()
-        || fetch.is_some()
-        || !locks.is_empty()
-        || for_clause.is_some()
-        || settings.is_some()
-        || format_clause.is_some()
-        || !pipe_operators.is_empty()
-    {
-        return Err(SqlError::Unsupported("query modifier".to_owned()));
-    }
-    if let Some(with) = with {
-        validate_with(with)?;
-    }
-    validate_set_expr(body)
-}
-
-fn validate_with(with: &With) -> Result<(), SqlError> {
-    let With {
-        with_token: _,
-        recursive,
-        cte_tables,
-    } = with;
-    if *recursive {
-        return Err(SqlError::Unsupported("recursive CTE".to_owned()));
-    }
-    for cte in cte_tables {
-        let Cte {
-            alias,
-            query,
-            from,
-            materialized,
-            closing_paren_token: _,
-        } = cte;
-        validate_alias(alias)?;
-        if from.is_some() || materialized.is_some() {
-            return Err(SqlError::Unsupported("CTE modifier".to_owned()));
-        }
-        validate_query(query)?;
-    }
-    Ok(())
-}
-
-fn validate_set_expr(expression: &SetExpr) -> Result<(), SqlError> {
-    match expression {
-        SetExpr::Select(select) => validate_select(select),
-        SetExpr::Query(query) => validate_query(query),
-        SetExpr::SetOperation {
-            left,
-            op: SetOperator::Union,
-            set_quantifier: SetQuantifier::All,
-            right,
-        } => {
-            validate_set_expr(left)?;
-            validate_set_expr(right)
-        }
-        SetExpr::SetOperation { .. } => Err(SqlError::Unsupported(
-            "set operation other than UNION ALL".to_owned(),
-        )),
-        SetExpr::Values(_)
-        | SetExpr::Insert(_)
-        | SetExpr::Update(_)
-        | SetExpr::Delete(_)
-        | SetExpr::Merge(_)
-        | SetExpr::Table(_) => Err(SqlError::Unsupported("query body".to_owned())),
-    }
-}
-
-fn validate_select(select: &Select) -> Result<(), SqlError> {
-    let Select {
-        select_token: _,
-        optimizer_hints,
-        distinct,
-        select_modifiers,
-        top,
-        top_before_distinct,
-        projection: _,
-        exclude,
-        into,
-        from,
-        lateral_views,
-        prewhere,
-        selection: _,
-        connect_by,
-        group_by,
-        cluster_by,
-        distribute_by,
-        sort_by,
-        having,
-        named_window,
-        qualify,
-        window_before_qualify,
-        value_table_mode,
-        flavor,
-    } = select;
-    let plain_group_by = matches!(
-        group_by,
-        GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()
-    );
-    if !optimizer_hints.is_empty()
-        || !matches!(distinct, None | Some(SelectDistinct::Distinct))
-        || select_modifiers.is_some()
-        || top.is_some()
-        || *top_before_distinct
-        || exclude.is_some()
-        || into.is_some()
-        || !lateral_views.is_empty()
-        || prewhere.is_some()
-        || !connect_by.is_empty()
-        || !plain_group_by
-        || !cluster_by.is_empty()
-        || !distribute_by.is_empty()
-        || !sort_by.is_empty()
-        || having.is_some()
-        || !named_window.is_empty()
-        || qualify.is_some()
-        || *window_before_qualify
-        || value_table_mode.is_some()
-        || *flavor != SelectFlavor::Standard
-    {
-        return Err(SqlError::Unsupported("SELECT modifier".to_owned()));
-    }
-    for table in from {
-        validate_table(table)?;
-    }
-    Ok(())
-}
-
-fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
-    let TableWithJoins { relation, joins } = table;
-    validate_table_factor(relation)?;
-    for join in joins {
-        if join.global {
-            return Err(SqlError::Unsupported("join modifier".to_owned()));
-        }
-        match &join.join_operator {
-            JoinOperator::Join(JoinConstraint::On(condition))
-            | JoinOperator::Inner(JoinConstraint::On(condition)) => {
-                validate_inner_join_condition(condition)?;
-            }
-            JoinOperator::Left(JoinConstraint::On(condition))
-            | JoinOperator::LeftOuter(JoinConstraint::On(condition))
-            | JoinOperator::Right(JoinConstraint::On(condition))
-            | JoinOperator::RightOuter(JoinConstraint::On(condition))
-            | JoinOperator::FullOuter(JoinConstraint::On(condition))
-            | JoinOperator::LeftSemi(JoinConstraint::On(condition))
-            | JoinOperator::RightSemi(JoinConstraint::On(condition))
-            | JoinOperator::LeftAnti(JoinConstraint::On(condition))
-            | JoinOperator::RightAnti(JoinConstraint::On(condition)) => {
-                validate_join_condition(condition)?;
-            }
-            _ => {
-                return Err(SqlError::Unsupported("join type or constraint".to_owned()));
-            }
-        }
-        validate_table_factor(&join.relation)?;
-    }
-    Ok(())
-}
-
-fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
-    match relation {
-        TableFactor::Table {
-            name: _,
-            alias,
-            args: _,
-            with_hints,
-            version,
-            with_ordinality,
-            partitions,
-            json_path,
-            sample,
-            index_hints,
-        } if with_hints.is_empty()
-            && version.is_none()
-            && !with_ordinality
-            && partitions.is_empty()
-            && json_path.is_none()
-            && sample.is_none()
-            && index_hints.is_empty() =>
-        {
-            validate_optional_alias(alias.as_ref())
-        }
-        TableFactor::Derived {
-            lateral,
-            subquery,
-            alias,
-            sample,
-        } if !lateral && sample.is_none() => {
-            validate_optional_alias(alias.as_ref())?;
-            validate_query(subquery)
-        }
-        TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-        } => {
-            validate_optional_alias(alias.as_ref())?;
-            validate_table(table_with_joins)
-        }
-        _ => Err(SqlError::Unsupported("table modifier".to_owned())),
-    }
-}
-
-fn validate_inner_join_condition(condition: &Expr) -> Result<(), SqlError> {
-    fn contains_equality_conjunct(condition: &Expr) -> bool {
-        match condition {
-            Expr::Nested(condition) => contains_equality_conjunct(condition),
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => contains_equality_conjunct(left) || contains_equality_conjunct(right),
-            Expr::BinaryOp {
-                op: BinaryOperator::Eq,
-                ..
-            } => true,
-            _ => false,
-        }
-    }
-
-    if contains_equality_conjunct(condition) {
-        Ok(())
+fn resolve_state_path(supplied: &Path) -> Result<(std::path::PathBuf, bool), SqlError> {
+    let absolute = std::path::absolute(supplied).map_err(|source| SqlError::StatePath {
+        path: supplied.to_path_buf(),
+        source,
+    })?;
+    let exists = absolute
+        .try_exists()
+        .map_err(|source| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source,
+        })?;
+    let path = if exists {
+        fs::canonicalize(&absolute).map_err(|source| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source,
+        })?
     } else {
-        Err(SqlError::Unsupported(
-            "INNER JOIN requires an equality conjunct".to_owned(),
-        ))
+        let parent = absolute.parent().ok_or_else(|| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state path has no parent directory",
+            ),
+        })?;
+        fs::create_dir_all(parent).map_err(|source| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source,
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|source| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source,
+        })?;
+        let name = absolute.file_name().ok_or_else(|| SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state path has no final component",
+            ),
+        })?;
+        parent.join(name)
+    };
+    if path.to_str().is_none() {
+        return Err(SqlError::StatePath {
+            path: supplied.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state path must be valid UTF-8",
+            ),
+        });
     }
+    Ok((path, exists))
 }
 
-fn validate_join_condition(condition: &Expr) -> Result<(), SqlError> {
-    match condition {
-        Expr::Nested(condition) => validate_join_condition(condition),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            validate_join_condition(left)?;
-            validate_join_condition(right)
-        }
-        Expr::BinaryOp {
-            op: BinaryOperator::Eq,
-            ..
-        } => Ok(()),
-        _ => Err(SqlError::Unsupported(
-            "JOIN condition other than equality conjunction".to_owned(),
-        )),
-    }
+pub(crate) fn write_identity_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+    let length = u64::try_from(value.len()).expect("a byte slice length fits in u64");
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(value);
 }
 
-fn validate_optional_alias(alias: Option<&TableAlias>) -> Result<(), SqlError> {
-    alias.map_or(Ok(()), validate_alias)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn validate_alias(alias: &TableAlias) -> Result<(), SqlError> {
-    let TableAlias {
-        explicit: _,
-        name: _,
-        columns,
-        at,
-    } = alias;
-    let typed_column = columns.iter().any(|column| {
-        let TableAliasColumnDef { name: _, data_type } = column;
-        data_type.is_some()
-    });
-    if at.is_some() || typed_column {
-        return Err(SqlError::Unsupported("typed or indexed alias".to_owned()));
+    fn identity(sql: &str) -> [u8; 32] {
+        SqlProgram::parse(sql).unwrap().identity().unwrap()
     }
-    Ok(())
+
+    #[test]
+    fn missing_state_path_canonicalizes_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let supplied = root.path().join("nested/../state");
+
+        let (resolved, exists) = resolve_state_path(&supplied).unwrap();
+
+        assert!(!exists);
+        assert_eq!(
+            resolved,
+            fs::canonicalize(root.path()).unwrap().join("state")
+        );
+    }
+
+    #[test]
+    fn program_identity_has_one_stable_canonical_encoding() {
+        let identity = identity(
+            "INSERT INTO discard() SELECT value FROM sequence(start => 7) WHERE value > 10",
+        );
+        assert_eq!(
+            blake3::Hash::from(identity).to_hex().as_str(),
+            "494fa9fd8fed1f9d806f55fcf40e609697e2d2d3e4650398ce72077332328103"
+        );
+    }
+
+    #[test]
+    fn formatting_and_endpoint_argument_order_do_not_change_identity() {
+        let first = identity(
+            "INSERT INTO sqlite(path => '/tmp/result.sqlite', table => 'result') \
+             SELECT value FROM sequence(start => 7)",
+        );
+        let second = identity(
+            "-- formatting is not program identity\n\
+             INSERT INTO sqlite(table => 'result', path => '/tmp/result.sqlite')\n\
+             SELECT value\nFROM sequence(start => 7);",
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unquoted_identifier_case_is_canonical_but_string_case_is_semantic() {
+        let lower = identity(
+            "INSERT INTO discard() SELECT value, 'kept' AS label FROM sequence(start => 7)",
+        );
+        let upper = identity(
+            "insert into DISCARD() select VALUE, 'kept' as LABEL from SEQUENCE(start => 7)",
+        );
+        let changed_literal = identity(
+            "INSERT INTO discard() SELECT value, 'KEPT' AS label FROM sequence(start => 7)",
+        );
+        assert_eq!(lower, upper);
+        assert_ne!(lower, changed_literal);
+    }
+
+    #[test]
+    fn connection_runtime_fields_do_not_change_identity() {
+        let first = identity(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://alice:first@127.0.0.1:5432/app',\
+                table => 'public.orders', publication => 'orders_publication'\
+            )",
+        );
+        let second = identity(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                publication => 'orders_publication', table => 'public.orders',\
+                connection => 'postgres://bob:second@127.0.0.2:6432/app',\
+                bootstrap_spool_bytes => 1073741824\
+            )",
+        );
+        assert_eq!(first, second);
+
+        let changed_database = identity(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgres://bob:second@127.0.0.2:6432/other',\
+                table => 'public.orders', publication => 'orders_publication'\
+            )",
+        );
+        assert_ne!(first, changed_database);
+    }
 }

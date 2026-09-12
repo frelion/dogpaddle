@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use dogpaddle_flow::{AdvanceOutcome, Flow};
-use dogpaddle_sql::SqlProgram;
+use dogpaddle_flow::{AdvanceOutcome, Flow, FlowError};
+use dogpaddle_sql::{SqlError, SqlProgram};
 use rusqlite::{Connection, OpenFlags};
 
 const TABLE: &str = "selected_numbers";
@@ -18,7 +18,7 @@ fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
     );
     let program = SqlProgram::parse(&sql).unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(
         flow.status()
             .unwrap()
@@ -42,7 +42,7 @@ fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
         ]
     );
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     for _ in 0..6 {
         assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     }
@@ -90,7 +90,7 @@ fn projection_executes_qualified_coerced_expressions_into_sqlite() {
     ))
     .unwrap();
 
-    let mut flow = program.build(root.path().join("flow")).unwrap();
+    let mut flow = program.start(root.path().join("flow")).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -140,11 +140,11 @@ fn inner_join_executes_expression_keys_and_projection_across_reopen() {
     ))
     .unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -164,7 +164,7 @@ fn inner_join_executes_expression_keys_and_projection_across_reopen() {
     rows.sort_unstable();
     assert_eq!(rows, [(u64::MAX - 1, u64::MAX - 1), (u64::MAX, u64::MAX),]);
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
 }
 
@@ -236,8 +236,8 @@ fn outer_join_family_preserves_rows_and_schema_across_reopen() {
         ))
         .unwrap();
 
-        drop(program.build(&flow_path).unwrap());
-        let mut flow = program.open(&flow_path).unwrap();
+        drop(program.start(&flow_path).unwrap());
+        let mut flow = program.start(&flow_path).unwrap();
         advance_to_idle(&mut flow);
         drop(flow);
 
@@ -295,10 +295,10 @@ fn right_outer_join_restores_asymmetric_sql_schema_and_state_across_reopen() {
     ))
     .unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -401,8 +401,8 @@ fn semi_and_anti_join_family_selects_the_preserved_side_across_reopen() {
         ))
         .unwrap();
 
-        drop(program.build(&flow_path).unwrap());
-        let mut flow = program.open(&flow_path).unwrap();
+        drop(program.start(&flow_path).unwrap());
+        let mut flow = program.start(&flow_path).unwrap();
         advance_to_idle(&mut flow);
         drop(flow);
 
@@ -433,12 +433,12 @@ fn select_distinct_deduplicates_projected_rows_across_reopen() {
     ))
     .unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -480,12 +480,12 @@ fn grouped_aggregates_update_one_relation_across_reopen() {
     ))
     .unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -521,7 +521,7 @@ fn grouped_aggregates_update_one_relation_across_reopen() {
         ]
     );
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
 }
 
@@ -538,7 +538,7 @@ fn group_by_without_calls_emits_one_row_per_group() {
     ))
     .unwrap();
 
-    let mut flow = program.build(root.path().join("flow")).unwrap();
+    let mut flow = program.start(root.path().join("flow")).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -564,7 +564,7 @@ fn union_all_keeps_separate_scan_stations() {
     )
     .unwrap();
 
-    let flow = program.build(root.path().join("flow")).unwrap();
+    let flow = program.start(root.path().join("flow")).unwrap();
     assert_eq!(
         flow.status()
             .unwrap()
@@ -607,11 +607,11 @@ fn union_all_preserves_common_name_type_nullability_and_multiplicity() {
     ))
     .unwrap();
 
-    let mut flow = program.build(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     advance_to_idle(&mut flow);
     drop(flow);
 
@@ -639,7 +639,7 @@ fn union_all_preserves_common_name_type_nullability_and_multiplicity() {
         ]
     );
 
-    let mut flow = program.open(&flow_path).unwrap();
+    let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
     drop(flow);
     assert_eq!(
@@ -663,7 +663,7 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
 
     let parsed = SqlProgram::parse(&sql).unwrap();
     let read = SqlProgram::read(&sql_path).unwrap();
-    let mut flow = parsed.build(&flow_path).unwrap();
+    let mut flow = parsed.start(&flow_path).unwrap();
     assert!(!sqlite_path.exists());
 
     let status = flow.status().unwrap();
@@ -698,7 +698,7 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
-    let mut reopened = read.open(&flow_path).unwrap();
+    let mut reopened = read.start(&flow_path).unwrap();
     assert_eq!(
         reopened
             .status()
@@ -727,7 +727,7 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
 
     assert_eq!(sqlite_values(&sqlite_path), vec![u64::MAX - 1, u64::MAX]);
 
-    let mut reopened = parsed.open(&flow_path).unwrap();
+    let mut reopened = parsed.start(&flow_path).unwrap();
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
     drop(reopened);
     assert_eq!(sqlite_values(&sqlite_path), vec![u64::MAX - 1, u64::MAX]);
@@ -739,8 +739,13 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
         sql_string(&replacement_path)
     ))
     .unwrap();
-    let mut reopened = replacement.open(&flow_path).unwrap();
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
+    let Err(error) = replacement.start(&flow_path) else {
+        panic!("different SQL opened existing state");
+    };
+    assert!(matches!(
+        error,
+        SqlError::Flow(FlowError::OwnerIdentityMismatch)
+    ));
     assert!(!replacement_path.exists());
 }
 

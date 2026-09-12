@@ -7,6 +7,8 @@ use dogpaddle_operation::operation::{
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
+const OTHER_OWNER_IDENTITY: [u8; 32] = [0x5a; 32];
 
 #[test]
 fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecycle() {
@@ -115,6 +117,52 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     ));
     drop(flow);
     assert!(FlowFactory::new(&path).open().is_ok());
+}
+
+#[test]
+fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let identified_path = root.path().join("identified");
+    let mut builder = FlowFactory::new(&identified_path);
+    builder.owner_identity(OWNER_IDENTITY);
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
+    builder.connect([scan], sink);
+    drop(builder.build().unwrap());
+
+    assert!(matches!(
+        FlowFactory::new(&identified_path).open(),
+        Err(FlowError::OwnerIdentityMismatch)
+    ));
+
+    let mut wrong_owner = FlowFactory::new(&identified_path);
+    wrong_owner.owner_identity(OTHER_OWNER_IDENTITY);
+    wrong_owner.resource("unknown", ()).unwrap();
+    assert!(matches!(
+        wrong_owner.open(),
+        Err(FlowError::OwnerIdentityMismatch)
+    ));
+
+    let mut matching_owner = FlowFactory::new(&identified_path);
+    matching_owner.owner_identity(OWNER_IDENTITY);
+    drop(matching_owner.open().unwrap());
+
+    let anonymous_path = root.path().join("anonymous");
+    let mut builder = FlowFactory::new(&anonymous_path);
+    let scan = builder.station("scan", SequenceScanDefinition::new(0));
+    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
+    builder.connect([scan], sink);
+    drop(builder.build().unwrap());
+
+    let mut unexpected_owner = FlowFactory::new(&anonymous_path);
+    unexpected_owner.owner_identity(OWNER_IDENTITY);
+    assert!(matches!(
+        unexpected_owner.open(),
+        Err(FlowError::OwnerIdentityMismatch)
+    ));
+    drop(FlowFactory::new(anonymous_path).open().unwrap());
 }
 
 #[test]

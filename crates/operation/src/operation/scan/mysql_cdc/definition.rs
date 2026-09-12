@@ -28,8 +28,9 @@ pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConne
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
 /// The runtime verifies this identity against `MySQL` before starting its
-/// connector. Reusing an engine name or replication client ID for another live
-/// Scan is unsupported. The Scan does not create or alter the source table.
+/// connector. Reusing an engine name for another live Scan is unsupported; it
+/// also determines the connector's replication client ID. The Scan does not
+/// create or alter the source table.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MySqlCdcScanSpec {

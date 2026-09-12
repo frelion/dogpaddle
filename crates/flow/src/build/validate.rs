@@ -100,6 +100,7 @@ pub enum TopologyError {
 }
 
 pub(super) fn finish_definition(
+    owner_identity: Option<[u8; 32]>,
     token: u64,
     mut stations: Vec<StationDefinition>,
     connections: &[(Vec<StationRef>, StationRef)],
@@ -124,7 +125,7 @@ pub(super) fn finish_definition(
             .collect();
     }
 
-    Ok(FlowDefinition::new(stations))
+    Ok(FlowDefinition::new(owner_identity, stations))
 }
 
 pub(super) fn append_operation(

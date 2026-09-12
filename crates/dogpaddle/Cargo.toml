@@ -1,0 +1,30 @@
+[package]
+name = "dogpaddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+readme = "README.md"
+autotests = false
+autobenches = false
+autoexamples = false
+
+[[bin]]
+name = "dogpaddle"
+path = "src/main.rs"
+bench = false
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "correctness"
+path = "tests/correctness.rs"
+
+[dependencies]
+ctrlc.workspace = true
+dogpaddle-flow.workspace = true
+dogpaddle-sql.workspace = true
+
+[lints]
+workspace = true

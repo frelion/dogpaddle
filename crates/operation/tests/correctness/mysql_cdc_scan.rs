@@ -21,7 +21,6 @@ fn config() -> MySqlCdcScanConfig {
         "shop",
         "cdc",
         "do-not-persist-this-password",
-        54_001,
     )
     .unwrap()
 }
@@ -249,15 +248,11 @@ fn mysql_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_set
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("do-not-persist-this-password"));
     assert!(
-        MySqlCdcScanConfig::new_unencrypted("relative", "host", 3306, "db", "user", "password", 1)
+        MySqlCdcScanConfig::new_unencrypted("relative", "host", 3306, "db", "user", "password")
             .is_err()
     );
     assert!(
-        MySqlCdcScanConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password", 1)
-            .is_err()
-    );
-    assert!(
-        MySqlCdcScanConfig::new_unencrypted("/bundle", "host", 3306, "db", "user", "password", 0)
+        MySqlCdcScanConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password")
             .is_err()
     );
 }

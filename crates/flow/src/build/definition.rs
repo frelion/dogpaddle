@@ -4,6 +4,7 @@ use dogpaddle_operation::OperationDefinition;
 
 #[derive(Debug)]
 pub(crate) struct FlowDefinition {
+    pub(super) owner_identity: Option<[u8; 32]>,
     pub(super) stations: Vec<StationDefinition>,
 }
 
@@ -21,8 +22,18 @@ pub(crate) struct InputDefinition {
 }
 
 impl FlowDefinition {
-    pub(super) const fn new(stations: Vec<StationDefinition>) -> Self {
-        Self { stations }
+    pub(super) const fn new(
+        owner_identity: Option<[u8; 32]>,
+        stations: Vec<StationDefinition>,
+    ) -> Self {
+        Self {
+            owner_identity,
+            stations,
+        }
+    }
+
+    pub(crate) const fn owner_identity(&self) -> Option<[u8; 32]> {
+        self.owner_identity
     }
 
     pub(crate) fn stations(&self) -> &[StationDefinition] {

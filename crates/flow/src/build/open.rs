@@ -35,10 +35,14 @@ impl FlowFactory {
             return Err(FlowError::OpenWithDefinition);
         }
         let path = self.path;
+        let expected_owner_identity = self.owner_identity;
         let store = Store::open(&path)?;
         let published = open_definition_cell(&store)?;
         let definition_bytes = read_published_definition(&store, &published)?;
         let (definition, topology) = codec::decode(&definition_bytes)?;
+        if definition.owner_identity() != expected_owner_identity {
+            return Err(FlowError::OwnerIdentityMismatch);
+        }
         let bindings = schema::bind_operations(&definition, &topology)?;
         validate_data_declarations(&definition)?;
         let resources = bind_resources(&definition, &bindings, self.resources)?;

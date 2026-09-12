@@ -64,6 +64,19 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
         FlowDefinitionError::UnsupportedVersion(u16::MAX)
     );
 
+    let mut invalid_owner_identity_presence = original.clone();
+    let owner_identity_presence = FLOW_MAGIC.len() + size_of::<u16>();
+    invalid_owner_identity_presence[owner_identity_presence] = 2;
+    rewrite_checksum(&mut invalid_owner_identity_presence);
+    assert_eq!(
+        definition_error(
+            root.path(),
+            "invalid-owner-identity-presence",
+            &invalid_owner_identity_presence,
+        ),
+        FlowDefinitionError::InvalidOwnerIdentityPresence(2)
+    );
+
     let mut invalid_utf8 = original.clone();
     let scan_id = find_first(&invalid_utf8, b"scan");
     invalid_utf8[scan_id] = 0xff;

@@ -464,7 +464,6 @@ mod tests {
             "shop",
             "cdc",
             "password",
-            54_001,
         )
         .unwrap()
     }

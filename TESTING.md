@@ -20,7 +20,8 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 - Store 拥有事务、能力边界、集合布局、分页、容量、订阅位置与安全回收、reopen 和 crash consistency。
 - Operation 拥有 Operation + Store：Definition、稳定 tag/payload、bind、materialize、运行协议、状态和算子语义。
 - Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、subscription 装配、调度、claim、背压、fail-stop、status 和 reopen。
-- SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering 和 SQL 层 reopen。
+- SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering、Program identity 和 `start` 的自动构建/恢复选择。
+- `dogpaddle` binary 只拥有 `run SQL_FILE [--state DIR]` 的参数、默认状态路径、短等待循环和 Ctrl-C 有界停止；它不复制 SQL 生命周期。
 - Debezium 拥有 connector-neutral runtime、bundle、checkpoint、delivery 和 ACK 生命周期。
 - Change 与 Store 的外部组合只由 `integration-tests/change-store/` 证明。
 
@@ -52,15 +53,23 @@ Right Join 的 swap + SchemaAlign、Inner residual 的 Atomic 尾链，以及每
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
-Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。
+Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。Definition
+还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和 materialize 前拒绝
+identity mismatch。
 
 ### SQL
 
-SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,build,open}` 验证产品契约。护栏分四层：parser/endpoint 参数契约；所有拒绝路径不创建 Flow；Sequence→SQLite 的结果与精确目标列结构；真实 PostgreSQL 的端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
+SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
-SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言 build 或一次 advance 成功。Distinct witness 必须跨 drop/open，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/open；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/open 后持久 position，以及不同 SQL 调用 `open` 不会替换磁盘 Definition。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 reopen 幂等重投；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 reopen 会丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
+Endpoint 证据固定覆盖 `postgres_cdc(connection,table,publication[,bootstrap_spool_bytes])`、
+`mysql_cdc(connection,table[,bootstrap_spool_bytes])` 和 `postgres(connection,table)`；默认 spool 必须等价于显式
+1 GiB，旧的 split connection、runtime、engine、slot、sink 和 client-ID 参数必须作为 unknown parameter 拒绝。
+连接 URL 的 secret 与 transient host/port 不改变 Program identity，database、qualified table、publication、spool
+和查询语义必须改变 identity。CDC 测试只用绝对 `DOGPADDLE_DEBEZIUM_RUNTIME` 指向构建产物。
 
-Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 reopen；
+SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言构建或一次 advance 成功。Distinct witness 必须跨 drop/start，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/start；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/start 后持久 position；语义相同但格式或 endpoint 参数顺序不同的 SQL 必须能恢复，语义或持久 endpoint 身份不同的 Program 必须因 owner identity mismatch 失败且不能替换磁盘 Definition。损坏、不完整、已存在但不可打开或被占用的状态不得触发自动重建。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 start 幂等重投；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 start 会恢复既有状态、丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
+
+Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 drop/start 恢复；
 Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 必须证明 `EquiJoin → SchemaAlign → Filter`
 仍在一个 Transform Station；Outer/Semi/Anti residual、Cross/Natural/Using、纯非等值和同侧 equality 必须在创建 Flow 前拒绝。
 
@@ -68,6 +77,12 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 
 宿主 I/O、SIGKILL、PostgreSQL 重放日志和关系快照，供 [持续 ETL 演示](docs/demo/README.md) 排版。
 启用 trace 时，还会追加 28 次有界连续源表变更，每次完整目标关系与原生 PostgreSQL SQL oracle
 核对，并记录推进前后快照。断言与故障边界仍由 SQL 系统验收拥有；视频间隔不作为性能证据。
+
+### 产品命令
+
+`crates/dogpaddle/tests/correctness.rs` 只验证产品壳：唯一 `run` 子命令、SQL 旁
+`.dogpaddle/<stem>` 默认状态、打印 canonical path、Ctrl-C 在当前有界轮次后成功退出，以及再次执行同一命令
+恢复已有状态。SQL parsing、identity、构建和恢复语义继续由 SQL correctness 拥有，不在 binary 测试复制。
 
 ### 测试分卷
 
@@ -155,6 +170,7 @@ cargo test -p dogpaddle-store --test correctness transaction::
 cargo test -p dogpaddle-operation --test correctness aggregate::
 cargo test -p dogpaddle-flow --test correctness runtime_corruption::
 cargo test -p dogpaddle-sql --test correctness
+cargo test -p dogpaddle --test correctness
 cargo test -p dogpaddle-change-store-integration
 ```
 
@@ -204,7 +220,7 @@ scripts/clean.sh
 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。
 
-PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink、SQL 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。
+PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink、SQL 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。推送与 workspace version 完全一致的 `v<version>` tag 时，同一 workflow 将 native `dogpaddle` 与已验证 runtime 组装为固定 `bin/`、`libexec/` 布局，为每个平台生成 tarball 和 SHA-256，并在全部 matrix job 成功后发布 GitHub Release。
 
 ## 新增或删除验证
 

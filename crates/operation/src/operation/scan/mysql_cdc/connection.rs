@@ -8,6 +8,8 @@ use super::{MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType, schema}
 
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
+const REPLICATION_CLIENT_ID_CONTEXT: &str =
+    "dogpaddle MySQL CDC replication client ID derived from engine name v1";
 type ColumnRow = (
     String,
     String,
@@ -31,7 +33,6 @@ pub struct MySqlCdcScanConfig {
     database: String,
     user: String,
     password: String,
-    replication_client_id: u32,
 }
 
 impl MySqlCdcScanConfig {
@@ -41,9 +42,9 @@ impl MySqlCdcScanConfig {
     ///
     /// # Errors
     ///
-    /// Rejects a relative bundle path, zero port or replication client ID,
-    /// blank connection fields, or NUL bytes. The password may be empty for
-    /// externally secured local access.
+    /// Rejects a relative bundle path, zero port, blank connection fields, or
+    /// NUL bytes. The password may be empty for externally secured local
+    /// access.
     pub fn new_unencrypted(
         runtime_bundle: impl Into<PathBuf>,
         host: impl Into<String>,
@@ -51,7 +52,6 @@ impl MySqlCdcScanConfig {
         database: impl Into<String>,
         user: impl Into<String>,
         password: impl Into<String>,
-        replication_client_id: u32,
     ) -> Result<Self, MySqlCdcScanError> {
         let config = Self {
             runtime_bundle: runtime_bundle.into(),
@@ -60,11 +60,10 @@ impl MySqlCdcScanConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
-            replication_client_id,
         };
-        if !config.runtime_bundle.is_absolute() || port == 0 || replication_client_id == 0 {
+        if !config.runtime_bundle.is_absolute() || port == 0 {
             return Err(MySqlCdcScanError::new(
-                "MySQL runtime requires an absolute bundle path, nonzero port, and nonzero replication client ID",
+                "MySQL runtime requires an absolute bundle path and nonzero port",
             ));
         }
         if [&config.host, &config.database, &config.user]
@@ -82,8 +81,8 @@ impl MySqlCdcScanConfig {
     /// Reads catalog metadata only. Requires a single permanent, nonpartitioned
     /// `InnoDB` table; binary logging with row events and full row images; and
     /// access to `INFORMATION_SCHEMA.INNODB_TABLES` for the table identity. No
-    /// source object is created or changed. The replication client ID must be
-    /// unique among active `MySQL` replication clients.
+    /// source object is created or changed. The replication client ID is
+    /// derived from the persisted engine name.
     ///
     /// # Errors
     ///
@@ -316,7 +315,7 @@ impl MySqlCdcScanConfig {
             .and_then(|config| config.max_delivery_bytes(MAX_DELIVERY_BYTES))
             .map_err(|_| MySqlCdcScanError::new("invalid MySQL connector identity"))?;
         let port = self.port.to_string();
-        let replication_client_id = self.replication_client_id.to_string();
+        let replication_client_id = replication_client_id(&spec.engine_name).to_string();
         let snapshot_mode = mode.snapshot_mode();
         let heartbeat_interval = match mode {
             ConnectorMode::Snapshot => "1",
@@ -412,7 +411,6 @@ impl fmt::Debug for MySqlCdcScanConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"[redacted]")
-            .field("replication_client_id", &self.replication_client_id)
             .finish()
     }
 }
@@ -461,13 +459,34 @@ fn catalog_error(stage: &str) -> MySqlCdcScanError {
     MySqlCdcScanError::new(format!("MySQL {stage} failed"))
 }
 
+fn replication_client_id(engine_name: &str) -> u32 {
+    let mut hasher = blake3::Hasher::new_derive_key(REPLICATION_CLIENT_ID_CONTEXT);
+    hasher.update(engine_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    let domain = u64::from(u32::MAX);
+    u32::try_from(u64::from_be_bytes(bytes) % domain + 1)
+        .expect("the derived replication client ID is in the u32 domain")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ConnectorMode;
+    use super::{ConnectorMode, replication_client_id};
 
     #[test]
     fn snapshot_then_recovery_are_the_only_connector_modes() {
         assert_eq!(ConnectorMode::Snapshot.snapshot_mode(), "initial_only");
         assert_eq!(ConnectorMode::Recovery.snapshot_mode(), "recovery");
+    }
+
+    #[test]
+    fn replication_client_id_is_stable_nonzero_and_bound_to_the_engine() {
+        assert_eq!(replication_client_id("orders"), 3_766_999_730);
+        assert_ne!(replication_client_id("orders"), 0);
+        assert_ne!(
+            replication_client_id("orders"),
+            replication_client_id("users")
+        );
     }
 }

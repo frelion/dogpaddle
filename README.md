@@ -1,40 +1,39 @@
 # DogPaddle
 
-**用 SQL 持续处理数据变化，把结果写进数据库。**
+**用一份 SQL 持续处理数据库变化，并把结果写回数据库。**
 
-DogPaddle 是一个嵌入 Rust 应用的流处理引擎。你用 SQL 指定数据从哪里来、如何筛选和计算、
-写到哪里；它负责处理后续变化，并把处理进度保存在本地，供程序重启后继续运行。
-
-例如，把订单表中的已付款订单转换成履约队列：新订单进入队列，订单修改后重新计算，
-订单删除后撤回对应结果。业务后端只需写订单表。
+DogPaddle 是一个本地运行、持久化进度的流处理引擎。SQL 描述数据入口、计算和结果表；同一条命令负责首次创建状态，也负责进程重启后的恢复。
 
 ```text
-PostgreSQL / MySQL 数据变化  →  SQL 筛选、计算、分流  →  PostgreSQL / SQLite 结果表
+PostgreSQL / MySQL 变化  →  SQL 筛选、计算、聚合、Join  →  PostgreSQL / SQLite
 ```
 
-目前适合本地实验和 Rust 应用集成验证。项目仍在早期开发，PostgreSQL 与 MySQL 接入均处于试点阶段。
+项目仍处于早期开发阶段，PostgreSQL 与 MySQL 接入均为固定 Schema 的试点能力。
 
-[快速上手](#快速上手) · [嵌入 Rust 应用](#嵌入-rust-应用) · [当前支持什么](#当前支持什么) · [订单演示](#订单演示) · [技术文档](#文档)
+[快速上手](#快速上手) · [SQL 入口](#sql-入口) · [当前能力](#当前能力) · [架构](#架构) · [文档](#文档)
 
 [![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
 [![PostgreSQL 恢复测试](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml)
 
 ## 快速上手
 
-先跑一个本地例子：**生成递增数字 → 筛选偶数 → 计算平方 → 写入 SQLite**。
-这个例子不需要 PostgreSQL 或 Java，还能直接验证程序退出后是否可以接着处理。
+从 [GitHub Releases](https://github.com/frelion/dogpaddle/releases) 下载与你的平台匹配的压缩包：
 
-准备 Rust 1.96（仓库已固定版本）和 `sqlite3` 命令行。以下命令适用于 macOS / Linux，
-首次运行需要编译依赖。
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
 
-### 1. 获取代码，看看 SQL
+压缩包同时包含 DogPaddle 和固定版本的 Debezium/JRE runtime。解压后可直接运行，不需要安装 Rust 或系统 Java：
 
 ```sh
-git clone https://github.com/frelion/dogpaddle.git
-cd dogpaddle
+tar -xzf dogpaddle-v0.1.0-aarch64-apple-darwin.tar.gz
+./dogpaddle-v0.1.0-aarch64-apple-darwin/bin/dogpaddle run orders.sql
 ```
 
-仓库已包含 [quickstart.sql](crates/sql/examples/quickstart.sql)，无需另建文件：
+发布页同时提供每个压缩包的 `.sha256` 文件。
+
+仓库中的 [quickstart.sql](crates/sql/examples/quickstart.sql) 会持续生成递增数字，筛选偶数并写入 SQLite。它不需要 PostgreSQL 或 Java。
 
 ```sql
 INSERT INTO sqlite(
@@ -53,142 +52,130 @@ FROM numbers
 WHERE number % 2 = 0;
 ```
 
-`FROM sequence(...)` 持续生成数字，`SELECT ... WHERE ...` 定义计算规则，
-`INSERT INTO sqlite(...)` 指定结果文件和表名。`env(...)` 从环境变量读取文件路径。
-
-### 2. 运行并查看结果
-
-在仓库根目录执行：
+准备仓库指定的 Rust 1.96，然后运行：
 
 ```sh
+git clone https://github.com/frelion/dogpaddle.git
+cd dogpaddle
+
 demo_dir="$(mktemp -d /tmp/dogpaddle-demo.XXXXXX)"
 export DOGPADDLE_QUICKSTART_SQLITE="$demo_dir/results.sqlite"
 
-cargo run --locked -q -p dogpaddle-sql --example quickstart -- \
-  build crates/sql/examples/quickstart.sql "$demo_dir/flow" 12 0
-
-sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
-  'SELECT number, square, size FROM even_squares ORDER BY number;'
+cargo run --locked -p dogpaddle -- \
+  run crates/sql/examples/quickstart.sql --state "$demo_dir/state"
 ```
 
-查询结果：
-
-```text
-number  square  size
-------  ------  -----
-0       0       small
-2       4       small
-4       16      small
-6       36      small
-8       64      small
-```
-
-这里运行的是仓库提供的 Rust 示例程序。`build` 创建一条处理流程（Flow），
-`"$demo_dir/flow"` 保存进度，`results.sqlite` 保存结果。最后的 `12 0` 表示推进 12 轮、
-每轮等待 0 毫秒；轮数不等于结果行数。示例跑完这些轮次便退出。
-
-### 3. 从上次进度继续
-
-在**同一个终端**中执行，把 `build` 换成 `open`，沿用 SQL、进度目录和结果文件：
+`sequence` 是持续数据源，按 `Ctrl-C` 后 DogPaddle 会在当前有界调度轮结束时退出。随后查看结果：
 
 ```sh
-cargo run --locked -q -p dogpaddle-sql --example quickstart -- \
-  open crates/sql/examples/quickstart.sql "$demo_dir/flow" 6 0
-
 sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
-  'SELECT number, square, size FROM even_squares ORDER BY number;'
+  'SELECT number, square, size FROM even_squares ORDER BY number LIMIT 10;'
 ```
 
-原来的五行仍在，另外增加两行：
+再次执行完全相同的 `dogpaddle run` 命令会从已提交的位置继续。状态损坏、不完整、正在被另一进程占用，或 SQL 与该状态不匹配时，命令会报错；它不会删除或偷偷重建已有状态。
+
+## SQL 入口
+
+产品命令只有一个：
 
 ```text
-10      100     large
-12      144     large
+dogpaddle run SQL_FILE [--state DIR]
 ```
 
-这次运行从保存的进度继续，已有结果没有重复写入。
+省略 `--state` 时，状态目录是 SQL 文件旁的 `.dogpaddle/<文件名去掉扩展名>`。命令启动后会打印规范化后的状态路径。生产环境建议显式指定状态目录，例如：
 
-## 嵌入 Rust 应用
+```sh
+dogpaddle run /etc/dogpaddle/orders.sql --state /var/lib/dogpaddle/orders
+```
 
-SQL 描述处理规则，Rust 应用控制何时运行和停止。核心用法如下：
+数据库密码放在进程环境变量中，SQL 只保存环境变量名：
 
-```rust
+```sql
+INSERT INTO postgres(
+    connection => env('TARGET_DATABASE_URL'),
+    table => 'ops.current_orders'
+)
+SELECT *
+FROM postgres_cdc(
+    connection => env('SOURCE_DATABASE_URL'),
+    table => 'sales.orders',
+    publication => 'orders_publication'
+);
+```
+
+连接值是无 TLS 的数据库 URL，不能带 query 或 fragment：
+
+```text
+postgresql://user:password@127.0.0.1:5432/database
+mysql://user:password@127.0.0.1:3306/database
+```
+
+DogPaddle 从 SQL 身份、状态路径和端点位置确定性派生 connector、PostgreSQL slot、Sink ownership 和 MySQL replication client ID，用户无需配置这些内部标识。CDC runtime 随产品安装在 `<安装根>/libexec/dogpaddle/debezium`。
+
+Rust 应用也可以直接控制每一轮调度：
+
+```rust,no_run
 use dogpaddle_sql::SqlProgram;
 
-let program = SqlProgram::read("flow.sql")?;
-let mut flow = program.build("./flow-state")?;
-flow.advance()?; // 推进一轮；由应用重复调用，持续处理数据
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let program = SqlProgram::read("orders.sql")?;
+let mut flow = program.start("/var/lib/dogpaddle/orders")?;
 
-drop(flow);
-let mut flow = program.open("./flow-state")?;
-flow.advance()?; // 重启后继续
+loop {
+    let outcome = flow.advance()?;
+    // 宿主根据 outcome 决定立即继续、等待或停止。
+    # let _ = outcome;
+    # break;
+}
+# Ok(())
+}
 ```
 
-DogPaddle 在应用进程内运行，目前没有独立服务或内置后台运行循环。
-完整可运行代码见 [quickstart.rs](crates/sql/examples/quickstart.rs)，
-接口说明见 [SQL 文档](crates/sql/README.md#3-buildadvanceopen)。
+SQL 层的公共生命周期只有 `SqlProgram::parse`、`SqlProgram::read` 和 `SqlProgram::start`。需要直接装配 Operation 的底层用户仍可使用 `FlowFactory::build/open`。
 
-## 当前支持什么
+## 当前能力
 
-| 你想做的事 | 当前支持 |
+| 需求 | 当前支持 |
 | --- | --- |
-| 读取数据 | 递增数字源；PostgreSQL WAL / MySQL binlog 单表变更捕获（固定 Schema 试点） |
-| 筛选和计算 | `SELECT`、`WHERE`、算术与布尔表达式、`CASE`、`CAST`、`TRY_CAST` |
-| 组织查询 | 字段别名、非递归 CTE、派生查询、`SELECT DISTINCT`、`UNION ALL` |
-| 关联数据 | `INNER`、`LEFT`、`RIGHT`、`FULL OUTER`、`LEFT/RIGHT SEMI`、`LEFT/RIGHT ANTI JOIN ... ON` 的等值连接 |
-| 分组聚合 | 非空 `GROUP BY`；`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；只分组不聚合 |
-| 写入结果 | SQLite；PostgreSQL（试点）；丢弃输出 |
-| 停止后继续 | 本地保存流程、处理进度和算子状态，重新打开后恢复 |
+| 读取数据 | `sequence`；PostgreSQL WAL / MySQL binlog 单表 CDC 与一致初始快照 |
+| 筛选和计算 | `SELECT`、`WHERE`、别名、算术与布尔表达式、`CASE`、`CAST`、`TRY_CAST` |
+| 查询结构 | 非递归 CTE、派生查询、`SELECT DISTINCT`、`UNION ALL` |
+| Join | Inner、Left/Right/Full Outer、Left/Right Semi、Left/Right Anti 等值连接 |
+| 聚合 | 非空 `GROUP BY`；`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；纯分组 |
+| 输出 | SQLite、PostgreSQL、Discard |
+| 恢复 | 本地持久化拓扑、订阅位置与算子状态；相同 SQL 自动恢复 |
 
-开始接入前，需要了解这些边界：
+主要边界：
 
-- **SQL 范围有限。** 每个文件只接受一条 `INSERT INTO ... SELECT ...`。Join 必须至少包含一个跨输入
-  等值条件；`INNER JOIN` 还能追加 residual 谓词，其他 Join 只接受等值合取。不支持 Cross/Natural/Using
-  Join 或纯非等值 Join。暂不支持无分组的
-  全局聚合、grouping sets、聚合修饰符或 UDF，也不支持 `DISTINCT ON`、普通 `UNION`、排序、
-  Limit、窗口和交互式查询结果。
-- **聚合类型范围有限。** 分组字段不能包含浮点值；`SUM/AVG` 只接受 `Int64/UInt64`，`MIN/MAX`
-  只接受非浮点的扁平 DogPaddle scalar。`COUNT(*)` 和 `COUNT(expression)` 均可使用。
-- **去重采用精确记录身份。** `SELECT DISTINCT` 比较完整 canonical 记录；浮点值按
-  原始位模式区分，因此 `-0.0` 与 `+0.0` 不会像常见 SQL / `DataFusion` 分组那样合并。
-- **PostgreSQL 会先复制已有数据，再持续处理 WAL 变化。** 试点要求预先配置 publication、
-  `REPLICA IDENTITY FULL` 和一个首次启动前必须不存在、之后由该 Scan 独占的 slot 名。初始快照在私有持久
-  spool 中完整封口后才对下游发布，因而无需要求源表为空或先停写。需要显式配置能容纳完整快照及
-  快照封口前 WAL 重叠的 `bootstrap_spool_bytes`。目前仍不支持 TLS、DNS 地址、多表路由或运行中改表。
-  详见 [外部端点文档](crates/operation/README.md)。
-- **MySQL 会先复制已有数据，再从同一快照切点继续 binlog CDC。** MySQL 8.4 试点使用
-  `initial_only` 和 `minimal` locking 取得一致快照，封口后从 initial-snapshot completion
-  notification 的 checkpoint 以
-  `recovery` 继续。快照也会先写入受 `bootstrap_spool_bytes` 限制的私有持久 spool，完整后再逐批发布。
-  binlog 必须覆盖初始快照、私有 spool 排空、公开 output 背压和追平的全部时间；过早 `PURGE`
-  会以错误终止，不会悄悄跳过数据。要求固定 Schema，不支持运行中 DDL、TLS 或未列出的源类型。
-  详见 [外部端点文档](crates/operation/README.md)。
-- **结果表由 DogPaddle 独占。** SQLite / PostgreSQL 输出必须使用新目标表，不能接管已有表或
-  与业务代码共同写入。PostgreSQL 结果表不复制源表结构，文本当前按 bytes 保存。
-- **恢复沿用原来的处理规则。** 修改 SQL 后请使用新进度目录和新目标表；`open` 不会更新已有流程。
-  同一进度目录同时只能由一个活动 Flow 使用。开发期持久格式不承诺跨版本迁移。
+- 每个文件只接受一条 `INSERT INTO sink(...) <query>`。不支持交互式查询、Sort、Limit、Window、普通 `UNION`、`DISTINCT ON` 或无分组全局聚合。
+- Join 至少包含一个跨输入等值 key。Inner Join 可附加 residual 条件；Outer、Semi、Anti 只接受等值合取。Cross、Natural、Using 和纯非等值 Join 尚未实现。
+- PostgreSQL / MySQL CDC 使用固定 Schema。PostgreSQL 要求预先配置 publication 和 `REPLICA IDENTITY FULL`；MySQL binlog 必须覆盖快照、spool 发布和追平阶段。两者暂不支持 TLS、在线 DDL 或多表路由。
+- `bootstrap_spool_bytes` 可选，默认 1 GiB。它必须能容纳完整快照；PostgreSQL 还要容纳快照封口前的 WAL 重叠。
+- SQLite / PostgreSQL 结果表由 DogPaddle 独占，必须是新目标，不能与其他写入者共享。
+- v1 持久格式不提供迁移或兼容层。修改 SQL 语义、端点身份或装配规则后，应使用新状态目录和新目标。
 
-## 订单演示
+## 架构
 
-[fulfillment.sql](crates/sql/examples/fulfillment.sql) 展示了一个真实 PostgreSQL 场景：
-从 `sales.orders` 读取变化，计算折后金额，筛选已付款且金额达标的订单，再按地区和金额分配
-履约中心与优先级，写入同一数据库的 `ops.fulfillment_queue`。
+```text
+SQL / dogpaddle run
+        ↓ parse · plan · assemble
+Flow：静态 DAG、Station、调度、事务边界
+        ↓
+Operation：Scan / Transform / Sink 的状态与执行语义
+        ↓                         ↓
+Change：Arrow 差分批次          Store：RocksDB 事务与持久集合
+```
 
-无声演示固定展示源表、完整 `fulfillment.sql` 文件、目标表。源表连续发生 28 次新增、修改和删除，
-目标表随之筛选、重算、切换路由或撤回结果；SQL 从端点到最后一行全程可见，变化的行和字段会高亮。
-
-[![无声持续 ETL：源表更新、常驻 SQL、目标表变化](docs/assets/fulfillment-hero.png)](docs/assets/fulfillment-continuous.mp4)
-
-[观看视频](docs/assets/fulfillment-continuous.mp4) · [本机复现与原始记录](docs/demo/README.md)
-
-画面来自真实 PostgreSQL 执行记录，保留原始数据供核对；每次变更留出观察时间，不代表实际处理延迟。
+SQL 编译器会把一条直线上的单输入原子算子装入同一个 Station，使它们在一笔事务中执行并省去中间持久队列。分叉、多输入边界、要求独占的算子和 Sink 会形成新的 Station。分组是确定性的结构规则，不引入成本优化器或第二套执行引擎。
 
 ## 文档
 
-- **第一次读源码：** [Flow 的十分钟运行骨架](crates/flow/README.md) ·
-  [Operation 的构建与执行](crates/operation/README.md) · [Change 数据模型](crates/change/README.md) ·
-  [Store 事务状态](crates/store/README.md)
-- **产品入口：** [SQL 编译与智能装配](crates/sql/README.md) ·
-  [Debezium 拉取与恢复](crates/debezium/README.md)
-- **开发：** [构建、测试与性能验证](TESTING.md) · [算子路线图](OPERATOR_ROADMAP.md) ·
-  [Debezium 接入路线图](DEBEZIUM_ROADMAP.md)
+- [SQL、端点与智能装配](crates/sql/README.md)
+- [Flow 的十分钟运行骨架](crates/flow/README.md)
+- [Operation 的构建与执行](crates/operation/README.md)
+- [Change 数据模型](crates/change/README.md)
+- [Store 事务状态](crates/store/README.md)
+- [Debezium 拉取与恢复](crates/debezium/README.md)
+- [构建、测试与性能验证](TESTING.md)
+- [算子路线图](OPERATOR_ROADMAP.md)
+- [Debezium 接入路线图](DEBEZIUM_ROADMAP.md)

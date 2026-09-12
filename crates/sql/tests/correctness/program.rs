@@ -1,3 +1,4 @@
+use dogpaddle_flow::FlowError;
 use dogpaddle_sql::{SqlError, SqlProgram};
 
 #[test]
@@ -14,29 +15,14 @@ fn bundled_sql_examples_parse_through_the_public_file_api() {
 fn parse_accepts_every_v1_scan_and_sink_endpoint() {
     let postgres = r"
         INSERT INTO postgres(
-            sink_id => 'orders_copy',
-            host => '127.0.0.1',
-            port => 5432,
-            database => 'app',
-            user => 'dogpaddle',
-            password => env('DOGPADDLE_SQL_TEST_PASSWORD'),
-            schema => 'target',
-            table => 'orders'
+            connection => env('DOGPADDLE_TARGET_DATABASE_URL'),
+            table => 'target.orders'
         )
         SELECT id, amount
         FROM postgres_cdc(
-            engine_name => 'orders_scan',
-            runtime_bundle => '/opt/dogpaddle/debezium',
-            host => '127.0.0.1',
-            port => 5432,
-            database => 'app',
-            user => 'dogpaddle',
-            password => env('DOGPADDLE_SQL_TEST_PASSWORD'),
-            schema => 'public',
-            table => 'orders',
-            slot => 'orders_slot',
-            publication => 'orders_publication',
-            bootstrap_spool_bytes => 1073741824
+            connection => env('DOGPADDLE_SOURCE_DATABASE_URL'),
+            table => 'public.orders',
+            publication => 'orders_publication'
         ) AS orders
     ";
     SqlProgram::parse(postgres).unwrap();
@@ -45,16 +31,8 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
         INSERT INTO discard()
         SELECT id, amount
         FROM mysql_cdc(
-            engine_name => 'orders_mysql_scan',
-            runtime_bundle => '/opt/dogpaddle/debezium',
-            host => '127.0.0.1',
-            port => 3306,
-            database => 'app',
-            user => 'dogpaddle',
-            password => env('DOGPADDLE_SQL_TEST_PASSWORD'),
-            replication_client_id => 5401,
-            table => 'orders',
-            bootstrap_spool_bytes => 1073741824
+            connection => env('DOGPADDLE_SOURCE_DATABASE_URL'),
+            table => 'app.orders'
         ) AS orders
     ";
     SqlProgram::parse(mysql).unwrap();
@@ -201,31 +179,16 @@ fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
             "INSERT INTO discard() SELECT value FROM sequence(start => -1)",
         ),
         (
-            "overflowing MySQL replication client ID",
-            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
-                engine_name => 'orders_mysql_scan', \
-                runtime_bundle => '/opt/dogpaddle/debezium', host => '127.0.0.1', \
-                port => 3306, database => 'app', user => 'dogpaddle', password => 'secret', \
-                replication_client_id => 4294967296, table => 'orders', \
-                bootstrap_spool_bytes => 1073741824\
-            )",
-        ),
-        (
-            "missing PostgreSQL bootstrap spool capacity",
+            "missing PostgreSQL publication",
             "INSERT INTO discard() SELECT * FROM postgres_cdc(\
-                engine_name => 'orders_scan', runtime_bundle => '/opt/dogpaddle/debezium', \
-                host => '127.0.0.1', port => 5432, database => 'app', \
-                user => 'dogpaddle', password => 'secret', schema => 'public', \
-                table => 'orders', slot => 'orders_slot', publication => 'orders_publication'\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders'\
             )",
         ),
         (
-            "missing MySQL bootstrap spool capacity",
+            "missing MySQL table",
             "INSERT INTO discard() SELECT * FROM mysql_cdc(\
-                engine_name => 'orders_mysql_scan', runtime_bundle => '/opt/dogpaddle/debezium', \
-                host => '127.0.0.1', port => 3306, database => 'app', \
-                user => 'dogpaddle', password => 'secret', replication_client_id => 5401, \
-                table => 'orders'\
+                connection => 'mysql://user:secret@127.0.0.1/app'\
             )",
         ),
         (
@@ -247,20 +210,80 @@ fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
 }
 
 #[test]
-fn build_rejects_zero_bootstrap_spool_capacity_before_source_io() {
+fn parse_rejects_every_removed_endpoint_argument() {
+    let postgres_cdc_arguments = [
+        ("engine_name", "'orders_scan'"),
+        ("runtime_bundle", "'/opt/dogpaddle/debezium'"),
+        ("host", "'127.0.0.1'"),
+        ("port", "5432"),
+        ("database", "'app'"),
+        ("user", "'dogpaddle'"),
+        ("password", "'secret'"),
+        ("schema", "'public'"),
+        ("slot", "'orders_slot'"),
+    ];
+    for (name, value) in postgres_cdc_arguments {
+        let sql = format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders', publication => 'orders_publication', \
+                {name} => {value}\
+            )"
+        );
+        assert!(SqlProgram::parse(&sql).is_err(), "accepted {name}");
+    }
+
+    let mysql_cdc_arguments = [
+        ("engine_name", "'orders_scan'"),
+        ("runtime_bundle", "'/opt/dogpaddle/debezium'"),
+        ("host", "'127.0.0.1'"),
+        ("port", "3306"),
+        ("database", "'app'"),
+        ("user", "'dogpaddle'"),
+        ("password", "'secret'"),
+        ("replication_client_id", "5401"),
+    ];
+    for (name, value) in mysql_cdc_arguments {
+        let sql = format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.orders', {name} => {value}\
+            )"
+        );
+        assert!(SqlProgram::parse(&sql).is_err(), "accepted {name}");
+    }
+
+    let postgres_sink_arguments = [
+        ("sink_id", "'orders_sink'"),
+        ("host", "'127.0.0.1'"),
+        ("port", "5432"),
+        ("database", "'app'"),
+        ("user", "'dogpaddle'"),
+        ("password", "'secret'"),
+        ("schema", "'public'"),
+    ];
+    for (name, value) in postgres_sink_arguments {
+        let sql = format!(
+            "INSERT INTO postgres(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders', {name} => {value}\
+             ) SELECT value FROM sequence(start => 0)"
+        );
+        assert!(SqlProgram::parse(&sql).is_err(), "accepted {name}");
+    }
+}
+
+#[test]
+fn start_rejects_zero_bootstrap_spool_capacity_before_source_io() {
     let root = tempfile::tempdir().unwrap();
     let programs = [
         "INSERT INTO discard() SELECT * FROM postgres_cdc(\
-            engine_name => 'orders_scan', runtime_bundle => '/nonexistent/runtime', \
-            host => '127.0.0.1', port => 5432, database => 'app', user => 'dogpaddle', \
-            password => 'secret', schema => 'public', table => 'orders', \
-            slot => 'orders_slot', publication => 'orders_publication', \
+            connection => 'postgresql://user:secret@127.0.0.1/app', \
+            table => 'public.orders', publication => 'orders_publication', \
             bootstrap_spool_bytes => 0\
         )",
         "INSERT INTO discard() SELECT * FROM mysql_cdc(\
-            engine_name => 'orders_scan', runtime_bundle => '/nonexistent/runtime', \
-            host => '127.0.0.1', port => 3306, database => 'app', user => 'dogpaddle', \
-            password => 'secret', replication_client_id => 5401, table => 'orders', \
+            connection => 'mysql://user:secret@127.0.0.1/app', table => 'app.orders', \
             bootstrap_spool_bytes => 0\
         )",
     ];
@@ -268,13 +291,67 @@ fn build_rejects_zero_bootstrap_spool_capacity_before_source_io() {
     for (index, sql) in programs.iter().enumerate() {
         let flow_path = root.path().join(format!("flow-{index}"));
         let program = SqlProgram::parse(sql).unwrap();
-        assert!(program.build(&flow_path).is_err());
+        assert!(program.start(&flow_path).is_err());
         assert!(!flow_path.exists());
     }
 }
 
 #[test]
-fn build_rejects_missing_environment_values_before_creating_the_flow() {
+fn start_rejects_malformed_database_urls_and_qualified_tables_before_source_io() {
+    let root = tempfile::tempdir().unwrap();
+    let programs = [
+        (
+            "PostgreSQL CDC URL",
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'not-a-url', table => 'public.orders', \
+                publication => 'orders_publication'\
+            )",
+        ),
+        (
+            "MySQL CDC URL",
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'app.orders'\
+            )",
+        ),
+        (
+            "PostgreSQL sink URL",
+            "INSERT INTO postgres(connection => 'postgresql:///app', table => 'public.orders') \
+             SELECT value FROM sequence(start => 0)",
+        ),
+        (
+            "unqualified PostgreSQL CDC table",
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'orders', publication => 'orders_publication'\
+            )",
+        ),
+        (
+            "over-qualified PostgreSQL sink table",
+            "INSERT INTO postgres(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'catalog.public.orders'\
+             ) SELECT value FROM sequence(start => 0)",
+        ),
+        (
+            "MySQL table from another database",
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'other.orders'\
+            )",
+        ),
+    ];
+
+    for (index, (case, sql)) in programs.into_iter().enumerate() {
+        let state_path = root.path().join(format!("invalid-endpoint-{index}"));
+        let program = SqlProgram::parse(sql).unwrap();
+        assert!(program.start(&state_path).is_err(), "started {case}");
+        assert!(!state_path.exists(), "{case} created state");
+    }
+}
+
+#[test]
+fn start_rejects_missing_environment_values_before_creating_state() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let variable = "DOGPADDLE_SQL_CORRECTNESS_MISSING_7F930A9E";
@@ -285,8 +362,51 @@ fn build_rejects_missing_environment_values_before_creating_the_flow() {
     );
     let program = SqlProgram::parse(&sql).unwrap();
 
-    assert!(program.build(&flow_path).is_err());
+    assert!(program.start(&flow_path).is_err());
     assert!(!flow_path.exists());
+}
+
+#[test]
+fn start_creates_state_then_resumes_it_and_rejects_a_mismatched_program() {
+    let root = tempfile::tempdir().unwrap();
+    let state_path = root.path().join("state");
+    let original = SqlProgram::parse(
+        "INSERT INTO discard() SELECT value FROM sequence(start => 0) WHERE value < 2",
+    )
+    .unwrap();
+
+    drop(original.start(&state_path).unwrap());
+    assert!(state_path.exists());
+    drop(original.start(&state_path).unwrap());
+
+    let replacement = SqlProgram::parse(
+        "INSERT INTO discard() SELECT value FROM sequence(start => 1) WHERE value < 2",
+    )
+    .unwrap();
+    assert!(matches!(
+        replacement.start(&state_path),
+        Err(SqlError::Flow(FlowError::OwnerIdentityMismatch))
+    ));
+
+    drop(original.start(&state_path).unwrap());
+}
+
+#[test]
+fn start_never_rebuilds_an_existing_incomplete_state_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let state_path = root.path().join("incomplete-state");
+    let sqlite_path = root.path().join("must-not-exist.sqlite");
+    std::fs::create_dir(&state_path).unwrap();
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'events') \
+         SELECT value FROM sequence(start => 0)",
+        sqlite_path.display()
+    ))
+    .unwrap();
+
+    assert!(program.start(&state_path).is_err());
+    assert!(state_path.is_dir());
+    assert!(!sqlite_path.exists());
 }
 
 #[test]
@@ -296,14 +416,13 @@ fn resolved_environment_values_are_not_in_errors() {
     let resolved = std::env::var("PATH").expect("Cargo tests have PATH");
     let program = SqlProgram::parse(
         "INSERT INTO postgres(\
-            sink_id => 'sink', host => 'not-an-ip', port => 5432, database => 'app', \
-            user => 'dogpaddle', password => env('PATH'), schema => 'public', table => 'events'\
+            connection => env('PATH'), table => 'public.events'\
          ) SELECT value FROM sequence(start => 0)",
     )
     .unwrap();
 
-    let Err(error) = program.build(&flow_path) else {
-        panic!("invalid PostgreSQL host built a Flow");
+    let Err(error) = program.start(&flow_path) else {
+        panic!("invalid PostgreSQL connection started a Flow");
     };
     assert!(!error.to_string().contains(&resolved));
     assert!(!flow_path.exists());
@@ -380,7 +499,7 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
         let flow_path = root.path().join(format!("flow-{index}"));
         let sql = format!("INSERT INTO discard() {query}");
         if let Ok(program) = SqlProgram::parse(&sql) {
-            assert!(program.build(&flow_path).is_err(), "built {case}");
+            assert!(program.start(&flow_path).is_err(), "started {case}");
         }
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
@@ -454,7 +573,7 @@ fn unsupported_aggregate_forms_fail_without_creating_a_flow() {
     for (index, (case, query)) in queries.into_iter().enumerate() {
         let flow_path = root.path().join(format!("aggregate-{index}"));
         let program = SqlProgram::parse(&format!("INSERT INTO discard() {query}")).unwrap();
-        assert!(program.build(&flow_path).is_err(), "built {case}");
+        assert!(program.start(&flow_path).is_err(), "started {case}");
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
 }
@@ -529,7 +648,7 @@ fn invalid_plan_shapes_fail_without_creating_a_flow() {
         let flow_path = root.path().join(format!("invalid-plan-{index}"));
         let sql = format!("INSERT INTO discard() {query}");
         if let Ok(program) = SqlProgram::parse(&sql) {
-            assert!(program.build(&flow_path).is_err(), "built {case}");
+            assert!(program.start(&flow_path).is_err(), "started {case}");
         }
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
@@ -597,16 +716,16 @@ fn ignored_sql_modifiers_are_rejected_before_creating_a_flow() {
         let flow_path = root.path().join(format!("modifier-{index}"));
         let sql = format!("INSERT INTO discard() {query}");
         if let Ok(program) = SqlProgram::parse(&sql) {
-            assert!(program.build(&flow_path).is_err(), "built {case}");
+            assert!(program.start(&flow_path).is_err(), "started {case}");
         }
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
 }
 
 #[test]
-fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
+fn start_resolves_every_endpoint_parameter_before_selecting_state_lifecycle() {
     let root = tempfile::tempdir().unwrap();
-    let variable = "DOGPADDLE_SQL_CORRECTNESS_OPEN_MISSING_91F6E33D";
+    let variable = "DOGPADDLE_SQL_CORRECTNESS_START_MISSING_91F6E33D";
     assert!(std::env::var_os(variable).is_none());
     let programs = [
         format!("INSERT INTO discard() SELECT value FROM sequence(start => env('{variable}'))"),
@@ -615,30 +734,59 @@ fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
              SELECT value FROM sequence(start => 0)"
         ),
         format!(
+            "INSERT INTO sqlite(path => '/tmp/events.sqlite', table => env('{variable}')) \
+             SELECT value FROM sequence(start => 0)"
+        ),
+        format!(
             "INSERT INTO discard() SELECT * FROM postgres_cdc(\
-                engine_name => env('{variable}'), \
-                runtime_bundle => '/tmp/dogpaddle-runtime', \
-                host => '127.0.0.1', port => 5432, database => 'app', \
-                user => 'dogpaddle', password => 'secret', schema => 'public', \
-                table => 'events', slot => 'events_slot', publication => 'events_pub', \
-                bootstrap_spool_bytes => 1073741824\
+                connection => env('{variable}'), table => 'public.events', \
+                publication => 'events_publication'\
+            )"
+        ),
+        format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => env('{variable}'), publication => 'events_publication'\
+            )"
+        ),
+        format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.events', publication => env('{variable}')\
+            )"
+        ),
+        format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.events', publication => 'events_publication', \
+                bootstrap_spool_bytes => env('{variable}')\
             )"
         ),
         format!(
             "INSERT INTO discard() SELECT * FROM mysql_cdc(\
-                engine_name => env('{variable}'), \
-                runtime_bundle => '/tmp/dogpaddle-runtime', \
-                host => '127.0.0.1', port => 3306, database => 'app', \
-                user => 'dogpaddle', password => 'secret', \
-                replication_client_id => 5401, table => 'events', \
-                bootstrap_spool_bytes => 1073741824\
+                connection => env('{variable}'), table => 'app.events'\
             )"
         ),
         format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => env('{variable}')\
+            )"
+        ),
+        format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.events', bootstrap_spool_bytes => env('{variable}')\
+            )"
+        ),
+        format!(
+            "INSERT INTO postgres(connection => env('{variable}'), table => 'public.events') \
+             SELECT value FROM sequence(start => 0)"
+        ),
+        format!(
             "INSERT INTO postgres(\
-                sink_id => env('{variable}'), host => '127.0.0.1', port => 5432, \
-                database => 'app', user => 'dogpaddle', password => 'secret', \
-                schema => 'public', table => 'events'\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => env('{variable}')\
              ) SELECT value FROM sequence(start => 0)"
         ),
     ];
@@ -647,7 +795,7 @@ fn open_resolves_every_endpoint_parameter_before_reading_the_flow() {
         let flow_path = root.path().join(format!("flow-{index}"));
         let program = SqlProgram::parse(sql).unwrap();
         assert!(
-            matches!(program.open(&flow_path), Err(SqlError::Environment { name }) if name == variable)
+            matches!(program.start(&flow_path), Err(SqlError::Environment { name }) if name == variable)
         );
         assert!(!flow_path.exists());
     }

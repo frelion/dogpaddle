@@ -29,8 +29,9 @@ use dogpaddle_operation::{
 use crate::{
     SqlError,
     aggregate::{lower as lower_builtin_aggregate, planning_builtins},
-    compiler::{LogicalArena, LogicalNodeId, LogicalOperator, LogicalQuery, TransformDefinition},
+    assembly::{LogicalArena, LogicalNodeId, LogicalOperator, LogicalQuery, TransformDefinition},
     endpoint::BuiltScan,
+    syntax::internal_scan_name,
 };
 
 #[derive(Debug)]
@@ -682,10 +683,6 @@ fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {
         .output_schema()
         .cloned()
         .ok_or_else(|| SqlError::invalid("scan definition has no output Schema"))
-}
-
-pub(crate) fn internal_scan_name(index: usize) -> String {
-    format!("__dogpaddle_sql_scan_{index:08x}")
 }
 
 fn internal_join_field_name(index: usize) -> String {

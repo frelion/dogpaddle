@@ -5,7 +5,7 @@ use datafusion_sql::sqlparser::parser::ParserError;
 use dogpaddle_flow::FlowError;
 use thiserror::Error;
 
-/// Failure while parsing, building, or opening a SQL program.
+/// Failure while parsing or starting a SQL program.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SqlError {
@@ -16,6 +16,15 @@ pub enum SqlError {
     #[error("failed to read SQL file {path:?}: {source}")]
     Read {
         /// Path supplied by the caller.
+        path: PathBuf,
+        /// Underlying file-system error.
+        #[source]
+        source: io::Error,
+    },
+    /// The state path could not be prepared before choosing build or open.
+    #[error("failed to prepare SQL state path {path:?}: {source}")]
+    StatePath {
+        /// State path supplied by the caller.
         path: PathBuf,
         /// Underlying file-system error.
         #[source]

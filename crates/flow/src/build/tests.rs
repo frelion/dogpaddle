@@ -353,6 +353,19 @@ fn decoder_round_trips_a_large_chain() {
 }
 
 #[test]
+fn owner_identity_round_trips_exactly() {
+    let identity = [0xa5; 32];
+    let mut definition = codec_definition();
+    definition.owner_identity = Some(identity);
+
+    let encoded = encode(&definition).unwrap();
+    let (decoded, _) = decode(&encoded).unwrap();
+
+    assert_eq!(decoded.owner_identity(), Some(identity));
+    assert_eq!(encode(&decoded).unwrap(), encoded);
+}
+
+#[test]
 fn decoder_rejects_empty_and_non_atomic_station_tails() {
     let mut empty = codec_definition();
     empty.stations[0].operations.clear();

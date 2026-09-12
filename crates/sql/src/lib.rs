@@ -1,11 +1,12 @@
 #![doc = include_str!("../README.md")]
 
 mod aggregate;
-mod compiler;
+mod assembly;
 mod endpoint;
 mod error;
-mod lower;
+mod plan;
 mod program;
+mod syntax;
 
 pub use error::SqlError;
 pub use program::SqlProgram;

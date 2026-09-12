@@ -2,7 +2,7 @@ use dogpaddle_sql::SqlProgram;
 use dogpaddle_store::{Cell, Store};
 
 #[test]
-fn physical_compiler_keeps_the_canonical_flow_definition() {
+fn physical_assembly_keeps_the_canonical_flow_definition() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let program = SqlProgram::parse(
@@ -14,13 +14,13 @@ fn physical_compiler_keeps_the_canonical_flow_definition() {
     )
     .unwrap();
 
-    drop(program.build(&path).unwrap());
+    drop(program.start(&path).unwrap());
     let definition = read_definition(&path);
 
-    assert_eq!(definition.len(), 907);
+    assert_eq!(definition.len(), 940);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "7252265dfc5dedc3ef43bd53652d751d2d473e9782159671835531ef69597559"
+        "556e2e40875f5a296fdd084e144adb5bdb597dba8cb6134213b6de186481cf5e"
     );
 }
 
@@ -39,7 +39,7 @@ fn inner_join_residual_and_projection_are_fused_into_one_transform_station() {
     )
     .unwrap();
 
-    let flow = program.build(&path).unwrap();
+    let flow = program.start(&path).unwrap();
     let expected = [
         "sql/scan/00000000",
         "sql/scan/00000001",
@@ -56,7 +56,7 @@ fn inner_join_residual_and_projection_are_fused_into_one_transform_station() {
     );
 
     drop(flow);
-    let reopened = program.open(&path).unwrap();
+    let reopened = program.start(&path).unwrap();
     assert_eq!(
         reopened
             .status()
@@ -110,7 +110,7 @@ fn lowering_rebinds_qualified_columns_across_self_and_nested_joins() {
     for (index, query) in queries.into_iter().enumerate() {
         let program = SqlProgram::parse(&format!("INSERT INTO discard() {query}")).unwrap();
         program
-            .build(root.path().join(format!("join-{index}")))
+            .start(root.path().join(format!("join-{index}")))
             .unwrap();
     }
 }

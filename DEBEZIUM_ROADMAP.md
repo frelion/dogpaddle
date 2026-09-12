@@ -40,6 +40,13 @@ D6 初始全量实现取代。真实 MySQL host/recovery gate 仍是 D7 的阶�
 Store 现在基于 RocksDB `OptimisticTransactionDB`，当前仍保留唯一线性写事务 owner 与顺序 Flow。
 D5 发布加固、D6 的完整规模/故障矩阵以及 D7 的真实 MySQL host/recovery gate 仍开放。
 
+2026-09-12 产品入口补充：SQL endpoint 不再让用户传 `runtime_bundle`、engine name、PostgreSQL slot
+或 MySQL replication client ID。产品 archive 固定为 `<archive>/bin/dogpaddle` 与
+`<archive>/libexec/dogpaddle/debezium`，`dogpaddle run` 从 executable 定位同一发布物中的 runtime；源码树和
+系统测试可以用绝对路径 `DOGPADDLE_DEBEZIUM_RUNTIME` 覆盖。所有 CDC Scan 在一个原生进程内共享同一个
+canonical runtime 和进程级 JVM，具体 engine 与数据库端 identity 由 SQL Program identity、状态路径和
+endpoint 序号确定性派生。D2 的 connector-neutral `DebeziumRuntime::open(path)` 仍保持显式路径 API。
+
 ## 目标与成功定义
 
 目标是在 Rust 应用进程内嵌入成熟的开源 Debezium Engine，先实现 PostgreSQL CDC，
@@ -270,8 +277,8 @@ status JSON。
   绝不回退系统 Java；
 - `open` 校验 target manifest、JRE release/关键资源、nested JAR 精确集合与 hash，以及 `libjvm`
   路径 containment；它不遍历重哈希整棵 JRE。archive digest 与可信只读安装是完整性边界；
-- Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个 payload；D2 不定义 host/`bin` 布局，
-  最终应用 release packager 以后再组合 executable 与 runtime；
+- Linux GNU x86_64/aarch64 与 macOS x86_64/aarch64 四个 payload；D2 本身不定义 host/`bin` 布局，
+  产品 packager 以 `bin/dogpaddle` 和 `libexec/dogpaddle/debezium` 组合 executable 与 runtime；
 - connector-neutral Java bridge，只有一个 outstanding batch，无 Java→Rust callback；
 - `ConnectorConfig` 只做 secret-safe properties 容器，runtime 强制单 task、ordered、always
   commit、自有 offset store，并拒绝 SMT/predicate 与调用方 offset store；

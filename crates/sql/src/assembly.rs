@@ -14,7 +14,9 @@ use crate::{
     endpoint::{BuiltScan, BuiltSink},
 };
 
-const OUTPUT_CAPACITY: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).expect("64 MiB is nonzero");
+pub(crate) const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+const OUTPUT_CAPACITY: NonZeroU64 =
+    NonZeroU64::new(OUTPUT_CAPACITY_BYTES).expect("64 MiB is nonzero");
 
 pub(crate) fn scan_station_id(index: usize) -> String {
     format!("sql/scan/{index:08x}")
@@ -337,8 +339,8 @@ mod tests {
             panic!("test SQL must parse as a query");
         };
         let scans = vec![BuiltScan::Sequence(SequenceScanDefinition::new(7))];
-        let plan = crate::lower::plan(*query, &scans).unwrap();
-        let query = crate::lower::lower_query(&plan, scans).unwrap();
+        let plan = crate::plan::plan(*query, &scans).unwrap();
+        let query = crate::plan::lower_query(&plan, scans).unwrap();
         let scan_nodes = query
             .arena
             .nodes
