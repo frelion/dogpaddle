@@ -122,7 +122,12 @@ pub enum OperationKind {
     Scan,
     /// Completely consumes one input Change inside the Station transaction.
     AtomicTransform(NonZeroU32),
-    /// Owns a full turn and must be the sole Operation in its Station.
+    /// Owns a full, replayable turn and may lead a Station's atomic tail.
+    ///
+    /// An uncommitted turn must be safe to recompute from unchanged durable
+    /// state when a later atomic Operation or final output admission fails.
+    TurnTransform(NonZeroU32),
+    /// Owns a full turn and requires a durable output boundary before downstream work.
     ExclusiveTransform(NonZeroU32),
     /// Consumes input records without producing output.
     Sink(NonZeroU32),
@@ -134,9 +139,10 @@ impl OperationKind {
     pub const fn input_count(self) -> u32 {
         match self {
             Self::Scan => 0,
-            Self::AtomicTransform(count) | Self::ExclusiveTransform(count) | Self::Sink(count) => {
-                count.get()
-            }
+            Self::AtomicTransform(count)
+            | Self::TurnTransform(count)
+            | Self::ExclusiveTransform(count)
+            | Self::Sink(count) => count.get(),
         }
     }
 
@@ -152,10 +158,19 @@ impl OperationKind {
         matches!(self, Self::Sink(_))
     }
 
-    /// Returns whether this Operation can be followed by another Operation in one transaction.
+    /// Returns whether this kind completely consumes one input Change in the current transaction.
     #[must_use]
     pub const fn is_atomic(self) -> bool {
         matches!(self, Self::AtomicTransform(_))
+    }
+
+    /// Returns whether this kind may lead a Station's atomic tail.
+    #[must_use]
+    pub const fn allows_atomic_tail(self) -> bool {
+        matches!(
+            self,
+            Self::Scan | Self::AtomicTransform(_) | Self::TurnTransform(_)
+        )
     }
 
     /// Returns whether this kind owns an output stream.
@@ -163,7 +178,10 @@ impl OperationKind {
     pub const fn has_output(self) -> bool {
         matches!(
             self,
-            Self::Scan | Self::AtomicTransform(_) | Self::ExclusiveTransform(_)
+            Self::Scan
+                | Self::AtomicTransform(_)
+                | Self::TurnTransform(_)
+                | Self::ExclusiveTransform(_)
         )
     }
 }
@@ -370,7 +388,10 @@ impl OperationBinding {
         let materializer = match (kind, self.materializer) {
             (OperationKind::AtomicTransform(_), materializer @ Materializer::Atomic(_))
             | (
-                OperationKind::Scan | OperationKind::ExclusiveTransform(_) | OperationKind::Sink(_),
+                OperationKind::Scan
+                | OperationKind::TurnTransform(_)
+                | OperationKind::ExclusiveTransform(_)
+                | OperationKind::Sink(_),
                 materializer @ Materializer::Turn { .. },
             ) => materializer,
             (OperationKind::ExclusiveTransform(_), Materializer::Atomic(materialize)) => {

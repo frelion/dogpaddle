@@ -125,6 +125,56 @@ fn projection_executes_qualified_coerced_expressions_into_sqlite() {
 }
 
 #[test]
+fn inner_join_executes_expression_keys_and_projection_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let flow_path = root.path().join("flow");
+    let sqlite_path = root.path().join("join.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'joined_values') \
+         SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => 18446744073709551613) AS left_scan \
+         JOIN sequence(start => 18446744073709551613) AS right_scan \
+         ON left_scan.value + CAST(0 AS BIGINT UNSIGNED) = right_scan.value",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
+
+    let mut flow = program.build(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+
+    let mut flow = program.open(&flow_path).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let mut rows = connection
+        .prepare("SELECT left_value, right_value FROM joined_values")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                decode_u64(row.get::<_, Vec<u8>>(0)?),
+                decode_u64(row.get::<_, Vec<u8>>(1)?),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        [
+            (u64::MAX - 2, u64::MAX - 2),
+            (u64::MAX - 1, u64::MAX - 1),
+            (u64::MAX, u64::MAX),
+        ]
+    );
+
+    let mut flow = program.open(&flow_path).unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+}
+
+#[test]
 fn select_distinct_deduplicates_projected_rows_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");

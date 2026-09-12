@@ -2,7 +2,7 @@
 
 mod row;
 
-pub(crate) use row::{RowError, canonical_row, encode_canonical, row_hash};
+pub(crate) use row::{RowError, canonical_row, decode_canonical_row, encode_canonical, row_hash};
 
 #[cfg(test)]
 mod tests;

@@ -184,13 +184,15 @@ completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minima
 - 非递归 CTE 与派生查询
 - `CAST`、`TRY_CAST`、`CASE`
 - 现有表达式执行层可接受的比较、布尔与算术表达式
+- `JOIN` / `INNER JOIN ... ON`，条件必须是非空的跨输入等值表达式合取；键可使用可绑定的
+  行内表达式，`NULL` 不匹配，v1 键类型限于 Join Operation 支持的扁平非浮点类型
 - `UNION ALL`
 - 非空 `GROUP BY`，以及 `COUNT`、`SUM`、`AVG`、`MIN`、`MAX`；`SUM/AVG` 的参数在 v1
   绑定后必须是 `Int64/UInt64`，只有分组字段而没有聚合调用也合法
 
 在创建 state 目录前明确拒绝：
 
-- 普通表、Join 和普通 `UNION`
+- 普通表、外连接、Cross/Natural/Using Join、非等值或带 residual 的 Join，以及普通 `UNION`
 - `SELECT ALL`、`DISTINCT ON`、Sort、Limit、Window、Values
 - 无分组的全局 Aggregate、grouping sets 和聚合调用的 `DISTINCT`、`FILTER`、`ORDER BY`、null treatment
 - 包含 `Float32/Float64` 的分组字段
@@ -201,7 +203,7 @@ completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minima
 - 任何没有显式 lowering 的 `LogicalPlan` 节点
 
 `DataFusion` 负责 SQL 解析、名称解析和 type coercion；分析得到的显式表达式与精确 `Schema` 被 lower
-为现有 `Filter`、`SchemaAlign`、`UnionAll`、`Distinct` 和 `Aggregate` Operation。聚合函数只在 SQL
+为现有 `Filter`、`SchemaAlign`、`InnerEquiJoin`、`UnionAll`、`Distinct` 和 `Aggregate` Operation。聚合函数只在 SQL
 规划时使用一张固定的逻辑描述表；`AVG` 保留整数参数并推导 `Float64` 输出，实际状态和计算完全属于
 `DogPaddle`。`DataFusion` 不执行 `Flow`，
 `DogPaddle` 也不维护第二套表达式 AST 或 SQL 执行引擎。
@@ -211,7 +213,7 @@ completion notification 前 WAL 重叠。MySQL 8.4 使用 `initial_only + minima
 `build` 先把 `DataFusion` plan lower 为 SQL crate 私有的 logical arena，再按确定性 postorder 直接装配
 Flow。一个单输入 atomic transform 只有在其直接 producer 恰好只有一条消费边、producer 仍是所属
 Station 的末项且该 Station 允许追加时，才进入同一 Station；连续满足条件的 Operation 构成最大线性
-program。Scan 可以作为 program 首项，多输入 atomic transform 可以新建 Station 后吸收单输入后缀；
+program。Scan 可以作为 program 首项，Join 等 turn transform 可以新建 Station 后吸收单输入 atomic 后缀；
 Sink 和不满足 atomic capability 的 transform 始终独占 Station。
 
 fan-out 始终保留 producer 的 durable output，每个分支从新的 Station 开始。同一个 producer 重复接入

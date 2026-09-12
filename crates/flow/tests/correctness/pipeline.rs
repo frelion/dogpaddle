@@ -7,8 +7,9 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition},
         transform::{
-            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            ExtendDefinition, FilterDefinition, InnerEquiJoinDefinition, ProjectDefinition,
+            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
         },
     },
 };
@@ -334,6 +335,91 @@ fn append_rejects_non_atomic_operations_without_mutating_the_station() {
             .err()
             .unwrap(),
         TopologyError::StationCannotBeExtended("sink".to_owned())
+    );
+}
+
+#[test]
+fn turn_transform_can_head_an_atomic_tail_but_cannot_be_appended() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let left = factory.station("left", SequenceScanDefinition::new(0));
+    let right = factory.station("right", SequenceScanDefinition::new(0));
+    let join_definition = || {
+        InnerEquiJoinDefinition::try_new(
+            [(col("value"), col("value"))],
+            ["left_value", "right_value"],
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        factory.append(left, join_definition()).err().unwrap(),
+        TopologyError::InvalidAppendedOperation {
+            station: "left".to_owned(),
+            operation: 1,
+        }
+    );
+
+    let join = factory.station("join", join_definition());
+    factory
+        .append(join, RunningEventCountDefinition::new())
+        .unwrap();
+    let sink = factory.station("sink", DiscardDefinition::new());
+    for station in [left, right, join] {
+        factory.output_capacity_bytes(station, CAPACITY);
+    }
+    factory.connect([left, right], join);
+    factory.connect([join], sink);
+
+    let mut flow = factory.build().unwrap();
+    assert_eq!(
+        flow.station_ids().collect::<Vec<_>>(),
+        ["left", "right", "join", "sink"]
+    );
+    for _ in 0..8 {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    drop(flow);
+
+    let before_reopen = {
+        let store = Store::open(&path).unwrap();
+        let count: Cell<u64> = store
+            .open_data("station/00000002/operation/00000001/running_event_count.count")
+            .unwrap();
+        let transaction = store.read_transaction();
+        count
+            .read(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap()
+            .unwrap()
+    };
+    assert!(before_reopen > 0);
+
+    let mut reopened = FlowFactory::new(&path).open().unwrap();
+    assert_eq!(
+        reopened.station_ids().collect::<Vec<_>>(),
+        ["left", "right", "join", "sink"]
+    );
+    for _ in 0..4 {
+        assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    drop(reopened);
+
+    let store = Store::open(&path).unwrap();
+    let count: Cell<u64> = store
+        .open_data("station/00000002/operation/00000001/running_event_count.count")
+        .unwrap();
+    let transaction = store.read_transaction();
+    assert!(
+        count
+            .read(transaction.access())
+            .unwrap()
+            .get()
+            .unwrap()
+            .unwrap()
+            > before_reopen
     );
 }
 

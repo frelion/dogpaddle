@@ -8,9 +8,9 @@ mod store;
 
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
-    Cell, CellAccess, CellReadAccess, MultiplicityChange, MultisetEntry, MultisetPartition,
-    OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess, OrderedMultiset,
-    OrderedMultisetAccess, OrderedMultisetReadAccess, PartitionedMultiset,
+    Cell, CellAccess, CellReadAccess, MultiplicityChange, MultisetEntry, MultisetPage,
+    MultisetPartition, OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess,
+    OrderedMultiset, OrderedMultisetAccess, OrderedMultisetReadAccess, PartitionedMultiset,
     PartitionedMultisetAccess, PartitionedMultisetReadAccess, Queue, QueueAccess,
     ReadMultisetPartition, SubscribedLog, SubscribedLogStatus, SubscribedLogWriter, Subscription,
     SubscriptionStatus,

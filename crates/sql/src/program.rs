@@ -2,9 +2,9 @@ use std::{fs, ops::ControlFlow, path::Path};
 
 use datafusion_sql::sqlparser::{
     ast::{
-        Cte, Distinct as SelectDistinct, Expr, GroupByExpr, Ident, ObjectName, Query, Select,
-        SelectFlavor, SetExpr, SetOperator, SetQuantifier, TableAlias, TableAliasColumnDef,
-        TableFactor, TableWithJoins, VisitMut, VisitorMut, With,
+        BinaryOperator, Cte, Distinct as SelectDistinct, Expr, GroupByExpr, Ident, JoinConstraint,
+        JoinOperator, ObjectName, Query, Select, SelectFlavor, SetExpr, SetOperator, SetQuantifier,
+        TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, VisitMut, VisitorMut, With,
     },
     dialect::GenericDialect,
     keywords::Keyword,
@@ -361,9 +361,23 @@ fn validate_select(select: &Select) -> Result<(), SqlError> {
 
 fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
     let TableWithJoins { relation, joins } = table;
-    if !joins.is_empty() {
-        return Err(SqlError::Unsupported("join".to_owned()));
+    validate_table_factor(relation)?;
+    for join in joins {
+        if join.global {
+            return Err(SqlError::Unsupported("join modifier".to_owned()));
+        }
+        let (JoinOperator::Join(JoinConstraint::On(condition))
+        | JoinOperator::Inner(JoinConstraint::On(condition))) = &join.join_operator
+        else {
+            return Err(SqlError::Unsupported("join type or constraint".to_owned()));
+        };
+        validate_join_condition(condition)?;
+        validate_table_factor(&join.relation)?;
     }
+    Ok(())
+}
+
+fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
     match relation {
         TableFactor::Table {
             name: _,
@@ -395,7 +409,35 @@ fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
             validate_optional_alias(alias.as_ref())?;
             validate_query(subquery)
         }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            validate_optional_alias(alias.as_ref())?;
+            validate_table(table_with_joins)
+        }
         _ => Err(SqlError::Unsupported("table modifier".to_owned())),
+    }
+}
+
+fn validate_join_condition(condition: &Expr) -> Result<(), SqlError> {
+    match condition {
+        Expr::Nested(condition) => validate_join_condition(condition),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            validate_join_condition(left)?;
+            validate_join_condition(right)
+        }
+        Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            ..
+        } => Ok(()),
+        _ => Err(SqlError::Unsupported(
+            "JOIN condition other than equality conjunction".to_owned(),
+        )),
     }
 }
 

@@ -1,12 +1,12 @@
-use std::{marker::PhantomData, num::NonZeroUsize};
+use std::marker::PhantomData;
 
 use crate::{
     CodecError, DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanDirection,
-    StoreError, StoreKey, TransactionAccess,
+    ScanLimit, StoreError, StoreKey, TransactionAccess,
 };
 
 use super::multiset::{
-    MultiplicityChange, MultisetEntry, adjust_encoded, first_entry, last_entry,
+    MultiplicityChange, MultisetEntry, MultisetPage, adjust_encoded, first_entry, last_entry,
     read_encoded_multiplicity, scan_entries,
 };
 
@@ -161,17 +161,31 @@ impl<K: StoreKey> MultisetPartition<'_, '_, K> {
         last_entry(self.data.as_read(), &self.prefix)
     }
 
-    /// Returns up to `max_items` entries from this partition in key order.
+    /// Returns one fully decoded, owned page from this partition.
+    ///
+    /// `resume_after` excludes the last key of the preceding page. The limit
+    /// bounds the entry count and encoded partition framing, key, and
+    /// multiplicity bytes.
     ///
     /// # Errors
     ///
-    /// Returns an error when storage access or decoding fails.
+    /// Encoding, decoding and storage failures poison the transaction. No
+    /// partial page is returned. If the first matching entry exceeds the byte
+    /// limit, returns [`StoreError::ItemTooLarge`] without poisoning, allowing
+    /// another scan with a larger limit.
     pub fn scan(
         &self,
         direction: ScanDirection,
-        max_items: NonZeroUsize,
-    ) -> Result<Vec<MultisetEntry<K>>, StoreError> {
-        scan_entries(self.data.as_read(), &self.prefix, direction, max_items)
+        resume_after: Option<&K>,
+        limit: ScanLimit,
+    ) -> Result<MultisetPage<K>, StoreError> {
+        scan_entries(
+            self.data.as_read(),
+            &self.prefix,
+            direction,
+            resume_after,
+            limit,
+        )
     }
 }
 
@@ -204,17 +218,22 @@ impl<K: StoreKey> ReadMultisetPartition<'_, '_, K> {
         last_entry(self.data, &self.prefix)
     }
 
-    /// Returns up to `max_items` entries from this partition in key order.
+    /// Returns one fully decoded, owned page from this partition.
+    ///
+    /// Range, continuation and admission semantics match [`MultisetPartition::scan`].
     ///
     /// # Errors
     ///
-    /// Returns an error when storage access or decoding fails.
+    /// Encoding, decoding and storage failures poison the snapshot. A first
+    /// entry exceeding the byte limit returns [`StoreError::ItemTooLarge`]
+    /// without poisoning it. No partial page is returned.
     pub fn scan(
         &self,
         direction: ScanDirection,
-        max_items: NonZeroUsize,
-    ) -> Result<Vec<MultisetEntry<K>>, StoreError> {
-        scan_entries(self.data, &self.prefix, direction, max_items)
+        resume_after: Option<&K>,
+        limit: ScanLimit,
+    ) -> Result<MultisetPage<K>, StoreError> {
+        scan_entries(self.data, &self.prefix, direction, resume_after, limit)
     }
 }
 
@@ -297,6 +316,58 @@ mod tests {
                 .partition(&7_u64)
                 .unwrap()
                 .multiplicity(&9_u64),
+            Err(StoreError::CorruptMultiset { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+
+        let transaction = transactions.begin();
+        assert_eq!(
+            marker.access(transaction.access()).unwrap().get().unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_scan_returns_no_page_and_poisons_prior_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let multiset = store
+            .create_data::<PartitionedMultiset<u64, u64>>("multiset")
+            .unwrap();
+        let marker = store.create_data::<Cell<u64>>("marker").unwrap();
+        let mut transactions = store.into_transactions();
+
+        let transaction = transactions.begin();
+        {
+            let mut data = multiset.data.access(transaction.access()).unwrap();
+            let prefix = encode_partition(data.as_read(), &7_u64).unwrap();
+            let valid = encode_key(data.as_read(), &prefix, &1_u64).unwrap();
+            data.put(&valid, &1_u64.to_be_bytes()).unwrap();
+            let corrupt = encode_key(data.as_read(), &prefix, &2_u64).unwrap();
+            data.put(&corrupt, &[1]).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        marker
+            .access(transaction.access())
+            .unwrap()
+            .set(&1)
+            .unwrap();
+        assert!(matches!(
+            multiset
+                .access(transaction.access())
+                .unwrap()
+                .partition(&7_u64)
+                .unwrap()
+                .scan(
+                    ScanDirection::Ascending,
+                    None,
+                    ScanLimit::new(2, 1024).unwrap(),
+                ),
             Err(StoreError::CorruptMultiset { .. })
         ));
         assert!(matches!(

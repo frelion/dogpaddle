@@ -7,7 +7,7 @@ mod subscribed_log;
 
 pub use cell::{Cell, CellAccess, CellReadAccess};
 pub use multiset::{
-    MultiplicityChange, MultisetEntry, OrderedMultiset, OrderedMultisetAccess,
+    MultiplicityChange, MultisetEntry, MultisetPage, OrderedMultiset, OrderedMultisetAccess,
     OrderedMultisetReadAccess,
 };
 pub use ordered_map::{OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess};

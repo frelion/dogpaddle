@@ -1,7 +1,7 @@
 # DogPaddle 算子与执行内核路线图
 
 本文定义 DogPaddle 算子体系和执行内核的演进阶段、语义边界、交付物与退出标准。
-它是实施路线；阶段 0/1、阶段 3 的 Distinct 和阶段 4 的 grouped Aggregate 最小纵向切片已完成，
+它是实施路线；阶段 0/1、阶段 3 的 Distinct、阶段 4 的 grouped Aggregate 和阶段 5 的 Inner Equi Join 最小纵向切片已完成，
 后续候选算子或用户接口仍不表示已经交付。当前精确能力以根目录 [`README.md`](README.md) 和各产品
 crate 的 README 为准。
 
@@ -17,7 +17,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 - 由其他应用或语言编译得到的持久化计划。
 
 这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 已用无状态算子、
-Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候选。路线首先回答：
+Distinct、grouped Aggregate 和 Inner Equi Join 证明这条分层路径，其余接口仍是候选。路线首先回答：
 
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
@@ -52,6 +52,7 @@ Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候�
 | Transform | RunningEventCount | 运行事件计数器 | 已明确为事件观测，不是关系 Aggregate |
 | Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
 | Transform | Aggregate | 按非空 group key 持续维护多个聚合结果 | 已完成阶段 4 最小纵向切片 |
+| Transform | InnerEquiJoin | 按非空等值 key 持续维护双边关系并有界发布 fan-out | 已完成阶段 5 最小纵向切片 |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
 | Transform | Extend | 保留输入并追加一个表达式列 | 保留为基础无状态算子 |
@@ -62,15 +63,15 @@ Distinct 和 grouped Aggregate 证明这条分层路径，其余接口仍是候�
 | Sink | PostgresSink | 将单输入 exact relation 幂等物化到独占的固定 Schema PostgreSQL 表 | 已有远端试点；TLS、在线演进与发布门仍待实施 |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十五个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十六个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
 当前 `dogpaddle-sql` 接受一条直接的 `INSERT INTO sqlite/postgres/discard(...) Query`，Scan 直接写成
 `FROM sequence/postgres_cdc/mysql_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，把 TableScan、
-Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL` 与非空 `GROUP BY` lowering 为现有 Definition DAG。
+Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL`、非空 `GROUP BY` 与受限 Inner Equi Join lowering 为现有 Definition DAG。
 SQL 聚合支持 `COUNT/SUM/AVG/MIN/MAX` 和纯分组；SQL 不建立 DogPaddle Table、View、catalog、独立状态或执行层。
-Join、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
+SQL Join 当前只接受 `JOIN` / `INNER JOIN ... ON` 的非空跨输入等值表达式合取。Outer/Cross/Natural/Using Join、residual、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
 必须在建库前拒绝。`SqlProgram::build` 持久化 canonical Flow Definition，`open` 继续以
 这份磁盘 Definition 为恢复真相，SQL 变更要求新路径或显式重建。
 
@@ -213,8 +214,8 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 ### 当前执行内核：线性多 Operation Station
 
 一个 Station 保存非空、有序的普通 Operation 列表，并在一个事务中执行首项和全部 Atomic 尾项，
-只让最终边界进入 `SubscribedLog`。Atomic 可以拥有关系状态、增加输出行或改变 diff；Scan 可以作为
-首项，Sink 和需要跨 turn 的 Exclusive Transform 必须独占。Flow build/open 持久并恢复当前 v1
+只让最终边界进入 `SubscribedLog`。Atomic 可以拥有关系状态、增加输出行或改变 diff；Scan 和需要 durable continuation 的 TurnTransform 可以作为
+首项，Sink 和 Exclusive Transform 必须独占。Flow build/open 持久并恢复当前 v1
 物理分组，不提供旧布局兼容路径。SQL build 先生成私有 logical arena，再按 Operation 身份、直接
 consumer edge 数量和 fan-out 边界确定性装配最大合法线性 Station；open 不重新分组。最终不变量、Definition 形状、
 事务/`AfterCommit` 规则和验证矩阵见
@@ -229,7 +230,7 @@ consumer edge 数量和 fan-out 边界确定性装配最大合法线性 Station�
 | 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、MySqlCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
 | 3（已完成最小切片） | 建立精确行权重状态 | `OrderedMultiset`、完整 canonical row identity、Distinct | 首个持久状态关系算子 |
 | 4（已完成最小切片） | 完成 Aggregate 与多重集算子 | grouped COUNT/SUM/AVG/MIN/MAX；global/set ops/UDF 待续 | 可持续维护首个分组聚合关系 |
-| 5 | 完成 Join 算子族 | Inner、Semi/Anti、Outer Join | 可组合的多关系增量计算 |
+| 5（已完成最小切片） | 完成 Join 算子族 | Inner Equi Join；residual、Semi/Anti、Outer 待续 | 首个可组合的多关系增量计算 |
 | 6 | 引入有界、顺序与时间语义 | Barrier、TopK、Window、watermark | 明确承载完成、排序和时间计算 |
 | 7 | 完成运行产品化与上层 API 就绪 | lifecycle、连接器协议、observability、capability catalog | 多种用户 API 可稳定构建同一内核 |
 
@@ -326,7 +327,7 @@ Definition 另存 Schema metadata。Field/Schema metadata 的输入顺序不影�
 
 所有表达式绑定同一个原始 input Schema，不能引用同一 SchemaAlign 新建的名称；空字段定义合法并
 保留行数与 diff。直接列引用和 diff 共享 Arrow buffer，派生表达式按 DataFusion 语义分配。
-UnionAll 和未来 Join 继续只接收 exact Schema；上层通过 SchemaAlign 显式构造公共输入结构。
+UnionAll 和 InnerEquiJoin 继续只接收 exact Schema；上层通过 SchemaAlign 显式构造公共输入结构。
 
 ### 类型能力
 
@@ -576,7 +577,7 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 - 完整 canonical row 直接作为 `OrderedMultiset` key，不把 hash 当记录身份；
 - codec、边界变化、负前缀/overflow、背压与 reopen 有对应 owner 证据；
 - SQL 只新增 `SELECT DISTINCT` lowering；普通 `UNION` 仍未支持；
-- Aggregate 已在阶段 4 建立自己的 group/admission/index state；Join 的专用状态仍按其语义另行设计。
+- Aggregate 已在阶段 4 建立自己的 group/admission/index state；InnerEquiJoin 在阶段 5 建立自己的双边 keyed state 和有界 continuation。
 
 ## 阶段 4：Aggregate 与多重集算子
 
@@ -645,20 +646,23 @@ zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema i
 
 ## 阶段 5：Join 算子族
 
+**状态：多 key Inner Equi Join 最小纵向切片已完成；residual、Semi/Anti 与 Outer Join 待续。**
+
 Join key expression、双边状态、有界 fan-out，以及 Join 与现有线性多 Operation Station 的边界见
-[`docs/plans/operator-pipelines-and-join.md`](docs/plans/operator-pipelines-and-join.md)。该提案把 logical operation、
-physical Station 和 arrangement 视为不同层次；Join 作为多输入 Station 的首 Operation，并直接接入已经完成的
+[`docs/plans/operator-pipelines-and-join.md`](docs/plans/operator-pipelines-and-join.md)。该设计把 logical operation、
+physical Station 和 arrangement 视为不同层次；已实现的 Join 作为多输入 Station 的首 Operation，并直接接入
+已经完成的
 原子尾链装配机制。
 
 ### 目标
 
-在阶段 3 已证明的完整行 weight invariant 和 materialized oracle 上独立设计多输入增量 Join。优先组合
-现有有序 Store 结构，但不假定 Distinct 或 Aggregate 已经提供 Join arrangement。
+在阶段 3 已证明的完整行 weight invariant 上实现多输入增量 Join。当前 Inner Join 直接组合现有
+`PartitionedMultiset` 和 `Cell`，左右状态由算子私有拥有，不假定 Distinct 或 Aggregate 已经提供 arrangement。
 
 ### 实现顺序
 
-1. 单 key Inner Equi-Join；
-2. 多 key Equi-Join；
+1. 单 key Inner Equi-Join（已完成）；
+2. 多 key Equi-Join（已完成）；
 3. equi key 后的 residual predicate；
 4. Semi Join；
 5. Anti Join；
@@ -693,17 +697,19 @@ Outer Join 还要维护匹配数量：
   acknowledgement 派生；
 - 未完成输入完整重放不重复加入 Join state。
 
-### 退出标准
+### 最小切片证据与后续退出标准
 
-系统排列并验证：
+Inner Equi Join 已验证：
 
 - left then right、right then left 和交错输入；
 - 不同物理分批；
 - 重复记录和非单位 diff；
 - 双侧插入、撤回和更新；
-- unmatched/matched 状态转换；
-- backpressure、reopen、overflow 和 corruption；
-- Inner、Semi/Anti、Outer 各自的独立关系 oracle。
+- NULL key、unmatched/matched 状态、负前缀与 overflow；
+- 有界分页、backpressure、reopen 和 corruption；
+- SQL qualified column、同名字段、key expression、确定性 Station grouping 和 build/open。
+
+阶段 5 完整退出仍要求 residual、Semi/Anti 与 Outer 各自的独立关系 oracle 和 nullability 证据。
 
 ## 阶段 6：有界、顺序与时间算子
 
@@ -940,13 +946,14 @@ PostgresCdcScan
 exact-row weights（已完成）
 → Distinct（已完成）
 → Group Aggregate：COUNT/SUM/AVG/MIN/MAX（最小切片已完成）
+→ Inner Equi Join（最小切片已完成）
 → Global Aggregate / multiset set ops / aggregate UDF
-→ Inner Join
 ```
 
 Distinct 用完整 canonical row 与 `OrderedMultiset` 建立 checked weight 语义；Aggregate 组合
 `OrderedMap`、`PartitionedMultiset` 与 `Cell`，新增私有 group ID、exact admission、Fold/Extrema
-descriptor 和有序 argument layout。Join 的 keyed arrangement、fan-out 和 continuation 仍按 Join 语义另行设计。
+descriptor 和有序 argument layout。Inner Equi Join 用两份私有 `PartitionedMultiset` 和一个最小
+continuation 持久化双边关系与有界 fan-out；没有预建共享 arrangement。
 
 ## 开放决策
 
@@ -957,7 +964,7 @@ descriptor 和有序 argument layout。Join 的 keyed arrangement、fan-out 和 
 - ResultLog 是否只使用 build 时固定的 `SubscribedLog` subscriptions；若要动态注册，租约、过期和回收
   应如何扩展 Store 契约？
 - Materialize 如何稳定编码完整 Record key、weight 和分页 continuation？
-- Join 的 keyed arrangement、fan-out 和有界 continuation 应该如何持久化？
+- 何时有至少两个真实消费者和 profile 证据，值得把 Join 私有 keyed state 提升为可复用 arrangement？
 - Consolidate 的显式作用域是一个 Change、barrier 区间还是完整关系？
 - Date/Timestamp/Decimal 上哪些额外 DataFusion operator/type 组合值得补齐证据并加入已承诺集合？
 - 时间和随机表达式来自输入、持久执行上下文还是 control signal？
@@ -965,7 +972,7 @@ descriptor 和有序 argument layout。Join 的 keyed arrangement、fan-out 和 
 - bounded Sort、持续 TopK 和 Window 各自的完成及 retention 边界是什么？
 - 多个 Flow 是否共享输入 `SubscribedLog` 或 arrangement；若共享，由哪个组合根声明 subscriptions 并拥有 retention？
 - 何时引入 partition/exchange，而不破坏唯一 writer 和确定性提交？
-- SQL 在 Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
+- SQL 在 residual/Outer Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
   capability/introspection？
 
 ## 内核稳定准入定义

@@ -117,7 +117,7 @@ impl FlowFactory {
     /// # Errors
     ///
     /// Returns an error if `station` belongs to another factory, the existing
-    /// program ends in an exclusive Operation, or `definition` is not a
+    /// program requires a durable boundary, or `definition` is not a
     /// single-input atomic transform. Failure leaves the Station unchanged.
     pub fn append<D>(
         &mut self,

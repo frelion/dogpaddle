@@ -63,6 +63,67 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
 }
 
 #[test]
+fn parse_accepts_inner_equality_join_conjunctions() {
+    for keyword in ["JOIN", "INNER JOIN"] {
+        SqlProgram::parse(&format!(
+            "INSERT INTO discard() \
+             SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+             FROM sequence(start => 0) AS left_scan \
+             {keyword} sequence(start => 1) AS right_scan \
+             ON left_scan.value + 1 = right_scan.value \
+             AND left_scan.value = right_scan.value - 1"
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
+fn parse_rejects_join_types_constraints_and_residuals_outside_v1() {
+    let queries = [
+        (
+            "left join",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             LEFT JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value = right_scan.value",
+        ),
+        (
+            "using",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             JOIN sequence(start => 1) AS right_scan USING (value)",
+        ),
+        (
+            "natural join",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             NATURAL JOIN sequence(start => 1) AS right_scan",
+        ),
+        (
+            "cross join",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             CROSS JOIN sequence(start => 1) AS right_scan",
+        ),
+        (
+            "non-equality",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value < right_scan.value",
+        ),
+        (
+            "residual",
+            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
+             JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value = right_scan.value AND left_scan.value > 0",
+        ),
+    ];
+
+    for (case, query) in queries {
+        assert!(
+            SqlProgram::parse(&format!("INSERT INTO discard() {query}")).is_err(),
+            "accepted {case}"
+        );
+    }
+}
+
+#[test]
 fn parse_rejects_non_programs_and_invalid_endpoint_arguments() {
     let cases = [
         ("bare query", "SELECT 1"),
@@ -229,12 +290,6 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
     let queries = [
         ("ordinary table", "SELECT * FROM ordinary_table"),
         (
-            "join",
-            "SELECT left_scan.value FROM sequence(start => 0) AS left_scan \
-             JOIN sequence(start => 0) AS right_scan \
-             ON left_scan.value = right_scan.value",
-        ),
-        (
             "sort",
             "SELECT value FROM sequence(start => 0) ORDER BY value",
         ),
@@ -381,6 +436,13 @@ fn invalid_plan_shapes_fail_without_creating_a_flow() {
             "SELECT left_scan.value \
              FROM sequence(start => 0) AS left_scan, \
                   sequence(start => 0) AS right_scan",
+        ),
+        (
+            "same-side join equality",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             JOIN sequence(start => 1) AS right_scan \
+             ON left_scan.value = left_scan.value",
         ),
         (
             "union field count",

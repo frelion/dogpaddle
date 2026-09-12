@@ -1,4 +1,4 @@
-use std::{borrow::Cow, marker::PhantomData, num::NonZeroUsize, ops::Bound};
+use std::{borrow::Cow, marker::PhantomData, ops::Bound};
 
 use crate::{
     DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, ScanDirection, ScanLimit,
@@ -40,6 +40,18 @@ pub struct MultisetEntry<K> {
     pub key: K,
     /// Positive multiplicity stored for the key.
     pub multiplicity: u64,
+}
+
+/// One fully decoded, owned page from a partitioned-multiset scan.
+///
+/// The continuation is the last key in this page when more entries remain in
+/// the selected direction. Passing it to the next scan excludes that key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisetPage<K> {
+    /// Decoded entries in the requested order.
+    pub entries: Vec<MultisetEntry<K>>,
+    /// Last returned key when another page remains.
+    pub continuation: Option<K>,
 }
 
 impl MultiplicityChange {
@@ -194,8 +206,10 @@ pub(super) fn first_entry<K: StoreKey>(
         data,
         key_prefix,
         ScanDirection::Ascending,
-        NonZeroUsize::MIN,
+        None,
+        ScanLimit::new(1, usize::MAX).expect("one item and usize::MAX are valid scan limits"),
     )?
+    .entries
     .pop())
 }
 
@@ -207,8 +221,10 @@ pub(super) fn last_entry<K: StoreKey>(
         data,
         key_prefix,
         ScanDirection::Descending,
-        NonZeroUsize::MIN,
+        None,
+        ScanLimit::new(1, usize::MAX).expect("one item and usize::MAX are valid scan limits"),
     )?
+    .entries
     .pop())
 }
 
@@ -216,30 +232,58 @@ pub(super) fn scan_entries<K: StoreKey>(
     data: &ReadDataAccess<'_>,
     key_prefix: &[u8],
     direction: ScanDirection,
-    max_items: NonZeroUsize,
-) -> Result<Vec<MultisetEntry<K>>, StoreError> {
+    resume_after: Option<&K>,
+    limit: ScanLimit,
+) -> Result<MultisetPage<K>, StoreError> {
     let upper = prefix_successor(key_prefix);
     let upper_bound = upper.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+    let resume = data.poison_on_error(
+        resume_after
+            .map(|key| {
+                key.encode_key().map(|encoded| {
+                    let mut framed = Vec::with_capacity(key_prefix.len() + encoded.as_ref().len());
+                    framed.extend_from_slice(key_prefix);
+                    framed.extend_from_slice(encoded.as_ref());
+                    framed
+                })
+            })
+            .transpose(),
+    )?;
     let raw = data.scan(
         (Bound::Included(key_prefix), upper_bound),
         direction,
-        None,
-        ScanLimit::new(max_items.get(), usize::MAX)
-            .expect("a non-zero item count and usize::MAX are valid scan limits"),
+        resume.as_deref(),
+        limit,
     )?;
-    let decoded = raw
-        .items
-        .into_iter()
-        .map(|(key, value)| {
-            let key = key
-                .strip_prefix(key_prefix)
-                .expect("the encoded scan range admits only this key prefix");
-            let key = K::decode_key(Cow::Owned(key.to_vec())).map_err(StoreError::from)?;
-            let multiplicity = decode_multiplicity(&value)?;
-            Ok(MultisetEntry { key, multiplicity })
-        })
-        .collect::<Result<Vec<_>, StoreError>>();
-    data.poison_on_error(decoded)
+    let continuation = data.poison_on_error(
+        raw.items
+            .last()
+            .filter(|_| raw.limited)
+            .map(|(key, _)| {
+                let key = key
+                    .strip_prefix(key_prefix)
+                    .expect("the encoded scan range admits only this key prefix");
+                K::decode_key(Cow::Borrowed(key))
+            })
+            .transpose(),
+    )?;
+    let entries = data.poison_on_error(
+        raw.items
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key
+                    .strip_prefix(key_prefix)
+                    .expect("the encoded scan range admits only this key prefix");
+                let key = K::decode_key(Cow::Owned(key.to_vec()))?;
+                let multiplicity = decode_multiplicity(&value)?;
+                Ok(MultisetEntry { key, multiplicity })
+            })
+            .collect::<Result<Vec<_>, StoreError>>(),
+    )?;
+    Ok(MultisetPage {
+        entries,
+        continuation,
+    })
 }
 
 fn decode_multiplicity(encoded: &[u8]) -> Result<u64, StoreError> {

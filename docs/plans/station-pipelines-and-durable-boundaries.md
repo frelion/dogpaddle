@@ -17,6 +17,7 @@
 pub enum OperationKind {
     Scan,
     AtomicTransform(NonZeroU32),
+    TurnTransform(NonZeroU32),
     ExclusiveTransform(NonZeroU32),
     Sink(NonZeroU32),
 }
@@ -24,12 +25,15 @@ pub enum OperationKind {
 
 `AtomicTransform` 表示它能在一次事务中完整处理一个输入 Change。它可以持久化状态、增加输出行或改变 diff；身份不能从空 data、具体 tag 或拓扑位置推断。
 
-`ExclusiveTransform` 使用完整 turn 协议并独占 Station。表达式算子按 Definition 实例检查确定性：合格实例是 Atomic，不合格实例保持现有单算子绑定和执行行为，但没有融合资格。Aggregate 对全部 group expression 和 aggregate argument 执行同样检查。
+`TurnTransform` 使用完整 turn/continuation 协议，只能位于 Station 首项，但可以带单输入 Atomic 尾链。它必须能从未变化的 durable state 安全重放未提交 turn；continuation 和尾项状态随同一次事务提交。
+
+`ExclusiveTransform` 使用完整 turn 协议并独占 Station，表示它需要在下游执行前先形成独立持久化输出边界。表达式算子按 Definition 实例检查确定性：合格实例是 Atomic，不合格实例保持现有单算子绑定和执行行为，但没有融合资格。Aggregate 对全部 group expression 和 aggregate argument 执行同样检查。
 
 装配规则只有以下几条：
 
 - Scan 只能在 ordinal `0`，可以带 Atomic 尾链。
 - N 输入 Atomic 可以在 ordinal `0`；ordinal 大于 `0` 时必须是单输入 Atomic。
+- N 输入 TurnTransform 只能在 ordinal `0`，可以带单输入 Atomic 尾链。
 - Exclusive 与 Sink 必须独占 Station，包括 Discard。
 - 首 Operation 的 arity 是 Station 的外部输入数量；末 Operation 的 Schema 是 Station 的最终输出 Schema。
 
@@ -73,7 +77,7 @@ pub trait AtomicOperation: Send + 'static {
 
 Atomic Operation 不保存当前输入，不产生 `AfterCommit`，不接收事务启动或提交能力，不执行外部 I/O。所有影响重放的状态都经当前 `TransactionAccess` 更新。即使它已经成功，后续 Operation、output admission 或 commit 失败也必须能从未变化的 durable state 重试。
 
-Scan、Sink 和跨 turn Transform 使用 `TurnOperation`，即原有 `turn → PreparedTurn → Action + AfterCommit` 协议。运行实例统一表示为：
+Scan、Sink、TurnTransform 和 ExclusiveTransform 使用 `TurnOperation`，即原有 `turn → PreparedTurn → Action + AfterCommit` 协议。运行实例统一表示为：
 
 ```rust
 pub enum Operation {
@@ -161,7 +165,7 @@ Scan → Filter → Aggregate → Select → Sink
 [Scan B] ─┘
 ```
 
-分叉前的线性尾部可以留在 producer Station；分叉后的每个分支独立成链。Exclusive 前后都有持久边界，Sink 独占。v1 使用最大合法线性融合，不设链长阈值或成本模型。Scan ID、稠密 Transform Station ID、Sink ID 和 64 MiB output capacity 规则保持稳定。
+分叉前的线性尾部可以留在 producer Station；分叉后的每个分支独立成链。TurnTransform 可以吸收后续单输入 Atomic；Exclusive 前后都有持久边界，Sink 独占。v1 使用最大合法线性融合，不设链长阈值或成本模型。Scan ID、稠密 Transform Station ID、Sink ID 和 64 MiB output capacity 规则保持稳定。
 
 `open` 只恢复持久化的 Flow Definition，不重新编译 SQL 或重新分组。
 
@@ -178,6 +182,6 @@ Scan → Filter → Aggregate → Select → Sink
 
 普通工作区 gate 不依赖 Java 或 PostgreSQL。现有 PostgreSQL gate 用一条 CDC 后接状态 Atomic 的链覆盖外部 ACK、回滚和 reopen 接缝。
 
-## 后续 Join 边界
+## Join 边界
 
-Join 作为多输入 Operation 位于 Station 首项。若它需要分页 continuation，则声明 `ExclusiveTransform(2)` 并独占；它完成一次 Change 后，未来可以在证明完整消费契约时升级为 Atomic，再自然吸收单输入尾链。Join key 表达式归 Join Definition 所有，融合不要求预先创建 `func(A)` 的持久化辅助列。
+Join 作为多输入 `TurnTransform(2)` 位于 Station 首项。它用 durable continuation 分页处理无界 fan-out，并可在同一 Station 中把每页输出继续交给 Filter、Projection 等单输入 Atomic；尾项错误、背压或 commit failure 会把该页的 Join continuation、状态与尾项状态共同回滚。Join key 表达式归 Join Definition 所有，融合不要求预先创建 `func(A)` 的持久化辅助列。

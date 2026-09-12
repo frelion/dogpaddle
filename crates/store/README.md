@@ -78,7 +78,7 @@ Subscribed log 的 capacity 是防止 producer 因 backlog 无限增长而淹没
 下面的例子只使用公共 API，并把六种结构的更新放进真实事务边界：
 
 ```rust,no_run
-use std::{num::{NonZeroU64, NonZeroUsize}, path::Path};
+use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_store::{
     Cell, OrderedMap, OrderedMultiset, PartitionedMultiset, Queue, ScanDirection,
@@ -160,8 +160,12 @@ fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let partition = extrema
         .read(snapshot.access())?
         .partition(&7)?
-        .scan(ScanDirection::Descending, NonZeroUsize::MIN)?;
-    assert_eq!(partition[0].multiplicity, 1);
+        .scan(
+            ScanDirection::Descending,
+            None,
+            ScanLimit::new(1, 1024)?,
+        )?;
+    assert_eq!(partition.entries[0].multiplicity, 1);
     Ok(())
 }
 ```
@@ -223,9 +227,10 @@ page 拥有全部数据，可以在 transaction 或 Store 关闭后继续使用�
 entry projection，页面解码错误仍使所属事务中毒，页面返回后的业务错误由调用方决定如何处理事务。
 
 第一条匹配项单独超过 byte limit 时返回 `StoreError::ItemTooLarge`。这是唯一可调整 limit 后在同一
-事务重试的 Store 错误，不会使事务中毒。`PartitionedMultiset` 的 scan 更窄：它只接受方向和非零
-最大条目数，并直接返回拥有型 `Vec<MultisetEntry<K>>`；`first` 与 `last` 是 Top-K/极值维护的常用
-单项路径。
+事务重试的 Store 错误，不会使事务中毒。`PartitionedMultiset` 的 scan 只省略范围参数；它接受方向、
+排他的 `resume_after` 与同一个 `ScanLimit`，并把 partition framing、key 和 multiplicity 的编码字节
+计入 byte limit，返回拥有型 `MultisetPage<K>`。`first` 与 `last` 是
+Top-K/极值维护的常用单项路径。
 
 ## 错误与事务中毒
 

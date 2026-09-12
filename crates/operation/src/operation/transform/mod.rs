@@ -4,6 +4,7 @@ pub(crate) mod aggregate;
 pub(crate) mod distinct;
 pub(crate) mod extend;
 pub(crate) mod filter;
+pub(crate) mod inner_join;
 pub(crate) mod project;
 pub(crate) mod running_event_count;
 pub(crate) mod schema_align;
@@ -19,6 +20,10 @@ pub use extend::{
     ExtendDefinition, ExtendDefinitionError, ExtendError, ExtendOperation, ExtendSchemaError,
 };
 pub use filter::{FilterDefinition, FilterError, FilterOperation, FilterSchemaError};
+pub use inner_join::{
+    InnerEquiJoinDefinition, InnerEquiJoinDefinitionError, InnerEquiJoinError,
+    InnerEquiJoinOperation, InnerEquiJoinSchemaError,
+};
 pub use project::{ProjectDefinition, ProjectError, ProjectOperation, ProjectSchemaError};
 pub use running_event_count::{
     RunningEventCountDefinition, RunningEventCountError, RunningEventCountOperation,

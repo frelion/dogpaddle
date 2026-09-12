@@ -139,10 +139,7 @@ pub(super) fn append_operation(
         .operations
         .last()
         .expect("a declared Station starts with one Operation");
-    if !matches!(
-        last.kind(),
-        OperationKind::Scan | OperationKind::AtomicTransform(_)
-    ) {
+    if !last.kind().allows_atomic_tail() {
         return Err(TopologyError::StationCannotBeExtended(station_id));
     }
     if !matches!(
@@ -163,12 +160,7 @@ fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), Topol
         let Some((first, tail)) = station.operations.split_first() else {
             return Err(TopologyError::EmptyOperationList(station.id.clone()));
         };
-        if !tail.is_empty()
-            && !matches!(
-                first.kind(),
-                OperationKind::Scan | OperationKind::AtomicTransform(_)
-            )
-        {
+        if !tail.is_empty() && !first.kind().allows_atomic_tail() {
             return Err(TopologyError::StationCannotBeExtended(station.id.clone()));
         }
         for (operation, definition) in tail.iter().enumerate() {

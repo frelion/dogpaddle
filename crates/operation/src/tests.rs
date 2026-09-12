@@ -26,8 +26,9 @@ use crate::{
         },
         transform::{
             AggregateCall, AggregateDefinition, DistinctDefinition, ExtendDefinition,
-            FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            FilterDefinition, InnerEquiJoinDefinition, ProjectDefinition,
+            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
         },
     },
 };
@@ -87,7 +88,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 16] {
     [
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
@@ -181,7 +182,12 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 15] {
                 .unwrap(),
             ),
         ),
+        (16, Box::new(join_definition())),
     ]
+}
+
+fn join_definition() -> InnerEquiJoinDefinition {
+    InnerEquiJoinDefinition::try_new([(col("value"), col("value"))], ["left", "right"]).unwrap()
 }
 
 fn valid_schema() -> SchemaRef {
@@ -194,6 +200,34 @@ fn invalid_schema() -> SchemaRef {
         DataType::UInt64,
         false,
     )]))
+}
+
+#[test]
+fn turn_transform_kind_preserves_arity_output_and_tail_capability() {
+    let kind = OperationKind::TurnTransform(NonZeroU32::new(2).unwrap());
+
+    assert_eq!(kind.input_count(), 2);
+    assert!(!kind.is_scan());
+    assert!(!kind.is_sink());
+    assert!(!kind.is_atomic());
+    assert!(kind.allows_atomic_tail());
+    assert!(kind.has_output());
+}
+
+#[test]
+fn turn_transform_accepts_the_full_turn_materializer() {
+    let definition = TestDefinition {
+        kind: OperationKind::TurnTransform(NonZeroU32::MIN),
+        binding: TestBinding::UnexpectedOutput,
+    };
+
+    let binding = (&definition as &dyn OperationDefinition)
+        .bind(&[valid_schema()])
+        .unwrap();
+    let operation = binding
+        .materialize(DataInstances::new(), crate::RuntimeResource::none())
+        .unwrap();
+    assert!(matches!(operation, crate::operation::Operation::Turn(_)));
 }
 
 #[test]

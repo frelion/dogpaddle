@@ -1,10 +1,10 @@
-# Join 后续设计说明
+# Join 设计与实现说明
 
-状态：提案  
-日期：2026-09-11
+状态：Inner Equi Join 首个切片已实现
+日期：2026-09-12
 
 线性 Station 与 SQL deterministic grouping 已经直接落入当前 v1：一个 Station 保存一个非空、有序的普通 Operation 列表，列表共享事务且只持久化最终输出。其 canonical 设计、事务语义、装配规则和验证证据统一记录在
-[`station-pipelines-and-durable-boundaries.md`](station-pipelines-and-durable-boundaries.md)。本文只说明 Join 的后续语义、状态和实施顺序。
+[`station-pipelines-and-durable-boundaries.md`](station-pipelines-and-durable-boundaries.md)。本文记录已落地的 Inner Equi Join 语义、状态与后续 Join family 边界。
 
 ## 目标与决策
 
@@ -14,11 +14,11 @@
 ... JOIN right ON normalize(left.a) = right.b
 ```
 
-不需要先创建 helper Extend，也不产生只为 key 计算服务的中间持久日志。需要跨 turn continuation 的 Join 作为独占 Station；若未来证明它能完整消费一个 Change，则可作为多输入 Atomic 位于 Station 首项并吸收后续单输入 Atomic。
+不需要先创建 helper Extend，也不产生只为 key 计算服务的中间持久日志。需要跨 turn continuation 的 Join 声明为多输入 `TurnTransform`，位于 Station 首项并可吸收后续单输入 Atomic；Join 的当前页、continuation、尾项状态和最终 output 在同一事务提交。
 
 当前决策是：
 
-- Join Definition 持久化非空、有序的左右 key pairs 和显式 output mapping；
+- Join Definition 持久化非空、有序的左右 key pairs 和左后右的完整 output names；
 - port `0` 永久表示 left，port `1` 永久表示 right；
 - 第一版只实现 SQL `=` 语义的 Inner equi Join；
 - Join 私有拥有左右两份 keyed relation state，不先建立共享 arrangement；
@@ -40,7 +40,7 @@
 
 ## Definition 与 Schema binding
 
-建议使用下一个稳定 tag `16`：
+当前稳定 tag 是 `16`：
 
 ```text
 JoinKeyPair {
@@ -50,7 +50,7 @@ JoinKeyPair {
 
 InnerEquiJoinDefinition {
     keys: NonEmpty<JoinKeyPair>,
-    output_fields: explicit collision-free mapping,
+    output_names: left-all then right-all,
 }
 ```
 
@@ -62,8 +62,7 @@ bind 必须验证：
 - 每个 left expression 只绑定 input `0`，每个 right expression 只绑定 input `1`；
 - 每对 key 在显式 coercion 后具有完全相同的类型；
 - key 类型具有稳定、无碰撞的 canonical equality encoding；
-- output mapping 中字段名唯一，类型、nullability 与 metadata 完整确定；
-- Inner Join 的输出字段来自选定的 left/right 输入字段；
+- output names 数量等于左右字段总数且名称唯一，类型、nullability 与 metadata 按左后右完整保留；
 - 每个表达式和最终 output 都通过现有 DogPaddle Schema guard。
 
 SQL `=` 下，只要复合 key 的任一分量为 NULL，该行就不与对侧匹配。本侧记录仍须进入 state，确保以后 retract 可以做 exact admission。`IS NOT DISTINCT FROM` 的 NULL equality 是独立语义，不能复用同一 Definition。
@@ -75,13 +74,10 @@ DataFusion logical `DFSchema` 可以用 qualifier 区分 `left.id` 和 `right.id
 lowering 应携带类似以下私有信息：
 
 ```text
-LoweredRelation {
-    node,
-    logical_fields: [(qualifier, ordinal) -> unique physical field],
-}
+LoweredRelation { node, physical_schema }
 ```
 
-表达式先按 logical qualifier/ordinal 解析，再改写为对应输入侧的唯一物理字段。Join Definition 保存显式 output mapping；Join 后的 projection 继续由 SchemaAlign 表达，并可由现有 grouping 追加到 Join 所在 Station。
+DataFusion logical `DFSchema` 保留 qualifier；lowering 用它解出字段 ordinal，再按 `physical_schema` 同一 ordinal 改写为唯一物理字段名。不另存一张 column map。Join Definition 只保存左后右的全量 output names；Join 后的 projection 继续由 SchemaAlign 表达，并可由现有 grouping 追加到 Join 所在 Station。
 
 对 `JOIN ... ON ...`，SQL lowering 按以下顺序工作：
 
@@ -150,24 +146,22 @@ Store 在返回前完成 item/byte admission、整页复制和 decode；错误�
 
 Join 对一个完整 Claim 使用两阶段协议：
 
-1. `PreflightOwn`：按行序检查完整 Change 的本侧 exact admission 和最终权重，不修改业务 state；
-2. `PreflightMatches`：分页遍历全部对侧候选，检查 row decode、residual、output diff 和关系权重 overflow；
-3. `Emit`：只有完整预检成功后才再次分页 probe，逐页提交 state、output 和 continuation；最后一页完成输入。
+1. 没有 continuation 时，先按行序检查完整 Change 的本侧 exact admission 和最终权重，不修改业务 state，并在同一事务内直接开始 `Probe`；只有遇到工作边界才持久化 continuation；
+2. `Probe` 在固定 item/byte 工作预算内遍历全部对侧候选，空分区也计一个 work item；它检查 row decode 和 output diff，不产生 output；
+3. `Emit` 只有在完整 Probe 成功后才再次遍历，同一 turn 可聚合多个小分区，提交本侧 state、output 和 continuation；最后一块工作完成输入。
 
 第二遍 range read 保证当前 Claim 数据决定的业务错误在其任何 state/output 发布前出现。若真实性能数据证明读放大不可接受，再评估每个 key 的 weight summary。
 
-`JoinContinuation` 至少保存：
+`JoinContinuation` 只保存：
 
-- 当前 input port 和 input row index；
-- 当前 canonical key、input diff 与必要的 encoded row；
-- `PreflightOwn | PreflightMatches | Emit` phase；
-- probe resume key；
-- 本侧 adjustment 是否已经提交；
-- Change 内下一待处理位置；
+- 当前 input port；
+- `Probe | Emit` phase；
+- 当前 input row ordinal；
+- 对侧 partition 的排他 resume key。
 
-Operation 看不到 Subscription offset，也不复制 input position 或 Change fingerprint。reopen 后仍由 Subscription 提供同一完整 Claim；continuation 只保存继续有界工作所需的业务位置。
+canonical key、input row、diff、Subscription position 和 Change fingerprint 都不重复持久化。reopen 后仍由 Subscription 提供同一完整 Claim，运行实例从该 Claim 重建临时 row/key cache；Station 的 durable active pin 保证 continuation 期间对侧状态不变，因此 resume key 也不需要额外存在性校验。
 
-Emit 首个 turn 原子提交本侧 adjustment、第一页 output 和下一 continuation。中间页使用 `Action::Commit`；最后一页使用 `Action::Complete`，提交最终 output、清除 continuation 并完成输入。背压和 fault 保留 durable identity；reopen 从已提交 phase/resume key 继续。
+Emit 在当前 row 的最后一页才调整该 row 的本侧权重；一个 turn 可以按固定总预算完成并聚合多个小分区。预算不足时先提交已有工作，下一 turn 再处理当前 row；只有空 turn 可以单独推进一个超过 byte budget 的不可拆项。中间块使用 `Action::Commit`；最后一块原子提交最终 output、清除 continuation 并用 `Action::Complete` 完成输入。背压、尾链错误和 commit failure 一起回滚本块；reopen 从已提交 phase/row/resume key 继续。
 
 ## residual 与 Join family
 
@@ -204,9 +198,9 @@ ArrangementSpec {
 
 | 阶段 | 工作 | 退出标准 |
 | --- | --- | --- |
-| J0 Store/codec | 给 `PartitionedMultiset` 增加 item/byte 分页和 continuation；补 canonical row decoder 与 composite key codec；验证 roundtrip、NULL、损坏和 resume | Join 只依赖公共 Store collection contract 即可有界扫描并恢复完整 row |
-| J1 Inner Operation | 新增 tag `16`、key pairs、三个资源、whole-Claim preflight、分页 Emit；覆盖端口交错、diff、NULL、retract、overflow、fault 和 reopen | 每页 state/output/continuation 同事务提交，最终页完成 Claim，恢复不重不漏 |
-| J2 SQL lowering | 引入 logical column identity；从 `ON` 提取 equi pairs 与显式 cast；先拒绝 residual；接入现有 arena、确定性分组 pass 和当前 v1 Flow Definition | `JOIN ON deterministic_func(left.a) = right.b` 没有 helper Station/log，build/open 保持相同 grouping 和 relation |
+| J0 Store/codec（已完成） | 给 `PartitionedMultiset` 增加 item/byte 分页和 continuation；补 canonical row decoder 与 composite key codec；验证 roundtrip、NULL、损坏和 resume | Join 只依赖公共 Store collection contract 即可有界扫描并恢复完整 row |
+| J1 Inner Operation（已完成） | 新增 tag `16`、key pairs、三个资源、whole-Claim preflight、分页 Emit；覆盖端口交错、diff、NULL、retract、overflow、fault 和 reopen | 每块 state/output/continuation 同事务提交，最终块完成 Claim，恢复不重不漏 |
+| J2 SQL lowering（已完成） | 用私有 `LoweredRelation` 保留物理 Schema；按 logical Schema ordinal 改写 qualified column；从 `ON` 提取 equi pairs 与显式 cast；先拒绝 residual；接入现有 arena、确定性分组 pass 和当前 v1 Flow Definition | `JOIN ON deterministic_func(left.a) = right.b` 没有 helper Station/log，build/open 保持相同 grouping 和 relation |
 | J3 Join family | 加入 residual，再依次实现 Semi/Anti、Left Outer、Right/Full Outer | 每种语义有独立 multiset oracle 和 nullability witness |
 | J4 优化 | 根据 profile 决定 weight summary、单 Flow arrangement reuse、join order 或成本模型 | 只引入由真实 workload 证明收益的状态与规则 |
 

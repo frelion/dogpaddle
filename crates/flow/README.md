@@ -3,7 +3,8 @@
 `dogpaddle-flow` 用公共 `FlowFactory` 定义、构建和重新打开一条持久化 Flow；成功返回的
 `Flow` 只表示运行态，不承担声明、构建或打开职责。每个 Station 是一个持久化与事务边界，内部
 保存一条非空、线性的 Operation 序列。首项决定输入数量和 Scan/Sink 角色，后续项只能是单输入
-atomic transform；Station 只把末项结果写入持久化 output。Flow 不枚举具体算子，拓扑仍只连接 Station。
+atomic transform；Station 只把末项结果写入持久化 output。Scan、`AtomicTransform` 和 `TurnTransform`
+可以带 atomic 尾链，`ExclusiveTransform` 与 Sink 必须独占。Flow 不枚举具体算子，拓扑仍只连接 Station。
 
 ## 构建 Flow
 
@@ -73,9 +74,10 @@ Station ID 返回 `FlowError::Schema`。拓扑、容量、Schema、Operation dat
 
 `append(station, definition)` 在 Station 末尾追加一个单输入 atomic transform。它可以拥有 Store
 状态、改变 Schema、扩展行数或改变 diff，但必须在一次调用中完整处理当前 Change，且所有状态修改
-都能随 Station 事务回滚。Scan 可以作为首项并吸收 atomic 尾链；多输入 atomic transform 只能作为
-首项；exclusive transform 与所有 Sink 必须独占 Station。foreign `StationRef`、非 atomic 尾项和
-独占 Station 的追加请求会立即失败，且不会部分修改 Factory。
+都能随 Station 事务回滚。Scan、任意 arity 的 atomic transform，以及拥有 durable continuation 且
+可安全重放未提交 turn 的 `TurnTransform`，都可以作为首项并吸收 atomic 尾链；多输入 Operation
+仍只能作为首项。需要独立持久化输出边界的 `ExclusiveTransform` 与所有 Sink 必须独占 Station。
+foreign `StationRef`、非 atomic 尾项和独占 Station 的追加请求会立即失败，且不会部分修改 Factory。
 
 ### 外部算子的运行配置
 

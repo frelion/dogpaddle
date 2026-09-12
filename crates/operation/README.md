@@ -17,8 +17,8 @@ batch 的合并与 flush。Change 的行位置是事件顺序；Operation 必须
 其声明的语义产生有序输出，不能把未 consolidation 的输入当作可交换集合。除非将来接收到
 独立定义的窗口、barrier 或 flush 信号，Operation 的展平输出事件序列和最终业务状态必须在稳定
 合并或切分 Change 后保持不变，也不能因同一个 Change 被分成多少个 `Commit` turn 而改变。显式声明
-跨端口无序的多输入关系算子只保持每个端口的事件子序列和最终关系状态；当前 `UnionAll` 的跨端口
-交织由 Station 调度，可能随分批变化。除此之外，物理 Change 边界和 turn 边界都不能被算子当成
+跨端口无序的多输入关系算子只保持每个端口的事件子序列和最终关系状态；`UnionAll` 与
+`InnerEquiJoin` 的跨端口交织由 Station 调度，可能随分批变化。除此之外，物理 Change 边界和 turn 边界都不能被算子当成
 业务事件。这个比较域要求每种分批的输入和对应输出都能
 由其声明的 Arrow 类型物理表示；例如不能要求 `Utf8` offset 已溢出的单个 `RecordBatch` 成功构造。
 
@@ -49,7 +49,8 @@ Project 按稳定顶层字段索引绑定输入，拒绝越界、重复或重排
 并以选中字段的完整 Schema 作为 output；Filter 用绑定后的 Boolean 表达式保持 input Schema；
 Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability；Select 从同一个原始输入计算有序的完整输出列；
 `SchemaAlign` 从同一个原始输入计算有序字段，并显式声明名称、目标 nullability、Field metadata
-和 Schema metadata；`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；Discard 接受任意
+和 Schema metadata；`UnionAll` 要求所有输入 Schema 完全相同并原样转发 Change；`InnerEquiJoin`
+分别绑定两个输入上的非空等值键，并固定输出左侧全部字段后接右侧全部字段；Discard 接受任意
 合法的单一输入且没有 output；`SqliteSink` 还把合法输入编译为确定的 `STRICT`
 表布局、绑定 SQL 和无损行编码；`PostgresSink` 把单一 exact relation 输入绑定为固定的 `PostgreSQL`
 表布局与参数化语句。无需额外的
@@ -62,15 +63,27 @@ Extend 由绑定表达式唯一推导一个新增字段的类型和 nullability�
 副作用或产生 `AfterCommit`。同一 Station 中后续 Operation、最终 output 或 commit 失败时，当前
 Operation 的全部重放相关变化必须能随事务回滚。
 
+需要多次 turn 才能完成一个 Change、但能从未变化的 durable state 安全重放未提交 turn 的 Transform
+显式声明为 `TurnTransform`。它实现完整的 `TurnOperation` 协议，只能位于 Station 首项，但可以让
+后续单输入 Atomic 在同一事务中消费本 turn 的输出。continuation、首项状态、全部尾项状态、最终
+output 与适用的输入完成共同提交；尾项错误或背压会回滚本 turn，并丢弃首项的 `AfterCommit`。
+
+`ExclusiveTransform` 同样使用完整 turn 协议，但要求在其输出之后先形成独立持久化边界，因此必须
+独占 Station。它用于未承诺从相同 durable state 重算同一输出的 Transform；例如含 `Volatile` 或
+placeholder 表达式的现有表达式算子仍声明为 Exclusive，避免下游失败把其结果和下游状态一起重算。
+
 资格由具体 Definition instance 显式写入 [`OperationKind`]。Project、`RunningEventCount`、Distinct、
 `UnionAll` 恒为 `AtomicTransform`；Filter、Extend、Select、`SchemaAlign` 与 Aggregate 还检查全部
 持久表达式。表达式树只接受 row-local scalar 构造和 `Immutable` scalar function；`Stable`、
 `Volatile`、placeholder、subquery、aggregate/window、unnest、外部引用等实例声明为
 `ExclusiveTransform`，继续使用相同 Schema binding 和执行 kernel，但必须独占 Station。
+`InnerEquiJoin` 显式声明为两输入 `TurnTransform`，用持久 continuation 将一个完整输入拆成可重放的
+验证与输出页，并允许后接单输入 Atomic tail。
 
-这里没有第二套 Definition、binding 或 codec。所有 Transform 的 `bind_schemas` 都产生同一种 atomic
-kernel；统一 `OperationDefinition::bind` 根据 kind 保留为 `Operation::Atomic`，或把不合格实例包装为
-`Operation::Turn`。因此 eligibility、持久化字节和运行语义只有一个来源。
+这里没有第二套 Definition、binding 或 codec。能完整消费 Change 的 Transform 只产生一种 atomic
+kernel；统一 `OperationDefinition::bind` 根据 kind 保留为 `Operation::Atomic`，或把需要独占边界的
+实例包装为 `Operation::Turn`。`TurnTransform` 直接绑定同一个 `TurnOperation` 运行接口。因此
+eligibility、持久化字节和运行语义都只有一个来源。
 
 Filter、Extend、Select、`SchemaAlign` 与 `Aggregate` 的公共入口直接接收 `DataFusion` [`Expr`]；`dogpaddle_operation` 在 crate 根级重导出
 [`Expr`]、[`col`]、[`ident`]、[`lit`]、[`cast`]、[`try_cast`] 和 [`ScalarValue`]，调用方不再学习另一套表达式
@@ -175,7 +188,7 @@ binding 先验证其精确 Rust 类型，Flow 在创建 Store 前完成全图检
 connector enum 或启动回调；资源只在 materialize 时 move 进 Operation，外部初始化仍由 turn 完成。
 
 运行时 [`operation::Operation`] 是带执行能力的 enum：`Atomic` 保存
-`Box<dyn AtomicOperation>`，`Turn` 保存 `Box<dyn TurnOperation>`。Scan、Sink 与独占 Transform 使用
+`Box<dyn AtomicOperation>`，`Turn` 保存 `Box<dyn TurnOperation>`。Scan、`TurnTransform`、Sink 与独占 Transform 使用
 完整 `TurnOperation::turn` 协议；Atomic Transform 直接在 Station 已开启的事务中调用
 `AtomicOperation::apply`。当 Atomic Transform 独占 Station 或位于首位时，`Operation::turn` 将它适配
 为 `Action::Complete`。Operation 不接收 Subscription offset、Transaction 或事务启动能力。
@@ -245,7 +258,7 @@ checkpoint 恢复的外部服务；独立调用代码把 output IPC 与 checkpoi
 
 ## 内建算子能力与 conformance
 
-下表是当前十五个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
+下表是当前十六个内建算子的产品契约索引。`任意` 指任意合法且已由 Change 支持的精确 logical
 Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/buffer 证据的路径。表中未列出的
 `DataFusion` 表达式或 Arrow 类型不能由“底层依赖碰巧支持”推导为 `DogPaddle` 承诺。这是文档与测试
 索引，不是代码级 capability registry；Flow 仍不枚举具体算子。
@@ -263,12 +276,13 @@ Schema，不表示运行期动态 Schema；`共享` 只表示有公开 pointer/b
 | Extend (`6`) | `Atomic/ExclusiveTransform` / 1 | 保留 input，追加一个由 Expr 推导的 Field | 行序和 diff 不变 | 无 | input 列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、名称拒绝、temporal/decimal 直接列、reopen/重批；Definition codec，无独立 turn benchmark |
 | Select (`7`) | `Atomic/ExclusiveTransform` / 1 | 同一原始 input 上的有序 `name + Expr` 完整输出 | 行序和 diff 不变；空 Select 保留行数 | 无 | 直接列和 diff 共享；派生列按需分配 | Expr golden、bind/evaluate、空/非空 runtime Schema guard、别名隔离、temporal/decimal 选择/重排、reopen/重批；Definition codec，无独立 turn benchmark |
 | `UnionAll` (`8`) | `AtomicTransform` / N，N > 0 | 所有输入必须 exact 相同，原样输出 | 保持每端口行序/diff；跨端口无序 | 无 | 整个 Change 原样共享 | golden、arity/bind 与 runtime exact-Schema 拒绝、多端口 runtime/reopen/重批；Definition codec，无独立 turn benchmark |
+| `InnerEquiJoin` (`16`) | `TurnTransform` / 2 | 非空、同类型 flat non-float 等值键；output 固定为重命名后的 left 全字段 + right 全字段 | 按输入行序及 opposite canonical row 顺序输出，diff 为输入 diff × opposite multiplicity；NULL key 不匹配；分页 `Commit` 后 `Complete` | `inner_join.left_rows/right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>`、`inner_join.continuation: Cell` | 每个 output page 从 canonical opposite rows 重建 | tag16 golden、bind、两端更新、NULL/composite key、负前缀/overflow、rollback、分页/reopen、大行 fanout |
 | `SchemaAlign` (`9`) | `Atomic/ExclusiveTransform` / 1 | 有序 `name + Expr + target nullable + Field metadata`，另有 Schema metadata | 行序和 diff 不变；空定义保留行数 | 无 | 直接列和 diff 共享；表达式结果按需分配 | golden/canonical metadata 与重复 key 构造拒绝、bind/收窄拒绝、空/非空 runtime Schema guard、temporal/decimal 精确 cast、runtime/reopen；Definition codec，无独立 turn benchmark |
 | Discard (`3`) | Sink / 1 | 接受任意，无 output | 完成完整输入，`Complete(None)` | 无 | 不产生 output | golden、bind、runtime、rollback、reopen |
 | `SqliteSink` (`10`) | Sink / 1 | 校验 `SQLite` 列名与列数；无 output | 共享固定 ID 批次协议，每批至多 1024 操作，目标提交后结算 continuation 或 `Complete` | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 `SQLite` 值 | tag/payload、state/hash golden、全部 v1 类型、批界、非负前缀、rollback/reopen；无独立 benchmark |
 | `PostgresSink` (`12`) | Sink / 1 | 校验 `PostgreSQL` 列名、系统列与列数；无 output | 同一共享协议，批量匹配、insert-ignore 与 delete | `relation_sink.state: Cell<Vec<u8>>` | 共享 canonical/hash，绑定 PG 参数 | tag12 canonical JSON、资源/Schema/布局；普通 gate 离线，真实批量与恢复见 `system-tests/postgres/check_sink.py` |
 
-所有十五个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
+所有十六个算子共用同一条 `Definition → exact Schema binding → materialize → turn` 路径。每个算子在
 `tests/correctness/<operation>.rs` 垂直拥有自己的 literal golden、kind、data declaration、bind、
 materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`protocol`、`atomic` 与 `metamorphic`
 只保留跨算子契约；`correctness/atomic.rs` 证明实例级 kind、全部表达式 owner 的资格归纳和直接 atomic
@@ -276,11 +290,12 @@ materialize、runtime 和 reopen 证据；`definition_codec`、`expression`、`p
 和事务重放由 `crates/flow/tests/correctness` 所有。Operation 不建立 release benchmark；组合性能由
 真正拥有 workload 的 Flow、Store 或 Change + Store target 证明。
 
-tag `1..=10`、tag `13` 与 tag `14` 的稳定字节入口位于 `tests/fixtures/v1/`；tag11、tag12 与 tag15 的完整
+tag `1..=10`、tag `13`、tag `14` 与 tag `16` 的稳定字节入口位于 `tests/fixtures/v1/`；tag11、tag12 与 tag15 的完整
 canonical JSON golden 分别由 `tests/correctness/postgres_cdc_scan.rs`、`tests/correctness/postgres_sink.rs` 与
 `tests/correctness/mysql_cdc_scan.rs` 拥有。其中事件计数、对齐、
 `SQLite` Sink 与 Distinct 的 fixture 分别为 `running_event_count_definition.hex`、`schema_align_explicit.hex`、
-`sqlite_sink_output_events.hex`、`distinct_definition.hex` 与 `aggregate_department.hex`，冻结 tag `2`、`9`、`10`、`13` 与 `14`。每个算子文件会自行完成 decode、bind、
+`sqlite_sink_output_events.hex`、`distinct_definition.hex`、`aggregate_department.hex` 与
+`inner_equi_join_id.hex`，冻结 tag `2`、`9`、`10`、`13`、`14` 与 `16`。每个算子文件会自行完成 decode、bind、
 materialize 与运行证据。Flow manifest 的端到端基线为
 `crates/flow/tests/fixtures/v1/sequence_scan_running_event_count_discard.hex`。这些文件名只帮助定位
 证据；契约仍由公共测试断言和上表语义定义。
@@ -288,7 +303,7 @@ materialize 与运行证据。Flow manifest 的端到端基线为
 运行实例及具体算子统一组织在 `operation` 模块中，其下按语义分为三个公共模块：`scan`
 保存零输入且拥有 output 的 Scan 算子，`transform` 保存消费并产生记录的转换算子，`sink` 保存只消费记录
 的终点算子。当前 `scan` 包含 `SequenceScan`、`PostgresCdcScan` 与 `MySqlCdcScan`，`transform` 包含 RunningEventCount、Distinct、Aggregate、Project、Filter、
-Extend、Select、SchemaAlign 和 `UnionAll`，`sink` 包含
+Extend、Select、SchemaAlign、`UnionAll` 与 `InnerEquiJoin`，`sink` 包含
 Discard、`SqliteSink` 与 `PostgresSink`。目录分类不作为运行时类型系统；每个 Definition 必须通过
 [`OperationDefinition::kind`] 显式声明包含输入数量的结构类型。
 
@@ -336,11 +351,33 @@ group output 保留 input Schema metadata 以及 `DataFusion` `Expr::to_field` �
 `MIN/MAX`。这避免把 bit identity、NaN order 或历史相关的浮点累计误称为 SQL 语义；后续增加对应实现时再连同
 精确语义和持久证据一起开放。
 
+## 两输入关系算子：InnerEquiJoin
+
+`InnerEquiJoinDefinition` 接收非空、有序的 `(left Expr, right Expr)` 等值键和完整 output names。
+每个表达式只绑定自己的输入 Schema；同一对键必须具有相同 exact type，并且 v1 只接受 flat、
+non-float scalar。output 固定包含 left 全字段后接 right 全字段，字段只按 output names 改名并保留
+source Field metadata，Schema metadata 固定为空。选择、重排或对齐继续交给后续普通 Transform。
+
+两个输入关系分别保存在 `inner_join.left_rows` 与 `inner_join.right_rows`：partition 是完整 canonical
+join key，partition 内的 key 是完整 canonical input row，value 是正 multiplicity。NULL key 仍进入
+自己的关系状态以支持精确 retract，但永远不 probe 对侧。每个匹配的 opposite distinct row 只产生一个
+output 事件，其 diff 是 input diff 与 opposite multiplicity 的 checked product，不按 multiplicity 展开。
+
+Join 用 `inner_join.continuation` 将一个 pinned Change 分成两段。没有 continuation 时先对完整 Claim 的
+own-row 权重变化做无写入准入，并在同一事务中直接开始 `Probe`；它分页遍历全部匹配并提前验证
+persisted row 与 output diff，随后 `Emit`
+按相同 canonical 顺序提交 output pages。当前 input row 只在它的最后一个 emit page 调整 own relation，
+最后一行同时清除 continuation 并返回 `Complete`。因此页级背压、tail 错误或事务失败会一起回滚该页，
+reopen 从 durable cursor 继续，不需要 Station 保存第二份进度。page item 数还会按 driving canonical row
+大小收紧，避免一个大 own row 被固定 fanout 数重复后放大单页内存。同一 turn 在固定的 item 与
+canonical byte 预算内跨过多个 input row，`Emit` 把这些 row 的小匹配分区按原顺序聚合成一个 output；
+出现分页 cursor、耗尽任一预算或完成输入时才形成边界，单个超预算 row 仍允许独立推进。
+
 ## Definition 与持久化
 
 具体 Definition 统一实现 sealed [`OperationDefinition`] trait。trait 要求每个具体算子手动返回
 [`OperationKind`]，并以 `{ 逻辑名: data class }` 的形式向 Flow 声明完整数据 schema。
-`OperationKind::Scan` 固定为零输入，`AtomicTransform`、`ExclusiveTransform` 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
+`OperationKind::Scan` 固定为零输入，`AtomicTransform`、`TurnTransform`、`ExclusiveTransform` 与 Sink variant 携带非零 `u32` 输入数量，因此类别、
 input arity 和 output 属性不会形成非法组合。kind 不是从拓扑位置推断：Scan、Transform 和 Sink
 分别声明自己在数据流中的结构语义；Station 读取所包裹 Definition 的 kind，再向 Flow 提供自己的
 Scan/Sink 角色与 output 属性。Flow 负责生成完整
@@ -376,8 +413,10 @@ Definition 集合在本 crate 内保持封闭，但不再使用公共 enum。稳
 过程中进行私有类型擦除；具名声明在 binding 的 `materialize` 中将其安全恢复为精确 data class。
 类型不匹配会返回错误而不是 panic。类型擦除不会进入运行实例、事务访问路径或持久化格式。
 
-物化后的具体实例统一实现 [`operation::Operation`] trait。Flow 将异构实例保存为
-`Box<dyn operation::Operation>`，并通过同一个可变 `turn` 分派运行；运行实例只要求 `Send`，调度方
+物化结果统一装入 [`operation::Operation`] enum：完整消费一个 Change 的 kernel 保存为
+`Atomic(Box<dyn operation::AtomicOperation>)`，拥有 turn/continuation/AfterCommit 协议的实例保存为
+`Turn(Box<dyn operation::TurnOperation>)`。Flow 通过同一个可变 `turn` 入口分派，enum 会把 Atomic head 适配成
+一次 `Complete` turn；运行实例只要求 `Send`，调度方
 在从准备到提交后 completion 结束的整个 turn 期间持有其独占可变访问。Schema binding 只在 build/open
 期间连接 Definition 与实例；运行 trait 和具体运行类型都不反向保存或暴露 Definition，Flow
 已经从持久 Definition 获得 kind、资源声明和端口 Schema。
@@ -625,7 +664,7 @@ input/output Schema。它在任何表达式求值前检查 runtime input，所�
 [`operation::transform::SchemaAlignError::InputSchemaMismatch`] 拒绝 Schema drift，不产生 output 或
 持久写入。每个合法 turn 计算完整 output，保持行序并共享 diff；直接列引用继续共享原
 `ArrayRef`，cast 等派生结果按 `DataFusion` 语义分配。它不排序、不去重、不 consolidation，也不修改
-diff。`UnionAll` 与未来 Join 仍然只接受 exact Schema；所有上层 API 若需要共同结构，都应显式插入
+diff。`UnionAll` 与 `InnerEquiJoin` 仍然只接受 exact Schema；所有上层 API 若需要共同结构，都应显式插入
 `SchemaAlign` 或生成等价的已声明变换。
 
 ## `operation::transform::UnionAll`
