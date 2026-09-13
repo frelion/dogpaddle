@@ -305,4 +305,41 @@ mod tests {
         );
         assert_ne!(first, changed_database);
     }
+
+    #[test]
+    fn cdc_runtime_tuning_does_not_change_identity() {
+        let postgres = identity(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders', publication => 'orders_publication'\
+            )",
+        );
+        let tuned_postgres = identity(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders', publication => 'orders_publication', \
+                connect_timeout_ms => 7000, query_timeout_ms => 8000, \
+                retry_limit => 9, retry_max_delay_ms => 11000, \
+                heartbeat_interval_ms => 2000, snapshot_fetch_size => 4096\
+            )",
+        );
+        assert_eq!(postgres, tuned_postgres);
+
+        let mysql = identity(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.orders'\
+            )",
+        );
+        let tuned_mysql = identity(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.orders', connect_timeout_ms => 7000, \
+                query_timeout_ms => 8000, retry_limit => 9, \
+                retry_max_delay_ms => 11000, heartbeat_interval_ms => 2000, \
+                snapshot_fetch_size => 4096\
+            )",
+        );
+        assert_eq!(mysql, tuned_mysql);
+    }
 }

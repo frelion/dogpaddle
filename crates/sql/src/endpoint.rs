@@ -2,7 +2,7 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
 };
 
@@ -13,8 +13,8 @@ use datafusion_sql::sqlparser::ast::{
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::operation::{
     scan::{
-        MySqlCdcScanConfig, MySqlCdcScanDefinition, PostgresCdcScanConfig,
-        PostgresCdcScanDefinition, SequenceScanDefinition,
+        MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanOptions, PostgresCdcScanConfig,
+        PostgresCdcScanDefinition, PostgresCdcScanOptions, SequenceScanDefinition,
     },
     sink::{DiscardDefinition, PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
 };
@@ -76,14 +76,21 @@ enum ParameterKind {
 struct ParameterSpec {
     name: &'static str,
     kind: ParameterKind,
-    default: Option<&'static str>,
+    presence: ParameterPresence,
+}
+
+#[derive(Clone, Copy)]
+enum ParameterPresence {
+    Required,
+    Default(&'static str),
+    Optional,
 }
 
 const fn string(name: &'static str) -> ParameterSpec {
     ParameterSpec {
         name,
         kind: ParameterKind::String,
-        default: None,
+        presence: ParameterPresence::Required,
     }
 }
 
@@ -91,7 +98,7 @@ const fn u64_parameter(name: &'static str) -> ParameterSpec {
     ParameterSpec {
         name,
         kind: ParameterKind::U64,
-        default: None,
+        presence: ParameterPresence::Required,
     }
 }
 
@@ -99,8 +106,167 @@ const fn optional_u64(name: &'static str, default: &'static str) -> ParameterSpe
     ParameterSpec {
         name,
         kind: ParameterKind::U64,
-        default: Some(default),
+        presence: ParameterPresence::Default(default),
     }
+}
+
+const fn optional_u64_override(name: &'static str) -> ParameterSpec {
+    ParameterSpec {
+        name,
+        kind: ParameterKind::U64,
+        presence: ParameterPresence::Optional,
+    }
+}
+
+struct CdcTuningParameters {
+    connect_timeout_ms: Option<Parameter>,
+    query_timeout_ms: Option<Parameter>,
+    retry_limit: Option<Parameter>,
+    retry_max_delay_ms: Option<Parameter>,
+    heartbeat_interval_ms: Option<Parameter>,
+    snapshot_fetch_size: Option<Parameter>,
+}
+
+impl CdcTuningParameters {
+    fn resolved(&self) -> Result<Self, SqlError> {
+        Ok(Self {
+            connect_timeout_ms: resolve_optional(self.connect_timeout_ms.as_ref())?,
+            query_timeout_ms: resolve_optional(self.query_timeout_ms.as_ref())?,
+            retry_limit: resolve_optional(self.retry_limit.as_ref())?,
+            retry_max_delay_ms: resolve_optional(self.retry_max_delay_ms.as_ref())?,
+            heartbeat_interval_ms: resolve_optional(self.heartbeat_interval_ms.as_ref())?,
+            snapshot_fetch_size: resolve_optional(self.snapshot_fetch_size.as_ref())?,
+        })
+    }
+
+    fn postgres_options(&self) -> Result<PostgresCdcScanOptions, SqlError> {
+        let mut options = PostgresCdcScanOptions::new();
+        if let Some(value) = self.milliseconds("postgres_cdc", "connect_timeout_ms")? {
+            options = options
+                .connect_timeout(value)
+                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "connect_timeout_ms", error))?;
+        }
+        if let Some(value) = self.milliseconds("postgres_cdc", "query_timeout_ms")? {
+            options = options
+                .query_timeout(value)
+                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "query_timeout_ms", error))?;
+        }
+        if let Some(value) = self.unsigned("postgres_cdc", "retry_limit")? {
+            options = options
+                .retry_limit(value)
+                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "retry_limit", error))?;
+        }
+        if let Some(value) = self.milliseconds("postgres_cdc", "retry_max_delay_ms")? {
+            options = options
+                .retry_max_delay(value)
+                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "retry_max_delay_ms", error))?;
+        }
+        if let Some(value) = self.milliseconds("postgres_cdc", "heartbeat_interval_ms")? {
+            options = options.heartbeat_interval(value).map_err(|error| {
+                invalid_cdc_tuning("postgres_cdc", "heartbeat_interval_ms", error)
+            })?;
+        }
+        if let Some(value) = self.nonzero_unsigned("postgres_cdc", "snapshot_fetch_size")? {
+            options = options.snapshot_fetch_size(value).map_err(|error| {
+                invalid_cdc_tuning("postgres_cdc", "snapshot_fetch_size", error)
+            })?;
+        }
+        Ok(options)
+    }
+
+    fn mysql_options(&self) -> Result<MySqlCdcScanOptions, SqlError> {
+        let mut options = MySqlCdcScanOptions::new();
+        if let Some(value) = self.milliseconds("mysql_cdc", "connect_timeout_ms")? {
+            options = options
+                .connect_timeout(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "connect_timeout_ms", error))?;
+        }
+        if let Some(value) = self.milliseconds("mysql_cdc", "query_timeout_ms")? {
+            options = options
+                .query_timeout(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "query_timeout_ms", error))?;
+        }
+        if let Some(value) = self.unsigned("mysql_cdc", "retry_limit")? {
+            options = options
+                .retry_limit(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "retry_limit", error))?;
+        }
+        if let Some(value) = self.milliseconds("mysql_cdc", "retry_max_delay_ms")? {
+            options = options
+                .retry_max_delay(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "retry_max_delay_ms", error))?;
+        }
+        if let Some(value) = self.milliseconds("mysql_cdc", "heartbeat_interval_ms")? {
+            options = options
+                .heartbeat_interval(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "heartbeat_interval_ms", error))?;
+        }
+        if let Some(value) = self.nonzero_unsigned("mysql_cdc", "snapshot_fetch_size")? {
+            options = options
+                .snapshot_fetch_size(value)
+                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "snapshot_fetch_size", error))?;
+        }
+        Ok(options)
+    }
+
+    fn milliseconds(
+        &self,
+        endpoint: &str,
+        name: &str,
+    ) -> Result<Option<std::time::Duration>, SqlError> {
+        self.parameter(name)
+            .map(|parameter| {
+                parameter
+                    .resolve_u64(endpoint, name)
+                    .map(std::time::Duration::from_millis)
+            })
+            .transpose()
+    }
+
+    fn unsigned(&self, endpoint: &str, name: &str) -> Result<Option<u32>, SqlError> {
+        self.parameter(name)
+            .map(|parameter| {
+                let value = parameter.resolve_u64(endpoint, name)?;
+                u32::try_from(value).map_err(|_| {
+                    SqlError::invalid(format!(
+                        "{endpoint} parameter {name:?} exceeds an unsigned 32-bit integer"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn nonzero_unsigned(&self, endpoint: &str, name: &str) -> Result<Option<NonZeroU32>, SqlError> {
+        self.unsigned(endpoint, name)?
+            .map(|value| {
+                NonZeroU32::new(value).ok_or_else(|| {
+                    SqlError::invalid(format!(
+                        "{endpoint} parameter {name:?} must resolve to a nonzero unsigned integer"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn parameter(&self, name: &str) -> Option<&Parameter> {
+        match name {
+            "connect_timeout_ms" => self.connect_timeout_ms.as_ref(),
+            "query_timeout_ms" => self.query_timeout_ms.as_ref(),
+            "retry_limit" => self.retry_limit.as_ref(),
+            "retry_max_delay_ms" => self.retry_max_delay_ms.as_ref(),
+            "heartbeat_interval_ms" => self.heartbeat_interval_ms.as_ref(),
+            "snapshot_fetch_size" => self.snapshot_fetch_size.as_ref(),
+            _ => unreachable!("CDC tuning parameter names are fixed"),
+        }
+    }
+}
+
+fn resolve_optional(parameter: Option<&Parameter>) -> Result<Option<Parameter>, SqlError> {
+    parameter.map(Parameter::resolved).transpose()
+}
+
+fn invalid_cdc_tuning(endpoint: &str, name: &str, error: impl std::fmt::Display) -> SqlError {
+    SqlError::invalid(format!("{endpoint} parameter {name:?} is invalid: {error}"))
 }
 
 struct DatabaseConnection {
@@ -173,6 +339,7 @@ impl DatabaseConnection {
     fn postgres_cdc_config(
         &self,
         runtime_bundle: &Path,
+        options: PostgresCdcScanOptions,
     ) -> Result<PostgresCdcScanConfig, SqlError> {
         PostgresCdcScanConfig::new_unencrypted(
             runtime_bundle,
@@ -182,6 +349,7 @@ impl DatabaseConnection {
             &self.user,
             &self.password,
         )
+        .map(|config| config.options(options))
         .map_err(SqlError::endpoint)
     }
 
@@ -196,7 +364,11 @@ impl DatabaseConnection {
         .map_err(SqlError::endpoint)
     }
 
-    fn mysql_config(&self, runtime_bundle: &Path) -> Result<MySqlCdcScanConfig, SqlError> {
+    fn mysql_config(
+        &self,
+        runtime_bundle: &Path,
+        options: MySqlCdcScanOptions,
+    ) -> Result<MySqlCdcScanConfig, SqlError> {
         MySqlCdcScanConfig::new_unencrypted(
             runtime_bundle,
             &self.host,
@@ -205,6 +377,7 @@ impl DatabaseConnection {
             &self.user,
             &self.password,
         )
+        .map(|config| config.options(options))
         .map_err(SqlError::endpoint)
     }
 }
@@ -227,12 +400,14 @@ pub(crate) struct PostgresCdcEndpoint {
     table: Parameter,
     publication: Parameter,
     bootstrap_spool_bytes: Parameter,
+    tuning: CdcTuningParameters,
 }
 
 pub(crate) struct MySqlCdcEndpoint {
     connection: Parameter,
     table: Parameter,
     bootstrap_spool_bytes: Parameter,
+    tuning: CdcTuningParameters,
 }
 
 pub(crate) enum ScanEndpoint {
@@ -268,12 +443,16 @@ impl ScanEndpoint {
                 table: endpoint.table.resolved()?,
                 publication: endpoint.publication.resolved()?,
                 bootstrap_spool_bytes: endpoint.bootstrap_spool_bytes.resolved()?,
-            }))),
+                tuning: endpoint.tuning.resolved()?,
+            })))
+            .and_then(validate_resolved_scan),
             Self::MySqlCdc(endpoint) => Ok(Self::MySqlCdc(Box::new(MySqlCdcEndpoint {
                 connection: endpoint.connection.resolved()?,
                 table: endpoint.table.resolved()?,
                 bootstrap_spool_bytes: endpoint.bootstrap_spool_bytes.resolved()?,
-            }))),
+                tuning: endpoint.tuning.resolved()?,
+            })))
+            .and_then(validate_resolved_scan),
         }
     }
 
@@ -324,7 +503,8 @@ impl ScanEndpoint {
                     .bootstrap_spool_bytes
                     .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?;
                 let engine_name = scan_name(identity, state_path, index);
-                let config = connection.postgres_cdc_config(runtime_bundle)?;
+                let config = connection
+                    .postgres_cdc_config(runtime_bundle, endpoint.tuning.postgres_options()?)?;
                 let spec = config
                     .discover(&engine_name, &schema, &table, &engine_name, &publication)
                     .map_err(SqlError::endpoint)?;
@@ -344,7 +524,8 @@ impl ScanEndpoint {
                     .bootstrap_spool_bytes
                     .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?;
                 let engine_name = scan_name(identity, state_path, index);
-                let config = connection.mysql_config(runtime_bundle)?;
+                let config =
+                    connection.mysql_config(runtime_bundle, endpoint.tuning.mysql_options()?)?;
                 let spec = config
                     .discover(&engine_name, &table)
                     .map_err(SqlError::endpoint)?;
@@ -418,13 +599,18 @@ impl ScanEndpoint {
                 let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
                 let connection =
                     DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
-                factory.resource(station_id, connection.postgres_cdc_config(runtime_bundle)?)?;
+                factory.resource(
+                    station_id,
+                    connection
+                        .postgres_cdc_config(runtime_bundle, endpoint.tuning.postgres_options()?)?,
+                )?;
                 Ok(())
             }
             Self::MySqlCdc(endpoint) => {
                 let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
                 let connection = DatabaseConnection::mysql(&endpoint.connection)?;
-                let config = connection.mysql_config(runtime_bundle)?;
+                let config =
+                    connection.mysql_config(runtime_bundle, endpoint.tuning.mysql_options()?)?;
                 factory.resource(station_id, config)?;
                 Ok(())
             }
@@ -432,40 +618,107 @@ impl ScanEndpoint {
     }
 }
 
+fn validate_resolved_scan(scan: ScanEndpoint) -> Result<ScanEndpoint, SqlError> {
+    match &scan {
+        ScanEndpoint::PostgresCdc(endpoint) => {
+            let _ = endpoint.tuning.postgres_options()?;
+        }
+        ScanEndpoint::MySqlCdc(endpoint) => {
+            let _ = endpoint.tuning.mysql_options()?;
+        }
+        ScanEndpoint::Sequence { .. } => {}
+    }
+    Ok(scan)
+}
+
 fn parse_postgres_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
-    let [connection, table, publication, bootstrap_spool_bytes] =
-        exact_parameters(parse_arguments(
-            "postgres_cdc",
-            &arguments.args,
-            &[
-                string("connection"),
-                string("table"),
-                string("publication"),
-                optional_u64("bootstrap_spool_bytes", "1073741824"),
-            ],
-        )?);
+    let [
+        Some(connection),
+        Some(table),
+        Some(publication),
+        Some(bootstrap_spool_bytes),
+        connect_timeout_ms,
+        query_timeout_ms,
+        retry_limit,
+        retry_max_delay_ms,
+        heartbeat_interval_ms,
+        snapshot_fetch_size,
+    ] = exact_parameter_slots(parse_argument_slots(
+        "postgres_cdc",
+        &arguments.args,
+        &[
+            string("connection"),
+            string("table"),
+            string("publication"),
+            optional_u64("bootstrap_spool_bytes", "1073741824"),
+            optional_u64_override("connect_timeout_ms"),
+            optional_u64_override("query_timeout_ms"),
+            optional_u64_override("retry_limit"),
+            optional_u64_override("retry_max_delay_ms"),
+            optional_u64_override("heartbeat_interval_ms"),
+            optional_u64_override("snapshot_fetch_size"),
+        ],
+    )?)
+    else {
+        unreachable!("required PostgreSQL CDC parameters are present")
+    };
     Ok(ScanEndpoint::PostgresCdc(Box::new(PostgresCdcEndpoint {
         connection,
         table,
         publication,
         bootstrap_spool_bytes,
+        tuning: CdcTuningParameters {
+            connect_timeout_ms,
+            query_timeout_ms,
+            retry_limit,
+            retry_max_delay_ms,
+            heartbeat_interval_ms,
+            snapshot_fetch_size,
+        },
     })))
 }
 
 fn parse_mysql_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
-    let [connection, table, bootstrap_spool_bytes] = exact_parameters(parse_arguments(
+    let [
+        Some(connection),
+        Some(table),
+        Some(bootstrap_spool_bytes),
+        connect_timeout_ms,
+        query_timeout_ms,
+        retry_limit,
+        retry_max_delay_ms,
+        heartbeat_interval_ms,
+        snapshot_fetch_size,
+    ] = exact_parameter_slots(parse_argument_slots(
         "mysql_cdc",
         &arguments.args,
         &[
             string("connection"),
             string("table"),
             optional_u64("bootstrap_spool_bytes", "1073741824"),
+            optional_u64_override("connect_timeout_ms"),
+            optional_u64_override("query_timeout_ms"),
+            optional_u64_override("retry_limit"),
+            optional_u64_override("retry_max_delay_ms"),
+            optional_u64_override("heartbeat_interval_ms"),
+            optional_u64_override("snapshot_fetch_size"),
         ],
-    )?);
+    )?)
+    else {
+        unreachable!("required MySQL CDC parameters are present")
+    };
     Ok(ScanEndpoint::MySqlCdc(Box::new(MySqlCdcEndpoint {
         connection,
         table,
         bootstrap_spool_bytes,
+        tuning: CdcTuningParameters {
+            connect_timeout_ms,
+            query_timeout_ms,
+            retry_limit,
+            retry_max_delay_ms,
+            heartbeat_interval_ms,
+            snapshot_fetch_size,
+        },
     })))
 }
 
@@ -736,6 +989,25 @@ fn parse_arguments(
     arguments: &[FunctionArg],
     expected: &[ParameterSpec],
 ) -> Result<Vec<Parameter>, SqlError> {
+    parse_argument_slots(endpoint, arguments, expected)?
+        .into_iter()
+        .zip(expected)
+        .map(|(value, specification)| {
+            value.ok_or_else(|| {
+                SqlError::invalid(format!(
+                    "missing {endpoint} parameter {:?}",
+                    specification.name
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_argument_slots(
+    endpoint: &str,
+    arguments: &[FunctionArg],
+    expected: &[ParameterSpec],
+) -> Result<Vec<Option<Parameter>>, SqlError> {
     let mut values = std::iter::repeat_with(|| None)
         .take(expected.len())
         .collect::<Vec<_>>();
@@ -761,8 +1033,18 @@ fn parse_arguments(
             .enumerate()
             .find(|(_, specification)| specification.name == name)
         else {
+            if expected.is_empty() {
+                return Err(SqlError::invalid(format!(
+                    "{endpoint} does not accept parameters"
+                )));
+            }
+            let supported = expected
+                .iter()
+                .map(|specification| format!("{:?}", specification.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(SqlError::invalid(format!(
-                "unknown {endpoint} parameter {name:?}"
+                "unknown {endpoint} parameter {name:?}; supported parameters are {supported}"
             )));
         };
         if values[index].is_some() {
@@ -786,24 +1068,30 @@ fn parse_arguments(
     expected
         .iter()
         .zip(values)
-        .map(|(specification, value)| {
-            value
-                .or_else(|| {
-                    specification
-                        .default
-                        .map(|value| Parameter::Literal(value.to_owned()))
-                })
-                .ok_or_else(|| {
-                    SqlError::invalid(format!(
-                        "missing {endpoint} parameter {:?}",
-                        specification.name
-                    ))
-                })
-        })
+        .map(
+            |(specification, value)| match (value, specification.presence) {
+                (Some(value), _) => Ok(Some(value)),
+                (None, ParameterPresence::Default(value)) => {
+                    Ok(Some(Parameter::Literal(value.to_owned())))
+                }
+                (None, ParameterPresence::Optional) => Ok(None),
+                (None, ParameterPresence::Required) => Err(SqlError::invalid(format!(
+                    "missing {endpoint} parameter {:?}",
+                    specification.name
+                ))),
+            },
+        )
         .collect()
 }
 
 fn exact_parameters<const N: usize>(values: Vec<Parameter>) -> [Parameter; N] {
+    let Ok(values) = values.try_into() else {
+        unreachable!("the parameter specification fixes the result length")
+    };
+    values
+}
+
+fn exact_parameter_slots<const N: usize>(values: Vec<Option<Parameter>>) -> [Option<Parameter>; N] {
     let Ok(values) = values.try_into() else {
         unreachable!("the parameter specification fixes the result length")
     };
@@ -936,5 +1224,46 @@ mod tests {
             scan_name(&identity, first_path, 0),
             sink_name(&identity, first_path)
         );
+    }
+
+    #[test]
+    fn cdc_tuning_names_translate_to_the_exact_connector_options() {
+        let tuning = CdcTuningParameters {
+            connect_timeout_ms: Some(Parameter::Literal("1001".to_owned())),
+            query_timeout_ms: Some(Parameter::Literal("2002".to_owned())),
+            retry_limit: Some(Parameter::Literal("3".to_owned())),
+            retry_max_delay_ms: Some(Parameter::Literal("4004".to_owned())),
+            heartbeat_interval_ms: Some(Parameter::Literal("5005".to_owned())),
+            snapshot_fetch_size: Some(Parameter::Literal("6006".to_owned())),
+        };
+        let expected_postgres = PostgresCdcScanOptions::new()
+            .connect_timeout(std::time::Duration::from_millis(1001))
+            .unwrap()
+            .query_timeout(std::time::Duration::from_millis(2002))
+            .unwrap()
+            .retry_limit(3)
+            .unwrap()
+            .retry_max_delay(std::time::Duration::from_millis(4004))
+            .unwrap()
+            .heartbeat_interval(std::time::Duration::from_millis(5005))
+            .unwrap()
+            .snapshot_fetch_size(NonZeroU32::new(6006).unwrap())
+            .unwrap();
+        let expected_mysql = MySqlCdcScanOptions::new()
+            .connect_timeout(std::time::Duration::from_millis(1001))
+            .unwrap()
+            .query_timeout(std::time::Duration::from_millis(2002))
+            .unwrap()
+            .retry_limit(3)
+            .unwrap()
+            .retry_max_delay(std::time::Duration::from_millis(4004))
+            .unwrap()
+            .heartbeat_interval(std::time::Duration::from_millis(5005))
+            .unwrap()
+            .snapshot_fetch_size(NonZeroU32::new(6006).unwrap())
+            .unwrap();
+
+        assert_eq!(tuning.postgres_options().unwrap(), expected_postgres);
+        assert_eq!(tuning.mysql_options().unwrap(), expected_mysql);
     }
 }

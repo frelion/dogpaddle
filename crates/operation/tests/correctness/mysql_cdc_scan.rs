@@ -1,9 +1,12 @@
-use std::path::Path;
+use std::{num::NonZeroU32, path::Path, time::Duration};
 
 use dogpaddle_operation::{
     DataInstances, MaterializeError, OperationDefinition, OperationKind, RuntimeResource,
     decode_definition, encode_definition,
-    operation::{Action, Operation, OperationError, Turn, scan::MySqlCdcScanConfig},
+    operation::{
+        Action, Operation, OperationError, Turn,
+        scan::{MySqlCdcScanConfig, MySqlCdcScanOptions},
+    },
 };
 use dogpaddle_store::{Cell, Queue, Store, Transactions};
 
@@ -244,15 +247,55 @@ fn mysql_cdc_restores_opaque_checkpoint_across_rollback_and_reopen_without_exter
 
 #[test]
 fn mysql_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_setup() {
-    let debug = format!("{:?}", config());
+    let options = MySqlCdcScanOptions::new()
+        .connect_timeout(Duration::from_millis(7))
+        .unwrap()
+        .query_timeout(Duration::from_millis(8))
+        .unwrap()
+        .retry_limit(9)
+        .unwrap()
+        .retry_max_delay(Duration::from_millis(301))
+        .unwrap()
+        .heartbeat_interval(Duration::from_millis(11))
+        .unwrap()
+        .snapshot_fetch_size(NonZeroU32::new(12).unwrap())
+        .unwrap();
+    let debug = format!("{:?}", config().options(options));
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("do-not-persist-this-password"));
+    assert!(debug.contains("snapshot_fetch_size: Some(12)"));
     assert!(
         MySqlCdcScanConfig::new_unencrypted("relative", "host", 3306, "db", "user", "password")
             .is_err()
     );
     assert!(
         MySqlCdcScanConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password")
+            .is_err()
+    );
+}
+
+#[test]
+fn mysql_cdc_runtime_options_reject_values_debezium_cannot_represent() {
+    let excessive = Duration::from_millis(u64::try_from(i32::MAX).unwrap() + 1);
+    for result in [
+        MySqlCdcScanOptions::new().connect_timeout(Duration::ZERO),
+        MySqlCdcScanOptions::new().connect_timeout(Duration::from_nanos(1)),
+        MySqlCdcScanOptions::new().connect_timeout(excessive),
+        MySqlCdcScanOptions::new().query_timeout(Duration::ZERO),
+        MySqlCdcScanOptions::new().query_timeout(Duration::from_millis(2_147_483_001)),
+        MySqlCdcScanOptions::new().retry_max_delay(Duration::from_millis(300)),
+        MySqlCdcScanOptions::new().heartbeat_interval(Duration::ZERO),
+    ] {
+        assert!(result.is_err());
+    }
+    assert!(
+        MySqlCdcScanOptions::new()
+            .retry_limit(u32::try_from(i32::MAX).unwrap() + 1)
+            .is_err()
+    );
+    assert!(
+        MySqlCdcScanOptions::new()
+            .snapshot_fetch_size(NonZeroU32::new(u32::try_from(i32::MAX).unwrap() + 1).unwrap())
             .is_err()
     );
 }

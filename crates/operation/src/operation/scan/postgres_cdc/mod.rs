@@ -7,7 +7,7 @@ mod error;
 mod runtime;
 mod schema;
 
-pub use connection::PostgresCdcScanConfig;
+pub use connection::{PostgresCdcScanConfig, PostgresCdcScanOptions};
 pub use definition::{PostgresCdcScanDefinition, PostgresCdcScanSpec};
 pub use error::PostgresCdcScanError;
 pub use runtime::PostgresCdcScanOperation;

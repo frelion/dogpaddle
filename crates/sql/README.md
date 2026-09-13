@@ -105,8 +105,8 @@ SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::
 | 方向 | 函数 | 参数 |
 | --- | --- | --- |
 | Scan | `sequence` | `start` |
-| Scan | `postgres_cdc` | `connection`, `table`, `publication`; 可选 `bootstrap_spool_bytes` |
-| Scan | `mysql_cdc` | `connection`, `table`; 可选 `bootstrap_spool_bytes` |
+| Scan | `postgres_cdc` | `connection`, `table`, `publication`; 可选 `bootstrap_spool_bytes` 和 CDC 调优参数 |
+| Scan | `mysql_cdc` | `connection`, `table`; 可选 `bootstrap_spool_bytes` 和 CDC 调优参数 |
 | Sink | `sqlite` | `path`, `table` |
 | Sink | `postgres` | `connection`, `table` |
 | Sink | `discard` | 无 |
@@ -123,7 +123,9 @@ FROM postgres_cdc(
     connection => env('SOURCE_DATABASE_URL'),
     table => 'sales.orders',
     publication => 'orders_publication',
-    bootstrap_spool_bytes => 2147483648
+    bootstrap_spool_bytes => 2147483648,
+    heartbeat_interval_ms => 2000,
+    snapshot_fetch_size => 4096
 );
 ```
 
@@ -148,6 +150,27 @@ mysql://user:password@127.0.0.1:3306/database
 URL 必须包含用户名和一个数据库路径段，用户名、密码和数据库名支持 percent encoding。`PostgreSQL` Sink 仍受底层试点限制，只接受 numeric IP。`table` 必须恰好包含两个非空部分：`PostgreSQL` 使用 `schema.table`，`MySQL` 使用 `database.table`，且 `MySQL` 的 database 必须与 URL 一致。
 
 `bootstrap_spool_bytes` 是私有快照队列的非零硬上限，默认 1 GiB。PostgreSQL 的容量要覆盖完整快照和快照封口前的 WAL 重叠；MySQL 的容量要覆盖完整快照，binlog 还必须保留到私有 spool 发布并追平完成。容量不足时当前 delivery 不提交也不 ACK，需要以更大容量和新状态重建。
+
+两个 CDC Scan 都接受下面这些可选运行调优参数：
+
+| 参数 | 作用 | 约束 |
+| --- | --- | --- |
+| `connect_timeout_ms` | 数据库连接超时；同时作用于启动前发现和 Debezium connector | `1..=2147483647` |
+| `query_timeout_ms` | 数据库查询超时；同时作用于启动前发现和 Debezium connector | `1..=2147483000` |
+| `retry_limit` | connector 启动成功后，Debezium 对可重试 polling 故障的最大重试次数；`0` 表示不重试 | `0..=2147483647` |
+| `retry_max_delay_ms` | 上述 post-start polling 重试的最大退避间隔 | `301..=2147483647` |
+| `heartbeat_interval_ms` | 持续捕获阶段的 heartbeat 间隔 | `1..=2147483647` |
+| `snapshot_fetch_size` | 初始快照每次向 JDBC 请求的行数 | `1..=2147483647` |
+
+省略这些参数时由对应 Scan 使用固定的产品默认值。PostgreSQL 的启动前发现与 Debezium 默认连接、查询超时均为 5 秒，快照 fetch size 为 10240。MySQL 的启动前发现默认连接、查询超时为 5 秒；Debezium 保持 30 秒连接超时、10 分钟查询超时以及未设置 fetch size 的流式读取行为。两者默认无限重试，最大退避 10 秒，持续捕获 heartbeat 为 1 秒。bootstrap 阶段为推进内部 checkpoint 固定使用 1 毫秒 heartbeat，不受用户参数影响。
+
+启动前发现使用用户给出的精确毫秒值。Debezium 3.6 的 JDBC 查询超时实际以整秒执行，因此 connector 侧会向上取整到下一秒，避免 `1..999ms` 被 JDBC 解释成 `0`（无限等待）；PostgreSQL JDBC 的连接超时同样向上取整到整秒。MySQL 的发现阶段 query timeout 是 socket 读写等待上限，Debezium 阶段则是 JDBC statement 上限，两者共享预算但触发条件不同。
+
+这些值只改变本次进程的连接、等待和读取批量，不进入 Program 身份或 Flow Definition。修改后重新执行同一 SQL 和 state path 即可生效。`snapshot.mode`、offset、schema history、事件表示、过滤、topic/slot/client identity、queue 和 delivery 上限仍由 `DogPaddle` 管理。
+
+`retry_limit` 与 `retry_max_delay_ms` 映射 Debezium 的 connector error handler，只管理已进入 polling 后的可重试故障；它们不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。
+
+`connect_timeout_ms` 与 `query_timeout_ms` 是单次数据库操作的预算，不是整个 connector 启动预算。为避免启动永久阻塞，`DogPaddle` 仍以固定 60 秒等待 connector 进入 polling；这高于当前 Debezium 任务管理的默认 40 秒，也为 `MySQL` 默认 30 秒连接超时留出调度余量。更大的连接或查询预算在启动后的重连与查询中仍会生效，但不会延长这 60 秒 readiness 边界。
 
 SQL 不再接收 `runtime_bundle`、engine name、`PostgreSQL` slot、Sink ID 或 `MySQL` replication client ID。engine、slot 和 Sink ID 由 Program 身份、状态路径、endpoint 序号确定性派生；持久化的 `MySQL` engine name 再唯一确定 client ID，因此移动状态目录不会改变恢复身份。
 

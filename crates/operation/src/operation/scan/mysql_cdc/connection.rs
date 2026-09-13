@@ -1,6 +1,6 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, num::NonZeroU32, path::PathBuf, time::Duration};
 
-use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime};
+use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, ErrorKind};
 use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
 
 use super::definition::{CONNECTOR_CLASS, validate_spec};
@@ -8,6 +8,14 @@ use super::{MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType, schema}
 
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 30_000;
+const DEFAULT_QUERY_TIMEOUT_MS: i32 = 600_000;
+const MAX_JDBC_QUERY_TIMEOUT_MS: i32 = i32::MAX / 1_000 * 1_000;
+const DEFAULT_RETRY_LIMIT: i32 = -1;
+const RETRY_INITIAL_DELAY_MS: i32 = 300;
+const DEFAULT_RETRY_MAX_DELAY_MS: i32 = 10_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS: i32 = 1_000;
+const SNAPSHOT_HEARTBEAT_INTERVAL_MS: i32 = 1;
 const REPLICATION_CLIENT_ID_CONTEXT: &str =
     "dogpaddle MySQL CDC replication client ID derived from engine name v1";
 type ColumnRow = (
@@ -21,6 +29,143 @@ type ColumnRow = (
     String,
 );
 
+/// Runtime tuning for a [`MySqlCdcScanConfig`].
+///
+/// Defaults preserve the fixed discovery bounds and Debezium connector
+/// behavior used by the Scan. These options are ephemeral: they are neither
+/// encoded in the Operation Definition nor persisted in Flow state, so supply
+/// the desired values again when reopening a Flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MySqlCdcScanOptions {
+    discovery_connect_timeout: Duration,
+    discovery_query_timeout: Duration,
+    connect_timeout_ms: i32,
+    query_timeout_ms: i32,
+    retry_limit: i32,
+    retry_max_delay_ms: i32,
+    heartbeat_interval_ms: i32,
+    snapshot_fetch_size: Option<i32>,
+}
+
+impl MySqlCdcScanOptions {
+    /// Creates options with the Scan's stable runtime defaults.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            discovery_connect_timeout: DATABASE_TIMEOUT,
+            discovery_query_timeout: DATABASE_TIMEOUT,
+            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            query_timeout_ms: DEFAULT_QUERY_TIMEOUT_MS,
+            retry_limit: DEFAULT_RETRY_LIMIT,
+            retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+            heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            snapshot_fetch_size: None,
+        }
+    }
+
+    /// Sets both discovery and Debezium connection timeouts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, fractional-millisecond durations, or values whose
+    /// millisecond count exceeds a Java signed 32-bit integer.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Result<Self, MySqlCdcScanError> {
+        self.connect_timeout_ms = positive_milliseconds("connect_timeout", timeout)?;
+        self.discovery_connect_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets both discovery socket and Debezium query timeouts.
+    ///
+    /// Debezium 3.6 ultimately gives JDBC whole seconds, so a sub-second
+    /// remainder is rounded up for the connector while native discovery keeps
+    /// the exact duration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, fractional-millisecond durations, or values greater than
+    /// 2,147,483,000 milliseconds.
+    pub fn query_timeout(mut self, timeout: Duration) -> Result<Self, MySqlCdcScanError> {
+        let milliseconds = positive_milliseconds("query timeout", timeout)?;
+        if milliseconds > MAX_JDBC_QUERY_TIMEOUT_MS {
+            return Err(MySqlCdcScanError::invalid_options(
+                "query timeout exceeds 2,147,483,000 milliseconds",
+            ));
+        }
+        self.query_timeout_ms = milliseconds;
+        self.discovery_query_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets the finite number of Debezium retryable polling-failure retries.
+    ///
+    /// Zero disables retries. Leaving this option unset preserves Debezium's
+    /// unlimited `-1` default. This setting applies after connector startup;
+    /// it does not govern initial task startup.
+    ///
+    /// # Errors
+    ///
+    /// Rejects values greater than a Java signed 32-bit integer.
+    pub fn retry_limit(mut self, limit: u32) -> Result<Self, MySqlCdcScanError> {
+        self.retry_limit = i32::try_from(limit).map_err(|_| {
+            MySqlCdcScanError::invalid_options("retry limit exceeds Java Integer.MAX_VALUE")
+        })?;
+        Ok(self)
+    }
+
+    /// Sets the maximum delay between Debezium post-start polling retries.
+    ///
+    /// # Errors
+    ///
+    /// Rejects durations that are not whole milliseconds, exceed a Java
+    /// signed 32-bit integer, or are at most the fixed 300 ms initial delay.
+    pub fn retry_max_delay(mut self, delay: Duration) -> Result<Self, MySqlCdcScanError> {
+        let milliseconds = positive_milliseconds("retry_max_delay", delay)?;
+        if milliseconds <= RETRY_INITIAL_DELAY_MS {
+            return Err(MySqlCdcScanError::invalid_options(
+                "maximum retry delay must be greater than 300 milliseconds",
+            ));
+        }
+        self.retry_max_delay_ms = milliseconds;
+        Ok(self)
+    }
+
+    /// Sets the streaming heartbeat interval.
+    ///
+    /// Snapshot capture retains its fixed 1 ms heartbeat so that bootstrap
+    /// checkpoint behavior is independent of runtime tuning.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, fractional-millisecond durations, or values whose
+    /// millisecond count exceeds a Java signed 32-bit integer.
+    pub fn heartbeat_interval(mut self, interval: Duration) -> Result<Self, MySqlCdcScanError> {
+        self.heartbeat_interval_ms = positive_milliseconds("heartbeat_interval", interval)?;
+        Ok(self)
+    }
+
+    /// Sets the maximum rows in one Debezium snapshot fetch.
+    ///
+    /// By default the property is omitted completely, retaining the `MySQL`
+    /// connector's special streaming-result behavior.
+    ///
+    /// # Errors
+    ///
+    /// Rejects values greater than a Java signed 32-bit integer.
+    pub fn snapshot_fetch_size(mut self, rows: NonZeroU32) -> Result<Self, MySqlCdcScanError> {
+        self.snapshot_fetch_size = Some(i32::try_from(rows.get()).map_err(|_| {
+            MySqlCdcScanError::invalid_options("snapshot fetch size exceeds Java Integer.MAX_VALUE")
+        })?);
+        Ok(self)
+    }
+}
+
+impl Default for MySqlCdcScanOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Ephemeral `MySQL` credentials and the installed Debezium runtime bundle.
 ///
 /// This pilot explicitly uses unencrypted `MySQL` connections. Use it only
@@ -33,6 +178,7 @@ pub struct MySqlCdcScanConfig {
     database: String,
     user: String,
     password: String,
+    options: MySqlCdcScanOptions,
 }
 
 impl MySqlCdcScanConfig {
@@ -60,6 +206,7 @@ impl MySqlCdcScanConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            options: MySqlCdcScanOptions::new(),
         };
         if !config.runtime_bundle.is_absolute() || port == 0 {
             return Err(MySqlCdcScanError::new(
@@ -74,6 +221,13 @@ impl MySqlCdcScanConfig {
             return Err(MySqlCdcScanError::new("invalid MySQL connection fields"));
         }
         Ok(config)
+    }
+
+    /// Uses the supplied ephemeral runtime tuning.
+    #[must_use]
+    pub const fn options(mut self, options: MySqlCdcScanOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Discovers one preconfigured table before constructing a Flow Definition.
@@ -144,11 +298,13 @@ impl MySqlCdcScanConfig {
                 self.connector_config(expected, ConnectorMode::Snapshot)?,
                 None,
             )
-            .map_err(|error| {
-                MySqlCdcScanError::new(format!(
-                    "Debezium snapshot start failed ({:?})",
-                    error.kind()
-                ))
+            .map_err(|error| match error.kind() {
+                ErrorKind::Timeout => MySqlCdcScanError::new(
+                    "Debezium snapshot did not enter polling within DogPaddle's fixed 60-second readiness deadline",
+                ),
+                kind => MySqlCdcScanError::new(format!(
+                    "Debezium snapshot start failed ({kind:?})"
+                )),
             })
     }
 
@@ -171,11 +327,13 @@ impl MySqlCdcScanConfig {
                 self.connector_config(expected, ConnectorMode::Recovery)?,
                 Some(checkpoint),
             )
-            .map_err(|error| {
-                MySqlCdcScanError::new(format!(
-                    "Debezium connector start failed ({:?})",
-                    error.kind()
-                ))
+            .map_err(|error| match error.kind() {
+                ErrorKind::Timeout => MySqlCdcScanError::new(
+                    "Debezium connector did not enter polling within DogPaddle's fixed 60-second readiness deadline",
+                ),
+                kind => MySqlCdcScanError::new(format!(
+                    "Debezium connector start failed ({kind:?})"
+                )),
             })
     }
 
@@ -187,9 +345,9 @@ impl MySqlCdcScanConfig {
             .pass(Some(self.password.clone()))
             .db_name(Some(self.database.clone()))
             .prefer_socket(false)
-            .tcp_connect_timeout(Some(DATABASE_TIMEOUT))
-            .read_timeout(Some(DATABASE_TIMEOUT))
-            .write_timeout(Some(DATABASE_TIMEOUT));
+            .tcp_connect_timeout(Some(self.options.discovery_connect_timeout))
+            .read_timeout(Some(self.options.discovery_query_timeout))
+            .write_timeout(Some(self.options.discovery_query_timeout));
         Conn::new(options).map_err(|_| catalog_error("connect"))
     }
 
@@ -317,10 +475,6 @@ impl MySqlCdcScanConfig {
         let port = self.port.to_string();
         let replication_client_id = replication_client_id(&spec.engine_name).to_string();
         let snapshot_mode = mode.snapshot_mode();
-        let heartbeat_interval = match mode {
-            ConnectorMode::Snapshot => "1",
-            ConnectorMode::Recovery => "1000",
-        };
         let notification_topic = format!("__dogpaddle-notification.{}", spec.engine_name);
         // Definition identifiers are restricted to lowercase ASCII and '_'.
         let include = format!("^{}\\.{}$", spec.database, spec.table);
@@ -360,7 +514,6 @@ impl MySqlCdcScanConfig {
             ("tombstones.on.delete", "false"),
             ("provide.transaction.metadata", "false"),
             ("skipped.operations", "none"),
-            ("heartbeat.interval.ms", heartbeat_interval),
             ("max.batch.size", "1024"),
             ("max.queue.size", "2048"),
             ("max.queue.size.in.bytes", "16777216"),
@@ -371,6 +524,11 @@ impl MySqlCdcScanConfig {
             config = config.property(key, value).map_err(|_| {
                 MySqlCdcScanError::new("invalid fixed MySQL connector configuration")
             })?;
+        }
+        for (key, value) in connector_option_properties(&self.options, mode) {
+            config = config
+                .property(key, value)
+                .map_err(|_| MySqlCdcScanError::new("invalid MySQL connector runtime options"))?;
         }
         if matches!(mode, ConnectorMode::Snapshot) {
             for (key, value) in [
@@ -411,8 +569,63 @@ impl fmt::Debug for MySqlCdcScanConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"[redacted]")
+            .field("options", &self.options)
             .finish()
     }
+}
+
+fn positive_milliseconds(label: &str, duration: Duration) -> Result<i32, MySqlCdcScanError> {
+    let milliseconds = i32::try_from(duration.as_millis()).map_err(|_| {
+        MySqlCdcScanError::invalid_options(format!(
+            "{label} exceeds Java Integer.MAX_VALUE milliseconds"
+        ))
+    })?;
+    if milliseconds == 0
+        || Duration::from_millis(u64::try_from(milliseconds).expect("positive i32 fits u64"))
+            != duration
+    {
+        return Err(MySqlCdcScanError::invalid_options(format!(
+            "{label} must be a positive whole-millisecond duration"
+        )));
+    }
+    Ok(milliseconds)
+}
+
+fn connector_option_properties(
+    options: &MySqlCdcScanOptions,
+    mode: ConnectorMode,
+) -> Vec<(&'static str, String)> {
+    let heartbeat_interval_ms = match mode {
+        ConnectorMode::Snapshot => SNAPSHOT_HEARTBEAT_INTERVAL_MS,
+        ConnectorMode::Recovery => options.heartbeat_interval_ms,
+    };
+    let mut properties = vec![
+        ("connect.timeout.ms", options.connect_timeout_ms.to_string()),
+        (
+            "database.query.timeout.ms",
+            jdbc_query_timeout_millis(options.query_timeout_ms).to_string(),
+        ),
+        ("errors.max.retries", options.retry_limit.to_string()),
+        (
+            "errors.retry.delay.initial.ms",
+            RETRY_INITIAL_DELAY_MS.to_string(),
+        ),
+        (
+            "errors.retry.delay.max.ms",
+            options.retry_max_delay_ms.to_string(),
+        ),
+        ("heartbeat.interval.ms", heartbeat_interval_ms.to_string()),
+    ];
+    if matches!(mode, ConnectorMode::Snapshot)
+        && let Some(snapshot_fetch_size) = options.snapshot_fetch_size
+    {
+        properties.push(("snapshot.fetch.size", snapshot_fetch_size.to_string()));
+    }
+    properties
+}
+
+fn jdbc_query_timeout_millis(milliseconds: i32) -> i32 {
+    (milliseconds / 1_000 + i32::from(milliseconds % 1_000 != 0)) * 1_000
 }
 
 fn column_type(
@@ -472,7 +685,12 @@ fn replication_client_id(engine_name: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectorMode, replication_client_id};
+    use std::{num::NonZeroU32, time::Duration};
+
+    use super::{
+        ConnectorMode, DATABASE_TIMEOUT, MySqlCdcScanOptions, connector_option_properties,
+        replication_client_id,
+    };
 
     #[test]
     fn snapshot_then_recovery_are_the_only_connector_modes() {
@@ -487,6 +705,74 @@ mod tests {
         assert_ne!(
             replication_client_id("orders"),
             replication_client_id("users")
+        );
+    }
+
+    #[test]
+    fn connector_options_pin_defaults_without_setting_snapshot_fetch_size() {
+        let options = MySqlCdcScanOptions::new();
+        assert_eq!(options.discovery_connect_timeout, DATABASE_TIMEOUT);
+        assert_eq!(options.discovery_query_timeout, DATABASE_TIMEOUT);
+        assert_eq!(
+            connector_option_properties(&options, ConnectorMode::Snapshot),
+            vec![
+                ("connect.timeout.ms", "30000".to_owned()),
+                ("database.query.timeout.ms", "600000".to_owned()),
+                ("errors.max.retries", "-1".to_owned()),
+                ("errors.retry.delay.initial.ms", "300".to_owned()),
+                ("errors.retry.delay.max.ms", "10000".to_owned()),
+                ("heartbeat.interval.ms", "1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            connector_option_properties(&options, ConnectorMode::Recovery),
+            vec![
+                ("connect.timeout.ms", "30000".to_owned()),
+                ("database.query.timeout.ms", "600000".to_owned()),
+                ("errors.max.retries", "-1".to_owned()),
+                ("errors.retry.delay.initial.ms", "300".to_owned()),
+                ("errors.retry.delay.max.ms", "10000".to_owned()),
+                ("heartbeat.interval.ms", "1000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_options_map_explicit_values_and_keep_snapshot_heartbeat_fixed() {
+        let options = MySqlCdcScanOptions::new()
+            .connect_timeout(Duration::from_millis(7))
+            .unwrap()
+            .query_timeout(Duration::from_millis(8))
+            .unwrap()
+            .retry_limit(9)
+            .unwrap()
+            .retry_max_delay(Duration::from_millis(301))
+            .unwrap()
+            .heartbeat_interval(Duration::from_millis(11))
+            .unwrap()
+            .snapshot_fetch_size(NonZeroU32::new(12).unwrap())
+            .unwrap();
+        assert_eq!(options.discovery_connect_timeout, Duration::from_millis(7));
+        assert_eq!(options.discovery_query_timeout, Duration::from_millis(8));
+        assert_eq!(
+            connector_option_properties(&options, ConnectorMode::Snapshot),
+            vec![
+                ("connect.timeout.ms", "7".to_owned()),
+                ("database.query.timeout.ms", "1000".to_owned()),
+                ("errors.max.retries", "9".to_owned()),
+                ("errors.retry.delay.initial.ms", "300".to_owned()),
+                ("errors.retry.delay.max.ms", "301".to_owned()),
+                ("heartbeat.interval.ms", "1".to_owned()),
+                ("snapshot.fetch.size", "12".to_owned()),
+            ]
+        );
+        assert_eq!(
+            connector_option_properties(&options, ConnectorMode::Recovery)[5],
+            ("heartbeat.interval.ms", "11".to_owned())
+        );
+        assert_eq!(
+            connector_option_properties(&options, ConnectorMode::Recovery).len(),
+            6
         );
     }
 }

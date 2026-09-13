@@ -61,9 +61,12 @@ identity mismatch。
 
 SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
-Endpoint 证据固定覆盖 `postgres_cdc(connection,table,publication[,bootstrap_spool_bytes])`、
-`mysql_cdc(connection,table[,bootstrap_spool_bytes])` 和 `postgres(connection,table)`；默认 spool 必须等价于显式
-1 GiB，旧的 split connection、runtime、engine、slot、sink 和 client-ID 参数必须作为 unknown parameter 拒绝。
+Endpoint 证据固定覆盖 `postgres_cdc(connection,table,publication[,bootstrap_spool_bytes][,CDC tuning...])`、
+`mysql_cdc(connection,table[,bootstrap_spool_bytes][,CDC tuning...])` 和 `postgres(connection,table)`；CDC tuning
+包含 connect/query timeout、retry limit/max delay、streaming heartbeat 和 snapshot fetch size，必须证明类型与范围校验在
+Store/source I/O 前完成、准确映射到具体 connector、bootstrap heartbeat 不可覆盖、MySQL 未设置 fetch size 时不写 property，
+且修改 tuning 后 Program identity 不变。默认 spool 必须等价于显式 1 GiB，旧的 split connection、runtime、engine、slot、sink
+和 client-ID 参数必须作为 unknown parameter 拒绝。
 连接 URL 的 secret 与 transient host/port 不改变 Program identity，database、qualified table、publication、spool
 和查询语义必须改变 identity。CDC 测试只用绝对 `DOGPADDLE_DEBEZIUM_RUNTIME` 指向构建产物。
 

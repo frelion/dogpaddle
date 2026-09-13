@@ -22,7 +22,13 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
         FROM postgres_cdc(
             connection => env('DOGPADDLE_SOURCE_DATABASE_URL'),
             table => 'public.orders',
-            publication => 'orders_publication'
+            publication => 'orders_publication',
+            connect_timeout_ms => 5000,
+            query_timeout_ms => 6000,
+            retry_limit => 12,
+            retry_max_delay_ms => 12000,
+            heartbeat_interval_ms => 2000,
+            snapshot_fetch_size => 4096
         ) AS orders
     ";
     SqlProgram::parse(postgres).unwrap();
@@ -32,7 +38,13 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
         SELECT id, amount
         FROM mysql_cdc(
             connection => env('DOGPADDLE_SOURCE_DATABASE_URL'),
-            table => 'app.orders'
+            table => 'app.orders',
+            connect_timeout_ms => 5000,
+            query_timeout_ms => 6000,
+            retry_limit => 12,
+            retry_max_delay_ms => 12000,
+            heartbeat_interval_ms => 2000,
+            snapshot_fetch_size => 4096
         ) AS orders
     ";
     SqlProgram::parse(mysql).unwrap();
@@ -294,6 +306,64 @@ fn start_rejects_zero_bootstrap_spool_capacity_before_source_io() {
         assert!(program.start(&flow_path).is_err());
         assert!(!flow_path.exists());
     }
+}
+
+#[test]
+fn start_rejects_invalid_cdc_tuning_before_source_or_state_io() {
+    let root = tempfile::tempdir().unwrap();
+    let common = [
+        ("connect_timeout_ms", "0"),
+        ("query_timeout_ms", "0"),
+        ("query_timeout_ms", "2147483001"),
+        ("retry_limit", "2147483648"),
+        ("retry_max_delay_ms", "300"),
+        ("heartbeat_interval_ms", "0"),
+        ("snapshot_fetch_size", "0"),
+    ];
+    let mut programs = Vec::new();
+    for (name, value) in common {
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.orders', publication => 'orders_publication', \
+                {name} => {value}\
+            )"
+        ));
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.orders', {name} => {value}\
+            )"
+        ));
+    }
+
+    for (index, sql) in programs.iter().enumerate() {
+        let state_path = root.path().join(format!("invalid-tuning-{index}"));
+        let program = SqlProgram::parse(sql).unwrap();
+        let Err(error) = program.start(&state_path) else {
+            panic!("invalid CDC tuning unexpectedly started")
+        };
+        assert!(matches!(error, SqlError::Invalid(_)));
+        assert!(error.to_string().contains(common[index / 2].0));
+        assert!(!state_path.exists());
+    }
+}
+
+#[test]
+fn unknown_cdc_tuning_reports_the_supported_sql_vocabulary() {
+    let Err(error) = SqlProgram::parse(
+        "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+            connection => 'postgresql://user:secret@127.0.0.1/app', \
+            table => 'public.orders', publication => 'orders_publication', \
+            heartbeat_intervl_ms => 1000\
+        )",
+    ) else {
+        panic!("misspelled CDC tuning unexpectedly parsed")
+    };
+    let message = error.to_string();
+    assert!(message.contains("unknown postgres_cdc parameter \"heartbeat_intervl_ms\""));
+    assert!(message.contains("\"heartbeat_interval_ms\""));
+    assert!(!message.contains("secret"));
 }
 
 #[test]
@@ -727,7 +797,7 @@ fn start_resolves_every_endpoint_parameter_before_selecting_state_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let variable = "DOGPADDLE_SQL_CORRECTNESS_START_MISSING_91F6E33D";
     assert!(std::env::var_os(variable).is_none());
-    let programs = [
+    let mut programs = vec![
         format!("INSERT INTO discard() SELECT value FROM sequence(start => env('{variable}'))"),
         format!(
             "INSERT INTO sqlite(path => env('{variable}'), table => 'events') \
@@ -790,6 +860,29 @@ fn start_resolves_every_endpoint_parameter_before_selecting_state_lifecycle() {
              ) SELECT value FROM sequence(start => 0)"
         ),
     ];
+
+    for parameter in [
+        "connect_timeout_ms",
+        "query_timeout_ms",
+        "retry_limit",
+        "retry_max_delay_ms",
+        "heartbeat_interval_ms",
+        "snapshot_fetch_size",
+    ] {
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.events', publication => 'events_publication', \
+                {parameter} => env('{variable}')\
+            )"
+        ));
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.events', {parameter} => env('{variable}')\
+            )"
+        ));
+    }
 
     for (index, sql) in programs.iter().enumerate() {
         let flow_path = root.path().join(format!("flow-{index}"));

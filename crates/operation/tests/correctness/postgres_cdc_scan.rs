@@ -4,13 +4,17 @@ use dogpaddle_operation::{
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{
-            PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn,
-            PostgresType,
+            PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanOptions,
+            PostgresCdcScanSpec, PostgresColumn, PostgresType,
         },
     },
 };
 use dogpaddle_store::{Cell, Queue, Store, Transactions};
-use std::{num::NonZeroU64, path::Path};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+    time::Duration,
+};
 
 use super::support::decode_hex;
 
@@ -314,8 +318,15 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
 
 #[test]
 fn postgres_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_setup() {
-    let debug = format!("{:?}", config());
+    let options = PostgresCdcScanOptions::new()
+        .retry_limit(3)
+        .unwrap()
+        .heartbeat_interval(Duration::from_secs(2))
+        .unwrap();
+    let debug = format!("{:?}", config().options(options));
     assert!(debug.contains("[redacted]"));
+    assert!(debug.contains("PostgresCdcScanOptions"));
+    assert!(debug.contains("retry_limit: 3"));
     assert!(!debug.contains("do-not-persist-this-password"));
     assert!(
         PostgresCdcScanConfig::new_unencrypted("relative", "host", 5432, "db", "user", "password")
@@ -323,6 +334,46 @@ fn postgres_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_
     );
     assert!(
         PostgresCdcScanConfig::new_unencrypted("/bundle", "host", 0, "db", "user", "password")
+            .is_err()
+    );
+}
+
+#[test]
+fn postgres_cdc_runtime_options_validate_java_bounds_before_external_io() {
+    let defaults = PostgresCdcScanOptions::new();
+    assert_eq!(defaults, PostgresCdcScanOptions::default());
+
+    let too_large = Duration::from_millis(u64::try_from(i32::MAX).unwrap() + 1);
+    for invalid in [Duration::ZERO, Duration::from_nanos(1), too_large] {
+        assert!(defaults.connect_timeout(invalid).is_err());
+        assert!(defaults.query_timeout(invalid).is_err());
+        assert!(defaults.heartbeat_interval(invalid).is_err());
+        assert!(defaults.retry_max_delay(invalid).is_err());
+    }
+
+    assert!(
+        defaults
+            .retry_max_delay(Duration::from_millis(300))
+            .is_err()
+    );
+    assert!(defaults.retry_max_delay(Duration::from_millis(301)).is_ok());
+    assert!(
+        defaults
+            .query_timeout(Duration::from_millis(2_147_483_001))
+            .is_err()
+    );
+
+    let maximum = u32::try_from(i32::MAX).unwrap();
+    assert!(defaults.retry_limit(maximum).is_ok());
+    assert!(defaults.retry_limit(maximum + 1).is_err());
+    assert!(
+        defaults
+            .snapshot_fetch_size(NonZeroU32::new(maximum).unwrap())
+            .is_ok()
+    );
+    assert!(
+        defaults
+            .snapshot_fetch_size(NonZeroU32::new(maximum + 1).unwrap())
             .is_err()
     );
 }

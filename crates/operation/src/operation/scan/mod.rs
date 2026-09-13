@@ -6,10 +6,11 @@ pub(crate) mod sequence;
 
 pub use mysql_cdc::{
     MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanOperation,
-    MySqlCdcScanSpec, MySqlColumn, MySqlType,
+    MySqlCdcScanOptions, MySqlCdcScanSpec, MySqlColumn, MySqlType,
 };
 pub use postgres_cdc::{
     PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanError,
-    PostgresCdcScanOperation, PostgresCdcScanSpec, PostgresColumn, PostgresType,
+    PostgresCdcScanOperation, PostgresCdcScanOptions, PostgresCdcScanSpec, PostgresColumn,
+    PostgresType,
 };
 pub use sequence::{SequenceScanDefinition, SequenceScanError, SequenceScanOperation};

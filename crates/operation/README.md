@@ -322,6 +322,23 @@ Station output，再进入持续流阶段。spool 容量是硬限制；超限的
 两个 CDC Scan 都固定单表 Schema，运行中不支持在线 DDL、TLS 或跨实例 fencing。捕获阶段 reopen
 会清理未完成快照并从头再做，不从半个快照继续。
 
+`PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
+timeout、进入 polling 后的有限重试次数与最大等待、持续流 heartbeat 和初始 snapshot fetch size。默认显式固定
+5 秒连接与查询 timeout、无限重试、300 毫秒初始/10 秒最大重试等待、1 秒持续流 heartbeat 和
+10240 行 snapshot fetch。捕获阶段 heartbeat 始终为 1 毫秒。PostgreSQL JDBC 的连接 timeout 与
+Debezium JDBC 的 query timeout 都以秒生效，因此 connector 值会向上取整；native discovery 仍使用
+精确毫秒值。这些选项不进入 Definition 或持久状态，reopen 时需要重新提供。
+
+`MySqlCdcScanOptions` 为运行资源提供类型化调优，并由 `MySqlCdcScanConfig` 翻译成固定版本的
+Debezium properties。它可以同时调整 discovery 与 connector 的连接/查询 timeout、进入 polling 后的有限重试次数、
+最大重试等待、持续流 heartbeat 和可选 snapshot fetch size。默认显式固定 Debezium 的 30 秒连接、
+10 分钟查询、无限重试、300 毫秒初始/10 秒最大重试等待与 1 秒持续流 heartbeat；discovery 仍固定
+5 秒。初始快照 heartbeat 始终为 1 毫秒。Debezium JDBC 的 query timeout 向上取整到整秒，discovery
+的 socket timeout 保留精确毫秒值。MySQL 的 snapshot fetch 默认会完全省略 property，以保留
+Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 snapshot connector。这些选项不进入
+Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
+`dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
+
 `SQLite` 与 `PostgreSQL` Sink 共用关系写入协议：先在 Store 中持久化至多 1024 个具体 mutation，
 提交后在目标数据库的一个事务中按稳定 `$dogpaddle.id` 幂等执行，下一 turn 再结算输入。目标已经
 提交而本地尚未结算时会重投当前批次。

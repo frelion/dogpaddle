@@ -171,12 +171,14 @@ host；产品 archive 在固定 `bin/` 与 `libexec/` 布局中组合两者。
 
 | 调用 | deadline |
 | --- | --- |
-| `start` | 固定 30 秒 |
+| `start` | 固定 60 秒 |
 | `poll` | 调用方传入 |
 | `Delivery::ack` | 固定 30 秒 |
 | `stop` | 调用方传入 |
 
 这些都是同步 API。`poll` 超时返回 `Ok(None)`，表示当前没有一批可交付数据，不代表 connector 已结束。
+`start` 的 60 秒是整个 connector 进入 polling 的 readiness 上限，与具体 connector 的单次连接和查询超时相互独立；
+它高于当前 Debezium Async Engine 默认的 40 秒 task-management 上限。
 
 `ConnectorConfig::max_delivery_bytes` 限制一次完成后跨 JNI 复制的编码 frame，默认 16 MiB。它不限制 JVM heap、
 connector 内部队列或数据库日志占用。单个 delivery 超限是终止性 connector 错误，需要调整配置并重启。

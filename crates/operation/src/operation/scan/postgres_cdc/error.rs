@@ -7,6 +7,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PostgresCdcScanError {
+    /// The ephemeral connector tuning is invalid.
+    #[error("invalid PostgreSQL CDC scan options: {0}")]
+    InvalidOptions(String),
     /// The non-sensitive Scan definition is invalid.
     #[error("invalid PostgreSQL CDC scan definition: {0}")]
     InvalidDefinition(String),
@@ -37,6 +40,10 @@ pub enum PostgresCdcScanError {
 }
 
 impl PostgresCdcScanError {
+    pub(super) fn invalid_options(message: impl Into<String>) -> Self {
+        Self::InvalidOptions(message.into())
+    }
+
     pub(super) fn new(message: impl Into<String>) -> Self {
         Self::InvalidRuntime(message.into())
     }

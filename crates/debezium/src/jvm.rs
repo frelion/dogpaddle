@@ -9,7 +9,7 @@ use crate::bundle::Bundle;
 use crate::connector::Connector;
 use crate::{Checkpoint, ConnectorConfig, Error, ErrorKind};
 
-const START_TIMEOUT: Duration = Duration::from_secs(30);
+const START_TIMEOUT: Duration = Duration::from_mins(1);
 const BRIDGE_PROTOCOL_VERSION: i32 = 1;
 const FAILURE_NONE: i32 = 0;
 const FAILURE_DELIVERY_TOO_LARGE: i32 = 1;
@@ -264,7 +264,10 @@ impl JvmHost {
         } else {
             Err(Error::new(
                 ErrorKind::Timeout,
-                "embedded Debezium connector did not start within 30 seconds",
+                format!(
+                    "embedded Debezium connector did not start within {} seconds",
+                    START_TIMEOUT.as_secs()
+                ),
             ))
         }
     }
