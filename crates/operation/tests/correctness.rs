@@ -1,5 +1,7 @@
 #[path = "correctness/aggregate.rs"]
 mod aggregate;
+#[path = "correctness/asof_join.rs"]
+mod asof_join;
 #[path = "correctness/atomic.rs"]
 mod atomic;
 #[path = "correctness/definition_codec.rs"]

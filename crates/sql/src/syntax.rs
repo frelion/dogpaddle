@@ -303,6 +303,10 @@ fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
             | JoinOperator::RightAnti(JoinConstraint::On(condition)) => {
                 validate_join_condition(condition)?;
             }
+            JoinOperator::AsOf {
+                match_condition: _,
+                constraint: JoinConstraint::On(_) | JoinConstraint::Using(_) | JoinConstraint::None,
+            } => {}
             _ => {
                 return Err(SqlError::Unsupported("join type or constraint".to_owned()));
             }

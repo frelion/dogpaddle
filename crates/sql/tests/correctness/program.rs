@@ -109,6 +109,26 @@ fn parse_accepts_residuals_for_the_equality_join_family() {
 }
 
 #[test]
+fn parse_accepts_the_native_asof_join_surface() {
+    for (comparison, constraint) in [
+        (">=", ""),
+        (">", "ON left_scan.value = right_scan.value"),
+        ("<=", "USING (value)"),
+        ("<", ""),
+    ] {
+        SqlProgram::parse(&format!(
+            "INSERT INTO discard() \
+             SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value {comparison} right_scan.value) \
+             {constraint}"
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
 fn parse_rejects_join_constraints_and_conditions_outside_the_family() {
     let queries = [
         (
@@ -744,6 +764,60 @@ fn invalid_plan_shapes_fail_without_creating_a_flow() {
         if let Ok(program) = SqlProgram::parse(&sql) {
             assert!(program.start(&flow_path).is_err(), "started {case}");
         }
+        assert!(!flow_path.exists(), "{case} created a Flow path");
+    }
+}
+
+#[test]
+fn invalid_asof_plan_shapes_fail_without_creating_a_flow() {
+    let queries = [
+        (
+            "equality match operator",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value = right_scan.value)",
+        ),
+        (
+            "mixed ON predicates",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value >= right_scan.value) \
+             ON left_scan.value = right_scan.value \
+             AND left_scan.value > right_scan.value",
+        ),
+        (
+            "reversed match sides",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (right_scan.value >= left_scan.value)",
+        ),
+        (
+            "floating match type",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (\
+                 CAST(left_scan.value AS DOUBLE) >= CAST(right_scan.value AS DOUBLE)\
+             )",
+        ),
+        (
+            "floating equality type",
+            "SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value >= right_scan.value) \
+             ON CAST(left_scan.value AS DOUBLE) = CAST(right_scan.value AS DOUBLE)",
+        ),
+    ];
+
+    let root = tempfile::tempdir().unwrap();
+    for (index, (case, query)) in queries.into_iter().enumerate() {
+        let flow_path = root.path().join(format!("invalid-asof-{index}"));
+        let program = SqlProgram::parse(&format!("INSERT INTO discard() {query}")).unwrap();
+        assert!(program.start(&flow_path).is_err(), "started {case}");
         assert!(!flow_path.exists(), "{case} created a Flow path");
     }
 }

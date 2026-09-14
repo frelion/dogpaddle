@@ -1,7 +1,8 @@
 # DogPaddle 算子与执行内核路线图
 
 本文定义 DogPaddle 算子体系和执行内核的演进阶段、语义边界、交付物与退出标准。
-它是实施路线；阶段 0/1、阶段 3 的 Distinct、阶段 4 的 grouped Aggregate 和阶段 5 的 EquiJoin family 已完成，
+它是实施路线；阶段 0/1、阶段 3 的 Distinct、阶段 4 的 grouped Aggregate，以及阶段 5 的
+EquiJoin family 与 Dynamic ASOF Join 已完成，
 后续候选算子或用户接口仍不表示已经交付。当前精确能力以根目录 [`README.md`](README.md) 和各产品
 crate 的 README 为准。
 
@@ -17,7 +18,7 @@ DogPaddle 的核心产品不是某一种查询语言，而是一套嵌入式、�
 - 由其他应用或语言编译得到的持久化计划。
 
 这些接口都只是上层适配器，不进入 Change、Store、Operation 或 Flow 的核心语义。SQL v1 已用无状态算子、
-Distinct、grouped Aggregate 和 EquiJoin family 证明这条分层路径，其余接口仍是候选。路线首先回答：
+Distinct、grouped Aggregate、EquiJoin family 和 Dynamic ASOF Join 证明这条分层路径，其余接口仍是候选。路线首先回答：
 
 1. 一组算子是否拥有精确、可组合、可持久恢复的行为；
 2. 状态算子能否正确解释有序、带正负 diff 的变化流；
@@ -53,6 +54,7 @@ Distinct、grouped Aggregate 和 EquiJoin family 证明这条分层路径，其�
 | Transform | Distinct | 按完整记录的当前正权重维护存在性 | 已完成首个持久状态关系算子 |
 | Transform | Aggregate | 按非空 group key 持续维护多个聚合结果 | 已完成阶段 4 最小纵向切片 |
 | Transform | EquiJoin | 按等值 key 增量维护 Inner、Semi/Anti 和 Outer 关系并有界发布 fan-out | 已完成阶段 5 |
+| Transform | AsOfJoin | 按等值分区和有序条件动态维护单候选 Inner、Left Outer/Semi/Anti | 已完成阶段 5；无 watermark 时永久保留两侧历史 |
 | Transform | Project | 严格递增顶层索引的零拷贝删列 | 保留为结构/物理优化算子 |
 | Transform | Filter | DataFusion Boolean Expr 行过滤 | 保留为基础无状态算子 |
 | Transform | Extend | 保留输入并追加一个表达式列 | 保留为基础无状态算子 |
@@ -63,15 +65,18 @@ Distinct、grouped Aggregate 和 EquiJoin family 证明这条分层路径，其�
 | Sink | PostgresSink | 将单输入 exact relation 幂等物化到独占的固定 Schema PostgreSQL 表 | 已有远端试点；TLS、在线演进与发布门仍待实施 |
 | Sink | Discard | 无副作用地完成输入 | 保留为测试和显式丢弃终点 |
 
-当前十六个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
+当前十七个内建算子已进入统一能力/conformance 表；覆盖度仍小，但已实现行为的可靠性边界值得
 继续保留。后续工作重点是扩展算子族和公共
 conformance，而不是让某个上层 API 反向定义运行内核。
 
 当前 `dogpaddle-sql` 接受一条直接的 `INSERT INTO sqlite/postgres/discard(...) Query`，Scan 直接写成
 `FROM sequence/postgres_cdc/mysql_cdc(...)`。它用 DataFusion 完成解析、类型分析和 coercion，把 TableScan、
-Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL`、非空 `GROUP BY` 与 EquiJoin family lowering 为现有 Definition DAG。
+Projection、Filter、非递归 CTE、`SELECT DISTINCT`、`UNION ALL`、非空 `GROUP BY`、EquiJoin family
+与 left-preserving 原生 `ASOF JOIN` lowering 为现有 Definition DAG。
 SQL 聚合支持 `COUNT/SUM/AVG/MIN/MAX` 和纯分组；SQL 不建立 DogPaddle Table、View、catalog、独立状态或执行层。
-SQL Join 支持 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti；每个 Join 至少有一个跨输入等值 key，Inner residual 作为同 Station Atomic Filter，其他 kind 只接受等值合取。Cross/Natural/Using Join、纯非等值 Join、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
+普通 SQL Join 支持 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti；每个普通 Join 至少有一个
+跨输入等值 key，剩余 `ON` 合取作为 EquiJoin candidate residual。SQL ASOF 支持四种 strict/exact
+前后向 `MATCH_CONDITION`，可选普通等值 `ON`/`USING`，并允许全局分区。Cross/Natural Join、普通纯非等值 Join、global aggregate、grouping sets、聚合 UDF/修饰符、普通 `UNION`、`DISTINCT ON`、Sort、Limit 和 Window
 必须在建库前拒绝。`SqlProgram::start` 在状态路径缺失时持久化 canonical Flow Definition，已有路径则先
 校验 Program identity 再以磁盘 Definition 恢复；任何恢复失败都不回退构建。SQL 语义变更要求新路径。
 
@@ -231,7 +236,7 @@ Rust Builder、SQL 或其他接口可以保存自己的 Scan 描述，用于解�
 | 2（进行中） | 打通真实 Scan/Sink | PostgresCdcScan、MySqlCdcScan、SqliteSink、PostgresSink、ResultLog、Materialize | 不依赖测试 Scan/Sink 的真实数据闭环 |
 | 3（已完成最小切片） | 建立精确行权重状态 | `OrderedMultiset`、完整 canonical row identity、Distinct | 首个持久状态关系算子 |
 | 4（已完成最小切片） | 完成 Aggregate 与多重集算子 | grouped COUNT/SUM/AVG/MIN/MAX；global/set ops/UDF 待续 | 可持续维护首个分组聚合关系 |
-| 5（已完成） | 完成 EquiJoin 算子族 | Inner、Left Semi/Anti、Left/Full Outer；SQL Right 改写与 Inner residual 融合 | 常见等值关系的可恢复增量计算 |
+| 5（已完成） | 完成 EquiJoin 与 Dynamic ASOF 算子族 | EquiJoin 全部 kind 的原生 residual 与 SQL Right 改写；Dynamic ASOF 的方向、保留、tolerance、tie、residual、双侧修正与 SQL lowering | 常见等值关系及有序单候选关系的可恢复增量计算 |
 | 6 | 引入有界、顺序与时间语义 | Barrier、TopK、Window、watermark | 明确承载完成、排序和时间计算 |
 | 7 | 完成运行产品化与上层 API 就绪 | lifecycle、连接器协议、observability、capability catalog | 多种用户 API 可稳定构建同一内核 |
 
@@ -648,7 +653,7 @@ zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema i
 
 ## 阶段 5：Join 算子族
 
-**状态：常用 EquiJoin family 已完成。**
+**状态：常用 EquiJoin family 与完整 Dynamic ASOF Operation 已完成。**
 
 Join key expression、双边状态、有界 fan-out，以及 Join 与现有线性多 Operation Station 的边界见
 [`docs/plans/operator-pipelines-and-join.md`](docs/plans/operator-pipelines-and-join.md)。一个统一的
@@ -668,7 +673,8 @@ Filter 和 Projection 继续使用已有 Atomic 尾链。
 2. Left Semi/Anti Join（已完成）；
 3. Left/Full Outer Join（已完成）；
 4. SQL Right Outer/Semi/Anti swap lowering（已完成）；
-5. SQL Inner residual 的 Atomic Filter 融合（已完成）。
+5. 全部 EquiJoin kind 的原生 candidate residual（已完成）；
+6. Dynamic ASOF 的 backward/forward/nearest、tolerance、tie、residual、双侧修正与原生 SQL lowering（已完成）。
 
 ### 状态和 diff
 
@@ -711,11 +717,14 @@ EquiJoin 已验证：
 - NULL key、unmatched/matched 状态、负前缀与 overflow；
 - 有界分页、backpressure、reopen 和 corruption；
 - 五种底层 kind 的独立关系 oracle、outer nullability、同一 Claim 内 presence 往返；
-- SQL qualified column、同名字段、key expression、Right swap、Inner residual、确定性 Station grouping 和 drop/start 恢复。
+- SQL qualified column、同名字段、key expression、Right swap、全 Join family residual、确定性 Station grouping 和 drop/start 恢复。
 
-Operation 仍保持纯 equi，不把 residual 放进 Join 状态机。SQL 只对 Inner residual 使用等价的 fused Filter；
-Outer/Semi/Anti residual、Cross/Natural/Using、非等值 Join、共享 arrangement 和成本型 join order 留给
-未来有真实需求和状态语义后再设计。
+`AsOfJoin` 另以 ordered maps 持久化两侧 exact-row weights，覆盖 backward/forward/nearest、exactness、
+tolerance、NULL-safe equality、确定性 tie、candidate residual 与 right presence 引发的历史 left 重配。
+Operation 提供 Inner、Left Outer/Semi/Anti；没有 occurrence identity 时，Right/Full ASOF 的 unmatched
+right-copy 数量不能由 exact-row weighted relation 唯一决定，因此不以扫描顺序伪造语义。SQL 只降低
+DataFusion 原生 node 真正携带的 left-preserving 四方向能力。Cross/Natural、普通纯非等值 Join、共享
+arrangement 和成本型 join order 留给未来有真实需求和状态语义后再设计。
 
 ## 阶段 6：有界、顺序与时间算子
 
@@ -953,6 +962,7 @@ exact-row weights（已完成）
 → Distinct（已完成）
 → Group Aggregate：COUNT/SUM/AVG/MIN/MAX（最小切片已完成）
 → EquiJoin family（已完成）
+→ Dynamic ASOF Join（已完成）
 → Global Aggregate / multiset set ops / aggregate UDF
 ```
 
@@ -960,6 +970,8 @@ Distinct 用完整 canonical row 与 `OrderedMultiset` 建立 checked weight 语
 `OrderedMap`、`PartitionedMultiset` 与 `Cell`，新增私有 group ID、exact admission、Fold/Extrema
 descriptor 和有序 argument layout。EquiJoin 用两份私有 `PartitionedMultiset`、非 Inner kind 的
 presence counts 和一个最小 continuation 持久化双边关系与有界 fan-out；没有预建共享 arrangement。
+AsOfJoin 用两份私有 `OrderedMap` 和一个 continuation 持久化有序双边关系与可恢复历史重配，同样没有
+提升为共享 arrangement。
 
 ## 开放决策
 
@@ -978,14 +990,14 @@ presence counts 和一个最小 continuation 持久化双边关系与有界 fan-
 - bounded Sort、持续 TopK 和 Window 各自的完成及 retention 边界是什么？
 - 多个 Flow 是否共享输入 `SubscribedLog` 或 arrangement；若共享，由哪个组合根声明 subscriptions 并拥有 retention？
 - 何时引入 partition/exchange，而不破坏唯一 writer 和确定性提交？
-- SQL 在非 Inner residual、非等值/时间 Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
+- SQL 在 range/interval/time Join、global Aggregate、aggregate UDF、Window 等底层能力完成后扩展到哪些语法，以及何时需要只读
   capability/introspection？
 
 ## 内核稳定准入定义
 
 只有同时满足以下条件，算子与执行内核才进入稳定接口评估：
 
-- 基础无状态、结构、真实 Scan/Sink、Materialize、Distinct、Aggregate 和常用 EquiJoin family 有完整证据；
+- 基础无状态、结构、真实 Scan/Sink、Materialize、Distinct、Aggregate、常用 EquiJoin family 和 Dynamic ASOF Join 有完整证据；
 - Change 的 diff、顺序、重复和重批语义在所有算子族中一致；
 - 关系状态统一处理 weight、负前缀、overflow、zero cleanup 和 reopen；
 - exact Schema 对齐、实用 Date/Timestamp/Decimal 类型和表达式能力矩阵可用；

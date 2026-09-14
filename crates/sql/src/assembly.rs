@@ -4,8 +4,8 @@ use dogpaddle_flow::{FlowError, FlowFactory, StationRef};
 use dogpaddle_operation::{
     OperationDefinition, OperationKind,
     operation::transform::{
-        AggregateDefinition, DistinctDefinition, EquiJoinDefinition, FilterDefinition,
-        SchemaAlignDefinition, UnionAllDefinition,
+        AggregateDefinition, AsOfJoinDefinition, DistinctDefinition, EquiJoinDefinition,
+        FilterDefinition, SchemaAlignDefinition, UnionAllDefinition,
     },
 };
 
@@ -94,6 +94,7 @@ pub(crate) enum LogicalOperator {
 
 pub(crate) enum TransformDefinition {
     Aggregate(AggregateDefinition),
+    AsOfJoin(AsOfJoinDefinition),
     Distinct(DistinctDefinition),
     Filter(FilterDefinition),
     EquiJoin(EquiJoinDefinition),
@@ -104,6 +105,12 @@ pub(crate) enum TransformDefinition {
 impl From<AggregateDefinition> for TransformDefinition {
     fn from(definition: AggregateDefinition) -> Self {
         Self::Aggregate(definition)
+    }
+}
+
+impl From<AsOfJoinDefinition> for TransformDefinition {
+    fn from(definition: AsOfJoinDefinition) -> Self {
+        Self::AsOfJoin(definition)
     }
 }
 
@@ -163,6 +170,7 @@ impl TransformDefinition {
     fn definition(&self) -> &dyn OperationDefinition {
         match self {
             Self::Aggregate(definition) => definition,
+            Self::AsOfJoin(definition) => definition,
             Self::Distinct(definition) => definition,
             Self::Filter(definition) => definition,
             Self::EquiJoin(definition) => definition,
@@ -186,6 +194,7 @@ impl TransformDefinition {
     fn append(self, factory: &mut FlowFactory, station: StationRef) -> Result<(), SqlError> {
         match self {
             Self::Aggregate(definition) => factory.append(station, definition),
+            Self::AsOfJoin(definition) => factory.append(station, definition),
             Self::Distinct(definition) => factory.append(station, definition),
             Self::Filter(definition) => factory.append(station, definition),
             Self::EquiJoin(definition) => factory.append(station, definition),
@@ -302,6 +311,7 @@ impl TransformDefinition {
     fn emit(self, factory: &mut FlowFactory, id: &str) -> StationRef {
         match self {
             Self::Aggregate(definition) => factory.station(id, definition),
+            Self::AsOfJoin(definition) => factory.station(id, definition),
             Self::Distinct(definition) => factory.station(id, definition),
             Self::Filter(definition) => factory.station(id, definition),
             Self::EquiJoin(definition) => factory.station(id, definition),

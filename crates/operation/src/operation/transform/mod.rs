@@ -1,6 +1,7 @@
 //! Transform operations that consume input records and produce derived records.
 
 pub(crate) mod aggregate;
+pub(crate) mod asof_join;
 pub(crate) mod distinct;
 pub(crate) mod equi_join;
 pub(crate) mod extend;
@@ -14,6 +15,11 @@ pub(crate) mod union_all;
 pub use aggregate::{
     AggregateCall, AggregateDefinition, AggregateDefinitionError, AggregateError,
     AggregateOperation, AggregateSchemaError,
+};
+pub use asof_join::{
+    AsOfDirection, AsOfEqualityKey, AsOfEqualityMode, AsOfEquidistantPreference,
+    AsOfJoinDefinition, AsOfJoinDefinitionError, AsOfJoinError, AsOfJoinKind, AsOfJoinOperation,
+    AsOfJoinSchemaError, AsOfOrderKey, AsOfTieBreak, AsOfTieFallback,
 };
 pub use distinct::{DistinctDefinition, DistinctError, DistinctOperation};
 pub use equi_join::{

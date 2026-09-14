@@ -15,7 +15,7 @@ use crate::{
     syntax,
 };
 
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v2";
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v3";
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
 pub struct SqlProgram {
@@ -247,7 +247,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "a2811217c8fd2db48eedeabe08351f5a264613b5ff53950b90c2c31e2d1c0daf"
+            "85ed0ec942fe61e0aa385e1404755f61eacb813b1a641490e7852f45867ecddd"
         );
     }
 
@@ -263,6 +263,34 @@ mod tests {
              SELECT value\nFROM sequence(start => 7);",
         );
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn asof_direction_is_semantic_but_formatting_is_not_identity() {
+        let backward = identity(
+            "INSERT INTO discard() \
+             SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value >= right_scan.value)",
+        );
+        let reformatted = identity(
+            "INSERT INTO discard()\n\
+             SELECT LEFT_SCAN.VALUE\n\
+             FROM sequence(start => 0) AS left_scan\n\
+             ASOF JOIN sequence(start => 1) AS right_scan\n\
+             MATCH_CONDITION(left_scan.value>=right_scan.value);",
+        );
+        let forward = identity(
+            "INSERT INTO discard() \
+             SELECT left_scan.value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value <= right_scan.value)",
+        );
+
+        assert_eq!(backward, reformatted);
+        assert_ne!(backward, forward);
     }
 
     #[test]

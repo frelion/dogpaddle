@@ -184,18 +184,40 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 - `CAST`、`TRY_CAST`、`CASE`，以及当前表达式层支持的比较、布尔和算术表达式；
 - `SELECT DISTINCT` 和 positional `UNION ALL`；
 - Inner、Left/Right/Full Outer、Left/Right Semi、Left/Right Anti Join；
+- left-preserving `ASOF JOIN ... MATCH_CONDITION (...) [ON ... | USING (...)]`；
 - 非空 `GROUP BY`，`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`，以及只有分组字段的查询。
 
-每个 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
+每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
 Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
 `SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、名称、nullability 和 metadata。
+
+`ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row
+选择至多一个 right row，没有匹配时仍保留 left row，并把 right 字段补为 NULL。`MATCH_CONDITION`
+必须是跨左右输入的一次 `<`、`<=`、`>` 或 `>=` 比较：`>`/`>=` 选择向后最近值，`<`/`<=`
+选择向前最近值，是否包含等号就是 exact-match 策略。可选 `ON` 只接受等值合取，`USING` 接受
+同名等值分区；两者都省略时在全局分区中匹配。
+
+ASOF equality 与 order 表达式绑定后只接受左右完全相同的稳定、扁平、非浮点 Arrow 类型：`Null`、
+`Boolean`、`Int8`、`Int16`、`Int32`、`Int64`、`UInt8`、`UInt16`、`UInt32`、`UInt64`、`Utf8`、
+`Binary`、`Date32`、任意单位与时区的 `Timestamp`，以及 `Decimal128`；`Float32`、`Float64` 和
+其他类型都会在创建状态目录前被拒绝。普通 SQL equality 不匹配 NULL，NULL order 也永远没有
+候选；完整 Rust API 另有 null-safe `NotDistinct`。
+
+完整 `AsOfJoinDefinition` Rust API 的 backward/forward 支持非空 lexicographic order tuple；nearest
+或 tolerance 则必须恰好只有一个可计算距离的 order，其类型限于上述整数、`Date32`、`Timestamp`
+或 `Decimal128`。当前 `DataFusion` 原生 SQL node 固定只携带一个 order comparison；DogPaddle 的原生
+ASOF SQL surface 中，`ON` 只接受 ordinary equality 合取，也没有 candidate residual、nearest、
+tolerance、NULL-safe equality 或 tie-break 子句，因此 SQL 层不伪造这些扩展。SQL 中同一分区和
+order 值若仍有多个不同的 right candidate，会确定性报错，而不会按到达顺序任意选择。没有
+watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧修正重配历史 left rows，因此
+控制的是输出基数，不承诺有界状态。
 
 明确拒绝：
 
 - 普通表或未注册函数；
 - `SELECT ALL`、`DISTINCT ON`、普通 `UNION` 和非 positional `UNION ALL`；
-- Cross、Natural、Using 和没有跨输入等值 key 的纯非等值 Join；
+- Cross、Natural、普通等值 Join 的 `USING`，以及没有跨输入等值 key 的普通纯非等值 Join；
 - 空 `GROUP BY` 的 global aggregate、grouping sets、aggregate modifier、聚合 UDF 和不支持的类型；
 - Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
 - 会在规划时丢失语义的 sampling、hint、row lock、typed alias 等语法。
