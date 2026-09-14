@@ -24,6 +24,7 @@ rust-version = "1.96"
 [workspace.dependencies]
 arrow-array = "=59.3.0"
 arrow-buffer = "=59.3.0"
+arrow-data = "=59.3.0"
 arrow-ipc = "=59.3.0"
 arrow-schema = "=59.3.0"
 arrow-select = "=59.3.0"

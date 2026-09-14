@@ -5,6 +5,12 @@ use thiserror::Error;
 
 /// Maximum number of nested Arrow List or Struct boundaries.
 pub const MAX_NESTING_DEPTH: usize = 60;
+/// Maximum total number of logical fields, including nested List and Struct fields.
+pub const MAX_SCHEMA_FIELDS: usize = 16_384;
+/// Maximum total number of Schema and Field metadata entries.
+pub const MAX_SCHEMA_METADATA_ENTRIES: usize = 49_152;
+/// Maximum total UTF-8 bytes in field names, Timestamp timezones, and metadata.
+pub const MAX_SCHEMA_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) const RESERVED_FIELD_PREFIX: &str = "$dogpaddle.";
 pub(crate) const RESERVED_METADATA_PREFIX: &str = "dogpaddle.";
@@ -60,18 +66,49 @@ impl<'a> DataTypeLayout<'a> {
 ///
 /// # Errors
 ///
-/// Returns `SchemaError` for duplicate or reserved field names, reserved
-/// metadata, unsupported Arrow types, or nesting deeper than
-/// `MAX_NESTING_DEPTH`.
+/// Returns `SchemaError` for a Schema outside the bounded field, metadata, or
+/// identity-text representation; duplicate or reserved names; unsupported
+/// Arrow types; or nesting deeper than [`MAX_NESTING_DEPTH`].
 pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
-    validate_metadata(schema.metadata(), "schema")?;
-    validate_fields(schema.fields(), "", 0)
+    let mut budget = SchemaBudget::default();
+    let mut path = Vec::new();
+    validate_metadata(schema.metadata(), &path, &mut budget)?;
+    validate_fields(schema.fields(), &mut path, 0, &mut budget)
+}
+
+#[derive(Default)]
+struct SchemaBudget {
+    fields: usize,
+    metadata_entries: usize,
+    text_bytes: usize,
 }
 
 /// A logical record schema validation failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum SchemaError {
+    /// A Schema contains more fields than the bounded v1 representation accepts.
+    #[error("schema contains more than {max_fields} total fields")]
+    TooManyFields {
+        /// Maximum number of top-level plus nested fields.
+        max_fields: usize,
+    },
+    /// Aggregate Schema and Field metadata exceeds the bounded v1 representation.
+    #[error("schema metadata exceeds {max_entries} total entries while reading {owner:?}")]
+    TooManyMetadataEntries {
+        /// Schema or dot-separated field path owning the metadata.
+        owner: String,
+        /// Maximum aggregate entries accepted across the Schema.
+        max_entries: usize,
+    },
+    /// Schema identity text exceeds the bounded v1 representation.
+    #[error("schema identity text exceeds {max_bytes} total UTF-8 bytes while reading {owner:?}")]
+    TooManyTextBytes {
+        /// Schema or dot-separated field path whose text crossed the limit.
+        owner: String,
+        /// Maximum aggregate UTF-8 byte count.
+        max_bytes: usize,
+    },
     /// A field name occurs more than once in one Schema or Struct scope.
     #[error("duplicate field {name:?} in schema scope {scope:?}")]
     DuplicateField {
@@ -101,8 +138,8 @@ pub enum SchemaError {
     UnsupportedType {
         /// Dot-separated diagnostic path to the field.
         field: String,
-        /// The unsupported Arrow type.
-        data_type: DataType,
+        /// Bounded name of the unsupported top-level Arrow type.
+        data_type: &'static str,
     },
     /// A Decimal128 field has precision or scale outside the stable v1 range.
     #[error(
@@ -131,59 +168,142 @@ pub enum SchemaError {
     },
 }
 
-fn validate_fields(fields: &Fields, scope: &str, depth: usize) -> Result<(), SchemaError> {
+fn validate_fields<'a>(
+    fields: &'a Fields,
+    path: &mut Vec<&'a str>,
+    depth: usize,
+    budget: &mut SchemaBudget,
+) -> Result<(), SchemaError> {
+    if budget
+        .fields
+        .checked_add(fields.len())
+        .is_none_or(|count| count > MAX_SCHEMA_FIELDS)
+    {
+        return Err(SchemaError::TooManyFields {
+            max_fields: MAX_SCHEMA_FIELDS,
+        });
+    }
     let mut names = HashSet::with_capacity(fields.len());
     for field in fields {
         if !names.insert(field.name().as_str()) {
             return Err(SchemaError::DuplicateField {
-                scope: scope.to_owned(),
+                scope: path.join("."),
                 name: field.name().clone(),
             });
         }
-        let path = join_path(scope, field.name());
-        validate_field(field, &path, depth)?;
+        path.push(field.name());
+        let result = validate_field(field, path, depth, budget);
+        path.pop();
+        result?;
     }
     Ok(())
 }
 
-fn validate_field(field: &Field, path: &str, depth: usize) -> Result<(), SchemaError> {
+fn validate_field<'a>(
+    field: &'a Field,
+    path: &mut Vec<&'a str>,
+    depth: usize,
+    budget: &mut SchemaBudget,
+) -> Result<(), SchemaError> {
+    budget.fields = budget
+        .fields
+        .checked_add(1)
+        .filter(|count| *count <= MAX_SCHEMA_FIELDS)
+        .ok_or(SchemaError::TooManyFields {
+            max_fields: MAX_SCHEMA_FIELDS,
+        })?;
+    charge_text(budget, field.name().len(), path)?;
     if field.name().starts_with(RESERVED_FIELD_PREFIX) {
         return Err(SchemaError::ReservedFieldName {
-            field: path.to_owned(),
+            field: path.join("."),
             name: field.name().clone(),
         });
     }
-    validate_metadata(field.metadata(), path)?;
+    validate_metadata(field.metadata(), path, budget)?;
     if let DataType::Decimal128(precision, scale) = field.data_type()
         && !valid_decimal128_parameters(*precision, *scale)
     {
         return Err(SchemaError::InvalidDecimal128 {
-            field: path.to_owned(),
+            field: path.join("."),
             precision: *precision,
             scale: *scale,
         });
+    }
+    if let DataType::Timestamp(_, Some(timezone)) = field.data_type() {
+        charge_text(budget, timezone.len(), path)?;
     }
     if let DataType::Timestamp(_, Some(timezone)) = field.data_type()
         && timezone.is_empty()
     {
         return Err(SchemaError::EmptyTimestampTimezone {
-            field: path.to_owned(),
+            field: path.join("."),
         });
     }
     match DataTypeLayout::classify(field.data_type()) {
         Some(DataTypeLayout::List(child)) => {
             let nested = enter_container(depth)?;
-            validate_field(child, &join_path(path, child.name()), nested)
+            path.push(child.name());
+            let result = validate_field(child, path, nested, budget);
+            path.pop();
+            result
         }
         Some(DataTypeLayout::Struct(fields)) => {
             let nested = enter_container(depth)?;
-            validate_fields(fields, path, nested)
+            validate_fields(fields, path, nested, budget)
         }
         Some(_) => Ok(()),
         None => Err(SchemaError::UnsupportedType {
-            field: path.to_owned(),
-            data_type: field.data_type().clone(),
+            field: path.join("."),
+            data_type: unsupported_type_name(field.data_type()),
         }),
+    }
+}
+
+fn unsupported_type_name(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Float16 => "Float16",
+        DataType::Date64 => "Date64",
+        DataType::Time32(_) => "Time32",
+        DataType::Time64(_) => "Time64",
+        DataType::Duration(_) => "Duration",
+        DataType::Interval(_) => "Interval",
+        DataType::FixedSizeBinary(_) => "FixedSizeBinary",
+        DataType::LargeBinary => "LargeBinary",
+        DataType::BinaryView => "BinaryView",
+        DataType::LargeUtf8 => "LargeUtf8",
+        DataType::Utf8View => "Utf8View",
+        DataType::ListView(_) => "ListView",
+        DataType::FixedSizeList(_, _) => "FixedSizeList",
+        DataType::LargeList(_) => "LargeList",
+        DataType::LargeListView(_) => "LargeListView",
+        DataType::Union(_, _) => "Union",
+        DataType::Dictionary(_, _) => "Dictionary",
+        DataType::Decimal32(_, _) => "Decimal32",
+        DataType::Decimal64(_, _) => "Decimal64",
+        DataType::Decimal256(_, _) => "Decimal256",
+        DataType::Map(_, _) => "Map",
+        DataType::RunEndEncoded(_, _) => "RunEndEncoded",
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(_, _)
+        | DataType::Date32
+        | DataType::Binary
+        | DataType::Utf8
+        | DataType::List(_)
+        | DataType::Struct(_)
+        | DataType::Decimal128(_, _) => {
+            unreachable!("supported Arrow types have a DataTypeLayout")
+        }
     }
 }
 
@@ -191,18 +311,54 @@ pub(crate) const fn valid_decimal128_parameters(precision: u8, scale: i8) -> boo
     precision > 0 && precision <= 38 && (scale <= 0 || scale <= precision.cast_signed())
 }
 
-fn validate_metadata(metadata: &HashMap<String, String>, owner: &str) -> Result<(), SchemaError> {
+fn validate_metadata(
+    metadata: &HashMap<String, String>,
+    path: &[&str],
+    budget: &mut SchemaBudget,
+) -> Result<(), SchemaError> {
+    budget.metadata_entries = budget
+        .metadata_entries
+        .checked_add(metadata.len())
+        .filter(|entries| *entries <= MAX_SCHEMA_METADATA_ENTRIES)
+        .ok_or_else(|| SchemaError::TooManyMetadataEntries {
+            owner: owner(path),
+            max_entries: MAX_SCHEMA_METADATA_ENTRIES,
+        })?;
+    for (key, value) in metadata {
+        charge_text(budget, key.len(), path)?;
+        charge_text(budget, value.len(), path)?;
+    }
     if let Some(key) = metadata
         .keys()
         .filter(|key| key.starts_with(RESERVED_METADATA_PREFIX))
         .min()
     {
         Err(SchemaError::ReservedMetadataKey {
-            owner: owner.to_owned(),
+            owner: owner(path),
             key: key.clone(),
         })
     } else {
         Ok(())
+    }
+}
+
+fn charge_text(budget: &mut SchemaBudget, bytes: usize, path: &[&str]) -> Result<(), SchemaError> {
+    budget.text_bytes = budget
+        .text_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= MAX_SCHEMA_TEXT_BYTES)
+        .ok_or_else(|| SchemaError::TooManyTextBytes {
+            owner: owner(path),
+            max_bytes: MAX_SCHEMA_TEXT_BYTES,
+        })?;
+    Ok(())
+}
+
+fn owner(path: &[&str]) -> String {
+    if path.is_empty() {
+        "schema".to_owned()
+    } else {
+        path.join(".")
     }
 }
 
@@ -216,13 +372,5 @@ fn enter_container(depth: usize) -> Result<usize, SchemaError> {
         })
     } else {
         Ok(nested)
-    }
-}
-
-fn join_path(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{prefix}.{name}")
     }
 }

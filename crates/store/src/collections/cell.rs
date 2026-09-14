@@ -113,6 +113,22 @@ impl<T: StoreValue> CellAccess<'_, T> {
     }
 }
 
+impl CellAccess<'_, Vec<u8>> {
+    /// Reads the current byte value only when its encoded length is within `max_bytes`.
+    ///
+    /// The length is checked through the transaction's pinned value before an
+    /// owned payload is constructed. [`StoreError::ItemTooLarge`] is retryable,
+    /// so the same transaction may retry with a larger limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access or value decoding fails, or when
+    /// the encoded value exceeds `max_bytes`.
+    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+        read_byte_cell_bounded(self.data.as_read(), max_bytes)
+    }
+}
+
 impl<T: StoreValue> CellReadAccess<'_, T> {
     /// Reads the current value visible to the originating transaction.
     ///
@@ -124,6 +140,21 @@ impl<T: StoreValue> CellReadAccess<'_, T> {
     }
 }
 
+impl CellReadAccess<'_, Vec<u8>> {
+    /// Reads the current byte value only when its encoded length is within `max_bytes`.
+    ///
+    /// The length is checked through the read transaction's pinned value before
+    /// an owned payload is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage access or value decoding fails, or when
+    /// the encoded value exceeds `max_bytes`.
+    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+        read_byte_cell_bounded(&self.data, max_bytes)
+    }
+}
+
 fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, StoreError> {
     let encoded = data.get(CELL_KEY)?;
     data.poison_on_error(
@@ -132,6 +163,22 @@ fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, Stor
             .transpose(),
     )
     .map_err(StoreError::from)
+}
+
+fn read_byte_cell_bounded(
+    data: &ReadDataAccess<'_>,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(size) = data.value_len(CELL_KEY)? else {
+        return Ok(None);
+    };
+    if size > max_bytes {
+        return Err(StoreError::ItemTooLarge {
+            size,
+            limit: max_bytes,
+        });
+    }
+    read_cell(data)
 }
 
 impl<T> Clone for Cell<T> {

@@ -91,6 +91,10 @@ diff 提前相加。Operation 必须从第零行开始依次观察。
 同一个 Schema 或 Struct 作用域内不能有重名字段。以 `$dogpaddle.` 开头的字段名和以
 `dogpaddle.` 开头的 metadata key 留给物理协议使用。
 
+v1 还固定限制为最多 16,384 个顶层加嵌套字段、49,152 个 Schema/Field metadata entry，以及
+8 MiB 的字段名、Timestamp timezone、metadata key/value 全局 UTF-8 字节总量。解码器在复制这些
+字符串前执行同一预算，并限制 FlatBuffer 的展开大小，避免很小的恶意 offset 图放大为无界分配。
+
 Timestamp 保留可选 timezone 字符串，但拒绝空字符串；`None` 表示无时区。Decimal128 precision
 必须在 `1..=38`，正 scale 不能超过 precision。构造和完整解码还会检查每个 non-null 物理值确实
 落在声明的 precision 内。这一层只验证表示是否合法，不定义时区换算、舍入或算术规则。
@@ -176,6 +180,10 @@ Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff
 
 物理 Schema 的第零字段固定为 non-null Int64 `$dogpaddle.diff`，随后是完整 logical fields；
 Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.version = 1`。
+
+需要在写入持久容量前限制分配时使用 [`encode_change_bounded`]。它先按 Arrow v1 支持类型无拷贝计算
+当前逻辑 slice 的未压缩 IPC body，并用限长 writer 约束完整输出；因此超大 body 不会先被完整构造后
+才遭拒绝。普通 [`encode_change`] 保留无调用方 byte limit 的通用入口。
 
 写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝错误 marker、
 大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle` Schema。writer options、

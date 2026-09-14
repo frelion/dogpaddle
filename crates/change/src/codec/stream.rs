@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::Cell, collections::HashMap, fmt, io::Write, rc::Rc, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{
     DateUnit as IpcDateUnit, Endianness, Field as IpcField, Message, MessageHeader,
     MetadataVersion, Precision, RecordBatch as IpcRecordBatch, Schema as IpcSchema,
-    TimeUnit as IpcTimeUnit, Type as IpcType, root_as_message,
+    TimeUnit as IpcTimeUnit, Type as IpcType, root_as_message_with_opts,
     writer::{IpcWriteOptions, StreamWriter},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -13,7 +13,8 @@ use super::CodecError;
 use crate::{
     change::Change,
     schema::{
-        MAX_NESTING_DEPTH, RESERVED_METADATA_PREFIX, valid_decimal128_parameters, validate_schema,
+        MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES,
+        RESERVED_METADATA_PREFIX, valid_decimal128_parameters, validate_schema,
     },
 };
 
@@ -24,6 +25,17 @@ const CHANGE_VERSION_KEY: &str = "dogpaddle.change.version";
 const CHANGE_VERSION: &str = "1";
 const CANONICAL_CONTINUATION: &[u8; 4] = &[0xff; 4];
 const CANONICAL_EOS: &[u8; 8] = &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+const MAX_PHYSICAL_SCHEMA_FIELDS: usize = MAX_SCHEMA_FIELDS + 1;
+const MAX_PHYSICAL_METADATA_ENTRIES: usize = MAX_SCHEMA_METADATA_ENTRIES + 2;
+const PROTOCOL_TEXT_BYTES: usize = DIFF_FIELD_NAME.len()
+    + CHANGE_KIND_KEY.len()
+    + CHANGE_KIND.len()
+    + CHANGE_VERSION_KEY.len()
+    + CHANGE_VERSION.len();
+const MAX_PHYSICAL_SCHEMA_TEXT_BYTES: usize = MAX_SCHEMA_TEXT_BYTES + PROTOCOL_TEXT_BYTES;
+const MAX_FLATBUFFER_TABLES: usize =
+    MAX_PHYSICAL_SCHEMA_FIELDS * 2 + MAX_PHYSICAL_METADATA_ENTRIES + 1024;
+const MAX_FLATBUFFER_APPARENT_SIZE: usize = 64 * 1024 * 1024;
 
 pub(super) struct ParsedChange<'encoded> {
     pub(super) physical_schema: SchemaRef,
@@ -40,6 +52,86 @@ pub(super) fn encode(change: &Change) -> Result<Vec<u8>, CodecError> {
         StreamWriter::try_new_with_options(Vec::new(), physical.schema_ref(), options)?;
     writer.write(&physical)?;
     Ok(writer.into_inner()?)
+}
+
+pub(super) fn encode_bounded(
+    change: &Change,
+    max_bytes: usize,
+    body_bytes: usize,
+) -> Result<Vec<u8>, CodecError> {
+    let physical = physical_batch(change)?;
+    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
+    let limit_hit = Rc::new(Cell::new(false));
+    let mut output = BoundedWriter::new(max_bytes, Rc::clone(&limit_hit));
+    let mut writer =
+        match StreamWriter::try_new_with_options(&mut output, physical.schema_ref(), options) {
+            Ok(writer) => writer,
+            Err(_error) if limit_hit.get() => return Err(CodecError::size_limit(max_bytes)),
+            Err(error) => return Err(error.into()),
+        };
+    if body_bytes > writer.get_ref().remaining() {
+        return Err(CodecError::size_limit(max_bytes));
+    }
+    if let Err(error) = writer.write(&physical) {
+        drop(writer);
+        return if limit_hit.get() {
+            Err(CodecError::size_limit(max_bytes))
+        } else {
+            Err(error.into())
+        };
+    }
+    if let Err(error) = writer.finish() {
+        drop(writer);
+        return if limit_hit.get() {
+            Err(CodecError::size_limit(max_bytes))
+        } else {
+            Err(error.into())
+        };
+    }
+    drop(writer);
+    Ok(output.bytes)
+}
+
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_hit: Rc<Cell<bool>>,
+}
+
+impl BoundedWriter {
+    fn new(max_bytes: usize, limit_hit: Rc<Cell<bool>>) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
+            max_bytes,
+            limit_hit,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.max_bytes - self.bytes.len()
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(input.len())
+            .is_none_or(|length| length > self.max_bytes)
+        {
+            self.limit_hit.set(true);
+            return Err(std::io::Error::other(
+                "DogPaddle Change size limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(super) fn parse(encoded: &[u8]) -> Result<ParsedChange<'_>, CodecError> {
@@ -113,21 +205,62 @@ pub(super) fn parse(encoded: &[u8]) -> Result<ParsedChange<'_>, CodecError> {
 // Arrow's general FlatBuffer converter is infallible and panics on malformed
 // type parameters. Decode the deliberately narrow v1 type set directly.
 fn parse_schema(embedded: IpcSchema<'_>) -> Result<Schema, CodecError> {
-    let fields = embedded
+    let embedded_fields = embedded
         .fields()
-        .ok_or_else(|| CodecError::invalid("Arrow Schema has no fields vector"))?
+        .ok_or_else(|| CodecError::invalid("Arrow Schema has no fields vector"))?;
+    if embedded_fields.len() > MAX_PHYSICAL_SCHEMA_FIELDS {
+        return Err(CodecError::invalid(format!(
+            "physical Arrow Schema exceeds {MAX_PHYSICAL_SCHEMA_FIELDS} total fields"
+        )));
+    }
+    let mut budget = SchemaParseBudget::default();
+    let fields = embedded_fields
         .iter()
-        .map(|field| parse_field(field, 0))
+        .map(|field| parse_field(field, 0, &mut budget))
         .collect::<Result<Vec<_>, _>>()?;
-    let metadata = parse_metadata(embedded.custom_metadata(), "Arrow Schema")?;
+    let metadata = parse_metadata(
+        embedded.custom_metadata(),
+        MetadataOwner::Schema,
+        &mut budget,
+    )?;
     Ok(Schema::new_with_metadata(fields, metadata))
 }
 
-fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
+#[derive(Default)]
+struct SchemaParseBudget {
+    fields: usize,
+    metadata_entries: usize,
+    text_bytes: usize,
+}
+
+fn parse_field(
+    field: IpcField<'_>,
+    depth: usize,
+    budget: &mut SchemaParseBudget,
+) -> Result<Field, CodecError> {
+    budget.fields = budget
+        .fields
+        .checked_add(1)
+        .filter(|count| *count <= MAX_PHYSICAL_SCHEMA_FIELDS)
+        .ok_or_else(|| {
+            CodecError::invalid(format!(
+                "physical Arrow Schema exceeds {MAX_PHYSICAL_SCHEMA_FIELDS} total fields"
+            ))
+        })?;
     let name = field.name().unwrap_or_default();
+    charge_schema_text(budget, name.len(), "Arrow field name")?;
     if field.dictionary().is_some() {
         return Err(CodecError::invalid(format!(
             "dictionary encoding is not supported at Arrow field {name:?}"
+        )));
+    }
+    if !matches!(field.type_type(), IpcType::List | IpcType::Struct_)
+        && field
+            .children()
+            .is_some_and(|children| !children.is_empty())
+    {
+        return Err(CodecError::invalid(format!(
+            "non-nested Arrow field {name:?} has children"
         )));
     }
 
@@ -137,7 +270,7 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
         IpcType::Int => parse_integer_type(field)?,
         IpcType::FloatingPoint => parse_floating_type(field)?,
         IpcType::Date => parse_date_type(field)?,
-        IpcType::Timestamp => parse_timestamp_type(field)?,
+        IpcType::Timestamp => parse_timestamp_type(field, budget)?,
         IpcType::Decimal => parse_decimal_type(field)?,
         IpcType::Binary => DataType::Binary,
         IpcType::Utf8 => DataType::Utf8,
@@ -154,6 +287,7 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
             DataType::List(Arc::new(parse_field(
                 children.get(0),
                 nested_depth(depth)?,
+                budget,
             )?))
         }
         IpcType::Struct_ => {
@@ -163,7 +297,7 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
                 .map(|children| {
                     children
                         .iter()
-                        .map(|child| parse_field(child, nested))
+                        .map(|child| parse_field(child, nested, budget))
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?
@@ -176,11 +310,11 @@ fn parse_field(field: IpcField<'_>, depth: usize) -> Result<Field, CodecError> {
             )));
         }
     };
-
     Ok(
         Field::new(name, data_type, field.nullable()).with_metadata(parse_metadata(
             field.custom_metadata(),
-            &format!("Arrow field {name:?}"),
+            MetadataOwner::Field(name),
+            budget,
         )?),
     )
 }
@@ -198,7 +332,10 @@ fn parse_date_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
     }
 }
 
-fn parse_timestamp_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
+fn parse_timestamp_type(
+    field: IpcField<'_>,
+    budget: &mut SchemaParseBudget,
+) -> Result<DataType, CodecError> {
     let name = field.name().unwrap_or_default();
     let timestamp = field.type_as_timestamp().ok_or_else(|| {
         CodecError::invalid(format!(
@@ -221,6 +358,9 @@ fn parse_timestamp_type(field: IpcField<'_>) -> Result<DataType, CodecError> {
         return Err(CodecError::invalid(format!(
             "Timestamp field {name:?} has an empty timezone; use no timezone for a naive timestamp"
         )));
+    }
+    if let Some(timezone) = timezone {
+        charge_schema_text(budget, timezone.len(), "Arrow Timestamp timezone")?;
     }
     Ok(DataType::Timestamp(unit, timezone.map(Into::into)))
 }
@@ -309,9 +449,20 @@ fn parse_metadata<'a>(
     metadata: Option<
         flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<arrow_ipc::KeyValue<'a>>>,
     >,
-    owner: &str,
+    owner: MetadataOwner<'_>,
+    budget: &mut SchemaParseBudget,
 ) -> Result<HashMap<String, String>, CodecError> {
-    let mut parsed = HashMap::new();
+    let metadata_len = metadata.as_ref().map_or(0, |metadata| metadata.len());
+    budget.metadata_entries = budget
+        .metadata_entries
+        .checked_add(metadata_len)
+        .filter(|entries| *entries <= MAX_PHYSICAL_METADATA_ENTRIES)
+        .ok_or_else(|| {
+            CodecError::invalid(format!(
+                "physical Arrow Schema metadata exceeds {MAX_PHYSICAL_METADATA_ENTRIES} total entries while reading {owner}"
+            ))
+        })?;
+    let mut parsed = HashMap::with_capacity(metadata_len);
     let mut previous: Option<&str> = None;
     if let Some(metadata) = metadata {
         for pair in metadata {
@@ -321,6 +472,8 @@ fn parse_metadata<'a>(
             let value = pair.value().ok_or_else(|| {
                 CodecError::invalid(format!("{owner} metadata key {key:?} has no value"))
             })?;
+            charge_schema_text(budget, key.len(), owner)?;
+            charge_schema_text(budget, value.len(), owner)?;
             if previous.is_some_and(|previous| previous >= key) {
                 return Err(CodecError::invalid(format!(
                     "{owner} metadata keys must be unique and strictly increasing"
@@ -331,6 +484,38 @@ fn parse_metadata<'a>(
         }
     }
     Ok(parsed)
+}
+
+#[derive(Clone, Copy)]
+enum MetadataOwner<'a> {
+    Schema,
+    Field(&'a str),
+}
+
+impl fmt::Display for MetadataOwner<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schema => formatter.write_str("Arrow Schema"),
+            Self::Field(name) => write!(formatter, "Arrow field {name:?}"),
+        }
+    }
+}
+
+fn charge_schema_text(
+    budget: &mut SchemaParseBudget,
+    bytes: usize,
+    owner: impl fmt::Display,
+) -> Result<(), CodecError> {
+    budget.text_bytes = budget
+        .text_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= MAX_PHYSICAL_SCHEMA_TEXT_BYTES)
+        .ok_or_else(|| {
+            CodecError::invalid(format!(
+                "physical Arrow Schema identity text exceeds {MAX_PHYSICAL_SCHEMA_TEXT_BYTES} total UTF-8 bytes while reading {owner}"
+            ))
+        })?;
+    Ok(())
 }
 
 struct ParsedMessage<'encoded> {
@@ -380,7 +565,12 @@ fn parse_message(
             "{expected:?} metadata length exceeds the encoded entry"
         ))
     })?;
-    let message = root_as_message(metadata).map_err(|error| {
+    let verifier = flatbuffers::VerifierOptions {
+        max_tables: MAX_FLATBUFFER_TABLES,
+        max_apparent_size: MAX_FLATBUFFER_APPARENT_SIZE,
+        ..flatbuffers::VerifierOptions::default()
+    };
+    let message = root_as_message_with_opts(&verifier, metadata).map_err(|error| {
         CodecError::invalid(format!("invalid {expected:?} IPC metadata: {error}"))
     })?;
     if message.version() != MetadataVersion::V5 {

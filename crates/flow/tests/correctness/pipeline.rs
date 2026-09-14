@@ -13,7 +13,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Store, SubscribedLog};
+use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
 use rusqlite::{Connection, OpenFlags};
 
 const CAPACITY: NonZeroU64 = NonZeroU64::MAX;
@@ -99,7 +99,10 @@ fn five_atomic_transforms_run_in_one_station_across_reopen() {
         .unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let _: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/relation_sink.state")
+        .open_data("station/00000001/operation/00000000/sink.control")
+        .unwrap();
+    let _: OrderedMap<u64, Vec<u8>> = store
+        .open_data("station/00000001/operation/00000000/sink.buffer")
         .unwrap();
     let transaction = store.read_transaction();
     let status = output.writer().status(transaction.access()).unwrap();

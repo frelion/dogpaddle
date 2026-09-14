@@ -12,6 +12,7 @@ use crate::{
 };
 
 mod batch;
+mod size;
 mod stream;
 
 #[cfg(test)]
@@ -32,6 +33,26 @@ mod tests;
 pub fn encode_change(change: &Change) -> Result<Vec<u8>, CodecError> {
     ensure_little_endian_target()?;
     stream::encode(change)
+}
+
+/// Encodes one Change while bounding its uncompressed IPC body and output.
+///
+/// Before Arrow constructs the record-batch body, this traverses the logical
+/// slices and rejects a body larger than `max_bytes`. The output writer is also
+/// capped at `max_bytes`, so a Schema or record-batch header that makes the
+/// complete stream too large is rejected without growing the output past the
+/// limit. Schema identity text is independently bounded by
+/// [`crate::MAX_SCHEMA_TEXT_BYTES`] when the [`Change`] is constructed.
+///
+/// # Errors
+///
+/// Returns [`CodecError::EncodedSizeLimitExceeded`] when either the IPC body or
+/// complete stream exceeds `max_bytes`, or another [`CodecError`] if Arrow
+/// cannot encode the physical batch.
+pub fn encode_change_bounded(change: &Change, max_bytes: usize) -> Result<Vec<u8>, CodecError> {
+    ensure_little_endian_target()?;
+    let body_bytes = size::body_len_bounded(change, max_bytes)?;
+    stream::encode_bounded(change, max_bytes, body_bytes)
 }
 
 /// Decodes one self-contained `DogPaddle` change from an Arrow IPC stream.
@@ -116,6 +137,12 @@ pub enum CodecError {
     /// The current target cannot safely interpret v1 Arrow IPC buffers.
     #[error("DogPaddle Change v1 only supports little-endian targets")]
     UnsupportedTargetEndianness,
+    /// The encoded Change exceeds a caller-provided byte limit.
+    #[error("encoded DogPaddle Change exceeds the {max_bytes}-byte limit")]
+    EncodedSizeLimitExceeded {
+        /// Maximum accepted uncompressed body and complete stream length.
+        max_bytes: usize,
+    },
     /// The encoding is not a canonical `DogPaddle` Change stream.
     #[error("invalid DogPaddle Change encoding: {message}")]
     InvalidEncoding {
@@ -132,6 +159,10 @@ impl CodecError {
         Self::InvalidEncoding {
             message: message.into(),
         }
+    }
+
+    const fn size_limit(max_bytes: usize) -> Self {
+        Self::EncodedSizeLimitExceeded { max_bytes }
     }
 }
 

@@ -14,7 +14,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store};
 
 use super::support::{TestStore, rollback_ready};
 
@@ -86,15 +86,21 @@ fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
 
 #[test]
 fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io() {
-    // Shared relation state v1, Ready(next_id = 1, no continuation).
-    let ready = vec![1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+    // Shared buffered state v1: Ready(empty buffer, batch ID 1, relation ID 1).
+    let mut ready = vec![1, 1, 0];
+    ready.extend([0; size_of::<u64>() * 3]);
+    ready.extend(1_u64.to_be_bytes());
+    ready.extend(1_u64.to_be_bytes());
     let store_root = TestStore::new();
     let definition = definition();
     let mut store = Store::create(store_root.path()).unwrap();
     definition.data()[0]
-        .create(&mut store, "physical-state")
+        .create(&mut store, "physical-control")
         .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+    definition.data()[1]
+        .create(&mut store, "physical-buffer")
+        .unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     state
@@ -109,9 +115,11 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         let store = Store::open(store_root.path()).unwrap();
         let decoded = decode_definition(&literal_definition_bytes()).unwrap();
         let mut data = DataInstances::new();
-        data.insert(decoded.data()[0].open(&store, "physical-state").unwrap())
+        data.insert(decoded.data()[0].open(&store, "physical-control").unwrap())
             .unwrap();
-        let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+        data.insert(decoded.data()[1].open(&store, "physical-buffer").unwrap())
+            .unwrap();
+        let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
         let mut operation = decoded
             .bind(&[input_schema()])
             .unwrap()
@@ -158,7 +166,7 @@ fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
 }
 
 #[test]
-fn postgres_sink_declares_one_state_cell_and_exact_runtime_resource() {
+fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let definition = definition();
     assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
     assert_eq!(
@@ -167,7 +175,7 @@ fn postgres_sink_declares_one_state_cell_and_exact_runtime_resource() {
             .iter()
             .map(dogpaddle_operation::DataDeclaration::name)
             .collect::<Vec<_>>(),
-        ["relation_sink.state"]
+        ["sink.control", "sink.buffer"]
     );
 
     let binding = (&definition as &dyn OperationDefinition)
@@ -191,9 +199,15 @@ fn postgres_sink_declares_one_state_cell_and_exact_runtime_resource() {
     let store_root = TestStore::new();
     let mut store = Store::create(store_root.path()).unwrap();
     definition.data()[0]
-        .create(&mut store, "physical-state")
+        .create(&mut store, "physical-control")
         .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+    definition.data()[1]
+        .create(&mut store, "physical-buffer")
+        .unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
+    store
+        .open_data::<OrderedMap<u64, Vec<u8>>>("physical-buffer")
+        .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     assert_eq!(
@@ -272,11 +286,17 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     let mut data = DataInstances::new();
     data.insert(
         definition.data()[0]
-            .create(&mut store, "physical-state")
+            .create(&mut store, "physical-control")
             .unwrap(),
     )
     .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-state").unwrap();
+    data.insert(
+        definition.data()[1]
+            .create(&mut store, "physical-buffer")
+            .unwrap(),
+    )
+    .unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
 
     // The endpoint is deliberately unreachable and names another database.
     // Binding, Store construction, materialization, turn preparation, and

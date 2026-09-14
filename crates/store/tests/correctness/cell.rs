@@ -89,6 +89,35 @@ fn newly_written_cell_values_are_owned_for_decoding() {
     assert!(decoded.input_was_owned);
 }
 
+#[test]
+fn byte_cell_bounded_read_is_retryable_in_the_same_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let cell = create_cell::<Vec<u8>>(&mut store, "cell").unwrap();
+    let mut transactions = store.into_transactions();
+
+    {
+        let transaction = transactions.begin();
+        cell.access(transaction.access())
+            .unwrap()
+            .set(&vec![7; 32])
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let transaction = transactions.begin();
+    let access = cell.access(transaction.access()).unwrap();
+    assert!(matches!(
+        access.get_bounded(31),
+        Err(StoreError::ItemTooLarge {
+            size: 32,
+            limit: 31
+        })
+    ));
+    assert_eq!(access.get_bounded(32).unwrap(), Some(vec![7; 32]));
+    transaction.commit().unwrap();
+}
+
 impl StoreValue for BrokenValue {
     fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
         Err::<[u8; 0], _>(CodecError::new("intentional encode failure"))

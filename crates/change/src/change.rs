@@ -208,16 +208,20 @@ pub enum ChangeError {
 }
 
 fn validate_decimal128_values(records: &RecordBatch) -> Result<(), ChangeError> {
+    let mut path = Vec::new();
     for (field, array) in records.schema_ref().fields().iter().zip(records.columns()) {
-        validate_decimal128_array(field, array.as_ref(), field.name())?;
+        path.push(field.name().as_str());
+        let result = validate_decimal128_array(field, array.as_ref(), &mut path);
+        path.pop();
+        result?;
     }
     Ok(())
 }
 
-fn validate_decimal128_array(
-    field: &Field,
+fn validate_decimal128_array<'a>(
+    field: &'a Field,
     array: &dyn Array,
-    path: &str,
+    path: &mut Vec<&'a str>,
 ) -> Result<(), ChangeError> {
     match field.data_type() {
         DataType::Decimal128(precision, scale) => {
@@ -237,7 +241,7 @@ fn validate_decimal128_array(
                     && !(-limit < value && value < limit)
                 {
                     return Err(ChangeError::InvalidDecimal128Value {
-                        field: path.to_owned(),
+                        field: path.join("."),
                         index,
                         value,
                         precision: *precision,
@@ -263,7 +267,10 @@ fn validate_decimal128_array(
             let end = usize::try_from(offsets[offsets.len() - 1])
                 .expect("an Arrow ListArray has non-negative validated offsets");
             let values = list.values().slice(start, end - start);
-            validate_decimal128_array(child, values.as_ref(), &join_path(path, child.name()))?;
+            path.push(child.name());
+            let result = validate_decimal128_array(child, values.as_ref(), path);
+            path.pop();
+            result?;
         }
         DataType::Struct(fields) => {
             let canonical;
@@ -277,14 +284,13 @@ fn validate_decimal128_array(
                     .expect("make_array canonicalizes an Arrow Struct array")
             };
             for (child, array) in fields.iter().zip(structure.columns()) {
-                validate_decimal128_array(child, array.as_ref(), &join_path(path, child.name()))?;
+                path.push(child.name());
+                let result = validate_decimal128_array(child, array.as_ref(), path);
+                path.pop();
+                result?;
             }
         }
         _ => {}
     }
     Ok(())
-}
-
-fn join_path(parent: &str, child: &str) -> String {
-    format!("{parent}.{child}")
 }

@@ -1,8 +1,9 @@
 //! Native `PostgreSQL` protocol gate host, driven by
 //! `system-tests/postgres/check_sink.py`.
 //!
-//! The caller retains the complete input across Commit turns and process kills.
-//! Fault boundaries use the public staged-turn API, not product test hooks.
+//! The caller retains the complete input until `Complete`, then drives durable
+//! buffered delivery with explicit no-input turns. Fault boundaries use the
+//! public staged-turn API, not product test hooks.
 
 use std::{
     env,
@@ -80,18 +81,20 @@ impl Host {
         }
         Ok(Self {
             operation: binding.materialize(data, RuntimeResource::new(config))?,
-            state: store.open_data("relation_sink.state")?,
+            state: store.open_data("sink.control")?,
             transactions: store.into_transactions(),
         })
     }
 
-    fn advance(&mut self, command: &str, change: &Change) -> Result<Value, OperationError> {
+    fn advance(&mut self, command: &str, change: Option<&Change>) -> Result<Value, OperationError> {
         let prepared = match self
             .operation
-            .turn(Some(OperationInput { port: 0, change }))
+            .turn(change.map(|change| OperationInput { port: 0, change }))
         {
             Ok(Turn::Ready(prepared)) => prepared,
-            Ok(Turn::Idle) => return Err("a sink with input unexpectedly idled".into()),
+            Ok(Turn::Idle) => {
+                return Ok(json!({"kind": "advance", "outcome": "Idle"}));
+            }
             // Ordinary turn errors leave the same runtime retryable. Errors
             // from apply/completion remain fatal in this small protocol host.
             Err(error) => return Ok(json!({"kind": "error", "message": error.to_string()})),
@@ -124,7 +127,7 @@ impl Host {
 
 fn fixture(scenario: &str, stage: &str) -> Result<Change, OperationError> {
     let (records, multiplicity) = match scenario {
-        "bulk" => {
+        "bulk" | "bulk_invalid" => {
             let (values, diffs) = match stage {
                 "seed" => (vec![u64::MAX], vec![16_385]),
                 "withdraw" => (vec![u64::MAX], vec![-16_385]),
@@ -269,22 +272,27 @@ fn respond(response: &Value) -> Result<(), OperationError> {
 fn main() -> Result<(), OperationError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let [mode, path, port, scenario] = args.as_slice() else {
-        return Err(
-            "usage: postgres_sink_recovery <build|open> PATH PORT <bulk|updates|types|wide|empty>"
-                .into(),
-        );
+        return Err("usage: postgres_sink_recovery <build|open> PATH PORT \
+             <bulk|bulk_invalid|updates|types|wide|empty>"
+            .into());
     };
     let mut host = Host::open(mode, &PathBuf::from(path), port.parse()?, scenario)?;
     respond(&json!({"kind": "ready", "mode": mode}))?;
     for line in io::stdin().lock().lines() {
         let line = line?;
-        let Some((command @ ("advance" | "rollback" | "prepare-only"), stage)) =
-            line.split_once(' ')
-        else {
+        let mut parts = line.split_ascii_whitespace();
+        let Some(command @ ("advance" | "rollback" | "prepare-only")) = parts.next() else {
             return Err("unsupported command".into());
         };
-        let change = fixture(scenario, stage)?;
-        match host.advance(command, &change) {
+        let stage = parts.next();
+        if parts.next().is_some() {
+            return Err("too many command arguments".into());
+        }
+        let change = stage
+            .filter(|stage| *stage != "-")
+            .map(|stage| fixture(scenario, stage))
+            .transpose()?;
+        match host.advance(command, change.as_ref()) {
             Ok(response) => respond(&response)?,
             Err(error) => {
                 respond(&json!({"kind": "error", "message": error.to_string()}))?;

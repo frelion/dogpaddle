@@ -464,20 +464,35 @@ MySQL 的普通 gate 保持离线，部署前还必须在真实 MySQL 上验证 
 IPv4/IPv6，连接握手和每个数据库工作单元都有 5 秒 client deadline。target discovery 是 build 前
 显式的只读 catalog 操作，Definition/bind/materialize 与 Flow build/open 本身不访问 PG。
 
-SQLite 与 PG 共用 `relation_sink.state: Cell<Vec<u8>>` 和固定 ID 的批次协议。Ready turn 在
-Store 写事务外批量匹配关系行、规划至多 1024 个具体 mutation；apply 先持久化 Prepared，
-`AfterCommit` 才在一个目标事务中先 insert-ignore、再按 ID delete。下一 turn 结算 Ready：
-有 continuation 时 `Commit`，该 Change 结束时 `Complete`。目标已提交但结算前崩溃时原样重投
-同一组 ID；无需 receipt、delivery sequence 或 digest，也不重投已结算的旧批次。
+SQLite 与 PG 共用 `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` 和固定 ID
+的批次协议。每个完整 Change 先与 control accounting、input `Complete` 在一个 Store 事务中 durable
+admit；随后在无 Claim turn 或到达 watermark 时从一个或多个 entries 构造至多 1024 个 mutation 的
+delivery。单项 canonical uncompressed IPC+key 与单次 encoded delivery 都受 8 MiB 上限约束，编码前
+先预检 body；owned decode 在对齐合适时共享 backing，否则局部复制仍受 body 上限约束。target mutation
+按 canonical row、技术字段和每列固定 framing 的逻辑口径计费并另受 8 MiB 上限；该口径不是 driver
+heap、SQL/wire payload 或数据库事务资源的硬配额。整个 buffer 最多按 IPC+key 逻辑口径保留 64 MiB、1,048,576 events，
+并不等于 heap/WAL/磁盘硬配额。超限或无法在剩余 batch-ID/technical-ID 区间内排空的 input 在 ACK 前失败；
+reopen 在目标副作用前校验全部 retained entries、连续 sequence、Schema、accounting 与剩余正事件容量。
+
+Ready delivery 在 Store 写事务外批量匹配关系行；apply 先持久化 Prepared 的 buffer settlement、
+relation checkpoint 和具体 mutation，`AfterCommit` 才在一个目标事务中先 insert-ignore、核对每个
+已存在 mutation ID 仍绑定同一完整逻辑行，再按 ID delete。Prepared 的 insert/delete 都保存 row index
+与 ID。下一 turn 原子删除已完整消费的 entries 并回到 Ready。目标已提交但 settle 前崩溃时从原
+buffer 重建并原样重投同一组 ID；无需 receipt、delivery sequence 或 digest，也不重投已 settle 的
+旧批次。
 
 该试点要求 Sink 独占其目标表、索引与约束，Schema 固定，外部不得改表、改数据或替换/
 恢复数据库，同一 target spec 不得被其他 Flow 接管或共享。远端 marker 只标识 ownership/layout
-版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；当前没有 TLS 或在线 Schema evolution。普通 Cargo gate 离线，显式本机
+版本，精确 logical Schema 由 Flow binding 与运行时 guard 保证；外部把 Store/目标共同改成另一组
+语义自洽状态不属于恢复契约。当前没有 TLS 或在线 Schema evolution；PG 的 5 秒 work-unit deadline
+包含宽 Schema 的全部 SQL 分片往返，极宽目标要求低延迟连接。普通 Cargo gate 离线，显式本机
 `system-tests/postgres/check_sink.py` 覆盖初始化、大批 insert/delete、混合插删重放、宽 Schema、
 1000 条不同记录的交错更新与“PG 已提交/Store 仍 Prepared”窗口的进程重开。SQL 次数证据见
-`TESTING.md`；尚无 Sink 独立吞吐或长稳 benchmark。
+`TESTING.md`；`buffered_sink` Criterion target 覆盖同步 Store commit、SQLite I/O、小批稳态、多 entry
+合批、大 payload 和高 multiplicity churn。长稳/真实 PG 吞吐仍不在普通 benchmark gate 中。
 
-两种 Definition 直接装配共享运行内核，数据库适配只负责目标检查、初始化、精确匹配和原子写入。
+两种 Definition 直接装配唯一 buffered 运行内核；crate 私有 relation 层只负责目标检查、初始化、
+精确匹配、technical-ID planning/codec 和原子写入。
 没有公共通用 Sink trait、backend enum、plugin registry 或 ORM 抽象。旧 runtime/state 与兼容出口
 直接删除；旧 Flow 和目标重建。
 

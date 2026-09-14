@@ -1,7 +1,8 @@
-use dogpaddle_change::Change;
-
 use super::{SinkTarget, invalid};
 use crate::operation::OperationError;
+
+#[cfg(test)]
+use super::DeliveryBatch;
 
 const VERSION: u8 = 1;
 
@@ -9,7 +10,18 @@ const VERSION: u8 = 1;
 pub(super) struct Position {
     pub(super) sequence: u64,
     pub(super) row_index: u64,
+    /// Zero denotes an entry boundary whose first diff has not been decoded.
     pub(super) remaining: u64,
+}
+
+impl Position {
+    pub(super) const fn entry_start(sequence: u64) -> Self {
+        Self {
+            sequence,
+            row_index: 0,
+            remaining: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,17 +46,36 @@ impl BufferState {
 
     pub(super) fn validate(self) -> Result<(), OperationError> {
         match self.head {
-            None if self.pending_events == 0 && self.retained_bytes == 0 => Ok(()),
+            None if self == Self::EMPTY => Ok(()),
             Some(head)
                 if head.sequence < self.tail
-                    && head.remaining != 0
+                    && (head.remaining != 0 || head.row_index == 0)
+                    && self.pending_events != 0
                     && self.pending_events >= head.remaining
+                    && self.tail - head.sequence <= self.pending_events
                     && self.retained_bytes >= size_of::<u64>() as u64 =>
             {
                 Ok(())
             }
             None | Some(_) => Err(invalid("invalid buffer control state")),
         }
+    }
+}
+
+pub(super) const fn has_batch_id_capacity(buffer: BufferState, next_batch_id: u64) -> bool {
+    next_batch_id != 0 && buffer.pending_events <= u64::MAX - next_batch_id
+}
+
+fn validate_batch_id_capacity(
+    buffer: BufferState,
+    next_batch_id: u64,
+) -> Result<(), OperationError> {
+    if has_batch_id_capacity(buffer, next_batch_id) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "buffered input cannot drain before the batch ID range is exhausted",
+        ))
     }
 }
 
@@ -71,7 +102,41 @@ pub(super) enum State<C, P> {
     Prepared(Prepared<C, P>),
 }
 
+pub(super) enum Header<'input, C> {
+    Initialize,
+    Ready(Ready<C>),
+    Prepared {
+        before: BufferState,
+        after: BufferState,
+        batch_id: u64,
+        checkpoint: C,
+        encoded_plan: &'input [u8],
+    },
+}
+
 impl<C, P> State<C, P> {
+    pub(super) fn validate(&self) -> Result<(), OperationError> {
+        match self {
+            Self::Initialize => Ok(()),
+            Self::Ready(ready) => {
+                ready.buffer.validate()?;
+                if ready.next_batch_id == 0 {
+                    Err(invalid("next batch ID is zero"))
+                } else {
+                    validate_batch_id_capacity(ready.buffer, ready.next_batch_id)
+                }
+            }
+            Self::Prepared(prepared) => {
+                validate_settlement(prepared.before, prepared.after)?;
+                if prepared.batch_id == 0 || prepared.batch_id == u64::MAX {
+                    Err(invalid("prepared batch ID is outside 1..u64::MAX"))
+                } else {
+                    validate_batch_id_capacity(prepared.after, prepared.batch_id + 1)
+                }
+            }
+        }
+    }
+
     pub(super) fn encode<T>(&self) -> Vec<u8>
     where
         T: SinkTarget<Checkpoint = C, Plan = P>,
@@ -95,45 +160,80 @@ impl<C, P> State<C, P> {
         output
     }
 
+    #[cfg(test)]
     pub(super) fn decode<T>(
-        mut input: &[u8],
-        prepared_input: Option<&Change>,
+        input: &[u8],
+        prepared_input: Option<&DeliveryBatch>,
     ) -> Result<Self, OperationError>
     where
         T: SinkTarget<Checkpoint = C, Plan = P>,
     {
-        if read::<1>(&mut input)? != [VERSION] {
-            return Err(invalid("unknown control-state version"));
-        }
-        let state = match read::<1>(&mut input)?[0] {
-            0 => Self::Initialize,
-            1 => Self::Ready(decode_ready::<T>(&mut input)?),
-            2 => {
-                let before = decode_buffer(&mut input)?;
-                let after = decode_buffer(&mut input)?;
-                validate_settlement(before, after)?;
-                let batch_id = u64::from_be_bytes(read(&mut input)?);
-                if batch_id == u64::MAX {
-                    return Err(invalid("prepared batch ID is exhausted"));
-                }
-                let checkpoint = T::decode_checkpoint(&mut input)?;
+        match decode_header::<T>(input)? {
+            Header::Initialize => Ok(Self::Initialize),
+            Header::Ready(ready) => Ok(Self::Ready(ready)),
+            Header::Prepared {
+                before,
+                after,
+                batch_id,
+                checkpoint,
+                mut encoded_plan,
+            } => {
                 let change = prepared_input
                     .ok_or_else(|| invalid("prepared input is required to decode its plan"))?;
-                let plan = T::decode_plan(&mut input, change, &checkpoint)?;
-                Self::Prepared(Prepared {
+                let plan = T::decode_plan(&mut encoded_plan, change, &checkpoint)?;
+                if !encoded_plan.is_empty() {
+                    return Err(invalid("trailing control-state bytes"));
+                }
+                Ok(Self::Prepared(Prepared {
                     before,
                     after,
                     batch_id,
                     checkpoint,
                     plan,
-                })
+                }))
             }
-            _ => return Err(invalid("unknown control-state phase")),
-        };
-        if !input.is_empty() {
-            return Err(invalid("trailing control-state bytes"));
         }
-        Ok(state)
+    }
+}
+
+pub(super) fn decode_header<'input, T>(
+    mut input: &'input [u8],
+) -> Result<Header<'input, T::Checkpoint>, OperationError>
+where
+    T: SinkTarget,
+{
+    if read::<1>(&mut input)? != [VERSION] {
+        return Err(invalid("unknown control-state version"));
+    }
+    match read::<1>(&mut input)?[0] {
+        0 => {
+            require_end(input)?;
+            Ok(Header::Initialize)
+        }
+        1 => {
+            let ready = decode_ready::<T>(&mut input)?;
+            require_end(input)?;
+            Ok(Header::Ready(ready))
+        }
+        2 => {
+            let before = decode_buffer(&mut input)?;
+            let after = decode_buffer(&mut input)?;
+            validate_settlement(before, after)?;
+            let batch_id = u64::from_be_bytes(read(&mut input)?);
+            if batch_id == 0 || batch_id == u64::MAX {
+                return Err(invalid("prepared batch ID is outside 1..u64::MAX"));
+            }
+            validate_batch_id_capacity(after, batch_id + 1)?;
+            let checkpoint = T::decode_checkpoint(&mut input)?;
+            Ok(Header::Prepared {
+                before,
+                after,
+                batch_id,
+                checkpoint,
+                encoded_plan: input,
+            })
+        }
+        _ => Err(invalid("unknown control-state phase")),
     }
 }
 
@@ -146,9 +246,10 @@ fn encode_ready<T: SinkTarget>(ready: &Ready<T::Checkpoint>, output: &mut Vec<u8
 fn decode_ready<T: SinkTarget>(input: &mut &[u8]) -> Result<Ready<T::Checkpoint>, OperationError> {
     let buffer = decode_buffer(input)?;
     let next_batch_id = u64::from_be_bytes(read(input)?);
-    if next_batch_id == u64::MAX {
-        return Err(invalid("next batch ID is exhausted"));
+    if next_batch_id == 0 {
+        return Err(invalid("next batch ID is zero"));
     }
+    validate_batch_id_capacity(buffer, next_batch_id)?;
     let checkpoint = T::decode_checkpoint(input)?;
     Ok(Ready {
         buffer,
@@ -193,19 +294,40 @@ fn decode_buffer(input: &mut &[u8]) -> Result<BufferState, OperationError> {
 }
 
 fn validate_settlement(before: BufferState, after: BufferState) -> Result<(), OperationError> {
+    before.validate()?;
+    after.validate()?;
+    let heads_progress = match (before.head, after.head) {
+        (Some(_), None) => after == BufferState::EMPTY,
+        (Some(start), Some(end)) => {
+            before.tail == after.tail
+                && (end.sequence > start.sequence
+                    || (end.sequence == start.sequence
+                        && (end.row_index > start.row_index
+                            || (end.row_index == start.row_index
+                                && if start.remaining == 0 {
+                                    end.remaining != 0
+                                } else {
+                                    end.remaining < start.remaining
+                                }))))
+        }
+        (None, _) => false,
+    };
     if before.is_empty()
-        || before.tail != after.tail
+        || !heads_progress
         || after.pending_events >= before.pending_events
         || after.retained_bytes > before.retained_bytes
-        || match (before.head, after.head) {
-            (Some(_), None) => after.pending_events != 0 || after.retained_bytes != 0,
-            (Some(start), Some(end)) => end.sequence < start.sequence,
-            (None, _) => true,
-        }
     {
         return Err(invalid("invalid prepared settlement"));
     }
     Ok(())
+}
+
+fn require_end(input: &[u8]) -> Result<(), OperationError> {
+    if input.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid("trailing control-state bytes"))
+    }
 }
 
 pub(super) fn read<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], OperationError> {

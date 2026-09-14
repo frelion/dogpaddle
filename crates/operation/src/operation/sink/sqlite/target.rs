@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_change::Change;
@@ -140,34 +140,32 @@ impl SqliteTarget {
 
     fn write(&mut self, change: &Change, batch: &Batch) -> Result<(), SqliteSinkError> {
         self.verify_ready()?;
-        let mut inserts = Vec::new();
-        for group in batch
-            .inserts
-            .chunk_by(|left, right| left.row_index == right.row_index)
-        {
-            let row_index = usize::try_from(group[0].row_index).map_err(|_| {
-                super::error::invalid_batch("mutation row index cannot be represented by usize")
-            })?;
-            let ids = group
-                .iter()
-                .map(|insert| technical_id_as_i64(insert.technical_id))
-                .collect::<Result<Vec<_>, _>>()?;
-            inserts.push((ids, self.encode_row(change, row_index)?));
-        }
-        let deletes = batch
-            .deletes
-            .iter()
-            .map(|id| technical_id_as_i64(*id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (groups, deletes) = self.encode_mutation_groups(change, batch)?;
         let (connection, sql) = self.parts()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (ids, encoded) in &inserts {
+        for group in &groups {
             let mut statement = transaction.prepare_cached(&sql.insert)?;
-            for id in ids {
-                let values = [id as &dyn ToSql, &encoded.hash as &dyn ToSql]
+            for id in &group.insert_ids {
+                let values = [id as &dyn ToSql, &group.row.hash as &dyn ToSql]
                     .into_iter()
-                    .chain(encoded.values.iter().map(|value| value as &dyn ToSql));
+                    .chain(group.row.values.iter().map(|value| value as &dyn ToSql));
                 statement.execute(params_from_iter(values))?;
+            }
+        }
+        for group in &groups {
+            let mut values = group
+                .mutation_ids
+                .iter()
+                .map(|id| id as &dyn ToSql)
+                .chain(std::iter::once(&group.row.hash as &dyn ToSql))
+                .chain(group.row.values.iter().map(|value| value as &dyn ToSql));
+            let mismatch = transaction
+                .prepare_cached(&sql.mismatch_statement(group.mutation_ids.len()))?
+                .query_row(params_from_iter(&mut values), |row| row.get::<_, bool>(0))?;
+            if mismatch {
+                return Err(super::error::invalid_batch(
+                    "target technical ID belongs to a different logical row",
+                ));
             }
         }
         if !deletes.is_empty() {
@@ -181,6 +179,50 @@ impl SqliteTarget {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    fn encode_mutation_groups(
+        &self,
+        change: &Change,
+        batch: &Batch,
+    ) -> Result<(Vec<EncodedMutationGroup>, Vec<i64>), SqliteSinkError> {
+        #[derive(Default)]
+        struct Ids {
+            inserts: Vec<i64>,
+            mutations: Vec<i64>,
+        }
+
+        let mut by_row = BTreeMap::<u64, Ids>::new();
+        for insert in &batch.inserts {
+            let id = technical_id_as_i64(insert.technical_id)?;
+            let group = by_row.entry(insert.row_index).or_default();
+            group.inserts.push(id);
+            group.mutations.push(id);
+        }
+        let mut deletes = Vec::with_capacity(batch.deletes.len());
+        for delete in &batch.deletes {
+            let id = technical_id_as_i64(delete.technical_id)?;
+            by_row
+                .entry(delete.row_index)
+                .or_default()
+                .mutations
+                .push(id);
+            deletes.push(id);
+        }
+        let groups = by_row
+            .into_iter()
+            .map(|(row_index, ids)| {
+                let row_index = usize::try_from(row_index).map_err(|_| {
+                    super::error::invalid_batch("mutation row index cannot be represented by usize")
+                })?;
+                Ok(EncodedMutationGroup {
+                    insert_ids: ids.inserts,
+                    mutation_ids: ids.mutations,
+                    row: self.encode_row(change, row_index)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SqliteSinkError>>()?;
+        Ok((groups, deletes))
     }
 
     fn parts(&mut self) -> Result<(&mut Connection, &SqlPlan), SqliteSinkError> {
@@ -200,6 +242,12 @@ impl SqliteTarget {
             sql,
         ))
     }
+}
+
+struct EncodedMutationGroup {
+    insert_ids: Vec<i64>,
+    mutation_ids: Vec<i64>,
+    row: EncodedRow,
 }
 
 impl RelationTarget for SqliteTarget {
@@ -240,6 +288,8 @@ struct SqlPlan {
     insert: String,
     select_matching_ids: String,
     count_matches: String,
+    row_columns: String,
+    row_value_count: usize,
     delete_prefix: String,
     has_rows: String,
 }
@@ -311,9 +361,29 @@ impl SqlPlan {
             insert,
             select_matching_ids,
             count_matches,
+            row_columns,
+            row_value_count: columns.len() - 1,
             delete_prefix,
             has_rows,
         })
+    }
+
+    fn mismatch_statement(&self, ids: usize) -> String {
+        assert!(ids != 0);
+        let id_placeholders = (1..=ids)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row_placeholders = (ids + 1..=ids + self.row_value_count)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IN ({id_placeholders}) AND NOT (({}) IS ({row_placeholders})))",
+            quote_identifier(&self.table_name),
+            quote_identifier(TECHNICAL_ID),
+            self.row_columns,
+        )
     }
 }
 

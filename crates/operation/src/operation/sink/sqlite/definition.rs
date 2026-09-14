@@ -14,7 +14,10 @@ use crate::{
     OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
-    operation::sink::relation::{DATA, RelationalSink, STATE},
+    operation::sink::{
+        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
+        relation::RelationSinkTarget,
+    },
 };
 
 pub(crate) const TAG: u16 = 10;
@@ -169,11 +172,12 @@ impl SealedDefinition for SqliteSinkDefinition {
         let schema = Arc::clone(input_schema);
         Ok(OperationBinding::turn(
             None,
-            move |data: &mut DataInstances| -> Result<RelationalSink<SqliteTarget>, MaterializeError> {
-                Ok(RelationalSink::new(
+            move |data: &mut DataInstances| -> Result<_, MaterializeError> {
+                Ok(BufferedSink::new(
                     schema,
-                    target,
-                    data.take(&STATE)?,
+                    RelationSinkTarget::new(target),
+                    data.take(&CONTROL)?,
+                    data.take(&BUFFER)?,
                 ))
             },
         ))

@@ -32,6 +32,8 @@ pub(crate) enum RowError {
     UnexpectedNull { field: String },
     #[error("nested value length cannot be represented by the canonical row format")]
     LengthOverflow,
+    #[error("canonical row exceeds its {max_bytes}-byte limit")]
+    SizeLimit { max_bytes: usize },
     #[error("canonical row is truncated")]
     Truncated,
     #[error("canonical row contains an invalid null marker")]
@@ -47,17 +49,213 @@ pub(crate) enum RowError {
 }
 
 pub(crate) fn canonical_row(batch: &RecordBatch, index: usize) -> Result<Vec<u8>, OperationError> {
+    canonical_row_with_limit(batch, index, None)
+}
+
+pub(crate) fn canonical_row_bounded(
+    batch: &RecordBatch,
+    index: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, OperationError> {
+    canonical_row_with_limit(batch, index, Some(max_bytes))
+}
+
+pub(crate) fn canonical_row_size_bounded(
+    batch: &RecordBatch,
+    index: usize,
+    max_bytes: usize,
+) -> Result<usize, OperationError> {
     if index >= batch.num_rows() {
         return Err(Box::new(RowError::RowOutOfBounds {
             row_index: index,
             rows: batch.num_rows(),
         }));
     }
-    let mut bytes = Vec::new();
+    let mut size = 0;
+    let mut path = Vec::new();
     for (field, array) in batch.schema_ref().fields().iter().zip(batch.columns()) {
-        encode_canonical(field, array.as_ref(), index, field.name(), &mut bytes)?;
+        path.push(field.name().as_str());
+        let result = canonical_size_inner(
+            field,
+            array.as_ref(),
+            index,
+            &mut path,
+            &mut size,
+            max_bytes,
+        );
+        path.pop();
+        result?;
+    }
+    Ok(size)
+}
+
+fn canonical_row_with_limit(
+    batch: &RecordBatch,
+    index: usize,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, OperationError> {
+    let mut bytes = Vec::new();
+    if index >= batch.num_rows() {
+        return Err(Box::new(RowError::RowOutOfBounds {
+            row_index: index,
+            rows: batch.num_rows(),
+        }));
+    }
+    let mut path = Vec::new();
+    for (field, array) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+        path.push(field.name().as_str());
+        let result = encode_canonical_inner(
+            field,
+            array.as_ref(),
+            index,
+            &mut path,
+            &mut bytes,
+            max_bytes,
+        );
+        path.pop();
+        result?;
     }
     Ok(bytes)
+}
+
+#[allow(clippy::too_many_lines)]
+fn canonical_size_inner<'a>(
+    field: &'a Field,
+    array: &dyn Array,
+    index: usize,
+    path: &mut Vec<&'a str>,
+    size: &mut usize,
+    max_bytes: usize,
+) -> Result<(), RowError> {
+    if array.data_type() != field.data_type() {
+        return Err(RowError::ArrayTypeMismatch {
+            field: path.join("."),
+            expected: field.data_type().clone(),
+            actual: array.data_type().clone(),
+        });
+    }
+    if index >= array.len() {
+        return Err(RowError::RowOutOfBounds {
+            row_index: index,
+            rows: array.len(),
+        });
+    }
+    let null_type = matches!(field.data_type(), DataType::Null);
+    if null_type || array.is_null(index) {
+        if !field.is_nullable() && !null_type {
+            return Err(RowError::UnexpectedNull {
+                field: path.join("."),
+            });
+        }
+        add_size(size, 1, max_bytes)?;
+        return Ok(());
+    }
+
+    add_size(size, 1, max_bytes)?;
+    let fixed_width = match field.data_type() {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 => Some(2),
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Some(4),
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => {
+            Some(8)
+        }
+        DataType::Decimal128(_, _) => Some(16),
+        _ => None,
+    };
+    if let Some(width) = fixed_width {
+        return add_size(size, width, max_bytes);
+    }
+
+    match field.data_type() {
+        DataType::Utf8 => {
+            let bytes = downcast::<StringArray>(array, field, path)?.value(index);
+            add_size(size, 8, max_bytes)?;
+            add_size(size, bytes.len(), max_bytes)
+        }
+        DataType::Binary => {
+            let bytes = downcast::<BinaryArray>(array, field, path)?.value(index);
+            add_size(size, 8, max_bytes)?;
+            add_size(size, bytes.len(), max_bytes)
+        }
+        DataType::List(child) => {
+            let values = downcast::<ListArray>(array, field, path)?.value(index);
+            add_size(size, 8, max_bytes)?;
+            if let Some(child_size) = constant_canonical_size(child, values.as_ref()) {
+                let children = values
+                    .len()
+                    .checked_mul(child_size)
+                    .ok_or(RowError::LengthOverflow)?;
+                return add_size(size, children, max_bytes);
+            }
+            path.push(child.name());
+            for index in 0..values.len() {
+                canonical_size_inner(child, values.as_ref(), index, path, size, max_bytes)?;
+            }
+            path.pop();
+            Ok(())
+        }
+        DataType::Struct(fields) => {
+            let structure = downcast::<StructArray>(array, field, path)?;
+            for (child, values) in fields.iter().zip(structure.columns()) {
+                path.push(child.name());
+                let result =
+                    canonical_size_inner(child, values.as_ref(), index, path, size, max_bytes);
+                path.pop();
+                result?;
+            }
+            Ok(())
+        }
+        DataType::Null => unreachable!("null values are handled above"),
+        other => Err(RowError::ArrayTypeMismatch {
+            field: path.join("."),
+            expected: other.clone(),
+            actual: array.data_type().clone(),
+        }),
+    }
+}
+
+fn constant_canonical_size(field: &Field, array: &dyn Array) -> Option<usize> {
+    if array.data_type() != field.data_type() {
+        return None;
+    }
+    if matches!(field.data_type(), DataType::Null) {
+        return Some(1);
+    }
+    let value_size = match field.data_type() {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 2,
+        DataType::Int16 | DataType::UInt16 => 3,
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 5,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => 9,
+        DataType::Decimal128(_, _) => 17,
+        DataType::Struct(fields) => {
+            let structure = array.as_any().downcast_ref::<StructArray>()?;
+            fields
+                .iter()
+                .zip(structure.columns())
+                .try_fold(1_usize, |size, (child, values)| {
+                    size.checked_add(constant_canonical_size(child, values.as_ref())?)
+                })?
+        }
+        DataType::Utf8 | DataType::Binary | DataType::List(_) => return None,
+        _ => return None,
+    };
+    if array.null_count() == 0 || value_size == 1 {
+        Some(value_size)
+    } else {
+        None
+    }
+}
+
+fn add_size(size: &mut usize, additional: usize, max_bytes: usize) -> Result<(), RowError> {
+    let next = size
+        .checked_add(additional)
+        .ok_or(RowError::LengthOverflow)?;
+    if next > max_bytes {
+        Err(RowError::SizeLimit { max_bytes })
+    } else {
+        *size = next;
+        Ok(())
+    }
 }
 
 pub(crate) fn row_hash(bytes: &[u8]) -> [u8; 16] {
@@ -244,16 +442,28 @@ impl<'a> RowCursor<'a> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn encode_canonical(
-    field: &Field,
+pub(crate) fn encode_canonical<'a>(
+    field: &'a Field,
     array: &dyn Array,
     index: usize,
-    path: &str,
+    path: &'a str,
     output: &mut Vec<u8>,
+) -> Result<(), RowError> {
+    encode_canonical_inner(field, array, index, &mut vec![path], output, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_canonical_inner<'a>(
+    field: &'a Field,
+    array: &dyn Array,
+    index: usize,
+    path: &mut Vec<&'a str>,
+    output: &mut Vec<u8>,
+    max_bytes: Option<usize>,
 ) -> Result<(), RowError> {
     if array.data_type() != field.data_type() {
         return Err(RowError::ArrayTypeMismatch {
-            field: path.to_owned(),
+            field: path.join("."),
             expected: field.data_type().clone(),
             actual: array.data_type().clone(),
         });
@@ -268,27 +478,31 @@ pub(crate) fn encode_canonical(
     if null_type || array.is_null(index) {
         if !field.is_nullable() && !null_type {
             return Err(RowError::UnexpectedNull {
-                field: path.to_owned(),
+                field: path.join("."),
             });
         }
-        output.push(0);
+        push_byte(output, 0, max_bytes)?;
         return Ok(());
     }
-    output.push(1);
+    push_byte(output, 1, max_bytes)?;
     macro_rules! fixed {
         ($array:ty) => {
-            output.extend_from_slice(
+            append_bytes(
+                output,
                 &downcast::<$array>(array, field, path)?
                     .value(index)
                     .to_be_bytes(),
-            )
+                max_bytes,
+            )?
         };
     }
     match field.data_type() {
         DataType::Null => unreachable!("null values are handled above"),
-        DataType::Boolean => output.push(u8::from(
-            downcast::<BooleanArray>(array, field, path)?.value(index),
-        )),
+        DataType::Boolean => push_byte(
+            output,
+            u8::from(downcast::<BooleanArray>(array, field, path)?.value(index)),
+            max_bytes,
+        )?,
         DataType::Int8 => fixed!(Int8Array),
         DataType::Int16 => fixed!(Int16Array),
         DataType::Int32 => fixed!(Int32Array),
@@ -297,18 +511,22 @@ pub(crate) fn encode_canonical(
         DataType::UInt16 => fixed!(UInt16Array),
         DataType::UInt32 => fixed!(UInt32Array),
         DataType::UInt64 => fixed!(UInt64Array),
-        DataType::Float32 => output.extend_from_slice(
+        DataType::Float32 => append_bytes(
+            output,
             &downcast::<Float32Array>(array, field, path)?
                 .value(index)
                 .to_bits()
                 .to_be_bytes(),
-        ),
-        DataType::Float64 => output.extend_from_slice(
+            max_bytes,
+        )?,
+        DataType::Float64 => append_bytes(
+            output,
             &downcast::<Float64Array>(array, field, path)?
                 .value(index)
                 .to_bits()
                 .to_be_bytes(),
-        ),
+            max_bytes,
+        )?,
         DataType::Date32 => fixed!(Date32Array),
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => fixed!(TimestampSecondArray),
@@ -322,34 +540,36 @@ pub(crate) fn encode_canonical(
                 .value(index)
                 .as_bytes(),
             output,
+            max_bytes,
         )?,
         DataType::Binary => encode_bytes(
             downcast::<BinaryArray>(array, field, path)?.value(index),
             output,
+            max_bytes,
         )?,
         DataType::List(child) => {
             let values = downcast::<ListArray>(array, field, path)?.value(index);
-            encode_length(values.len(), output)?;
-            let path = format!("{path}.{}", child.name());
+            encode_length(values.len(), output, max_bytes)?;
+            require_capacity(output, values.len(), max_bytes)?;
+            path.push(child.name());
             for index in 0..values.len() {
-                encode_canonical(child, values.as_ref(), index, &path, output)?;
+                encode_canonical_inner(child, values.as_ref(), index, path, output, max_bytes)?;
             }
+            path.pop();
         }
         DataType::Struct(fields) => {
             let structure = downcast::<StructArray>(array, field, path)?;
             for (child, values) in fields.iter().zip(structure.columns()) {
-                encode_canonical(
-                    child,
-                    values.as_ref(),
-                    index,
-                    &format!("{path}.{}", child.name()),
-                    output,
-                )?;
+                path.push(child.name());
+                let result =
+                    encode_canonical_inner(child, values.as_ref(), index, path, output, max_bytes);
+                path.pop();
+                result?;
             }
         }
         other => {
             return Err(RowError::ArrayTypeMismatch {
-                field: path.to_owned(),
+                field: path.join("."),
                 expected: other.clone(),
                 actual: array.data_type().clone(),
             });
@@ -358,33 +578,74 @@ pub(crate) fn encode_canonical(
     Ok(())
 }
 
-fn downcast<'a, T: Array + 'static>(
-    array: &'a dyn Array,
+fn downcast<'array, T: Array + 'static>(
+    array: &'array dyn Array,
     field: &Field,
-    path: &str,
-) -> Result<&'a T, RowError> {
+    path: &[&str],
+) -> Result<&'array T, RowError> {
     array
         .as_any()
         .downcast_ref()
         .ok_or_else(|| RowError::ArrayTypeMismatch {
-            field: path.to_owned(),
+            field: path.join("."),
             expected: field.data_type().clone(),
             actual: array.data_type().clone(),
         })
 }
 
-fn encode_bytes(bytes: &[u8], output: &mut Vec<u8>) -> Result<(), RowError> {
-    encode_length(bytes.len(), output)?;
+fn encode_bytes(
+    bytes: &[u8],
+    output: &mut Vec<u8>,
+    max_bytes: Option<usize>,
+) -> Result<(), RowError> {
+    encode_length(bytes.len(), output, max_bytes)?;
+    append_bytes(output, bytes, max_bytes)
+}
+
+fn encode_length(
+    length: usize,
+    output: &mut Vec<u8>,
+    max_bytes: Option<usize>,
+) -> Result<(), RowError> {
+    append_bytes(
+        output,
+        &u64::try_from(length)
+            .map_err(|_| RowError::LengthOverflow)?
+            .to_be_bytes(),
+        max_bytes,
+    )
+}
+
+fn push_byte(output: &mut Vec<u8>, byte: u8, max_bytes: Option<usize>) -> Result<(), RowError> {
+    require_capacity(output, 1, max_bytes)?;
+    output.push(byte);
+    Ok(())
+}
+
+fn append_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    max_bytes: Option<usize>,
+) -> Result<(), RowError> {
+    require_capacity(output, bytes.len(), max_bytes)?;
     output.extend_from_slice(bytes);
     Ok(())
 }
 
-fn encode_length(length: usize, output: &mut Vec<u8>) -> Result<(), RowError> {
-    output.extend_from_slice(
-        &u64::try_from(length)
-            .map_err(|_| RowError::LengthOverflow)?
-            .to_be_bytes(),
-    );
+fn require_capacity(
+    output: &[u8],
+    additional: usize,
+    max_bytes: Option<usize>,
+) -> Result<(), RowError> {
+    let next = output
+        .len()
+        .checked_add(additional)
+        .ok_or(RowError::LengthOverflow)?;
+    if let Some(max_bytes) = max_bytes {
+        if next > max_bytes {
+            return Err(RowError::SizeLimit { max_bytes });
+        }
+    }
     Ok(())
 }
 

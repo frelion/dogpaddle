@@ -277,9 +277,9 @@ Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 
 | `Select` (7) | Atomic 或 Exclusive / 1 | 从同一输入计算完整有序输出列 | 无 |
 | `UnionAll` (8) | Atomic / N | 原样转发 Schema 完全相同的各端口 Change | 无 |
 | `SchemaAlign` (9) | Atomic 或 Exclusive / 1 | 显式产生目标字段与 metadata | 无 |
-| `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 `SQLite` STRICT 表 | `relation_sink.state: Cell<Vec<u8>>` |
+| `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 `SQLite` STRICT 表 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
 | `PostgresCdcScan` (11) | Scan / 0 | `PostgreSQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 `PostgreSQL` | `relation_sink.state: Cell<Vec<u8>>` |
+| `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 `PostgreSQL` | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
 | `Distinct` (13) | Atomic / 1 | 把任意正权重关系变成集合边界变化 | `distinct.weights: OrderedMultiset` |
 | `Aggregate` (14) | Atomic 或 Exclusive / 1 | 增量维护非空分组聚合 | groups、entries、control |
 | `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
@@ -342,13 +342,35 @@ Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 s
 Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
 `dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
 
-`SQLite` 与 `PostgreSQL` Sink 共用关系写入协议：先在 Store 中持久化至多 1024 个具体 mutation，
-提交后在目标数据库的一个事务中按稳定 `$dogpaddle.id` 幂等执行，下一 turn 再结算输入。目标已经
-提交而本地尚未结算时会重投当前批次。
+`SQLite` 与 `PostgreSQL` Sink 共用唯一的 durable buffered Sink 协议。完整输入 Change 先编码为一个
+`sink.buffer` entry，并与 `sink.control` accounting、input `Complete` acknowledgement 在同一 Store
+事务提交；因此调用方在目标数据库写入前就可以释放 Claim。连续小 Change 可以聚合；没有新 Claim、
+待处理事件达到目标上限或 retained bytes 达到 delivery watermark 时，运行时才从 buffer 构造一个
+有界批次。单个 buffered Change 的 canonical、uncompressed IPC 加 8-byte key 不得超过 8 MiB；编码前
+先无拷贝预检 IPC body，避免超大 Change 在拒绝前形成完整临时 body。owned decode 在对齐合适时共享这份
+受限 IPC backing，否则只做受 body 上限约束的局部对齐复制。整个 buffer 最多按 IPC+key 的逻辑口径
+保留 64 MiB、1,048,576 个 relation events；这不是 Rust heap、RocksDB WAL 或磁盘硬配额。
+SQLite/PostgreSQL 的每个目标批次最多 1024 个 mutation，完整 encoded 输入聚合受 8 MiB 上限；
+target mutation 按 canonical row、技术字段和每列固定 framing 的逻辑口径计费，并受独立 8 MiB
+上限。后者不是 driver heap、SQL/wire payload 或数据库事务资源的硬配额。
+超出单项或 event 上限、或不能在剩余 batch-ID 区间内排空的 Claim 在 admission 前明确失败，不产生
+ACK 或部分 buffer 写入。
+
+批次先把 relation checkpoint、buffer settlement 和固定-ID mutation plan 持久化为 `Prepared`，Store
+commit 后才在目标数据库的一个事务中执行；之后的独立 Store turn 删除完整消费的 entries 并发布
+新的 `Ready`。进程在目标提交与本地 settle 之间退出时，reopen 从原 buffer 精确重建 Prepared 批次并
+重投；Prepared 的 insert/delete 都绑定 delivery row index 与固定 `$dogpaddle.id`，目标事务在忽略
+重复 insert 后仍核对该 ID 的完整逻辑行，再执行 delete，使原样重投幂等且拒绝 ID/行错配。外部提交结果不确定或 AfterCommit 失败
+会使当前 runtime fail-stop，只有 reopen 可以继续。恢复在任何目标副作用前分页校验全部 retained
+entries、连续 sequence、Schema、control accounting，以及 checkpoint 下剩余正事件的技术 ID 容量，
+不能先交付损坏 buffer 的有效前缀。该检查覆盖结构损坏与正常 crash/replay；外部篡改 Store/目标为另一组
+语义自洽状态不在恢复契约内，目标表仍必须由 Sink 独占。
 
 `SQLite` Sink 只接受新的非保留目标表和绝对 UTF-8 文件路径。PostgreSQL Sink 要求调用方每次注入
 连接配置，Definition 只保存 discovery 得到的非敏感 target spec；当前不支持 DNS endpoint、TLS、
-共享目标或在线 Schema evolution。真实数据库限制和恢复证据见对应 correctness 与 system test。
+共享目标或在线 Schema evolution。PostgreSQL 的 5 秒 work-unit deadline 包含宽 Schema 为遵守参数上限
+产生的全部 SQL 分片往返，因此极宽目标需要低延迟连接。真实数据库限制和恢复证据见对应 correctness
+与 system test。
 
 ## 持久化 ABI
 
@@ -359,9 +381,10 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 ```
 
 tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
-`GroupState` 与 `JoinContinuation` 等状态 codec、collection 的 key/value codec，以及 Flow 加上的
-Station/Operation 序号路径共同构成当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash 还是
-远端布局 ABI。decoder 表在
+`GroupState`、`JoinContinuation` 与 buffered Sink control codec、buffer 内完整 Change IPC、collection
+的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成当前 v1 持久化边界。
+关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation codec 还是目标布局/恢复
+ABI。decoder 表在
 [`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
 
 这是开发期 v1。破坏性修改直接更新当前格式、golden 和布局测试；不增加旧版本 alias、fallback、
@@ -402,8 +425,9 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 - Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
   [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
 
-`Aggregate` 的 MIN/MAX 与 `EquiJoin` 的 match/presence transition 各有 owner benchmark；其他组合
-性能由真正拥有 workload 的 Flow、Store 或 Change + Store target 负责。
+`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition 和 durable buffered SQLite Sink
+各有 owner benchmark；其他组合性能由真正拥有 workload 的 Flow、Store 或 Change + Store target
+负责。
 
 ```bash
 cargo test -p dogpaddle-operation
@@ -412,6 +436,7 @@ cargo doc -p dogpaddle-operation --no-deps
 cargo test -p dogpaddle-operation --benches
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink
 ```
 
 全工作区测试所有权和性能口径见 [`TESTING.md`](../../TESTING.md)。

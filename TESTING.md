@@ -129,6 +129,7 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 
 | `cell` | Criterion |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、重复 MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
 | `equi_join` | Operation 自有 Criterion：Inner first/last match、Semi 稳定与 first/last presence、Full Outer first/last transition；两个完整 Claim 的 Probe/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
+| `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
 | `ordered_map` | Criterion；完整 owned-page 扫描 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
@@ -187,6 +188,7 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ord
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench buffered_sink
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```

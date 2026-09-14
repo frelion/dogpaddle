@@ -12,7 +12,7 @@ use dogpaddle_operation::{
         transform::{ExtendDefinition, FilterDefinition, SelectDefinition},
     },
 };
-use dogpaddle_store::{Cell, Store, SubscribedLog};
+use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
 use rusqlite::{Connection, OpenFlags};
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::MAX;
@@ -82,7 +82,7 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
 }
 
 #[test]
-fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reopen() {
+fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batch() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("sink.sqlite");
@@ -107,8 +107,8 @@ fn sqlite_sink_retains_one_change_until_all_1025_mutations_complete_across_reope
         drop(flow);
         assert_eq!(sqlite_rows(&sqlite_path), Some(1_024), "replay {replay}");
         let snapshot = sink_snapshot(&flow_path);
-        assert_eq!(snapshot.input_position, 0);
-        assert_eq!(snapshot.output_bounds, 0..1);
+        assert_eq!(snapshot.input_position, 1);
+        assert_eq!(snapshot.output_bounds, 1..1);
         assert_eq!(
             snapshot.encoded_entry.as_deref(),
             Some(encoded_change.as_slice())
@@ -214,7 +214,10 @@ fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
     let writer = output.writer();
     let input = output.subscription(0);
     let sink_state: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/relation_sink.state")
+        .open_data("station/00000001/operation/00000000/sink.control")
+        .unwrap();
+    let sink_buffer: OrderedMap<u64, Vec<u8>> = store
+        .open_data("station/00000001/operation/00000000/sink.buffer")
         .unwrap();
     let transaction = store.read_transaction();
     let access = transaction.access();
@@ -223,7 +226,7 @@ fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
     SinkSnapshot {
         input_position: input_status.position,
         output_bounds: output_status.head..output_status.tail,
-        encoded_entry: input.peek(access).unwrap().map(|(_, encoded)| encoded),
+        encoded_entry: sink_buffer.read(access).unwrap().get(&0).unwrap(),
         state: sink_state.read(access).unwrap().get().unwrap(),
     }
 }

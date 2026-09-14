@@ -6,20 +6,17 @@ mod state;
 
 use std::{fmt, num::NonZeroU32};
 
-use dogpaddle_change::Change;
 use dogpaddle_store::{Cell, OrderedMap};
 
-use crate::{
-    DataDeclaration,
-    definition::DataName,
-    operation::OperationError,
-};
+use crate::{DataDeclaration, definition::DataName, operation::OperationError};
 
+pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
 
 pub(crate) const CONTROL: DataName<Cell<Vec<u8>>> = DataName::new("sink.control");
 pub(crate) const BUFFER: DataName<OrderedMap<u64, Vec<u8>>> = DataName::new("sink.buffer");
 pub(crate) const DATA: &[DataDeclaration] = &[CONTROL.declaration(), BUFFER.declaration()];
+pub(crate) const MAX_TARGET_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Target-specific part of the durable sink protocol.
 ///
@@ -27,36 +24,87 @@ pub(crate) const DATA: &[DataDeclaration] = &[CONTROL.declaration(), BUFFER.decl
 /// settlement. An adapter owns target initialization, planning, delivery and
 /// the stable codecs for its small checkpoint and prepared plan.
 pub(crate) trait SinkTarget: Send + 'static {
-    type Checkpoint: Clone;
-    type Plan: Clone;
+    type Checkpoint: Clone + Send + 'static;
+    type Plan: Clone + Send + 'static;
 
-    /// A backend safety ceiling applied after the user batch preference.
+    /// A backend safety ceiling combined with the shared delivery limits.
     const MAX_BATCH_EVENTS: NonZeroU32;
 
+    /// Proves a fresh target is absent before initialization intent is durable.
     fn require_absent(&mut self) -> Result<(), OperationError>;
+    /// Creates or verifies the owned empty target after intent is durable.
+    ///
+    /// A process can exit or receive an uncertain result after this call. The
+    /// same call on reopen must therefore be idempotent and must reject a
+    /// target with incompatible ownership or layout.
     fn initialize(&mut self) -> Result<(), OperationError>;
+    /// Returns the stable checkpoint for the initialized empty target.
     fn initial_checkpoint(&self) -> Self::Checkpoint;
 
+    /// Returns the deterministic target-side byte charge for one row event.
+    ///
+    /// This method must be pure, must not perform target I/O, and must return a
+    /// nonzero value. The shared runtime calls it before input acknowledgement
+    /// and while slicing durable input so one target transaction cannot expand
+    /// a compact Change into unbounded work.
+    fn event_bytes(
+        &self,
+        input: &dogpaddle_change::Change,
+        row_index: usize,
+    ) -> Result<u64, OperationError>;
+
+    /// Rejects input that cannot eventually be represented from this target
+    /// checkpoint, before the shared buffer acknowledges it.
+    fn validate_admission(
+        &self,
+        input: &dogpaddle_change::Change,
+        checkpoint: &Self::Checkpoint,
+        buffered_events: u64,
+    ) -> Result<(), OperationError>;
+
+    /// Validates target-specific capacity for all positive events remaining
+    /// after a recovered checkpoint, before any target I/O is attempted.
+    fn validate_recovery(
+        &self,
+        checkpoint: &Self::Checkpoint,
+        remaining_positive_events: u64,
+    ) -> Result<(), OperationError>;
+
+    /// Plans one exact bounded delivery without changing the target.
+    ///
+    /// The same batch, checkpoint and batch ID can be prepared again after a
+    /// local rollback or process exit. Any target session poisoned by a failed
+    /// read must be reset before returning an error.
     fn prepare(
         &mut self,
-        input: &Change,
+        input: &DeliveryBatch,
         checkpoint: &Self::Checkpoint,
         batch_id: u64,
     ) -> Result<(Self::Checkpoint, Self::Plan), OperationError>;
 
+    /// Atomically and idempotently confirms one durably prepared delivery.
+    ///
+    /// Reopen repeats this call after process exit, an explicit error, or an
+    /// uncertain target commit. Repeating the exact durable plan must be a
+    /// no-op success; adapters may use either the stable batch ID or the
+    /// plan's fixed mutation identities to recognize that replay.
     fn deliver(
         &mut self,
-        input: &Change,
+        input: &DeliveryBatch,
         batch_id: u64,
         plan: &Self::Plan,
     ) -> Result<(), OperationError>;
 
+    /// Appends one stable, self-delimiting checkpoint encoding.
     fn encode_checkpoint(checkpoint: &Self::Checkpoint, output: &mut Vec<u8>);
+    /// Consumes exactly one checkpoint from the control-state suffix.
     fn decode_checkpoint(input: &mut &[u8]) -> Result<Self::Checkpoint, OperationError>;
+    /// Appends one stable prepared-plan encoding.
     fn encode_plan(plan: &Self::Plan, output: &mut Vec<u8>);
+    /// Consumes and validates one plan against its exact reconstructed batch.
     fn decode_plan(
         input: &mut &[u8],
-        change: &Change,
+        change: &DeliveryBatch,
         checkpoint: &Self::Checkpoint,
     ) -> Result<Self::Plan, OperationError>;
 }

@@ -7,7 +7,7 @@ use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 use super::super::{error::SqliteSinkError, target::SqliteTarget};
-use crate::operation::sink::relation::{Batch, Continuation, Insert, Lookup, RelationTarget};
+use crate::operation::sink::relation::{Batch, Delete, Insert, Lookup, RelationTarget};
 
 struct Fixture {
     root: TempDir,
@@ -88,7 +88,7 @@ fn values(schema: &SchemaRef, values: &[i64]) -> Change {
     Change::try_new(records, Int64Array::from(vec![1; values.len()])).unwrap()
 }
 
-fn batch(inserts: &[(u64, u64)], deletes: &[u64]) -> Batch {
+fn batch(inserts: &[(u64, u64)], deletes: &[(u64, u64)]) -> Batch {
     Batch {
         inserts: inserts
             .iter()
@@ -97,8 +97,13 @@ fn batch(inserts: &[(u64, u64)], deletes: &[u64]) -> Batch {
                 technical_id,
             })
             .collect(),
-        deletes: deletes.to_vec(),
-        continuation: Continuation::Done,
+        deletes: deletes
+            .iter()
+            .map(|&(row_index, technical_id)| Delete {
+                row_index,
+                technical_id,
+            })
+            .collect(),
     }
 }
 
@@ -157,12 +162,43 @@ fn fixed_inserts_and_deletes_replay_as_one_idempotent_batch() {
     let mut fixture = Fixture::new(schema());
     fixture.initialize();
     let input = values(&fixture.schema, &[7, 8]);
-    let writes = batch(&[(0, 1), (1, 2), (0, 3)], &[1, 3, 999]);
+    let writes = batch(&[(0, 1), (1, 2), (0, 3)], &[(0, 1), (0, 3), (0, 999)]);
     fixture.target.write_batch(&input, &writes).unwrap();
     assert_eq!(fixture.rows(), [(2, 8)]);
     fixture.target = fixture.fresh_target();
     fixture.target.write_batch(&input, &writes).unwrap();
     assert_eq!(fixture.rows(), [(2, 8)]);
+}
+
+#[test]
+fn replay_rejects_an_existing_id_bound_to_a_different_row() {
+    let mut fixture = Fixture::new(schema());
+    fixture.initialize();
+    let input = values(&fixture.schema, &[7, 8]);
+    fixture
+        .target
+        .write_batch(&input, &batch(&[(0, 1)], &[]))
+        .unwrap();
+
+    assert!(
+        fixture
+            .target
+            .write_batch(&input, &batch(&[(1, 1)], &[]))
+            .is_err()
+    );
+    assert!(
+        fixture
+            .target
+            .write_batch(&input, &batch(&[], &[(1, 1)]))
+            .is_err()
+    );
+    assert_eq!(fixture.rows(), [(1, 7)]);
+
+    fixture
+        .target
+        .write_batch(&input, &batch(&[], &[(1, 999)]))
+        .unwrap();
+    assert_eq!(fixture.rows(), [(1, 7)]);
 }
 
 #[test]
@@ -184,7 +220,7 @@ fn only_primary_key_duplicates_are_ignored_and_other_errors_roll_back_the_batch(
     assert!(
         fixture
             .target
-            .write_batch(&input, &batch(&[(0, 2), (1, 3)], &[1]))
+            .write_batch(&input, &batch(&[(0, 2), (1, 3)], &[(0, 1)]))
             .is_err()
     );
     assert_eq!(fixture.rows(), [(1, 7)]);
@@ -194,7 +230,7 @@ fn only_primary_key_duplicates_are_ignored_and_other_errors_roll_back_the_batch(
         .unwrap();
     fixture
         .target
-        .write_batch(&input, &batch(&[(0, 2), (1, 3)], &[1]))
+        .write_batch(&input, &batch(&[(0, 2), (1, 3)], &[(0, 1)]))
         .unwrap();
     assert_eq!(fixture.rows(), [(2, 7), (3, 8)]);
 }
@@ -239,7 +275,10 @@ fn lookup_returns_bounded_smallest_ids_and_a_capped_exact_count() {
     assert_eq!(matches[0].ids.len(), 1_024);
     fixture
         .target
-        .write_batch(&input, &batch(&[], &(1..=1_024).collect::<Vec<_>>()))
+        .write_batch(
+            &input,
+            &batch(&[], &(1..=1_024).map(|id| (0, id)).collect::<Vec<_>>()),
+        )
         .unwrap();
     let matches = fixture
         .target
@@ -373,7 +412,7 @@ fn empty_and_maximum_width_schemas_support_insert_lookup_and_delete() {
         assert_eq!(matches[0].ids, [1]);
         fixture
             .target
-            .write_batch(&input, &batch(&[], &[1]))
+            .write_batch(&input, &batch(&[], &[(0, 1)]))
             .unwrap();
         let matches = fixture
             .target

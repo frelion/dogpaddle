@@ -103,6 +103,9 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 
 `StoreData` 是 sealed trait；产品代码只能使用这些结构，不能绕过 catalog 自造新的物理布局。
 
+`Cell<Vec<u8>>` 另提供 `get_bounded(max_bytes)`。它在同一个 snapshot 中先检查编码长度，再决定是否
+复制 owned value；超限返回 `ItemTooLarge`，不会毒化事务，调用方可以在同一事务提高 limit 后重试。
+
 ### Queue 与 `SubscribedLog` 的区别
 
 两者都保存有序数据，但用途不同：

@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
@@ -7,7 +7,7 @@ use tokio_postgres::{Client, GenericClient, IsolationLevel, types::ToSql};
 
 use crate::operation::{
     OperationError,
-    sink::relation::{Batch, Insert, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget},
+    sink::relation::{Batch, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget},
 };
 
 use super::{
@@ -204,12 +204,16 @@ impl RelationTarget for PostgresTarget {
 
     fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
         self.with_client(|runtime, client, spec, sql, codec, layout_verified| {
-            let inserts = encode_inserts(codec, input, &batch.inserts)?;
-            let deletes = batch
-                .deletes
+            let (groups, deletes) = encode_mutation_groups(codec, input, batch)?;
+            let inserts = groups
                 .iter()
-                .map(|id| positive_i64(*id))
-                .collect::<Result<Vec<_>, _>>()?;
+                .flat_map(|group| {
+                    group.insert_ids.iter().map(|technical_id| EncodedInsert {
+                        technical_id: *technical_id,
+                        row: Arc::clone(&group.row),
+                    })
+                })
+                .collect::<Vec<_>>();
             bounded(runtime, "write target batch", async {
                 let transaction = client
                     .transaction()
@@ -221,6 +225,9 @@ impl RelationTarget for PostgresTarget {
                 // delete even when an ID occurs in both lists.
                 for inserts in inserts.chunks(sql.insert_batch_size()) {
                     insert_batch(&transaction, sql, inserts).await?;
+                }
+                for groups in groups.chunks(sql.mismatch_batch_size()) {
+                    reject_mismatched_ids(&transaction, sql, groups).await?;
                 }
                 if !deletes.is_empty() {
                     transaction
@@ -244,30 +251,53 @@ struct EncodedInsert {
     row: Arc<EncodedRow>,
 }
 
-fn encode_inserts(
+struct EncodedMutationGroup {
+    insert_ids: Vec<i64>,
+    mutation_ids: Vec<i64>,
+    row: Arc<EncodedRow>,
+}
+
+fn encode_mutation_groups(
     codec: &PostgresRowCodec,
     input: &Change,
-    inserts: &[Insert],
-) -> Result<Vec<EncodedInsert>, PostgresSinkError> {
-    let mut encoded = Vec::with_capacity(inserts.len());
-    let mut cached = None::<(u64, Arc<EncodedRow>)>;
-    for insert in inserts {
-        let row = match &cached {
-            Some((index, row)) if *index == insert.row_index => Arc::clone(row),
-            _ => {
-                let index = usize::try_from(insert.row_index)
-                    .map_err(|_| invalid_batch("insert row index exceeds usize"))?;
-                let row = Arc::new(codec.encode_row(input.records(), index)?);
-                cached = Some((insert.row_index, Arc::clone(&row)));
-                row
-            }
-        };
-        encoded.push(EncodedInsert {
-            technical_id: positive_i64(insert.technical_id)?,
-            row,
-        });
+    batch: &Batch,
+) -> Result<(Vec<EncodedMutationGroup>, Vec<i64>), PostgresSinkError> {
+    #[derive(Default)]
+    struct Ids {
+        inserts: Vec<i64>,
+        mutations: Vec<i64>,
     }
-    Ok(encoded)
+
+    let mut by_row = BTreeMap::<u64, Ids>::new();
+    for insert in &batch.inserts {
+        let id = positive_i64(insert.technical_id)?;
+        let group = by_row.entry(insert.row_index).or_default();
+        group.inserts.push(id);
+        group.mutations.push(id);
+    }
+    let mut deletes = Vec::with_capacity(batch.deletes.len());
+    for delete in &batch.deletes {
+        let id = positive_i64(delete.technical_id)?;
+        by_row
+            .entry(delete.row_index)
+            .or_default()
+            .mutations
+            .push(id);
+        deletes.push(id);
+    }
+    let groups = by_row
+        .into_iter()
+        .map(|(row_index, ids)| {
+            let row_index = usize::try_from(row_index)
+                .map_err(|_| invalid_batch("mutation row index exceeds usize"))?;
+            Ok(EncodedMutationGroup {
+                insert_ids: ids.inserts,
+                mutation_ids: ids.mutations,
+                row: Arc::new(codec.encode_row(input.records(), row_index)?),
+            })
+        })
+        .collect::<Result<Vec<_>, PostgresSinkError>>()?;
+    Ok((groups, deletes))
 }
 
 async fn insert_batch(
@@ -291,6 +321,37 @@ async fn insert_batch(
     Ok(())
 }
 
+async fn reject_mismatched_ids(
+    transaction: &tokio_postgres::Transaction<'_>,
+    sql: &SqlPlan,
+    groups: &[EncodedMutationGroup],
+) -> Result<(), PostgresSinkError> {
+    let hashes = groups
+        .iter()
+        .map(|group| group.row.hash.as_slice())
+        .collect::<Vec<_>>();
+    let mut parameters: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    for (group, hash) in groups.iter().zip(&hashes) {
+        parameters.extend([
+            &group.mutation_ids as &(dyn ToSql + Sync),
+            hash as &(dyn ToSql + Sync),
+        ]);
+        parameters.extend(group.row.values.iter().map(PostgresValue::as_parameter));
+    }
+    let mismatch = transaction
+        .query_one(&sql.mismatch_statement(groups.len()), &parameters)
+        .await
+        .map_err(|error| database_error("verify target mutation IDs", &error))?
+        .get::<_, bool>(0);
+    if mismatch {
+        Err(invalid_batch(
+            "target technical ID belongs to a different logical row",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn positive_i64(id: u64) -> Result<i64, PostgresSinkError> {
     i64::try_from(id)
         .ok()
@@ -307,6 +368,8 @@ pub(super) struct SqlPlan {
     parameter_types: Vec<&'static str>,
     lookup_prefix: String,
     lookup_suffix: String,
+    mismatch_prefix: String,
+    mismatch_suffix: String,
     pub(super) delete: String,
     target_empty: String,
 }
@@ -430,6 +493,21 @@ impl SqlPlan {
              (SELECT count(*) FROM (SELECT 1 {matching} LIMIT request.needed) AS counted) \
              ELSE cardinality(selected.ids)::bigint END, selected.ids FROM (VALUES "
         );
+        let mut different = format!("target.{hash} IS DISTINCT FROM expected.hash");
+        for (index, name) in logical_names.iter().enumerate() {
+            write!(
+                different,
+                " OR target.{name} IS DISTINCT FROM expected.c{index}"
+            )
+            .expect("writing SQL cannot fail");
+        }
+        let mut expected_names = vec!["ids".to_owned(), "hash".to_owned()];
+        expected_names.extend((0..logical_names.len()).map(|index| format!("c{index}")));
+        let mismatch_prefix = "SELECT EXISTS(SELECT 1 FROM (VALUES ".to_owned();
+        let mismatch_suffix = format!(
+            ") AS expected ({}) JOIN ONLY {target} AS target ON target.{id} = ANY(expected.ids) WHERE {different})",
+            expected_names.join(", ")
+        );
         let delete = format!("DELETE FROM ONLY {target} WHERE {id} = ANY($1::bigint[])");
         let target_empty = format!("SELECT NOT EXISTS(SELECT 1 FROM ONLY {target})");
         Self {
@@ -441,6 +519,8 @@ impl SqlPlan {
             parameter_types,
             lookup_prefix,
             lookup_suffix,
+            mismatch_prefix,
+            mismatch_suffix,
             delete,
             target_empty,
         }
@@ -452,6 +532,10 @@ impl SqlPlan {
 
     pub(super) fn lookup_batch_size(&self) -> usize {
         (usize::from(u16::MAX) / (self.parameter_types.len() + 1)).min(MAX_MUTATIONS_PER_BATCH)
+    }
+
+    pub(super) fn mismatch_batch_size(&self) -> usize {
+        self.insert_batch_size()
     }
 
     pub(super) fn insert_statement(&self, rows: usize) -> String {
@@ -469,6 +553,16 @@ impl SqlPlan {
         types.extend(&self.parameter_types);
         write_values(&mut sql, rows, &types, true);
         sql.push_str(&self.lookup_suffix);
+        sql
+    }
+
+    pub(super) fn mismatch_statement(&self, rows: usize) -> String {
+        assert!((1..=self.mismatch_batch_size()).contains(&rows));
+        let mut sql = self.mismatch_prefix.clone();
+        let mut types = vec!["bigint[]"];
+        types.extend(&self.parameter_types[1..]);
+        write_values(&mut sql, rows, &types, false);
+        sql.push_str(&self.mismatch_suffix);
         sql
     }
 }

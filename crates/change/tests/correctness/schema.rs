@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use dogpaddle_change::{MAX_NESTING_DEPTH, SchemaError, validate_schema};
+use dogpaddle_change::{
+    MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_TEXT_BYTES, SchemaError, validate_schema,
+};
 
 use super::support::nested_schema;
 
@@ -36,25 +38,85 @@ fn schema_rejects_duplicate_fields_at_their_exact_scope() {
 }
 
 #[test]
+fn schema_rejects_total_field_fanout_beyond_the_v1_limit() {
+    let schema = Schema::new(
+        (0..=MAX_SCHEMA_FIELDS)
+            .map(|index| Field::new(format!("field_{index}"), DataType::Null, true))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        validate_schema(&schema),
+        Err(SchemaError::TooManyFields {
+            max_fields: MAX_SCHEMA_FIELDS
+        })
+    );
+}
+
+#[test]
+fn schema_bounds_aggregate_identity_text() {
+    let maximum = Schema::new(vec![Field::new(
+        "x".repeat(MAX_SCHEMA_TEXT_BYTES),
+        DataType::Null,
+        true,
+    )]);
+    assert_eq!(validate_schema(&maximum), Ok(()));
+
+    let oversized = Schema::new(vec![Field::new(
+        "x".repeat(MAX_SCHEMA_TEXT_BYTES + 1),
+        DataType::Null,
+        true,
+    )]);
+    assert!(matches!(
+        validate_schema(&oversized),
+        Err(SchemaError::TooManyTextBytes {
+            owner,
+            max_bytes: MAX_SCHEMA_TEXT_BYTES
+        }) if owner.len() == MAX_SCHEMA_TEXT_BYTES + 1
+    ));
+}
+
+#[test]
 fn schema_rejects_representative_types_outside_the_v1_subset() {
     let unsupported = [
-        DataType::LargeUtf8,
-        DataType::LargeBinary,
-        DataType::FixedSizeBinary(16),
-        DataType::Date64,
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        (DataType::LargeUtf8, "LargeUtf8"),
+        (DataType::LargeBinary, "LargeBinary"),
+        (DataType::FixedSizeBinary(16), "FixedSizeBinary"),
+        (DataType::Date64, "Date64"),
+        (
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            "Dictionary",
+        ),
     ];
 
-    for data_type in unsupported {
+    for (data_type, expected_name) in unsupported {
         let schema = Schema::new(vec![Field::new("value", data_type.clone(), true)]);
         assert!(matches!(
             validate_schema(&schema),
             Err(SchemaError::UnsupportedType {
                 field,
                 data_type: rejected
-            }) if field == "value" && rejected == data_type
+            }) if field == "value" && rejected == expected_name
         ));
     }
+}
+
+#[test]
+fn unsupported_recursive_type_reports_only_its_bounded_top_level_kind() {
+    let mut data_type = DataType::Null;
+    for _ in 0..4_096 {
+        data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type));
+    }
+    let schema = Schema::new(vec![Field::new("value", data_type, true)]);
+    assert!(matches!(
+        validate_schema(&schema),
+        Err(SchemaError::UnsupportedType {
+            field,
+            data_type: "Dictionary"
+        }) if field == "value"
+    ));
+    // Recursively dropping this deliberately adversarial Arrow type would test
+    // the standard library stack rather than DogPaddle's bounded validation.
+    std::mem::forget(schema);
 }
 
 #[test]

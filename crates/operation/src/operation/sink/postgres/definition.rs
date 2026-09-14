@@ -12,7 +12,10 @@ use crate::{
     DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
     OperationDefinition, OperationKind, OperationSchemaError,
     definition::Sealed,
-    operation::sink::relation::{DATA, RelationalSink, STATE},
+    operation::sink::{
+        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
+        relation::RelationSinkTarget,
+    },
 };
 
 pub(crate) const TAG: u16 = 12;
@@ -72,12 +75,16 @@ impl Sealed for PostgresSinkDefinition {
             _,
         >(
             None,
-            move |data: &mut DataInstances,
-                  config|
-                  -> Result<RelationalSink<PostgresTarget>, MaterializeError> {
-                let state = data.take(&STATE)?;
+            move |data: &mut DataInstances, config| -> Result<_, MaterializeError> {
+                let control = data.take(&CONTROL)?;
+                let buffer = data.take(&BUFFER)?;
                 let target = PostgresTarget::new_bound(config, target, Arc::clone(&input_schema));
-                Ok(RelationalSink::new(input_schema, target, state))
+                Ok(BufferedSink::new(
+                    input_schema,
+                    RelationSinkTarget::new(target),
+                    control,
+                    buffer,
+                ))
             },
         ))
     }

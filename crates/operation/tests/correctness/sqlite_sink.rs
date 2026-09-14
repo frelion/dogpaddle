@@ -15,12 +15,11 @@ use dogpaddle_operation::{
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
     },
 };
-use dogpaddle_store::{Cell, Store, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, Store, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
-    rollback_ready, value_schema,
+    TestStore, assert_literal_definition, bind, data_names, decode_hex, materialize, value_schema,
 };
 
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
@@ -36,7 +35,7 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
         10,
         OperationKind::Sink(std::num::NonZeroU32::MIN),
     );
-    assert_eq!(data_names(&sqlite), ["relation_sink.state"]);
+    assert_eq!(data_names(&sqlite), ["sink.control", "sink.buffer"]);
     assert_eq!(
         sqlite.database_path(),
         Path::new("/var/lib/dogpaddle/output.sqlite")
@@ -335,16 +334,23 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
 
     let mut store = Store::create(fixture.path()).unwrap();
-    assert_eq!(definition.data().len(), 1);
-    definition.data()[0]
-        .create(&mut store, "sqlite-state")
-        .unwrap();
+    assert_eq!(definition.data().len(), 2);
+    definition.data()[0].create(&mut store, "control").unwrap();
+    definition.data()[1].create(&mut store, "buffer").unwrap();
     assert!(!sqlite_path.exists());
     drop(store);
 
     let store = Store::open(fixture.path()).unwrap();
-    store.open_data::<Cell<Vec<u8>>>("sqlite-state").unwrap();
-    let operation = materialize(&definition, &[value_schema()], &store, &["sqlite-state"]);
+    store.open_data::<Cell<Vec<u8>>>("control").unwrap();
+    store
+        .open_data::<OrderedMap<u64, Vec<u8>>>("buffer")
+        .unwrap();
+    let operation = materialize(
+        &definition,
+        &[value_schema()],
+        &store,
+        &["control", "buffer"],
+    );
     assert!(!sqlite_path.exists());
     drop(operation);
 }
@@ -363,21 +369,24 @@ impl Fixture {
         let definition =
             SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events").unwrap();
         let mut store = Store::create(root.path()).unwrap();
-        definition.data()[0].create(&mut store, "state").unwrap();
+        definition.data()[0].create(&mut store, "control").unwrap();
+        definition.data()[1].create(&mut store, "buffer").unwrap();
         Self::open(root, encode_definition(&definition), store)
     }
 
     fn open(root: TestStore, definition: Vec<u8>, store: Store) -> Self {
         let decoded = decode_definition(&definition).unwrap();
         let mut data = DataInstances::new();
-        data.insert(decoded.data()[0].open(&store, "state").unwrap())
+        data.insert(decoded.data()[0].open(&store, "control").unwrap())
+            .unwrap();
+        data.insert(decoded.data()[1].open(&store, "buffer").unwrap())
             .unwrap();
         let operation = decoded
             .bind(&[schema()])
             .unwrap()
             .materialize(data, RuntimeResource::none())
             .unwrap();
-        let state = store.open_data("state").unwrap();
+        let state = store.open_data("control").unwrap();
         Self {
             root,
             definition,
@@ -445,55 +454,93 @@ impl Fixture {
         state
     }
 
-    fn try_commit(&mut self, change: &Change) -> Result<Action, OperationError> {
-        commit_ready(
-            &mut self.operation,
-            Some(input(change)),
-            &mut self.transactions,
-        )
+    fn try_commit(&mut self, change: Option<&Change>) -> Result<Option<Action>, OperationError> {
+        let turn = self.operation.turn(change.map(input))?;
+        let Turn::Ready(turn) = turn else {
+            return Ok(None);
+        };
+        let transaction = self.transactions.begin();
+        let (action, completion) = turn.apply(transaction.access())?;
+        if matches!(action, Action::Idle) {
+            drop(transaction);
+            drop(completion);
+            return Ok(Some(action));
+        }
+        transaction.commit()?;
+        completion
+            .run()
+            .map_err(|error| Box::new(error) as OperationError)?;
+        Ok(Some(action))
     }
 
-    fn commit(&mut self, change: &Change) -> Action {
+    fn commit(&mut self, change: Option<&Change>) -> Option<Action> {
         self.try_commit(change).unwrap()
     }
 
-    fn rollback(&mut self, change: &Change) -> Action {
-        rollback_ready(
-            &mut self.operation,
-            Some(input(change)),
-            &mut self.transactions,
-        )
-        .unwrap()
+    fn rollback(&mut self, change: Option<&Change>) -> Option<Action> {
+        let turn = self.operation.turn(change.map(input)).unwrap();
+        let Turn::Ready(turn) = turn else {
+            return None;
+        };
+        let transaction = self.transactions.begin();
+        let (action, completion) = turn.apply(transaction.access()).unwrap();
+        drop(transaction);
+        drop(completion);
+        Some(action)
     }
 
-    fn commit_without_completion(&mut self, change: &Change) -> Action {
-        let Turn::Ready(turn) = self.operation.turn(Some(input(change))).unwrap() else {
-            panic!("relation sink unexpectedly returned Idle");
+    fn commit_without_completion(&mut self, change: Option<&Change>) -> Option<Action> {
+        let turn = self.operation.turn(change.map(input)).unwrap();
+        let Turn::Ready(turn) = turn else {
+            return None;
         };
         let transaction = self.transactions.begin();
         let (action, completion) = turn.apply(transaction.access()).unwrap();
         transaction.commit().unwrap();
         drop(completion);
-        action
+        Some(action)
     }
 
-    fn initialize(&mut self, change: &Change) {
-        for _ in 0..3 {
-            assert!(matches!(self.commit(change), Action::Commit(None)));
+    fn initialize(&mut self) {
+        for _ in 0..8 {
+            match self.commit(None) {
+                None | Some(Action::Idle) => {
+                    assert!(self.has_table());
+                    return;
+                }
+                Some(Action::Commit(None)) => {}
+                action => panic!("unexpected initialization action {action:?}"),
+            }
         }
-        assert!(self.has_table());
-        assert!(self.rows().is_empty());
+        panic!("bounded fixture failed to initialize");
+    }
+
+    fn admit(&mut self, change: &Change) {
+        for _ in 0..8 {
+            match self.commit(Some(change)) {
+                Some(Action::Complete(None)) => return,
+                Some(Action::Commit(None)) => {}
+                action => panic!("unexpected admission action {action:?}"),
+            }
+        }
+        panic!("bounded fixture failed to admit input");
+    }
+
+    fn drain(&mut self) {
+        for _ in 0..64 {
+            match self.commit(None) {
+                None | Some(Action::Idle) => return,
+                Some(Action::Commit(None)) => {}
+                action => panic!("unexpected drain action {action:?}"),
+            }
+        }
+        panic!("bounded fixture failed to drain");
     }
 
     fn finish(&mut self, change: &Change) {
-        for _ in 0..32 {
-            match self.commit(change) {
-                Action::Complete(None) => return,
-                Action::Commit(None) => {}
-                action => panic!("unexpected sink action {action:?}"),
-            }
-        }
-        panic!("bounded fixture failed to finish");
+        self.initialize();
+        self.admit(change);
+        self.drain();
     }
 }
 
@@ -519,26 +566,26 @@ fn input(change: &Change) -> OperationInput<'_> {
 fn initialization_survives_rollback_lost_completion_and_repeated_reopen() {
     let input = change(&[7], &[1]);
     let mut fixture = Fixture::new();
-    fixture.rollback(&input); // Discard the initial durable-state read.
+    fixture.rollback(None); // Discard the initial durable-state read.
     assert_eq!(fixture.state(), None);
     assert!(!fixture.sqlite_path().exists());
-    fixture.commit(&input);
-    fixture.rollback(&input); // Discard the initialization intent.
+    fixture.commit(None);
+    fixture.rollback(None); // Discard the initialization intent.
     assert_eq!(fixture.state(), None);
     assert!(!fixture.has_table());
 
-    fixture.commit_without_completion(&input);
+    fixture.commit_without_completion(None);
     let initialization = fixture.state();
     assert!(initialization.is_some());
     assert!(!fixture.has_table());
     for _ in 0..2 {
         fixture = fixture.reopen();
-        fixture.commit(&input);
+        fixture.commit(None);
         assert!(fixture.has_table());
         assert!(fixture.rows().is_empty());
         assert_eq!(fixture.state(), initialization);
     }
-    fixture.rollback(&input); // Discard initialization settlement.
+    fixture.rollback(None); // Discard initialization settlement.
     assert_eq!(fixture.state(), initialization);
     fixture.finish(&input);
     assert_eq!(fixture.rows(), [(1, 7)]);
@@ -548,28 +595,30 @@ fn initialization_survives_rollback_lost_completion_and_repeated_reopen() {
 fn prepared_batches_recover_before_and_after_sqlite_commit_without_reallocating_ids() {
     let input = change(&[7], &[2]);
     let mut fixture = Fixture::new();
-    fixture.initialize(&input);
+    fixture.initialize();
+    fixture.admit(&input);
     let ready = fixture.state();
 
-    fixture.rollback(&input);
+    fixture.rollback(None);
     assert_eq!(fixture.state(), ready);
     assert!(fixture.rows().is_empty());
-    fixture.commit_without_completion(&input);
+    fixture.commit(None); // Load the fixed batch without changing durable state.
+    fixture.commit_without_completion(None); // Persist Prepared but do not deliver it.
     let prepared = fixture.state();
     assert_ne!(prepared, ready);
     assert!(fixture.rows().is_empty());
 
     for _ in 0..3 {
         fixture = fixture.reopen();
-        fixture.commit(&input);
+        fixture.commit(None);
         assert_eq!(fixture.rows(), [(1, 7), (2, 7)]);
         assert_eq!(fixture.state(), prepared);
     }
-    assert!(matches!(fixture.rollback(&input), Action::Complete(None)));
+    assert!(matches!(fixture.rollback(None), Some(Action::Commit(None))));
     assert_eq!(fixture.state(), prepared);
     fixture = fixture.reopen();
-    fixture.commit(&input);
-    assert!(matches!(fixture.commit(&input), Action::Complete(None)));
+    fixture.commit(None);
+    assert!(matches!(fixture.commit(None), Some(Action::Commit(None))));
     assert_ne!(fixture.state(), prepared);
     fixture.finish(&change(&[8], &[1]));
     assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 8)]);
@@ -579,38 +628,44 @@ fn prepared_batches_recover_before_and_after_sqlite_commit_without_reallocating_
 fn a_batch_that_inserts_then_deletes_its_own_ids_is_idempotent_on_reopen() {
     let input = change(&[7, 7, 8, 7], &[2, -1, 1, -1]);
     let mut fixture = Fixture::new();
-    fixture.initialize(&input);
-    fixture.commit(&input);
+    fixture.initialize();
+    fixture.admit(&input);
+    fixture.commit(None);
+    fixture.commit(None);
     let prepared = fixture.state();
     assert_eq!(fixture.rows(), [(3, 8)]);
     for _ in 0..3 {
         fixture = fixture.reopen();
-        fixture.commit(&input);
+        fixture.commit(None);
         assert_eq!(fixture.rows(), [(3, 8)]);
         assert_eq!(fixture.state(), prepared);
     }
-    assert!(matches!(fixture.rollback(&input), Action::Complete(None)));
+    assert!(matches!(fixture.rollback(None), Some(Action::Commit(None))));
     assert_eq!(fixture.state(), prepared);
-    assert!(matches!(fixture.commit(&input), Action::Complete(None)));
+    assert!(matches!(fixture.commit(None), Some(Action::Commit(None))));
     fixture.finish(&change(&[7], &[1]));
     assert_eq!(fixture.rows(), [(3, 8), (4, 7)]);
 }
 
 #[test]
-fn missing_negative_prefixes_do_not_write_or_consume_ids_and_same_instance_can_retry() {
-    let mut fixture = Fixture::new();
-    let invalid = change(&[7, 7], &[-1, 1]);
-    fixture.initialize(&invalid);
-    let ready = fixture.state();
-    for invalid in [
-        invalid,
-        change(&[7, 8, 8], &[1, -1, 1]),
-        change(&[7], &[i64::MIN]),
-    ] {
-        assert!(fixture.try_commit(&invalid).is_err());
-        assert_eq!(fixture.state(), ready);
+fn missing_negative_prefixes_are_rejected_before_any_target_batch_is_written() {
+    for invalid in [change(&[7, 7], &[-1, 1]), change(&[7, 8, 8], &[1, -1, 1])] {
+        let mut fixture = Fixture::new();
+        fixture.initialize();
+        fixture.admit(&invalid);
+        let buffered = fixture.state();
+        fixture.commit(None); // Load the batch before target-side planning.
+        assert!(fixture.try_commit(None).is_err());
+        assert_eq!(fixture.state(), buffered);
+        assert!(fixture.rows().is_empty());
+        fixture = fixture.reopen();
+        fixture.commit(None); // Restore Ready, then reconstruct the fixed batch.
+        fixture.commit(None);
+        assert!(fixture.try_commit(None).is_err());
         assert!(fixture.rows().is_empty());
     }
+
+    let mut fixture = Fixture::new();
     fixture.finish(&change(&[7], &[1]));
     assert_eq!(fixture.rows(), [(1, 7)]);
     fixture.finish(&change(&[7], &[-1]));
@@ -620,23 +675,44 @@ fn missing_negative_prefixes_do_not_write_or_consume_ids_and_same_instance_can_r
 }
 
 #[test]
+fn a_change_over_the_event_capacity_is_rejected_before_admission_or_target_io() {
+    let mut fixture = Fixture::new();
+    fixture.initialize();
+    let ready = fixture.state();
+
+    assert!(
+        fixture
+            .try_commit(Some(&change(&[7], &[i64::MIN])))
+            .is_err()
+    );
+    assert_eq!(fixture.state(), ready);
+    assert!(fixture.rows().is_empty());
+}
+
+#[test]
 fn large_retractions_are_fully_admitted_and_continue_correctly_across_reopen() {
+    let mut invalid = Fixture::new();
+    invalid.finish(&change(&[7], &[2_050]));
+    invalid.admit(&change(&[7], &[-2_051]));
+    let buffered = invalid.state();
+    invalid.commit(None);
+    assert!(invalid.try_commit(None).is_err());
+    assert_eq!(invalid.state(), buffered);
+    assert_eq!(invalid.rows().len(), 2_050);
+
     let mut fixture = Fixture::new();
     fixture.finish(&change(&[7], &[2_050]));
-    let ready = fixture.state();
-    assert!(fixture.try_commit(&change(&[7], &[-2_051])).is_err());
-    assert_eq!(fixture.state(), ready);
-    assert_eq!(fixture.rows().len(), 2_050);
-
     let remove = change(&[7], &[-2_050]);
-    fixture.commit(&remove);
+    fixture.admit(&remove);
+    fixture.commit(None);
+    fixture.commit(None);
     let prepared = fixture.state();
     assert_eq!(fixture.rows().len(), 1_026);
     fixture = fixture.reopen();
-    fixture.commit(&remove);
+    fixture.commit(None);
     assert_eq!(fixture.rows().len(), 1_026);
     assert_eq!(fixture.state(), prepared);
-    fixture.finish(&remove);
+    fixture.drain();
     assert!(fixture.rows().is_empty());
     fixture.finish(&change(&[8], &[1]));
     assert_eq!(fixture.rows(), [(2_051, 8)]);
@@ -646,7 +722,7 @@ fn large_retractions_are_fully_admitted_and_continue_correctly_across_reopen() {
 fn invalid_input_port_schema_and_missing_input_fail_before_external_io() {
     let mut fixture = Fixture::new();
     let input = change(&[7], &[1]);
-    assert!(fixture.operation.turn(None).is_err());
+    assert!(matches!(fixture.operation.turn(None), Ok(Turn::Ready(_))));
     assert!(
         fixture
             .operation
@@ -669,7 +745,7 @@ fn invalid_input_port_schema_and_missing_input_fail_before_external_io() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    assert!(fixture.try_commit(&wrong).is_err());
+    assert!(fixture.try_commit(Some(&wrong)).is_err());
     assert_eq!(fixture.state(), None);
     assert!(!fixture.sqlite_path().exists());
     fixture.finish(&input);
@@ -680,8 +756,10 @@ fn invalid_input_port_schema_and_missing_input_fail_before_external_io() {
 fn after_commit_target_error_keeps_the_fixed_batch_for_reopen() {
     let mut fixture = Fixture::new();
     let input = change(&[7], &[1]);
-    fixture.initialize(&input);
-    let ready = fixture.state();
+    fixture.initialize();
+    fixture.admit(&input);
+    fixture.commit(None); // Load the fixed delivery batch.
+    let buffered = fixture.state();
     fixture
         .connection()
         .execute_batch(
@@ -689,15 +767,15 @@ fn after_commit_target_error_keeps_the_fixed_batch_for_reopen() {
          BEGIN SELECT RAISE(ABORT, 'injected target failure'); END;",
         )
         .unwrap();
-    assert!(fixture.try_commit(&input).is_err());
-    assert_ne!(fixture.state(), ready);
+    assert!(fixture.try_commit(None).is_err());
+    assert_ne!(fixture.state(), buffered);
     assert!(fixture.rows().is_empty());
     fixture
         .connection()
         .execute_batch("DROP TRIGGER reject_insert")
         .unwrap();
     fixture = fixture.reopen();
-    fixture.finish(&input);
+    fixture.drain();
     assert_eq!(fixture.rows(), [(1, 7)]);
 }
 
@@ -711,5 +789,4 @@ fn stable_rebatching_preserves_technical_ids_and_final_relation() {
     }
     assert_eq!(whole.rows(), [(2, 7), (4, 7)]);
     assert_eq!(whole.rows(), split.rows());
-    assert_eq!(whole.state(), split.state());
 }

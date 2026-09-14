@@ -15,8 +15,9 @@ use arrow_ipc::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{
-    Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, decode_change,
-    decode_change_owned, decode_change_projected, encode_change,
+    Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS,
+    MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES, decode_change, decode_change_owned,
+    decode_change_projected, encode_change, encode_change_bounded,
 };
 
 use super::support::{assert_change_eq, fixture_hex, hex, representative_change};
@@ -79,6 +80,15 @@ fn temporal_decimal_change() -> Change {
 fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
     let change = representative_change();
     let encoded = encode_change(&change).unwrap();
+    assert_eq!(
+        encode_change_bounded(&change, encoded.len()).unwrap(),
+        encoded
+    );
+    assert!(matches!(
+        encode_change_bounded(&change, encoded.len() - 1),
+        Err(CodecError::EncodedSizeLimitExceeded { max_bytes })
+            if max_bytes == encoded.len() - 1
+    ));
     assert_change_eq(&decode_change(&encoded).unwrap(), &change);
     assert_change_eq(&decode_change_owned(encoded.clone()).unwrap(), &change);
 
@@ -106,6 +116,61 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
         change.diffs()
     );
     assert!(reader.next().is_none());
+}
+
+#[test]
+fn bounded_encoder_accounts_for_synthesized_validity_buffers() {
+    let rows = 100_000;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "flag",
+        DataType::Boolean,
+        false,
+    )]));
+    let records =
+        RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(vec![true; rows]))]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1; rows])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+    assert_eq!(
+        encode_change_bounded(&change, encoded.len()).unwrap(),
+        encoded
+    );
+}
+
+#[test]
+fn maximum_schema_text_round_trips_at_the_public_boundary() {
+    let field_name = "x".repeat(MAX_SCHEMA_TEXT_BYTES);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        field_name.clone(),
+        DataType::Null,
+        true,
+    )]));
+    let records = RecordBatch::try_new(schema, vec![new_null_array(&DataType::Null, 1)]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+    assert_eq!(decoded.records().schema_ref().field(0).name(), &field_name);
+}
+
+#[test]
+fn maximum_schema_field_and_metadata_counts_round_trip_together() {
+    let metadata = (0..MAX_SCHEMA_METADATA_ENTRIES)
+        .map(|index| (format!("m{index:05x}"), String::new()))
+        .collect::<HashMap<_, _>>();
+    let fields = (0..MAX_SCHEMA_FIELDS)
+        .map(|index| Field::new(format!("f{index:04x}"), DataType::Null, true))
+        .collect::<Vec<_>>();
+    let nulls = new_null_array(&DataType::Null, 1);
+    let records = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, metadata)),
+        vec![nulls; MAX_SCHEMA_FIELDS],
+    )
+    .unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+    assert_eq!(decoded.records().num_columns(), MAX_SCHEMA_FIELDS);
+    assert_eq!(
+        decoded.records().schema_ref().metadata().len(),
+        MAX_SCHEMA_METADATA_ENTRIES
+    );
 }
 
 #[test]

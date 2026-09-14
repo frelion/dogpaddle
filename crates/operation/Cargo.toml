@@ -50,6 +50,11 @@ name = "equi_join"
 harness = false
 test = true
 
+[[bench]]
+name = "buffered_sink"
+harness = false
+test = true
+
 [[test]]
 name = "correctness"
 path = "tests/correctness.rs"

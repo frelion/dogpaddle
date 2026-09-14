@@ -1,5 +1,6 @@
 //! Sink operations that consume records without producing output.
 
+mod buffered;
 mod relation;
 
 pub(crate) mod discard;

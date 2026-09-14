@@ -145,17 +145,30 @@ struct LayoutCursor {
 
 impl BatchLayout {
     pub(super) fn parse(parsed: &ParsedChange<'_>) -> Result<Self, CodecError> {
-        let nodes = parsed
+        let expected = expected_layout_counts(&parsed.physical_schema)?;
+        let node_descriptors = parsed
             .batch
             .nodes()
-            .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no field nodes"))?
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+            .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no field nodes"))?;
+        if node_descriptors.len() != expected.nodes {
+            return Err(CodecError::invalid(format!(
+                "RecordBatch has {} field nodes; Schema requires {}",
+                node_descriptors.len(),
+                expected.nodes
+            )));
+        }
+        let nodes = node_descriptors.iter().copied().collect::<Vec<_>>();
         let descriptors = parsed
             .batch
             .buffers()
             .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no buffers"))?;
+        if descriptors.len() != expected.buffers {
+            return Err(CodecError::invalid(format!(
+                "RecordBatch has {} buffers; Schema requires {}",
+                descriptors.len(),
+                expected.buffers
+            )));
+        }
         let buffers = validate_buffer_layout(descriptors.iter().copied(), parsed.body.len())?;
 
         let mut cursor = LayoutCursor::default();
@@ -250,6 +263,40 @@ impl BatchLayout {
         }
         Ok(length)
     }
+}
+
+fn expected_layout_counts(schema: &SchemaRef) -> Result<LayoutCursor, CodecError> {
+    fn add_field(field: &Field, counts: &mut LayoutCursor) -> Result<(), CodecError> {
+        let layout = DataTypeLayout::classify(field.data_type())
+            .ok_or_else(|| CodecError::invalid("Schema contains an unsupported field type"))?;
+        counts.nodes = counts
+            .nodes
+            .checked_add(1)
+            .ok_or_else(|| CodecError::invalid("Schema field-node count overflowed"))?;
+        counts.buffers = counts
+            .buffers
+            .checked_add(layout.own_buffer_count())
+            .ok_or_else(|| CodecError::invalid("Schema buffer count overflowed"))?;
+        match layout {
+            DataTypeLayout::List(child) => add_field(child, counts),
+            DataTypeLayout::Struct(fields) => {
+                for child in fields {
+                    add_field(child, counts)?;
+                }
+                Ok(())
+            }
+            DataTypeLayout::Null
+            | DataTypeLayout::Bitmap
+            | DataTypeLayout::FixedWidth(_)
+            | DataTypeLayout::VariableWidth => Ok(()),
+        }
+    }
+
+    let mut counts = LayoutCursor::default();
+    for field in schema.fields() {
+        add_field(field, &mut counts)?;
+    }
+    Ok(counts)
 }
 
 pub(super) struct CompactedBatch {

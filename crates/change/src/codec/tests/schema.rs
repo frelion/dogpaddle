@@ -17,6 +17,50 @@ use super::super::{CodecError, decode_change, decode_change_projected, encode_ch
 use super::support::*;
 use crate::{ChangeError, ChangeProjection};
 
+fn repeated_field_schema_stream(field_count: usize) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let name = builder.create_string("$dogpaddle.diff");
+    let int = IpcInt::create(
+        &mut builder,
+        &IntArgs {
+            bitWidth: 64,
+            is_signed: true,
+        },
+    );
+    let field = IpcField::create(
+        &mut builder,
+        &FieldArgs {
+            name: Some(name),
+            nullable: false,
+            type_type: IpcType::Int,
+            type_: Some(int.as_union_value()),
+            ..FieldArgs::default()
+        },
+    );
+    let fields = builder.create_vector(&vec![field; field_count]);
+    let schema = IpcSchema::create(
+        &mut builder,
+        &SchemaArgs {
+            endianness: Endianness::Little,
+            fields: Some(fields),
+            ..SchemaArgs::default()
+        },
+    );
+    let message = IpcMessage::create(
+        &mut builder,
+        &MessageArgs {
+            version: MetadataVersion::V5,
+            header_type: MessageHeader::Schema,
+            header: Some(schema.as_union_value()),
+            ..MessageArgs::default()
+        },
+    );
+    builder.finish(message, None);
+    let mut encoded = frame_ipc_message(builder.finished_data(), &[]);
+    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    encoded
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum MalformedSchemaCase {
     Date64,
@@ -37,6 +81,7 @@ pub(super) enum MalformedSchemaCase {
     ListMissingChildren,
     ListTwoChildren,
     NestingTooDeep,
+    ScalarWithChildren,
     TimestampEmptyTimezone,
     TimestampMissingTable,
     TimestampUnknownUnit,
@@ -102,6 +147,10 @@ pub(super) const MALFORMED_SCHEMA_CASES: &[(MalformedSchemaCase, &str)] = &[
         "Nested table depth limit reached",
     ),
     (
+        MalformedSchemaCase::ScalarWithChildren,
+        "non-nested Arrow field \"malformed\" has children",
+    ),
+    (
         MalformedSchemaCase::TimestampEmptyTimezone,
         "empty timezone",
     ),
@@ -129,6 +178,83 @@ fn metadata_schema_stream(entries: &[(Option<&str>, Option<&str>)]) -> Vec<u8> {
             KeyValue::create(&mut builder, &KeyValueArgs { key, value })
         })
         .collect::<Vec<_>>();
+    let metadata = builder.create_vector(&metadata);
+    let name = builder.create_string("$dogpaddle.diff");
+    let int = IpcInt::create(
+        &mut builder,
+        &IntArgs {
+            bitWidth: 64,
+            is_signed: true,
+        },
+    );
+    let field = IpcField::create(
+        &mut builder,
+        &FieldArgs {
+            name: Some(name),
+            nullable: false,
+            type_type: IpcType::Int,
+            type_: Some(int.as_union_value()),
+            ..FieldArgs::default()
+        },
+    );
+    let fields = builder.create_vector(&[field]);
+    let schema = IpcSchema::create(
+        &mut builder,
+        &SchemaArgs {
+            endianness: Endianness::Little,
+            fields: Some(fields),
+            custom_metadata: Some(metadata),
+            ..SchemaArgs::default()
+        },
+    );
+    let message = IpcMessage::create(
+        &mut builder,
+        &MessageArgs {
+            version: MetadataVersion::V5,
+            header_type: MessageHeader::Schema,
+            header: Some(schema.as_union_value()),
+            ..MessageArgs::default()
+        },
+    );
+    builder.finish(message, None);
+    let mut encoded = frame_ipc_message(builder.finished_data(), &[]);
+    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    encoded
+}
+
+fn shared_metadata_value_schema_stream(entries: usize, value_bytes: usize) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let shared_value = builder.create_string(&"v".repeat(value_bytes));
+    let mut metadata = (0..entries)
+        .map(|index| {
+            let key = builder.create_string(&format!("a{index:08x}"));
+            KeyValue::create(
+                &mut builder,
+                &KeyValueArgs {
+                    key: Some(key),
+                    value: Some(shared_value),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let version_key = builder.create_string(VERSION_KEY);
+    let version_value = builder.create_string("1");
+    metadata.push(KeyValue::create(
+        &mut builder,
+        &KeyValueArgs {
+            key: Some(version_key),
+            value: Some(version_value),
+        },
+    ));
+    let kind_key = builder.create_string(KIND_KEY);
+    let kind_value = builder.create_string("change");
+    metadata.push(KeyValue::create(
+        &mut builder,
+        &KeyValueArgs {
+            key: Some(kind_key),
+            value: Some(kind_value),
+        },
+    ));
     let metadata = builder.create_vector(&metadata);
     let name = builder.create_string("$dogpaddle.diff");
     let int = IpcInt::create(
@@ -389,6 +515,33 @@ pub(super) fn malformed_schema_stream(case: MalformedSchemaCase) -> Vec<u8> {
                     None,
                 )
             }
+            MalformedSchemaCase::ScalarWithChildren => {
+                let child_name = builder.create_string("hidden");
+                let child_type = IpcNull::create(&mut builder, &NullArgs::default());
+                let child = IpcField::create(
+                    &mut builder,
+                    &FieldArgs {
+                        name: Some(child_name),
+                        type_type: IpcType::Null,
+                        type_: Some(child_type.as_union_value()),
+                        ..FieldArgs::default()
+                    },
+                );
+                let children = builder.create_vector(&[child]);
+                let data_type = IpcInt::create(
+                    &mut builder,
+                    &IntArgs {
+                        bitWidth: 64,
+                        is_signed: true,
+                    },
+                );
+                (
+                    IpcType::Int,
+                    Some(data_type.as_union_value()),
+                    Some(children),
+                    None,
+                )
+            }
             MalformedSchemaCase::TimestampEmptyTimezone => {
                 let timezone = builder.create_string("");
                 let data_type = IpcTimestamp::create(
@@ -524,6 +677,22 @@ fn decoder_rejects_invalid_physical_schema_and_version_markers() {
     let schema = unit_physical_schema(unknown);
     let batch = unit_physical_batch(Arc::clone(&schema), Int64Array::from(vec![1]));
     assert_both_invalid_encoding(&encode_stream(&schema, &[batch]), &projection);
+}
+
+#[test]
+fn decoder_rejects_repeated_field_offset_fanout_before_schema_allocation() {
+    let encoded = repeated_field_schema_stream(crate::MAX_SCHEMA_FIELDS + 2);
+    assert!(encoded.len() < 1024 * 1024);
+    let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
+    assert_both_invalid_encoding(&encoded, &projection);
+}
+
+#[test]
+fn decoder_rejects_shared_string_offset_fanout_before_metadata_cloning() {
+    let encoded = shared_metadata_value_schema_stream(1_024, 64 * 1_024);
+    assert!(encoded.len() < 1024 * 1024);
+    let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
+    assert_both_invalid_encoding(&encoded, &projection);
 }
 
 #[test]

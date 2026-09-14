@@ -222,6 +222,7 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
     ]));
     let plan = SqlPlan::new(&spec("target"), &PostgresLayout::try_new(schema).unwrap());
     let lookup = plan.lookup_statement(2);
+    let mismatch = plan.mismatch_statement(2);
 
     assert!(
         lookup
@@ -237,6 +238,12 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
     assert!(lookup.contains("request.needed > request.take"));
     assert!(lookup.ends_with("ORDER BY request.n"));
     assert!(!lookup.contains("excluded"));
+    assert!(mismatch.contains("$1::bigint[]"));
+    assert!(mismatch.contains("$5::bigint[]"));
+    assert!(mismatch.contains("target.\"$dogpaddle.hash\" IS DISTINCT FROM expected.hash"));
+    assert!(mismatch.contains("target.\"a\" IS DISTINCT FROM expected.c0"));
+    assert!(mismatch.contains("target.\"b\" IS DISTINCT FROM expected.c1"));
+    assert!(mismatch.contains("target.\"$dogpaddle.id\" = ANY(expected.ids)"));
 
     assert_eq!(
         plan.delete,
@@ -276,12 +283,16 @@ fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
     );
     assert_eq!(wide.insert_batch_size(), 40);
     assert_eq!(wide.lookup_batch_size(), 40);
+    assert_eq!(wide.mismatch_batch_size(), 40);
     let insert = wide.insert_statement(40);
     assert!(insert.contains("$64000::bigint)"));
     assert!(!insert.contains("$64001"));
     let lookup = wide.lookup_statement(40);
     assert!(lookup.contains("$64040::bigint)"));
     assert!(!lookup.contains("$64041"));
+    let mismatch = wide.mismatch_statement(40);
+    assert!(mismatch.contains("$64000::bigint)"));
+    assert!(!mismatch.contains("$64001"));
 }
 
 #[test]

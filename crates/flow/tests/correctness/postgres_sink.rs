@@ -11,11 +11,12 @@ use dogpaddle_operation::{
         transform::SelectDefinition,
     },
 };
-use dogpaddle_store::{Cell, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store};
 
 const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024).unwrap();
 const SINK: &str = "postgres";
-const STATE: &str = "station/00000001/operation/00000000/relation_sink.state";
+const CONTROL: &str = "station/00000001/operation/00000000/sink.control";
+const BUFFER: &str = "station/00000001/operation/00000000/sink.buffer";
 
 fn config() -> PostgresSinkConfig {
     PostgresSinkConfig::new_unencrypted("127.0.0.1", 1, "database", "writer", "secret-not-durable")
@@ -100,7 +101,7 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
 }
 
 #[test]
-fn postgres_sink_build_and_reopen_are_offline_and_use_one_stable_state_cell() {
+fn postgres_sink_build_and_reopen_are_offline_and_use_stable_buffered_state() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut build = factory(&path);
@@ -122,7 +123,8 @@ fn postgres_sink_build_and_reopen_are_offline_and_use_one_stable_state_cell() {
     }
 
     let store = Store::open(&path).unwrap();
-    let state: Cell<Vec<u8>> = store.open_data(STATE).unwrap();
+    let state: Cell<Vec<u8>> = store.open_data(CONTROL).unwrap();
+    let _: OrderedMap<u64, Vec<u8>> = store.open_data(BUFFER).unwrap();
     let transaction = store.read_transaction();
     assert!(
         state
