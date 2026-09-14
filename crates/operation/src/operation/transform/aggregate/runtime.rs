@@ -10,7 +10,7 @@ use crate::{
     expression::BoundExpression,
     operation::{
         AtomicOperation, OperationError, OperationInput,
-        relation::{canonical_row, encode_canonical},
+        relation::{OrderError, canonical_row, encode_canonical, order_key, ordered_value},
     },
 };
 
@@ -18,7 +18,7 @@ use super::{
     AggregateError,
     functions::{ExtremaDirection, Fold, apply_weight},
     state::{Control, Entries, EntryPartition, GroupState, Groups},
-    value::{null, order_key, ordered_value},
+    value::null,
 };
 
 const ADMISSION_LAYOUT: u32 = 0;
@@ -204,7 +204,7 @@ impl AtomicOperation for AggregateOperation {
 
             for (layout, column) in self.layouts.iter().zip(&layout_columns) {
                 let value = ScalarValue::try_from_array(column.as_ref(), row)?;
-                if let Some(key) = order_key(&layout.field, &value)? {
+                if let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? {
                     entries
                         .partition(&EntryPartition::new(layout.id, state.id))?
                         .adjust(&key, difference)
@@ -304,7 +304,7 @@ fn call_output(
                 };
                 entry.map_or_else(
                     || null(layout.field.data_type()),
-                    |entry| ordered_value(&layout.field, &entry.key),
+                    |entry| ordered_value(&layout.field, &entry.key).map_err(map_order_error),
                 )
             }
         })
@@ -317,6 +317,10 @@ fn map_weight_error(error: StoreError) -> AggregateError {
         StoreError::MultiplicityOverflow => AggregateError::ArithmeticOverflow,
         source => AggregateError::Store(source),
     }
+}
+
+const fn map_order_error(_error: OrderError) -> AggregateError {
+    AggregateError::InvalidState
 }
 
 impl OutputRows {

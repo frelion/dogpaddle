@@ -84,6 +84,28 @@ JOIN customers
 
 任一数据源发生变化，DogPaddle 都会更新对应的 Join 结果。
 
+## 4. 动态 ASOF Join
+
+把每个事实关联到同一分区中当时最近的版本；右侧历史被插入或撤回时，已经输出的左侧结果也会自动改配。
+
+```sql
+INSERT INTO sqlite(path => './analytics.db', table => 'valued_trades')
+SELECT trades.trade_id, trades.symbol, trades.executed_at, quotes.price
+FROM postgres_cdc(
+    connection => env('TRADES_DATABASE_URL'),
+    table => 'market.trades',
+    publication => 'trades_publication'
+) AS trades
+ASOF JOIN mysql_cdc(
+    connection => env('QUOTES_DATABASE_URL'),
+    table => 'market.quotes'
+) AS quotes
+MATCH_CONDITION (trades.executed_at >= quotes.quoted_at)
+ON trades.symbol = quotes.symbol;
+```
+
+SQL 原生支持向前/向后四种严格或包含等值的匹配；Rust Operation API 还支持 nearest、tolerance、NULL-safe equality、显式 tie-break、candidate residual 以及 Inner/Left Outer/Semi/Anti 关系语义。
+
 ## 快速开始
 
 从 [GitHub Releases](https://github.com/frelion/dogpaddle/releases) 下载压缩包。发行包已包含固定版本的 Debezium 与 JRE，无需安装 Rust 或系统 Java。
@@ -105,7 +127,7 @@ INSERT INTO target(...) <query>;
 | | 支持 |
 | --- | --- |
 | 数据源 | PostgreSQL CDC、MySQL CDC |
-| SQL | `SELECT`、`WHERE`、表达式、`JOIN`、`GROUP BY`、`DISTINCT`、`UNION ALL` |
+| SQL | `SELECT`、`WHERE`、表达式、普通 `JOIN`、动态 `ASOF JOIN`、`GROUP BY`、`DISTINCT`、`UNION ALL` |
 | 聚合 | `COUNT`、`SUM`、`AVG`、`MIN`、`MAX` |
 | 目标端 | PostgreSQL、SQLite |
 | 恢复 | 本地持久化进度、拓扑和算子状态 |

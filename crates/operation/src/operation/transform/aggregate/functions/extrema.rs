@@ -1,7 +1,7 @@
 use super::{BoundReduction, Descriptor, Reduction, unsupported};
 use crate::{
     expression::BoundExpression,
-    operation::transform::aggregate::{AggregateSchemaError, value::indexable},
+    operation::{relation::indexable, transform::aggregate::AggregateSchemaError},
 };
 
 pub(super) const MIN_DESCRIPTOR: Descriptor = Descriptor {

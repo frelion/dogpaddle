@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_change::Change;
@@ -12,7 +12,7 @@ use super::{
 };
 use crate::operation::{
     OperationError,
-    sink::relation::{Batch, Lookup, Matches, RelationTarget},
+    sink::relation::{Batch, Lookup, Matches, RelationTarget, group_mutations},
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -186,42 +186,34 @@ impl SqliteTarget {
         change: &Change,
         batch: &Batch,
     ) -> Result<(Vec<EncodedMutationGroup>, Vec<i64>), SqliteSinkError> {
-        #[derive(Default)]
-        struct Ids {
-            inserts: Vec<i64>,
-            mutations: Vec<i64>,
-        }
-
-        let mut by_row = BTreeMap::<u64, Ids>::new();
-        for insert in &batch.inserts {
-            let id = technical_id_as_i64(insert.technical_id)?;
-            let group = by_row.entry(insert.row_index).or_default();
-            group.inserts.push(id);
-            group.mutations.push(id);
-        }
-        let mut deletes = Vec::with_capacity(batch.deletes.len());
-        for delete in &batch.deletes {
-            let id = technical_id_as_i64(delete.technical_id)?;
-            by_row
-                .entry(delete.row_index)
-                .or_default()
-                .mutations
-                .push(id);
-            deletes.push(id);
-        }
-        let groups = by_row
+        let mutations = group_mutations(batch);
+        let groups = mutations
+            .rows
             .into_iter()
-            .map(|(row_index, ids)| {
-                let row_index = usize::try_from(row_index).map_err(|_| {
+            .map(|group| {
+                let row_index = usize::try_from(group.row_index).map_err(|_| {
                     super::error::invalid_batch("mutation row index cannot be represented by usize")
                 })?;
                 Ok(EncodedMutationGroup {
-                    insert_ids: ids.inserts,
-                    mutation_ids: ids.mutations,
+                    insert_ids: group
+                        .insert_ids
+                        .into_iter()
+                        .map(technical_id_as_i64)
+                        .collect::<Result<_, _>>()?,
+                    mutation_ids: group
+                        .mutation_ids
+                        .into_iter()
+                        .map(technical_id_as_i64)
+                        .collect::<Result<_, _>>()?,
                     row: self.encode_row(change, row_index)?,
                 })
             })
             .collect::<Result<Vec<_>, SqliteSinkError>>()?;
+        let deletes = mutations
+            .delete_ids
+            .into_iter()
+            .map(technical_id_as_i64)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok((groups, deletes))
     }
 

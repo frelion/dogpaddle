@@ -2,7 +2,7 @@
 
 mod plan;
 
-use std::num::NonZeroU32;
+use std::{collections::BTreeMap, num::NonZeroU32};
 
 use dogpaddle_change::Change;
 use thiserror::Error;
@@ -40,6 +40,55 @@ pub(crate) struct Delete {
 pub(crate) struct Batch {
     pub inserts: Vec<Insert>,
     pub deletes: Vec<Delete>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct MutationGroup {
+    pub(super) row_index: u64,
+    pub(super) insert_ids: Vec<u64>,
+    pub(super) mutation_ids: Vec<u64>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct MutationGroups {
+    pub(super) rows: Vec<MutationGroup>,
+    pub(super) delete_ids: Vec<u64>,
+}
+
+/// Groups a validated plan by logical input row without applying backend rules.
+pub(super) fn group_mutations(batch: &Batch) -> MutationGroups {
+    #[derive(Default)]
+    struct Ids {
+        inserts: Vec<u64>,
+        mutations: Vec<u64>,
+    }
+
+    let mut by_row = BTreeMap::<u64, Ids>::new();
+    for insert in &batch.inserts {
+        let group = by_row.entry(insert.row_index).or_default();
+        group.inserts.push(insert.technical_id);
+        group.mutations.push(insert.technical_id);
+    }
+    let mut delete_ids = Vec::with_capacity(batch.deletes.len());
+    for delete in &batch.deletes {
+        by_row
+            .entry(delete.row_index)
+            .or_default()
+            .mutations
+            .push(delete.technical_id);
+        delete_ids.push(delete.technical_id);
+    }
+    MutationGroups {
+        rows: by_row
+            .into_iter()
+            .map(|(row_index, ids)| MutationGroup {
+                row_index,
+                insert_ids: ids.inserts,
+                mutation_ids: ids.mutations,
+            })
+            .collect(),
+        delete_ids,
+    }
 }
 
 /// One request per distinct logical row. Counts may exceed the returned ID limit.
@@ -176,17 +225,11 @@ impl<T: RelationTarget> SinkTarget for RelationSinkTarget<T> {
         &mut self,
         input: &DeliveryBatch,
         checkpoint: &Self::Checkpoint,
-        _batch_id: u64,
     ) -> Result<(Self::Checkpoint, Self::Plan), OperationError> {
         plan::prepare(&mut self.target, input, *checkpoint)
     }
 
-    fn deliver(
-        &mut self,
-        input: &DeliveryBatch,
-        _batch_id: u64,
-        plan: &Self::Plan,
-    ) -> Result<(), OperationError> {
+    fn deliver(&mut self, input: &DeliveryBatch, plan: &Self::Plan) -> Result<(), OperationError> {
         self.target.write_batch(input.change(), plan)
     }
 

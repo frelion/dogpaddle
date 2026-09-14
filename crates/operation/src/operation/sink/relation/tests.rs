@@ -213,7 +213,7 @@ fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
 
     let input = delivery(&[(7, 1), (7, -1)], &[1, 1]);
     let mut adapter = Adapter::new(Target::default());
-    let (checkpoint, plan) = adapter.prepare(&input, &1, 9).unwrap();
+    let (checkpoint, plan) = adapter.prepare(&input, &1).unwrap();
     let mut encoded = Vec::new();
     Adapter::encode_checkpoint(&checkpoint, &mut encoded);
     Adapter::encode_plan(&plan, &mut encoded);
@@ -247,6 +247,60 @@ fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
     let different = delivery(&[(7, 1), (8, -1)], &[1, 1]);
     let mut cursor = encoded[8..].as_ref();
     assert!(Adapter::decode_plan(&mut cursor, &different, &checkpoint).is_err());
+}
+
+#[test]
+fn mutation_grouping_collects_each_rows_insert_validation_and_delete_ids() {
+    let grouped = group_mutations(&Batch {
+        inserts: vec![
+            Insert {
+                row_index: 1,
+                technical_id: 11,
+            },
+            Insert {
+                row_index: 0,
+                technical_id: 7,
+            },
+        ],
+        deletes: vec![
+            Delete {
+                row_index: 1,
+                technical_id: 11,
+            },
+            Delete {
+                row_index: 0,
+                technical_id: 3,
+            },
+        ],
+    });
+
+    assert_eq!(
+        grouped,
+        MutationGroups {
+            rows: vec![
+                MutationGroup {
+                    row_index: 0,
+                    insert_ids: vec![7],
+                    mutation_ids: vec![7, 3],
+                },
+                MutationGroup {
+                    row_index: 1,
+                    insert_ids: vec![11],
+                    mutation_ids: vec![11, 11],
+                },
+            ],
+            delete_ids: vec![11, 3],
+        }
+    );
+}
+
+#[test]
+fn duplicate_technical_ids_remain_a_plan_validation_error() {
+    let input = delivery(&[(7, 1), (8, 1)], &[1, 1]);
+    let mut target = Target::default();
+    let (checkpoint, mut batch) = plan::prepare(&mut target, &input, 1).unwrap();
+    batch.inserts[1].technical_id = batch.inserts[0].technical_id;
+    assert!(plan::validate(&batch, checkpoint, input.change()).is_err());
 }
 
 #[test]

@@ -18,7 +18,7 @@ use crate::operation::sink::buffered::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Plan {
-    batch_id: u64,
+    start: u64,
     events: u64,
     fingerprint: u64,
 }
@@ -106,31 +106,26 @@ impl SinkTarget for Target {
         &mut self,
         input: &DeliveryBatch,
         checkpoint: &Self::Checkpoint,
-        batch_id: u64,
     ) -> Result<(Self::Checkpoint, Self::Plan), OperationError> {
         self.state.lock().unwrap().prepare_calls += 1;
         let events = batch::event_count(input.change())?;
+        let start = *checkpoint;
         let checkpoint = checkpoint
             .checked_add(events)
             .ok_or_else(|| invalid("fake checkpoint overflow"))?;
         Ok((
             checkpoint,
             Plan {
-                batch_id,
+                start,
                 events,
                 fingerprint: fingerprint(input),
             },
         ))
     }
 
-    fn deliver(
-        &mut self,
-        input: &DeliveryBatch,
-        batch_id: u64,
-        plan: &Self::Plan,
-    ) -> Result<(), OperationError> {
+    fn deliver(&mut self, input: &DeliveryBatch, plan: &Self::Plan) -> Result<(), OperationError> {
         let expected = Plan {
-            batch_id,
+            start: plan.start,
             events: batch::event_count(input.change())?,
             fingerprint: fingerprint(input),
         };
@@ -143,13 +138,15 @@ impl SinkTarget for Target {
         if std::mem::take(&mut state.fail_before_delivery_once) {
             return Err(invalid("fake delivery failed before commit"));
         }
-        match state.delivered.get(&batch_id) {
+        match state.delivered.get(&plan.start) {
             Some(previous) if previous != plan => {
-                return Err(invalid("fake batch ID was reused with a different plan"));
+                return Err(invalid(
+                    "fake mutation identity was reused with a different plan",
+                ));
             }
             Some(_) => {}
             None => {
-                state.delivered.insert(batch_id, plan.clone());
+                state.delivered.insert(plan.start, plan.clone());
             }
         }
         if std::mem::take(&mut state.fail_after_delivery_once) {
@@ -168,7 +165,7 @@ impl SinkTarget for Target {
 
     fn encode_plan(plan: &Self::Plan, output: &mut Vec<u8>) {
         output.push(1);
-        output.extend(plan.batch_id.to_be_bytes());
+        output.extend(plan.start.to_be_bytes());
         output.extend(plan.events.to_be_bytes());
         output.extend(plan.fingerprint.to_be_bytes());
     }
@@ -176,17 +173,18 @@ impl SinkTarget for Target {
     fn decode_plan(
         input: &mut &[u8],
         change: &DeliveryBatch,
-        _checkpoint: &Self::Checkpoint,
+        checkpoint: &Self::Checkpoint,
     ) -> Result<Self::Plan, OperationError> {
         if state::read::<1>(input)? != [1] {
             return Err(invalid("unknown fake-plan version"));
         }
         let plan = Plan {
-            batch_id: u64::from_be_bytes(state::read(input)?),
+            start: u64::from_be_bytes(state::read(input)?),
             events: u64::from_be_bytes(state::read(input)?),
             fingerprint: u64::from_be_bytes(state::read(input)?),
         };
-        if plan.events != batch::event_count(change.change())?
+        if plan.start.checked_add(plan.events) != Some(*checkpoint)
+            || plan.events != batch::event_count(change.change())?
             || plan.fingerprint != fingerprint(change)
         {
             return Err(invalid(
@@ -373,16 +371,6 @@ impl Fixture {
         value
     }
 
-    fn set_control(&mut self, value: &Vec<u8>) {
-        let transaction = self.transactions.begin();
-        self.control
-            .access(transaction.access())
-            .unwrap()
-            .set(value)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
     fn entry(&mut self, sequence: u64) -> Option<Vec<u8>> {
         let transaction = self.transactions.begin();
         let value = self
@@ -423,15 +411,14 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
 
     let ready_state = State::<u64, Plan>::Ready(Ready {
         buffer: BufferState::EMPTY,
-        next_batch_id: u64::MAX,
         checkpoint: 9,
     });
     let ready_bytes = ready_state.encode::<Target>();
     assert_eq!(
         ready_bytes,
         [
-            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 9,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 9,
         ]
     );
     let State::Ready(decoded_ready) =
@@ -440,15 +427,7 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
         panic!("expected Ready");
     };
     assert_eq!(decoded_ready.buffer, BufferState::EMPTY);
-    assert_eq!(decoded_ready.next_batch_id, u64::MAX);
     assert_eq!(decoded_ready.checkpoint, 9);
-    let zero_ready = State::<u64, Plan>::Ready(Ready {
-        buffer: BufferState::EMPTY,
-        next_batch_id: 0,
-        checkpoint: 9,
-    })
-    .encode::<Target>();
-    assert!(State::<u64, Plan>::decode::<Target>(&zero_ready, None).is_err());
 
     let prepared = State::Prepared(Prepared {
         before: BufferState {
@@ -462,15 +441,26 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
             retained_bytes: 100,
         },
         after: BufferState::EMPTY,
-        batch_id: 5,
-        checkpoint: 11,
+        checkpoint: 7,
         plan: Plan {
-            batch_id: 5,
+            start: 5,
             events: 2,
             fingerprint: fingerprint(&delivery),
         },
     });
     let prepared_bytes = prepared.encode::<Target>();
+    let mut prepared_golden = vec![1, 2, 1];
+    for value in [3_u64, 0, 2, 4, 2, 100] {
+        prepared_golden.extend(value.to_be_bytes());
+    }
+    prepared_golden.push(0);
+    prepared_golden.extend([0; size_of::<u64>() * 3]);
+    prepared_golden.extend(7_u64.to_be_bytes());
+    prepared_golden.push(1);
+    for value in [5_u64, 2, fingerprint(&delivery)] {
+        prepared_golden.extend(value.to_be_bytes());
+    }
+    assert_eq!(prepared_bytes, prepared_golden);
     let State::Prepared(decoded) =
         State::<u64, Plan>::decode::<Target>(&prepared_bytes, Some(&delivery)).unwrap()
     else {
@@ -478,7 +468,7 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
     };
     assert_eq!(decoded.before.head.unwrap().sequence, 3);
     assert_eq!(decoded.after, BufferState::EMPTY);
-    assert_eq!(decoded.plan.batch_id, 5);
+    assert_eq!(decoded.plan.start, 5);
     for end in 0..prepared_bytes.len() {
         assert!(
             State::<u64, Plan>::decode::<Target>(&prepared_bytes[..end], Some(&delivery)).is_err(),
@@ -491,30 +481,6 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
     let mut corrupt_plan = prepared_bytes;
     *corrupt_plan.last_mut().unwrap() ^= 1;
     assert!(State::<u64, Plan>::decode::<Target>(&corrupt_plan, Some(&delivery)).is_err());
-    for invalid_id in [0, u64::MAX] {
-        let invalid = State::Prepared(Prepared {
-            before: BufferState {
-                head: Some(Position {
-                    sequence: 3,
-                    row_index: 0,
-                    remaining: 2,
-                }),
-                tail: 4,
-                pending_events: 2,
-                retained_bytes: 100,
-            },
-            after: BufferState::EMPTY,
-            batch_id: invalid_id,
-            checkpoint: 11,
-            plan: Plan {
-                batch_id: invalid_id,
-                events: 2,
-                fingerprint: fingerprint(&delivery),
-            },
-        })
-        .encode::<Target>();
-        assert!(State::<u64, Plan>::decode::<Target>(&invalid, Some(&delivery)).is_err());
-    }
 }
 
 #[test]
@@ -853,9 +819,9 @@ fn one_large_diff_is_settled_across_bounded_batches() {
     }
     assert!(fixture.commit(None).unwrap().is_none());
     let delivered = fixture.target.lock().unwrap();
-    assert_eq!(delivered.delivered[&1].events, 3);
-    assert_eq!(delivered.delivered[&2].events, 3);
-    assert_eq!(delivered.delivered[&3].events, 1);
+    assert_eq!(delivered.delivered[&0].events, 3);
+    assert_eq!(delivered.delivered[&3].events, 3);
+    assert_eq!(delivered.delivered[&6].events, 1);
 }
 
 #[test]
@@ -944,10 +910,9 @@ fn recovery_rejects_a_forged_settlement_before_decoding_its_plan() {
             pending_events: 1,
             retained_bytes: before.buffer.retained_bytes,
         },
-        batch_id: before.next_batch_id,
         checkpoint: 3,
         plan: Plan {
-            batch_id: before.next_batch_id,
+            start: 0,
             events: 3,
             fingerprint: fingerprint(&delivery),
         },
@@ -1080,59 +1045,6 @@ fn a_wide_large_change_round_trips_through_owned_ipc_and_reopen() {
 }
 
 #[test]
-fn admission_reserves_enough_batch_ids_for_every_buffered_event() {
-    let mut fixture = Fixture::create();
-    fixture.bootstrap();
-    fixture.set_control(
-        &State::<u64, Plan>::Ready(Ready {
-            buffer: BufferState::EMPTY,
-            next_batch_id: u64::MAX - 1,
-            checkpoint: 0,
-        })
-        .encode::<Target>(),
-    );
-    let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap().as_ref());
-
-    assert!(fixture.commit(Some(&change(&[1], &[2]))).is_err());
-    assert!(fixture.entry(0).is_none());
-    assert_eq!(
-        ready(&fixture.control().unwrap()).next_batch_id,
-        u64::MAX - 1
-    );
-
-    assert_complete(fixture.commit(Some(&change(&[1], &[1]))).unwrap().as_ref());
-    assert_commit(fixture.commit(None).unwrap().as_ref());
-    assert_commit(fixture.commit(None).unwrap().as_ref());
-    assert_commit(fixture.commit(None).unwrap().as_ref());
-    let exhausted = ready(&fixture.control().unwrap());
-    assert!(exhausted.buffer.is_empty());
-    assert_eq!(exhausted.next_batch_id, u64::MAX);
-    assert!(fixture.commit(Some(&change(&[2], &[1]))).is_err());
-}
-
-#[test]
-fn recovery_rejects_buffered_work_that_cannot_drain_before_id_exhaustion() {
-    let mut fixture = Fixture::create();
-    fixture.bootstrap();
-    assert_complete(fixture.commit(Some(&change(&[1], &[2]))).unwrap().as_ref());
-    let admitted = ready(&fixture.control().unwrap());
-    fixture.set_control(
-        &State::<u64, Plan>::Ready(Ready {
-            buffer: admitted.buffer,
-            next_batch_id: u64::MAX - 1,
-            checkpoint: admitted.checkpoint,
-        })
-        .encode::<Target>(),
-    );
-
-    let mut fixture = fixture.reopen();
-    assert!(fixture.commit(None).is_err());
-    assert!(fixture.entry(0).is_some());
-    assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 0);
-}
-
-#[test]
 fn restore_validates_every_buffer_entry_and_accounting_before_delivery() {
     let mut missing = Fixture::create();
     missing.bootstrap();
@@ -1218,7 +1130,6 @@ fn restore_validation_crosses_scan_pages_before_external_io() {
             pending_events: u64::try_from(count).unwrap(),
             retained_bytes,
         },
-        next_batch_id: 1,
         checkpoint: 0,
     })
     .encode::<Target>();

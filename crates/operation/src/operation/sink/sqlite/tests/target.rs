@@ -171,6 +171,21 @@ fn fixed_inserts_and_deletes_replay_as_one_idempotent_batch() {
 }
 
 #[test]
+fn mutation_row_index_is_rejected_while_the_adapter_encodes_the_row() {
+    let mut fixture = Fixture::new(schema());
+    fixture.initialize();
+    let input = values(&fixture.schema, &[7]);
+
+    assert!(
+        fixture
+            .target
+            .write_batch(&input, &batch(&[(1, 1)], &[]))
+            .is_err()
+    );
+    assert!(fixture.rows().is_empty());
+}
+
+#[test]
 fn replay_rejects_an_existing_id_bound_to_a_different_row() {
     let mut fixture = Fixture::new(schema());
     fixture.initialize();

@@ -50,9 +50,18 @@ presence 往返、outer nullability、正负 diff 边界、分页 rollback 和 P
 Right Join 的 swap + SchemaAlign、原生 residual 的方向改写，以及每种新增 LogicalPlan lowering
 至少一个最终关系 witness，不复制 Join 状态机。
 
+AsOfJoin 的 owner 文件必须用独立 winner/关系 oracle 覆盖 Inner、LeftOuter、LeftSemi 与
+LeftAnti，并证明 tag `17`、`asof_join.left_rows/right_rows/continuation` 三资源、完整
+Definition roundtrip 与精确 output Schema。运行证据覆盖 backward/forward/nearest、exact 开关、
+两种 equidistant policy、空/多 equality partition、`Equal/NotDistinct`、单/多 order、NULL、tolerance 边界、
+显式 tie-break 和三种 fallback、residual 跳过近候选、重复 multiplicity、两侧 insert/retract、旧负新正的
+历史修正顺序、整批负前缀/溢出/歧义 rollback，以及候选与外层 left 双重分页中的 commit
+rollback 和 reopen。SQL 只证明 DataFusion 原生 left-preserving `ASOF JOIN` 的四个不等方向、零/多等值键、
+Schema/Program identity 和最终关系，不复制 Operation API 的 nearest、tolerance、tie 或 residual 状态机。
+
 ### Flow
 
-Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
+Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、AsOfJoin 新增的双输入外层/候选双重 continuation 在真实资源路径上的 drop/open、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
 Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。Definition
 还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和 materialize 前拒绝
@@ -133,6 +142,8 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 | `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的 Probe/ClearShadow/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
 | `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
+| `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、nearest+tolerance 和 residual 远候选回退；每次计时包含一对使关系回到初始态的完整 Claim、全部 Probe/Emit turns、同步 commit 和 AfterCommit，fixture、seed 与结果校验不计时 |
+| `asof_join_resources` | Operation 自有进程隔离 runner：分页候选、宽/超大单行、whole-Claim、residual 远回退、右侧历史 rematch、双侧 NULL-order history N/2N，以及 port 1 的 empty-left distinct N/2N preload、same-key 高 multiplicity 和 active-overlay N/2N growth；分别输出一个完整 driving Claim 的 Rust allocator heap、每页产生的 Arrow array memory/行数、turn 数，以及独立 non-profile pass 扫描两个 rows map 得到的持久逻辑 entry/key+value bytes；RSS 明示 unavailable |
 | `ordered_map` | Criterion；完整 owned-page 扫描 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
@@ -143,7 +154,25 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 
 `equi_join_resources` 的每个 case 必须在新子进程中建立 fixture、seed 与 driving Change，再启动一个 `dhat 0.3.3` profiler 覆盖恰好一个完整 Claim。heap 数字只表示经过 Rust global allocator 的 total/current/peak bytes 与 blocks，不包含 profiler 启动前的输入 Arrow/seed/fixture，也不包含 RocksDB native heap。输出 Arrow array memory 单独按每个 Change 的 `get_array_memory_size` 累计；FullOuter 状态另用不受 profiler 影响的独立 pass 在每次 commit 后扫描 `equi_join.match_counts`，只记录实际/影子 entry 数及 decoded key + `u64` 逻辑字节，不代表 WAL、LSM、cache、压缩或文件系统占用。portable runner 不采集平台单位不一致的 RSS，JSONL 中必须保留 `rss_bytes: null` 和原因，各口径不得互相替代。
 
-Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime` 与 `equi_join_resources` 的自有 runner 同样设置 `test = true`；test mode 自动选择小规模 workload，后者仍逐 case 启动隔离子进程。其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
+`asof_join_resources` 遵循相同的新子进程/单完整 Claim `dhat 0.3.3` 边界。除候选分页、宽行、
+whole-Claim、residual 和历史 rematch 外，它还成对比较 empty-left distinct N/2N、same-key 高
+multiplicity、active-overlay N/2N，以及持久 NULL-order left/right history N/2N。NULL-left 对照固定
+同一份 RHS Claim 并必须在两个 turn 内完成；NULL-right 对照固定同一条 left Claim 并必须在一个 turn
+内完成。两者都必须自动断言 N/2N 的 claim 与 Rust heap 记录完全相同，证明双向 scan 都精确 seek 到
+matchable marker，不能让永不匹配的历史放大另一侧更新。Heap 不包含
+profiler 前建立的 fixture、seed 和输入 Arrow，也不包含 RocksDB native heap；output 单独累计
+`RecordBatch::get_array_memory_size` 与 diff array，可能重复计入共享 buffer。持久状态在另一个不受 profiler 影响的
+pass 中以 `OrderedMap<Vec<u8>, u64>` 观察句柄扫描 `asof_join.left_rows/right_rows`，记录解码
+entry 数与 key + 8-byte positive weight；这是 codec 已锁定的逻辑大小，不是 RocksDB/WAL/LSM/cache/
+压缩/文件系统占用。port 1 必须用 empty-left distinct N/2N preload 证明整批准入、turn continuation、
+最终 right state 与撤回闭环，并用 same-key Claim 证明单 entry 的高 multiplicity；active-overlay N/2N
+对照先 seed N 个不同 equality partition 的 left row，再由一个每 partition 一行的 N-row right Claim 驱动，
+使每个事件只 rematch 一个 left 和一个 candidate。该 active case 的 non-profile oracle 必须在插入与撤回两向
+校验每个 group 恰好一次、左右 group/order 对应及精确 `+1/-1` 权重，且最终状态回到 seed；paired 记录用于
+同一次 benchmark 环境下比较 heap/turn 增长，test mode 只验证协议，不作为性能基线。RSS 仍必须明示
+`null` 与 unavailable 原因，各口径不得互相替代。
+
+Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime`、`equi_join_resources` 与 `asof_join_resources` 的自有 runner 同样设置 `test = true`；test mode 自动选择小规模 workload，后两者仍逐 case 启动隔离子进程。其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
 `flow_runtime` 的线性链对照固定使用相同的 SequenceScan→Project→Extend→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局是 7 个 Station、6 个 durable output log 和 6 条 input edge；融合布局通过 `FlowFactory::append` 把五个 transform 放入 Scan Station，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。这些 commit 与 append 是 Flow 协议层的语义计数，不是 RocksDB 内部计数。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration 或历史累计 IPC bytes，JSONL context 必须把两项记为 unavailable，不能用均摊延迟或当前 retained bytes 冒充。
 
@@ -195,6 +224,8 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench buffered_sink
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join_resources
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join_resources
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```

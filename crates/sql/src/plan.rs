@@ -10,7 +10,7 @@ use datafusion_expr::{
     AggregateUDF, Distinct as LogicalDistinct, Expr, ExprSchemable, HigherOrderUDF, LogicalPlan,
     Operator, ScalarUDF, TableSource, WindowUDF,
     expr::{AggregateFunction, BinaryExpr},
-    logical_plan::{Aggregate, Join},
+    logical_plan::{Aggregate, AsOfJoin, Join},
     planner::ExprPlanner,
     utils::{find_valid_equijoin_key_pair, split_conjunction_owned},
 };
@@ -21,8 +21,10 @@ use datafusion_sql::sqlparser::ast::Statement;
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
-        AggregateCall, AggregateDefinition, DistinctDefinition, EquiJoinDefinition, EquiJoinKind,
-        FilterDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
+        AggregateCall, AggregateDefinition, AsOfDirection, AsOfEqualityKey, AsOfEqualityMode,
+        AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieFallback, DistinctDefinition,
+        EquiJoinDefinition, EquiJoinKind, FilterDefinition, SchemaAlignDefinition,
+        SchemaAlignField, UnionAllDefinition,
     },
 };
 
@@ -236,6 +238,7 @@ impl Lowerer {
                 let input = self.lower(input)?;
                 self.add_transform([input], DistinctDefinition::new())
             }
+            LogicalPlan::AsOfJoin(join) => self.lower_asof_join(join),
             LogicalPlan::Join(join) => self.lower_join(join),
             LogicalPlan::Aggregate(aggregate) => self.lower_aggregate(aggregate),
             LogicalPlan::Union(union) => {
@@ -260,6 +263,65 @@ impl Lowerer {
                 plan.display()
             ))),
         }
+    }
+
+    fn lower_asof_join(&mut self, join: &AsOfJoin) -> Result<LoweredRelation, SqlError> {
+        if !matches!(
+            join.join_constraint,
+            JoinConstraint::On | JoinConstraint::Using
+        ) {
+            return Err(SqlError::Unsupported(
+                "ASOF join constraint semantics".to_owned(),
+            ));
+        }
+
+        let left = self.lower(&join.left)?;
+        let right = self.lower(&join.right)?;
+        let equalities = join
+            .on
+            .iter()
+            .map(|(left_key, right_key)| {
+                Ok(AsOfEqualityKey::new(
+                    AsOfEqualityMode::Equal,
+                    rewrite_columns(left_key.clone(), join.left.schema(), &left.physical_schema)?,
+                    rewrite_columns(
+                        right_key.clone(),
+                        join.right.schema(),
+                        &right.physical_schema,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, SqlError>>()?;
+        let direction = asof_direction(join.match_condition.op)?;
+        let order = AsOfOrderKey::new(
+            rewrite_columns(
+                join.match_condition.left.clone(),
+                join.left.schema(),
+                &left.physical_schema,
+            )?,
+            rewrite_columns(
+                join.match_condition.right.clone(),
+                join.right.schema(),
+                &right.physical_schema,
+            )?,
+        );
+        let output_count =
+            left.physical_schema.fields().len() + right.physical_schema.fields().len();
+        let source_order = (0..output_count).collect::<Vec<_>>();
+        let definition = AsOfJoinDefinition::try_new(
+            AsOfJoinKind::LeftOuter,
+            direction,
+            equalities,
+            [order],
+            [],
+            AsOfTieFallback::Reject,
+            None,
+            (0..output_count).map(internal_join_field_name),
+            None,
+        )
+        .map_err(SqlError::endpoint)?;
+        let joined = self.add_transform([left, right], definition)?;
+        self.align_join_output(joined, join.schema.as_ref(), &source_order)
     }
 
     fn lower_join(&mut self, join: &Join) -> Result<LoweredRelation, SqlError> {
@@ -659,6 +721,18 @@ fn unsupported_join_condition() -> SqlError {
     SqlError::Unsupported("JOIN without a cross-input equality key".to_owned())
 }
 
+fn asof_direction(operator: Operator) -> Result<AsOfDirection, SqlError> {
+    match operator {
+        Operator::Lt => Ok(AsOfDirection::Forward { allow_exact: false }),
+        Operator::LtEq => Ok(AsOfDirection::Forward { allow_exact: true }),
+        Operator::Gt => Ok(AsOfDirection::Backward { allow_exact: false }),
+        Operator::GtEq => Ok(AsOfDirection::Backward { allow_exact: true }),
+        operator => Err(SqlError::invalid(format!(
+            "DataFusion produced unsupported ASOF match operator {operator}"
+        ))),
+    }
+}
+
 fn rewrite_join_residual(
     expression: Expr,
     logical_left: &DFSchema,
@@ -758,4 +832,30 @@ fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {
 
 fn internal_join_field_name(index: usize) -> String {
     format!("__dogpaddle_sql_join_{index:08x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_asof_comparisons_map_to_direction_and_exactness() {
+        assert_eq!(
+            asof_direction(Operator::Lt).unwrap(),
+            AsOfDirection::Forward { allow_exact: false }
+        );
+        assert_eq!(
+            asof_direction(Operator::LtEq).unwrap(),
+            AsOfDirection::Forward { allow_exact: true }
+        );
+        assert_eq!(
+            asof_direction(Operator::Gt).unwrap(),
+            AsOfDirection::Backward { allow_exact: false }
+        );
+        assert_eq!(
+            asof_direction(Operator::GtEq).unwrap(),
+            AsOfDirection::Backward { allow_exact: true }
+        );
+        assert!(asof_direction(Operator::Eq).is_err());
+    }
 }

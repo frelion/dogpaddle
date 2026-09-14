@@ -85,6 +85,9 @@ Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；re
 - `UnionAll` 要求所有输入 Schema 完全相同。
 - `EquiJoin` 分别绑定左右键，要求每对键具有相同类型；可选 residual 在精确的
   `left.* + right.*` candidate Schema 上绑定，具体 kind 决定输出列和 outer nullability。
+- `AsOfJoin` 要求左右 equality/order 表达式成对同类型，order 至少一对；nearest 和
+  tolerance 额外要求唯一可计算距离的 order，tie-break 只针对右侧绑定，可选
+  residual 与 `EquiJoin` 一样使用 `left.* + right.*` qualifier。
 - Sink 检查目标系统能否无损表示全部输入列，并且没有输出 Schema。
 
 运行时收到的 `Change` 仍会与绑定时 Schema 比较。这样，磁盘 Definition、编译好的表达式和真实
@@ -201,6 +204,7 @@ Definition 通过稳定逻辑名称声明自己需要的持久数据，例如：
 sequence_scan.position: Cell<u64>
 distinct.weights: OrderedMultiset<Vec<u8>>
 equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
+asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
 ```
 
 Flow 在路径中加入 Station 和 Operation 序号，然后统一创建或打开这些对象。具体算子只得到
@@ -212,7 +216,7 @@ Flow 在路径中加入 Station 和 Operation 序号，然后统一创建或打�
 仍保存在 Definition。资源使用精确 Rust 类型匹配；普通算子必须收到空资源。只有 Station 首项可以
 获得运行资源，因此可融合的 Atomic 尾项始终是纯粹的本地计算。
 
-## 三个有状态关系算子的直觉
+## 四个有状态关系算子的直觉
 
 ### Distinct：完整行到账本
 
@@ -284,6 +288,63 @@ driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftS
 `match_counts` 以完整 canonical row 为 key，持久状态与 tracked rows 的总宽度成正比；分页也不限制
 整个 Join 关系的磁盘大小，无法消除连接结果本身的高 fan-out 成本。
 
+### AsOfJoin：动态关系中的单候选最近匹配
+
+`AsOfJoin` 固定把 port `0` 作为 probe/left，port `1` 作为 candidate/right。Equality
+表达式先划分 partition，然后每个正权重 left exact row 在当前 right 关系中最多选一个候选：
+
+- `Backward` 选最大的前驱，`Forward` 选最小的后继，两者都显式声明是否允许 exact match；
+- `Nearest` 按唯一 distance-capable order 的绝对距离选择，并显式声明等距时选前驱还是后继；
+- backward/forward 可以用非空 lexicographic order tuple；nearest 和 tolerance 只能用单个
+  integer、Date32、Timestamp 或 Decimal128 order；
+- tolerance 是该 order 物理单位上的包含边界上限。它只限制匹配，不是 watermark，也不允许删除历史状态。
+
+Equality 键可为空，表示一个全局 partition。`Equal` 模式下任一分量为 NULL 就不匹配；
+`NotDistinct` 让两侧 NULL 进入同一 partition。Order 的 NULL 永远不匹配。指定了 residual 时，
+它在排名前对完整 `left + right` pair 求值；false 或 NULL 候选会被跳过，搜索继续到更远的
+eligible candidate。
+
+同 order 下的不同 right rows 先按有序 right-only tie-break 排名，每个 tie 都指定升/降序和
+NULL first/last。若显式 tie 仍不唯一，Definition 必须选择拒绝歧义，或使用 canonical right row
+的升/降序作最终决胜。同一 canonical right row 的 multiplicity 只决定 candidate 是否存在，
+不会把一个 left row 的匹配输出再乘一次。
+
+`AsOfJoinKind` 提供 `Inner`、`LeftOuter`、`LeftSemi` 和 `LeftAnti`。Right 候选的
+`0 ↔ positive` presence transition 会重新计算已有 left rows，依次输出旧结果 `-weight` 和新结果
+`+weight`；仅在正 multiplicity 之间变化不会改变被选 identity。两侧的插入和撤回都进入同一
+ordered relation，不是“左流到达时查一次右表”的 processing-time lookup。
+
+加权关系在没有 occurrence identity 时不能唯一决定 Right/Full ASOF 中哪个物理 right copy
+已被使用。例如同一 left row 权重 2、同一 right row 权重 3 时，两个 probe copy 可以共用一个
+candidate occurrence，也可以各用一个；joined value multiset 相同，但 unmatched right 权重不同。
+`Change` 没有这种 occurrence identity，因而这四种 left-family 是输入关系能唯一决定的完整语义；
+交换左右侧可以表达反向的 probe 问题，但那是另一个选择函数，不是 Right ASOF 的等价改写。
+
+算子只声明三个持久资源：
+
+```text
+asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
+asof_join.right_rows: OrderedMap<Vec<u8>, RowWeight>
+asof_join.continuation: Cell<AsOfContinuation>
+```
+
+两个 map 的 key 按 `partition + order + tie rank + canonical row` 排序，值只保存正 multiplicity；
+continuation 保存当前输入行序号、Probe/Emit phase、外层 left cursor、候选 cursor、已找到的 before/after
+winner 和歧义标记。Probe 先为整个 pinned Change 验证准入、候选、解码、residual、tie 与所有输出
+diff 都可表示，Emit 再发布修正并更新关系；状态、output 和最后的 input completion 始终在调用方
+事务中一起前进。
+
+候选搜索和 right-side rematch 都以 Store 的 owned page 进行。常规候选页最多 64 项、1 MiB
+logical Store bytes 和 16,384 个 `ScalarValue` slots；整个 turn 常规最多 256 项和 4 MiB 逻辑
+工作量。当空 turn 的首个 Store item 本身超限时，为了活性会单独接受它。因此普通运行时峰值是
+`O(pinned Claim + candidate page + turn output)`，而非整个 partition；单个 oversized row 仍是显式例外。
+这些边界限制一次 turn 的内存和事务放大，不限制整个关系的磁盘状态。没有 watermark 时两侧历史都
+必须保留。Residual 可以让最近候选不合格，所以当前正确性路径要分页扫描整个 right partition；
+right presence transition 还要扫描该 partition 的全部 left rows，并对每个 left row 完成候选搜索。因而普通左侧
+lookup 成本与候选 partition 大小成正比，最坏右侧历史修正是该 partition 左右状态的乘积；分页只保证
+每个 turn 有界，不会隐藏总成本。候选 right scan 与 rematch left scan 都从索引内的
+matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远不可能参与匹配的历史。
+
 ## 内建算子索引
 
 “精确输入”表示运行期 Schema 固定，并非动态 Schema。Data 一列列出算子自己拥有的持久状态；
@@ -307,6 +368,7 @@ driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftS
 | `Aggregate` (14) | Atomic 或 Exclusive / 1 | 增量维护非空分组聚合 | groups、entries、control |
 | `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
 | `EquiJoin` (16) | Turn / 2 | 增量维护带可选 residual 的 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 使用 key counts 或逐行 match counts |
+| `AsOfJoin` (17) | Turn / 2 | 按 equality partition 增量维护 backward/forward/nearest 的单候选 Inner、Left Outer/Semi/Anti | ordered left rows、ordered right rows、continuation |
 
 源码按业务角色放在 [`operation/scan/`](src/operation/scan/)、
 [`operation/transform/`](src/operation/transform/) 和
@@ -315,7 +377,7 @@ driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftS
 
 ## 表达式边界
 
-Filter、Extend、Select、SchemaAlign、Aggregate 和 `EquiJoin` 直接接收 `DataFusion` `Expr`。
+Filter、Extend、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
 字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
 
@@ -324,6 +386,8 @@ Definition 构造时立即把表达式编码并解码为 canonical protobuf；bi
 Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要显式 `cast`。
 `EquiJoin` residual 的两个输入固定使用 `left` 与 `right` qualifier；它绑定原始输入字段的类型、
 nullability 和 metadata，而不是 Outer 已放宽或 Semi/Anti 已裁剪的输出 Schema。
+`AsOfJoin` residual 使用同样的 qualifier；equality/order 分别针对自己的输入 Schema 绑定，
+tie-break 只针对 right Schema 绑定。
 
 当前产品证据覆盖以下纵向切片：
 
@@ -378,7 +442,7 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 SQLite/PostgreSQL 的每个目标批次最多 1024 个 mutation，完整 encoded 输入聚合受 8 MiB 上限；
 target mutation 按 canonical row、技术字段和每列固定 framing 的逻辑口径计费，并受独立 8 MiB
 上限。后者不是 driver heap、SQL/wire payload 或数据库事务资源的硬配额。
-超出单项或 event 上限、或不能在剩余 batch-ID 区间内排空的 Claim 在 admission 前明确失败，不产生
+超出单项或 event 上限、或不能在剩余 technical-ID 区间内排空的 Claim 在 admission 前明确失败，不产生
 ACK 或部分 buffer 写入。
 
 批次先把 relation checkpoint、buffer settlement 和固定-ID mutation plan 持久化为 `Prepared`，Store
@@ -406,10 +470,10 @@ entries、连续 sequence、Schema、control accounting，以及 checkpoint 下�
 ```
 
 tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
-`GroupState`、`JoinContinuation` 与 buffered Sink control codec、buffer 内完整 Change IPC、collection
-的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成当前 v1 持久化边界。
-关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation codec 还是目标布局/恢复
-ABI。decoder 表在
+`GroupState`、`JoinContinuation`、`AsOfContinuation` 与 buffered Sink control codec、buffer 内完整
+Change IPC、collection 的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成
+当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation
+codec 还是目标布局/恢复 ABI。decoder 表在
 [`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
 
 这是开发期 v1。破坏性修改直接更新当前格式、golden 和布局测试；不增加旧版本 alias、fallback、
@@ -423,7 +487,8 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 建议先读最小的 [`Project`](src/operation/transform/project.rs)，再读带状态的
 [`Distinct`](src/operation/transform/distinct.rs)；需要分页时读
-[`EquiJoin`](src/operation/transform/equi_join/)，需要外部恢复协议时读
+[`EquiJoin`](src/operation/transform/equi_join/) 和
+[`AsOfJoin`](src/operation/transform/asof_join/)，需要外部恢复协议时读
 [`queue_scan`](examples/support/queue_scan.rs)。
 
 新增实现应依次完成：
@@ -450,9 +515,17 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 - Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
   [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
 
-`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition 和 durable buffered `SQLite` Sink
-各有 owner benchmark；其他组合性能由真正拥有 workload 的 Flow、Store 或 Change + Store target
-负责。
+`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition、`AsOfJoin` 的 ordered lookup/
+historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
+workload 的 Flow、Store 或 Change + Store target 负责。
+
+`asof_join` Criterion 把两个使关系回到原状的完整 Claim 作为计时单位，覆盖多小 partition、
+单大 partition、尾部小修正、历史全量修正、nearest+tolerance 和 residual 远候选回退。
+`asof_join_resources` 为每个 case 启动新子进程：fixture、seed 与 input Arrow 在 profiler 前建立，
+`dhat` 只覆盖一个完整 driving Claim；output Arrow bytes 和两个 ordered rows map 的 decoded
+key+weight 逻辑大小分开报告。NULL-order left/right history 都使用 N/2N 对照，并自动要求 driving
+Claim 的 turn、output 与 Rust heap 完全不随无关历史增长。Rust allocator、Arrow、Store logical bytes
+都不是 RSS；runner 对 RSS 明确记为 unavailable。
 
 ```bash
 cargo test -p dogpaddle-operation
@@ -462,6 +535,8 @@ cargo test -p dogpaddle-operation --benches
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join_resources
 ```
 
 全工作区测试所有权和性能口径见 [`TESTING.md`](../../TESTING.md)。

@@ -20,7 +20,7 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     assert_eq!(definition.len(), 940);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "599773a34ba4a9bfca4b5a70b6cc5654aa097fad7dacf3005f28437df2dbeaf5"
+        "94f6b81ea91d1e200dcdb9506bc2bb4ff96a846a443f3b735f5476a7374a4aa3"
     );
 }
 
@@ -125,6 +125,76 @@ fn lowering_rebinds_qualified_columns_across_self_and_nested_joins() {
             .start(root.path().join(format!("join-{index}")))
             .unwrap();
     }
+}
+
+#[test]
+fn native_asof_join_lowers_all_directions_and_constraints() {
+    let cases = [
+        (">=", ""),
+        (">", "ON left_scan.value = right_scan.value"),
+        ("<=", "USING (value)"),
+        ("<", ""),
+    ];
+    let root = tempfile::tempdir().unwrap();
+
+    for (index, (comparison, constraint)) in cases.into_iter().enumerate() {
+        let program = SqlProgram::parse(&format!(
+            "INSERT INTO discard() \
+             SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+             FROM sequence(start => 0) AS left_scan \
+             ASOF JOIN sequence(start => 1) AS right_scan \
+             MATCH_CONDITION (left_scan.value {comparison} right_scan.value) \
+             {constraint}"
+        ))
+        .unwrap();
+        let path = root.path().join(format!("asof-{index}"));
+        let flow = program.start(&path).unwrap();
+        assert_eq!(
+            flow.status()
+                .unwrap()
+                .iter()
+                .map(|station| station.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "sql/scan/00000000",
+                "sql/scan/00000001",
+                "sql/transform/00000000",
+                "sql/sink",
+            ]
+        );
+        drop(flow);
+        program.start(&path).unwrap();
+    }
+
+    let coerced = SqlProgram::parse(
+        "INSERT INTO discard() \
+         SELECT left_scan.ts AS left_ts, right_scan.ts AS right_ts \
+         FROM (SELECT CAST(value AS BIGINT) AS ts \
+               FROM sequence(start => 0)) AS left_scan \
+         ASOF JOIN (SELECT CAST(value AS INTEGER) AS ts \
+                    FROM sequence(start => 1)) AS right_scan \
+         MATCH_CONDITION (left_scan.ts >= right_scan.ts)",
+    )
+    .unwrap();
+    let path = root.path().join("asof-coerced");
+    drop(coerced.start(&path).unwrap());
+    coerced.start(&path).unwrap();
+
+    let partitioned = SqlProgram::parse(
+        "INSERT INTO discard() \
+         SELECT left_scan.ts AS left_ts, right_scan.ts AS right_ts \
+         FROM (SELECT value AS ts, value % 2 AS bucket, value % 3 AS shard \
+               FROM sequence(start => 0)) AS left_scan \
+         ASOF JOIN (SELECT value AS ts, value % 2 AS bucket, value % 3 AS shard \
+                    FROM sequence(start => 1)) AS right_scan \
+         MATCH_CONDITION (left_scan.ts >= right_scan.ts) \
+         ON left_scan.bucket = right_scan.bucket \
+         AND left_scan.shard = right_scan.shard",
+    )
+    .unwrap();
+    let path = root.path().join("asof-two-equalities");
+    drop(partitioned.start(&path).unwrap());
+    partitioned.start(&path).unwrap();
 }
 
 fn read_definition(path: &std::path::Path) -> Vec<u8> {

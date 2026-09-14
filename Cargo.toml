@@ -34,13 +34,13 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 crc32fast = "=1.5.1"
 ctrlc = "=3.5.2"
-datafusion-common = { version = "=55.0.0", default-features = false }
-datafusion-expr = { version = "=55.0.0", default-features = false }
-datafusion-functions-aggregate = { version = "=55.0.0", default-features = false }
-datafusion-optimizer = { version = "=55.0.0", default-features = false }
-datafusion-physical-expr = { version = "=55.0.0", default-features = false }
-datafusion-proto = { version = "=55.0.0", default-features = false }
-datafusion-sql = { version = "=55.0.0", default-features = false }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-debezium = { path = "crates/debezium" }
 dogpaddle-flow = { path = "crates/flow" }

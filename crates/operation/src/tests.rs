@@ -25,10 +25,10 @@ use crate::{
             SqliteSinkDefinition,
         },
         transform::{
-            AggregateCall, AggregateDefinition, DistinctDefinition, EquiJoinDefinition,
-            EquiJoinKind, ExtendDefinition, FilterDefinition, ProjectDefinition,
-            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition,
+            AggregateCall, AggregateDefinition, AsOfDirection, AsOfJoinDefinition, AsOfJoinKind,
+            AsOfOrderKey, AsOfTieFallback, DistinctDefinition, EquiJoinDefinition, EquiJoinKind,
+            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -88,7 +88,7 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 16] {
+fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 17] {
     [
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
@@ -183,6 +183,7 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 16] {
             ),
         ),
         (16, Box::new(join_definition())),
+        (17, Box::new(asof_join_definition())),
     ]
 }
 
@@ -190,6 +191,21 @@ fn join_definition() -> EquiJoinDefinition {
     EquiJoinDefinition::try_new(
         EquiJoinKind::Inner,
         [(col("value"), col("value"))],
+        ["left", "right"],
+        None,
+    )
+    .unwrap()
+}
+
+fn asof_join_definition() -> AsOfJoinDefinition {
+    AsOfJoinDefinition::try_new(
+        AsOfJoinKind::Inner,
+        AsOfDirection::Backward { allow_exact: true },
+        [],
+        [AsOfOrderKey::new(col("value"), col("value"))],
+        [],
+        AsOfTieFallback::CanonicalAscending,
+        None,
         ["left", "right"],
         None,
     )

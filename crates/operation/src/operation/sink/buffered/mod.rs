@@ -72,28 +72,22 @@ pub(crate) trait SinkTarget: Send + 'static {
 
     /// Plans one exact bounded delivery without changing the target.
     ///
-    /// The same batch, checkpoint and batch ID can be prepared again after a
+    /// The same batch and checkpoint can be prepared again after a
     /// local rollback or process exit. Any target session poisoned by a failed
     /// read must be reset before returning an error.
     fn prepare(
         &mut self,
         input: &DeliveryBatch,
         checkpoint: &Self::Checkpoint,
-        batch_id: u64,
     ) -> Result<(Self::Checkpoint, Self::Plan), OperationError>;
 
     /// Atomically and idempotently confirms one durably prepared delivery.
     ///
     /// Reopen repeats this call after process exit, an explicit error, or an
     /// uncertain target commit. Repeating the exact durable plan must be a
-    /// no-op success; adapters may use either the stable batch ID or the
-    /// plan's fixed mutation identities to recognize that replay.
-    fn deliver(
-        &mut self,
-        input: &DeliveryBatch,
-        batch_id: u64,
-        plan: &Self::Plan,
-    ) -> Result<(), OperationError>;
+    /// no-op success; adapters use the plan's fixed mutation identities to
+    /// recognize that replay.
+    fn deliver(&mut self, input: &DeliveryBatch, plan: &Self::Plan) -> Result<(), OperationError>;
 
     /// Appends one stable, self-delimiting checkpoint encoding.
     fn encode_checkpoint(checkpoint: &Self::Checkpoint, output: &mut Vec<u8>);

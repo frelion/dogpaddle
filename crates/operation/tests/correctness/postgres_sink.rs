@@ -86,10 +86,9 @@ fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
 
 #[test]
 fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io() {
-    // Shared buffered state v1: Ready(empty buffer, batch ID 1, relation ID 1).
+    // Shared buffered state v1: Ready(empty buffer, relation ID 1).
     let mut ready = vec![1, 1, 0];
     ready.extend([0; size_of::<u64>() * 3]);
-    ready.extend(1_u64.to_be_bytes());
     ready.extend(1_u64.to_be_bytes());
     let store_root = TestStore::new();
     let definition = definition();

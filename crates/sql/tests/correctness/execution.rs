@@ -510,6 +510,130 @@ fn semi_and_anti_join_family_applies_residuals_across_reopen() {
     }
 }
 
+struct AsOfExecutionCase {
+    name: &'static str,
+    comparison: &'static str,
+    constraint: &'static str,
+    expected: Vec<(u64, Option<u64>)>,
+}
+
+const ASOF_MAX: u64 = u64::MAX;
+const ASOF_LEFT_START: u64 = ASOF_MAX - 6;
+const ASOF_RIGHT_START: u64 = ASOF_MAX - 12;
+
+fn asof_execution_cases() -> [AsOfExecutionCase; 4] {
+    const PARTITIONED_ON: &str = "ON left_scan.bucket = right_scan.bucket \
+                                  AND left_scan.shard = right_scan.shard";
+
+    [
+        AsOfExecutionCase {
+            name: "backward-exact-partitioned",
+            comparison: ">=",
+            constraint: PARTITIONED_ON,
+            expected: vec![
+                (ASOF_MAX - 6, Some(ASOF_MAX - 6)),
+                (ASOF_MAX - 5, None),
+                (ASOF_MAX - 4, None),
+                (ASOF_MAX - 3, None),
+                (ASOF_MAX - 2, None),
+                (ASOF_MAX - 1, None),
+                (ASOF_MAX, Some(ASOF_MAX)),
+            ],
+        },
+        AsOfExecutionCase {
+            name: "backward-strict-partitioned",
+            comparison: ">",
+            constraint: "USING (bucket, shard)",
+            expected: vec![
+                (ASOF_MAX - 6, Some(ASOF_MAX - 12)),
+                (ASOF_MAX - 5, None),
+                (ASOF_MAX - 4, None),
+                (ASOF_MAX - 3, None),
+                (ASOF_MAX - 2, None),
+                (ASOF_MAX - 1, None),
+                (ASOF_MAX, Some(ASOF_MAX - 6)),
+            ],
+        },
+        AsOfExecutionCase {
+            name: "forward-exact-global",
+            comparison: "<=",
+            constraint: "",
+            expected: vec![
+                (ASOF_MAX - 6, Some(ASOF_MAX - 6)),
+                (ASOF_MAX - 5, Some(ASOF_MAX)),
+                (ASOF_MAX - 4, Some(ASOF_MAX)),
+                (ASOF_MAX - 3, Some(ASOF_MAX)),
+                (ASOF_MAX - 2, Some(ASOF_MAX)),
+                (ASOF_MAX - 1, Some(ASOF_MAX)),
+                (ASOF_MAX, Some(ASOF_MAX)),
+            ],
+        },
+        AsOfExecutionCase {
+            name: "forward-strict-global",
+            comparison: "<",
+            constraint: "",
+            expected: vec![
+                (ASOF_MAX - 6, Some(ASOF_MAX)),
+                (ASOF_MAX - 5, Some(ASOF_MAX)),
+                (ASOF_MAX - 4, Some(ASOF_MAX)),
+                (ASOF_MAX - 3, Some(ASOF_MAX)),
+                (ASOF_MAX - 2, Some(ASOF_MAX)),
+                (ASOF_MAX - 1, Some(ASOF_MAX)),
+                (ASOF_MAX, None),
+            ],
+        },
+    ]
+}
+
+#[test]
+fn native_asof_join_executes_all_directions_and_historical_right_corrections_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    for case in asof_execution_cases() {
+        let flow_path = root.path().join(format!("{}-flow", case.name));
+        let sqlite_path = root.path().join(format!("{}.sqlite", case.name));
+        let program = SqlProgram::parse(&format!(
+            "INSERT INTO sqlite(path => '{}', table => 'asof_rows') \
+             SELECT left_scan.ts AS left_ts, right_scan.ts AS right_ts \
+             FROM (\
+                 SELECT value AS ts, \
+                        value % CAST(2 AS BIGINT UNSIGNED) AS bucket, \
+                        value % CAST(3 AS BIGINT UNSIGNED) AS shard \
+                 FROM sequence(start => {ASOF_LEFT_START})\
+             ) AS left_scan \
+             ASOF JOIN (\
+                 SELECT value AS ts, \
+                        value % CAST(2 AS BIGINT UNSIGNED) AS bucket, \
+                        value % CAST(3 AS BIGINT UNSIGNED) AS shard \
+                 FROM sequence(start => {ASOF_RIGHT_START}) \
+                 WHERE value % CAST(6 AS BIGINT UNSIGNED) \
+                       = CAST(3 AS BIGINT UNSIGNED)\
+             ) AS right_scan \
+             MATCH_CONDITION (left_scan.ts {} right_scan.ts) \
+             {}",
+            sql_string(&sqlite_path),
+            case.comparison,
+            case.constraint,
+        ))
+        .unwrap();
+
+        let mut flow = program.start(&flow_path).unwrap();
+        advance_until_first_asof_left_claim(&mut flow, case.name);
+        drop(flow);
+
+        let mut flow = program.start(&flow_path).unwrap();
+        advance_to_idle(&mut flow);
+        drop(flow);
+
+        assert_eq!(asof_rows(&sqlite_path), case.expected, "{}", case.name);
+        let connection = sqlite(&sqlite_path);
+        assert!(sqlite_column(&connection, "asof_rows", "left_ts").1);
+        assert!(!sqlite_column(&connection, "asof_rows", "right_ts").1);
+
+        let mut flow = program.start(&flow_path).unwrap();
+        assert_restores_to_idle(&mut flow);
+    }
+}
+
 #[test]
 fn select_distinct_deduplicates_projected_rows_across_reopen() {
     let root = tempfile::tempdir().unwrap();
@@ -889,6 +1013,41 @@ fn sqlite_values(path: &Path) -> Vec<u64> {
         .collect::<Vec<_>>();
     values.sort_unstable();
     values
+}
+
+fn advance_until_first_asof_left_claim(flow: &mut Flow, case: &str) {
+    for _ in 0..32 {
+        let status = flow.status().unwrap();
+        let asof = status
+            .iter()
+            .find(|station| station.inputs.len() == 2)
+            .expect("the SQL ASOF plan has one two-input Station");
+        if asof.inputs[0].position == 1 {
+            assert_eq!(
+                asof.inputs[1].position, 0,
+                "{case} consumed a right candidate before reopen"
+            );
+            return;
+        }
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    panic!("{case} did not finish its first left Claim within 32 advances");
+}
+
+fn asof_rows(path: &Path) -> Vec<(u64, Option<u64>)> {
+    let connection = sqlite(path);
+    connection
+        .prepare("SELECT left_ts, right_ts FROM asof_rows ORDER BY left_ts")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                decode_u64(row.get::<_, Vec<u8>>(0)?),
+                row.get::<_, Option<Vec<u8>>>(1)?.map(decode_u64),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn quickstart_rows(path: &Path) -> Vec<(i64, i64, String)> {

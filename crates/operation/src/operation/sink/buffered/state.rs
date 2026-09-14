@@ -62,27 +62,9 @@ impl BufferState {
     }
 }
 
-pub(super) const fn has_batch_id_capacity(buffer: BufferState, next_batch_id: u64) -> bool {
-    next_batch_id != 0 && buffer.pending_events <= u64::MAX - next_batch_id
-}
-
-fn validate_batch_id_capacity(
-    buffer: BufferState,
-    next_batch_id: u64,
-) -> Result<(), OperationError> {
-    if has_batch_id_capacity(buffer, next_batch_id) {
-        Ok(())
-    } else {
-        Err(invalid(
-            "buffered input cannot drain before the batch ID range is exhausted",
-        ))
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct Ready<C> {
     pub(super) buffer: BufferState,
-    pub(super) next_batch_id: u64,
     pub(super) checkpoint: C,
 }
 
@@ -90,7 +72,6 @@ pub(super) struct Ready<C> {
 pub(super) struct Prepared<C, P> {
     pub(super) before: BufferState,
     pub(super) after: BufferState,
-    pub(super) batch_id: u64,
     pub(super) checkpoint: C,
     pub(super) plan: P,
 }
@@ -108,7 +89,6 @@ pub(super) enum Header<'input, C> {
     Prepared {
         before: BufferState,
         after: BufferState,
-        batch_id: u64,
         checkpoint: C,
         encoded_plan: &'input [u8],
     },
@@ -118,22 +98,8 @@ impl<C, P> State<C, P> {
     pub(super) fn validate(&self) -> Result<(), OperationError> {
         match self {
             Self::Initialize => Ok(()),
-            Self::Ready(ready) => {
-                ready.buffer.validate()?;
-                if ready.next_batch_id == 0 {
-                    Err(invalid("next batch ID is zero"))
-                } else {
-                    validate_batch_id_capacity(ready.buffer, ready.next_batch_id)
-                }
-            }
-            Self::Prepared(prepared) => {
-                validate_settlement(prepared.before, prepared.after)?;
-                if prepared.batch_id == 0 || prepared.batch_id == u64::MAX {
-                    Err(invalid("prepared batch ID is outside 1..u64::MAX"))
-                } else {
-                    validate_batch_id_capacity(prepared.after, prepared.batch_id + 1)
-                }
-            }
+            Self::Ready(ready) => ready.buffer.validate(),
+            Self::Prepared(prepared) => validate_settlement(prepared.before, prepared.after),
         }
     }
 
@@ -152,7 +118,6 @@ impl<C, P> State<C, P> {
                 output.push(2);
                 encode_buffer(prepared.before, &mut output);
                 encode_buffer(prepared.after, &mut output);
-                output.extend(prepared.batch_id.to_be_bytes());
                 T::encode_checkpoint(&prepared.checkpoint, &mut output);
                 T::encode_plan(&prepared.plan, &mut output);
             }
@@ -174,7 +139,6 @@ impl<C, P> State<C, P> {
             Header::Prepared {
                 before,
                 after,
-                batch_id,
                 checkpoint,
                 mut encoded_plan,
             } => {
@@ -187,7 +151,6 @@ impl<C, P> State<C, P> {
                 Ok(Self::Prepared(Prepared {
                     before,
                     after,
-                    batch_id,
                     checkpoint,
                     plan,
                 }))
@@ -219,16 +182,10 @@ where
             let before = decode_buffer(&mut input)?;
             let after = decode_buffer(&mut input)?;
             validate_settlement(before, after)?;
-            let batch_id = u64::from_be_bytes(read(&mut input)?);
-            if batch_id == 0 || batch_id == u64::MAX {
-                return Err(invalid("prepared batch ID is outside 1..u64::MAX"));
-            }
-            validate_batch_id_capacity(after, batch_id + 1)?;
             let checkpoint = T::decode_checkpoint(&mut input)?;
             Ok(Header::Prepared {
                 before,
                 after,
-                batch_id,
                 checkpoint,
                 encoded_plan: input,
             })
@@ -239,23 +196,13 @@ where
 
 fn encode_ready<T: SinkTarget>(ready: &Ready<T::Checkpoint>, output: &mut Vec<u8>) {
     encode_buffer(ready.buffer, output);
-    output.extend(ready.next_batch_id.to_be_bytes());
     T::encode_checkpoint(&ready.checkpoint, output);
 }
 
 fn decode_ready<T: SinkTarget>(input: &mut &[u8]) -> Result<Ready<T::Checkpoint>, OperationError> {
     let buffer = decode_buffer(input)?;
-    let next_batch_id = u64::from_be_bytes(read(input)?);
-    if next_batch_id == 0 {
-        return Err(invalid("next batch ID is zero"));
-    }
-    validate_batch_id_capacity(buffer, next_batch_id)?;
     let checkpoint = T::decode_checkpoint(input)?;
-    Ok(Ready {
-        buffer,
-        next_batch_id,
-        checkpoint,
-    })
+    Ok(Ready { buffer, checkpoint })
 }
 
 fn encode_buffer(buffer: BufferState, output: &mut Vec<u8>) {

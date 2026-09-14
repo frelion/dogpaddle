@@ -22,6 +22,10 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
         transform::aggregate::decode_definition,
     ),
     (
+        transform::asof_join::TAG,
+        transform::asof_join::decode_definition,
+    ),
+    (
         transform::distinct::TAG,
         transform::distinct::decode_definition,
     ),

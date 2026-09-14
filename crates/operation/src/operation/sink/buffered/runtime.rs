@@ -12,7 +12,6 @@ use super::{
 };
 use crate::operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation};
 
-const FIRST_BATCH_ID: u64 = 1;
 const MAX_BUFFERED_EVENTS: u64 = 1_048_576;
 const MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DELIVERY_BYTES: u64 = 8 * 1024 * 1024;
@@ -61,7 +60,6 @@ struct PlannedPhase<C, P> {
 struct Delivered<C> {
     before: BufferState,
     after: BufferState,
-    next_batch_id: u64,
     checkpoint: C,
 }
 
@@ -75,7 +73,6 @@ enum Restored<C, P> {
 struct PreparedRestore<'plan, C> {
     before: BufferState,
     after: BufferState,
-    batch_id: u64,
     checkpoint: C,
     encoded_plan: &'plan [u8],
 }
@@ -116,12 +113,9 @@ impl<T: SinkTarget> BufferedSink<T> {
                         }
                         Restored::Ready(ready) => self.phase = Phase::Ready(ready),
                         Restored::Prepared(planned) => {
-                            self.target.deliver(
-                                &planned.delivery,
-                                planned.prepared.batch_id,
-                                &planned.prepared.plan,
-                            )?;
-                            self.phase = Phase::Delivered(delivered(&planned.prepared)?);
+                            self.target
+                                .deliver(&planned.delivery, &planned.prepared.plan)?;
+                            self.phase = Phase::Delivered(delivered(&planned.prepared));
                         }
                     }
                     Ok(())
@@ -153,14 +147,12 @@ impl<T: SinkTarget> BufferedSink<T> {
             Header::Prepared {
                 before,
                 after,
-                batch_id,
                 checkpoint,
                 encoded_plan,
             } => self.restore_prepared(
                 PreparedRestore {
                     before,
                     after,
-                    batch_id,
                     checkpoint,
                     encoded_plan,
                 },
@@ -215,7 +207,6 @@ impl<T: SinkTarget> BufferedSink<T> {
             prepared: Prepared {
                 before: restored.before,
                 after: restored.after,
-                batch_id: restored.batch_id,
                 checkpoint: restored.checkpoint,
                 plan,
             },
@@ -363,7 +354,6 @@ impl<T: SinkTarget> BufferedSink<T> {
     fn publish_ready(&mut self) -> Result<Turn<'_>, OperationError> {
         let ready = Ready {
             buffer: BufferState::EMPTY,
-            next_batch_id: FIRST_BATCH_ID,
             checkpoint: self.target.initial_checkpoint(),
         };
         let encoded = encode_bounded::<T>(&State::Ready(ready.clone()))?;
@@ -384,9 +374,6 @@ impl<T: SinkTarget> BufferedSink<T> {
         admission: Admission,
         ready: Ready<T::Checkpoint>,
     ) -> Result<Turn<'_>, OperationError> {
-        if ready.next_batch_id == u64::MAX {
-            return Err(invalid("batch ID is exhausted"));
-        }
         let retained_bytes = ready
             .buffer
             .retained_bytes
@@ -433,12 +420,9 @@ impl<T: SinkTarget> BufferedSink<T> {
         }))
     }
 
-    fn load(&mut self, ready: Ready<T::Checkpoint>) -> Result<Turn<'_>, OperationError> {
-        if ready.next_batch_id == u64::MAX {
-            return Err(invalid("batch ID is exhausted with buffered input"));
-        }
+    fn load(&mut self, ready: Ready<T::Checkpoint>) -> Turn<'_> {
         let max_events = delivery_event_limit::<T>();
-        Ok(Turn::ready(move |access| {
+        Turn::ready(move |access| {
             let loaded = batch::load(
                 &self.buffer,
                 ready.buffer,
@@ -458,7 +442,7 @@ impl<T: SinkTarget> BufferedSink<T> {
                     Ok(())
                 }),
             ))
-        }))
+        })
     }
 
     fn plan(&mut self) -> Result<Turn<'_>, OperationError> {
@@ -466,13 +450,10 @@ impl<T: SinkTarget> BufferedSink<T> {
             Phase::Loaded(loaded) => (loaded.ready.clone(), loaded.batch.clone()),
             _ => unreachable!("plan is called only for a loaded batch"),
         };
-        let (checkpoint, plan) =
-            self.target
-                .prepare(&loaded.delivery, &ready.checkpoint, ready.next_batch_id)?;
+        let (checkpoint, plan) = self.target.prepare(&loaded.delivery, &ready.checkpoint)?;
         let prepared = Prepared {
             before: ready.buffer,
             after: loaded.after,
-            batch_id: ready.next_batch_id,
             checkpoint,
             plan,
         };
@@ -495,9 +476,8 @@ impl<T: SinkTarget> BufferedSink<T> {
                 Action::Commit(None),
                 AfterCommit::new(move || {
                     self.phase = Phase::Failed;
-                    self.target
-                        .deliver(&delivery, prepared.batch_id, &prepared.plan)?;
-                    self.phase = Phase::Delivered(delivered(&prepared)?);
+                    self.target.deliver(&delivery, &prepared.plan)?;
+                    self.phase = Phase::Delivered(delivered(&prepared));
                     Ok(())
                 }),
             ))
@@ -507,7 +487,6 @@ impl<T: SinkTarget> BufferedSink<T> {
     fn settle(&mut self, delivered: Delivered<T::Checkpoint>) -> Result<Turn<'_>, OperationError> {
         let ready = Ready {
             buffer: delivered.after,
-            next_batch_id: delivered.next_batch_id,
             checkpoint: delivered.checkpoint,
         };
         let encoded = encode_bounded::<T>(&State::Ready(ready.clone()))?;
@@ -585,11 +564,8 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
                         ),
                         None => Ok(Turn::Idle),
                     }
-                } else if input.is_none()
-                    || should_drain::<T>(&ready)
-                    || ready.next_batch_id == u64::MAX
-                {
-                    self.load(ready)
+                } else if input.is_none() || should_drain::<T>(&ready) {
+                    Ok(self.load(ready))
                 } else {
                     match prepare_admission(
                         &self.target,
@@ -598,7 +574,7 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
                         input.expect("the offered input was checked"),
                     ) {
                         Ok(admission) if fits(&ready, &admission) => self.admit(admission, ready),
-                        Ok(_) | Err(_) => self.load(ready),
+                        Ok(_) | Err(_) => Ok(self.load(ready)),
                     }
                 }
             }
@@ -667,13 +643,6 @@ fn fits<C>(ready: &Ready<C>, admission: &Admission) -> bool {
         .checked_add(admission.item_bytes)
         .is_some_and(|bytes| bytes <= MAX_RETAINED_BYTES)
         && pending_events <= MAX_BUFFERED_EVENTS
-        && state::has_batch_id_capacity(
-            BufferState {
-                pending_events,
-                ..ready.buffer
-            },
-            ready.next_batch_id,
-        )
         && ready.buffer.tail.checked_add(1).is_some()
 }
 
@@ -703,17 +672,12 @@ fn validate_capacity(buffer: BufferState) -> Result<(), OperationError> {
     }
 }
 
-fn delivered<C: Clone, P>(prepared: &Prepared<C, P>) -> Result<Delivered<C>, OperationError> {
-    let next_batch_id = prepared
-        .batch_id
-        .checked_add(1)
-        .ok_or_else(|| invalid("batch ID is exhausted"))?;
-    Ok(Delivered {
+fn delivered<C: Clone, P>(prepared: &Prepared<C, P>) -> Delivered<C> {
+    Delivered {
         before: prepared.before,
         after: prepared.after,
-        next_batch_id,
         checkpoint: prepared.checkpoint.clone(),
-    })
+    }
 }
 
 fn encode_bounded<T: SinkTarget>(

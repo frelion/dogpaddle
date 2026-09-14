@@ -1,7 +1,9 @@
-//! Crate-private exact-row state shared by relational operations.
+//! Crate-private row identity and ordering shared by relational operations.
 
+mod order;
 mod row;
 
+pub(crate) use order::{OrderError, indexable, order_key, ordered_value};
 pub(crate) use row::{
     RowError, canonical_row, canonical_row_bounded, canonical_row_size_bounded,
     decode_canonical_row, encode_canonical, row_hash,

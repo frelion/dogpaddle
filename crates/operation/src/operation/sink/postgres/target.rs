@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+use std::{fmt::Write as _, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
@@ -7,7 +7,9 @@ use tokio_postgres::{Client, GenericClient, IsolationLevel, types::ToSql};
 
 use crate::operation::{
     OperationError,
-    sink::relation::{Batch, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget},
+    sink::relation::{
+        Batch, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget, group_mutations,
+    },
 };
 
 use super::{
@@ -262,41 +264,33 @@ fn encode_mutation_groups(
     input: &Change,
     batch: &Batch,
 ) -> Result<(Vec<EncodedMutationGroup>, Vec<i64>), PostgresSinkError> {
-    #[derive(Default)]
-    struct Ids {
-        inserts: Vec<i64>,
-        mutations: Vec<i64>,
-    }
-
-    let mut by_row = BTreeMap::<u64, Ids>::new();
-    for insert in &batch.inserts {
-        let id = positive_i64(insert.technical_id)?;
-        let group = by_row.entry(insert.row_index).or_default();
-        group.inserts.push(id);
-        group.mutations.push(id);
-    }
-    let mut deletes = Vec::with_capacity(batch.deletes.len());
-    for delete in &batch.deletes {
-        let id = positive_i64(delete.technical_id)?;
-        by_row
-            .entry(delete.row_index)
-            .or_default()
-            .mutations
-            .push(id);
-        deletes.push(id);
-    }
-    let groups = by_row
+    let mutations = group_mutations(batch);
+    let groups = mutations
+        .rows
         .into_iter()
-        .map(|(row_index, ids)| {
-            let row_index = usize::try_from(row_index)
+        .map(|group| {
+            let row_index = usize::try_from(group.row_index)
                 .map_err(|_| invalid_batch("mutation row index exceeds usize"))?;
             Ok(EncodedMutationGroup {
-                insert_ids: ids.inserts,
-                mutation_ids: ids.mutations,
+                insert_ids: group
+                    .insert_ids
+                    .into_iter()
+                    .map(positive_i64)
+                    .collect::<Result<_, _>>()?,
+                mutation_ids: group
+                    .mutation_ids
+                    .into_iter()
+                    .map(positive_i64)
+                    .collect::<Result<_, _>>()?,
                 row: Arc::new(codec.encode_row(input.records(), row_index)?),
             })
         })
         .collect::<Result<Vec<_>, PostgresSinkError>>()?;
+    let deletes = mutations
+        .delete_ids
+        .into_iter()
+        .map(positive_i64)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((groups, deletes))
 }
 
