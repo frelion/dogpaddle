@@ -350,6 +350,7 @@ fn turn_transform_can_head_an_atomic_tail_but_cannot_be_appended() {
             EquiJoinKind::Inner,
             [(col("value"), col("value"))],
             ["left_value", "right_value"],
+            None,
         )
         .unwrap()
     };

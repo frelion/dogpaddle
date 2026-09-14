@@ -191,6 +191,7 @@ fn join_definition() -> EquiJoinDefinition {
         EquiJoinKind::Inner,
         [(col("value"), col("value"))],
         ["left", "right"],
+        None,
     )
     .unwrap()
 }

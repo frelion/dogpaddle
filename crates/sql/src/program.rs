@@ -15,7 +15,7 @@ use crate::{
     syntax,
 };
 
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1";
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v2";
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
 pub struct SqlProgram {
@@ -247,7 +247,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "494fa9fd8fed1f9d806f55fcf40e609697e2d2d3e4650398ce72077332328103"
+            "a2811217c8fd2db48eedeabe08351f5a264613b5ff53950b90c2c31e2d1c0daf"
         );
     }
 

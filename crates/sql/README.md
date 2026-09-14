@@ -186,13 +186,16 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 - Inner、Left/Right/Full Outer、Left/Right Semi、Left/Right Anti Join；
 - 非空 `GROUP BY`，`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`，以及只有分组字段的查询。
 
-每个 Join 至少有一个跨左右输入的等值 key。Inner Join 可以把剩余条件编译为 Join 后同 Station 的 Atomic Filter；Outer、Semi 和 Anti 只接受等值合取。Right Join 通过交换输入复用 Left 语义，再用同 Station 的 `SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、名称、nullability 和 metadata。
+每个 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
+Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
+Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
+`SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、名称、nullability 和 metadata。
 
 明确拒绝：
 
 - 普通表或未注册函数；
 - `SELECT ALL`、`DISTINCT ON`、普通 `UNION` 和非 positional `UNION ALL`；
-- Cross、Natural、Using、纯非等值 Join，以及 Outer/Semi/Anti residual；
+- Cross、Natural、Using 和没有跨输入等值 key 的纯非等值 Join；
 - 空 `GROUP BY` 的 global aggregate、grouping sets、aggregate modifier、聚合 UDF 和不支持的类型；
 - Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
 - 会在规划时丢失语义的 sampling、hint、row lock、typed alias 等语法。

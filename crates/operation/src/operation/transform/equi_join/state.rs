@@ -7,6 +7,37 @@ use super::EquiJoinError;
 pub(super) type Rows = PartitionedMultiset<Vec<u8>, Vec<u8>>;
 pub(super) type Continuation = Cell<JoinContinuation>;
 pub(super) type Counts = OrderedMap<Vec<u8>, KeyCounts>;
+pub(super) type MatchCounts = OrderedMap<Vec<u8>, u64>;
+
+const ACTUAL_MATCH_DOMAIN: u8 = 0;
+const SHADOW_MATCH_DOMAIN: u8 = 1;
+const AFTER_SHADOW_MATCH_DOMAIN: u8 = 2;
+
+/// Returns the collision-free key for one row's committed qualifying-match count.
+pub(super) fn actual_match_key(port: usize, row: &[u8]) -> Vec<u8> {
+    match_key(ACTUAL_MATCH_DOMAIN, port, row)
+}
+
+/// Returns the collision-free key for one row's preflight shadow count.
+pub(super) fn shadow_match_key(port: usize, row: &[u8]) -> Vec<u8> {
+    match_key(SHADOW_MATCH_DOMAIN, port, row)
+}
+
+/// Returns the exclusive ordered-map range containing every preflight shadow count.
+pub(super) fn shadow_match_range() -> std::ops::Range<Vec<u8>> {
+    vec![SHADOW_MATCH_DOMAIN]..vec![AFTER_SHADOW_MATCH_DOMAIN]
+}
+
+fn match_key(domain: u8, port: usize, row: &[u8]) -> Vec<u8> {
+    let port = u8::try_from(port)
+        .ok()
+        .filter(|port| *port <= 1)
+        .expect("a validated equi-join port is zero or one");
+    let mut key = Vec::with_capacity(row.len().saturating_add(2));
+    key.extend_from_slice(&[domain, port]);
+    key.extend_from_slice(row);
+    key
+}
 
 /// Positive distinct rows per side; a missing key represents two zero counts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,11 +91,12 @@ impl StoreValue for KeyCounts {
     }
 }
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Phase {
     Probe,
+    ClearShadow,
     Emit,
 }
 
@@ -73,6 +105,7 @@ pub(super) struct JoinContinuation {
     pub(super) port: u8,
     pub(super) phase: Phase,
     pub(super) row: u64,
+    pub(super) found_match: bool,
     pub(super) resume_after: Option<Vec<u8>>,
 }
 
@@ -83,9 +116,11 @@ impl StoreValue for JoinContinuation {
         encoded.push(self.port);
         encoded.push(match self.phase {
             Phase::Probe => 0,
-            Phase::Emit => 1,
+            Phase::ClearShadow => 1,
+            Phase::Emit => 2,
         });
         encoded.extend_from_slice(&self.row.to_be_bytes());
+        encoded.push(u8::from(self.found_match));
         match &self.resume_after {
             None => encoded.push(0),
             Some(resume) => {
@@ -112,10 +147,20 @@ impl StoreValue for JoinContinuation {
         }
         let phase = match cursor.u8()? {
             0 => Phase::Probe,
-            1 => Phase::Emit,
+            1 => Phase::ClearShadow,
+            2 => Phase::Emit,
             _ => return Err(CodecError::new("equi-join continuation phase is invalid")),
         };
         let row = cursor.u64()?;
+        let found_match = match cursor.u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(CodecError::new(
+                    "equi-join continuation match marker is invalid",
+                ));
+            }
+        };
         let resume_after = match cursor.u8()? {
             0 => None,
             1 => {
@@ -135,6 +180,7 @@ impl StoreValue for JoinContinuation {
             port,
             phase,
             row,
+            found_match,
             resume_after,
         })
     }
@@ -239,15 +285,16 @@ mod tests {
             port: 1,
             phase: Phase::Emit,
             row: 7,
+            found_match: true,
             resume_after: Some(Vec::new()),
         };
         let encoded = state.encode_value().unwrap().as_ref().to_vec();
         assert_eq!(
             encoded,
             [
-                &[1, 1, 1][..],
+                &[2, 1, 2][..],
                 &7_u64.to_be_bytes(),
-                &[1],
+                &[1, 1],
                 &0_u64.to_be_bytes(),
             ]
             .concat()
@@ -259,13 +306,22 @@ mod tests {
         for length in 0..encoded.len() {
             assert!(JoinContinuation::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
         }
-        for index in [0, 1, 2, 11] {
+        for index in [0, 1, 2, 11, 12] {
             let mut invalid = encoded.clone();
-            invalid[index] = 2;
+            invalid[index] = u8::MAX;
             assert!(JoinContinuation::decode_value(Cow::Borrowed(&invalid)).is_err());
         }
         let mut trailing = encoded;
         trailing.push(0);
         assert!(JoinContinuation::decode_value(Cow::Borrowed(&trailing)).is_err());
+    }
+
+    #[test]
+    fn match_count_key_domains_are_disjoint_and_preserve_the_canonical_row() {
+        assert_eq!(actual_match_key(0, &[]), [0, 0]);
+        assert_eq!(actual_match_key(1, &[0, 1, 2]), [0, 1, 0, 1, 2]);
+        assert_eq!(shadow_match_key(0, &[0, 1, 2]), [1, 0, 0, 1, 2]);
+        assert_eq!(shadow_match_key(1, &[]), [1, 1]);
+        assert_eq!(shadow_match_range(), vec![1]..vec![2]);
     }
 }

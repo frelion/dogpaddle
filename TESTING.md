@@ -45,8 +45,9 @@ MIN/MAX 首尾选择与 reopen，以及不变结果不产生冗余 output。函�
 
 EquiJoin 的 owner 文件必须用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 与 FullOuter，
 并证明 tag `16` 的 kind payload、Inner 三资源与其余 kind 四资源、NULL key、重复权重、同一 Claim 内的
-presence 往返、outer nullability、正负 diff 边界、分页 rollback 和 Probe/Emit reopen。SQL 只证明
-Right Join 的 swap + SchemaAlign、Inner residual 的 Atomic 尾链，以及每种新增 LogicalPlan lowering
+presence 往返、outer nullability、正负 diff 边界、分页 rollback 和 Probe/Emit reopen；residual 还必须
+覆盖逐完整行 support、`FALSE/NULL`、Probe/ClearShadow/Emit reopen 与 rollback。SQL 只证明
+Right Join 的 swap + SchemaAlign、原生 residual 的方向改写，以及每种新增 LogicalPlan lowering
 至少一个最终关系 witness，不复制 Join 状态机。
 
 ### Flow
@@ -73,8 +74,9 @@ Store/source I/O 前完成、准确映射到具体 connector、bootstrap heartbe
 SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言构建或一次 advance 成功。Distinct witness 必须跨 drop/start，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/start；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/start 后持久 position；语义相同但格式或 endpoint 参数顺序不同的 SQL 必须能恢复，语义或持久 endpoint 身份不同的 Program 必须因 owner identity mismatch 失败且不能替换磁盘 Definition。损坏、不完整、已存在但不可打开或被占用的状态不得触发自动重建。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 start 幂等重投；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 start 会恢复既有状态、丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
 
 Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 drop/start 恢复；
-Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 必须证明 `EquiJoin → SchemaAlign → Filter`
-仍在一个 Transform Station；Outer/Semi/Anti residual、Cross/Natural/Using、纯非等值和同侧 equality 必须在创建 Flow 前拒绝。
+Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join family 的 residual 必须证明 predicate
+原生进入 `EquiJoin`，并覆盖同 key 下同时存在通过与不通过的候选；Cross/Natural/Using、纯非等值和
+同侧 equality 必须在创建 Flow 前拒绝。
 
 `system-tests/postgres/check_sql.py --trace-output ...` 可在完整验收通过后导出该场景的 SQL、
 宿主 I/O、SIGKILL、PostgreSQL 重放日志和关系快照，供 [持续 ETL 演示](docs/demo/README.md) 排版。
@@ -128,7 +130,8 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 
 | `change_codec` | Change 自有五路旋转 runner |
 | `cell` | Criterion |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、重复 MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
-| `equi_join` | Operation 自有 Criterion：Inner first/last match、Semi 稳定与 first/last presence、Full Outer first/last transition；两个完整 Claim 的 Probe/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
+| `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的 Probe/ClearShadow/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
+| `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `ordered_map` | Criterion；完整 owned-page 扫描 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
@@ -137,7 +140,9 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。Inner residual 
 
 自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
-Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime` 的自有 runner 同样设置 `test = true`，test mode 自动选择小规模 smoke 并执行完整结构与 durable oracle；其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
+`equi_join_resources` 的每个 case 必须在新子进程中建立 fixture、seed 与 driving Change，再启动一个 `dhat 0.3.3` profiler 覆盖恰好一个完整 Claim。heap 数字只表示经过 Rust global allocator 的 total/current/peak bytes 与 blocks，不包含 profiler 启动前的输入 Arrow/seed/fixture，也不包含 RocksDB native heap。输出 Arrow array memory 单独按每个 Change 的 `get_array_memory_size` 累计；FullOuter 状态另用不受 profiler 影响的独立 pass 在每次 commit 后扫描 `equi_join.match_counts`，只记录实际/影子 entry 数及 decoded key + `u64` 逻辑字节，不代表 WAL、LSM、cache、压缩或文件系统占用。portable runner 不采集平台单位不一致的 RSS，JSONL 中必须保留 `rss_bytes: null` 和原因，各口径不得互相替代。
+
+Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime` 与 `equi_join_resources` 的自有 runner 同样设置 `test = true`；test mode 自动选择小规模 workload，后者仍逐 case 启动隔离子进程。其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
 `flow_runtime` 的线性链对照固定使用相同的 SequenceScan→Project→Extend→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局是 7 个 Station、6 个 durable output log 和 6 条 input edge；融合布局通过 `FlowFactory::append` 把五个 transform 放入 Scan Station，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。这些 commit 与 append 是 Flow 协议层的语义计数，不是 RocksDB 内部计数。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration 或历史累计 IPC bytes，JSONL context 必须把两项记为 unavailable，不能用均摊延迟或当前 retained bytes 冒充。
 
@@ -187,6 +192,7 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ord
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join_resources
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```

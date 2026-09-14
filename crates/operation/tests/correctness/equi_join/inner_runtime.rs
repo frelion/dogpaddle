@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
@@ -47,6 +47,7 @@ fn definition() -> EquiJoinDefinition {
         EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "left_label", "right_fk", "right_amount"],
+        None,
     )
     .unwrap()
 }
@@ -204,11 +205,15 @@ fn inner_binding_preserves_field_metadata_and_requires_named_data() {
 
 #[test]
 fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
+    assert!(EquiJoinDefinition::supports_key_type(&DataType::UInt64));
+    assert!(!EquiJoinDefinition::supports_key_type(&DataType::Float64));
+
     assert!(matches!(
         EquiJoinDefinition::try_new(
             EquiJoinKind::Inner,
             std::iter::empty::<(Expr, Expr)>(),
-            ["value"]
+            ["value"],
+            None,
         ),
         Err(EquiJoinDefinitionError::EmptyKeys)
     ));
@@ -217,6 +222,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         EquiJoinKind::Inner,
         [(col("id"), col("amount"))],
         ["left_id", "left_label", "right_fk", "right_amount"],
+        None,
     )
     .unwrap();
     let Err(OperationBindError::Rejected { source }) =
@@ -238,6 +244,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         EquiJoinKind::Inner,
         [(col("key"), col("key"))],
         ["left_key", "right_key"],
+        None,
     )
     .unwrap();
     let Err(OperationBindError::Rejected { source }) =
@@ -250,9 +257,13 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         Some(EquiJoinSchemaError::UnsupportedKeyType { key: 0, .. })
     ));
 
-    let wrong_count =
-        EquiJoinDefinition::try_new(EquiJoinKind::Inner, [(col("id"), col("fk"))], ["only_one"])
-            .unwrap();
+    let wrong_count = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
+        [(col("id"), col("fk"))],
+        ["only_one"],
+        None,
+    )
+    .unwrap();
     assert!(matches!(
         bind(&wrong_count, &[left_schema(), right_schema()]),
         Err(OperationBindError::Rejected { .. })
@@ -261,6 +272,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
         EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["same", "same", "third", "fourth"],
+        None,
     )
     .unwrap();
     assert!(matches!(
@@ -541,6 +553,7 @@ fn composite_variable_width_keys_keep_component_boundaries() {
         EquiJoinKind::Inner,
         [(col("a"), col("x")), (col("b"), col("y"))],
         ["a", "b", "left_value", "x", "y", "right_value"],
+        None,
     )
     .unwrap();
     let root = TestStore::new();
@@ -704,6 +717,78 @@ fn sparse_large_rows_respect_the_turn_byte_budget() {
 }
 
 #[test]
+fn residual_wide_candidates_are_split_by_scalar_working_set() {
+    const VALUE_FIELDS: usize = 128;
+    const RIGHT_ROWS: usize = 129;
+
+    let schema = Arc::new(Schema::new(
+        std::iter::once(Field::new("key", DataType::UInt64, false))
+            .chain(
+                (0..VALUE_FIELDS)
+                    .map(|field| Field::new(format!("value_{field}"), DataType::Int64, false)),
+            )
+            .collect::<Vec<_>>(),
+    ));
+    let output_names = (0..schema.fields().len())
+        .map(|field| format!("left_{field}"))
+        .chain((0..schema.fields().len()).map(|field| format!("right_{field}")))
+        .collect::<Vec<_>>();
+    let definition = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
+        [(col("key"), col("key"))],
+        output_names,
+        Some(col("left.value_0").lt(col("right.value_0"))),
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let mut store = Store::create(root.path()).unwrap();
+    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
+        declaration.create(&mut store, physical).unwrap();
+    }
+    let mut operation = materialize(
+        &definition,
+        &[Arc::clone(&schema), Arc::clone(&schema)],
+        &store,
+        &PHYSICAL_DATA,
+    );
+    let mut transactions = store.into_transactions();
+
+    let right_values = (1..=RIGHT_ROWS)
+        .map(|value| i64::try_from(value).unwrap())
+        .collect::<Vec<_>>();
+    let mut right_columns = Vec::<ArrayRef>::with_capacity(VALUE_FIELDS + 1);
+    right_columns.push(Arc::new(UInt64Array::from(vec![7; RIGHT_ROWS])));
+    right_columns.push(Arc::new(Int64Array::from(right_values)));
+    right_columns.extend(
+        (1..VALUE_FIELDS).map(|_| Arc::new(Int64Array::from(vec![0; RIGHT_ROWS])) as ArrayRef),
+    );
+    let right = Change::try_new(
+        RecordBatch::try_new(Arc::clone(&schema), right_columns).unwrap(),
+        Int64Array::from(vec![1; RIGHT_ROWS]),
+    )
+    .unwrap();
+    run_claim(&mut operation, &mut transactions, 1, &right).unwrap();
+
+    let mut left_columns = Vec::<ArrayRef>::with_capacity(VALUE_FIELDS + 1);
+    left_columns.push(Arc::new(UInt64Array::from(vec![7])));
+    left_columns.extend((0..VALUE_FIELDS).map(|_| Arc::new(Int64Array::from(vec![0])) as ArrayRef));
+    let left = Change::try_new(
+        RecordBatch::try_new(schema, left_columns).unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+    let (outputs, turns) =
+        run_claim_with_turns(&mut operation, &mut transactions, 0, &left).unwrap();
+
+    assert_eq!(
+        outputs.iter().map(Change::num_rows).sum::<usize>(),
+        RIGHT_ROWS
+    );
+    assert!(turns >= 5);
+    assert!(outputs.iter().all(|output| output.num_rows() <= 63));
+}
+
+#[test]
 fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     let root = TestStore::new();
     let definition = definition();
@@ -820,6 +905,7 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
         EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "payload", "right_fk", "ordinal"],
+        None,
     )
     .unwrap();
     let root = TestStore::new();
@@ -873,7 +959,7 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
 }
 
 #[test]
-fn semi_and_anti_presence_budget_does_not_repeat_the_unemitted_driving_row() {
+fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phase() {
     const MATCHES: usize = 32;
     const PRESENCE_DATA: [&str; 4] = ["left-rows", "right-rows", "continuation", "key-counts"];
 
@@ -900,7 +986,8 @@ fn semi_and_anti_presence_budget_does_not_repeat_the_unemitted_driving_row() {
     )
     .unwrap();
     // This row exceeds the half-turn scan budget. Semi/Anti output only the
-    // matched left rows, so its payload must not be charged once per match.
+    // matched left rows, so its payload is charged once in Probe and once in
+    // Emit, rather than once for each match.
     let payload = "x".repeat(2_200_000);
     let right_change = |difference| {
         Change::try_new(
@@ -927,6 +1014,7 @@ fn semi_and_anti_presence_budget_does_not_repeat_the_unemitted_driving_row() {
             kind,
             [(col("key"), col("key"))],
             ["left_key", "left_value"],
+            None,
         )
         .unwrap();
         let root = TestStore::new();
@@ -948,7 +1036,10 @@ fn semi_and_anti_presence_budget_does_not_repeat_the_unemitted_driving_row() {
         {
             let (outputs, turns) =
                 run_claim_with_turns(&mut operation, &mut transactions, 1, input).unwrap();
-            assert_eq!(turns, 1, "{kind:?} repeated the right driving row budget");
+            assert_eq!(
+                turns, 2,
+                "{kind:?} did not charge the right driving row once per phase"
+            );
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].num_rows(), MATCHES);
             assert!(
@@ -976,6 +1067,7 @@ fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
         EquiJoinKind::Inner,
         [(col("id"), col("fk"))],
         ["left_id", "ordinal", "right_fk", "payload"],
+        None,
     )
     .unwrap();
     let root = TestStore::new();
