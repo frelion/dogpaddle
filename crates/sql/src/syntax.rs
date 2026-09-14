@@ -291,10 +291,8 @@ fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
         }
         match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(condition))
-            | JoinOperator::Inner(JoinConstraint::On(condition)) => {
-                validate_inner_join_condition(condition)?;
-            }
-            JoinOperator::Left(JoinConstraint::On(condition))
+            | JoinOperator::Inner(JoinConstraint::On(condition))
+            | JoinOperator::Left(JoinConstraint::On(condition))
             | JoinOperator::LeftOuter(JoinConstraint::On(condition))
             | JoinOperator::Right(JoinConstraint::On(condition))
             | JoinOperator::RightOuter(JoinConstraint::On(condition))
@@ -357,7 +355,7 @@ fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
     }
 }
 
-fn validate_inner_join_condition(condition: &Expr) -> Result<(), SqlError> {
+fn validate_join_condition(condition: &Expr) -> Result<(), SqlError> {
     fn contains_equality_conjunct(condition: &Expr) -> bool {
         match condition {
             Expr::Nested(condition) => contains_equality_conjunct(condition),
@@ -378,29 +376,8 @@ fn validate_inner_join_condition(condition: &Expr) -> Result<(), SqlError> {
         Ok(())
     } else {
         Err(SqlError::Unsupported(
-            "INNER JOIN requires an equality conjunct".to_owned(),
+            "JOIN requires an equality conjunct".to_owned(),
         ))
-    }
-}
-
-fn validate_join_condition(condition: &Expr) -> Result<(), SqlError> {
-    match condition {
-        Expr::Nested(condition) => validate_join_condition(condition),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            validate_join_condition(left)?;
-            validate_join_condition(right)
-        }
-        Expr::BinaryOp {
-            op: BinaryOperator::Eq,
-            ..
-        } => Ok(()),
-        _ => Err(SqlError::Unsupported(
-            "JOIN condition other than equality conjunction".to_owned(),
-        )),
     }
 }
 

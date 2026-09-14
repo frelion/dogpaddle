@@ -37,6 +37,7 @@ tokio-postgres.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+dhat.workspace = true
 dogpaddle-perf-context.workspace = true
 tempfile.workspace = true
 
@@ -52,6 +53,11 @@ test = true
 
 [[bench]]
 name = "buffered_sink"
+harness = false
+test = true
+
+[[bench]]
+name = "equi_join_resources"
 harness = false
 test = true
 

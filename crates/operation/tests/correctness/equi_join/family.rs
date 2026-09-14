@@ -2,15 +2,21 @@ use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
 use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, placeholder};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationDefinition, OperationKind, col, decode_definition,
+    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, col,
+    decode_definition, lit,
     operation::{
         Action, Operation, OperationError, OperationInput,
-        transform::{EquiJoinDefinition, EquiJoinError, EquiJoinKind},
+        transform::{
+            EquiJoinDefinition, EquiJoinDefinitionError, EquiJoinError, EquiJoinKind,
+            EquiJoinSchemaError,
+        },
     },
 };
-use dogpaddle_store::{PartitionedMultiset, Store, Transactions};
+use dogpaddle_store::{Cell, PartitionedMultiset, Store, Transactions};
 
 use crate::support::{
     TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
@@ -35,6 +41,8 @@ const LEFT_SEMI_V1: &str = include_str!("../../fixtures/v1/equi_join_left_semi.h
 const LEFT_ANTI_V1: &str = include_str!("../../fixtures/v1/equi_join_left_anti.hex");
 const LEFT_OUTER_V1: &str = include_str!("../../fixtures/v1/equi_join_left_outer.hex");
 const FULL_OUTER_V1: &str = include_str!("../../fixtures/v1/equi_join_full_outer.hex");
+const LEFT_SEMI_RESIDUAL_V1: &str =
+    include_str!("../../fixtures/v1/equi_join_left_semi_residual.hex");
 const OLD_INNER_ONLY_TAG_16_V1: &str = "
 646f67706164646c652e6f7065726174696f6e0000010010
 00000001000000060a040a026964000000060a040a02666b
@@ -69,6 +77,17 @@ struct InputEvent {
 struct NaiveRelation {
     left: BTreeMap<InputRow, u64>,
     right: BTreeMap<InputRow, u64>,
+    residual: ResidualCase,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ResidualCase {
+    #[default]
+    None,
+    GreaterThan,
+    LessThan,
+    False,
+    Null,
 }
 
 struct Fixture {
@@ -78,6 +97,8 @@ struct Fixture {
     operation: Operation,
     transactions: Transactions,
 }
+
+type ResidualErrorPredicate = fn(&EquiJoinSchemaError) -> bool;
 
 fn left_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -103,12 +124,21 @@ fn output_names(kind: EquiJoinKind) -> &'static [&'static str] {
 }
 
 fn definition(kind: EquiJoinKind) -> EquiJoinDefinition {
+    definition_with_residual(kind, ResidualCase::None)
+}
+
+fn definition_with_residual(kind: EquiJoinKind, residual: ResidualCase) -> EquiJoinDefinition {
     EquiJoinDefinition::try_new(
         kind,
         [(col("key"), col("key"))],
         output_names(kind).iter().copied(),
+        residual.expression(),
     )
     .unwrap()
+}
+
+fn residual_definition(kind: EquiJoinKind) -> EquiJoinDefinition {
+    definition_with_residual(kind, ResidualCase::GreaterThan)
 }
 
 fn input_change(port: usize, events: &[InputEvent]) -> Change {
@@ -143,7 +173,11 @@ fn input_change(port: usize, events: &[InputEvent]) -> Change {
 
 impl Fixture {
     fn new(kind: EquiJoinKind) -> Self {
-        let definition = definition(kind);
+        Self::with_residual(kind, ResidualCase::None)
+    }
+
+    fn with_residual(kind: EquiJoinKind, residual: ResidualCase) -> Self {
+        let definition = definition_with_residual(kind, residual);
         let root = TestStore::new();
         let store = create_store(&root, &definition);
         let operation = open_operation(&store, &definition);
@@ -207,12 +241,7 @@ impl Fixture {
         )
     }
 
-    fn adjust_raw_row(self, port: usize, key: &[u8], row: &[u8], difference: i64) -> Self {
-        assert_eq!(
-            self.kind,
-            EquiJoinKind::Inner,
-            "raw row injection intentionally bypasses counted-kind key_counts"
-        );
+    fn corrupt_raw_row(self, port: usize, key: &[u8], row: &[u8], difference: i64) -> Self {
         let Self {
             kind,
             definition,
@@ -246,6 +275,60 @@ impl Fixture {
             root,
             operation,
             transactions,
+        }
+    }
+
+    fn rewrite_raw_continuation(self, rewrite: impl FnOnce(&mut Vec<u8>)) -> Self {
+        let Self {
+            kind,
+            definition,
+            root,
+            operation,
+            transactions,
+        } = self;
+        drop((operation, transactions));
+
+        let store = Store::open(root.path()).unwrap();
+        let raw: Cell<Vec<u8>> = store.open_data("equi_join.continuation").unwrap();
+        let operation = open_operation(&store, &definition);
+        let mut transactions = store.into_transactions();
+        let transaction = transactions.begin();
+        let mut raw = raw.access(transaction.access()).unwrap();
+        let mut value = raw
+            .get()
+            .unwrap()
+            .expect("the test requires a continuation");
+        rewrite(&mut value);
+        raw.set(&value).unwrap();
+        transaction.commit().unwrap();
+
+        Self {
+            kind,
+            definition,
+            root,
+            operation,
+            transactions,
+        }
+    }
+}
+
+impl ResidualCase {
+    fn expression(self) -> Option<Expr> {
+        match self {
+            Self::None => None,
+            Self::GreaterThan => Some(col("left.left_value").gt(col("right.right_value"))),
+            Self::LessThan => Some(col("left.left_value").lt(col("right.right_value"))),
+            Self::False => Some(lit(false)),
+            Self::Null => Some(lit(ScalarValue::Boolean(None))),
+        }
+    }
+
+    fn matches(self, left: &InputRow, right: &InputRow) -> bool {
+        match self {
+            Self::None => true,
+            Self::GreaterThan => left.value > right.value,
+            Self::LessThan => left.value < right.value,
+            Self::False | Self::Null => false,
         }
     }
 }
@@ -378,6 +461,13 @@ fn assert_outer_corrections_are_paired(outputs: &[Change]) {
 }
 
 impl NaiveRelation {
+    fn with_residual(residual: ResidualCase) -> Self {
+        Self {
+            residual,
+            ..Self::default()
+        }
+    }
+
     fn apply_claim(
         &mut self,
         kind: EquiJoinKind,
@@ -420,7 +510,7 @@ impl NaiveRelation {
             let matches = self
                 .right
                 .iter()
-                .filter(|(right, _)| matchable(left, right))
+                .filter(|(right, _)| self.matchable(left, right))
                 .collect::<Vec<_>>();
             match kind {
                 EquiJoinKind::Inner => {
@@ -447,7 +537,7 @@ impl NaiveRelation {
         }
         if kind == EquiJoinKind::FullOuter {
             for (right, right_weight) in &self.right {
-                let matched = self.left.keys().any(|left| matchable(left, right));
+                let matched = self.left.keys().any(|left| self.matchable(left, right));
                 if !matched {
                     add_weight(
                         &mut output,
@@ -459,10 +549,10 @@ impl NaiveRelation {
         }
         output
     }
-}
 
-fn matchable(left: &InputRow, right: &InputRow) -> bool {
-    left.key.is_some() && left.key == right.key
+    fn matchable(&self, left: &InputRow, right: &InputRow) -> bool {
+        left.key.is_some() && left.key == right.key && self.residual.matches(left, right)
+    }
 }
 
 fn add_matches(
@@ -652,6 +742,69 @@ fn oracle_claims() -> Vec<(usize, Vec<InputEvent>)> {
     ]
 }
 
+fn residual_oracle_claims(residual: ResidualCase) -> Vec<(usize, Vec<InputEvent>)> {
+    let (dominant_left, marginal_left, first_right, second_right, roundtrip_right, never) =
+        match residual {
+            ResidualCase::GreaterThan => (10, 5, 7, 4, 3, (1, 20)),
+            ResidualCase::LessThan => (0, 5, 3, 6, 7, (20, 1)),
+            _ => panic!("the relational residual oracle needs an ordered predicate"),
+        };
+    vec![
+        (
+            0,
+            vec![
+                event(Some(1), dominant_left, 2),
+                event(Some(1), marginal_left, 1),
+                event(Some(2), never.0, 1),
+                event(None, 99, 1),
+            ],
+        ),
+        (
+            1,
+            vec![
+                event(Some(1), first_right, 3),
+                event(Some(2), never.1, 1),
+                event(None, -99, 2),
+            ],
+        ),
+        (
+            1,
+            vec![
+                event(Some(1), first_right, 2),
+                event(Some(1), first_right, -1),
+            ],
+        ),
+        (1, vec![event(Some(1), second_right, 1)]),
+        (
+            0,
+            vec![
+                event(Some(1), dominant_left, -1),
+                event(Some(1), marginal_left, 2),
+                event(Some(1), marginal_left, -1),
+            ],
+        ),
+        (1, vec![event(Some(1), first_right, -4)]),
+        (1, vec![event(Some(1), second_right, -1)]),
+        (
+            1,
+            vec![
+                event(Some(1), roundtrip_right, 1),
+                event(Some(1), roundtrip_right, -1),
+            ],
+        ),
+        (
+            0,
+            vec![
+                event(Some(1), dominant_left, -1),
+                event(Some(1), marginal_left, -2),
+                event(Some(2), never.0, -1),
+                event(None, 99, -1),
+            ],
+        ),
+        (1, vec![event(Some(2), never.1, -1), event(None, -99, -2)]),
+    ]
+}
+
 #[test]
 fn every_kind_has_a_literal_tag_layout_and_exact_nullable_schema() {
     for kind in KINDS {
@@ -707,12 +860,117 @@ fn every_kind_has_a_literal_tag_layout_and_exact_nullable_schema() {
 }
 
 #[test]
-fn tag_16_rejects_an_invalid_kind_and_the_old_inner_only_payload() {
+fn residual_round_trips_with_qualified_pair_binding_and_selects_match_count_layout() {
+    let expected_residual = col("left.left_value").gt(col("right.right_value"));
+    for kind in KINDS {
+        let definition = residual_definition(kind);
+        assert_eq!(definition.residual(), Some(&expected_residual));
+        let expected_data = if kind == EquiJoinKind::Inner {
+            vec![
+                "equi_join.left_rows",
+                "equi_join.right_rows",
+                "equi_join.continuation",
+            ]
+        } else {
+            vec![
+                "equi_join.left_rows",
+                "equi_join.right_rows",
+                "equi_join.continuation",
+                "equi_join.match_counts",
+            ]
+        };
+        assert_eq!(data_names(&definition), expected_data);
+        bind(&definition, &[left_schema(), right_schema()]).unwrap();
+    }
+
+    let definition = residual_definition(EquiJoinKind::LeftSemi);
+    let decoded = assert_literal_definition(
+        &definition,
+        LEFT_SEMI_RESIDUAL_V1,
+        16,
+        OperationKind::TurnTransform(NonZeroU32::new(2).unwrap()),
+    );
+    let output = bind(decoded.as_ref(), &[left_schema(), right_schema()])
+        .unwrap()
+        .output_schema()
+        .unwrap()
+        .clone();
+    assert_eq!(output.fields().len(), left_schema().fields().len());
+}
+
+#[test]
+fn residual_binding_rejects_non_boolean_missing_and_ambiguous_columns() {
+    let cases: [(Expr, ResidualErrorPredicate); 3] = [
+        (col("left.left_value"), |error: &EquiJoinSchemaError| {
+            matches!(
+                error,
+                EquiJoinSchemaError::ResidualType {
+                    actual: DataType::Int64
+                }
+            )
+        }),
+        (
+            col("left.missing").eq(lit(0_i64)),
+            |error: &EquiJoinSchemaError| {
+                matches!(error, EquiJoinSchemaError::ResidualExpression { .. })
+            },
+        ),
+        (col("key").eq(lit(0_u64)), |error: &EquiJoinSchemaError| {
+            matches!(error, EquiJoinSchemaError::ResidualExpression { .. })
+        }),
+    ];
+    for (residual, expected) in cases {
+        let definition = EquiJoinDefinition::try_new(
+            EquiJoinKind::LeftSemi,
+            [(col("key"), col("key"))],
+            output_names(EquiJoinKind::LeftSemi).iter().copied(),
+            Some(residual),
+        )
+        .unwrap();
+        let Err(OperationBindError::Rejected { source }) =
+            bind(&definition, &[left_schema(), right_schema()])
+        else {
+            panic!("invalid residual unexpectedly bound")
+        };
+        let error = source.downcast_ref::<EquiJoinSchemaError>().unwrap();
+        assert!(expected(error), "unexpected residual rejection: {error}");
+    }
+}
+
+#[test]
+fn definition_rejects_a_non_immutable_residual() {
+    assert!(matches!(
+        EquiJoinDefinition::try_new(
+            EquiJoinKind::Inner,
+            [(col("key"), col("key"))],
+            output_names(EquiJoinKind::Inner).iter().copied(),
+            Some(placeholder("$1")),
+        ),
+        Err(EquiJoinDefinitionError::NonImmutableResidual)
+    ));
+}
+
+#[test]
+fn tag_16_rejects_invalid_kind_residual_marker_and_removed_payloads() {
     let mut invalid_kind = decode_hex(INNER_V1);
     invalid_kind[DEFINITION_HEADER_BYTES] = u8::MAX;
     assert_eq!(
         decode_definition(&invalid_kind).unwrap_err(),
         DefinitionCodecError::InvalidPayload("equi-join kind is invalid")
+    );
+
+    let mut invalid_marker = decode_hex(INNER_V1);
+    *invalid_marker.last_mut().unwrap() = u8::MAX;
+    assert_eq!(
+        decode_definition(&invalid_marker).unwrap_err(),
+        DefinitionCodecError::InvalidPayload("equi-join residual marker is invalid")
+    );
+
+    let mut missing_marker = decode_hex(INNER_V1);
+    missing_marker.pop();
+    assert_eq!(
+        decode_definition(&missing_marker).unwrap_err(),
+        DefinitionCodecError::Truncated
     );
 
     assert!(
@@ -733,6 +991,152 @@ fn five_kinds_match_a_naive_relation_oracle_across_multiplicity_nulls_and_flips(
             let actual = fixture.run(*port, events).unwrap();
             assert_events(kind, &actual, expected);
         }
+    }
+}
+
+#[test]
+fn residual_kinds_match_independent_row_support_oracles_in_both_input_directions() {
+    for residual in [ResidualCase::GreaterThan, ResidualCase::LessThan] {
+        let claims = residual_oracle_claims(residual);
+        for kind in KINDS {
+            let mut fixture = Fixture::with_residual(kind, residual);
+            let mut oracle = NaiveRelation::with_residual(residual);
+            for (port, events) in &claims {
+                let expected = oracle.apply_claim(kind, *port, events);
+                let actual = fixture.run(*port, events).unwrap();
+                assert_events(kind, &actual, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn false_and_null_residuals_never_qualify_for_any_join_kind() {
+    let claims = [
+        (0, vec![event(Some(1), 10, 2), event(None, 11, 1)]),
+        (1, vec![event(Some(1), -5, 3), event(None, -6, 2)]),
+        (0, vec![event(Some(1), 10, -1)]),
+        (1, vec![event(Some(1), -5, -2)]),
+    ];
+
+    for residual in [ResidualCase::False, ResidualCase::Null] {
+        for kind in KINDS {
+            let mut fixture = Fixture::with_residual(kind, residual);
+            let mut oracle = NaiveRelation::with_residual(residual);
+            for (port, events) in &claims {
+                let expected = oracle.apply_claim(kind, *port, events);
+                let actual = fixture.run(*port, events).unwrap();
+                assert_events(kind, &actual, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn residual_left_only_skips_stable_multiplicity_without_scanning_the_opposite_rows() {
+    let key = canonical_u64(23);
+    let corrupt_row = vec![u8::MAX; 32];
+    let left = [event(Some(23), 10, 1)];
+    let right = [event(Some(23), 5, 1)];
+
+    for kind in [EquiJoinKind::LeftSemi, EquiJoinKind::LeftAnti] {
+        let mut fixture = Fixture::with_residual(kind, ResidualCase::GreaterThan);
+        fixture.run(0, &left).unwrap();
+        fixture.run(1, &right).unwrap();
+        fixture = fixture.corrupt_raw_row(0, &key, &corrupt_row, 1);
+
+        assert!(
+            fixture.run(1, &right).unwrap().is_empty(),
+            "{kind:?} emitted output for a stable right multiplicity change"
+        );
+
+        fixture = fixture.corrupt_raw_row(1, &key, &corrupt_row, 1);
+        let output = output_events(kind, &fixture.run(0, &left).unwrap());
+        if kind == EquiJoinKind::LeftSemi {
+            assert_eq!(
+                output,
+                vec![(
+                    OutputRow {
+                        left_key: Some(23),
+                        left_value: Some(10),
+                        right_key: None,
+                        right_value: None,
+                    },
+                    1,
+                )]
+            );
+        } else {
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn residual_left_only_uses_same_claim_shadow_support_for_a_stable_left_row() {
+    let right = [event(Some(31), 5, 1)];
+    let left = [
+        event(Some(31), 10, 1),
+        event(Some(31), 10, 1),
+        event(Some(31), 10, -1),
+    ];
+
+    for kind in [EquiJoinKind::LeftSemi, EquiJoinKind::LeftAnti] {
+        let residual = ResidualCase::GreaterThan;
+        let mut fixture = Fixture::with_residual(kind, residual);
+        let mut oracle = NaiveRelation::with_residual(residual);
+        let expected = oracle.apply_claim(kind, 1, &right);
+        assert_events(kind, &fixture.run(1, &right).unwrap(), expected);
+        let expected = oracle.apply_claim(kind, 0, &left);
+        assert_events(kind, &fixture.run(0, &left).unwrap(), expected);
+    }
+}
+
+#[test]
+fn residual_left_only_qualifying_pages_replay_without_intermediate_output() {
+    let right = (0_i64..257)
+        .map(|value| event(Some(41), value, 1))
+        .collect::<Vec<_>>();
+    let inserted = [event(Some(41), 900, 1)];
+    let retracted = [event(Some(41), 900, -1)];
+
+    for kind in [EquiJoinKind::LeftSemi, EquiJoinKind::LeftAnti] {
+        let residual = ResidualCase::GreaterThan;
+        let mut fixture = Fixture::with_residual(kind, residual);
+        let mut oracle = NaiveRelation::with_residual(residual);
+
+        let expected = oracle.apply_claim(kind, 1, &right);
+        assert_events(kind, &fixture.run(1, &right).unwrap(), expected);
+        let expected = oracle.apply_claim(kind, 0, &inserted);
+        let input = input_change(0, &inserted);
+
+        assert!(matches!(
+            fixture.commit_once(0, &input).unwrap(),
+            Action::Commit(None)
+        ));
+        fixture = fixture.reopen();
+
+        let (committed, rolled_back_complete, committed_turns) =
+            commit_prefix_and_rollback_complete(&mut fixture, 0, &input);
+        assert!(
+            committed_turns > 0,
+            "{kind:?} did not page its qualifying scan"
+        );
+        assert!(
+            committed.is_empty(),
+            "{kind:?} emitted per-candidate rows from its left-only path"
+        );
+
+        fixture = fixture.reopen();
+        let retried_complete = fixture.run(0, &inserted).unwrap();
+        assert_events(
+            kind,
+            &retried_complete,
+            output_events(kind, &rolled_back_complete),
+        );
+        assert_events(kind, &retried_complete, expected);
+
+        let expected = oracle.apply_claim(kind, 0, &retracted);
+        assert_events(kind, &fixture.run(0, &retracted).unwrap(), expected);
     }
 }
 
@@ -792,6 +1196,191 @@ fn presence_kinds_reopen_after_probe_and_rolled_back_first_and_last_emit_pages()
         }
         assert_events(kind, &outputs, expected);
     }
+}
+
+#[test]
+fn residual_presence_paging_replays_probe_shadow_cleanup_and_late_emit() {
+    let mut candidates = (0_i64..767)
+        .map(|value| event(Some(19), value, 1))
+        .collect::<Vec<_>>();
+    // Canonical positive i64 rows sort before -1, so the only qualifying
+    // candidate is the 768th and forces every Probe and Emit page to run.
+    candidates.push(event(Some(19), -1, 1));
+    assert_eq!(candidates.len(), 768);
+
+    let residual = ResidualCase::GreaterThan;
+    let kind = EquiJoinKind::LeftOuter;
+    let mut fixture = Fixture::with_residual(kind, residual);
+    let mut oracle = NaiveRelation::with_residual(residual);
+    let expected = oracle.apply_claim(kind, 1, &candidates);
+    assert_events(kind, &fixture.run(1, &candidates).unwrap(), expected);
+
+    let inserted = [event(Some(19), 0, 1)];
+    let expected = oracle.apply_claim(kind, 0, &inserted);
+    let input = input_change(0, &inserted);
+
+    // Commit the first Probe page, reopen, then prove the next Probe page is
+    // transactionally replayable from the same cursor.
+    assert!(matches!(
+        fixture.commit_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    fixture = fixture.reopen();
+    assert!(matches!(
+        fixture.rollback_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    assert!(matches!(
+        fixture.commit_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    fixture = fixture.reopen();
+
+    // The third 256-candidate page ends Probe exactly at the turn boundary,
+    // leaving ClearShadow durable for reopen.
+    assert!(matches!(
+        fixture.commit_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    fixture = fixture.reopen();
+
+    // Clearing the preflight shadow and starting Emit share one transaction;
+    // rolling it back must restore both the shadow and the continuation.
+    assert!(matches!(
+        fixture.rollback_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    assert!(matches!(
+        fixture.commit_once(0, &input).unwrap(),
+        Action::Commit(None)
+    ));
+    fixture = fixture.reopen();
+
+    // Roll back the final Complete carrying the late match, reopen, and prove
+    // it is produced exactly once by the retried durable suffix.
+    let (mut outputs, rolled_back_complete, committed_turns) =
+        commit_prefix_and_rollback_complete(&mut fixture, 0, &input);
+    assert!(committed_turns > 0);
+    fixture = fixture.reopen();
+    let retried_complete = fixture.run(0, &inserted).unwrap();
+    assert_events(
+        kind,
+        &retried_complete,
+        output_events(kind, &rolled_back_complete),
+    );
+    outputs.extend(retried_complete);
+    assert_events(kind, &outputs, expected);
+
+    let retracted = [event(Some(19), 0, -1)];
+    let expected = oracle.apply_claim(kind, 0, &retracted);
+    assert_events(kind, &fixture.run(0, &retracted).unwrap(), expected);
+}
+
+#[test]
+fn residual_full_outer_replays_coalesced_counts_and_multi_page_shadow_cleanup() {
+    let left = (0_i64..257)
+        .map(|value| event(Some(29), value, 1))
+        .collect::<Vec<_>>();
+    let right = [event(Some(29), -1, 1)];
+    let kind = EquiJoinKind::FullOuter;
+    let residual = ResidualCase::GreaterThan;
+    let mut fixture = Fixture::with_residual(kind, residual);
+    let mut oracle = NaiveRelation::with_residual(residual);
+
+    let expected = oracle.apply_claim(kind, 0, &left);
+    assert_events(kind, &fixture.run(0, &left).unwrap(), expected);
+    let expected = oracle.apply_claim(kind, 1, &right);
+    let input = input_change(1, &right);
+
+    // Every intermediate page is first rolled back and then replayed. The 257
+    // qualifying left rows create 258 shadow keys, so cleanup itself is paged.
+    let (mut output, rolled_back_complete, committed_turns) =
+        commit_prefix_and_rollback_complete(&mut fixture, 1, &input);
+    assert!(committed_turns >= 4);
+    fixture = fixture.reopen();
+    let retried_complete = fixture.run(1, &right).unwrap();
+    assert_events(
+        kind,
+        &retried_complete,
+        output_events(kind, &rolled_back_complete),
+    );
+    output.extend(retried_complete);
+    assert_events(kind, &output, expected);
+
+    let retracted = [event(Some(29), -1, -1)];
+    let expected = oracle.apply_claim(kind, 1, &retracted);
+    assert_events(kind, &fixture.run(1, &retracted).unwrap(), expected);
+}
+
+#[test]
+fn residual_clear_shadow_rejects_a_cursor_that_skips_remaining_counts() {
+    let left = (0_i64..257)
+        .map(|value| event(Some(37), value, 1))
+        .collect::<Vec<_>>();
+    let right = [event(Some(37), -1, 1)];
+    let kind = EquiJoinKind::FullOuter;
+    let residual = ResidualCase::GreaterThan;
+    let mut fixture = Fixture::with_residual(kind, residual);
+    let mut oracle = NaiveRelation::with_residual(residual);
+    let expected = oracle.apply_claim(kind, 0, &left);
+    assert_events(kind, &fixture.run(0, &left).unwrap(), expected);
+    let expected = oracle.apply_claim(kind, 1, &right);
+    let input = input_change(1, &right);
+
+    for _ in 0..3 {
+        assert!(matches!(
+            fixture.commit_once(1, &input).unwrap(),
+            Action::Commit(None)
+        ));
+    }
+    let mut original = None;
+    fixture = fixture.rewrite_raw_continuation(|value| {
+        assert_eq!(value[0], 2, "unexpected continuation version");
+        assert_eq!(value[2], 1, "the test did not reach ClearShadow");
+        assert_eq!(value[12], 1, "the cleanup page did not retain a cursor");
+        original = Some(value.clone());
+        value.truncate(13);
+        value.extend_from_slice(&34_u64.to_be_bytes());
+        value.extend_from_slice(&[1, 1]);
+        value.extend_from_slice(&[u8::MAX; 32]);
+    });
+
+    let error = fixture.commit_once(1, &input).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::InvalidContinuation(
+            "shadow cleanup cursor skipped a remaining count"
+        ))
+    ));
+
+    let original = original.expect("the original cleanup continuation was captured");
+    fixture = fixture.rewrite_raw_continuation(move |value| *value = original);
+    let Action::Commit(Some(first_output)) = fixture.commit_once(1, &input).unwrap() else {
+        panic!("the restored cleanup did not enter a paged Emit");
+    };
+
+    let mut original = None;
+    fixture = fixture.rewrite_raw_continuation(|value| {
+        assert_eq!(value[2], 2, "the test did not reach Emit");
+        assert_eq!(value[11], 1, "the Emit page did not find a match");
+        assert_eq!(value[12], 1, "the Emit page did not retain a cursor");
+        original = Some(value.clone());
+        value[12] = 0;
+        value.truncate(13);
+    });
+    let error = fixture.commit_once(1, &input).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::InvalidContinuation(
+            "matched row has no committed opposite-row cursor"
+        ))
+    ));
+
+    let original = original.expect("the original Emit continuation was captured");
+    fixture = fixture.rewrite_raw_continuation(move |value| *value = original);
+    let mut output = vec![first_output];
+    output.extend(fixture.run(1, &right).unwrap());
+    assert_events(kind, &output, expected);
 }
 
 #[test]
@@ -948,7 +1537,7 @@ fn a_late_outer_overflow_rejects_the_whole_claim_before_earlier_output() {
 }
 
 #[test]
-fn probe_rejects_a_late_corrupt_persistent_row_without_partial_output_or_input_state() {
+fn probe_rejects_a_late_corrupt_row_before_output_with_or_without_a_residual() {
     let valid_right = (0..257)
         .map(|value| event(Some(42), value, 1))
         .collect::<Vec<_>>();
@@ -957,40 +1546,43 @@ fn probe_rejects_a_late_corrupt_persistent_row_without_partial_output_or_input_s
     let key = canonical_u64(42);
     let corrupt_row = vec![u8::MAX; 32];
 
-    let mut fixture = Fixture::new(EquiJoinKind::Inner);
-    assert!(fixture.run(1, &valid_right).unwrap().is_empty());
-    fixture = fixture.adjust_raw_row(1, &key, &corrupt_row, 1);
+    for residual in [ResidualCase::None, ResidualCase::GreaterThan] {
+        let mut fixture = Fixture::with_residual(EquiJoinKind::Inner, residual);
+        assert!(fixture.run(1, &valid_right).unwrap().is_empty());
+        fixture = fixture.corrupt_raw_row(1, &key, &corrupt_row, 1);
 
-    assert!(matches!(
-        fixture.commit_once(0, &input).unwrap(),
-        Action::Commit(None)
-    ));
-    let error = fixture.commit_once(0, &input).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<EquiJoinError>(),
-        Some(EquiJoinError::CanonicalRow { .. })
-    ));
+        assert!(matches!(
+            fixture.commit_once(0, &input).unwrap(),
+            Action::Commit(None)
+        ));
+        fixture = fixture.reopen();
+        let error = fixture.commit_once(0, &input).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::CanonicalRow { .. })
+        ));
 
-    fixture = fixture.adjust_raw_row(1, &key, &corrupt_row, -1);
-    let output = fixture.run(0, &left).unwrap();
-    let mut values = output_events(EquiJoinKind::Inner, &output)
-        .into_iter()
-        .map(|(row, difference)| {
-            assert_eq!(difference, 1);
-            row.right_value.unwrap()
-        })
-        .collect::<Vec<_>>();
-    values.sort_unstable();
-    assert_eq!(values, (0..257).collect::<Vec<_>>());
+        fixture = fixture.corrupt_raw_row(1, &key, &corrupt_row, -1);
+        let output = fixture.run(0, &left).unwrap();
+        let mut values = output_events(EquiJoinKind::Inner, &output)
+            .into_iter()
+            .map(|(row, difference)| {
+                assert_eq!(difference, 1);
+                row.right_value.unwrap()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, (0..257).collect::<Vec<_>>());
 
-    let retract = [event(Some(42), 900, -1)];
-    assert_eq!(
-        output_events(EquiJoinKind::Inner, &fixture.run(0, &retract).unwrap()).len(),
-        257
-    );
-    let error = fixture.run(0, &retract).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<EquiJoinError>(),
-        Some(EquiJoinError::NegativeWeight)
-    ));
+        let retract = [event(Some(42), 900, -1)];
+        assert_eq!(
+            output_events(EquiJoinKind::Inner, &fixture.run(0, &retract).unwrap()).len(),
+            257
+        );
+        let error = fixture.run(0, &retract).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::NegativeWeight)
+        ));
+    }
 }

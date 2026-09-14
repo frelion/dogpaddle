@@ -7,8 +7,8 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
-    AggregateUDF, Distinct as LogicalDistinct, Expr, HigherOrderUDF, LogicalPlan, Operator,
-    ScalarUDF, TableSource, WindowUDF,
+    AggregateUDF, Distinct as LogicalDistinct, Expr, ExprSchemable, HigherOrderUDF, LogicalPlan,
+    Operator, ScalarUDF, TableSource, WindowUDF,
     expr::{AggregateFunction, BinaryExpr},
     logical_plan::{Aggregate, Join},
     planner::ExprPlanner,
@@ -19,7 +19,7 @@ use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind,
+    OperationDefinition,
     operation::transform::{
         AggregateCall, AggregateDefinition, DistinctDefinition, EquiJoinDefinition, EquiJoinKind,
         FilterDefinition, SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
@@ -180,6 +180,7 @@ struct OrientedJoin {
     inputs: [LoweredRelation; 2],
     keys: Vec<EquiJoinKey>,
     source_order: Vec<usize>,
+    swapped: bool,
 }
 
 struct Lowerer {
@@ -273,11 +274,6 @@ impl Lowerer {
         if logical_keys.is_empty() {
             return Err(unsupported_join_condition());
         }
-        if join.join_type != JoinType::Inner && !residuals.is_empty() {
-            return Err(SqlError::Unsupported(
-                "outer, semi, and anti JOIN residual predicates".to_owned(),
-            ));
-        }
 
         let left = self.lower(&join.left)?;
         let right = self.lower(&join.right)?;
@@ -295,28 +291,31 @@ impl Lowerer {
             inputs,
             keys,
             source_order,
+            swapped,
         } = orient_join(join.join_type, left, right, keys)?;
+        let residual = residuals
+            .into_iter()
+            .reduce(Expr::and)
+            .map(|residual| {
+                rewrite_join_residual(
+                    residual,
+                    join.left.schema(),
+                    join.right.schema(),
+                    &inputs,
+                    swapped,
+                )
+            })
+            .transpose()?;
         let output_count = source_order.len();
         let definition = EquiJoinDefinition::try_new(
             kind,
             keys,
             (0..output_count).map(internal_join_field_name),
+            residual,
         )
         .map_err(SqlError::endpoint)?;
         let joined = self.add_transform(inputs, definition)?;
-        let joined = self.align_join_output(joined, join.schema.as_ref(), &source_order)?;
-
-        let Some(residual) = residuals.into_iter().reduce(Expr::and) else {
-            return Ok(joined);
-        };
-        let residual = rewrite_columns(residual, join.schema.as_ref(), &joined.physical_schema)?;
-        let filter = FilterDefinition::try_new(residual).map_err(SqlError::endpoint)?;
-        if !matches!(filter.kind(), OperationKind::AtomicTransform(_)) {
-            return Err(SqlError::Unsupported(
-                "INNER JOIN residual predicate that cannot be fused".to_owned(),
-            ));
-        }
-        self.add_transform([joined], filter)
+        self.align_join_output(joined, join.schema.as_ref(), &source_order)
     }
 
     fn lower_aggregate(&mut self, aggregate: &Aggregate) -> Result<LoweredRelation, SqlError> {
@@ -531,16 +530,17 @@ fn lower_aggregate_call(
 
 fn collect_join_condition(join: &Join) -> Result<(Vec<EquiJoinKey>, Vec<Expr>), SqlError> {
     let mut keys = Vec::with_capacity(join.on.len() + usize::from(join.filter.is_some()));
+    let mut residuals = Vec::new();
     for (left_key, right_key) in &join.on {
-        keys.push(normalize_join_key(
-            left_key,
-            right_key,
-            join.left.schema(),
-            join.right.schema(),
-        )?);
+        if let Some(key) =
+            supported_join_key(left_key, right_key, join.left.schema(), join.right.schema())?
+        {
+            keys.push(key);
+        } else {
+            residuals.push(left_key.clone().eq(right_key.clone()));
+        }
     }
 
-    let mut residuals = Vec::new();
     if let Some(filter) = &join.filter {
         for predicate in split_conjunction_owned(filter.clone()) {
             let key = match &predicate {
@@ -548,12 +548,7 @@ fn collect_join_condition(join: &Join) -> Result<(Vec<EquiJoinKey>, Vec<Expr>), 
                     left,
                     op: Operator::Eq,
                     right,
-                }) => find_valid_equijoin_key_pair(
-                    left,
-                    right,
-                    join.left.schema(),
-                    join.right.schema(),
-                )?,
+                }) => supported_join_key(left, right, join.left.schema(), join.right.schema())?,
                 _ => None,
             };
             if let Some(key) = key {
@@ -564,6 +559,26 @@ fn collect_join_condition(join: &Join) -> Result<(Vec<EquiJoinKey>, Vec<Expr>), 
         }
     }
     Ok((keys, residuals))
+}
+
+fn supported_join_key(
+    left_key: &Expr,
+    right_key: &Expr,
+    left_schema: &DFSchema,
+    right_schema: &DFSchema,
+) -> Result<Option<EquiJoinKey>, SqlError> {
+    let Some((left_key, right_key)) =
+        find_valid_equijoin_key_pair(left_key, right_key, left_schema, right_schema)?
+    else {
+        return Ok(None);
+    };
+    let left_type = left_key.get_type(left_schema)?;
+    let right_type = right_key.get_type(right_schema)?;
+    if left_type == right_type && EquiJoinDefinition::supports_key_type(&left_type) {
+        Ok(Some((left_key, right_key)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn orient_join(
@@ -580,30 +595,35 @@ fn orient_join(
             inputs: [left, right],
             keys,
             source_order: (0..left_count + right_count).collect(),
+            swapped: false,
         },
         JoinType::Left => OrientedJoin {
             kind: EquiJoinKind::LeftOuter,
             inputs: [left, right],
             keys,
             source_order: (0..left_count + right_count).collect(),
+            swapped: false,
         },
         JoinType::Full => OrientedJoin {
             kind: EquiJoinKind::FullOuter,
             inputs: [left, right],
             keys,
             source_order: (0..left_count + right_count).collect(),
+            swapped: false,
         },
         JoinType::LeftSemi => OrientedJoin {
             kind: EquiJoinKind::LeftSemi,
             inputs: [left, right],
             keys,
             source_order: (0..left_count).collect(),
+            swapped: false,
         },
         JoinType::LeftAnti => OrientedJoin {
             kind: EquiJoinKind::LeftAnti,
             inputs: [left, right],
             keys,
             source_order: (0..left_count).collect(),
+            swapped: false,
         },
         JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
             let (kind, output_count) = match join_type {
@@ -627,6 +647,7 @@ fn orient_join(
                     .map(|(left, right)| (right, left))
                     .collect(),
                 source_order,
+                swapped: true,
             }
         }
         _ => return Err(SqlError::Unsupported("join type or semantics".to_owned())),
@@ -634,18 +655,68 @@ fn orient_join(
     Ok(oriented)
 }
 
-fn normalize_join_key(
-    left_key: &Expr,
-    right_key: &Expr,
-    left_schema: &DFSchema,
-    right_schema: &DFSchema,
-) -> Result<(Expr, Expr), SqlError> {
-    find_valid_equijoin_key_pair(left_key, right_key, left_schema, right_schema)?
-        .ok_or_else(unsupported_join_condition)
+fn unsupported_join_condition() -> SqlError {
+    SqlError::Unsupported("JOIN without a cross-input equality key".to_owned())
 }
 
-fn unsupported_join_condition() -> SqlError {
-    SqlError::Unsupported("JOIN condition other than cross-input equality conjunction".to_owned())
+fn rewrite_join_residual(
+    expression: Expr,
+    logical_left: &DFSchema,
+    logical_right: &DFSchema,
+    oriented_inputs: &[LoweredRelation; 2],
+    swapped: bool,
+) -> Result<Expr, SqlError> {
+    let (physical_left, physical_right, left_port, right_port) = if swapped {
+        (
+            &oriented_inputs[1].physical_schema,
+            &oriented_inputs[0].physical_schema,
+            "right",
+            "left",
+        )
+    } else {
+        (
+            &oriented_inputs[0].physical_schema,
+            &oriented_inputs[1].physical_schema,
+            "left",
+            "right",
+        )
+    };
+    if logical_left.fields().len() != physical_left.fields().len()
+        || logical_right.fields().len() != physical_right.fields().len()
+    {
+        return Err(SqlError::invalid(
+            "logical and physical JOIN input field counts diverged while lowering SQL",
+        ));
+    }
+
+    expression
+        .transform_up(|nested| match nested {
+            Expr::Column(column) => {
+                let left = logical_left.maybe_index_of_column(&column);
+                let right = logical_right.maybe_index_of_column(&column);
+                let (physical, port, index) = match (left, right) {
+                    (Some(index), None) => (physical_left, left_port, index),
+                    (None, Some(index)) => (physical_right, right_port, index),
+                    (Some(_), Some(_)) => {
+                        return Err(DataFusionError::Plan(
+                            "JOIN residual column is ambiguous between its inputs".to_owned(),
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(DataFusionError::Plan(
+                            "JOIN residual column is outside both inputs".to_owned(),
+                        ));
+                    }
+                };
+                Ok(Transformed::yes(Expr::Column(Column::new(
+                    Some(TableReference::bare(port)),
+                    physical.field(index).name(),
+                ))))
+            }
+            _ => Ok(Transformed::no(nested)),
+        })
+        .data()
+        .map_err(Into::into)
 }
 
 fn rewrite_columns(

@@ -83,7 +83,8 @@ Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；re
 - Filter 要求谓词输出 Boolean，并保持输入 Schema。
 - Select 从同一个输入计算一组有序输出列。
 - `UnionAll` 要求所有输入 Schema 完全相同。
-- `EquiJoin` 分别绑定左右键，要求每对键具有相同类型；具体 kind 决定输出列和 outer nullability。
+- `EquiJoin` 分别绑定左右键，要求每对键具有相同类型；可选 residual 在精确的
+  `left.* + right.*` candidate Schema 上绑定，具体 kind 决定输出列和 outer nullability。
 - Sink 检查目标系统能否无损表示全部输入列，并且没有输出 Schema。
 
 运行时收到的 `Change` 仍会与绑定时 Schema 比较。这样，磁盘 Definition、编译好的表达式和真实
@@ -114,7 +115,7 @@ Station 内没有第二张拓扑图，中间结果也不写日志。最后一个
 
 具体 Definition 实例自己声明 kind。Filter、Extend、Select、SchemaAlign 和 Aggregate 会根据表达式
 分类：可重放的逐行 immutable 表达式可以成为 Atomic；仍受支持但需要单独边界的实例成为 Exclusive，
-其他表达式会在构造或 bind 时被拒绝。EquiJoin 的 key 必须是 immutable；不满足时直接拒绝，
+其他表达式会在构造或 bind 时被拒绝。EquiJoin 的 key 和 residual 必须是 immutable；不满足时直接拒绝，
 不会退化成 Exclusive。`EquiJoin` 是两输入 TurnTransform，可以分页完成一个输入，再把每一页
 交给后面的 Atomic 算子。
 
@@ -248,18 +249,40 @@ right_rows[join key] = 右侧完整行及各自权重
 完全对称。复合 key 任一分量为 NULL 时不匹配，但原行仍进入本侧账本，以便以后精确撤回。
 
 Definition 用 `EquiJoinKind` 选择 `Inner`、`LeftSemi`、`LeftAnti`、`LeftOuter` 或 `FullOuter`。
-Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 nullability。除 Inner 外，运行时再维护
-一份 `key_counts`，只记录每个 key 在左右各有多少种不同完整行：它用来识别“第一个匹配出现”和
-“最后一个匹配消失”，从而精确撤回或补回 null-extended row。重复行权重仍只保存在左右 row state，
-不会膨胀这份计数。
+Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 nullability。可选 residual 对同 key 的
+每个候选记录对求值，只有 non-null `true` 才匹配。没有 residual 时，非 Inner 继续使用紧凑的
+`key_counts`，只记录每个 key 在左右各有多少种不同完整行；有 residual 时，非 Inner 改为维护逐完整行
+的 `match_counts`，记录它有多少种满足整个 `ON` 条件的对侧记录。重复行权重仍只保存在左右 row state，
+不会膨胀 presence 计数。Semi/Anti 中同一 exact row 仅改变 multiplicity 时不重扫对侧 bucket：right
+变化不改变 support，left 变化直接读取该行已有的 actual/shadow match count。需要变化的 driving-row
+count 按 qualifying page 合并，对侧每种 distinct row 的 count 仍分别更新。
 
 热点 key 可能产生非常大的结果，所以 Join 用持久 continuation 分页：Probe 先验证这批输入的全部
-匹配都能安全计算，Emit 再分页产生真正输出。一个输入 Change 完成前，Station 固定当前端口；reopen
-可以从已提交页继续。`TURN_ITEMS` 和 `TURN_BYTES` 当前以 256 项和 4 MiB 作为常规单 turn 的工作软预算；
-若首个 Store item 自身更大，空 turn 会单独处理它以保证继续前进。这两个预算不限制完整 Claim 的瞬态
-内存：Station 已持有整个输入 Change，EquiJoin 还会为整批建立 row、value 和 key 的 `PreparedClaim`
-缓存，因此峰值至少是 `O(Claim)`，也可能超过 4 MiB。分页同样不限制整个 Join 关系的磁盘大小，无法
-消除连接结果本身的高 fan-out 成本。
+匹配都能安全计算，Emit 再分页产生真正输出。Residual presence Join 的 Probe 只写隐藏的模拟计数，
+随后由 `ClearShadow` 有界清理，再由 Emit 原子更新真实计数；因此后段 predicate、解码或 diff 错误不会
+在输出前污染关系状态。一个输入 Change 完成前，Station 固定当前端口；reopen 可以从已提交页继续。
+
+Probe/Emit 重复扫描和求值是有意的 whole-Claim failure-before-output 边界：整个 Claim 中后面的
+predicate、存储行损坏或 output-diff overflow 不会在前面的结果已经发布后才暴露。当前不持久化
+qualifying-pair spool 或 bitset，也不用跨阶段内存 cache 代替可重放的第二遍。
+
+`PreparedClaim` 只为整批保留 canonical row、join key、diff 和 admission effect，不再保留每行的全量
+`ScalarValue`；每个 turn 处理当前 row 时，仅在 predicate 或真实输出需要字段值时，才从 Station 固定的
+`RecordBatch` 惰性物化一次短期 values。空 bucket、无输出存在性路径和稳定 Semi/Anti 右侧更新不会复制宽行。
+Residual 候选的
+常规单批上限是 256 行、1 MiB Store logical bytes 和 16,384 个 candidate scalar slots；实际行数还受
+candidate 字段数及当前 turn 剩余预算约束。每批会完整解码候选并构造 Arrow candidate batch，但
+LeftSemi/LeftAnti 的左侧 driving row 只保留 qualifying count，其他路径也只把 predicate 通过的候选
+values 带入当前输出阶段。
+
+`TURN_ITEMS` 和 `TURN_BYTES` 以 256 项和 4 MiB 限制常规单 turn 的逻辑扫描、ScalarValue slot、
+输出和事务工作量。分区扫描按每个候选重复计算 partition frame、完整 join key、row key 与 multiplicity，
+driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftSemi/LeftAnti 的右侧宽行不会逃逸预算。
+这些值不是进程 RSS 硬上限：Station 仍已持有完整 Change，Arrow/DataFusion 可以产生
+额外中间分配，且空 turn 遇到单个超过批字节或 scalar-slot 界限的 Store row 时会单独处理它，以避免永久
+停滞。因此峰值至少是 `O(Claim + candidate page)`，还有“单个 oversized row”的活性例外。逐行
+`match_counts` 以完整 canonical row 为 key，持久状态与 tracked rows 的总宽度成正比；分页也不限制
+整个 Join 关系的磁盘大小，无法消除连接结果本身的高 fan-out 成本。
 
 ## 内建算子索引
 
@@ -283,7 +306,7 @@ Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 
 | `Distinct` (13) | Atomic / 1 | 把任意正权重关系变成集合边界变化 | `distinct.weights: OrderedMultiset` |
 | `Aggregate` (14) | Atomic 或 Exclusive / 1 | 增量维护非空分组聚合 | groups、entries、control |
 | `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `EquiJoin` (16) | Turn / 2 | 增量维护 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 另有 key counts |
+| `EquiJoin` (16) | Turn / 2 | 增量维护带可选 residual 的 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 使用 key counts 或逐行 match counts |
 
 源码按业务角色放在 [`operation/scan/`](src/operation/scan/)、
 [`operation/transform/`](src/operation/transform/) 和
@@ -299,6 +322,8 @@ crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarV
 Definition 构造时立即把表达式编码并解码为 canonical protobuf；bind 时再针对 exact input Schema
 生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 `DataFusion` 提供。
 Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要显式 `cast`。
+`EquiJoin` residual 的两个输入固定使用 `left` 与 `right` qualifier；它绑定原始输入字段的类型、
+nullability 和 metadata，而不是 Outer 已放宽或 Semi/Anti 已裁剪的输出 Schema。
 
 当前产品证据覆盖以下纵向切片：
 

@@ -1,5 +1,5 @@
 use dogpaddle_sql::SqlProgram;
-use dogpaddle_store::{Cell, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreError};
 
 #[test]
 fn physical_assembly_keeps_the_canonical_flow_definition() {
@@ -20,19 +20,19 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     assert_eq!(definition.len(), 940);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "556e2e40875f5a296fdd084e144adb5bdb597dba8cb6134213b6de186481cf5e"
+        "599773a34ba4a9bfca4b5a70b6cc5654aa097fad7dacf3005f28437df2dbeaf5"
     );
 }
 
 #[test]
-fn inner_join_residual_and_projection_are_fused_into_one_transform_station() {
+fn outer_join_residual_is_native_and_projection_stays_in_one_transform_station() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let program = SqlProgram::parse(
         "INSERT INTO discard() \
          SELECT left_scan.value AS left_value, right_scan.value AS right_value \
          FROM sequence(start => 0) AS left_scan \
-         INNER JOIN sequence(start => 1) AS right_scan \
+         LEFT OUTER JOIN sequence(start => 1) AS right_scan \
          ON left_scan.value + 1 = right_scan.value \
          AND left_scan.value = right_scan.value - 1 \
          AND left_scan.value + right_scan.value > 0",
@@ -56,6 +56,18 @@ fn inner_join_residual_and_projection_are_fused_into_one_transform_station() {
     );
 
     drop(flow);
+    let store = Store::open(&path).unwrap();
+    let _: OrderedMap<Vec<u8>, u64> = store
+        .open_data("station/00000002/operation/00000000/equi_join.match_counts")
+        .unwrap();
+    assert!(matches!(
+        store.open_data::<OrderedMap<Vec<u8>, u64>>(
+            "station/00000002/operation/00000000/equi_join.key_counts"
+        ),
+        Err(StoreError::DataNotFound(_))
+    ));
+    drop(store);
+
     let reopened = program.start(&path).unwrap();
     assert_eq!(
         reopened

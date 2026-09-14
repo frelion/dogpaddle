@@ -125,7 +125,7 @@ fn projection_executes_qualified_coerced_expressions_into_sqlite() {
 }
 
 #[test]
-fn inner_join_executes_expression_keys_and_projection_across_reopen() {
+fn inner_join_executes_native_residual_and_projection_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("join.sqlite");
@@ -134,8 +134,9 @@ fn inner_join_executes_expression_keys_and_projection_across_reopen() {
          SELECT left_scan.value AS left_value, right_scan.value AS right_value \
          FROM sequence(start => 18446744073709551613) AS left_scan \
          JOIN sequence(start => 18446744073709551613) AS right_scan \
-         ON left_scan.value + CAST(0 AS BIGINT UNSIGNED) = right_scan.value \
-         AND left_scan.value > 18446744073709551613",
+         ON left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+         AND left_scan.value < right_scan.value",
         sql_string(&sqlite_path)
     ))
     .unwrap();
@@ -162,111 +163,192 @@ fn inner_join_executes_expression_keys_and_projection_across_reopen() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     rows.sort_unstable();
-    assert_eq!(rows, [(u64::MAX - 1, u64::MAX - 1), (u64::MAX, u64::MAX),]);
+    assert_eq!(rows, [(u64::MAX - 2, u64::MAX)]);
 
     let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
 }
 
 #[test]
-fn outer_join_family_preserves_rows_and_schema_across_reopen() {
-    struct Case {
-        name: &'static str,
-        join: &'static str,
-        left_start: u64,
-        right_start: u64,
-        condition: &'static str,
-        expected: Vec<(Option<u64>, Option<u64>)>,
-        left_not_null: bool,
-        right_not_null: bool,
-    }
+fn supported_key_keeps_float_equality_as_a_residual() {
+    let root = tempfile::tempdir().unwrap();
+    let sqlite_path = root.path().join("float-residual.sqlite");
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'joined_values') \
+         SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => 18446744073709551613) AS left_scan \
+         JOIN sequence(start => 18446744073709551613) AS right_scan \
+         ON left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+         AND CAST(left_scan.value % CAST(3 AS BIGINT UNSIGNED) AS DOUBLE) \
+                = CAST(right_scan.value % CAST(3 AS BIGINT UNSIGNED) AS DOUBLE)",
+        sql_string(&sqlite_path)
+    ))
+    .unwrap();
 
+    let mut flow = program.start(root.path().join("flow")).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let mut rows = connection
+        .prepare("SELECT left_value, right_value FROM joined_values")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                decode_u64(row.get::<_, Vec<u8>>(0)?),
+                decode_u64(row.get::<_, Vec<u8>>(1)?),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        [
+            (u64::MAX - 2, u64::MAX - 2),
+            (u64::MAX - 1, u64::MAX - 1),
+            (u64::MAX, u64::MAX),
+        ]
+    );
+}
+
+struct OuterJoinCase {
+    name: &'static str,
+    join: &'static str,
+    left_start: u64,
+    right_start: u64,
+    condition: &'static str,
+    expected: Vec<(Option<u64>, Option<u64>)>,
+    left_not_null: bool,
+    right_not_null: bool,
+}
+
+#[test]
+fn outer_join_family_preserves_rows_and_schema_across_reopen() {
     let cases = [
-        Case {
+        OuterJoinCase {
             name: "left",
             join: "LEFT OUTER JOIN",
-            left_start: u64::MAX - 1,
-            right_start: u64::MAX,
-            condition: "left_scan.value = right_scan.value - CAST(1 AS BIGINT UNSIGNED)",
-            expected: vec![(Some(u64::MAX - 1), Some(u64::MAX)), (Some(u64::MAX), None)],
+            left_start: u64::MAX - 2,
+            right_start: u64::MAX - 2,
+            condition: "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        AND left_scan.value < right_scan.value",
+            expected: vec![
+                (Some(u64::MAX - 2), Some(u64::MAX)),
+                (Some(u64::MAX - 1), None),
+                (Some(u64::MAX), None),
+            ],
             left_not_null: true,
             right_not_null: false,
         },
-        Case {
+        OuterJoinCase {
             name: "right",
             join: "RIGHT OUTER JOIN",
-            left_start: u64::MAX,
-            right_start: u64::MAX - 1,
-            condition: "left_scan.value - CAST(1 AS BIGINT UNSIGNED) = right_scan.value",
-            expected: vec![(Some(u64::MAX), Some(u64::MAX - 1)), (None, Some(u64::MAX))],
+            left_start: u64::MAX - 2,
+            right_start: u64::MAX - 2,
+            condition: "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        AND left_scan.value < right_scan.value",
+            expected: vec![
+                (None, Some(u64::MAX - 2)),
+                (None, Some(u64::MAX - 1)),
+                (Some(u64::MAX - 2), Some(u64::MAX)),
+            ],
             left_not_null: false,
             right_not_null: true,
         },
-        Case {
+        OuterJoinCase {
             name: "full",
             join: "FULL OUTER JOIN",
-            left_start: u64::MAX - 1,
+            left_start: u64::MAX - 2,
             right_start: u64::MAX - 2,
-            condition: "left_scan.value = right_scan.value",
+            condition: "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        AND left_scan.value < right_scan.value",
             expected: vec![
                 (None, Some(u64::MAX - 2)),
-                (Some(u64::MAX - 1), Some(u64::MAX - 1)),
-                (Some(u64::MAX), Some(u64::MAX)),
+                (None, Some(u64::MAX - 1)),
+                (Some(u64::MAX - 2), Some(u64::MAX)),
+                (Some(u64::MAX - 1), None),
+                (Some(u64::MAX), None),
             ],
             left_not_null: false,
+            right_not_null: false,
+        },
+        OuterJoinCase {
+            name: "left-null-residual",
+            join: "LEFT OUTER JOIN",
+            left_start: u64::MAX - 2,
+            right_start: u64::MAX - 2,
+            condition: "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+                        AND CAST(NULL AS BOOLEAN)",
+            expected: vec![
+                (Some(u64::MAX - 2), None),
+                (Some(u64::MAX - 1), None),
+                (Some(u64::MAX), None),
+            ],
+            left_not_null: true,
             right_not_null: false,
         },
     ];
 
     let root = tempfile::tempdir().unwrap();
     for case in cases {
-        let flow_path = root.path().join(format!("{}-flow", case.name));
-        let sqlite_path = root.path().join(format!("{}.sqlite", case.name));
-        let program = SqlProgram::parse(&format!(
-            "INSERT INTO sqlite(path => '{}', table => 'joined') \
-             SELECT left_scan.value AS left_value, right_scan.value AS right_value \
-             FROM sequence(start => {}) AS left_scan \
-             {} sequence(start => {}) AS right_scan \
-             ON {}",
-            sql_string(&sqlite_path),
-            case.left_start,
-            case.join,
-            case.right_start,
-            case.condition,
-        ))
-        .unwrap();
-
-        drop(program.start(&flow_path).unwrap());
-        let mut flow = program.start(&flow_path).unwrap();
-        advance_to_idle(&mut flow);
-        drop(flow);
-
-        let connection = sqlite(&sqlite_path);
-        let mut rows = connection
-            .prepare("SELECT left_value, right_value FROM joined")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<Vec<u8>>>(0)?.map(decode_u64),
-                    row.get::<_, Option<Vec<u8>>>(1)?.map(decode_u64),
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        rows.sort_unstable();
-        let mut expected = case.expected;
-        expected.sort_unstable();
-        assert_eq!(rows, expected, "{} outer join", case.name);
-        assert_eq!(
-            sqlite_column(&connection, "joined", "left_value").1,
-            case.left_not_null
-        );
-        assert_eq!(
-            sqlite_column(&connection, "joined", "right_value").1,
-            case.right_not_null
-        );
+        assert_outer_join_case(root.path(), case);
     }
+}
+
+fn assert_outer_join_case(root: &Path, case: OuterJoinCase) {
+    let flow_path = root.join(format!("{}-flow", case.name));
+    let sqlite_path = root.join(format!("{}.sqlite", case.name));
+    let program = SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{}', table => 'joined') \
+         SELECT left_scan.value AS left_value, right_scan.value AS right_value \
+         FROM sequence(start => {}) AS left_scan \
+         {} sequence(start => {}) AS right_scan \
+         ON {}",
+        sql_string(&sqlite_path),
+        case.left_start,
+        case.join,
+        case.right_start,
+        case.condition,
+    ))
+    .unwrap();
+
+    drop(program.start(&flow_path).unwrap());
+    let mut flow = program.start(&flow_path).unwrap();
+    advance_to_idle(&mut flow);
+    drop(flow);
+
+    let connection = sqlite(&sqlite_path);
+    let mut rows = connection
+        .prepare("SELECT left_value, right_value FROM joined")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?.map(decode_u64),
+                row.get::<_, Option<Vec<u8>>>(1)?.map(decode_u64),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.sort_unstable();
+    let mut expected = case.expected;
+    expected.sort_unstable();
+    assert_eq!(rows, expected, "{} outer join", case.name);
+    assert_eq!(
+        sqlite_column(&connection, "joined", "left_value").1,
+        case.left_not_null
+    );
+    assert_eq!(
+        sqlite_column(&connection, "joined", "right_value").1,
+        case.right_not_null
+    );
 }
 
 #[test]
@@ -288,7 +370,9 @@ fn right_outer_join_restores_asymmetric_sql_schema_and_state_across_reopen() {
                     CAST(value AS VARCHAR) AS right_text \
              FROM sequence(start => {})\
          ) AS right_scan \
-         ON left_scan.left_id = right_scan.right_id",
+         ON left_scan.left_code % CAST(1 AS BIGINT) \
+                = right_scan.right_code % CAST(1 AS BIGINT) \
+         AND left_scan.left_id <= right_scan.right_id",
         sql_string(&sqlite_path),
         u64::MAX,
         u64::MAX - 1,
@@ -347,55 +431,74 @@ fn right_outer_join_restores_asymmetric_sql_schema_and_state_across_reopen() {
 }
 
 #[test]
-fn semi_and_anti_join_family_selects_the_preserved_side_across_reopen() {
+fn semi_and_anti_join_family_applies_residuals_across_reopen() {
+    let start = u64::MAX - 2;
     let cases = [
         (
             "left-semi",
             "left_scan.value",
             "LEFT SEMI JOIN",
-            u64::MAX - 1,
-            u64::MAX,
-            "left_scan.value = right_scan.value - CAST(1 AS BIGINT UNSIGNED)",
-            vec![u64::MAX - 1],
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND left_scan.value < right_scan.value",
+            vec![u64::MAX - 2],
         ),
         (
             "left-anti",
             "left_scan.value",
             "LEFT ANTI JOIN",
-            u64::MAX - 1,
-            u64::MAX,
-            "left_scan.value = right_scan.value - CAST(1 AS BIGINT UNSIGNED)",
-            vec![u64::MAX],
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND left_scan.value < right_scan.value",
+            vec![u64::MAX - 1, u64::MAX],
         ),
         (
             "right-semi",
             "right_scan.value",
             "RIGHT SEMI JOIN",
-            u64::MAX,
-            u64::MAX - 1,
-            "left_scan.value - CAST(1 AS BIGINT UNSIGNED) = right_scan.value",
-            vec![u64::MAX - 1],
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND left_scan.value < right_scan.value",
+            vec![u64::MAX],
         ),
         (
             "right-anti",
             "right_scan.value",
             "RIGHT ANTI JOIN",
-            u64::MAX,
-            u64::MAX - 1,
-            "left_scan.value - CAST(1 AS BIGINT UNSIGNED) = right_scan.value",
-            vec![u64::MAX],
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND right_scan.value = 18446744073709551615",
+            vec![u64::MAX - 2, u64::MAX - 1],
+        ),
+        (
+            "left-semi-null-residual",
+            "left_scan.value",
+            "LEFT SEMI JOIN",
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND CAST(NULL AS BOOLEAN)",
+            vec![],
+        ),
+        (
+            "left-anti-null-residual",
+            "left_scan.value",
+            "LEFT ANTI JOIN",
+            "left_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             = right_scan.value % CAST(2 AS BIGINT UNSIGNED) \
+             AND CAST(NULL AS BOOLEAN)",
+            vec![u64::MAX - 2, u64::MAX - 1, u64::MAX],
         ),
     ];
 
     let root = tempfile::tempdir().unwrap();
-    for (name, selected, join, left_start, right_start, condition, expected) in cases {
+    for (name, selected, join, condition, expected) in cases {
         let flow_path = root.path().join(format!("{name}-flow"));
         let sqlite_path = root.path().join(format!("{name}.sqlite"));
         let program = SqlProgram::parse(&format!(
             "INSERT INTO sqlite(path => '{}', table => 'selected') \
              SELECT {selected} AS value \
-             FROM sequence(start => {left_start}) AS left_scan \
-             {join} sequence(start => {right_start}) AS right_scan \
+             FROM sequence(start => {start}) AS left_scan \
+             {join} sequence(start => {start}) AS right_scan \
              ON {condition}",
             sql_string(&sqlite_path),
         ))
@@ -406,6 +509,13 @@ fn semi_and_anti_join_family_selects_the_preserved_side_across_reopen() {
         advance_to_idle(&mut flow);
         drop(flow);
 
+        if expected.is_empty() {
+            assert!(
+                !sqlite_path.exists(),
+                "{name} emitted an unexpected relation"
+            );
+            continue;
+        }
         let connection = sqlite(&sqlite_path);
         let mut values = connection
             .prepare("SELECT value FROM selected")

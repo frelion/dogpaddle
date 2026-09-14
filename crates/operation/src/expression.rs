@@ -147,16 +147,24 @@ impl StoredExpression {
         &self,
         input_schema: SchemaRef,
     ) -> Result<BoundExpression, ExpressionBindError> {
-        let datafusion_schema = DFSchema::try_from(Arc::clone(&input_schema))?;
+        let datafusion_schema = DFSchema::try_from(input_schema)?;
+        self.bind_with_dfschema(&datafusion_schema)
+    }
+
+    pub(crate) fn bind_with_dfschema(
+        &self,
+        datafusion_schema: &DFSchema,
+    ) -> Result<BoundExpression, ExpressionBindError> {
+        let input_schema = Arc::clone(datafusion_schema.inner());
         let output_metadata = self
             .expression()
-            .to_field(&datafusion_schema)?
+            .to_field(datafusion_schema)?
             .1
             .metadata()
             .clone();
         let physical = create_physical_expr(
             self.expression(),
-            &datafusion_schema,
+            datafusion_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
         )?;

@@ -100,6 +100,16 @@ pub enum EquiJoinDefinitionError {
         /// Side containing the rejected expression.
         side: &'static str,
     },
+    /// The residual predicate cannot be persisted canonically.
+    #[error("equi-join residual predicate cannot be persisted")]
+    ResidualExpression {
+        /// Expression persistence failure.
+        #[source]
+        source: ExpressionDefinitionError,
+    },
+    /// The residual must be immutable because a paged turn evaluates it again after reopen.
+    #[error("equi-join residual predicate is not immutable")]
+    NonImmutableResidual,
 }
 
 /// Equality join rejection while binding two exact input Schemas.
@@ -134,6 +144,19 @@ pub enum EquiJoinSchemaError {
         key: usize,
         /// Rejected exact type.
         data_type: DataType,
+    },
+    /// The persistent residual cannot bind to the exact candidate-pair Schema.
+    #[error("equi-join residual predicate cannot bind")]
+    ResidualExpression {
+        /// Expression binding failure.
+        #[source]
+        source: ExpressionBindError,
+    },
+    /// A residual predicate must produce a Boolean value.
+    #[error("equi-join residual predicate must produce Boolean, found {actual}")]
+    ResidualType {
+        /// Actual expression result type.
+        actual: DataType,
     },
     /// One stable name is required for every field emitted by the selected Join kind.
     #[error("equi-join requires {expected} output names but received {actual}")]
@@ -175,6 +198,16 @@ pub enum EquiJoinError {
         #[source]
         source: ExpressionError,
     },
+    /// The exact candidate-pair residual predicate failed during evaluation.
+    #[error("equi-join residual predicate evaluation failed")]
+    ResidualExpression {
+        /// Predicate evaluation failure.
+        #[source]
+        source: ExpressionError,
+    },
+    /// The residual reported Boolean but did not produce Arrow's canonical Boolean array.
+    #[error("equi-join residual predicate did not produce a canonical Boolean Arrow array")]
+    ResidualArray,
     /// Applying a difference would make one exact input row negative.
     #[error("equi-join input would make an exact row weight negative")]
     NegativeWeight,
@@ -187,6 +220,15 @@ pub enum EquiJoinError {
     /// Persisted key counts disagree with an exact row removal.
     #[error("equi-join key row count underflow")]
     KeyCountUnderflow,
+    /// The number of qualifying distinct opposite rows for one exact row cannot be represented.
+    #[error("equi-join match count overflow")]
+    MatchCountOverflow,
+    /// Persisted qualifying-match support disagrees with a distinct-row removal.
+    #[error("equi-join match count underflow")]
+    MatchCountUnderflow,
+    /// Durable qualifying-match state is inconsistent with the pinned input Claim.
+    #[error("equi-join match count is invalid: {0}")]
+    InvalidMatchCount(&'static str),
     /// A matched-pair difference or an existence/NULL-row correction exceeds `i64`.
     #[error("equi-join output difference overflow")]
     OutputDifferenceOverflow,
