@@ -125,6 +125,54 @@ fn turn_idle_never_enters_the_transactional_body() {
 }
 
 #[test]
+fn input_station_without_a_claim_can_commit_internal_work() {
+    let mut fixture = scan_sink(1, NonZeroU64::MAX);
+    let state = fixture.states[1].clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.stations[1].replace_operation(Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"internal-progress",
+            ScriptResult::Action(Action::Commit(None)),
+        )
+        .with_after_commit(Arc::clone(&runs), false),
+    ));
+
+    assert_eq!(fixture.step(1), AdvanceOutcome::Progressed);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        read_attempt(&state, &mut fixture.transactions).as_deref(),
+        Some(b"internal-progress".as_slice())
+    );
+    assert_eq!(fixture.position(1, 0), 0);
+    assert_eq!(claim_id(&fixture.stations[1]), None);
+}
+
+#[test]
+fn complete_without_an_offered_claim_is_a_rollback_error() {
+    let mut fixture = scan_sink(1, NonZeroU64::MAX);
+    let state = fixture.states[1].clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.stations[1].replace_operation(Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"must-roll-back",
+            ScriptResult::Action(Action::Complete(None)),
+        )
+        .with_after_commit(Arc::clone(&runs), false),
+    ));
+
+    assert!(matches!(
+        fixture.try_step(1),
+        Err(StationError::OperationCompletedWithoutInput)
+    ));
+    assert_eq!(runs.load(Ordering::Relaxed), 0);
+    assert_eq!(read_attempt(&state, &mut fixture.transactions), None);
+    assert_eq!(fixture.position(1, 0), 0);
+    assert_eq!(claim_id(&fixture.stations[1]), None);
+}
+
+#[test]
 fn duplicate_edges_acknowledge_independently_and_release_the_shared_entry() {
     let mut fixture = duplicate_input_station();
 

@@ -44,7 +44,7 @@ pub(crate) enum StationError {
     MissingActiveInput,
     #[error("station durable active input {input} is outside input count {input_count}")]
     ActiveInputOutOfRange { input: usize, input_count: usize },
-    #[error("an input-free Operation returned Complete")]
+    #[error("an Operation returned Complete without an offered input")]
     OperationCompletedWithoutInput,
     #[error("operation produced output for a Station without an output stream")]
     UnexpectedOutput,

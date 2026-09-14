@@ -164,17 +164,20 @@ turn(input) ──> PreparedTurn ──> prepared.apply(access) ──> commit �
 ```
 
 `turn` 适合轮询外部来源、恢复临时客户端或准备一个有界页面。它不能提前 ACK，也不能推进任何影响
-重放的事实。返回 `Turn::Idle` 时，Station 连事务都不需要开启。
+重放的事实。`None` 表示本轮没有 Claim：Scan 始终收到 `None`，输入 Operation 在上游暂时没有数据时
+也会收到 `None`，从而可以继续处理自己的持久内部工作；没有这种工作时返回 `Turn::Idle`，Station
+连事务都不需要开启。
 
 `PreparedTurn::apply` 在事务内返回一个 `Action`：
 
 | action | 本 turn 的写入和输出 | 当前输入 |
 | --- | --- | --- |
 | `Idle` | 全部回滚 | 保持原样 |
-| `Commit(output)` | 提交 | 保留，下一 turn 再收到完整输入 |
-| `Complete(output)` | 提交 | 同事务完成并推进 |
+| `Commit(output)` | 提交 | 若有 Claim 则保留；无 Claim 时只提交内部进度 |
+| `Complete(output)` | 提交 | 同事务完成并推进，要求本轮确实有 Claim |
 
-没有输入的 Scan 用 `Commit` 表示一次成功输出。只有消费输入的 Operation 可以返回 `Complete`。
+没有输入的 Scan 和执行内部工作的输入 Operation 都用 `Commit` 表示成功。只有收到 Claim 的
+Operation 可以返回 `Complete`。
 Join 用 `Commit` 保存分页进度，最后一页才返回 `Complete`。
 
 `AfterCommit` 只在事务真正提交后执行。CDC 的外部 delivery ACK、关系 Sink 的目标数据库写入都在

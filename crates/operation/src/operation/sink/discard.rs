@@ -30,9 +30,6 @@ pub struct DiscardOperation;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DiscardError {
-    /// The sink was called without an input Change.
-    #[error("discard requires one input Change")]
-    MissingInput,
     /// Discard only accepts its definition's first input port.
     #[error("discard does not accept input port {port}")]
     InvalidInputPort {
@@ -83,7 +80,9 @@ impl TurnOperation for DiscardOperation {
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
-        let input = input.ok_or(DiscardError::MissingInput)?;
+        let Some(input) = input else {
+            return Ok(Turn::Idle);
+        };
         if input.port != 0 {
             return Err(DiscardError::InvalidInputPort { port: input.port }.into());
         }

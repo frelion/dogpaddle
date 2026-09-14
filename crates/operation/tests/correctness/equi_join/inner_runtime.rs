@@ -6,7 +6,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     Expr, MaterializeError, OperationBindError, OperationDefinition, col,
     operation::{
-        Action, Operation, OperationError, OperationInput,
+        Action, Operation, OperationError, OperationInput, Turn,
         transform::{
             EquiJoinDefinition, EquiJoinDefinitionError, EquiJoinError, EquiJoinKind,
             EquiJoinSchemaError,
@@ -316,16 +316,10 @@ fn both_input_ports_update_relations_and_emit_weighted_matches_in_left_right_ord
 }
 
 #[test]
-fn runtime_rejects_missing_invalid_port_and_exact_schema_drift() {
+fn runtime_idles_without_input_and_rejects_invalid_port_and_exact_schema_drift() {
     let root = TestStore::new();
     let (mut operation, mut transactions) = create_operation(&root);
-    let Err(error) = operation.turn(None) else {
-        panic!("inner join accepted a missing input");
-    };
-    assert!(matches!(
-        error.downcast_ref::<EquiJoinError>(),
-        Some(EquiJoinError::MissingInput)
-    ));
+    assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
 
     let input = left_change(vec![Some(1)], vec!["left"], vec![1]);
     let error = rollback_ready(

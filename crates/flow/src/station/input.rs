@@ -88,10 +88,6 @@ impl Inbox {
         Ok((Some(active), inputs))
     }
 
-    pub(super) const fn is_input_free(&self) -> bool {
-        self.ports.is_empty()
-    }
-
     pub(super) const fn claim(&self) -> Option<&Claim> {
         self.claim.as_ref()
     }

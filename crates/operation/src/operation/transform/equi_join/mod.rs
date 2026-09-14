@@ -152,9 +152,6 @@ pub enum EquiJoinSchemaError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EquiJoinError {
-    /// The runtime requires one complete input Change.
-    #[error("equi-join requires input")]
-    MissingInput,
     /// Only the two bound input ports are valid.
     #[error("equi-join does not accept input port {port}")]
     InvalidInputPort {

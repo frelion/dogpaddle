@@ -665,7 +665,9 @@ impl TurnOperation for EquiJoinOperation {
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
-        let input = input.ok_or_else(|| Box::new(EquiJoinError::MissingInput) as OperationError)?;
+        let Some(input) = input else {
+            return Ok(Turn::Idle);
+        };
         self.validate_input(input)?;
         if self.prepared.is_none() {
             self.prepared = Some(self.prepare_claim(input)?);

@@ -59,9 +59,6 @@ impl Station {
         transactions: &mut Transactions,
     ) -> Result<AdvanceOutcome, StationError> {
         self.ensure_runnable()?;
-        if !self.inbox.is_input_free() && self.inbox.claim().is_none() {
-            return Ok(AdvanceOutcome::Idle);
-        }
 
         let (completes_input, after_commit) = {
             let input = self.inbox.claim().map(|claim| OperationInput {
@@ -90,7 +87,7 @@ impl Station {
                 Action::Idle => return Ok(AdvanceOutcome::Idle),
                 Action::Commit(output) => (output, false),
                 Action::Complete(output) => {
-                    if self.inbox.is_input_free() {
+                    if self.inbox.claim().is_none() {
                         return Err(StationError::OperationCompletedWithoutInput);
                     }
                     (output, true)

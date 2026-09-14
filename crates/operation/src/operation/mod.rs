@@ -26,14 +26,15 @@ pub enum Action {
     Idle,
     /// Commits the Operation's state and optional output without completing an input.
     ///
-    /// An input Operation retains the complete input Change for its next turn.
-    /// An input-free Operation uses this action for a successful turn.
+    /// Any offered input remains current for the next turn. An Operation may
+    /// also use this action to commit internal progress when no input was
+    /// offered.
     Commit(Option<Change>),
     /// Commits the Operation's state, optional output, and input completion atomically.
     ///
     /// The caller advances the offered input only after the enclosing
     /// transaction commits successfully. Returning this action from an
-    /// input-free turn is a protocol violation.
+    /// turn without an offered input is a protocol violation.
     Complete(Option<Change>),
 }
 
@@ -240,10 +241,13 @@ impl<'turn> Turn<'turn> {
 pub trait TurnOperation: Send + 'static {
     /// Produces one bounded turn while no Store write transaction is active.
     ///
-    /// A Scan receives `None`. An input Operation receives exactly one
-    /// complete Change. This phase may prepare bounded external work, but it
-    /// must not confirm that work or advance any replay-sensitive fact before
-    /// the returned prepared turn commits.
+    /// `None` means that no input Claim is currently offered. A Scan always
+    /// receives `None`; an input Operation may also receive `None` when its
+    /// inputs are caught up, allowing durable internal work to continue. An
+    /// Operation with no such work returns [`Turn::Idle`]. This phase may
+    /// prepare bounded external work, but it must not confirm that work or
+    /// advance any replay-sensitive fact before the returned prepared turn
+    /// commits.
     ///
     /// [`Turn::Idle`] avoids opening a Store transaction. [`Turn::Ready`]
     /// contains a linear prepared turn that the caller applies once in a Store
@@ -288,17 +292,17 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns the concrete preparation failure, or a protocol error when an
-    /// atomic transform is invoked without an input.
+    /// Returns a concrete preparation failure reported by a full-turn
+    /// Operation.
     pub fn turn<'turn>(
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
         match self {
             Self::Atomic(operation) => {
-                let input = input.ok_or_else(|| {
-                    Box::new(AtomicInputRequired) as Box<dyn Error + Send + Sync + 'static>
-                })?;
+                let Some(input) = input else {
+                    return Ok(Turn::Idle);
+                };
                 Ok(Turn::Ready(PreparedTurn::atomic(operation.as_mut(), input)))
             }
             Self::Turn(operation) => operation.turn(input),
@@ -310,17 +314,6 @@ pub(crate) fn exclusive_turn(operation: Box<dyn AtomicOperation>) -> Box<dyn Tur
     Box::new(ExclusiveAtomic { operation })
 }
 
-#[derive(Debug)]
-struct AtomicInputRequired;
-
-impl fmt::Display for AtomicInputRequired {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("atomic transform requires one complete input Change")
-    }
-}
-
-impl Error for AtomicInputRequired {}
-
 struct ExclusiveAtomic {
     operation: Box<dyn AtomicOperation>,
 }
@@ -330,12 +323,40 @@ impl TurnOperation for ExclusiveAtomic {
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
-        let input = input.ok_or_else(|| {
-            Box::new(AtomicInputRequired) as Box<dyn Error + Send + Sync + 'static>
-        })?;
+        let Some(input) = input else {
+            return Ok(Turn::Idle);
+        };
         Ok(Turn::Ready(PreparedTurn::atomic(
             self.operation.as_mut(),
             input,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicOperation, Operation, OperationError, OperationInput, Turn, exclusive_turn};
+    use dogpaddle_change::Change;
+    use dogpaddle_store::TransactionAccess;
+
+    struct UncalledAtomic;
+
+    impl AtomicOperation for UncalledAtomic {
+        fn apply(
+            &mut self,
+            _input: OperationInput<'_>,
+            _access: TransactionAccess<'_>,
+        ) -> Result<Option<Change>, OperationError> {
+            unreachable!("an atomic adapter without an offered input must idle")
+        }
+    }
+
+    #[test]
+    fn atomic_adapters_idle_without_an_offered_input() {
+        let mut atomic = Operation::Atomic(Box::new(UncalledAtomic));
+        assert!(matches!(atomic.turn(None).unwrap(), Turn::Idle));
+
+        let mut exclusive = Operation::Turn(exclusive_turn(Box::new(UncalledAtomic)));
+        assert!(matches!(exclusive.turn(None).unwrap(), Turn::Idle));
     }
 }

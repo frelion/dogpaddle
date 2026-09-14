@@ -37,10 +37,11 @@
 `Flow::advance()` 是宿主显式调用的一轮调度，不是后台线程。它按确定的拓扑顺序访问每个 Station，
 每个 Station 最多执行一个 turn（一次有界尝试）。上游在本轮提交的输出，排在后面的下游可以在同一轮读到。
 
-对一个有输入的 Station，一次 turn 的主路径是：
+对一个 Station，一次 turn 的主路径是：
 
-1. 从某个输入队列查看下一条完整 `Change`，解码并放进内存。这个尚未确认的输入称为
-   **Claim**，意思是“本 Station 当前正在处理的那一条输入”。
+1. 如果输入队列有数据，从某个输入查看下一条完整 `Change`，解码并放进内存。这个尚未确认的输入
+   称为 **Claim**，意思是“本 Station 当前正在处理的那一条输入”。没有数据时本轮没有 Claim，
+   Operation 仍可继续处理自己的持久内部工作。
 2. 首 Operation 在没有写事务时准备工作。如果暂时无事可做，直接返回 `Idle`。
 3. Flow 开启一笔 `RocksDB` 写事务，执行首 Operation 已准备好的工作，再依次执行 Station 内的尾部 Operation。
 4. 把最后一个 Operation 的输出追加到 Station 的持久队列。
@@ -52,11 +53,11 @@
 | 动作 | 含义 |
 | --- | --- |
 | `Idle` | 本次没有进展，事务内写入全部回滚 |
-| `Commit(output)` | 提交状态和可选输出，但保留当前 Claim，下一轮继续它 |
-| `Complete(output)` | 提交状态和可选输出，同时确认整个 Claim 已处理完 |
+| `Commit(output)` | 提交状态和可选输出；若有 Claim 则保留它，下一轮继续 |
+| `Complete(output)` | 提交状态和可选输出，同时确认整个 Claim；无 Claim 时非法 |
 
 因此 Join 可以把一个大输入分几轮处理：中间轮使用 `Commit` 保存游标，最后一轮使用 `Complete`。
-零输入 Scan 没有 Claim，成功时使用 `Commit`。
+零输入 Scan 或暂时没有 Claim 但仍有内部工作的 Operation，成功时使用 `Commit`。
 
 如果输出队列达到容量，Operation turn 返回 `Backpressured`：算子状态、输出和输入确认都不提交。
 多输入 Station 如果刚切换过端口，之前提交的端口选择仍然保留，因此这一轮 Flow 仍报告发生了进展。

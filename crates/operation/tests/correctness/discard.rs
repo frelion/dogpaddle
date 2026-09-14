@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use dogpaddle_operation::{
     DataInstances, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
     operation::{
-        Action, OperationInput,
+        Action, OperationInput, Turn,
         sink::{DiscardDefinition, DiscardError},
     },
 };
@@ -39,7 +39,7 @@ fn definition_has_stable_v1_literal_and_is_a_data_free_exact_sink() {
 }
 
 #[test]
-fn runtime_completes_input_and_rejects_missing_or_invalid_ports() {
+fn runtime_completes_input_idles_without_input_and_rejects_invalid_ports() {
     let input = change(&[1, -1]);
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
@@ -53,11 +53,7 @@ fn runtime_completes_input_and_rejects_missing_or_invalid_ports() {
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
         Action::Complete(None)
     ));
-    let error = rollback_ready(&mut operation, None, &mut transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<DiscardError>(),
-        Some(DiscardError::MissingInput)
-    ));
+    assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
     let error = rollback_ready(
         &mut operation,
         Some(OperationInput {
