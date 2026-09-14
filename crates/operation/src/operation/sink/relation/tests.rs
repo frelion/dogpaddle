@@ -102,8 +102,8 @@ fn delivery(rows: &[(i64, i64)], admissions: &[u64]) -> DeliveryBatch {
     DeliveryBatch::for_test(change(rows), admissions.to_vec()).unwrap()
 }
 
-fn apply(target: &mut Target, input: DeliveryBatch, next_id: &mut u64) {
-    let (next, plan) = plan::prepare(target, &input, *next_id).unwrap();
+fn apply(target: &mut Target, input: &DeliveryBatch, next_id: &mut u64) {
+    let (next, plan) = plan::prepare(target, input, *next_id).unwrap();
     plan::validate(&plan, next, input.change()).unwrap();
     target.write_batch(input.change(), &plan).unwrap();
     let once = target.rows.clone();
@@ -118,12 +118,12 @@ fn insert_delete_same_id_replays_empty_and_never_reuses_an_id() {
     let mut next_id = 1;
     apply(
         &mut target,
-        delivery(&[(7, 2), (7, -2)], &[2, 2]),
+        &delivery(&[(7, 2), (7, -2)], &[2, 2]),
         &mut next_id,
     );
     assert!(target.rows.is_empty());
     assert_eq!(next_id, 3);
-    apply(&mut target, delivery(&[(7, 1)], &[1]), &mut next_id);
+    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
     assert_eq!(target.rows.keys().copied().collect::<Vec<_>>(), [3]);
 }
 
@@ -131,7 +131,7 @@ fn insert_delete_same_id_replays_empty_and_never_reuses_an_id() {
 fn retractions_use_oldest_existing_then_newly_inserted_ids() {
     let mut target = Target::default();
     let mut next_id = 1;
-    apply(&mut target, delivery(&[(7, 3)], &[3]), &mut next_id);
+    apply(&mut target, &delivery(&[(7, 3)], &[3]), &mut next_id);
     let input = delivery(&[(7, 2), (7, -4)], &[2, 4]);
     let (_, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
     assert_eq!(
@@ -167,7 +167,7 @@ fn first_slice_admits_a_large_event_before_any_partial_delivery() {
     for (diff, admission) in [(1024, 2050), (1024, 1024), (2, 2)] {
         apply(
             &mut target,
-            delivery(&[(7, diff)], &[admission]),
+            &delivery(&[(7, diff)], &[admission]),
             &mut next_id,
         );
     }
@@ -181,7 +181,7 @@ fn first_slice_admits_a_large_event_before_any_partial_delivery() {
     for (diff, admission) in [(-1024, 2050), (-1024, 1024), (-2, 2)] {
         apply(
             &mut target,
-            delivery(&[(7, diff)], &[admission]),
+            &delivery(&[(7, diff)], &[admission]),
             &mut next_id,
         );
     }

@@ -233,7 +233,7 @@ fn input(change: &Change) -> OperationInput<'_> {
 }
 
 struct Fixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     path: PathBuf,
     schema: SchemaRef,
     target: Arc<Mutex<TargetState>>,
@@ -264,7 +264,7 @@ impl Fixture {
             buffer.clone(),
         );
         Self {
-            _root: root,
+            root,
             path,
             schema,
             target,
@@ -277,7 +277,7 @@ impl Fixture {
 
     fn reopen(self) -> Self {
         let Self {
-            _root,
+            root,
             path,
             schema,
             target,
@@ -299,7 +299,7 @@ impl Fixture {
             buffer.clone(),
         );
         Self {
-            _root,
+            root,
             path,
             schema,
             target,
@@ -311,10 +311,10 @@ impl Fixture {
     }
 
     fn bootstrap(&mut self) {
-        assert_commit(self.commit(None).unwrap());
-        assert_commit(self.commit(None).unwrap());
-        assert_commit(self.commit(None).unwrap());
-        assert!(matches!(self.commit(None).unwrap(), None));
+        assert_commit(self.commit(None).unwrap().as_ref());
+        assert_commit(self.commit(None).unwrap().as_ref());
+        assert_commit(self.commit(None).unwrap().as_ref());
+        assert!(self.commit(None).unwrap().is_none());
     }
 
     fn commit(&mut self, offered: Option<&Change>) -> Result<Option<Action>, OperationError> {
@@ -396,11 +396,11 @@ impl Fixture {
     }
 }
 
-fn assert_commit(action: Option<Action>) {
+fn assert_commit(action: Option<&Action>) {
     assert!(matches!(action, Some(Action::Commit(None))));
 }
 
-fn assert_complete(action: Option<Action>) {
+fn assert_complete(action: Option<&Action>) {
     assert!(matches!(action, Some(Action::Complete(None))));
 }
 
@@ -551,10 +551,12 @@ fn loader_slices_mixed_diffs_and_preserves_whole_row_admission() {
     let first_batch = batch::load(
         &buffer,
         before,
-        6,
-        MAX_DELIVERY_BYTES,
-        MAX_DELIVERY_BYTES,
-        MAX_TARGET_BATCH_BYTES,
+        batch::LoadLimits::new(
+            6,
+            MAX_DELIVERY_BYTES,
+            MAX_DELIVERY_BYTES,
+            MAX_TARGET_BATCH_BYTES,
+        ),
         &mut None,
         &schema(),
         transaction.access(),
@@ -578,10 +580,12 @@ fn loader_slices_mixed_diffs_and_preserves_whole_row_admission() {
     let second_batch = batch::load(
         &buffer,
         first_batch.after,
-        4,
-        MAX_DELIVERY_BYTES,
-        MAX_DELIVERY_BYTES,
-        MAX_TARGET_BATCH_BYTES,
+        batch::LoadLimits::new(
+            4,
+            MAX_DELIVERY_BYTES,
+            MAX_DELIVERY_BYTES,
+            MAX_TARGET_BATCH_BYTES,
+        ),
         &mut None,
         &schema(),
         transaction.access(),
@@ -636,10 +640,12 @@ fn loader_bounds_cross_entry_aggregation_by_encoded_bytes() {
     let loaded = batch::load(
         &buffer,
         before,
-        2,
-        first_bytes + second_bytes - 1,
-        MAX_DELIVERY_BYTES,
-        MAX_TARGET_BATCH_BYTES,
+        batch::LoadLimits::new(
+            2,
+            first_bytes + second_bytes - 1,
+            MAX_DELIVERY_BYTES,
+            MAX_TARGET_BATCH_BYTES,
+        ),
         &mut None,
         &schema(),
         transaction.access(),
@@ -650,6 +656,31 @@ fn loader_bounds_cross_entry_aggregation_by_encoded_bytes() {
     assert_eq!(loaded.delivery.change().diffs().values(), &[1]);
     assert_eq!(loaded.after.head, Some(Position::entry_start(1)));
     assert_eq!(loaded.after.retained_bytes, second_bytes);
+}
+
+fn assert_loader_error(
+    buffer: &OrderedMap<u64, Vec<u8>>,
+    transactions: &mut Transactions,
+    before: BufferState,
+) {
+    let transaction = transactions.begin();
+    assert!(
+        batch::load(
+            buffer,
+            before,
+            batch::LoadLimits::new(
+                1,
+                MAX_DELIVERY_BYTES,
+                MAX_DELIVERY_BYTES,
+                MAX_TARGET_BATCH_BYTES,
+            ),
+            &mut None,
+            &schema(),
+            transaction.access(),
+            |_, _| Ok(1),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -671,23 +702,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: 8,
     };
 
-    let transaction = transactions.begin();
-    assert!(
-        batch::load(
-            &buffer,
-            before,
-            1,
-            MAX_DELIVERY_BYTES,
-            MAX_DELIVERY_BYTES,
-            MAX_TARGET_BATCH_BYTES,
-            &mut None,
-            &schema(),
-            transaction.access(),
-            |_, _| Ok(1),
-        )
-        .is_err()
-    );
-    drop(transaction);
+    assert_loader_error(&buffer, &mut transactions, before);
 
     let transaction = transactions.begin();
     buffer
@@ -700,23 +715,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: 11,
         ..before
     };
-    let transaction = transactions.begin();
-    assert!(
-        batch::load(
-            &buffer,
-            corrupt,
-            1,
-            MAX_DELIVERY_BYTES,
-            MAX_DELIVERY_BYTES,
-            MAX_TARGET_BATCH_BYTES,
-            &mut None,
-            &schema(),
-            transaction.access(),
-            |_, _| Ok(1),
-        )
-        .is_err()
-    );
-    drop(transaction);
+    assert_loader_error(&buffer, &mut transactions, corrupt);
 
     let wrong = Change::try_new(
         RecordBatch::try_new(
@@ -743,28 +742,13 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: encoded_item_bytes(&encoded).unwrap(),
         ..before
     };
-    let transaction = transactions.begin();
-    assert!(
-        batch::load(
-            &buffer,
-            wrong_schema,
-            1,
-            MAX_DELIVERY_BYTES,
-            MAX_DELIVERY_BYTES,
-            MAX_TARGET_BATCH_BYTES,
-            &mut None,
-            &schema(),
-            transaction.access(),
-            |_, _| Ok(1),
-        )
-        .is_err()
-    );
+    assert_loader_error(&buffer, &mut transactions, wrong_schema);
 }
 
 #[test]
 fn initialization_intent_rollback_has_no_target_effect() {
     let mut fixture = Fixture::create();
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(matches!(
         fixture.rollback(None).unwrap(),
         Action::Commit(None)
@@ -789,8 +773,8 @@ fn admission_rolls_back_atomically_and_small_claims_form_multiple_entries() {
     assert!(fixture.entry(0).is_none());
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
 
-    assert_complete(fixture.commit(Some(&first)).unwrap());
-    assert_complete(fixture.commit(Some(&second)).unwrap());
+    assert_complete(fixture.commit(Some(&first)).unwrap().as_ref());
+    assert_complete(fixture.commit(Some(&second)).unwrap().as_ref());
     assert!(fixture.entry(0).is_some());
     assert!(fixture.entry(1).is_some());
     let durable = ready(&fixture.control().unwrap());
@@ -803,7 +787,7 @@ fn load_cache_and_prepared_intent_only_advance_after_commit() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let input = change(&[1], &[3]);
-    assert_complete(fixture.commit(Some(&input)).unwrap());
+    assert_complete(fixture.commit(Some(&input)).unwrap().as_ref());
 
     assert!(matches!(
         fixture.rollback(None).unwrap(),
@@ -815,7 +799,7 @@ fn load_cache_and_prepared_intent_only_advance_after_commit() {
         Header::Ready(_)
     ));
 
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(matches!(
         fixture.rollback(None).unwrap(),
         Action::Commit(None)
@@ -827,7 +811,7 @@ fn load_cache_and_prepared_intent_only_advance_after_commit() {
         Header::Ready(_)
     ));
 
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().prepare_calls, 1);
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 1);
 }
@@ -838,15 +822,15 @@ fn continuous_claim_is_held_while_threshold_drains_and_then_is_admitted() {
     fixture.bootstrap();
     let buffered = change(&[1], &[3]);
     let offered = change(&[9], &[1]);
-    assert_complete(fixture.commit(Some(&buffered)).unwrap());
+    assert_complete(fixture.commit(Some(&buffered)).unwrap().as_ref());
 
-    assert_commit(fixture.commit(Some(&offered)).unwrap());
+    assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().prepare_calls, 0);
-    assert_commit(fixture.commit(Some(&offered)).unwrap());
+    assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().delivered.len(), 1);
-    assert_commit(fixture.commit(Some(&offered)).unwrap());
+    assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
     assert!(fixture.entry(0).is_none());
-    assert_complete(fixture.commit(Some(&offered)).unwrap());
+    assert_complete(fixture.commit(Some(&offered)).unwrap().as_ref());
     assert!(fixture.entry(0).is_some());
 }
 
@@ -855,19 +839,19 @@ fn one_large_diff_is_settled_across_bounded_batches() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let input = change(&[1], &[7]);
-    assert_complete(fixture.commit(Some(&input)).unwrap());
+    assert_complete(fixture.commit(Some(&input)).unwrap().as_ref());
 
     for expected_batch in 1..=3 {
-        assert_commit(fixture.commit(None).unwrap());
-        assert_commit(fixture.commit(None).unwrap());
-        assert_commit(fixture.commit(None).unwrap());
+        assert_commit(fixture.commit(None).unwrap().as_ref());
+        assert_commit(fixture.commit(None).unwrap().as_ref());
+        assert_commit(fixture.commit(None).unwrap().as_ref());
         assert_eq!(
             fixture.target.lock().unwrap().delivered.len(),
             expected_batch
         );
         assert_eq!(fixture.entry(0).is_none(), expected_batch == 3);
     }
-    assert!(matches!(fixture.commit(None).unwrap(), None));
+    assert!(fixture.commit(None).unwrap().is_none());
     let delivered = fixture.target.lock().unwrap();
     assert_eq!(delivered.delivered[&1].events, 3);
     assert_eq!(delivered.delivered[&2].events, 3);
@@ -879,8 +863,8 @@ fn prepared_delivery_is_rebuilt_after_an_uncertain_result() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let change = change(&[1], &[3]);
-    assert_complete(fixture.commit(Some(&change)).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
+    assert_complete(fixture.commit(Some(&change)).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     fixture.target.lock().unwrap().fail_after_delivery_once = true;
     assert!(fixture.commit(None).is_err());
     assert_eq!(fixture.target.lock().unwrap().delivered.len(), 1);
@@ -891,9 +875,9 @@ fn prepared_delivery_is_rebuilt_after_an_uncertain_result() {
     ));
 
     let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 2);
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(fixture.entry(0).is_none());
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
 }
@@ -903,8 +887,8 @@ fn committed_prepared_without_its_callback_replays_on_open() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let change = change(&[1], &[3]);
-    assert_complete(fixture.commit(Some(&change)).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
+    assert_complete(fixture.commit(Some(&change)).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(matches!(
         fixture.commit_without_after_commit(None).unwrap(),
         Action::Commit(None)
@@ -912,9 +896,9 @@ fn committed_prepared_without_its_callback_replays_on_open() {
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 0);
 
     let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 1);
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(fixture.entry(0).is_none());
 }
 
@@ -923,9 +907,9 @@ fn settlement_rollback_keeps_the_prepared_state_and_complete_entries() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let change = change(&[1], &[3]);
-    assert_complete(fixture.commit(Some(&change)).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
+    assert_complete(fixture.commit(Some(&change)).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
 
     assert!(matches!(
         fixture.rollback(None).unwrap(),
@@ -936,7 +920,7 @@ fn settlement_rollback_keeps_the_prepared_state_and_complete_entries() {
         state::decode_header::<Target>(&fixture.control().unwrap()).unwrap(),
         Header::Prepared { .. }
     ));
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(fixture.entry(0).is_none());
 }
 
@@ -945,7 +929,7 @@ fn recovery_rejects_a_forged_settlement_before_decoding_its_plan() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let input_change = change(&[1], &[5]);
-    assert_complete(fixture.commit(Some(&input_change)).unwrap());
+    assert_complete(fixture.commit(Some(&input_change)).unwrap().as_ref());
     let before = ready(&fixture.control().unwrap());
     let delivery = DeliveryBatch::for_test(change(&[1], &[3]), vec![5]).unwrap();
     let forged = State::Prepared(Prepared {
@@ -1019,10 +1003,10 @@ fn target_byte_charge_slices_delivery_and_rejects_one_oversized_event_before_ack
     let mut fixture = Fixture::create();
     fixture.target.lock().unwrap().event_bytes = MAX_TARGET_BATCH_BYTES / 2 + 1;
     fixture.bootstrap();
-    assert_complete(fixture.commit(Some(&change(&[7], &[3]))).unwrap());
+    assert_complete(fixture.commit(Some(&change(&[7], &[3]))).unwrap().as_ref());
 
     let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     for _ in 0..32 {
         if fixture.commit(None).unwrap().is_none() {
             break;
@@ -1047,7 +1031,12 @@ fn target_byte_charge_slices_delivery_and_rejects_one_oversized_event_before_ack
 fn restore_checks_positive_capacity_before_any_target_io() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
-    assert_complete(fixture.commit(Some(&change(&[1, 2], &[-2, 2]))).unwrap());
+    assert_complete(
+        fixture
+            .commit(Some(&change(&[1, 2], &[-2, 2])))
+            .unwrap()
+            .as_ref(),
+    );
     fixture.target.lock().unwrap().recovery_positive_capacity = Some(1);
 
     let mut fixture = fixture.reopen();
@@ -1080,12 +1069,12 @@ fn a_wide_large_change_round_trips_through_owned_ipc_and_reopen() {
 
     let mut fixture = Fixture::create_with_schema(wide_schema);
     fixture.bootstrap();
-    assert_complete(fixture.commit(Some(&input)).unwrap());
+    assert_complete(fixture.commit(Some(&input)).unwrap().as_ref());
     let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
     assert_eq!(fixture.target.lock().unwrap().delivered.len(), 1);
 }
@@ -1103,7 +1092,7 @@ fn admission_reserves_enough_batch_ids_for_every_buffered_event() {
         .encode::<Target>(),
     );
     let mut fixture = fixture.reopen();
-    assert_commit(fixture.commit(None).unwrap());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
 
     assert!(fixture.commit(Some(&change(&[1], &[2]))).is_err());
     assert!(fixture.entry(0).is_none());
@@ -1112,10 +1101,10 @@ fn admission_reserves_enough_batch_ids_for_every_buffered_event() {
         u64::MAX - 1
     );
 
-    assert_complete(fixture.commit(Some(&change(&[1], &[1]))).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
-    assert_commit(fixture.commit(None).unwrap());
+    assert_complete(fixture.commit(Some(&change(&[1], &[1]))).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
     let exhausted = ready(&fixture.control().unwrap());
     assert!(exhausted.buffer.is_empty());
     assert_eq!(exhausted.next_batch_id, u64::MAX);
@@ -1126,7 +1115,7 @@ fn admission_reserves_enough_batch_ids_for_every_buffered_event() {
 fn recovery_rejects_buffered_work_that_cannot_drain_before_id_exhaustion() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
-    assert_complete(fixture.commit(Some(&change(&[1], &[2]))).unwrap());
+    assert_complete(fixture.commit(Some(&change(&[1], &[2]))).unwrap().as_ref());
     let admitted = ready(&fixture.control().unwrap());
     fixture.set_control(
         &State::<u64, Plan>::Ready(Ready {
@@ -1147,8 +1136,8 @@ fn recovery_rejects_buffered_work_that_cannot_drain_before_id_exhaustion() {
 fn restore_validates_every_buffer_entry_and_accounting_before_delivery() {
     let mut missing = Fixture::create();
     missing.bootstrap();
-    assert_complete(missing.commit(Some(&change(&[1], &[1]))).unwrap());
-    assert_complete(missing.commit(Some(&change(&[2], &[1]))).unwrap());
+    assert_complete(missing.commit(Some(&change(&[1], &[1]))).unwrap().as_ref());
+    assert_complete(missing.commit(Some(&change(&[2], &[1]))).unwrap().as_ref());
     let transaction = missing.transactions.begin();
     assert!(
         missing
@@ -1165,8 +1154,8 @@ fn restore_validates_every_buffer_entry_and_accounting_before_delivery() {
 
     let mut corrupt = Fixture::create();
     corrupt.bootstrap();
-    assert_complete(corrupt.commit(Some(&change(&[1], &[1]))).unwrap());
-    assert_complete(corrupt.commit(Some(&change(&[2], &[1]))).unwrap());
+    assert_complete(corrupt.commit(Some(&change(&[1], &[1]))).unwrap().as_ref());
+    assert_complete(corrupt.commit(Some(&change(&[2], &[1]))).unwrap().as_ref());
     let transaction = corrupt.transactions.begin();
     let malformed = vec![0, 1, 2];
     corrupt
@@ -1182,7 +1171,12 @@ fn restore_validates_every_buffer_entry_and_accounting_before_delivery() {
 
     let mut miscounted = Fixture::create();
     miscounted.bootstrap();
-    assert_complete(miscounted.commit(Some(&change(&[1, 2], &[1, 1]))).unwrap());
+    assert_complete(
+        miscounted
+            .commit(Some(&change(&[1, 2], &[1, 1])))
+            .unwrap()
+            .as_ref(),
+    );
     let mut durable = ready(&miscounted.control().unwrap());
     durable.buffer.pending_events += 1;
     let encoded = State::<u64, Plan>::Ready(durable).encode::<Target>();

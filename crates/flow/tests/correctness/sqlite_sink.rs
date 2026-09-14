@@ -150,6 +150,7 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
     assert_eq!(rows, (1..=1_025).map(|id| (id, 7)).collect::<Vec<_>>());
 
     let mut reopened = FlowFactory::new(&flow_path).open().unwrap();
+    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
     assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
     assert_eq!(sqlite_rows(&sqlite_path), Some(1_025));
 }

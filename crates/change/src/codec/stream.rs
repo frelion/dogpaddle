@@ -452,7 +452,7 @@ fn parse_metadata<'a>(
     owner: MetadataOwner<'_>,
     budget: &mut SchemaParseBudget,
 ) -> Result<HashMap<String, String>, CodecError> {
-    let metadata_len = metadata.as_ref().map_or(0, |metadata| metadata.len());
+    let metadata_len = metadata.as_ref().map_or(0, flatbuffers::Vector::len);
     budget.metadata_entries = budget
         .metadata_entries
         .checked_add(metadata_len)

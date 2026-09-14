@@ -27,38 +27,15 @@ fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
             .collect::<Vec<_>>(),
         ["sql/scan/00000000", "sql/sink"]
     );
-    for _ in 0..12 {
-        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    }
+    let before_reopen = advance_until_quickstart_rows(&mut flow, &sqlite_path, 5);
     drop(flow);
-    assert_eq!(
-        quickstart_rows(&sqlite_path),
-        [
-            (0, 0, "small".to_owned()),
-            (2, 4, "small".to_owned()),
-            (4, 16, "small".to_owned()),
-            (6, 36, "small".to_owned()),
-            (8, 64, "small".to_owned()),
-        ]
-    );
+    assert_eq!(before_reopen, expected_quickstart_rows(before_reopen.len()));
 
     let mut flow = program.start(&flow_path).unwrap();
-    for _ in 0..6 {
-        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    }
+    let after_reopen =
+        advance_until_quickstart_rows(&mut flow, &sqlite_path, before_reopen.len() + 2);
     drop(flow);
-    assert_eq!(
-        quickstart_rows(&sqlite_path),
-        [
-            (0, 0, "small".to_owned()),
-            (2, 4, "small".to_owned()),
-            (4, 16, "small".to_owned()),
-            (6, 36, "small".to_owned()),
-            (8, 64, "small".to_owned()),
-            (10, 100, "large".to_owned()),
-            (12, 144, "large".to_owned()),
-        ]
-    );
+    assert_eq!(after_reopen, expected_quickstart_rows(after_reopen.len()));
 }
 
 #[test]
@@ -166,7 +143,7 @@ fn inner_join_executes_native_residual_and_projection_across_reopen() {
     assert_eq!(rows, [(u64::MAX - 2, u64::MAX)]);
 
     let mut flow = program.start(&flow_path).unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    assert_restores_to_idle(&mut flow);
 }
 
 #[test]
@@ -510,10 +487,13 @@ fn semi_and_anti_join_family_applies_residuals_across_reopen() {
         drop(flow);
 
         if expected.is_empty() {
-            assert!(
-                !sqlite_path.exists(),
-                "{name} emitted an unexpected relation"
-            );
+            let connection = sqlite(&sqlite_path);
+            let rows = connection
+                .query_row("SELECT COUNT(*) FROM selected", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{name} emitted an unexpected relation");
             continue;
         }
         let connection = sqlite(&sqlite_path);
@@ -632,7 +612,7 @@ fn grouped_aggregates_update_one_relation_across_reopen() {
     );
 
     let mut flow = program.start(&flow_path).unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    assert_restores_to_idle(&mut flow);
 }
 
 #[test]
@@ -750,7 +730,7 @@ fn union_all_preserves_common_name_type_nullability_and_multiplicity() {
     );
 
     let mut flow = program.start(&flow_path).unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    assert_restores_to_idle(&mut flow);
     drop(flow);
     assert_eq!(
         connection
@@ -838,7 +818,7 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     assert_eq!(sqlite_values(&sqlite_path), vec![u64::MAX - 1, u64::MAX]);
 
     let mut reopened = parsed.start(&flow_path).unwrap();
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
+    assert_restores_to_idle(&mut reopened);
     drop(reopened);
     assert_eq!(sqlite_values(&sqlite_path), vec![u64::MAX - 1, u64::MAX]);
 
@@ -920,6 +900,38 @@ fn quickstart_rows(path: &Path) -> Vec<(i64, i64, String)> {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn advance_until_quickstart_rows(
+    flow: &mut Flow,
+    path: &Path,
+    minimum_rows: usize,
+) -> Vec<(i64, i64, String)> {
+    for _ in 0..128 {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+        if path.exists() {
+            let rows = quickstart_rows(path);
+            if rows.len() >= minimum_rows {
+                return rows;
+            }
+        }
+    }
+    panic!("quickstart target did not reach {minimum_rows} rows within 128 advances");
+}
+
+fn expected_quickstart_rows(rows: usize) -> Vec<(i64, i64, String)> {
+    (0..rows)
+        .map(|index| {
+            let number = i64::try_from(index * 2).unwrap();
+            let size = if number >= 10 { "large" } else { "small" };
+            (number, number * number, size.to_owned())
+        })
+        .collect()
+}
+
+fn assert_restores_to_idle(flow: &mut Flow) {
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
 }
 
 fn advance_to_idle(flow: &mut Flow) {

@@ -385,7 +385,7 @@ ACK 或部分 buffer 写入。
 commit 后才在目标数据库的一个事务中执行；之后的独立 Store turn 删除完整消费的 entries 并发布
 新的 `Ready`。进程在目标提交与本地 settle 之间退出时，reopen 从原 buffer 精确重建 Prepared 批次并
 重投；Prepared 的 insert/delete 都绑定 delivery row index 与固定 `$dogpaddle.id`，目标事务在忽略
-重复 insert 后仍核对该 ID 的完整逻辑行，再执行 delete，使原样重投幂等且拒绝 ID/行错配。外部提交结果不确定或 AfterCommit 失败
+重复 insert 后仍核对该 ID 的完整逻辑行，再执行 delete，使原样重投幂等且拒绝 ID/行错配。外部提交结果不确定或 `AfterCommit` 失败
 会使当前 runtime fail-stop，只有 reopen 可以继续。恢复在任何目标副作用前分页校验全部 retained
 entries、连续 sequence、Schema、control accounting，以及 checkpoint 下剩余正事件的技术 ID 容量，
 不能先交付损坏 buffer 的有效前缀。该检查覆盖结构损坏与正常 crash/replay；外部篡改 Store/目标为另一组
@@ -450,7 +450,7 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 - Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
   [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
 
-`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition 和 durable buffered SQLite Sink
+`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition 和 durable buffered `SQLite` Sink
 各有 owner benchmark；其他组合性能由真正拥有 workload 的 Flow、Store 或 Change + Store target
 负责。
 

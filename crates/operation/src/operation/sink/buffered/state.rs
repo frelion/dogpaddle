@@ -196,9 +196,9 @@ impl<C, P> State<C, P> {
     }
 }
 
-pub(super) fn decode_header<'input, T>(
-    mut input: &'input [u8],
-) -> Result<Header<'input, T::Checkpoint>, OperationError>
+pub(super) fn decode_header<T>(
+    mut input: &[u8],
+) -> Result<Header<'_, T::Checkpoint>, OperationError>
 where
     T: SinkTarget,
 {

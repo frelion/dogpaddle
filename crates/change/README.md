@@ -93,7 +93,7 @@ diff 提前相加。Operation 必须从第零行开始依次观察。
 
 v1 还固定限制为最多 16,384 个顶层加嵌套字段、49,152 个 Schema/Field metadata entry，以及
 8 MiB 的字段名、Timestamp timezone、metadata key/value 全局 UTF-8 字节总量。解码器在复制这些
-字符串前执行同一预算，并限制 FlatBuffer 的展开大小，避免很小的恶意 offset 图放大为无界分配。
+字符串前执行同一预算，并限制 `FlatBuffer` 的展开大小，避免很小的恶意 offset 图放大为无界分配。
 
 Timestamp 保留可选 timezone 字符串，但拒绝空字符串；`None` 表示无时区。Decimal128 precision
 必须在 `1..=38`，正 scale 不能超过 precision。构造和完整解码还会检查每个 non-null 物理值确实

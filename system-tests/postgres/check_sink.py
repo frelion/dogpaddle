@@ -293,6 +293,7 @@ class Gate:
         with self.host("open", 4) as host:
             reopened = {station["id"]: station for station in host.status()}
             assert reopened == drained, (reopened, drained)
+            assert host.advance() == "Progressed"
             assert host.advance() == "Idle"
             assert {station["id"]: station for station in host.status()} == drained
             fourth_rows = self.rows()
@@ -304,7 +305,8 @@ class Gate:
         print("PASS target transaction failure rolls back data and fail-stops Flow; "
               "crash at externally committed/local Prepared boundary; reopen produced "
               "exactly three big-endian UInt64 rows with unchanged IDs; input "
-              "head/tail/position=3/3/3 and retained_bytes=0; fourth reopen remained Idle")
+              "head/tail/position=3/3/3 and retained_bytes=0; fourth reopen restored then "
+              "remained Idle")
 
     def direct_host(self, binary: Path, mode: str, scenario: str, session: int) -> Host:
         return Host(binary, mode, self.root / scenario, self.port,

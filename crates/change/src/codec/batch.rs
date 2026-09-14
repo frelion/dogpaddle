@@ -342,7 +342,16 @@ fn consume_field_layout(
             field.name()
         )));
     }
-    if !field.is_nullable() && null_count > masked_nulls {
+    let data_type_layout = DataTypeLayout::classify(field.data_type()).ok_or_else(|| {
+        CodecError::invalid(format!(
+            "unsupported Arrow type {} in RecordBatch layout",
+            field.data_type()
+        ))
+    })?;
+    if !matches!(data_type_layout, DataTypeLayout::Null)
+        && !field.is_nullable()
+        && null_count > masked_nulls
+    {
         return Err(CodecError::invalid(format!(
             "RecordBatch non-nullable field {:?} has {null_count} nulls, but its parent can mask at most {masked_nulls}",
             field.name()
@@ -354,12 +363,6 @@ fn consume_field_layout(
             field.name()
         )));
     }
-    let data_type_layout = DataTypeLayout::classify(field.data_type()).ok_or_else(|| {
-        CodecError::invalid(format!(
-            "unsupported Arrow type {} in RecordBatch layout",
-            field.data_type()
-        ))
-    })?;
     if matches!(data_type_layout, DataTypeLayout::Null) && null_count != length {
         return Err(CodecError::invalid(format!(
             "RecordBatch Null field {:?} must mark every row as null",

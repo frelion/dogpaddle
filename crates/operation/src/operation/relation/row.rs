@@ -236,7 +236,6 @@ fn constant_canonical_size(field: &Field, array: &dyn Array) -> Option<usize> {
                     size.checked_add(constant_canonical_size(child, values.as_ref())?)
                 })?
         }
-        DataType::Utf8 | DataType::Binary | DataType::List(_) => return None,
         _ => return None,
     };
     if array.null_count() == 0 || value_size == 1 {
@@ -641,10 +640,10 @@ fn require_capacity(
         .len()
         .checked_add(additional)
         .ok_or(RowError::LengthOverflow)?;
-    if let Some(max_bytes) = max_bytes {
-        if next > max_bytes {
-            return Err(RowError::SizeLimit { max_bytes });
-        }
+    if let Some(max_bytes) = max_bytes
+        && next > max_bytes
+    {
+        return Err(RowError::SizeLimit { max_bytes });
     }
     Ok(())
 }

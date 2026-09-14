@@ -12,9 +12,10 @@ use crate::operation::{
     sink::buffered::{DeliveryBatch, MAX_TARGET_BATCH_BYTES, SinkTarget},
 };
 
+#[cfg(test)]
+pub(crate) use crate::operation::relation::canonical_row;
 pub(crate) use crate::operation::relation::{
-    RowError, canonical_row, canonical_row_bounded, canonical_row_size_bounded, encode_canonical,
-    row_hash,
+    RowError, canonical_row_bounded, canonical_row_size_bounded, encode_canonical, row_hash,
 };
 
 pub(crate) const MAX_MUTATIONS_PER_BATCH: usize = 1024;
@@ -89,8 +90,8 @@ impl<T: RelationTarget> SinkTarget for RelationSinkTarget<T> {
     type Checkpoint = u64;
     type Plan = Batch;
 
-    const MAX_BATCH_EVENTS: NonZeroU32 = NonZeroU32::new(MAX_MUTATIONS_PER_BATCH as u32)
-        .expect("the relation batch limit is nonzero");
+    const MAX_BATCH_EVENTS: NonZeroU32 =
+        NonZeroU32::new(1024).expect("the relation batch limit is nonzero");
 
     fn require_absent(&mut self) -> Result<(), OperationError> {
         self.target.require_absent()

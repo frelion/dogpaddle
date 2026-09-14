@@ -1,4 +1,4 @@
-//! Buffered SQLite Sink workloads, including every synchronous Store commit.
+//! Buffered `SQLite` Sink workloads, including every synchronous Store commit.
 
 use std::{
     ops::AddAssign,
@@ -274,8 +274,8 @@ fn benchmark_round_trip(
     group: &mut BenchmarkGroup<'_, WallTime>,
     root: &RunRoot,
     scenario: &str,
-    positive: Change,
-    negative: Change,
+    positive: &Change,
+    negative: &Change,
     minimum_batches_per_direction: u64,
 ) {
     let events = positive
@@ -287,7 +287,7 @@ fn benchmark_round_trip(
         .sum();
     group.throughput(Throughput::Elements(events));
     let mut fixture = Fixture::new(root, scenario, positive.records().schema());
-    let warmup = fixture.round_trip(&positive, &negative);
+    let warmup = fixture.round_trip(positive, negative);
     let minimum_turns = 2 + 6 * minimum_batches_per_direction;
     assert!(warmup.turns >= minimum_turns);
     assert_eq!(warmup.turns, warmup.commits);
@@ -298,7 +298,7 @@ fn benchmark_round_trip(
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
                 let started = Instant::now();
-                let stats = fixture.round_trip(&positive, &negative);
+                let stats = fixture.round_trip(positive, negative);
                 elapsed += started.elapsed();
                 assert!(stats.turns >= minimum_turns);
                 assert_eq!(stats.turns, stats.commits);
@@ -492,8 +492,8 @@ fn main() {
         &mut group,
         &root,
         "steady_small_admission_drain",
-        integer_change(&integer, values.clone(), 1),
-        integer_change(&integer, values, -1),
+        &integer_change(&integer, values.clone(), 1),
+        &integer_change(&integer, values, -1),
         1,
     );
 
@@ -510,8 +510,8 @@ fn main() {
         &mut group,
         &root,
         "large_payload_small_event",
-        string_change(&strings, &payload, 1),
-        string_change(&strings, &payload, -1),
+        &string_change(&strings, &payload, 1),
+        &string_change(&strings, &payload, -1),
         1,
     );
 
@@ -520,8 +520,8 @@ fn main() {
         &mut group,
         &root,
         "large_payload_multiplicity_target_slicing",
-        string_change(&strings, &cross_payload, CROSS_MULTIPLICITY),
-        string_change(&strings, &cross_payload, -CROSS_MULTIPLICITY),
+        &string_change(&strings, &cross_payload, CROSS_MULTIPLICITY),
+        &string_change(&strings, &cross_payload, -CROSS_MULTIPLICITY),
         2,
     );
 
@@ -530,8 +530,8 @@ fn main() {
         &mut group,
         &root,
         "high_multiplicity_finite_capacity_churn",
-        integer_change(&multiplicity, vec![7], config.multiplicity),
-        integer_change(&multiplicity, vec![7], -config.multiplicity),
+        &integer_change(&multiplicity, vec![7], config.multiplicity),
+        &integer_change(&multiplicity, vec![7], -config.multiplicity),
         1,
     );
 

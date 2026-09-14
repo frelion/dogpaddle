@@ -119,6 +119,30 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
 }
 
 #[test]
+fn non_nullable_null_type_round_trips_as_an_always_null_column() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nothing",
+        DataType::Null,
+        false,
+    )]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![new_null_array(&DataType::Null, 2)],
+    )
+    .unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+
+    let decoded = decode_change(&encoded).unwrap();
+    let bounded = decode_change(&encode_change_bounded(&change, encoded.len()).unwrap()).unwrap();
+
+    assert_change_eq(&decoded, &change);
+    assert_change_eq(&bounded, &change);
+    assert_eq!(decoded.records().schema_ref(), &schema);
+    assert_eq!(decoded.records().column(0).logical_null_count(), 2);
+}
+
+#[test]
 fn bounded_encoder_accounts_for_synthesized_validity_buffers() {
     let rows = 100_000;
     let schema = Arc::new(Schema::new(vec![Field::new(

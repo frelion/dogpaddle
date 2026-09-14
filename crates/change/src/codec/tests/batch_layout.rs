@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, NullArray, RecordBatch};
 use arrow_ipc::{Buffer as IpcBuffer, FieldNode};
+use arrow_schema::{DataType, Field, Schema};
 
 use super::super::encode_change;
 use super::support::*;
-use crate::ChangeProjection;
+use crate::{Change, ChangeProjection};
 
 #[test]
 fn both_decoders_validate_all_unselected_batch_metadata() {
@@ -40,6 +44,26 @@ fn both_decoders_validate_all_unselected_batch_metadata() {
     ] {
         assert_both_invalid_encoding(&malformed, &projection);
     }
+}
+
+#[test]
+fn non_nullable_null_still_requires_an_all_null_field_node() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nothing",
+        DataType::Null,
+        false,
+    )]));
+    let records = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(2))]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
+    let encoded = encode_change(&change).unwrap();
+    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
+    let malformed = corrupt_layout(&encoded, |parsed, layout, nodes, _| {
+        let index = field_layout(parsed, layout, "nothing").nodes.start;
+        nodes[index] = FieldNode::new(parsed.batch.length(), parsed.batch.length() - 1);
+        0
+    });
+
+    assert_both_invalid_encoding(&malformed, &projection);
 }
 
 #[test]
