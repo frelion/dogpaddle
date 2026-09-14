@@ -368,6 +368,26 @@ fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
 }
 
 #[test]
+fn mysql_cdc_snapshot_accepts_debezium_collection_boundary_markers() {
+    let columns = [column(MySqlType::Int64)];
+    let mut first = envelope(&columns, "r", Value::Null, json!({"value":1}));
+    first["payload"]["source"]["snapshot"] = json!("first");
+    let progress = snapshot(&columns, &[first]).unwrap().next_progress;
+
+    let mut last = envelope(&columns, "r", Value::Null, json!({"value":2}));
+    last["payload"]["source"]["snapshot"] = json!("last_in_data_collection");
+    let progress = snapshot_after(&columns, &[last], progress)
+        .unwrap()
+        .next_progress;
+
+    assert!(
+        snapshot_after(&columns, &[notification("COMPLETED")], progress)
+            .unwrap()
+            .complete
+    );
+}
+
+#[test]
 fn mysql_cdc_snapshot_progress_crosses_delivery_boundaries() {
     let columns = [column(MySqlType::Int64)];
     let mut first_row = envelope(&columns, "r", Value::Null, json!({"value":1}));

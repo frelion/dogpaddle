@@ -368,7 +368,7 @@ impl MySqlCdcScanConfig {
                 "MySQL server settings are unavailable",
             ));
         };
-        if !log_bin.eq_ignore_ascii_case("ON")
+        if !mysql_global_flag_enabled(&log_bin)
             || !binlog_format.eq_ignore_ascii_case("ROW")
             || !row_image.eq_ignore_ascii_case("FULL")
             || lower_case_table_names != 0
@@ -591,6 +591,10 @@ fn positive_milliseconds(label: &str, duration: Duration) -> Result<i32, MySqlCd
     Ok(milliseconds)
 }
 
+fn mysql_global_flag_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("ON")
+}
+
 fn connector_option_properties(
     options: &MySqlCdcScanOptions,
     mode: ConnectorMode,
@@ -689,8 +693,17 @@ mod tests {
 
     use super::{
         ConnectorMode, DATABASE_TIMEOUT, MySqlCdcScanOptions, connector_option_properties,
-        replication_client_id,
+        mysql_global_flag_enabled, replication_client_id,
     };
+
+    #[test]
+    fn global_boolean_accepts_mysql_text_and_numeric_forms() {
+        assert!(mysql_global_flag_enabled("ON"));
+        assert!(mysql_global_flag_enabled("on"));
+        assert!(mysql_global_flag_enabled("1"));
+        assert!(!mysql_global_flag_enabled("OFF"));
+        assert!(!mysql_global_flag_enabled("0"));
+    }
 
     #[test]
     fn snapshot_then_recovery_are_the_only_connector_modes() {

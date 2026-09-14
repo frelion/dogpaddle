@@ -260,13 +260,13 @@ fn validate_snapshot_metadata(
             )));
         }
     }
-    let marker = metadata.get("snapshot").and_then(Value::as_str);
-    if !matches!(marker, Some("true" | "last")) {
-        return Err(invalid(
+    match metadata.get("snapshot").and_then(Value::as_str) {
+        Some("true" | "first" | "first_in_data_collection") => Ok(false),
+        Some("last" | "last_in_data_collection") => Ok(true),
+        _ => Err(invalid(
             "Debezium record is not part of the initial snapshot",
-        ));
+        )),
     }
-    Ok(marker == Some("last"))
 }
 
 fn validate_metadata(payload: &Row, database: &str, table: &str) -> Result<(), MySqlCdcScanError> {
