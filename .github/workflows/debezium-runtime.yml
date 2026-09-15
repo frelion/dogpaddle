@@ -173,11 +173,12 @@ jobs:
           set -euo pipefail
           cargo_home="$(dirname -- "$(dirname -- "$(command -v cargo)")")"
           rustup_home="$(rustup show home)"
+          toolchain_bin="$(rustup run 1.96.0 rustc --print sysroot)/bin"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env CARGO_HOME="$cargo_home" \
-            --env RUSTUP_HOME="$rustup_home" \
             --env TARGET="$TARGET" \
+            --env TOOLCHAIN_BIN="$toolchain_bin" \
             --volume "$cargo_home:$cargo_home" \
             --volume "$rustup_home:$rustup_home:ro" \
             --volume "$GITHUB_WORKSPACE:/workspace" \
@@ -185,7 +186,8 @@ jobs:
             --entrypoint /bin/bash \
             "$BUILD_IMAGE" \
             -c 'set -euo pipefail
-            export PATH="$CARGO_HOME/bin:$PATH"
+            export PATH="$TOOLCHAIN_BIN:$PATH"
+            export RUSTC="$TOOLCHAIN_BIN/rustc"
             rustc --version --verbose
             cargo --version --verbose
             crates/dogpaddle/scripts/build-release-binaries.sh "$TARGET"'
