@@ -190,8 +190,9 @@ jobs:
           printf '%s  %s\n' "$libclang_sha256" "$libclang_wheel" | sha256sum --check -
           mkdir -p -- "$libclang_root"
           python3 -m zipfile -e "$libclang_wheel" "$libclang_root"
-          libclang_path="$libclang_root/clang/native"
-          test -f "$libclang_path/libclang.so"
+          libclang_file="$(find "$libclang_root" -path '*/clang/native/libclang.so' -type f -print -quit)"
+          test -n "$libclang_file"
+          libclang_path="$(dirname -- "$libclang_file")"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env CARGO_HOME="$cargo_home" \
