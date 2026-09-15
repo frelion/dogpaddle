@@ -10,6 +10,7 @@ archive="$1"
 api_key="$2"
 key_id="$3"
 issuer_id="$4"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 archive_name="$(basename -- "$archive")"
 release_name="${archive_name%.tar.gz}"
 staging="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-notarization.XXXXXX")"
@@ -24,18 +25,18 @@ if [[ ! -f "$archive" || ! -f "$api_key" ]]; then
   exit 1
 fi
 
-tar -xzf "$archive" -C "$staging"
-if [[ ! -d "$staging/$release_name" ]]; then
-  echo "release archive has an unexpected root: $archive" >&2
+release_root="$(python3 "$script_dir/release_archive.py" "$archive" "$staging")"
+if [[ "$release_root" != "$staging/$release_name" ]]; then
+  echo "release archive has an unexpected root: $release_root" >&2
   exit 1
 fi
-submission="$staging/$release_name.zip"
-ditto -c -k --keepParent "$staging/$release_name" "$submission"
+submission="$release_root.zip"
+ditto -c -k --keepParent "$release_root" "$submission"
 xcrun notarytool submit "$submission" \
   --key "$api_key" \
   --key-id "$key_id" \
   --issuer "$issuer_id" \
   --wait
-spctl --assess --type execute --verbose=2 "$staging/$release_name/bin/dogpaddle"
+spctl --assess --type execute --verbose=2 "$release_root/bin/dogpaddle"
 
 echo "PASS notarized macOS release: $archive"

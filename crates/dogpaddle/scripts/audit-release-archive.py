@@ -10,15 +10,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 
+from release_archive import extract
 
 LINUX_GLIBC_BASELINE = (2, 28)
 MACOS_DEPLOYMENT_TARGET = (11, 0)
-MAX_ARCHIVE_ENTRIES = 100_000
-MAX_ARCHIVE_FILE_SIZE = 1024 * 1024 * 1024
-MAX_ARCHIVE_EXPANDED_SIZE = 4 * 1024 * 1024 * 1024
 LINUX_SYSTEM_LIBRARIES = {
     "ld-linux-aarch64.so.1",
     "ld-linux-x86-64.so.2",
@@ -33,44 +30,38 @@ LINUX_SYSTEM_LIBRARIES = {
 VERSIONED_SYMBOL = re.compile(r"\b(GLIBC|GLIBCXX|CXXABI)_([0-9]+(?:\.[0-9]+)+)\b")
 
 
+MAX_TOOL_OUTPUT = 1024 * 1024
+MACHO_MAGICS = {
+    bytes.fromhex(value)
+    for value in (
+        "feedface",
+        "feedfacf",
+        "cefaedfe",
+        "cffaedfe",
+        "cafebabe",
+        "cafebabf",
+        "bebafeca",
+        "bfbafeca",
+    )
+}
+
+
 def run(*command: str) -> str:
-    return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE).stdout
+    result = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if len(result.stdout) > MAX_TOOL_OUTPUT:
+        raise RuntimeError(f"tool output exceeded limit: {command[0]}")
+    return result.stdout
 
 
 def version(value: str) -> tuple[int, ...]:
     return tuple(int(component) for component in value.split("."))
-
-
-def extract(archive: Path, destination: Path) -> Path:
-    with tarfile.open(archive, "r:gz") as source:
-        members = source.getmembers()
-        if len(members) > MAX_ARCHIVE_ENTRIES:
-            raise RuntimeError("release archive contains too many entries")
-        names = set()
-        expanded_size = 0
-        for member in members:
-            if member.name in names:
-                raise RuntimeError(f"archive contains duplicate path: {member.name}")
-            names.add(member.name)
-            candidate = (destination / member.name).resolve()
-            if destination.resolve() not in candidate.parents:
-                raise RuntimeError(f"archive path escapes its root: {member.name}")
-            if not (member.isdir() or member.isfile()):
-                raise RuntimeError(f"archive contains a non-regular entry: {member.name}")
-            if member.isfile():
-                if member.size > MAX_ARCHIVE_FILE_SIZE:
-                    raise RuntimeError(f"archive contains oversized file: {member.name}")
-                expanded_size += member.size
-                if expanded_size > MAX_ARCHIVE_EXPANDED_SIZE:
-                    raise RuntimeError("release archive expands beyond the size limit")
-        if hasattr(tarfile, "data_filter"):
-            source.extractall(destination, members=members, filter="data")
-        else:
-            source.extractall(destination, members=members)
-    roots = list(destination.iterdir())
-    if len(roots) != 1 or not roots[0].is_dir():
-        raise RuntimeError("release archive must contain exactly one root directory")
-    return roots[0]
 
 
 def files(root: Path) -> list[Path]:
@@ -114,20 +105,17 @@ def audit_linux(root: Path, target: str) -> list[str]:
         "aarch64-unknown-linux-gnu": "AArch64",
     }[target]
     for path in files(root):
-        result = subprocess.run(
-            [readelf, "--file-header", str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            header = run(readelf, "--file-header", str(path))
-            match = re.search(r"^\s*Machine:\s*(.+)$", header, re.MULTILINE)
-            if match is None or match.group(1) != expected_machine:
-                actual = match.group(1) if match else "unknown"
-                raise RuntimeError(
-                    f"{path.relative_to(root)} has machine {actual}, expected {expected_machine}"
-                )
-            elf_files.append(path)
+        with path.open("rb") as source:
+            if source.read(4) != b"\x7fELF":
+                continue
+        header = run(readelf, "--file-header", str(path))
+        match = re.search(r"^\s*Machine:\s*(.+)$", header, re.MULTILINE)
+        if match is None or match.group(1) != expected_machine:
+            actual = match.group(1) if match else "unknown"
+            raise RuntimeError(
+                f"{path.relative_to(root)} has machine {actual}, expected {expected_machine}"
+            )
+        elf_files.append(path)
     if not elf_files:
         raise RuntimeError("release archive contains no ELF files")
 
@@ -234,6 +222,9 @@ def audit_macos(root: Path, target: str) -> list[str]:
         "aarch64-apple-darwin": "arm64",
     }[target]
     for path in files(root):
+        with path.open("rb") as source:
+            if source.read(4) not in MACHO_MAGICS:
+                continue
         description = run("file", "-b", str(path))
         if "Mach-O" not in description:
             continue
@@ -327,6 +318,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"release audit failed: {error}", file=sys.stderr)
         sys.exit(1)

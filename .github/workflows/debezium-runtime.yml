@@ -148,7 +148,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/${{ matrix.target }}
-          key: release-cargo-v2-${{ matrix.target }}-1.96-${{ hashFiles('Cargo.lock', '.github/workflows/debezium-runtime.yml', 'crates/dogpaddle/scripts/build-release-binaries.sh') }}
+          key: release-cargo-v2-${{ matrix.target }}-1.96-${{ hashFiles('Cargo.lock', '.github/workflows/debezium-runtime.yml', 'crates/dogpaddle/scripts/build-linux-release.sh', 'crates/dogpaddle/scripts/build-release-binaries.sh') }}
           restore-keys: |
             release-cargo-v2-${{ matrix.target }}-1.96-
 
@@ -169,52 +169,7 @@ jobs:
         env:
           BUILD_IMAGE: ${{ matrix.build_image }}
           TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          cargo_home="$(dirname -- "$(dirname -- "$(command -v cargo)")")"
-          rustup_home="$(rustup show home)"
-          toolchain_bin="$(rustup run 1.96.0 rustc --print sysroot)/bin"
-          case "$TARGET" in
-            x86_64-unknown-linux-gnu)
-              libclang_url="https://files.pythonhosted.org/packages/1d/fc/716c1e62e512ef1c160e7984a73a5fc7df45166f2ff3f254e71c58076f7c/libclang-18.1.1-py2.py3-none-manylinux2010_x86_64.whl"
-              libclang_sha256="c533091d8a3bbf7460a00cb6c1a71da93bffe148f172c7d03b1c31fbf8aa2a0b"
-              ;;
-            aarch64-unknown-linux-gnu)
-              libclang_url="https://files.pythonhosted.org/packages/3c/3d/f0ac1150280d8d20d059608cf2d5ff61b7c3b7f7bcf9c0f425ab92df769a/libclang-18.1.1-py2.py3-none-manylinux2014_aarch64.whl"
-              libclang_sha256="54dda940a4a0491a9d1532bf071ea3ef26e6dbaf03b5000ed94dd7174e8f9592"
-              ;;
-          esac
-          libclang_wheel="$RUNNER_TEMP/libclang-$TARGET.whl"
-          libclang_root="$RUNNER_TEMP/libclang-$TARGET"
-          curl --fail --location --retry 3 --output "$libclang_wheel" "$libclang_url"
-          printf '%s  %s\n' "$libclang_sha256" "$libclang_wheel" | sha256sum --check -
-          mkdir -p -- "$libclang_root"
-          python3 -m zipfile -e "$libclang_wheel" "$libclang_root"
-          libclang_file="$(find "$libclang_root" -path '*/clang/native/libclang.so' -type f -print -quit)"
-          test -n "$libclang_file"
-          libclang_path="$(dirname -- "$libclang_file")"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --env CARGO_HOME="$cargo_home" \
-            --env LIBCLANG_PATH="$libclang_path" \
-            --env TARGET="$TARGET" \
-            --env TOOLCHAIN_BIN="$toolchain_bin" \
-            --volume "$cargo_home:$cargo_home" \
-            --volume "$libclang_root:$libclang_root:ro" \
-            --volume "$rustup_home:$rustup_home:ro" \
-            --volume "$GITHUB_WORKSPACE:/workspace" \
-            --workdir /workspace \
-            --entrypoint /bin/bash \
-            "$BUILD_IMAGE" \
-            -c 'set -euo pipefail
-            export PATH="$TOOLCHAIN_BIN:$PATH"
-            export RUSTC="$TOOLCHAIN_BIN/rustc"
-            compiler_include_dir="$(gcc -print-file-name=include)"
-            test -f "$compiler_include_dir/stdbool.h"
-            export BINDGEN_EXTRA_CLANG_ARGS="-isystem $compiler_include_dir"
-            rustc --version --verbose
-            cargo --version --verbose
-            crates/dogpaddle/scripts/build-release-binaries.sh "$TARGET"'
+        run: crates/dogpaddle/scripts/build-linux-release.sh "$TARGET" "$BUILD_IMAGE"
 
       - name: Build portable macOS release binaries
         if: runner.os == 'macOS'
@@ -338,7 +293,16 @@ jobs:
             "$MACOS_NOTARY_ISSUER_ID"
           rm -f -- "$api_key"
 
+      - name: Upload the compatibility report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dogpaddle-compatibility-${{ matrix.target }}
+          path: target/release-packages/dogpaddle-${{ env.RELEASE_ID }}-${{ matrix.target }}.compatibility.txt
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Upload the DogPaddle release archive
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dogpaddle-release-${{ matrix.target }}

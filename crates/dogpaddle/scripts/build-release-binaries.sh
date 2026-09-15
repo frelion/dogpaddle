@@ -3,6 +3,14 @@ set -euo pipefail
 
 readonly LINUX_GLIBC_BASELINE="2.28"
 readonly MACOS_DEPLOYMENT_TARGET="11.0"
+static_runtime_dir=""
+
+cleanup() {
+  if [[ -n "$static_runtime_dir" ]]; then
+    rm -rf -- "$static_runtime_dir"
+  fi
+}
+trap cleanup EXIT
 
 if [[ "$#" -ne 1 ]]; then
   echo 'usage: build-release-binaries.sh TARGET' >&2
@@ -27,9 +35,11 @@ case "$target" in
         exit 1
       fi
     done
+    # librocksdb-sys and rustc request dynamic runtime names explicitly. Put
+    # static archives first in that lookup; the final archive audit enforces it.
     ln -s "$libstdcxx_archive" "$static_runtime_dir/libstdc++.so"
     ln -s "$libgcc_archive" "$static_runtime_dir/libgcc_s.so"
-    export RUSTFLAGS="-L native=$static_runtime_dir -C link-arg=$libgcc_eh_archive"
+    export RUSTFLAGS="-L native=$static_runtime_dir -C link-arg=-Wl,--start-group -C link-arg=$libgcc_eh_archive -C link-arg=$libgcc_archive -C link-arg=-Wl,--end-group"
     ;;
   x86_64-apple-darwin|aarch64-apple-darwin)
     export MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET"

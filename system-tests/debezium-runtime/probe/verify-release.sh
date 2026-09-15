@@ -12,6 +12,7 @@ probe="$3"
 probe_connector="$4"
 scratch_dir="$5"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+workspace="$(cd -- "$script_dir/../../.." && pwd)"
 archive_name="$(basename -- "$archive")"
 release_name="${archive_name%.tar.gz}"
 checksum="$archive.sha256"
@@ -38,8 +39,12 @@ if [[ -e "$relocated_parent" ]]; then
   exit 1
 fi
 mkdir -p -- "$relocated_parent"
-tar -xzf "$archive" -C "$relocated_parent"
-release_root="$relocated_parent/$release_name"
+release_root="$(python3 "$workspace/crates/dogpaddle/scripts/release_archive.py" \
+  "$archive" "$relocated_parent")"
+if [[ "$release_root" != "$relocated_parent/$release_name" ]]; then
+  echo "release archive has an unexpected root: $release_root" >&2
+  exit 1
+fi
 runtime="$release_root/libexec/dogpaddle/debezium"
 dogpaddle="$release_root/bin/dogpaddle"
 
