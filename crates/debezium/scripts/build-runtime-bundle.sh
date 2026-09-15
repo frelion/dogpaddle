@@ -70,8 +70,12 @@ download_verified() {
   local expected="$2"
   local destination="$3"
   local maximum_size="$4"
-  if [[ -f "$destination" && "$(sha256_file "$destination")" == "$expected" ]]; then
-    return
+  if [[ -f "$destination" ]]; then
+    if [[ "$(wc -c <"$destination")" -le "$maximum_size" ]] \
+      && [[ "$(sha256_file "$destination")" == "$expected" ]]; then
+      return
+    fi
+    rm -f -- "$destination"
   fi
   local temporary="$destination.part"
   if [[ -f "$temporary" && "$(wc -c <"$temporary")" -gt "$maximum_size" ]]; then
@@ -84,6 +88,11 @@ download_verified() {
     curl --fail --location --retry 3 \
       --connect-timeout 15 --max-time 300 --max-filesize "$maximum_size" \
       --output "$temporary" "$url"
+  fi
+  if [[ "$(wc -c <"$temporary")" -gt "$maximum_size" ]]; then
+    rm -f -- "$temporary"
+    echo "download exceeded size limit for $url" >&2
+    exit 1
   fi
   local actual
   actual="$(sha256_file "$temporary")"

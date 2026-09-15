@@ -74,7 +74,13 @@ def preflight(archive: Path) -> None:
             stream_size += padded_size
             if stream_size > MAX_ARCHIVE_EXPANDED_SIZE:
                 raise RuntimeError("release archive stream exceeds the size limit")
-            _discard_exact(source, padded_size)
+            if entry_type in {b"g", b"x"}:
+                payload = _read_exact(source, size)
+                if b"GNU.sparse." in payload:
+                    raise RuntimeError("release archive contains sparse PAX metadata")
+                _discard_exact(source, padded_size - size)
+            else:
+                _discard_exact(source, padded_size)
 
 
 def extract(archive: Path, destination: Path) -> Path:
