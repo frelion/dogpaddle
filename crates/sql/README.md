@@ -109,6 +109,8 @@ SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::
 | Scan | `mysql_cdc` | `connection`, `table`; 可选 `bootstrap_spool_bytes` 和 CDC 调优参数 |
 | Sink | `sqlite` | `path`, `table` |
 | Sink | `postgres` | `connection`, `table` |
+| Sink | `clickhouse` | `connection`, `table` |
+| Sink | `doris` | `connection`, `table` |
 | Sink | `discard` | 无 |
 
 `PostgreSQL` 示例：
@@ -145,9 +147,12 @@ FROM mysql_cdc(
 ```text
 postgresql://user:password@127.0.0.1:5432/database
 mysql://user:password@127.0.0.1:3306/database
+clickhouse://user:password@127.0.0.1:8123/database
+clickhouse+http://user:password@127.0.0.1:8123/database
+doris://user:password@127.0.0.1:9030/database
 ```
 
-URL 必须包含用户名和一个数据库路径段，用户名、密码和数据库名支持 percent encoding。`PostgreSQL` Sink 仍受底层试点限制，只接受 numeric IP。`table` 必须恰好包含两个非空部分：`PostgreSQL` 使用 `schema.table`，`MySQL` 使用 `database.table`，且 `MySQL` 的 database 必须与 URL 一致。
+URL 必须包含用户名和一个数据库路径段，用户名、密码和数据库名支持 percent encoding。数据库 Sink 只接受 numeric IP。`table` 必须恰好包含两个非空部分：`PostgreSQL` 使用 `schema.table`；`MySQL`、`ClickHouse` 和 `Doris` 使用 `database.table`，且 database 必须与 URL 一致。`ClickHouse` 与 `Doris` 当前只支持无 TLS endpoint。
 
 `bootstrap_spool_bytes` 是私有快照队列的非零硬上限，默认 1 GiB。PostgreSQL 的容量要覆盖完整快照和快照封口前的 WAL 重叠；MySQL 的容量要覆盖完整快照，binlog 还必须保留到私有 spool 发布并追平完成。容量不足时当前 delivery 不提交也不 ACK，需要以更大容量和新状态重建。
 

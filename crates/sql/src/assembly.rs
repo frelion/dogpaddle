@@ -296,6 +296,14 @@ impl LogicalOperator {
             },
             Self::Transform(definition) => Ok(definition.emit(factory, id)),
             Self::Sink(sink) => match sink {
+                BuiltSink::ClickHouse { definition, config } => {
+                    factory.resource(id, config)?;
+                    Ok(factory.station(id, definition))
+                }
+                BuiltSink::Doris { definition, config } => {
+                    factory.resource(id, config)?;
+                    Ok(factory.station(id, definition))
+                }
                 BuiltSink::Postgres { definition, config } => {
                     factory.resource(id, config)?;
                     Ok(factory.station(id, definition))

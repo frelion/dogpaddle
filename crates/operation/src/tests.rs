@@ -21,7 +21,8 @@ use crate::{
             SequenceScanDefinition,
         },
         sink::{
-            DiscardDefinition, DiscardOperation, PostgresSinkDefinition, PostgresTargetSpec,
+            ClickHouseSinkDefinition, ClickHouseTargetSpec, DiscardDefinition, DiscardOperation,
+            DorisSinkDefinition, DorisTargetSpec, PostgresSinkDefinition, PostgresTargetSpec,
             SqliteSinkDefinition,
         },
         transform::{
@@ -88,8 +89,8 @@ impl OperationDefinition for TestDefinition {
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
-fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 17] {
-    [
+fn builtin_definitions() -> Vec<(u16, Box<dyn OperationDefinition>)> {
+    let mut definitions: Vec<(u16, Box<dyn OperationDefinition>)> = vec![
         (1, Box::new(SequenceScanDefinition::new(0))),
         (2, Box::new(RunningEventCountDefinition::new())),
         (3, Box::new(DiscardDefinition::new())),
@@ -184,6 +185,37 @@ fn builtin_definitions() -> [(u16, Box<dyn OperationDefinition>); 17] {
         ),
         (16, Box::new(join_definition())),
         (17, Box::new(asof_join_definition())),
+    ];
+    definitions.extend(database_sink_definitions());
+    definitions
+}
+
+fn database_sink_definitions() -> [(u16, Box<dyn OperationDefinition>); 2] {
+    [
+        (
+            18,
+            Box::new(
+                DorisSinkDefinition::try_new(
+                    DorisTargetSpec::try_new("events", "shop", "events", 1).unwrap(),
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            19,
+            Box::new(
+                ClickHouseSinkDefinition::try_new(
+                    ClickHouseTargetSpec::try_new(
+                        "events",
+                        "shop",
+                        "events",
+                        "01234567-89ab-cdef-0123-456789abcdef",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
+        ),
     ]
 }
 

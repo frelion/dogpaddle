@@ -55,6 +55,13 @@ pub(super) struct MutationGroups {
     pub(super) delete_ids: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TerminalMutation {
+    pub(super) row_index: u64,
+    pub(super) technical_id: u64,
+    pub(super) deleted: bool,
+}
+
 /// Groups a validated plan by logical input row without applying backend rules.
 pub(super) fn group_mutations(batch: &Batch) -> MutationGroups {
     #[derive(Default)]
@@ -91,6 +98,37 @@ pub(super) fn group_mutations(batch: &Batch) -> MutationGroups {
     }
 }
 
+/// Returns the final mutation for each technical ID in a validated plan.
+pub(super) fn terminal_mutations(batch: &Batch) -> Vec<TerminalMutation> {
+    let mut by_id = BTreeMap::<u64, TerminalMutation>::new();
+    for insert in &batch.inserts {
+        let replaced = by_id.insert(
+            insert.technical_id,
+            TerminalMutation {
+                row_index: insert.row_index,
+                technical_id: insert.technical_id,
+                deleted: false,
+            },
+        );
+        debug_assert!(replaced.is_none(), "validated insert IDs are unique");
+    }
+    for delete in &batch.deletes {
+        by_id
+            .entry(delete.technical_id)
+            .and_modify(|mutation| {
+                // Equal canonical rows can occur at different input indexes.
+                mutation.row_index = delete.row_index;
+                mutation.deleted = true;
+            })
+            .or_insert(TerminalMutation {
+                row_index: delete.row_index,
+                technical_id: delete.technical_id,
+                deleted: true,
+            });
+    }
+    by_id.into_values().collect()
+}
+
 /// One request per distinct logical row. Counts may exceed the returned ID limit.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Lookup {
@@ -107,6 +145,11 @@ pub(crate) struct Matches {
 
 /// Database I/O only; no Store access or ownership of input progress.
 pub(crate) trait RelationTarget: Send + 'static {
+    /// Charges one event using the backend's concrete delivery encoding.
+    fn event_bytes(&self, input: &Change, row_index: usize) -> Result<u64, OperationError> {
+        relation_event_bytes(input, row_index)
+    }
+
     /// Fresh construction must reject existing targets before publishing intent.
     fn require_absent(&mut self) -> Result<(), OperationError>;
     /// Creates or verifies the owned empty layout after initialization is durable.
@@ -135,6 +178,34 @@ impl<T> RelationSinkTarget<T> {
     }
 }
 
+pub(super) fn relation_event_bytes(
+    input: &Change,
+    row_index: usize,
+) -> Result<u64, OperationError> {
+    const TECHNICAL_VALUE_BYTES: usize = size_of::<u64>() + 16;
+    const PARAMETER_FRAMING_BYTES: usize = 8;
+
+    let canonical_bytes = canonical_row_size_bounded(
+        input.records(),
+        row_index,
+        usize::try_from(MAX_TARGET_BATCH_BYTES).expect("the target byte limit fits usize"),
+    )?;
+    let columns = input
+        .records()
+        .num_columns()
+        .checked_add(2)
+        .ok_or_else(|| invalid("target mutation column count exceeds usize"))?;
+    canonical_bytes
+        .checked_add(TECHNICAL_VALUE_BYTES)
+        .and_then(|bytes| {
+            columns
+                .checked_mul(PARAMETER_FRAMING_BYTES)
+                .and_then(|framing| bytes.checked_add(framing))
+        })
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| invalid("target mutation byte charge exceeds u64"))
+}
+
 impl<T: RelationTarget> SinkTarget for RelationSinkTarget<T> {
     type Checkpoint = u64;
     type Plan = Batch;
@@ -155,28 +226,7 @@ impl<T: RelationTarget> SinkTarget for RelationSinkTarget<T> {
     }
 
     fn event_bytes(&self, input: &Change, row_index: usize) -> Result<u64, OperationError> {
-        const TECHNICAL_VALUE_BYTES: usize = size_of::<u64>() + 16;
-        const PARAMETER_FRAMING_BYTES: usize = 8;
-
-        let canonical_bytes = canonical_row_size_bounded(
-            input.records(),
-            row_index,
-            usize::try_from(MAX_TARGET_BATCH_BYTES).expect("the target byte limit fits usize"),
-        )?;
-        let columns = input
-            .records()
-            .num_columns()
-            .checked_add(2)
-            .ok_or_else(|| invalid("target mutation column count exceeds usize"))?;
-        canonical_bytes
-            .checked_add(TECHNICAL_VALUE_BYTES)
-            .and_then(|bytes| {
-                columns
-                    .checked_mul(PARAMETER_FRAMING_BYTES)
-                    .and_then(|framing| bytes.checked_add(framing))
-            })
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| invalid("target mutation byte charge exceeds u64"))
+        self.target.event_bytes(input, row_index)
     }
 
     fn validate_admission(

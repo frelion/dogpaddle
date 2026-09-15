@@ -16,7 +16,10 @@ use dogpaddle_operation::operation::{
         MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanOptions, PostgresCdcScanConfig,
         PostgresCdcScanDefinition, PostgresCdcScanOptions, SequenceScanDefinition,
     },
-    sink::{DiscardDefinition, PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
+    sink::{
+        ClickHouseSinkConfig, ClickHouseSinkDefinition, DiscardDefinition, DorisSinkConfig,
+        DorisSinkDefinition, PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition,
+    },
 };
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -286,6 +289,19 @@ impl DatabaseConnection {
         Self::parse(parameter, "mysql_cdc", &["mysql"], 3306)
     }
 
+    fn doris(parameter: &Parameter) -> Result<Self, SqlError> {
+        Self::parse(parameter, "doris", &["doris"], 9030)
+    }
+
+    fn clickhouse(parameter: &Parameter) -> Result<Self, SqlError> {
+        Self::parse(
+            parameter,
+            "clickhouse",
+            &["clickhouse", "clickhouse+http"],
+            8123,
+        )
+    }
+
     fn parse(
         parameter: &Parameter,
         endpoint: &str,
@@ -355,6 +371,28 @@ impl DatabaseConnection {
 
     fn postgres_sink_config(&self) -> Result<PostgresSinkConfig, SqlError> {
         PostgresSinkConfig::new_unencrypted(
+            &self.host,
+            self.port,
+            &self.database,
+            &self.user,
+            &self.password,
+        )
+        .map_err(SqlError::endpoint)
+    }
+
+    fn doris_sink_config(&self) -> Result<DorisSinkConfig, SqlError> {
+        DorisSinkConfig::new_unencrypted(
+            &self.host,
+            self.port,
+            &self.database,
+            &self.user,
+            &self.password,
+        )
+        .map_err(SqlError::endpoint)
+    }
+
+    fn clickhouse_sink_config(&self) -> Result<ClickHouseSinkConfig, SqlError> {
+        ClickHouseSinkConfig::new_unencrypted(
             &self.host,
             self.port,
             &self.database,
@@ -727,13 +765,33 @@ pub(crate) struct PostgresSinkEndpoint {
     table: Parameter,
 }
 
+pub(crate) struct DorisSinkEndpoint {
+    connection: Parameter,
+    table: Parameter,
+}
+
+pub(crate) struct ClickHouseSinkEndpoint {
+    connection: Parameter,
+    table: Parameter,
+}
+
 pub(crate) enum SinkEndpoint {
+    ClickHouse(ClickHouseSinkEndpoint),
+    Doris(DorisSinkEndpoint),
     Postgres(PostgresSinkEndpoint),
     Sqlite { path: Parameter, table: Parameter },
     Discard,
 }
 
 pub(crate) enum BuiltSink {
+    ClickHouse {
+        definition: ClickHouseSinkDefinition,
+        config: ClickHouseSinkConfig,
+    },
+    Doris {
+        definition: DorisSinkDefinition,
+        config: DorisSinkConfig,
+    },
     Postgres {
         definition: PostgresSinkDefinition,
         config: PostgresSinkConfig,
@@ -745,6 +803,14 @@ pub(crate) enum BuiltSink {
 impl SinkEndpoint {
     pub(crate) fn resolved(&self) -> Result<Self, SqlError> {
         match self {
+            Self::ClickHouse(endpoint) => Ok(Self::ClickHouse(ClickHouseSinkEndpoint {
+                connection: endpoint.connection.resolved()?,
+                table: endpoint.table.resolved()?,
+            })),
+            Self::Doris(endpoint) => Ok(Self::Doris(DorisSinkEndpoint {
+                connection: endpoint.connection.resolved()?,
+                table: endpoint.table.resolved()?,
+            })),
             Self::Postgres(endpoint) => Ok(Self::Postgres(PostgresSinkEndpoint {
                 connection: endpoint.connection.resolved()?,
                 table: endpoint.table.resolved()?,
@@ -779,6 +845,25 @@ impl SinkEndpoint {
         }
 
         match endpoint_name(&function.name).as_deref() {
+            Some("clickhouse") => {
+                let [connection, table] = exact_parameters(parse_arguments(
+                    "clickhouse",
+                    &arguments.args,
+                    &[string("connection"), string("table")],
+                )?);
+                Ok(Self::ClickHouse(ClickHouseSinkEndpoint {
+                    connection,
+                    table,
+                }))
+            }
+            Some("doris") => {
+                let [connection, table] = exact_parameters(parse_arguments(
+                    "doris",
+                    &arguments.args,
+                    &[string("connection"), string("table")],
+                )?);
+                Ok(Self::Doris(DorisSinkEndpoint { connection, table }))
+            }
             Some("postgres") => {
                 let [connection, table] = exact_parameters(parse_arguments(
                     "postgres",
@@ -812,6 +897,30 @@ impl SinkEndpoint {
         state_path: &Path,
     ) -> Result<BuiltSink, SqlError> {
         match self {
+            Self::ClickHouse(endpoint) => {
+                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                let (database, table) = qualified_table(&endpoint.table, "clickhouse")?;
+                require_connection_database(&connection, &database, "clickhouse")?;
+                let config = connection.clickhouse_sink_config()?;
+                let target = config
+                    .discover_target(sink_name(identity, state_path), table)
+                    .map_err(SqlError::endpoint)?;
+                let definition =
+                    ClickHouseSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
+                Ok(BuiltSink::ClickHouse { definition, config })
+            }
+            Self::Doris(endpoint) => {
+                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                let (database, table) = qualified_table(&endpoint.table, "doris")?;
+                require_connection_database(&connection, &database, "doris")?;
+                let config = connection.doris_sink_config()?;
+                let target = config
+                    .discover_target(sink_name(identity, state_path), table)
+                    .map_err(SqlError::endpoint)?;
+                let definition =
+                    DorisSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
+                Ok(BuiltSink::Doris { definition, config })
+            }
             Self::Postgres(endpoint) => {
                 let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
                 let (schema, table) = qualified_table(&endpoint.table, "postgres")?;
@@ -834,6 +943,22 @@ impl SinkEndpoint {
 
     pub(crate) fn write_identity(&self, encoded: &mut Vec<u8>) -> Result<(), SqlError> {
         match self {
+            Self::ClickHouse(endpoint) => {
+                encoded.push(3);
+                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                write_identity_bytes(encoded, connection.database.as_bytes());
+                let (database, table) = qualified_table(&endpoint.table, "clickhouse")?;
+                require_connection_database(&connection, &database, "clickhouse")?;
+                write_identity_bytes(encoded, table.as_bytes());
+            }
+            Self::Doris(endpoint) => {
+                encoded.push(4);
+                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                write_identity_bytes(encoded, connection.database.as_bytes());
+                let (database, table) = qualified_table(&endpoint.table, "doris")?;
+                require_connection_database(&connection, &database, "doris")?;
+                write_identity_bytes(encoded, table.as_bytes());
+            }
             Self::Postgres(endpoint) => {
                 encoded.push(0);
                 let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
@@ -852,14 +977,40 @@ impl SinkEndpoint {
         Ok(())
     }
 
-    pub(crate) fn open_runtime_config(&self) -> Result<Option<PostgresSinkConfig>, SqlError> {
+    pub(crate) fn install_open_runtime_resource(
+        &self,
+        factory: &mut FlowFactory,
+    ) -> Result<(), SqlError> {
         match self {
+            Self::ClickHouse(endpoint) => {
+                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                factory.resource("sql/sink", connection.clickhouse_sink_config()?)?;
+            }
+            Self::Doris(endpoint) => {
+                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                factory.resource("sql/sink", connection.doris_sink_config()?)?;
+            }
             Self::Postgres(endpoint) => {
                 let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
-                Ok(Some(connection.postgres_sink_config()?))
+                factory.resource("sql/sink", connection.postgres_sink_config()?)?;
             }
-            Self::Sqlite { .. } | Self::Discard => Ok(None),
+            Self::Sqlite { .. } | Self::Discard => {}
         }
+        Ok(())
+    }
+}
+
+fn require_connection_database(
+    connection: &DatabaseConnection,
+    table_database: &str,
+    endpoint: &str,
+) -> Result<(), SqlError> {
+    if connection.database == table_database {
+        Ok(())
+    } else {
+        Err(SqlError::invalid(format!(
+            "{endpoint} table database must match the connection database"
+        )))
     }
 }
 

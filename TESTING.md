@@ -72,7 +72,8 @@ identity mismatch。
 SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
 Endpoint 证据固定覆盖 `postgres_cdc(connection,table,publication[,bootstrap_spool_bytes][,CDC tuning...])`、
-`mysql_cdc(connection,table[,bootstrap_spool_bytes][,CDC tuning...])` 和 `postgres(connection,table)`；CDC tuning
+`mysql_cdc(connection,table[,bootstrap_spool_bytes][,CDC tuning...])`、`postgres(connection,table)`、
+`clickhouse(connection,table)` 和 `doris(connection,table)`；CDC tuning
 包含 connect/query timeout、retry limit/max delay、streaming heartbeat 和 snapshot fetch size，必须证明类型与范围校验在
 Store/source I/O 前完成、准确映射到具体 connector、bootstrap heartbeat 不可覆盖、MySQL 未设置 fetch size 时不写 property，
 且修改 tuning 后 Program identity 不变。默认 spool 必须等价于显式 1 GiB，旧的 split connection、runtime、engine、slot、sink
@@ -244,6 +245,7 @@ python3 system-tests/postgres/check_sink.py \
 python3 system-tests/postgres/check_sql.py \
   --bundle /absolute/path/to/runtime-bundle \
   --postgres-bin /absolute/path/to/postgresql/bin
+system-tests/warehouse-sinks/check.sh
 ```
 
 `system-tests/debezium-postgres/host` 是独立 Cargo workspace 和 lockfile，只依赖 Debezium crate，作为真实外部消费者。它不进入根 workspace。脚本接口固定为：
@@ -259,6 +261,7 @@ scripts/clean.sh
 `check.sh`、`run.sh` 或日常 CI workflow。
 
 根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink、Sink recovery 和 SQL 四个 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 使用。
+`system-tests/warehouse-sinks/check.sh` 用锁定的官方镜像启动一次性 ClickHouse/Doris fixture，运行产品 crate 内标记为 ignored 的真实 adapter 测试，并在退出时删除容器和 volume；可用 `CONTAINER_ENGINE` 选择兼容 Compose 的容器 CLI。
 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。
 

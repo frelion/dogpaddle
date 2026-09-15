@@ -292,6 +292,47 @@ fn mutation_grouping_collects_each_rows_insert_validation_and_delete_ids() {
             delete_ids: vec![11, 3],
         }
     );
+    assert_eq!(
+        terminal_mutations(&Batch {
+            inserts: vec![
+                Insert {
+                    row_index: 1,
+                    technical_id: 11,
+                },
+                Insert {
+                    row_index: 0,
+                    technical_id: 7,
+                },
+            ],
+            deletes: vec![
+                Delete {
+                    row_index: 2,
+                    technical_id: 11,
+                },
+                Delete {
+                    row_index: 0,
+                    technical_id: 3,
+                },
+            ],
+        }),
+        vec![
+            TerminalMutation {
+                row_index: 0,
+                technical_id: 3,
+                deleted: true,
+            },
+            TerminalMutation {
+                row_index: 0,
+                technical_id: 7,
+                deleted: false,
+            },
+            TerminalMutation {
+                row_index: 2,
+                technical_id: 11,
+                deleted: true,
+            },
+        ]
+    );
 }
 
 #[test]

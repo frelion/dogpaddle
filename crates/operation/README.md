@@ -369,6 +369,8 @@ matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远�
 | `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
 | `EquiJoin` (16) | Turn / 2 | 增量维护带可选 residual 的 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 使用 key counts 或逐行 match counts |
 | `AsOfJoin` (17) | Turn / 2 | 按 equality partition 增量维护 backward/forward/nearest 的单候选 Inner、Left Outer/Semi/Anti | ordered left rows、ordered right rows、continuation |
+| `DorisSink` (18) | Sink / 1 | 通过 Unique Key merge-on-write 表维护 Apache Doris 精确关系 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
+| `ClickHouseSink` (19) | Sink / 1 | 通过 `ReplacingMergeTree` 与 `FINAL` view 维护 `ClickHouse` 精确关系 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
 
 源码按业务角色放在 [`operation/scan/`](src/operation/scan/)、
 [`operation/transform/`](src/operation/transform/) 和
@@ -431,7 +433,7 @@ Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 s
 Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
 `dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
 
-`SQLite` 与 `PostgreSQL` Sink 共用唯一的 durable buffered Sink 协议。完整输入 Change 先编码为一个
+`SQLite`、`PostgreSQL`、`ClickHouse` 与 `Doris` Sink 共用唯一的 durable buffered Sink 协议。完整输入 Change 先编码为一个
 `sink.buffer` entry，并与 `sink.control` accounting、input `Complete` acknowledgement 在同一 Store
 事务提交；因此调用方在目标数据库写入前就可以释放 Claim。连续小 Change 可以聚合；没有新 Claim、
 待处理事件达到目标上限或 retained bytes 达到 delivery watermark 时，运行时才从 buffer 构造一个
@@ -439,7 +441,7 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 先无拷贝预检 IPC body，避免超大 Change 在拒绝前形成完整临时 body。owned decode 在对齐合适时共享这份
 受限 IPC backing，否则只做受 body 上限约束的局部对齐复制。整个 buffer 最多按 IPC+key 的逻辑口径
 保留 64 MiB、1,048,576 个 relation events；这不是 Rust heap、RocksDB WAL 或磁盘硬配额。
-SQLite/PostgreSQL 的每个目标批次最多 1024 个 mutation，完整 encoded 输入聚合受 8 MiB 上限；
+每个目标批次最多 1024 个 mutation，完整 encoded 输入聚合受 8 MiB 上限；
 target mutation 按 canonical row、技术字段和每列固定 framing 的逻辑口径计费，并受独立 8 MiB
 上限。后者不是 driver heap、SQL/wire payload 或数据库事务资源的硬配额。
 超出单项或 event 上限、或不能在剩余 technical-ID 区间内排空的 Claim 在 admission 前明确失败，不产生
@@ -460,6 +462,13 @@ entries、连续 sequence、Schema、control accounting，以及 checkpoint 下�
 共享目标或在线 Schema evolution。PostgreSQL 的 5 秒 work-unit deadline 包含宽 Schema 为遵守参数上限
 产生的全部 SQL 分片往返，因此极宽目标需要低延迟连接。真实数据库限制和恢复证据见对应 correctness
 与 system test。
+
+`ClickHouse` Sink 使用无 TLS HTTP endpoint，持久化 Atomic database UUID，并独占一个
+`ReplacingMergeTree(version)` 状态表和公开 `FINAL` view；delete version 高于 live version，旧 live 重放
+不能复活 tombstone。Doris Sink 使用无 TLS `MySQL` endpoint，持久化唯一 cluster ID，并独占一个开启
+merge-on-write 的 Unique Key 状态表和公开 view；delete marker 同时作为 sequence column。两者均只把
+非敏感 target identity 写入 Definition，host、port、user 和 password 必须在每次 materialize 时重新注入。
+两个状态表都为 row hash 建立后端原生索引，lookup 仍逐 logical row 做完整值核对。为了让提交结果不确定的旧写入永远不能复活已经删除的 technical ID，删除记录作为每个 ID 的终态保留；引擎 compaction 可合并同一 ID 的版本，但状态表物理基数仍随历史分配过的 technical ID 增长。当前没有安全的自动 GC，长期高 churn 部署必须监控目标容量并在维护窗口以新 state/target 重建。
 
 ## 持久化 ABI
 

@@ -49,6 +49,17 @@ fn parse_accepts_every_v1_scan_and_sink_endpoint() {
     ";
     SqlProgram::parse(mysql).unwrap();
 
+    SqlProgram::parse(
+        "INSERT INTO doris(connection => env('DOGPADDLE_DORIS_URL'), \
+         table => 'analytics.orders') SELECT value FROM sequence(start => 0)",
+    )
+    .unwrap();
+    SqlProgram::parse(
+        "INSERT INTO clickhouse(connection => env('DOGPADDLE_CLICKHOUSE_URL'), \
+         table => 'analytics.orders') SELECT value FROM sequence(start => 0)",
+    )
+    .unwrap();
+
     SqlProgram::parse("INSERT INTO discard() SELECT value FROM sequence(start => 0)").unwrap();
 }
 
@@ -438,6 +449,17 @@ fn start_rejects_malformed_database_urls_and_qualified_tables_before_source_io()
                 connection => 'mysql://user:secret@127.0.0.1/app', \
                 table => 'other.orders'\
             )",
+        ),
+        (
+            "Doris table from another database",
+            "INSERT INTO doris(connection => 'doris://user:secret@127.0.0.1/app', \
+                table => 'other.orders') SELECT value FROM sequence(start => 0)",
+        ),
+        (
+            "ClickHouse table from another database",
+            "INSERT INTO clickhouse(\
+                connection => 'clickhouse://user:secret@127.0.0.1/app', \
+                table => 'other.orders') SELECT value FROM sequence(start => 0)",
         ),
     ];
 
@@ -895,7 +917,43 @@ fn start_resolves_every_endpoint_parameter_before_selecting_state_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let variable = "DOGPADDLE_SQL_CORRECTNESS_START_MISSING_91F6E33D";
     assert!(std::env::var_os(variable).is_none());
-    let mut programs = vec![
+    let mut programs = endpoint_programs_with_missing_parameter(variable);
+
+    for parameter in [
+        "connect_timeout_ms",
+        "query_timeout_ms",
+        "retry_limit",
+        "retry_max_delay_ms",
+        "heartbeat_interval_ms",
+        "snapshot_fetch_size",
+    ] {
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
+                connection => 'postgresql://user:secret@127.0.0.1/app', \
+                table => 'public.events', publication => 'events_publication', \
+                {parameter} => env('{variable}')\
+            )"
+        ));
+        programs.push(format!(
+            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
+                connection => 'mysql://user:secret@127.0.0.1/app', \
+                table => 'app.events', {parameter} => env('{variable}')\
+            )"
+        ));
+    }
+
+    for (index, sql) in programs.iter().enumerate() {
+        let flow_path = root.path().join(format!("flow-{index}"));
+        let program = SqlProgram::parse(sql).unwrap();
+        assert!(
+            matches!(program.start(&flow_path), Err(SqlError::Environment { name }) if name == variable)
+        );
+        assert!(!flow_path.exists());
+    }
+}
+
+fn endpoint_programs_with_missing_parameter(variable: &str) -> Vec<String> {
+    vec![
         format!("INSERT INTO discard() SELECT value FROM sequence(start => env('{variable}'))"),
         format!(
             "INSERT INTO sqlite(path => env('{variable}'), table => 'events') \
@@ -957,37 +1015,25 @@ fn start_resolves_every_endpoint_parameter_before_selecting_state_lifecycle() {
                 table => env('{variable}')\
              ) SELECT value FROM sequence(start => 0)"
         ),
-    ];
-
-    for parameter in [
-        "connect_timeout_ms",
-        "query_timeout_ms",
-        "retry_limit",
-        "retry_max_delay_ms",
-        "heartbeat_interval_ms",
-        "snapshot_fetch_size",
-    ] {
-        programs.push(format!(
-            "INSERT INTO discard() SELECT * FROM postgres_cdc(\
-                connection => 'postgresql://user:secret@127.0.0.1/app', \
-                table => 'public.events', publication => 'events_publication', \
-                {parameter} => env('{variable}')\
-            )"
-        ));
-        programs.push(format!(
-            "INSERT INTO discard() SELECT * FROM mysql_cdc(\
-                connection => 'mysql://user:secret@127.0.0.1/app', \
-                table => 'app.events', {parameter} => env('{variable}')\
-            )"
-        ));
-    }
-
-    for (index, sql) in programs.iter().enumerate() {
-        let flow_path = root.path().join(format!("flow-{index}"));
-        let program = SqlProgram::parse(sql).unwrap();
-        assert!(
-            matches!(program.start(&flow_path), Err(SqlError::Environment { name }) if name == variable)
-        );
-        assert!(!flow_path.exists());
-    }
+        format!(
+            "INSERT INTO doris(connection => env('{variable}'), table => 'app.events') \
+             SELECT value FROM sequence(start => 0)"
+        ),
+        format!(
+            "INSERT INTO doris(\
+                connection => 'doris://user:secret@127.0.0.1/app', \
+                table => env('{variable}')\
+             ) SELECT value FROM sequence(start => 0)"
+        ),
+        format!(
+            "INSERT INTO clickhouse(connection => env('{variable}'), table => 'app.events') \
+             SELECT value FROM sequence(start => 0)"
+        ),
+        format!(
+            "INSERT INTO clickhouse(\
+                connection => 'clickhouse://user:secret@127.0.0.1/app', \
+                table => env('{variable}')\
+             ) SELECT value FROM sequence(start => 0)"
+        ),
+    ]
 }

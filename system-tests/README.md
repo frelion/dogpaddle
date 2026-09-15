@@ -16,6 +16,10 @@ or another process boundary. It is intentionally outside the product crates.
   remains a separate workspace with its own byte-for-byte preserved
   `Cargo.lock`; `scripts/check.sh` builds its inputs and runs the full local gate,
   while `scripts/run.sh` accepts only already-built absolute artifact paths.
+- `warehouse-sinks/` owns disposable official ClickHouse and Doris containers.
+  Its gate runs the ignored live adapter cases for target ownership, layout,
+  convergent replay, stale-write suppression, exact row validation, and Doris
+  multi-statement transaction splitting.
 
 Normal `cargo test --workspace` does not start Java, PostgreSQL, or containers.
 The exact local and CI commands are documented in [`../TESTING.md`](../TESTING.md).

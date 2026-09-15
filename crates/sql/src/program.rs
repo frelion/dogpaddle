@@ -122,9 +122,7 @@ impl SqlProgram {
             let station_id = scan_station_id(index);
             scan.install_open_runtime_resource(&mut factory, &station_id, runtime_bundle)?;
         }
-        if let Some(config) = self.sink.open_runtime_config()? {
-            factory.resource("sql/sink", config)?;
-        }
+        self.sink.install_open_runtime_resource(&mut factory)?;
         factory.open().map_err(Into::into)
     }
 
@@ -332,6 +330,29 @@ mod tests {
             )",
         );
         assert_ne!(first, changed_database);
+
+        for endpoint in ["doris", "clickhouse"] {
+            let first = identity(&format!(
+                "INSERT INTO {endpoint}(\
+                    connection => '{endpoint}://alice:first@127.0.0.1:8123/app', \
+                    table => 'app.orders'\
+                 ) SELECT value FROM sequence(start => 0)"
+            ));
+            let second = identity(&format!(
+                "INSERT INTO {endpoint}(\
+                    connection => '{endpoint}://bob:second@127.0.0.2:9123/app', \
+                    table => 'app.orders'\
+                 ) SELECT value FROM sequence(start => 0)"
+            ));
+            let changed_database = identity(&format!(
+                "INSERT INTO {endpoint}(\
+                    connection => '{endpoint}://bob:second@127.0.0.2:9123/other', \
+                    table => 'other.orders'\
+                 ) SELECT value FROM sequence(start => 0)"
+            ));
+            assert_eq!(first, second);
+            assert_ne!(first, changed_database);
+        }
     }
 
     #[test]

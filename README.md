@@ -3,7 +3,7 @@
 **一条 SQL，持续把数据库变化变成另一个数据库中的结果。**
 
 ```text
-PostgreSQL / MySQL  ── CDC ──▶  SQL  ──▶  PostgreSQL / SQLite
+PostgreSQL / MySQL  ── CDC ──▶  SQL  ──▶  PostgreSQL / SQLite / ClickHouse / Doris
 ```
 
 DogPaddle 是一个本地运行、可恢复的实时数据引擎。它先读取一致快照，再持续消费 WAL 或 binlog；进程重启后，从已提交的位置继续。
@@ -15,7 +15,7 @@ DogPaddle 是一个本地运行、可恢复的实时数据引擎。它先读取�
 
 ## 1. 数据同步
 
-把 PostgreSQL 或 MySQL 的数据变化持续同步到 PostgreSQL 或 SQLite。源表发生 `INSERT`、`UPDATE`、`DELETE`，目标表随之改变。
+把 PostgreSQL 或 MySQL 的数据变化持续同步到 PostgreSQL、SQLite、ClickHouse 或 Apache Doris。源表发生 `INSERT`、`UPDATE`、`DELETE`，目标关系随之改变。
 
 ![DogPaddle 将 PostgreSQL 的数据变化持续同步到另一个 PostgreSQL](docs/assets/readme-cdc-sync.gif)
 

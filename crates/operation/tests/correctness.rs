@@ -4,12 +4,16 @@ mod aggregate;
 mod asof_join;
 #[path = "correctness/atomic.rs"]
 mod atomic;
+#[path = "correctness/clickhouse_sink.rs"]
+mod clickhouse_sink;
 #[path = "correctness/definition_codec.rs"]
 mod definition_codec;
 #[path = "correctness/discard.rs"]
 mod discard;
 #[path = "correctness/distinct.rs"]
 mod distinct;
+#[path = "correctness/doris_sink.rs"]
+mod doris_sink;
 #[path = "correctness/equi_join.rs"]
 mod equi_join;
 #[path = "correctness/expression.rs"]
