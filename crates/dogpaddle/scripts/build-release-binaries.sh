@@ -17,7 +17,19 @@ case "$target" in
       echo "Linux releases must be built against glibc $LINUX_GLIBC_BASELINE, got ${actual_glibc:-unknown}" >&2
       exit 1
     fi
-    export RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+    static_runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-static-runtime.XXXXXX")"
+    libstdcxx_archive="$(gcc -print-file-name=libstdc++.a)"
+    libgcc_archive="$(gcc -print-libgcc-file-name)"
+    libgcc_eh_archive="$(gcc -print-file-name=libgcc_eh.a)"
+    for archive in "$libstdcxx_archive" "$libgcc_archive" "$libgcc_eh_archive"; do
+      if [[ ! -f "$archive" ]]; then
+        echo "Linux release compiler is missing static runtime archive: $archive" >&2
+        exit 1
+      fi
+    done
+    ln -s "$libstdcxx_archive" "$static_runtime_dir/libstdc++.so"
+    ln -s "$libgcc_archive" "$static_runtime_dir/libgcc_s.so"
+    export RUSTFLAGS="-L native=$static_runtime_dir -C link-arg=$libgcc_eh_archive"
     ;;
   x86_64-apple-darwin|aarch64-apple-darwin)
     export MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET"
