@@ -90,8 +90,7 @@ nested distribution 的精确 JAR 集合与 hash，以及 `libjvm` path containm
 D2 构建器支持 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
 `x86_64-apple-darwin` 和 `aarch64-apple-darwin`。Linux 支持边界是 GNU/glibc，不含
 musl/Alpine。D2 只交付可复用 runtime payload；仓库有实际主产品 executable 后，由最终 release
-packager 把二者组合为用户归档。macOS 开发 archive 未签名；正式 Developer ID 签名与 Apple
-notarization 是 D5 发布门。
+packager 把二者组合为用户归档。macOS archive 不做 Developer ID 签名或 Apple notarization。
 
 ### 3. 使用 stock Debezium Engine
 
@@ -241,7 +240,7 @@ Rust snapshot reader 属于新架构决策，需要后续 ADR，不由 D6 实现
 ### 负面结果与代价
 
 - 每个平台归档都携带 JRE/HotSpot，发布体积、启动时间和常驻内存显著上升；
-- Linux GNU 与 macOS 的双架构需要原生构建/验收；macOS 正式发布还需要签名与 notarization；
+- Linux GNU 与 macOS 的双架构需要原生构建/验收；未签名的 macOS archive 可能被 Gatekeeper 拦截；
 - JNI 引入跨语言错误、线程 attach、reference 和 class-loader 生命周期；
 - HotSpot fatal error 可使整个 Rust 进程退出，没有 sidecar 故障隔离；
 - JVM options/class path 是进程级配置，不能由不同 Flow 独立更改；

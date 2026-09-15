@@ -133,8 +133,8 @@ Invocation API。这是可重复基线，不是“自动跟随 latest”策略�
   payload 内 `libjvm`，没有 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java fallback。Linux 不承诺
   musl/Alpine。普通 Cargo gate 不下载 Java；payload 是独立的显式构建。
 - D2 的开发/验收 bundle 生成 Debezium transitive SBOM，保存 Temurin 上游 SBOM、artifact checksum、
-  runtime notices 与源码引用。它们是审查输入，不等于正式许可证或安全审查。macOS 开发包目前
-  未签名；Developer ID 签名、notarization、CVE 与升级 rehearsal 统一属于 D5 发布门。
+  runtime notices 与源码引用。它们是审查输入，不等于正式许可证或安全审查。macOS 发布包保持
+  未签名，Gatekeeper 放行由用户处理；CVE 与升级 rehearsal 属于 D5 发布门。
 
 ## 阶段总览
 
@@ -522,7 +522,7 @@ Snapshot、在线 DDL 和第二 connector 仍非目标。
 - 指标与诊断：JVM/Engine 状态、poll/ACK latency、outstanding bytes、accepted checkpoint、
   output backlog、backpressure 源头、slot/WAL lag；
 - secret redaction、TLS 边界、JDK/JAR provenance、license/SBOM/CVE 流程；
-- macOS Developer ID 签名、notarization 与发布验证；Linux/macOS 正式支持矩阵及升级归档；
+- 未签名 macOS archive 的发布验证与 Gatekeeper 边界说明；Linux/macOS 正式支持矩阵及升级归档；
 - 精确版本升级流程：旧 opaque offset fixture、bridge envelope、Definition/state golden、
   上游 Debezium connector 兼容性评审。
 

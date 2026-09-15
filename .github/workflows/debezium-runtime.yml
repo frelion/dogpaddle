@@ -181,38 +181,6 @@ jobs:
           python3 --version
           crates/dogpaddle/scripts/build-release-binaries.sh "$TARGET"
 
-      - name: Sign the macOS release executables
-        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$MACOS_CERTIFICATE_P12_BASE64" \
-            || -z "$MACOS_CERTIFICATE_PASSWORD" \
-            || -z "$MACOS_SIGNING_IDENTITY" ]]; then
-            echo 'tagged macOS releases require signing certificate secrets' >&2
-            exit 1
-          fi
-          certificate="$RUNNER_TEMP/dogpaddle-release-certificate.p12"
-          keychain="$RUNNER_TEMP/dogpaddle-release.keychain-db"
-          keychain_password="$(openssl rand -hex 32)"
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" \
-            | openssl base64 -d -A -out "$certificate"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$certificate" -k "$keychain" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: \
-            -s -k "$keychain_password" "$keychain"
-          security list-keychains -d user -s "$keychain"
-          crates/dogpaddle/scripts/sign-macos-release.sh \
-            "$TARGET" "$MACOS_SIGNING_IDENTITY"
-          rm -f -- "$certificate"
-
       - name: Assemble the self-contained runtime bundle
         run: crates/debezium/scripts/build-runtime-bundle.sh "${{ matrix.target }}"
 
@@ -268,31 +236,6 @@ jobs:
             "$RUNNER_TEMP/debezium-runtime-probe/dogpaddle-debezium-lifecycle-probe.jar" \
             "$RUNNER_TEMP"
 
-      - name: Notarize the macOS release
-        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
-        env:
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$MACOS_NOTARY_ISSUER_ID" \
-            || -z "$MACOS_NOTARY_KEY_ID" \
-            || -z "$MACOS_NOTARY_KEY_P8_BASE64" ]]; then
-            echo 'tagged macOS releases require App Store Connect notarization secrets' >&2
-            exit 1
-          fi
-          api_key="$RUNNER_TEMP/AuthKey_$MACOS_NOTARY_KEY_ID.p8"
-          printf '%s' "$MACOS_NOTARY_KEY_P8_BASE64" \
-            | openssl base64 -d -A -out "$api_key"
-          crates/dogpaddle/scripts/notarize-macos-release.sh \
-            "$GITHUB_WORKSPACE/target/release-packages/dogpaddle-$RELEASE_ID-$TARGET.tar.gz" \
-            "$api_key" \
-            "$MACOS_NOTARY_KEY_ID" \
-            "$MACOS_NOTARY_ISSUER_ID"
-          rm -f -- "$api_key"
-
       - name: Upload the compatibility report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -310,16 +253,6 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-
-      - name: Remove the temporary macOS signing keychain
-        if: always() && startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
-        run: |
-          keychain="$RUNNER_TEMP/dogpaddle-release.keychain-db"
-          if [[ -f "$keychain" ]]; then
-            security delete-keychain "$keychain"
-          fi
-          rm -f -- "$RUNNER_TEMP/dogpaddle-release-certificate.p12"
-          rm -f -- "$RUNNER_TEMP"/AuthKey_*.p8
 
   release:
     name: Publish GitHub Release

@@ -198,7 +198,7 @@ sqlite3 -readonly -header -column "$DOGPADDLE_QUICKSTART_SQLITE" \
 
 原生发行包当前覆盖 `x86_64`、`aarch64` 的 GNU/Linux 与 macOS。Linux 以 glibc 2.28 为最低用户态 ABI，并静态链接 DogPaddle 使用的 C++ compiler runtime；macOS 以 macOS 11.0 为最低 deployment target。每个 archive 都在发布前检查 OS ABI、包内动态库引用和 CPU 架构，并在没有系统 Java、空 `PATH`、只读安装目录下完成首次构建与 reopen smoke。JRE 中未被 DogPaddle headless 路径加载的桌面模块可能仍声明 X11 或 ALSA 动态库；它们记录在随 release 发布的 `compatibility.txt` 中，不属于 DogPaddle 运行路径。
 
-正式 tag 的 macOS executable 使用 Hardened Runtime 签名，并在发布前通过 Apple notarization；缺少签名或 notarization 凭据时 release 会直接失败，不会发布未签名的 macOS 包。
+macOS archive 不做 Developer ID 签名或 Apple notarization。若 Gatekeeper 阻止从互联网下载的 executable，用户需要在系统设置中手动允许运行。
 
 产品命令只有：
 
