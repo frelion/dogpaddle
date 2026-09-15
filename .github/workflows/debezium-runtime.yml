@@ -209,9 +209,9 @@ jobs:
             -c 'set -euo pipefail
             export PATH="$TOOLCHAIN_BIN:$PATH"
             export RUSTC="$TOOLCHAIN_BIN/rustc"
-            clang_resource_dir="$(clang -print-resource-dir)"
-            test -f "$clang_resource_dir/include/stdbool.h"
-            export BINDGEN_EXTRA_CLANG_ARGS="-isystem $clang_resource_dir/include"
+            compiler_include_dir="$(gcc -print-file-name=include)"
+            test -f "$compiler_include_dir/stdbool.h"
+            export BINDGEN_EXTRA_CLANG_ARGS="-isystem $compiler_include_dir"
             rustc --version --verbose
             cargo --version --verbose
             crates/dogpaddle/scripts/build-release-binaries.sh "$TARGET"'
