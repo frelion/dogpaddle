@@ -108,10 +108,11 @@ SQL 原生支持向前/向后四种严格或包含等值的匹配；Rust Operati
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/frelion/dogpaddle/releases) 下载压缩包。发行包已包含固定版本的 Debezium 与 JRE，无需安装 Rust 或系统 Java。
+从 [GitHub Releases](https://github.com/frelion/dogpaddle/releases) 下载对应平台的压缩包。发行包已包含固定版本的 Debezium 与 JRE，无需安装 Rust 或系统 Java。以下以 Apple Silicon macOS 为例：
 
 ```sh
-dogpaddle run pipeline.sql --state ./state
+tar -xzf dogpaddle-v0.2.0-aarch64-apple-darwin.tar.gz
+./dogpaddle-v0.2.0-aarch64-apple-darwin/bin/dogpaddle run pipeline.sql --state ./state
 ```
 
 每个 SQL 文件只描述一条数据管道：
@@ -129,7 +130,7 @@ INSERT INTO target(...) <query>;
 | 数据源 | PostgreSQL CDC、MySQL CDC |
 | SQL | `SELECT`、`WHERE`、表达式、普通 `JOIN`、动态 `ASOF JOIN`、`GROUP BY`、`DISTINCT`、`UNION ALL` |
 | 聚合 | `COUNT`、`SUM`、`AVG`、`MIN`、`MAX` |
-| 目标端 | PostgreSQL、SQLite |
+| 目标端 | PostgreSQL、SQLite、ClickHouse、Doris |
 | 恢复 | 本地持久化进度、拓扑和算子状态 |
 
 DogPaddle 仍处于早期开发阶段。CDC 当前要求固定 Schema，暂不支持 TLS、在线 DDL 或多表路由；完整约束见 [SQL 文档](crates/sql/README.md)。

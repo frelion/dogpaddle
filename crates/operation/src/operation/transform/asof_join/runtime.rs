@@ -19,7 +19,8 @@ use crate::{
     operation::{
         Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation,
         relation::{
-            canonical_row, decode_canonical_row, encode_canonical, order_key, ordered_value,
+            RowError, canonical_row_bounded, decode_canonical_row, encode_canonical_bounded,
+            order_key, ordered_value,
         },
     },
 };
@@ -36,6 +37,7 @@ use super::{
 
 const TURN_ITEMS: usize = 256;
 const TURN_BYTES: usize = 4 * 1024 * 1024;
+const PREPARED_CLAIM_BYTES: usize = 64 * 1024 * 1024;
 const CANDIDATE_ITEMS: usize = 64;
 const CANDIDATE_BYTES: usize = 1024 * 1024;
 const CANDIDATE_SCALAR_VALUES: usize = 16 * 1024;
@@ -96,6 +98,20 @@ struct PreparedRow {
     order: Vec<u8>,
     matchable: bool,
     difference: i64,
+}
+
+struct PreparingRow {
+    row: Vec<u8>,
+    partition: Vec<u8>,
+    order: Vec<u8>,
+    rank: Vec<u8>,
+    matchable: bool,
+    order_matchable: bool,
+    difference: i64,
+}
+
+struct PreparationBudget {
+    bytes: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -209,6 +225,135 @@ impl BoundOrderPair {
     }
 }
 
+impl PreparationBudget {
+    fn new(rows: usize) -> Result<Self, AsOfJoinError> {
+        let structural_bytes = rows
+            .checked_mul(size_of::<PreparingRow>().saturating_add(size_of::<PreparedRow>()))
+            .ok_or_else(prepared_claim_too_large)?;
+        if structural_bytes > PREPARED_CLAIM_BYTES {
+            return Err(prepared_claim_too_large());
+        }
+        Ok(Self {
+            bytes: structural_bytes,
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        PREPARED_CLAIM_BYTES.saturating_sub(self.bytes)
+    }
+
+    fn output_limit(&self, current: usize) -> Result<usize, AsOfJoinError> {
+        current
+            .checked_add(self.remaining())
+            .ok_or_else(prepared_claim_too_large)
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), AsOfJoinError> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= PREPARED_CLAIM_BYTES)
+            .ok_or_else(prepared_claim_too_large)?;
+        Ok(())
+    }
+
+    fn push_component(
+        &mut self,
+        output: &mut Vec<u8>,
+        component: &[u8],
+    ) -> Result<(), AsOfJoinError> {
+        let bytes = framed_component_bytes(component).ok_or_else(prepared_claim_too_large)?;
+        if bytes > self.remaining() {
+            return Err(prepared_claim_too_large());
+        }
+        push_component(output, component);
+        self.charge(bytes)
+    }
+
+    fn push_nullable_component(
+        &mut self,
+        output: &mut Vec<u8>,
+        component: Option<&[u8]>,
+        descending: bool,
+        nulls_first: bool,
+    ) -> Result<(), AsOfJoinError> {
+        let marker = [u8::from(component.is_none() != nulls_first)];
+        let bytes = framed_component_bytes(&marker)
+            .and_then(|bytes| {
+                component.map_or(Some(bytes), |component| {
+                    bytes.checked_add(framed_component_bytes(component)?)
+                })
+            })
+            .ok_or_else(prepared_claim_too_large)?;
+        if bytes > self.remaining() {
+            return Err(prepared_claim_too_large());
+        }
+        push_nullable_ordered_component(output, component, descending, nulls_first);
+        self.charge(bytes)
+    }
+
+    fn row_key(
+        &mut self,
+        partition: &[u8],
+        order: &[u8],
+        rank: &[u8],
+        row: &[u8],
+    ) -> Result<Vec<u8>, AsOfJoinError> {
+        let bytes = [partition, order, rank, row]
+            .into_iter()
+            .try_fold(0_usize, |bytes, component| {
+                bytes.checked_add(framed_component_bytes(component)?)
+            })
+            .ok_or_else(prepared_claim_too_large)?;
+        if bytes > self.remaining() {
+            return Err(prepared_claim_too_large());
+        }
+        let key = row_key(partition, order, rank, row);
+        debug_assert_eq!(key.len(), bytes);
+        self.charge(bytes)?;
+        Ok(key)
+    }
+}
+
+fn framed_component_bytes(component: &[u8]) -> Option<usize> {
+    component
+        .iter()
+        .try_fold(component.len().checked_add(2)?, |bytes, byte| {
+            if *byte == 0 {
+                bytes.checked_add(1)
+            } else {
+                Some(bytes)
+            }
+        })
+}
+
+const fn prepared_claim_too_large() -> AsOfJoinError {
+    AsOfJoinError::PreparedClaimTooLarge {
+        max_bytes: PREPARED_CLAIM_BYTES,
+    }
+}
+
+fn map_preparation_row_error(source: OperationError) -> AsOfJoinError {
+    if matches!(
+        source.downcast_ref::<RowError>(),
+        Some(RowError::SizeLimit { .. })
+    ) {
+        prepared_claim_too_large()
+    } else {
+        AsOfJoinError::CanonicalRow { source }
+    }
+}
+
+fn map_preparation_codec_error(source: RowError) -> AsOfJoinError {
+    if matches!(source, RowError::SizeLimit { .. }) {
+        prepared_claim_too_large()
+    } else {
+        AsOfJoinError::CanonicalRow {
+            source: Box::new(source),
+        }
+    }
+}
+
 impl AsOfJoinOperation {
     fn validate_input(&self, input: OperationInput<'_>) -> Result<(), AsOfJoinError> {
         if input.port >= self.input_schemas.len() {
@@ -222,125 +367,119 @@ impl AsOfJoinOperation {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "preparation evaluates and encodes each independently configured key family"
+        reason = "preparation evaluates one key expression at a time and bounds every retained encoding"
     )]
     fn prepare_claim(&self, input: OperationInput<'_>) -> Result<PreparedClaim, OperationError> {
         let records = input.change.records();
-        let equality_columns = self
-            .equalities
-            .iter()
-            .enumerate()
-            .map(|(index, pair)| {
-                pair.for_port(input.port)
-                    .expression
-                    .evaluate(records)
-                    .map_err(|source| AsOfJoinError::Expression {
-                        role: "equality",
-                        index,
-                        port: input.port,
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let order_columns = self
-            .orders
-            .iter()
-            .enumerate()
-            .map(|(index, pair)| {
-                pair.for_port(input.port)
-                    .expression
-                    .evaluate(records)
-                    .map_err(|source| AsOfJoinError::Expression {
-                        role: "order",
-                        index,
-                        port: input.port,
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let tie_columns = if input.port == 1 {
-            self.ties
-                .iter()
-                .enumerate()
-                .map(|(index, tie)| {
-                    tie.value.expression.evaluate(records).map_err(|source| {
-                        AsOfJoinError::Expression {
-                            role: "tie break",
-                            index,
-                            port: input.port,
-                            source,
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
-
-        let mut rows = Vec::with_capacity(input.change.num_rows());
+        let mut budget = PreparationBudget::new(input.change.num_rows())?;
+        let mut preparing = Vec::with_capacity(input.change.num_rows());
         for index in 0..input.change.num_rows() {
-            let row = canonical_row(records, index)
-                .map_err(|source| AsOfJoinError::CanonicalRow { source })?;
-            let mut partition = Vec::new();
-            let mut matchable = true;
-            for (pair, column) in self.equalities.iter().zip(&equality_columns) {
-                let scalar = pair.for_port(input.port);
-                if pair.mode == AsOfEqualityMode::Equal && column.is_null(index) {
-                    matchable = false;
+            let row = canonical_row_bounded(records, index, budget.remaining())
+                .map_err(map_preparation_row_error)?;
+            budget.charge(row.len())?;
+            budget.charge(1)?;
+            preparing.push(PreparingRow {
+                row,
+                partition: Vec::new(),
+                order: vec![0],
+                rank: Vec::new(),
+                matchable: true,
+                order_matchable: true,
+                difference: input.change.diffs().value(index),
+            });
+        }
+
+        for (expression_index, pair) in self.equalities.iter().enumerate() {
+            let scalar = pair.for_port(input.port);
+            let column = scalar.expression.evaluate(records).map_err(|source| {
+                AsOfJoinError::Expression {
+                    role: "equality",
+                    index: expression_index,
+                    port: input.port,
+                    source,
                 }
-                encode_canonical(
+            })?;
+            for (row_index, row) in preparing.iter_mut().enumerate() {
+                let scalar = pair.for_port(input.port);
+                if pair.mode == AsOfEqualityMode::Equal && column.is_null(row_index) {
+                    row.matchable = false;
+                }
+                let before = row.partition.len();
+                encode_canonical_bounded(
                     &scalar.field,
                     column.as_ref(),
-                    index,
+                    row_index,
                     "ASOF equality",
-                    &mut partition,
+                    &mut row.partition,
+                    budget.output_limit(before)?,
                 )
-                .map_err(|source| AsOfJoinError::CanonicalRow {
-                    source: Box::new(source),
-                })?;
+                .map_err(map_preparation_codec_error)?;
+                budget.charge(row.partition.len().saturating_sub(before))?;
             }
+        }
 
-            let mut order_components = Vec::new();
-            let mut order_matchable = true;
-            for (pair, column) in self.orders.iter().zip(&order_columns) {
+        for (expression_index, pair) in self.orders.iter().enumerate() {
+            let scalar = pair.for_port(input.port);
+            let column = scalar.expression.evaluate(records).map_err(|source| {
+                AsOfJoinError::Expression {
+                    role: "order",
+                    index: expression_index,
+                    port: input.port,
+                    source,
+                }
+            })?;
+            for (row_index, row) in preparing.iter_mut().enumerate() {
                 let scalar = pair.for_port(input.port);
-                let value = ScalarValue::try_from_array(column.as_ref(), index)?;
+                let value = ScalarValue::try_from_array(column.as_ref(), row_index)?;
                 if let Some(component) = order_key(&scalar.field, &value)
                     .map_err(|_| AsOfJoinError::InvalidIndex("bound order value is invalid"))?
                 {
-                    push_component(&mut order_components, &component);
+                    budget.push_component(&mut row.order, &component)?;
                 } else {
-                    order_matchable = false;
-                    push_component(&mut order_components, &[]);
+                    row.order_matchable = false;
+                    budget.push_component(&mut row.order, &[])?;
                 }
             }
-            matchable &= order_matchable;
-            let mut order = Vec::with_capacity(order_components.len().saturating_add(1));
-            order.push(u8::from(order_matchable));
-            order.extend_from_slice(&order_components);
+        }
+        for row in &mut preparing {
+            row.matchable &= row.order_matchable;
+            row.order[0] = u8::from(row.order_matchable);
+        }
 
-            let mut rank = Vec::new();
-            if input.port == 1 {
-                for (tie, column) in self.ties.iter().zip(&tie_columns) {
-                    let value = ScalarValue::try_from_array(column.as_ref(), index)?;
+        if input.port == 1 {
+            for (expression_index, tie) in self.ties.iter().enumerate() {
+                let column = tie.value.expression.evaluate(records).map_err(|source| {
+                    AsOfJoinError::Expression {
+                        role: "tie break",
+                        index: expression_index,
+                        port: input.port,
+                        source,
+                    }
+                })?;
+                for (row_index, row) in preparing.iter_mut().enumerate() {
+                    let value = ScalarValue::try_from_array(column.as_ref(), row_index)?;
                     let encoded = order_key(&tie.value.field, &value).map_err(|_| {
                         AsOfJoinError::InvalidIndex("bound tie-break value is invalid")
                     })?;
-                    push_nullable_ordered_component(
-                        &mut rank,
+                    budget.push_nullable_component(
+                        &mut row.rank,
                         encoded.as_deref(),
                         tie.descending,
                         tie.nulls_first,
-                    );
+                    )?;
                 }
             }
-            let key = row_key(&partition, &order, &rank, &row);
+        }
+
+        let mut rows = Vec::with_capacity(preparing.len());
+        for row in preparing {
+            let key = budget.row_key(&row.partition, &row.order, &row.rank, &row.row)?;
             rows.push(PreparedRow {
                 key,
-                partition,
-                order,
-                matchable,
-                difference: input.change.diffs().value(index),
+                partition: row.partition,
+                order: row.order,
+                matchable: row.matchable,
+                difference: row.difference,
             });
         }
         Ok(PreparedClaim {

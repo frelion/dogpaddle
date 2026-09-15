@@ -452,6 +452,25 @@ pub(crate) fn encode_canonical<'a>(
 }
 
 #[allow(clippy::too_many_lines)]
+pub(crate) fn encode_canonical_bounded<'a>(
+    field: &'a Field,
+    array: &dyn Array,
+    index: usize,
+    path: &'a str,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<(), RowError> {
+    encode_canonical_inner(
+        field,
+        array,
+        index,
+        &mut vec![path],
+        output,
+        Some(max_bytes),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
 fn encode_canonical_inner<'a>(
     field: &'a Field,
     array: &dyn Array,

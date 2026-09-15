@@ -363,6 +363,12 @@ pub enum AsOfJoinError {
     /// Explicit tie-breaks do not identify one right row.
     #[error("ASOF join right candidates remain ambiguous after explicit tie-breaks")]
     AmbiguousTie,
+    /// Preparing the pinned input would retain an excessive index working set.
+    #[error("ASOF join prepared Claim exceeds its {max_bytes}-byte limit")]
+    PreparedClaimTooLarge {
+        /// Maximum retained preparation working set.
+        max_bytes: usize,
+    },
     /// Durable index state is malformed or inconsistent.
     #[error("ASOF join index is invalid: {0}")]
     InvalidIndex(&'static str),

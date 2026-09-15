@@ -220,6 +220,68 @@ fn right_change(events: &[RightEvent]) -> Change {
     .unwrap()
 }
 
+#[test]
+fn repeated_wide_index_expressions_are_bounded_before_turn_work() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("at", DataType::Int64, false),
+    ]));
+    let definition = AsOfJoinDefinition::try_new(
+        AsOfJoinKind::Inner,
+        AsOfDirection::Backward { allow_exact: true },
+        (0..128)
+            .map(|_| AsOfEqualityKey::new(AsOfEqualityMode::Equal, col("payload"), col("payload"))),
+        [AsOfOrderKey::new(col("at"), col("at"))],
+        std::iter::empty::<AsOfTieBreak>(),
+        AsOfTieFallback::CanonicalAscending,
+        None,
+        ["left_payload", "left_at", "right_payload", "right_at"],
+        None,
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let store = create_store(&root, &definition);
+    let names = definition
+        .data()
+        .iter()
+        .map(dogpaddle_operation::DataDeclaration::name)
+        .collect::<Vec<_>>();
+    let mut operation = materialize(
+        &definition,
+        &[Arc::clone(&schema), Arc::clone(&schema)],
+        &store,
+        &names,
+    );
+    let mut transactions = store.into_transactions();
+    let payload = "x".repeat(512 * 1024);
+    let change = Change::try_new(
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![payload])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+
+    let error = commit_ready(
+        &mut operation,
+        Some(OperationInput {
+            port: 0,
+            change: &change,
+        }),
+        &mut transactions,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<AsOfJoinError>(),
+        Some(AsOfJoinError::PreparedClaimTooLarge { .. })
+    ));
+}
+
 impl Fixture {
     fn new(config: Config) -> Self {
         let definition = definition(config);
