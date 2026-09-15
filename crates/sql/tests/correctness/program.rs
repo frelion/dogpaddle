@@ -3,12 +3,10 @@ use dogpaddle_sql::{SqlError, SqlProgram};
 
 #[test]
 fn bundled_sql_examples_parse_through_the_public_file_api() {
-    for file in ["quickstart.sql", "fulfillment.sql"] {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples")
-            .join(file);
-        SqlProgram::read(path).unwrap();
-    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("quickstart.sql");
+    SqlProgram::read(path).unwrap();
 }
 
 #[test]

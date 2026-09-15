@@ -204,7 +204,7 @@ class View:
         self.text(draw, 2270, 77, f"变更 {index:02} / {total:02}", 20, MUTED)
         draw.line((28, 122, 2532, 122), fill="#394b5e")
         self.text(draw, 30, 151, "源表  sales.orders", 26, AMBER)
-        self.text(draw, 607, 151, "ETL  fulfillment.sql", 26, BLUE)
+        self.text(draw, 607, 151, "ETL  pipeline.sql", 26, BLUE)
         self.text(draw, 1990, 151, "目标  ops.fulfillment_queue", 22, GREEN)
         draw.polygon(((558, 162), (576, 171), (558, 180)), fill=BLUE)
         draw.polygon(((1962, 162), (1980, 171), (1962, 180)), fill=GREEN)

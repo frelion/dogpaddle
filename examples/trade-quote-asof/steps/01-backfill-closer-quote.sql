@@ -1,0 +1,2 @@
+INSERT INTO market.quotes VALUES
+    (2, 'ACME', '2026-09-15 09:30:00.400', 10008, 10016);

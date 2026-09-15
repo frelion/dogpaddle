@@ -265,7 +265,18 @@ scripts/clean.sh
 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。
 
-PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink、SQL 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。推送与 workspace version 完全一致的 `v<version>` tag 时，同一 workflow 将 native `dogpaddle` 与已验证 runtime 组装为固定 `bin/`、`libexec/` 布局，为每个平台生成 tarball 和 SHA-256，并在全部 matrix job 成功后发布 GitHub Release。
+PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建；D1、CDC、Sink、SQL 各自执行并始终上传独立日志；最终 required check 名称为 `PostgreSQL engine, scan and sink recovery`。四平台 runtime bundle workflow 保持独立，artifact 不跨 workflow 共享。Linux release executable 在锁定 digest 的 manylinux 2.28 环境中构建，macOS release 显式使用 11.0 deployment target。每次 workflow 都组装并 smoke 最终产品 archive，审计目标架构、OS ABI、动态库引用和 compiler runtime 链接；推送与 workspace version 完全一致的 `v<version>` tag 时，在全部 matrix job 成功后发布这些已验证 archive、SHA-256 和 compatibility report，不重新构建。
+
+正式 macOS tag 还必须完成 Hardened Runtime 签名与 Apple notarization。仓库使用以下 GitHub Actions secrets：
+
+- `MACOS_CERTIFICATE_P12_BASE64`
+- `MACOS_CERTIFICATE_PASSWORD`
+- `MACOS_SIGNING_IDENTITY`
+- `MACOS_NOTARY_KEY_P8_BASE64`
+- `MACOS_NOTARY_KEY_ID`
+- `MACOS_NOTARY_ISSUER_ID`
+
+任何一项缺失都会阻止 tag release，避免发布会被 Gatekeeper 拦截的未签名产物。签名只覆盖 DogPaddle executable 和同构的 lifecycle probe；bundle 内 Temurin Mach-O 保留 Eclipse Adoptium 的原始 Developer ID 签名。DogPaddle entitlement 只允许 HotSpot 所需的 JIT、unsigned executable memory 和跨 Team ID library loading。
 
 ## 新增或删除验证
 

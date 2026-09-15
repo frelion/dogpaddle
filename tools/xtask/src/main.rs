@@ -53,6 +53,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn check(workspace: &Path) -> Result<(), String> {
+    check_examples(workspace)?;
     run_cargo(
         workspace,
         ["fmt", "--all", "--", "--check"],
@@ -86,6 +87,27 @@ fn check(workspace: &Path) -> Result<(), String> {
         ["doc", "--workspace", "--no-deps", "--locked"],
         CargoEnvironment::Overlay(&[("RUSTDOCFLAGS", "-D warnings")]),
     )
+}
+
+fn check_examples(workspace: &Path) -> Result<(), String> {
+    let examples = [
+        "event-sync",
+        "order-etl",
+        "order-fulfillment",
+        "customer-order-enrichment",
+        "payment-reconciliation",
+        "trade-quote-asof",
+        "store-sales-summary",
+    ];
+    for example in examples {
+        let path = workspace
+            .join("examples")
+            .join(example)
+            .join("pipeline.sql");
+        dogpaddle_sql::SqlProgram::read(&path)
+            .map_err(|error| format!("example {} is invalid: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn run_cargo<I, S>(

@@ -147,7 +147,7 @@ class Gate:
         self.flow = root / "flow"
         repository = Path(__file__).resolve().parents[2]
         self.program = (
-            repository / "crates/sql/examples/fulfillment.sql"
+            repository / "examples/order-fulfillment/pipeline.sql"
         ).resolve(strict=True)
         self.port = cluster.port
         self.pg_env = dict(os.environ, PGPASSWORD=PASSWORD)

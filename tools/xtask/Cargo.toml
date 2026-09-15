@@ -7,6 +7,9 @@ publish = false
 autotests = false
 autobenches = false
 
+[dependencies]
+dogpaddle-sql.workspace = true
+
 [[bin]]
 name = "dogpaddle-xtask"
 path = "src/main.rs"

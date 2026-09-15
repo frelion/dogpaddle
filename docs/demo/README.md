@@ -8,8 +8,8 @@
 
 黄色标出源字段变化，绿色标出结果新增或更新，红色划线短暂标出刚删除或撤回的行。
 表格下方保留本轮旧值到新值的变化，底部显示实际执行的源表 SQL。中间展示
-完整的 `fulfillment.sql` 原文，包括读写端点、连接参数、全部 CTE、字段和 `UNION ALL` 分支。
-文件仅调整空白排版为 46 行，带行号一次展示到底，全程固定，无省略或滚动。
+完整的 [`pipeline.sql`](../../examples/order-fulfillment/pipeline.sql) 原文，包括读写端点、连接参数、全部 CTE、字段和 `UNION ALL` 分支。
+文件只调整空白排版，带行号一次展示到底，全程固定，无省略或滚动。
 
 ## 录制
 
@@ -45,6 +45,18 @@ docs/tools/record_fulfillment_demo.sh \
 渲染器直接使用这些源表和目标表快照，不执行 ETL 表达式，不生成业务结果。
 源表先变化、目标表随后变化的停留时间为观察需要而设置，不代表实际 CDC 延迟。
 内部 oracle 查询不逐条录入 transcript，原始采集时间保存在 trace 中。
+
+## README 终端录制
+
+根 README 中的 ASOF 与门店聚合 GIF 使用真实 PTY 录制。脚本创建临时 PostgreSQL cluster，启动产品 binary，逐个执行 example 的 `steps/*.sql`，等待并查询实际目标关系，再由 `asciinema` 保存终端会话、`agg` 转成 GIF：
+
+```sh
+docs/tools/record_readme_examples.sh \
+  --bundle /absolute/path/to/runtime-bundle \
+  --postgres-bin /absolute/path/to/postgresql/bin
+```
+
+录制会同时保留可回放的 `docs/assets/readme-*.cast`。脚本对每一步的目标结果设有检查；数据库变化未被 DogPaddle 处理到预期状态时不会生成新的 GIF。需要预先安装 `asciinema` 与 `agg`。
 
 ## 只重新渲染
 

@@ -158,8 +158,9 @@ bundle 必须在整个进程生命周期内保持不可修改，并安装在不�
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-Linux 目标要求 GNU/glibc，不支持 musl 或 Alpine。macOS archive 当前是未签名的开发产物；发布签名、
-notarization 和完整 native dependency closure 不属于这个 crate 当前的交付承诺。
+Linux 目标要求 GNU/glibc 2.28 或更高版本，不支持 musl 或 Alpine。产品 release 在锁定的 glibc 2.28
+环境构建，并审计最终 archive 的版本化 glibc symbol；macOS 目标的最低 deployment target 是 11.0。
+平台 archive 的 native dependency 报告、重定位和产品 smoke 由 release workflow 统一负责。
 
 payload 本身仍只包含可复用的 Java runtime 与 Debezium distribution，不包含 `DogPaddle` executable 或测试
 host；产品 archive 在固定 `bin/` 与 `libexec/` 布局中组合两者。
