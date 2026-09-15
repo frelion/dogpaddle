@@ -23,7 +23,7 @@ case "$target" in
     ;;
 esac
 
-for command in awk basename cat cp curl dirname find grep mkdir mktemp mv python3 rm rmdir tar; do
+for command in awk basename cat cp curl dirname find grep mkdir mktemp mv python3 rm rmdir tar wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "missing required command: $command" >&2
     exit 1
@@ -69,13 +69,21 @@ download_verified() {
   local url="$1"
   local expected="$2"
   local destination="$3"
+  local maximum_size="$4"
   if [[ -f "$destination" && "$(sha256_file "$destination")" == "$expected" ]]; then
     return
   fi
   local temporary="$destination.part"
-  if ! curl --continue-at - --fail --location --retry 3 --output "$temporary" "$url"; then
+  if [[ -f "$temporary" && "$(wc -c <"$temporary")" -gt "$maximum_size" ]]; then
     rm -f -- "$temporary"
-    curl --fail --location --retry 3 --output "$temporary" "$url"
+  fi
+  if ! curl --continue-at - --fail --location --retry 3 \
+    --connect-timeout 15 --max-time 300 --max-filesize "$maximum_size" \
+    --output "$temporary" "$url"; then
+    rm -f -- "$temporary"
+    curl --fail --location --retry 3 \
+      --connect-timeout 15 --max-time 300 --max-filesize "$maximum_size" \
+      --output "$temporary" "$url"
   fi
   local actual
   actual="$(sha256_file "$temporary")"
@@ -104,8 +112,8 @@ trap cleanup EXIT
 
 jre_archive="$download_dir/${jre_url##*/}"
 sbom_file="$download_dir/${sbom_url##*/}"
-download_verified "$jre_url" "$jre_sha256" "$jre_archive"
-download_verified "$sbom_url" "$sbom_sha256" "$sbom_file"
+download_verified "$jre_url" "$jre_sha256" "$jre_archive" 134217728
+download_verified "$sbom_url" "$sbom_sha256" "$sbom_file" 16777216
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-debezium-bundle.XXXXXX")"
 extracted="$staging/extracted"

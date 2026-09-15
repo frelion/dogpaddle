@@ -7,10 +7,12 @@ import argparse
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from release_archive import extract
 
@@ -31,6 +33,10 @@ VERSIONED_SYMBOL = re.compile(r"\b(GLIBC|GLIBCXX|CXXABI)_([0-9]+(?:\.[0-9]+)+)\b
 
 
 MAX_TOOL_OUTPUT = 1024 * 1024
+MAX_TOOL_CALLS = 512
+MAX_AUDIT_SECONDS = 300
+audit_started = time.monotonic()
+tool_calls = 0
 MACHO_MAGICS = {
     bytes.fromhex(value)
     for value in (
@@ -47,17 +53,36 @@ MACHO_MAGICS = {
 
 
 def run(*command: str) -> str:
-    result = subprocess.run(
-        command,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-    )
-    if len(result.stdout) > MAX_TOOL_OUTPUT:
-        raise RuntimeError(f"tool output exceeded limit: {command[0]}")
-    return result.stdout
+    global tool_calls
+    tool_calls += 1
+    if tool_calls > MAX_TOOL_CALLS:
+        raise RuntimeError("release audit exceeded its external tool call limit")
+    remaining = MAX_AUDIT_SECONDS - (time.monotonic() - audit_started)
+    if remaining <= 0:
+        raise RuntimeError("release audit exceeded its wall-clock limit")
+
+    def limit_output() -> None:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_TOOL_OUTPUT, MAX_TOOL_OUTPUT))
+
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=min(30, remaining),
+            preexec_fn=limit_output,
+        )
+        stdout.seek(0, os.SEEK_END)
+        stderr.seek(0, os.SEEK_END)
+        if stdout.tell() >= MAX_TOOL_OUTPUT or stderr.tell() >= MAX_TOOL_OUTPUT:
+            raise RuntimeError(f"tool output exceeded limit: {command[0]}")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"release audit tool failed ({result.returncode}): {command[0]}"
+            )
+        stdout.seek(0)
+        return stdout.read().decode("utf-8", errors="replace")
 
 
 def version(value: str) -> tuple[int, ...]:

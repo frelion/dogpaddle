@@ -25,7 +25,8 @@ case "$target" in
       echo "Linux releases must be built against glibc $LINUX_GLIBC_BASELINE, got ${actual_glibc:-unknown}" >&2
       exit 1
     fi
-    static_runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/dogpaddle-static-runtime.XXXXXX")"
+    static_runtime_dir="${TMPDIR:-/tmp}/dogpaddle-static-runtime-$target"
+    mkdir -- "$static_runtime_dir"
     libstdcxx_archive="$(gcc -print-file-name=libstdc++.a)"
     libgcc_archive="$(gcc -print-libgcc-file-name)"
     libgcc_eh_archive="$(gcc -print-file-name=libgcc_eh.a)"

@@ -37,7 +37,9 @@ esac
 
 libclang_wheel="$scratch/libclang.whl"
 libclang_root="$scratch/libclang"
-curl --fail --location --retry 3 --output "$libclang_wheel" "$libclang_url"
+curl --fail --location --retry 3 \
+  --connect-timeout 15 --max-time 300 --max-filesize 67108864 \
+  --output "$libclang_wheel" "$libclang_url"
 printf '%s  %s\n' "$libclang_sha256" "$libclang_wheel" | sha256sum --check -
 mkdir -p -- "$libclang_root"
 python3 -m zipfile -e "$libclang_wheel" "$libclang_root"
@@ -51,11 +53,11 @@ libclang_path="$(dirname -- "$libclang_file")"
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   --env CARGO_HOME="$cargo_home" \
-  --env LIBCLANG_PATH="$libclang_path" \
+  --env LIBCLANG_PATH=/opt/dogpaddle-libclang \
   --env TARGET="$target" \
   --env TOOLCHAIN_BIN="$toolchain_bin" \
   --volume "$cargo_home:$cargo_home" \
-  --volume "$libclang_root:$libclang_root:ro" \
+  --volume "$libclang_path:/opt/dogpaddle-libclang:ro" \
   --volume "$rustup_home:$rustup_home:ro" \
   --volume "$workspace:/workspace" \
   --workdir /workspace \
