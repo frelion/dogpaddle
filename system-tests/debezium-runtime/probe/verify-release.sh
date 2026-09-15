@@ -49,7 +49,7 @@ if [[ ! -x "$dogpaddle" || ! -d "$runtime" ]]; then
 fi
 
 "$script_dir/install.sh" "$runtime" "$probe_connector"
-chmod -R a-w -- "$release_root"
+chmod -R a-w "$release_root"
 
 empty_path="$scratch_dir/dogpaddle-empty-path-$target"
 missing_java="$scratch_dir/dogpaddle-missing-java-$target"
