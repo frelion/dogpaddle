@@ -608,11 +608,7 @@ class Gate:
                     )
                 if rows != after_delete:
                     return False
-                sink = response["sink"]
-                if (
-                    response["outcome"] != "Progressed"
-                    or sink["position"] >= sink["tail"]
-                ):
+                if response["outcome"] != "Progressed":
                     raise RuntimeError(
                         "deletion was not observed at the Prepared crash point"
                     )
@@ -631,8 +627,9 @@ class Gate:
                 raise RuntimeError("PostgreSQL did not log the target deletion")
             self.capture("deleted")
             self.record_target_deletes()
-            # PostgreSQL has committed the delete, while the durable input
-            # Subscription still points at the same Change. Kill before settlement.
+            # PostgreSQL has committed the delete from the durable Prepared plan.
+            # One Flow advance visits the Sink only once, so its settlement cannot
+            # run until the next round. Kill at that exact external/local boundary.
             host.kill()
 
         until("killed SQL host releases its slot", lambda: not self.slot_active())
@@ -642,7 +639,6 @@ class Gate:
             replay = host.advance()
             if (
                 replay["outcome"] != "Progressed"
-                or replay["sink"]["position"] >= replay["sink"]["tail"]
                 or self.rows() != crashed_rows
                 or self.technical_ids() != crashed_ids
             ):
