@@ -8,98 +8,36 @@ PostgreSQL / MySQL  ── 一致快照 + CDC ──▶  SQL  ──▶  Postgre
 
 DogPaddle 是一个本地运行、可恢复的增量 SQL 引擎。它先读取源表的一致快照，再持续消费 WAL 或 binlog；源记录被新增、修改或删除时，筛选、Join、聚合和时间匹配产生的结果随之改变。进程重启后，从已提交的位置继续。
 
-下面的动图记录真实数据库写入和 DogPaddle 运行结果。每个场景对应的完整 SQL、建表语句和逐步操作都保存在 [`examples/`](examples/)，可以在本地重新运行。
+下面完整展开成交分析与门店经营两个场景：先介绍业务、源表与 SQL，再用动图展示源数据变化如何影响结果。SQL 启动后持续运行，演示中的后续操作只修改源表。完整建表语句、连接配置与逐步操作都保存在 [`examples/`](examples/)，可以使用 release 包中的 `dogpaddle` 在本地复现；其他业务示例见后文的「更多可运行场景」。
 
 [![CI](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/ci.yml)
 [![PostgreSQL 恢复测试](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml/badge.svg)](https://github.com/frelion/dogpaddle/actions/workflows/debezium-postgres.yml)
 
-## 1. 让另一张表跟着源表变化
+## 成交分析：历史报价变化后，重新匹配已有成交
 
-初次运行把 `sales.events` 的现有记录写入目标。此后的新增、修改和删除继续反映到 `warehouse.events_sync`。
+分析成交价格时，需要知道成交发生时最近的市场报价，再将成交价与买卖报价的中间价比较。成交和报价分别写入数据库，历史报价还可能被补录、修正或撤回，因此已生成的分析结果也需要更新。
 
-![DogPaddle 持续同步 PostgreSQL 数据变化](docs/assets/readme-cdc-sync.gif)
+### 两张源表
 
-```sql
-INSERT INTO postgres(
-    connection => env('DOGPADDLE_EVENT_SYNC_TARGET'),
-    table => 'warehouse.events_sync'
-)
-SELECT event_id, payload
-FROM postgres_cdc(
-    connection => env('DOGPADDLE_EVENT_SYNC_SOURCE'),
-    table => 'sales.events',
-    publication => 'dogpaddle_demo_publication'
-);
-```
+两表都在 PostgreSQL 中。`market.fills` 以 `trade_id BIGINT` 为主键，其他字段为非空的 `symbol TEXT`、`executed_at TIMESTAMP`、`side TEXT` 和 `price_cents BIGINT`：
 
-[运行 event-sync example](examples/event-sync/)
+| trade_id | symbol | executed_at | side | price_cents |
+| --- | --- | --- | --- | --- |
+| 9001 | ACME | 09:30:00.500 | BUY | 10018 |
 
-## 2. 订单付款后进入履约队列
+`market.quotes` 以 `quote_id BIGINT` 为主键，其他字段为非空的 `symbol TEXT`、`quoted_at TIMESTAMP`、`bid_cents BIGINT` 和 `ask_cents BIGINT`：
 
-待付款订单不在目标关系中。付款后结果出现；数量或单价改变时，金额和处理通道被替换；订单取消后，原结果被撤回。
+| quote_id | symbol | quoted_at | bid_cents | ask_cents |
+| --- | --- | --- | --- | --- |
+| 1 | ACME | 09:30:00.100 | 10000 | 10020 |
 
-![DogPaddle 持续筛选订单并重新计算履约结果](docs/assets/readme-realtime-etl.gif)
+表中的时间均为 `2026-09-15`，这里只显示时分秒。价格以整数分存储；两个时间字段表示成交、报价的业务发生时间。初始报价的中间价为 `10010` 分，这笔买入成交比它高 `8` 分。
 
-```sql
-INSERT INTO postgres(
-    connection => env('DOGPADDLE_ORDER_ETL_TARGET'),
-    table => 'ops.fulfillment'
-)
-SELECT
-    order_id,
-    quantity * unit_price_cents AS amount,
-    CASE WHEN quantity * unit_price_cents >= 40000
-         THEN 'priority' ELSE 'standard' END AS lane
-FROM postgres_cdc(
-    connection => env('DOGPADDLE_ORDER_ETL_SOURCE'),
-    table => 'sales.orders',
-    publication => 'dogpaddle_demo_publication'
-)
-WHERE status = 'paid';
-```
+### 实时 SQL
 
-[运行 order-etl example](examples/order-etl/)；[完整履约 example](examples/order-fulfillment/)还包含折扣、地区路由、`UNION ALL` 和崩溃恢复验收。
+`ON` 按证券代码分组，`ASOF JOIN` 为每笔成交选择**不晚于成交时刻的最近报价**。`arrival_mid_cents` 计算买卖报价的中间价；买入时用成交价减中间价，卖出时反向相减，得到本例的 `slippage_cents` 价格偏差。结果写入 `analytics.execution_quality`，保留成交与匹配报价的时间，便于核对。
 
-## 3. 客户等级变化后更新已有订单
-
-订单保存在 PostgreSQL，客户等级保存在 MySQL。新订单会关联当前客户等级；客户从普通用户变为 VIP 或 Gold 时，已经存在的订单结果也会更新。
-
-![DogPaddle 关联 PostgreSQL 订单与 MySQL 客户资料](docs/assets/readme-multi-source.gif)
-
-```sql
-INSERT INTO postgres(
-    connection => env('DOGPADDLE_CUSTOMER_ORDERS_TARGET'),
-    table => 'analytics.enriched_orders'
-)
-WITH orders AS (
-    SELECT order_id, customer_id, status
-    FROM postgres_cdc(
-        connection => env('DOGPADDLE_ORDERS_SOURCE'),
-        table => 'sales.orders',
-        publication => 'dogpaddle_customer_orders'
-    )
-),
-customers AS (
-    SELECT customer_id, segment
-    FROM mysql_cdc(
-        connection => env('DOGPADDLE_CUSTOMERS_SOURCE'),
-        table => 'crm.customers'
-    )
-)
-SELECT orders.order_id, orders.customer_id, customers.segment
-FROM orders
-JOIN customers
-    ON orders.customer_id = customers.customer_id
-WHERE orders.status = 'paid';
-```
-
-[运行 customer-order-enrichment example](examples/customer-order-enrichment/)；[`payment-reconciliation`](examples/payment-reconciliation/) 用 `FULL OUTER JOIN` 保留尚未匹配、金额不符和只有单侧记录的支付对账项。
-
-## 4. 成交匹配当时最近的报价
-
-每笔成交匹配相同证券在成交时刻之前最近的一条报价。补录更接近成交时间的历史报价后，已经输出的成交会改配；修正或撤回这条报价时，成交质量结果再次变化。
-
-![历史报价补录后，DogPaddle 重新匹配已有成交](docs/assets/readme-trade-asof.gif)
+没有符合条件的报价时，成交仍保留，报价及依赖报价的计算列为空。本例用可整除的报价演示中间价计算，SQL 中的价格运算保持整数分单位。
 
 ```sql
 INSERT INTO postgres(
@@ -133,13 +71,37 @@ MATCH_CONDITION (fills.executed_at >= quotes.quoted_at)
 ON fills.symbol = quotes.symbol;
 ```
 
-[运行 trade-quote-asof example](examples/trade-quote-asof/) · [查看原始终端录制](docs/assets/readme-trade-quote-asof.cast)
+### 看同一笔成交如何重新匹配
 
-## 5. 退款发生后修正门店销售汇总
+动图先展示完整 SQL 并启动 DogPaddle，随后左栏显示成交和报价，右栏显示目标结果。成交 `9001` 始终不变，依次观察三次报价变更：
 
-每个门店只有一条当前汇总。订单付款会增加计数和营收；改价会替换旧贡献；退款会减少汇总。门店最后一笔已付款订单退出后，整个分组消失。
+1. 补录 `09:30:00.400` 的报价，中间价为 `10012`。它更接近成交时间，右侧改配到这条报价，偏差从 `8` 变为 `6`。
+2. 将这条报价的买卖价修正为 `10012 / 10016`。匹配时间不变，中间价变为 `10014`，偏差变为 `4`。
+3. 删除这条报价。成交重新匹配 `09:30:00.100` 的原报价，偏差回到 `8`。
 
-![订单付款、改价和退款持续修正门店销售汇总](docs/assets/readme-store-sales.gif)
+![补录、修正和删除历史报价，使已有成交的匹配报价与价格偏差持续变化](docs/assets/readme-trade-asof.gif)
+
+[本地复现](examples/trade-quote-asof/) · [建表与初始数据](examples/trade-quote-asof/setup.sql) · [完整 SQL](examples/trade-quote-asof/pipeline.sql) · [逐步变更](examples/trade-quote-asof/steps/) · [终端录制](docs/assets/readme-trade-quote-asof.cast)
+
+## 门店经营：改价和退款后，修正销售汇总
+
+门店看板需要显示当前已付款订单的数量、金额合计、平均金额和最小／最大金额。订单会从待付款变为已付款，也可能改价或退款；本例约定退款订单不再计入这份汇总。
+
+### 源表与初始数据
+
+PostgreSQL 的 `sales.store_orders` 以 `order_id BIGINT` 为主键，另外包含非空的 `store_id BIGINT`、`status TEXT` 和 `amount_cents BIGINT`。金额以分存储：
+
+| order_id | store_id | status | amount_cents |
+| --- | --- | --- | --- |
+| 3001 | 11 | paid | 12000 |
+| 3002 | 11 | paid | 18000 |
+| 3003 | 12 | pending | 25000 |
+
+### 实时 SQL
+
+先用 `WHERE status = 'paid'` 筛选订单，再按门店分组。`COUNT/SUM/AVG/MIN/MAX` 分别计算订单数、金额合计、平均值和两端值，写入 `analytics.store_sales`。每个仍有已付款订单的门店对应一条当前汇总。
+
+初始时，门店 `11` 有两笔订单：合计 `30000` 分，平均 `15000` 分，最小 `12000` 分，最大 `18000` 分。门店 `12` 的订单尚未付款，因此没有汇总行。
 
 ```sql
 INSERT INTO postgres(
@@ -162,7 +124,30 @@ WHERE status = 'paid'
 GROUP BY store_id;
 ```
 
-[运行 store-sales-summary example](examples/store-sales-summary/) · [查看原始终端录制](docs/assets/readme-store-sales-summary.cast)
+### 看改价和退款如何修正汇总
+
+动图先展示 SQL 并启动 DogPaddle，随后左栏显示订单，右栏显示门店汇总。右栏为便于阅读，展示订单数、合计、最小值和最大值；平均值也由 SQL 写入目标表。
+
+1. 订单 `3003` 付款，门店 `12` 出现一条汇总。
+2. 订单 `3002` 从 `18000` 分改为 `22000` 分，门店 `11` 的合计从 `30000` 变为 `34000`，最大值也变为 `22000`。
+3. 订单 `3003` 退款，门店 `12` 的汇总消失。
+4. 门店 `11` 的剩余订单退款，目标表变为空。最后一笔已付款订单退出后，该分组不再出现在查询结果中。
+
+![订单付款创建门店汇总，改价更新合计与最大值，退款撤回贡献并移除空分组](docs/assets/readme-store-sales.gif)
+
+[本地复现](examples/store-sales-summary/) · [建表与初始数据](examples/store-sales-summary/setup.sql) · [完整 SQL](examples/store-sales-summary/pipeline.sql) · [逐步变更](examples/store-sales-summary/steps/) · [终端录制](docs/assets/readme-store-sales-summary.cast)
+
+## 更多可运行场景
+
+下面的 examples 同样保留建表、完整 SQL 和逐步变更脚本：
+
+| 场景 | 源表与计算逻辑 | 可以观察的变化 |
+| --- | --- | --- |
+| [业务事件同步](examples/event-sync/) | PostgreSQL 事件表原样写入仓库表 | 新增、修正和删除反映到目标副本 |
+| [订单履约](examples/order-etl/) | 筛选已付款订单，按数量与单价计算金额，再按金额分配处理通道 | 付款后进入结果、改量后重算、取消后撤回 |
+| [客户订单关联](examples/customer-order-enrichment/) | PostgreSQL 订单与 MySQL 客户按客户 ID 连接 | 已付款订单关联客户当前等级，相关资料变化后更新结果 |
+| [支付对账](examples/payment-reconciliation/) | PostgreSQL 业务支付与 MySQL 渠道结算做全外连接 | 结算迟到、金额不符和修正后的对账状态变化 |
+| [完整订单履约](examples/order-fulfillment/) | 付款筛选、折扣计算、地区路由与 `UNION ALL` | 订单变更，以及进程中断后的恢复验收 |
 
 ## 中断后继续
 

@@ -48,15 +48,16 @@ docs/tools/record_fulfillment_demo.sh \
 
 ## README 终端录制
 
-根 README 中的 ASOF 与门店聚合 GIF 使用真实 PTY 录制。脚本创建临时 PostgreSQL cluster，启动产品 binary，逐个执行 example 的 `steps/*.sql`，等待并查询实际目标关系，再由 `asciinema` 保存终端会话、`agg` 转成 GIF：
+根 README 中的 ASOF 与门店聚合 GIF 使用真实 PTY 录制。第一屏展示完整 `pipeline.sql` 并启动产品 binary，随后进入 `tmux` 双栏：左侧查询 source，右侧查询 target。脚本创建临时 PostgreSQL cluster，逐个执行 example 的 `steps/*.sql`；每次先刷新 source，等待实际目标关系通过断言后再刷新 target。最后由 `asciinema` 保存终端会话、`agg` 转成 GIF：
 
 ```sh
 docs/tools/record_readme_examples.sh \
+  --dogpaddle /absolute/path/to/release/bin/dogpaddle \
   --bundle /absolute/path/to/runtime-bundle \
   --postgres-bin /absolute/path/to/postgresql/bin
 ```
 
-录制会同时保留可回放的 `docs/assets/readme-*.cast`。脚本对每一步的目标结果设有检查；数据库变化未被 DogPaddle 处理到预期状态时不会生成新的 GIF。需要预先安装 `asciinema` 与 `agg`。
+录制脚本不编译 DogPaddle；`--dogpaddle` 直接传入已经构建好的产品 binary，通常是 release archive 中的 `bin/dogpaddle`。录制会同时保留可回放的 `docs/assets/readme-*.cast`。脚本对每一步的目标结果设有检查；数据库变化未被 DogPaddle 处理到预期状态时不会生成新的 GIF。需要预先安装 `asciinema`、`agg` 与 `tmux`。
 
 ## 只重新渲染
 

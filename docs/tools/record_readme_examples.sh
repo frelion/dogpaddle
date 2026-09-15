@@ -7,13 +7,19 @@ script_directory="$(cd -- "$(dirname -- "$script_path")" && pwd -P)"
 repository="$(cd "$script_directory/../.." && pwd -P)"
 
 usage() {
-    echo "usage: $(basename -- "$script_path") --bundle ABSOLUTE_RUNTIME_BUNDLE --postgres-bin ABSOLUTE_POSTGRES_BIN" >&2
+    echo "usage: $(basename -- "$script_path") --dogpaddle ABSOLUTE_BINARY --bundle ABSOLUTE_RUNTIME_BUNDLE --postgres-bin ABSOLUTE_POSTGRES_BIN" >&2
 }
 
+dogpaddle=""
 bundle=""
 postgres_bin=""
 while (( $# > 0 )); do
     case "$1" in
+        --dogpaddle)
+            (( $# >= 2 )) || { usage; exit 2; }
+            dogpaddle="${2:-}"
+            shift 2
+            ;;
         --bundle)
             (( $# >= 2 )) || { usage; exit 2; }
             bundle="${2:-}"
@@ -31,13 +37,12 @@ while (( $# > 0 )); do
     esac
 done
 
-if [[ -z "$bundle" || -z "$postgres_bin" || "$bundle" != /* || "$postgres_bin" != /* ]]; then
+if [[ -z "$dogpaddle" || -z "$bundle" || -z "$postgres_bin" || "$dogpaddle" != /* || "$bundle" != /* || "$postgres_bin" != /* ]]; then
     usage
     exit 2
 fi
 
 cd "$repository"
-cargo build --locked -p dogpaddle
 
 for command in python3 asciinema agg tmux; do
     if ! command -v "$command" >/dev/null; then
@@ -49,7 +54,7 @@ done
 python3 docs/tools/record_readme_examples.py \
     --bundle "$bundle" \
     --postgres-bin "$postgres_bin" \
-    --dogpaddle "$repository/target/debug/dogpaddle" \
+    --dogpaddle "$dogpaddle" \
     --asciinema "$(command -v asciinema)" \
     --agg "$(command -v agg)" \
     --tmux "$(command -v tmux)" \
