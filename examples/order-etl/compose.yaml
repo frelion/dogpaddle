@@ -1,0 +1,26 @@
+name: dogpaddle-order-etl
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16.15@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    environment:
+      POSTGRES_DB: dogpaddle
+      POSTGRES_USER: dogpaddle
+      POSTGRES_PASSWORD: dogpaddle
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=8, -c, max_wal_senders=8, -c, max_slot_wal_keep_size=256MB]
+    ports:
+      - "127.0.0.1:${DOGPADDLE_ORDER_ETL_PG_PORT}:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -U dogpaddle -d dogpaddle && psql -U dogpaddle -d dogpaddle -v ON_ERROR_STOP=1 -c 'SELECT 1 FROM sales.orders LIMIT 0' >/dev/null
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./setup.sql:/docker-entrypoint-initdb.d/00-example.sql:ro,Z
+
+volumes:
+  postgres-data:

@@ -269,6 +269,35 @@ PostgreSQL CI 是单 workflow DAG：Linux runtime 和 native hosts 独立构建�
 
 macOS tag 直接发布经过相同 archive audit 和 smoke 的未签名产物，不需要 Apple Developer 凭据。用户环境中的 Gatekeeper 可能要求手动允许从互联网下载的 executable；这不属于 archive 的兼容性验证范围。bundle 内 Temurin Mach-O 保留 Eclipse Adoptium 的原始签名。
 
+## Example 容器体验
+
+`examples/` 下全部七个场景各自拥有 Compose 配置、公开 `.env`、初始化 SQL 和业务步骤。它们是用户体验环境，不是新增执行引擎或 gate host。验证使用已编译的产品 binary，数据库初始化直接挂载各自的 setup SQL，业务变更直接执行 `steps/*.sql`；跨库场景额外挂载只用于本地演示的 MySQL 账号初始化脚本。
+
+2026-09-16 本机验收组合（macOS arm64，Podman 6.1.0 rootless machine，固定 PostgreSQL 16.15 / MySQL 8.4.6 多架构镜像 digest）：
+
+| 引擎 / provider | 场景 | 验证范围 |
+| --- | --- | --- |
+| Podman / podman-compose 1.6.0 | 门店销售汇总 | 启动、健康、全部业务步骤、手动插入、重复 up、down/up 后 reopen 与离线变更、重置 |
+| Podman / Docker Compose 5.5.1 | 成交报价匹配 | 启动、健康、全部业务步骤、重复 up、down/up 后 reopen 与离线变更、重置 |
+| Podman / Docker Compose 5.5.1 | event-sync、order-etl、order-fulfillment | 启动、健康、全部业务步骤、down/up 保留卷、同 state reopen 与停机期间手动变更、空卷与新 state 恢复初始结果 |
+| Podman / podman-compose 1.6.0 | customer-order-enrichment | 双库启动与健康、MySQL CDC/DML 权限、全部业务步骤、down/up 保留卷、同 state reopen 与停机期间修改客户、空卷与新 state 恢复初始结果 |
+| Podman / Docker Compose 5.5.1 | payment-reconciliation | 双库启动与健康、MySQL CDC/DML 权限、全部业务步骤、down/up 保留卷、同 state reopen 与停机期间修正结算、空卷与新 state 恢复初始结果 |
+| Docker Engine | 全部七个场景 | 当前机器未安装，未实跑；七份配置通过 Docker Compose 5.5.1 config 检查 |
+
+本次产品运行使用本机已有的 `target/release/dogpaddle`，配同架构 Debezium runtime 的绝对覆盖路径，没有重新编译，也没有把它当作从 GitHub 下载的 archive 验收。release archive 的布局/打包验证仍归上面的发布 smoke。Linux/SELinux 与其他 provider 版本的端到端组合尚未实跑。
+
+跨库实跑发现并补齐了读取 InnoDB 表标识所需的 `PROCESS` 权限，随后从空卷验证。另一个本机旧 runtime 只有 PostgreSQL connector，造成 MySQL `InvalidConfiguration`；切换已有完整 PostgreSQL/MySQL runtime 后通过，不修改产品代码或让用户手工补 JAR。七份 README 的 shell 代码块均通过 `sh -n` / `zsh -n`，续行符及步骤重定向另做人工复核。
+
+后续修改这些配置时，从独立的空项目/数据卷和新 state 开始，按 example README 验证：
+
+1. Compose config 能展开端口与初始化挂载；同一 shell 依次加载不同场景 `.env`，各场景仍分别使用自己的项目和端口。各 `.env` 不导出共享的 `COMPOSE_PROJECT_NAME`。
+2. up 只创建数据库，不启动 DogPaddle；healthy 后源表和 publication 已存在，目标表尚不存在。容器内客户端和宿主 TCP 连接均可查询。
+3. 启动产品后逐步写源表，比较有序目标查询与预期值。门店查询包含 COUNT/SUM/MIN/MAX，并以 `encode(average_order_cents, 'hex')` 验证 Float64 的原始位模式；ASOF 验证匹配时间、中间价和价格偏差；其他五例核对各 README 展示的业务字段（不是所有内部 Sink 列）。跨库步骤分别在对应的 PostgreSQL / MySQL 执行。
+4. 自由写入额外源记录；重复 up 不覆盖它。停止产品后 down/up，保留两侧状态，停机期间再写源数据，重跑同一 state 能追上变化。
+5. 先停止产品，再删除仅属于验收项目的数据库卷，同时移走旧 state。重新 up 并使用新 state，初始数据/结果恢复，验收追加数据不再出现。
+
+数据库与 state 必须作为一组管理。验收通过 Compose project 覆盖与临时 state 隔离于用户默认体验项目；结束后删除仅由该次验收创建的数据卷/容器，不清理其他项目。普通 Cargo correctness/benchmark/Clippy 不需要 Docker 或 Podman；本轮纯 Compose/文档修改不重复运行未变动的 Rust gate。
+
 ## 新增或删除验证
 
 提交前回答：

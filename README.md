@@ -139,6 +139,8 @@ GROUP BY store_id;
 
 ## 更多可运行场景
 
+全部七个 [examples](examples/) 都提供 Docker／Podman Compose 环境和独立运行说明：启动数据库，再运行下载好的 DogPaddle。数据库开放本机连接，可以自由查看和修改源表；跨库场景同时准备 PostgreSQL 和 MySQL。
+
 下面的 examples 同样保留建表、完整 SQL 和逐步变更脚本：
 
 | 场景 | 源表与计算逻辑 | 可以观察的变化 |
