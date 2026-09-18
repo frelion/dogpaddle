@@ -2,7 +2,9 @@ use datafusion_common::ScalarValue;
 
 use arrow_schema::DataType;
 
-use super::{BoundReduction, Descriptor, Fold, Reduction, apply_weight, read_u64, write_u64};
+use super::{
+    BoundReduction, Descriptor, Fold, Reduction, TrackedWeight, apply_weight, read_u64, write_u64,
+};
 use crate::operation::transform::aggregate::AggregateError;
 
 pub(super) const COUNT_ALL_DESCRIPTOR: Descriptor = Descriptor {
@@ -79,7 +81,7 @@ impl Fold for Count {
         if value.is_null() {
             return Ok(());
         }
-        let count = apply_weight(read_u64(state)?, difference)?;
+        let count = apply_weight(read_u64(state)?, difference, TrackedWeight::Call)?;
         if count > i64::MAX.cast_unsigned() {
             return Err(AggregateError::ArithmeticOverflow);
         }

@@ -12,8 +12,11 @@ use crate::{
 
 use super::{
     AggregateDefinitionError, AggregateSchemaError,
-    functions::{AVG, COUNT, COUNT_ALL, MAX, MIN, Reduction, SUM, argument_field, descriptor},
-    runtime::{AggregateOperation, BoundCall, BoundLayout},
+    functions::{
+        AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, argument_field,
+        descriptor,
+    },
+    runtime::{AggregateOperation, BoundAggregate, BoundCall, BoundLayout, ExtremaSlot},
     state::{Control, Entries, Groups},
     value::contains_float,
 };
@@ -29,8 +32,6 @@ const DATA: &[DataDeclaration] = &[
     CONTROL.declaration(),
 ];
 
-type BoundCalls = (Box<[BoundCall]>, Box<[BoundLayout]>);
-
 /// One built-in aggregate invocation without its output field name.
 ///
 /// Constructors are infallible. The enclosing [`AggregateDefinition`] owns
@@ -44,7 +45,7 @@ pub struct AggregateCall {
 /// Pure definition of one grouped relational aggregate.
 ///
 /// All grouping expressions and calls are evaluated by one Operation so group
-/// ownership, exact-row admission, state, and output transitions share one
+/// ownership, tracked-weight validation, state, and output transitions share one
 /// transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateDefinition {
@@ -184,7 +185,11 @@ impl SealedDefinition for AggregateDefinition {
             .expect("the final binding entrypoint enforces Aggregate input arity");
         let mut output_fields = Vec::with_capacity(self.groups.len() + self.calls.len());
         let group_expressions = self.bind_groups(input_schema, &mut output_fields)?;
-        let (calls, layouts) = self.bind_calls(input_schema, &mut output_fields)?;
+        let BoundAggregate {
+            calls,
+            layouts,
+            slots,
+        } = self.bind_calls(input_schema, &mut output_fields)?;
 
         let output_schema = Arc::new(Schema::new_with_metadata(
             output_fields,
@@ -200,6 +205,7 @@ impl SealedDefinition for AggregateDefinition {
                     group_expressions,
                     calls,
                     layouts,
+                    slots,
                     groups: data.take(&GROUPS)?,
                     entries: data.take(&ENTRIES)?,
                     control: data.take(&CONTROL)?,
@@ -241,9 +247,10 @@ impl AggregateDefinition {
         &self,
         input_schema: &SchemaRef,
         output_fields: &mut Vec<Arc<Field>>,
-    ) -> Result<BoundCalls, OperationSchemaError> {
+    ) -> Result<BoundAggregate, OperationSchemaError> {
         let mut calls = Vec::with_capacity(self.calls.len());
         let mut layouts: Vec<(StoredExpression, BoundLayout)> = Vec::new();
+        let mut slots: Vec<ExtremaSlot> = Vec::new();
         let mut fold_states = 0;
         for (aggregate, call) in self.calls.iter().enumerate() {
             let function = descriptor(call.function)
@@ -283,7 +290,8 @@ impl AggregateDefinition {
                         .next()
                         .expect("extrema has exactly one bound argument");
                     let layout = indexed_layout(&mut layouts, stored, argument, aggregate);
-                    calls.push(BoundCall::extrema(layout, direction));
+                    let slot = indexed_slot(&mut slots, layout, direction);
+                    calls.push(BoundCall::extrema(slot));
                 }
             }
         }
@@ -292,7 +300,11 @@ impl AggregateDefinition {
             .map(|(_, layout)| layout)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Ok((calls.into_boxed_slice(), layouts))
+        Ok(BoundAggregate {
+            calls: calls.into_boxed_slice(),
+            layouts,
+            slots: slots.into_boxed_slice(),
+        })
     }
 }
 
@@ -309,17 +321,31 @@ fn indexed_layout(
         return position;
     }
     let position = layouts.len();
-    let id = u32::try_from(position + 1).expect("stable Aggregate call count bounds layout IDs");
     layouts.push((
         stored.clone(),
         BoundLayout {
-            id,
             owner,
             field: Arc::new(argument_field(&argument)),
             expression: argument,
         },
     ));
     position
+}
+
+/// Returns the dense slot of one (layout, direction) pair, adding it if absent.
+///
+/// `MIN(x), MAX(x)` share the layout but need one slot each; repeating the same
+/// call reuses one slot, so the cached group state stays proportional to the
+/// distinct extremes the definition actually reads.
+fn indexed_slot(slots: &mut Vec<ExtremaSlot>, layout: usize, direction: ExtremaDirection) -> usize {
+    if let Some(position) = slots
+        .iter()
+        .position(|slot| slot.layout == layout && slot.direction == direction)
+    {
+        return position;
+    }
+    slots.push(ExtremaSlot { layout, direction });
+    slots.len() - 1
 }
 
 impl OperationDefinition for AggregateDefinition {

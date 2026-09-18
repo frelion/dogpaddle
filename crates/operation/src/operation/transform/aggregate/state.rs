@@ -6,13 +6,20 @@ pub(super) type Groups = OrderedMap<Vec<u8>, GroupState>;
 pub(super) type Entries = PartitionedMultiset<EntryPartition, Vec<u8>>;
 pub(super) type Control = Cell<u64>;
 
-const GROUP_STATE_VERSION: u8 = 1;
+const GROUP_STATE_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GroupState {
     pub(super) id: u64,
     pub(super) weight: u64,
     pub(super) folds: Vec<Vec<u8>>,
+    /// Current extreme key per bound extrema slot, absent while no key is stored.
+    ///
+    /// The entries partition remains the source of truth; this is a cache that
+    /// is written in the same transaction and only re-read when the extreme
+    /// itself is retracted. A present but empty key is a valid key, so presence
+    /// is encoded explicitly rather than inferred from the key length.
+    pub(super) extremes: Box<[Option<Vec<u8>>]>,
 }
 
 impl StoreValue for GroupState {
@@ -22,6 +29,8 @@ impl StoreValue for GroupState {
         }
         let count = u32::try_from(self.folds.len())
             .map_err(|_| CodecError::new("aggregate group has too many fold states"))?;
+        let extremes = u32::try_from(self.extremes.len())
+            .map_err(|_| CodecError::new("aggregate group has too many cached extrema"))?;
         let mut encoded = Vec::new();
         encoded.push(GROUP_STATE_VERSION);
         encoded.extend_from_slice(&self.id.to_be_bytes());
@@ -29,6 +38,16 @@ impl StoreValue for GroupState {
         encoded.extend_from_slice(&count.to_be_bytes());
         for state in &self.folds {
             put_bytes(&mut encoded, state)?;
+        }
+        encoded.extend_from_slice(&extremes.to_be_bytes());
+        for extreme in &self.extremes {
+            match extreme {
+                None => encoded.push(0),
+                Some(key) => {
+                    encoded.push(1);
+                    put_bytes(&mut encoded, key)?;
+                }
+            }
         }
         Ok(encoded)
     }
@@ -45,12 +64,41 @@ impl StoreValue for GroupState {
         }
         let count = usize::try_from(cursor.u32()?)
             .map_err(|_| CodecError::new("aggregate call count exceeds usize"))?;
+        // Every fold state and every cached extreme occupies at least one byte,
+        // so a count beyond the remaining value length is corrupt. Rejecting it
+        // before allocating keeps a damaged value from requesting an unbounded
+        // reservation.
+        if count > cursor.remaining_bytes() {
+            return Err(CodecError::new(
+                "aggregate fold count exceeds the value length",
+            ));
+        }
         let mut folds = Vec::with_capacity(count);
         for _ in 0..count {
             folds.push(cursor.bytes()?.to_vec());
         }
+        let extremes = usize::try_from(cursor.u32()?)
+            .map_err(|_| CodecError::new("aggregate extrema cache count exceeds usize"))?;
+        if extremes > cursor.remaining_bytes() {
+            return Err(CodecError::new(
+                "aggregate extrema cache count exceeds the value length",
+            ));
+        }
+        let mut cached = Vec::with_capacity(extremes);
+        for _ in 0..extremes {
+            match cursor.u8()? {
+                0 => cached.push(None),
+                1 => cached.push(Some(cursor.bytes()?.to_vec())),
+                _ => return Err(CodecError::new("aggregate extrema cache marker is invalid")),
+            }
+        }
         cursor.finish()?;
-        Ok(Self { id, weight, folds })
+        Ok(Self {
+            id,
+            weight,
+            folds,
+            extremes: cached.into_boxed_slice(),
+        })
     }
 }
 
@@ -143,6 +191,10 @@ impl<'a> ValueCursor<'a> {
         Ok(*value)
     }
 
+    fn remaining_bytes(&self) -> usize {
+        self.remaining.len()
+    }
+
     fn finish(self) -> Result<(), CodecError> {
         if self.remaining.is_empty() {
             Ok(())
@@ -166,17 +218,22 @@ mod tests {
             id: 7,
             weight: 3,
             folds: vec![vec![1, 2], Vec::new()],
+            extremes: Box::new([Some(Vec::new()), None, Some(vec![0x80, 0x2a])]),
         };
         let encoded = state.encode_value().unwrap().as_ref().to_vec();
         assert_eq!(
             encoded,
             [
-                1, // version
+                2, // version
                 0, 0, 0, 0, 0, 0, 0, 7, // group ID
                 0, 0, 0, 0, 0, 0, 0, 3, // group weight
                 0, 0, 0, 2, // fold count
                 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, // first fold
                 0, 0, 0, 0, 0, 0, 0, 0, // second fold
+                0, 0, 0, 3, // extrema cache count
+                1, 0, 0, 0, 0, 0, 0, 0, 0, // present but empty key
+                0, // absent key
+                1, 0, 0, 0, 0, 0, 0, 0, 2, 0x80, 0x2a, // present two-byte key
             ]
         );
         assert_eq!(
@@ -191,5 +248,19 @@ mod tests {
             EntryPartition::decode_key(Cow::Borrowed(&encoded)).unwrap(),
             partition
         );
+    }
+
+    #[test]
+    fn group_state_rejects_an_unknown_extrema_cache_marker() {
+        let state = GroupState {
+            id: 1,
+            weight: 1,
+            folds: Vec::new(),
+            extremes: Box::new([None]),
+        };
+        let mut encoded = state.encode_value().unwrap().as_ref().to_vec();
+        let marker = encoded.len() - 1;
+        encoded[marker] = 2;
+        assert!(GroupState::decode_value(Cow::Owned(encoded)).is_err());
     }
 }

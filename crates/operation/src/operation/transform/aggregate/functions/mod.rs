@@ -78,13 +78,36 @@ pub(super) fn unsupported(function: &'static str, data_type: &DataType) -> Aggre
     }
 }
 
-pub(super) fn apply_weight(weight: u64, difference: i64) -> Result<u64, AggregateError> {
-    let next = if difference > 0 {
-        weight.checked_add(difference.unsigned_abs())
+/// Which tracked weight one adjustment applies to.
+#[derive(Clone, Copy)]
+pub(super) enum TrackedWeight {
+    /// The group's own row count.
+    Group,
+    /// One aggregate call's non-null argument count.
+    Call,
+}
+
+/// Applies a signed adjustment to a tracked weight.
+///
+/// The two tracked quantities report distinct underflow errors because a group
+/// can still hold rows while one call's non-null count is exhausted.
+pub(super) fn apply_weight(
+    weight: u64,
+    difference: i64,
+    tracked: TrackedWeight,
+) -> Result<u64, AggregateError> {
+    if difference > 0 {
+        weight
+            .checked_add(difference.unsigned_abs())
+            .ok_or(AggregateError::ArithmeticOverflow)
     } else {
-        weight.checked_sub(difference.unsigned_abs())
-    };
-    next.ok_or(AggregateError::ArithmeticOverflow)
+        weight
+            .checked_sub(difference.unsigned_abs())
+            .ok_or(match tracked {
+                TrackedWeight::Group => AggregateError::GroupWeightUnderflow,
+                TrackedWeight::Call => AggregateError::CallWeightUnderflow,
+            })
+    }
 }
 
 pub(super) fn read_u64(state: &[u8]) -> Result<u64, AggregateError> {

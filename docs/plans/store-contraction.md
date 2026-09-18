@@ -88,7 +88,7 @@ M5 就是本计划终点。并发事务、并发调度以及为并发消除确�
 | 结构 | 状态 | 首个 owner | 独立拥有的不变量 | 替代的旧复杂性 | 阶段 |
 | --- | --- | --- | --- | --- | --- |
 | `OrderedMultiset<K>` | 引入；S2 用真实代码确定最小表面 | Distinct | key 有总序；不存在即零；持久 multiplicity 恒为正；checked 增减；归零删除 | weight 编解码和重复的 get/check/put/remove；配合直接 key 删除碰撞桶 | S2 |
-| `PartitionedMultiset<P, K>` | 引入为 `OrderedMultiset` 的强类型分区形态，共享私有 multiplicity engine | Aggregate admission 与 MIN/MAX index；未来 grouped TopK | 每个 partition 内按 `K` 有序，访问不能越过 partition，计数不变量与全局多重集合相同 | Operation 手写 composite framing、sentinel range 与 `scan(limit=1)` 协议 | S3 |
+| `PartitionedMultiset<P, K>` | 引入为 `OrderedMultiset` 的强类型分区形态，共享私有 multiplicity engine | Aggregate MIN/MAX index；未来 grouped TopK | 每个 partition 内按 `K` 有序，访问不能越过 partition，计数不变量与全局多重集合相同 | Operation 手写 composite framing、sentinel range 与 `scan(limit=1)` 协议 | S3 |
 | `Queue<T>` | 引入 | PostgreSQL/MySQL CDC bootstrap spool | 单 owner FIFO、hard logical capacity、原子 push/pop、可恢复 queued bytes | bounds + scan-one + truncate-one；向算子暴露的任意 offset/range/truncate | S4 |
 | `SubscribedLog<T>` | 引入 | Flow edge | 固定订阅者、稳定 offset、每订阅者唯一 position、确认与安全保留 | Flow 的 cursor codec、consumer frontier、反向资源引用和回收协议 | S5 |
 
@@ -112,8 +112,7 @@ first(range) / last(range)
 真实调用方与删除收益：
 
 - Distinct：`canonical row -> count`，删除 digest 寻址、碰撞桶、桶内查找和权重编解码。
-- Aggregate admission：`partition(group id)[canonical input row] -> count`，复用同一 checked multiplicity 规则。
-- Aggregate indexed argument：`partition(layout, group id)[ordered argument] -> count`，直接提供 MIN/MAX 的首尾候选。
+- Aggregate indexed argument：`partition(layout, group id)[ordered argument] -> count`，直接提供 MIN/MAX 的首尾候选；分组行数、Fold 非空计数与极值参数计数分别由 Aggregate 的 `groups` 状态和这些索引共同校验，不再保存完整输入行。
 
 这比一个接受任意闭包的通用 Map Update API 更窄、更容易定义失败语义，并且已经有多个真实消费者。最终返回类型在 S2 以 Distinct 的调用代码为准；即使底层复用 ordered map 核心，也应封闭任意 put/remove，让调用方只能使用正计数语义。
 
@@ -128,7 +127,7 @@ partition(p).first() / last()
 partition(p).scan(direction, limit)
 ```
 
-这不是只为未来预埋的结构。Aggregate 当前就用它表达每组 exact admission 和每组 MIN/MAX argument index，并删除手工 `layout | group_id | value` range。未来 grouped TopK 只需让 Operation 定义 `RankKey = sort tuple + deterministic row tie-breaker`，然后在对应 partition 中按方向取前 `K` 个 key 及 multiplicity。Store 不理解 SQL ASC/DESC、NULL、tie、Change 或 TopK 输出更新。
+这不是只为未来预埋的结构。Aggregate 当前用它表达每组 MIN/MAX argument index，并删除手工 `layout | group_id | value` range；分组行数、Fold 非空计数与极值参数计数由 Aggregate 的分组状态和这些索引共同维护，不保存完整输入行。未来 grouped TopK 只需让 Operation 定义 `RankKey = sort tuple + deterministic row tie-breaker`，然后在对应 partition 中按方向取前 `K` 个 key 及 multiplicity。Store 不理解 SQL ASC/DESC、NULL、tie、Change 或 TopK 输出更新。
 
 ```text
 let group = rankings.partition(group_key)
@@ -234,10 +233,10 @@ Small/Large 不提前改造成一套短命的 MDBX 新布局，也不在 RocksDB
 
 按两个完整行为变更实施，避免一次同时更换所有状态和算法：
 
-1. 先把 group 改为直接 `OrderedMap` key，把 exact admission 改为按 group 划分的 `PartitionedMultiset`，保持 checked admission、Fold 结果和逐事件输出。稳定 group ID 初期保留，避免把宽 group bytes 复制进每条 admission/index key；以后只有真实测量证明不值得时才删除。
-2. 再把 MIN/MAX argument index 改为按 `(layout, group id)` 分区、按逻辑值排序的 `PartitionedMultiset`，并用 `first()` / `last()` 找到候选。排序 codec 由 Operation 编译和拥有；Store 只处理 typed partition 与有序 key。删除 `scan_layout` 与失去极值后的整组归约路径。
+1. 把 group 改为直接 `OrderedMap` key，并让 Aggregate 按分组权重、Fold 非空参数计数与极值参数计数执行 checked validation，不保存完整输入行。稳定 group ID 保留，避免把宽 group bytes 复制进每条索引 key。
+2. 将 MIN/MAX argument index 按 `(layout, group id)` 分区、按逻辑值排序存入 `PartitionedMultiset`，并用 `first()` / `last()` 找到候选。排序 codec 由 Operation 编译和拥有；Store 只处理 typed partition 与有序 key。删除 `scan_layout` 与失去极值后的整组归约路径。
 
-Store 在此阶段补充分区内的 `first`、`last` 与有界方向扫描。它们形成一个足够支持 Aggregate 与未来 grouped TopK 的完整有序访问面；不再让每个 Operation 构造 raw prefix、sentinel 或 successor，也不同时包装为 PartitionedMap/MultiMap/GroupedMap 多套近似结构。
+Store 在此阶段补充分区内的 `first`、`last` 与有界方向扫描。它们形成一个足够支持 Aggregate 与未来 grouped TopK 的完整有序访问面；不再让每个 Operation 构造 raw prefix、sentinel 或 successor，也不同时包装为 PartitionedMap/MultiMap/GroupedMap 多套近似结构。Aggregate 允许参数级撤回而不保存完整行，因此 group 归零时会在同一事务中按 layout 清理可能残留的 extrema keys；正常流中这些分区通常已经为空，清理只做边界检查。
 
 审查 Indexed 的扫描 callback 协议：有序索引替代重扫后，删除没有消费者的 trait 方法和间接层。稳定 function descriptor、函数 tag、binding 和必要的类型/算术语义继续保留。
 

@@ -214,7 +214,7 @@ Store catalog 记录资源名、collection kind 和独立 namespace，但不知�
 ```
 
 `StoreKey` 编码必须 canonical、可逆、无碰撞，并按字节保持 Rust `Ord`；`StoreValue` 编码必须能在重启后稳定还原。
-所有结构共享一个启用 LZ4 的默认 column family，物理前缀、namespace、压缩设置和 `RocksDB` 句柄都不对外暴露。
+所有结构共享一个启用 LZ4 与 whole-key bloom filter 的默认 column family，物理前缀、namespace、压缩与过滤器设置和 `RocksDB` 句柄都不对外暴露。
 
 当前是开发期 v1。修改资源名、collection kind、codec、key framing 或 metadata 就是修改持久 ABI；同步更新布局和
 reopen 测试，然后删除旧 Flow 重建，不增加旧格式迁移或兼容分支。

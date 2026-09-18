@@ -16,7 +16,7 @@ pub(super) const MAX_DESCRIPTOR: Descriptor = Descriptor {
     bind: bind_max,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::operation::transform::aggregate) enum ExtremaDirection {
     Min,
     Max,

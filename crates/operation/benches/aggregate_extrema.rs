@@ -24,6 +24,13 @@ use tempfile::TempDir;
 
 const BENCHMARK: &str = "aggregate_extrema";
 
+/// Rows carried by one Change in the per-row workload below.
+///
+/// The single-row cases measure one turn each; this case keeps the turn count
+/// fixed and varies the rows inside it, which is where the aggregate used to pay
+/// two ordered partition reads per row.
+const BULK_ROWS: usize = 4096;
+
 struct Fixture {
     operation: Operation,
     transactions: Transactions,
@@ -127,6 +134,35 @@ fn validate(action: &Action, expected: Option<([i64; 2], [i64; 2])>, pairs: usiz
     }
 }
 
+/// Extrema of the last row one turn emitted.
+///
+/// The per-row cases assert their whole two-row transition; a turn carrying many
+/// rows emits one transition per row, so its closing state is the stable check.
+fn last_row_extrema(action: &Action, pairs: usize) -> (Vec<i64>, Vec<i64>) {
+    let Action::Complete(output) = action else {
+        panic!("aggregate must complete input")
+    };
+    let output = output.as_ref().expect("extrema transition output");
+    assert_eq!(output.records().num_columns(), 1 + 2 * pairs);
+    let column = |index| {
+        output
+            .records()
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 output")
+    };
+    let last = output.num_rows() - 1;
+    (
+        (0..pairs)
+            .map(|pair| column(1 + 2 * pair).value(last))
+            .collect(),
+        (0..pairs)
+            .map(|pair| column(2 + 2 * pair).value(last))
+            .collect(),
+    )
+}
+
 fn main() {
     let profile = PerformanceProfile::for_benchmark();
     if std::env::args_os().any(|argument| argument == "--bench") {
@@ -146,6 +182,7 @@ fn main() {
                 PerformanceProfile::Reference => 5_000,
             },
             "non_extreme_weight": 1_000_000, "repeated_extrema_pairs": 8,
+            "bulk_rows_per_turn": BULK_ROWS,
             "timed_boundary": "two turns, apply, synchronous commit, AfterCommit",
             "untimed": "fixture, seed, warmup, output validation, teardown"
         }
@@ -202,5 +239,46 @@ fn main() {
         });
     }
     group.finish();
+    bench_bulk_rows(&mut criterion, &root, &schema, &seed);
     criterion.final_summary();
+}
+
+/// One turn carrying many rows: the shape that pays the aggregate's per-row cost
+/// rather than only the per-turn commit cost.
+fn bench_bulk_rows(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef, seed: &Change) {
+    let rows = i64::try_from(BULK_ROWS).expect("bulk rows fit i64");
+    let bulk_values: Vec<i64> = (0..rows).collect();
+    let bulk = change(schema, bulk_values.clone(), vec![1; BULK_ROWS]);
+    let bulk_undo = change(schema, bulk_values, vec![-1; BULK_ROWS]);
+    let mut fixture = Fixture::new(root, schema, 1);
+    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
+    // Untimed rounds verify the closing state and return the group to the seed.
+    assert_eq!(
+        last_row_extrema(&fixture.apply(&bulk), 1),
+        (vec![0], vec![rows - 1])
+    );
+    assert_eq!(
+        last_row_extrema(&fixture.apply(&bulk_undo), 1),
+        (vec![0], vec![100])
+    );
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(BULK_ROWS * 2).expect("bulk elements fit u64"),
+    ));
+    group.bench_function("many_rows_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let up = fixture.apply(&bulk);
+                let down = fixture.apply(&bulk_undo);
+                elapsed += started.elapsed();
+                assert!(matches!(up, Action::Complete(Some(_))));
+                assert!(matches!(down, Action::Complete(Some(_))));
+            }
+            elapsed
+        });
+    });
+    group.finish();
 }

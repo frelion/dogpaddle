@@ -10,8 +10,8 @@ use std::{
 };
 
 use rocksdb::{
-    DBCompressionType, Direction, IteratorMode, OptimisticTransactionDB as Database, Options,
-    ReadOptions, SnapshotWithThreadMode,
+    BlockBasedOptions, DBCompressionType, Direction, IteratorMode,
+    OptimisticTransactionDB as Database, Options, ReadOptions, SnapshotWithThreadMode,
 };
 
 use super::{
@@ -23,6 +23,13 @@ const STORE_MARKER_KEY: &[u8] = &[0];
 const STORE_MARKER: &[u8] = b"dogpaddle.store.rocks.v1\0";
 const CATALOG_DOMAIN: u8 = 1;
 const MAX_NAME_BYTES: usize = 255;
+
+/// Whole-key bloom filter bits per stored key.
+///
+/// Ten bits per key is the usual point-lookup tradeoff (roughly a one percent
+/// false-positive rate) and is not correctness-relevant: a filter hit is always
+/// confirmed against the stored block.
+const BLOOM_BITS_PER_KEY: f64 = 10.0;
 
 type Catalog = BTreeMap<String, (u32, DataKind)>;
 
@@ -241,7 +248,27 @@ fn open_database(path: &Path, create: bool) -> Result<Database, StoreError> {
     options.create_if_missing(create);
     options.set_error_if_exists(create);
     options.set_compression_type(DBCompressionType::Lz4);
+    options.set_block_based_table_factory(&table_options());
     Database::open(&options, path).map_err(|error| StoreError::storage("open RocksDB", error))
+}
+
+/// Table options shared by every collection in the default column family.
+///
+/// Point lookups dominate this Store: an adjustment always reads the current
+/// multiplicity first, and for a key that is not stored yet that read would
+/// otherwise fetch and decompress a data block only to learn the key is absent.
+/// A whole-key filter answers such a lookup without touching a block, and a
+/// false positive only costs the block read we would have paid anyway.
+///
+/// Nothing else is configured here. A prefix filter would need one fixed-length
+/// partition header shared by all six collections, which is a layout decision
+/// rather than an option; cache sizing is deliberately left at the `RocksDB`
+/// default until a measurement justifies a number.
+fn table_options() -> BlockBasedOptions {
+    let mut table = BlockBasedOptions::default();
+    table.set_bloom_filter(BLOOM_BITS_PER_KEY, true);
+    table.set_whole_key_filtering(true);
+    table
 }
 
 fn validate_store_path(path: &Path) -> Result<(), StoreError> {

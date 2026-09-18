@@ -12,6 +12,9 @@ mod runtime;
 mod state;
 mod value;
 
+#[cfg(test)]
+mod tests;
+
 pub use definition::{AggregateCall, AggregateDefinition};
 pub(crate) use definition::{TAG, decode_definition};
 pub use runtime::AggregateOperation;
@@ -118,9 +121,15 @@ pub enum AggregateError {
         #[source]
         source: ExpressionError,
     },
-    /// Applying an input difference would make an exact row weight negative.
-    #[error("aggregate input would make a row weight negative")]
-    NegativeWeight,
+    /// Applying an input difference would make the group's row count negative.
+    #[error("aggregate input would make a group row count negative")]
+    GroupWeightUnderflow,
+    /// Applying an input difference would make one call's non-null count negative.
+    #[error("aggregate input would make an aggregate call's non-null count negative")]
+    CallWeightUnderflow,
+    /// Applying an input difference would make an extrema argument negative.
+    #[error("aggregate input would make an extrema argument weight negative")]
+    ExtremaWeightUnderflow,
     /// A group identifier cannot be allocated.
     #[error("aggregate group identifiers are exhausted")]
     GroupIdExhausted,

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroU32,
+    sync::Arc,
+};
 
 use arrow_array::{
     Array, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
@@ -481,6 +485,28 @@ fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
 }
 
 #[test]
+fn null_arguments_never_enter_the_extrema_partition() {
+    let root = TestStore::new();
+    let definition = definition();
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+    let initial = change(&["A", "A"], &[None, None], &[1, 1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not emit NULL-argument group transitions");
+    };
+    let rows = output_rows(&output);
+    let last = rows.last().unwrap();
+    assert_eq!(last.rows, 2);
+    assert_eq!(last.values, 0);
+    assert_eq!(last.min, None);
+    assert_eq!(last.max, None);
+}
+
+#[test]
 fn extrema_multiplicity_and_group_partitions_are_independent() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("department", DataType::Utf8, false),
@@ -690,7 +716,7 @@ fn unsigned_sum_and_average_use_input_multiplicity() {
 }
 
 #[test]
-fn exact_row_admission_rolls_back_the_whole_change() {
+fn unknown_extrema_argument_rolls_back_the_whole_change() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
@@ -718,7 +744,7 @@ fn exact_row_admission_rolls_back_the_whole_change() {
     .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<AggregateError>(),
-        Some(AggregateError::NegativeWeight)
+        Some(AggregateError::ExtremaWeightUnderflow)
     ));
 
     let retry = change(&["B"], &[Some(30)], &[1]);
@@ -735,6 +761,169 @@ fn exact_row_admission_rolls_back_the_whole_change() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(minimum.values(), &[30]);
+}
+
+#[test]
+fn group_weight_underflow_rolls_back_the_turn() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [("rows", AggregateCall::count_all())],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+    let initial = change(&["A"], &[Some(10)], &[1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    let invalid = change(&["A"], &[Some(10)], &[-2]);
+    let error = rollback_ready(
+        &mut operation,
+        Some(turn_input(&invalid)),
+        &mut transactions,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<AggregateError>(),
+        Some(AggregateError::GroupWeightUnderflow)
+    ));
+
+    let retract = change(&["A"], &[Some(10)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("the failed turn leaked into durable state");
+    };
+    let rows = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(rows.values(), &[1]);
+    assert_eq!(output.diffs().values(), &[-1]);
+}
+
+#[test]
+fn retraction_of_an_unused_column_is_accepted() {
+    // The weakened contract: the Aggregate no longer keeps an exact-row ledger,
+    // so a retraction whose (group, extrema argument) pair is covered by other
+    // rows is accepted even though that exact row was never stored. The retained
+    // checks are the group row count and each extrema argument's multiplicity,
+    // and the `note` column is covered by neither.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("department", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, true),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) =
+        create_operation_for_schema(&root, &definition, Arc::clone(&schema));
+    let rows = |values: Vec<i64>, notes: Vec<&str>, diffs: Vec<i64>| {
+        Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["A"; values.len()])),
+                    Arc::new(Int64Array::from(
+                        values.into_iter().map(Some).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(notes)),
+                ],
+            )
+            .unwrap(),
+            Int64Array::from(diffs),
+        )
+        .unwrap()
+    };
+
+    let initial = rows(vec![10, 20], vec!["x", "y"], vec![1, 1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    let covered = rows(vec![10], vec!["z"], vec![-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&covered)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("Aggregate did not accept the covered retraction");
+    };
+    let min = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let max = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    // The retracted value was the minimum, so it advances and the maximum stays.
+    assert_eq!(min.values(), &[10, 20]);
+    assert_eq!(max.values(), &[20, 20]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
+}
+
+#[test]
+fn non_null_count_underflow_rolls_back_the_turn() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [("values", AggregateCall::count(col("value")))],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+    let initial = change(
+        &["A", "A", "A", "A"],
+        &[None, None, None, Some(5)],
+        &[1, 1, 1, 1],
+    );
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+    let retract = change(&["A"], &[Some(5)], &[-1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    // The group still holds rows, but one call's non-null count cannot go below
+    // zero: that is a distinct condition from a negative group row count.
+    let again = change(&["A"], &[Some(5)], &[-1]);
+    let error =
+        rollback_ready(&mut operation, Some(turn_input(&again)), &mut transactions).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<AggregateError>(),
+        Some(AggregateError::CallWeightUnderflow)
+    ));
 }
 
 #[test]
@@ -833,6 +1022,83 @@ fn decoded_definition_reopens_group_and_index_state() {
 }
 
 #[test]
+fn cached_extrema_follow_duplicate_retraction_across_reopen() {
+    let root = TestStore::new();
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let encoded = encode_definition(&definition);
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+    let initial = change(
+        &["A", "A", "A"],
+        &[Some(10), Some(10), Some(20)],
+        &[1, 1, 1],
+    );
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let decoded = decode_definition(&encoded).unwrap();
+    let mut operation = materialize(
+        decoded.as_ref(),
+        &[input_schema()],
+        &store,
+        &["groups", "entries", "control"],
+    );
+    let mut transactions = store.into_transactions();
+
+    // A duplicate leaves: neither extreme moves, so the turn emits nothing and
+    // the cached extremes must stay untouched.
+    let duplicate = change(&["A"], &[Some(10)], &[-1]);
+    assert!(matches!(
+        commit_ready(
+            &mut operation,
+            Some(turn_input(&duplicate)),
+            &mut transactions
+        )
+        .unwrap(),
+        Action::Complete(None)
+    ));
+
+    // The last copy leaves: the cached minimum must be re-read from the partition.
+    let last_copy = change(&["A"], &[Some(10)], &[-1]);
+    let action = commit_ready(
+        &mut operation,
+        Some(turn_input(&last_copy)),
+        &mut transactions,
+    )
+    .unwrap();
+    let Action::Complete(Some(output)) = action else {
+        panic!("reopened Aggregate did not refresh its cached minimum: {action:?}");
+    };
+    let minimum = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let maximum = output
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(minimum.values(), &[10, 20]);
+    assert_eq!(maximum.values(), &[20, 20]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
+}
+
+#[test]
 fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
     assert!(matches!(
         AggregateDefinition::try_new(
@@ -880,4 +1146,151 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
                 if matches!(source.downcast_ref::<AggregateSchemaError>(), Some(AggregateSchemaError::UnsupportedArgument { .. }))
         ));
     }
+}
+
+/// One logical aggregate output row, used as a relation key.
+type RelationKey = (String, i64, Option<i64>, Option<i64>, Option<i64>);
+
+/// Folds one emitted Change into the accumulated relation.
+fn fold_relation(change: &Change, relation: &mut BTreeMap<RelationKey, i64>) {
+    let departments = change
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rows = change
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum = change
+        .records()
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let min = change
+        .records()
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let max = change
+        .records()
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for row in 0..change.num_rows() {
+        let key = (
+            StringArray::value(departments, row).to_owned(),
+            Int64Array::value(rows, row),
+            (!Int64Array::is_null(sum, row)).then(|| Int64Array::value(sum, row)),
+            (!Int64Array::is_null(min, row)).then(|| Int64Array::value(min, row)),
+            (!Int64Array::is_null(max, row)).then(|| Int64Array::value(max, row)),
+        );
+        *relation.entry(key).or_insert(0) += change.diffs().value(row);
+    }
+}
+
+/// Deterministic stream of retractions, duplicates and NULL arguments together
+/// with the multiset it describes. An event is only admitted while every
+/// (group, argument) multiplicity stays non-negative, which is exactly the
+/// contract the Aggregate itself checks.
+#[expect(
+    clippy::type_complexity,
+    reason = "the model is one flat multiset keyed by group and argument"
+)]
+fn multiset_stream() -> (
+    Vec<(&'static str, Option<i64>, i64)>,
+    BTreeMap<(&'static str, Option<i64>), i64>,
+) {
+    let departments = ["A", "B"];
+    let mut model: BTreeMap<(&'static str, Option<i64>), i64> = BTreeMap::new();
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut random = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut events = Vec::new();
+    while events.len() < 400 {
+        let department = departments[(random() % 2) as usize];
+        let value = match random() % 4 {
+            0 => None,
+            other => Some(i64::try_from(other).unwrap()),
+        };
+        let difference = [-2, -1, 1, 2][(random() % 4) as usize];
+        let next = model.get(&(department, value)).copied().unwrap_or(0) + difference;
+        if next < 0 {
+            continue;
+        }
+        model.insert((department, value), next);
+        events.push((department, value, difference));
+    }
+    (events, model)
+}
+
+/// The relation the multiset model requires, one row per non-empty group.
+fn modelled_relation(model: &BTreeMap<(&str, Option<i64>), i64>) -> BTreeMap<RelationKey, i64> {
+    let mut grouped: BTreeMap<&str, Vec<(Option<i64>, i64)>> = BTreeMap::new();
+    for ((department, value), weight) in model {
+        if *weight > 0 {
+            grouped
+                .entry(*department)
+                .or_default()
+                .push((*value, *weight));
+        }
+    }
+    let mut expected = BTreeMap::new();
+    for (department, values) in grouped {
+        let rows: i64 = values.iter().map(|(_, weight)| *weight).sum();
+        let non_null: Vec<(i64, i64)> = values
+            .iter()
+            .filter_map(|(value, weight)| value.map(|value| (value, *weight)))
+            .collect();
+        let sum = (!non_null.is_empty())
+            .then(|| non_null.iter().map(|(value, weight)| value * weight).sum());
+        let min = non_null.iter().map(|(value, _)| *value).min();
+        let max = non_null.iter().map(|(value, _)| *value).max();
+        expected.insert((department.to_owned(), rows, sum, min, max), 1);
+    }
+    expected
+}
+
+#[test]
+fn emitted_relation_matches_a_multiset_model_under_retraction() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("rows", AggregateCall::count_all()),
+            ("sum", AggregateCall::sum(col("value"))),
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = create_operation(&root, &definition);
+
+    let (events, model) = multiset_stream();
+    let mut emitted = BTreeMap::new();
+    for batch in events.chunks(13) {
+        let input = change(
+            &batch.iter().map(|event| event.0).collect::<Vec<_>>(),
+            &batch.iter().map(|event| event.1).collect::<Vec<_>>(),
+            &batch.iter().map(|event| event.2).collect::<Vec<_>>(),
+        );
+        match commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap() {
+            Action::Complete(Some(change)) => fold_relation(&change, &mut emitted),
+            Action::Complete(None) => {}
+            Action::Idle | Action::Commit(_) => panic!("Aggregate returned the wrong action"),
+        }
+    }
+    emitted.retain(|_, weight| *weight != 0);
+
+    assert_eq!(emitted, modelled_relation(&model));
 }

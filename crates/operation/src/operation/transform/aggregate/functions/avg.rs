@@ -1,7 +1,9 @@
 use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 
-use super::{BoundReduction, Descriptor, Fold, Reduction, apply_weight, unsupported};
+use super::{
+    BoundReduction, Descriptor, Fold, Reduction, TrackedWeight, apply_weight, unsupported,
+};
 use crate::{
     expression::BoundExpression,
     operation::transform::aggregate::{AggregateError, AggregateSchemaError},
@@ -57,7 +59,7 @@ impl Fold for Average {
         match (self, value) {
             (Self::Signed, ScalarValue::Int64(Some(value))) => {
                 let (count, sum) = read_i128_state(state)?;
-                let count = apply_weight(count, difference)?;
+                let count = apply_weight(count, difference, TrackedWeight::Call)?;
                 let delta = i128::from(*value) * i128::from(difference);
                 let sum = sum
                     .checked_add(delta)
@@ -66,7 +68,7 @@ impl Fold for Average {
             }
             (Self::Unsigned, ScalarValue::UInt64(Some(value))) => {
                 let (count, sum) = read_u128_state(state)?;
-                let count = apply_weight(count, difference)?;
+                let count = apply_weight(count, difference, TrackedWeight::Call)?;
                 let delta = u128::from(*value) * u128::from(difference.unsigned_abs());
                 let sum = if difference > 0 {
                     sum.checked_add(delta)

@@ -4,37 +4,39 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
-use dogpaddle_store::{PartitionedMultisetAccess, StoreError, TransactionAccess};
+use dogpaddle_store::{
+    MultisetPartition, PartitionedMultisetAccess, StoreError, TransactionAccess,
+};
 
 use crate::{
     expression::BoundExpression,
     operation::{
         AtomicOperation, OperationError, OperationInput,
-        relation::{OrderError, canonical_row, encode_canonical, order_key, ordered_value},
+        relation::{OrderError, encode_canonical, order_key, ordered_value},
     },
 };
 
 use super::{
     AggregateError,
-    functions::{ExtremaDirection, Fold, apply_weight},
+    functions::{ExtremaDirection, Fold, TrackedWeight, apply_weight},
     state::{Control, Entries, EntryPartition, GroupState, Groups},
     value::null,
 };
 
-const ADMISSION_LAYOUT: u32 = 0;
-
-/// Materialized exact grouped aggregate.
+/// Materialized grouped aggregate over an ordered difference stream.
 pub struct AggregateOperation {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[BoundExpression]>,
     pub(super) calls: Box<[BoundCall]>,
     pub(super) layouts: Box<[BoundLayout]>,
+    pub(super) slots: Box<[ExtremaSlot]>,
     pub(super) groups: Groups,
     pub(super) entries: Entries,
     pub(super) control: Control,
 }
 
+/// One bound aggregate call.
 pub(super) enum BoundCall {
     Fold {
         state: usize,
@@ -42,16 +44,36 @@ pub(super) enum BoundCall {
         reduction: Box<dyn Fold>,
     },
     Extrema {
-        layout: usize,
-        direction: ExtremaDirection,
+        slot: usize,
     },
 }
 
+/// One distinct ordered-argument expression of the bound aggregate.
+///
+/// Layouts are dense and 0-based, so a layout's position in
+/// [`AggregateOperation::layouts`] is also the partition id it owns in
+/// `aggregate.entries` and the layout index its [`ExtremaSlot`]s reference.
 pub(super) struct BoundLayout {
-    pub(super) id: u32,
     pub(super) owner: usize,
     pub(super) field: Arc<Field>,
     pub(super) expression: BoundExpression,
+}
+
+/// One distinct (layout, direction) pair whose extreme is cached per group.
+///
+/// `MIN(x), MAX(x)` share one layout and need two slots; repeating the same
+/// call needs one. Caching only the directions that are bound keeps the cached
+/// state proportional to what the definition actually reads.
+pub(super) struct ExtremaSlot {
+    pub(super) layout: usize,
+    pub(super) direction: ExtremaDirection,
+}
+
+/// Bound calls, layouts and extrema slots produced by one Schema binding.
+pub(super) struct BoundAggregate {
+    pub(super) calls: Box<[BoundCall]>,
+    pub(super) layouts: Box<[BoundLayout]>,
+    pub(super) slots: Box<[ExtremaSlot]>,
 }
 
 struct OutputRows {
@@ -72,8 +94,8 @@ impl BoundCall {
         }
     }
 
-    pub(super) const fn extrema(layout: usize, direction: ExtremaDirection) -> Self {
-        Self::Extrema { layout, direction }
+    pub(super) const fn extrema(slot: usize) -> Self {
+        Self::Extrema { slot }
     }
 
     fn initial_fold_state(&self) -> Option<Vec<u8>> {
@@ -159,7 +181,7 @@ impl AtomicOperation for AggregateOperation {
                 (true, state)
             } else {
                 if difference < 0 {
-                    return Err(AggregateError::NegativeWeight.into());
+                    return Err(AggregateError::GroupWeightUnderflow.into());
                 }
                 let id = control.get()?.unwrap_or(0);
                 let next = id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?;
@@ -174,10 +196,11 @@ impl AtomicOperation for AggregateOperation {
                             .iter()
                             .filter_map(BoundCall::initial_fold_state)
                             .collect(),
+                        extremes: vec![None; self.slots.len()].into_boxed_slice(),
                     },
                 )
             };
-            if state.folds.len() != fold_count {
+            if state.folds.len() != fold_count || state.extremes.len() != self.slots.len() {
                 return Err(AggregateError::InvalidState.into());
             }
 
@@ -186,30 +209,51 @@ impl AtomicOperation for AggregateOperation {
                     call_output(
                         &self.calls,
                         &self.layouts,
+                        &self.slots,
                         &state.folds,
+                        &state.extremes,
                         state.weight,
-                        &mut entries,
-                        state.id,
                     )
                 })
                 .transpose()?;
 
-            let input_row = canonical_row(records, row)?;
-            entries
-                .partition(&EntryPartition::new(ADMISSION_LAYOUT, state.id))?
-                .adjust(&input_row, difference)
-                .map(|_| ())
-                .map_err(map_weight_error)?;
-            state.weight = apply_weight(state.weight, difference)?;
+            state.weight = apply_weight(state.weight, difference, TrackedWeight::Group)?;
 
-            for (layout, column) in self.layouts.iter().zip(&layout_columns) {
+            for (layout_index, (layout, column)) in
+                self.layouts.iter().zip(&layout_columns).enumerate()
+            {
                 let value = ScalarValue::try_from_array(column.as_ref(), row)?;
-                if let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? {
-                    entries
-                        .partition(&EntryPartition::new(layout.id, state.id))?
-                        .adjust(&key, difference)
-                        .map(|_| ())
-                        .map_err(map_weight_error)?;
+                // A NULL argument never enters the ordered partition, so it can
+                // neither become nor retract an extreme.
+                let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? else {
+                    continue;
+                };
+                let partition_id = u32::try_from(layout_index)
+                    .expect("the layout count is bounded by the aggregate call count");
+                let change = entries
+                    .partition(&EntryPartition::new(partition_id, state.id))?
+                    .adjust(&key, difference)
+                    .map_err(map_weight_error)?;
+                // `Change` rejects zero differences, so an absent key here means
+                // the key just entered the partition.
+                if change.before() == 0 {
+                    promote_cached_extreme(&self.slots, &mut state.extremes, layout_index, &key);
+                }
+                // A group that loses its last row is removed below, so a
+                // partition re-read here would only be discarded.
+                if change.after() == 0
+                    && state.weight != 0
+                    && caches_key(&self.slots, &state.extremes, layout_index, &key)
+                {
+                    let partition =
+                        entries.partition(&EntryPartition::new(partition_id, state.id))?;
+                    refresh_cached_extreme(
+                        &self.slots,
+                        &mut state.extremes,
+                        layout_index,
+                        &key,
+                        &partition,
+                    )?;
                 }
             }
 
@@ -234,15 +278,16 @@ impl AtomicOperation for AggregateOperation {
                     old_output.expect("an existing group has positive weight"),
                     -1,
                 )?;
+                drain_group_entries(self.layouts.len(), &mut entries, state.id)?;
                 groups.remove(&group)?;
             } else {
                 let new_output = call_output(
                     &self.calls,
                     &self.layouts,
+                    &self.slots,
                     &state.folds,
+                    &state.extremes,
                     state.weight,
-                    &mut entries,
-                    state.id,
                 )?;
                 match old_output {
                     None => output.push(&group_columns, row, new_output, 1)?,
@@ -284,10 +329,10 @@ fn scalar_tuple(columns: &[ArrayRef], row: usize) -> Result<Vec<ScalarValue>, Ag
 fn call_output(
     calls: &[BoundCall],
     layouts: &[BoundLayout],
+    slots: &[ExtremaSlot],
     fold_states: &[Vec<u8>],
+    extremes: &[Option<Vec<u8>>],
     group_weight: u64,
-    entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
-    group: u64,
 ) -> Result<Vec<ScalarValue>, AggregateError> {
     calls
         .iter()
@@ -295,25 +340,110 @@ fn call_output(
             BoundCall::Fold {
                 state, reduction, ..
             } => reduction.output(&fold_states[*state], group_weight),
-            BoundCall::Extrema { layout, direction } => {
-                let layout = &layouts[*layout];
-                let partition = entries.partition(&EntryPartition::new(layout.id, group))?;
-                let entry = match direction {
-                    ExtremaDirection::Min => partition.first()?,
-                    ExtremaDirection::Max => partition.last()?,
-                };
-                entry.map_or_else(
-                    || null(layout.field.data_type()),
-                    |entry| ordered_value(&layout.field, &entry.key).map_err(map_order_error),
-                )
+            BoundCall::Extrema { slot } => {
+                let target = &slots[*slot];
+                let layout = &layouts[target.layout];
+                match extremes[*slot].as_deref() {
+                    None => null(layout.field.data_type()),
+                    Some(key) => ordered_value(&layout.field, key).map_err(map_order_error),
+                }
             }
         })
         .collect()
 }
 
+/// Removes every key a dying group still owns.
+///
+/// The relaxed validation accepts a stream that drives a group's row count to
+/// zero while one of its ordered partitions still holds keys (retracting a row
+/// whose argument is NULL touches no partition). Group IDs are never reused, so
+/// those keys would be unreachable and permanent. A stream that retracts the
+/// rows it inserted empties each partition through its own adjustments, so this
+/// scan normally finds nothing.
+pub(super) fn drain_group_entries(
+    layout_count: usize,
+    entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+    group: u64,
+) -> Result<(), AggregateError> {
+    for layout_index in 0..layout_count {
+        let partition_id = u32::try_from(layout_index)
+            .expect("the layout count is bounded by the aggregate call count");
+        let mut partition = entries.partition(&EntryPartition::new(partition_id, group))?;
+        while let Some(entry) = partition.first()? {
+            let removal = i64::try_from(entry.multiplicity).unwrap_or(i64::MAX);
+            partition.adjust(&entry.key, -removal)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether any slot of one layout currently caches the removed key.
+///
+/// A key that never was an extreme leaves every cache untouched, so the
+/// partition does not need to be opened at all.
+fn caches_key(
+    slots: &[ExtremaSlot],
+    extremes: &[Option<Vec<u8>>],
+    layout: usize,
+    key: &[u8],
+) -> bool {
+    slots
+        .iter()
+        .enumerate()
+        .any(|(index, slot)| slot.layout == layout && extremes[index].as_deref() == Some(key))
+}
+
+/// Promotes a key that just entered its partition when it beats a cached extreme.
+fn promote_cached_extreme(
+    slots: &[ExtremaSlot],
+    extremes: &mut [Option<Vec<u8>>],
+    layout: usize,
+    key: &[u8],
+) {
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.layout != layout {
+            continue;
+        }
+        let better = match &extremes[index] {
+            None => true,
+            Some(current) => match slot.direction {
+                ExtremaDirection::Min => key < current.as_slice(),
+                ExtremaDirection::Max => key > current.as_slice(),
+            },
+        };
+        if better {
+            extremes[index] = Some(key.to_vec());
+        }
+    }
+}
+
+/// Re-reads a cached extreme whose key just left the partition.
+///
+/// The partition is the source of truth, so the retraction of the cached
+/// extreme is the only case that pays for an ordered read.
+fn refresh_cached_extreme(
+    slots: &[ExtremaSlot],
+    extremes: &mut [Option<Vec<u8>>],
+    layout: usize,
+    key: &[u8],
+    partition: &MultisetPartition<'_, '_, Vec<u8>>,
+) -> Result<(), AggregateError> {
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.layout != layout || extremes[index].as_deref() != Some(key) {
+            continue;
+        }
+        let entry = match slot.direction {
+            ExtremaDirection::Min => partition.first()?,
+            ExtremaDirection::Max => partition.last()?,
+        };
+        extremes[index] = entry.map(|entry| entry.key);
+    }
+    Ok(())
+}
+
 fn map_weight_error(error: StoreError) -> AggregateError {
     match error {
-        StoreError::MultiplicityUnderflow => AggregateError::NegativeWeight,
+        StoreError::MultiplicityUnderflow => AggregateError::ExtremaWeightUnderflow,
         StoreError::MultiplicityOverflow => AggregateError::ArithmeticOverflow,
         source => AggregateError::Store(source),
     }

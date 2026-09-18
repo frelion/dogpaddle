@@ -599,7 +599,7 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 - 完整 canonical row 直接作为 `OrderedMultiset` key，不把 hash 当记录身份；
 - codec、边界变化、负前缀/overflow、背压与 reopen 有对应 owner 证据；
 - SQL 只新增 `SELECT DISTINCT` lowering；普通 `UNION` 仍未支持；
-- Aggregate 已在阶段 4 建立自己的 group/admission/index state；EquiJoin 在阶段 5 建立自己的双边 keyed state、presence counts 和有界 continuation。
+- Aggregate 已在阶段 4 建立自己的 group/extrema/index state；EquiJoin 在阶段 5 建立自己的双边 keyed state、presence counts 和有界 continuation。
 
 ## 阶段 4：Aggregate 与多重集算子
 
@@ -625,18 +625,19 @@ completion 在同一事务提交，背压和 reopen 保持同一输入语义。
 Aggregate 只声明三个资源：
 
 ```text
-aggregate.groups   OrderedMap<canonical group, group ID + weight + Fold states>
+aggregate.groups   OrderedMap<canonical group, group ID + weight + Fold states + cached extremes>
 aggregate.entries  PartitionedMultiset<(layout, group ID), ordered entry key>
 aggregate.control  Cell<next group ID>
 ```
 
-`entries` 的 layout `0` 保存每个完整 canonical input row，是撤回前的 exact admission；其余 layout
-保存 extrema 的有序 canonical argument key。相同持久表达式共享一个 layout，不按函数复制 multiset；
-partition 由 `layout + group ID` 定义，完整 bytes 直接定义 identity。
+`entries` 的每个 layout 对应一个排序表达式，只保存 extrema 的有序 canonical argument key。相同持久表达式
+共享一个 layout，不按函数复制 multiset；partition 由 `layout + group ID` 定义，完整 bytes 直接定义
+identity。极值不按行读取 partition：group state 按 `(layout, direction)` 缓存当前极值键，只有被撤回的
+正是该缓存键时才回 partition 取 `first`/`last`。
 
 私有静态 descriptor 唯一声明 function tag、arity、binding 与 reduction 形态：`Fold` 只操作每组有界小
 state，`Extrema` 只定义 argument key 的绑定与顺序，二者都不接收 Store。COUNT/SUM/AVG 是 Fold；
-MIN/MAX 通过对应 partition 的 `first`/`last` 直接取得当前极值，不再维护候选状态或分页重扫整组。
+MIN/MAX 从 group state 的极值缓存取得当前值，缓存失效时才回对应 partition 取 `first`/`last`。
 
 ### 输出变化
 
@@ -648,20 +649,23 @@ new_row, diff=+1
 ```
 
 group 消失时只撤回旧行，首次出现时只插入新行，结果未变不输出。null 和非单位 diff 由各 descriptor
-按同一 exact admission 解释；负 row 前缀或 arithmetic overflow 回滚整个 turn。
+按各自被跟踪的权重解释；分组行数、call 非空计数或极值份数降为负，以及 arithmetic overflow，都回滚
+整个 turn。
 
 同一 Change 内一个 group 更新多次时逐事件发出上述变化，不按物理 batch 合并。group/call/index 状态、
 output 与 input completion 在同一事务提交；错误、背压和 reopen 保持同一完整输入。
 
 ### Min/Max 的特殊状态
 
-MIN/MAX 为每个 argument key 维护正权重；当前值撤回到零后直接读取 partition 的新首项或末项。null 不进入候选，
+MIN/MAX 为每个 argument key 维护正权重，并把当前极值键按 `(layout, direction)` 缓存在 group state 里；
+当前值撤回到零后，只有它正是缓存极值时才读取 partition 的新首项或末项。null 不进入候选也不进入缓存，
 zero-weight tuple 立即清理；浮点、List 和 Struct 暂不进入 extrema index。
 
 ### 最小切片证据与剩余工作
 
 - owner correctness 已覆盖 tag/payload、三资源、bind/materialize、COUNT/SUM/AVG/MIN/MAX 的有序变化、
-  exact admission 整 turn rollback、极值不变不冗余输出和 reopen 后有序极值读取；SQL 有跨 drop/start 的最终关系 witness、
+  被跟踪权重 underflow 的整 turn rollback、极值缓存与撤回重取、极值不变不冗余输出和 reopen 后极值读取；
+  SQL 有跨 drop/start 的最终关系 witness、
   纯分组 witness 及拒绝路径无目录副作用证据。
 - 尚需 global aggregate 的空关系语义、UnionDistinct/Intersect/Except、aggregate DISTINCT/FILTER/ORDER、
   UDF 接入、更多类型，以及大 group cardinality/高更新频率 benchmark；这些不由当前最小切片暗示支持。
@@ -982,7 +986,7 @@ exact-row weights（已完成）
 ```
 
 Distinct 用完整 canonical row 与 `OrderedMultiset` 建立 checked weight 语义；Aggregate 组合
-`OrderedMap`、`PartitionedMultiset` 与 `Cell`，新增私有 group ID、exact admission、Fold/Extrema
+`OrderedMap`、`PartitionedMultiset` 与 `Cell`，新增私有 group ID、极值缓存、Fold/Extrema
 descriptor 和有序 argument layout。EquiJoin 用两份私有 `PartitionedMultiset`、非 Inner kind 的
 presence counts 和一个最小 continuation 持久化双边关系与有界 fan-out；没有预建共享 arrangement。
 AsOfJoin 用两份私有 `OrderedMap` 和一个 continuation 持久化有序双边关系与可恢复历史重配，同样没有

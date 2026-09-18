@@ -39,8 +39,9 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个 
 生产 decoder registry、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 registry 反向生成期望值。
 
 Aggregate 的 owner 文件必须证明 tag `14` 与 `aggregate.groups/entries/control` 三资源、完整 Definition
-roundtrip、精确 output Schema、exact-row admission 的整 turn rollback、Fold 结果变化、分区有序索引的
-MIN/MAX 首尾选择与 reopen，以及不变结果不产生冗余 output。函数 descriptor、argument tuple framing
+roundtrip、精确 output Schema、被跟踪权重（分组行数、call 非空计数、极值份数）underflow 的整 turn
+rollback、Fold 结果变化、极值缓存与分区 `first`/`last` 重取、缓存跨 reopen，以及不变结果不产生冗余
+output。函数 descriptor、argument tuple framing
 和 group state codec 属于 Operation 私有实现，不在 Flow 或 SQL 复制 oracle。
 
 EquiJoin 的 owner 文件必须用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 与 FullOuter，
