@@ -5,14 +5,13 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
     definition::Sealed as SealedDefinition,
     operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
 pub(crate) const TAG: u16 = 3;
-const DATA: &[DataDeclaration] = &[];
 
 /// Pure definition of a sink that intentionally discards every input Change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,17 +54,13 @@ impl SealedDefinition for DiscardDefinition {
         &self,
         _input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::without_data_turn(None, DiscardOperation))
+        Ok(OperationBinding::turn_ready(None, DiscardOperation))
     }
 }
 
 impl OperationDefinition for DiscardDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

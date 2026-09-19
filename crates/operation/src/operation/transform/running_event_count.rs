@@ -6,19 +6,23 @@ use std::{
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
-use dogpaddle_store::{Cell, TransactionAccess};
+use dogpaddle_store::{Cell, Store, StoreSetup, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::{DataName, Sealed as SealedDefinition},
-    operation::{AtomicOperation, OperationError, OperationInput},
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed as SealedDefinition},
+    operation::{AtomicOperation, Operation, OperationError, OperationInput},
+    setup::{OperationSetupError, create_data, open_data},
 };
 
 pub(crate) const TAG: u16 = 2;
-const COUNT: DataName<Cell<u64>> = DataName::new("running_event_count.count");
-const DATA: &[DataDeclaration] = &[COUNT.declaration()];
+const COUNT: &str = "running_event_count.count";
+
+pub(crate) struct BoundRunningEventCount {
+    input_schema: SchemaRef,
+}
 
 /// Pure definition of a running event-count operation.
 ///
@@ -74,13 +78,11 @@ impl SealedDefinition for RunningEventCountDefinition {
         &self,
         input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        let input_schema = Arc::clone(&input_schemas[0]);
-        Ok(OperationBinding::atomic(
-            output_schema(),
-            move |data: &mut DataInstances| -> Result<RunningEventCountOperation, MaterializeError> {
-                let count = data.take(&COUNT)?;
-                Ok(RunningEventCountOperation::new(input_schema, count))
-            },
+        Ok(OperationBinding::bound(
+            Some(output_schema()),
+            BoundBody::RunningEventCount(BoundRunningEventCount {
+                input_schema: Arc::clone(&input_schemas[0]),
+            }),
         ))
     }
 }
@@ -90,15 +92,33 @@ impl OperationDefinition for RunningEventCountDefinition {
         OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
-    }
-
     fn persistence_tag(&self) -> u16 {
         TAG
     }
 
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
+}
+
+pub(crate) fn create(
+    bound: BoundRunningEventCount,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let count = create_data::<Cell<u64>>(setup, prefix, COUNT)?;
+    Ok(Operation::Atomic(Box::new(
+        RunningEventCountOperation::new(bound.input_schema, count),
+    )))
+}
+
+pub(crate) fn open(
+    bound: BoundRunningEventCount,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let count = open_data::<Cell<u64>>(store, prefix, COUNT)?;
+    Ok(Operation::Atomic(Box::new(
+        RunningEventCountOperation::new(bound.input_schema, count),
+    )))
 }
 
 impl RunningEventCountOperation {

@@ -3,7 +3,7 @@
 use arrow_schema::{ArrowError, DataType};
 use datafusion_common::DataFusionError;
 use dogpaddle_change::ChangeError;
-use dogpaddle_store::StoreError;
+use dogpaddle_store::{Store, StoreError, StoreSetup};
 use thiserror::Error;
 
 use crate::{
@@ -16,8 +16,60 @@ mod runtime;
 mod state;
 
 pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey, AsOfTieBreak};
-pub(crate) use definition::{TAG, decode_definition};
+pub(crate) use definition::{BoundAsOfJoin, TAG, decode_definition};
 pub use runtime::AsOfJoinOperation;
+
+use crate::{
+    operation::Operation,
+    setup::{OperationSetupError, create_data, open_data},
+};
+
+fn assemble(
+    bound: BoundAsOfJoin,
+    left_rows: state::Rows,
+    right_rows: state::Rows,
+    continuation: state::Continuation,
+) -> Operation {
+    Operation::Turn(Box::new(AsOfJoinOperation {
+        kind: bound.kind,
+        direction: bound.direction,
+        tie_fallback: bound.tie_fallback,
+        tolerance: bound.tolerance,
+        input_schemas: bound.input_schemas,
+        candidate_schema: bound.candidate_schema,
+        output_schema: bound.output_schema,
+        equalities: bound.equalities,
+        orders: bound.orders,
+        ties: bound.ties,
+        right_nulls: bound.right_nulls,
+        residual: bound.residual,
+        left_rows,
+        right_rows,
+        continuation,
+        prepared: None,
+    }))
+}
+
+pub(crate) fn create(
+    bound: BoundAsOfJoin,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let left_rows = create_data::<state::Rows>(setup, prefix, definition::LEFT_ROWS)?;
+    let right_rows = create_data::<state::Rows>(setup, prefix, definition::RIGHT_ROWS)?;
+    let continuation = create_data::<state::Continuation>(setup, prefix, definition::CONTINUATION)?;
+    Ok(assemble(bound, left_rows, right_rows, continuation))
+}
+pub(crate) fn open(
+    bound: BoundAsOfJoin,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let left_rows = open_data::<state::Rows>(store, prefix, definition::LEFT_ROWS)?;
+    let right_rows = open_data::<state::Rows>(store, prefix, definition::RIGHT_ROWS)?;
+    let continuation = open_data::<state::Continuation>(store, prefix, definition::CONTINUATION)?;
+    Ok(assemble(bound, left_rows, right_rows, continuation))
+}
 
 /// Relational output semantics of an ASOF join.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

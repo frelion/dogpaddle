@@ -1,7 +1,7 @@
 use arrow_schema::{ArrowError, DataType};
 use datafusion_common::DataFusionError;
 use dogpaddle_change::ChangeError;
-use dogpaddle_store::StoreError;
+use dogpaddle_store::{Store, StoreError, StoreSetup};
 use thiserror::Error;
 
 use crate::{ExpressionBindError, ExpressionDefinitionError, ExpressionError};
@@ -16,8 +16,54 @@ mod value;
 mod tests;
 
 pub use definition::{AggregateCall, AggregateDefinition};
-pub(crate) use definition::{TAG, decode_definition};
+pub(crate) use definition::{BoundAggregateOperation, TAG, decode_definition};
 pub use runtime::AggregateOperation;
+
+use crate::{
+    operation::Operation,
+    setup::{OperationSetupError, create_data, open_data},
+};
+
+fn assemble(
+    bound: BoundAggregateOperation,
+    groups: state::Groups,
+    entries: state::Entries,
+    control: state::Control,
+) -> Operation {
+    Operation::Atomic(Box::new(AggregateOperation {
+        input_schema: bound.input_schema,
+        output_schema: bound.output_schema,
+        group_expressions: bound.group_expressions,
+        calls: bound.calls,
+        layouts: bound.layouts,
+        slots: bound.slots,
+        groups,
+        entries,
+        control,
+    }))
+}
+
+pub(crate) fn create(
+    bound: BoundAggregateOperation,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let groups = create_data::<state::Groups>(setup, prefix, definition::GROUPS)?;
+    let entries = create_data::<state::Entries>(setup, prefix, definition::ENTRIES)?;
+    let control = create_data::<state::Control>(setup, prefix, definition::CONTROL)?;
+    Ok(assemble(bound, groups, entries, control))
+}
+
+pub(crate) fn open(
+    bound: BoundAggregateOperation,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let groups = open_data::<state::Groups>(store, prefix, definition::GROUPS)?;
+    let entries = open_data::<state::Entries>(store, prefix, definition::ENTRIES)?;
+    let control = open_data::<state::Control>(store, prefix, definition::CONTROL)?;
+    Ok(assemble(bound, groups, entries, control))
+}
 
 /// Failure while constructing a persistent [`AggregateDefinition`].
 #[derive(Debug, Error)]

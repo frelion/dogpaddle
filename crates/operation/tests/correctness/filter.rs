@@ -18,7 +18,7 @@ use dogpaddle_store::Store;
 
 use super::support::{
     TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    data_names, decode_hex, rollback_ready, roundtripped_output, stateless_operation,
+    decode_hex, rollback_ready, roundtripped_output, stateless_operation,
     temporal_and_decimal_change, turn_input, value_schema,
 };
 
@@ -66,7 +66,6 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(definition.predicate(), &predicate);
-    assert!(data_names(&definition).is_empty());
     assert_eq!(
         bind(decoded.as_ref(), std::slice::from_ref(&input))
             .unwrap()

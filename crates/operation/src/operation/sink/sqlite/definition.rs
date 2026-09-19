@@ -10,18 +10,19 @@ use thiserror::Error;
 
 use super::{TECHNICAL_HASH, TECHNICAL_ID, target::SqliteTarget};
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
-    operation::sink::{
-        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
-        relation::RelationSinkTarget,
-    },
+    definition::{BoundBody, Sealed as SealedDefinition},
 };
 
 pub(crate) const TAG: u16 = 10;
 const MAX_LOGICAL_COLUMNS: usize = 1_998;
+
+pub(crate) struct BoundSqliteSink {
+    pub(super) input_schema: SchemaRef,
+    pub(super) target: SqliteTarget,
+}
 
 /// Pure definition of a sink that materializes its input relation in `SQLite`.
 ///
@@ -169,17 +170,12 @@ impl SealedDefinition for SqliteSinkDefinition {
             Arc::clone(input_schema),
         )
         .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        let schema = Arc::clone(input_schema);
-        Ok(OperationBinding::turn(
+        Ok(OperationBinding::bound(
             None,
-            move |data: &mut DataInstances| -> Result<_, MaterializeError> {
-                Ok(BufferedSink::new(
-                    schema,
-                    RelationSinkTarget::new(target),
-                    data.take(&CONTROL)?,
-                    data.take(&BUFFER)?,
-                ))
-            },
+            BoundBody::SqliteSink(Box::new(BoundSqliteSink {
+                input_schema: Arc::clone(input_schema),
+                target,
+            })),
         ))
     }
 }
@@ -187,10 +183,6 @@ impl SealedDefinition for SqliteSinkDefinition {
 impl OperationDefinition for SqliteSinkDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

@@ -7,8 +7,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError,
+    OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
@@ -16,7 +16,6 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 9;
-const DATA: &[DataDeclaration] = &[];
 
 /// One ordered output field of a [`SchemaAlignDefinition`].
 ///
@@ -361,10 +360,7 @@ impl SealedDefinition for SchemaAlignDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data_atomic(
-            output_schema,
-            operation,
-        ))
+        Ok(OperationBinding::atomic_ready(output_schema, operation))
     }
 }
 
@@ -375,10 +371,6 @@ impl OperationDefinition for SchemaAlignDefinition {
         } else {
             OperationKind::ExclusiveTransform(NonZeroU32::MIN)
         }
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

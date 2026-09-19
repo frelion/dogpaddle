@@ -17,7 +17,8 @@ use arrow_array::{Int32Array, Int64Array, StringArray};
 use dogpaddle_change::{decode_change, encode_change};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, RuntimeResource, decode_definition, encode_definition,
+    OperationDefinition, RuntimeResource, create_operation, decode_definition, encode_definition,
+    open_operation,
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
@@ -28,13 +29,15 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store, Transactions};
 use serde_json::{Value, json};
 
-const SCAN_CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
-const SCAN_PHASE: &str = "postgres_cdc_scan.phase";
+const OPERATION_PREFIX: &str = "operation";
+const SCAN_CHECKPOINT: &str = "operation/postgres_cdc_scan.checkpoint";
+const SCAN_PHASE: &str = "operation/postgres_cdc_scan.phase";
 
 struct Options {
     mode: String,
     root: PathBuf,
-    config: PostgresCdcScanConfig,
+    bundle: PathBuf,
+    password: String,
     table: String,
     slot: String,
     publication: String,
@@ -50,18 +53,11 @@ impl Options {
                     .into(),
             );
         };
-        let config = PostgresCdcScanConfig::new_unencrypted(
-            bundle,
-            "127.0.0.1",
-            port.parse()?,
-            "postgres",
-            "dogpaddle_gate",
-            env::var("DOGPADDLE_GATE_PASSWORD")?,
-        )?;
         Ok(Self {
             mode: mode.clone(),
             root: root.into(),
-            config,
+            bundle: bundle.into(),
+            password: env::var("DOGPADDLE_GATE_PASSWORD")?,
             table: table.clone(),
             slot: slot.clone(),
             publication: publication.clone(),
@@ -69,9 +65,20 @@ impl Options {
         })
     }
 
+    fn config(&self) -> Result<PostgresCdcScanConfig, OperationError> {
+        Ok(PostgresCdcScanConfig::new_unencrypted(
+            &self.bundle,
+            "127.0.0.1",
+            self.port,
+            "postgres",
+            "dogpaddle_gate",
+            &self.password,
+        )?)
+    }
+
     fn definition(&self) -> Result<PostgresCdcScanDefinition, OperationError> {
         Ok(PostgresCdcScanDefinition::try_new(
-            self.config.discover(
+            self.config()?.discover(
                 &format!("dogpaddle_gate_{}", self.table),
                 "public",
                 &self.table,
@@ -86,8 +93,8 @@ impl Options {
 fn main() -> Result<(), OperationError> {
     let options = Options::read()?;
     let mut runner = match options.mode.as_str() {
-        "flow" | "flow-pg" => Runner::Flow(open_flow(options)?),
-        "direct" => Runner::Direct(DirectScan::open(options)?),
+        "flow" | "flow-pg" => Runner::Flow(open_flow(&options)?),
+        "direct" => Runner::Direct(DirectScan::open(&options)?),
         _ => return Err("mode must be flow, flow-pg or direct".into()),
     };
     respond(&json!({"kind": "ready"}))?;
@@ -141,7 +148,7 @@ impl Runner {
     }
 }
 
-fn open_flow(options: Options) -> Result<Flow, OperationError> {
+fn open_flow(options: &Options) -> Result<Flow, OperationError> {
     let flow_path = options.root.join("flow");
     let mut factory = FlowFactory::new(&flow_path);
     let sink_config = if options.mode == "flow-pg" {
@@ -156,7 +163,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
         None
     };
     if flow_path.exists() {
-        factory.resource("pg", options.config)?;
+        factory.resource("pg", options.config()?)?;
         if let Some(config) = sink_config {
             factory.resource("sink", config)?;
         }
@@ -176,7 +183,7 @@ fn open_flow(options: Options) -> Result<Flow, OperationError> {
     // One retained entry at a time, with the normal empty-log oversize rule.
     factory.output_capacity_bytes(scan, NonZeroU64::MIN);
     factory.connect([scan], sink);
-    factory.resource("pg", options.config)?;
+    factory.resource("pg", options.config()?)?;
     if let Some(config) = sink_config {
         factory.resource("sink", config)?;
     }
@@ -193,10 +200,10 @@ struct DirectScan {
 }
 
 impl DirectScan {
-    fn open(options: Options) -> Result<Self, OperationError> {
+    fn open(options: &Options) -> Result<Self, OperationError> {
         let path = options.root.join("scan");
         if !path.exists() {
-            Self::create(&path, &options.definition()?)?;
+            Self::create(&path, &options.definition()?, options.config()?)?;
         }
         let store = Store::open(&path)?;
         let definition_cell: Cell<Vec<u8>> = store.open_data("definition")?;
@@ -210,12 +217,14 @@ impl DirectScan {
             )?
         };
         let binding = definition.bind(&[])?;
-        let mut data = DataInstances::new();
-        for declaration in definition.data() {
-            data.insert(declaration.open(&store, declaration.name())?)?;
-        }
+        let scan = open_operation(
+            binding,
+            &store,
+            OPERATION_PREFIX,
+            RuntimeResource::new(options.config()?),
+        )?;
         Ok(Self {
-            scan: binding.materialize(data, RuntimeResource::new(options.config))?,
+            scan,
             phase: store.open_data(SCAN_PHASE)?,
             checkpoint: store.open_data(SCAN_CHECKPOINT)?,
             output: store.open_data("output")?,
@@ -224,21 +233,28 @@ impl DirectScan {
         })
     }
 
-    fn create(path: &Path, definition: &dyn OperationDefinition) -> Result<(), OperationError> {
+    fn create(
+        path: &Path,
+        definition: &dyn OperationDefinition,
+        config: PostgresCdcScanConfig,
+    ) -> Result<(), OperationError> {
         let encoded = encode_definition(definition);
         let canonical = decode_definition(&encoded)?;
-        let _ = canonical.bind(&[])?;
-        let mut store = Store::create(path)?;
-        let saved: Cell<Vec<u8>> = store.create_data("definition")?;
-        for declaration in canonical.data() {
-            let _ = declaration.create(&mut store, declaration.name())?;
-        }
-        store.create_data::<OrderedMap<u64, Vec<u8>>>("output")?;
-        store.create_data::<Cell<u64>>("output-tail")?;
-        let mut transactions = store.into_transactions();
-        let transaction = transactions.begin();
-        saved.access(transaction.access())?.set(&encoded)?;
-        transaction.commit()?;
+        let binding = canonical.bind(&[])?;
+        let mut setup = Store::setup(path)?;
+        let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
+        let _operation = create_operation(
+            binding,
+            &mut setup,
+            OPERATION_PREFIX,
+            RuntimeResource::new(config),
+        )?;
+        setup.create_data::<OrderedMap<u64, Vec<u8>>>("output")?;
+        setup.create_data::<Cell<u64>>("output-tail")?;
+        let _transactions = setup.commit(|access| {
+            saved.access(access)?.set(&encoded)?;
+            Ok(())
+        })?;
         Ok(())
     }
 

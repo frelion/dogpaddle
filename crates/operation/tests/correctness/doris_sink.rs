@@ -2,8 +2,8 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationBindError, OperationDefinition, OperationKind,
-    RuntimeResource, decode_definition, encode_definition,
+    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    create_operation, decode_definition, encode_definition, open_operation,
     operation::sink::{
         DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
     },
@@ -54,25 +54,17 @@ fn doris_sink_has_canonical_non_secret_tag_18_bytes() {
 #[test]
 fn doris_sink_declares_buffered_state_and_exact_runtime_resource() {
     let definition = definition();
-    assert_eq!(
-        definition
-            .data()
-            .iter()
-            .map(dogpaddle_operation::DataDeclaration::name)
-            .collect::<Vec<_>>(),
-        ["sink.control", "sink.buffer"]
-    );
     let binding = (&definition as &dyn OperationDefinition)
         .bind(&[schema()])
         .unwrap();
     assert!(binding.output_schema().is_none());
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::none()),
-        Err(MaterializeError::MissingRuntimeResource)
+        Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::new(42_u64)),
-        Err(MaterializeError::WrongRuntimeResource)
+        Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
         binding
@@ -81,18 +73,24 @@ fn doris_sink_declares_buffered_state_and_exact_runtime_resource() {
     );
 
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    definition.data()[0]
-        .create(&mut store, "physical-control")
-        .unwrap();
-    definition.data()[1]
-        .create(&mut store, "physical-buffer")
+    let mut setup = Store::setup(root.path()).unwrap();
+    let operation = create_operation(
+        (&definition as &dyn OperationDefinition)
+            .bind(&[schema()])
+            .unwrap(),
+        &mut setup,
+        "operation",
+        RuntimeResource::new(config("shop")),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    store
+        .open_data::<Cell<Vec<u8>>>("operation/sink.control")
         .unwrap();
     store
-        .open_data::<Cell<Vec<u8>>>("physical-control")
-        .unwrap();
-    store
-        .open_data::<OrderedMap<u64, Vec<u8>>>("physical-buffer")
+        .open_data::<OrderedMap<u64, Vec<u8>>>("operation/sink.buffer")
         .unwrap();
 }
 
@@ -119,17 +117,25 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
 
     let root = TestStore::new();
     let decoded = decode_definition(&literal_definition_bytes()).unwrap();
-    let mut store = Store::create(root.path()).unwrap();
-    let mut data = DataInstances::new();
-    for declaration in decoded.data() {
-        data.insert(declaration.create(&mut store, declaration.name()).unwrap())
-            .unwrap();
-    }
-    decoded
-        .bind(&[schema()])
-        .unwrap()
-        .materialize(data, RuntimeResource::new(config("shop")))
-        .unwrap();
+    let mut setup = Store::setup(root.path()).unwrap();
+    let operation = create_operation(
+        decoded.bind(&[schema()]).unwrap(),
+        &mut setup,
+        "operation",
+        RuntimeResource::new(config("shop")),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let operation = open_operation(
+        decoded.bind(&[schema()]).unwrap(),
+        &store,
+        "operation",
+        RuntimeResource::new(config("shop")),
+    )
+    .unwrap();
+    drop(operation);
 }
 
 #[test]

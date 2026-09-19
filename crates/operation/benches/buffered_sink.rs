@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement::WallTime};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, RuntimeResource,
+    OperationDefinition, RuntimeResource, create_operation, open_operation as reopen_operation,
     operation::{Action, Operation, OperationInput, Turn, sink::SqliteSinkDefinition},
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
@@ -102,18 +102,18 @@ impl Fixture {
         let sqlite_path = sample.path().join("target.sqlite");
         let definition =
             SqliteSinkDefinition::try_new(&sqlite_path, TABLE).expect("define SQLite sink");
-        let mut store = Store::create(sample.path().join("store")).expect("create Sink store");
-        for declaration in definition.data() {
-            declaration
-                .create(&mut store, declaration.name())
-                .expect("create Sink data");
-        }
-        let operation = open_operation(&definition, &schema, &store);
+        let mut setup = Store::setup(sample.path().join("store")).expect("setup Sink store");
+        let binding = (&definition as &dyn OperationDefinition)
+            .bind(&[Arc::clone(&schema)])
+            .expect("bind SQLite Sink");
+        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
+            .expect("create SQLite Sink");
+        let transactions = setup.commit(|_| Ok(())).expect("commit Sink setup");
         let mut fixture = Self {
             definition,
             schema,
             operation: Some(operation),
-            transactions: Some(store.into_transactions()),
+            transactions: Some(transactions),
             sqlite_path,
             root: sample,
         };
@@ -224,20 +224,11 @@ fn open_operation(
     schema: &SchemaRef,
     store: &Store,
 ) -> Operation {
-    let mut data = DataInstances::new();
-    for declaration in definition.data() {
-        data.insert(
-            declaration
-                .open(store, declaration.name())
-                .expect("open Sink data instance"),
-        )
-        .expect("insert Sink data instance");
-    }
-    (definition as &dyn OperationDefinition)
+    let binding = (definition as &dyn OperationDefinition)
         .bind(&[Arc::clone(schema)])
-        .expect("bind SQLite Sink")
-        .materialize(data, RuntimeResource::none())
-        .expect("materialize SQLite Sink")
+        .expect("bind SQLite Sink");
+    reopen_operation(binding, store, "operation", RuntimeResource::none())
+        .expect("open SQLite Sink")
 }
 
 fn integer_schema() -> SchemaRef {

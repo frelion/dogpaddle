@@ -16,11 +16,14 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 理解这个 crate 最重要的是两条线：
 
 ```text
-构建时：Definition ── bind(Schema) ──> Binding ── 接入状态和资源 ──> Runtime Operation
+构建/恢复：Definition ── bind(exact Schemas) ──> opaque OperationBinding
+            ── typed setup create/open(prefix, resource) ──> Runtime Operation
 运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
 ```
 
-前一条线让错误尽量在建库前暴露，后一条线保证状态、输出和输入进度可以在一个事务里前进。
+这不是给旧装配层换名字：原来的 Data declaration、类型擦除的 data bag 和 materializer 层已经删除。
+绑定只保存算子私有的编译结果与布局选择；随后唯一的 setup dispatch 直接调用具体算子的 typed
+`create/open`。这样错误尽量在建库前暴露，运行时仍保证状态、输出和输入进度可以在一个事务里前进。
 
 ## 先认识 Definition 和运行实例
 
@@ -36,12 +39,14 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 **Runtime Operation 是正在工作的实例。** 它保存已经按输入 Schema 编译好的表达式、Flow 为它
 打开的类型化状态，以及必要的临时客户端。它不再保存 Definition，也不知道自己的稳定资源路径。
 
-中间的 `bind` 和 materialize 只是把这两种形态安全地接起来：
+中间只有 bind 和 typed setup：
 
 1. `bind` 接收每个输入端口的完整 Arrow Schema，检查列、类型、输入数量和输出 Schema。它是纯
    计算，不访问 Store、网络、时间或随机数。
-2. bind 成功后得到一次性的 `OperationBinding`。Flow 此时才创建或打开 Definition 声明的状态。
-3. Flow 把这些状态和可选运行资源交给 binding，得到 Runtime Operation。
+2. bind 成功后得到一次性的、不透明 `OperationBinding`；其中封装具体算子的编译结果和已选定布局，
+   Flow 只能读取输出 Schema 和校验运行资源，不能查看或改写内部类型。
+3. setup 消费 binding，以 Flow 提供的稳定前缀借用 `StoreSetup` 创建 typed collections，或借用
+   `Store` 打开它们，然后直接构造 Runtime Operation。具体算子拥有 collection codec 和逻辑资源名。
 
 例如，下面的 Filter 可以在没有 Store 的情况下完成编码、解码和 Schema 检查：
 
@@ -69,8 +74,8 @@ assert_eq!(binding.output_schema(), Some(&input));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-正常使用时不需要手工 materialize；`FlowFactory::build/open` 会完成这条路径。分阶段的价值在于：
-Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；reopen 也能从持久 Definition 和状态
+正常使用时不需要手工调用 setup；`FlowFactory::build/open` 会完成这条路径。分阶段的价值在于：
+Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；open 也能从持久 Definition 和状态
 重新得到同一个执行实例。
 
 ## Schema 在这里意味着什么
@@ -207,14 +212,16 @@ equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
 asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
 ```
 
-Flow 在路径中加入 Station 和 Operation 序号，然后统一创建或打开这些对象。具体算子只得到
-`Cell`、`OrderedMap` 等类型化 handle，看不到 Store、RocksDB 句柄或物理 key。materialize 会拒绝
-缺失、类型错误和多余的数据实例。
+Flow 只生成 `station/{station}/operation/{operation}` 前缀并选择 create 或 open。operation crate 的
+setup dispatch 随后调用具体算子的 typed constructor；算子自己的代码用固定逻辑名和 codec 创建或打开
+`Cell`、`OrderedMap` 等 handle。旧的 Data declaration、`DataInstances` 和 erased materializer 已不在
+这条路径中，Flow 也不会枚举具体算子或解释其状态布局。
 
-某些外部算子的密码、网络访问参数和临时客户端配置属于 `RuntimeResource`。它们每次 build/open 由
-调用方重新注入，不进入 Store；非敏感 source/target identity、固定 Schema 和 `SQLite` 路径等稳定信息
-仍保存在 Definition。资源使用精确 Rust 类型匹配；普通算子必须收到空资源。只有 Station 首项可以
-获得运行资源，因此可融合的 Atomic 尾项始终是纯粹的本地计算。
+某些外部算子的密码、网络访问参数和临时客户端配置通过 `RuntimeResource` 传入。它只是拥有型
+`Any` 擦除容器：binding 先检查精确 Rust 类型，具体 typed setup 再取回该值；它不承载持久状态、codec
+或资源字典。资源每次 build/open 由调用方重新注入，不进入 Store；非敏感 source/target identity、固定
+Schema 和 `SQLite` 路径等稳定信息仍保存在 Definition。普通算子必须收到空资源，且只有 Station 首项
+可以获得运行资源。
 
 ## 四个有状态关系算子的直觉
 
@@ -356,10 +363,10 @@ matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远�
 
 ## 内建算子索引
 
-“精确输入”表示运行期 Schema 固定，并非动态 Schema。Data 一列列出算子自己拥有的持久状态；
-`无` 表示只用当前事务中的输入输出。
+“精确输入”表示运行期 Schema 固定，并非动态 Schema。“持久状态”一列列出由具体算子代码拥有
+逻辑名和 codec 的 typed collections；`无` 表示只用当前事务中的输入输出。
 
-| 算子（tag） | kind / 输入数 | 核心行为 | Data |
+| 算子（tag） | kind / 输入数 | 核心行为 | 持久状态 |
 | --- | --- | --- | --- |
 | `SequenceScan` (1) | Scan / 0 | 从起始值连续产生 `UInt64`，diff 固定 `+1` | `sequence_scan.position: Cell<u64>` |
 | `RunningEventCount` (2) | Atomic / 1 | 每观察一行计数加一；忽略输入 diff 值 | `running_event_count.count: Cell<u64>` |
@@ -476,7 +483,7 @@ entries、连续 sequence、Schema、control accounting，以及 checkpoint 下�
 `ReplacingMergeTree(version)` 状态表和公开 `FINAL` view；delete version 高于 live version，旧 live 重放
 不能复活 tombstone。Doris Sink 使用无 TLS `MySQL` endpoint，持久化唯一 cluster ID，并独占一个开启
 merge-on-write 的 Unique Key 状态表和公开 view；delete marker 同时作为 sequence column。两者均只把
-非敏感 target identity 写入 Definition，host、port、user 和 password 必须在每次 materialize 时重新注入。
+非敏感 target identity 写入 Definition，host、port、user 和 password 必须在每次 build/open 时重新注入。
 两个状态表都为 row hash 建立后端原生索引，lookup 仍逐 logical row 做完整值核对。为了让提交结果不确定的旧写入永远不能复活已经删除的 technical ID，删除记录作为每个 ID 的终态保留；引擎 compaction 可合并同一 ID 的版本，但状态表物理基数仍随历史分配过的 technical ID 增长。当前没有安全的自动 GC，长期高 churn 部署必须监控目标容量并在维护窗口以新 state/target 重建。
 
 ## 持久化 ABI
@@ -494,9 +501,6 @@ Change IPC、collection 的 key/value codec，以及 Flow 加上的 Station/Oper
 codec 还是目标布局/恢复 ABI。decoder 表在
 [`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
 
-这是开发期 v1。破坏性修改直接更新当前格式、golden 和布局测试；不增加旧版本 alias、fallback、
-迁移或兼容分支。已有旧数据库删除后重建。
-
 大部分 Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/)；三个外部端点的
 canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 [`crates/flow/tests/fixtures/v1/`](../flow/tests/fixtures/v1/)。
@@ -512,12 +516,13 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 新增实现应依次完成：
 
 1. 在 `scan/`、`transform/` 或 `sink/` 下建立具体模块。
-2. Definition 显式声明唯一 tag、`OperationKind`、canonical payload 和完整 Data。
-3. 在 sealed `bind_schemas` 中检查 exact input Schema，产生唯一 output Schema 和一次性 binding。
-4. 选择 `AtomicOperation` 或 `TurnOperation`，让所有重放相关写入服从调用方事务。
-5. 只通过 materialize 接收具名类型化 Data 和可选 `RuntimeResource`。
-6. 在 [`src/codec.rs`](src/codec.rs) 注册具体 decoder。
-7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、Data、bind、materialize、turn、
+2. Definition 显式声明唯一 tag、`OperationKind` 和 canonical payload。
+3. 在 sealed `bind_schemas` 中检查 exact input Schema，产生唯一 output Schema 和不透明 binding。
+4. 在具体模块提供 typed `create/open`，由算子代码固定逻辑资源名、collection 类型和 codec。
+5. 选择 `AtomicOperation` 或 `TurnOperation`，让所有重放相关写入服从调用方事务；需要临时配置时只从
+   `RuntimeResource` 取回精确类型。
+6. 把 binding 变体接入唯一 setup dispatch，并在 [`src/codec.rs`](src/codec.rs) 注册具体 decoder。
+7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、bind、typed create/open、turn、
    rollback 和适用的 reopen。
 8. 只有引入新的通用执行机制时才增加 Flow witness；普通算子语义由自己的 correctness 文件拥有。
 
@@ -525,7 +530,7 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 
-- 每个算子文件纵向覆盖 Definition、codec、bind、materialize、运行和 reopen。
+- 每个算子文件纵向覆盖 Definition、codec、bind、typed create/open、运行和 reopen。
 - [`definition_codec.rs`](tests/correctness/definition_codec.rs) 验证共享外层格式。
 - [`atomic.rs`](tests/correctness/atomic.rs) 验证实例级融合资格和 Atomic 执行。
 - [`protocol.rs`](tests/correctness/protocol.rs) 验证 turn、rollback、ACK 与恢复边界。

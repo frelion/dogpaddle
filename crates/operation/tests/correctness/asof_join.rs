@@ -4,7 +4,8 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    Expr, OperationBindError, OperationDefinition, OperationKind, ScalarValue, col, lit,
+    Expr, OperationBindError, OperationDefinition, OperationKind, RuntimeResource, ScalarValue,
+    col, create_operation, lit, open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         transform::{
@@ -16,9 +17,14 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Store, Transactions};
 
-use crate::support::{
-    TestStore, assert_literal_definition, commit_ready, data_names, materialize, rollback_ready,
-};
+use crate::support::{TestStore, assert_literal_definition, commit_ready, rollback_ready};
+
+const OPERATION_PREFIX: &str = "operation";
+const ASOF_RESOURCE_NAMES: [&str; 3] = [
+    "asof_join.left_rows",
+    "asof_join.right_rows",
+    "asof_join.continuation",
+];
 
 const ASOF_JOIN_LITERAL: &str = "646f67706164646c652e6f7065726174696f6e000001001101000101000000000100000000090a070a0567726f7570000000090a070a0567726f757000000001000000060a040a026174000000060a040a02617400000000000000070000000a6c6566745f67726f7570000000076c6566745f6174000000076c6566745f69640000000b72696768745f67726f75700000000872696768745f61740000000e72696768745f7072696f726974790000000872696768745f696400";
 
@@ -240,19 +246,8 @@ fn repeated_wide_index_expressions_are_bounded_before_turn_work() {
     )
     .unwrap();
     let root = TestStore::new();
-    let store = create_store(&root, &definition);
-    let names = definition
-        .data()
-        .iter()
-        .map(dogpaddle_operation::DataDeclaration::name)
-        .collect::<Vec<_>>();
-    let mut operation = materialize(
-        &definition,
-        &[Arc::clone(&schema), Arc::clone(&schema)],
-        &store,
-        &names,
-    );
-    let mut transactions = store.into_transactions();
+    let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
+    let (mut operation, mut transactions) = create_join_operation(&root, &definition, &schemas);
     let payload = "x".repeat(512 * 1024);
     let change = Change::try_new(
         RecordBatch::try_new(
@@ -290,14 +285,14 @@ impl Fixture {
 
     fn with_definition(config: Config, definition: AsOfJoinDefinition) -> Self {
         let root = TestStore::new();
-        let store = create_store(&root, &definition);
-        let operation = open_operation(&store, &definition);
+        let schemas = [left_schema(), right_schema()];
+        let (operation, transactions) = create_join_operation(&root, &definition, &schemas);
         Self {
             config,
             definition,
             root,
             operation,
-            transactions: store.into_transactions(),
+            transactions,
         }
     }
 
@@ -311,7 +306,7 @@ impl Fixture {
         } = self;
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
-        let operation = open_operation(&store, &definition);
+        let operation = open_join_operation(&store, &definition, &[left_schema(), right_schema()]);
         Self {
             config,
             definition,
@@ -357,21 +352,31 @@ impl Fixture {
     }
 }
 
-fn create_store(root: &TestStore, definition: &AsOfJoinDefinition) -> Store {
-    let mut store = Store::create(root.path()).unwrap();
-    for declaration in definition.data() {
-        declaration.create(&mut store, declaration.name()).unwrap();
-    }
-    store
+fn create_join_operation(
+    root: &TestStore,
+    definition: &dyn OperationDefinition,
+    schemas: &[SchemaRef],
+) -> (Operation, Transactions) {
+    let binding = definition.bind(schemas).unwrap();
+    let mut setup = Store::setup(root.path()).unwrap();
+    let operation = create_operation(
+        binding,
+        &mut setup,
+        OPERATION_PREFIX,
+        RuntimeResource::none(),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    (operation, transactions)
 }
 
-fn open_operation(store: &Store, definition: &AsOfJoinDefinition) -> Operation {
-    let names = definition
-        .data()
-        .iter()
-        .map(dogpaddle_operation::DataDeclaration::name)
-        .collect::<Vec<_>>();
-    materialize(definition, &[left_schema(), right_schema()], store, &names)
+fn open_join_operation(
+    store: &Store,
+    definition: &dyn OperationDefinition,
+    schemas: &[SchemaRef],
+) -> Operation {
+    let binding = definition.bind(schemas).unwrap();
+    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
 }
 
 impl Oracle {
@@ -693,7 +698,7 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
         OperationKind::TurnTransform(std::num::NonZeroU32::new(2).unwrap()),
     );
     assert_eq!(
-        data_names(decoded.as_ref()),
+        ASOF_RESOURCE_NAMES,
         [
             "asof_join.left_rows",
             "asof_join.right_rows",
@@ -728,13 +733,8 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
     );
 
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    for declaration in decoded.data() {
-        declaration.create(&mut store, declaration.name()).unwrap();
-    }
-    let names = data_names(decoded.as_ref());
-    let mut operation = materialize(decoded.as_ref(), &schemas, &store, &names);
-    let mut transactions = store.into_transactions();
+    let (mut operation, mut transactions) =
+        create_join_operation(&root, decoded.as_ref(), &schemas);
     assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
     let right = right_change(&[right(Some("A"), Some(10), None, 10, 1)]);
     assert!(matches!(
@@ -1442,11 +1442,8 @@ fn scalar_selection(
     let schema = scalar_order_schema(data_type);
     let definition = scalar_order_definition(direction, tolerance);
     let root = TestStore::new();
-    let store = create_store(&root, &definition);
     let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
-    let names = data_names(&definition);
-    let mut operation = materialize(&definition, &schemas, &store, &names);
-    let mut transactions = store.into_transactions();
+    let (mut operation, mut transactions) = create_join_operation(&root, &definition, &schemas);
 
     let right_values = right
         .iter()

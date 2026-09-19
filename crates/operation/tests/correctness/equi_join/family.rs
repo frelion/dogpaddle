@@ -6,8 +6,8 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{Expr, placeholder};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, col,
-    decode_definition, lit,
+    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
+    col, create_operation, decode_definition, lit, open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput,
         transform::{
@@ -19,9 +19,15 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, PartitionedMultiset, Store, Transactions};
 
 use crate::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
-    rollback_ready,
+    TestStore, assert_literal_definition, bind, commit_ready, decode_hex, rollback_ready,
 };
+
+const OPERATION_PREFIX: &str = "operation";
+const BASE_RESOURCES: [&str; 3] = [
+    "equi_join.left_rows",
+    "equi_join.right_rows",
+    "equi_join.continuation",
+];
 
 const KINDS: [EquiJoinKind; 5] = [
     EquiJoinKind::Inner,
@@ -179,14 +185,13 @@ impl Fixture {
     fn with_residual(kind: EquiJoinKind, residual: ResidualCase) -> Self {
         let definition = definition_with_residual(kind, residual);
         let root = TestStore::new();
-        let store = create_store(&root, &definition);
-        let operation = open_operation(&store, &definition);
+        let (operation, transactions) = create_join_operation(&root, &definition);
         Self {
             kind,
             definition,
             root,
             operation,
-            transactions: store.into_transactions(),
+            transactions,
         }
     }
 
@@ -200,7 +205,7 @@ impl Fixture {
         } = self;
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
-        let operation = open_operation(&store, &definition);
+        let operation = open_join_operation(&store, &definition);
         Self {
             kind,
             definition,
@@ -257,8 +262,10 @@ impl Fixture {
             1 => "equi_join.right_rows",
             _ => panic!("test input port is outside the equi-join"),
         };
-        let rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store.open_data(data_name).unwrap();
-        let operation = open_operation(&store, &definition);
+        let rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
+            .open_data(&format!("{OPERATION_PREFIX}/{data_name}"))
+            .unwrap();
+        let operation = open_join_operation(&store, &definition);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         rows.access(transaction.access())
@@ -289,8 +296,10 @@ impl Fixture {
         drop((operation, transactions));
 
         let store = Store::open(root.path()).unwrap();
-        let raw: Cell<Vec<u8>> = store.open_data("equi_join.continuation").unwrap();
-        let operation = open_operation(&store, &definition);
+        let raw: Cell<Vec<u8>> = store
+            .open_data(&format!("{OPERATION_PREFIX}/equi_join.continuation"))
+            .unwrap();
+        let operation = open_join_operation(&store, &definition);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         let mut raw = raw.access(transaction.access()).unwrap();
@@ -333,21 +342,42 @@ impl ResidualCase {
     }
 }
 
-fn create_store(root: &TestStore, definition: &EquiJoinDefinition) -> Store {
-    let mut store = Store::create(root.path()).unwrap();
-    for declaration in definition.data() {
-        declaration.create(&mut store, declaration.name()).unwrap();
-    }
-    store
+fn create_join_operation(
+    root: &TestStore,
+    definition: &EquiJoinDefinition,
+) -> (Operation, Transactions) {
+    let binding = (definition as &dyn OperationDefinition)
+        .bind(&[left_schema(), right_schema()])
+        .unwrap();
+    let mut setup = Store::setup(root.path()).unwrap();
+    let operation = create_operation(
+        binding,
+        &mut setup,
+        OPERATION_PREFIX,
+        RuntimeResource::none(),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    (operation, transactions)
 }
 
-fn open_operation(store: &Store, definition: &EquiJoinDefinition) -> Operation {
-    let names = definition
-        .data()
-        .iter()
-        .map(dogpaddle_operation::DataDeclaration::name)
-        .collect::<Vec<_>>();
-    materialize(definition, &[left_schema(), right_schema()], store, &names)
+fn open_join_operation(store: &Store, definition: &EquiJoinDefinition) -> Operation {
+    let binding = (definition as &dyn OperationDefinition)
+        .bind(&[left_schema(), right_schema()])
+        .unwrap();
+    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
+}
+
+fn resource_names(kind: EquiJoinKind, has_residual: bool) -> Vec<&'static str> {
+    let mut names = BASE_RESOURCES.to_vec();
+    if kind != EquiJoinKind::Inner {
+        names.push(if has_residual {
+            "equi_join.match_counts"
+        } else {
+            "equi_join.key_counts"
+        });
+    }
+    names
 }
 
 fn run_claim(
@@ -830,7 +860,7 @@ fn every_kind_has_a_literal_tag_layout_and_exact_nullable_schema() {
                 "equi_join.key_counts",
             ]
         };
-        assert_eq!(data_names(&definition), expected_data);
+        assert_eq!(resource_names(kind, false), expected_data);
 
         let binding = bind(decoded.as_ref(), &[left_schema(), right_schema()]).unwrap();
         let output = binding.output_schema().unwrap();
@@ -879,7 +909,7 @@ fn residual_round_trips_with_qualified_pair_binding_and_selects_match_count_layo
                 "equi_join.match_counts",
             ]
         };
-        assert_eq!(data_names(&definition), expected_data);
+        assert_eq!(resource_names(kind, true), expected_data);
         bind(&definition, &[left_schema(), right_schema()]).unwrap();
     }
 

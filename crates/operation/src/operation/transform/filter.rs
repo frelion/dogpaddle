@@ -8,8 +8,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError,
-    ExpressionError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError,
+    OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
     expression::{BoundExpression, StoredExpression},
@@ -17,7 +17,6 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 5;
-const DATA: &[DataDeclaration] = &[];
 
 /// Pure definition of an order-preserving row filter.
 ///
@@ -123,7 +122,7 @@ impl SealedDefinition for FilterDefinition {
         let operation = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data_atomic(
+        Ok(OperationBinding::atomic_ready(
             Arc::clone(input_schema),
             operation,
         ))
@@ -137,10 +136,6 @@ impl OperationDefinition for FilterDefinition {
         } else {
             OperationKind::ExclusiveTransform(NonZeroU32::MIN)
         }
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

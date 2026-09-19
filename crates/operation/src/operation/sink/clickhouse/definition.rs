@@ -3,23 +3,23 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::SchemaRef;
 
 use super::{
-    config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
+    config::ClickHouseTargetSpec,
     error::{ClickHouseSinkError, invalid_spec},
     schema::ClickHouseLayout,
-    target::ClickHouseTarget,
 };
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::Sealed,
-    operation::sink::{
-        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
-        relation::RelationSinkTarget,
-    },
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed},
 };
 
 pub(crate) const TAG: u16 = 19;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct BoundClickHouseSink {
+    pub(super) target: ClickHouseTargetSpec,
+    pub(super) input_schema: SchemaRef,
+}
 
 /// Pure definition of a sink-owned `ClickHouse` relation target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,23 +62,12 @@ impl Sealed for ClickHouseSinkDefinition {
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         let target = self.target.clone();
         let input_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::turn_with_resource::<
-            ClickHouseSinkConfig,
-            _,
-            _,
-        >(
+        Ok(OperationBinding::bound(
             None,
-            move |data: &mut DataInstances, config| -> Result<_, MaterializeError> {
-                let control = data.take(&CONTROL)?;
-                let buffer = data.take(&BUFFER)?;
-                let target = ClickHouseTarget::new_bound(config, target, Arc::clone(&input_schema));
-                Ok(BufferedSink::new(
-                    input_schema,
-                    RelationSinkTarget::new(target),
-                    control,
-                    buffer,
-                ))
-            },
+            BoundBody::ClickHouseSink(Box::new(BoundClickHouseSink {
+                target,
+                input_schema,
+            })),
         ))
     }
 }
@@ -86,10 +75,6 @@ impl Sealed for ClickHouseSinkDefinition {
 impl OperationDefinition for ClickHouseSinkDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

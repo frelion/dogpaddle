@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     AggregateError,
-    functions::{ExtremaDirection, Fold, TrackedWeight, apply_weight},
+    functions::{Fold, TrackedWeight, apply_weight},
     state::{Control, Entries, EntryPartition, GroupState, Groups},
     value::null,
 };
@@ -57,6 +57,8 @@ pub(super) struct BoundLayout {
     pub(super) owner: usize,
     pub(super) field: Arc<Field>,
     pub(super) expression: BoundExpression,
+    pub(super) min_slot: Option<usize>,
+    pub(super) max_slot: Option<usize>,
 }
 
 /// One distinct (layout, direction) pair whose extreme is cached per group.
@@ -66,7 +68,6 @@ pub(super) struct BoundLayout {
 /// state proportional to what the definition actually reads.
 pub(super) struct ExtremaSlot {
     pub(super) layout: usize,
-    pub(super) direction: ExtremaDirection,
 }
 
 /// Bound calls, layouts and extrema slots produced by one Schema binding.
@@ -237,23 +238,17 @@ impl AtomicOperation for AggregateOperation {
                 // `Change` rejects zero differences, so an absent key here means
                 // the key just entered the partition.
                 if change.before() == 0 {
-                    promote_cached_extreme(&self.slots, &mut state.extremes, layout_index, &key);
+                    promote_cached_extreme(layout, &mut state.extremes, &key);
                 }
                 // A group that loses its last row is removed below, so a
                 // partition re-read here would only be discarded.
                 if change.after() == 0
                     && state.weight != 0
-                    && caches_key(&self.slots, &state.extremes, layout_index, &key)
+                    && caches_key(layout, &state.extremes, &key)
                 {
                     let partition =
                         entries.partition(&EntryPartition::new(partition_id, state.id))?;
-                    refresh_cached_extreme(
-                        &self.slots,
-                        &mut state.extremes,
-                        layout_index,
-                        &key,
-                        &partition,
-                    )?;
+                    refresh_cached_extreme(layout, &mut state.extremes, &key, &partition)?;
                 }
             }
 
@@ -377,43 +372,32 @@ pub(super) fn drain_group_entries(
     Ok(())
 }
 
-/// Reports whether any slot of one layout currently caches the removed key.
+/// Reports whether either slot of one layout currently caches the removed key.
 ///
-/// A key that never was an extreme leaves every cache untouched, so the
+/// A key that never was an extreme leaves both caches untouched, so the
 /// partition does not need to be opened at all.
-fn caches_key(
-    slots: &[ExtremaSlot],
-    extremes: &[Option<Vec<u8>>],
-    layout: usize,
-    key: &[u8],
-) -> bool {
-    slots
-        .iter()
-        .enumerate()
-        .any(|(index, slot)| slot.layout == layout && extremes[index].as_deref() == Some(key))
+fn caches_key(layout: &BoundLayout, extremes: &[Option<Vec<u8>>], key: &[u8]) -> bool {
+    [layout.min_slot, layout.max_slot]
+        .into_iter()
+        .flatten()
+        .any(|slot| extremes[slot].as_deref() == Some(key))
 }
 
 /// Promotes a key that just entered its partition when it beats a cached extreme.
-fn promote_cached_extreme(
-    slots: &[ExtremaSlot],
-    extremes: &mut [Option<Vec<u8>>],
-    layout: usize,
-    key: &[u8],
-) {
-    for (index, slot) in slots.iter().enumerate() {
-        if slot.layout != layout {
-            continue;
-        }
-        let better = match &extremes[index] {
-            None => true,
-            Some(current) => match slot.direction {
-                ExtremaDirection::Min => key < current.as_slice(),
-                ExtremaDirection::Max => key > current.as_slice(),
-            },
-        };
-        if better {
-            extremes[index] = Some(key.to_vec());
-        }
+fn promote_cached_extreme(layout: &BoundLayout, extremes: &mut [Option<Vec<u8>>], key: &[u8]) {
+    if let Some(slot) = layout.min_slot
+        && extremes[slot]
+            .as_deref()
+            .is_none_or(|current| key < current)
+    {
+        extremes[slot] = Some(key.to_vec());
+    }
+    if let Some(slot) = layout.max_slot
+        && extremes[slot]
+            .as_deref()
+            .is_none_or(|current| key > current)
+    {
+        extremes[slot] = Some(key.to_vec());
     }
 }
 
@@ -422,21 +406,20 @@ fn promote_cached_extreme(
 /// The partition is the source of truth, so the retraction of the cached
 /// extreme is the only case that pays for an ordered read.
 fn refresh_cached_extreme(
-    slots: &[ExtremaSlot],
+    layout: &BoundLayout,
     extremes: &mut [Option<Vec<u8>>],
-    layout: usize,
     key: &[u8],
     partition: &MultisetPartition<'_, '_, Vec<u8>>,
 ) -> Result<(), AggregateError> {
-    for (index, slot) in slots.iter().enumerate() {
-        if slot.layout != layout || extremes[index].as_deref() != Some(key) {
-            continue;
-        }
-        let entry = match slot.direction {
-            ExtremaDirection::Min => partition.first()?,
-            ExtremaDirection::Max => partition.last()?,
-        };
-        extremes[index] = entry.map(|entry| entry.key);
+    if let Some(slot) = layout.min_slot
+        && extremes[slot].as_deref() == Some(key)
+    {
+        extremes[slot] = partition.first()?.map(|entry| entry.key);
+    }
+    if let Some(slot) = layout.max_slot
+        && extremes[slot].as_deref() == Some(key)
+    {
+        extremes[slot] = partition.last()?.map(|entry| entry.key);
     }
     Ok(())
 }

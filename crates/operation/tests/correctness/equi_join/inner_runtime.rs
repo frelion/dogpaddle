@@ -4,7 +4,8 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64A
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    Expr, MaterializeError, OperationBindError, OperationDefinition, col,
+    Expr, OperationBindError, OperationDefinition, RuntimeResource, col,
+    create_operation as setup_operation, open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         transform::{
@@ -15,9 +16,14 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{PartitionedMultiset, Store, Transactions};
 
-use crate::support::{TestStore, bind, commit_ready, materialize, rollback_ready};
+use crate::support::{TestStore, bind, commit_ready, rollback_ready};
 
-const PHYSICAL_DATA: [&str; 3] = ["left-rows", "right-rows", "continuation"];
+const OPERATION_PREFIX: &str = "operation";
+const BASE_RESOURCES: [&str; 3] = [
+    "equi_join.left_rows",
+    "equi_join.right_rows",
+    "equi_join.continuation",
+];
 type OutputRow = (Option<u64>, String, Option<u64>, i64, i64);
 
 fn left_schema() -> SchemaRef {
@@ -83,18 +89,38 @@ fn right_change(keys: Vec<Option<u64>>, amounts: Vec<i64>, differences: Vec<i64>
 }
 
 fn create_operation(root: &TestStore) -> (Operation, Transactions) {
-    let definition = definition();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let operation = materialize(
-        &definition,
-        &[left_schema(), right_schema()],
-        &store,
-        &PHYSICAL_DATA,
-    );
-    (operation, store.into_transactions())
+    create_operation_for_schemas(root, &definition(), &[left_schema(), right_schema()])
+}
+
+fn create_operation_for_schemas(
+    root: &TestStore,
+    definition: &dyn OperationDefinition,
+    schemas: &[SchemaRef],
+) -> (Operation, Transactions) {
+    let binding = definition.bind(schemas).unwrap();
+    let mut setup = Store::setup(root.path()).unwrap();
+    let operation = setup_operation(
+        binding,
+        &mut setup,
+        OPERATION_PREFIX,
+        RuntimeResource::none(),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    (operation, transactions)
+}
+
+fn reopen_operation(
+    store: &Store,
+    definition: &dyn OperationDefinition,
+    schemas: &[SchemaRef],
+) -> Operation {
+    let binding = definition.bind(schemas).unwrap();
+    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
+}
+
+fn resource_name(logical: &str) -> String {
+    format!("{OPERATION_PREFIX}/{logical}")
 }
 
 fn run_claim(
@@ -175,7 +201,7 @@ fn output_rows(outputs: &[Change]) -> Vec<OutputRow> {
 }
 
 #[test]
-fn inner_binding_preserves_field_metadata_and_requires_named_data() {
+fn inner_binding_preserves_field_metadata_and_uses_exact_typed_layout() {
     let definition = definition();
     let binding = bind(&definition, &[left_schema(), right_schema()]).unwrap();
     let output = binding.output_schema().unwrap();
@@ -191,16 +217,14 @@ fn inner_binding_preserves_field_metadata_and_requires_named_data() {
     assert_eq!(output.field(0).metadata().get("source").unwrap(), "left");
     assert_eq!(output.field(2).metadata().get("source").unwrap(), "right");
 
-    let result = binding.materialize(
-        dogpaddle_operation::DataInstances::new(),
-        dogpaddle_operation::RuntimeResource::none(),
+    assert_eq!(
+        BASE_RESOURCES,
+        [
+            "equi_join.left_rows",
+            "equi_join.right_rows",
+            "equi_join.continuation",
+        ]
     );
-    assert!(matches!(
-        result,
-        Err(MaterializeError::MissingData {
-            name: "equi_join.left_rows"
-        })
-    ));
 }
 
 #[test]
@@ -450,18 +474,13 @@ fn state_and_output_weight_overflow_fail_before_emission() {
     {
         let root = TestStore::new();
         let definition = definition();
-        let mut store = Store::create(root.path()).unwrap();
-        for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-            declaration.create(&mut store, physical).unwrap();
-        }
-        let left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> =
-            store.open_data(PHYSICAL_DATA[0]).unwrap();
-        let mut operation = materialize(
-            &definition,
-            &[left_schema(), right_schema()],
-            &store,
-            &PHYSICAL_DATA,
-        );
+        let (operation, transactions) = create_operation(&root);
+        drop((operation, transactions));
+        let store = Store::open(root.path()).unwrap();
+        let left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
+            .open_data(&resource_name("equi_join.left_rows"))
+            .unwrap();
+        let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         let mut rows = left_rows.access(transaction.access()).unwrap();
@@ -491,18 +510,13 @@ fn state_and_output_weight_overflow_fail_before_emission() {
     {
         let root = TestStore::new();
         let definition = definition();
-        let mut store = Store::create(root.path()).unwrap();
-        for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-            declaration.create(&mut store, physical).unwrap();
-        }
-        let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> =
-            store.open_data(PHYSICAL_DATA[1]).unwrap();
-        let mut operation = materialize(
-            &definition,
-            &[left_schema(), right_schema()],
-            &store,
-            &PHYSICAL_DATA,
-        );
+        let (operation, transactions) = create_operation(&root);
+        drop((operation, transactions));
+        let store = Store::open(root.path()).unwrap();
+        let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
+            .open_data(&resource_name("equi_join.right_rows"))
+            .unwrap();
+        let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         right_rows
@@ -551,17 +565,9 @@ fn composite_variable_width_keys_keep_component_boundaries() {
     )
     .unwrap();
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let mut operation = materialize(
-        &definition,
-        &[Arc::clone(&left_schema), Arc::clone(&right_schema)],
-        &store,
-        &PHYSICAL_DATA,
-    );
-    let mut transactions = store.into_transactions();
+    let schemas = [Arc::clone(&left_schema), Arc::clone(&right_schema)];
+    let (mut operation, mut transactions) =
+        create_operation_for_schemas(&root, &definition, &schemas);
     let right = Change::try_new(
         RecordBatch::try_new(
             right_schema,
@@ -735,17 +741,9 @@ fn residual_wide_candidates_are_split_by_scalar_working_set() {
     )
     .unwrap();
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let mut operation = materialize(
-        &definition,
-        &[Arc::clone(&schema), Arc::clone(&schema)],
-        &store,
-        &PHYSICAL_DATA,
-    );
-    let mut transactions = store.into_transactions();
+    let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
+    let (mut operation, mut transactions) =
+        create_operation_for_schemas(&root, &definition, &schemas);
 
     let right_values = (1..=RIGHT_ROWS)
         .map(|value| i64::try_from(value).unwrap())
@@ -786,18 +784,13 @@ fn residual_wide_candidates_are_split_by_scalar_working_set() {
 fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     let root = TestStore::new();
     let definition = definition();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> =
-        store.open_data(PHYSICAL_DATA[1]).unwrap();
-    let mut operation = materialize(
-        &definition,
-        &[left_schema(), right_schema()],
-        &store,
-        &PHYSICAL_DATA,
-    );
+    let (operation, transactions) = create_operation(&root);
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
+        .open_data(&resource_name("equi_join.right_rows"))
+        .unwrap();
+    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     let mut rows = right_rows.access(transaction.access()).unwrap();
@@ -825,12 +818,7 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let mut operation = materialize(
-        &definition,
-        &[left_schema(), right_schema()],
-        &store,
-        &PHYSICAL_DATA,
-    );
+    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let Action::Commit(Some(first_output)) = commit_ready(
         &mut operation,
@@ -847,12 +835,7 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let mut operation = materialize(
-        &definition,
-        &[left_schema(), right_schema()],
-        &store,
-        &PHYSICAL_DATA,
-    );
+    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let mut outputs = vec![first_output];
     outputs.extend(run_claim(&mut operation, &mut transactions, 0, &input).unwrap());
@@ -903,17 +886,9 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
     )
     .unwrap();
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let mut operation = materialize(
-        &definition,
-        &[Arc::clone(&left), Arc::clone(&right)],
-        &store,
-        &PHYSICAL_DATA,
-    );
-    let mut transactions = store.into_transactions();
+    let schemas = [Arc::clone(&left), Arc::clone(&right)];
+    let (mut operation, mut transactions) =
+        create_operation_for_schemas(&root, &definition, &schemas);
     let right_input = Change::try_new(
         RecordBatch::try_new(
             right,
@@ -955,8 +930,6 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
 #[test]
 fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phase() {
     const MATCHES: usize = 32;
-    const PRESENCE_DATA: [&str; 4] = ["left-rows", "right-rows", "continuation", "key-counts"];
-
     let left = Arc::new(Schema::new(vec![
         Field::new("key", DataType::UInt64, false),
         Field::new("value", DataType::UInt64, false),
@@ -1012,17 +985,9 @@ fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phas
         )
         .unwrap();
         let root = TestStore::new();
-        let mut store = Store::create(root.path()).unwrap();
-        for (declaration, physical) in definition.data().iter().zip(PRESENCE_DATA) {
-            declaration.create(&mut store, physical).unwrap();
-        }
-        let mut operation = materialize(
-            &definition,
-            &[Arc::clone(&left), Arc::clone(&right)],
-            &store,
-            &PRESENCE_DATA,
-        );
-        let mut transactions = store.into_transactions();
+        let schemas = [Arc::clone(&left), Arc::clone(&right)];
+        let (mut operation, mut transactions) =
+            create_operation_for_schemas(&root, &definition, &schemas);
         run_claim(&mut operation, &mut transactions, 0, &left_input).unwrap();
 
         for (input, expected_difference) in
@@ -1065,17 +1030,9 @@ fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
     )
     .unwrap();
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    for (declaration, physical) in definition.data().iter().zip(PHYSICAL_DATA) {
-        declaration.create(&mut store, physical).unwrap();
-    }
-    let mut operation = materialize(
-        &definition,
-        &[Arc::clone(&left), Arc::clone(&right)],
-        &store,
-        &PHYSICAL_DATA,
-    );
-    let mut transactions = store.into_transactions();
+    let schemas = [Arc::clone(&left), Arc::clone(&right)];
+    let (mut operation, mut transactions) =
+        create_operation_for_schemas(&root, &definition, &schemas);
     let large = "x".repeat(2_200_000);
     let right_input = Change::try_new(
         RecordBatch::try_new(

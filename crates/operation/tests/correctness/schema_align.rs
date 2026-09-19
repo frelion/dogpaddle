@@ -20,8 +20,8 @@ use dogpaddle_store::Store;
 
 use super::support::{
     TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    data_names, decode_hex, project_input_schema, rollback_ready, roundtripped_output,
-    stateless_operation, temporal_and_decimal_change, turn_input, value_schema,
+    decode_hex, project_input_schema, rollback_ready, roundtripped_output, stateless_operation,
+    temporal_and_decimal_change, turn_input, value_schema,
 };
 
 const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
@@ -87,7 +87,6 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
         9,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
-    assert!(data_names(&definition).is_empty());
     let fields = definition.fields().collect::<Vec<_>>();
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].name(), "renamed");

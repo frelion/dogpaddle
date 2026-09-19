@@ -6,16 +6,43 @@ mod state;
 
 use std::{fmt, num::NonZeroU32};
 
-use dogpaddle_store::{Cell, OrderedMap};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
-use crate::{DataDeclaration, definition::DataName, operation::OperationError};
+use crate::{
+    operation::{Operation, OperationError},
+    setup::{OperationSetupError, create_data, open_data},
+};
 
 pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
 
-pub(crate) const CONTROL: DataName<Cell<Vec<u8>>> = DataName::new("sink.control");
-pub(crate) const BUFFER: DataName<OrderedMap<u64, Vec<u8>>> = DataName::new("sink.buffer");
-pub(crate) const DATA: &[DataDeclaration] = &[CONTROL.declaration(), BUFFER.declaration()];
+pub(crate) const CONTROL: &str = "sink.control";
+pub(crate) const BUFFER: &str = "sink.buffer";
+
+pub(crate) fn create<T: SinkTarget>(
+    schema: arrow_schema::SchemaRef,
+    target: T,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let control = create_data::<Cell<Vec<u8>>>(setup, prefix, CONTROL)?;
+    let buffer = create_data::<OrderedMap<u64, Vec<u8>>>(setup, prefix, BUFFER)?;
+    Ok(Operation::Turn(Box::new(BufferedSink::new(
+        schema, target, control, buffer,
+    ))))
+}
+pub(crate) fn open<T: SinkTarget>(
+    schema: arrow_schema::SchemaRef,
+    target: T,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let control = open_data::<Cell<Vec<u8>>>(store, prefix, CONTROL)?;
+    let buffer = open_data::<OrderedMap<u64, Vec<u8>>>(store, prefix, BUFFER)?;
+    Ok(Operation::Turn(Box::new(BufferedSink::new(
+        schema, target, control, buffer,
+    ))))
+}
 pub(crate) const MAX_TARGET_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Target-specific part of the durable sink protocol.

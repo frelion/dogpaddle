@@ -4,10 +4,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expr, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::{DataName, Sealed as SealedDefinition},
+    definition::{BoundBody, Sealed as SealedDefinition},
     expression::{BoundExpression, StoredExpression},
     operation::relation::indexable,
 };
@@ -15,20 +15,29 @@ use crate::{
 use super::{
     AsOfDirection, AsOfEqualityMode, AsOfJoinDefinitionError, AsOfJoinKind, AsOfJoinSchemaError,
     AsOfTieFallback,
-    runtime::{AsOfJoinOperation, BoundEqualityPair, BoundOrderPair, BoundScalar, BoundTieBreak},
-    state::{Continuation, Rows},
+    runtime::{BoundEqualityPair, BoundOrderPair, BoundScalar, BoundTieBreak},
 };
 
 pub(crate) const TAG: u16 = 17;
 
-const LEFT_ROWS: DataName<Rows> = DataName::new("asof_join.left_rows");
-const RIGHT_ROWS: DataName<Rows> = DataName::new("asof_join.right_rows");
-const CONTINUATION: DataName<Continuation> = DataName::new("asof_join.continuation");
-const DATA: &[DataDeclaration] = &[
-    LEFT_ROWS.declaration(),
-    RIGHT_ROWS.declaration(),
-    CONTINUATION.declaration(),
-];
+pub(super) const LEFT_ROWS: &str = "asof_join.left_rows";
+pub(super) const RIGHT_ROWS: &str = "asof_join.right_rows";
+pub(super) const CONTINUATION: &str = "asof_join.continuation";
+
+pub(crate) struct BoundAsOfJoin {
+    pub(super) kind: AsOfJoinKind,
+    pub(super) direction: AsOfDirection,
+    pub(super) tie_fallback: AsOfTieFallback,
+    pub(super) tolerance: Option<u128>,
+    pub(super) input_schemas: [SchemaRef; 2],
+    pub(super) candidate_schema: SchemaRef,
+    pub(super) output_schema: SchemaRef,
+    pub(super) equalities: Box<[BoundEqualityPair]>,
+    pub(super) orders: Box<[BoundOrderPair]>,
+    pub(super) ties: Box<[BoundTieBreak]>,
+    pub(super) right_nulls: Vec<ScalarValue>,
+    pub(super) residual: Option<BoundExpression>,
+}
 
 /// One left/right equality expression pair and its NULL comparison semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,28 +432,22 @@ impl SealedDefinition for AsOfJoinDefinition {
         let tolerance = self.tolerance;
         let runtime_input_schemas = [Arc::clone(left_schema), Arc::clone(right_schema)];
         let runtime_output_schema = Arc::clone(&output_schema);
-        Ok(OperationBinding::turn(
+        Ok(OperationBinding::bound(
             Some(output_schema),
-            move |data: &mut DataInstances| -> Result<AsOfJoinOperation, MaterializeError> {
-                Ok(AsOfJoinOperation {
-                    kind,
-                    direction,
-                    tie_fallback,
-                    tolerance,
-                    input_schemas: runtime_input_schemas,
-                    candidate_schema,
-                    output_schema: runtime_output_schema,
-                    equalities: equalities.into_boxed_slice(),
-                    orders: orders.into_boxed_slice(),
-                    ties: ties.into_boxed_slice(),
-                    right_nulls,
-                    residual,
-                    left_rows: data.take(&LEFT_ROWS)?,
-                    right_rows: data.take(&RIGHT_ROWS)?,
-                    continuation: data.take(&CONTINUATION)?,
-                    prepared: None,
-                })
-            },
+            BoundBody::AsOfJoin(Box::new(BoundAsOfJoin {
+                kind,
+                direction,
+                tie_fallback,
+                tolerance,
+                input_schemas: runtime_input_schemas,
+                candidate_schema,
+                output_schema: runtime_output_schema,
+                equalities: equalities.into_boxed_slice(),
+                orders: orders.into_boxed_slice(),
+                ties: ties.into_boxed_slice(),
+                right_nulls,
+                residual,
+            })),
         ))
     }
 }
@@ -452,10 +455,6 @@ impl SealedDefinition for AsOfJoinDefinition {
 impl OperationDefinition for AsOfJoinDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::TurnTransform(NonZeroU32::new(2).expect("ASOF join has two inputs"))
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {
@@ -997,23 +996,6 @@ mod tests {
                 AsOfTieFallback::CanonicalDescending.code(),
             ],
             [0, 1, 2]
-        );
-    }
-
-    #[test]
-    fn definition_declares_only_the_three_fixed_resources() {
-        let definition = definition(AsOfDirection::Forward { allow_exact: true }, None);
-        assert_eq!(
-            definition
-                .data()
-                .iter()
-                .map(DataDeclaration::name)
-                .collect::<Vec<_>>(),
-            [
-                "asof_join.left_rows",
-                "asof_join.right_rows",
-                "asof_join.continuation",
-            ]
         );
     }
 

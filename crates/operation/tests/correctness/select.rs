@@ -20,7 +20,7 @@ use dogpaddle_store::Store;
 
 use super::support::{
     TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    data_names, decode_hex, project_input_schema, rollback_ready, stateless_operation, turn_input,
+    decode_hex, project_input_schema, rollback_ready, stateless_operation, turn_input,
     value_schema,
 };
 
@@ -53,7 +53,6 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
             .iter()
             .map(|(name, expression)| (*name, expression)))
     );
-    assert!(data_names(&definition).is_empty());
 
     let schema = value_schema();
     let records = RecordBatch::try_new(

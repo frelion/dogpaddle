@@ -113,7 +113,7 @@ fn atomic_runtime_applies_a_complete_change_directly() {
     let mut operation =
         stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
     let Operation::Atomic(operation) = &mut operation else {
-        panic!("eligible Filter did not materialize as an atomic operation");
+        panic!("eligible Filter was not created as an atomic operation");
     };
 
     let fixture = TestStore::new();

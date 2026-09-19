@@ -5,23 +5,16 @@
 
 use dogpaddle_store::Store;
 
-use crate::definition::{DataInstances, DataName};
-
 use super::{
     runtime::drain_group_entries,
     state::{Entries, EntryPartition},
 };
 
-const ENTRIES: DataName<Entries> = DataName::new("aggregate.entries");
-
 #[test]
 fn draining_a_dead_group_removes_only_its_own_partitions() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(root.path().join("store")).unwrap();
-    let mut data = DataInstances::new();
-    data.insert(ENTRIES.declaration().create(&mut store, "entries").unwrap())
-        .unwrap();
-    let entries: Entries = data.take(&ENTRIES).unwrap();
+    let entries = store.create_data::<Entries>("entries").unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin();

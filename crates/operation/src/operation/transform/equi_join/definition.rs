@@ -4,43 +4,36 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expr, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::{DataName, Sealed as SealedDefinition},
+    definition::{BoundBody, Sealed as SealedDefinition},
     expression::{BoundExpression, StoredExpression},
 };
 
 use super::{
     EquiJoinDefinitionError, EquiJoinKind, EquiJoinSchemaError, key_type_supported,
-    runtime::{BoundKey, BoundKeyPair, EquiJoinOperation},
-    state::{Continuation, Counts, MatchCounts, Rows},
+    runtime::{BoundKey, BoundKeyPair},
 };
 
 pub(crate) const TAG: u16 = 16;
 
-const LEFT_ROWS: DataName<Rows> = DataName::new("equi_join.left_rows");
-const RIGHT_ROWS: DataName<Rows> = DataName::new("equi_join.right_rows");
-const CONTINUATION: DataName<Continuation> = DataName::new("equi_join.continuation");
-const KEY_COUNTS: DataName<Counts> = DataName::new("equi_join.key_counts");
-const MATCH_COUNTS: DataName<MatchCounts> = DataName::new("equi_join.match_counts");
-const INNER_DATA: &[DataDeclaration] = &[
-    LEFT_ROWS.declaration(),
-    RIGHT_ROWS.declaration(),
-    CONTINUATION.declaration(),
-];
-const COUNTED_DATA: &[DataDeclaration] = &[
-    LEFT_ROWS.declaration(),
-    RIGHT_ROWS.declaration(),
-    CONTINUATION.declaration(),
-    KEY_COUNTS.declaration(),
-];
-const RESIDUAL_COUNTED_DATA: &[DataDeclaration] = &[
-    LEFT_ROWS.declaration(),
-    RIGHT_ROWS.declaration(),
-    CONTINUATION.declaration(),
-    MATCH_COUNTS.declaration(),
-];
+pub(super) const LEFT_ROWS: &str = "equi_join.left_rows";
+pub(super) const RIGHT_ROWS: &str = "equi_join.right_rows";
+pub(super) const CONTINUATION: &str = "equi_join.continuation";
+pub(super) const KEY_COUNTS: &str = "equi_join.key_counts";
+pub(super) const MATCH_COUNTS: &str = "equi_join.match_counts";
+
+pub(crate) struct BoundEquiJoin {
+    pub(super) kind: EquiJoinKind,
+    pub(super) input_schemas: [SchemaRef; 2],
+    pub(super) candidate_schema: SchemaRef,
+    pub(super) output_schema: SchemaRef,
+    pub(super) keys: Box<[BoundKeyPair]>,
+    pub(super) residual: Option<BoundExpression>,
+    pub(super) nulls: [Vec<ScalarValue>; 2],
+    pub(super) has_residual: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StoredKeyPair {
@@ -224,33 +217,18 @@ impl SealedDefinition for EquiJoinDefinition {
         let runtime_output_schema = Arc::clone(&output_schema);
         let kind = self.kind;
         let has_residual = residual.is_some();
-        Ok(OperationBinding::turn(
+        Ok(OperationBinding::bound(
             Some(output_schema),
-            move |data: &mut DataInstances| -> Result<EquiJoinOperation, MaterializeError> {
-                Ok(EquiJoinOperation {
-                    kind,
-                    input_schemas: [runtime_left_schema, runtime_right_schema],
-                    candidate_schema,
-                    output_schema: runtime_output_schema,
-                    keys: bound_keys.into_boxed_slice(),
-                    residual,
-                    nulls,
-                    left_rows: data.take(&LEFT_ROWS)?,
-                    right_rows: data.take(&RIGHT_ROWS)?,
-                    continuation: data.take(&CONTINUATION)?,
-                    key_counts: if kind != EquiJoinKind::Inner && !has_residual {
-                        Some(data.take(&KEY_COUNTS)?)
-                    } else {
-                        None
-                    },
-                    match_counts: if kind != EquiJoinKind::Inner && has_residual {
-                        Some(data.take(&MATCH_COUNTS)?)
-                    } else {
-                        None
-                    },
-                    prepared: None,
-                })
-            },
+            BoundBody::EquiJoin(Box::new(BoundEquiJoin {
+                kind,
+                input_schemas: [runtime_left_schema, runtime_right_schema],
+                candidate_schema,
+                output_schema: runtime_output_schema,
+                keys: bound_keys.into_boxed_slice(),
+                residual,
+                nulls,
+                has_residual,
+            })),
         ))
     }
 }
@@ -258,16 +236,6 @@ impl SealedDefinition for EquiJoinDefinition {
 impl OperationDefinition for EquiJoinDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::TurnTransform(NonZeroU32::new(2).expect("equi-join has two inputs"))
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        if self.kind == EquiJoinKind::Inner {
-            INNER_DATA
-        } else if self.residual.is_some() {
-            RESIDUAL_COUNTED_DATA
-        } else {
-            COUNTED_DATA
-        }
     }
 
     fn persistence_tag(&self) -> u16 {

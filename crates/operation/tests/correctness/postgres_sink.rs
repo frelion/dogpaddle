@@ -4,8 +4,8 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationBindError, OperationDefinition, OperationKind,
-    RuntimeResource, decode_definition, encode_definition,
+    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    create_operation, decode_definition, encode_definition, open_operation,
     operation::{
         Action, OperationInput, Turn,
         sink::{
@@ -92,14 +92,21 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     ready.extend(1_u64.to_be_bytes());
     let store_root = TestStore::new();
     let definition = definition();
-    let mut store = Store::create(store_root.path()).unwrap();
-    definition.data()[0]
-        .create(&mut store, "physical-control")
+    let binding = (&definition as &dyn OperationDefinition)
+        .bind(&[input_schema()])
         .unwrap();
-    definition.data()[1]
-        .create(&mut store, "physical-buffer")
-        .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
+    let mut setup = Store::setup(store_root.path()).unwrap();
+    let operation = create_operation(
+        binding,
+        &mut setup,
+        "operation",
+        RuntimeResource::new(config()),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(store_root.path()).unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     state
@@ -113,17 +120,14 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     for _ in 0..2 {
         let store = Store::open(store_root.path()).unwrap();
         let decoded = decode_definition(&literal_definition_bytes()).unwrap();
-        let mut data = DataInstances::new();
-        data.insert(decoded.data()[0].open(&store, "physical-control").unwrap())
-            .unwrap();
-        data.insert(decoded.data()[1].open(&store, "physical-buffer").unwrap())
-            .unwrap();
-        let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
-        let mut operation = decoded
-            .bind(&[input_schema()])
-            .unwrap()
-            .materialize(data, RuntimeResource::new(config()))
-            .unwrap();
+        let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
+        let mut operation = open_operation(
+            decoded.bind(&[input_schema()]).unwrap(),
+            &store,
+            "operation",
+            RuntimeResource::new(config()),
+        )
+        .unwrap();
         let mut transactions = store.into_transactions();
         let input = input_change();
         let Turn::Ready(prepared) = operation
@@ -168,26 +172,17 @@ fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
 fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let definition = definition();
     assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
-    assert_eq!(
-        definition
-            .data()
-            .iter()
-            .map(dogpaddle_operation::DataDeclaration::name)
-            .collect::<Vec<_>>(),
-        ["sink.control", "sink.buffer"]
-    );
-
     let binding = (&definition as &dyn OperationDefinition)
         .bind(&[input_schema()])
         .unwrap();
     assert!(binding.output_schema().is_none());
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::none()),
-        Err(MaterializeError::MissingRuntimeResource)
+        Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::new(42_u64)),
-        Err(MaterializeError::WrongRuntimeResource)
+        Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
         binding
@@ -196,16 +191,22 @@ fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     );
 
     let store_root = TestStore::new();
-    let mut store = Store::create(store_root.path()).unwrap();
-    definition.data()[0]
-        .create(&mut store, "physical-control")
-        .unwrap();
-    definition.data()[1]
-        .create(&mut store, "physical-buffer")
-        .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
+    let mut setup = Store::setup(store_root.path()).unwrap();
+    let operation = create_operation(
+        (&definition as &dyn OperationDefinition)
+            .bind(&[input_schema()])
+            .unwrap(),
+        &mut setup,
+        "operation",
+        RuntimeResource::new(config()),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(store_root.path()).unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
     store
-        .open_data::<OrderedMap<u64, Vec<u8>>>("physical-buffer")
+        .open_data::<OrderedMap<u64, Vec<u8>>>("operation/sink.buffer")
         .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
@@ -281,33 +282,36 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
 fn postgres_sink_restores_offline_then_checks_target_before_publishing_initialization() {
     let store_root = TestStore::new();
     let definition = definition();
-    let mut store = Store::create(store_root.path()).unwrap();
-    let mut data = DataInstances::new();
-    data.insert(
-        definition.data()[0]
-            .create(&mut store, "physical-control")
+    let mut setup = Store::setup(store_root.path()).unwrap();
+    let operation = create_operation(
+        (&definition as &dyn OperationDefinition)
+            .bind(&[input_schema()])
             .unwrap(),
+        &mut setup,
+        "operation",
+        RuntimeResource::new(mismatched_config()),
     )
     .unwrap();
-    data.insert(
-        definition.data()[1]
-            .create(&mut store, "physical-buffer")
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(store_root.path()).unwrap();
+    let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
+    let mut operation = open_operation(
+        (&definition as &dyn OperationDefinition)
+            .bind(&[input_schema()])
             .unwrap(),
+        &store,
+        "operation",
+        RuntimeResource::new(mismatched_config()),
     )
     .unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("physical-control").unwrap();
+    let mut transactions = store.into_transactions();
 
     // The endpoint is deliberately unreachable and names another database.
-    // Binding, Store construction, materialization, turn preparation, and
+    // Binding, Store construction, typed setup, turn preparation, and
     // transaction application and first completion only restore local state.
     // The next transaction-free turn checks the target before publishing any
     // initialization intent.
-    let mut operation = (&definition as &dyn OperationDefinition)
-        .bind(&[input_schema()])
-        .unwrap()
-        .materialize(data, RuntimeResource::new(mismatched_config()))
-        .unwrap();
-    let mut transactions = store.into_transactions();
     let change = input_change();
     drop(
         operation

@@ -82,12 +82,8 @@ pub(crate) fn station_output_name(index: usize) -> String {
     format!("station/{index:08x}/output")
 }
 
-pub(crate) fn station_operation_data_name(
-    station: usize,
-    operation: usize,
-    logical_name: &str,
-) -> String {
-    format!("station/{station:08x}/operation/{operation:08x}/{logical_name}")
+pub(crate) fn station_operation_prefix(station: usize, operation: usize) -> String {
+    format!("station/{station:08x}/operation/{operation:08x}")
 }
 
 pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {

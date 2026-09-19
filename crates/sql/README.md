@@ -92,11 +92,11 @@ let outcome = flow.advance()?;
 
 ## Program 身份与恢复
 
-SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 原子写入 canonical Flow Definition。恢复时，Flow 在 Schema binding、资源打开和 Operation materialize 之前比较期望身份。
+SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按 Station ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 完成 bind 后调用 operation-owned typed `create`；路径已存在时，它先比较 owner identity，再 bind 并调用 typed `open`。SQL 不声明算子持久数据，也没有自己的 materialize 层。
 
 身份覆盖规范化查询、确定性装配 ABI、固定输出容量，以及会改变持久语义的 endpoint 参数。密码、用户名、主机、端口、runtime 位置和环境变量名称不进入身份；因此可以轮换凭据或连接地址，但不能用另一份查询、另一张表或不同的持久参数接管已有状态。SQL 原文、AST、LogicalPlan、凭据和环境引用都不持久化。
 
-如果修改了查询语义、表身份、publication、spool 容量或装配规则，应使用新的状态路径。当前是开发期 v1，不读取或迁移旧布局。
+如果修改了查询语义、表身份、publication、spool 容量或装配规则，应使用新的状态路径。
 
 ## Endpoint 合同
 

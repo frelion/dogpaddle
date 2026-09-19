@@ -3,19 +3,26 @@ use std::sync::{Arc, OnceLock};
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
-use dogpaddle_store::{Cell, TransactionAccess};
+use dogpaddle_store::{Cell, Store, StoreSetup, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::{DataName, Sealed as SealedDefinition},
-    operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed as SealedDefinition},
+    operation::{
+        Action, AfterCommit, Operation, OperationError, OperationInput, Turn, TurnOperation,
+    },
+    setup::{OperationSetupError, create_data, open_data},
 };
 
 pub(crate) const TAG: u16 = 1;
-const POSITION: DataName<Cell<u64>> = DataName::new("sequence_scan.position");
-const DATA: &[DataDeclaration] = &[POSITION.declaration()];
+const POSITION: &str = "sequence_scan.position";
+
+#[derive(Clone, Copy)]
+pub(crate) struct BoundSequence {
+    start: u64,
+}
 
 /// Pure definition of a monotonically increasing Scan.
 ///
@@ -65,13 +72,9 @@ impl SealedDefinition for SequenceScanDefinition {
         &self,
         _input_schemas: &[SchemaRef],
     ) -> Result<OperationBinding, OperationSchemaError> {
-        let start = self.start;
-        Ok(OperationBinding::turn(
+        Ok(OperationBinding::bound(
             Some(output_schema()),
-            move |data: &mut DataInstances| -> Result<SequenceScanOperation, MaterializeError> {
-                let position = data.take(&POSITION)?;
-                Ok(SequenceScanOperation::new(start, position))
-            },
+            BoundBody::Sequence(BoundSequence { start: self.start }),
         ))
     }
 }
@@ -81,10 +84,6 @@ impl OperationDefinition for SequenceScanDefinition {
         OperationKind::Scan
     }
 
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
-    }
-
     fn persistence_tag(&self) -> u16 {
         TAG
     }
@@ -92,6 +91,30 @@ impl OperationDefinition for SequenceScanDefinition {
     fn encode_payload(&self, output: &mut Vec<u8>) {
         output.extend_from_slice(&self.start.to_be_bytes());
     }
+}
+
+pub(crate) fn create(
+    bound: BoundSequence,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let position = create_data::<Cell<u64>>(setup, prefix, POSITION)?;
+    Ok(Operation::Turn(Box::new(SequenceScanOperation::new(
+        bound.start,
+        position,
+    ))))
+}
+
+pub(crate) fn open(
+    bound: BoundSequence,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let position = open_data::<Cell<u64>>(store, prefix, POSITION)?;
+    Ok(Operation::Turn(Box::new(SequenceScanOperation::new(
+        bound.start,
+        position,
+    ))))
 }
 
 impl SequenceScanOperation {

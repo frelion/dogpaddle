@@ -1,7 +1,7 @@
 use thiserror::Error;
 
-use dogpaddle_operation::MaterializeError;
-use dogpaddle_store::StoreError;
+use dogpaddle_operation::OperationSetupError;
+use dogpaddle_store::{StoreError, StoreError::DataNotFound};
 
 use crate::{
     build::{FlowDefinitionError, FlowSchemaError, TopologyError},
@@ -37,7 +37,7 @@ pub enum FlowError {
         station_id: String,
         /// Exact resource mismatch without exposing its contents.
         #[source]
-        source: MaterializeError,
+        source: OperationSetupError,
     },
     /// The declared topology is invalid.
     #[error(transparent)]
@@ -51,9 +51,17 @@ pub enum FlowError {
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// Provided typed data instances do not match an operation definition.
-    #[error(transparent)]
-    Materialize(#[from] MaterializeError),
+    /// A bound Operation could not be constructed during setup.
+    #[error("station {station_id:?} operation {operation} setup failed: {source}")]
+    OperationSetup {
+        /// Stable Station ID containing the Operation.
+        station_id: String,
+        /// Zero-based Operation ordinal inside the Station.
+        operation: usize,
+        /// Concrete setup or construction failure.
+        #[source]
+        source: OperationSetupError,
+    },
     /// A Store exists, but no complete Flow definition was published.
     #[error("flow build is incomplete")]
     IncompleteBuild,
@@ -71,6 +79,31 @@ pub enum FlowError {
         /// Concrete invariant violation detected while opening or inspecting.
         reason: String,
     },
+}
+
+pub(crate) fn operation_setup_error(
+    station_id: &str,
+    operation: usize,
+    source: OperationSetupError,
+) -> FlowError {
+    match source {
+        OperationSetupError::MissingRuntimeResource
+        | OperationSetupError::WrongRuntimeResource
+        | OperationSetupError::UnexpectedRuntimeResource => FlowError::RuntimeResource {
+            station_id: station_id.to_owned(),
+            source,
+        },
+        OperationSetupError::Store {
+            name,
+            source: DataNotFound(_),
+        } => FlowError::MissingResource { name },
+        OperationSetupError::Store { source, .. } => FlowError::Store(source),
+        source => FlowError::OperationSetup {
+            station_id: station_id.to_owned(),
+            operation,
+            source,
+        },
+    }
 }
 
 pub(crate) fn runtime_state_error(station_id: &str, source: StationError) -> FlowError {

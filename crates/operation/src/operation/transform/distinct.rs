@@ -4,19 +4,25 @@ use arrow_array::{BooleanArray, Int64Array};
 use arrow_schema::{ArrowError, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::{OrderedMultiset, StoreError, TransactionAccess};
+use dogpaddle_store::{OrderedMultiset, Store, StoreError, StoreSetup, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::{DataName, Sealed as SealedDefinition},
-    operation::{AtomicOperation, OperationError, OperationInput, relation::canonical_row},
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed as SealedDefinition},
+    operation::{
+        AtomicOperation, Operation, OperationError, OperationInput, relation::canonical_row,
+    },
+    setup::{OperationSetupError, create_data, open_data},
 };
 
 pub(crate) const TAG: u16 = 13;
-const WEIGHTS: DataName<OrderedMultiset<Vec<u8>>> = DataName::new("distinct.weights");
-const DATA: &[DataDeclaration] = &[WEIGHTS.declaration()];
+const WEIGHTS: &str = "distinct.weights";
+
+pub(crate) struct BoundDistinct {
+    input_schema: SchemaRef,
+}
 
 /// Pure definition of an exact, order-preserving distinct operation.
 ///
@@ -88,16 +94,11 @@ impl SealedDefinition for DistinctDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Distinct input arity");
-        let runtime_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::atomic(
-            Arc::clone(input_schema),
-            move |data: &mut DataInstances| -> Result<DistinctOperation, MaterializeError> {
-                let weights = data.take(&WEIGHTS)?;
-                Ok(DistinctOperation {
-                    input_schema: runtime_schema,
-                    weights,
-                })
-            },
+        Ok(OperationBinding::bound(
+            Some(Arc::clone(input_schema)),
+            BoundBody::Distinct(BoundDistinct {
+                input_schema: Arc::clone(input_schema),
+            }),
         ))
     }
 }
@@ -107,15 +108,35 @@ impl OperationDefinition for DistinctDefinition {
         OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
-    }
-
     fn persistence_tag(&self) -> u16 {
         TAG
     }
 
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
+}
+
+pub(crate) fn create(
+    bound: BoundDistinct,
+    setup: &mut StoreSetup,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let weights = create_data::<OrderedMultiset<Vec<u8>>>(setup, prefix, WEIGHTS)?;
+    Ok(Operation::Atomic(Box::new(DistinctOperation {
+        input_schema: bound.input_schema,
+        weights,
+    })))
+}
+
+pub(crate) fn open(
+    bound: BoundDistinct,
+    store: &Store,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let weights = open_data::<OrderedMultiset<Vec<u8>>>(store, prefix, WEIGHTS)?;
+    Ok(Operation::Atomic(Box::new(DistinctOperation {
+        input_schema: bound.input_schema,
+        weights,
+    })))
 }
 
 impl AtomicOperation for DistinctOperation {

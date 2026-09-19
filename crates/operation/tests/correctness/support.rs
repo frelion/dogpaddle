@@ -9,8 +9,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataDeclaration, DataInstances, DefinitionCodecError, OperationBindError, OperationBinding,
-    OperationDefinition, OperationKind, RuntimeResource, decode_definition, encode_definition,
+    DefinitionCodecError, OperationBindError, OperationBinding, OperationDefinition, OperationKind,
+    RuntimeResource, create_operation, decode_definition, encode_definition,
     operation::{Action, AfterCommit, Operation, OperationError, OperationInput, Turn},
 };
 use dogpaddle_store::{Store, TransactionAccess, Transactions};
@@ -31,14 +31,6 @@ impl TestStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
-
-pub fn data_names(definition: &dyn OperationDefinition) -> Vec<&'static str> {
-    definition
-        .data()
-        .iter()
-        .map(DataDeclaration::name)
-        .collect()
 }
 
 pub fn assert_literal_definition(
@@ -80,23 +72,17 @@ pub fn bind(
     definition.bind(input_schemas)
 }
 
-pub fn materialize(
+pub fn setup_operation(
     definition: &dyn OperationDefinition,
     input_schemas: &[SchemaRef],
-    store: &Store,
-    physical_names: &[&str],
-) -> Operation {
-    assert_eq!(definition.data().len(), physical_names.len());
-    let mut data = DataInstances::new();
-    for (declaration, physical_name) in definition.data().iter().zip(physical_names) {
-        data.insert(declaration.open(store, physical_name).unwrap())
-            .unwrap();
-    }
-    definition
-        .bind(input_schemas)
-        .unwrap()
-        .materialize(data, RuntimeResource::none())
-        .unwrap()
+    fixture: &TestStore,
+    prefix: &str,
+) -> (Operation, Transactions) {
+    let binding = definition.bind(input_schemas).unwrap();
+    let mut setup = Store::setup(fixture.path()).unwrap();
+    let operation = create_operation(binding, &mut setup, prefix, RuntimeResource::none()).unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    (operation, transactions)
 }
 
 pub fn value_schema() -> SchemaRef {
@@ -181,11 +167,13 @@ pub fn stateless_operation(
     definition: &dyn OperationDefinition,
     input_schema: SchemaRef,
 ) -> Operation {
-    definition
-        .bind(&[input_schema])
-        .unwrap()
-        .materialize(DataInstances::new(), RuntimeResource::none())
-        .unwrap()
+    let binding = definition.bind(&[input_schema]).unwrap();
+    let fixture = TestStore::new();
+    let mut setup = Store::setup(fixture.path()).unwrap();
+    let operation =
+        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
+    let _transactions = setup.commit(|_| Ok(())).unwrap();
+    operation
 }
 
 pub fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change) -> Change {

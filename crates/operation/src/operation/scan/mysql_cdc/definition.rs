@@ -1,29 +1,28 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_store::{Cell, Queue};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
-    definition::{DataName, Sealed},
+    definition::{BoundBody, Sealed},
 };
 
-use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlColumn, schema};
+use super::{MySqlCdcScanError, MySqlColumn, schema};
 
 pub(crate) const TAG: u16 = 15;
-const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
-const PHASE: DataName<Cell<u32>> = DataName::new("mysql_cdc_scan.phase");
-const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("mysql_cdc_scan.checkpoint");
-const BOOTSTRAP_SPOOL: DataName<Queue<Vec<u8>>> = DataName::new("mysql_cdc_scan.bootstrap_spool");
-static DATA: [DataDeclaration; 3] = [
-    PHASE.declaration(),
-    CHECKPOINT.declaration(),
-    BOOTSTRAP_SPOOL.declaration(),
-];
-
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
+const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+pub(super) const PHASE: &str = "mysql_cdc_scan.phase";
+pub(super) const CHECKPOINT: &str = "mysql_cdc_scan.checkpoint";
+pub(super) const BOOTSTRAP_SPOOL: &str = "mysql_cdc_scan.bootstrap_spool";
+
+pub(crate) struct BoundMySqlCdc {
+    pub(super) spec: MySqlCdcScanSpec,
+    pub(super) output: SchemaRef,
+    pub(super) bootstrap_spool_bytes: NonZeroU64,
+}
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
@@ -51,7 +50,7 @@ pub struct MySqlCdcScanSpec {
 /// Fixed-Schema, single-table `MySQL` snapshot and binlog CDC Scan.
 ///
 /// Credentials and runtime bundle paths are supplied separately through
-/// [`MySqlCdcScanConfig`]. Build and open perform no `MySQL` or JVM I/O. On its
+/// [`super::MySqlCdcScanConfig`]. Build and open perform no `MySQL` or JVM I/O. On its
 /// first advance the Scan captures a consistent full table snapshot into its
 /// private durable spool, publishes that spool, and then continues from the
 /// snapshot's sealed checkpoint. No source-write gate is required. Online
@@ -109,31 +108,20 @@ impl Sealed for MySqlCdcScanDefinition {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
         let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
-        Ok(OperationBinding::turn_with_resource::<
-            MySqlCdcScanConfig,
-            _,
-            _,
-        >(Some(Arc::clone(&output)), move |data, config| {
-            Ok(MySqlCdcScanOperation::new_bound(
+        Ok(OperationBinding::bound(
+            Some(Arc::clone(&output)),
+            BoundBody::MySqlCdc(Box::new(BoundMySqlCdc {
                 spec,
                 output,
-                data.take(&PHASE)?,
-                data.take(&CHECKPOINT)?,
-                data.take(&BOOTSTRAP_SPOOL)?,
                 bootstrap_spool_bytes,
-                config,
-            ))
-        }))
+            })),
+        ))
     }
 }
 
 impl OperationDefinition for MySqlCdcScanDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Scan
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        &DATA
     }
 
     fn persistence_tag(&self) -> u16 {

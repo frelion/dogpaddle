@@ -148,7 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`FlowFactory` 的核心调用只有这些：
+`FlowFactory` 的核心调用只有这些。`resource` 以 Station 字符串 ID 绑定一个不透明值；Flow 只负责把它
+交给首 Operation 的 binding 校验和 typed setup，不查看其中的凭据，也不把它变成持久资源描述：
 
 | API | 作用 |
 | --- | --- |
@@ -168,13 +169,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 第一次构建
 
-`build` 在创建 Store 前完成能纯计算的工作：
+`build` 按下面的生命周期工作：
 
 1. 校验 Station、输入顺序、容量和整张 DAG。
 2. 稳定编码声明，再立即解码；后续只使用这份即将持久化的 canonical（规范化）Definition。
-3. 按拓扑传播 Arrow Schema，并按 Station 内顺序绑定每个 Operation。
-4. 校验每个 Operation 声明的持久数据和运行资源。
-5. 创建 Store、Operation 状态、Station 输出和订阅位置，最后原子发布 Flow Definition。
+3. 按拓扑传播 Arrow Schema，并按 Station 内顺序把每个 Definition 绑定成不透明 `OperationBinding`。
+4. 在创建 Store 前检查所有 Station 资源的存在与精确类型。
+5. 创建 Store；为每个 Operation 生成稳定 ordinal 前缀，由 operation-owned typed setup 创建具体状态并
+   直接构造运行 Operation；随后创建 Station 输出和订阅位置，原子发布 Flow Definition。
 
 因此常见的拓扑、Schema 和资源类型错误不会留下目标目录。底层 Store 在创建后的失败仍可能留下一个
 不完整目录，`open` 会拒绝把它当成完整 Flow。
@@ -210,18 +212,17 @@ flow.advance()?;
 
 `open` 从磁盘读取 owner identity、Station 拓扑、Operation 顺序、定义和容量。若 Factory 设置了
 `owner_identity`，它必须与磁盘中的值精确相同；未设置的 Factory 只接受同样未设置 owner 的 Flow。
-比较发生在 Schema binding、资源打开和 Operation materialize 之前。随后 Flow 才重新做相同的 Schema
-绑定，打开全部状态并装配运行对象。它不会接受另一份拓扑声明，也不会重新决定如何融合。凭据、
-进程内 connector 等 runtime resource 不写入磁盘，必须按 Station ID 再次注入。
-
-当前 v1 不读取旧布局、不迁移旧数据库。修改定义、拓扑或融合结果后，应删除旧状态或使用新目录。
+比较发生在 Schema binding 和 typed state open 之前。随后 Flow 重新做相同的 Schema 传播与 bind，
+检查全部临时资源，再为每个 Operation 生成相同前缀，由 operation-owned typed setup 打开具体状态并
+直接装配运行对象。Flow 不读取 binding 内部布局、不枚举算子，也不会重新决定如何融合。凭据、进程内
+connector 等 `RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；它是这条路径上唯一的类型擦除。
 
 ### 磁盘里有什么
 
 一条 Flow 的持久状态由四部分组成：
 
 - canonical Flow Definition：可选的不透明 owner identity、Station ID、有序 Operation Definition、输入 Station ID 和输出容量；
-- 每个 Operation 自己声明的数据，例如计数、Join 两侧关系或 CDC checkpoint；
+- 每个 Operation 由具体 typed setup 创建的状态，例如计数、Join 两侧关系或 CDC checkpoint；
 - 每个 Station 最终输出的 `SubscribedLog` 及每条下游边的订阅位置；
 - 多输入 Station 当前固定的输入端口。
 
@@ -285,7 +286,6 @@ Flow 只实现装配、拓扑、调度和事务边界，不枚举具体算子，
 - 拓扑、Station program 和持久资源在 build 后不可修改。
 - 每条 Flow 独占一个 Store 和唯一写事务能力。
 - 外部 Scan/Sink 的连接、快照和幂等协议属于具体 Operation；Flow 没有 connector 专用分支。
-- 当前只有开发期 v1，破坏性修改要求重建状态，不提供兼容层。
 
 常用验证命令：
 

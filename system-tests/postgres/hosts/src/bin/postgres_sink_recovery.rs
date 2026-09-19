@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, RuntimeResource, decode_definition, encode_definition,
+    RuntimeResource, create_operation, decode_definition, encode_definition, open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         sink::{PostgresSinkConfig, PostgresSinkDefinition},
@@ -28,6 +28,9 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, Store, Transactions};
 use serde_json::{Value, json};
+
+const OPERATION_PREFIX: &str = "operation";
+const SINK_CONTROL: &str = "operation/sink.control";
 
 struct Host {
     operation: Operation,
@@ -50,19 +53,29 @@ impl Host {
             let definition = PostgresSinkDefinition::try_new(target)?;
             let encoded = encode_definition(&definition);
             let canonical = decode_definition(&encoded)?;
-            canonical.bind(&[Arc::clone(&schema)])?;
-            let mut store = Store::create(path)?;
-            let saved: Cell<Vec<u8>> = store.create_data("definition")?;
-            for declaration in canonical.data() {
-                declaration.create(&mut store, declaration.name())?;
-            }
-            let mut transactions = store.into_transactions();
-            let transaction = transactions.begin();
-            saved.access(transaction.access())?.set(&encoded)?;
-            transaction.commit()?;
+            let binding = canonical.bind(&[Arc::clone(&schema)])?;
+            let mut setup = Store::setup(path)?;
+            let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
+            let _operation = create_operation(
+                binding,
+                &mut setup,
+                OPERATION_PREFIX,
+                RuntimeResource::new(config),
+            )?;
+            let _transactions = setup.commit(|access| {
+                saved.access(access)?.set(&encoded)?;
+                Ok(())
+            })?;
         } else if mode != "open" {
             return Err("mode must be build or open".into());
         }
+        let config = PostgresSinkConfig::new_unencrypted(
+            "127.0.0.1",
+            port,
+            "postgres",
+            "dogpaddle_gate",
+            env::var("DOGPADDLE_GATE_PASSWORD")?,
+        )?;
         let store = Store::open(path)?;
         let saved: Cell<Vec<u8>> = store.open_data("definition")?;
         let definition = {
@@ -75,13 +88,15 @@ impl Host {
             )?
         };
         let binding = definition.bind(&[schema])?;
-        let mut data = DataInstances::new();
-        for declaration in definition.data() {
-            data.insert(declaration.open(&store, declaration.name())?)?;
-        }
+        let operation = open_operation(
+            binding,
+            &store,
+            OPERATION_PREFIX,
+            RuntimeResource::new(config),
+        )?;
         Ok(Self {
-            operation: binding.materialize(data, RuntimeResource::new(config))?,
-            state: store.open_data("sink.control")?,
+            operation,
+            state: store.open_data(SINK_CONTROL)?,
             transactions: store.into_transactions(),
         })
     }

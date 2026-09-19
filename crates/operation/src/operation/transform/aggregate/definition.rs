@@ -3,10 +3,10 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{Field, Schema, SchemaRef};
 
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, Expr, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
+    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
     codec::PayloadCursor,
-    definition::{DataName, Sealed as SealedDefinition},
+    definition::{BoundBody, Sealed as SealedDefinition},
     expression::StoredExpression,
 };
 
@@ -16,21 +16,24 @@ use super::{
         AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, argument_field,
         descriptor,
     },
-    runtime::{AggregateOperation, BoundAggregate, BoundCall, BoundLayout, ExtremaSlot},
-    state::{Control, Entries, Groups},
+    runtime::{BoundAggregate, BoundCall, BoundLayout, ExtremaSlot},
     value::contains_float,
 };
 
 pub(crate) const TAG: u16 = 14;
 
-const GROUPS: DataName<Groups> = DataName::new("aggregate.groups");
-const ENTRIES: DataName<Entries> = DataName::new("aggregate.entries");
-const CONTROL: DataName<Control> = DataName::new("aggregate.control");
-const DATA: &[DataDeclaration] = &[
-    GROUPS.declaration(),
-    ENTRIES.declaration(),
-    CONTROL.declaration(),
-];
+pub(super) const GROUPS: &str = "aggregate.groups";
+pub(super) const ENTRIES: &str = "aggregate.entries";
+pub(super) const CONTROL: &str = "aggregate.control";
+
+pub(crate) struct BoundAggregateOperation {
+    pub(super) input_schema: SchemaRef,
+    pub(super) output_schema: SchemaRef,
+    pub(super) group_expressions: Box<[crate::expression::BoundExpression]>,
+    pub(super) calls: Box<[BoundCall]>,
+    pub(super) layouts: Box<[BoundLayout]>,
+    pub(super) slots: Box<[ExtremaSlot]>,
+}
 
 /// One built-in aggregate invocation without its output field name.
 ///
@@ -195,23 +198,17 @@ impl SealedDefinition for AggregateDefinition {
             output_fields,
             input_schema.metadata().clone(),
         ));
-        let runtime_input = Arc::clone(input_schema);
-        let runtime_output = Arc::clone(&output_schema);
-        let materialize =
-            move |data: &mut DataInstances| -> Result<AggregateOperation, MaterializeError> {
-                Ok(AggregateOperation {
-                    input_schema: runtime_input,
-                    output_schema: runtime_output,
-                    group_expressions,
-                    calls,
-                    layouts,
-                    slots,
-                    groups: data.take(&GROUPS)?,
-                    entries: data.take(&ENTRIES)?,
-                    control: data.take(&CONTROL)?,
-                })
-            };
-        Ok(OperationBinding::atomic(output_schema, materialize))
+        Ok(OperationBinding::bound(
+            Some(Arc::clone(&output_schema)),
+            BoundBody::Aggregate(Box::new(BoundAggregateOperation {
+                input_schema: Arc::clone(input_schema),
+                output_schema,
+                group_expressions,
+                calls,
+                layouts,
+                slots,
+            })),
+        ))
     }
 }
 
@@ -290,7 +287,7 @@ impl AggregateDefinition {
                         .next()
                         .expect("extrema has exactly one bound argument");
                     let layout = indexed_layout(&mut layouts, stored, argument, aggregate);
-                    let slot = indexed_slot(&mut slots, layout, direction);
+                    let slot = indexed_slot(&mut slots, &mut layouts[layout].1, layout, direction);
                     calls.push(BoundCall::extrema(slot));
                 }
             }
@@ -327,6 +324,8 @@ fn indexed_layout(
             owner,
             field: Arc::new(argument_field(&argument)),
             expression: argument,
+            min_slot: None,
+            max_slot: None,
         },
     ));
     position
@@ -337,15 +336,23 @@ fn indexed_layout(
 /// `MIN(x), MAX(x)` share the layout but need one slot each; repeating the same
 /// call reuses one slot, so the cached group state stays proportional to the
 /// distinct extremes the definition actually reads.
-fn indexed_slot(slots: &mut Vec<ExtremaSlot>, layout: usize, direction: ExtremaDirection) -> usize {
-    if let Some(position) = slots
-        .iter()
-        .position(|slot| slot.layout == layout && slot.direction == direction)
-    {
-        return position;
+fn indexed_slot(
+    slots: &mut Vec<ExtremaSlot>,
+    bound_layout: &mut BoundLayout,
+    layout: usize,
+    direction: ExtremaDirection,
+) -> usize {
+    let cached_slot = match direction {
+        ExtremaDirection::Min => &mut bound_layout.min_slot,
+        ExtremaDirection::Max => &mut bound_layout.max_slot,
+    };
+    if let Some(slot) = *cached_slot {
+        return slot;
     }
-    slots.push(ExtremaSlot { layout, direction });
-    slots.len() - 1
+    let slot = slots.len();
+    slots.push(ExtremaSlot { layout });
+    *cached_slot = Some(slot);
+    slot
 }
 
 impl OperationDefinition for AggregateDefinition {
@@ -355,10 +362,6 @@ impl OperationDefinition for AggregateDefinition {
         } else {
             OperationKind::ExclusiveTransform(NonZeroU32::MIN)
         }
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

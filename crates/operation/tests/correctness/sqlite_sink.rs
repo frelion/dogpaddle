@@ -8,8 +8,9 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
-    RuntimeResource, decode_definition, encode_definition,
+    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
+    OperationSetupError, RuntimeResource, create_operation, decode_definition, encode_definition,
+    open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
@@ -18,9 +19,7 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, OrderedMap, Store, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
-use super::support::{
-    TestStore, assert_literal_definition, bind, data_names, decode_hex, materialize, value_schema,
-};
+use super::support::{TestStore, assert_literal_definition, bind, decode_hex, value_schema};
 
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
@@ -35,7 +34,6 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
         10,
         OperationKind::Sink(std::num::NonZeroU32::MIN),
     );
-    assert_eq!(data_names(&sqlite), ["sink.control", "sink.buffer"]);
     assert_eq!(
         sqlite.database_path(),
         Path::new("/var/lib/dogpaddle/output.sqlite")
@@ -332,25 +330,36 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let fixture = TestStore::new();
     let sqlite_path = fixture.path().with_extension("sqlite");
     let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
-
-    let mut store = Store::create(fixture.path()).unwrap();
-    assert_eq!(definition.data().len(), 2);
-    definition.data()[0].create(&mut store, "control").unwrap();
-    definition.data()[1].create(&mut store, "buffer").unwrap();
+    let binding = (&definition as &dyn OperationDefinition)
+        .bind(&[value_schema()])
+        .unwrap();
+    assert!(matches!(
+        binding.validate_resource(&RuntimeResource::new(42_u64)),
+        Err(OperationSetupError::UnexpectedRuntimeResource)
+    ));
+    let mut setup = Store::setup(fixture.path()).unwrap();
+    let operation =
+        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
     assert!(!sqlite_path.exists());
-    drop(store);
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
 
     let store = Store::open(fixture.path()).unwrap();
-    store.open_data::<Cell<Vec<u8>>>("control").unwrap();
     store
-        .open_data::<OrderedMap<u64, Vec<u8>>>("buffer")
+        .open_data::<Cell<Vec<u8>>>("operation/sink.control")
         .unwrap();
-    let operation = materialize(
-        &definition,
-        &[value_schema()],
+    store
+        .open_data::<OrderedMap<u64, Vec<u8>>>("operation/sink.buffer")
+        .unwrap();
+    let operation = open_operation(
+        (&definition as &dyn OperationDefinition)
+            .bind(&[value_schema()])
+            .unwrap(),
         &store,
-        &["control", "buffer"],
-    );
+        "operation",
+        RuntimeResource::none(),
+    )
+    .unwrap();
     assert!(!sqlite_path.exists());
     drop(operation);
 }
@@ -368,25 +377,29 @@ impl Fixture {
         let root = TestStore::new();
         let definition =
             SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events").unwrap();
-        let mut store = Store::create(root.path()).unwrap();
-        definition.data()[0].create(&mut store, "control").unwrap();
-        definition.data()[1].create(&mut store, "buffer").unwrap();
-        Self::open(root, encode_definition(&definition), store)
+        let encoded = encode_definition(&definition);
+        let binding = (&definition as &dyn OperationDefinition)
+            .bind(&[schema()])
+            .unwrap();
+        let mut setup = Store::setup(root.path()).unwrap();
+        let operation =
+            create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
+        let transactions = setup.commit(|_| Ok(())).unwrap();
+        drop((operation, transactions));
+        let store = Store::open(root.path()).unwrap();
+        Self::open(root, encoded, store)
     }
 
     fn open(root: TestStore, definition: Vec<u8>, store: Store) -> Self {
         let decoded = decode_definition(&definition).unwrap();
-        let mut data = DataInstances::new();
-        data.insert(decoded.data()[0].open(&store, "control").unwrap())
-            .unwrap();
-        data.insert(decoded.data()[1].open(&store, "buffer").unwrap())
-            .unwrap();
-        let operation = decoded
-            .bind(&[schema()])
-            .unwrap()
-            .materialize(data, RuntimeResource::none())
-            .unwrap();
-        let state = store.open_data("control").unwrap();
+        let operation = open_operation(
+            decoded.bind(&[schema()]).unwrap(),
+            &store,
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+        let state = store.open_data("operation/sink.control").unwrap();
         Self {
             root,
             definition,

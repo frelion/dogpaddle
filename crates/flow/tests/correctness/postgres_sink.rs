@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::{
-    MaterializeError, OperationBindError, col,
+    OperationBindError, OperationSetupError, col,
     operation::{
         scan::SequenceScanDefinition,
         sink::{
@@ -45,7 +45,7 @@ fn postgres_sink_resource_errors_are_station_scoped_and_precede_store_creation()
     let missing_path = root.path().join("missing");
     let Err(FlowError::RuntimeResource {
         station_id,
-        source: MaterializeError::MissingRuntimeResource,
+        source: OperationSetupError::MissingRuntimeResource,
     }) = factory(&missing_path).build()
     else {
         panic!("missing PostgreSQL sink resource was accepted");
@@ -58,7 +58,7 @@ fn postgres_sink_resource_errors_are_station_scoped_and_precede_store_creation()
     wrong.resource(SINK, 42_u64).unwrap();
     let Err(FlowError::RuntimeResource {
         station_id,
-        source: MaterializeError::WrongRuntimeResource,
+        source: OperationSetupError::WrongRuntimeResource,
     }) = wrong.build()
     else {
         panic!("wrong PostgreSQL sink resource type was accepted");
@@ -112,7 +112,7 @@ fn postgres_sink_build_and_reopen_are_offline_and_use_stable_buffered_state() {
         FlowFactory::new(&path).open(),
         Err(FlowError::RuntimeResource {
             station_id,
-            source: MaterializeError::MissingRuntimeResource,
+            source: OperationSetupError::MissingRuntimeResource,
         }) if station_id == SINK
     ));
 

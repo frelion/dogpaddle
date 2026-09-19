@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 
-use crate::MaterializeError;
+use crate::OperationSetupError;
 
 /// One optional, owned runtime resource for an Operation.
 ///
@@ -23,21 +23,21 @@ impl RuntimeResource {
         Self(None)
     }
 
-    pub(crate) fn validate(&self, expected: Option<TypeId>) -> Result<(), MaterializeError> {
+    pub(crate) fn validate(&self, expected: Option<TypeId>) -> Result<(), OperationSetupError> {
         match (expected, self.0.as_deref()) {
             (None, None) => Ok(()),
             (Some(expected), Some(value)) if expected == value.type_id() => Ok(()),
-            (Some(_), None) => Err(MaterializeError::MissingRuntimeResource),
-            (Some(_), Some(_)) => Err(MaterializeError::WrongRuntimeResource),
-            (None, Some(_)) => Err(MaterializeError::UnexpectedRuntimeResource),
+            (Some(_), None) => Err(OperationSetupError::MissingRuntimeResource),
+            (Some(_), Some(_)) => Err(OperationSetupError::WrongRuntimeResource),
+            (None, Some(_)) => Err(OperationSetupError::UnexpectedRuntimeResource),
         }
     }
 
-    pub(crate) fn take<T: Send + 'static>(self) -> Result<T, MaterializeError> {
+    pub(crate) fn take<T: Send + 'static>(self) -> Result<T, OperationSetupError> {
         self.0
-            .ok_or(MaterializeError::MissingRuntimeResource)?
+            .ok_or(OperationSetupError::MissingRuntimeResource)?
             .downcast::<T>()
             .map(|value| *value)
-            .map_err(|_| MaterializeError::WrongRuntimeResource)
+            .map_err(|_| OperationSetupError::WrongRuntimeResource)
     }
 }

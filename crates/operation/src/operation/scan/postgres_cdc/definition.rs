@@ -1,30 +1,27 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_store::{Cell, Queue};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
-    definition::{DataName, Sealed},
+    definition::{BoundBody, Sealed},
 };
 
-use super::{
-    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, PostgresColumn, schema,
-};
+use super::{PostgresCdcScanError, PostgresColumn, schema};
 
 pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
-const PHASE: DataName<Cell<u32>> = DataName::new("postgres_cdc_scan.phase");
-const CHECKPOINT: DataName<Cell<Vec<u8>>> = DataName::new("postgres_cdc_scan.checkpoint");
-const BOOTSTRAP_SPOOL: DataName<Queue<Vec<u8>>> =
-    DataName::new("postgres_cdc_scan.bootstrap_spool");
-static DATA: [DataDeclaration; 3] = [
-    PHASE.declaration(),
-    CHECKPOINT.declaration(),
-    BOOTSTRAP_SPOOL.declaration(),
-];
+pub(super) const PHASE: &str = "postgres_cdc_scan.phase";
+pub(super) const CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
+pub(super) const BOOTSTRAP_SPOOL: &str = "postgres_cdc_scan.bootstrap_spool";
+
+pub(crate) struct BoundPostgresCdc {
+    pub(super) spec: PostgresCdcScanSpec,
+    pub(super) output: SchemaRef,
+    pub(super) bootstrap_spool_bytes: NonZeroU64,
+}
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
@@ -61,7 +58,7 @@ pub struct PostgresCdcScanSpec {
 /// continuous WAL CDC.
 ///
 /// Credentials and runtime bundle paths are supplied separately through
-/// [`PostgresCdcScanConfig`]. Construction, binding, build, and open perform no
+/// [`super::PostgresCdcScanConfig`]. Construction, binding, build, and open perform no
 /// `PostgreSQL` or JVM I/O. Online Schema evolution is not supported. The
 /// initial snapshot remains private until it is complete, then drains through
 /// the ordinary Flow output before WAL streaming resumes from the snapshot's
@@ -75,7 +72,7 @@ pub struct PostgresCdcScanDefinition {
 impl PostgresCdcScanDefinition {
     /// Freezes a non-sensitive Scan specification as a persistent definition.
     ///
-    /// Obtain the specification with [`PostgresCdcScanConfig::discover`] before
+    /// Obtain the specification with [`super::PostgresCdcScanConfig::discover`] before
     /// constructing a Flow. Runtime checks also protect manually supplied specs.
     ///
     /// `bootstrap_spool_bytes` is the maximum logical bytes retained by the
@@ -120,31 +117,20 @@ impl Sealed for PostgresCdcScanDefinition {
         let output = schema::compile(&self.spec.columns)?;
         let spec = self.spec.clone();
         let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
-        Ok(OperationBinding::turn_with_resource::<
-            PostgresCdcScanConfig,
-            _,
-            _,
-        >(Some(Arc::clone(&output)), move |data, config| {
-            Ok(PostgresCdcScanOperation::new_bound(
+        Ok(OperationBinding::bound(
+            Some(Arc::clone(&output)),
+            BoundBody::PostgresCdc(Box::new(BoundPostgresCdc {
                 spec,
                 output,
-                data.take(&PHASE)?,
-                data.take(&CHECKPOINT)?,
-                data.take(&BOOTSTRAP_SPOOL)?,
-                config,
                 bootstrap_spool_bytes,
-            ))
-        }))
+            })),
+        ))
     }
 }
 
 impl OperationDefinition for PostgresCdcScanDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Scan
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        &DATA
     }
 
     fn persistence_tag(&self) -> u16 {

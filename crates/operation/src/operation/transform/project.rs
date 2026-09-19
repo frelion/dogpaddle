@@ -6,14 +6,13 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
     definition::Sealed as SealedDefinition,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 4;
-const DATA: &[DataDeclaration] = &[];
 
 /// Pure definition of an order-preserving top-level field projection.
 ///
@@ -108,20 +107,13 @@ impl SealedDefinition for ProjectDefinition {
         let (output_schema, operation) = self
             .bind_operation(input_schema)
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::without_data_atomic(
-            output_schema,
-            operation,
-        ))
+        Ok(OperationBinding::atomic_ready(output_schema, operation))
     }
 }
 
 impl OperationDefinition for ProjectDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

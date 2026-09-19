@@ -3,29 +3,29 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::SchemaRef;
 
 use super::{
-    config::{PostgresSinkConfig, PostgresTargetSpec},
+    config::PostgresTargetSpec,
     error::{PostgresSinkError, invalid_spec},
     schema::PostgresLayout,
-    target::PostgresTarget,
 };
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::Sealed,
-    operation::sink::{
-        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
-        relation::RelationSinkTarget,
-    },
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed},
 };
 
 pub(crate) const TAG: u16 = 12;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 
+pub(crate) struct BoundPostgresSink {
+    pub(super) target: PostgresTargetSpec,
+    pub(super) input_schema: SchemaRef,
+}
+
 /// Pure definition of a sink that materializes its input relation in `PostgreSQL`.
 ///
 /// The definition persists only the non-sensitive target identity discovered
 /// before Flow construction. Credentials and endpoint configuration are
-/// supplied separately through [`PostgresSinkConfig`] whenever the Flow is
+/// supplied separately through [`super::PostgresSinkConfig`] whenever the Flow is
 /// built or reopened. Construction and Schema binding perform no network I/O.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostgresSinkDefinition {
@@ -69,23 +69,12 @@ impl Sealed for PostgresSinkDefinition {
 
         let target = self.target.clone();
         let input_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::turn_with_resource::<
-            PostgresSinkConfig,
-            _,
-            _,
-        >(
+        Ok(OperationBinding::bound(
             None,
-            move |data: &mut DataInstances, config| -> Result<_, MaterializeError> {
-                let control = data.take(&CONTROL)?;
-                let buffer = data.take(&BUFFER)?;
-                let target = PostgresTarget::new_bound(config, target, Arc::clone(&input_schema));
-                Ok(BufferedSink::new(
-                    input_schema,
-                    RelationSinkTarget::new(target),
-                    control,
-                    buffer,
-                ))
-            },
+            BoundBody::PostgresSink(Box::new(BoundPostgresSink {
+                target,
+                input_schema,
+            })),
         ))
     }
 }
@@ -93,10 +82,6 @@ impl Sealed for PostgresSinkDefinition {
 impl OperationDefinition for PostgresSinkDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

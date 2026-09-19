@@ -1,5 +1,5 @@
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, decode_definition,
+    OperationBindError, OperationKind, RuntimeResource, decode_definition, open_operation,
     operation::{
         Action, Operation, OperationInput,
         scan::{SequenceScanDefinition, SequenceScanError, SequenceScanOperation},
@@ -8,8 +8,8 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, Store, StoreError};
 
 use super::support::{
-    ExpectedAction, TestStore, assert_literal_definition, bind, change, commit_ready, data_names,
-    decode_hex, materialize, output_values, rollback_ready, value_schema,
+    ExpectedAction, TestStore, assert_literal_definition, bind, change, commit_ready, decode_hex,
+    output_values, rollback_ready, setup_operation, value_schema,
 };
 
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_scan_start_42.hex");
@@ -19,16 +19,13 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
     let definition = SequenceScanDefinition::new(42);
     let decoded = assert_literal_definition(&definition, SEQUENCE_V1, 1, OperationKind::Scan);
     assert_eq!(definition.start(), 42);
-    assert_eq!(data_names(&definition), ["sequence_scan.position"]);
     assert_eq!(
         bind(decoded.as_ref(), &[]).unwrap().output_schema(),
         Some(&value_schema())
     );
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    decoded.data()[0].create(&mut store, "position").unwrap();
-    let mut operation = materialize(decoded.as_ref(), &[], &store, &["position"]);
-    let mut transactions = store.into_transactions();
+    let (mut operation, mut transactions) =
+        setup_operation(decoded.as_ref(), &[], &root, "operation");
     assert_eq!(
         output_values(
             commit_ready(&mut operation, None, &mut transactions).unwrap(),
@@ -41,7 +38,9 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(SEQUENCE_V1)).unwrap();
-    let mut operation = materialize(decoded.as_ref(), &[], &store, &["position"]);
+    let binding = bind(decoded.as_ref(), &[]).unwrap();
+    let mut operation =
+        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(
@@ -64,13 +63,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
 fn rollback_commit_reopen_and_terminal_position_are_exact() {
     let root = TestStore::new();
     let definition = SequenceScanDefinition::new(u64::MAX - 1);
-    let mut store = Store::create(root.path()).unwrap();
-    definition.data()[0].create(&mut store, "position").unwrap();
-    drop(store);
-
-    let store = Store::open(root.path()).unwrap();
-    let mut operation = materialize(&definition, &[], &store, &["position"]);
-    let mut transactions = store.into_transactions();
+    let (mut operation, mut transactions) = setup_operation(&definition, &[], &root, "operation");
     assert_eq!(
         output_values(
             rollback_ready(&mut operation, None, &mut transactions).unwrap(),
@@ -90,8 +83,12 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let position = store.open_data::<Cell<u64>>("position").unwrap();
-    let mut operation = materialize(&definition, &[], &store, &["position"]);
+    let position = store
+        .open_data::<Cell<u64>>("operation/sequence_scan.position")
+        .unwrap();
+    let binding = bind(&definition, &[]).unwrap();
+    let mut operation =
+        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
     let mut transactions = store.into_transactions();
     assert_eq!(
         output_values(

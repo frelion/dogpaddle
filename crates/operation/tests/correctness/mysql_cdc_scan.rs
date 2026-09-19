@@ -1,8 +1,8 @@
 use std::{num::NonZeroU32, path::Path, time::Duration};
 
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationDefinition, OperationKind, RuntimeResource,
-    decode_definition, encode_definition,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, create_operation,
+    decode_definition, encode_definition, open_operation,
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{MySqlCdcScanConfig, MySqlCdcScanOptions},
@@ -57,18 +57,6 @@ fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     assert_eq!(decoded.kind(), OperationKind::Scan);
     assert_eq!(decoded.persistence_tag(), 15);
     assert_eq!(encode_definition(decoded.as_ref()), bytes);
-    assert_eq!(
-        decoded
-            .data()
-            .iter()
-            .map(dogpaddle_operation::DataDeclaration::name)
-            .collect::<Vec<_>>(),
-        [
-            "mysql_cdc_scan.phase",
-            "mysql_cdc_scan.checkpoint",
-            "mysql_cdc_scan.bootstrap_spool",
-        ]
-    );
     let binding = decoded.bind(&[]).unwrap();
     let output = binding.output_schema().unwrap();
     assert_eq!(output.fields().len(), 1);
@@ -87,12 +75,22 @@ fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
 #[test]
 fn mysql_cdc_bootstrap_spool_is_a_queue() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let path = root.path().join("state");
     let definition = definition();
-    let spool = &definition.data()[2];
-    spool.create(&mut store, spool.name()).unwrap();
-    store
-        .open_data::<Queue<Vec<u8>>>("mysql_cdc_scan.bootstrap_spool")
+    let binding = definition.bind(&[]).unwrap();
+    let mut setup = Store::setup(&path).unwrap();
+    let operation = create_operation(
+        binding,
+        &mut setup,
+        "operation",
+        RuntimeResource::new(config()),
+    )
+    .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop((operation, transactions));
+    Store::open(path)
+        .unwrap()
+        .open_data::<Queue<Vec<u8>>>("operation/mysql_cdc_scan.bootstrap_spool")
         .unwrap();
 }
 
@@ -102,11 +100,11 @@ fn mysql_cdc_materialization_requires_one_exact_runtime_resource() {
     let binding = definition.bind(&[]).unwrap();
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::none()),
-        Err(MaterializeError::MissingRuntimeResource)
+        Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
         binding.validate_resource(&RuntimeResource::new(42_u64)),
-        Err(MaterializeError::WrongRuntimeResource)
+        Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
         binding
@@ -124,29 +122,31 @@ struct Fixture {
 
 impl Fixture {
     fn create(path: &Path) -> Self {
-        let mut store = Store::create(path).unwrap();
         let definition = definition();
-        for declaration in definition.data() {
-            declaration.create(&mut store, declaration.name()).unwrap();
-        }
-        Self::open(store)
+        let binding = definition.bind(&[]).unwrap();
+        let mut setup = Store::setup(path).unwrap();
+        let operation = create_operation(
+            binding,
+            &mut setup,
+            "operation",
+            RuntimeResource::new(config()),
+        )
+        .unwrap();
+        let transactions = setup.commit(|_| Ok(())).unwrap();
+        drop((operation, transactions));
+        Self::open(Store::open(path).unwrap())
     }
 
     fn open(store: Store) -> Self {
         let definition = decode_definition(&literal_definition_bytes()).unwrap();
-        let mut data = DataInstances::new();
-        for declaration in definition.data() {
-            data.insert(declaration.open(&store, declaration.name()).unwrap())
-                .unwrap();
-        }
+        let binding = definition.bind(&[]).unwrap();
         Self {
-            scan: definition
-                .bind(&[])
-                .unwrap()
-                .materialize(data, RuntimeResource::new(config()))
+            scan: open_operation(binding, &store, "operation", RuntimeResource::new(config()))
                 .unwrap(),
-            phase: store.open_data("mysql_cdc_scan.phase").unwrap(),
-            checkpoint: store.open_data("mysql_cdc_scan.checkpoint").unwrap(),
+            phase: store.open_data("operation/mysql_cdc_scan.phase").unwrap(),
+            checkpoint: store
+                .open_data("operation/mysql_cdc_scan.checkpoint")
+                .unwrap(),
             transactions: store.into_transactions(),
         }
     }

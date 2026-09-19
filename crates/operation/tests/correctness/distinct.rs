@@ -6,18 +6,18 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, MaterializeError, OperationDefinition, OperationKind, RuntimeResource,
-    decode_definition,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
+    open_operation,
     operation::{
         Action, Operation,
         transform::{DistinctDefinition, DistinctError},
     },
 };
-use dogpaddle_store::{OrderedMultiset, Store, Transactions};
+use dogpaddle_store::{Cell, OrderedMultiset, Store, StoreError, Transactions};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, data_names, decode_hex, materialize,
-    rollback_ready, turn_input,
+    TestStore, assert_literal_definition, bind, commit_ready, decode_hex, rollback_ready,
+    setup_operation, turn_input,
 };
 
 const DISTINCT_V1: &str = include_str!("../fixtures/v1/distinct_definition.hex");
@@ -62,16 +62,38 @@ fn append_action(action: Action, rows: &mut Vec<(u64, i64)>) {
 }
 
 fn create_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation, Transactions) {
-    let definition = DistinctDefinition::new();
-    let mut store = Store::create(root.path()).unwrap();
-    definition.data()[0].create(&mut store, "weights").unwrap();
-    let operation = materialize(
-        &definition,
+    setup_operation(
+        &DistinctDefinition::new(),
         std::slice::from_ref(input_schema),
+        root,
+        "operation",
+    )
+}
+
+#[test]
+fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
+    let root = TestStore::new();
+    let mut setup = Store::setup(root.path()).unwrap();
+    setup
+        .create_data::<Cell<u64>>("operation/distinct.weights")
+        .unwrap();
+    let transactions = setup.commit(|_| Ok(())).unwrap();
+    drop(transactions);
+
+    let store = Store::open(root.path()).unwrap();
+    let result = open_operation(
+        bind(&DistinctDefinition::new(), &[schema()]).unwrap(),
         &store,
-        &["weights"],
+        "operation",
+        RuntimeResource::none(),
     );
-    (operation, store.into_transactions())
+    assert!(matches!(
+        result,
+        Err(OperationSetupError::Store {
+            name,
+            source: StoreError::DataKindMismatch { name: source_name, .. },
+        }) if name == "operation/distinct.weights" && source_name == name
+    ));
 }
 
 #[test]
@@ -83,7 +105,6 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
         13,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
-    assert_eq!(data_names(&definition), ["distinct.weights"]);
     let input = schema();
     assert_eq!(
         bind(decoded.as_ref(), std::slice::from_ref(&input))
@@ -92,14 +113,18 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
         Some(&input)
     );
 
-    let result = bind(&definition, &[schema()])
-        .unwrap()
-        .materialize(DataInstances::new(), RuntimeResource::none());
+    let empty = TestStore::new();
+    let store = Store::create(empty.path()).unwrap();
+    let result = open_operation(
+        bind(&definition, &[schema()]).unwrap(),
+        &store,
+        "operation",
+        RuntimeResource::none(),
+    );
     assert!(matches!(
         result,
-        Err(MaterializeError::MissingData {
-            name: "distinct.weights"
-        })
+        Err(OperationSetupError::Store { name, .. })
+            if name == "operation/distinct.weights"
     ));
 }
 
@@ -206,11 +231,9 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
 #[test]
 fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
     let definition = DistinctDefinition::new();
-    definition.data()[0].create(&mut store, "weights").unwrap();
-    let mut operation = materialize(&definition, &[schema()], &store, &["weights"]);
-    let mut transactions = store.into_transactions();
+    let (mut operation, mut transactions) =
+        setup_operation(&definition, &[schema()], &root, "operation");
     let first = change(&[7, 8], &[2, 1]);
     let mut output = Vec::new();
     append_action(
@@ -222,7 +245,9 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decoded_definition();
-    let mut operation = materialize(decoded.as_ref(), &[schema()], &store, &["weights"]);
+    let binding = bind(decoded.as_ref(), &[schema()]).unwrap();
+    let mut operation =
+        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
     let mut transactions = store.into_transactions();
     let second = change(&[7, 8, 7], &[-1, -1, -1]);
     let mut output = Vec::new();
@@ -264,7 +289,7 @@ fn long_canonical_rows_are_supported_as_exact_store_keys() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let weights: OrderedMultiset<Vec<u8>> = store.open_data("weights").unwrap();
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("operation/distinct.weights").unwrap();
     let transaction = store.read_transaction();
     let weights = weights.read(transaction.access()).unwrap();
     let mut canonical_row = Vec::with_capacity(1 + size_of::<u64>() + long.len());
@@ -347,7 +372,7 @@ fn zero_weight_removes_the_exact_row_key() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let weights: OrderedMultiset<Vec<u8>> = store.open_data("weights").unwrap();
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("operation/distinct.weights").unwrap();
     let transaction = store.read_transaction();
     let weights = weights.read(transaction.access()).unwrap();
     let mut canonical_row = vec![1];

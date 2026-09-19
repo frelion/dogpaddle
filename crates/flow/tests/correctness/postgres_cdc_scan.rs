@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
-    MaterializeError,
+    OperationSetupError,
     operation::{
         scan::{
             PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn,
@@ -55,7 +55,7 @@ fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creati
     let path = root.path().join("flow");
     let Err(FlowError::RuntimeResource {
         station_id,
-        source: MaterializeError::MissingRuntimeResource,
+        source: OperationSetupError::MissingRuntimeResource,
     }) = factory(&path, "id").build()
     else {
         panic!("missing resource")
@@ -67,7 +67,7 @@ fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creati
     assert!(matches!(
         wrong.build(),
         Err(FlowError::RuntimeResource {
-            source: MaterializeError::WrongRuntimeResource,
+            source: OperationSetupError::WrongRuntimeResource,
             ..
         })
     ));
@@ -115,7 +115,7 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     assert!(matches!(
         FlowFactory::new(&path).open(),
         Err(FlowError::RuntimeResource {
-            source: MaterializeError::MissingRuntimeResource,
+            source: OperationSetupError::MissingRuntimeResource,
             ..
         })
     ));
@@ -193,7 +193,7 @@ fn open_rejects_new_topology_and_self_contained_operations_reject_resources() {
     assert!(matches!(
         build.build(),
         Err(FlowError::RuntimeResource {
-            source: MaterializeError::UnexpectedRuntimeResource,
+            source: OperationSetupError::UnexpectedRuntimeResource,
             ..
         })
     ));

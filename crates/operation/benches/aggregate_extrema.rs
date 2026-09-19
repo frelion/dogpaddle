@@ -11,7 +11,7 @@ use criterion::{Criterion, Throughput};
 use datafusion_expr::col;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, RuntimeResource,
+    OperationDefinition, RuntimeResource, create_operation,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{AggregateCall, AggregateDefinition},
@@ -38,14 +38,22 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(root: &RunRoot, schema: &SchemaRef, pairs: usize) -> Self {
+    fn new(root: &RunRoot, schema: &SchemaRef, pairs: usize, distinct_layouts: bool) -> Self {
         let sample = root.sample(BENCHMARK);
         let definition = AggregateDefinition::try_new(
             [("group", col("group"))],
             (0..pairs).flat_map(|index| {
+                let expression = if distinct_layouts {
+                    col(format!("value_{index}"))
+                } else {
+                    col("value")
+                };
                 [
-                    (format!("min_{index}"), AggregateCall::min(col("value"))),
-                    (format!("max_{index}"), AggregateCall::max(col("value"))),
+                    (
+                        format!("min_{index}"),
+                        AggregateCall::min(expression.clone()),
+                    ),
+                    (format!("max_{index}"), AggregateCall::max(expression)),
                 ]
             }),
         )
@@ -53,24 +61,13 @@ impl Fixture {
         let binding = (&definition as &dyn OperationDefinition)
             .bind(&[Arc::clone(schema)])
             .expect("bind aggregate");
-        let mut store = Store::create(sample.path().join("store")).expect("create store");
-        let mut data = DataInstances::new();
-        for declaration in definition.data() {
-            declaration
-                .create(&mut store, declaration.name())
-                .expect("create aggregate resource");
-            data.insert(
-                declaration
-                    .open(&store, declaration.name())
-                    .expect("open aggregate resource"),
-            )
-            .expect("insert aggregate resource");
-        }
+        let mut setup = Store::setup(sample.path().join("store")).expect("create store setup");
+        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
+            .expect("create aggregate");
+        let transactions = setup.commit(|_| Ok(())).expect("commit store setup");
         Self {
-            operation: binding
-                .materialize(data, RuntimeResource::none())
-                .expect("materialize aggregate"),
-            transactions: store.into_transactions(),
+            operation,
+            transactions,
             _root: sample,
         }
     }
@@ -93,19 +90,27 @@ impl Fixture {
     }
 }
 
-fn change(schema: &SchemaRef, values: Vec<i64>, diffs: Vec<i64>) -> Change {
-    let records = RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1; values.len()])),
-            Arc::new(Int64Array::from(values)),
-        ],
-    )
-    .expect("build input records");
+fn change(schema: &SchemaRef, values: &[i64], diffs: Vec<i64>) -> Change {
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> =
+        vec![Arc::new(Int64Array::from(vec![1; values.len()]))];
+    columns.extend((1..schema.fields().len()).map(|index| {
+        Arc::new(Int64Array::from(
+            values
+                .iter()
+                .map(|value| value + i64::try_from(index - 1).expect("layout index fits i64"))
+                .collect::<Vec<_>>(),
+        )) as Arc<dyn arrow_array::Array>
+    }));
+    let records = RecordBatch::try_new(Arc::clone(schema), columns).expect("build input records");
     Change::try_new(records, Int64Array::from(diffs)).expect("build input Change")
 }
 
-fn validate(action: &Action, expected: Option<([i64; 2], [i64; 2])>, pairs: usize) {
+fn validate(
+    action: &Action,
+    expected: Option<([i64; 2], [i64; 2])>,
+    pairs: usize,
+    distinct_layouts: bool,
+) {
     let Action::Complete(output) = action else {
         panic!("aggregate must complete input")
     };
@@ -129,8 +134,19 @@ fn validate(action: &Action, expected: Option<([i64; 2], [i64; 2])>, pairs: usiz
     assert_eq!(column(0).values(), &[1, 1]);
     assert_eq!(output.records().num_columns(), 1 + 2 * pairs);
     for pair in 0..pairs {
-        assert_eq!(column(1 + 2 * pair).values(), &minima);
-        assert_eq!(column(2 + 2 * pair).values(), &maxima);
+        let offset = if distinct_layouts {
+            i64::try_from(pair).expect("pair index fits i64")
+        } else {
+            0
+        };
+        assert_eq!(
+            column(1 + 2 * pair).values(),
+            &[minima[0] + offset, minima[1] + offset]
+        );
+        assert_eq!(
+            column(2 + 2 * pair).values(),
+            &[maxima[0] + offset, maxima[1] + offset]
+        );
     }
 }
 
@@ -163,6 +179,10 @@ fn last_row_extrema(action: &Action, pairs: usize) -> (Vec<i64>, Vec<i64>) {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the benchmark keeps its workload registry and timed boundaries together"
+)]
 fn main() {
     let profile = PerformanceProfile::for_benchmark();
     if std::env::args_os().any(|argument| argument == "--bench") {
@@ -182,6 +202,7 @@ fn main() {
                 PerformanceProfile::Reference => 5_000,
             },
             "non_extreme_weight": 1_000_000, "repeated_extrema_pairs": 8,
+            "distinct_extrema_layouts": 8,
             "bulk_rows_per_turn": BULK_ROWS,
             "timed_boundary": "two turns, apply, synchronous commit, AfterCommit",
             "untimed": "fixture, seed, warmup, output validation, teardown"
@@ -201,28 +222,56 @@ fn main() {
         })
         .output_directory(&root.path().join("criterion"))
         .configure_from_args();
-    let schema = Arc::new(Schema::new(vec![
+    let historical_schema = Arc::new(Schema::new(vec![
         Field::new("group", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
     ]));
-    let seed = change(&schema, vec![0, 50, 100], vec![1, 1, 1]);
+    let distinct_schema = Arc::new(Schema::new(
+        std::iter::once(Field::new("group", DataType::Int64, false))
+            .chain((0..8).map(|index| Field::new(format!("value_{index}"), DataType::Int64, false)))
+            .collect::<Vec<_>>(),
+    ));
     let mut group = criterion.benchmark_group(BENCHMARK);
     group.throughput(Throughput::Elements(2));
-    for (name, pairs, value, difference, transition) in [
-        ("same_group_high_multiplicity", 1, 50, 1_000_000, false),
-        ("extrema_retraction", 1, 0, -1, true),
-        ("repeated_min_max", 8, 0, -1, true),
+    for (name, pairs, distinct_layouts, value, difference, transition) in [
+        (
+            "same_group_high_multiplicity",
+            1,
+            false,
+            50,
+            1_000_000,
+            false,
+        ),
+        ("extrema_retraction", 1, false, 0, -1, true),
+        ("repeated_min_max", 8, false, 0, -1, true),
+        ("distinct_layout_min_max", 8, true, 0, -1, true),
     ] {
-        let mut fixture = Fixture::new(&root, &schema, pairs);
+        let schema = if distinct_layouts {
+            &distinct_schema
+        } else {
+            &historical_schema
+        };
+        let mut fixture = Fixture::new(&root, schema, pairs, distinct_layouts);
+        let seed = change(schema, &[0, 50, 100], vec![1, 1, 1]);
         let seed_action = fixture.apply(&seed);
         assert!(matches!(seed_action, Action::Complete(Some(_))));
-        let first = change(&schema, vec![value], vec![difference]);
-        let second = change(&schema, vec![value], vec![-difference]);
+        let first = change(schema, &[value], vec![difference]);
+        let second = change(schema, &[value], vec![-difference]);
         let first_expected = transition.then_some(([0, 50], [100, 100]));
         let second_expected = transition.then_some(([50, 0], [100, 100]));
         // One explicit untimed round verifies the seed and returns to its state.
-        validate(&fixture.apply(&first), first_expected, pairs);
-        validate(&fixture.apply(&second), second_expected, pairs);
+        validate(
+            &fixture.apply(&first),
+            first_expected,
+            pairs,
+            distinct_layouts,
+        );
+        validate(
+            &fixture.apply(&second),
+            second_expected,
+            pairs,
+            distinct_layouts,
+        );
         group.bench_function(name, |bencher| {
             bencher.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
@@ -231,15 +280,16 @@ fn main() {
                     let first_action = fixture.apply(&first);
                     let second_action = fixture.apply(&second);
                     elapsed += started.elapsed();
-                    validate(&first_action, first_expected, pairs);
-                    validate(&second_action, second_expected, pairs);
+                    validate(&first_action, first_expected, pairs, distinct_layouts);
+                    validate(&second_action, second_expected, pairs, distinct_layouts);
                 }
                 elapsed
             });
         });
     }
     group.finish();
-    bench_bulk_rows(&mut criterion, &root, &schema, &seed);
+    let seed = change(&historical_schema, &[0, 50, 100], vec![1, 1, 1]);
+    bench_bulk_rows(&mut criterion, &root, &historical_schema, &seed);
     criterion.final_summary();
 }
 
@@ -248,9 +298,9 @@ fn main() {
 fn bench_bulk_rows(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef, seed: &Change) {
     let rows = i64::try_from(BULK_ROWS).expect("bulk rows fit i64");
     let bulk_values: Vec<i64> = (0..rows).collect();
-    let bulk = change(schema, bulk_values.clone(), vec![1; BULK_ROWS]);
-    let bulk_undo = change(schema, bulk_values, vec![-1; BULK_ROWS]);
-    let mut fixture = Fixture::new(root, schema, 1);
+    let bulk = change(schema, &bulk_values, vec![1; BULK_ROWS]);
+    let bulk_undo = change(schema, &bulk_values, vec![-1; BULK_ROWS]);
+    let mut fixture = Fixture::new(root, schema, 1, false);
     assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
     // Untimed rounds verify the closing state and return the group to the seed.
     assert_eq!(

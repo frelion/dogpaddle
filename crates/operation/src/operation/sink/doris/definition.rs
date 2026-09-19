@@ -3,23 +3,23 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::SchemaRef;
 
 use super::{
-    config::{DorisSinkConfig, DorisTargetSpec},
+    config::DorisTargetSpec,
     error::{DorisSinkError, invalid_spec},
     schema::DorisLayout,
-    target::DorisTarget,
 };
 use crate::{
-    DataDeclaration, DataInstances, DefinitionCodecError, MaterializeError, OperationBinding,
-    OperationDefinition, OperationKind, OperationSchemaError,
-    definition::Sealed,
-    operation::sink::{
-        buffered::{BUFFER, BufferedSink, CONTROL, DATA},
-        relation::RelationSinkTarget,
-    },
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    OperationSchemaError,
+    definition::{BoundBody, Sealed},
 };
 
 pub(crate) const TAG: u16 = 18;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct BoundDorisSink {
+    pub(super) target: DorisTargetSpec,
+    pub(super) input_schema: SchemaRef,
+}
 
 /// Pure definition of a sink-owned Apache Doris relation target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,32 +62,19 @@ impl Sealed for DorisSinkDefinition {
             .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
         let target = self.target.clone();
         let input_schema = Arc::clone(input_schema);
-        Ok(
-            OperationBinding::turn_with_resource::<DorisSinkConfig, _, _>(
-                None,
-                move |data: &mut DataInstances, config| -> Result<_, MaterializeError> {
-                    let control = data.take(&CONTROL)?;
-                    let buffer = data.take(&BUFFER)?;
-                    let target = DorisTarget::new_bound(config, target, Arc::clone(&input_schema));
-                    Ok(BufferedSink::new(
-                        input_schema,
-                        RelationSinkTarget::new(target),
-                        control,
-                        buffer,
-                    ))
-                },
-            ),
-        )
+        Ok(OperationBinding::bound(
+            None,
+            BoundBody::DorisSink(Box::new(BoundDorisSink {
+                target,
+                input_schema,
+            })),
+        ))
     }
 }
 
 impl OperationDefinition for DorisSinkDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

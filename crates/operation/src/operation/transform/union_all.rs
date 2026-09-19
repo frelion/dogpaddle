@@ -5,7 +5,7 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DataDeclaration, DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
+    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
     OperationSchemaError,
     codec::PayloadCursor,
     definition::Sealed as SealedDefinition,
@@ -13,7 +13,6 @@ use crate::{
 };
 
 pub(crate) const TAG: u16 = 8;
-const DATA: &[DataDeclaration] = &[];
 
 /// Pure definition of an order-preserving `UNION ALL` operation.
 ///
@@ -112,7 +111,7 @@ impl SealedDefinition for UnionAllDefinition {
         let input_count = usize::try_from(self.input_count.get())
             .expect("a UnionAll u32 input count fits supported Arrow targets");
         let input_schema = Arc::clone(output_schema);
-        Ok(OperationBinding::without_data_atomic(
+        Ok(OperationBinding::atomic_ready(
             Arc::clone(output_schema),
             UnionAllOperation {
                 input_count,
@@ -125,10 +124,6 @@ impl SealedDefinition for UnionAllDefinition {
 impl OperationDefinition for UnionAllDefinition {
     fn kind(&self) -> OperationKind {
         OperationKind::AtomicTransform(self.input_count)
-    }
-
-    fn data(&self) -> &'static [DataDeclaration] {
-        DATA
     }
 
     fn persistence_tag(&self) -> u16 {

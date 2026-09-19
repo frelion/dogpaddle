@@ -1,16 +1,14 @@
-use dogpaddle_operation::{DataInstances, RuntimeResource};
+use dogpaddle_operation::{RuntimeResource, open_operation};
 use dogpaddle_store::{Cell, Store, StoreData, StoreError, SubscribedLog};
 
 use crate::{
     assembly::assemble_stations,
-    error::{FlowError, runtime_state_error},
+    error::{FlowError, operation_setup_error, runtime_state_error},
     flow::Flow,
     station::StationParts,
 };
 
-use super::{
-    FlowFactory, StationDefinition, bind_resources, codec, schema, validate_data_declarations,
-};
+use super::{FlowFactory, StationDefinition, bind_resources, codec, schema};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
@@ -44,7 +42,6 @@ impl FlowFactory {
             return Err(FlowError::OwnerIdentityMismatch);
         }
         let bindings = schema::bind_operations(&definition, &topology)?;
-        validate_data_declarations(&definition)?;
         let resources = bind_resources(&definition, &bindings, self.resources)?;
         let station_ids = definition
             .stations()
@@ -115,30 +112,21 @@ fn open_station_part(
         .transpose()?;
     let output_schema = binding.output_schema().cloned();
     let mut resource = Some(resource);
-    let operations = station
-        .operations()
-        .iter()
-        .zip(binding.into_operations())
-        .enumerate()
-        .map(|(operation, (definition, binding))| {
-            let mut data = DataInstances::new();
-            for declaration in definition.data() {
-                let physical_name =
-                    codec::station_operation_data_name(index, operation, declaration.name());
-                let instance =
-                    require_resource(&physical_name, declaration.open(store, &physical_name))?;
-                data.insert(instance)?;
-            }
-            let resource = if operation == 0 {
-                resource
-                    .take()
-                    .expect("the first Operation uniquely owns the Station resource")
-            } else {
-                RuntimeResource::default()
-            };
-            binding.materialize(data, resource).map_err(FlowError::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut operations = Vec::with_capacity(station.operations().len());
+    for (operation, binding) in binding.into_operations().into_iter().enumerate() {
+        let operation_resource = if operation == 0 {
+            resource
+                .take()
+                .expect("the first Operation uniquely owns the Station resource")
+        } else {
+            RuntimeResource::default()
+        };
+        let prefix = codec::station_operation_prefix(index, operation);
+        operations.push(
+            open_operation(binding, store, &prefix, operation_resource)
+                .map_err(|source| operation_setup_error(station.id(), operation, source))?,
+        );
+    }
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => {
             let name = codec::station_output_name(index);

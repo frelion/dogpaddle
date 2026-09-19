@@ -4,7 +4,7 @@ use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, col, lit,
+    OperationDefinition, RuntimeResource, col, create_operation, lit,
     operation::{
         Action, OperationInput,
         transform::{
@@ -15,7 +15,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::Store;
 
-use super::support::{TestStore, commit_ready, stateless_operation, turn_input};
+use super::support::{TestStore, bind, commit_ready, stateless_operation, turn_input};
 
 fn structural_trace(
     definition: &dyn OperationDefinition,
@@ -31,15 +31,12 @@ fn structural_trace(
     let input_schemas = (0..definition.kind().input_count())
         .map(|_| Arc::clone(&schema))
         .collect::<Vec<_>>();
-    let data = DataInstances::new();
-    let mut operation = definition
-        .bind(&input_schemas)
-        .unwrap()
-        .materialize(data, dogpaddle_operation::RuntimeResource::none())
-        .unwrap();
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let mut setup = Store::setup(fixture.path()).unwrap();
+    let binding = bind(definition, &input_schemas).unwrap();
+    let mut operation =
+        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
+    let mut transactions = setup.commit(|_| Ok(())).unwrap();
     let mut trace = Vec::new();
     let mut start = 0;
 

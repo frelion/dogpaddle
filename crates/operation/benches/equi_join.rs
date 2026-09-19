@@ -11,7 +11,7 @@ use criterion::{BenchmarkGroup, Criterion, Throughput, measurement::WallTime};
 use datafusion_expr::{Expr, col};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DataInstances, OperationDefinition, RuntimeResource,
+    OperationDefinition, RuntimeResource, create_operation,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{EquiJoinDefinition, EquiJoinKind},
@@ -57,24 +57,13 @@ impl Fixture {
         let binding = (&definition as &dyn OperationDefinition)
             .bind(&[Arc::clone(schema), Arc::clone(schema)])
             .expect("bind equi-join");
-        let mut store = Store::create(sample.path().join("store")).expect("create store");
-        let mut data = DataInstances::new();
-        for declaration in definition.data() {
-            declaration
-                .create(&mut store, declaration.name())
-                .expect("create equi-join resource");
-            data.insert(
-                declaration
-                    .open(&store, declaration.name())
-                    .expect("open equi-join resource"),
-            )
-            .expect("insert equi-join resource");
-        }
+        let mut setup = Store::setup(sample.path().join("store")).expect("create store setup");
+        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
+            .expect("create equi-join");
+        let transactions = setup.commit(|_| Ok(())).expect("commit store setup");
         Self {
-            operation: binding
-                .materialize(data, RuntimeResource::none())
-                .expect("materialize equi-join"),
-            transactions: store.into_transactions(),
+            operation,
+            transactions,
             _root: sample,
         }
     }

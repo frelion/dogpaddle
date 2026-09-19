@@ -1,14 +1,19 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{DataInstances, MaterializeError, OperationDefinition, RuntimeResource};
+use dogpaddle_operation::{OperationDefinition, RuntimeResource, create_operation};
 use dogpaddle_store::{Cell, Store, SubscribedLog};
 
-use crate::{assembly::assemble_stations, error::FlowError, flow::Flow, station::StationParts};
+use crate::{
+    assembly::assemble_stations,
+    error::{FlowError, operation_setup_error},
+    flow::Flow,
+    station::StationParts,
+};
 
 pub(crate) mod codec;
 mod definition;
@@ -199,7 +204,6 @@ impl FlowFactory {
         let definition_bytes = codec::encode(&declared_definition)?;
         let (definition, topology) = codec::decode(&definition_bytes)?;
         let bindings = schema::bind_operations(&definition, &topology)?;
-        validate_data_declarations(&definition)?;
         let resources = bind_resources(&definition, &bindings, resources)?;
         let station_ids = definition
             .stations()
@@ -276,21 +280,6 @@ fn bind_resources(
     Ok(bound)
 }
 
-fn validate_data_declarations(definition: &FlowDefinition) -> Result<(), MaterializeError> {
-    for station in definition.stations() {
-        for operation in station.operations() {
-            let mut names = BTreeSet::new();
-            for declaration in operation.data() {
-                let name = declaration.name();
-                if !names.insert(name) {
-                    return Err(MaterializeError::DuplicateData { name });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn create_station_part(
     setup: &mut dogpaddle_store::StoreSetup,
     index: usize,
@@ -303,28 +292,21 @@ fn create_station_part(
         .transpose()?;
     let output_schema = binding.output_schema().cloned();
     let mut resource = Some(resource);
-    let operations = station
-        .operations()
-        .iter()
-        .zip(binding.into_operations())
-        .enumerate()
-        .map(|(operation, (definition, binding))| {
-            let mut data = DataInstances::new();
-            for declaration in definition.data() {
-                let physical_name =
-                    codec::station_operation_data_name(index, operation, declaration.name());
-                data.insert(declaration.create_setup(setup, &physical_name)?)?;
-            }
-            let resource = if operation == 0 {
-                resource
-                    .take()
-                    .expect("the first Operation uniquely owns the Station resource")
-            } else {
-                RuntimeResource::default()
-            };
-            binding.materialize(data, resource).map_err(FlowError::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut operations = Vec::with_capacity(station.operations().len());
+    for (operation, binding) in binding.into_operations().into_iter().enumerate() {
+        let operation_resource = if operation == 0 {
+            resource
+                .take()
+                .expect("the first Operation uniquely owns the Station resource")
+        } else {
+            RuntimeResource::default()
+        };
+        let prefix = codec::station_operation_prefix(index, operation);
+        operations.push(
+            create_operation(binding, setup, &prefix, operation_resource)
+                .map_err(|source| operation_setup_error(station.id(), operation, source))?,
+        );
+    }
     let output = match (station.output_capacity_bytes(), output_schema) {
         (Some(capacity), Some(schema)) => setup
             .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
