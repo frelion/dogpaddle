@@ -93,11 +93,8 @@ pub(crate) fn operation_setup_error(
             station_id: station_id.to_owned(),
             source,
         },
-        OperationSetupError::Store {
-            name,
-            source: DataNotFound(_),
-        } => FlowError::MissingResource { name },
-        OperationSetupError::Store { source, .. } => FlowError::Store(source),
+        OperationSetupError::Store(DataNotFound(name)) => FlowError::MissingResource { name },
+        OperationSetupError::Store(source) => FlowError::Store(source),
         source => FlowError::OperationSetup {
             station_id: station_id.to_owned(),
             operation,

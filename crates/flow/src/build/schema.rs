@@ -107,7 +107,7 @@ pub(super) fn construct_stations(
             };
             let prefix = codec::station_operation_prefix(station_index, operation_index);
             let constructed = definition
-                .construct(inputs, data, &prefix, resource)
+                .construct(inputs, &mut data.scoped(&prefix), resource)
                 .map_err(|source| construction_error(station.id(), operation_index, source))?;
             let (operation, output_schema) = constructed.into_parts();
             operations.push(operation);

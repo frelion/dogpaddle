@@ -69,7 +69,6 @@ impl Sealed for PostgresSinkDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
@@ -83,7 +82,7 @@ impl Sealed for PostgresSinkDefinition {
             self.target.clone(),
             layout,
         ));
-        buffered::construct(input_schema, target, data, prefix)
+        buffered::construct(input_schema, target, data)
     }
 
     fn resource_type(&self) -> Option<TypeId> {

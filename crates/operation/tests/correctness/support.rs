@@ -172,8 +172,7 @@ pub fn stateless_operation(
     let constructed = <dyn OperationDefinition>::construct(
         definition,
         &[input_schema],
-        &mut setup.data_scope(),
-        "operation",
+        &mut setup.data_scope().scoped("operation"),
         RuntimeResource::none(),
     )
     .unwrap();

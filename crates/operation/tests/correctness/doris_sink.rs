@@ -82,8 +82,7 @@ fn doris_sink_declares_buffered_state_and_exact_runtime_resource() {
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(config("shop")),
         )
         .unwrap()
@@ -127,8 +126,7 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
     let (operation, output) = decoded
         .construct(
             &[schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(config("shop")),
         )
         .unwrap()
@@ -140,8 +138,7 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
     let (operation, output) = decoded
         .construct(
             &[schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::new(config("shop")),
         )
         .unwrap()

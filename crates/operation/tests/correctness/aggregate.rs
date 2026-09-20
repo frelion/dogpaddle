@@ -89,8 +89,7 @@ fn construct_aggregate_for_schema(
     let constructed = (definition as &dyn OperationDefinition)
         .construct(
             &[schema],
-            &mut setup.data_scope(),
-            AGGREGATE_PREFIX,
+            &mut setup.data_scope().scoped(AGGREGATE_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -111,8 +110,7 @@ fn reopen_aggregate_for_schema(
     let constructed = (definition as &dyn OperationDefinition)
         .construct(
             &[schema],
-            &mut store.data_scope(),
-            AGGREGATE_PREFIX,
+            &mut store.data_scope().scoped(AGGREGATE_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -300,8 +298,7 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
     let constructed = (&definition as &dyn OperationDefinition)
         .construct(
             &[input_schema()],
-            &mut setup.data_scope(),
-            AGGREGATE_PREFIX,
+            &mut setup.data_scope().scoped(AGGREGATE_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -313,16 +310,15 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
     let store = Store::open(fixture.path()).unwrap();
     let Err(error) = decoded.construct(
         &[input],
-        &mut store.data_scope(),
-        "operation/missing-aggregate",
+        &mut store.data_scope().scoped("operation/missing-aggregate"),
         RuntimeResource::none(),
     ) else {
         panic!("missing Aggregate state unexpectedly opened");
     };
     assert!(matches!(
         error,
-        OperationSetupError::Store { name, source: StoreError::DataNotFound(found) }
-            if name == "operation/missing-aggregate/aggregate.groups" && found == name
+        OperationSetupError::Store(StoreError::DataNotFound(name))
+            if name == "operation/missing-aggregate/aggregate.groups"
     ));
 }
 

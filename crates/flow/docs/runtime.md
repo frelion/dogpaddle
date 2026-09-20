@@ -42,6 +42,7 @@ Station 内中间 Operation 不创建 output log、Subscription 或 Station stat
 `open` 先读取持久化 Definition、精确比较 Factory 期望与磁盘中的 owner identity，再全图前置检查 runtime resource，并在同一个 Store ownership 生命周期中通过只查已有资源的 `DataScope` 直接构造全部 Operation、验证 durable Station state，最后消费 Store 取得事务能力；Some/None 也必须匹配，identity mismatch 不得进入 Schema 编译或运行构造。
 derived edge Schema 不单独持久化为 Cell、fingerprint 或 registry；Operation tag、payload、有序 input Schema 到最终构造语义及任何 Schema 相关状态 codec 都属于 reopen ABI。
 Flow 负责 Store draft/open 生命周期、Station 与 Operation ordinal 组成的稳定资源名前缀、全图 resource preflight 和最终 Station 装配，但不能枚举具体算子。
+Flow 在调用 construct 前通过 `DataScope::scoped` 限定每个 Operation 的资源作用域；Operation 只接收这个子 scope 并声明本地逻辑名，不接收或拼接完整前缀。build/open 使用相同前缀，持久资源名不变。
 只有首 Operation 可以消费按 Station ID 注入的 runtime resource，Atomic 尾项不能接收 runtime resource。
 固定的逻辑资源名和 codec 由具体算子代码与独立布局/golden/reopen 测试共同守护；公开 Store catalog 只验证 collection kind，不宣称运行时审计整个 catalog 或同 kind 的 codec 身份。
 runtime Operation 只保存执行参数、已取得的 collection handle 与可由 durable state 重建的临时运行资源，不得保存 Definition、DataScope 或 Store。

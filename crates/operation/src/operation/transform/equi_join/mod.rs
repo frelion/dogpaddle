@@ -16,31 +16,22 @@ pub use definition::EquiJoinDefinition;
 pub(crate) use definition::{EquiJoinLayout, TAG, decode_definition};
 pub(crate) use runtime::EquiJoinOperation;
 
-use crate::{OperationSetupError, definition::data, operation::Operation};
+use crate::{OperationSetupError, operation::Operation};
 
 fn construct(
     layout: EquiJoinLayout,
     scope: &mut DataScope<'_>,
-    prefix: &str,
 ) -> Result<Operation, OperationSetupError> {
-    let left_rows = data::<state::Rows>(scope, prefix, definition::LEFT_ROWS)?;
-    let right_rows = data::<state::Rows>(scope, prefix, definition::RIGHT_ROWS)?;
-    let continuation = data::<state::Continuation>(scope, prefix, definition::CONTINUATION)?;
+    let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
+    let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
+    let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
     let key_counts = if layout.kind != EquiJoinKind::Inner && !layout.has_residual {
-        Some(data::<state::Counts>(
-            scope,
-            prefix,
-            definition::KEY_COUNTS,
-        )?)
+        Some(scope.data::<state::Counts>(definition::KEY_COUNTS)?)
     } else {
         None
     };
     let match_counts = if layout.kind != EquiJoinKind::Inner && layout.has_residual {
-        Some(data::<state::MatchCounts>(
-            scope,
-            prefix,
-            definition::MATCH_COUNTS,
-        )?)
+        Some(scope.data::<state::MatchCounts>(definition::MATCH_COUNTS)?)
     } else {
         None
     };

@@ -9,7 +9,6 @@ use thiserror::Error;
 
 use crate::{
     DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::data,
     definition::{ConstructedOperation, Sealed as SealedDefinition},
     operation::{AtomicOperation, OperationError, OperationInput, relation::canonical_row},
 };
@@ -93,13 +92,12 @@ impl SealedDefinition for DistinctDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Distinct input arity");
-        let weights = data::<OrderedMultiset<Vec<u8>>>(scope, prefix, WEIGHTS)?;
+        let weights = scope.data::<OrderedMultiset<Vec<u8>>>(WEIGHTS)?;
         Ok(ConstructedOperation::atomic(
             Arc::clone(input_schema),
             DistinctOperation {

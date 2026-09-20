@@ -104,7 +104,6 @@ impl SealedDefinition for UnionAllDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
-        _prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let output_schema = Self::compile_schema(input_schemas).map_err(schema_error)?;

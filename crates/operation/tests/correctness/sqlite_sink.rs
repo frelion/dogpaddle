@@ -333,8 +333,7 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[value_schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -354,8 +353,7 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[value_schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -383,8 +381,7 @@ impl Fixture {
         let (operation, output) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[schema()],
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .unwrap()
@@ -401,8 +398,7 @@ impl Fixture {
         let (operation, output) = decoded
             .construct(
                 &[schema()],
-                &mut store.data_scope(),
-                "operation",
+                &mut store.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .unwrap()

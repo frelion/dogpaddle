@@ -216,7 +216,6 @@ impl SealedDefinition for SelectDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
-        _prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas

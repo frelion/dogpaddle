@@ -66,8 +66,7 @@ fn construct_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation
     let constructed = (&definition as &dyn OperationDefinition)
         .construct(
             std::slice::from_ref(input_schema),
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -89,16 +88,13 @@ fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
     let store = Store::open(root.path()).unwrap();
     let result = (&DistinctDefinition::new() as &dyn OperationDefinition).construct(
         &[schema()],
-        &mut store.data_scope(),
-        "operation",
+        &mut store.data_scope().scoped("operation"),
         RuntimeResource::none(),
     );
     assert!(matches!(
         result,
-        Err(OperationSetupError::Store {
-            name,
-            source: StoreError::DataKindMismatch { name: source_name, .. },
-        }) if name == "operation/distinct.weights" && source_name == name
+        Err(OperationSetupError::Store(StoreError::DataKindMismatch { name, .. }))
+            if name == "operation/distinct.weights"
     ));
 }
 
@@ -123,13 +119,12 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
     let store = Store::create(empty.path()).unwrap();
     let result = (&definition as &dyn OperationDefinition).construct(
         &[schema()],
-        &mut store.data_scope(),
-        "operation",
+        &mut store.data_scope().scoped("operation"),
         RuntimeResource::none(),
     );
     assert!(matches!(
         result,
-        Err(OperationSetupError::Store { name, .. })
+        Err(OperationSetupError::Store(StoreError::DataNotFound(name)))
             if name == "operation/distinct.weights"
     ));
 }
@@ -252,8 +247,7 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
     let constructed = decoded
         .construct(
             &[schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();

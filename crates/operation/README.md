@@ -16,7 +16,7 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 理解这个 crate 最重要的是两条线：
 
 ```text
-构建/恢复：Definition + exact Schemas + DataScope + prefix + RuntimeResource
+构建/恢复：Definition + exact Schemas + scoped DataScope + RuntimeResource
             ── checked construct ──> Runtime Operation + output Schema
 运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
 ```
@@ -55,7 +55,7 @@ Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station �
 
 1. 在接触 Store 前，对全部 Definition 调用 `validate_resource(&resource)`，预检运行资源是否存在且为
    精确 Rust 类型。Flow 会先对全图完成这一步，因此错误不会留下目录或部分 catalog。
-2. `construct` 接收每个输入端口的完整 Arrow Schema、短期 `DataScope`、稳定前缀和拥有型
+2. `construct` 接收每个输入端口的完整 Arrow Schema、已限定资源名范围的短期 `DataScope` 和拥有型
    `RuntimeResource`，统一检查输入数量、DogPaddle Schema 与资源 presence/type。
 3. sealed 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
    的 typed collections；同一代码同时服务新建与恢复。
@@ -95,7 +95,7 @@ definition.validate_resource(&resource)?;
 let mut setup = StoreSetup::new();
 let constructed = {
     let mut data = setup.data_scope();
-    definition.construct(&[Arc::clone(&input)], &mut data, "operation", resource)?
+    definition.construct(&[Arc::clone(&input)], &mut data.scoped("operation"), resource)?
 };
 assert_eq!(constructed.output_schema(), Some(&input));
 let (_operation, output_schema) = constructed.into_parts();
@@ -110,7 +110,7 @@ definition.validate_resource(&resource)?;
 let store = Store::open(&path)?;
 let constructed = {
     let mut data = store.data_scope();
-    definition.construct(&[Arc::clone(&input)], &mut data, "operation", resource)?
+    definition.construct(&[Arc::clone(&input)], &mut data.scoped("operation"), resource)?
 };
 let (_operation, output_schema) = constructed.into_parts();
 assert_eq!(output_schema.as_ref(), Some(&input));
@@ -260,7 +260,8 @@ equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
 asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
 ```
 
-Flow 只生成 `station/{station}/operation/{operation}` 前缀并提供 build/open 对应的 `DataScope`。具体 Definition 的同一个 constructor 用固定逻辑名和 codec 声明或查找
+Flow 用 `station/{station}/operation/{operation}` 前缀限定 build/open 对应的 `DataScope`，
+再将这个子 scope 交给 Operation。具体 Definition 不接收全局前缀，只用固定逻辑名和 codec 声明或查找
 `Cell`、`OrderedMap` 等 handle。旧的 Data declaration、`DataInstances` 和 erased materializer 已不在
 这条路径中，Flow 也不会枚举具体算子或解释其状态布局。
 

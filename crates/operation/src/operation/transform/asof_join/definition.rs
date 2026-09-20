@@ -367,7 +367,6 @@ impl SealedDefinition for AsOfJoinDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
@@ -377,7 +376,7 @@ impl SealedDefinition for AsOfJoinDefinition {
             .compile_layout(left_schema, right_schema)
             .map_err(schema_error)?;
         let output_schema = Arc::clone(&layout.output_schema);
-        let operation = super::construct(layout, data, prefix)?;
+        let operation = super::construct(layout, data)?;
         Ok(ConstructedOperation::new(operation, Some(output_schema)))
     }
 }
@@ -898,8 +897,7 @@ mod tests {
         let mut setup = StoreSetup::new();
         (definition as &dyn crate::OperationDefinition).construct(
             inputs,
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
     }

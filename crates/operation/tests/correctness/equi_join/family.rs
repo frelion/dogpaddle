@@ -348,8 +348,7 @@ fn construct_join(root: &TestStore, definition: &EquiJoinDefinition) -> (Operati
     let (operation, _) = (definition as &dyn dogpaddle_operation::OperationDefinition)
         .construct(
             &[left_schema(), right_schema()],
-            &mut setup.data_scope(),
-            OPERATION_PREFIX,
+            &mut setup.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -362,8 +361,7 @@ fn reopen_join(store: &Store, definition: &EquiJoinDefinition) -> Operation {
     (definition as &dyn dogpaddle_operation::OperationDefinition)
         .construct(
             &[left_schema(), right_schema()],
-            &mut store.data_scope(),
-            OPERATION_PREFIX,
+            &mut store.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap()

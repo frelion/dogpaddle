@@ -36,7 +36,6 @@ mod private {
             _: ConstructionToken,
             inputs: &[SchemaRef],
             data: &mut DataScope<'_>,
-            prefix: &str,
             resource: RuntimeResource,
         ) -> Result<ConstructedOperation, OperationSetupError>;
         fn resource_type(&self) -> Option<TypeId> {
@@ -126,7 +125,7 @@ impl OperationKind {
 /// // Missing input is rejected, rather than reaching the concrete constructor.
 /// assert!(definition.output_schema(&[]).is_err());
 /// assert!(definition.construct(
-///     &[], &mut setup.data_scope(), "count", RuntimeResource::none(),
+///     &[], &mut setup.data_scope().scoped("count"), RuntimeResource::none(),
 /// ).is_err());
 /// ```
 ///
@@ -147,7 +146,7 @@ impl OperationKind {
 /// fn bypass(definition: &dyn OperationDefinition) {
 ///     let mut setup = StoreSetup::new();
 ///     let _ = definition.construct_unchecked(
-///         &[], &mut setup.data_scope(), "count", RuntimeResource::none(),
+///         &[], &mut setup.data_scope().scoped("count"), RuntimeResource::none(),
 ///     );
 /// }
 /// ```
@@ -238,6 +237,8 @@ impl dyn OperationDefinition + '_ {
 
     /// Constructs the final runtime operation and exact output Schema through the only checked path.
     /// Resource metadata is checked before concrete code may access Store data.
+    /// The caller scopes `data` to this operation’s resource prefix before construction.
+    /// Concrete definitions declare only their own fixed logical names within that scope.
     /// Construction performs no transactions, state reads, or external I/O.
     ///
     /// # Errors
@@ -246,7 +247,6 @@ impl dyn OperationDefinition + '_ {
         &self,
         inputs: &[SchemaRef],
         data: &mut DataScope<'_>,
-        prefix: &str,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, OperationSetupError> {
         let kind = self.kind();
@@ -257,7 +257,6 @@ impl dyn OperationDefinition + '_ {
             ConstructionToken(()),
             inputs,
             data,
-            prefix,
             resource,
         )?;
         validate_output(kind, built.output_schema.as_ref())?;
@@ -360,12 +359,8 @@ pub enum OperationSetupError {
     WrongRuntimeResource,
     #[error("operation does not accept a runtime resource")]
     UnexpectedRuntimeResource,
-    #[error("operation data {name:?} could not be declared or opened: {source}")]
-    Store {
-        name: String,
-        #[source]
-        source: dogpaddle_store::StoreError,
-    },
+    #[error(transparent)]
+    Store(#[from] dogpaddle_store::StoreError),
     #[error("operation construction execution capability does not match its declared kind")]
     ExecutionKind,
 }
@@ -377,15 +372,4 @@ where
     OperationSetupError::Schema {
         source: source.into(),
     }
-}
-
-pub(crate) fn data<D: dogpaddle_store::StoreData>(
-    scope: &mut DataScope<'_>,
-    prefix: &str,
-    logical: &str,
-) -> Result<D, OperationSetupError> {
-    let name = format!("{prefix}/{logical}");
-    scope
-        .data(&name)
-        .map_err(|source| OperationSetupError::Store { name, source })
 }

@@ -45,7 +45,6 @@ impl Sealed for InvalidDefinition {
         _: crate::definition::ConstructionToken,
         _inputs: &[SchemaRef],
         _data: &mut DataScope<'_>,
-        _prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, OperationSetupError> {
         Ok(match self.body {
@@ -89,8 +88,7 @@ fn construct_rejects_missing_and_unexpected_output() {
     assert!(matches!(
         (&missing as &dyn OperationDefinition).construct(
             &[],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         ),
         Err(OperationSetupError::Bind(OperationBindError::MissingOutput))
@@ -105,8 +103,7 @@ fn construct_rejects_missing_and_unexpected_output() {
     assert!(matches!(
         (&unexpected as &dyn OperationDefinition).construct(
             &[schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         ),
         Err(OperationSetupError::Bind(
@@ -130,8 +127,7 @@ fn exclusive_transform_create_and_open_accept_atomic_and_turn_bodies() {
         let (operation, output) = (&definition as &dyn OperationDefinition)
             .construct(
                 std::slice::from_ref(&input),
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("construct exclusive body for create")
@@ -145,8 +141,7 @@ fn exclusive_transform_create_and_open_accept_atomic_and_turn_bodies() {
         let (operation, output) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[input],
-                &mut store.data_scope(),
-                "operation",
+                &mut store.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("construct exclusive body for open")
@@ -167,8 +162,7 @@ fn atomic_transform_rejects_a_turn_body() {
     assert!(matches!(
         (&definition as &dyn OperationDefinition).construct(
             &[schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         ),
         Err(OperationSetupError::ExecutionKind)

@@ -90,8 +90,7 @@ fn bench_projections(criterion: &mut Criterion, root: &RunRoot) {
                 let (operation, _) = definition
                     .construct(
                         &[Arc::clone(&schema)],
-                        &mut setup.data_scope(),
-                        "projection",
+                        &mut setup.data_scope().scoped("projection"),
                         RuntimeResource::none(),
                     )
                     .unwrap()

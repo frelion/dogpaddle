@@ -19,16 +19,15 @@ pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey, AsOfTieB
 pub(crate) use definition::{AsOfJoinLayout, TAG, decode_definition};
 pub(crate) use runtime::AsOfJoinOperation;
 
-use crate::{OperationSetupError, definition::data, operation::Operation};
+use crate::{OperationSetupError, operation::Operation};
 
 fn construct(
     layout: AsOfJoinLayout,
     scope: &mut DataScope<'_>,
-    prefix: &str,
 ) -> Result<Operation, OperationSetupError> {
-    let left_rows = data::<state::Rows>(scope, prefix, definition::LEFT_ROWS)?;
-    let right_rows = data::<state::Rows>(scope, prefix, definition::RIGHT_ROWS)?;
-    let continuation = data::<state::Continuation>(scope, prefix, definition::CONTINUATION)?;
+    let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
+    let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
+    let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
     Ok(Operation::Turn(Box::new(AsOfJoinOperation {
         kind: layout.kind,
         direction: layout.direction,

@@ -43,8 +43,11 @@ pub enum StoreError {
     InvalidStore,
 
     /// No more durable data object identifiers are available.
-    #[error("store has exhausted its data object identifiers")]
-    DataIdExhausted,
+    #[error("store has exhausted its data object identifiers while declaring {name:?}")]
+    DataIdExhausted {
+        /// Full catalog name of the attempted declaration.
+        name: String,
+    },
 
     /// A data object belongs to another store.
     #[error("data object belongs to another store")]

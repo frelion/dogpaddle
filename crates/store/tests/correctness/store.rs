@@ -223,6 +223,107 @@ fn data_scope_strictly_declares_or_looks_up_typed_data() {
 }
 
 #[test]
+fn scoped_data_preserves_literal_names_and_reopens_the_same_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut setup = StoreSetup::new();
+    let declared = {
+        let mut data = setup.data_scope();
+        let mut operation = data.scoped("station/0");
+        let mut nested = operation.scoped("../operation//0/");
+        let value = nested.data::<Cell<u64>>("count").unwrap();
+        assert!(matches!(
+            nested.data::<Cell<u64>>("count"),
+            Err(StoreError::DataAlreadyExists(name))
+                if name == "station/0/../operation//0//count"
+        ));
+        value
+    };
+    let sibling = setup
+        .data_scope()
+        .scoped("station/1")
+        .scoped("../operation//0/")
+        .data::<Cell<u64>>("count")
+        .unwrap();
+    setup
+        .commit(&path, |access| {
+            declared.access(access)?.set(&42)?;
+            sibling.access(access)?.set(&17)
+        })
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let value = store
+        .data_scope()
+        .scoped("station/0")
+        .scoped("../operation//0/")
+        .data::<Cell<u64>>("count")
+        .unwrap();
+    assert!(matches!(
+        store.data_scope().scoped("station/0").scoped("../operation//0/")
+            .data::<OrderedMap<u64, u64>>("count"),
+        Err(StoreError::DataKindMismatch { name, .. })
+            if name == "station/0/../operation//0//count"
+    ));
+    assert!(matches!(
+        store.data_scope().scoped("station/0").data::<Cell<u64>>("missing"),
+        Err(StoreError::DataNotFound(name)) if name == "station/0/missing"
+    ));
+    // The literal catalog name is also available through the root Store API.
+    store
+        .open_data::<Cell<u64>>("station/0/../operation//0//count")
+        .unwrap();
+    let sibling = store
+        .data_scope()
+        .scoped("station/1")
+        .scoped("../operation//0/")
+        .data::<Cell<u64>>("count")
+        .unwrap();
+    let transaction = store.read_transaction();
+    assert_eq!(
+        value.read(transaction.access()).unwrap().get().unwrap(),
+        Some(42)
+    );
+    assert_eq!(
+        sibling.read(transaction.access()).unwrap().get().unwrap(),
+        Some(17)
+    );
+}
+
+#[test]
+fn child_scope_does_not_change_its_parent_or_normalize_empty_prefixes() {
+    let mut setup = StoreSetup::new();
+    let mut root = setup.data_scope();
+    root.data::<Cell<u64>>("value").unwrap();
+    root.scoped("").data::<Cell<u64>>("value").unwrap();
+    root.scoped("")
+        .scoped("")
+        .data::<Cell<u64>>("value")
+        .unwrap();
+    assert!(matches!(root.data::<Cell<u64>>("/value"),
+        Err(StoreError::DataAlreadyExists(name)) if name == "/value"));
+    assert!(matches!(root.data::<Cell<u64>>("//value"),
+        Err(StoreError::DataAlreadyExists(name)) if name == "//value"));
+    assert!(matches!(root.data::<Cell<u64>>("value"),
+        Err(StoreError::DataAlreadyExists(name)) if name == "value"));
+}
+
+#[test]
+fn scoped_names_are_validated_only_when_data_is_requested() {
+    let mut setup = StoreSetup::new();
+    let mut root = setup.data_scope();
+    drop(root.scoped("unused\0prefix"));
+    assert!(
+        matches!(root.scoped("bad\0prefix").data::<Cell<u64>>("value"),
+        Err(StoreError::InvalidName { name, .. }) if name == "bad\0prefix/value")
+    );
+    let prefix = "x".repeat(254);
+    let expected = format!("{prefix}/x");
+    assert!(matches!(root.scoped(&prefix).data::<Cell<u64>>("x"),
+        Err(StoreError::InvalidName { name, .. }) if name == expected));
+    root.data::<Cell<u64>>("valid").unwrap();
+}
+
+#[test]
 fn reopening_after_more_catalog_entries_keeps_existing_bindings() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);

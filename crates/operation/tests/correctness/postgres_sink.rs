@@ -103,8 +103,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[input_schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(config()),
         )
         .unwrap()
@@ -131,8 +130,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         let (mut operation, output) = decoded
             .construct(
                 &[input_schema()],
-                &mut store.data_scope(),
-                "operation",
+                &mut store.data_scope().scoped("operation"),
                 RuntimeResource::new(config()),
             )
             .unwrap()
@@ -201,8 +199,7 @@ fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[input_schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(config()),
         )
         .unwrap()
@@ -291,8 +288,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     let (operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[input_schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(mismatched_config()),
         )
         .unwrap()
@@ -305,8 +301,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     let (mut operation, output) = (&definition as &dyn OperationDefinition)
         .construct(
             &[input_schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::new(mismatched_config()),
         )
         .unwrap()

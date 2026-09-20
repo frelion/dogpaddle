@@ -81,6 +81,13 @@ owner Definition 放进同一笔同步事务。
 `data::<D>(name)` 只创建新 binding 并拒绝重复名；后者固定为 existing，只查找已有 binding 并拒绝缺失或 kind
 不匹配。`DataScope` 不暴露事务、读取、裸 ID 或模式切换。
 
+`data.scoped("owner")` 借用一个只处理该前缀下名称的子 scope，子 scope 的 `data("count")`
+声明或查找完整名称 `owner/count`。嵌套 scope 继续追加前缀，不能重置父 scope；释放子 scope 后
+父 scope 保持原样。名称是平面 catalog 字符串：只按 `/` 字面拼接，不清理重复斜线或解释 `..`。
+根 scope 不加前缀，而显式 `scoped("")` 会保留空段，`data("count")` 得到 `/count`。
+前缀本身不提前校验，只有请求数据时才校验完整名称；声明/查找错误均报告完整名称，包含
+`DataIdExhausted { name }`。scope 只用于短期装配，返回的 handle 不保留它或前缀。
+
 `Store::into_transactions` 结束 setup，返回唯一的写事务启动能力。调用 `split` 后得到两种能力：
 
 ```text

@@ -62,7 +62,6 @@ impl SealedDefinition for DiscardDefinition {
         _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
-        _prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         Ok(ConstructedOperation::turn(None, DiscardOperation))

@@ -36,8 +36,7 @@ fn structural_trace(
     let constructed = definition
         .construct(
             &input_schemas,
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();

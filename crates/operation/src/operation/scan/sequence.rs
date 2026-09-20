@@ -8,7 +8,6 @@ use thiserror::Error;
 
 use crate::{
     DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::data,
     definition::{ConstructedOperation, Sealed as SealedDefinition},
     operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
@@ -73,10 +72,9 @@ impl SealedDefinition for SequenceScanDefinition {
         _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        let position = data::<Cell<u64>>(scope, prefix, POSITION)?;
+        let position = scope.data::<Cell<u64>>(POSITION)?;
         Ok(ConstructedOperation::turn(
             Some(output_schema()),
             SequenceScanOperation::new(self.start, position),

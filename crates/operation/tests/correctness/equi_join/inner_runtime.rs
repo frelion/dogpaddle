@@ -100,8 +100,7 @@ fn construct_operation_for_schemas(
     let (operation, _) = definition
         .construct(
             schemas,
-            &mut setup.data_scope(),
-            OPERATION_PREFIX,
+            &mut setup.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -118,8 +117,7 @@ fn reopen_join(
     definition
         .construct(
             schemas,
-            &mut store.data_scope(),
-            OPERATION_PREFIX,
+            &mut store.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap()

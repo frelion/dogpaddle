@@ -19,16 +19,15 @@ pub use definition::{AggregateCall, AggregateDefinition};
 pub(crate) use definition::{AggregateLayout, TAG, decode_definition};
 pub(crate) use runtime::AggregateOperation;
 
-use crate::{OperationSetupError, definition::data, operation::Operation};
+use crate::{OperationSetupError, operation::Operation};
 
 fn construct(
     layout: AggregateLayout,
     scope: &mut DataScope<'_>,
-    prefix: &str,
 ) -> Result<Operation, OperationSetupError> {
-    let groups = data::<state::Groups>(scope, prefix, definition::GROUPS)?;
-    let entries = data::<state::Entries>(scope, prefix, definition::ENTRIES)?;
-    let control = data::<state::Control>(scope, prefix, definition::CONTROL)?;
+    let groups = scope.data::<state::Groups>(definition::GROUPS)?;
+    let entries = scope.data::<state::Entries>(definition::ENTRIES)?;
+    let control = scope.data::<state::Control>(definition::CONTROL)?;
     Ok(Operation::Atomic(Box::new(AggregateOperation {
         input_schema: layout.input_schema,
         output_schema: layout.output_schema,

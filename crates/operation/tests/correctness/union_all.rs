@@ -125,8 +125,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
     let constructed = definition
         .construct(
             &[input.schema(), input.schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -175,8 +174,7 @@ fn union_all_forwards_every_legal_port_without_copying() {
     let constructed = definition
         .construct(
             &[input.schema(), input.schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -205,8 +203,7 @@ fn runtime_rejects_missing_and_invalid_ports() {
     let constructed = (&definition as &dyn OperationDefinition)
         .construct(
             &[input.schema(), input.schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();

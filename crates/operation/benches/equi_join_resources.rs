@@ -269,8 +269,7 @@ impl Fixture {
         let (operation, _) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("construct residual EquiJoin resource workload")
@@ -286,8 +285,7 @@ impl Fixture {
         let (operation, _) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
-                &mut store.data_scope(),
-                "operation",
+                &mut store.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("open residual EquiJoin resource workload")

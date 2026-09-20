@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
     RuntimeResource,
-    definition::data,
     definition::{Sealed, schema_error},
 };
 
@@ -126,13 +125,12 @@ impl Sealed for PostgresCdcScanDefinition {
         _: crate::definition::ConstructionToken,
         _: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let output = schema::compile(&self.spec.columns).map_err(schema_error)?;
-        let phase = data::<Cell<u32>>(scope, prefix, PHASE)?;
-        let checkpoint = data::<Cell<Vec<u8>>>(scope, prefix, CHECKPOINT)?;
-        let spool = data::<Queue<Vec<u8>>>(scope, prefix, BOOTSTRAP_SPOOL)?;
+        let phase = scope.data::<Cell<u32>>(PHASE)?;
+        let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
+        let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
         let config = resource.take::<PostgresCdcScanConfig>()?;
         let operation = PostgresCdcScanOperation::new_bound(
             self.spec.clone(),

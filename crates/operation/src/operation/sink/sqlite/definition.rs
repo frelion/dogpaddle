@@ -165,7 +165,6 @@ impl SealedDefinition for SqliteSinkDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
@@ -180,7 +179,7 @@ impl SealedDefinition for SqliteSinkDefinition {
             Arc::clone(&input_schema),
         )
         .map_err(schema_error)?;
-        buffered::construct(input_schema, RelationSinkTarget::new(target), data, prefix)
+        buffered::construct(input_schema, RelationSinkTarget::new(target), data)
     }
 }
 

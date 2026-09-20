@@ -363,8 +363,7 @@ fn construct_join_operation(
     let constructed = definition
         .construct(
             schemas,
-            &mut setup.data_scope(),
-            OPERATION_PREFIX,
+            &mut setup.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -381,8 +380,7 @@ fn reconstruct_join_operation(
     let constructed = definition
         .construct(
             schemas,
-            &mut store.data_scope(),
-            OPERATION_PREFIX,
+            &mut store.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::none(),
         )
         .unwrap();

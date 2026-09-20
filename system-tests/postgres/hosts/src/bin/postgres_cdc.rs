@@ -225,8 +225,7 @@ impl DirectScan {
         let scan = definition
             .construct(
                 &[],
-                &mut store.data_scope(),
-                OPERATION_PREFIX,
+                &mut store.data_scope().scoped(OPERATION_PREFIX),
                 RuntimeResource::new(options.config()?),
             )?
             .into_parts()
@@ -252,8 +251,7 @@ impl DirectScan {
         let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
         let _operation = canonical.construct(
             &[],
-            &mut setup.data_scope(),
-            OPERATION_PREFIX,
+            &mut setup.data_scope().scoped(OPERATION_PREFIX),
             RuntimeResource::new(config),
         )?;
         setup.create_data::<OrderedMap<u64, Vec<u8>>>("output")?;

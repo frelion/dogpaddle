@@ -11,7 +11,6 @@ use thiserror::Error;
 
 use crate::{
     DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::data,
     definition::{ConstructedOperation, Sealed as SealedDefinition},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
@@ -82,10 +81,9 @@ impl SealedDefinition for RunningEventCountDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        let count = data::<Cell<u64>>(scope, prefix, COUNT)?;
+        let count = scope.data::<Cell<u64>>(COUNT)?;
         Ok(ConstructedOperation::atomic(
             output_schema(),
             RunningEventCountOperation::new(Arc::clone(&input_schemas[0]), count),

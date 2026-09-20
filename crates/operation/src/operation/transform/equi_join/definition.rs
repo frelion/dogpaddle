@@ -170,7 +170,6 @@ impl SealedDefinition for EquiJoinDefinition {
         _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        prefix: &str,
         _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
@@ -180,7 +179,7 @@ impl SealedDefinition for EquiJoinDefinition {
             .compile_layout(left_schema, right_schema)
             .map_err(schema_error)?;
         let output_schema = Arc::clone(&layout.output_schema);
-        let operation = super::construct(layout, data, prefix)?;
+        let operation = super::construct(layout, data)?;
         Ok(ConstructedOperation::new(operation, Some(output_schema)))
     }
 }

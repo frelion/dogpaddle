@@ -57,8 +57,7 @@ impl Host {
             let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
             let _operation = canonical.construct(
                 &[Arc::clone(&schema)],
-                &mut setup.data_scope(),
-                OPERATION_PREFIX,
+                &mut setup.data_scope().scoped(OPERATION_PREFIX),
                 RuntimeResource::new(config),
             )?;
             let _transactions = setup.commit(path, |access| {
@@ -89,8 +88,7 @@ impl Host {
         let operation = definition
             .construct(
                 &[schema],
-                &mut store.data_scope(),
-                OPERATION_PREFIX,
+                &mut store.data_scope().scoped(OPERATION_PREFIX),
                 RuntimeResource::new(config),
             )?
             .into_parts()

@@ -22,8 +22,7 @@ fn construct_operation(
     let constructed = definition
         .construct(
             &[],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -58,8 +57,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
     let constructed = decoded
         .construct(
             &[],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -112,8 +110,7 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     let constructed = (&definition as &dyn OperationDefinition)
         .construct(
             &[],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();

@@ -221,7 +221,7 @@ flow.advance()?;
 `owner_identity`，它必须与磁盘中的值精确相同；未设置的 Factory 只接受同样未设置 owner 的 Flow。
 比较发生在运行资源预检、Schema 传播和 typed state open 之前。随后 Flow 先全图检查全部临时资源，
 再保持同一个 Store，由拓扑顺序和 Station program 顺序调用 Definition 的统一 `construct`，以相同前缀
-打开具体状态、直接装配最终运行对象并传播 output Schema；之后才校验持久 Station 状态并导出事务能力。
+限定 `DataScope` 的作用域后打开具体状态、直接装配最终运行对象并传播 output Schema；之后才校验持久 Station 状态并导出事务能力。
 Flow 不读取算子内部布局、不枚举具体算子，也不会重新决定如何融合。凭据、进程内 connector 等
 `RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；其内容不会被日志或持久化编码展开。
 

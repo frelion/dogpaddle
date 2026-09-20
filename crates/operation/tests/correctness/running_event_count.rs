@@ -95,8 +95,7 @@ fn construct_operation(
     let constructed = definition
         .construct(
             &[value_schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -151,8 +150,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let constructed = decoded
         .construct(
             &[value_schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -177,8 +175,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     let (mut operation, _) = (&definition as &dyn OperationDefinition)
         .construct(
             &[value_schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -232,8 +229,7 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let (mut operation, _) = (&definition as &dyn OperationDefinition)
         .construct(
             &[value_schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()

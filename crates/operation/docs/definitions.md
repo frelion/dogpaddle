@@ -13,8 +13,9 @@ TurnTransform 使用完整 turn/continuation 协议，但其未提交 turn 必�
 首项决定 Station 的输入角色与 arity，末项决定 output 属性，Flow 只校验 Station，不能枚举具体算子。
 表达式 Operation 的实例级资格只决定能否融合；不合格实例仍走原有独占绑定与执行路径，本次不扩大或收紧表达式支持。
 Filter、Extend、Select、SchemaAlign 检查自身全部表达式，Aggregate 同时检查所有 group expression 与 call argument。
-具体 Definition 通过 trait object 上不可覆盖的统一 `construct` 入口，把有序、精确的 input logical `SchemaRef`、短期 `DataScope`、稳定资源名前缀和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
+具体 Definition 通过 trait object 上不可覆盖的统一 `construct` 入口，把有序、精确的 input logical `SchemaRef`、已限定资源名范围的短期 `DataScope` 和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
 入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型、kind/output 与执行能力一致性；private sealed `construct_unchecked` 只实现具体算子规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
+资源前缀由调用方通过 `DataScope::scoped` 限定；具体 Definition 只向 `DataScope::data` 传固定逻辑名，不拼接全局资源名。Store 声明/查找错误透明传递，保留完整资源名。
 Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink 必须没有 output。
 构造不得读取业务状态、开始事务、访问外部系统、时间或随机性；相同持久化 tag、payload 与有序 input Schemas 必须维持相同 Schema、状态资源集合和执行语义。
 

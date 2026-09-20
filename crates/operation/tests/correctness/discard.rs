@@ -44,8 +44,7 @@ fn runtime_completes_input_idles_without_input_and_rejects_invalid_ports() {
     let (mut operation, output) = decoded_definition()
         .construct(
             &[input.schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()
@@ -76,8 +75,7 @@ fn runtime_completes_input_idles_without_input_and_rejects_invalid_ports() {
     let (mut operation, output) = decoded_definition()
         .construct(
             &[input.schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap()

@@ -88,8 +88,7 @@ fn mysql_cdc_bootstrap_spool_is_a_queue() {
     let (operation, _) = definition
         .construct(
             &[],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::new(config()),
         )
         .unwrap()
@@ -134,8 +133,7 @@ impl Fixture {
         let (operation, _) = definition
             .construct(
                 &[],
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::new(config()),
             )
             .unwrap()
@@ -150,8 +148,7 @@ impl Fixture {
         let (scan, _) = definition
             .construct(
                 &[],
-                &mut store.data_scope(),
-                "operation",
+                &mut store.data_scope().scoped("operation"),
                 RuntimeResource::new(config()),
             )
             .unwrap()

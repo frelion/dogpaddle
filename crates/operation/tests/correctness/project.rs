@@ -100,8 +100,7 @@ fn project_rejects_invalid_port_and_schema_drift() {
     let constructed = definition
         .construct(
             &[input.schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -139,8 +138,7 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
     let constructed = definition
         .construct(
             &[input.schema()],
-            &mut setup.data_scope(),
-            "operation",
+            &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();
@@ -171,8 +169,7 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
     let constructed = definition
         .construct(
             &[input.schema()],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .unwrap();

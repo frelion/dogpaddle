@@ -58,8 +58,7 @@ impl Fixture {
         let (operation, _) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("construct equi-join")

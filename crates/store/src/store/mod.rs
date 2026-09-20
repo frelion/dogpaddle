@@ -79,6 +79,7 @@ pub struct StoreSetup {
 /// modes. Typed handles returned by [`DataScope::data`] do not borrow the scope.
 pub struct DataScope<'owner> {
     mode: DataScopeMode<'owner>,
+    prefix: Option<String>,
 }
 
 enum DataScopeMode<'owner> {

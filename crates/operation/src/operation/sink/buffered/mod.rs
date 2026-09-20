@@ -8,9 +8,7 @@ use std::{fmt, num::NonZeroU32};
 
 use dogpaddle_store::{Cell, DataScope, OrderedMap};
 
-use crate::{
-    ConstructedOperation, OperationSetupError, definition::data, operation::OperationError,
-};
+use crate::{ConstructedOperation, OperationSetupError, operation::OperationError};
 
 pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
@@ -22,10 +20,9 @@ pub(crate) fn construct<T: SinkTarget>(
     schema: arrow_schema::SchemaRef,
     target: T,
     scope: &mut DataScope<'_>,
-    prefix: &str,
 ) -> Result<ConstructedOperation, OperationSetupError> {
-    let control = data::<Cell<Vec<u8>>>(scope, prefix, CONTROL)?;
-    let buffer = data::<OrderedMap<u64, Vec<u8>>>(scope, prefix, BUFFER)?;
+    let control = scope.data::<Cell<Vec<u8>>>(CONTROL)?;
+    let buffer = scope.data::<OrderedMap<u64, Vec<u8>>>(BUFFER)?;
     Ok(ConstructedOperation::turn(
         None,
         BufferedSink::new(schema, target, control, buffer),

@@ -106,8 +106,7 @@ impl Fixture {
         let (operation, _) = (&definition as &dyn OperationDefinition)
             .construct(
                 &[Arc::clone(&schema)],
-                &mut setup.data_scope(),
-                "operation",
+                &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
             .expect("construct SQLite Sink")
@@ -233,8 +232,7 @@ fn construct_reopened(
     (definition as &dyn OperationDefinition)
         .construct(
             &[Arc::clone(schema)],
-            &mut store.data_scope(),
-            "operation",
+            &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
         .expect("open SQLite Sink")

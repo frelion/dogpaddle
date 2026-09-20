@@ -154,6 +154,7 @@ impl Store {
     pub const fn data_scope(&self) -> DataScope<'_> {
         DataScope {
             mode: DataScopeMode::Existing(self),
+            prefix: None,
         }
     }
 
@@ -185,7 +186,9 @@ fn create_binding(
     if catalog.contains_key(name) {
         return Err(StoreError::DataAlreadyExists(name.to_owned()));
     }
-    let data_id = u32::try_from(*next_data_id).map_err(|_| StoreError::DataIdExhausted)?;
+    let data_id = u32::try_from(*next_data_id).map_err(|_| StoreError::DataIdExhausted {
+        name: name.to_owned(),
+    })?;
     // Namespace identifiers are monotonic within both a draft and an open Store.
     // Callers never reuse an identifier after this reservation succeeds.
     *next_data_id += 1;
@@ -233,6 +236,7 @@ impl StoreSetup {
     pub fn data_scope(&mut self) -> DataScope<'_> {
         DataScope {
             mode: DataScopeMode::Declare(self),
+            prefix: None,
         }
     }
 }
@@ -244,6 +248,31 @@ impl Default for StoreSetup {
 }
 
 impl DataScope<'_> {
+    /// Borrows a child scope whose names are prefixed by `prefix`.
+    ///
+    /// Prefixes are joined literally with `/`; they are not filesystem paths.
+    /// Nested scopes retain their parent's prefix, including empty segments,
+    /// slashes and `..`. An empty child prefix therefore differs from an
+    /// unprefixed root scope. Names are validated only when [`Self::data`] is
+    /// called, so an unused prefix is not validated.
+    ///
+    /// The child retains this scope's declaration or lookup mode and cannot
+    /// access names outside its prefix. Dropping it restores access to the
+    /// unchanged parent scope.
+    #[must_use]
+    pub fn scoped(&mut self, prefix: &str) -> DataScope<'_> {
+        let prefix = Some(
+            self.prefix
+                .as_ref()
+                .map_or_else(|| prefix.to_owned(), |parent| format!("{parent}/{prefix}")),
+        );
+        let mode = match &mut self.mode {
+            DataScopeMode::Declare(setup) => DataScopeMode::Declare(setup),
+            DataScopeMode::Existing(store) => DataScopeMode::Existing(store),
+        };
+        DataScope { mode, prefix }
+    }
+
     /// Declares or looks up one typed data object according to this scope's
     /// fixed mode.
     ///
@@ -253,8 +282,14 @@ impl DataScope<'_> {
     ///
     /// # Errors
     ///
-    /// Returns the corresponding declaration or lookup error.
+    /// Returns the corresponding declaration or lookup error, with the full
+    /// catalog name after applying this scope's prefix.
     pub fn data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
+        let full_name = self
+            .prefix
+            .as_ref()
+            .map(|prefix| format!("{prefix}/{name}"));
+        let name = full_name.as_deref().unwrap_or(name);
         match &mut self.mode {
             DataScopeMode::Declare(setup) => setup.create_data(name),
             DataScopeMode::Existing(store) => store.open_data(name),
@@ -414,6 +449,21 @@ fn decode_binding(bytes: &[u8]) -> Result<(u32, DataKind), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_declaration_reports_full_name_when_identifiers_are_exhausted() {
+        let mut setup = StoreSetup::new();
+        setup.next_data_id = u64::from(u32::MAX) + 1;
+        let error = setup
+            .data_scope()
+            .scoped("owner")
+            .data::<crate::Cell<u64>>("count");
+        assert!(
+            matches!(error, Err(StoreError::DataIdExhausted { name }) if name == "owner/count")
+        );
+        assert!(setup.catalog.is_empty());
+        assert_eq!(setup.next_data_id, u64::from(u32::MAX) + 1);
+    }
 
     #[test]
     fn failed_catalog_write_reserves_the_attempted_namespace() {
