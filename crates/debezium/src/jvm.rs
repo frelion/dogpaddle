@@ -141,6 +141,8 @@ impl JvmHost {
     fn launch(bundle: &Bundle) -> Result<Self, Error> {
         let classpath_option = format!("-Djava.class.path={}", bundle.classpath());
         let arguments = InitArgsBuilder::new()
+            // The embedding host owns shutdown signals, including its Ctrl-C handler.
+            .option("-Xrs")
             .option(classpath_option)
             .option("-Dfile.encoding=UTF-8")
             .option("-Dorg.slf4j.simpleLogger.logFile=System.err")

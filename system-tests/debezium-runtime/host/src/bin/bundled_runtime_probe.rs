@@ -2,6 +2,8 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, Delivery, Header, Record};
@@ -32,7 +34,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err(probe_error("usage: bundled_runtime_probe BUNDLE_ROOT")),
     };
 
+    // Match the product host: install its handler before initializing the JVM.
+    let (interrupt, interrupted) = mpsc::sync_channel(1);
+    ctrlc::set_handler(move || {
+        let _ = interrupt.try_send(());
+    })?;
     let runtime = dogpaddle_debezium::DebeziumRuntime::open(&bundle)?;
+    require(
+        Command::new("/bin/kill")
+            .args(["-INT", &std::process::id().to_string()])
+            .status()?
+            .success(),
+        "failed to send SIGINT to the runtime host",
+    )?;
+    interrupted
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| probe_error("JVM initialization replaced the host Ctrl-C handler"))?;
+
     let config = ConnectorConfig::new(ENGINE_NAME, CONNECTOR_CLASS)?;
     let mut connector = runtime.start(config, None)?;
 
@@ -72,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     restored.stop(STOP_TIMEOUT)?;
 
     println!(
-        "PASS bundled Debezium public lifecycle: {}",
+        "PASS bundled Debezium public lifecycle and host Ctrl-C handler: {}",
         bundle.display()
     );
     Ok(())

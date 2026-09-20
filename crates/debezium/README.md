@@ -151,6 +151,10 @@ dogpaddle-debezium-runtime-<target>/
 `DogPaddle` 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
 bundle 必须在整个进程生命周期内保持不可修改，并安装在不受非信任用户写入的位置。
 
+JVM 固定使用 `-Xrs`，将中断与终止信号留给宿主处理，避免覆盖宿主在 `open` 前注册的 Ctrl-C handler。
+宿主负责停止 connector；不能依赖 JVM 的信号 shutdown hook。Unix 的 SIGQUIT thread dump 也因此不可用。
+产品 CLI 收到 Ctrl-C 后仍等待当前有界 `advance` 返回，再正常退出。
+
 支持的 payload target：
 
 - `x86_64-unknown-linux-gnu`

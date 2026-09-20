@@ -1523,6 +1523,7 @@ dependencies = [
 name = "dogpaddle-debezium-runtime-host"
 version = "0.2.1"
 dependencies = [
+ "ctrlc",
  "dogpaddle-debezium",
  "serde_json",
 ]
