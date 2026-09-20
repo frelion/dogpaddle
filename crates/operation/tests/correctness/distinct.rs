@@ -7,17 +7,16 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
-    open_operation,
     operation::{
         Action, Operation,
         transform::{DistinctDefinition, DistinctError},
     },
 };
-use dogpaddle_store::{Cell, OrderedMultiset, Store, StoreError, Transactions};
+use dogpaddle_store::{Cell, OrderedMultiset, Store, StoreError, StoreSetup, Transactions};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, decode_hex, rollback_ready,
-    setup_operation, turn_input,
+    TestStore, assert_literal_definition, commit_ready, construct_checked, decode_hex,
+    rollback_ready, turn_input,
 };
 
 const DISTINCT_V1: &str = include_str!("../fixtures/v1/distinct_definition.hex");
@@ -61,29 +60,36 @@ fn append_action(action: Action, rows: &mut Vec<(u64, i64)>) {
     }
 }
 
-fn create_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation, Transactions) {
-    setup_operation(
-        &DistinctDefinition::new(),
-        std::slice::from_ref(input_schema),
-        root,
-        "operation",
-    )
+fn construct_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation, Transactions) {
+    let mut setup = StoreSetup::new();
+    let definition = DistinctDefinition::new();
+    let constructed = (&definition as &dyn OperationDefinition)
+        .construct(
+            std::slice::from_ref(input_schema),
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (operation, _) = constructed.into_parts();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
+    (operation, transactions)
 }
 
 #[test]
 fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
     let root = TestStore::new();
-    let mut setup = Store::setup(root.path()).unwrap();
+    let mut setup = StoreSetup::new();
     setup
         .create_data::<Cell<u64>>("operation/distinct.weights")
         .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     drop(transactions);
 
     let store = Store::open(root.path()).unwrap();
-    let result = open_operation(
-        bind(&DistinctDefinition::new(), &[schema()]).unwrap(),
-        &store,
+    let result = (&DistinctDefinition::new() as &dyn OperationDefinition).construct(
+        &[schema()],
+        &mut store.data_scope(),
         "operation",
         RuntimeResource::none(),
     );
@@ -107,17 +113,17 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
     );
     let input = schema();
     assert_eq!(
-        bind(decoded.as_ref(), std::slice::from_ref(&input))
+        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
             .unwrap()
-            .output_schema(),
+            .as_ref(),
         Some(&input)
     );
 
     let empty = TestStore::new();
     let store = Store::create(empty.path()).unwrap();
-    let result = open_operation(
-        bind(&definition, &[schema()]).unwrap(),
-        &store,
+    let result = (&definition as &dyn OperationDefinition).construct(
+        &[schema()],
+        &mut store.data_scope(),
         "operation",
         RuntimeResource::none(),
     );
@@ -131,7 +137,7 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
 fn distinct_trace(events: &[(u64, i64)], batches: &[usize]) -> Vec<(u64, i64)> {
     assert_eq!(batches.iter().sum::<usize>(), events.len());
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root, &schema());
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
     let mut trace = Vec::new();
     let mut start = 0;
     for &rows in batches {
@@ -176,7 +182,7 @@ fn event_order_presence_boundaries_and_rebatching_are_stable() {
 fn invalid_weight_changes_roll_back_the_whole_turn() {
     {
         let root = TestStore::new();
-        let (mut operation, mut transactions) = create_operation(&root, &schema());
+        let (mut operation, mut transactions) = construct_operation(&root, &schema());
         let invalid = change(&[20, 99], &[1, -1]);
         let error = rollback_ready(
             &mut operation,
@@ -200,7 +206,7 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
 
     {
         let root = TestStore::new();
-        let (mut operation, mut transactions) = create_operation(&root, &schema());
+        let (mut operation, mut transactions) = construct_operation(&root, &schema());
         for diff in [i64::MAX, i64::MAX] {
             let input = change(&[7], &[diff]);
             commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap();
@@ -231,9 +237,7 @@ fn invalid_weight_changes_roll_back_the_whole_turn() {
 #[test]
 fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
     let root = TestStore::new();
-    let definition = DistinctDefinition::new();
-    let (mut operation, mut transactions) =
-        setup_operation(&definition, &[schema()], &root, "operation");
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
     let first = change(&[7, 8], &[2, 1]);
     let mut output = Vec::new();
     append_action(
@@ -245,9 +249,15 @@ fn distinct_reopens_from_durable_weights_and_a_decoded_definition() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decoded_definition();
-    let binding = bind(decoded.as_ref(), &[schema()]).unwrap();
-    let mut operation =
-        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
+    let constructed = decoded
+        .construct(
+            &[schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
     let second = change(&[7, 8, 7], &[-1, -1, -1]);
     let mut output = Vec::new();
@@ -273,7 +283,7 @@ fn long_canonical_rows_are_supported_as_exact_store_keys() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root, &input_schema);
+    let (mut operation, mut transactions) = construct_operation(&root, &input_schema);
     let Action::Complete(Some(output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
@@ -314,7 +324,7 @@ fn signed_float_zeroes_are_distinct_exact_rows() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, -1, -1])).unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root, &input_schema);
+    let (mut operation, mut transactions) = construct_operation(&root, &input_schema);
     let Action::Complete(Some(output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
@@ -348,7 +358,7 @@ fn empty_logical_rows_keep_their_selected_row_count() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, -1, -1])).unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root, &input_schema);
+    let (mut operation, mut transactions) = construct_operation(&root, &input_schema);
     let Action::Complete(Some(output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
@@ -361,7 +371,7 @@ fn empty_logical_rows_keep_their_selected_row_count() {
 #[test]
 fn zero_weight_removes_the_exact_row_key() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root, &schema());
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
     let input = change(&[7, 7], &[3, -3]);
     let mut output = Vec::new();
     append_action(

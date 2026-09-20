@@ -11,14 +11,14 @@ use criterion::{Criterion, Throughput};
 use datafusion_expr::col;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation,
+    OperationDefinition, RuntimeResource,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{AggregateCall, AggregateDefinition},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Store, Transactions};
+use dogpaddle_store::{StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -58,13 +58,19 @@ impl Fixture {
             }),
         )
         .expect("define aggregate");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema)])
-            .expect("bind aggregate");
-        let mut setup = Store::setup(sample.path().join("store")).expect("create store setup");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("create aggregate");
-        let transactions = setup.commit(|_| Ok(())).expect("commit store setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct aggregate")
+            .into_parts();
+        let transactions = setup
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .expect("commit store setup");
         Self {
             operation,
             transactions,

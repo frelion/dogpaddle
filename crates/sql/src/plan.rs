@@ -545,12 +545,9 @@ impl Lowerer {
             .iter()
             .map(|input| Arc::clone(&input.physical_schema))
             .collect::<Vec<_>>();
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&input_schemas)
-            .map_err(SqlError::endpoint)?;
-        let physical_schema = binding
-            .output_schema()
-            .cloned()
+        let physical_schema = (&definition as &dyn OperationDefinition)
+            .output_schema(&input_schemas)
+            .map_err(SqlError::endpoint)?
             .ok_or_else(|| SqlError::invalid("transform definition has no output Schema"))?;
         let node = self.arena.push(
             inputs.into_iter().map(|input| input.node),
@@ -823,10 +820,9 @@ fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {
         BuiltScan::PostgresCdc(scan) => &scan.definition,
         BuiltScan::MySqlCdc(scan) => &scan.definition,
     };
-    let binding = definition.bind(&[]).map_err(SqlError::endpoint)?;
-    binding
-        .output_schema()
-        .cloned()
+    definition
+        .output_schema(&[])
+        .map_err(SqlError::endpoint)?
         .ok_or_else(|| SqlError::invalid("scan definition has no output Schema"))
 }
 

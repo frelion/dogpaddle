@@ -6,8 +6,8 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{Expr, placeholder};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
-    col, create_operation, decode_definition, lit, open_operation,
+    DefinitionCodecError, OperationBindError, OperationKind, RuntimeResource, col,
+    decode_definition, lit,
     operation::{
         Action, Operation, OperationError, OperationInput,
         transform::{
@@ -16,10 +16,11 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, PartitionedMultiset, Store, Transactions};
+use dogpaddle_store::{Cell, PartitionedMultiset, Store, StoreSetup, Transactions};
 
 use crate::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, decode_hex, rollback_ready,
+    TestStore, assert_literal_definition, commit_ready, construct_checked, decode_hex,
+    rollback_ready,
 };
 
 const OPERATION_PREFIX: &str = "operation";
@@ -185,7 +186,7 @@ impl Fixture {
     fn with_residual(kind: EquiJoinKind, residual: ResidualCase) -> Self {
         let definition = definition_with_residual(kind, residual);
         let root = TestStore::new();
-        let (operation, transactions) = create_join_operation(&root, &definition);
+        let (operation, transactions) = construct_join(&root, &definition);
         Self {
             kind,
             definition,
@@ -205,7 +206,7 @@ impl Fixture {
         } = self;
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
-        let operation = open_join_operation(&store, &definition);
+        let operation = reopen_join(&store, &definition);
         Self {
             kind,
             definition,
@@ -265,7 +266,7 @@ impl Fixture {
         let rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
             .open_data(&format!("{OPERATION_PREFIX}/{data_name}"))
             .unwrap();
-        let operation = open_join_operation(&store, &definition);
+        let operation = reopen_join(&store, &definition);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         rows.access(transaction.access())
@@ -299,7 +300,7 @@ impl Fixture {
         let raw: Cell<Vec<u8>> = store
             .open_data(&format!("{OPERATION_PREFIX}/equi_join.continuation"))
             .unwrap();
-        let operation = open_join_operation(&store, &definition);
+        let operation = reopen_join(&store, &definition);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         let mut raw = raw.access(transaction.access()).unwrap();
@@ -342,30 +343,32 @@ impl ResidualCase {
     }
 }
 
-fn create_join_operation(
-    root: &TestStore,
-    definition: &EquiJoinDefinition,
-) -> (Operation, Transactions) {
-    let binding = (definition as &dyn OperationDefinition)
-        .bind(&[left_schema(), right_schema()])
-        .unwrap();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = create_operation(
-        binding,
-        &mut setup,
-        OPERATION_PREFIX,
-        RuntimeResource::none(),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+fn construct_join(root: &TestStore, definition: &EquiJoinDefinition) -> (Operation, Transactions) {
+    let mut setup = StoreSetup::new();
+    let (operation, _) = (definition as &dyn dogpaddle_operation::OperationDefinition)
+        .construct(
+            &[left_schema(), right_schema()],
+            &mut setup.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     (operation, transactions)
 }
 
-fn open_join_operation(store: &Store, definition: &EquiJoinDefinition) -> Operation {
-    let binding = (definition as &dyn OperationDefinition)
-        .bind(&[left_schema(), right_schema()])
-        .unwrap();
-    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
+fn reopen_join(store: &Store, definition: &EquiJoinDefinition) -> Operation {
+    (definition as &dyn dogpaddle_operation::OperationDefinition)
+        .construct(
+            &[left_schema(), right_schema()],
+            &mut store.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0
 }
 
 fn resource_names(kind: EquiJoinKind, has_residual: bool) -> Vec<&'static str> {
@@ -862,8 +865,9 @@ fn every_kind_has_a_literal_tag_layout_and_exact_nullable_schema() {
         };
         assert_eq!(resource_names(kind, false), expected_data);
 
-        let binding = bind(decoded.as_ref(), &[left_schema(), right_schema()]).unwrap();
-        let output = binding.output_schema().unwrap();
+        let binding =
+            construct_checked(decoded.as_ref(), &[left_schema(), right_schema()]).unwrap();
+        let output = binding.as_ref().unwrap();
         assert_eq!(
             output
                 .fields()
@@ -910,7 +914,7 @@ fn residual_round_trips_with_qualified_pair_binding_and_selects_match_count_layo
             ]
         };
         assert_eq!(resource_names(kind, true), expected_data);
-        bind(&definition, &[left_schema(), right_schema()]).unwrap();
+        construct_checked(&definition, &[left_schema(), right_schema()]).unwrap();
     }
 
     let definition = residual_definition(EquiJoinKind::LeftSemi);
@@ -920,11 +924,9 @@ fn residual_round_trips_with_qualified_pair_binding_and_selects_match_count_layo
         16,
         OperationKind::TurnTransform(NonZeroU32::new(2).unwrap()),
     );
-    let output = bind(decoded.as_ref(), &[left_schema(), right_schema()])
+    let output = construct_checked(decoded.as_ref(), &[left_schema(), right_schema()])
         .unwrap()
-        .output_schema()
-        .unwrap()
-        .clone();
+        .unwrap();
     assert_eq!(output.fields().len(), left_schema().fields().len());
 }
 
@@ -958,7 +960,7 @@ fn residual_binding_rejects_non_boolean_missing_and_ambiguous_columns() {
         )
         .unwrap();
         let Err(OperationBindError::Rejected { source }) =
-            bind(&definition, &[left_schema(), right_schema()])
+            construct_checked(&definition, &[left_schema(), right_schema()])
         else {
             panic!("invalid residual unexpectedly bound")
         };

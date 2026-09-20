@@ -1,7 +1,8 @@
-use std::{any::TypeId, error::Error, fmt::Debug, num::NonZeroU32};
+use std::{error::Error, fmt::Debug, num::NonZeroU32};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{SchemaError, validate_schema};
+use dogpaddle_store::DataScope;
 use thiserror::Error;
 
 use crate::{
@@ -10,49 +11,59 @@ use crate::{
 };
 
 mod private {
+    use super::ConstructedOperation;
+    use crate::{OperationSetupError, RuntimeResource};
     use arrow_schema::SchemaRef;
-
-    use super::{OperationBinding, OperationSchemaError};
+    use dogpaddle_store::DataScope;
+    use std::any::TypeId;
 
     pub trait Sealed {
-        fn bind_schemas(
+        fn output_schema_unchecked(
             &self,
-            input_schemas: &[SchemaRef],
-        ) -> Result<OperationBinding, OperationSchemaError>;
+            inputs: &[SchemaRef],
+        ) -> Result<Option<SchemaRef>, crate::OperationSchemaError>;
+        fn construct_unchecked(
+            &self,
+            inputs: &[SchemaRef],
+            data: &mut DataScope<'_>,
+            prefix: &str,
+            resource: RuntimeResource,
+        ) -> Result<ConstructedOperation, OperationSetupError>;
+        fn resource_type(&self) -> Option<TypeId> {
+            None
+        }
     }
 }
-
 pub(crate) use private::Sealed;
 
-/// Type-erased Schema rejection from one concrete Operation definition.
+/// Type-erased error from a concrete operation's pure Schema compiler.
 pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
 
-/// Complete structural kind explicitly declared by an Operation definition.
+/// Declared execution role, exact input arity, and station-fusion capability of an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OperationKind {
-    /// Produces records without consuming input.
+    /// Zero-input source driven by turns.
     Scan,
-    /// Completely consumes one input Change inside the Station transaction.
+    /// Transaction-local transform with the given nonzero input arity.
     AtomicTransform(NonZeroU32),
-    /// Owns a full, replayable turn and may lead a Station's atomic tail.
+    /// Turn-based transform that may head an atomic tail.
     TurnTransform(NonZeroU32),
-    /// Owns a full turn and requires a durable output boundary before downstream work.
+    /// Transform that must occupy its own station.
     ExclusiveTransform(NonZeroU32),
-    /// Consumes input records without producing output.
+    /// Outputless terminal operation.
     Sink(NonZeroU32),
 }
-
 impl OperationKind {
     /// Returns the exact number of ordered inputs.
     #[must_use]
     pub const fn input_count(self) -> u32 {
         match self {
             Self::Scan => 0,
-            Self::AtomicTransform(count)
-            | Self::TurnTransform(count)
-            | Self::ExclusiveTransform(count)
-            | Self::Sink(count) => count.get(),
+            Self::AtomicTransform(n)
+            | Self::TurnTransform(n)
+            | Self::ExclusiveTransform(n)
+            | Self::Sink(n) => n.get(),
         }
     }
 
@@ -86,206 +97,152 @@ impl OperationKind {
     /// Returns whether this kind owns an output stream.
     #[must_use]
     pub const fn has_output(self) -> bool {
-        matches!(
-            self,
-            Self::Scan
-                | Self::AtomicTransform(_)
-                | Self::TurnTransform(_)
-                | Self::ExclusiveTransform(_)
-        )
+        !matches!(self, Self::Sink(_))
     }
 }
 
-/// Pure definition shared by every built-in operation.
+/// Sealed persistent operation plan with authoritative pure Schema derivation and final construction.
 pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
-    /// Returns the Operation's explicitly declared structural kind and input arity.
+    /// Returns the operation's declared execution role and exact input arity.
     fn kind(&self) -> OperationKind;
-
-    /// Returns this definition's stable persistent tag.
     #[doc(hidden)]
     fn persistence_tag(&self) -> u16;
-
-    /// Appends this definition's variant-specific persistent payload.
     #[doc(hidden)]
     fn encode_payload(&self, output: &mut Vec<u8>);
 }
 
-impl dyn OperationDefinition + '_ {
-    /// Purely binds this definition to ordered, exact logical input Schemas.
-    ///
-    /// Inputs follow their zero-based port order; Scans receive an empty slice.
-    /// Binding may depend only on the persistent Definition and these Schemas:
-    /// it must not access Store, external registries, time, or randomness.
-    /// A `TurnTransform` must remain replayable from unchanged durable state if
-    /// a later atomic tail or final output admission rolls its transaction back.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OperationBindError`] when arity, Schema, or execution capability is invalid.
-    pub fn bind(
-        &self,
-        input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationBindError> {
-        let kind = self.kind();
-        let expected = kind.input_count() as usize;
-        let actual = input_schemas.len();
-        if actual != expected {
-            return Err(OperationBindError::InputCount { expected, actual });
-        }
-        for (input, schema) in input_schemas.iter().enumerate() {
-            validate_schema(schema)
-                .map_err(|source| OperationBindError::InvalidInputSchema { input, source })?;
-        }
-        let mut binding = private::Sealed::bind_schemas(self, input_schemas)
-            .map_err(|source| OperationBindError::Rejected { source })?;
-        match (kind.has_output(), binding.output_schema.as_ref()) {
-            (true, None) => return Err(OperationBindError::MissingOutput),
-            (false, Some(_)) => return Err(OperationBindError::UnexpectedOutput),
-            (true, Some(schema)) => validate_schema(schema)
-                .map_err(|source| OperationBindError::InvalidOutputSchema { source })?,
-            (false, None) => {}
-        }
-        if !binding.body.supports(kind) {
-            return Err(OperationBindError::ExecutionKind);
-        }
-        binding.kind = kind;
-        Ok(binding)
-    }
+/// Final runtime operation paired with its checked logical output Schema metadata.
+pub struct ConstructedOperation {
+    operation: Operation,
+    output_schema: Option<SchemaRef>,
 }
-
-/// One pure, ephemeral binding of an Operation definition to exact input Schemas.
-#[doc(hidden)]
-pub struct OperationBinding {
-    pub(crate) output_schema: Option<SchemaRef>,
-    pub(crate) kind: OperationKind,
-    pub(crate) body: BoundBody,
-}
-
-pub(crate) enum BoundBody {
-    AtomicReady(Box<dyn AtomicOperation>),
-    TurnReady(Box<dyn TurnOperation>),
-    Sequence(crate::operation::scan::sequence::BoundSequence),
-    PostgresCdc(Box<crate::operation::scan::postgres_cdc::BoundPostgresCdc>),
-    MySqlCdc(Box<crate::operation::scan::mysql_cdc::BoundMySqlCdc>),
-    RunningEventCount(crate::operation::transform::running_event_count::BoundRunningEventCount),
-    Distinct(crate::operation::transform::distinct::BoundDistinct),
-    Aggregate(Box<crate::operation::transform::aggregate::BoundAggregateOperation>),
-    EquiJoin(Box<crate::operation::transform::equi_join::BoundEquiJoin>),
-    AsOfJoin(Box<crate::operation::transform::asof_join::BoundAsOfJoin>),
-    SqliteSink(Box<crate::operation::sink::sqlite::BoundSqliteSink>),
-    PostgresSink(Box<crate::operation::sink::postgres::BoundPostgresSink>),
-    DorisSink(Box<crate::operation::sink::doris::BoundDorisSink>),
-    ClickHouseSink(Box<crate::operation::sink::clickhouse::BoundClickHouseSink>),
-}
-
-impl BoundBody {
-    fn supports(&self, kind: OperationKind) -> bool {
-        let atomic = matches!(
-            self,
-            Self::AtomicReady(_)
-                | Self::RunningEventCount(_)
-                | Self::Distinct(_)
-                | Self::Aggregate(_)
-        );
-        match kind {
-            OperationKind::AtomicTransform(_) => atomic,
-            OperationKind::ExclusiveTransform(_) => true,
-            OperationKind::Scan | OperationKind::TurnTransform(_) | OperationKind::Sink(_) => {
-                !atomic
-            }
-        }
-    }
-
-    pub(crate) fn resource_type(&self) -> Option<TypeId> {
-        match self {
-            Self::PostgresCdc(_) => Some(TypeId::of::<
-                crate::operation::scan::postgres_cdc::PostgresCdcScanConfig,
-            >()),
-            Self::MySqlCdc(_) => Some(TypeId::of::<
-                crate::operation::scan::mysql_cdc::MySqlCdcScanConfig,
-            >()),
-            Self::PostgresSink(_) => Some(TypeId::of::<
-                crate::operation::sink::postgres::PostgresSinkConfig,
-            >()),
-            Self::DorisSink(_) => {
-                Some(TypeId::of::<crate::operation::sink::doris::DorisSinkConfig>())
-            }
-            Self::ClickHouseSink(_) => Some(TypeId::of::<
-                crate::operation::sink::clickhouse::ClickHouseSinkConfig,
-            >()),
-            _ => None,
-        }
-    }
-}
-
-impl OperationBinding {
-    pub(crate) fn atomic_ready(output_schema: SchemaRef, operation: impl AtomicOperation) -> Self {
+impl ConstructedOperation {
+    pub(crate) fn atomic(schema: SchemaRef, op: impl AtomicOperation) -> Self {
         Self {
-            output_schema: Some(output_schema),
-            kind: OperationKind::AtomicTransform(NonZeroU32::MIN),
-            body: BoundBody::AtomicReady(Box::new(operation)),
+            operation: Operation::Atomic(Box::new(op)),
+            output_schema: Some(schema),
         }
     }
 
-    pub(crate) fn turn_ready(
-        output_schema: Option<SchemaRef>,
-        operation: impl TurnOperation,
-    ) -> Self {
+    pub(crate) fn turn(schema: Option<SchemaRef>, op: impl TurnOperation) -> Self {
         Self {
+            operation: Operation::Turn(Box::new(op)),
+            output_schema: schema,
+        }
+    }
+
+    pub(crate) fn new(operation: Operation, output_schema: Option<SchemaRef>) -> Self {
+        Self {
+            operation,
             output_schema,
-            kind: OperationKind::Scan,
-            body: BoundBody::TurnReady(Box::new(operation)),
         }
     }
 
-    pub(crate) fn bound(output_schema: Option<SchemaRef>, body: BoundBody) -> Self {
-        Self {
-            output_schema,
-            kind: OperationKind::Scan,
-            body,
-        }
-    }
-
-    /// Checks the resource's presence and exact type without accessing it.
-    ///
-    /// # Errors
-    /// Returns an error for a missing, unexpected, or wrong-type resource.
-    pub fn validate_resource(
-        &self,
-        resource: &RuntimeResource,
-    ) -> Result<(), crate::OperationSetupError> {
-        resource.validate(self.body.resource_type())
-    }
-
-    /// Returns the exact logical output Schema, or `None` for a Sink binding.
-    #[doc(hidden)]
+    /// Borrows the final checked logical output Schema, if this operation has output.
     #[must_use]
     pub const fn output_schema(&self) -> Option<&SchemaRef> {
         self.output_schema.as_ref()
     }
 
-    pub(crate) fn normalize(
-        kind: OperationKind,
-        operation: Operation,
-    ) -> Result<Operation, crate::OperationSetupError> {
-        match (kind, operation) {
-            (OperationKind::ExclusiveTransform(_), Operation::Atomic(operation)) => {
-                Ok(Operation::Turn(exclusive_turn(operation)))
+    /// Consumes the result into its runnable operation and output Schema metadata.
+    #[must_use]
+    pub fn into_parts(self) -> (Operation, Option<SchemaRef>) {
+        (self.operation, self.output_schema)
+    }
+}
+
+impl dyn OperationDefinition + '_ {
+    /// Purely derives the exact logical output Schema from this definition and its inputs.
+    ///
+    /// This path performs the same checked Schema compilation used by final construction, but
+    /// declares no Store data and creates no runtime operation.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input arity or Schemas, a concrete Schema rejection, or an
+    /// output whose presence or logical Schema violates the declared operation kind.
+    pub fn output_schema(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, OperationBindError> {
+        validate_inputs(self.kind(), inputs)?;
+        let output = private::Sealed::output_schema_unchecked(self, inputs)
+            .map_err(|source| OperationBindError::Rejected { source })?;
+        validate_output(self.kind(), output.as_ref())?;
+        Ok(output)
+    }
+
+    /// Constructs the final runtime operation and exact output Schema through the only checked path.
+    /// Resource metadata is checked before concrete code may access Store data.
+    /// Construction performs no transactions, state reads, or external I/O.
+    ///
+    /// # Errors
+    /// Returns an error for invalid arity/Schemas, resources, typed data, or execution capability.
+    pub fn construct(
+        &self,
+        inputs: &[SchemaRef],
+        data: &mut DataScope<'_>,
+        prefix: &str,
+        resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, OperationSetupError> {
+        let kind = self.kind();
+        validate_inputs(kind, inputs)?;
+        resource.validate(private::Sealed::resource_type(self))?;
+        let mut built = private::Sealed::construct_unchecked(self, inputs, data, prefix, resource)?;
+        validate_output(kind, built.output_schema.as_ref())?;
+        built.operation = match (kind, built.operation) {
+            (OperationKind::ExclusiveTransform(_), Operation::Atomic(op)) => {
+                Operation::Turn(exclusive_turn(op))
             }
-            (OperationKind::AtomicTransform(_), operation @ Operation::Atomic(_))
+            (OperationKind::AtomicTransform(_), op @ Operation::Atomic(_))
             | (
                 OperationKind::Scan
                 | OperationKind::TurnTransform(_)
                 | OperationKind::ExclusiveTransform(_)
                 | OperationKind::Sink(_),
-                operation @ Operation::Turn(_),
-            ) => Ok(operation),
-            _ => Err(crate::OperationSetupError::ExecutionKind),
-        }
+                op @ Operation::Turn(_),
+            ) => op,
+            _ => return Err(OperationSetupError::ExecutionKind),
+        };
+        Ok(built)
+    }
+
+    /// Preflights runtime-resource presence and exact type.
+    ///
+    /// # Errors
+    /// Returns an error for a missing, unexpected, or wrong-type resource.
+    pub fn validate_resource(&self, resource: &RuntimeResource) -> Result<(), OperationSetupError> {
+        resource.validate(private::Sealed::resource_type(self))
     }
 }
 
-/// Failure while binding one Operation definition to exact logical Schemas.
+fn validate_inputs(kind: OperationKind, inputs: &[SchemaRef]) -> Result<(), OperationBindError> {
+    let expected = kind.input_count() as usize;
+    if inputs.len() != expected {
+        return Err(OperationBindError::InputCount {
+            expected,
+            actual: inputs.len(),
+        });
+    }
+    for (input, schema) in inputs.iter().enumerate() {
+        validate_schema(schema)
+            .map_err(|source| OperationBindError::InvalidInputSchema { input, source })?;
+    }
+    Ok(())
+}
+
+fn validate_output(
+    kind: OperationKind,
+    output: Option<&SchemaRef>,
+) -> Result<(), OperationBindError> {
+    match (kind.has_output(), output) {
+        (true, None) => Err(OperationBindError::MissingOutput),
+        (false, Some(_)) => Err(OperationBindError::UnexpectedOutput),
+        (true, Some(schema)) => validate_schema(schema)
+            .map_err(|source| OperationBindError::InvalidOutputSchema { source }),
+        (false, None) => Ok(()),
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum OperationBindError {
@@ -302,15 +259,61 @@ pub enum OperationBindError {
         #[source]
         source: OperationSchemaError,
     },
-    #[error("operation kind requires an output schema but its binding has none")]
+    #[error("operation kind requires an output schema but construction has none")]
     MissingOutput,
-    #[error("outputless operation kind bound an output schema")]
+    #[error("outputless operation kind constructed an output schema")]
     UnexpectedOutput,
     #[error("operation output schema is invalid: {source}")]
     InvalidOutputSchema {
         #[source]
         source: SchemaError,
     },
-    #[error("operation binding execution capability does not match its declared kind")]
+    #[error("operation execution capability does not match its declared kind")]
     ExecutionKind,
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum OperationSetupError {
+    #[error(transparent)]
+    Bind(#[from] OperationBindError),
+    #[error("operation rejected its input schemas: {source}")]
+    Schema {
+        #[source]
+        source: OperationSchemaError,
+    },
+    #[error("operation runtime resource was not provided")]
+    MissingRuntimeResource,
+    #[error("operation runtime resource has the wrong type")]
+    WrongRuntimeResource,
+    #[error("operation does not accept a runtime resource")]
+    UnexpectedRuntimeResource,
+    #[error("operation data {name:?} could not be declared or opened: {source}")]
+    Store {
+        name: String,
+        #[source]
+        source: dogpaddle_store::StoreError,
+    },
+    #[error("operation construction execution capability does not match its declared kind")]
+    ExecutionKind,
+}
+
+pub(crate) fn schema_error<E>(source: E) -> OperationSetupError
+where
+    E: Into<OperationSchemaError>,
+{
+    OperationSetupError::Schema {
+        source: source.into(),
+    }
+}
+
+pub(crate) fn data<D: dogpaddle_store::StoreData>(
+    scope: &mut DataScope<'_>,
+    prefix: &str,
+    logical: &str,
+) -> Result<D, OperationSetupError> {
+    let name = format!("{prefix}/{logical}");
+    scope
+        .data(&name)
+        .map_err(|source| OperationSetupError::Store { name, source })
 }

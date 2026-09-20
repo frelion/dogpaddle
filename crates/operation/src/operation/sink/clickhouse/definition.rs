@@ -1,25 +1,23 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{any::TypeId, num::NonZeroU32, sync::Arc};
 
 use arrow_schema::SchemaRef;
 
 use super::{
-    config::ClickHouseTargetSpec,
+    buffered,
+    config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
     error::{ClickHouseSinkError, invalid_spec},
+    relation::RelationSinkTarget,
     schema::ClickHouseLayout,
+    target::ClickHouseTarget,
 };
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
-    definition::{BoundBody, Sealed},
+    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
+    RuntimeResource,
+    definition::{Sealed, schema_error},
 };
 
 pub(crate) const TAG: u16 = 19;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
-
-pub(crate) struct BoundClickHouseSink {
-    pub(super) target: ClickHouseTargetSpec,
-    pub(super) input_schema: SchemaRef,
-}
 
 /// Pure definition of a sink-owned `ClickHouse` relation target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,24 +49,37 @@ impl ClickHouseSinkDefinition {
 }
 
 impl Sealed for ClickHouseSinkDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        ClickHouseLayout::try_new(Arc::clone(&inputs[0]))?;
+        Ok(None)
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        data: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces ClickHouse sink input arity");
-        let _layout = ClickHouseLayout::try_new(Arc::clone(input_schema))
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        let target = self.target.clone();
+        let layout = ClickHouseLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
-        Ok(OperationBinding::bound(
-            None,
-            BoundBody::ClickHouseSink(Box::new(BoundClickHouseSink {
-                target,
-                input_schema,
-            })),
-        ))
+        let config = resource.take::<ClickHouseSinkConfig>()?;
+        let target = RelationSinkTarget::new(ClickHouseTarget::new_bound(
+            config,
+            self.target.clone(),
+            layout,
+        ));
+        buffered::construct(input_schema, target, data, prefix)
+    }
+
+    fn resource_type(&self) -> Option<TypeId> {
+        Some(TypeId::of::<ClickHouseSinkConfig>())
     }
 }
 

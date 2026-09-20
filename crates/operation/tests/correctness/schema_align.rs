@@ -19,9 +19,9 @@ use dogpaddle_operation::{
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    decode_hex, project_input_schema, rollback_ready, roundtripped_output, stateless_operation,
-    temporal_and_decimal_change, turn_input, value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
+    construct_checked, decode_hex, project_input_schema, rollback_ready, roundtripped_output,
+    stateless_operation, temporal_and_decimal_change, turn_input, value_schema,
 };
 
 const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
@@ -106,8 +106,8 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     );
 
     let schema = value_schema();
-    let binding = decoded.bind(std::slice::from_ref(&schema)).unwrap();
-    let output_schema = binding.output_schema().unwrap();
+    let constructed = construct_checked(decoded.as_ref(), std::slice::from_ref(&schema)).unwrap();
+    let output_schema = constructed.as_ref().unwrap();
     assert_eq!(output_schema.metadata().get("owner").unwrap(), "test");
     assert_eq!(output_schema.field(0).name(), "renamed");
     assert!(output_schema.field(0).is_nullable());
@@ -258,7 +258,8 @@ fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
 fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
     let input = project_input_schema();
     let missing = align([SchemaAlignField::try_new("missing", col("missing"), true).unwrap()]);
-    let Err(OperationBindError::Rejected { source }) = bind(&missing, std::slice::from_ref(&input))
+    let Err(OperationBindError::Rejected { source }) =
+        construct_checked(&missing, std::slice::from_ref(&input))
     else {
         panic!("SchemaAlign missing-column expression unexpectedly bound");
     };
@@ -272,7 +273,7 @@ fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
 
     let narrowed = align([SchemaAlignField::try_new("message", col("message"), false).unwrap()]);
     let Err(OperationBindError::Rejected { source }) =
-        bind(&narrowed, std::slice::from_ref(&input))
+        construct_checked(&narrowed, std::slice::from_ref(&input))
     else {
         panic!("SchemaAlign nullable-to-non-null field unexpectedly bound");
     };
@@ -283,9 +284,8 @@ fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
 
     let widened = align([SchemaAlignField::try_new("id", col("id"), true).unwrap()]);
     assert!(
-        bind(&widened, std::slice::from_ref(&input))
+        construct_checked(&widened, std::slice::from_ref(&input))
             .unwrap()
-            .output_schema()
             .unwrap()
             .field(0)
             .is_nullable()
@@ -296,7 +296,7 @@ fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
         SchemaAlignField::try_new("same", col("score"), false).unwrap(),
     ]);
     assert!(matches!(
-        bind(&duplicate, std::slice::from_ref(&input)),
+        construct_checked(&duplicate, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::DuplicateField { ref name, .. }
         }) if name == "same"
@@ -308,7 +308,7 @@ fn schema_align_rejects_expression_failures_and_nullability_narrowing() {
     )
     .unwrap();
     assert!(matches!(
-        bind(&reserved_metadata, std::slice::from_ref(&input)),
+        construct_checked(&reserved_metadata, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::ReservedMetadataKey { ref key, .. }
         }) if key == "dogpaddle.private"

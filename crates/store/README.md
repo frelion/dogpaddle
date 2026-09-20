@@ -68,13 +68,18 @@ Store 刻意把生命周期分成两段：
 | setup | 创建或打开具名资源，固定资源类型和名字 | `Store`、`StoreSetup` |
 | runtime | 读取和更新已经声明的资源 | `Transactions`、`ReadTransactions` |
 
-普通使用可以调用 `Store::create` / `Store::open`，再逐个 `create_data` / `open_data`。Flow 构建时需要一次
-发布完整资源集合，因此使用 `Store::setup`：资源先暂存在 setup 中，最后由 `StoreSetup::commit` 把 catalog、
-初始状态和 Flow Definition 放进同一笔同步事务。
+普通使用可以调用 `Store::create` / `Store::open`，再逐个 `create_data` / `open_data`。需要一次发布完整资源集合时，
+先用 `StoreSetup::new()` 建立纯内存 draft；资源声明只分配最终 Store token、catalog namespace 和 typed handle，
+不会创建路径。最后由 `StoreSetup::commit(path, initialize)` 创建数据库，并把 marker、完整 catalog、初始状态和
+owner Definition 放进同一笔同步事务。
 
 `StoreSetup` 不是普通 `Store`：它不能读取或打开资源，也不能直接进入 runtime。`commit` 无论成功、初始化失败，
-还是遇到结果不确定的底层提交错误，都会消费这个 setup owner；不能在失败后继续追加资源。未 commit 就丢弃时，
-磁盘只留下一个可重新打开的 marker-only 空 Store。
+还是遇到结果不确定的底层提交错误，都会消费这个 setup owner；不能在失败后继续追加资源。丢弃未 commit 的 draft
+没有文件系统副作用；commit 开始后失败则可能留下没有 marker 的 incomplete path，`Store::open` 必须拒绝它。
+
+短期装配代码可以通过 `StoreSetup::data_scope()` 或 `Store::data_scope()` 取得 `DataScope`。前者固定为 declare，
+`data::<D>(name)` 只创建新 binding 并拒绝重复名；后者固定为 existing，只查找已有 binding 并拒绝缺失或 kind
+不匹配。`DataScope` 不暴露事务、读取、裸 ID 或模式切换。
 
 `Store::into_transactions` 结束 setup，返回唯一的写事务启动能力。调用 `split` 后得到两种能力：
 
@@ -136,9 +141,9 @@ use std::{num::NonZeroU64, path::Path};
 use dogpaddle_store::{Store, SubscribedLog};
 
 fn build(path: &Path) -> Result<(), dogpaddle_store::StoreError> {
-    let mut setup = Store::setup(path)?;
+    let mut setup = dogpaddle_store::StoreSetup::new();
     let log = setup.create_data::<SubscribedLog<Vec<u8>>>("output")?;
-    let _transactions = setup.commit(|access| {
+    let _transactions = setup.commit(path, |access| {
         log.initialize(NonZeroU64::MIN, access)
     })?;
     let _writer = log.writer();
@@ -197,8 +202,9 @@ Store 在返回前完成准入、复制和完整解码；错误不会交付半�
 multiset underflow/overflow，以及非法 subscription acknowledgement。之后的访问返回
 `StoreError::TransactionPoisoned`，写事务不能提交。
 
-底层 commit 返回存储错误时，结果可能不确定。setup owner 必须丢弃当前对象，再通过 reopen 判断；Flow 运行期
-则进入 fail-stop，并要求重新打开 Flow。Store 不用额外日志去猜测一次不确定提交的结果。
+`StoreSetup::commit` 会消费 draft。初始化闭包确定失败时会留下没有有效 marker 的不完整目录，不能作为 Store 打开；
+底层 `RocksDB` commit 返回存储错误时结果可能不确定，只能通过 reopen 判断。Flow 运行期遇到不确定提交则进入
+fail-stop，并要求重新打开 Flow。Store 不用额外日志去猜测一次不确定提交的结果。
 
 `Cell`、Map、Multiset 和 `Queue` handle 可以 clone，但每次访问都会检查它属于当前事务所在的 Store。
 完整 `SubscribedLog` setup handle、writer 和 subscription 都不可 clone；应在 setup 时各派生一次并 move 给唯一 owner。

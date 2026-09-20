@@ -5,9 +5,8 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
-    definition::Sealed as SealedDefinition,
+    DefinitionCodecError, OperationDefinition, OperationKind, RuntimeResource,
+    definition::{ConstructedOperation, Sealed as SealedDefinition},
     operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
@@ -50,11 +49,21 @@ impl DiscardDefinition {
 }
 
 impl SealedDefinition for DiscardDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
         &self,
         _input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::turn_ready(None, DiscardOperation))
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        Ok(None)
+    }
+
+    fn construct_unchecked(
+        &self,
+        _input_schemas: &[SchemaRef],
+        _data: &mut dogpaddle_store::DataScope<'_>,
+        _prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        Ok(ConstructedOperation::turn(None, DiscardOperation))
     }
 }
 

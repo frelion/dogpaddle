@@ -1,6 +1,6 @@
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, create_operation,
-    decode_definition, encode_definition, open_operation,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
+    encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{
@@ -9,14 +9,21 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Queue, Store, Transactions};
+use dogpaddle_store::{Cell, Queue, Store, StoreSetup, Transactions};
 use std::{
     num::{NonZeroU32, NonZeroU64},
     path::Path,
     time::Duration,
 };
 
-use super::support::decode_hex;
+use super::support::{construct_checked_with_resource, decode_hex};
+
+fn construct_checked(
+    definition: &dyn OperationDefinition,
+    inputs: &[arrow_schema::SchemaRef],
+) -> Result<Option<arrow_schema::SchemaRef>, dogpaddle_operation::OperationBindError> {
+    construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config()))
+}
 
 fn definition() -> PostgresCdcScanDefinition {
     PostgresCdcScanDefinition::try_new(
@@ -67,8 +74,8 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     assert_eq!(decoded.kind(), OperationKind::Scan);
     assert_eq!(decoded.persistence_tag(), 11);
     assert_eq!(encode_definition(decoded.as_ref()), bytes);
-    let binding = decoded.bind(&[]).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(decoded.as_ref(), &[]).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.fields().len(), 1);
     assert_eq!(output.field(0).name(), "id");
     assert_eq!(output.field(0).data_type(), &arrow_schema::DataType::Int64);
@@ -87,16 +94,17 @@ fn postgres_cdc_bootstrap_spool_is_a_queue() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state");
     let definition = definition();
-    let binding = (&definition as &dyn OperationDefinition).bind(&[]).unwrap();
-    let mut setup = Store::setup(&path).unwrap();
-    let operation = create_operation(
-        binding,
-        &mut setup,
-        "operation",
-        RuntimeResource::new(config()),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, _) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    let transactions = setup.commit(&path, |_| Ok(())).unwrap();
     drop((operation, transactions));
     Store::open(path)
         .unwrap()
@@ -107,17 +115,16 @@ fn postgres_cdc_bootstrap_spool_is_a_queue() {
 #[test]
 fn postgres_cdc_materialization_requires_one_exact_runtime_resource() {
     let definition = definition();
-    let binding = (&definition as &dyn OperationDefinition).bind(&[]).unwrap();
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::none()),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::none()),
         Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::new(42_u64)),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
-        binding
+        (&definition as &dyn OperationDefinition)
             .validate_resource(&RuntimeResource::new(config()))
             .is_ok()
     );
@@ -133,26 +140,34 @@ struct Fixture {
 impl Fixture {
     fn create(path: &Path) -> Self {
         let definition = definition();
-        let binding = (&definition as &dyn OperationDefinition).bind(&[]).unwrap();
-        let mut setup = Store::setup(path).unwrap();
-        let operation = create_operation(
-            binding,
-            &mut setup,
-            "operation",
-            RuntimeResource::new(config()),
-        )
-        .unwrap();
-        let transactions = setup.commit(|_| Ok(())).unwrap();
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::new(config()),
+            )
+            .unwrap()
+            .into_parts();
+        let transactions = setup.commit(path, |_| Ok(())).unwrap();
         drop((operation, transactions));
         Self::open(Store::open(path).unwrap())
     }
 
     fn open(store: Store) -> Self {
         let definition = decode_definition(&literal_definition_bytes()).unwrap();
-        let binding = definition.bind(&[]).unwrap();
+        let (scan, _) = definition
+            .construct(
+                &[],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::new(config()),
+            )
+            .unwrap()
+            .into_parts();
         Self {
-            scan: open_operation(binding, &store, "operation", RuntimeResource::new(config()))
-                .unwrap(),
+            scan,
             phase: store
                 .open_data("operation/postgres_cdc_scan.phase")
                 .unwrap(),
@@ -314,7 +329,7 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
         if let Ok(definition) =
             PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap())
         {
-            assert!((&definition as &dyn OperationDefinition).bind(&[]).is_err());
+            assert!(construct_checked(&definition, &[]).is_err());
         }
     }
 }

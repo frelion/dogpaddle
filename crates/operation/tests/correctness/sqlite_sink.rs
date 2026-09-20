@@ -9,17 +9,18 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
-    OperationSetupError, RuntimeResource, create_operation, decode_definition, encode_definition,
-    open_operation,
+    OperationSetupError, RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
-use super::support::{TestStore, assert_literal_definition, bind, decode_hex, value_schema};
+use super::support::{
+    TestStore, assert_literal_definition, construct_checked, decode_hex, value_schema,
+};
 
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
@@ -40,10 +41,8 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
     );
     assert_eq!(sqlite.table_name(), "events");
     assert!(
-        decoded
-            .bind(&[value_schema()])
+        construct_checked(decoded.as_ref(), &[value_schema()])
             .unwrap()
-            .output_schema()
             .is_none()
     );
 
@@ -208,17 +207,15 @@ fn sqlite_sink_binding_accepts_zero_and_1998_logical_columns() {
     let definition = SqliteSinkDefinition::try_new("/tmp/output.sqlite", "events").unwrap();
     let empty = Arc::new(Schema::empty());
     assert!(
-        bind(&definition, std::slice::from_ref(&empty))
+        construct_checked(&definition, std::slice::from_ref(&empty))
             .unwrap()
-            .output_schema()
             .is_none()
     );
 
     let empty_name = Arc::new(Schema::new(vec![Field::new("", DataType::Utf8, true)]));
     assert!(
-        bind(&definition, std::slice::from_ref(&empty_name))
+        construct_checked(&definition, std::slice::from_ref(&empty_name))
             .unwrap()
-            .output_schema()
             .is_none()
     );
 
@@ -228,9 +225,8 @@ fn sqlite_sink_binding_accepts_zero_and_1998_logical_columns() {
             .collect::<Vec<_>>(),
     ));
     assert!(
-        bind(&definition, std::slice::from_ref(&maximum))
+        construct_checked(&definition, std::slice::from_ref(&maximum))
             .unwrap()
-            .output_schema()
             .is_none()
     );
 
@@ -244,9 +240,8 @@ fn sqlite_sink_binding_accepts_zero_and_1998_logical_columns() {
         Field::new("amount", DataType::Decimal128(38, -4), false),
     ]));
     assert!(
-        bind(&definition, std::slice::from_ref(&temporal_and_decimal))
+        construct_checked(&definition, std::slice::from_ref(&temporal_and_decimal))
             .unwrap()
-            .output_schema()
             .is_none()
     );
 }
@@ -261,7 +256,7 @@ fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
             .collect::<Vec<_>>(),
     ));
     let Err(OperationBindError::Rejected { source }) =
-        bind(&definition, std::slice::from_ref(&too_many))
+        construct_checked(&definition, std::slice::from_ref(&too_many))
     else {
         panic!("a SQLite sink with 1999 logical columns unexpectedly bound");
     };
@@ -279,7 +274,7 @@ fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
         true,
     )]));
     let Err(OperationBindError::Rejected { source }) =
-        bind(&definition, std::slice::from_ref(&nul))
+        construct_checked(&definition, std::slice::from_ref(&nul))
     else {
         panic!("a SQLite sink field containing NUL unexpectedly bound");
     };
@@ -293,7 +288,7 @@ fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
         Field::new("name", DataType::Utf8, true),
     ]));
     let Err(OperationBindError::Rejected { source }) =
-        bind(&definition, std::slice::from_ref(&duplicate))
+        construct_checked(&definition, std::slice::from_ref(&duplicate))
     else {
         panic!("ASCII case-insensitive SQLite field collision unexpectedly bound");
     };
@@ -311,7 +306,7 @@ fn sqlite_sink_binding_rejects_sqlite_identifier_collisions_and_1999_columns() {
     ] {
         let collision = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
         let Err(OperationBindError::Rejected { source }) =
-            bind(&definition, std::slice::from_ref(&collision))
+            construct_checked(&definition, std::slice::from_ref(&collision))
         else {
             panic!("SQLite technical field collision unexpectedly bound");
         };
@@ -330,18 +325,23 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let fixture = TestStore::new();
     let sqlite_path = fixture.path().with_extension("sqlite");
     let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
-    let binding = (&definition as &dyn OperationDefinition)
-        .bind(&[value_schema()])
-        .unwrap();
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::new(42_u64)),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::UnexpectedRuntimeResource)
     ));
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let operation =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[value_schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
     assert!(!sqlite_path.exists());
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
 
     let store = Store::open(fixture.path()).unwrap();
@@ -351,15 +351,16 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     store
         .open_data::<OrderedMap<u64, Vec<u8>>>("operation/sink.buffer")
         .unwrap();
-    let operation = open_operation(
-        (&definition as &dyn OperationDefinition)
-            .bind(&[value_schema()])
-            .unwrap(),
-        &store,
-        "operation",
-        RuntimeResource::none(),
-    )
-    .unwrap();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[value_schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
     assert!(!sqlite_path.exists());
     drop(operation);
 }
@@ -378,13 +379,18 @@ impl Fixture {
         let definition =
             SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events").unwrap();
         let encoded = encode_definition(&definition);
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[schema()])
-            .unwrap();
-        let mut setup = Store::setup(root.path()).unwrap();
-        let operation =
-            create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-        let transactions = setup.commit(|_| Ok(())).unwrap();
+        let mut setup = StoreSetup::new();
+        let (operation, output) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[schema()],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .unwrap()
+            .into_parts();
+        assert!(output.is_none());
+        let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
         Self::open(root, encoded, store)
@@ -392,13 +398,16 @@ impl Fixture {
 
     fn open(root: TestStore, definition: Vec<u8>, store: Store) -> Self {
         let decoded = decode_definition(&definition).unwrap();
-        let operation = open_operation(
-            decoded.bind(&[schema()]).unwrap(),
-            &store,
-            "operation",
-            RuntimeResource::none(),
-        )
-        .unwrap();
+        let (operation, output) = decoded
+            .construct(
+                &[schema()],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .unwrap()
+            .into_parts();
+        assert!(output.is_none());
         let state = store.open_data("operation/sink.control").unwrap();
         Self {
             root,

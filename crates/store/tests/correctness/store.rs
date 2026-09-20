@@ -1,6 +1,6 @@
 use std::fs;
 
-use dogpaddle_store::{Cell, OrderedMap, Store, StoreError};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreError, StoreSetup};
 
 use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
 
@@ -142,39 +142,43 @@ fn catalog_reopens_named_collections_with_isolated_data() {
 }
 
 #[test]
+fn dropping_a_setup_draft_never_creates_its_future_path() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("draft");
+    let mut setup = StoreSetup::new();
+    setup.create_data::<Cell<u64>>("value").unwrap();
+    drop(setup);
+    assert!(!path.exists());
+}
+
+#[test]
 fn staged_setup_publishes_catalog_and_initial_data_atomically() {
     let root = tempfile::tempdir().unwrap();
     let failed_path = root.path().join("failed");
-    let mut setup = Store::setup(&failed_path).unwrap();
+    let mut setup = StoreSetup::new();
     let value = setup.create_data::<Cell<u64>>("value").unwrap();
+    assert!(!failed_path.exists());
     assert!(matches!(
-        setup.commit(|access| {
+        setup.commit(&failed_path, |access| {
             value.access(access)?.set(&42)?;
             Err(StoreError::InvalidScanLimit)
         }),
         Err(StoreError::InvalidScanLimit)
     ));
-
-    let mut store = Store::open(&failed_path).unwrap();
+    assert!(failed_path.exists());
     assert!(matches!(
-        store.open_data::<Cell<u64>>("value"),
-        Err(StoreError::DataNotFound(name)) if name == "value"
+        Store::open(&failed_path),
+        Err(StoreError::InvalidStore)
     ));
-    let value = store.create_data::<Cell<u64>>("value").unwrap();
-    let transactions = store.into_transactions();
-    let (_, reads) = transactions.split();
-    let transaction = reads.begin();
-    assert_eq!(
-        value.read(transaction.access()).unwrap().get().unwrap(),
-        None
-    );
 
     let complete_path = root.path().join("complete");
-    let mut setup = Store::setup(&complete_path).unwrap();
+    let mut setup = StoreSetup::new();
     let value = setup.create_data::<Cell<u64>>("value").unwrap();
     let initialized = value.clone();
     let transactions = setup
-        .commit(|access| initialized.access(access)?.set(&42))
+        .commit(&complete_path, |access| {
+            initialized.access(access)?.set(&42)
+        })
         .unwrap();
     drop(transactions);
 
@@ -184,6 +188,37 @@ fn staged_setup_publishes_catalog_and_initial_data_atomically() {
     assert_eq!(
         value.read(transaction.access()).unwrap().get().unwrap(),
         Some(42)
+    );
+}
+
+#[test]
+fn data_scope_strictly_declares_or_looks_up_typed_data() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut setup = StoreSetup::new();
+    let declared = setup.data_scope().data::<Cell<u64>>("value").unwrap();
+    assert!(matches!(
+        setup.data_scope().data::<Cell<u64>>("value"),
+        Err(StoreError::DataAlreadyExists(name)) if name == "value"
+    ));
+    setup
+        .commit(&path, |access| declared.access(access)?.set(&7))
+        .unwrap();
+
+    let store = Store::open(path).unwrap();
+    let existing = store.data_scope().data::<Cell<u64>>("value").unwrap();
+    assert!(matches!(
+        store.data_scope().data::<OrderedMap<u64, u64>>("value"),
+        Err(StoreError::DataKindMismatch { .. })
+    ));
+    assert!(matches!(
+        store.data_scope().data::<Cell<u64>>("missing"),
+        Err(StoreError::DataNotFound(name)) if name == "missing"
+    ));
+    let transaction = store.read_transaction();
+    assert_eq!(
+        existing.read(transaction.access()).unwrap().get().unwrap(),
+        Some(7)
     );
 }
 

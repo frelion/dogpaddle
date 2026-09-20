@@ -26,8 +26,8 @@ use dogpaddle_operation::{
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, bind, commit_ready, project_input_schema, roundtripped_output, stateless_operation,
-    temporal_and_decimal_change, turn_input,
+    TestStore, commit_ready, construct_checked, project_input_schema, roundtripped_output,
+    stateless_operation, temporal_and_decimal_change, turn_input,
 };
 
 fn filter(predicate: Expr) -> FilterDefinition {
@@ -141,7 +141,7 @@ fn expression_decoder_never_panics_for_valid_header_arbitrary_payloads() {
 #[test]
 fn expression_binding_delegates_planning_errors_and_enforces_filter_results() {
     let input = project_input_schema();
-    let Err(OperationBindError::Rejected { source }) = bind(
+    let Err(OperationBindError::Rejected { source }) = construct_checked(
         &extend("copy", col("missing")),
         std::slice::from_ref(&input),
     ) else {
@@ -155,7 +155,7 @@ fn expression_binding_delegates_planning_errors_and_enforces_filter_results() {
     ));
 
     let Err(OperationBindError::Rejected { source }) =
-        bind(&filter(col("id")), std::slice::from_ref(&input))
+        construct_checked(&filter(col("id")), std::slice::from_ref(&input))
     else {
         panic!("non-Boolean filter predicate unexpectedly bound");
     };
@@ -282,7 +282,7 @@ fn expression_boundaries_reject_external_registry_variables_and_unbound_paramete
 
     let parameter = extend("parameter", placeholder("$1"));
     let Err(OperationBindError::Rejected { source }) =
-        bind(&parameter, std::slice::from_ref(&project_input_schema()))
+        construct_checked(&parameter, std::slice::from_ref(&project_input_schema()))
     else {
         panic!("unbound expression parameter unexpectedly bound");
     };
@@ -302,14 +302,14 @@ fn datafusion_binding_derives_arithmetic_and_cast_output_schema() {
     ]));
 
     let arithmetic = extend("next", cast(col("value"), DataType::Int64) + lit(1_i64));
-    let binding = bind(&arithmetic, std::slice::from_ref(&input)).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&arithmetic, std::slice::from_ref(&input)).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.field(2).data_type(), &DataType::Int64);
     assert!(!output.field(2).is_nullable());
 
     let parsed = extend("parsed", try_cast(col("text"), DataType::Int64));
-    let binding = bind(&parsed, std::slice::from_ref(&input)).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&parsed, std::slice::from_ref(&input)).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.field(2).data_type(), &DataType::Int64);
     assert!(output.field(2).is_nullable());
 }

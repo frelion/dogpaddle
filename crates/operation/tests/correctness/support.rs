@@ -9,11 +9,11 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationBinding, OperationDefinition, OperationKind,
-    RuntimeResource, create_operation, decode_definition, encode_definition,
+    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
+    decode_definition, encode_definition,
     operation::{Action, AfterCommit, Operation, OperationError, OperationInput, Turn},
 };
-use dogpaddle_store::{Store, TransactionAccess, Transactions};
+use dogpaddle_store::{Store, StoreSetup, TransactionAccess, Transactions};
 use tempfile::TempDir;
 
 pub struct TestStore {
@@ -65,24 +65,24 @@ pub fn assert_literal_definition(
     decoded
 }
 
-pub fn bind(
+pub fn construct_checked(
     definition: &dyn OperationDefinition,
     input_schemas: &[SchemaRef],
-) -> Result<OperationBinding, OperationBindError> {
-    definition.bind(input_schemas)
+) -> Result<Option<SchemaRef>, OperationBindError> {
+    let definition = decode_definition(&encode_definition(definition)).unwrap();
+    definition.output_schema(input_schemas)
 }
 
-pub fn setup_operation(
+pub fn construct_checked_with_resource(
     definition: &dyn OperationDefinition,
     input_schemas: &[SchemaRef],
-    fixture: &TestStore,
-    prefix: &str,
-) -> (Operation, Transactions) {
-    let binding = definition.bind(input_schemas).unwrap();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let operation = create_operation(binding, &mut setup, prefix, RuntimeResource::none()).unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
-    (operation, transactions)
+    resource: &RuntimeResource,
+) -> Result<Option<SchemaRef>, OperationBindError> {
+    let definition = decode_definition(&encode_definition(definition)).unwrap();
+    definition
+        .validate_resource(resource)
+        .expect("correctness helper received an invalid runtime resource");
+    definition.output_schema(input_schemas)
 }
 
 pub fn value_schema() -> SchemaRef {
@@ -167,12 +167,18 @@ pub fn stateless_operation(
     definition: &dyn OperationDefinition,
     input_schema: SchemaRef,
 ) -> Operation {
-    let binding = definition.bind(&[input_schema]).unwrap();
     let fixture = TestStore::new();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let operation =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-    let _transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let constructed = <dyn OperationDefinition>::construct(
+        definition,
+        &[input_schema],
+        &mut setup.data_scope(),
+        "operation",
+        RuntimeResource::none(),
+    )
+    .unwrap();
+    let (operation, _) = constructed.into_parts();
+    let _transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     operation
 }
 

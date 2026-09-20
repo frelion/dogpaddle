@@ -1,6 +1,5 @@
 use std::{fmt::Write as _, sync::Arc};
 
-use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use tokio::runtime::Runtime;
 use tokio_postgres::{Client, GenericClient, IsolationLevel, types::ToSql};
@@ -33,10 +32,8 @@ impl PostgresTarget {
     pub(super) fn new_bound(
         config: PostgresSinkConfig,
         spec: PostgresTargetSpec,
-        input_schema: SchemaRef,
+        layout: PostgresLayout,
     ) -> Self {
-        let layout = PostgresLayout::try_new(input_schema)
-            .expect("the sealed Definition binding validated this exact Schema");
         let sql = SqlPlan::new(&spec, &layout);
         Self {
             config,

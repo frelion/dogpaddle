@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_expr::col;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation, open_operation,
+    OperationDefinition, RuntimeResource,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{
@@ -26,7 +26,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{
-    OrderedMap, ReadTransactions, ScanDirection, ScanLimit, Store, Transactions,
+    OrderedMap, ReadTransactions, ScanDirection, ScanLimit, Store, StoreSetup, Transactions,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -495,13 +495,17 @@ impl Fixture {
             residual.then(|| col("right.value").gt(col("left.value"))),
         )
         .expect("define ASOF resource workload");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("bind ASOF resource workload");
-        let mut setup = Store::setup(path).expect("create ASOF resource store");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("create ASOF resource workload");
-        let transactions = setup.commit(|_| Ok(())).expect("commit setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct ASOF resource workload")
+            .into_parts();
+        let transactions = setup.commit(path, |_| Ok(())).expect("commit setup");
         drop((operation, transactions));
         let store = Store::open(path).expect("reopen observational store");
         let left_rows = store
@@ -510,11 +514,15 @@ impl Fixture {
         let right_rows = store
             .open_data::<OrderedMap<Vec<u8>, u64>>("operation/asof_join.right_rows")
             .expect("open observational ASOF right rows");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("rebind ASOF resource workload");
-        let operation = open_operation(binding, &store, "operation", RuntimeResource::none())
-            .expect("open ASOF resource workload");
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("open ASOF resource workload")
+            .into_parts();
         let (transactions, reads) = store.into_transactions().split();
         Self {
             operation,

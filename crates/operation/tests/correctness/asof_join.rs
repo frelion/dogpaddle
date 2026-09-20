@@ -1,3 +1,4 @@
+use crate::support::construct_checked;
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
@@ -5,7 +6,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     Expr, OperationBindError, OperationDefinition, OperationKind, RuntimeResource, ScalarValue,
-    col, create_operation, lit, open_operation,
+    col, lit,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         transform::{
@@ -15,7 +16,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Store, Transactions};
+use dogpaddle_store::{Store, StoreSetup, Transactions};
 
 use crate::support::{TestStore, assert_literal_definition, commit_ready, rollback_ready};
 
@@ -247,7 +248,7 @@ fn repeated_wide_index_expressions_are_bounded_before_turn_work() {
     .unwrap();
     let root = TestStore::new();
     let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
-    let (mut operation, mut transactions) = create_join_operation(&root, &definition, &schemas);
+    let (mut operation, mut transactions) = construct_join_operation(&root, &definition, &schemas);
     let payload = "x".repeat(512 * 1024);
     let change = Change::try_new(
         RecordBatch::try_new(
@@ -286,7 +287,7 @@ impl Fixture {
     fn with_definition(config: Config, definition: AsOfJoinDefinition) -> Self {
         let root = TestStore::new();
         let schemas = [left_schema(), right_schema()];
-        let (operation, transactions) = create_join_operation(&root, &definition, &schemas);
+        let (operation, transactions) = construct_join_operation(&root, &definition, &schemas);
         Self {
             config,
             definition,
@@ -306,7 +307,8 @@ impl Fixture {
         } = self;
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
-        let operation = open_join_operation(&store, &definition, &[left_schema(), right_schema()]);
+        let operation =
+            reconstruct_join_operation(&store, &definition, &[left_schema(), right_schema()]);
         Self {
             config,
             definition,
@@ -352,31 +354,39 @@ impl Fixture {
     }
 }
 
-fn create_join_operation(
+fn construct_join_operation(
     root: &TestStore,
     definition: &dyn OperationDefinition,
     schemas: &[SchemaRef],
 ) -> (Operation, Transactions) {
-    let binding = definition.bind(schemas).unwrap();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = create_operation(
-        binding,
-        &mut setup,
-        OPERATION_PREFIX,
-        RuntimeResource::none(),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let constructed = definition
+        .construct(
+            schemas,
+            &mut setup.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (operation, _) = constructed.into_parts();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     (operation, transactions)
 }
 
-fn open_join_operation(
+fn reconstruct_join_operation(
     store: &Store,
     definition: &dyn OperationDefinition,
     schemas: &[SchemaRef],
 ) -> Operation {
-    let binding = definition.bind(schemas).unwrap();
-    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
+    let constructed = definition
+        .construct(
+            schemas,
+            &mut store.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    constructed.into_parts().0
 }
 
 impl Oracle {
@@ -707,8 +717,8 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
     );
 
     let schemas = [left_schema(), right_schema()];
-    let binding = decoded.bind(&schemas).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(decoded.as_ref(), &schemas).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(
         output
             .fields()
@@ -734,7 +744,7 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
 
     let root = TestStore::new();
     let (mut operation, mut transactions) =
-        create_join_operation(&root, decoded.as_ref(), &schemas);
+        construct_join_operation(&root, decoded.as_ref(), &schemas);
     assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
     let right = right_change(&[right(Some("A"), Some(10), None, 10, 1)]);
     assert!(matches!(
@@ -1443,7 +1453,7 @@ fn scalar_selection(
     let definition = scalar_order_definition(direction, tolerance);
     let root = TestStore::new();
     let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
-    let (mut operation, mut transactions) = create_join_operation(&root, &definition, &schemas);
+    let (mut operation, mut transactions) = construct_join_operation(&root, &definition, &schemas);
 
     let right_values = right
         .iter()
@@ -1879,7 +1889,7 @@ fn tie_break_direction_null_placement_and_canonical_fallback_are_independent() {
 }
 
 fn bind_rejection(definition: &AsOfJoinDefinition, schemas: &[SchemaRef]) -> OperationBindError {
-    match (definition as &dyn OperationDefinition).bind(schemas) {
+    match construct_checked(definition, schemas) {
         Ok(_) => panic!("invalid ASOF definition unexpectedly bound"),
         Err(error) => error,
     }

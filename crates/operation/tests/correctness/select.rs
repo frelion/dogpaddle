@@ -19,9 +19,9 @@ use dogpaddle_operation::{
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    decode_hex, project_input_schema, rollback_ready, stateless_operation, turn_input,
-    value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
+    construct_checked, decode_hex, project_input_schema, rollback_ready, stateless_operation,
+    turn_input, value_schema,
 };
 
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
@@ -157,8 +157,8 @@ fn select_binds_ordered_independent_expressions_and_preserves_schema_metadata() 
     ])
     .unwrap();
 
-    let binding = bind(&definition, std::slice::from_ref(&input)).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&definition, std::slice::from_ref(&input)).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.metadata(), &metadata);
     assert_eq!(output.fields().len(), 3);
     assert_eq!(
@@ -184,7 +184,7 @@ fn select_reports_expression_context_and_rejects_invalid_output_names_centrally(
     ])
     .unwrap();
     let Err(OperationBindError::Rejected { source }) =
-        bind(&alias_reference, std::slice::from_ref(&input))
+        construct_checked(&alias_reference, std::slice::from_ref(&input))
     else {
         panic!("Select expression unexpectedly referenced an earlier output alias");
     };
@@ -199,7 +199,7 @@ fn select_reports_expression_context_and_rejects_invalid_output_names_centrally(
     let duplicate =
         SelectDefinition::try_new([("same", col("id")), ("same", col("score"))]).unwrap();
     assert!(matches!(
-        bind(&duplicate, std::slice::from_ref(&input)),
+        construct_checked(&duplicate, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::DuplicateField { ref name, .. }
         }) if name == "same"
@@ -207,7 +207,7 @@ fn select_reports_expression_context_and_rejects_invalid_output_names_centrally(
 
     let reserved = SelectDefinition::try_new([("$dogpaddle.internal", col("id"))]).unwrap();
     assert!(matches!(
-        bind(&reserved, std::slice::from_ref(&input)),
+        construct_checked(&reserved, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::ReservedFieldName { ref name, .. }
         }) if name == "$dogpaddle.internal"

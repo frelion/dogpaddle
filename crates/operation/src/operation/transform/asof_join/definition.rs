@@ -4,10 +4,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    DefinitionCodecError, Expr, OperationDefinition, OperationKind, OperationSchemaError,
+    RuntimeResource,
     codec::PayloadCursor,
-    definition::{BoundBody, Sealed as SealedDefinition},
+    definition::{ConstructedOperation, Sealed as SealedDefinition, schema_error},
     expression::{BoundExpression, StoredExpression},
     operation::relation::indexable,
 };
@@ -24,7 +24,7 @@ pub(super) const LEFT_ROWS: &str = "asof_join.left_rows";
 pub(super) const RIGHT_ROWS: &str = "asof_join.right_rows";
 pub(super) const CONTINUATION: &str = "asof_join.continuation";
 
-pub(crate) struct BoundAsOfJoin {
+pub(crate) struct AsOfJoinLayout {
     pub(super) kind: AsOfJoinKind,
     pub(super) direction: AsOfDirection,
     pub(super) tie_fallback: AsOfTieFallback,
@@ -350,13 +350,42 @@ impl AsOfJoinDefinition {
 }
 
 impl SealedDefinition for AsOfJoinDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        let [left, right] = inputs else {
+            unreachable!()
+        };
+        self.compile_layout(left, right)
+            .map(|layout| Some(layout.output_schema))
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        data: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
             unreachable!("the final binding entrypoint enforces ASOF join input arity")
         };
+        let layout = self
+            .compile_layout(left_schema, right_schema)
+            .map_err(schema_error)?;
+        let output_schema = Arc::clone(&layout.output_schema);
+        let operation = super::construct(layout, data, prefix)?;
+        Ok(ConstructedOperation::new(operation, Some(output_schema)))
+    }
+}
+
+impl AsOfJoinDefinition {
+    fn compile_layout(
+        &self,
+        left_schema: &SchemaRef,
+        right_schema: &SchemaRef,
+    ) -> Result<AsOfJoinLayout, OperationSchemaError> {
         let expected_names = left_schema.fields().len()
             + if self.kind.left_only() {
                 0
@@ -387,7 +416,6 @@ impl SealedDefinition for AsOfJoinDefinition {
             }));
         }
         let ties = bind_ties(&self.ties, right_schema)?;
-
         let candidate_schema = Arc::new(Schema::new(
             left_schema
                 .fields()
@@ -400,55 +428,50 @@ impl SealedDefinition for AsOfJoinDefinition {
             .residual
             .as_ref()
             .map(|stored| bind_residual(stored, &candidate_schema, left_schema.fields().len()))
-            .transpose()
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+            .transpose()?;
 
+        let input_schemas = [Arc::clone(left_schema), Arc::clone(right_schema)];
         let mut output_fields = Vec::with_capacity(expected_names);
         for field in left_schema.fields() {
-            let name = &self.output_names[output_fields.len()];
-            output_fields.push(Arc::new(field.as_ref().clone().with_name(name)));
+            output_fields.push(Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_name(&self.output_names[output_fields.len()]),
+            ));
         }
         let mut right_nulls = Vec::new();
         if !self.kind.left_only() {
             for field in right_schema.fields() {
-                let name = &self.output_names[output_fields.len()];
-                let mut output = field.as_ref().clone().with_name(name);
+                let mut output = field
+                    .as_ref()
+                    .clone()
+                    .with_name(&self.output_names[output_fields.len()]);
                 if self.kind == AsOfJoinKind::LeftOuter {
                     output = output.with_nullable(true);
-                    right_nulls.push(ScalarValue::try_from(field.data_type()).map_err(
-                        |source| -> OperationSchemaError {
-                            Box::new(AsOfJoinSchemaError::NullPadding(source))
-                        },
-                    )?);
+                    right_nulls.push(
+                        ScalarValue::try_from(field.data_type())
+                            .map_err(AsOfJoinSchemaError::NullPadding)?,
+                    );
                 }
                 output_fields.push(Arc::new(output));
             }
         }
         let output_schema = Arc::new(Schema::new(output_fields));
-
-        let kind = self.kind;
-        let direction = self.direction;
-        let tie_fallback = self.tie_fallback;
-        let tolerance = self.tolerance;
-        let runtime_input_schemas = [Arc::clone(left_schema), Arc::clone(right_schema)];
-        let runtime_output_schema = Arc::clone(&output_schema);
-        Ok(OperationBinding::bound(
-            Some(output_schema),
-            BoundBody::AsOfJoin(Box::new(BoundAsOfJoin {
-                kind,
-                direction,
-                tie_fallback,
-                tolerance,
-                input_schemas: runtime_input_schemas,
-                candidate_schema,
-                output_schema: runtime_output_schema,
-                equalities: equalities.into_boxed_slice(),
-                orders: orders.into_boxed_slice(),
-                ties: ties.into_boxed_slice(),
-                right_nulls,
-                residual,
-            })),
-        ))
+        Ok(AsOfJoinLayout {
+            kind: self.kind,
+            direction: self.direction,
+            tie_fallback: self.tie_fallback,
+            tolerance: self.tolerance,
+            input_schemas,
+            candidate_schema,
+            output_schema,
+            equalities: equalities.into_boxed_slice(),
+            orders: orders.into_boxed_slice(),
+            ties: ties.into_boxed_slice(),
+            right_nulls,
+            residual,
+        })
     }
 }
 
@@ -856,15 +879,27 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
 
-    use crate::{
-        OperationBindError, OperationDefinition, col, decode_definition, encode_definition,
-    };
+    use crate::{OperationSetupError, RuntimeResource, col, decode_definition, encode_definition};
+    use dogpaddle_store::StoreSetup;
 
     use super::*;
     use crate::operation::transform::asof_join::AsOfEquidistantPreference;
 
     fn schema(fields: impl IntoIterator<Item = Field>) -> SchemaRef {
         Arc::new(Schema::new(fields.into_iter().collect::<Vec<_>>()))
+    }
+
+    fn construct(
+        definition: &AsOfJoinDefinition,
+        inputs: &[SchemaRef],
+    ) -> Result<crate::ConstructedOperation, OperationSetupError> {
+        let mut setup = StoreSetup::new();
+        (definition as &dyn crate::OperationDefinition).construct(
+            inputs,
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -1011,9 +1046,7 @@ mod tests {
             Field::new("sequence", DataType::UInt64, false),
         ]);
         let definition = definition(AsOfDirection::Backward { allow_exact: true }, Some(7));
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[left, right])
-            .unwrap();
+        let binding = construct(&definition, &[left, right]).unwrap();
         let output = binding.output_schema().unwrap();
         assert_eq!(output.fields().len(), 5);
         assert!(!output.field(0).is_nullable());
@@ -1036,18 +1069,10 @@ mod tests {
             Field::new("sequence", DataType::UInt64, false),
         ]);
         let unbounded = definition(AsOfDirection::Backward { allow_exact: true }, None);
-        assert!(
-            (&unbounded as &dyn OperationDefinition)
-                .bind(&[Arc::clone(&strings), mismatched])
-                .is_err()
-        );
+        assert!(construct(&unbounded, &[Arc::clone(&strings), mismatched]).is_err());
 
         let bounded = definition(AsOfDirection::Backward { allow_exact: true }, Some(1));
-        assert!(
-            (&bounded as &dyn OperationDefinition)
-                .bind(&[Arc::clone(&strings), strings])
-                .is_err()
-        );
+        assert!(construct(&bounded, &[Arc::clone(&strings), strings]).is_err());
     }
 
     #[test]
@@ -1063,8 +1088,7 @@ mod tests {
         ]);
         let mut non_boolean = definition(AsOfDirection::Backward { allow_exact: true }, None);
         non_boolean.residual = Some(store_residual(col("left.at")).unwrap());
-        let Err(OperationBindError::Rejected { source }) =
-            (&non_boolean as &dyn OperationDefinition).bind(&[left, right])
+        let Err(OperationSetupError::Schema { source }) = construct(&non_boolean, &[left, right])
         else {
             panic!("non-Boolean ASOF residual unexpectedly bound");
         };

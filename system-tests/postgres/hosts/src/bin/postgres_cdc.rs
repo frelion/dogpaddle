@@ -17,8 +17,7 @@ use arrow_array::{Int32Array, Int64Array, StringArray};
 use dogpaddle_change::{decode_change, encode_change};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation, decode_definition, encode_definition,
-    open_operation,
+    OperationDefinition, RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
@@ -216,13 +215,15 @@ impl DirectScan {
                     .ok_or("missing definition")?,
             )?
         };
-        let binding = definition.bind(&[])?;
-        let scan = open_operation(
-            binding,
-            &store,
-            OPERATION_PREFIX,
-            RuntimeResource::new(options.config()?),
-        )?;
+        let scan = definition
+            .construct(
+                &[],
+                &mut store.data_scope(),
+                OPERATION_PREFIX,
+                RuntimeResource::new(options.config()?),
+            )?
+            .into_parts()
+            .0;
         Ok(Self {
             scan,
             phase: store.open_data(SCAN_PHASE)?,
@@ -240,18 +241,17 @@ impl DirectScan {
     ) -> Result<(), OperationError> {
         let encoded = encode_definition(definition);
         let canonical = decode_definition(&encoded)?;
-        let binding = canonical.bind(&[])?;
-        let mut setup = Store::setup(path)?;
+        let mut setup = dogpaddle_store::StoreSetup::new();
         let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
-        let _operation = create_operation(
-            binding,
-            &mut setup,
+        let _operation = canonical.construct(
+            &[],
+            &mut setup.data_scope(),
             OPERATION_PREFIX,
             RuntimeResource::new(config),
         )?;
         setup.create_data::<OrderedMap<u64, Vec<u8>>>("output")?;
         setup.create_data::<Cell<u64>>("output-tail")?;
-        let _transactions = setup.commit(|access| {
+        let _transactions = setup.commit(path, |access| {
             saved.access(access)?.set(&encoded)?;
             Ok(())
         })?;

@@ -4,10 +4,10 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ConstructedOperation, DefinitionCodecError, Expr, OperationDefinition, OperationKind,
+    OperationSchemaError, RuntimeResource,
     codec::PayloadCursor,
-    definition::{BoundBody, Sealed as SealedDefinition},
+    definition::{Sealed as SealedDefinition, schema_error},
     expression::{BoundExpression, StoredExpression},
 };
 
@@ -24,7 +24,7 @@ pub(super) const CONTINUATION: &str = "equi_join.continuation";
 pub(super) const KEY_COUNTS: &str = "equi_join.key_counts";
 pub(super) const MATCH_COUNTS: &str = "equi_join.match_counts";
 
-pub(crate) struct BoundEquiJoin {
+pub(crate) struct EquiJoinLayout {
     pub(super) kind: EquiJoinKind,
     pub(super) input_schemas: [SchemaRef; 2],
     pub(super) candidate_schema: SchemaRef,
@@ -153,13 +153,42 @@ impl EquiJoinDefinition {
 }
 
 impl SealedDefinition for EquiJoinDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        let [left, right] = inputs else {
+            unreachable!()
+        };
+        self.compile_layout(left, right)
+            .map(|layout| Some(layout.output_schema))
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        data: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
             unreachable!("the final binding entrypoint enforces Join input arity")
         };
+        let layout = self
+            .compile_layout(left_schema, right_schema)
+            .map_err(schema_error)?;
+        let output_schema = Arc::clone(&layout.output_schema);
+        let operation = super::construct(layout, data, prefix)?;
+        Ok(ConstructedOperation::new(operation, Some(output_schema)))
+    }
+}
+
+impl EquiJoinDefinition {
+    fn compile_layout(
+        &self,
+        left_schema: &SchemaRef,
+        right_schema: &SchemaRef,
+    ) -> Result<EquiJoinLayout, OperationSchemaError> {
         let expected_names = left_schema.fields().len()
             + if self.kind.left_only() {
                 0
@@ -173,8 +202,7 @@ impl SealedDefinition for EquiJoinDefinition {
             }));
         }
 
-        let bound_keys = bind_keys(&self.keys, left_schema, right_schema)?;
-
+        let keys = bind_keys(&self.keys, left_schema, right_schema)?;
         let candidate_schema = Arc::new(Schema::new(
             left_schema
                 .fields()
@@ -187,9 +215,9 @@ impl SealedDefinition for EquiJoinDefinition {
             .residual
             .as_ref()
             .map(|stored| bind_residual(stored, &candidate_schema, left_schema.fields().len()))
-            .transpose()
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+            .transpose()?;
 
+        let input_schemas = [Arc::clone(left_schema), Arc::clone(right_schema)];
         let mut output_fields = Vec::with_capacity(expected_names);
         let mut nulls = [Vec::new(), Vec::new()];
         for (port, schema) in input_schemas.iter().enumerate() {
@@ -198,38 +226,32 @@ impl SealedDefinition for EquiJoinDefinition {
             }
             let pad = self.kind.preserves(1 - port);
             for field in schema.fields() {
-                let name = &self.output_names[output_fields.len()];
-                let mut output = field.as_ref().clone().with_name(name);
+                let mut output = field
+                    .as_ref()
+                    .clone()
+                    .with_name(&self.output_names[output_fields.len()]);
                 if pad {
                     output = output.with_nullable(true);
-                    nulls[port].push(ScalarValue::try_from(field.data_type()).map_err(
-                        |source| -> OperationSchemaError {
-                            Box::new(EquiJoinSchemaError::NullPadding(source))
-                        },
-                    )?);
+                    nulls[port].push(
+                        ScalarValue::try_from(field.data_type())
+                            .map_err(EquiJoinSchemaError::NullPadding)?,
+                    );
                 }
                 output_fields.push(Arc::new(output));
             }
         }
         let output_schema = Arc::new(Schema::new(output_fields));
-        let runtime_left_schema = Arc::clone(left_schema);
-        let runtime_right_schema = Arc::clone(right_schema);
-        let runtime_output_schema = Arc::clone(&output_schema);
-        let kind = self.kind;
         let has_residual = residual.is_some();
-        Ok(OperationBinding::bound(
-            Some(output_schema),
-            BoundBody::EquiJoin(Box::new(BoundEquiJoin {
-                kind,
-                input_schemas: [runtime_left_schema, runtime_right_schema],
-                candidate_schema,
-                output_schema: runtime_output_schema,
-                keys: bound_keys.into_boxed_slice(),
-                residual,
-                nulls,
-                has_residual,
-            })),
-        ))
+        Ok(EquiJoinLayout {
+            kind: self.kind,
+            input_schemas,
+            candidate_schema,
+            output_schema,
+            keys: keys.into_boxed_slice(),
+            residual,
+            nulls,
+            has_residual,
+        })
     }
 }
 

@@ -8,21 +8,18 @@ use std::{
 use arrow_schema::{DataType, SchemaRef};
 use thiserror::Error;
 
-use super::{TECHNICAL_HASH, TECHNICAL_ID, target::SqliteTarget};
+use super::{
+    TECHNICAL_HASH, TECHNICAL_ID, buffered, relation::RelationSinkTarget, target::SqliteTarget,
+};
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
+    RuntimeResource,
     codec::PayloadCursor,
-    definition::{BoundBody, Sealed as SealedDefinition},
+    definition::{Sealed as SealedDefinition, schema_error},
 };
 
 pub(crate) const TAG: u16 = 10;
 const MAX_LOGICAL_COLUMNS: usize = 1_998;
-
-pub(crate) struct BoundSqliteSink {
-    pub(super) input_schema: SchemaRef,
-    pub(super) target: SqliteTarget,
-}
 
 /// Pure definition of a sink that materializes its input relation in `SQLite`.
 ///
@@ -154,29 +151,34 @@ impl SqliteSinkDefinition {
 }
 
 impl SealedDefinition for SqliteSinkDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        validate_input_schema(&inputs[0])?;
+        Ok(None)
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        data: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces SQLiteSink input arity");
-        validate_input_schema(input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
+        validate_input_schema(input_schema).map_err(schema_error)?;
 
+        let input_schema = Arc::clone(input_schema);
         let target = SqliteTarget::try_new(
             self.database_path.clone(),
             self.table_name.clone(),
-            Arc::clone(input_schema),
+            Arc::clone(&input_schema),
         )
-        .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::bound(
-            None,
-            BoundBody::SqliteSink(Box::new(BoundSqliteSink {
-                input_schema: Arc::clone(input_schema),
-                target,
-            })),
-        ))
+        .map_err(schema_error)?;
+        buffered::construct(input_schema, RelationSinkTarget::new(target), data, prefix)
     }
 }
 

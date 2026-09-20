@@ -1,27 +1,25 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{any::TypeId, num::NonZeroU64, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
-    definition::{BoundBody, Sealed},
+    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
+    RuntimeResource,
+    definition::data,
+    definition::{Sealed, schema_error},
 };
 
-use super::{PostgresCdcScanError, PostgresColumn, schema};
+use super::{
+    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, PostgresColumn, schema,
+};
+use dogpaddle_store::{Cell, Queue};
 
 pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "postgres_cdc_scan.phase";
 pub(super) const CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
 pub(super) const BOOTSTRAP_SPOOL: &str = "postgres_cdc_scan.bootstrap_spool";
-
-pub(crate) struct BoundPostgresCdc {
-    pub(super) spec: PostgresCdcScanSpec,
-    pub(super) output: SchemaRef,
-    pub(super) bootstrap_spool_bytes: NonZeroU64,
-}
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
@@ -113,18 +111,41 @@ impl PostgresCdcScanDefinition {
 }
 
 impl Sealed for PostgresCdcScanDefinition {
-    fn bind_schemas(&self, _: &[SchemaRef]) -> Result<OperationBinding, OperationSchemaError> {
-        let output = schema::compile(&self.spec.columns)?;
-        let spec = self.spec.clone();
-        let bootstrap_spool_bytes = self.bootstrap_spool_bytes;
-        Ok(OperationBinding::bound(
-            Some(Arc::clone(&output)),
-            BoundBody::PostgresCdc(Box::new(BoundPostgresCdc {
-                spec,
-                output,
-                bootstrap_spool_bytes,
-            })),
-        ))
+    fn output_schema_unchecked(
+        &self,
+        _: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        schema::compile(&self.spec.columns)
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn construct_unchecked(
+        &self,
+        _: &[SchemaRef],
+        scope: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        let output = schema::compile(&self.spec.columns).map_err(schema_error)?;
+        let phase = data::<Cell<u32>>(scope, prefix, PHASE)?;
+        let checkpoint = data::<Cell<Vec<u8>>>(scope, prefix, CHECKPOINT)?;
+        let spool = data::<Queue<Vec<u8>>>(scope, prefix, BOOTSTRAP_SPOOL)?;
+        let config = resource.take::<PostgresCdcScanConfig>()?;
+        let operation = PostgresCdcScanOperation::new_bound(
+            self.spec.clone(),
+            Arc::clone(&output),
+            phase,
+            checkpoint,
+            spool,
+            config,
+            self.bootstrap_spool_bytes,
+        );
+        Ok(ConstructedOperation::turn(Some(output), operation))
+    }
+
+    fn resource_type(&self) -> Option<TypeId> {
+        Some(TypeId::of::<PostgresCdcScanConfig>())
     }
 }
 

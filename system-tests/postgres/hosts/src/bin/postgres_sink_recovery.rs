@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    RuntimeResource, create_operation, decode_definition, encode_definition, open_operation,
+    RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         sink::{PostgresSinkConfig, PostgresSinkDefinition},
@@ -53,16 +53,15 @@ impl Host {
             let definition = PostgresSinkDefinition::try_new(target)?;
             let encoded = encode_definition(&definition);
             let canonical = decode_definition(&encoded)?;
-            let binding = canonical.bind(&[Arc::clone(&schema)])?;
-            let mut setup = Store::setup(path)?;
+            let mut setup = dogpaddle_store::StoreSetup::new();
             let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
-            let _operation = create_operation(
-                binding,
-                &mut setup,
+            let _operation = canonical.construct(
+                &[Arc::clone(&schema)],
+                &mut setup.data_scope(),
                 OPERATION_PREFIX,
                 RuntimeResource::new(config),
             )?;
-            let _transactions = setup.commit(|access| {
+            let _transactions = setup.commit(path, |access| {
                 saved.access(access)?.set(&encoded)?;
                 Ok(())
             })?;
@@ -87,13 +86,15 @@ impl Host {
                     .ok_or("missing definition")?,
             )?
         };
-        let binding = definition.bind(&[schema])?;
-        let operation = open_operation(
-            binding,
-            &store,
-            OPERATION_PREFIX,
-            RuntimeResource::new(config),
-        )?;
+        let operation = definition
+            .construct(
+                &[schema],
+                &mut store.data_scope(),
+                OPERATION_PREFIX,
+                RuntimeResource::new(config),
+            )?
+            .into_parts()
+            .0;
         Ok(Self {
             operation,
             state: store.open_data(SINK_CONTROL)?,

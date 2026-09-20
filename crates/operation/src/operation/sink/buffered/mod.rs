@@ -6,11 +6,10 @@ mod state;
 
 use std::{fmt, num::NonZeroU32};
 
-use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
+use dogpaddle_store::{Cell, DataScope, OrderedMap};
 
 use crate::{
-    operation::{Operation, OperationError},
-    setup::{OperationSetupError, create_data, open_data},
+    ConstructedOperation, OperationSetupError, definition::data, operation::OperationError,
 };
 
 pub(crate) use batch::DeliveryBatch;
@@ -19,29 +18,18 @@ pub(crate) use runtime::BufferedSink;
 pub(crate) const CONTROL: &str = "sink.control";
 pub(crate) const BUFFER: &str = "sink.buffer";
 
-pub(crate) fn create<T: SinkTarget>(
+pub(crate) fn construct<T: SinkTarget>(
     schema: arrow_schema::SchemaRef,
     target: T,
-    setup: &mut StoreSetup,
+    scope: &mut DataScope<'_>,
     prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let control = create_data::<Cell<Vec<u8>>>(setup, prefix, CONTROL)?;
-    let buffer = create_data::<OrderedMap<u64, Vec<u8>>>(setup, prefix, BUFFER)?;
-    Ok(Operation::Turn(Box::new(BufferedSink::new(
-        schema, target, control, buffer,
-    ))))
-}
-pub(crate) fn open<T: SinkTarget>(
-    schema: arrow_schema::SchemaRef,
-    target: T,
-    store: &Store,
-    prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let control = open_data::<Cell<Vec<u8>>>(store, prefix, CONTROL)?;
-    let buffer = open_data::<OrderedMap<u64, Vec<u8>>>(store, prefix, BUFFER)?;
-    Ok(Operation::Turn(Box::new(BufferedSink::new(
-        schema, target, control, buffer,
-    ))))
+) -> Result<ConstructedOperation, OperationSetupError> {
+    let control = data::<Cell<Vec<u8>>>(scope, prefix, CONTROL)?;
+    let buffer = data::<OrderedMap<u64, Vec<u8>>>(scope, prefix, BUFFER)?;
+    Ok(ConstructedOperation::turn(
+        None,
+        BufferedSink::new(schema, target, control, buffer),
+    ))
 }
 pub(crate) const MAX_TARGET_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 

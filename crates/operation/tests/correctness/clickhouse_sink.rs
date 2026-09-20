@@ -3,15 +3,22 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
-    create_operation, decode_definition, encode_definition, open_operation,
+    decode_definition, encode_definition,
     operation::sink::{
         ClickHouseSinkConfig, ClickHouseSinkDefinition, ClickHouseSinkError,
         ClickHouseSinkSchemaError, ClickHouseTargetSpec,
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
-use super::support::TestStore;
+use super::support::{TestStore, construct_checked_with_resource};
+
+fn construct_checked(
+    definition: &dyn OperationDefinition,
+    inputs: &[SchemaRef],
+) -> Result<Option<SchemaRef>, OperationBindError> {
+    construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config("shop")))
+}
 
 const DATABASE_UUID: &str = "12345678-1234-1234-1234-123456789abc";
 const PASSWORD: &str = "do-not-persist-clickhouse-password";
@@ -57,36 +64,35 @@ fn clickhouse_sink_has_canonical_non_secret_tag_19_bytes() {
 #[test]
 fn clickhouse_sink_declares_buffered_state_and_exact_runtime_resource() {
     let definition = definition();
-    let binding = (&definition as &dyn OperationDefinition)
-        .bind(&[schema()])
-        .unwrap();
-    assert!(binding.output_schema().is_none());
+    let binding = construct_checked(&definition, &[schema()]).unwrap();
+    assert!(binding.as_ref().is_none());
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::none()),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::none()),
         Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::new(42_u64)),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
-        binding
+        (&definition as &dyn OperationDefinition)
             .validate_resource(&RuntimeResource::new(config("shop")))
             .is_ok()
     );
 
     let root = TestStore::new();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = create_operation(
-        (&definition as &dyn OperationDefinition)
-            .bind(&[schema()])
-            .unwrap(),
-        &mut setup,
-        "operation",
-        RuntimeResource::new(config("shop")),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(config("shop")),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     store
@@ -105,7 +111,7 @@ fn clickhouse_sink_validates_schema_target_and_decoded_materialization_offline()
         false,
     )]));
     let Err(OperationBindError::Rejected { source }) =
-        (&definition() as &dyn OperationDefinition).bind(&[invalid_schema])
+        construct_checked(&definition(), &[invalid_schema])
     else {
         panic!("an oversized ClickHouse field unexpectedly bound");
     };
@@ -120,24 +126,30 @@ fn clickhouse_sink_validates_schema_target_and_decoded_materialization_offline()
 
     let root = TestStore::new();
     let decoded = decode_definition(&literal_definition_bytes()).unwrap();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = create_operation(
-        decoded.bind(&[schema()]).unwrap(),
-        &mut setup,
-        "operation",
-        RuntimeResource::new(config("shop")),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = decoded
+        .construct(
+            &[schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(config("shop")),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
-    let operation = open_operation(
-        decoded.bind(&[schema()]).unwrap(),
-        &store,
-        "operation",
-        RuntimeResource::new(config("shop")),
-    )
-    .unwrap();
+    let (operation, output) = decoded
+        .construct(
+            &[schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::new(config("shop")),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
     drop(operation);
 }
 

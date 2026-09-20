@@ -3,17 +3,16 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use dogpaddle_change::{Change, ProjectionError};
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource, create_operation,
-    decode_definition, open_operation,
+    OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
     operation::{
         Action, OperationInput,
         transform::{ProjectDefinition, ProjectError, ProjectSchemaError},
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, commit_ready, decode_hex,
+    TestStore, assert_literal_definition, change, commit_ready, construct_checked, decode_hex,
     project_input_schema, rollback_ready, turn_input,
 };
 
@@ -52,14 +51,14 @@ fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
     assert_eq!(definition.field_indices(), [0, 2]);
     let expected = Arc::new(input.project(&[0, 2]).unwrap());
     assert_eq!(
-        bind(decoded.as_ref(), std::slice::from_ref(&input))
+        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
             .unwrap()
-            .output_schema(),
+            .as_ref(),
         Some(&expected)
     );
 
     for (indices, previous, current) in [([0, 0], 0, 0), ([1, 0], 1, 0)] {
-        let Err(OperationBindError::Rejected { source }) = bind(
+        let Err(OperationBindError::Rejected { source }) = construct_checked(
             &ProjectDefinition::new(indices),
             std::slice::from_ref(&input),
         ) else {
@@ -77,7 +76,7 @@ fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
     }
 
     let Err(OperationBindError::Rejected { source }) =
-        bind(&ProjectDefinition::new([3]), std::slice::from_ref(&input))
+        construct_checked(&ProjectDefinition::new([3]), std::slice::from_ref(&input))
     else {
         panic!("out-of-bounds Project unexpectedly bound");
     };
@@ -96,11 +95,18 @@ fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
 fn project_rejects_invalid_port_and_schema_drift() {
     let input = project_change();
     let fixture = TestStore::new();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let binding = bind(decoded_definition().as_ref(), &[input.schema()]).unwrap();
-    let mut project =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-    let mut transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let definition = decoded_definition();
+    let constructed = definition
+        .construct(
+            &[input.schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut project, _) = constructed.into_parts();
+    let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     let invalid_port = rollback_ready(
         &mut project,
         Some(OperationInput {
@@ -128,11 +134,18 @@ fn project_rejects_invalid_port_and_schema_drift() {
 fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state() {
     let input = project_change();
     let fixture = TestStore::new();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let binding = bind(decoded_definition().as_ref(), &[input.schema()]).unwrap();
-    let mut operation =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-    let mut transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let definition = decoded_definition();
+    let constructed = definition
+        .construct(
+            &[input.schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
+    let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     let Action::Complete(Some(output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
     else {
@@ -154,9 +167,16 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
 
     drop((operation, transactions));
     let store = Store::open(fixture.path()).unwrap();
-    let binding = bind(decoded_definition().as_ref(), &[input.schema()]).unwrap();
-    let mut operation =
-        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
+    let definition = decoded_definition();
+    let constructed = definition
+        .construct(
+            &[input.schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
     let Action::Complete(Some(reopened_output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()

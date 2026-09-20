@@ -11,7 +11,7 @@ use criterion::{BenchmarkGroup, Criterion, Throughput, measurement::WallTime};
 use datafusion_expr::col;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation,
+    OperationDefinition, RuntimeResource,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{
@@ -21,7 +21,7 @@ use dogpaddle_operation::{
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Store, Transactions};
+use dogpaddle_store::{StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -73,13 +73,19 @@ impl Fixture {
             options.residual,
         )
         .expect("define ASOF benchmark");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("bind ASOF benchmark");
-        let mut setup = Store::setup(sample.path().join("store")).expect("create ASOF store");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("materialize ASOF benchmark");
-        let transactions = setup.commit(|_| Ok(())).expect("commit setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct ASOF benchmark")
+            .into_parts();
+        let transactions = setup
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .expect("commit setup");
         Self {
             operation,
             transactions,

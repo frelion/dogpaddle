@@ -17,8 +17,8 @@ use dogpaddle_operation::{
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    decode_hex, rollback_ready, roundtripped_output, stateless_operation,
+    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
+    construct_checked, decode_hex, rollback_ready, roundtripped_output, stateless_operation,
     temporal_and_decimal_change, turn_input, value_schema,
 };
 
@@ -67,9 +67,9 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     );
     assert_eq!(definition.predicate(), &predicate);
     assert_eq!(
-        bind(decoded.as_ref(), std::slice::from_ref(&input))
+        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
             .unwrap()
-            .output_schema(),
+            .as_ref(),
         Some(&input)
     );
 

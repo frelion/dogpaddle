@@ -4,7 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use mysql::{Conn, Params, Value, params, prelude::Queryable};
 
@@ -43,9 +42,8 @@ impl DorisTarget {
     pub(super) fn new_bound(
         config: DorisSinkConfig,
         spec: DorisTargetSpec,
-        schema: SchemaRef,
+        layout: DorisLayout,
     ) -> Self {
-        let layout = DorisLayout::try_new(schema).expect("binding validated the Doris layout");
         Self {
             config,
             spec,
@@ -814,7 +812,8 @@ mod live_tests {
             Int64Array::from(vec![1, 1]),
         )
         .unwrap();
-        let mut target = DorisTarget::new_bound(config, spec, schema);
+        let mut target =
+            DorisTarget::new_bound(config, spec, DorisLayout::try_new(schema).unwrap());
         target.initialize().unwrap();
         let insert = Batch {
             inserts: vec![Insert {
@@ -943,7 +942,8 @@ mod live_tests {
             Int64Array::from(vec![1024]),
         )
         .unwrap();
-        let mut target = DorisTarget::new_bound(config, spec, schema);
+        let mut target =
+            DorisTarget::new_bound(config, spec, DorisLayout::try_new(schema).unwrap());
         target.initialize().unwrap();
         let inserts = (1..=1024)
             .map(|technical_id| Insert {

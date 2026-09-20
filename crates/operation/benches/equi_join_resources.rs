@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_expr::col;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation, open_operation,
+    OperationDefinition, RuntimeResource,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{EquiJoinDefinition, EquiJoinKind},
@@ -23,7 +23,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{
-    OrderedMap, ReadTransactions, ScanDirection, ScanLimit, Store, Transactions,
+    OrderedMap, ReadTransactions, ScanDirection, ScanLimit, Store, StoreSetup, Transactions,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -249,13 +249,17 @@ impl Fixture {
             Some(col("left.value").lt(col("right.value"))),
         )
         .expect("define residual EquiJoin resource workload");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("bind residual EquiJoin resource workload");
-        let mut setup = Store::setup(path).expect("create EquiJoin resource store");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("create residual EquiJoin resource workload");
-        let transactions = setup.commit(|_| Ok(())).expect("commit setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct residual EquiJoin resource workload")
+            .into_parts();
+        let transactions = setup.commit(path, |_| Ok(())).expect("commit setup");
         drop((operation, transactions));
         let store = Store::open(path).expect("reopen observational store");
         let match_counts = (kind != EquiJoinKind::Inner).then(|| {
@@ -263,11 +267,15 @@ impl Fixture {
                 .open_data::<OrderedMap<Vec<u8>, u64>>("operation/equi_join.match_counts")
                 .expect("open an observational match-count handle")
         });
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("rebind residual EquiJoin resource workload");
-        let operation = open_operation(binding, &store, "operation", RuntimeResource::none())
-            .expect("open residual EquiJoin resource workload");
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("open residual EquiJoin resource workload")
+            .into_parts();
         let (transactions, reads) = store.into_transactions().split();
         Self {
             operation,

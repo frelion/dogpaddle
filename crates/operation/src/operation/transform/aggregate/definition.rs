@@ -3,10 +3,10 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{Field, Schema, SchemaRef};
 
 use crate::{
-    DefinitionCodecError, Expr, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ConstructedOperation, DefinitionCodecError, Expr, OperationDefinition, OperationKind,
+    OperationSchemaError, RuntimeResource,
     codec::PayloadCursor,
-    definition::{BoundBody, Sealed as SealedDefinition},
+    definition::{Sealed as SealedDefinition, schema_error},
     expression::StoredExpression,
 };
 
@@ -26,7 +26,7 @@ pub(super) const GROUPS: &str = "aggregate.groups";
 pub(super) const ENTRIES: &str = "aggregate.entries";
 pub(super) const CONTROL: &str = "aggregate.control";
 
-pub(crate) struct BoundAggregateOperation {
+pub(crate) struct AggregateLayout {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[crate::expression::BoundExpression]>,
@@ -179,13 +179,36 @@ impl AggregateDefinition {
 }
 
 impl SealedDefinition for AggregateDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, OperationSchemaError> {
+        self.compile_layout(&inputs[0])
+            .map(|layout| Some(layout.output_schema))
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        data: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Aggregate input arity");
+        let layout = self.compile_layout(input_schema).map_err(schema_error)?;
+        let output_schema = Arc::clone(&layout.output_schema);
+        let operation = super::construct(layout, data, prefix)?;
+        Ok(ConstructedOperation::new(operation, Some(output_schema)))
+    }
+}
+
+impl AggregateDefinition {
+    fn compile_layout(
+        &self,
+        input_schema: &SchemaRef,
+    ) -> Result<AggregateLayout, OperationSchemaError> {
         let mut output_fields = Vec::with_capacity(self.groups.len() + self.calls.len());
         let group_expressions = self.bind_groups(input_schema, &mut output_fields)?;
         let BoundAggregate {
@@ -193,26 +216,20 @@ impl SealedDefinition for AggregateDefinition {
             layouts,
             slots,
         } = self.bind_calls(input_schema, &mut output_fields)?;
-
         let output_schema = Arc::new(Schema::new_with_metadata(
             output_fields,
             input_schema.metadata().clone(),
         ));
-        Ok(OperationBinding::bound(
-            Some(Arc::clone(&output_schema)),
-            BoundBody::Aggregate(Box::new(BoundAggregateOperation {
-                input_schema: Arc::clone(input_schema),
-                output_schema,
-                group_expressions,
-                calls,
-                layouts,
-                slots,
-            })),
-        ))
+        Ok(AggregateLayout {
+            input_schema: Arc::clone(input_schema),
+            output_schema,
+            group_expressions,
+            calls,
+            layouts,
+            slots,
+        })
     }
-}
 
-impl AggregateDefinition {
     fn bind_groups(
         &self,
         input_schema: &SchemaRef,

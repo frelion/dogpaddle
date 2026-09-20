@@ -3,7 +3,6 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
-    open_operation,
     operation::{
         Operation, OperationInput,
         transform::{
@@ -11,11 +10,11 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Store, StoreError};
+use dogpaddle_store::{Cell, Store, StoreError, StoreSetup};
 
 use super::support::{
-    ExpectedAction, TestStore, assert_literal_definition, bind, change, change_with_field_name,
-    commit_ready, count_schema, decode_hex, output_values, rollback_ready, setup_operation,
+    ExpectedAction, TestStore, assert_literal_definition, change, change_with_field_name,
+    commit_ready, construct_checked, count_schema, decode_hex, output_values, rollback_ready,
     turn_input, value_schema,
 };
 
@@ -36,9 +35,9 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(
-        bind(decoded.as_ref(), &[value_schema()])
+        construct_checked(decoded.as_ref(), &[value_schema()])
             .unwrap()
-            .output_schema(),
+            .as_ref(),
         Some(&count_schema())
     );
 
@@ -48,7 +47,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
         false,
     )]));
     assert!(matches!(
-        bind(&definition, &[invalid]),
+        construct_checked(&definition, &[invalid]),
         Err(OperationBindError::InvalidInputSchema { input: 0, .. })
     ));
 }
@@ -94,12 +93,29 @@ fn runtime_rejects_missing_invalid_port_and_foreign_store() {
     ));
 }
 
+fn construct_operation(
+    fixture: &TestStore,
+    definition: &dyn OperationDefinition,
+) -> (Operation, dogpaddle_store::Transactions) {
+    let mut setup = StoreSetup::new();
+    let constructed = definition
+        .construct(
+            &[value_schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (operation, _) = constructed.into_parts();
+    let transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
+    (operation, transactions)
+}
+
 fn running_event_count_trace(diffs: &[i64], batches: &[usize]) -> Vec<u64> {
     assert_eq!(batches.iter().sum::<usize>(), diffs.len());
     let fixture = TestStore::new();
     let definition = RunningEventCountDefinition::new();
-    let (mut operation, mut transactions) =
-        setup_operation(&definition, &[value_schema()], &fixture, "operation");
+    let (mut operation, mut transactions) = construct_operation(&fixture, &definition);
     let mut output = Vec::new();
     let mut start = 0;
     for &rows in batches {
@@ -124,12 +140,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 
     let reopened_root = TestStore::new();
     let decoded = decoded_definition();
-    let (mut operation, mut transactions) = setup_operation(
-        decoded.as_ref(),
-        &[value_schema()],
-        &reopened_root,
-        "operation",
-    );
+    let (mut operation, mut transactions) = construct_operation(&reopened_root, decoded.as_ref());
     let first = value_change(&[1, -1]);
     assert_eq!(
         output_values(
@@ -143,9 +154,15 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 
     let store = Store::open(reopened_root.path()).unwrap();
     let decoded = decoded_definition();
-    let binding = bind(decoded.as_ref(), &[value_schema()]).unwrap();
-    let mut operation =
-        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
+    let constructed = decoded
+        .construct(
+            &[value_schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
     let second = value_change(&[1]);
     assert_eq!(
@@ -235,8 +252,7 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
 fn runtime_rejects_schema_drift_before_touching_state() {
     let fixture = TestStore::new();
     let definition = RunningEventCountDefinition::new();
-    let (mut operation, mut transactions) =
-        setup_operation(&definition, &[value_schema()], &fixture, "operation");
+    let (mut operation, mut transactions) = construct_operation(&fixture, &definition);
     let mismatched = change(&[1]);
 
     let error = rollback_ready(

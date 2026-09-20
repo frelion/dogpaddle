@@ -15,9 +15,9 @@ use dogpaddle_operation::{
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    decode_hex, project_input_schema, rollback_ready, stateless_operation, turn_input,
-    value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
+    construct_checked, decode_hex, project_input_schema, rollback_ready, stateless_operation,
+    turn_input, value_schema,
 };
 
 const EXTEND_V1: &str = include_str!("../fixtures/v1/extend_is_seven.hex");
@@ -53,12 +53,9 @@ fn literal_definition_reconstructs_expression_binding_and_runtime() {
     assert_eq!(definition.expression(), &expression);
 
     let schema = value_schema();
-    let output_schema = decoded
-        .bind(std::slice::from_ref(&schema))
+    let output_schema = construct_checked(decoded.as_ref(), std::slice::from_ref(&schema))
         .unwrap()
-        .output_schema()
-        .unwrap()
-        .clone();
+        .unwrap();
     assert_eq!(output_schema.field(1).name(), "is_seven");
     assert_eq!(output_schema.field(1).data_type(), &DataType::Boolean);
     assert!(!output_schema.field(1).is_nullable());
@@ -153,8 +150,8 @@ fn extend_derives_one_valid_field_and_preserves_input_schema_metadata() {
     ));
 
     let copied_flag = extend("copied_flag", col("flag"));
-    let binding = bind(&copied_flag, std::slice::from_ref(&input)).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&copied_flag, std::slice::from_ref(&input)).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.metadata(), &metadata);
     assert_eq!(output.field(0), input.field(0));
     assert_eq!(output.field(2).data_type(), &DataType::Boolean);
@@ -162,16 +159,16 @@ fn extend_derives_one_valid_field_and_preserves_input_schema_metadata() {
     assert!(output.field(2).metadata().is_empty());
 
     let copied_null = extend("copied_null", col("nothing"));
-    let binding = bind(&copied_null, std::slice::from_ref(&input)).unwrap();
-    assert!(binding.output_schema().unwrap().field(2).is_nullable());
+    let binding = construct_checked(&copied_null, std::slice::from_ref(&input)).unwrap();
+    assert!(binding.as_ref().unwrap().field(2).is_nullable());
 
     let non_null = extend("constant", lit("ready"));
-    let binding = bind(&non_null, std::slice::from_ref(&input)).unwrap();
-    assert!(!binding.output_schema().unwrap().field(2).is_nullable());
+    let binding = construct_checked(&non_null, std::slice::from_ref(&input)).unwrap();
+    assert!(!binding.as_ref().unwrap().field(2).is_nullable());
 
     let typed_null = extend("missing", lit(ScalarValue::Int64(None)));
-    let binding = bind(&typed_null, std::slice::from_ref(&input)).unwrap();
-    assert!(binding.output_schema().unwrap().field(2).is_nullable());
+    let binding = construct_checked(&typed_null, std::slice::from_ref(&input)).unwrap();
+    assert!(binding.as_ref().unwrap().field(2).is_nullable());
 }
 
 #[test]
@@ -179,7 +176,7 @@ fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
     let input = project_input_schema();
     let duplicate = extend("id", col("id"));
     assert!(matches!(
-        bind(&duplicate, std::slice::from_ref(&input)),
+        construct_checked(&duplicate, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::DuplicateField { ref name, .. }
         }) if name == "id"
@@ -187,7 +184,7 @@ fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
 
     let reserved = extend("$dogpaddle.internal", col("id"));
     assert!(matches!(
-        bind(&reserved, std::slice::from_ref(&input)),
+        construct_checked(&reserved, std::slice::from_ref(&input)),
         Err(OperationBindError::InvalidOutputSchema {
             source: SchemaError::ReservedFieldName { ref name, .. }
         }) if name == "$dogpaddle.internal"

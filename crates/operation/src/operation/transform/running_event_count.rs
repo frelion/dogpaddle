@@ -6,23 +6,18 @@ use std::{
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
-use dogpaddle_store::{Cell, Store, StoreSetup, TransactionAccess};
+use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
-    definition::{BoundBody, Sealed as SealedDefinition},
-    operation::{AtomicOperation, Operation, OperationError, OperationInput},
-    setup::{OperationSetupError, create_data, open_data},
+    DefinitionCodecError, OperationDefinition, OperationKind,
+    definition::data,
+    definition::{ConstructedOperation, Sealed as SealedDefinition},
+    operation::{AtomicOperation, OperationError, OperationInput},
 };
 
 pub(crate) const TAG: u16 = 2;
 const COUNT: &str = "running_event_count.count";
-
-pub(crate) struct BoundRunningEventCount {
-    input_schema: SchemaRef,
-}
 
 /// Pure definition of a running event-count operation.
 ///
@@ -74,15 +69,24 @@ impl RunningEventCountDefinition {
 }
 
 impl SealedDefinition for RunningEventCountDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        _input_schemas: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        Ok(Some(output_schema()))
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
-        Ok(OperationBinding::bound(
-            Some(output_schema()),
-            BoundBody::RunningEventCount(BoundRunningEventCount {
-                input_schema: Arc::clone(&input_schemas[0]),
-            }),
+        scope: &mut dogpaddle_store::DataScope<'_>,
+        prefix: &str,
+        _resource: crate::RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        let count = data::<Cell<u64>>(scope, prefix, COUNT)?;
+        Ok(ConstructedOperation::atomic(
+            output_schema(),
+            RunningEventCountOperation::new(Arc::clone(&input_schemas[0]), count),
         ))
     }
 }
@@ -97,28 +101,6 @@ impl OperationDefinition for RunningEventCountDefinition {
     }
 
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
-}
-
-pub(crate) fn create(
-    bound: BoundRunningEventCount,
-    setup: &mut StoreSetup,
-    prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let count = create_data::<Cell<u64>>(setup, prefix, COUNT)?;
-    Ok(Operation::Atomic(Box::new(
-        RunningEventCountOperation::new(bound.input_schema, count),
-    )))
-}
-
-pub(crate) fn open(
-    bound: BoundRunningEventCount,
-    store: &Store,
-    prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let count = open_data::<Cell<u64>>(store, prefix, COUNT)?;
-    Ok(Operation::Atomic(Box::new(
-        RunningEventCountOperation::new(bound.input_schema, count),
-    )))
 }
 
 impl RunningEventCountOperation {

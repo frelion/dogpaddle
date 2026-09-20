@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fs, io::ErrorKind, path::Path, sync::Arc};
 
 use rocksdb::{
     OptimisticTransactionDB as Database, OptimisticTransactionOptions,
@@ -8,7 +8,7 @@ use rocksdb::{
 use super::{
     DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, StoreSetup,
     Transaction, TransactionAccess, Transactions,
-    database::{catalog_key, encode_binding},
+    database::{STORE_MARKER, STORE_MARKER_KEY, catalog_key, encode_binding, open_database},
 };
 use crate::StoreError;
 
@@ -34,38 +34,43 @@ impl Store {
 }
 
 impl StoreSetup {
-    /// Creates one named typed data object in the staged catalog.
+    /// Creates the database and atomically publishes its marker, drafted
+    /// catalog, and caller-provided initial data.
+    ///
+    /// This consumes the setup capability on every outcome. Path creation is
+    /// delayed until this call; once it starts, any error may leave an
+    /// incomplete directory that [`Store::open`] rejects.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid or duplicate name or exhausted namespace
-    /// identifiers.
-    pub fn create_data<D: crate::StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
-        self.store.create_data(name)
-    }
-
-    /// Atomically publishes the staged catalog and caller-provided initial data,
-    /// then yields the unique runtime write capability.
-    ///
-    /// This consumes the setup capability whether initialization or commit
-    /// succeeds, so a failed or indeterminate commit cannot be continued.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when initialization fails or `RocksDB` cannot commit
-    /// the complete setup transaction.
+    /// Returns an error when the path is occupied, database creation or
+    /// initialization fails, or `RocksDB` cannot commit the complete setup
+    /// transaction.
     pub fn commit(
         self,
+        path: impl AsRef<Path>,
         initialize: impl FnOnce(TransactionAccess<'_>) -> Result<(), StoreError>,
     ) -> Result<Transactions, StoreError> {
-        let store = self.store;
+        let path = path.as_ref();
+        fs::create_dir(path).map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                StoreError::PathExists(path.to_path_buf())
+            } else {
+                StoreError::storage("create store directory", error)
+            }
+        })?;
+        let database = open_database(path, true)?;
         let transaction = Transaction {
-            inner: begin_write_transaction(&store.database),
-            store_token: store.token,
+            inner: begin_write_transaction(&database),
+            store_token: self.token,
             poisoned: std::cell::Cell::new(false),
             _thread_bound: std::marker::PhantomData,
         };
-        for (name, &(data_id, kind)) in &store.catalog {
+        transaction
+            .inner
+            .put(STORE_MARKER_KEY, STORE_MARKER)
+            .map_err(|error| StoreError::storage("stage store marker", error))?;
+        for (name, &(data_id, kind)) in &self.catalog {
             transaction
                 .inner
                 .put(catalog_key(name), encode_binding(data_id, kind))
@@ -74,8 +79,8 @@ impl StoreSetup {
         initialize(transaction.access())?;
         transaction.commit()?;
         Ok(Transactions {
-            database: Arc::new(store.database),
-            store_token: store.token,
+            database: Arc::new(database),
+            store_token: self.token,
         })
     }
 }

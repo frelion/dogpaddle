@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
-    create_operation, decode_definition, encode_definition, open_operation,
+    decode_definition, encode_definition,
     operation::{
         Action, OperationInput, Turn,
         sink::{
@@ -14,9 +14,16 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
-use super::support::{TestStore, rollback_ready};
+use super::support::{TestStore, construct_checked_with_resource, rollback_ready};
+
+fn construct_checked(
+    definition: &dyn OperationDefinition,
+    inputs: &[SchemaRef],
+) -> Result<Option<SchemaRef>, OperationBindError> {
+    construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config()))
+}
 
 const PASSWORD: &str = "do-not-persist-postgres-sink-password";
 
@@ -92,18 +99,18 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     ready.extend(1_u64.to_be_bytes());
     let store_root = TestStore::new();
     let definition = definition();
-    let binding = (&definition as &dyn OperationDefinition)
-        .bind(&[input_schema()])
-        .unwrap();
-    let mut setup = Store::setup(store_root.path()).unwrap();
-    let operation = create_operation(
-        binding,
-        &mut setup,
-        "operation",
-        RuntimeResource::new(config()),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input_schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
+    let transactions = setup.commit(store_root.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
     let store = Store::open(store_root.path()).unwrap();
     let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
@@ -121,13 +128,16 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         let store = Store::open(store_root.path()).unwrap();
         let decoded = decode_definition(&literal_definition_bytes()).unwrap();
         let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
-        let mut operation = open_operation(
-            decoded.bind(&[input_schema()]).unwrap(),
-            &store,
-            "operation",
-            RuntimeResource::new(config()),
-        )
-        .unwrap();
+        let (mut operation, output) = decoded
+            .construct(
+                &[input_schema()],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::new(config()),
+            )
+            .unwrap()
+            .into_parts();
+        assert!(output.is_none());
         let mut transactions = store.into_transactions();
         let input = input_change();
         let Turn::Ready(prepared) = operation
@@ -172,36 +182,33 @@ fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
 fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let definition = definition();
     assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
-    let binding = (&definition as &dyn OperationDefinition)
-        .bind(&[input_schema()])
-        .unwrap();
-    assert!(binding.output_schema().is_none());
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::none()),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::none()),
         Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
-        binding.validate_resource(&RuntimeResource::new(42_u64)),
+        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
-        binding
+        (&definition as &dyn OperationDefinition)
             .validate_resource(&RuntimeResource::new(config()))
             .is_ok()
     );
 
     let store_root = TestStore::new();
-    let mut setup = Store::setup(store_root.path()).unwrap();
-    let operation = create_operation(
-        (&definition as &dyn OperationDefinition)
-            .bind(&[input_schema()])
-            .unwrap(),
-        &mut setup,
-        "operation",
-        RuntimeResource::new(config()),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input_schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
+    let transactions = setup.commit(store_root.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
     let store = Store::open(store_root.path()).unwrap();
     let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
@@ -227,10 +234,8 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
     assert_eq!(target.system_identifier(), "123456789");
     assert_eq!(target.database_oid(), 42);
     assert!(
-        (&definition() as &dyn OperationDefinition)
-            .bind(&[input_schema()])
+        construct_checked(&definition(), &[input_schema()])
             .unwrap()
-            .output_schema()
             .is_none()
     );
 
@@ -240,7 +245,7 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
         false,
     )]));
     let Err(OperationBindError::Rejected { source }) =
-        (&definition() as &dyn OperationDefinition).bind(&[invalid_schema])
+        construct_checked(&definition(), &[invalid_schema])
     else {
         panic!("a PostgreSQL sink field longer than 63 bytes unexpectedly bound");
     };
@@ -256,7 +261,7 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
         false,
     )]));
     let Err(OperationBindError::Rejected { source }) =
-        (&definition() as &dyn OperationDefinition).bind(&[system_column])
+        construct_checked(&definition(), &[system_column])
     else {
         panic!("the exact PostgreSQL system column ctid unexpectedly bound");
     };
@@ -282,29 +287,31 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
 fn postgres_sink_restores_offline_then_checks_target_before_publishing_initialization() {
     let store_root = TestStore::new();
     let definition = definition();
-    let mut setup = Store::setup(store_root.path()).unwrap();
-    let operation = create_operation(
-        (&definition as &dyn OperationDefinition)
-            .bind(&[input_schema()])
-            .unwrap(),
-        &mut setup,
-        "operation",
-        RuntimeResource::new(mismatched_config()),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input_schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::new(mismatched_config()),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
+    let transactions = setup.commit(store_root.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
     let store = Store::open(store_root.path()).unwrap();
     let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
-    let mut operation = open_operation(
-        (&definition as &dyn OperationDefinition)
-            .bind(&[input_schema()])
-            .unwrap(),
-        &store,
-        "operation",
-        RuntimeResource::new(mismatched_config()),
-    )
-    .unwrap();
+    let (mut operation, output) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input_schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::new(mismatched_config()),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(output.is_none());
     let mut transactions = store.into_transactions();
 
     // The endpoint is deliberately unreachable and names another database.

@@ -11,14 +11,14 @@ use criterion::{BenchmarkGroup, Criterion, Throughput, measurement::WallTime};
 use datafusion_expr::{Expr, col};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation,
+    OperationDefinition, RuntimeResource,
     operation::{
         Action, Operation, OperationInput, Turn,
         transform::{EquiJoinDefinition, EquiJoinKind},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Store, Transactions};
+use dogpaddle_store::{StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -54,13 +54,19 @@ impl Fixture {
             residual,
         )
         .expect("define equi-join");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(schema), Arc::clone(schema)])
-            .expect("bind equi-join");
-        let mut setup = Store::setup(sample.path().join("store")).expect("create store setup");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("create equi-join");
-        let transactions = setup.commit(|_| Ok(())).expect("commit store setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(schema), Arc::clone(schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct equi-join")
+            .into_parts();
+        let transactions = setup
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .expect("commit store setup");
         Self {
             operation,
             transactions,

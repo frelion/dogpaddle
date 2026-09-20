@@ -1,7 +1,7 @@
 use arrow_schema::{ArrowError, DataType};
 use datafusion_common::DataFusionError;
 use dogpaddle_change::ChangeError;
-use dogpaddle_store::{Store, StoreError, StoreSetup};
+use dogpaddle_store::{DataScope, StoreError};
 use thiserror::Error;
 
 use crate::{
@@ -13,95 +13,52 @@ mod runtime;
 mod state;
 
 pub use definition::EquiJoinDefinition;
-pub(crate) use definition::{BoundEquiJoin, TAG, decode_definition};
+pub(crate) use definition::{EquiJoinLayout, TAG, decode_definition};
 pub use runtime::EquiJoinOperation;
 
-use crate::{
-    operation::Operation,
-    setup::{OperationSetupError, create_data, open_data},
-};
+use crate::{OperationSetupError, definition::data, operation::Operation};
 
-fn assemble(
-    bound: BoundEquiJoin,
-    left_rows: state::Rows,
-    right_rows: state::Rows,
-    continuation: state::Continuation,
-    key_counts: Option<state::Counts>,
-    match_counts: Option<state::MatchCounts>,
-) -> Operation {
-    Operation::Turn(Box::new(EquiJoinOperation {
-        kind: bound.kind,
-        input_schemas: bound.input_schemas,
-        candidate_schema: bound.candidate_schema,
-        output_schema: bound.output_schema,
-        keys: bound.keys,
-        residual: bound.residual,
-        nulls: bound.nulls,
+fn construct(
+    layout: EquiJoinLayout,
+    scope: &mut DataScope<'_>,
+    prefix: &str,
+) -> Result<Operation, OperationSetupError> {
+    let left_rows = data::<state::Rows>(scope, prefix, definition::LEFT_ROWS)?;
+    let right_rows = data::<state::Rows>(scope, prefix, definition::RIGHT_ROWS)?;
+    let continuation = data::<state::Continuation>(scope, prefix, definition::CONTINUATION)?;
+    let key_counts = if layout.kind != EquiJoinKind::Inner && !layout.has_residual {
+        Some(data::<state::Counts>(
+            scope,
+            prefix,
+            definition::KEY_COUNTS,
+        )?)
+    } else {
+        None
+    };
+    let match_counts = if layout.kind != EquiJoinKind::Inner && layout.has_residual {
+        Some(data::<state::MatchCounts>(
+            scope,
+            prefix,
+            definition::MATCH_COUNTS,
+        )?)
+    } else {
+        None
+    };
+    Ok(Operation::Turn(Box::new(EquiJoinOperation {
+        kind: layout.kind,
+        input_schemas: layout.input_schemas,
+        candidate_schema: layout.candidate_schema,
+        output_schema: layout.output_schema,
+        keys: layout.keys,
+        residual: layout.residual,
+        nulls: layout.nulls,
         left_rows,
         right_rows,
         continuation,
         key_counts,
         match_counts,
         prepared: None,
-    }))
-}
-
-pub(crate) fn create(
-    bound: BoundEquiJoin,
-    setup: &mut StoreSetup,
-    prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let left = create_data::<state::Rows>(setup, prefix, definition::LEFT_ROWS)?;
-    let right = create_data::<state::Rows>(setup, prefix, definition::RIGHT_ROWS)?;
-    let cont = create_data::<state::Continuation>(setup, prefix, definition::CONTINUATION)?;
-    let keys = if bound.kind != EquiJoinKind::Inner && !bound.has_residual {
-        Some(create_data::<state::Counts>(
-            setup,
-            prefix,
-            definition::KEY_COUNTS,
-        )?)
-    } else {
-        None
-    };
-    let matches = if bound.kind != EquiJoinKind::Inner && bound.has_residual {
-        Some(create_data::<state::MatchCounts>(
-            setup,
-            prefix,
-            definition::MATCH_COUNTS,
-        )?)
-    } else {
-        None
-    };
-    Ok(assemble(bound, left, right, cont, keys, matches))
-}
-
-pub(crate) fn open(
-    bound: BoundEquiJoin,
-    store: &Store,
-    prefix: &str,
-) -> Result<Operation, OperationSetupError> {
-    let left = open_data::<state::Rows>(store, prefix, definition::LEFT_ROWS)?;
-    let right = open_data::<state::Rows>(store, prefix, definition::RIGHT_ROWS)?;
-    let cont = open_data::<state::Continuation>(store, prefix, definition::CONTINUATION)?;
-    let keys = if bound.kind != EquiJoinKind::Inner && !bound.has_residual {
-        Some(open_data::<state::Counts>(
-            store,
-            prefix,
-            definition::KEY_COUNTS,
-        )?)
-    } else {
-        None
-    };
-    let matches = if bound.kind != EquiJoinKind::Inner && bound.has_residual {
-        Some(open_data::<state::MatchCounts>(
-            store,
-            prefix,
-            definition::MATCH_COUNTS,
-        )?)
-    } else {
-        None
-    };
-    Ok(assemble(bound, left, right, cont, keys, matches))
+    })))
 }
 
 /// Relational output semantics of an equality join.

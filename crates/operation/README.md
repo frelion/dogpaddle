@@ -16,14 +16,15 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 理解这个 crate 最重要的是两条线：
 
 ```text
-构建/恢复：Definition ── bind(exact Schemas) ──> opaque OperationBinding
-            ── typed setup create/open(prefix, resource) ──> Runtime Operation
+构建/恢复：Definition + exact Schemas + DataScope + prefix + RuntimeResource
+            ── checked construct ──> Runtime Operation + output Schema
 运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
 ```
 
-这不是给旧装配层换名字：原来的 Data declaration、类型擦除的 data bag 和 materializer 层已经删除。
-绑定只保存算子私有的编译结果与布局选择；随后唯一的 setup dispatch 直接调用具体算子的 typed
-`create/open`。这样错误尽量在建库前暴露，运行时仍保证状态、输出和输入进度可以在一个事务里前进。
+这不是给旧装配层换名字：旧的分阶段绑定对象、Data declaration、类型擦除的 data bag、materializer
+和双路 setup 入口都已删除。唯一的 checked construction path 先统一校验输入数量、输入/输出
+Schema、执行能力和运行资源 presence/type，再由 sealed 具体 Definition 本地编译语义、通过
+`DataScope` 取得类型化 handle 并直接构造最终 Operation。构造不执行外部 I/O、事务或状态读取。
 
 ## 先认识 Definition 和运行实例
 
@@ -34,56 +35,94 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 密码或正在执行到哪一步。
 
 `OperationDefinition` 是 sealed trait，下游 crate 不能实现。新增内建算子必须修改这个 crate，并在
-统一 decoder 表中注册稳定 tag；这样磁盘中的 Definition 不会在运行时落入未知实现。
+统一 decoder 表中注册稳定 tag；这样磁盘中的 Definition 不会在运行时落入未知实现。其纯
+`output_schema(inputs)` 路径复用具体算子的同一 Schema 编译规则，供 SQL 等上层在接触 Store 前取得
+权威输出 Schema；它不声明状态或构造 runtime，Sink 返回 `None`。
 
 **Runtime Operation 是正在工作的实例。** 它保存已经按输入 Schema 编译好的表达式、Flow 为它
 打开的类型化状态，以及必要的临时客户端。它不再保存 Definition，也不知道自己的稳定资源路径。
 
-中间只有 bind 和 typed setup：
+中间只有一个 checked construction path：
 
-1. `bind` 接收每个输入端口的完整 Arrow Schema，检查列、类型、输入数量和输出 Schema。它是纯
-   计算，不访问 Store、网络、时间或随机数。
-2. bind 成功后得到一次性的、不透明 `OperationBinding`；其中封装具体算子的编译结果和已选定布局，
-   Flow 只能读取输出 Schema 和校验运行资源，不能查看或改写内部类型。
-3. setup 消费 binding，以 Flow 提供的稳定前缀借用 `StoreSetup` 创建 typed collections，或借用
-   `Store` 打开它们，然后直接构造 Runtime Operation。具体算子拥有 collection codec 和逻辑资源名。
+1. 在接触 Store 前，对全部 Definition 调用 `validate_resource(&resource)`，预检运行资源是否存在且为
+   精确 Rust 类型。Flow 会先对全图完成这一步，因此错误不会留下目录或部分 catalog。
+2. `construct` 接收每个输入端口的完整 Arrow Schema、短期 `DataScope`、稳定前缀和拥有型
+   `RuntimeResource`，统一检查输入数量、DogPaddle Schema 与资源 presence/type。
+3. sealed 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
+   的 typed collections；同一代码同时服务新建与恢复。
+4. 统一入口复核 output Schema 和 `Atomic`/`Turn` 执行能力，规范化 Exclusive Atomic 为 Turn，返回
+   `ConstructedOperation`。调用方用 `into_parts()` 一次性取出最终 `Operation` 和 output Schema。
 
-例如，下面的 Filter 可以在没有 Store 的情况下完成编码、解码和 Schema 检查：
+下面的无状态 Filter 展示完整的新建和恢复生命周期。实际 Flow 会先对全图做 Schema 传播和
+`validate_resource` preflight，再创建 `StoreSetup`；这里的 `commit(path, init)` 空初始化闭包只因为
+Filter 没有需要写入初值的状态：
 
 ```rust
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_operation::{
-    OperationDefinition, col, decode_definition, encode_definition, lit,
-};
 use dogpaddle_operation::operation::transform::FilterDefinition;
+use dogpaddle_operation::{
+    OperationDefinition, RuntimeResource, col, decode_definition, encode_definition, lit,
+};
+use dogpaddle_store::{Store, StoreSetup};
 
 let input = Arc::new(Schema::new(vec![Field::new(
     "value",
     DataType::UInt64,
     false,
 )]));
-
 let definition = FilterDefinition::try_new(col("value").eq(lit(7_u64)))?;
 let encoded = encode_definition(&definition);
-let reopened = decode_definition(&encoded)?;
-let binding = reopened.bind(&[Arc::clone(&input)])?;
+let definition = decode_definition(&encoded)?;
+let fixture = tempfile::tempdir()?;
+let path = fixture.path().join("state");
 
-assert_eq!(binding.output_schema(), Some(&input));
+// Preflight every runtime resource before creating or opening Store state.
+let resource = RuntimeResource::none();
+definition.validate_resource(&resource)?;
+
+// New state: the scope declares the concrete Definition's typed data.
+let mut setup = StoreSetup::new();
+let constructed = {
+    let mut data = setup.data_scope();
+    definition.construct(&[Arc::clone(&input)], &mut data, "operation", resource)?
+};
+assert_eq!(constructed.output_schema(), Some(&input));
+let (_operation, output_schema) = constructed.into_parts();
+assert_eq!(output_schema.as_ref(), Some(&input));
+let transactions = setup.commit(&path, |_init| Ok(()))?;
+drop(transactions);
+
+// Existing state: the same constructor looks up exactly the same typed data.
+let definition = decode_definition(&encoded)?;
+let resource = RuntimeResource::none();
+definition.validate_resource(&resource)?;
+let store = Store::open(&path)?;
+let constructed = {
+    let mut data = store.data_scope();
+    definition.construct(&[Arc::clone(&input)], &mut data, "operation", resource)?
+};
+let (_operation, output_schema) = constructed.into_parts();
+assert_eq!(output_schema.as_ref(), Some(&input));
+let _transactions = store.into_transactions();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-正常使用时不需要手工调用 setup；`FlowFactory::build/open` 会完成这条路径。分阶段的价值在于：
-Schema 或运行资源不合法时，不会先创建一半 `RocksDB` 资源；open 也能从持久 Definition 和状态
-重新得到同一个执行实例。
+`StoreSetup::new()` 只建立内存 draft，不做文件系统 I/O；`setup.data_scope()` 只声明新名称。
+`Store::data_scope()` 则只查找现有名称，并拒绝缺失资源或 collection kind 不匹配。新建路径最终必须
+消费 setup 调用 `commit(path, init)`，在一笔事务中发布 Store marker、完整 catalog 和各算子初值；
+恢复路径不再次初始化，而是在 construction 完成后消费 `Store` 获得运行期事务能力。
+
+正常使用时不需要手工执行这套装配；`FlowFactory::build/open` 会完成它。旧的绑定阶段和双路 setup
+入口没有兼容 API，也不会为旧调用方式保留 alias、fallback 或迁移路径。
 
 ## Schema 在这里意味着什么
 
 端口 Schema 是记录列的完整 logical Arrow Schema，不包含 `Change` 编码中的
 `$dogpaddle.diff`。字段名、顺序、类型、nullability、嵌套结构和 metadata 都必须精确匹配。
 
-不同算子在 bind 时做不同检查：
+不同算子在 checked `construct` 时做不同检查：
 
 - Filter 要求谓词输出 Boolean，并保持输入 Schema。
 - Select 从同一个输入计算一组有序输出列。
@@ -123,7 +162,7 @@ Station 内没有第二张拓扑图，中间结果也不写日志。最后一个
 
 具体 Definition 实例自己声明 kind。Filter、Extend、Select、SchemaAlign 和 Aggregate 会根据表达式
 分类：可重放的逐行 immutable 表达式可以成为 Atomic；仍受支持但需要单独边界的实例成为 Exclusive，
-其他表达式会在构造或 bind 时被拒绝。EquiJoin 的 key 和 residual 必须是 immutable；不满足时直接拒绝，
+其他表达式会在 Definition 构造或 checked `construct` 时被拒绝。EquiJoin 的 key 和 residual 必须是 immutable；不满足时直接拒绝，
 不会退化成 Exclusive。`EquiJoin` 是两输入 TurnTransform，可以分页完成一个输入，再把每一页
 交给后面的 Atomic 算子。
 
@@ -212,13 +251,12 @@ equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
 asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
 ```
 
-Flow 只生成 `station/{station}/operation/{operation}` 前缀并选择 create 或 open。operation crate 的
-setup dispatch 随后调用具体算子的 typed constructor；算子自己的代码用固定逻辑名和 codec 创建或打开
+Flow 只生成 `station/{station}/operation/{operation}` 前缀并提供 build/open 对应的 `DataScope`。具体 Definition 的同一个 constructor 用固定逻辑名和 codec 声明或查找
 `Cell`、`OrderedMap` 等 handle。旧的 Data declaration、`DataInstances` 和 erased materializer 已不在
 这条路径中，Flow 也不会枚举具体算子或解释其状态布局。
 
 某些外部算子的密码、网络访问参数和临时客户端配置通过 `RuntimeResource` 传入。它只是拥有型
-`Any` 擦除容器：binding 先检查精确 Rust 类型，具体 typed setup 再取回该值；它不承载持久状态、codec
+`Any` 擦除容器：checked construction path 先检查精确 Rust 类型，具体 Definition 再取回该值；它不承载持久状态、codec
 或资源字典。资源每次 build/open 由调用方重新注入，不进入 Store；非敏感 source/target identity、固定
 Schema 和 `SQLite` 路径等稳定信息仍保存在 Definition。普通算子必须收到空资源，且只有 Station 首项
 可以获得运行资源。
@@ -399,8 +437,8 @@ Filter、Extend、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` �
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
 字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
 
-Definition 构造时立即把表达式编码并解码为 canonical protobuf；bind 时再针对 exact input Schema
-生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 `DataFusion` 提供。
+Definition 构造时立即把表达式编码并解码为 canonical protobuf；checked `construct` 再针对 exact input
+Schema 生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 `DataFusion` 提供。
 Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要显式 `cast`。
 `EquiJoin` residual 的两个输入固定使用 `left` 与 `right` qualifier；它绑定原始输入字段的类型、
 nullability 和 metadata，而不是 Outer 已放宽或 Semi/Anti 已裁剪的输出 Schema。
@@ -413,11 +451,11 @@ tie-break 只针对 right Schema 绑定。
 | --- | --- |
 | 已承诺 | 精确列引用、Boolean predicate、`UInt64` 同类型 equality、`UInt64 → Utf8` 显式 cast |
 | 已承诺的时间/Decimal 切片 | Date32、无 timezone 的 Millisecond Timestamp、`Decimal128(10,2)` 的直接复制、同类型比较，以及 `SchemaAlign` 中已测试的显式 cast |
-| `DataFusion` 可能支持但 `DogPaddle` 尚未承诺 | 未经 Definition codec、exact bind、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
+| `DataFusion` 可能支持但 `DogPaddle` 尚未承诺 | 未经 Definition codec、checked construction、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
 | 明确拒绝 | 无法 canonical protobuf roundtrip、字段缺失或歧义、Filter 非 Boolean、隐式 coercion、运行时 Schema 漂移 |
 
 只有逐行 immutable scalar 表达式可以融合。Stable、Volatile、placeholder、subquery、
-aggregate/window、unnest 和外部引用等实例需要独立持久边界，或在构造/bind 时被拒绝。
+aggregate/window、unnest 和外部引用等实例需要独立持久边界，或在 Definition 构造/checked `construct` 时被拒绝。
 
 Expr protobuf 与精确 pin 的 `DataFusion` 版本绑定。升级 `DataFusion` 时必须审查 roundtrip、physical
 planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库直接删除重建。
@@ -517,12 +555,12 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 1. 在 `scan/`、`transform/` 或 `sink/` 下建立具体模块。
 2. Definition 显式声明唯一 tag、`OperationKind` 和 canonical payload。
-3. 在 sealed `bind_schemas` 中检查 exact input Schema，产生唯一 output Schema 和不透明 binding。
-4. 在具体模块提供 typed `create/open`，由算子代码固定逻辑资源名、collection 类型和 codec。
+3. 在 sealed `construct` 中编译 exact input Schema 语义，通过 `DataScope` 获取 typed handles，并产生最终 Operation 与唯一 output Schema。
+4. 由算子代码固定逻辑资源名、collection 类型和 codec；新建与恢复使用同一 constructor。
 5. 选择 `AtomicOperation` 或 `TurnOperation`，让所有重放相关写入服从调用方事务；需要临时配置时只从
    `RuntimeResource` 取回精确类型。
-6. 把 binding 变体接入唯一 setup dispatch，并在 [`src/codec.rs`](src/codec.rs) 注册具体 decoder。
-7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、bind、typed create/open、turn、
+6. 在 [`src/codec.rs`](src/codec.rs) 注册具体 decoder。
+7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、checked construct、typed data、turn、
    rollback 和适用的 reopen。
 8. 只有引入新的通用执行机制时才增加 Flow witness；普通算子语义由自己的 correctness 文件拥有。
 
@@ -530,7 +568,7 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 
-- 每个算子文件纵向覆盖 Definition、codec、bind、typed create/open、运行和 reopen。
+- 每个算子文件纵向覆盖 Definition、codec、checked construct、typed data、运行和 reopen。
 - [`definition_codec.rs`](tests/correctness/definition_codec.rs) 验证共享外层格式。
 - [`atomic.rs`](tests/correctness/atomic.rs) 验证实例级融合资格和 Atomic 执行。
 - [`protocol.rs`](tests/correctness/protocol.rs) 验证 turn、rollback、ACK 与恢复边界。

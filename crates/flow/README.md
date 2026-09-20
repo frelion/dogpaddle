@@ -148,8 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`FlowFactory` 的核心调用只有这些。`resource` 以 Station 字符串 ID 绑定一个不透明值；Flow 只负责把它
-交给首 Operation 的 binding 校验和 typed setup，不查看其中的凭据，也不把它变成持久资源描述：
+`FlowFactory` 的核心调用只有这些。`resource` 以 Station 字符串 ID 绑定一个不透明值；Flow 只负责在
+全图元数据预检后把它交给首 Operation 的直接构造，不查看其中的凭据，也不把它变成持久资源描述：
 
 | API | 作用 |
 | --- | --- |
@@ -173,10 +173,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. 校验 Station、输入顺序、容量和整张 DAG。
 2. 稳定编码声明，再立即解码；后续只使用这份即将持久化的 canonical（规范化）Definition。
-3. 按拓扑传播 Arrow Schema，并按 Station 内顺序把每个 Definition 绑定成不透明 `OperationBinding`。
-4. 在创建 Store 前检查所有 Station 资源的存在与精确类型。
-5. 创建 Store；为每个 Operation 生成稳定 ordinal 前缀，由 operation-owned typed setup 创建具体状态并
-   直接构造运行 Operation；随后创建 Station 输出和订阅位置，原子发布 Flow Definition。
+3. 在创建 Store 前全图检查所有 Station 资源的存在与精确类型。
+4. 创建纯内存 `StoreSetup`；按拓扑传播 Arrow Schema，并按 Station 内顺序让每个 Definition 通过统一
+   `construct` 入口直接声明或打开 typed data、构造最终运行 Operation，再传播它的最终 output Schema。
+5. 所有构造成功后才在 `commit` 时创建状态目录，并在同一事务中初始化 Station 输出、订阅位置和发布
+   Flow Definition。
 
 因此常见的拓扑、Schema 和资源类型错误不会留下目标目录。底层 Store 在创建后的失败仍可能留下一个
 不完整目录，`open` 会拒绝把它当成完整 Flow。
@@ -212,17 +213,18 @@ flow.advance()?;
 
 `open` 从磁盘读取 owner identity、Station 拓扑、Operation 顺序、定义和容量。若 Factory 设置了
 `owner_identity`，它必须与磁盘中的值精确相同；未设置的 Factory 只接受同样未设置 owner 的 Flow。
-比较发生在 Schema binding 和 typed state open 之前。随后 Flow 重新做相同的 Schema 传播与 bind，
-检查全部临时资源，再为每个 Operation 生成相同前缀，由 operation-owned typed setup 打开具体状态并
-直接装配运行对象。Flow 不读取 binding 内部布局、不枚举算子，也不会重新决定如何融合。凭据、进程内
-connector 等 `RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；它是这条路径上唯一的类型擦除。
+比较发生在运行资源预检、Schema 传播和 typed state open 之前。随后 Flow 先全图检查全部临时资源，
+再保持同一个 Store，由拓扑顺序和 Station program 顺序调用 Definition 的统一 `construct`，以相同前缀
+打开具体状态、直接装配最终运行对象并传播 output Schema；之后才校验持久 Station 状态并导出事务能力。
+Flow 不读取算子内部布局、不枚举具体算子，也不会重新决定如何融合。凭据、进程内 connector 等
+`RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；它是这条路径上唯一的类型擦除。
 
 ### 磁盘里有什么
 
 一条 Flow 的持久状态由四部分组成：
 
 - canonical Flow Definition：可选的不透明 owner identity、Station ID、有序 Operation Definition、输入 Station ID 和输出容量；
-- 每个 Operation 由具体 typed setup 创建的状态，例如计数、Join 两侧关系或 CDC checkpoint；
+- 每个 Operation 由具体 Definition 构造时声明的 typed 状态，例如计数、Join 两侧关系或 CDC checkpoint；
 - 每个 Station 最终输出的 `SubscribedLog` 及每条下游边的订阅位置；
 - 多输入 Station 当前固定的输入端口。
 
@@ -270,7 +272,7 @@ backlog 的单位是完整 `Change`，不是行数。输出容量限制的是持
 2. [`src/flow/advance.rs`](src/flow/advance.rs)：一轮调度只有几十行，是运行入口。
 3. [`src/station/runtime.rs`](src/station/runtime.rs)：一个 Station 如何执行首项、尾链、输出和提交。
 4. [`src/station/input.rs`](src/station/input.rs)：Claim、输入端口、订阅位置和多输入固定规则。
-5. [`src/build/schema.rs`](src/build/schema.rs)：全图 Schema 如何逐项绑定。
+5. [`src/build/schema.rs`](src/build/schema.rs)：全图 Schema 如何传播并逐项构造最终 Operation。
 6. [`src/assembly.rs`](src/assembly.rs)：已验证 Definition 如何变成运行期 Station。
 7. [`src/build/codec.rs`](src/build/codec.rs) 与 [`src/build/open.rs`](src/build/open.rs)：持久格式和恢复路径。
 

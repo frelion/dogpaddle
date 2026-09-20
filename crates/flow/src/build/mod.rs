@@ -5,15 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use dogpaddle_operation::{OperationDefinition, RuntimeResource, create_operation};
-use dogpaddle_store::{Cell, Store, SubscribedLog};
+use dogpaddle_operation::{OperationDefinition, RuntimeResource};
+use dogpaddle_store::{Cell, StoreSetup};
 
-use crate::{
-    assembly::assemble_stations,
-    error::{FlowError, operation_setup_error},
-    flow::Flow,
-    station::StationParts,
-};
+use crate::{assembly::assemble_stations, error::FlowError, flow::Flow};
 
 pub(crate) mod codec;
 mod definition;
@@ -203,27 +198,18 @@ impl FlowFactory {
         let declared_definition = self.finish_definition()?;
         let definition_bytes = codec::encode(&declared_definition)?;
         let (definition, topology) = codec::decode(&definition_bytes)?;
-        let bindings = schema::bind_operations(&definition, &topology)?;
-        let resources = bind_resources(&definition, &bindings, resources)?;
+        let resources = preflight_resources(&definition, resources)?;
         let station_ids = definition
             .stations()
             .iter()
             .map(|station| station.id().to_owned())
             .collect();
 
-        let mut setup = Store::setup(&path)?;
+        let mut setup = StoreSetup::new();
         let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;
-        let station_parts = definition
-            .stations()
-            .iter()
-            .enumerate()
-            .zip(bindings)
-            .zip(resources)
-            .map(|(((index, station), binding), resource)| {
-                create_station_part(&mut setup, index, station, binding, resource)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let transactions = setup.commit(|access| {
+        let station_parts =
+            schema::construct_stations(&definition, &topology, &mut setup.data_scope(), resources)?;
+        let transactions = setup.commit(&path, |access| {
             for (index, station) in station_parts.iter().enumerate() {
                 station.initialize(topology.subscriber_count(index), access)?;
             }
@@ -254,74 +240,29 @@ impl FlowFactory {
         )
     }
 }
-fn bind_resources(
+fn preflight_resources(
     definition: &FlowDefinition,
-    bindings: &[schema::StationBinding],
     mut resources: BTreeMap<String, RuntimeResource>,
 ) -> Result<Vec<RuntimeResource>, FlowError> {
-    let mut bound = Vec::with_capacity(bindings.len());
-    for (station, binding) in definition.stations().iter().zip(bindings) {
+    let mut validated = Vec::with_capacity(definition.stations().len());
+    for station in definition.stations() {
         let resource = resources.remove(station.id()).unwrap_or_default();
-        for (operation, operation_binding) in binding.operations().iter().enumerate() {
+        for (operation, operation_definition) in station.operations().iter().enumerate() {
             let empty = RuntimeResource::default();
             let operation_resource = if operation == 0 { &resource } else { &empty };
-            operation_binding
+            operation_definition
                 .validate_resource(operation_resource)
                 .map_err(|source| FlowError::RuntimeResource {
                     station_id: station.id().to_owned(),
                     source,
                 })?;
         }
-        bound.push(resource);
+        validated.push(resource);
     }
     if let Some(station_id) = resources.into_keys().next() {
         return Err(FlowError::UnknownRuntimeResource { station_id });
     }
-    Ok(bound)
-}
-
-fn create_station_part(
-    setup: &mut dogpaddle_store::StoreSetup,
-    index: usize,
-    station: &StationDefinition,
-    binding: schema::StationBinding,
-    resource: RuntimeResource,
-) -> Result<StationParts, FlowError> {
-    let active = (station.inputs().len() > 1)
-        .then(|| setup.create_data::<Cell<u32>>(&codec::station_active_input_name(index)))
-        .transpose()?;
-    let output_schema = binding.output_schema().cloned();
-    let mut resource = Some(resource);
-    let mut operations = Vec::with_capacity(station.operations().len());
-    for (operation, binding) in binding.into_operations().into_iter().enumerate() {
-        let operation_resource = if operation == 0 {
-            resource
-                .take()
-                .expect("the first Operation uniquely owns the Station resource")
-        } else {
-            RuntimeResource::default()
-        };
-        let prefix = codec::station_operation_prefix(index, operation);
-        operations.push(
-            create_operation(binding, setup, &prefix, operation_resource)
-                .map_err(|source| operation_setup_error(station.id(), operation, source))?,
-        );
-    }
-    let output = match (station.output_capacity_bytes(), output_schema) {
-        (Some(capacity), Some(schema)) => setup
-            .create_data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(index))
-            .map(|log| Some((log, capacity, schema)))?,
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            unreachable!("validated output capacity and bound Schema must agree")
-        }
-    };
-    Ok(StationParts::new(
-        active,
-        station.input_count(),
-        operations,
-        output,
-    ))
+    Ok(validated)
 }
 
 #[cfg(test)]

@@ -11,11 +11,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement::WallTime};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, create_operation, open_operation as reopen_operation,
+    OperationDefinition, RuntimeResource,
     operation::{Action, Operation, OperationInput, Turn, sink::SqliteSinkDefinition},
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Store, Transactions};
+use dogpaddle_store::{Store, StoreSetup, Transactions};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use tempfile::TempDir;
@@ -102,13 +102,19 @@ impl Fixture {
         let sqlite_path = sample.path().join("target.sqlite");
         let definition =
             SqliteSinkDefinition::try_new(&sqlite_path, TABLE).expect("define SQLite sink");
-        let mut setup = Store::setup(sample.path().join("store")).expect("setup Sink store");
-        let binding = (&definition as &dyn OperationDefinition)
-            .bind(&[Arc::clone(&schema)])
-            .expect("bind SQLite Sink");
-        let operation = create_operation(binding, &mut setup, "operation", RuntimeResource::none())
-            .expect("create SQLite Sink");
-        let transactions = setup.commit(|_| Ok(())).expect("commit Sink setup");
+        let mut setup = StoreSetup::new();
+        let (operation, _) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[Arc::clone(&schema)],
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct SQLite Sink")
+            .into_parts();
+        let transactions = setup
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .expect("commit Sink setup");
         let mut fixture = Self {
             definition,
             schema,
@@ -199,7 +205,7 @@ impl Fixture {
         drop(self.operation.take());
         drop(self.transactions.take());
         let store = Store::open(self.root.path().join("store")).expect("reopen Sink store");
-        self.operation = Some(open_operation(&self.definition, &self.schema, &store));
+        self.operation = Some(construct_reopened(&self.definition, &self.schema, &store));
         self.transactions = Some(store.into_transactions());
     }
 
@@ -219,16 +225,21 @@ impl Fixture {
     }
 }
 
-fn open_operation(
+fn construct_reopened(
     definition: &SqliteSinkDefinition,
     schema: &SchemaRef,
     store: &Store,
 ) -> Operation {
-    let binding = (definition as &dyn OperationDefinition)
-        .bind(&[Arc::clone(schema)])
-        .expect("bind SQLite Sink");
-    reopen_operation(binding, store, "operation", RuntimeResource::none())
+    (definition as &dyn OperationDefinition)
+        .construct(
+            &[Arc::clone(schema)],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
         .expect("open SQLite Sink")
+        .into_parts()
+        .0
 }
 
 fn integer_schema() -> SchemaRef {

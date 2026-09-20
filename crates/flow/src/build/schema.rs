@@ -1,10 +1,15 @@
 use arrow_schema::SchemaRef;
-use dogpaddle_operation::{OperationBindError, OperationBinding};
+use dogpaddle_operation::{OperationBindError, OperationSetupError, RuntimeResource};
+use dogpaddle_store::{Cell, DataScope, StoreError, SubscribedLog};
 use thiserror::Error;
 
-use crate::assembly::ResolvedTopology;
+use crate::{
+    assembly::ResolvedTopology,
+    error::{FlowError, operation_setup_error},
+    station::StationParts,
+};
 
-use super::FlowDefinition;
+use super::{FlowDefinition, codec};
 
 /// Failure while binding one Operation in a Station's linear program.
 #[derive(Debug, Error)]
@@ -49,77 +54,123 @@ impl FlowSchemaError {
     }
 }
 
-pub(crate) struct StationBinding {
-    operations: Vec<OperationBinding>,
-}
-
-impl StationBinding {
-    pub(crate) fn operations(&self) -> &[OperationBinding] {
-        &self.operations
-    }
-
-    pub(crate) fn output_schema(&self) -> Option<&SchemaRef> {
-        self.operations
-            .last()
-            .expect("a validated Station binding is nonempty")
-            .output_schema()
-    }
-
-    pub(crate) fn into_operations(self) -> Vec<OperationBinding> {
-        self.operations
-    }
-}
-
-pub(super) fn bind_operations(
+pub(super) fn construct_stations(
     definition: &FlowDefinition,
     topology: &ResolvedTopology,
-) -> Result<Vec<StationBinding>, FlowSchemaError> {
-    let mut bindings = std::iter::repeat_with(|| None)
+    data: &mut DataScope<'_>,
+    resources: Vec<RuntimeResource>,
+) -> Result<Vec<StationParts>, FlowError> {
+    let mut resources = resources.into_iter().map(Some).collect::<Vec<_>>();
+    let mut output_schemas = std::iter::repeat_with(|| None)
         .take(definition.stations().len())
-        .collect::<Vec<_>>();
+        .collect::<Vec<Option<SchemaRef>>>();
+    let mut stations = std::iter::repeat_with(|| None)
+        .take(definition.stations().len())
+        .collect::<Vec<Option<StationParts>>>();
 
-    for &station in topology.schedule() {
-        let station_definition = &definition.stations()[station];
+    for &station_index in topology.schedule() {
+        let station = &definition.stations()[station_index];
         let input_schemas = topology
-            .inputs(station)
+            .inputs(station_index)
             .iter()
             .map(|producer| {
-                bindings[*producer]
+                output_schemas[*producer]
                     .as_ref()
-                    .and_then(StationBinding::output_schema)
-                    .expect("a scheduled, validated input must have a bound output Schema")
+                    .expect("a scheduled, validated input must have a constructed output Schema")
                     .clone()
             })
             .collect::<Vec<_>>();
+        let active = (station.inputs().len() > 1)
+            .then(|| data.data::<Cell<u32>>(&codec::station_active_input_name(station_index)))
+            .transpose()
+            .map_err(map_store_error)?;
+        let mut station_resource = resources[station_index]
+            .take()
+            .expect("each Station resource is consumed exactly once");
+        let mut operations = Vec::with_capacity(station.operations().len());
+        let mut current_schema = None;
 
-        let mut operation_bindings = Vec::with_capacity(station_definition.operations().len());
-        for (operation, definition) in station_definition.operations().iter().enumerate() {
-            let binding_inputs = if operation == 0 {
+        for (operation_index, definition) in station.operations().iter().enumerate() {
+            let inputs = if operation_index == 0 {
                 input_schemas.as_slice()
             } else {
-                let schema = operation_bindings
-                    .last()
-                    .and_then(OperationBinding::output_schema)
-                    .expect("a validated intermediate Operation has an output Schema");
-                std::slice::from_ref(schema)
+                std::slice::from_ref(
+                    current_schema
+                        .as_ref()
+                        .expect("a validated intermediate Operation has an output Schema"),
+                )
             };
-            let binding =
-                definition
-                    .bind(binding_inputs)
-                    .map_err(|source| FlowSchemaError::Operation {
-                        station_id: station_definition.id().to_owned(),
-                        operation,
-                        source,
-                    })?;
-            operation_bindings.push(binding);
+            let resource = if operation_index == 0 {
+                std::mem::take(&mut station_resource)
+            } else {
+                RuntimeResource::default()
+            };
+            let prefix = codec::station_operation_prefix(station_index, operation_index);
+            let constructed = definition
+                .construct(inputs, data, &prefix, resource)
+                .map_err(|source| construction_error(station.id(), operation_index, source))?;
+            let (operation, output_schema) = constructed.into_parts();
+            operations.push(operation);
+            current_schema = output_schema;
         }
-        bindings[station] = Some(StationBinding {
-            operations: operation_bindings,
-        });
+
+        let output = match (station.output_capacity_bytes(), current_schema.as_ref()) {
+            (Some(capacity), Some(schema)) => Some((
+                data.data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(station_index))
+                    .map_err(map_store_error)?,
+                capacity,
+                schema.clone(),
+            )),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                unreachable!("validated output capacity and constructed Schema must agree")
+            }
+        };
+        output_schemas[station_index] = current_schema;
+        stations[station_index] = Some(StationParts::new(
+            active,
+            station.input_count(),
+            operations,
+            output,
+        ));
     }
 
-    Ok(bindings
+    Ok(stations
         .into_iter()
-        .map(|binding| binding.expect("every validated Station must be scheduled and bound"))
+        .map(|station| station.expect("every validated Station must be scheduled and constructed"))
         .collect())
+}
+
+fn construction_error(
+    station_id: &str,
+    operation: usize,
+    source: OperationSetupError,
+) -> FlowError {
+    let source = match source {
+        OperationSetupError::Bind(source) => {
+            return FlowSchemaError::Operation {
+                station_id: station_id.to_owned(),
+                operation,
+                source,
+            }
+            .into();
+        }
+        OperationSetupError::Schema { source } => {
+            return FlowSchemaError::Operation {
+                station_id: station_id.to_owned(),
+                operation,
+                source: OperationBindError::Rejected { source },
+            }
+            .into();
+        }
+        source => source,
+    };
+    operation_setup_error(station_id, operation, source)
+}
+
+fn map_store_error(source: StoreError) -> FlowError {
+    match source {
+        StoreError::DataNotFound(name) => FlowError::MissingResource { name },
+        source => source.into(),
+    }
 }

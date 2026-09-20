@@ -3,7 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use serde_json::Value;
 
@@ -37,10 +36,8 @@ impl ClickHouseTarget {
     pub(super) fn new_bound(
         config: ClickHouseSinkConfig,
         spec: ClickHouseTargetSpec,
-        schema: SchemaRef,
+        layout: ClickHouseLayout,
     ) -> Self {
-        let layout =
-            ClickHouseLayout::try_new(schema).expect("binding validated the ClickHouse layout");
         Self {
             config,
             spec,
@@ -849,7 +846,8 @@ mod live_tests {
             Int64Array::from(vec![1, 1]),
         )
         .unwrap();
-        let mut target = ClickHouseTarget::new_bound(config, spec, schema);
+        let mut target =
+            ClickHouseTarget::new_bound(config, spec, ClickHouseLayout::try_new(schema).unwrap());
         target.initialize().unwrap();
         let insert = Batch {
             inserts: vec![Insert {
@@ -996,7 +994,8 @@ mod live_tests {
             Int64Array::from(vec![1; ROWS]),
         )
         .unwrap();
-        let mut target = ClickHouseTarget::new_bound(config, spec, schema);
+        let mut target =
+            ClickHouseTarget::new_bound(config, spec, ClickHouseLayout::try_new(schema).unwrap());
         target.initialize().unwrap();
         for start in (0..ROWS).step_by(LOOKUPS) {
             let batch = Batch {

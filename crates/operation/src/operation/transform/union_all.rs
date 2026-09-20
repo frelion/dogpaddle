@@ -5,10 +5,10 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
+    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
+    RuntimeResource,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
+    definition::{Sealed as SealedDefinition, schema_error},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -91,13 +91,41 @@ impl UnionAllDefinition {
 }
 
 impl SealedDefinition for UnionAllDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        Self::compile_schema(inputs).map(Some)
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        _data: &mut dogpaddle_store::DataScope<'_>,
+        _prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        let output_schema = Self::compile_schema(input_schemas).map_err(schema_error)?;
+        let input_count = usize::try_from(self.input_count.get())
+            .expect("a UnionAll u32 input count fits supported Arrow targets");
+        let input_schema = Arc::clone(&output_schema);
+        Ok(ConstructedOperation::atomic(
+            output_schema,
+            UnionAllOperation {
+                input_count,
+                input_schema,
+            },
+        ))
+    }
+}
+
+impl UnionAllDefinition {
+    fn compile_schema(
+        input_schemas: &[SchemaRef],
+    ) -> Result<SchemaRef, crate::OperationSchemaError> {
         let output_schema = input_schemas
             .first()
-            .expect("the final binding entrypoint enforces UnionAll input arity");
+            .expect("the checked entrypoint enforces UnionAll input arity");
         for (input, schema) in input_schemas.iter().enumerate().skip(1) {
             if schema != output_schema {
                 return Err(Box::new(UnionAllSchemaError::InputSchemaMismatch {
@@ -107,17 +135,7 @@ impl SealedDefinition for UnionAllDefinition {
                 }));
             }
         }
-
-        let input_count = usize::try_from(self.input_count.get())
-            .expect("a UnionAll u32 input count fits supported Arrow targets");
-        let input_schema = Arc::clone(output_schema);
-        Ok(OperationBinding::atomic_ready(
-            Arc::clone(output_schema),
-            UnionAllOperation {
-                input_count,
-                input_schema,
-            },
-        ))
+        Ok(Arc::clone(output_schema))
     }
 }
 

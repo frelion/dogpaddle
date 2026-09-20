@@ -14,13 +14,11 @@ use rocksdb::{
     OptimisticTransactionDB as Database, Options, ReadOptions, SnapshotWithThreadMode,
 };
 
-use super::{
-    CatalogMode, DataHandle, DataKind, Store, Transactions, transaction::durable_write_options,
-};
+use super::{DataHandle, DataKind, DataScope, DataScopeMode, Store, StoreSetup, Transactions};
 use crate::{StoreData, StoreError, data_class};
 
-const STORE_MARKER_KEY: &[u8] = &[0];
-const STORE_MARKER: &[u8] = b"dogpaddle.store.rocks.v1\0";
+pub(super) const STORE_MARKER_KEY: &[u8] = &[0];
+pub(super) const STORE_MARKER: &[u8] = b"dogpaddle.store.rocks.v1\0";
 const CATALOG_DOMAIN: u8 = 1;
 const MAX_NAME_BYTES: usize = 255;
 
@@ -55,31 +53,18 @@ impl Store {
 
         let database = open_database(path, true)?;
         database
-            .put_opt(STORE_MARKER_KEY, STORE_MARKER, &durable_write_options())
+            .put_opt(
+                STORE_MARKER_KEY,
+                STORE_MARKER,
+                &super::transaction::durable_write_options(),
+            )
             .map_err(|error| StoreError::storage("write store marker", error))?;
         Ok(Self {
             database,
             token: fresh_token(),
             catalog: BTreeMap::new(),
             next_data_id: 0,
-            catalog_mode: CatalogMode::Immediate,
         })
-    }
-
-    /// Creates a marker-only Store whose catalog remains staged until
-    /// [`StoreSetup::commit`](super::StoreSetup::commit) atomically publishes it
-    /// with initialized data.
-    ///
-    /// This is intended for owners, such as Flow, that build a complete typed
-    /// resource set before making any part of that set visible to reopen.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error under the same conditions as [`Store::create`].
-    pub fn setup(path: impl AsRef<Path>) -> Result<super::StoreSetup, StoreError> {
-        let mut store = Self::create(path)?;
-        store.catalog_mode = CatalogMode::Staged;
-        Ok(super::StoreSetup { store })
     }
 
     /// Opens an existing store.
@@ -106,7 +91,6 @@ impl Store {
             token: fresh_token(),
             catalog,
             next_data_id,
-            catalog_mode: CatalogMode::Immediate,
         })
     }
 
@@ -124,24 +108,19 @@ impl Store {
     }
 
     fn create_handle(&mut self, name: &str, kind: DataKind) -> Result<DataHandle, StoreError> {
-        let database = &self.database;
-        let catalog_mode = self.catalog_mode;
         let data_id = create_binding(
             &mut self.catalog,
             &mut self.next_data_id,
             name,
             kind,
             |data_id| {
-                if catalog_mode == CatalogMode::Immediate {
-                    database
-                        .put_opt(
-                            catalog_key(name),
-                            encode_binding(data_id, kind),
-                            &durable_write_options(),
-                        )
-                        .map_err(|error| StoreError::storage("write data catalog", error))?;
-                }
-                Ok(())
+                self.database
+                    .put_opt(
+                        catalog_key(name),
+                        encode_binding(data_id, kind),
+                        &super::transaction::durable_write_options(),
+                    )
+                    .map_err(|error| StoreError::storage("write data catalog", error))
             },
         )?;
         Ok(self.handle(data_id))
@@ -168,6 +147,14 @@ impl Store {
             });
         }
         Ok(data_class::from_handle(self.handle(data_id)))
+    }
+
+    /// Borrows a short-lived scope that strictly looks up existing data.
+    #[must_use]
+    pub const fn data_scope(&self) -> DataScope<'_> {
+        DataScope {
+            mode: DataScopeMode::Existing(self),
+        }
     }
 
     /// Ends data object setup and yields the unique runtime write capability.
@@ -199,12 +186,80 @@ fn create_binding(
         return Err(StoreError::DataAlreadyExists(name.to_owned()));
     }
     let data_id = u32::try_from(*next_data_id).map_err(|_| StoreError::DataIdExhausted)?;
-    // Reserve before durable I/O. A failed write can have an indeterminate
-    // outcome, so this Store must never reuse the same physical namespace.
+    // Namespace identifiers are monotonic within both a draft and an open Store.
+    // Callers never reuse an identifier after this reservation succeeds.
     *next_data_id += 1;
     persist(data_id)?;
     catalog.insert(name.to_owned(), (data_id, kind));
     Ok(data_id)
+}
+
+impl StoreSetup {
+    /// Creates an empty in-memory Store draft.
+    ///
+    /// This allocates the final Store identity but performs no filesystem I/O.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            token: fresh_token(),
+            catalog: BTreeMap::new(),
+            next_data_id: 0,
+        }
+    }
+
+    /// Creates one named typed data object in this in-memory draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or duplicate name or exhausted namespace
+    /// identifiers.
+    pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
+        let kind = data_class::kind::<D>();
+        let data_id = create_binding(
+            &mut self.catalog,
+            &mut self.next_data_id,
+            name,
+            kind,
+            |_| Ok(()),
+        )?;
+        Ok(data_class::from_handle(DataHandle {
+            store_token: self.token,
+            data_id,
+        }))
+    }
+
+    /// Borrows a short-lived scope that strictly declares new data.
+    #[must_use]
+    pub fn data_scope(&mut self) -> DataScope<'_> {
+        DataScope {
+            mode: DataScopeMode::Declare(self),
+        }
+    }
+}
+
+impl Default for StoreSetup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DataScope<'_> {
+    /// Declares or looks up one typed data object according to this scope's
+    /// fixed mode.
+    ///
+    /// A scope from [`StoreSetup::data_scope`] declares a new name and rejects
+    /// duplicates. A scope from [`Store::data_scope`] looks up an existing name
+    /// and rejects missing names or collection-kind mismatches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the corresponding declaration or lookup error.
+    pub fn data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
+        match &mut self.mode {
+            DataScopeMode::Declare(setup) => setup.create_data(name),
+            DataScopeMode::Existing(store) => store.open_data(name),
+        }
+    }
 }
 
 impl DataKind {
@@ -243,7 +298,7 @@ impl DataKind {
     }
 }
 
-fn open_database(path: &Path, create: bool) -> Result<Database, StoreError> {
+pub(super) fn open_database(path: &Path, create: bool) -> Result<Database, StoreError> {
     let mut options = Options::default();
     options.create_if_missing(create);
     options.set_error_if_exists(create);

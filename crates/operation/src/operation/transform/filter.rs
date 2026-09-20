@@ -8,10 +8,11 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError,
-    OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
+    ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
+    ExpressionDefinitionError, ExpressionError, OperationDefinition, OperationKind,
+    RuntimeResource,
     codec::PayloadCursor,
-    definition::Sealed as SealedDefinition,
+    definition::{Sealed as SealedDefinition, schema_error},
     expression::{BoundExpression, StoredExpression},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
@@ -112,17 +113,26 @@ impl FilterDefinition {
 }
 
 impl SealedDefinition for FilterDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        self.bind_operation(&inputs[0])?;
+        Ok(Some(Arc::clone(&inputs[0])))
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        _data: &mut dogpaddle_store::DataScope<'_>,
+        _prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Filter input arity");
-        let operation = self
-            .bind_operation(input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::atomic_ready(
+        let operation = self.bind_operation(input_schema).map_err(schema_error)?;
+        Ok(ConstructedOperation::atomic(
             Arc::clone(input_schema),
             operation,
         ))

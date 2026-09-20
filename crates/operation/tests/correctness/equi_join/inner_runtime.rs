@@ -5,7 +5,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     Expr, OperationBindError, OperationDefinition, RuntimeResource, col,
-    create_operation as setup_operation, open_operation,
     operation::{
         Action, Operation, OperationError, OperationInput, Turn,
         transform::{
@@ -14,9 +13,9 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{PartitionedMultiset, Store, Transactions};
+use dogpaddle_store::{PartitionedMultiset, Store, StoreSetup, Transactions};
 
-use crate::support::{TestStore, bind, commit_ready, rollback_ready};
+use crate::support::{TestStore, commit_ready, construct_checked, rollback_ready};
 
 const OPERATION_PREFIX: &str = "operation";
 const BASE_RESOURCES: [&str; 3] = [
@@ -88,35 +87,44 @@ fn right_change(keys: Vec<Option<u64>>, amounts: Vec<i64>, differences: Vec<i64>
     .unwrap()
 }
 
-fn create_operation(root: &TestStore) -> (Operation, Transactions) {
-    create_operation_for_schemas(root, &definition(), &[left_schema(), right_schema()])
+fn construct_operation(root: &TestStore) -> (Operation, Transactions) {
+    construct_operation_for_schemas(root, &definition(), &[left_schema(), right_schema()])
 }
 
-fn create_operation_for_schemas(
+fn construct_operation_for_schemas(
     root: &TestStore,
     definition: &dyn OperationDefinition,
     schemas: &[SchemaRef],
 ) -> (Operation, Transactions) {
-    let binding = definition.bind(schemas).unwrap();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = setup_operation(
-        binding,
-        &mut setup,
-        OPERATION_PREFIX,
-        RuntimeResource::none(),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let (operation, _) = definition
+        .construct(
+            schemas,
+            &mut setup.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     (operation, transactions)
 }
 
-fn reopen_operation(
+fn reopen_join(
     store: &Store,
     definition: &dyn OperationDefinition,
     schemas: &[SchemaRef],
 ) -> Operation {
-    let binding = definition.bind(schemas).unwrap();
-    open_operation(binding, store, OPERATION_PREFIX, RuntimeResource::none()).unwrap()
+    definition
+        .construct(
+            schemas,
+            &mut store.data_scope(),
+            OPERATION_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0
 }
 
 fn resource_name(logical: &str) -> String {
@@ -203,8 +211,8 @@ fn output_rows(outputs: &[Change]) -> Vec<OutputRow> {
 #[test]
 fn inner_binding_preserves_field_metadata_and_uses_exact_typed_layout() {
     let definition = definition();
-    let binding = bind(&definition, &[left_schema(), right_schema()]).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&definition, &[left_schema(), right_schema()]).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(
         output
             .fields()
@@ -250,7 +258,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
     )
     .unwrap();
     let Err(OperationBindError::Rejected { source }) =
-        bind(&mismatched, &[left_schema(), right_schema()])
+        construct_checked(&mismatched, &[left_schema(), right_schema()])
     else {
         panic!("mismatched Join key types unexpectedly bound")
     };
@@ -272,7 +280,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
     )
     .unwrap();
     let Err(OperationBindError::Rejected { source }) =
-        bind(&unsupported, &[Arc::clone(&floats), floats])
+        construct_checked(&unsupported, &[Arc::clone(&floats), floats])
     else {
         panic!("floating Join key unexpectedly bound")
     };
@@ -289,7 +297,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
     )
     .unwrap();
     assert!(matches!(
-        bind(&wrong_count, &[left_schema(), right_schema()]),
+        construct_checked(&wrong_count, &[left_schema(), right_schema()]),
         Err(OperationBindError::Rejected { .. })
     ));
     let duplicate_names = EquiJoinDefinition::try_new(
@@ -300,7 +308,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
     )
     .unwrap();
     assert!(matches!(
-        bind(&duplicate_names, &[left_schema(), right_schema()]),
+        construct_checked(&duplicate_names, &[left_schema(), right_schema()]),
         Err(OperationBindError::InvalidOutputSchema { .. })
     ));
 }
@@ -308,7 +316,7 @@ fn definition_rejects_empty_mismatched_and_unsupported_keys_and_bad_names() {
 #[test]
 fn both_input_ports_update_relations_and_emit_weighted_matches_in_left_right_order() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let right = right_change(
         vec![Some(1), Some(1), None],
         vec![10, 20, 99],
@@ -354,7 +362,7 @@ fn both_input_ports_update_relations_and_emit_weighted_matches_in_left_right_ord
 #[test]
 fn runtime_idles_without_input_and_rejects_invalid_port_and_exact_schema_drift() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
 
     let input = left_change(vec![Some(1)], vec!["left"], vec![1]);
@@ -391,7 +399,7 @@ fn runtime_idles_without_input_and_rejects_invalid_port_and_exact_schema_drift()
 #[test]
 fn whole_claim_admission_rejects_negative_prefix_without_partial_state() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let invalid = left_change(vec![Some(7), Some(7)], vec!["same", "same"], vec![1, -2]);
     let error = rollback_ready(
         &mut operation,
@@ -426,7 +434,7 @@ fn whole_claim_admission_rejects_negative_prefix_without_partial_state() {
 #[test]
 fn rolled_back_emit_page_replays_and_adjusts_the_input_once() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let right = right_change(vec![Some(3)], vec![30], vec![1]);
     run_claim(&mut operation, &mut transactions, 1, &right).unwrap();
     let left = left_change(vec![Some(3)], vec!["left"], vec![1]);
@@ -474,13 +482,13 @@ fn state_and_output_weight_overflow_fail_before_emission() {
     {
         let root = TestStore::new();
         let definition = definition();
-        let (operation, transactions) = create_operation(&root);
+        let (operation, transactions) = construct_operation(&root);
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
         let left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
             .open_data(&resource_name("equi_join.left_rows"))
             .unwrap();
-        let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
+        let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         let mut rows = left_rows.access(transaction.access()).unwrap();
@@ -510,13 +518,13 @@ fn state_and_output_weight_overflow_fail_before_emission() {
     {
         let root = TestStore::new();
         let definition = definition();
-        let (operation, transactions) = create_operation(&root);
+        let (operation, transactions) = construct_operation(&root);
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
         let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
             .open_data(&resource_name("equi_join.right_rows"))
             .unwrap();
-        let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
+        let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
         let mut transactions = store.into_transactions();
         let transaction = transactions.begin();
         right_rows
@@ -567,7 +575,7 @@ fn composite_variable_width_keys_keep_component_boundaries() {
     let root = TestStore::new();
     let schemas = [Arc::clone(&left_schema), Arc::clone(&right_schema)];
     let (mut operation, mut transactions) =
-        create_operation_for_schemas(&root, &definition, &schemas);
+        construct_operation_for_schemas(&root, &definition, &schemas);
     let right = Change::try_new(
         RecordBatch::try_new(
             right_schema,
@@ -617,7 +625,7 @@ fn per_port_event_trace_is_stable_across_input_rebatching() {
     ];
     let trace = |batches: &[usize]| {
         let root = TestStore::new();
-        let (mut operation, mut transactions) = create_operation(&root);
+        let (mut operation, mut transactions) = construct_operation(&root);
         let right = right_change(vec![Some(1), Some(2)], vec![10, 20], vec![3, 2]);
         run_claim(&mut operation, &mut transactions, 1, &right).unwrap();
         let mut output = Vec::new();
@@ -645,7 +653,7 @@ fn per_port_event_trace_is_stable_across_input_rebatching() {
 #[test]
 fn sparse_claims_advance_many_rows_per_transaction() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let rows = 300_u64;
     let input = right_change(
         (0..rows).map(Some).collect(),
@@ -663,7 +671,7 @@ fn sparse_claims_advance_many_rows_per_transaction() {
 #[test]
 fn one_to_one_claims_aggregate_many_output_rows_per_transaction() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let rows = 300_u64;
     let right = right_change(
         (0..rows).map(Some).collect(),
@@ -701,7 +709,7 @@ fn one_to_one_claims_aggregate_many_output_rows_per_transaction() {
 #[test]
 fn sparse_large_rows_respect_the_turn_byte_budget() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_operation(&root);
+    let (mut operation, mut transactions) = construct_operation(&root);
     let large = "x".repeat(2_200_000);
     let input = left_change(
         vec![Some(1), Some(2), Some(3)],
@@ -743,7 +751,7 @@ fn residual_wide_candidates_are_split_by_scalar_working_set() {
     let root = TestStore::new();
     let schemas = [Arc::clone(&schema), Arc::clone(&schema)];
     let (mut operation, mut transactions) =
-        create_operation_for_schemas(&root, &definition, &schemas);
+        construct_operation_for_schemas(&root, &definition, &schemas);
 
     let right_values = (1..=RIGHT_ROWS)
         .map(|value| i64::try_from(value).unwrap())
@@ -784,13 +792,13 @@ fn residual_wide_candidates_are_split_by_scalar_working_set() {
 fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     let root = TestStore::new();
     let definition = definition();
-    let (operation, transactions) = create_operation(&root);
+    let (operation, transactions) = construct_operation(&root);
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>> = store
         .open_data(&resource_name("equi_join.right_rows"))
         .unwrap();
-    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
+    let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     let mut rows = right_rows.access(transaction.access()).unwrap();
@@ -818,7 +826,7 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
+    let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let Action::Commit(Some(first_output)) = commit_ready(
         &mut operation,
@@ -835,7 +843,7 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let mut operation = reopen_operation(&store, &definition, &[left_schema(), right_schema()]);
+    let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
     let mut transactions = store.into_transactions();
     let mut outputs = vec![first_output];
     outputs.extend(run_claim(&mut operation, &mut transactions, 0, &input).unwrap());
@@ -888,7 +896,7 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
     let root = TestStore::new();
     let schemas = [Arc::clone(&left), Arc::clone(&right)];
     let (mut operation, mut transactions) =
-        create_operation_for_schemas(&root, &definition, &schemas);
+        construct_operation_for_schemas(&root, &definition, &schemas);
     let right_input = Change::try_new(
         RecordBatch::try_new(
             right,
@@ -987,7 +995,7 @@ fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phas
         let root = TestStore::new();
         let schemas = [Arc::clone(&left), Arc::clone(&right)];
         let (mut operation, mut transactions) =
-            create_operation_for_schemas(&root, &definition, &schemas);
+            construct_operation_for_schemas(&root, &definition, &schemas);
         run_claim(&mut operation, &mut transactions, 0, &left_input).unwrap();
 
         for (input, expected_difference) in
@@ -1032,7 +1040,7 @@ fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
     let root = TestStore::new();
     let schemas = [Arc::clone(&left), Arc::clone(&right)];
     let (mut operation, mut transactions) =
-        create_operation_for_schemas(&root, &definition, &schemas);
+        construct_operation_for_schemas(&root, &definition, &schemas);
     let large = "x".repeat(2_200_000);
     let right_input = Change::try_new(
         RecordBatch::try_new(

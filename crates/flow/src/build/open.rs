@@ -1,22 +1,20 @@
-use dogpaddle_operation::{RuntimeResource, open_operation};
-use dogpaddle_store::{Cell, Store, StoreData, StoreError, SubscribedLog};
+use dogpaddle_store::{Cell, Store, StoreError};
 
 use crate::{
     assembly::assemble_stations,
-    error::{FlowError, operation_setup_error, runtime_state_error},
+    error::{FlowError, runtime_state_error},
     flow::Flow,
-    station::StationParts,
 };
 
-use super::{FlowFactory, StationDefinition, bind_resources, codec, schema};
+use super::{FlowFactory, codec, preflight_resources, schema};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
     ///
-    /// Setup reads the definition and opens every declared data object using
-    /// the same exclusively owned Store. A read-only snapshot then validates
-    /// active inputs and output subscriptions before setup is frozen into
-    /// runtime transaction capabilities.
+    /// The owner identity is checked first. Runtime-resource metadata is then
+    /// preflighted globally before Operations directly construct against the
+    /// existing Store's data scope. The Store remains held while runtime state
+    /// is validated and is consumed into transaction capabilities only last.
     ///
     /// # Errors
     ///
@@ -41,24 +39,14 @@ impl FlowFactory {
         if definition.owner_identity() != expected_owner_identity {
             return Err(FlowError::OwnerIdentityMismatch);
         }
-        let bindings = schema::bind_operations(&definition, &topology)?;
-        let resources = bind_resources(&definition, &bindings, self.resources)?;
+        let resources = preflight_resources(&definition, self.resources)?;
         let station_ids = definition
             .stations()
             .iter()
             .map(|station| station.id().to_owned())
             .collect();
-
-        let station_parts = definition
-            .stations()
-            .iter()
-            .enumerate()
-            .zip(bindings)
-            .zip(resources)
-            .map(|(((index, station), binding), resource)| {
-                open_station_part(&store, index, station, binding, resource)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let station_parts =
+            schema::construct_stations(&definition, &topology, &mut store.data_scope(), resources)?;
         {
             let transaction = store.read_transaction();
             for (index, (station_definition, station)) in
@@ -96,69 +84,6 @@ fn open_definition_cell(store: &Store) -> Result<Cell<Vec<u8>>, FlowError> {
     match store.open_data(codec::DEFINITION_DATA_NAME) {
         Ok(data) => Ok(data),
         Err(StoreError::DataNotFound(_)) => Err(FlowError::IncompleteBuild),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn open_station_part(
-    store: &Store,
-    index: usize,
-    station: &StationDefinition,
-    binding: schema::StationBinding,
-    resource: RuntimeResource,
-) -> Result<StationParts, FlowError> {
-    let active = (station.inputs().len() > 1)
-        .then(|| open_required_data::<Cell<u32>>(store, &codec::station_active_input_name(index)))
-        .transpose()?;
-    let output_schema = binding.output_schema().cloned();
-    let mut resource = Some(resource);
-    let mut operations = Vec::with_capacity(station.operations().len());
-    for (operation, binding) in binding.into_operations().into_iter().enumerate() {
-        let operation_resource = if operation == 0 {
-            resource
-                .take()
-                .expect("the first Operation uniquely owns the Station resource")
-        } else {
-            RuntimeResource::default()
-        };
-        let prefix = codec::station_operation_prefix(index, operation);
-        operations.push(
-            open_operation(binding, store, &prefix, operation_resource)
-                .map_err(|source| operation_setup_error(station.id(), operation, source))?,
-        );
-    }
-    let output = match (station.output_capacity_bytes(), output_schema) {
-        (Some(capacity), Some(schema)) => {
-            let name = codec::station_output_name(index);
-            Some((
-                open_required_data::<SubscribedLog<Vec<u8>>>(store, &name)?,
-                capacity,
-                schema,
-            ))
-        }
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            unreachable!("validated output capacity and bound Schema must agree")
-        }
-    };
-    Ok(StationParts::new(
-        active,
-        station.input_count(),
-        operations,
-        output,
-    ))
-}
-
-fn open_required_data<D: StoreData>(store: &Store, name: &str) -> Result<D, FlowError> {
-    require_resource(name, store.open_data(name))
-}
-
-fn require_resource<T>(name: &str, result: Result<T, StoreError>) -> Result<T, FlowError> {
-    match result {
-        Ok(data) => Ok(data),
-        Err(StoreError::DataNotFound(_)) => Err(FlowError::MissingResource {
-            name: name.to_owned(),
-        }),
         Err(error) => Err(error.into()),
     }
 }

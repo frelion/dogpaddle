@@ -10,8 +10,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, create_operation,
-    decode_definition, encode_definition, open_operation,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
+    encode_definition,
     operation::{
         Action, Operation,
         transform::{
@@ -20,10 +20,11 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Store, StoreError, Transactions};
+use dogpaddle_store::{Store, StoreError, StoreSetup, Transactions};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, commit_ready, rollback_ready, turn_input,
+    TestStore, assert_literal_definition, commit_ready, construct_checked, rollback_ready,
+    turn_input,
 };
 use dogpaddle_operation::col;
 
@@ -72,42 +73,50 @@ fn change(departments: &[&str], values: &[Option<i64>], diffs: &[i64]) -> Change
     Change::try_new(records, Int64Array::from(diffs.to_vec())).unwrap()
 }
 
-fn create_aggregate(
+fn construct_aggregate(
     root: &TestStore,
     definition: &dyn OperationDefinition,
 ) -> (Operation, Transactions) {
-    create_aggregate_for_schema(root, definition, input_schema())
+    construct_aggregate_for_schema(root, definition, input_schema())
 }
 
-fn create_aggregate_for_schema(
+fn construct_aggregate_for_schema(
     root: &TestStore,
     definition: &dyn OperationDefinition,
     schema: SchemaRef,
 ) -> (Operation, Transactions) {
-    let binding = bind(definition, &[schema]).unwrap();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let operation = create_operation(
-        binding,
-        &mut setup,
-        AGGREGATE_PREFIX,
-        RuntimeResource::none(),
-    )
-    .unwrap();
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let constructed = (definition as &dyn OperationDefinition)
+        .construct(
+            &[schema],
+            &mut setup.data_scope(),
+            AGGREGATE_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (operation, _) = constructed.into_parts();
+    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     (operation, transactions)
 }
 
-fn open_aggregate(store: &Store, definition: &dyn OperationDefinition) -> Operation {
-    open_aggregate_for_schema(store, definition, input_schema())
+fn reopen_aggregate(store: &Store, definition: &dyn OperationDefinition) -> Operation {
+    reopen_aggregate_for_schema(store, definition, input_schema())
 }
 
-fn open_aggregate_for_schema(
+fn reopen_aggregate_for_schema(
     store: &Store,
     definition: &dyn OperationDefinition,
     schema: SchemaRef,
 ) -> Operation {
-    let binding = bind(definition, &[schema]).unwrap();
-    open_operation(binding, store, AGGREGATE_PREFIX, RuntimeResource::none()).unwrap()
+    let constructed = (definition as &dyn OperationDefinition)
+        .construct(
+            &[schema],
+            &mut store.data_scope(),
+            AGGREGATE_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    constructed.into_parts().0
 }
 
 #[derive(Debug, PartialEq)]
@@ -238,7 +247,7 @@ fn aggregate_trace(events: &[(&str, Option<i64>, i64)], batches: &[usize]) -> Ve
     assert_eq!(batches.iter().sum::<usize>(), events.len());
     let root = TestStore::new();
     let definition = definition();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let mut output = Vec::new();
     let mut start = 0;
     for &rows in batches {
@@ -272,8 +281,8 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
     );
     assert_eq!(definition.persistence_tag(), 14);
     let input = input_schema();
-    let binding = bind(&definition, std::slice::from_ref(&input)).unwrap();
-    let output = binding.output_schema().unwrap();
+    let binding = construct_checked(&definition, std::slice::from_ref(&input)).unwrap();
+    let output = binding.as_ref().unwrap();
     assert_eq!(output.metadata(), input.metadata());
     assert_eq!(output.fields().len(), 7);
     assert_eq!(output.field(0), input.field(0));
@@ -287,22 +296,24 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
     }
 
     let fixture = TestStore::new();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let operation = create_operation(
-        bind(&definition, &[input_schema()]).unwrap(),
-        &mut setup,
-        AGGREGATE_PREFIX,
-        RuntimeResource::none(),
-    )
-    .unwrap();
+    let mut setup = StoreSetup::new();
+    let constructed = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input_schema()],
+            &mut setup.data_scope(),
+            AGGREGATE_PREFIX,
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (operation, _) = constructed.into_parts();
     assert!(matches!(operation, Operation::Atomic(_)));
-    let transactions = setup.commit(|_| Ok(())).unwrap();
+    let transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     drop((operation, transactions));
 
     let store = Store::open(fixture.path()).unwrap();
-    let Err(error) = open_operation(
-        bind(decoded.as_ref(), &[input]).unwrap(),
-        &store,
+    let Err(error) = decoded.construct(
+        &[input],
+        &mut store.data_scope(),
         "operation/missing-aggregate",
         RuntimeResource::none(),
     ) else {
@@ -319,7 +330,7 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
 fn count_sum_average_and_extrema_follow_ordered_group_transitions() {
     let root = TestStore::new();
     let definition = definition();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let input = change(
         &["A", "A", "A", "A", "A", "A"],
         &[Some(10), Some(20), None, Some(10), Some(20), None],
@@ -356,7 +367,7 @@ fn unchanged_extrema_do_not_emit_redundant_rows() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let input = change(
         &["A", "A", "A"],
         &[Some(10), Some(20), Some(20)],
@@ -382,7 +393,7 @@ fn extrema_order_signed_values_by_value() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let input = change(&["A", "A", "A"], &[Some(0), Some(-10), Some(5)], &[1, 1, 1]);
     let Action::Complete(Some(output)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
@@ -449,7 +460,7 @@ fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
     .unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) =
-        create_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let records = RecordBatch::try_new(
         schema,
         vec![
@@ -554,7 +565,7 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
     let root = TestStore::new();
     let encoded = encode_definition(&definition);
     let (mut operation, mut transactions) =
-        create_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let initial = make_change(
         vec!["A", "B", "A", "B", "A", "A"],
         vec![
@@ -585,7 +596,7 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = open_aggregate_for_schema(&store, decoded.as_ref(), Arc::clone(&schema));
+    let mut operation = reopen_aggregate_for_schema(&store, decoded.as_ref(), Arc::clone(&schema));
     let mut transactions = store.into_transactions();
     let retract = make_change(
         vec!["A", "B", "A"],
@@ -687,7 +698,7 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
 fn null_arguments_never_enter_the_extrema_partition() {
     let root = TestStore::new();
     let definition = definition();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A", "A"], &[None, None], &[1, 1]);
     let Action::Complete(Some(output)) = commit_ready(
         &mut operation,
@@ -722,7 +733,7 @@ fn extrema_multiplicity_and_group_partitions_are_independent() {
     .unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) =
-        create_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let make_change =
         |departments: Vec<&str>, identities: Vec<i64>, values: Vec<i64>, diffs: Vec<i64>| {
             Change::try_new(
@@ -830,7 +841,7 @@ fn empty_call_list_groups_rows_without_redundant_updates() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let input = change(
         &["A", "A", "A", "A"],
         &[Some(10), Some(20), Some(10), Some(20)],
@@ -867,7 +878,7 @@ fn unsigned_sum_and_average_use_input_multiplicity() {
     .unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) =
-        create_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let records = RecordBatch::try_new(
         schema,
         vec![
@@ -912,7 +923,7 @@ fn unknown_extrema_argument_rolls_back_the_whole_change() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A"], &[Some(10)], &[1]);
     commit_ready(
         &mut operation,
@@ -957,7 +968,7 @@ fn group_weight_underflow_rolls_back_the_turn() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A"], &[Some(10)], &[1]);
     commit_ready(
         &mut operation,
@@ -1019,7 +1030,7 @@ fn retraction_of_an_unused_column_is_accepted() {
     .unwrap();
     let root = TestStore::new();
     let (mut operation, mut transactions) =
-        create_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let rows = |values: Vec<i64>, notes: Vec<&str>, diffs: Vec<i64>| {
         Change::try_new(
             RecordBatch::try_new(
@@ -1081,7 +1092,7 @@ fn non_null_count_underflow_rolls_back_the_turn() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(
         &["A", "A", "A", "A"],
         &[None, None, None, Some(5)],
@@ -1120,7 +1131,7 @@ fn count_overflow_rolls_back_the_whole_turn() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A"], &[Some(10)], &[i64::MAX]);
     commit_ready(
         &mut operation,
@@ -1169,7 +1180,7 @@ fn decoded_definition_reopens_group_and_index_state() {
     )
     .unwrap();
     let encoded = encode_definition(&definition);
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
     commit_ready(
         &mut operation,
@@ -1181,7 +1192,7 @@ fn decoded_definition_reopens_group_and_index_state() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = open_aggregate(&store, decoded.as_ref());
+    let mut operation = reopen_aggregate(&store, decoded.as_ref());
     let mut transactions = store.into_transactions();
     let retract_min = change(&["A"], &[Some(10)], &[-1]);
     let Action::Complete(Some(output)) = commit_ready(
@@ -1214,7 +1225,7 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
     )
     .unwrap();
     let encoded = encode_definition(&definition);
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(
         &["A", "A", "A"],
         &[Some(10), Some(10), Some(20)],
@@ -1230,7 +1241,7 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = open_aggregate(&store, decoded.as_ref());
+    let mut operation = reopen_aggregate(&store, decoded.as_ref());
     let mut transactions = store.into_transactions();
 
     // A duplicate leaves: neither extreme moves, so the turn emits nothing and
@@ -1294,7 +1305,7 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
         [("rows", AggregateCall::count_all())],
     )
     .unwrap();
-    let Err(error) = bind(&float_group, std::slice::from_ref(&float_schema)) else {
+    let Err(error) = construct_checked(&float_group, std::slice::from_ref(&float_schema)) else {
         panic!("floating-point GROUP BY unexpectedly bound");
     };
     assert!(matches!(
@@ -1313,7 +1324,8 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
     ] {
         let definition =
             AggregateDefinition::try_new([("key", col("key"))], [("result", call)]).unwrap();
-        let Err(error) = bind(&definition, std::slice::from_ref(&keyed_float_schema)) else {
+        let Err(error) = construct_checked(&definition, std::slice::from_ref(&keyed_float_schema))
+        else {
             panic!("unsupported floating-point aggregate unexpectedly bound");
         };
         assert!(matches!(
@@ -1450,7 +1462,7 @@ fn emitted_relation_matches_a_multiset_model_under_retraction() {
     )
     .unwrap();
     let root = TestStore::new();
-    let (mut operation, mut transactions) = create_aggregate(&root, &definition);
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
 
     let (events, model) = multiset_stream();
     let mut emitted = BTreeMap::new();

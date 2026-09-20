@@ -5,17 +5,17 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
-    create_operation, decode_definition, encode_definition, open_operation,
+    decode_definition, encode_definition,
     operation::{
         Action, OperationInput,
         transform::{UnionAllDefinition, UnionAllError, UnionAllSchemaError},
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
-    TestStore, assert_literal_definition, bind, change, change_with_field_name, commit_ready,
-    decode_hex, rollback_ready, value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
+    construct_checked, decode_hex, rollback_ready, value_schema,
 };
 
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
@@ -52,7 +52,7 @@ fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
         true,
     )]));
 
-    let Err(OperationBindError::Rejected { source }) = bind(
+    let Err(OperationBindError::Rejected { source }) = construct_checked(
         &definition,
         &[Arc::clone(&expected), Arc::clone(&mismatched)],
     ) else {
@@ -67,8 +67,9 @@ fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
         }) if actual_expected == &expected && actual == &mismatched
     ));
 
-    let binding = bind(&definition, &[Arc::clone(&expected), Arc::clone(&expected)]).unwrap();
-    assert_eq!(binding.output_schema(), Some(&expected));
+    let binding =
+        construct_checked(&definition, &[Arc::clone(&expected), Arc::clone(&expected)]).unwrap();
+    assert_eq!(binding.as_ref(), Some(&expected));
 }
 
 #[test]
@@ -83,7 +84,9 @@ fn literal_definition_preserves_arity_binding_and_data_contract() {
     assert_eq!(definition.input_count().get(), 2);
     let inputs = [value_schema(), value_schema()];
     assert_eq!(
-        bind(decoded.as_ref(), &inputs).unwrap().output_schema(),
+        construct_checked(decoded.as_ref(), &inputs)
+            .unwrap()
+            .as_ref(),
         Some(&value_schema())
     );
 }
@@ -117,15 +120,18 @@ fn union_all_forwards_every_legal_port_without_copying() {
     )
     .unwrap();
     let fixture = TestStore::new();
-    let mut setup = Store::setup(fixture.path()).unwrap();
-    let binding = bind(
-        decoded_definition().as_ref(),
-        &[input.schema(), input.schema()],
-    )
-    .unwrap();
-    let mut operation =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-    let mut transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let definition = decoded_definition();
+    let constructed = definition
+        .construct(
+            &[input.schema(), input.schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
+    let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     for port in 0..2 {
         let Action::Complete(Some(output)) = commit_ready(
             &mut operation,
@@ -165,13 +171,16 @@ fn union_all_forwards_every_legal_port_without_copying() {
 
     drop((operation, transactions));
     let store = Store::open(fixture.path()).unwrap();
-    let binding = bind(
-        decoded_definition().as_ref(),
-        &[input.schema(), input.schema()],
-    )
-    .unwrap();
-    let mut operation =
-        open_operation(binding, &store, "operation", RuntimeResource::none()).unwrap();
+    let definition = decoded_definition();
+    let constructed = definition
+        .construct(
+            &[input.schema(), input.schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
     let Action::Complete(Some(reopened_output)) = commit_ready(
         &mut operation,
@@ -192,11 +201,17 @@ fn runtime_rejects_missing_and_invalid_ports() {
     let input = change(&[1]);
     let definition = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
     let root = TestStore::new();
-    let mut setup = Store::setup(root.path()).unwrap();
-    let binding = bind(&definition, &[input.schema(), input.schema()]).unwrap();
-    let mut operation =
-        create_operation(binding, &mut setup, "operation", RuntimeResource::none()).unwrap();
-    let mut transactions = setup.commit(|_| Ok(())).unwrap();
+    let mut setup = StoreSetup::new();
+    let constructed = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[input.schema(), input.schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap();
+    let (mut operation, _) = constructed.into_parts();
+    let mut transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
     let error = rollback_ready(
         &mut operation,
         Some(OperationInput {

@@ -2,15 +2,12 @@ use std::{fmt, num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
-use dogpaddle_store::{Store, TransactionAccess};
+use dogpaddle_store::{DataScope, Store, StoreSetup, TransactionAccess};
 
 use crate::{
-    OperationBindError, OperationBinding, OperationDefinition, OperationKind, OperationSchemaError,
-    RuntimeResource,
+    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     codec::DECODERS,
-    create_operation,
-    definition::Sealed,
-    open_operation,
+    definition::{ConstructedOperation, Sealed},
     operation::{AtomicOperation, Operation, OperationError, OperationInput, Turn, TurnOperation},
 };
 
@@ -35,16 +32,26 @@ enum Body {
 }
 
 impl Sealed for InvalidDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
         &self,
-        _input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        _inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        Ok(self.output.clone())
+    }
+
+    fn construct_unchecked(
+        &self,
+        _inputs: &[SchemaRef],
+        _data: &mut DataScope<'_>,
+        _prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, OperationSetupError> {
         Ok(match self.body {
-            Body::Atomic => OperationBinding::atomic_ready(
+            Body::Atomic => ConstructedOperation::atomic(
                 self.output.clone().expect("atomic test body needs output"),
                 TestAtomic,
             ),
-            Body::Turn => OperationBinding::turn_ready(self.output.clone(), TestTurn),
+            Body::Turn => ConstructedOperation::turn(self.output.clone(), TestTurn),
         })
     }
 }
@@ -70,15 +77,21 @@ fn schema() -> SchemaRef {
 }
 
 #[test]
-fn bind_rejects_missing_and_unexpected_output() {
+fn construct_rejects_missing_and_unexpected_output() {
     let missing = InvalidDefinition {
         kind: OperationKind::Scan,
         output: None,
         body: Body::Turn,
     };
+    let mut setup = StoreSetup::new();
     assert!(matches!(
-        (&missing as &dyn OperationDefinition).bind(&[]),
-        Err(OperationBindError::MissingOutput)
+        (&missing as &dyn OperationDefinition).construct(
+            &[],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        ),
+        Err(OperationSetupError::Bind(OperationBindError::MissingOutput))
     ));
 
     let unexpected = InvalidDefinition {
@@ -86,9 +99,17 @@ fn bind_rejects_missing_and_unexpected_output() {
         output: Some(schema()),
         body: Body::Turn,
     };
+    let mut setup = StoreSetup::new();
     assert!(matches!(
-        (&unexpected as &dyn OperationDefinition).bind(&[schema()]),
-        Err(OperationBindError::UnexpectedOutput)
+        (&unexpected as &dyn OperationDefinition).construct(
+            &[schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        ),
+        Err(OperationSetupError::Bind(
+            OperationBindError::UnexpectedOutput
+        ))
     ));
 }
 
@@ -102,30 +123,33 @@ fn exclusive_transform_create_and_open_accept_atomic_and_turn_bodies() {
         };
         let input = schema();
         let root = tempfile::tempdir().unwrap();
-        let mut setup = Store::setup(root.path().join("store")).unwrap();
-        let operation = create_operation(
-            (&definition as &dyn OperationDefinition)
-                .bind(std::slice::from_ref(&input))
-                .expect("bind exclusive body for create"),
-            &mut setup,
-            "operation",
-            RuntimeResource::none(),
-        )
-        .expect("create exclusive body");
+        let path = root.path().join("store");
+        let mut setup = StoreSetup::new();
+        let (operation, output) = (&definition as &dyn OperationDefinition)
+            .construct(
+                std::slice::from_ref(&input),
+                &mut setup.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct exclusive body for create")
+            .into_parts();
+        assert_eq!(output, Some(Arc::clone(&input)));
         assert!(matches!(operation, Operation::Turn(_)));
-        let transactions = setup.commit(|_| Ok(())).unwrap();
+        let transactions = setup.commit(&path, |_| Ok(())).unwrap();
         drop(transactions);
 
-        let store = Store::open(root.path().join("store")).unwrap();
-        let operation = open_operation(
-            (&definition as &dyn OperationDefinition)
-                .bind(&[input])
-                .expect("bind exclusive body for open"),
-            &store,
-            "operation",
-            RuntimeResource::none(),
-        )
-        .expect("open exclusive body");
+        let store = Store::open(&path).unwrap();
+        let (operation, output) = (&definition as &dyn OperationDefinition)
+            .construct(
+                &[input],
+                &mut store.data_scope(),
+                "operation",
+                RuntimeResource::none(),
+            )
+            .expect("construct exclusive body for open")
+            .into_parts();
+        assert!(output.is_some());
         assert!(matches!(operation, Operation::Turn(_)));
     }
 }
@@ -137,9 +161,15 @@ fn atomic_transform_rejects_a_turn_body() {
         output: Some(schema()),
         body: Body::Turn,
     };
+    let mut setup = StoreSetup::new();
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).bind(&[schema()]),
-        Err(OperationBindError::ExecutionKind)
+        (&definition as &dyn OperationDefinition).construct(
+            &[schema()],
+            &mut setup.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        ),
+        Err(OperationSetupError::ExecutionKind)
     ));
 }
 

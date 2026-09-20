@@ -41,37 +41,49 @@ pub struct Store {
     token: u64,
     catalog: BTreeMap<String, (u32, DataKind)>,
     next_data_id: u64,
-    catalog_mode: CatalogMode,
 }
 
-/// Owns a new marker-only Store while its complete typed resource set is staged.
+/// Owns an in-memory draft of a new Store's complete typed resource set.
 ///
-/// Dropping this capability before commit leaves a valid empty Store.
-/// [`StoreSetup::commit`] atomically publishes the staged catalog together
-/// with caller-provided collection initialization and consumes the capability
-/// on every outcome, including an indeterminate storage commit error.
+/// Creating or dropping a draft does not touch the filesystem. The draft
+/// allocates the final Store identity, catalog, namespace identifiers, and
+/// typed handles. [`StoreSetup::commit`] consumes it, creates the Store at the
+/// supplied path, and atomically publishes the marker, complete catalog, and
+/// caller-provided initialization.
 ///
-/// Staged setup cannot inspect data or enter runtime without committing.
+/// A failed commit consumes the draft. Once creation has started, failure may
+/// leave an incomplete path which [`Store::open`] rejects.
+///
+/// Draft setup cannot inspect data or enter runtime without committing.
 ///
 /// ```compile_fail
-/// let setup = dogpaddle_store::Store::setup("state")?;
+/// let setup = dogpaddle_store::StoreSetup::new();
 /// setup.read_transaction();
-/// # Ok::<(), dogpaddle_store::StoreError>(())
 /// ```
 ///
 /// ```compile_fail
-/// let setup = dogpaddle_store::Store::setup("state")?;
+/// let setup = dogpaddle_store::StoreSetup::new();
 /// setup.into_transactions();
-/// # Ok::<(), dogpaddle_store::StoreError>(())
 /// ```
 pub struct StoreSetup {
-    store: Store,
+    token: u64,
+    catalog: BTreeMap<String, (u32, DataKind)>,
+    next_data_id: u64,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CatalogMode {
-    Immediate,
-    Staged,
+/// A short-lived capability for declaring or looking up typed Store data.
+///
+/// A scope borrowed from [`StoreSetup`] strictly declares new names, while a
+/// scope borrowed from [`Store`] strictly looks up existing names. It exposes
+/// no transaction capability, raw namespace identifier, or way to switch
+/// modes. Typed handles returned by [`DataScope::data`] do not borrow the scope.
+pub struct DataScope<'owner> {
+    mode: DataScopeMode<'owner>,
+}
+
+enum DataScopeMode<'owner> {
+    Declare(&'owner mut StoreSetup),
+    Existing(&'owner Store),
 }
 
 /// Uniquely owns the runtime capability to begin Store write transactions.

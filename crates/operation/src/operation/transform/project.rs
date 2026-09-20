@@ -6,9 +6,9 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationBinding, OperationDefinition, OperationKind,
-    OperationSchemaError,
-    definition::Sealed as SealedDefinition,
+    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
+    RuntimeResource,
+    definition::{Sealed as SealedDefinition, schema_error},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -97,17 +97,27 @@ impl ProjectDefinition {
 }
 
 impl SealedDefinition for ProjectDefinition {
-    fn bind_schemas(
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        self.bind_operation(&inputs[0])
+            .map(|(schema, _)| Some(schema))
+            .map_err(Into::into)
+    }
+
+    fn construct_unchecked(
         &self,
         input_schemas: &[SchemaRef],
-    ) -> Result<OperationBinding, OperationSchemaError> {
+        _data: &mut dogpaddle_store::DataScope<'_>,
+        _prefix: &str,
+        _resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Project input arity");
-        let (output_schema, operation) = self
-            .bind_operation(input_schema)
-            .map_err(|source| -> OperationSchemaError { Box::new(source) })?;
-        Ok(OperationBinding::atomic_ready(output_schema, operation))
+        let (output_schema, operation) = self.bind_operation(input_schema).map_err(schema_error)?;
+        Ok(ConstructedOperation::atomic(output_schema, operation))
     }
 }
 
