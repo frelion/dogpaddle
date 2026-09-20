@@ -113,6 +113,7 @@ impl PostgresCdcScanDefinition {
 impl Sealed for PostgresCdcScanDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         schema::compile(&self.spec.columns)
@@ -122,6 +123,7 @@ impl Sealed for PostgresCdcScanDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
         prefix: &str,

@@ -17,13 +17,23 @@ mod private {
     use dogpaddle_store::DataScope;
     use std::any::TypeId;
 
+    /// Unnameable in-crate capability guarding the unchecked construction
+    /// entry points. Nominally public so it can appear in the sealed trait,
+    /// but every ancestor module is private: downstream crates can neither
+    /// name nor construct it. They must use the checked
+    /// `OperationDefinition::output_schema` and
+    /// `OperationDefinition::construct` entry points instead.
+    pub struct ConstructionToken(pub(super) ());
+
     pub trait Sealed {
         fn output_schema_unchecked(
             &self,
+            _: ConstructionToken,
             inputs: &[SchemaRef],
         ) -> Result<Option<SchemaRef>, crate::OperationSchemaError>;
         fn construct_unchecked(
             &self,
+            _: ConstructionToken,
             inputs: &[SchemaRef],
             data: &mut DataScope<'_>,
             prefix: &str,
@@ -34,7 +44,7 @@ mod private {
         }
     }
 }
-pub(crate) use private::Sealed;
+pub(crate) use private::{ConstructionToken, Sealed};
 
 /// Type-erased error from a concrete operation's pure Schema compiler.
 pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
@@ -102,6 +112,61 @@ impl OperationKind {
 }
 
 /// Sealed persistent operation plan with authoritative pure Schema derivation and final construction.
+///
+/// Use the checked entry points through a trait object:
+///
+/// ```
+/// use dogpaddle_operation::{OperationDefinition, RuntimeResource};
+/// use dogpaddle_operation::operation::transform::RunningEventCountDefinition;
+/// use dogpaddle_store::StoreSetup;
+///
+/// let definition = RunningEventCountDefinition::new();
+/// let definition: &dyn OperationDefinition = &definition;
+/// let mut setup = StoreSetup::new();
+/// // Missing input is rejected, rather than reaching the concrete constructor.
+/// assert!(definition.output_schema(&[]).is_err());
+/// assert!(definition.construct(
+///     &[], &mut setup.data_scope(), "count", RuntimeResource::none(),
+/// ).is_err());
+/// ```
+///
+/// Sealing alone does not hide inherited methods. The unchecked entry points
+/// also require an internal capability that downstream code cannot obtain.
+/// Calling either entry point without that capability fails to compile:
+///
+/// ```compile_fail,E0061
+/// use dogpaddle_operation::OperationDefinition;
+/// fn bypass(definition: &dyn OperationDefinition) {
+///     let _ = definition.output_schema_unchecked(&[]);
+/// }
+/// ```
+///
+/// ```compile_fail,E0061
+/// use dogpaddle_operation::{OperationDefinition, RuntimeResource};
+/// use dogpaddle_store::StoreSetup;
+/// fn bypass(definition: &dyn OperationDefinition) {
+///     let mut setup = StoreSetup::new();
+///     let _ = definition.construct_unchecked(
+///         &[], &mut setup.data_scope(), "count", RuntimeResource::none(),
+///     );
+/// }
+/// ```
+///
+/// The capability cannot be obtained using type inference and `Default`:
+///
+/// ```compile_fail,E0277
+/// use dogpaddle_operation::OperationDefinition;
+/// fn bypass(definition: &dyn OperationDefinition) {
+///     let _ = definition.output_schema_unchecked(Default::default(), &[]);
+/// }
+/// ```
+///
+/// Its constructor is not publicly accessible either:
+///
+/// ```compile_fail,E0603
+/// use dogpaddle_operation::definition::ConstructionToken;
+/// let _ = ConstructionToken(());
+/// ```
 pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
     /// Returns the operation's declared execution role and exact input arity.
     fn kind(&self) -> OperationKind;
@@ -165,7 +230,7 @@ impl dyn OperationDefinition + '_ {
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, OperationBindError> {
         validate_inputs(self.kind(), inputs)?;
-        let output = private::Sealed::output_schema_unchecked(self, inputs)
+        let output = private::Sealed::output_schema_unchecked(self, ConstructionToken(()), inputs)
             .map_err(|source| OperationBindError::Rejected { source })?;
         validate_output(self.kind(), output.as_ref())?;
         Ok(output)
@@ -187,7 +252,14 @@ impl dyn OperationDefinition + '_ {
         let kind = self.kind();
         validate_inputs(kind, inputs)?;
         resource.validate(private::Sealed::resource_type(self))?;
-        let mut built = private::Sealed::construct_unchecked(self, inputs, data, prefix, resource)?;
+        let mut built = private::Sealed::construct_unchecked(
+            self,
+            ConstructionToken(()),
+            inputs,
+            data,
+            prefix,
+            resource,
+        )?;
         validate_output(kind, built.output_schema.as_ref())?;
         built.operation = match (kind, built.operation) {
             (OperationKind::ExclusiveTransform(_), Operation::Atomic(op)) => {

@@ -34,6 +34,7 @@ enum Body {
 impl Sealed for InvalidDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         Ok(self.output.clone())
@@ -41,6 +42,7 @@ impl Sealed for InvalidDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _inputs: &[SchemaRef],
         _data: &mut DataScope<'_>,
         _prefix: &str,

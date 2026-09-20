@@ -115,6 +115,7 @@ impl FilterDefinition {
 impl SealedDefinition for FilterDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         self.bind_operation(&inputs[0])?;
@@ -123,6 +124,7 @@ impl SealedDefinition for FilterDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
         _prefix: &str,

@@ -82,6 +82,7 @@ impl DistinctDefinition {
 impl SealedDefinition for DistinctDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         Ok(Some(Arc::clone(&input_schemas[0])))
@@ -89,6 +90,7 @@ impl SealedDefinition for DistinctDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
         prefix: &str,

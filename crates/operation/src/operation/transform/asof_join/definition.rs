@@ -352,6 +352,7 @@ impl AsOfJoinDefinition {
 impl SealedDefinition for AsOfJoinDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         let [left, right] = inputs else {
@@ -363,6 +364,7 @@ impl SealedDefinition for AsOfJoinDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
         prefix: &str,

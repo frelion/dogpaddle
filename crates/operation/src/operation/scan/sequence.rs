@@ -62,6 +62,7 @@ impl SequenceScanDefinition {
 impl SealedDefinition for SequenceScanDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         Ok(Some(output_schema()))
@@ -69,6 +70,7 @@ impl SealedDefinition for SequenceScanDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
         prefix: &str,

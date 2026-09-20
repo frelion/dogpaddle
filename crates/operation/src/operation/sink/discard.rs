@@ -51,6 +51,7 @@ impl DiscardDefinition {
 impl SealedDefinition for DiscardDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         Ok(None)
@@ -58,6 +59,7 @@ impl SealedDefinition for DiscardDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         _input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
         _prefix: &str,

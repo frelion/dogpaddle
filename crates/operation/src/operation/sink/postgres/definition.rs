@@ -57,6 +57,7 @@ impl PostgresSinkDefinition {
 impl Sealed for PostgresSinkDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         PostgresLayout::try_new(Arc::clone(&inputs[0]))?;
@@ -65,6 +66,7 @@ impl Sealed for PostgresSinkDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
         prefix: &str,

@@ -93,6 +93,7 @@ impl UnionAllDefinition {
 impl SealedDefinition for UnionAllDefinition {
     fn output_schema_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         Self::compile_schema(inputs).map(Some)
@@ -100,6 +101,7 @@ impl SealedDefinition for UnionAllDefinition {
 
     fn construct_unchecked(
         &self,
+        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         _data: &mut dogpaddle_store::DataScope<'_>,
         _prefix: &str,
