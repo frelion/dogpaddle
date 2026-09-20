@@ -1,5 +1,7 @@
 # DogPaddle 算子简化重构路线图
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 > 状态：已按本路线图实施并通过本地完整 gate。基线：`fbaa5dc`（main，工作区原本干净）。
 > 目标读者：负责实施、审查和接手维护的 Agent，以及只掌握 Rust 基础语法的开发者。
 > 本文保留实施前的决策与阶段设计；配套 `operator-simplification-agent-brief.md` 给出交接与审查提示，实际命令和验证证据见 `operator-simplification-execution.md`。

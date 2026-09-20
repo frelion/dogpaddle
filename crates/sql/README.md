@@ -233,29 +233,18 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 
 `DataFusion` 只做 parser、`SqlToRel` 和 `TypeCoercion`。SQL crate 不运行 logical optimizer、physical planner 或 `SessionContext`。Projection 和 Union 分支最终都通过 `SchemaAlign` 精确保留分析后的 Arrow Schema。
 
-## 智能装配规则
+## 装配与稳定 ID
 
-Flow 统一统计每个 Operation 的直接消费边，再按确定性顺序处理；SQL 不实现这套规划规则。当前 Operation 只有同时满足以下条件时才追加到上游 Station：
+Station 融合和持久边界由 [Flow](../flow/README.md#最小公共-api) 唯一决定。SQL lowering 按确定性 postorder 直接调用 `FlowFactory::operation` 声明算子，不维护第二张图或融合规则。
 
-1. 它是单输入 `AtomicTransform`；
-2. 唯一上游只有这一条消费边，没有分叉；
-3. 上游仍是所属 Station 的末项；
-4. 该 Station 允许追加 atomic 尾链。
+每个实际有输出的 Station 固定使用 64 MiB 持久队列；Scan ID 为 `sql/scan/{index:08x}`，每个 logical Transform 使用稠密 `sql/transform/{index:08x}`，Station ID 取其首 Operation ID（因此 Transform Station 编号可以有间隔），最终 Sink 为 `sql/sink`。
 
-不满足时创建新 Station。分叉需要为每个消费者保留独立订阅位置；Join 作为双输入 `TurnTransform` 从新 Station 开始，但可以吸收后续单输入 Atomic；`ExclusiveTransform` 和 Sink 必须独占。
-
-```text
-直线： [Scan, Filter, Projection] ══持久边══> [Sink]
-
-分叉： [Scan] ══> [Filter A]
-             ╚══> [Filter B]
-
-Join： [Left Scan]  ─┐
-                     ├══> [Join, Projection] ══> [Sink]
-      [Right Scan] ──┘
-```
-
-消费数按 edge 计算，同一 producer 接到同一个多输入 Operation 的两个端口也算两条。每个实际有输出的 Station 固定使用 64 MiB 持久队列；Scan ID 为 `sql/scan/{index:08x}`，每个 logical Transform 使用稠密 `sql/transform/{index:08x}`，Station ID 取其首 Operation ID（因此 Transform Station 编号可以有间隔），最终 Sink 为 `sql/sink`。
+构建时 lowering 只接受 endpoint `TableScan`、`Filter`、`Projection`、`SubqueryAlias`、`Join`、`AsOfJoin`、`Union`、`Distinct::All` 和非空分组 `Aggregate`。
+`SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `SchemaAlign`。
+只执行 `TypeCoercion` Analyzer 并关闭 `Utf8View` 映射；语法层先拒绝会被 planner 擦除的 modifier。
+SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata 与 `AggregateCall` lowering，不重复函数目录。
+同一 CTE 的重复引用复用 Scan identity；任何已声明却不可达的 Scan 都在创建状态前拒绝。
+`ResolvedEndpoints` 是一次 start 的强类型快照，不复制 Query，也不在 identity/build/open 中重复解析。Program identity 使用手工稳定 framing 的 BLAKE3。
 
 ## 源码入口
 

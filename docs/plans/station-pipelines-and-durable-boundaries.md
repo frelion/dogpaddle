@@ -1,5 +1,7 @@
 # 线性 Station 与持久化边界
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 > 历史设计记录：本文的手工 `station/append/connect` API 已由 2026-09-20 的自动规划替代。当前入口是 `FlowFactory::operation` 与可选 `materialize`；SQL 不再维护独立装配图。以 [Flow README](../../crates/flow/README.md) 为准。Station 内事务与持久边界的原则仍保留。
 
 状态：历史 v1 设计（声明 API 已被自动规划替代）

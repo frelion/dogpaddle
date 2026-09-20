@@ -1,5 +1,7 @@
 # DogPaddle 算子简化重构执行记录
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 > 主设计：`operator-simplification-roadmap.md`
 > 执行开始基线：`fbaa5dc`，`main...origin/main [ahead 1]`；开始时除两份已批准计划文档外无产品代码变更。
 > 当前阶段：P0–P3 实现、全量迁移、本地 Cargo gate与最终独立复审均已完成。

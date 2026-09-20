@@ -32,6 +32,9 @@ Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station �
 `construct` 取得统一 `Operation`。该入口校验 Schema、执行能力和资源类型，再取得 typed handles
 并构造运行实例，不执行外部 I/O、事务或状态读取。
 
+定义/表达式的精确维护规则见 [定义契约](docs/definitions.md)；Station 的事务与确认由
+[Flow 运行契约](../flow/docs/runtime.md) 唯一规定。本文提供使用与阅读顺序。
+
 ## 先认识 Definition 和运行实例
 
 同一个算子有两种形态。
@@ -269,141 +272,16 @@ Schema 和 `SQLite` 路径等稳定信息仍保存在 Definition。普通算子�
 
 ## 四个有状态关系算子的直觉
 
-### Distinct：完整行到账本
+| 算子 | 状态如何组织 | 一条事件如何改变结果 |
+| --- | --- | --- |
+| Distinct | 完整行 → 正权重 | 只在零与正权重之间跨越时输出 |
+| Aggregate | 分组 → Fold 状态与极值缓存 | 旧结果撤回，再发布新结果 |
+| `EquiJoin` | 连接键 → 左右完整行与权重 | 查另一侧同键记录，分页发布匹配和存在性修正 |
+| `AsOfJoin` | 分区、排序键 → 左右完整行与权重 | 为每个左行选择至多一个右行；右侧变化修正历史选择 |
 
-`Distinct` 把完整行的确定性字节编码（canonical row）当作 key，在 `OrderedMultiset` 中保存正权重：
-
-- `0 → positive` 输出这行 `+1`；
-- `positive → 0` 输出这行 `-1`；
-- 其他权重变化不输出。
-
-输入仍按行序应用。非法负前缀或整数溢出会回滚整个 Change。
-
-### Aggregate：每组一个小状态
-
-`Aggregate` 用完整分组键查找 group state。COUNT、SUM、AVG 保存可增量更新的小状态；MIN/MAX 把
-候选值放进有序分区，并在 group state 里缓存每个「排序表达式 + 方向」的当前极值：插入时直接比较
-更新，只有被撤回的正是当前极值时，才回分区重取第一个或最后一个值。缓存保存保序编码的 key，因而
-会和对应分区短暂重复一份字节；这是按 bound extrema slot 数量限制的明确取舍，用可变 key 字节换取
-正常输出路径不必逐行读取 `RocksDB` 分区。
-
-它不保留完整输入行。算子只检查三类被跟踪的权重非负：分组行数、每个 COUNT(expr)/SUM/AVG 的非空
-参数计数、每个极值参数的份数；此外从未出现过的分组遇到负 diff 直接失败。也就是说它按「分组 +
-调用参数」校验，而不是按记录校验；需要记录级身份的算子（`Distinct`、`EquiJoin`、`AsOfJoin` 和
-Sink）仍然按完整行记账。由于 NULL 参数不进入极值分区，宽松的参数级契约允许一个分组归零时仍有
-不可达的旧极值键；归零路径会在同一事务中按 layout 清空这些残留。正常合法重放通常每个分区已经为空，
-此时只做每个 layout 一次边界检查。
-
-一条事件引起的 group state、极值索引、极值缓存和输出在同一事务更新。已有组结果改变时先输出旧行
-`-1`，再输出新行 `+1`。
-
-v1 要求至少一个分组表达式，且分组键不能包含浮点值。COUNT 可以统计受支持表达式的 non-null 值，
-包括浮点列；SUM/AVG 只接受整数，MIN/MAX 只接受扁平非浮点值。不支持 global aggregate 和嵌套 MIN/MAX。
-
-### EquiJoin：一套状态覆盖五种关系语义
-
-`EquiJoin` 维护：
-
-```text
-left_rows[join key]  = 左侧完整行及各自权重
-right_rows[join key] = 右侧完整行及各自权重
-```
-
-左侧来一行时，它查右侧同 key 的所有行，输出 diff 为“输入 diff × 对侧权重”的组合；右侧输入
-完全对称。复合 key 任一分量为 NULL 时不匹配，但原行仍进入本侧账本，以便以后精确撤回。
-
-Definition 用 `EquiJoinKind` 选择 `Inner`、`LeftSemi`、`LeftAnti`、`LeftOuter` 或 `FullOuter`。
-Semi/Anti 只输出左侧字段；Outer 为可能补 NULL 的一侧放宽字段 nullability。可选 residual 对同 key 的
-每个候选记录对求值，只有 non-null `true` 才匹配。没有 residual 时，非 Inner 继续使用紧凑的
-`key_counts`，只记录每个 key 在左右各有多少种不同完整行；有 residual 时，非 Inner 改为维护逐完整行
-的 `match_counts`，记录它有多少种满足整个 `ON` 条件的对侧记录。重复行权重仍只保存在左右 row state，
-不会膨胀 presence 计数。Semi/Anti 中同一 exact row 仅改变 multiplicity 时不重扫对侧 bucket：right
-变化不改变 support，left 变化直接读取该行已有的 actual/shadow match count。需要变化的 driving-row
-count 按 qualifying page 合并，对侧每种 distinct row 的 count 仍分别更新。
-
-热点 key 可能产生非常大的结果，所以 Join 用持久 continuation 分页：Probe 先验证这批输入的全部
-匹配都能安全计算，Emit 再分页产生真正输出。Residual presence Join 的 Probe 只写隐藏的模拟计数，
-随后由 `ClearShadow` 有界清理，再由 Emit 原子更新真实计数；因此后段 predicate、解码或 diff 错误不会
-在输出前污染关系状态。一个输入 Change 完成前，Station 固定当前端口；reopen 可以从已提交页继续。
-
-Probe/Emit 重复扫描和求值是有意的 whole-Claim failure-before-output 边界：整个 Claim 中后面的
-predicate、存储行损坏或 output-diff overflow 不会在前面的结果已经发布后才暴露。当前不持久化
-qualifying-pair spool 或 bitset，也不用跨阶段内存 cache 代替可重放的第二遍。
-
-`PreparedClaim` 只为整批保留 canonical row、join key、diff 和 admission effect，不再保留每行的全量
-`ScalarValue`；每个 turn 处理当前 row 时，仅在 predicate 或真实输出需要字段值时，才从 Station 固定的
-`RecordBatch` 惰性物化一次短期 values。空 bucket、无输出存在性路径和稳定 Semi/Anti 右侧更新不会复制宽行。
-Residual 候选的
-常规单批上限是 256 行、1 MiB Store logical bytes 和 16,384 个 candidate scalar slots；实际行数还受
-candidate 字段数及当前 turn 剩余预算约束。每批会完整解码候选并构造 Arrow candidate batch，但
-LeftSemi/LeftAnti 的左侧 driving row 只保留 qualifying count，其他路径也只把 predicate 通过的候选
-values 带入当前输出阶段。
-
-`TURN_ITEMS` 和 `TURN_BYTES` 以 256 项和 4 MiB 限制常规单 turn 的逻辑扫描、ScalarValue slot、
-输出和事务工作量。分区扫描按每个候选重复计算 partition frame、完整 join key、row key 与 multiplicity，
-driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftSemi/LeftAnti 的右侧宽行不会逃逸预算。
-这些值不是进程 RSS 硬上限：Station 仍已持有完整 Change，Arrow/DataFusion 可以产生
-额外中间分配，且空 turn 遇到单个超过批字节或 scalar-slot 界限的 Store row 时会单独处理它，以避免永久
-停滞。因此峰值至少是 `O(Claim + candidate page)`，还有“单个 oversized row”的活性例外。逐行
-`match_counts` 以完整 canonical row 为 key，持久状态与 tracked rows 的总宽度成正比；分页也不限制
-整个 Join 关系的磁盘大小，无法消除连接结果本身的高 fan-out 成本。
-
-### AsOfJoin：动态关系中的单候选最近匹配
-
-`AsOfJoin` 固定把 port `0` 作为 probe/left，port `1` 作为 candidate/right。Equality
-表达式先划分 partition，然后每个正权重 left exact row 在当前 right 关系中最多选一个候选：
-
-- `Backward` 选最大的前驱，`Forward` 选最小的后继，两者都显式声明是否允许 exact match；
-- `Nearest` 按唯一 distance-capable order 的绝对距离选择，并显式声明等距时选前驱还是后继；
-- backward/forward 可以用非空 lexicographic order tuple；nearest 和 tolerance 只能用单个
-  integer、Date32、Timestamp 或 Decimal128 order；
-- tolerance 是该 order 物理单位上的包含边界上限。它只限制匹配，不是 watermark，也不允许删除历史状态。
-
-Equality 键可为空，表示一个全局 partition。`Equal` 模式下任一分量为 NULL 就不匹配；
-`NotDistinct` 让两侧 NULL 进入同一 partition。Order 的 NULL 永远不匹配。指定了 residual 时，
-它在排名前对完整 `left + right` pair 求值；false 或 NULL 候选会被跳过，搜索继续到更远的
-eligible candidate。
-
-同 order 下的不同 right rows 先按有序 right-only tie-break 排名，每个 tie 都指定升/降序和
-NULL first/last。若显式 tie 仍不唯一，Definition 必须选择拒绝歧义，或使用 canonical right row
-的升/降序作最终决胜。同一 canonical right row 的 multiplicity 只决定 candidate 是否存在，
-不会把一个 left row 的匹配输出再乘一次。
-
-`AsOfJoinKind` 提供 `Inner`、`LeftOuter`、`LeftSemi` 和 `LeftAnti`。Right 候选的
-`0 ↔ positive` presence transition 会重新计算已有 left rows，依次输出旧结果 `-weight` 和新结果
-`+weight`；仅在正 multiplicity 之间变化不会改变被选 identity。两侧的插入和撤回都进入同一
-ordered relation，不是“左流到达时查一次右表”的 processing-time lookup。
-
-加权关系在没有 occurrence identity 时不能唯一决定 Right/Full ASOF 中哪个物理 right copy
-已被使用。例如同一 left row 权重 2、同一 right row 权重 3 时，两个 probe copy 可以共用一个
-candidate occurrence，也可以各用一个；joined value multiset 相同，但 unmatched right 权重不同。
-`Change` 没有这种 occurrence identity，因而这四种 left-family 是输入关系能唯一决定的完整语义；
-交换左右侧可以表达反向的 probe 问题，但那是另一个选择函数，不是 Right ASOF 的等价改写。
-
-算子只声明三个持久资源：
-
-```text
-asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
-asof_join.right_rows: OrderedMap<Vec<u8>, RowWeight>
-asof_join.continuation: Cell<AsOfContinuation>
-```
-
-两个 map 的 key 按 `partition + order + tie rank + canonical row` 排序，值只保存正 multiplicity；
-continuation 保存当前输入行序号、Probe/Emit phase、外层 left cursor、候选 cursor、已找到的 before/after
-winner 和歧义标记。Probe 先为整个 pinned Change 验证准入、候选、解码、residual、tie 与所有输出
-diff 都可表示，Emit 再发布修正并更新关系；状态、output 和最后的 input completion 始终在调用方
-事务中一起前进。
-
-候选搜索和 right-side rematch 都以 Store 的 owned page 进行。常规候选页最多 64 项、1 MiB
-logical Store bytes 和 16,384 个 `ScalarValue` slots；整个 turn 常规最多 256 项和 4 MiB 逻辑
-工作量。当空 turn 的首个 Store item 本身超限时，为了活性会单独接受它。因此普通运行时峰值是
-`O(pinned Claim + candidate page + turn output)`，而非整个 partition；单个 oversized row 仍是显式例外。
-这些边界限制一次 turn 的内存和事务放大，不限制整个关系的磁盘状态。没有 watermark 时两侧历史都
-必须保留。Residual 可以让最近候选不合格，所以当前正确性路径要分页扫描整个 right partition；
-right presence transition 还要扫描该 partition 的全部 left rows，并对每个 left row 完成候选搜索。因而普通左侧
-lookup 成本与候选 partition 大小成正比，最坏右侧历史修正是该 partition 左右状态的乘积；分页只保证
-每个 turn 有界，不会隐藏总成本。候选 right scan 与 rematch left scan 都从索引内的
-matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远不可能参与匹配的历史。
+Aggregate 按「分组 + 调用参数」校验被跟踪权重，不保存完整输入行；其他三个算子按完整行身份记账。
+Join 的 Probe 先验证整个 Claim，Emit 再分页发布，避免输入后段失败时已经发布了前段结果。
+复杂算法的状态、输入类型、NULL、分页和恢复规则以 [关系算子契约](docs/relations.md) 为准。
 
 ## 内建算子索引
 
@@ -470,13 +348,9 @@ planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库�
 
 ## 外部端点边界
 
-`PostgreSQL` CDC Scan 会把初始快照和封口前观察到的 WAL 重叠写入私有
-`bootstrap_spool: Queue<Vec<u8>>`，因此 spool 必须容纳两者。MySQL Scan 的 spool 只保存完整快照；
-并发变化留在 binlog，binlog 必须覆盖快照、发布和追平阶段。封口后，两者都把 spool 逐条发布到
-Station output，再进入持续流阶段。spool 容量是硬限制；超限的 delivery 不提交也不 ACK。
-
-两个 CDC Scan 都固定单表 Schema，运行中不支持在线 DDL、TLS 或跨实例 fencing。捕获阶段 reopen
-会清理未完成快照并从头再做，不从半个快照继续。
+CDC 先将初始快照放入私有 spool，封口后逐条发布，再进入持续捕获。PostgreSQL spool 还需要容纳
+封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。两者的阶段、事务、容量、重置和部署前提见
+[CDC Scan 契约](docs/cdc.md)。它们保留具体 connector 实现，不建立通用 CDC 框架。
 
 `PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
 timeout、进入 polling 后的有限重试次数与最大等待、持续流 heartbeat 和初始 snapshot fetch size。默认显式固定
@@ -495,42 +369,9 @@ Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 s
 Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
 `dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
 
-`SQLite`、`PostgreSQL`、`ClickHouse` 与 `Doris` Sink 共用唯一的 durable buffered Sink 协议。完整输入 Change 先编码为一个
-`sink.buffer` entry，并与 `sink.control` accounting、input `Complete` acknowledgement 在同一 Store
-事务提交；因此调用方在目标数据库写入前就可以释放 Claim。连续小 Change 可以聚合；没有新 Claim、
-待处理事件达到目标上限或 retained bytes 达到 delivery watermark 时，运行时才从 buffer 构造一个
-有界批次。单个 buffered Change 的 canonical、uncompressed IPC 加 8-byte key 不得超过 8 MiB；编码前
-先无拷贝预检 IPC body，避免超大 Change 在拒绝前形成完整临时 body。owned decode 在对齐合适时共享这份
-受限 IPC backing，否则只做受 body 上限约束的局部对齐复制。整个 buffer 最多按 IPC+key 的逻辑口径
-保留 64 MiB、1,048,576 个 relation events；这不是 Rust heap、RocksDB WAL 或磁盘硬配额。
-每个目标批次最多 1024 个 mutation，完整 encoded 输入聚合受 8 MiB 上限；
-target mutation 按 canonical row、技术字段和每列固定 framing 的逻辑口径计费，并受独立 8 MiB
-上限。后者不是 driver heap、SQL/wire payload 或数据库事务资源的硬配额。
-超出单项或 event 上限、或不能在剩余 technical-ID 区间内排空的 Claim 在 admission 前明确失败，不产生
-ACK 或部分 buffer 写入。
-
-批次先把 relation checkpoint、buffer settlement 和固定-ID mutation plan 持久化为 `Prepared`，Store
-commit 后才在目标数据库的一个事务中执行；之后的独立 Store turn 删除完整消费的 entries 并发布
-新的 `Ready`。进程在目标提交与本地 settle 之间退出时，reopen 从原 buffer 精确重建 Prepared 批次并
-重投；Prepared 的 insert/delete 都绑定 delivery row index 与固定 `$dogpaddle.id`，目标事务在忽略
-重复 insert 后仍核对该 ID 的完整逻辑行，再执行 delete，使原样重投幂等且拒绝 ID/行错配。外部提交结果不确定或 `AfterCommit` 失败
-会使当前 runtime fail-stop，只有 reopen 可以继续。恢复在任何目标副作用前分页校验全部 retained
-entries、连续 sequence、Schema、control accounting，以及 checkpoint 下剩余正事件的技术 ID 容量，
-不能先交付损坏 buffer 的有效前缀。该检查覆盖结构损坏与正常 crash/replay；外部篡改 Store/目标为另一组
-语义自洽状态不在恢复契约内，目标表仍必须由 Sink 独占。
-
-`SQLite` Sink 只接受新的非保留目标表和绝对 UTF-8 文件路径。PostgreSQL Sink 要求调用方每次注入
-连接配置，Definition 只保存 discovery 得到的非敏感 target spec；当前不支持 DNS endpoint、TLS、
-共享目标或在线 Schema evolution。PostgreSQL 的 5 秒 work-unit deadline 包含宽 Schema 为遵守参数上限
-产生的全部 SQL 分片往返，因此极宽目标需要低延迟连接。真实数据库限制和恢复证据见对应 correctness
-与 system test。
-
-`ClickHouse` Sink 使用无 TLS HTTP endpoint，持久化 Atomic database UUID，并独占一个
-`ReplacingMergeTree(version)` 状态表和公开 `FINAL` view；delete version 高于 live version，旧 live 重放
-不能复活 tombstone。Doris Sink 使用无 TLS `MySQL` endpoint，持久化唯一 cluster ID，并独占一个开启
-merge-on-write 的 Unique Key 状态表和公开 view；delete marker 同时作为 sequence column。两者均只把
-非敏感 target identity 写入 Definition，host、port、user 和 password 必须在每次 build/open 时重新注入。
-两个状态表都为 row hash 建立后端原生索引，lookup 仍逐 logical row 做完整值核对。为了让提交结果不确定的旧写入永远不能复活已经删除的 technical ID，删除记录作为每个 ID 的终态保留；引擎 compaction 可合并同一 ID 的版本，但状态表物理基数仍随历史分配过的 technical ID 增长。当前没有安全的自动 GC，长期高 churn 部署必须监控目标容量并在维护窗口以新 state/target 重建。
+关系 Sink 先把完整输入提交到本地 buffer，再将固定 ID 的 mutation plan 持久化为 Prepared；目标提交后，
+下一 Store turn 才结算本地进度。SQLite、PostgreSQL、Doris 和 `ClickHouse` 共用这套私有内核，具体目标
+只实现布局、查询与幂等写入。容量口径、恢复校验、行身份和各目标限制见 [关系 Sink 契约](docs/sinks.md)。
 
 ## 持久化 ABI
 
@@ -550,8 +391,6 @@ codec 还是目标布局/恢复 ABI。decoder 表在
 大部分 Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/)；三个外部端点的
 canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 [`crates/flow/tests/fixtures/v1/`](../flow/tests/fixtures/v1/)。
-
-`EquiJoin` 的输入准备逐个求值并编码 key expression，释放当前 key array 后再处理下一个；全部 key 完成后才编码完整行。整批 admission 与 Probe 仍在任何输出发布前完成，此优化不增加输入硬上限。
 
 ## 新增一个算子
 

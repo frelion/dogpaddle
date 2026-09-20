@@ -1,5 +1,7 @@
 # DogPaddle ASOF Join 决策与实施记录
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 ## 结论
 
 调研选择并已经完成的下一种新 Join 语义是完整的 **动态 `ASOF JOIN`**：

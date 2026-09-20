@@ -1,5 +1,7 @@
 # 算子重构 Agent 执行与交接说明
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 主计划：[operator-simplification-roadmap.md](operator-simplification-roadmap.md)。本文件不能单独替代主计划；发生冲突以主计划的安全边界、P1 gate 和当前用户授权为准。
 
 ## 1. 直接交给实施 Agent 的任务

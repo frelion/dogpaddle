@@ -73,6 +73,13 @@ diff 提前相加。Operation 必须从第零行开始依次观察。
 `Change` 也没有事件时间、watermark、来源 offset 或已物化关系。它只回答：这批记录按什么顺序，
 各自增加或撤回多少。
 
+有效事件流要求每条记录的「应用前权重 + 已处理前缀累计 diff」非负，维护关系的组件负责报错与回滚。
+Aggregate 不保留完整输入行，只按分组与调用参数检查被跟踪权重，具体例外由 [关系算子契约](../operation/docs/relations.md#aggregate) 定义。
+
+每个端口稳定重批必须逐项保持展平事件序列；Operation 的展平输出和最终业务状态必须同时对稳定重批及同一 Change 的重复 Commit turn 切分不变。
+只有显式窗口、barrier 或 flush 才能引入额外语义边界。跨端口明确无序的算子只要求每端口子序列和最终关系不变，当前 `UnionAll` 采用此契约。
+比较域内每种分批都必须能由声明 Arrow 类型表示。Subscription offset 仅定位完整 Change，片段内 continuation 由 Operation 自己的持久状态拥有。
+
 ## Schema 是完整契约
 
 `Change::schema()` 返回记录列的 logical Arrow Schema。物理 diff 列不在这个 Schema 中。字段的
@@ -93,11 +100,11 @@ diff 提前相加。Operation 必须从第零行开始依次观察。
 
 v1 还固定限制为最多 16,384 个顶层加嵌套字段、49,152 个 Schema/Field metadata entry，以及
 8 MiB 的字段名、Timestamp timezone、metadata key/value 全局 UTF-8 字节总量。解码器在复制这些
-字符串前执行同一预算，并限制 `FlatBuffer` 的展开大小，避免很小的恶意 offset 图放大为无界分配。
+字符串前执行同一预算，并以 64 MiB apparent-size ceiling 限制 `FlatBuffer` 的展开大小，避免很小的恶意 offset 图放大为无界分配。
 
 Timestamp 保留可选 timezone 字符串，但拒绝空字符串；`None` 表示无时区。Decimal128 precision
 必须在 `1..=38`，正 scale 不能超过 precision。构造和完整解码还会检查每个 non-null 物理值确实
-落在声明的 precision 内。这一层只验证表示是否合法，不定义时区换算、舍入或算术规则。
+满足 `|unscaled| < 10^precision`。检查递归进入 List/Struct，祖先 null 不豁免物理 non-null child；List slice 只检查当前 offsets 可达的 child 区间。这一层只验证表示是否合法，不定义时区换算、舍入或算术规则。
 
 需要只验证 Schema 时，调用 [`validate_schema`]。
 
@@ -146,7 +153,7 @@ assert_eq!(in_memory.records(), from_ipc.records());
 ```
 
 内存投影只重组 Schema 和 `ArrayRef`，不会复制选中的 Arrow 数据。选择性 IPC 解码会跳过未选字段
-的值区，但仍验证整个消息结构以及字段和 buffer 描述。它减少解码和分配，不会改变已经写入的
+的值区，但仍先验证内嵌 Schema、完整 framing，以及全部不读取 payload 即可判断的 batch metadata。List/Struct 只能按完整子树选择；所选字段递归校验，返回不借用 entry 或事务的 owned Change。它减少解码和分配，不会改变已经写入的
 日志大小，也不承诺 `RocksDB` 或设备层面的字段级 I/O。未选字段的 UTF-8、List offset、Decimal
 value 等值级约束不会被读取和验证；需要审计全部内容时使用 [`decode_change`]。
 
@@ -174,7 +181,7 @@ RecordBatch message/body（恰好一个非空 batch）
 canonical EOS
 ```
 
-没有额外的 `DogPaddle` envelope，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
+没有额外的 `DogPaddle` envelope、独立 Schema resource、fingerprint 或 segment，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
 Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff 和顺序。调用方已经拥有编码
 字节时，[`decode_change_owned`] 可以继续共享满足对齐要求的 Arrow body 分配。
 

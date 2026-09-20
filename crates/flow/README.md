@@ -7,6 +7,8 @@
 这里的 **Operation（算子）** 是一次具体计算，例如 Scan、Filter、Join 或 Sink；**Station（执行站）**
 是一组按顺序执行的 Operation；**Flow（流水线）** 是由 Station 和它们之间的连接组成的有向无环图。
 
+本页提供使用与阅读入口；精确的 Claim、事务、装配和持久资源约束统一见 [运行契约](docs/runtime.md)。
+
 ## 十分钟理解运行骨架
 
 ### 1. 数据沿 Station 之间的持久队列移动
@@ -158,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 因此声明天然构成 DAG；持久 Definition 的 decoder 仍独立校验环和拓扑。
 所有算子 ID（包括最终被融合的尾项）都必须合法且唯一。Station ID 使用其首算子的 ID。
 
-默认融合只发生在单输入 Atomic 与唯一上游之间，并要求上游只有一条消费边、首项允许尾链、
+build 按确定性顺序划分最大合法 Station。默认融合只发生在单输入 Atomic 与唯一上游之间，并要求上游只有一条消费边、首项允许尾链、
 上游未显式 materialize。重复连接同一 producer 的两个端口也计为两条边。多输入算子可以成为
 Station 首项并吸收后续 Atomic；Exclusive 与 Sink 独占。
 

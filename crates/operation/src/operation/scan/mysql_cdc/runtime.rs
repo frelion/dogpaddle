@@ -42,6 +42,19 @@ impl Phase {
     }
 }
 
+/// The next in-process action; only `Phase` is persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NextStep {
+    Restore,
+    BeginCapture,
+    Capture,
+    PrepareReset,
+    Reset,
+    Publish,
+    Stream,
+    RestartStream,
+}
+
 /// One materialized `MySQL` snapshot and CDC Scan.
 ///
 /// The initial snapshot is first sealed in a private durable spool. Only then
@@ -55,11 +68,9 @@ pub(crate) struct MySqlCdcScanOperation {
     bootstrap_spool: Queue<Vec<u8>>,
     bootstrap_spool_bytes: NonZeroU64,
     config: MySqlCdcScanConfig,
-    phase: Option<Phase>,
+    next_step: NextStep,
     resume: Option<Checkpoint>,
     connector: Option<Connector>,
-    snapshot_failed: bool,
-    restart_connector: bool,
     snapshot_progress: SnapshotProgress,
 }
 
@@ -81,11 +92,9 @@ impl MySqlCdcScanOperation {
             bootstrap_spool,
             bootstrap_spool_bytes,
             config,
-            phase: None,
+            next_step: NextStep::Restore,
             resume: None,
             connector: None,
-            snapshot_failed: false,
-            restart_connector: false,
             snapshot_progress: SnapshotProgress::default(),
         }
     }
@@ -93,7 +102,7 @@ impl MySqlCdcScanOperation {
     fn restore(&mut self) -> Turn<'_> {
         Turn::ready(move |access| {
             let encoded_phase = self.phase_cell.access(access)?.get()?;
-            let mut phase = Phase::decode(encoded_phase)?;
+            let phase = Phase::decode(encoded_phase)?;
             let checkpoint = self
                 .checkpoint
                 .access(access)?
@@ -140,14 +149,18 @@ impl MySqlCdcScanOperation {
                     // runtime owns no live connector, so it can durably enter
                     // incremental cleanup immediately.
                     self.phase_cell.access(access)?.set(&RESETTING)?;
-                    phase = Phase::Resetting;
                 }
                 Phase::Fresh | Phase::Publishing | Phase::Streaming | Phase::Resetting => {}
             }
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Some(phase);
+                    self.next_step = match phase {
+                        Phase::Fresh => NextStep::BeginCapture,
+                        Phase::Capturing | Phase::Resetting => NextStep::Reset,
+                        Phase::Publishing => NextStep::Publish,
+                        Phase::Streaming => NextStep::Stream,
+                    };
                     self.resume = checkpoint;
                     Ok(())
                 }),
@@ -161,7 +174,7 @@ impl MySqlCdcScanOperation {
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Some(Phase::Capturing);
+                    self.next_step = NextStep::Capture;
                     self.snapshot_progress = SnapshotProgress::default();
                     Ok(())
                 }),
@@ -169,19 +182,19 @@ impl MySqlCdcScanOperation {
         })
     }
 
-    fn begin_reset(&mut self) -> Turn<'_> {
-        Turn::ready(move |access| {
+    fn prepare_reset(&mut self) -> Result<Turn<'_>, OperationError> {
+        self.stop_connector("failed snapshot")?;
+        Ok(Turn::ready(move |access| {
             self.phase_cell.access(access)?.set(&RESETTING)?;
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Some(Phase::Resetting);
-                    self.snapshot_failed = false;
+                    self.next_step = NextStep::Reset;
                     self.snapshot_progress = SnapshotProgress::default();
                     Ok(())
                 }),
             ))
-        })
+        }))
     }
 
     fn reset(&mut self) -> Turn<'_> {
@@ -196,7 +209,7 @@ impl MySqlCdcScanOperation {
                 Action::Commit(None),
                 AfterCommit::new(move || {
                     if finished {
-                        self.phase = Some(Phase::Fresh);
+                        self.next_step = NextStep::BeginCapture;
                         self.resume = None;
                     }
                     Ok(())
@@ -210,7 +223,7 @@ impl MySqlCdcScanOperation {
             match self.config.start_snapshot(&self.spec) {
                 Ok(connector) => self.connector = Some(connector),
                 Err(error) => {
-                    self.snapshot_failed = true;
+                    self.next_step = NextStep::PrepareReset;
                     return Err(error.into());
                 }
             }
@@ -223,7 +236,7 @@ impl MySqlCdcScanOperation {
             Ok(Some(delivery)) => delivery,
             Ok(None) => return Ok(Turn::Idle),
             Err(error) => {
-                self.snapshot_failed = true;
+                self.next_step = NextStep::PrepareReset;
                 return Err(MySqlCdcScanError::new(format!(
                     "Debezium snapshot poll failed ({:?})",
                     error.kind()
@@ -242,14 +255,14 @@ impl MySqlCdcScanOperation {
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.snapshot_failed = true;
+                self.next_step = NextStep::PrepareReset;
                 return Err(error.into());
             }
         };
         let encoded_change = match snapshot.change.as_ref().map(encode_change).transpose() {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.snapshot_failed = true;
+                self.next_step = NextStep::PrepareReset;
                 return Err(error.into());
             }
         };
@@ -261,7 +274,7 @@ impl MySqlCdcScanOperation {
         let capacity = self.bootstrap_spool_bytes;
         let checkpoint = &self.checkpoint;
         let phase_cell = &self.phase_cell;
-        let phase = &mut self.phase;
+        let next_step = &mut self.next_step;
         let resume = &mut self.resume;
         let progress = &mut self.snapshot_progress;
         Ok(Turn::ready(move |access| {
@@ -286,7 +299,7 @@ impl MySqlCdcScanOperation {
                     })?;
                     *resume = Some(resumed_checkpoint);
                     if complete {
-                        *phase = Some(Phase::Publishing);
+                        *next_step = NextStep::Publish;
                     } else {
                         *progress = next_progress;
                     }
@@ -305,7 +318,7 @@ impl MySqlCdcScanOperation {
                 return Ok((
                     Action::Commit(None),
                     AfterCommit::new(move || {
-                        self.phase = Some(Phase::Streaming);
+                        self.next_step = NextStep::Stream;
                         Ok(())
                     }),
                 ));
@@ -328,7 +341,7 @@ impl MySqlCdcScanOperation {
                 Action::Commit(Some(change)),
                 AfterCommit::new(move || {
                     if finished {
-                        self.phase = Some(Phase::Streaming);
+                        self.next_step = NextStep::Stream;
                     }
                     Ok(())
                 }),
@@ -336,11 +349,13 @@ impl MySqlCdcScanOperation {
         }))
     }
 
+    fn restart_stream(&mut self) -> Result<Turn<'_>, OperationError> {
+        self.stop_connector("failed stream")?;
+        self.next_step = NextStep::Stream;
+        self.stream()
+    }
+
     fn stream(&mut self) -> Result<Turn<'_>, OperationError> {
-        if self.restart_connector {
-            self.stop_connector("failed stream")?;
-            self.restart_connector = false;
-        }
         if self.connector.is_none() {
             let checkpoint = self.resume.as_ref().ok_or(MySqlCdcScanError::InvalidState(
                 "streaming CDC scan has no checkpoint",
@@ -351,12 +366,12 @@ impl MySqlCdcScanOperation {
             .connector
             .as_mut()
             .expect("streaming connector was started above");
-        self.restart_connector = true;
+        self.next_step = NextStep::RestartStream;
         let polled = connector.poll(Duration::ZERO).map_err(|error| {
             MySqlCdcScanError::new(format!("Debezium poll failed ({:?})", error.kind()))
         })?;
         let Some(delivery) = polled else {
-            self.restart_connector = false;
+            self.next_step = NextStep::Stream;
             return Ok(Turn::Idle);
         };
         let change = convert_records(
@@ -367,7 +382,7 @@ impl MySqlCdcScanOperation {
             &self.spec.table,
             delivery.records(),
         )?;
-        self.restart_connector = false;
+        self.next_step = NextStep::Stream;
         let encoded = delivery.checkpoint().as_bytes().to_vec();
         let resumed = delivery.checkpoint().clone();
         let checkpoint = &self.checkpoint;
@@ -410,17 +425,15 @@ impl TurnOperation for MySqlCdcScanOperation {
         if input.is_some() {
             return Err(MySqlCdcScanError::new("MySQL CDC scan does not accept input").into());
         }
-        match self.phase {
-            None => Ok(self.restore()),
-            Some(Phase::Fresh) => Ok(self.begin_capture()),
-            Some(Phase::Capturing) if self.snapshot_failed => {
-                self.stop_connector("failed snapshot")?;
-                Ok(self.begin_reset())
-            }
-            Some(Phase::Capturing) => self.capture(),
-            Some(Phase::Publishing) => self.publish(),
-            Some(Phase::Streaming) => self.stream(),
-            Some(Phase::Resetting) => Ok(self.reset()),
+        match self.next_step {
+            NextStep::Restore => Ok(self.restore()),
+            NextStep::BeginCapture => Ok(self.begin_capture()),
+            NextStep::Capture => self.capture(),
+            NextStep::PrepareReset => self.prepare_reset(),
+            NextStep::Reset => Ok(self.reset()),
+            NextStep::Publish => self.publish(),
+            NextStep::Stream => self.stream(),
+            NextStep::RestartStream => self.restart_stream(),
         }
     }
 }
@@ -531,6 +544,17 @@ mod tests {
             action
         }
 
+        fn rollback(&mut self) -> Action {
+            let Turn::Ready(prepared) = self.operation.turn(None).unwrap() else {
+                panic!("expected prepared turn");
+            };
+            let transaction = self.transactions.begin();
+            let (action, completion) = prepared.apply(transaction.access()).unwrap();
+            drop(transaction);
+            drop(completion);
+            action
+        }
+
         fn durable(&mut self) -> (Option<u32>, Option<Vec<u8>>, u64) {
             let transaction = self.transactions.begin();
             let result = (
@@ -558,8 +582,13 @@ mod tests {
     #[test]
     fn fresh_is_durably_pinned_before_snapshot_start() {
         let mut fixture = Fixture::create();
+        assert!(matches!(fixture.rollback(), Action::Commit(None)));
+        assert_eq!(fixture.operation.next_step, NextStep::Restore);
         assert!(matches!(fixture.commit(), Action::Commit(None)));
-        assert_eq!(fixture.operation.phase, Some(Phase::Fresh));
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
+        assert!(matches!(fixture.rollback(), Action::Commit(None)));
+        assert_eq!(fixture.durable(), (None, None, 0));
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.durable(), (Some(CAPTURING), None, 0));
     }
@@ -587,13 +616,26 @@ mod tests {
         assert!(spool.try_push(&encoded, queue_capacity()).unwrap());
         transaction.commit().unwrap();
 
+        fixture.rollback();
+        assert_eq!(fixture.durable().0, Some(CAPTURING));
+        assert_eq!(fixture.operation.next_step, NextStep::Restore);
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.durable().0, Some(RESETTING));
         fixture.commit();
         assert_eq!(fixture.durable().2, queued_bytes(&encoded));
+        fixture.rollback();
+        assert_eq!(
+            fixture.durable(),
+            (
+                Some(RESETTING),
+                Some(checkpoint().as_bytes().to_vec()),
+                queued_bytes(&encoded)
+            )
+        );
+        assert_eq!(fixture.operation.next_step, NextStep::Reset);
         fixture.commit();
         assert_eq!(fixture.durable(), (None, None, 0));
-        assert_eq!(fixture.operation.phase, Some(Phase::Fresh));
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
     }
 
     #[test]

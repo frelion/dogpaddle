@@ -18,7 +18,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 - Change 拥有 Schema、Change、Projection、Arrow IPC 字节格式、互操作、损坏拒绝和稳定事件顺序。
 - Store 拥有事务、能力边界、集合布局、分页、容量、订阅位置与安全回收、reopen 和 crash consistency。
-- Operation 拥有 Operation + Store：Definition、稳定 tag/payload、bind、materialize、运行协议、状态和算子语义。
+- Operation 拥有 Operation + Store：Definition、稳定 tag/payload、checked construct、运行协议、状态和算子语义。
 - Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、subscription 装配、调度、claim、背压、fail-stop、status 和 reopen。
 - SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering、Program identity 和 `start` 的自动构建/恢复选择。
 - `dogpaddle` binary 只拥有 `run SQL_FILE [--state DIR]` 的参数、默认状态路径、短等待循环和 Ctrl-C 有界停止；它不复制 SQL 生命周期。
@@ -29,7 +29,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 ### Operation
 
-Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、kind、data declaration、bind、materialize、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
+Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、kind、data declaration、checked construct、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
 
 - `definition_codec`：外层 envelope、unknown tag 和通用损坏拒绝；
 - `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
@@ -65,7 +65,7 @@ Schema/Program identity 和最终关系，不复制 Operation API 的 nearest、
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、AsOfJoin 新增的双输入外层/候选双重 continuation 在真实资源路径上的 drop/open、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
 
 Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。Definition
-还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和 materialize 前拒绝
+还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和运行构造前拒绝
 identity mismatch。
 
 ### SQL
@@ -110,6 +110,8 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 - EquiJoin correctness：`family` 拥有五种关系语义与持久恢复，`inner_runtime` 拥有 Inner 热路径及 Join
   分页/预算分支；literal golden 只在 `family`。
 
+源码 `tests.rs` 超过约 700 行且确有至少两个独立行为域时，才允许保留唯一 façade 并拆入 `tests/<behavior>.rs`。测试名称清楚描述行为；临时存储使用 `tempfile` 隔离。
+
 ## 正确性证据准入
 
 每个持久化协议至少具有：
@@ -122,7 +124,13 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 
 持久化定义或布局变更必须同时覆盖成功构建、纯校验失败无文件副作用、不完整构建、稳定编码、资源布局和重新打开。项目不识别、迁移或兼容未发布的旧格式；旧数据库直接删除并重建。
 
+Change IPC 变更必须覆盖完整 Stream literal golden、标准 Arrow reader 互操作、顺序保持、零/多 RecordBatch 拒绝、截断、尾随字节与 reopen。
+
 普通 correctness 测试不得依赖 wall-clock 断言、系统 Java 或外部 PostgreSQL。没有覆盖率或代码行数 CI 阈值。
+
+运行期 Schema guard 必须证明 output 违例整 turn 回滚，以及合法 IPC 中的错误 input Schema 不安装 Claim、不 pin、不推进 Subscription position。
+Operation turn 协议必须证明 borrowed linear work 能跨 prepared transaction 到达 AfterCommit；Turn::Idle、Action::Idle、错误、背压和 commit failure 都不运行 completion。
+AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提交前拒绝，并可经 reopen 恢复。
 
 ## 性能所有权
 
@@ -232,6 +240,10 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```
+
+system-tests 统一拥有真实 JVM、Debezium bundle、PG gate host 和 warehouse 容器脚本；gate-only host 不得伪装成产品 example。
+
+system-tests 的稳定 host 布局只有三个边界：根 workspace 的 `system-tests/debezium-runtime/host` 只含 bundle probe，`system-tests/postgres/hosts` 只含原生 PG gate host；独立 workspace `system-tests/debezium-postgres/host` 只依赖 Debezium 产品。`system-tests/postgres/support` 只能由 PG 脚本共享进程执行、临时 cluster、端口和日志基础设施，不得包含场景 oracle、SQL 或 host 协议，D1 不得引用。`system-tests/warehouse-sinks` 只拥有锁定官方镜像的 Compose fixture 和真实 adapter gate，不新增 Rust host。
 
 ## 系统验收
 

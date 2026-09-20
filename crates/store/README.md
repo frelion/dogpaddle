@@ -93,6 +93,8 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - snapshot 只看见它开始时已经提交的数据，后续提交由新的 snapshot 看见。
 - transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 进一步约定只在当前 turn 内使用它们。
 
+读写权限同时由 collection handle 与 transaction access 两层约束；只读 handle 不能借写事务获得写入权限。
+
 这套类型不是为了模拟 `RocksDB` 的全部能力，而是让上层代码很难绕过 `DogPaddle` 的事务边界。
 
 ## 六种持久数据结构
@@ -193,9 +195,11 @@ let next = page.continuation;
 Store 在返回前完成准入、复制和完整解码；错误不会交付半页。第一项单独超过 byte limit 时返回
 `StoreError::ItemTooLarge`，调用方可以在同一事务中提高 limit 后重试。其他 codec 或存储错误会使事务中毒。
 
+分区扫描只省略 range，仍保留 direction、排他 `resume_after` 和同一 `ScanLimit`。页面不提供 visitor 或 encoded-entry projection；业务层自行遍历并处置业务错误。私有扫描先检查范围和准入再复制 payload，存在性与长度检查不得构造完整 owned value。
+
 ## 提交、错误与恢复
 
-写事务使用 WAL 并同步提交。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
+底层使用 `RocksDB` `OptimisticTransactionDB`。写事务使用 WAL 并同步提交。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
 全部回滚。
 
 以下错误会使当前事务中毒：编码或解码失败、损坏的 metadata、使用另一个 Store 的 handle、RocksDB 访问失败、
@@ -224,6 +228,8 @@ Store catalog 记录资源名、collection kind 和独立 namespace，但不知�
 
 当前是开发期 v1。修改资源名、collection kind、codec、key framing 或 metadata 就是修改持久 ABI；同步更新布局和
 reopen 测试，然后删除旧 Flow 重建，不增加旧格式迁移或兼容分支。
+
+`SubscribedLog` 的稳定 metadata 保存 big-endian `subscriber_count`、`tail` 和 `retained_bytes`，每个稠密 subscriber 另有一个 big-endian `position`；`head` 只由全部 positions 的最小值派生，不单独持久化。offset 永不重置，`retained_bytes` 只计算 `[head, tail)` 中每条 entry 的 8-byte offset 与完整 encoded value，不包含 metadata、subscriber positions、RocksDB block/WAL/MVCC 或文件开销；`try_append` 与 `acknowledge` 在自身事务内精确维护，Flow 不得复制这套计费与 retention 逻辑。非空 backlog 只有在追加后不超过 capacity 时接受 entry；空 backlog 允许一条 oversize entry，因而该机制是 per-output soft high watermark，不是磁盘或内存硬配额。`Queue` 使用相同的每项逻辑计费，但其 capacity 是硬上限，空队列也拒绝 oversize entry，并在弹出最后一项时删除 metadata、重置不对外暴露的 sequence。
 
 ## 读代码的顺序
 

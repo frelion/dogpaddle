@@ -1,5 +1,7 @@
 # EquiJoin 设计与实现说明
 
+> 历史提案：记录当时方案与取舍，不作为当前实现约束。当前设计以根 [AGENTS.md](../../AGENTS.md) 指向的 owner 文档为准；不要据此恢复已删除的 API 或抽象。
+
 状态：带原生 residual 的常用 EquiJoin family 已实现
 
 日期：2026-09-14

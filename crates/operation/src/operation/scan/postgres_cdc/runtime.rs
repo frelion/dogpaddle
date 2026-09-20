@@ -51,6 +51,19 @@ impl Phase {
     }
 }
 
+/// The next in-process action; only `Phase` is persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NextStep {
+    Restore,
+    BeginCapture,
+    Capture,
+    PrepareReset,
+    Reset,
+    Publish,
+    Stream,
+    RestartStream,
+}
+
 /// One materialized `PostgreSQL` CDC Scan with reconstructible connector resources.
 ///
 /// The initial snapshot is durably sealed in a private queue before any
@@ -64,13 +77,10 @@ pub(crate) struct PostgresCdcScanOperation {
     bootstrap_spool: Queue<Vec<u8>>,
     config: PostgresCdcScanConfig,
     bootstrap_spool_bytes: NonZeroU64,
-    restored: bool,
-    phase: Phase,
+    next_step: NextStep,
     resume: Option<Checkpoint>,
     connector: Option<Connector>,
     capture_progress: CaptureProgress,
-    reset_capture: bool,
-    restart_streaming: bool,
 }
 
 impl PostgresCdcScanOperation {
@@ -91,13 +101,10 @@ impl PostgresCdcScanOperation {
             bootstrap_spool,
             config,
             bootstrap_spool_bytes,
-            restored: false,
-            phase: Phase::Fresh,
+            next_step: NextStep::Restore,
             resume: None,
             connector: None,
             capture_progress: CaptureProgress::default(),
-            reset_capture: false,
-            restart_streaming: false,
         }
     }
 
@@ -139,10 +146,14 @@ impl PostgresCdcScanOperation {
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = phase;
+                    self.next_step = match phase {
+                        Phase::Fresh => NextStep::BeginCapture,
+                        Phase::Capturing => NextStep::PrepareReset,
+                        Phase::Publishing => NextStep::Publish,
+                        Phase::Streaming => NextStep::Stream,
+                        Phase::Resetting => NextStep::Reset,
+                    };
                     self.resume = resume;
-                    self.reset_capture = phase == Phase::Capturing;
-                    self.restored = true;
                     Ok(())
                 }),
             ))
@@ -157,7 +168,7 @@ impl PostgresCdcScanOperation {
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Phase::Capturing;
+                    self.next_step = NextStep::Capture;
                     self.capture_progress = CaptureProgress::default();
                     Ok(())
                 }),
@@ -183,10 +194,9 @@ impl PostgresCdcScanOperation {
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Phase::Resetting;
+                    self.next_step = NextStep::Reset;
                     self.resume = None;
                     self.capture_progress = CaptureProgress::default();
-                    self.reset_capture = false;
                     Ok(())
                 }),
             ))
@@ -204,7 +214,7 @@ impl PostgresCdcScanOperation {
             Ok((
                 Action::Commit(None),
                 AfterCommit::new(move || {
-                    self.phase = Phase::Fresh;
+                    self.next_step = NextStep::BeginCapture;
                     Ok(())
                 }),
             ))
@@ -213,9 +223,9 @@ impl PostgresCdcScanOperation {
 
     fn capture(&mut self) -> Result<Turn<'_>, OperationError> {
         if self.connector.is_none() {
-            self.reset_capture = true;
+            self.next_step = NextStep::PrepareReset;
             self.connector = Some(self.config.start_snapshot(&self.spec)?);
-            self.reset_capture = false;
+            self.next_step = NextStep::Capture;
         }
 
         let current_progress = self.capture_progress;
@@ -227,7 +237,7 @@ impl PostgresCdcScanOperation {
         let Some(delivery) = (match polled {
             Ok(delivery) => delivery,
             Err(error) => {
-                self.reset_capture = true;
+                self.next_step = NextStep::PrepareReset;
                 return Err(PostgresCdcScanError::new(format!(
                     "Debezium bootstrap poll failed ({:?})",
                     error.kind()
@@ -249,7 +259,7 @@ impl PostgresCdcScanOperation {
             Ok(converted) => converted,
             Err(error) => {
                 drop(delivery);
-                self.reset_capture = true;
+                self.next_step = NextStep::PrepareReset;
                 return Err(error.into());
             }
         };
@@ -267,7 +277,7 @@ impl PostgresCdcScanOperation {
         let phase_cell = &self.phase_cell;
         let spool = &self.bootstrap_spool;
         let capacity = self.bootstrap_spool_bytes;
-        let phase = &mut self.phase;
+        let next_step = &mut self.next_step;
         let progress = &mut self.capture_progress;
         let resume = &mut self.resume;
         Ok(Turn::ready(move |access| {
@@ -293,7 +303,7 @@ impl PostgresCdcScanOperation {
                         )))
                     })?;
                     if sealed {
-                        *phase = Phase::Publishing;
+                        *next_step = NextStep::Publish;
                         *resume = Some(resume_checkpoint);
                     } else {
                         *progress = next_progress;
@@ -324,7 +334,7 @@ impl PostgresCdcScanOperation {
                     Action::Commit(None),
                     AfterCommit::new(move || {
                         self.connector = None;
-                        self.phase = Phase::Streaming;
+                        self.next_step = NextStep::Stream;
                         Ok(())
                     }),
                 ));
@@ -350,7 +360,7 @@ impl PostgresCdcScanOperation {
                 if finished {
                     AfterCommit::new(move || {
                         self.connector = None;
-                        self.phase = Phase::Streaming;
+                        self.next_step = NextStep::Stream;
                         Ok(())
                     })
                 } else {
@@ -360,19 +370,21 @@ impl PostgresCdcScanOperation {
         }))
     }
 
-    fn stream(&mut self) -> Result<Turn<'_>, OperationError> {
-        if self.restart_streaming {
-            if let Some(connector) = self.connector.as_mut() {
-                connector.stop(STOP_TIMEOUT).map_err(|error| {
-                    PostgresCdcScanError::new(format!(
-                        "Debezium streaming stop failed ({:?})",
-                        error.kind()
-                    ))
-                })?;
-            }
-            self.connector = None;
-            self.restart_streaming = false;
+    fn restart_stream(&mut self) -> Result<Turn<'_>, OperationError> {
+        if let Some(connector) = self.connector.as_mut() {
+            connector.stop(STOP_TIMEOUT).map_err(|error| {
+                PostgresCdcScanError::new(format!(
+                    "Debezium streaming stop failed ({:?})",
+                    error.kind()
+                ))
+            })?;
         }
+        self.connector = None;
+        self.next_step = NextStep::Stream;
+        self.stream()
+    }
+
+    fn stream(&mut self) -> Result<Turn<'_>, OperationError> {
         if self.connector.is_none() {
             let checkpoint = self
                 .resume
@@ -389,7 +401,7 @@ impl PostgresCdcScanOperation {
         let Some(delivery) = (match polled {
             Ok(delivery) => delivery,
             Err(error) => {
-                self.restart_streaming = true;
+                self.next_step = NextStep::RestartStream;
                 return Err(PostgresCdcScanError::new(format!(
                     "Debezium streaming poll failed ({:?})",
                     error.kind()
@@ -410,7 +422,7 @@ impl PostgresCdcScanOperation {
             Ok(change) => change,
             Err(error) => {
                 drop(delivery);
-                self.restart_streaming = true;
+                self.next_step = NextStep::RestartStream;
                 return Err(error.into());
             }
         };
@@ -447,16 +459,15 @@ impl TurnOperation for PostgresCdcScanOperation {
                 PostgresCdcScanError::new("PostgreSQL CDC scan does not accept input").into(),
             );
         }
-        if !self.restored {
-            return Ok(self.restore());
-        }
-        match self.phase {
-            Phase::Fresh => Ok(self.begin_capture()),
-            Phase::Capturing if self.reset_capture => self.prepare_capture_reset(),
-            Phase::Capturing => self.capture(),
-            Phase::Publishing => self.publish(),
-            Phase::Streaming => self.stream(),
-            Phase::Resetting => Ok(self.reset()),
+        match self.next_step {
+            NextStep::Restore => Ok(self.restore()),
+            NextStep::BeginCapture => Ok(self.begin_capture()),
+            NextStep::Capture => self.capture(),
+            NextStep::PrepareReset => self.prepare_capture_reset(),
+            NextStep::Reset => Ok(self.reset()),
+            NextStep::Publish => self.publish(),
+            NextStep::Stream => self.stream(),
+            NextStep::RestartStream => self.restart_stream(),
         }
     }
 }
@@ -580,6 +591,17 @@ mod tests {
             action
         }
 
+        fn rollback(&mut self) -> Action {
+            let Turn::Ready(prepared) = self.operation.turn(None).unwrap() else {
+                panic!("expected prepared turn");
+            };
+            let transaction = self.transactions.begin();
+            let (action, completion) = prepared.apply(transaction.access()).unwrap();
+            drop(transaction);
+            drop(completion);
+            action
+        }
+
         fn durable(&mut self) -> (Option<u32>, Option<Vec<u8>>, u64) {
             let transaction = self.transactions.begin();
             let durable = (
@@ -631,8 +653,13 @@ mod tests {
     #[test]
     fn fresh_is_durably_capturing_before_external_start() {
         let mut fixture = Fixture::create();
+        assert!(matches!(fixture.rollback(), Action::Commit(None)));
+        assert_eq!(fixture.operation.next_step, NextStep::Restore);
         assert!(matches!(fixture.commit(), Action::Commit(None)));
-        assert_eq!(fixture.operation.phase, Phase::Fresh);
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
+        assert!(matches!(fixture.rollback(), Action::Commit(None)));
+        assert_eq!(fixture.durable(), (None, None, 0));
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.durable(), (Some(1), None, 0));
     }
@@ -666,8 +693,7 @@ mod tests {
         transaction.commit().unwrap();
 
         fixture.commit();
-        assert_eq!(fixture.operation.phase, Phase::Capturing);
-        assert!(fixture.operation.reset_capture);
+        assert_eq!(fixture.operation.next_step, NextStep::PrepareReset);
         assert_eq!(
             fixture.durable(),
             (Some(1), Some(checkpoint()), queued_bytes(&encoded))
@@ -777,8 +803,14 @@ mod tests {
         fixture.commit();
         fixture.commit();
         assert_eq!(fixture.durable().2, queued_bytes(&encoded));
+        fixture.rollback();
+        assert_eq!(
+            fixture.durable(),
+            (Some(4), Some(checkpoint()), queued_bytes(&encoded))
+        );
+        assert_eq!(fixture.operation.next_step, NextStep::Reset);
         fixture.commit();
         assert_eq!(fixture.durable(), (None, None, 0));
-        assert_eq!(fixture.operation.phase, Phase::Fresh);
+        assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
     }
 }
