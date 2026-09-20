@@ -22,9 +22,9 @@ pub struct DiscardDefinition {
 ///
 /// Input completion remains durable because the owning Station acknowledges
 /// its Subscription in the same transaction as this Operation turn.
-pub struct DiscardOperation;
+pub(crate) struct DiscardOperation;
 
-/// Discard-specific failure during one [`DiscardOperation`] turn.
+/// Discard-specific failure during one `DiscardOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DiscardError {

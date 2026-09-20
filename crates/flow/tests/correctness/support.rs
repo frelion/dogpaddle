@@ -6,10 +6,10 @@ use dogpaddle_store::{Cell, Store};
 
 pub(super) fn build_scan_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let mut builder = FlowFactory::new(path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([scan], sink);
-    builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+
+    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 
     read_published_definition(path)

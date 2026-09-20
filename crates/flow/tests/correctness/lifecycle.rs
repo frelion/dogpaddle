@@ -15,19 +15,36 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let chain_scan = builder.station("chain-scan", SequenceScanDefinition::new(u64::MAX - 1));
-    let count = builder.station("count", RunningEventCountDefinition::new());
-    let chain_sink = builder.station("chain-sink", DiscardDefinition::new());
-    let fanout_scan = builder.station("fanout-scan", SequenceScanDefinition::new(u64::MAX));
-    let first_sink = builder.station("first-fanout-sink", DiscardDefinition::new());
-    let second_sink = builder.station("second-fanout-sink", DiscardDefinition::new());
+    let chain_scan = builder.operation(
+        "chain-scan",
+        Box::new(SequenceScanDefinition::new(u64::MAX - 1)),
+        [],
+    );
+    let count = builder.operation(
+        "count",
+        Box::new(RunningEventCountDefinition::new()),
+        [chain_scan],
+    );
+    builder.operation("chain-sink", Box::new(DiscardDefinition::new()), [count]);
+    let fanout_scan = builder.operation(
+        "fanout-scan",
+        Box::new(SequenceScanDefinition::new(u64::MAX)),
+        [],
+    );
+    builder.operation(
+        "first-fanout-sink",
+        Box::new(DiscardDefinition::new()),
+        [fanout_scan],
+    );
+    builder.operation(
+        "second-fanout-sink",
+        Box::new(DiscardDefinition::new()),
+        [fanout_scan],
+    );
     for station in [chain_scan, count, fanout_scan] {
-        builder.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
+        builder.materialize(station, OUTPUT_CAPACITY_BYTES);
     }
-    builder.connect([chain_scan], count);
-    builder.connect([count], chain_sink);
-    builder.connect([fanout_scan], first_sink);
-    builder.connect([fanout_scan], second_sink);
+
     let flow = builder.build().unwrap();
     assert_eq!(
         (flow.path(), flow.station_ids().collect::<Vec<_>>()),
@@ -105,10 +122,10 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
-    builder.connect([scan], sink);
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
+
     let flow = builder.build().unwrap();
 
     assert!(matches!(
@@ -125,10 +142,10 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
     let identified_path = root.path().join("identified");
     let mut builder = FlowFactory::new(&identified_path);
     builder.owner_identity(OWNER_IDENTITY);
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
-    builder.connect([scan], sink);
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
+
     drop(builder.build().unwrap());
 
     assert!(matches!(
@@ -150,10 +167,10 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
 
     let anonymous_path = root.path().join("anonymous");
     let mut builder = FlowFactory::new(&anonymous_path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
-    builder.connect([scan], sink);
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
+
     drop(builder.build().unwrap());
 
     let mut unexpected_owner = FlowFactory::new(&anonymous_path);
@@ -172,16 +189,19 @@ fn build_and_open_support_many_station_output_logs() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let mut previous = builder.station("scan", SequenceScanDefinition::new(0));
-    builder.output_capacity_bytes(previous, OUTPUT_CAPACITY_BYTES);
+    let mut previous = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.materialize(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..OUTPUT_STATION_COUNT {
-        let current = builder.station(format!("count-{index}"), RunningEventCountDefinition::new());
-        builder.output_capacity_bytes(current, OUTPUT_CAPACITY_BYTES);
-        builder.connect([previous], current);
+        let current = builder.operation(
+            format!("count-{index}"),
+            Box::new(RunningEventCountDefinition::new()),
+            [previous],
+        );
+        builder.materialize(current, OUTPUT_CAPACITY_BYTES);
+
         previous = current;
     }
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([previous], sink);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [previous]);
 
     let flow = builder.build().unwrap();
     assert_eq!(flow.station_count(), OUTPUT_STATION_COUNT + 1);

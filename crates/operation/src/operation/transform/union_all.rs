@@ -31,7 +31,7 @@ pub struct UnionAllDefinition {
 ///
 /// This value stores its input count and the exact common input Schema bound by
 /// its Definition. It owns no persistent Store data.
-pub struct UnionAllOperation {
+pub(crate) struct UnionAllOperation {
     input_count: usize,
     input_schema: SchemaRef,
 }
@@ -52,7 +52,7 @@ pub enum UnionAllSchemaError {
     },
 }
 
-/// `UnionAll`-specific failure during one [`UnionAllOperation`] turn.
+/// `UnionAll`-specific failure during one `UnionAllOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum UnionAllError {

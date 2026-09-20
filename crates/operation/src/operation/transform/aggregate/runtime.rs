@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Materialized grouped aggregate over an ordered difference stream.
-pub struct AggregateOperation {
+pub(crate) struct AggregateOperation {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[BoundExpression]>,

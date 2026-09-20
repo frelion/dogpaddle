@@ -13,7 +13,7 @@ pub use clickhouse::{
     ClickHouseSinkConfig, ClickHouseSinkDefinition, ClickHouseSinkError, ClickHouseSinkSchemaError,
     ClickHouseTargetSpec,
 };
-pub use discard::{DiscardDefinition, DiscardError, DiscardOperation};
+pub use discard::{DiscardDefinition, DiscardError};
 pub use doris::{
     DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
 };

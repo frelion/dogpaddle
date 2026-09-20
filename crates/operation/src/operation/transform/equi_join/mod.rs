@@ -14,7 +14,7 @@ mod state;
 
 pub use definition::EquiJoinDefinition;
 pub(crate) use definition::{EquiJoinLayout, TAG, decode_definition};
-pub use runtime::EquiJoinOperation;
+pub(crate) use runtime::EquiJoinOperation;
 
 use crate::{OperationSetupError, definition::data, operation::Operation};
 
@@ -216,7 +216,7 @@ pub enum EquiJoinSchemaError {
     NullPadding(#[source] DataFusionError),
 }
 
-/// Failure during one [`EquiJoinOperation`] turn.
+/// Failure during one `EquiJoinOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EquiJoinError {

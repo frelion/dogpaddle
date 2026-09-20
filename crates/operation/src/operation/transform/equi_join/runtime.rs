@@ -54,7 +54,7 @@ pub(super) struct BoundKeyPair {
 /// durable continuation first validates every match for the pinned input
 /// Change, then emits bounded pages. This makes output-difference overflow and
 /// corrupt stored rows fail before any page from that Change is published.
-pub struct EquiJoinOperation {
+pub(crate) struct EquiJoinOperation {
     pub(super) kind: EquiJoinKind,
     pub(super) input_schemas: [SchemaRef; 2],
     pub(super) candidate_schema: SchemaRef,
@@ -206,43 +206,37 @@ impl EquiJoinOperation {
 
     fn prepare_claim(&self, input: OperationInput<'_>) -> Result<PreparedClaim, OperationError> {
         let records = input.change.records();
-        let key_columns = self
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(key, pair)| {
-                pair.for_port(input.port)
-                    .expression
-                    .evaluate(records)
-                    .map_err(|source| EquiJoinError::KeyExpression {
-                        port: input.port,
-                        key,
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut rows = Vec::with_capacity(input.change.num_rows());
-        for index in 0..input.change.num_rows() {
-            let row = canonical_row(records, index)
-                .map_err(|source| EquiJoinError::CanonicalRow { source })?;
-            let mut key = Vec::new();
-            let mut matchable = true;
-            for (pair, column) in self.keys.iter().zip(&key_columns) {
-                let bound = pair.for_port(input.port);
-                matchable &= !column.is_null(index);
-                encode_canonical(&bound.field, column.as_ref(), index, "key", &mut key).map_err(
-                    |source| EquiJoinError::CanonicalRow {
-                        source: Box::new(source),
-                    },
-                )?;
-            }
-            rows.push(PreparedRow {
-                row,
-                key,
-                matchable,
+        let mut rows = (0..input.change.num_rows())
+            .map(|index| PreparedRow {
+                row: Vec::new(),
+                key: Vec::new(),
+                matchable: true,
                 difference: input.change.diffs().value(index),
-            });
+            })
+            .collect::<Vec<_>>();
+        // Retain at most one evaluated key array. Encode full rows only after
+        // all key arrays have been released; the complete Claim still passes
+        // admission and Probe before any output is published.
+        for (key, pair) in self.keys.iter().enumerate() {
+            let bound = pair.for_port(input.port);
+            let column = bound.expression.evaluate(records).map_err(|source| {
+                EquiJoinError::KeyExpression {
+                    port: input.port,
+                    key,
+                    source,
+                }
+            })?;
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.matchable &= !column.is_null(index);
+                encode_canonical(&bound.field, column.as_ref(), index, "key", &mut row.key)
+                    .map_err(|source| EquiJoinError::CanonicalRow {
+                        source: Box::new(source),
+                    })?;
+            }
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.row = canonical_row(records, index)
+                .map_err(|source| EquiJoinError::CanonicalRow { source })?;
         }
         Ok(PreparedClaim {
             port: input.port,

@@ -13,12 +13,7 @@ pub(crate) struct StationDefinition {
     pub(super) id: String,
     pub(super) operations: Vec<Box<dyn OperationDefinition>>,
     pub(super) output_capacity_bytes: Option<NonZeroU64>,
-    pub(super) inputs: Vec<InputDefinition>,
-}
-
-#[derive(Debug)]
-pub(crate) struct InputDefinition {
-    pub(super) station_id: String,
+    pub(super) inputs: Vec<String>,
 }
 
 impl FlowDefinition {
@@ -92,20 +87,6 @@ impl StationDefinition {
     }
 
     pub(crate) fn inputs(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.inputs.iter().map(InputDefinition::station_id)
-    }
-
-    pub(crate) fn input_definitions(&self) -> &[InputDefinition] {
-        &self.inputs
-    }
-}
-
-impl InputDefinition {
-    pub(super) const fn new(station_id: String) -> Self {
-        Self { station_id }
-    }
-
-    pub(crate) fn station_id(&self) -> &str {
-        &self.station_id
+        self.inputs.iter().map(String::as_str)
     }
 }

@@ -17,7 +17,7 @@ mod schema;
 mod validate;
 
 pub use codec::FlowDefinitionError;
-pub(crate) use definition::{FlowDefinition, StationDefinition};
+pub(crate) use definition::FlowDefinition;
 pub use schema::FlowSchemaError;
 pub use validate::{InvalidStationIdReason, TopologyError};
 
@@ -25,7 +25,7 @@ static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Factory for building or opening a persistent Flow.
 ///
-/// Declaring stations, output capacities, and connections is side-effect free.
+/// Declaring Operations and their ordered inputs is side-effect free.
 /// [`FlowFactory::build`] validates the complete graph before creating the Store
 /// at the target path.
 /// [`FlowFactory::open`] restores an already-built Flow using only the path and
@@ -34,20 +34,26 @@ pub struct FlowFactory {
     path: PathBuf,
     token: u64,
     owner_identity: Option<[u8; 32]>,
-    stations: Vec<StationDefinition>,
-    connections: Vec<(Vec<StationRef>, StationRef)>,
-    output_capacities: Vec<(StationRef, NonZeroU64)>,
+    operations: Vec<DeclaredOperation>,
+    output_capacity: NonZeroU64,
+    materializations: Vec<(OperationRef, NonZeroU64)>,
     resources: BTreeMap<String, RuntimeResource>,
 }
 
-/// Temporary reference to a station declared in one [`FlowFactory`].
+/// Temporary reference to an Operation declared in one [`FlowFactory`].
 ///
 /// A reference is valid only while assembling the factory that created it. The
-/// durable Flow definition stores stable station IDs instead.
+/// durable Flow definition stores the resulting Station programs instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StationRef {
+pub struct OperationRef {
     factory_token: u64,
     index: usize,
+}
+
+struct DeclaredOperation {
+    id: String,
+    definition: Box<dyn OperationDefinition>,
+    inputs: Vec<OperationRef>,
 }
 
 impl FlowFactory {
@@ -64,9 +70,9 @@ impl FlowFactory {
             path: path.as_ref().to_path_buf(),
             token,
             owner_identity: None,
-            stations: Vec::new(),
-            connections: Vec::new(),
-            output_capacities: Vec::new(),
+            operations: Vec::new(),
+            output_capacity: NonZeroU64::new(64 * 1024 * 1024).expect("nonzero default capacity"),
+            materializations: Vec::new(),
             resources: BTreeMap::new(),
         }
     }
@@ -82,14 +88,16 @@ impl FlowFactory {
         self
     }
 
-    /// Supplies one ephemeral resource to a Station, for either build or open.
+    /// Supplies an ephemeral resource by stable Operation ID, for build or open.
     ///
     /// Resources are moved into Operations during assembly and never persisted.
-    /// Flow does not inspect their values or initialize external clients.
+    /// Flow does not inspect their values or initialize external clients. Resources
+    /// must belong to the first Operation in a resulting Station; build rejects
+    /// resources addressed to fused tails.
     ///
     /// # Errors
     ///
-    /// Returns an error if the same Station is assigned more than one resource.
+    /// Returns an error if the same ID is assigned more than one resource.
     pub fn resource<R: Send + 'static>(
         &mut self,
         station_id: impl Into<String>,
@@ -104,77 +112,46 @@ impl FlowFactory {
         Ok(self)
     }
 
-    /// Declares one Station with the first Operation in its linear program.
+    /// Declares an Operation and its complete, ordered inputs.
     ///
-    /// The returned reference belongs to this factory and is used by
-    /// [`FlowFactory::connect`] and [`FlowFactory::output_capacity_bytes`]. The
-    /// string ID is the station's durable identity.
-    pub fn station<D>(&mut self, id: impl Into<String>, definition: D) -> StationRef
-    where
-        D: OperationDefinition,
-    {
-        let reference = StationRef {
+    /// Inputs must refer to Operations previously declared in this factory.
+    /// Build fuses eligible single-input atomic Operations automatically. Each
+    /// resulting Station takes its first Operation's stable ID.
+    pub fn operation(
+        &mut self,
+        id: impl Into<String>,
+        definition: Box<dyn OperationDefinition>,
+        inputs: impl IntoIterator<Item = OperationRef>,
+    ) -> OperationRef {
+        let reference = OperationRef {
             factory_token: self.token,
-            index: self.stations.len(),
+            index: self.operations.len(),
         };
-        self.stations
-            .push(StationDefinition::new(id.into(), Box::new(definition)));
+        self.operations.push(DeclaredOperation {
+            id: id.into(),
+            definition,
+            inputs: inputs.into_iter().collect(),
+        });
         reference
     }
 
-    /// Appends one single-input atomic transform to a Station.
+    /// Sets the retained-byte capacity for automatically created durable outputs.
     ///
-    /// Appended Operations execute in declaration order inside the Station's
-    /// transaction and only the final result reaches its durable output.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `station` belongs to another factory, the existing
-    /// program requires a durable boundary, or `definition` is not a
-    /// single-input atomic transform. Failure leaves the Station unchanged.
-    pub fn append<D>(
-        &mut self,
-        station: StationRef,
-        definition: D,
-    ) -> Result<&mut Self, TopologyError>
-    where
-        D: OperationDefinition,
-    {
-        validate::append_operation(
-            self.token,
-            &mut self.stations,
-            station,
-            Box::new(definition),
-        )?;
-        Ok(self)
-    }
-
-    /// Declares a Station's complete, ordered input list.
-    ///
-    /// Call this exactly once for operations with inputs. Scans do
-    /// not need a connection. Input order is preserved in the durable definition.
-    pub fn connect<I>(&mut self, inputs: I, station: StationRef) -> &mut Self
-    where
-        I: IntoIterator<Item = StationRef>,
-    {
-        self.connections
-            .push((inputs.into_iter().collect(), station));
+    /// The default is 64 MiB. Only actual Station outputs persist a capacity.
+    /// An empty output may admit one larger Change to avoid permanent stalls.
+    /// This setting has no effect when opening an existing Flow.
+    pub fn output_capacity_bytes(&mut self, capacity: NonZeroU64) -> &mut Self {
+        self.output_capacity = capacity;
         self
     }
 
-    /// Declares the retained-output byte high-water mark for one Station.
+    /// Requires a durable output after this Operation, with the given capacity.
     ///
-    /// Call this exactly once for every Station whose Operation category has an
-    /// output. Outputless Stations must not declare a capacity. The capacity is
-    /// persisted as part of the immutable Flow definition. An empty output log
-    /// may accept one entry larger than this mark so that one large change cannot
-    /// permanently stall the Flow.
-    pub fn output_capacity_bytes(
-        &mut self,
-        station: StationRef,
-        capacity: NonZeroU64,
-    ) -> &mut Self {
-        self.output_capacities.push((station, capacity));
+    /// This prevents fusion across that output and establishes an explicit
+    /// transaction and backpressure boundary. Build rejects foreign references,
+    /// duplicate declarations, and Operations without an output.
+    pub fn materialize(&mut self, operation: OperationRef, capacity: NonZeroU64) -> &mut Self {
+        self.materializations.push((operation, capacity));
         self
     }
 
@@ -197,7 +174,11 @@ impl FlowFactory {
         let path = self.path.clone();
         let declared_definition = self.finish_definition()?;
         let definition_bytes = codec::encode(&declared_definition)?;
-        let (definition, topology) = codec::decode(&definition_bytes)?;
+        let (definition, topology) =
+            codec::decode(&definition_bytes).map_err(|error| match error {
+                FlowDefinitionError::Topology(error) => FlowError::Topology(error),
+                error => FlowError::Definition(error),
+            })?;
         let resources = preflight_resources(&definition, resources)?;
         let station_ids = definition
             .stations()
@@ -224,7 +205,7 @@ impl FlowFactory {
             path,
             station_ids,
             assembled.stations,
-            assembled.topology,
+            assembled.schedule,
             transactions,
             reads,
         ))
@@ -234,9 +215,9 @@ impl FlowFactory {
         validate::finish_definition(
             self.owner_identity,
             self.token,
-            self.stations,
-            &self.connections,
-            &self.output_capacities,
+            self.operations,
+            self.output_capacity,
+            &self.materializations,
         )
     }
 }

@@ -18,6 +18,7 @@ use datafusion_functions_aggregate::planner::AggregateFunctionPlanner;
 use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
+use dogpaddle_flow::{FlowFactory, OperationRef};
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
@@ -31,7 +32,7 @@ use dogpaddle_operation::{
 use crate::{
     SqlError,
     aggregate::{lower as lower_builtin_aggregate, planning_builtins},
-    assembly::{LogicalArena, LogicalNodeId, LogicalOperator, LogicalQuery, TransformDefinition},
+    assembly::add_scan,
     endpoint::BuiltScan,
     syntax::internal_scan_name,
 };
@@ -154,9 +155,11 @@ pub(crate) fn plan(
 pub(crate) fn lower_query(
     plan: &LogicalPlan,
     scans: Vec<BuiltScan>,
-) -> Result<LogicalQuery, SqlError> {
+    factory: &mut FlowFactory,
+) -> Result<OperationRef, SqlError> {
     let mut lowerer = Lowerer {
-        arena: LogicalArena::default(),
+        factory,
+        next_transform: 0,
         scans: scans.into_iter().map(Some).collect(),
         scan_nodes: HashMap::new(),
     };
@@ -166,12 +169,12 @@ pub(crate) fn lower_query(
             "every declared scan must be reachable from the query result",
         ));
     }
-    Ok(LogicalQuery::new(lowerer.arena, output.node))
+    Ok(output.node)
 }
 
 #[derive(Clone)]
 struct LoweredRelation {
-    node: LogicalNodeId,
+    node: OperationRef,
     physical_schema: SchemaRef,
 }
 
@@ -185,13 +188,14 @@ struct OrientedJoin {
     swapped: bool,
 }
 
-struct Lowerer {
-    arena: LogicalArena,
+struct Lowerer<'a> {
+    factory: &'a mut FlowFactory,
+    next_transform: usize,
     scans: Vec<Option<BuiltScan>>,
     scan_nodes: HashMap<usize, LoweredRelation>,
 }
 
-impl Lowerer {
+impl Lowerer<'_> {
     fn lower(&mut self, plan: &LogicalPlan) -> Result<LoweredRelation, SqlError> {
         match plan {
             LogicalPlan::TableScan(scan) => self.lower_scan(scan),
@@ -449,13 +453,7 @@ impl Lowerer {
             .get_mut(source.index)
             .and_then(Option::take)
             .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
-        let node = self.arena.push(
-            [],
-            LogicalOperator::Scan {
-                source_index: source.index,
-                definition: built,
-            },
-        );
+        let node = add_scan(self.factory, source.index, built)?;
         let relation = LoweredRelation {
             node,
             physical_schema: Arc::clone(&source.schema),
@@ -538,7 +536,7 @@ impl Lowerer {
     fn add_transform<I, D>(&mut self, inputs: I, definition: D) -> Result<LoweredRelation, SqlError>
     where
         I: IntoIterator<Item = LoweredRelation>,
-        D: Into<TransformDefinition> + OperationDefinition,
+        D: OperationDefinition,
     {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let input_schemas = inputs
@@ -549,9 +547,12 @@ impl Lowerer {
             .output_schema(&input_schemas)
             .map_err(SqlError::endpoint)?
             .ok_or_else(|| SqlError::invalid("transform definition has no output Schema"))?;
-        let node = self.arena.push(
+        let id = format!("sql/transform/{:08x}", self.next_transform);
+        self.next_transform += 1;
+        let node = self.factory.operation(
+            id,
+            Box::new(definition),
             inputs.into_iter().map(|input| input.node),
-            LogicalOperator::Transform(definition.into()),
         );
         Ok(LoweredRelation {
             node,

@@ -7,8 +7,8 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, SchemaRef};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 use datafusion_common::{
     DFSchema, DataFusionError,
     tree_node::{TreeNode, TreeNodeRecursion},
@@ -19,6 +19,7 @@ use datafusion_expr::{
 };
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_proto::bytes::Serializeable;
+use dogpaddle_change::{Change, ChangeError};
 use thiserror::Error;
 
 use crate::{DefinitionCodecError, codec::PayloadCursor};
@@ -77,6 +78,71 @@ pub(crate) struct BoundExpression {
     output_type: DataType,
     output_nullable: bool,
     output_metadata: HashMap<String, String>,
+}
+
+/// A group of expressions bound to one exact input Schema.
+/// The input guard includes empty projections; only this implementation may
+/// evaluate the group's physical expressions without per-expression guards.
+pub(crate) struct BoundProjection {
+    input_schema: SchemaRef,
+    expressions: Box<[BoundExpression]>,
+    output_schema: SchemaRef,
+}
+
+pub(crate) enum ProjectionError {
+    SchemaMismatch,
+    Expression {
+        field: usize,
+        source: ExpressionError,
+    },
+    Arrow(ArrowError),
+    Change(ChangeError),
+}
+
+impl BoundProjection {
+    pub(crate) fn new(
+        input_schema: SchemaRef,
+        expressions: Vec<BoundExpression>,
+        output_schema: SchemaRef,
+    ) -> Self {
+        assert!(
+            expressions
+                .iter()
+                .all(|expression| expression.input_schema.as_ref() == input_schema.as_ref()),
+            "projection expressions must share the bound input Schema"
+        );
+        Self {
+            input_schema,
+            expressions: expressions.into_boxed_slice(),
+            output_schema,
+        }
+    }
+
+    pub(crate) fn evaluate(&self, input: &Change) -> Result<Change, ProjectionError> {
+        if input.records().schema_ref().as_ref() != self.input_schema.as_ref() {
+            return Err(ProjectionError::SchemaMismatch);
+        }
+        let columns = self
+            .expressions
+            .iter()
+            .enumerate()
+            .map(|(field, expression)| {
+                expression
+                    .physical
+                    .evaluate(input.records())
+                    .and_then(|value| value.into_array_of_size(input.num_rows()))
+                    .map_err(|source| ProjectionError::Expression {
+                        field,
+                        source: ExpressionError::DataFusion(source),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(input.num_rows()));
+        let records =
+            RecordBatch::try_new_with_options(Arc::clone(&self.output_schema), columns, &options)
+                .map_err(ProjectionError::Arrow)?;
+        Change::try_new(records, input.diffs().clone()).map_err(ProjectionError::Change)
+    }
 }
 
 impl StoredExpression {

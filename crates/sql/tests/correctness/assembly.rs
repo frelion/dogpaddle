@@ -20,7 +20,7 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     assert_eq!(definition.len(), 940);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "94f6b81ea91d1e200dcdb9506bc2bb4ff96a846a443f3b735f5476a7374a4aa3"
+        "36ff1d280b47791498b4f13db82c5d09b8b56180cb141efac95e18f8cab67538"
     );
 }
 

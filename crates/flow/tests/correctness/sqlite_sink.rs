@@ -27,31 +27,38 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
 
     // SequenceScan becomes idle after u64::MAX, so this emits exactly three rows.
     let mut factory = FlowFactory::new(&flow_path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(scan_start));
-    let extend = factory.station(
+    let scan = factory.operation(
+        "scan",
+        Box::new(SequenceScanDefinition::new(scan_start)),
+        [],
+    );
+    let extend = factory.operation(
         "extend",
-        ExtendDefinition::try_new("offset", col("value") - lit(scan_start)).unwrap(),
+        Box::new(ExtendDefinition::try_new("offset", col("value") - lit(scan_start)).unwrap()),
+        [scan],
     );
-    let filter = factory.station(
+    let filter = factory.operation(
         "filter",
-        FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap(),
+        Box::new(FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap()),
+        [extend],
     );
-    let select = factory.station(
+    let select = factory.operation(
         "select",
-        SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
-            .unwrap(),
+        Box::new(
+            SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
+                .unwrap(),
+        ),
+        [filter],
     );
-    let sqlite = factory.station(
+    factory.operation(
         "sqlite",
-        SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap(),
+        Box::new(SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap()),
+        [select],
     );
     for station in [scan, extend, filter, select] {
-        factory.output_capacity_bytes(station, OUTPUT_CAPACITY_BYTES);
+        factory.materialize(station, OUTPUT_CAPACITY_BYTES);
     }
-    factory.connect([scan], extend);
-    factory.connect([extend], filter);
-    factory.connect([filter], select);
-    factory.connect([select], sqlite);
+
     let mut flow = factory.build().unwrap();
 
     assert!(
@@ -157,13 +164,14 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
 
 fn build_sqlite_flow(flow_path: &Path, sqlite_path: &Path) -> dogpaddle_flow::Flow {
     let mut factory = FlowFactory::new(flow_path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX));
-    let sink = factory.station(
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    factory.operation(
         "sqlite",
-        SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
+        Box::new(SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap()),
+        [scan],
     );
-    factory.output_capacity_bytes(scan, OUTPUT_CAPACITY_BYTES);
-    factory.connect([scan], sink);
+    factory.materialize(scan, OUTPUT_CAPACITY_BYTES);
+
     factory.build().unwrap()
 }
 

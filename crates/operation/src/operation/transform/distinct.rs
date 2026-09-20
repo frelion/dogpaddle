@@ -32,12 +32,12 @@ pub struct DistinctDefinition {
 ///
 /// The runtime owns only its bound input Schema and durable row weights. It
 /// does not retain its Definition or begin, commit, or store a transaction.
-pub struct DistinctOperation {
+pub(crate) struct DistinctOperation {
     input_schema: SchemaRef,
     weights: OrderedMultiset<Vec<u8>>,
 }
 
-/// Distinct-specific failure during one [`DistinctOperation`] turn.
+/// Distinct-specific failure during one `DistinctOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DistinctError {

@@ -56,7 +56,7 @@ impl Phase {
 /// The initial snapshot is durably sealed in a private queue before any
 /// row becomes public. A capture interrupted before sealing is discarded and
 /// restarted with a newly created logical slot.
-pub struct PostgresCdcScanOperation {
+pub(crate) struct PostgresCdcScanOperation {
     spec: PostgresCdcScanSpec,
     output_schema: SchemaRef,
     phase_cell: Cell<u32>,

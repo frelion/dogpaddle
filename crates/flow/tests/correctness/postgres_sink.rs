@@ -31,10 +31,10 @@ fn definition() -> PostgresSinkDefinition {
 
 fn factory(path: &Path) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(0));
-    let sink = factory.station(SINK, definition());
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.connect([scan], sink);
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    factory.operation(SINK, Box::new(definition()), [scan]);
+    factory.materialize(scan, CAPACITY);
+
     factory
 }
 
@@ -73,16 +73,16 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
     let path = root.path().join("flow");
     let invalid_name = "x".repeat(64);
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(0));
-    let select = factory.station(
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let select = factory.operation(
         "select",
-        SelectDefinition::try_new([(invalid_name.clone(), col("value"))]).unwrap(),
+        Box::new(SelectDefinition::try_new([(invalid_name.clone(), col("value"))]).unwrap()),
+        [scan],
     );
-    let sink = factory.station(SINK, definition());
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.output_capacity_bytes(select, CAPACITY);
-    factory.connect([scan], select);
-    factory.connect([select], sink);
+    factory.operation(SINK, Box::new(definition()), [select]);
+    factory.materialize(scan, CAPACITY);
+    factory.materialize(select, CAPACITY);
+
     factory.resource(SINK, config()).unwrap();
 
     let Err(FlowError::Schema(error)) = factory.build() else {

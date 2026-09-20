@@ -49,7 +49,7 @@ impl Flow {
         for station in &mut self.stations {
             station.clear_outcome();
         }
-        for &index in &self.topology.schedule {
+        for &index in &self.schedule {
             let station_id = &self.station_ids[index];
             self.stations[index]
                 .ensure_runnable()
@@ -57,7 +57,7 @@ impl Flow {
         }
 
         let mut outcome = AdvanceOutcome::Idle;
-        for &index in &self.topology.schedule {
+        for &index in &self.schedule {
             let station_id = &self.station_ids[index];
             let station_outcome = self.stations[index]
                 .advance(&self.reads, &mut self.transactions)

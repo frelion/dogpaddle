@@ -560,3 +560,34 @@ fn schema_align_rejects_invalid_port_and_schema_drift() {
         Some(SchemaAlignError::InputSchemaMismatch)
     ));
 }
+
+#[test]
+fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
+    let input = change(&[1, -1]);
+    let failing = col("input") / dogpaddle_operation::lit(0_u64);
+    let definition = SchemaAlignDefinition::try_new([
+        SchemaAlignField::try_new("first", col("input"), false).unwrap(),
+        SchemaAlignField::try_new("second", failing, true).unwrap(),
+    ])
+    .unwrap();
+    let mut operation = stateless_operation(&definition, input.schema());
+    let fixture = TestStore::new();
+    let mut transactions = Store::create(fixture.path()).unwrap().into_transactions();
+    let drifted = change_with_field_name("other", &[1, -1]);
+    let error = rollback_ready(
+        &mut operation,
+        Some(turn_input(&drifted)),
+        &mut transactions,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::InputSchemaMismatch)
+    ));
+    let error =
+        rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SchemaAlignError>(),
+        Some(SchemaAlignError::Expression { field: 1, .. })
+    ));
+}

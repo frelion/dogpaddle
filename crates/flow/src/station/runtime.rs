@@ -1,26 +1,18 @@
-use std::{num::NonZeroU64, sync::Arc};
+#[cfg(test)]
+use dogpaddle_operation::operation::Operation;
+use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
-use dogpaddle_operation::operation::{Action, Operation, OperationInput, Turn};
-use dogpaddle_store::{
-    Cell, ReadTransactionAccess, ReadTransactions, StoreError, SubscribedLog, Subscription,
-    TransactionAccess, Transactions,
-};
+use dogpaddle_operation::operation::{Action, OperationInput, Turn};
+use dogpaddle_store::{ReadTransactionAccess, ReadTransactions, TransactionAccess, Transactions};
 
 use crate::flow::{AdvanceOutcome, StationStatus};
 
 use super::{
-    input::{Inbox, InputPort, Output},
+    input::{Inbox, Output},
     program::StationProgram,
     protocol::StationError,
 };
-
-pub(crate) struct StationParts {
-    active: Option<Cell<u32>>,
-    program: StationProgram,
-    output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
-}
 
 pub(crate) struct Station {
     program: StationProgram,
@@ -31,6 +23,16 @@ pub(crate) struct Station {
 }
 
 impl Station {
+    pub(crate) fn new(program: StationProgram, inbox: Inbox, output: Option<Arc<Output>>) -> Self {
+        Self {
+            program,
+            inbox,
+            output,
+            needs_reopen: false,
+            last_outcome: None,
+        }
+    }
+
     pub(crate) fn advance(
         &mut self,
         reads: &ReadTransactions,
@@ -191,103 +193,4 @@ fn append_output(
     };
     let output = output.ok_or(StationError::UnexpectedOutput)?;
     output.try_append(&change, access)
-}
-
-impl StationParts {
-    pub(crate) fn new(
-        active: Option<Cell<u32>>,
-        input_count: usize,
-        operations: Vec<Operation>,
-        output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
-    ) -> Self {
-        Self {
-            active,
-            program: StationProgram::new(input_count, operations),
-            output,
-        }
-    }
-
-    pub(crate) fn initialize(
-        &self,
-        subscriber_count: u64,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), StoreError> {
-        if let Some(active) = &self.active {
-            active.access(access)?.set(&0)?;
-        }
-        match (&self.output, NonZeroU64::new(subscriber_count)) {
-            (Some((log, _, _)), Some(subscriber_count)) => {
-                log.initialize(subscriber_count, access)?;
-            }
-            (None, None) => {}
-            (Some(_), None) | (None, Some(_)) => {
-                unreachable!("validated output ownership must match direct consumer count")
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate(
-        &self,
-        subscriber_count: u64,
-        access: ReadTransactionAccess<'_>,
-    ) -> Result<(), StationError> {
-        if let Some(active) = &self.active {
-            let active = active
-                .read(access)?
-                .get()?
-                .ok_or(StationError::MissingActiveInput)?;
-            let input_count = self.program.input_count();
-            let active = usize::try_from(active).expect("u32 fits usize on supported targets");
-            if active >= input_count {
-                return Err(StationError::ActiveInputOutOfRange {
-                    input: active,
-                    input_count,
-                });
-            }
-        }
-        match (&self.output, NonZeroU64::new(subscriber_count)) {
-            (Some((log, _, _)), Some(subscriber_count)) => {
-                log.validate(subscriber_count, access)?;
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            (Some(_), None) | (None, Some(_)) => {
-                unreachable!("validated output ownership must match direct consumer count")
-            }
-        }
-    }
-
-    pub(crate) fn subscription(&self, subscriber: u64) -> Subscription<Vec<u8>> {
-        self.output
-            .as_ref()
-            .expect("validated input Station must produce output")
-            .0
-            .subscription(subscriber)
-    }
-
-    pub(crate) fn prepare_output(&mut self) -> Option<Arc<Output>> {
-        self.output.take().map(|(log, capacity_bytes, schema)| {
-            Arc::new(Output::new(log.writer(), capacity_bytes, schema))
-        })
-    }
-
-    pub(crate) fn finish(self, inputs: Vec<InputPort>, output: Option<Arc<Output>>) -> Station {
-        assert_eq!(
-            inputs.len(),
-            self.program.input_count(),
-            "station input capabilities must match its operation definition"
-        );
-        assert!(
-            self.output.is_none(),
-            "station output must be moved exactly once during assembly"
-        );
-        Station {
-            program: self.program,
-            inbox: Inbox::new(self.active, inputs),
-            output,
-            needs_reopen: false,
-            last_outcome: None,
-        }
-    }
 }

@@ -10,7 +10,7 @@ mod schema;
 pub use connection::{PostgresCdcScanConfig, PostgresCdcScanOptions};
 pub use definition::{PostgresCdcScanDefinition, PostgresCdcScanSpec};
 pub use error::PostgresCdcScanError;
-pub use runtime::PostgresCdcScanOperation;
+pub(crate) use runtime::PostgresCdcScanOperation;
 pub use schema::{PostgresColumn, PostgresType};
 
 pub(crate) use definition::{TAG, decode_definition};

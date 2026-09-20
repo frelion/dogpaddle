@@ -21,10 +21,16 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
 ```
 
-这不是给旧装配层换名字：旧的分阶段绑定对象、Data declaration、类型擦除的 data bag、materializer
-和双路 setup 入口都已删除。唯一的 checked construction path 先统一校验输入数量、输入/输出
-Schema、执行能力和运行资源 presence/type，再由 sealed 具体 Definition 本地编译语义、通过
-`DataScope` 取得类型化 handle 并直接构造最终 Operation。构造不执行外部 I/O、事务或状态读取。
+普通算子开发从 [`Project`](src/operation/transform/project.rs) 开始，再读
+[`RunningEventCount`](src/operation/transform/running_event_count.rs) 及其
+[correctness 测试](tests/correctness/running_event_count.rs)。日常开发只需要掌握 Definition、
+Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station 提交、订阅确认和恢复调度由 Flow 负责。
+跨 turn 工作和外部 I/O 再使用 `TurnOperation` 与 AfterCommit，详见下文。
+
+公共入口只提供具体 Definition、必要的参数与错误类型，以及统一运行协议。
+具体 `XxxOperation` 和它们的构造函数都是 crate 内部实现；调用方一律通过 Definition 的 checked
+`construct` 取得统一 `Operation`。该入口校验 Schema、执行能力和资源类型，再取得 typed handles
+并构造运行实例，不执行外部 I/O、事务或状态读取。
 
 ## 先认识 Definition 和运行实例
 
@@ -433,6 +439,8 @@ matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远�
 
 ## 表达式边界
 
+`Select` 与 `SchemaAlign` 共用私有批量投影执行实现：绑定时共享一个 `DFSchema`，每个 Change 只做一次整组 exact Schema 校验，空投影也检查。各 Definition 继续独立决定字段、metadata、nullability 与稳定编码，运行错误保留具体字段序号。
+
 Filter、Extend、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
 字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
@@ -543,10 +551,12 @@ codec 还是目标布局/恢复 ABI。decoder 表在
 canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 [`crates/flow/tests/fixtures/v1/`](../flow/tests/fixtures/v1/)。
 
+`EquiJoin` 的输入准备逐个求值并编码 key expression，释放当前 key array 后再处理下一个；全部 key 完成后才编码完整行。整批 admission 与 Probe 仍在任何输出发布前完成，此优化不增加输入硬上限。
+
 ## 新增一个算子
 
 建议先读最小的 [`Project`](src/operation/transform/project.rs)，再读带状态的
-[`Distinct`](src/operation/transform/distinct.rs)；需要分页时读
+[`RunningEventCount`](src/operation/transform/running_event_count.rs)；需要分页时读
 [`EquiJoin`](src/operation/transform/equi_join/) 和
 [`AsOfJoin`](src/operation/transform/asof_join/)，需要外部恢复协议时读
 [`queue_scan`](examples/support/queue_scan.rs)。
@@ -593,6 +603,7 @@ cargo test -p dogpaddle-operation
 cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 cargo test -p dogpaddle-operation --benches
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench projection
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink

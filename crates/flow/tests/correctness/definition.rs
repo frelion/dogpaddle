@@ -186,27 +186,32 @@ fn open_rejects_an_unpublished_build() {
 
 fn build_chain(path: &Path) {
     let mut builder = FlowFactory::new(path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(7));
-    let count = builder.station("count", RunningEventCountDefinition::new());
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([scan], count);
-    builder.connect([count], sink);
-    builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
-    builder.output_capacity_bytes(count, NonZeroU64::new(2_048).unwrap());
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(7)), []);
+    let count = builder.operation(
+        "count",
+        Box::new(RunningEventCountDefinition::new()),
+        [scan],
+    );
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+
+    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
+    builder.materialize(count, NonZeroU64::new(2_048).unwrap());
     drop(builder.build().unwrap());
 }
 
 fn build_multi_operation_station(path: &Path) {
     let mut builder = FlowFactory::new(path);
     builder.owner_identity(OWNER_IDENTITY);
-    let scan = builder.station("scan", SequenceScanDefinition::new(7));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.append(scan, ProjectDefinition::new([0])).unwrap();
-    builder
-        .append(scan, RunningEventCountDefinition::new())
-        .unwrap();
-    builder.append(scan, ProjectDefinition::new([0])).unwrap();
-    builder.connect([scan], sink);
-    builder.output_capacity_bytes(scan, NonZeroU64::new(1_024).unwrap());
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(7)), []);
+    let scan = builder.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = builder.operation(
+        "scan/tail-2",
+        Box::new(RunningEventCountDefinition::new()),
+        [scan],
+    );
+    let scan = builder.operation("scan/tail-3", Box::new(ProjectDefinition::new([0])), [scan]);
+
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 }

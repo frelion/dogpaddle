@@ -84,7 +84,7 @@ head Operation → atomic tail 0 → atomic tail 1 → ... → durable output
 
 这里的 **atomic transform（原子转换）** 指能在当前写事务中完整处理一条输入 Change 的算子。
 它不保留“当前输入处理到哪里”的游标，不执行外部 I/O，也不产生提交后的动作，所以可以安全地接在别的
-Operation 后面。`FlowFactory::append` 只接受单输入 atomic transform。
+Operation 后面。Flow 在新建时自动把符合条件的单输入 atomic transform 合入唯一上游。
 
 每个 Operation Definition（可编码、尚未运行的算子定义）会明确报告自己的结构角色：
 
@@ -108,8 +108,6 @@ Operation 后面。`FlowFactory::append` 只接受单输入 atomic transform。
 下面的 Flow 只有两个 Station。`numbers` 内含 `SequenceScan` 和 Filter，`sink` 独占：
 
 ```rust,no_run
-use std::num::NonZeroU64;
-
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::{
     col, lit,
@@ -125,18 +123,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = root.path().join("flow");
 
     let mut factory = FlowFactory::new(&state);
-    let numbers = factory.station("numbers", SequenceScanDefinition::new(0));
-    factory.append(
-        numbers,
-        FilterDefinition::try_new(col("value").eq(lit(7_u64)))?,
-    )?;
-    factory.output_capacity_bytes(
-        numbers,
-        NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+    let numbers = factory.operation("numbers", Box::new(SequenceScanDefinition::new(0)), []);
+    let selected = factory.operation(
+        "selected",
+        Box::new(FilterDefinition::try_new(col("value").eq(lit(7_u64)))?),
+        [numbers],
     );
-
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.connect([numbers], sink);
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [selected]);
 
     let mut flow = factory.build()?;
     flow.advance()?;
@@ -148,22 +141,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`FlowFactory` 的核心调用只有这些。`resource` 以 Station 字符串 ID 绑定一个不透明值；Flow 只负责在
-全图元数据预检后把它交给首 Operation 的直接构造，不查看其中的凭据，也不把它变成持久资源描述：
+`FlowFactory` 接收算子和有序输入，统一决定 Station 边界。SQL 和 Rust 使用同一条构建路径。
 
 | API | 作用 |
 | --- | --- |
 | `new(path)` | 指定这条 Flow 独占的状态目录 |
 | `owner_identity(identity)` | 设置不透明的 32 字节 owner 身份；build 持久化，open 必须精确匹配 |
-| `station(id, definition)` | 创建 Station，并放入首 Operation |
-| `append(station, definition)` | 在现有 Station 末尾追加单输入 atomic transform |
-| `connect(inputs, station)` | 按顺序连接 Station 的全部输入端口 |
-| `output_capacity_bytes(station, bytes)` | 设置该 Station 持久输出的保留字节高水位 |
-| `resource(station_id, value)` | 注入密码、连接配置等不持久化的运行资源 |
-| `build()` | 校验声明、创建状态并返回运行态 `Flow` |
-| `open()` | 从已有状态目录恢复运行态 `Flow` |
+| `operation(id, definition, inputs)` | 声明算子及其全部有序输入，返回 `OperationRef` |
+| `output_capacity_bytes(bytes)` | 设置新建时所有实际持久输出的默认容量，初值为 64 MiB |
+| `materialize(operation, bytes)` | 在指定算子之后建立持久输出，阻止跨越此输出的融合，并指定容量 |
+| `resource(head_id, value)` | 给 Station 首算子注入密码、连接配置等临时运行资源 |
+| `build()` | 校验声明、自动划分 Station、创建状态并返回运行态 `Flow` |
+| `open()` | 按已有持久计划恢复运行态 `Flow`，不重新划分 Station |
 
-`StationRef` 只是声明期句柄，只能在创建它的 Factory 中使用。字符串 ID 才是持久身份。
+`operation` 接收拥有型 `Box<dyn OperationDefinition>`。输入只能引用本 Factory 中先前声明的算子，
+因此声明天然构成 DAG；持久 Definition 的 decoder 仍独立校验环和拓扑。
+所有算子 ID（包括最终被融合的尾项）都必须合法且唯一。Station ID 使用其首算子的 ID。
+
+默认融合只发生在单输入 Atomic 与唯一上游之间，并要求上游只有一条消费边、首项允许尾链、
+上游未显式 materialize。重复连接同一 producer 的两个端口也计为两条边。多输入算子可以成为
+Station 首项并吸收后续 Atomic；Exclusive 与 Sink 独占。
+
+`materialize` 的边界位于指定算子之后：它仍可以融入自己的上游，但后续算子不能跨越其持久输出。
+普通声明无需调用它；需要独立事务、背压或容量控制时才显式指定。新建时容量只写入最终输出，
+不存在中间队列。恢复以磁盘中的容量为准，Factory 的默认容量设置不会改变它。
+
+`OperationRef` 只在创建它的 Factory 内有效。运行资源按首算子稳定 ID 注入，不得给融合尾项注入；
+资源不进入 Definition，open 时必须再次提供。
 
 ## `build` 与 `open`
 
@@ -171,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `build` 按下面的生命周期工作：
 
-1. 校验 Station、输入顺序、容量和整张 DAG。
+1. 校验全部声明节点的 ID、输入数、引用、输出能力和显式边界，再按消费边数量划分 Station。
 2. 稳定编码声明，再立即解码；后续只使用这份即将持久化的 canonical（规范化）Definition。
 3. 在创建 Store 前全图检查所有 Station 资源的存在与精确类型。
 4. 创建纯内存 `StoreSetup`；按拓扑传播 Arrow Schema，并按 Station 内顺序让每个 Definition 通过统一
@@ -182,9 +186,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 因此常见的拓扑、Schema 和资源类型错误不会留下目标目录。底层 Store 在创建后的失败仍可能留下一个
 不完整目录，`open` 会拒绝把它当成完整 Flow。
 
-构建规则包括：Station ID 非空、唯一且不含 NUL；图必须无环；输入数和顺序必须与首 Operation 一致；
-每个起点必须以 Scan 开始，每个终点必须是 Sink；每个有输出的 Station 必须有直接消费者，并且恰好设置
-一次非零容量；Sink 不能设置输出容量。一个输出可被多个下游消费，每条边有独立订阅位置。
+构建规则包括：所有声明 ID 非空、唯一且不含 NUL；输入数和顺序必须与 Operation 一致；
+每个起点必须是 Scan，每个终点必须是 Sink。每个实际持久输出必须有消费者及非零容量；
+Sink 不能 materialize。一个输出可被多个下游消费，每条边有独立订阅位置。
 
 ### 重新打开
 
@@ -217,7 +221,7 @@ flow.advance()?;
 再保持同一个 Store，由拓扑顺序和 Station program 顺序调用 Definition 的统一 `construct`，以相同前缀
 打开具体状态、直接装配最终运行对象并传播 output Schema；之后才校验持久 Station 状态并导出事务能力。
 Flow 不读取算子内部布局、不枚举具体算子，也不会重新决定如何融合。凭据、进程内 connector 等
-`RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；它是这条路径上唯一的类型擦除。
+`RuntimeResource` 不写入磁盘，必须按 Station ID 再次注入；其内容不会被日志或持久化编码展开。
 
 ### 磁盘里有什么
 
@@ -270,10 +274,10 @@ backlog 的单位是完整 `Change`，不是行数。输出容量限制的是持
 
 1. [`src/build/mod.rs`](src/build/mod.rs)：`FlowFactory` 的全部公共声明 API 和 `build`。
 2. [`src/flow/advance.rs`](src/flow/advance.rs)：一轮调度只有几十行，是运行入口。
-3. [`src/station/runtime.rs`](src/station/runtime.rs)：一个 Station 如何执行首项、尾链、输出和提交。
+3. [`src/station/runtime.rs`](src/station/runtime.rs)：只包含运行态，一个 Station 如何执行首项、尾链、输出和提交。
 4. [`src/station/input.rs`](src/station/input.rs)：Claim、输入端口、订阅位置和多输入固定规则。
 5. [`src/build/schema.rs`](src/build/schema.rs)：全图 Schema 如何传播并逐项构造最终 Operation。
-6. [`src/assembly.rs`](src/assembly.rs)：已验证 Definition 如何变成运行期 Station。
+6. [`src/assembly.rs`](src/assembly.rs)：构建期 `StationParts` 的初始化、恢复验证，以及已验证 Definition 如何变成运行期 Station。
 7. [`src/build/codec.rs`](src/build/codec.rs) 与 [`src/build/open.rs`](src/build/open.rs)：持久格式和恢复路径。
 
 Flow 只实现装配、拓扑、调度和事务边界，不枚举具体算子，也不包含 SQL planner。SQL 层用 owner identity

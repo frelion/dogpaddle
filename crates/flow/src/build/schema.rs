@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::{
     assembly::ResolvedTopology,
+    assembly::StationParts,
     error::{FlowError, operation_setup_error},
-    station::StationParts,
 };
 
 use super::{FlowDefinition, codec};
@@ -74,7 +74,7 @@ pub(super) fn construct_stations(
             .inputs(station_index)
             .iter()
             .map(|producer| {
-                output_schemas[*producer]
+                output_schemas[producer.producer]
                     .as_ref()
                     .expect("a scheduled, validated input must have a constructed output Schema")
                     .clone()

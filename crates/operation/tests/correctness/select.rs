@@ -318,3 +318,31 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
         Some(SelectError::InputSchemaMismatch)
     ));
 }
+
+#[test]
+fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
+    let input = change(&[1, -1]);
+    let failing = col("input") / dogpaddle_operation::lit(0_u64);
+    let definition =
+        SelectDefinition::try_new([("first", col("input")), ("second", failing)]).unwrap();
+    let mut operation = stateless_operation(&definition, input.schema());
+    let fixture = TestStore::new();
+    let mut transactions = Store::create(fixture.path()).unwrap().into_transactions();
+    let drifted = change_with_field_name("other", &[1, -1]);
+    let error = rollback_ready(
+        &mut operation,
+        Some(turn_input(&drifted)),
+        &mut transactions,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SelectError>(),
+        Some(SelectError::InputSchemaMismatch)
+    ));
+    let error =
+        rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SelectError>(),
+        Some(SelectError::Expression { field: 1, .. })
+    ));
+}

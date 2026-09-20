@@ -1,5 +1,7 @@
 #[path = "correctness/asof_join.rs"]
 mod asof_join;
+#[path = "correctness/auto_planning.rs"]
+mod auto_planning;
 #[path = "correctness/binding.rs"]
 mod binding;
 #[path = "correctness/definition.rs"]

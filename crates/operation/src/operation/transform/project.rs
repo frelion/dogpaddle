@@ -29,7 +29,7 @@ pub struct ProjectDefinition {
 ///
 /// The operation retains only the exact Schema-bound [`ChangeProjection`]
 /// compiled by its Definition. It owns no persistent Store data.
-pub struct ProjectOperation {
+pub(crate) struct ProjectOperation {
     projection: ChangeProjection,
 }
 
@@ -42,7 +42,7 @@ pub enum ProjectSchemaError {
     Projection(#[from] ProjectionError),
 }
 
-/// Project-specific failure during one [`ProjectOperation`] turn.
+/// Project-specific failure during one `ProjectOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProjectError {
@@ -145,7 +145,7 @@ impl OperationDefinition for ProjectDefinition {
 impl ProjectOperation {
     /// Creates a Project operation from an exact Schema-bound projection.
     #[must_use]
-    pub const fn new(projection: ChangeProjection) -> Self {
+    const fn new(projection: ChangeProjection) -> Self {
         Self { projection }
     }
 }

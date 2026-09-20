@@ -32,7 +32,7 @@ pub struct FilterDefinition {
 /// Materialized exact-Schema-bound row filter.
 ///
 /// This value owns only its compiled predicate and no persistent Store data.
-pub struct FilterOperation {
+pub(crate) struct FilterOperation {
     predicate: BoundExpression,
 }
 
@@ -51,7 +51,7 @@ pub enum FilterSchemaError {
     },
 }
 
-/// Filter-specific failure during one [`FilterOperation`] turn.
+/// Filter-specific failure during one `FilterOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FilterError {

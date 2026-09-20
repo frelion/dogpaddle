@@ -2,7 +2,7 @@ use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
     operation::{
         Action, Operation, OperationInput,
-        scan::{SequenceScanDefinition, SequenceScanError, SequenceScanOperation},
+        scan::{SequenceScanDefinition, SequenceScanError},
     },
 };
 use dogpaddle_store::{Cell, Store, StoreError, StoreSetup, Transactions};
@@ -146,11 +146,9 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
 #[test]
 fn runtime_rejects_input_and_a_foreign_store() {
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    let position = store.create_data::<Cell<u64>>("position").unwrap();
-    let mut operation = Operation::Turn(Box::new(SequenceScanOperation::new(0, position)));
+    let (mut operation, mut transactions) =
+        construct_operation(&root, &SequenceScanDefinition::new(0));
     let input = change(&[1]);
-    let mut transactions = store.into_transactions();
     let error = rollback_ready(
         &mut operation,
         Some(OperationInput {

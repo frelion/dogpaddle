@@ -1,9 +1,11 @@
 # dogpaddle-sql
 
 `dogpaddle-sql` 是 `DogPaddle` 的产品编译入口。一个 `SqlProgram` 表示一条
-`INSERT INTO sink(...) <query>`：SQL crate 负责解析、类型分析、翻译成 Operation，并把可以共用事务边界的 Operation 装进同一个 Station。执行和恢复仍由普通 `Flow` 完成。
+`INSERT INTO sink(...) <query>`：SQL crate 负责解析、类型分析，并直接向 `FlowFactory` 声明 Operation 和输入。Station 划分、执行和恢复由普通 `Flow` 完成。
 
 它不维护第二套执行引擎，也不引入 Table、View、Catalog、后台 runner 或成本优化器。
+
+endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity、build 和 open 复用已解析值；环境引用与凭据不进入持久 Definition。SQL lowering 创建具体 Definition 并直接声明算子图，不维护私有 logical arena、Transform 目录或 Station 融合规则。
 
 ## 一条 SQL 如何运行
 
@@ -12,7 +14,7 @@ SQL 文件
   │
   ├─ syntax：验证一条 INSERT，并提取具体 source / sink
   ├─ plan：用 DataFusion 做名称解析与类型转换，再翻译受支持的 LogicalPlan
-  ├─ assembly：形成 Operation DAG，并按结构规则融合 Station
+  ├─ assembly：声明 endpoint Operation 并注入运行资源
   └─ program：生成身份，创建或恢复持久 Flow
           │
           ▼
@@ -92,7 +94,9 @@ let outcome = flow.advance()?;
 
 ## Program 身份与恢复
 
-SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按 Station ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 完成 bind 后调用 operation-owned typed `create`；路径已存在时，它先比较 owner identity，再 bind 并调用 typed `open`。SQL 不声明算子持久数据，也没有自己的 materialize 层。
+SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按 Station ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 自动划分 Station，并通过统一 checked `construct` 取得类型化状态句柄；路径已存在时，它先比较 owner identity，再直接从持久 Definition 构造运行对象，不重新划分 Station。SQL 不声明算子持久数据，也没有自己的 materialize 层。
+
+SQL identity 使用固定的开发期 v1 域；开发期实现变更直接更新当前 v1 黄金测试，旧状态删除重建，不提供旧版本识别、迁移或兼容分支。
 
 身份覆盖规范化查询、确定性装配 ABI、固定输出容量，以及会改变持久语义的 endpoint 参数。密码、用户名、主机、端口、runtime 位置和环境变量名称不进入身份；因此可以轮换凭据或连接地址，但不能用另一份查询、另一张表或不同的持久参数接管已有状态。SQL 原文、AST、LogicalPlan、凭据和环境引用都不持久化。
 
@@ -231,7 +235,7 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 
 ## 智能装配规则
 
-装配器统计每个 logical node 的直接消费边，再按确定性 postorder 处理。当前 Operation 只有同时满足以下条件时才追加到上游 Station：
+Flow 统一统计每个 Operation 的直接消费边，再按确定性顺序处理；SQL 不实现这套规划规则。当前 Operation 只有同时满足以下条件时才追加到上游 Station：
 
 1. 它是单输入 `AtomicTransform`；
 2. 唯一上游只有这一条消费边，没有分叉；
@@ -251,7 +255,7 @@ Join： [Left Scan]  ─┐
       [Right Scan] ──┘
 ```
 
-消费数按 edge 计算，同一 producer 接到同一个多输入 Operation 的两个端口也算两条。每个实际有输出的 Station 固定使用 64 MiB 持久队列；Scan ID 为 `sql/scan/{index:08x}`，实际新建的 Transform Station 使用稠密 `sql/transform/{index:08x}`，最终 Sink 为 `sql/sink`。
+消费数按 edge 计算，同一 producer 接到同一个多输入 Operation 的两个端口也算两条。每个实际有输出的 Station 固定使用 64 MiB 持久队列；Scan ID 为 `sql/scan/{index:08x}`，每个 logical Transform 使用稠密 `sql/transform/{index:08x}`，Station ID 取其首 Operation ID（因此 Transform Station 编号可以有间隔），最终 Sink 为 `sql/sink`。
 
 ## 源码入口
 
@@ -259,7 +263,7 @@ Join： [Left Scan]  ─┐
 2. [`src/syntax.rs`](src/syntax.rs)：外层 INSERT 和 endpoint Table Function 的语法验证。
 3. [`src/endpoint.rs`](src/endpoint.rs)：具体 endpoint 参数、连接解析、发现和运行资源。
 4. [`src/plan.rs`](src/plan.rs)：`DataFusion` 规划与受支持节点的 lowering。
-5. [`src/assembly.rs`](src/assembly.rs)：私有 logical arena、Station ID 与融合规则。
+5. [`src/assembly.rs`](src/assembly.rs)：endpoint Operation 声明和运行资源注入。
 6. [`src/aggregate.rs`](src/aggregate.rs)：SQL 聚合函数 descriptor 与 lowering。
 
 ## 验证

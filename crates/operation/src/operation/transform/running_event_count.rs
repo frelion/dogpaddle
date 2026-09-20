@@ -33,12 +33,12 @@ pub struct RunningEventCountDefinition {
 ///
 /// This value stores only its persistent count. It never retains its definition
 /// or begins, commits, or stores a transaction.
-pub struct RunningEventCountOperation {
+pub(crate) struct RunningEventCountOperation {
     input_schema: SchemaRef,
     count: Cell<u64>,
 }
 
-/// Running-event-count failure during one [`RunningEventCountOperation`] turn.
+/// Running-event-count failure during one `RunningEventCountOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunningEventCountError {
@@ -108,7 +108,7 @@ impl OperationDefinition for RunningEventCountDefinition {
 impl RunningEventCountOperation {
     /// Creates a running event-count operation from its durable count.
     #[must_use]
-    pub const fn new(input_schema: SchemaRef, count: Cell<u64>) -> Self {
+    const fn new(input_schema: SchemaRef, count: Cell<u64>) -> Self {
         Self {
             input_schema,
             count,

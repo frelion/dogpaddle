@@ -47,7 +47,7 @@ impl Phase {
 /// The initial snapshot is first sealed in a private durable spool. Only then
 /// is it published to the Station output, after which the connector resumes
 /// continuous binlog CDC from the sealed checkpoint.
-pub struct MySqlCdcScanOperation {
+pub(crate) struct MySqlCdcScanOperation {
     spec: MySqlCdcScanSpec,
     output_schema: SchemaRef,
     phase_cell: Cell<u32>,

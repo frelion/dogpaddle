@@ -14,31 +14,24 @@ pub(crate) mod union_all;
 
 pub use aggregate::{
     AggregateCall, AggregateDefinition, AggregateDefinitionError, AggregateError,
-    AggregateOperation, AggregateSchemaError,
+    AggregateSchemaError,
 };
 pub use asof_join::{
     AsOfDirection, AsOfEqualityKey, AsOfEqualityMode, AsOfEquidistantPreference,
-    AsOfJoinDefinition, AsOfJoinDefinitionError, AsOfJoinError, AsOfJoinKind, AsOfJoinOperation,
-    AsOfJoinSchemaError, AsOfOrderKey, AsOfTieBreak, AsOfTieFallback,
+    AsOfJoinDefinition, AsOfJoinDefinitionError, AsOfJoinError, AsOfJoinKind, AsOfJoinSchemaError,
+    AsOfOrderKey, AsOfTieBreak, AsOfTieFallback,
 };
-pub use distinct::{DistinctDefinition, DistinctError, DistinctOperation};
+pub use distinct::{DistinctDefinition, DistinctError};
 pub use equi_join::{
-    EquiJoinDefinition, EquiJoinDefinitionError, EquiJoinError, EquiJoinKind, EquiJoinOperation,
-    EquiJoinSchemaError,
+    EquiJoinDefinition, EquiJoinDefinitionError, EquiJoinError, EquiJoinKind, EquiJoinSchemaError,
 };
-pub use extend::{
-    ExtendDefinition, ExtendDefinitionError, ExtendError, ExtendOperation, ExtendSchemaError,
-};
-pub use filter::{FilterDefinition, FilterError, FilterOperation, FilterSchemaError};
-pub use project::{ProjectDefinition, ProjectError, ProjectOperation, ProjectSchemaError};
-pub use running_event_count::{
-    RunningEventCountDefinition, RunningEventCountError, RunningEventCountOperation,
-};
+pub use extend::{ExtendDefinition, ExtendDefinitionError, ExtendError, ExtendSchemaError};
+pub use filter::{FilterDefinition, FilterError, FilterSchemaError};
+pub use project::{ProjectDefinition, ProjectError, ProjectSchemaError};
+pub use running_event_count::{RunningEventCountDefinition, RunningEventCountError};
 pub use schema_align::{
     SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignError, SchemaAlignField,
-    SchemaAlignFieldError, SchemaAlignOperation, SchemaAlignSchemaError,
+    SchemaAlignFieldError, SchemaAlignSchemaError,
 };
-pub use select::{
-    SelectDefinition, SelectDefinitionError, SelectError, SelectOperation, SelectSchemaError,
-};
-pub use union_all::{UnionAllDefinition, UnionAllError, UnionAllOperation, UnionAllSchemaError};
+pub use select::{SelectDefinition, SelectDefinitionError, SelectError, SelectSchemaError};
+pub use union_all::{UnionAllDefinition, UnionAllError, UnionAllSchemaError};

@@ -30,7 +30,7 @@ pub(crate) struct InputPort {
 }
 
 /// A Station's complete input-delivery state.
-pub(super) struct Inbox {
+pub(crate) struct Inbox {
     active: Option<Cell<u32>>,
     ports: Vec<InputPort>,
     claim: Option<Claim>,
@@ -59,7 +59,7 @@ impl Claim {
 }
 
 impl Inbox {
-    pub(super) const fn new(active: Option<Cell<u32>>, ports: Vec<InputPort>) -> Self {
+    pub(crate) const fn new(active: Option<Cell<u32>>, ports: Vec<InputPort>) -> Self {
         Self {
             active,
             ports,
@@ -231,7 +231,7 @@ impl InputPort {
 }
 
 impl Output {
-    pub(super) const fn new(
+    pub(crate) const fn new(
         writer: SubscribedLogWriter<Vec<u8>>,
         capacity_bytes: NonZeroU64,
         schema: SchemaRef,

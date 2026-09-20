@@ -95,18 +95,18 @@ fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
 
 fn build_two_input_union(path: &Path) {
     let mut builder = FlowFactory::new(path);
-    let left = builder.station("left", SequenceScanDefinition::new(0));
-    let right = builder.station("right", SequenceScanDefinition::new(0));
-    let union = builder.station(
+    let left = builder.operation("left", Box::new(SequenceScanDefinition::new(0)), []);
+    let right = builder.operation("right", Box::new(SequenceScanDefinition::new(0)), []);
+    let union = builder.operation(
         "union",
-        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        [left, right],
     );
-    let sink = builder.station("sink", DiscardDefinition::new());
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [union]);
     for station in [left, right, union] {
-        builder.output_capacity_bytes(station, NonZeroU64::MAX);
+        builder.materialize(station, NonZeroU64::MAX);
     }
-    builder.connect([left, right], union);
-    builder.connect([union], sink);
+
     drop(builder.build().unwrap());
 }
 
@@ -144,10 +144,10 @@ fn count_change(value: u64) -> Change {
 
 fn publish_pending_input(path: &Path, encoded: &[u8]) {
     let mut builder = FlowFactory::new(path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(u64::MAX));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, NonZeroU64::MAX);
-    builder.connect([scan], sink);
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, NonZeroU64::MAX);
+
     drop(builder.build().unwrap());
 
     let store = Store::open(path).unwrap();

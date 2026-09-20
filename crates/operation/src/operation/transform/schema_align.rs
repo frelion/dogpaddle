@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
+use datafusion_common::DFSchema;
 use dogpaddle_change::{Change, ChangeError};
 use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
@@ -12,7 +12,7 @@ use crate::{
     RuntimeResource,
     codec::PayloadCursor,
     definition::{Sealed as SealedDefinition, schema_error},
-    expression::{BoundExpression, StoredExpression},
+    expression::{BoundProjection, ProjectionError, StoredExpression},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -50,10 +50,8 @@ pub struct SchemaAlignDefinition {
 /// This value owns only its exact input Schema, compiled expressions, and
 /// exact output Schema. It owns no persistent Store data and retains no
 /// Definition.
-pub struct SchemaAlignOperation {
-    input_schema: SchemaRef,
-    expressions: Box<[BoundExpression]>,
-    output_schema: SchemaRef,
+pub(crate) struct SchemaAlignOperation {
+    projection: BoundProjection,
 }
 
 /// Failure while constructing one [`SchemaAlignField`].
@@ -128,7 +126,7 @@ pub enum SchemaAlignSchemaError {
     },
 }
 
-/// SchemaAlign-specific failure during one [`SchemaAlignOperation`] turn.
+/// SchemaAlign-specific failure during one `SchemaAlignOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SchemaAlignError {
@@ -307,12 +305,15 @@ impl SchemaAlignDefinition {
         &self,
         input_schema: &SchemaRef,
     ) -> Result<(SchemaRef, SchemaAlignOperation), SchemaAlignSchemaError> {
+        let datafusion_schema = DFSchema::try_from(Arc::clone(input_schema))
+            .map_err(ExpressionBindError::from)
+            .map_err(|source| SchemaAlignSchemaError::Expression { field: 0, source })?;
         let mut expressions = Vec::with_capacity(self.fields.len());
         let mut output_fields = Vec::with_capacity(self.fields.len());
         for (field, target) in self.fields.iter().enumerate() {
             let expression = target
                 .expression
-                .bind(Arc::clone(input_schema))
+                .bind_with_dfschema(&datafusion_schema)
                 .map_err(|source| SchemaAlignSchemaError::Expression { field, source })?;
             if expression.output_nullable() && !target.nullable {
                 return Err(SchemaAlignSchemaError::NullabilityNarrowing { field });
@@ -342,9 +343,11 @@ impl SchemaAlignDefinition {
                 .collect(),
         ));
         let operation = SchemaAlignOperation {
-            input_schema: Arc::clone(input_schema),
-            expressions: expressions.into_boxed_slice(),
-            output_schema: Arc::clone(&output_schema),
+            projection: BoundProjection::new(
+                Arc::clone(input_schema),
+                expressions,
+                Arc::clone(&output_schema),
+            ),
         };
         Ok((output_schema, operation))
     }
@@ -413,28 +416,20 @@ impl AtomicOperation for SchemaAlignOperation {
         if input.port != 0 {
             return Err(SchemaAlignError::InvalidInputPort { port: input.port }.into());
         }
-        let input = input.change;
-        if input.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(SchemaAlignError::InputSchemaMismatch.into());
-        }
-
-        let columns = self
-            .expressions
-            .iter()
-            .enumerate()
-            .map(|(field, expression)| {
-                expression
-                    .evaluate(input.records())
-                    .map_err(|source| SchemaAlignError::Expression { field, source })
+        self.projection
+            .evaluate(input.change)
+            .map(Some)
+            .map_err(|error| {
+                let error = match error {
+                    ProjectionError::SchemaMismatch => SchemaAlignError::InputSchemaMismatch,
+                    ProjectionError::Expression { field, source } => {
+                        SchemaAlignError::Expression { field, source }
+                    }
+                    ProjectionError::Arrow(source) => SchemaAlignError::Arrow(source),
+                    ProjectionError::Change(source) => SchemaAlignError::Change(source),
+                };
+                error.into()
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(input.num_rows()));
-        let records =
-            RecordBatch::try_new_with_options(Arc::clone(&self.output_schema), columns, &options)
-                .map_err(SchemaAlignError::Arrow)?;
-        let output =
-            Change::try_new(records, input.diffs().clone()).map_err(SchemaAlignError::Change)?;
-        Ok(Some(output))
     }
 }
 

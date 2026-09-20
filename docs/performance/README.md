@@ -8,3 +8,6 @@ There is no cross-target result schema or migration format. Compare only runs fr
 workload profile and reference environment. Target ownership and commands are defined in [`TESTING.md`](../../TESTING.md).
 
 The [2026-08-27 pre-reset report](./2026-08-27-pre-reset-reference.md) is retained only as a design-history record.
+
+The [2026-09-20 architecture smoke comparison](./2026-09-20-architecture-smoke.md) records local
+diagnostic results and their limitations; it does not establish a reference baseline.

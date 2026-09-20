@@ -2,13 +2,12 @@ use dogpaddle_operation::operation::{AtomicOperation, Operation};
 
 /// The executable linear Operation sequence inside one Station.
 pub(crate) struct StationProgram {
-    input_count: usize,
     head: Operation,
     tail: Vec<Box<dyn AtomicOperation>>,
 }
 
 impl StationProgram {
-    pub(crate) fn new(input_count: usize, operations: Vec<Operation>) -> Self {
+    pub(crate) fn new(operations: Vec<Operation>) -> Self {
         let mut operations = operations.into_iter();
         let head = operations
             .next()
@@ -21,15 +20,7 @@ impl StationProgram {
                 }
             })
             .collect();
-        Self {
-            input_count,
-            head,
-            tail,
-        }
-    }
-
-    pub(crate) const fn input_count(&self) -> usize {
-        self.input_count
+        Self { head, tail }
     }
 
     pub(crate) fn operations_mut(&mut self) -> (&mut Operation, &mut [Box<dyn AtomicOperation>]) {

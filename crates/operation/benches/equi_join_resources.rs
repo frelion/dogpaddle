@@ -12,7 +12,7 @@ use std::{
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion_expr::col;
+use datafusion_expr::{col, lit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
@@ -55,6 +55,7 @@ enum Scenario {
     WholeClaim {
         rows: usize,
         payload_bytes: usize,
+        key_count: usize,
     },
 }
 
@@ -181,12 +182,18 @@ impl CaseSpec {
         }
     }
 
-    const fn whole_claim(name: &'static str, rows: usize, payload_bytes: usize) -> Self {
+    const fn whole_claim(
+        name: &'static str,
+        rows: usize,
+        payload_bytes: usize,
+        key_count: usize,
+    ) -> Self {
         Self {
             name,
             scenario: Scenario::WholeClaim {
                 rows,
                 payload_bytes,
+                key_count,
             },
         }
     }
@@ -212,11 +219,13 @@ impl CaseSpec {
             Scenario::WholeClaim {
                 rows,
                 payload_bytes,
+                key_count,
             } => json!({
                 "name": self.name,
                 "scenario": "whole_claim",
                 "join_kind": "Inner",
                 "claim_rows": rows,
+                "computed_key_count": key_count,
                 "claim_payload_bytes_per_row": payload_bytes,
                 "distinct_candidates": 0,
                 "qualifying_candidates": 0,
@@ -228,7 +237,7 @@ impl CaseSpec {
 }
 
 impl Fixture {
-    fn new(path: &Path, kind: EquiJoinKind, schema: &SchemaRef) -> Self {
+    fn new(path: &Path, kind: EquiJoinKind, schema: &SchemaRef, key_count: usize) -> Self {
         let output_names: &[&str] = match kind {
             EquiJoinKind::LeftSemi | EquiJoinKind::LeftAnti => {
                 &["left_key", "left_value", "left_payload"]
@@ -244,7 +253,14 @@ impl Fixture {
         };
         let definition = EquiJoinDefinition::try_new(
             kind,
-            [(col("key"), col("key"))],
+            (0..key_count).map(|index| {
+                let key = if key_count == 1 {
+                    col("key")
+                } else {
+                    col("key") + lit(u64::try_from(index).unwrap())
+                };
+                (key.clone(), key)
+            }),
             output_names.iter().copied(),
             Some(col("left.value").lt(col("right.value"))),
         )
@@ -453,7 +469,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
             ..
         } => {
             assert!(qualifying <= candidates);
-            let mut fixture = Fixture::new(path, kind, &schema);
+            let mut fixture = Fixture::new(path, kind, &schema, 1);
             let seed = change(
                 &schema,
                 repeated_key(candidates),
@@ -482,8 +498,9 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
         Scenario::WholeClaim {
             rows,
             payload_bytes,
+            key_count,
         } => {
-            let fixture = Fixture::new(path, EquiJoinKind::Inner, &schema);
+            let fixture = Fixture::new(path, EquiJoinKind::Inner, &schema, key_count);
             let input = change(
                 &schema,
                 unique_keys(rows),
@@ -564,7 +581,7 @@ fn measure_persistent_state(spec: CaseSpec, path: &Path) -> PersistentStateMeasu
         panic!("persistent-state measurement requires its FullOuter case")
     };
     let schema = schema();
-    let mut fixture = Fixture::new(path, EquiJoinKind::FullOuter, &schema);
+    let mut fixture = Fixture::new(path, EquiJoinKind::FullOuter, &schema, 1);
     let seed = change(
         &schema,
         repeated_key(candidates),
@@ -659,7 +676,8 @@ fn test_cases() -> Vec<CaseSpec> {
             false,
         ),
         CaseSpec::fanout("page_boundary", EquiJoinKind::Inner, 257, 0, 129, false),
-        CaseSpec::whole_claim("whole_claim", 33, 256),
+        CaseSpec::whole_claim("whole_claim", 33, 256, 1),
+        CaseSpec::whole_claim("computed_keys", 33, 0, 32),
         CaseSpec::fanout(
             "full_outer_state",
             EquiJoinKind::FullOuter,
@@ -743,7 +761,8 @@ fn benchmark_cases(profile: PerformanceProfile) -> Vec<CaseSpec> {
             large_fanout / 2,
             false,
         ),
-        CaseSpec::whole_claim("whole_claim", claim_rows, claim_payload),
+        CaseSpec::whole_claim("whole_claim", claim_rows, claim_payload, 1),
+        CaseSpec::whole_claim("computed_keys", claim_rows, 0, 32),
         CaseSpec::fanout(
             "full_outer_state",
             EquiJoinKind::FullOuter,

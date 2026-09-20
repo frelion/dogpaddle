@@ -17,7 +17,7 @@ mod tests;
 
 pub use definition::{AggregateCall, AggregateDefinition};
 pub(crate) use definition::{AggregateLayout, TAG, decode_definition};
-pub use runtime::AggregateOperation;
+pub(crate) use runtime::AggregateOperation;
 
 use crate::{OperationSetupError, definition::data, operation::Operation};
 
@@ -113,7 +113,7 @@ pub enum AggregateSchemaError {
     },
 }
 
-/// Failure during one [`AggregateOperation`] turn.
+/// Failure during one `AggregateOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AggregateError {

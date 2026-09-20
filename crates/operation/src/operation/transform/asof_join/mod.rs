@@ -17,7 +17,7 @@ mod state;
 
 pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey, AsOfTieBreak};
 pub(crate) use definition::{AsOfJoinLayout, TAG, decode_definition};
-pub use runtime::AsOfJoinOperation;
+pub(crate) use runtime::AsOfJoinOperation;
 
 use crate::{OperationSetupError, definition::data, operation::Operation};
 
@@ -342,7 +342,7 @@ pub enum AsOfJoinSchemaError {
     NullPadding(#[source] DataFusionError),
 }
 
-/// Failure during one [`AsOfJoinOperation`] turn.
+/// Failure during one `AsOfJoinOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AsOfJoinError {

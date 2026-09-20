@@ -1,6 +1,6 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
-use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError, TopologyError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
 use dogpaddle_operation::{
     col, lit,
     operation::{
@@ -26,43 +26,43 @@ fn five_atomic_transforms_run_in_one_station_across_reopen() {
     let start = u64::MAX - 2;
 
     let mut factory = FlowFactory::new(&flow_path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(start));
-    factory.append(scan, ProjectDefinition::new([0])).unwrap();
-    factory
-        .append(
-            scan,
-            ExtendDefinition::try_new("offset", col("value") - lit(start)).unwrap(),
-        )
-        .unwrap();
-    factory
-        .append(
-            scan,
-            FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap(),
-        )
-        .unwrap();
-    factory
-        .append(
-            scan,
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(start)), []);
+    let scan = factory.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = factory.operation(
+        "scan/tail-2",
+        Box::new(ExtendDefinition::try_new("offset", col("value") - lit(start)).unwrap()),
+        [scan],
+    );
+    let scan = factory.operation(
+        "scan/tail-3",
+        Box::new(FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap()),
+        [scan],
+    );
+    let scan = factory.operation(
+        "scan/tail-4",
+        Box::new(
             SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
                 .unwrap(),
-        )
-        .unwrap();
-    factory
-        .append(
-            scan,
+        ),
+        [scan],
+    );
+    let scan = factory.operation(
+        "scan/tail-5",
+        Box::new(
             SchemaAlignDefinition::try_new([
                 SchemaAlignField::try_new("scan_value", col("scan_value"), false).unwrap(),
                 SchemaAlignField::try_new("offset", col("offset"), false).unwrap(),
             ])
             .unwrap(),
-        )
-        .unwrap();
-    let sink = factory.station(
-        "sqlite",
-        SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap(),
+        ),
+        [scan],
     );
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.connect([scan], sink);
+    factory.operation(
+        "sqlite",
+        Box::new(SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap()),
+        [scan],
+    );
+    factory.materialize(scan, CAPACITY);
 
     let mut flow = factory.build().unwrap();
     assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["scan", "sqlite"]);
@@ -114,19 +114,23 @@ fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let compute = factory.station("compute", SequenceScanDefinition::new(u64::MAX - 1));
-    factory
-        .append(
-            compute,
-            FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
-        )
-        .unwrap();
-    factory
-        .append(compute, RunningEventCountDefinition::new())
-        .unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(compute, CAPACITY);
-    factory.connect([compute], sink);
+    let compute = factory.operation(
+        "compute",
+        Box::new(SequenceScanDefinition::new(u64::MAX - 1)),
+        [],
+    );
+    let compute = factory.operation(
+        "compute/tail-1",
+        Box::new(FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap()),
+        [compute],
+    );
+    let compute = factory.operation(
+        "compute/tail-2",
+        Box::new(RunningEventCountDefinition::new()),
+        [compute],
+    );
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [compute]);
+    factory.materialize(compute, CAPACITY);
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
@@ -165,16 +169,24 @@ fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("rollback");
     let mut factory = FlowFactory::new(&path);
-    let compute = factory.station("compute", SequenceScanDefinition::new(u64::MAX));
-    factory
-        .append(compute, RunningEventCountDefinition::new())
-        .unwrap();
-    factory
-        .append(compute, RunningEventCountDefinition::new())
-        .unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(compute, CAPACITY);
-    factory.connect([compute], sink);
+    let compute = factory.operation(
+        "compute",
+        Box::new(SequenceScanDefinition::new(u64::MAX)),
+        [],
+    );
+    let compute = factory.operation(
+        "compute/tail-1",
+        Box::new(RunningEventCountDefinition::new()),
+        [compute],
+    );
+    let compute = factory.operation(
+        "compute/tail-2",
+        Box::new(RunningEventCountDefinition::new()),
+        [compute],
+    );
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [compute]);
+    factory.materialize(compute, CAPACITY);
+
     drop(factory.build().unwrap());
 
     let store = Store::open(&path).unwrap();
@@ -232,24 +244,26 @@ fn a_multi_input_head_preserves_ports_before_its_atomic_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let left = factory.station("left", SequenceScanDefinition::new(u64::MAX - 1));
-    let right = factory.station("right", SequenceScanDefinition::new(u64::MAX));
-    let union = factory.station(
-        "union",
-        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+    let left = factory.operation(
+        "left",
+        Box::new(SequenceScanDefinition::new(u64::MAX - 1)),
+        [],
     );
-    factory
-        .append(
-            union,
-            FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
-        )
-        .unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
+    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let union = factory.operation(
+        "union",
+        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        [left, right],
+    );
+    let union = factory.operation(
+        "union/tail-1",
+        Box::new(FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap()),
+        [union],
+    );
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [union]);
     for station in [left, right, union] {
-        factory.output_capacity_bytes(station, CAPACITY);
+        factory.materialize(station, CAPACITY);
     }
-    factory.connect([left, right], union);
-    factory.connect([union], sink);
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
@@ -296,12 +310,11 @@ fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(0));
-    factory.append(scan, ProjectDefinition::new([0])).unwrap();
-    factory.append(scan, ProjectDefinition::new([1])).unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(scan, CAPACITY);
-    factory.connect([scan], sink);
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let scan = factory.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = factory.operation("scan/tail-2", Box::new(ProjectDefinition::new([1])), [scan]);
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    factory.materialize(scan, CAPACITY);
 
     let Err(FlowError::Schema(FlowSchemaError::Operation {
         station_id,
@@ -316,38 +329,12 @@ fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
 }
 
 #[test]
-fn append_rejects_non_atomic_operations_without_mutating_the_station() {
-    let mut factory = FlowFactory::new("");
-    let scan = factory.station("scan", SequenceScanDefinition::new(0));
-    assert_eq!(
-        factory
-            .append(scan, SequenceScanDefinition::new(1))
-            .err()
-            .unwrap(),
-        TopologyError::InvalidAppendedOperation {
-            station: "scan".to_owned(),
-            operation: 1,
-        }
-    );
-    factory.append(scan, ProjectDefinition::new([0])).unwrap();
-
-    let sink = factory.station("sink", DiscardDefinition::new());
-    assert_eq!(
-        factory
-            .append(sink, ProjectDefinition::new([0]))
-            .err()
-            .unwrap(),
-        TopologyError::StationCannotBeExtended("sink".to_owned())
-    );
-}
-
-#[test]
-fn turn_transform_can_head_an_atomic_tail_but_cannot_be_appended() {
+fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let left = factory.station("left", SequenceScanDefinition::new(0));
-    let right = factory.station("right", SequenceScanDefinition::new(0));
+    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(0)), []);
+    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(0)), []);
     let join_definition = || {
         EquiJoinDefinition::try_new(
             EquiJoinKind::Inner,
@@ -358,24 +345,16 @@ fn turn_transform_can_head_an_atomic_tail_but_cannot_be_appended() {
         .unwrap()
     };
 
-    assert_eq!(
-        factory.append(left, join_definition()).err().unwrap(),
-        TopologyError::InvalidAppendedOperation {
-            station: "left".to_owned(),
-            operation: 1,
-        }
+    let join = factory.operation("join", Box::new(join_definition()), [left, right]);
+    let join = factory.operation(
+        "join/tail-2",
+        Box::new(RunningEventCountDefinition::new()),
+        [join],
     );
-
-    let join = factory.station("join", join_definition());
-    factory
-        .append(join, RunningEventCountDefinition::new())
-        .unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [join]);
     for station in [left, right, join] {
-        factory.output_capacity_bytes(station, CAPACITY);
+        factory.materialize(station, CAPACITY);
     }
-    factory.connect([left, right], join);
-    factory.connect([join], sink);
 
     let mut flow = factory.build().unwrap();
     assert_eq!(

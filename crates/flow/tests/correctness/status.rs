@@ -12,16 +12,24 @@ fn status_observes_backpressure_without_advancing_and_preserves_durable_counters
     let path = root.path().join("flow");
     let sqlite = root.path().join("sink.sqlite");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX - 3));
-    let count = factory.station("count", RunningEventCountDefinition::new());
-    let sink = factory.station(
-        "sink",
-        SqliteSinkDefinition::try_new(&sqlite, "events").unwrap(),
+    let scan = factory.operation(
+        "scan",
+        Box::new(SequenceScanDefinition::new(u64::MAX - 3)),
+        [],
     );
-    factory.connect([scan], count);
-    factory.connect([count], sink);
+    let count = factory.operation(
+        "count",
+        Box::new(RunningEventCountDefinition::new()),
+        [scan],
+    );
+    factory.operation(
+        "sink",
+        Box::new(SqliteSinkDefinition::try_new(&sqlite, "events").unwrap()),
+        [count],
+    );
+
     for station in [scan, count] {
-        factory.output_capacity_bytes(station, NonZeroU64::MIN);
+        factory.materialize(station, NonZeroU64::MIN);
     }
     let mut flow = factory.build().unwrap();
     let initial = flow.status().unwrap();

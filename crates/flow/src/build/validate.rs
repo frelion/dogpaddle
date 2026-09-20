@@ -1,11 +1,11 @@
 use std::{collections::HashSet, num::NonZeroU64};
 
-use dogpaddle_operation::{OperationDefinition, OperationKind};
+use dogpaddle_operation::OperationKind;
 use thiserror::Error;
 
 use super::{
-    StationRef,
-    definition::{FlowDefinition, InputDefinition, StationDefinition},
+    DeclaredOperation, OperationRef,
+    definition::{FlowDefinition, StationDefinition},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,15 +35,10 @@ pub enum TopologyError {
     /// Two stations declared the same stable ID.
     #[error("duplicate station ID {0:?}")]
     DuplicateStationId(String),
-    /// A connection used a reference created by another factory.
-    #[error("station reference belongs to another flow factory")]
-    ForeignStationRef(StationRef),
-    /// `connect` was called without any inputs.
-    #[error("station {0:?} was connected with an empty input list")]
-    EmptyInputs(String),
-    /// A Station's complete input list was declared more than once.
-    #[error("inputs for station {0:?} were already set")]
-    InputsAlreadySet(String),
+    /// An input or materialization does not reference an earlier declaration
+    /// in the same factory.
+    #[error("operation reference is not valid in this flow factory")]
+    ForeignOperationRef(OperationRef),
     /// A station directly references itself.
     #[error("station {0:?} directly references itself")]
     SelfLoop(String),
@@ -102,58 +97,89 @@ pub enum TopologyError {
 pub(super) fn finish_definition(
     owner_identity: Option<[u8; 32]>,
     token: u64,
-    mut stations: Vec<StationDefinition>,
-    connections: &[(Vec<StationRef>, StationRef)],
-    output_capacities: &[(StationRef, NonZeroU64)],
+    operations: Vec<DeclaredOperation>,
+    default_capacity: NonZeroU64,
+    materializations: &[(OperationRef, NonZeroU64)],
 ) -> Result<FlowDefinition, TopologyError> {
-    validate_station_ids(&stations)?;
-    validate_station_programs(&stations)?;
-    let mut inputs_by_station = validate_connections(token, &stations, connections)?;
-    validate_topology(&stations, &inputs_by_station)?;
-    apply_output_capacities(token, &mut stations, output_capacities)?;
-
-    let station_ids = stations
-        .iter()
-        .map(|station| station.id.clone())
-        .collect::<Vec<_>>();
-    for (index, station) in stations.iter_mut().enumerate() {
-        station.inputs = inputs_by_station[index]
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|input| InputDefinition::new(station_ids[input].clone()))
-            .collect();
+    validate_ids(operations.iter().map(|operation| operation.id.as_str()))?;
+    let mut consumers = vec![0_usize; operations.len()];
+    for (index, operation) in operations.iter().enumerate() {
+        let expected = usize::try_from(operation.definition.kind().input_count())
+            .expect("Operation arity fits usize");
+        if operation.inputs.len() != expected {
+            return Err(TopologyError::InputCount {
+                station: operation.id.clone(),
+                expected,
+                actual: operation.inputs.len(),
+            });
+        }
+        for input in &operation.inputs {
+            let input = resolve_ref(token, index, *input)?;
+            if !operations[input].definition.kind().has_output() {
+                return Err(TopologyError::InputHasNoOutput {
+                    input_station: operations[input].id.clone(),
+                    station: operation.id.clone(),
+                });
+            }
+            consumers[input] += 1;
+        }
+    }
+    let mut capacities = vec![None; operations.len()];
+    for (reference, capacity) in materializations {
+        let index = resolve_ref(token, operations.len(), *reference)?;
+        if !operations[index].definition.kind().has_output() {
+            return Err(TopologyError::UnexpectedOutputCapacity(
+                operations[index].id.clone(),
+            ));
+        }
+        if capacities[index].replace(*capacity).is_some() {
+            return Err(TopologyError::OutputCapacityAlreadySet(
+                operations[index].id.clone(),
+            ));
+        }
     }
 
-    Ok(FlowDefinition::new(owner_identity, stations))
-}
-
-pub(super) fn append_operation(
-    token: u64,
-    stations: &mut [StationDefinition],
-    reference: StationRef,
-    definition: Box<dyn OperationDefinition>,
-) -> Result<(), TopologyError> {
-    let station = resolve_ref(token, stations.len(), reference)?;
-    let station_id = stations[station].id.clone();
-    let last = stations[station]
-        .operations
-        .last()
-        .expect("a declared Station starts with one Operation");
-    if !last.kind().allows_atomic_tail() {
-        return Err(TopologyError::StationCannotBeExtended(station_id));
-    }
-    if !matches!(
-        definition.kind(),
-        OperationKind::AtomicTransform(count) if count.get() == 1
-    ) {
-        return Err(TopologyError::InvalidAppendedOperation {
-            station: station_id,
-            operation: stations[station].operations.len(),
+    let mut stations: Vec<StationDefinition> = Vec::new();
+    let mut station_by_operation: Vec<usize> = Vec::with_capacity(operations.len());
+    for operation in operations {
+        let is_atomic = matches!(
+            operation.definition.kind(),
+            OperationKind::AtomicTransform(count) if count.get() == 1
+        );
+        let fused_station = operation.inputs.first().and_then(|input| {
+            let station = station_by_operation[input.index];
+            let last = stations[station]
+                .operations
+                .last()
+                .expect("nonempty program");
+            // A sole consumer guarantees this input is still its Station's tail.
+            (is_atomic
+                && consumers[input.index] == 1
+                && capacities[input.index].is_none()
+                && last.kind().allows_atomic_tail())
+            .then_some(station)
         });
+        let capacity = capacities[station_by_operation.len()].unwrap_or(default_capacity);
+        let station = if let Some(station) = fused_station {
+            stations[station].operations.push(operation.definition);
+            stations[station].output_capacity_bytes = Some(capacity);
+            station
+        } else {
+            let mut station = StationDefinition::new(operation.id, operation.definition);
+            station.inputs = operation
+                .inputs
+                .iter()
+                .map(|input| stations[station_by_operation[input.index]].id.clone())
+                .collect();
+            station.output_capacity_bytes = station.has_output().then_some(capacity);
+            stations.push(station);
+            stations.len() - 1
+        };
+        station_by_operation.push(station);
     }
-    stations[station].operations.push(definition);
-    Ok(())
+    // The canonical decoder owns durable graph validation and scheduling. The
+    // declaration order already guarantees that the input graph is acyclic.
+    Ok(FlowDefinition::new(owner_identity, stations))
 }
 
 fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), TopologyError> {
@@ -195,27 +221,6 @@ pub(super) fn validate_decoded_topology(
     let schedule = validate_topology(stations, inputs_by_station)?;
     validate_output_capacities(stations)?;
     Ok(schedule)
-}
-
-fn apply_output_capacities(
-    token: u64,
-    stations: &mut [StationDefinition],
-    declarations: &[(StationRef, NonZeroU64)],
-) -> Result<(), TopologyError> {
-    let mut capacities = vec![None; stations.len()];
-    for (reference, capacity) in declarations {
-        let index = resolve_ref(token, stations.len(), *reference)?;
-        if capacities[index].replace(*capacity).is_some() {
-            return Err(TopologyError::OutputCapacityAlreadySet(
-                stations[index].id.clone(),
-            ));
-        }
-    }
-
-    for (station, capacity) in stations.iter_mut().zip(capacities) {
-        station.output_capacity_bytes = capacity;
-    }
-    validate_output_capacities(stations)
 }
 
 fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), TopologyError> {
@@ -301,68 +306,42 @@ fn validate_input_counts(
 }
 
 pub(super) fn validate_station_ids(stations: &[StationDefinition]) -> Result<(), TopologyError> {
-    if stations.is_empty() {
-        return Err(TopologyError::EmptyTopology);
-    }
+    validate_ids(stations.iter().map(|station| station.id.as_str()))
+}
 
-    let mut seen = HashSet::with_capacity(stations.len());
-    for station in stations {
-        let reason = if station.id.is_empty() {
+fn validate_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<(), TopologyError> {
+    let mut seen = HashSet::new();
+    for id in ids {
+        let reason = if id.is_empty() {
             Some(InvalidStationIdReason::Empty)
-        } else if station.id.as_bytes().contains(&0) {
+        } else if id.as_bytes().contains(&0) {
             Some(InvalidStationIdReason::ContainsNul)
         } else {
             None
         };
         if let Some(reason) = reason {
             return Err(TopologyError::InvalidStationId {
-                id: station.id.clone(),
+                id: id.to_owned(),
                 reason,
             });
         }
-        if !seen.insert(station.id.as_str()) {
-            return Err(TopologyError::DuplicateStationId(station.id.clone()));
+        if !seen.insert(id) {
+            return Err(TopologyError::DuplicateStationId(id.to_owned()));
         }
+    }
+    if seen.is_empty() {
+        return Err(TopologyError::EmptyTopology);
     }
     Ok(())
-}
-
-pub(super) fn validate_connections(
-    token: u64,
-    stations: &[StationDefinition],
-    connections: &[(Vec<StationRef>, StationRef)],
-) -> Result<Vec<Option<Vec<usize>>>, TopologyError> {
-    let mut inputs_by_station = vec![None; stations.len()];
-    for (inputs, station) in connections {
-        let station = resolve_ref(token, stations.len(), *station)?;
-        if inputs.is_empty() {
-            return Err(TopologyError::EmptyInputs(stations[station].id.clone()));
-        }
-        if inputs_by_station[station].is_some() {
-            return Err(TopologyError::InputsAlreadySet(
-                stations[station].id.clone(),
-            ));
-        }
-
-        let inputs = inputs
-            .iter()
-            .map(|input| resolve_ref(token, stations.len(), *input))
-            .collect::<Result<Vec<_>, _>>()?;
-        if inputs.contains(&station) {
-            return Err(TopologyError::SelfLoop(stations[station].id.clone()));
-        }
-        inputs_by_station[station] = Some(inputs);
-    }
-    Ok(inputs_by_station)
 }
 
 fn resolve_ref(
     token: u64,
     station_count: usize,
-    reference: StationRef,
+    reference: OperationRef,
 ) -> Result<usize, TopologyError> {
     if reference.factory_token != token || reference.index >= station_count {
-        Err(TopologyError::ForeignStationRef(reference))
+        Err(TopologyError::ForeignOperationRef(reference))
     } else {
         Ok(reference.index)
     }

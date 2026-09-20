@@ -19,7 +19,8 @@ use dogpaddle_store::{
 
 use crate::flow::AdvanceOutcome;
 
-use super::super::{Output, Station, StationParts, protocol::StationError};
+use super::super::{Output, Station, protocol::StationError};
+use crate::assembly::StationParts;
 
 pub(super) type State = Cell<Vec<u8>>;
 

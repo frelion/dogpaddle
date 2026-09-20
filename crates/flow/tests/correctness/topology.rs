@@ -1,6 +1,6 @@
 use std::{num::NonZeroU64, path::Path};
 
-use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, StationRef, TopologyError};
+use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, OperationRef, TopologyError};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
@@ -15,14 +15,11 @@ enum InvalidCase {
     NulId,
     NonScanRoot,
     ScanTerminal,
-    MissingCapacity,
     UnexpectedCapacity,
     DuplicateCapacity,
     ForeignCapacity,
     SinkFeedsStation,
     ForeignConnection,
-    EmptyInputs,
-    InputsTwice,
 }
 
 #[test]
@@ -34,14 +31,11 @@ fn every_topology_rejection_is_precise_and_has_no_store_side_effect() {
         InvalidCase::NulId,
         InvalidCase::NonScanRoot,
         InvalidCase::ScanTerminal,
-        InvalidCase::MissingCapacity,
         InvalidCase::UnexpectedCapacity,
         InvalidCase::DuplicateCapacity,
         InvalidCase::ForeignCapacity,
         InvalidCase::SinkFeedsStation,
         InvalidCase::ForeignConnection,
-        InvalidCase::EmptyInputs,
-        InvalidCase::InputsTwice,
     ] {
         let path = root.path().join(format!("{case:?}"));
         let (builder, expected) = invalid_topology(case, &path, root.path());
@@ -58,60 +52,68 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
     let expected = match case {
         InvalidCase::Empty => TopologyError::EmptyTopology,
         InvalidCase::EmptyId => {
-            builder.station("", SequenceScanDefinition::new(0));
+            builder.operation("", Box::new(SequenceScanDefinition::new(0)), []);
             TopologyError::InvalidStationId {
                 id: String::new(),
                 reason: InvalidStationIdReason::Empty,
             }
         }
         InvalidCase::NulId => {
-            builder.station("contains\0nul", SequenceScanDefinition::new(0));
+            builder.operation(
+                "contains\0nul",
+                Box::new(SequenceScanDefinition::new(0)),
+                [],
+            );
             TopologyError::InvalidStationId {
                 id: "contains\0nul".to_owned(),
                 reason: InvalidStationIdReason::ContainsNul,
             }
         }
         InvalidCase::NonScanRoot => {
-            let count = builder.station("count", RunningEventCountDefinition::new());
-            let sink = builder.station("sink", DiscardDefinition::new());
-            builder.connect([count], sink);
-            TopologyError::RootIsNotScan("count".to_owned())
+            let count =
+                builder.operation("count", Box::new(RunningEventCountDefinition::new()), []);
+            builder.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+
+            TopologyError::InputCount {
+                station: "count".to_owned(),
+                expected: 1,
+                actual: 0,
+            }
         }
         InvalidCase::ScanTerminal => {
-            builder.station("scan", SequenceScanDefinition::new(0));
+            builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
             TopologyError::TerminalIsNotSink("scan".to_owned())
         }
-        InvalidCase::MissingCapacity => {
-            scan_sink(&mut builder);
-            TopologyError::MissingOutputCapacity("scan".to_owned())
-        }
+
         InvalidCase::UnexpectedCapacity => {
             let (scan, sink) = scan_sink(&mut builder);
-            builder.output_capacity_bytes(scan, CAPACITY);
-            builder.output_capacity_bytes(sink, CAPACITY);
+            builder.materialize(scan, CAPACITY);
+            builder.materialize(sink, CAPACITY);
             TopologyError::UnexpectedOutputCapacity("sink".to_owned())
         }
         InvalidCase::DuplicateCapacity => {
             let (scan, _) = scan_sink(&mut builder);
-            builder.output_capacity_bytes(scan, CAPACITY);
-            builder.output_capacity_bytes(scan, CAPACITY);
+            builder.materialize(scan, CAPACITY);
+            builder.materialize(scan, CAPACITY);
             TopologyError::OutputCapacityAlreadySet("scan".to_owned())
         }
         InvalidCase::ForeignCapacity => {
             let foreign = foreign_scan(root);
             let (scan, _) = scan_sink(&mut builder);
-            builder.output_capacity_bytes(scan, CAPACITY);
-            builder.output_capacity_bytes(foreign, CAPACITY);
-            TopologyError::ForeignStationRef(foreign)
+            builder.materialize(scan, CAPACITY);
+            builder.materialize(foreign, CAPACITY);
+            TopologyError::ForeignOperationRef(foreign)
         }
         InvalidCase::SinkFeedsStation => {
-            let scan = builder.station("scan", SequenceScanDefinition::new(0));
-            let sink = builder.station("sink", DiscardDefinition::new());
-            let count = builder.station("count", RunningEventCountDefinition::new());
-            let terminal = builder.station("terminal", DiscardDefinition::new());
-            builder.connect([scan], sink);
-            builder.connect([sink], count);
-            builder.connect([count], terminal);
+            let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+            let sink = builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+            let count = builder.operation(
+                "count",
+                Box::new(RunningEventCountDefinition::new()),
+                [sink],
+            );
+            builder.operation("terminal", Box::new(DiscardDefinition::new()), [count]);
+
             TopologyError::InputHasNoOutput {
                 input_station: "sink".to_owned(),
                 station: "count".to_owned(),
@@ -119,38 +121,29 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         }
         InvalidCase::ForeignConnection => {
             let foreign = foreign_scan(root);
-            builder.station("own-scan", SequenceScanDefinition::new(0));
-            let count = builder.station("count", RunningEventCountDefinition::new());
-            builder.connect([foreign], count);
-            TopologyError::ForeignStationRef(foreign)
-        }
-        InvalidCase::EmptyInputs => {
-            let scan = builder.station("scan", SequenceScanDefinition::new(0));
-            builder.connect([], scan);
-            TopologyError::EmptyInputs("scan".to_owned())
-        }
-        InvalidCase::InputsTwice => {
-            let first = builder.station("first", SequenceScanDefinition::new(0));
-            let second = builder.station("second", SequenceScanDefinition::new(1));
-            let count = builder.station("count", RunningEventCountDefinition::new());
-            builder.connect([first], count);
-            builder.connect([second], count);
-            TopologyError::InputsAlreadySet("count".to_owned())
+            builder.operation("own-scan", Box::new(SequenceScanDefinition::new(0)), []);
+            builder.operation(
+                "count",
+                Box::new(RunningEventCountDefinition::new()),
+                [foreign],
+            );
+
+            TopologyError::ForeignOperationRef(foreign)
         }
     };
     (builder, expected)
 }
 
-fn scan_sink(builder: &mut FlowFactory) -> (StationRef, StationRef) {
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let sink = builder.station("sink", DiscardDefinition::new());
-    builder.connect([scan], sink);
+fn scan_sink(builder: &mut FlowFactory) -> (OperationRef, OperationRef) {
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let sink = builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+
     (scan, sink)
 }
 
-fn foreign_scan(root: &Path) -> StationRef {
+fn foreign_scan(root: &Path) -> OperationRef {
     let mut foreign = FlowFactory::new(root.join("foreign"));
-    foreign.station("foreign", SequenceScanDefinition::new(0))
+    foreign.operation("foreign", Box::new(SequenceScanDefinition::new(0)), [])
 }
 
 #[test]
@@ -171,7 +164,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
 
     let mut builder = FlowFactory::new(&path);
     let (scan, _) = scan_sink(&mut builder);
-    builder.output_capacity_bytes(scan, CAPACITY);
+    builder.materialize(scan, CAPACITY);
     assert!(matches!(
         build_error(builder),
         FlowError::Store(StoreError::PathExists(actual)) if actual == path

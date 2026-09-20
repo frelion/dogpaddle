@@ -66,7 +66,7 @@ pub(super) struct BoundTieBreak {
 }
 
 /// Materialized dynamic ASOF join.
-pub struct AsOfJoinOperation {
+pub(crate) struct AsOfJoinOperation {
     pub(super) kind: AsOfJoinKind,
     pub(super) direction: AsOfDirection,
     pub(super) tie_fallback: AsOfTieFallback,

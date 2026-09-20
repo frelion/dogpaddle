@@ -31,12 +31,12 @@ pub struct SequenceScanDefinition {
 /// This value stores only the first value and persistent position needed at
 /// execution time. It never retains its definition or begins, commits, or
 /// stores a transaction.
-pub struct SequenceScanOperation {
+pub(crate) struct SequenceScanOperation {
     start: u64,
     position: Cell<u64>,
 }
 
-/// Sequence-specific failure during one [`SequenceScanOperation`] turn.
+/// Sequence-specific failure during one `SequenceScanOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SequenceScanError {
@@ -101,7 +101,7 @@ impl OperationDefinition for SequenceScanDefinition {
 impl SequenceScanOperation {
     /// Creates a Sequence Scan from its first value and durable position.
     #[must_use]
-    pub const fn new(start: u64, position: Cell<u64>) -> Self {
+    const fn new(start: u64, position: Cell<u64>) -> Self {
         Self { start, position }
     }
 }

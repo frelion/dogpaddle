@@ -5,9 +5,7 @@ use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
     operation::{
         Operation, OperationInput,
-        transform::{
-            RunningEventCountDefinition, RunningEventCountError, RunningEventCountOperation,
-        },
+        transform::{RunningEventCountDefinition, RunningEventCountError},
     },
 };
 use dogpaddle_store::{Cell, Store, StoreError, StoreSetup};
@@ -55,13 +53,9 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
 #[test]
 fn runtime_rejects_missing_invalid_port_and_foreign_store() {
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
-    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
-        value_schema(),
-        store.create_data::<Cell<u64>>("count").unwrap(),
-    )));
+    let (mut operation, mut transactions) =
+        construct_operation(&root, &RunningEventCountDefinition::new());
     let input = value_change(&[1]);
-    let mut transactions = store.into_transactions();
 
     let error = rollback_ready(
         &mut operation,
@@ -176,11 +170,19 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 
     let fixture = TestStore::new();
     let mut store = Store::create(fixture.path()).unwrap();
-    let state = store.create_data::<Cell<u64>>("count").unwrap();
-    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
-        value_schema(),
-        state.clone(),
-    )));
+    let state = store
+        .create_data::<Cell<u64>>("operation/running_event_count.count")
+        .unwrap();
+    let definition = RunningEventCountDefinition::new();
+    let (mut operation, _) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[value_schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
     let input = value_change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
@@ -211,7 +213,9 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     let fixture = TestStore::new();
     let persisted = "not-a-u64".to_owned();
     let mut store = Store::create(fixture.path()).unwrap();
-    let raw = store.create_data::<Cell<String>>("count").unwrap();
+    let raw = store
+        .create_data::<Cell<String>>("operation/running_event_count.count")
+        .unwrap();
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin();
@@ -224,10 +228,16 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let mut operation = Operation::Atomic(Box::new(RunningEventCountOperation::new(
-        value_schema(),
-        store.open_data::<Cell<u64>>("count").unwrap(),
-    )));
+    let definition = RunningEventCountDefinition::new();
+    let (mut operation, _) = (&definition as &dyn OperationDefinition)
+        .construct(
+            &[value_schema()],
+            &mut store.data_scope(),
+            "operation",
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
     let mut transactions = store.into_transactions();
     let change = value_change(&[1]);
     let error =
@@ -239,7 +249,9 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     drop(transactions);
 
     let store = Store::open(fixture.path()).unwrap();
-    let raw = store.open_data::<Cell<String>>("count").unwrap();
+    let raw = store
+        .open_data::<Cell<String>>("operation/running_event_count.count")
+        .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     assert_eq!(

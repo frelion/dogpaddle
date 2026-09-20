@@ -22,12 +22,10 @@ impl FlowFactory {
     /// published, or another [`FlowError`] when the Store, definition, topology,
     /// or required station resources are invalid. Returns
     /// [`FlowError::OpenWithDefinition`] if this factory also declares topology,
-    /// or output capacities; open accepts only the path and runtime resources.
+    /// or materialization boundaries; open accepts the path, owner identity, and
+    /// runtime resources.
     pub fn open(self) -> Result<Flow, FlowError> {
-        if !self.stations.is_empty()
-            || !self.connections.is_empty()
-            || !self.output_capacities.is_empty()
-        {
+        if !self.operations.is_empty() || !self.materializations.is_empty() {
             return Err(FlowError::OpenWithDefinition);
         }
         let path = self.path;
@@ -64,7 +62,7 @@ impl FlowFactory {
             path,
             station_ids,
             assembled.stations,
-            assembled.topology,
+            assembled.schedule,
             transactions,
             reads,
         ))

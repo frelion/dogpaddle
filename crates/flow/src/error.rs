@@ -13,7 +13,7 @@ use crate::{
 #[non_exhaustive]
 pub enum FlowError {
     /// Opening uses the durable Definition, never declarations on the factory.
-    #[error("opening a flow does not accept station, connection, or capacity declarations")]
+    #[error("opening a flow does not accept operation or materialization declarations")]
     OpenWithDefinition,
     /// The caller does not own the persistent Flow at this path.
     #[error("persistent flow owner identity does not match the expected identity")]

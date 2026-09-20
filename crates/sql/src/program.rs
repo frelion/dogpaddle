@@ -9,13 +9,18 @@ use dogpaddle_flow::{Flow, FlowFactory};
 
 use crate::{
     SqlError,
-    assembly::{OUTPUT_CAPACITY_BYTES, scan_station_id},
-    endpoint::{ScanEndpoint, SinkEndpoint, resolve_debezium_runtime},
+    assembly::{OUTPUT_CAPACITY, OUTPUT_CAPACITY_BYTES, add_sink, scan_operation_id},
+    endpoint::{
+        ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
+        resolve_debezium_runtime,
+    },
     plan::{lower_query, plan},
     syntax,
 };
 
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v3";
+// Development v1: Flow owns Station fusion and keeps the head Operation ID.
+// Update v1 golden fixtures in place; old development state is discarded, not migrated.
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1";
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
 pub struct SqlProgram {
@@ -61,41 +66,41 @@ impl SqlProgram {
     /// or belongs to another program, or the underlying Flow cannot start.
     pub fn start(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
         let supplied_path = path.as_ref();
-        let program = self.resolved()?;
-        let identity = program.identity()?;
-        let runtime_bundle = program
+        let endpoints = self.resolve_endpoints()?;
+        let identity = self.identity(&endpoints);
+        let runtime_bundle = endpoints
             .scans
             .iter()
-            .any(ScanEndpoint::needs_debezium)
+            .any(ResolvedScanEndpoint::needs_debezium)
             .then(resolve_debezium_runtime)
             .transpose()?;
         let (path, exists) = resolve_state_path(supplied_path)?;
         if exists {
-            program.open_existing(&path, identity, runtime_bundle.as_deref())
+            Self::open_existing(&endpoints, &path, identity, runtime_bundle.as_deref())
         } else {
-            program.build_new(&path, identity, runtime_bundle.as_deref())
+            self.build_new(&endpoints, &path, identity, runtime_bundle.as_deref())
         }
     }
 
-    fn resolved(&self) -> Result<Self, SqlError> {
-        Ok(Self {
-            sink: self.sink.resolved()?,
-            query: self.query.clone(),
+    fn resolve_endpoints(&self) -> Result<ResolvedEndpoints, SqlError> {
+        Ok(ResolvedEndpoints {
+            sink: self.sink.resolve()?,
             scans: self
                 .scans
                 .iter()
-                .map(ScanEndpoint::resolved)
+                .map(ScanEndpoint::resolve)
                 .collect::<Result<_, _>>()?,
         })
     }
 
     fn build_new(
         &self,
+        endpoints: &ResolvedEndpoints,
         path: &Path,
         identity: [u8; 32],
         runtime_bundle: Option<&Path>,
     ) -> Result<Flow, SqlError> {
-        let scans = self
+        let scans = endpoints
             .scans
             .iter()
             .enumerate()
@@ -104,40 +109,41 @@ impl SqlProgram {
         let logical_plan = plan(self.query.clone(), &scans)?;
         let mut factory = FlowFactory::new(path);
         factory.owner_identity(identity);
-        let query = lower_query(&logical_plan, scans)?;
-        let sink = self.sink.build(&identity, path)?;
-        let factory = query.emit(factory, sink)?;
+        factory.output_capacity_bytes(OUTPUT_CAPACITY);
+        let output = lower_query(&logical_plan, scans, &mut factory)?;
+        let sink = endpoints.sink.build(&identity, path)?;
+        add_sink(&mut factory, output, sink)?;
         factory.build().map_err(Into::into)
     }
 
     fn open_existing(
-        &self,
+        endpoints: &ResolvedEndpoints,
         path: &Path,
         identity: [u8; 32],
         runtime_bundle: Option<&Path>,
     ) -> Result<Flow, SqlError> {
         let mut factory = FlowFactory::new(path);
         factory.owner_identity(identity);
-        for (index, scan) in self.scans.iter().enumerate() {
-            let station_id = scan_station_id(index);
-            scan.install_open_runtime_resource(&mut factory, &station_id, runtime_bundle)?;
+        for (index, scan) in endpoints.scans.iter().enumerate() {
+            let operation_id = scan_operation_id(index);
+            scan.install_open_runtime_resource(&mut factory, &operation_id, runtime_bundle)?;
         }
-        self.sink.install_open_runtime_resource(&mut factory)?;
+        endpoints.sink.install_open_runtime_resource(&mut factory)?;
         factory.open().map_err(Into::into)
     }
 
-    fn identity(&self) -> Result<[u8; 32], SqlError> {
+    fn identity(&self, endpoints: &ResolvedEndpoints) -> [u8; 32] {
         let mut encoded = Vec::new();
         write_identity_bytes(&mut encoded, IDENTITY_DOMAIN);
         write_identity_bytes(&mut encoded, canonical_query(&self.query).as_bytes());
         encoded.extend_from_slice(&OUTPUT_CAPACITY_BYTES.to_be_bytes());
-        let scan_count = u64::try_from(self.scans.len()).expect("a Vec length fits in u64");
+        let scan_count = u64::try_from(endpoints.scans.len()).expect("a Vec length fits in u64");
         encoded.extend_from_slice(&scan_count.to_be_bytes());
-        for scan in &self.scans {
-            scan.write_identity(&mut encoded)?;
+        for scan in &endpoints.scans {
+            scan.write_identity(&mut encoded);
         }
-        self.sink.write_identity(&mut encoded)?;
-        Ok(*blake3::hash(&encoded).as_bytes())
+        endpoints.sink.write_identity(&mut encoded);
+        *blake3::hash(&encoded).as_bytes()
     }
 }
 
@@ -221,7 +227,8 @@ mod tests {
     use super::*;
 
     fn identity(sql: &str) -> [u8; 32] {
-        SqlProgram::parse(sql).unwrap().identity().unwrap()
+        let program = SqlProgram::parse(sql).unwrap();
+        program.identity(&program.resolve_endpoints().unwrap())
     }
 
     #[test]
@@ -245,7 +252,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "85ed0ec942fe61e0aa385e1404755f61eacb813b1a641490e7852f45867ecddd"
+            "494fa9fd8fed1f9d806f55fcf40e609697e2d2d3e4650398ce72077332328103"
         );
     }
 

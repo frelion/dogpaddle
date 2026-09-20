@@ -788,7 +788,7 @@ fn union_all_keeps_separate_scan_stations() {
         [
             "sql/scan/00000000",
             "sql/scan/00000001",
-            "sql/transform/00000000",
+            "sql/transform/00000002",
             "sql/sink",
         ]
     );
@@ -889,8 +889,8 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
         [
             "sql/scan/00000000",
             "sql/transform/00000000",
-            "sql/transform/00000001",
-            "sql/transform/00000002",
+            "sql/transform/00000004",
+            "sql/transform/00000007",
             "sql/sink",
         ]
     );
@@ -923,8 +923,8 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
         [
             "sql/scan/00000000",
             "sql/transform/00000000",
-            "sql/transform/00000001",
-            "sql/transform/00000002",
+            "sql/transform/00000004",
+            "sql/transform/00000007",
             "sql/sink",
         ]
     );

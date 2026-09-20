@@ -83,3 +83,8 @@ path = "examples/queue_scan.rs"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "projection"
+harness = false
+test = true

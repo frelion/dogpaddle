@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::assembly::{ResolvedTopology, resolve_topology};
 
 use super::{
-    definition::{FlowDefinition, InputDefinition, StationDefinition},
+    definition::{FlowDefinition, StationDefinition},
     validate::{TopologyError, validate_decoded_topology, validate_station_ids},
 };
 
@@ -112,8 +112,8 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
         let input_count = u32::try_from(station.inputs().len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("input count"))?;
         encoded.extend_from_slice(&input_count.to_be_bytes());
-        for input in station.input_definitions() {
-            encode_string(&mut encoded, input.station_id(), "input ID")?;
+        for input in station.inputs() {
+            encode_string(&mut encoded, input, "input ID")?;
         }
         if let Some(capacity) = station.output_capacity_bytes() {
             encoded.push(1);
@@ -186,7 +186,7 @@ pub(crate) fn decode(
         let input_count = cursor.read_u32()?;
         let mut inputs = Vec::new();
         for _ in 0..input_count {
-            inputs.push(InputDefinition::new(cursor.read_string()?));
+            inputs.push(cursor.read_string()?);
         }
         let output_capacity_bytes = match cursor.read_u8()? {
             0 => None,
@@ -232,10 +232,10 @@ fn validate_definition(
                     .inputs
                     .iter()
                     .map(|input| {
-                        ids.get(input.station_id()).copied().ok_or_else(|| {
+                        ids.get(input.as_str()).copied().ok_or_else(|| {
                             FlowDefinitionError::UnknownInput {
                                 station: station.id.clone(),
-                                input_id: input.station_id.clone(),
+                                input_id: input.clone(),
                             }
                         })
                     })

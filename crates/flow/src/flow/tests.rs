@@ -50,26 +50,40 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let first_target = builder.station("first-target", RunningEventCountDefinition::new());
-    let second_target = builder.station("second-target", RunningEventCountDefinition::new());
-    let second_scan = builder.station("second-scan", SequenceScanDefinition::new(0));
-    let first_scan = builder.station("first-scan", SequenceScanDefinition::new(0));
-    let first_sink = builder.station("first-sink", DiscardDefinition::new());
-    let second_sink = builder.station("second-sink", DiscardDefinition::new());
+    let second_scan =
+        builder.operation("second-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let first_scan = builder.operation("first-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let first_target = builder.operation(
+        "first-target",
+        Box::new(RunningEventCountDefinition::new()),
+        [first_scan],
+    );
+    builder.operation(
+        "first-sink",
+        Box::new(DiscardDefinition::new()),
+        [first_target],
+    );
+    let second_target = builder.operation(
+        "second-target",
+        Box::new(RunningEventCountDefinition::new()),
+        [second_scan],
+    );
+
+    builder.operation(
+        "second-sink",
+        Box::new(DiscardDefinition::new()),
+        [second_target],
+    );
     for station in [first_target, second_target, second_scan, first_scan] {
-        builder.output_capacity_bytes(station, NonZeroU64::MAX);
+        builder.materialize(station, NonZeroU64::MAX);
     }
-    builder.connect([first_scan], first_target);
-    builder.connect([second_scan], second_target);
-    builder.connect([first_target], first_sink);
-    builder.connect([second_target], second_sink);
 
     let flow = builder.build().unwrap();
-    assert_eq!(flow.topology.schedule, [2, 3, 0, 1, 4, 5]);
+    assert_eq!(flow.schedule, [0, 1, 2, 4, 3, 5]);
     drop(flow);
 
     let reopened = FlowFactory::new(path).open().unwrap();
-    assert_eq!(reopened.topology.schedule, [2, 3, 0, 1, 4, 5]);
+    assert_eq!(reopened.schedule, [0, 1, 2, 4, 3, 5]);
 }
 
 #[test]
@@ -77,26 +91,38 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let blocked_scan = builder.station("blocked-scan", SequenceScanDefinition::new(0));
-    let progressing_scan = builder.station("progressing-scan", SequenceScanDefinition::new(0));
-    let blocked_sink = builder.station("blocked-sink", DiscardDefinition::new());
-    let progressing_sink = builder.station("progressing-sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(blocked_scan, NonZeroU64::new(1).unwrap());
-    builder.output_capacity_bytes(progressing_scan, NonZeroU64::MAX);
-    builder.connect([blocked_scan], blocked_sink);
-    builder.connect([progressing_scan], progressing_sink);
+    let blocked_scan =
+        builder.operation("blocked-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let progressing_scan = builder.operation(
+        "progressing-scan",
+        Box::new(SequenceScanDefinition::new(0)),
+        [],
+    );
+    builder.operation(
+        "blocked-sink",
+        Box::new(DiscardDefinition::new()),
+        [blocked_scan],
+    );
+    builder.operation(
+        "progressing-sink",
+        Box::new(DiscardDefinition::new()),
+        [progressing_scan],
+    );
+    builder.materialize(blocked_scan, NonZeroU64::new(1).unwrap());
+    builder.materialize(progressing_scan, NonZeroU64::MAX);
+
     let mut flow = builder.build().unwrap();
-    flow.topology.schedule = vec![0, 1];
+    flow.schedule = vec![0, 1];
     assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     drop(flow);
 
     let mut reopened = FlowFactory::new(&path).open().unwrap();
-    reopened.topology.schedule = vec![0, 1];
+    reopened.schedule = vec![0, 1];
     assert_eq!(
         reopened.advance().unwrap(),
         super::AdvanceOutcome::Progressed
     );
-    reopened.topology.schedule = vec![0];
+    reopened.schedule = vec![0];
     assert_eq!(
         reopened.advance().unwrap(),
         super::AdvanceOutcome::Backpressured
@@ -149,15 +175,14 @@ fn fanout_retains_output_until_the_slowest_subscription_completes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let scan = builder.station("scan", SequenceScanDefinition::new(0));
-    let first_sink = builder.station("first-sink", DiscardDefinition::new());
-    let slow_sink = builder.station("slow-sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(scan, NonZeroU64::MAX);
-    builder.connect([scan], first_sink);
-    builder.connect([scan], slow_sink);
+    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("first-sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.operation("slow-sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.materialize(scan, NonZeroU64::MAX);
+
     let mut flow = builder.build().unwrap();
 
-    flow.topology.schedule = vec![0, 1];
+    flow.schedule = vec![0, 1];
     assert_eq!(flow.advance().unwrap(), super::AdvanceOutcome::Progressed);
     let pending = flow.status().unwrap();
     let output = pending[0].output.as_ref().unwrap();
@@ -178,7 +203,7 @@ fn fanout_retains_output_until_the_slowest_subscription_completes() {
         ),
         (0, 0)
     );
-    reopened.topology.schedule = vec![2];
+    reopened.schedule = vec![2];
     assert_eq!(
         reopened.advance().unwrap(),
         super::AdvanceOutcome::Progressed
@@ -194,14 +219,22 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let first_scan = builder.station("first-scan", SequenceScanDefinition::new(0));
-    let first_sink = builder.station("first-sink", DiscardDefinition::new());
-    let failed_scan = builder.station("failed-scan", SequenceScanDefinition::new(0));
-    let failed_sink = builder.station("failed-sink", DiscardDefinition::new());
-    builder.output_capacity_bytes(first_scan, NonZeroU64::MAX);
-    builder.output_capacity_bytes(failed_scan, NonZeroU64::MAX);
-    builder.connect([first_scan], first_sink);
-    builder.connect([failed_scan], failed_sink);
+    let first_scan = builder.operation("first-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation(
+        "first-sink",
+        Box::new(DiscardDefinition::new()),
+        [first_scan],
+    );
+    let failed_scan =
+        builder.operation("failed-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation(
+        "failed-sink",
+        Box::new(DiscardDefinition::new()),
+        [failed_scan],
+    );
+    builder.materialize(first_scan, NonZeroU64::MAX);
+    builder.materialize(failed_scan, NonZeroU64::MAX);
+
     let mut flow = builder.build().unwrap();
     let runs = Arc::new(AtomicUsize::new(0));
     flow.stations[2].replace_operation(Box::new(FailingAfterCommit {

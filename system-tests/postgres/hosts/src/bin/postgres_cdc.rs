@@ -168,20 +168,27 @@ fn open_flow(options: &Options) -> Result<Flow, OperationError> {
         }
         return Ok(factory.open()?);
     }
-    let scan = factory.station("pg", options.definition()?);
-    let sink = if let Some(config) = &sink_config {
+    let scan = factory.operation("pg", Box::new(options.definition()?), []);
+    let scan = factory.operation("distinct", Box::new(DistinctDefinition::new()), [scan]);
+    if let Some(config) = &sink_config {
         let target = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
-        factory.station("sink", PostgresSinkDefinition::try_new(target)?)
+        factory.operation(
+            "sink",
+            Box::new(PostgresSinkDefinition::try_new(target)?),
+            [scan],
+        )
     } else {
-        factory.station(
+        factory.operation(
             "sqlite",
-            SqliteSinkDefinition::try_new(options.root.join("sink.sqlite"), "events")?,
+            Box::new(SqliteSinkDefinition::try_new(
+                options.root.join("sink.sqlite"),
+                "events",
+            )?),
+            [scan],
         )
     };
-    factory.append(scan, DistinctDefinition::new())?;
     // One retained entry at a time, with the normal empty-log oversize rule.
-    factory.output_capacity_bytes(scan, NonZeroU64::MIN);
-    factory.connect([scan], sink);
+    factory.materialize(scan, NonZeroU64::MIN);
     factory.resource("pg", options.config()?)?;
     if let Some(config) = sink_config {
         factory.resource("sink", config)?;

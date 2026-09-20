@@ -34,10 +34,6 @@ pub(crate) enum Parameter {
 }
 
 impl Parameter {
-    fn resolved(&self) -> Result<Self, SqlError> {
-        self.resolve().map(Self::Literal)
-    }
-
     fn resolve(&self) -> Result<String, SqlError> {
         match self {
             Self::Literal(value) => Ok(value.clone()),
@@ -61,11 +57,6 @@ impl Parameter {
                 "{endpoint} parameter {name:?} must resolve to a nonzero unsigned 64-bit integer"
             ))
         })
-    }
-
-    fn write_resolved_identity(&self, encoded: &mut Vec<u8>) -> Result<(), SqlError> {
-        write_identity_bytes(encoded, self.resolve()?.as_bytes());
-        Ok(())
     }
 }
 
@@ -131,17 +122,6 @@ struct CdcTuningParameters {
 }
 
 impl CdcTuningParameters {
-    fn resolved(&self) -> Result<Self, SqlError> {
-        Ok(Self {
-            connect_timeout_ms: resolve_optional(self.connect_timeout_ms.as_ref())?,
-            query_timeout_ms: resolve_optional(self.query_timeout_ms.as_ref())?,
-            retry_limit: resolve_optional(self.retry_limit.as_ref())?,
-            retry_max_delay_ms: resolve_optional(self.retry_max_delay_ms.as_ref())?,
-            heartbeat_interval_ms: resolve_optional(self.heartbeat_interval_ms.as_ref())?,
-            snapshot_fetch_size: resolve_optional(self.snapshot_fetch_size.as_ref())?,
-        })
-    }
-
     fn postgres_options(&self) -> Result<PostgresCdcScanOptions, SqlError> {
         let mut options = PostgresCdcScanOptions::new();
         if let Some(value) = self.milliseconds("postgres_cdc", "connect_timeout_ms")? {
@@ -262,10 +242,6 @@ impl CdcTuningParameters {
             _ => unreachable!("CDC tuning parameter names are fixed"),
         }
     }
-}
-
-fn resolve_optional(parameter: Option<&Parameter>) -> Result<Option<Parameter>, SqlError> {
-    parameter.map(Parameter::resolved).transpose()
 }
 
 fn invalid_cdc_tuning(endpoint: &str, name: &str, error: impl std::fmt::Display) -> SqlError {
@@ -470,27 +446,75 @@ pub(crate) struct BuiltMySqlCdcScan {
     pub(crate) config: MySqlCdcScanConfig,
 }
 
+pub(crate) struct ResolvedEndpoints {
+    pub(crate) scans: Vec<ResolvedScanEndpoint>,
+    pub(crate) sink: ResolvedSinkEndpoint,
+}
+
+pub(crate) enum ResolvedScanEndpoint {
+    Sequence { start: u64 },
+    PostgresCdc(Box<ResolvedPostgresCdc>),
+    MySqlCdc(Box<ResolvedMySqlCdc>),
+}
+
+pub(crate) struct ResolvedPostgresCdc {
+    connection: DatabaseConnection,
+    schema: String,
+    table: String,
+    publication: String,
+    bootstrap_spool_bytes: NonZeroU64,
+    options: PostgresCdcScanOptions,
+}
+
+pub(crate) struct ResolvedMySqlCdc {
+    connection: DatabaseConnection,
+    table: String,
+    bootstrap_spool_bytes: NonZeroU64,
+    options: MySqlCdcScanOptions,
+}
+
 impl ScanEndpoint {
-    pub(crate) fn resolved(&self) -> Result<Self, SqlError> {
+    pub(crate) fn resolve(&self) -> Result<ResolvedScanEndpoint, SqlError> {
         match self {
-            Self::Sequence { start } => Ok(Self::Sequence {
-                start: start.resolved()?,
+            Self::Sequence { start } => Ok(ResolvedScanEndpoint::Sequence {
+                start: start.resolve_u64("sequence", "start")?,
             }),
-            Self::PostgresCdc(endpoint) => Ok(Self::PostgresCdc(Box::new(PostgresCdcEndpoint {
-                connection: endpoint.connection.resolved()?,
-                table: endpoint.table.resolved()?,
-                publication: endpoint.publication.resolved()?,
-                bootstrap_spool_bytes: endpoint.bootstrap_spool_bytes.resolved()?,
-                tuning: endpoint.tuning.resolved()?,
-            })))
-            .and_then(validate_resolved_scan),
-            Self::MySqlCdc(endpoint) => Ok(Self::MySqlCdc(Box::new(MySqlCdcEndpoint {
-                connection: endpoint.connection.resolved()?,
-                table: endpoint.table.resolved()?,
-                bootstrap_spool_bytes: endpoint.bootstrap_spool_bytes.resolved()?,
-                tuning: endpoint.tuning.resolved()?,
-            })))
-            .and_then(validate_resolved_scan),
+            Self::PostgresCdc(endpoint) => {
+                let connection =
+                    DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
+                let (schema, table) = qualified_table(&endpoint.table, "postgres_cdc")?;
+                validate_cdc_identifier(&schema, "postgres_cdc", "table schema")?;
+                validate_cdc_identifier(&table, "postgres_cdc", "table name")?;
+                let publication = endpoint.publication.resolve()?;
+                validate_cdc_identifier(&publication, "postgres_cdc", "publication")?;
+                Ok(ResolvedScanEndpoint::PostgresCdc(Box::new(
+                    ResolvedPostgresCdc {
+                        connection,
+                        schema,
+                        table,
+                        publication,
+                        bootstrap_spool_bytes: endpoint
+                            .bootstrap_spool_bytes
+                            .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?,
+                        options: endpoint.tuning.postgres_options()?,
+                    },
+                )))
+            }
+            Self::MySqlCdc(endpoint) => {
+                let connection = DatabaseConnection::mysql(&endpoint.connection)?;
+                let (database, table) = qualified_table(&endpoint.table, "mysql_cdc")?;
+                require_database(&connection, &database, "mysql_cdc")?;
+                validate_cdc_identifier(&database, "mysql_cdc", "database")?;
+                validate_cdc_identifier(&table, "mysql_cdc", "table name")?;
+                Ok(ResolvedScanEndpoint::MySqlCdc(Box::new(ResolvedMySqlCdc {
+                    connection,
+                    table,
+                    bootstrap_spool_bytes: endpoint
+                        .bootstrap_spool_bytes
+                        .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?,
+                    options: endpoint.tuning.mysql_options()?,
+                })))
+            }
         }
     }
 
@@ -515,7 +539,9 @@ impl ScanEndpoint {
             _ => Err(SqlError::invalid(format!("unknown scan function {name}"))),
         }
     }
+}
 
+impl ResolvedScanEndpoint {
     pub(crate) const fn needs_debezium(&self) -> bool {
         matches!(self, Self::PostgresCdc(_) | Self::MySqlCdc(_))
     }
@@ -528,47 +554,43 @@ impl ScanEndpoint {
         runtime_bundle: Option<&Path>,
     ) -> Result<BuiltScan, SqlError> {
         match self {
-            Self::Sequence { start } => Ok(BuiltScan::Sequence(SequenceScanDefinition::new(
-                start.resolve_u64("sequence", "start")?,
-            ))),
+            Self::Sequence { start } => {
+                Ok(BuiltScan::Sequence(SequenceScanDefinition::new(*start)))
+            }
             Self::PostgresCdc(endpoint) => {
-                let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
-                let connection =
-                    DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
-                let (schema, table) = qualified_table(&endpoint.table, "postgres_cdc")?;
-                let publication = endpoint.publication.resolve()?;
-                let bootstrap_spool_bytes = endpoint
-                    .bootstrap_spool_bytes
-                    .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?;
+                let config = endpoint.connection.postgres_cdc_config(
+                    runtime_bundle.expect("CDC programs resolve one runtime"),
+                    endpoint.options,
+                )?;
                 let engine_name = scan_name(identity, state_path, index);
-                let config = connection
-                    .postgres_cdc_config(runtime_bundle, endpoint.tuning.postgres_options()?)?;
                 let spec = config
-                    .discover(&engine_name, &schema, &table, &engine_name, &publication)
+                    .discover(
+                        &engine_name,
+                        &endpoint.schema,
+                        &endpoint.table,
+                        &engine_name,
+                        &endpoint.publication,
+                    )
                     .map_err(SqlError::endpoint)?;
-                let definition = PostgresCdcScanDefinition::try_new(spec, bootstrap_spool_bytes)
-                    .map_err(SqlError::endpoint)?;
+                let definition =
+                    PostgresCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
+                        .map_err(SqlError::endpoint)?;
                 Ok(BuiltScan::PostgresCdc(Box::new(BuiltPostgresCdcScan {
                     definition,
                     config,
                 })))
             }
             Self::MySqlCdc(endpoint) => {
-                let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
-                let connection = DatabaseConnection::mysql(&endpoint.connection)?;
-                let (database, table) = qualified_table(&endpoint.table, "mysql_cdc")?;
-                require_database(&connection, &database, "mysql_cdc")?;
-                let bootstrap_spool_bytes = endpoint
-                    .bootstrap_spool_bytes
-                    .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?;
-                let engine_name = scan_name(identity, state_path, index);
-                let config =
-                    connection.mysql_config(runtime_bundle, endpoint.tuning.mysql_options()?)?;
+                let config = endpoint.connection.mysql_config(
+                    runtime_bundle.expect("CDC programs resolve one runtime"),
+                    endpoint.options,
+                )?;
                 let spec = config
-                    .discover(&engine_name, &table)
+                    .discover(&scan_name(identity, state_path, index), &endpoint.table)
                     .map_err(SqlError::endpoint)?;
-                let definition = MySqlCdcScanDefinition::try_new(spec, bootstrap_spool_bytes)
-                    .map_err(SqlError::endpoint)?;
+                let definition =
+                    MySqlCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
+                        .map_err(SqlError::endpoint)?;
                 Ok(BuiltScan::MySqlCdc(Box::new(BuiltMySqlCdcScan {
                     definition,
                     config,
@@ -577,52 +599,27 @@ impl ScanEndpoint {
         }
     }
 
-    pub(crate) fn write_identity(&self, encoded: &mut Vec<u8>) -> Result<(), SqlError> {
+    pub(crate) fn write_identity(&self, encoded: &mut Vec<u8>) {
         match self {
             Self::Sequence { start } => {
                 encoded.push(0);
-                encoded.extend_from_slice(&start.resolve_u64("sequence", "start")?.to_be_bytes());
+                encoded.extend_from_slice(&start.to_be_bytes());
             }
             Self::PostgresCdc(endpoint) => {
                 encoded.push(1);
-                let connection =
-                    DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
-                write_identity_bytes(encoded, connection.database.as_bytes());
-                let (schema, table) = qualified_table(&endpoint.table, "postgres_cdc")?;
-                validate_cdc_identifier(&schema, "postgres_cdc", "table schema")?;
-                validate_cdc_identifier(&table, "postgres_cdc", "table name")?;
-                write_identity_bytes(encoded, schema.as_bytes());
-                write_identity_bytes(encoded, table.as_bytes());
-                let publication = endpoint.publication.resolve()?;
-                validate_cdc_identifier(&publication, "postgres_cdc", "publication")?;
-                write_identity_bytes(encoded, publication.as_bytes());
-                encoded.extend_from_slice(
-                    &endpoint
-                        .bootstrap_spool_bytes
-                        .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?
-                        .get()
-                        .to_be_bytes(),
-                );
+                write_identity_bytes(encoded, endpoint.connection.database.as_bytes());
+                write_identity_bytes(encoded, endpoint.schema.as_bytes());
+                write_identity_bytes(encoded, endpoint.table.as_bytes());
+                write_identity_bytes(encoded, endpoint.publication.as_bytes());
+                encoded.extend_from_slice(&endpoint.bootstrap_spool_bytes.get().to_be_bytes());
             }
             Self::MySqlCdc(endpoint) => {
                 encoded.push(2);
-                let connection = DatabaseConnection::mysql(&endpoint.connection)?;
-                validate_cdc_identifier(&connection.database, "mysql_cdc", "database")?;
-                write_identity_bytes(encoded, connection.database.as_bytes());
-                let (database, table) = qualified_table(&endpoint.table, "mysql_cdc")?;
-                require_database(&connection, &database, "mysql_cdc")?;
-                validate_cdc_identifier(&table, "mysql_cdc", "table name")?;
-                write_identity_bytes(encoded, table.as_bytes());
-                encoded.extend_from_slice(
-                    &endpoint
-                        .bootstrap_spool_bytes
-                        .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?
-                        .get()
-                        .to_be_bytes(),
-                );
+                write_identity_bytes(encoded, endpoint.connection.database.as_bytes());
+                write_identity_bytes(encoded, endpoint.table.as_bytes());
+                encoded.extend_from_slice(&endpoint.bootstrap_spool_bytes.get().to_be_bytes());
             }
         }
-        Ok(())
     }
 
     pub(crate) fn install_open_runtime_resource(
@@ -632,41 +629,28 @@ impl ScanEndpoint {
         runtime_bundle: Option<&Path>,
     ) -> Result<(), SqlError> {
         match self {
-            Self::Sequence { .. } => Ok(()),
+            Self::Sequence { .. } => {}
             Self::PostgresCdc(endpoint) => {
-                let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
-                let connection =
-                    DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
                 factory.resource(
                     station_id,
-                    connection
-                        .postgres_cdc_config(runtime_bundle, endpoint.tuning.postgres_options()?)?,
+                    endpoint.connection.postgres_cdc_config(
+                        runtime_bundle.expect("CDC programs resolve one runtime"),
+                        endpoint.options,
+                    )?,
                 )?;
-                Ok(())
             }
             Self::MySqlCdc(endpoint) => {
-                let runtime_bundle = runtime_bundle.expect("CDC programs resolve one runtime");
-                let connection = DatabaseConnection::mysql(&endpoint.connection)?;
-                let config =
-                    connection.mysql_config(runtime_bundle, endpoint.tuning.mysql_options()?)?;
-                factory.resource(station_id, config)?;
-                Ok(())
+                factory.resource(
+                    station_id,
+                    endpoint.connection.mysql_config(
+                        runtime_bundle.expect("CDC programs resolve one runtime"),
+                        endpoint.options,
+                    )?,
+                )?;
             }
         }
+        Ok(())
     }
-}
-
-fn validate_resolved_scan(scan: ScanEndpoint) -> Result<ScanEndpoint, SqlError> {
-    match &scan {
-        ScanEndpoint::PostgresCdc(endpoint) => {
-            let _ = endpoint.tuning.postgres_options()?;
-        }
-        ScanEndpoint::MySqlCdc(endpoint) => {
-            let _ = endpoint.tuning.mysql_options()?;
-        }
-        ScanEndpoint::Sequence { .. } => {}
-    }
-    Ok(scan)
 }
 
 fn parse_postgres_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
@@ -760,25 +744,29 @@ fn parse_mysql_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlErr
     })))
 }
 
-pub(crate) struct PostgresSinkEndpoint {
+pub(crate) struct DatabaseSinkEndpoint {
     connection: Parameter,
     table: Parameter,
 }
 
-pub(crate) struct DorisSinkEndpoint {
-    connection: Parameter,
-    table: Parameter,
+pub(crate) struct ResolvedDatabaseSink {
+    connection: DatabaseConnection,
+    namespace: String,
+    table: String,
 }
 
-pub(crate) struct ClickHouseSinkEndpoint {
-    connection: Parameter,
-    table: Parameter,
+pub(crate) enum ResolvedSinkEndpoint {
+    ClickHouse(ResolvedDatabaseSink),
+    Doris(ResolvedDatabaseSink),
+    Postgres(ResolvedDatabaseSink),
+    Sqlite { path: String, table: String },
+    Discard,
 }
 
 pub(crate) enum SinkEndpoint {
-    ClickHouse(ClickHouseSinkEndpoint),
-    Doris(DorisSinkEndpoint),
-    Postgres(PostgresSinkEndpoint),
+    ClickHouse(DatabaseSinkEndpoint),
+    Doris(DatabaseSinkEndpoint),
+    Postgres(DatabaseSinkEndpoint),
     Sqlite { path: Parameter, table: Parameter },
     Discard,
 }
@@ -801,25 +789,42 @@ pub(crate) enum BuiltSink {
 }
 
 impl SinkEndpoint {
-    pub(crate) fn resolved(&self) -> Result<Self, SqlError> {
+    pub(crate) fn resolve(&self) -> Result<ResolvedSinkEndpoint, SqlError> {
         match self {
-            Self::ClickHouse(endpoint) => Ok(Self::ClickHouse(ClickHouseSinkEndpoint {
-                connection: endpoint.connection.resolved()?,
-                table: endpoint.table.resolved()?,
-            })),
-            Self::Doris(endpoint) => Ok(Self::Doris(DorisSinkEndpoint {
-                connection: endpoint.connection.resolved()?,
-                table: endpoint.table.resolved()?,
-            })),
-            Self::Postgres(endpoint) => Ok(Self::Postgres(PostgresSinkEndpoint {
-                connection: endpoint.connection.resolved()?,
-                table: endpoint.table.resolved()?,
-            })),
-            Self::Sqlite { path, table } => Ok(Self::Sqlite {
-                path: path.resolved()?,
-                table: table.resolved()?,
+            Self::ClickHouse(endpoint) => {
+                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                let (namespace, table) = qualified_table(&endpoint.table, "clickhouse")?;
+                require_connection_database(&connection, &namespace, "clickhouse")?;
+                Ok(ResolvedSinkEndpoint::ClickHouse(ResolvedDatabaseSink {
+                    connection,
+                    namespace,
+                    table,
+                }))
+            }
+            Self::Doris(endpoint) => {
+                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                let (namespace, table) = qualified_table(&endpoint.table, "doris")?;
+                require_connection_database(&connection, &namespace, "doris")?;
+                Ok(ResolvedSinkEndpoint::Doris(ResolvedDatabaseSink {
+                    connection,
+                    namespace,
+                    table,
+                }))
+            }
+            Self::Postgres(endpoint) => {
+                let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
+                let (namespace, table) = qualified_table(&endpoint.table, "postgres")?;
+                Ok(ResolvedSinkEndpoint::Postgres(ResolvedDatabaseSink {
+                    connection,
+                    namespace,
+                    table,
+                }))
+            }
+            Self::Sqlite { path, table } => Ok(ResolvedSinkEndpoint::Sqlite {
+                path: path.resolve()?,
+                table: table.resolve()?,
             }),
-            Self::Discard => Ok(Self::Discard),
+            Self::Discard => Ok(ResolvedSinkEndpoint::Discard),
         }
     }
 
@@ -851,10 +856,7 @@ impl SinkEndpoint {
                     &arguments.args,
                     &[string("connection"), string("table")],
                 )?);
-                Ok(Self::ClickHouse(ClickHouseSinkEndpoint {
-                    connection,
-                    table,
-                }))
+                Ok(Self::ClickHouse(DatabaseSinkEndpoint { connection, table }))
             }
             Some("doris") => {
                 let [connection, table] = exact_parameters(parse_arguments(
@@ -862,7 +864,7 @@ impl SinkEndpoint {
                     &arguments.args,
                     &[string("connection"), string("table")],
                 )?);
-                Ok(Self::Doris(DorisSinkEndpoint { connection, table }))
+                Ok(Self::Doris(DatabaseSinkEndpoint { connection, table }))
             }
             Some("postgres") => {
                 let [connection, table] = exact_parameters(parse_arguments(
@@ -870,7 +872,7 @@ impl SinkEndpoint {
                     &arguments.args,
                     &[string("connection"), string("table")],
                 )?);
-                Ok(Self::Postgres(PostgresSinkEndpoint { connection, table }))
+                Ok(Self::Postgres(DatabaseSinkEndpoint { connection, table }))
             }
             Some("sqlite") => {
                 let [path, table] = exact_parameters(parse_arguments(
@@ -890,7 +892,9 @@ impl SinkEndpoint {
             ))),
         }
     }
+}
 
+impl ResolvedSinkEndpoint {
     pub(crate) fn build(
         &self,
         identity: &[u8; 32],
@@ -898,9 +902,8 @@ impl SinkEndpoint {
     ) -> Result<BuiltSink, SqlError> {
         match self {
             Self::ClickHouse(endpoint) => {
-                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
-                let (database, table) = qualified_table(&endpoint.table, "clickhouse")?;
-                require_connection_database(&connection, &database, "clickhouse")?;
+                let connection = &endpoint.connection;
+                let table = &endpoint.table;
                 let config = connection.clickhouse_sink_config()?;
                 let target = config
                     .discover_target(sink_name(identity, state_path), table)
@@ -910,9 +913,8 @@ impl SinkEndpoint {
                 Ok(BuiltSink::ClickHouse { definition, config })
             }
             Self::Doris(endpoint) => {
-                let connection = DatabaseConnection::doris(&endpoint.connection)?;
-                let (database, table) = qualified_table(&endpoint.table, "doris")?;
-                require_connection_database(&connection, &database, "doris")?;
+                let connection = &endpoint.connection;
+                let table = &endpoint.table;
                 let config = connection.doris_sink_config()?;
                 let target = config
                     .discover_target(sink_name(identity, state_path), table)
@@ -922,18 +924,18 @@ impl SinkEndpoint {
                 Ok(BuiltSink::Doris { definition, config })
             }
             Self::Postgres(endpoint) => {
-                let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
-                let (schema, table) = qualified_table(&endpoint.table, "postgres")?;
+                let connection = &endpoint.connection;
+                let table = &endpoint.table;
                 let config = connection.postgres_sink_config()?;
                 let target = config
-                    .discover_target(sink_name(identity, state_path), schema, table)
+                    .discover_target(sink_name(identity, state_path), &endpoint.namespace, table)
                     .map_err(SqlError::endpoint)?;
                 let definition =
                     PostgresSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 Ok(BuiltSink::Postgres { definition, config })
             }
             Self::Sqlite { path, table } => {
-                SqliteSinkDefinition::try_new(PathBuf::from(path.resolve()?), table.resolve()?)
+                SqliteSinkDefinition::try_new(PathBuf::from(path), table)
                     .map(BuiltSink::Sqlite)
                     .map_err(SqlError::endpoint)
             }
@@ -941,40 +943,37 @@ impl SinkEndpoint {
         }
     }
 
-    pub(crate) fn write_identity(&self, encoded: &mut Vec<u8>) -> Result<(), SqlError> {
+    pub(crate) fn write_identity(&self, encoded: &mut Vec<u8>) {
         match self {
             Self::ClickHouse(endpoint) => {
                 encoded.push(3);
-                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                let connection = &endpoint.connection;
                 write_identity_bytes(encoded, connection.database.as_bytes());
-                let (database, table) = qualified_table(&endpoint.table, "clickhouse")?;
-                require_connection_database(&connection, &database, "clickhouse")?;
+                let table = &endpoint.table;
                 write_identity_bytes(encoded, table.as_bytes());
             }
             Self::Doris(endpoint) => {
                 encoded.push(4);
-                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                let connection = &endpoint.connection;
                 write_identity_bytes(encoded, connection.database.as_bytes());
-                let (database, table) = qualified_table(&endpoint.table, "doris")?;
-                require_connection_database(&connection, &database, "doris")?;
+                let table = &endpoint.table;
                 write_identity_bytes(encoded, table.as_bytes());
             }
             Self::Postgres(endpoint) => {
                 encoded.push(0);
-                let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
+                let connection = &endpoint.connection;
                 write_identity_bytes(encoded, connection.database.as_bytes());
-                let (schema, table) = qualified_table(&endpoint.table, "postgres")?;
-                write_identity_bytes(encoded, schema.as_bytes());
+                let table = &endpoint.table;
+                write_identity_bytes(encoded, endpoint.namespace.as_bytes());
                 write_identity_bytes(encoded, table.as_bytes());
             }
             Self::Sqlite { path, table } => {
                 encoded.push(1);
-                path.write_resolved_identity(encoded)?;
-                table.write_resolved_identity(encoded)?;
+                write_identity_bytes(encoded, path.as_bytes());
+                write_identity_bytes(encoded, table.as_bytes());
             }
             Self::Discard => encoded.push(2),
         }
-        Ok(())
     }
 
     pub(crate) fn install_open_runtime_resource(
@@ -983,15 +982,15 @@ impl SinkEndpoint {
     ) -> Result<(), SqlError> {
         match self {
             Self::ClickHouse(endpoint) => {
-                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
+                let connection = &endpoint.connection;
                 factory.resource("sql/sink", connection.clickhouse_sink_config()?)?;
             }
             Self::Doris(endpoint) => {
-                let connection = DatabaseConnection::doris(&endpoint.connection)?;
+                let connection = &endpoint.connection;
                 factory.resource("sql/sink", connection.doris_sink_config()?)?;
             }
             Self::Postgres(endpoint) => {
-                let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
+                let connection = &endpoint.connection;
                 factory.resource("sql/sink", connection.postgres_sink_config()?)?;
             }
             Self::Sqlite { .. } | Self::Discard => {}

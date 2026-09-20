@@ -4,10 +4,6 @@ use dogpaddle_store::{ReadTransactions, Transactions};
 
 use crate::station::Station;
 
-pub(crate) struct RuntimeTopology {
-    pub(crate) schedule: Vec<usize>,
-}
-
 /// The runtime handle for a built or reopened persistent Flow.
 ///
 /// A Flow owns separate Store capabilities for beginning read-only and write
@@ -20,7 +16,7 @@ pub struct Flow {
     path: PathBuf,
     pub(super) station_ids: Box<[String]>,
     pub(super) stations: Vec<Station>,
-    pub(super) topology: RuntimeTopology,
+    pub(super) schedule: Vec<usize>,
     pub(super) transactions: Transactions,
     pub(super) reads: ReadTransactions,
 }
@@ -30,7 +26,7 @@ impl Flow {
         path: PathBuf,
         station_ids: Vec<String>,
         stations: Vec<Station>,
-        topology: RuntimeTopology,
+        schedule: Vec<usize>,
         transactions: Transactions,
         reads: ReadTransactions,
     ) -> Self {
@@ -43,7 +39,7 @@ impl Flow {
             path,
             station_ids: station_ids.into_boxed_slice(),
             stations,
-            topology,
+            schedule,
             transactions,
             reads,
         }

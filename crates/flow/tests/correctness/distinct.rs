@@ -18,13 +18,12 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.station("scan", SequenceScanDefinition::new(u64::MAX));
-    let distinct = factory.station("distinct", DistinctDefinition::new());
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(scan, NonZeroU64::MAX);
-    factory.output_capacity_bytes(distinct, NonZeroU64::MIN);
-    factory.connect([scan], distinct);
-    factory.connect([distinct], sink);
+    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let distinct = factory.operation("distinct", Box::new(DistinctDefinition::new()), [scan]);
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [distinct]);
+    factory.materialize(scan, NonZeroU64::MAX);
+    factory.materialize(distinct, NonZeroU64::MIN);
+
     drop(factory.build().unwrap());
 
     let blocker = encode_change(&value_change(41)).unwrap();
@@ -70,14 +69,24 @@ fn fused_stateful_operations_roll_back_together_when_final_output_is_backpressur
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("fused");
     let mut factory = FlowFactory::new(&path);
-    let compute = factory.station("compute", SequenceScanDefinition::new(u64::MAX));
-    factory
-        .append(compute, RunningEventCountDefinition::new())
-        .unwrap();
-    factory.append(compute, DistinctDefinition::new()).unwrap();
-    let sink = factory.station("sink", DiscardDefinition::new());
-    factory.output_capacity_bytes(compute, NonZeroU64::MIN);
-    factory.connect([compute], sink);
+    let compute = factory.operation(
+        "compute",
+        Box::new(SequenceScanDefinition::new(u64::MAX)),
+        [],
+    );
+    let compute = factory.operation(
+        "compute/tail-1",
+        Box::new(RunningEventCountDefinition::new()),
+        [compute],
+    );
+    let compute = factory.operation(
+        "compute/tail-2",
+        Box::new(DistinctDefinition::new()),
+        [compute],
+    );
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [compute]);
+    factory.materialize(compute, NonZeroU64::MIN);
+
     drop(factory.build().unwrap());
 
     let blocker = encode_change(&count_change(41)).unwrap();

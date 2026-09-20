@@ -34,7 +34,7 @@ pub struct ExtendDefinition {
 ///
 /// This value owns only its compiled expression and exact output Schema. It
 /// owns no persistent Store data and retains no Definition.
-pub struct ExtendOperation {
+pub(crate) struct ExtendOperation {
     expression: BoundExpression,
     output_schema: SchemaRef,
 }
@@ -60,7 +60,7 @@ pub enum ExtendDefinitionError {
     Expression(#[from] ExpressionDefinitionError),
 }
 
-/// Extend-specific failure during one [`ExtendOperation`] turn.
+/// Extend-specific failure during one `ExtendOperation` turn.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExtendError {
