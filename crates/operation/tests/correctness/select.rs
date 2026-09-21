@@ -9,11 +9,11 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaError};
 use dogpaddle_operation::{
-    DefinitionCodecError, Expr, ExpressionBindError, OperationBindError, OperationKind, col,
-    decode_definition, encode_definition, lit,
+    DefinitionCodecError, Expr, ExpressionBindError, OperationBindError, OperationKind,
+    ProjectionError, col, decode_definition, encode_definition, lit,
     operation::{
         Action, OperationInput,
-        transform::{SelectDefinition, SelectError, SelectSchemaError},
+        transform::{SelectDefinition, SelectSchemaError},
     },
 };
 use dogpaddle_store::Store;
@@ -234,8 +234,8 @@ fn runtime_rejects_invalid_ports() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SelectError>(),
-        Some(SelectError::InvalidInputPort { port: 1 })
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InvalidInputPort { port: 1 })
     ));
 }
 
@@ -314,8 +314,8 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SelectError>(),
-        Some(SelectError::InputSchemaMismatch)
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
 }
 
@@ -336,13 +336,19 @@ fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SelectError>(),
-        Some(SelectError::InputSchemaMismatch)
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
     let error =
         rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SelectError>(),
-        Some(SelectError::Expression { field: 1, .. })
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::Expression { field: 1, .. })
+    ));
+    assert!(matches!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<dogpaddle_operation::ExpressionError>()),
+        Some(dogpaddle_operation::ExpressionError::DataFusion(_))
     ));
 }

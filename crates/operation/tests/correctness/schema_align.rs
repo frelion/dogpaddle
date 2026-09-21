@@ -6,12 +6,12 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaError};
 use dogpaddle_operation::{
-    DefinitionCodecError, ExpressionBindError, OperationBindError, OperationKind, cast, col,
-    decode_definition, encode_definition,
+    DefinitionCodecError, ExpressionBindError, OperationBindError, OperationKind, ProjectionError,
+    cast, col, decode_definition, encode_definition,
     operation::{
         Action, OperationInput,
         transform::{
-            SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignError, SchemaAlignField,
+            SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignField,
             SchemaAlignFieldError, SchemaAlignSchemaError,
         },
     },
@@ -517,8 +517,8 @@ fn empty_schema_align_preserves_row_count_and_diffs_and_rejects_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::InputSchemaMismatch)
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
 }
 
@@ -544,8 +544,8 @@ fn schema_align_rejects_invalid_port_and_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::InvalidInputPort { port: 1 })
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InvalidInputPort { port: 1 })
     ));
 
     let drifted = change_with_field_name("other", &[1]);
@@ -556,8 +556,8 @@ fn schema_align_rejects_invalid_port_and_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::InputSchemaMismatch)
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
 }
 
@@ -581,13 +581,19 @@ fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
     )
     .unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::InputSchemaMismatch)
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
     let error =
         rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<SchemaAlignError>(),
-        Some(SchemaAlignError::Expression { field: 1, .. })
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::Expression { field: 1, .. })
+    ));
+    assert!(matches!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<dogpaddle_operation::ExpressionError>()),
+        Some(dogpaddle_operation::ExpressionError::DataFusion(_))
     ));
 }

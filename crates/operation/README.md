@@ -318,7 +318,7 @@ Join 的 Probe 先验证整个 Claim，Emit 再分页发布，避免输入后段
 
 ## 表达式边界
 
-`Select` 与 `SchemaAlign` 共用私有批量投影执行实现：绑定时共享一个 `DFSchema`，每个 Change 只做一次整组 exact Schema 校验，空投影也检查。各 Definition 继续独立决定字段、metadata、nullability 与稳定编码，运行错误保留具体字段序号。
+`Select` 与 `SchemaAlign` 直接使用同一个私有 `BoundProjection` 运行实例：绑定时共享一个 `DFSchema`，每个 Change 只做一次整组 exact Schema 校验，空投影也检查。各 Definition 继续独立决定字段、metadata、nullability 与稳定编码，运行错误统一为 `ProjectionError`，保留输入端口、具体字段序号和底层错误链；两个 Definition 的构造与 Schema 错误仍各自独立。
 
 Filter、Extend、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow

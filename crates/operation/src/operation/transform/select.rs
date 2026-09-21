@@ -1,19 +1,15 @@
 use std::{num::NonZeroU32, sync::Arc};
 
-use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion_common::DFSchema;
-use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
     ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, ExpressionError, OperationDefinition, OperationKind,
-    RuntimeResource,
+    ExpressionDefinitionError, OperationDefinition, OperationKind, RuntimeResource,
     codec::PayloadCursor,
     definition::{Sealed as SealedDefinition, schema_error},
-    expression::{BoundProjection, ProjectionError, StoredExpression},
-    operation::{AtomicOperation, OperationError, OperationInput},
+    expression::{BoundProjection, StoredExpression},
 };
 
 pub(crate) const TAG: u16 = 7;
@@ -33,15 +29,6 @@ struct SelectField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectDefinition {
     fields: Box<[SelectField]>,
-}
-
-/// Materialized exact-Schema-bound expression projection.
-///
-/// This value owns only its exact input Schema, compiled expressions, and
-/// exact output Schema. It owns no persistent Store data and retains no
-/// Definition.
-pub(crate) struct SelectOperation {
-    projection: BoundProjection,
 }
 
 /// Failure while constructing a [`SelectDefinition`].
@@ -81,36 +68,6 @@ pub enum SelectSchemaError {
         #[source]
         source: ExpressionBindError,
     },
-}
-
-/// Select-specific failure during one `SelectOperation` turn.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum SelectError {
-    /// Select only accepts its Definition's first input port.
-    #[error("select does not accept input port {port}")]
-    InvalidInputPort {
-        /// Rejected zero-based port index.
-        port: usize,
-    },
-    /// Runtime input differs from the exact Schema used during binding.
-    #[error("select input schema differs from its bound schema")]
-    InputSchemaMismatch,
-    /// One bound expression could not evaluate against the input batch.
-    #[error("Select field {field} expression evaluation failed")]
-    Expression {
-        /// Zero-based index of the failed field.
-        field: usize,
-        /// Expression evaluation failure.
-        #[source]
-        source: ExpressionError,
-    },
-    /// Arrow could not construct the selected record batch.
-    #[error(transparent)]
-    Arrow(#[from] ArrowError),
-    /// The selected output violates the Change invariant.
-    #[error(transparent)]
-    Change(#[from] ChangeError),
 }
 
 impl SelectDefinition {
@@ -166,7 +123,7 @@ impl SelectDefinition {
     fn bind_operation(
         &self,
         input_schema: &SchemaRef,
-    ) -> Result<(SchemaRef, SelectOperation), SelectSchemaError> {
+    ) -> Result<(SchemaRef, BoundProjection), SelectSchemaError> {
         let datafusion_schema = DFSchema::try_from(Arc::clone(input_schema))
             .map_err(ExpressionBindError::from)
             .map_err(|source| SelectSchemaError::Expression { field: 0, source })?;
@@ -189,13 +146,11 @@ impl SelectDefinition {
             output_fields,
             input_schema.metadata().clone(),
         ));
-        let operation = SelectOperation {
-            projection: BoundProjection::new(
-                Arc::clone(input_schema),
-                expressions,
-                Arc::clone(&output_schema),
-            ),
-        };
+        let operation = BoundProjection::new(
+            Arc::clone(input_schema),
+            expressions,
+            Arc::clone(&output_schema),
+        );
         Ok((output_schema, operation))
     }
 }
@@ -250,32 +205,6 @@ impl OperationDefinition for SelectDefinition {
             output.extend_from_slice(field.name.as_bytes());
             field.expression.encode(output);
         }
-    }
-}
-
-impl AtomicOperation for SelectOperation {
-    fn apply(
-        &mut self,
-        input: OperationInput<'_>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
-        if input.port != 0 {
-            return Err(SelectError::InvalidInputPort { port: input.port }.into());
-        }
-        self.projection
-            .evaluate(input.change)
-            .map(Some)
-            .map_err(|error| {
-                let error = match error {
-                    ProjectionError::SchemaMismatch => SelectError::InputSchemaMismatch,
-                    ProjectionError::Expression { field, source } => {
-                        SelectError::Expression { field, source }
-                    }
-                    ProjectionError::Arrow(source) => SelectError::Arrow(source),
-                    ProjectionError::Change(source) => SelectError::Change(source),
-                };
-                error.into()
-            })
     }
 }
 

@@ -39,7 +39,7 @@ Filter 的 tag 是 5，output Schema 精确等于 input，只保留 non-null tru
 Extend 的 tag 是 6，每个实例只追加一个由 `name + Expr` 唯一推导类型和 nullability 的字段，保留 input FieldRef 与 Schema metadata，不接受调用者重复声明 Field/type。
 二者都不声明 Operation data；公共证据必须覆盖 proto golden/roundtrip、build 静态拒绝无目录副作用、decoded Definition 的 construct/turn 语义、open 重新构造、成功 build/open/reopen、Filter 空/全量/部分选择与携带混合 diff 的重批、Extend Schema metadata/nullability 和 Array/diff 共享。
 
-Select 与 SchemaAlign 的运行实例共用私有 `BoundProjection`：同组表达式共享 `DFSchema`，执行时整组检查一次 exact input Schema（空投影也检查），保留逐字段错误上下文和各 Definition 的独立 Schema/metadata/codec 规则。
+Select 与 SchemaAlign 直接构造同一个私有 `BoundProjection`，由它实现 `AtomicOperation`，不另设算子运行包装类型：同组表达式共享 `DFSchema`，执行时整组检查一次 exact input Schema（空投影也检查），运行错误使用公共 `ProjectionError`，保留 port、逐字段错误上下文及底层错误链；各 Definition 仍拥有独立 Schema/metadata/codec 规则。
 
 ## 简单 Transform
 

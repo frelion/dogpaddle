@@ -30,8 +30,8 @@ pub use filter::{FilterDefinition, FilterError, FilterSchemaError};
 pub use project::{ProjectDefinition, ProjectError, ProjectSchemaError};
 pub use running_event_count::{RunningEventCountDefinition, RunningEventCountError};
 pub use schema_align::{
-    SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignError, SchemaAlignField,
-    SchemaAlignFieldError, SchemaAlignSchemaError,
+    SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignField, SchemaAlignFieldError,
+    SchemaAlignSchemaError,
 };
-pub use select::{SelectDefinition, SelectDefinitionError, SelectError, SelectSchemaError};
+pub use select::{SelectDefinition, SelectDefinitionError, SelectSchemaError};
 pub use union_all::{UnionAllDefinition, UnionAllError, UnionAllSchemaError};

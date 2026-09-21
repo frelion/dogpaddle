@@ -12,8 +12,8 @@ pub use definition::{
     OperationSchemaError, OperationSetupError,
 };
 pub use expression::{
-    Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError, Operator, ScalarValue,
-    cast, col, ident, lit, try_cast,
+    Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError, Operator,
+    ProjectionError, ScalarValue, cast, col, ident, lit, try_cast,
 };
 pub use resource::RuntimeResource;
 

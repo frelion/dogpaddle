@@ -20,9 +20,14 @@ use datafusion_expr::{
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_proto::bytes::Serializeable;
 use dogpaddle_change::{Change, ChangeError};
+use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
-use crate::{DefinitionCodecError, codec::PayloadCursor};
+use crate::{
+    DefinitionCodecError,
+    codec::PayloadCursor,
+    operation::{AtomicOperation, OperationError, OperationInput},
+};
 
 pub use datafusion_common::ScalarValue;
 pub use datafusion_expr::{Expr, Operator, cast, col, ident, lit, try_cast};
@@ -89,14 +94,34 @@ pub(crate) struct BoundProjection {
     output_schema: SchemaRef,
 }
 
-pub(crate) enum ProjectionError {
-    SchemaMismatch,
+/// Failure while executing a `Select` or `SchemaAlign` expression projection.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ProjectionError {
+    /// Expression projections accept only their first input port.
+    #[error("expression projection does not accept input port {port}")]
+    InvalidInputPort {
+        /// Rejected zero-based port index.
+        port: usize,
+    },
+    /// Runtime input differs from the exact Schema used during binding.
+    #[error("expression projection input schema differs from its bound schema")]
+    InputSchemaMismatch,
+    /// One bound expression could not evaluate against the input batch.
+    #[error("projection field {field} expression evaluation failed")]
     Expression {
+        /// Zero-based index of the failed output field.
         field: usize,
+        /// Expression evaluation failure.
+        #[source]
         source: ExpressionError,
     },
-    Arrow(ArrowError),
-    Change(ChangeError),
+    /// Arrow could not construct the projected record batch.
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
+    /// The projected output violates the Change invariant.
+    #[error(transparent)]
+    Change(#[from] ChangeError),
 }
 
 impl BoundProjection {
@@ -118,9 +143,9 @@ impl BoundProjection {
         }
     }
 
-    pub(crate) fn evaluate(&self, input: &Change) -> Result<Change, ProjectionError> {
+    fn evaluate(&self, input: &Change) -> Result<Change, ProjectionError> {
         if input.records().schema_ref().as_ref() != self.input_schema.as_ref() {
-            return Err(ProjectionError::SchemaMismatch);
+            return Err(ProjectionError::InputSchemaMismatch);
         }
         let columns = self
             .expressions
@@ -142,6 +167,19 @@ impl BoundProjection {
             RecordBatch::try_new_with_options(Arc::clone(&self.output_schema), columns, &options)
                 .map_err(ProjectionError::Arrow)?;
         Change::try_new(records, input.diffs().clone()).map_err(ProjectionError::Change)
+    }
+}
+
+impl AtomicOperation for BoundProjection {
+    fn apply(
+        &mut self,
+        input: OperationInput<'_>,
+        _access: TransactionAccess<'_>,
+    ) -> Result<Option<Change>, OperationError> {
+        if input.port != 0 {
+            return Err(ProjectionError::InvalidInputPort { port: input.port }.into());
+        }
+        self.evaluate(input.change).map(Some).map_err(Into::into)
     }
 }
 

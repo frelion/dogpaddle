@@ -1,19 +1,15 @@
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
-use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion_common::DFSchema;
-use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
     ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, ExpressionError, OperationDefinition, OperationKind,
-    RuntimeResource,
+    ExpressionDefinitionError, OperationDefinition, OperationKind, RuntimeResource,
     codec::PayloadCursor,
     definition::{Sealed as SealedDefinition, schema_error},
-    expression::{BoundProjection, ProjectionError, StoredExpression},
-    operation::{AtomicOperation, OperationError, OperationInput},
+    expression::{BoundProjection, StoredExpression},
 };
 
 pub(crate) const TAG: u16 = 9;
@@ -43,15 +39,6 @@ pub struct SchemaAlignField {
 pub struct SchemaAlignDefinition {
     fields: Box<[SchemaAlignField]>,
     metadata: BTreeMap<String, String>,
-}
-
-/// Materialized exact-Schema-bound alignment.
-///
-/// This value owns only its exact input Schema, compiled expressions, and
-/// exact output Schema. It owns no persistent Store data and retains no
-/// Definition.
-pub(crate) struct SchemaAlignOperation {
-    projection: BoundProjection,
 }
 
 /// Failure while constructing one [`SchemaAlignField`].
@@ -124,36 +111,6 @@ pub enum SchemaAlignSchemaError {
         /// Zero-based index of the rejected output field.
         field: usize,
     },
-}
-
-/// SchemaAlign-specific failure during one `SchemaAlignOperation` turn.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum SchemaAlignError {
-    /// `SchemaAlign` only accepts its Definition's first input port.
-    #[error("schema align does not accept input port {port}")]
-    InvalidInputPort {
-        /// Rejected zero-based port index.
-        port: usize,
-    },
-    /// Runtime input differs from the exact Schema used during binding.
-    #[error("schema align input schema differs from its bound schema")]
-    InputSchemaMismatch,
-    /// One bound expression could not evaluate against the input batch.
-    #[error("SchemaAlign field {field} expression evaluation failed")]
-    Expression {
-        /// Zero-based index of the failed output field.
-        field: usize,
-        /// Expression evaluation failure.
-        #[source]
-        source: ExpressionError,
-    },
-    /// Arrow could not construct the aligned record batch.
-    #[error(transparent)]
-    Arrow(#[from] ArrowError),
-    /// The aligned output violates the Change invariant.
-    #[error(transparent)]
-    Change(#[from] ChangeError),
 }
 
 impl SchemaAlignField {
@@ -304,7 +261,7 @@ impl SchemaAlignDefinition {
     fn bind_operation(
         &self,
         input_schema: &SchemaRef,
-    ) -> Result<(SchemaRef, SchemaAlignOperation), SchemaAlignSchemaError> {
+    ) -> Result<(SchemaRef, BoundProjection), SchemaAlignSchemaError> {
         let datafusion_schema = DFSchema::try_from(Arc::clone(input_schema))
             .map_err(ExpressionBindError::from)
             .map_err(|source| SchemaAlignSchemaError::Expression { field: 0, source })?;
@@ -342,13 +299,11 @@ impl SchemaAlignDefinition {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         ));
-        let operation = SchemaAlignOperation {
-            projection: BoundProjection::new(
-                Arc::clone(input_schema),
-                expressions,
-                Arc::clone(&output_schema),
-            ),
-        };
+        let operation = BoundProjection::new(
+            Arc::clone(input_schema),
+            expressions,
+            Arc::clone(&output_schema),
+        );
         Ok((output_schema, operation))
     }
 }
@@ -403,32 +358,6 @@ impl OperationDefinition for SchemaAlignDefinition {
             encode_metadata(&field.metadata, output);
         }
         encode_metadata(&self.metadata, output);
-    }
-}
-
-impl AtomicOperation for SchemaAlignOperation {
-    fn apply(
-        &mut self,
-        input: OperationInput<'_>,
-        _access: TransactionAccess<'_>,
-    ) -> Result<Option<Change>, OperationError> {
-        if input.port != 0 {
-            return Err(SchemaAlignError::InvalidInputPort { port: input.port }.into());
-        }
-        self.projection
-            .evaluate(input.change)
-            .map(Some)
-            .map_err(|error| {
-                let error = match error {
-                    ProjectionError::SchemaMismatch => SchemaAlignError::InputSchemaMismatch,
-                    ProjectionError::Expression { field, source } => {
-                        SchemaAlignError::Expression { field, source }
-                    }
-                    ProjectionError::Arrow(source) => SchemaAlignError::Arrow(source),
-                    ProjectionError::Change(source) => SchemaAlignError::Change(source),
-                };
-                error.into()
-            })
     }
 }
 
