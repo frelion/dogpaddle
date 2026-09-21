@@ -225,9 +225,6 @@ fn validate_definition(
         stations
             .iter()
             .map(|station| {
-                if station.inputs.is_empty() {
-                    return Ok(None);
-                }
                 station
                     .inputs
                     .iter()
@@ -240,7 +237,6 @@ fn validate_definition(
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map(Some)
             })
             .collect::<Result<Vec<_>, _>>()?
     };

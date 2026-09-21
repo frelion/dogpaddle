@@ -25,7 +25,7 @@ pub(crate) struct ResolvedTopology {
 }
 
 pub(crate) fn resolve_topology(
-    inputs_by_station: Vec<Option<Vec<usize>>>,
+    inputs_by_station: Vec<Vec<usize>>,
     schedule: Vec<usize>,
 ) -> ResolvedTopology {
     let mut subscriber_counts = vec![0_u64; inputs_by_station.len()];
@@ -33,7 +33,6 @@ pub(crate) fn resolve_topology(
         .into_iter()
         .map(|inputs| {
             inputs
-                .unwrap_or_default()
                 .into_iter()
                 .map(|producer| {
                     let subscriber = subscriber_counts[producer];

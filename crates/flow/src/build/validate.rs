@@ -207,14 +207,11 @@ fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), Topol
 
 pub(super) fn validate_decoded_topology(
     stations: &[StationDefinition],
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<Vec<usize>, TopologyError> {
     validate_station_programs(stations)?;
     for (station, inputs) in inputs_by_station.iter().enumerate() {
-        if inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.contains(&station))
-        {
+        if inputs.contains(&station) {
             return Err(TopologyError::SelfLoop(stations[station].id.clone()));
         }
     }
@@ -240,7 +237,7 @@ fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), Topo
 
 fn validate_topology(
     stations: &[StationDefinition],
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<Vec<usize>, TopologyError> {
     let schedule = topological_schedule(inputs_by_station)?;
     validate_endpoints(stations, inputs_by_station)?;
@@ -251,15 +248,15 @@ fn validate_topology(
 
 fn validate_endpoints(
     stations: &[StationDefinition],
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<(), TopologyError> {
     let mut has_consumer = vec![false; stations.len()];
-    for input in inputs_by_station.iter().flatten().flatten() {
+    for input in inputs_by_station.iter().flatten() {
         has_consumer[*input] = true;
     }
 
     for (index, station) in stations.iter().enumerate() {
-        let is_root = inputs_by_station[index].as_ref().is_none_or(Vec::is_empty);
+        let is_root = inputs_by_station[index].is_empty();
         if is_root && !station.is_scan() {
             return Err(TopologyError::RootIsNotScan(station.id.clone()));
         }
@@ -272,10 +269,10 @@ fn validate_endpoints(
 
 fn validate_inputs_have_output(
     stations: &[StationDefinition],
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<(), TopologyError> {
     for (station, inputs) in inputs_by_station.iter().enumerate() {
-        for input in inputs.iter().flatten() {
+        for input in inputs {
             if !stations[*input].has_output() {
                 return Err(TopologyError::InputHasNoOutput {
                     input_station: stations[*input].id.clone(),
@@ -289,11 +286,11 @@ fn validate_inputs_have_output(
 
 fn validate_input_counts(
     stations: &[StationDefinition],
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<(), TopologyError> {
     for (station, inputs) in stations.iter().zip(inputs_by_station) {
         let expected = station.input_count();
-        let actual = inputs.as_ref().map_or(0, Vec::len);
+        let actual = inputs.len();
         if actual != expected {
             return Err(TopologyError::InputCount {
                 station: station.id.clone(),
@@ -348,13 +345,13 @@ fn resolve_ref(
 }
 
 pub(super) fn topological_schedule(
-    inputs_by_station: &[Option<Vec<usize>>],
+    inputs_by_station: &[Vec<usize>],
 ) -> Result<Vec<usize>, TopologyError> {
     let station_count = inputs_by_station.len();
     let mut indegrees = vec![0_usize; station_count];
     let mut consumers_by_station = vec![Vec::new(); station_count];
     for (station, inputs) in inputs_by_station.iter().enumerate() {
-        for input in inputs.iter().flatten() {
+        for input in inputs {
             indegrees[station] += 1;
             consumers_by_station[*input].push(station);
         }
