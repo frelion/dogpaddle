@@ -37,18 +37,29 @@ Residual 在原始 exact input fields 组成的 `left.* + right.*` candidate Sch
 所有 kind 声明 `equi_join.left_rows` / `equi_join.right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>` 和 `equi_join.continuation: Cell<JoinContinuation>`：两侧按完整 canonical key 分区，以完整 canonical row 及正 `u64` multiplicity 表示关系。
 无 residual 的非 Inner 另外声明 `equi_join.key_counts: OrderedMap<Vec<u8>, KeyCounts>`，值是该 key 左右两侧的正 distinct-row counts；NULL key 不进入 counts，zero/zero 必须删除。
 带 residual 的非 Inner 改为声明 `equi_join.match_counts: OrderedMap<Vec<u8>, u64>`，按完整行记录 qualifying distinct opposite rows；FullOuter 跟踪两侧，其他 presence kind 只跟踪 left，真实零必须缺失。
-每个 Claim 先按行序预检本侧 exact admission 和同 Claim 的 presence transitions，再分页 Probe 全部需要读取的对侧记录，只有所有 predicate、row decode、typed NULL output 和 diff 计算都可表示后才进入 Emit；residual presence 的 Probe 只写隔离 shadow domain，随后 ClearShadow 分页清理，绝不提前改变真实关系状态。
-Emit 逐页提交 output 与 continuation；每个 outer presence transition 的 null correction 与对应 pair 作为同一分页 work item，当前输入行最后一页同事务调整本侧 rows/counts，最后一行清理 continuation 并 Complete。
-Station durable active pin 保证 Claim 完成前对侧状态不变；continuation 只保存 port、Probe/ClearShadow/Emit phase、row ordinal、本行 match marker 和排他 resume key，不复制 Subscription identity、Change 或 fingerprint。
+当前 v1 match-count key 为单字节 port 加完整 canonical row；continuation 的 v1 codec 不含 phase。旧布局的数据库需重建，不提供格式识别、迁移或兼容路径。
+每个 Claim 先按行序预检本侧 exact admission 和同 Claim 的 presence transitions，在发布输出前拒绝本侧负前缀和 `u64` multiplicity overflow。随后直接分页扫描对侧、求值 residual、更新真实 support 并构造输出，不预演整个 Claim，也不保存影子计数。
+每页同事务提交真实状态、output 与 continuation；每个 outer presence transition 的 null correction 与对应 pair 作为同一分页 work item，当前输入行最后一页同事务调整本侧 rows/counts，最后一行清理 continuation 并 Complete。
+Station durable active pin 保证 Claim 完成前对侧状态不变；continuation 只保存 port、row ordinal、本行 match marker 和排他 resume key，不复制 Subscription identity、Change 或 fingerprint。
 Inner 保持三资源热路径；无 residual 不访问 match counts；五种语义共用一个 Definition/runtime，不建立 per-kind Operation、arrangement、Join Station 或第二套执行协议。
 
 `EquiJoin` 的输入准备逐个求值并编码 key expression，释放当前 key array 后再处理下一个；全部 key 完成后才编码完整行。
-整批 admission 与 Probe 仍在任何输出发布前完成，此优化不增加输入硬上限。
+整批 admission 在任何输出发布前完成，不增加输入硬上限。
 
-Probe/Emit 重复扫描和求值是有意的 whole-Claim failure-before-output 边界：整个 Claim 中后面的
-predicate、存储行损坏或 output-diff overflow 不会在前面的结果已经发布后才暴露。
-当前不持久化
-qualifying-pair spool 或 bitset，也不用跨阶段内存 cache 代替可重放的第二遍。
+错误边界是一笔 turn 事务。后续页面的 residual 求值、存储行解码、typed NULL output 或
+`i64` output-diff overflow 可能在前面页面已经发布后失败；合法输入和合法的两侧 multiplicity
+也可能触发计算错误。当前失败页全部回滚，之前提交的状态、输出与 continuation 保留，
+下游及外部 Sink 可能已经看到部分结果。状态可能停在一个输入行处理到一半的位置，
+不能把它解释为完整输入事件前缀的最终关系。只有 Complete 才确认整个 Claim。
+
+reopen 从持久的排他游标继续，不重复已提交页，也不跳过失败页；确定性错误仍会在同处失败。
+恢复不补偿已发布输出、不自动删除状态，也不提供 skip 或修复坏 Claim 的接口。
+当前行的本侧 rows/counts 仅在最后一页更新，reopen 从当前行重建 admission；
+已提交的 actual support 与 continuation 共同描述行内进度。PreparedClaim 不缓存可推进的分页游标。
+
+成功执行时，对固定有序 `(port, Change)` 输入，展平后的有序 `(row, diff)` 输出不因分页变化而改变。
+turn 数会影响多输入 Flow 的调度交错，因此不承诺全图差分轨迹、输出时间、IPC 字节或
+RunningEventCount 结果不变；纯关系链在每源顺序相同且成功执行到静止后应得到相同最终关系。
 
 `PreparedClaim` 只为整批保留 canonical row、join key、diff 和 admission effect，不再保留每行的全量
 `ScalarValue`；每个 turn 处理当前 row 时，仅在 predicate 或真实输出需要字段值时，才从 Station 固定的
@@ -75,7 +86,7 @@ driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftS
 `match_counts` 以完整 canonical row 为 key，持久状态与 tracked rows 的总宽度成正比；分页也不限制
 整个 Join 关系的磁盘大小，无法消除连接结果本身的高 fan-out 成本。
 
-Semi/Anti 同一 exact row 仅改变正 multiplicity 时不重扫对侧 bucket；right 更新不改变 support，left 更新直接读已有 actual/shadow count。
+Semi/Anti 同一 exact row 仅改变正 multiplicity 时不重扫对侧 bucket；right 更新不改变 support，left 更新直接读已有 actual count。
 Driving-row count 按 qualifying page 合并，对侧 distinct-row count 分别更新。
 
 ## AsOfJoin
@@ -123,5 +134,5 @@ Tolerance 使用 order 的物理单位且包含端点，只限制匹配，不授
 
 ## EquiJoin 源码分工
 
-`equi_join/runtime.rs` 拥有阶段推进、continuation 和持久写入；私有子模块 `runtime/matches.rs` 拥有候选扫描、residual 与批次预算，`runtime/output.rs` 拥有结果构造、修正和共享 preflight 验证。
+`equi_join/runtime.rs` 拥有分页推进、continuation 和持久写入；私有子模块 `runtime/matches.rs` 拥有候选扫描、residual 与批次预算，`runtime/output.rs` 拥有结果构造、修正和 checked diff 验证。
 这些模块仍操作同一个运行对象，不增加 Context、Engine、每种 Join kind 的对象或第二套执行协议。

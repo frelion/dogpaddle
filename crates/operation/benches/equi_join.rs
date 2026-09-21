@@ -177,7 +177,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "two complete Claims, all Probe/ClearShadow/Emit turns, synchronous commits, AfterCommit",
+            "timed_boundary": "two complete Claims, all paged turns, synchronous commits, AfterCommit",
             "throughput_unit": "Claims (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
             "cases": {
@@ -197,14 +197,12 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                 "predicate": "left.value < right.value for every residual case; the driving right.value changes selectivity without changing the expression shape",
                 "scope": "one timed iteration is a +1 Claim followed by its -1 Claim; right-stable keeps one identical right row present, left-stable keeps the left row and a right fanout present",
                 "scanning_case_candidate_pairs_per_iteration": 2 * fanout,
-                "scanning_case_predicate_candidate_evaluations_per_iteration": 4 * fanout,
+                "scanning_case_predicate_candidate_evaluations_per_iteration": 2 * fanout,
                 "selectivity_cases": [0.0, 0.5, 1.0],
                 "match_count_traffic": {
                     "inner_residual_half_selective": {
                         "tracked_sides_per_qualifying_pair": 0,
-                        "shadow_adjustments_per_iteration": 0,
-                        "actual_adjustments_per_iteration": 0,
-                        "shadow_cleanup_entries_per_iteration": 0
+                        "actual_adjustments_per_iteration": 0
                     },
                     "left_semi_residual_presence_stable": {
                         "candidate_scans_per_iteration": 0,
@@ -213,20 +211,16 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                     "left_semi_residual_left_presence_stable": {
                         "candidate_scans_per_iteration": 0,
                         "match_count_writes_per_iteration": 0,
-                        "match_count_reads": "constant per Probe and Emit, independent of right fanout"
+                        "match_count_reads": "constant per Claim, independent of right fanout"
                     },
                     "left_semi_residual_partial_transition": {
                         "tracked_sides_per_qualifying_pair": 1,
-                        "shadow_adjustments_per_iteration": 2 * half,
-                        "actual_adjustments_per_iteration": 2 * half,
-                        "shadow_cleanup_entries_per_iteration": 2 * half
+                        "actual_adjustments_per_iteration": 2 * half
                     },
                     "full_outer_residual_partial_transition": {
                         "tracked_sides_per_qualifying_pair": 2,
-                        "opposite_row_shadow_adjustments_per_iteration": 2 * half,
                         "opposite_row_actual_adjustments_per_iteration": 2 * half,
-                        "driving_row_adjustments": "one checked adjustment per qualifying scan page in Probe and Emit",
-                        "shadow_cleanup_entries_per_iteration": 2 * (half + 1)
+                        "driving_row_adjustments": "one checked adjustment per qualifying scan page"
                     }
                 }
             }

@@ -1,4 +1,4 @@
-//! Output rows and corrections, shared by preflight validation and emission.
+//! Output rows and presence corrections for the current transactional page.
 
 use std::sync::Arc;
 
@@ -21,18 +21,6 @@ pub(super) struct OutputRows {
 }
 
 impl EquiJoinOperation {
-    pub(super) fn validate_output_page(
-        &self,
-        port: usize,
-        input: &ActiveRow<'_>,
-        effect: RowEffect,
-        matches: &[MultisetEntry<Vec<u8>>],
-    ) -> Result<(), EquiJoinError> {
-        let mut output = OutputRows::new(self.output_schema.fields().len());
-        self.append_output_page(port, input, effect, matches, &mut output)?;
-        output.finish(&self.output_schema).map(|_| ())
-    }
-
     pub(super) fn append_output_page(
         &self,
         port: usize,
@@ -192,17 +180,6 @@ impl EquiJoinOperation {
             ));
         }
         Ok(())
-    }
-
-    pub(super) fn validate_residual_current(
-        &self,
-        port: usize,
-        input: &ActiveRow<'_>,
-        found_match: bool,
-    ) -> Result<(), EquiJoinError> {
-        let mut output = OutputRows::new(self.output_schema.fields().len());
-        self.append_residual_current(port, input, found_match, &mut output)?;
-        output.finish(&self.output_schema).map(|_| ())
     }
 
     pub(super) fn append_residual_current(

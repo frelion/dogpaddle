@@ -46,8 +46,10 @@ output。函数 descriptor、argument tuple framing
 
 EquiJoin 的 owner 文件必须用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 与 FullOuter，
 并证明 tag `16` 的 kind payload、Inner 三资源与其余 kind 四资源、NULL key、重复权重、同一 Claim 内的
-presence 往返、outer nullability、正负 diff 边界、分页 rollback 和 Probe/Emit reopen；residual 还必须
-覆盖逐完整行 support、`FALSE/NULL`、Probe/ClearShadow/Emit reopen 与 rollback。SQL 只证明
+presence 往返、outer nullability、正负 diff 边界、分页 rollback 和行内 continuation reopen；residual 还必须
+覆盖逐完整行 support、`FALSE/NULL`、已提交 support 的行内恢复与 Complete rollback。
+晚期 residual、decode 和 output-diff 错误必须证明：当前 turn 回滚，已提交页保留，
+reopen 不重复输出且不跳过确定性失败；整批本侧负前缀与 multiplicity overflow 仍在输出前拒绝。SQL 只证明
 Right Join 的 swap + SchemaAlign、原生 residual 的方向改写，以及每种新增 LogicalPlan lowering
 至少一个最终关系 witness，不复制 Join 状态机。
 
@@ -63,6 +65,8 @@ Schema/Program identity 和最终关系，不复制 Operation API 的 nearest、
 ### Flow
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Project 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、AsOfJoin 新增的双输入外层/候选双重 continuation 在真实资源路径上的 drop/open、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
+
+EquiJoin 的跨 turn 晚期错误由真实 SQLite Sink witness 证明目标可见的部分结果、未确认输入和 reopen；不在 Flow 复制各 Join kind 的关系 oracle。
 
 Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。Definition
 还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和运行构造前拒绝
@@ -150,7 +154,7 @@ AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提�
 | `cell` | Criterion |
 | `projection` | Operation 自有 Criterion：Select/SchemaAlign 的 8/128/512 列 × 1/256 行；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX，以及独立的多真实 layout MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
-| `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的 Probe/ClearShadow/Emit、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
+| `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的全部分页 turns、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
 | `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
 | `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、nearest+tolerance 和 residual 远候选回退；每次计时包含一对使关系回到初始态的完整 Claim、全部 Probe/Emit turns、同步 commit 和 AfterCommit，fixture、seed 与结果校验不计时 |

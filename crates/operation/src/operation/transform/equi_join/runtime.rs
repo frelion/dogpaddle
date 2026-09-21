@@ -1,4 +1,4 @@
-// Phase advancement and durable writes stay here. Candidate evaluation and
+// Input progress and durable writes stay here. Candidate evaluation and
 // output construction are private children and share this runtime's state.
 mod matches;
 mod output;
@@ -8,10 +8,7 @@ use std::{cell::OnceCell, collections::HashMap, mem::size_of, ops::Deref, sync::
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
-use dogpaddle_store::{
-    MultisetEntry, OrderedMapAccess, OrderedMapPage, ScanDirection, ScanLimit, StoreError,
-    TransactionAccess,
-};
+use dogpaddle_store::{MultisetEntry, OrderedMapAccess, StoreError, TransactionAccess};
 
 use crate::{
     expression::BoundExpression,
@@ -24,8 +21,7 @@ use crate::{
 use super::{
     EquiJoinError, EquiJoinKind,
     state::{
-        Continuation, Counts, JoinContinuation, KeyCounts, MatchCounts, Phase, Rows,
-        actual_match_key, shadow_match_key, shadow_match_range,
+        Continuation, Counts, JoinContinuation, KeyCounts, MatchCounts, Rows, actual_match_key,
     },
 };
 
@@ -50,9 +46,9 @@ pub(super) struct BoundKeyPair {
 /// Materialized, exact-Schema equality join.
 ///
 /// The runtime keeps both input relations in private durable multisets. A
-/// durable continuation first validates every match for the pinned input
-/// Change, then emits bounded pages. This makes output-difference overflow and
-/// corrupt stored rows fail before any page from that Change is published.
+/// durable continuation advances through bounded output pages after exact-row
+/// admission. Each page commits atomically; a later page failure leaves earlier
+/// committed pages and their progress intact.
 pub(crate) struct EquiJoinOperation {
     pub(super) kind: EquiJoinKind,
     pub(super) input_schemas: [SchemaRef; 2],
@@ -210,7 +206,7 @@ impl EquiJoinOperation {
             .collect::<Vec<_>>();
         // Retain at most one evaluated key array. Encode full rows only after
         // all key arrays have been released; the complete Claim still passes
-        // admission and Probe before any output is published.
+        // admission before any output is published.
         for (key, pair) in self.keys.iter().enumerate() {
             let bound = pair.for_port(input.port);
             let column = bound.expression.evaluate(records).map_err(|source| {
@@ -252,10 +248,6 @@ impl EquiJoinOperation {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one loop keeps the durable pure-equality Probe/Emit state machine auditable"
-    )]
     fn apply_equi_claim(
         &self,
         claim: &mut PreparedClaim,
@@ -269,25 +261,16 @@ impl EquiJoinOperation {
         } else {
             JoinContinuation {
                 port: u8::try_from(claim.port).expect("the two validated Join ports fit in a byte"),
-                phase: Phase::Probe,
                 row: 0,
                 found_match: false,
                 resume_after: None,
             }
         };
         if claim.effects.is_none() {
-            // Probe has not changed either relation. Emit has committed only
-            // earlier rows, so reopen simulates the still-unapplied suffix.
-            let start = match state.phase {
-                Phase::Probe => 0,
-                Phase::Emit => usize::try_from(state.row)
-                    .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?,
-                Phase::ClearShadow => {
-                    return Err(EquiJoinError::InvalidContinuation(
-                        "pure equality join has a residual shadow phase",
-                    ));
-                }
-            };
+            // Only complete earlier rows have changed own rows/counts. After
+            // reopen, simulate the still-unapplied suffix from the durable row.
+            let start = usize::try_from(state.row)
+                .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?;
             claim.effects = Some(self.preflight_admission(claim, start, access)?);
         }
 
@@ -297,10 +280,7 @@ impl EquiJoinOperation {
             let row_index = usize::try_from(state.row)
                 .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?;
             let prepared = &claim.rows[row_index];
-            let effect = claim
-                .effects
-                .as_ref()
-                .expect("the Claim has been preflighted")[row_index];
+            let effect = claim.effects.as_ref().expect("the Claim has been admitted")[row_index];
             if !budget.can_start(prepared) {
                 continuation.set(&state)?;
                 return Ok(Action::Commit(output.finish(&self.output_schema)?));
@@ -323,67 +303,30 @@ impl EquiJoinOperation {
                 continuation.set(&state)?;
                 return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
-            match state.phase {
-                Phase::Probe => {
-                    self.validate_output_page(claim.port, &row, effect, &page.entries)?;
-                }
-                Phase::Emit => {
-                    self.append_output_page(claim.port, &row, effect, &page.entries, &mut output)?;
-                }
-                Phase::ClearShadow => unreachable!("the pure equality path rejects this phase"),
-            }
+            self.append_output_page(claim.port, &row, effect, &page.entries, &mut output)?;
             budget.charge(work);
 
             if let Some(resume_after) = page.continuation {
                 state.resume_after = Some(resume_after);
                 continuation.set(&state)?;
-                return Ok(match state.phase {
-                    Phase::Probe => Action::Commit(None),
-                    Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    Phase::ClearShadow => {
-                        unreachable!("the pure equality path rejects this phase")
-                    }
-                });
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
 
-            match state.phase {
-                Phase::Probe => {
-                    let next = row_index + 1;
-                    if next == claim.rows.len() {
-                        state.phase = Phase::Emit;
-                        state.row = 0;
-                    } else {
-                        state.row = persistent_row(next)?;
-                    }
-                    state.resume_after = None;
-                    if budget.exhausted() {
-                        continuation.set(&state)?;
-                        return Ok(Action::Commit(None));
-                    }
-                }
-                Phase::Emit => {
-                    self.adjust_own_row(claim.port, &row, access)?;
-                    let next = row_index + 1;
-                    if next == claim.rows.len() {
-                        continuation.clear()?;
-                        return Ok(Action::Complete(output.finish(&self.output_schema)?));
-                    }
-                    state.row = persistent_row(next)?;
-                    state.resume_after = None;
-                    if budget.exhausted() {
-                        continuation.set(&state)?;
-                        return Ok(Action::Commit(output.finish(&self.output_schema)?));
-                    }
-                }
-                Phase::ClearShadow => unreachable!("the pure equality path rejects this phase"),
+            self.adjust_own_row(claim.port, &row, access)?;
+            let next = row_index + 1;
+            if next == claim.rows.len() {
+                continuation.clear()?;
+                return Ok(Action::Complete(output.finish(&self.output_schema)?));
+            }
+            state.row = persistent_row(next)?;
+            state.resume_after = None;
+            if budget.exhausted() {
+                continuation.set(&state)?;
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one loop keeps the durable Probe/ClearShadow/Emit transitions and commits together"
-    )]
     fn apply_residual_claim(
         &self,
         claim: &mut PreparedClaim,
@@ -393,105 +336,34 @@ impl EquiJoinOperation {
         debug_assert!(self.residual.is_some());
         let mut continuation = self.continuation.access(access)?;
         let mut state = if let Some(state) = continuation.get()? {
-            self.validate_residual_continuation(claim, &state)?;
+            Self::validate_residual_continuation(claim, &state)?;
             state
         } else {
             JoinContinuation {
                 port: u8::try_from(claim.port).expect("the two validated Join ports fit in a byte"),
-                phase: Phase::Probe,
                 row: 0,
                 found_match: false,
                 resume_after: None,
             }
         };
         if claim.effects.is_none() {
-            // Probe and shadow cleanup leave both input relations unchanged.
-            // Emit commits only complete earlier rows, so a reopen can
-            // reconstruct the exact-row presence transitions for its suffix.
-            let start = match state.phase {
-                Phase::Probe | Phase::ClearShadow => 0,
-                Phase::Emit => usize::try_from(state.row)
-                    .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?,
-            };
+            // Partial pages may update support counts, but own rows change only
+            // on the last page. Admission reads own rows, not support counts.
+            let start = usize::try_from(state.row)
+                .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?;
             claim.effects = Some(self.preflight_residual_admission(claim, start, access)?);
         }
 
         let mut budget = TurnBudget::new();
         let mut output = OutputRows::new(self.output_schema.fields().len());
         loop {
-            if state.phase == Phase::ClearShadow {
-                let Some(page) =
-                    self.scan_shadow_matches(state.resume_after.as_ref(), &budget, access)?
-                else {
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(None));
-                };
-                let work = shadow_work(&page);
-                if !budget.can_accept(work) {
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(None));
-                }
-                let mut counts = self
-                    .match_counts
-                    .as_ref()
-                    .ok_or(EquiJoinError::InvalidMatchCount(
-                        "residual presence join has no match-count state",
-                    ))?
-                    .access(access)?;
-                for (key, _) in &page.entries {
-                    if !counts.remove(key)? {
-                        return Err(EquiJoinError::InvalidMatchCount(
-                            "shadow count disappeared during cleanup",
-                        ));
-                    }
-                }
-                budget.charge(work);
-                if let Some(resume_after) = page.continuation {
-                    state.resume_after = Some(resume_after);
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(None));
-                }
-                let probe_limit = ScanLimit::new(1, 1)
-                    .expect("one item and one logical byte form a valid existence probe");
-                match counts.scan(
-                    shadow_match_range(),
-                    ScanDirection::Ascending,
-                    None,
-                    probe_limit,
-                ) {
-                    Ok(remaining) if remaining.entries.is_empty() => {}
-                    Ok(_) | Err(StoreError::ItemTooLarge { .. }) => {
-                        return Err(EquiJoinError::InvalidContinuation(
-                            "shadow cleanup cursor skipped a remaining count",
-                        ));
-                    }
-                    Err(source) => return Err(source.into()),
-                }
-                state.phase = Phase::Emit;
-                state.row = 0;
-                state.found_match = false;
-                state.resume_after = None;
-                if budget.exhausted() {
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(None));
-                }
-                continue;
-            }
-
             let row_index = usize::try_from(state.row)
                 .map_err(|_| EquiJoinError::InvalidContinuation("row exceeds usize"))?;
             let prepared = &claim.rows[row_index];
-            let effect = claim
-                .effects
-                .as_ref()
-                .expect("the Claim has been preflighted")[row_index];
+            let effect = claim.effects.as_ref().expect("the Claim has been admitted")[row_index];
             if !budget.can_start(prepared) {
                 continuation.set(&state)?;
-                return Ok(match state.phase {
-                    Phase::Probe => Action::Commit(None),
-                    Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
-                });
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
             let row = ActiveRow::new(prepared, records, row_index);
             if self.kind.left_only() && matches!(effect.transition, KeyTransition::None) {
@@ -500,8 +372,7 @@ impl EquiJoinOperation {
                         "stable left-only row has an opposite-row cursor",
                     ));
                 }
-                state.found_match =
-                    self.stable_left_only_found_match(claim.port, &row, state.phase, access)?;
+                state.found_match = self.stable_left_only_found_match(claim.port, &row, access)?;
             }
             let Some(page) = self.scan_residual_matches(
                 claim.port,
@@ -513,111 +384,45 @@ impl EquiJoinOperation {
             )?
             else {
                 continuation.set(&state)?;
-                return Ok(match state.phase {
-                    Phase::Probe => Action::Commit(None),
-                    Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
-                });
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             };
             if !budget.can_accept(page.work) {
                 continuation.set(&state)?;
-                return Ok(match state.phase {
-                    Phase::Probe => Action::Commit(None),
-                    Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
-                });
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
 
-            match state.phase {
-                Phase::Probe => {
-                    self.probe_residual_page(
-                        claim.port,
-                        &row,
-                        effect,
-                        &page.matches,
-                        page.qualifying,
-                        &mut state,
-                        access,
-                    )?;
-                }
-                Phase::Emit => {
-                    self.emit_residual_page(
-                        claim.port,
-                        &row,
-                        effect,
-                        &page.matches,
-                        page.qualifying,
-                        &mut state,
-                        &mut output,
-                        access,
-                    )?;
-                }
-                Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
-            }
+            self.emit_residual_page(
+                claim.port,
+                &row,
+                effect,
+                &page.matches,
+                page.qualifying,
+                &mut state,
+                &mut output,
+                access,
+            )?;
             budget.charge(page.work);
 
             if let Some(resume_after) = page.continuation {
                 state.resume_after = Some(resume_after);
                 continuation.set(&state)?;
-                return Ok(match state.phase {
-                    Phase::Probe => Action::Commit(None),
-                    Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
-                });
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
 
-            match state.phase {
-                Phase::Probe => {
-                    self.validate_residual_current(claim.port, &row, state.found_match)?;
-                    self.validate_shadow_current_match_count(
-                        claim.port,
-                        &row,
-                        effect,
-                        state.found_match,
-                        access,
-                    )?;
-                    let next = row_index + 1;
-                    if next == claim.rows.len() {
-                        state.phase = if self.match_counts.is_some() {
-                            Phase::ClearShadow
-                        } else {
-                            Phase::Emit
-                        };
-                        state.row = 0;
-                    } else {
-                        state.row = persistent_row(next)?;
-                    }
-                    state.found_match = false;
-                    state.resume_after = None;
-                    if budget.exhausted() {
-                        continuation.set(&state)?;
-                        return Ok(Action::Commit(None));
-                    }
-                }
-                Phase::Emit => {
-                    self.append_residual_current(claim.port, &row, state.found_match, &mut output)?;
-                    self.validate_current_match_count(
-                        claim.port,
-                        &row,
-                        effect,
-                        state.found_match,
-                        access,
-                    )?;
-                    self.adjust_own_row(claim.port, &row, access)?;
-                    let next = row_index + 1;
-                    if next == claim.rows.len() {
-                        continuation.clear()?;
-                        return Ok(Action::Complete(output.finish(&self.output_schema)?));
-                    }
-                    state.row = persistent_row(next)?;
-                    state.found_match = false;
-                    state.resume_after = None;
-                    if budget.exhausted() {
-                        continuation.set(&state)?;
-                        return Ok(Action::Commit(output.finish(&self.output_schema)?));
-                    }
-                }
-                Phase::ClearShadow => unreachable!("shadow cleanup was handled above"),
+            self.append_residual_current(claim.port, &row, state.found_match, &mut output)?;
+            self.validate_current_match_count(claim.port, &row, effect, state.found_match, access)?;
+            self.adjust_own_row(claim.port, &row, access)?;
+            let next = row_index + 1;
+            if next == claim.rows.len() {
+                continuation.clear()?;
+                return Ok(Action::Complete(output.finish(&self.output_schema)?));
+            }
+            state.row = persistent_row(next)?;
+            state.found_match = false;
+            state.resume_after = None;
+            if budget.exhausted() {
+                continuation.set(&state)?;
+                return Ok(Action::Commit(output.finish(&self.output_schema)?));
             }
         }
     }
@@ -698,140 +503,6 @@ impl EquiJoinOperation {
             }
         }
         Ok(effects)
-    }
-
-    fn scan_shadow_matches(
-        &self,
-        resume_after: Option<&Vec<u8>>,
-        budget: &TurnBudget,
-        access: TransactionAccess<'_>,
-    ) -> Result<Option<OrderedMapPage<Vec<u8>, u64>>, EquiJoinError> {
-        let counts = self
-            .match_counts
-            .as_ref()
-            .ok_or(EquiJoinError::InvalidMatchCount(
-                "residual presence join has no match-count state",
-            ))?
-            .access(access)?;
-        let limit = ScanLimit::new(budget.remaining_items(), budget.remaining_bytes().max(1))
-            .expect("positive shadow cleanup limits are valid");
-        match counts.scan(
-            shadow_match_range(),
-            ScanDirection::Ascending,
-            resume_after,
-            limit,
-        ) {
-            Ok(page) => Ok(Some(page)),
-            Err(StoreError::ItemTooLarge { .. }) if !budget.is_empty() => Ok(None),
-            Err(StoreError::ItemTooLarge { size, .. }) => {
-                let limit = ScanLimit::new(1, size.max(1))
-                    .expect("one item and a positive observed byte size are valid");
-                Ok(Some(counts.scan(
-                    shadow_match_range(),
-                    ScanDirection::Ascending,
-                    resume_after,
-                    limit,
-                )?))
-            }
-            Err(source) => Err(source.into()),
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the validation page explicitly receives its pinned row, effect, continuation, and transaction"
-    )]
-    fn probe_residual_page(
-        &self,
-        port: usize,
-        input: &ActiveRow<'_>,
-        effect: RowEffect,
-        matches: &[PreparedMatch],
-        qualifying: usize,
-        state: &mut JoinContinuation,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), EquiJoinError> {
-        let mut validation = OutputRows::new(self.output_schema.fields().len());
-        let mut counts = self
-            .match_counts
-            .as_ref()
-            .map(|counts| counts.access(access))
-            .transpose()?;
-        state.found_match |= qualifying != 0;
-        if self.tracks_match_count(port)
-            && !matches!(effect.transition, KeyTransition::None)
-            && qualifying != 0
-        {
-            Self::adjust_shadow_match_count(
-                counts.as_mut().ok_or(EquiJoinError::InvalidMatchCount(
-                    "tracked residual join has no match-count state",
-                ))?,
-                port,
-                &input.row,
-                effect.transition,
-                u64::try_from(qualifying).map_err(|_| EquiJoinError::MatchCountOverflow)?,
-            )?;
-        }
-        for matched in matches {
-            let transition = if self.tracks_match_count(1 - port)
-                && !matches!(effect.transition, KeyTransition::None)
-            {
-                Self::adjust_shadow_match_count(
-                    counts.as_mut().ok_or(EquiJoinError::InvalidMatchCount(
-                        "tracked residual join has no match-count state",
-                    ))?,
-                    1 - port,
-                    &matched.row,
-                    effect.transition,
-                    1,
-                )?
-            } else {
-                MatchTransition::None
-            };
-            self.append_residual_match_output(
-                port,
-                input,
-                effect,
-                matched,
-                transition,
-                &mut validation,
-            )?;
-        }
-        validation.finish(&self.output_schema).map(|_| ())
-    }
-
-    fn validate_shadow_current_match_count(
-        &self,
-        port: usize,
-        input: &PreparedRow,
-        effect: RowEffect,
-        found_match: bool,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), EquiJoinError> {
-        if !self.tracks_match_count(port) {
-            return Ok(());
-        }
-        let counts = self
-            .match_counts
-            .as_ref()
-            .ok_or(EquiJoinError::InvalidMatchCount(
-                "tracked residual join has no match-count state",
-            ))?
-            .access(access)?;
-        let actual = Self::actual_match_count(&counts, port, &input.row)?;
-        let count = counts
-            .get(&shadow_match_key(port, &input.row))?
-            .unwrap_or(actual);
-        let valid = match effect.transition {
-            KeyTransition::Last => count == 0,
-            KeyTransition::First | KeyTransition::None => (count > 0) == found_match,
-        };
-        if !valid {
-            return Err(EquiJoinError::InvalidMatchCount(
-                "preflight row support disagrees with its qualifying candidates",
-            ));
-        }
-        Ok(())
     }
 
     #[expect(
@@ -921,25 +592,6 @@ impl EquiJoinOperation {
         Ok(())
     }
 
-    fn adjust_shadow_match_count(
-        counts: &mut OrderedMapAccess<'_, Vec<u8>, u64>,
-        port: usize,
-        row: &[u8],
-        transition: KeyTransition,
-        amount: u64,
-    ) -> Result<MatchTransition, EquiJoinError> {
-        let actual = Self::actual_match_count(counts, port, row)?;
-        let shadow_key = shadow_match_key(port, row);
-        let before = counts.get(&shadow_key)?.unwrap_or(actual);
-        let after = adjust_match_count(before, transition, amount)?;
-        if after == actual {
-            counts.remove(&shadow_key)?;
-        } else {
-            counts.put(&shadow_key, &after)?;
-        }
-        Ok(match_transition(before, after))
-    }
-
     fn adjust_actual_match_count(
         counts: &mut OrderedMapAccess<'_, Vec<u8>, u64>,
         port: usize,
@@ -992,7 +644,6 @@ impl EquiJoinOperation {
         &self,
         port: usize,
         input: &PreparedRow,
-        phase: Phase,
         access: TransactionAccess<'_>,
     ) -> Result<bool, EquiJoinError> {
         if port == 1 || !input.matchable {
@@ -1006,18 +657,10 @@ impl EquiJoinOperation {
             ))?
             .access(access)?;
         let actual = Self::actual_match_count(&counts, port, &input.row)?;
-        let count = match phase {
-            Phase::Probe => counts
-                .get(&shadow_match_key(port, &input.row))?
-                .unwrap_or(actual),
-            Phase::Emit => actual,
-            Phase::ClearShadow => unreachable!("shadow cleanup has no current input row"),
-        };
-        Ok(count > 0)
+        Ok(actual > 0)
     }
 
     fn validate_residual_continuation(
-        &self,
         claim: &PreparedClaim,
         state: &JoinContinuation,
     ) -> Result<(), EquiJoinError> {
@@ -1025,26 +668,6 @@ impl EquiJoinOperation {
             return Err(EquiJoinError::InvalidContinuation(
                 "port differs from the pinned input",
             ));
-        }
-        if state.phase == Phase::ClearShadow {
-            if self.match_counts.is_none() {
-                return Err(EquiJoinError::InvalidContinuation(
-                    "Inner residual join has a shadow cleanup phase",
-                ));
-            }
-            if state.row != 0 || state.found_match {
-                return Err(EquiJoinError::InvalidContinuation(
-                    "shadow cleanup retains row-local residual state",
-                ));
-            }
-            if let Some(key) = &state.resume_after
-                && (key.len() < 2 || key[0] != 1 || key[1] > 1)
-            {
-                return Err(EquiJoinError::InvalidContinuation(
-                    "shadow cleanup cursor is outside the shadow row domains",
-                ));
-            }
-            return Ok(());
         }
         let row = usize::try_from(state.row)
             .ok()
@@ -1074,7 +697,7 @@ impl EquiJoinOperation {
                 "port differs from the pinned input",
             ));
         }
-        if state.phase == Phase::ClearShadow || state.found_match {
+        if state.found_match {
             return Err(EquiJoinError::InvalidContinuation(
                 "pure equality join has residual continuation state",
             ));
@@ -1321,18 +944,6 @@ fn match_transition(before: u64, after: u64) -> MatchTransition {
         (false, true) => MatchTransition::BecameUnmatched,
         _ => MatchTransition::None,
     }
-}
-
-fn shadow_work(page: &OrderedMapPage<Vec<u8>, u64>) -> (usize, usize) {
-    let items = page.entries.len().max(1);
-    let bytes = page
-        .entries
-        .iter()
-        .fold(0_usize, |bytes, (key, _)| {
-            bytes.saturating_add(key.len()).saturating_add(8)
-        })
-        .max(1);
-    (items, bytes)
 }
 
 fn persistent_row(row: usize) -> Result<u64, EquiJoinError> {

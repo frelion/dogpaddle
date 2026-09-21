@@ -663,7 +663,7 @@ fn sparse_claims_advance_many_rows_per_transaction() {
     let (outputs, turns) =
         run_claim_with_turns(&mut operation, &mut transactions, 1, &input).unwrap();
     assert!(outputs.is_empty());
-    assert_eq!(turns, 3);
+    assert_eq!(turns, 2);
 }
 
 #[test]
@@ -688,10 +688,10 @@ fn one_to_one_claims_aggregate_many_output_rows_per_transaction() {
     let (outputs, turns) =
         run_claim_with_turns(&mut operation, &mut transactions, 0, &left).unwrap();
 
-    assert_eq!(turns, 3);
+    assert_eq!(turns, 2);
     assert_eq!(
         outputs.iter().map(Change::num_rows).collect::<Vec<_>>(),
-        [212, 88]
+        [256, 44]
     );
     assert_eq!(
         output_rows(&outputs)
@@ -719,7 +719,7 @@ fn sparse_large_rows_respect_the_turn_byte_budget() {
         run_claim_with_turns(&mut operation, &mut transactions, 0, &input).unwrap();
 
     assert!(outputs.is_empty());
-    assert_eq!(turns, 6);
+    assert_eq!(turns, 3);
 }
 
 #[test]
@@ -782,12 +782,12 @@ fn residual_wide_candidates_are_split_by_scalar_working_set() {
         outputs.iter().map(Change::num_rows).sum::<usize>(),
         RIGHT_ROWS
     );
-    assert!(turns >= 5);
+    assert_eq!(turns, 3);
     assert!(outputs.iter().all(|output| output.num_rows() <= 63));
 }
 
 #[test]
-fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
+fn continuation_reopens_after_committed_pages_without_duplicates() {
     let root = TestStore::new();
     let definition = definition();
     let (operation, transactions) = construct_operation(&root);
@@ -809,23 +809,6 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     transaction.commit().unwrap();
 
     let input = left_change(vec![Some(7)], vec!["left"], vec![1]);
-    assert!(matches!(
-        commit_ready(
-            &mut operation,
-            Some(OperationInput {
-                port: 0,
-                change: &input
-            }),
-            &mut transactions
-        )
-        .unwrap(),
-        Action::Commit(None)
-    ));
-    drop((operation, transactions));
-
-    let store = Store::open(root.path()).unwrap();
-    let mut operation = reopen_join(&store, &definition, &[left_schema(), right_schema()]);
-    let mut transactions = store.into_transactions();
     let Action::Commit(Some(first_output)) = commit_ready(
         &mut operation,
         Some(OperationInput {
@@ -835,9 +818,9 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
         &mut transactions,
     )
     .unwrap() else {
-        panic!("reopened Join did not commit its first Emit page");
+        panic!("Join did not commit its first output page");
     };
-    assert_eq!(first_output.num_rows(), 255);
+    assert_eq!(first_output.num_rows(), 256);
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
@@ -847,7 +830,7 @@ fn continuation_reopens_after_probe_and_emit_pages_without_duplicates() {
     outputs.extend(run_claim(&mut operation, &mut transactions, 0, &input).unwrap());
     assert_eq!(
         outputs.iter().map(Change::num_rows).collect::<Vec<_>>(),
-        [255, 2]
+        [256, 1]
     );
     let rows = output_rows(&outputs);
     assert_eq!(rows.len(), 257);
@@ -934,7 +917,7 @@ fn large_driving_rows_reduce_match_pages_to_bound_output_amplification() {
 }
 
 #[test]
-fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phase() {
+fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_turn() {
     const MATCHES: usize = 32;
     let left = Arc::new(Schema::new(vec![
         Field::new("key", DataType::UInt64, false),
@@ -959,8 +942,8 @@ fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phas
     )
     .unwrap();
     // This row exceeds the half-turn scan budget. Semi/Anti output only the
-    // matched left rows, so its payload is charged once in Probe and once in
-    // Emit, rather than once for each match.
+    // matched left rows, so its payload is charged once for the turn,
+    // rather than once for each match.
     let payload = "x".repeat(2_200_000);
     let right_change = |difference| {
         Change::try_new(
@@ -1002,8 +985,8 @@ fn semi_and_anti_presence_budget_charges_the_unemitted_driving_row_once_per_phas
             let (outputs, turns) =
                 run_claim_with_turns(&mut operation, &mut transactions, 1, input).unwrap();
             assert_eq!(
-                turns, 2,
-                "{kind:?} did not charge the right driving row once per phase"
+                turns, 1,
+                "{kind:?} did not charge the right driving row once per turn"
             );
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].num_rows(), MATCHES);
@@ -1069,7 +1052,7 @@ fn an_oversized_scan_item_waits_for_an_empty_turn_budget() {
     let (outputs, turns) =
         run_claim_with_turns(&mut operation, &mut transactions, 0, &left_input).unwrap();
 
-    assert_eq!(turns, 3);
+    assert_eq!(turns, 2);
     assert_eq!(
         outputs.iter().map(Change::num_rows).collect::<Vec<_>>(),
         [1, 1]

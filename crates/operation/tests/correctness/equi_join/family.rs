@@ -16,7 +16,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, PartitionedMultiset, Store, StoreSetup, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, PartitionedMultiset, Store, StoreSetup, Transactions};
 
 use crate::support::{
     TestStore, assert_literal_definition, commit_ready, construct_checked, decode_hex,
@@ -286,6 +286,62 @@ impl Fixture {
         }
     }
 
+    fn assert_partial_full_outer_counts(self, output: &[Change]) -> Self {
+        let Self {
+            kind,
+            definition,
+            root,
+            operation,
+            transactions,
+        } = self;
+        drop((operation, transactions));
+        let store = Store::open(root.path()).unwrap();
+        let counts: OrderedMap<Vec<u8>, u64> = store
+            .open_data(&format!("{OPERATION_PREFIX}/equi_join.match_counts"))
+            .unwrap();
+        let operation = reopen_join(&store, &definition);
+        let mut transactions = store.into_transactions();
+        let matched = output_events(kind, output)
+            .into_iter()
+            .filter_map(|(row, difference)| {
+                if row.right_value.is_some() {
+                    assert_eq!(difference, 1);
+                    Some(row.left_value.unwrap())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(!matched.is_empty());
+        assert!(matched.len() < 257, "the driving row must still be partial");
+        {
+            let transaction = transactions.begin();
+            let access = counts.access(transaction.access()).unwrap();
+            for value in 0..257 {
+                let mut key = vec![0];
+                key.extend(canonical_row(29, value));
+                assert_eq!(
+                    access.get(&key).unwrap(),
+                    matched.contains(&value).then_some(1)
+                );
+            }
+            let mut key = vec![1];
+            key.extend(canonical_row(29, -1));
+            assert_eq!(
+                access.get(&key).unwrap(),
+                Some(u64::try_from(matched.len()).unwrap())
+            );
+            transaction.commit().unwrap();
+        }
+        Self {
+            kind,
+            definition,
+            root,
+            operation,
+            transactions,
+        }
+    }
+
     fn rewrite_raw_continuation(self, rewrite: impl FnOnce(&mut Vec<u8>)) -> Self {
         let Self {
             kind,
@@ -415,7 +471,10 @@ fn rollback_and_commit_first_output_page(
 ) -> Vec<Change> {
     loop {
         let Action::Commit(rolled_back) = fixture.rollback_once(port, input).unwrap() else {
-            panic!("{:?} completed before its expected Emit page", fixture.kind)
+            panic!(
+                "{:?} completed before its expected output page",
+                fixture.kind
+            )
         };
         let Action::Commit(committed) = fixture.commit_once(port, input).unwrap() else {
             panic!("{:?} did not replay its rolled-back turn", fixture.kind)
@@ -467,6 +526,29 @@ fn commit_prefix_and_rollback_complete(
         }
     }
     panic!("equi-join did not reach a bounded final Complete turn")
+}
+
+fn commit_until_error(
+    fixture: &mut Fixture,
+    port: usize,
+    input: &Change,
+) -> (Vec<Change>, OperationError) {
+    let mut outputs = Vec::new();
+    for _ in 0..10_000 {
+        match fixture.commit_once(port, input) {
+            Ok(Action::Commit(output)) => outputs.extend(output),
+            Ok(_) => panic!("invalid Claim completed instead of reporting its late error"),
+            Err(error) => return (outputs, error),
+        }
+    }
+    panic!("invalid Claim did not reach its bounded late error")
+}
+
+fn canonical_row(key: u64, value: i64) -> Vec<u8> {
+    let mut encoded = canonical_u64(key);
+    encoded.push(1);
+    encoded.extend_from_slice(&value.to_be_bytes());
+    encoded
 }
 
 fn assert_outer_corrections_are_paired(outputs: &[Change]) {
@@ -1102,7 +1184,7 @@ fn residual_left_only_skips_stable_multiplicity_without_scanning_the_opposite_ro
 }
 
 #[test]
-fn residual_left_only_uses_same_claim_shadow_support_for_a_stable_left_row() {
+fn residual_left_only_uses_same_claim_committed_support_for_a_stable_left_row() {
     let right = [event(Some(31), 5, 1)];
     let left = [
         event(Some(31), 10, 1),
@@ -1145,12 +1227,8 @@ fn residual_left_only_qualifying_pages_replay_without_intermediate_output() {
         ));
         fixture = fixture.reopen();
 
-        let (committed, rolled_back_complete, committed_turns) =
+        let (committed, rolled_back_complete, _) =
             commit_prefix_and_rollback_complete(&mut fixture, 0, &input);
-        assert!(
-            committed_turns > 0,
-            "{kind:?} did not page its qualifying scan"
-        );
         assert!(
             committed.is_empty(),
             "{kind:?} emitted per-candidate rows from its left-only path"
@@ -1171,7 +1249,7 @@ fn residual_left_only_qualifying_pages_replay_without_intermediate_output() {
 }
 
 #[test]
-fn presence_kinds_reopen_after_probe_and_rolled_back_first_and_last_emit_pages() {
+fn presence_kinds_reopen_after_rolled_back_output_pages() {
     let left = (0..257)
         .map(|value| InputEvent {
             key: Some(7),
@@ -1193,12 +1271,6 @@ fn presence_kinds_reopen_after_probe_and_rolled_back_first_and_last_emit_pages()
         let expected = oracle.apply_claim(kind, 1, &trigger);
         let input = input_change(1, &trigger);
 
-        assert!(matches!(
-            fixture.commit_once(1, &input).unwrap(),
-            Action::Commit(None)
-        ));
-        fixture = fixture.reopen();
-
         let mut outputs = rollback_and_commit_first_output_page(&mut fixture, 1, &input);
         fixture = fixture.reopen();
         outputs.extend(fixture.run(1, &trigger).unwrap());
@@ -1213,11 +1285,6 @@ fn presence_kinds_reopen_after_probe_and_rolled_back_first_and_last_emit_pages()
         }];
         let expected = oracle.apply_claim(kind, 1, &retract);
         let input = input_change(1, &retract);
-        assert!(matches!(
-            fixture.commit_once(1, &input).unwrap(),
-            Action::Commit(None)
-        ));
-        fixture = fixture.reopen();
         let mut outputs = rollback_and_commit_first_output_page(&mut fixture, 1, &input);
         fixture = fixture.reopen();
         outputs.extend(fixture.run(1, &retract).unwrap());
@@ -1229,12 +1296,67 @@ fn presence_kinds_reopen_after_probe_and_rolled_back_first_and_last_emit_pages()
 }
 
 #[test]
-fn residual_presence_paging_replays_probe_shadow_cleanup_and_late_emit() {
+fn full_outer_ordered_corrections_survive_page_rollback_and_reopen() {
+    let kind = EquiJoinKind::FullOuter;
+    let left = (0..257)
+        .map(|value| event(Some(7), value, 1))
+        .collect::<Vec<_>>();
+    for residual in [ResidualCase::None, ResidualCase::GreaterThan] {
+        let mut uninterrupted = Fixture::with_residual(kind, residual);
+        let mut resumed = Fixture::with_residual(kind, residual);
+        uninterrupted.run(0, &left).unwrap();
+        resumed.run(0, &left).unwrap();
+        for difference in [1, -1] {
+            let trigger = [event(Some(7), -1, difference)];
+            let expected = (0..257)
+                .flat_map(|value| {
+                    let padded = OutputRow {
+                        left_key: Some(7),
+                        left_value: Some(value),
+                        right_key: None,
+                        right_value: None,
+                    };
+                    let paired = OutputRow {
+                        right_key: Some(7),
+                        right_value: Some(-1),
+                        ..padded.clone()
+                    };
+                    if difference > 0 {
+                        [(padded, -1), (paired, 1)]
+                    } else {
+                        [(paired, -1), (padded, 1)]
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output_events(kind, &uninterrupted.run(1, &trigger).unwrap()),
+                expected
+            );
+            let input = input_change(1, &trigger);
+            let mut outputs = rollback_and_commit_first_output_page(&mut resumed, 1, &input);
+            resumed = resumed.reopen();
+            let (prefix, final_page, _) =
+                commit_prefix_and_rollback_complete(&mut resumed, 1, &input);
+            outputs.extend(prefix);
+            resumed = resumed.reopen();
+            let retried = resumed.run(1, &trigger).unwrap();
+            assert_eq!(
+                output_events(kind, &retried),
+                output_events(kind, &final_page)
+            );
+            outputs.extend(retried);
+            assert_eq!(output_events(kind, &outputs), expected);
+        }
+    }
+}
+
+#[test]
+fn residual_presence_paging_replays_empty_pages_and_late_match() {
     let mut candidates = (0_i64..767)
         .map(|value| event(Some(19), value, 1))
         .collect::<Vec<_>>();
     // Canonical positive i64 rows sort before -1, so the only qualifying
-    // candidate is the 768th and forces every Probe and Emit page to run.
+    // candidate is the 768th and forces every candidate page to run.
     candidates.push(event(Some(19), -1, 1));
     assert_eq!(candidates.len(), 768);
 
@@ -1249,8 +1371,7 @@ fn residual_presence_paging_replays_probe_shadow_cleanup_and_late_emit() {
     let expected = oracle.apply_claim(kind, 0, &inserted);
     let input = input_change(0, &inserted);
 
-    // Commit the first Probe page, reopen, then prove the next Probe page is
-    // transactionally replayable from the same cursor.
+    // Commit an empty candidate page, reopen, and roll back the next page.
     assert!(matches!(
         fixture.commit_once(0, &input).unwrap(),
         Action::Commit(None)
@@ -1258,30 +1379,6 @@ fn residual_presence_paging_replays_probe_shadow_cleanup_and_late_emit() {
     fixture = fixture.reopen();
     assert!(matches!(
         fixture.rollback_once(0, &input).unwrap(),
-        Action::Commit(None)
-    ));
-    assert!(matches!(
-        fixture.commit_once(0, &input).unwrap(),
-        Action::Commit(None)
-    ));
-    fixture = fixture.reopen();
-
-    // The third 256-candidate page ends Probe exactly at the turn boundary,
-    // leaving ClearShadow durable for reopen.
-    assert!(matches!(
-        fixture.commit_once(0, &input).unwrap(),
-        Action::Commit(None)
-    ));
-    fixture = fixture.reopen();
-
-    // Clearing the preflight shadow and starting Emit share one transaction;
-    // rolling it back must restore both the shadow and the continuation.
-    assert!(matches!(
-        fixture.rollback_once(0, &input).unwrap(),
-        Action::Commit(None)
-    ));
-    assert!(matches!(
-        fixture.commit_once(0, &input).unwrap(),
         Action::Commit(None)
     ));
     fixture = fixture.reopen();
@@ -1307,7 +1404,7 @@ fn residual_presence_paging_replays_probe_shadow_cleanup_and_late_emit() {
 }
 
 #[test]
-fn residual_full_outer_replays_coalesced_counts_and_multi_page_shadow_cleanup() {
+fn residual_full_outer_replays_partial_row_counts_and_final_completion() {
     let left = (0_i64..257)
         .map(|value| event(Some(29), value, 1))
         .collect::<Vec<_>>();
@@ -1322,12 +1419,12 @@ fn residual_full_outer_replays_coalesced_counts_and_multi_page_shadow_cleanup() 
     let expected = oracle.apply_claim(kind, 1, &right);
     let input = input_change(1, &right);
 
-    // Every intermediate page is first rolled back and then replayed. The 257
-    // qualifying left rows create 258 shadow keys, so cleanup itself is paged.
+    // Every intermediate page is first rolled back and then replayed. Real
+    // per-row match counts must track only the committed candidate prefix.
     let (mut output, rolled_back_complete, committed_turns) =
         commit_prefix_and_rollback_complete(&mut fixture, 1, &input);
-    assert!(committed_turns >= 4);
-    fixture = fixture.reopen();
+    assert!(committed_turns > 0);
+    fixture = fixture.assert_partial_full_outer_counts(&output);
     let retried_complete = fixture.run(1, &right).unwrap();
     assert_events(
         kind,
@@ -1343,7 +1440,7 @@ fn residual_full_outer_replays_coalesced_counts_and_multi_page_shadow_cleanup() 
 }
 
 #[test]
-fn residual_clear_shadow_rejects_a_cursor_that_skips_remaining_counts() {
+fn residual_partial_row_rejects_a_missing_committed_cursor() {
     let left = (0_i64..257)
         .map(|value| event(Some(37), value, 1))
         .collect::<Vec<_>>();
@@ -1357,46 +1454,18 @@ fn residual_clear_shadow_rejects_a_cursor_that_skips_remaining_counts() {
     let expected = oracle.apply_claim(kind, 1, &right);
     let input = input_change(1, &right);
 
-    for _ in 0..3 {
-        assert!(matches!(
-            fixture.commit_once(1, &input).unwrap(),
-            Action::Commit(None)
-        ));
-    }
-    let mut original = None;
-    fixture = fixture.rewrite_raw_continuation(|value| {
-        assert_eq!(value[0], 2, "unexpected continuation version");
-        assert_eq!(value[2], 1, "the test did not reach ClearShadow");
-        assert_eq!(value[12], 1, "the cleanup page did not retain a cursor");
-        original = Some(value.clone());
-        value.truncate(13);
-        value.extend_from_slice(&34_u64.to_be_bytes());
-        value.extend_from_slice(&[1, 1]);
-        value.extend_from_slice(&[u8::MAX; 32]);
-    });
-
-    let error = fixture.commit_once(1, &input).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<EquiJoinError>(),
-        Some(EquiJoinError::InvalidContinuation(
-            "shadow cleanup cursor skipped a remaining count"
-        ))
-    ));
-
-    let original = original.expect("the original cleanup continuation was captured");
-    fixture = fixture.rewrite_raw_continuation(move |value| *value = original);
     let Action::Commit(Some(first_output)) = fixture.commit_once(1, &input).unwrap() else {
-        panic!("the restored cleanup did not enter a paged Emit");
+        panic!("the qualifying rows did not produce a paged output");
     };
 
     let mut original = None;
     fixture = fixture.rewrite_raw_continuation(|value| {
-        assert_eq!(value[2], 2, "the test did not reach Emit");
-        assert_eq!(value[11], 1, "the Emit page did not find a match");
-        assert_eq!(value[12], 1, "the Emit page did not retain a cursor");
+        assert_eq!(value[0], 1, "unexpected current v1 continuation");
+        assert_eq!(value[10], 1, "the output page did not find a match");
+        assert_eq!(value[11], 1, "the output page did not retain a cursor");
         original = Some(value.clone());
-        value[12] = 0;
-        value.truncate(13);
+        value[11] = 0;
+        value.truncate(12);
     });
     let error = fixture.commit_once(1, &input).unwrap_err();
     assert!(matches!(
@@ -1406,7 +1475,7 @@ fn residual_clear_shadow_rejects_a_cursor_that_skips_remaining_counts() {
         ))
     ));
 
-    let original = original.expect("the original Emit continuation was captured");
+    let original = original.expect("the original continuation was captured");
     fixture = fixture.rewrite_raw_continuation(move |value| *value = original);
     let mut output = vec![first_output];
     output.extend(fixture.run(1, &right).unwrap());
@@ -1526,48 +1595,55 @@ fn presence_outputs_overflow_before_any_state_is_committed() {
 }
 
 #[test]
-fn a_late_outer_overflow_rejects_the_whole_claim_before_earlier_output() {
-    let mut fixture = Fixture::new(EquiJoinKind::FullOuter);
-    fixture.run(0, &[event(Some(1), 10, 1)]).unwrap();
-    fixture.run(0, &[event(Some(2), 20, i64::MAX)]).unwrap();
-    fixture.run(0, &[event(Some(2), 20, 2)]).unwrap();
+fn late_outer_overflow_keeps_committed_pages_and_replays_only_the_failed_suffix() {
+    let kind = EquiJoinKind::FullOuter;
+    let mut fixture = Fixture::new(kind);
+    let left = (0..257)
+        .map(|value| event(Some(2), value, 1))
+        .collect::<Vec<_>>();
+    fixture.run(0, &left).unwrap();
+    fixture.run(0, &[event(Some(2), 1_000, i64::MAX)]).unwrap();
+    fixture.run(0, &[event(Some(2), 1_000, 2)]).unwrap();
+    let trigger = [event(Some(2), 2_000, 1)];
+    let input = input_change(1, &trigger);
 
-    let invalid = input_change(1, &[event(Some(1), 100, 1), event(Some(2), 200, 1)]);
-    let error = fixture.rollback_once(1, &invalid).unwrap_err();
+    let (mut outputs, error) = commit_until_error(&mut fixture, 1, &input);
+    assert!(
+        !outputs.is_empty(),
+        "the valid candidate prefix must be published"
+    );
+    assert_outer_corrections_are_paired(&outputs);
     assert!(matches!(
         error.downcast_ref::<EquiJoinError>(),
         Some(EquiJoinError::OutputDifferenceOverflow)
     ));
+    for _ in 0..2 {
+        fixture = fixture.reopen();
+        let error = fixture.commit_once(1, &input).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::OutputDifferenceOverflow)
+        ));
+    }
 
-    let output = fixture.run(1, &[event(Some(1), 100, 1)]).unwrap();
+    // Test-only repair lets the same durable suffix finish; it is not a product
+    // recovery API. Neither the committed prefix nor the failed turn may replay.
+    fixture = fixture.corrupt_raw_row(0, &canonical_u64(2), &canonical_row(2, 1_000), -2);
+    outputs.extend(fixture.run(1, &trigger).unwrap());
+    let mut oracle = NaiveRelation::default();
+    oracle.apply_claim(kind, 0, &left);
+    oracle.apply_claim(kind, 0, &[event(Some(2), 1_000, i64::MAX)]);
+    assert_events(kind, &outputs, oracle.apply_claim(kind, 1, &trigger));
+    let retract = [event(Some(2), 2_000, -1)];
     assert_events(
-        EquiJoinKind::FullOuter,
-        &output,
-        vec![
-            (
-                OutputRow {
-                    left_key: Some(1),
-                    left_value: Some(10),
-                    right_key: None,
-                    right_value: None,
-                },
-                -1,
-            ),
-            (
-                OutputRow {
-                    left_key: Some(1),
-                    left_value: Some(10),
-                    right_key: Some(1),
-                    right_value: Some(100),
-                },
-                1,
-            ),
-        ],
+        kind,
+        &fixture.run(1, &retract).unwrap(),
+        oracle.apply_claim(kind, 1, &retract),
     );
 }
 
 #[test]
-fn probe_rejects_a_late_corrupt_row_before_output_with_or_without_a_residual() {
+fn late_corrupt_row_preserves_committed_output_and_retries_the_same_suffix() {
     let valid_right = (0..257)
         .map(|value| event(Some(42), value, 1))
         .collect::<Vec<_>>();
@@ -1581,19 +1657,23 @@ fn probe_rejects_a_late_corrupt_row_before_output_with_or_without_a_residual() {
         assert!(fixture.run(1, &valid_right).unwrap().is_empty());
         fixture = fixture.corrupt_raw_row(1, &key, &corrupt_row, 1);
 
-        assert!(matches!(
-            fixture.commit_once(0, &input).unwrap(),
-            Action::Commit(None)
-        ));
-        fixture = fixture.reopen();
-        let error = fixture.commit_once(0, &input).unwrap_err();
+        let (mut output, error) = commit_until_error(&mut fixture, 0, &input);
+        assert!(!output.is_empty());
         assert!(matches!(
             error.downcast_ref::<EquiJoinError>(),
             Some(EquiJoinError::CanonicalRow { .. })
         ));
+        for _ in 0..2 {
+            fixture = fixture.reopen();
+            let error = fixture.commit_once(0, &input).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<EquiJoinError>(),
+                Some(EquiJoinError::CanonicalRow { .. })
+            ));
+        }
 
         fixture = fixture.corrupt_raw_row(1, &key, &corrupt_row, -1);
-        let output = fixture.run(0, &left).unwrap();
+        output.extend(fixture.run(0, &left).unwrap());
         let mut values = output_events(EquiJoinKind::Inner, &output)
             .into_iter()
             .map(|(row, difference)| {
@@ -1615,4 +1695,63 @@ fn probe_rejects_a_late_corrupt_row_before_output_with_or_without_a_residual() {
             Some(EquiJoinError::NegativeWeight)
         ));
     }
+}
+
+#[test]
+fn late_residual_error_preserves_committed_pages_and_replays_only_uncommitted_rows() {
+    let kind = EquiJoinKind::Inner;
+    let residual =
+        (col("left.left_value") / (lit(257_i64) - col("right.right_value"))).gt(lit(0_i64));
+    let definition = EquiJoinDefinition::try_new(
+        kind,
+        [(col("key"), col("key"))],
+        output_names(kind).iter().copied(),
+        Some(residual),
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (operation, transactions) = construct_join(&root, &definition);
+    let mut fixture = Fixture {
+        kind,
+        definition,
+        root,
+        operation,
+        transactions,
+    };
+    let right = (0..258)
+        .map(|value| event(Some(43), value, 1))
+        .collect::<Vec<_>>();
+    assert!(fixture.run(1, &right).unwrap().is_empty());
+    let left = [event(Some(43), 900, 1)];
+    let input = input_change(0, &left);
+    let (mut outputs, error) = commit_until_error(&mut fixture, 0, &input);
+    assert!(!outputs.is_empty());
+    assert!(matches!(
+        error.downcast_ref::<EquiJoinError>(),
+        Some(EquiJoinError::ResidualExpression { .. })
+    ));
+    for _ in 0..2 {
+        fixture = fixture.reopen();
+        let error = fixture.commit_once(0, &input).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EquiJoinError>(),
+            Some(EquiJoinError::ResidualExpression { .. })
+        ));
+    }
+    // Removing the poisonous stored candidate is test-only fault repair.
+    fixture = fixture.corrupt_raw_row(1, &canonical_u64(43), &canonical_row(43, 257), -1);
+    outputs.extend(fixture.run(0, &left).unwrap());
+    let mut values = output_events(kind, &outputs)
+        .into_iter()
+        .map(|(row, difference)| {
+            assert_eq!(difference, 1);
+            row.right_value.unwrap()
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, (0..257).collect::<Vec<_>>());
+    let retract = [event(Some(43), 900, -1)];
+    let retracted = output_events(kind, &fixture.run(0, &retract).unwrap());
+    assert_eq!(retracted.len(), 257);
+    assert!(retracted.iter().all(|(_, difference)| *difference == -1));
 }

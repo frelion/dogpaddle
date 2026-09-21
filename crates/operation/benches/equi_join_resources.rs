@@ -93,7 +93,6 @@ struct ClaimMeasurement {
 #[derive(Clone, Copy, Default, Serialize)]
 struct StateSnapshot {
     actual_entries: usize,
-    shadow_entries: usize,
     zero_value_entries: usize,
     logical_key_value_bytes: usize,
 }
@@ -101,8 +100,6 @@ struct StateSnapshot {
 #[derive(Default)]
 struct StatePeaks {
     actual_entries: usize,
-    shadow_entries: usize,
-    total_entries: usize,
     logical_key_value_bytes: usize,
 }
 
@@ -111,8 +108,6 @@ struct PersistentStateMeasurement {
     collection: &'static str,
     coverage: &'static str,
     peak_actual_entries: usize,
-    peak_shadow_entries: usize,
-    peak_total_entries: usize,
     peak_logical_key_value_bytes: usize,
     after_insert: StateSnapshot,
     after_retract: StateSnapshot,
@@ -213,7 +208,7 @@ impl CaseSpec {
                 "distinct_candidates": candidates,
                 "candidate_payload_bytes": candidate_payload_bytes,
                 "qualifying_candidates": qualifying,
-                "logical_predicate_evaluations": 2 * candidates,
+                "logical_predicate_evaluations": candidates,
                 "observe_match_counts": observe_state,
             }),
             Scenario::WholeClaim {
@@ -354,11 +349,11 @@ impl Fixture {
                 .scan(.., ScanDirection::Ascending, resume_after.as_ref(), limit)
                 .expect("scan match-count state");
             for (key, value) in page.entries {
-                match key.first() {
-                    Some(0) => snapshot.actual_entries += 1,
-                    Some(1) => snapshot.shadow_entries += 1,
-                    _ => panic!("match-count state contains an unknown key domain"),
-                }
+                assert!(
+                    matches!(key.first(), Some(0 | 1)),
+                    "invalid match-count port"
+                );
+                snapshot.actual_entries += 1;
                 snapshot.zero_value_entries += usize::from(value == 0);
                 snapshot.logical_key_value_bytes = snapshot
                     .logical_key_value_bytes
@@ -399,10 +394,6 @@ impl ClaimMeasurement {
 impl StatePeaks {
     fn observe(&mut self, snapshot: StateSnapshot) {
         self.actual_entries = self.actual_entries.max(snapshot.actual_entries);
-        self.shadow_entries = self.shadow_entries.max(snapshot.shadow_entries);
-        self.total_entries = self
-            .total_entries
-            .max(snapshot.actual_entries + snapshot.shadow_entries);
         self.logical_key_value_bytes = self
             .logical_key_value_bytes
             .max(snapshot.logical_key_value_bytes);
@@ -598,20 +589,15 @@ fn measure_persistent_state(spec: CaseSpec, path: &Path) -> PersistentStateMeasu
     let after_insert = fixture.state_snapshot();
     let expected_actual = qualifying + 1;
     assert_eq!(after_insert.actual_entries, expected_actual);
-    assert_eq!(after_insert.shadow_entries, 0);
     let retracted = run_observed_claim(&mut fixture, 1, &retract, &mut peaks);
     assert_eq!(retracted.output_rows, 2 * qualifying);
     let after_retract = fixture.state_snapshot();
     assert_eq!(after_retract.actual_entries, 0);
-    assert_eq!(after_retract.shadow_entries, 0);
-    assert!(peaks.shadow_entries >= expected_actual);
-    assert!(peaks.total_entries >= expected_actual.saturating_mul(2));
+    assert_eq!(peaks.actual_entries, expected_actual);
     PersistentStateMeasurement {
         collection: MATCH_COUNTS,
         coverage: "decoded logical map entries and key-plus-u64 bytes observed after every committed turn in a separate unprofiled pass; excludes RocksDB/WAL/LSM/cache bytes",
         peak_actual_entries: peaks.actual_entries,
-        peak_shadow_entries: peaks.shadow_entries,
-        peak_total_entries: peaks.total_entries,
         peak_logical_key_value_bytes: peaks.logical_key_value_bytes,
         after_insert,
         after_retract,
