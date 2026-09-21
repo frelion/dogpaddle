@@ -5,7 +5,7 @@
 
 它不维护第二套执行引擎，也不引入 Table、View、Catalog、后台 runner 或成本优化器。
 
-endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity、build 和 open 复用已解析值；环境引用与凭据不进入持久 Definition。SQL lowering 创建具体 Definition 并直接声明算子图，不维护私有 logical arena、Transform 目录或 Station 融合规则。
+endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity、build 和 open 复用已解析值；环境引用与凭据不进入持久 Definition。新建时，各 endpoint 完成发现后将具体运行配置交给内存 `FlowFactory`，只把普通 `OperationDefinition` 交给后续规划和声明。SQL lowering 创建具体 Definition 并直接声明算子图，不维护私有 logical arena、Transform 目录或 Station 融合规则。
 
 ## 一条 SQL 如何运行
 
@@ -14,7 +14,7 @@ SQL 文件
   │
   ├─ syntax：验证一条 INSERT，并提取具体 source / sink
   ├─ plan：用 DataFusion 做名称解析与类型转换，再翻译受支持的 LogicalPlan
-  ├─ assembly：声明 endpoint Operation 并注入运行资源
+  ├─ endpoint：发现具体 source / sink，注入运行资源并返回 Operation Definition
   └─ program：生成身份，创建或恢复持久 Flow
           │
           ▼
@@ -252,8 +252,7 @@ SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata
 2. [`src/syntax.rs`](src/syntax.rs)：外层 INSERT 和 endpoint Table Function 的语法验证。
 3. [`src/endpoint.rs`](src/endpoint.rs)：具体 endpoint 参数、连接解析、发现和运行资源。
 4. [`src/plan.rs`](src/plan.rs)：`DataFusion` 规划与受支持节点的 lowering。
-5. [`src/assembly.rs`](src/assembly.rs)：endpoint Operation 声明和运行资源注入。
-6. [`src/aggregate.rs`](src/aggregate.rs)：SQL 聚合函数 descriptor 与 lowering。
+5. [`src/aggregate.rs`](src/aggregate.rs)：SQL 聚合函数 descriptor 与 lowering。
 
 ## 验证
 

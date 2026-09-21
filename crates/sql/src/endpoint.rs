@@ -11,6 +11,7 @@ use datafusion_sql::sqlparser::ast::{
     ObjectName, TableFunctionArgs, Value,
 };
 use dogpaddle_flow::FlowFactory;
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_operation::operation::{
     scan::{
         MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanOptions, PostgresCdcScanConfig,
@@ -24,7 +25,10 @@ use dogpaddle_operation::operation::{
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-use crate::{SqlError, program::write_identity_bytes};
+use crate::{
+    SqlError,
+    program::{SINK_OPERATION_ID, scan_operation_id, write_identity_bytes},
+};
 
 const DEBEZIUM_RUNTIME_ENV: &str = "DOGPADDLE_DEBEZIUM_RUNTIME";
 
@@ -430,22 +434,6 @@ pub(crate) enum ScanEndpoint {
     MySqlCdc(Box<MySqlCdcEndpoint>),
 }
 
-pub(crate) enum BuiltScan {
-    Sequence(SequenceScanDefinition),
-    PostgresCdc(Box<BuiltPostgresCdcScan>),
-    MySqlCdc(Box<BuiltMySqlCdcScan>),
-}
-
-pub(crate) struct BuiltPostgresCdcScan {
-    pub(crate) definition: PostgresCdcScanDefinition,
-    pub(crate) config: PostgresCdcScanConfig,
-}
-
-pub(crate) struct BuiltMySqlCdcScan {
-    pub(crate) definition: MySqlCdcScanDefinition,
-    pub(crate) config: MySqlCdcScanConfig,
-}
-
 pub(crate) struct ResolvedEndpoints {
     pub(crate) scans: Vec<ResolvedScanEndpoint>,
     pub(crate) sink: ResolvedSinkEndpoint,
@@ -552,11 +540,10 @@ impl ResolvedScanEndpoint {
         index: usize,
         state_path: &Path,
         runtime_bundle: Option<&Path>,
-    ) -> Result<BuiltScan, SqlError> {
+        factory: &mut FlowFactory,
+    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
         match self {
-            Self::Sequence { start } => {
-                Ok(BuiltScan::Sequence(SequenceScanDefinition::new(*start)))
-            }
+            Self::Sequence { start } => Ok(Box::new(SequenceScanDefinition::new(*start))),
             Self::PostgresCdc(endpoint) => {
                 let config = endpoint.connection.postgres_cdc_config(
                     runtime_bundle.expect("CDC programs resolve one runtime"),
@@ -575,10 +562,8 @@ impl ResolvedScanEndpoint {
                 let definition =
                     PostgresCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
-                Ok(BuiltScan::PostgresCdc(Box::new(BuiltPostgresCdcScan {
-                    definition,
-                    config,
-                })))
+                factory.resource(scan_operation_id(index), config)?;
+                Ok(Box::new(definition))
             }
             Self::MySqlCdc(endpoint) => {
                 let config = endpoint.connection.mysql_config(
@@ -591,10 +576,8 @@ impl ResolvedScanEndpoint {
                 let definition =
                     MySqlCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
-                Ok(BuiltScan::MySqlCdc(Box::new(BuiltMySqlCdcScan {
-                    definition,
-                    config,
-                })))
+                factory.resource(scan_operation_id(index), config)?;
+                Ok(Box::new(definition))
             }
         }
     }
@@ -771,23 +754,6 @@ pub(crate) enum SinkEndpoint {
     Discard,
 }
 
-pub(crate) enum BuiltSink {
-    ClickHouse {
-        definition: ClickHouseSinkDefinition,
-        config: ClickHouseSinkConfig,
-    },
-    Doris {
-        definition: DorisSinkDefinition,
-        config: DorisSinkConfig,
-    },
-    Postgres {
-        definition: PostgresSinkDefinition,
-        config: PostgresSinkConfig,
-    },
-    Sqlite(SqliteSinkDefinition),
-    Discard(DiscardDefinition),
-}
-
 impl SinkEndpoint {
     pub(crate) fn resolve(&self) -> Result<ResolvedSinkEndpoint, SqlError> {
         match self {
@@ -899,7 +865,8 @@ impl ResolvedSinkEndpoint {
         &self,
         identity: &[u8; 32],
         state_path: &Path,
-    ) -> Result<BuiltSink, SqlError> {
+        factory: &mut FlowFactory,
+    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
         match self {
             Self::ClickHouse(endpoint) => {
                 let connection = &endpoint.connection;
@@ -910,7 +877,8 @@ impl ResolvedSinkEndpoint {
                     .map_err(SqlError::endpoint)?;
                 let definition =
                     ClickHouseSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
-                Ok(BuiltSink::ClickHouse { definition, config })
+                factory.resource(SINK_OPERATION_ID, config)?;
+                Ok(Box::new(definition))
             }
             Self::Doris(endpoint) => {
                 let connection = &endpoint.connection;
@@ -921,7 +889,8 @@ impl ResolvedSinkEndpoint {
                     .map_err(SqlError::endpoint)?;
                 let definition =
                     DorisSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
-                Ok(BuiltSink::Doris { definition, config })
+                factory.resource(SINK_OPERATION_ID, config)?;
+                Ok(Box::new(definition))
             }
             Self::Postgres(endpoint) => {
                 let connection = &endpoint.connection;
@@ -932,14 +901,15 @@ impl ResolvedSinkEndpoint {
                     .map_err(SqlError::endpoint)?;
                 let definition =
                     PostgresSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
-                Ok(BuiltSink::Postgres { definition, config })
+                factory.resource(SINK_OPERATION_ID, config)?;
+                Ok(Box::new(definition))
             }
             Self::Sqlite { path, table } => {
-                SqliteSinkDefinition::try_new(PathBuf::from(path), table)
-                    .map(BuiltSink::Sqlite)
-                    .map_err(SqlError::endpoint)
+                let definition = SqliteSinkDefinition::try_new(PathBuf::from(path), table)
+                    .map_err(SqlError::endpoint)?;
+                Ok(Box::new(definition))
             }
-            Self::Discard => Ok(BuiltSink::Discard(DiscardDefinition::new())),
+            Self::Discard => Ok(Box::new(DiscardDefinition::new())),
         }
     }
 
@@ -983,15 +953,15 @@ impl ResolvedSinkEndpoint {
         match self {
             Self::ClickHouse(endpoint) => {
                 let connection = &endpoint.connection;
-                factory.resource("sql/sink", connection.clickhouse_sink_config()?)?;
+                factory.resource(SINK_OPERATION_ID, connection.clickhouse_sink_config()?)?;
             }
             Self::Doris(endpoint) => {
                 let connection = &endpoint.connection;
-                factory.resource("sql/sink", connection.doris_sink_config()?)?;
+                factory.resource(SINK_OPERATION_ID, connection.doris_sink_config()?)?;
             }
             Self::Postgres(endpoint) => {
                 let connection = &endpoint.connection;
-                factory.resource("sql/sink", connection.postgres_sink_config()?)?;
+                factory.resource(SINK_OPERATION_ID, connection.postgres_sink_config()?)?;
             }
             Self::Sqlite { .. } | Self::Discard => {}
         }

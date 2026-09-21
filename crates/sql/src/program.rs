@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, num::NonZeroU64, path::Path};
 
 use datafusion_sql::sqlparser::{
     ast::Query,
@@ -9,7 +9,6 @@ use dogpaddle_flow::{Flow, FlowFactory};
 
 use crate::{
     SqlError,
-    assembly::{OUTPUT_CAPACITY, OUTPUT_CAPACITY_BYTES, add_sink, scan_operation_id},
     endpoint::{
         ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
         resolve_debezium_runtime,
@@ -21,6 +20,14 @@ use crate::{
 // Development v1: Flow owns Station fusion and keeps the head Operation ID.
 // Update v1 golden fixtures in place; old development state is discarded, not migrated.
 const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1";
+const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+const OUTPUT_CAPACITY: NonZeroU64 =
+    NonZeroU64::new(OUTPUT_CAPACITY_BYTES).expect("64 MiB is nonzero");
+pub(crate) const SINK_OPERATION_ID: &str = "sql/sink";
+
+pub(crate) fn scan_operation_id(index: usize) -> String {
+    format!("sql/scan/{index:08x}")
+}
 
 /// One `INSERT INTO sink(...)` statement and its streaming query.
 pub struct SqlProgram {
@@ -100,19 +107,19 @@ impl SqlProgram {
         identity: [u8; 32],
         runtime_bundle: Option<&Path>,
     ) -> Result<Flow, SqlError> {
+        let mut factory = FlowFactory::new(path);
+        factory.owner_identity(identity);
+        factory.output_capacity_bytes(OUTPUT_CAPACITY);
         let scans = endpoints
             .scans
             .iter()
             .enumerate()
-            .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle))
+            .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle, &mut factory))
             .collect::<Result<Vec<_>, _>>()?;
         let logical_plan = plan(self.query.clone(), &scans)?;
-        let mut factory = FlowFactory::new(path);
-        factory.owner_identity(identity);
-        factory.output_capacity_bytes(OUTPUT_CAPACITY);
         let output = lower_query(&logical_plan, scans, &mut factory)?;
-        let sink = endpoints.sink.build(&identity, path)?;
-        add_sink(&mut factory, output, sink)?;
+        let sink = endpoints.sink.build(&identity, path, &mut factory)?;
+        factory.operation(SINK_OPERATION_ID, sink, [output]);
         factory.build().map_err(Into::into)
     }
 

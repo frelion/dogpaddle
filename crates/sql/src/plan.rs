@@ -32,8 +32,7 @@ use dogpaddle_operation::{
 use crate::{
     SqlError,
     aggregate::{lower as lower_builtin_aggregate, planning_builtins},
-    assembly::add_scan,
-    endpoint::BuiltScan,
+    program::scan_operation_id,
     syntax::internal_scan_name,
 };
 
@@ -57,7 +56,7 @@ struct PlanningContext {
 }
 
 impl PlanningContext {
-    fn new(scans: &[BuiltScan]) -> Result<Self, SqlError> {
+    fn new(scans: &[Box<dyn OperationDefinition>]) -> Result<Self, SqlError> {
         let mut options = ConfigOptions::default();
         options.sql_parser.map_string_types_to_utf8view = false;
         let sources = scans
@@ -68,7 +67,7 @@ impl PlanningContext {
                     internal_scan_name(index),
                     Arc::new(ScanSource {
                         index,
-                        schema: scan_schema(scan)?,
+                        schema: scan_schema(scan.as_ref())?,
                     }),
                 ))
             })
@@ -143,7 +142,7 @@ impl ContextProvider for PlanningContext {
 
 pub(crate) fn plan(
     query: datafusion_sql::sqlparser::ast::Query,
-    scans: &[BuiltScan],
+    scans: &[Box<dyn OperationDefinition>],
 ) -> Result<LogicalPlan, SqlError> {
     let context = PlanningContext::new(scans)?;
     let plan = SqlToRel::new(&context).sql_statement_to_plan(Statement::Query(Box::new(query)))?;
@@ -154,7 +153,7 @@ pub(crate) fn plan(
 
 pub(crate) fn lower_query(
     plan: &LogicalPlan,
-    scans: Vec<BuiltScan>,
+    scans: Vec<Box<dyn OperationDefinition>>,
     factory: &mut FlowFactory,
 ) -> Result<OperationRef, SqlError> {
     let mut lowerer = Lowerer {
@@ -191,7 +190,7 @@ struct OrientedJoin {
 struct Lowerer<'a> {
     factory: &'a mut FlowFactory,
     next_transform: usize,
-    scans: Vec<Option<BuiltScan>>,
+    scans: Vec<Option<Box<dyn OperationDefinition>>>,
     scan_nodes: HashMap<usize, LoweredRelation>,
 }
 
@@ -448,12 +447,14 @@ impl Lowerer<'_> {
         if let Some(node) = self.scan_nodes.get(&source.index) {
             return Ok(node.clone());
         }
-        let built = self
+        let definition = self
             .scans
             .get_mut(source.index)
             .and_then(Option::take)
             .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
-        let node = add_scan(self.factory, source.index, built)?;
+        let node = self
+            .factory
+            .operation(scan_operation_id(source.index), definition, []);
         let relation = LoweredRelation {
             node,
             physical_schema: Arc::clone(&source.schema),
@@ -815,12 +816,7 @@ fn rewrite_columns(
         .map_err(Into::into)
 }
 
-fn scan_schema(scan: &BuiltScan) -> Result<SchemaRef, SqlError> {
-    let definition: &dyn OperationDefinition = match scan {
-        BuiltScan::Sequence(definition) => definition,
-        BuiltScan::PostgresCdc(scan) => &scan.definition,
-        BuiltScan::MySqlCdc(scan) => &scan.definition,
-    };
+fn scan_schema(definition: &dyn OperationDefinition) -> Result<SchemaRef, SqlError> {
     definition
         .output_schema(&[])
         .map_err(SqlError::endpoint)?

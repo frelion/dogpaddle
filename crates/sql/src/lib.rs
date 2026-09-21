@@ -1,7 +1,6 @@
 #![doc = include_str!("../README.md")]
 
 mod aggregate;
-mod assembly;
 mod endpoint;
 mod error;
 mod plan;
