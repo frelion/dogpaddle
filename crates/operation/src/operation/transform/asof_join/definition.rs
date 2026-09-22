@@ -567,8 +567,8 @@ pub(crate) fn decode_definition(
         )?;
         equalities.push(StoredEqualityKey {
             mode,
-            left: decode_expression(&mut cursor)?,
-            right: decode_expression(&mut cursor)?,
+            left: StoredExpression::decode(&mut cursor)?,
+            right: StoredExpression::decode(&mut cursor)?,
         });
     }
 
@@ -581,8 +581,8 @@ pub(crate) fn decode_definition(
     let mut orders = Vec::new();
     for _ in 0..order_count {
         orders.push(StoredOrderKey {
-            left: decode_expression(&mut cursor)?,
-            right: decode_expression(&mut cursor)?,
+            left: StoredExpression::decode(&mut cursor)?,
+            right: StoredExpression::decode(&mut cursor)?,
         });
     }
 
@@ -592,7 +592,7 @@ pub(crate) fn decode_definition(
         let descending = read_bool(&mut cursor, "ASOF join tie direction marker is invalid")?;
         let nulls_first = read_bool(&mut cursor, "ASOF join tie NULL marker is invalid")?;
         ties.push(StoredTieBreak {
-            value: decode_expression(&mut cursor)?,
+            value: StoredExpression::decode(&mut cursor)?,
             descending,
             nulls_first,
         });
@@ -611,7 +611,7 @@ pub(crate) fn decode_definition(
     }
     let residual = match cursor.read_bytes(1)?[0] {
         0 => None,
-        1 => Some(decode_residual(&mut cursor)?),
+        1 => Some(StoredExpression::decode(&mut cursor)?),
         _ => {
             return Err(DefinitionCodecError::InvalidPayload(
                 "ASOF join residual marker is invalid",
@@ -637,50 +637,16 @@ fn store_expression(
     role: &'static str,
     index: usize,
 ) -> Result<StoredExpression, AsOfJoinDefinitionError> {
-    let expression = StoredExpression::try_new(expression).map_err(|source| {
-        AsOfJoinDefinitionError::Expression {
-            role,
-            index,
-            source,
-        }
-    })?;
-    if !expression.is_atomic() {
-        return Err(AsOfJoinDefinitionError::NonImmutableExpression { role, index });
-    }
-    Ok(expression)
+    StoredExpression::try_new(expression).map_err(|source| AsOfJoinDefinitionError::Expression {
+        role,
+        index,
+        source,
+    })
 }
 
 fn store_residual(expression: Expr) -> Result<StoredExpression, AsOfJoinDefinitionError> {
-    let expression = StoredExpression::try_new(expression)
-        .map_err(|source| AsOfJoinDefinitionError::ResidualExpression { source })?;
-    if !expression.is_atomic() {
-        return Err(AsOfJoinDefinitionError::NonImmutableResidual);
-    }
-    Ok(expression)
-}
-
-fn decode_expression(
-    cursor: &mut PayloadCursor<'_>,
-) -> Result<StoredExpression, DefinitionCodecError> {
-    let expression = StoredExpression::decode(cursor)?;
-    if !expression.is_atomic() {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "ASOF join expression is not immutable",
-        ));
-    }
-    Ok(expression)
-}
-
-fn decode_residual(
-    cursor: &mut PayloadCursor<'_>,
-) -> Result<StoredExpression, DefinitionCodecError> {
-    let expression = StoredExpression::decode(cursor)?;
-    if !expression.is_atomic() {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "ASOF join residual expression is not immutable",
-        ));
-    }
-    Ok(expression)
+    StoredExpression::try_new(expression)
+        .map_err(|source| AsOfJoinDefinitionError::ResidualExpression { source })
 }
 
 fn bind_equalities(

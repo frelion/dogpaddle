@@ -1,10 +1,9 @@
+use dogpaddle_operation::operation::transform::SelectDefinition;
 use std::{num::NonZeroU64, path::Path};
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
-    scan::SequenceScanDefinition,
-    sink::DiscardDefinition,
-    transform::{ProjectDefinition, RunningEventCountDefinition},
+    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{
     Cell, Store, StoreError, SubscribedLog, SubscribedLogStatus, SubscriptionStatus,
@@ -203,13 +202,25 @@ fn build_multi_operation_station(path: &Path) {
     let mut builder = FlowFactory::new(path);
     builder.owner_identity(OWNER_IDENTITY);
     let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(7)), []);
-    let scan = builder.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = builder.operation(
+        "scan/tail-1",
+        Box::new(
+            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        ),
+        [scan],
+    );
     let scan = builder.operation(
         "scan/tail-2",
         Box::new(RunningEventCountDefinition::new()),
         [scan],
     );
-    let scan = builder.operation("scan/tail-3", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = builder.operation(
+        "scan/tail-3",
+        Box::new(
+            SelectDefinition::try_new([("count", dogpaddle_operation::col("count"))]).unwrap(),
+        ),
+        [scan],
+    );
 
     builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
     builder.materialize(scan, NonZeroU64::new(1_024).unwrap());

@@ -86,6 +86,8 @@ impl FilterDefinition {
     ///
     /// # Errors
     ///
+    /// Non-replayable expressions (not immutable or not row-local) are rejected.
+    ///
     /// Returns [`ExpressionDefinitionError`] when `DataFusion` cannot encode and
     /// decode the expression exactly and canonically.
     pub fn try_new(predicate: Expr) -> Result<Self, ExpressionDefinitionError> {
@@ -142,11 +144,7 @@ impl SealedDefinition for FilterDefinition {
 
 impl OperationDefinition for FilterDefinition {
     fn kind(&self) -> OperationKind {
-        if self.predicate.is_atomic() {
-            OperationKind::AtomicTransform(NonZeroU32::MIN)
-        } else {
-            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
-        }
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn persistence_tag(&self) -> u16 {

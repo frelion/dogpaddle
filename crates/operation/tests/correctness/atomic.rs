@@ -9,9 +9,9 @@ use dogpaddle_operation::{
     operation::{
         AtomicOperation, Operation, OperationInput,
         transform::{
-            AggregateCall, AggregateDefinition, DistinctDefinition, ExtendDefinition,
-            FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            AggregateCall, AggregateDefinition, DistinctDefinition, FilterDefinition,
+            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
         },
     },
 };
@@ -26,9 +26,7 @@ fn unary() -> NonZeroU32 {
 #[test]
 fn transform_kind_declares_atomic_execution_explicitly() {
     let definitions: Vec<Box<dyn OperationDefinition>> = vec![
-        Box::new(ProjectDefinition::new([0])),
         Box::new(FilterDefinition::try_new(col("keep")).unwrap()),
-        Box::new(ExtendDefinition::try_new("copy", col("id")).unwrap()),
         Box::new(SelectDefinition::try_new([("id", col("id"))]).unwrap()),
         Box::new(
             SchemaAlignDefinition::try_new([
@@ -57,42 +55,25 @@ fn transform_kind_declares_atomic_execution_explicitly() {
 }
 
 #[test]
-fn every_expression_owner_uses_instance_eligibility() {
+fn every_expression_owner_rejects_unbound_parameters_at_definition_time() {
     let parameter = placeholder("$1");
-    let definitions: Vec<Box<dyn OperationDefinition>> = vec![
-        Box::new(FilterDefinition::try_new(parameter.clone().eq(parameter.clone())).unwrap()),
-        Box::new(ExtendDefinition::try_new("parameter", parameter.clone()).unwrap()),
-        Box::new(SelectDefinition::try_new([("parameter", parameter.clone())]).unwrap()),
-        Box::new(
-            SchemaAlignDefinition::try_new([SchemaAlignField::try_new(
-                "parameter",
-                parameter.clone(),
-                true,
-            )
-            .unwrap()])
-            .unwrap(),
-        ),
-        Box::new(
-            AggregateDefinition::try_new(
-                [("parameter", parameter.clone())],
-                [("count", AggregateCall::count_all())],
-            )
-            .unwrap(),
-        ),
-        Box::new(
-            AggregateDefinition::try_new(
-                [("id", col("id"))],
-                [("count", AggregateCall::count(parameter))],
-            )
-            .unwrap(),
-        ),
-    ];
-    for definition in definitions {
-        assert_eq!(
-            definition.kind(),
-            OperationKind::ExclusiveTransform(unary())
-        );
-    }
+    assert!(FilterDefinition::try_new(parameter.clone().eq(parameter.clone())).is_err());
+    assert!(SelectDefinition::try_new([("parameter", parameter.clone())]).is_err());
+    assert!(SchemaAlignField::try_new("parameter", parameter.clone(), true).is_err());
+    assert!(
+        AggregateDefinition::try_new(
+            [("parameter", parameter.clone())],
+            [("count", AggregateCall::count_all())],
+        )
+        .is_err()
+    );
+    assert!(
+        AggregateDefinition::try_new(
+            [("id", col("id"))],
+            [("count", AggregateCall::count(parameter))]
+        )
+        .is_err()
+    );
 }
 
 #[test]

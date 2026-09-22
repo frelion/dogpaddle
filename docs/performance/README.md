@@ -11,3 +11,7 @@ The [2026-08-27 pre-reset report](./2026-08-27-pre-reset-reference.md) is retain
 
 The [2026-09-20 architecture smoke comparison](./2026-09-20-architecture-smoke.md) records local
 diagnostic results and their limitations; it does not establish a reference baseline.
+
+The [2026-09-22 issue 30 smoke comparison](./2026-09-22-issue-30-smoke.md) records same-host
+projection and ASOF before/after timings, turn counts, Rust heap peaks and output bounds.
+It includes the former Project fast-path comparison and remains a local diagnostic.

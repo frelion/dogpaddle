@@ -1,25 +1,22 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
-use dogpaddle_change::{Change, ProjectionError};
+use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
-    operation::{
-        Action, OperationInput,
-        transform::{ProjectDefinition, ProjectError, ProjectSchemaError},
-    },
+    OperationDefinition, ProjectionError, RuntimeResource, col, decode_definition,
+    encode_definition,
+    operation::{Action, OperationInput, transform::SelectDefinition},
 };
 use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
-    TestStore, assert_literal_definition, change, commit_ready, construct_checked, decode_hex,
-    project_input_schema, rollback_ready, turn_input,
+    TestStore, change, commit_ready, project_input_schema, rollback_ready, turn_input,
 };
 
-const PROJECT_V1: &str = include_str!("../fixtures/v1/project_fields_0_2.hex");
-
 fn decoded_definition() -> Box<dyn OperationDefinition> {
-    decode_definition(&decode_hex(PROJECT_V1)).unwrap()
+    let definition =
+        SelectDefinition::try_new([("id", col("id")), ("score", col("score"))]).unwrap();
+    decode_definition(&encode_definition(&definition)).unwrap()
 }
 
 fn project_change() -> Change {
@@ -36,59 +33,6 @@ fn project_change() -> Change {
         Int64Array::from(vec![1, -1]),
     )
     .unwrap()
-}
-
-#[test]
-fn definition_has_stable_v1_literal_and_binds_projection_exactly() {
-    let input = project_input_schema();
-    let definition = ProjectDefinition::new([0, 2]);
-    let decoded = assert_literal_definition(
-        &definition,
-        PROJECT_V1,
-        4,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
-    assert_eq!(definition.field_indices(), [0, 2]);
-    let expected = Arc::new(input.project(&[0, 2]).unwrap());
-    assert_eq!(
-        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
-            .unwrap()
-            .as_ref(),
-        Some(&expected)
-    );
-
-    for (indices, previous, current) in [([0, 0], 0, 0), ([1, 0], 1, 0)] {
-        let Err(OperationBindError::Rejected { source }) = construct_checked(
-            &ProjectDefinition::new(indices),
-            std::slice::from_ref(&input),
-        ) else {
-            panic!("unordered Project indices unexpectedly bound");
-        };
-        assert!(matches!(
-            source.downcast_ref::<ProjectSchemaError>(),
-            Some(ProjectSchemaError::Projection(
-                ProjectionError::FieldsNotStrictlyIncreasing {
-                    previous: actual_previous,
-                    current: actual_current,
-                }
-            )) if (*actual_previous, *actual_current) == (previous, current)
-        ));
-    }
-
-    let Err(OperationBindError::Rejected { source }) =
-        construct_checked(&ProjectDefinition::new([3]), std::slice::from_ref(&input))
-    else {
-        panic!("out-of-bounds Project unexpectedly bound");
-    };
-    assert!(matches!(
-        source.downcast_ref::<ProjectSchemaError>(),
-        Some(ProjectSchemaError::Projection(
-            ProjectionError::FieldOutOfBounds {
-                index: 3,
-                fields: 3
-            }
-        ))
-    ));
 }
 
 #[test]
@@ -116,16 +60,16 @@ fn project_rejects_invalid_port_and_schema_drift() {
     )
     .unwrap_err();
     assert!(matches!(
-        invalid_port.downcast_ref::<ProjectError>(),
-        Some(ProjectError::InvalidInputPort { port: 1 })
+        invalid_port.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InvalidInputPort { port: 1 })
     ));
 
     let drifted = change(&[1]);
     let error =
         rollback_ready(&mut project, Some(turn_input(&drifted)), &mut transactions).unwrap_err();
     assert!(matches!(
-        error.downcast_ref::<ProjectError>(),
-        Some(ProjectError::Projection(ProjectionError::SchemaMismatch))
+        error.downcast_ref::<ProjectionError>(),
+        Some(ProjectionError::InputSchemaMismatch)
     ));
 }
 

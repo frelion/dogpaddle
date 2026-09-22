@@ -95,9 +95,16 @@ Driving-row count 按 qualifying page 合并，对侧 distinct-row count 分别�
 Definition 保存 `AsOfJoinKind::{Inner,LeftOuter,LeftSemi,LeftAnti}`、零或多组 `Equal`/`NotDistinct` equality pairs、非空 lexicographic order pairs、`Backward`/`Forward`/`Nearest` direction 与 exactness、nearest 等距偏好、显式 right tie-break、canonical/reject fallback、可选 inclusive tolerance、output names 和可选 candidate residual。
 Equality/order/tie 只接受左右精确同型且可稳定 canonical/order 编码的 flat non-float scalar；nearest/tolerance 只允许一个 distance-capable order，其类型为整数、Date32、Timestamp 或 Decimal128。
 它声明 `asof_join.left_rows`、`asof_join.right_rows: OrderedMap<Vec<u8>, RowWeight>` 与 `asof_join.continuation: Cell<AsOfContinuation>`，完整索引 key 依次编码 equality partition、order、right rank 和 canonical row；缺失代表零 multiplicity，只有 RHS presence 的 `0 ↔ positive` 才触发历史 rematch。
-每个 Claim 先整批 preflight 非负权重/overflow，再以 Probe/Emit 两阶段和持久的 outer/candidate cursors 分页；Probe 只验证全部选择、residual、ambiguity、decode 和输出 diff，Emit 才按事件顺序原子提交 right state、旧结果 `-left_weight`、新结果 `+left_weight` 与 continuation。
-候选 right scan 和 RHS rematch 的 left outer scan 都必须从 matchable-order marker 精确 seek，不得重复读取同 partition 中永远不匹配的 NULL-order history。
-运行期只缓存 pinned Claim 的 prepared rows、effects 与一份按 active row 增量维护的 before/after visibility overlay；rollback/reopen 时由 durable row/phase 重建，不能持久化第二套 input identity。
+每个 Claim 先按事件顺序整批 preflight 非负权重/overflow，再以持久的 outer/candidate cursors 单遍分页，不预演选择与输出。
+左事件在完成候选选择的同一 turn 更新 left state 并输出。右事件开始历史 rematch 时更新 right state，并与首个历史/候选游标同事务提交；每个历史左行的旧结果 `-left_weight` 与新结果 `+left_weight` 同事务发布。
+右行变更前后仅当前事件 key 的可见性不同；先前事件已在真实状态中，不再保存或模拟整批前缀。恢复时由当前输入行、持久游标及 right weight 重建 before/after 权重，不能重复应用已经提交的右侧变更。
+候选 right scan 和 RHS rematch 的 left outer scan 都从 matchable-order marker 精确 seek，不重复读取永不匹配的 NULL-order history。
+运行期只缓存 pinned Claim 的 prepared rows 与 admission effects；可推进位置以 durable continuation 为准。rollback/reopen 从该位置继续，Complete 的缓存释放只在提交后执行；不持久化第二套 input identity。
+
+错误边界与 EquiJoin 一致：晚期 residual、歧义、解码或输出 diff overflow 可以在早期页面已发布后失败。失败 turn 全部回滚，已提交的状态、输出与 continuation 保留，真实 Sink 可能已经看到部分结果。该状态可以停在单个事件处理到一半，不能解释为完整事件前缀的最终关系。
+Station active pin 保持同一未确认输入，只有 Complete 才 ACK。reopen 不重复已提交页、不跳过确定性错误、不补偿已发布结果，也不自动删除或改写已有状态。
+对固定有序输入成功执行时，展平的有序 `(row, diff)` 保持不变；turn 数减少可能改变全图调度交错，不承诺输出时间或事件计数轨迹不变。
+
 没有 watermark/retention 时两侧关系永久保留。
 Right/Full ASOF 不属于当前 exact-row weighted relation：没有 occurrence identity 时 unmatched right copy 数量不能由输入关系唯一决定；不得用交换输入伪装成同一选择函数，也不得以任意 physical scan order 补定义。
 
@@ -120,7 +127,7 @@ lookup 成本与候选 partition 大小成正比，最坏右侧历史修正是�
 候选 right scan 与 rematch left scan 都从索引内的
 matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远不可能参与匹配的历史。
 
-AsOfContinuation 保存当前行序号、Probe/Emit phase、outer/candidate cursor、已经找到的 before/after winner 与歧义标记。
+AsOfContinuation 保存 port、当前行序号、outer/candidate cursor、已经找到的 before/after winner 与歧义标记；当前开发期 v1 codec 不含 phase。受影响旧状态重建，不增加格式识别或迁移。
 
 ASOF 的 `Equal` 在任一 NULL equality 分量时不匹配，`NotDistinct` 允许 NULL 分区；NULL order 永远不匹配。
 

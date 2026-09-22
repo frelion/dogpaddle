@@ -1,7 +1,6 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use arrow_schema::{DataType, TimeUnit};
-use dogpaddle_change::ProjectionError;
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
 use dogpaddle_operation::{
     OperationBindError, ScalarValue, cast, col, encode_definition, lit,
@@ -9,9 +8,8 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition, SqliteSinkSchemaError},
         transform::{
-            ExtendDefinition, FilterDefinition, ProjectDefinition, ProjectSchemaError,
-            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition, UnionAllSchemaError,
+            FilterDefinition, RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField,
+            SelectDefinition, SelectSchemaError, UnionAllDefinition, UnionAllSchemaError,
         },
     },
 };
@@ -23,12 +21,18 @@ const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024 * 1_024).unwrap();
 const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 
 #[test]
-fn build_reports_the_exact_project_schema_rejection_without_creating_a_store() {
+fn build_reports_the_exact_projection_schema_rejection_without_creating_a_store() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let project = factory.operation("project", Box::new(ProjectDefinition::new([1])), [scan]);
+    let project = factory.operation(
+        "project",
+        Box::new(
+            SelectDefinition::try_new([("missing", dogpaddle_operation::col("other"))]).unwrap(),
+        ),
+        [scan],
+    );
     factory.operation("sink", Box::new(DiscardDefinition::new()), [project]);
     factory.materialize(scan, CAPACITY);
     factory.materialize(project, CAPACITY);
@@ -36,7 +40,7 @@ fn build_reports_the_exact_project_schema_rejection_without_creating_a_store() {
     let Err(FlowError::Schema(error)) = factory.build() else {
         panic!("schema-incompatible Flow did not return FlowError::Schema");
     };
-    assert_project_field_rejection(&error);
+    assert_projection_field_rejection(&error);
     assert!(!path.exists(), "Schema rejection created the Store path");
 }
 
@@ -96,13 +100,19 @@ fn build_reports_sqlite_identifier_collisions_without_creating_either_database()
 }
 
 #[test]
-fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources() {
+fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     factory.owner_identity(OWNER_IDENTITY);
     let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let project = factory.operation("project", Box::new(ProjectDefinition::new([0])), [scan]);
+    let project = factory.operation(
+        "project",
+        Box::new(
+            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        ),
+        [scan],
+    );
     factory.operation("sink", Box::new(DiscardDefinition::new()), [project]);
     factory.materialize(scan, CAPACITY);
     factory.materialize(project, CAPACITY);
@@ -110,14 +120,17 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     drop(factory.build().unwrap());
 
     let mut definition = read_published_definition(&path);
-    let valid_project = encode_definition(&ProjectDefinition::new([0]));
+    let valid_project = encode_definition(
+        &SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+    );
     let offset = definition
         .windows(valid_project.len())
         .position(|candidate| candidate == valid_project)
         .expect("published Flow contains the Project definition");
-    let encoded_index = offset + valid_project.len() - size_of::<u32>();
-    definition[encoded_index..encoded_index + size_of::<u32>()]
-        .copy_from_slice(&1_u32.to_be_bytes());
+    let invalid_projection =
+        encode_definition(&SelectDefinition::try_new([("value", col("other"))]).unwrap());
+    assert_eq!(invalid_projection.len(), valid_project.len());
+    definition[offset..offset + valid_project.len()].copy_from_slice(&invalid_projection);
     rewrite_checksum(&mut definition);
     replace_published_definition(&path, &definition);
 
@@ -131,7 +144,7 @@ fn open_rebinds_the_decoded_project_definition_before_opening_runtime_resources(
     let Err(FlowError::Schema(error)) = open.open() else {
         panic!("open did not rebind the decoded schema-incompatible Project");
     };
-    assert_project_field_rejection(&error);
+    assert_projection_field_rejection(&error);
     assert_eq!(read_published_definition(&path), definition);
 }
 
@@ -288,36 +301,37 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     let align = factory.operation(
         "schema-align",
         Box::new(
-            SchemaAlignDefinition::try_new([
-                SchemaAlignField::try_new(
-                    "event_date",
-                    cast(cast(col("value"), DataType::Int32), DataType::Date32),
-                    false,
-                )
-                .unwrap(),
-                SchemaAlignField::try_new(
-                    "event_time",
-                    cast(
-                        cast(col("value"), DataType::Int64),
-                        DataType::Timestamp(TimeUnit::Millisecond, None),
+            SchemaAlignDefinition::try_new(
+                [
+                    (
+                        "event_date",
+                        cast(cast(col("value"), DataType::Int32), DataType::Date32),
                     ),
-                    false,
-                )
-                .unwrap(),
-                SchemaAlignField::try_new(
-                    "amount",
-                    cast(col("value"), DataType::Decimal128(10, 2)),
-                    false,
-                )
-                .unwrap(),
-            ])
+                    (
+                        "event_time",
+                        cast(
+                            cast(col("value"), DataType::Int64),
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                        ),
+                    ),
+                    ("amount", cast(col("value"), DataType::Decimal128(10, 2))),
+                ]
+                .map(|(name, expression)| {
+                    SchemaAlignField::try_new(name, expression, false).unwrap()
+                }),
+            )
             .unwrap(),
         ),
         [scan],
     );
     let project = factory.operation(
         "project",
-        Box::new(ProjectDefinition::new([0, 1, 2])),
+        Box::new(
+            SelectDefinition::try_new(
+                ["event_date", "event_time", "amount"].map(|name| (name, col(name))),
+            )
+            .unwrap(),
+        ),
         [align],
     );
     let select = factory.operation(
@@ -338,7 +352,15 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
         .and(col("amount").gt(lit(ScalarValue::Decimal128(Some(0), 10, 2))));
     let extend = factory.operation(
         "extend",
-        Box::new(ExtendDefinition::try_new("keep", predicate).unwrap()),
+        Box::new(
+            SelectDefinition::try_new([
+                ("date", col("date")),
+                ("time", col("time")),
+                ("amount", col("amount")),
+                ("keep", predicate),
+            ])
+            .unwrap(),
+        ),
         [select],
     );
     let filter = factory.operation(
@@ -378,12 +400,18 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
 }
 
 #[test]
-fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
+fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let project = factory.operation("project", Box::new(ProjectDefinition::new([])), [scan]);
+    let project = factory.operation(
+        "project",
+        Box::new(
+            SelectDefinition::try_new(Vec::<(&str, dogpaddle_operation::Expr)>::new()).unwrap(),
+        ),
+        [scan],
+    );
     let count = factory.operation(
         "count",
         Box::new(RunningEventCountDefinition::new()),
@@ -433,19 +461,14 @@ fn empty_project_schema_runs_through_count_and_discard_across_reopen() {
     assert_eq!((project_output.head, project_output.tail), (1, 1));
 }
 
-fn assert_project_field_rejection(error: &FlowSchemaError) {
+fn assert_projection_field_rejection(error: &FlowSchemaError) {
     assert_eq!(error.station_id(), "project");
     let OperationBindError::Rejected { source } = error.operation_error() else {
         panic!("Project returned a non-concrete Schema binding error");
     };
     assert!(matches!(
-        source.downcast_ref::<ProjectSchemaError>(),
-        Some(ProjectSchemaError::Projection(
-            ProjectionError::FieldOutOfBounds {
-                index: 1,
-                fields: 1
-            }
-        ))
+        source.downcast_ref::<SelectSchemaError>(),
+        Some(SelectSchemaError::Expression { field: 0, .. })
     ));
 }
 

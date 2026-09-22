@@ -7,9 +7,8 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition},
         transform::{
-            EquiJoinDefinition, EquiJoinKind, ExtendDefinition, FilterDefinition,
-            ProjectDefinition, RunningEventCountDefinition, SchemaAlignDefinition,
-            SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            EquiJoinDefinition, EquiJoinKind, FilterDefinition, RunningEventCountDefinition,
+            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -27,10 +26,22 @@ fn five_atomic_transforms_run_in_one_station_across_reopen() {
 
     let mut factory = FlowFactory::new(&flow_path);
     let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(start)), []);
-    let scan = factory.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
+    let scan = factory.operation(
+        "scan/tail-1",
+        Box::new(
+            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        ),
+        [scan],
+    );
     let scan = factory.operation(
         "scan/tail-2",
-        Box::new(ExtendDefinition::try_new("offset", col("value") - lit(start)).unwrap()),
+        Box::new(
+            SelectDefinition::try_new([
+                ("value", col("value")),
+                ("offset", col("value") - lit(start)),
+            ])
+            .unwrap(),
+        ),
         [scan],
     );
     let scan = factory.operation(
@@ -311,8 +322,20 @@ fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let scan = factory.operation("scan/tail-1", Box::new(ProjectDefinition::new([0])), [scan]);
-    let scan = factory.operation("scan/tail-2", Box::new(ProjectDefinition::new([1])), [scan]);
+    let scan = factory.operation(
+        "scan/tail-1",
+        Box::new(
+            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        ),
+        [scan],
+    );
+    let scan = factory.operation(
+        "scan/tail-2",
+        Box::new(
+            SelectDefinition::try_new([("missing", dogpaddle_operation::col("other"))]).unwrap(),
+        ),
+        [scan],
+    );
     factory.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
     factory.materialize(scan, CAPACITY);
 

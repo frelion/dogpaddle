@@ -680,9 +680,17 @@ fn right(
 }
 
 fn apply_left(fixture: &mut Fixture, oracle: &mut Oracle, events: &[LeftEvent]) {
+    let sequence = events
+        .iter()
+        .filter_map(|event| {
+            oracle_selected_row(oracle, &event.row, fixture.config)
+                .map(|row| (row, event.difference))
+        })
+        .collect::<Vec<_>>();
     let mut expected = oracle.clone();
     let delta = expected.apply_left(events, fixture.config);
     let output = fixture.run(0, &left_change(events)).unwrap();
+    assert_eq!(observed_sequence(&output, fixture.config.kind), sequence);
     assert_eq!(observed(&output, fixture.config.kind), delta);
     *oracle = expected;
 }
@@ -947,12 +955,15 @@ fn a_paged_build_correction_replays_after_rollback_and_reopen() {
     let rolled_back = fixture.rollback_once(1, &change).unwrap();
     let replayed = fixture.commit_once(1, &change).unwrap();
     assert_eq!(
-        action_observed(rolled_back, config.kind),
-        action_observed(replayed, config.kind)
+        action_sequence(&rolled_back, config.kind),
+        action_sequence(&replayed, config.kind)
     );
 
+    let mut outputs = match replayed {
+        Action::Commit(output) => output.into_iter().collect::<Vec<_>>(),
+        _ => panic!("historical correction must span multiple turns"),
+    };
     fixture = fixture.reopen();
-    let mut outputs = Vec::new();
     for _ in 0..20_000 {
         match fixture.commit_once(1, &change).unwrap() {
             Action::Commit(output) => outputs.extend(output),
@@ -1001,8 +1012,8 @@ fn a_large_right_claim_without_left_rows_is_budgeted_and_reopens() {
         }
     }
     assert!(
-        committed_turns >= 4,
-        "both Probe and Emit must page a 600-row right Claim"
+        committed_turns >= 2,
+        "a single pass must page a 600-row right Claim"
     );
 
     let probe = left(Some("A"), Some(1_000), 1, 1);
@@ -1044,8 +1055,8 @@ fn right_rematch_skips_persisted_null_order_left_history() {
         }
     }
     assert_eq!(
-        committed_turns, 2,
-        "only the 129 right events in Probe and Emit should consume turn work"
+        committed_turns, 1,
+        "only the 129 right events should consume turn work"
     );
 }
 
@@ -1241,7 +1252,7 @@ fn whole_claim_preflight_rolls_back_late_negative_prefixes() {
 }
 
 #[test]
-fn build_rematch_overflow_is_preflighted_and_i64_min_retraction_remains_valid() {
+fn first_turn_rematch_overflow_rolls_back_and_i64_min_retraction_remains_valid() {
     let config = Config::backward(AsOfJoinKind::LeftOuter);
     let mut fixture = Fixture::new(config);
     let original = right(Some("A"), Some(10), None, 10, 1);
@@ -1312,7 +1323,7 @@ fn rebatching_one_port_preserves_the_flattened_correction_sequence() {
 }
 
 #[test]
-fn every_paged_phase_replays_after_rollback_and_repeated_reopen() {
+fn every_candidate_and_history_page_replays_after_rollback_and_repeated_reopen() {
     let config = Config::backward(AsOfJoinKind::LeftOuter);
     let mut fixture = Fixture::new(config);
     let candidates = (0..130)
@@ -1354,15 +1365,6 @@ fn every_paged_phase_replays_after_rollback_and_repeated_reopen() {
     oracle.apply_left(&probes, config);
     let expected = oracle.apply_right(&[event], config);
     assert_eq!(observed(&outputs, config.kind), expected);
-}
-
-fn action_observed(action: Action, kind: AsOfJoinKind) -> BTreeMap<OutputRow, i128> {
-    match action {
-        Action::Commit(output) | Action::Complete(output) => {
-            observed(&output.into_iter().collect::<Vec<_>>(), kind)
-        }
-        Action::Idle => panic!("ASOF join returned Idle for a pinned input"),
-    }
 }
 
 fn action_sequence(action: &Action, kind: AsOfJoinKind) -> Vec<(OutputRow, i64)> {
@@ -2056,4 +2058,259 @@ fn binding_rejects_multi_order_distance_and_wrong_output_cardinality() {
             actual: 1,
         }
     ));
+}
+
+fn oracle_selected_row(oracle: &Oracle, row: &LeftRow, config: Config) -> Option<OutputRow> {
+    let winner = oracle.winner(row, config);
+    match config.kind {
+        AsOfJoinKind::Inner => winner.map(|right| OutputRow::Pair(row.clone(), Some(right))),
+        AsOfJoinKind::LeftOuter => Some(OutputRow::Pair(row.clone(), winner)),
+        AsOfJoinKind::LeftSemi => winner.map(|_| OutputRow::Left(row.clone())),
+        AsOfJoinKind::LeftAnti => winner.is_none().then(|| OutputRow::Left(row.clone())),
+    }
+}
+
+fn oracle_right_sequence(
+    oracle: &mut Oracle,
+    events: &[RightEvent],
+    config: Config,
+) -> Vec<(OutputRow, i64)> {
+    let mut sequence = Vec::new();
+    for event in events {
+        // These witnesses use one partition and distinct positive order keys, so
+        // the logical left-row order is also the documented historical scan order.
+        let before = oracle
+            .left
+            .keys()
+            .map(|row| oracle_selected_row(oracle, row, config))
+            .collect::<Vec<_>>();
+        adjust(&mut oracle.right, event.row.clone(), event.difference);
+        for ((left, weight), before) in oracle.left.iter().zip(before) {
+            let after = oracle_selected_row(oracle, left, config);
+            if before != after {
+                let weight = i64::try_from(*weight).unwrap();
+                sequence.extend(before.map(|row| (row, -weight)));
+                sequence.extend(after.map(|row| (row, weight)));
+            }
+        }
+    }
+    sequence
+}
+
+#[test]
+fn paged_repeated_right_events_preserve_the_independent_oracles_ordered_trace() {
+    for kind in [
+        AsOfJoinKind::Inner,
+        AsOfJoinKind::LeftOuter,
+        AsOfJoinKind::LeftSemi,
+        AsOfJoinKind::LeftAnti,
+    ] {
+        let config = Config::backward(kind);
+        let mut fixture = Fixture::new(config);
+        let mut oracle = Oracle::default();
+        let rights = (0..130)
+            .map(|at| right(Some("A"), Some(at), None, at, 1))
+            .collect::<Vec<_>>();
+        let lefts = (0..5)
+            .map(|id| left(Some("A"), Some(200 + id), id, 2))
+            .collect::<Vec<_>>();
+        apply_right(&mut fixture, &mut oracle, &rights);
+        apply_left(&mut fixture, &mut oracle, &lefts);
+        let events = [
+            right(Some("A"), Some(150), None, 150, 1),
+            right(Some("A"), Some(150), None, 150, 1),
+            right(Some("A"), Some(150), None, 150, -2),
+            right(Some("A"), Some(160), None, 160, 1),
+            right(Some("A"), Some(160), None, 160, -1),
+        ];
+        let expected = oracle_right_sequence(&mut oracle, &events, config);
+        let change = right_change(&events);
+        let mut actual = Vec::new();
+        let mut completed = false;
+        for turn in 0..2_000 {
+            let rolled_back = fixture.rollback_once(1, &change).unwrap();
+            // Also reopen after rolling back Complete, before AfterCommit may
+            // release the prepared Claim. This exercises both durable cursors.
+            fixture = fixture.reopen();
+            let committed = fixture.commit_once(1, &change).unwrap();
+            assert_eq!(
+                action_sequence(&rolled_back, kind),
+                action_sequence(&committed, kind),
+                "turn {turn}"
+            );
+            actual.extend(action_sequence(&committed, kind));
+            if matches!(committed, Action::Complete(_)) {
+                completed = true;
+                break;
+            }
+            fixture = fixture.reopen();
+        }
+        assert!(completed);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn late_rematch_overflow_preserves_committed_pages_and_repeats_after_reopen() {
+    let config = Config::backward(AsOfJoinKind::LeftOuter);
+    let mut fixture = Fixture::new(config);
+    let mut lefts = (0..700)
+        .map(|id| left(Some("A"), Some(100 + id), id, 1))
+        .collect::<Vec<_>>();
+    lefts.push(left(Some("A"), Some(1_000), 1_000, i64::MAX));
+    lefts.push(left(Some("A"), Some(1_000), 1_000, 1));
+    fixture.run(0, &left_change(&lefts)).unwrap();
+    let change = right_change(&[right(Some("A"), Some(50), None, 50, 1)]);
+    let mut prefix = Vec::new();
+    let mut failed = false;
+    for _ in 0..100 {
+        match fixture.commit_once(1, &change) {
+            Ok(Action::Commit(output)) => prefix.extend(output),
+            Err(error) => {
+                assert!(matches!(
+                    error.downcast_ref::<AsOfJoinError>(),
+                    Some(AsOfJoinError::OutputDifferenceOverflow)
+                ));
+                failed = true;
+                break;
+            }
+            _ => panic!("overflowing rematch unexpectedly completed"),
+        }
+    }
+    assert!(failed);
+    let prefix = observed_sequence(&prefix, config.kind);
+    assert!(!prefix.is_empty());
+    assert!(prefix.len() <= 1_400);
+    for _ in 0..2 {
+        fixture = fixture.reopen();
+        let error = fixture.commit_once(1, &change).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<AsOfJoinError>(),
+            Some(AsOfJoinError::OutputDifferenceOverflow)
+        ));
+    }
+}
+
+#[test]
+fn late_ambiguity_keeps_earlier_corrections_and_rejects_the_same_page_after_reopen() {
+    let mut config = Config::backward(AsOfJoinKind::LeftOuter);
+    config.tie_fallback = AsOfTieFallback::Reject;
+    let mut fixture = Fixture::new(config);
+    fixture
+        .run(1, &right_change(&[right(Some("B"), Some(10), None, 1, 1)]))
+        .unwrap();
+    let mut lefts = (0..700)
+        .map(|id| left(Some("A"), Some(100 + id), id, 1))
+        .collect::<Vec<_>>();
+    lefts.push(left(Some("B"), Some(100), 1, 1));
+    fixture.run(0, &left_change(&lefts)).unwrap();
+    let change = right_change(&[
+        right(Some("A"), Some(10), None, 1, 1),
+        right(Some("B"), Some(10), None, 2, 1),
+    ]);
+    let mut outputs = Vec::new();
+    let mut failed = false;
+    for _ in 0..100 {
+        match fixture.commit_once(1, &change) {
+            Ok(Action::Commit(output)) => outputs.extend(output),
+            Err(error) => {
+                assert!(matches!(
+                    error.downcast_ref::<AsOfJoinError>(),
+                    Some(AsOfJoinError::AmbiguousTie)
+                ));
+                failed = true;
+                break;
+            }
+            _ => panic!("ambiguous rematch unexpectedly completed"),
+        }
+    }
+    assert!(failed);
+    assert!(!observed_sequence(&outputs, config.kind).is_empty());
+    fixture = fixture.reopen();
+    assert!(matches!(
+        fixture
+            .commit_once(1, &change)
+            .unwrap_err()
+            .downcast_ref::<AsOfJoinError>(),
+        Some(AsOfJoinError::AmbiguousTie)
+    ));
+}
+
+#[test]
+fn late_stored_weight_decode_failure_does_not_replay_committed_output() {
+    use dogpaddle_store::{OrderedMap, ScanDirection, ScanLimit};
+    let config = Config::backward(AsOfJoinKind::Inner);
+    let mut fixture = Fixture::new(config);
+    fixture
+        .run(
+            1,
+            &right_change(&[
+                right(Some("A"), Some(10), None, 1, 1),
+                right(Some("B"), Some(10), None, 2, 1),
+            ]),
+        )
+        .unwrap();
+    let Fixture {
+        config,
+        definition,
+        root,
+        operation,
+        transactions,
+    } = fixture;
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let raw: OrderedMap<Vec<u8>, Vec<u8>> =
+        store.open_data("operation/asof_join.right_rows").unwrap();
+    let operation =
+        reconstruct_join_operation(&store, &definition, &[left_schema(), right_schema()]);
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin();
+        let page = raw
+            .access(transaction.access())
+            .unwrap()
+            .scan(
+                ..,
+                ScanDirection::Descending,
+                None,
+                ScanLimit::new(1, usize::MAX).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        raw.access(transaction.access())
+            .unwrap()
+            .put(&page.entries[0].0, &vec![0])
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    fixture = Fixture {
+        config,
+        definition,
+        root,
+        operation,
+        transactions,
+    };
+    let mut events = (0..700)
+        .map(|id| left(Some("A"), Some(100 + id), id, 1))
+        .collect::<Vec<_>>();
+    events.push(left(Some("B"), Some(100), 1, 1));
+    let change = left_change(&events);
+    let mut output_rows = 0;
+    let error = loop {
+        match fixture.commit_once(0, &change) {
+            Ok(Action::Commit(output)) => {
+                output_rows += output.as_ref().map_or(0, Change::num_rows);
+            }
+            Err(error) => break error,
+            _ => panic!("corrupt candidate weight unexpectedly completed"),
+        }
+    };
+    assert!(output_rows > 0 && output_rows <= 700);
+    assert!(matches!(
+        error.downcast_ref::<AsOfJoinError>(),
+        Some(AsOfJoinError::Store(_))
+    ));
+    fixture = fixture.reopen();
+    let replayed = fixture.commit_once(0, &change).unwrap_err();
+    assert_eq!(error.to_string(), replayed.to_string());
 }

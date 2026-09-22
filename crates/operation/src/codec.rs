@@ -33,16 +33,11 @@ pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
         transform::running_event_count::TAG,
         transform::running_event_count::decode_definition,
     ),
-    (
-        transform::project::TAG,
-        transform::project::decode_definition,
-    ),
     (transform::filter::TAG, transform::filter::decode_definition),
     (
         transform::equi_join::TAG,
         transform::equi_join::decode_definition,
     ),
-    (transform::extend::TAG, transform::extend::decode_definition),
     (transform::select::TAG, transform::select::decode_definition),
     (
         transform::union_all::TAG,

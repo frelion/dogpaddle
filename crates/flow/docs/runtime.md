@@ -98,3 +98,7 @@ Flow 长期唯一持有不可克隆的 `Transactions`，并在取得所有权时
 
 合法 DAG 可以有多个 Scan 起点、Sink 终点和独立分量。
 逻辑声明和容量 API 以 [README](../README.md#最小公共-api) 为准；open 不重新规划。
+
+## 分页 Join 的失败边界
+
+EquiJoin 与 ASOF 都按已提交 turn 推进，不预演整个 Claim。后页错误只回滚当前 Station turn，之前的输出及下游 Sink 交付保留；active pin 与输入 position 仍表示同一未完成 Claim。reopen 从 continuation 继续，不能重发已提交页、提前 ACK、跳过确定性错误或自动修复状态。成功关系等价不意味着 turn 数变化后的全图调度轨迹等价。

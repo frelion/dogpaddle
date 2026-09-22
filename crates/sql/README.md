@@ -262,3 +262,7 @@ cargo test -p dogpaddle-sql --doc
 ```
 
 产品命令的完整本地例子见仓库根 [`README`](../../README.md)。真实 `PostgreSQL` CDC、Sink、恢复和 SQL gate 见仓库根目录的 [`TESTING.md`](../../TESTING.md)。
+
+### 分页 Join 的运行错误
+
+普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；输入只有全部完成才确认。重启继续同一未确认输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `SchemaAlign`，普通 Rust 投影使用 `Select`，两者共享执行实现。

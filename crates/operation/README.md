@@ -21,7 +21,7 @@ Postgres CDC          Filter / Aggregate / Join         SQLite
 运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
 ```
 
-普通算子开发从 [`Project`](src/operation/transform/project.rs) 开始，再读
+普通算子开发从 [`Select`](src/operation/transform/select.rs) 开始，再读
 [`RunningEventCount`](src/operation/transform/running_event_count.rs) 及其
 [correctness 测试](tests/correctness/running_event_count.rs)。日常开发只需要掌握 Definition、
 Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station 提交、订阅确认和恢复调度由 Flow 负责。
@@ -59,7 +59,7 @@ Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station �
    `RuntimeResource`，统一检查输入数量、DogPaddle Schema 与资源 presence/type。
 3. sealed 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
    的 typed collections；同一代码同时服务新建与恢复。
-4. 统一入口复核 output Schema 和 `Atomic`/`Turn` 执行能力，规范化 Exclusive Atomic 为 Turn，返回
+4. 统一入口复核 output Schema 和 `Atomic`/`Turn` 执行能力，返回
    `ConstructedOperation`。调用方用 `into_parts()` 一次性取出最终 `Operation` 和 output Schema。
 
 下面的无状态 Filter 展示完整的新建和恢复生命周期。实际 Flow 会先对全图做 Schema 传播和
@@ -146,7 +146,7 @@ let _transactions = store.into_transactions();
 运行时收到的 `Change` 仍会与绑定时 Schema 比较。这样，磁盘 Definition、编译好的表达式和真实
 输入不会在 Schema 漂移后悄悄错位。
 
-## 三类业务角色，五种执行能力
+## 三类业务角色，四种执行能力
 
 Scan、Transform、Sink 是容易理解的业务角色；`OperationKind` 进一步告诉 Flow 输入数量，以及
 这个实例能否和相邻算子放进同一个 Station。
@@ -156,7 +156,6 @@ Scan、Transform、Sink 是容易理解的业务角色；`OperationKind` 进一�
 | `Scan` | 0 / 有输出 | 主动拉取或生成数据 | 可作为首项，后接单输入 Atomic |
 | `AtomicTransform(N)` | N / 有输出 | 一笔事务完整消费一个 Change | 可作为首项；单输入时也可作为尾项 |
 | `TurnTransform(N)` | N / 有输出 | 一个 Change 可以分成多个有界 turn | 只能作为首项，可后接单输入 Atomic |
-| `ExclusiveTransform(N)` | N / 有输出 | 需要自己的持久输出边界 | 必须独占 Station |
 | `Sink(N)` | N / 无输出 | 消费数据并结束这条路径 | 必须独占 Station |
 
 因此一个 Station 的程序始终是一条简单的线：
@@ -167,20 +166,18 @@ Scan、Transform、Sink 是容易理解的业务角色；`OperationKind` 进一�
 
 首项可以是 Scan、AtomicTransform 或 TurnTransform；后面只能追加单输入 `AtomicTransform`。
 Station 内没有第二张拓扑图，中间结果也不写日志。最后一个 Operation 的输出才进入 Station 的
-持久日志。Exclusive 和 Sink 单独装配，所以外部副作用或必须固定结果的计算不会被错误地融合。
+持久日志。Sink 单独装配，外部副作用遵循提交后的交付协议。
 
-具体 Definition 实例自己声明 kind。Filter、Extend、Select、SchemaAlign 和 Aggregate 会根据表达式
-分类：可重放的逐行 immutable 表达式可以成为 Atomic；仍受支持但需要单独边界的实例成为 Exclusive，
-其他表达式会在 Definition 构造或 checked `construct` 时被拒绝。EquiJoin 的 key 和 residual 必须是 immutable；不满足时直接拒绝，
-不会退化成 Exclusive。`EquiJoin` 是两输入 TurnTransform，可以分页完成一个输入，再把每一页
-交给后面的 Atomic 算子。
+具体 Definition 自己声明 kind。Filter、Select、SchemaAlign 和 Aggregate 只接受逐行 immutable 表达式，固定使用 Atomic。
+Join 的 key、order、tie 和 residual 也必须 immutable；不满足时在 Definition 构造或 decode 阶段拒绝。
+`EquiJoin` 与 `AsOfJoin` 是两输入 TurnTransform，分页完成一个输入，并把每页交给后面的 Atomic 算子。
 
 ## 一次 Station 是怎样运行的
 
 假设 Station 是：
 
 ```text
-EquiJoin ──> Filter ──> Project
+EquiJoin ──> Filter ──> Select
 ```
 
 运行时大致发生这些事：
@@ -189,7 +186,7 @@ EquiJoin ──> Filter ──> Project
    因而 Join 处理左侧时右侧关系不会在中途变化。
 2. 首 Operation 在没有写事务时准备一次有界工作。
 3. Station 开启一笔 Store 写事务，执行首项本 turn 的状态变化。
-4. 如果首项产生输出，Filter 和 Project 在同一事务中连续处理内存中的 `Change`。
+4. 如果首项产生输出，Filter 和 Select 在同一事务中连续处理内存中的 `Change`。
 5. Station 尝试把最终输出写入自己的持久日志；若输入已经完成，也在这笔事务中推进订阅位置。
 6. 事务提交后，才执行外部 ACK 等不可回滚动作。
 
@@ -197,7 +194,7 @@ Atomic 尾项、Schema 检查、输出背压或其他提交前错误会确定回
 持久状态重算。`Transaction::commit` 返回错误时，落盘结果可能不确定；Station 会停止继续运行，
 调用方必须 reopen，再由持久状态决定从哪里恢复。
 
-这就是算子融合带来的直接收益：Filter 和 Project 之间不再进行 Arrow IPC 编码、RocksDB 写入、
+这就是算子融合带来的直接收益：Filter 和 Select 之间不再进行 Arrow IPC 编码、RocksDB 写入、
 订阅读取和解码，同时仍共享一笔事务。持久边界只保留在 Station 之间。
 
 ## 两种运行接口
@@ -212,7 +209,7 @@ Atomic 尾项、Schema 检查、输出背压或其他提交前错误会确定回
 Atomic Operation 可以更新自己声明的 Store 状态，但不能保存跨 turn 进度、执行外部副作用或安排
 提交后的动作。
 
-Scan、Sink、Join 以及 Exclusive Transform 使用完整的 `TurnOperation::turn` 协议：
+Scan、Sink 和 Join 使用完整的 `TurnOperation::turn` 协议：
 
 ```text
 没有写事务                         Store 写事务                      提交以后
@@ -281,8 +278,8 @@ Schema 和 `SQLite` 路径等稳定信息仍保存在 Definition。普通算子�
 | `AsOfJoin` | 分区、排序键 → 左右完整行与权重 | 为每个左行选择至多一个右行；右侧变化修正历史选择 |
 
 Aggregate 按「分组 + 调用参数」校验被跟踪权重，不保存完整输入行；其他三个算子按完整行身份记账。
-`EquiJoin` 先预检本侧权重，再逐页计算并提交；后页计算失败只回滚当前 turn，之前的结果可能已到达 Sink。
-reopen 保留已提交进度，但不会跳过确定性错误或补偿部分结果。`AsOfJoin` 仍先 Probe 整个 Claim，再 Emit。
+`EquiJoin` 与 `AsOfJoin` 先预检本侧权重，再逐页计算并提交；后页计算失败只回滚当前 turn，之前的结果可能已到达 Sink。
+reopen 保留已提交进度，但不会跳过确定性错误或补偿部分结果。只有 Complete 才确认整个输入；状态可能停在单个输入事件的处理中间。
 复杂算法的状态、输入类型、NULL、分页和恢复规则以 [关系算子契约](docs/relations.md) 为准。
 
 ## 内建算子索引
@@ -295,17 +292,15 @@ reopen 保留已提交进度，但不会跳过确定性错误或补偿部分结�
 | `SequenceScan` (1) | Scan / 0 | 从起始值连续产生 `UInt64`，diff 固定 `+1` | `sequence_scan.position: Cell<u64>` |
 | `RunningEventCount` (2) | Atomic / 1 | 每观察一行计数加一；忽略输入 diff 值 | `running_event_count.count: Cell<u64>` |
 | `Discard` (3) | Sink / 1 | 完成输入，不产生输出 | 无 |
-| `Project` (4) | Atomic / 1 | 按严格递增索引保留顶层列 | 无 |
-| `Filter` (5) | Atomic 或 Exclusive / 1 | 只保留谓词为 non-null true 的行 | 无 |
-| `Extend` (6) | Atomic 或 Exclusive / 1 | 保留输入并追加一个表达式列 | 无 |
-| `Select` (7) | Atomic 或 Exclusive / 1 | 从同一输入计算完整有序输出列 | 无 |
+| `Filter` (5) | Atomic / 1 | 只保留谓词为 non-null true 的行 | 无 |
+| `Select` (7) | Atomic / 1 | 从同一输入计算完整有序输出列 | 无 |
 | `UnionAll` (8) | Atomic / N | 原样转发 Schema 完全相同的各端口 Change | 无 |
-| `SchemaAlign` (9) | Atomic 或 Exclusive / 1 | 显式产生目标字段与 metadata | 无 |
+| `SchemaAlign` (9) | Atomic / 1 | 显式产生目标字段与 metadata | 无 |
 | `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 `SQLite` STRICT 表 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
 | `PostgresCdcScan` (11) | Scan / 0 | `PostgreSQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
 | `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 `PostgreSQL` | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
 | `Distinct` (13) | Atomic / 1 | 把任意正权重关系变成集合边界变化 | `distinct.weights: OrderedMultiset` |
-| `Aggregate` (14) | Atomic 或 Exclusive / 1 | 增量维护非空分组聚合 | groups、entries、control |
+| `Aggregate` (14) | Atomic / 1 | 增量维护非空分组聚合 | groups、entries、control |
 | `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
 | `EquiJoin` (16) | Turn / 2 | 增量维护带可选 residual 的 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 使用 key counts 或逐行 match counts |
 | `AsOfJoin` (17) | Turn / 2 | 按 equality partition 增量维护 backward/forward/nearest 的单候选 Inner、Left Outer/Semi/Anti | ordered left rows、ordered right rows、continuation |
@@ -317,11 +312,33 @@ reopen 保留已提交进度，但不会跳过确定性错误或补偿部分结�
 [`operation/sink/`](src/operation/sink/)。目录只是帮助阅读；真正的输入数、输出属性和融合资格
 始终来自每个 Definition 的 `OperationKind`。
 
+## 投影入口
+
+普通调用者只需输出名字和表达式：
+
+```rust
+use dogpaddle_operation::{col, lit};
+use dogpaddle_operation::operation::transform::SelectDefinition;
+
+let selected = SelectDefinition::try_new([
+    ("id", col("order_id")),
+    ("amount", col("amount")),
+    ("next_amount", col("amount") + lit(1_u64)),
+])?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+引擎推导类型和 nullability；直接列引用保留字段 metadata，计算列 metadata 为空，输入 Schema metadata 保留。
+已有输入 Schema 时，`SelectDefinition::try_extend(&input_schema, fields)` 保留原列并追加多个计算列，立即生成普通 Select 定义。
+所有表达式读取原始输入，不能引用同组新别名。空投影保留行数与 diff；直接选列和改名共享输入 array，diff 也不复制。
+编译器使用 `SchemaAlignDefinition` 明确控制 metadata 和目标 nullability，需要转换类型时在 Expr 中显式 cast。
+旧 Project/Extend 类型与持久 tag 不保留；受影响状态重新构建。
+
 ## 表达式边界
 
 `Select` 与 `SchemaAlign` 直接使用同一个私有 `BoundProjection` 运行实例：绑定时共享一个 `DFSchema`，每个 Change 只做一次整组 exact Schema 校验，空投影也检查。各 Definition 继续独立决定字段、metadata、nullability 与稳定编码，运行错误统一为 `ProjectionError`，保留输入端口、具体字段序号和底层错误链；两个 Definition 的构造与 Schema 错误仍各自独立。
 
-Filter、Extend、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
+Filter、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
 crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
 字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
 
@@ -342,8 +359,9 @@ tie-break 只针对 right Schema 绑定。
 | `DataFusion` 可能支持但 `DogPaddle` 尚未承诺 | 未经 Definition codec、checked construction、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
 | 明确拒绝 | 无法 canonical protobuf roundtrip、字段缺失或歧义、Filter 非 Boolean、隐式 coercion、运行时 Schema 漂移 |
 
-只有逐行 immutable scalar 表达式可以融合。Stable、Volatile、placeholder、subquery、
-aggregate/window、unnest 和外部引用等实例需要独立持久边界，或在 Definition 构造/checked `construct` 时被拒绝。
+普通计算只接受逐行 immutable 表达式。Stable、Volatile、placeholder、subquery、
+aggregate/window、unnest 和外部引用等节点在 Definition 构造或 decode 时拒绝；没有独占计算模式。
+当前默认 codec 无法重建 scalar UDF，包括 immutable UDF。Rust API 能力审计及拒绝阶段见 [定义契约](docs/definitions.md#不可重放表达式的准入与能力审计)。
 
 Expr protobuf 与精确 pin 的 `DataFusion` 版本绑定。升级 `DataFusion` 时必须审查 roundtrip、physical
 planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库直接删除重建。
@@ -396,7 +414,7 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 
 ## 新增一个算子
 
-建议先读最小的 [`Project`](src/operation/transform/project.rs)，再读带状态的
+建议先读最小的 [`Select`](src/operation/transform/select.rs)，再读带状态的
 [`RunningEventCount`](src/operation/transform/running_event_count.rs)；需要分页时读
 [`EquiJoin`](src/operation/transform/equi_join/) 和
 [`AsOfJoin`](src/operation/transform/asof_join/)，需要外部恢复协议时读

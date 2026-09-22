@@ -250,14 +250,6 @@ pub enum AsOfJoinDefinitionError {
         #[source]
         source: ExpressionDefinitionError,
     },
-    /// Every expression must be immutable because a paged turn can reevaluate it after reopen.
-    #[error("ASOF join {role} expression {index} is not immutable")]
-    NonImmutableExpression {
-        /// Expression collection.
-        role: &'static str,
-        /// Zero-based expression or pair index.
-        index: usize,
-    },
     /// The candidate-eligibility predicate cannot be persisted canonically.
     #[error("ASOF join residual predicate cannot be persisted")]
     ResidualExpression {
@@ -265,9 +257,6 @@ pub enum AsOfJoinDefinitionError {
         #[source]
         source: ExpressionDefinitionError,
     },
-    /// The residual must be immutable because a paged turn can reevaluate it after reopen.
-    #[error("ASOF join residual predicate is not immutable")]
-    NonImmutableResidual,
 }
 
 /// ASOF join rejection while binding two exact input Schemas.

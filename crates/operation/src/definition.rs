@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     RuntimeResource,
-    operation::{AtomicOperation, Operation, TurnOperation, exclusive_turn},
+    operation::{AtomicOperation, Operation, TurnOperation},
 };
 
 mod private {
@@ -58,8 +58,6 @@ pub enum OperationKind {
     AtomicTransform(NonZeroU32),
     /// Turn-based transform that may head an atomic tail.
     TurnTransform(NonZeroU32),
-    /// Transform that must occupy its own station.
-    ExclusiveTransform(NonZeroU32),
     /// Outputless terminal operation.
     Sink(NonZeroU32),
 }
@@ -69,10 +67,7 @@ impl OperationKind {
     pub const fn input_count(self) -> u32 {
         match self {
             Self::Scan => 0,
-            Self::AtomicTransform(n)
-            | Self::TurnTransform(n)
-            | Self::ExclusiveTransform(n)
-            | Self::Sink(n) => n.get(),
+            Self::AtomicTransform(n) | Self::TurnTransform(n) | Self::Sink(n) => n.get(),
         }
     }
 
@@ -252,7 +247,7 @@ impl dyn OperationDefinition + '_ {
         let kind = self.kind();
         validate_inputs(kind, inputs)?;
         resource.validate(private::Sealed::resource_type(self))?;
-        let mut built = private::Sealed::construct_unchecked(
+        let built = private::Sealed::construct_unchecked(
             self,
             ConstructionToken(()),
             inputs,
@@ -260,20 +255,16 @@ impl dyn OperationDefinition + '_ {
             resource,
         )?;
         validate_output(kind, built.output_schema.as_ref())?;
-        built.operation = match (kind, built.operation) {
-            (OperationKind::ExclusiveTransform(_), Operation::Atomic(op)) => {
-                Operation::Turn(exclusive_turn(op))
-            }
-            (OperationKind::AtomicTransform(_), op @ Operation::Atomic(_))
-            | (
-                OperationKind::Scan
-                | OperationKind::TurnTransform(_)
-                | OperationKind::ExclusiveTransform(_)
-                | OperationKind::Sink(_),
-                op @ Operation::Turn(_),
-            ) => op,
-            _ => return Err(OperationSetupError::ExecutionKind),
-        };
+        if !matches!(
+            (kind, &built.operation),
+            (OperationKind::AtomicTransform(_), Operation::Atomic(_))
+                | (
+                    OperationKind::Scan | OperationKind::TurnTransform(_) | OperationKind::Sink(_),
+                    Operation::Turn(_),
+                )
+        ) {
+            return Err(OperationSetupError::ExecutionKind);
+        }
         Ok(built)
     }
 

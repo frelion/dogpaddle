@@ -25,7 +25,8 @@ struct SelectField {
 /// Every expression is bound independently to the same exact input Schema.
 /// The output contains exactly the declared fields in declaration order and
 /// may contain no fields. Output types and nullability come from `DataFusion`;
-/// input Schema metadata is preserved and output Field metadata starts empty.
+/// input Schema metadata is preserved. Direct column references retain Field
+/// metadata; computed fields start with empty metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectDefinition {
     fields: Box<[SelectField]>,
@@ -79,6 +80,8 @@ impl SelectDefinition {
     ///
     /// # Errors
     ///
+    /// Non-replayable expressions (not immutable or not row-local) are rejected.
+    ///
     /// Returns [`SelectDefinitionError`] when the field count or a field name
     /// cannot fit the stable format, or when `DataFusion` cannot round-trip an
     /// expression exactly and canonically.
@@ -108,16 +111,38 @@ impl SelectDefinition {
         })
     }
 
+    /// Appends named expressions to all fields of an existing input Schema.
+    ///
+    /// Every expression reads the original input, including when several fields
+    /// are appended. No output Schema or field type is required from the caller.
+    ///
+    /// # Errors
+    /// Returns the same persistence errors as [`Self::try_new`]. Duplicate output
+    /// names and invalid expressions are rejected during construction or binding.
+    pub fn try_extend<I, N>(input: &SchemaRef, fields: I) -> Result<Self, SelectDefinitionError>
+    where
+        I: IntoIterator<Item = (N, Expr)>,
+        N: Into<String>,
+    {
+        Self::try_new(
+            input
+                .fields()
+                .iter()
+                .map(|field| (field.name().clone(), crate::ident(field.name().clone())))
+                .chain(
+                    fields
+                        .into_iter()
+                        .map(|(name, expression)| (name.into(), expression)),
+                ),
+        )
+    }
+
     /// Returns the selected field names and canonical expressions in order.
     #[must_use]
     pub fn fields(&self) -> impl ExactSizeIterator<Item = (&str, &Expr)> {
         self.fields
             .iter()
             .map(|field| (field.name.as_str(), field.expression.expression()))
-    }
-
-    fn is_atomic(&self) -> bool {
-        self.fields.iter().all(|field| field.expression.is_atomic())
     }
 
     fn bind_operation(
@@ -134,11 +159,15 @@ impl SelectDefinition {
                 .expression
                 .bind_with_dfschema(&datafusion_schema)
                 .map_err(|source| SelectSchemaError::Expression { field, source })?;
-            output_fields.push(Arc::new(Field::new(
+            let mut output_field = Field::new(
                 &selected.name,
                 expression.output_type().clone(),
                 expression.output_nullable(),
-            )));
+            );
+            if matches!(selected.expression.expression(), Expr::Column(_)) {
+                output_field = output_field.with_metadata(expression.output_metadata().clone());
+            }
+            output_fields.push(Arc::new(output_field));
             expressions.push(expression);
         }
 
@@ -183,11 +212,7 @@ impl SealedDefinition for SelectDefinition {
 
 impl OperationDefinition for SelectDefinition {
     fn kind(&self) -> OperationKind {
-        if self.is_atomic() {
-            OperationKind::AtomicTransform(NonZeroU32::MIN)
-        } else {
-            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
-        }
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn persistence_tag(&self) -> u16 {

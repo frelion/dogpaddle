@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     mem::size_of,
-    ops::Bound,
+    ops::{Bound, RangeBounds},
     sync::Arc,
 };
 
@@ -32,7 +32,7 @@ use super::{
         ParsedIndexKey, matchable_partition_prefix, parse_row_key, prefix_successor,
         push_component, push_nullable_ordered_component, row_key, take_component,
     },
-    state::{AsOfContinuation, Continuation, Phase, RowWeight, RowWeightError, Rows},
+    state::{AsOfContinuation, Continuation, RowWeight, RowWeightError, Rows},
 };
 
 const TURN_ITEMS: usize = 256;
@@ -89,7 +89,6 @@ pub(super) struct PreparedClaim {
     port: usize,
     rows: Vec<PreparedRow>,
     effects: Option<Vec<RowEffect>>,
-    overlay: CachedEventOverlay,
 }
 
 struct PreparedRow {
@@ -153,14 +152,7 @@ struct MergedPage {
     work: (usize, usize),
 }
 
-type VisibilityOverlay = BTreeMap<Vec<u8>, RowEffect>;
-
-#[derive(Default)]
-struct CachedEventOverlay {
-    phase: Option<Phase>,
-    row: Option<usize>,
-    weights: VisibilityOverlay,
-}
+type EventVisibility<'a> = Option<(&'a [u8], RowEffect)>;
 
 struct SelectionPage {
     best_before: Option<Winner>,
@@ -486,14 +478,12 @@ impl AsOfJoinOperation {
             port: input.port,
             rows,
             effects: None,
-            overlay: CachedEventOverlay::default(),
         })
     }
 
     fn initial_continuation(port: usize) -> AsOfContinuation {
         AsOfContinuation {
             port: u8::try_from(port).expect("the two ASOF ports fit in a byte"),
-            phase: Phase::Probe,
             row: 0,
             left_resume_after: None,
             candidate_resume_after: None,
@@ -517,14 +507,9 @@ impl AsOfJoinOperation {
             Self::initial_continuation(claim.port)
         };
         if claim.effects.is_none() {
-            let start = if state.phase == Phase::Probe {
-                0
-            } else {
-                usize::try_from(state.row)
-                    .map_err(|_| AsOfJoinError::InvalidContinuation("row exceeds usize"))?
-            };
-            let current_applied =
-                claim.port == 1 && state.phase == Phase::Emit && state.left_resume_after.is_some();
+            let start = usize::try_from(state.row)
+                .map_err(|_| AsOfJoinError::InvalidContinuation("row exceeds usize"))?;
+            let current_applied = claim.port == 1 && state.left_resume_after.is_some();
             claim.effects =
                 Some(self.preflight_admission(claim, start, current_applied, access)?);
         }
@@ -557,17 +542,11 @@ impl AsOfJoinOperation {
                 }
                 Step::Yield => {
                     continuation.set(&state)?;
-                    return Ok(match state.phase {
-                        Phase::Probe => Action::Commit(None),
-                        Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    });
+                    return Ok(Action::Commit(output.finish(&self.output_schema)?));
                 }
                 Step::Continue if budget.exhausted() => {
                     continuation.set(&state)?;
-                    return Ok(match state.phase {
-                        Phase::Probe => Action::Commit(None),
-                        Phase::Emit => Action::Commit(output.finish(&self.output_schema)?),
-                    });
+                    return Ok(Action::Commit(output.finish(&self.output_schema)?));
                 }
                 Step::Continue => {}
             }
@@ -619,8 +598,7 @@ impl AsOfJoinOperation {
             return Ok(Step::Yield);
         }
         let page = if row.matchable {
-            let empty = VisibilityOverlay::new();
-            let Some(page) = self.selection_page(row, &empty, false, state, budget, access)? else {
+            let Some(page) = self.selection_page(row, None, false, state, budget, access)? else {
                 return Ok(Step::Yield);
             };
             page
@@ -651,25 +629,12 @@ impl AsOfJoinOperation {
         let winner = finish_selection(state.best_after.as_deref(), state.ambiguous_after)?;
         state.ambiguous_after = false;
         let effect = claim.effects.as_ref().expect("the ASOF Claim was admitted")[row_index];
-        match state.phase {
-            Phase::Probe => {
-                let mut validation = OutputRows::new(self.output_schema.fields().len());
-                self.append_left_result(row, winner.as_ref(), &mut validation)?;
-                validation.finish(&self.output_schema)?;
-            }
-            Phase::Emit => {
-                self.append_left_result(row, winner.as_ref(), output)?;
-                self.adjust_actual(0, row, effect, access)?;
-            }
-        }
+        self.append_left_result(row, winner.as_ref(), output)?;
+        self.adjust_actual(0, row, effect, access)?;
         clear_candidate_state(state);
         Self::advance_claim_row(claim, state, continuation)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one row coordinates the durable outer cursor, inner selection cursor, and atomic correction"
-    )]
     fn process_right_claim_row(
         &self,
         claim: &mut PreparedClaim,
@@ -692,14 +657,12 @@ impl AsOfJoinOperation {
                     "right row without rematch work retains scan state",
                 ));
             }
-            if state.phase == Phase::Emit {
-                self.adjust_actual(1, right, effect, access)?;
-            }
+            self.adjust_actual(1, right, effect, access)?;
             budget.charge(TurnBudget::stored_row_work(right));
             return Self::advance_claim_row(claim, state, continuation);
         }
 
-        let applied = state.phase == Phase::Emit && state.left_resume_after.is_some();
+        let applied = state.left_resume_after.is_some();
         let first_left = state.left_resume_after.is_none();
         let (left_key, left_weight, left) =
             match self.current_or_next_left(right, state, budget, access)? {
@@ -709,7 +672,7 @@ impl AsOfJoinOperation {
                     if first_left {
                         budget.charge(TurnBudget::stored_row_work(right));
                     }
-                    if state.phase == Phase::Emit && !applied {
+                    if !applied {
                         self.adjust_actual(1, right, effect, access)?;
                     }
                     clear_outer_state(state);
@@ -717,21 +680,10 @@ impl AsOfJoinOperation {
                 }
             };
 
-        // Building the batch-prefix overlay is proportional to the number of prior
-        // right events. Defer it until there is a matchable left row to select for:
-        // empty partitions and NULL-order left rows must not pay that cost for every
-        // event in a large right-hand Claim.
-        let overlay = event_overlay(
-            &claim.rows,
-            claim
-                .effects
-                .as_ref()
-                .expect("the ASOF Claim was admitted before building its overlay"),
-            &mut claim.overlay,
-            row_index,
-            state.phase,
-        );
-        let page = self.selection_page(&left, overlay, true, state, budget, access)?;
+        // Prior events are already durable. Only the current right row differs
+        // between the before and after views, even after its update commits.
+        let visibility = Some((right.key.as_slice(), effect));
+        let page = self.selection_page(&left, visibility, true, state, budget, access)?;
         let Some(page) = page else {
             return Ok(Step::Yield);
         };
@@ -757,10 +709,10 @@ impl AsOfJoinOperation {
         if !budget.can_accept(work) {
             return Ok(Step::Yield);
         }
-        if state.phase == Phase::Emit && !applied {
-            self.adjust_actual(1, right, effect, access)?;
-        } else if state.phase == Phase::Emit {
+        if applied {
             self.validate_applied(right, effect, access)?;
+        } else {
+            self.adjust_actual(1, right, effect, access)?;
         }
         budget.charge(work);
         state.left_resume_after = Some(left_key);
@@ -779,14 +731,7 @@ impl AsOfJoinOperation {
             before,
             after,
         };
-        match state.phase {
-            Phase::Probe => {
-                let mut validation = OutputRows::new(self.output_schema.fields().len());
-                self.append_correction(&correction, &mut validation)?;
-                validation.finish(&self.output_schema)?;
-            }
-            Phase::Emit => self.append_correction(&correction, output)?,
-        }
+        self.append_correction(&correction, output)?;
         clear_candidate_state(state);
         Ok(Step::Continue)
     }
@@ -823,8 +768,7 @@ impl AsOfJoinOperation {
 
         // NULL-order left rows can never select any right candidate. Their order
         // tuple starts with marker `0`; constrain the durable outer scan to marker
-        // `1` so a right presence transition does not rescan irrelevant history in
-        // both Probe and Emit.
+        // `1` so a right presence transition does not rescan irrelevant history during historical rematch.
         let range = prefix_range(matchable_partition_prefix(&right.partition));
         let limit = ScanLimit::new(1, budget.remaining_bytes().max(1))
             .expect("one ASOF left row and positive bytes form a valid limit");
@@ -867,7 +811,7 @@ impl AsOfJoinOperation {
     fn selection_page(
         &self,
         left: &PreparedRow,
-        overlay: &VisibilityOverlay,
+        overlay: EventVisibility<'_>,
         track_before: bool,
         state: &AsOfContinuation,
         budget: &TurnBudget,
@@ -1289,11 +1233,6 @@ impl AsOfJoinOperation {
             state.row = persistent_row(next)?;
             return Ok(Step::Continue);
         }
-        if state.phase == Phase::Probe {
-            state.phase = Phase::Emit;
-            state.row = 0;
-            return Ok(Step::Continue);
-        }
         continuation.clear()?;
         Ok(Step::Complete)
     }
@@ -1436,64 +1375,9 @@ const fn map_weight_error(error: RowWeightError) -> AsOfJoinError {
     }
 }
 
-fn event_overlay<'cache>(
-    rows: &[PreparedRow],
-    effects: &[RowEffect],
-    cache: &'cache mut CachedEventOverlay,
-    row_index: usize,
-    phase: Phase,
-) -> &'cache VisibilityOverlay {
-    let rebuild = cache.phase != Some(phase)
-        || cache.row.is_none()
-        || cache.row.is_some_and(|cached| cached > row_index);
-    if rebuild {
-        cache.weights.clear();
-        if phase == Phase::Probe {
-            for (row, effect) in rows[..row_index].iter().zip(&effects[..row_index]) {
-                put_overlay(
-                    &mut cache.weights,
-                    &row.key,
-                    RowEffect {
-                        before: effect.after,
-                        after: effect.after,
-                    },
-                );
-            }
-        }
-    } else if phase == Phase::Probe {
-        let cached = cache.row.expect("a reusable event overlay has a row");
-        for index in cached..row_index {
-            let effect = effects[index];
-            put_overlay(
-                &mut cache.weights,
-                &rows[index].key,
-                RowEffect {
-                    before: effect.after,
-                    after: effect.after,
-                },
-            );
-        }
-    } else if cache.row != Some(row_index) {
-        cache.weights.clear();
-    }
-
-    put_overlay(&mut cache.weights, &rows[row_index].key, effects[row_index]);
-    cache.phase = Some(phase);
-    cache.row = Some(row_index);
-    &cache.weights
-}
-
-fn put_overlay(overlay: &mut VisibilityOverlay, key: &[u8], effect: RowEffect) {
-    if let Some(stored) = overlay.get_mut(key) {
-        *stored = effect;
-    } else {
-        overlay.insert(key.to_vec(), effect);
-    }
-}
-
 fn merged_page(
     rows: &OrderedMapAccess<'_, Vec<u8>, RowWeight>,
-    overlay: &VisibilityOverlay,
+    overlay: EventVisibility<'_>,
     range: &KeyRange,
     resume_after: Option<&Vec<u8>>,
     max_items: usize,
@@ -1536,8 +1420,15 @@ fn merged_page(
     for (key, _) in &actual.entries {
         keys.insert(key);
     }
-    let overlay_truncated =
-        collect_overlay_keys(overlay, range, resume_after, frontier, max_items, &mut keys);
+    if let Some((key, _)) = overlay {
+        let bounds = (range.start_bytes(), range.end_bytes());
+        if RangeBounds::<[u8]>::contains(&bounds, key)
+            && resume_after.is_none_or(|resume| key > resume.as_slice())
+            && frontier.is_none_or(|last| key <= last.as_slice())
+        {
+            keys.insert(key);
+        }
+    }
 
     let mut entries = Vec::new();
     let mut examined = 0_usize;
@@ -1559,8 +1450,8 @@ fn merged_page(
             .binary_search_by(|(actual_key, _)| actual_key.as_slice().cmp(key))
             .is_ok();
         let (visible_before, visible_after) = overlay
-            .get(key)
-            .map_or((actual_present, actual_present), |effect| {
+            .filter(|(event_key, _)| *event_key == key)
+            .map_or((actual_present, actual_present), |(_, effect)| {
                 (effect.before != 0, effect.after != 0)
             });
         if visible_before || visible_after {
@@ -1574,7 +1465,7 @@ fn merged_page(
     if stopped && last_examined.is_none() {
         return Ok(None);
     }
-    let has_more = stopped || actual.continuation.is_some() || overlay_truncated;
+    let has_more = stopped || actual.continuation.is_some();
     let continuation = if has_more {
         last_examined
             .ok_or(AsOfJoinError::InvalidIndex(
@@ -1589,33 +1480,6 @@ fn merged_page(
         continuation,
         work: (examined.max(1), bytes.max(1)),
     }))
-}
-
-fn collect_overlay_keys<'key>(
-    overlay: &'key VisibilityOverlay,
-    range: &KeyRange,
-    resume_after: Option<&Vec<u8>>,
-    frontier: Option<&Vec<u8>>,
-    max_items: usize,
-    keys: &mut BTreeSet<&'key [u8]>,
-) -> bool {
-    let lower = match resume_after {
-        Some(key) => Bound::Excluded(key.as_slice()),
-        None => range.start_bytes(),
-    };
-    let upper = match frontier {
-        Some(key) => Bound::Included(key.as_slice()),
-        None => range.end_bytes(),
-    };
-    let mut seen = 0_usize;
-    for (key, _) in overlay.range::<[u8], _>((lower, upper)) {
-        if seen == max_items {
-            return true;
-        }
-        keys.insert(key);
-        seen = seen.saturating_add(1);
-    }
-    false
 }
 
 fn candidate_item_limit(field_count: usize, left_row_bytes: usize) -> usize {

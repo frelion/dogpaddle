@@ -7,12 +7,12 @@
 
 具体 `XxxOperation` 运行类型及其构造入口只在 operation crate 内可见；公共调用方通过具体 Definition 的统一 checked `construct` 得到 `Operation`，不另设手工装配入口。
 
-`OperationDefinition` 是 operation crate 内的 sealed trait；每个具体 Definition 实例必须手动声明完整的 `OperationKind::Scan`、`AtomicTransform(NonZeroU32)`、`TurnTransform(NonZeroU32)`、`ExclusiveTransform(NonZeroU32)` 或 `Sink(NonZeroU32)`，role、融合资格与非零 input arity 不能从拓扑位置、空 data 或具体 tag 反向推断。
-每个 Station 包含非空、有序的普通 Operation 列表：首项可以是 Scan、任意 arity 的 Atomic 或 TurnTransform，之后只能是单输入 Atomic；Exclusive 与 Sink 必须独占。
-TurnTransform 使用完整 turn/continuation 协议，但其未提交 turn 必须能从未变化的 durable state 重放，因此允许吸收 Atomic 尾链；Exclusive 表示必须先形成独立持久化输出边界。
+`OperationDefinition` 是 operation crate 内的 sealed trait；每个具体 Definition 实例必须手动声明完整的 `OperationKind::Scan`、`AtomicTransform(NonZeroU32)`、`TurnTransform(NonZeroU32)` 或 `Sink(NonZeroU32)`，role、融合资格与非零 input arity 不能从拓扑位置、空 data 或具体 tag 反向推断。
+每个 Station 包含非空、有序的普通 Operation 列表：首项可以是 Scan、任意 arity 的 Atomic 或 TurnTransform，之后只能是单输入 Atomic；Sink 必须独占。
+TurnTransform 使用完整 turn/continuation 协议，但其未提交 turn 必须能从未变化的 durable state 重放，因此允许吸收 Atomic 尾链。
 首项决定 Station 的输入角色与 arity，末项决定 output 属性，Flow 只校验 Station，不能枚举具体算子。
-表达式 Operation 的实例级资格只决定能否融合；不合格实例仍走原有独占绑定与执行路径，本次不扩大或收紧表达式支持。
-Filter、Extend、Select、SchemaAlign 检查自身全部表达式，Aggregate 同时检查所有 group expression 与 call argument。
+普通关系表达式统一要求 immutable、逐行可执行；Definition 构造与 decode 都执行相同准入规则，不能借恢复绕过。
+Filter、Select、SchemaAlign、Aggregate 固定声明 Atomic；Aggregate 同时检查 group expression 与 call argument。
 具体 Definition 通过 trait object 上不可覆盖的统一 `construct` 入口，把有序、精确的 input logical `SchemaRef`、已限定资源名范围的短期 `DataScope` 和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
 入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型、kind/output 与执行能力一致性；private sealed `construct_unchecked` 只实现具体算子规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
 资源前缀由调用方通过 `DataScope::scoped` 限定；具体 Definition 只向 `DataScope::data` 传固定逻辑名，不拼接全局资源名。Store 声明/查找错误透明传递，保留完整资源名。
@@ -27,7 +27,7 @@ Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propaga
 
 ## 表达式
 
-Filter、Extend、Select 与 SchemaAlign 的公共入口直接接收 DataFusion `Expr`；fallible `try_new` 使用 `datafusion-proto` 编码表达式，Definition 直接持久化这份 protobuf，并在 decode/open 时用同一 DataFusion 版本还原。
+Filter、Select 与 SchemaAlign 的公共入口直接接收 DataFusion `Expr`；fallible `try_new` 使用 `datafusion-proto` 编码表达式，Definition 直接持久化这份 protobuf，并在 decode/open 时用同一 DataFusion 版本还原。
 DogPaddle 不再维护另一套表达式 AST、operator/type/nullability 规则或递归深度限制。
 Schema bind 必须通过 DataFusion `create_physical_expr` 建立 exact-input-Schema-bound `PhysicalExpr`，表达式类型、nullability、cast 与运行期 `evaluate` 语义均以 DataFusion 为唯一实现；该 API 假定 logical coercion 已完成，Operation 层不运行 logical/SQL planner，也不额外插入隐式 cast，直接调用 Operation API 时需要显式 `cast`。
 DogPaddle 只负责 Definition/Flow 边界、完整 Schema guard 及 Change 语义。
@@ -36,8 +36,11 @@ DataFusion Expr protobuf 是 Expression payload 的版本绑定格式，不承�
 工作区全部 DataFusion direct/transitive crate 必须精确 pin 到 `82335b426d8851db6a7b965f3d43053c585cabfd`，并保持唯一 Arrow 59.3.0 与 sqlparser 0.62.0 类型族；升级时必须审查 ASOF logical lowering、proto roundtrip、physical planning 和执行语义。
 若新版本不能读取或保持旧 payload 语义，必须 bump 外层 Operation Definition tag/version，并要求重建 Flow，不在同一版本内猜测或迁移旧表达式。
 Filter 的 tag 是 5，output Schema 精确等于 input，只保留 non-null true；全删返回 `None`，部分筛选必须用同一 predicate 保持 records/diffs 对齐。
-Extend 的 tag 是 6，每个实例只追加一个由 `name + Expr` 唯一推导类型和 nullability 的字段，保留 input FieldRef 与 Schema metadata，不接受调用者重复声明 Field/type。
-二者都不声明 Operation data；公共证据必须覆盖 proto golden/roundtrip、build 静态拒绝无目录副作用、decoded Definition 的 construct/turn 语义、open 重新构造、成功 build/open/reopen、Filter 空/全量/部分选择与携带混合 diff 的重批、Extend Schema metadata/nullability 和 Array/diff 共享。
+Filter 与投影不声明 Operation data；公共证据覆盖 proto golden/roundtrip、静态拒绝无目录副作用、decoded Definition 的 construct/turn、open 重新构造、Filter 空/全量/部分选择与混合 diff 重批，以及投影 Schema metadata/nullability 和 Array/diff 共享。
+
+Project/Extend 的独立 Definition、tag 4/6 和运行实例已删除，decoder 不再注册这些 tag。
+选列与改名直接使用 `SelectDefinition::try_new([(name, Expr), ...])`；追加列使用
+`SelectDefinition::try_extend(&input_schema, fields)`，它立即展开为普通 Select 字段列表，不保存 mode、输入 Schema 或单独的持久格式。
 
 Select 与 SchemaAlign 直接构造同一个私有 `BoundProjection`，由它实现 `AtomicOperation`，不另设算子运行包装类型：同组表达式共享 `DFSchema`，执行时整组检查一次 exact input Schema（空投影也检查），运行错误使用公共 `ProjectionError`，保留 port、逐字段错误上下文及底层错误链；各 Definition 仍拥有独立 Schema/metadata/codec 规则。
 
@@ -48,6 +51,10 @@ RunningEventCount 的 tag 是 2，只声明 `running_event_count.count: Cell<u64
 公共 API 与资源路径的破坏性重命名不提供 alias、fallback 或迁移；旧数据库直接删除并重建，不为旧版本增加识别或兼容协议。
 
 Select 的 tag 是 7，以有序 `name + Expr` 列表一次性计算完整 output，所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。
+Select 保留输入 Schema metadata；直接列引用（包括改名）保留源字段 metadata，计算列 metadata 为空。
+纯列引用共享输入 Arrow arrays，全部投影共享 diff buffer；保留完整子树，字段重排无需复制数据。
+绑定后的严格递增纯列引用若输出 Schema 精确等于对应输入投影，自动复用 ChangeProjection 快路径，避免重扫已验证的 diff 和 Decimal 值；不增加公开或持久 mode。改名、重排和计算走共享表达式执行。
+这改变了原 Select 直接列引用的字段 metadata 规则；受影响的精确 Schema、Flow 与目标布局应重建。
 UnionAll 的 tag 是 8，Definition 只保存非零 input arity，要求所有输入具有完全相同的 logical Schema，按端口原样转发 Change。
 二者都不声明 Operation data，也不引入 planner、额外表达式层或专用 Flow 抽象。
 
@@ -55,3 +62,11 @@ SchemaAlign 的 tag 是 9，以有序 `name + Expr + target nullability + Field 
 它允许 non-null 到 nullable 的放宽，拒绝 nullable 到 non-null 的收窄；所有表达式绑定同一个原始 input Schema，空字段定义合法并保留输入行数与 diff。
 metadata 按 key canonical 排序，重复 key 必须在构造期拒绝，不能静默覆盖。
 SchemaAlign 不声明 Operation data，不提供隐式 coercion，也不为 SQL 或其他上层接口引入专用 Flow 抽象。
+
+## 不可重放表达式的准入与能力审计
+
+当前锁定的 DataFusion revision 上，`Expr::from_bytes` 使用 `TaskContext::default()`：scalar function registry 为空，默认 logical extension codec 也不能重建 ScalarUDF。`random`、`uuid`、`input_file_name`、`file_row_index` 是 volatile，`now/current_timestamp`、`current_date`、`current_time` 是 stable；它们与外部 UDF 一样，不能通过当前 Rust Definition 的完整 round-trip。不能从 SQL 对这些函数的拒绝推断 Rust API 行为；这里的结论来自锁定源码的 decoder 路径及三种 volatility 的 codec 拒绝证据。
+
+此次没有发现能够经过当前默认 codec、绑定并执行的 stable/volatile ScalarUDF。已有 UDF 仍先报告编码/解码错误；immutable 标记也不能替代函数注册。未绑定 Placeholder 等部分 Expr 过去可以持久化并被分为 Exclusive，随后在绑定时失败；现在 Definition 构造和 decode 直接拒绝非逐行可重放节点。嵌套节点同样检查。已准入的表达式继续由 DataFusion 负责类型、nullability 和求值，不引入第二套 AST。
+
+`ExpressionDefinitionError::NonReplayable` 表示这项新准入失败，各 owner 包装错误仍保留字段、key 或 argument 位置。现有状态不做 alias、迁移或自动修复；旧 tag、continuation 或精确布局受影响时使用新的 state 与目标。

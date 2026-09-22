@@ -17,9 +17,9 @@ use datafusion_expr::{
     ExprSchemable, Volatility, execution_props::ExecutionProps,
     physical_planning_context::PhysicalPlanningContext,
 };
-use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr, expressions::Column};
 use datafusion_proto::bytes::Serializeable;
-use dogpaddle_change::{Change, ChangeError};
+use dogpaddle_change::{Change, ChangeError, ChangeProjection};
 use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
@@ -48,6 +48,9 @@ pub enum ExpressionDefinitionError {
     /// The protobuf cannot fit the Operation Definition length field.
     #[error("DataFusion expression protobuf is too large for an Operation Definition")]
     TooLarge,
+    /// The expression cannot be replayed as an immutable row-local calculation.
+    #[error("expression must be immutable and row-local")]
+    NonReplayable,
 }
 
 /// Failure while binding a persisted expression to one exact input Schema.
@@ -92,6 +95,7 @@ pub(crate) struct BoundProjection {
     input_schema: SchemaRef,
     expressions: Box<[BoundExpression]>,
     output_schema: SchemaRef,
+    column_projection: Option<ChangeProjection>,
 }
 
 /// Failure while executing a `Select` or `SchemaAlign` expression projection.
@@ -119,6 +123,9 @@ pub enum ProjectionError {
     /// Arrow could not construct the projected record batch.
     #[error(transparent)]
     Arrow(#[from] ArrowError),
+    /// Arrow or the exact column projection rejected the input.
+    #[error(transparent)]
+    Columns(#[from] dogpaddle_change::ProjectionError),
     /// The projected output violates the Change invariant.
     #[error(transparent)]
     Change(#[from] ChangeError),
@@ -136,14 +143,43 @@ impl BoundProjection {
                 .all(|expression| expression.input_schema.as_ref() == input_schema.as_ref()),
             "projection expressions must share the bound input Schema"
         );
+        let column_projection = expressions
+            .iter()
+            .map(|expression| {
+                expression
+                    .physical
+                    .downcast_ref::<Column>()
+                    .map(Column::index)
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|indices| ChangeProjection::try_new(Arc::clone(&input_schema), indices).ok())
+            .filter(|projection| projection.output_schema().as_ref() == output_schema.as_ref());
+        // Exact pure selection needs no physical expressions at runtime. The
+        // Change projection retains the original no-revalidation fast path.
+        let expressions = if column_projection.is_some() {
+            Vec::new()
+        } else {
+            expressions
+        };
         Self {
             input_schema,
             expressions: expressions.into_boxed_slice(),
             output_schema,
+            column_projection,
         }
     }
 
     fn evaluate(&self, input: &Change) -> Result<Change, ProjectionError> {
+        if let Some(projection) = &self.column_projection {
+            return input
+                .try_project(projection)
+                .map_err(|source| match source {
+                    dogpaddle_change::ProjectionError::SchemaMismatch => {
+                        ProjectionError::InputSchemaMismatch
+                    }
+                    other => ProjectionError::Columns(other),
+                });
+        }
         if input.records().schema_ref().as_ref() != self.input_schema.as_ref() {
             return Err(ProjectionError::InputSchemaMismatch);
         }
@@ -202,6 +238,9 @@ impl StoredExpression {
             return Err(ExpressionDefinitionError::NonCanonical);
         }
 
+        if !replayable_expression(&expression) {
+            return Err(ExpressionDefinitionError::NonReplayable);
+        }
         Ok(Self {
             expression: Arc::new(expression),
             protobuf: Arc::from(canonical.as_ref()),
@@ -241,6 +280,11 @@ impl StoredExpression {
             ));
         }
 
+        if !replayable_expression(&expression) {
+            return Err(DefinitionCodecError::InvalidPayload(
+                "expression must be immutable and row-local",
+            ));
+        }
         Ok(Self {
             expression: Arc::new(expression),
             protobuf: Arc::from(protobuf),
@@ -283,30 +327,30 @@ impl StoredExpression {
             output_metadata,
         })
     }
-
-    pub(crate) fn is_atomic(&self) -> bool {
-        let mut eligible = true;
-        let _ = self.expression().apply(|expression| {
-            eligible = atomic_expression_supported(expression);
-            Ok::<_, DataFusionError>(if eligible {
-                TreeNodeRecursion::Continue
-            } else {
-                TreeNodeRecursion::Stop
-            })
-        });
-        eligible
-    }
 }
 
-fn atomic_expression_supported(expression: &Expr) -> bool {
+fn replayable_expression(expression: &Expr) -> bool {
+    let mut eligible = true;
+    let _ = expression.apply(|expression| {
+        eligible = replayable_node(expression);
+        Ok::<_, DataFusionError>(if eligible {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
+    });
+    eligible
+}
+
+fn replayable_node(expression: &Expr) -> bool {
     if let Expr::ScalarFunction(function) = expression {
         return function.func.signature().volatility == Volatility::Immutable;
     }
-    !unsupported_atomic_expression(expression)
+    !unsupported_row_expression(expression)
 }
 
 #[expect(deprecated)]
-fn unsupported_atomic_expression(expression: &Expr) -> bool {
+fn unsupported_row_expression(expression: &Expr) -> bool {
     matches!(
         expression,
         Expr::ScalarVariable(_, _)
@@ -430,7 +474,7 @@ mod tests {
     use arrow_schema::DataType;
     use datafusion_expr::{Volatility, create_udf};
 
-    use super::{atomic_expression_supported, col};
+    use super::{col, replayable_node};
 
     fn function_expression(name: &str, volatility: Volatility) -> super::Expr {
         create_udf(
@@ -444,16 +488,16 @@ mod tests {
     }
 
     #[test]
-    fn atomic_expression_requires_immutable_scalar_functions() {
-        assert!(!atomic_expression_supported(&function_expression(
+    fn replayable_expression_requires_immutable_scalar_functions() {
+        assert!(!replayable_node(&function_expression(
             "stable_identity",
             Volatility::Stable
         )));
-        assert!(!atomic_expression_supported(&function_expression(
+        assert!(!replayable_node(&function_expression(
             "volatile_identity",
             Volatility::Volatile
         )));
-        assert!(atomic_expression_supported(&function_expression(
+        assert!(replayable_node(&function_expression(
             "immutable_identity",
             Volatility::Immutable
         )));

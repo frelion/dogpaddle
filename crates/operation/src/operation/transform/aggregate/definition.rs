@@ -123,6 +123,8 @@ impl AggregateDefinition {
     ///
     /// # Errors
     ///
+    /// Non-replayable expressions (not immutable or not row-local) are rejected.
+    ///
     /// Returns [`AggregateDefinitionError`] for an empty grouping list, a value
     /// too large for the stable format, or an expression that cannot be
     /// persisted canonically.
@@ -167,14 +169,6 @@ impl AggregateDefinition {
             groups: stored_groups.into_boxed_slice(),
             calls: stored_calls.into_boxed_slice(),
         })
-    }
-
-    fn is_atomic(&self) -> bool {
-        self.groups.iter().all(|group| group.expression.is_atomic())
-            && self
-                .calls
-                .iter()
-                .all(|call| call.arguments.iter().all(StoredExpression::is_atomic))
     }
 }
 
@@ -375,11 +369,7 @@ fn indexed_slot(
 
 impl OperationDefinition for AggregateDefinition {
     fn kind(&self) -> OperationKind {
-        if self.is_atomic() {
-            OperationKind::AtomicTransform(NonZeroU32::MIN)
-        } else {
-            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
-        }
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn persistence_tag(&self) -> u16 {

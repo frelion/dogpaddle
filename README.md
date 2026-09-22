@@ -171,7 +171,7 @@ bin/dogpaddle run SQL_FILE [--state DIR]
 | 目标端 | PostgreSQL、SQLite、ClickHouse、Doris |
 | 恢复 | 本地持久化输入位置、拓扑和算子状态 |
 
-DogPaddle 仍处于早期开发阶段。当前每个 SQL 文件只接受一条 `INSERT INTO sink(...) <query>`；CDC 读取单表并要求固定 Schema，暂不支持 TLS、在线 DDL 或多表路由。数据库目标关系由 DogPaddle 独占。当前 v1 状态格式不提供迁移；修改查询语义或持久 endpoint identity 时应使用新的 state 路径。完整约束见 [SQL 文档](crates/sql/README.md)。
+DogPaddle 仍处于早期开发阶段。当前每个 SQL 文件只接受一条 `INSERT INTO sink(...) <query>`；CDC 读取单表并要求固定 Schema，暂不支持 TLS、在线 DDL 或多表路由。数据库目标关系由 DogPaddle 独占。当前 v1 状态格式不提供迁移；修改查询语义或持久 endpoint identity 时应使用新的 state 路径。分页 Join 的晚期错误可能保留已交付的部分结果；重启继续失败位置。完整约束见 [SQL 文档](crates/sql/README.md)。
 
 ## 文档
 

@@ -128,14 +128,6 @@ pub enum EquiJoinDefinitionError {
         #[source]
         source: ExpressionDefinitionError,
     },
-    /// Join keys must be immutable because a paged turn evaluates them again after reopen.
-    #[error("equi-join {side} key expression {key} is not immutable")]
-    NonImmutableKey {
-        /// Zero-based key pair.
-        key: usize,
-        /// Side containing the rejected expression.
-        side: &'static str,
-    },
     /// The residual predicate cannot be persisted canonically.
     #[error("equi-join residual predicate cannot be persisted")]
     ResidualExpression {
@@ -143,9 +135,6 @@ pub enum EquiJoinDefinitionError {
         #[source]
         source: ExpressionDefinitionError,
     },
-    /// The residual must be immutable because a paged turn evaluates it again after reopen.
-    #[error("equi-join residual predicate is not immutable")]
-    NonImmutableResidual,
 }
 
 /// Equality join rejection while binding two exact input Schemas.

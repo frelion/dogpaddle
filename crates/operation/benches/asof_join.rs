@@ -529,7 +529,7 @@ fn write_context(
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "one insert Claim plus its exact retract Claim, including all Probe/Emit turns, synchronous commits, and AfterCommit; the pair restores the initial relation",
+            "timed_boundary": "one insert Claim plus its exact retract Claim, including all committed turns, synchronous commits, and AfterCommit; the pair restores the initial relation",
             "throughput_unit": "Claims (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
             "runtime_counters": "unavailable: Operation does not expose scan-page or logical read/write-byte counters; workload cardinalities and committed turn/output counts are retained instead",

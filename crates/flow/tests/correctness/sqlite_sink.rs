@@ -10,8 +10,7 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::SqliteSinkDefinition,
         transform::{
-            EquiJoinDefinition, EquiJoinError, EquiJoinKind, ExtendDefinition, FilterDefinition,
-            SelectDefinition,
+            EquiJoinDefinition, EquiJoinError, EquiJoinKind, FilterDefinition, SelectDefinition,
         },
     },
 };
@@ -37,7 +36,13 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
     );
     let extend = factory.operation(
         "extend",
-        Box::new(ExtendDefinition::try_new("offset", col("value") - lit(scan_start)).unwrap()),
+        Box::new(
+            SelectDefinition::try_new([
+                ("value", col("value")),
+                ("offset", col("value") - lit(scan_start)),
+            ])
+            .unwrap(),
+        ),
         [scan],
     );
     let filter = factory.operation(
@@ -302,15 +307,24 @@ fn sqlite_connection(sqlite_path: &Path) -> Connection {
 
 #[test]
 fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_page() {
+    exercise_late_join_failure(false);
+}
+
+#[test]
+fn late_asof_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_page() {
+    exercise_late_join_failure(true);
+}
+
+fn exercise_late_join_failure(asof: bool) {
     const RIGHT_ROWS: u64 = 4_096;
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("join-flow");
     let sqlite_path = root.path().join("join.sqlite");
-    build_failing_join_flow(&flow_path, &sqlite_path);
+    build_failing_join_flow(&flow_path, &sqlite_path, asof);
 
     // Seed the right relation before admitting the driving Claim. Both genuine
     // SequenceScan sources are exhausted; only the published fixture inputs run.
-    publish_join_input(&flow_path, 1, 0..RIGHT_ROWS);
+    publish_join_input(&flow_path, 1, 0..if asof { 1 } else { RIGHT_ROWS });
     let mut flow = FlowFactory::new(&flow_path).open().unwrap();
     let mut idle = false;
     for _ in 0..128 {
@@ -321,10 +335,15 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
     }
     assert!(idle, "right-side seeding did not finish");
     drop(flow);
-    publish_join_input(&flow_path, 0, [1, 0]);
+    let driving = if asof {
+        (1..=RIGHT_ROWS).chain([0]).collect::<Vec<_>>()
+    } else {
+        vec![1, 0]
+    };
+    publish_join_input(&flow_path, 0, driving);
 
-    // The first row emits enough bounded pages for the real sink to publish a
-    // target transaction. The next row deterministically divides by zero.
+    // The successful prefix emits enough bounded pages for the real sink to
+    // publish a target transaction. The final row divides by zero.
     let mut flow = FlowFactory::new(&flow_path).open().unwrap();
     let mut failed = false;
     let mut failure_message = String::new();
@@ -333,7 +352,11 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
         if let Err(error) = flow.advance() {
             assert_eq!(error.station_id(), "join");
             let mut source: &(dyn std::error::Error + 'static) = &error;
-            while source.downcast_ref::<EquiJoinError>().is_none() {
+            while source.downcast_ref::<EquiJoinError>().is_none()
+                && source
+                    .downcast_ref::<dogpaddle_operation::operation::transform::AsOfJoinError>()
+                    .is_none()
+            {
                 source = source
                     .source()
                     .expect("Join failure retains its error chain");
@@ -341,7 +364,7 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
             assert!(matches!(
                 source.downcast_ref::<EquiJoinError>(),
                 Some(EquiJoinError::ResidualExpression { .. })
-            ));
+            ) || matches!(source.downcast_ref::<dogpaddle_operation::operation::transform::AsOfJoinError>(), Some(dogpaddle_operation::operation::transform::AsOfJoinError::ResidualExpression { .. })));
             failure_message = error.to_string();
             let after = flow.status().unwrap();
             assert_eq!(after[2].inputs, before[2].inputs);
@@ -360,11 +383,11 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
     let delivered = sqlite_join_rows(&sqlite_path);
     assert!(!delivered.is_empty(), "earlier output never reached SQLite");
     assert!(delivered.len() <= usize::try_from(RIGHT_ROWS).unwrap());
-    assert!(
-        delivered
-            .iter()
-            .all(|&(left, right)| left == 1 && right < RIGHT_ROWS)
-    );
+    assert!(delivered.iter().all(|&(left, right)| if asof {
+        (1..=RIGHT_ROWS).contains(&left) && right == 0
+    } else {
+        left == 1 && right < RIGHT_ROWS
+    }));
     assert_eq!(
         delivered
             .iter()
@@ -374,7 +397,8 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
         "the target contains duplicate Join output"
     );
     drop(flow);
-    let continuation = join_continuation(&flow_path).expect("unfinished Claim retains its cursor");
+    let continuation =
+        join_continuation(&flow_path, asof).expect("unfinished Claim retains its cursor");
 
     for _ in 0..2 {
         let mut reopened = FlowFactory::new(&flow_path).open().unwrap();
@@ -390,26 +414,49 @@ fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_p
         assert_eq!(after[2].output, restored[2].output);
         assert_eq!(after[3].inputs, restored[3].inputs);
         drop(reopened);
-        assert_eq!(join_continuation(&flow_path).as_ref(), Some(&continuation));
+        assert_eq!(
+            join_continuation(&flow_path, asof).as_ref(),
+            Some(&continuation)
+        );
         assert_eq!(sqlite_join_rows(&sqlite_path), delivered);
     }
 }
 
-fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path) {
+fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path, asof: bool) {
+    use dogpaddle_operation::operation::transform::{
+        AsOfDirection, AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieFallback,
+    };
     let mut factory = FlowFactory::new(flow_path);
     let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
     let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
     let join = factory.operation(
         "join",
-        Box::new(
-            EquiJoinDefinition::try_new(
-                EquiJoinKind::Inner,
-                [(lit(0_u64), lit(0_u64))],
-                ["left_value", "right_value"],
-                Some((lit(1_u64) / col("left.value")).gt(lit(0_u64))),
+        if asof {
+            Box::new(
+                AsOfJoinDefinition::try_new(
+                    AsOfJoinKind::Inner,
+                    AsOfDirection::Backward { allow_exact: true },
+                    [],
+                    [AsOfOrderKey::new(col("value"), col("value"))],
+                    [],
+                    AsOfTieFallback::CanonicalAscending,
+                    None,
+                    ["left_value", "right_value"],
+                    Some((lit(1_u64) / col("left.value")).gt_eq(lit(0_u64))),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        ),
+        } else {
+            Box::new(
+                EquiJoinDefinition::try_new(
+                    EquiJoinKind::Inner,
+                    [(lit(0_u64), lit(0_u64))],
+                    ["left_value", "right_value"],
+                    Some((lit(1_u64) / col("left.value")).gt(lit(0_u64))),
+                )
+                .unwrap(),
+            )
+        },
         [left, right],
     );
     factory.operation(
@@ -462,10 +509,14 @@ fn publish_join_input(flow_path: &Path, station: usize, values: impl IntoIterato
     transaction.commit().unwrap();
 }
 
-fn join_continuation(flow_path: &Path) -> Option<Vec<u8>> {
+fn join_continuation(flow_path: &Path, asof: bool) -> Option<Vec<u8>> {
     let store = Store::open(flow_path).unwrap();
     let continuation: Cell<Vec<u8>> = store
-        .open_data("station/00000002/operation/00000000/equi_join.continuation")
+        .open_data(if asof {
+            "station/00000002/operation/00000000/asof_join.continuation"
+        } else {
+            "station/00000002/operation/00000000/equi_join.continuation"
+        })
         .unwrap();
     let transaction = store.read_transaction();
     continuation

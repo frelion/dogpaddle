@@ -69,17 +69,10 @@ pub(super) enum RowWeightError {
     Overflow,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Phase {
-    Probe,
-    Emit,
-}
-
 /// Durable cursor for one input row's paged, replayable correction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AsOfContinuation {
     pub(super) port: u8,
-    pub(super) phase: Phase,
     pub(super) row: u64,
     /// On port 1, the current left key while `candidate_resume_after` is set,
     /// otherwise the last completely processed left key. Always absent on port 0.
@@ -106,10 +99,6 @@ impl StoreValue for AsOfContinuation {
         let mut encoded = Vec::new();
         encoded.push(VERSION);
         encoded.push(self.port);
-        encoded.push(match self.phase {
-            Phase::Probe => 0,
-            Phase::Emit => 1,
-        });
         encoded.extend_from_slice(&self.row.to_be_bytes());
         put_optional(&mut encoded, self.left_resume_after.as_deref())?;
         put_optional(&mut encoded, self.candidate_resume_after.as_deref())?;
@@ -129,11 +118,6 @@ impl StoreValue for AsOfContinuation {
         if port > 1 {
             return Err(CodecError::new("ASOF continuation port is invalid"));
         }
-        let phase = match cursor.u8()? {
-            0 => Phase::Probe,
-            1 => Phase::Emit,
-            _ => return Err(CodecError::new("ASOF continuation phase is invalid")),
-        };
         let row = cursor.u64()?;
         let left_resume_after = cursor.optional()?;
         let candidate_resume_after = cursor.optional()?;
@@ -144,7 +128,6 @@ impl StoreValue for AsOfContinuation {
         cursor.finish()?;
         Ok(Self {
             port,
-            phase,
             row,
             left_resume_after,
             candidate_resume_after,
@@ -268,7 +251,6 @@ mod tests {
     fn continuation_codec_is_strict_and_distinguishes_absent_from_empty() {
         let continuation = AsOfContinuation {
             port: 1,
-            phase: Phase::Emit,
             row: 7,
             left_resume_after: Some(Vec::new()),
             candidate_resume_after: None,
@@ -281,7 +263,7 @@ mod tests {
         assert_eq!(
             encoded,
             [
-                1, 1, 1, // version, port, Emit
+                1, 1, // version, port
                 0, 0, 0, 0, 0, 0, 0, 7, // row
                 1, 0, 0, 0, 0, 0, 0, 0, 0, // present empty left cursor
                 0, // absent candidate cursor
@@ -300,7 +282,7 @@ mod tests {
                 "prefix length {length} was accepted"
             );
         }
-        for index in [0, 1, 2, 11, encoded.len() - 2, encoded.len() - 1] {
+        for index in [0, 1, 10, encoded.len() - 2, encoded.len() - 1] {
             let mut invalid = encoded.clone();
             invalid[index] = u8::MAX;
             assert!(AsOfContinuation::decode_value(Cow::Borrowed(&invalid)).is_err());
@@ -314,7 +296,6 @@ mod tests {
     fn continuation_encoder_rejects_invalid_port() {
         let continuation = AsOfContinuation {
             port: 2,
-            phase: Phase::Probe,
             row: 0,
             left_resume_after: None,
             candidate_resume_after: None,

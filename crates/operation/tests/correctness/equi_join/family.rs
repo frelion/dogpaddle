@@ -1058,7 +1058,9 @@ fn definition_rejects_a_non_immutable_residual() {
             output_names(EquiJoinKind::Inner).iter().copied(),
             Some(placeholder("$1")),
         ),
-        Err(EquiJoinDefinitionError::NonImmutableResidual)
+        Err(EquiJoinDefinitionError::ResidualExpression {
+            source: dogpaddle_operation::ExpressionDefinitionError::NonReplayable
+        })
     ));
 }
 

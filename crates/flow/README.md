@@ -95,7 +95,6 @@ Operation 后面。Flow 在新建时自动把符合条件的单输入 atomic tra
 | `Scan` | 不读取上游，主动产生 Change | 可以做首项，也可带 atomic 尾链 |
 | `AtomicTransform(n)` | 在一笔事务内完整消费输入 | 任意输入数可做首项；只有单输入实例可追加 |
 | `TurnTransform(n)` | 可能用多轮处理一条输入，并持久化进度 | 可以做首项，也可带 atomic 尾链 |
-| `ExclusiveTransform(n)` | 需要在它之后形成独立的持久边界 | 必须独占 Station |
 | `Sink(n)` | 消费输入但没有 Flow 输出 | 必须独占 Station |
 
 首项决定 Station 有几个输入，末项决定 Station 的输出 Schema。尾项固定接收前一项输出，某一项返回
@@ -162,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 build 按确定性顺序划分最大合法 Station。默认融合只发生在单输入 Atomic 与唯一上游之间，并要求上游只有一条消费边、首项允许尾链、
 上游未显式 materialize。重复连接同一 producer 的两个端口也计为两条边。多输入算子可以成为
-Station 首项并吸收后续 Atomic；Exclusive 与 Sink 独占。
+Station 首项并吸收后续 Atomic；Sink 独占。
 
 `materialize` 的边界位于指定算子之后：它仍可以融入自己的上游，但后续算子不能跨越其持久输出。
 普通声明无需调用它；需要独立事务、背压或容量控制时才显式指定。新建时容量只写入最终输出，

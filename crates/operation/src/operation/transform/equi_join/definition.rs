@@ -302,8 +302,8 @@ pub(crate) fn decode_definition(
     }
     let mut keys = Vec::new();
     for _ in 0..key_count {
-        let left = decode_key(&mut cursor)?;
-        let right = decode_key(&mut cursor)?;
+        let left = StoredExpression::decode(&mut cursor)?;
+        let right = StoredExpression::decode(&mut cursor)?;
         keys.push(StoredKeyPair { left, right });
     }
     let output_count = cursor.read_u32()?;
@@ -320,7 +320,7 @@ pub(crate) fn decode_definition(
     }
     let residual = match cursor.read_bytes(1)?[0] {
         0 => None,
-        1 => Some(decode_residual(&mut cursor)?),
+        1 => Some(StoredExpression::decode(&mut cursor)?),
         _ => {
             return Err(DefinitionCodecError::InvalidPayload(
                 "equi-join residual marker is invalid",
@@ -341,21 +341,16 @@ fn store_key(
     key: usize,
     side: &'static str,
 ) -> Result<StoredExpression, EquiJoinDefinitionError> {
-    let expression = StoredExpression::try_new(expression)
-        .map_err(|source| EquiJoinDefinitionError::KeyExpression { key, side, source })?;
-    if !expression.is_atomic() {
-        return Err(EquiJoinDefinitionError::NonImmutableKey { key, side });
-    }
-    Ok(expression)
+    StoredExpression::try_new(expression).map_err(|source| EquiJoinDefinitionError::KeyExpression {
+        key,
+        side,
+        source,
+    })
 }
 
 fn store_residual(expression: Expr) -> Result<StoredExpression, EquiJoinDefinitionError> {
-    let expression = StoredExpression::try_new(expression)
-        .map_err(|source| EquiJoinDefinitionError::ResidualExpression { source })?;
-    if !expression.is_atomic() {
-        return Err(EquiJoinDefinitionError::NonImmutableResidual);
-    }
-    Ok(expression)
+    StoredExpression::try_new(expression)
+        .map_err(|source| EquiJoinDefinitionError::ResidualExpression { source })
 }
 
 fn bind_keys(
@@ -425,28 +420,6 @@ fn bind_residual(
         });
     }
     Ok(residual)
-}
-
-fn decode_key(cursor: &mut PayloadCursor<'_>) -> Result<StoredExpression, DefinitionCodecError> {
-    let expression = StoredExpression::decode(cursor)?;
-    if !expression.is_atomic() {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "equi-join key expression is not immutable",
-        ));
-    }
-    Ok(expression)
-}
-
-fn decode_residual(
-    cursor: &mut PayloadCursor<'_>,
-) -> Result<StoredExpression, DefinitionCodecError> {
-    let expression = StoredExpression::decode(cursor)?;
-    if !expression.is_atomic() {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "equi-join residual expression is not immutable",
-        ));
-    }
-    Ok(expression)
 }
 
 fn ensure_count(index: usize, kind: &'static str) -> Result<(), EquiJoinDefinitionError> {

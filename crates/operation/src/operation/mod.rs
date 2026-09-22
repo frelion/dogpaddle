@@ -310,32 +310,9 @@ impl Operation {
     }
 }
 
-pub(crate) fn exclusive_turn(operation: Box<dyn AtomicOperation>) -> Box<dyn TurnOperation> {
-    Box::new(ExclusiveAtomic { operation })
-}
-
-struct ExclusiveAtomic {
-    operation: Box<dyn AtomicOperation>,
-}
-
-impl TurnOperation for ExclusiveAtomic {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        let Some(input) = input else {
-            return Ok(Turn::Idle);
-        };
-        Ok(Turn::Ready(PreparedTurn::atomic(
-            self.operation.as_mut(),
-            input,
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AtomicOperation, Operation, OperationError, OperationInput, Turn, exclusive_turn};
+    use super::{AtomicOperation, Operation, OperationError, OperationInput, Turn};
     use dogpaddle_change::Change;
     use dogpaddle_store::TransactionAccess;
 
@@ -355,8 +332,5 @@ mod tests {
     fn atomic_adapters_idle_without_an_offered_input() {
         let mut atomic = Operation::Atomic(Box::new(UncalledAtomic));
         assert!(matches!(atomic.turn(None).unwrap(), Turn::Idle));
-
-        let mut exclusive = Operation::Turn(exclusive_turn(Box::new(UncalledAtomic)));
-        assert!(matches!(exclusive.turn(None).unwrap(), Turn::Idle));
     }
 }

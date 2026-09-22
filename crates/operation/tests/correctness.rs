@@ -18,8 +18,6 @@ mod doris_sink;
 mod equi_join;
 #[path = "correctness/expression.rs"]
 mod expression;
-#[path = "correctness/extend.rs"]
-mod extend;
 #[path = "correctness/filter.rs"]
 mod filter;
 #[path = "correctness/metamorphic.rs"]
@@ -30,8 +28,10 @@ mod mysql_cdc_scan;
 mod postgres_cdc_scan;
 #[path = "correctness/postgres_sink.rs"]
 mod postgres_sink;
-#[path = "correctness/project.rs"]
-mod project;
+#[path = "correctness/projection_append.rs"]
+mod projection_append;
+#[path = "correctness/projection_columns.rs"]
+mod projection_columns;
 #[path = "correctness/protocol.rs"]
 mod protocol;
 #[path = "correctness/running_event_count.rs"]

@@ -444,7 +444,7 @@ fn right_null_left_history_context(
         "right_claim_events": right_events,
         "payload_bytes_per_row": payload_bytes,
         "expected_output_rows": 0,
-        "expected_max_turns": 2,
+        "expected_max_turns": 1,
         "purpose": "prove right presence changes seek directly to matchable left-order rows instead of scanning persisted NULL-order history",
     })
 }
@@ -641,7 +641,7 @@ fn assert_claim(claim: &ClaimMeasurement, expected: ExpectedOutput, expected_min
 fn assert_scenario_turn_bound(spec: CaseSpec, claim: &ClaimMeasurement) {
     match spec.scenario {
         Scenario::RightNullLeftHistory { .. } => assert!(
-            claim.turns <= 2,
+            claim.turns <= 1,
             "persisted NULL-order left history must not add right-Claim turns"
         ),
         Scenario::LeftNullRightHistory { .. } => assert!(
@@ -932,7 +932,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
                     positive_rows: 0,
                     negative_rows: 0,
                 },
-                expected_min_turns: 2,
+                expected_min_turns: rows.div_ceil(256),
                 expected_left_after_insert: Some((0, 0)),
                 expected_right_after_insert: Some((expected_entries, rows as u64)),
             }
@@ -983,7 +983,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
                     positive_rows: 0,
                     negative_rows: 0,
                 },
-                expected_min_turns: 2,
+                expected_min_turns: 1,
                 expected_left_after_insert: Some((left_rows, left_rows as u64)),
                 expected_right_after_insert: Some((right_events, right_events as u64)),
             }
@@ -1070,7 +1070,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
                     positive_rows: 0,
                     negative_rows: rows,
                 },
-                expected_min_turns: 2,
+                expected_min_turns: rows.div_ceil(256),
                 expected_left_after_insert: Some((rows, rows as u64)),
                 expected_right_after_insert: Some((rows, rows as u64)),
             }
@@ -1484,7 +1484,7 @@ fn write_context(
             "rust_heap": "Each fresh child builds its fixture, seed, and input before starting one dhat Profiler. Stats cover allocations made through Rust's global allocator during one complete driving Claim. They exclude input Arrow allocation, pre-existing fixture/seed memory, and RocksDB native allocations.",
             "persistent_logical_state": "A second unprofiled fixture scans asof_join.left_rows and asof_join.right_rows after every committed turn. Counts and decoded key-plus-u64 bytes exclude continuation, RocksDB cache, WAL, LSM, compression, tombstones, and filesystem allocation.",
             "output_arrow_bytes": "Arrow get_array_memory_size plus the diff array, summed for emitted Changes. Arrow may count shared buffers more than once.",
-            "turns": "Committed Probe and Emit turns needed to finish the driving Claim; Store scan-page and read/write logical-byte counters are not exposed.",
+            "turns": "Committed turns needed to finish the driving Claim; Store scan-page and read/write logical-byte counters are not exposed.",
             "rss": "Unavailable. The portable owner runner intentionally does not treat allocator counters, logical Store bytes, ps samples, or platform-specific high-water units as process RSS.",
             "comparison": "Only benchmark-mode records from the same code, rustc, host, profile, filesystem, workload, and baseline epoch are comparable. Test-mode heap values validate the protocol only."
         },

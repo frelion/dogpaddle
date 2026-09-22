@@ -16,8 +16,8 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::DiscardDefinition,
         transform::{
-            ExtendDefinition, FilterDefinition, ProjectDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            FilterDefinition, RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField,
+            SelectDefinition,
         },
     },
 };
@@ -872,13 +872,13 @@ fn fused_pure_chain_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> F
     factory
 }
 
-fn pure_chain_project() -> ProjectDefinition {
-    ProjectDefinition::new([0])
+fn pure_chain_project() -> SelectDefinition {
+    SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap()
 }
 
-fn pure_chain_extend() -> ExtendDefinition {
-    ExtendDefinition::try_new("next", col("value") + lit(1_u64))
-        .expect("construct pure-chain Extend definition")
+fn pure_chain_extend() -> SelectDefinition {
+    SelectDefinition::try_new([("value", col("value")), ("next", col("value") + lit(1_u64))])
+        .expect("construct pure-chain append projection")
 }
 
 fn pure_chain_filter() -> FilterDefinition {

@@ -16,10 +16,7 @@ use dogpaddle_operation::{
     Operator, ScalarValue, cast, col, decode_definition, encode_definition, lit,
     operation::{
         Action,
-        transform::{
-            ExtendDefinition, ExtendSchemaError, FilterDefinition, FilterSchemaError,
-            ProjectDefinition, SelectDefinition,
-        },
+        transform::{FilterDefinition, FilterSchemaError, SelectDefinition, SelectSchemaError},
     },
     try_cast,
 };
@@ -32,10 +29,6 @@ use super::support::{
 
 fn filter(predicate: Expr) -> FilterDefinition {
     FilterDefinition::try_new(predicate).unwrap()
-}
-
-fn extend(field_name: &str, expression: Expr) -> ExtendDefinition {
-    ExtendDefinition::try_new(field_name, expression).unwrap()
 }
 
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
@@ -142,16 +135,17 @@ fn expression_decoder_never_panics_for_valid_header_arbitrary_payloads() {
 fn expression_binding_delegates_planning_errors_and_enforces_filter_results() {
     let input = project_input_schema();
     let Err(OperationBindError::Rejected { source }) = construct_checked(
-        &extend("copy", col("missing")),
+        &SelectDefinition::try_new([("copy", col("missing"))]).unwrap(),
         std::slice::from_ref(&input),
     ) else {
         panic!("out-of-bounds expression column unexpectedly bound");
     };
     assert!(matches!(
-        source.downcast_ref::<ExtendSchemaError>(),
-        Some(ExtendSchemaError::Expression(
-            ExpressionBindError::DataFusion(_)
-        ))
+        source.downcast_ref::<SelectSchemaError>(),
+        Some(SelectSchemaError::Expression {
+            source: ExpressionBindError::DataFusion(_),
+            ..
+        })
     ));
 
     let Err(OperationBindError::Rejected { source }) =
@@ -179,8 +173,8 @@ fn expression_constructors_accept_exactly_round_tripping_datafusion_exprs() {
     }
 
     let expression = col("value").between(lit(1_u64), lit(10_u64));
-    let definition = ExtendDefinition::try_new("in_range", expression.clone()).unwrap();
-    assert_eq!(definition.expression(), &expression);
+    let definition = SelectDefinition::try_new([("in_range", expression.clone())]).unwrap();
+    assert_eq!(definition.fields().next().unwrap().1, &expression);
 }
 
 #[test]
@@ -280,17 +274,14 @@ fn expression_boundaries_reject_external_registry_variables_and_unbound_paramete
         Err(ExpressionDefinitionError::DataFusion(_))
     ));
 
-    let parameter = extend("parameter", placeholder("$1"));
-    let Err(OperationBindError::Rejected { source }) =
-        construct_checked(&parameter, std::slice::from_ref(&project_input_schema()))
-    else {
-        panic!("unbound expression parameter unexpectedly bound");
-    };
     assert!(matches!(
-        source.downcast_ref::<ExtendSchemaError>(),
-        Some(ExtendSchemaError::Expression(
-            ExpressionBindError::DataFusion(_)
-        ))
+        SelectDefinition::try_new([("parameter", placeholder("$1"))]),
+        Err(
+            dogpaddle_operation::operation::transform::SelectDefinitionError::Expression {
+                source: ExpressionDefinitionError::NonReplayable,
+                ..
+            }
+        )
     ));
 }
 
@@ -301,13 +292,19 @@ fn datafusion_binding_derives_arithmetic_and_cast_output_schema() {
         Field::new("text", DataType::Utf8, true),
     ]));
 
-    let arithmetic = extend("next", cast(col("value"), DataType::Int64) + lit(1_i64));
+    let arithmetic = SelectDefinition::try_extend(
+        &input,
+        [("next", cast(col("value"), DataType::Int64) + lit(1_i64))],
+    )
+    .unwrap();
     let binding = construct_checked(&arithmetic, std::slice::from_ref(&input)).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(output.field(2).data_type(), &DataType::Int64);
     assert!(!output.field(2).is_nullable());
 
-    let parsed = extend("parsed", try_cast(col("text"), DataType::Int64));
+    let parsed =
+        SelectDefinition::try_extend(&input, [("parsed", try_cast(col("text"), DataType::Int64))])
+            .unwrap();
     let binding = construct_checked(&parsed, std::slice::from_ref(&input)).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(output.field(2).data_type(), &DataType::Int64);
@@ -390,11 +387,19 @@ fn kleene_cases() -> Vec<(&'static str, Expr, Vec<Option<bool>>)> {
 }
 
 #[test]
-fn temporal_and_decimal_direct_columns_cross_project_select_and_extend_after_codec_roundtrip() {
+fn temporal_and_decimal_columns_survive_selection_renaming_and_append_after_codec_roundtrip() {
     let input = temporal_and_decimal_change();
     let schema = input.schema();
 
-    let projected = roundtripped_output(&ProjectDefinition::new([0, 1, 2]), &input);
+    let projected = roundtripped_output(
+        &SelectDefinition::try_new([
+            ("date", col("date")),
+            ("occurred_at", col("occurred_at")),
+            ("amount", col("amount")),
+        ])
+        .unwrap(),
+        &input,
+    );
     assert_eq!(projected.schema(), schema);
     for index in 0..3 {
         assert!(Arc::ptr_eq(
@@ -451,7 +456,7 @@ fn temporal_and_decimal_direct_columns_cross_project_select_and_extend_after_cod
         ("occurred_at", "occurred_at_copy", 1),
         ("amount", "amount_copy", 2),
     ] {
-        let definition = ExtendDefinition::try_new(copy, col(source)).unwrap();
+        let definition = SelectDefinition::try_extend(&schema, [(copy, col(source))]).unwrap();
         let extended = roundtripped_output(&definition, &input);
         assert_eq!(extended.schema().field(3).name(), copy);
         assert_eq!(
@@ -503,7 +508,7 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
     let mut transactions = store.into_transactions();
     for (name, expression, expected) in kleene_cases() {
         let mut operation = stateless_operation(
-            &ExtendDefinition::try_new(name, expression).unwrap(),
+            &SelectDefinition::try_extend(&schema, [(name, expression)]).unwrap(),
             Arc::clone(&schema),
         );
         let Action::Complete(Some(output)) =
@@ -562,7 +567,7 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
                 comparison(operator, lit(literal.clone()), col(column)),
             ] {
                 let mut operation = stateless_operation(
-                    &ExtendDefinition::try_new("result", expression).unwrap(),
+                    &SelectDefinition::try_extend(&schema, [("result", expression)]).unwrap(),
                     Arc::clone(&schema),
                 );
                 let Action::Complete(Some(output)) =
@@ -589,9 +594,12 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
         (Operator::NotEq, [Some(false), Some(false), None]),
     ] {
         let mut operation = stateless_operation(
-            &ExtendDefinition::try_new(
-                "array_result",
-                comparison(operator, col("boolean"), col("boolean")),
+            &SelectDefinition::try_extend(
+                &schema,
+                [(
+                    "array_result",
+                    comparison(operator, col("boolean"), col("boolean")),
+                )],
             )
             .unwrap(),
             Arc::clone(&schema),
@@ -633,7 +641,7 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     let mut transactions = store.into_transactions();
     let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
     let mut operation = stateless_operation(
-        &ExtendDefinition::try_new("greater", predicate).unwrap(),
+        &SelectDefinition::try_extend(&schema, [("greater", predicate)]).unwrap(),
         Arc::clone(&schema),
     );
     let Action::Complete(Some(output)) =
@@ -653,7 +661,11 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     );
 
     let mut operation = stateless_operation(
-        &ExtendDefinition::try_new("parsed", try_cast(col("text"), DataType::Int64)).unwrap(),
+        &SelectDefinition::try_extend(
+            &schema,
+            [("parsed", try_cast(col("text"), DataType::Int64))],
+        )
+        .unwrap(),
         Arc::clone(&schema),
     );
     let Action::Complete(Some(output)) =
@@ -668,4 +680,47 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(parsed.iter().collect::<Vec<_>>(), [Some(10), None]);
+}
+
+#[test]
+fn scalar_functions_of_every_volatility_require_an_unavailable_decode_registry() {
+    // Audit the exact path used before the immutable-only change as well: protobuf
+    // encoding succeeds, but the default decoder cannot reconstruct any ScalarUDF.
+    for volatility in [
+        Volatility::Immutable,
+        Volatility::Stable,
+        Volatility::Volatile,
+    ] {
+        let expression = create_udf(
+            "audit_identity",
+            vec![DataType::UInt64],
+            DataType::UInt64,
+            volatility,
+            Arc::new(|arguments| Ok(arguments[0].clone())),
+        )
+        .call(vec![col("value")]);
+        let bytes = expression.to_bytes().unwrap();
+        assert!(Expr::from_bytes(&bytes).is_err());
+        assert!(matches!(
+            FilterDefinition::try_new(expression),
+            Err(ExpressionDefinitionError::DataFusion(_))
+        ));
+    }
+}
+
+#[test]
+fn decoder_rejects_non_replayable_expressions_even_when_protobuf_is_canonical() {
+    let mut encoded = encode_definition(&filter(lit(true)));
+    encoded.truncate(DEFINITION_HEADER_LEN);
+    let parameter = placeholder("$1").to_bytes().unwrap();
+    encoded.extend_from_slice(&u32::try_from(parameter.len()).unwrap().to_be_bytes());
+    encoded.extend_from_slice(&parameter);
+    assert!(matches!(
+        decode_definition(&encoded),
+        Err(DefinitionCodecError::InvalidPayload(_))
+    ));
+    assert!(matches!(
+        FilterDefinition::try_new(placeholder("$1").eq(lit(1_u64))),
+        Err(ExpressionDefinitionError::NonReplayable)
+    ));
 }

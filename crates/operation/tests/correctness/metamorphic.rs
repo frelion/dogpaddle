@@ -8,8 +8,8 @@ use dogpaddle_operation::{
     operation::{
         Action, OperationInput,
         transform::{
-            ExtendDefinition, FilterDefinition, ProjectDefinition, SchemaAlignDefinition,
-            SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            FilterDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
+            UnionAllDefinition,
         },
     },
 };
@@ -95,7 +95,10 @@ fn structural_trace(
 fn project_select_and_schema_align_preserve_flattened_records_and_diffs_across_rebatching() {
     let rows = [(1, 10, 1), (2, 20, -1), (3, 30, 2), (4, 40, -2)];
     let cases: [(&str, Box<dyn OperationDefinition>); 3] = [
-        ("Project", Box::new(ProjectDefinition::new([1]))),
+        (
+            "Project",
+            Box::new(SelectDefinition::try_new([("right", col("right"))]).unwrap()),
+        ),
         (
             "Select",
             Box::new(
@@ -222,7 +225,7 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
         false,
     )]));
     let mut operation = stateless_operation(
-        &ExtendDefinition::try_new("seven", col("value").eq(lit(7_u64))).unwrap(),
+        &SelectDefinition::try_extend(&schema, [("seven", col("value").eq(lit(7_u64)))]).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();

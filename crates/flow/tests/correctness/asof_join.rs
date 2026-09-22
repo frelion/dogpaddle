@@ -42,7 +42,7 @@ fn asof_right_rematch_continuation_survives_reopen_in_a_real_two_input_flow() {
     );
     drop(opened);
 
-    assert_probe_continuation(&path);
+    assert_committed_continuation(&path);
 
     let mut reopened = FlowFactory::new(&path).open().unwrap();
     run_until_idle(&mut reopened);
@@ -67,7 +67,7 @@ fn asof_right_rematch_continuation_survives_reopen_in_a_real_two_input_flow() {
 }
 
 #[test]
-fn asof_emit_backpressure_rolls_back_and_reopens_the_correction_exactly_once() {
+fn asof_page_backpressure_rolls_back_and_reopens_the_correction_exactly_once() {
     const BACKPRESSURE_ROW_COUNT: usize = 1_024;
 
     let root = tempfile::tempdir().unwrap();
@@ -86,7 +86,7 @@ fn asof_emit_backpressure_rolls_back_and_reopens_the_correction_exactly_once() {
     assert_eq!(read_map_len(&path, RIGHT_ROWS, 2), 1);
 
     publish_right_change(&path, &value_change([1]));
-    let emit_continuation = drive_right_rematch_to_emit(&path);
+    let page_continuation = drive_right_rematch_to_page(&path);
     let right_rows_before_pressure = read_map_len(&path, RIGHT_ROWS, 3);
     let event_count_before_pressure = read_event_count(&path).unwrap();
     let blocker_tail = append_join_output_blocker(&path);
@@ -105,9 +105,9 @@ fn asof_emit_backpressure_rolls_back_and_reopens_the_correction_exactly_once() {
     assert_eq!(
         read_map_len(&path, RIGHT_ROWS, 3),
         right_rows_before_pressure,
-        "the backpressured Emit transaction must not change the right index"
+        "the backpressured page transaction must not change the right index"
     );
-    assert_eq!(read_continuation(&path), Some(emit_continuation));
+    assert_eq!(read_continuation(&path), Some(page_continuation));
     assert_eq!(
         read_event_count(&path),
         Some(event_count_before_pressure + 1),
@@ -210,7 +210,7 @@ fn build_backpressure_fixture(path: &Path) {
     drop(factory.build().unwrap());
 }
 
-fn assert_probe_continuation(path: &Path) {
+fn assert_committed_continuation(path: &Path) {
     let store = Store::open(path).unwrap();
     let left_rows: OrderedMap<Vec<u8>, u64> = store.open_data(LEFT_ROWS).unwrap();
     let right_rows: OrderedMap<Vec<u8>, u64> = store.open_data(RIGHT_ROWS).unwrap();
@@ -231,7 +231,7 @@ fn assert_probe_continuation(path: &Path) {
             .len(),
         ROW_COUNT
     );
-    assert!(
+    assert_eq!(
         right_rows
             .read(transaction.access())
             .unwrap()
@@ -243,15 +243,16 @@ fn assert_probe_continuation(path: &Path) {
             )
             .unwrap()
             .entries
-            .is_empty()
+            .len(),
+        1
     );
     let encoded = continuation
         .read(transaction.access())
         .unwrap()
         .get()
         .unwrap()
-        .expect("the right rematch must persist its unfinished Probe cursor");
-    assert_eq!(&encoded[..3], &[1, 1, 0]);
+        .expect("the right rematch must persist its unfinished correction cursor");
+    assert_eq!(&encoded[..2], &[1, 1]);
 }
 
 fn assert_completed_resources(path: &Path) {
@@ -346,18 +347,18 @@ fn publish_right_change(path: &Path, change: &Change) {
     transaction.commit().unwrap();
 }
 
-fn drive_right_rematch_to_emit(path: &Path) -> Vec<u8> {
+fn drive_right_rematch_to_page(path: &Path) -> Vec<u8> {
     for _ in 0..64 {
         let mut flow = FlowFactory::new(path).open().unwrap();
         assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
         drop(flow);
         if let Some(encoded) = read_continuation(path)
-            && encoded.starts_with(&[1, 1, 1])
+            && encoded.starts_with(&[1, 1])
         {
             return encoded;
         }
     }
-    panic!("ASOF Flow did not persist the bounded right rematch Emit phase");
+    panic!("ASOF Flow did not persist the bounded right rematch page");
 }
 
 fn append_join_output_blocker(path: &Path) -> u64 {
@@ -462,4 +463,99 @@ fn run_until_idle(flow: &mut Flow) {
         }
     }
     panic!("ASOF Flow did not become idle within its bounded fixture");
+}
+
+#[test]
+fn final_asof_complete_backpressure_rolls_back_rhs_and_ack_together() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("complete-pressure");
+    build_backpressure_fixture(&path);
+    publish_changes(&path, &value_change([1]), &value_change([0]));
+    let mut seeded = FlowFactory::new(&path).open().unwrap();
+    run_until_idle(&mut seeded);
+    drop(seeded);
+    publish_right_change(&path, &value_change([1]));
+    let blocker_tail = append_join_output_blocker(&path);
+    let mut pressured = FlowFactory::new(&path).open().unwrap();
+    assert_eq!(pressured.advance().unwrap(), AdvanceOutcome::Progressed);
+    let status = pressured.status().unwrap();
+    assert_eq!(status[2].last_outcome, Some(AdvanceOutcome::Backpressured));
+    assert_eq!(
+        (status[2].inputs[1].position, status[2].inputs[1].tail),
+        (1, 2)
+    );
+    assert_eq!(status[2].output.as_ref().unwrap().tail, blocker_tail);
+    drop(pressured);
+    assert_eq!(read_map_len(&path, RIGHT_ROWS, 3), 1);
+    assert_eq!(read_continuation(&path), None);
+    let mut reopened = FlowFactory::new(&path).open().unwrap();
+    run_until_idle(&mut reopened);
+    assert_eq!(reopened.status().unwrap()[2].inputs[1].position, 2);
+    drop(reopened);
+    assert_eq!(read_map_len(&path, RIGHT_ROWS, 3), 2);
+    assert_eq!(read_continuation(&path), None);
+    assert_eq!(read_event_count(&path), Some(4));
+}
+
+#[test]
+fn fused_atomic_tail_failure_rolls_back_asof_complete_and_repeats_after_reopen() {
+    use dogpaddle_operation::{lit, operation::transform::FilterDefinition};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("tail-failure");
+    let mut factory = FlowFactory::new(&path);
+    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let join = factory.operation(
+        "join",
+        Box::new(
+            AsOfJoinDefinition::try_new(
+                AsOfJoinKind::Inner,
+                AsOfDirection::Backward { allow_exact: true },
+                [],
+                [AsOfOrderKey::new(col("value"), col("value"))],
+                [],
+                AsOfTieFallback::CanonicalAscending,
+                None,
+                ["left_value", "right_value"],
+                None,
+            )
+            .unwrap(),
+        ),
+        [left, right],
+    );
+    let tail = factory.operation(
+        "tail",
+        Box::new(
+            FilterDefinition::try_new((lit(1_u64) / col("left_value")).gt(lit(0_u64))).unwrap(),
+        ),
+        [join],
+    );
+    factory.operation("sink", Box::new(DiscardDefinition::new()), [tail]);
+    factory.materialize(left, CAPACITY);
+    factory.materialize(right, CAPACITY);
+    factory.materialize(tail, CAPACITY);
+    drop(factory.build().unwrap());
+    publish_changes(&path, &value_change([0]), &value_change([0]));
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    for _ in 0..2 {
+        let before = flow.status().unwrap();
+        assert_eq!(
+            before.len(),
+            4,
+            "the failing Filter must be fused into Join's Station"
+        );
+        let error = flow.advance().unwrap_err();
+        assert_eq!(error.station_id(), "join");
+        let after = flow.status().unwrap();
+        assert_eq!(before[2].inputs, after[2].inputs);
+        assert_eq!(before[2].output, after[2].output);
+        assert_eq!(after[2].inputs[1].position, 0);
+        assert_eq!(after[2].inputs[1].tail, 1);
+        drop(flow);
+        assert_eq!(read_map_len(&path, LEFT_ROWS, 2), 1);
+        assert_eq!(read_map_len(&path, RIGHT_ROWS, 2), 0);
+        assert_eq!(read_continuation(&path), None);
+        flow = FlowFactory::new(&path).open().unwrap();
+    }
 }

@@ -121,6 +121,8 @@ impl SchemaAlignField {
     ///
     /// # Errors
     ///
+    /// Non-replayable expressions (not immutable or not row-local) are rejected.
+    ///
     /// Returns [`SchemaAlignFieldError`] when the name cannot fit the stable
     /// format or the expression cannot round-trip exactly and canonically.
     pub fn try_new(
@@ -138,6 +140,8 @@ impl SchemaAlignField {
     /// rejected rather than silently overwritten.
     ///
     /// # Errors
+    ///
+    /// Non-replayable expressions (not immutable or not row-local) are rejected.
     ///
     /// Returns [`SchemaAlignFieldError`] when the name or metadata cannot fit
     /// the stable format, a metadata key is duplicated, or the expression
@@ -196,10 +200,6 @@ impl SchemaAlignField {
 }
 
 impl SchemaAlignDefinition {
-    fn is_atomic(&self) -> bool {
-        self.fields.iter().all(|field| field.expression.is_atomic())
-    }
-
     /// Creates an alignment with empty output Schema metadata.
     ///
     /// An empty output field collection is valid and preserves the input row
@@ -336,11 +336,7 @@ impl SealedDefinition for SchemaAlignDefinition {
 
 impl OperationDefinition for SchemaAlignDefinition {
     fn kind(&self) -> OperationKind {
-        if self.is_atomic() {
-            OperationKind::AtomicTransform(NonZeroU32::MIN)
-        } else {
-            OperationKind::ExclusiveTransform(NonZeroU32::MIN)
-        }
+        OperationKind::AtomicTransform(NonZeroU32::MIN)
     }
 
     fn persistence_tag(&self) -> u16 {
