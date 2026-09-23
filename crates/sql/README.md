@@ -198,7 +198,7 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
-Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
+非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
 `SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、名称、nullability 和 metadata。
 
 `ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row

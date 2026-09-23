@@ -651,41 +651,27 @@ fn orient_join(
     let left_count = left.physical_schema.fields().len();
     let right_count = right.physical_schema.fields().len();
     let oriented = match join_type {
-        JoinType::Inner => OrientedJoin {
-            kind: EquiJoinKind::Inner,
-            inputs: [left, right],
-            keys,
-            source_order: (0..left_count + right_count).collect(),
-            swapped: false,
-        },
-        JoinType::Left => OrientedJoin {
-            kind: EquiJoinKind::LeftOuter,
-            inputs: [left, right],
-            keys,
-            source_order: (0..left_count + right_count).collect(),
-            swapped: false,
-        },
-        JoinType::Full => OrientedJoin {
-            kind: EquiJoinKind::FullOuter,
-            inputs: [left, right],
-            keys,
-            source_order: (0..left_count + right_count).collect(),
-            swapped: false,
-        },
-        JoinType::LeftSemi => OrientedJoin {
-            kind: EquiJoinKind::LeftSemi,
-            inputs: [left, right],
-            keys,
-            source_order: (0..left_count).collect(),
-            swapped: false,
-        },
-        JoinType::LeftAnti => OrientedJoin {
-            kind: EquiJoinKind::LeftAnti,
-            inputs: [left, right],
-            keys,
-            source_order: (0..left_count).collect(),
-            swapped: false,
-        },
+        JoinType::Inner
+        | JoinType::Left
+        | JoinType::Full
+        | JoinType::LeftSemi
+        | JoinType::LeftAnti => {
+            let (kind, output_count) = match join_type {
+                JoinType::Inner => (EquiJoinKind::Inner, left_count + right_count),
+                JoinType::Left => (EquiJoinKind::LeftOuter, left_count + right_count),
+                JoinType::Full => (EquiJoinKind::FullOuter, left_count + right_count),
+                JoinType::LeftSemi => (EquiJoinKind::LeftSemi, left_count),
+                JoinType::LeftAnti => (EquiJoinKind::LeftAnti, left_count),
+                _ => unreachable!("the outer match selected a non-right JOIN"),
+            };
+            OrientedJoin {
+                kind,
+                inputs: [left, right],
+                keys,
+                source_order: (0..output_count).collect(),
+                swapped: false,
+            }
+        }
         JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
             let (kind, output_count) = match join_type {
                 JoinType::Right => (EquiJoinKind::LeftOuter, left_count + right_count),
