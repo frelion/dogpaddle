@@ -56,7 +56,7 @@ impl Source for PostgresSource {
         records: &[Record],
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
-        let converted = convert_capture_records(
+        Ok(convert_capture_records(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
@@ -64,12 +64,7 @@ impl Source for PostgresSource {
             &self.spec.table,
             records,
             progress,
-        )?;
-        Ok(Captured {
-            change: converted.change,
-            sealed: converted.sealed,
-            progress: converted.next_progress,
-        })
+        )?)
     }
     fn stream(
         &self,

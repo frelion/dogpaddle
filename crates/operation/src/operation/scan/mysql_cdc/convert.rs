@@ -11,6 +11,7 @@ use dogpaddle_debezium::Record;
 use serde_json::{Map, Value};
 
 use super::{MySqlCdcScanError, MySqlColumn, MySqlType};
+use crate::operation::scan::cdc_runtime::Captured;
 
 type Row = Map<String, Value>;
 
@@ -18,12 +19,6 @@ type Row = Map<String, Value>;
 pub(crate) struct SnapshotProgress {
     saw_snapshot_row: bool,
     saw_last: bool,
-}
-
-pub(super) struct SnapshotDelivery {
-    pub(super) change: Option<Change>,
-    pub(super) complete: bool,
-    pub(super) next_progress: SnapshotProgress,
 }
 
 pub(super) fn convert_records(
@@ -54,7 +49,7 @@ pub(super) fn convert_snapshot_records(
     table: &str,
     records: &[Record],
     progress: SnapshotProgress,
-) -> Result<SnapshotDelivery, MySqlCdcScanError> {
+) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     convert_snapshot_values(
         columns,
         output_schema,
@@ -78,7 +73,7 @@ pub(super) fn convert_snapshot_values<'a>(
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
     progress: SnapshotProgress,
-) -> Result<SnapshotDelivery, MySqlCdcScanError> {
+) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     let table_topic = format!("{topic_prefix}.{database}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
     let notification_topic = format!("__dogpaddle-notification.{topic_prefix}");
@@ -136,10 +131,10 @@ pub(super) fn convert_snapshot_values<'a>(
         }
     }
     let diffs = vec![1; rows.len()];
-    Ok(SnapshotDelivery {
+    Ok(Captured {
         change: build_change(columns, output_schema, &rows, diffs)?,
-        complete,
-        next_progress: progress,
+        sealed: complete,
+        progress,
     })
 }
 

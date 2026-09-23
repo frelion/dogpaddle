@@ -11,6 +11,7 @@ use super::{
     convert::{SnapshotProgress, convert_snapshot_values, convert_values},
     schema,
 };
+use crate::operation::scan::cdc_runtime::Captured;
 
 fn column(data_type: MySqlType) -> MySqlColumn {
     MySqlColumn::new("value", data_type, true)
@@ -84,7 +85,7 @@ fn notification(kind: &str) -> Value {
 fn snapshot(
     columns: &[MySqlColumn],
     events: &[Value],
-) -> Result<super::convert::SnapshotDelivery, MySqlCdcScanError> {
+) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     snapshot_after(columns, events, SnapshotProgress::default())
 }
 
@@ -92,7 +93,7 @@ fn snapshot_after(
     columns: &[MySqlColumn],
     events: &[Value],
     progress: SnapshotProgress,
-) -> Result<super::convert::SnapshotDelivery, MySqlCdcScanError> {
+) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
@@ -328,26 +329,26 @@ fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
     row["payload"]["source"]["snapshot"] = json!("last");
 
     let continuing = snapshot(&columns, std::slice::from_ref(&row)).unwrap();
-    assert!(!continuing.complete);
+    assert!(!continuing.sealed);
     assert_eq!(continuing.change.unwrap().diffs().values(), &[1]);
 
     let complete = snapshot_after(
         &columns,
         &[heartbeat(), notification("COMPLETED")],
-        continuing.next_progress,
+        continuing.progress,
     )
     .unwrap();
-    assert!(complete.complete);
+    assert!(complete.sealed);
     assert!(complete.change.is_none());
 
     let empty = snapshot(&columns, &[notification("COMPLETED")]).unwrap();
-    assert!(empty.complete);
+    assert!(empty.sealed);
     assert!(empty.change.is_none());
 
     assert!(
         !snapshot(&columns, &[heartbeat(), notification("STARTED")])
             .unwrap()
-            .complete
+            .sealed
     );
     assert!(snapshot(&columns, &[notification("COMPLETED"), row.clone()]).is_err());
     assert!(
@@ -372,18 +373,18 @@ fn mysql_cdc_snapshot_accepts_debezium_collection_boundary_markers() {
     let columns = [column(MySqlType::Int64)];
     let mut first = envelope(&columns, "r", Value::Null, json!({"value":1}));
     first["payload"]["source"]["snapshot"] = json!("first");
-    let progress = snapshot(&columns, &[first]).unwrap().next_progress;
+    let progress = snapshot(&columns, &[first]).unwrap().progress;
 
     let mut last = envelope(&columns, "r", Value::Null, json!({"value":2}));
     last["payload"]["source"]["snapshot"] = json!("last_in_data_collection");
     let progress = snapshot_after(&columns, &[last], progress)
         .unwrap()
-        .next_progress;
+        .progress;
 
     assert!(
         snapshot_after(&columns, &[notification("COMPLETED")], progress)
             .unwrap()
-            .complete
+            .sealed
     );
 }
 
@@ -393,16 +394,16 @@ fn mysql_cdc_snapshot_progress_crosses_delivery_boundaries() {
     let mut first_row = envelope(&columns, "r", Value::Null, json!({"value":1}));
     first_row["payload"]["source"]["snapshot"] = json!("true");
     let first = snapshot(&columns, &[first_row]).unwrap();
-    assert!(!first.complete);
+    assert!(!first.sealed);
 
-    assert!(snapshot_after(&columns, &[notification("COMPLETED")], first.next_progress,).is_err());
+    assert!(snapshot_after(&columns, &[notification("COMPLETED")], first.progress,).is_err());
 
     let mut last = envelope(&columns, "r", Value::Null, json!({"value":2}));
     last["payload"]["source"]["snapshot"] = json!("last");
-    let second = snapshot_after(&columns, &[last], first.next_progress).unwrap();
+    let second = snapshot_after(&columns, &[last], first.progress).unwrap();
     let completed =
-        snapshot_after(&columns, &[notification("COMPLETED")], second.next_progress).unwrap();
-    assert!(completed.complete);
+        snapshot_after(&columns, &[notification("COMPLETED")], second.progress).unwrap();
+    assert!(completed.sealed);
     assert!(completed.change.is_none());
 }
 

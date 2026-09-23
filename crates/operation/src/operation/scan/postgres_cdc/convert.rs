@@ -12,6 +12,7 @@ use dogpaddle_debezium::Record;
 use serde_json::{Map, Value};
 
 use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
+use crate::operation::scan::cdc_runtime::Captured;
 
 type Row = Map<String, Value>;
 
@@ -19,12 +20,6 @@ type Row = Map<String, Value>;
 pub(crate) struct CaptureProgress {
     saw_snapshot_row: bool,
     snapshot_complete: bool,
-}
-
-pub(super) struct CapturedDelivery {
-    pub(super) change: Option<Change>,
-    pub(super) sealed: bool,
-    pub(super) next_progress: CaptureProgress,
 }
 
 enum ConversionMode {
@@ -70,7 +65,7 @@ pub(super) fn convert_capture_records(
     table: &str,
     records: &[Record],
     progress: CaptureProgress,
-) -> Result<CapturedDelivery, PostgresCdcScanError> {
+) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     convert_capture_values(
         columns,
         output_schema,
@@ -114,7 +109,7 @@ pub(super) fn convert_capture_values<'a>(
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
     progress: CaptureProgress,
-) -> Result<CapturedDelivery, PostgresCdcScanError> {
+) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     convert_values_in_mode(
         columns,
         output_schema,
@@ -137,7 +132,7 @@ fn convert_values_in_mode<'a>(
     table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
     mut mode: ConversionMode,
-) -> Result<CapturedDelivery, PostgresCdcScanError> {
+) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     let table_topic = format!("{topic_prefix}.{table_schema}.{table}");
     let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
     let notification_topic = format!("__dogpaddle-notification.{topic_prefix}");
@@ -227,14 +222,14 @@ fn convert_values_in_mode<'a>(
         let records = RecordBatch::try_new(output_schema, arrays)?;
         Some(Change::try_new(records, Int64Array::from(diffs))?)
     };
-    let (next_progress, sealed) = match mode {
+    let (progress, sealed) = match mode {
         ConversionMode::Capture { progress, sealed } => (progress, sealed),
         ConversionMode::Streaming => (CaptureProgress::default(), false),
     };
-    Ok(CapturedDelivery {
+    Ok(Captured {
         change,
         sealed,
-        next_progress,
+        progress,
     })
 }
 

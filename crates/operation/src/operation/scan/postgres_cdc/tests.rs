@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 
 use super::{
     PostgresCdcScanError, PostgresColumn, PostgresType,
-    convert::{CaptureProgress, CapturedDelivery, convert_capture_values, convert_values},
+    convert::{CaptureProgress, convert_capture_values, convert_values},
     schema,
 };
+use crate::operation::scan::cdc_runtime::Captured;
 
 fn column(data_type: PostgresType) -> PostgresColumn {
     PostgresColumn::new("value", data_type, true)
@@ -87,7 +88,7 @@ fn capture(
     columns: &[PostgresColumn],
     events: &[(&str, Value)],
     progress: CaptureProgress,
-) -> Result<CapturedDelivery, PostgresCdcScanError> {
+) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     let bytes = events
         .iter()
         .map(|(_, event)| serde_json::to_vec(event).unwrap())
@@ -484,7 +485,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
         capture(
             &columns,
             &[("__dogpaddle-notification.source", notification("COMPLETED"))],
-            terminal.next_progress,
+            terminal.progress,
         )
         .unwrap()
         .sealed
@@ -556,7 +557,7 @@ fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_completion_bounda
             ("__dogpaddle-notification.source", notification("COMPLETED")),
             ("source.public.events", delete),
         ],
-        first.next_progress,
+        first.progress,
     )
     .unwrap();
     assert!(second.sealed);

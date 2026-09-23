@@ -55,7 +55,7 @@ impl Source for MySqlSource {
         records: &[Record],
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
-        let converted = convert_snapshot_records(
+        Ok(convert_snapshot_records(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
@@ -63,12 +63,7 @@ impl Source for MySqlSource {
             &self.spec.table,
             records,
             progress,
-        )?;
-        Ok(Captured {
-            change: converted.change,
-            sealed: converted.complete,
-            progress: converted.next_progress,
-        })
+        )?)
     }
     fn stream(
         &self,
