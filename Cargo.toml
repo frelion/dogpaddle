@@ -9,6 +9,7 @@ members = [
     "crates/store",
     "integration-tests/change-store",
     "system-tests/debezium-runtime/host",
+    "system-tests/mysql/host",
     "system-tests/postgres/hosts",
     "test-support/perf-context",
     "tools/xtask",

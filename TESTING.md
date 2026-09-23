@@ -7,7 +7,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 1. `crates/<owner>/src/**/tests.rs`：必须访问私有状态的单元测试、故障注入和独立算法 oracle。
 2. `crates/<owner>/tests/correctness.rs`：该产品 crate 唯一的公共测试 target，领域文件位于相邻的 `tests/correctness/`。
 3. `integration-tests/<seam>/`：仅用于没有产品组合根的 sibling seam。当前只有 `integration-tests/change-store/`。
-4. `system-tests/`：依赖真实 Java、Debezium 或 PostgreSQL 的系统验收。
+4. `system-tests/`：依赖真实 Java、Debezium、PostgreSQL、MySQL 或其他外部服务的系统验收。
 5. `crates/<owner>/benches/`：由 workload owner 直接拥有的 benchmark。
 
 不存在通用实验框架。准备合并的实验必须归入 correctness、system test 或 benchmark；否则留在临时分支。
@@ -58,9 +58,12 @@ LeftAnti，并证明 tag `17`、`asof_join.left_rows/right_rows/continuation` �
 Definition roundtrip 与精确 output Schema。运行证据覆盖 backward/forward/nearest、exact 开关、
 两种 equidistant policy、空/多 equality partition、`Equal/NotDistinct`、单/多 order、NULL、tolerance 边界、
 显式 tie-break 和三种 fallback、residual 跳过近候选、重复 multiplicity、两侧 insert/retract、旧负新正的
-历史修正顺序、整批负前缀/溢出/歧义 rollback，以及候选与外层 left 双重分页中的 commit
-rollback 和 reopen。SQL 只证明 DataFusion 原生 left-preserving `ASOF JOIN` 的四个不等方向、零/多等值键、
-Schema/Program identity 和最终关系，不复制 Operation API 的 nearest、tolerance、tie 或 residual 状态机。
+历史修正顺序，以及候选与外层 left 双重分页中的提交、回滚和 reopen。整批权重准入失败
+（负前缀或 `u64` multiplicity overflow）必须在任何输出前拒绝并回滚整个 Claim；晚期候选歧义或
+output-diff overflow 只回滚失败的当前 turn，已提交的分页状态、输出和 continuation 保留；
+reopen 不重复已提交页，也不跳过确定性失败。SQL 只证明 DataFusion 原生 left-preserving `ASOF JOIN`
+的四个不等方向、零/多等值键、Schema/Program identity 和最终关系，不复制 Operation API 的
+nearest、tolerance、tie 或 residual 状态机。
 
 ### Flow
 
@@ -236,9 +239,11 @@ cargo test --workspace --benches --locked
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench change_codec
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench projection
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench buffered_sink
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench cdc_bootstrap
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join_resources
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join_resources
@@ -246,9 +251,9 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-inte
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```
 
-system-tests 统一拥有真实 JVM、Debezium bundle、PG gate host 和 warehouse 容器脚本；gate-only host 不得伪装成产品 example。
+system-tests 统一拥有真实 JVM、Debezium bundle、PG/MySQL gate host 和 warehouse 容器脚本；gate-only host 不得伪装成产品 example。
 
-system-tests 的稳定 host 布局只有三个边界：根 workspace 的 `system-tests/debezium-runtime/host` 只含 bundle probe，`system-tests/postgres/hosts` 只含原生 PG gate host；独立 workspace `system-tests/debezium-postgres/host` 只依赖 Debezium 产品。`system-tests/postgres/support` 只能由 PG 脚本共享进程执行、临时 cluster、端口和日志基础设施，不得包含场景 oracle、SQL 或 host 协议，D1 不得引用。`system-tests/warehouse-sinks` 只拥有锁定官方镜像的 Compose fixture 和真实 adapter gate，不新增 Rust host。
+system-tests 的稳定 host 布局：根 workspace 的 `system-tests/debezium-runtime/host` 只含 bundle probe，`system-tests/postgres/hosts` 只含原生 PG gate host，`system-tests/mysql/host` 只含 MySQL CDC gate host；独立 workspace `system-tests/debezium-postgres/host` 只依赖 Debezium 产品。`system-tests/postgres/support` 只能由 PG 脚本共享进程执行、临时 cluster、端口和日志基础设施，不得包含场景 oracle、SQL 或 host 协议，D1 和 MySQL gate 不得引用。`system-tests/warehouse-sinks` 只拥有锁定官方镜像的 Compose fixture 和真实 adapter gate，不新增 Rust host。
 
 ## 系统验收
 
@@ -259,6 +264,9 @@ system-tests/debezium-postgres/scripts/check.sh
 python3 system-tests/postgres/check_cdc.py \
   --bundle /absolute/path/to/runtime-bundle \
   --postgres-bin /absolute/path/to/postgresql/bin
+python3 system-tests/mysql/check_cdc.py \
+  --bundle /absolute/path/to/mysql-capable-runtime-bundle \
+  --engine podman
 python3 system-tests/postgres/check_sink.py \
   --postgres-bin /absolute/path/to/postgresql/bin
 python3 system-tests/postgres/check_sql.py \
@@ -279,7 +287,8 @@ scripts/clean.sh
 `crates/debezium/scripts/audit-upstream-contract.sh` 只在 pin 升级时由升级者显式执行，不属于 D1 的
 `check.sh`、`run.sh` 或日常 CI workflow。
 
-根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink、Sink recovery 和 SQL 四个 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 使用。
+根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink、Sink recovery 和 SQL 四个 host；`system-tests/mysql/host` 只拥有 MySQL CDC 的直接 Operation/Store 验收 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 或 MySQL gate 使用。
+`system-tests/mysql/check_cdc.py` 每次使用随机名称的独立 MySQL 8.4 Compose 项目、数据卷和回环端口，不接触现有数据库。它用真正的 Debezium delivery 验证快照封口与 streaming 的 Store commit 后、AfterCommit ACK 前进程退出；重开检查私有 spool、精确有序输出、无重复和后继 binlog 事件；失败保留私有状态、丢弃可能泄露凭据的 host stderr，仅在终端显示脱敏的容器诊断，容器和数据卷仅清理本轮项目。bundle 必须包含 MySQL connector；可用 `--host` 指向已编译的绝对路径，容器 CLI 由 `--engine` 指定。此门禁不属于普通 Cargo gate。
 `system-tests/warehouse-sinks/check.sh` 用锁定的官方镜像启动一次性 ClickHouse/Doris fixture，运行产品 crate 内标记为 ignored 的真实 adapter 测试，并在退出时删除容器和 volume；可用 `CONTAINER_ENGINE` 选择兼容 Compose 的容器 CLI。
 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。

@@ -1,0 +1,17 @@
+# The runner supplies unique names, a fresh password and a free loopback port for
+# every invocation; do not run this fixture without system-tests/mysql/check_cdc.py.
+services:
+  mysql:
+    image: docker.io/library/mysql:8.4.6@sha256:869218921e61d6c3c89820955d63cca42971f0e3e6c1e2792247bbd944ebc6e9
+    container_name: ${DOGPADDLE_GATE_CONTAINER:?set by check_cdc.py}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DOGPADDLE_GATE_PASSWORD:?set by check_cdc.py}
+    command: [mysqld, --server-id=1, --log-bin=mysql-bin, --binlog-format=ROW, --binlog-row-image=FULL, --lower-case-table-names=0, --binlog-expire-logs-seconds=86400, --mysql-native-password=ON]
+    ports:
+      - "127.0.0.1:${DOGPADDLE_GATE_PORT:?set by check_cdc.py}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:
+    name: ${DOGPADDLE_GATE_VOLUME:?set by check_cdc.py}

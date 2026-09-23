@@ -84,7 +84,7 @@ CARGO_BUILD_JOBS=1 DOGPADDLE_PERF_PROFILE=smoke \
 UPDATE/DELETE/INSERT、SIGINT 正常停止、停机期间 UPDATE/INSERT、使用同一 state
 重开并精确追平，逐阶段核对完整结果且无重复。使用仓库锁定的 MySQL 镜像，以及
 官方脚本重新构建并校验的完整 PG/MySQL runtime bundle；Java bridge 的 51 项测试通过。
-此场景不注入 ACK 窗口崩溃，不将 PG 的崩溃覆盖冒充为 MySQL 的同等覆盖。
+上述 SQL/CLI 场景不注入 ACK 窗口崩溃，不将 PG 的崩溃覆盖冒充为 MySQL 的同等覆盖。后续另增 `system-tests/mysql/check_cdc.py` 直接公共 Operation/Store 的真实 MySQL 门禁，固定在 Store commit 后、Delivery ACK 前退出并验证快照封口及 streaming 的恢复；它不属于本次历史实跑记录，须单独执行并记录结果。
 
 抽象与职责、正确性与事务恢复、性能与资源分别由三个未参与产品实现的 Agent
 独立复审，无确认 finding。主 Agent 核实了具体结论；最后的格式修正又经正确性

@@ -30,7 +30,7 @@ DogPaddle 是 Rust 2024 工作区。使用根 `Cargo.toml` 指定的 **Rust 1.96
 
 ## 构建与验证
 
-- `cargo build --workspace`：使用工作区锁定的依赖构建七个产品 crate、不可发布的 Change–Store 接缝包、两个系统验收 host 包、性能上下文与 xtask。
+- `cargo build --workspace`：使用工作区锁定的依赖构建七个产品 crate、不可发布的 Change–Store 接缝包、三个系统验收 host 包、性能上下文与 xtask。
 - `cargo test --workspace`：运行单元测试、集成测试和文档测试。
 - `cargo test -p dogpaddle-change-store-integration`：只运行 Change 与 SubscribedLog 的外部组合测试。
 - `cargo test -p dogpaddle-store --test correctness transaction::`：运行指定公共测试区域；所有 crate 的公共测试 target 都统一命名为 `correctness`。

@@ -1,7 +1,7 @@
 # System tests
 
-This directory owns validation that needs a packaged runtime, PostgreSQL, a JVM,
-or another process boundary. It is intentionally outside the product crates.
+This directory owns validation that needs a packaged runtime, PostgreSQL,
+MySQL, a JVM, or another process boundary. It is intentionally outside the product crates.
 
 - `debezium-runtime/host/` is a non-publishable root-workspace package that
   contains only `bundled_runtime_probe`; `debezium-runtime/probe/` owns the
@@ -12,6 +12,10 @@ or another process boundary. It is intentionally outside the product crates.
   `postgres/check_cdc.py`, `postgres/check_sink.py`, and `postgres/check_sql.py`
   own their disposable PostgreSQL scenarios and build those release binaries
   when no prebuilt host paths are supplied.
+- `mysql/host/` is a non-publishable root-workspace package containing only the
+  MySQL CDC direct-Operation crash-window host. `mysql/check_cdc.py` owns a
+  disposable, pinned MySQL Compose fixture and verifies both terminal snapshot
+  and streaming Store-commit-before-ACK recovery with a MySQL-capable bundle.
 - `debezium-postgres/` is the isolated D1 black-box gate. Its Rust host
   remains a separate workspace with its own byte-for-byte preserved
   `Cargo.lock`; `scripts/check.sh` builds its inputs and runs the full local gate,
@@ -21,5 +25,5 @@ or another process boundary. It is intentionally outside the product crates.
   convergent replay, stale-write suppression, exact row validation, and Doris
   multi-statement transaction splitting.
 
-Normal `cargo test --workspace` does not start Java, PostgreSQL, or containers.
+Normal `cargo test --workspace` does not start Java, PostgreSQL, MySQL, or containers.
 The exact local and CI commands are documented in [`../TESTING.md`](../TESTING.md).

@@ -1546,6 +1546,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dogpaddle-mysql-system-host"
+version = "0.2.1"
+dependencies = [
+ "arrow-array",
+ "dogpaddle-change",
+ "dogpaddle-operation",
+ "dogpaddle-store",
+ "serde_json",
+]
+
+[[package]]
 name = "dogpaddle-operation"
 version = "0.2.1"
 dependencies = [

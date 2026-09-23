@@ -26,7 +26,7 @@ MySqlCdcScan 的 tag 是 15，同样是单个具体 Scan，Definition 保存发�
 捕获、封口、发布、背压和 ACK 与 PG 由同一个私有 CDC runtime 实现；数据库连接、记录转换和 checkpoint 身份校验仍由各具体源拥有。
 Capturing 期 reopen 通过 Resetting 每 turn `pop_front` 至多一项并清理 checkpoint 后重做完整快照；不从中间 checkpoint 恢复。
 容量是相同的 Queue 硬上限，每项计费为 8-byte private sequence 加完整 IPC bytes，空队列也不接受超限项；超限不 ACK 并要求用更大容量重建。
-部署角色应具有短时 global read lock 所需权限，但不得授予 `LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 之前失败。
+部署角色应具有短时 global read lock 所需权限，但不得授予 `LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 之前失败。真实系统验收入口为 `system-tests/mysql/check_cdc.py`：直接通过公共 Operation/Store 协议在快照封口及 streaming delivery 的 Store commit 后、ACK 前退出，再验证重开与有序后继事件；普通 Cargo 测试不启动 MySQL。
 binlog 必须覆盖快照、私有 spool 排空、公开 output 背压与追平全期；过早 `PURGE` 必须 fail closed，不得新选起点。
 只支持固定 Schema，无 TLS、在线 DDL、跨实例 fencing 或旧格式迁移。
 

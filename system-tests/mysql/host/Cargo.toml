@@ -1,0 +1,25 @@
+[package]
+name = "dogpaddle-mysql-system-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+autobins = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "mysql_cdc"
+path = "src/bin/mysql_cdc.rs"
+test = false
+bench = false
+
+[dependencies]
+arrow-array.workspace = true
+dogpaddle-change.workspace = true
+dogpaddle-operation.workspace = true
+dogpaddle-store.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
