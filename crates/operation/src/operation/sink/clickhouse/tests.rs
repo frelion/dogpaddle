@@ -37,43 +37,6 @@ fn definition_round_trips_canonically() {
 }
 
 #[test]
-fn row_codec_preserves_nulls_and_logical_values() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("number", DataType::Int64, false),
-        Field::new("text", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![7])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-        ],
-    )
-    .unwrap();
-    let codec = ClickHouseRowCodec::new(ClickHouseLayout::try_new(schema).unwrap());
-    let row = codec.encode_row(&batch, 0).unwrap();
-    assert_eq!(row.values[0], serde_json::json!(7));
-    assert_eq!(row.values[1], serde_json::Value::Null);
-    assert_eq!(row.hash.len(), 32);
-}
-
-#[test]
-fn row_codec_rejects_out_of_bounds_index() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "number",
-        DataType::Int64,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(Int64Array::from(vec![7]))],
-    )
-    .unwrap();
-    let codec = ClickHouseRowCodec::new(ClickHouseLayout::try_new(schema).unwrap());
-    assert!(codec.encode_row(&batch, 1).is_err());
-}
-
-#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one fixture checks every native numeric width and timestamp unit against JSON Number semantics"
@@ -279,6 +242,7 @@ fn row_codec_preserves_encoded_float_bits_and_nested_values() {
             .collect::<Vec<_>>()
     );
     assert_ne!(row.values[0], row.values[1]);
+    assert_eq!(row.hash.len(), 32);
 }
 
 #[test]

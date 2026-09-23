@@ -18,7 +18,7 @@ exclude = ["system-tests/debezium-postgres/host"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.96"
 
@@ -66,6 +66,22 @@ tokio = { version = "=1.53.1", features = ["rt", "time"] }
 tokio-postgres = "=0.7.18"
 ureq = { version = "=3.4.2", default-features = false }
 url = "=2.5.8"
+
+# Tests retain file/line diagnostics while avoiding multi-gigabyte native
+# RocksDB DWARF in each debug build. Release and benchmark profiles are unchanged.
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.dev.package.librocksdb-sys]
+debug = 0
+
+[profile.test.package.librocksdb-sys]
+debug = 0
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

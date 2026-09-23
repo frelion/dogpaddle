@@ -102,6 +102,16 @@ fn delivery(rows: &[(i64, i64)], admissions: &[u64]) -> DeliveryBatch {
     DeliveryBatch::for_test(change(rows), admissions.to_vec()).unwrap()
 }
 
+fn assert_plan_roundtrip(input: &DeliveryBatch, checkpoint: u64, batch: &Batch) {
+    let mut encoded = Vec::new();
+    RelationSinkTarget::<Target>::encode_plan(batch, &mut encoded);
+    let mut cursor = encoded.as_slice();
+    let recovered =
+        RelationSinkTarget::<Target>::decode_plan(&mut cursor, input, &checkpoint).unwrap();
+    assert!(cursor.is_empty());
+    assert_eq!(&recovered, batch);
+}
+
 fn apply(target: &mut Target, input: &DeliveryBatch, next_id: &mut u64) {
     let (next, plan) = plan::prepare(target, input, *next_id).unwrap();
     plan::validate(&plan, next, input.change()).unwrap();
@@ -144,13 +154,7 @@ fn insert_only_batch_reserves_ids_in_event_order_without_target_lookup() {
         [(0, 1), (0, 2), (1, 3), (2, 4), (2, 5), (2, 6)]
     );
     plan::validate(&batch, checkpoint, input.change()).unwrap();
-    let mut encoded = Vec::new();
-    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
-    let mut cursor = encoded.as_slice();
-    let recovered =
-        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap();
-    assert!(cursor.is_empty());
-    assert_eq!(recovered, batch);
+    assert_plan_roundtrip(&input, checkpoint, &batch);
     target.write_batch(input.change(), &batch).unwrap();
     assert_eq!(target.rows.len(), 6);
 }
@@ -165,14 +169,7 @@ fn recovered_delete_only_plan_retains_full_canonical_budget_without_new_row_comp
     assert!(batch.inserts.is_empty());
     assert_eq!(batch.deletes[0].technical_id, 1);
     plan::validate(&batch, checkpoint, input.change()).unwrap();
-    let mut encoded = Vec::new();
-    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
-    let mut cursor = encoded.as_slice();
-    assert_eq!(
-        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap(),
-        batch
-    );
-    assert!(cursor.is_empty());
+    assert_plan_roundtrip(&input, checkpoint, &batch);
 }
 
 #[test]
@@ -185,14 +182,7 @@ fn recovered_mixed_plan_deleting_only_existing_ids_keeps_identity_checks_on_targ
     assert_eq!(batch.inserts[0].technical_id, next_id);
     assert_eq!(batch.deletes[0].technical_id, 1);
     plan::validate(&batch, checkpoint, input.change()).unwrap();
-    let mut encoded = Vec::new();
-    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
-    let mut cursor = encoded.as_slice();
-    assert_eq!(
-        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap(),
-        batch
-    );
-    assert!(cursor.is_empty());
+    assert_plan_roundtrip(&input, checkpoint, &batch);
     target.write_batch(input.change(), &batch).unwrap();
     assert_eq!(target.rows.len(), 1);
 }
@@ -423,26 +413,29 @@ fn relation_recovery_rejects_positive_work_beyond_the_id_frontier() {
     assert!(adapter.validate_recovery(&(EXHAUSTED_ID - 2), 3).is_err());
 }
 
-#[test]
-fn recovered_plan_compares_each_large_row_pair_once() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "payload",
-        DataType::Binary,
-        false,
-    )]));
-    let payload = vec![7_u8; 3 * 1024 * 1024];
-    let input = Change::try_new(
+fn repeated_binary_change(payload_bytes: usize, diffs: [i64; 2]) -> Change {
+    let payload = vec![7_u8; payload_bytes];
+    Change::try_new(
         RecordBatch::try_new(
-            schema,
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                false,
+            )])),
             vec![Arc::new(BinaryArray::from(vec![
                 Some(payload.as_slice()),
                 Some(payload.as_slice()),
             ]))],
         )
         .unwrap(),
-        Int64Array::from(vec![512, -512]),
+        Int64Array::from(diffs.to_vec()),
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn recovered_plan_compares_each_large_row_pair_once() {
+    let input = repeated_binary_change(3 * 1024 * 1024, [512, -512]);
     let batch = Batch {
         inserts: (1..=512)
             .map(|technical_id| Insert {
@@ -463,23 +456,7 @@ fn recovered_plan_compares_each_large_row_pair_once() {
 
 #[test]
 fn recovered_deletes_of_existing_ids_still_check_the_full_canonical_budget() {
-    let payload = vec![7_u8; 4 * 1024 * 1024];
-    let input = Change::try_new(
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "payload",
-                DataType::Binary,
-                false,
-            )])),
-            vec![Arc::new(BinaryArray::from(vec![
-                Some(payload.as_slice()),
-                Some(payload.as_slice()),
-            ]))],
-        )
-        .unwrap(),
-        Int64Array::from(vec![-1, -1]),
-    )
-    .unwrap();
+    let input = repeated_binary_change(4 * 1024 * 1024, [-1, -1]);
     let batch = Batch {
         inserts: Vec::new(),
         deletes: vec![
@@ -498,23 +475,7 @@ fn recovered_deletes_of_existing_ids_still_check_the_full_canonical_budget() {
 
 #[test]
 fn insert_only_rows_still_share_the_full_canonical_batch_budget() {
-    let payload = vec![7_u8; 4 * 1024 * 1024];
-    let input = Change::try_new(
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "payload",
-                DataType::Binary,
-                false,
-            )])),
-            vec![Arc::new(BinaryArray::from(vec![
-                Some(payload.as_slice()),
-                Some(payload.as_slice()),
-            ]))],
-        )
-        .unwrap(),
-        Int64Array::from(vec![1, 1]),
-    )
-    .unwrap();
+    let input = repeated_binary_change(4 * 1024 * 1024, [1, 1]);
     let mut target = Target::default();
     assert!(
         plan::prepare(

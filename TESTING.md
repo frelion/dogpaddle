@@ -210,6 +210,8 @@ fixture、seed、预热和结果校验必须位于计时外。全部 runner 记�
 cargo xtask check
 ```
 
+工作区 `dev`/`test` 保留行号级调试信息，但不保留 `librocksdb-sys` 的 C++ DWARF，且关闭本地增量缓存；这使宽依赖/原生测试的冷编译可能变慢或失去原生 C++ 变量级调试。`release`/Criterion 配置不变。若确需原生调试，可用 Cargo profile 覆盖或临时独立 target 构建。修改 profile 会生成新的构建哈希，不会自动删除旧 `target/`：停止构建并确认无需保留全部 debug/test 缓存后，可先用 `cargo clean --profile dev --dry-run` 检查删除范围，再清理并重新构建；该命令可能删除整个 `target/debug`（包括 test-mode benchmark 产物），并非只清理旧哈希。不要无参数运行 `cargo clean`，它还会删除 `target/local-tools` 中独立下载的 JDK/Maven 和 benchmark/实验目录。新旧产物并存大小不是精简后的稳态大小；test-mode 与 release benchmark 也不能当作同一性能口径。
+
 它等价于：
 
 ```bash

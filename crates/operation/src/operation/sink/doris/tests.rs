@@ -32,27 +32,6 @@ fn definition_round_trips_canonically() {
 }
 
 #[test]
-fn row_codec_preserves_nulls_and_logical_values() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("number", DataType::Int64, false),
-        Field::new("text", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![7])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-        ],
-    )
-    .unwrap();
-    let codec = DorisRowCodec::new(DorisLayout::try_new(schema).unwrap());
-    let row = codec.encode_row(&batch, 0).unwrap();
-    assert_eq!(row.values[0], mysql::Value::Int(7));
-    assert_eq!(row.values[1], mysql::Value::NULL);
-    assert_eq!(row.hash.len(), 32);
-}
-
-#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one row fixture checks the complete supported type mapping and field order"
@@ -165,6 +144,7 @@ fn row_codec_maps_every_supported_type_without_reinterpreting_canonical_values()
     expected_absent[15] = Value::Bytes(b"AQEAAA==".to_vec());
     assert_eq!(absent.values, expected_absent);
     assert_ne!(present.hash, absent.hash);
+    assert_eq!(present.hash.len(), 32);
     assert!(present.hash.iter().all(u8::is_ascii_hexdigit));
 }
 

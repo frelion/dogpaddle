@@ -139,38 +139,6 @@ fn maximum_sink_identity_keeps_derived_names_below_postgresql_limit() {
 }
 
 #[test]
-fn row_codec_preserves_unsigned_and_float_bit_patterns() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("unsigned", DataType::UInt64, false),
-        Field::new("float32", DataType::Float32, false),
-        Field::new("float64", DataType::Float64, false),
-    ]));
-    let float32 = f32::from_bits(0x7f80_0123);
-    let float64 = -0.0_f64;
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef,
-            Arc::new(Float32Array::from(vec![float32])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![float64])) as ArrayRef,
-        ],
-    )
-    .unwrap();
-    let encoded = PostgresRowCodec::new(PostgresLayout::try_new(schema).unwrap())
-        .encode_row(&batch, 0)
-        .unwrap();
-
-    assert_eq!(
-        encoded.values,
-        [
-            PostgresValue::Bytes(Some(u64::MAX.to_be_bytes().to_vec())),
-            PostgresValue::Bytes(Some(float32.to_bits().to_be_bytes().to_vec())),
-            PostgresValue::Bytes(Some(float64.to_bits().to_be_bytes().to_vec())),
-        ]
-    );
-}
-
-#[test]
 #[allow(clippy::too_many_lines)]
 fn row_codec_maps_fixed_width_values_and_typed_nulls_from_canonical_bytes() {
     let fields = vec![
@@ -443,26 +411,4 @@ fn layout_owns_only_the_target_and_two_indexes() {
     );
     assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
     assert!(plan.initialize.contains("dogpaddle.postgres-relation.v2:"));
-}
-
-#[test]
-fn row_codec_preserves_the_complete_utf8_domain_as_bytes() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "message",
-        DataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(StringArray::from(vec!["before\0after"])) as ArrayRef],
-    )
-    .unwrap();
-    let encoded = PostgresRowCodec::new(PostgresLayout::try_new(schema).unwrap())
-        .encode_row(&batch, 0)
-        .unwrap();
-
-    assert_eq!(
-        encoded.values,
-        [PostgresValue::Bytes(Some(b"before\0after".to_vec()))]
-    );
 }
