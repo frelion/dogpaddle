@@ -152,20 +152,9 @@ fn canonical_size_inner<'a>(
     }
 
     add_size(size, 1, max_bytes)?;
-    let fixed_width = match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
-        DataType::Int16 | DataType::UInt16 => Some(2),
-        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Some(4),
-        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => {
-            Some(8)
-        }
-        DataType::Decimal128(_, _) => Some(16),
-        _ => None,
-    };
-    if let Some(width) = fixed_width {
+    if let Some(width) = fixed_canonical_width(field, array, path)? {
         return add_size(size, width, max_bytes);
     }
-
     match field.data_type() {
         DataType::Utf8 => {
             let bytes = downcast::<StringArray>(array, field, path)?.value(index);
@@ -180,6 +169,9 @@ fn canonical_size_inner<'a>(
         DataType::List(child) => {
             let values = downcast::<ListArray>(array, field, path)?.value(index);
             add_size(size, 8, max_bytes)?;
+            if values.len() > max_bytes - *size {
+                return Err(RowError::SizeLimit { max_bytes });
+            }
             if let Some(child_size) = constant_canonical_size(child, values.as_ref()) {
                 let children = values
                     .len()
@@ -214,6 +206,39 @@ fn canonical_size_inner<'a>(
     }
 }
 
+fn fixed_canonical_width(
+    field: &Field,
+    array: &dyn Array,
+    path: &[&str],
+) -> Result<Option<usize>, RowError> {
+    macro_rules! width {
+        ($type:ty, $size:expr) => {{
+            downcast::<$type>(array, field, path)?;
+            Some($size)
+        }};
+    }
+    Ok(match field.data_type() {
+        DataType::Boolean => width!(BooleanArray, 1),
+        DataType::Int8 => width!(Int8Array, 1),
+        DataType::Int16 => width!(Int16Array, 2),
+        DataType::Int32 => width!(Int32Array, 4),
+        DataType::Int64 => width!(Int64Array, 8),
+        DataType::UInt8 => width!(UInt8Array, 1),
+        DataType::UInt16 => width!(UInt16Array, 2),
+        DataType::UInt32 => width!(UInt32Array, 4),
+        DataType::UInt64 => width!(UInt64Array, 8),
+        DataType::Float32 => width!(Float32Array, 4),
+        DataType::Float64 => width!(Float64Array, 8),
+        DataType::Date32 => width!(Date32Array, 4),
+        DataType::Timestamp(TimeUnit::Second, _) => width!(TimestampSecondArray, 8),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => width!(TimestampMillisecondArray, 8),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => width!(TimestampMicrosecondArray, 8),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => width!(TimestampNanosecondArray, 8),
+        DataType::Decimal128(_, _) => width!(Decimal128Array, 16),
+        _ => None,
+    })
+}
+
 fn constant_canonical_size(field: &Field, array: &dyn Array) -> Option<usize> {
     if array.data_type() != field.data_type() {
         return None;
@@ -221,22 +246,18 @@ fn constant_canonical_size(field: &Field, array: &dyn Array) -> Option<usize> {
     if matches!(field.data_type(), DataType::Null) {
         return Some(1);
     }
-    let value_size = match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 2,
-        DataType::Int16 | DataType::UInt16 => 3,
-        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 5,
-        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => 9,
-        DataType::Decimal128(_, _) => 17,
-        DataType::Struct(fields) => {
-            let structure = array.as_any().downcast_ref::<StructArray>()?;
-            fields
-                .iter()
-                .zip(structure.columns())
-                .try_fold(1_usize, |size, (child, values)| {
-                    size.checked_add(constant_canonical_size(child, values.as_ref())?)
-                })?
-        }
-        _ => return None,
+    let value_size = if let Some(width) = fixed_canonical_width(field, array, &[]).ok()? {
+        width + 1
+    } else if let DataType::Struct(fields) = field.data_type() {
+        let structure = array.as_any().downcast_ref::<StructArray>()?;
+        fields
+            .iter()
+            .zip(structure.columns())
+            .try_fold(1_usize, |size, (child, values)| {
+                size.checked_add(constant_canonical_size(child, values.as_ref())?)
+            })?
+    } else {
+        return None;
     };
     if array.null_count() == 0 || value_size == 1 {
         Some(value_size)
@@ -669,7 +690,10 @@ fn require_capacity(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, ListArray, RecordBatch, StringArray, StructArray, types::UInt64Type};
+    use arrow_array::{
+        Array, BooleanArray, Decimal128Array, ListArray, RecordBatch, StringArray, StructArray,
+        TimestampMicrosecondArray, types::UInt64Type,
+    };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
@@ -715,6 +739,10 @@ mod tests {
 
         for row in 0..records.num_rows() {
             let encoded = canonical_row(&records, row).unwrap();
+            assert_eq!(
+                canonical_row_size_bounded(&records, row, encoded.len()).unwrap(),
+                encoded.len()
+            );
             let decoded = decode_canonical_row(&schema, &encoded).unwrap();
             let columns = decoded
                 .iter()
@@ -722,6 +750,38 @@ mod tests {
                 .collect();
             let rebuilt = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
             assert_eq!(canonical_row(&rebuilt, 0).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn canonical_sizes_match_encoded_fixed_nullable_decimal_and_timestamp_values() {
+        let records = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("flag", DataType::Boolean, true),
+                Field::new(
+                    "when",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Field::new("decimal", DataType::Decimal128(12, 2), true),
+            ])),
+            vec![
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(-7), None])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(-123), None])
+                        .with_precision_and_scale(12, 2)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        for index in 0..records.num_rows() {
+            let encoded = canonical_row(&records, index).unwrap();
+            assert_eq!(
+                canonical_row_size_bounded(&records, index, encoded.len()).unwrap(),
+                encoded.len()
+            );
         }
     }
 

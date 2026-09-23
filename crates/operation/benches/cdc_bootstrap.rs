@@ -243,18 +243,20 @@ fn main() {
     if is_benchmark {
         require_release_build("cdc_bootstrap");
     }
-    let (entries, rows) = match (profile, is_benchmark) {
-        (PerformanceProfile::Smoke, false) => (2, 2),
-        (PerformanceProfile::Smoke, true) => (8, 64),
-        (PerformanceProfile::Reference, _) => (32, 256),
+    let (entries, rows, wide_reset_rows) = match (profile, is_benchmark) {
+        (PerformanceProfile::Smoke, false) => (2, 2, 512),
+        (PerformanceProfile::Smoke, true) => (8, 64, 16_384),
+        (PerformanceProfile::Reference, _) => (32, 256, 32_768),
     };
     let root = RunRoot::for_profile("cdc_bootstrap", profile);
     std::fs::write(root.path().join("context.json"), serde_json::to_vec_pretty(&json!({
         "benchmark": "cdc_bootstrap", "profile": profile,
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
-        "entries": entries, "rows_per_entry": rows,
+        "entries": entries, "rows_per_entry": rows, "wide_entries": 1,
+        "wide_rows_per_entry": wide_reset_rows,
         "turns_per_iteration": entries + 1, "sync_commits_per_iteration": entries + 1,
-        "cases": ["postgres/publish", "postgres/reset", "mysql/publish", "mysql/reset"],
+        "wide_turns_and_sync_commits": 2,
+        "cases": ["postgres/publish", "postgres/reset", "postgres/publish_wide", "postgres/reset_wide", "mysql/publish", "mysql/reset", "mysql/publish_wide", "mysql/reset_wide"],
         "timed_boundary": "restore and all spool entry turns, apply, synchronous commit, AfterCommit, and retaining Actions for untimed validation",
         "untimed": "Definition decoding, construction, Store creation/open, fixture encoding/seed, output and durable-state oracle, teardown",
         "external_io": "none; stops at Streaming or Fresh before connector start",
@@ -272,20 +274,23 @@ fn main() {
         .configure_from_args();
     let mut group = criterion.benchmark_group("cdc_bootstrap");
     for source in [Source::Postgres, Source::MySql] {
-        for reset in [false, true] {
-            group.bench_function(
-                BenchmarkId::new(source.name(), if reset { "reset" } else { "publish" }),
-                |bencher| {
-                    bencher.iter_custom(|iterations| {
-                        let mut elapsed = Duration::ZERO;
-                        for _ in 0..iterations {
-                            let mut fixture = Fixture::new(&root, source, entries, rows, reset);
-                            elapsed += fixture.run(reset);
-                        }
-                        elapsed
-                    });
-                },
-            );
+        for (name, case_entries, case_rows, reset) in [
+            ("publish", entries, rows, false),
+            ("reset", entries, rows, true),
+            ("publish_wide", 1, wide_reset_rows, false),
+            ("reset_wide", 1, wide_reset_rows, true),
+        ] {
+            group.bench_function(BenchmarkId::new(source.name(), name), |bencher| {
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let mut fixture =
+                            Fixture::new(&root, source, case_entries, case_rows, reset);
+                        elapsed += fixture.run(reset);
+                    }
+                    elapsed
+                });
+            });
         }
     }
     group.finish();

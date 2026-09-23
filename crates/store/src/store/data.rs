@@ -241,6 +241,7 @@ impl TransactionRef<'_> {
         lower: Option<&EncodedBound<'key>>,
         upper: Option<&EncodedBound<'key>>,
         limit: ScanLimit,
+        key_suffix_prefix: &[u8],
     ) -> Result<ScanBatch, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
@@ -251,10 +252,19 @@ impl TransactionRef<'_> {
                 lower,
                 upper,
                 limit,
+                key_suffix_prefix,
             ),
             Self::Write(transaction) => {
                 let snapshot = transaction.inner.snapshot();
-                scan_data(&snapshot, prefix, direction, lower, upper, limit)
+                scan_data(
+                    &snapshot,
+                    prefix,
+                    direction,
+                    lower,
+                    upper,
+                    limit,
+                    key_suffix_prefix,
+                )
             }
         };
         self.record_result(result)
@@ -303,6 +313,22 @@ impl ReadDataAccess<'_> {
     where
         R: RangeBounds<&'range [u8]>,
     {
+        self.scan_key_suffix(range, direction, resume_after, limit, &[])
+    }
+
+    /// Uses the full encoded key for bounds and byte admission, but owns only
+    /// the suffix after `key_prefix` for admitted entries in a prefix range.
+    pub(crate) fn scan_key_suffix<'range, R>(
+        &self,
+        range: R,
+        direction: ScanDirection,
+        resume_after: Option<&[u8]>,
+        limit: ScanLimit,
+        key_suffix_prefix: &[u8],
+    ) -> Result<ScanBatch, StoreError>
+    where
+        R: RangeBounds<&'range [u8]>,
+    {
         let declared_lower = match range.start_bound() {
             Bound::Included(key) => Some((*key, true)),
             Bound::Excluded(key) => Some((*key, false)),
@@ -324,6 +350,7 @@ impl ReadDataAccess<'_> {
             lower.as_ref(),
             upper.as_ref(),
             limit,
+            key_suffix_prefix,
         )
     }
 }
@@ -349,6 +376,7 @@ fn scan_data<D: DBAccess>(
     lower: Option<&EncodedBound<'_>>,
     upper: Option<&EncodedBound<'_>>,
     limit: ScanLimit,
+    key_suffix_prefix: &[u8],
 ) -> Result<ScanBatch, StoreError> {
     let mut read_options = ReadOptions::default();
     read_options.set_iterate_lower_bound(prefix.to_vec());
@@ -424,7 +452,10 @@ fn scan_data<D: DBAccess>(
             });
         }
         bytes = next_bytes.expect("bounded sum was checked above");
-        items.push((key.to_vec(), value.to_vec()));
+        let suffix = key
+            .strip_prefix(key_suffix_prefix)
+            .expect("the encoded scan range admits only this key prefix");
+        items.push((suffix.to_vec(), value.to_vec()));
         match direction {
             ScanDirection::Ascending => iterator.next(),
             ScanDirection::Descending => iterator.prev(),

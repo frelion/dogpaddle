@@ -1,16 +1,9 @@
-use arrow_array::{
-    Array, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-};
-use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, SchemaRef};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mysql::Value;
 
-use super::{
-    error::DorisSinkError,
-    schema::{DorisLayout, StorageType},
-};
+use super::{error::DorisSinkError, schema::DorisLayout};
 use crate::operation::sink::relation::{RowError, encode_canonical, row_hash};
 
 #[derive(Debug)]
@@ -47,13 +40,7 @@ impl DorisRowCodec {
         }
         let mut canonical = Vec::new();
         let mut values = Vec::with_capacity(self.schema().fields().len());
-        for ((field, array), column) in self
-            .schema()
-            .fields()
-            .iter()
-            .zip(batch.columns())
-            .zip(self.layout.columns())
-        {
+        for (field, array) in self.schema().fields().iter().zip(batch.columns()) {
             let start = canonical.len();
             encode_canonical(
                 field,
@@ -62,13 +49,7 @@ impl DorisRowCodec {
                 field.name(),
                 &mut canonical,
             )?;
-            values.push(doris_value(
-                field,
-                array.as_ref(),
-                row_index,
-                column.storage(),
-                &canonical[start..],
-            )?);
+            values.push(doris_value(field.data_type(), &canonical[start..]));
         }
         Ok(EncodedRow {
             hash: hex(&row_hash(&canonical)),
@@ -83,59 +64,30 @@ pub(super) struct EncodedRow {
     pub(super) values: Vec<Value>,
 }
 
-fn doris_value(
-    field: &Field,
-    array: &dyn Array,
-    index: usize,
-    storage: StorageType,
-    canonical: &[u8],
-) -> Result<Value, RowError> {
-    if matches!(storage, StorageType::Null) || array.is_null(index) {
-        return Ok(Value::NULL);
+fn doris_value(data_type: &DataType, canonical: &[u8]) -> Value {
+    // encode_canonical already checked the field's Arrow type, physical array,
+    // index and nullability before producing this complete field slice.
+    if canonical[0] == 0 {
+        return Value::NULL;
     }
-    Ok(match field.data_type() {
-        DataType::Null => unreachable!("handled by null branch"),
-        DataType::Boolean => Value::Int(i64::from(
-            downcast::<BooleanArray>(array, field)?.value(index),
-        )),
-        DataType::Int8 => Value::Int(i64::from(downcast::<Int8Array>(array, field)?.value(index))),
-        DataType::Int16 => Value::Int(i64::from(
-            downcast::<Int16Array>(array, field)?.value(index),
-        )),
-        DataType::Int32 => Value::Int(i64::from(
-            downcast::<Int32Array>(array, field)?.value(index),
-        )),
-        DataType::Int64 => Value::Int(downcast::<Int64Array>(array, field)?.value(index)),
-        DataType::UInt8 => Value::UInt(u64::from(
-            downcast::<UInt8Array>(array, field)?.value(index),
-        )),
-        DataType::UInt16 => Value::UInt(u64::from(
-            downcast::<UInt16Array>(array, field)?.value(index),
-        )),
-        DataType::UInt32 => Value::UInt(u64::from(
-            downcast::<UInt32Array>(array, field)?.value(index),
-        )),
-        DataType::Date32 => Value::Int(i64::from(
-            downcast::<Date32Array>(array, field)?.value(index),
-        )),
-        DataType::Timestamp(unit, _) => Value::Int(match unit {
-            TimeUnit::Second => downcast::<TimestampSecondArray>(array, field)?.value(index),
-            TimeUnit::Millisecond => {
-                downcast::<TimestampMillisecondArray>(array, field)?.value(index)
-            }
-            TimeUnit::Microsecond => {
-                downcast::<TimestampMicrosecondArray>(array, field)?.value(index)
-            }
-            TimeUnit::Nanosecond => {
-                downcast::<TimestampNanosecondArray>(array, field)?.value(index)
-            }
-        }),
-        DataType::Utf8 => Value::Bytes(
-            downcast::<StringArray>(array, field)?
-                .value(index)
-                .as_bytes()
-                .to_vec(),
-        ),
+    let bytes = &canonical[1..];
+    macro_rules! integer {
+        ($kind:ty, $value:ident) => {
+            Value::$value(
+                <$kind>::from_be_bytes(bytes.try_into().expect("validated canonical width")).into(),
+            )
+        };
+    }
+    match data_type {
+        DataType::Boolean => Value::Int(i64::from(bytes[0])),
+        DataType::Int8 => integer!(i8, Int),
+        DataType::Int16 => integer!(i16, Int),
+        DataType::Int32 | DataType::Date32 => integer!(i32, Int),
+        DataType::Int64 | DataType::Timestamp(_, _) => integer!(i64, Int),
+        DataType::UInt8 => integer!(u8, UInt),
+        DataType::UInt16 => integer!(u16, UInt),
+        DataType::UInt32 => integer!(u32, UInt),
+        DataType::Utf8 => Value::Bytes(bytes[8..].to_vec()),
         DataType::UInt64
         | DataType::Float32
         | DataType::Float64
@@ -143,28 +95,8 @@ fn doris_value(
         | DataType::Binary
         | DataType::List(_)
         | DataType::Struct(_) => Value::Bytes(STANDARD.encode(canonical).into_bytes()),
-        unsupported => {
-            return Err(RowError::ArrayTypeMismatch {
-                field: field.name().clone(),
-                expected: unsupported.clone(),
-                actual: array.data_type().clone(),
-            });
-        }
-    })
-}
-
-fn downcast<'a, T: Array + 'static>(
-    array: &'a dyn Array,
-    field: &Field,
-) -> Result<&'a T, RowError> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| RowError::ArrayTypeMismatch {
-            field: field.name().clone(),
-            expected: field.data_type().clone(),
-            actual: array.data_type().clone(),
-        })
+        _ => unreachable!("binding and canonical encoding accept only supported DogPaddle types"),
+    }
 }
 
 fn hex(bytes: &[u8]) -> Vec<u8> {

@@ -1,9 +1,5 @@
-use arrow_array::{
-    Array, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, SchemaRef};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Number, Value};
 
@@ -63,12 +59,10 @@ impl ClickHouseRowCodec {
                 &mut canonical,
             )?;
             values.push(clickhouse_value(
-                field,
-                array.as_ref(),
-                row_index,
+                field.data_type(),
                 column,
                 &canonical[start..],
-            )?);
+            ));
         }
         Ok(EncodedRow {
             hash: hex(&row_hash(&canonical)),
@@ -83,92 +77,35 @@ pub(super) struct EncodedRow {
     pub(super) values: Vec<Value>,
 }
 
-fn clickhouse_value(
-    field: &Field,
-    array: &dyn Array,
-    index: usize,
-    column: &ColumnLayout,
-    canonical: &[u8],
-) -> Result<Value, RowError> {
-    if column.always_null() || array.is_null(index) {
-        return Ok(Value::Null);
+fn clickhouse_value(data_type: &DataType, column: &ColumnLayout, canonical: &[u8]) -> Value {
+    if canonical[0] == 0 {
+        return Value::Null;
     }
     if column.encoded() {
-        return Ok(Value::String(STANDARD.encode(canonical)));
+        return Value::String(STANDARD.encode(canonical));
     }
-    Ok(match field.data_type() {
-        DataType::Null => unreachable!("handled by null branch"),
-        DataType::Boolean => Value::Number(Number::from(u8::from(
-            downcast::<BooleanArray>(array, field)?.value(index),
-        ))),
-        DataType::Int8 => Value::Number(Number::from(
-            downcast::<Int8Array>(array, field)?.value(index),
-        )),
-        DataType::Int16 => Value::Number(Number::from(
-            downcast::<Int16Array>(array, field)?.value(index),
-        )),
-        DataType::Int32 => Value::Number(Number::from(
-            downcast::<Int32Array>(array, field)?.value(index),
-        )),
-        DataType::Int64 => Value::Number(Number::from(
-            downcast::<Int64Array>(array, field)?.value(index),
-        )),
-        DataType::UInt8 => Value::Number(Number::from(
-            downcast::<UInt8Array>(array, field)?.value(index),
-        )),
-        DataType::UInt16 => Value::Number(Number::from(
-            downcast::<UInt16Array>(array, field)?.value(index),
-        )),
-        DataType::UInt32 => Value::Number(Number::from(
-            downcast::<UInt32Array>(array, field)?.value(index),
-        )),
-        DataType::UInt64 => Value::Number(Number::from(
-            downcast::<UInt64Array>(array, field)?.value(index),
-        )),
-        DataType::Date32 => Value::Number(Number::from(
-            downcast::<Date32Array>(array, field)?.value(index),
-        )),
-        DataType::Timestamp(unit, _) => Value::Number(Number::from(match unit {
-            TimeUnit::Second => downcast::<TimestampSecondArray>(array, field)?.value(index),
-            TimeUnit::Millisecond => {
-                downcast::<TimestampMillisecondArray>(array, field)?.value(index)
-            }
-            TimeUnit::Microsecond => {
-                downcast::<TimestampMicrosecondArray>(array, field)?.value(index)
-            }
-            TimeUnit::Nanosecond => {
-                downcast::<TimestampNanosecondArray>(array, field)?.value(index)
-            }
-        })),
-        DataType::Utf8
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Decimal128(_, _)
-        | DataType::Binary
-        | DataType::List(_)
-        | DataType::Struct(_) => unreachable!("encoded columns returned above"),
-        unsupported => {
-            return Err(RowError::ArrayTypeMismatch {
-                field: field.name().clone(),
-                expected: unsupported.clone(),
-                actual: array.data_type().clone(),
-            });
-        }
-    })
-}
-
-fn downcast<'a, T: Array + 'static>(
-    array: &'a dyn Array,
-    field: &Field,
-) -> Result<&'a T, RowError> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| RowError::ArrayTypeMismatch {
-            field: field.name().clone(),
-            expected: field.data_type().clone(),
-            actual: array.data_type().clone(),
-        })
+    // encode_canonical already checked the Arrow type and nullability. Fixed-width
+    // values follow the non-null marker in big-endian order; encoded columns keep
+    // the entire canonical value (including its marker) for exact row comparison.
+    let bytes = &canonical[1..];
+    macro_rules! number {
+        ($kind:ty) => {
+            Value::Number(Number::from(<$kind>::from_be_bytes(
+                bytes.try_into().expect("validated canonical width"),
+            )))
+        };
+    }
+    match data_type {
+        DataType::Boolean | DataType::UInt8 => number!(u8),
+        DataType::Int8 => number!(i8),
+        DataType::Int16 => number!(i16),
+        DataType::Int32 | DataType::Date32 => number!(i32),
+        DataType::Int64 | DataType::Timestamp(_, _) => number!(i64),
+        DataType::UInt16 => number!(u16),
+        DataType::UInt32 => number!(u32),
+        DataType::UInt64 => number!(u64),
+        _ => unreachable!("binding and canonical encoding accept only supported DogPaddle types"),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

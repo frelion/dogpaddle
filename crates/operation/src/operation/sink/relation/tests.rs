@@ -128,6 +128,76 @@ fn insert_delete_same_id_replays_empty_and_never_reuses_an_id() {
 }
 
 #[test]
+fn insert_only_batch_reserves_ids_in_event_order_without_target_lookup() {
+    let input = delivery(&[(7, 2), (8, 1), (7, 3)], &[2, 1, 3]);
+    let mut target = Target::default();
+    let (checkpoint, batch) = plan::prepare(&mut target, &input, 1).unwrap();
+    assert_eq!(checkpoint, 7);
+    assert!(target.lookups.is_empty());
+    assert!(batch.deletes.is_empty());
+    assert_eq!(
+        batch
+            .inserts
+            .iter()
+            .map(|insert| (insert.row_index, insert.technical_id))
+            .collect::<Vec<_>>(),
+        [(0, 1), (0, 2), (1, 3), (2, 4), (2, 5), (2, 6)]
+    );
+    plan::validate(&batch, checkpoint, input.change()).unwrap();
+    let mut encoded = Vec::new();
+    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
+    let mut cursor = encoded.as_slice();
+    let recovered =
+        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap();
+    assert!(cursor.is_empty());
+    assert_eq!(recovered, batch);
+    target.write_batch(input.change(), &batch).unwrap();
+    assert_eq!(target.rows.len(), 6);
+}
+
+#[test]
+fn recovered_delete_only_plan_retains_full_canonical_budget_without_new_row_comparisons() {
+    let mut target = Target::default();
+    let mut next_id = 1;
+    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
+    let input = delivery(&[(7, -1)], &[1]);
+    let (checkpoint, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
+    assert!(batch.inserts.is_empty());
+    assert_eq!(batch.deletes[0].technical_id, 1);
+    plan::validate(&batch, checkpoint, input.change()).unwrap();
+    let mut encoded = Vec::new();
+    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
+    let mut cursor = encoded.as_slice();
+    assert_eq!(
+        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap(),
+        batch
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn recovered_mixed_plan_deleting_only_existing_ids_keeps_identity_checks_on_target() {
+    let mut target = Target::default();
+    let mut next_id = 1;
+    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
+    let input = delivery(&[(8, 1), (7, -1)], &[1, 1]);
+    let (checkpoint, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
+    assert_eq!(batch.inserts[0].technical_id, next_id);
+    assert_eq!(batch.deletes[0].technical_id, 1);
+    plan::validate(&batch, checkpoint, input.change()).unwrap();
+    let mut encoded = Vec::new();
+    RelationSinkTarget::<Target>::encode_plan(&batch, &mut encoded);
+    let mut cursor = encoded.as_slice();
+    assert_eq!(
+        RelationSinkTarget::<Target>::decode_plan(&mut cursor, &input, &checkpoint).unwrap(),
+        batch
+    );
+    assert!(cursor.is_empty());
+    target.write_batch(input.change(), &batch).unwrap();
+    assert_eq!(target.rows.len(), 1);
+}
+
+#[test]
 fn retractions_use_oldest_existing_then_newly_inserted_ids() {
     let mut target = Target::default();
     let mut next_id = 1;
@@ -389,6 +459,72 @@ fn recovered_plan_compares_each_large_row_pair_once() {
     };
 
     plan::validate(&batch, 513, &input).unwrap();
+}
+
+#[test]
+fn recovered_deletes_of_existing_ids_still_check_the_full_canonical_budget() {
+    let payload = vec![7_u8; 4 * 1024 * 1024];
+    let input = Change::try_new(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                false,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![
+                Some(payload.as_slice()),
+                Some(payload.as_slice()),
+            ]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![-1, -1]),
+    )
+    .unwrap();
+    let batch = Batch {
+        inserts: Vec::new(),
+        deletes: vec![
+            Delete {
+                row_index: 0,
+                technical_id: 1,
+            },
+            Delete {
+                row_index: 1,
+                technical_id: 2,
+            },
+        ],
+    };
+    assert!(plan::validate(&batch, 3, &input).is_err());
+}
+
+#[test]
+fn insert_only_rows_still_share_the_full_canonical_batch_budget() {
+    let payload = vec![7_u8; 4 * 1024 * 1024];
+    let input = Change::try_new(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                false,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![
+                Some(payload.as_slice()),
+                Some(payload.as_slice()),
+            ]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1, 1]),
+    )
+    .unwrap();
+    let mut target = Target::default();
+    assert!(
+        plan::prepare(
+            &mut target,
+            &DeliveryBatch::for_test(input, vec![1, 1]).unwrap(),
+            1
+        )
+        .is_err()
+    );
+    assert!(target.lookups.is_empty());
 }
 
 #[test]

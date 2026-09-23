@@ -129,7 +129,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - `SubscribedLog` 允许多个 consumer 分别读取。每个 subscription 保存自己的下一条位置，最慢的 consumer
   决定数据何时可以回收。
 
-`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。
+`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front` 只读 front 的编码长度以精确扣减计费，不复制或解码完整 value；和 `pop_front` 共用删除、最后一项清理与损坏检查，仍由调用方事务统一提交或回滚。
 `SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 `RocksDB` 自身开销。
 
 `SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
@@ -202,7 +202,7 @@ let next = page.continuation;
 Store 在返回前完成准入、复制和完整解码；错误不会交付半页。第一项单独超过 byte limit 时返回
 `StoreError::ItemTooLarge`，调用方可以在同一事务中提高 limit 后重试。其他 codec 或存储错误会使事务中毒。
 
-分区扫描只省略 range，仍保留 direction、排他 `resume_after` 和同一 `ScanLimit`。页面不提供 visitor 或 encoded-entry projection；业务层自行遍历并处置业务错误。私有扫描先检查范围和准入再复制 payload，存在性与长度检查不得构造完整 owned value。
+分区扫描只省略 range，仍保留 direction、排他 `resume_after` 和同一 `ScanLimit`。页面不提供 visitor 或 encoded-entry projection；业务层自行遍历并处置业务错误。私有扫描先检查范围和准入再复制 payload；分区项按完整 framing + 行 key + multiplicity 计入字节预算，但准入后只复制行 key 后缀供 owned 解码。存在性与长度检查不得构造完整 owned value。
 
 ## 提交、错误与恢复
 

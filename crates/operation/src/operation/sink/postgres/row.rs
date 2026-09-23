@@ -1,10 +1,5 @@
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, SchemaRef};
 use postgres::types::ToSql;
 
 use super::{
@@ -62,13 +57,7 @@ impl PostgresRowCodec {
                 field.name(),
                 &mut canonical,
             )?;
-            values.push(postgres_value(
-                field,
-                array.as_ref(),
-                row_index,
-                column.storage(),
-                &canonical[start..],
-            )?);
+            values.push(postgres_value(field, column.storage(), &canonical[start..]));
         }
 
         Ok(EncodedRow {
@@ -107,109 +96,35 @@ impl PostgresValue {
     }
 }
 
-fn postgres_value(
-    field: &Field,
-    array: &dyn Array,
-    index: usize,
-    storage: StorageType,
-    canonical: &[u8],
-) -> Result<PostgresValue, RowError> {
-    if matches!(field.data_type(), DataType::Null) || array.is_null(index) {
-        return Ok(null_value(storage));
+fn postgres_value(field: &Field, storage: StorageType, canonical: &[u8]) -> PostgresValue {
+    // encode_canonical validated the marker, width, and array type before this conversion.
+    if canonical[0] == 0 {
+        return null_value(storage);
     }
-    Ok(match field.data_type() {
-        DataType::Null => unreachable!("handled by the null branch"),
-        DataType::Boolean => PostgresValue::Boolean(Some(
-            downcast::<BooleanArray>(array, field.name(), field.data_type())?.value(index),
-        )),
-        DataType::Int8 => PostgresValue::Int16(Some(i16::from(
-            downcast::<Int8Array>(array, field.name(), field.data_type())?.value(index),
-        ))),
-        DataType::Int16 => PostgresValue::Int16(Some(
-            downcast::<Int16Array>(array, field.name(), field.data_type())?.value(index),
-        )),
-        DataType::Int32 => PostgresValue::Int32(Some(
-            downcast::<Int32Array>(array, field.name(), field.data_type())?.value(index),
-        )),
-        DataType::Int64 => PostgresValue::Int64(Some(
-            downcast::<Int64Array>(array, field.name(), field.data_type())?.value(index),
-        )),
-        DataType::UInt8 => PostgresValue::Int16(Some(i16::from(
-            downcast::<UInt8Array>(array, field.name(), field.data_type())?.value(index),
-        ))),
-        DataType::UInt16 => PostgresValue::Int32(Some(i32::from(
-            downcast::<UInt16Array>(array, field.name(), field.data_type())?.value(index),
-        ))),
-        DataType::UInt32 => PostgresValue::Int64(Some(i64::from(
-            downcast::<UInt32Array>(array, field.name(), field.data_type())?.value(index),
-        ))),
-        DataType::UInt64 => PostgresValue::Bytes(Some(
-            downcast::<UInt64Array>(array, field.name(), field.data_type())?
-                .value(index)
-                .to_be_bytes()
-                .to_vec(),
-        )),
-        DataType::Float32 => PostgresValue::Bytes(Some(
-            downcast::<Float32Array>(array, field.name(), field.data_type())?
-                .value(index)
-                .to_bits()
-                .to_be_bytes()
-                .to_vec(),
-        )),
-        DataType::Float64 => PostgresValue::Bytes(Some(
-            downcast::<Float64Array>(array, field.name(), field.data_type())?
-                .value(index)
-                .to_bits()
-                .to_be_bytes()
-                .to_vec(),
-        )),
-        DataType::Date32 => PostgresValue::Int32(Some(
-            downcast::<Date32Array>(array, field.name(), field.data_type())?.value(index),
-        )),
-        DataType::Timestamp(unit, _) => PostgresValue::Int64(Some(match unit {
-            TimeUnit::Second => {
-                downcast::<TimestampSecondArray>(array, field.name(), field.data_type())?
-                    .value(index)
-            }
-            TimeUnit::Millisecond => {
-                downcast::<TimestampMillisecondArray>(array, field.name(), field.data_type())?
-                    .value(index)
-            }
-            TimeUnit::Microsecond => {
-                downcast::<TimestampMicrosecondArray>(array, field.name(), field.data_type())?
-                    .value(index)
-            }
-            TimeUnit::Nanosecond => {
-                downcast::<TimestampNanosecondArray>(array, field.name(), field.data_type())?
-                    .value(index)
-            }
-        })),
-        DataType::Decimal128(_, _) => PostgresValue::Bytes(Some(
-            downcast::<Decimal128Array>(array, field.name(), field.data_type())?
-                .value(index)
-                .to_be_bytes()
-                .to_vec(),
-        )),
-        DataType::Utf8 => PostgresValue::Bytes(Some(
-            downcast::<StringArray>(array, field.name(), field.data_type())?
-                .value(index)
-                .as_bytes()
-                .to_vec(),
-        )),
-        DataType::Binary => PostgresValue::Bytes(Some(
-            downcast::<BinaryArray>(array, field.name(), field.data_type())?
-                .value(index)
-                .to_vec(),
-        )),
-        DataType::List(_) | DataType::Struct(_) => PostgresValue::Bytes(Some(canonical.to_vec())),
-        unsupported => {
-            return Err(RowError::ArrayTypeMismatch {
-                field: field.name().clone(),
-                expected: unsupported.clone(),
-                actual: array.data_type().clone(),
-            });
+    let bytes = &canonical[1..];
+    macro_rules! integer {
+        ($source:ty, $target:ty, $variant:ident) => {
+            PostgresValue::$variant(Some(<$target>::from(<$source>::from_be_bytes(
+                bytes.try_into().expect("validated canonical width"),
+            ))))
+        };
+    }
+    match field.data_type() {
+        DataType::Boolean => PostgresValue::Boolean(Some(bytes[0] == 1)),
+        DataType::Int8 => integer!(i8, i16, Int16),
+        DataType::Int16 => integer!(i16, i16, Int16),
+        DataType::Int32 | DataType::Date32 => integer!(i32, i32, Int32),
+        DataType::Int64 | DataType::Timestamp(_, _) => integer!(i64, i64, Int64),
+        DataType::UInt8 => integer!(u8, i16, Int16),
+        DataType::UInt16 => integer!(u16, i32, Int32),
+        DataType::UInt32 => integer!(u32, i64, Int64),
+        DataType::UInt64 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => {
+            PostgresValue::Bytes(Some(bytes.to_vec()))
         }
-    })
+        DataType::Utf8 | DataType::Binary => PostgresValue::Bytes(Some(bytes[8..].to_vec())),
+        DataType::List(_) | DataType::Struct(_) => PostgresValue::Bytes(Some(canonical.to_vec())),
+        _ => unreachable!("layout and canonical encoding accept only supported DogPaddle types"),
+    }
 }
 
 const fn null_value(storage: StorageType) -> PostgresValue {
@@ -220,21 +135,6 @@ const fn null_value(storage: StorageType) -> PostgresValue {
         StorageType::Int64 => PostgresValue::Int64(None),
         StorageType::Bytes(_) => PostgresValue::Bytes(None),
     }
-}
-
-fn downcast<'a, T: Array + 'static>(
-    array: &'a dyn Array,
-    path: &str,
-    expected: &DataType,
-) -> Result<&'a T, RowError> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| RowError::ArrayTypeMismatch {
-            field: path.to_owned(),
-            expected: expected.clone(),
-            actual: array.data_type().clone(),
-        })
 }
 
 impl From<RowError> for PostgresSinkError {

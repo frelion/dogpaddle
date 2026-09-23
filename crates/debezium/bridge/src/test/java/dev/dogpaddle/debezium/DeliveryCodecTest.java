@@ -6,9 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.ByteBuffer;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.CRC32;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.Test;
@@ -41,6 +43,31 @@ class DeliveryCodecTest {
                     checkpointBytes, List.of(first, second), 64 * 1024);
         }
         assertArrayEquals(GOLDEN, encoded);
+    }
+
+    @Test
+    void delivery_checksum_covers_the_body_at_the_exact_size_limit_after_buffer_growth() {
+        byte[] checkpoint = CheckpointCodec.encode(
+                new Checkpoint("engine-a", "example.Connector", Map.of()));
+        SourceRecord record = record("x".repeat(8192), 1, 10L);
+
+        try (DeliveryCodec codec = new DeliveryCodec()) {
+            byte[] encoded = codec.encode(checkpoint, List.of(record), 64 * 1024);
+            assertTrue(encoded.length > 8192);
+
+            CRC32 checksum = new CRC32();
+            checksum.update(encoded, 0, encoded.length - Integer.BYTES);
+            long actual = Integer.toUnsignedLong(
+                    ByteBuffer.wrap(encoded, encoded.length - Integer.BYTES, Integer.BYTES)
+                            .getInt());
+            assertEquals(checksum.getValue(), actual);
+            assertArrayEquals(encoded, codec.encode(checkpoint, List.of(record), encoded.length));
+
+            IllegalStateException error = assertThrows(
+                    IllegalStateException.class,
+                    () -> codec.encode(checkpoint, List.of(record), encoded.length - 1));
+            assertTrue(DeliveryCodec.isTooLarge(error));
+        }
     }
 
     @Test

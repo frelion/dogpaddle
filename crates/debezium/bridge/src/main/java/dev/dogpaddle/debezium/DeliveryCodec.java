@@ -56,10 +56,7 @@ final class DeliveryCodec implements AutoCloseable {
             if (bytes.size() > maximumBytes - CHECKSUM_BYTES) {
                 throw tooLarge(maximumBytes);
             }
-            byte[] body = bytes.toByteArray();
-            CRC32 checksum = new CRC32();
-            checksum.update(body);
-            output.writeInt((int) checksum.getValue());
+            output.writeInt(bytes.crc32());
             output.flush();
             return bytes.toByteArray();
         }
@@ -186,6 +183,12 @@ final class DeliveryCodec implements AutoCloseable {
         BoundedBytes(int maximumBytes) {
             super(Math.min(maximumBytes, 8192));
             this.maximumBytes = maximumBytes;
+        }
+
+        private int crc32() {
+            CRC32 checksum = new CRC32();
+            checksum.update(buf, 0, count);
+            return (int) checksum.getValue();
         }
 
         @Override

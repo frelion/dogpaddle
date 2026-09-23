@@ -325,6 +325,81 @@ fn partitioned_multiset_byte_limit_can_be_retried() {
 }
 
 #[test]
+fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let multiset = store
+        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let partition_key = vec![0x11; 256];
+    let adjacent_partition = vec![0x12; 256];
+    let keys = [vec![0x31; 8 * 1024], vec![0x32; 8 * 1024]];
+    let item_bytes = 8 + partition_key.len() + keys[0].len() + 8;
+
+    {
+        let transaction = transactions.begin();
+        let mut values = multiset.access(transaction.access()).unwrap();
+        let mut partition = values.partition(&partition_key).unwrap();
+        partition.adjust(&keys[0], 2).unwrap();
+        partition.adjust(&keys[1], 3).unwrap();
+        values
+            .partition(&adjacent_partition)
+            .unwrap()
+            .adjust(&vec![0xff; 9 * 1024], 4)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let (_, reads) = transactions.split();
+    let snapshot = reads.begin();
+    let values = multiset.read(snapshot.access()).unwrap();
+    let partition = values.partition(&partition_key).unwrap();
+    assert!(matches!(
+        partition.scan(
+            ScanDirection::Ascending,
+            None,
+            ScanLimit::new(2, item_bytes - 1).unwrap(),
+        ),
+        Err(StoreError::ItemTooLarge { size, limit })
+            if size == item_bytes && limit == item_bytes - 1
+    ));
+    for direction in [ScanDirection::Ascending, ScanDirection::Descending] {
+        let (first, second) = if direction == ScanDirection::Ascending {
+            (0, 1)
+        } else {
+            (1, 0)
+        };
+        let page = partition
+            .scan(direction, None, ScanLimit::new(2, item_bytes).unwrap())
+            .unwrap();
+        assert_eq!(
+            page.entries,
+            vec![MultisetEntry {
+                key: keys[first].clone(),
+                multiplicity: first as u64 + 2,
+            }]
+        );
+        assert_eq!(page.continuation, Some(keys[first].clone()));
+        let page = partition
+            .scan(
+                direction,
+                page.continuation.as_ref(),
+                ScanLimit::new(2, item_bytes).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            page.entries,
+            vec![MultisetEntry {
+                key: keys[second].clone(),
+                multiplicity: second as u64 + 2,
+            }]
+        );
+        assert_eq!(page.continuation, None);
+    }
+}
+
+#[test]
 fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);

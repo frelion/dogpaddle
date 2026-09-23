@@ -72,29 +72,27 @@ pub(super) struct ColumnLayout {
     name: String,
     storage: StorageType,
     nullable: bool,
-    always_null: bool,
-    encoded: bool,
 }
 
 impl ColumnLayout {
     fn try_new(field: &Field) -> Result<Self, ClickHouseSinkSchemaError> {
-        let (storage, encoded) = match field.data_type() {
-            DataType::Boolean | DataType::UInt8 => (StorageType::UInt8, false),
-            DataType::Int8 => (StorageType::Int8, false),
-            DataType::Int16 => (StorageType::Int16, false),
-            DataType::Int32 | DataType::Date32 => (StorageType::Int32, false),
-            DataType::Int64 | DataType::Timestamp(_, _) => (StorageType::Int64, false),
-            DataType::UInt16 => (StorageType::UInt16, false),
-            DataType::UInt32 => (StorageType::UInt32, false),
-            DataType::UInt64 => (StorageType::UInt64, false),
-            DataType::Null => (StorageType::String, false),
-            DataType::Utf8
+        let storage = match field.data_type() {
+            DataType::Boolean | DataType::UInt8 => StorageType::UInt8,
+            DataType::Int8 => StorageType::Int8,
+            DataType::Int16 => StorageType::Int16,
+            DataType::Int32 | DataType::Date32 => StorageType::Int32,
+            DataType::Int64 | DataType::Timestamp(_, _) => StorageType::Int64,
+            DataType::UInt16 => StorageType::UInt16,
+            DataType::UInt32 => StorageType::UInt32,
+            DataType::UInt64 => StorageType::UInt64,
+            DataType::Null
+            | DataType::Utf8
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
             | DataType::Binary
             | DataType::List(_)
-            | DataType::Struct(_) => (StorageType::String, true),
+            | DataType::Struct(_) => StorageType::String,
             unsupported => {
                 return Err(ClickHouseSinkSchemaError::UnsupportedType {
                     field: field.name().clone(),
@@ -106,8 +104,6 @@ impl ColumnLayout {
             name: field.name().clone(),
             storage,
             nullable: field.is_nullable() || matches!(field.data_type(), DataType::Null),
-            always_null: matches!(field.data_type(), DataType::Null),
-            encoded,
         })
     }
 
@@ -115,12 +111,8 @@ impl ColumnLayout {
         &self.name
     }
 
-    pub(super) const fn always_null(&self) -> bool {
-        self.always_null
-    }
-
     pub(super) const fn encoded(&self) -> bool {
-        self.encoded
+        matches!(self.storage, StorageType::String)
     }
 
     pub(super) fn sql_type(&self) -> String {

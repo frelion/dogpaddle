@@ -449,7 +449,7 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
 workload 的 Flow、Store 或 Change + Store target 负责。
 
-`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的逐条清理。
+`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的逐条清理，另有单条宽 IPC 的 reset 对照用于观察丢弃路径。
 计时包含恢复、每条 spool entry 的小事务提交和 AfterCommit，校验输出顺序、完整 Change 与最终持久状态；不启动 Java 或外部数据库，不能用于推断捕获、网络 ACK 或端到端 CDC 吞吐。
 
 `asof_join` Criterion 把两个使关系回到原状的完整 Claim 作为计时单位，覆盖多小 partition、

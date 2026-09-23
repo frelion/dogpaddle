@@ -249,32 +249,25 @@ pub(super) fn scan_entries<K: StoreKey>(
             })
             .transpose(),
     )?;
-    let raw = data.scan(
+    let raw = data.scan_key_suffix(
         (Bound::Included(key_prefix), upper_bound),
         direction,
         resume.as_deref(),
         limit,
+        key_prefix,
     )?;
     let continuation = data.poison_on_error(
         raw.items
             .last()
             .filter(|_| raw.limited)
-            .map(|(key, _)| {
-                let key = key
-                    .strip_prefix(key_prefix)
-                    .expect("the encoded scan range admits only this key prefix");
-                K::decode_key(Cow::Borrowed(key))
-            })
+            .map(|(key, _)| K::decode_key(Cow::Borrowed(key)))
             .transpose(),
     )?;
     let entries = data.poison_on_error(
         raw.items
             .into_iter()
             .map(|(key, value)| {
-                let key = key
-                    .strip_prefix(key_prefix)
-                    .expect("the encoded scan range admits only this key prefix");
-                let key = K::decode_key(Cow::Owned(key.to_vec()))?;
+                let key = K::decode_key(Cow::Owned(key))?;
                 let multiplicity = decode_multiplicity(&value)?;
                 Ok(MultisetEntry { key, multiplicity })
             })

@@ -213,7 +213,7 @@ impl<B: Source> CdcRuntime<B> {
     fn reset(&mut self) -> Turn<'_> {
         Turn::ready(move |access| {
             let mut spool = self.spool.access(access)?;
-            let finished = spool.pop_front()?.is_none() || spool.is_empty()?;
+            let finished = !spool.discard_front()? || spool.is_empty()?;
             if finished {
                 self.checkpoint.access(access)?.clear()?;
                 self.phase_cell.access(access)?.clear()?;

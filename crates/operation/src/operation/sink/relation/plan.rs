@@ -4,7 +4,8 @@ use dogpaddle_change::Change;
 
 use super::{
     Batch, Delete, EXHAUSTED_ID, Insert, Lookup, MAX_MUTATIONS_PER_BATCH, MAX_TECHNICAL_ID,
-    Matches, RelationTarget, canonical_row_bounded, invalid, validate_next_id,
+    Matches, RelationTarget, canonical_row_bounded, canonical_row_size_bounded, invalid,
+    validate_next_id,
 };
 use crate::operation::{OperationError, sink::buffered::DeliveryBatch};
 
@@ -42,6 +43,10 @@ pub(super) fn prepare(
         || events > u64::try_from(MAX_MUTATIONS_PER_BATCH).expect("the batch limit fits u64")
     {
         return Err(invalid("relation batch exceeds its mutation limit"));
+    }
+
+    if change.diffs().values().iter().all(|diff| *diff > 0) {
+        return prepare_inserts(change, input, next_id, events);
     }
 
     let mut groups = Vec::<RowPlan>::new();
@@ -130,6 +135,43 @@ pub(super) fn prepare(
     }
     debug_assert_eq!(allocated, next_id_after);
     Ok((next_id_after, batch))
+}
+
+// Pure insert batches never compare row identities during planning or query the target.
+// Check the same aggregate canonical budget before reserving technical IDs.
+fn prepare_inserts(
+    change: &Change,
+    input: &DeliveryBatch,
+    next_id: u64,
+    events: u64,
+) -> Result<(u64, Batch), OperationError> {
+    check_canonical_budget(change)?;
+
+    let mut allocated = next_id;
+    let mut inserts =
+        Vec::with_capacity(usize::try_from(events).expect("the batch mutation limit fits usize"));
+    for row_index in 0..change.num_rows() {
+        let admission = input.admission(row_index);
+        if admission > EXHAUSTED_ID - allocated {
+            return Err(invalid(format!(
+                "technical ID range from {allocated} cannot reserve {admission} inserts"
+            )));
+        }
+        for _ in 0..change.diffs().value(row_index).unsigned_abs() {
+            inserts.push(Insert {
+                row_index: u64::try_from(row_index).expect("an addressable row index fits u64"),
+                technical_id: allocated,
+            });
+            allocated += 1;
+        }
+    }
+    Ok((
+        allocated,
+        Batch {
+            inserts,
+            deletes: Vec::new(),
+        },
+    ))
 }
 
 fn lookup(
@@ -236,7 +278,16 @@ pub(super) fn validate(batch: &Batch, next_id: u64, input: &Change) -> Result<()
         return Err(invalid("invalid prepared technical IDs"));
     }
 
-    let canonical_rows = bounded_canonical_rows(input)?;
+    let compares_new_rows = batch
+        .deletes
+        .iter()
+        .any(|delete| delete.technical_id >= first_id);
+    let canonical_rows = if compares_new_rows {
+        Some(bounded_canonical_rows(input)?)
+    } else {
+        check_canonical_budget(input)?;
+        None
+    };
     let mut inserts = batch.inserts.iter().rev();
     let mut deletions = batch.deletes.iter().rev();
     for row in (0..input.num_rows()).rev() {
@@ -267,6 +318,9 @@ pub(super) fn validate(batch: &Batch, next_id: u64, input: &Change) -> Result<()
                             "deletion cannot consume a later or different insert",
                         ));
                     }
+                    let canonical_rows = canonical_rows
+                        .as_ref()
+                        .expect("plans containing deletions retain canonical rows");
                     if canonical_rows[source] != canonical_rows[row] {
                         return Err(invalid(
                             "deletion cannot consume a later or different insert",
@@ -278,6 +332,14 @@ pub(super) fn validate(batch: &Batch, next_id: u64, input: &Change) -> Result<()
     }
     if inserts.next().is_some() || deletions.next().is_some() {
         return Err(invalid("prepared mutations do not match the input"));
+    }
+    Ok(())
+}
+
+fn check_canonical_budget(input: &Change) -> Result<(), OperationError> {
+    let mut remaining = MAX_CANONICAL_BATCH_BYTES;
+    for row in 0..input.num_rows() {
+        remaining -= canonical_row_size_bounded(input.records(), row, remaining)?;
     }
     Ok(())
 }

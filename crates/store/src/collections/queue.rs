@@ -130,7 +130,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         let encoded = self
             .data
             .poison_on_error(value.encode_value().map_err(StoreError::from))?;
-        let item_bytes = match encoded_item_bytes(encoded.as_ref()) {
+        let item_bytes = match encoded_item_bytes(encoded.as_ref().len()) {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error),
         };
@@ -180,19 +180,29 @@ impl<T: StoreValue> QueueAccess<'_, T> {
                 reason: "the front entry is missing",
             });
         };
-        let item_bytes = match encoded_item_bytes(encoded.as_ref()) {
+        let item_bytes = match encoded_item_bytes(encoded.len()) {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error),
         };
         let value = self
             .data
             .poison_on_error(T::decode_value(Cow::Owned(encoded)).map_err(StoreError::from))?;
+        self.remove_front(metadata, &key, item_bytes)?;
+        Ok(Some(value))
+    }
+
+    fn remove_front(
+        &mut self,
+        metadata: Metadata,
+        key: &[u8],
+        item_bytes: u64,
+    ) -> Result<(), StoreError> {
         let Some(queued_bytes) = metadata.queued_bytes.checked_sub(item_bytes) else {
             return self.fail(StoreError::CorruptQueue {
                 reason: "queued-byte metadata is smaller than the front entry",
             });
         };
-        self.data.erase(&key)?;
+        self.data.erase(key)?;
 
         let head = metadata.head + 1;
         if head == metadata.tail {
@@ -219,7 +229,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
                 queued_bytes,
             })?;
         }
-        Ok(Some(value))
+        Ok(())
     }
 
     fn read_metadata(&self) -> Result<Metadata, StoreError> {
@@ -240,6 +250,37 @@ impl<T: StoreValue> QueueAccess<'_, T> {
     }
 }
 
+impl QueueAccess<'_, Vec<u8>> {
+    /// Removes the front byte value without copying or decoding its payload.
+    ///
+    /// Returns `false` if the queue is empty. Logical byte accounting and
+    /// transaction rollback match [`Self::pop_front`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage fails, byte accounting underflows, or
+    /// persisted queue state is corrupt. Any such error poisons the transaction.
+    pub fn discard_front(&mut self) -> Result<bool, StoreError> {
+        let metadata = self.read_metadata()?;
+        if metadata.is_empty() {
+            return Ok(false);
+        }
+
+        let key = encode_sequence(metadata.head);
+        let Some(length) = self.data.as_read().value_len(&key)? else {
+            return self.fail(StoreError::CorruptQueue {
+                reason: "the front entry is missing",
+            });
+        };
+        let item_bytes = match encoded_item_bytes(length) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail(error),
+        };
+        self.remove_front(metadata, &key, item_bytes)?;
+        Ok(true)
+    }
+}
+
 fn read_metadata(data: &ReadDataAccess<'_>) -> Result<Metadata, StoreError> {
     let Some(encoded) = data.get(METADATA_KEY)? else {
         return if data.is_physically_empty()? {
@@ -256,8 +297,8 @@ fn read_metadata(data: &ReadDataAccess<'_>) -> Result<Metadata, StoreError> {
     data.record_result(metadata)
 }
 
-fn encoded_item_bytes(encoded: &[u8]) -> Result<u64, StoreError> {
-    u64::try_from(encoded.len())
+fn encoded_item_bytes(encoded_len: usize) -> Result<u64, StoreError> {
+    u64::try_from(encoded_len)
         .ok()
         .and_then(|bytes| bytes.checked_add(SEQUENCE_BYTES))
         .ok_or(StoreError::QueueByteCountExhausted)
@@ -335,6 +376,132 @@ mod tests {
     }
 
     #[test]
+    fn discard_rejects_missing_next_entry_and_rolls_back_erase() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+        let safe = store.create_data::<Cell<u64>>("safe").unwrap();
+        let mut transactions = store.into_transactions();
+        let capacity = NonZeroU64::new(100).unwrap();
+
+        let transaction = transactions.begin();
+        let access = transaction.access();
+        assert!(
+            queue
+                .access(access)
+                .unwrap()
+                .try_push(&vec![1; 3], capacity)
+                .unwrap()
+        );
+        assert!(
+            queue
+                .access(access)
+                .unwrap()
+                .try_push(&vec![2; 5], capacity)
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        queue
+            .data
+            .access(transaction.access())
+            .unwrap()
+            .erase(&encode_sequence(1))
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        safe.access(transaction.access()).unwrap().set(&1).unwrap();
+        assert!(matches!(
+            queue.access(transaction.access()).unwrap().discard_front(),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+
+        let transaction = transactions.begin();
+        assert_eq!(
+            safe.access(transaction.access()).unwrap().get().unwrap(),
+            None
+        );
+        assert_eq!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .queued_bytes()
+                .unwrap(),
+            24
+        );
+        assert_eq!(
+            queue
+                .data
+                .access(transaction.access())
+                .unwrap()
+                .as_read()
+                .value_len(&encode_sequence(0))
+                .unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn discard_rejects_last_entry_with_extra_namespace_data() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+        let mut transactions = store.into_transactions();
+
+        let transaction = transactions.begin();
+        assert!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .try_push(&vec![1], NonZeroU64::new(100).unwrap())
+                .unwrap()
+        );
+        queue
+            .data
+            .access(transaction.access())
+            .unwrap()
+            .put(&encode_sequence(9), &[3])
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        assert!(matches!(
+            queue.access(transaction.access()).unwrap().discard_front(),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+
+        let transaction = transactions.begin();
+        assert_eq!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .queued_bytes()
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            queue
+                .data
+                .access(transaction.access())
+                .unwrap()
+                .as_read()
+                .value_len(&encode_sequence(0))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn missing_persisted_entry_poisons_and_rolls_back_other_writes() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::create(root.path().join("store")).unwrap();
@@ -367,6 +534,17 @@ mod tests {
         safe.access(transaction.access()).unwrap().set(&2).unwrap();
         assert!(matches!(
             queue.access(transaction.access()).unwrap().pop_front(),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+
+        let transaction = transactions.begin();
+        safe.access(transaction.access()).unwrap().set(&3).unwrap();
+        assert!(matches!(
+            queue.access(transaction.access()).unwrap().discard_front(),
             Err(StoreError::CorruptQueue { .. })
         ));
         assert!(matches!(

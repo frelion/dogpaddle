@@ -40,7 +40,8 @@ control 状态只有 Initialize、Ready、Prepared；buffer 的每个 value 是�
 完整 encoded delivery 与 target-expanded mutation work 分别受 8 MiB 上限；超限或不能在剩余 technical-ID 区间排空的 input 在 ACK 前失败。
 reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、IPC、精确 Schema、accounting 与 checkpoint 下剩余正事件容量。
 首次启动在事务外拒绝已有目标，再持久化 Initialize；AfterCommit 创建或验证同布局的空目标。
-批次在 Store 写事务外规划，apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
+批次在 Store 写事务外规划；纯正事件批次在保持 canonical 行字节预算和逐行校验的前提下只计算行长度与固定 ID，不为分组构造整行 canonical bytes。混合批次仍按完整行身份分组。apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
+Prepared 恢复对所有行仍校验 canonical 总预算；只有 delete 引用同一 plan 新分配的 ID 时才暂存该批全部 canonical 行字节做身份对比，纯撤回及只删除既存 ID 的批次无需额外行副本。目标适配器分别编码 canonical 行，并直接从本次编码的字段字节投影目标列值，不对同一字段重复读取 Arrow 数组。
 AfterCommit 在一个目标事务中先 insert-on-ID-conflict-do-nothing，再核对所有已存在 mutation ID 仍绑定对应完整逻辑行，最后按 ID delete；下一独立 Store turn 删除完整消费的 buffer entries 并发布 Ready。
 目标已提交而本地未结算时只从原 buffer 重建并依靠 Prepared plan 的固定 technical ID 重投；从不重投已结算批次。
 普通 planning 错误可重试，AfterCommit 错误或提交不确定必须 fail-stop/reopen，全部外部 I/O 不得占用 Store 写事务。

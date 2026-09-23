@@ -6,10 +6,12 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch, StringArray,
-    StructArray, UInt64Array, types::Int64Type,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, ListArray, NullArray, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, types::Int64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::{
     PostgresSinkConfig, PostgresSinkError, PostgresTargetSpec,
@@ -18,7 +20,7 @@ use super::{
     schema::PostgresLayout,
     target::{SqlPlan, quote_identifier},
 };
-use crate::operation::sink::relation::encode_canonical;
+use crate::operation::sink::relation::{RowError, canonical_row, encode_canonical, row_hash};
 
 fn spec(table: &str) -> PostgresTargetSpec {
     PostgresTargetSpec::try_new("sink_1", "database", "Target Schema", table, "1", 2).unwrap()
@@ -165,6 +167,139 @@ fn row_codec_preserves_unsigned_and_float_bit_patterns() {
             PostgresValue::Bytes(Some(float32.to_bits().to_be_bytes().to_vec())),
             PostgresValue::Bytes(Some(float64.to_bits().to_be_bytes().to_vec())),
         ]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn row_codec_maps_fixed_width_values_and_typed_nulls_from_canonical_bytes() {
+    let fields = vec![
+        Field::new("null", DataType::Null, false),
+        Field::new("boolean", DataType::Boolean, true),
+        Field::new("int8", DataType::Int8, true),
+        Field::new("int16", DataType::Int16, true),
+        Field::new("int32", DataType::Int32, true),
+        Field::new("int64", DataType::Int64, true),
+        Field::new("uint8", DataType::UInt8, true),
+        Field::new("uint16", DataType::UInt16, true),
+        Field::new("uint32", DataType::UInt32, true),
+        Field::new("uint64", DataType::UInt64, true),
+        Field::new("float32", DataType::Float32, true),
+        Field::new("float64", DataType::Float64, true),
+        Field::new("date32", DataType::Date32, true),
+        Field::new("seconds", DataType::Timestamp(TimeUnit::Second, None), true),
+        Field::new(
+            "millis",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "micros",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "nanos",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("decimal", DataType::Decimal128(10, 2), true),
+        Field::new("utf8", DataType::Utf8, true),
+        Field::new("binary", DataType::Binary, true),
+    ];
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(NullArray::new(2)),
+        Arc::new(BooleanArray::from(vec![Some(true), None])),
+        Arc::new(Int8Array::from(vec![Some(-128), None])),
+        Arc::new(Int16Array::from(vec![Some(-32_768), None])),
+        Arc::new(Int32Array::from(vec![Some(i32::MIN), None])),
+        Arc::new(Int64Array::from(vec![Some(i64::MIN), None])),
+        Arc::new(UInt8Array::from(vec![Some(u8::MAX), None])),
+        Arc::new(UInt16Array::from(vec![Some(u16::MAX), None])),
+        Arc::new(UInt32Array::from(vec![Some(u32::MAX), None])),
+        Arc::new(UInt64Array::from(vec![Some(u64::MAX), None])),
+        Arc::new(Float32Array::from(vec![
+            Some(f32::from_bits(0x7f80_0123)),
+            None,
+        ])),
+        Arc::new(Float64Array::from(vec![Some(-0.0_f64), None])),
+        Arc::new(Date32Array::from(vec![Some(-12), None])),
+        Arc::new(TimestampSecondArray::from(vec![Some(-1), None])),
+        Arc::new(TimestampMillisecondArray::from(vec![Some(-2), None])),
+        Arc::new(TimestampMicrosecondArray::from(vec![Some(-3), None])),
+        Arc::new(TimestampNanosecondArray::from(vec![Some(-4), None])),
+        Arc::new(
+            Decimal128Array::from(vec![Some(-12345), None])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ),
+        Arc::new(StringArray::from(vec![Some("before\0after"), None])),
+        Arc::new(BinaryArray::from(vec![Some(&b"\0\xff"[..]), None])),
+    ];
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+    let codec = PostgresRowCodec::new(PostgresLayout::try_new(schema).unwrap());
+    let present = codec.encode_row(&batch, 0).unwrap();
+    let nulls = codec.encode_row(&batch, 1).unwrap();
+
+    assert_eq!(present.hash, row_hash(&canonical_row(&batch, 0).unwrap()));
+    assert_eq!(nulls.hash, row_hash(&canonical_row(&batch, 1).unwrap()));
+    assert_eq!(
+        present.values,
+        vec![
+            PostgresValue::Bytes(None),
+            PostgresValue::Boolean(Some(true)),
+            PostgresValue::Int16(Some(-128)),
+            PostgresValue::Int16(Some(-32_768)),
+            PostgresValue::Int32(Some(i32::MIN)),
+            PostgresValue::Int64(Some(i64::MIN)),
+            PostgresValue::Int16(Some(i16::from(u8::MAX))),
+            PostgresValue::Int32(Some(i32::from(u16::MAX))),
+            PostgresValue::Int64(Some(i64::from(u32::MAX))),
+            PostgresValue::Bytes(Some(u64::MAX.to_be_bytes().to_vec())),
+            PostgresValue::Bytes(Some(0x7f80_0123_u32.to_be_bytes().to_vec())),
+            PostgresValue::Bytes(Some((-0.0_f64).to_bits().to_be_bytes().to_vec())),
+            PostgresValue::Int32(Some(-12)),
+            PostgresValue::Int64(Some(-1)),
+            PostgresValue::Int64(Some(-2)),
+            PostgresValue::Int64(Some(-3)),
+            PostgresValue::Int64(Some(-4)),
+            PostgresValue::Bytes(Some((-12345_i128).to_be_bytes().to_vec())),
+            PostgresValue::Bytes(Some(b"before\0after".to_vec())),
+            PostgresValue::Bytes(Some(vec![0, 255])),
+        ]
+    );
+    assert_eq!(
+        nulls.values,
+        vec![
+            PostgresValue::Bytes(None),
+            PostgresValue::Boolean(None),
+            PostgresValue::Int16(None),
+            PostgresValue::Int16(None),
+            PostgresValue::Int32(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Int16(None),
+            PostgresValue::Int32(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Bytes(None),
+            PostgresValue::Bytes(None),
+            PostgresValue::Bytes(None),
+            PostgresValue::Int32(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Int64(None),
+            PostgresValue::Bytes(None),
+            PostgresValue::Bytes(None),
+            PostgresValue::Bytes(None),
+        ]
+    );
+    assert_eq!(
+        codec.encode_row(&batch, 2),
+        Err(RowError::RowOutOfBounds {
+            row_index: 2,
+            rows: 2,
+        })
     );
 }
 

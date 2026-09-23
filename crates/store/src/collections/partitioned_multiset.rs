@@ -331,6 +331,41 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_partition_scan_poisons_read_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let multiset = store
+            .create_data::<PartitionedMultiset<u64, Vec<u8>>>("multiset")
+            .unwrap();
+        let mut transactions = store.into_transactions();
+        let key = vec![7; 8 * 1024];
+
+        let transaction = transactions.begin();
+        let mut data = multiset.data.access(transaction.access()).unwrap();
+        let prefix = encode_partition(data.as_read(), &7_u64).unwrap();
+        let framed = encode_key(data.as_read(), &prefix, &key).unwrap();
+        data.put(&framed, &[1]).unwrap();
+        transaction.commit().unwrap();
+
+        let (_, reads) = transactions.split();
+        let snapshot = reads.begin();
+        let values = multiset.read(snapshot.access()).unwrap();
+        let partition = values.partition(&7_u64).unwrap();
+        assert!(matches!(
+            partition.scan(
+                ScanDirection::Ascending,
+                None,
+                ScanLimit::new(1, usize::MAX).unwrap(),
+            ),
+            Err(StoreError::CorruptMultiset { .. })
+        ));
+        assert!(matches!(
+            partition.multiplicity(&key),
+            Err(StoreError::TransactionPoisoned)
+        ));
+    }
+
+    #[test]
     fn corrupt_scan_returns_no_page_and_poisons_prior_writes() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::create(root.path().join("store")).unwrap();
