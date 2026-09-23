@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::HashMap, fmt, io::Write, rc::Rc, sync::Arc};
+use std::{collections::HashMap, fmt, io::Write, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{
@@ -61,20 +61,24 @@ pub(super) fn encode_bounded(
 ) -> Result<Vec<u8>, CodecError> {
     let physical = physical_batch(change)?;
     let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
-    let limit_hit = Rc::new(Cell::new(false));
-    let mut output = BoundedWriter::new(max_bytes, Rc::clone(&limit_hit));
+    let mut output = BoundedWriter::new(max_bytes);
     let mut writer =
         match StreamWriter::try_new_with_options(&mut output, physical.schema_ref(), options) {
             Ok(writer) => writer,
-            Err(_error) if limit_hit.get() => return Err(CodecError::size_limit(max_bytes)),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return if output.limit_hit {
+                    Err(CodecError::size_limit(max_bytes))
+                } else {
+                    Err(error.into())
+                };
+            }
         };
     if body_bytes > writer.get_ref().remaining() {
         return Err(CodecError::size_limit(max_bytes));
     }
     if let Err(error) = writer.write(&physical) {
         drop(writer);
-        return if limit_hit.get() {
+        return if output.limit_hit {
             Err(CodecError::size_limit(max_bytes))
         } else {
             Err(error.into())
@@ -82,7 +86,7 @@ pub(super) fn encode_bounded(
     }
     if let Err(error) = writer.finish() {
         drop(writer);
-        return if limit_hit.get() {
+        return if output.limit_hit {
             Err(CodecError::size_limit(max_bytes))
         } else {
             Err(error.into())
@@ -95,15 +99,15 @@ pub(super) fn encode_bounded(
 struct BoundedWriter {
     bytes: Vec<u8>,
     max_bytes: usize,
-    limit_hit: Rc<Cell<bool>>,
+    limit_hit: bool,
 }
 
 impl BoundedWriter {
-    fn new(max_bytes: usize, limit_hit: Rc<Cell<bool>>) -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
             max_bytes,
-            limit_hit,
+            limit_hit: false,
         }
     }
 
@@ -120,7 +124,7 @@ impl Write for BoundedWriter {
             .checked_add(input.len())
             .is_none_or(|length| length > self.max_bytes)
         {
-            self.limit_hit.set(true);
+            self.limit_hit = true;
             return Err(std::io::Error::other(
                 "DogPaddle Change size limit exceeded",
             ));

@@ -189,8 +189,9 @@ Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff
 Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.version = 1`。
 
 需要在写入持久容量前限制分配时使用 [`encode_change_bounded`]。它先按 Arrow v1 支持类型无拷贝计算
-当前逻辑 slice 的未压缩 IPC body，并用限长 writer 约束完整输出；因此超大 body 不会先被完整构造后
-才遭拒绝。普通 [`encode_change`] 保留无调用方 byte limit 的通用入口。
+当前逻辑 slice 的未压缩 IPC body，并用自持超限标记的限长 writer 约束完整输出；Schema 写入、batch 和 EOS
+任一阶段超限都返回同一容量错误，因此超大 body 不会先被完整构造后才遭拒绝。普通 [`encode_change`]
+保留无调用方 byte limit 的通用入口。
 
 写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝错误 marker、
 大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle` Schema。writer options、

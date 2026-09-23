@@ -119,6 +119,23 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
 }
 
 #[test]
+fn bounded_encoder_reports_schema_header_overflow_as_a_size_limit() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nothing",
+        DataType::Null,
+        false,
+    )]));
+    let records = RecordBatch::try_new(schema, vec![new_null_array(&DataType::Null, 1)]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    for max_bytes in [16, 32] {
+        assert!(matches!(
+            encode_change_bounded(&change, max_bytes),
+            Err(CodecError::EncodedSizeLimitExceeded { max_bytes: actual }) if actual == max_bytes
+        ));
+    }
+}
+
+#[test]
 fn non_nullable_null_type_round_trips_as_an_always_null_column() {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nothing",
