@@ -267,6 +267,51 @@ fn postgres_cdc_restores_opaque_checkpoint_across_rollback_and_reopen_without_ex
 }
 
 #[test]
+fn postgres_cdc_reopen_keeps_capture_durable_until_source_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state");
+    let mut fixture = Fixture::create(&path);
+    let captured = checkpoint();
+    fixture.set_checkpoint(&captured);
+    let transaction = fixture.transactions.begin();
+    fixture
+        .phase
+        .access(transaction.access())
+        .unwrap()
+        .set(&1)
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(fixture);
+
+    for commit in [false, true] {
+        let mut fixture = Fixture::open(Store::open(&path).unwrap());
+        fixture.restore(commit).unwrap();
+        // Recovery must not authorize clearing the snapshot before the
+        // PostgreSQL slot has been cleaned up outside the Store transaction.
+        let transaction = fixture.transactions.begin();
+        assert_eq!(
+            fixture
+                .phase
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            fixture
+                .checkpoint
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(captured.clone())
+        );
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
 fn postgres_cdc_restore_rejects_corrupt_checkpoint_without_initializing() {
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::create(&root.path().join("state"));

@@ -23,7 +23,7 @@ TRUNCATE 必须送入 converter 并拒绝；运行中外部修改 slot/publicati
 
 MySqlCdcScan 的 tag 是 15，同样是单个具体 Scan，Definition 保存发现的非敏感单表身份、固定列和必填 `NonZeroU64 bootstrap_spool_bytes`；三个资源为 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和 `mysql_cdc_scan.bootstrap_spool: Queue<Vec<u8>>`。
 它也按 `Fresh → Capturing → Publishing → Streaming` 推进，使用 `initial_only` + `snapshot.locking.mode=minimal` 捕获 MySQL 8.4 一致初始快照，以 terminal heartbeat 的 checkpoint 封口，排空私有 spool 后以 `recovery` 继续 binlog。
-捕获、封口、发布、背压和 ACK 与 PG 遵循相同的事务边界，但不建立共享 CDC 抽象。
+捕获、封口、发布、背压和 ACK 与 PG 由同一个私有 CDC runtime 实现；数据库连接、记录转换和 checkpoint 身份校验仍由各具体源拥有。
 Capturing 期 reopen 通过 Resetting 每 turn `pop_front` 至多一项并清理 checkpoint 后重做完整快照；不从中间 checkpoint 恢复。
 容量是相同的 Queue 硬上限，每项计费为 8-byte private sequence 加完整 IPC bytes，空队列也不接受超限项；超限不 ACK 并要求用更大容量重建。
 部署角色应具有短时 global read lock 所需权限，但不得授予 `LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 之前失败。
@@ -33,7 +33,11 @@ binlog 必须覆盖快照、私有 spool 排空、公开 output 背压与追平�
 
 ## 阅读运行实现
 
-两个具体 runtime 都用私有 `NextStep` 表示下一次调用要做的工作，`turn` 校验输入后只分派一个步骤；持久 `Phase` 仍是 v1 的五个阶段。
+`scan/cdc_runtime.rs` 是两种源唯一的事务与恢复驱动。它拥有具体 Debezium `Connector`、phase/checkpoint/spool handle 和私有 `NextStep`；`turn` 校验输入后只分派一个步骤，持久 `Phase` 仍是 v1 的五个阶段。
 `Restore/BeginCapture/Capture/PrepareReset/Reset/Publish/Stream/RestartStream` 取代可相互冲突的恢复、重启和快照失败布尔标记。
 PostgreSQL 的 PrepareReset 在写入 Resetting 前停止 connector 并清理 slot；MySQL 恢复时没有 connector，可直接提交 Resetting。
-RestartStream 在同一 turn 完成 stop、restart 和 poll。运行步骤不另行持久化，也不改变 checkpoint/ACK 规则；两类 connector 不共享新的状态机框架。
+RestartStream 在同一 turn 完成 stop、restart 和 poll。运行步骤不另行持久化；checkpoint、spool 或 output 同事务提交后才消费真实的 `Delivery` 执行 ACK，回滚不推进内存 checkpoint 或捕获进度。快照启动、poll、转换或 IPC 编码失败均安排完整快照重置，不能继续使用已失败的捕获过程。
+
+`postgres_cdc/runtime.rs` 和 `mysql_cdc/runtime.rs` 只实现私有源适配：启动 snapshot/streaming connector、清理源快照资源、转换记录、恢复 checkpoint 及具体错误分类。它们不访问 Store、不执行 ACK，也不各自维护另一套 Phase/NextStep。私有接口只服务这两种已支持的 Debezium 源，不是公共 connector API、插件 registry 或任意生命周期 hook 框架。
+
+恢复仍保留源差异：PG 只在 Publishing/Streaming 解析可恢复 checkpoint，未封口 checkpoint 随完整快照丢弃；MySQL 在全部阶段验证已有 checkpoint，并拒绝 Resetting 中有 spool 却没有 checkpoint 的状态。源的 tag、三个资源名称、phase 数字和 checkpoint 原始字节不变。

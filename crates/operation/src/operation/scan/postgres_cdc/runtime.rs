@@ -1,86 +1,19 @@
-use std::{num::NonZeroU64, sync::Arc, time::Duration};
-
-use arrow_schema::SchemaRef;
-use dogpaddle_change::{decode_change_owned, encode_change};
-use dogpaddle_debezium::{Checkpoint, Connector};
-use dogpaddle_store::{Cell, Queue};
-
-use crate::operation::{
-    Action, AfterCommit, OperationError, OperationInput, PostCommitError, Turn, TurnOperation,
-};
-
 use super::{
     PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanSpec,
-    connection::CONNECTOR_CLASS,
     convert::{CaptureProgress, convert_capture_records, convert_records},
 };
+use crate::operation::OperationError;
+use crate::operation::scan::cdc_runtime::{Captured, CdcRuntime, Phase, Source};
+use arrow_schema::SchemaRef;
+use dogpaddle_change::Change;
+use dogpaddle_debezium::{Checkpoint, Connector, Record};
+use dogpaddle_store::{Cell, Queue};
+use std::num::NonZeroU64;
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Phase {
-    Fresh,
-    Capturing,
-    Publishing,
-    Streaming,
-    Resetting,
-}
-
-impl Phase {
-    fn decode(value: Option<u32>) -> Result<Self, PostgresCdcScanError> {
-        match value {
-            None => Ok(Self::Fresh),
-            Some(1) => Ok(Self::Capturing),
-            Some(2) => Ok(Self::Publishing),
-            Some(3) => Ok(Self::Streaming),
-            Some(4) => Ok(Self::Resetting),
-            Some(_) => Err(PostgresCdcScanError::InvalidState(
-                "CDC scan phase is invalid",
-            )),
-        }
-    }
-
-    const fn durable(self) -> Option<u32> {
-        match self {
-            Self::Fresh => None,
-            Self::Capturing => Some(1),
-            Self::Publishing => Some(2),
-            Self::Streaming => Some(3),
-            Self::Resetting => Some(4),
-        }
-    }
-}
-
-/// The next in-process action; only `Phase` is persisted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NextStep {
-    Restore,
-    BeginCapture,
-    Capture,
-    PrepareReset,
-    Reset,
-    Publish,
-    Stream,
-    RestartStream,
-}
-
-/// One materialized `PostgreSQL` CDC Scan with reconstructible connector resources.
-///
-/// The initial snapshot is durably sealed in a private queue before any
-/// row becomes public. A capture interrupted before sealing is discarded and
-/// restarted with a newly created logical slot.
-pub(crate) struct PostgresCdcScanOperation {
+pub(super) type PostgresCdcScanOperation = CdcRuntime<PostgresSource>;
+pub(super) struct PostgresSource {
     spec: PostgresCdcScanSpec,
-    output_schema: SchemaRef,
-    phase_cell: Cell<u32>,
-    checkpoint: Cell<Vec<u8>>,
-    bootstrap_spool: Queue<Vec<u8>>,
     config: PostgresCdcScanConfig,
-    bootstrap_spool_bytes: NonZeroU64,
-    next_step: NextStep,
-    resume: Option<Checkpoint>,
-    connector: Option<Connector>,
-    capture_progress: CaptureProgress,
 }
 
 impl PostgresCdcScanOperation {
@@ -93,392 +26,101 @@ impl PostgresCdcScanOperation {
         config: PostgresCdcScanConfig,
         bootstrap_spool_bytes: NonZeroU64,
     ) -> Self {
-        Self {
-            spec,
+        Self::new(
+            PostgresSource { spec, config },
             output_schema,
             phase_cell,
             checkpoint,
             bootstrap_spool,
-            config,
             bootstrap_spool_bytes,
-            next_step: NextStep::Restore,
-            resume: None,
-            connector: None,
-            capture_progress: CaptureProgress::default(),
-        }
+        )
     }
+}
 
-    fn restore(&mut self) -> Turn<'_> {
-        Turn::ready(move |access| {
-            let phase = Phase::decode(self.phase_cell.access(access)?.get()?)?;
-            let checkpoint = self.checkpoint.access(access)?.get()?;
-            let spool_empty = self.bootstrap_spool.access(access)?.is_empty()?;
-            match phase {
-                Phase::Fresh if checkpoint.is_some() || !spool_empty => {
-                    return Err(PostgresCdcScanError::InvalidState(
-                        "fresh CDC scan retains bootstrap data",
-                    )
-                    .into());
-                }
-                Phase::Streaming if !spool_empty => {
-                    return Err(PostgresCdcScanError::InvalidState(
-                        "streaming CDC scan retains bootstrap output",
-                    )
-                    .into());
-                }
-                Phase::Capturing if !spool_empty && checkpoint.is_none() => {
-                    return Err(PostgresCdcScanError::InvalidState(
-                        "captured bootstrap output has no checkpoint",
-                    )
-                    .into());
-                }
-                _ => {}
-            }
-            let resume = match phase {
-                Phase::Publishing | Phase::Streaming => Some(parse_checkpoint(
-                    checkpoint.ok_or(PostgresCdcScanError::InvalidState(
-                        "sealed CDC scan has no checkpoint",
-                    ))?,
-                    &self.spec,
-                )?),
-                Phase::Fresh | Phase::Capturing | Phase::Resetting => None,
-            };
-            Ok((
-                Action::Commit(None),
-                AfterCommit::new(move || {
-                    self.next_step = match phase {
-                        Phase::Fresh => NextStep::BeginCapture,
-                        Phase::Capturing => NextStep::PrepareReset,
-                        Phase::Publishing => NextStep::Publish,
-                        Phase::Streaming => NextStep::Stream,
-                        Phase::Resetting => NextStep::Reset,
-                    };
-                    self.resume = resume;
-                    Ok(())
-                }),
-            ))
-        })
+impl Source for PostgresSource {
+    type Progress = CaptureProgress;
+    const RESET_REQUIRES_SOURCE_CLEANUP: bool = true;
+    fn start_snapshot(&self) -> Result<Connector, OperationError> {
+        Ok(self.config.start_snapshot(&self.spec)?)
     }
-
-    fn begin_capture(&mut self) -> Turn<'_> {
-        Turn::ready(move |access| {
-            self.phase_cell
-                .access(access)?
-                .set(&Phase::Capturing.durable().expect("capturing is durable"))?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::new(move || {
-                    self.next_step = NextStep::Capture;
-                    self.capture_progress = CaptureProgress::default();
-                    Ok(())
-                }),
-            ))
-        })
+    fn start_streaming(&self, checkpoint: &Checkpoint) -> Result<Connector, OperationError> {
+        Ok(self.config.start_streaming(&self.spec, checkpoint)?)
     }
-
-    fn prepare_capture_reset(&mut self) -> Result<Turn<'_>, OperationError> {
-        if let Some(connector) = self.connector.as_mut() {
-            connector.stop(STOP_TIMEOUT).map_err(|error| {
-                PostgresCdcScanError::new(format!(
-                    "Debezium bootstrap stop failed ({:?})",
-                    error.kind()
-                ))
-            })?;
-        }
-        self.connector = None;
+    fn cleanup_snapshot(&self) -> Result<(), OperationError> {
         self.config.drop_snapshot_slot(&self.spec)?;
-        Ok(Turn::ready(move |access| {
-            self.phase_cell
-                .access(access)?
-                .set(&Phase::Resetting.durable().expect("resetting is durable"))?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::new(move || {
-                    self.next_step = NextStep::Reset;
-                    self.resume = None;
-                    self.capture_progress = CaptureProgress::default();
-                    Ok(())
-                }),
-            ))
-        }))
+        Ok(())
     }
-
-    fn reset(&mut self) -> Turn<'_> {
-        Turn::ready(move |access| {
-            let mut spool = self.bootstrap_spool.access(access)?;
-            if spool.pop_front()?.is_some() && !spool.is_empty()? {
-                return Ok((Action::Commit(None), AfterCommit::none()));
-            }
-            self.checkpoint.access(access)?.clear()?;
-            self.phase_cell.access(access)?.clear()?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::new(move || {
-                    self.next_step = NextStep::BeginCapture;
-                    Ok(())
-                }),
-            ))
+    fn capture(
+        &self,
+        schema: SchemaRef,
+        records: &[Record],
+        progress: Self::Progress,
+    ) -> Result<Captured<Self::Progress>, OperationError> {
+        let converted = convert_capture_records(
+            &self.spec.columns,
+            schema,
+            &self.spec.engine_name,
+            &self.spec.schema,
+            &self.spec.table,
+            records,
+            progress,
+        )?;
+        Ok(Captured {
+            change: converted.change,
+            sealed: converted.sealed,
+            progress: converted.next_progress,
         })
     }
-
-    fn capture(&mut self) -> Result<Turn<'_>, OperationError> {
-        if self.connector.is_none() {
-            self.next_step = NextStep::PrepareReset;
-            self.connector = Some(self.config.start_snapshot(&self.spec)?);
-            self.next_step = NextStep::Capture;
-        }
-
-        let current_progress = self.capture_progress;
-        let connector = self
-            .connector
-            .as_mut()
-            .expect("snapshot connector was started above");
-        let polled = connector.poll(Duration::ZERO);
-        let Some(delivery) = (match polled {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                self.next_step = NextStep::PrepareReset;
-                return Err(PostgresCdcScanError::new(format!(
-                    "Debezium bootstrap poll failed ({:?})",
-                    error.kind()
-                ))
-                .into());
-            }
-        }) else {
-            return Ok(Turn::Idle);
-        };
-        let converted = match convert_capture_records(
+    fn stream(
+        &self,
+        schema: SchemaRef,
+        records: &[Record],
+    ) -> Result<Option<Change>, OperationError> {
+        Ok(convert_records(
             &self.spec.columns,
-            Arc::clone(&self.output_schema),
+            schema,
             &self.spec.engine_name,
             &self.spec.schema,
             &self.spec.table,
-            delivery.records(),
-            current_progress,
-        ) {
-            Ok(converted) => converted,
-            Err(error) => {
-                drop(delivery);
-                self.next_step = NextStep::PrepareReset;
-                return Err(error.into());
-            }
-        };
-        let encoded = converted
-            .change
-            .as_ref()
-            .map(encode_change)
-            .transpose()
-            .map_err(PostgresCdcScanError::from)?;
-        let sealed = converted.sealed;
-        let next_progress = converted.next_progress;
-        let checkpoint_bytes = delivery.checkpoint().as_bytes().to_vec();
-        let resume_checkpoint = delivery.checkpoint().clone();
-        let checkpoint = &self.checkpoint;
-        let phase_cell = &self.phase_cell;
-        let spool = &self.bootstrap_spool;
-        let capacity = self.bootstrap_spool_bytes;
-        let next_step = &mut self.next_step;
-        let progress = &mut self.capture_progress;
-        let resume = &mut self.resume;
-        Ok(Turn::ready(move |access| {
-            if let Some(encoded) = encoded {
-                let mut spool = spool.access(access)?;
-                if !spool.try_push(&encoded, capacity)? {
-                    return Err(PostgresCdcScanError::BootstrapSpoolFull.into());
-                }
-            }
-            checkpoint.access(access)?.set(&checkpoint_bytes)?;
-            if sealed {
-                phase_cell
-                    .access(access)?
-                    .set(&Phase::Publishing.durable().expect("publishing is durable"))?;
-            }
-            Ok((
-                Action::Commit(None),
-                AfterCommit::new(move || {
-                    delivery.ack().map_err(|error| {
-                        PostCommitError::new(PostgresCdcScanError::new(format!(
-                            "Debezium bootstrap ACK failed ({:?})",
-                            error.kind()
-                        )))
-                    })?;
-                    if sealed {
-                        *next_step = NextStep::Publish;
-                        *resume = Some(resume_checkpoint);
-                    } else {
-                        *progress = next_progress;
-                    }
-                    Ok(())
-                }),
-            ))
-        }))
+            records,
+        )?)
     }
-
-    fn publish(&mut self) -> Result<Turn<'_>, OperationError> {
-        if let Some(connector) = self.connector.as_mut() {
-            connector.stop(STOP_TIMEOUT).map_err(|error| {
-                PostgresCdcScanError::new(format!(
-                    "Debezium bootstrap stop failed ({:?})",
-                    error.kind()
-                ))
-            })?;
+    fn restore_checkpoint(
+        &self,
+        phase: Phase,
+        bytes: Option<Vec<u8>>,
+        _spool_empty: bool,
+    ) -> Result<Option<Checkpoint>, OperationError> {
+        match phase {
+            Phase::Publishing | Phase::Streaming => Ok(Some(parse_checkpoint(
+                bytes.ok_or(PostgresCdcScanError::InvalidState(
+                    "sealed CDC scan has no checkpoint",
+                ))?,
+                &self.spec,
+            )?)),
+            Phase::Fresh | Phase::Capturing | Phase::Resetting => Ok(None),
         }
-        self.connector = None;
-        Ok(Turn::ready(move |access| {
-            let mut spool = self.bootstrap_spool.access(access)?;
-            let Some(encoded) = spool.pop_front()? else {
-                self.phase_cell
-                    .access(access)?
-                    .set(&Phase::Streaming.durable().expect("streaming is durable"))?;
-                return Ok((
-                    Action::Commit(None),
-                    AfterCommit::new(move || {
-                        self.connector = None;
-                        self.next_step = NextStep::Stream;
-                        Ok(())
-                    }),
-                ));
-            };
-
-            let change = decode_change_owned(encoded).map_err(|_| {
-                PostgresCdcScanError::InvalidState("bootstrap spool Change is invalid")
-            })?;
-            if change.records().schema().as_ref() != self.output_schema.as_ref() {
-                return Err(PostgresCdcScanError::InvalidState(
-                    "bootstrap spool Change has the wrong schema",
-                )
-                .into());
-            }
-            let finished = spool.is_empty()?;
-            if finished {
-                self.phase_cell
-                    .access(access)?
-                    .set(&Phase::Streaming.durable().expect("streaming is durable"))?;
-            }
-            Ok((
-                Action::Commit(Some(change)),
-                if finished {
-                    AfterCommit::new(move || {
-                        self.connector = None;
-                        self.next_step = NextStep::Stream;
-                        Ok(())
-                    })
-                } else {
-                    AfterCommit::none()
-                },
-            ))
-        }))
     }
-
-    fn restart_stream(&mut self) -> Result<Turn<'_>, OperationError> {
-        if let Some(connector) = self.connector.as_mut() {
-            connector.stop(STOP_TIMEOUT).map_err(|error| {
-                PostgresCdcScanError::new(format!(
-                    "Debezium streaming stop failed ({:?})",
-                    error.kind()
-                ))
-            })?;
-        }
-        self.connector = None;
-        self.next_step = NextStep::Stream;
-        self.stream()
+    fn invalid_state(message: &'static str) -> OperationError {
+        Box::new(PostgresCdcScanError::InvalidState(message))
     }
-
-    fn stream(&mut self) -> Result<Turn<'_>, OperationError> {
-        if self.connector.is_none() {
-            let checkpoint = self
-                .resume
-                .as_ref()
-                .expect("publishing and restore retain the sealed checkpoint");
-            self.connector = Some(self.config.start_streaming(&self.spec, checkpoint)?);
-        }
-
-        let connector = self
-            .connector
-            .as_mut()
-            .expect("streaming connector was started above");
-        let polled = connector.poll(Duration::ZERO);
-        let Some(delivery) = (match polled {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                self.next_step = NextStep::RestartStream;
-                return Err(PostgresCdcScanError::new(format!(
-                    "Debezium streaming poll failed ({:?})",
-                    error.kind()
-                ))
-                .into());
-            }
-        }) else {
-            return Ok(Turn::Idle);
-        };
-        let change = match convert_records(
-            &self.spec.columns,
-            Arc::clone(&self.output_schema),
-            &self.spec.engine_name,
-            &self.spec.schema,
-            &self.spec.table,
-            delivery.records(),
-        ) {
-            Ok(change) => change,
-            Err(error) => {
-                drop(delivery);
-                self.next_step = NextStep::RestartStream;
-                return Err(error.into());
-            }
-        };
-        let checkpoint_bytes = delivery.checkpoint().as_bytes().to_vec();
-        let resume_checkpoint = delivery.checkpoint().clone();
-        let checkpoint = &self.checkpoint;
-        let resume = &mut self.resume;
-        Ok(Turn::ready(move |access| {
-            checkpoint.access(access)?.set(&checkpoint_bytes)?;
-            Ok((
-                Action::Commit(change),
-                AfterCommit::new(move || {
-                    delivery.ack().map_err(|error| {
-                        PostCommitError::new(PostgresCdcScanError::new(format!(
-                            "Debezium streaming ACK failed ({:?})",
-                            error.kind()
-                        )))
-                    })?;
-                    *resume = Some(resume_checkpoint);
-                    Ok(())
-                }),
-            ))
-        }))
+    fn runtime_error(message: String) -> OperationError {
+        Box::new(PostgresCdcScanError::new(message))
+    }
+    fn spool_full() -> OperationError {
+        Box::new(PostgresCdcScanError::BootstrapSpoolFull)
+    }
+    fn codec_error(error: dogpaddle_change::CodecError) -> OperationError {
+        Box::new(PostgresCdcScanError::from(error))
     }
 }
-
-impl TurnOperation for PostgresCdcScanOperation {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        if input.is_some() {
-            return Err(
-                PostgresCdcScanError::new("PostgreSQL CDC scan does not accept input").into(),
-            );
-        }
-        match self.next_step {
-            NextStep::Restore => Ok(self.restore()),
-            NextStep::BeginCapture => Ok(self.begin_capture()),
-            NextStep::Capture => self.capture(),
-            NextStep::PrepareReset => self.prepare_capture_reset(),
-            NextStep::Reset => Ok(self.reset()),
-            NextStep::Publish => self.publish(),
-            NextStep::Stream => self.stream(),
-            NextStep::RestartStream => self.restart_stream(),
-        }
-    }
-}
-
 fn parse_checkpoint(
     bytes: Vec<u8>,
     spec: &PostgresCdcScanSpec,
 ) -> Result<Checkpoint, PostgresCdcScanError> {
     let checkpoint = Checkpoint::from_bytes(bytes)
         .map_err(|_| PostgresCdcScanError::InvalidState("CDC scan checkpoint is invalid"))?;
-    if !checkpoint.matches(&spec.engine_name, CONNECTOR_CLASS) {
+    if !checkpoint.matches(&spec.engine_name, super::connection::CONNECTOR_CLASS) {
         return Err(PostgresCdcScanError::InvalidState(
             "CDC scan checkpoint belongs to another PostgreSQL connector",
         ));
@@ -490,11 +132,14 @@ fn parse_checkpoint(
 mod tests {
     use arrow_array::{Int64Array, RecordBatch};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
-    use dogpaddle_change::Change;
+    use dogpaddle_change::{Change, encode_change};
     use dogpaddle_store::{Store, Transactions};
 
     use super::*;
+    use crate::operation::scan::cdc_runtime::NextStep;
     use crate::operation::scan::{PostgresColumn, PostgresType};
+    use crate::operation::{Action, Turn, TurnOperation};
+    use std::sync::Arc;
 
     fn config() -> PostgresCdcScanConfig {
         PostgresCdcScanConfig::new_unencrypted(

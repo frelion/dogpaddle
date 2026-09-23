@@ -88,3 +88,8 @@ workspace = true
 name = "projection"
 harness = false
 test = true
+
+[[bench]]
+name = "cdc_bootstrap"
+harness = false
+test = true

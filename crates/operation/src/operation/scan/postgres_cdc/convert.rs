@@ -16,7 +16,7 @@ use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
 type Row = Map<String, Value>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct CaptureProgress {
+pub(crate) struct CaptureProgress {
     saw_snapshot_row: bool,
     snapshot_complete: bool,
 }

@@ -15,7 +15,7 @@ use super::{MySqlCdcScanError, MySqlColumn, MySqlType};
 type Row = Map<String, Value>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct SnapshotProgress {
+pub(crate) struct SnapshotProgress {
     saw_snapshot_row: bool,
     saw_last: bool,
 }

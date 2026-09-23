@@ -369,8 +369,8 @@ planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库�
 ## 外部端点边界
 
 CDC 先将初始快照放入私有 spool，封口后逐条发布，再进入持续捕获。PostgreSQL spool 还需要容纳
-封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。两者的阶段、事务、容量、重置和部署前提见
-[CDC Scan 契约](docs/cdc.md)。它们保留具体 connector 实现，不建立通用 CDC 框架。
+封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。两者共享一个私有 runtime，统一实现 spool、checkpoint、提交后 ACK 和恢复推进；具体源只负责连接、记录转换、checkpoint 校验与源资源清理。阶段、事务、容量、重置和部署前提见
+[CDC Scan 契约](docs/cdc.md)。新增源行为时不需要复制整套事务状态机；具体数据库协议仍分别维护。
 
 `PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
 timeout、进入 polling 后的有限重试次数与最大等待、持续流 heartbeat 和初始 snapshot fetch size。默认显式固定
@@ -449,6 +449,9 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
 workload 的 Flow、Store 或 Change + Store target 负责。
 
+`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的逐条清理。
+计时包含恢复、每条 spool entry 的小事务提交和 AfterCommit，校验输出顺序、完整 Change 与最终持久状态；不启动 Java 或外部数据库，不能用于推断捕获、网络 ACK 或端到端 CDC 吞吐。
+
 `asof_join` Criterion 把两个使关系回到原状的完整 Claim 作为计时单位，覆盖多小 partition、
 单大 partition、尾部小修正、历史全量修正、nearest+tolerance 和 residual 远候选回退。
 `asof_join_resources` 为每个 case 启动新子进程：fixture、seed 与 input Arrow 在 profiler 前建立，
@@ -466,6 +469,7 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench projecti
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench cdc_bootstrap
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join_resources
 ```

@@ -226,6 +226,51 @@ fn mysql_cdc_initialization_and_reopen_do_not_start_external_resources() {
 }
 
 #[test]
+fn mysql_cdc_reopen_commits_capture_reset_without_external_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state");
+    let mut fixture = Fixture::create(&path);
+    let captured = checkpoint();
+    fixture.set_checkpoint(&captured);
+    let transaction = fixture.transactions.begin();
+    fixture
+        .phase
+        .access(transaction.access())
+        .unwrap()
+        .set(&1)
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(fixture);
+
+    for (commit, expected_phase) in [(false, 1), (true, 4)] {
+        let mut fixture = Fixture::open(Store::open(&path).unwrap());
+        fixture.restore(commit).unwrap();
+        // MySQL has no source-owned snapshot slot to remove. The restore
+        // transaction may enter Resetting, but rollback must retain Capturing.
+        let transaction = fixture.transactions.begin();
+        assert_eq!(
+            fixture
+                .phase
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(expected_phase)
+        );
+        assert_eq!(
+            fixture
+                .checkpoint
+                .access(transaction.access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(captured.clone())
+        );
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
 fn mysql_cdc_restore_rejects_corrupt_checkpoint_without_initializing() {
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::create(&root.path().join("state"));

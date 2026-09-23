@@ -10,7 +10,7 @@ mod schema;
 pub use connection::{MySqlCdcScanConfig, MySqlCdcScanOptions};
 pub use definition::{MySqlCdcScanDefinition, MySqlCdcScanSpec};
 pub use error::MySqlCdcScanError;
-pub(crate) use runtime::MySqlCdcScanOperation;
+use runtime::MySqlCdcScanOperation;
 pub use schema::{MySqlColumn, MySqlType};
 
 pub(crate) use definition::{TAG, decode_definition};
