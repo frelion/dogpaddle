@@ -23,17 +23,17 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
-arrow-array = "=59.3.0"
-arrow-buffer = "=59.3.0"
-arrow-data = "=59.3.0"
-arrow-ipc = "=59.3.0"
-arrow-schema = "=59.3.0"
-arrow-select = "=59.3.0"
+arrow-array = "=60.0.0"
+arrow-buffer = "=60.0.0"
+arrow-data = "=60.0.0"
+arrow-ipc = "=60.0.0"
+arrow-schema = "=60.0.0"
+arrow-select = "=60.0.0"
 base64 = "=0.23.1"
 blake3 = "=1.8.7"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
-crc32fast = "=1.5.1"
+crc32fast = "=1.5.2"
 ctrlc = "=3.5.2"
 datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
 datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
