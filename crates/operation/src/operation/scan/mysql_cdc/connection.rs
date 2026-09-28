@@ -284,34 +284,22 @@ impl MySqlCdcScanConfig {
         &self,
         expected: &MySqlCdcScanSpec,
     ) -> Result<Connector, MySqlCdcScanError> {
-        let actual = self.discover(&expected.engine_name, &expected.table)?;
-        if &actual != expected {
-            return Err(MySqlCdcScanError::new(
-                "MySQL CDC scan identity or logical schema changed",
-            ));
-        }
-        let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
-            MySqlCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
-        })?;
-        runtime
-            .start(
-                self.connector_config(expected, ConnectorMode::Snapshot)?,
-                None,
-            )
-            .map_err(|error| match error.kind() {
-                ErrorKind::Timeout => MySqlCdcScanError::new(
-                    "Debezium snapshot did not enter polling within DogPaddle's fixed 60-second readiness deadline",
-                ),
-                kind => MySqlCdcScanError::new(format!(
-                    "Debezium snapshot start failed ({kind:?})"
-                )),
-            })
+        self.start(expected, ConnectorMode::Snapshot, None)
     }
 
     pub(super) fn start_streaming(
         &self,
         expected: &MySqlCdcScanSpec,
         checkpoint: &Checkpoint,
+    ) -> Result<Connector, MySqlCdcScanError> {
+        self.start(expected, ConnectorMode::Recovery, Some(checkpoint))
+    }
+
+    fn start(
+        &self,
+        expected: &MySqlCdcScanSpec,
+        mode: ConnectorMode,
+        checkpoint: Option<&Checkpoint>,
     ) -> Result<Connector, MySqlCdcScanError> {
         let actual = self.discover(&expected.engine_name, &expected.table)?;
         if &actual != expected {
@@ -322,18 +310,21 @@ impl MySqlCdcScanConfig {
         let runtime = DebeziumRuntime::open(&self.runtime_bundle).map_err(|error| {
             MySqlCdcScanError::new(format!("Debezium runtime open failed ({:?})", error.kind()))
         })?;
+        let (stage, timeout_message) = match mode {
+            ConnectorMode::Snapshot => (
+                "snapshot",
+                "Debezium snapshot did not enter polling within DogPaddle's fixed 60-second readiness deadline",
+            ),
+            ConnectorMode::Recovery => (
+                "connector",
+                "Debezium connector did not enter polling within DogPaddle's fixed 60-second readiness deadline",
+            ),
+        };
         runtime
-            .start(
-                self.connector_config(expected, ConnectorMode::Recovery)?,
-                Some(checkpoint),
-            )
+            .start(self.connector_config(expected, mode)?, checkpoint)
             .map_err(|error| match error.kind() {
-                ErrorKind::Timeout => MySqlCdcScanError::new(
-                    "Debezium connector did not enter polling within DogPaddle's fixed 60-second readiness deadline",
-                ),
-                kind => MySqlCdcScanError::new(format!(
-                    "Debezium connector start failed ({kind:?})"
-                )),
+                ErrorKind::Timeout => MySqlCdcScanError::new(timeout_message),
+                kind => MySqlCdcScanError::new(format!("Debezium {stage} start failed ({kind:?})")),
             })
     }
 

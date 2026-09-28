@@ -7,7 +7,7 @@ use super::{
     error::ClickHouseSinkError,
     schema::{ClickHouseLayout, ColumnLayout},
 };
-use crate::operation::sink::relation::{RowError, encode_canonical, row_hash};
+use crate::operation::sink::relation::{RowError, encode_target_values, row_hash};
 
 #[derive(Debug)]
 pub(super) struct ClickHouseRowCodec {
@@ -32,38 +32,10 @@ impl ClickHouseRowCodec {
         batch: &RecordBatch,
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
-        if batch.schema_ref().as_ref() != self.schema().as_ref() {
-            return Err(RowError::SchemaMismatch);
-        }
-        if row_index >= batch.num_rows() {
-            return Err(RowError::RowOutOfBounds {
-                row_index,
-                rows: batch.num_rows(),
-            });
-        }
-        let mut canonical = Vec::new();
-        let mut values = Vec::with_capacity(self.schema().fields().len());
-        for ((field, array), column) in self
-            .schema()
-            .fields()
-            .iter()
-            .zip(batch.columns())
-            .zip(self.layout.columns())
-        {
-            let start = canonical.len();
-            encode_canonical(
-                field,
-                array.as_ref(),
-                row_index,
-                field.name(),
-                &mut canonical,
-            )?;
-            values.push(clickhouse_value(
-                field.data_type(),
-                column,
-                &canonical[start..],
-            ));
-        }
+        let (canonical, values) =
+            encode_target_values(self.schema(), batch, row_index, |index, field, bytes| {
+                clickhouse_value(field.data_type(), &self.layout.columns()[index], bytes)
+            })?;
         Ok(EncodedRow {
             hash: hex(&row_hash(&canonical)),
             values,

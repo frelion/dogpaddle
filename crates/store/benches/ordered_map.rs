@@ -14,8 +14,8 @@ mod measure;
 
 use fixture::{MapFixture, StationFixture};
 use measure::{
-    measure_bulk_put, measure_point_get, measure_scan, measure_single_put_commits,
-    measure_station_steps,
+    measure_bulk_erase, measure_bulk_put, measure_bulk_remove, measure_point_get, measure_scan,
+    measure_single_put_commits, measure_station_steps,
 };
 
 const BENCHMARK: &str = "ordered_map";
@@ -105,6 +105,24 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
             });
         },
     );
+    for (name, checked) in [
+        ("bulk_remove_checked_commit", true),
+        ("bulk_erase_known_commit", false),
+    ] {
+        group.bench_function(BenchmarkId::new(name, config.entries), |bencher| {
+            bencher.iter_custom(|iterations| {
+                measure_iterations(iterations, || {
+                    let mut fixture =
+                        MapFixture::populated(root, name, config.entries, VALUE_BYTES);
+                    if checked {
+                        measure_bulk_remove(&mut fixture, config.entries)
+                    } else {
+                        measure_bulk_erase(&mut fixture, config.entries)
+                    }
+                })
+            });
+        });
+    }
 
     let fixture = MapFixture::populated(root, "hot", config.entries, VALUE_BYTES);
     group.bench_function(BenchmarkId::new("point_get", config.entries), |bencher| {
@@ -211,11 +229,13 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
                 "write_mode": "WAL enabled, sync=true"
             },
             "read_transactions": "read-only snapshots",
-            "read_cache": "warm",
+            "read_cache": "point_get and scan cases are warm; delete cases use a freshly seeded memtable",
             "validation": "outside_timing",
             "execution": "single_thread",
             "scenarios": [
                 "bulk_put_commit",
+                "bulk_remove_checked_commit",
+                "bulk_erase_known_commit",
                 "point_get",
                 "ascending_scan",
                 "descending_scan",

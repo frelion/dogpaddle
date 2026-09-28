@@ -25,12 +25,13 @@ fn construct(
     let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
     let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
     let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
-    let key_counts = if layout.kind != EquiJoinKind::Inner && !layout.has_residual {
+    let has_residual = layout.residual.is_some();
+    let key_counts = if layout.kind != EquiJoinKind::Inner && !has_residual {
         Some(scope.data::<state::Counts>(definition::KEY_COUNTS)?)
     } else {
         None
     };
-    let match_counts = if layout.kind != EquiJoinKind::Inner && layout.has_residual {
+    let match_counts = if layout.kind != EquiJoinKind::Inner && has_residual {
         Some(scope.data::<state::MatchCounts>(definition::MATCH_COUNTS)?)
     } else {
         None

@@ -445,7 +445,7 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 - Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
   [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
 
-`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition、`AsOfJoin` 的 ordered lookup/
+`Distinct` 的连续同 key 更新、`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition、`AsOfJoin` 的 ordered lookup/
 historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
 workload 的 Flow、Store 或 Change + Store target 负责。
 
@@ -466,6 +466,7 @@ cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
 cargo doc -p dogpaddle-operation --no-deps
 cargo test -p dogpaddle-operation --benches
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench projection
+DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench distinct
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink

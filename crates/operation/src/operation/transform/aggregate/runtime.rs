@@ -5,7 +5,8 @@ use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
 use dogpaddle_store::{
-    MultisetPartition, PartitionedMultisetAccess, StoreError, TransactionAccess,
+    CellAccess, MultisetPartition, OrderedMapAccess, PartitionedMultisetAccess, StoreError,
+    TransactionAccess,
 };
 
 use crate::{
@@ -82,28 +83,344 @@ struct OutputRows {
     diffs: Vec<i64>,
 }
 
-impl BoundCall {
-    pub(super) fn fold(
-        state: usize,
-        arguments: Box<[BoundExpression]>,
-        reduction: Box<dyn Fold>,
-    ) -> Self {
-        Self::Fold {
+/// Expression results materialized before any durable state is accessed.
+struct EvaluatedColumns {
+    groups: Vec<ArrayRef>,
+    calls: Vec<Vec<ArrayRef>>,
+    layouts: Vec<ArrayRef>,
+}
+
+/// State for one contiguous run of the same canonical group key.
+struct PendingGroup {
+    key: Vec<u8>,
+    was_present: bool,
+    /// Original state cloned only when a multi-row run may end unchanged.
+    comparison_baseline: Option<GroupState>,
+    state: Option<GroupState>,
+}
+
+/// One key per layout is enough to collapse repeated adjacent arguments while
+/// keeping memory independent of the number of rows in a Change.
+struct PendingExtrema {
+    keys: Vec<Option<PendingExtreme>>,
+}
+
+struct PendingExtreme {
+    group: u64,
+    key: Vec<u8>,
+    stored: u64,
+    current: u64,
+}
+
+impl EvaluatedColumns {
+    fn evaluate(
+        operation: &AggregateOperation,
+        records: &RecordBatch,
+    ) -> Result<Self, AggregateError> {
+        let groups = operation
+            .group_expressions
+            .iter()
+            .enumerate()
+            .map(|(group, expression)| {
+                expression
+                    .evaluate(records)
+                    .map_err(|source| AggregateError::GroupExpression { group, source })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let calls = operation
+            .calls
+            .iter()
+            .enumerate()
+            .map(|(aggregate, call)| match call {
+                BoundCall::Fold { arguments, .. } => arguments
+                    .iter()
+                    .map(|expression| {
+                        expression.evaluate(records).map_err(|source| {
+                            AggregateError::AggregateExpression { aggregate, source }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>(),
+                BoundCall::Extrema { .. } => Ok(Vec::new()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layouts = operation
+            .layouts
+            .iter()
+            .map(|layout| {
+                layout.expression.evaluate(records).map_err(|source| {
+                    AggregateError::AggregateExpression {
+                        aggregate: layout.owner,
+                        source,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            groups,
+            calls,
+            layouts,
+        })
+    }
+}
+
+impl PendingGroup {
+    fn load(
+        groups: &OrderedMapAccess<'_, Vec<u8>, GroupState>,
+        key: Vec<u8>,
+        continues: bool,
+    ) -> Result<Self, StoreError> {
+        let state = groups.get(&key)?;
+        Ok(Self {
+            key,
+            was_present: state.is_some(),
+            comparison_baseline: if continues { state.clone() } else { None },
             state,
-            arguments,
-            reduction,
+        })
+    }
+}
+
+impl PendingExtrema {
+    fn new(layouts: usize) -> Self {
+        Self {
+            keys: (0..layouts).map(|_| None).collect(),
         }
     }
 
-    pub(super) const fn extrema(slot: usize) -> Self {
-        Self::Extrema { slot }
+    fn adjust(
+        &mut self,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        layout: u32,
+        group: u64,
+        key: &Vec<u8>,
+        difference: i64,
+    ) -> Result<(u64, u64), AggregateError> {
+        let slot = &mut self.keys[layout as usize];
+        if slot
+            .as_ref()
+            .is_some_and(|pending| pending.group == group && pending.key == *key)
+        {
+            let pending = slot.as_mut().expect("the matching key is present");
+            let before = pending.current;
+            if let Some(after) = checked_extrema_weight(before, difference) {
+                pending.current = after;
+                return Ok((before, after));
+            }
+            // Materialize the earlier valid prefix before asking Store to
+            // reject this event. Its checked adjustment poisons the transaction
+            // exactly as it did on the per-row path.
+            Self::flush_slot(slot, entries, layout)?;
+            return match entries
+                .partition(&EntryPartition::new(layout, group))?
+                .adjust(key, difference)
+            {
+                Err(error) => Err(map_weight_error(error)),
+                Ok(_) => Err(AggregateError::InvalidState),
+            };
+        }
+
+        Self::flush_slot(slot, entries, layout)?;
+        let mut partition = entries.partition(&EntryPartition::new(layout, group))?;
+        let before = partition.multiplicity(key)?;
+        let Some(after) = checked_extrema_weight(before, difference) else {
+            // The read validates persisted bytes, while Store still owns the
+            // transaction poison on an invalid signed adjustment.
+            return match partition.adjust(key, difference) {
+                Err(error) => Err(map_weight_error(error)),
+                Ok(_) => Err(AggregateError::InvalidState),
+            };
+        };
+        *slot = Some(PendingExtreme {
+            group,
+            key: key.clone(),
+            stored: before,
+            current: after,
+        });
+        Ok((before, after))
     }
 
+    fn flush_layout(
+        &mut self,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        layout: u32,
+    ) -> Result<(), AggregateError> {
+        Self::flush_slot(&mut self.keys[layout as usize], entries, layout)
+    }
+
+    fn flush_all(
+        &mut self,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+    ) -> Result<(), AggregateError> {
+        for (layout, slot) in self.keys.iter_mut().enumerate() {
+            Self::flush_slot(
+                slot,
+                entries,
+                u32::try_from(layout).expect("layout count fits the persistent partition id"),
+            )?;
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    fn discard_group(
+        &mut self,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        group: u64,
+    ) -> Result<(), AggregateError> {
+        for (layout, slot) in self.keys.iter_mut().enumerate() {
+            let Some(pending) = slot.take() else {
+                continue;
+            };
+            debug_assert_eq!(pending.group, group);
+            if pending.stored == 0 {
+                continue;
+            }
+            let layout =
+                u32::try_from(layout).expect("layout count fits the persistent partition id");
+            entries
+                .partition(&EntryPartition::new(layout, group))?
+                .set_multiplicity(&pending.key, 0)?;
+        }
+        Ok(())
+    }
+
+    fn flush_slot(
+        slot: &mut Option<PendingExtreme>,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        layout: u32,
+    ) -> Result<(), AggregateError> {
+        let Some(pending) = slot.as_mut() else {
+            return Ok(());
+        };
+        if pending.current == pending.stored {
+            return Ok(());
+        }
+        entries
+            .partition(&EntryPartition::new(layout, pending.group))?
+            .set_multiplicity(&pending.key, pending.current)?;
+        pending.stored = pending.current;
+        Ok(())
+    }
+}
+
+fn checked_extrema_weight(before: u64, difference: i64) -> Option<u64> {
+    if difference > 0 {
+        before.checked_add(difference.unsigned_abs())
+    } else {
+        before.checked_sub(difference.unsigned_abs())
+    }
+}
+
+impl BoundCall {
     fn initial_fold_state(&self) -> Option<Vec<u8>> {
         match self {
             Self::Fold { reduction, .. } => Some(reduction.empty()),
             Self::Extrema { .. } => None,
         }
+    }
+}
+
+impl AggregateOperation {
+    fn new_group_state(
+        &self,
+        control: &CellAccess<'_, u64>,
+        next_group_id: &mut Option<u64>,
+    ) -> Result<GroupState, AggregateError> {
+        let id = match *next_group_id {
+            Some(id) => id,
+            None => control.get()?.unwrap_or(0),
+        };
+        *next_group_id = Some(id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?);
+        Ok(GroupState {
+            id,
+            weight: 0,
+            folds: self
+                .calls
+                .iter()
+                .filter_map(BoundCall::initial_fold_state)
+                .collect(),
+            extremes: vec![None; self.slots.len()].into_boxed_slice(),
+        })
+    }
+
+    fn group_output(&self, state: &GroupState) -> Result<Vec<ScalarValue>, AggregateError> {
+        self.calls
+            .iter()
+            .map(|call| match call {
+                BoundCall::Fold {
+                    state: state_index,
+                    reduction,
+                    ..
+                } => reduction.output(&state.folds[*state_index], state.weight),
+                BoundCall::Extrema { slot } => {
+                    let target = &self.slots[*slot];
+                    let layout = &self.layouts[target.layout];
+                    match state.extremes[*slot].as_deref() {
+                        None => null(layout.field.data_type()),
+                        Some(key) => ordered_value(&layout.field, key).map_err(map_order_error),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn apply_extrema_row(
+        &self,
+        state: &mut GroupState,
+        columns: &[ArrayRef],
+        row: usize,
+        difference: i64,
+        pending: &mut PendingExtrema,
+        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+    ) -> Result<(), AggregateError> {
+        for (layout_index, (layout, column)) in self.layouts.iter().zip(columns).enumerate() {
+            let value = ScalarValue::try_from_array(column.as_ref(), row)?;
+            // A NULL argument never enters the ordered partition, so it can
+            // neither become nor retract an extreme.
+            let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? else {
+                continue;
+            };
+            let partition_id = u32::try_from(layout_index)
+                .expect("the layout count is bounded by the aggregate call count");
+            let (before, after) =
+                pending.adjust(entries, partition_id, state.id, &key, difference)?;
+            // `Change` rejects zero differences, so an absent key here means
+            // the key just entered the partition.
+            if before == 0 {
+                promote_cached_extreme(layout, &mut state.extremes, &key);
+            }
+            // A group that loses its last row is removed by the caller, so a
+            // partition re-read here would only be discarded.
+            if after == 0 && state.weight != 0 && caches_key(layout, &state.extremes, &key) {
+                pending.flush_layout(entries, partition_id)?;
+                let partition = entries.partition(&EntryPartition::new(partition_id, state.id))?;
+                refresh_cached_extreme(layout, &mut state.extremes, &key, &partition)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_fold_row(
+        &self,
+        state: &mut GroupState,
+        columns: &[Vec<ArrayRef>],
+        row: usize,
+        difference: i64,
+    ) -> Result<(), AggregateError> {
+        for (aggregate, call) in self.calls.iter().enumerate() {
+            let BoundCall::Fold {
+                state: state_index,
+                reduction,
+                ..
+            } = call
+            else {
+                continue;
+            };
+            // Binding assigns dense indices after persisted shape validation.
+            let call_state = &mut state.folds[*state_index];
+            let values = scalar_tuple(&columns[aggregate], row)?;
+            reduction.apply(call_state, &values, difference, state.weight)?;
+        }
+        Ok(())
     }
 }
 
@@ -124,45 +441,7 @@ impl AtomicOperation for AggregateOperation {
             return Err(AggregateError::InputSchemaMismatch.into());
         }
 
-        let records = input.change.records();
-        let group_columns = self
-            .group_expressions
-            .iter()
-            .enumerate()
-            .map(|(group, expression)| {
-                expression
-                    .evaluate(records)
-                    .map_err(|source| AggregateError::GroupExpression { group, source })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let call_columns = self
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(aggregate, call)| match call {
-                BoundCall::Fold { arguments, .. } => arguments
-                    .iter()
-                    .map(|expression| {
-                        expression.evaluate(records).map_err(|source| {
-                            AggregateError::AggregateExpression { aggregate, source }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>(),
-                BoundCall::Extrema { .. } => Ok(Vec::new()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout_columns = self
-            .layouts
-            .iter()
-            .map(|layout| {
-                layout.expression.evaluate(records).map_err(|source| {
-                    AggregateError::AggregateExpression {
-                        aggregate: layout.owner,
-                        source,
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let columns = EvaluatedColumns::evaluate(self, input.change.records())?;
 
         let group_fields = &self.output_schema.fields()[..self.group_expressions.len()];
         let fold_count = self
@@ -174,130 +453,129 @@ impl AtomicOperation for AggregateOperation {
         let mut groups = self.groups.access(access)?;
         let mut entries = self.entries.access(access)?;
         let mut control = self.control.access(access)?;
+        let mut next_group_id = None;
+        let mut pending_group: Option<PendingGroup> = None;
+        let mut pending_extrema = PendingExtrema::new(self.layouts.len());
+        let row_count = input.change.num_rows();
+        let mut next_group = if row_count == 0 {
+            None
+        } else {
+            Some(encode_tuple(group_fields, &columns.groups, 0))
+        };
 
-        for row in 0..input.change.num_rows() {
+        for row in 0..row_count {
             let difference = input.change.diffs().value(row);
-            let group = encode_tuple(group_fields, &group_columns, row)?;
-            let (existed, mut state) = if let Some(state) = groups.get(&group)? {
-                (true, state)
+            let group = next_group
+                .take()
+                .expect("the current row key was encoded")?;
+            let starts_run = pending_group
+                .as_ref()
+                .is_none_or(|pending| pending.key != group);
+            if starts_run {
+                pending_extrema.flush_all(&mut entries)?;
+                if let Some(pending) = pending_group.take() {
+                    flush_pending_group(&mut groups, pending)?;
+                }
+            }
+            next_group = if row + 1 < row_count {
+                Some(encode_tuple(group_fields, &columns.groups, row + 1))
             } else {
-                if difference < 0 {
+                None
+            };
+            if starts_run {
+                let continues = matches!(
+                    next_group.as_ref(),
+                    Some(Ok(next)) if next.as_slice() == group.as_slice()
+                );
+                pending_group = Some(PendingGroup::load(&groups, group, continues)?);
+            }
+            let pending = pending_group
+                .as_mut()
+                .expect("the current group was loaded above");
+            let existed = pending.state.is_some();
+            let mut state = match pending.state.take() {
+                Some(state) => state,
+                None if difference < 0 => {
                     return Err(AggregateError::GroupWeightUnderflow.into());
                 }
-                let id = control.get()?.unwrap_or(0);
-                let next = id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?;
-                control.set(&next)?;
-                (
-                    false,
-                    GroupState {
-                        id,
-                        weight: 0,
-                        folds: self
-                            .calls
-                            .iter()
-                            .filter_map(BoundCall::initial_fold_state)
-                            .collect(),
-                        extremes: vec![None; self.slots.len()].into_boxed_slice(),
-                    },
-                )
+                None => self.new_group_state(&control, &mut next_group_id)?,
             };
             if state.folds.len() != fold_count || state.extremes.len() != self.slots.len() {
                 return Err(AggregateError::InvalidState.into());
             }
 
-            let old_output = existed
-                .then(|| {
-                    call_output(
-                        &self.calls,
-                        &self.layouts,
-                        &self.slots,
-                        &state.folds,
-                        &state.extremes,
-                        state.weight,
-                    )
-                })
-                .transpose()?;
+            let old_output = if existed {
+                Some(self.group_output(&state)?)
+            } else {
+                None
+            };
 
             state.weight = apply_weight(state.weight, difference, TrackedWeight::Group)?;
-
-            for (layout_index, (layout, column)) in
-                self.layouts.iter().zip(&layout_columns).enumerate()
-            {
-                let value = ScalarValue::try_from_array(column.as_ref(), row)?;
-                // A NULL argument never enters the ordered partition, so it can
-                // neither become nor retract an extreme.
-                let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? else {
-                    continue;
-                };
-                let partition_id = u32::try_from(layout_index)
-                    .expect("the layout count is bounded by the aggregate call count");
-                let change = entries
-                    .partition(&EntryPartition::new(partition_id, state.id))?
-                    .adjust(&key, difference)
-                    .map_err(map_weight_error)?;
-                // `Change` rejects zero differences, so an absent key here means
-                // the key just entered the partition.
-                if change.before() == 0 {
-                    promote_cached_extreme(layout, &mut state.extremes, &key);
-                }
-                // A group that loses its last row is removed below, so a
-                // partition re-read here would only be discarded.
-                if change.after() == 0
-                    && state.weight != 0
-                    && caches_key(layout, &state.extremes, &key)
-                {
-                    let partition =
-                        entries.partition(&EntryPartition::new(partition_id, state.id))?;
-                    refresh_cached_extreme(layout, &mut state.extremes, &key, &partition)?;
-                }
-            }
-
-            for (aggregate, call) in self.calls.iter().enumerate() {
-                if let BoundCall::Fold {
-                    state: state_index,
-                    reduction,
-                    ..
-                } = call
-                {
-                    // The persisted count was checked above; binding assigns dense indices.
-                    let call_state = &mut state.folds[*state_index];
-                    let values = scalar_tuple(&call_columns[aggregate], row)?;
-                    reduction.apply(call_state, &values, difference, state.weight)?;
-                }
-            }
+            self.apply_extrema_row(
+                &mut state,
+                &columns.layouts,
+                row,
+                difference,
+                &mut pending_extrema,
+                &mut entries,
+            )?;
+            self.apply_fold_row(&mut state, &columns.calls, row, difference)?;
 
             if state.weight == 0 {
                 output.push(
-                    &group_columns,
+                    &columns.groups,
                     row,
                     old_output.expect("an existing group has positive weight"),
                     -1,
                 )?;
+                // Delete known persisted keys directly and drop keys that only
+                // existed in the pending cache. The drain handles older keys.
+                pending_extrema.discard_group(&mut entries, state.id)?;
                 drain_group_entries(self.layouts.len(), &mut entries, state.id)?;
-                groups.remove(&group)?;
             } else {
-                let new_output = call_output(
-                    &self.calls,
-                    &self.layouts,
-                    &self.slots,
-                    &state.folds,
-                    &state.extremes,
-                    state.weight,
-                )?;
+                let new_output = self.group_output(&state)?;
                 match old_output {
-                    None => output.push(&group_columns, row, new_output, 1)?,
+                    None => output.push(&columns.groups, row, new_output, 1)?,
                     Some(old_output) if old_output != new_output => {
-                        output.push(&group_columns, row, old_output, -1)?;
-                        output.push(&group_columns, row, new_output, 1)?;
+                        output.push(&columns.groups, row, old_output, -1)?;
+                        output.push(&columns.groups, row, new_output, 1)?;
                     }
                     Some(_) => {}
                 }
-                groups.put(&group, &state)?;
+                pending.state = Some(state);
             }
+        }
+        pending_extrema.flush_all(&mut entries)?;
+        if let Some(pending) = pending_group {
+            flush_pending_group(&mut groups, pending)?;
+        }
+        if let Some(next_group_id) = next_group_id {
+            control.set(&next_group_id)?;
         }
 
         Ok(output.finish(&self.output_schema)?)
     }
+}
+
+fn flush_pending_group(
+    groups: &mut OrderedMapAccess<'_, Vec<u8>, GroupState>,
+    pending: PendingGroup,
+) -> Result<(), AggregateError> {
+    if pending
+        .comparison_baseline
+        .as_ref()
+        .is_some_and(|baseline| pending.state.as_ref() == Some(baseline))
+    {
+        return Ok(());
+    }
+    match pending.state {
+        Some(state) => groups.put(&pending.key, &state)?,
+        None if pending.was_present => {
+            groups.erase(&pending.key)?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn encode_tuple(
@@ -321,32 +599,6 @@ fn scalar_tuple(columns: &[ArrayRef], row: usize) -> Result<Vec<ScalarValue>, Ag
         .collect()
 }
 
-fn call_output(
-    calls: &[BoundCall],
-    layouts: &[BoundLayout],
-    slots: &[ExtremaSlot],
-    fold_states: &[Vec<u8>],
-    extremes: &[Option<Vec<u8>>],
-    group_weight: u64,
-) -> Result<Vec<ScalarValue>, AggregateError> {
-    calls
-        .iter()
-        .map(|call| match call {
-            BoundCall::Fold {
-                state, reduction, ..
-            } => reduction.output(&fold_states[*state], group_weight),
-            BoundCall::Extrema { slot } => {
-                let target = &slots[*slot];
-                let layout = &layouts[target.layout];
-                match extremes[*slot].as_deref() {
-                    None => null(layout.field.data_type()),
-                    Some(key) => ordered_value(&layout.field, key).map_err(map_order_error),
-                }
-            }
-        })
-        .collect()
-}
-
 /// Removes every key a dying group still owns.
 ///
 /// The relaxed validation accepts a stream that drives a group's row count to
@@ -365,8 +617,7 @@ pub(super) fn drain_group_entries(
             .expect("the layout count is bounded by the aggregate call count");
         let mut partition = entries.partition(&EntryPartition::new(partition_id, group))?;
         while let Some(entry) = partition.first()? {
-            let removal = i64::try_from(entry.multiplicity).unwrap_or(i64::MAX);
-            partition.adjust(&entry.key, -removal)?;
+            partition.set_multiplicity(&entry.key, 0)?;
         }
     }
     Ok(())

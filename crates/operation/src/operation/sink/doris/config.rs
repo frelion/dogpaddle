@@ -4,10 +4,10 @@ use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 
 use super::error::{DorisSinkError, database, invalid_config, invalid_spec};
+use crate::operation::sink::is_valid_sink_id;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 64;
-const MAX_SINK_ID_BYTES: usize = 32;
 
 /// Ephemeral credentials and endpoint for one Apache Doris sink.
 pub struct DorisSinkConfig {
@@ -175,13 +175,7 @@ impl DorisTargetSpec {
     }
 
     fn validate_names(&self) -> Result<(), DorisSinkError> {
-        if self.sink_id.is_empty()
-            || self.sink_id.len() > MAX_SINK_ID_BYTES
-            || !self
-                .sink_id
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
+        if !is_valid_sink_id(&self.sink_id) {
             return Err(invalid_spec(
                 "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
             ));

@@ -39,9 +39,7 @@ fn bind(arguments: &[BoundExpression]) -> Result<BoundReduction, AggregateSchema
 
 impl Fold for Sum {
     fn empty(&self) -> Vec<u8> {
-        match self {
-            Self::Signed | Self::Unsigned => vec![0; 16],
-        }
+        vec![0; 16]
     }
 
     fn apply(

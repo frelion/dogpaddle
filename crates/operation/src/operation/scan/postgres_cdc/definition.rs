@@ -60,7 +60,7 @@ pub struct PostgresCdcScanSpec {
 /// initial snapshot remains private until it is complete, then drains through
 /// the ordinary Flow output before WAL streaming resumes from the snapshot's
 /// sealed checkpoint.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PostgresCdcScanDefinition {
     spec: PostgresCdcScanSpec,
     bootstrap_spool_bytes: NonZeroU64,
@@ -78,7 +78,7 @@ impl PostgresCdcScanDefinition {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid identifiers or an oversized specification.
+    /// Returns an error for invalid identifiers or an oversized persistent definition.
     pub fn try_new(
         spec: PostgresCdcScanSpec,
         bootstrap_spool_bytes: NonZeroU64,
@@ -184,7 +184,7 @@ pub(crate) fn decode_definition(
     Ok(Box::new(definition))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistentDefinition {
     spec: PostgresCdcScanSpec,
@@ -192,11 +192,7 @@ struct PersistentDefinition {
 }
 
 fn encode(definition: &PostgresCdcScanDefinition) -> Result<Vec<u8>, PostgresCdcScanError> {
-    serde_json::to_vec(&PersistentDefinition {
-        spec: definition.spec.clone(),
-        bootstrap_spool_bytes: definition.bootstrap_spool_bytes.get(),
-    })
-    .map_err(|_| {
+    serde_json::to_vec(definition).map_err(|_| {
         PostgresCdcScanError::InvalidDefinition("cannot encode scan definition".to_owned())
     })
 }
@@ -238,13 +234,6 @@ fn validate(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError> {
     }
     if spec.columns.is_empty() || spec.columns.len() > 1600 {
         return Err(invalid("pilot tables require between 1 and 1600 columns"));
-    }
-    if serde_json::to_vec(spec)
-        .map_err(|_| invalid("cannot encode scan specification"))?
-        .len()
-        > MAX_DEFINITION_BYTES
-    {
-        return Err(invalid("scan specification exceeds 1 MiB"));
     }
     Ok(())
 }

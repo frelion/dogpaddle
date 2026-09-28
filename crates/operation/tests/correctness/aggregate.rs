@@ -13,7 +13,7 @@ use dogpaddle_operation::{
     OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
     encode_definition,
     operation::{
-        Action, Operation,
+        Action, Operation, Turn,
         transform::{
             AggregateCall, AggregateDefinition, AggregateDefinitionError, AggregateError,
             AggregateSchemaError,
@@ -808,6 +808,7 @@ fn non_unit_differences_and_rebatching_preserve_the_flattened_trace() {
         ("A", Some(20), 1),
         ("A", Some(10), -1),
         ("A", Some(20), -1),
+        ("A", Some(30), 1),
     ];
     let expected = aggregate_trace(&events, &[events.len()]);
     assert_eq!(
@@ -823,10 +824,155 @@ fn non_unit_differences_and_rebatching_preserve_the_flattened_trace() {
             1,
         ))
     );
-    assert_eq!(expected.last().unwrap().7, -1);
-    for batches in [&[1, 4][..], &[2, 1, 2], &[1, 1, 1, 1, 1]] {
+    assert_eq!(expected[expected.len() - 2].7, -1);
+    assert_eq!(expected.last().unwrap().7, 1);
+    for batches in [&[1, 5][..], &[2, 1, 3], &[1, 1, 1, 1, 1, 1]] {
         assert_eq!(aggregate_trace(&events, batches), expected);
     }
+}
+
+#[test]
+fn repeated_extrema_key_refreshes_each_ordered_prefix_across_batching() {
+    let events = [
+        ("A", Some(10), 1),
+        ("A", Some(20), 1),
+        ("A", Some(10), 1),
+        ("A", Some(10), -2),
+        ("A", Some(10), 1),
+    ];
+    let expected = aggregate_trace(&events, &[events.len()]);
+    let row = |rows, sum, avg, min, max, diff| {
+        (
+            "A".to_owned(),
+            rows,
+            rows,
+            Some(sum),
+            Some(avg),
+            Some(min),
+            Some(max),
+            diff,
+        )
+    };
+    assert_eq!(
+        expected,
+        vec![
+            row(1, 10, 10.0, 10, 10, 1),
+            row(1, 10, 10.0, 10, 10, -1),
+            row(2, 30, 15.0, 10, 20, 1),
+            row(2, 30, 15.0, 10, 20, -1),
+            row(3, 40, 40.0 / 3.0, 10, 20, 1),
+            row(3, 40, 40.0 / 3.0, 10, 20, -1),
+            row(1, 20, 20.0, 20, 20, 1),
+            row(1, 20, 20.0, 20, 20, -1),
+            row(2, 30, 15.0, 10, 20, 1),
+        ]
+    );
+    assert_eq!(aggregate_trace(&events, &[2, 1, 2]), expected);
+    assert_eq!(aggregate_trace(&events, &[1, 1, 1, 1, 1]), expected);
+}
+
+#[test]
+fn existing_group_net_zero_cycle_emits_ordered_updates_and_survives_reopen() {
+    let root = TestStore::new();
+    let definition = definition();
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
+    let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    let cycle = change(&["A", "A"], &[Some(10), Some(10)], &[1, -1]);
+    let Action::Complete(Some(output)) =
+        commit_ready(&mut operation, Some(turn_input(&cycle)), &mut transactions).unwrap()
+    else {
+        panic!("the intermediate COUNT/SUM change must emit updates");
+    };
+    assert_eq!(
+        output_rows(&output),
+        [
+            a((2, 2, Some(30), Some(15.0), Some(10), Some(20), -1)),
+            a((3, 3, Some(40), Some(40.0 / 3.0), Some(10), Some(20), 1)),
+            a((3, 3, Some(40), Some(40.0 / 3.0), Some(10), Some(20), -1)),
+            a((2, 2, Some(30), Some(15.0), Some(10), Some(20), 1)),
+        ]
+    );
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let mut operation = reopen_aggregate(&store, &definition);
+    let mut transactions = store.into_transactions();
+    let retract = change(&["A"], &[Some(10)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("the reopened group must retain its original state");
+    };
+    assert_eq!(
+        output_rows(&output),
+        [
+            a((2, 2, Some(30), Some(15.0), Some(10), Some(20), -1)),
+            a((1, 1, Some(20), Some(20.0), Some(20), Some(20), 1)),
+        ]
+    );
+}
+
+#[test]
+fn group_death_discards_pending_new_extrema_before_same_change_recreation() {
+    let root = TestStore::new();
+    let definition = definition();
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
+    let initial = change(&["A"], &[None], &[1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    // The first value exists only in the pending extrema cache when the two
+    // NULL retractions kill the group. The final row recreates the same group
+    // key with a new durable group ID in this Change.
+    let replace = change(
+        &["A", "A", "A", "A"],
+        &[Some(10), None, None, Some(20)],
+        &[1, -1, -1, 1],
+    );
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&replace)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("group death and recreation must emit ordered transitions");
+    };
+    assert_eq!(
+        output_rows(&output).last(),
+        Some(&a((1, 1, Some(20), Some(20.0), Some(20), Some(20), 1)))
+    );
+
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let mut operation = reopen_aggregate(&store, &definition);
+    let mut transactions = store.into_transactions();
+    let retract = change(&["A"], &[Some(20)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("the recreated group must survive reopen");
+    };
+    assert_eq!(
+        output_rows(&output),
+        [a((1, 1, Some(20), Some(20.0), Some(20), Some(20), -1))]
+    );
 }
 
 #[test]
@@ -954,6 +1100,166 @@ fn unknown_extrema_argument_rolls_back_the_whole_change() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(minimum.values(), &[30]);
+}
+
+#[test]
+fn cached_extrema_underflow_poisons_commit_and_preserves_durable_state() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+        ],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
+    let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 3]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    // The first event reads Store, the second updates the pending count, and
+    // the last underflows that cached prefix while the group weight stays valid.
+    let invalid = change(
+        &["A", "A", "A"],
+        &[Some(10), Some(10), Some(10)],
+        &[1, 1, -4],
+    );
+    let Turn::Ready(prepared) = operation.turn(Some(turn_input(&invalid))).unwrap() else {
+        panic!("aggregate must prepare an input turn");
+    };
+    let transaction = transactions.begin();
+    let Err(error) = prepared.apply(transaction.access()) else {
+        panic!("the cached extrema prefix must underflow");
+    };
+    assert!(matches!(
+        error.downcast_ref::<AggregateError>(),
+        Some(AggregateError::ExtremaWeightUnderflow)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+
+    let retract = change(&["A"], &[Some(10)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("the failed turn changed durable extrema counts");
+    };
+    let minimum = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(minimum.values(), &[10, 20]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
+}
+
+#[test]
+fn first_extrema_event_underflow_poisons_commit_after_read_only_lookup() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [("min", AggregateCall::min(col("value")))],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
+    let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    let invalid = change(&["A"], &[Some(11)], &[-1]);
+    let Turn::Ready(prepared) = operation.turn(Some(turn_input(&invalid))).unwrap() else {
+        panic!("aggregate must prepare an input turn");
+    };
+    let transaction = transactions.begin();
+    let Err(error) = prepared.apply(transaction.access()) else {
+        panic!("the absent argument must underflow");
+    };
+    assert!(matches!(
+        error.downcast_ref::<AggregateError>(),
+        Some(AggregateError::ExtremaWeightUnderflow)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+
+    let retract = change(&["A"], &[Some(10)], &[-1]);
+    let Action::Complete(Some(output)) = commit_ready(
+        &mut operation,
+        Some(turn_input(&retract)),
+        &mut transactions,
+    )
+    .unwrap() else {
+        panic!("the failed turn changed durable extrema counts");
+    };
+    let minimum = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(minimum.values(), &[10, 20]);
+    assert_eq!(output.diffs().values(), &[-1, 1]);
+}
+
+#[test]
+fn cached_extrema_overflow_poisons_commit() {
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [("min", AggregateCall::min(col("value")))],
+    )
+    .unwrap();
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
+    let initial = change(
+        &["A", "A", "A"],
+        &[Some(10), Some(10), Some(10)],
+        &[i64::MAX, i64::MAX, 1],
+    );
+    commit_ready(
+        &mut operation,
+        Some(turn_input(&initial)),
+        &mut transactions,
+    )
+    .unwrap();
+
+    // A NULL retraction leaves room in the group count while the ordered
+    // argument returns to u64::MAX inside the pending extrema cache.
+    let invalid = change(
+        &["A", "A", "A", "A"],
+        &[Some(10), Some(10), None, Some(10)],
+        &[-1, 1, -1, 1],
+    );
+    let Turn::Ready(prepared) = operation.turn(Some(turn_input(&invalid))).unwrap() else {
+        panic!("aggregate must prepare an input turn");
+    };
+    let transaction = transactions.begin();
+    let Err(error) = prepared.apply(transaction.access()) else {
+        panic!("the cached extrema prefix must overflow");
+    };
+    assert!(matches!(
+        error.downcast_ref::<AggregateError>(),
+        Some(AggregateError::ArithmeticOverflow)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
 }
 
 #[test]

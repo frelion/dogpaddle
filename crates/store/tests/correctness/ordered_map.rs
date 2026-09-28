@@ -32,6 +32,10 @@ fn ordered_map_point_operations_are_exact() {
     assert_eq!(access.get(&7).unwrap(), Some("first".to_owned()));
     access.put(&7, &"second".to_owned()).unwrap();
     assert_eq!(access.get(&7).unwrap(), Some("second".to_owned()));
+    access.erase(&7).unwrap();
+    assert_eq!(access.get(&7).unwrap(), None);
+    access.erase(&7).unwrap();
+    access.put(&7, &"third".to_owned()).unwrap();
     assert!(access.remove(&7).unwrap());
     assert!(!access.remove(&7).unwrap());
     assert_eq!(access.get(&7).unwrap(), None);

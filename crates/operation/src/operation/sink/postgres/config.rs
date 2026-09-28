@@ -5,10 +5,10 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls};
 
 use super::error::{PostgresSinkError, database_error, invalid_config, invalid_spec, timeout};
+use crate::operation::sink::is_valid_sink_id;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 63;
-const MAX_SINK_ID_BYTES: usize = 32;
 
 pub(super) struct PgClient {
     pub(super) runtime: Runtime,
@@ -364,13 +364,7 @@ impl PostgresTargetSpec {
 }
 
 fn validate_names(spec: &PostgresTargetSpec) -> Result<(), PostgresSinkError> {
-    if spec.sink_id.is_empty()
-        || spec.sink_id.len() > MAX_SINK_ID_BYTES
-        || !spec
-            .sink_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
+    if !is_valid_sink_id(&spec.sink_id) {
         return Err(invalid_spec(
             "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
         ));

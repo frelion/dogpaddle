@@ -17,13 +17,6 @@ struct RowPlan {
     ids: VecDeque<u64>,
 }
 
-struct Span {
-    row_index: usize,
-    group: usize,
-    insert: bool,
-    take: u64,
-}
-
 pub(super) const MAX_CANONICAL_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn prepare(
@@ -51,7 +44,7 @@ pub(super) fn prepare(
 
     let mut groups = Vec::<RowPlan>::new();
     let mut keys = HashMap::<Vec<u8>, usize>::new();
-    let mut spans = Vec::with_capacity(change.num_rows());
+    let mut row_groups = Vec::with_capacity(change.num_rows());
     let mut next_id_after = next_id;
     let canonical_rows = bounded_canonical_rows(change)?;
 
@@ -96,12 +89,7 @@ pub(super) fn prepare(
                 .ok_or_else(|| invalid("relation lookup count exceeds usize"))?;
             row.net -= i128::from(take);
         }
-        spans.push(Span {
-            row_index,
-            group,
-            insert,
-            take,
-        });
+        row_groups.push(group);
     }
 
     lookup(target, change, next_id, &mut groups)?;
@@ -111,21 +99,20 @@ pub(super) fn prepare(
         deletes: Vec::new(),
     };
     let mut allocated = next_id;
-    for span in spans {
-        let ids = &mut groups[span.group].ids;
-        for _ in 0..span.take {
-            if span.insert {
+    for (row_index, group) in row_groups.into_iter().enumerate() {
+        let ids = &mut groups[group].ids;
+        let difference = change.diffs().value(row_index);
+        for _ in 0..difference.unsigned_abs() {
+            if difference > 0 {
                 batch.inserts.push(Insert {
-                    row_index: u64::try_from(span.row_index)
-                        .expect("an addressable row index fits u64"),
+                    row_index: u64::try_from(row_index).expect("an addressable row index fits u64"),
                     technical_id: allocated,
                 });
                 ids.push_back(allocated);
                 allocated += 1;
             } else {
                 batch.deletes.push(Delete {
-                    row_index: u64::try_from(span.row_index)
-                        .expect("an addressable row index fits u64"),
+                    row_index: u64::try_from(row_index).expect("an addressable row index fits u64"),
                     technical_id: ids.pop_front().ok_or_else(|| {
                         invalid("target returned too few IDs for an admitted row")
                     })?,

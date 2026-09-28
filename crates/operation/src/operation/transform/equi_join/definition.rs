@@ -32,7 +32,6 @@ pub(crate) struct EquiJoinLayout {
     pub(super) keys: Box<[BoundKeyPair]>,
     pub(super) residual: Option<BoundExpression>,
     pub(super) nulls: [Vec<ScalarValue>; 2],
-    pub(super) has_residual: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,7 +241,6 @@ impl EquiJoinDefinition {
             }
         }
         let output_schema = Arc::new(Schema::new(output_fields));
-        let has_residual = residual.is_some();
         Ok(EquiJoinLayout {
             kind: self.kind,
             input_schemas,
@@ -251,7 +249,6 @@ impl EquiJoinDefinition {
             keys: keys.into_boxed_slice(),
             residual,
             nulls,
-            has_residual,
         })
     }
 }

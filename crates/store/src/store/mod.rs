@@ -1,6 +1,4 @@
-use std::{
-    cell::Cell as PoisonFlag, collections::BTreeMap, marker::PhantomData, rc::Rc, sync::Arc,
-};
+use std::{cell::Cell, collections::BTreeMap, marker::PhantomData, rc::Rc, sync::Arc};
 
 use rocksdb::{
     OptimisticTransactionDB as Database, SnapshotWithThreadMode, Transaction as RocksTransaction,
@@ -156,7 +154,8 @@ pub struct ReadTransactions {
 pub struct Transaction<'database> {
     inner: RocksTransaction<'database, Database>,
     store_token: u64,
-    poisoned: PoisonFlag<bool>,
+    poisoned: Cell<bool>,
+    has_writes: Cell<bool>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -187,7 +186,7 @@ pub struct Transaction<'database> {
 pub struct ReadTransaction<'database> {
     snapshot: SnapshotWithThreadMode<'database, Database>,
     store_token: u64,
-    poisoned: PoisonFlag<bool>,
+    poisoned: Cell<bool>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 

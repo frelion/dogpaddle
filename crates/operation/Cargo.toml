@@ -49,6 +49,11 @@ harness = false
 test = true
 
 [[bench]]
+name = "distinct"
+harness = false
+test = true
+
+[[bench]]
 name = "equi_join"
 harness = false
 test = true

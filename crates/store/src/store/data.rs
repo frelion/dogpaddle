@@ -139,7 +139,7 @@ impl<'transaction> DataAccess<'transaction> {
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.transaction.ensure_healthy()?;
         let key = physical_key(self.read.prefix, key);
-        self.transaction.record_result(
+        self.transaction.record_write_result(
             self.transaction
                 .inner
                 .put(key, value)
@@ -160,7 +160,7 @@ impl<'transaction> DataAccess<'transaction> {
     pub(crate) fn erase(&mut self, key: &[u8]) -> Result<(), StoreError> {
         self.transaction.ensure_healthy()?;
         let key = physical_key(self.read.prefix, key);
-        self.transaction.record_result(
+        self.transaction.record_write_result(
             self.transaction
                 .inner
                 .delete(key)
@@ -225,6 +225,25 @@ impl TransactionRef<'_> {
         self.record_result(result)
     }
 
+    fn get_bounded(self, key: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+        self.ensure_healthy()?;
+        let result = match self {
+            Self::Read(transaction) => transaction
+                .snapshot
+                .get_pinned(key)
+                .map_err(|error| StoreError::storage("read bounded data", error))
+                .and_then(|value| copy_bounded_value(value, max_bytes)),
+            Self::Write(transaction) => {
+                let snapshot = transaction.inner.snapshot();
+                snapshot
+                    .get_pinned(key)
+                    .map_err(|error| StoreError::storage("read bounded data", error))
+                    .and_then(|value| copy_bounded_value(value, max_bytes))
+            }
+        };
+        self.record_result(result)
+    }
+
     fn is_physically_empty(self, prefix: [u8; 5]) -> Result<bool, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
@@ -271,6 +290,23 @@ impl TransactionRef<'_> {
     }
 }
 
+fn copy_bounded_value(
+    value: Option<impl AsRef<[u8]>>,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.as_ref();
+    if value.len() > max_bytes {
+        return Err(StoreError::ItemTooLarge {
+            size: value.len(),
+            limit: max_bytes,
+        });
+    }
+    Ok(Some(value.to_vec()))
+}
+
 impl ReadDataAccess<'_> {
     /// Marks the transaction unusable when a collection-level operation fails.
     pub(crate) fn poison_on_error<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
@@ -295,6 +331,16 @@ impl ReadDataAccess<'_> {
     /// Reads the exact encoded value length without constructing an owned payload buffer.
     pub(crate) fn value_len(&self, key: &[u8]) -> Result<Option<usize>, StoreError> {
         self.transaction.value_len(&physical_key(self.prefix, key))
+    }
+
+    /// Reads an encoded value only when it fits the caller's owned-byte bound.
+    pub(crate) fn get_bounded(
+        &self,
+        key: &[u8],
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.transaction
+            .get_bounded(&physical_key(self.prefix, key), max_bytes)
     }
 
     /// Reports whether this namespace contains no entries.

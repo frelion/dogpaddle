@@ -328,7 +328,9 @@ impl<T: StoreValue> Subscription<T> {
                 });
         let encoded_len = data.as_read().record_result(encoded_len)?;
         let (old_head, new_head) = acknowledgement_frontiers(&positions, index, next);
-        validate_retention(data.as_read(), metadata, old_head)?;
+        // The length read above already proves this entry exists. Reuse that
+        // result when it is also a retention boundary.
+        validate_retention(data.as_read(), metadata, old_head, Some(actual))?;
         let retained_bytes = if new_head == old_head {
             None
         } else {
@@ -411,7 +413,7 @@ fn read_frontier(data: &ReadDataAccess<'_>, metadata: Metadata) -> Result<u64, S
         .iter()
         .min()
         .expect("a subscribed log has a non-empty subscriber set");
-    validate_retention(data, metadata, head)?;
+    validate_retention(data, metadata, head, None)?;
     Ok(head)
 }
 
@@ -539,6 +541,7 @@ fn validate_retention(
     data: &ReadDataAccess<'_>,
     metadata: Metadata,
     head: u64,
+    known_present: Option<u64>,
 ) -> Result<(), StoreError> {
     let entries = metadata.tail - head;
     if entries == 0 {
@@ -568,7 +571,7 @@ fn validate_retention(
             },
         );
     }
-    if !data.contains_key(&entry_key(head))? {
+    if known_present != Some(head) && !data.contains_key(&entry_key(head))? {
         return fail(
             data,
             StoreError::CorruptSubscribedLog {
@@ -576,7 +579,8 @@ fn validate_retention(
             },
         );
     }
-    if !data.contains_key(&entry_key(metadata.tail - 1))? {
+    let last = metadata.tail - 1;
+    if last != head && known_present != Some(last) && !data.contains_key(&entry_key(last))? {
         return fail(
             data,
             StoreError::CorruptSubscribedLog {
@@ -781,6 +785,60 @@ mod tests {
         assert!(matches!(
             subscription.acknowledge(0, transaction.access()),
             Err(StoreError::CorruptSubscribedLog { .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+
+        let transaction = transactions.begin();
+        assert_eq!(
+            marker.access(transaction.access()).unwrap().get().unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn acknowledgement_still_rejects_a_missing_distinct_tail_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let log = store.create_data::<SubscribedLog<Vec<u8>>>("log").unwrap();
+        let marker = store.create_data::<Cell<u64>>("marker").unwrap();
+        let writer = log.writer();
+        let subscription = log.subscription(0);
+        let mut transactions = store.into_transactions();
+
+        let transaction = transactions.begin();
+        log.initialize(NonZeroU64::new(2).unwrap(), transaction.access())
+            .unwrap();
+        for value in [1, 2] {
+            assert!(
+                writer
+                    .try_append(&vec![value], NonZeroU64::MAX, transaction.access())
+                    .unwrap()
+            );
+        }
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        log.data
+            .access(transaction.access())
+            .unwrap()
+            .erase(&entry_key(1))
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let transaction = transactions.begin();
+        marker
+            .access(transaction.access())
+            .unwrap()
+            .set(&1)
+            .unwrap();
+        assert!(matches!(
+            subscription.acknowledge(0, transaction.access()),
+            Err(StoreError::CorruptSubscribedLog {
+                reason: "the entry before the tail is missing"
+            })
         ));
         assert!(matches!(
             transaction.commit(),

@@ -4,6 +4,8 @@ mod plan;
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 
+use arrow_array::RecordBatch;
+use arrow_schema::{Field, SchemaRef};
 use dogpaddle_change::Change;
 use thiserror::Error;
 
@@ -176,6 +178,39 @@ impl<T> RelationSinkTarget<T> {
     pub(crate) const fn new(target: T) -> Self {
         Self { target }
     }
+}
+
+/// Encodes each field once and projects its fresh canonical bytes to a target value.
+pub(crate) fn encode_target_values<V>(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+    row_index: usize,
+    mut value: impl FnMut(usize, &Field, &[u8]) -> V,
+) -> Result<(Vec<u8>, Vec<V>), RowError> {
+    if batch.schema_ref().as_ref() != schema.as_ref() {
+        return Err(RowError::SchemaMismatch);
+    }
+    if row_index >= batch.num_rows() {
+        return Err(RowError::RowOutOfBounds {
+            row_index,
+            rows: batch.num_rows(),
+        });
+    }
+
+    let mut canonical = Vec::new();
+    let mut values = Vec::with_capacity(schema.fields().len());
+    for (index, (field, array)) in schema.fields().iter().zip(batch.columns()).enumerate() {
+        let start = canonical.len();
+        encode_canonical(
+            field,
+            array.as_ref(),
+            row_index,
+            field.name(),
+            &mut canonical,
+        )?;
+        values.push(value(index, field, &canonical[start..]));
+    }
+    Ok((canonical, values))
 }
 
 pub(super) fn relation_event_bytes(

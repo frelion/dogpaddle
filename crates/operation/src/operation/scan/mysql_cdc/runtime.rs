@@ -1,6 +1,6 @@
 use super::{
     MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanSpec,
-    convert::{SnapshotProgress, convert_records, convert_snapshot_records},
+    convert::{SnapshotProgress, convert_snapshot_values, convert_values},
 };
 use crate::operation::OperationError;
 use crate::operation::scan::cdc_runtime::{Captured, CdcRuntime, Phase, Source};
@@ -55,13 +55,15 @@ impl Source for MySqlSource {
         records: &[Record],
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
-        Ok(convert_snapshot_records(
+        Ok(convert_snapshot_values(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
             &self.spec.database,
             &self.spec.table,
-            records,
+            records
+                .iter()
+                .map(|record| (record.topic(), record.value())),
             progress,
         )?)
     }
@@ -70,13 +72,15 @@ impl Source for MySqlSource {
         schema: SchemaRef,
         records: &[Record],
     ) -> Result<Option<Change>, OperationError> {
-        Ok(convert_records(
+        Ok(convert_values(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
             &self.spec.database,
             &self.spec.table,
-            records,
+            records
+                .iter()
+                .map(|record| (record.topic(), record.value())),
         )?)
     }
     fn restore_checkpoint(

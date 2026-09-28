@@ -132,6 +132,23 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
         self.data.delete(encoded_key.as_ref())
     }
 
+    /// Unconditionally stages one key's deletion without first reading it.
+    ///
+    /// Use [`Self::remove`] when the caller needs to know whether the key
+    /// existed. `erase` is intended for callers that already established the
+    /// key's presence and would otherwise repeat the same point lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key encoding or storage access fails.
+    pub fn erase(&mut self, key: &K) -> Result<(), StoreError> {
+        let encoded_key = self
+            .data
+            .poison_on_error(key.encode_key())
+            .map_err(StoreError::from)?;
+        self.data.erase(encoded_key.as_ref())
+    }
+
     /// Returns one fully decoded page in an ordered key range.
     ///
     /// `resume_after` excludes the last key of the preceding page. The limit

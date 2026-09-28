@@ -125,7 +125,7 @@ impl CellAccess<'_, Vec<u8>> {
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
     pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
-        read_byte_cell_bounded(self.data.as_read(), max_bytes)
+        self.data.as_read().get_bounded(CELL_KEY, max_bytes)
     }
 }
 
@@ -151,7 +151,7 @@ impl CellReadAccess<'_, Vec<u8>> {
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
     pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
-        read_byte_cell_bounded(&self.data, max_bytes)
+        self.data.get_bounded(CELL_KEY, max_bytes)
     }
 }
 
@@ -163,22 +163,6 @@ fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, Stor
             .transpose(),
     )
     .map_err(StoreError::from)
-}
-
-fn read_byte_cell_bounded(
-    data: &ReadDataAccess<'_>,
-    max_bytes: usize,
-) -> Result<Option<Vec<u8>>, StoreError> {
-    let Some(size) = data.value_len(CELL_KEY)? else {
-        return Ok(None);
-    };
-    if size > max_bytes {
-        return Err(StoreError::ItemTooLarge {
-            size,
-            limit: max_bytes,
-        });
-    }
-    read_cell(data)
 }
 
 impl<T> Clone for Cell<T> {

@@ -211,12 +211,8 @@ fn canonical_record_batch(records: &RecordBatch) -> Result<RecordBatch, ArrowErr
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    decode_filter(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-fn decode_filter(payload: &[u8]) -> Result<FilterDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let predicate = StoredExpression::decode(&mut cursor)?;
     cursor.finish()?;
-    Ok(FilterDefinition { predicate })
+    Ok(Box::new(FilterDefinition { predicate }))
 }

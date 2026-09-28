@@ -8,10 +8,13 @@ Store 自己拥有 workload、fixture、seed、预热、正确性断言和结果
 
 ### `cell`
 
-- `hot_get_one_tx`：在一个事务中重复读取已预热的 `Cell<u64>`；
+- `hot_get_one_tx`：在一个事务中重复读取已预热的 `Cell<u64>`，随后结束无写入事务而不进入 WAL；
 - `read_update_commit`：每次 read-modify-write 都提交一个 durable transaction。
 
 ### `ordered_map`
+
+除点查、分页和同步写入外，`bulk_remove_checked_commit` 与 `bulk_erase_known_commit` 使用相同的预填充
+map 和删除集合，区分“需要返回存在性”的 remove 与“调用方已经证明存在”的无条件 erase 成本。
 
 这个 target 只测量当前唯一的 `OrderedMap<u64, Vec<u8>>`。场景分别回答：
 

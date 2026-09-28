@@ -24,3 +24,11 @@ pub use postgres::{
 pub use sqlite::{
     SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkError, SqliteSinkSchemaError,
 };
+
+fn is_valid_sink_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}

@@ -7,7 +7,6 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use dogpaddle_change::Change;
-use dogpaddle_debezium::Record;
 use serde_json::{Map, Value};
 
 use super::{MySqlCdcScanError, MySqlColumn, MySqlType};
@@ -19,48 +18,6 @@ type Row = Map<String, Value>;
 pub(crate) struct SnapshotProgress {
     saw_snapshot_row: bool,
     saw_last: bool,
-}
-
-pub(super) fn convert_records(
-    columns: &[MySqlColumn],
-    output_schema: SchemaRef,
-    topic_prefix: &str,
-    database: &str,
-    table: &str,
-    records: &[Record],
-) -> Result<Option<Change>, MySqlCdcScanError> {
-    convert_values(
-        columns,
-        output_schema,
-        topic_prefix,
-        database,
-        table,
-        records
-            .iter()
-            .map(|record| (record.topic(), record.value())),
-    )
-}
-
-pub(super) fn convert_snapshot_records(
-    columns: &[MySqlColumn],
-    output_schema: SchemaRef,
-    topic_prefix: &str,
-    database: &str,
-    table: &str,
-    records: &[Record],
-    progress: SnapshotProgress,
-) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
-    convert_snapshot_values(
-        columns,
-        output_schema,
-        topic_prefix,
-        database,
-        table,
-        records
-            .iter()
-            .map(|record| (record.topic(), record.value())),
-        progress,
-    )
 }
 
 // The byte-level boundary also lets tests use actual Connect JSON without

@@ -114,19 +114,16 @@ impl<T: StoreValue> QueueAccess<'_, T> {
     /// accounting overflows, or persisted queue state is corrupt.
     pub fn try_push(&mut self, value: &T, capacity: NonZeroU64) -> Result<bool, StoreError> {
         let metadata = self.read_metadata()?;
-        let metadata = if metadata.is_empty() {
-            Metadata::EMPTY
-        } else {
-            if !self
+        let was_empty = metadata.is_empty();
+        if !was_empty
+            && !self
                 .data
                 .contains_key(&encode_sequence(metadata.tail - 1))?
-            {
-                return self.fail(StoreError::CorruptQueue {
-                    reason: "the entry before the tail is missing",
-                });
-            }
-            metadata
-        };
+        {
+            return self.fail(StoreError::CorruptQueue {
+                reason: "the entry before the tail is missing",
+            });
+        }
         let encoded = self
             .data
             .poison_on_error(value.encode_value().map_err(StoreError::from))?;
@@ -144,7 +141,9 @@ impl<T: StoreValue> QueueAccess<'_, T> {
             return self.fail(StoreError::QueueSequenceExhausted);
         };
         let key = encode_sequence(metadata.tail);
-        if self.data.contains_key(&key)? {
+        // Missing metadata is accepted as empty only after read_metadata has
+        // proved the entire namespace empty, so sequence zero cannot collide.
+        if !was_empty && self.data.contains_key(&key)? {
             return self.fail(StoreError::CorruptQueue {
                 reason: "an entry already exists at the next sequence number",
             });
@@ -161,14 +160,15 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         Ok(true)
     }
 
-    /// Removes and returns the value at the front of the queue.
+    /// Removes and returns the value at the front of the queue, together with
+    /// whether the queue is empty after removal. `None` means it was empty.
     ///
     /// # Errors
     ///
     /// Returns an error when decoding or storage fails, byte accounting
     /// underflows, or persisted queue state is corrupt. Any such error poisons
     /// the transaction.
-    pub fn pop_front(&mut self) -> Result<Option<T>, StoreError> {
+    pub fn pop_front(&mut self) -> Result<Option<(T, bool)>, StoreError> {
         let metadata = self.read_metadata()?;
         if metadata.is_empty() {
             return Ok(None);
@@ -187,8 +187,8 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         let value = self
             .data
             .poison_on_error(T::decode_value(Cow::Owned(encoded)).map_err(StoreError::from))?;
-        self.remove_front(metadata, &key, item_bytes)?;
-        Ok(Some(value))
+        let empty_after = self.remove_front(metadata, &key, item_bytes)?;
+        Ok(Some((value, empty_after)))
     }
 
     fn remove_front(
@@ -196,7 +196,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         metadata: Metadata,
         key: &[u8],
         item_bytes: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let Some(queued_bytes) = metadata.queued_bytes.checked_sub(item_bytes) else {
             return self.fail(StoreError::CorruptQueue {
                 reason: "queued-byte metadata is smaller than the front entry",
@@ -205,7 +205,8 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         self.data.erase(key)?;
 
         let head = metadata.head + 1;
-        if head == metadata.tail {
+        let empty_after = head == metadata.tail;
+        if empty_after {
             if queued_bytes != 0 {
                 return self.fail(StoreError::CorruptQueue {
                     reason: "an empty queue has a non-zero byte count",
@@ -229,7 +230,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
                 queued_bytes,
             })?;
         }
-        Ok(())
+        Ok(empty_after)
     }
 
     fn read_metadata(&self) -> Result<Metadata, StoreError> {
@@ -253,17 +254,18 @@ impl<T: StoreValue> QueueAccess<'_, T> {
 impl QueueAccess<'_, Vec<u8>> {
     /// Removes the front byte value without copying or decoding its payload.
     ///
-    /// Returns `false` if the queue is empty. Logical byte accounting and
-    /// transaction rollback match [`Self::pop_front`].
+    /// Returns `None` if the queue was empty, or `Some(empty_after)` when an
+    /// entry was removed. Logical byte accounting and transaction rollback
+    /// match [`Self::pop_front`].
     ///
     /// # Errors
     ///
     /// Returns an error when storage fails, byte accounting underflows, or
     /// persisted queue state is corrupt. Any such error poisons the transaction.
-    pub fn discard_front(&mut self) -> Result<bool, StoreError> {
+    pub fn discard_front(&mut self) -> Result<Option<bool>, StoreError> {
         let metadata = self.read_metadata()?;
         if metadata.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let key = encode_sequence(metadata.head);
@@ -276,8 +278,8 @@ impl QueueAccess<'_, Vec<u8>> {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error),
         };
-        self.remove_front(metadata, &key, item_bytes)?;
-        Ok(true)
+        let empty_after = self.remove_front(metadata, &key, item_bytes)?;
+        Ok(Some(empty_after))
     }
 }
 

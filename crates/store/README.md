@@ -117,7 +117,15 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 
 `StoreData` 是 sealed trait；产品代码只能使用这些结构，不能绕过 catalog 自造新的物理布局。
 
-`Cell<Vec<u8>>` 另提供 `get_bounded(max_bytes)`。它在同一个 snapshot 中先检查编码长度，再决定是否
+`OrderedMap::remove` 先确认 key 是否存在并返回该结果；已经从同一事务取得存在性证据的调用方可用
+`erase` 直接暂存 tombstone，避免删除前重复 point lookup。
+
+`OrderedMultiset` 和 `PartitionedMultiset` 的 `adjust` 逐次检查 signed difference 的负前缀与
+`u64` overflow。已按事件顺序自行检查权重的调用方可用对应 access 的 `set_multiplicity` 一次写回
+最终值；它不再次读取旧权重，也不替调用方检查中间前缀。写入零会删除 key；调用方仍须在事务内
+保持校验和写回的原子性。
+
+`Cell<Vec<u8>>` 另提供 `get_bounded(max_bytes)`。它通过一次 pinned lookup 先检查编码长度，再决定是否
 复制 owned value；超限返回 `ItemTooLarge`，不会毒化事务，调用方可以在同一事务提高 limit 后重试。
 
 ### Queue 与 `SubscribedLog` 的区别
@@ -129,7 +137,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - `SubscribedLog` 允许多个 consumer 分别读取。每个 subscription 保存自己的下一条位置，最慢的 consumer
   决定数据何时可以回收。
 
-`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front` 只读 front 的编码长度以精确扣减计费，不复制或解码完整 value；和 `pop_front` 共用删除、最后一项清理与损坏检查，仍由调用方事务统一提交或回滚。
+`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front` 只读 front 的编码长度以精确扣减计费，不复制或解码完整 value；和 `pop_front` 共用删除、最后一项清理与损坏检查。两种出队都返回删除后的空状态，调用方不必再读一次 metadata；事务仍由调用方统一提交或回滚。
 `SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 `RocksDB` 自身开销。
 
 `SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
@@ -206,7 +214,7 @@ Store 在返回前完成准入、复制和完整解码；错误不会交付半�
 
 ## 提交、错误与恢复
 
-底层使用 `RocksDB` `OptimisticTransactionDB`。写事务使用 WAL 并同步提交。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
+底层使用 `RocksDB` `OptimisticTransactionDB`。包含写入的事务使用 WAL 并同步提交；没有暂存写入的健康事务在 `commit` 时直接完成，不进入 `RocksDB` 写队列或同步 WAL。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
 全部回滚。
 
 以下错误会使当前事务中毒：编码或解码失败、损坏的 metadata、使用另一个 Store 的 handle、RocksDB 访问失败、

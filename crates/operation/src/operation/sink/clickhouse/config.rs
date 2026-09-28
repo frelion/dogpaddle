@@ -5,11 +5,11 @@ use ureq::Agent;
 use url::Url;
 
 use super::error::{ClickHouseSinkError, database, invalid_config, invalid_response, invalid_spec};
+use crate::operation::sink::is_valid_sink_id;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 255;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_SINK_ID_BYTES: usize = 32;
 
 /// Ephemeral HTTP credentials and endpoint for one `ClickHouse` sink.
 pub struct ClickHouseSinkConfig {
@@ -210,13 +210,7 @@ impl ClickHouseTargetSpec {
     }
 
     fn validate_names(&self) -> Result<(), ClickHouseSinkError> {
-        if self.sink_id.is_empty()
-            || self.sink_id.len() > MAX_SINK_ID_BYTES
-            || !self
-                .sink_id
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
+        if !is_valid_sink_id(&self.sink_id) {
             return Err(invalid_spec(
                 "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
             ));

@@ -38,6 +38,54 @@ pub(super) fn measure_bulk_put(fixture: &mut MapFixture, entries: usize) -> Dura
     elapsed
 }
 
+pub(super) fn measure_bulk_remove(fixture: &mut MapFixture, entries: usize) -> Duration {
+    measure_bulk_delete(fixture, entries, true)
+}
+
+pub(super) fn measure_bulk_erase(fixture: &mut MapFixture, entries: usize) -> Duration {
+    measure_bulk_delete(fixture, entries, false)
+}
+
+fn measure_bulk_delete(fixture: &mut MapFixture, entries: usize, check_presence: bool) -> Duration {
+    let mut removed = 0_usize;
+    let started = std::time::Instant::now();
+    let transaction = fixture.writes.begin();
+    {
+        let mut map = fixture
+            .map
+            .access(transaction.access())
+            .expect("access bulk-delete map");
+        for key in 0..u64::try_from(entries).expect("entry count fits u64") {
+            if check_presence {
+                removed += usize::from(map.remove(&key).expect("remove seeded benchmark entry"));
+            } else {
+                map.erase(&key).expect("erase seeded benchmark entry");
+            }
+        }
+    }
+    transaction.commit().expect("commit bulk delete");
+    let elapsed = started.elapsed();
+    if check_presence {
+        assert_eq!(removed, entries);
+    }
+
+    let snapshot = fixture.reads.begin();
+    let map = fixture
+        .map
+        .read(snapshot.access())
+        .expect("read bulk-delete map");
+    let page = map
+        .scan(
+            ..,
+            ScanDirection::Ascending,
+            None,
+            ScanLimit::new(1, usize::MAX).expect("one item is a valid scan limit"),
+        )
+        .expect("scan deleted benchmark map");
+    assert!(page.entries.is_empty());
+    elapsed
+}
+
 pub(super) fn measure_point_get(fixture: &MapFixture, operations: usize) -> Duration {
     let started = std::time::Instant::now();
     let checksum = {

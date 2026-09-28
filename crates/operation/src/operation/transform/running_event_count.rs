@@ -86,7 +86,10 @@ impl SealedDefinition for RunningEventCountDefinition {
         let count = scope.data::<Cell<u64>>(COUNT)?;
         Ok(ConstructedOperation::atomic(
             output_schema(),
-            RunningEventCountOperation::new(Arc::clone(&input_schemas[0]), count),
+            RunningEventCountOperation {
+                input_schema: Arc::clone(&input_schemas[0]),
+                count,
+            },
         ))
     }
 }
@@ -101,17 +104,6 @@ impl OperationDefinition for RunningEventCountDefinition {
     }
 
     fn encode_payload(&self, _output: &mut Vec<u8>) {}
-}
-
-impl RunningEventCountOperation {
-    /// Creates a running event-count operation from its durable count.
-    #[must_use]
-    const fn new(input_schema: SchemaRef, count: Cell<u64>) -> Self {
-        Self {
-            input_schema,
-            count,
-        }
-    }
 }
 
 impl AtomicOperation for RunningEventCountOperation {
@@ -138,18 +130,15 @@ impl AtomicOperation for RunningEventCountOperation {
             .checked_add(1)
             .expect("nonempty Change fitting the count has a first value");
         let values = (first..=final_count).collect::<Vec<_>>();
-        let output = uint64_change(values)?;
+        let row_count = values.len();
+        let records =
+            RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
+        let diffs = Int64Array::from(vec![1_i64; row_count]);
+        let output = Change::try_new(records, diffs)?;
 
         count.set(&final_count)?;
         Ok(Some(output))
     }
-}
-
-fn uint64_change(values: Vec<u64>) -> Result<Change, OperationError> {
-    let row_count = values.len();
-    let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
-    let diffs = Int64Array::from(vec![1_i64; row_count]);
-    Ok(Change::try_new(records, diffs)?)
 }
 
 fn output_schema() -> SchemaRef {

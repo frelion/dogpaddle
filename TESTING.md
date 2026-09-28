@@ -156,14 +156,15 @@ AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提�
 | `change_codec` | Change 自有五路旋转 runner |
 | `cell` | Criterion |
 | `projection` | Operation 自有 Criterion：Select/SchemaAlign 的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
-| `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX，以及独立的多真实 layout MIN/MAX；两轮 turn/apply/sync commit/AfterCommit，fixture 与输出 oracle 不计时 |
+| `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单 turn 多行、单 turn 重复极值 key、同 turn 净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |
+| `distinct` | Operation 自有 Criterion：同一 Change 内同 key 连续正负循环与两 key 交错循环；每轮完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 和逐事件输出 oracle 不计时 |
 | `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条发布和未完成快照逐条清理，宽 IPC 用同一 entry/row 布局配对发布与清理；计时一次 restore 及全部 spool entry 的 turn/apply/同步 commit/AfterCommit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
 | `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的全部分页 turns、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
 | `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
 | `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、nearest+tolerance 和 residual 远候选回退；每次计时包含一对使关系回到初始态的完整 Claim、全部分页 turns、同步 commit 和 AfterCommit，fixture、seed 与结果校验不计时 |
 | `asof_join_resources` | Operation 自有进程隔离 runner：分页候选、宽/超大单行、whole-Claim、residual 远回退、右侧历史 rematch、双侧 NULL-order history N/2N，以及 port 1 的 empty-left distinct N/2N preload、same-key 高 multiplicity 和 active-overlay N/2N growth；分别输出一个完整 driving Claim 的 Rust allocator heap、每页产生的 Arrow array memory/行数、turn 数，以及独立 non-profile pass 扫描两个 rows map 得到的持久逻辑 entry/key+value bytes；RSS 明示 unavailable |
-| `ordered_map` | Criterion；完整 owned-page 扫描 |
+| `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除 |
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
 | `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含同一 Select（选列）→Select（追加列）→Filter→Select→SchemaAlign 逻辑链的独立 Station 与线性多 Operation Station 对照 |
@@ -242,6 +243,7 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench ch
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench projection
+DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench distinct
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench buffered_sink

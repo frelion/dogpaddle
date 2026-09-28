@@ -7,7 +7,7 @@
 
 `Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition payload 为空，只声明 `distinct.weights: OrderedMultiset<Vec<u8>>`。
 key 是完整 canonical row bytes，multiplicity 是 Store 维护的正 `u64`；缺失表示零，checked signed adjustment 归零即删除。
-输入按行序逐事件更新：负前缀和 overflow 回滚整个 turn，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。
+输入按行序逐事件更新：负前缀和 overflow 回滚整个 turn，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。同一 Change 内连续相同 key 只缓存一个 key 和其当前 `u64` 权重；仍逐事件校验及产出边界，key 切换或 turn 结束时才写回最终权重，净变化为零时不写。无效前缀继续毒化 Store 事务。
 状态、output 和 input completion 同事务提交，背压与 reopen 保持同一输入语义。
 SQL `SELECT DISTINCT` 复用这一 exact-row identity，包括按原始位模式区分浮点值。
 canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation` 模块；Store 只提供通用 multiplicity，不预建 Aggregate/Join 的关系框架。
@@ -18,7 +18,8 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 `Aggregate` 的 tag 是 14，是单输入的 grouped relational Transform；至少一个 group expression，aggregate call 可以为空。
 Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。
 它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: PartitionedMultiset<EntryPartition, Vec<u8>>` 和 `aggregate.control: Cell<u64>`：groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个 Fold call 的小状态与每个极值 slot 的缓存极值；entries 的 partition 是 `layout + group ID`，每个 layout 对应一个不同的排序表达式，只维护有序的 extrema argument key，不保存完整输入行；control 只分配不复用的 group ID。
-极值 slot 在绑定期按 `(layout, 方向)` 去重产生，`MIN(x), MAX(x)` 共用一个 layout、两个 slot，重复的同一调用复用一个 slot；group state 里的缓存是该 slot 当前极值键的保序字节，与 entries 在同一事务更新，只有被撤回的正是缓存极值时回分区重取 `first`/`last`，因此 NULL 参数既不进分区也不进缓存。
+极值 slot 在绑定期按 `(layout, 方向)` 去重产生，`MIN(x), MAX(x)` 共用一个 layout、两个 slot，重复的同一调用复用一个 slot；group state 里的缓存是该 slot 当前极值键的保序字节，与 entries 在同一事务更新，只有被撤回的正是缓存极值时回分区重取 `first`/`last`，因此 NULL 参数既不进分区也不进缓存。同一组的相邻相同极值参数在当前事务内暂存至每个 layout 一个 key：首次只读该 key 的份数，随后逐事件检查并更新输出；换 key、换组、撤回缓存极值而需重读分区或完成 Change 前，才将最终份数写回 entries。组归零时对已持久化的 pending key 直接暂存 tombstone，丢弃只存在于缓存的新 key，再清理其余持久分区，避免写入随即删除。仅当前连续 key run 的最终份数等于读入份数时，这个 run 不写 entries；其它 run 仍可在同一 Change 内写入。无效前缀仍交给 Store 的 checked adjustment 毒化事务。待写缓存与 entries 合起来是当前事务内的有效极值状态；提交时两者均已同步持久化。
+同一组的相邻事件也只暂存一个 group；一行 lookahead 使每行 group key 只编码一次，单行 run 不复制原状态。已有 group 的 run 至少两行时保留读入的原状态，逐事件结果照常输出，离开 run 或完成 Change 时若最终 group state 等于原状态则不写 groups。若各 layout 的连续极值 key run 也净零且未因缓存极值撤回而重读分区，Aggregate 对此 run 不暂存 groups/entries 写入。
 静态函数 descriptor 唯一声明 stable function tag、arity、binding 和 `Fold`/`Extrema` reduction；COUNT/SUM/AVG 使用每组定长 Fold state，MIN/MAX 从缓存极值取结果，函数实现只接收值或小状态，不接收 Store。
 校验按「分组 + 调用参数」而不是按记录进行：只有从未出现过的分组遇到负 diff、分组行数减为负、某个 Fold call 的非空参数计数减为负、某个极值参数的份数减为负才报错；撤回一行而它的参数组合被其它行覆盖不再报错，需要记录级身份的算子继续按完整行记账。
 每个输入事件按行序完成全部 call 更新和旧行 `-1`/新行 `+1`；组首次出现只输出 `+1`，消失只输出 `-1`，结果未变不输出，整个 Change 的状态、output 和 input completion 同事务提交，任何负权重、overflow 或背压均不留下部分状态。
@@ -26,7 +27,7 @@ COUNT 输出 non-null `Int64`；SUM 仅接受 `Int64/UInt64` 并保持类型；A
 group key 不能包含 Float32/Float64；global aggregate、grouping sets、aggregate modifier、UDF、浮点 SUM/AVG/MIN/MAX、List/Struct MIN/MAX 均不属于 v1。
 
 MIN/MAX 的 NULL 参数不进入 entries/cache。
-参数级撤回允许组归零时存在不可达旧 extrema keys；归零必须在同一事务按 layout 清空，空分区仍执行边界检查。
+参数级撤回允许组归零时存在不可达旧 extrema keys；归零必须在同一事务按 layout 清空，空分区仍执行边界检查。清理时从有序首项已取得 key 和份数，直接删除该 key，不再对份数做第二次点读。
 
 ## EquiJoin
 

@@ -51,6 +51,56 @@ fn ordered_multiset_adjusts_exactly_and_survives_reopen() {
 }
 
 #[test]
+fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let multiset = store
+        .create_data::<OrderedMultiset<Vec<u8>>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let key = b"row".to_vec();
+
+    {
+        let transaction = transactions.begin();
+        let mut values = multiset.access(transaction.access()).unwrap();
+        values.set_multiplicity(&key, u64::MAX).unwrap();
+        assert_eq!(values.multiplicity(&key).unwrap(), u64::MAX);
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    let store = Store::open(&path).unwrap();
+    let multiset = store
+        .open_data::<OrderedMultiset<Vec<u8>>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin();
+        let mut values = multiset.access(transaction.access()).unwrap();
+        assert_eq!(values.multiplicity(&key).unwrap(), u64::MAX);
+        values.set_multiplicity(&key, 0).unwrap();
+        assert_eq!(values.multiplicity(&key).unwrap(), 0);
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    let store = Store::open(path).unwrap();
+    let multiset = store
+        .open_data::<OrderedMultiset<Vec<u8>>>("values")
+        .unwrap();
+    let transaction = store.read_transaction();
+    assert_eq!(
+        multiset
+            .read(transaction.access())
+            .unwrap()
+            .multiplicity(&key)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn invalid_multiplicity_adjustments_poison_and_roll_back_the_transaction() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
@@ -197,6 +247,95 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
             .multiplicity(&keys[3])
             .unwrap(),
         4
+    );
+}
+
+#[test]
+fn partitioned_multiset_replaces_weight_without_changing_other_partitions() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let multiset = store
+        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let first = b"first".to_vec();
+    let second = b"second".to_vec();
+    let key = b"key".to_vec();
+
+    {
+        let transaction = transactions.begin();
+        let mut values = multiset.access(transaction.access()).unwrap();
+        values
+            .partition(&first)
+            .unwrap()
+            .set_multiplicity(&key, u64::MAX)
+            .unwrap();
+        values
+            .partition(&second)
+            .unwrap()
+            .set_multiplicity(&key, 7)
+            .unwrap();
+        assert_eq!(
+            values
+                .partition(&first)
+                .unwrap()
+                .multiplicity(&key)
+                .unwrap(),
+            u64::MAX
+        );
+        transaction.commit().unwrap();
+    }
+
+    {
+        let transaction = transactions.begin();
+        let mut values = multiset.access(transaction.access()).unwrap();
+        values
+            .partition(&first)
+            .unwrap()
+            .set_multiplicity(&key, 0)
+            .unwrap();
+        assert_eq!(
+            values
+                .partition(&first)
+                .unwrap()
+                .multiplicity(&key)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            values
+                .partition(&second)
+                .unwrap()
+                .multiplicity(&key)
+                .unwrap(),
+            7
+        );
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+
+    let store = Store::open(path).unwrap();
+    let multiset = store
+        .open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .unwrap();
+    let transaction = store.read_transaction();
+    let values = multiset.read(transaction.access()).unwrap();
+    assert_eq!(
+        values
+            .partition(&first)
+            .unwrap()
+            .multiplicity(&key)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        values
+            .partition(&second)
+            .unwrap()
+            .multiplicity(&key)
+            .unwrap(),
+        7
     );
 }
 

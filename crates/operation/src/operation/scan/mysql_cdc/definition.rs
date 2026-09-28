@@ -50,7 +50,7 @@ pub struct MySqlCdcScanSpec {
 /// private durable spool, publishes that spool, and then continues from the
 /// snapshot's sealed checkpoint. No source-write gate is required. Online
 /// Schema evolution is not supported.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct MySqlCdcScanDefinition {
     spec: MySqlCdcScanSpec,
     bootstrap_spool_bytes: NonZeroU64,
@@ -171,7 +171,7 @@ pub(crate) fn decode_definition(
     Ok(Box::new(definition))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistentDefinition {
     spec: MySqlCdcScanSpec,
@@ -179,11 +179,9 @@ struct PersistentDefinition {
 }
 
 fn encode(definition: &MySqlCdcScanDefinition) -> Result<Vec<u8>, MySqlCdcScanError> {
-    serde_json::to_vec(&PersistentDefinition {
-        spec: definition.spec.clone(),
-        bootstrap_spool_bytes: definition.bootstrap_spool_bytes,
+    serde_json::to_vec(definition).map_err(|_| {
+        MySqlCdcScanError::InvalidDefinition("cannot encode scan definition".to_owned())
     })
-    .map_err(|_| MySqlCdcScanError::InvalidDefinition("cannot encode scan definition".to_owned()))
 }
 
 pub(super) fn validate_spec(spec: &MySqlCdcScanSpec) -> Result<(), MySqlCdcScanError> {

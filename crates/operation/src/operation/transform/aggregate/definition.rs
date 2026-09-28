@@ -12,10 +12,7 @@ use crate::{
 
 use super::{
     AggregateDefinitionError, AggregateSchemaError,
-    functions::{
-        AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, argument_field,
-        descriptor,
-    },
+    functions::{AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, descriptor},
     runtime::{BoundAggregate, BoundCall, BoundLayout, ExtremaSlot},
     value::contains_float,
 };
@@ -282,11 +279,11 @@ impl AggregateDefinition {
 
             match bound.reduction {
                 Reduction::Fold(reduction) => {
-                    calls.push(BoundCall::fold(
-                        fold_states,
-                        arguments.into_boxed_slice(),
+                    calls.push(BoundCall::Fold {
+                        state: fold_states,
+                        arguments: arguments.into_boxed_slice(),
                         reduction,
-                    ));
+                    });
                     fold_states += 1;
                 }
                 Reduction::Extrema(direction) => {
@@ -300,7 +297,7 @@ impl AggregateDefinition {
                         .expect("extrema has exactly one bound argument");
                     let layout = indexed_layout(&mut layouts, stored, argument, aggregate);
                     let slot = indexed_slot(&mut slots, &mut layouts[layout].1, layout, direction);
-                    calls.push(BoundCall::extrema(slot));
+                    calls.push(BoundCall::Extrema { slot });
                 }
             }
         }
@@ -334,7 +331,11 @@ fn indexed_layout(
         stored.clone(),
         BoundLayout {
             owner,
-            field: Arc::new(argument_field(&argument)),
+            field: Arc::new(Field::new(
+                "argument",
+                argument.output_type().clone(),
+                argument.output_nullable(),
+            )),
             expression: argument,
             min_slot: None,
             max_slot: None,

@@ -36,9 +36,9 @@ fn queue_is_fifo_and_survives_reopen() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     let mut queue = queue.access(transaction.access()).unwrap();
-    assert_eq!(queue.pop_front().unwrap(), Some(b"first".to_vec()));
+    assert_eq!(queue.pop_front().unwrap(), Some((b"first".to_vec(), false)));
     assert_eq!(queue.queued_bytes().unwrap(), 8 + 6);
-    assert_eq!(queue.pop_front().unwrap(), Some(b"second".to_vec()));
+    assert_eq!(queue.pop_front().unwrap(), Some((b"second".to_vec(), true)));
     assert!(queue.is_empty().unwrap());
     assert_eq!(queue.queued_bytes().unwrap(), 0);
     assert_eq!(queue.pop_front().unwrap(), None);
@@ -73,7 +73,7 @@ fn capacity_is_hard_even_for_an_empty_queue_and_counts_the_private_key() {
             .try_push(&Vec::new(), NonZeroU64::new(115).unwrap())
             .unwrap()
     );
-    assert_eq!(queue.pop_front().unwrap(), Some(value.clone()));
+    assert_eq!(queue.pop_front().unwrap(), Some((value.clone(), true)));
     assert!(queue.is_empty().unwrap());
 
     // Emptying the queue resets its private sequence and capacity accounting.
@@ -98,7 +98,7 @@ fn discard_front_counts_bytes_and_rolls_back_with_other_state() {
     {
         let transaction = transactions.begin();
         let mut access = queue.access(transaction.access()).unwrap();
-        assert!(!access.discard_front().unwrap());
+        assert_eq!(access.discard_front().unwrap(), None);
         assert!(access.try_push(&vec![1; 4], capacity).unwrap());
         assert!(access.try_push(&vec![2; 10], capacity).unwrap());
         assert_eq!(access.queued_bytes().unwrap(), 30);
@@ -107,7 +107,7 @@ fn discard_front_counts_bytes_and_rolls_back_with_other_state() {
     {
         let transaction = transactions.begin();
         let mut access = queue.access(transaction.access()).unwrap();
-        assert!(access.discard_front().unwrap());
+        assert_eq!(access.discard_front().unwrap(), Some(false));
         assert_eq!(access.queued_bytes().unwrap(), 18);
         cell.access(transaction.access()).unwrap().set(&1).unwrap();
         // Both the discarded entry and cell update must roll back.
@@ -115,15 +115,15 @@ fn discard_front_counts_bytes_and_rolls_back_with_other_state() {
     {
         let transaction = transactions.begin();
         let mut access = queue.access(transaction.access()).unwrap();
-        assert_eq!(access.pop_front().unwrap(), Some(vec![1; 4]));
+        assert_eq!(access.pop_front().unwrap(), Some((vec![1; 4], false)));
         assert_eq!(access.queued_bytes().unwrap(), 18);
         assert_eq!(
             cell.access(transaction.access()).unwrap().get().unwrap(),
             None
         );
-        assert!(access.discard_front().unwrap());
+        assert_eq!(access.discard_front().unwrap(), Some(true));
         assert_eq!(access.queued_bytes().unwrap(), 0);
-        assert!(!access.discard_front().unwrap());
+        assert_eq!(access.discard_front().unwrap(), None);
         assert!(access.try_push(&vec![3; 32], capacity).unwrap());
         assert_eq!(access.queued_bytes().unwrap(), 40);
         transaction.commit().unwrap();
@@ -135,8 +135,8 @@ fn discard_front_counts_bytes_and_rolls_back_with_other_state() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     let mut access = queue.access(transaction.access()).unwrap();
-    assert_eq!(access.pop_front().unwrap(), Some(vec![3; 32]));
-    assert!(!access.discard_front().unwrap());
+    assert_eq!(access.pop_front().unwrap(), Some((vec![3; 32], true)));
+    assert_eq!(access.discard_front().unwrap(), None);
     transaction.commit().unwrap();
 }
 
@@ -161,7 +161,7 @@ fn pop_and_other_state_roll_back_together() {
             .unwrap()
             .pop_front()
             .unwrap(),
-        Some(10)
+        Some((10, false))
     );
     cell.access(transaction.access()).unwrap().set(&1).unwrap();
     drop(transaction);
@@ -173,7 +173,7 @@ fn pop_and_other_state_roll_back_together() {
             .unwrap()
             .pop_front()
             .unwrap(),
-        Some(10)
+        Some((10, false))
     );
     assert_eq!(
         cell.access(transaction.access()).unwrap().get().unwrap(),
@@ -250,17 +250,19 @@ fn codec_failures_poison_and_roll_back_the_whole_transaction() {
         None
     );
     // Only the byte-valued queue supports discarding without invoking a codec.
-    assert!(
+    assert_eq!(
         raw.access(transaction.access())
             .unwrap()
             .discard_front()
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
-    assert!(
-        !raw.access(transaction.access())
+    assert_eq!(
+        raw.access(transaction.access())
             .unwrap()
             .discard_front()
-            .unwrap()
+            .unwrap(),
+        None
     );
     transaction.commit().unwrap();
 }

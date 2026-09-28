@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mysql::Value;
 
 use super::{error::DorisSinkError, schema::DorisLayout};
-use crate::operation::sink::relation::{RowError, encode_canonical, row_hash};
+use crate::operation::sink::relation::{RowError, encode_target_values, row_hash};
 
 #[derive(Debug)]
 pub(super) struct DorisRowCodec {
@@ -29,28 +29,10 @@ impl DorisRowCodec {
         batch: &RecordBatch,
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
-        if batch.schema_ref().as_ref() != self.schema().as_ref() {
-            return Err(RowError::SchemaMismatch);
-        }
-        if row_index >= batch.num_rows() {
-            return Err(RowError::RowOutOfBounds {
-                row_index,
-                rows: batch.num_rows(),
-            });
-        }
-        let mut canonical = Vec::new();
-        let mut values = Vec::with_capacity(self.schema().fields().len());
-        for (field, array) in self.schema().fields().iter().zip(batch.columns()) {
-            let start = canonical.len();
-            encode_canonical(
-                field,
-                array.as_ref(),
-                row_index,
-                field.name(),
-                &mut canonical,
-            )?;
-            values.push(doris_value(field.data_type(), &canonical[start..]));
-        }
+        let (canonical, values) =
+            encode_target_values(self.schema(), batch, row_index, |_, field, bytes| {
+                doris_value(field.data_type(), bytes)
+            })?;
         Ok(EncodedRow {
             hash: hex(&row_hash(&canonical)),
             values,

@@ -64,6 +64,9 @@ impl StoreSetup {
             inner: begin_write_transaction(&database),
             store_token: self.token,
             poisoned: std::cell::Cell::new(false),
+            // The marker is always staged below, even when the draft catalog
+            // and initializer are otherwise empty.
+            has_writes: std::cell::Cell::new(true),
             _thread_bound: std::marker::PhantomData,
         };
         transaction
@@ -130,6 +133,7 @@ impl Transactions {
             inner: begin_write_transaction(&self.database),
             store_token: self.store_token,
             poisoned: std::cell::Cell::new(false),
+            has_writes: std::cell::Cell::new(false),
             _thread_bound: std::marker::PhantomData,
         }
     }
@@ -164,6 +168,8 @@ impl Transaction<'_> {
     }
 
     /// Atomically commits all changes and consumes the transaction.
+    /// A healthy transaction that staged no writes completes without entering
+    /// the `RocksDB` write queue or synchronizing its WAL.
     ///
     /// # Errors
     ///
@@ -171,10 +177,16 @@ impl Transaction<'_> {
     /// commit it.
     pub fn commit(self) -> Result<(), StoreError> {
         let Self {
-            inner, poisoned, ..
+            inner,
+            poisoned,
+            has_writes,
+            ..
         } = self;
         if poisoned.get() {
             return Err(StoreError::TransactionPoisoned);
+        }
+        if !has_writes.get() {
+            return Ok(());
         }
         commit_transaction(inner)
     }
@@ -184,6 +196,17 @@ impl Transaction<'_> {
             && error.poisons_transaction()
         {
             self.poisoned.set(true);
+        }
+        result
+    }
+
+    pub(super) fn record_write_result<T>(
+        &self,
+        result: Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let result = self.record_result(result);
+        if result.is_ok() {
+            self.has_writes.set(true);
         }
         result
     }

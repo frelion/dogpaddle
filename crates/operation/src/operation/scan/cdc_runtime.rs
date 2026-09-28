@@ -213,7 +213,7 @@ impl<B: Source> CdcRuntime<B> {
     fn reset(&mut self) -> Turn<'_> {
         Turn::ready(move |access| {
             let mut spool = self.spool.access(access)?;
-            let finished = !spool.discard_front()? || spool.is_empty()?;
+            let finished = spool.discard_front()?.unwrap_or(true);
             if finished {
                 self.checkpoint.access(access)?.clear()?;
                 self.phase_cell.access(access)?.clear()?;
@@ -316,9 +316,10 @@ impl<B: Source> CdcRuntime<B> {
         self.stop_connector("snapshot")?;
         Ok(Turn::ready(move |access| {
             let mut spool = self.spool.access(access)?;
-            let change = spool
-                .pop_front()?
-                .map(|encoded| {
+            let popped = spool.pop_front()?;
+            let finished = popped.as_ref().is_none_or(|(_, empty_after)| *empty_after);
+            let change = popped
+                .map(|(encoded, _)| {
                     let change = decode_change_owned(encoded)
                         .map_err(|_| B::invalid_state("bootstrap spool Change is invalid"))?;
                     if change.records().schema() != self.output_schema {
@@ -329,7 +330,6 @@ impl<B: Source> CdcRuntime<B> {
                     Ok::<_, OperationError>(change)
                 })
                 .transpose()?;
-            let finished = spool.is_empty()?;
             if finished {
                 self.phase_cell.access(access)?.set(&STREAMING)?;
             }

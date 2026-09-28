@@ -1,6 +1,6 @@
 use super::{
     PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanSpec,
-    convert::{CaptureProgress, convert_capture_records, convert_records},
+    convert::{CaptureProgress, convert_capture_values, convert_values},
 };
 use crate::operation::OperationError;
 use crate::operation::scan::cdc_runtime::{Captured, CdcRuntime, Phase, Source};
@@ -56,13 +56,15 @@ impl Source for PostgresSource {
         records: &[Record],
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
-        Ok(convert_capture_records(
+        Ok(convert_capture_values(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
             &self.spec.schema,
             &self.spec.table,
-            records,
+            records
+                .iter()
+                .map(|record| (record.topic(), record.value())),
             progress,
         )?)
     }
@@ -71,13 +73,15 @@ impl Source for PostgresSource {
         schema: SchemaRef,
         records: &[Record],
     ) -> Result<Option<Change>, OperationError> {
-        Ok(convert_records(
+        Ok(convert_values(
             &self.spec.columns,
             schema,
             &self.spec.engine_name,
             &self.spec.schema,
             &self.spec.table,
-            records,
+            records
+                .iter()
+                .map(|record| (record.topic(), record.value())),
         )?)
     }
     fn restore_checkpoint(

@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use rusqlite::{Row, types::ValueRef};
 
 pub(super) use crate::operation::sink::relation::RowError;
-use crate::operation::sink::relation::{encode_canonical, row_hash};
+use crate::operation::sink::relation::{encode_target_values, row_hash};
 
 /// Maps shared canonical row values to `SQLite`'s exact storage representation.
 #[derive(Debug)]
@@ -27,28 +27,10 @@ impl RowCodec {
         batch: &RecordBatch,
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
-        if batch.schema_ref().as_ref() != self.schema.as_ref() {
-            return Err(RowError::SchemaMismatch);
-        }
-        if row_index >= batch.num_rows() {
-            return Err(RowError::RowOutOfBounds {
-                row_index,
-                rows: batch.num_rows(),
-            });
-        }
-        let mut canonical = Vec::new();
-        let mut values = Vec::with_capacity(self.schema.fields().len());
-        for (field, array) in self.schema.fields().iter().zip(batch.columns()) {
-            let start = canonical.len();
-            encode_canonical(
-                field,
-                array.as_ref(),
-                row_index,
-                field.name(),
-                &mut canonical,
-            )?;
-            values.push(sqlite_value(field.data_type(), &canonical[start..]));
-        }
+        let (canonical, values) =
+            encode_target_values(&self.schema, batch, row_index, |_, field, bytes| {
+                sqlite_value(field.data_type(), bytes)
+            })?;
         Ok(EncodedRow {
             hash: row_hash(&canonical),
             #[cfg(test)]

@@ -611,7 +611,7 @@ impl EquiJoinOperation {
         };
         let after = adjust_match_count(before, transition, amount)?;
         if after == 0 {
-            counts.remove(&key)?;
+            counts.erase(&key)?;
         } else {
             counts.put(&key, &after)?;
         }
@@ -739,7 +739,7 @@ impl EquiJoinOperation {
             let mut value = counts.get(&row.key)?.unwrap_or_default();
             value.adjust(port, change.before(), change.after())?;
             if value.is_empty() {
-                counts.remove(&row.key)?;
+                counts.erase(&row.key)?;
             } else {
                 counts.put(&row.key, &value)?;
             }

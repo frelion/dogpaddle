@@ -4,6 +4,7 @@ use std::{
 };
 
 use dogpaddle_change::Change;
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
@@ -625,9 +626,12 @@ fn verify_view(
     Ok(())
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
 struct ObjectMetadata {
     engine: String,
     comment: String,
+    #[serde(rename = "create_table_query")]
     create_query: String,
     sorting_key: String,
     primary_key: String,
@@ -647,40 +651,7 @@ fn object_metadata(
         ),
         "inspect target object",
     )?;
-    let value: Value =
-        serde_json::from_str(body.trim()).map_err(|_| invalid_response("inspect target object"))?;
-    Ok(ObjectMetadata {
-        engine: value
-            .get("engine")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        comment: value
-            .get("comment")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        create_query: value
-            .get("create_table_query")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        sorting_key: value
-            .get("sorting_key")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        primary_key: value
-            .get("primary_key")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        engine_full: value
-            .get("engine_full")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-    })
+    serde_json::from_str(body.trim()).map_err(|_| invalid_response("inspect target object"))
 }
 
 fn select_tail(sql: &str) -> Option<String> {

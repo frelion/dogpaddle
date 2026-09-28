@@ -1,4 +1,4 @@
-use arrow_schema::{DataType, Field};
+use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 
 use crate::expression::BoundExpression;
@@ -61,14 +61,6 @@ const DESCRIPTORS: &[Descriptor] = &[
 
 pub(super) fn descriptor(tag: u16) -> Option<&'static Descriptor> {
     DESCRIPTORS.iter().find(|descriptor| descriptor.tag == tag)
-}
-
-pub(super) fn argument_field(expression: &BoundExpression) -> Field {
-    Field::new(
-        "argument",
-        expression.output_type().clone(),
-        expression.output_nullable(),
-    )
 }
 
 pub(super) fn unsupported(function: &'static str, data_type: &DataType) -> AggregateSchemaError {

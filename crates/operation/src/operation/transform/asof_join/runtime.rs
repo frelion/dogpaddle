@@ -1104,17 +1104,11 @@ impl AsOfJoinOperation {
     ) -> Result<(), AsOfJoinError> {
         let left = decode_row(&self.input_schemas[0], &prepared_row_bytes(row)?)?;
         match self.kind {
-            AsOfJoinKind::Inner => {
+            AsOfJoinKind::Inner | AsOfJoinKind::LeftOuter => {
                 if let Some(winner) = winner {
                     let right = decode_row(&self.input_schemas[1], &winner.row)?;
                     output.push(&left, &right, row.difference);
-                }
-            }
-            AsOfJoinKind::LeftOuter => {
-                if let Some(winner) = winner {
-                    let right = decode_row(&self.input_schemas[1], &winner.row)?;
-                    output.push(&left, &right, row.difference);
-                } else {
+                } else if self.kind == AsOfJoinKind::LeftOuter {
                     output.push(&left, &self.right_nulls, row.difference);
                 }
             }
@@ -1201,7 +1195,7 @@ impl AsOfJoinOperation {
         match RowWeight::new(effect.after) {
             Some(weight) => rows.put(&row.key, &weight)?,
             None => {
-                rows.remove(&row.key)?;
+                rows.erase(&row.key)?;
             }
         }
         Ok(())

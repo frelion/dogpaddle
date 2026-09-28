@@ -8,7 +8,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
     operation::{
-        Action, Operation,
+        Action, Operation, Turn,
         transform::{DistinctDefinition, DistinctError},
     },
 };
@@ -171,6 +171,127 @@ fn event_order_presence_boundaries_and_rebatching_are_stable() {
     ] {
         assert_eq!(distinct_trace(&events, batches), expected);
     }
+}
+
+#[test]
+fn contiguous_key_cycles_keep_every_boundary_and_only_the_final_weight() {
+    let events = [(7, 1), (7, -1), (7, 3), (7, -1), (8, 1), (7, -2), (7, 1)];
+    let expected = [(7, 1), (7, -1), (7, 1), (8, 1), (7, -1), (7, 1)];
+    for batches in [&[events.len()][..], &[4, 3], &[1, 2, 1, 3]] {
+        assert_eq!(distinct_trace(&events, batches), expected);
+    }
+
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
+    let input = change(
+        &events.iter().map(|event| event.0).collect::<Vec<_>>(),
+        &events.iter().map(|event| event.1).collect::<Vec<_>>(),
+    );
+    commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap();
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("operation/distinct.weights").unwrap();
+    let transaction = store.read_transaction();
+    let weights = weights.read(transaction.access()).unwrap();
+    for (value, expected) in [(7_u64, 1_u64), (8, 1)] {
+        let mut key = vec![1];
+        key.extend_from_slice(&value.to_be_bytes());
+        assert_eq!(weights.multiplicity(&key).unwrap(), expected);
+    }
+}
+
+#[test]
+fn invalid_contiguous_prefix_poisons_and_rolls_back_prior_events() {
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
+    let seed = change(&[7], &[1]);
+    commit_ready(&mut operation, Some(turn_input(&seed)), &mut transactions).unwrap();
+
+    let invalid = change(&[8, 7, 7], &[1, -1, -1]);
+    let transaction = transactions.begin();
+    let error = match operation.turn(Some(turn_input(&invalid))).unwrap() {
+        Turn::Ready(prepared) => match prepared.apply(transaction.access()) {
+            Ok(_) => panic!("the negative prefix must fail"),
+            Err(error) => error,
+        },
+        Turn::Idle => panic!("Distinct must process an offered Change"),
+    };
+    assert!(matches!(
+        error.downcast_ref::<DistinctError>(),
+        Some(DistinctError::NegativeWeight)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+
+    let valid = change(&[7], &[-1]);
+    let mut trace = Vec::new();
+    append_action(
+        commit_ready(&mut operation, Some(turn_input(&valid)), &mut transactions).unwrap(),
+        &mut trace,
+    );
+    assert_eq!(trace, [(7, -1)]);
+}
+
+#[test]
+fn one_contiguous_run_reaches_full_u64_weight() {
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
+    let input = change(&[7, 7, 7], &[i64::MAX, i64::MAX, 1]);
+    let mut trace = Vec::new();
+    append_action(
+        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap(),
+        &mut trace,
+    );
+    assert_eq!(trace, [(7, 1)]);
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let weights: OrderedMultiset<Vec<u8>> = store.open_data("operation/distinct.weights").unwrap();
+    let transaction = store.read_transaction();
+    let mut key = vec![1];
+    key.extend_from_slice(&7_u64.to_be_bytes());
+    assert_eq!(
+        weights
+            .read(transaction.access())
+            .unwrap()
+            .multiplicity(&key)
+            .unwrap(),
+        u64::MAX
+    );
+}
+
+#[test]
+fn contiguous_run_overflow_poisons_and_rolls_back_its_cached_prefix() {
+    let root = TestStore::new();
+    let (mut operation, mut transactions) = construct_operation(&root, &schema());
+    let invalid = change(&[7, 7, 7, 7], &[i64::MAX, i64::MAX, 1, 1]);
+    let transaction = transactions.begin();
+    let error = match operation.turn(Some(turn_input(&invalid))).unwrap() {
+        Turn::Ready(prepared) => match prepared.apply(transaction.access()) {
+            Ok(_) => panic!("the overflow prefix must fail"),
+            Err(error) => error,
+        },
+        Turn::Idle => panic!("Distinct must process an offered Change"),
+    };
+    assert!(matches!(
+        error.downcast_ref::<DistinctError>(),
+        Some(DistinctError::WeightOverflow)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+
+    let valid = change(&[7], &[1]);
+    let mut trace = Vec::new();
+    append_action(
+        commit_ready(&mut operation, Some(turn_input(&valid)), &mut transactions).unwrap(),
+        &mut trace,
+    );
+    assert_eq!(trace, [(7, 1)]);
 }
 
 #[test]

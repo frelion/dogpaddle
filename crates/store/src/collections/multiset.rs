@@ -137,6 +137,24 @@ impl<K: StoreKey> OrderedMultisetAccess<'_, K> {
             .map_err(StoreError::from)?;
         adjust_encoded(&mut self.data, encoded_key.as_ref(), difference)
     }
+
+    /// Replaces one key's multiplicity after the caller has checked its
+    /// ordered adjustments. Zero removes the key; positive values are stored.
+    ///
+    /// This operation does not check prior multiplicity or an event prefix.
+    /// Use [`Self::adjust`] when each signed difference must be validated by
+    /// the Store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key encoding or storage access fails.
+    pub fn set_multiplicity(&mut self, key: &K, multiplicity: u64) -> Result<(), StoreError> {
+        let encoded_key = self
+            .data
+            .poison_on_error(key.encode_key())
+            .map_err(StoreError::from)?;
+        set_encoded_multiplicity(&mut self.data, encoded_key.as_ref(), multiplicity)
+    }
 }
 
 impl<K: StoreKey> OrderedMultisetReadAccess<'_, K> {
@@ -190,12 +208,20 @@ pub(super) fn adjust_encoded(
             .ok_or(StoreError::MultiplicityUnderflow)
     };
     let after = data.poison_on_error(after)?;
-    if after == 0 {
-        data.erase(encoded_key)?;
-    } else {
-        data.put(encoded_key, &after.to_be_bytes())?;
-    }
+    set_encoded_multiplicity(data, encoded_key, after)?;
     Ok(MultiplicityChange { before, after })
+}
+
+pub(super) fn set_encoded_multiplicity(
+    data: &mut DataAccess<'_>,
+    encoded_key: &[u8],
+    multiplicity: u64,
+) -> Result<(), StoreError> {
+    if multiplicity == 0 {
+        data.erase(encoded_key)
+    } else {
+        data.put(encoded_key, &multiplicity.to_be_bytes())
+    }
 }
 
 pub(super) fn first_entry<K: StoreKey>(

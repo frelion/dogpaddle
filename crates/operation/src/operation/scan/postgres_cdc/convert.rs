@@ -8,7 +8,6 @@ use arrow_schema::SchemaRef;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use chrono::DateTime;
 use dogpaddle_change::Change;
-use dogpaddle_debezium::Record;
 use serde_json::{Map, Value};
 
 use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
@@ -35,48 +34,6 @@ enum SnapshotMarker {
     Snapshot,
     Last,
     Streaming,
-}
-
-pub(super) fn convert_records(
-    columns: &[PostgresColumn],
-    output_schema: SchemaRef,
-    topic_prefix: &str,
-    table_schema: &str,
-    table: &str,
-    records: &[Record],
-) -> Result<Option<Change>, PostgresCdcScanError> {
-    convert_values(
-        columns,
-        output_schema,
-        topic_prefix,
-        table_schema,
-        table,
-        records
-            .iter()
-            .map(|record| (record.topic(), record.value())),
-    )
-}
-
-pub(super) fn convert_capture_records(
-    columns: &[PostgresColumn],
-    output_schema: SchemaRef,
-    topic_prefix: &str,
-    table_schema: &str,
-    table: &str,
-    records: &[Record],
-    progress: CaptureProgress,
-) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
-    convert_capture_values(
-        columns,
-        output_schema,
-        topic_prefix,
-        table_schema,
-        table,
-        records
-            .iter()
-            .map(|record| (record.topic(), record.value())),
-        progress,
-    )
 }
 
 // The byte-level boundary also lets tests use actual Connect JSON without

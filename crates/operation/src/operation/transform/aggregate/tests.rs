@@ -22,7 +22,12 @@ fn draining_a_dead_group_removes_only_its_own_partitions() {
         access
             .partition(&EntryPartition::new(0, 4))
             .unwrap()
-            .adjust(&b"dead".to_vec(), 3)
+            .set_multiplicity(&b"dead".to_vec(), u64::MAX)
+            .unwrap();
+        access
+            .partition(&EntryPartition::new(0, 4))
+            .unwrap()
+            .adjust(&b"later".to_vec(), 5)
             .unwrap();
         access
             .partition(&EntryPartition::new(1, 4))
@@ -32,7 +37,7 @@ fn draining_a_dead_group_removes_only_its_own_partitions() {
         access
             .partition(&EntryPartition::new(0, 9))
             .unwrap()
-            .adjust(&b"other".to_vec(), 2)
+            .set_multiplicity(&b"other".to_vec(), u64::MAX)
             .unwrap();
         transaction.commit().unwrap();
     }
@@ -44,8 +49,11 @@ fn draining_a_dead_group_removes_only_its_own_partitions() {
         transaction.commit().unwrap();
     }
 
-    let transaction = transactions.begin();
-    let mut access = entries.access(transaction.access()).unwrap();
+    drop(transactions);
+    let store = Store::open(root.path().join("store")).unwrap();
+    let entries = store.open_data::<Entries>("entries").unwrap();
+    let transaction = store.read_transaction();
+    let access = entries.read(transaction.access()).unwrap();
     for layout in 0..2 {
         let partition = access.partition(&EntryPartition::new(layout, 4)).unwrap();
         assert!(partition.first().unwrap().is_none());
@@ -57,6 +65,6 @@ fn draining_a_dead_group_removes_only_its_own_partitions() {
             .unwrap()
             .multiplicity(&b"other".to_vec())
             .unwrap(),
-        2
+        u64::MAX
     );
 }

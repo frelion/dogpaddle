@@ -7,7 +7,7 @@ use crate::{
 
 use super::multiset::{
     MultiplicityChange, MultisetEntry, MultisetPage, adjust_encoded, first_entry, last_entry,
-    read_encoded_multiplicity, scan_entries,
+    read_encoded_multiplicity, scan_entries, set_encoded_multiplicity,
 };
 
 /// A named persistent collection of independently ordered multisets.
@@ -141,6 +141,20 @@ impl<K: StoreKey> MultisetPartition<'_, '_, K> {
     pub fn adjust(&mut self, key: &K, difference: i64) -> Result<MultiplicityChange, StoreError> {
         let key = encode_key(self.data.as_read(), &self.prefix, key)?;
         adjust_encoded(self.data, &key, difference)
+    }
+
+    /// Replaces one key's multiplicity after the caller has checked its
+    /// ordered adjustments. Zero removes the key; positive values are stored.
+    ///
+    /// This operation does not check prior multiplicity or an event prefix.
+    /// Use [`Self::adjust`] when Store must validate each signed difference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key encoding or storage access fails.
+    pub fn set_multiplicity(&mut self, key: &K, multiplicity: u64) -> Result<(), StoreError> {
+        let key = encode_key(self.data.as_read(), &self.prefix, key)?;
+        set_encoded_multiplicity(self.data, &key, multiplicity)
     }
 
     /// Returns the smallest key and multiplicity in this partition.

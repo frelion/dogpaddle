@@ -360,11 +360,6 @@ impl OperationDefinition for SchemaAlignDefinition {
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    decode_schema_align(payload)
-        .map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-fn decode_schema_align(payload: &[u8]) -> Result<SchemaAlignDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let field_count = cursor.read_u32()?;
     let mut fields = Vec::new();
@@ -390,10 +385,10 @@ fn decode_schema_align(payload: &[u8]) -> Result<SchemaAlignDefinition, Definiti
     }
     let metadata = decode_metadata(&mut cursor, "SchemaAlign Schema metadata is invalid")?;
     cursor.finish()?;
-    Ok(SchemaAlignDefinition {
+    Ok(Box::new(SchemaAlignDefinition {
         fields: fields.into_boxed_slice(),
         metadata,
-    })
+    }))
 }
 
 #[derive(Clone)]
@@ -466,14 +461,15 @@ fn decode_metadata(
 ) -> Result<BTreeMap<String, String>, DefinitionCodecError> {
     let count = cursor.read_u32()?;
     let mut metadata = BTreeMap::new();
-    let mut previous: Option<String> = None;
     for _ in 0..count {
         let key = decode_string(cursor, invalid)?;
-        if previous.as_ref().is_some_and(|previous| previous >= &key) {
+        if metadata
+            .last_key_value()
+            .is_some_and(|(previous, _)| previous >= &key)
+        {
             return Err(DefinitionCodecError::InvalidPayload(invalid));
         }
         let value = decode_string(cursor, invalid)?;
-        previous = Some(key.clone());
         metadata.insert(key, value);
     }
     Ok(metadata)

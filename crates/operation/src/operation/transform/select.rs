@@ -236,10 +236,6 @@ impl OperationDefinition for SelectDefinition {
 pub(crate) fn decode_definition(
     payload: &[u8],
 ) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    decode_select(payload).map(|definition| Box::new(definition) as Box<dyn OperationDefinition>)
-}
-
-fn decode_select(payload: &[u8]) -> Result<SelectDefinition, DefinitionCodecError> {
     let mut cursor = PayloadCursor::new(payload);
     let count = cursor.read_u32()?;
     let mut fields = Vec::new();
@@ -258,7 +254,7 @@ fn decode_select(payload: &[u8]) -> Result<SelectDefinition, DefinitionCodecErro
         });
     }
     cursor.finish()?;
-    Ok(SelectDefinition {
+    Ok(Box::new(SelectDefinition {
         fields: fields.into_boxed_slice(),
-    })
+    }))
 }

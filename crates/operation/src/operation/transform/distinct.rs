@@ -4,7 +4,7 @@ use arrow_array::{BooleanArray, Int64Array};
 use arrow_schema::{ArrowError, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use dogpaddle_change::{Change, ChangeError};
-use dogpaddle_store::{OrderedMultiset, StoreError, TransactionAccess};
+use dogpaddle_store::{OrderedMultiset, OrderedMultisetAccess, StoreError, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
@@ -34,6 +34,13 @@ pub struct DistinctDefinition {
 pub(crate) struct DistinctOperation {
     input_schema: SchemaRef,
     weights: OrderedMultiset<Vec<u8>>,
+}
+
+/// One contiguous run; only its current weight needs to stay in memory.
+struct PendingWeight {
+    key: Vec<u8>,
+    persisted: u64,
+    current: u64,
 }
 
 /// Distinct-specific failure during one `DistinctOperation` turn.
@@ -136,12 +143,39 @@ impl AtomicOperation for DistinctOperation {
         let mut selected = Vec::with_capacity(input.change.num_rows());
         let mut output_diffs = Vec::new();
         let mut weights = self.weights.access(access).map_err(DistinctError::Store)?;
+        let mut pending: Option<PendingWeight> = None;
         for row_index in 0..input.change.num_rows() {
             let row = canonical_row(input.change.records(), row_index)?;
-            let change = weights
-                .adjust(&row, input.change.diffs().value(row_index))
-                .map_err(map_weight_error)?;
-            let output_difference = match (change.before(), change.after()) {
+            if pending.as_ref().is_none_or(|pending| pending.key != row) {
+                if let Some(previous) = pending.take() {
+                    flush_weight(&mut weights, &previous).map_err(map_weight_error)?;
+                }
+                let persisted = weights.multiplicity(&row).map_err(map_weight_error)?;
+                pending = Some(PendingWeight {
+                    key: row,
+                    persisted,
+                    current: persisted,
+                });
+            }
+            let pending = pending.as_mut().expect("the current row was loaded above");
+            let difference = input.change.diffs().value(row_index);
+            let before = pending.current;
+            let after = if difference > 0 {
+                before.checked_add(difference.unsigned_abs())
+            } else {
+                before.checked_sub(difference.unsigned_abs())
+            };
+            let Some(after) = after else {
+                // Preserve Store's transaction-poisoning rule on an invalid
+                // prefix, even though earlier events in the run were cached.
+                flush_weight(&mut weights, pending).map_err(map_weight_error)?;
+                let error = weights
+                    .adjust(&pending.key, difference)
+                    .expect_err("the checked prefix rejected this adjustment");
+                return Err(map_weight_error(error).into());
+            };
+            pending.current = after;
+            let output_difference = match (before, after) {
                 (0, after) if after > 0 => Some(1),
                 (before, 0) if before > 0 => Some(-1),
                 _ => None,
@@ -152,6 +186,9 @@ impl AtomicOperation for DistinctOperation {
             } else {
                 selected.push(false);
             }
+        }
+        if let Some(pending) = pending {
+            flush_weight(&mut weights, &pending).map_err(map_weight_error)?;
         }
 
         if output_diffs.is_empty() {
@@ -167,6 +204,16 @@ impl AtomicOperation for DistinctOperation {
             .map_err(DistinctError::Change)?;
         Ok(Some(output))
     }
+}
+
+fn flush_weight(
+    weights: &mut OrderedMultisetAccess<'_, Vec<u8>>,
+    pending: &PendingWeight,
+) -> Result<(), StoreError> {
+    if pending.current != pending.persisted {
+        weights.set_multiplicity(&pending.key, pending.current)?;
+    }
+    Ok(())
 }
 
 fn map_weight_error(error: StoreError) -> DistinctError {

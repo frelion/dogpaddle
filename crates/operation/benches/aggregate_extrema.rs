@@ -96,8 +96,19 @@ impl Fixture {
 }
 
 fn change(schema: &SchemaRef, values: &[i64], diffs: Vec<i64>) -> Change {
+    let groups = vec![1; values.len()];
+    change_with_groups(schema, &groups, values, diffs)
+}
+
+fn change_with_groups(
+    schema: &SchemaRef,
+    groups: &[i64],
+    values: &[i64],
+    diffs: Vec<i64>,
+) -> Change {
+    assert_eq!(groups.len(), values.len());
     let mut columns: Vec<Arc<dyn arrow_array::Array>> =
-        vec![Arc::new(Int64Array::from(vec![1; values.len()]))];
+        vec![Arc::new(Int64Array::from(groups.to_vec()))];
     columns.extend((1..schema.fields().len()).map(|index| {
         Arc::new(Int64Array::from(
             values
@@ -200,7 +211,19 @@ fn main() {
         "result_directory": root.path().display().to_string(),
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
         "configuration": {
-            "seed_values": [0, 50, 100], "group_count": 1,
+            "single_group_cases": {
+                "group_count": 1,
+                "seed_values": [0, 50, 100]
+            },
+            "many_new_groups_case": {
+                "group_count": BULK_ROWS,
+                "rows_per_turn": BULK_ROWS
+            },
+            "many_existing_groups_case": {
+                "group_count": BULK_ROWS,
+                "rows_per_turn": BULK_ROWS,
+                "extrema_key_type": "Int64"
+            },
             "criterion_samples": 10, "warmup_ms": 100,
             "measurement_ms": match profile {
                 PerformanceProfile::Smoke => 200,
@@ -209,7 +232,10 @@ fn main() {
             "non_extreme_weight": 1_000_000, "repeated_extrema_pairs": 8,
             "distinct_extrema_layouts": 8,
             "bulk_rows_per_turn": BULK_ROWS,
-            "timed_boundary": "two turns, apply, synchronous commit, AfterCommit",
+            "hot_extrema_value": 150,
+            "zero_net_group_cycle_rows": BULK_ROWS,
+            "bulk_new_groups_per_turn": BULK_ROWS,
+            "timed_boundary": "one or two turns per case; each includes apply, Transaction::commit, AfterCommit; writes synchronize WAL",
             "untimed": "fixture, seed, warmup, output validation, teardown"
         }
     });
@@ -295,6 +321,10 @@ fn main() {
     group.finish();
     let seed = change(&historical_schema, &[0, 50, 100], vec![1, 1, 1]);
     bench_bulk_rows(&mut criterion, &root, &historical_schema, &seed);
+    bench_hot_extrema_key(&mut criterion, &root, &historical_schema, &seed);
+    bench_zero_net_group_cycles(&mut criterion, &root, &historical_schema, &seed);
+    bench_existing_groups(&mut criterion, &root, &historical_schema);
+    bench_new_groups(&mut criterion, &root, &historical_schema);
     criterion.final_summary();
 }
 
@@ -336,4 +366,195 @@ fn bench_bulk_rows(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef
         });
     });
     group.finish();
+}
+
+/// One repeated ordered argument in a Change measures the bounded extrema
+/// cache while its first and last events still change the visible maximum.
+fn bench_hot_extrema_key(
+    criterion: &mut Criterion,
+    root: &RunRoot,
+    schema: &SchemaRef,
+    seed: &Change,
+) {
+    let values = vec![150; BULK_ROWS];
+    let insert = change(schema, &values, vec![1; BULK_ROWS]);
+    let retract = change(schema, &values, vec![-1; BULK_ROWS]);
+    let mut fixture = Fixture::new(root, schema, 1, false);
+    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
+    assert_eq!(
+        last_row_extrema(&fixture.apply(&insert), 1),
+        (vec![0], vec![150])
+    );
+    assert_eq!(
+        last_row_extrema(&fixture.apply(&retract), 1),
+        (vec![0], vec![100])
+    );
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(BULK_ROWS * 2).expect("bulk elements fit u64"),
+    ));
+    group.bench_function("repeated_extrema_key_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let up = fixture.apply(&insert);
+                let down = fixture.apply(&retract);
+                elapsed += started.elapsed();
+                assert_eq!(last_row_extrema(&up, 1), (vec![0], vec![150]));
+                assert_eq!(last_row_extrema(&down, 1), (vec![0], vec![100]));
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+/// Repeated positive/negative pairs restore both the existing group and its
+/// extrema partition within one turn, leaving no persistent writes to commit.
+fn bench_zero_net_group_cycles(
+    criterion: &mut Criterion,
+    root: &RunRoot,
+    schema: &SchemaRef,
+    seed: &Change,
+) {
+    let values = vec![100; BULK_ROWS];
+    let diffs = (0..BULK_ROWS)
+        .map(|row| if row % 2 == 0 { 1 } else { -1 })
+        .collect();
+    let cycle = change(schema, &values, diffs);
+    let retract = change(schema, &[100], vec![-1]);
+    let restore = change(schema, &[100], vec![1]);
+    let mut fixture = Fixture::new(root, schema, 1, false);
+    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
+    assert!(matches!(fixture.apply(&cycle), Action::Complete(None)));
+    // The visible max transition proves the seed's multiplicity is exactly one.
+    validate(
+        &fixture.apply(&retract),
+        Some(([0, 0], [100, 50])),
+        1,
+        false,
+    );
+    validate(
+        &fixture.apply(&restore),
+        Some(([0, 0], [50, 100])),
+        1,
+        false,
+    );
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(BULK_ROWS).expect("bulk elements fit u64"),
+    ));
+    group.bench_function("zero_net_group_extrema_cycles_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let action = fixture.apply(&cycle);
+                elapsed += started.elapsed();
+                assert!(matches!(action, Action::Complete(None)));
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+/// One row per existing group exercises the common path without a group clone.
+fn bench_existing_groups(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef) {
+    let groups: Vec<i64> = (0..i64::try_from(BULK_ROWS).expect("bulk rows fit i64")).collect();
+    let values = vec![50; BULK_ROWS];
+    let insert = change_with_groups(schema, &groups, &values, vec![1; BULK_ROWS]);
+    let retract = change_with_groups(schema, &groups, &values, vec![-1; BULK_ROWS]);
+    let mut fixture = Fixture::new(root, schema, 1, false);
+
+    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
+    assert!(matches!(fixture.apply(&insert), Action::Complete(None)));
+    assert!(matches!(fixture.apply(&retract), Action::Complete(None)));
+    // Untimed death and rebirth prove every group returned to weight one.
+    validate_group_lifecycle(&fixture.apply(&retract), &groups, -1);
+    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(BULK_ROWS * 2).expect("bulk elements fit u64"),
+    ));
+    group.bench_function("many_existing_groups_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let increased = fixture.apply(&insert);
+                let restored = fixture.apply(&retract);
+                elapsed += started.elapsed();
+                assert!(matches!(increased, Action::Complete(None)));
+                assert!(matches!(restored, Action::Complete(None)));
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+/// Many groups born in one turn exercise the aggregate's durable ID allocator.
+fn bench_new_groups(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef) {
+    let groups: Vec<i64> = (0..i64::try_from(BULK_ROWS).expect("bulk rows fit i64")).collect();
+    let values = vec![50; BULK_ROWS];
+    let insert = change_with_groups(schema, &groups, &values, vec![1; BULK_ROWS]);
+    let retract = change_with_groups(schema, &groups, &values, vec![-1; BULK_ROWS]);
+    let mut fixture = Fixture::new(root, schema, 1, false);
+
+    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
+    validate_group_lifecycle(&fixture.apply(&retract), &groups, -1);
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(BULK_ROWS * 2).expect("bulk elements fit u64"),
+    ));
+    group.bench_function("many_new_groups_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let inserted = fixture.apply(&insert);
+                let retracted = fixture.apply(&retract);
+                elapsed += started.elapsed();
+                validate_group_lifecycle(&inserted, &groups, 1);
+                validate_group_lifecycle(&retracted, &groups, -1);
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+fn validate_group_lifecycle(action: &Action, groups: &[i64], difference: i64) {
+    let Action::Complete(Some(output)) = action else {
+        panic!("group lifecycle must produce output")
+    };
+    assert_eq!(output.num_rows(), groups.len());
+    assert!(
+        output
+            .diffs()
+            .values()
+            .iter()
+            .all(|value| *value == difference)
+    );
+    let output_groups = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 group output");
+    assert_eq!(output_groups.values(), groups);
+    assert_eq!(output.records().num_columns(), 3);
+    for column in &output.records().columns()[1..] {
+        let values = column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 extrema output");
+        assert!(values.values().iter().all(|value| *value == 50));
+    }
 }

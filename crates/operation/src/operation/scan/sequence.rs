@@ -77,7 +77,10 @@ impl SealedDefinition for SequenceScanDefinition {
         let position = scope.data::<Cell<u64>>(POSITION)?;
         Ok(ConstructedOperation::turn(
             Some(output_schema()),
-            SequenceScanOperation::new(self.start, position),
+            SequenceScanOperation {
+                start: self.start,
+                position,
+            },
         ))
     }
 }
@@ -93,14 +96,6 @@ impl OperationDefinition for SequenceScanDefinition {
 
     fn encode_payload(&self, output: &mut Vec<u8>) {
         output.extend_from_slice(&self.start.to_be_bytes());
-    }
-}
-
-impl SequenceScanOperation {
-    /// Creates a Sequence Scan from its first value and durable position.
-    #[must_use]
-    const fn new(start: u64, position: Cell<u64>) -> Self {
-        Self { start, position }
     }
 }
 
@@ -123,19 +118,16 @@ impl TurnOperation for SequenceScanOperation {
                 }
                 None => self.start,
             };
-            let output = uint64_change(vec![next])?;
+            let records = RecordBatch::try_new(
+                output_schema(),
+                vec![Arc::new(UInt64Array::from(vec![next]))],
+            )?;
+            let output = Change::try_new(records, Int64Array::from(vec![1_i64]))?;
 
             position.set(&next)?;
             Ok((Action::Commit(Some(output)), AfterCommit::none()))
         }))
     }
-}
-
-fn uint64_change(values: Vec<u64>) -> Result<Change, OperationError> {
-    let row_count = values.len();
-    let records = RecordBatch::try_new(output_schema(), vec![Arc::new(UInt64Array::from(values))])?;
-    let diffs = Int64Array::from(vec![1_i64; row_count]);
-    Ok(Change::try_new(records, diffs)?)
 }
 
 fn output_schema() -> SchemaRef {

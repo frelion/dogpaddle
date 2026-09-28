@@ -11,7 +11,7 @@ Definition 保存非敏感身份、固定列声明和必填 `NonZeroU64 bootstra
 首次运行按 `Fresh → Capturing → Publishing → Streaming` 推进：`initial` 快照期不产生公开 output，而是把 delivery 的可选完整 Change IPC、整个 delivery 的 opaque checkpoint 与 phase 在同一事务提交，之后才 ACK；terminal heartbeat 将快照封口。
 封口后每个 turn 在同一事务从私有 Queue `pop_front` 一条完整 IPC 并追加普通 Station output，背压或 commit 失败同时回滚出队和 output。
 进入 Streaming 后从封口 checkpoint 以 `no_data` 继续原有 checkpoint/output/AfterCommit ACK 协议。
-Capturing 期 reopen 或普通错误绝不恢复部分快照；它必须先停止 connector、在 Store 事务外删除兼容且非 active 的 source-owned slot，再通过 Resetting 每 turn `discard_front` 至多一项、有界清空 spool/checkpoint 并回到 Fresh，不复制或解码已废弃的 IPC。
+Capturing 期 reopen 或普通错误绝不恢复部分快照；它必须先停止 connector、在 Store 事务外删除兼容且非 active 的 source-owned slot，再通过 Resetting 每 turn `discard_front` 至多一项、有界清空 spool/checkpoint 并回到 Fresh，不复制或解码已废弃的 IPC。Resetting 和 Publishing 直接使用出队返回的空状态推进阶段。
 `bootstrap_spool_bytes` 是 Queue 执行的硬逻辑上限，每项计费为 8-byte private sequence 加完整 IPC bytes，空队列也不接受超限项；不足时该 delivery 不提交、不 ACK，必须用更大容量重建 Flow。
 PG discovery 要求预配置 publication、FULL replica、单张 permanent 非 partition 表，以及首次启动前不存在、之后由该 Scan 独占的 slot 名；spool 必须容纳完整快照和 terminal heartbeat 前的 WAL 重叠。
 无 TLS、在线 Schema evolution、跨实例 fencing 或旧格式迁移。

@@ -1,4 +1,4 @@
-//! Hot-access and durable-update scenarios for `Cell`.
+//! Hot-access with a write-free transaction finish and durable `Cell` updates.
 
 use std::{hint::black_box, time::Duration};
 
@@ -192,7 +192,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
             "validation": "outside_timing",
             "store": {
                 "engine": "RocksDB",
-                "write_mode": "WAL enabled, sync=true"
+                "write_mode": "write transactions use WAL with sync=true; write-free transactions skip the RocksDB write path"
             },
         },
     });
