@@ -1,6 +1,7 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt, marker::PhantomData};
 
 use dogpaddle_store::{Cell, CodecError, OrderedMap, PartitionedMultiset, StoreKey, StoreValue};
+use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess};
 
 pub(super) type Groups = OrderedMap<Vec<u8>, GroupState>;
 pub(super) type Entries = PartitionedMultiset<EntryPartition, Vec<u8>>;
@@ -8,10 +9,11 @@ pub(super) type Control = Cell<u64>;
 
 const GROUP_STATE_VERSION: u8 = 2;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct GroupState {
     pub(super) id: u64,
     pub(super) weight: u64,
+    #[serde(deserialize_with = "decode_folds")]
     pub(super) folds: Vec<Vec<u8>>,
     /// Current extreme key per bound extrema slot, absent while no key is stored.
     ///
@@ -19,6 +21,7 @@ pub(super) struct GroupState {
     /// is written in the same transaction and only re-read when the extreme
     /// itself is retracted. A present but empty key is a valid key, so presence
     /// is encoded explicitly rather than inferred from the key length.
+    #[serde(deserialize_with = "decode_extremes")]
     pub(super) extremes: Box<[Option<Vec<u8>>]>,
 }
 
@@ -27,79 +30,96 @@ impl StoreValue for GroupState {
         if self.weight == 0 {
             return Err(CodecError::new("aggregate group has zero weight"));
         }
-        let count = u32::try_from(self.folds.len())
+        u32::try_from(self.folds.len())
             .map_err(|_| CodecError::new("aggregate group has too many fold states"))?;
-        let extremes = u32::try_from(self.extremes.len())
+        u32::try_from(self.extremes.len())
             .map_err(|_| CodecError::new("aggregate group has too many cached extrema"))?;
-        let mut encoded = Vec::new();
-        encoded.push(GROUP_STATE_VERSION);
-        encoded.extend_from_slice(&self.id.to_be_bytes());
-        encoded.extend_from_slice(&self.weight.to_be_bytes());
-        encoded.extend_from_slice(&count.to_be_bytes());
-        for state in &self.folds {
-            put_bytes(&mut encoded, state)?;
-        }
-        encoded.extend_from_slice(&extremes.to_be_bytes());
-        for extreme in &self.extremes {
-            match extreme {
-                None => encoded.push(0),
-                Some(key) => {
-                    encoded.push(1);
-                    put_bytes(&mut encoded, key)?;
-                }
-            }
-        }
-        Ok(encoded)
+        bincode::serde::encode_to_vec(
+            (GROUP_STATE_VERSION, self),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("aggregate group state cannot be encoded"))
     }
 
     fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        let mut cursor = ValueCursor::new(bytes.as_ref());
-        if cursor.u8()? != GROUP_STATE_VERSION {
+        if bytes.first() != Some(&GROUP_STATE_VERSION) {
             return Err(CodecError::new("unsupported aggregate group state version"));
         }
-        let id = cursor.u64()?;
-        let weight = cursor.u64()?;
-        if weight == 0 {
+        let ((_, state), consumed): ((u8, Self), usize) = bincode::serde::borrow_decode_from_slice(
+            bytes.as_ref(),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("aggregate group state is invalid"))?;
+        if consumed != bytes.len() {
+            return Err(CodecError::new("aggregate state has trailing bytes"));
+        }
+        if state.weight == 0 {
             return Err(CodecError::new("aggregate group has zero weight"));
         }
-        let count = usize::try_from(cursor.u32()?)
-            .map_err(|_| CodecError::new("aggregate call count exceeds usize"))?;
-        // Every fold state and every cached extreme occupies at least one byte,
-        // so a count beyond the remaining value length is corrupt. Rejecting it
-        // before allocating keeps a damaged value from requesting an unbounded
-        // reservation.
-        if count > cursor.remaining_bytes() {
-            return Err(CodecError::new(
-                "aggregate fold count exceeds the value length",
-            ));
+        if u32::try_from(state.folds.len()).is_err() || u32::try_from(state.extremes.len()).is_err()
+        {
+            return Err(CodecError::new("aggregate group state count is too large"));
         }
-        let mut folds = Vec::with_capacity(count);
-        for _ in 0..count {
-            folds.push(cursor.bytes()?.to_vec());
+        if state.encode_value()?.as_ref() != bytes.as_ref() {
+            return Err(CodecError::new("aggregate group state is non-canonical"));
         }
-        let extremes = usize::try_from(cursor.u32()?)
-            .map_err(|_| CodecError::new("aggregate extrema cache count exceeds usize"))?;
-        if extremes > cursor.remaining_bytes() {
-            return Err(CodecError::new(
-                "aggregate extrema cache count exceeds the value length",
-            ));
-        }
-        let mut cached = Vec::with_capacity(extremes);
-        for _ in 0..extremes {
-            match cursor.u8()? {
-                0 => cached.push(None),
-                1 => cached.push(Some(cursor.bytes()?.to_vec())),
-                _ => return Err(CodecError::new("aggregate extrema cache marker is invalid")),
-            }
-        }
-        cursor.finish()?;
-        Ok(Self {
-            id,
-            weight,
-            folds,
-            extremes: cached.into_boxed_slice(),
-        })
+        Ok(state)
     }
+}
+
+// Serde's normal Vec visitor can reserve up to 1 MiB from a forged count in a
+// short value. Push only elements actually present, copying each borrowed
+// field directly into the final state instead of staging a second Vec.
+fn decode_sequence<'de, D, B, O, F>(decoder: D, map: F) -> Result<Vec<O>, D::Error>
+where
+    D: Deserializer<'de>,
+    B: Deserialize<'de>,
+    F: Fn(B) -> O,
+{
+    struct NoReserve<B, O, F>(F, PhantomData<fn(B) -> O>);
+
+    impl<'de, B, O, F> serde::de::Visitor<'de> for NoReserve<B, O, F>
+    where
+        B: Deserialize<'de>,
+        F: Fn(B) -> O,
+    {
+        type Value = Vec<O>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a sequence of stored bytes")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element::<B>()? {
+                values.push((self.0)(value));
+            }
+            Ok(values)
+        }
+    }
+
+    decoder.deserialize_seq(NoReserve(map, PhantomData))
+}
+
+fn decode_folds<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<Vec<u8>>, D::Error> {
+    decode_sequence(decoder, |bytes: &'de [u8]| bytes.to_vec())
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "Serde requires the exact extrema field type"
+)]
+fn decode_extremes<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Box<[Option<Vec<u8>>]>, D::Error> {
+    let keys = decode_sequence(decoder, |key: Option<&'de [u8]>| key.map(ToOwned::to_owned))?;
+    Ok(keys.into_boxed_slice())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -142,68 +162,6 @@ impl StoreKey for EntryPartition {
     }
 }
 
-fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), CodecError> {
-    let length = u64::try_from(value.len())
-        .map_err(|_| CodecError::new("aggregate state value exceeds u64"))?;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(value);
-    Ok(())
-}
-
-struct ValueCursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> ValueCursor<'a> {
-    const fn new(remaining: &'a [u8]) -> Self {
-        Self { remaining }
-    }
-
-    fn u8(&mut self) -> Result<u8, CodecError> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, CodecError> {
-        Ok(u32::from_be_bytes(self.take()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.take()?))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], CodecError> {
-        let length = usize::try_from(self.u64()?)
-            .map_err(|_| CodecError::new("aggregate state length exceeds usize"))?;
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(length)
-            .ok_or_else(|| CodecError::new("aggregate state is truncated"))?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        let (value, remaining) = self
-            .remaining
-            .split_first_chunk::<N>()
-            .ok_or_else(|| CodecError::new("aggregate state is truncated"))?;
-        self.remaining = remaining;
-        Ok(*value)
-    }
-
-    fn remaining_bytes(&self) -> usize {
-        self.remaining.len()
-    }
-
-    fn finish(self) -> Result<(), CodecError> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(CodecError::new("aggregate state has trailing bytes"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -225,15 +183,15 @@ mod tests {
             encoded,
             [
                 2, // version
-                0, 0, 0, 0, 0, 0, 0, 7, // group ID
-                0, 0, 0, 0, 0, 0, 0, 3, // group weight
-                0, 0, 0, 2, // fold count
-                0, 0, 0, 0, 0, 0, 0, 2, 1, 2, // first fold
-                0, 0, 0, 0, 0, 0, 0, 0, // second fold
-                0, 0, 0, 3, // extrema cache count
-                1, 0, 0, 0, 0, 0, 0, 0, 0, // present but empty key
+                7, // group ID
+                3, // group weight
+                2, // fold count
+                2, 1, 2, // first fold
+                0, // second fold
+                3, // extrema cache count
+                1, 0, // present but empty key
                 0, // absent key
-                1, 0, 0, 0, 0, 0, 0, 0, 2, 0x80, 0x2a, // present two-byte key
+                1, 2, 0x80, 0x2a, // present two-byte key
             ]
         );
         assert_eq!(
@@ -262,5 +220,45 @@ mod tests {
         let marker = encoded.len() - 1;
         encoded[marker] = 2;
         assert!(GroupState::decode_value(Cow::Owned(encoded)).is_err());
+    }
+
+    #[test]
+    fn group_state_rejects_noncanonical_lengths_and_unbounded_counts() {
+        let state = GroupState {
+            id: 7,
+            weight: 1,
+            folds: Vec::new(),
+            extremes: Box::new([]),
+        };
+        let encoded = state.encode_value().unwrap().as_ref().to_vec();
+        assert_eq!(encoded, [2, 7, 1, 0, 0]);
+        for length in 0..encoded.len() {
+            assert!(GroupState::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
+        }
+
+        let mut overlong_id = vec![2, 251, 0, 7];
+        overlong_id.extend_from_slice(&encoded[2..]);
+        assert!(GroupState::decode_value(Cow::Borrowed(&overlong_id)).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 1, 251, 0, 0, 0])).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 1, 0, 251, 0, 0])).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 0, 0, 0])).is_err());
+
+        let huge = [253, 255, 255, 255, 255, 255, 255, 255, 255];
+        let mut huge_folds = vec![2, 7, 1];
+        huge_folds.extend_from_slice(&huge);
+        assert!(GroupState::decode_value(Cow::Borrowed(&huge_folds)).is_err());
+        let mut huge_fold_value = vec![2, 7, 1, 1];
+        huge_fold_value.extend_from_slice(&huge);
+        assert!(GroupState::decode_value(Cow::Borrowed(&huge_fold_value)).is_err());
+        let mut huge_extremes = vec![2, 7, 1, 0];
+        huge_extremes.extend_from_slice(&huge);
+        assert!(GroupState::decode_value(Cow::Borrowed(&huge_extremes)).is_err());
+
+        let mut invalid_version = encoded.clone();
+        invalid_version[0] = u8::MAX;
+        assert!(GroupState::decode_value(Cow::Borrowed(&invalid_version)).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(GroupState::decode_value(Cow::Borrowed(&trailing)).is_err());
     }
 }

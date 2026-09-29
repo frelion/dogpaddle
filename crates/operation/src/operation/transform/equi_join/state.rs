@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use dogpaddle_store::{Cell, CodecError, OrderedMap, PartitionedMultiset, StoreValue};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::EquiJoinError;
 
@@ -63,9 +64,14 @@ impl StoreValue for KeyCounts {
     }
 
     fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        let mut cursor = Cursor::new(bytes.as_ref());
-        let counts = Self([cursor.u64()?, cursor.u64()?]);
-        cursor.finish()?;
+        let encoded: [u8; 16] = bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| CodecError::new("invalid equi-join key counts length"))?;
+        let counts = Self([
+            u64::from_be_bytes(encoded[..8].try_into().expect("the slice has eight bytes")),
+            u64::from_be_bytes(encoded[8..].try_into().expect("the slice has eight bytes")),
+        ]);
         if counts.is_empty() {
             return Err(CodecError::new("empty equi-join key counts must be absent"));
         }
@@ -75,120 +81,60 @@ impl StoreValue for KeyCounts {
 
 const VERSION: u8 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct JoinContinuation {
     pub(super) port: u8,
     pub(super) row: u64,
     pub(super) found_match: bool,
+    #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) resume_after: Option<Vec<u8>>,
+}
+
+fn decode_optional_bytes<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Vec<u8>>, D::Error> {
+    Option::<&[u8]>::deserialize(decoder).map(|value| value.map(ToOwned::to_owned))
 }
 
 impl StoreValue for JoinContinuation {
     fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
-        let mut encoded = Vec::new();
-        encoded.push(VERSION);
-        encoded.push(self.port);
-        encoded.extend_from_slice(&self.row.to_be_bytes());
-        encoded.push(u8::from(self.found_match));
-        match &self.resume_after {
-            None => encoded.push(0),
-            Some(resume) => {
-                encoded.push(1);
-                let length = u64::try_from(resume.len())
-                    .map_err(|_| CodecError::new("equi-join continuation key is too long"))?;
-                encoded.extend_from_slice(&length.to_be_bytes());
-                encoded.extend_from_slice(resume);
-            }
+        if self.port > 1 {
+            return Err(CodecError::new("equi-join continuation port is invalid"));
         }
-        Ok(encoded)
+        bincode::serde::encode_to_vec(
+            (VERSION, self),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("equi-join continuation cannot be encoded"))
     }
 
     fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        let mut cursor = Cursor::new(bytes.as_ref());
-        if cursor.u8()? != VERSION {
+        if bytes.first() != Some(&VERSION) {
             return Err(CodecError::new(
                 "unsupported equi-join continuation version",
             ));
         }
-        let port = cursor.u8()?;
-        if port > 1 {
+        if bytes.get(1).is_none_or(|port| *port > 1) {
             return Err(CodecError::new("equi-join continuation port is invalid"));
         }
-        let row = cursor.u64()?;
-        let found_match = match cursor.u8()? {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(CodecError::new(
-                    "equi-join continuation match marker is invalid",
-                ));
-            }
-        };
-        let resume_after = match cursor.u8()? {
-            0 => None,
-            1 => {
-                let length = usize::try_from(cursor.u64()?).map_err(|_| {
-                    CodecError::new("equi-join continuation key length exceeds usize")
-                })?;
-                Some(cursor.bytes(length)?.to_vec())
-            }
-            _ => {
-                return Err(CodecError::new(
-                    "equi-join continuation key marker is invalid",
-                ));
-            }
-        };
-        cursor.finish()?;
-        Ok(Self {
-            port,
-            row,
-            found_match,
-            resume_after,
-        })
-    }
-}
-
-struct Cursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    const fn new(remaining: &'a [u8]) -> Self {
-        Self { remaining }
-    }
-
-    fn u8(&mut self) -> Result<u8, CodecError> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.take()?))
-    }
-
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
-        let (bytes, remaining) = self
-            .remaining
-            .split_at_checked(length)
-            .ok_or_else(|| CodecError::new("equi-join continuation is truncated"))?;
-        self.remaining = remaining;
-        Ok(bytes)
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        let (bytes, remaining) = self
-            .remaining
-            .split_first_chunk::<N>()
-            .ok_or_else(|| CodecError::new("equi-join continuation is truncated"))?;
-        self.remaining = remaining;
-        Ok(*bytes)
-    }
-
-    fn finish(self) -> Result<(), CodecError> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(CodecError::new("equi-join continuation has trailing bytes"))
+        let ((_, state), consumed): ((u8, Self), usize) = bincode::serde::borrow_decode_from_slice(
+            bytes.as_ref(),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("equi-join continuation is invalid"))?;
+        if consumed != bytes.len() {
+            return Err(CodecError::new("equi-join continuation has trailing bytes"));
         }
+        if state.encode_value()?.as_ref() != bytes.as_ref() {
+            return Err(CodecError::new("equi-join continuation is non-canonical"));
+        }
+        Ok(state)
     }
 }
 
@@ -250,16 +196,7 @@ mod tests {
             resume_after: Some(Vec::new()),
         };
         let encoded = state.encode_value().unwrap().as_ref().to_vec();
-        assert_eq!(
-            encoded,
-            [
-                &[1, 1][..],
-                &7_u64.to_be_bytes(),
-                &[1, 1],
-                &0_u64.to_be_bytes(),
-            ]
-            .concat()
-        );
+        assert_eq!(encoded, [1, 1, 7, 1, 1, 0]);
         assert_eq!(
             JoinContinuation::decode_value(Cow::Borrowed(&encoded)).unwrap(),
             state
@@ -267,11 +204,20 @@ mod tests {
         for length in 0..encoded.len() {
             assert!(JoinContinuation::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
         }
-        for index in [0, 1, 10, 11] {
+        for index in [0, 1, 3, 4] {
             let mut invalid = encoded.clone();
             invalid[index] = u8::MAX;
             assert!(JoinContinuation::decode_value(Cow::Borrowed(&invalid)).is_err());
         }
+        let mut overlong_row = vec![1, 1, 251, 0, 7];
+        overlong_row.extend_from_slice(&encoded[3..]);
+        assert!(JoinContinuation::decode_value(Cow::Borrowed(&overlong_row)).is_err());
+        let mut huge_resume_key = vec![1, 1, 7, 1, 1, 253];
+        huge_resume_key.extend_from_slice(&[255; 8]);
+        assert!(JoinContinuation::decode_value(Cow::Borrowed(&huge_resume_key)).is_err());
+        let mut invalid_version = encoded.clone();
+        invalid_version[0] = u8::MAX;
+        assert!(JoinContinuation::decode_value(Cow::Borrowed(&invalid_version)).is_err());
         let mut trailing = encoded;
         trailing.push(0);
         assert!(JoinContinuation::decode_value(Cow::Borrowed(&trailing)).is_err());

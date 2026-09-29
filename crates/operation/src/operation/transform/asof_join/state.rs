@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use dogpaddle_store::{Cell, CodecError, OrderedMap, StoreValue};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub(super) type Rows = OrderedMap<Vec<u8>, RowWeight>;
@@ -70,23 +71,33 @@ pub(super) enum RowWeightError {
 }
 
 /// Durable cursor for one input row's paged, replayable correction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct AsOfContinuation {
     pub(super) port: u8,
     pub(super) row: u64,
     /// On port 1, the current left key while `candidate_resume_after` is set,
     /// otherwise the last completely processed left key. Always absent on port 0.
+    #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) left_resume_after: Option<Vec<u8>>,
     /// Last right candidate consumed while selecting the current left row's winner.
+    #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) candidate_resume_after: Option<Vec<u8>>,
     /// Best committed-state right index key seen for the current left row.
+    #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) best_before: Option<Vec<u8>>,
     /// Best event-overlay right index key seen for the current left row.
+    #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) best_after: Option<Vec<u8>>,
     /// Whether another committed-state row tied `best_before` under Reject fallback.
     pub(super) ambiguous_before: bool,
     /// Whether another event-overlay row tied `best_after` under Reject fallback.
     pub(super) ambiguous_after: bool,
+}
+
+fn decode_optional_bytes<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Vec<u8>>, D::Error> {
+    Option::<&[u8]>::deserialize(decoder).map(|value| value.map(ToOwned::to_owned))
 }
 
 const VERSION: u8 = 1;
@@ -96,127 +107,38 @@ impl StoreValue for AsOfContinuation {
         if self.port > 1 {
             return Err(CodecError::new("ASOF continuation port is invalid"));
         }
-        let mut encoded = Vec::new();
-        encoded.push(VERSION);
-        encoded.push(self.port);
-        encoded.extend_from_slice(&self.row.to_be_bytes());
-        put_optional(&mut encoded, self.left_resume_after.as_deref())?;
-        put_optional(&mut encoded, self.candidate_resume_after.as_deref())?;
-        put_optional(&mut encoded, self.best_before.as_deref())?;
-        put_optional(&mut encoded, self.best_after.as_deref())?;
-        encoded.push(u8::from(self.ambiguous_before));
-        encoded.push(u8::from(self.ambiguous_after));
-        Ok(encoded)
+        bincode::serde::encode_to_vec(
+            (VERSION, self),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("ASOF continuation cannot be encoded"))
     }
 
     fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        let mut cursor = Cursor::new(bytes.as_ref());
-        if cursor.u8()? != VERSION {
+        if bytes.first() != Some(&VERSION) {
             return Err(CodecError::new("unsupported ASOF continuation version"));
         }
-        let port = cursor.u8()?;
-        if port > 1 {
+        if bytes.get(1).is_none_or(|port| *port > 1) {
             return Err(CodecError::new("ASOF continuation port is invalid"));
         }
-        let row = cursor.u64()?;
-        let left_resume_after = cursor.optional()?;
-        let candidate_resume_after = cursor.optional()?;
-        let best_before = cursor.optional()?;
-        let best_after = cursor.optional()?;
-        let ambiguous_before = cursor.boolean("ASOF continuation before ambiguity is invalid")?;
-        let ambiguous_after = cursor.boolean("ASOF continuation after ambiguity is invalid")?;
-        cursor.finish()?;
-        Ok(Self {
-            port,
-            row,
-            left_resume_after,
-            candidate_resume_after,
-            best_before,
-            best_after,
-            ambiguous_before,
-            ambiguous_after,
-        })
-    }
-}
-
-fn put_optional(output: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), CodecError> {
-    match value {
-        None => output.push(0),
-        Some(bytes) => {
-            output.push(1);
-            let length = u64::try_from(bytes.len())
-                .map_err(|_| CodecError::new("ASOF continuation component is too long"))?;
-            output.extend_from_slice(&length.to_be_bytes());
-            output.extend_from_slice(bytes);
+        let ((_, state), consumed): ((u8, Self), usize) = bincode::serde::borrow_decode_from_slice(
+            bytes.as_ref(),
+            bincode::config::standard()
+                .with_big_endian()
+                .with_variable_int_encoding()
+                .with_limit::<{ isize::MAX as usize }>(),
+        )
+        .map_err(|_| CodecError::new("ASOF continuation is invalid"))?;
+        if consumed != bytes.len() {
+            return Err(CodecError::new("ASOF continuation has trailing bytes"));
         }
-    }
-    Ok(())
-}
-
-struct Cursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    const fn new(remaining: &'a [u8]) -> Self {
-        Self { remaining }
-    }
-
-    fn u8(&mut self) -> Result<u8, CodecError> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.take()?))
-    }
-
-    fn optional(&mut self) -> Result<Option<Vec<u8>>, CodecError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => {
-                let length = usize::try_from(self.u64()?).map_err(|_| {
-                    CodecError::new("ASOF continuation component length exceeds usize")
-                })?;
-                Ok(Some(self.bytes(length)?.to_vec()))
-            }
-            _ => Err(CodecError::new(
-                "ASOF continuation optional marker is invalid",
-            )),
+        if state.encode_value()?.as_ref() != bytes.as_ref() {
+            return Err(CodecError::new("ASOF continuation is non-canonical"));
         }
-    }
-
-    fn boolean(&mut self, message: &'static str) -> Result<bool, CodecError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(CodecError::new(message)),
-        }
-    }
-
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
-        let (bytes, remaining) = self
-            .remaining
-            .split_at_checked(length)
-            .ok_or_else(|| CodecError::new("ASOF continuation is truncated"))?;
-        self.remaining = remaining;
-        Ok(bytes)
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        let (bytes, remaining) = self
-            .remaining
-            .split_first_chunk::<N>()
-            .ok_or_else(|| CodecError::new("ASOF continuation is truncated"))?;
-        self.remaining = remaining;
-        Ok(*bytes)
-    }
-
-    fn finish(self) -> Result<(), CodecError> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(CodecError::new("ASOF continuation has trailing bytes"))
-        }
+        Ok(state)
     }
 }
 
@@ -264,11 +186,11 @@ mod tests {
             encoded,
             [
                 1, 1, // version, port
-                0, 0, 0, 0, 0, 0, 0, 7, // row
-                1, 0, 0, 0, 0, 0, 0, 0, 0, // present empty left cursor
+                7, // row
+                1, 0, // present empty left cursor
                 0, // absent candidate cursor
-                1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, // before key
-                1, 0, 0, 0, 0, 0, 0, 0, 1, 2, // after key
+                1, 2, 0, 1, // before key
+                1, 1, 2, // after key
                 0, 1, // ambiguity markers
             ]
         );
@@ -282,11 +204,20 @@ mod tests {
                 "prefix length {length} was accepted"
             );
         }
-        for index in [0, 1, 10, encoded.len() - 2, encoded.len() - 1] {
+        for index in [0, 1, 3, encoded.len() - 2, encoded.len() - 1] {
             let mut invalid = encoded.clone();
             invalid[index] = u8::MAX;
             assert!(AsOfContinuation::decode_value(Cow::Borrowed(&invalid)).is_err());
         }
+        let mut overlong_row = vec![1, 1, 251, 0, 7];
+        overlong_row.extend_from_slice(&encoded[3..]);
+        assert!(AsOfContinuation::decode_value(Cow::Borrowed(&overlong_row)).is_err());
+        let mut huge_left_key = vec![1, 1, 7, 1, 253];
+        huge_left_key.extend_from_slice(&[255; 8]);
+        assert!(AsOfContinuation::decode_value(Cow::Borrowed(&huge_left_key)).is_err());
+        let mut invalid_version = encoded.clone();
+        invalid_version[0] = u8::MAX;
+        assert!(AsOfContinuation::decode_value(Cow::Borrowed(&invalid_version)).is_err());
         let mut trailing = encoded;
         trailing.push(0);
         assert!(AsOfContinuation::decode_value(Cow::Borrowed(&trailing)).is_err());

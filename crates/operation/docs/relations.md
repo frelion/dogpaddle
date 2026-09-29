@@ -18,6 +18,7 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 `Aggregate` 的 tag 是 14，是单输入的 grouped relational Transform；至少一个 group expression，aggregate call 可以为空。
 Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。
 它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: PartitionedMultiset<EntryPartition, Vec<u8>>` 和 `aggregate.control: Cell<u64>`：groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个 Fold call 的小状态与每个极值 slot 的缓存极值；entries 的 partition 是 `layout + group ID`，每个 layout 对应一个不同的排序表达式，只维护有序的 extrema argument key，不保存完整输入行；control 只分配不复用的 group ID。
+`GroupState` 的当前开发期 v1 value 以原有标记字节 `2` 起始，其余字段按 `id`、`weight`、fold states、可空 extrema keys 的顺序使用 big-endian varint bincode/Serde 编码。解码拒绝零权重、超出 `u32` 的集合长度、截断、尾随字节和非规范整数编码；损坏的集合长度不能使短 value 预留大块内存。旧 value 直接重建，不提供格式识别或迁移。
 极值 slot 在绑定期按 `(layout, 方向)` 去重产生，`MIN(x), MAX(x)` 共用一个 layout、两个 slot，重复的同一调用复用一个 slot；group state 里的缓存是该 slot 当前极值键的保序字节，与 entries 在同一事务更新，只有被撤回的正是缓存极值时回分区重取 `first`/`last`，因此 NULL 参数既不进分区也不进缓存。同一组的相邻相同极值参数在当前事务内暂存至每个 layout 一个 key：首次只读该 key 的份数，随后逐事件检查并更新输出；换 key、换组、撤回缓存极值而需重读分区或完成 Change 前，才将最终份数写回 entries。组归零时对已持久化的 pending key 直接暂存 tombstone，丢弃只存在于缓存的新 key，再清理其余持久分区，避免写入随即删除。仅当前连续 key run 的最终份数等于读入份数时，这个 run 不写 entries；其它 run 仍可在同一 Change 内写入。无效前缀仍交给 Store 的 checked adjustment 毒化事务。待写缓存与 entries 合起来是当前事务内的有效极值状态；提交时两者均已同步持久化。
 同一组的相邻事件也只暂存一个 group；一行 lookahead 使每行 group key 只编码一次，单行 run 不复制原状态。已有 group 的 run 至少两行时保留读入的原状态，逐事件结果照常输出，离开 run 或完成 Change 时若最终 group state 等于原状态则不写 groups。若各 layout 的连续极值 key run 也净零且未因缓存极值撤回而重读分区，Aggregate 对此 run 不暂存 groups/entries 写入。
 静态函数 descriptor 唯一声明 stable function tag、arity、binding 和 `Fold`/`Extrema` reduction；COUNT/SUM/AVG 使用每组定长 Fold state，MIN/MAX 从缓存极值取结果，函数实现只接收值或小状态，不接收 Store。
@@ -38,7 +39,7 @@ Residual 在原始 exact input fields 组成的 `left.* + right.*` candidate Sch
 所有 kind 声明 `equi_join.left_rows` / `equi_join.right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>` 和 `equi_join.continuation: Cell<JoinContinuation>`：两侧按完整 canonical key 分区，以完整 canonical row 及正 `u64` multiplicity 表示关系。
 无 residual 的非 Inner 另外声明 `equi_join.key_counts: OrderedMap<Vec<u8>, KeyCounts>`，值是该 key 左右两侧的正 distinct-row counts；NULL key 不进入 counts，zero/zero 必须删除。
 带 residual 的非 Inner 改为声明 `equi_join.match_counts: OrderedMap<Vec<u8>, u64>`，按完整行记录 qualifying distinct opposite rows；FullOuter 跟踪两侧，其他 presence kind 只跟踪 left，真实零必须缺失。
-当前 v1 match-count key 为单字节 port 加完整 canonical row；continuation 的 v1 codec 不含 phase。旧布局的数据库需重建，不提供格式识别、迁移或兼容路径。
+当前 v1 match-count key 为单字节 port 加完整 canonical row；continuation 的 value 以原有标记字节 `1` 起始，其余字段按 port、row ordinal、match marker、可空排他 resume key 的顺序使用 big-endian varint bincode/Serde 编码，不含 phase。解码拒绝截断、尾随字节和非规范整数编码。旧布局的数据库需重建，不提供格式识别、迁移或兼容路径。
 每个 Claim 先按行序预检本侧 exact admission 和同 Claim 的 presence transitions，在发布输出前拒绝本侧负前缀和 `u64` multiplicity overflow。随后直接分页扫描对侧、求值 residual、更新真实 support 并构造输出，不预演整个 Claim，也不保存影子计数。
 每页同事务提交真实状态、output 与 continuation；每个 outer presence transition 的 null correction 与对应 pair 作为同一分页 work item，当前输入行最后一页同事务调整本侧 rows/counts，最后一行清理 continuation 并 Complete。
 Station durable active pin 保证 Claim 完成前对侧状态不变；continuation 只保存 port、row ordinal、本行 match marker 和排他 resume key，不复制 Subscription identity、Change 或 fingerprint。
@@ -128,7 +129,7 @@ lookup 成本与候选 partition 大小成正比，最坏右侧历史修正是�
 候选 right scan 与 rematch left scan 都从索引内的
 matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远不可能参与匹配的历史。
 
-AsOfContinuation 保存 port、当前行序号、outer/candidate cursor、已经找到的 before/after winner 与歧义标记；当前开发期 v1 codec 不含 phase。受影响旧状态重建，不增加格式识别或迁移。
+AsOfContinuation 保存 port、当前行序号、outer/candidate cursor、已经找到的 before/after winner 与歧义标记；当前开发期 v1 value 以原有标记字节 `1` 起始，其余字段按该顺序使用 big-endian varint bincode/Serde 编码，不含 phase。解码拒绝截断、尾随字节和非规范整数编码。受影响旧状态重建，不增加格式识别或迁移。
 
 ASOF 的 `Equal` 在任一 NULL equality 分量时不匹配，`NotDistinct` 允许 NULL 分区；NULL order 永远不匹配。
 

@@ -1463,11 +1463,11 @@ fn residual_partial_row_rejects_a_missing_committed_cursor() {
     let mut original = None;
     fixture = fixture.rewrite_raw_continuation(|value| {
         assert_eq!(value[0], 1, "unexpected current v1 continuation");
-        assert_eq!(value[10], 1, "the output page did not find a match");
-        assert_eq!(value[11], 1, "the output page did not retain a cursor");
+        assert_eq!(value[3], 1, "the output page did not find a match");
+        assert_eq!(value[4], 1, "the output page did not retain a cursor");
         original = Some(value.clone());
-        value[11] = 0;
-        value.truncate(12);
+        value[4] = 0;
+        value.truncate(5);
     });
     let error = fixture.commit_once(1, &input).unwrap_err();
     assert!(matches!(
