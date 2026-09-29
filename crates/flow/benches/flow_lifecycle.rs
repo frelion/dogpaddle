@@ -88,7 +88,7 @@ impl LifecycleRun {
                 "fixture_and_validation": "outside_timing",
                 "fresh_build_oracle": "validate_then_reopen_and_validate_outside_timing",
                 "execution": "single_thread",
-                "rocksdb_wal_sync": true,
+                "store_write_mode": "fresh build uses one WAL-enabled sync transaction; warm reopen is read-only",
             },
         });
         let encoded = serde_json::to_vec_pretty(&context)

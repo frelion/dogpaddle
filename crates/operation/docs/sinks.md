@@ -33,16 +33,16 @@ ClickHouseSink 的 tag 是 19，Definition 只持久化 sink ID、database/table
 
 SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`；crate 私有 `relation` 只拥有 exact-row lookup、technical-ID 分配、mutation codec、按 logical row 的纯 mutation 分组与 target adapter，不再拥有第二套 runtime/state。
 不得建立公共通用 Sink trait、backend enum、registry 或 ORM。
-control 状态只有 Initialize、Ready、Prepared；buffer 的每个 value 是一个完整自描述 Change IPC，Ready/Prepared 保存连续 `[head, tail)`、当前行剩余 diff、pending event 数和 retained IPC bytes。
+构造时从固定 input Schema 创建唯一的 `SchemaBoundChangeCodec`，它同时拥有运行时 exact-Schema guard 与 buffer codec。control 状态只有 Initialize、Ready、Prepared；buffer 的每个 value 是一个 schema-bound Change entry，Ready/Prepared 保存连续 `[head, tail)`、当前行剩余 diff、pending event 数和 retained encoded-entry bytes。
 完整 Change admission、control accounting 与 input `Complete` 必须在同一 Store 事务提交；连续小 Claim 可聚合，没有 offered Claim、达到 target event limit 或 8 MiB delivery watermark 时继续无输入内部 drain。
-单个 Change 的 canonical uncompressed IPC+8-byte key 不得超过 8 MiB，编码前必须无拷贝预检 IPC body；owned decode 仅在对齐合适时共享 backing，否则局部复制仍受 body 上限约束。
-全部 retained buffer 按 IPC+key 的逻辑口径不得超过 64 MiB 或 1,048,576 events，该口径不是 heap、WAL 或磁盘硬配额。
+schema-bound entry 的 v1 持久布局固定为 format marker、canonical physical Schema 的 BLAKE3 fingerprint、单个 uncompressed RecordBatch IPC message 和 EOS，不在每项重复完整 Schema，也不接受 self-contained IPC fallback。单个 encoded entry 加 8-byte key 不得超过 8 MiB，编码前必须无拷贝预检 IPC body；owned decode 仅在对齐合适时共享 backing，否则局部复制仍受 body 上限约束。
+全部 retained buffer 按实际 encoded entry bytes 加 key 的逻辑口径不得超过 64 MiB 或 1,048,576 events，该口径不是 heap、WAL 或磁盘硬配额。
 完整 encoded delivery 与 target-expanded mutation work 分别受 8 MiB 上限；超限或不能在剩余 technical-ID 区间排空的 input 在 ACK 前失败。
-reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、IPC、精确 Schema、accounting 与 checkpoint 下剩余正事件容量。
-首次启动在事务外拒绝已有目标，再持久化 Initialize；AfterCommit 创建或验证同布局的空目标。
+reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、schema fingerprint、single-batch framing、Change value、accounting 与 checkpoint 下剩余正事件容量。
+首次启动在事务外拒绝已有目标，再持久化 Initialize；durable AfterCommit 在 Store barrier 后创建或验证同布局的空目标。
 批次在 Store 写事务外规划；纯正事件批次在保持 canonical 行字节预算和逐行校验的前提下只计算行长度与固定 ID，不为分组构造整行 canonical bytes。混合批次仍按完整行身份分组。apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
 Prepared 恢复对所有行仍校验 canonical 总预算；只有 delete 引用同一 plan 新分配的 ID 时才暂存该批全部 canonical 行字节做身份对比，纯撤回及只删除既存 ID 的批次无需额外行副本。目标适配器分别编码 canonical 行，并直接从本次编码的字段字节投影目标列值，不对同一字段重复读取 Arrow 数组。
-AfterCommit 在一个目标事务中先 insert-on-ID-conflict-do-nothing，再核对所有已存在 mutation ID 仍绑定对应完整逻辑行，最后按 ID delete；下一独立 Store turn 删除完整消费的 buffer entries 并发布 Ready。
+durable AfterCommit 在 Store barrier 后于一个目标事务中先 insert-on-ID-conflict-do-nothing，再核对所有已存在 mutation ID 仍绑定对应完整逻辑行，最后按 ID delete；恢复、admit、load、publish-ready 和 settle 的纯内存 phase 发布使用 local AfterCommit；下一独立 Store turn 删除完整消费的 buffer entries 并发布 Ready。
 目标已提交而本地未结算时只从原 buffer 重建并依靠 Prepared plan 的固定 technical ID 重投；从不重投已结算批次。
 普通 planning 错误可重试，AfterCommit 错误或提交不确定必须 fail-stop/reopen，全部外部 I/O 不得占用 Store 写事务。
 
@@ -58,6 +58,6 @@ PG 宽 Schema 遵守 65,535 参数上限并在同一事务内切分 SQL；5 秒 
 目标布局只在初始化/重新连接时校验，不逐 turn 扫表或查询 MIN/MAX。
 输入语义保持事件顺序与非负前缀；目标 SQL 允许整批先插后删，只承诺批次提交后的关系，不承诺目标 WAL 顺序。
 目标表、索引、约束由 Sink 独占，不支持外部写入、额外业务唯一约束、trigger/FK、改表或数据库替换恢复。
-共享 buffered state、relation codec、row hash 与目标布局取代未发布的旧格式，旧 Flow 和目标必须重建；不提供 alias、兼容读取或迁移。
+共享 buffered state、schema-bound Change entry、relation codec、row hash 与目标布局取代未发布的旧格式，旧 Flow 和目标必须重建；不提供 alias、fallback、兼容读取或迁移。
 
 这里的 target-expanded mutation work 是 canonical row、技术字段与每列固定 framing 的确定性逻辑计费；8 MiB 限制不代表 driver heap、SQL/wire payload 或数据库事务资源的硬配额。

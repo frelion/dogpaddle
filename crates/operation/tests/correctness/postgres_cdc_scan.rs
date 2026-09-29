@@ -58,7 +58,7 @@ fn config() -> PostgresCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0b".to_vec();
-    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#);
+    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}"#);
     expected
 }
 
@@ -340,8 +340,13 @@ fn postgres_cdc_restore_rejects_corrupt_checkpoint_without_initializing() {
 #[test]
 fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
     let column = |data_type| PostgresColumn::new("id", data_type, false);
+    let mut no_columns = definition().spec().clone();
+    no_columns.columns.clear();
+    assert!(
+        PostgresCdcScanDefinition::try_new(no_columns, NonZeroU64::new(1_048_576).unwrap())
+            .is_err()
+    );
     for columns in [
-        vec![],
         vec![PostgresColumn::new("", PostgresType::Int64, false)],
         vec![PostgresColumn::new(
             "$dogpaddle.value",
@@ -368,11 +373,49 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
     ] {
         let mut spec = definition().spec().clone();
         spec.columns = columns;
-        if let Ok(definition) =
-            PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap())
-        {
-            assert!(construct_checked(&definition, &[]).is_err());
-        }
+        let definition =
+            PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap()).unwrap();
+        assert!(
+            (&definition as &dyn OperationDefinition)
+                .output_schema(&[])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn postgres_cdc_projection_is_ordered_and_can_preserve_rows_without_columns() {
+    let mut spec = definition().spec().clone();
+    spec.columns
+        .push(PostgresColumn::new("payload", PostgresType::Text, true));
+    let capacity = NonZeroU64::new(1_048_576).unwrap();
+
+    let projected =
+        PostgresCdcScanDefinition::try_new_projected(spec.clone(), vec![1], capacity).unwrap();
+    assert_eq!(projected.output_projection(), &[1]);
+    let output = (&projected as &dyn OperationDefinition)
+        .output_schema(&[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.fields().len(), 1);
+    assert_eq!(output.field(0).name(), "payload");
+    assert!(output.field(0).is_nullable());
+
+    let empty =
+        PostgresCdcScanDefinition::try_new_projected(spec.clone(), vec![], capacity).unwrap();
+    assert!(
+        (&empty as &dyn OperationDefinition)
+            .output_schema(&[])
+            .unwrap()
+            .unwrap()
+            .fields()
+            .is_empty()
+    );
+
+    for invalid in [vec![0, 0], vec![1, 0], vec![2]] {
+        assert!(
+            PostgresCdcScanDefinition::try_new_projected(spec.clone(), invalid, capacity).is_err()
+        );
     }
 }
 

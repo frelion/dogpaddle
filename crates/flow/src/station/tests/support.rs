@@ -8,7 +8,7 @@ use std::{
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_operation::operation::{
     Action, AfterCommit, AtomicOperation, Operation, OperationError, OperationInput,
     PostCommitError, Turn, TurnOperation,
@@ -34,7 +34,16 @@ pub(super) struct RuntimeFixture {
 
 impl RuntimeFixture {
     pub(super) fn try_step(&mut self, station: usize) -> Result<AdvanceOutcome, StationError> {
-        self.stations[station].advance(&self.reads, &mut self.transactions)
+        let mut batch = self.transactions.durability_batch();
+        let result = self.stations[station].advance(&self.reads, &mut batch);
+        if matches!(result, Err(StationError::DurabilityBarrier { .. })) {
+            drop(batch);
+            return result;
+        }
+        batch
+            .finish()
+            .map_err(|source| StationError::DurabilityBarrier { source })?;
+        result
     }
 
     pub(super) fn step(&mut self, station: usize) -> AdvanceOutcome {
@@ -73,7 +82,16 @@ pub(super) struct MultiInputFixture {
 
 impl MultiInputFixture {
     pub(super) fn try_step(&mut self) -> Result<AdvanceOutcome, StationError> {
-        self.station.advance(&self.reads, &mut self.transactions)
+        let mut batch = self.transactions.durability_batch();
+        let result = self.station.advance(&self.reads, &mut batch);
+        if matches!(result, Err(StationError::DurabilityBarrier { .. })) {
+            drop(batch);
+            return result;
+        }
+        batch
+            .finish()
+            .map_err(|source| StationError::DurabilityBarrier { source })?;
+        result
     }
 
     pub(super) fn step(&mut self) -> AdvanceOutcome {
@@ -128,6 +146,7 @@ pub(super) enum ScriptResult {
 #[derive(Clone)]
 struct ScriptedAfterCommit {
     runs: Arc<AtomicUsize>,
+    durable: bool,
     fails: bool,
     panics: bool,
 }
@@ -195,7 +214,18 @@ impl ScriptedOperation {
     pub(super) fn with_after_commit(mut self, runs: Arc<AtomicUsize>, fails: bool) -> Self {
         self.after_commit = Some(ScriptedAfterCommit {
             runs,
+            durable: true,
             fails,
+            panics: false,
+        });
+        self
+    }
+
+    pub(super) fn with_local_after_commit(mut self, runs: Arc<AtomicUsize>) -> Self {
+        self.after_commit = Some(ScriptedAfterCommit {
+            runs,
+            durable: false,
+            fails: false,
             panics: false,
         });
         self
@@ -204,6 +234,7 @@ impl ScriptedOperation {
     pub(super) fn with_panicking_after_commit(mut self, runs: Arc<AtomicUsize>) -> Self {
         self.after_commit = Some(ScriptedAfterCommit {
             runs,
+            durable: true,
             fails: false,
             panics: true,
         });
@@ -245,20 +276,28 @@ impl TurnOperation for ScriptedOperation {
                 OperationError::from(std::io::Error::other("planned turn failure"))
             })?;
             let after_commit = after_commit.map_or_else(AfterCommit::none, |script| {
-                AfterCommit::new(move || {
-                    script.runs.fetch_add(1, Ordering::Relaxed);
-                    assert!(!script.panics, "planned after-commit panic");
-                    if script.fails {
-                        Err(PostCommitError::new(std::io::Error::other(
-                            "planned after-commit failure",
-                        )))
-                    } else {
-                        Ok(())
-                    }
-                })
+                if script.durable {
+                    AfterCommit::durable(move || script.run())
+                } else {
+                    AfterCommit::local(move || script.run())
+                }
             });
             Ok((action, after_commit))
         }))
+    }
+}
+
+impl ScriptedAfterCommit {
+    fn run(self) -> Result<(), PostCommitError> {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panics, "planned after-commit panic");
+        if self.fails {
+            Err(PostCommitError::new(std::io::Error::other(
+                "planned after-commit failure",
+            )))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -332,7 +371,8 @@ fn runtime_fixture(
                 let log = store
                     .create_data::<SubscribedLog<Vec<u8>>>(&format!("output-{station}"))
                     .unwrap();
-                (log, capacity, schema)
+                let codec = SchemaBoundChangeCodec::try_new(schema).unwrap();
+                (log, capacity, codec)
             });
             StationParts::new(
                 active,
@@ -479,7 +519,10 @@ fn raw_station_with_program(
         log.initialize(NonZeroU64::new(*subscribers).unwrap(), transaction.access())
             .unwrap();
     }
-    let encoded = encode_change(populated_change).unwrap();
+    let encoded = SchemaBoundChangeCodec::try_new(populated_change.schema())
+        .unwrap()
+        .encode(populated_change)
+        .unwrap();
     for output in populated {
         assert!(
             logs[*output]
@@ -573,7 +616,7 @@ fn finish_station(
             Arc::new(Output::new(
                 log.writer(),
                 NonZeroU64::MAX,
-                Arc::clone(schema),
+                SchemaBoundChangeCodec::try_new(Arc::clone(schema)).unwrap(),
             ))
         })
         .collect::<Vec<_>>();
@@ -627,7 +670,11 @@ pub(super) fn claim_ptr(station: &Station) -> *const Change {
 }
 
 pub(super) fn claim_bytes(station: &Station) -> Vec<u8> {
-    encode_change(station.inbox.cached_claim().unwrap().change()).unwrap()
+    let change = station.inbox.cached_claim().unwrap().change();
+    SchemaBoundChangeCodec::try_new(change.schema())
+        .unwrap()
+        .encode(change)
+        .unwrap()
 }
 
 pub(super) fn read_attempt(state: &State, transactions: &mut Transactions) -> Option<Vec<u8>> {

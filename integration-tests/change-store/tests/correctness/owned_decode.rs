@@ -1,15 +1,13 @@
 use std::num::NonZeroU64;
 
-use dogpaddle_change_store_integration::{assert_change_eq, projectable_fixture};
+use dogpaddle_change_store_integration::nested_change_fixture;
 use dogpaddle_store::{Store, SubscribedLog};
-
-use super::support::{decode_entry, decode_projected_entry};
 
 #[test]
 fn subscription_payload_is_owned_beyond_its_read_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
-    let expected = projectable_fixture(100, 4, 17);
+    let expected = nested_change_fixture(100, 4, 17);
 
     let mut store = Store::create(&path).unwrap();
     let log = store
@@ -43,8 +41,7 @@ fn subscription_payload_is_owned_beyond_its_read_snapshot() {
         encoded
     };
 
-    let full = decode_entry(&encoded).unwrap();
-    let projected = decode_projected_entry(&encoded, &expected.projection).unwrap();
-    assert_change_eq(&full, &expected.change);
-    assert_change_eq(&projected, &expected.projected);
+    let full = expected.codec.decode_owned(encoded).unwrap();
+    assert_eq!(full.records(), expected.change.records());
+    assert_eq!(full.diffs(), expected.change.diffs());
 }

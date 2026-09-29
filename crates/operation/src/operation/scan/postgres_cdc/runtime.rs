@@ -1,5 +1,5 @@
 use super::{
-    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanSpec,
+    PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanError, PostgresCdcScanSpec,
     convert::{CaptureProgress, convert_capture_values, convert_values},
 };
 use crate::operation::OperationError;
@@ -8,31 +8,34 @@ use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_debezium::{Checkpoint, Connector, Record};
 use dogpaddle_store::{Cell, Queue};
-use std::num::NonZeroU64;
 
 pub(super) type PostgresCdcScanOperation = CdcRuntime<PostgresSource>;
 pub(super) struct PostgresSource {
     spec: PostgresCdcScanSpec,
+    output_projection: Vec<u32>,
     config: PostgresCdcScanConfig,
 }
 
 impl PostgresCdcScanOperation {
     pub(super) fn new_bound(
-        spec: PostgresCdcScanSpec,
+        definition: &PostgresCdcScanDefinition,
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
         bootstrap_spool: Queue<Vec<u8>>,
         config: PostgresCdcScanConfig,
-        bootstrap_spool_bytes: NonZeroU64,
-    ) -> Self {
+    ) -> Result<Self, dogpaddle_change::CodecError> {
         Self::new(
-            PostgresSource { spec, config },
+            PostgresSource {
+                spec: definition.spec().clone(),
+                output_projection: definition.output_projection().to_vec(),
+                config,
+            },
             output_schema,
             phase_cell,
             checkpoint,
             bootstrap_spool,
-            bootstrap_spool_bytes,
+            definition.bootstrap_spool_bytes(),
         )
     }
 }
@@ -57,11 +60,9 @@ impl Source for PostgresSource {
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
         Ok(convert_capture_values(
-            &self.spec.columns,
+            &self.spec,
+            &self.output_projection,
             schema,
-            &self.spec.engine_name,
-            &self.spec.schema,
-            &self.spec.table,
             records
                 .iter()
                 .map(|record| (record.topic(), record.value())),
@@ -74,11 +75,9 @@ impl Source for PostgresSource {
         records: &[Record],
     ) -> Result<Option<Change>, OperationError> {
         Ok(convert_values(
-            &self.spec.columns,
+            &self.spec,
+            &self.output_projection,
             schema,
-            &self.spec.engine_name,
-            &self.spec.schema,
-            &self.spec.table,
             records
                 .iter()
                 .map(|record| (record.topic(), record.value())),
@@ -129,16 +128,17 @@ fn parse_checkpoint(
 
 #[cfg(test)]
 mod tests {
+    use std::{num::NonZeroU64, sync::Arc};
+
     use arrow_array::{Int64Array, RecordBatch};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
-    use dogpaddle_change::{Change, encode_change};
+    use dogpaddle_change::Change;
     use dogpaddle_store::{Store, Transactions};
 
     use super::*;
     use crate::operation::scan::cdc_runtime::NextStep;
     use crate::operation::scan::{PostgresColumn, PostgresType};
     use crate::operation::{Action, Turn, TurnOperation};
-    use std::sync::Arc;
 
     fn config() -> PostgresCdcScanConfig {
         PostgresCdcScanConfig::new_unencrypted(
@@ -194,7 +194,7 @@ mod tests {
             let spool = store.create_data::<Queue<Vec<u8>>>("spool").unwrap();
             let columns = vec![PostgresColumn::new("id", PostgresType::Int64, false)];
             let schema = super::super::schema::compile(&columns).unwrap();
-            let operation = PostgresCdcScanOperation::new_bound(
+            let definition = PostgresCdcScanDefinition::try_new(
                 PostgresCdcScanSpec {
                     engine_name: "orders".to_owned(),
                     database: "shop".to_owned(),
@@ -207,13 +207,18 @@ mod tests {
                     table_oid: 43,
                     columns,
                 },
+                NonZeroU64::new(1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            let operation = PostgresCdcScanOperation::new_bound(
+                &definition,
                 schema,
                 phase.clone(),
                 checkpoint.clone(),
                 spool.clone(),
                 config(),
-                NonZeroU64::new(1024 * 1024).unwrap(),
-            );
+            )
+            .unwrap();
             Self {
                 _root: root,
                 operation,
@@ -268,6 +273,13 @@ mod tests {
             transaction.commit().unwrap();
             durable
         }
+
+        fn encoded_change(&self, value: i64) -> Vec<u8> {
+            self.operation
+                .codec
+                .encode(&change(self.operation.codec.schema(), value))
+                .unwrap()
+        }
     }
 
     #[test]
@@ -311,8 +323,7 @@ mod tests {
     #[test]
     fn reopening_capture_requires_slot_cleanup_before_durable_reset() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
+        let encoded = fixture.encoded_change(7);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -347,8 +358,7 @@ mod tests {
     #[test]
     fn captured_output_without_its_checkpoint_is_rejected() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
+        let encoded = fixture.encoded_change(7);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -378,8 +388,7 @@ mod tests {
     #[test]
     fn publishing_pop_and_streaming_transition_rollback_together() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 9)).unwrap();
+        let encoded = fixture.encoded_change(9);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -422,10 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_pops_at_most_one_entry_per_turn_before_returning_fresh() {
+    fn reset_discards_a_small_spool_atomically_before_returning_fresh() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 1)).unwrap();
+        let encoded = fixture.encoded_change(1);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -445,12 +453,10 @@ mod tests {
         transaction.commit().unwrap();
 
         fixture.commit();
-        fixture.commit();
-        assert_eq!(fixture.durable().2, queued_bytes(&encoded));
         fixture.rollback();
         assert_eq!(
             fixture.durable(),
-            (Some(4), Some(checkpoint()), queued_bytes(&encoded))
+            (Some(4), Some(checkpoint()), queued_bytes(&encoded) * 2)
         );
         assert_eq!(fixture.operation.next_step, NextStep::Reset);
         fixture.commit();

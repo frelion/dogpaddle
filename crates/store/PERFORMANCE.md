@@ -49,7 +49,10 @@ Criterion 目录；这里只测有界 churn，不声称覆盖长期 compaction �
 - 实际 workload、scan limit 和固定随机种子；
 - rustc、OS/kernel、CPU、git revision 和 dirty state；
 - 结果文件系统；
-- RocksDB、WAL enabled 与 `sync=true` 的 durable write 模式。
+- RocksDB、WAL enabled 与 `sync=true` 的普通 `Transactions` durable write 模式。
+
+这些 owner target 不使用 `DurabilityBatch`，因此仍逐笔呈现同步写成本。Flow 调度轮共享 barrier 的收益由
+`flow_runtime` benchmark 负责；两者的 Station 语义 commit 数与 RocksDB WAL sync 次数不能互相替代。
 
 fixture 创建、数据填充、预热和 oracle 位于计时外。`ordered_map` 的读场景使用真正的只读
 snapshot；写场景通过唯一 `Transactions` capability 提交。字段只属于当前 target，不形成跨

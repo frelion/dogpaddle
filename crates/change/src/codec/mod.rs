@@ -1,4 +1,4 @@
-//! Encoding and decoding for self-contained `DogPaddle` Change streams.
+//! Encoding and decoding for `DogPaddle` Change entries.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -12,8 +12,11 @@ use crate::{
 };
 
 mod batch;
+mod bound;
 mod size;
 mod stream;
+
+pub use bound::SchemaBoundChangeCodec;
 
 #[cfg(test)]
 mod tests;
@@ -115,7 +118,7 @@ pub fn decode_change_projected(
     decode_guarded(encoded, Some(projection))
 }
 
-/// A self-contained Change encoding or decoding failure.
+/// A Change encoding or decoding failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CodecError {
@@ -143,6 +146,9 @@ pub enum CodecError {
         /// Maximum accepted uncompressed body and complete stream length.
         max_bytes: usize,
     },
+    /// A Change or encoded entry has a different Schema from its codec.
+    #[error("the Change schema differs from the schema bound to this codec")]
+    SchemaMismatch,
     /// The encoding is not a canonical `DogPaddle` Change stream.
     #[error("invalid DogPaddle Change encoding: {message}")]
     InvalidEncoding {

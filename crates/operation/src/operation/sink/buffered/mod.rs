@@ -6,9 +6,12 @@ mod state;
 
 use std::{fmt, num::NonZeroU32};
 
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_store::{Cell, DataScope, OrderedMap};
 
-use crate::{ConstructedOperation, OperationSetupError, operation::OperationError};
+use crate::{
+    ConstructedOperation, OperationSetupError, definition::schema_error, operation::OperationError,
+};
 
 pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
@@ -23,9 +26,10 @@ pub(crate) fn construct<T: SinkTarget>(
 ) -> Result<ConstructedOperation, OperationSetupError> {
     let control = scope.data::<Cell<Vec<u8>>>(CONTROL)?;
     let buffer = scope.data::<OrderedMap<u64, Vec<u8>>>(BUFFER)?;
+    let codec = SchemaBoundChangeCodec::try_new(schema).map_err(schema_error)?;
     Ok(ConstructedOperation::turn(
         None,
-        BufferedSink::new(schema, target, control, buffer),
+        BufferedSink::new(codec, target, control, buffer),
     ))
 }
 pub(crate) const MAX_TARGET_BATCH_BYTES: u64 = 8 * 1024 * 1024;

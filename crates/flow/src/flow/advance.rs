@@ -1,4 +1,5 @@
 use crate::error::FlowRunError;
+use crate::station::StationError;
 
 use super::runtime::Flow;
 
@@ -37,8 +38,9 @@ impl Flow {
     /// turn. That pin counts as progress even if the Operation is idle; a later
     /// turn with the already-pinned input can then report idle normally.
     /// An Operation prepares its turn without an active write transaction. A
-    /// ready turn is applied once inside a transaction, and any post-commit
-    /// completion runs only after that transaction commits.
+    /// ready turn is applied once inside a transaction. Independent Station
+    /// commits share a final durability barrier; a post-commit completion that
+    /// can affect an external system first forces that barrier and then runs.
     ///
     /// # Errors
     ///
@@ -57,13 +59,57 @@ impl Flow {
         }
 
         let mut outcome = AdvanceOutcome::Idle;
-        for &index in &self.schedule {
+        let mut pending_start = None;
+        let mut batch = self.transactions.durability_batch();
+        for position in 0..self.schedule.len() {
+            let index = self.schedule[position];
             let station_id = &self.station_ids[index];
-            let station_outcome = self.stations[index]
-                .advance(&self.reads, &mut self.transactions)
-                .map_err(|source| FlowRunError::new(station_id, source))?;
-            outcome = outcome.join(station_outcome);
+            let station_result = self.stations[index].advance(&self.reads, &mut batch);
+            if batch.has_pending() {
+                pending_start.get_or_insert(position);
+            } else {
+                pending_start = None;
+            }
+            match station_result {
+                Ok(station_outcome) => outcome = outcome.join(station_outcome),
+                Err(source @ StationError::DurabilityBarrier { .. }) => {
+                    drop(batch);
+                    if let Some(start) = pending_start {
+                        for &pending in &self.schedule[start..=position] {
+                            self.stations[pending].mark_needs_reopen();
+                        }
+                    }
+                    return Err(FlowRunError::new(station_id, source));
+                }
+                Err(source) => {
+                    if let Err(barrier) = batch.finish() {
+                        return Err(self.durability_failure(pending_start, position + 1, barrier));
+                    }
+                    return Err(FlowRunError::new(station_id, source));
+                }
+            }
         }
+        batch.finish().map_err(|source| {
+            self.durability_failure(pending_start, self.schedule.len(), source)
+        })?;
         Ok(outcome)
+    }
+
+    pub(super) fn durability_failure(
+        &mut self,
+        pending_start: Option<usize>,
+        end: usize,
+        source: dogpaddle_store::StoreError,
+    ) -> FlowRunError {
+        let start =
+            pending_start.expect("a failed durability barrier has at least one pending Station");
+        let failed = self.schedule[start];
+        for &index in &self.schedule[start..end] {
+            self.stations[index].mark_needs_reopen();
+        }
+        FlowRunError::new(
+            &self.station_ids[failed],
+            StationError::DurabilityBarrier { source },
+        )
     }
 }

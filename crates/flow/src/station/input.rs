@@ -1,10 +1,9 @@
 use std::{num::NonZeroU64, sync::Arc};
 
-use arrow_schema::SchemaRef;
-use dogpaddle_change::{Change, decode_change_owned, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{
-    Cell, ReadTransactionAccess, ReadTransactions, SubscribedLogWriter, Subscription,
-    TransactionAccess, Transactions,
+    Cell, DurabilityBatch, ReadTransactionAccess, ReadTransactions, SubscribedLogWriter,
+    Subscription, TransactionAccess,
 };
 
 use super::protocol::StationError;
@@ -36,11 +35,11 @@ pub(crate) struct Inbox {
     claim: Option<Claim>,
 }
 
-/// One producer's append capability and exact output Schema.
+/// One producer's append capability and Schema-bound Change codec.
 pub(crate) struct Output {
     writer: SubscribedLogWriter<Vec<u8>>,
     capacity_bytes: NonZeroU64,
-    schema: SchemaRef,
+    codec: SchemaBoundChangeCodec,
 }
 
 impl Claim {
@@ -116,7 +115,7 @@ impl Inbox {
     pub(super) fn intake(
         &mut self,
         reads: &ReadTransactions,
-        transactions: &mut Transactions,
+        transactions: &mut DurabilityBatch<'_>,
     ) -> Result<bool, StationError> {
         if self.claim.is_some() || self.ports.is_empty() {
             return Ok(false);
@@ -151,20 +150,14 @@ impl Inbox {
             offset,
             encoded,
         } = selected;
-        let change =
-            decode_change_owned(encoded).map_err(|source| StationError::InvalidInputChange {
+        let change = self.ports[port]
+            .output
+            .codec
+            .decode_owned(encoded)
+            .map_err(|source| StationError::InvalidInputChange {
                 input: port,
                 source,
             })?;
-        let actual = change.schema();
-        let expected = self.ports[port].output.schema();
-        if !schemas_match(expected, &actual) {
-            return Err(StationError::InputSchemaMismatch {
-                input: port,
-                expected: Arc::clone(expected),
-                actual,
-            });
-        }
         let pinned = self.active.is_some() && port != active;
         if pinned {
             let transaction = transactions.begin();
@@ -231,15 +224,15 @@ impl InputPort {
 }
 
 impl Output {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         writer: SubscribedLogWriter<Vec<u8>>,
         capacity_bytes: NonZeroU64,
-        schema: SchemaRef,
+        codec: SchemaBoundChangeCodec,
     ) -> Self {
         Self {
             writer,
             capacity_bytes,
-            schema,
+            codec,
         }
     }
 
@@ -268,22 +261,13 @@ impl Output {
         change: &Change,
         access: TransactionAccess<'_>,
     ) -> Result<bool, StationError> {
-        let actual = change.schema();
-        if !schemas_match(&self.schema, &actual) {
-            return Err(StationError::OutputSchemaMismatch {
-                expected: Arc::clone(&self.schema),
-                actual,
-            });
-        }
-        let encoded =
-            encode_change(change).map_err(|source| StationError::InvalidOutputChange { source })?;
+        let encoded = self
+            .codec
+            .encode(change)
+            .map_err(|source| StationError::InvalidOutputChange { source })?;
         Ok(self
             .writer
             .try_append(&encoded, self.capacity_bytes, access)?)
-    }
-
-    pub(super) const fn schema(&self) -> &SchemaRef {
-        &self.schema
     }
 }
 
@@ -297,8 +281,4 @@ fn validate_active(active: u32, input_count: usize) -> Result<usize, StationErro
     } else {
         Ok(active)
     }
-}
-
-fn schemas_match(expected: &SchemaRef, actual: &SchemaRef) -> bool {
-    Arc::ptr_eq(expected, actual) || expected.as_ref() == actual.as_ref()
 }

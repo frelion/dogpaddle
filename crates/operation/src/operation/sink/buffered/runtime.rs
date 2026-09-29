@@ -1,7 +1,6 @@
-use std::cmp;
+use std::{cmp, sync::Arc};
 
-use arrow_schema::SchemaRef;
-use dogpaddle_change::{Change, encode_change_bounded};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
 use super::{
@@ -27,7 +26,7 @@ struct Admission {
 }
 
 pub(crate) struct BufferedSink<T: SinkTarget> {
-    schema: SchemaRef,
+    codec: SchemaBoundChangeCodec,
     target: T,
     control: Cell<Vec<u8>>,
     buffer: OrderedMap<u64, Vec<u8>>,
@@ -79,13 +78,13 @@ struct PreparedRestore<'plan, C> {
 
 impl<T: SinkTarget> BufferedSink<T> {
     pub(crate) const fn new(
-        schema: SchemaRef,
+        codec: SchemaBoundChangeCodec,
         target: T,
         control: Cell<Vec<u8>>,
         buffer: OrderedMap<u64, Vec<u8>>,
     ) -> Self {
         Self {
-            schema,
+            codec,
             target,
             control,
             buffer,
@@ -103,7 +102,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             let restored = self.decode_restored(encoded.as_deref(), access)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     self.phase = Phase::Failed;
                     match restored {
                         Restored::New => self.phase = Phase::New,
@@ -183,7 +182,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             restored.before,
             delivery_limits(delivered_events),
             &mut self.head_cache,
-            &self.schema,
+            &self.codec,
             access,
             |change, row| self.target.event_bytes(change, row),
         )?;
@@ -265,7 +264,7 @@ impl<T: SinkTarget> BufferedSink<T> {
                 }
                 let item_bytes = batch::encoded_item_bytes(&encoded)?;
                 let change =
-                    batch::decode_entry(sequence, encoded, MAX_DELIVERY_BYTES, &self.schema)?;
+                    batch::decode_entry(sequence, encoded, MAX_DELIVERY_BYTES, &self.codec)?;
                 validate_event_sizes(&self.target, &change)?;
                 let (events, positive) = batch::remaining_event_counts(
                     &change,
@@ -341,7 +340,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             self.control.access(access)?.set(&encoded)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     self.phase = Phase::Failed;
                     self.target.initialize()?;
                     self.phase = Phase::Initialized;
@@ -361,7 +360,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             self.control.access(access)?.set(&encoded)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.phase = Phase::Ready(ready);
                     Ok(())
                 }),
@@ -412,7 +411,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             self.control.access(access)?.set(&encoded_control)?;
             Ok((
                 Action::Complete(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.phase = Phase::Ready(next);
                     Ok(())
                 }),
@@ -428,13 +427,13 @@ impl<T: SinkTarget> BufferedSink<T> {
                 ready.buffer,
                 delivery_limits(max_events),
                 &mut self.head_cache,
-                &self.schema,
+                &self.codec,
                 access,
                 |change, row| self.target.event_bytes(change, row),
             )?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.phase = Phase::Loaded(Box::new(LoadedPhase {
                         ready,
                         batch: loaded,
@@ -474,7 +473,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             self.control.access(access)?.set(&encoded)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     self.phase = Phase::Failed;
                     self.target.deliver(&delivery, &prepared.plan)?;
                     self.phase = Phase::Delivered(delivered(&prepared));
@@ -511,7 +510,7 @@ impl<T: SinkTarget> BufferedSink<T> {
             self.control.access(access)?.set(&encoded)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     let head = ready.buffer.head.map(|position| position.sequence);
                     if self
                         .head_cache
@@ -533,12 +532,14 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
         &'turn mut self,
         input: Option<OperationInput<'turn>>,
     ) -> Result<Turn<'turn>, OperationError> {
+        let bound_schema = self.codec.schema();
         let input = input
             .map(|input| {
                 if input.port != 0 {
                     return Err(invalid("only input port zero is supported"));
                 }
-                if input.change.records().schema() != self.schema {
+                let actual = input.change.records().schema_ref();
+                if !Arc::ptr_eq(&bound_schema, actual) && bound_schema.as_ref() != actual.as_ref() {
                     return Err(invalid("input Schema differs from the bound Schema"));
                 }
                 Ok(input.change)
@@ -555,6 +556,7 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
                     match input {
                         Some(input) => self.admit(
                             prepare_admission(
+                                &self.codec,
                                 &self.target,
                                 &ready.checkpoint,
                                 ready.buffer.pending_events,
@@ -568,6 +570,7 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
                     Ok(self.load(ready))
                 } else {
                     match prepare_admission(
+                        &self.codec,
                         &self.target,
                         &ready.checkpoint,
                         ready.buffer.pending_events,
@@ -589,6 +592,7 @@ impl<T: SinkTarget> TurnOperation for BufferedSink<T> {
 }
 
 fn prepare_admission<T: SinkTarget>(
+    codec: &SchemaBoundChangeCodec,
     target: &T,
     checkpoint: &T::Checkpoint,
     buffered_events: u64,
@@ -600,7 +604,7 @@ fn prepare_admission<T: SinkTarget>(
     }
     target.validate_admission(input, checkpoint, buffered_events)?;
     validate_event_sizes(target, input)?;
-    let encoded_change = encode_change_bounded(
+    let encoded_change = codec.encode_bounded(
         input,
         usize::try_from(MAX_DELIVERY_BYTES).expect("the delivery byte limit fits usize"),
     )?;

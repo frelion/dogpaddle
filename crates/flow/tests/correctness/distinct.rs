@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::Change;
 use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition,
@@ -10,6 +10,8 @@ use dogpaddle_operation::operation::{
     transform::{DistinctDefinition, RunningEventCountDefinition},
 };
 use dogpaddle_store::{Cell, Store, SubscribedLog};
+
+use super::support::encode_output_entry;
 
 const DISTINCT_OUTPUT: &str = "station/00000001/output";
 
@@ -26,7 +28,7 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
 
     drop(factory.build().unwrap());
 
-    let blocker = encode_change(&value_change(41)).unwrap();
+    let blocker = encode_output_entry(&value_change(41));
     let store = Store::open(&path).unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data(DISTINCT_OUTPUT).unwrap();
     let mut transactions = store.into_transactions();
@@ -89,7 +91,7 @@ fn fused_stateful_operations_roll_back_together_when_final_output_is_backpressur
 
     drop(factory.build().unwrap());
 
-    let blocker = encode_change(&count_change(41)).unwrap();
+    let blocker = encode_output_entry(&count_change(41));
     let store = Store::open(&path).unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let mut transactions = store.into_transactions();

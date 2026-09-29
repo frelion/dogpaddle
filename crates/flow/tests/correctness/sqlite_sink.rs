@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, ops::Range, path::Path, sync::Arc};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::{
     col, lit,
@@ -16,6 +16,8 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
 use rusqlite::{Connection, OpenFlags};
+
+use super::support::encode_output_entry;
 
 const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::MAX;
 const TABLE: &str = "events";
@@ -105,8 +107,13 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
     drop(FlowFactory::new(&flow_path).open().unwrap());
     assert!(!sqlite_path.exists(), "build/open must not create SQLite");
 
-    let encoded_change = encode_change(&multiplicity_change(7, 1_025)).unwrap();
-    publish_scan_change(&flow_path, &encoded_change);
+    let change = multiplicity_change(7, 1_025);
+    let output_entry = encode_output_entry(&change);
+    let buffered_entry = SchemaBoundChangeCodec::try_new(change.schema())
+        .unwrap()
+        .encode(&change)
+        .unwrap();
+    publish_scan_change(&flow_path, &output_entry);
     let mut prepared = None;
 
     // Stop after the target transaction, before local settlement; reopen must
@@ -126,7 +133,7 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
         assert_eq!(snapshot.output_bounds, 1..1);
         assert_eq!(
             snapshot.encoded_entry.as_deref(),
-            Some(encoded_change.as_slice())
+            Some(buffered_entry.as_slice())
         );
         assert!(snapshot.state.is_some());
         if replay == 0 {
@@ -477,7 +484,7 @@ fn publish_join_input(flow_path: &Path, station: usize, values: impl IntoIterato
     let row_count = values.len();
     let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(values))]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1; row_count])).unwrap();
-    let encoded = encode_change(&change).unwrap();
+    let encoded = encode_output_entry(&change);
     let store = Store::open(flow_path).unwrap();
     let positions = (0..2)
         .map(|index| {

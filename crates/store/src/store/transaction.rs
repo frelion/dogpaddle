@@ -6,8 +6,8 @@ use rocksdb::{
 };
 
 use super::{
-    DataHandle, ReadTransaction, ReadTransactionAccess, ReadTransactions, Store, StoreSetup,
-    Transaction, TransactionAccess, Transactions,
+    BatchedTransaction, DataHandle, DurabilityBatch, ReadTransaction, ReadTransactionAccess,
+    ReadTransactions, Store, StoreSetup, Transaction, TransactionAccess, Transactions,
     database::{STORE_MARKER, STORE_MARKER_KEY, catalog_key, encode_binding, open_database},
 };
 use crate::StoreError;
@@ -61,7 +61,7 @@ impl StoreSetup {
         })?;
         let database = open_database(path, true)?;
         let transaction = Transaction {
-            inner: begin_write_transaction(&database),
+            inner: begin_write_transaction(&database, true),
             store_token: self.token,
             poisoned: std::cell::Cell::new(false),
             // The marker is always staged below, even when the draft catalog
@@ -130,12 +130,81 @@ impl Transactions {
     /// ```
     pub fn begin(&mut self) -> Transaction<'_> {
         Transaction {
-            inner: begin_write_transaction(&self.database),
+            inner: begin_write_transaction(&self.database, true),
             store_token: self.store_token,
             poisoned: std::cell::Cell::new(false),
             has_writes: std::cell::Cell::new(false),
             _thread_bound: std::marker::PhantomData,
         }
+    }
+
+    /// Begins an explicit batch of atomic commits that share durability
+    /// barriers.
+    ///
+    /// Transactions started through the returned capability keep WAL enabled,
+    /// but leave their WAL records in `RocksDB`'s manual-flush buffer. A caller
+    /// must write out and synchronize the batch before any external effect
+    /// depends on a commit and finish the batch before returning control to
+    /// its own caller.
+    pub fn durability_batch(&mut self) -> DurabilityBatch<'_> {
+        DurabilityBatch {
+            database: &self.database,
+            store_token: self.store_token,
+            pending: false,
+        }
+    }
+}
+
+impl DurabilityBatch<'_> {
+    /// Begins one atomic transaction whose write commit attempt joins this
+    /// batch's next durability barrier.
+    pub fn begin(&mut self) -> BatchedTransaction<'_> {
+        BatchedTransaction {
+            transaction: Transaction {
+                inner: begin_write_transaction(self.database, false),
+                store_token: self.store_token,
+                poisoned: std::cell::Cell::new(false),
+                has_writes: std::cell::Cell::new(false),
+                _thread_bound: std::marker::PhantomData,
+            },
+            pending: &mut self.pending,
+        }
+    }
+
+    /// Returns whether write commit attempts are waiting for a durability
+    /// barrier.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Writes out and makes every successful write commit since the previous
+    /// barrier durable. A batch with no pending writes completes without
+    /// entering `RocksDB`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `RocksDB` cannot synchronize the WAL. The outcome is
+    /// uncertain and the owning runtime must be reconstructed before reuse.
+    pub fn sync(&mut self) -> Result<(), StoreError> {
+        if !self.pending {
+            return Ok(());
+        }
+        self.database
+            .flush_wal(true)
+            .map_err(|error| StoreError::storage("synchronize durability batch", error))?;
+        self.pending = false;
+        Ok(())
+    }
+
+    /// Establishes the final durability barrier and consumes this batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `RocksDB` cannot synchronize the WAL. The outcome is
+    /// uncertain and the owning runtime must be reconstructed before reuse.
+    pub fn finish(mut self) -> Result<(), StoreError> {
+        self.sync()
     }
 }
 
@@ -236,6 +305,34 @@ impl Transaction<'_> {
     }
 }
 
+impl BatchedTransaction<'_> {
+    /// Borrows this transaction as a typed data-access capability.
+    #[must_use]
+    pub fn access(&self) -> TransactionAccess<'_> {
+        self.transaction.access()
+    }
+
+    /// Atomically commits all changes and consumes the transaction.
+    ///
+    /// A write commit attempt joins the enclosing batch's next durability
+    /// barrier before entering `RocksDB`. A healthy no-write transaction does
+    /// not enter `RocksDB` or make the batch pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction is poisoned or `RocksDB` cannot
+    /// commit it. The batch remains pending after a failed write commit so its
+    /// owner can still establish the final barrier. The owning runtime must
+    /// treat a `RocksDB` commit error as an uncertain outcome and reconstruct
+    /// itself before reuse.
+    pub fn commit(self) -> Result<(), StoreError> {
+        // A RocksDB commit error can have an uncertain outcome, so arm the
+        // barrier before attempting any staged write.
+        *self.pending |= self.transaction.has_writes.get();
+        self.transaction.commit()
+    }
+}
+
 impl ReadTransaction<'_> {
     /// Borrows this snapshot as a typed read-only data-access capability.
     #[must_use]
@@ -289,16 +386,23 @@ impl<'transaction> ReadTransactionAccess<'transaction> {
     }
 }
 
-pub(super) fn begin_write_transaction(database: &Database) -> RocksTransaction<'_, Database> {
-    let write_options = durable_write_options();
+pub(super) fn begin_write_transaction(
+    database: &Database,
+    sync: bool,
+) -> RocksTransaction<'_, Database> {
+    let write_options = write_options(sync);
     let mut transaction_options = OptimisticTransactionOptions::default();
     transaction_options.set_snapshot(true);
     database.transaction_opt(&write_options, &transaction_options)
 }
 
 pub(super) fn durable_write_options() -> WriteOptions {
+    write_options(true)
+}
+
+fn write_options(sync: bool) -> WriteOptions {
     let mut options = WriteOptions::default();
-    options.set_sync(true);
+    options.set_sync(sync);
     options.disable_wal(false);
     options
 }

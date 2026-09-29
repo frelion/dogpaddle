@@ -16,19 +16,22 @@ Change 自己拥有 Arrow fixture、工作量、预热、正确性 oracle 和输
 位于 `RunRoot/criterion/`，相邻 `criterion-context.json` 记录 profile、host、固定 workload 和 encoded
 bytes。该 target 设置 `test = true`，Cargo test mode 自动使用最小 smoke fixture。
 
-## `change_codec` — 五路旋转 runner
+## `change_codec` — 七路旋转 runner
 
-同一 fixture 的五个 case 在每个 sample 内执行一次，并逐 sample 轮换首个 case：
+同一 fixture 的七个 case 在每个 sample 内执行一次，并逐 sample 轮换首个 case：
 
-1. encode；
-2. full decode；
-3. diff-only projected decode；
-4. narrow projected decode；
-5. identity projected decode。
+1. self-contained encode；
+2. schema-bound encode；
+3. self-contained full decode；
+4. schema-bound full decode；
+5. diff-only projected decode；
+6. narrow projected decode；
+7. identity projected decode。
 
 这样保留同一 sample 下的配对关系，同时分散固定顺序和热度偏差。所有 projection、预编码字节、独立
-oracle 和 warm-up 在计时外。stdout 逐行输出 owner-specific JSONL：context、fixture、包含五个有序
-measurement 的 paired sample、completion；stderr 只输出进度。失败前已 flush 的样本仍然可用。
+oracle 和 warm-up 在计时外。stdout 逐行输出 owner-specific JSONL：context、fixture、包含七个有序
+measurement 的 paired sample、completion；fixture record 同时记录两种格式的每 Change 字节数、节省字节
+和整数 basis points。stderr 只输出进度。失败前已 flush 的样本仍然可用。
 
 `smoke` 使用 4 rows/Change 和 16-byte 宽 payload；`reference` 使用 1、64、1024、16384 rows/Change、
 1 KiB 宽 payload及 9 次旋转 sample。类型全集属于 correctness，这里只选不同成本形状。

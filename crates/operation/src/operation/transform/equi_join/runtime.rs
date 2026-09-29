@@ -898,7 +898,7 @@ impl TurnOperation for EquiJoinOperation {
             let complete = matches!(&action, Action::Complete(_));
             self.prepared = Some(claim);
             let after_commit = if complete {
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.prepared = None;
                     Ok(())
                 })

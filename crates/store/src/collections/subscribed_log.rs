@@ -297,9 +297,18 @@ impl<T: StoreValue> Subscription<T> {
     ) -> Result<(), StoreError> {
         let mut data = self.data.access(access)?;
         let metadata = read_metadata(data.as_read())?;
-        let positions = read_positions(data.as_read(), metadata)?;
-        let index = subscriber_index(metadata, self.subscriber, data.as_read())?;
-        let actual = positions[index];
+        let positions = if metadata.subscriber_count == 1 {
+            None
+        } else {
+            Some(read_positions(data.as_read(), metadata)?)
+        };
+        let (actual, index) = match &positions {
+            Some(positions) => {
+                let index = subscriber_index(metadata, self.subscriber, data.as_read())?;
+                (positions[index], index)
+            }
+            None => (read_position(data.as_read(), metadata, self.subscriber)?, 0),
+        };
         if actual != expected_offset {
             return fail(
                 data.as_read(),
@@ -327,7 +336,9 @@ impl<T: StoreValue> Subscription<T> {
                     reason: "the acknowledged entry is missing",
                 });
         let encoded_len = data.as_read().record_result(encoded_len)?;
-        let (old_head, new_head) = acknowledgement_frontiers(&positions, index, next);
+        let (old_head, new_head) = positions.as_ref().map_or((actual, next), |positions| {
+            acknowledgement_frontiers(positions, index, next)
+        });
         // The length read above already proves this entry exists. Reuse that
         // result when it is also a retention boundary.
         validate_retention(data.as_read(), metadata, old_head, Some(actual))?;

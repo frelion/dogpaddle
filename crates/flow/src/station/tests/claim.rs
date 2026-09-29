@@ -1,3 +1,4 @@
+use dogpaddle_change::CodecError;
 use dogpaddle_operation::operation::Action;
 
 use crate::flow::AdvanceOutcome;
@@ -17,13 +18,15 @@ fn claim_is_owned_idempotent_and_survives_commit_cache_loss_and_reopen() {
     assert_eq!(claim_id(&pinned.station), Some((1, 0)));
     let encoded = claim_bytes(&pinned.station);
     let memory_identity = claim_ptr(&pinned.station);
+    let mut batch = pinned.transactions.durability_batch();
     assert!(
         !pinned
             .station
             .inbox
-            .intake(&pinned.reads, &mut pinned.transactions)
+            .intake(&pinned.reads, &mut batch)
             .unwrap()
     );
+    batch.finish().unwrap();
     assert_eq!(claim_ptr(&pinned.station), memory_identity);
 
     pinned
@@ -34,13 +37,15 @@ fn claim_is_owned_idempotent_and_survives_commit_cache_loss_and_reopen() {
     assert_eq!(claim_ptr(&pinned.station), memory_identity);
 
     pinned.station.inbox.clear_cached_claim();
+    let mut batch = pinned.transactions.durability_batch();
     assert!(
         !pinned
             .station
             .inbox
-            .intake(&pinned.reads, &mut pinned.transactions)
+            .intake(&pinned.reads, &mut batch)
             .unwrap()
     );
+    batch.finish().unwrap();
     assert_eq!(claim_id(&pinned.station), Some((1, 0)));
     assert_eq!(claim_bytes(&pinned.station), encoded);
 
@@ -53,7 +58,7 @@ fn claim_is_owned_idempotent_and_survives_commit_cache_loss_and_reopen() {
 }
 
 #[test]
-fn intake_checks_the_selected_outputs_schema_before_durable_pin() {
+fn intake_uses_the_selected_outputs_codec_before_durable_pin() {
     let schemas = [value_schema(), count_schema()];
     let mut valid = raw_station_with_change_and_schemas(
         &[0, 1],
@@ -75,7 +80,10 @@ fn intake_checks_the_selected_outputs_schema_before_durable_pin() {
     );
     assert!(matches!(
         invalid.try_step(),
-        Err(StationError::InputSchemaMismatch { input: 1, .. })
+        Err(StationError::InvalidInputChange {
+            input: 1,
+            source: CodecError::SchemaMismatch,
+        })
     ));
     assert_eq!((invalid.active(), invalid.position(1)), (0, 0));
     assert_eq!(invalid.bounds(1), 0..1);

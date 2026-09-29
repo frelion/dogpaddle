@@ -7,7 +7,7 @@ use std::{
 
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{Cell, OrderedMap, Store, Transactions};
 
 use super::*;
@@ -217,6 +217,10 @@ fn schema() -> SchemaRef {
     )]))
 }
 
+fn codec() -> SchemaBoundChangeCodec {
+    SchemaBoundChangeCodec::try_new(schema()).unwrap()
+}
+
 fn change(values: &[u64], diffs: &[i64]) -> Change {
     assert_eq!(values.len(), diffs.len());
     Change::try_new(
@@ -256,7 +260,7 @@ impl Fixture {
             .unwrap();
         let target = Arc::new(Mutex::new(TargetState::default()));
         let operation = BufferedSink::new(
-            Arc::clone(&schema),
+            SchemaBoundChangeCodec::try_new(Arc::clone(&schema)).unwrap(),
             Target::new(Arc::clone(&target)),
             control.clone(),
             buffer.clone(),
@@ -291,7 +295,7 @@ impl Fixture {
             .open_data::<OrderedMap<u64, Vec<u8>>>("sink.buffer")
             .unwrap();
         let operation = BufferedSink::new(
-            Arc::clone(&schema),
+            SchemaBoundChangeCodec::try_new(Arc::clone(&schema)).unwrap(),
             Target::new(Arc::clone(&target)),
             control.clone(),
             buffer.clone(),
@@ -492,9 +496,10 @@ fn loader_slices_mixed_diffs_and_preserves_whole_row_admission() {
         .unwrap();
     let first = change(&[10, 11, 12], &[2, -5, 1]);
     let second = change(&[20, 21], &[-3, 4]);
+    let codec = codec();
     let encoded = [
-        encode_change(&first).unwrap(),
-        encode_change(&second).unwrap(),
+        codec.encode(&first).unwrap(),
+        codec.encode(&second).unwrap(),
     ];
     let retained_bytes = encoded
         .iter()
@@ -524,7 +529,7 @@ fn loader_slices_mixed_diffs_and_preserves_whole_row_admission() {
             MAX_TARGET_BATCH_BYTES,
         ),
         &mut None,
-        &schema(),
+        &codec,
         transaction.access(),
         |_, _| Ok(1),
     )
@@ -553,7 +558,7 @@ fn loader_slices_mixed_diffs_and_preserves_whole_row_admission() {
             MAX_TARGET_BATCH_BYTES,
         ),
         &mut None,
-        &schema(),
+        &codec,
         transaction.access(),
         |_, _| Ok(1),
     )
@@ -585,8 +590,9 @@ fn loader_bounds_cross_entry_aggregation_by_encoded_bytes() {
         .unwrap();
     let first = change(&[1], &[1]);
     let second = change(&[2], &[1]);
-    let first_encoded = encode_change(&first).unwrap();
-    let second_encoded = encode_change(&second).unwrap();
+    let codec = codec();
+    let first_encoded = codec.encode(&first).unwrap();
+    let second_encoded = codec.encode(&second).unwrap();
     let first_bytes = encoded_item_bytes(&first_encoded).unwrap();
     let second_bytes = encoded_item_bytes(&second_encoded).unwrap();
     let before = BufferState {
@@ -613,7 +619,7 @@ fn loader_bounds_cross_entry_aggregation_by_encoded_bytes() {
             MAX_TARGET_BATCH_BYTES,
         ),
         &mut None,
-        &schema(),
+        &codec,
         transaction.access(),
         |_, _| Ok(1),
     )
@@ -628,6 +634,7 @@ fn assert_loader_error(
     buffer: &OrderedMap<u64, Vec<u8>>,
     transactions: &mut Transactions,
     before: BufferState,
+    codec: &SchemaBoundChangeCodec,
 ) {
     let transaction = transactions.begin();
     assert!(
@@ -641,7 +648,7 @@ fn assert_loader_error(
                 MAX_TARGET_BATCH_BYTES,
             ),
             &mut None,
-            &schema(),
+            codec,
             transaction.access(),
             |_, _| Ok(1),
         )
@@ -657,6 +664,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         .create_data::<OrderedMap<u64, Vec<u8>>>("buffer")
         .unwrap();
     let mut transactions = store.into_transactions();
+    let codec = codec();
     let before = BufferState {
         head: Some(Position {
             sequence: 0,
@@ -668,7 +676,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: 8,
     };
 
-    assert_loader_error(&buffer, &mut transactions, before);
+    assert_loader_error(&buffer, &mut transactions, before, &codec);
 
     let transaction = transactions.begin();
     buffer
@@ -681,7 +689,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: 11,
         ..before
     };
-    assert_loader_error(&buffer, &mut transactions, corrupt);
+    assert_loader_error(&buffer, &mut transactions, corrupt, &codec);
 
     let wrong = Change::try_new(
         RecordBatch::try_new(
@@ -696,7 +704,8 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    let encoded = encode_change(&wrong).unwrap();
+    let wrong_codec = SchemaBoundChangeCodec::try_new(wrong.records().schema()).unwrap();
+    let encoded = wrong_codec.encode(&wrong).unwrap();
     let transaction = transactions.begin();
     buffer
         .access(transaction.access())
@@ -708,7 +717,7 @@ fn loader_rejects_missing_corrupt_and_wrong_schema_entries() {
         retained_bytes: encoded_item_bytes(&encoded).unwrap(),
         ..before
     };
-    assert_loader_error(&buffer, &mut transactions, wrong_schema);
+    assert_loader_error(&buffer, &mut transactions, wrong_schema, &codec);
 }
 
 #[test]
@@ -941,8 +950,9 @@ fn oversized_event_and_item_are_rejected_without_partial_admission() {
     assert!(fixture.entry(0).is_none());
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
     let target = Target::new(Arc::new(Mutex::new(TargetState::default())));
-    assert!(prepare_admission(&target, &0, 0, &change(&[1], &[1_048_576])).is_ok());
-    assert!(prepare_admission(&target, &0, 0, &change(&[1], &[1_048_577])).is_err());
+    let codec = codec();
+    assert!(prepare_admission(&codec, &target, &0, 0, &change(&[1], &[1_048_576])).is_ok());
+    assert!(prepare_admission(&codec, &target, &0, 0, &change(&[1], &[1_048_577])).is_err());
     assert!(batch::event_count(&change(&[1, 2], &[i64::MIN, i64::MIN])).is_err());
 
     let binary_schema = Arc::new(Schema::new(vec![Field::new(
@@ -950,6 +960,7 @@ fn oversized_event_and_item_are_rejected_without_partial_admission() {
         DataType::Binary,
         false,
     )]));
+    let binary_codec = SchemaBoundChangeCodec::try_new(Arc::clone(&binary_schema)).unwrap();
     let payload = vec![7_u8; usize::try_from(MAX_DELIVERY_BYTES).unwrap()];
     let oversized = Change::try_new(
         RecordBatch::try_new(
@@ -960,7 +971,7 @@ fn oversized_event_and_item_are_rejected_without_partial_admission() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    assert!(prepare_admission(&target, &0, 0, &oversized).is_err());
+    assert!(prepare_admission(&binary_codec, &target, &0, 0, &oversized).is_err());
 }
 
 #[test]
@@ -1011,7 +1022,7 @@ fn restore_checks_positive_capacity_before_any_target_io() {
 }
 
 #[test]
-fn a_wide_large_change_round_trips_through_owned_ipc_and_reopen() {
+fn a_wide_large_change_round_trips_through_owned_bound_entry_and_reopen() {
     let wide_schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::UInt64, false),
         Field::new("first", DataType::Binary, false),
@@ -1030,7 +1041,8 @@ fn a_wide_large_change_round_trips_through_owned_ipc_and_reopen() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    assert!(encoded_item_bytes(&encode_change(&input).unwrap()).unwrap() < MAX_DELIVERY_BYTES);
+    let codec = SchemaBoundChangeCodec::try_new(Arc::clone(&wide_schema)).unwrap();
+    assert!(encoded_item_bytes(&codec.encode(&input).unwrap()).unwrap() < MAX_DELIVERY_BYTES);
 
     let mut fixture = Fixture::create_with_schema(wide_schema);
     fixture.bootstrap();
@@ -1110,8 +1122,13 @@ fn restore_validation_crosses_scan_pages_before_external_io() {
     let mut fixture = Fixture::create();
     fixture.bootstrap();
     let count = BUFFER_VALIDATION_ITEMS + 1;
+    let codec = codec();
     let valid = (0..count)
-        .map(|value| encode_change(&change(&[u64::try_from(value).unwrap()], &[1])).unwrap())
+        .map(|value| {
+            codec
+                .encode(&change(&[u64::try_from(value).unwrap()], &[1]))
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     let malformed = vec![0, 1, 2];
     let retained_bytes = valid[..count - 1]
@@ -1160,12 +1177,13 @@ fn restore_validation_crosses_scan_pages_before_external_io() {
 #[test]
 fn restore_rejects_a_nonzero_orphan_without_control_state() {
     let mut fixture = Fixture::create();
+    let codec = codec();
     let transaction = fixture.transactions.begin();
     fixture
         .buffer
         .access(transaction.access())
         .unwrap()
-        .put(&7, &encode_change(&change(&[7], &[1])).unwrap())
+        .put(&7, &codec.encode(&change(&[7], &[1])).unwrap())
         .unwrap();
     transaction.commit().unwrap();
 

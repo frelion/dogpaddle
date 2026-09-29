@@ -2,7 +2,7 @@
 use std::{num::NonZeroU64, time::Duration};
 
 use arrow_schema::SchemaRef;
-use dogpaddle_change::{Change, decode_change_owned, encode_change};
+use dogpaddle_change::{Change, CodecError, SchemaBoundChangeCodec};
 use dogpaddle_debezium::{Checkpoint, Connector, Record};
 use dogpaddle_store::{Cell, Queue};
 
@@ -12,6 +12,7 @@ const CAPTURING: u32 = 1;
 const PUBLISHING: u32 = 2;
 const STREAMING: u32 = 3;
 const RESETTING: u32 = 4;
+const RESET_BATCH_ENTRIES: usize = 256;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -91,7 +92,7 @@ pub(super) trait Source: Send + 'static {
 
 pub(super) struct CdcRuntime<B: Source> {
     source: B,
-    pub(super) output_schema: SchemaRef,
+    pub(super) codec: SchemaBoundChangeCodec,
     phase_cell: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     spool: Queue<Vec<u8>>,
@@ -110,10 +111,10 @@ impl<B: Source> CdcRuntime<B> {
         checkpoint: Cell<Vec<u8>>,
         spool: Queue<Vec<u8>>,
         capacity: NonZeroU64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
             source,
-            output_schema,
+            codec: SchemaBoundChangeCodec::try_new(output_schema)?,
             phase_cell,
             checkpoint,
             spool,
@@ -122,7 +123,7 @@ impl<B: Source> CdcRuntime<B> {
             resume: None,
             connector: None,
             progress: B::Progress::default(),
-        }
+        })
     }
 
     fn restore(&mut self) -> Turn<'_> {
@@ -152,7 +153,7 @@ impl<B: Source> CdcRuntime<B> {
             }
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.next_step = match phase {
                         Phase::Fresh => NextStep::BeginCapture,
                         Phase::Capturing if B::RESET_REQUIRES_SOURCE_CLEANUP => {
@@ -174,7 +175,7 @@ impl<B: Source> CdcRuntime<B> {
             self.phase_cell.access(access)?.set(&CAPTURING)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.next_step = NextStep::Capture;
                     self.progress = B::Progress::default();
                     Ok(())
@@ -200,7 +201,7 @@ impl<B: Source> CdcRuntime<B> {
             self.phase_cell.access(access)?.set(&RESETTING)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::local(move || {
                     self.next_step = NextStep::Reset;
                     self.resume = None;
                     self.progress = B::Progress::default();
@@ -213,7 +214,7 @@ impl<B: Source> CdcRuntime<B> {
     fn reset(&mut self) -> Turn<'_> {
         Turn::ready(move |access| {
             let mut spool = self.spool.access(access)?;
-            let finished = spool.discard_front()?.unwrap_or(true);
+            let finished = spool.discard_front(RESET_BATCH_ENTRIES)?;
             if finished {
                 self.checkpoint.access(access)?.clear()?;
                 self.phase_cell.access(access)?.clear()?;
@@ -221,7 +222,7 @@ impl<B: Source> CdcRuntime<B> {
             Ok((
                 Action::Commit(None),
                 if finished {
-                    AfterCommit::new(move || {
+                    AfterCommit::local(move || {
                         self.next_step = NextStep::BeginCapture;
                         self.resume = None;
                         Ok(())
@@ -254,18 +255,23 @@ impl<B: Source> CdcRuntime<B> {
                 )));
             }
         };
-        let captured = match self.source.capture(
-            self.output_schema.clone(),
-            delivery.records(),
-            self.progress,
-        ) {
-            Ok(captured) => captured,
-            Err(error) => {
-                self.next_step = NextStep::PrepareReset;
-                return Err(error);
-            }
-        };
-        let encoded = match captured.change.as_ref().map(encode_change).transpose() {
+        let captured =
+            match self
+                .source
+                .capture(self.codec.schema(), delivery.records(), self.progress)
+            {
+                Ok(captured) => captured,
+                Err(error) => {
+                    self.next_step = NextStep::PrepareReset;
+                    return Err(error);
+                }
+            };
+        let encoded = match captured
+            .change
+            .as_ref()
+            .map(|change| self.codec.encode(change))
+            .transpose()
+        {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.next_step = NextStep::PrepareReset;
@@ -293,7 +299,7 @@ impl<B: Source> CdcRuntime<B> {
             }
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     delivery.ack().map_err(|error| {
                         B::runtime_error(format!(
                             "Debezium snapshot ACK failed ({:?})",
@@ -320,13 +326,10 @@ impl<B: Source> CdcRuntime<B> {
             let finished = popped.as_ref().is_none_or(|(_, empty_after)| *empty_after);
             let change = popped
                 .map(|(encoded, _)| {
-                    let change = decode_change_owned(encoded)
+                    let change = self
+                        .codec
+                        .decode_owned(encoded)
                         .map_err(|_| B::invalid_state("bootstrap spool Change is invalid"))?;
-                    if change.records().schema() != self.output_schema {
-                        return Err(B::invalid_state(
-                            "bootstrap spool Change has the wrong schema",
-                        ));
-                    }
                     Ok::<_, OperationError>(change)
                 })
                 .transpose()?;
@@ -336,7 +339,7 @@ impl<B: Source> CdcRuntime<B> {
             Ok((
                 Action::Commit(change),
                 if finished {
-                    AfterCommit::new(move || {
+                    AfterCommit::local(move || {
                         self.next_step = NextStep::Stream;
                         Ok(())
                     })
@@ -372,7 +375,7 @@ impl<B: Source> CdcRuntime<B> {
         };
         let change = self
             .source
-            .stream(self.output_schema.clone(), delivery.records())?;
+            .stream(self.codec.schema(), delivery.records())?;
         self.next_step = NextStep::Stream;
         let encoded = delivery.checkpoint().as_bytes().to_vec();
         let resumed = delivery.checkpoint().clone();
@@ -382,7 +385,7 @@ impl<B: Source> CdcRuntime<B> {
             checkpoint.access(access)?.set(&encoded)?;
             Ok((
                 Action::Commit(change),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     delivery.ack().map_err(|error| {
                         B::runtime_error(format!(
                             "Debezium streaming ACK failed ({:?})",

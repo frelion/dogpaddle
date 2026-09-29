@@ -1,5 +1,5 @@
 use super::{
-    MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanSpec,
+    MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanSpec,
     convert::{SnapshotProgress, convert_snapshot_values, convert_values},
 };
 use crate::operation::OperationError;
@@ -8,31 +8,34 @@ use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use dogpaddle_debezium::{Checkpoint, Connector, Record};
 use dogpaddle_store::{Cell, Queue};
-use std::num::NonZeroU64;
 
 pub(super) type MySqlCdcScanOperation = CdcRuntime<MySqlSource>;
 pub(super) struct MySqlSource {
     spec: MySqlCdcScanSpec,
+    output_projection: Vec<u32>,
     config: MySqlCdcScanConfig,
 }
 
 impl MySqlCdcScanOperation {
     pub(super) fn new_bound(
-        spec: MySqlCdcScanSpec,
+        definition: &MySqlCdcScanDefinition,
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
         bootstrap_spool: Queue<Vec<u8>>,
-        bootstrap_spool_bytes: NonZeroU64,
         config: MySqlCdcScanConfig,
-    ) -> Self {
+    ) -> Result<Self, dogpaddle_change::CodecError> {
         Self::new(
-            MySqlSource { spec, config },
+            MySqlSource {
+                spec: definition.spec().clone(),
+                output_projection: definition.output_projection().to_vec(),
+                config,
+            },
             output_schema,
             phase_cell,
             checkpoint,
             bootstrap_spool,
-            bootstrap_spool_bytes,
+            definition.bootstrap_spool_bytes(),
         )
     }
 }
@@ -56,11 +59,9 @@ impl Source for MySqlSource {
         progress: Self::Progress,
     ) -> Result<Captured<Self::Progress>, OperationError> {
         Ok(convert_snapshot_values(
-            &self.spec.columns,
+            &self.spec,
+            &self.output_projection,
             schema,
-            &self.spec.engine_name,
-            &self.spec.database,
-            &self.spec.table,
             records
                 .iter()
                 .map(|record| (record.topic(), record.value())),
@@ -73,11 +74,9 @@ impl Source for MySqlSource {
         records: &[Record],
     ) -> Result<Option<Change>, OperationError> {
         Ok(convert_values(
-            &self.spec.columns,
+            &self.spec,
+            &self.output_projection,
             schema,
-            &self.spec.engine_name,
-            &self.spec.database,
-            &self.spec.table,
             records
                 .iter()
                 .map(|record| (record.topic(), record.value())),
@@ -134,7 +133,7 @@ mod tests {
 
     use arrow_array::{Int64Array, RecordBatch};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
-    use dogpaddle_change::{Change, encode_change};
+    use dogpaddle_change::Change;
     use dogpaddle_store::{Cell, Queue, Store};
 
     const CAPTURING: u32 = 1;
@@ -204,7 +203,7 @@ mod tests {
             let spool = store.create_data::<Queue<Vec<u8>>>("spool").unwrap();
             let columns = vec![MySqlColumn::new("id", MySqlType::Int64, false)];
             let schema = super::super::schema::compile(&columns).unwrap();
-            let operation = MySqlCdcScanOperation::new_bound(
+            let definition = MySqlCdcScanDefinition::try_new(
                 MySqlCdcScanSpec {
                     engine_name: "orders".to_owned(),
                     database: "shop".to_owned(),
@@ -213,13 +212,18 @@ mod tests {
                     table_id: 43,
                     columns,
                 },
+                NonZeroU64::new(1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            let operation = MySqlCdcScanOperation::new_bound(
+                &definition,
                 schema,
                 phase.clone(),
                 checkpoint.clone(),
                 spool.clone(),
-                NonZeroU64::new(1024 * 1024).unwrap(),
                 config(),
-            );
+            )
+            .unwrap();
             Self {
                 operation,
                 phase,
@@ -274,6 +278,13 @@ mod tests {
             transaction.commit().unwrap();
             result
         }
+
+        fn encoded_change(&self, value: i64) -> Vec<u8> {
+            self.operation
+                .codec
+                .encode(&change(self.operation.codec.schema(), value))
+                .unwrap()
+        }
     }
 
     #[test]
@@ -291,10 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_partial_capture_enters_incremental_reset() {
+    fn reopening_a_partial_capture_resets_spool_and_checkpoint() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
+        let encoded = fixture.encoded_change(7);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -319,18 +329,6 @@ mod tests {
         assert!(matches!(fixture.commit(), Action::Commit(None)));
         assert_eq!(fixture.durable().0, Some(RESETTING));
         fixture.commit();
-        assert_eq!(fixture.durable().2, queued_bytes(&encoded));
-        fixture.rollback();
-        assert_eq!(
-            fixture.durable(),
-            (
-                Some(RESETTING),
-                Some(checkpoint().as_bytes().to_vec()),
-                queued_bytes(&encoded)
-            )
-        );
-        assert_eq!(fixture.operation.next_step, NextStep::Reset);
-        fixture.commit();
         assert_eq!(fixture.durable(), (None, None, 0));
         assert_eq!(fixture.operation.next_step, NextStep::BeginCapture);
     }
@@ -338,8 +336,7 @@ mod tests {
     #[test]
     fn partial_capture_without_its_atomic_checkpoint_is_rejected() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 7)).unwrap();
+        let encoded = fixture.encoded_change(7);
         let transaction = fixture.transactions.begin();
         fixture
             .phase
@@ -372,8 +369,7 @@ mod tests {
     #[test]
     fn publishing_pop_and_streaming_transition_rollback_together() {
         let mut fixture = Fixture::create();
-        let encoded =
-            encode_change(&change(Arc::clone(&fixture.operation.output_schema), 9)).unwrap();
+        let encoded = fixture.encoded_change(9);
         let transaction = fixture.transactions.begin();
         fixture
             .phase

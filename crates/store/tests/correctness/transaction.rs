@@ -287,6 +287,56 @@ fn commit_and_drop_are_atomic_across_collections() {
 }
 
 #[test]
+fn durability_batch_tracks_write_commits_and_shares_one_explicit_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let cell = store.create_data::<Cell<u64>>("cell").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+
+    let mut batch = writes.durability_batch();
+    batch.begin().commit().unwrap();
+    assert!(!batch.has_pending());
+
+    let transaction = batch.begin();
+    cell.access(transaction.access()).unwrap().set(&41).unwrap();
+    transaction.commit().unwrap();
+    assert!(batch.has_pending());
+
+    let snapshot = reads.begin();
+    assert_eq!(
+        cell.read(snapshot.access()).unwrap().get().unwrap(),
+        Some(41)
+    );
+    drop(snapshot);
+
+    let transaction = batch.begin();
+    cell.access(transaction.access()).unwrap().set(&42).unwrap();
+    transaction.commit().unwrap();
+    assert!(batch.has_pending());
+    batch.sync().unwrap();
+    assert!(!batch.has_pending());
+    batch.finish().unwrap();
+
+    let snapshot = reads.begin();
+    assert_eq!(
+        cell.read(snapshot.access()).unwrap().get().unwrap(),
+        Some(42)
+    );
+    drop(snapshot);
+    drop(reads);
+    drop(writes);
+
+    let store = Store::open(path).unwrap();
+    let cell = store.open_data::<Cell<u64>>("cell").unwrap();
+    let snapshot = store.read_transaction();
+    assert_eq!(
+        cell.read(snapshot.access()).unwrap().get().unwrap(),
+        Some(42)
+    );
+}
+
+#[test]
 fn wrong_store_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut first_store = Store::create(root.path().join("first")).unwrap();

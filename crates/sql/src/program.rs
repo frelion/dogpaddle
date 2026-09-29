@@ -10,16 +10,16 @@ use dogpaddle_flow::{Flow, FlowFactory};
 use crate::{
     SqlError,
     endpoint::{
-        ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
+        BuiltScan, ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
         resolve_debezium_runtime,
     },
-    plan::{lower_query, plan},
+    plan::{lower_query, plan, scan_projections},
     syntax,
 };
 
 // Development v1: Flow owns Station fusion and keeps the head Operation ID.
 // Update v1 golden fixtures in place; old development state is discarded, not migrated.
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1";
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1/projection-pruning";
 const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const OUTPUT_CAPACITY: NonZeroU64 =
     NonZeroU64::new(OUTPUT_CAPACITY_BYTES).expect("64 MiB is nonzero");
@@ -116,8 +116,20 @@ impl SqlProgram {
             .enumerate()
             .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle, &mut factory))
             .collect::<Result<Vec<_>, _>>()?;
-        let logical_plan = plan(self.query.clone(), &scans)?;
-        let output = lower_query(&logical_plan, scans, &mut factory)?;
+        let planning_scans = scans.iter().map(BuiltScan::definition).collect::<Vec<_>>();
+        let logical_plan = plan(self.query.clone(), &planning_scans)?;
+        drop(planning_scans);
+        let projections = scan_projections(&logical_plan, scans.len())?;
+        let scans = scans
+            .into_iter()
+            .zip(&projections)
+            .map(|(scan, projection)| {
+                scan.into_definition(projection.as_deref().ok_or_else(|| {
+                    SqlError::invalid("every declared scan must be reachable from the query result")
+                })?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = lower_query(&logical_plan, scans, projections, &mut factory)?;
         let sink = endpoints.sink.build(&identity, path, &mut factory)?;
         factory.operation(SINK_OPERATION_ID, sink, [output]);
         factory.build().map_err(Into::into)
@@ -259,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "494fa9fd8fed1f9d806f55fcf40e609697e2d2d3e4650398ce72077332328103"
+            "d8ad0f567ec2235c0fb85e37b1dbdfeeab8f77ebbefe7283aed753e6ea525a58"
         );
     }
 

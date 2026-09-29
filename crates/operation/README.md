@@ -234,8 +234,11 @@ turn(input) ──> PreparedTurn ──> prepared.apply(access) ──> commit �
 Operation 可以返回 `Complete`。
 Join 用 `Commit` 保存分页进度，最后一页才返回 `Complete`。
 
-`AfterCommit` 只在事务真正提交后执行。CDC 的外部 delivery ACK、关系 Sink 的目标数据库写入都在
-这个阶段。rollback、背压或 commit 失败只会丢弃它。AfterCommit 失败时，本地状态已经提交，当前
+`AfterCommit` 只在事务真正提交后执行，并明确区分两类动作：`local` 只发布可由 Store 状态恢复的
+进程内 phase，可以与其他 Station 共享稍后的持久化 barrier；`durable` 会 ACK delivery 或写目标数据库，
+必须等此前 Store WAL 已经持久化后才能运行。Join 完成时释放 prepared cache、CDC 和 buffered Sink 的
+内部 phase 切换属于 `local`；CDC 外部 delivery ACK、Sink initialize/deliver 属于 `durable`。
+rollback、背压或 commit 失败只会丢弃 completion。任一 completion 失败时，本地事务已经提交，当前
 Station 会停止，必须 reopen 后从持久状态恢复。
 
 可运行的最小协议例子在
@@ -369,7 +372,11 @@ planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库�
 ## 外部端点边界
 
 CDC 先将初始快照放入私有 spool，封口后逐条发布，再进入持续捕获。PostgreSQL spool 还需要容纳
-封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。两者共享一个私有 runtime，统一实现 spool、checkpoint、提交后 ACK 和恢复推进；具体源只负责连接、记录转换、checkpoint 校验与源资源清理。阶段、事务、容量、重置和部署前提见
+封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。Definition 持久保存完整 source 列声明和有序 output
+projection；converter 用前者校验完整 envelope/row image，只为后者构造 array，空投影也保留行数与 diff。
+两者共享一个私有 runtime，并从 projected output Schema 构造唯一 codec；spool 的 schema-bound entry
+既不重复保存完整 Schema，也不保存 projection 之外的 source 列。runtime 统一实现 spool、checkpoint、
+提交后 ACK 和恢复推进；具体源只负责连接、记录转换、checkpoint 校验与源资源清理。阶段、事务、容量、重置和部署前提见
 [CDC Scan 契约](docs/cdc.md)。新增源行为时不需要复制整套事务状态机；具体数据库协议仍分别维护。
 
 `PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
@@ -389,7 +396,7 @@ Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 s
 Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
 `dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
 
-关系 Sink 先把完整输入提交到本地 buffer，再将固定 ID 的 mutation plan 持久化为 Prepared；目标提交后，
+关系 Sink 用固定 input Schema 构造唯一 codec，把输入编码成不重复完整 Schema 的 schema-bound entry 后提交到本地 buffer，再将固定 ID 的 mutation plan 持久化为 Prepared；目标提交后，
 下一 Store turn 才结算本地进度。SQLite、PostgreSQL、Doris 和 `ClickHouse` 共用这套私有内核，具体目标
 只实现布局、查询与幂等写入。容量口径、恢复校验、行身份和各目标限制见 [关系 Sink 契约](docs/sinks.md)。
 
@@ -402,10 +409,11 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 ```
 
 tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
-`GroupState`、`JoinContinuation`、`AsOfContinuation` 与 buffered Sink control codec、buffer 内完整
-Change IPC、collection 的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成
+`GroupState`、`JoinContinuation`、`AsOfContinuation`、buffered Sink control codec，以及 CDC spool 与
+buffered Sink 内 schema-bound Change entry 的 format marker、Schema fingerprint、single-batch framing 和
+EOS、collection 的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成
 当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation
-codec 还是目标布局/恢复 ABI。decoder 表在
+codec 还是目标布局/恢复 ABI。旧状态直接重建，不提供 self-contained IPC fallback、旧格式识别或迁移。decoder 表在
 [`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
 
 大部分 Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/)；三个外部端点的
@@ -449,8 +457,8 @@ Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
 historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
 workload 的 Flow、Store 或 Change + Store target 负责。
 
-`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的逐条清理，另有单条宽 IPC 的 reset 对照用于观察丢弃路径。
-计时包含恢复、每条 spool entry 的小事务提交和 AfterCommit，校验输出顺序、完整 Change 与最终持久状态；不启动 Java 或外部数据库，不能用于推断捕获、网络 ACK 或端到端 CDC 吞吐。
+`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的有界批量清理；常规 reset 固定为 257 条窄 entry，跨过 256 条事务边界，另有单条宽 schema-bound entry 的 reset 对照用于观察 payload 宽度是否影响无需复制的丢弃路径。
+计时包含只读恢复 turn、发布时每条 entry 或 reset 时每批的同步事务提交和 AfterCommit，校验输出顺序、完整 Change 与最终持久状态；不启动 Java 或外部数据库，不能用于推断捕获、网络 ACK 或端到端 CDC 吞吐。
 
 `asof_join` Criterion 把两个使关系回到原状的完整 Claim 作为计时单位，覆盖多小 partition、
 单大 partition、尾部小修正、历史全量修正、nearest+tolerance 和 residual 远候选回退。

@@ -187,25 +187,24 @@ impl<T: StoreValue> QueueAccess<'_, T> {
         let value = self
             .data
             .poison_on_error(T::decode_value(Cow::Owned(encoded)).map_err(StoreError::from))?;
-        let empty_after = self.remove_front(metadata, &key, item_bytes)?;
-        Ok(Some((value, empty_after)))
-    }
-
-    fn remove_front(
-        &mut self,
-        metadata: Metadata,
-        key: &[u8],
-        item_bytes: u64,
-    ) -> Result<bool, StoreError> {
         let Some(queued_bytes) = metadata.queued_bytes.checked_sub(item_bytes) else {
             return self.fail(StoreError::CorruptQueue {
                 reason: "queued-byte metadata is smaller than the front entry",
             });
         };
-        self.data.erase(key)?;
+        self.data.erase(&key)?;
+        let empty_after =
+            self.finish_front_removal(metadata.head + 1, metadata.tail, queued_bytes)?;
+        Ok(Some((value, empty_after)))
+    }
 
-        let head = metadata.head + 1;
-        let empty_after = head == metadata.tail;
+    fn finish_front_removal(
+        &mut self,
+        head: u64,
+        tail: u64,
+        queued_bytes: u64,
+    ) -> Result<bool, StoreError> {
+        let empty_after = head == tail;
         if empty_after {
             if queued_bytes != 0 {
                 return self.fail(StoreError::CorruptQueue {
@@ -226,7 +225,7 @@ impl<T: StoreValue> QueueAccess<'_, T> {
             }
             self.write_metadata(Metadata {
                 head,
-                tail: metadata.tail,
+                tail,
                 queued_bytes,
             })?;
         }
@@ -252,34 +251,54 @@ impl<T: StoreValue> QueueAccess<'_, T> {
 }
 
 impl QueueAccess<'_, Vec<u8>> {
-    /// Removes the front byte value without copying or decoding its payload.
+    /// Removes up to `max_entries` byte values from the front without copying
+    /// or decoding their payloads.
     ///
-    /// Returns `None` if the queue was empty, or `Some(empty_after)` when an
-    /// entry was removed. Logical byte accounting and transaction rollback
-    /// match [`Self::pop_front`].
+    /// Returns whether the queue is empty afterward. A zero bound leaves a
+    /// non-empty queue unchanged. Every removed entry contributes one
+    /// tombstone, while queue metadata is updated once after the whole batch.
+    /// Logical byte accounting and transaction rollback match
+    /// [`Self::pop_front`].
     ///
     /// # Errors
     ///
     /// Returns an error when storage fails, byte accounting underflows, or
     /// persisted queue state is corrupt. Any such error poisons the transaction.
-    pub fn discard_front(&mut self) -> Result<Option<bool>, StoreError> {
+    pub fn discard_front(&mut self, max_entries: usize) -> Result<bool, StoreError> {
         let metadata = self.read_metadata()?;
         if metadata.is_empty() {
-            return Ok(None);
+            return Ok(true);
         }
 
-        let key = encode_sequence(metadata.head);
-        let Some(length) = self.data.as_read().value_len(&key)? else {
-            return self.fail(StoreError::CorruptQueue {
-                reason: "the front entry is missing",
-            });
-        };
-        let item_bytes = match encoded_item_bytes(length) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error),
-        };
-        let empty_after = self.remove_front(metadata, &key, item_bytes)?;
-        Ok(Some(empty_after))
+        let mut head = metadata.head;
+        let mut queued_bytes = metadata.queued_bytes;
+        for _ in 0..max_entries {
+            if head == metadata.tail {
+                break;
+            }
+            let key = encode_sequence(head);
+            let Some(length) = self.data.as_read().value_len(&key)? else {
+                return self.fail(StoreError::CorruptQueue {
+                    reason: "a queued entry is missing",
+                });
+            };
+            let item_bytes = match encoded_item_bytes(length) {
+                Ok(bytes) => bytes,
+                Err(error) => return self.fail(error),
+            };
+            let Some(remaining_bytes) = queued_bytes.checked_sub(item_bytes) else {
+                return self.fail(StoreError::CorruptQueue {
+                    reason: "queued-byte metadata is smaller than its entries",
+                });
+            };
+            self.data.erase(&key)?;
+            queued_bytes = remaining_bytes;
+            head += 1;
+        }
+        if head == metadata.head {
+            return Ok(false);
+        }
+        self.finish_front_removal(head, metadata.tail, queued_bytes)
     }
 }
 
@@ -416,7 +435,7 @@ mod tests {
         let transaction = transactions.begin();
         safe.access(transaction.access()).unwrap().set(&1).unwrap();
         assert!(matches!(
-            queue.access(transaction.access()).unwrap().discard_front(),
+            queue.access(transaction.access()).unwrap().discard_front(2),
             Err(StoreError::CorruptQueue { .. })
         ));
         assert!(matches!(
@@ -474,7 +493,7 @@ mod tests {
 
         let transaction = transactions.begin();
         assert!(matches!(
-            queue.access(transaction.access()).unwrap().discard_front(),
+            queue.access(transaction.access()).unwrap().discard_front(1),
             Err(StoreError::CorruptQueue { .. })
         ));
         assert!(matches!(
@@ -546,7 +565,7 @@ mod tests {
         let transaction = transactions.begin();
         safe.access(transaction.access()).unwrap().set(&3).unwrap();
         assert!(matches!(
-            queue.access(transaction.access()).unwrap().discard_front(),
+            queue.access(transaction.access()).unwrap().discard_front(1),
             Err(StoreError::CorruptQueue { .. })
         ));
         assert!(matches!(

@@ -12,12 +12,12 @@ use std::{
 use arrow_array::UInt64Array;
 use criterion::{BenchmarkId, Criterion, Throughput};
 use dogpaddle_change::Change;
-use dogpaddle_change_store_integration::{EncodedChanges, heterogeneous_changes_fixture};
+use dogpaddle_change_store_integration::{EncodedChanges, fixed_schema_changes_fixture};
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{Store, SubscribedLog};
 use serde_json::json;
 
-use support::{SampleStore, decode_entry};
+use support::SampleStore;
 
 const BENCHMARK: &str = "change_subscribed_log";
 
@@ -143,7 +143,7 @@ fn measure_iterations(
 }
 
 fn representative_workload(config: &Config) -> EncodedChanges {
-    let workload = heterogeneous_changes_fixture(
+    let workload = fixed_schema_changes_fixture(
         config.total_changes(),
         config.rows_per_change,
         config.payload_bytes,
@@ -215,7 +215,10 @@ fn measure_consume(run: &RunRoot, config: &Config) -> ScenarioMeasurement {
             subscription.peek(snapshot.access()).unwrap().unwrap()
         };
         assert_eq!(offset, expected_offset);
-        let change = decode_entry(&encoded);
+        let change = workload
+            .codec
+            .decode_owned(encoded)
+            .expect("decode fixture Change");
         checksum = mix(checksum, change_checksum(&change));
         black_box(&change);
 
@@ -330,7 +333,8 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
         "result_directory": root.path().display().to_string(),
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
         "configuration": {
-            "fixture": "heterogeneous_changes",
+            "fixture": "fixed_schema_variable_width_changes",
+            "entry_format": "schema_bound_change_v1",
             "rows_per_change": config.rows_per_change,
             "changes_per_transaction": config.changes_per_transaction,
             "transactions_per_iteration": config.transactions_per_iteration,
@@ -349,7 +353,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
             "scenarios": ["append_durable", "consume_durable"],
             "timing_scope": {
                 "append_durable": "transaction begin, SubscribedLog append, and durable commit",
-                "consume_durable": "per entry read snapshot, subscription peek, full Change decode, exact-offset acknowledge, and durable commit"
+                "consume_durable": "per entry read snapshot, subscription peek, owned schema-bound Change decode, exact-offset acknowledge, and durable commit"
             },
             "fixture_and_validation": "outside_timing",
             "execution": "single_thread"

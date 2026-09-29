@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{Store, SubscribedLog};
+use dogpaddle_store::{Store, SubscribedLog, TransactionAccess};
 
 use crate::support::{create_byte_map, open_byte_map, store_path};
 
@@ -76,7 +76,7 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
 }
 
 #[test]
-fn process_sigkill_before_and_after_commit_preserves_the_atomic_boundary() {
+fn process_sigkill_preserves_normal_and_batched_durability_boundaries() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     prepare(&path);
@@ -88,6 +88,13 @@ fn process_sigkill_before_and_after_commit_preserves_the_atomic_boundary() {
     let after = run_worker(&path, "after-commit");
     assert_eq!(after.signal(), Some(9));
     assert_values(&path, Some(b"committed"));
+
+    let batch_root = tempfile::tempdir().unwrap();
+    let batch_path = store_path(&batch_root);
+    prepare(&batch_path);
+    let batched = run_worker(&batch_path, "batch-after-finish");
+    assert_eq!(batched.signal(), Some(9));
+    assert_values(&batch_path, Some(b"batched"));
 }
 
 #[test]
@@ -105,30 +112,44 @@ fn crash_worker() {
         .unwrap()
         .writer();
     let mut transactions = store.into_transactions();
-    let transaction = transactions.begin();
-    first
-        .access(transaction.access())
-        .unwrap()
-        .put(&b"key".to_vec(), &b"committed".to_vec())
-        .unwrap();
-    second
-        .access(transaction.access())
-        .unwrap()
-        .put(&b"key".to_vec(), &b"committed".to_vec())
-        .unwrap();
-    assert!(
-        log.try_append(
-            &b"committed".to_vec(),
-            NonZeroU64::new(1_024).unwrap(),
-            transaction.access(),
-        )
-        .unwrap()
-    );
+    let value = if scenario == "batch-after-finish" {
+        b"batched".to_vec()
+    } else {
+        b"committed".to_vec()
+    };
+    let stage = |access: TransactionAccess<'_>| {
+        first
+            .access(access)
+            .unwrap()
+            .put(&b"key".to_vec(), &value)
+            .unwrap();
+        second
+            .access(access)
+            .unwrap()
+            .put(&b"key".to_vec(), &value)
+            .unwrap();
+        assert!(
+            log.try_append(&value, NonZeroU64::new(1_024).unwrap(), access)
+                .unwrap()
+        );
+    };
 
     match scenario.as_str() {
-        "before-commit" => kill_self(),
-        "after-commit" => {
+        "before-commit" | "after-commit" => {
+            let transaction = transactions.begin();
+            stage(transaction.access());
+            if scenario == "before-commit" {
+                kill_self();
+            }
             transaction.commit().unwrap();
+            kill_self();
+        }
+        "batch-after-finish" => {
+            let mut batch = transactions.durability_batch();
+            let transaction = batch.begin();
+            stage(transaction.access());
+            transaction.commit().unwrap();
+            batch.finish().unwrap();
             kill_self();
         }
         _ => panic!("unknown crash scenario: {scenario}"),

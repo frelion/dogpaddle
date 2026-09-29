@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use dogpaddle_change::Change;
 use dogpaddle_operation::operation::{Action, OperationInput, Turn};
-use dogpaddle_store::{ReadTransactionAccess, ReadTransactions, TransactionAccess, Transactions};
+use dogpaddle_store::{
+    DurabilityBatch, ReadTransactionAccess, ReadTransactions, TransactionAccess,
+};
 
 use crate::flow::{AdvanceOutcome, StationStatus};
 
@@ -36,7 +38,7 @@ impl Station {
     pub(crate) fn advance(
         &mut self,
         reads: &ReadTransactions,
-        transactions: &mut Transactions,
+        transactions: &mut DurabilityBatch<'_>,
     ) -> Result<AdvanceOutcome, StationError> {
         let pinned = match self.inbox.intake(reads, transactions) {
             Ok(pinned) => pinned,
@@ -47,7 +49,7 @@ impl Station {
                 return Err(error);
             }
         };
-        let outcome = self.process(transactions)?;
+        let outcome = self.process_in_batch(transactions)?;
         self.last_outcome = Some(outcome);
         if pinned {
             Ok(AdvanceOutcome::Progressed)
@@ -56,9 +58,9 @@ impl Station {
         }
     }
 
-    pub(super) fn process(
+    fn process_in_batch(
         &mut self,
-        transactions: &mut Transactions,
+        transactions: &mut DurabilityBatch<'_>,
     ) -> Result<AdvanceOutcome, StationError> {
         self.ensure_runnable()?;
 
@@ -120,6 +122,13 @@ impl Station {
             (completes_input, after_commit)
         };
 
+        if after_commit.requires_durability()
+            && let Err(source) = transactions.sync()
+        {
+            self.needs_reopen = true;
+            return Err(StationError::DurabilityBarrier { source });
+        }
+
         // Arm before calling user code: unwinding must also prevent reuse.
         self.needs_reopen = true;
         let after_commit_result = after_commit.run();
@@ -144,6 +153,10 @@ impl Station {
 
     pub(crate) fn clear_outcome(&mut self) {
         self.last_outcome = None;
+    }
+
+    pub(crate) fn mark_needs_reopen(&mut self) {
+        self.needs_reopen = true;
     }
 
     pub(crate) fn status(

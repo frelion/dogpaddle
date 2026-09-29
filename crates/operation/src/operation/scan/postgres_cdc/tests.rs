@@ -1,13 +1,16 @@
+use std::sync::Arc;
+
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
+use arrow_schema::Schema;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
 use super::{
-    PostgresCdcScanError, PostgresColumn, PostgresType,
+    PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType,
     convert::{CaptureProgress, convert_capture_values, convert_values},
     schema,
 };
@@ -15,6 +18,25 @@ use crate::operation::scan::cdc_runtime::Captured;
 
 fn column(data_type: PostgresType) -> PostgresColumn {
     PostgresColumn::new("value", data_type, true)
+}
+
+fn spec(columns: &[PostgresColumn]) -> PostgresCdcScanSpec {
+    PostgresCdcScanSpec {
+        engine_name: "source".to_owned(),
+        database: "shop".to_owned(),
+        schema: "public".to_owned(),
+        table: "events".to_owned(),
+        slot: "events_slot".to_owned(),
+        publication: "events_pub".to_owned(),
+        system_identifier: "123".to_owned(),
+        database_oid: 42,
+        table_oid: 43,
+        columns: columns.to_vec(),
+    }
+}
+
+fn identity_projection(columns: &[PostgresColumn]) -> Vec<u32> {
+    (0..u32::try_from(columns.len()).unwrap()).collect()
 }
 
 fn envelope(columns: &[PostgresColumn], op: &str, before: Value, after: Value) -> Value {
@@ -51,20 +73,43 @@ fn convert(
     columns: &[PostgresColumn],
     events: &[Value],
 ) -> Result<Option<Change>, PostgresCdcScanError> {
+    let projection = identity_projection(columns);
+    convert_projected(columns, &projection, events)
+}
+
+fn convert_projected(
+    columns: &[PostgresColumn],
+    projection: &[u32],
+    events: &[Value],
+) -> Result<Option<Change>, PostgresCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
         .collect::<Vec<_>>();
+    let output_schema = projected_schema(columns, projection)?;
     convert_values(
-        columns,
-        schema::compile(columns)?,
-        "source",
-        "public",
-        "events",
+        &spec(columns),
+        projection,
+        output_schema,
         bytes
             .iter()
             .map(|bytes| (Some("source.public.events"), Some(bytes.as_slice()))),
     )
+}
+
+fn projected_schema(
+    columns: &[PostgresColumn],
+    projection: &[u32],
+) -> Result<Arc<Schema>, PostgresCdcScanError> {
+    let full_schema = schema::compile(columns)?;
+    let fields = projection
+        .iter()
+        .map(|index| full_schema.fields()[usize::try_from(*index).unwrap()].clone())
+        .collect::<Vec<_>>();
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        full_schema.metadata().clone(),
+    )))
 }
 
 fn heartbeat() -> Value {
@@ -89,16 +134,24 @@ fn capture(
     events: &[(&str, Value)],
     progress: CaptureProgress,
 ) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
+    let projection = identity_projection(columns);
+    capture_projected(columns, &projection, events, progress)
+}
+
+fn capture_projected(
+    columns: &[PostgresColumn],
+    projection: &[u32],
+    events: &[(&str, Value)],
+    progress: CaptureProgress,
+) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     let bytes = events
         .iter()
         .map(|(_, event)| serde_json::to_vec(event).unwrap())
         .collect::<Vec<_>>();
     convert_capture_values(
-        columns,
-        schema::compile(columns)?,
-        "source",
-        "public",
-        "events",
+        &spec(columns),
+        projection,
+        projected_schema(columns, projection)?,
         events
             .iter()
             .zip(&bytes)
@@ -150,6 +203,82 @@ fn postgres_cdc_conversion_preserves_insert_update_delete_event_order() {
         .flat_map(|change| change.diffs().values().iter().copied())
         .collect::<Vec<_>>();
     assert_eq!(diffs, change.diffs().values().as_ref());
+}
+
+#[test]
+fn postgres_cdc_projection_validates_full_rows_and_preserves_zero_column_row_count() {
+    let columns = [
+        PostgresColumn::new("id", PostgresType::Int64, false),
+        PostgresColumn::new("payload", PostgresType::Text, false),
+        PostgresColumn::new("unused", PostgresType::Bytea, false),
+    ];
+    let event = envelope(
+        &columns,
+        "c",
+        Value::Null,
+        json!({"id":7,"payload":"kept","unused":BASE64_STANDARD.encode([1, 2, 3].repeat(2048))}),
+    );
+
+    let projected = convert_projected(&columns, &[1], std::slice::from_ref(&event))
+        .unwrap()
+        .unwrap();
+    assert_eq!(projected.records().num_columns(), 1);
+    assert_eq!(projected.records().schema().field(0).name(), "payload");
+    assert_eq!(
+        projected
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "kept"
+    );
+
+    let empty = convert_projected(&columns, &[], std::slice::from_ref(&event))
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.records().num_columns(), 0);
+    assert_eq!(empty.records().num_rows(), 1);
+    assert_eq!(empty.diffs().values(), &[1]);
+
+    let malformed_base64 = format!("{}!", event["payload"]["after"]["unused"].as_str().unwrap());
+    let mut malformed = event.clone();
+    malformed["payload"]["after"]["unused"] = json!(malformed_base64);
+    assert!(convert_projected(&columns, &[], &[malformed]).is_err());
+
+    let mut incomplete = event;
+    incomplete["payload"]["after"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unused");
+    assert!(convert_projected(&columns, &[], &[incomplete]).is_err());
+}
+
+#[test]
+fn postgres_cdc_projection_rejects_bad_unselected_values_in_streaming_and_capture() {
+    let columns = [
+        PostgresColumn::new("id", PostgresType::Int64, false),
+        PostgresColumn::new("unused", PostgresType::Int32, false),
+    ];
+    let projections: [&[u32]; 2] = [&[0], &[]];
+
+    for projection in projections {
+        let row = json!({"id":7,"unused":"bad"});
+        let streaming = envelope(&columns, "c", Value::Null, row.clone());
+        assert!(convert_projected(&columns, projection, &[streaming]).is_err());
+
+        let capture_event = snapshot(&columns, "last", row);
+        assert!(
+            capture_projected(
+                &columns,
+                projection,
+                &[("source.public.events", capture_event)],
+                CaptureProgress::default(),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -682,11 +811,9 @@ fn postgres_cdc_conversion_accepts_only_identified_control_records() {
     let heartbeat = serde_json::to_vec(&json!({"schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},"payload":{"ts_ms":123}})).unwrap();
     let convert_control = |topic, value| {
         convert_values(
-            &columns,
+            &spec(&columns),
+            &identity_projection(&columns),
             schema::compile(&columns).unwrap(),
-            "source",
-            "public",
-            "events",
             [(topic, value)],
         )
     };

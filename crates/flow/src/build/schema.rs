@@ -1,4 +1,5 @@
 use arrow_schema::SchemaRef;
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_operation::{OperationBindError, OperationSetupError, RuntimeResource};
 use dogpaddle_store::{Cell, DataScope, StoreError, SubscribedLog};
 use thiserror::Error;
@@ -115,12 +116,21 @@ pub(super) fn construct_stations(
         }
 
         let output = match (station.output_capacity_bytes(), current_schema.as_ref()) {
-            (Some(capacity), Some(schema)) => Some((
-                data.data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(station_index))
-                    .map_err(map_store_error)?,
-                capacity,
-                schema.clone(),
-            )),
+            (Some(capacity), Some(schema)) => {
+                let change_codec =
+                    SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
+                        FlowError::OutputCodec {
+                            station_id: station.id().to_owned(),
+                            source,
+                        }
+                    })?;
+                Some((
+                    data.data::<SubscribedLog<Vec<u8>>>(&codec::station_output_name(station_index))
+                        .map_err(map_store_error)?,
+                    capacity,
+                    change_codec,
+                ))
+            }
             (None, None) => None,
             (Some(_), None) | (None, Some(_)) => {
                 unreachable!("validated output capacity and constructed Schema must agree")

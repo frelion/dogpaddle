@@ -1,4 +1,3 @@
-use arrow_schema::SchemaRef;
 use dogpaddle_change::CodecError as ChangeCodecError;
 use dogpaddle_operation::operation::{OperationError, PostCommitError};
 use dogpaddle_store::StoreError;
@@ -19,6 +18,11 @@ pub(crate) enum StationError {
         #[source]
         source: StoreError,
     },
+    #[error("Store durability barrier failed; affected stations must be reopened: {source}")]
+    DurabilityBarrier {
+        #[source]
+        source: StoreError,
+    },
     #[error("operation failed after its Store transaction committed: {source}")]
     AfterCommit {
         #[source]
@@ -31,14 +35,6 @@ pub(crate) enum StationError {
         input: usize,
         #[source]
         source: ChangeCodecError,
-    },
-    #[error(
-        "station input {input} Schema does not match its binding: expected {expected:?}, actual {actual:?}"
-    )]
-    InputSchemaMismatch {
-        input: usize,
-        expected: SchemaRef,
-        actual: SchemaRef,
     },
     #[error("station has inputs but no durable active input")]
     MissingActiveInput,
@@ -53,20 +49,16 @@ pub(crate) enum StationError {
         #[source]
         source: ChangeCodecError,
     },
-    #[error(
-        "operation output Schema does not match its binding: expected {expected:?}, actual {actual:?}"
-    )]
-    OutputSchemaMismatch {
-        expected: SchemaRef,
-        actual: SchemaRef,
-    },
 }
 
 impl StationError {
     pub(crate) const fn requires_reopen(&self) -> bool {
         matches!(
             self,
-            Self::Commit { .. } | Self::AfterCommit { .. } | Self::NeedsReopen
+            Self::Commit { .. }
+                | Self::DurabilityBarrier { .. }
+                | Self::AfterCommit { .. }
+                | Self::NeedsReopen
         )
     }
 }

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use dogpaddle_change::CodecError as ChangeCodecError;
 use dogpaddle_operation::OperationSetupError;
 use dogpaddle_store::{StoreError, StoreError::DataNotFound};
 
@@ -51,6 +52,15 @@ pub enum FlowError {
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A Station output Schema could not bind its persistent Change codec.
+    #[error("station {station_id:?} output Change codec is invalid: {source}")]
+    OutputCodec {
+        /// Stable ID of the Station that owns the output.
+        station_id: String,
+        /// Schema validation or canonical codec construction failure.
+        #[source]
+        source: ChangeCodecError,
+    },
     /// A bound Operation could not be constructed during setup.
     #[error("station {station_id:?} operation {operation} setup failed: {source}")]
     OperationSetup {
@@ -139,10 +149,10 @@ impl FlowRunError {
     /// Returns whether this runtime must be reopened before scheduling can
     /// continue.
     ///
-    /// This is true after a Store commit reports failure, after a post-commit
-    /// callback fails, and for later calls rejected by the runtime's fail-stop
-    /// guard. Stations earlier in the originating scheduling round may already
-    /// have committed.
+    /// This is true after a Store commit or durability barrier reports failure,
+    /// after a post-commit callback fails, and for later calls rejected by the
+    /// runtime's fail-stop guard. A barrier failure also marks every Station
+    /// with a commit pending in that barrier for reopen.
     #[must_use]
     pub fn requires_reopen(&self) -> bool {
         self.source.requires_reopen()

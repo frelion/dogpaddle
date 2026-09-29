@@ -98,7 +98,8 @@ fn failed_source_cleanup_and_rolled_back_reset_preserve_the_captured_snapshot() 
         checkpoint.clone(),
         spool.clone(),
         capacity,
-    );
+    )
+    .unwrap();
     let transaction = transactions.begin();
     let access = transaction.access();
     phase.access(access).unwrap().set(&1).unwrap();
@@ -148,9 +149,58 @@ fn failed_source_cleanup_and_rolled_back_reset_preserve_the_captured_snapshot() 
     commit(&mut runtime, &mut transactions);
     let transaction = transactions.begin();
     let access = transaction.access();
-    assert_eq!(phase.access(access).unwrap().get().unwrap(), Some(4));
+    assert_eq!(phase.access(access).unwrap().get().unwrap(), None);
+    assert_eq!(checkpoint.access(access).unwrap().get().unwrap(), None);
+    assert!(spool.access(access).unwrap().is_empty().unwrap());
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn reset_discards_257_entries_across_two_bounded_transactions() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(root.path().join("store")).unwrap();
+    let phase = store.create_data::<Cell<u32>>("phase").unwrap();
+    let checkpoint = store.create_data::<Cell<Vec<u8>>>("checkpoint").unwrap();
+    let spool = store.create_data::<Queue<Vec<u8>>>("spool").unwrap();
+    let mut transactions = store.into_transactions();
+    let entries = RESET_BATCH_ENTRIES + 1;
+    let capacity = NonZeroU64::new(u64::try_from(entries * 9).unwrap()).unwrap();
+
+    let transaction = transactions.begin();
+    let access = transaction.access();
+    phase.access(access).unwrap().set(&RESETTING).unwrap();
+    checkpoint.access(access).unwrap().set(&vec![9]).unwrap();
+    let mut queue = spool.access(access).unwrap();
+    for _ in 0..entries {
+        assert!(queue.try_push(&vec![1], capacity).unwrap());
+    }
+    transaction.commit().unwrap();
+
+    let mut runtime = CdcRuntime::new(
+        SnapshotOwner::default(),
+        Arc::new(arrow_schema::Schema::empty()),
+        phase.clone(),
+        checkpoint.clone(),
+        spool.clone(),
+        capacity,
+    )
+    .unwrap();
+    runtime.next_step = NextStep::Reset;
+
+    commit(&mut runtime, &mut transactions);
+    let transaction = transactions.begin();
+    let access = transaction.access();
+    assert_eq!(
+        phase.access(access).unwrap().get().unwrap(),
+        Some(RESETTING)
+    );
+    assert_eq!(
+        checkpoint.access(access).unwrap().get().unwrap(),
+        Some(vec![9])
+    );
     assert_eq!(spool.access(access).unwrap().queued_bytes().unwrap(), 9);
     transaction.commit().unwrap();
+
     commit(&mut runtime, &mut transactions);
     let transaction = transactions.begin();
     let access = transaction.access();

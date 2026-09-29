@@ -10,7 +10,7 @@ use dogpaddle_operation::operation::{
     Action, AfterCommit, OperationError, OperationInput, PostCommitError, Turn, TurnOperation,
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{Cell, Store, SubscribedLog};
+use dogpaddle_store::{Cell, Store, StoreError, SubscribedLog};
 
 use crate::{build::FlowFactory, error::FlowRunError, station::StationError};
 
@@ -28,7 +28,7 @@ impl TurnOperation for FailingAfterCommit {
         Ok(Turn::ready(move |_access| {
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     runs.fetch_add(1, Ordering::Relaxed);
                     Err(PostCommitError::new(std::io::Error::other(
                         "planned after-commit failure",
@@ -43,6 +43,31 @@ impl TurnOperation for FailingAfterCommit {
 fn precommit_flow_errors_do_not_require_reopen() {
     let error = FlowRunError::new("scan", StationError::UnexpectedOutput);
     assert!(!error.requires_reopen());
+}
+
+#[test]
+fn durability_failure_marks_every_station_pending_in_the_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    let mut builder = FlowFactory::new(root.path().join("flow"));
+    let first = builder.operation("first", Box::new(SequenceScanDefinition::new(0)), []);
+    let second = builder.operation("second", Box::new(SequenceScanDefinition::new(0)), []);
+    let third = builder.operation("third", Box::new(SequenceScanDefinition::new(0)), []);
+    builder.operation("first-sink", Box::new(DiscardDefinition::new()), [first]);
+    builder.operation("second-sink", Box::new(DiscardDefinition::new()), [second]);
+    builder.operation("third-sink", Box::new(DiscardDefinition::new()), [third]);
+    for station in [first, second, third] {
+        builder.materialize(station, NonZeroU64::MAX);
+    }
+    let mut flow = builder.build().unwrap();
+
+    let error = flow.durability_failure(Some(1), 3, StoreError::WrongStore);
+
+    assert_eq!(error.station_id(), "second");
+    assert!(error.requires_reopen());
+    let statuses = flow.status().unwrap();
+    assert!(!statuses[0].needs_reopen);
+    assert!(statuses[1].needs_reopen);
+    assert!(statuses[2].needs_reopen);
 }
 
 #[test]

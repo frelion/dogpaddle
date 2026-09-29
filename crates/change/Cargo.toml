@@ -17,6 +17,7 @@ arrow-buffer.workspace = true
 arrow-data.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+blake3.workspace = true
 flatbuffers.workspace = true
 thiserror.workspace = true
 

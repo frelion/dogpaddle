@@ -445,6 +445,54 @@ pub(crate) enum ResolvedScanEndpoint {
     MySqlCdc(Box<ResolvedMySqlCdc>),
 }
 
+pub(crate) enum BuiltScan {
+    Sequence(SequenceScanDefinition),
+    PostgresCdc(PostgresCdcScanDefinition),
+    MySqlCdc(MySqlCdcScanDefinition),
+}
+
+impl BuiltScan {
+    pub(crate) fn definition(&self) -> &dyn OperationDefinition {
+        match self {
+            Self::Sequence(definition) => definition,
+            Self::PostgresCdc(definition) => definition,
+            Self::MySqlCdc(definition) => definition,
+        }
+    }
+
+    pub(crate) fn into_definition(
+        self,
+        projection: &[usize],
+    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
+        let projection = projection
+            .iter()
+            .map(|index| {
+                u32::try_from(*index)
+                    .map_err(|_| SqlError::invalid("scan projection index exceeds u32"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match self {
+            Self::Sequence(definition) => Ok(Box::new(definition)),
+            Self::PostgresCdc(definition) => Ok(Box::new(
+                PostgresCdcScanDefinition::try_new_projected(
+                    definition.spec().clone(),
+                    projection,
+                    definition.bootstrap_spool_bytes(),
+                )
+                .map_err(SqlError::endpoint)?,
+            )),
+            Self::MySqlCdc(definition) => Ok(Box::new(
+                MySqlCdcScanDefinition::try_new_projected(
+                    definition.spec().clone(),
+                    projection,
+                    definition.bootstrap_spool_bytes(),
+                )
+                .map_err(SqlError::endpoint)?,
+            )),
+        }
+    }
+}
+
 pub(crate) struct ResolvedPostgresCdc {
     connection: DatabaseConnection,
     schema: String,
@@ -541,9 +589,11 @@ impl ResolvedScanEndpoint {
         state_path: &Path,
         runtime_bundle: Option<&Path>,
         factory: &mut FlowFactory,
-    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
+    ) -> Result<BuiltScan, SqlError> {
         match self {
-            Self::Sequence { start } => Ok(Box::new(SequenceScanDefinition::new(*start))),
+            Self::Sequence { start } => {
+                Ok(BuiltScan::Sequence(SequenceScanDefinition::new(*start)))
+            }
             Self::PostgresCdc(endpoint) => {
                 let config = endpoint.connection.postgres_cdc_config(
                     runtime_bundle.expect("CDC programs resolve one runtime"),
@@ -563,7 +613,7 @@ impl ResolvedScanEndpoint {
                     PostgresCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
                 factory.resource(scan_operation_id(index), config)?;
-                Ok(Box::new(definition))
+                Ok(BuiltScan::PostgresCdc(definition))
             }
             Self::MySqlCdc(endpoint) => {
                 let config = endpoint.connection.mysql_config(
@@ -577,7 +627,7 @@ impl ResolvedScanEndpoint {
                     MySqlCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
                 factory.resource(scan_operation_id(index), config)?;
-                Ok(Box::new(definition))
+                Ok(BuiltScan::MySqlCdc(definition))
             }
         }
     }

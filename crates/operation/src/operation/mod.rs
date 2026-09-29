@@ -68,7 +68,9 @@ pub trait AtomicOperation: Send + 'static {
 /// Failure after one prepared Operation turn has committed.
 ///
 /// This phase is deliberately distinct from [`OperationError`]: the local
-/// Store transaction is already durable and cannot be rolled back.
+/// Store transaction is already committed and cannot be rolled back. A local
+/// completion may run before a shared durability barrier; an external
+/// completion runs only after that barrier.
 #[derive(Debug)]
 pub struct PostCommitError {
     source: OperationError,
@@ -113,6 +115,11 @@ impl From<OperationError> for PostCommitError {
 /// rollback, backpressure, or commit failure must not confirm an external
 /// delivery. The callback itself is never run from [`Drop`].
 ///
+/// A local completion only publishes recoverable in-process state and may run
+/// before a shared durability barrier. A durable completion can affect an
+/// external system, so its caller must first make the preceding Store commit
+/// durable. Both kinds run after the transaction becomes atomically visible.
+///
 /// The preceding transaction must persist everything needed to recover if the
 /// process exits before the callback runs or if the callback fails. A callback
 /// is a settlement of durable intent, never the sole owner of replay state.
@@ -120,23 +127,53 @@ impl From<OperationError> for PostCommitError {
 /// Operation again; it must reconstruct it from durable state first.
 #[must_use = "after-commit work must be run after a successful Store commit or deliberately dropped"]
 pub struct AfterCommit<'turn> {
-    effect: Option<Box<dyn FnOnce() -> Result<(), PostCommitError> + 'turn>>,
+    effect: AfterCommitEffect<'turn>,
+}
+
+enum AfterCommitEffect<'turn> {
+    None,
+    Local(Box<dyn FnOnce() -> Result<(), PostCommitError> + 'turn>),
+    Durable(Box<dyn FnOnce() -> Result<(), PostCommitError> + 'turn>),
 }
 
 impl<'turn> AfterCommit<'turn> {
-    /// Creates one consuming post-commit effect without executing it.
-    pub fn new<F>(effect: F) -> Self
+    /// Creates in-process work that is recoverable without an immediate
+    /// durability barrier.
+    pub fn local<F>(effect: F) -> Self
     where
         F: FnOnce() -> Result<(), PostCommitError> + 'turn,
     {
         Self {
-            effect: Some(Box::new(effect)),
+            effect: AfterCommitEffect::Local(Box::new(effect)),
+        }
+    }
+
+    /// Creates an external effect that requires the preceding Store commit to
+    /// be durable before it runs.
+    pub fn durable<F>(effect: F) -> Self
+    where
+        F: FnOnce() -> Result<(), PostCommitError> + 'turn,
+    {
+        Self {
+            effect: AfterCommitEffect::Durable(Box::new(effect)),
         }
     }
 
     /// Creates an empty completion for a wholly transactional turn.
     pub const fn none() -> Self {
-        Self { effect: None }
+        Self {
+            effect: AfterCommitEffect::None,
+        }
+    }
+
+    /// Returns whether this completion can affect an external system and must
+    /// wait for a durability barrier.
+    ///
+    /// Local and empty completions return `false` so several transactions can
+    /// share a later barrier.
+    #[must_use]
+    pub const fn requires_durability(&self) -> bool {
+        matches!(self.effect, AfterCommitEffect::Durable(_))
     }
 
     /// Runs the completion after the enclosing Store transaction has committed.
@@ -146,7 +183,10 @@ impl<'turn> AfterCommit<'turn> {
     /// Returns the concrete post-commit failure. The Store transaction has
     /// already committed when this method is called and cannot be rolled back.
     pub fn run(self) -> Result<(), PostCommitError> {
-        self.effect.map_or(Ok(()), |effect| effect())
+        match self.effect {
+            AfterCommitEffect::None => Ok(()),
+            AfterCommitEffect::Local(effect) | AfterCommitEffect::Durable(effect) => effect(),
+        }
     }
 }
 

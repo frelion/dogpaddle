@@ -158,7 +158,7 @@ doris://user:password@127.0.0.1:9030/database
 
 URL 必须包含用户名和一个数据库路径段，用户名、密码和数据库名支持 percent encoding。数据库 Sink 只接受 numeric IP。`table` 必须恰好包含两个非空部分：`PostgreSQL` 使用 `schema.table`；`MySQL`、`ClickHouse` 和 `Doris` 使用 `database.table`，且 database 必须与 URL 一致。`ClickHouse` 与 `Doris` 当前只支持无 TLS endpoint。
 
-`bootstrap_spool_bytes` 是私有快照队列的非零硬上限，默认 1 GiB。PostgreSQL 的容量要覆盖完整快照和快照封口前的 WAL 重叠；MySQL 的容量要覆盖完整快照，binlog 还必须保留到私有 spool 发布并追平完成。容量不足时当前 delivery 不提交也不 ACK，需要以更大容量和新状态重建。
+`bootstrap_spool_bytes` 是私有快照队列的非零硬上限，默认 1 GiB。SQL 会先把所有同源引用需要的列合成最小并集，CDC spool 只按该 projected output 的 schema-bound entry 计费；source 的完整列声明仍用于校验每个 row image。PostgreSQL 的容量要覆盖 projected 快照和快照封口前的 WAL 重叠；MySQL 的容量要覆盖 projected 快照，binlog 还必须保留到私有 spool 发布并追平完成。容量不足时当前 delivery 不提交也不 ACK，需要以更大容量和新状态重建。
 
 两个 CDC Scan 都接受下面这些可选运行调优参数：
 
@@ -199,7 +199,7 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
 非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
-`SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、名称、nullability 和 metadata。
+`SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、nullability 和 metadata，并用无歧义的内部字段名继续父级 lowering；query 最终的 positional `SchemaAlign` 再恢复 SQL 字段名。
 
 `ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row
 选择至多一个 right row，没有匹配时仍保留 left row，并把 right 字段补为 NULL。`MATCH_CONDITION`
@@ -231,7 +231,7 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 - Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
 - 会在规划时丢失语义的 sampling、hint、row lock、typed alias 等语法。
 
-`DataFusion` 只做 parser、`SqlToRel` 和 `TypeCoercion`。SQL crate 不运行 logical optimizer、physical planner 或 `SessionContext`。Projection 和 Union 分支最终都通过 `SchemaAlign` 精确保留分析后的 Arrow Schema。
+`DataFusion` 只做 parser、`SqlToRel`、`TypeCoercion` 和单条 `OptimizeProjections` 规则；SQL crate 不运行完整 logical optimizer、physical planner 或 `SessionContext`。列裁剪会把下游确实使用的列穿过 Join 和 Aggregate 推回 Scan，避免这些持久算子保存无关宽列。CDC Definition 在 Flow build 前直接采用同源引用的列并集，因此私有 bootstrap spool 和 Scan output 都不写入无用 source 列；Sequence 保持通用的 Scan 后 positional `SchemaAlign`。Projection、Union 分支和 query 最终输出也通过 positional `SchemaAlign` 精确保留分析后的 Arrow Schema；即使优化器删除根部 identity Projection，Sink 仍收到 SQL 字段名、nullability 和 metadata。
 
 ## 装配与稳定 ID
 
@@ -243,7 +243,7 @@ Station 融合和持久边界由 [Flow](../flow/README.md#最小公共-api) 唯�
 `SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `SchemaAlign`。
 只执行 `TypeCoercion` Analyzer 并关闭 `Utf8View` 映射；语法层先拒绝会被 planner 擦除的 modifier。
 SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata 与 `AggregateCall` lowering，不重复函数目录。
-同一 CTE 的重复引用复用 Scan identity；任何已声明却不可达的 Scan 都在创建状态前拒绝。
+同一 CTE 的重复引用复用 Scan identity。lowering 先收集各次引用投影的最小并集，让共享 CDC Scan 从 source converter 起只输出这份并集；每个引用再在进入自己的分支前选择所需子集，因此一条分支的额外列不会扩大另一条分支的 Join 或 Aggregate 状态。空并集保留事件行数与 diff。CDC Definition 的 `output_projection` 属于开发期 v1 持久布局，旧状态直接重建。任何已声明却不可达的 Scan 都在创建状态前拒绝。
 `ResolvedEndpoints` 是一次 start 的强类型快照，不复制 Query，也不在 identity/build/open 中重复解析。Program identity 使用手工稳定 framing 的 BLAKE3。
 
 ## 源码入口

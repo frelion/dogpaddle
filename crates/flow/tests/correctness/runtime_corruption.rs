@@ -6,12 +6,14 @@ use std::{
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::Change;
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::UnionAllDefinition,
 };
 use dogpaddle_store::{Cell, Store, SubscribedLog, SubscribedLogStatus, SubscriptionStatus};
+
+use super::support::encode_output_entry;
 
 #[derive(Debug, Eq, PartialEq)]
 struct DurableInputState {
@@ -76,7 +78,7 @@ fn advance_rejects_an_invalid_encoded_change_without_writes() {
 fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let encoded = encode_change(&count_change(7)).unwrap();
+    let encoded = encode_output_entry(&count_change(7));
     publish_pending_input(&path, &encoded);
     let before = durable_input_state(&path);
 
@@ -86,7 +88,7 @@ fn advance_rejects_a_valid_change_with_the_wrong_bound_schema_without_writes() {
     assert!(
         error
             .to_string()
-            .contains("station input 0 Schema does not match its binding")
+            .contains("the Change schema differs from the schema bound to this codec")
     );
     drop(flow);
 

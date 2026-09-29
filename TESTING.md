@@ -131,7 +131,7 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 
 持久化定义或布局变更必须同时覆盖成功构建、纯校验失败无文件副作用、不完整构建、稳定编码、资源布局和重新打开。项目不识别、迁移或兼容未发布的旧格式；旧数据库直接删除并重建。
 
-Change IPC 变更必须覆盖完整 Stream literal golden、标准 Arrow reader 互操作、顺序保持、零/多 RecordBatch 拒绝、截断、尾随字节与 reopen。
+Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arrow reader 互操作、顺序保持、零/多 RecordBatch 拒绝、截断和尾随字节；schema-bound 格式还必须覆盖 marker、Schema fingerprint、单 batch framing、owned decode 与 reopen。
 
 普通 correctness 测试不得依赖 wall-clock 断言、系统 Java 或外部 PostgreSQL。没有覆盖率或代码行数 CI 阈值。
 
@@ -153,12 +153,12 @@ AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提�
 | Target | Runner 与必须保留的口径 |
 | --- | --- |
 | `change_core` | Criterion |
-| `change_codec` | Change 自有五路旋转 runner |
+| `change_codec` | Change 自有七路旋转 runner：self-contained/schema-bound encode 与 full decode，加三种 self-contained projected decode；同 fixture 记录两种格式 bytes 与节省比例 |
 | `cell` | Criterion |
 | `projection` | Operation 自有 Criterion：Select/SchemaAlign 的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单 turn 多行、单 turn 重复极值 key、同 turn 净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |
 | `distinct` | Operation 自有 Criterion：同一 Change 内同 key 连续正负循环与两 key 交错循环；每轮完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 和逐事件输出 oracle 不计时 |
-| `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条发布和未完成快照逐条清理，宽 IPC 用同一 entry/row 布局配对发布与清理；计时一次 restore 及全部 spool entry 的 turn/apply/同步 commit/AfterCommit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
+| `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条发布；未完成快照的常规 reset 固定用 257 条窄 entry 跨过 256-entry 批界，wide schema-bound entry 用同一 entry/row 布局配对发布与清理；计时一次只读 restore、publish 的逐 entry 或 reset 的逐 batch turn/apply/同步 commit/AfterCommit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
 | `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的全部分页 turns、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
 | `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
@@ -168,7 +168,7 @@ AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提�
 | `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
 | `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含同一 Select（选列）→Select（追加列）→Filter→Select→SchemaAlign 逻辑链的独立 Station 与线性多 Operation Station 对照 |
-| `change_subscribed_log` | Criterion |
+| `change_subscribed_log` | Criterion；单 exact Schema 的 schema-bound entries，durable append 与 owned decode/ack consume |
 
 自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
@@ -194,7 +194,7 @@ entry 数与 key + 8-byte positive weight；这是 codec 已锁定的逻辑大�
 
 Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime`、`equi_join_resources` 与 `asof_join_resources` 的自有 runner 同样设置 `test = true`；test mode 自动选择小规模 workload，后两者仍逐 case 启动隔离子进程。其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
-`flow_runtime` 的线性链对照固定使用相同的 SequenceScan→Select（选列）→Select（追加列）→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局通过 `materialize` 固定边界，是 7 个 Station、6 个 durable output log 和 6 条 input edge；融合布局通过 `FlowFactory::operation` 的自动规划把五个 transform 放入 Scan Station，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。这些 commit 与 append 是 Flow 协议层的语义计数，不是 RocksDB 内部计数。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration 或历史累计 IPC bytes，JSONL context 必须把两项记为 unavailable，不能用均摊延迟或当前 retained bytes 冒充。
+`flow_runtime` 的线性链对照固定使用相同的 SequenceScan→Select（选列）→Select（追加列）→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局通过 `materialize` 固定边界，是 7 个 Station、6 个 durable output log 和 6 条 input edge；融合布局通过 `FlowFactory::operation` 的自动规划把五个 transform 放入 Scan Station，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个 Station transaction 仍独立原子提交并启用 WAL，但同一 `advance` 内在 durable AfterCommit 或返回前共享 durability barrier；这些语义 commit 数不是 RocksDB WAL sync 次数。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration、实际 WAL sync 次数或历史累计 IPC bytes，JSONL context 必须把这些字段记为 unavailable，不能用语义 commit 数、均摊延迟或当前 retained bytes 冒充。
 
 性能环境只有两个入口：
 

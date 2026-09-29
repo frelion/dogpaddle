@@ -7,7 +7,7 @@ use std::{
 
 use arrow_array::{Int64Array, RecordBatch};
 use criterion::{BenchmarkId, Criterion};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, decode_definition,
     operation::{
@@ -19,6 +19,10 @@ use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, requi
 use dogpaddle_store::{Cell, Queue, Store, StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
+
+const RESET_BATCH_ENTRIES: usize = 256;
+const BATCHED_RESET_ENTRIES: usize = RESET_BATCH_ENTRIES + 1;
+const RESET_ROWS_PER_ENTRY: usize = 1;
 
 #[derive(Clone, Copy)]
 enum Source {
@@ -36,8 +40,8 @@ impl Source {
 
     fn definition(self) -> Box<dyn OperationDefinition> {
         let (tag, payload): (u16, &[u8]) = match self {
-            Self::Postgres => (11, br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#),
-            Self::MySql => (15, br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#),
+            Self::Postgres => (11, br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}"#),
+            Self::MySql => (15, br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}"#),
         };
         let mut bytes = b"dogpaddle.operation\0\0\x01".to_vec();
         bytes.extend_from_slice(&tag.to_be_bytes());
@@ -135,6 +139,7 @@ impl Fixture {
             .unwrap()
             .into_parts();
         let mut transactions = store.into_transactions();
+        let codec = SchemaBoundChangeCodec::try_new(Arc::clone(&schema)).unwrap();
         let expected = (0..entries)
             .map(|entry| {
                 let values = (0..rows)
@@ -170,7 +175,7 @@ impl Fixture {
                         .access(access)
                         .unwrap()
                         .try_push(
-                            &encode_change(change).unwrap(),
+                            &codec.encode(change).unwrap(),
                             NonZeroU64::new(1_048_576).unwrap()
                         )
                         .unwrap()
@@ -191,10 +196,16 @@ impl Fixture {
     }
 
     fn run(&mut self, reset: bool) -> Duration {
-        let mut outputs = Vec::with_capacity(self.expected.len() + 1);
-        // One restore turn followed by exactly one committed turn per spool entry.
+        let work_turns = if reset {
+            self.expected.len().div_ceil(RESET_BATCH_ENTRIES).max(1)
+        } else {
+            self.expected.len()
+        };
+        let mut outputs = Vec::with_capacity(work_turns + 1);
+        // Restore is read-only. Publication commits once per entry; reset
+        // commits once per bounded discard batch.
         let started = Instant::now();
-        for _ in 0..=self.expected.len() {
+        for _ in 0..=work_turns {
             let Turn::Ready(prepared) = self.operation.turn(None).unwrap() else {
                 panic!("CDC bootstrap unexpectedly idled")
             };
@@ -206,10 +217,15 @@ impl Fixture {
         }
         let elapsed = started.elapsed();
         assert!(matches!(outputs.remove(0), Action::Commit(None)));
-        for (action, expected) in outputs.into_iter().zip(&self.expected) {
-            if reset {
-                assert!(matches!(action, Action::Commit(None)));
-            } else {
+        if reset {
+            assert_eq!(outputs.len(), work_turns);
+            assert!(
+                outputs
+                    .into_iter()
+                    .all(|action| matches!(action, Action::Commit(None)))
+            );
+        } else {
+            for (action, expected) in outputs.into_iter().zip(&self.expected) {
                 let Action::Commit(Some(actual)) = action else {
                     panic!("publication omitted an entry")
                 };
@@ -243,21 +259,27 @@ fn main() {
     if is_benchmark {
         require_release_build("cdc_bootstrap");
     }
-    let (entries, rows, wide_reset_rows) = match (profile, is_benchmark) {
+    let (publish_entries, publish_rows, wide_rows_per_entry) = match (profile, is_benchmark) {
         (PerformanceProfile::Smoke, false) => (2, 2, 512),
         (PerformanceProfile::Smoke, true) => (8, 64, 16_384),
         (PerformanceProfile::Reference, _) => (32, 256, 32_768),
     };
+    let reset_batches = BATCHED_RESET_ENTRIES.div_ceil(RESET_BATCH_ENTRIES);
     let root = RunRoot::for_profile("cdc_bootstrap", profile);
     std::fs::write(root.path().join("context.json"), serde_json::to_vec_pretty(&json!({
         "benchmark": "cdc_bootstrap", "profile": profile,
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
-        "entries": entries, "rows_per_entry": rows, "wide_entries": 1,
-        "wide_rows_per_entry": wide_reset_rows,
-        "turns_per_iteration": entries + 1, "sync_commits_per_iteration": entries + 1,
-        "wide_turns_and_sync_commits": 2,
+        "spool_entry_format": "schema-bound Change entry without a repeated Arrow Schema",
+        "reset_batch_entries": RESET_BATCH_ENTRIES,
+        "publish_entries": publish_entries, "publish_rows_per_entry": publish_rows,
+        "reset_entries": BATCHED_RESET_ENTRIES, "reset_rows_per_entry": RESET_ROWS_PER_ENTRY,
+        "wide_entries": 1, "wide_rows_per_entry": wide_rows_per_entry,
+        "publish_turns_per_iteration": publish_entries + 1, "publish_sync_commits_per_iteration": publish_entries,
+        "reset_turns_per_iteration": reset_batches + 1, "reset_sync_commits_per_iteration": reset_batches,
+        "wide_publish_turns": 2, "wide_publish_sync_commits": 1,
+        "wide_reset_turns": 2, "wide_reset_sync_commits": 1,
         "cases": ["postgres/publish", "postgres/reset", "postgres/publish_wide", "postgres/reset_wide", "mysql/publish", "mysql/reset", "mysql/publish_wide", "mysql/reset_wide"],
-        "timed_boundary": "restore and all spool entry turns, apply, synchronous commit, AfterCommit, and retaining Actions for untimed validation",
+        "timed_boundary": "restore and all publication-entry or reset-batch turns, apply, synchronous commit, AfterCommit, and retaining Actions for untimed validation",
         "untimed": "Definition decoding, construction, Store creation/open, fixture encoding/seed, output and durable-state oracle, teardown",
         "external_io": "none; stops at Streaming or Fresh before connector start",
         "limitations": "does not measure capture, connector polling, ACK, source cleanup, or full Flow output log writes"
@@ -275,10 +297,10 @@ fn main() {
     let mut group = criterion.benchmark_group("cdc_bootstrap");
     for source in [Source::Postgres, Source::MySql] {
         for (name, case_entries, case_rows, reset) in [
-            ("publish", entries, rows, false),
-            ("reset", entries, rows, true),
-            ("publish_wide", 1, wide_reset_rows, false),
-            ("reset_wide", 1, wide_reset_rows, true),
+            ("publish", publish_entries, publish_rows, false),
+            ("reset", BATCHED_RESET_ENTRIES, RESET_ROWS_PER_ENTRY, true),
+            ("publish_wide", 1, wide_rows_per_entry, false),
+            ("reset_wide", 1, wide_rows_per_entry, true),
         ] {
             group.bench_function(BenchmarkId::new(source.name(), name), |bencher| {
                 bencher.iter_custom(|iterations| {

@@ -1,8 +1,16 @@
 use std::{num::NonZeroU64, path::Path};
 
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::operation::{scan::SequenceScanDefinition, sink::DiscardDefinition};
 use dogpaddle_store::{Cell, Store};
+
+pub(super) fn encode_output_entry(change: &Change) -> Vec<u8> {
+    SchemaBoundChangeCodec::try_new(change.schema())
+        .unwrap()
+        .encode(change)
+        .unwrap()
+}
 
 pub(super) fn build_scan_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let mut builder = FlowFactory::new(path);

@@ -193,18 +193,47 @@ Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.ver
 任一阶段超限都返回同一容量错误，因此超大 body 不会先被完整构造后才遭拒绝。普通 [`encode_change`]
 保留无调用方 byte limit 的通用入口。
 
-写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝错误 marker、
-大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle` Schema。writer options、
-物理 diff 布局、允许的 Arrow 类型和行序都是 v1 持久化边界。
-
-canonical 约束 framing、EOS、writer options，以及有序且唯一的 metadata key；decoder 不要求把
-输入重新编码后逐字节相等。`encode_change` 的确定性输出和 golden bytes 是写入端基准。
+自描述格式的写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝
+错误 marker、大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle`
+Schema。canonical 约束 framing、EOS、writer options，以及有序且唯一的 metadata key；decoder
+不要求把输入重新编码后逐字节相等。`encode_change` 的确定性输出和 golden bytes 是写入端基准。
 
 这是开发期 v1。修改物理 diff 布局、Schema marker、writer options、允许类型或解码规则时，应同步更新
 golden 和 reopen 证据并重建旧 Flow，不增加旧格式迁移或兼容分支。
 
-运行时每个日志 entry 恰好保存一个完整 Change Stream。多个订阅者可以对同一 entry 使用不同投影，
-最慢订阅者决定 entry 何时回收；这些属于 Flow 和 Store 的职责。
+### 资源已绑定 Schema 的 entry
+
+同一个持久资源内的每条 Change 都使用同一精确 Schema 时，可以构造
+[`SchemaBoundChangeCodec`]，把完整 Schema 留在资源所有者处，只在每条 entry 保存固定身份：
+
+```text
+DPCHB001                                      8-byte format/version marker
+BLAKE3(canonical physical Schema message)   32-byte Schema fingerprint
+RecordBatch message/body                     exactly one non-empty batch
+canonical EOS
+```
+
+这里的 canonical physical Schema 是 [`encode_change`] 使用的同一个布局：non-null Int64 diff 在第零列，
+其后是 logical fields，并包含固定 kind/version metadata。fingerprint 因此覆盖字段顺序、名称、类型、
+nullability、嵌套结构以及全部 Schema/Field metadata。codec 在编码时要求 `Change` 的 logical Schema
+逐项相等；解码时先比较 fingerprint，避免把物理 buffer 布局恰好相同但语义不同的 entry 错绑到当前
+Schema。
+
+绑定格式仍固定为 Metadata V5、8 字节对齐、非 legacy framing、无字典和无压缩，并复用完整 decoder
+的 batch layout、值、diff 与 canonical EOS 检查。它不是自描述的标准 Arrow Stream；资源必须先可靠地
+恢复 exact Schema，再构造 codec。[`SchemaBoundChangeCodec::decode_owned`] 对满足对齐要求的 IPC body
+继续共享传入的 `Vec<u8>` 分配，[`SchemaBoundChangeCodec::encode_bounded`] 同时限制未压缩 body 与完整
+entry。
+
+绑定格式也是开发期 v1 持久边界。marker、fingerprint 输入、writer options、物理布局或 framing 变化
+必须同步更新 bound golden/layout/reopen 证据并重建受影响资源，不增加旧格式兼容分支。
+
+两种 codec 的职责不同：[`encode_change`]/[`decode_change`] 用于没有可信外部 Schema 上下文、需要单条
+自描述 Arrow Stream 的边界，[`decode_change_projected`] 也只读取这种自描述格式；
+[`SchemaBoundChangeCodec`] 用于一个持久资源已经由 exact Schema 拥有、会连续保存许多 Change 的边界。
+Flow 的 Station output 使用后一种格式，producer 与全部 input edge 共享同一个 bound codec，并完整解码
+Claim，不按 subscriber 做 projected decode。最慢订阅者决定 entry 何时回收；订阅位置、容量和回收属于
+Flow 与 Store 的职责。
 
 ## 从哪里继续读
 

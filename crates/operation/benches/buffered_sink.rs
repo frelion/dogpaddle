@@ -422,6 +422,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
         "result_directory": root.path().display().to_string(),
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
         "configuration": {
+            "buffer_entry_format": "schema-bound Change entry without a repeated Arrow Schema",
             "mode": mode,
             "steady_rows": config.steady_rows,
             "staged_entries": config.staged_entries,
@@ -447,7 +448,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
             "cases": {
                 "steady_small_admission_drain": "each small Claim admitted and fully drained before the next",
                 "multi_entry_batch": "multiple complete Claims admitted before one delivery, with admission included in the timed sample",
-                "restore_validation": "reopen a staged multi-entry buffer and validate all retained entries in the first restore turn",
+                "restore_validation": "reopen a staged multi-entry schema-bound buffer and validate all retained entries in the first restore turn",
                 "large_payload_small_event": "one large UTF-8 value with unit multiplicity",
                 "large_payload_multiplicity_target_slicing": "a 4 MiB-plus UTF-8 value at multiplicity two, forcing at least two target-byte-bounded batches without unbounded amplification",
                 "high_multiplicity_finite_capacity_churn": "one logical row split across bounded 1024-event SQLite deliveries"

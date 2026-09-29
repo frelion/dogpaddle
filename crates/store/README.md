@@ -92,10 +92,12 @@ owner Definition 放进同一笔同步事务。
 
 ```text
 Transactions       → begin() → Transaction       → TransactionAccess
+                   → durability_batch() → DurabilityBatch → BatchedTransaction
 ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 ```
 
 - `Transactions` 不可克隆，并且 `begin(&mut self)` 需要独占借用；当前运行模型因此一次只有一个 writer。
+- `DurabilityBatch` 仍保持一个 writer 和逐事务原子性，只把多笔 WAL write 与 fsync 合并到显式 barrier。
 - `ReadTransactions` 不可克隆但可以共享；每次 `begin()` 得到一个稳定的只读 snapshot。
 - snapshot 只看见它开始时已经提交的数据，后续提交由新的 snapshot 看见。
 - transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 进一步约定只在当前 turn 内使用它们。
@@ -137,7 +139,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - `SubscribedLog` 允许多个 consumer 分别读取。每个 subscription 保存自己的下一条位置，最慢的 consumer
   决定数据何时可以回收。
 
-`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front` 只读 front 的编码长度以精确扣减计费，不复制或解码完整 value；和 `pop_front` 共用删除、最后一项清理与损坏检查。两种出队都返回删除后的空状态，调用方不必再读一次 metadata；事务仍由调用方统一提交或回滚。
+`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front(max_entries)` 有界遍历 front：逐项读取编码长度、验证连续性并写 tombstone，不复制或解码完整 value，整批只在末尾更新一次 metadata。它与 `pop_front` 共用最后一项清理与损坏检查，并直接返回删除后的空状态；调用方不必再读一次 metadata，事务仍由调用方统一提交或回滚。
 `SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 `RocksDB` 自身开销。
 
 `SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
@@ -214,8 +216,17 @@ Store 在返回前完成准入、复制和完整解码；错误不会交付半�
 
 ## 提交、错误与恢复
 
-底层使用 `RocksDB` `OptimisticTransactionDB`。包含写入的事务使用 WAL 并同步提交；没有暂存写入的健康事务在 `commit` 时直接完成，不进入 `RocksDB` 写队列或同步 WAL。`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时
-全部回滚。
+底层使用 `RocksDB` `OptimisticTransactionDB`。普通 `Transactions::begin` 产生的写事务使用 WAL 并同步提交；
+没有暂存写入的健康事务在 `commit` 时直接完成，不进入 `RocksDB` 写队列或同步 WAL。
+`Transaction::commit` 成功后，整笔修改一起持久化；未 commit 的事务被丢弃时全部回滚。
+
+Store 启用 `RocksDB` 的 manual WAL flush。普通同步事务仍在成功返回前写出并同步自己的 WAL；需要让多笔独立
+事务共享 WAL write 与持久化等待的协调者可以显式创建 `DurabilityBatch`。batch 内每笔事务仍原子提交、启用 WAL
+并立即对后续 snapshot 可见，但 WAL record 先留在 `RocksDB` 的进程内 buffer，由 `sync` 或最终 `finish` 统一写出并
+同步到磁盘。
+在 barrier 完成前不得执行依赖这些提交的外部效果，也不得把成功返回给上层。无 pending write 的 barrier 不进入
+`RocksDB`。一次有写的 commit 即使返回错误也保留 pending，因为底层结果可能不确定，owner 返回前仍须尝试最终
+barrier。barrier 失败表示这一组提交的持久化结果不确定，owner 必须 fail-stop 并从磁盘重新打开，不能继续复用。
 
 以下错误会使当前事务中毒：编码或解码失败、损坏的 metadata、使用另一个 Store 的 handle、RocksDB 访问失败、
 multiset underflow/overflow，以及非法 subscription acknowledgement。之后的访问返回

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, ListArray, NullArray, RecordBatch};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::encode_change;
+use dogpaddle_change::SchemaBoundChangeCodec;
 
 use super::*;
 use crate::operation::sink::buffered::{DeliveryBatch, SinkTarget};
@@ -514,7 +514,8 @@ fn zero_width_nested_values_cannot_expand_past_the_planning_budget() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    assert!(encode_change(&input).unwrap().len() < 1024);
+    let codec = SchemaBoundChangeCodec::try_new(input.records().schema()).unwrap();
+    assert!(codec.encode(&input).unwrap().len() < 1024);
 
     let mut target = Target::default();
     assert!(

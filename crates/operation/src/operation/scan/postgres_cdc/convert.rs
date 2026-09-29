@@ -1,16 +1,17 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::SchemaRef;
-use base64::{Engine as _, prelude::BASE64_STANDARD};
+use base64::{Engine as _, prelude::BASE64_STANDARD, read::DecoderReader};
 use chrono::DateTime;
 use dogpaddle_change::Change;
 use serde_json::{Map, Value};
 
-use super::{PostgresCdcScanError, PostgresColumn, PostgresType};
+use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType};
 use crate::operation::scan::cdc_runtime::Captured;
 
 type Row = Map<String, Value>;
@@ -39,19 +40,15 @@ enum SnapshotMarker {
 // The byte-level boundary also lets tests use actual Connect JSON without
 // exposing constructors for the runtime's owned Record capability.
 pub(super) fn convert_values<'a>(
-    columns: &[PostgresColumn],
+    spec: &PostgresCdcScanSpec,
+    output_projection: &[u32],
     output_schema: SchemaRef,
-    topic_prefix: &str,
-    table_schema: &str,
-    table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
 ) -> Result<Option<Change>, PostgresCdcScanError> {
     Ok(convert_values_in_mode(
-        columns,
+        spec,
+        output_projection,
         output_schema,
-        topic_prefix,
-        table_schema,
-        table,
         values,
         ConversionMode::Streaming,
     )?
@@ -59,20 +56,16 @@ pub(super) fn convert_values<'a>(
 }
 
 pub(super) fn convert_capture_values<'a>(
-    columns: &[PostgresColumn],
+    spec: &PostgresCdcScanSpec,
+    output_projection: &[u32],
     output_schema: SchemaRef,
-    topic_prefix: &str,
-    table_schema: &str,
-    table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
     progress: CaptureProgress,
 ) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
     convert_values_in_mode(
-        columns,
+        spec,
+        output_projection,
         output_schema,
-        topic_prefix,
-        table_schema,
-        table,
         values,
         ConversionMode::Capture {
             progress,
@@ -82,17 +75,16 @@ pub(super) fn convert_capture_values<'a>(
 }
 
 fn convert_values_in_mode<'a>(
-    columns: &[PostgresColumn],
+    spec: &PostgresCdcScanSpec,
+    output_projection: &[u32],
     output_schema: SchemaRef,
-    topic_prefix: &str,
-    table_schema: &str,
-    table: &str,
     values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
     mut mode: ConversionMode,
 ) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
-    let table_topic = format!("{topic_prefix}.{table_schema}.{table}");
-    let heartbeat_topic = format!("__debezium-heartbeat.{topic_prefix}");
-    let notification_topic = format!("__dogpaddle-notification.{topic_prefix}");
+    let columns = &spec.columns;
+    let table_topic = format!("{}.{}.{}", spec.engine_name, spec.schema, spec.table);
+    let heartbeat_topic = format!("__debezium-heartbeat.{}", spec.engine_name);
+    let notification_topic = format!("__dogpaddle-notification.{}", spec.engine_name);
     let mut rows = Vec::new();
     let mut diffs = Vec::new();
     for (topic, bytes) in values {
@@ -122,7 +114,7 @@ fn convert_values_in_mode<'a>(
             .get_mut("payload")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| invalid("missing object field payload"))?;
-        let marker = validate_metadata(payload, table_schema, table)?;
+        let marker = validate_metadata(payload, &spec.schema, &spec.table)?;
         let before = payload
             .remove("before")
             .ok_or_else(|| invalid("missing before"))?;
@@ -142,7 +134,7 @@ fn convert_values_in_mode<'a>(
                 if *sealed || progress.snapshot_complete {
                     return Err(invalid("snapshot record arrived after snapshot completion"));
                 }
-                rows.push(complete_row(columns, after)?);
+                rows.push(complete_row(columns, output_projection, after)?);
                 diffs.push(1);
                 progress.saw_snapshot_row = true;
                 if marker == SnapshotMarker::Last {
@@ -150,16 +142,16 @@ fn convert_values_in_mode<'a>(
                 }
             }
             (Some("c"), SnapshotMarker::Streaming) if accepts_streaming && before.is_null() => {
-                rows.push(complete_row(columns, after)?);
+                rows.push(complete_row(columns, output_projection, after)?);
                 diffs.push(1);
             }
             (Some("u"), SnapshotMarker::Streaming) if accepts_streaming => {
-                rows.push(complete_row(columns, before)?);
-                rows.push(complete_row(columns, after)?);
+                rows.push(complete_row(columns, output_projection, before)?);
+                rows.push(complete_row(columns, output_projection, after)?);
                 diffs.extend([-1, 1]);
             }
             (Some("d"), SnapshotMarker::Streaming) if accepts_streaming && after.is_null() => {
-                rows.push(complete_row(columns, before)?);
+                rows.push(complete_row(columns, output_projection, before)?);
                 diffs.push(-1);
             }
             _ => {
@@ -169,16 +161,7 @@ fn convert_values_in_mode<'a>(
             }
         }
     }
-    let change = if rows.is_empty() {
-        None
-    } else {
-        let arrays = columns
-            .iter()
-            .map(|column| column_array(column, &rows))
-            .collect::<Result<Vec<_>, _>>()?;
-        let records = RecordBatch::try_new(output_schema, arrays)?;
-        Some(Change::try_new(records, Int64Array::from(diffs))?)
-    };
+    let change = build_change(columns, output_projection, output_schema, &rows, diffs)?;
     let (progress, sealed) = match mode {
         ConversionMode::Capture { progress, sealed } => (progress, sealed),
         ConversionMode::Streaming => (CaptureProgress::default(), false),
@@ -188,6 +171,31 @@ fn convert_values_in_mode<'a>(
         sealed,
         progress,
     })
+}
+
+fn build_change(
+    columns: &[PostgresColumn],
+    output_projection: &[u32],
+    output_schema: SchemaRef,
+    rows: &[Row],
+    diffs: Vec<i64>,
+) -> Result<Option<Change>, PostgresCdcScanError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let arrays = output_projection
+        .iter()
+        .map(|index| {
+            let column = usize::try_from(*index)
+                .ok()
+                .and_then(|index| columns.get(index))
+                .ok_or_else(|| invalid("output projection is outside the source schema"))?;
+            column_array(column, rows)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    let records = RecordBatch::try_new_with_options(output_schema, arrays, &options)?;
+    Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
 }
 
 fn apply_snapshot_notification(
@@ -353,8 +361,13 @@ fn validate_heartbeat(schema: &Row, payload: &Row) -> Result<(), PostgresCdcScan
     Ok(())
 }
 
-fn complete_row(columns: &[PostgresColumn], value: Value) -> Result<Row, PostgresCdcScanError> {
-    let Value::Object(row) = value else {
+#[allow(clippy::cast_possible_truncation)] // A validated source has at most 1600 columns.
+fn complete_row(
+    columns: &[PostgresColumn],
+    output_projection: &[u32],
+    value: Value,
+) -> Result<Row, PostgresCdcScanError> {
+    let Value::Object(mut row) = value else {
         return Err(invalid(
             "missing complete row image; the captured table requires REPLICA IDENTITY FULL",
         ));
@@ -364,15 +377,25 @@ fn complete_row(columns: &[PostgresColumn], value: Value) -> Result<Row, Postgre
             "row image does not contain exactly the declared columns",
         ));
     }
-    for column in columns {
-        let value = row
-            .get(column.name())
-            .ok_or_else(|| invalid(format!("row image is missing column {}", column.name())))?;
-        if value.is_null() && !column.is_nullable() {
-            return Err(invalid(format!(
-                "non-null column {} contains null",
-                column.name()
-            )));
+    let mut projection = output_projection.iter().copied();
+    let mut next = projection.next();
+    for (index, column) in columns.iter().enumerate() {
+        {
+            let value = row
+                .get(column.name())
+                .ok_or_else(|| invalid(format!("row image is missing column {}", column.name())))?;
+            if value.is_null() && !column.is_nullable() {
+                return Err(invalid(format!(
+                    "non-null column {} contains null",
+                    column.name()
+                )));
+            }
+        }
+        if next == Some(index as u32) {
+            next = projection.next();
+        } else {
+            validate_column_value(column, &row[column.name()])?;
+            let _ = row.remove(column.name());
         }
     }
     Ok(row)
@@ -389,15 +412,43 @@ fn column_values<'a, T>(
             if value.is_null() {
                 Ok(None)
             } else {
-                parse(value).map(Some).ok_or_else(|| {
-                    invalid(format!(
-                        "invalid or unsupported value in column {}",
-                        column.name()
-                    ))
-                })
+                parse(value)
+                    .map(Some)
+                    .ok_or_else(|| invalid_column_value(column))
             }
         })
         .collect()
+}
+
+fn validate_column_value(
+    column: &PostgresColumn,
+    value: &Value,
+) -> Result<(), PostgresCdcScanError> {
+    let valid = value.is_null()
+        || match column.data_type() {
+            PostgresType::Boolean => value.as_bool().is_some(),
+            PostgresType::Int16 => parse_int16(value).is_some(),
+            PostgresType::Int32 => parse_int32(value).is_some(),
+            PostgresType::Int64 => value.as_i64().is_some(),
+            PostgresType::Float32 => parse_float32(value).is_some(),
+            PostgresType::Float64 => parse_float64(value).is_some(),
+            PostgresType::Text => value.as_str().is_some(),
+            PostgresType::Bytea => valid_binary(value),
+            PostgresType::Date => parse_date(value).is_some(),
+            PostgresType::Timestamp => parse_timestamp(value).is_some(),
+            PostgresType::TimestampTz => parse_timestamp_tz(value).is_some(),
+            PostgresType::Numeric { precision, .. } => parse_decimal(value, precision).is_some(),
+        };
+    valid
+        .then_some(())
+        .ok_or_else(|| invalid_column_value(column))
+}
+
+fn invalid_column_value(column: &PostgresColumn) -> PostgresCdcScanError {
+    invalid(format!(
+        "invalid or unsupported value in column {}",
+        column.name()
+    ))
 }
 
 fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, PostgresCdcScanError> {
@@ -407,12 +458,12 @@ fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, Postg
             rows,
             Value::as_bool,
         )?)),
-        PostgresType::Int16 => Arc::new(Int16Array::from(column_values(column, rows, |value| {
-            i16::try_from(value.as_i64()?).ok()
-        })?)),
-        PostgresType::Int32 => Arc::new(Int32Array::from(column_values(column, rows, |value| {
-            i32::try_from(value.as_i64()?).ok()
-        })?)),
+        PostgresType::Int16 => {
+            Arc::new(Int16Array::from(column_values(column, rows, parse_int16)?))
+        }
+        PostgresType::Int32 => {
+            Arc::new(Int32Array::from(column_values(column, rows, parse_int32)?))
+        }
         PostgresType::Int64 => Arc::new(Int64Array::from(column_values(
             column,
             rows,
@@ -434,36 +485,18 @@ fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, Postg
             Value::as_str,
         )?)),
         PostgresType::Bytea => {
-            let values = column_values(column, rows, |value| {
-                BASE64_STANDARD.decode(value.as_str()?).ok()
-            })?;
+            let values = column_values(column, rows, parse_binary)?;
             Arc::new(values.iter().map(Option::as_deref).collect::<BinaryArray>())
         }
-        PostgresType::Date => Arc::new(Date32Array::from(column_values(column, rows, |value| {
-            let days = i32::try_from(value.as_i64()?).ok()?;
-            // Earlier values include Debezium's wrapped PostgreSQL infinity sentinels.
-            (days >= -2_440_588).then_some(days)
-        })?)),
+        PostgresType::Date => Arc::new(Date32Array::from(column_values(column, rows, parse_date)?)),
         PostgresType::Timestamp => Arc::new(TimestampMicrosecondArray::from(column_values(
             column,
             rows,
-            |value| {
-                let micros = value.as_i64()?;
-                (!matches!(
-                    micros,
-                    9_223_372_036_825_200_000 | -9_223_372_036_832_400_000
-                ))
-                .then_some(micros)
-            },
+            parse_timestamp,
         )?)),
         PostgresType::TimestampTz => Arc::new(
-            TimestampMicrosecondArray::from(column_values(column, rows, |value| {
-                let timestamp = DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
-                (timestamp.timestamp_subsec_nanos() < 1_000_000_000
-                    && timestamp.timestamp_subsec_nanos() % 1_000 == 0)
-                    .then(|| timestamp.timestamp_micros())
-            })?)
-            .with_timezone("UTC"),
+            TimestampMicrosecondArray::from(column_values(column, rows, parse_timestamp_tz)?)
+                .with_timezone("UTC"),
         ),
         PostgresType::Numeric { precision, scale } => Arc::new(
             Decimal128Array::from(column_values(column, rows, |value| {
@@ -472,6 +505,47 @@ fn column_array(column: &PostgresColumn, rows: &[Row]) -> Result<ArrayRef, Postg
             .with_precision_and_scale(precision, scale)?,
         ),
     })
+}
+
+fn parse_int16(value: &Value) -> Option<i16> {
+    i16::try_from(value.as_i64()?).ok()
+}
+
+fn parse_int32(value: &Value) -> Option<i32> {
+    i32::try_from(value.as_i64()?).ok()
+}
+
+fn parse_binary(value: &Value) -> Option<Vec<u8>> {
+    BASE64_STANDARD.decode(value.as_str()?).ok()
+}
+
+fn valid_binary(value: &Value) -> bool {
+    value.as_str().is_some_and(|encoded| {
+        let mut decoder = DecoderReader::new(encoded.as_bytes(), &BASE64_STANDARD);
+        io::copy(&mut decoder, &mut io::sink()).is_ok()
+    })
+}
+
+fn parse_date(value: &Value) -> Option<i32> {
+    let days = i32::try_from(value.as_i64()?).ok()?;
+    // Earlier values include Debezium's wrapped PostgreSQL infinity sentinels.
+    (days >= -2_440_588).then_some(days)
+}
+
+fn parse_timestamp(value: &Value) -> Option<i64> {
+    let micros = value.as_i64()?;
+    (!matches!(
+        micros,
+        9_223_372_036_825_200_000 | -9_223_372_036_832_400_000
+    ))
+    .then_some(micros)
+}
+
+fn parse_timestamp_tz(value: &Value) -> Option<i64> {
+    let timestamp = DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+    (timestamp.timestamp_subsec_nanos() < 1_000_000_000
+        && timestamp.timestamp_subsec_nanos() % 1_000 == 0)
+        .then(|| timestamp.timestamp_micros())
 }
 
 fn parse_float64(value: &Value) -> Option<f64> {
@@ -493,13 +567,23 @@ fn parse_float32(value: &Value) -> Option<f32> {
 }
 
 fn parse_decimal(value: &Value, precision: u8) -> Option<i128> {
-    let bytes = BASE64_STANDARD.decode(value.as_str()?).ok()?;
+    let encoded_value = value.as_str()?;
+    // At most 16 decoded bytes fit in i128; a 24-byte Base64 input needs
+    // an 18-byte output slice for the decoder's conservative size estimate.
+    if encoded_value.len() > 24 {
+        return None;
+    }
+    let mut decoded = [0; 18];
+    let decoded_len = BASE64_STANDARD
+        .decode_slice(encoded_value, &mut decoded)
+        .ok()?;
+    let bytes = decoded.get(..decoded_len)?;
     let first = *bytes.first()?;
     if bytes.len() > size_of::<i128>() {
         return None;
     }
     let mut encoded = [if first & 0x80 == 0 { 0 } else { 0xff }; size_of::<i128>()];
-    encoded[size_of::<i128>() - bytes.len()..].copy_from_slice(&bytes);
+    encoded[size_of::<i128>() - bytes.len()..].copy_from_slice(bytes);
     let unscaled = i128::from_be_bytes(encoded);
     (unscaled.unsigned_abs() < 10_u128.pow(u32::from(precision))).then_some(unscaled)
 }

@@ -14,3 +14,18 @@ pub use postgres_cdc::{
     PostgresCdcScanSpec, PostgresColumn, PostgresType,
 };
 pub use sequence::{SequenceScanDefinition, SequenceScanError};
+
+fn ordered_projection(projection: &[u32], source_fields: usize) -> Option<Vec<usize>> {
+    let mut previous = None;
+    projection
+        .iter()
+        .map(|&index| {
+            let index = usize::try_from(index).ok()?;
+            if index >= source_fields || previous.is_some_and(|previous| previous >= index) {
+                return None;
+            }
+            previous = Some(index);
+            Some(index)
+        })
+        .collect()
+}

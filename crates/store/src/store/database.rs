@@ -338,6 +338,7 @@ pub(super) fn open_database(path: &Path, create: bool) -> Result<Database, Store
     options.create_if_missing(create);
     options.set_error_if_exists(create);
     options.set_compression_type(DBCompressionType::Lz4);
+    options.set_manual_wal_flush(true);
     options.set_block_based_table_factory(&table_options());
     Database::open(&options, path).map_err(|error| StoreError::storage("open RocksDB", error))
 }

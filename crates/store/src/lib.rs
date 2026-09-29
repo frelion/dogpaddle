@@ -17,9 +17,9 @@ pub use collections::{
 };
 pub use data_class::StoreData;
 pub use error::StoreError;
-pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess};
 pub use store::{
-    DataScope, ScanDirection, ScanLimit, Store, StoreSetup, Transaction, TransactionAccess,
-    Transactions,
+    BatchedTransaction, DataScope, DurabilityBatch, ScanDirection, ScanLimit, Store, StoreSetup,
+    Transaction, TransactionAccess, Transactions,
 };
+pub(crate) use store::{DataAccess, DataHandle, DataKind, ReadDataAccess};
 pub use store::{ReadTransaction, ReadTransactionAccess, ReadTransactions};

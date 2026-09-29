@@ -8,7 +8,7 @@ use std::{
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
 use dogpaddle_operation::{
     col, lit,
@@ -662,7 +662,10 @@ fn encoded_fixture_change() -> Vec<u8> {
         .expect("construct capacity backlog records");
     let change = Change::try_new(records, Int64Array::from(vec![1_i64]))
         .expect("construct capacity backlog Change");
-    encode_change(&change).expect("encode capacity backlog Change")
+    SchemaBoundChangeCodec::try_new(change.schema())
+        .expect("bind capacity backlog Change schema")
+        .encode(&change)
+        .expect("encode capacity backlog Change")
 }
 
 fn validate_durable_work(
@@ -985,6 +988,9 @@ fn configuration(config: &Config) -> Value {
         "per_transaction_duration_ns": null,
         "per_transaction_duration_unavailable_reason":
             "public_flow_api_exposes_complete_advance_duration_not_individual_station_transactions",
+        "wal_sync_count": null,
+        "wal_sync_count_unavailable_reason":
+            "public_flow_api_exposes_barrier_policy_not_internal_rocksdb_sync_counters",
         "round_latency_scope": "one_complete_flow_advance_call",
         "raw_round_latencies": "one_advance_record_per_sampled_call",
         "raw_outcomes": "one_advance_record_per_sampled_call",
@@ -993,7 +999,9 @@ fn configuration(config: &Config) -> Value {
         "fixtures": "built_once_outside_timing",
         "validation": "outside_timing",
         "execution": "single_thread",
-        "rocksdb_wal_sync": true,
+        "station_transaction_commit": "atomic_wal_enabled_visible_before_barrier",
+        "durability_barrier":
+            "shared_within_advance_and_forced_before_durable_after_commit_or_return",
     })
 }
 

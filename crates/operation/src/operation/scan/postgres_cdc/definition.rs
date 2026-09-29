@@ -63,6 +63,7 @@ pub struct PostgresCdcScanSpec {
 #[derive(Clone, Debug, Serialize)]
 pub struct PostgresCdcScanDefinition {
     spec: PostgresCdcScanSpec,
+    output_projection: Vec<u32>,
     bootstrap_spool_bytes: NonZeroU64,
 }
 
@@ -73,8 +74,10 @@ impl PostgresCdcScanDefinition {
     /// constructing a Flow. Runtime checks also protect manually supplied specs.
     ///
     /// `bootstrap_spool_bytes` is the maximum logical bytes retained by the
-    /// private initial-snapshot spool. It must hold the complete snapshot plus
-    /// WAL changes observed before snapshot publication finishes.
+    /// private initial-snapshot spool. Each Change contributes its actual
+    /// schema-bound encoded-entry length plus the queue's private eight-byte
+    /// sequence key. It must hold the complete snapshot plus WAL changes
+    /// observed before snapshot publication finishes.
     ///
     /// # Errors
     ///
@@ -83,9 +86,43 @@ impl PostgresCdcScanDefinition {
         spec: PostgresCdcScanSpec,
         bootstrap_spool_bytes: NonZeroU64,
     ) -> Result<Self, PostgresCdcScanError> {
+        let output_projection = (0..spec.columns.len())
+            .map(u32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                PostgresCdcScanError::InvalidDefinition(
+                    "source column count exceeds the projection index range".to_owned(),
+                )
+            })?;
+        Self::try_new_projected(spec, output_projection, bootstrap_spool_bytes)
+    }
+
+    /// Freezes a source while exposing only the selected source columns.
+    ///
+    /// `output_projection` contains strictly increasing zero-based indexes into
+    /// the complete ordered [`PostgresCdcScanSpec::columns`]. An empty
+    /// projection preserves row counts and differences without retaining any
+    /// source column in the bootstrap spool or public output.
+    ///
+    /// The complete source Schema remains in the specification and is still
+    /// validated against every Debezium envelope and row image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid source specification, an unordered,
+    /// duplicate, or out-of-range projection, or an oversized persistent
+    /// definition.
+    pub fn try_new_projected(
+        spec: PostgresCdcScanSpec,
+        output_projection: Vec<u32>,
+        bootstrap_spool_bytes: NonZeroU64,
+    ) -> Result<Self, PostgresCdcScanError> {
         validate(&spec)?;
+        super::super::ordered_projection(&output_projection, spec.columns.len())
+            .ok_or_else(invalid_projection)?;
         let definition = Self {
             spec,
+            output_projection,
             bootstrap_spool_bytes,
         };
         if encode(&definition)?.len() > MAX_DEFINITION_BYTES {
@@ -102,6 +139,12 @@ impl PostgresCdcScanDefinition {
         &self.spec
     }
 
+    /// Returns the strictly increasing source-column indexes exposed by this Scan.
+    #[must_use]
+    pub fn output_projection(&self) -> &[u32] {
+        &self.output_projection
+    }
+
     /// Returns the private initial-snapshot spool capacity in logical bytes.
     #[must_use]
     pub const fn bootstrap_spool_bytes(&self) -> NonZeroU64 {
@@ -115,7 +158,7 @@ impl Sealed for PostgresCdcScanDefinition {
         _: crate::definition::ConstructionToken,
         _: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        schema::compile(&self.spec.columns)
+        output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
@@ -127,20 +170,20 @@ impl Sealed for PostgresCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        let output = schema::compile(&self.spec.columns).map_err(schema_error)?;
+        let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
         let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
         let config = resource.take::<PostgresCdcScanConfig>()?;
         let operation = PostgresCdcScanOperation::new_bound(
-            self.spec.clone(),
+            self,
             Arc::clone(&output),
             phase,
             checkpoint,
             spool,
             config,
-            self.bootstrap_spool_bytes,
-        );
+        )
+        .map_err(schema_error)?;
         Ok(ConstructedOperation::turn(Some(output), operation))
     }
 
@@ -174,8 +217,12 @@ pub(crate) fn decode_definition(
     let persistent: PersistentDefinition =
         serde_json::from_slice(payload).map_err(|_| invalid())?;
     let capacity = NonZeroU64::new(persistent.bootstrap_spool_bytes).ok_or_else(invalid)?;
-    let definition =
-        PostgresCdcScanDefinition::try_new(persistent.spec, capacity).map_err(|_| invalid())?;
+    let definition = PostgresCdcScanDefinition::try_new_projected(
+        persistent.spec,
+        persistent.output_projection,
+        capacity,
+    )
+    .map_err(|_| invalid())?;
     let mut canonical = Vec::new();
     definition.encode_payload(&mut canonical);
     if canonical != payload {
@@ -188,6 +235,7 @@ pub(crate) fn decode_definition(
 #[serde(deny_unknown_fields)]
 struct PersistentDefinition {
     spec: PostgresCdcScanSpec,
+    output_projection: Vec<u32>,
     bootstrap_spool_bytes: u64,
 }
 
@@ -236,4 +284,22 @@ fn validate(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError> {
         return Err(invalid("pilot tables require between 1 and 1600 columns"));
     }
     Ok(())
+}
+
+fn output_schema(
+    spec: &PostgresCdcScanSpec,
+    projection: &[u32],
+) -> Result<SchemaRef, PostgresCdcScanError> {
+    let full = schema::compile(&spec.columns)?;
+    let indices = super::super::ordered_projection(projection, full.fields().len())
+        .ok_or_else(invalid_projection)?;
+    Ok(Arc::new(
+        full.project(&indices).map_err(|_| invalid_projection())?,
+    ))
+}
+
+fn invalid_projection() -> PostgresCdcScanError {
+    PostgresCdcScanError::InvalidDefinition(
+        "output projection must contain unique source columns in source order".to_owned(),
+    )
 }

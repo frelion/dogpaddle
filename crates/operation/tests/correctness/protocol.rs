@@ -26,6 +26,20 @@ fn post_commit_error_accepts_an_already_erased_operation_error() {
     assert_eq!(PostCommitError::from(source).to_string(), "erased failure");
 }
 
+#[test]
+fn post_commit_work_declares_when_it_needs_a_durability_barrier() {
+    let none = AfterCommit::none();
+    let local = AfterCommit::local(|| Ok(()));
+    let durable = AfterCommit::durable(|| Ok(()));
+
+    assert!(!none.requires_durability());
+    assert!(!local.requires_durability());
+    assert!(durable.requires_durability());
+    none.run().unwrap();
+    local.run().unwrap();
+    durable.run().unwrap();
+}
+
 struct BorrowedDeliveryConnector {
     acknowledgements: Arc<AtomicUsize>,
 }
@@ -65,7 +79,7 @@ impl TurnOperation for BorrowedDeliveryScan {
             accepted.access(access)?.set(&7)?;
             Ok((
                 Action::Commit(None),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     delivery.ack();
                     Ok(())
                 }),

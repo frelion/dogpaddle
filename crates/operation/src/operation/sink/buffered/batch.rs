@@ -1,7 +1,6 @@
 use arrow_array::Int64Array;
-use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
-use dogpaddle_change::{Change, decode_change_owned};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{OrderedMap, OrderedMapAccess, TransactionAccess};
 
 use super::{
@@ -116,7 +115,7 @@ struct Loader<'resources, 'transaction, SizeEvent> {
     before: BufferState,
     limits: LoadLimits,
     cache: &'resources mut Option<EntryCache>,
-    schema: &'resources SchemaRef,
+    codec: &'resources SchemaBoundChangeCodec,
     size_event: SizeEvent,
     sequence: u64,
     row_index: usize,
@@ -206,20 +205,14 @@ pub(super) fn decode_entry(
     sequence: u64,
     encoded: Vec<u8>,
     max_bytes: u64,
-    schema: &SchemaRef,
+    codec: &SchemaBoundChangeCodec,
 ) -> Result<Change, OperationError> {
     if encoded_item_bytes(&encoded)? > max_bytes {
         return Err(invalid(format!(
             "buffer entry {sequence} exceeds the delivery byte limit"
         )));
     }
-    let change = decode_change_owned(encoded)?;
-    if change.records().schema() != *schema {
-        return Err(invalid(
-            "buffered Change Schema differs from the bound Schema",
-        ));
-    }
-    Ok(change)
+    Ok(codec.decode_owned(encoded)?)
 }
 
 pub(super) fn load(
@@ -227,7 +220,7 @@ pub(super) fn load(
     before: BufferState,
     limits: LoadLimits,
     cache: &mut Option<EntryCache>,
-    schema: &SchemaRef,
+    codec: &SchemaBoundChangeCodec,
     access: TransactionAccess<'_>,
     size_event: impl FnMut(&Change, usize) -> Result<u64, OperationError>,
 ) -> Result<LoadedBatch, OperationError> {
@@ -243,7 +236,7 @@ pub(super) fn load(
         before,
         limits,
         cache,
-        schema,
+        codec,
         size_event,
         sequence: start.sequence,
         row_index,
@@ -290,7 +283,7 @@ where
             .get(&self.sequence)?
             .ok_or_else(|| invalid(format!("buffer entry {} is missing", self.sequence)))?;
         let item_bytes = encoded_item_bytes(&encoded)?;
-        let change = decode_entry(self.sequence, encoded, self.limits.item_bytes, self.schema)?;
+        let change = decode_entry(self.sequence, encoded, self.limits.item_bytes, self.codec)?;
         *self.cache = Some(EntryCache {
             sequence: self.sequence,
             item_bytes,
@@ -476,7 +469,7 @@ where
         let records = if self.record_batches.len() == 1 {
             self.record_batches.pop().expect("one record batch exists")
         } else {
-            concat_batches(self.schema, &self.record_batches)?
+            concat_batches(&self.codec.schema(), &self.record_batches)?
         };
         let delivery = DeliveryBatch::new(
             Change::try_new(records, Int64Array::from(self.diffs))?,

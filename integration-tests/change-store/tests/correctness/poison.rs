@@ -1,14 +1,14 @@
 use std::num::NonZeroU64;
 
-use dogpaddle_change::decode_change;
-use dogpaddle_change_store_integration::projectable_fixture;
+use dogpaddle_change_store_integration::nested_change_fixture;
 use dogpaddle_store::{Store, SubscribedLog};
 
 #[test]
 fn invalid_change_does_not_acknowledge_its_subscription_offset() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
-    let valid = projectable_fixture(10, 2, 7).encoded;
+    let fixture = nested_change_fixture(10, 2, 7);
+    let valid = fixture.encoded;
     let corrupt = valid[..valid.len() - 1].to_vec();
 
     let mut store = Store::create(&path).unwrap();
@@ -38,7 +38,7 @@ fn invalid_change_does_not_acknowledge_its_subscription_offset() {
         let snapshot = snapshots.begin();
         let (offset, encoded) = subscription.peek(snapshot.access()).unwrap().unwrap();
         assert_eq!(offset, 0);
-        decode_change(&encoded).unwrap();
+        fixture.codec.decode_owned(encoded).unwrap();
     }
     {
         let transaction = transactions.begin();
@@ -49,7 +49,7 @@ fn invalid_change_does_not_acknowledge_its_subscription_offset() {
         let snapshot = snapshots.begin();
         let (offset, encoded) = subscription.peek(snapshot.access()).unwrap().unwrap();
         assert_eq!(offset, 1);
-        assert!(decode_change(&encoded).is_err());
+        assert!(fixture.codec.decode_owned(encoded).is_err());
     }
     drop((snapshots, transactions));
 
@@ -65,5 +65,5 @@ fn invalid_change_does_not_acknowledge_its_subscription_offset() {
         .unwrap()
         .unwrap();
     assert_eq!(offset, 1);
-    assert!(decode_change(&encoded).is_err());
+    assert!(fixture.codec.decode_owned(encoded).is_err());
 }

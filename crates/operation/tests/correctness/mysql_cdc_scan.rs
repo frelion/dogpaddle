@@ -37,7 +37,7 @@ fn config() -> MySqlCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01\0\x0f".to_vec();
-    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"bootstrap_spool_bytes":1048576}"#);
+    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}"#);
     expected
 }
 

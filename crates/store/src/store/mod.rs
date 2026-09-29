@@ -110,6 +110,30 @@ pub struct Transactions {
     store_token: u64,
 }
 
+/// Groups independent transactions behind explicit durability barriers.
+///
+/// Each transaction remains atomic and becomes visible when it commits, but
+/// several successful commits can share one durable flush. Callers must invoke
+/// [`DurabilityBatch::sync`] before performing an external effect that relies
+/// on those commits and [`DurabilityBatch::finish`] before returning control
+/// to their caller.
+#[must_use = "a durability batch must be finished before returning control"]
+pub struct DurabilityBatch<'transactions> {
+    database: &'transactions Database,
+    store_token: u64,
+    pending: bool,
+}
+
+/// Owns one atomic transaction inside a [`DurabilityBatch`].
+///
+/// A successful commit is visible immediately, while durability is established
+/// by the enclosing batch's next barrier.
+#[must_use = "dropping a batched transaction rolls back its changes"]
+pub struct BatchedTransaction<'database> {
+    transaction: Transaction<'database>,
+    pending: &'database mut bool,
+}
+
 /// A shareable runtime capability for beginning read-only Store transactions.
 ///
 /// This capability is created by consuming [`Transactions`] with

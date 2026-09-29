@@ -46,7 +46,7 @@ impl TurnOperation for QueueScan {
                 }
                 Ok((
                     Action::Commit(None),
-                    AfterCommit::new(move || {
+                    AfterCommit::local(move || {
                         self.client = Some(QueueClient { position });
                         Ok(())
                     }),
@@ -68,7 +68,7 @@ impl TurnOperation for QueueScan {
             checkpoint.access(access)?.set(&next_position)?;
             Ok((
                 Action::Commit(Some(change)),
-                AfterCommit::new(move || {
+                AfterCommit::durable(move || {
                     // Dropping this closure leaves the delivery available for replay.
                     delivery.ack();
                     Ok(())

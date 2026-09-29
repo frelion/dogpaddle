@@ -16,8 +16,8 @@ use arrow_ipc::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{
     Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS,
-    MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES, decode_change, decode_change_owned,
-    decode_change_projected, encode_change, encode_change_bounded,
+    MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES, SchemaBoundChangeCodec, decode_change,
+    decode_change_owned, decode_change_projected, encode_change, encode_change_bounded,
 };
 
 use super::support::{assert_change_eq, fixture_hex, hex, representative_change};
@@ -116,6 +116,143 @@ fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
         change.diffs()
     );
     assert!(reader.next().is_none());
+}
+
+#[test]
+fn schema_bound_round_trip_omits_the_repeated_schema_and_keeps_a_stable_entry() {
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    let records =
+        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![-1])).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+
+    let encoded = codec.encode(&change).unwrap();
+    assert!(encoded.len() < encode_change(&change).unwrap().len());
+    assert_eq!(
+        codec.encode_bounded(&change, encoded.len()).unwrap(),
+        encoded
+    );
+    assert!(matches!(
+        codec.encode_bounded(&change, encoded.len() - 1),
+        Err(CodecError::EncodedSizeLimitExceeded { max_bytes })
+            if max_bytes == encoded.len() - 1
+    ));
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
+    assert_change_eq(&codec.decode_owned(encoded.clone()).unwrap(), &change);
+    assert_eq!(
+        hex(&encoded),
+        fixture_hex(include_str!("../fixtures/v1/schema_bound_zero_columns.hex"))
+    );
+}
+
+#[test]
+fn schema_bound_codec_rejects_schema_drift_with_the_same_physical_layout() {
+    let original = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let renamed = Arc::new(Schema::new(vec![Field::new(
+        "renamed",
+        DataType::UInt64,
+        false,
+    )]));
+    let original_change = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&original),
+            vec![Arc::new(UInt64Array::from(vec![7]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+    let renamed_change = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&renamed),
+            vec![Arc::new(UInt64Array::from(vec![7]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+    let original_codec = SchemaBoundChangeCodec::try_new(original).unwrap();
+    let renamed_codec = SchemaBoundChangeCodec::try_new(renamed).unwrap();
+    let encoded = original_codec.encode(&original_change).unwrap();
+
+    assert!(matches!(
+        original_codec.encode(&renamed_change),
+        Err(CodecError::SchemaMismatch)
+    ));
+    assert!(matches!(
+        renamed_codec.decode(&encoded),
+        Err(CodecError::SchemaMismatch)
+    ));
+}
+
+#[test]
+fn schema_bound_decoder_rejects_noncanonical_or_incomplete_entries() {
+    let change = representative_change();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+
+    for end in 0..encoded.len() {
+        assert!(codec.decode(&encoded[..end]).is_err());
+    }
+
+    let mut bad_marker = encoded.clone();
+    bad_marker[0] ^= 1;
+    assert!(matches!(
+        codec.decode(&bad_marker),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+
+    let mut bad_fingerprint = encoded.clone();
+    bad_fingerprint[8] ^= 1;
+    assert!(matches!(
+        codec.decode(&bad_fingerprint),
+        Err(CodecError::SchemaMismatch)
+    ));
+
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(matches!(
+        codec.decode(&trailing),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+
+    let mut repeated_batch = encoded[..encoded.len() - 8].to_vec();
+    repeated_batch.extend_from_slice(&encoded[40..]);
+    assert!(matches!(
+        codec.decode(&repeated_batch),
+        Err(CodecError::InvalidEncoding { .. })
+    ));
+}
+
+#[test]
+fn schema_bound_owned_decode_reuses_an_aligned_primitive_entry_allocation() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(UInt64Array::from(vec![7, 11, 13]))],
+    )
+    .unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1, -1, 1])).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(schema).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let allocation = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+
+    if allocation.start.is_multiple_of(align_of::<u64>()) {
+        let decoded = codec.decode_owned(encoded).unwrap();
+        let values = decoded.records().column(0).to_data();
+        let values = &values.buffers()[0];
+        let values_range = values.as_ptr() as usize..values.as_ptr() as usize + values.len();
+        assert!(allocation.start <= values_range.start);
+        assert!(values_range.end <= allocation.end);
+    }
 }
 
 #[test]

@@ -46,8 +46,8 @@ pub(super) struct ParsedChange<'encoded> {
 }
 
 pub(super) fn encode(change: &Change) -> Result<Vec<u8>, CodecError> {
-    let physical = physical_batch(change)?;
-    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
+    let physical = physical_batch(change, physical_schema(change.records().schema_ref()))?;
+    let options = write_options()?;
     let mut writer =
         StreamWriter::try_new_with_options(Vec::new(), physical.schema_ref(), options)?;
     writer.write(&physical)?;
@@ -59,14 +59,14 @@ pub(super) fn encode_bounded(
     max_bytes: usize,
     body_bytes: usize,
 ) -> Result<Vec<u8>, CodecError> {
-    let physical = physical_batch(change)?;
-    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
+    let physical = physical_batch(change, physical_schema(change.records().schema_ref()))?;
+    let options = write_options()?;
     let mut output = BoundedWriter::new(max_bytes);
     let mut writer =
         match StreamWriter::try_new_with_options(&mut output, physical.schema_ref(), options) {
             Ok(writer) => writer,
             Err(error) => {
-                return if output.limit_hit {
+                return if output.limit_hit() {
                     Err(CodecError::size_limit(max_bytes))
                 } else {
                     Err(error.into())
@@ -78,7 +78,7 @@ pub(super) fn encode_bounded(
     }
     if let Err(error) = writer.write(&physical) {
         drop(writer);
-        return if output.limit_hit {
+        return if output.limit_hit() {
             Err(CodecError::size_limit(max_bytes))
         } else {
             Err(error.into())
@@ -86,24 +86,24 @@ pub(super) fn encode_bounded(
     }
     if let Err(error) = writer.finish() {
         drop(writer);
-        return if output.limit_hit {
+        return if output.limit_hit() {
             Err(CodecError::size_limit(max_bytes))
         } else {
             Err(error.into())
         };
     }
     drop(writer);
-    Ok(output.bytes)
+    Ok(output.into_inner())
 }
 
-struct BoundedWriter {
+pub(super) struct BoundedWriter {
     bytes: Vec<u8>,
     max_bytes: usize,
     limit_hit: bool,
 }
 
 impl BoundedWriter {
-    fn new(max_bytes: usize) -> Self {
+    pub(super) fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
             max_bytes,
@@ -111,8 +111,16 @@ impl BoundedWriter {
         }
     }
 
-    fn remaining(&self) -> usize {
+    pub(super) fn remaining(&self) -> usize {
         self.max_bytes - self.bytes.len()
+    }
+
+    pub(super) const fn limit_hit(&self) -> bool {
+        self.limit_hit
+    }
+
+    pub(super) fn into_inner(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
@@ -165,7 +173,16 @@ pub(super) fn parse(encoded: &[u8]) -> Result<ParsedChange<'_>, CodecError> {
     let physical_schema = Arc::new(parse_schema(embedded_schema)?);
     let logical_schema = logical_schema(&physical_schema)?;
 
-    let batch_message = parse_message(encoded, schema_message.end, MessageHeader::RecordBatch)?;
+    parse_record_batch(encoded, schema_message.end, physical_schema, logical_schema)
+}
+
+pub(super) fn parse_record_batch(
+    encoded: &[u8],
+    offset: usize,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+) -> Result<ParsedChange<'_>, CodecError> {
+    let batch_message = parse_message(encoded, offset, MessageHeader::RecordBatch)?;
     if encoded.get(batch_message.end..) != Some(CANONICAL_EOS.as_slice()) {
         return Err(CodecError::invalid(
             "the first record batch must be followed by one canonical EOS marker and no other bytes",
@@ -620,14 +637,18 @@ fn parse_message(
     })
 }
 
-fn physical_batch(change: &Change) -> Result<RecordBatch, CodecError> {
+pub(super) fn physical_batch(
+    change: &Change,
+    physical_schema: SchemaRef,
+) -> Result<RecordBatch, CodecError> {
     let mut columns = Vec::with_capacity(change.records().num_columns() + 1);
     columns.push(Arc::new(change.diffs().clone()) as ArrayRef);
     columns.extend(change.records().columns().iter().cloned());
-    Ok(RecordBatch::try_new(
-        physical_schema(change.records().schema_ref()),
-        columns,
-    )?)
+    Ok(RecordBatch::try_new(physical_schema, columns)?)
+}
+
+pub(super) fn write_options() -> Result<IpcWriteOptions, CodecError> {
+    Ok(IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?)
 }
 
 pub(super) fn physical_schema(logical: &Schema) -> SchemaRef {

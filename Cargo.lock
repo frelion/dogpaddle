@@ -1487,6 +1487,7 @@ dependencies = [
  "arrow-data",
  "arrow-ipc",
  "arrow-schema",
+ "blake3",
  "criterion",
  "dogpaddle-perf-context",
  "flatbuffers",

@@ -1,5 +1,5 @@
 use crate::station::{Inbox, InputPort, Output, Station, StationError, StationProgram};
-use arrow_schema::SchemaRef;
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_operation::operation::Operation;
 use dogpaddle_store::{
     Cell, ReadTransactionAccess, StoreError, SubscribedLog, Subscription, TransactionAccess,
@@ -114,7 +114,7 @@ pub(crate) struct StationParts {
     active: Option<Cell<u32>>,
     input_count: usize,
     program: StationProgram,
-    output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
+    output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaBoundChangeCodec)>,
 }
 
 impl StationParts {
@@ -122,7 +122,7 @@ impl StationParts {
         active: Option<Cell<u32>>,
         input_count: usize,
         operations: Vec<Operation>,
-        output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaRef)>,
+        output: Option<(SubscribedLog<Vec<u8>>, NonZeroU64, SchemaBoundChangeCodec)>,
     ) -> Self {
         Self {
             active,
@@ -192,8 +192,8 @@ impl StationParts {
     }
 
     pub(crate) fn prepare_output(&mut self) -> Option<Arc<Output>> {
-        self.output.take().map(|(log, capacity_bytes, schema)| {
-            Arc::new(Output::new(log.writer(), capacity_bytes, schema))
+        self.output.take().map(|(log, capacity_bytes, codec)| {
+            Arc::new(Output::new(log.writer(), capacity_bytes, codec))
         })
     }
 

@@ -53,16 +53,17 @@ pub struct MySqlCdcScanSpec {
 #[derive(Clone, Debug, Serialize)]
 pub struct MySqlCdcScanDefinition {
     spec: MySqlCdcScanSpec,
+    output_projection: Vec<u32>,
     bootstrap_spool_bytes: NonZeroU64,
 }
 
 impl MySqlCdcScanDefinition {
     /// Freezes a discovered source and its private bootstrap spool capacity.
     ///
-    /// The capacity is an exact logical retained-byte ceiling: each encoded
-    /// Change contributes its full IPC byte length plus the queue's private
-    /// eight-byte sequence key. It must hold the complete initial snapshot
-    /// until publication.
+    /// The capacity is an exact logical retained-byte ceiling: each Change
+    /// contributes its actual schema-bound encoded-entry length plus the
+    /// queue's private eight-byte sequence key. It must hold the complete
+    /// initial snapshot until publication.
     ///
     /// # Errors
     ///
@@ -72,9 +73,43 @@ impl MySqlCdcScanDefinition {
         spec: MySqlCdcScanSpec,
         bootstrap_spool_bytes: NonZeroU64,
     ) -> Result<Self, MySqlCdcScanError> {
+        let output_projection = (0..spec.columns.len())
+            .map(u32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                MySqlCdcScanError::InvalidDefinition(
+                    "source column count exceeds the projection index range".to_owned(),
+                )
+            })?;
+        Self::try_new_projected(spec, output_projection, bootstrap_spool_bytes)
+    }
+
+    /// Freezes a source while exposing only the selected source columns.
+    ///
+    /// `output_projection` contains strictly increasing zero-based indexes into
+    /// the complete ordered [`MySqlCdcScanSpec::columns`]. An empty projection
+    /// preserves row counts and differences without retaining source columns in
+    /// the bootstrap spool or public output.
+    ///
+    /// The complete source Schema remains in the specification and is still
+    /// validated against every Debezium envelope and row image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid source specification, an unordered,
+    /// duplicate, or out-of-range projection, or an oversized persistent
+    /// definition.
+    pub fn try_new_projected(
+        spec: MySqlCdcScanSpec,
+        output_projection: Vec<u32>,
+        bootstrap_spool_bytes: NonZeroU64,
+    ) -> Result<Self, MySqlCdcScanError> {
         validate_spec(&spec)?;
+        super::super::ordered_projection(&output_projection, spec.columns.len())
+            .ok_or_else(invalid_projection)?;
         let definition = Self {
             spec,
+            output_projection,
             bootstrap_spool_bytes,
         };
         if encode(&definition)?.len() > MAX_DEFINITION_BYTES {
@@ -91,6 +126,12 @@ impl MySqlCdcScanDefinition {
         &self.spec
     }
 
+    /// Returns the strictly increasing source-column indexes exposed by this Scan.
+    #[must_use]
+    pub fn output_projection(&self) -> &[u32] {
+        &self.output_projection
+    }
+
     /// Returns the exact logical retained-byte limit of the bootstrap spool.
     #[must_use]
     pub const fn bootstrap_spool_bytes(&self) -> NonZeroU64 {
@@ -104,7 +145,7 @@ impl Sealed for MySqlCdcScanDefinition {
         _: crate::definition::ConstructionToken,
         _: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        schema::compile(&self.spec.columns)
+        output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
@@ -116,20 +157,20 @@ impl Sealed for MySqlCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        let output = schema::compile(&self.spec.columns).map_err(schema_error)?;
+        let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
         let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
         let config = resource.take::<MySqlCdcScanConfig>()?;
         let operation = MySqlCdcScanOperation::new_bound(
-            self.spec.clone(),
+            self,
             Arc::clone(&output),
             phase,
             checkpoint,
             spool,
-            self.bootstrap_spool_bytes,
             config,
-        );
+        )
+        .map_err(schema_error)?;
         Ok(ConstructedOperation::turn(Some(output), operation))
     }
 
@@ -161,8 +202,12 @@ pub(crate) fn decode_definition(
     }
     let payload: PersistentDefinition =
         serde_json::from_slice(payload_bytes).map_err(|_| invalid())?;
-    let definition = MySqlCdcScanDefinition::try_new(payload.spec, payload.bootstrap_spool_bytes)
-        .map_err(|_| invalid())?;
+    let definition = MySqlCdcScanDefinition::try_new_projected(
+        payload.spec,
+        payload.output_projection,
+        payload.bootstrap_spool_bytes,
+    )
+    .map_err(|_| invalid())?;
     let mut canonical = Vec::new();
     definition.encode_payload(&mut canonical);
     if canonical != payload_bytes {
@@ -175,6 +220,7 @@ pub(crate) fn decode_definition(
 #[serde(deny_unknown_fields)]
 struct PersistentDefinition {
     spec: MySqlCdcScanSpec,
+    output_projection: Vec<u32>,
     bootstrap_spool_bytes: NonZeroU64,
 }
 
@@ -218,6 +264,24 @@ fn is_uuid(value: &str) -> bool {
         })
 }
 
+fn output_schema(
+    spec: &MySqlCdcScanSpec,
+    projection: &[u32],
+) -> Result<SchemaRef, MySqlCdcScanError> {
+    let full = schema::compile(&spec.columns)?;
+    let indices = super::super::ordered_projection(projection, full.fields().len())
+        .ok_or_else(invalid_projection)?;
+    Ok(Arc::new(
+        full.project(&indices).map_err(|_| invalid_projection())?,
+    ))
+}
+
+fn invalid_projection() -> MySqlCdcScanError {
+    MySqlCdcScanError::InvalidDefinition(
+        "output projection must contain unique source columns in source order".to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -253,10 +317,49 @@ mod tests {
     }
 
     #[test]
-    fn definition_rejects_invalid_source_identity_and_schema() {
+    fn output_projection_is_ordered_and_can_be_empty() {
+        let mut spec = spec("orders");
+        spec.columns
+            .push(MySqlColumn::new("payload", MySqlType::Text, true));
+
+        let projected =
+            MySqlCdcScanDefinition::try_new_projected(spec.clone(), vec![1], capacity()).unwrap();
+        assert_eq!(projected.output_projection(), &[1]);
+        let output = (&projected as &dyn crate::OperationDefinition)
+            .output_schema(&[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.fields().len(), 1);
+        assert_eq!(output.field(0).name(), "payload");
+        assert!(output.field(0).is_nullable());
+
+        let empty =
+            MySqlCdcScanDefinition::try_new_projected(spec.clone(), vec![], capacity()).unwrap();
+        assert!(
+            (&empty as &dyn crate::OperationDefinition)
+                .output_schema(&[])
+                .unwrap()
+                .unwrap()
+                .fields()
+                .is_empty()
+        );
+
+        for invalid in [vec![0, 0], vec![1, 0], vec![2]] {
+            assert!(
+                MySqlCdcScanDefinition::try_new_projected(spec.clone(), invalid, capacity())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn source_identity_is_checked_at_definition_and_schema_at_binding() {
+        let mut no_columns = spec("orders");
+        no_columns.columns.clear();
+        assert!(MySqlCdcScanDefinition::try_new(no_columns, capacity()).is_err());
+
         let column = |data_type| MySqlColumn::new("id", data_type, false);
         for columns in [
-            vec![],
             vec![MySqlColumn::new("", MySqlType::Int64, false)],
             vec![MySqlColumn::new(
                 "$dogpaddle.value",
@@ -283,18 +386,12 @@ mod tests {
         ] {
             let mut candidate = spec("orders");
             candidate.columns = columns;
-            if let Ok(definition) = MySqlCdcScanDefinition::try_new(candidate, capacity()) {
-                let mut setup = dogpaddle_store::StoreSetup::new();
-                assert!(
-                    (&definition as &dyn crate::OperationDefinition)
-                        .construct(
-                            &[],
-                            &mut setup.data_scope().scoped("operation"),
-                            crate::RuntimeResource::none()
-                        )
-                        .is_err()
-                );
-            }
+            let definition = MySqlCdcScanDefinition::try_new(candidate, capacity()).unwrap();
+            assert!(
+                (&definition as &dyn crate::OperationDefinition)
+                    .output_schema(&[])
+                    .is_err()
+            );
         }
         for (server_uuid, table_id) in [
             ("not-a-uuid".into(), 1),

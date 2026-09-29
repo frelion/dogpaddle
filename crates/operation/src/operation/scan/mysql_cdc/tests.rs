@@ -1,13 +1,16 @@
+use std::sync::Arc;
+
 use arrow_array::{
     Array, BinaryArray, Decimal128Array, Float64Array, Int16Array, Int32Array, Int64Array,
     StringArray,
 };
+use arrow_schema::Schema;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
 use super::{
-    MySqlCdcScanError, MySqlColumn, MySqlType,
+    MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType,
     convert::{SnapshotProgress, convert_snapshot_values, convert_values},
     schema,
 };
@@ -15,6 +18,21 @@ use crate::operation::scan::cdc_runtime::Captured;
 
 fn column(data_type: MySqlType) -> MySqlColumn {
     MySqlColumn::new("value", data_type, true)
+}
+
+fn spec(columns: &[MySqlColumn]) -> MySqlCdcScanSpec {
+    MySqlCdcScanSpec {
+        engine_name: "source".to_owned(),
+        database: "shop".to_owned(),
+        table: "events".to_owned(),
+        server_uuid: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        table_id: 43,
+        columns: columns.to_vec(),
+    }
+}
+
+fn identity_projection(columns: &[MySqlColumn]) -> Vec<u32> {
+    (0..u32::try_from(columns.len()).unwrap()).collect()
 }
 
 fn envelope(columns: &[MySqlColumn], op: &str, before: Value, after: Value) -> Value {
@@ -52,20 +70,43 @@ fn envelope(columns: &[MySqlColumn], op: &str, before: Value, after: Value) -> V
 }
 
 fn convert(columns: &[MySqlColumn], events: &[Value]) -> Result<Option<Change>, MySqlCdcScanError> {
+    let projection = identity_projection(columns);
+    convert_projected(columns, &projection, events)
+}
+
+fn convert_projected(
+    columns: &[MySqlColumn],
+    projection: &[u32],
+    events: &[Value],
+) -> Result<Option<Change>, MySqlCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
         .collect::<Vec<_>>();
+    let output_schema = projected_schema(columns, projection)?;
     convert_values(
-        columns,
-        schema::compile(columns)?,
-        "source",
-        "shop",
-        "events",
+        &spec(columns),
+        projection,
+        output_schema,
         bytes
             .iter()
             .map(|bytes| (Some("source.shop.events"), Some(bytes.as_slice()))),
     )
+}
+
+fn projected_schema(
+    columns: &[MySqlColumn],
+    projection: &[u32],
+) -> Result<Arc<Schema>, MySqlCdcScanError> {
+    let full_schema = schema::compile(columns)?;
+    let fields = projection
+        .iter()
+        .map(|index| full_schema.fields()[usize::try_from(*index).unwrap()].clone())
+        .collect::<Vec<_>>();
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        full_schema.metadata().clone(),
+    )))
 }
 
 fn heartbeat() -> Value {
@@ -94,16 +135,24 @@ fn snapshot_after(
     events: &[Value],
     progress: SnapshotProgress,
 ) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
+    let projection = identity_projection(columns);
+    snapshot_after_projected(columns, &projection, events, progress)
+}
+
+fn snapshot_after_projected(
+    columns: &[MySqlColumn],
+    projection: &[u32],
+    events: &[Value],
+    progress: SnapshotProgress,
+) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
         .collect::<Vec<_>>();
     convert_snapshot_values(
-        columns,
-        schema::compile(columns)?,
-        "source",
-        "shop",
-        "events",
+        &spec(columns),
+        projection,
+        projected_schema(columns, projection)?,
         bytes.iter().enumerate().map(|(index, bytes)| {
             let topic = match events[index]["schema"]["name"].as_str() {
                 Some("io.debezium.connector.common.Heartbeat") => "__debezium-heartbeat.source",
@@ -148,6 +197,83 @@ fn mysql_cdc_conversion_preserves_insert_update_delete_event_order() {
         .flat_map(|change| change.diffs().values().iter().copied())
         .collect::<Vec<_>>();
     assert_eq!(diffs, change.diffs().values().as_ref());
+}
+
+#[test]
+fn mysql_cdc_projection_validates_full_rows_and_preserves_zero_column_row_count() {
+    let columns = [
+        MySqlColumn::new("id", MySqlType::Int64, false),
+        MySqlColumn::new("payload", MySqlType::Text, false),
+        MySqlColumn::new("unused", MySqlType::Binary, false),
+    ];
+    let event = envelope(
+        &columns,
+        "c",
+        Value::Null,
+        json!({"id":7,"payload":"kept","unused":BASE64_STANDARD.encode([1, 2, 3].repeat(2048))}),
+    );
+
+    let projected = convert_projected(&columns, &[1], std::slice::from_ref(&event))
+        .unwrap()
+        .unwrap();
+    assert_eq!(projected.records().num_columns(), 1);
+    assert_eq!(projected.records().schema().field(0).name(), "payload");
+    assert_eq!(
+        projected
+            .records()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "kept"
+    );
+
+    let empty = convert_projected(&columns, &[], std::slice::from_ref(&event))
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.records().num_columns(), 0);
+    assert_eq!(empty.records().num_rows(), 1);
+    assert_eq!(empty.diffs().values(), &[1]);
+
+    let malformed_base64 = format!("{}!", event["payload"]["after"]["unused"].as_str().unwrap());
+    let mut malformed = event.clone();
+    malformed["payload"]["after"]["unused"] = json!(malformed_base64);
+    assert!(convert_projected(&columns, &[], &[malformed]).is_err());
+
+    let mut incomplete = event;
+    incomplete["payload"]["after"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unused");
+    assert!(convert_projected(&columns, &[], &[incomplete]).is_err());
+}
+
+#[test]
+fn mysql_cdc_projection_rejects_bad_unselected_values_in_streaming_and_capture() {
+    let columns = [
+        MySqlColumn::new("id", MySqlType::Int64, false),
+        MySqlColumn::new("unused", MySqlType::Int32, false),
+    ];
+    let projections: [&[u32]; 2] = [&[0], &[]];
+
+    for projection in projections {
+        let row = json!({"id":7,"unused":"bad"});
+        let streaming = envelope(&columns, "c", Value::Null, row.clone());
+        assert!(convert_projected(&columns, projection, &[streaming]).is_err());
+
+        let mut capture_event = envelope(&columns, "r", Value::Null, row);
+        capture_event["payload"]["source"]["snapshot"] = json!("last");
+        assert!(
+            snapshot_after_projected(
+                &columns,
+                projection,
+                &[capture_event],
+                SnapshotProgress::default(),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -283,11 +409,9 @@ fn mysql_cdc_conversion_rejects_snapshot_truncate_schema_change_and_wrong_metada
     let schema_change = serde_json::to_vec(&json!({"schema":{},"payload":{}})).unwrap();
     assert!(
         convert_values(
-            &columns,
+            &spec(&columns),
+            &identity_projection(&columns),
             schema::compile(&columns).unwrap(),
-            "source",
-            "shop",
-            "events",
             [(Some("source"), Some(schema_change.as_slice()))],
         )
         .is_err()
@@ -307,11 +431,9 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
     let heartbeat = serde_json::to_vec(&heartbeat()).unwrap();
     assert!(
         convert_values(
-            &columns,
+            &spec(&columns),
+            &identity_projection(&columns),
             schema::compile(&columns).unwrap(),
-            "source",
-            "shop",
-            "events",
             [(
                 Some("__debezium-heartbeat.source"),
                 Some(heartbeat.as_slice())

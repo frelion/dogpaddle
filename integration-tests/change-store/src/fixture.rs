@@ -4,25 +4,32 @@ use arrow_array::{
     ArrayRef, BinaryArray, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
     types::Int64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, ChangeProjection, encode_change};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 
 /// Logical Changes paired with the exact bytes stored in a `SubscribedLog`.
 pub struct EncodedChanges {
+    /// Codec shared by every entry in this exact-Schema resource.
+    pub codec: SchemaBoundChangeCodec,
     /// Changes in durable log order.
     pub changes: Vec<Change>,
-    /// One complete Arrow IPC Stream per Change.
+    /// One schema-bound entry per Change.
     pub encoded: Vec<Vec<u8>>,
 }
 
 impl EncodedChanges {
-    fn new(changes: Vec<Change>) -> Self {
+    fn new(schema: SchemaRef, changes: Vec<Change>) -> Self {
         assert!(!changes.is_empty(), "a seam workload must not be empty");
+        let codec = SchemaBoundChangeCodec::try_new(schema).expect("bind fixture Change Schema");
         let encoded = changes
             .iter()
-            .map(|change| encode_change(change).expect("encode fixture Change"))
+            .map(|change| codec.encode(change).expect("encode fixture Change"))
             .collect();
-        Self { changes, encoded }
+        Self {
+            codec,
+            changes,
+            encoded,
+        }
     }
 
     /// Returns an order-sensitive checksum of the exact encoded entries.
@@ -32,16 +39,14 @@ impl EncodedChanges {
     }
 }
 
-/// A sliced nested Change and its full and projected expectations.
-pub struct ProjectableFixture {
-    /// Full Change with non-zero Arrow array offsets.
+/// A sliced nested Change and its exact schema-bound encoding.
+pub struct EncodedChange {
+    /// Codec bound to the resource's exact Schema.
+    pub codec: SchemaBoundChangeCodec,
+    /// Change with non-zero Arrow array offsets.
     pub change: Change,
-    /// Complete self-describing Stream for `change`.
+    /// Schema-bound entry for `change`.
     pub encoded: Vec<u8>,
-    /// Schema-bound top-level projection.
-    pub projection: ChangeProjection,
-    /// Expected projected Change.
-    pub projected: Change,
 }
 
 /// Builds a nested, variable-width Change whose arrays start at a non-zero offset.
@@ -50,8 +55,8 @@ pub struct ProjectableFixture {
 ///
 /// Panics when `rows` or `payload_bytes` is zero or fixture dimensions overflow.
 #[must_use]
-pub fn projectable_fixture(seed: u64, rows: usize, payload_bytes: usize) -> ProjectableFixture {
-    assert!(rows > 0, "a projectable fixture must contain a row");
+pub fn nested_change_fixture(seed: u64, rows: usize, payload_bytes: usize) -> EncodedChange {
+    assert!(rows > 0, "a nested fixture must contain a row");
     assert!(payload_bytes > 0, "payload width must be non-zero");
     let source_rows = rows.checked_add(2).expect("fixture row count fits usize");
     let ids = fixture_ids(seed, source_rows);
@@ -99,61 +104,58 @@ pub fn projectable_fixture(seed: u64, rows: usize, payload_bytes: usize) -> Proj
         Field::new("values", columns[3].data_type().clone(), true),
         Field::new("tail", DataType::UInt64, false),
     ]));
-    let records = RecordBatch::try_new(schema, columns).expect("construct projectable fixture");
+    let records = RecordBatch::try_new(schema, columns).expect("construct nested fixture");
     let source = Change::try_new(records, Int64Array::from(vec![1; source_rows]))
-        .expect("construct valid projectable Change");
+        .expect("construct valid nested Change");
     let change = source
         .try_slice(1, rows)
-        .expect("slice projectable Change at a non-zero offset");
-    let projection = ChangeProjection::try_new(change.schema(), [0, 2, 3, 4])
-        .expect("bind projectable fixture projection");
-    let projected = change
-        .try_project(&projection)
-        .expect("project fixture Change");
-    let encoded = encode_change(&change).expect("encode projectable fixture");
-    ProjectableFixture {
+        .expect("slice nested Change at a non-zero offset");
+    let codec =
+        SchemaBoundChangeCodec::try_new(change.schema()).expect("bind nested Change Schema");
+    let encoded = codec.encode(&change).expect("encode nested fixture");
+    EncodedChange {
+        codec,
         change,
         encoded,
-        projection,
-        projected,
     }
 }
 
-/// Builds alternating schemas and entry widths for the regular seam benchmark.
+/// Builds fixed-schema Changes with alternating entry widths for the seam benchmark.
 ///
 /// # Panics
 ///
 /// Panics when fewer than two entries are requested, dimensions are zero, or
 /// fixture dimensions overflow.
 #[must_use]
-pub fn heterogeneous_changes_fixture(
+pub fn fixed_schema_changes_fixture(
     entries: usize,
     rows: usize,
     payload_bytes: usize,
 ) -> EncodedChanges {
     assert!(
         entries >= 2,
-        "heterogeneous workload needs at least two entries"
+        "fixed-schema workload needs at least two entries"
     );
     assert!(rows > 0, "a Change fixture must contain a row");
     assert!(payload_bytes > 0, "payload width must be non-zero");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::UInt64, false),
+        Field::new("payload", DataType::Binary, false),
+        Field::new("tail", DataType::UInt64, false),
+    ]));
     let mut start = 1_000_u64;
     let mut changes = Vec::with_capacity(entries);
     for ordinal in 0..entries {
-        let change = if ordinal.is_multiple_of(2) {
-            scalar_change(start, rows)
-        } else {
-            let width = payload_bytes
-                .checked_mul(ordinal % 3 + 1)
-                .expect("fixture payload width fits usize");
-            wide_change(start, rows, width)
-        };
+        let width = payload_bytes
+            .checked_mul(ordinal % 3 + 1)
+            .expect("fixture payload width fits usize");
+        let change = wide_change(Arc::clone(&schema), start, rows, width);
         start = start
             .checked_add(u64::try_from(rows).expect("row count fits u64"))
             .expect("fixture id fits u64");
         changes.push(change);
     }
-    EncodedChanges::new(changes)
+    EncodedChanges::new(schema, changes)
 }
 
 /// Builds a fixed-schema, variable-width Change.
@@ -162,7 +164,7 @@ pub fn heterogeneous_changes_fixture(
 ///
 /// Panics when `rows` or `payload_bytes` is zero or fixture dimensions overflow.
 #[must_use]
-fn wide_change(start: u64, rows: usize, payload_bytes: usize) -> Change {
+fn wide_change(schema: SchemaRef, start: u64, rows: usize, payload_bytes: usize) -> Change {
     assert!(rows > 0, "a Change fixture must contain a row");
     assert!(payload_bytes > 0, "payload width must be non-zero");
     let ids = fixture_ids(start, rows);
@@ -184,23 +186,8 @@ fn wide_change(start: u64, rows: usize, payload_bytes: usize) -> Change {
                 .collect::<Vec<_>>(),
         )),
     ];
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("event_id", DataType::UInt64, false),
-        Field::new("payload", DataType::Binary, false),
-        Field::new("tail", DataType::UInt64, false),
-    ]));
     let records = RecordBatch::try_new(schema, columns).expect("construct wide fixture");
     Change::try_new(records, Int64Array::from(vec![1; rows])).expect("construct valid wide Change")
-}
-
-/// Asserts complete logical equality between two Changes.
-///
-/// # Panics
-///
-/// Panics when schemas, arrays, row order, or differences differ.
-pub fn assert_change_eq(actual: &Change, expected: &Change) {
-    assert_eq!(actual.records(), expected.records());
-    assert_eq!(actual.diffs(), expected.diffs());
 }
 
 fn order_checksum<I, B>(entries: I) -> u64
@@ -221,26 +208,6 @@ where
                     (state ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
                 })
         })
-}
-
-fn scalar_change(start: u64, rows: usize) -> Change {
-    let values = fixture_ids(start, rows);
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::UInt64,
-        false,
-    )]));
-    let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(values))])
-        .expect("construct scalar fixture");
-    Change::try_new(
-        records,
-        Int64Array::from(
-            (0..rows)
-                .map(|row| if row.is_multiple_of(3) { 2 } else { 1 })
-                .collect::<Vec<_>>(),
-        ),
-    )
-    .expect("construct valid scalar Change")
 }
 
 fn fixture_ids(start: u64, rows: usize) -> Vec<u64> {

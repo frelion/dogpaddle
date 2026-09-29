@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, path::Path, sync::Arc};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, encode_change};
+use dogpaddle_change::Change;
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowFactory};
 use dogpaddle_operation::{
     col,
@@ -16,6 +16,8 @@ use dogpaddle_operation::{
     },
 };
 use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, Store, SubscribedLog};
+
+use super::support::encode_output_entry;
 
 const CAPACITY: NonZeroU64 = NonZeroU64::MAX;
 const ROW_COUNT: usize = 1_025;
@@ -294,8 +296,8 @@ fn publish_input_changes(path: &Path) {
 }
 
 fn publish_changes(path: &Path, left_change: &Change, right_change: &Change) {
-    let left_change = encode_change(left_change).unwrap();
-    let right_change = encode_change(right_change).unwrap();
+    let left_change = encode_output_entry(left_change);
+    let right_change = encode_output_entry(right_change);
     let store = Store::open(path).unwrap();
     let left_position: Cell<u64> = store
         .open_data("station/00000000/operation/00000000/sequence_scan.position")
@@ -333,7 +335,7 @@ fn publish_changes(path: &Path, left_change: &Change, right_change: &Change) {
 }
 
 fn publish_right_change(path: &Path, change: &Change) {
-    let change = encode_change(change).unwrap();
+    let change = encode_output_entry(change);
     let store = Store::open(path).unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
     let mut transactions = store.into_transactions();
@@ -362,7 +364,7 @@ fn drive_right_rematch_to_page(path: &Path) -> Vec<u8> {
 }
 
 fn append_join_output_blocker(path: &Path) -> u64 {
-    let blocker = encode_change(&pair_change(0, 0)).unwrap();
+    let blocker = encode_output_entry(&pair_change(0, 0));
     let store = Store::open(path).unwrap();
     let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
     let mut transactions = store.into_transactions();

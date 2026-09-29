@@ -1,4 +1,8 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    num::NonZeroU32,
+    sync::Arc,
+};
 
 use arrow_schema::SchemaRef;
 use datafusion_common::{
@@ -15,7 +19,10 @@ use datafusion_expr::{
     utils::{find_valid_equijoin_key_pair, split_conjunction_owned},
 };
 use datafusion_functions_aggregate::planner::AggregateFunctionPlanner;
-use datafusion_optimizer::{Analyzer, analyzer::type_coercion::TypeCoercion};
+use datafusion_optimizer::{
+    Analyzer, Optimizer, OptimizerContext, analyzer::type_coercion::TypeCoercion,
+    optimize_projections::OptimizeProjections,
+};
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::sqlparser::ast::Statement;
 use dogpaddle_flow::{FlowFactory, OperationRef};
@@ -56,7 +63,7 @@ struct PlanningContext {
 }
 
 impl PlanningContext {
-    fn new(scans: &[Box<dyn OperationDefinition>]) -> Result<Self, SqlError> {
+    fn new(scans: &[&dyn OperationDefinition]) -> Result<Self, SqlError> {
         let mut options = ConfigOptions::default();
         options.sql_parser.map_string_types_to_utf8view = false;
         let sources = scans
@@ -67,7 +74,7 @@ impl PlanningContext {
                     internal_scan_name(index),
                     Arc::new(ScanSource {
                         index,
-                        schema: scan_schema(scan.as_ref())?,
+                        schema: scan_schema(*scan)?,
                     }),
                 ))
             })
@@ -142,27 +149,46 @@ impl ContextProvider for PlanningContext {
 
 pub(crate) fn plan(
     query: datafusion_sql::sqlparser::ast::Query,
-    scans: &[Box<dyn OperationDefinition>],
+    scans: &[&dyn OperationDefinition],
 ) -> Result<LogicalPlan, SqlError> {
     let context = PlanningContext::new(scans)?;
     let plan = SqlToRel::new(&context).sql_statement_to_plan(Statement::Query(Box::new(query)))?;
-    Analyzer::with_rules(vec![Arc::new(TypeCoercion::new())])
+    let plan = Analyzer::with_rules(vec![Arc::new(TypeCoercion::new())])
         .execute_and_check(plan, &context.options, |_, _| {})
+        .map_err(SqlError::from)?;
+    let optimizer = Optimizer::with_rules(vec![Arc::new(OptimizeProjections::new())]);
+    let optimizer_context =
+        OptimizerContext::new_with_config_options(Arc::new(context.options.clone()));
+    optimizer
+        .optimize(plan, &optimizer_context, |_, _| {})
         .map_err(Into::into)
 }
 
 pub(crate) fn lower_query(
     plan: &LogicalPlan,
     scans: Vec<Box<dyn OperationDefinition>>,
+    scan_projections: Vec<Option<Vec<usize>>>,
     factory: &mut FlowFactory,
 ) -> Result<OperationRef, SqlError> {
+    if scan_projections.len() != scans.len() {
+        return Err(SqlError::invalid(
+            "scan projection count differs from the declared scans",
+        ));
+    }
     let mut lowerer = Lowerer {
         factory,
         next_transform: 0,
         scans: scans.into_iter().map(Some).collect(),
         scan_nodes: HashMap::new(),
+        scan_projections,
     };
     let output = lowerer.lower(plan)?;
+    // Join lowering keeps unique physical names so parent expressions remain
+    // unambiguous. The optimizer can remove the root projection that would
+    // otherwise restore the SQL names, so bind the final positional Schema.
+    let output_schema = Arc::new(plan.schema().as_arrow().clone());
+    let output_positions = (0..output_schema.fields().len()).collect::<Vec<_>>();
+    let output = lowerer.project_columns(output, &output_positions, &output_schema)?;
     if lowerer.scans.iter().any(Option::is_some) {
         return Err(SqlError::invalid(
             "every declared scan must be reachable from the query result",
@@ -192,6 +218,7 @@ struct Lowerer<'a> {
     next_transform: usize,
     scans: Vec<Option<Box<dyn OperationDefinition>>>,
     scan_nodes: HashMap<usize, LoweredRelation>,
+    scan_projections: Vec<Option<Vec<usize>>>,
 }
 
 impl Lowerer<'_> {
@@ -435,56 +462,101 @@ impl Lowerer<'_> {
         &mut self,
         scan: &datafusion_expr::logical_plan::TableScan,
     ) -> Result<LoweredRelation, SqlError> {
-        if scan.projection.is_some() || !scan.filters.is_empty() || scan.fetch.is_some() {
+        if !scan.filters.is_empty() || scan.fetch.is_some() {
             return Err(SqlError::invalid(
-                "DataFusion embedded projection, filter, or fetch in a scan",
+                "DataFusion embedded filter or fetch in a scan",
             ));
         }
         let source = scan
             .source
             .downcast_ref::<ScanSource>()
             .ok_or_else(|| SqlError::invalid("logical plan contains a foreign table source"))?;
-        if let Some(node) = self.scan_nodes.get(&source.index) {
-            return Ok(node.clone());
-        }
-        let definition = self
-            .scans
-            .get_mut(source.index)
-            .and_then(Option::take)
-            .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
-        let node = self
-            .factory
-            .operation(scan_operation_id(source.index), definition, []);
-        let relation = LoweredRelation {
-            node,
-            physical_schema: Arc::clone(&source.schema),
+        let occurrence = scan_projection(scan, source)?;
+        let shared = if let Some(node) = self.scan_nodes.get(&source.index) {
+            node.clone()
+        } else {
+            let definition = self
+                .scans
+                .get_mut(source.index)
+                .and_then(Option::take)
+                .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
+            let physical_schema = definition
+                .output_schema(&[])
+                .map_err(SqlError::endpoint)?
+                .ok_or_else(|| SqlError::invalid("scan definition has no output Schema"))?;
+            let node = self
+                .factory
+                .operation(scan_operation_id(source.index), definition, []);
+            let relation = LoweredRelation {
+                node,
+                physical_schema,
+            };
+            let projection = self
+                .scan_projections
+                .get(source.index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?
+                .clone();
+            let schema =
+                Arc::new(source.schema.project(&projection).map_err(|_| {
+                    SqlError::invalid("scan projection is outside its source Schema")
+                })?);
+            let relation = if relation.physical_schema.as_ref() == source.schema.as_ref() {
+                self.project_columns(relation, &projection, &schema)?
+            } else if relation.physical_schema.as_ref() == schema.as_ref() {
+                relation
+            } else {
+                return Err(SqlError::invalid(
+                    "scan Definition output differs from its full and shared projected Schemas",
+                ));
+            };
+            self.scan_nodes.insert(source.index, relation.clone());
+            relation
         };
-        self.scan_nodes.insert(source.index, relation.clone());
-        Ok(relation)
+        let shared_projection = self.scan_projections[source.index]
+            .as_ref()
+            .expect("a lowered scan occurrence was collected first");
+        let positions = occurrence
+            .iter()
+            .map(|index| {
+                shared_projection.binary_search(index).map_err(|_| {
+                    SqlError::invalid("scan occurrence projection is outside its shared projection")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = Arc::new(scan.projected_schema.as_arrow().clone());
+        self.project_columns(shared, &positions, &schema)
     }
 
-    fn align_union_input(
+    fn project_columns(
         &mut self,
         input: LoweredRelation,
-        union_schema: &DFSchema,
+        positions: &[usize],
+        target: &SchemaRef,
     ) -> Result<LoweredRelation, SqlError> {
-        if input.physical_schema.as_ref() == union_schema.as_arrow() {
-            return Ok(input);
-        }
-        if input.physical_schema.fields().len() != union_schema.fields().len() {
+        if positions.len() != target.fields().len()
+            || positions
+                .iter()
+                .any(|position| *position >= input.physical_schema.fields().len())
+        {
             return Err(SqlError::invalid(
-                "DataFusion produced incompatible UNION ALL field counts",
+                "DataFusion projection and physical output shape diverged",
             ));
         }
-        let fields = input
-            .physical_schema
-            .fields()
+        if input.physical_schema.as_ref() == target.as_ref()
+            && positions.iter().copied().eq(0..positions.len())
+        {
+            return Ok(input);
+        }
+        let fields = positions
             .iter()
-            .zip(union_schema.fields())
-            .map(|(source, target)| {
+            .zip(target.fields())
+            .map(|(position, target)| {
                 SchemaAlignField::try_new_with_metadata(
                     target.name().to_owned(),
-                    Expr::Column(Column::new_unqualified(source.name())),
+                    Expr::Column(Column::new_unqualified(
+                        input.physical_schema.field(*position).name(),
+                    )),
                     target.is_nullable(),
                     target.metadata().clone(),
                 )
@@ -492,9 +564,19 @@ impl Lowerer<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let definition =
-            SchemaAlignDefinition::try_new_with_metadata(fields, union_schema.metadata().clone())
+            SchemaAlignDefinition::try_new_with_metadata(fields, target.metadata().clone())
                 .map_err(SqlError::endpoint)?;
         self.add_transform([input], definition)
+    }
+
+    fn align_union_input(
+        &mut self,
+        input: LoweredRelation,
+        union_schema: &DFSchema,
+    ) -> Result<LoweredRelation, SqlError> {
+        let target = Arc::new(union_schema.as_arrow().clone());
+        let positions = (0..target.fields().len()).collect::<Vec<_>>();
+        self.project_columns(input, &positions, &target)
     }
 
     fn align_join_output(
@@ -560,6 +642,66 @@ impl Lowerer<'_> {
             physical_schema,
         })
     }
+}
+
+pub(crate) fn scan_projections(
+    plan: &LogicalPlan,
+    scan_count: usize,
+) -> Result<Vec<Option<Vec<usize>>>, SqlError> {
+    fn collect(plan: &LogicalPlan, unions: &mut [Option<BTreeSet<usize>>]) -> Result<(), SqlError> {
+        if let LogicalPlan::TableScan(scan) = plan {
+            let source = scan
+                .source
+                .downcast_ref::<ScanSource>()
+                .ok_or_else(|| SqlError::invalid("logical plan contains a foreign table source"))?;
+            let projection = scan_projection(scan, source)?;
+            unions
+                .get_mut(source.index)
+                .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?
+                .get_or_insert_with(BTreeSet::new)
+                .extend(projection);
+        }
+        for input in plan.inputs() {
+            collect(input, unions)?;
+        }
+        Ok(())
+    }
+
+    let mut unions = vec![None; scan_count];
+    collect(plan, &mut unions)?;
+    Ok(unions
+        .into_iter()
+        .map(|projection| projection.map(|indices| indices.into_iter().collect()))
+        .collect())
+}
+
+fn scan_projection(
+    scan: &datafusion_expr::logical_plan::TableScan,
+    source: &ScanSource,
+) -> Result<Vec<usize>, SqlError> {
+    let projection = scan
+        .projection
+        .clone()
+        .unwrap_or_else(|| (0..source.schema.fields().len()).collect());
+    if projection.len() != scan.projected_schema.fields().len() {
+        return Err(SqlError::invalid(
+            "DataFusion scan projection and projected Schema diverged",
+        ));
+    }
+    for (projected, index) in scan
+        .projected_schema
+        .as_arrow()
+        .fields()
+        .iter()
+        .zip(&projection)
+    {
+        if source.schema.fields().get(*index) != Some(projected) {
+            return Err(SqlError::invalid(
+                "DataFusion scan projection field differs from its source Schema",
+            ));
+        }
+    }
+    Ok(projection)
 }
 
 fn lower_aggregate_call(
@@ -816,6 +958,158 @@ fn internal_join_field_name(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use dogpaddle_operation::operation::scan::{
+        PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn, PostgresType,
+    };
+
+    fn wide_definition() -> PostgresCdcScanDefinition {
+        PostgresCdcScanDefinition::try_new(
+            PostgresCdcScanSpec {
+                engine_name: "rows".into(),
+                database: "app".into(),
+                schema: "public".into(),
+                table: "rows".into(),
+                slot: "rows_slot".into(),
+                publication: "rows_pub".into(),
+                system_identifier: "1".into(),
+                database_oid: 2,
+                table_oid: 3,
+                columns: vec![
+                    PostgresColumn::new("id", PostgresType::Int64, false),
+                    PostgresColumn::new("payload", PostgresType::Text, true),
+                    PostgresColumn::new("bucket", PostgresType::Int32, false),
+                    PostgresColumn::new("unused", PostgresType::Bytea, true),
+                ],
+            },
+            NonZeroU64::new(1024).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn wide_scan() -> Box<dyn OperationDefinition> {
+        Box::new(wide_definition())
+    }
+
+    fn plan_sql(sql: &str, scans: &[Box<dyn OperationDefinition>]) -> LogicalPlan {
+        let (_, query, endpoints) = crate::syntax::parse(sql).unwrap();
+        assert_eq!(endpoints.len(), scans.len());
+        let scans = scans.iter().map(Box::as_ref).collect::<Vec<_>>();
+        plan(query, &scans).unwrap()
+    }
+
+    fn table_scans<'a>(
+        plan: &'a LogicalPlan,
+        output: &mut Vec<&'a datafusion_expr::logical_plan::TableScan>,
+    ) {
+        if let LogicalPlan::TableScan(scan) = plan {
+            output.push(scan);
+        }
+        for input in plan.inputs() {
+            table_scans(input, output);
+        }
+    }
+
+    #[test]
+    fn projection_optimization_prunes_join_and_aggregate_inputs() {
+        let scans = vec![wide_scan(), wide_scan()];
+        let plan = plan_sql(
+            "INSERT INTO discard() \
+             SELECT left_rows.bucket, COUNT(left_rows.payload) \
+             FROM postgres_cdc( \
+                 connection => 'postgresql://user:secret@127.0.0.1/app', \
+                 table => 'public.left_rows', publication => 'left_rows_pub' \
+             ) AS left_rows \
+             JOIN postgres_cdc( \
+                 connection => 'postgresql://user:secret@127.0.0.1/app', \
+                 table => 'public.right_rows', publication => 'right_rows_pub' \
+             ) AS right_rows \
+             ON left_rows.id = right_rows.id \
+             GROUP BY left_rows.bucket",
+            &scans,
+        );
+
+        assert_eq!(
+            scan_projections(&plan, scans.len()).unwrap(),
+            [Some(vec![0, 1, 2]), Some(vec![0])]
+        );
+    }
+
+    #[test]
+    fn repeated_scan_uses_one_union_projection_and_branch_subsets() {
+        let scans = vec![wide_scan()];
+        let plan = plan_sql(
+            "INSERT INTO discard() \
+             WITH rows AS ( \
+                 SELECT id, payload, bucket, unused \
+                 FROM postgres_cdc( \
+                     connection => 'postgresql://user:secret@127.0.0.1/app', \
+                     table => 'public.rows', publication => 'rows_pub' \
+                 ) \
+             ) \
+             SELECT left_rows.payload \
+             FROM rows AS left_rows \
+             JOIN rows AS right_rows ON left_rows.id = right_rows.id",
+            &scans,
+        );
+        let projections = scan_projections(&plan, scans.len()).unwrap();
+        assert_eq!(projections, [Some(vec![0, 1])]);
+
+        let full = wide_definition();
+        let projected = Box::new(
+            PostgresCdcScanDefinition::try_new_projected(
+                full.spec().clone(),
+                vec![0, 1],
+                full.bootstrap_spool_bytes(),
+            )
+            .unwrap(),
+        ) as Box<dyn OperationDefinition>;
+
+        let mut occurrences = Vec::new();
+        table_scans(&plan, &mut occurrences);
+        assert_eq!(occurrences.len(), 2);
+        let mut factory = FlowFactory::new("unused-column-pruning-test-state");
+        let mut lowerer = Lowerer {
+            factory: &mut factory,
+            next_transform: 0,
+            scans: vec![Some(projected)],
+            scan_nodes: HashMap::new(),
+            scan_projections: projections,
+        };
+        let mut schemas = occurrences
+            .into_iter()
+            .map(|scan| {
+                lowerer
+                    .lower_scan(scan)
+                    .unwrap()
+                    .physical_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        schemas.sort();
+
+        assert_eq!(
+            schemas,
+            [
+                vec!["id".to_owned()],
+                vec!["id".to_owned(), "payload".to_owned()]
+            ]
+        );
+        assert_eq!(
+            lowerer.scan_nodes[&0]
+                .physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id", "payload"]
+        );
+        assert_eq!(lowerer.next_transform, 1);
+    }
 
     #[test]
     fn native_asof_comparisons_map_to_direction_and_exactness() {

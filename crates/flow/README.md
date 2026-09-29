@@ -17,6 +17,11 @@
 之间的连接都经过 producer 在 `RocksDB` 中的持久输出；同一 Station 内的 Operation 直接传递内存中的
 `Change`。一个输出分叉时，下游共享这份日志，但各自保存读取位置。
 
+每个持久输出在 build/open 的 Schema 传播阶段构造一个绑定 exact logical Schema 的 Change codec。
+日志 entry 只保存固定格式标记、Schema fingerprint、一个未压缩 Arrow IPC batch 和 EOS，不再为每个
+Change 重复完整 Arrow IPC Schema。所有下游输入共享 producer 的同一个 codec；Schema identity 检查、
+编码和解码因此只有这一处事实来源。
+
 ```text
                     一个 Station                         另一个 Station
              ┌─────────────────────────┐              ┌──────────────┐
@@ -48,7 +53,8 @@
 3. Flow 开启一笔 `RocksDB` 写事务，执行首 Operation 已准备好的工作，再依次执行 Station 内的尾部 Operation。
 4. 把最后一个 Operation 的输出追加到 Station 的持久队列。
 5. 如果首 Operation 已完整处理输入，在同一事务中推进输入队列的订阅位置。
-6. 提交成功后，才执行外部 ACK 等 `AfterCommit` 动作。
+6. 事务提交后立即对本轮后续 Station 可见；纯 Store turn 的 WAL record 在本轮共用一次最终写出与持久化 barrier。
+7. 有外部 ACK 等 `AfterCommit` 时，先完成此前全部 WAL 的持久化 barrier，再执行该动作。
 
 首 Operation 用三种动作描述事务结果：
 
@@ -65,6 +71,10 @@
 多输入 Station 如果刚切换过端口，之前提交的端口选择仍然保留，因此这一轮 Flow 仍报告发生了进展。
 如果 Store 已提交而外部 `AfterCommit` 失败，当前运行实例会停止继续调度；调用方必须丢弃它并 `open`，
 让 Operation 从持久状态恢复。
+
+一轮 `advance` 在成功返回或返回普通处理错误前也会完成最终 barrier。这样线性流水线不再为每个推进的
+Station 串行等待一次磁盘同步，同时仍保证宿主收到结果、外部系统收到 ACK 之前，本轮此前的本地状态已经持久化。
+barrier 本身失败时，此 barrier 覆盖的全部 Station 都进入 fail-stop，必须整体 reopen 后再调度。
 
 ### 3. 多输入为什么需要“固定端口”
 
@@ -180,7 +190,8 @@ Station 首项并吸收后续 Atomic；Sink 独占。
 2. 稳定编码声明，再立即解码；后续只使用这份即将持久化的 canonical（规范化）Definition。
 3. 在创建 Store 前全图检查所有 Station 资源的存在与精确类型。
 4. 创建纯内存 `StoreSetup`；按拓扑传播 Arrow Schema，并按 Station 内顺序让每个 Definition 通过统一
-   `construct` 入口直接声明或打开 typed data、构造最终运行 Operation，再传播它的最终 output Schema。
+   `construct` 入口直接声明或打开 typed data、构造最终运行 Operation，再传播它的最终 output Schema，
+   为实际持久输出构造 Schema-bound Change codec。
 5. 所有构造成功后才在 `commit` 时创建状态目录，并在同一事务中初始化 Station 输出、订阅位置和发布
    Flow Definition。
 
@@ -233,9 +244,10 @@ Flow 不读取算子内部布局、不枚举具体算子，也不会重新决定
 - 每个 Station 最终输出的 `SubscribedLog` 及每条下游边的订阅位置；
 - 多输入 Station 当前固定的输入端口。
 
-内存 Claim、调度顺序、运行连接、物理表达式和派生 Schema 不单独持久化。`open` 从 Definition 和输入
-Schema 确定性重建它们。Operation 状态的完整资源名包含 Station 与 Operation 的序号，因此同一 Station
-中的多个 Operation 不会冲突。
+内存 Claim、调度顺序、运行连接、物理表达式和派生 Schema 不单独保存为独立资源。`open` 从 Definition
+和输入 Schema 确定性重建它们；每条 output entry 的固定 fingerprint 只校验它属于这份重建出的 exact
+Schema。Operation 状态的完整资源名包含 Station 与 Operation 的序号，因此同一 Station 中的多个
+Operation 不会冲突。
 
 ## 调度结果、背压与状态观察
 

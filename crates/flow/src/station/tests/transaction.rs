@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use dogpaddle_change::CodecError;
 use dogpaddle_operation::operation::Action;
 use dogpaddle_store::StoreError;
 
@@ -217,6 +218,49 @@ fn after_commit_runs_once_after_each_successful_store_commit() {
 }
 
 #[test]
+fn only_durable_after_commit_forces_the_shared_batch_barrier() {
+    let mut fixture = scan_sink(1, NonZeroU64::MAX);
+    let state = fixture.states[0].clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    fixture.stations[0].replace_operation(Box::new(
+        ScriptedOperation::writing(
+            state.clone(),
+            b"local",
+            ScriptResult::Action(Action::Commit(None)),
+        )
+        .with_local_after_commit(Arc::clone(&runs)),
+    ));
+
+    let mut batch = fixture.transactions.durability_batch();
+    assert_eq!(
+        fixture.stations[0]
+            .advance(&fixture.reads, &mut batch)
+            .unwrap(),
+        AdvanceOutcome::Progressed
+    );
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert!(batch.has_pending());
+
+    fixture.stations[0].replace_operation(Box::new(
+        ScriptedOperation::writing(
+            state,
+            b"durable",
+            ScriptResult::Action(Action::Commit(None)),
+        )
+        .with_after_commit(Arc::clone(&runs), false),
+    ));
+    assert_eq!(
+        fixture.stations[0]
+            .advance(&fixture.reads, &mut batch)
+            .unwrap(),
+        AdvanceOutcome::Progressed
+    );
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    assert!(!batch.has_pending());
+    batch.finish().unwrap();
+}
+
+#[test]
 fn backpressure_rolls_back_the_turn_and_discards_after_commit() {
     let mut fixture = scan_sink(1, NonZeroU64::MIN);
     assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
@@ -309,10 +353,7 @@ fn after_commit_failure_preserves_completion_and_makes_the_station_fail_stop() {
         .with_after_commit(Arc::clone(&runs), true),
     ));
 
-    let error = fixture
-        .station
-        .process(&mut fixture.transactions)
-        .unwrap_err();
+    let error = fixture.try_step().unwrap_err();
     assert!(matches!(error, StationError::AfterCommit { .. }));
     assert_eq!(runs.load(Ordering::Relaxed), 1);
     assert_eq!(
@@ -322,10 +363,7 @@ fn after_commit_failure_preserves_completion_and_makes_the_station_fail_stop() {
     assert_eq!((fixture.active(), fixture.position(1)), (0, 1));
     assert_eq!(fixture.bounds(1), 1..1);
     assert_eq!(claim_id(&fixture.station), None);
-    assert!(matches!(
-        fixture.station.process(&mut fixture.transactions),
-        Err(StationError::NeedsReopen)
-    ));
+    assert!(matches!(fixture.try_step(), Err(StationError::NeedsReopen)));
 
     fixture.append(0, &change(&[8]));
     assert_eq!(fixture.bounds(0), 0..1);
@@ -354,7 +392,7 @@ fn after_commit_panic_keeps_the_station_fail_stop_until_reopen() {
     ));
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = fixture.station.process(&mut fixture.transactions);
+        let _ = fixture.try_step();
     }));
     assert!(panic.is_err());
     assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -365,10 +403,7 @@ fn after_commit_panic_keeps_the_station_fail_stop_until_reopen() {
     assert_eq!((fixture.active(), fixture.position(1)), (0, 1));
     assert_eq!(fixture.bounds(1), 1..1);
     assert_eq!(claim_id(&fixture.station), Some((1, 0)));
-    assert!(matches!(
-        fixture.station.process(&mut fixture.transactions),
-        Err(StationError::NeedsReopen)
-    ));
+    assert!(matches!(fixture.try_step(), Err(StationError::NeedsReopen)));
 
     let reopened = reopen_multi_input(fixture, Action::Complete(None));
     reopened.station.ensure_runnable().unwrap();
@@ -376,7 +411,7 @@ fn after_commit_panic_keeps_the_station_fail_stop_until_reopen() {
 }
 
 #[test]
-fn output_schema_mismatch_precedes_capacity_and_rolls_back() {
+fn output_codec_schema_mismatch_precedes_capacity_and_rolls_back() {
     let mut fixture = scan_count_sink(NonZeroU64::MAX, NonZeroU64::MIN);
     assert_eq!(fixture.step(0), AdvanceOutcome::Progressed);
     let state = fixture.states[1].clone();
@@ -398,7 +433,9 @@ fn output_schema_mismatch_precedes_capacity_and_rolls_back() {
     );
     assert!(matches!(
         fixture.try_step(1),
-        Err(StationError::OutputSchemaMismatch { .. })
+        Err(StationError::InvalidOutputChange {
+            source: CodecError::SchemaMismatch,
+        })
     ));
     assert_eq!(
         read_attempt(&state, &mut fixture.transactions).as_deref(),
