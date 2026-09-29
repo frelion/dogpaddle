@@ -5,16 +5,27 @@ import io.debezium.engine.DebeziumEngine;
 import io.debezium.engine.RecordChangeEvent;
 import io.debezium.engine.format.ChangeEventFormat;
 import io.debezium.engine.spi.OffsetCommitPolicy;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.net.ssl.TrustManagerFactory;
 import org.apache.kafka.connect.source.SourceRecord;
 
-/** Owns one Debezium Engine and its single-delivery ACK protocol. */
-final class ConnectorRuntime {
+/** JNI-owned Debezium Engine and its single-delivery ACK protocol. */
+public final class ConnectorRuntime {
+    private static final int FAILURE_NONE = 0;
+    private static final int FAILURE_DELIVERY_TOO_LARGE = 1;
+
     private enum State {
         CREATED,
         STARTING,
@@ -101,7 +112,25 @@ final class ConnectorRuntime {
                 this::closeAndJoinEngine);
     }
 
-    static ConnectorRuntime create(
+    /** Returns the JNI and wire protocol version without creating a connector. */
+    public static int protocolVersion() {
+        return 1;
+    }
+
+    /** Verifies the bundled runtime resources required by connector operation. */
+    public static void verifyRuntime() throws GeneralSecurityException, UnknownHostException {
+        if (!"UTF-8".equals(StandardCharsets.UTF_8.name())) {
+            throw new IllegalStateException("UTF-8 charset is unavailable");
+        }
+        ZoneId.of("Asia/Shanghai").getRules().getOffset(Instant.EPOCH);
+        TrustManagerFactory trustManagers = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm());
+        trustManagers.init((KeyStore) null);
+        InetAddress.getByName("localhost");
+    }
+
+    /** Creates a stopped connector from JSON properties and an optional checkpoint. */
+    public static ConnectorRuntime create(
             byte[] configurationJson,
             byte[] checkpointBytes,
             int maximumDeliveryBytes) {
@@ -131,7 +160,8 @@ final class ConnectorRuntime {
         return new ConnectorRuntime(configuration, checkpoint, maximumDeliveryBytes);
     }
 
-    boolean start(long timeoutMillis) {
+    /** Starts this connector once and waits for polling readiness. */
+    public boolean start(long timeoutMillis) {
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("startup timeout must be non-negative");
         }
@@ -177,7 +207,8 @@ final class ConnectorRuntime {
         }
     }
 
-    byte[] poll(long timeoutMillis) {
+    /** Returns one encoded delivery, or null on an ordinary timeout. */
+    public byte[] poll(long timeoutMillis) {
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("poll timeout must be non-negative");
         }
@@ -201,12 +232,14 @@ final class ConnectorRuntime {
         }
     }
 
-    boolean ack(long timeoutMillis) {
+    /** Acknowledges the outstanding delivery after its offset commit settles. */
+    public boolean ack(long timeoutMillis) {
         requireNotDisposed();
         return exchange.ack(timeoutMillis);
     }
 
-    boolean stop(long timeoutMillis) {
+    /** Requests shutdown and waits up to the total deadline. */
+    public boolean stop(long timeoutMillis) {
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("stop timeout must be non-negative");
         }
@@ -235,10 +268,11 @@ final class ConnectorRuntime {
         return shutdownWorker.awaitUntil(startedAt, timeoutNanos);
     }
 
-    synchronized void dispose() {
+    /** Releases the offset reservation after the Engine thread terminates. */
+    public synchronized void dispose() {
         State observed = state.get();
         if (observed == State.DISPOSED) {
-            throw new IllegalStateException("connector is already disposed");
+            return;
         }
         Thread thread = engineThread;
         if (observed != State.STOPPED && observed != State.FAILED) {
@@ -253,7 +287,16 @@ final class ConnectorRuntime {
         state.set(State.DISPOSED);
     }
 
-    void abandon(Runnable reclaim) {
+    /** Releases a newly created runtime if JNI cannot retain its object. */
+    public void discardCreated() {
+        if (!stop(0)) {
+            throw new IllegalStateException("created connector did not stop");
+        }
+        dispose();
+    }
+
+    /** Starts non-blocking cleanup without acknowledging an outstanding delivery. */
+    public void abandon() {
         synchronized (this) {
             if (state.get() == State.DISPOSED || abandonStarted) {
                 return;
@@ -264,7 +307,7 @@ final class ConnectorRuntime {
             exchange.close();
         }
         Thread cleanup = new Thread(
-                () -> abandonInBackground(reclaim),
+                this::abandonInBackground,
                 "dogpaddle-debezium-reclaim-" + configuration.engineName());
         cleanup.setDaemon(true);
         cleanup.start();
@@ -274,10 +317,11 @@ final class ConnectorRuntime {
         return state.get() == State.DISPOSED;
     }
 
-    int failureKind() {
+    /** Returns the stable classification of the last connector failure. */
+    public int failureKind() {
         return DeliveryCodec.isTooLarge(failure)
-                ? DebeziumBridge.FAILURE_DELIVERY_TOO_LARGE
-                : DebeziumBridge.FAILURE_NONE;
+                ? FAILURE_DELIVERY_TOO_LARGE
+                : FAILURE_NONE;
     }
 
     private void handleBatch(
@@ -343,7 +387,7 @@ final class ConnectorRuntime {
         }
     }
 
-    private void abandonInBackground(Runnable reclaim) {
+    private void abandonInBackground() {
         Throwable cleanupFailure = null;
         try {
             if (!stop(Long.MAX_VALUE)) {
@@ -355,7 +399,7 @@ final class ConnectorRuntime {
             cleanupFailure = error;
         }
 
-        cleanupFailure = awaitTerminationAndReclaim(engineThread, reclaim, cleanupFailure);
+        cleanupFailure = awaitTerminationAndReclaim(engineThread, this::dispose, cleanupFailure);
         if (cleanupFailure != null) {
             failure = cleanupFailure;
             state.compareAndSet(State.STOPPING, State.FAILED);

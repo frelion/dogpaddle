@@ -151,6 +151,10 @@ dogpaddle-debezium-runtime-<target>/
 `DogPaddle` 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
 bundle 必须在整个进程生命周期内保持不可修改，并安装在不受非信任用户写入的位置。
 
+Rust `Connector` 持有对应 Java `ConnectorRuntime` 的 JNI 全局引用，start、poll、ACK、stop 直接调用该对象；
+它不通过数字 handle 注册表查找 connector。成功 stop 后释放引用；Drop 先请求 Java 后台清理，清理线程仍持有对象，
+直到 Engine 退出并注销其 offset store。这个 offset store 注册表仍用于 Kafka Connect 反射创建的 backing store。
+
 JVM 固定使用 `-Xrs`，将中断与终止信号留给宿主处理，避免覆盖宿主在 `open` 前注册的 Ctrl-C handler。
 宿主负责停止 connector；不能依赖 JVM 的信号 shutdown hook。Unix 的 SIGQUIT thread dump 也因此不可用。
 产品 CLI 收到 Ctrl-C 后仍等待当前有界 `advance` 返回，再正常退出。

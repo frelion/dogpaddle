@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use jni::objects::{JByteArray, Reference};
+use jni::objects::{Global, JByteArray, JObject, Reference};
 use jni::{InitArgsBuilder, JValue, JavaVM, jni_sig, jni_str};
 
 use crate::bundle::Bundle;
@@ -15,6 +15,8 @@ const FAILURE_NONE: i32 = 0;
 const FAILURE_DELIVERY_TOO_LARGE: i32 = 1;
 
 static JVM_HOST: OnceLock<Mutex<Option<Arc<JvmHost>>>> = OnceLock::new();
+
+pub(crate) type RuntimeObject = Global<JObject<'static>>;
 
 /// A cloneable reference to `DogPaddle`'s process-wide embedded JVM.
 ///
@@ -101,25 +103,23 @@ impl DebeziumRuntime {
         let engine_name = Box::<str>::from(config.engine_name());
         let connector_class = Box::<str>::from(config.connector_class());
         let (configuration, delivery_bound) = config.encode()?;
-        let handle = self.host.create(
+        let runtime = self.host.create(
             &configuration,
             checkpoint.map(Checkpoint::as_bytes),
             delivery_bound,
         )?;
 
-        let result = self.host.start(handle, START_TIMEOUT).map(|()| {
-            Connector::new(
-                Arc::clone(&self.host),
-                handle,
-                engine_name,
-                connector_class,
-                delivery_bound,
-            )
-        });
-        if result.is_err() {
-            self.host.abandon(handle);
+        if let Err(error) = self.host.start(&runtime, START_TIMEOUT) {
+            self.host.abandon(&runtime);
+            return Err(error);
         }
-        result
+        Ok(Connector::new(
+            Arc::clone(&self.host),
+            runtime,
+            engine_name,
+            connector_class,
+            delivery_bound,
+        ))
     }
 }
 
@@ -183,14 +183,14 @@ impl JvmHost {
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<i32> {
                 let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                    jni_str!("dev/dogpaddle/debezium/ConnectorRuntime"),
                     jni_str!("protocolVersion"),
                     jni_sig!("()I"),
                     &[],
                 )?;
                 let version = result.into_int()?;
                 environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                    jni_str!("dev/dogpaddle/debezium/ConnectorRuntime"),
                     jni_str!("verifyRuntime"),
                     jni_sig!("()V"),
                     &[],
@@ -217,7 +217,7 @@ impl JvmHost {
         configuration: &[u8],
         checkpoint: Option<&[u8]>,
         max_delivery_bytes: usize,
-    ) -> Result<i64, Error> {
+    ) -> Result<RuntimeObject, Error> {
         let max_delivery_bytes = i32::try_from(max_delivery_bytes).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidConfiguration,
@@ -225,7 +225,7 @@ impl JvmHost {
             )
         })?;
         self.vm
-            .attach_current_thread(|environment| -> jni::errors::Result<i64> {
+            .attach_current_thread(|environment| -> jni::errors::Result<RuntimeObject> {
                 let configuration = environment.byte_array_from_slice(configuration)?;
                 let checkpoint: JByteArray<'_> = if let Some(bytes) = checkpoint {
                     environment.byte_array_from_slice(bytes)?
@@ -233,30 +233,52 @@ impl JvmHost {
                     JByteArray::null()
                 };
                 let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                    jni_str!("dev/dogpaddle/debezium/ConnectorRuntime"),
                     jni_str!("create"),
-                    jni_sig!("([B[BI)J"),
+                    jni_sig!("([B[BI)Ldev/dogpaddle/debezium/ConnectorRuntime;"),
                     &[
                         JValue::Object(configuration.as_ref()),
                         JValue::Object(checkpoint.as_ref()),
                         JValue::Int(max_delivery_bytes),
                     ],
                 )?;
-                result.into_long()
+                let runtime = result.into_object()?;
+                match environment.new_global_ref(&runtime) {
+                    Ok(global) => Ok(global),
+                    Err(error) => {
+                        // Creation reserved the engine name. Release that reservation
+                        // before the local reference leaves this JNI frame.
+                        environment.exception_clear();
+                        if environment
+                            .call_method(&runtime, jni_str!("discardCreated"), jni_sig!("()V"), &[])
+                            .is_err()
+                        {
+                            environment.exception_clear();
+                            let _ = environment.call_method(
+                                &runtime,
+                                jni_str!("abandon"),
+                                jni_sig!("()V"),
+                                &[],
+                            );
+                        }
+                        environment.exception_clear();
+                        Err(error)
+                    }
+                }
             })
             .map_err(|_| bridge_error(ErrorKind::InvalidConfiguration, "create"))
     }
 
-    pub(crate) fn start(&self, handle: i64, timeout: Duration) -> Result<(), Error> {
+    pub(crate) fn start(&self, runtime: &RuntimeObject, timeout: Duration) -> Result<(), Error> {
         let timeout = duration_millis(timeout, "start")?;
         let started = self
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<bool> {
-                let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                let result = environment.call_method(
+                    runtime,
                     jni_str!("start"),
-                    jni_sig!("(JJ)Z"),
-                    &[JValue::Long(handle), JValue::Long(timeout)],
+                    jni_sig!("(J)Z"),
+                    &[JValue::Long(timeout)],
                 )?;
                 result.into_bool()
             })
@@ -276,18 +298,18 @@ impl JvmHost {
 
     pub(crate) fn poll(
         &self,
-        handle: i64,
+        runtime: &RuntimeObject,
         timeout: Duration,
         max_delivery_bytes: usize,
     ) -> Result<Option<Vec<u8>>, Error> {
         let timeout = duration_millis(timeout, "poll")?;
         self.vm
             .attach_current_thread(|environment| -> Result<Option<Vec<u8>>, BoundedCallError> {
-                let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                let result = environment.call_method(
+                    runtime,
                     jni_str!("poll"),
-                    jni_sig!("(JJ)[B"),
-                    &[JValue::Long(handle), JValue::Long(timeout)],
+                    jni_sig!("(J)[B"),
+                    &[JValue::Long(timeout)],
                 )?;
                 let object = result.into_object()?;
                 if object.is_null() {
@@ -300,7 +322,7 @@ impl JvmHost {
                 Ok(Some(environment.convert_byte_array(&bytes)?))
             })
             .map_err(|error| match error {
-                BoundedCallError::Jni => match self.failure_kind(handle) {
+                BoundedCallError::Jni => match self.failure_kind(runtime) {
                     Ok(FAILURE_NONE) | Err(_) => bridge_error(ErrorKind::ConnectorFailed, "poll"),
                     Ok(FAILURE_DELIVERY_TOO_LARGE) => {
                         bridge_error(ErrorKind::DeliveryTooLarge, "poll")
@@ -314,16 +336,16 @@ impl JvmHost {
             })
     }
 
-    pub(crate) fn ack(&self, handle: i64, timeout: Duration) -> Result<(), Error> {
+    pub(crate) fn ack(&self, runtime: &RuntimeObject, timeout: Duration) -> Result<(), Error> {
         let timeout = duration_millis(timeout, "ack")?;
         let settled = self
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<bool> {
-                let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                let result = environment.call_method(
+                    runtime,
                     jni_str!("ack"),
-                    jni_sig!("(JJ)Z"),
-                    &[JValue::Long(handle), JValue::Long(timeout)],
+                    jni_sig!("(J)Z"),
+                    &[JValue::Long(timeout)],
                 )?;
                 result.into_bool()
             })
@@ -338,16 +360,16 @@ impl JvmHost {
         }
     }
 
-    pub(crate) fn stop(&self, handle: i64, timeout: Duration) -> Result<(), Error> {
+    pub(crate) fn stop(&self, runtime: &RuntimeObject, timeout: Duration) -> Result<(), Error> {
         let timeout = duration_millis(timeout, "stop")?;
         let stopped = self
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<bool> {
-                let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                let result = environment.call_method(
+                    runtime,
                     jni_str!("stop"),
-                    jni_sig!("(JJ)Z"),
-                    &[JValue::Long(handle), JValue::Long(timeout)],
+                    jni_sig!("(J)Z"),
+                    &[JValue::Long(timeout)],
                 )?;
                 result.into_bool()
             })
@@ -362,42 +384,32 @@ impl JvmHost {
         }
     }
 
-    pub(crate) fn abandon(&self, handle: i64) {
+    pub(crate) fn abandon(&self, runtime: &RuntimeObject) {
         let _ = self
             .vm
             .attach_current_thread(|environment| -> jni::errors::Result<()> {
-                environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
-                    jni_str!("abandon"),
-                    jni_sig!("(J)V"),
-                    &[JValue::Long(handle)],
-                )?;
+                environment.call_method(runtime, jni_str!("abandon"), jni_sig!("()V"), &[])?;
                 Ok(())
             });
     }
 
-    pub(crate) fn dispose(&self, handle: i64) -> Result<(), Error> {
+    pub(crate) fn dispose(&self, runtime: &RuntimeObject) -> Result<(), Error> {
         self.vm
             .attach_current_thread(|environment| -> jni::errors::Result<()> {
-                environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
-                    jni_str!("dispose"),
-                    jni_sig!("(J)V"),
-                    &[JValue::Long(handle)],
-                )?;
+                environment.call_method(runtime, jni_str!("dispose"), jni_sig!("()V"), &[])?;
                 Ok(())
             })
             .map_err(|_| bridge_error(ErrorKind::ConnectorFailed, "dispose"))
     }
 
-    fn failure_kind(&self, handle: i64) -> Result<i32, Error> {
+    fn failure_kind(&self, runtime: &RuntimeObject) -> Result<i32, Error> {
         self.vm
             .attach_current_thread(|environment| -> jni::errors::Result<i32> {
-                let result = environment.call_static_method(
-                    jni_str!("dev/dogpaddle/debezium/DebeziumBridge"),
+                let result = environment.call_method(
+                    runtime,
                     jni_str!("failureKind"),
-                    jni_sig!("(J)I"),
-                    &[JValue::Long(handle)],
+                    jni_sig!("()I"),
+                    &[],
                 )?;
                 result.into_int()
             })

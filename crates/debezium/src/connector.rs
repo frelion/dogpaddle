@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::jvm::JvmHost;
+use crate::jvm::{JvmHost, RuntimeObject};
 use crate::protocol::decode_delivery;
 use crate::{Checkpoint, Error, ErrorKind};
 
@@ -128,14 +128,14 @@ impl fmt::Debug for Record {
     }
 }
 
-/// A running, single-threaded Debezium connector handle.
+/// A running, single-threaded Debezium connector.
 ///
 /// Every operation needs exclusive access. A live [`Delivery`] borrows that
 /// access, which makes polling, stopping, or acknowledging through another
 /// connector impossible at compile time.
 pub struct Connector {
     host: Arc<JvmHost>,
-    handle: Option<i64>,
+    runtime: Option<RuntimeObject>,
     engine_name: Box<str>,
     class_name: Box<str>,
     max_delivery_bytes: usize,
@@ -145,14 +145,14 @@ pub struct Connector {
 impl Connector {
     pub(crate) fn new(
         host: Arc<JvmHost>,
-        handle: i64,
+        runtime: RuntimeObject,
         engine_name: Box<str>,
         class_name: Box<str>,
         max_delivery_bytes: usize,
     ) -> Self {
         Self {
             host,
-            handle: Some(handle),
+            runtime: Some(runtime),
             engine_name,
             class_name,
             max_delivery_bytes,
@@ -171,8 +171,8 @@ impl Connector {
     /// Returns an error for an invalid duration, connector failure, malformed
     /// bridge response, or use after stop or an uncertain ACK.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<Delivery<'_>>, Error> {
-        let handle = self.usable_handle()?;
-        let polled = self.host.poll(handle, timeout, self.max_delivery_bytes);
+        let runtime = self.usable_runtime()?;
+        let polled = self.host.poll(runtime, timeout, self.max_delivery_bytes);
         let Some(bytes) = (match polled {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -211,7 +211,7 @@ impl Connector {
         }))
     }
 
-    /// Stops this connector within `timeout` and releases its Java handle.
+    /// Stops this connector within `timeout` and releases its Java runtime.
     ///
     /// An outstanding delivery is aborted and is never acknowledged. If the
     /// deadline expires, the Java cleanup worker continues and this method can
@@ -222,40 +222,41 @@ impl Connector {
     /// Returns an error when the duration is invalid, shutdown fails, or the
     /// deadline expires.
     pub fn stop(&mut self, timeout: Duration) -> Result<(), Error> {
-        let Some(handle) = self.handle else {
+        let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
         };
-        self.host.stop(handle, timeout)?;
-        self.host.dispose(handle)?;
-        self.handle = None;
+        self.host.stop(runtime, timeout)?;
+        self.host.dispose(runtime)?;
+        self.runtime = None;
         Ok(())
     }
 
     fn acknowledge(&mut self) -> Result<(), Error> {
-        let handle = self.usable_handle()?;
-        if let Err(error) = self.host.ack(handle, ACK_TIMEOUT) {
+        let runtime = self.usable_runtime()?;
+        if let Err(error) = self.host.ack(runtime, ACK_TIMEOUT) {
             self.poisoned = true;
             return Err(error);
         }
         Ok(())
     }
 
-    fn usable_handle(&self) -> Result<i64, Error> {
+    fn usable_runtime(&self) -> Result<&RuntimeObject, Error> {
         if self.poisoned {
             return Err(Error::new(
                 ErrorKind::ConnectorFailed,
                 "connector is unusable after an uncertain ACK or bridge protocol failure; stop it and restart from the persisted checkpoint",
             ));
         }
-        self.handle
+        self.runtime
+            .as_ref()
             .ok_or_else(|| Error::new(ErrorKind::ConnectorFailed, "connector has already stopped"))
     }
 }
 
 impl Drop for Connector {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle {
-            self.host.abandon(handle);
+        if let Some(runtime) = self.runtime.as_ref() {
+            self.host.abandon(runtime);
         }
     }
 }

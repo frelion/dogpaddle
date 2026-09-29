@@ -11,13 +11,13 @@ import org.junit.jupiter.api.Test;
 
 class ConnectorRuntimeTest {
     @Test
-    void bridge_protocol_version_is_available_without_creating_a_connector() {
-        assertEquals(1, DebeziumBridge.protocolVersion());
+    void protocol_version_is_available_without_creating_a_connector() {
+        assertEquals(1, ConnectorRuntime.protocolVersion());
     }
 
     @Test
     void required_runtime_resources_are_available() throws Exception {
-        DebeziumBridge.verifyRuntime();
+        ConnectorRuntime.verifyRuntime();
     }
 
     @Test
