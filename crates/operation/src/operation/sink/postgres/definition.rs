@@ -6,7 +6,6 @@ use super::{
     buffered,
     config::{PostgresSinkConfig, PostgresTargetSpec},
     error::{PostgresSinkError, invalid_spec},
-    relation::RelationSinkTarget,
     schema::PostgresLayout,
     target::PostgresTarget,
 };
@@ -77,11 +76,7 @@ impl Sealed for PostgresSinkDefinition {
         let layout = PostgresLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
         let config = resource.take::<PostgresSinkConfig>()?;
-        let target = RelationSinkTarget::new(PostgresTarget::new_bound(
-            config,
-            self.target.clone(),
-            layout,
-        ));
+        let target = PostgresTarget::new_bound(config, self.target.clone(), layout);
         buffered::construct(input_schema, target, data)
     }
 

@@ -19,7 +19,7 @@ struct RowPlan {
 
 pub(super) const MAX_CANONICAL_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
-pub(super) fn prepare(
+pub(crate) fn prepare(
     target: &mut impl RelationTarget,
     input: &DeliveryBatch,
     next_id: u64,

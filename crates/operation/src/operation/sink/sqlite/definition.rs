@@ -8,9 +8,7 @@ use std::{
 use arrow_schema::{DataType, SchemaRef};
 use thiserror::Error;
 
-use super::{
-    TECHNICAL_HASH, TECHNICAL_ID, buffered, relation::RelationSinkTarget, target::SqliteTarget,
-};
+use super::{TECHNICAL_HASH, TECHNICAL_ID, buffered, target::SqliteTarget};
 use crate::{
     ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
     RuntimeResource,
@@ -179,7 +177,7 @@ impl SealedDefinition for SqliteSinkDefinition {
             Arc::clone(&input_schema),
         )
         .map_err(schema_error)?;
-        buffered::construct(input_schema, RelationSinkTarget::new(target), data)
+        buffered::construct(input_schema, target, data)
     }
 }
 

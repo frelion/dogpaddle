@@ -398,7 +398,8 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 
 关系 Sink 用固定 input Schema 构造唯一 codec，把输入编码成不重复完整 Schema 的 schema-bound entry 后提交到本地 buffer，再将固定 ID 的 mutation plan 持久化为 Prepared；目标提交后，
 下一 Store turn 才结算本地进度。SQLite、PostgreSQL、Doris 和 `ClickHouse` 共用这套私有内核，具体目标
-只实现布局、查询与幂等写入。容量口径、恢复校验、行身份和各目标限制见 [关系 Sink 契约](docs/sinks.md)。
+直接实现同一个私有 `RelationTarget`，只负责布局、查询与幂等写入。内核固定以 `u64` 保存下一个 technical ID，
+以 `Batch` 保存 Prepared mutation，不再通过第二层通用 Sink adapter 转发。容量口径、恢复校验、行身份和各目标限制见 [关系 Sink 契约](docs/sinks.md)。
 
 ## 持久化 ABI
 

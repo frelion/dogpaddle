@@ -13,7 +13,7 @@ pub use error::{DorisSinkError, DorisSinkSchemaError};
 
 pub(crate) use definition::{TAG, decode_definition};
 
-use super::{buffered, relation};
+use super::buffered;
 
 #[cfg(test)]
 mod tests;

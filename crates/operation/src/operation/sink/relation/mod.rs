@@ -2,7 +2,9 @@
 
 mod plan;
 
-use std::{collections::BTreeMap, num::NonZeroU32};
+pub(crate) use plan::prepare;
+
+use std::collections::BTreeMap;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, SchemaRef};
@@ -11,7 +13,7 @@ use thiserror::Error;
 
 use crate::operation::{
     OperationError,
-    sink::buffered::{DeliveryBatch, MAX_TARGET_BATCH_BYTES, SinkTarget},
+    sink::buffered::{DeliveryBatch, MAX_TARGET_BATCH_BYTES},
 };
 
 #[cfg(test)]
@@ -145,9 +147,12 @@ pub(crate) struct Matches {
     pub ids: Vec<u64>,
 }
 
-/// Database I/O only; no Store access or ownership of input progress.
+/// Target layout and I/O for the single buffered relation sink protocol.
+/// Buffering, fixed-ID planning, durable state and replay belong to shared code.
 pub(crate) trait RelationTarget: Send + 'static {
-    /// Charges one event using the backend's concrete delivery encoding.
+    /// Deterministic, nonzero byte charge for one target mutation.
+    /// This must be pure and perform no target I/O: admission and delivery slicing
+    /// call it before a Change is acknowledged or a target transaction starts.
     fn event_bytes(&self, input: &Change, row_index: usize) -> Result<u64, OperationError> {
         relation_event_bytes(input, row_index)
     }
@@ -155,29 +160,23 @@ pub(crate) trait RelationTarget: Send + 'static {
     /// Fresh construction must reject existing targets before publishing intent.
     fn require_absent(&mut self) -> Result<(), OperationError>;
     /// Creates or verifies the owned empty layout after initialization is durable.
+    /// Reopen may repeat this call after an uncertain result, so it must be
+    /// idempotent and reject incompatible ownership or layout.
     fn initialize(&mut self) -> Result<(), OperationError>;
-    /// Returns exact matches in request order, with ascending IDs and bounded counts.
+    /// Read-only exact matches in request order, with ascending IDs and counts
+    /// capped at each request's `needed`; return at most `take` IDs per request.
+    /// A failed read must leave the target session ready for a retry of the same
+    /// loaded batch, resetting a poisoned connection before returning the error.
     fn lookup(
         &mut self,
         input: &Change,
         requests: &[Lookup],
     ) -> Result<Vec<Matches>, OperationError>;
-    /// One target transaction; duplicate inserts and missing deletes are replay.
+    /// Atomically deliver one durably prepared plan in one target transaction.
+    /// Reopen may repeat the exact plan after process exit or an uncertain commit:
+    /// matching duplicate IDs and already deleted IDs are successful replay,
+    /// while an ID bound to a different complete logical row must fail.
     fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError>;
-}
-
-/// Relational semantics layered on a database-specific target connection.
-///
-/// Buffering, replay and settlement belong to [`super::buffered`]. This value
-/// owns only exact-row planning, technical-ID allocation and target I/O.
-pub(crate) struct RelationSinkTarget<T> {
-    target: T,
-}
-
-impl<T> RelationSinkTarget<T> {
-    pub(crate) const fn new(target: T) -> Self {
-        Self { target }
-    }
 }
 
 /// Encodes each field once and projects its fresh canonical bytes to a target value.
@@ -241,150 +240,112 @@ pub(super) fn relation_event_bytes(
         .ok_or_else(|| invalid("target mutation byte charge exceeds u64"))
 }
 
-impl<T: RelationTarget> SinkTarget for RelationSinkTarget<T> {
-    type Checkpoint = u64;
-    type Plan = Batch;
-
-    const MAX_BATCH_EVENTS: NonZeroU32 =
-        NonZeroU32::new(1024).expect("the relation batch limit is nonzero");
-
-    fn require_absent(&mut self) -> Result<(), OperationError> {
-        self.target.require_absent()
+pub(crate) fn validate_admission(
+    input: &Change,
+    checkpoint: u64,
+    buffered_events: u64,
+) -> Result<(), OperationError> {
+    validate_next_id(checkpoint)?;
+    let positive_events = input
+        .diffs()
+        .values()
+        .iter()
+        .filter(|diff| **diff > 0)
+        .try_fold(0_u64, |total, diff| {
+            total
+                .checked_add(diff.unsigned_abs())
+                .ok_or_else(|| invalid("positive event count exceeds u64"))
+        })?;
+    let reserved = buffered_events
+        .checked_add(positive_events)
+        .ok_or_else(|| invalid("technical ID reservation exceeds u64"))?;
+    if reserved > EXHAUSTED_ID - checkpoint {
+        Err(invalid("technical ID capacity is exhausted"))
+    } else {
+        Ok(())
     }
+}
 
-    fn initialize(&mut self) -> Result<(), OperationError> {
-        self.target.initialize()
+pub(crate) fn validate_recovery(
+    checkpoint: u64,
+    remaining_positive_events: u64,
+) -> Result<(), OperationError> {
+    validate_next_id(checkpoint)?;
+    if remaining_positive_events > EXHAUSTED_ID - checkpoint {
+        Err(invalid(
+            "buffered positive events exceed the remaining technical ID capacity",
+        ))
+    } else {
+        Ok(())
     }
+}
 
-    fn initial_checkpoint(&self) -> Self::Checkpoint {
-        FIRST_TECHNICAL_ID
-    }
+pub(crate) fn encode_checkpoint(checkpoint: u64, output: &mut Vec<u8>) {
+    output.extend(checkpoint.to_be_bytes());
+}
 
-    fn event_bytes(&self, input: &Change, row_index: usize) -> Result<u64, OperationError> {
-        self.target.event_bytes(input, row_index)
-    }
+pub(crate) fn decode_checkpoint(input: &mut &[u8]) -> Result<u64, OperationError> {
+    let checkpoint = u64::from_be_bytes(read(input)?);
+    validate_next_id(checkpoint)?;
+    Ok(checkpoint)
+}
 
-    fn validate_admission(
-        &self,
-        input: &Change,
-        checkpoint: &Self::Checkpoint,
-        buffered_events: u64,
-    ) -> Result<(), OperationError> {
-        validate_next_id(*checkpoint)?;
-        let positive_events = input
-            .diffs()
-            .values()
-            .iter()
-            .filter(|diff| **diff > 0)
-            .try_fold(0_u64, |total, diff| {
-                total
-                    .checked_add(diff.unsigned_abs())
-                    .ok_or_else(|| invalid("positive event count exceeds u64"))
-            })?;
-        let reserved = buffered_events
-            .checked_add(positive_events)
-            .ok_or_else(|| invalid("technical ID reservation exceeds u64"))?;
-        if reserved > EXHAUSTED_ID - *checkpoint {
-            Err(invalid("technical ID capacity is exhausted"))
-        } else {
-            Ok(())
-        }
+pub(crate) fn encode_plan(plan: &Batch, output: &mut Vec<u8>) {
+    output.push(1);
+    output.extend(
+        u16::try_from(plan.inserts.len())
+            .expect("the relation plan is bounded")
+            .to_be_bytes(),
+    );
+    output.extend(
+        u16::try_from(plan.deletes.len())
+            .expect("the relation plan is bounded")
+            .to_be_bytes(),
+    );
+    for insert in &plan.inserts {
+        output.extend(insert.row_index.to_be_bytes());
+        output.extend(insert.technical_id.to_be_bytes());
     }
+    for delete in &plan.deletes {
+        output.extend(delete.row_index.to_be_bytes());
+        output.extend(delete.technical_id.to_be_bytes());
+    }
+}
 
-    fn validate_recovery(
-        &self,
-        checkpoint: &Self::Checkpoint,
-        remaining_positive_events: u64,
-    ) -> Result<(), OperationError> {
-        validate_next_id(*checkpoint)?;
-        if remaining_positive_events > EXHAUSTED_ID - *checkpoint {
-            Err(invalid(
-                "buffered positive events exceed the remaining technical ID capacity",
-            ))
-        } else {
-            Ok(())
-        }
+pub(crate) fn decode_plan(
+    input: &mut &[u8],
+    batch: &DeliveryBatch,
+    checkpoint: u64,
+) -> Result<Batch, OperationError> {
+    if read::<1>(input)? != [1] {
+        return Err(invalid("unknown relation-plan version"));
     }
-
-    fn prepare(
-        &mut self,
-        input: &DeliveryBatch,
-        checkpoint: &Self::Checkpoint,
-    ) -> Result<(Self::Checkpoint, Self::Plan), OperationError> {
-        plan::prepare(&mut self.target, input, *checkpoint)
+    let inserts = usize::from(u16::from_be_bytes(read(input)?));
+    let deletes = usize::from(u16::from_be_bytes(read(input)?));
+    let count = inserts
+        .checked_add(deletes)
+        .ok_or_else(|| invalid("relation-plan mutation count overflows usize"))?;
+    if count == 0 || count > MAX_MUTATIONS_PER_BATCH {
+        return Err(invalid("invalid relation-plan mutation count"));
     }
-
-    fn deliver(&mut self, input: &DeliveryBatch, plan: &Self::Plan) -> Result<(), OperationError> {
-        self.target.write_batch(input.change(), plan)
+    let mut plan = Batch {
+        inserts: Vec::with_capacity(inserts),
+        deletes: Vec::with_capacity(deletes),
+    };
+    for _ in 0..inserts {
+        plan.inserts.push(Insert {
+            row_index: u64::from_be_bytes(read(input)?),
+            technical_id: u64::from_be_bytes(read(input)?),
+        });
     }
-
-    fn encode_checkpoint(checkpoint: &Self::Checkpoint, output: &mut Vec<u8>) {
-        output.extend(checkpoint.to_be_bytes());
+    for _ in 0..deletes {
+        plan.deletes.push(Delete {
+            row_index: u64::from_be_bytes(read(input)?),
+            technical_id: u64::from_be_bytes(read(input)?),
+        });
     }
-
-    fn decode_checkpoint(input: &mut &[u8]) -> Result<Self::Checkpoint, OperationError> {
-        let checkpoint = u64::from_be_bytes(read(input)?);
-        validate_next_id(checkpoint)?;
-        Ok(checkpoint)
-    }
-
-    fn encode_plan(plan: &Self::Plan, output: &mut Vec<u8>) {
-        output.push(1);
-        output.extend(
-            u16::try_from(plan.inserts.len())
-                .expect("the relation plan is bounded")
-                .to_be_bytes(),
-        );
-        output.extend(
-            u16::try_from(plan.deletes.len())
-                .expect("the relation plan is bounded")
-                .to_be_bytes(),
-        );
-        for insert in &plan.inserts {
-            output.extend(insert.row_index.to_be_bytes());
-            output.extend(insert.technical_id.to_be_bytes());
-        }
-        for delete in &plan.deletes {
-            output.extend(delete.row_index.to_be_bytes());
-            output.extend(delete.technical_id.to_be_bytes());
-        }
-    }
-
-    fn decode_plan(
-        input: &mut &[u8],
-        batch: &DeliveryBatch,
-        checkpoint: &Self::Checkpoint,
-    ) -> Result<Self::Plan, OperationError> {
-        if read::<1>(input)? != [1] {
-            return Err(invalid("unknown relation-plan version"));
-        }
-        let inserts = usize::from(u16::from_be_bytes(read(input)?));
-        let deletes = usize::from(u16::from_be_bytes(read(input)?));
-        let count = inserts
-            .checked_add(deletes)
-            .ok_or_else(|| invalid("relation-plan mutation count overflows usize"))?;
-        if count == 0 || count > MAX_MUTATIONS_PER_BATCH {
-            return Err(invalid("invalid relation-plan mutation count"));
-        }
-        let mut plan = Batch {
-            inserts: Vec::with_capacity(inserts),
-            deletes: Vec::with_capacity(deletes),
-        };
-        for _ in 0..inserts {
-            plan.inserts.push(Insert {
-                row_index: u64::from_be_bytes(read(input)?),
-                technical_id: u64::from_be_bytes(read(input)?),
-            });
-        }
-        for _ in 0..deletes {
-            plan.deletes.push(Delete {
-                row_index: u64::from_be_bytes(read(input)?),
-                technical_id: u64::from_be_bytes(read(input)?),
-            });
-        }
-        plan::validate(&plan, *checkpoint, batch.change())?;
-        Ok(plan)
-    }
+    plan::validate(&plan, checkpoint, batch.change())?;
+    Ok(plan)
 }
 
 #[derive(Debug, Error)]

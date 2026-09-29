@@ -1,5 +1,6 @@
-use super::{SinkTarget, invalid};
+use super::invalid;
 use crate::operation::OperationError;
+use crate::operation::sink::relation::{self, Batch};
 
 #[cfg(test)]
 use super::DeliveryBatch;
@@ -62,39 +63,39 @@ impl BufferState {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct Ready<C> {
+#[derive(Clone, Copy)]
+pub(super) struct Ready {
     pub(super) buffer: BufferState,
-    pub(super) checkpoint: C,
+    pub(super) checkpoint: u64,
 }
 
 #[derive(Clone)]
-pub(super) struct Prepared<C, P> {
+pub(super) struct Prepared {
     pub(super) before: BufferState,
     pub(super) after: BufferState,
-    pub(super) checkpoint: C,
-    pub(super) plan: P,
+    pub(super) checkpoint: u64,
+    pub(super) plan: Batch,
 }
 
 #[derive(Clone)]
-pub(super) enum State<C, P> {
+pub(super) enum State {
     Initialize,
-    Ready(Ready<C>),
-    Prepared(Prepared<C, P>),
+    Ready(Ready),
+    Prepared(Prepared),
 }
 
-pub(super) enum Header<'input, C> {
+pub(super) enum Header<'input> {
     Initialize,
-    Ready(Ready<C>),
+    Ready(Ready),
     Prepared {
         before: BufferState,
         after: BufferState,
-        checkpoint: C,
+        checkpoint: u64,
         encoded_plan: &'input [u8],
     },
 }
 
-impl<C, P> State<C, P> {
+impl State {
     pub(super) fn validate(&self) -> Result<(), OperationError> {
         match self {
             Self::Initialize => Ok(()),
@@ -103,37 +104,31 @@ impl<C, P> State<C, P> {
         }
     }
 
-    pub(super) fn encode<T>(&self) -> Vec<u8>
-    where
-        T: SinkTarget<Checkpoint = C, Plan = P>,
-    {
+    pub(super) fn encode(&self) -> Vec<u8> {
         let mut output = vec![VERSION];
         match self {
             Self::Initialize => output.push(0),
             Self::Ready(ready) => {
                 output.push(1);
-                encode_ready::<T>(ready, &mut output);
+                encode_ready(ready, &mut output);
             }
             Self::Prepared(prepared) => {
                 output.push(2);
                 encode_buffer(prepared.before, &mut output);
                 encode_buffer(prepared.after, &mut output);
-                T::encode_checkpoint(&prepared.checkpoint, &mut output);
-                T::encode_plan(&prepared.plan, &mut output);
+                relation::encode_checkpoint(prepared.checkpoint, &mut output);
+                relation::encode_plan(&prepared.plan, &mut output);
             }
         }
         output
     }
 
     #[cfg(test)]
-    pub(super) fn decode<T>(
+    pub(super) fn decode(
         input: &[u8],
         prepared_input: Option<&DeliveryBatch>,
-    ) -> Result<Self, OperationError>
-    where
-        T: SinkTarget<Checkpoint = C, Plan = P>,
-    {
-        match decode_header::<T>(input)? {
+    ) -> Result<Self, OperationError> {
+        match decode_header(input)? {
             Header::Initialize => Ok(Self::Initialize),
             Header::Ready(ready) => Ok(Self::Ready(ready)),
             Header::Prepared {
@@ -144,7 +139,7 @@ impl<C, P> State<C, P> {
             } => {
                 let change = prepared_input
                     .ok_or_else(|| invalid("prepared input is required to decode its plan"))?;
-                let plan = T::decode_plan(&mut encoded_plan, change, &checkpoint)?;
+                let plan = relation::decode_plan(&mut encoded_plan, change, checkpoint)?;
                 if !encoded_plan.is_empty() {
                     return Err(invalid("trailing control-state bytes"));
                 }
@@ -159,12 +154,7 @@ impl<C, P> State<C, P> {
     }
 }
 
-pub(super) fn decode_header<T>(
-    mut input: &[u8],
-) -> Result<Header<'_, T::Checkpoint>, OperationError>
-where
-    T: SinkTarget,
-{
+pub(super) fn decode_header(mut input: &[u8]) -> Result<Header<'_>, OperationError> {
     if read::<1>(&mut input)? != [VERSION] {
         return Err(invalid("unknown control-state version"));
     }
@@ -174,7 +164,7 @@ where
             Ok(Header::Initialize)
         }
         1 => {
-            let ready = decode_ready::<T>(&mut input)?;
+            let ready = decode_ready(&mut input)?;
             require_end(input)?;
             Ok(Header::Ready(ready))
         }
@@ -182,7 +172,7 @@ where
             let before = decode_buffer(&mut input)?;
             let after = decode_buffer(&mut input)?;
             validate_settlement(before, after)?;
-            let checkpoint = T::decode_checkpoint(&mut input)?;
+            let checkpoint = relation::decode_checkpoint(&mut input)?;
             Ok(Header::Prepared {
                 before,
                 after,
@@ -194,14 +184,14 @@ where
     }
 }
 
-fn encode_ready<T: SinkTarget>(ready: &Ready<T::Checkpoint>, output: &mut Vec<u8>) {
+fn encode_ready(ready: &Ready, output: &mut Vec<u8>) {
     encode_buffer(ready.buffer, output);
-    T::encode_checkpoint(&ready.checkpoint, output);
+    relation::encode_checkpoint(ready.checkpoint, output);
 }
 
-fn decode_ready<T: SinkTarget>(input: &mut &[u8]) -> Result<Ready<T::Checkpoint>, OperationError> {
+fn decode_ready(input: &mut &[u8]) -> Result<Ready, OperationError> {
     let buffer = decode_buffer(input)?;
-    let checkpoint = T::decode_checkpoint(input)?;
+    let checkpoint = relation::decode_checkpoint(input)?;
     Ok(Ready { buffer, checkpoint })
 }
 

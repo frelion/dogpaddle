@@ -22,6 +22,7 @@ Definition 只保存 discovery 得到的非敏感 `PostgresTargetSpec` canonical
 ## Doris 与 ClickHouse
 
 DorisSink 的 tag 是 18，Definition 只持久化 sink ID、database/table 和 discovery 得到的唯一 cluster ID；numeric IP、MySQL port、user/password 只属于每次构造注入的 `DorisSinkConfig`。
+目标 lookup 的数据库请求或布局复核失败后丢弃缓存连接；重试同一 Loaded batch 时重新连接并复核目标身份与布局。
 目标由一个开启 merge-on-write 的 Unique Key 状态表和公开 view 组成，私有 delete marker 同时是 sequence column，公开 technical ID/hash 固定别名为 `$dogpaddle.id`/`$dogpaddle.hash`。
 写入按 SQL bytes 与 value 数拆分，多个 statement 必须处于同一显式事务。
 ClickHouseSink 的 tag 是 19，Definition 只持久化 sink ID、database/table 和 Atomic database UUID；numeric IP、HTTP port、user/password 只属于 `ClickHouseSinkConfig`。
@@ -31,7 +32,7 @@ ClickHouseSink 的 tag 是 19，Definition 只持久化 sink ID、database/table
 
 ## 共享 buffered 协议
 
-SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`；crate 私有 `relation` 只拥有 exact-row lookup、technical-ID 分配、mutation codec、按 logical row 的纯 mutation 分组与 target adapter，不再拥有第二套 runtime/state。
+SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`。四个具体目标直接实现唯一的私有 `RelationTarget`，只提供目标布局、exact-row lookup、事件大小和幂等固定 ID 写入；共享的 `relation` 代码负责 technical-ID 分配、mutation codec 和按 logical row 的纯 mutation 分组。checkpoint 固定为下一个 technical ID `u64`，Prepared plan 固定为 `Batch`，不保留另一层 Sink trait、target wrapper 或第二套 runtime/state。
 不得建立公共通用 Sink trait、backend enum、registry 或 ORM。
 构造时从固定 input Schema 创建唯一的 `SchemaBoundChangeCodec`，它同时拥有运行时 exact-Schema guard 与 buffer codec。control 状态只有 Initialize、Ready、Prepared；buffer 的每个 value 是一个 schema-bound Change entry，Ready/Prepared 保存连续 `[head, tail)`、当前行剩余 diff、pending event 数和 retained encoded-entry bytes。
 完整 Change admission、control accounting 与 input `Complete` 必须在同一 Store 事务提交；连续小 Claim 可聚合，没有 offered Claim、达到 target event limit 或 8 MiB delivery watermark 时继续无输入内部 drain。
@@ -40,7 +41,7 @@ schema-bound entry 的 v1 持久布局固定为 format marker、canonical physic
 完整 encoded delivery 与 target-expanded mutation work 分别受 8 MiB 上限；超限或不能在剩余 technical-ID 区间排空的 input 在 ACK 前失败。
 reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、schema fingerprint、single-batch framing、Change value、accounting 与 checkpoint 下剩余正事件容量。
 首次启动在事务外拒绝已有目标，再持久化 Initialize；durable AfterCommit 在 Store barrier 后创建或验证同布局的空目标。
-批次在 Store 写事务外规划；纯正事件批次在保持 canonical 行字节预算和逐行校验的前提下只计算行长度与固定 ID，不为分组构造整行 canonical bytes。混合批次仍按完整行身份分组。apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
+批次在 Store 写事务外规划；纯正事件批次在保持 canonical 行字节预算和逐行校验的前提下只计算行长度与固定 ID，不为分组构造整行 canonical bytes。混合批次仍按完整行身份分组。读取 buffer 的 Loaded turn 与随后的规划 turn 分开，以免目标查询占用 Store 写事务；规划后直接准备持久写入，若该写事务回滚，下一 turn 从同一 Loaded batch 与 checkpoint 重新规划。apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
 Prepared 恢复对所有行仍校验 canonical 总预算；只有 delete 引用同一 plan 新分配的 ID 时才暂存该批全部 canonical 行字节做身份对比，纯撤回及只删除既存 ID 的批次无需额外行副本。目标适配器分别编码 canonical 行，并直接从本次编码的字段字节投影目标列值，不对同一字段重复读取 Arrow 数组。
 durable AfterCommit 在 Store barrier 后于一个目标事务中先 insert-on-ID-conflict-do-nothing，再核对所有已存在 mutation ID 仍绑定对应完整逻辑行，最后按 ID delete；恢复、admit、load、publish-ready 和 settle 的纯内存 phase 发布使用 local AfterCommit；下一独立 Store turn 删除完整消费的 buffer entries 并发布 Ready。
 目标已提交而本地未结算时只从原 buffer 重建并依靠 Prepared plan 的固定 technical ID 重投；从不重投已结算批次。

@@ -6,7 +6,6 @@ use super::{
     buffered,
     config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
     error::{ClickHouseSinkError, invalid_spec},
-    relation::RelationSinkTarget,
     schema::ClickHouseLayout,
     target::ClickHouseTarget,
 };
@@ -71,11 +70,7 @@ impl Sealed for ClickHouseSinkDefinition {
         let layout = ClickHouseLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
         let config = resource.take::<ClickHouseSinkConfig>()?;
-        let target = RelationSinkTarget::new(ClickHouseTarget::new_bound(
-            config,
-            self.target.clone(),
-            layout,
-        ));
+        let target = ClickHouseTarget::new_bound(config, self.target.clone(), layout);
         buffered::construct(input_schema, target, data)
     }
 

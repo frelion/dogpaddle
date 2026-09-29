@@ -76,8 +76,8 @@ impl DorisTarget {
             let mut connection = self.connection.take().expect("connection was installed");
             let result = verify_state(&mut connection, &self.spec, self.codec.layout())
                 .and_then(|()| verify_view(&mut connection, &self.spec, self.codec.layout()));
-            self.connection = Some(connection);
             result?;
+            self.connection = Some(connection);
             self.verified = true;
         }
         Ok(())
@@ -171,10 +171,13 @@ impl DorisTarget {
     ) -> Result<(), DorisSinkError> {
         let expected_rows = output.len().saturating_add(clauses.len());
         let sql = format!("{} ORDER BY n, id IS NULL, id", clauses.join(" UNION ALL "));
-        let rows: Vec<(u64, Option<u64>, u64)> = self
-            .connect()?
-            .exec(sql, Params::Positional(parameters))
-            .map_err(|_| database("match target rows"))?;
+        let result: Result<Vec<(u64, Option<u64>, u64)>, _> =
+            self.connect()?.exec(sql, Params::Positional(parameters));
+        let Ok(rows) = result else {
+            self.connection = None;
+            self.verified = false;
+            return Err(database("match target rows"));
+        };
         let mut current = None;
         for (request_index, id, count) in rows {
             let request_index = usize::try_from(request_index)

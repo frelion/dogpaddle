@@ -6,7 +6,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::SchemaBoundChangeCodec;
 
 use super::*;
-use crate::operation::sink::buffered::{DeliveryBatch, SinkTarget};
+use crate::operation::sink::buffered::DeliveryBatch;
 
 #[derive(Default)]
 struct Target {
@@ -104,10 +104,9 @@ fn delivery(rows: &[(i64, i64)], admissions: &[u64]) -> DeliveryBatch {
 
 fn assert_plan_roundtrip(input: &DeliveryBatch, checkpoint: u64, batch: &Batch) {
     let mut encoded = Vec::new();
-    RelationSinkTarget::<Target>::encode_plan(batch, &mut encoded);
+    encode_plan(batch, &mut encoded);
     let mut cursor = encoded.as_slice();
-    let recovered =
-        RelationSinkTarget::<Target>::decode_plan(&mut cursor, input, &checkpoint).unwrap();
+    let recovered = decode_plan(&mut cursor, input, checkpoint).unwrap();
     assert!(cursor.is_empty());
     assert_eq!(&recovered, batch);
 }
@@ -269,14 +268,12 @@ fn last_technical_id_is_usable_but_an_event_cannot_partly_overflow() {
 
 #[test]
 fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
-    type Adapter = RelationSinkTarget<Target>;
-
     let input = delivery(&[(7, 1), (7, -1)], &[1, 1]);
-    let mut adapter = Adapter::new(Target::default());
-    let (checkpoint, plan) = adapter.prepare(&input, &1).unwrap();
+    let mut target = Target::default();
+    let (checkpoint, plan) = prepare(&mut target, &input, 1).unwrap();
     let mut encoded = Vec::new();
-    Adapter::encode_checkpoint(&checkpoint, &mut encoded);
-    Adapter::encode_plan(&plan, &mut encoded);
+    encode_checkpoint(checkpoint, &mut encoded);
+    encode_plan(&plan, &mut encoded);
     assert_eq!(
         encoded,
         [
@@ -290,15 +287,15 @@ fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
     );
 
     let mut cursor = encoded.as_slice();
-    let decoded_checkpoint = Adapter::decode_checkpoint(&mut cursor).unwrap();
-    let decoded = Adapter::decode_plan(&mut cursor, &input, &decoded_checkpoint).unwrap();
+    let decoded_checkpoint = decode_checkpoint(&mut cursor).unwrap();
+    let decoded = decode_plan(&mut cursor, &input, decoded_checkpoint).unwrap();
     assert!(cursor.is_empty());
     assert_eq!(decoded, plan);
 
     for end in 0..encoded.len() {
         let mut cursor = &encoded[..end];
-        let result = Adapter::decode_checkpoint(&mut cursor)
-            .and_then(|checkpoint| Adapter::decode_plan(&mut cursor, &input, &checkpoint));
+        let result = decode_checkpoint(&mut cursor)
+            .and_then(|checkpoint| decode_plan(&mut cursor, &input, checkpoint));
         assert!(
             result.is_err(),
             "accepted truncated relation state at {end}"
@@ -306,7 +303,7 @@ fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
     }
     let different = delivery(&[(7, 1), (8, -1)], &[1, 1]);
     let mut cursor = encoded[8..].as_ref();
-    assert!(Adapter::decode_plan(&mut cursor, &different, &checkpoint).is_err());
+    assert!(decode_plan(&mut cursor, &different, checkpoint).is_err());
 }
 
 #[test]
@@ -406,11 +403,10 @@ fn duplicate_technical_ids_remain_a_plan_validation_error() {
 
 #[test]
 fn relation_recovery_rejects_positive_work_beyond_the_id_frontier() {
-    let adapter = RelationSinkTarget::new(Target::default());
-    assert!(adapter.validate_recovery(&EXHAUSTED_ID, 0).is_ok());
-    assert!(adapter.validate_recovery(&EXHAUSTED_ID, 1).is_err());
-    assert!(adapter.validate_recovery(&(EXHAUSTED_ID - 2), 2).is_ok());
-    assert!(adapter.validate_recovery(&(EXHAUSTED_ID - 2), 3).is_err());
+    assert!(validate_recovery(EXHAUSTED_ID, 0).is_ok());
+    assert!(validate_recovery(EXHAUSTED_ID, 1).is_err());
+    assert!(validate_recovery(EXHAUSTED_ID - 2, 2).is_ok());
+    assert!(validate_recovery(EXHAUSTED_ID - 2, 3).is_err());
 }
 
 fn repeated_binary_change(payload_bytes: usize, diffs: [i64; 2]) -> Change {

@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -11,29 +10,26 @@ use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{Cell, OrderedMap, Store, Transactions};
 
 use super::*;
+use crate::operation::relation::canonical_row;
 use crate::operation::sink::buffered::{
     batch::encoded_item_bytes,
     state::{Header, Position},
 };
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Plan {
-    start: u64,
-    events: u64,
-    fingerprint: u64,
-}
+use crate::operation::sink::relation::{self, Batch, Insert, Lookup, Matches, RelationTarget};
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent one-shot faults keep each recovery test explicit.
 struct TargetState {
     present: bool,
     initialize_calls: usize,
-    prepare_calls: usize,
+    lookup_calls: usize,
     delivery_attempts: usize,
-    delivered: BTreeMap<u64, Plan>,
+    delivered: Vec<Batch>,
+    rows: BTreeMap<u64, Vec<u8>>,
+    fail_lookup_once: bool,
     fail_before_delivery_once: bool,
     fail_after_delivery_once: bool,
     event_bytes: u64,
-    recovery_positive_capacity: Option<u64>,
 }
 
 struct Target {
@@ -46,12 +42,7 @@ impl Target {
     }
 }
 
-impl SinkTarget for Target {
-    type Checkpoint = u64;
-    type Plan = Plan;
-
-    const MAX_BATCH_EVENTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
-
+impl RelationTarget for Target {
     fn require_absent(&mut self) -> Result<(), OperationError> {
         if self.state.lock().unwrap().present {
             Err(invalid("fake target already exists"))
@@ -67,146 +58,76 @@ impl SinkTarget for Target {
         Ok(())
     }
 
-    fn initial_checkpoint(&self) -> Self::Checkpoint {
-        0
-    }
-
     fn event_bytes(&self, _input: &Change, _row_index: usize) -> Result<u64, OperationError> {
         Ok(self.state.lock().unwrap().event_bytes.max(1))
     }
 
-    fn validate_admission(
-        &self,
-        _input: &Change,
-        _checkpoint: &Self::Checkpoint,
-        _buffered_events: u64,
-    ) -> Result<(), OperationError> {
-        Ok(())
-    }
-
-    fn validate_recovery(
-        &self,
-        _checkpoint: &Self::Checkpoint,
-        remaining_positive_events: u64,
-    ) -> Result<(), OperationError> {
-        if self
-            .state
-            .lock()
-            .unwrap()
-            .recovery_positive_capacity
-            .is_some_and(|capacity| remaining_positive_events > capacity)
-        {
-            Err(invalid("fake recovery capacity is exhausted"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn prepare(
+    fn lookup(
         &mut self,
-        input: &DeliveryBatch,
-        checkpoint: &Self::Checkpoint,
-    ) -> Result<(Self::Checkpoint, Self::Plan), OperationError> {
-        self.state.lock().unwrap().prepare_calls += 1;
-        let events = batch::event_count(input.change())?;
-        let start = *checkpoint;
-        let checkpoint = checkpoint
-            .checked_add(events)
-            .ok_or_else(|| invalid("fake checkpoint overflow"))?;
-        Ok((
-            checkpoint,
-            Plan {
-                start,
-                events,
-                fingerprint: fingerprint(input),
-            },
-        ))
+        input: &Change,
+        requests: &[Lookup],
+    ) -> Result<Vec<Matches>, OperationError> {
+        let mut state = self.state.lock().unwrap();
+        state.lookup_calls += 1;
+        if std::mem::take(&mut state.fail_lookup_once) {
+            return Err(invalid("fake lookup failed"));
+        }
+        requests
+            .iter()
+            .map(|request| {
+                let row = canonical_row(input.records(), request.row_index)?;
+                let matching = state
+                    .rows
+                    .iter()
+                    .filter(|(_, stored)| **stored == row)
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                Ok(Matches {
+                    count: u64::try_from(matching.len()).unwrap().min(request.needed),
+                    ids: matching.into_iter().take(request.take).collect(),
+                })
+            })
+            .collect()
     }
 
-    fn deliver(&mut self, input: &DeliveryBatch, plan: &Self::Plan) -> Result<(), OperationError> {
-        let expected = Plan {
-            start: plan.start,
-            events: batch::event_count(input.change())?,
-            fingerprint: fingerprint(input),
-        };
-        if *plan != expected {
-            return Err(invalid("fake plan differs from its delivery"));
-        }
-
+    fn write_batch(&mut self, input: &Change, plan: &Batch) -> Result<(), OperationError> {
         let mut state = self.state.lock().unwrap();
         state.delivery_attempts += 1;
         if std::mem::take(&mut state.fail_before_delivery_once) {
             return Err(invalid("fake delivery failed before commit"));
         }
-        match state.delivered.get(&plan.start) {
-            Some(previous) if previous != plan => {
-                return Err(invalid(
-                    "fake mutation identity was reused with a different plan",
-                ));
+        let mut rows = state.rows.clone();
+        for insert in &plan.inserts {
+            let row = canonical_row(input.records(), usize::try_from(insert.row_index).unwrap())?;
+            match rows.entry(insert.technical_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &row => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(invalid("fake mutation ID belongs to a different row"));
+                }
             }
-            Some(_) => {}
-            None => {
-                state.delivered.insert(plan.start, plan.clone());
+        }
+        for delete in &plan.deletes {
+            let row = canonical_row(input.records(), usize::try_from(delete.row_index).unwrap())?;
+            if rows
+                .get(&delete.technical_id)
+                .is_some_and(|stored| stored != &row)
+            {
+                return Err(invalid("fake deletion ID belongs to a different row"));
             }
+            rows.remove(&delete.technical_id);
+        }
+        state.rows = rows;
+        if !state.delivered.contains(plan) {
+            state.delivered.push(plan.clone());
         }
         if std::mem::take(&mut state.fail_after_delivery_once) {
             return Err(invalid("fake delivery result was uncertain"));
         }
         Ok(())
     }
-
-    fn encode_checkpoint(checkpoint: &Self::Checkpoint, output: &mut Vec<u8>) {
-        output.extend(checkpoint.to_be_bytes());
-    }
-
-    fn decode_checkpoint(input: &mut &[u8]) -> Result<Self::Checkpoint, OperationError> {
-        Ok(u64::from_be_bytes(state::read(input)?))
-    }
-
-    fn encode_plan(plan: &Self::Plan, output: &mut Vec<u8>) {
-        output.push(1);
-        output.extend(plan.start.to_be_bytes());
-        output.extend(plan.events.to_be_bytes());
-        output.extend(plan.fingerprint.to_be_bytes());
-    }
-
-    fn decode_plan(
-        input: &mut &[u8],
-        change: &DeliveryBatch,
-        checkpoint: &Self::Checkpoint,
-    ) -> Result<Self::Plan, OperationError> {
-        if state::read::<1>(input)? != [1] {
-            return Err(invalid("unknown fake-plan version"));
-        }
-        let plan = Plan {
-            start: u64::from_be_bytes(state::read(input)?),
-            events: u64::from_be_bytes(state::read(input)?),
-            fingerprint: u64::from_be_bytes(state::read(input)?),
-        };
-        if plan.start.checked_add(plan.events) != Some(*checkpoint)
-            || plan.events != batch::event_count(change.change())?
-            || plan.fingerprint != fingerprint(change)
-        {
-            return Err(invalid(
-                "fake plan does not match its reconstructed delivery",
-            ));
-        }
-        Ok(plan)
-    }
-}
-
-fn fingerprint(batch: &DeliveryBatch) -> u64 {
-    let values = batch.change().records().column(0);
-    let values = values.as_any().downcast_ref::<UInt64Array>().unwrap();
-    batch.change().diffs().values().iter().enumerate().fold(
-        0xcbf2_9ce4_8422_2325_u64,
-        |hash, (row, diff)| {
-            hash.wrapping_mul(0x100_0000_01b3)
-                ^ u64::from_be_bytes(diff.to_be_bytes())
-                ^ batch.admission(row).rotate_left(17)
-                ^ values.value(row).rotate_left(31)
-        },
-    )
 }
 
 fn schema() -> SchemaRef {
@@ -259,12 +180,13 @@ impl Fixture {
             .create_data::<OrderedMap<u64, Vec<u8>>>("sink.buffer")
             .unwrap();
         let target = Arc::new(Mutex::new(TargetState::default()));
-        let operation = BufferedSink::new(
+        let mut operation = BufferedSink::new(
             SchemaBoundChangeCodec::try_new(Arc::clone(&schema)).unwrap(),
             Target::new(Arc::clone(&target)),
             control.clone(),
             buffer.clone(),
         );
+        operation.max_batch_events = 3;
         Self {
             root,
             path,
@@ -294,12 +216,13 @@ impl Fixture {
         let buffer = store
             .open_data::<OrderedMap<u64, Vec<u8>>>("sink.buffer")
             .unwrap();
-        let operation = BufferedSink::new(
+        let mut operation = BufferedSink::new(
             SchemaBoundChangeCodec::try_new(Arc::clone(&schema)).unwrap(),
             Target::new(Arc::clone(&target)),
             control.clone(),
             buffer.clone(),
         );
+        operation.max_batch_events = 3;
         Self {
             root,
             path,
@@ -396,8 +319,8 @@ fn assert_complete(action: Option<&Action>) {
     assert!(matches!(action, Some(Action::Complete(None))));
 }
 
-fn ready(bytes: &[u8]) -> Ready<u64> {
-    match state::decode_header::<Target>(bytes).unwrap() {
+fn ready(bytes: &[u8]) -> Ready {
+    match state::decode_header(bytes).unwrap() {
         Header::Ready(ready) => ready,
         Header::Initialize | Header::Prepared { .. } => panic!("expected Ready control state"),
     }
@@ -406,18 +329,18 @@ fn ready(bytes: &[u8]) -> Ready<u64> {
 #[test]
 fn control_codec_has_phase_goldens_and_rejects_corruption() {
     let delivery = DeliveryBatch::for_test(change(&[7], &[2]), vec![2]).unwrap();
-    let initialize = State::<u64, Plan>::Initialize;
-    assert_eq!(initialize.encode::<Target>(), [1, 0]);
+    let initialize = State::Initialize;
+    assert_eq!(initialize.encode(), [1, 0]);
     assert!(matches!(
-        State::<u64, Plan>::decode::<Target>(&[1, 0], None).unwrap(),
+        State::decode(&[1, 0], None).unwrap(),
         State::Initialize
     ));
 
-    let ready_state = State::<u64, Plan>::Ready(Ready {
+    let ready_state = State::Ready(Ready {
         buffer: BufferState::EMPTY,
         checkpoint: 9,
     });
-    let ready_bytes = ready_state.encode::<Target>();
+    let ready_bytes = ready_state.encode();
     assert_eq!(
         ready_bytes,
         [
@@ -425,9 +348,7 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
             0, 0, 0, 0, 0, 9,
         ]
     );
-    let State::Ready(decoded_ready) =
-        State::<u64, Plan>::decode::<Target>(&ready_bytes, None).unwrap()
-    else {
+    let State::Ready(decoded_ready) = State::decode(&ready_bytes, None).unwrap() else {
         panic!("expected Ready");
     };
     assert_eq!(decoded_ready.buffer, BufferState::EMPTY);
@@ -445,46 +366,54 @@ fn control_codec_has_phase_goldens_and_rejects_corruption() {
             retained_bytes: 100,
         },
         after: BufferState::EMPTY,
-        checkpoint: 7,
-        plan: Plan {
-            start: 5,
-            events: 2,
-            fingerprint: fingerprint(&delivery),
+        checkpoint: 3,
+        plan: Batch {
+            inserts: vec![
+                Insert {
+                    row_index: 0,
+                    technical_id: 1,
+                },
+                Insert {
+                    row_index: 0,
+                    technical_id: 2,
+                },
+            ],
+            deletes: Vec::new(),
         },
     });
-    let prepared_bytes = prepared.encode::<Target>();
+    let prepared_bytes = prepared.encode();
     let mut prepared_golden = vec![1, 2, 1];
     for value in [3_u64, 0, 2, 4, 2, 100] {
         prepared_golden.extend(value.to_be_bytes());
     }
     prepared_golden.push(0);
     prepared_golden.extend([0; size_of::<u64>() * 3]);
-    prepared_golden.extend(7_u64.to_be_bytes());
-    prepared_golden.push(1);
-    for value in [5_u64, 2, fingerprint(&delivery)] {
-        prepared_golden.extend(value.to_be_bytes());
+    prepared_golden.extend(3_u64.to_be_bytes());
+    prepared_golden.extend([1, 0, 2, 0, 0]);
+    for id in [1_u64, 2] {
+        prepared_golden.extend(0_u64.to_be_bytes());
+        prepared_golden.extend(id.to_be_bytes());
     }
     assert_eq!(prepared_bytes, prepared_golden);
-    let State::Prepared(decoded) =
-        State::<u64, Plan>::decode::<Target>(&prepared_bytes, Some(&delivery)).unwrap()
-    else {
+    let State::Prepared(decoded) = State::decode(&prepared_bytes, Some(&delivery)).unwrap() else {
         panic!("expected Prepared");
     };
     assert_eq!(decoded.before.head.unwrap().sequence, 3);
     assert_eq!(decoded.after, BufferState::EMPTY);
-    assert_eq!(decoded.plan.start, 5);
+    assert_eq!(decoded.plan.inserts.len(), 2);
+    assert_eq!(decoded.plan.inserts[0].technical_id, 1);
     for end in 0..prepared_bytes.len() {
         assert!(
-            State::<u64, Plan>::decode::<Target>(&prepared_bytes[..end], Some(&delivery)).is_err(),
+            State::decode(&prepared_bytes[..end], Some(&delivery)).is_err(),
             "accepted truncated control state at {end}"
         );
     }
     let mut trailing = prepared_bytes.clone();
     trailing.push(0);
-    assert!(State::<u64, Plan>::decode::<Target>(&trailing, Some(&delivery)).is_err());
+    assert!(State::decode(&trailing, Some(&delivery)).is_err());
     let mut corrupt_plan = prepared_bytes;
     *corrupt_plan.last_mut().unwrap() ^= 1;
-    assert!(State::<u64, Plan>::decode::<Target>(&corrupt_plan, Some(&delivery)).is_err());
+    assert!(State::decode(&corrupt_plan, Some(&delivery)).is_err());
 }
 
 #[test]
@@ -768,9 +697,9 @@ fn load_cache_and_prepared_intent_only_advance_after_commit() {
         fixture.rollback(None).unwrap(),
         Action::Commit(None)
     ));
-    assert_eq!(fixture.target.lock().unwrap().prepare_calls, 0);
+    assert!(matches!(&fixture.operation.phase, Phase::Ready(_)));
     assert!(matches!(
-        state::decode_header::<Target>(&fixture.control().unwrap()).unwrap(),
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
         Header::Ready(_)
     ));
 
@@ -779,16 +708,54 @@ fn load_cache_and_prepared_intent_only_advance_after_commit() {
         fixture.rollback(None).unwrap(),
         Action::Commit(None)
     ));
-    assert_eq!(fixture.target.lock().unwrap().prepare_calls, 1);
+    assert!(matches!(&fixture.operation.phase, Phase::Loaded(_)));
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 0);
     assert!(matches!(
-        state::decode_header::<Target>(&fixture.control().unwrap()).unwrap(),
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
         Header::Ready(_)
     ));
 
     assert_commit(fixture.commit(None).unwrap().as_ref());
-    assert_eq!(fixture.target.lock().unwrap().prepare_calls, 1);
+    assert!(matches!(&fixture.operation.phase, Phase::Delivered(_)));
     assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 1);
+}
+
+#[test]
+fn failed_lookup_and_rolled_back_prepared_write_replan_the_loaded_batch() {
+    let mut fixture = Fixture::create();
+    fixture.bootstrap();
+    assert_complete(fixture.commit(Some(&change(&[1], &[1]))).unwrap().as_ref());
+    for _ in 0..3 {
+        assert_commit(fixture.commit(None).unwrap().as_ref());
+    }
+    assert_complete(fixture.commit(Some(&change(&[1], &[-1]))).unwrap().as_ref());
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+
+    fixture.target.lock().unwrap().fail_lookup_once = true;
+    assert!(fixture.commit(None).is_err());
+    assert!(matches!(&fixture.operation.phase, Phase::Loaded(_)));
+    assert_eq!(fixture.target.lock().unwrap().lookup_calls, 1);
+    assert!(matches!(
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
+        Header::Ready(_)
+    ));
+
+    assert!(matches!(
+        fixture.rollback(None).unwrap(),
+        Action::Commit(None)
+    ));
+    assert_eq!(fixture.target.lock().unwrap().lookup_calls, 2);
+    assert!(matches!(&fixture.operation.phase, Phase::Loaded(_)));
+    assert!(matches!(
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
+        Header::Ready(_)
+    ));
+
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert_eq!(fixture.target.lock().unwrap().lookup_calls, 3);
+    assert_eq!(fixture.target.lock().unwrap().delivery_attempts, 2);
+    assert_commit(fixture.commit(None).unwrap().as_ref());
+    assert!(fixture.target.lock().unwrap().rows.is_empty());
 }
 
 #[test]
@@ -800,7 +767,7 @@ fn continuous_claim_is_held_while_threshold_drains_and_then_is_admitted() {
     assert_complete(fixture.commit(Some(&buffered)).unwrap().as_ref());
 
     assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
-    assert_eq!(fixture.target.lock().unwrap().prepare_calls, 0);
+    assert!(matches!(&fixture.operation.phase, Phase::Loaded(_)));
     assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
     assert_eq!(fixture.target.lock().unwrap().delivered.len(), 1);
     assert_commit(fixture.commit(Some(&offered)).unwrap().as_ref());
@@ -828,9 +795,12 @@ fn one_large_diff_is_settled_across_bounded_batches() {
     }
     assert!(fixture.commit(None).unwrap().is_none());
     let delivered = fixture.target.lock().unwrap();
-    assert_eq!(delivered.delivered[&0].events, 3);
-    assert_eq!(delivered.delivered[&3].events, 3);
-    assert_eq!(delivered.delivered[&6].events, 1);
+    assert_eq!(delivered.delivered[0].inserts.len(), 3);
+    assert_eq!(delivered.delivered[1].inserts.len(), 3);
+    assert_eq!(delivered.delivered[2].inserts.len(), 1);
+    assert_eq!(delivered.delivered[0].inserts[0].technical_id, 1);
+    assert_eq!(delivered.delivered[1].inserts[0].technical_id, 4);
+    assert_eq!(delivered.delivered[2].inserts[0].technical_id, 7);
 }
 
 #[test]
@@ -845,7 +815,7 @@ fn prepared_delivery_is_rebuilt_after_an_uncertain_result() {
     assert_eq!(fixture.target.lock().unwrap().delivered.len(), 1);
     assert!(fixture.entry(0).is_some());
     assert!(matches!(
-        state::decode_header::<Target>(&fixture.control().unwrap()).unwrap(),
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
         Header::Prepared { .. }
     ));
 
@@ -892,7 +862,7 @@ fn settlement_rollback_keeps_the_prepared_state_and_complete_entries() {
     ));
     assert!(fixture.entry(0).is_some());
     assert!(matches!(
-        state::decode_header::<Target>(&fixture.control().unwrap()).unwrap(),
+        state::decode_header(&fixture.control().unwrap()).unwrap(),
         Header::Prepared { .. }
     ));
     assert_commit(fixture.commit(None).unwrap().as_ref());
@@ -906,7 +876,6 @@ fn recovery_rejects_a_forged_settlement_before_decoding_its_plan() {
     let input_change = change(&[1], &[5]);
     assert_complete(fixture.commit(Some(&input_change)).unwrap().as_ref());
     let before = ready(&fixture.control().unwrap());
-    let delivery = DeliveryBatch::for_test(change(&[1], &[3]), vec![5]).unwrap();
     let forged = State::Prepared(Prepared {
         before: before.buffer,
         after: BufferState {
@@ -919,14 +888,18 @@ fn recovery_rejects_a_forged_settlement_before_decoding_its_plan() {
             pending_events: 1,
             retained_bytes: before.buffer.retained_bytes,
         },
-        checkpoint: 3,
-        plan: Plan {
-            start: 0,
-            events: 3,
-            fingerprint: fingerprint(&delivery),
+        checkpoint: 4,
+        plan: Batch {
+            inserts: (1..=3)
+                .map(|technical_id| Insert {
+                    row_index: 0,
+                    technical_id,
+                })
+                .collect(),
+            deletes: Vec::new(),
         },
     })
-    .encode::<Target>();
+    .encode();
     let transaction = fixture.transactions.begin();
     fixture
         .control
@@ -951,8 +924,8 @@ fn oversized_event_and_item_are_rejected_without_partial_admission() {
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
     let target = Target::new(Arc::new(Mutex::new(TargetState::default())));
     let codec = codec();
-    assert!(prepare_admission(&codec, &target, &0, 0, &change(&[1], &[1_048_576])).is_ok());
-    assert!(prepare_admission(&codec, &target, &0, 0, &change(&[1], &[1_048_577])).is_err());
+    assert!(prepare_admission(&codec, &target, 1, 0, &change(&[1], &[1_048_576])).is_ok());
+    assert!(prepare_admission(&codec, &target, 1, 0, &change(&[1], &[1_048_577])).is_err());
     assert!(batch::event_count(&change(&[1, 2], &[i64::MIN, i64::MIN])).is_err());
 
     let binary_schema = Arc::new(Schema::new(vec![Field::new(
@@ -971,7 +944,7 @@ fn oversized_event_and_item_are_rejected_without_partial_admission() {
         Int64Array::from(vec![1]),
     )
     .unwrap();
-    assert!(prepare_admission(&binary_codec, &target, &0, 0, &oversized).is_err());
+    assert!(prepare_admission(&binary_codec, &target, 1, 0, &oversized).is_err());
 }
 
 #[test]
@@ -990,7 +963,7 @@ fn target_byte_charge_slices_delivery_and_rejects_one_oversized_event_before_ack
     }
     let target = fixture.target.lock().unwrap();
     assert_eq!(target.delivered.len(), 3);
-    assert!(target.delivered.values().all(|plan| plan.events == 1));
+    assert!(target.delivered.iter().all(|plan| plan.inserts.len() == 1));
     drop(target);
     assert!(ready(&fixture.control().unwrap()).buffer.is_empty());
 
@@ -1013,7 +986,16 @@ fn restore_checks_positive_capacity_before_any_target_io() {
             .unwrap()
             .as_ref(),
     );
-    fixture.target.lock().unwrap().recovery_positive_capacity = Some(1);
+    let mut durable = ready(&fixture.control().unwrap());
+    durable.checkpoint = relation::MAX_TECHNICAL_ID + 1;
+    let transaction = fixture.transactions.begin();
+    fixture
+        .control
+        .access(transaction.access())
+        .unwrap()
+        .set(&State::Ready(durable).encode())
+        .unwrap();
+    transaction.commit().unwrap();
 
     let mut fixture = fixture.reopen();
     assert!(fixture.commit(None).is_err());
@@ -1103,7 +1085,7 @@ fn restore_validates_every_buffer_entry_and_accounting_before_delivery() {
     );
     let mut durable = ready(&miscounted.control().unwrap());
     durable.buffer.pending_events += 1;
-    let encoded = State::<u64, Plan>::Ready(durable).encode::<Target>();
+    let encoded = State::Ready(durable).encode();
     let transaction = miscounted.transactions.begin();
     miscounted
         .control
@@ -1136,7 +1118,7 @@ fn restore_validation_crosses_scan_pages_before_external_io() {
         .map(|encoded| encoded_item_bytes(encoded).unwrap())
         .sum::<u64>()
         + encoded_item_bytes(&malformed).unwrap();
-    let control = State::<u64, Plan>::Ready(Ready {
+    let control = State::Ready(Ready {
         buffer: BufferState {
             head: Some(Position {
                 sequence: 0,
@@ -1147,9 +1129,9 @@ fn restore_validation_crosses_scan_pages_before_external_io() {
             pending_events: u64::try_from(count).unwrap(),
             retained_bytes,
         },
-        checkpoint: 0,
+        checkpoint: 1,
     })
-    .encode::<Target>();
+    .encode();
     let transaction = fixture.transactions.begin();
     let access = transaction.access();
     let mut buffer = fixture.buffer.access(access).unwrap();
