@@ -56,8 +56,8 @@ runtime Operation 只保存执行参数、已取得的 collection handle 与可�
 
 ## 装配所有权
 
-assembly 必须先按拓扑派生每条 edge 的确定性 subscriber ID，从 producer 的完整 `SubscribedLog` handle 派生对应 `Subscription`，再把每个 producer 的 writer、capacity 与已绑定 Station 最终 exact logical Schema 的 Change codec 唯一 move 进一个 `Arc<Output>`；producer Station 和所有 `InputPort` 只共享该 `Arc<Output>`，每个 `InputPort` 另持有自己唯一的 `Subscription`，不得另存完整 log handle 或第二份 Schema 判断。
-assembly 只消费已经逐项构造和校验的 Operation 列表，并拆成首 Operation 与 Atomic 尾链，不重新判断融合资格或改变列表顺序。
+拓扑校验在 consumer Station 声明顺序和 input port 顺序中派生每条 edge 的确定性 subscriber ID；assembly 从 producer 的完整 `SubscribedLog` handle 派生对应 `Subscription`，再把每个 producer 的 writer、capacity 与已绑定 Station 最终 exact logical Schema 的 Change codec 唯一 move 进一个 `Arc<Output>`；producer Station 和所有 `InputPort` 只共享该 `Arc<Output>`，每个 `InputPort` 另持有自己唯一的 `Subscription`，不得另存完整 log handle 或第二份 Schema 判断。
+`construct_stations` 逐项构造和校验 Operation，并在创建 `StationParts` 时拆成首 Operation 与 Atomic 尾链；`assemble_flow` 只连接这些已构造的 Station 构件，不重新判断融合资格或改变列表顺序。
 Store 的 collection kind、稳定资源名和 codec 共同构成持久化 schema；Store catalog 只验证 kind，每项 Operation tag 对应的代码 schema 负责具体 key/value codec 一致性。
 Flow 的每个起点必须是首项为 Scan 的 Station，每个终点必须是独占 Sink Station；允许多个起点、多个终点和多个合法 DAG 分量，Sink 没有 output，任何 Scan 或 Transform output 都必须至少有一个直接 consumer。
 
@@ -89,7 +89,10 @@ Flow 不得复制 subscriber positions、retained-byte 计费或回收逻辑，�
 
 ## 源码职责与能力边界
 
-`build/` 拥有声明、定义、编码、校验与 build/open，`schema.rs` 只在拓扑和 Station program 顺序中构造最终 Operation。
+`build/` 拥有声明、定义、编码、校验与 build/open；`build/validate.rs` 同时派生调度顺序、subscriber ID 和各 output 的 subscriber 数。
+
+`assembly.rs` 按调度顺序传播 Schema 并构造 Operation，按声明顺序保存 Station 构件；build 初始化状态、open 验证状态后，两条路径都在这里组装最终 Flow。
+Operation 的 Schema 绑定失败直接映射到 `FlowError::Schema { station_id, operation, source }`，不增加单变体的错误包装层；Store 资源缺失和其他 setup 错误继续保持各自的失败分类。
 
 `flow/runtime.rs` 保存轻量 Station ID、运行对象、确定性 schedule 与读写事务能力；`flow/advance.rs` 保存调度 outcome 和 advance。
 

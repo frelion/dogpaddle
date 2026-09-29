@@ -1,7 +1,7 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use arrow_schema::{DataType, TimeUnit};
-use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
     OperationBindError, ScalarValue, cast, col, encode_definition, lit,
     operation::{
@@ -37,7 +37,7 @@ fn build_reports_the_exact_projection_schema_rejection_without_creating_a_store(
     factory.materialize(scan, CAPACITY);
     factory.materialize(project, CAPACITY);
 
-    let Err(FlowError::Schema(error)) = factory.build() else {
+    let Err(error @ FlowError::Schema { .. }) = factory.build() else {
         panic!("schema-incompatible Flow did not return FlowError::Schema");
     };
     assert_projection_field_rejection(&error);
@@ -66,7 +66,7 @@ fn build_reports_a_multi_input_schema_rejection_without_store_side_effects() {
         factory.materialize(station, CAPACITY);
     }
 
-    let Err(FlowError::Schema(error)) = factory.build() else {
+    let Err(error @ FlowError::Schema { .. }) = factory.build() else {
         panic!("schema-incompatible UnionAll Flow unexpectedly built");
     };
     assert_union_schema_mismatch(&error, 1);
@@ -84,7 +84,8 @@ fn build_reports_sqlite_identifier_collisions_without_creating_either_database()
     let select =
         SelectDefinition::try_new([("Name", col("value")), ("name", col("value"))]).unwrap();
 
-    let Err(FlowError::Schema(error)) = build_select_sqlite_flow(&flow_path, &sqlite_path, select)
+    let Err(error @ FlowError::Schema { .. }) =
+        build_select_sqlite_flow(&flow_path, &sqlite_path, select)
     else {
         panic!("SQLite-incompatible output Schema unexpectedly built");
     };
@@ -141,7 +142,7 @@ fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources()
 
     let mut open = FlowFactory::new(&path);
     open.owner_identity(OWNER_IDENTITY);
-    let Err(FlowError::Schema(error)) = open.open() else {
+    let Err(error @ FlowError::Schema { .. }) = open.open() else {
         panic!("open did not rebind the decoded schema-incompatible Project");
     };
     assert_projection_field_rejection(&error);
@@ -184,7 +185,7 @@ fn open_rebinds_decoded_multi_input_definitions() {
     rewrite_checksum(&mut definition);
     replace_published_definition(&union_path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::new(&union_path).open() else {
+    let Err(error @ FlowError::Schema { .. }) = FlowFactory::new(&union_path).open() else {
         panic!("open did not rebind the decoded schema-incompatible UnionAll");
     };
     assert_union_schema_mismatch(&error, 1);
@@ -214,7 +215,7 @@ fn open_rebinds_the_decoded_sqlite_sink_input_before_opening_its_database() {
     rewrite_checksum(&mut definition);
     replace_published_definition(&flow_path, &definition);
 
-    let Err(FlowError::Schema(error)) = FlowFactory::new(&flow_path).open() else {
+    let Err(error @ FlowError::Schema { .. }) = FlowFactory::new(&flow_path).open() else {
         panic!("open did not rebind the SQLite-incompatible output Schema");
     };
     assert_sqlite_identifier_collision(&error);
@@ -461,9 +462,15 @@ fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
     assert_eq!((project_output.head, project_output.tail), (1, 1));
 }
 
-fn assert_projection_field_rejection(error: &FlowSchemaError) {
-    assert_eq!(error.station_id(), "project");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+fn assert_projection_field_rejection(error: &FlowError) {
+    let FlowError::Schema {
+        station_id, source, ..
+    } = error
+    else {
+        panic!("expected Flow Schema error");
+    };
+    assert_eq!(station_id, "project");
+    let OperationBindError::Rejected { source } = source else {
         panic!("Project returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -472,9 +479,15 @@ fn assert_projection_field_rejection(error: &FlowSchemaError) {
     ));
 }
 
-fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
-    assert_eq!(error.station_id(), "union");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+fn assert_union_schema_mismatch(error: &FlowError, input: usize) {
+    let FlowError::Schema {
+        station_id, source, ..
+    } = error
+    else {
+        panic!("expected Flow Schema error");
+    };
+    assert_eq!(station_id, "union");
+    let OperationBindError::Rejected { source } = source else {
         panic!("UnionAll returned a non-concrete Schema binding error");
     };
     assert!(matches!(
@@ -484,9 +497,15 @@ fn assert_union_schema_mismatch(error: &FlowSchemaError, input: usize) {
     ));
 }
 
-fn assert_sqlite_identifier_collision(error: &FlowSchemaError) {
-    assert_eq!(error.station_id(), "sqlite");
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+fn assert_sqlite_identifier_collision(error: &FlowError) {
+    let FlowError::Schema {
+        station_id, source, ..
+    } = error
+    else {
+        panic!("expected Flow Schema error");
+    };
+    assert_eq!(station_id, "sqlite");
+    let OperationBindError::Rejected { source } = source else {
         panic!("SQLite identifier collision returned the wrong binding error");
     };
     assert!(matches!(

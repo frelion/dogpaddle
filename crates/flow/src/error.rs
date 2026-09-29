@@ -1,11 +1,11 @@
 use thiserror::Error;
 
 use dogpaddle_change::CodecError as ChangeCodecError;
-use dogpaddle_operation::OperationSetupError;
+use dogpaddle_operation::{OperationBindError, OperationSetupError};
 use dogpaddle_store::{StoreError, StoreError::DataNotFound};
 
 use crate::{
-    build::{FlowDefinitionError, FlowSchemaError, TopologyError},
+    build::{FlowDefinitionError, TopologyError},
     station::StationError,
 };
 
@@ -47,8 +47,16 @@ pub enum FlowError {
     #[error(transparent)]
     Definition(#[from] FlowDefinitionError),
     /// One Station rejected the exact Schemas supplied through its inputs.
-    #[error(transparent)]
-    Schema(#[from] FlowSchemaError),
+    #[error("station {station_id:?} operation {operation} has an invalid schema binding: {source}")]
+    Schema {
+        /// Stable ID of the Station whose binding failed.
+        station_id: String,
+        /// Zero-based Operation ordinal inside the Station.
+        operation: usize,
+        /// Operation-level binding failure.
+        #[source]
+        source: OperationBindError,
+    },
     /// Store creation, lookup, transaction, or persistence failed.
     #[error(transparent)]
     Store(#[from] StoreError),

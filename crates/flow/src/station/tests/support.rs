@@ -376,7 +376,6 @@ fn runtime_fixture(
             });
             StationParts::new(
                 active,
-                inputs.len(),
                 vec![turn_operation(ScriptedOperation::returning(action))],
                 output,
             )
@@ -504,7 +503,7 @@ fn raw_station_with_program(
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let parts = StationParts::new(active, inputs.len(), vec![operation], None);
+    let parts = StationParts::new(active, vec![operation], None);
     let subscribers = {
         let mut counts = vec![0_u64; output_count];
         for input in inputs {
@@ -573,9 +572,11 @@ pub(super) fn reopen_multi_input(fixture: MultiInputFixture, action: Action) -> 
         }
         counts
     };
-    let parts = station_parts(active, inputs.len(), action);
+    let parts = station_parts(active, action);
     let transaction = store.read_transaction();
-    parts.validate(0, transaction.access()).unwrap();
+    parts
+        .validate(0, inputs.len(), transaction.access())
+        .unwrap();
     for (log, subscribers) in logs.iter().zip(&subscribers) {
         log.validate(NonZeroU64::new(*subscribers).unwrap(), transaction.access())
             .unwrap();
@@ -594,10 +595,9 @@ pub(super) fn reopen_multi_input(fixture: MultiInputFixture, action: Action) -> 
     }
 }
 
-fn station_parts(active: Option<Cell<u32>>, input_count: usize, action: Action) -> StationParts {
+fn station_parts(active: Option<Cell<u32>>, action: Action) -> StationParts {
     StationParts::new(
         active,
-        input_count,
         vec![turn_operation(ScriptedOperation::returning(action))],
         None,
     )

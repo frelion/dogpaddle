@@ -1,6 +1,6 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
-use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory, FlowSchemaError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
     col, lit,
     operation::{
@@ -339,11 +339,11 @@ fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
     factory.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
     factory.materialize(scan, CAPACITY);
 
-    let Err(FlowError::Schema(FlowSchemaError::Operation {
+    let Err(FlowError::Schema {
         station_id,
         operation,
         source: _,
-    })) = factory.build()
+    }) = factory.build()
     else {
         panic!("invalid intermediate Schema unexpectedly built");
     };

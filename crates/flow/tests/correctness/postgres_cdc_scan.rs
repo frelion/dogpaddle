@@ -96,10 +96,10 @@ fn postgres_cdc_scan_schema_failure_is_pure_and_identifies_the_station() {
     let path = root.path().join("flow");
     let mut factory = factory(&path, "$dogpaddle.reserved");
     factory.resource("pg", config()).unwrap();
-    let Err(FlowError::Schema(error)) = factory.build() else {
+    let Err(FlowError::Schema { station_id, .. }) = factory.build() else {
         panic!("invalid bound schema")
     };
-    assert_eq!(error.station_id(), "pg");
+    assert_eq!(station_id, "pg");
     assert!(!path.exists());
 }
 

@@ -7,8 +7,7 @@ mod flow;
 mod station;
 
 pub use build::{
-    FlowDefinitionError, FlowFactory, FlowSchemaError, InvalidStationIdReason, OperationRef,
-    TopologyError,
+    FlowDefinitionError, FlowFactory, InvalidStationIdReason, OperationRef, TopologyError,
 };
 pub use error::{FlowError, FlowRunError};
 pub use flow::{AdvanceOutcome, Flow, InputStatus, OutputStatus, StationStatus};

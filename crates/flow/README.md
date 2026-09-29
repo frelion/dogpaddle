@@ -197,6 +197,7 @@ Station 首项并吸收后续 Atomic；Sink 独占。
 
 因此常见的拓扑、Schema 和资源类型错误不会留下目标目录。底层 Store 在创建后的失败仍可能留下一个
 不完整目录，`open` 会拒绝把它当成完整 Flow。
+算子 Schema 绑定失败直接由 `FlowError::Schema` 携带 Station ID、Station 内的 Operation 序号和具体绑定错误。
 
 构建规则包括：所有声明 ID 非空、唯一且不含 NUL；输入数和顺序必须与 Operation 一致；
 每个起点必须是 Scan，每个终点必须是 Sink。每个实际持久输出必须有消费者及非零容量；
@@ -289,8 +290,8 @@ backlog 的单位是完整 `Change`，不是行数。输出容量限制的是持
 2. [`src/flow/advance.rs`](src/flow/advance.rs)：一轮调度只有几十行，是运行入口。
 3. [`src/station/runtime.rs`](src/station/runtime.rs)：只包含运行态，一个 Station 如何执行首项、尾链、输出和提交。
 4. [`src/station/input.rs`](src/station/input.rs)：Claim、输入端口、订阅位置和多输入固定规则。
-5. [`src/build/schema.rs`](src/build/schema.rs)：全图 Schema 如何传播并逐项构造最终 Operation。
-6. [`src/assembly.rs`](src/assembly.rs)：构建期 `StationParts` 的初始化、恢复验证，以及已验证 Definition 如何变成运行期 Station。
+5. [`src/build/validate.rs`](src/build/validate.rs)：声明如何划分 Station，以及持久图如何校验并派生调度和订阅编号。
+6. [`src/assembly.rs`](src/assembly.rs)：沿拓扑传播 Schema、构造 Operation，初始化或验证 Station 状态，再组装运行对象。
 7. [`src/build/codec.rs`](src/build/codec.rs) 与 [`src/build/open.rs`](src/build/open.rs)：持久格式和恢复路径。
 
 Flow 只实现装配、拓扑、调度和事务边界，不枚举具体算子，也不包含 SQL planner。SQL 层用 owner identity

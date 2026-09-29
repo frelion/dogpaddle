@@ -3,11 +3,9 @@ use std::{collections::HashMap, num::NonZeroU64};
 use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
 
-use crate::assembly::{ResolvedTopology, resolve_topology};
-
 use super::{
     definition::{FlowDefinition, StationDefinition},
-    validate::{TopologyError, validate_decoded_topology, validate_station_ids},
+    validate::{ResolvedTopology, TopologyError, validate_decoded_topology, validate_station_ids},
 };
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
@@ -240,8 +238,7 @@ fn validate_definition(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    let schedule = validate_decoded_topology(&stations, &inputs_by_station)?;
-    let topology = resolve_topology(inputs_by_station, schedule);
+    let topology = validate_decoded_topology(&stations, inputs_by_station)?;
     Ok((FlowDefinition::new(owner_identity, stations), topology))
 }
 

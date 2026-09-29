@@ -8,6 +8,37 @@ use super::{
     definition::{FlowDefinition, StationDefinition},
 };
 
+#[derive(Debug)]
+pub(crate) struct ResolvedInput {
+    pub(crate) producer: usize,
+    pub(crate) subscriber: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedTopology {
+    pub(crate) inputs_by_station: Vec<Vec<ResolvedInput>>,
+    subscriber_counts: Vec<u64>,
+    pub(crate) schedule: Vec<usize>,
+}
+
+impl ResolvedTopology {
+    pub(crate) fn inputs(&self, station: usize) -> &[ResolvedInput] {
+        &self.inputs_by_station[station]
+    }
+
+    pub(crate) fn schedule(&self) -> &[usize] {
+        &self.schedule
+    }
+
+    pub(crate) fn subscriber_count(&self, station: usize) -> u64 {
+        self.subscriber_counts[station]
+    }
+
+    pub(crate) fn input_count(&self, station: usize) -> usize {
+        self.inputs_by_station[station].len()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum InvalidStationIdReason {
@@ -207,17 +238,20 @@ fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), Topol
 
 pub(super) fn validate_decoded_topology(
     stations: &[StationDefinition],
-    inputs_by_station: &[Vec<usize>],
-) -> Result<Vec<usize>, TopologyError> {
+    inputs_by_station: Vec<Vec<usize>>,
+) -> Result<ResolvedTopology, TopologyError> {
     validate_station_programs(stations)?;
     for (station, inputs) in inputs_by_station.iter().enumerate() {
         if inputs.contains(&station) {
             return Err(TopologyError::SelfLoop(stations[station].id.clone()));
         }
     }
-    let schedule = validate_topology(stations, inputs_by_station)?;
+    let topology = resolve_topology(inputs_by_station)?;
+    validate_endpoints(stations, &topology)?;
+    validate_input_counts(stations, &topology)?;
+    validate_inputs_have_output(stations, &topology)?;
     validate_output_capacities(stations)?;
-    Ok(schedule)
+    Ok(topology)
 }
 
 fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), TopologyError> {
@@ -235,32 +269,16 @@ fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), Topo
     Ok(())
 }
 
-fn validate_topology(
-    stations: &[StationDefinition],
-    inputs_by_station: &[Vec<usize>],
-) -> Result<Vec<usize>, TopologyError> {
-    let schedule = topological_schedule(inputs_by_station)?;
-    validate_endpoints(stations, inputs_by_station)?;
-    validate_input_counts(stations, inputs_by_station)?;
-    validate_inputs_have_output(stations, inputs_by_station)?;
-    Ok(schedule)
-}
-
 fn validate_endpoints(
     stations: &[StationDefinition],
-    inputs_by_station: &[Vec<usize>],
+    topology: &ResolvedTopology,
 ) -> Result<(), TopologyError> {
-    let mut has_consumer = vec![false; stations.len()];
-    for input in inputs_by_station.iter().flatten() {
-        has_consumer[*input] = true;
-    }
-
     for (index, station) in stations.iter().enumerate() {
-        let is_root = inputs_by_station[index].is_empty();
+        let is_root = topology.input_count(index) == 0;
         if is_root && !station.is_scan() {
             return Err(TopologyError::RootIsNotScan(station.id.clone()));
         }
-        if !has_consumer[index] && !station.is_sink() {
+        if topology.subscriber_count(index) == 0 && !station.is_sink() {
             return Err(TopologyError::TerminalIsNotSink(station.id.clone()));
         }
     }
@@ -269,13 +287,13 @@ fn validate_endpoints(
 
 fn validate_inputs_have_output(
     stations: &[StationDefinition],
-    inputs_by_station: &[Vec<usize>],
+    topology: &ResolvedTopology,
 ) -> Result<(), TopologyError> {
-    for (station, inputs) in inputs_by_station.iter().enumerate() {
+    for (station, inputs) in topology.inputs_by_station.iter().enumerate() {
         for input in inputs {
-            if !stations[*input].has_output() {
+            if !stations[input.producer].has_output() {
                 return Err(TopologyError::InputHasNoOutput {
-                    input_station: stations[*input].id.clone(),
+                    input_station: stations[input.producer].id.clone(),
                     station: stations[station].id.clone(),
                 });
             }
@@ -286,9 +304,9 @@ fn validate_inputs_have_output(
 
 fn validate_input_counts(
     stations: &[StationDefinition],
-    inputs_by_station: &[Vec<usize>],
+    topology: &ResolvedTopology,
 ) -> Result<(), TopologyError> {
-    for (station, inputs) in stations.iter().zip(inputs_by_station) {
+    for (station, inputs) in stations.iter().zip(&topology.inputs_by_station) {
         let expected = station.input_count();
         let actual = inputs.len();
         if actual != expected {
@@ -344,18 +362,32 @@ fn resolve_ref(
     }
 }
 
-pub(super) fn topological_schedule(
-    inputs_by_station: &[Vec<usize>],
-) -> Result<Vec<usize>, TopologyError> {
+fn resolve_topology(inputs_by_station: Vec<Vec<usize>>) -> Result<ResolvedTopology, TopologyError> {
     let station_count = inputs_by_station.len();
     let mut indegrees = vec![0_usize; station_count];
     let mut consumers_by_station = vec![Vec::new(); station_count];
-    for (station, inputs) in inputs_by_station.iter().enumerate() {
-        for input in inputs {
-            indegrees[station] += 1;
-            consumers_by_station[*input].push(station);
-        }
-    }
+    let mut subscriber_counts = vec![0_u64; station_count];
+    let inputs_by_station = inputs_by_station
+        .into_iter()
+        .enumerate()
+        .map(|(station, inputs)| {
+            inputs
+                .into_iter()
+                .map(|producer| {
+                    let subscriber = subscriber_counts[producer];
+                    subscriber_counts[producer] = subscriber
+                        .checked_add(1)
+                        .expect("a materialized Flow cannot contain u64::MAX edges");
+                    indegrees[station] += 1;
+                    consumers_by_station[producer].push(station);
+                    ResolvedInput {
+                        producer,
+                        subscriber,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
     let mut ready = indegrees
         .iter()
@@ -379,7 +411,11 @@ pub(super) fn topological_schedule(
     }
 
     if schedule.len() == station_count {
-        Ok(schedule)
+        Ok(ResolvedTopology {
+            inputs_by_station,
+            subscriber_counts,
+            schedule,
+        })
     } else {
         Err(TopologyError::Cycle)
     }

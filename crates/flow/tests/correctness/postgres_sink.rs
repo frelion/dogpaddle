@@ -85,11 +85,14 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
 
     factory.resource(SINK, config()).unwrap();
 
-    let Err(FlowError::Schema(error)) = factory.build() else {
+    let Err(FlowError::Schema {
+        station_id, source, ..
+    }) = factory.build()
+    else {
         panic!("PostgreSQL-incompatible field name unexpectedly bound");
     };
-    assert_eq!(error.station_id(), SINK);
-    let OperationBindError::Rejected { source } = error.operation_error() else {
+    assert_eq!(station_id, SINK);
+    let OperationBindError::Rejected { source } = source else {
         panic!("PostgreSQL field-name rejection returned the wrong binding error");
     };
     assert!(matches!(

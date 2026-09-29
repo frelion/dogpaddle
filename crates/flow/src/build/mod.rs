@@ -8,17 +8,20 @@ use std::{
 use dogpaddle_operation::{OperationDefinition, RuntimeResource};
 use dogpaddle_store::{Cell, StoreSetup};
 
-use crate::{assembly::assemble_stations, error::FlowError, flow::Flow};
+use crate::{
+    assembly::{assemble_flow, construct_stations},
+    error::FlowError,
+    flow::Flow,
+};
 
 pub(crate) mod codec;
 mod definition;
 mod open;
-mod schema;
 mod validate;
 
 pub use codec::FlowDefinitionError;
 pub(crate) use definition::FlowDefinition;
-pub use schema::FlowSchemaError;
+pub(crate) use validate::ResolvedTopology;
 pub use validate::{InvalidStationIdReason, TopologyError};
 
 static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -180,16 +183,10 @@ impl FlowFactory {
                 error => FlowError::Definition(error),
             })?;
         let resources = preflight_resources(&definition, resources)?;
-        let station_ids = definition
-            .stations()
-            .iter()
-            .map(|station| station.id().to_owned())
-            .collect();
-
         let mut setup = StoreSetup::new();
         let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;
         let station_parts =
-            schema::construct_stations(&definition, &topology, &mut setup.data_scope(), resources)?;
+            construct_stations(&definition, &topology, &mut setup.data_scope(), resources)?;
         let transactions = setup.commit(&path, |access| {
             for (index, station) in station_parts.iter().enumerate() {
                 station.initialize(topology.subscriber_count(index), access)?;
@@ -199,13 +196,11 @@ impl FlowFactory {
             Ok(())
         })?;
         let (transactions, reads) = transactions.split();
-        let assembled = assemble_stations(topology, station_parts);
-
-        Ok(Flow::from_parts(
+        Ok(assemble_flow(
             path,
-            station_ids,
-            assembled.stations,
-            assembled.schedule,
+            &definition,
+            topology,
+            station_parts,
             transactions,
             reads,
         ))

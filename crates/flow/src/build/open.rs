@@ -1,12 +1,12 @@
 use dogpaddle_store::{Cell, Store, StoreError};
 
 use crate::{
-    assembly::assemble_stations,
+    assembly::{assemble_flow, construct_stations},
     error::{FlowError, runtime_state_error},
     flow::Flow,
 };
 
-use super::{FlowFactory, codec, preflight_resources, schema};
+use super::{FlowFactory, codec, preflight_resources};
 
 impl FlowFactory {
     /// Opens a completely built Flow and reassembles all runtime stations.
@@ -38,31 +38,28 @@ impl FlowFactory {
             return Err(FlowError::OwnerIdentityMismatch);
         }
         let resources = preflight_resources(&definition, self.resources)?;
-        let station_ids = definition
-            .stations()
-            .iter()
-            .map(|station| station.id().to_owned())
-            .collect();
         let station_parts =
-            schema::construct_stations(&definition, &topology, &mut store.data_scope(), resources)?;
+            construct_stations(&definition, &topology, &mut store.data_scope(), resources)?;
         {
             let transaction = store.read_transaction();
             for (index, (station_definition, station)) in
                 definition.stations().iter().zip(&station_parts).enumerate()
             {
                 station
-                    .validate(topology.subscriber_count(index), transaction.access())
+                    .validate(
+                        topology.subscriber_count(index),
+                        topology.input_count(index),
+                        transaction.access(),
+                    )
                     .map_err(|source| runtime_state_error(station_definition.id(), source))?;
             }
         }
         let (transactions, reads) = store.into_transactions().split();
-        let assembled = assemble_stations(topology, station_parts);
-
-        Ok(Flow::from_parts(
+        Ok(assemble_flow(
             path,
-            station_ids,
-            assembled.stations,
-            assembled.schedule,
+            &definition,
+            topology,
+            station_parts,
             transactions,
             reads,
         ))
