@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{num::NonZeroU32, sync::Arc};
 
 use arrow_schema::SchemaRef;
@@ -5,10 +6,9 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ConstructedOperation, DefinitionCodecError,
+    codec::decode_json_payload,
+    definition::schema_error,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -22,7 +22,8 @@ pub(crate) const TAG: u16 = 8;
 /// interleaving follows the owning Station's input schedule and may change when
 /// inputs are rebatched. Each port's event order and the final relation remain
 /// unchanged.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnionAllDefinition {
     input_count: NonZeroU32,
 }
@@ -85,26 +86,15 @@ impl UnionAllDefinition {
 
     /// Returns the exact number of ordered inputs.
     #[must_use]
-    pub const fn input_count(&self) -> NonZeroU32 {
+    pub const fn input_count(self) -> NonZeroU32 {
         self.input_count
     }
 }
 
-impl SealedDefinition for UnionAllDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        inputs: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        Self::compile_schema(inputs).map(Some)
-    }
-
-    fn construct_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+impl UnionAllDefinition {
+    pub(crate) fn construct_unchecked(
+        self,
         input_schemas: &[SchemaRef],
-        _data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let output_schema = Self::compile_schema(input_schemas).map_err(schema_error)?;
         let input_count = usize::try_from(self.input_count.get())
@@ -121,7 +111,7 @@ impl SealedDefinition for UnionAllDefinition {
 }
 
 impl UnionAllDefinition {
-    fn compile_schema(
+    pub(crate) fn compile_schema(
         input_schemas: &[SchemaRef],
     ) -> Result<SchemaRef, crate::OperationSchemaError> {
         let output_schema = input_schemas
@@ -137,20 +127,6 @@ impl UnionAllDefinition {
             }
         }
         Ok(Arc::clone(output_schema))
-    }
-}
-
-impl OperationDefinition for UnionAllDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(self.input_count)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend_from_slice(&self.input_count.get().to_be_bytes());
     }
 }
 
@@ -183,11 +159,7 @@ impl AtomicOperation for UnionAllOperation {
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let input_count = NonZeroU32::new(cursor.read_u32()?).ok_or(
-        DefinitionCodecError::InvalidPayload("union-all input count must be non-zero"),
-    )?;
-    cursor.finish()?;
-    Ok(Box::new(UnionAllDefinition::new(input_count)))
+) -> Result<Box<UnionAllDefinition>, DefinitionCodecError> {
+    let definition: UnionAllDefinition = decode_json_payload(payload, "invalid UnionAll payload")?;
+    Ok(Box::new(definition))
 }

@@ -7,6 +7,7 @@ use std::{
 
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_expr::{Volatility, create_udf, expr::Cast, placeholder};
 use datafusion_proto::bytes::Serializeable;
@@ -34,20 +35,16 @@ fn filter(predicate: Expr) -> FilterDefinition {
 const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
 const MAP_EXPRESSION_PROBE: &str = "DOGPADDLE_MAP_EXPRESSION_PROBE";
 
-fn length_prefixed_bytes(encoded: &[u8], length_offset: usize) -> &[u8] {
-    let length = usize::try_from(u32::from_be_bytes(
-        encoded[length_offset..length_offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    let value_offset = length_offset + size_of::<u32>();
-    assert_eq!(value_offset + length, encoded.len());
-    &encoded[value_offset..]
+fn filter_with_protobuf(protobuf: &[u8]) -> Vec<u8> {
+    let canonical = encode_definition(&filter(lit(true)).into());
+    let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    encoded
+        .extend_from_slice(format!(r#"{{"predicate":"{}"}}"#, BASE64.encode(protobuf)).as_bytes());
+    encoded
 }
 
 #[test]
-fn expression_payloads_are_length_prefixed_canonical_datafusion_protobuf() {
+fn expression_payloads_are_base64_canonical_datafusion_protobuf() {
     let expressions = [
         col("value").eq(lit(7_u64)),
         !lit(false),
@@ -61,58 +58,70 @@ fn expression_payloads_are_length_prefixed_canonical_datafusion_protobuf() {
 
     for expression in expressions {
         let protobuf = expression.to_bytes().unwrap();
-        let encoded = encode_definition(&filter(expression));
+        let encoded = encode_definition(&filter(expression).into());
         assert_eq!(
-            &encoded[DEFINITION_HEADER_LEN..DEFINITION_HEADER_LEN + size_of::<u32>()],
-            &u32::try_from(protobuf.len()).unwrap().to_be_bytes(),
-        );
-        assert_eq!(
-            length_prefixed_bytes(&encoded, DEFINITION_HEADER_LEN),
-            protobuf.as_ref()
+            &encoded[DEFINITION_HEADER_LEN..],
+            format!(r#"{{"predicate":"{}"}}"#, BASE64.encode(protobuf.as_ref())).as_bytes()
         );
 
         let decoded = decode_definition(&encoded).unwrap();
-        assert_eq!(encode_definition(decoded.as_ref()), encoded);
+        assert_eq!(encode_definition(&decoded), encoded);
     }
 }
 
 #[test]
-fn expression_decoder_rejects_bad_lengths_malformed_and_noncanonical_protobuf() {
-    let canonical = encode_definition(&filter(lit(true)));
-    let protobuf = length_prefixed_bytes(&canonical, DEFINITION_HEADER_LEN).to_vec();
-    let wrap = |protobuf: &[u8]| {
-        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
-        encoded.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_be_bytes());
-        encoded.extend_from_slice(protobuf);
-        encoded
-    };
+fn expression_decoder_rejects_invalid_base64_malformed_and_noncanonical_protobuf() {
+    let canonical = encode_definition(&filter(lit(true)).into());
+    let protobuf = lit(true).to_bytes().unwrap();
 
-    for malformed in [wrap(&[]), wrap(&[u8::MAX])] {
+    for malformed in [filter_with_protobuf(&[]), filter_with_protobuf(&[u8::MAX])] {
         assert!(matches!(
-            decode_definition(&malformed),
-            Err(DefinitionCodecError::InvalidPayload(_))
+            decode_definition(&malformed).unwrap_err(),
+            DefinitionCodecError::InvalidJsonPayload {
+                reason: "DataFusion expression protobuf is invalid",
+                ..
+            }
         ));
     }
 
-    let mut forged_length = canonical.clone();
-    forged_length[DEFINITION_HEADER_LEN..DEFINITION_HEADER_LEN + size_of::<u32>()]
-        .copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut invalid_base64 = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    invalid_base64.extend_from_slice(br#"{"predicate":"***"}"#);
+    assert!(matches!(
+        decode_definition(&invalid_base64).unwrap_err(),
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "expression protobuf base64 is invalid",
+            ..
+        }
+    ));
+
+    let mut truncated = canonical;
+    truncated.pop();
     assert_eq!(
-        decode_definition(&forged_length).unwrap_err(),
+        decode_definition(&truncated).unwrap_err(),
         DefinitionCodecError::Truncated
     );
 
-    let mut protobuf_with_unknown_field = protobuf;
+    let mut protobuf_with_unknown_field = protobuf.to_vec();
     protobuf_with_unknown_field.extend_from_slice(&[0xf8, 0x07, 0x00]);
     assert!(matches!(
-        decode_definition(&wrap(&protobuf_with_unknown_field)),
-        Err(DefinitionCodecError::InvalidPayload(_))
+        decode_definition(&filter_with_protobuf(&protobuf_with_unknown_field)).unwrap_err(),
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "DataFusion expression protobuf is not canonical",
+            ..
+        }
     ));
+
+    let mut noncanonical_json = filter_with_protobuf(&protobuf);
+    noncanonical_json.insert(DEFINITION_HEADER_LEN + 1, b' ');
+    assert_eq!(
+        decode_definition(&noncanonical_json).unwrap_err(),
+        DefinitionCodecError::InvalidPayload("invalid Filter payload")
+    );
 }
 
 #[test]
 fn expression_decoder_never_panics_for_valid_header_arbitrary_payloads() {
-    let mut header = encode_definition(&filter(lit(true)));
+    let mut header = encode_definition(&filter(lit(true)).into());
     header.truncate(DEFINITION_HEADER_LEN);
     let mut state = 0xbb67_ae85_84ca_a73b_u64;
     for length in 0..=256 {
@@ -221,16 +230,16 @@ fn map_bearing_expression_is_rejected_consistently_across_processes() {
         ));
         assert!(matches!(
             decode_definition(&std::fs::read(path).unwrap()),
-            Err(DefinitionCodecError::InvalidPayload(_))
+            Err(DefinitionCodecError::InvalidJsonPayload {
+                reason: "DataFusion expression protobuf contains non-canonical map metadata",
+                ..
+            })
         ));
         return;
     }
 
     let protobuf = map_bearing_cast().to_bytes().unwrap();
-    let canonical = encode_definition(&filter(lit(true)));
-    let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
-    encoded.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_be_bytes());
-    encoded.extend_from_slice(&protobuf);
+    let encoded = filter_with_protobuf(&protobuf);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("map-bearing.definition");
     std::fs::write(&path, encoded).unwrap();
@@ -710,14 +719,14 @@ fn scalar_functions_of_every_volatility_require_an_unavailable_decode_registry()
 
 #[test]
 fn decoder_rejects_non_replayable_expressions_even_when_protobuf_is_canonical() {
-    let mut encoded = encode_definition(&filter(lit(true)));
-    encoded.truncate(DEFINITION_HEADER_LEN);
     let parameter = placeholder("$1").to_bytes().unwrap();
-    encoded.extend_from_slice(&u32::try_from(parameter.len()).unwrap().to_be_bytes());
-    encoded.extend_from_slice(&parameter);
+    let encoded = filter_with_protobuf(&parameter);
     assert!(matches!(
         decode_definition(&encoded),
-        Err(DefinitionCodecError::InvalidPayload(_))
+        Err(DefinitionCodecError::InvalidJsonPayload {
+            reason: "expression must be immutable and row-local",
+            ..
+        })
     ));
     assert!(matches!(
         FilterDefinition::try_new(placeholder("$1").eq(lit(1_u64))),

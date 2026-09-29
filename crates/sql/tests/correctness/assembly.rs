@@ -17,10 +17,10 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     drop(program.start(&path).unwrap());
     let definition = read_definition(&path);
 
-    assert_eq!(definition.len(), 814);
+    assert_eq!(definition.len(), 1046);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "0be4503bff723409ec2f7fc0f303946e0b5c6294f793892d33a6c0328017ff50"
+        "309085436cb3475edfdbd0342c06c4fcab40c27749742e04f60a98cdacccca61"
     );
 }
 

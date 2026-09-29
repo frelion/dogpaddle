@@ -1,4 +1,5 @@
-use std::{num::NonZeroU32, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion_common::DFSchema;
@@ -6,15 +7,16 @@ use thiserror::Error;
 
 use crate::{
     ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, OperationDefinition, OperationKind, RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ExpressionDefinitionError,
+    codec::decode_json_payload,
+    definition::schema_error,
     expression::{BoundProjection, StoredExpression},
 };
 
 pub(crate) const TAG: u16 = 7;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SelectField {
     name: String,
     expression: StoredExpression,
@@ -27,7 +29,8 @@ struct SelectField {
 /// may contain no fields. Output types and nullability come from `DataFusion`;
 /// input Schema metadata is preserved. Direct column references retain Field
 /// metadata; computed fields start with empty metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectDefinition {
     fields: Box<[SelectField]>,
 }
@@ -184,10 +187,9 @@ impl SelectDefinition {
     }
 }
 
-impl SealedDefinition for SelectDefinition {
-    fn output_schema_unchecked(
+impl SelectDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         self.bind_operation(&inputs[0])
@@ -195,12 +197,9 @@ impl SealedDefinition for SelectDefinition {
             .map_err(Into::into)
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
-        _data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -210,51 +209,9 @@ impl SealedDefinition for SelectDefinition {
     }
 }
 
-impl OperationDefinition for SelectDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        let count = u32::try_from(self.fields.len())
-            .expect("SelectDefinition::try_new validated the stable field count");
-        output.extend_from_slice(&count.to_be_bytes());
-        for field in &self.fields {
-            let name_length = u32::try_from(field.name.len())
-                .expect("SelectDefinition::try_new validated the stable field-name length");
-            output.extend_from_slice(&name_length.to_be_bytes());
-            output.extend_from_slice(field.name.as_bytes());
-            field.expression.encode(output);
-        }
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let count = cursor.read_u32()?;
-    let mut fields = Vec::new();
-    for _ in 0..count {
-        let name_length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("Select field-name length is invalid")
-        })?;
-        let name = cursor.read_bytes(name_length)?;
-        let name = std::str::from_utf8(name).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("Select field name is invalid UTF-8")
-        })?;
-        let expression = StoredExpression::decode(&mut cursor)?;
-        fields.push(SelectField {
-            name: name.to_owned(),
-            expression,
-        });
-    }
-    cursor.finish()?;
-    Ok(Box::new(SelectDefinition {
-        fields: fields.into_boxed_slice(),
-    }))
+) -> Result<Box<SelectDefinition>, DefinitionCodecError> {
+    let definition: SelectDefinition = decode_json_payload(payload, "invalid Select payload")?;
+    Ok(Box::new(definition))
 }

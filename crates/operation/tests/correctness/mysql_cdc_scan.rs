@@ -13,13 +13,13 @@ use dogpaddle_store::{Cell, Queue, Store, StoreSetup, Transactions};
 use super::support::{construct_checked_with_resource, decode_hex};
 
 fn construct_checked(
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     inputs: &[arrow_schema::SchemaRef],
 ) -> Result<Option<arrow_schema::SchemaRef>, dogpaddle_operation::OperationBindError> {
     construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config()))
 }
 
-fn definition() -> Box<dyn OperationDefinition> {
+fn definition() -> OperationDefinition {
     decode_definition(&literal_definition_bytes()).unwrap()
 }
 
@@ -57,14 +57,14 @@ fn mysql_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     let definition = definition();
     assert_eq!(definition.kind(), OperationKind::Scan);
     assert_eq!(definition.persistence_tag(), 15);
-    let bytes = encode_definition(definition.as_ref());
+    let bytes = encode_definition(&definition);
     let expected = literal_definition_bytes();
     assert_eq!(bytes, expected);
     let decoded = decode_definition(&bytes).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Scan);
     assert_eq!(decoded.persistence_tag(), 15);
-    assert_eq!(encode_definition(decoded.as_ref()), bytes);
-    let binding = construct_checked(decoded.as_ref(), &[]).unwrap();
+    assert_eq!(encode_definition(&decoded), bytes);
+    let binding = construct_checked(&decoded, &[]).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(output.fields().len(), 1);
     assert_eq!(output.field(0).name(), "id");

@@ -1,4 +1,5 @@
-use std::{num::NonZeroU32, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchOptions, make_array};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
@@ -9,10 +10,9 @@ use thiserror::Error;
 
 use crate::{
     ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, ExpressionError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ExpressionDefinitionError, ExpressionError,
+    codec::decode_json_payload,
+    definition::schema_error,
     expression::{BoundExpression, StoredExpression},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
@@ -24,7 +24,8 @@ pub(crate) const TAG: u16 = 5;
 /// The predicate is bound to the exact logical input Schema and must produce a
 /// Boolean. A row is retained only when its predicate is non-null `true`;
 /// `false` and null both remove the row. Filtering never changes differences.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterDefinition {
     predicate: StoredExpression,
 }
@@ -114,22 +115,18 @@ impl FilterDefinition {
     }
 }
 
-impl SealedDefinition for FilterDefinition {
-    fn output_schema_unchecked(
+impl FilterDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         self.bind_operation(&inputs[0])?;
         Ok(Some(Arc::clone(&inputs[0])))
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
-        _data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -139,20 +136,6 @@ impl SealedDefinition for FilterDefinition {
             Arc::clone(input_schema),
             operation,
         ))
-    }
-}
-
-impl OperationDefinition for FilterDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        self.predicate.encode(output);
     }
 }
 
@@ -210,9 +193,7 @@ fn canonical_record_batch(records: &RecordBatch) -> Result<RecordBatch, ArrowErr
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let predicate = StoredExpression::decode(&mut cursor)?;
-    cursor.finish()?;
-    Ok(Box::new(FilterDefinition { predicate }))
+) -> Result<Box<FilterDefinition>, DefinitionCodecError> {
+    let definition: FilterDefinition = decode_json_payload(payload, "invalid Filter payload")?;
+    Ok(Box::new(definition))
 }

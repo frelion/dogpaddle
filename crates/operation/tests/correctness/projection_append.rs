@@ -219,7 +219,10 @@ fn append_expands_to_an_ordinary_select_and_preserves_literal_names_and_nested_b
         ("copy", ident("nested")),
     ])
     .unwrap();
-    assert_eq!(encode_definition(&definition), encode_definition(&explicit));
+    assert_eq!(
+        encode_definition(&definition.clone().into()),
+        encode_definition(&explicit.clone().into())
+    );
     let output = roundtripped_output(&definition, &input);
     assert_eq!(output.schema().metadata(), &metadata);
     for index in 0..2 {

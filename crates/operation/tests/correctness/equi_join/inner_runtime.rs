@@ -93,9 +93,10 @@ fn construct_operation(root: &TestStore) -> (Operation, Transactions) {
 
 fn construct_operation_for_schemas(
     root: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schemas: &[SchemaRef],
 ) -> (Operation, Transactions) {
+    let definition: OperationDefinition = definition.clone().into();
     let mut setup = StoreSetup::new();
     let (operation, _) = definition
         .construct(
@@ -111,9 +112,10 @@ fn construct_operation_for_schemas(
 
 fn reopen_join(
     store: &Store,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schemas: &[SchemaRef],
 ) -> Operation {
+    let definition: OperationDefinition = definition.clone().into();
     definition
         .construct(
             schemas,

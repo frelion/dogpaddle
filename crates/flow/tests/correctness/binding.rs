@@ -25,15 +25,13 @@ fn build_reports_the_exact_projection_schema_rejection_without_creating_a_store(
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     let project = factory.operation(
         "project",
-        Box::new(
-            SelectDefinition::try_new([("missing", dogpaddle_operation::col("other"))]).unwrap(),
-        ),
+        SelectDefinition::try_new([("missing", dogpaddle_operation::col("other"))]).unwrap(),
         [scan],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [project]);
+    factory.operation("sink", DiscardDefinition::new(), [project]);
     factory.materialize(scan, CAPACITY);
     factory.materialize(project, CAPACITY);
 
@@ -49,19 +47,15 @@ fn build_reports_a_multi_input_schema_rejection_without_store_side_effects() {
     let root = tempfile::tempdir().unwrap();
     let union_path = root.path().join("union");
     let mut factory = FlowFactory::new(&union_path);
-    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(0)), []);
-    let right_scan = factory.operation("right-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let right = factory.operation(
-        "right",
-        Box::new(RunningEventCountDefinition::new()),
-        [right_scan],
-    );
+    let left = factory.operation("left", SequenceScanDefinition::new(0), []);
+    let right_scan = factory.operation("right-scan", SequenceScanDefinition::new(0), []);
+    let right = factory.operation("right", RunningEventCountDefinition::new(), [right_scan]);
     let union = factory.operation(
         "union",
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
         [left, right],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [union]);
+    factory.operation("sink", DiscardDefinition::new(), [union]);
     for station in [left, right_scan, right, union] {
         factory.materialize(station, CAPACITY);
     }
@@ -106,15 +100,13 @@ fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources()
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     factory.owner_identity(OWNER_IDENTITY);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     let project = factory.operation(
         "project",
-        Box::new(
-            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
-        ),
+        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
         [scan],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [project]);
+    factory.operation("sink", DiscardDefinition::new(), [project]);
     factory.materialize(scan, CAPACITY);
     factory.materialize(project, CAPACITY);
 
@@ -122,14 +114,19 @@ fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources()
 
     let mut definition = read_published_definition(&path);
     let valid_project = encode_definition(
-        &SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        &SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))])
+            .unwrap()
+            .into(),
     );
     let offset = definition
         .windows(valid_project.len())
         .position(|candidate| candidate == valid_project)
         .expect("published Flow contains the Project definition");
-    let invalid_projection =
-        encode_definition(&SelectDefinition::try_new([("value", col("other"))]).unwrap());
+    let invalid_projection = encode_definition(
+        &SelectDefinition::try_new([("value", col("other"))])
+            .unwrap()
+            .into(),
+    );
     assert_eq!(invalid_projection.len(), valid_project.len());
     definition[offset..offset + valid_project.len()].copy_from_slice(&invalid_projection);
     rewrite_checksum(&mut definition);
@@ -155,21 +152,21 @@ fn open_rebinds_decoded_multi_input_definitions() {
     let union_path = root.path().join("union");
     let valid_select = SelectDefinition::try_new([("a", col("value"))]).unwrap();
     let invalid_select = SelectDefinition::try_new([("b", col("value"))]).unwrap();
-    let valid_operation = encode_definition(&valid_select);
-    let invalid_operation = encode_definition(&invalid_select);
+    let valid_operation = encode_definition(&valid_select.clone().into());
+    let invalid_operation = encode_definition(&invalid_select.into());
     assert_eq!(valid_operation.len(), invalid_operation.len());
 
     let mut factory = FlowFactory::new(&union_path);
-    let left_scan = factory.operation("left-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let left = factory.operation("left", Box::new(valid_select.clone()), [left_scan]);
-    let right_scan = factory.operation("right-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let right = factory.operation("right", Box::new(valid_select), [right_scan]);
+    let left_scan = factory.operation("left-scan", SequenceScanDefinition::new(0), []);
+    let left = factory.operation("left", valid_select.clone(), [left_scan]);
+    let right_scan = factory.operation("right-scan", SequenceScanDefinition::new(0), []);
+    let right = factory.operation("right", valid_select, [right_scan]);
     let union = factory.operation(
         "union",
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
         [left, right],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [union]);
+    factory.operation("sink", DiscardDefinition::new(), [union]);
     for station in [left_scan, left, right_scan, right, union] {
         factory.materialize(station, CAPACITY);
     }
@@ -201,8 +198,8 @@ fn open_rebinds_the_decoded_sqlite_sink_input_before_opening_its_database() {
         SelectDefinition::try_new([("Name", col("value")), ("Nome", col("value"))]).unwrap();
     let invalid_select =
         SelectDefinition::try_new([("Name", col("value")), ("name", col("value"))]).unwrap();
-    let valid_operation = encode_definition(&valid_select);
-    let invalid_operation = encode_definition(&invalid_select);
+    let valid_operation = encode_definition(&valid_select.clone().into());
+    let invalid_operation = encode_definition(&invalid_select.into());
     assert_eq!(valid_operation.len(), invalid_operation.len());
     drop(build_select_sqlite_flow(&flow_path, &sqlite_path, valid_select).unwrap());
 
@@ -231,23 +228,19 @@ fn select_and_repeated_input_union_run_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
     let select = factory.operation(
         "select",
-        Box::new(SelectDefinition::try_new([("is_max", col("value").eq(lit(u64::MAX)))]).unwrap()),
+        SelectDefinition::try_new([("is_max", col("value").eq(lit(u64::MAX)))]).unwrap(),
         [scan],
     );
     let union = factory.operation(
         "union",
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
         [select, select],
     );
-    let count = factory.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [union],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [union]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
     for station in [scan, select, union, count] {
         factory.materialize(station, CAPACITY);
     }
@@ -298,53 +291,45 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(1)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(1), []);
     let align = factory.operation(
         "schema-align",
-        Box::new(
-            SchemaAlignDefinition::try_new(
-                [
-                    (
-                        "event_date",
-                        cast(cast(col("value"), DataType::Int32), DataType::Date32),
+        SchemaAlignDefinition::try_new(
+            [
+                (
+                    "event_date",
+                    cast(cast(col("value"), DataType::Int32), DataType::Date32),
+                ),
+                (
+                    "event_time",
+                    cast(
+                        cast(col("value"), DataType::Int64),
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
                     ),
-                    (
-                        "event_time",
-                        cast(
-                            cast(col("value"), DataType::Int64),
-                            DataType::Timestamp(TimeUnit::Millisecond, None),
-                        ),
-                    ),
-                    ("amount", cast(col("value"), DataType::Decimal128(10, 2))),
-                ]
-                .map(|(name, expression)| {
-                    SchemaAlignField::try_new(name, expression, false).unwrap()
-                }),
-            )
-            .unwrap(),
-        ),
+                ),
+                ("amount", cast(col("value"), DataType::Decimal128(10, 2))),
+            ]
+            .map(|(name, expression)| SchemaAlignField::try_new(name, expression, false).unwrap()),
+        )
+        .unwrap(),
         [scan],
     );
     let project = factory.operation(
         "project",
-        Box::new(
-            SelectDefinition::try_new(
-                ["event_date", "event_time", "amount"].map(|name| (name, col(name))),
-            )
-            .unwrap(),
-        ),
+        SelectDefinition::try_new(
+            ["event_date", "event_time", "amount"].map(|name| (name, col(name))),
+        )
+        .unwrap(),
         [align],
     );
     let select = factory.operation(
         "select",
-        Box::new(
-            SelectDefinition::try_new([
-                ("date", col("event_date")),
-                ("time", col("event_time")),
-                ("amount", col("amount")),
-            ])
-            .unwrap(),
-        ),
+        SelectDefinition::try_new([
+            ("date", col("event_date")),
+            ("time", col("event_time")),
+            ("amount", col("amount")),
+        ])
+        .unwrap(),
         [project],
     );
     let predicate = col("date")
@@ -353,28 +338,22 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
         .and(col("amount").gt(lit(ScalarValue::Decimal128(Some(0), 10, 2))));
     let extend = factory.operation(
         "extend",
-        Box::new(
-            SelectDefinition::try_new([
-                ("date", col("date")),
-                ("time", col("time")),
-                ("amount", col("amount")),
-                ("keep", predicate),
-            ])
-            .unwrap(),
-        ),
+        SelectDefinition::try_new([
+            ("date", col("date")),
+            ("time", col("time")),
+            ("amount", col("amount")),
+            ("keep", predicate),
+        ])
+        .unwrap(),
         [select],
     );
     let filter = factory.operation(
         "filter",
-        Box::new(FilterDefinition::try_new(col("keep")).unwrap()),
+        FilterDefinition::try_new(col("keep")).unwrap(),
         [extend],
     );
-    let count = factory.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [filter],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [filter]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
     for station in [scan, align, project, select, extend, filter, count] {
         factory.materialize(station, CAPACITY);
     }
@@ -405,20 +384,14 @@ fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
     let project = factory.operation(
         "project",
-        Box::new(
-            SelectDefinition::try_new(Vec::<(&str, dogpaddle_operation::Expr)>::new()).unwrap(),
-        ),
+        SelectDefinition::try_new(Vec::<(&str, dogpaddle_operation::Expr)>::new()).unwrap(),
         [scan],
     );
-    let count = factory.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [project],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [project]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
     for station in [scan, project, count] {
         factory.materialize(station, CAPACITY);
     }
@@ -523,11 +496,11 @@ fn build_select_sqlite_flow(
     select: SelectDefinition,
 ) -> Result<dogpaddle_flow::Flow, FlowError> {
     let mut factory = FlowFactory::new(flow_path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let select = factory.operation("select", Box::new(select), [scan]);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    let select = factory.operation("select", select, [scan]);
     factory.operation(
         "sqlite",
-        Box::new(SqliteSinkDefinition::try_new(sqlite_path, "events").unwrap()),
+        SqliteSinkDefinition::try_new(sqlite_path, "events").unwrap(),
         [select],
     );
     factory.materialize(scan, CAPACITY);

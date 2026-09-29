@@ -10,7 +10,7 @@ const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>() * 2;
 
 #[test]
 fn definition_envelope_rejects_invalid_magic_version_unknown_tag_and_trailing_bytes() {
-    let canonical = encode_definition(&RunningEventCountDefinition::new());
+    let canonical = encode_definition(&RunningEventCountDefinition::new().into());
     assert_eq!(&canonical[..MAGIC.len()], MAGIC);
     assert_eq!(
         &canonical[MAGIC.len()..MAGIC.len() + size_of::<u16>()],
@@ -53,7 +53,7 @@ fn definition_envelope_rejects_invalid_magic_version_unknown_tag_and_trailing_by
 
 #[test]
 fn definition_envelope_rejects_every_truncated_prefix() {
-    let canonical = encode_definition(&RunningEventCountDefinition::new());
+    let canonical = encode_definition(&RunningEventCountDefinition::new().into());
     for length in 0..canonical.len() {
         assert_eq!(
             decode_definition(&canonical[..length]).unwrap_err(),
@@ -78,4 +78,23 @@ fn definition_decoder_never_panics_for_deterministic_arbitrary_bytes() {
         let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&input)));
         assert!(result.is_ok(), "decoder panicked for input length {length}");
     }
+}
+
+#[test]
+fn json_decode_error_never_echoes_an_untrusted_field_name() {
+    let canonical = encode_definition(&RunningEventCountDefinition::new().into());
+    let mut forged = canonical[..HEADER_LEN].to_vec();
+    forged.extend_from_slice(br#"{"secret-token-4f2b":1}"#);
+
+    let error = decode_definition(&forged).unwrap_err();
+    assert!(matches!(
+        error,
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            line: 1,
+            column: _,
+        }
+    ));
+    assert!(!error.to_string().contains("secret-token-4f2b"));
+    assert!(!format!("{error:?}").contains("secret-token-4f2b"));
 }

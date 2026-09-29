@@ -14,8 +14,8 @@ pub(super) fn encode_output_entry(change: &Change) -> Vec<u8> {
 
 pub(super) fn build_scan_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let mut builder = FlowFactory::new(path);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    builder.operation("sink", DiscardDefinition::new(), [scan]);
 
     builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());

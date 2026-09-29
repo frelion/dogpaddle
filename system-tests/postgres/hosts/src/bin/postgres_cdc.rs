@@ -17,7 +17,7 @@ use arrow_array::{Int32Array, Int64Array, StringArray};
 use dogpaddle_change::{decode_change, encode_change};
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, decode_definition, encode_definition,
+    RuntimeResource, decode_definition, encode_definition,
     operation::{
         Action, Operation, OperationError, Turn,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
@@ -168,22 +168,15 @@ fn open_flow(options: &Options) -> Result<Flow, OperationError> {
         }
         return Ok(factory.open()?);
     }
-    let scan = factory.operation("pg", Box::new(options.definition()?), []);
-    let scan = factory.operation("distinct", Box::new(DistinctDefinition::new()), [scan]);
+    let scan = factory.operation("pg", options.definition()?, []);
+    let scan = factory.operation("distinct", DistinctDefinition::new(), [scan]);
     if let Some(config) = &sink_config {
         let target = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
-        factory.operation(
-            "sink",
-            Box::new(PostgresSinkDefinition::try_new(target)?),
-            [scan],
-        )
+        factory.operation("sink", PostgresSinkDefinition::try_new(target)?, [scan])
     } else {
         factory.operation(
             "sqlite",
-            Box::new(SqliteSinkDefinition::try_new(
-                options.root.join("sink.sqlite"),
-                "events",
-            )?),
+            SqliteSinkDefinition::try_new(options.root.join("sink.sqlite"), "events")?,
             [scan],
         )
     };
@@ -209,7 +202,7 @@ impl DirectScan {
     fn open(options: &Options) -> Result<Self, OperationError> {
         let path = options.root.join("scan");
         if !path.exists() {
-            Self::create(&path, &options.definition()?, options.config()?)?;
+            Self::create(&path, options.definition()?, options.config()?)?;
         }
         let store = Store::open(&path)?;
         let definition_cell: Cell<Vec<u8>> = store.open_data("definition")?;
@@ -242,10 +235,10 @@ impl DirectScan {
 
     fn create(
         path: &Path,
-        definition: &dyn OperationDefinition,
+        definition: PostgresCdcScanDefinition,
         config: PostgresCdcScanConfig,
     ) -> Result<(), OperationError> {
-        let encoded = encode_definition(definition);
+        let encoded = encode_definition(&definition.into());
         let canonical = decode_definition(&encoded)?;
         let mut setup = dogpaddle_store::StoreSetup::new();
         let saved: Cell<Vec<u8>> = setup.create_data("definition")?;

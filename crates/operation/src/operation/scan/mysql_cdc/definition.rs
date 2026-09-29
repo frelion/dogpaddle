@@ -4,9 +4,9 @@ use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    definition::{Sealed, schema_error},
+    ConstructedOperation, DefinitionCodecError, RuntimeResource,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
 };
 
 use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlColumn, schema};
@@ -139,21 +139,17 @@ impl MySqlCdcScanDefinition {
     }
 }
 
-impl Sealed for MySqlCdcScanDefinition {
-    fn output_schema_unchecked(
+impl MySqlCdcScanDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
-        _: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
-        _: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
@@ -174,45 +170,30 @@ impl Sealed for MySqlCdcScanDefinition {
         Ok(ConstructedOperation::turn(Some(output), operation))
     }
 
-    fn resource_type(&self) -> Option<TypeId> {
-        Some(TypeId::of::<MySqlCdcScanConfig>())
-    }
-}
-
-impl OperationDefinition for MySqlCdcScanDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Scan
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend(encode(self).expect("validated MySQL scan definition is encodable"));
+    pub(crate) fn resource_type() -> TypeId {
+        TypeId::of::<MySqlCdcScanConfig>()
     }
 }
 
 pub(crate) fn decode_definition(
     payload_bytes: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+) -> Result<Box<MySqlCdcScanDefinition>, DefinitionCodecError> {
     let invalid = || DefinitionCodecError::InvalidPayload("invalid MySQL CDC scan specification");
     if payload_bytes.len() > MAX_DEFINITION_BYTES {
         return Err(invalid());
     }
-    let payload: PersistentDefinition =
-        serde_json::from_slice(payload_bytes).map_err(|_| invalid())?;
+    let payload: PersistentDefinition = parse_json_payload(payload_bytes)?;
     let definition = MySqlCdcScanDefinition::try_new_projected(
         payload.spec,
         payload.output_projection,
         payload.bootstrap_spool_bytes,
     )
     .map_err(|_| invalid())?;
-    let mut canonical = Vec::new();
-    definition.encode_payload(&mut canonical);
-    if canonical != payload_bytes {
-        return Err(invalid());
-    }
+    require_canonical_json_payload(
+        &definition,
+        payload_bytes,
+        "invalid MySQL CDC scan specification",
+    )?;
     Ok(Box::new(definition))
 }
 
@@ -310,8 +291,8 @@ mod tests {
         let payload = encode(&definition).unwrap();
         let decoded = decode_definition(&payload).unwrap();
         assert_eq!(
-            crate::encode_definition(decoded.as_ref()),
-            crate::encode_definition(&definition)
+            crate::encode_definition(&crate::OperationDefinition::from(*decoded)),
+            crate::encode_definition(&crate::OperationDefinition::from(definition.clone()))
         );
         assert_eq!(definition.bootstrap_spool_bytes(), capacity());
     }
@@ -325,7 +306,7 @@ mod tests {
         let projected =
             MySqlCdcScanDefinition::try_new_projected(spec.clone(), vec![1], capacity()).unwrap();
         assert_eq!(projected.output_projection(), &[1]);
-        let output = (&projected as &dyn crate::OperationDefinition)
+        let output = crate::OperationDefinition::from(projected)
             .output_schema(&[])
             .unwrap()
             .unwrap();
@@ -336,7 +317,7 @@ mod tests {
         let empty =
             MySqlCdcScanDefinition::try_new_projected(spec.clone(), vec![], capacity()).unwrap();
         assert!(
-            (&empty as &dyn crate::OperationDefinition)
+            crate::OperationDefinition::from(empty)
                 .output_schema(&[])
                 .unwrap()
                 .unwrap()
@@ -388,7 +369,7 @@ mod tests {
             candidate.columns = columns;
             let definition = MySqlCdcScanDefinition::try_new(candidate, capacity()).unwrap();
             assert!(
-                (&definition as &dyn crate::OperationDefinition)
+                crate::OperationDefinition::from(definition)
                     .output_schema(&[])
                     .is_err()
             );

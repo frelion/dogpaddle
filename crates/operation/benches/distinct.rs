@@ -31,7 +31,7 @@ impl Fixture {
         let sample = root.sample(name);
         let mut setup = StoreSetup::new();
         let definition = DistinctDefinition::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition)
             .construct(
                 &[Arc::clone(schema)],
                 &mut setup.data_scope().scoped("operation"),

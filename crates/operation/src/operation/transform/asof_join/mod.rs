@@ -4,6 +4,7 @@ use arrow_schema::{ArrowError, DataType};
 use datafusion_common::DataFusionError;
 use dogpaddle_change::ChangeError;
 use dogpaddle_store::{DataScope, StoreError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -49,7 +50,7 @@ fn construct(
 }
 
 /// Relational output semantics of an ASOF join.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfJoinKind {
     /// Emits each left row with its selected right row, when one exists.
     Inner,
@@ -65,29 +66,10 @@ impl AsOfJoinKind {
     pub(super) const fn left_only(self) -> bool {
         matches!(self, Self::LeftSemi | Self::LeftAnti)
     }
-
-    pub(super) const fn code(self) -> u8 {
-        match self {
-            Self::Inner => 0,
-            Self::LeftOuter => 1,
-            Self::LeftSemi => 2,
-            Self::LeftAnti => 3,
-        }
-    }
-
-    pub(super) const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Inner),
-            1 => Some(Self::LeftOuter),
-            2 => Some(Self::LeftSemi),
-            3 => Some(Self::LeftAnti),
-            _ => None,
-        }
-    }
 }
 
 /// Which candidate wins when nearest neighbors are equally distant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfEquidistantPreference {
     /// Selects the candidate before the left order value.
     Backward,
@@ -96,7 +78,7 @@ pub enum AsOfEquidistantPreference {
 }
 
 /// Ordered candidate-search strategy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfDirection {
     /// Selects the greatest eligible right value before the left value.
     Backward {
@@ -128,44 +110,13 @@ impl AsOfDirection {
         }
     }
 
-    pub(super) const fn code(self) -> u8 {
-        match self {
-            Self::Backward { .. } => 0,
-            Self::Forward { .. } => 1,
-            Self::Nearest {
-                equidistant: AsOfEquidistantPreference::Backward,
-                ..
-            } => 2,
-            Self::Nearest {
-                equidistant: AsOfEquidistantPreference::Forward,
-                ..
-            } => 3,
-        }
-    }
-
-    pub(super) const fn from_code(code: u8, allow_exact: bool) -> Option<Self> {
-        match code {
-            0 => Some(Self::Backward { allow_exact }),
-            1 => Some(Self::Forward { allow_exact }),
-            2 => Some(Self::Nearest {
-                allow_exact,
-                equidistant: AsOfEquidistantPreference::Backward,
-            }),
-            3 => Some(Self::Nearest {
-                allow_exact,
-                equidistant: AsOfEquidistantPreference::Forward,
-            }),
-            _ => None,
-        }
-    }
-
     pub(super) const fn nearest(self) -> bool {
         matches!(self, Self::Nearest { .. })
     }
 }
 
 /// NULL comparison semantics for one equality partition key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfEqualityMode {
     /// SQL equality: a NULL on either side makes the key ineligible.
     Equal,
@@ -173,25 +124,8 @@ pub enum AsOfEqualityMode {
     NotDistinct,
 }
 
-impl AsOfEqualityMode {
-    pub(super) const fn code(self) -> u8 {
-        match self {
-            Self::Equal => 0,
-            Self::NotDistinct => 1,
-        }
-    }
-
-    pub(super) const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Equal),
-            1 => Some(Self::NotDistinct),
-            _ => None,
-        }
-    }
-}
-
 /// Behavior when explicit right tie-break expressions do not identify one row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfTieFallback {
     /// Rejects an ambiguous right candidate set at runtime.
     Reject,
@@ -199,25 +133,6 @@ pub enum AsOfTieFallback {
     CanonicalAscending,
     /// Uses the exact canonical right row in descending byte order.
     CanonicalDescending,
-}
-
-impl AsOfTieFallback {
-    pub(super) const fn code(self) -> u8 {
-        match self {
-            Self::Reject => 0,
-            Self::CanonicalAscending => 1,
-            Self::CanonicalDescending => 2,
-        }
-    }
-
-    pub(super) const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Reject),
-            1 => Some(Self::CanonicalAscending),
-            2 => Some(Self::CanonicalDescending),
-            _ => None,
-        }
-    }
 }
 
 /// Failure while constructing a persistent [`AsOfJoinDefinition`].

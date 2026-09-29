@@ -66,25 +66,23 @@ fn bench_projections(criterion: &mut Criterion, root: &RunRoot) {
                 Int64Array::from(vec![1; rows]),
             )
             .unwrap();
-            let definitions: [(&str, Box<dyn OperationDefinition>); 2] = [
+            let definitions: [(&str, OperationDefinition); 2] = [
                 (
                     "select",
-                    Box::new(
-                        SelectDefinition::try_new(
-                            (0..width).map(|i| (format!("v{i}"), col(format!("v{i}")))),
-                        )
-                        .unwrap(),
-                    ),
+                    SelectDefinition::try_new(
+                        (0..width).map(|i| (format!("v{i}"), col(format!("v{i}")))),
+                    )
+                    .unwrap()
+                    .into(),
                 ),
                 (
                     "align",
-                    Box::new(
-                        SchemaAlignDefinition::try_new((0..width).map(|i| {
-                            SchemaAlignField::try_new(format!("v{i}"), col(format!("v{i}")), false)
-                                .unwrap()
-                        }))
-                        .unwrap(),
-                    ),
+                    SchemaAlignDefinition::try_new((0..width).map(|i| {
+                        SchemaAlignField::try_new(format!("v{i}"), col(format!("v{i}")), false)
+                            .unwrap()
+                    }))
+                    .unwrap()
+                    .into(),
                 ),
             ];
             for (name, definition) in definitions {
@@ -170,7 +168,7 @@ fn bench_column_projection(criterion: &mut Criterion, root: &RunRoot) {
             .unwrap();
             let sample = root.sample(name);
             let mut setup = StoreSetup::new();
-            let (operation, _) = (&definition as &dyn OperationDefinition)
+            let (operation, _) = OperationDefinition::from(definition.clone())
                 .construct(
                     &[Arc::clone(&schema)],
                     &mut setup.data_scope().scoped("projection"),

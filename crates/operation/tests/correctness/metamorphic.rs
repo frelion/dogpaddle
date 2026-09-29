@@ -18,11 +18,12 @@ use dogpaddle_store::{Store, StoreSetup};
 use super::support::{TestStore, commit_ready, stateless_operation, turn_input};
 
 fn structural_trace(
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     port: usize,
     rows: &[(u64, u64, i64)],
     batches: &[usize],
 ) -> Vec<(Vec<u64>, i64)> {
+    let definition: OperationDefinition = definition.clone().into();
     assert_eq!(batches.iter().sum::<usize>(), rows.len());
     let schema = Arc::new(Schema::new(vec![
         Field::new("left", DataType::UInt64, false),
@@ -94,38 +95,38 @@ fn structural_trace(
 #[test]
 fn project_select_and_schema_align_preserve_flattened_records_and_diffs_across_rebatching() {
     let rows = [(1, 10, 1), (2, 20, -1), (3, 30, 2), (4, 40, -2)];
-    let cases: [(&str, Box<dyn OperationDefinition>); 3] = [
+    let cases: [(&str, OperationDefinition); 3] = [
         (
             "Project",
-            Box::new(SelectDefinition::try_new([("right", col("right"))]).unwrap()),
+            SelectDefinition::try_new([("right", col("right"))])
+                .unwrap()
+                .into(),
         ),
         (
             "Select",
-            Box::new(
-                SelectDefinition::try_new([
-                    ("right", col("right")),
-                    ("next", col("left") + lit(1_u64)),
-                ])
-                .unwrap(),
-            ),
+            SelectDefinition::try_new([
+                ("right", col("right")),
+                ("next", col("left") + lit(1_u64)),
+            ])
+            .unwrap()
+            .into(),
         ),
         (
             "SchemaAlign",
-            Box::new(
-                SchemaAlignDefinition::try_new([
-                    SchemaAlignField::try_new("right", col("right"), false).unwrap(),
-                    SchemaAlignField::try_new("left", col("left"), true).unwrap(),
-                ])
-                .unwrap(),
-            ),
+            SchemaAlignDefinition::try_new([
+                SchemaAlignField::try_new("right", col("right"), false).unwrap(),
+                SchemaAlignField::try_new("left", col("left"), true).unwrap(),
+            ])
+            .unwrap()
+            .into(),
         ),
     ];
 
     for (name, definition) in cases {
-        let expected = structural_trace(definition.as_ref(), 0, &rows, &[rows.len()]);
+        let expected = structural_trace(&definition, 0, &rows, &[rows.len()]);
         for batches in [&[1, 3][..], &[2, 1, 1], &[1, 1, 1, 1]] {
             assert_eq!(
-                structural_trace(definition.as_ref(), 0, &rows, batches),
+                structural_trace(&definition, 0, &rows, batches),
                 expected,
                 "{name} changed its flattened trace after rebatching"
             );

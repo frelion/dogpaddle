@@ -1,52 +1,20 @@
-use std::{error::Error, fmt::Debug, num::NonZeroU32};
+use std::{any::TypeId, error::Error, num::NonZeroU32};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{SchemaError, validate_schema};
 use dogpaddle_store::DataScope;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
     RuntimeResource,
-    operation::{AtomicOperation, Operation, TurnOperation},
+    operation::{AtomicOperation, Operation, TurnOperation, scan, sink, transform},
 };
-
-mod private {
-    use super::ConstructedOperation;
-    use crate::{OperationSetupError, RuntimeResource};
-    use arrow_schema::SchemaRef;
-    use dogpaddle_store::DataScope;
-    use std::any::TypeId;
-
-    /// Unnameable in-crate capability guarding the unchecked construction
-    /// entry points. Nominally public so it can appear in the sealed trait,
-    /// but every ancestor module is private: downstream crates can neither
-    /// name nor construct it. They must use the checked
-    /// `OperationDefinition::output_schema` and
-    /// `OperationDefinition::construct` entry points instead.
-    pub struct ConstructionToken(pub(super) ());
-
-    pub trait Sealed {
-        fn output_schema_unchecked(
-            &self,
-            _: ConstructionToken,
-            inputs: &[SchemaRef],
-        ) -> Result<Option<SchemaRef>, crate::OperationSchemaError>;
-        fn construct_unchecked(
-            &self,
-            _: ConstructionToken,
-            inputs: &[SchemaRef],
-            data: &mut DataScope<'_>,
-            resource: RuntimeResource,
-        ) -> Result<ConstructedOperation, OperationSetupError>;
-        fn resource_type(&self) -> Option<TypeId> {
-            None
-        }
-    }
-}
-pub(crate) use private::{ConstructionToken, Sealed};
 
 /// Type-erased error from a concrete operation's pure Schema compiler.
 pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
+
+const TWO_INPUTS: NonZeroU32 = NonZeroU32::new(2).expect("two is nonzero");
 
 /// Declared execution role, exact input arity, and station-fusion capability of an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,69 +73,150 @@ impl OperationKind {
     }
 }
 
-/// Sealed persistent operation plan with authoritative pure Schema derivation and final construction.
+/// Persistent, typed plan for one built-in operation.
 ///
-/// Use the checked entry points through a trait object:
-///
-/// ```
-/// use dogpaddle_operation::{OperationDefinition, RuntimeResource};
-/// use dogpaddle_operation::operation::transform::RunningEventCountDefinition;
-/// use dogpaddle_store::StoreSetup;
-///
-/// let definition = RunningEventCountDefinition::new();
-/// let definition: &dyn OperationDefinition = &definition;
-/// let mut setup = StoreSetup::new();
-/// // Missing input is rejected, rather than reaching the concrete constructor.
-/// assert!(definition.output_schema(&[]).is_err());
-/// assert!(definition.construct(
-///     &[], &mut setup.data_scope().scoped("count"), RuntimeResource::none(),
-/// ).is_err());
-/// ```
-///
-/// Sealing alone does not hide inherited methods. The unchecked entry points
-/// also require an internal capability that downstream code cannot obtain.
-/// Calling either entry point without that capability fails to compile:
-///
-/// ```compile_fail,E0061
-/// use dogpaddle_operation::OperationDefinition;
-/// fn bypass(definition: &dyn OperationDefinition) {
-///     let _ = definition.output_schema_unchecked(&[]);
-/// }
-/// ```
-///
-/// ```compile_fail,E0061
-/// use dogpaddle_operation::{OperationDefinition, RuntimeResource};
-/// use dogpaddle_store::StoreSetup;
-/// fn bypass(definition: &dyn OperationDefinition) {
-///     let mut setup = StoreSetup::new();
-///     let _ = definition.construct_unchecked(
-///         &[], &mut setup.data_scope().scoped("count"), RuntimeResource::none(),
-///     );
-/// }
-/// ```
-///
-/// The capability cannot be obtained using type inference and `Default`:
-///
-/// ```compile_fail,E0277
-/// use dogpaddle_operation::OperationDefinition;
-/// fn bypass(definition: &dyn OperationDefinition) {
-///     let _ = definition.output_schema_unchecked(Default::default(), &[]);
-/// }
-/// ```
-///
-/// Its constructor is not publicly accessible either:
-///
-/// ```compile_fail,E0603
-/// use dogpaddle_operation::definition::ConstructionToken;
-/// let _ = ConstructionToken(());
-/// ```
-pub trait OperationDefinition: private::Sealed + Debug + Send + Sync + 'static {
-    /// Returns the operation's declared execution role and exact input arity.
-    fn kind(&self) -> OperationKind;
-    #[doc(hidden)]
-    fn persistence_tag(&self) -> u16;
-    #[doc(hidden)]
-    fn encode_payload(&self, output: &mut Vec<u8>);
+/// This enum is the complete set of operations accepted by Flow. Each variant
+/// contains only persistent plan data; runtime clients and state handles are
+/// acquired through [`Self::construct`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum OperationDefinition {
+    /// `MySqlCdcScan` operation plan.
+    MySqlCdcScan(Box<scan::MySqlCdcScanDefinition>),
+    /// `PostgresCdcScan` operation plan.
+    PostgresCdcScan(Box<scan::PostgresCdcScanDefinition>),
+    /// `SequenceScan` operation plan.
+    SequenceScan(Box<scan::SequenceScanDefinition>),
+    /// `Aggregate` operation plan.
+    Aggregate(Box<transform::AggregateDefinition>),
+    /// `AsOfJoin` operation plan.
+    AsOfJoin(Box<transform::AsOfJoinDefinition>),
+    /// `Distinct` operation plan.
+    Distinct(Box<transform::DistinctDefinition>),
+    /// `RunningEventCount` operation plan.
+    RunningEventCount(Box<transform::RunningEventCountDefinition>),
+    /// `Filter` operation plan.
+    Filter(Box<transform::FilterDefinition>),
+    /// `EquiJoin` operation plan.
+    EquiJoin(Box<transform::EquiJoinDefinition>),
+    /// `Select` operation plan.
+    Select(Box<transform::SelectDefinition>),
+    /// `UnionAll` operation plan.
+    UnionAll(Box<transform::UnionAllDefinition>),
+    /// `SchemaAlign` operation plan.
+    SchemaAlign(Box<transform::SchemaAlignDefinition>),
+    /// `ClickHouseSink` operation plan.
+    ClickHouseSink(Box<sink::ClickHouseSinkDefinition>),
+    /// `Discard` operation plan.
+    Discard(Box<sink::DiscardDefinition>),
+    /// `DorisSink` operation plan.
+    DorisSink(Box<sink::DorisSinkDefinition>),
+    /// `PostgresSink` operation plan.
+    PostgresSink(Box<sink::PostgresSinkDefinition>),
+    /// `SqliteSink` operation plan.
+    SqliteSink(Box<sink::SqliteSinkDefinition>),
+}
+
+impl From<scan::MySqlCdcScanDefinition> for OperationDefinition {
+    fn from(definition: scan::MySqlCdcScanDefinition) -> Self {
+        Self::MySqlCdcScan(Box::new(definition))
+    }
+}
+
+impl From<scan::PostgresCdcScanDefinition> for OperationDefinition {
+    fn from(definition: scan::PostgresCdcScanDefinition) -> Self {
+        Self::PostgresCdcScan(Box::new(definition))
+    }
+}
+
+impl From<scan::SequenceScanDefinition> for OperationDefinition {
+    fn from(definition: scan::SequenceScanDefinition) -> Self {
+        Self::SequenceScan(Box::new(definition))
+    }
+}
+
+impl From<transform::AggregateDefinition> for OperationDefinition {
+    fn from(definition: transform::AggregateDefinition) -> Self {
+        Self::Aggregate(Box::new(definition))
+    }
+}
+
+impl From<transform::AsOfJoinDefinition> for OperationDefinition {
+    fn from(definition: transform::AsOfJoinDefinition) -> Self {
+        Self::AsOfJoin(Box::new(definition))
+    }
+}
+
+impl From<transform::DistinctDefinition> for OperationDefinition {
+    fn from(definition: transform::DistinctDefinition) -> Self {
+        Self::Distinct(Box::new(definition))
+    }
+}
+
+impl From<transform::RunningEventCountDefinition> for OperationDefinition {
+    fn from(definition: transform::RunningEventCountDefinition) -> Self {
+        Self::RunningEventCount(Box::new(definition))
+    }
+}
+
+impl From<transform::FilterDefinition> for OperationDefinition {
+    fn from(definition: transform::FilterDefinition) -> Self {
+        Self::Filter(Box::new(definition))
+    }
+}
+
+impl From<transform::EquiJoinDefinition> for OperationDefinition {
+    fn from(definition: transform::EquiJoinDefinition) -> Self {
+        Self::EquiJoin(Box::new(definition))
+    }
+}
+
+impl From<transform::SelectDefinition> for OperationDefinition {
+    fn from(definition: transform::SelectDefinition) -> Self {
+        Self::Select(Box::new(definition))
+    }
+}
+
+impl From<transform::UnionAllDefinition> for OperationDefinition {
+    fn from(definition: transform::UnionAllDefinition) -> Self {
+        Self::UnionAll(Box::new(definition))
+    }
+}
+
+impl From<transform::SchemaAlignDefinition> for OperationDefinition {
+    fn from(definition: transform::SchemaAlignDefinition) -> Self {
+        Self::SchemaAlign(Box::new(definition))
+    }
+}
+
+impl From<sink::ClickHouseSinkDefinition> for OperationDefinition {
+    fn from(definition: sink::ClickHouseSinkDefinition) -> Self {
+        Self::ClickHouseSink(Box::new(definition))
+    }
+}
+
+impl From<sink::DiscardDefinition> for OperationDefinition {
+    fn from(definition: sink::DiscardDefinition) -> Self {
+        Self::Discard(Box::new(definition))
+    }
+}
+
+impl From<sink::DorisSinkDefinition> for OperationDefinition {
+    fn from(definition: sink::DorisSinkDefinition) -> Self {
+        Self::DorisSink(Box::new(definition))
+    }
+}
+
+impl From<sink::PostgresSinkDefinition> for OperationDefinition {
+    fn from(definition: sink::PostgresSinkDefinition) -> Self {
+        Self::PostgresSink(Box::new(definition))
+    }
+}
+
+impl From<sink::SqliteSinkDefinition> for OperationDefinition {
+    fn from(definition: sink::SqliteSinkDefinition) -> Self {
+        Self::SqliteSink(Box::new(definition))
+    }
 }
 
 /// Final runtime operation paired with its checked logical output Schema metadata.
@@ -210,7 +259,141 @@ impl ConstructedOperation {
     }
 }
 
-impl dyn OperationDefinition + '_ {
+impl OperationDefinition {
+    /// Returns the execution role and exact input arity.
+    #[must_use]
+    pub fn kind(&self) -> OperationKind {
+        match self {
+            Self::MySqlCdcScan(_) | Self::PostgresCdcScan(_) | Self::SequenceScan(_) => {
+                OperationKind::Scan
+            }
+            Self::AsOfJoin(_) | Self::EquiJoin(_) => OperationKind::TurnTransform(TWO_INPUTS),
+            Self::UnionAll(definition) => OperationKind::AtomicTransform(definition.input_count()),
+            Self::Aggregate(_)
+            | Self::Distinct(_)
+            | Self::RunningEventCount(_)
+            | Self::Filter(_)
+            | Self::Select(_)
+            | Self::SchemaAlign(_) => OperationKind::AtomicTransform(NonZeroU32::MIN),
+            Self::ClickHouseSink(_)
+            | Self::Discard(_)
+            | Self::DorisSink(_)
+            | Self::PostgresSink(_)
+            | Self::SqliteSink(_) => OperationKind::Sink(NonZeroU32::MIN),
+        }
+    }
+
+    /// Returns the stable v1 payload tag for this operation.
+    #[must_use]
+    pub fn persistence_tag(&self) -> u16 {
+        match self {
+            Self::MySqlCdcScan(_) => scan::mysql_cdc::TAG,
+            Self::PostgresCdcScan(_) => scan::postgres_cdc::TAG,
+            Self::SequenceScan(_) => scan::sequence::TAG,
+            Self::Aggregate(_) => transform::aggregate::TAG,
+            Self::AsOfJoin(_) => transform::asof_join::TAG,
+            Self::Distinct(_) => transform::distinct::TAG,
+            Self::RunningEventCount(_) => transform::running_event_count::TAG,
+            Self::Filter(_) => transform::filter::TAG,
+            Self::EquiJoin(_) => transform::equi_join::TAG,
+            Self::Select(_) => transform::select::TAG,
+            Self::UnionAll(_) => transform::union_all::TAG,
+            Self::SchemaAlign(_) => transform::schema_align::TAG,
+            Self::ClickHouseSink(_) => sink::clickhouse::TAG,
+            Self::Discard(_) => sink::discard::TAG,
+            Self::DorisSink(_) => sink::doris::TAG,
+            Self::PostgresSink(_) => sink::postgres::TAG,
+            Self::SqliteSink(_) => sink::sqlite::TAG,
+        }
+    }
+
+    fn output_schema_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+    ) -> Result<Option<SchemaRef>, OperationSchemaError> {
+        match self {
+            Self::MySqlCdcScan(definition) => definition.output_schema_unchecked(),
+            Self::PostgresCdcScan(definition) => definition.output_schema_unchecked(),
+            Self::SequenceScan(_) => {
+                Ok(Some(scan::SequenceScanDefinition::output_schema_unchecked()))
+            }
+            Self::Aggregate(definition) => definition.output_schema_unchecked(inputs),
+            Self::AsOfJoin(definition) => definition.output_schema_unchecked(inputs),
+            Self::Distinct(_) => Ok(Some(
+                transform::DistinctDefinition::output_schema_unchecked(inputs),
+            )),
+            Self::RunningEventCount(_) => Ok(Some(
+                transform::RunningEventCountDefinition::output_schema_unchecked(),
+            )),
+            Self::Filter(definition) => definition.output_schema_unchecked(inputs),
+            Self::EquiJoin(definition) => definition.output_schema_unchecked(inputs),
+            Self::Select(definition) => definition.output_schema_unchecked(inputs),
+            Self::UnionAll(_) => transform::UnionAllDefinition::compile_schema(inputs).map(Some),
+            Self::SchemaAlign(definition) => definition.output_schema_unchecked(inputs),
+            Self::ClickHouseSink(_) => {
+                sink::ClickHouseSinkDefinition::output_schema_unchecked(inputs)?;
+                Ok(None)
+            }
+            Self::Discard(_) => Ok(None),
+            Self::DorisSink(_) => {
+                sink::DorisSinkDefinition::output_schema_unchecked(inputs)?;
+                Ok(None)
+            }
+            Self::PostgresSink(_) => {
+                sink::PostgresSinkDefinition::output_schema_unchecked(inputs)?;
+                Ok(None)
+            }
+            Self::SqliteSink(_) => {
+                sink::SqliteSinkDefinition::output_schema_unchecked(inputs)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn construct_unchecked(
+        &self,
+        inputs: &[SchemaRef],
+        data: &mut DataScope<'_>,
+        resource: RuntimeResource,
+    ) -> Result<ConstructedOperation, OperationSetupError> {
+        match self {
+            Self::MySqlCdcScan(definition) => definition.construct_unchecked(data, resource),
+            Self::PostgresCdcScan(definition) => definition.construct_unchecked(data, resource),
+            Self::SequenceScan(definition) => (**definition).construct_unchecked(data),
+            Self::Aggregate(definition) => definition.construct_unchecked(inputs, data),
+            Self::AsOfJoin(definition) => definition.construct_unchecked(inputs, data),
+            Self::Distinct(_) => transform::DistinctDefinition::construct_unchecked(inputs, data),
+            Self::RunningEventCount(_) => {
+                transform::RunningEventCountDefinition::construct_unchecked(inputs, data)
+            }
+            Self::Filter(definition) => definition.construct_unchecked(inputs),
+            Self::EquiJoin(definition) => definition.construct_unchecked(inputs, data),
+            Self::Select(definition) => definition.construct_unchecked(inputs),
+            Self::UnionAll(definition) => (**definition).construct_unchecked(inputs),
+            Self::SchemaAlign(definition) => definition.construct_unchecked(inputs),
+            Self::ClickHouseSink(definition) => {
+                definition.construct_unchecked(inputs, data, resource)
+            }
+            Self::Discard(_) => Ok(sink::DiscardDefinition::construct_unchecked()),
+            Self::DorisSink(definition) => definition.construct_unchecked(inputs, data, resource),
+            Self::PostgresSink(definition) => {
+                definition.construct_unchecked(inputs, data, resource)
+            }
+            Self::SqliteSink(definition) => definition.construct_unchecked(inputs, data),
+        }
+    }
+
+    fn resource_type(&self) -> Option<TypeId> {
+        match self {
+            Self::MySqlCdcScan(_) => Some(scan::MySqlCdcScanDefinition::resource_type()),
+            Self::PostgresCdcScan(_) => Some(scan::PostgresCdcScanDefinition::resource_type()),
+            Self::ClickHouseSink(_) => Some(sink::ClickHouseSinkDefinition::resource_type()),
+            Self::DorisSink(_) => Some(sink::DorisSinkDefinition::resource_type()),
+            Self::PostgresSink(_) => Some(sink::PostgresSinkDefinition::resource_type()),
+            _ => None,
+        }
+    }
+
     /// Purely derives the exact logical output Schema from this definition and its inputs.
     ///
     /// This path performs the same checked Schema compilation used by final construction, but
@@ -224,7 +407,8 @@ impl dyn OperationDefinition + '_ {
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, OperationBindError> {
         validate_inputs(self.kind(), inputs)?;
-        let output = private::Sealed::output_schema_unchecked(self, ConstructionToken(()), inputs)
+        let output = self
+            .output_schema_unchecked(inputs)
             .map_err(|source| OperationBindError::Rejected { source })?;
         validate_output(self.kind(), output.as_ref())?;
         Ok(output)
@@ -246,14 +430,8 @@ impl dyn OperationDefinition + '_ {
     ) -> Result<ConstructedOperation, OperationSetupError> {
         let kind = self.kind();
         validate_inputs(kind, inputs)?;
-        resource.validate(private::Sealed::resource_type(self))?;
-        let built = private::Sealed::construct_unchecked(
-            self,
-            ConstructionToken(()),
-            inputs,
-            data,
-            resource,
-        )?;
+        resource.validate(self.resource_type())?;
+        let built = self.construct_unchecked(inputs, data, resource)?;
         validate_output(kind, built.output_schema.as_ref())?;
         if !matches!(
             (kind, &built.operation),
@@ -273,7 +451,7 @@ impl dyn OperationDefinition + '_ {
     /// # Errors
     /// Returns an error for a missing, unexpected, or wrong-type resource.
     pub fn validate_resource(&self, resource: &RuntimeResource) -> Result<(), OperationSetupError> {
-        resource.validate(private::Sealed::resource_type(self))
+        resource.validate(self.resource_type())
     }
 }
 

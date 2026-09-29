@@ -25,31 +25,28 @@ fn unary() -> NonZeroU32 {
 
 #[test]
 fn transform_kind_declares_atomic_execution_explicitly() {
-    let definitions: Vec<Box<dyn OperationDefinition>> = vec![
-        Box::new(FilterDefinition::try_new(col("keep")).unwrap()),
-        Box::new(SelectDefinition::try_new([("id", col("id"))]).unwrap()),
-        Box::new(
-            SchemaAlignDefinition::try_new([
-                SchemaAlignField::try_new("id", col("id"), false).unwrap()
-            ])
-            .unwrap(),
-        ),
-        Box::new(RunningEventCountDefinition::new()),
-        Box::new(DistinctDefinition::new()),
-        Box::new(
-            AggregateDefinition::try_new(
-                [("id", col("id"))],
-                [("count", AggregateCall::count_all())],
-            )
-            .unwrap(),
-        ),
+    let definitions: Vec<OperationDefinition> = vec![
+        FilterDefinition::try_new(col("keep")).unwrap().into(),
+        SelectDefinition::try_new([("id", col("id"))])
+            .unwrap()
+            .into(),
+        SchemaAlignDefinition::try_new(
+            [SchemaAlignField::try_new("id", col("id"), false).unwrap()],
+        )
+        .unwrap()
+        .into(),
+        RunningEventCountDefinition::new().into(),
+        DistinctDefinition::new().into(),
+        AggregateDefinition::try_new([("id", col("id"))], [("count", AggregateCall::count_all())])
+            .unwrap()
+            .into(),
     ];
     for definition in definitions {
         assert_eq!(definition.kind(), OperationKind::AtomicTransform(unary()));
     }
     let union = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
     assert_eq!(
-        union.kind(),
+        OperationDefinition::from(union).kind(),
         OperationKind::AtomicTransform(NonZeroU32::new(2).unwrap())
     );
 }

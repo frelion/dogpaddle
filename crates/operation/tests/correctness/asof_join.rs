@@ -27,7 +27,7 @@ const ASOF_RESOURCE_NAMES: [&str; 3] = [
     "asof_join.continuation",
 ];
 
-const ASOF_JOIN_LITERAL: &str = "646f67706164646c652e6f7065726174696f6e000001001101000101000000000100000000090a070a0567726f7570000000090a070a0567726f757000000001000000060a040a026174000000060a040a02617400000000000000070000000a6c6566745f67726f7570000000076c6566745f6174000000076c6566745f69640000000b72696768745f67726f75700000000872696768745f61740000000e72696768745f7072696f726974790000000872696768745f696400";
+const ASOF_JOIN_LITERAL: &str = include_str!("../fixtures/v1/asof_join_backward_left_outer.hex");
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct LeftRow {
@@ -161,6 +161,14 @@ fn definition_with_residual(config: Config, residual: Option<Expr>) -> AsOfJoinD
         residual,
     )
     .unwrap()
+}
+
+#[test]
+fn public_json_deserialization_rejects_an_empty_asof_order() {
+    let mut payload =
+        serde_json::to_value(definition(Config::backward(AsOfJoinKind::LeftOuter))).unwrap();
+    payload["orders"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<AsOfJoinDefinition>(payload).is_err());
 }
 
 fn left_change(events: &[LeftEvent]) -> Change {
@@ -356,9 +364,10 @@ impl Fixture {
 
 fn construct_join_operation(
     root: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schemas: &[SchemaRef],
 ) -> (Operation, Transactions) {
+    let definition: OperationDefinition = definition.clone().into();
     let mut setup = StoreSetup::new();
     let constructed = definition
         .construct(
@@ -374,9 +383,10 @@ fn construct_join_operation(
 
 fn reconstruct_join_operation(
     store: &Store,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schemas: &[SchemaRef],
 ) -> Operation {
+    let definition: OperationDefinition = definition.clone().into();
     let constructed = definition
         .construct(
             schemas,
@@ -723,7 +733,7 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
     );
 
     let schemas = [left_schema(), right_schema()];
-    let binding = construct_checked(decoded.as_ref(), &schemas).unwrap();
+    let binding = construct_checked(&decoded, &schemas).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(
         output
@@ -749,8 +759,7 @@ fn literal_definition_has_tag_resources_exact_schema_and_decoded_runtime() {
     );
 
     let root = TestStore::new();
-    let (mut operation, mut transactions) =
-        construct_join_operation(&root, decoded.as_ref(), &schemas);
+    let (mut operation, mut transactions) = construct_join_operation(&root, &decoded, &schemas);
     assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
     let right = right_change(&[right(Some("A"), Some(10), None, 10, 1)]);
     assert!(matches!(

@@ -1,3 +1,7 @@
+use std::io::{self, Write};
+
+use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 use thiserror::Error;
 
 use crate::{
@@ -7,52 +11,6 @@ use crate::{
 
 const MAGIC: &[u8] = b"dogpaddle.operation\0";
 const FORMAT_VERSION: u16 = 1;
-
-pub(crate) type DecodeFn = fn(&[u8]) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError>;
-
-pub(crate) const DECODERS: &[(u16, DecodeFn)] = &[
-    (scan::mysql_cdc::TAG, scan::mysql_cdc::decode_definition),
-    (
-        scan::postgres_cdc::TAG,
-        scan::postgres_cdc::decode_definition,
-    ),
-    (scan::sequence::TAG, scan::sequence::decode_definition),
-    (
-        transform::aggregate::TAG,
-        transform::aggregate::decode_definition,
-    ),
-    (
-        transform::asof_join::TAG,
-        transform::asof_join::decode_definition,
-    ),
-    (
-        transform::distinct::TAG,
-        transform::distinct::decode_definition,
-    ),
-    (
-        transform::running_event_count::TAG,
-        transform::running_event_count::decode_definition,
-    ),
-    (transform::filter::TAG, transform::filter::decode_definition),
-    (
-        transform::equi_join::TAG,
-        transform::equi_join::decode_definition,
-    ),
-    (transform::select::TAG, transform::select::decode_definition),
-    (
-        transform::union_all::TAG,
-        transform::union_all::decode_definition,
-    ),
-    (
-        transform::schema_align::TAG,
-        transform::schema_align::decode_definition,
-    ),
-    (sink::clickhouse::TAG, sink::clickhouse::decode_definition),
-    (sink::discard::TAG, sink::discard::decode_definition),
-    (sink::doris::TAG, sink::doris::decode_definition),
-    (sink::postgres::TAG, sink::postgres::decode_definition),
-    (sink::sqlite::TAG, sink::sqlite::decode_definition),
-];
 
 /// Versioned operation-definition encoding failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -73,6 +31,16 @@ pub enum DefinitionCodecError {
     /// A known operation variant contains a non-canonical persistent payload.
     #[error("operation definition payload is invalid: {0}")]
     InvalidPayload(&'static str),
+    /// A JSON payload could not be decoded. The category and position never echo input values.
+    #[error("operation definition JSON payload has {reason} at line {line} column {column}")]
+    InvalidJsonPayload {
+        /// Static error category without input text.
+        reason: &'static str,
+        /// One-based JSON line number.
+        line: usize,
+        /// One-based JSON column number.
+        column: usize,
+    },
     /// Bytes remain after decoding the selected operation variant.
     #[error("operation definition contains trailing bytes")]
     TrailingBytes,
@@ -80,16 +48,21 @@ pub enum DefinitionCodecError {
 
 /// Encodes a definition using `DogPaddle`'s versioned binary format.
 ///
-/// Some operation payloads contain bytes owned by an exactly pinned upstream
-/// codec. Such bytes are part of this outer format version and may require a
-/// version bump when that dependency changes.
+/// Operation payloads may embed canonical bytes from pinned upstream codecs.
+/// Development v1 state is rebuilt when such bytes or the payload layout changes;
+/// no older payload format is recognized or migrated.
+///
+/// # Panics
+///
+/// Panics if a trusted definition violates its serialization invariant.
 #[must_use]
-pub fn encode_definition(definition: &dyn OperationDefinition) -> Vec<u8> {
+pub fn encode_definition(definition: &OperationDefinition) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(MAGIC.len() + 12);
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
     encoded.extend_from_slice(&definition.persistence_tag().to_be_bytes());
-    definition.encode_payload(&mut encoded);
+    serde_json::to_writer(&mut encoded, definition)
+        .expect("validated operation definition has a serializable payload");
     encoded
 }
 
@@ -99,15 +72,190 @@ pub fn encode_definition(definition: &dyn OperationDefinition) -> Vec<u8> {
 ///
 /// Returns a [`DefinitionCodecError`] for truncated, unsupported, unknown, or
 /// non-canonical input.
-pub fn decode_definition(
-    encoded: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+pub fn decode_definition(encoded: &[u8]) -> Result<OperationDefinition, DefinitionCodecError> {
     let (tag, payload) = decode_header(encoded)?;
-    let decoder = DECODERS
-        .iter()
-        .find_map(|(registered, decoder)| (*registered == tag).then_some(*decoder))
-        .ok_or(DefinitionCodecError::UnknownTag(tag))?;
-    decoder(payload)
+    match tag {
+        scan::mysql_cdc::TAG => {
+            scan::mysql_cdc::decode_definition(payload).map(OperationDefinition::MySqlCdcScan)
+        }
+        scan::postgres_cdc::TAG => {
+            scan::postgres_cdc::decode_definition(payload).map(OperationDefinition::PostgresCdcScan)
+        }
+        scan::sequence::TAG => {
+            scan::sequence::decode_definition(payload).map(OperationDefinition::SequenceScan)
+        }
+        transform::aggregate::TAG => {
+            transform::aggregate::decode_definition(payload).map(OperationDefinition::Aggregate)
+        }
+        transform::asof_join::TAG => {
+            transform::asof_join::decode_definition(payload).map(OperationDefinition::AsOfJoin)
+        }
+        transform::distinct::TAG => {
+            transform::distinct::decode_definition(payload).map(OperationDefinition::Distinct)
+        }
+        transform::running_event_count::TAG => {
+            transform::running_event_count::decode_definition(payload)
+                .map(OperationDefinition::RunningEventCount)
+        }
+        transform::filter::TAG => {
+            transform::filter::decode_definition(payload).map(OperationDefinition::Filter)
+        }
+        transform::equi_join::TAG => {
+            transform::equi_join::decode_definition(payload).map(OperationDefinition::EquiJoin)
+        }
+        transform::select::TAG => {
+            transform::select::decode_definition(payload).map(OperationDefinition::Select)
+        }
+        transform::union_all::TAG => {
+            transform::union_all::decode_definition(payload).map(OperationDefinition::UnionAll)
+        }
+        transform::schema_align::TAG => transform::schema_align::decode_definition(payload)
+            .map(OperationDefinition::SchemaAlign),
+        sink::clickhouse::TAG => {
+            sink::clickhouse::decode_definition(payload).map(OperationDefinition::ClickHouseSink)
+        }
+        sink::discard::TAG => {
+            sink::discard::decode_definition(payload).map(OperationDefinition::Discard)
+        }
+        sink::doris::TAG => {
+            sink::doris::decode_definition(payload).map(OperationDefinition::DorisSink)
+        }
+        sink::postgres::TAG => {
+            sink::postgres::decode_definition(payload).map(OperationDefinition::PostgresSink)
+        }
+        sink::sqlite::TAG => {
+            sink::sqlite::decode_definition(payload).map(OperationDefinition::SqliteSink)
+        }
+        _ => Err(DefinitionCodecError::UnknownTag(tag)),
+    }
+}
+
+pub(crate) fn decode_json_payload<T>(
+    payload: &[u8],
+    invalid: &'static str,
+) -> Result<T, DefinitionCodecError>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let definition: T = parse_json_payload(payload)?;
+    require_canonical_json_payload(&definition, payload, invalid)?;
+    Ok(definition)
+}
+
+pub(crate) fn require_canonical_json_payload<T: Serialize>(
+    definition: &T,
+    payload: &[u8],
+    invalid: &'static str,
+) -> Result<(), DefinitionCodecError> {
+    let mut comparison = PayloadComparisonWriter {
+        expected: payload,
+        position: 0,
+        matches: true,
+    };
+    serde_json::to_writer(&mut comparison, &definition)
+        .expect("decoded operation definition has a serializable payload");
+    if !comparison.matches || comparison.position != payload.len() {
+        return Err(DefinitionCodecError::InvalidPayload(invalid));
+    }
+    Ok(())
+}
+
+struct PayloadComparisonWriter<'a> {
+    expected: &'a [u8],
+    position: usize,
+    matches: bool,
+}
+
+impl Write for PayloadComparisonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self.position.saturating_add(bytes.len());
+        self.matches &= self.expected.get(self.position..end) == Some(bytes);
+        self.position = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_json_payload<T: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+) -> Result<T, DefinitionCodecError> {
+    let mut decoder = serde_json::Deserializer::from_slice(payload);
+    let definition = T::deserialize(&mut decoder).map_err(|error| {
+        let reason = match error.classify() {
+            Category::Eof => return DefinitionCodecError::Truncated,
+            Category::Data => safe_json_data_reason(&error),
+            Category::Syntax => "invalid syntax",
+            Category::Io => "I/O failure",
+        };
+        DefinitionCodecError::InvalidJsonPayload {
+            reason,
+            line: error.line(),
+            column: error.column(),
+        }
+    })?;
+    decoder
+        .end()
+        .map_err(|_| DefinitionCodecError::TrailingBytes)?;
+    Ok(definition)
+}
+
+fn safe_json_data_reason(error: &serde_json::Error) -> &'static str {
+    const EXPRESSION_REASONS: [&str; 6] = [
+        "DataFusion expression protobuf is too large",
+        "DataFusion expression protobuf is invalid",
+        "DataFusion expression protobuf contains non-canonical map metadata",
+        "DataFusion expression cannot be re-encoded",
+        "DataFusion expression protobuf is not canonical",
+        "expression must be immutable and row-local",
+    ];
+
+    let mut prefix = ErrorPrefix::default();
+    std::fmt::write(&mut prefix, format_args!("{error}"))
+        .expect("bounded error prefix writer cannot fail");
+    let message = prefix.as_bytes();
+    if message.starts_with(b"expression protobuf base64 is invalid") {
+        return "expression protobuf base64 is invalid";
+    }
+    if let Some(detail) = message.strip_prefix(b"operation definition payload is invalid: ") {
+        for reason in EXPRESSION_REASONS {
+            if detail.starts_with(reason.as_bytes()) {
+                return reason;
+            }
+        }
+    }
+    "invalid value"
+}
+
+struct ErrorPrefix {
+    bytes: [u8; 160],
+    len: usize,
+}
+
+impl Default for ErrorPrefix {
+    fn default() -> Self {
+        Self {
+            bytes: [0; 160],
+            len: 0,
+        }
+    }
+}
+
+impl ErrorPrefix {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl std::fmt::Write for ErrorPrefix {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let count = text.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+        self.len += count;
+        Ok(())
+    }
 }
 
 fn decode_header(encoded: &[u8]) -> Result<(u16, &[u8]), DefinitionCodecError> {
@@ -118,59 +266,15 @@ fn decode_header(encoded: &[u8]) -> Result<(u16, &[u8]), DefinitionCodecError> {
         return Err(DefinitionCodecError::InvalidMagic);
     }
 
-    let mut cursor = PayloadCursor::new(&encoded[MAGIC.len()..]);
-    let version = cursor.read_u16()?;
+    let (version, remaining) = encoded[MAGIC.len()..]
+        .split_first_chunk::<2>()
+        .ok_or(DefinitionCodecError::Truncated)?;
+    let version = u16::from_be_bytes(*version);
     if version != FORMAT_VERSION {
         return Err(DefinitionCodecError::UnsupportedVersion(version));
     }
-    let tag = cursor.read_u16()?;
-    Ok((tag, cursor.remaining()))
-}
-
-pub(crate) struct PayloadCursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> PayloadCursor<'a> {
-    pub(crate) const fn new(remaining: &'a [u8]) -> Self {
-        Self { remaining }
-    }
-
-    pub(crate) const fn remaining(&self) -> &'a [u8] {
-        self.remaining
-    }
-
-    pub(crate) fn read_u16(&mut self) -> Result<u16, DefinitionCodecError> {
-        Ok(u16::from_be_bytes(self.take::<2>()?))
-    }
-
-    pub(crate) fn read_u32(&mut self) -> Result<u32, DefinitionCodecError> {
-        Ok(u32::from_be_bytes(self.take::<4>()?))
-    }
-
-    pub(crate) fn read_bytes(&mut self, length: usize) -> Result<&'a [u8], DefinitionCodecError> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(length)
-            .ok_or(DefinitionCodecError::Truncated)?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    pub(crate) fn finish(self) -> Result<(), DefinitionCodecError> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(DefinitionCodecError::TrailingBytes)
-        }
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], DefinitionCodecError> {
-        let (value, remaining) = self
-            .remaining
-            .split_first_chunk::<N>()
-            .ok_or(DefinitionCodecError::Truncated)?;
-        self.remaining = remaining;
-        Ok(*value)
-    }
+    let (tag, payload) = remaining
+        .split_first_chunk::<2>()
+        .ok_or(DefinitionCodecError::Truncated)?;
+    Ok((u16::from_be_bytes(*tag), payload))
 }

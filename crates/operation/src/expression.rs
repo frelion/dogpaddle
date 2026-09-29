@@ -9,6 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use datafusion_common::{
     DFSchema, DataFusionError,
     tree_node::{TreeNode, TreeNodeRecursion},
@@ -21,11 +22,11 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr, expressions::
 use datafusion_proto::bytes::Serializeable;
 use dogpaddle_change::{Change, ChangeError, ChangeProjection};
 use dogpaddle_store::TransactionAccess;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 
 use crate::{
     DefinitionCodecError,
-    codec::PayloadCursor,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -45,7 +46,7 @@ pub enum ExpressionDefinitionError {
     /// `DataFusion` did not produce one canonical protobuf representation.
     #[error("DataFusion protobuf encoding is not canonical for this expression")]
     NonCanonical,
-    /// The protobuf cannot fit the Operation Definition length field.
+    /// The protobuf exceeds the persistent expression size limit.
     #[error("DataFusion expression protobuf is too large for an Operation Definition")]
     TooLarge,
     /// The expression cannot be replayed as an immutable row-local calculation.
@@ -78,6 +79,22 @@ pub enum ExpressionError {
 pub(crate) struct StoredExpression {
     expression: Arc<Expr>,
     protobuf: Arc<[u8]>,
+}
+
+impl Serialize for StoredExpression {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(self.protobuf.as_ref()))
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredExpression {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = <&str>::deserialize(deserializer)?;
+        let protobuf = BASE64
+            .decode(encoded)
+            .map_err(|_| D::Error::custom("expression protobuf base64 is invalid"))?;
+        Self::decode_protobuf(&protobuf).map_err(D::Error::custom)
+    }
 }
 
 pub(crate) struct BoundExpression {
@@ -251,18 +268,12 @@ impl StoredExpression {
         self.expression.as_ref()
     }
 
-    pub(crate) fn encode(&self, output: &mut Vec<u8>) {
-        let length = u32::try_from(self.protobuf.len())
-            .expect("expression construction enforces the protobuf length");
-        output.extend_from_slice(&length.to_be_bytes());
-        output.extend_from_slice(&self.protobuf);
-    }
-
-    pub(crate) fn decode(cursor: &mut PayloadCursor<'_>) -> Result<Self, DefinitionCodecError> {
-        let length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("DataFusion expression protobuf length is invalid")
-        })?;
-        let protobuf = cursor.read_bytes(length)?;
+    fn decode_protobuf(protobuf: &[u8]) -> Result<Self, DefinitionCodecError> {
+        if u32::try_from(protobuf.len()).is_err() {
+            return Err(DefinitionCodecError::InvalidPayload(
+                "DataFusion expression protobuf is too large",
+            ));
+        }
         let expression = Expr::from_bytes(protobuf).map_err(|_| {
             DefinitionCodecError::InvalidPayload("DataFusion expression protobuf is invalid")
         })?;

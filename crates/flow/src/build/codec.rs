@@ -104,7 +104,7 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
             .map_err(|_| FlowDefinitionError::LengthOverflow("operation count"))?;
         encoded.extend_from_slice(&operation_count.to_be_bytes());
         for operation in station.operations() {
-            let operation = encode_definition(operation.as_ref());
+            let operation = encode_definition(operation);
             encode_bytes(&mut encoded, &operation, "operation definition")?;
         }
         let input_count = u32::try_from(station.inputs().len())

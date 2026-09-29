@@ -120,7 +120,7 @@ impl DirectScan {
     fn open(options: &Options) -> Result<Self, OperationError> {
         let path = options.root.join("scan");
         if !path.exists() {
-            Self::create(&path, &options.definition()?, options.config()?)?;
+            Self::create(&path, options.definition()?, options.config()?)?;
         }
         let store = Store::open(&path)?;
         let definition_cell: Cell<Vec<u8>> = store.open_data("definition")?;
@@ -154,10 +154,10 @@ impl DirectScan {
 
     fn create(
         path: &Path,
-        definition: &dyn OperationDefinition,
+        definition: impl Into<OperationDefinition>,
         config: MySqlCdcScanConfig,
     ) -> Result<(), OperationError> {
-        let encoded = encode_definition(definition);
+        let encoded = encode_definition(&definition.into());
         let canonical = decode_definition(&encoded)?;
         let mut setup = dogpaddle_store::StoreSetup::new();
         let saved: Cell<Vec<u8>> = setup.create_data("definition")?;

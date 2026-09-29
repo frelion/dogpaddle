@@ -1,4 +1,5 @@
-use std::{num::NonZeroU32, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use arrow_array::{BooleanArray, Int64Array};
 use arrow_schema::{ArrowError, SchemaRef};
@@ -8,8 +9,9 @@ use dogpaddle_store::{OrderedMultiset, OrderedMultisetAccess, StoreError, Transa
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::{ConstructedOperation, Sealed as SealedDefinition},
+    DefinitionCodecError,
+    codec::decode_json_payload,
+    definition::ConstructedOperation,
     operation::{AtomicOperation, OperationError, OperationInput, relation::canonical_row},
 };
 
@@ -22,10 +24,10 @@ const WEIGHTS: &str = "distinct.weights";
 /// emits an insertion when a row first becomes present and a retraction when
 /// its multiplicity returns to zero. Intermediate multiplicity changes emit
 /// nothing, and input event order is never consolidated or reordered.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DistinctDefinition {
-    _private: (),
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DistinctDefinition {}
 
 /// Materialized exact-row distinct operation.
 ///
@@ -81,25 +83,18 @@ impl DistinctDefinition {
     /// Creates a distinct definition.
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {}
     }
 }
 
-impl SealedDefinition for DistinctDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        input_schemas: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        Ok(Some(Arc::clone(&input_schemas[0])))
+impl DistinctDefinition {
+    pub(crate) fn output_schema_unchecked(input_schemas: &[SchemaRef]) -> SchemaRef {
+        Arc::clone(&input_schemas[0])
     }
 
-    fn construct_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+    pub(crate) fn construct_unchecked(
         input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -113,18 +108,6 @@ impl SealedDefinition for DistinctDefinition {
             },
         ))
     }
-}
-
-impl OperationDefinition for DistinctDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
 impl AtomicOperation for DistinctOperation {
@@ -226,10 +209,7 @@ fn map_weight_error(error: StoreError) -> DistinctError {
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    if payload.is_empty() {
-        Ok(Box::new(DistinctDefinition::new()))
-    } else {
-        Err(DefinitionCodecError::TrailingBytes)
-    }
+) -> Result<Box<DistinctDefinition>, DefinitionCodecError> {
+    let definition: DistinctDefinition = decode_json_payload(payload, "invalid Distinct payload")?;
+    Ok(Box::new(definition))
 }

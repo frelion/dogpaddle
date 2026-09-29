@@ -55,27 +55,10 @@ fn persisted_definition() -> SchemaAlignDefinition {
     .unwrap()
 }
 
-fn skip_length_prefixed(encoded: &[u8], offset: &mut usize) {
-    let length = usize::try_from(u32::from_be_bytes(
-        encoded[*offset..*offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    *offset += size_of::<u32>() + length;
-}
-
-fn skip_metadata(encoded: &[u8], offset: &mut usize) {
-    let count = u32::from_be_bytes(
-        encoded[*offset..*offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
-    );
-    *offset += size_of::<u32>();
-    for _ in 0..count {
-        skip_length_prefixed(encoded, offset);
-        skip_length_prefixed(encoded, offset);
-    }
+#[test]
+fn public_json_deserialization_rejects_duplicate_schema_metadata() {
+    let forged = r#"{"fields":[],"metadata":{"owner":"first","owner":"second"}}"#;
+    assert!(serde_json::from_str::<SchemaAlignDefinition>(forged).is_err());
 }
 
 #[test]
@@ -106,7 +89,7 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     );
 
     let schema = value_schema();
-    let constructed = construct_checked(decoded.as_ref(), std::slice::from_ref(&schema)).unwrap();
+    let constructed = construct_checked(&decoded, std::slice::from_ref(&schema)).unwrap();
     let output_schema = constructed.as_ref().unwrap();
     assert_eq!(output_schema.metadata().get("owner").unwrap(), "test");
     assert_eq!(output_schema.field(0).name(), "renamed");
@@ -120,7 +103,7 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), schema);
+    let mut operation = stateless_operation(&decoded, schema);
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -148,7 +131,7 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(SCHEMA_ALIGN_V1)).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), input.schema());
+    let mut operation = stateless_operation(&decoded, input.schema());
     let mut transactions = store.into_transactions();
     let Action::Complete(Some(reopened_aligned)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
@@ -178,7 +161,7 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
 
 #[test]
 fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
-    let canonical = encode_definition(&persisted_definition());
+    let canonical = encode_definition(&persisted_definition().into());
     let reversed_input_order = SchemaAlignDefinition::try_new_with_metadata(
         [
             SchemaAlignField::try_new_with_metadata(
@@ -200,58 +183,37 @@ fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
         ],
     )
     .unwrap();
-    assert_eq!(encode_definition(&reversed_input_order), canonical);
-
-    let mut offset = DEFINITION_HEADER_LEN;
-    let field_count = u32::from_be_bytes(
-        canonical[offset..offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
+    assert_eq!(
+        encode_definition(&reversed_input_order.clone().into()),
+        canonical
     );
-    offset += size_of::<u32>();
-    let mut first_nullable = None;
-    for field in 0..field_count {
-        skip_length_prefixed(&canonical, &mut offset);
-        skip_length_prefixed(&canonical, &mut offset);
-        if field == 0 {
-            first_nullable = Some(offset);
+
+    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    let wrap = |payload: &str| {
+        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    };
+
+    let invalid_nullability = wrap(&payload.replacen("\"nullable\":true", "\"nullable\":2", 1));
+    assert_ne!(invalid_nullability, canonical);
+    assert!(matches!(
+        decode_definition(&invalid_nullability).unwrap_err(),
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            ..
         }
-        offset += 1;
-        skip_metadata(&canonical, &mut offset);
-    }
-
-    let mut invalid_nullability = canonical.clone();
-    invalid_nullability[first_nullable.unwrap()] = 2;
-    assert!(matches!(
-        decode_definition(&invalid_nullability),
-        Err(DefinitionCodecError::InvalidPayload(_))
     ));
 
-    let schema_metadata_count_offset = offset;
-    let metadata_count = u32::from_be_bytes(
-        canonical[offset..offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
+    let unsorted = wrap(&payload.replace(
+        "\"metadata\":{\"owner\":\"test\",\"version\":\"1\"}",
+        "\"metadata\":{\"version\":\"1\",\"owner\":\"test\"}",
+    ));
+    assert_ne!(unsorted, canonical);
+    assert_eq!(
+        decode_definition(&unsorted).unwrap_err(),
+        DefinitionCodecError::InvalidPayload("invalid SchemaAlign payload")
     );
-    assert_eq!(metadata_count, 2);
-    offset += size_of::<u32>();
-    let first_start = offset;
-    skip_length_prefixed(&canonical, &mut offset);
-    skip_length_prefixed(&canonical, &mut offset);
-    let first_end = offset;
-    let second_start = offset;
-    skip_length_prefixed(&canonical, &mut offset);
-    skip_length_prefixed(&canonical, &mut offset);
-    let second_end = offset;
-
-    let mut unsorted = canonical[..schema_metadata_count_offset + size_of::<u32>()].to_vec();
-    unsorted.extend_from_slice(&canonical[second_start..second_end]);
-    unsorted.extend_from_slice(&canonical[first_start..first_end]);
-    unsorted.extend_from_slice(&canonical[second_end..]);
-    assert!(matches!(
-        decode_definition(&unsorted),
-        Err(DefinitionCodecError::InvalidPayload(_))
-    ));
 }
 
 #[test]

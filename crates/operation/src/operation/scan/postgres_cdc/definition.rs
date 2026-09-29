@@ -4,9 +4,9 @@ use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    definition::{Sealed, schema_error},
+    ConstructedOperation, DefinitionCodecError, RuntimeResource,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
 };
 
 use super::{
@@ -152,21 +152,17 @@ impl PostgresCdcScanDefinition {
     }
 }
 
-impl Sealed for PostgresCdcScanDefinition {
-    fn output_schema_unchecked(
+impl PostgresCdcScanDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
-        _: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
-        _: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
@@ -187,35 +183,20 @@ impl Sealed for PostgresCdcScanDefinition {
         Ok(ConstructedOperation::turn(Some(output), operation))
     }
 
-    fn resource_type(&self) -> Option<TypeId> {
-        Some(TypeId::of::<PostgresCdcScanConfig>())
-    }
-}
-
-impl OperationDefinition for PostgresCdcScanDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Scan
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend(encode(self).expect("validated PostgreSQL scan definition is encodable"));
+    pub(crate) fn resource_type() -> TypeId {
+        TypeId::of::<PostgresCdcScanConfig>()
     }
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+) -> Result<Box<PostgresCdcScanDefinition>, DefinitionCodecError> {
     let invalid =
         || DefinitionCodecError::InvalidPayload("invalid PostgreSQL CDC scan specification");
     if payload.len() > MAX_DEFINITION_BYTES {
         return Err(invalid());
     }
-    let persistent: PersistentDefinition =
-        serde_json::from_slice(payload).map_err(|_| invalid())?;
+    let persistent: PersistentDefinition = parse_json_payload(payload)?;
     let capacity = NonZeroU64::new(persistent.bootstrap_spool_bytes).ok_or_else(invalid)?;
     let definition = PostgresCdcScanDefinition::try_new_projected(
         persistent.spec,
@@ -223,11 +204,11 @@ pub(crate) fn decode_definition(
         capacity,
     )
     .map_err(|_| invalid())?;
-    let mut canonical = Vec::new();
-    definition.encode_payload(&mut canonical);
-    if canonical != payload {
-        return Err(invalid());
-    }
+    require_canonical_json_payload(
+        &definition,
+        payload,
+        "invalid PostgreSQL CDC scan specification",
+    )?;
     Ok(Box::new(definition))
 }
 

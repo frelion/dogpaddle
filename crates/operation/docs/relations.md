@@ -5,7 +5,7 @@
 
 ## Distinct
 
-`Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition payload 为空，只声明 `distinct.weights: OrderedMultiset<Vec<u8>>`。
+`Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition 的 canonical JSON payload 为 `{}`，只声明 `distinct.weights: OrderedMultiset<Vec<u8>>`。
 key 是完整 canonical row bytes，multiplicity 是 Store 维护的正 `u64`；缺失表示零，checked signed adjustment 归零即删除。
 输入按行序逐事件更新：负前缀和 overflow 回滚整个 turn，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。同一 Change 内连续相同 key 只缓存一个 key 和其当前 `u64` 权重；仍逐事件校验及产出边界，key 切换或 turn 结束时才写回最终权重，净变化为零时不写。无效前缀继续毒化 Store 事务。
 状态、output 和 input completion 同事务提交，背压与 reopen 保持同一输入语义。

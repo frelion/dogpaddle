@@ -10,8 +10,8 @@ use dogpaddle_flow::{Flow, FlowFactory};
 use crate::{
     SqlError,
     endpoint::{
-        BuiltScan, ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
-        resolve_debezium_runtime,
+        ResolvedEndpoints, ResolvedScanEndpoint, ScanEndpoint, SinkEndpoint,
+        project_scan_definition, resolve_debezium_runtime,
     },
     plan::{lower_query, plan, scan_projections},
     syntax,
@@ -116,7 +116,7 @@ impl SqlProgram {
             .enumerate()
             .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle, &mut factory))
             .collect::<Result<Vec<_>, _>>()?;
-        let planning_scans = scans.iter().map(BuiltScan::definition).collect::<Vec<_>>();
+        let planning_scans = scans.iter().collect::<Vec<_>>();
         let logical_plan = plan(self.query.clone(), &planning_scans)?;
         drop(planning_scans);
         let projections = scan_projections(&logical_plan, scans.len())?;
@@ -124,9 +124,14 @@ impl SqlProgram {
             .into_iter()
             .zip(&projections)
             .map(|(scan, projection)| {
-                scan.into_definition(projection.as_deref().ok_or_else(|| {
-                    SqlError::invalid("every declared scan must be reachable from the query result")
-                })?)
+                project_scan_definition(
+                    scan,
+                    projection.as_deref().ok_or_else(|| {
+                        SqlError::invalid(
+                            "every declared scan must be reachable from the query result",
+                        )
+                    })?,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output = lower_query(&logical_plan, scans, projections, &mut factory)?;

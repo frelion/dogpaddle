@@ -19,7 +19,7 @@ use std::{
 use super::support::{construct_checked_with_resource, decode_hex};
 
 fn construct_checked(
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     inputs: &[arrow_schema::SchemaRef],
 ) -> Result<Option<arrow_schema::SchemaRef>, dogpaddle_operation::OperationBindError> {
     construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config()))
@@ -65,16 +65,22 @@ fn literal_definition_bytes() -> Vec<u8> {
 #[test]
 fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
     let definition = definition();
-    assert_eq!(definition.kind(), OperationKind::Scan);
-    assert_eq!(definition.persistence_tag(), 11);
-    let bytes = encode_definition(&definition);
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).kind(),
+        OperationKind::Scan
+    );
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).persistence_tag(),
+        11
+    );
+    let bytes = encode_definition(&definition.clone().into());
     let expected = literal_definition_bytes();
     assert_eq!(bytes, expected);
     let decoded = decode_definition(&bytes).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Scan);
     assert_eq!(decoded.persistence_tag(), 11);
-    assert_eq!(encode_definition(decoded.as_ref()), bytes);
-    let binding = construct_checked(decoded.as_ref(), &[]).unwrap();
+    assert_eq!(encode_definition(&decoded), bytes);
+    let binding = construct_checked(&decoded, &[]).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(output.fields().len(), 1);
     assert_eq!(output.field(0).name(), "id");
@@ -95,7 +101,7 @@ fn postgres_cdc_bootstrap_spool_is_a_queue() {
     let path = root.path().join("state");
     let definition = definition();
     let mut setup = StoreSetup::new();
-    let (operation, _) = (&definition as &dyn OperationDefinition)
+    let (operation, _) = OperationDefinition::from(definition.clone())
         .construct(
             &[],
             &mut setup.data_scope().scoped("operation"),
@@ -115,15 +121,16 @@ fn postgres_cdc_bootstrap_spool_is_a_queue() {
 fn postgres_cdc_materialization_requires_one_exact_runtime_resource() {
     let definition = definition();
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::none()),
+        OperationDefinition::from(definition.clone()).validate_resource(&RuntimeResource::none()),
         Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
+        OperationDefinition::from(definition.clone())
+            .validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
-        (&definition as &dyn OperationDefinition)
+        OperationDefinition::from(definition.clone())
             .validate_resource(&RuntimeResource::new(config()))
             .is_ok()
     );
@@ -140,7 +147,7 @@ impl Fixture {
     fn create(path: &Path) -> Self {
         let definition = definition();
         let mut setup = StoreSetup::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[],
                 &mut setup.data_scope().scoped("operation"),
@@ -376,7 +383,7 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
         let definition =
             PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap()).unwrap();
         assert!(
-            (&definition as &dyn OperationDefinition)
+            OperationDefinition::from(definition.clone())
                 .output_schema(&[])
                 .is_err()
         );
@@ -393,7 +400,7 @@ fn postgres_cdc_projection_is_ordered_and_can_preserve_rows_without_columns() {
     let projected =
         PostgresCdcScanDefinition::try_new_projected(spec.clone(), vec![1], capacity).unwrap();
     assert_eq!(projected.output_projection(), &[1]);
-    let output = (&projected as &dyn OperationDefinition)
+    let output = OperationDefinition::from(projected.clone())
         .output_schema(&[])
         .unwrap()
         .unwrap();
@@ -404,7 +411,7 @@ fn postgres_cdc_projection_is_ordered_and_can_preserve_rows_without_columns() {
     let empty =
         PostgresCdcScanDefinition::try_new_projected(spec.clone(), vec![], capacity).unwrap();
     assert!(
-        (&empty as &dyn OperationDefinition)
+        OperationDefinition::from(empty.clone())
             .output_schema(&[])
             .unwrap()
             .unwrap()

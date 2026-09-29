@@ -43,8 +43,8 @@ Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station �
 聚合函数。它是纯数据，可以稳定编码进 Flow Definition。Definition 不持有数据库句柄、连接、
 密码或正在执行到哪一步。
 
-`OperationDefinition` 是 sealed trait，下游 crate 不能实现。新增内建算子必须修改这个 crate，并在
-统一 decoder 表中注册稳定 tag；这样磁盘中的 Definition 不会在运行时落入未知实现。其纯
+`OperationDefinition` 是列出全部内建算子的封闭 enum。新增算子必须修改这个 enum 和持久化
+tag dispatch；Flow 无法收到未列入其中的实现。其纯
 `output_schema(inputs)` 路径复用具体算子的同一 Schema 编译规则，供 SQL 等上层在接触 Store 前取得
 权威输出 Schema；它不声明状态或构造 runtime，Sink 返回 `None`。
 
@@ -57,7 +57,7 @@ Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station �
    精确 Rust 类型。Flow 会先对全图完成这一步，因此错误不会留下目录或部分 catalog。
 2. `construct` 接收每个输入端口的完整 Arrow Schema、已限定资源名范围的短期 `DataScope` 和拥有型
    `RuntimeResource`，统一检查输入数量、DogPaddle Schema 与资源 presence/type。
-3. sealed 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
+3. 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
    的 typed collections；同一代码同时服务新建与恢复。
 4. 统一入口复核 output Schema 和 `Atomic`/`Turn` 执行能力，返回
    `ConstructedOperation`。调用方用 `into_parts()` 一次性取出最终 `Operation` 和 output Schema。
@@ -81,7 +81,7 @@ let input = Arc::new(Schema::new(vec![Field::new(
     DataType::UInt64,
     false,
 )]));
-let definition = FilterDefinition::try_new(col("value").eq(lit(7_u64)))?;
+let definition = OperationDefinition::from(FilterDefinition::try_new(col("value").eq(lit(7_u64)))?);
 let encoded = encode_definition(&definition);
 let definition = decode_definition(&encoded)?;
 let fixture = tempfile::tempdir()?;
@@ -406,7 +406,7 @@ Definition 或持久状态，reopen 时需要重新提供。这组重试参数�
 `encode_definition` 的外层格式是：
 
 ```text
-"dogpaddle.operation\0" + format version 1 + u16 operation tag + variant payload
+"dogpaddle.operation\0" + format version 1 + u16 operation tag + canonical JSON payload
 ```
 
 tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
@@ -414,11 +414,12 @@ tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类�
 buffered Sink 内 schema-bound Change entry 的 format marker、Schema fingerprint、single-batch framing 和
 EOS、collection 的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成
 当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation
-codec 还是目标布局/恢复 ABI。旧状态直接重建，不提供 self-contained IPC fallback、旧格式识别或迁移。decoder 表在
-[`src/codec.rs`](src/codec.rs) 按具体算子注册，不存在分类级 decoder 或运行期 registry。
+codec 还是目标布局/恢复 ABI。旧状态直接重建，不提供 self-contained IPC fallback、旧格式识别或迁移。
+[`src/codec.rs`](src/codec.rs) 解析统一外层格式后按 tag 选择具体 Definition；不另建 decoder 注册表。
 
-大部分 Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/)；三个外部端点的
-canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
+Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/) 或算子自己的 literal 测试；
+所有 variant 的 payload 遵守同一 canonical JSON 规则，表达式保存 canonical protobuf 的 base64 字节。
+完整 Flow Definition 基线位于
 [`crates/flow/tests/fixtures/v1/`](../flow/tests/fixtures/v1/)。
 
 ## 新增一个算子
@@ -432,12 +433,12 @@ canonical JSON 由各自测试直接冻结。完整 Flow Definition 基线位于
 新增实现应依次完成：
 
 1. 在 `scan/`、`transform/` 或 `sink/` 下建立具体模块。
-2. Definition 显式声明唯一 tag、`OperationKind` 和 canonical payload。
-3. 在 sealed `construct` 中编译 exact input Schema 语义，通过 `DataScope` 获取 typed handles，并产生最终 Operation 与唯一 output Schema。
+2. 在 `OperationDefinition` 中加入 variant、kind 和唯一 tag；具体 Definition 实现 canonical payload。
+3. 在具体 Definition 的私有 `construct_unchecked` 中编译 exact input Schema 语义，通过 `DataScope` 获取 typed handles，并产生最终 Operation 与唯一 output Schema。统一 checked `construct` 校验边界。
 4. 由算子代码固定逻辑资源名、collection 类型和 codec；新建与恢复使用同一 constructor。
 5. 选择 `AtomicOperation` 或 `TurnOperation`，让所有重放相关写入服从调用方事务；需要临时配置时只从
    `RuntimeResource` 取回精确类型。
-6. 在 [`src/codec.rs`](src/codec.rs) 注册具体 decoder。
+6. 在 [`src/codec.rs`](src/codec.rs) 的 tag dispatch 中选择具体 payload decoder。
 7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、checked construct、typed data、turn、
    rollback 和适用的 reopen。
 8. 只有引入新的通用执行机制时才增加 Flow witness；普通算子语义由自己的 correctness 文件拥有。

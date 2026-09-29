@@ -63,7 +63,7 @@ struct PlanningContext {
 }
 
 impl PlanningContext {
-    fn new(scans: &[&dyn OperationDefinition]) -> Result<Self, SqlError> {
+    fn new(scans: &[&OperationDefinition]) -> Result<Self, SqlError> {
         let mut options = ConfigOptions::default();
         options.sql_parser.map_string_types_to_utf8view = false;
         let sources = scans
@@ -74,7 +74,7 @@ impl PlanningContext {
                     internal_scan_name(index),
                     Arc::new(ScanSource {
                         index,
-                        schema: scan_schema(*scan)?,
+                        schema: scan_schema(scan)?,
                     }),
                 ))
             })
@@ -149,7 +149,7 @@ impl ContextProvider for PlanningContext {
 
 pub(crate) fn plan(
     query: datafusion_sql::sqlparser::ast::Query,
-    scans: &[&dyn OperationDefinition],
+    scans: &[&OperationDefinition],
 ) -> Result<LogicalPlan, SqlError> {
     let context = PlanningContext::new(scans)?;
     let plan = SqlToRel::new(&context).sql_statement_to_plan(Statement::Query(Box::new(query)))?;
@@ -166,7 +166,7 @@ pub(crate) fn plan(
 
 pub(crate) fn lower_query(
     plan: &LogicalPlan,
-    scans: Vec<Box<dyn OperationDefinition>>,
+    scans: Vec<OperationDefinition>,
     scan_projections: Vec<Option<Vec<usize>>>,
     factory: &mut FlowFactory,
 ) -> Result<OperationRef, SqlError> {
@@ -216,7 +216,7 @@ struct OrientedJoin {
 struct Lowerer<'a> {
     factory: &'a mut FlowFactory,
     next_transform: usize,
-    scans: Vec<Option<Box<dyn OperationDefinition>>>,
+    scans: Vec<Option<OperationDefinition>>,
     scan_nodes: HashMap<usize, LoweredRelation>,
     scan_projections: Vec<Option<Vec<usize>>>,
 }
@@ -619,24 +619,23 @@ impl Lowerer<'_> {
     fn add_transform<I, D>(&mut self, inputs: I, definition: D) -> Result<LoweredRelation, SqlError>
     where
         I: IntoIterator<Item = LoweredRelation>,
-        D: OperationDefinition,
+        D: Into<OperationDefinition>,
     {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let input_schemas = inputs
             .iter()
             .map(|input| Arc::clone(&input.physical_schema))
             .collect::<Vec<_>>();
-        let physical_schema = (&definition as &dyn OperationDefinition)
+        let definition: OperationDefinition = definition.into();
+        let physical_schema = definition
             .output_schema(&input_schemas)
             .map_err(SqlError::endpoint)?
             .ok_or_else(|| SqlError::invalid("transform definition has no output Schema"))?;
         let id = format!("sql/transform/{:08x}", self.next_transform);
         self.next_transform += 1;
-        let node = self.factory.operation(
-            id,
-            Box::new(definition),
-            inputs.into_iter().map(|input| input.node),
-        );
+        let node =
+            self.factory
+                .operation(id, definition, inputs.into_iter().map(|input| input.node));
         Ok(LoweredRelation {
             node,
             physical_schema,
@@ -944,7 +943,7 @@ fn rewrite_columns(
         .map_err(Into::into)
 }
 
-fn scan_schema(definition: &dyn OperationDefinition) -> Result<SchemaRef, SqlError> {
+fn scan_schema(definition: &OperationDefinition) -> Result<SchemaRef, SqlError> {
     definition
         .output_schema(&[])
         .map_err(SqlError::endpoint)?
@@ -988,14 +987,14 @@ mod tests {
         .unwrap()
     }
 
-    fn wide_scan() -> Box<dyn OperationDefinition> {
-        Box::new(wide_definition())
+    fn wide_scan() -> OperationDefinition {
+        wide_definition().into()
     }
 
-    fn plan_sql(sql: &str, scans: &[Box<dyn OperationDefinition>]) -> LogicalPlan {
+    fn plan_sql(sql: &str, scans: &[OperationDefinition]) -> LogicalPlan {
         let (_, query, endpoints) = crate::syntax::parse(sql).unwrap();
         assert_eq!(endpoints.len(), scans.len());
-        let scans = scans.iter().map(Box::as_ref).collect::<Vec<_>>();
+        let scans = scans.iter().collect::<Vec<_>>();
         plan(query, &scans).unwrap()
     }
 
@@ -1057,14 +1056,13 @@ mod tests {
         assert_eq!(projections, [Some(vec![0, 1])]);
 
         let full = wide_definition();
-        let projected = Box::new(
-            PostgresCdcScanDefinition::try_new_projected(
-                full.spec().clone(),
-                vec![0, 1],
-                full.bootstrap_spool_bytes(),
-            )
-            .unwrap(),
-        ) as Box<dyn OperationDefinition>;
+        let projected: OperationDefinition = PostgresCdcScanDefinition::try_new_projected(
+            full.spec().clone(),
+            vec![0, 1],
+            full.bootstrap_spool_bytes(),
+        )
+        .unwrap()
+        .into();
 
         let mut occurrences = Vec::new();
         table_scans(&plan, &mut occurrences);

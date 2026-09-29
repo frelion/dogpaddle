@@ -41,87 +41,89 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
     );
     assert_eq!(sqlite.table_name(), "events");
     assert!(
-        construct_checked(decoded.as_ref(), &[value_schema()])
+        construct_checked(&decoded, &[value_schema()])
             .unwrap()
             .is_none()
     );
 
-    let encoded = encode_definition(&sqlite);
-    let path = b"/var/lib/dogpaddle/output.sqlite";
-    let table = b"events";
-    let path_length_offset = DEFINITION_HEADER_LEN;
-    let path_offset = path_length_offset + size_of::<u32>();
-    let table_length_offset = path_offset + path.len();
-    let table_offset = table_length_offset + size_of::<u32>();
+    let encoded = encode_definition(&sqlite.clone().into());
     assert_eq!(
-        &encoded[path_length_offset..path_offset],
-        &u32::try_from(path.len()).unwrap().to_be_bytes()
+        &encoded[DEFINITION_HEADER_LEN..],
+        br#"{"database_path":"/var/lib/dogpaddle/output.sqlite","table_name":"events"}"#
     );
-    assert_eq!(&encoded[path_offset..table_length_offset], path);
-    assert_eq!(
-        &encoded[table_length_offset..table_offset],
-        &u32::try_from(table.len()).unwrap().to_be_bytes()
-    );
-    assert_eq!(&encoded[table_offset..], table);
 }
 
 #[test]
-fn sqlite_sink_decoder_rejects_invalid_lengths_strings_and_paths() {
-    let canonical = decode_hex(SQLITE_SINK_V1);
-    let path_length_offset = DEFINITION_HEADER_LEN;
-    let path_length = usize::try_from(u32::from_be_bytes(
-        canonical[path_length_offset..path_length_offset + size_of::<u32>()]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    let path_offset = path_length_offset + size_of::<u32>();
-    let table_length_offset = path_offset + path_length;
-    let table_offset = table_length_offset + size_of::<u32>();
+fn public_json_deserialization_rejects_a_relative_sqlite_path() {
+    let forged = r#"{"database_path":"relative.sqlite","table_name":"events"}"#;
+    assert!(serde_json::from_str::<SqliteSinkDefinition>(forged).is_err());
+}
 
-    let mut forged_path_length = canonical.clone();
-    forged_path_length[path_length_offset..path_offset].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert_eq!(
-        decode_definition(&forged_path_length).unwrap_err(),
-        DefinitionCodecError::Truncated
+#[test]
+fn sqlite_sink_decoder_rejects_missing_fields_invalid_strings_and_paths() {
+    let canonical = encode_definition(
+        &SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events")
+            .unwrap()
+            .into(),
     );
-
-    let mut forged_table_length = canonical.clone();
-    forged_table_length[table_length_offset..table_offset].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert_eq!(
-        decode_definition(&forged_table_length).unwrap_err(),
-        DefinitionCodecError::Truncated
-    );
-
-    for invalid_utf8_offset in [path_offset, table_offset] {
-        let mut invalid_utf8 = canonical.clone();
-        invalid_utf8[invalid_utf8_offset] = u8::MAX;
+    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    for field in ["database_path", "table_name"] {
+        let mut missing = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        missing.extend_from_slice(
+            payload
+                .replacen(
+                    &format!("\"{field}\":"),
+                    &format!("\"unknown_{field}\":"),
+                    1,
+                )
+                .as_bytes(),
+        );
         assert!(matches!(
-            decode_definition(&invalid_utf8),
-            Err(DefinitionCodecError::InvalidPayload(_))
+            decode_definition(&missing).unwrap_err(),
+            DefinitionCodecError::InvalidJsonPayload {
+                reason: "invalid value",
+                ..
+            }
         ));
     }
 
-    let wrap = |path: &[u8], table: &[u8]| {
+    for value in [b"/var/lib/dogpaddle/output.sqlite".as_slice(), b"events"] {
+        let mut invalid_utf8 = canonical.clone();
+        let offset = invalid_utf8
+            .windows(value.len())
+            .position(|window| window == value)
+            .unwrap();
+        invalid_utf8[offset] = u8::MAX;
+        assert!(matches!(
+            decode_definition(&invalid_utf8).unwrap_err(),
+            DefinitionCodecError::InvalidJsonPayload { .. }
+        ));
+    }
+
+    let wrap = |path: &str, table: &str| {
         let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
-        encoded.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
-        encoded.extend_from_slice(path);
-        encoded.extend_from_slice(&u32::try_from(table.len()).unwrap().to_be_bytes());
-        encoded.extend_from_slice(table);
+        encoded.extend_from_slice(
+            format!(
+                r#"{{"database_path":{},"table_name":{}}}"#,
+                serde_json::to_string(path).unwrap(),
+                serde_json::to_string(table).unwrap()
+            )
+            .as_bytes(),
+        );
         encoded
     };
     for invalid in [
-        wrap(b"relative.sqlite", b"events"),
-        wrap(b":memory:", b"events"),
-        wrap(b"/tmp/invalid\0.sqlite", b"events"),
-        wrap(b"/tmp/output.sqlite", b""),
-        wrap(b"/tmp/output.sqlite", b"bad\0table"),
-        wrap(b"/tmp/output.sqlite", b"SQLITE_reserved"),
+        wrap("relative.sqlite", "events"),
+        wrap(":memory:", "events"),
+        wrap("/tmp/invalid\0.sqlite", "events"),
+        wrap("/tmp/output.sqlite", ""),
+        wrap("/tmp/output.sqlite", "bad\0table"),
+        wrap("/tmp/output.sqlite", "SQLITE_reserved"),
     ] {
-        assert!(matches!(
-            decode_definition(&invalid),
-            Err(DefinitionCodecError::InvalidPayload(_))
-        ));
+        assert_eq!(
+            decode_definition(&invalid).unwrap_err(),
+            DefinitionCodecError::InvalidPayload("SQLite sink definition is invalid")
+        );
     }
 }
 
@@ -326,11 +328,12 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     let sqlite_path = fixture.path().with_extension("sqlite");
     let definition = SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap();
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
+        OperationDefinition::from(definition.clone())
+            .validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::UnexpectedRuntimeResource)
     ));
     let mut setup = StoreSetup::new();
-    let (operation, output) = (&definition as &dyn OperationDefinition)
+    let (operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[value_schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -350,7 +353,7 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
     store
         .open_data::<OrderedMap<u64, Vec<u8>>>("operation/sink.buffer")
         .unwrap();
-    let (operation, output) = (&definition as &dyn OperationDefinition)
+    let (operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[value_schema()],
             &mut store.data_scope().scoped("operation"),
@@ -376,9 +379,9 @@ impl Fixture {
         let root = TestStore::new();
         let definition =
             SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events").unwrap();
-        let encoded = encode_definition(&definition);
+        let encoded = encode_definition(&definition.clone().into());
         let mut setup = StoreSetup::new();
-        let (operation, output) = (&definition as &dyn OperationDefinition)
+        let (operation, output) = OperationDefinition::from(definition.clone())
             .construct(
                 &[schema()],
                 &mut setup.data_scope().scoped("operation"),

@@ -74,7 +74,7 @@ impl Fixture {
         )
         .expect("define ASOF benchmark");
         let mut setup = StoreSetup::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
                 &mut setup.data_scope().scoped("operation"),

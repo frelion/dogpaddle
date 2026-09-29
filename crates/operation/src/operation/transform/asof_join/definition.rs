@@ -1,13 +1,14 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    DefinitionCodecError, Expr, OperationDefinition, OperationKind, OperationSchemaError,
-    RuntimeResource,
-    codec::PayloadCursor,
-    definition::{ConstructedOperation, Sealed as SealedDefinition, schema_error},
+    DefinitionCodecError, Expr, OperationSchemaError,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::{ConstructedOperation, schema_error},
     expression::{BoundExpression, StoredExpression},
     operation::relation::indexable,
 };
@@ -138,20 +139,23 @@ impl AsOfTieBreak {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredEqualityKey {
     mode: AsOfEqualityMode,
     left: StoredExpression,
     right: StoredExpression,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredOrderKey {
     left: StoredExpression,
     right: StoredExpression,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredTieBreak {
     value: StoredExpression,
     descending: bool,
@@ -164,7 +168,7 @@ struct StoredTieBreak {
 /// relation. Equality keys form a partition, order keys select the nearest
 /// eligible order value according to [`AsOfDirection`], and right-only tie
 /// breaks select a deterministic exact right row at that value.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AsOfJoinDefinition {
     kind: AsOfJoinKind,
     direction: AsOfDirection,
@@ -175,6 +179,47 @@ pub struct AsOfJoinDefinition {
     tolerance: Option<u128>,
     output_names: Box<[String]>,
     residual: Option<StoredExpression>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    kind: AsOfJoinKind,
+    direction: AsOfDirection,
+    equalities: Box<[StoredEqualityKey]>,
+    orders: Box<[StoredOrderKey]>,
+    ties: Box<[StoredTieBreak]>,
+    tie_fallback: AsOfTieFallback,
+    tolerance: Option<u128>,
+    output_names: Box<[String]>,
+    residual: Option<StoredExpression>,
+}
+
+impl Payload {
+    fn into_definition(self) -> Result<AsOfJoinDefinition, &'static str> {
+        if self.orders.is_empty() {
+            return Err("ASOF join order key list is empty");
+        }
+        Ok(AsOfJoinDefinition {
+            kind: self.kind,
+            direction: self.direction,
+            equalities: self.equalities,
+            orders: self.orders,
+            ties: self.ties,
+            tie_fallback: self.tie_fallback,
+            tolerance: self.tolerance,
+            output_names: self.output_names,
+            residual: self.residual,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AsOfJoinDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Payload::deserialize(deserializer)?
+            .into_definition()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl AsOfJoinDefinition {
@@ -195,7 +240,7 @@ impl AsOfJoinDefinition {
     /// Equality keys and tie breaks may be empty. At least one order pair is
     /// required. Output-name cardinality and exact expression types depend on
     /// the eventual input Schemas and are checked by the final
-    /// [`OperationDefinition`] binding entrypoint. The optional residual is a
+    /// [`crate::OperationDefinition`] binding entrypoint. The optional residual is a
     /// candidate-eligibility predicate evaluated before nearest selection;
     /// only a non-NULL `true` candidate remains eligible. A tolerance requires
     /// exactly one distance-capable order pair and is measured in that type's
@@ -349,10 +394,9 @@ impl AsOfJoinDefinition {
     }
 }
 
-impl SealedDefinition for AsOfJoinDefinition {
-    fn output_schema_unchecked(
+impl AsOfJoinDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         let [left, right] = inputs else {
@@ -362,12 +406,10 @@ impl SealedDefinition for AsOfJoinDefinition {
             .map(|layout| Some(layout.output_schema))
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
             unreachable!("the final binding entrypoint enforces ASOF join input arity")
@@ -476,160 +518,14 @@ impl AsOfJoinDefinition {
     }
 }
 
-impl OperationDefinition for AsOfJoinDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::TurnTransform(NonZeroU32::new(2).expect("ASOF join has two inputs"))
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.push(self.kind.code());
-        output.push(self.direction.code());
-        output.push(u8::from(self.direction.allow_exact()));
-        output.push(self.tie_fallback.code());
-        match self.tolerance {
-            None => output.push(0),
-            Some(tolerance) => {
-                output.push(1);
-                output.extend_from_slice(&tolerance.to_be_bytes());
-            }
-        }
-        put_count(output, self.equalities.len());
-        for key in &self.equalities {
-            output.push(key.mode.code());
-            key.left.encode(output);
-            key.right.encode(output);
-        }
-        put_count(output, self.orders.len());
-        for key in &self.orders {
-            key.left.encode(output);
-            key.right.encode(output);
-        }
-        put_count(output, self.ties.len());
-        for tie in &self.ties {
-            output.push(u8::from(tie.descending));
-            output.push(u8::from(tie.nulls_first));
-            tie.value.encode(output);
-        }
-        put_count(output, self.output_names.len());
-        for name in &self.output_names {
-            put_count(output, name.len());
-            output.extend_from_slice(name.as_bytes());
-        }
-        match &self.residual {
-            None => output.push(0),
-            Some(residual) => {
-                output.push(1);
-                residual.encode(output);
-            }
-        }
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let kind = AsOfJoinKind::from_code(cursor.read_bytes(1)?[0]).ok_or(
-        DefinitionCodecError::InvalidPayload("ASOF join kind is invalid"),
-    )?;
-    let direction_code = cursor.read_bytes(1)?[0];
-    let allow_exact = read_bool(&mut cursor, "ASOF join exact-match marker is invalid")?;
-    let direction = AsOfDirection::from_code(direction_code, allow_exact).ok_or(
-        DefinitionCodecError::InvalidPayload("ASOF join direction is invalid"),
-    )?;
-    let tie_fallback = AsOfTieFallback::from_code(cursor.read_bytes(1)?[0]).ok_or(
-        DefinitionCodecError::InvalidPayload("ASOF join tie fallback is invalid"),
-    )?;
-    let tolerance = match cursor.read_bytes(1)?[0] {
-        0 => None,
-        1 => Some(u128::from_be_bytes(
-            cursor
-                .read_bytes(16)?
-                .try_into()
-                .expect("read exact length"),
-        )),
-        _ => {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "ASOF join tolerance marker is invalid",
-            ));
-        }
-    };
-
-    let equality_count = cursor.read_u32()?;
-    let mut equalities = Vec::new();
-    for _ in 0..equality_count {
-        let mode = AsOfEqualityMode::from_code(cursor.read_bytes(1)?[0]).ok_or(
-            DefinitionCodecError::InvalidPayload("ASOF join equality mode is invalid"),
-        )?;
-        equalities.push(StoredEqualityKey {
-            mode,
-            left: StoredExpression::decode(&mut cursor)?,
-            right: StoredExpression::decode(&mut cursor)?,
-        });
-    }
-
-    let order_count = cursor.read_u32()?;
-    if order_count == 0 {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "ASOF join order key list is empty",
-        ));
-    }
-    let mut orders = Vec::new();
-    for _ in 0..order_count {
-        orders.push(StoredOrderKey {
-            left: StoredExpression::decode(&mut cursor)?,
-            right: StoredExpression::decode(&mut cursor)?,
-        });
-    }
-
-    let tie_count = cursor.read_u32()?;
-    let mut ties = Vec::new();
-    for _ in 0..tie_count {
-        let descending = read_bool(&mut cursor, "ASOF join tie direction marker is invalid")?;
-        let nulls_first = read_bool(&mut cursor, "ASOF join tie NULL marker is invalid")?;
-        ties.push(StoredTieBreak {
-            value: StoredExpression::decode(&mut cursor)?,
-            descending,
-            nulls_first,
-        });
-    }
-
-    let output_count = cursor.read_u32()?;
-    let mut output_names = Vec::new();
-    for _ in 0..output_count {
-        let length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("ASOF join output name length is invalid")
-        })?;
-        let name = std::str::from_utf8(cursor.read_bytes(length)?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("ASOF join output name is invalid UTF-8")
-        })?;
-        output_names.push(name.to_owned());
-    }
-    let residual = match cursor.read_bytes(1)?[0] {
-        0 => None,
-        1 => Some(StoredExpression::decode(&mut cursor)?),
-        _ => {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "ASOF join residual marker is invalid",
-            ));
-        }
-    };
-    cursor.finish()?;
-    Ok(Box::new(AsOfJoinDefinition {
-        kind,
-        direction,
-        equalities: equalities.into_boxed_slice(),
-        orders: orders.into_boxed_slice(),
-        ties: ties.into_boxed_slice(),
-        tie_fallback,
-        tolerance,
-        output_names: output_names.into_boxed_slice(),
-        residual,
-    }))
+) -> Result<Box<AsOfJoinDefinition>, DefinitionCodecError> {
+    let definition = parse_json_payload::<Payload>(payload)?
+        .into_definition()
+        .map_err(DefinitionCodecError::InvalidPayload)?;
+    require_canonical_json_payload(&definition, payload, "invalid ASOF join payload")?;
+    Ok(Box::new(definition))
 }
 
 fn store_expression(
@@ -813,17 +709,6 @@ const fn distance_capable(data_type: &DataType) -> bool {
     )
 }
 
-fn read_bool(
-    cursor: &mut PayloadCursor<'_>,
-    message: &'static str,
-) -> Result<bool, DefinitionCodecError> {
-    match cursor.read_bytes(1)?[0] {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(DefinitionCodecError::InvalidPayload(message)),
-    }
-}
-
 fn ensure_count(index: usize, kind: &'static str) -> Result<(), AsOfJoinDefinitionError> {
     index
         .checked_add(1)
@@ -832,17 +717,9 @@ fn ensure_count(index: usize, kind: &'static str) -> Result<(), AsOfJoinDefiniti
         .ok_or(AsOfJoinDefinitionError::TooMany { kind })
 }
 
-fn put_count(output: &mut Vec<u8>, count: usize) {
-    output.extend_from_slice(
-        &u32::try_from(count)
-            .expect("ASOF definition construction bounds persistent counts")
-            .to_be_bytes(),
-    );
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Write as _, sync::Arc};
+    use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
 
@@ -861,20 +738,10 @@ mod tests {
         inputs: &[SchemaRef],
     ) -> Result<crate::ConstructedOperation, OperationSetupError> {
         let mut setup = StoreSetup::new();
-        (definition as &dyn crate::OperationDefinition).construct(
+        crate::OperationDefinition::from(definition.clone()).construct(
             inputs,
             &mut setup.data_scope().scoped("operation"),
             RuntimeResource::none(),
-        )
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().fold(
-            String::with_capacity(bytes.len().saturating_mul(2)),
-            |mut output, byte| {
-                write!(&mut output, "{byte:02x}").expect("write bytes to an owned String");
-                output
-            },
         )
     }
 
@@ -912,20 +779,22 @@ mod tests {
             },
             Some(u128::MAX),
         );
-        let encoded = encode_definition(&definition_value);
-        assert_eq!(
-            hex(&encoded),
-            "646f67706164646c652e6f7065726174696f6e00000100110103000101ffffffffffffffffffffffffffffffff00000001010000000a0a080a0673796d626f6c0000000a0a080a0673796d626f6c00000001000000060a040a026174000000060a040a0261740000000101000000000c0a0a0a0873657175656e6365000000050000000b6c6566745f73796d626f6c000000076c6566745f61740000000c72696768745f73796d626f6c0000000872696768745f61740000000873657175656e6365010000002922270a0e0a0c0a02617412060a046c6566740a0f0a0d0a02617412070a0572696768741a0447744571"
-        );
+        let encoded = encode_definition(&definition_value.clone().into());
         let header = b"dogpaddle.operation\0".len() + 2;
         assert_eq!(&encoded[header..][..2], &TAG.to_be_bytes());
         let payload = &encoded[header + 2..];
         assert_eq!(
-            &payload[..26],
-            &[&[1, 3, 0, 1, 1][..], &[u8::MAX; 16], &[0, 0, 0, 1, 1],].concat()
+            serde_json::from_slice::<AsOfJoinDefinition>(payload).unwrap(),
+            definition_value
         );
+        let payload = std::str::from_utf8(payload).unwrap();
+        assert!(payload.contains("\"kind\":\"LeftOuter\""));
+        assert!(payload.contains(
+            "\"direction\":{\"Nearest\":{\"allow_exact\":false,\"equidistant\":\"Forward\"}}"
+        ));
+        assert!(payload.contains(&u128::MAX.to_string()));
         let decoded = decode_definition(&encoded).unwrap();
-        assert_eq!(encode_definition(decoded.as_ref()), encoded);
+        assert_eq!(encode_definition(&decoded), encoded);
         for length in 0..encoded.len() {
             assert!(
                 decode_definition(&encoded[..length]).is_err(),
@@ -933,70 +802,60 @@ mod tests {
             );
         }
 
-        let mut invalid_exact = encoded;
-        invalid_exact[header + 2 + 2] = 2;
+        let mut invalid_exact = encoded[..header + 2].to_vec();
+        invalid_exact.extend_from_slice(
+            payload
+                .replacen("\"allow_exact\":false", "\"allow_exact\":2", 1)
+                .as_bytes(),
+        );
         assert!(matches!(
             decode_definition(&invalid_exact),
-            Err(DefinitionCodecError::InvalidPayload(
-                "ASOF join exact-match marker is invalid"
-            ))
+            Err(DefinitionCodecError::InvalidJsonPayload { .. })
         ));
 
         let mut without_residual = definition(AsOfDirection::Backward { allow_exact: true }, None);
         without_residual.residual = None;
-        let mut invalid_residual = encode_definition(&without_residual);
-        assert_eq!(invalid_residual.last(), Some(&0));
-        *invalid_residual.last_mut().unwrap() = 2;
+        let encoded = encode_definition(&without_residual.into());
+        let mut invalid_residual = encoded[..header + 2].to_vec();
+        let payload = std::str::from_utf8(&encoded[header + 2..]).unwrap();
+        invalid_residual.extend_from_slice(
+            payload
+                .replacen("\"residual\":null", "\"residual\":2", 1)
+                .as_bytes(),
+        );
         assert!(matches!(
             decode_definition(&invalid_residual),
-            Err(DefinitionCodecError::InvalidPayload(
-                "ASOF join residual marker is invalid"
-            ))
+            Err(DefinitionCodecError::InvalidJsonPayload { .. })
         ));
     }
 
     #[test]
-    fn every_persistent_policy_discriminant_is_fixed() {
+    fn every_persistent_policy_name_is_fixed() {
         assert_eq!(
             [
-                AsOfJoinKind::Inner.code(),
-                AsOfJoinKind::LeftOuter.code(),
-                AsOfJoinKind::LeftSemi.code(),
-                AsOfJoinKind::LeftAnti.code(),
-            ],
-            [0, 1, 2, 3]
+                AsOfJoinKind::Inner,
+                AsOfJoinKind::LeftOuter,
+                AsOfJoinKind::LeftSemi,
+                AsOfJoinKind::LeftAnti,
+            ]
+            .map(|kind| serde_json::to_string(&kind).unwrap()),
+            ["\"Inner\"", "\"LeftOuter\"", "\"LeftSemi\"", "\"LeftAnti\""].map(str::to_owned)
         );
         assert_eq!(
-            [
-                AsOfDirection::Backward { allow_exact: false }.code(),
-                AsOfDirection::Forward { allow_exact: false }.code(),
-                AsOfDirection::Nearest {
-                    allow_exact: false,
-                    equidistant: AsOfEquidistantPreference::Backward,
-                }
-                .code(),
-                AsOfDirection::Nearest {
-                    allow_exact: false,
-                    equidistant: AsOfEquidistantPreference::Forward,
-                }
-                .code(),
-            ],
-            [0, 1, 2, 3]
+            serde_json::to_string(&AsOfDirection::Nearest {
+                allow_exact: false,
+                equidistant: AsOfEquidistantPreference::Forward,
+            })
+            .unwrap(),
+            "{\"Nearest\":{\"allow_exact\":false,\"equidistant\":\"Forward\"}}"
         );
         assert_eq!(
-            [
-                AsOfEqualityMode::Equal.code(),
-                AsOfEqualityMode::NotDistinct.code(),
-            ],
-            [0, 1]
+            serde_json::to_string(&AsOfEqualityMode::NotDistinct).unwrap(),
+            "\"NotDistinct\""
         );
         assert_eq!(
-            [
-                AsOfTieFallback::Reject.code(),
-                AsOfTieFallback::CanonicalAscending.code(),
-                AsOfTieFallback::CanonicalDescending.code(),
-            ],
-            [0, 1, 2]
+            serde_json::to_string(&AsOfTieFallback::CanonicalAscending).unwrap(),
+            "\"CanonicalAscending\""
         );
     }
 

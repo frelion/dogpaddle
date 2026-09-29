@@ -33,21 +33,22 @@ impl TestStore {
     }
 }
 
-pub fn assert_literal_definition(
-    definition: &dyn OperationDefinition,
+pub fn assert_literal_definition<D: Clone + Into<OperationDefinition>>(
+    definition: &D,
     fixture: &str,
     expected_tag: u16,
     expected_kind: OperationKind,
-) -> Box<dyn OperationDefinition> {
+) -> OperationDefinition {
+    let definition = definition.clone().into();
     let literal = decode_hex(fixture);
     assert_eq!(definition.persistence_tag(), expected_tag);
     assert_eq!(definition.kind(), expected_kind);
-    assert_eq!(encode_definition(definition), literal);
+    assert_eq!(encode_definition(&definition), literal);
 
     let decoded = decode_definition(&literal).unwrap();
     assert_eq!(decoded.persistence_tag(), expected_tag);
     assert_eq!(decoded.kind(), expected_kind);
-    assert_eq!(encode_definition(decoded.as_ref()), literal);
+    assert_eq!(encode_definition(&decoded), literal);
     for length in 0..literal.len() {
         assert_eq!(
             decode_definition(&literal[..length]).unwrap_err(),
@@ -65,20 +66,20 @@ pub fn assert_literal_definition(
     decoded
 }
 
-pub fn construct_checked(
-    definition: &dyn OperationDefinition,
+pub fn construct_checked<D: Clone + Into<OperationDefinition>>(
+    definition: &D,
     input_schemas: &[SchemaRef],
 ) -> Result<Option<SchemaRef>, OperationBindError> {
-    let definition = decode_definition(&encode_definition(definition)).unwrap();
+    let definition = decode_definition(&encode_definition(&definition.clone().into())).unwrap();
     definition.output_schema(input_schemas)
 }
 
-pub fn construct_checked_with_resource(
-    definition: &dyn OperationDefinition,
+pub fn construct_checked_with_resource<D: Clone + Into<OperationDefinition>>(
+    definition: &D,
     input_schemas: &[SchemaRef],
     resource: &RuntimeResource,
 ) -> Result<Option<SchemaRef>, OperationBindError> {
-    let definition = decode_definition(&encode_definition(definition)).unwrap();
+    let definition = decode_definition(&encode_definition(&definition.clone().into())).unwrap();
     definition
         .validate_resource(resource)
         .expect("correctness helper received an invalid runtime resource");
@@ -163,29 +164,33 @@ pub const fn turn_input(change: &Change) -> OperationInput<'_> {
     OperationInput { port: 0, change }
 }
 
-pub fn stateless_operation(
-    definition: &dyn OperationDefinition,
+pub fn stateless_operation<D: Clone + Into<OperationDefinition>>(
+    definition: &D,
     input_schema: SchemaRef,
 ) -> Operation {
+    let definition = definition.clone().into();
     let fixture = TestStore::new();
     let mut setup = StoreSetup::new();
-    let constructed = <dyn OperationDefinition>::construct(
-        definition,
-        &[input_schema],
-        &mut setup.data_scope().scoped("operation"),
-        RuntimeResource::none(),
-    )
-    .unwrap();
+    let constructed = definition
+        .construct(
+            &[input_schema],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap();
     let (operation, _) = constructed.into_parts();
     let _transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     operation
 }
 
-pub fn roundtripped_output(definition: &dyn OperationDefinition, input: &Change) -> Change {
-    let encoded = encode_definition(definition);
+pub fn roundtripped_output<D: Clone + Into<OperationDefinition>>(
+    definition: &D,
+    input: &Change,
+) -> Change {
+    let encoded = encode_definition(&definition.clone().into());
     let decoded = decode_definition(&encoded).unwrap();
-    assert_eq!(encode_definition(decoded.as_ref()), encoded);
-    let mut operation = stateless_operation(decoded.as_ref(), input.schema());
+    assert_eq!(encode_definition(&decoded), encoded);
+    let mut operation = stateless_operation(&decoded, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();

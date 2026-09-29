@@ -19,7 +19,7 @@ use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 use super::support::{TestStore, construct_checked_with_resource, rollback_ready};
 
 fn construct_checked(
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     inputs: &[SchemaRef],
 ) -> Result<Option<SchemaRef>, OperationBindError> {
     construct_checked_with_resource(definition, inputs, &RuntimeResource::new(config()))
@@ -71,16 +71,22 @@ fn literal_definition_bytes() -> Vec<u8> {
 #[test]
 fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
     let definition = definition();
-    assert_eq!(definition.persistence_tag(), 12);
-    assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
-    let encoded = encode_definition(&definition);
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).persistence_tag(),
+        12
+    );
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).kind(),
+        OperationKind::Sink(NonZeroU32::MIN)
+    );
+    let encoded = encode_definition(&definition.clone().into());
     let expected = literal_definition_bytes();
     assert_eq!(encoded, expected);
 
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Sink(NonZeroU32::MIN));
     assert_eq!(decoded.persistence_tag(), 12);
-    assert_eq!(encode_definition(decoded.as_ref()), encoded);
+    assert_eq!(encode_definition(&decoded), encoded);
     let printable = String::from_utf8(encoded.clone()).unwrap();
     for secret in [PASSWORD, "127.0.0.1", "sink_user"] {
         assert!(!printable.contains(secret));
@@ -100,7 +106,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     let store_root = TestStore::new();
     let definition = definition();
     let mut setup = StoreSetup::new();
-    let (operation, output) = (&definition as &dyn OperationDefinition)
+    let (operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[input_schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -166,7 +172,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
 
 #[test]
 fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
-    let encoded = encode_definition(&definition());
+    let encoded = encode_definition(&definition().into());
     for length in 0..encoded.len() {
         assert!(
             decode_definition(&encoded[..length]).is_err(),
@@ -179,24 +185,28 @@ fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
 #[test]
 fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let definition = definition();
-    assert_eq!(definition.kind(), OperationKind::Sink(NonZeroU32::MIN));
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).kind(),
+        OperationKind::Sink(NonZeroU32::MIN)
+    );
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::none()),
+        OperationDefinition::from(definition.clone()).validate_resource(&RuntimeResource::none()),
         Err(OperationSetupError::MissingRuntimeResource)
     ));
     assert!(matches!(
-        (&definition as &dyn OperationDefinition).validate_resource(&RuntimeResource::new(42_u64)),
+        OperationDefinition::from(definition.clone())
+            .validate_resource(&RuntimeResource::new(42_u64)),
         Err(OperationSetupError::WrongRuntimeResource)
     ));
     assert!(
-        (&definition as &dyn OperationDefinition)
+        OperationDefinition::from(definition.clone())
             .validate_resource(&RuntimeResource::new(config()))
             .is_ok()
     );
 
     let store_root = TestStore::new();
     let mut setup = StoreSetup::new();
-    let (operation, output) = (&definition as &dyn OperationDefinition)
+    let (operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[input_schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -285,7 +295,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     let store_root = TestStore::new();
     let definition = definition();
     let mut setup = StoreSetup::new();
-    let (operation, output) = (&definition as &dyn OperationDefinition)
+    let (operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[input_schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -298,7 +308,7 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
     drop((operation, transactions));
     let store = Store::open(store_root.path()).unwrap();
     let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
-    let (mut operation, output) = (&definition as &dyn OperationDefinition)
+    let (mut operation, output) = OperationDefinition::from(definition.clone())
         .construct(
             &[input_schema()],
             &mut store.data_scope().scoped("operation"),

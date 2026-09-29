@@ -49,12 +49,12 @@ fn precommit_flow_errors_do_not_require_reopen() {
 fn durability_failure_marks_every_station_pending_in_the_barrier() {
     let root = tempfile::tempdir().unwrap();
     let mut builder = FlowFactory::new(root.path().join("flow"));
-    let first = builder.operation("first", Box::new(SequenceScanDefinition::new(0)), []);
-    let second = builder.operation("second", Box::new(SequenceScanDefinition::new(0)), []);
-    let third = builder.operation("third", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("first-sink", Box::new(DiscardDefinition::new()), [first]);
-    builder.operation("second-sink", Box::new(DiscardDefinition::new()), [second]);
-    builder.operation("third-sink", Box::new(DiscardDefinition::new()), [third]);
+    let first = builder.operation("first", SequenceScanDefinition::new(0), []);
+    let second = builder.operation("second", SequenceScanDefinition::new(0), []);
+    let third = builder.operation("third", SequenceScanDefinition::new(0), []);
+    builder.operation("first-sink", DiscardDefinition::new(), [first]);
+    builder.operation("second-sink", DiscardDefinition::new(), [second]);
+    builder.operation("third-sink", DiscardDefinition::new(), [third]);
     for station in [first, second, third] {
         builder.materialize(station, NonZeroU64::MAX);
     }
@@ -75,30 +75,21 @@ fn build_and_open_derive_a_stable_layered_topological_schedule() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let second_scan =
-        builder.operation("second-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let first_scan = builder.operation("first-scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let second_scan = builder.operation("second-scan", SequenceScanDefinition::new(0), []);
+    let first_scan = builder.operation("first-scan", SequenceScanDefinition::new(0), []);
     let first_target = builder.operation(
         "first-target",
-        Box::new(RunningEventCountDefinition::new()),
+        RunningEventCountDefinition::new(),
         [first_scan],
     );
-    builder.operation(
-        "first-sink",
-        Box::new(DiscardDefinition::new()),
-        [first_target],
-    );
+    builder.operation("first-sink", DiscardDefinition::new(), [first_target]);
     let second_target = builder.operation(
         "second-target",
-        Box::new(RunningEventCountDefinition::new()),
+        RunningEventCountDefinition::new(),
         [second_scan],
     );
 
-    builder.operation(
-        "second-sink",
-        Box::new(DiscardDefinition::new()),
-        [second_target],
-    );
+    builder.operation("second-sink", DiscardDefinition::new(), [second_target]);
     for station in [first_target, second_target, second_scan, first_scan] {
         builder.materialize(station, NonZeroU64::MAX);
     }
@@ -116,21 +107,13 @@ fn reopen_reinstates_each_output_capacity_and_does_not_short_circuit_backpressur
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let blocked_scan =
-        builder.operation("blocked-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let progressing_scan = builder.operation(
-        "progressing-scan",
-        Box::new(SequenceScanDefinition::new(0)),
-        [],
-    );
-    builder.operation(
-        "blocked-sink",
-        Box::new(DiscardDefinition::new()),
-        [blocked_scan],
-    );
+    let blocked_scan = builder.operation("blocked-scan", SequenceScanDefinition::new(0), []);
+    let progressing_scan =
+        builder.operation("progressing-scan", SequenceScanDefinition::new(0), []);
+    builder.operation("blocked-sink", DiscardDefinition::new(), [blocked_scan]);
     builder.operation(
         "progressing-sink",
-        Box::new(DiscardDefinition::new()),
+        DiscardDefinition::new(),
         [progressing_scan],
     );
     builder.materialize(blocked_scan, NonZeroU64::new(1).unwrap());
@@ -200,9 +183,9 @@ fn fanout_retains_output_until_the_slowest_subscription_completes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("first-sink", Box::new(DiscardDefinition::new()), [scan]);
-    builder.operation("slow-sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    builder.operation("first-sink", DiscardDefinition::new(), [scan]);
+    builder.operation("slow-sink", DiscardDefinition::new(), [scan]);
     builder.materialize(scan, NonZeroU64::MAX);
 
     let mut flow = builder.build().unwrap();
@@ -244,19 +227,10 @@ fn advance_preflights_every_station_before_earlier_stations_can_commit() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let first_scan = builder.operation("first-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation(
-        "first-sink",
-        Box::new(DiscardDefinition::new()),
-        [first_scan],
-    );
-    let failed_scan =
-        builder.operation("failed-scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation(
-        "failed-sink",
-        Box::new(DiscardDefinition::new()),
-        [failed_scan],
-    );
+    let first_scan = builder.operation("first-scan", SequenceScanDefinition::new(0), []);
+    builder.operation("first-sink", DiscardDefinition::new(), [first_scan]);
+    let failed_scan = builder.operation("failed-scan", SequenceScanDefinition::new(0), []);
+    builder.operation("failed-sink", DiscardDefinition::new(), [failed_scan]);
     builder.materialize(first_scan, NonZeroU64::MAX);
     builder.materialize(failed_scan, NonZeroU64::MAX);
 

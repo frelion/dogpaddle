@@ -1,6 +1,7 @@
-use std::{any::TypeId, num::NonZeroU32, sync::Arc};
+use std::{any::TypeId, sync::Arc};
 
 use arrow_schema::SchemaRef;
+use serde::Serialize;
 
 use super::{
     buffered,
@@ -10,16 +11,17 @@ use super::{
     target::DorisTarget,
 };
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    definition::{Sealed, schema_error},
+    ConstructedOperation, DefinitionCodecError, RuntimeResource,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
 };
 
 pub(crate) const TAG: u16 = 18;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 
 /// Pure definition of a sink-owned Apache Doris relation target.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct DorisSinkDefinition {
     target: DorisTargetSpec,
 }
@@ -47,19 +49,16 @@ impl DorisSinkDefinition {
     }
 }
 
-impl Sealed for DorisSinkDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+impl DorisSinkDefinition {
+    pub(crate) fn output_schema_unchecked(
         inputs: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+    ) -> Result<(), crate::OperationSchemaError> {
         DorisLayout::try_new(Arc::clone(&inputs[0]))?;
-        Ok(None)
+        Ok(())
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
@@ -74,38 +73,26 @@ impl Sealed for DorisSinkDefinition {
         buffered::construct(input_schema, target, data)
     }
 
-    fn resource_type(&self) -> Option<TypeId> {
-        Some(TypeId::of::<DorisSinkConfig>())
-    }
-}
-
-impl OperationDefinition for DorisSinkDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend(encoded_target(&self.target));
+    pub(crate) fn resource_type() -> TypeId {
+        TypeId::of::<DorisSinkConfig>()
     }
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+) -> Result<Box<DorisSinkDefinition>, DefinitionCodecError> {
     let invalid =
         || DefinitionCodecError::InvalidPayload("invalid Doris sink target specification");
     if payload.len() > MAX_DEFINITION_BYTES {
         return Err(invalid());
     }
-    let target = serde_json::from_slice(payload).map_err(|_| invalid())?;
+    let target = parse_json_payload(payload)?;
     let definition = DorisSinkDefinition::try_new(target).map_err(|_| invalid())?;
-    if encoded_target(definition.target()) != payload {
-        return Err(invalid());
-    }
+    require_canonical_json_payload(
+        &definition,
+        payload,
+        "invalid Doris sink target specification",
+    )?;
     Ok(Box::new(definition))
 }
 

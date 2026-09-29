@@ -261,7 +261,7 @@ impl Fixture {
         )
         .expect("define residual EquiJoin resource workload");
         let mut setup = StoreSetup::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
                 &mut setup.data_scope().scoped("operation"),
@@ -277,7 +277,7 @@ impl Fixture {
                 .open_data::<OrderedMap<Vec<u8>, u64>>("operation/equi_join.match_counts")
                 .expect("open an observational match-count handle")
         });
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
                 &mut store.data_scope().scoped("operation"),

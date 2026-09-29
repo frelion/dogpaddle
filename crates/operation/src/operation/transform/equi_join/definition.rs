@@ -1,13 +1,14 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion_common::{DFSchema, ScalarValue, TableReference};
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, OperationDefinition, OperationKind,
-    OperationSchemaError, RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ConstructedOperation, DefinitionCodecError, Expr, OperationSchemaError,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
     expression::{BoundExpression, StoredExpression},
 };
 
@@ -34,7 +35,8 @@ pub(crate) struct EquiJoinLayout {
     pub(super) nulls: [Vec<ScalarValue>; 2],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredKeyPair {
     left: StoredExpression,
     right: StoredExpression,
@@ -50,12 +52,43 @@ struct StoredKeyPair {
 /// A residual is evaluated on each exact candidate pair before any Outer Join
 /// NULL extension; its fields use `left` and `right` qualifiers for ports `0`
 /// and `1`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EquiJoinDefinition {
     kind: EquiJoinKind,
     keys: Box<[StoredKeyPair]>,
     output_names: Box<[String]>,
     residual: Option<StoredExpression>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    kind: EquiJoinKind,
+    keys: Box<[StoredKeyPair]>,
+    output_names: Box<[String]>,
+    residual: Option<StoredExpression>,
+}
+
+impl Payload {
+    fn into_definition(self) -> Result<EquiJoinDefinition, &'static str> {
+        if self.keys.is_empty() {
+            return Err("equi-join key list is empty");
+        }
+        Ok(EquiJoinDefinition {
+            kind: self.kind,
+            keys: self.keys,
+            output_names: self.output_names,
+            residual: self.residual,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for EquiJoinDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Payload::deserialize(deserializer)?
+            .into_definition()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl EquiJoinDefinition {
@@ -72,7 +105,7 @@ impl EquiJoinDefinition {
     /// Creates an equality join with immutable ordered key pairs and an optional residual.
     ///
     /// Output-name cardinality and uniqueness depend on the eventual exact
-    /// input Schemas and are validated by the [`OperationDefinition`] binding entrypoint.
+    /// input Schemas and are validated by the [`crate::OperationDefinition`] binding entrypoint.
     /// A residual must produce Boolean when bound to the exact candidate-pair
     /// Schema; only a non-null `true` constitutes a match.
     ///
@@ -151,10 +184,9 @@ impl EquiJoinDefinition {
     }
 }
 
-impl SealedDefinition for EquiJoinDefinition {
-    fn output_schema_unchecked(
+impl EquiJoinDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         let [left, right] = inputs else {
@@ -164,12 +196,10 @@ impl SealedDefinition for EquiJoinDefinition {
             .map(|layout| Some(layout.output_schema))
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let [left_schema, right_schema] = input_schemas else {
             unreachable!("the final binding entrypoint enforces Join input arity")
@@ -253,84 +283,14 @@ impl EquiJoinDefinition {
     }
 }
 
-impl OperationDefinition for EquiJoinDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::TurnTransform(NonZeroU32::new(2).expect("equi-join has two inputs"))
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.push(self.kind.code());
-        put_count(output, self.keys.len());
-        for key in &self.keys {
-            key.left.encode(output);
-            key.right.encode(output);
-        }
-        put_count(output, self.output_names.len());
-        for name in &self.output_names {
-            put_count(output, name.len());
-            output.extend_from_slice(name.as_bytes());
-        }
-        match &self.residual {
-            None => output.push(0),
-            Some(residual) => {
-                output.push(1);
-                residual.encode(output);
-            }
-        }
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let kind = EquiJoinKind::from_code(cursor.read_bytes(1)?[0]).ok_or(
-        DefinitionCodecError::InvalidPayload("equi-join kind is invalid"),
-    )?;
-    let key_count = cursor.read_u32()?;
-    if key_count == 0 {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "equi-join key list is empty",
-        ));
-    }
-    let mut keys = Vec::new();
-    for _ in 0..key_count {
-        let left = StoredExpression::decode(&mut cursor)?;
-        let right = StoredExpression::decode(&mut cursor)?;
-        keys.push(StoredKeyPair { left, right });
-    }
-    let output_count = cursor.read_u32()?;
-    let mut output_names = Vec::new();
-    for _ in 0..output_count {
-        let length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("equi-join output name length is invalid")
-        })?;
-        let name = cursor.read_bytes(length)?;
-        let name = std::str::from_utf8(name).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("equi-join output name is invalid UTF-8")
-        })?;
-        output_names.push(name.to_owned());
-    }
-    let residual = match cursor.read_bytes(1)?[0] {
-        0 => None,
-        1 => Some(StoredExpression::decode(&mut cursor)?),
-        _ => {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "equi-join residual marker is invalid",
-            ));
-        }
-    };
-    cursor.finish()?;
-    Ok(Box::new(EquiJoinDefinition {
-        kind,
-        keys: keys.into_boxed_slice(),
-        output_names: output_names.into_boxed_slice(),
-        residual,
-    }))
+) -> Result<Box<EquiJoinDefinition>, DefinitionCodecError> {
+    let definition = parse_json_payload::<Payload>(payload)?
+        .into_definition()
+        .map_err(DefinitionCodecError::InvalidPayload)?;
+    require_canonical_json_payload(&definition, payload, "invalid equi-join payload")?;
+    Ok(Box::new(definition))
 }
 
 fn store_key(
@@ -425,12 +385,4 @@ fn ensure_count(index: usize, kind: &'static str) -> Result<(), EquiJoinDefiniti
         .and_then(|count| u32::try_from(count).ok())
         .map(|_| ())
         .ok_or(EquiJoinDefinitionError::TooMany { kind })
-}
-
-fn put_count(output: &mut Vec<u8>, count: usize) {
-    output.extend_from_slice(
-        &u32::try_from(count)
-            .expect("EquiJoinDefinition construction bounds persistent counts")
-            .to_be_bytes(),
-    );
 }

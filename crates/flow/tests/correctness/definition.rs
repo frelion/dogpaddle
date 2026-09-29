@@ -185,13 +185,9 @@ fn open_rejects_an_unpublished_build() {
 
 fn build_chain(path: &Path) {
     let mut builder = FlowFactory::new(path);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(7)), []);
-    let count = builder.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [scan],
-    );
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(7), []);
+    let count = builder.operation("count", RunningEventCountDefinition::new(), [scan]);
+    builder.operation("sink", DiscardDefinition::new(), [count]);
 
     builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     builder.materialize(count, NonZeroU64::new(2_048).unwrap());
@@ -201,28 +197,20 @@ fn build_chain(path: &Path) {
 fn build_multi_operation_station(path: &Path) {
     let mut builder = FlowFactory::new(path);
     builder.owner_identity(OWNER_IDENTITY);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(7)), []);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(7), []);
     let scan = builder.operation(
         "scan/tail-1",
-        Box::new(
-            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
-        ),
+        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
         [scan],
     );
-    let scan = builder.operation(
-        "scan/tail-2",
-        Box::new(RunningEventCountDefinition::new()),
-        [scan],
-    );
+    let scan = builder.operation("scan/tail-2", RunningEventCountDefinition::new(), [scan]);
     let scan = builder.operation(
         "scan/tail-3",
-        Box::new(
-            SelectDefinition::try_new([("count", dogpaddle_operation::col("count"))]).unwrap(),
-        ),
+        SelectDefinition::try_new([("count", dogpaddle_operation::col("count"))]).unwrap(),
         [scan],
     );
 
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    builder.operation("sink", DiscardDefinition::new(), [scan]);
     builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 }

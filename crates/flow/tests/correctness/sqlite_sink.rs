@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::{
-    col, lit,
+    OperationDefinition, col, lit,
     operation::{
         scan::SequenceScanDefinition,
         sink::SqliteSinkDefinition,
@@ -31,38 +31,30 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
 
     // SequenceScan becomes idle after u64::MAX, so this emits exactly three rows.
     let mut factory = FlowFactory::new(&flow_path);
-    let scan = factory.operation(
-        "scan",
-        Box::new(SequenceScanDefinition::new(scan_start)),
-        [],
-    );
+    let scan = factory.operation("scan", SequenceScanDefinition::new(scan_start), []);
     let extend = factory.operation(
         "extend",
-        Box::new(
-            SelectDefinition::try_new([
-                ("value", col("value")),
-                ("offset", col("value") - lit(scan_start)),
-            ])
-            .unwrap(),
-        ),
+        SelectDefinition::try_new([
+            ("value", col("value")),
+            ("offset", col("value") - lit(scan_start)),
+        ])
+        .unwrap(),
         [scan],
     );
     let filter = factory.operation(
         "filter",
-        Box::new(FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap()),
+        FilterDefinition::try_new(col("offset").gt(lit(0_u64))).unwrap(),
         [extend],
     );
     let select = factory.operation(
         "select",
-        Box::new(
-            SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
-                .unwrap(),
-        ),
+        SelectDefinition::try_new([("scan_value", col("value")), ("offset", col("offset"))])
+            .unwrap(),
         [filter],
     );
     factory.operation(
         "sqlite",
-        Box::new(SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap()),
+        SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap(),
         [select],
     );
     for station in [scan, extend, filter, select] {
@@ -179,10 +171,10 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
 
 fn build_sqlite_flow(flow_path: &Path, sqlite_path: &Path) -> dogpaddle_flow::Flow {
     let mut factory = FlowFactory::new(flow_path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
     factory.operation(
         "sqlite",
-        Box::new(SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap()),
+        SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
         [scan],
     );
     factory.materialize(scan, OUTPUT_CAPACITY_BYTES);
@@ -434,12 +426,12 @@ fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path, asof: bool) {
         AsOfDirection, AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieFallback,
     };
     let mut factory = FlowFactory::new(flow_path);
-    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
+    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
     let join = factory.operation(
         "join",
         if asof {
-            Box::new(
+            OperationDefinition::from(
                 AsOfJoinDefinition::try_new(
                     AsOfJoinKind::Inner,
                     AsOfDirection::Backward { allow_exact: true },
@@ -454,7 +446,7 @@ fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path, asof: bool) {
                 .unwrap(),
             )
         } else {
-            Box::new(
+            OperationDefinition::from(
                 EquiJoinDefinition::try_new(
                     EquiJoinKind::Inner,
                     [(lit(0_u64), lit(0_u64))],
@@ -468,7 +460,7 @@ fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path, asof: bool) {
     );
     factory.operation(
         "sqlite",
-        Box::new(SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap()),
+        SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
         [join],
     );
     drop(factory.build().unwrap());

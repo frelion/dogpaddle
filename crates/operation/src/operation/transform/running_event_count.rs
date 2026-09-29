@@ -1,7 +1,5 @@
-use std::{
-    num::NonZeroU32,
-    sync::{Arc, OnceLock},
-};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -10,8 +8,9 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::{ConstructedOperation, Sealed as SealedDefinition},
+    DefinitionCodecError,
+    codec::decode_json_payload,
+    definition::ConstructedOperation,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
@@ -23,10 +22,10 @@ const COUNT: &str = "running_event_count.count";
 /// The operation counts ordered input rows independently of their diff values
 /// and emits each updated count as an insertion event. It is an observation
 /// transform, not a relational cardinality aggregate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RunningEventCountDefinition {
-    _private: (),
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RunningEventCountDefinition {}
 
 /// Materialized running event-count operation.
 ///
@@ -63,25 +62,18 @@ impl RunningEventCountDefinition {
     /// Creates a running event-count definition.
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {}
     }
 }
 
-impl SealedDefinition for RunningEventCountDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        _input_schemas: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        Ok(Some(output_schema()))
+impl RunningEventCountDefinition {
+    pub(crate) fn output_schema_unchecked() -> SchemaRef {
+        output_schema()
     }
 
-    fn construct_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+    pub(crate) fn construct_unchecked(
         input_schemas: &[SchemaRef],
         scope: &mut dogpaddle_store::DataScope<'_>,
-        _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let count = scope.data::<Cell<u64>>(COUNT)?;
         Ok(ConstructedOperation::atomic(
@@ -92,18 +84,6 @@ impl SealedDefinition for RunningEventCountDefinition {
             },
         ))
     }
-}
-
-impl OperationDefinition for RunningEventCountDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
 impl AtomicOperation for RunningEventCountOperation {
@@ -154,10 +134,8 @@ fn output_schema() -> SchemaRef {
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    if payload.is_empty() {
-        Ok(Box::new(RunningEventCountDefinition::new()))
-    } else {
-        Err(DefinitionCodecError::TrailingBytes)
-    }
+) -> Result<Box<RunningEventCountDefinition>, DefinitionCodecError> {
+    let definition: RunningEventCountDefinition =
+        decode_json_payload(payload, "invalid RunningEventCount payload")?;
+    Ok(Box::new(definition))
 }

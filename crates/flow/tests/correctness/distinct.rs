@@ -20,9 +20,9 @@ fn distinct_retries_the_same_input_after_backpressure_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let distinct = factory.operation("distinct", Box::new(DistinctDefinition::new()), [scan]);
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [distinct]);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
+    let distinct = factory.operation("distinct", DistinctDefinition::new(), [scan]);
+    factory.operation("sink", DiscardDefinition::new(), [distinct]);
     factory.materialize(scan, NonZeroU64::MAX);
     factory.materialize(distinct, NonZeroU64::MIN);
 
@@ -71,22 +71,14 @@ fn fused_stateful_operations_roll_back_together_when_final_output_is_backpressur
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("fused");
     let mut factory = FlowFactory::new(&path);
-    let compute = factory.operation(
-        "compute",
-        Box::new(SequenceScanDefinition::new(u64::MAX)),
-        [],
-    );
+    let compute = factory.operation("compute", SequenceScanDefinition::new(u64::MAX), []);
     let compute = factory.operation(
         "compute/tail-1",
-        Box::new(RunningEventCountDefinition::new()),
+        RunningEventCountDefinition::new(),
         [compute],
     );
-    let compute = factory.operation(
-        "compute/tail-2",
-        Box::new(DistinctDefinition::new()),
-        [compute],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [compute]);
+    let compute = factory.operation("compute/tail-2", DistinctDefinition::new(), [compute]);
+    factory.operation("sink", DiscardDefinition::new(), [compute]);
     factory.materialize(compute, NonZeroU64::MIN);
 
     drop(factory.build().unwrap());

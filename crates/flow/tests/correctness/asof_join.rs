@@ -144,27 +144,25 @@ fn asof_page_backpressure_rolls_back_and_reopens_the_correction_exactly_once() {
 
 fn build_fixture(path: &Path) {
     let mut factory = FlowFactory::new(path);
-    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
+    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
     let join = factory.operation(
         "asof",
-        Box::new(
-            AsOfJoinDefinition::try_new(
-                AsOfJoinKind::Inner,
-                AsOfDirection::Backward { allow_exact: true },
-                [],
-                [AsOfOrderKey::new(col("value"), col("value"))],
-                [],
-                AsOfTieFallback::CanonicalAscending,
-                None,
-                ["left_value", "right_value"],
-                None,
-            )
-            .unwrap(),
-        ),
+        AsOfJoinDefinition::try_new(
+            AsOfJoinKind::Inner,
+            AsOfDirection::Backward { allow_exact: true },
+            [],
+            [AsOfOrderKey::new(col("value"), col("value"))],
+            [],
+            AsOfTieFallback::CanonicalAscending,
+            None,
+            ["left_value", "right_value"],
+            None,
+        )
+        .unwrap(),
         [left, right],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [join]);
+    factory.operation("sink", DiscardDefinition::new(), [join]);
     for station in [left, right, join] {
         factory.materialize(station, CAPACITY);
     }
@@ -178,32 +176,26 @@ fn build_fixture(path: &Path) {
 
 fn build_backpressure_fixture(path: &Path) {
     let mut factory = FlowFactory::new(path);
-    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
+    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
     let join = factory.operation(
         "asof",
-        Box::new(
-            AsOfJoinDefinition::try_new(
-                AsOfJoinKind::Inner,
-                AsOfDirection::Backward { allow_exact: true },
-                [],
-                [AsOfOrderKey::new(col("value"), col("value"))],
-                [],
-                AsOfTieFallback::CanonicalAscending,
-                None,
-                ["left_value", "right_value"],
-                None,
-            )
-            .unwrap(),
-        ),
+        AsOfJoinDefinition::try_new(
+            AsOfJoinKind::Inner,
+            AsOfDirection::Backward { allow_exact: true },
+            [],
+            [AsOfOrderKey::new(col("value"), col("value"))],
+            [],
+            AsOfTieFallback::CanonicalAscending,
+            None,
+            ["left_value", "right_value"],
+            None,
+        )
+        .unwrap(),
         [left, right],
     );
-    let count = factory.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [join],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [join]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
     factory.materialize(left, CAPACITY);
     factory.materialize(right, CAPACITY);
     factory.materialize(join, NonZeroU64::MIN);
@@ -505,34 +497,30 @@ fn fused_atomic_tail_failure_rolls_back_asof_complete_and_repeats_after_reopen()
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("tail-failure");
     let mut factory = FlowFactory::new(&path);
-    let left = factory.operation("left", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
-    let right = factory.operation("right", Box::new(SequenceScanDefinition::new(u64::MAX)), []);
+    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
+    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
     let join = factory.operation(
         "join",
-        Box::new(
-            AsOfJoinDefinition::try_new(
-                AsOfJoinKind::Inner,
-                AsOfDirection::Backward { allow_exact: true },
-                [],
-                [AsOfOrderKey::new(col("value"), col("value"))],
-                [],
-                AsOfTieFallback::CanonicalAscending,
-                None,
-                ["left_value", "right_value"],
-                None,
-            )
-            .unwrap(),
-        ),
+        AsOfJoinDefinition::try_new(
+            AsOfJoinKind::Inner,
+            AsOfDirection::Backward { allow_exact: true },
+            [],
+            [AsOfOrderKey::new(col("value"), col("value"))],
+            [],
+            AsOfTieFallback::CanonicalAscending,
+            None,
+            ["left_value", "right_value"],
+            None,
+        )
+        .unwrap(),
         [left, right],
     );
     let tail = factory.operation(
         "tail",
-        Box::new(
-            FilterDefinition::try_new((lit(1_u64) / col("left_value")).gt(lit(0_u64))).unwrap(),
-        ),
+        FilterDefinition::try_new((lit(1_u64) / col("left_value")).gt(lit(0_u64))).unwrap(),
         [join],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [tail]);
+    factory.operation("sink", DiscardDefinition::new(), [tail]);
     factory.materialize(left, CAPACITY);
     factory.materialize(right, CAPACITY);
     factory.materialize(tail, CAPACITY);

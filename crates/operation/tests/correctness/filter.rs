@@ -67,7 +67,7 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     );
     assert_eq!(definition.predicate(), &predicate);
     assert_eq!(
-        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
+        construct_checked(&decoded, std::slice::from_ref(&input))
             .unwrap()
             .as_ref(),
         Some(&input)
@@ -79,7 +79,7 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     )
     .unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), Arc::clone(&input));
+    let mut operation = stateless_operation(&decoded, Arc::clone(&input));
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -100,7 +100,7 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(FILTER_V1)).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), input);
+    let mut operation = stateless_operation(&decoded, input);
     let mut transactions = store.into_transactions();
     let Action::Complete(Some(reopened_filtered)) =
         commit_ready(&mut operation, Some(turn_input(&change)), &mut transactions).unwrap()

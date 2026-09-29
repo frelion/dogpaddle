@@ -11,7 +11,7 @@ pub(crate) struct FlowDefinition {
 #[derive(Debug)]
 pub(crate) struct StationDefinition {
     pub(super) id: String,
-    pub(super) operations: Vec<Box<dyn OperationDefinition>>,
+    pub(super) operations: Vec<OperationDefinition>,
     pub(super) output_capacity_bytes: Option<NonZeroU64>,
     pub(super) inputs: Vec<String>,
 }
@@ -37,7 +37,7 @@ impl FlowDefinition {
 }
 
 impl StationDefinition {
-    pub(super) fn new(id: String, operation: Box<dyn OperationDefinition>) -> Self {
+    pub(super) fn new(id: String, operation: OperationDefinition) -> Self {
         Self {
             id,
             operations: vec![operation],
@@ -50,15 +50,14 @@ impl StationDefinition {
         &self.id
     }
 
-    pub(crate) fn operations(&self) -> &[Box<dyn OperationDefinition>] {
+    pub(crate) fn operations(&self) -> &[OperationDefinition] {
         &self.operations
     }
 
-    pub(crate) fn first_operation(&self) -> &dyn OperationDefinition {
+    pub(crate) fn first_operation(&self) -> &OperationDefinition {
         self.operations
             .first()
             .expect("a validated Station program is nonempty")
-            .as_ref()
     }
 
     pub(crate) fn input_count(&self) -> usize {

@@ -55,7 +55,7 @@ pub struct OperationRef {
 
 struct DeclaredOperation {
     id: String,
-    definition: Box<dyn OperationDefinition>,
+    definition: OperationDefinition,
     inputs: Vec<OperationRef>,
 }
 
@@ -123,7 +123,7 @@ impl FlowFactory {
     pub fn operation(
         &mut self,
         id: impl Into<String>,
-        definition: Box<dyn OperationDefinition>,
+        definition: impl Into<OperationDefinition>,
         inputs: impl IntoIterator<Item = OperationRef>,
     ) -> OperationRef {
         let reference = OperationRef {
@@ -132,7 +132,7 @@ impl FlowFactory {
         };
         self.operations.push(DeclaredOperation {
             id: id.into(),
-            definition,
+            definition: definition.into(),
             inputs: inputs.into_iter().collect(),
         });
         reference

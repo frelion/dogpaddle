@@ -36,7 +36,7 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个 
 - `protocol`：`AtomicOperation::apply` 完整消费契约，以及 `turn -> PreparedTurn -> AfterCommit` 事务协议；
 - `metamorphic`：稳定重批和独立模型。
 
-生产 decoder registry、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 registry 反向生成期望值。
+生产 tag dispatch、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 dispatch 反向生成期望值。
 
 Aggregate 的 owner 文件必须证明 tag `14` 与 `aggregate.groups/entries/control` 三资源、完整 Definition
 roundtrip、精确 output Schema、被跟踪权重（分组行数、call 非空计数、极值份数）underflow 的整 turn

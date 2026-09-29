@@ -1,12 +1,13 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, OperationDefinition, OperationKind,
-    OperationSchemaError, RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ConstructedOperation, DefinitionCodecError, Expr, OperationSchemaError,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
     expression::StoredExpression,
 };
 
@@ -47,23 +48,60 @@ pub struct AggregateCall {
 /// All grouping expressions and calls are evaluated by one Operation so group
 /// ownership, tracked-weight validation, state, and output transitions share one
 /// transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AggregateDefinition {
     groups: Box<[NamedExpression]>,
     calls: Box<[NamedCall]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct NamedExpression {
     name: String,
     expression: StoredExpression,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct NamedCall {
     name: String,
     function: u16,
     arguments: Box<[StoredExpression]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    groups: Box<[NamedExpression]>,
+    calls: Box<[NamedCall]>,
+}
+
+impl Payload {
+    fn into_definition(self) -> Result<AggregateDefinition, &'static str> {
+        if self.groups.is_empty() {
+            return Err("Aggregate GROUP BY is empty");
+        }
+        for call in &self.calls {
+            let Some(descriptor) = descriptor(call.function) else {
+                return Err("Aggregate function tag is unknown");
+            };
+            if call.arguments.len() != descriptor.arguments {
+                return Err("Aggregate function argument count is invalid");
+            }
+        }
+        Ok(AggregateDefinition {
+            groups: self.groups,
+            calls: self.calls,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AggregateDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Payload::deserialize(deserializer)?
+            .into_definition()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl AggregateCall {
@@ -169,22 +207,19 @@ impl AggregateDefinition {
     }
 }
 
-impl SealedDefinition for AggregateDefinition {
-    fn output_schema_unchecked(
+impl AggregateDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, OperationSchemaError> {
         self.compile_layout(&inputs[0])
             .map(|layout| Some(layout.output_schema))
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -368,82 +403,14 @@ fn indexed_slot(
     slot
 }
 
-impl OperationDefinition for AggregateDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        put_count(output, self.groups.len());
-        for group in &self.groups {
-            put_name(output, &group.name);
-            group.expression.encode(output);
-        }
-        put_count(output, self.calls.len());
-        for call in &self.calls {
-            put_name(output, &call.name);
-            output.extend_from_slice(&call.function.to_be_bytes());
-            put_count(output, call.arguments.len());
-            for argument in &call.arguments {
-                argument.encode(output);
-            }
-        }
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let group_count = cursor.read_u32()?;
-    if group_count == 0 {
-        return Err(DefinitionCodecError::InvalidPayload(
-            "Aggregate GROUP BY is empty",
-        ));
-    }
-    let mut groups = Vec::new();
-    for _ in 0..group_count {
-        groups.push(NamedExpression {
-            name: read_name(&mut cursor)?,
-            expression: StoredExpression::decode(&mut cursor)?,
-        });
-    }
-
-    let call_count = cursor.read_u32()?;
-    let mut calls = Vec::new();
-    for _ in 0..call_count {
-        let name = read_name(&mut cursor)?;
-        let function = cursor.read_u16()?;
-        let descriptor = descriptor(function).ok_or(DefinitionCodecError::InvalidPayload(
-            "Aggregate function tag is unknown",
-        ))?;
-        let argument_count = usize::try_from(cursor.read_u32()?).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("Aggregate argument count is invalid")
-        })?;
-        if argument_count != descriptor.arguments {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "Aggregate function argument count is invalid",
-            ));
-        }
-        let mut arguments = Vec::new();
-        for _ in 0..argument_count {
-            arguments.push(StoredExpression::decode(&mut cursor)?);
-        }
-        calls.push(NamedCall {
-            name,
-            function,
-            arguments: arguments.into_boxed_slice(),
-        });
-    }
-    cursor.finish()?;
-    Ok(Box::new(AggregateDefinition {
-        groups: groups.into_boxed_slice(),
-        calls: calls.into_boxed_slice(),
-    }))
+) -> Result<Box<AggregateDefinition>, DefinitionCodecError> {
+    let definition = parse_json_payload::<Payload>(payload)?
+        .into_definition()
+        .map_err(DefinitionCodecError::InvalidPayload)?;
+    require_canonical_json_payload(&definition, payload, "invalid Aggregate payload")?;
+    Ok(Box::new(definition))
 }
 
 fn ensure_count(index: usize) -> Result<(), AggregateDefinitionError> {
@@ -458,26 +425,4 @@ fn ensure_name(name: &str) -> Result<(), AggregateDefinitionError> {
     u32::try_from(name.len())
         .map(|_| ())
         .map_err(|_| AggregateDefinitionError::FieldNameTooLong)
-}
-
-fn put_count(output: &mut Vec<u8>, count: usize) {
-    output.extend_from_slice(
-        &u32::try_from(count)
-            .expect("AggregateDefinition construction bounds field counts")
-            .to_be_bytes(),
-    );
-}
-
-fn put_name(output: &mut Vec<u8>, name: &str) {
-    put_count(output, name.len());
-    output.extend_from_slice(name.as_bytes());
-}
-
-fn read_name(cursor: &mut PayloadCursor<'_>) -> Result<String, DefinitionCodecError> {
-    let length = usize::try_from(cursor.read_u32()?)
-        .map_err(|_| DefinitionCodecError::InvalidPayload("Aggregate name length is invalid"))?;
-    let name = cursor.read_bytes(length)?;
-    std::str::from_utf8(name)
-        .map(str::to_owned)
-        .map_err(|_| DefinitionCodecError::InvalidPayload("Aggregate name is invalid UTF-8"))
 }

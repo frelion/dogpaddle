@@ -52,27 +52,22 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
     let expected = match case {
         InvalidCase::Empty => TopologyError::EmptyTopology,
         InvalidCase::EmptyId => {
-            builder.operation("", Box::new(SequenceScanDefinition::new(0)), []);
+            builder.operation("", SequenceScanDefinition::new(0), []);
             TopologyError::InvalidStationId {
                 id: String::new(),
                 reason: InvalidStationIdReason::Empty,
             }
         }
         InvalidCase::NulId => {
-            builder.operation(
-                "contains\0nul",
-                Box::new(SequenceScanDefinition::new(0)),
-                [],
-            );
+            builder.operation("contains\0nul", SequenceScanDefinition::new(0), []);
             TopologyError::InvalidStationId {
                 id: "contains\0nul".to_owned(),
                 reason: InvalidStationIdReason::ContainsNul,
             }
         }
         InvalidCase::NonScanRoot => {
-            let count =
-                builder.operation("count", Box::new(RunningEventCountDefinition::new()), []);
-            builder.operation("sink", Box::new(DiscardDefinition::new()), [count]);
+            let count = builder.operation("count", RunningEventCountDefinition::new(), []);
+            builder.operation("sink", DiscardDefinition::new(), [count]);
 
             TopologyError::InputCount {
                 station: "count".to_owned(),
@@ -81,7 +76,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
             }
         }
         InvalidCase::ScanTerminal => {
-            builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+            builder.operation("scan", SequenceScanDefinition::new(0), []);
             TopologyError::TerminalIsNotSink("scan".to_owned())
         }
 
@@ -105,14 +100,10 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
             TopologyError::ForeignOperationRef(foreign)
         }
         InvalidCase::SinkFeedsStation => {
-            let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-            let sink = builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
-            let count = builder.operation(
-                "count",
-                Box::new(RunningEventCountDefinition::new()),
-                [sink],
-            );
-            builder.operation("terminal", Box::new(DiscardDefinition::new()), [count]);
+            let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+            let sink = builder.operation("sink", DiscardDefinition::new(), [scan]);
+            let count = builder.operation("count", RunningEventCountDefinition::new(), [sink]);
+            builder.operation("terminal", DiscardDefinition::new(), [count]);
 
             TopologyError::InputHasNoOutput {
                 input_station: "sink".to_owned(),
@@ -121,12 +112,8 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         }
         InvalidCase::ForeignConnection => {
             let foreign = foreign_scan(root);
-            builder.operation("own-scan", Box::new(SequenceScanDefinition::new(0)), []);
-            builder.operation(
-                "count",
-                Box::new(RunningEventCountDefinition::new()),
-                [foreign],
-            );
+            builder.operation("own-scan", SequenceScanDefinition::new(0), []);
+            builder.operation("count", RunningEventCountDefinition::new(), [foreign]);
 
             TopologyError::ForeignOperationRef(foreign)
         }
@@ -135,15 +122,15 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
 }
 
 fn scan_sink(builder: &mut FlowFactory) -> (OperationRef, OperationRef) {
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let sink = builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    let sink = builder.operation("sink", DiscardDefinition::new(), [scan]);
 
     (scan, sink)
 }
 
 fn foreign_scan(root: &Path) -> OperationRef {
     let mut foreign = FlowFactory::new(root.join("foreign"));
-    foreign.operation("foreign", Box::new(SequenceScanDefinition::new(0)), [])
+    foreign.operation("foreign", SequenceScanDefinition::new(0), [])
 }
 
 #[test]

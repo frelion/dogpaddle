@@ -16,7 +16,7 @@ use super::support::{
 
 const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
 
-fn decoded_definition() -> Box<dyn OperationDefinition> {
+fn decoded_definition() -> OperationDefinition {
     decode_definition(&decode_hex(DISCARD_V1)).unwrap()
 }
 
@@ -30,7 +30,7 @@ fn definition_has_stable_v1_literal_and_is_a_data_free_exact_sink() {
         OperationKind::Sink(NonZeroU32::MIN),
     );
     assert!(
-        construct_checked(decoded.as_ref(), &[value_schema()])
+        construct_checked(&decoded, &[value_schema()])
             .unwrap()
             .is_none()
     );

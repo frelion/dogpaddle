@@ -103,7 +103,7 @@ impl Fixture {
         let definition =
             SqliteSinkDefinition::try_new(&sqlite_path, TABLE).expect("define SQLite sink");
         let mut setup = StoreSetup::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(&schema)],
                 &mut setup.data_scope().scoped("operation"),
@@ -229,7 +229,7 @@ fn construct_reopened(
     schema: &SchemaRef,
     store: &Store,
 ) -> Operation {
-    (definition as &dyn OperationDefinition)
+    OperationDefinition::from(definition.clone())
         .construct(
             &[Arc::clone(schema)],
             &mut store.data_scope().scoped("operation"),

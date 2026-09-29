@@ -30,10 +30,10 @@ fn definition_round_trips_canonically() {
             .unwrap(),
     )
     .unwrap();
-    let encoded = encode_definition(&definition);
+    let encoded = encode_definition(&definition.into());
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(decoded.persistence_tag(), 19);
-    assert_eq!(encode_definition(decoded.as_ref()), encoded);
+    assert_eq!(encode_definition(&decoded), encoded);
 }
 
 #[test]

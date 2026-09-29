@@ -51,7 +51,7 @@ impl Host {
         if mode == "build" {
             let target = config.discover_target(format!("gate_{scenario}"), "public", scenario)?;
             let definition = PostgresSinkDefinition::try_new(target)?;
-            let encoded = encode_definition(&definition);
+            let encoded = encode_definition(&definition.into());
             let canonical = decode_definition(&encoded)?;
             let mut setup = dogpaddle_store::StoreSetup::new();
             let saved: Cell<Vec<u8>> = setup.create_data("definition")?;

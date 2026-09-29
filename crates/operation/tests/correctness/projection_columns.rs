@@ -13,10 +13,10 @@ use super::support::{
     TestStore, change, commit_ready, project_input_schema, rollback_ready, turn_input,
 };
 
-fn decoded_definition() -> Box<dyn OperationDefinition> {
+fn decoded_definition() -> OperationDefinition {
     let definition =
         SelectDefinition::try_new([("id", col("id")), ("score", col("score"))]).unwrap();
-    decode_definition(&encode_definition(&definition)).unwrap()
+    decode_definition(&encode_definition(&definition.clone().into())).unwrap()
 }
 
 fn project_change() -> Change {

@@ -109,16 +109,8 @@ fn main() -> Result<(), GateError> {
 fn build_flow(path: &Path, config: PostgresSinkConfig) -> Result<Flow, GateError> {
     let target = config.discover_target(TARGET_SINK_ID, "public", TARGET_TABLE)?;
     let mut factory = FlowFactory::new(path);
-    let scan = factory.operation(
-        SCAN_ID,
-        Box::new(SequenceScanDefinition::new(FIRST_VALUE)),
-        [],
-    );
-    factory.operation(
-        SINK_ID,
-        Box::new(PostgresSinkDefinition::try_new(target)?),
-        [scan],
-    );
+    let scan = factory.operation(SCAN_ID, SequenceScanDefinition::new(FIRST_VALUE), []);
+    factory.operation(SINK_ID, PostgresSinkDefinition::try_new(target)?, [scan]);
     factory.materialize(scan, NonZeroU64::MAX);
 
     factory.resource(SINK_ID, config)?;

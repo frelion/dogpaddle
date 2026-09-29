@@ -61,7 +61,7 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), Arc::clone(&schema));
+    let mut operation = stateless_operation(&decoded, Arc::clone(&schema));
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -91,7 +91,7 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(SELECT_V1)).unwrap();
-    let mut operation = stateless_operation(decoded.as_ref(), input.schema());
+    let mut operation = stateless_operation(&decoded, input.schema());
     let mut transactions = store.into_transactions();
     let Action::Complete(Some(reopened_selected)) =
         commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
@@ -116,27 +116,41 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
 }
 
 #[test]
-fn decoder_rejects_a_forged_count_and_invalid_field_name_without_panicking() {
-    let canonical = encode_definition(&persisted_definition());
+fn decoder_rejects_unknown_fields_and_invalid_utf8_without_panicking() {
+    let canonical = encode_definition(&persisted_definition().into());
+    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    assert!(payload.starts_with("{\"fields\":"));
 
-    let mut forged_count = canonical[..DEFINITION_HEADER_LEN + size_of::<u32>()].to_vec();
-    forged_count[DEFINITION_HEADER_LEN..].copy_from_slice(&u32::MAX.to_be_bytes());
-    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&forged_count)));
+    let mut missing_fields = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    missing_fields.extend_from_slice(
+        payload
+            .replacen("\"fields\":", "\"unknown\":", 1)
+            .as_bytes(),
+    );
+    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&missing_fields)));
     assert!(
         result.is_ok(),
-        "Select decoder panicked for a forged field count"
+        "Select decoder panicked for an unknown field"
     );
-    assert_eq!(
+    assert!(matches!(
         result.unwrap().unwrap_err(),
-        DefinitionCodecError::Truncated
-    );
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            ..
+        }
+    ));
 
     let mut invalid_utf8 = canonical;
-    let first_name_offset = DEFINITION_HEADER_LEN + size_of::<u32>() * 2;
+    let first_name_offset = invalid_utf8
+        .windows(b"renamed".len())
+        .position(|window| window == b"renamed")
+        .unwrap();
     invalid_utf8[first_name_offset] = u8::MAX;
+    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&invalid_utf8)));
+    assert!(result.is_ok(), "Select decoder panicked for invalid UTF-8");
     assert!(matches!(
-        decode_definition(&invalid_utf8),
-        Err(DefinitionCodecError::InvalidPayload(_))
+        result.unwrap().unwrap_err(),
+        DefinitionCodecError::InvalidJsonPayload { .. }
     ));
 }
 

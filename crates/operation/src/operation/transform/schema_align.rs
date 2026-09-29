@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
+
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as _, MapAccess, Visitor},
+};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion_common::DFSchema;
@@ -6,9 +11,9 @@ use thiserror::Error;
 
 use crate::{
     ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, OperationDefinition, OperationKind, RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ExpressionDefinitionError,
+    codec::decode_json_payload,
+    definition::schema_error,
     expression::{BoundProjection, StoredExpression},
 };
 
@@ -21,11 +26,13 @@ pub(crate) const TAG: u16 = 9;
 /// by a `DataFusion` `cast` or `try_cast` expression rather than by a second
 /// conversion description. `nullable` may equal the expression's derived
 /// nullability or widen non-null to nullable; binding rejects narrowing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaAlignField {
     name: String,
     expression: StoredExpression,
     nullable: bool,
+    #[serde(deserialize_with = "deserialize_unique_metadata")]
     metadata: BTreeMap<String, String>,
 }
 
@@ -35,10 +42,38 @@ pub struct SchemaAlignField {
 /// Names, target nullability, Field metadata, and Schema metadata are explicit
 /// persistent inputs. Field types are derived from exact-input-bound
 /// expressions, including any caller-declared `cast` or `try_cast`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaAlignDefinition {
     fields: Box<[SchemaAlignField]>,
+    #[serde(deserialize_with = "deserialize_unique_metadata")]
     metadata: BTreeMap<String, String>,
+}
+
+fn deserialize_unique_metadata<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct UniqueMetadata;
+
+    impl<'de> Visitor<'de> for UniqueMetadata {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("metadata with unique keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
+            let mut metadata = BTreeMap::new();
+            while let Some((key, value)) = input.next_entry::<String, String>()? {
+                if metadata.insert(key, value).is_some() {
+                    return Err(A::Error::custom("duplicate SchemaAlign metadata key"));
+                }
+            }
+            Ok(metadata)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMetadata)
 }
 
 /// Failure while constructing one [`SchemaAlignField`].
@@ -308,10 +343,9 @@ impl SchemaAlignDefinition {
     }
 }
 
-impl SealedDefinition for SchemaAlignDefinition {
-    fn output_schema_unchecked(
+impl SchemaAlignDefinition {
+    pub(crate) fn output_schema_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
         self.bind_operation(&inputs[0])
@@ -319,12 +353,9 @@ impl SealedDefinition for SchemaAlignDefinition {
             .map_err(Into::into)
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
-        _data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -334,61 +365,11 @@ impl SealedDefinition for SchemaAlignDefinition {
     }
 }
 
-impl OperationDefinition for SchemaAlignDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        let field_count = u32::try_from(self.fields.len())
-            .expect("SchemaAlignDefinition::try_new validated the stable field count");
-        output.extend_from_slice(&field_count.to_be_bytes());
-        for field in &self.fields {
-            encode_string(&field.name, output);
-            field.expression.encode(output);
-            output.push(u8::from(field.nullable));
-            encode_metadata(&field.metadata, output);
-        }
-        encode_metadata(&self.metadata, output);
-    }
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let field_count = cursor.read_u32()?;
-    let mut fields = Vec::new();
-    for _ in 0..field_count {
-        let name = decode_string(&mut cursor, "SchemaAlign field name is invalid UTF-8")?;
-        let expression = StoredExpression::decode(&mut cursor)?;
-        let nullable = match cursor.read_bytes(1)?[0] {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(DefinitionCodecError::InvalidPayload(
-                    "SchemaAlign field nullability is invalid",
-                ));
-            }
-        };
-        let metadata = decode_metadata(&mut cursor, "SchemaAlign Field metadata is invalid")?;
-        fields.push(SchemaAlignField {
-            name,
-            expression,
-            nullable,
-            metadata,
-        });
-    }
-    let metadata = decode_metadata(&mut cursor, "SchemaAlign Schema metadata is invalid")?;
-    cursor.finish()?;
-    Ok(Box::new(SchemaAlignDefinition {
-        fields: fields.into_boxed_slice(),
-        metadata,
-    }))
+) -> Result<Box<SchemaAlignDefinition>, DefinitionCodecError> {
+    let definition = decode_json_payload(payload, "invalid SchemaAlign payload")?;
+    Ok(Box::new(definition))
 }
 
 #[derive(Clone)]
@@ -423,54 +404,4 @@ fn collect_metadata(
         return Err(MetadataConstructionError::Count);
     }
     Ok(canonical)
-}
-
-fn encode_string(value: &str, output: &mut Vec<u8>) {
-    let length = u32::try_from(value.len())
-        .expect("SchemaAlign construction validated the stable string length");
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
-}
-
-fn encode_metadata(metadata: &BTreeMap<String, String>, output: &mut Vec<u8>) {
-    let count = u32::try_from(metadata.len())
-        .expect("SchemaAlign construction validated the stable metadata count");
-    output.extend_from_slice(&count.to_be_bytes());
-    for (key, value) in metadata {
-        encode_string(key, output);
-        encode_string(value, output);
-    }
-}
-
-fn decode_string(
-    cursor: &mut PayloadCursor<'_>,
-    invalid_utf8: &'static str,
-) -> Result<String, DefinitionCodecError> {
-    let length = usize::try_from(cursor.read_u32()?).map_err(|_| {
-        DefinitionCodecError::InvalidPayload("SchemaAlign string length is invalid")
-    })?;
-    let value = cursor.read_bytes(length)?;
-    std::str::from_utf8(value)
-        .map(str::to_owned)
-        .map_err(|_| DefinitionCodecError::InvalidPayload(invalid_utf8))
-}
-
-fn decode_metadata(
-    cursor: &mut PayloadCursor<'_>,
-    invalid: &'static str,
-) -> Result<BTreeMap<String, String>, DefinitionCodecError> {
-    let count = cursor.read_u32()?;
-    let mut metadata = BTreeMap::new();
-    for _ in 0..count {
-        let key = decode_string(cursor, invalid)?;
-        if metadata
-            .last_key_value()
-            .is_some_and(|(previous, _)| previous >= &key)
-        {
-            return Err(DefinitionCodecError::InvalidPayload(invalid));
-        }
-        let value = decode_string(cursor, invalid)?;
-        metadata.insert(key, value);
-    }
-    Ok(metadata)
 }

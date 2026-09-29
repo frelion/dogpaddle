@@ -15,30 +15,14 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let chain_scan = builder.operation(
-        "chain-scan",
-        Box::new(SequenceScanDefinition::new(u64::MAX - 1)),
-        [],
-    );
-    let count = builder.operation(
-        "count",
-        Box::new(RunningEventCountDefinition::new()),
-        [chain_scan],
-    );
-    builder.operation("chain-sink", Box::new(DiscardDefinition::new()), [count]);
-    let fanout_scan = builder.operation(
-        "fanout-scan",
-        Box::new(SequenceScanDefinition::new(u64::MAX)),
-        [],
-    );
-    builder.operation(
-        "first-fanout-sink",
-        Box::new(DiscardDefinition::new()),
-        [fanout_scan],
-    );
+    let chain_scan = builder.operation("chain-scan", SequenceScanDefinition::new(u64::MAX - 1), []);
+    let count = builder.operation("count", RunningEventCountDefinition::new(), [chain_scan]);
+    builder.operation("chain-sink", DiscardDefinition::new(), [count]);
+    let fanout_scan = builder.operation("fanout-scan", SequenceScanDefinition::new(u64::MAX), []);
+    builder.operation("first-fanout-sink", DiscardDefinition::new(), [fanout_scan]);
     builder.operation(
         "second-fanout-sink",
-        Box::new(DiscardDefinition::new()),
+        DiscardDefinition::new(),
         [fanout_scan],
     );
     for station in [chain_scan, count, fanout_scan] {
@@ -122,8 +106,8 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    builder.operation("sink", DiscardDefinition::new(), [scan]);
     builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     let flow = builder.build().unwrap();
@@ -142,8 +126,8 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
     let identified_path = root.path().join("identified");
     let mut builder = FlowFactory::new(&identified_path);
     builder.owner_identity(OWNER_IDENTITY);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    builder.operation("sink", DiscardDefinition::new(), [scan]);
     builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     drop(builder.build().unwrap());
@@ -167,8 +151,8 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
 
     let anonymous_path = root.path().join("anonymous");
     let mut builder = FlowFactory::new(&anonymous_path);
-    let scan = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
+    builder.operation("sink", DiscardDefinition::new(), [scan]);
     builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     drop(builder.build().unwrap());
@@ -189,19 +173,19 @@ fn build_and_open_support_many_station_output_logs() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
-    let mut previous = builder.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let mut previous = builder.operation("scan", SequenceScanDefinition::new(0), []);
     builder.materialize(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..OUTPUT_STATION_COUNT {
         let current = builder.operation(
             format!("count-{index}"),
-            Box::new(RunningEventCountDefinition::new()),
+            RunningEventCountDefinition::new(),
             [previous],
         );
         builder.materialize(current, OUTPUT_CAPACITY_BYTES);
 
         previous = current;
     }
-    builder.operation("sink", Box::new(DiscardDefinition::new()), [previous]);
+    builder.operation("sink", DiscardDefinition::new(), [previous]);
 
     let flow = builder.build().unwrap();
     assert_eq!(flow.station_count(), OUTPUT_STATION_COUNT + 1);

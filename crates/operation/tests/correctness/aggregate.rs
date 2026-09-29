@@ -59,6 +59,17 @@ fn definition() -> AggregateDefinition {
     .unwrap()
 }
 
+#[test]
+fn public_json_deserialization_cannot_bypass_aggregate_validation() {
+    let mut unknown_function = serde_json::to_value(definition()).unwrap();
+    unknown_function["calls"][0]["function"] = serde_json::json!(u16::MAX);
+    assert!(serde_json::from_value::<AggregateDefinition>(unknown_function).is_err());
+
+    let mut empty_groups = serde_json::to_value(definition()).unwrap();
+    empty_groups["groups"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<AggregateDefinition>(empty_groups).is_err());
+}
+
 fn change(departments: &[&str], values: &[Option<i64>], diffs: &[i64]) -> Change {
     assert_eq!(departments.len(), values.len());
     assert_eq!(values.len(), diffs.len());
@@ -75,18 +86,19 @@ fn change(departments: &[&str], values: &[Option<i64>], diffs: &[i64]) -> Change
 
 fn construct_aggregate(
     root: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
 ) -> (Operation, Transactions) {
     construct_aggregate_for_schema(root, definition, input_schema())
 }
 
 fn construct_aggregate_for_schema(
     root: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schema: SchemaRef,
 ) -> (Operation, Transactions) {
+    let definition: OperationDefinition = definition.clone().into();
     let mut setup = StoreSetup::new();
-    let constructed = (definition as &dyn OperationDefinition)
+    let constructed = definition
         .construct(
             &[schema],
             &mut setup.data_scope().scoped(AGGREGATE_PREFIX),
@@ -98,16 +110,20 @@ fn construct_aggregate_for_schema(
     (operation, transactions)
 }
 
-fn reopen_aggregate(store: &Store, definition: &dyn OperationDefinition) -> Operation {
+fn reopen_aggregate(
+    store: &Store,
+    definition: &(impl Clone + Into<OperationDefinition>),
+) -> Operation {
     reopen_aggregate_for_schema(store, definition, input_schema())
 }
 
 fn reopen_aggregate_for_schema(
     store: &Store,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
     schema: SchemaRef,
 ) -> Operation {
-    let constructed = (definition as &dyn OperationDefinition)
+    let definition: OperationDefinition = definition.clone().into();
+    let constructed = definition
         .construct(
             &[schema],
             &mut store.data_scope().scoped(AGGREGATE_PREFIX),
@@ -274,10 +290,13 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(
-        definition.kind(),
+        OperationDefinition::from(definition.clone()).kind(),
         OperationKind::AtomicTransform(NonZeroU32::MIN)
     );
-    assert_eq!(definition.persistence_tag(), 14);
+    assert_eq!(
+        OperationDefinition::from(definition.clone()).persistence_tag(),
+        14
+    );
     let input = input_schema();
     let binding = construct_checked(&definition, std::slice::from_ref(&input)).unwrap();
     let output = binding.as_ref().unwrap();
@@ -295,7 +314,7 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
 
     let fixture = TestStore::new();
     let mut setup = StoreSetup::new();
-    let constructed = (&definition as &dyn OperationDefinition)
+    let constructed = OperationDefinition::from(definition.clone())
         .construct(
             &[input_schema()],
             &mut setup.data_scope().scoped(AGGREGATE_PREFIX),
@@ -559,7 +578,7 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
     };
 
     let root = TestStore::new();
-    let encoded = encode_definition(&definition);
+    let encoded = encode_definition(&definition.clone().into());
     let (mut operation, mut transactions) =
         construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let initial = make_change(
@@ -592,7 +611,7 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = reopen_aggregate_for_schema(&store, decoded.as_ref(), Arc::clone(&schema));
+    let mut operation = reopen_aggregate_for_schema(&store, &decoded, Arc::clone(&schema));
     let mut transactions = store.into_transactions();
     let retract = make_change(
         vec!["A", "B", "A"],
@@ -1481,7 +1500,7 @@ fn decoded_definition_reopens_group_and_index_state() {
         [("min", AggregateCall::min(col("value")))],
     )
     .unwrap();
-    let encoded = encode_definition(&definition);
+    let encoded = encode_definition(&definition.clone().into());
     let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
     commit_ready(
@@ -1494,7 +1513,7 @@ fn decoded_definition_reopens_group_and_index_state() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = reopen_aggregate(&store, decoded.as_ref());
+    let mut operation = reopen_aggregate(&store, &decoded);
     let mut transactions = store.into_transactions();
     let retract_min = change(&["A"], &[Some(10)], &[-1]);
     let Action::Complete(Some(output)) = commit_ready(
@@ -1526,7 +1545,7 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
         ],
     )
     .unwrap();
-    let encoded = encode_definition(&definition);
+    let encoded = encode_definition(&definition.clone().into());
     let (mut operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(
         &["A", "A", "A"],
@@ -1543,7 +1562,7 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
 
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&encoded).unwrap();
-    let mut operation = reopen_aggregate(&store, decoded.as_ref());
+    let mut operation = reopen_aggregate(&store, &decoded);
     let mut transactions = store.into_transactions();
 
     // A duplicate leaves: neither extreme moves, so the turn emits nothing and

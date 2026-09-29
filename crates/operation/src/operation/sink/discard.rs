@@ -1,22 +1,21 @@
-use std::num::NonZeroU32;
-
-use arrow_schema::SchemaRef;
 use dogpaddle_store::TransactionAccess;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationDefinition, OperationKind, RuntimeResource,
-    definition::{ConstructedOperation, Sealed as SealedDefinition},
+    DefinitionCodecError,
+    codec::decode_json_payload,
+    definition::ConstructedOperation,
     operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
 pub(crate) const TAG: u16 = 3;
 
 /// Pure definition of a sink that intentionally discards every input Change.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiscardDefinition {
-    _private: (),
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DiscardDefinition {}
 
 /// Materialized sink that intentionally discards every input Change.
 ///
@@ -44,40 +43,14 @@ impl DiscardDefinition {
     /// Creates a discard sink definition.
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {}
     }
 }
 
-impl SealedDefinition for DiscardDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        _input_schemas: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        Ok(None)
+impl DiscardDefinition {
+    pub(crate) fn construct_unchecked() -> ConstructedOperation {
+        ConstructedOperation::turn(None, DiscardOperation)
     }
-
-    fn construct_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        _input_schemas: &[SchemaRef],
-        _data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
-    ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        Ok(ConstructedOperation::turn(None, DiscardOperation))
-    }
-}
-
-impl OperationDefinition for DiscardDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, _output: &mut Vec<u8>) {}
 }
 
 impl TurnOperation for DiscardOperation {
@@ -99,10 +72,7 @@ impl TurnOperation for DiscardOperation {
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    if payload.is_empty() {
-        Ok(Box::new(DiscardDefinition::new()))
-    } else {
-        Err(DefinitionCodecError::TrailingBytes)
-    }
+) -> Result<Box<DiscardDefinition>, DefinitionCodecError> {
+    let definition: DiscardDefinition = decode_json_payload(payload, "invalid Discard payload")?;
+    Ok(Box::new(definition))
 }

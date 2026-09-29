@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
@@ -7,8 +8,9 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError, OperationDefinition, OperationKind,
-    definition::{ConstructedOperation, Sealed as SealedDefinition},
+    DefinitionCodecError,
+    codec::decode_json_payload,
+    definition::ConstructedOperation,
     operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
 };
 
@@ -20,7 +22,8 @@ const POSITION: &str = "sequence_scan.position";
 /// The Scan accepts no inputs and emits `u64` values beginning at `start`.
 /// After committing [`u64::MAX`], subsequent turns return
 /// [`Action::Idle`] without changing persistent state or producing output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequenceScanDefinition {
     start: u64,
 }
@@ -58,21 +61,14 @@ impl SequenceScanDefinition {
     }
 }
 
-impl SealedDefinition for SequenceScanDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        _input_schemas: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        Ok(Some(output_schema()))
+impl SequenceScanDefinition {
+    pub(crate) fn output_schema_unchecked() -> SchemaRef {
+        output_schema()
     }
 
-    fn construct_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
-        _input_schemas: &[SchemaRef],
+    pub(crate) fn construct_unchecked(
+        self,
         scope: &mut dogpaddle_store::DataScope<'_>,
-        _resource: crate::RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let position = scope.data::<Cell<u64>>(POSITION)?;
         Ok(ConstructedOperation::turn(
@@ -82,20 +78,6 @@ impl SealedDefinition for SequenceScanDefinition {
                 position,
             },
         ))
-    }
-}
-
-impl OperationDefinition for SequenceScanDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Scan
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend_from_slice(&self.start.to_be_bytes());
     }
 }
 
@@ -143,13 +125,8 @@ fn output_schema() -> SchemaRef {
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let start = match <[u8; 8]>::try_from(payload) {
-        Ok(bytes) => u64::from_be_bytes(bytes),
-        Err(_) if payload.len() < size_of::<u64>() => {
-            return Err(DefinitionCodecError::Truncated);
-        }
-        Err(_) => return Err(DefinitionCodecError::TrailingBytes),
-    };
-    Ok(Box::new(SequenceScanDefinition::new(start)))
+) -> Result<Box<SequenceScanDefinition>, DefinitionCodecError> {
+    let definition: SequenceScanDefinition =
+        decode_json_payload(payload, "invalid sequence scan payload")?;
+    Ok(Box::new(definition))
 }

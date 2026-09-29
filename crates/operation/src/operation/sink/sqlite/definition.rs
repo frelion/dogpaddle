@@ -1,6 +1,6 @@
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::{
     collections::BTreeMap,
-    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,10 +10,9 @@ use thiserror::Error;
 
 use super::{TECHNICAL_HASH, TECHNICAL_ID, buffered, target::SqliteTarget};
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    codec::PayloadCursor,
-    definition::{Sealed as SealedDefinition, schema_error},
+    ConstructedOperation, DefinitionCodecError,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
 };
 
 pub(crate) const TAG: u16 = 10;
@@ -24,10 +23,32 @@ const MAX_LOGICAL_COLUMNS: usize = 1_998;
 /// The definition only stores the absolute database path and target table
 /// name. Binding is pure, and neither opens the database nor creates the table;
 /// those effects are deferred to lazy runtime initialization.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SqliteSinkDefinition {
     database_path: PathBuf,
     table_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    database_path: PathBuf,
+    table_name: String,
+}
+
+impl Payload {
+    fn into_definition(self) -> Result<SqliteSinkDefinition, &'static str> {
+        SqliteSinkDefinition::try_new(self.database_path, self.table_name)
+            .map_err(|_| "SQLite sink definition is invalid")
+    }
+}
+
+impl<'de> Deserialize<'de> for SqliteSinkDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Payload::deserialize(deserializer)?
+            .into_definition()
+            .map_err(D::Error::custom)
+    }
 }
 
 /// Failure while constructing a [`SqliteSinkDefinition`].
@@ -148,22 +169,18 @@ impl SqliteSinkDefinition {
     }
 }
 
-impl SealedDefinition for SqliteSinkDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+impl SqliteSinkDefinition {
+    pub(crate) fn output_schema_unchecked(
         inputs: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+    ) -> Result<(), crate::OperationSchemaError> {
         validate_input_schema(&inputs[0])?;
-        Ok(None)
+        Ok(())
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
-        _resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let input_schema = input_schemas
             .first()
@@ -178,25 +195,6 @@ impl SealedDefinition for SqliteSinkDefinition {
         )
         .map_err(schema_error)?;
         buffered::construct(input_schema, target, data)
-    }
-}
-
-impl OperationDefinition for SqliteSinkDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        let database_path = self
-            .database_path
-            .to_str()
-            .expect("SqliteSinkDefinition::try_new accepted only UTF-8 paths");
-        encode_string(database_path, output);
-        encode_string(&self.table_name, output);
     }
 }
 
@@ -268,42 +266,12 @@ fn validate_definition(
     Ok(())
 }
 
-fn encode_string(value: &str, output: &mut Vec<u8>) {
-    let length = u32::try_from(value.len())
-        .expect("SqliteSinkDefinition::try_new validated stable string lengths");
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
-}
-
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
-    let mut cursor = PayloadCursor::new(payload);
-    let database_path = decode_string(
-        &mut cursor,
-        "SQLite sink database-path length is invalid",
-        "SQLite sink database path is invalid UTF-8",
-    )?;
-    let table_name = decode_string(
-        &mut cursor,
-        "SQLite sink table-name length is invalid",
-        "SQLite sink table name is invalid UTF-8",
-    )?;
-    cursor.finish()?;
-    let definition = SqliteSinkDefinition::try_new(PathBuf::from(database_path), table_name)
-        .map_err(|_| DefinitionCodecError::InvalidPayload("SQLite sink definition is invalid"))?;
+) -> Result<Box<SqliteSinkDefinition>, DefinitionCodecError> {
+    let definition = parse_json_payload::<Payload>(payload)?
+        .into_definition()
+        .map_err(DefinitionCodecError::InvalidPayload)?;
+    require_canonical_json_payload(&definition, payload, "invalid SQLite sink payload")?;
     Ok(Box::new(definition))
-}
-
-fn decode_string(
-    cursor: &mut PayloadCursor<'_>,
-    invalid_length: &'static str,
-    invalid_utf8: &'static str,
-) -> Result<String, DefinitionCodecError> {
-    let length = usize::try_from(cursor.read_u32()?)
-        .map_err(|_| DefinitionCodecError::InvalidPayload(invalid_length))?;
-    let bytes = cursor.read_bytes(length)?;
-    let value = std::str::from_utf8(bytes)
-        .map_err(|_| DefinitionCodecError::InvalidPayload(invalid_utf8))?;
-    Ok(value.to_owned())
 }

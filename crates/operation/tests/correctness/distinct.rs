@@ -21,7 +21,7 @@ use super::support::{
 
 const DISTINCT_V1: &str = include_str!("../fixtures/v1/distinct_definition.hex");
 
-fn decoded_definition() -> Box<dyn OperationDefinition> {
+fn decoded_definition() -> OperationDefinition {
     decode_definition(&decode_hex(DISTINCT_V1)).unwrap()
 }
 
@@ -63,7 +63,7 @@ fn append_action(action: Action, rows: &mut Vec<(u64, i64)>) {
 fn construct_operation(root: &TestStore, input_schema: &SchemaRef) -> (Operation, Transactions) {
     let mut setup = StoreSetup::new();
     let definition = DistinctDefinition::new();
-    let constructed = (&definition as &dyn OperationDefinition)
+    let constructed = OperationDefinition::from(definition)
         .construct(
             std::slice::from_ref(input_schema),
             &mut setup.data_scope().scoped("operation"),
@@ -86,7 +86,7 @@ fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
     drop(transactions);
 
     let store = Store::open(root.path()).unwrap();
-    let result = (&DistinctDefinition::new() as &dyn OperationDefinition).construct(
+    let result = OperationDefinition::from(DistinctDefinition::new()).construct(
         &[schema()],
         &mut store.data_scope().scoped("operation"),
         RuntimeResource::none(),
@@ -109,7 +109,7 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
     );
     let input = schema();
     assert_eq!(
-        construct_checked(decoded.as_ref(), std::slice::from_ref(&input))
+        construct_checked(&decoded, std::slice::from_ref(&input))
             .unwrap()
             .as_ref(),
         Some(&input)
@@ -117,7 +117,7 @@ fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
 
     let empty = TestStore::new();
     let store = Store::create(empty.path()).unwrap();
-    let result = (&definition as &dyn OperationDefinition).construct(
+    let result = OperationDefinition::from(definition).construct(
         &[schema()],
         &mut store.data_scope().scoped("operation"),
         RuntimeResource::none(),

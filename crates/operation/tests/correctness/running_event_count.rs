@@ -19,7 +19,7 @@ use super::support::{
 const RUNNING_EVENT_COUNT_V1: &str =
     include_str!("../fixtures/v1/running_event_count_definition.hex");
 
-fn decoded_definition() -> Box<dyn OperationDefinition> {
+fn decoded_definition() -> OperationDefinition {
     decode_definition(&decode_hex(RUNNING_EVENT_COUNT_V1)).unwrap()
 }
 
@@ -33,7 +33,7 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(
-        construct_checked(decoded.as_ref(), &[value_schema()])
+        construct_checked(&decoded, &[value_schema()])
             .unwrap()
             .as_ref(),
         Some(&count_schema())
@@ -89,8 +89,9 @@ fn runtime_rejects_missing_invalid_port_and_foreign_store() {
 
 fn construct_operation(
     fixture: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
 ) -> (Operation, dogpaddle_store::Transactions) {
+    let definition: OperationDefinition = definition.clone().into();
     let mut setup = StoreSetup::new();
     let constructed = definition
         .construct(
@@ -133,7 +134,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 
     let reopened_root = TestStore::new();
     let decoded = decoded_definition();
-    let (mut operation, mut transactions) = construct_operation(&reopened_root, decoded.as_ref());
+    let (mut operation, mut transactions) = construct_operation(&reopened_root, &decoded);
     let first = value_change(&[1, -1]);
     assert_eq!(
         output_values(
@@ -172,7 +173,7 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
         .create_data::<Cell<u64>>("operation/running_event_count.count")
         .unwrap();
     let definition = RunningEventCountDefinition::new();
-    let (mut operation, _) = (&definition as &dyn OperationDefinition)
+    let (mut operation, _) = OperationDefinition::from(definition)
         .construct(
             &[value_schema()],
             &mut store.data_scope().scoped("operation"),
@@ -226,7 +227,7 @@ fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
 
     let store = Store::open(fixture.path()).unwrap();
     let definition = RunningEventCountDefinition::new();
-    let (mut operation, _) = (&definition as &dyn OperationDefinition)
+    let (mut operation, _) = OperationDefinition::from(definition)
         .construct(
             &[value_schema()],
             &mut store.data_scope().scoped("operation"),

@@ -42,8 +42,8 @@ fn factory(path: &Path, field: &str) -> FlowFactory {
     )
     .unwrap();
     let mut factory = FlowFactory::new(path);
-    let scan = factory.operation("pg", Box::new(definition), []);
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = factory.operation("pg", definition, []);
+    factory.operation("sink", DiscardDefinition::new(), [scan]);
 
     factory.materialize(scan, NonZeroU64::new(1024).unwrap());
     factory
@@ -181,12 +181,12 @@ fn open_rejects_new_topology_and_self_contained_operations_reject_resources() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut open = FlowFactory::new(&path);
-    open.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    open.operation("scan", SequenceScanDefinition::new(0), []);
     assert!(matches!(open.open(), Err(FlowError::OpenWithDefinition)));
     assert!(!path.exists());
     let mut build = FlowFactory::new(&path);
-    let scan = build.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    build.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = build.operation("scan", SequenceScanDefinition::new(0), []);
+    build.operation("sink", DiscardDefinition::new(), [scan]);
     build.materialize(scan, NonZeroU64::new(1024).unwrap());
 
     build.resource("scan", config()).unwrap();

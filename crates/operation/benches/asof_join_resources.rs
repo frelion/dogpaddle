@@ -496,7 +496,7 @@ impl Fixture {
         )
         .expect("define ASOF resource workload");
         let mut setup = StoreSetup::new();
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
                 &mut setup.data_scope().scoped("operation"),
@@ -513,7 +513,7 @@ impl Fixture {
         let right_rows = store
             .open_data::<OrderedMap<Vec<u8>, u64>>("operation/asof_join.right_rows")
             .expect("open observational ASOF right rows");
-        let (operation, _) = (&definition as &dyn OperationDefinition)
+        let (operation, _) = OperationDefinition::from(definition.clone())
             .construct(
                 &[Arc::clone(schema), Arc::clone(schema)],
                 &mut store.data_scope().scoped("operation"),

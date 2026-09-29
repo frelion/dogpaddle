@@ -39,16 +39,17 @@ fn factory() -> FlowFactory {
 
 fn finish_with_target<D>(operation: D, input_count: usize) -> Result<FlowDefinition, TopologyError>
 where
-    D: OperationDefinition,
+    D: Into<OperationDefinition>,
 {
     let mut builder = factory();
+    let operation = operation.into();
     let has_output = operation.kind().has_output();
     let inputs = (0..input_count)
-        .map(|index| builder.operation(format!("scan-{index}"), Box::new(scan(index as u64)), []))
+        .map(|index| builder.operation(format!("scan-{index}"), scan(index as u64), []))
         .collect::<Vec<_>>();
-    let target = builder.operation("target", Box::new(operation), inputs);
+    let target = builder.operation("target", operation, inputs);
     if has_output {
-        builder.operation("sink", Box::new(discard()), [target]);
+        builder.operation("sink", discard(), [target]);
     }
     builder.finish_definition()
 }
@@ -56,14 +57,14 @@ where
 #[test]
 fn declaration_preserves_n_ary_order_and_repeated_inputs() {
     let mut builder = factory();
-    let first = builder.operation("first", Box::new(scan(1)), []);
-    let second = builder.operation("second", Box::new(scan(2)), []);
+    let first = builder.operation("first", scan(1), []);
+    let second = builder.operation("second", scan(2), []);
     let target = builder.operation(
         "target",
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(3).unwrap())),
+        UnionAllDefinition::new(NonZeroU32::new(3).unwrap()),
         [second, first, second],
     );
-    builder.operation("sink", Box::new(discard()), [target]);
+    builder.operation("sink", discard(), [target]);
     let definition = builder.finish_definition().unwrap();
     assert_eq!(definition.stations[2].inputs, ["second", "first", "second"]);
     let (decoded, _) = decode(&encode(&definition).unwrap()).unwrap();
@@ -164,10 +165,10 @@ fn unary_graph_definition(
 ) -> (FlowDefinition, Vec<usize>) {
     let mut stations = (0..station_count)
         .map(|index| {
-            let operation: Box<dyn OperationDefinition> = if parents[index].is_some() {
-                Box::new(count())
+            let operation: OperationDefinition = if parents[index].is_some() {
+                count().into()
             } else {
-                Box::new(scan(index as u64))
+                scan(index as u64).into()
             };
             let mut station = StationDefinition::new(station_id(index), operation);
             station.output_capacity_bytes = Some(NonZeroU64::MIN);
@@ -181,7 +182,7 @@ fn unary_graph_definition(
         .filter(|candidate| !parents.contains(&Some(*candidate)))
         .collect::<Vec<_>>();
     for &leaf in &leaves {
-        let mut sink = StationDefinition::new(format!("sink-{leaf}"), Box::new(discard()));
+        let mut sink = StationDefinition::new(format!("sink-{leaf}"), discard().into());
         sink.inputs = vec![station_id(leaf)];
         stations.push(sink);
     }
@@ -291,11 +292,11 @@ fn codec_definition() -> FlowDefinition {
 
 fn codec_definition_with_ids(scan_id: &str, count_id: &str) -> FlowDefinition {
     let mut builder = factory();
-    let scan = builder.operation(scan_id, Box::new(scan(7)), []);
+    let scan = builder.operation(scan_id, scan(7), []);
     builder.materialize(scan, NonZeroU64::new(1024).unwrap());
-    let count = builder.operation(count_id, Box::new(count()), [scan]);
+    let count = builder.operation(count_id, count(), [scan]);
     builder.materialize(count, NonZeroU64::new(2048).unwrap());
-    builder.operation("sink", Box::new(discard()), [count]);
+    builder.operation("sink", discard(), [count]);
     builder.finish_definition().unwrap()
 }
 
@@ -303,12 +304,12 @@ fn codec_definition_with_ids(scan_id: &str, count_id: &str) -> FlowDefinition {
 fn decoder_round_trips_a_large_chain() {
     const STATION_COUNT: usize = 4_096;
     let mut builder = factory();
-    let mut previous = builder.operation("station-0000", Box::new(scan(0)), []);
+    let mut previous = builder.operation("station-0000", scan(0), []);
     for index in 1..STATION_COUNT {
         builder.materialize(previous, NonZeroU64::MIN);
-        previous = builder.operation(format!("station-{index:04}"), Box::new(count()), [previous]);
+        previous = builder.operation(format!("station-{index:04}"), count(), [previous]);
     }
-    builder.operation("sink", Box::new(discard()), [previous]);
+    builder.operation("sink", discard(), [previous]);
     let encoded = encode(&builder.finish_definition().unwrap()).unwrap();
     let (decoded, _) = decode(&encoded).unwrap();
     assert_eq!(decoded.stations().len(), STATION_COUNT + 1);
@@ -338,9 +339,7 @@ fn decoder_rejects_empty_and_non_atomic_station_tails() {
     );
 
     let mut invalid_tail = codec_definition();
-    invalid_tail.stations[0]
-        .operations
-        .push(Box::new(discard()));
+    invalid_tail.stations[0].operations.push(discard().into());
     assert_eq!(
         decode(&encode(&invalid_tail).unwrap()).unwrap_err(),
         FlowDefinitionError::Topology(TopologyError::InvalidAppendedOperation {
@@ -353,11 +352,12 @@ fn decoder_rejects_empty_and_non_atomic_station_tails() {
 #[test]
 fn decoder_validates_capacity_against_the_decoded_operation_category() {
     let encoded = encode(&codec_definition()).unwrap();
+    let scan_definition = dogpaddle_operation::encode_definition(&scan(7).into());
     let scan_start = encoded
-        .windows(7_u64.to_be_bytes().len())
-        .position(|window| window == 7_u64.to_be_bytes())
+        .windows(scan_definition.len())
+        .position(|window| window == scan_definition)
         .unwrap();
-    let scan_output = scan_start + size_of::<u64>() + size_of::<u32>();
+    let scan_output = scan_start + scan_definition.len() + size_of::<u32>();
 
     let mut invalid_presence = encoded.clone();
     invalid_presence[scan_output] = 2;
@@ -469,10 +469,10 @@ fn runtime_state_error_maps_an_invariant_to_runtime_state() {
 #[test]
 fn planner_fuses_linear_operations_and_preserves_the_heads_identity() {
     let mut builder = factory();
-    let source = builder.operation("source", Box::new(scan(0)), []);
-    let first = builder.operation("first", Box::new(count()), [source]);
-    let second = builder.operation("second", Box::new(count()), [first]);
-    builder.operation("sink", Box::new(discard()), [second]);
+    let source = builder.operation("source", scan(0), []);
+    let first = builder.operation("first", count(), [source]);
+    let second = builder.operation("second", count(), [first]);
+    builder.operation("sink", discard(), [second]);
     let definition = builder.finish_definition().unwrap();
     assert_eq!(definition.stations.len(), 2);
     assert_eq!(definition.stations[0].id, "source");
@@ -489,11 +489,11 @@ fn planner_fuses_linear_operations_and_preserves_the_heads_identity() {
 fn materialization_ends_a_fused_program_and_overrides_its_capacity() {
     let mut builder = factory();
     builder.output_capacity_bytes(NonZeroU64::new(8192).unwrap());
-    let source = builder.operation("source", Box::new(scan(0)), []);
-    let first = builder.operation("first", Box::new(count()), [source]);
+    let source = builder.operation("source", scan(0), []);
+    let first = builder.operation("first", count(), [source]);
     builder.materialize(first, NonZeroU64::new(1024).unwrap());
-    let second = builder.operation("second", Box::new(count()), [first]);
-    builder.operation("sink", Box::new(discard()), [second]);
+    let second = builder.operation("second", count(), [first]);
+    builder.operation("sink", discard(), [second]);
     let definition = builder.finish_definition().unwrap();
     assert_eq!(definition.stations.len(), 3);
     assert_eq!(definition.stations[0].operations.len(), 2);
@@ -512,15 +512,15 @@ fn materialization_ends_a_fused_program_and_overrides_its_capacity() {
 #[test]
 fn repeated_edges_and_fanout_prevent_absorbing_the_producer() {
     let mut builder = factory();
-    let source = builder.operation("source", Box::new(scan(0)), []);
+    let source = builder.operation("source", scan(0), []);
     let union = builder.operation(
         "union",
-        Box::new(UnionAllDefinition::new(NonZeroU32::new(2).unwrap())),
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
         [source, source],
     );
-    let count = builder.operation("count", Box::new(count()), [union]);
-    builder.operation("sink", Box::new(discard()), [count]);
-    builder.operation("other_sink", Box::new(discard()), [source]);
+    let count = builder.operation("count", count(), [union]);
+    builder.operation("sink", discard(), [count]);
+    builder.operation("other_sink", discard(), [source]);
     let definition = builder.finish_definition().unwrap();
     assert_eq!(definition.stations.len(), 4);
     assert_eq!(definition.stations[0].operations.len(), 1);
@@ -532,18 +532,18 @@ fn repeated_edges_and_fanout_prevent_absorbing_the_producer() {
 #[test]
 fn planner_checks_absorbed_ids_and_foreign_inputs() {
     let mut builder = factory();
-    let source = builder.operation("duplicate", Box::new(scan(0)), []);
-    let count = builder.operation("duplicate", Box::new(count()), [source]);
-    builder.operation("sink", Box::new(discard()), [count]);
+    let source = builder.operation("duplicate", scan(0), []);
+    let count = builder.operation("duplicate", count(), [source]);
+    builder.operation("sink", discard(), [count]);
     assert_eq!(
         builder.finish_definition().unwrap_err(),
         TopologyError::DuplicateStationId("duplicate".to_owned())
     );
 
     let mut other = factory();
-    let foreign = other.operation("source", Box::new(scan(0)), []);
+    let foreign = other.operation("source", scan(0), []);
     let mut builder = factory();
-    builder.operation("sink", Box::new(discard()), [foreign]);
+    builder.operation("sink", discard(), [foreign]);
     assert_eq!(
         builder.finish_definition().unwrap_err(),
         TopologyError::ForeignOperationRef(foreign)

@@ -2,6 +2,7 @@ use arrow_schema::{ArrowError, DataType};
 use datafusion_common::DataFusionError;
 use dogpaddle_change::ChangeError;
 use dogpaddle_store::{DataScope, StoreError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -54,7 +55,7 @@ fn construct(
 }
 
 /// Relational output semantics of an equality join.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum EquiJoinKind {
     /// Emits every matching left/right pair with multiplied multiplicity.
     Inner,
@@ -75,27 +76,6 @@ impl EquiJoinKind {
 
     const fn preserves(self, port: usize) -> bool {
         matches!(self, Self::FullOuter) || matches!((self, port), (Self::LeftOuter, 0))
-    }
-
-    const fn code(self) -> u8 {
-        match self {
-            Self::Inner => 0,
-            Self::LeftSemi => 1,
-            Self::LeftAnti => 2,
-            Self::LeftOuter => 3,
-            Self::FullOuter => 4,
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Inner),
-            1 => Some(Self::LeftSemi),
-            2 => Some(Self::LeftAnti),
-            3 => Some(Self::LeftOuter),
-            4 => Some(Self::FullOuter),
-            _ => None,
-        }
     }
 }
 

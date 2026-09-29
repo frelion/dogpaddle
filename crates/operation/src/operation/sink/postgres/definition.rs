@@ -1,6 +1,7 @@
-use std::{any::TypeId, num::NonZeroU32, sync::Arc};
+use std::{any::TypeId, sync::Arc};
 
 use arrow_schema::SchemaRef;
+use serde::Serialize;
 
 use super::{
     buffered,
@@ -10,9 +11,9 @@ use super::{
     target::PostgresTarget,
 };
 use crate::{
-    ConstructedOperation, DefinitionCodecError, OperationDefinition, OperationKind,
-    RuntimeResource,
-    definition::{Sealed, schema_error},
+    ConstructedOperation, DefinitionCodecError, RuntimeResource,
+    codec::{parse_json_payload, require_canonical_json_payload},
+    definition::schema_error,
 };
 
 pub(crate) const TAG: u16 = 12;
@@ -24,7 +25,8 @@ const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 /// before Flow construction. Credentials and endpoint configuration are
 /// supplied separately through [`super::PostgresSinkConfig`] whenever the Flow is
 /// built or reopened. Construction and Schema binding perform no network I/O.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct PostgresSinkDefinition {
     target: PostgresTargetSpec,
 }
@@ -53,19 +55,16 @@ impl PostgresSinkDefinition {
     }
 }
 
-impl Sealed for PostgresSinkDefinition {
-    fn output_schema_unchecked(
-        &self,
-        _: crate::definition::ConstructionToken,
+impl PostgresSinkDefinition {
+    pub(crate) fn output_schema_unchecked(
         inputs: &[SchemaRef],
-    ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+    ) -> Result<(), crate::OperationSchemaError> {
         PostgresLayout::try_new(Arc::clone(&inputs[0]))?;
-        Ok(None)
+        Ok(())
     }
 
-    fn construct_unchecked(
+    pub(crate) fn construct_unchecked(
         &self,
-        _: crate::definition::ConstructionToken,
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
@@ -80,39 +79,27 @@ impl Sealed for PostgresSinkDefinition {
         buffered::construct(input_schema, target, data)
     }
 
-    fn resource_type(&self) -> Option<TypeId> {
-        Some(TypeId::of::<PostgresSinkConfig>())
-    }
-}
-
-impl OperationDefinition for PostgresSinkDefinition {
-    fn kind(&self) -> OperationKind {
-        OperationKind::Sink(NonZeroU32::MIN)
-    }
-
-    fn persistence_tag(&self) -> u16 {
-        TAG
-    }
-
-    fn encode_payload(&self, output: &mut Vec<u8>) {
-        output.extend(encoded_target(&self.target));
+    pub(crate) fn resource_type() -> TypeId {
+        TypeId::of::<PostgresSinkConfig>()
     }
 }
 
 pub(crate) fn decode_definition(
     payload: &[u8],
-) -> Result<Box<dyn OperationDefinition>, DefinitionCodecError> {
+) -> Result<Box<PostgresSinkDefinition>, DefinitionCodecError> {
     let invalid =
         || DefinitionCodecError::InvalidPayload("invalid PostgreSQL sink target specification");
     if payload.len() > MAX_DEFINITION_BYTES {
         return Err(invalid());
     }
 
-    let target = serde_json::from_slice(payload).map_err(|_| invalid())?;
+    let target = parse_json_payload(payload)?;
     let definition = PostgresSinkDefinition::try_new(target).map_err(|_| invalid())?;
-    if encoded_target(definition.target()) != payload {
-        return Err(invalid());
-    }
+    require_canonical_json_payload(
+        &definition,
+        payload,
+        "invalid PostgreSQL sink target specification",
+    )?;
     Ok(Box::new(definition))
 }
 

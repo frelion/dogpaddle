@@ -183,18 +183,18 @@ fn measure_reopen(path: &Path, station_count: usize, iterations: u64) -> Duratio
 
 fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let mut previous = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let mut previous = factory.operation("scan", SequenceScanDefinition::new(0), []);
     factory.materialize(previous, OUTPUT_CAPACITY_BYTES);
     for index in 1..station_count - 1 {
         let current = factory.operation(
             format!("count-{index:08x}"),
-            Box::new(RunningEventCountDefinition::new()),
+            RunningEventCountDefinition::new(),
             [previous],
         );
         factory.materialize(current, OUTPUT_CAPACITY_BYTES);
         previous = current;
     }
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [previous]);
+    factory.operation("sink", DiscardDefinition::new(), [previous]);
     factory
 }
 

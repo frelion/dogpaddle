@@ -134,13 +134,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = root.path().join("flow");
 
     let mut factory = FlowFactory::new(&state);
-    let numbers = factory.operation("numbers", Box::new(SequenceScanDefinition::new(0)), []);
+    let numbers = factory.operation("numbers", SequenceScanDefinition::new(0), []);
     let selected = factory.operation(
         "selected",
-        Box::new(FilterDefinition::try_new(col("value").eq(lit(7_u64)))?),
+        FilterDefinition::try_new(col("value").eq(lit(7_u64)))?,
         [numbers],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [selected]);
+    factory.operation("sink", DiscardDefinition::new(), [selected]);
 
     let mut flow = factory.build()?;
     flow.advance()?;
@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `build()` | 校验声明、自动划分 Station、创建状态并返回运行态 `Flow` |
 | `open()` | 按已有持久计划恢复运行态 `Flow`，不重新划分 Station |
 
-`operation` 接收拥有型 `Box<dyn OperationDefinition>`。输入只能引用本 Factory 中先前声明的算子，
+`operation` 接收可转为 `OperationDefinition` 的具体定义并取得所有权。输入只能引用本 Factory 中先前声明的算子，
 因此声明天然构成 DAG；持久 Definition 的 decoder 仍独立校验环和拓扑。
 所有算子 ID（包括最终被融合的尾项）都必须合法且唯一。Station ID 使用其首算子的 ID。
 

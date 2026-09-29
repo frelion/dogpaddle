@@ -834,24 +834,20 @@ fn scenario_factory(path: &Path, scenario: Scenario) -> FlowFactory {
 fn sink_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     factory.output_capacity_bytes(output_capacity_bytes);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [scan]);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    factory.operation("sink", DiscardDefinition::new(), [scan]);
     factory
 }
 
 fn unfused_pure_chain_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let project = factory.operation("project", Box::new(pure_chain_project()), [scan]);
-    let extend = factory.operation("extend", Box::new(pure_chain_extend()), [project]);
-    let filter = factory.operation("filter", Box::new(pure_chain_filter()), [extend]);
-    let select = factory.operation("select", Box::new(pure_chain_select()), [filter]);
-    let schema_align = factory.operation(
-        "schema-align",
-        Box::new(pure_chain_schema_align()),
-        [select],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [schema_align]);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    let project = factory.operation("project", pure_chain_project(), [scan]);
+    let extend = factory.operation("extend", pure_chain_extend(), [project]);
+    let filter = factory.operation("filter", pure_chain_filter(), [extend]);
+    let select = factory.operation("select", pure_chain_select(), [filter]);
+    let schema_align = factory.operation("schema-align", pure_chain_schema_align(), [select]);
+    factory.operation("sink", DiscardDefinition::new(), [schema_align]);
     for operation in [scan, project, extend, filter, select, schema_align] {
         factory.materialize(operation, output_capacity_bytes);
     }
@@ -861,17 +857,13 @@ fn unfused_pure_chain_factory(path: &Path, output_capacity_bytes: NonZeroU64) ->
 fn fused_pure_chain_factory(path: &Path, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     factory.output_capacity_bytes(output_capacity_bytes);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
-    let project = factory.operation("project", Box::new(pure_chain_project()), [scan]);
-    let extend = factory.operation("extend", Box::new(pure_chain_extend()), [project]);
-    let filter = factory.operation("filter", Box::new(pure_chain_filter()), [extend]);
-    let select = factory.operation("select", Box::new(pure_chain_select()), [filter]);
-    let schema_align = factory.operation(
-        "schema-align",
-        Box::new(pure_chain_schema_align()),
-        [select],
-    );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [schema_align]);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    let project = factory.operation("project", pure_chain_project(), [scan]);
+    let extend = factory.operation("extend", pure_chain_extend(), [project]);
+    let filter = factory.operation("filter", pure_chain_filter(), [extend]);
+    let select = factory.operation("select", pure_chain_select(), [filter]);
+    let schema_align = factory.operation("schema-align", pure_chain_schema_align(), [select]);
+    factory.operation("sink", DiscardDefinition::new(), [schema_align]);
     factory
 }
 
@@ -910,29 +902,29 @@ fn chain_factory(
     output_capacity_bytes: NonZeroU64,
 ) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
-    let mut previous = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let mut previous = factory.operation("scan", SequenceScanDefinition::new(0), []);
     factory.materialize(previous, output_capacity_bytes);
     for index in 1..station_count - 1 {
         let current = factory.operation(
             format!("count-{index:08x}"),
-            Box::new(RunningEventCountDefinition::new()),
+            RunningEventCountDefinition::new(),
             [previous],
         );
         factory.materialize(current, output_capacity_bytes);
         previous = current;
     }
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [previous]);
+    factory.operation("sink", DiscardDefinition::new(), [previous]);
     factory
 }
 
 fn fanout_factory(path: &Path, consumers: usize, output_capacity_bytes: NonZeroU64) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     factory.output_capacity_bytes(output_capacity_bytes);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     for index in 0..consumers {
         factory.operation(
             format!("sink-{index:08x}"),
-            Box::new(DiscardDefinition::new()),
+            DiscardDefinition::new(),
             [scan],
         );
     }

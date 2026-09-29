@@ -16,8 +16,9 @@ const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_scan_start_42.he
 
 fn construct_operation(
     root: &TestStore,
-    definition: &dyn OperationDefinition,
+    definition: &(impl Clone + Into<OperationDefinition>),
 ) -> (Operation, Transactions) {
+    let definition: OperationDefinition = definition.clone().into();
     let mut setup = StoreSetup::new();
     let constructed = definition
         .construct(
@@ -37,11 +38,11 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
     let decoded = assert_literal_definition(&definition, SEQUENCE_V1, 1, OperationKind::Scan);
     assert_eq!(definition.start(), 42);
     assert_eq!(
-        construct_checked(decoded.as_ref(), &[]).unwrap().as_ref(),
+        construct_checked(&decoded, &[]).unwrap().as_ref(),
         Some(&value_schema())
     );
     let root = TestStore::new();
-    let (mut operation, mut transactions) = construct_operation(&root, decoded.as_ref());
+    let (mut operation, mut transactions) = construct_operation(&root, &decoded);
     assert_eq!(
         output_values(
             commit_ready(&mut operation, None, &mut transactions).unwrap(),
@@ -107,7 +108,7 @@ fn rollback_commit_reopen_and_terminal_position_are_exact() {
     let position = store
         .open_data::<Cell<u64>>("operation/sequence_scan.position")
         .unwrap();
-    let constructed = (&definition as &dyn OperationDefinition)
+    let constructed = OperationDefinition::from(definition)
         .construct(
             &[],
             &mut store.data_scope().scoped("operation"),

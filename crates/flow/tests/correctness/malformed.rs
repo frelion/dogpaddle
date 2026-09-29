@@ -186,15 +186,13 @@ fn open_locates_an_invalid_operation_inside_a_station_program() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let mut factory = FlowFactory::new(&source);
-    let scan = factory.operation("scan", Box::new(SequenceScanDefinition::new(0)), []);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     let projected = factory.operation(
         "project",
-        Box::new(
-            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
-        ),
+        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
         [scan],
     );
-    factory.operation("sink", Box::new(DiscardDefinition::new()), [projected]);
+    factory.operation("sink", DiscardDefinition::new(), [projected]);
     factory.materialize(projected, NonZeroU64::MIN);
     drop(factory.build().unwrap());
 

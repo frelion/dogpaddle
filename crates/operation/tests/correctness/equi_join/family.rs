@@ -134,6 +134,13 @@ fn definition(kind: EquiJoinKind) -> EquiJoinDefinition {
     definition_with_residual(kind, ResidualCase::None)
 }
 
+#[test]
+fn public_json_deserialization_rejects_an_empty_equi_key_list() {
+    let mut payload = serde_json::to_value(definition(EquiJoinKind::Inner)).unwrap();
+    payload["keys"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<EquiJoinDefinition>(payload).is_err());
+}
+
 fn definition_with_residual(kind: EquiJoinKind, residual: ResidualCase) -> EquiJoinDefinition {
     EquiJoinDefinition::try_new(
         kind,
@@ -401,7 +408,7 @@ impl ResidualCase {
 
 fn construct_join(root: &TestStore, definition: &EquiJoinDefinition) -> (Operation, Transactions) {
     let mut setup = StoreSetup::new();
-    let (operation, _) = (definition as &dyn dogpaddle_operation::OperationDefinition)
+    let (operation, _) = dogpaddle_operation::OperationDefinition::from(definition.clone())
         .construct(
             &[left_schema(), right_schema()],
             &mut setup.data_scope().scoped(OPERATION_PREFIX),
@@ -414,7 +421,7 @@ fn construct_join(root: &TestStore, definition: &EquiJoinDefinition) -> (Operati
 }
 
 fn reopen_join(store: &Store, definition: &EquiJoinDefinition) -> Operation {
-    (definition as &dyn dogpaddle_operation::OperationDefinition)
+    dogpaddle_operation::OperationDefinition::from(definition.clone())
         .construct(
             &[left_schema(), right_schema()],
             &mut store.data_scope().scoped(OPERATION_PREFIX),
@@ -945,8 +952,7 @@ fn every_kind_has_a_literal_tag_layout_and_exact_nullable_schema() {
         };
         assert_eq!(resource_names(kind, false), expected_data);
 
-        let binding =
-            construct_checked(decoded.as_ref(), &[left_schema(), right_schema()]).unwrap();
+        let binding = construct_checked(&decoded, &[left_schema(), right_schema()]).unwrap();
         let output = binding.as_ref().unwrap();
         assert_eq!(
             output
@@ -1004,7 +1010,7 @@ fn residual_round_trips_with_qualified_pair_binding_and_selects_match_count_layo
         16,
         OperationKind::TurnTransform(NonZeroU32::new(2).unwrap()),
     );
-    let output = construct_checked(decoded.as_ref(), &[left_schema(), right_schema()])
+    let output = construct_checked(&decoded, &[left_schema(), right_schema()])
         .unwrap()
         .unwrap();
     assert_eq!(output.fields().len(), left_schema().fields().len());
@@ -1065,26 +1071,40 @@ fn definition_rejects_a_non_immutable_residual() {
 }
 
 #[test]
-fn tag_16_rejects_invalid_kind_residual_marker_and_removed_payloads() {
-    let mut invalid_kind = decode_hex(INNER_V1);
-    invalid_kind[DEFINITION_HEADER_BYTES] = u8::MAX;
-    assert_eq!(
+fn tag_16_rejects_invalid_kind_residual_and_removed_payloads() {
+    let canonical = dogpaddle_operation::encode_definition(&definition(EquiJoinKind::Inner).into());
+    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_BYTES..]).unwrap();
+    let wrap = |payload: &str| {
+        let mut encoded = canonical[..DEFINITION_HEADER_BYTES].to_vec();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    };
+
+    let invalid_kind = wrap(&payload.replacen("\"kind\":\"Inner\"", "\"kind\":\"Unknown\"", 1));
+    assert_ne!(invalid_kind, canonical);
+    assert!(matches!(
         decode_definition(&invalid_kind).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("equi-join kind is invalid")
-    );
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            ..
+        }
+    ));
 
-    let mut invalid_marker = decode_hex(INNER_V1);
-    *invalid_marker.last_mut().unwrap() = u8::MAX;
-    assert_eq!(
-        decode_definition(&invalid_marker).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("equi-join residual marker is invalid")
-    );
+    let invalid_residual = wrap(&payload.replacen("\"residual\":null", "\"residual\":2", 1));
+    assert_ne!(invalid_residual, canonical);
+    assert!(matches!(
+        decode_definition(&invalid_residual).unwrap_err(),
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            ..
+        }
+    ));
 
-    let mut missing_marker = decode_hex(INNER_V1);
-    missing_marker.pop();
+    let missing_residual = wrap(&payload.replacen(",\"residual\":null", "", 1));
+    assert_ne!(missing_residual, canonical);
     assert_eq!(
-        decode_definition(&missing_marker).unwrap_err(),
-        DefinitionCodecError::Truncated
+        decode_definition(&missing_residual).unwrap_err(),
+        DefinitionCodecError::InvalidPayload("invalid equi-join payload")
     );
 
     assert!(

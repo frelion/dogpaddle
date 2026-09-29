@@ -445,51 +445,40 @@ pub(crate) enum ResolvedScanEndpoint {
     MySqlCdc(Box<ResolvedMySqlCdc>),
 }
 
-pub(crate) enum BuiltScan {
-    Sequence(SequenceScanDefinition),
-    PostgresCdc(PostgresCdcScanDefinition),
-    MySqlCdc(MySqlCdcScanDefinition),
-}
-
-impl BuiltScan {
-    pub(crate) fn definition(&self) -> &dyn OperationDefinition {
-        match self {
-            Self::Sequence(definition) => definition,
-            Self::PostgresCdc(definition) => definition,
-            Self::MySqlCdc(definition) => definition,
+pub(crate) fn project_scan_definition(
+    definition: OperationDefinition,
+    projection: &[usize],
+) -> Result<OperationDefinition, SqlError> {
+    let projection = projection
+        .iter()
+        .map(|index| {
+            u32::try_from(*index)
+                .map_err(|_| SqlError::invalid("scan projection index exceeds u32"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match definition {
+        OperationDefinition::SequenceScan(definition) => {
+            Ok(OperationDefinition::SequenceScan(definition))
         }
-    }
-
-    pub(crate) fn into_definition(
-        self,
-        projection: &[usize],
-    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
-        let projection = projection
-            .iter()
-            .map(|index| {
-                u32::try_from(*index)
-                    .map_err(|_| SqlError::invalid("scan projection index exceeds u32"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        match self {
-            Self::Sequence(definition) => Ok(Box::new(definition)),
-            Self::PostgresCdc(definition) => Ok(Box::new(
-                PostgresCdcScanDefinition::try_new_projected(
-                    definition.spec().clone(),
-                    projection,
-                    definition.bootstrap_spool_bytes(),
-                )
-                .map_err(SqlError::endpoint)?,
-            )),
-            Self::MySqlCdc(definition) => Ok(Box::new(
-                MySqlCdcScanDefinition::try_new_projected(
-                    definition.spec().clone(),
-                    projection,
-                    definition.bootstrap_spool_bytes(),
-                )
-                .map_err(SqlError::endpoint)?,
-            )),
+        OperationDefinition::PostgresCdcScan(definition) => {
+            Ok(PostgresCdcScanDefinition::try_new_projected(
+                definition.spec().clone(),
+                projection,
+                definition.bootstrap_spool_bytes(),
+            )
+            .map_err(SqlError::endpoint)?
+            .into())
         }
+        OperationDefinition::MySqlCdcScan(definition) => {
+            Ok(MySqlCdcScanDefinition::try_new_projected(
+                definition.spec().clone(),
+                projection,
+                definition.bootstrap_spool_bytes(),
+            )
+            .map_err(SqlError::endpoint)?
+            .into())
+        }
+        _ => Err(SqlError::invalid("expected a scan definition")),
     }
 }
 
@@ -589,11 +578,9 @@ impl ResolvedScanEndpoint {
         state_path: &Path,
         runtime_bundle: Option<&Path>,
         factory: &mut FlowFactory,
-    ) -> Result<BuiltScan, SqlError> {
+    ) -> Result<OperationDefinition, SqlError> {
         match self {
-            Self::Sequence { start } => {
-                Ok(BuiltScan::Sequence(SequenceScanDefinition::new(*start)))
-            }
+            Self::Sequence { start } => Ok(SequenceScanDefinition::new(*start).into()),
             Self::PostgresCdc(endpoint) => {
                 let config = endpoint.connection.postgres_cdc_config(
                     runtime_bundle.expect("CDC programs resolve one runtime"),
@@ -613,7 +600,7 @@ impl ResolvedScanEndpoint {
                     PostgresCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
                 factory.resource(scan_operation_id(index), config)?;
-                Ok(BuiltScan::PostgresCdc(definition))
+                Ok(definition.into())
             }
             Self::MySqlCdc(endpoint) => {
                 let config = endpoint.connection.mysql_config(
@@ -627,7 +614,7 @@ impl ResolvedScanEndpoint {
                     MySqlCdcScanDefinition::try_new(spec, endpoint.bootstrap_spool_bytes)
                         .map_err(SqlError::endpoint)?;
                 factory.resource(scan_operation_id(index), config)?;
-                Ok(BuiltScan::MySqlCdc(definition))
+                Ok(definition.into())
             }
         }
     }
@@ -916,7 +903,7 @@ impl ResolvedSinkEndpoint {
         identity: &[u8; 32],
         state_path: &Path,
         factory: &mut FlowFactory,
-    ) -> Result<Box<dyn OperationDefinition>, SqlError> {
+    ) -> Result<OperationDefinition, SqlError> {
         match self {
             Self::ClickHouse(endpoint) => {
                 let connection = &endpoint.connection;
@@ -928,7 +915,7 @@ impl ResolvedSinkEndpoint {
                 let definition =
                     ClickHouseSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
-                Ok(Box::new(definition))
+                Ok(definition.into())
             }
             Self::Doris(endpoint) => {
                 let connection = &endpoint.connection;
@@ -940,7 +927,7 @@ impl ResolvedSinkEndpoint {
                 let definition =
                     DorisSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
-                Ok(Box::new(definition))
+                Ok(definition.into())
             }
             Self::Postgres(endpoint) => {
                 let connection = &endpoint.connection;
@@ -952,14 +939,14 @@ impl ResolvedSinkEndpoint {
                 let definition =
                     PostgresSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
-                Ok(Box::new(definition))
+                Ok(definition.into())
             }
             Self::Sqlite { path, table } => {
                 let definition = SqliteSinkDefinition::try_new(PathBuf::from(path), table)
                     .map_err(SqlError::endpoint)?;
-                Ok(Box::new(definition))
+                Ok(definition.into())
             }
-            Self::Discard => Ok(Box::new(DiscardDefinition::new())),
+            Self::Discard => Ok(DiscardDefinition::new().into()),
         }
     }
 
