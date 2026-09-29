@@ -15,7 +15,7 @@ SqliteSink 的 tag 是 10，只接受绝对 UTF-8 文件路径和新的非保留
 PostgresSink 的 tag 是 12，是具体的单输入 exact-relation Sink。
 Definition 只保存 discovery 得到的非敏感 `PostgresTargetSpec` canonical JSON；numeric IP、port、user 与 password 只存在于每次 Flow build/open 构造边界显式注入的拥有型 `PostgresSinkConfig`，不接受 DNS endpoint。
 私有 Tokio session 必须给完整连接握手、discovery、身份校验和每个数据库工作单元施加 5 秒 client deadline，失败或超时丢弃整个 session。
-同一 target spec 只能属于一个持久化 Flow/Sink，不能用于接管或共享已有目标；远端 marker 只标识 ownership/layout version，精确 logical Schema 由 Flow 构造与运行时 guard 保证。
+同一 target spec 只能属于一个持久化 Flow/Sink，不能用于接管或共享已有目标；远端 marker 使用开发期 `dogpaddle.postgres-relation.v1:` ownership/layout 前缀，精确 logical Schema 由 Flow 构造与运行时 guard 保证。已有目标需随当前 v1 布局重建。
 无 TLS 或在线 Schema evolution。
 普通 Cargo gate 不依赖 PG，真实本机验收为 system-tests/postgres/check_sink.py。
 

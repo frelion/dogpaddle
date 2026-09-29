@@ -7,7 +7,7 @@ pub(super) type Groups = OrderedMap<Vec<u8>, GroupState>;
 pub(super) type Entries = PartitionedMultiset<EntryPartition, Vec<u8>>;
 pub(super) type Control = Cell<u64>;
 
-const GROUP_STATE_VERSION: u8 = 2;
+const GROUP_STATE_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct GroupState {
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(
             encoded,
             [
-                2, // version
+                1, // version
                 7, // group ID
                 3, // group weight
                 2, // fold count
@@ -231,26 +231,26 @@ mod tests {
             extremes: Box::new([]),
         };
         let encoded = state.encode_value().unwrap().as_ref().to_vec();
-        assert_eq!(encoded, [2, 7, 1, 0, 0]);
+        assert_eq!(encoded, [1, 7, 1, 0, 0]);
         for length in 0..encoded.len() {
             assert!(GroupState::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
         }
 
-        let mut overlong_id = vec![2, 251, 0, 7];
+        let mut overlong_id = vec![1, 251, 0, 7];
         overlong_id.extend_from_slice(&encoded[2..]);
         assert!(GroupState::decode_value(Cow::Borrowed(&overlong_id)).is_err());
-        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 1, 251, 0, 0, 0])).is_err());
-        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 1, 0, 251, 0, 0])).is_err());
-        assert!(GroupState::decode_value(Cow::Borrowed(&[2, 7, 0, 0, 0])).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[1, 7, 1, 251, 0, 0, 0])).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[1, 7, 1, 0, 251, 0, 0])).is_err());
+        assert!(GroupState::decode_value(Cow::Borrowed(&[1, 7, 0, 0, 0])).is_err());
 
         let huge = [253, 255, 255, 255, 255, 255, 255, 255, 255];
-        let mut huge_folds = vec![2, 7, 1];
+        let mut huge_folds = vec![1, 7, 1];
         huge_folds.extend_from_slice(&huge);
         assert!(GroupState::decode_value(Cow::Borrowed(&huge_folds)).is_err());
-        let mut huge_fold_value = vec![2, 7, 1, 1];
+        let mut huge_fold_value = vec![1, 7, 1, 1];
         huge_fold_value.extend_from_slice(&huge);
         assert!(GroupState::decode_value(Cow::Borrowed(&huge_fold_value)).is_err());
-        let mut huge_extremes = vec![2, 7, 1, 0];
+        let mut huge_extremes = vec![1, 7, 1, 0];
         huge_extremes.extend_from_slice(&huge);
         assert!(GroupState::decode_value(Cow::Borrowed(&huge_extremes)).is_err());
 

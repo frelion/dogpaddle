@@ -410,5 +410,5 @@ fn layout_owns_only_the_target_and_two_indexes() {
         &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
     );
     assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
-    assert!(plan.initialize.contains("dogpaddle.postgres-relation.v2:"));
+    assert!(plan.initialize.contains("dogpaddle.postgres-relation.v1:"));
 }

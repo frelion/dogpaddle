@@ -432,7 +432,7 @@ impl SqlPlan {
             quote_identifier(&hash_index_name)
         );
         let marker_hash = blake3::hash(format!("{create_target}\0{create_hash_index}").as_bytes());
-        let marker = format!("dogpaddle.postgres-relation.v2:{}", marker_hash.to_hex());
+        let marker = format!("dogpaddle.postgres-relation.v1:{}", marker_hash.to_hex());
         let marker_literal = quote_literal(&marker);
         let initialize = format!(
             "{create_target}; {create_hash_index}; \
