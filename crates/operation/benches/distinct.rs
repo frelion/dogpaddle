@@ -11,7 +11,7 @@ use criterion::{Criterion, Throughput};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
-    operation::{Action, Operation, OperationInput, Turn, transform::DistinctDefinition},
+    operation::{Operation, OperationInput, StepBudget, transform::DistinctDefinition},
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use dogpaddle_store::{StoreSetup, Transactions};
@@ -49,21 +49,20 @@ impl Fixture {
         }
     }
 
-    fn apply(&mut self, change: &Change) -> Action {
-        let Turn::Ready(prepared) = self
-            .operation
-            .turn(Some(OperationInput { port: 0, change }))
-            .expect("prepare Distinct")
-        else {
-            panic!("Distinct must be ready")
+    fn apply(&mut self, change: &Change) -> Option<Change> {
+        let Operation::Atomic(operation) = &self.operation else {
+            panic!("Distinct must be atomic")
         };
         let transaction = self.transactions.begin();
-        let (action, completion) = prepared
-            .apply(transaction.access())
+        let output = operation
+            .apply(
+                OperationInput { port: 0, change },
+                transaction.access(),
+                &mut StepBudget::new(0, 64 * 1024 * 1024),
+            )
             .expect("apply Distinct");
         transaction.commit().expect("commit Distinct");
-        completion.run().expect("complete Distinct");
-        action
+        output
     }
 }
 
@@ -93,8 +92,8 @@ fn input(schema: &SchemaRef, rows: usize, contiguous: bool) -> Change {
     Change::try_new(records, Int64Array::from(differences)).expect("build Distinct Change")
 }
 
-fn validate(action: &Action, input: &Change) {
-    let Action::Complete(Some(output)) = action else {
+fn validate(action: Option<&Change>, input: &Change) {
+    let Some(output) = action else {
         panic!("every cycle must emit its presence transitions")
     };
     assert_eq!(output.records(), input.records());
@@ -127,7 +126,7 @@ fn main() {
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "one complete turn, apply, Transaction::commit, AfterCommit; writes synchronize WAL",
+            "timed_boundary": "one complete turn, apply, Transaction::commit, explicit 64MiB logical byte allowance; writes synchronize WAL",
             "untimed": "fixture, input construction, output oracle, teardown"
         }
     });
@@ -160,7 +159,7 @@ fn main() {
     ] {
         let mut fixture = Fixture::new(&root, name, &schema);
         let input = input(&schema, rows, contiguous);
-        validate(&fixture.apply(&input), &input);
+        validate(fixture.apply(&input).as_ref(), &input);
         group.bench_function(name, |bencher| {
             bencher.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
@@ -168,7 +167,7 @@ fn main() {
                     let started = Instant::now();
                     let action = fixture.apply(&input);
                     elapsed += started.elapsed();
-                    validate(&action, &input);
+                    validate(action.as_ref(), &input);
                 }
                 elapsed
             });

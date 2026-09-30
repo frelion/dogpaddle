@@ -57,6 +57,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (checkpoint, records) = {
         let delivery = required_delivery(&mut connector)?;
         verify_fixture_record(&delivery, 1)?;
+        require(
+            connector.poll(Duration::ZERO).is_err(),
+            "live Delivery allowed a second poll",
+        )?;
         let checkpoint = delivery.checkpoint().as_bytes().to_vec();
         require(!checkpoint.is_empty(), "delivery checkpoint is empty")?;
         let records = snapshot(delivery.records());
@@ -73,9 +77,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         snapshot(repeated.records()) == records,
         "dropping a delivery changed its repeated records",
     )?;
-    repeated.ack()?;
-
     connector.stop(STOP_TIMEOUT)?;
+    require(
+        connector.ack(repeated).is_err(),
+        "stop did not invalidate the outstanding capability",
+    )?;
 
     let checkpoint = Checkpoint::from_bytes(checkpoint)?;
     let config = ConnectorConfig::new(ENGINE_NAME, CONNECTOR_CLASS)?;
@@ -86,7 +92,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         witness.checkpoint().as_bytes() != checkpoint.as_bytes(),
         "checkpoint restore witness did not advance the checkpoint",
     )?;
-    witness.ack()?;
+    require(
+        connector.ack(witness).is_err(),
+        "another Connector accepted a foreign capability",
+    )?;
+    let witness = required_delivery(&mut restored)?;
+    verify_fixture_record(&witness, 2)?;
+    restored.ack(witness)?;
     restored.stop(STOP_TIMEOUT)?;
 
     println!(
@@ -96,14 +108,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn required_delivery(connector: &mut Connector) -> Result<Delivery<'_>, Box<dyn Error>> {
+fn required_delivery(connector: &mut Connector) -> Result<Delivery, Box<dyn Error>> {
     connector
         .poll(POLL_TIMEOUT)?
         .ok_or_else(|| probe_error("lifecycle probe timed out before delivering a record"))
 }
 
 fn verify_fixture_record(
-    delivery: &Delivery<'_>,
+    delivery: &Delivery,
     expected_position: i64,
 ) -> Result<(), Box<dyn Error>> {
     let [record] = delivery.records() else {

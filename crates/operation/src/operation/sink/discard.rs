@@ -1,12 +1,11 @@
-use dogpaddle_store::TransactionAccess;
+use dogpaddle_store::{ReadTransactionAccess, TransactionAccess};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::{
     DefinitionCodecError,
     codec::decode_json_payload,
     definition::ConstructedOperation,
-    operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
+    operation::{OperationError, SinkOperation, SinkPending, SinkPrepared},
 };
 
 pub(crate) const TAG: u16 = 3;
@@ -19,21 +18,9 @@ pub struct DiscardDefinition {}
 
 /// Materialized sink that intentionally discards every input Change.
 ///
-/// Input completion remains durable because the owning Station acknowledges
-/// its Subscription in the same transaction as this Operation turn.
+/// Input completion remains durable because Flow advances the parent frame
+/// in the same transaction as this sink accepts the page.
 pub(crate) struct DiscardOperation;
-
-/// Discard-specific failure during one `DiscardOperation` turn.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum DiscardError {
-    /// Discard only accepts its definition's first input port.
-    #[error("discard does not accept input port {port}")]
-    InvalidInputPort {
-        /// Rejected zero-based port index.
-        port: usize,
-    },
-}
 
 #[expect(
     clippy::new_without_default,
@@ -49,24 +36,43 @@ impl DiscardDefinition {
 
 impl DiscardDefinition {
     pub(crate) fn construct_unchecked() -> ConstructedOperation {
-        ConstructedOperation::turn(None, DiscardOperation)
+        ConstructedOperation::sink(DiscardOperation)
     }
 }
 
-impl TurnOperation for DiscardOperation {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        let Some(input) = input else {
-            return Ok(Turn::Idle);
-        };
-        if input.port != 0 {
-            return Err(DiscardError::InvalidInputPort { port: input.port }.into());
-        }
-        Ok(Turn::ready(|_access: TransactionAccess<'_>| {
-            Ok((Action::Complete(None), AfterCommit::none()))
-        }))
+impl SinkOperation for DiscardOperation {
+    fn try_enqueue(
+        &mut self,
+        _access: TransactionAccess<'_>,
+        _page: &dogpaddle_change::Change,
+    ) -> Result<bool, OperationError> {
+        Ok(true)
+    }
+    fn load(
+        &mut self,
+        _access: ReadTransactionAccess<'_>,
+    ) -> Result<Option<SinkPending>, OperationError> {
+        Ok(None)
+    }
+    fn prepare(&mut self, _pending: SinkPending) -> Result<SinkPrepared, OperationError> {
+        unreachable!("discard has no pending delivery")
+    }
+    fn persist_prepared(
+        &self,
+        _access: TransactionAccess<'_>,
+        _prepared: &SinkPrepared,
+    ) -> Result<(), OperationError> {
+        unreachable!("discard has no prepared delivery")
+    }
+    fn deliver(&mut self, _prepared: &SinkPrepared) -> Result<(), OperationError> {
+        unreachable!("discard has no prepared delivery")
+    }
+    fn settle(
+        &mut self,
+        _access: TransactionAccess<'_>,
+        _prepared: &SinkPrepared,
+    ) -> Result<(), OperationError> {
+        unreachable!("discard has no prepared delivery")
     }
 }
 

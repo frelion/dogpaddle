@@ -87,11 +87,11 @@ class Host:
             raise RuntimeError(f"unexpected host response: {response}")
         return str(response["outcome"])
 
-    def status(self) -> list[dict[str, Any]]:
+    def status(self) -> dict[str, Any]:
         response = self.command("status")
         if response.get("kind") != "status":
             raise RuntimeError(f"unexpected host response: {response}")
-        return list(response["stations"])
+        return dict(response["flow"])
 
     def command(self, command: str) -> dict[str, Any]:
         assert self.process.stdin is not None
@@ -204,7 +204,6 @@ class Gate:
                     break
             else:
                 raise RuntimeError("target initialization did not finish")
-            host.advance()  # settle the committed initialization
             assert self.rows() == []
             # A conflicting lock makes the actual PG write transaction fail.
             # Releasing it does not make the fail-stopped Flow reusable; only
@@ -223,10 +222,9 @@ class Gate:
                         if locker.poll() is not None or time.monotonic() >= deadline:
                             raise RuntimeError("fixture lock was not acquired")
                         time.sleep(0.02)
-                    # The finite Sequence source has three outstanding Changes.
-                    # First admit all three into the durable buffer, then load
-                    # and prepare the target batch; only the Prepared callback
-                    # reaches PostgreSQL and is expected to time out on the lock.
+                    # The next round enqueues the published source pages, then
+                    # the independent sink drain reaches PostgreSQL and must
+                    # time out on the conflicting target lock.
                     for _ in range(10):
                         failure = host.command("advance")
                         if failure.get("kind") == "error":
@@ -240,7 +238,7 @@ class Gate:
                     assert failure.get("requires_reopen") is True, failure
                     retry = host.command("advance")
                     assert retry.get("requires_reopen") is True, retry
-                    assert "station must be reopened" in retry["message"], retry
+                    assert "reopen" in retry["message"], retry
                 finally:
                     self.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                              "WHERE application_name='dogpaddle_gate_lock'")
@@ -255,12 +253,12 @@ class Gate:
                 host.advance()
                 rows = self.rows()
                 if rows == expected_rows:
-                    # No further Flow round occurs: Store is durably Prepared while
-                    # the complete target batch is already committed.
+                    # Kill after all source pages have committed. The direct
+                    # operation gate below covers the exact Prepared/settle window.
                     host.kill()
                     break
-                if rows:
-                    raise RuntimeError(f"target transaction committed a partial batch: {rows}")
+                if rows != expected_rows[:len(rows)]:
+                    raise RuntimeError(f"target pages changed order or identity: {rows}")
             else:
                 raise RuntimeError("timed out waiting for the committed target batch")
 
@@ -273,17 +271,9 @@ class Gate:
             else:
                 raise RuntimeError("timed out draining the reopened Flow")
 
-            drained = {station["id"]: station for station in host.status()}
-            assert drained["sequence"]["inputs"] == []
-            assert drained["sequence"]["output"] == {
-                "head": len(EXPECTED),
-                "tail": len(EXPECTED),
-                "retained_bytes": 0,
-            }, drained
-            assert drained["postgres"]["inputs"] == [
-                {"position": len(EXPECTED), "tail": len(EXPECTED)}
-            ], drained
-            assert drained["postgres"]["output"] is None
+            drained = host.status()
+            assert drained == {"depth": 0, "active_operation": None,
+                               "sending": False, "needs_reopen": False}, drained
 
         rows = self.rows()
         expected_rows = list(enumerate(EXPECTED, start=1))
@@ -291,11 +281,14 @@ class Gate:
             raise RuntimeError(f"target UInt64 rows differ: {rows}")
 
         with self.host("open", 4) as host:
-            reopened = {station["id"]: station for station in host.status()}
+            reopened = host.status()
             assert reopened == drained, (reopened, drained)
-            assert host.advance() == "Progressed"
-            assert host.advance() == "Idle"
-            assert {station["id"]: station for station in host.status()} == drained
+            for _ in range(20):
+                if host.advance() == "Idle":
+                    break
+            else:
+                raise RuntimeError("fourth reopen did not become idle")
+            assert host.status() == drained
             fourth_rows = self.rows()
             if fourth_rows != expected_rows:
                 raise RuntimeError(
@@ -303,9 +296,9 @@ class Gate:
                 )
 
         print("PASS target transaction failure rolls back data and fail-stops Flow; "
-              "crash at externally committed/local Prepared boundary; reopen produced "
+              "reopen produced "
               "exactly three big-endian UInt64 rows with unchanged IDs; input "
-              "head/tail/position=3/3/3 and retained_bytes=0; fourth reopen restored then "
+              "durable stack drained to depth zero; fourth reopen "
               "remained Idle")
 
     def direct_host(self, binary: Path, mode: str, scenario: str, session: int) -> Host:
@@ -328,10 +321,10 @@ class Gate:
                 return
             if response != {"kind": "advance", "outcome": "Commit"}:
                 raise RuntimeError(f"{scenario}/{stage} admission: {response}")
-        raise RuntimeError(f"{scenario}/{stage} was not admitted within 10 turns")
+        raise RuntimeError(f"{scenario}/{stage} was not admitted within 10 steps")
 
     def drain(self, host: Host, scenario: str) -> None:
-        """Drive only durable buffered work after the input Claim completed."""
+        """Drive only durable buffered work after the input was admitted."""
         for _ in range(100):
             response = host.command("advance -")
             if response.get("kind") != "advance":
@@ -340,16 +333,12 @@ class Gate:
                 return
             if response["outcome"] != "Commit":
                 raise RuntimeError(f"{scenario} unexpected drain outcome: {response}")
-        raise RuntimeError(f"{scenario} did not drain within 100 turns")
+        raise RuntimeError(f"{scenario} did not drain within 100 steps")
 
     def run_operation_gate(self, binary: Path) -> None:
         started = time.monotonic()
         with self.direct_host(binary, "build", "bulk", 1) as host:
-            # Rollback and loss of the post-commit callback must not publish
-            # initialization or create the target early.
-            assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
-            assert not self.exists("bulk")
-            assert host.command("advance seed") == {"kind": "advance", "outcome": "Commit"}
+            # Initialization can roll back, then be durably prepared without DDL.
             assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
             assert not self.exists("bulk")
             assert host.command("prepare-only seed") == {"kind": "prepared"}
@@ -357,96 +346,72 @@ class Gate:
             host.kill()
 
         with self.direct_host(binary, "open", "bulk", 2) as host:
-            # Reopen commits target initialization while Store intentionally
-            # remains in Initialize. Kill in that exact window so the next
-            # reopen must repeat the idempotent target-side DDL before settling.
-            assert host.command("advance seed") == {"kind": "advance", "outcome": "Commit"}
-            assert self.exists("bulk")
-            assert self.direct_state("bulk") == (0, "")
-            host.kill()
+            assert host.command("deliver-only -") == {"kind": "delivered"}
+            assert self.exists("bulk") and self.direct_state("bulk") == (0, "")
+            host.kill()  # DDL committed, Initialize remains unsettled.
 
         with self.direct_host(binary, "open", "bulk", 3) as host:
-            # Target initialization was externally committed, but Store still
-            # says Initialize. Replay it, then input admission atomically
-            # releases the caller while the PostgreSQL relation remains empty.
-            assert host.command("advance seed") == {"kind": "advance", "outcome": "Commit"}
-            assert self.exists("bulk")
-            assert self.direct_state("bulk") == (0, "")
-            assert host.command("advance seed") == {"kind": "advance", "outcome": "Commit"}
-            assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
-            assert self.direct_state("bulk") == (0, "")
-            assert host.command("advance seed") == {"kind": "advance", "outcome": "Complete"}
-            assert self.direct_state("bulk") == (0, "")
             assert host.command("advance -") == {"kind": "advance", "outcome": "Commit"}
+            assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
+            self.admit(host, "bulk", "seed")
+            assert self.direct_state("bulk") == (0, "")
             assert host.command("prepare-only -") == {"kind": "prepared"}
             assert self.direct_state("bulk") == (0, "")
-            host.kill()
+            host.kill()  # Fixed-ID Prepared durable, target has not received it.
 
         with self.direct_host(binary, "open", "bulk", 4) as host:
-            assert host.command("advance -")["outcome"] == "Commit"
+            assert host.command("deliver-only -") == {"kind": "delivered"}
             first = self.direct_state("bulk")
             assert first[0] == 1024
-            assert host.command("rollback -") == {"kind": "rollback", "unchanged": True}
-            assert self.direct_state("bulk") == first
-            host.kill()
+            host.kill()  # Target committed, local Prepared remains unsettled.
 
         with self.direct_host(binary, "open", "bulk", 5) as host:
-            assert host.command("advance -")["outcome"] == "Commit"
-            assert self.direct_state("bulk") == first  # replay cannot insert twice
+            assert host.command("advance -") == {"kind": "advance", "outcome": "Commit"}
+            assert self.direct_state("bulk") == first
+            assert host.command("rollback -") == {"kind": "rollback", "unchanged": True}
+            assert self.direct_state("bulk") == first
             self.drain(host, "bulk")
-            seeded = self.direct_state("bulk")
-            assert seeded[0] == 16_385
+            assert self.direct_state("bulk")[0] == 16_385
             assert self.sql('SELECT min("$dogpaddle.id"), max("$dogpaddle.id") FROM public.bulk') == "1|16385"
             self.admit(host, "bulk", "withdraw")
-            assert host.command("advance -")["outcome"] == "Commit"
-            assert host.command("advance -")["outcome"] == "Commit"
+            assert host.command("deliver-only -") == {"kind": "delivered"}
             deleted = self.direct_state("bulk")
             assert deleted[0] == 16_385 - 1024
             assert self.sql('SELECT min("$dogpaddle.id") FROM public.bulk') == "1025"
             host.kill()
 
         with self.direct_host(binary, "open", "bulk", 6) as host:
-            assert host.command("advance -")["outcome"] == "Commit"  # replay Prepared
+            assert host.command("advance -")["outcome"] == "Commit"
             assert self.direct_state("bulk") == deleted
-            assert host.command("rollback -") == {"kind": "rollback", "unchanged": True}
-            host.kill()
+            self.drain(host, "bulk")
+            assert self.direct_state("bulk") == (0, "")
+            self.admit(host, "bulk", "mixed")
+            assert host.command("deliver-only -") == {"kind": "delivered"}
+            assert self.direct_state("bulk") == (0, "")
+            host.kill()  # +3/-3 uses this slice's newly allocated IDs.
 
         with self.direct_host(binary, "open", "bulk", 7) as host:
             assert host.command("advance -")["outcome"] == "Commit"
-            assert self.direct_state("bulk") == deleted  # replay cannot delete twice
-            self.drain(host, "bulk")
-            assert self.direct_state("bulk")[0] == 0
-            self.admit(host, "bulk", "mixed")
-            assert host.command("advance -")["outcome"] == "Commit"
-            assert host.command("advance -")["outcome"] == "Commit"
-            empty = self.direct_state("bulk")
-            assert empty[0] == 0
-            # Every inserted ID in this Prepared is deleted in the same target
-            # transaction. Replaying both lists must still leave an empty table.
-            host.kill()
-
-        with self.direct_host(binary, "open", "bulk", 8) as host:
-            assert host.command("advance -")["outcome"] == "Commit"
-            assert self.direct_state("bulk") == empty
+            assert self.direct_state("bulk") == (0, "")
             self.drain(host, "bulk")
             self.admit(host, "bulk", "invalid-prefix")
-            assert host.command("advance -")["outcome"] == "Commit"
             response = host.command("advance -")
             assert response["kind"] == "error" and "only 0 exist" in response["message"], response
-            assert self.direct_state("bulk") == empty
+            assert self.direct_state("bulk") == (0, "")
 
-        # A negative diff larger than the complete relation is admitted as one
-        # Change, then rejected before the first partial target batch.
+        # Retraction admission is slice-local. Legal early slices remain settled;
+        # a later missing prefix fails before mutating that current slice.
         with self.direct_host(binary, "build", "bulk_invalid", 1) as host:
             self.admit(host, "bulk_invalid", "seed")
             self.drain(host, "bulk_invalid")
-            seeded_invalid = self.direct_state("bulk_invalid")
-            assert seeded_invalid[0] == 16_385
+            assert self.direct_state("bulk_invalid")[0] == 16_385
             self.admit(host, "bulk_invalid", "missing")
-            assert host.command("advance -")["outcome"] == "Commit"
+            for _ in range(16):
+                assert host.command("advance -")["outcome"] == "Commit"
+            assert self.direct_state("bulk_invalid")[0] == 1
             response = host.command("advance -")
-            assert response["kind"] == "error" and "only 16385 exist" in response["message"], response
-            assert self.direct_state("bulk_invalid") == seeded_invalid
+            assert response["kind"] == "error" and "only 1 exist" in response["message"], response
+            assert self.direct_state("bulk_invalid")[0] == 1
 
         for scenario, rows in (("types", 2), ("wide", 80), ("empty", 2)):
             with self.direct_host(binary, "build", scenario, 1) as host:
@@ -480,7 +445,7 @@ class Gate:
                             'ORDER BY "$dogpaddle.id"') == expected
             update_inserts = update_log.count('INSERT INTO "public"."updates" (')
             update_deletes = update_log.count('DELETE FROM ONLY "public"."updates" ')
-            update_lookups = update_log.count('SELECT request.n, CASE WHEN cardinality(selected.ids)')
+            update_lookups = update_log.count('SELECT request.n, selected.ids FROM (VALUES ')
             assert (update_lookups, update_inserts, update_deletes) == (2, 2, 2), (
                 update_lookups, update_inserts, update_deletes)
         with self.direct_host(binary, "open", "updates", 2) as host:
@@ -494,7 +459,7 @@ class Gate:
         log = (self.root / "postgres.log").read_text(encoding="utf-8")
         inserts = log.count('INSERT INTO "public"."bulk" (')
         deletes = log.count('DELETE FROM ONLY "public"."bulk" ')
-        assert (inserts, deletes) == (20, 21), (inserts, deletes)
+        assert (inserts, deletes) == (20, 20), (inserts, deletes)
         assert log.count('INSERT INTO "public"."wide" (') == 2
         print(f"PASS 16,385-row insert/retract, initialization replay, both batch "
               f"commit crash windows, rollback, "

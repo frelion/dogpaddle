@@ -16,10 +16,7 @@ pub use data::{ScanDirection, ScanLimit};
 pub enum DataKind {
     Cell,
     OrderedMap,
-    OrderedMultiset,
-    PartitionedMultiset,
     Queue,
-    SubscribedLog,
 }
 
 /// Locates one data object in a particular [`Store`].

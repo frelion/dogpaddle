@@ -1,25 +1,15 @@
-use std::{num::NonZeroU64, ops::Range, path::Path, sync::Arc};
-
-use arrow_array::{Int64Array, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, SchemaBoundChangeCodec};
+use super::support::{run_until_idle, seed_source, values_change};
 use dogpaddle_flow::{AdvanceOutcome, FlowFactory};
 use dogpaddle_operation::{
-    OperationDefinition, col, lit,
+    col, lit,
     operation::{
         scan::SequenceScanDefinition,
         sink::SqliteSinkDefinition,
-        transform::{
-            EquiJoinDefinition, EquiJoinError, EquiJoinKind, FilterDefinition, SelectDefinition,
-        },
+        transform::{EquiJoinDefinition, EquiJoinKind, FilterDefinition, SelectDefinition},
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
 use rusqlite::{Connection, OpenFlags};
-
-use super::support::encode_output_entry;
-
-const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::MAX;
+use std::path::Path;
 const TABLE: &str = "events";
 
 #[test]
@@ -57,9 +47,6 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
         SqliteSinkDefinition::try_new(&sqlite_path, TABLE).unwrap(),
         [select],
     );
-    for station in [scan, extend, filter, select] {
-        factory.materialize(station, OUTPUT_CAPACITY_BYTES);
-    }
 
     let mut flow = factory.build().unwrap();
 
@@ -91,69 +78,46 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
 }
 
 #[test]
-fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batch() {
+fn a_sink_batch_settles_and_reopens_without_reusing_technical_ids() {
     let root = tempfile::tempdir().unwrap();
-    let flow_path = root.path().join("flow");
-    let sqlite_path = root.path().join("sink.sqlite");
-    drop(build_sqlite_flow(&flow_path, &sqlite_path));
-    drop(FlowFactory::new(&flow_path).open().unwrap());
-    assert!(!sqlite_path.exists(), "build/open must not create SQLite");
-
-    let change = multiplicity_change(7, 1_025);
-    let output_entry = encode_output_entry(&change);
-    let buffered_entry = SchemaBoundChangeCodec::try_new(change.schema())
-        .unwrap()
-        .encode(&change)
-        .unwrap();
-    publish_scan_change(&flow_path, &output_entry);
-    let mut prepared = None;
-
-    // Stop after the target transaction, before local settlement; reopen must
-    // replay the same fixed IDs without allocating or deleting another row.
-    for replay in 0..3 {
-        let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-        for _ in 0..16 {
-            assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-            if sqlite_rows(&sqlite_path) == Some(1_024) {
-                break;
-            }
-        }
-        drop(flow);
-        assert_eq!(sqlite_rows(&sqlite_path), Some(1_024), "replay {replay}");
-        let snapshot = sink_snapshot(&flow_path);
-        assert_eq!(snapshot.input_position, 1);
-        assert_eq!(snapshot.output_bounds, 1..1);
-        assert_eq!(
-            snapshot.encoded_entry.as_deref(),
-            Some(buffered_entry.as_slice())
-        );
-        assert!(snapshot.state.is_some());
-        if replay == 0 {
-            prepared = snapshot.state;
-        } else {
-            assert_eq!(snapshot.state, prepared);
-        }
-    }
-
-    let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-    let mut outcome = AdvanceOutcome::Progressed;
-    for _ in 0..16 {
-        outcome = flow.advance().unwrap();
-        if outcome == AdvanceOutcome::Idle {
+    let path = root.path().join("flow");
+    let target = root.path().join("target.sqlite");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX), []);
+    factory.operation(
+        "sink",
+        SqliteSinkDefinition::try_new(&target, TABLE).unwrap(),
+        [source],
+    );
+    drop(factory.build().unwrap());
+    seed_source(&path, 0, &values_change([7], 1025));
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    for _ in 0..4 {
+        flow.advance().unwrap();
+        if target.exists()
+            && sqlite_connection(&target)
+                .query_row("SELECT count(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 1024
+        {
             break;
         }
     }
-    assert_eq!(outcome, AdvanceOutcome::Idle);
     drop(flow);
-
-    let snapshot = sink_snapshot(&flow_path);
-    assert_eq!(snapshot.input_position, 1);
-    assert_eq!(snapshot.output_bounds, 1..1);
-    assert_eq!(snapshot.encoded_entry, None);
-    assert_ne!(snapshot.state, prepared);
-    let connection = sqlite_connection(&sqlite_path);
-    let rows = connection
-        .prepare("SELECT \"$dogpaddle.id\", value FROM events ORDER BY \"$dogpaddle.id\"")
+    assert_eq!(
+        sqlite_connection(&target)
+            .query_row("SELECT count(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1024
+    );
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    run_until_idle(&mut flow);
+    drop(flow);
+    let rows = sqlite_connection(&target)
+        .prepare("SELECT \"$dogpaddle.id\",value FROM events ORDER BY \"$dogpaddle.id\"")
         .unwrap()
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, decode_u64_blob(row.get(1)?)))
@@ -161,106 +125,87 @@ fn sqlite_sink_releases_input_after_buffering_and_replays_each_fixed_target_batc
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows, (1..=1_025).map(|id| (id, 7)).collect::<Vec<_>>());
-
-    let mut reopened = FlowFactory::new(&flow_path).open().unwrap();
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
-    assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Idle);
-    assert_eq!(sqlite_rows(&sqlite_path), Some(1_025));
+    assert_eq!(rows, (1..=1025).map(|id| (id, 7)).collect::<Vec<_>>());
+    for _ in 0..2 {
+        let mut flow = FlowFactory::new(&path).open().unwrap();
+        run_until_idle(&mut flow);
+    }
+    assert_eq!(
+        sqlite_connection(&target)
+            .query_row("SELECT count(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1025
+    );
 }
 
-fn build_sqlite_flow(flow_path: &Path, sqlite_path: &Path) -> dogpaddle_flow::Flow {
-    let mut factory = FlowFactory::new(flow_path);
-    let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
+#[test]
+fn a_late_join_error_preserves_delivered_pages_and_the_failed_position_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let target = root.path().join("target.sqlite");
+    let mut factory = FlowFactory::new(&path);
+    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
+    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
+    let join = factory.operation(
+        "join",
+        EquiJoinDefinition::try_new(
+            EquiJoinKind::Inner,
+            [(lit(0_u64), lit(0_u64))],
+            ["left_value", "right_value"],
+            Some((lit(1_u64) / col("left.value")).gt_eq(lit(0_u64))),
+        )
+        .unwrap(),
+        [left, right],
+    );
     factory.operation(
-        "sqlite",
-        SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
-        [scan],
+        "sink",
+        SqliteSinkDefinition::try_new(&target, TABLE).unwrap(),
+        [join],
     );
-    factory.materialize(scan, OUTPUT_CAPACITY_BYTES);
-
-    factory.build().unwrap()
-}
-
-fn multiplicity_change(value: u64, diff: i64) -> Change {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::UInt64,
-        false,
-    )]));
-    let records =
-        RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![value]))]).unwrap();
-    Change::try_new(records, Int64Array::from(vec![diff])).unwrap()
-}
-
-fn publish_scan_change(flow_path: &Path, encoded_change: &[u8]) {
-    let store = Store::open(flow_path).unwrap();
-    let position: Cell<u64> = store
-        .open_data("station/00000000/operation/00000000/sequence_scan.position")
-        .unwrap();
-    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let writer = output.writer();
-    let encoded_change = encoded_change.to_vec();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin();
-    position
-        .access(transaction.access())
-        .unwrap()
-        .set(&u64::MAX)
-        .unwrap();
-    assert!(
-        writer
-            .try_append(&encoded_change, NonZeroU64::MAX, transaction.access())
-            .unwrap()
+    drop(factory.build().unwrap());
+    seed_source(&path, 0, &values_change(1..=128, 1));
+    seed_source(&path, 1, &values_change((1..=512).chain([0]), 1));
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    let message = (0..2000)
+        .find_map(|_| {
+            flow.advance().err().map(|error| {
+                assert!(!error.requires_reopen());
+                error.to_string()
+            })
+        })
+        .expect("last invalid event must fail");
+    let status = flow.status().unwrap();
+    assert!(status.depth > 0);
+    drop(flow);
+    let rows = sqlite_join_rows(&target);
+    assert!(!rows.is_empty());
+    assert!(rows.len() <= 512 * 128);
+    assert_eq!(
+        rows.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        rows.len()
     );
-    transaction.commit().unwrap();
-}
-
-#[derive(Debug)]
-struct SinkSnapshot {
-    input_position: u64,
-    output_bounds: Range<u64>,
-    encoded_entry: Option<Vec<u8>>,
-    state: Option<Vec<u8>>,
-}
-
-fn sink_snapshot(flow_path: &Path) -> SinkSnapshot {
-    let store = Store::open(flow_path).unwrap();
-    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let writer = output.writer();
-    let input = output.subscription(0);
-    let sink_state: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/sink.control")
-        .unwrap();
-    let sink_buffer: OrderedMap<u64, Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/sink.buffer")
-        .unwrap();
-    let transaction = store.read_transaction();
-    let access = transaction.access();
-    let input_status = input.status(access).unwrap();
-    let output_status = writer.status(access).unwrap();
-    SinkSnapshot {
-        input_position: input_status.position,
-        output_bounds: output_status.head..output_status.tail,
-        encoded_entry: sink_buffer.read(access).unwrap().get(&0).unwrap(),
-        state: sink_state.read(access).unwrap().get().unwrap(),
+    for _ in 0..2 {
+        let mut flow = FlowFactory::new(&path).open().unwrap();
+        assert_eq!(flow.status().unwrap(), status);
+        assert_eq!(flow.advance().unwrap_err().to_string(), message);
+        drop(flow);
+        assert_eq!(sqlite_join_rows(&target), rows);
     }
 }
-
-fn sqlite_object_count(sqlite_path: &Path) -> i64 {
-    sqlite_connection(sqlite_path)
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name IN (?1, ?2)",
-            [TABLE, "$dogpaddle.hash_index.events"],
-            |row| row.get(0),
-        )
+fn sqlite_join_rows(path: &Path) -> Vec<(u64, u64)> {
+    sqlite_connection(path)
+        .prepare("SELECT left_value,right_value FROM events ORDER BY \"$dogpaddle.id\"")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((decode_u64_blob(row.get(0)?), decode_u64_blob(row.get(1)?)))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
-
-fn sqlite_row_count(sqlite_path: &Path) -> i64 {
-    sqlite_connection(sqlite_path)
-        .query_row("SELECT COUNT(*) FROM \"events\"", [], |row| row.get(0))
-        .unwrap()
+fn sqlite_connection(path: &Path) -> Connection {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
 }
 
 fn sqlite_u64_rows(sqlite_path: &Path) -> Vec<(i64, u64, u64, i64)> {
@@ -290,249 +235,4 @@ fn sqlite_u64_rows(sqlite_path: &Path) -> Vec<(i64, u64, u64, i64)> {
 
 fn decode_u64_blob(value: Vec<u8>) -> u64 {
     u64::from_be_bytes(value.try_into().expect("UInt64 uses an 8-byte BLOB"))
-}
-
-fn sqlite_rows(sqlite_path: &Path) -> Option<i64> {
-    sqlite_path
-        .exists()
-        .then(|| sqlite_object_count(sqlite_path))
-        .filter(|count| *count == 2)
-        .map(|_| sqlite_row_count(sqlite_path))
-}
-
-fn sqlite_connection(sqlite_path: &Path) -> Connection {
-    Connection::open_with_flags(sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
-}
-
-#[test]
-fn late_join_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_page() {
-    exercise_late_join_failure(false);
-}
-
-#[test]
-fn late_asof_failure_preserves_delivered_sqlite_rows_and_reopens_at_the_failed_page() {
-    exercise_late_join_failure(true);
-}
-
-fn exercise_late_join_failure(asof: bool) {
-    const RIGHT_ROWS: u64 = 4_096;
-    let root = tempfile::tempdir().unwrap();
-    let flow_path = root.path().join("join-flow");
-    let sqlite_path = root.path().join("join.sqlite");
-    build_failing_join_flow(&flow_path, &sqlite_path, asof);
-
-    // Seed the right relation before admitting the driving Claim. Both genuine
-    // SequenceScan sources are exhausted; only the published fixture inputs run.
-    publish_join_input(&flow_path, 1, 0..if asof { 1 } else { RIGHT_ROWS });
-    let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-    let mut idle = false;
-    for _ in 0..128 {
-        if flow.advance().unwrap() == AdvanceOutcome::Idle {
-            idle = true;
-            break;
-        }
-    }
-    assert!(idle, "right-side seeding did not finish");
-    drop(flow);
-    let driving = if asof {
-        (1..=RIGHT_ROWS).chain([0]).collect::<Vec<_>>()
-    } else {
-        vec![1, 0]
-    };
-    publish_join_input(&flow_path, 0, driving);
-
-    // The successful prefix emits enough bounded pages for the real sink to
-    // publish a target transaction. The final row divides by zero.
-    let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-    let mut failed = false;
-    let mut failure_message = String::new();
-    for _ in 0..128 {
-        let before = flow.status().unwrap();
-        if let Err(error) = flow.advance() {
-            assert_eq!(error.station_id(), "join");
-            let mut source: &(dyn std::error::Error + 'static) = &error;
-            while source.downcast_ref::<EquiJoinError>().is_none()
-                && source
-                    .downcast_ref::<dogpaddle_operation::operation::transform::AsOfJoinError>()
-                    .is_none()
-            {
-                source = source
-                    .source()
-                    .expect("Join failure retains its error chain");
-            }
-            assert!(matches!(
-                source.downcast_ref::<EquiJoinError>(),
-                Some(EquiJoinError::ResidualExpression { .. })
-            ) || matches!(source.downcast_ref::<dogpaddle_operation::operation::transform::AsOfJoinError>(), Some(dogpaddle_operation::operation::transform::AsOfJoinError::ResidualExpression { .. })));
-            failure_message = error.to_string();
-            let after = flow.status().unwrap();
-            assert_eq!(after[2].inputs, before[2].inputs);
-            assert_eq!(after[2].output, before[2].output);
-            assert_eq!(after[2].active_input, before[2].active_input);
-            failed = true;
-            break;
-        }
-    }
-    assert!(failed, "the late residual error was not reached");
-    let suspended = flow.status().unwrap();
-    assert_eq!(suspended[2].active_input, Some(0));
-    assert_eq!(suspended[2].inputs[0].position, 0);
-    assert_eq!(suspended[2].inputs[0].tail, 1);
-    assert!(suspended[2].output.as_ref().unwrap().tail > 1);
-    let delivered = sqlite_join_rows(&sqlite_path);
-    assert!(!delivered.is_empty(), "earlier output never reached SQLite");
-    assert!(delivered.len() <= usize::try_from(RIGHT_ROWS).unwrap());
-    assert!(delivered.iter().all(|&(left, right)| if asof {
-        (1..=RIGHT_ROWS).contains(&left) && right == 0
-    } else {
-        left == 1 && right < RIGHT_ROWS
-    }));
-    assert_eq!(
-        delivered
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        delivered.len(),
-        "the target contains duplicate Join output"
-    );
-    drop(flow);
-    let continuation =
-        join_continuation(&flow_path, asof).expect("unfinished Claim retains its cursor");
-
-    for _ in 0..2 {
-        let mut reopened = FlowFactory::new(&flow_path).open().unwrap();
-        let restored = reopened.status().unwrap();
-        assert_eq!(restored[2].inputs, suspended[2].inputs);
-        assert_eq!(restored[2].output, suspended[2].output);
-        assert_eq!(restored[2].active_input, suspended[2].active_input);
-        let error = reopened.advance().unwrap_err();
-        assert_eq!(error.station_id(), "join");
-        assert_eq!(error.to_string(), failure_message);
-        let after = reopened.status().unwrap();
-        assert_eq!(after[2].inputs, restored[2].inputs);
-        assert_eq!(after[2].output, restored[2].output);
-        assert_eq!(after[3].inputs, restored[3].inputs);
-        drop(reopened);
-        assert_eq!(
-            join_continuation(&flow_path, asof).as_ref(),
-            Some(&continuation)
-        );
-        assert_eq!(sqlite_join_rows(&sqlite_path), delivered);
-    }
-}
-
-fn build_failing_join_flow(flow_path: &Path, sqlite_path: &Path, asof: bool) {
-    use dogpaddle_operation::operation::transform::{
-        AsOfDirection, AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieFallback,
-    };
-    let mut factory = FlowFactory::new(flow_path);
-    let left = factory.operation("left", SequenceScanDefinition::new(u64::MAX), []);
-    let right = factory.operation("right", SequenceScanDefinition::new(u64::MAX), []);
-    let join = factory.operation(
-        "join",
-        if asof {
-            OperationDefinition::from(
-                AsOfJoinDefinition::try_new(
-                    AsOfJoinKind::Inner,
-                    AsOfDirection::Backward { allow_exact: true },
-                    [],
-                    [AsOfOrderKey::new(col("value"), col("value"))],
-                    [],
-                    AsOfTieFallback::CanonicalAscending,
-                    None,
-                    ["left_value", "right_value"],
-                    Some((lit(1_u64) / col("left.value")).gt_eq(lit(0_u64))),
-                )
-                .unwrap(),
-            )
-        } else {
-            OperationDefinition::from(
-                EquiJoinDefinition::try_new(
-                    EquiJoinKind::Inner,
-                    [(lit(0_u64), lit(0_u64))],
-                    ["left_value", "right_value"],
-                    Some((lit(1_u64) / col("left.value")).gt(lit(0_u64))),
-                )
-                .unwrap(),
-            )
-        },
-        [left, right],
-    );
-    factory.operation(
-        "sqlite",
-        SqliteSinkDefinition::try_new(sqlite_path, TABLE).unwrap(),
-        [join],
-    );
-    drop(factory.build().unwrap());
-}
-
-fn publish_join_input(flow_path: &Path, station: usize, values: impl IntoIterator<Item = u64>) {
-    let values = values.into_iter().collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::UInt64,
-        false,
-    )]));
-    let row_count = values.len();
-    let records = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(values))]).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![1; row_count])).unwrap();
-    let encoded = encode_output_entry(&change);
-    let store = Store::open(flow_path).unwrap();
-    let positions = (0..2)
-        .map(|index| {
-            store
-                .open_data::<Cell<u64>>(&format!(
-                    "station/{index:08x}/operation/00000000/sequence_scan.position"
-                ))
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let output: SubscribedLog<Vec<u8>> = store
-        .open_data(&format!("station/{station:08x}/output"))
-        .unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin();
-    for position in positions {
-        position
-            .access(transaction.access())
-            .unwrap()
-            .set(&u64::MAX)
-            .unwrap();
-    }
-    assert!(
-        output
-            .writer()
-            .try_append(&encoded, NonZeroU64::MAX, transaction.access())
-            .unwrap()
-    );
-    transaction.commit().unwrap();
-}
-
-fn join_continuation(flow_path: &Path, asof: bool) -> Option<Vec<u8>> {
-    let store = Store::open(flow_path).unwrap();
-    let continuation: Cell<Vec<u8>> = store
-        .open_data(if asof {
-            "station/00000002/operation/00000000/asof_join.continuation"
-        } else {
-            "station/00000002/operation/00000000/equi_join.continuation"
-        })
-        .unwrap();
-    let transaction = store.read_transaction();
-    continuation
-        .read(transaction.access())
-        .unwrap()
-        .get()
-        .unwrap()
-}
-
-fn sqlite_join_rows(path: &Path) -> Vec<(u64, u64)> {
-    sqlite_connection(path)
-        .prepare("SELECT left_value, right_value FROM events ORDER BY \"$dogpaddle.id\"")
-        .unwrap()
-        .query_map([], |row| {
-            Ok((decode_u64_blob(row.get(0)?), decode_u64_blob(row.get(1)?)))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
 }

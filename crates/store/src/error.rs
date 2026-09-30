@@ -69,13 +69,6 @@ pub enum StoreError {
     #[error("multiset multiplicity overflow")]
     MultiplicityOverflow,
 
-    /// Persisted multiset bytes violate its positive-multiplicity invariant.
-    #[error("multiset is corrupt: {reason}")]
-    CorruptMultiset {
-        /// Violated invariant.
-        reason: &'static str,
-    },
-
     /// A non-empty queue has consumed every representable private sequence number.
     #[error("queue has exhausted its sequence number space")]
     QueueSequenceExhausted,
@@ -87,61 +80,6 @@ pub enum StoreError {
     /// Persisted queue metadata and entries violate the FIFO invariants.
     #[error("queue is corrupt: {reason}")]
     CorruptQueue {
-        /// Violated invariant.
-        reason: &'static str,
-    },
-
-    /// A persisted fixed subscriber count differs from its owning definition.
-    #[error("subscribed log has {actual} subscribers, but {expected} were expected")]
-    SubscriberCountMismatch {
-        /// Count derived from the owning definition.
-        expected: u64,
-        /// Count stored with the log.
-        actual: u64,
-    },
-
-    /// A requested subscriber is outside a log's fixed subscriber set.
-    #[error(
-        "subscriber {subscriber} is outside subscribed log subscriber count {subscriber_count}"
-    )]
-    SubscriberOutOfRange {
-        /// Requested subscriber identity.
-        subscriber: u64,
-        /// Fixed number of subscribers in the log.
-        subscriber_count: u64,
-    },
-
-    /// An acknowledgement does not identify the subscriber's current entry.
-    #[error("subscriber {subscriber} expected offset {actual}, not acknowledged offset {expected}")]
-    SubscriptionPositionMismatch {
-        /// Subscriber being acknowledged.
-        subscriber: u64,
-        /// Offset supplied by the caller.
-        expected: u64,
-        /// Subscriber's durable current position.
-        actual: u64,
-    },
-
-    /// A caught-up subscriber has no entry to acknowledge.
-    #[error("subscriber {subscriber} is already caught up at log tail {tail}")]
-    SubscriptionAtTail {
-        /// Subscriber being acknowledged.
-        subscriber: u64,
-        /// Current exclusive log tail.
-        tail: u64,
-    },
-
-    /// A subscribed log has consumed every representable stable offset.
-    #[error("subscribed log has exhausted its offset space")]
-    SubscribedLogOffsetExhausted,
-
-    /// A subscribed log cannot represent its retained logical byte count.
-    #[error("subscribed log has exhausted its retained-byte counter")]
-    SubscribedLogRetainedBytesExhausted,
-
-    /// Persisted subscribed-log metadata, positions, and entries disagree.
-    #[error("subscribed log is corrupt: {reason}")]
-    CorruptSubscribedLog {
         /// Violated invariant.
         reason: &'static str,
     },

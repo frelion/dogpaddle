@@ -1506,20 +1506,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dogpaddle-change-store-integration"
-version = "0.2.3"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "criterion",
- "dogpaddle-change",
- "dogpaddle-perf-context",
- "dogpaddle-store",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "dogpaddle-debezium"
 version = "0.2.3"
 dependencies = [

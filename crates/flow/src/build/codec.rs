@@ -1,70 +1,52 @@
-use std::{collections::HashMap, num::NonZeroU64};
-
+use super::{
+    definition::{FlowDefinition, OperationNode},
+    validate::{self, ResolvedTopology, TopologyError},
+};
 use dogpaddle_operation::{decode_definition, encode_definition};
 use thiserror::Error;
-
-use super::{
-    definition::{FlowDefinition, StationDefinition},
-    validate::{ResolvedTopology, TopologyError, validate_decoded_topology, validate_station_ids},
-};
 
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
 const FORMAT_VERSION: u16 = 1;
 pub(super) const CHECKSUM_LENGTH: usize = size_of::<u32>();
 const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
 pub(crate) const DEFINITION_DATA_NAME: &str = "flow/definition";
+pub(super) const MAX_DEFINITION_BYTES: usize = 8 * 1024 * 1024;
 
-/// Failure while encoding or decoding a durable Flow definition.
+/// Failure while encoding or decoding the sole logical DAG.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum FlowDefinitionError {
-    /// The encoded definition ends before all declared fields are present.
+    /// A declared field is incomplete.
     #[error("flow definition is truncated")]
     Truncated,
-    /// The encoded bytes do not begin with the `DogPaddle` Flow marker.
+    /// The format marker is invalid.
     #[error("flow definition marker is invalid")]
     InvalidMagic,
-    /// The Flow definition format version is unsupported.
-    #[error("unsupported flow definition format version {0}")]
+    /// The development format version is unsupported.
+    #[error("unsupported flow definition version {0}")]
     UnsupportedVersion(u16),
-    /// A station or input ID is not valid UTF-8.
-    #[error("flow definition contains an invalid UTF-8 station ID")]
+    /// An ID is not valid UTF-8.
+    #[error("flow definition contains invalid UTF-8")]
     InvalidUtf8,
-    /// A length cannot be represented by the durable format.
-    #[error("{0} is too large for the flow definition format")]
+    /// A field exceeds the bounded format.
+    #[error("{0} exceeds the flow definition limit")]
     LengthOverflow(&'static str),
-    /// The owner-identity presence discriminator is outside the canonical domain.
-    #[error("flow definition contains invalid owner identity presence {0}")]
+    /// The identity discriminator is noncanonical.
+    #[error("invalid owner identity presence {0}")]
     InvalidOwnerIdentityPresence(u8),
-    /// The output-presence discriminator is outside the canonical domain.
-    #[error("flow definition contains invalid output presence {0}")]
-    InvalidOutputPresence(u8),
-    /// A present output must declare a nonzero retained-byte capacity.
-    #[error("flow definition contains a zero output capacity")]
-    ZeroOutputCapacity,
-    /// An input ID does not identify a declared station.
-    #[error("station {station:?} references unknown input {input_id:?}")]
-    UnknownInput {
-        /// Station containing the invalid input reference.
-        station: String,
-        /// Missing input ID.
-        input_id: String,
-    },
-    /// One Operation definition is invalid or unsupported.
-    #[error("station {station_id:?} operation {operation} definition is invalid: {source}")]
+    /// A concrete Operation definition is invalid.
+    #[error("operation {operation_id:?} definition is invalid: {source}")]
     Operation {
-        /// Stable ID of the Station containing the Operation.
-        station_id: String,
-        /// Zero-based Operation ordinal.
-        operation: usize,
-        /// Operation codec failure.
+        /// Stable Operation ID.
+        operation_id: String,
+        /// Concrete codec failure.
         #[source]
         source: dogpaddle_operation::DefinitionCodecError,
     },
-    /// The persisted checksum does not match the definition bytes.
-    #[error("flow definition checksum does not match its contents")]
+    /// The integrity checksum does not match.
+    #[error("flow definition checksum does not match")]
     IntegrityMismatch,
-    /// The decoded graph violates topology rules.
+    /// The graph is invalid.
     #[error(transparent)]
     Topology(#[from] TopologyError),
     /// Bytes remain after the complete definition.
@@ -72,174 +54,110 @@ pub enum FlowDefinitionError {
     TrailingBytes,
 }
 
-pub(crate) fn station_active_input_name(index: usize) -> String {
-    format!("station/{index:08x}/active-input")
-}
-
-pub(crate) fn station_output_name(index: usize) -> String {
-    format!("station/{index:08x}/output")
-}
-
-pub(crate) fn station_operation_prefix(station: usize, operation: usize) -> String {
-    format!("station/{station:08x}/operation/{operation:08x}")
+pub(crate) fn operation_prefix(index: usize) -> String {
+    format!("operation/{index:08x}")
 }
 
 pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinitionError> {
-    let station_count = u32::try_from(definition.stations().len())
-        .map_err(|_| FlowDefinitionError::LengthOverflow("station count"))?;
     let mut encoded = Vec::new();
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-    if let Some(identity) = definition.owner_identity() {
+    if let Some(identity) = definition.owner_identity {
         encoded.push(1);
         encoded.extend_from_slice(&identity);
     } else {
         encoded.push(0);
     }
-    encoded.extend_from_slice(&station_count.to_be_bytes());
-
-    for station in definition.stations() {
-        encode_string(&mut encoded, station.id(), "station ID")?;
-        let operation_count = u32::try_from(station.operations().len())
-            .map_err(|_| FlowDefinitionError::LengthOverflow("operation count"))?;
-        encoded.extend_from_slice(&operation_count.to_be_bytes());
-        for operation in station.operations() {
-            let operation = encode_definition(operation);
-            encode_bytes(&mut encoded, &operation, "operation definition")?;
-        }
-        let input_count = u32::try_from(station.inputs().len())
+    let count = u32::try_from(definition.operations.len())
+        .map_err(|_| FlowDefinitionError::LengthOverflow("operation count"))?;
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for node in &definition.operations {
+        encode_string(&mut encoded, &node.id, "operation ID")?;
+        encode_bytes(
+            &mut encoded,
+            &encode_definition(&node.definition),
+            "operation definition",
+        )?;
+        let count = u32::try_from(node.inputs.len())
             .map_err(|_| FlowDefinitionError::LengthOverflow("input count"))?;
-        encoded.extend_from_slice(&input_count.to_be_bytes());
-        for input in station.inputs() {
-            encode_string(&mut encoded, input, "input ID")?;
-        }
-        if let Some(capacity) = station.output_capacity_bytes() {
-            encoded.push(1);
-            encoded.extend_from_slice(&capacity.get().to_be_bytes());
-        } else {
-            encoded.push(0);
+        encoded.extend_from_slice(&count.to_be_bytes());
+        for &input in &node.inputs {
+            let input = u32::try_from(input)
+                .map_err(|_| FlowDefinitionError::LengthOverflow("input ordinal"))?;
+            encoded.extend_from_slice(&input.to_be_bytes());
         }
     }
-    let checksum = crc32(&encoded);
-    encoded.extend_from_slice(&checksum.to_be_bytes());
+    if encoded.len() > MAX_DEFINITION_BYTES - CHECKSUM_LENGTH {
+        return Err(FlowDefinitionError::LengthOverflow("definition"));
+    }
+    encoded.extend_from_slice(&crc32(&encoded).to_be_bytes());
     Ok(encoded)
 }
 
 pub(crate) fn decode(
     encoded: &[u8],
 ) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
+    if encoded.len() > MAX_DEFINITION_BYTES {
+        return Err(FlowDefinitionError::LengthOverflow("definition"));
+    }
     if encoded.len() < MAGIC.len() {
         return Err(FlowDefinitionError::Truncated);
     }
     if &encoded[..MAGIC.len()] != MAGIC {
         return Err(FlowDefinitionError::InvalidMagic);
     }
-    if encoded.len()
-        < MAGIC.len() + size_of::<u16>() + size_of::<u8>() + size_of::<u32>() + CHECKSUM_LENGTH
-    {
+    if encoded.len() < MAGIC.len() + 2 + 1 + 4 + CHECKSUM_LENGTH {
         return Err(FlowDefinitionError::Truncated);
     }
-
-    let checksum_offset = encoded.len() - CHECKSUM_LENGTH;
-    let (definition, encoded_checksum) = encoded.split_at(checksum_offset);
-    let expected_checksum = u32::from_be_bytes(
-        encoded_checksum
-            .try_into()
-            .expect("checksum slice has a fixed length"),
-    );
-    if crc32(definition) != expected_checksum {
+    let (payload, checksum) = encoded.split_at(encoded.len() - CHECKSUM_LENGTH);
+    if crc32(payload) != u32::from_be_bytes(checksum.try_into().expect("fixed checksum")) {
         return Err(FlowDefinitionError::IntegrityMismatch);
     }
-
-    let mut cursor = Cursor::new(&definition[MAGIC.len()..]);
+    let mut cursor = Cursor::new(&payload[MAGIC.len()..]);
     let version = cursor.read_u16()?;
     if version != FORMAT_VERSION {
         return Err(FlowDefinitionError::UnsupportedVersion(version));
     }
-
     let owner_identity = match cursor.read_u8()? {
         0 => None,
         1 => Some(cursor.take::<32>()?),
-        presence => {
-            return Err(FlowDefinitionError::InvalidOwnerIdentityPresence(presence));
-        }
+        tag => return Err(FlowDefinitionError::InvalidOwnerIdentityPresence(tag)),
     };
-    let station_count = cursor.read_u32()?;
-    let mut stations = Vec::new();
-    for _ in 0..station_count {
+    let count = cursor.read_u32()? as usize;
+    if count > validate::MAX_OPERATIONS {
+        return Err(FlowDefinitionError::LengthOverflow("operation count"));
+    }
+    let mut operations = Vec::with_capacity(count);
+    for _ in 0..count {
         let id = cursor.read_string()?;
-        let operation_count = cursor.read_u32()?;
-        let mut operations = Vec::new();
-        for operation in 0..operation_count {
-            let operation =
-                usize::try_from(operation).expect("a u32 Operation ordinal fits supported targets");
-            operations.push(decode_definition(cursor.read_bytes()?).map_err(|source| {
-                FlowDefinitionError::Operation {
-                    station_id: id.clone(),
-                    operation,
-                    source,
-                }
-            })?);
-        }
-        let input_count = cursor.read_u32()?;
-        let mut inputs = Vec::new();
-        for _ in 0..input_count {
-            inputs.push(cursor.read_string()?);
-        }
-        let output_capacity_bytes = match cursor.read_u8()? {
-            0 => None,
-            1 => {
-                let capacity = NonZeroU64::new(cursor.read_u64()?)
-                    .ok_or(FlowDefinitionError::ZeroOutputCapacity)?;
-                Some(capacity)
+        let definition = decode_definition(cursor.read_bytes()?).map_err(|source| {
+            FlowDefinitionError::Operation {
+                operation_id: id.clone(),
+                source,
             }
-            presence => return Err(FlowDefinitionError::InvalidOutputPresence(presence)),
-        };
-        stations.push(StationDefinition {
+        })?;
+        let count = cursor.read_u32()? as usize;
+        if count > validate::MAX_OPERATIONS {
+            return Err(FlowDefinitionError::LengthOverflow("input count"));
+        }
+        let inputs = (0..count)
+            .map(|_| cursor.read_u32().map(|input| input as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        operations.push(OperationNode {
             id,
-            operations,
-            output_capacity_bytes,
+            definition,
             inputs,
         });
     }
     if !cursor.is_empty() {
         return Err(FlowDefinitionError::TrailingBytes);
     }
-
-    validate_definition(owner_identity, stations)
-}
-
-fn validate_definition(
-    owner_identity: Option<[u8; 32]>,
-    stations: Vec<StationDefinition>,
-) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
-    validate_station_ids(&stations)?;
-    let inputs_by_station = {
-        let ids = stations
-            .iter()
-            .enumerate()
-            .map(|(index, station)| (station.id.as_str(), index))
-            .collect::<HashMap<_, _>>();
-        stations
-            .iter()
-            .map(|station| {
-                station
-                    .inputs
-                    .iter()
-                    .map(|input| {
-                        ids.get(input.as_str()).copied().ok_or_else(|| {
-                            FlowDefinitionError::UnknownInput {
-                                station: station.id.clone(),
-                                input_id: input.clone(),
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?
+    let definition = FlowDefinition {
+        owner_identity,
+        operations,
     };
-    let topology = validate_decoded_topology(&stations, inputs_by_station)?;
-    Ok((FlowDefinition::new(owner_identity, stations), topology))
+    let topology = validate::resolve(&definition)?;
+    Ok((definition, topology))
 }
 
 fn encode_string(
@@ -297,10 +215,6 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32, FlowDefinitionError> {
         Ok(u32::from_be_bytes(self.take::<4>()?))
-    }
-
-    fn read_u64(&mut self) -> Result<u64, FlowDefinitionError> {
-        Ok(u64::from_be_bytes(self.take::<8>()?))
     }
 
     fn read_bytes(&mut self) -> Result<&'a [u8], FlowDefinitionError> {

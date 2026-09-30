@@ -1,12 +1,11 @@
 use std::borrow::Cow;
 
-use dogpaddle_store::{Cell, CodecError, OrderedMap, PartitionedMultiset, StoreValue};
+use dogpaddle_store::{CodecError, OrderedMap, PartitionKey, StoreValue};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::EquiJoinError;
 
-pub(super) type Rows = PartitionedMultiset<Vec<u8>, Vec<u8>>;
-pub(super) type Continuation = Cell<JoinContinuation>;
+pub(super) type Rows = OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, std::num::NonZeroU64>;
 pub(super) type Counts = OrderedMap<Vec<u8>, KeyCounts>;
 pub(super) type MatchCounts = OrderedMap<Vec<u8>, u64>;
 
@@ -79,63 +78,16 @@ impl StoreValue for KeyCounts {
     }
 }
 
-const VERSION: u8 = 1;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(super) struct JoinContinuation {
-    pub(super) port: u8,
-    pub(super) row: u64,
+pub(crate) struct JoinCursor {
     pub(super) found_match: bool,
     #[serde(deserialize_with = "decode_optional_bytes")]
     pub(super) resume_after: Option<Vec<u8>>,
 }
-
 fn decode_optional_bytes<'de, D: Deserializer<'de>>(
     decoder: D,
 ) -> Result<Option<Vec<u8>>, D::Error> {
     Option::<&[u8]>::deserialize(decoder).map(|value| value.map(ToOwned::to_owned))
-}
-
-impl StoreValue for JoinContinuation {
-    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
-        if self.port > 1 {
-            return Err(CodecError::new("equi-join continuation port is invalid"));
-        }
-        bincode::serde::encode_to_vec(
-            (VERSION, self),
-            bincode::config::standard()
-                .with_big_endian()
-                .with_variable_int_encoding()
-                .with_limit::<{ isize::MAX as usize }>(),
-        )
-        .map_err(|_| CodecError::new("equi-join continuation cannot be encoded"))
-    }
-
-    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
-        if bytes.first() != Some(&VERSION) {
-            return Err(CodecError::new(
-                "unsupported equi-join continuation version",
-            ));
-        }
-        if bytes.get(1).is_none_or(|port| *port > 1) {
-            return Err(CodecError::new("equi-join continuation port is invalid"));
-        }
-        let ((_, state), consumed): ((u8, Self), usize) = bincode::serde::borrow_decode_from_slice(
-            bytes.as_ref(),
-            bincode::config::standard()
-                .with_big_endian()
-                .with_variable_int_encoding()
-                .with_limit::<{ isize::MAX as usize }>(),
-        )
-        .map_err(|_| CodecError::new("equi-join continuation is invalid"))?;
-        if consumed != bytes.len() {
-            return Err(CodecError::new("equi-join continuation has trailing bytes"));
-        }
-        if state.encode_value()?.as_ref() != bytes.as_ref() {
-            return Err(CodecError::new("equi-join continuation is non-canonical"));
-        }
-        Ok(state)
-    }
 }
 
 #[cfg(test)]
@@ -185,42 +137,6 @@ mod tests {
             KeyCounts([u64::MAX, 0]).adjust(0, 0, 1),
             Err(EquiJoinError::KeyCountOverflow)
         ));
-    }
-
-    #[test]
-    fn continuation_codec_is_strict_and_round_trips_empty_resume_key() {
-        let state = JoinContinuation {
-            port: 1,
-            row: 7,
-            found_match: true,
-            resume_after: Some(Vec::new()),
-        };
-        let encoded = state.encode_value().unwrap().as_ref().to_vec();
-        assert_eq!(encoded, [1, 1, 7, 1, 1, 0]);
-        assert_eq!(
-            JoinContinuation::decode_value(Cow::Borrowed(&encoded)).unwrap(),
-            state
-        );
-        for length in 0..encoded.len() {
-            assert!(JoinContinuation::decode_value(Cow::Borrowed(&encoded[..length])).is_err());
-        }
-        for index in [0, 1, 3, 4] {
-            let mut invalid = encoded.clone();
-            invalid[index] = u8::MAX;
-            assert!(JoinContinuation::decode_value(Cow::Borrowed(&invalid)).is_err());
-        }
-        let mut overlong_row = vec![1, 1, 251, 0, 7];
-        overlong_row.extend_from_slice(&encoded[3..]);
-        assert!(JoinContinuation::decode_value(Cow::Borrowed(&overlong_row)).is_err());
-        let mut huge_resume_key = vec![1, 1, 7, 1, 1, 253];
-        huge_resume_key.extend_from_slice(&[255; 8]);
-        assert!(JoinContinuation::decode_value(Cow::Borrowed(&huge_resume_key)).is_err());
-        let mut invalid_version = encoded.clone();
-        invalid_version[0] = u8::MAX;
-        assert!(JoinContinuation::decode_value(Cow::Borrowed(&invalid_version)).is_err());
-        let mut trailing = encoded;
-        trailing.push(0);
-        assert!(JoinContinuation::decode_value(Cow::Borrowed(&trailing)).is_err());
     }
 
     #[test]

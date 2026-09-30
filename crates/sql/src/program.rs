@@ -1,4 +1,4 @@
-use std::{fs, num::NonZeroU64, path::Path};
+use std::{fs, path::Path};
 
 use datafusion_sql::sqlparser::{
     ast::Query,
@@ -17,12 +17,9 @@ use crate::{
     syntax,
 };
 
-// Development v1: Flow owns Station fusion and keeps the head Operation ID.
+// Development v1: persist the logical DAG; Flow derives atomic tails.
 // Update v1 golden fixtures in place; old development state is discarded, not migrated.
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1/projection-pruning";
-const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
-const OUTPUT_CAPACITY: NonZeroU64 =
-    NonZeroU64::new(OUTPUT_CAPACITY_BYTES).expect("64 MiB is nonzero");
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1/call-stack";
 pub(crate) const SINK_OPERATION_ID: &str = "sql/sink";
 
 pub(crate) fn scan_operation_id(index: usize) -> String {
@@ -97,7 +94,6 @@ impl SqlProgram {
             return factory.open().map_err(Into::into);
         }
 
-        factory.output_capacity_bytes(OUTPUT_CAPACITY);
         let scans = endpoints
             .scans
             .iter()
@@ -143,7 +139,6 @@ impl SqlProgram {
         let mut encoded = Vec::new();
         write_identity_bytes(&mut encoded, IDENTITY_DOMAIN);
         write_identity_bytes(&mut encoded, canonical_query(&self.query).as_bytes());
-        encoded.extend_from_slice(&OUTPUT_CAPACITY_BYTES.to_be_bytes());
         let scan_count = u64::try_from(endpoints.scans.len()).expect("a Vec length fits in u64");
         encoded.extend_from_slice(&scan_count.to_be_bytes());
         for scan in &endpoints.scans {
@@ -259,7 +254,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "d8ad0f567ec2235c0fb85e37b1dbdfeeab8f77ebbefe7283aed753e6ea525a58"
+            "ed9c0edd4c9c98b9a0463ca28820988038fd0f97b4c44cc3410fb1bb211199d8"
         );
     }
 

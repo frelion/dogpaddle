@@ -1,13 +1,10 @@
 #![doc = include_str!("../README.md")]
-
 mod assembly;
 mod build;
 mod error;
 mod flow;
-mod station;
-
 pub use build::{
-    FlowDefinitionError, FlowFactory, InvalidStationIdReason, OperationRef, TopologyError,
+    FlowDefinitionError, FlowFactory, InvalidOperationIdReason, OperationRef, TopologyError,
 };
 pub use error::{FlowError, FlowRunError};
-pub use flow::{AdvanceOutcome, Flow, InputStatus, OutputStatus, StationStatus};
+pub use flow::{AdvanceOutcome, Flow, FlowStatus};

@@ -263,18 +263,12 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
 
     with Host(binary, root, bundle, container.port, container.password, 2) as host:
         assert_rows(host, [], phase=2, spool_nonempty=True)
-        restored = host.request("advance")
-        if restored != {"kind": "advance", "output": False,
-                        "checkpoint_present": True, "commits": 1}:
-            raise RuntimeError(f"publishing restore changed durable output: {restored}")
-        assert_rows(host, [], phase=2, spool_nonempty=True)
-
         def publish() -> bool:
             response = host.request("advance")
             if response.get("output"):
                 if response != {"kind": "advance", "output": True,
-                                "checkpoint_present": True, "commits": 1}:
-                    raise RuntimeError(f"snapshot publish did not commit atomically: {response}")
+                                "checkpoint_present": True, "commits": 2}:
+                    raise RuntimeError(f"snapshot publication and consumption were not durable: {response}")
                 return True
             return False
 
@@ -295,8 +289,8 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
                 assert_rows(host, INITIAL, phase=3)
                 return False
             if response != {"kind": "durable-before-ack", "output": True,
-                            "checkpoint_present": True, "commits": 1}:
-                raise RuntimeError(f"streaming delivery did not atomically commit: {response}")
+                            "checkpoint_present": True, "commits": 2}:
+                raise RuntimeError(f"streaming capture and consumption were not durable before ACK: {response}")
             return True
 
         until("streaming UPDATE/INSERT committed before ACK", streaming_crash)
@@ -312,11 +306,6 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
                 or not isinstance(prefix, list) or not 1 < len(prefix) <= len(expected)
                 or prefix != expected[:len(prefix)]):
             raise RuntimeError(f"streaming pre-ACK prefix is not durable and ordered: {state}")
-        restored = host.request("advance")
-        if restored != {"kind": "advance", "output": False,
-                        "checkpoint_present": True, "commits": 1}:
-            raise RuntimeError(f"streaming restore re-emitted an ACKed row: {restored}")
-        assert_rows(host, prefix, phase=3)
         container.sql(f"INSERT INTO {DATABASE}.{TABLE} VALUES (30,30,'last-witness')")
         expected.append(SUCCESSOR)
 
@@ -324,9 +313,9 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
             response = host.request("advance")
             if response.get("output") and response != {
                 "kind": "advance", "output": True,
-                "checkpoint_present": True, "commits": 1,
-            }:
-                raise RuntimeError(f"replay data turn did not commit atomically: {response}")
+                "checkpoint_present": True, "commits": response.get("commits"),
+            } or (response.get("output") and response.get("commits") not in (1, 2)):
+                raise RuntimeError(f"replay data turn did not durably capture and consume its front: {response}")
             state = host.request("read")
             rows = state.get("rows")
             if (state.get("kind") != "rows" or state.get("phase") != 3

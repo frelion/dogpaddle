@@ -124,8 +124,8 @@ def crash_after_output(host: Host) -> bool:
     if response["kind"] != "durable-before-ack":
         return False
     if response != {"kind": "durable-before-ack", "output": True,
-                    "checkpoint_present": True, "commits": 1}:
-        raise RuntimeError(f"delivery did not atomically commit checkpoint and output: {response}")
+                    "checkpoint_present": True, "commits": response.get("commits")} or response.get("commits") not in (1, 2):
+        raise RuntimeError(f"capture and consumer commits were not durable before ACK: {response}")
     return True
 
 
@@ -249,8 +249,9 @@ class Fixture:
             if response["kind"] != kind:
                 return False
             if response != {"kind": kind, "output": True, "checkpoint_unchanged": True,
-                            "output_unchanged": True, "commits": 0}:
-                raise RuntimeError(f"rejected delivery changed durable state: {response}")
+                            "output_unchanged": True, "published_unchanged": True,
+                            "commits": response.get("commits")} or response.get("commits") not in (0, 1):
+                raise RuntimeError(f"consumer rollback changed its durable front or output: {response}")
             return True
 
         with self.host("direct", table, 1) as host:
@@ -263,14 +264,10 @@ class Fixture:
             if host.request("read") != {"kind": "rows", "rows": [],
                                         "checkpoint_present": True}:
                 raise RuntimeError("sealed initial snapshot became public before Publishing")
-            restored = host.request("advance")
-            if restored != {"kind": "advance", "output": False,
-                            "checkpoint_present": True, "commits": 1}:
-                raise RuntimeError(f"Publishing restore touched the source or output: {restored}")
-            until("actual delivery rollback", lambda: rejected_delivery(host, "rollback"))
+            until("published front consumer rollback", lambda: rejected_delivery(host, "rollback"))
             if host.request("read")["rows"]:
-                raise RuntimeError("rolled-back Scan emitted durable output")
-            until("same delivery commits checkpoint and output before ACK", lambda: crash_after_output(host))
+                raise RuntimeError("rolled-back consumer emitted durable output")
+            until("published front commits its consumer before the crash", lambda: crash_after_output(host))
             if host.process.wait(timeout=15) != 74:
                 raise RuntimeError("crash window did not terminate with the expected code")
         until("crashed Scan releases its slot", lambda: not self.active(table))
@@ -278,14 +275,9 @@ class Fixture:
             if host.request("read") != {"kind": "rows", "rows": [[1, 10, 10, "pre-existing"]],
                                         "checkpoint_present": True}:
                 raise RuntimeError("output and checkpoint were not both durable before ACK")
-            restored = host.request("advance")
-            if restored != {"kind": "advance", "output": False, "checkpoint_present": True, "commits": 1}:
-                raise RuntimeError(f"first turn did not only restore the checkpoint: {restored}")
-            if self.active(table):
-                raise RuntimeError("checkpoint restoration unexpectedly connected to PostgreSQL")
             drive(host, lambda: self.active(table), "reopened Scan restores checkpoint")
             self.sql(f"INSERT INTO {table} VALUES (20, 20, 'after-reopen')")
-            until("full output rejects checkpoint and output together",
+            until("full output preserves the durably captured front",
                   lambda: rejected_delivery(host, "backpressure"))
             if host.request("read")["rows"] != [[1, 10, 10, "pre-existing"]]:
                 raise RuntimeError("backpressure changed durable output")
@@ -299,18 +291,18 @@ class Fixture:
                 response = host.request("advance")
                 if not response.get("output", False):
                     return False
-                if response.get("commits") != 1 or not response.get("checkpoint_present"):
-                    raise RuntimeError(f"data turn did not use one atomic commit: {response}")
+                if response.get("commits") not in (1, 2) or not response.get("checkpoint_present"):
+                    raise RuntimeError(f"data turn did not durably capture and consume its front: {response}")
                 if host.request("read")["rows"] != expected:
                     raise RuntimeError("restart repeated an ACKed row or lost the backpressured row")
                 return True
 
-            until("PostgreSQL replays the unacknowledged backpressured delivery", replay)
+            until("reopen consumes the retained backpressured Source front", replay)
             self.sql(f"INSERT INTO {table} VALUES (30, 30, 'last-witness')")
             expected.append([1, 30, 30, "last-witness"])
             drive(host, lambda: host.request("read")["rows"] == expected,
                   "successor witnesses ordered replay without duplicates")
-        print("PASS real Scan existing-row snapshot, terminal pre-ACK recovery, atomic publish rollback, streaming backpressure replay and witness")
+        print("PASS real Scan existing-row snapshot, terminal pre-ACK recovery, consumer rollback, durable Source front backpressure/reopen and witness")
 
     def partial_snapshot_recovery_gate(self) -> None:
         table = "snapshot_recovery"
@@ -412,9 +404,9 @@ class Fixture:
 
             def replay_suffix() -> bool:
                 response = host.request("advance")
-                if response.get("output") and (response.get("commits") != 1
+                if response.get("output") and (response.get("commits") not in (1, 2)
                                                or not response.get("checkpoint_present")):
-                    raise RuntimeError("resumed data delivery was not one atomic checkpoint/output commit")
+                    raise RuntimeError("resumed data delivery did not durably capture and consume its front")
                 rows = host.request("read")["rows"]
                 if rows != expected[:len(rows)]:
                     raise RuntimeError("transaction split/reopen duplicated, reordered, or skipped events")

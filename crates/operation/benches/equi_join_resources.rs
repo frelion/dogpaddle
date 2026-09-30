@@ -17,7 +17,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
     operation::{
-        Action, Operation, OperationInput, Turn,
+        BudgetExceeded, Operation, OperationInput, Progress, Resume, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinKind},
     },
 };
@@ -52,7 +52,7 @@ enum Scenario {
         qualifying: usize,
         observe_state: bool,
     },
-    WholeClaim {
+    Batch {
         rows: usize,
         payload_bytes: usize,
         key_count: usize,
@@ -80,14 +80,14 @@ struct Workload {
 }
 
 #[derive(Default, Serialize)]
-struct ClaimMeasurement {
-    turns: usize,
+struct InputMeasurement {
+    pages: usize,
     output_rows: usize,
     positive_rows: usize,
     negative_rows: usize,
     output_arrow_bytes: usize,
-    max_turn_output_rows: usize,
-    max_turn_output_arrow_bytes: usize,
+    max_page_output_rows: usize,
+    max_page_output_arrow_bytes: usize,
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -133,7 +133,7 @@ struct ResourceRecord {
     workload: Value,
     input_arrow_bytes: usize,
     rust_heap: RustHeapMeasurement,
-    claim: ClaimMeasurement,
+    input: InputMeasurement,
     persistent_state: Option<PersistentStateMeasurement>,
     rss_bytes: Option<u64>,
     rss_status: &'static str,
@@ -177,7 +177,7 @@ impl CaseSpec {
         }
     }
 
-    const fn whole_claim(
+    const fn batch(
         name: &'static str,
         rows: usize,
         payload_bytes: usize,
@@ -185,7 +185,7 @@ impl CaseSpec {
     ) -> Self {
         Self {
             name,
-            scenario: Scenario::WholeClaim {
+            scenario: Scenario::Batch {
                 rows,
                 payload_bytes,
                 key_count,
@@ -211,17 +211,17 @@ impl CaseSpec {
                 "logical_predicate_evaluations": candidates,
                 "observe_match_counts": observe_state,
             }),
-            Scenario::WholeClaim {
+            Scenario::Batch {
                 rows,
                 payload_bytes,
                 key_count,
             } => json!({
                 "name": self.name,
-                "scenario": "whole_claim",
+                "scenario": "batch",
                 "join_kind": "Inner",
-                "claim_rows": rows,
+                "input_rows": rows,
                 "computed_key_count": key_count,
-                "claim_payload_bytes_per_row": payload_bytes,
+                "input_payload_bytes_per_row": payload_bytes,
                 "distinct_candidates": 0,
                 "qualifying_candidates": 0,
                 "logical_predicate_evaluations": 0,
@@ -294,40 +294,64 @@ impl Fixture {
         }
     }
 
-    fn apply(&mut self, port: usize, change: &Change) -> ClaimMeasurement {
-        let mut measurement = ClaimMeasurement::default();
+    fn apply(&mut self, port: usize, change: &Change) -> InputMeasurement {
+        let mut measurement = InputMeasurement::default();
+        let mut resume = self.operation.initial_resume();
         for _ in 0..100_000 {
-            let (complete, output) = self.apply_once(port, change);
+            let (complete, output) = self.apply_once(port, change, &mut resume);
             measurement.observe(output.as_ref());
             if complete {
                 return measurement;
             }
         }
-        panic!("residual EquiJoin resource Claim did not complete")
+        panic!("residual EquiJoin resource Input did not complete")
     }
 
-    fn apply_once(&mut self, port: usize, change: &Change) -> (bool, Option<Change>) {
-        let Turn::Ready(prepared) = self
-            .operation
-            .turn(Some(OperationInput { port, change }))
-            .expect("prepare residual EquiJoin resource turn")
-        else {
-            panic!("residual EquiJoin must be ready for a pinned input")
-        };
-        let transaction = self.transactions.begin();
-        let (action, completion) = prepared
-            .apply(transaction.access())
-            .expect("apply residual EquiJoin resource turn");
-        transaction
-            .commit()
-            .expect("commit residual EquiJoin resource turn");
-        completion
-            .run()
-            .expect("complete residual EquiJoin resource turn");
-        match action {
-            Action::Commit(output) => (false, output),
-            Action::Complete(output) => (true, output),
-            Action::Idle => panic!("residual EquiJoin returned Idle for a pinned input"),
+    fn apply_once(
+        &mut self,
+        port: usize,
+        change: &Change,
+        resume: &mut Resume,
+    ) -> (bool, Option<Change>) {
+        let mut items = 256;
+        loop {
+            let transaction = self.transactions.begin();
+            let result = self.operation.step(
+                OperationInput { port, change },
+                resume,
+                transaction.access(),
+                &mut StepBudget::new(items, 4 * 1024 * 1024),
+            );
+            match result {
+                Ok(step) => {
+                    transaction.commit().expect("commit residual equality page");
+                    match step.progress {
+                        Progress::Done => return (true, step.output),
+                        Progress::More(next) => {
+                            assert_ne!(&next, resume);
+                            *resume = next;
+                            return (false, step.output);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mut cause: &(dyn std::error::Error + 'static) = error.as_ref();
+                    let budget = loop {
+                        if cause.is::<BudgetExceeded>() {
+                            break true;
+                        }
+                        let Some(next) = cause.source() else {
+                            break false;
+                        };
+                        cause = next;
+                    };
+                    assert!(
+                        budget && items > 1,
+                        "equality resource page failed: {error}"
+                    );
+                    items /= 2;
+                }
+            }
         }
     }
 
@@ -369,9 +393,9 @@ impl Fixture {
     }
 }
 
-impl ClaimMeasurement {
+impl InputMeasurement {
     fn observe(&mut self, output: Option<&Change>) {
-        self.turns += 1;
+        self.pages += 1;
         let Some(output) = output else {
             return;
         };
@@ -379,8 +403,8 @@ impl ClaimMeasurement {
         let output_arrow_bytes = change_arrow_bytes(output);
         self.output_rows += output_rows;
         self.output_arrow_bytes = self.output_arrow_bytes.saturating_add(output_arrow_bytes);
-        self.max_turn_output_rows = self.max_turn_output_rows.max(output_rows);
-        self.max_turn_output_arrow_bytes = self.max_turn_output_arrow_bytes.max(output_arrow_bytes);
+        self.max_page_output_rows = self.max_page_output_rows.max(output_rows);
+        self.max_page_output_arrow_bytes = self.max_page_output_arrow_bytes.max(output_arrow_bytes);
         for difference in output.diffs().values() {
             match difference.cmp(&0) {
                 std::cmp::Ordering::Less => self.negative_rows += 1,
@@ -467,7 +491,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
                 1,
             );
             let seeded = fixture.apply(0, &seed);
-            assert!(seeded.turns > 0);
+            assert!(seeded.pages > 0);
             let threshold =
                 i64::try_from(qualifying).expect("resource workload selectivity fits i64");
             let input = change(&schema, vec![7], vec![threshold], 0, 1);
@@ -484,7 +508,7 @@ fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
                 expected_output_rows,
             }
         }
-        Scenario::WholeClaim {
+        Scenario::Batch {
             rows,
             payload_bytes,
             key_count,
@@ -514,7 +538,7 @@ fn change_arrow_bytes(change: &Change) -> usize {
         .saturating_add(change.diffs().get_array_memory_size())
 }
 
-fn measure_heap(spec: CaseSpec, path: &Path) -> (usize, ClaimMeasurement, RustHeapMeasurement) {
+fn measure_heap(spec: CaseSpec, path: &Path) -> (usize, InputMeasurement, RustHeapMeasurement) {
     let Workload {
         mut fixture,
         port,
@@ -523,13 +547,13 @@ fn measure_heap(spec: CaseSpec, path: &Path) -> (usize, ClaimMeasurement, RustHe
     } = prepare_workload(spec, path);
     let input_arrow_bytes = change_arrow_bytes(&input);
     let profiler = dhat::Profiler::builder().testing().build();
-    let claim = std::hint::black_box(fixture.apply(port, &input));
+    let input = std::hint::black_box(fixture.apply(port, &input));
     let stats = dhat::HeapStats::get();
     drop(profiler);
-    assert_eq!(claim.output_rows, expected_output_rows);
-    assert!(claim.turns > 0);
+    assert_eq!(input.output_rows, expected_output_rows);
+    assert!(input.pages > 0);
     let heap = RustHeapMeasurement {
-        coverage: "allocations made through Rust's global allocator during one complete driving Claim; fixture, seed, and input Arrow allocation excluded; RocksDB native heap excluded",
+        coverage: "allocations made through Rust's global allocator during one complete driving Input; fixture, seed, and input Arrow allocation excluded; RocksDB native heap excluded",
         total_blocks: stats.total_blocks,
         total_bytes: stats.total_bytes,
         current_blocks: stats.curr_blocks,
@@ -537,25 +561,26 @@ fn measure_heap(spec: CaseSpec, path: &Path) -> (usize, ClaimMeasurement, RustHe
         peak_blocks: stats.max_blocks,
         peak_bytes: stats.max_bytes,
     };
-    (input_arrow_bytes, claim, heap)
+    (input_arrow_bytes, input, heap)
 }
 
-fn run_observed_claim(
+fn run_observed_input(
     fixture: &mut Fixture,
     port: usize,
     input: &Change,
     peaks: &mut StatePeaks,
-) -> ClaimMeasurement {
-    let mut measurement = ClaimMeasurement::default();
+) -> InputMeasurement {
+    let mut measurement = InputMeasurement::default();
+    let mut resume = fixture.operation.initial_resume();
     for _ in 0..100_000 {
-        let (complete, output) = fixture.apply_once(port, input);
+        let (complete, output) = fixture.apply_once(port, input, &mut resume);
         measurement.observe(output.as_ref());
         peaks.observe(fixture.state_snapshot());
         if complete {
             return measurement;
         }
     }
-    panic!("observed residual EquiJoin resource Claim did not complete")
+    panic!("observed residual EquiJoin resource Input did not complete")
 }
 
 fn measure_persistent_state(spec: CaseSpec, path: &Path) -> PersistentStateMeasurement {
@@ -584,19 +609,19 @@ fn measure_persistent_state(spec: CaseSpec, path: &Path) -> PersistentStateMeasu
     let retract = change(&schema, vec![7], vec![threshold], 0, -1);
     let mut peaks = StatePeaks::default();
     peaks.observe(fixture.state_snapshot());
-    let inserted = run_observed_claim(&mut fixture, 1, &insert, &mut peaks);
+    let inserted = run_observed_input(&mut fixture, 1, &insert, &mut peaks);
     assert_eq!(inserted.output_rows, 2 * qualifying);
     let after_insert = fixture.state_snapshot();
     let expected_actual = qualifying + 1;
     assert_eq!(after_insert.actual_entries, expected_actual);
-    let retracted = run_observed_claim(&mut fixture, 1, &retract, &mut peaks);
+    let retracted = run_observed_input(&mut fixture, 1, &retract, &mut peaks);
     assert_eq!(retracted.output_rows, 2 * qualifying);
     let after_retract = fixture.state_snapshot();
     assert_eq!(after_retract.actual_entries, 0);
     assert_eq!(peaks.actual_entries, expected_actual);
     PersistentStateMeasurement {
         collection: MATCH_COUNTS,
-        coverage: "decoded logical map entries and key-plus-u64 bytes observed after every committed turn in a separate unprofiled pass; excludes RocksDB/WAL/LSM/cache bytes",
+        coverage: "decoded logical map entries and key-plus-u64 bytes observed after every committed page in a separate unprofiled pass; excludes RocksDB/WAL/LSM/cache bytes",
         peak_actual_entries: peaks.actual_entries,
         peak_logical_key_value_bytes: peaks.logical_key_value_bytes,
         after_insert,
@@ -611,7 +636,7 @@ fn measure_case(
     invocation: Invocation,
 ) -> ResourceRecord {
     let heap_path = sample.join("heap-store");
-    let (input_arrow_bytes, claim, rust_heap) = measure_heap(spec, &heap_path);
+    let (input_arrow_bytes, input, rust_heap) = measure_heap(spec, &heap_path);
     let persistent_state = match spec.scenario {
         Scenario::Fanout {
             observe_state: true,
@@ -621,7 +646,7 @@ fn measure_case(
             observe_state: false,
             ..
         }
-        | Scenario::WholeClaim { .. } => None,
+        | Scenario::Batch { .. } => None,
     };
     ResourceRecord {
         benchmark: BENCHMARK,
@@ -631,7 +656,7 @@ fn measure_case(
         workload: spec.context(),
         input_arrow_bytes,
         rust_heap,
-        claim,
+        input,
         persistent_state,
         rss_bytes: None,
         rss_status: "unavailable: this portable runner does not sample process RSS; allocator bytes and logical Store bytes must not be interpreted as RSS",
@@ -652,16 +677,16 @@ fn test_cases() -> Vec<CaseSpec> {
         CaseSpec::fanout("selectivity_full", EquiJoinKind::Inner, 8, 0, 8, false),
         CaseSpec::fanout("wide_full", EquiJoinKind::Inner, 8, 4 * 1024, 8, false),
         CaseSpec::fanout(
-            "oversized_candidate",
+            "wide_candidate",
             EquiJoinKind::Inner,
             1,
-            1024 * 1024 + 1,
+            128 * 1024,
             1,
             false,
         ),
         CaseSpec::fanout("page_boundary", EquiJoinKind::Inner, 257, 0, 129, false),
-        CaseSpec::whole_claim("whole_claim", 33, 256, 1),
-        CaseSpec::whole_claim("computed_keys", 33, 0, 32),
+        CaseSpec::batch("batch", 33, 256, 1),
+        CaseSpec::batch("computed_keys", 33, 0, 32),
         CaseSpec::fanout(
             "full_outer_state",
             EquiJoinKind::FullOuter,
@@ -682,7 +707,7 @@ fn test_cases() -> Vec<CaseSpec> {
 }
 
 fn benchmark_cases(profile: PerformanceProfile) -> Vec<CaseSpec> {
-    let (selection_fanout, wide_fanout, wide_payload, large_fanout, claim_rows, claim_payload) =
+    let (selection_fanout, wide_fanout, wide_payload, large_fanout, input_rows, input_payload) =
         match profile {
             PerformanceProfile::Smoke => (64, 32, 16 * 1024, 1_024, 257, 1_024),
             PerformanceProfile::Reference => (1_024, 64, 64 * 1024, 4_096, 1_024, 4 * 1024),
@@ -729,10 +754,10 @@ fn benchmark_cases(profile: PerformanceProfile) -> Vec<CaseSpec> {
             false,
         ),
         CaseSpec::fanout(
-            "oversized_candidate",
+            "wide_candidate",
             EquiJoinKind::Inner,
             1,
-            1024 * 1024 + 1,
+            128 * 1024,
             1,
             false,
         ),
@@ -745,8 +770,8 @@ fn benchmark_cases(profile: PerformanceProfile) -> Vec<CaseSpec> {
             large_fanout / 2,
             false,
         ),
-        CaseSpec::whole_claim("whole_claim", claim_rows, claim_payload, 1),
-        CaseSpec::whole_claim("computed_keys", claim_rows, 0, 32),
+        CaseSpec::batch("batch", input_rows, input_payload, 1),
+        CaseSpec::batch("computed_keys", input_rows, 0, 32),
         CaseSpec::fanout(
             "full_outer_state",
             EquiJoinKind::FullOuter,
@@ -846,8 +871,8 @@ fn write_context(
         "result_directory": root.path().display().to_string(),
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
         "measurement_contracts": {
-            "rust_heap": "Each fresh child builds its fixture, seed, and input before starting one dhat Profiler. Stats cover allocations made through Rust's global allocator during one complete driving Claim. They exclude the input Arrow allocation, pre-existing fixture/seed memory, and RocksDB native allocations.",
-            "persistent_logical_state": "The FullOuter case runs a second unprofiled fixture and scans equi_join.match_counts after every committed turn. Counts and decoded key-plus-u64 bytes exclude RocksDB cache, WAL, LSM, compression, tombstones, and filesystem allocation.",
+            "rust_heap": "Each fresh child builds its fixture, seed, and input before starting one dhat Profiler. Stats cover allocations made through Rust's global allocator during one complete driving Input. They exclude the input Arrow allocation, pre-existing fixture/seed memory, and RocksDB native allocations.",
+            "persistent_logical_state": "The FullOuter case runs a second unprofiled fixture and scans equi_join.match_counts after every committed page. Counts and decoded key-plus-u64 bytes exclude RocksDB cache, WAL, LSM, compression, tombstones, and filesystem allocation.",
             "output_arrow_bytes": "Arrow get_array_memory_size plus the diff array, summed for emitted Changes. Arrow may count shared buffers more than once.",
             "rss": "Unavailable. The portable owner runner intentionally does not treat allocator counters, logical Store bytes, ps samples, or platform-specific high-water units as process RSS.",
             "comparison": "Only benchmark-mode records from the same code, rustc, host, profile, filesystem, workload, and baseline epoch are comparable. Test-mode heap values validate the protocol only."

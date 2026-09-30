@@ -7,7 +7,7 @@ use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     decode_definition, encode_definition,
     operation::{
-        Action, OperationInput, Turn,
+        Operation,
         sink::{
             PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError, PostgresSinkSchemaError,
             PostgresTargetSpec,
@@ -16,7 +16,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
-use super::support::{TestStore, construct_checked_with_resource, rollback_ready};
+use super::support::{TestStore, construct_checked_with_resource};
 
 fn construct_checked(
     definition: &(impl Clone + Into<OperationDefinition>),
@@ -100,9 +100,9 @@ fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
 #[test]
 fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io() {
     // Shared buffered state v1: Ready(empty buffer, relation ID 1).
-    let mut ready = vec![1, 1, 0];
-    ready.extend([0; size_of::<u64>() * 3]);
-    ready.extend(1_u64.to_be_bytes());
+    let mut encoded_state = vec![1, 1, 0];
+    encoded_state.extend([0; size_of::<u64>() * 3]);
+    encoded_state.extend(1_u64.to_be_bytes());
     let store_root = TestStore::new();
     let definition = definition();
     let mut setup = StoreSetup::new();
@@ -124,7 +124,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
     state
         .access(transaction.access())
         .unwrap()
-        .set(&ready)
+        .set(&encoded_state)
         .unwrap();
     transaction.commit().unwrap();
     drop(transactions);
@@ -133,7 +133,7 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
         let store = Store::open(store_root.path()).unwrap();
         let decoded = decode_definition(&literal_definition_bytes()).unwrap();
         let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
-        let (mut operation, output) = decoded
+        let (operation, output) = decoded
             .construct(
                 &[input_schema()],
                 &mut store.data_scope().scoped("operation"),
@@ -142,31 +142,16 @@ fn postgres_sink_reopens_and_decodes_nonempty_relation_state_without_network_io(
             .unwrap()
             .into_parts();
         assert!(output.is_none());
-        let mut transactions = store.into_transactions();
-        let input = input_change();
-        let Turn::Ready(prepared) = operation
-            .turn(Some(OperationInput {
-                port: 0,
-                change: &input,
-            }))
-            .unwrap()
-        else {
-            panic!("reopened PostgreSQL sink did not prepare state restoration");
+        let (_, reads) = store.into_transactions().split();
+        let Operation::Sink(mut sink) = operation else {
+            panic!("expected sink");
         };
-        let transaction = transactions.begin();
-        let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap()
-        else {
-            panic!("reopened PostgreSQL sink did not decode its Ready state");
-        };
-        drop(transaction);
-        drop(completion); // Running it would perform target I/O; rollback must not.
-
-        let transaction = transactions.begin();
+        let snapshot = reads.begin();
+        assert!(sink.load(snapshot.access()).unwrap().is_none());
         assert_eq!(
-            state.access(transaction.access()).unwrap().get().unwrap(),
-            Some(ready.clone())
+            state.read(snapshot.access()).unwrap().get().unwrap(),
+            Some(encoded_state.clone())
         );
-        transaction.commit().unwrap();
     }
 }
 
@@ -291,11 +276,10 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
 }
 
 #[test]
-fn postgres_sink_restores_offline_then_checks_target_before_publishing_initialization() {
-    let store_root = TestStore::new();
-    let definition = definition();
+fn postgres_sink_load_is_offline_and_target_check_precedes_initialization_intent() {
+    let root = TestStore::new();
     let mut setup = StoreSetup::new();
-    let (operation, output) = OperationDefinition::from(definition.clone())
+    let (operation, _) = OperationDefinition::from(definition())
         .construct(
             &[input_schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -303,91 +287,18 @@ fn postgres_sink_restores_offline_then_checks_target_before_publishing_initializ
         )
         .unwrap()
         .into_parts();
-    assert!(output.is_none());
-    let transactions = setup.commit(store_root.path(), |_| Ok(())).unwrap();
-    drop((operation, transactions));
-    let store = Store::open(store_root.path()).unwrap();
-    let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
-    let (mut operation, output) = OperationDefinition::from(definition.clone())
-        .construct(
-            &[input_schema()],
-            &mut store.data_scope().scoped("operation"),
-            RuntimeResource::new(mismatched_config()),
-        )
-        .unwrap()
-        .into_parts();
-    assert!(output.is_none());
-    let mut transactions = store.into_transactions();
-
-    // The endpoint is deliberately unreachable and names another database.
-    // Binding, Store construction, typed setup, turn preparation, and
-    // transaction application and first completion only restore local state.
-    // The next transaction-free turn checks the target before publishing any
-    // initialization intent.
-    let change = input_change();
-    drop(
-        operation
-            .turn(Some(OperationInput {
-                port: 0,
-                change: &change,
-            }))
-            .unwrap(),
-    );
-    assert!(matches!(
-        rollback_ready(
-            &mut operation,
-            Some(OperationInput {
-                port: 0,
-                change: &change,
-            }),
-            &mut transactions,
-        )
-        .unwrap(),
-        Action::Commit(None)
-    ));
-
-    let transaction = transactions.begin();
-    assert_eq!(
-        state.access(transaction.access()).unwrap().get().unwrap(),
-        None
-    );
-    transaction.commit().unwrap();
-
-    let Turn::Ready(prepared) = operation
-        .turn(Some(OperationInput {
-            port: 0,
-            change: &change,
-        }))
-        .unwrap()
-    else {
-        panic!("a fresh PostgreSQL sink did not prepare local restoration");
+    let (mut writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+    let Operation::Sink(mut sink) = operation else {
+        panic!("expected sink");
     };
-    let transaction = transactions.begin();
-    let (Action::Commit(None), completion) = prepared.apply(transaction.access()).unwrap() else {
-        panic!("a fresh PostgreSQL sink did not commit local restoration");
-    };
-    transaction.commit().unwrap();
-    completion.run().unwrap();
-
-    let Err(error) = operation.turn(Some(OperationInput {
-        port: 0,
-        change: &change,
-    })) else {
-        panic!("a mismatched target was accepted before initialization");
+    let pending = sink.load(reads.begin().access()).unwrap().unwrap();
+    let Err(error) = sink.prepare(pending) else {
+        panic!("mismatched target accepted");
     };
     assert!(matches!(
         error.downcast_ref::<PostgresSinkError>(),
         Some(PostgresSinkError::DatabaseMismatch)
     ));
-
-    let transaction = transactions.begin();
-    assert!(
-        state
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap()
-            .is_none()
-    );
-    transaction.commit().unwrap();
+    let txn = writes.begin();
+    assert!(!sink.try_enqueue(txn.access(), &input_change()).unwrap());
 }

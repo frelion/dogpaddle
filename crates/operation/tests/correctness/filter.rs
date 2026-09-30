@@ -10,16 +10,16 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     Expr, ExpressionError, OperationKind, Operator, ScalarValue, col, decode_definition, lit,
     operation::{
-        Action, OperationInput,
+        OperationInput,
         transform::{FilterDefinition, FilterError},
     },
 };
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
-    construct_checked, decode_hex, rollback_ready, roundtripped_output, stateless_operation,
-    temporal_and_decimal_change, turn_input, value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, construct_checked,
+    decode_hex, rollback_input, roundtripped_output, run_input, stateless_operation, step_input,
+    temporal_and_decimal_change, value_schema,
 };
 
 const FILTER_V1: &str = include_str!("../fixtures/v1/filter_complex_expression.hex");
@@ -79,12 +79,11 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     )
     .unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation = stateless_operation(&decoded, Arc::clone(&input));
+    let operation = stateless_operation(&decoded, Arc::clone(&input));
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(filtered)) =
-        commit_ready(&mut operation, Some(turn_input(&change)), &mut transactions).unwrap()
+    let Some(filtered) = run_input(&operation, step_input(&change), &mut transactions).unwrap()
     else {
         panic!("decoded complex Filter did not emit its expected rows");
     };
@@ -100,10 +99,10 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(FILTER_V1)).unwrap();
-    let mut operation = stateless_operation(&decoded, input);
+    let operation = stateless_operation(&decoded, input);
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_filtered)) =
-        commit_ready(&mut operation, Some(turn_input(&change)), &mut transactions).unwrap()
+    let Some(reopened_filtered) =
+        run_input(&operation, step_input(&change), &mut transactions).unwrap()
     else {
         panic!("reopened Filter did not emit its expected rows");
     };
@@ -120,19 +119,19 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
 #[test]
 fn runtime_rejects_invalid_port_and_schema_drift() {
     let input = change(&[1]);
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
+    let error = rollback_input(
+        &operation,
+        OperationInput {
             port: 1,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();
@@ -142,12 +141,7 @@ fn runtime_rejects_invalid_port_and_schema_drift() {
     ));
 
     let drifted = change_with_field_name("renamed", &[1]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(turn_input(&drifted)),
-        &mut transactions,
-    )
-    .unwrap_err();
+    let error = rollback_input(&operation, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<FilterError>(),
         Some(FilterError::Expression(ExpressionError::SchemaMismatch))
@@ -193,16 +187,14 @@ fn filter_keeps_only_true_rows_with_the_same_order_records_and_diffs() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2])).unwrap();
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Filter did not complete with a partial output Change");
     };
     assert_eq!(output.schema(), schema);
@@ -286,16 +278,14 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 2, 3, 4])).unwrap();
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &FilterDefinition::try_new(col("keep")).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Filter did not produce its partial heterogeneous output");
     };
     assert_eq!(output.schema(), schema);
@@ -329,13 +319,11 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let mut all_true = stateless_operation(
+    let all_true = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),
     );
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut all_true, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&all_true, step_input(&input), &mut transactions).unwrap() else {
         panic!("all-true Filter did not retain its complete input");
     };
     assert!(Arc::ptr_eq(
@@ -348,14 +336,15 @@ fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output()
     );
 
     for predicate in [lit(false), lit(ScalarValue::Boolean(None))] {
-        let mut operation = stateless_operation(
+        let operation = stateless_operation(
             &FilterDefinition::try_new(predicate).unwrap(),
             input.schema(),
         );
-        assert!(matches!(
-            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
-            Action::Complete(None)
-        ));
+        assert!(
+            run_input(&operation, step_input(&input), &mut transactions)
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

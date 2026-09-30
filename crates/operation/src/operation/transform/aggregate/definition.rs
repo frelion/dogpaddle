@@ -14,7 +14,7 @@ use crate::{
 use super::{
     AggregateDefinitionError, AggregateSchemaError,
     functions::{AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, descriptor},
-    runtime::{BoundAggregate, BoundCall, BoundLayout, ExtremaSlot},
+    runtime::{BoundAggregate, BoundArgument, BoundCall, BoundLayout, BoundStatistic, ExtremaSlot},
     value::contains_float,
 };
 
@@ -29,6 +29,8 @@ pub(crate) struct AggregateLayout {
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[crate::expression::BoundExpression]>,
     pub(super) calls: Box<[BoundCall]>,
+    pub(super) arguments: Box<[BoundArgument]>,
+    pub(super) statistics: Box<[BoundStatistic]>,
     pub(super) layouts: Box<[BoundLayout]>,
     pub(super) slots: Box<[ExtremaSlot]>,
 }
@@ -240,6 +242,8 @@ impl AggregateDefinition {
         let group_expressions = self.bind_groups(input_schema, &mut output_fields)?;
         let BoundAggregate {
             calls,
+            arguments,
+            statistics,
             layouts,
             slots,
         } = self.bind_calls(input_schema, &mut output_fields)?;
@@ -252,6 +256,8 @@ impl AggregateDefinition {
             output_schema,
             group_expressions,
             calls,
+            arguments,
+            statistics,
             layouts,
             slots,
         })
@@ -284,19 +290,19 @@ impl AggregateDefinition {
         Ok(expressions.into_boxed_slice())
     }
 
-    fn bind_calls(
+    pub(super) fn bind_calls(
         &self,
         input_schema: &SchemaRef,
         output_fields: &mut Vec<Arc<Field>>,
     ) -> Result<BoundAggregate, OperationSchemaError> {
         let mut calls = Vec::with_capacity(self.calls.len());
-        let mut layouts: Vec<(StoredExpression, BoundLayout)> = Vec::new();
-        let mut slots: Vec<ExtremaSlot> = Vec::new();
-        let mut fold_states = 0;
+        let mut arguments: Vec<(StoredExpression, BoundArgument)> = Vec::new();
+        let mut statistics: Vec<BoundStatistic> = Vec::new();
+        let mut layouts: Vec<BoundLayout> = Vec::new();
+        let mut slots = Vec::new();
         for (aggregate, call) in self.calls.iter().enumerate() {
-            let function = descriptor(call.function)
-                .expect("AggregateDefinition construction and decoding admit known functions");
-            let arguments = call
+            let function = descriptor(call.function).expect("definitions admit known functions");
+            let bound_arguments = call
                 .arguments
                 .iter()
                 .map(|argument| argument.bind(Arc::clone(input_schema)))
@@ -304,79 +310,118 @@ impl AggregateDefinition {
                 .map_err(|source| -> OperationSchemaError {
                     Box::new(AggregateSchemaError::AggregateExpression { aggregate, source })
                 })?;
-            let bound = (function.bind)(&arguments)
+            let bound = (function.bind)(&bound_arguments)
                 .map_err(|error| Box::new(error) as OperationSchemaError)?;
             output_fields.push(Arc::new(Field::new(
                 &call.name,
                 bound.output_type,
                 bound.nullable,
             )));
-
-            match bound.reduction {
-                Reduction::Fold(reduction) => {
-                    calls.push(BoundCall::Fold {
-                        state: fold_states,
-                        arguments: arguments.into_boxed_slice(),
-                        reduction,
-                    });
-                    fold_states += 1;
-                }
+            let argument = bound_arguments.into_iter().next().map(|expression| {
+                indexed_argument(&mut arguments, &call.arguments[0], expression, aggregate)
+            });
+            calls.push(match bound.reduction {
+                Reduction::RowsCount => BoundCall::RowsCount,
                 Reduction::Extrema(direction) => {
-                    let stored = call
-                        .arguments
-                        .first()
-                        .expect("extrema has exactly one stored argument");
-                    let argument = arguments
-                        .into_iter()
-                        .next()
-                        .expect("extrema has exactly one bound argument");
-                    let layout = indexed_layout(&mut layouts, stored, argument, aggregate);
-                    let slot = indexed_slot(&mut slots, &mut layouts[layout].1, layout, direction);
-                    calls.push(BoundCall::Extrema { slot });
+                    let argument = argument.expect("extrema has one argument");
+                    let layout = if let Some(index) = layouts
+                        .iter()
+                        .position(|layout| layout.argument == argument)
+                    {
+                        index
+                    } else {
+                        let index = layouts.len();
+                        layouts.push(BoundLayout {
+                            argument,
+                            field: Arc::clone(&arguments[argument].1.field),
+                            min_slot: None,
+                            max_slot: None,
+                        });
+                        index
+                    };
+                    BoundCall::Extrema {
+                        slot: indexed_slot(&mut slots, &mut layouts[layout], layout, direction),
+                    }
                 }
-            }
+                reduction => {
+                    let argument = argument.expect("statistics have one argument");
+                    let kind = match reduction {
+                        Reduction::Count => super::functions::StatisticKind::Count,
+                        Reduction::Sum(kind) | Reduction::Average(kind) => kind,
+                        _ => unreachable!(),
+                    };
+                    let statistic = if let Some(index) = statistics
+                        .iter()
+                        .position(|statistic| statistic.argument == argument)
+                    {
+                        if kind != super::functions::StatisticKind::Count {
+                            statistics[index].kind = kind;
+                        }
+                        index
+                    } else {
+                        let index = statistics.len();
+                        statistics.push(BoundStatistic {
+                            argument,
+                            kind,
+                            count_output: false,
+                            sum_output: false,
+                        });
+                        index
+                    };
+                    match reduction {
+                        Reduction::Count => {
+                            statistics[statistic].count_output = true;
+                            BoundCall::Count { statistic }
+                        }
+                        Reduction::Sum(_) => {
+                            statistics[statistic].sum_output = true;
+                            BoundCall::Sum { statistic }
+                        }
+                        Reduction::Average(_) => BoundCall::Average { statistic },
+                        _ => unreachable!(),
+                    }
+                }
+            });
         }
-        let layouts = layouts
-            .into_iter()
-            .map(|(_, layout)| layout)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         Ok(BoundAggregate {
             calls: calls.into_boxed_slice(),
-            layouts,
+            arguments: arguments
+                .into_iter()
+                .map(|(_, argument)| argument)
+                .collect(),
+            statistics: statistics.into_boxed_slice(),
+            layouts: layouts.into_boxed_slice(),
             slots: slots.into_boxed_slice(),
         })
     }
 }
 
-fn indexed_layout(
-    layouts: &mut Vec<(StoredExpression, BoundLayout)>,
+fn indexed_argument(
+    arguments: &mut Vec<(StoredExpression, BoundArgument)>,
     stored: &StoredExpression,
-    argument: crate::expression::BoundExpression,
+    expression: crate::expression::BoundExpression,
     owner: usize,
 ) -> usize {
-    if let Some(position) = layouts
+    if let Some(index) = arguments
         .iter()
-        .position(|(expression, _)| expression == stored)
+        .position(|(existing, _)| existing == stored)
     {
-        return position;
+        return index;
     }
-    let position = layouts.len();
-    layouts.push((
+    let index = arguments.len();
+    arguments.push((
         stored.clone(),
-        BoundLayout {
+        BoundArgument {
             owner,
             field: Arc::new(Field::new(
                 "argument",
-                argument.output_type().clone(),
-                argument.output_nullable(),
+                expression.output_type().clone(),
+                expression.output_nullable(),
             )),
-            expression: argument,
-            min_slot: None,
-            max_slot: None,
+            expression,
         },
     ));
-    position
+    index
 }
 
 /// Returns the dense slot of one (layout, direction) pair, adding it if absent.

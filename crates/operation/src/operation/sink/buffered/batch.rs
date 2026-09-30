@@ -1,7 +1,7 @@
 use arrow_array::Int64Array;
 use arrow_select::concat::concat_batches;
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
-use dogpaddle_store::{OrderedMap, OrderedMapAccess, TransactionAccess};
+use dogpaddle_store::{OrderedMap, OrderedMapReadAccess, ReadTransactionAccess};
 
 use super::{
     invalid,
@@ -11,12 +11,8 @@ use crate::operation::OperationError;
 
 const MAP_KEY_BYTES: u64 = size_of::<u64>() as u64;
 
-/// One bounded delivery plus the admission obligation for each sliced row.
-///
-/// A negative diff can span delivery batches. Its first visible slice retains
-/// the whole still-unadmitted magnitude, while later slices only need to prove
-/// the events in that slice. Target planners use this metadata to reject an
-/// invalid negative prefix before applying any part of it.
+/// One bounded delivery and each positive event's first-slice ID reservation.
+/// Negative events are admitted only for the current slice's prefix deficit.
 #[derive(Clone)]
 pub(crate) struct DeliveryBatch {
     change: Change,
@@ -111,7 +107,7 @@ enum LoadProgress {
 }
 
 struct Loader<'resources, 'transaction, SizeEvent> {
-    map: OrderedMapAccess<'transaction, u64, Vec<u8>>,
+    map: OrderedMapReadAccess<'transaction, u64, Vec<u8>>,
     before: BufferState,
     limits: LoadLimits,
     cache: &'resources mut Option<EntryCache>,
@@ -221,7 +217,7 @@ pub(super) fn load(
     limits: LoadLimits,
     cache: &mut Option<EntryCache>,
     codec: &SchemaBoundChangeCodec,
-    access: TransactionAccess<'_>,
+    access: ReadTransactionAccess<'_>,
     size_event: impl FnMut(&Change, usize) -> Result<u64, OperationError>,
 ) -> Result<LoadedBatch, OperationError> {
     before.validate()?;
@@ -232,7 +228,7 @@ pub(super) fn load(
     let row_index =
         usize::try_from(start.row_index).map_err(|_| invalid("buffer row index exceeds usize"))?;
     Loader {
-        map: buffer.access(access)?,
+        map: buffer.read(access)?,
         before,
         limits,
         cache,
@@ -368,11 +364,12 @@ where
 
             let take = self.remaining.min(self.event_budget).min(target_events);
             local_diffs.push(signed_count(original, take)?);
-            self.admissions.push(if first_visible_slice {
-                self.remaining
-            } else {
-                take
-            });
+            self.admissions
+                .push(if first_visible_slice && original > 0 {
+                    self.remaining
+                } else {
+                    take
+                });
             self.charge(take, bytes_per_event)?;
 
             if self.remaining != 0 {
@@ -488,15 +485,6 @@ where
         });
         after.validate()?;
         Ok(LoadedBatch { delivery, after })
-    }
-}
-
-#[cfg(test)]
-pub(super) fn first_position(sequence: u64, change: &Change) -> Position {
-    Position {
-        sequence,
-        row_index: 0,
-        remaining: change.diffs().value(0).unsigned_abs(),
     }
 }
 

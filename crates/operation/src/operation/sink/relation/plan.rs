@@ -3,9 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use dogpaddle_change::Change;
 
 use super::{
-    Batch, Delete, EXHAUSTED_ID, Insert, Lookup, MAX_MUTATIONS_PER_BATCH, MAX_TECHNICAL_ID,
-    Matches, RelationTarget, canonical_row_bounded, canonical_row_size_bounded, invalid,
-    validate_next_id,
+    Batch, Delete, EXHAUSTED_ID, Insert, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget,
+    canonical_row_bounded, canonical_row_size_bounded, invalid, validate_next_id,
 };
 use crate::operation::{OperationError, sink::buffered::DeliveryBatch};
 
@@ -75,13 +74,8 @@ pub(crate) fn prepare(
             next_id_after += take;
             row.net += i128::from(take);
         } else {
-            // The first visible slice similarly proves the complete negative
-            // event is admissible before any of its deletions are delivered.
-            let needed = u64::try_from((i128::from(admission) - row.net).max(0))
-                .map_err(|_| invalid("retraction count overflows u64"))?;
-            if needed > MAX_TECHNICAL_ID {
-                return Err(invalid("retraction exceeds the maximum target row count"));
-            }
+            let needed = u64::try_from((i128::from(take) - row.net).max(0))
+                .map_err(|_| invalid("retraction prefix overflows u64"))?;
             row.needed = row.needed.max(needed);
             row.take = row
                 .take
@@ -172,9 +166,6 @@ fn lookup(
         .filter(|row| row.take != 0)
         .map(|row| Lookup {
             row_index: row.row_index,
-            needed: row
-                .needed
-                .max(u64::try_from(row.take).expect("the batch limit fits u64")),
             take: row.take,
         })
         .collect::<Vec<_>>();
@@ -195,10 +186,12 @@ fn lookup(
         .zip(matches)
     {
         validate_matches(request, &found, next_id)?;
-        if found.count < row.needed {
+        if u64::try_from(found.ids.len()).expect("bounded IDs fit u64") < row.needed {
             return Err(invalid(format!(
                 "row {} needs {} existing instances, but only {} exist",
-                row.row_index, row.needed, found.count
+                row.row_index,
+                row.needed,
+                found.ids.len()
             )));
         }
         row.ids = found.ids.into();
@@ -207,18 +200,11 @@ fn lookup(
 }
 
 fn validate_matches(request: &Lookup, found: &Matches, next_id: u64) -> Result<(), OperationError> {
-    let selected = usize::try_from(
-        found
-            .count
-            .min(u64::try_from(request.take).expect("the batch limit fits u64")),
-    )
-    .expect("the batch limit fits usize");
-    if found.count > request.needed
-        || found.ids.len() != selected
+    if found.ids.len() > request.take
         || found.ids.iter().any(|id| *id == 0 || *id >= next_id)
         || found.ids.windows(2).any(|pair| pair[0] >= pair[1])
     {
-        return Err(invalid("target returned invalid matching row IDs or count"));
+        return Err(invalid("target returned invalid matching row IDs"));
     }
     Ok(())
 }

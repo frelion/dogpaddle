@@ -1,7 +1,7 @@
 //! Scan operations that produce records without consuming input.
 
 mod cdc_convert;
-mod cdc_runtime;
+pub(crate) mod cdc_runtime;
 pub(crate) mod mysql_cdc;
 pub(crate) mod postgres_cdc;
 pub(crate) mod sequence;

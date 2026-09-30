@@ -1,18 +1,17 @@
 //! Output rows and presence corrections for the current transactional page.
 
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
-use dogpaddle_store::MultisetEntry;
 
-use crate::operation::relation::decode_canonical_row;
+use crate::operation::relation::decode_canonical_row_bounded;
 
 use super::{
     ActiveRow, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, MatchTransition,
-    PreparedMatch, RowEffect,
+    PreparedMatch, RowEffect, StepBudget, canonical_error,
 };
 
 pub(super) struct OutputRows {
@@ -26,11 +25,12 @@ impl EquiJoinOperation {
         port: usize,
         input: &ActiveRow<'_>,
         effect: RowEffect,
-        matches: &[MultisetEntry<Vec<u8>>],
+        matches: &[(Vec<u8>, NonZeroU64)],
         output: &mut OutputRows,
+        budget: &mut StepBudget,
     ) -> Result<(), EquiJoinError> {
         if self.kind.left_only() {
-            return self.append_existence_output(port, input, effect, matches, output);
+            return self.append_existence_output(port, input, effect, matches, output, budget);
         }
         if matches.is_empty() && !effect.matched && self.kind.preserves(port) {
             self.append_padded(port, input.values()?, input.difference, output);
@@ -41,21 +41,17 @@ impl EquiJoinOperation {
         let input_values = input.values()?;
         let opposite_schema = &self.input_schemas[1 - port];
         for matched in matches {
-            let opposite =
-                decode_canonical_row(opposite_schema, &matched.key).map_err(|source| {
-                    EquiJoinError::CanonicalRow {
-                        source: Box::new(source),
-                    }
-                })?;
+            let opposite = decode_canonical_row_bounded(opposite_schema, &matched.0, budget)
+                .map_err(canonical_error)?;
             let difference =
-                output_difference(i128::from(input.difference) * i128::from(matched.multiplicity))?;
+                output_difference(i128::from(input.difference) * i128::from(matched.1.get()))?;
             // A match and its NULL-row correction share one cursor position
             // and transaction, including when both have identical values.
             if self.kind.preserves(1 - port) && matches!(effect.transition, KeyTransition::First) {
                 self.append_padded(
                     1 - port,
                     &opposite,
-                    output_difference(-i128::from(matched.multiplicity))?,
+                    output_difference(-i128::from(matched.1.get()))?,
                     output,
                 );
             }
@@ -68,7 +64,7 @@ impl EquiJoinOperation {
                 self.append_padded(
                     1 - port,
                     &opposite,
-                    output_difference(i128::from(matched.multiplicity))?,
+                    output_difference(i128::from(matched.1.get()))?,
                     output,
                 );
             }
@@ -81,8 +77,9 @@ impl EquiJoinOperation {
         port: usize,
         input: &ActiveRow<'_>,
         effect: RowEffect,
-        matches: &[MultisetEntry<Vec<u8>>],
+        matches: &[(Vec<u8>, NonZeroU64)],
         output: &mut OutputRows,
+        budget: &mut StepBudget,
     ) -> Result<(), EquiJoinError> {
         let semi = self.kind == EquiJoinKind::LeftSemi;
         if port == 0 {
@@ -97,16 +94,12 @@ impl EquiJoinOperation {
             KeyTransition::None => return Ok(()),
         } * if semi { 1 } else { -1 };
         for matched in matches {
-            let left =
-                decode_canonical_row(&self.input_schemas[0], &matched.key).map_err(|source| {
-                    EquiJoinError::CanonicalRow {
-                        source: Box::new(source),
-                    }
-                })?;
+            let left = decode_canonical_row_bounded(&self.input_schemas[0], &matched.0, budget)
+                .map_err(canonical_error)?;
             output.push(
                 &left,
                 &[],
-                output_difference(sign * i128::from(matched.multiplicity))?,
+                output_difference(sign * i128::from(matched.1.get()))?,
             );
         }
         Ok(())

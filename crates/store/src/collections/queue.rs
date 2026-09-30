@@ -1,6 +1,9 @@
 use std::{borrow::Cow, marker::PhantomData, num::NonZeroU64};
 
-use crate::{DataAccess, DataHandle, ReadDataAccess, StoreError, StoreValue, TransactionAccess};
+use crate::{
+    DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, StoreError, StoreValue,
+    TransactionAccess,
+};
 
 const METADATA_KEY: &[u8] = &[];
 const METADATA_BYTES: usize = 3 * size_of::<u64>();
@@ -53,6 +56,12 @@ pub struct QueueAccess<'transaction, T> {
     _value: PhantomData<fn() -> T>,
 }
 
+/// Read-only queue access borrowed from one snapshot.
+pub struct QueueReadAccess<'transaction, T> {
+    data: ReadDataAccess<'transaction>,
+    _value: PhantomData<fn() -> T>,
+}
+
 impl<T: StoreValue> Queue<T> {
     pub(crate) fn from_handle(data: DataHandle) -> Self {
         Self {
@@ -75,6 +84,54 @@ impl<T: StoreValue> Queue<T> {
             data: self.data.access(access)?,
             _value: PhantomData,
         })
+    }
+
+    /// Binds this queue to an active read-only snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign or poisoned transaction.
+    pub fn read<'transaction>(
+        &self,
+        access: ReadTransactionAccess<'transaction>,
+    ) -> Result<QueueReadAccess<'transaction, T>, StoreError> {
+        Ok(QueueReadAccess {
+            data: self.data.read(access)?,
+            _value: PhantomData,
+        })
+    }
+}
+
+impl<T: StoreValue> QueueReadAccess<'_, T> {
+    /// Reads the front without removing it, admitting its encoded length first.
+    ///
+    /// The returned value is owned; later appends or removals do not alter it.
+    /// The same snapshot continues to observe its original front.
+    ///
+    /// # Errors
+    /// Returns storage, decoding, corrupt metadata or missing-front errors.
+    /// An oversized value returns `ItemTooLarge` without poisoning the snapshot.
+    pub fn front_bounded(&self, max_value_bytes: usize) -> Result<Option<T>, StoreError> {
+        let metadata = read_metadata(&self.data)?;
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        read_front(&self.data, metadata, max_value_bytes).map(|(value, _)| Some(value))
+    }
+
+    /// Reports whether the queue contains no values.
+    ///
+    /// # Errors
+    /// Returns storage or corrupt metadata errors.
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        Ok(read_metadata(&self.data)?.is_empty())
+    }
+
+    /// Returns encoded entry bytes, including private sequence keys.
+    ///
+    /// # Errors
+    /// Returns storage or corrupt metadata errors.
+    pub fn queued_bytes(&self) -> Result<u64, StoreError> {
+        Ok(read_metadata(&self.data)?.queued_bytes)
     }
 }
 
@@ -169,30 +226,30 @@ impl<T: StoreValue> QueueAccess<'_, T> {
     /// underflows, or persisted queue state is corrupt. Any such error poisons
     /// the transaction.
     pub fn pop_front(&mut self) -> Result<Option<(T, bool)>, StoreError> {
+        self.pop_front_bounded(usize::MAX)
+    }
+
+    /// Pops the front only if its encoded value fits `max_value_bytes`.
+    ///
+    /// Length admission occurs before copying or decoding. An oversized value
+    /// returns `ItemTooLarge`, leaves the queue unchanged, and permits a retry
+    /// with a larger bound in the same healthy transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized values, decoding or storage failures,
+    /// corrupt metadata, or accounting underflow. Oversize does not poison.
+    pub fn pop_front_bounded(
+        &mut self,
+        max_value_bytes: usize,
+    ) -> Result<Option<(T, bool)>, StoreError> {
         let metadata = self.read_metadata()?;
         if metadata.is_empty() {
             return Ok(None);
         }
 
-        let key = encode_sequence(metadata.head);
-        let Some(encoded) = self.data.as_read().get(&key)? else {
-            return self.fail(StoreError::CorruptQueue {
-                reason: "the front entry is missing",
-            });
-        };
-        let item_bytes = match encoded_item_bytes(encoded.len()) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error),
-        };
-        let value = self
-            .data
-            .poison_on_error(T::decode_value(Cow::Owned(encoded)).map_err(StoreError::from))?;
-        let Some(queued_bytes) = metadata.queued_bytes.checked_sub(item_bytes) else {
-            return self.fail(StoreError::CorruptQueue {
-                reason: "queued-byte metadata is smaller than the front entry",
-            });
-        };
-        self.data.erase(&key)?;
+        let (value, queued_bytes) = read_front(self.data.as_read(), metadata, max_value_bytes)?;
+        self.data.erase(&encode_sequence(metadata.head))?;
         let empty_after =
             self.finish_front_removal(metadata.head + 1, metadata.tail, queued_bytes)?;
         Ok(Some((value, empty_after)))
@@ -302,8 +359,36 @@ impl QueueAccess<'_, Vec<u8>> {
     }
 }
 
+fn read_front<T: StoreValue>(
+    data: &ReadDataAccess<'_>,
+    metadata: Metadata,
+    max_value_bytes: usize,
+) -> Result<(T, u64), StoreError> {
+    let Some(encoded) = data.get_bounded(&encode_sequence(metadata.head), max_value_bytes)? else {
+        return data.record_result(Err(StoreError::CorruptQueue {
+            reason: "the front entry is missing",
+        }));
+    };
+    let item_bytes = data.record_result(encoded_item_bytes(encoded.len()))?;
+    let queued_bytes = data.record_result(metadata.queued_bytes.checked_sub(item_bytes).ok_or(
+        StoreError::CorruptQueue {
+            reason: "queued-byte metadata is smaller than the front entry",
+        },
+    ))?;
+    let value = data.poison_on_error(T::decode_value(Cow::Owned(encoded)))?;
+    Ok((value, queued_bytes))
+}
+
 fn read_metadata(data: &ReadDataAccess<'_>) -> Result<Metadata, StoreError> {
-    let Some(encoded) = data.get(METADATA_KEY)? else {
+    let encoded = match data.get_bounded(METADATA_KEY, METADATA_BYTES) {
+        Err(StoreError::ItemTooLarge { .. }) => {
+            return data.record_result(Err(StoreError::CorruptQueue {
+                reason: "queue metadata exceeds its fixed width",
+            }));
+        }
+        result => result?,
+    };
+    let Some(encoded) = encoded else {
         return if data.is_physically_empty()? {
             Ok(Metadata::EMPTY)
         } else {
@@ -362,6 +447,44 @@ mod tests {
     use crate::{Cell, Store};
 
     #[test]
+    fn oversized_metadata_rejects_before_copy_and_poisons_prior_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::create(root.path().join("store")).unwrap();
+        let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+        let safe = store.create_data::<Cell<u64>>("safe").unwrap();
+        let mut transactions = store.into_transactions();
+        {
+            let transaction = transactions.begin();
+            queue
+                .data
+                .access(transaction.access())
+                .unwrap()
+                .put(METADATA_KEY, &vec![0; 1024 * 1024])
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        {
+            let transaction = transactions.begin();
+            safe.access(transaction.access()).unwrap().set(&1).unwrap();
+            assert!(matches!(
+                queue.access(transaction.access()).unwrap().queued_bytes(),
+                Err(StoreError::CorruptQueue { .. })
+            ));
+            assert!(matches!(
+                transaction.commit(),
+                Err(StoreError::TransactionPoisoned)
+            ));
+        }
+        let (_writes, reads) = transactions.split();
+        let snapshot = reads.begin();
+        assert_eq!(safe.read(snapshot.access()).unwrap().get().unwrap(), None);
+        assert!(matches!(
+            queue.read(snapshot.access()).unwrap().is_empty(),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+    }
+
+    #[test]
     fn persisted_empty_metadata_poisons_and_rolls_back_other_writes() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::create(root.path().join("store")).unwrap();
@@ -389,9 +512,19 @@ mod tests {
             Err(StoreError::TransactionPoisoned)
         ));
 
-        let transaction = transactions.begin();
+        let (_, reads) = transactions.split();
+        let snapshot = reads.begin();
+        let access = queue.read(snapshot.access()).unwrap();
+        assert!(matches!(
+            access.front_bounded(1),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+        assert!(matches!(
+            access.is_empty(),
+            Err(StoreError::TransactionPoisoned)
+        ));
         assert_eq!(
-            safe.access(transaction.access()).unwrap().get().unwrap(),
+            safe.read(reads.begin().access()).unwrap().get().unwrap(),
             None
         );
     }
@@ -573,9 +706,19 @@ mod tests {
             Err(StoreError::TransactionPoisoned)
         ));
 
-        let transaction = transactions.begin();
+        let (_, reads) = transactions.split();
+        let snapshot = reads.begin();
+        let access = queue.read(snapshot.access()).unwrap();
+        assert!(matches!(
+            access.front_bounded(1),
+            Err(StoreError::CorruptQueue { .. })
+        ));
+        assert!(matches!(
+            access.is_empty(),
+            Err(StoreError::TransactionPoisoned)
+        ));
         assert_eq!(
-            safe.access(transaction.access()).unwrap().get().unwrap(),
+            safe.read(reads.begin().access()).unwrap().get().unwrap(),
             None
         );
     }

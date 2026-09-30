@@ -6,7 +6,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, col, lit,
     operation::{
-        Action, OperationInput,
+        OperationInput,
         transform::{
             FilterDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
             UnionAllDefinition,
@@ -15,7 +15,7 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Store, StoreSetup};
 
-use super::support::{TestStore, commit_ready, stateless_operation, turn_input};
+use super::support::{TestStore, run_input, stateless_operation, step_input};
 
 fn structural_trace(
     definition: &(impl Clone + Into<OperationDefinition>),
@@ -41,7 +41,7 @@ fn structural_trace(
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     let mut trace = Vec::new();
     let mut start = 0;
@@ -61,12 +61,12 @@ fn structural_trace(
             Int64Array::from_iter_values(batch.iter().map(|row| row.2)),
         )
         .unwrap();
-        let Action::Complete(Some(output)) = commit_ready(
-            &mut operation,
-            Some(OperationInput {
+        let Some(output) = run_input(
+            &operation,
+            OperationInput {
                 port,
                 change: &input,
-            }),
+            },
             &mut transactions,
         )
         .unwrap() else {
@@ -180,8 +180,7 @@ fn filter_trace(
 ) -> Vec<(u64, i64)> {
     assert_eq!(batches.iter().sum::<usize>(), values.len());
     let schema = predicate_change(&values[..1], &keep[..1], &diffs[..1]).schema();
-    let mut operation =
-        stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
+    let operation = stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
@@ -193,24 +192,21 @@ fn filter_trace(
             &keep[start..start + rows],
             &diffs[start..start + rows],
         );
-        match commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap() {
-            Action::Complete(Some(change)) => {
-                let values = change
-                    .records()
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .unwrap();
-                output.extend(
-                    values
-                        .values()
-                        .iter()
-                        .copied()
-                        .zip(change.diffs().values().iter().copied()),
-                );
-            }
-            Action::Complete(None) => {}
-            Action::Idle | Action::Commit(_) => panic!("Filter returned the wrong action"),
+        if let Some(change) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
+        {
+            let values = change
+                .records()
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            output.extend(
+                values
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(change.diffs().values().iter().copied()),
+            );
         }
         start += rows;
     }
@@ -225,7 +221,7 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
         DataType::UInt64,
         false,
     )]));
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_extend(&schema, [("seven", col("value").eq(lit(7_u64)))]).unwrap(),
         Arc::clone(&schema),
     );
@@ -247,8 +243,7 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
             Int64Array::from(diffs[start..start + rows].to_vec()),
         )
         .unwrap();
-        let Action::Complete(Some(change)) =
-            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        let Some(change) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
         else {
             panic!("Extend returned the wrong action");
         };

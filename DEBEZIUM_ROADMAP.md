@@ -1,5 +1,8 @@
 # DogPaddle Debezium Scan 路线图
 
+> 历史路线记录：本文保留各阶段当时的设计与验收，不再定义当前 Source/Flow 交接协议。
+> 当前约束以 [Debezium README](crates/debezium/README.md) 和 [CDC 契约](crates/operation/docs/cdc.md) 为准。
+
 本文固化 DogPaddle 引入 Debezium Engine 的 D0–D7 实施顺序、阶段边界和通过门槛。
 它是 [GitHub #2](https://github.com/frelion/dogpaddle/issues/2) 的仓库内路线基线，不表示尚未通过验收的能力已经交付。
 总体架构决策见

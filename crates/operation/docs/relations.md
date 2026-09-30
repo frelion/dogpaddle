@@ -5,9 +5,10 @@
 
 ## Distinct
 
-`Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition 的 canonical JSON payload 为 `{}`，只声明 `distinct.weights: OrderedMultiset<Vec<u8>>`。
+`Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition 的 canonical JSON payload 为 `{}`，只声明 `distinct.weights: OrderedMap<Vec<u8>, NonZeroU64>`。
 key 是完整 canonical row bytes，multiplicity 是 Store 维护的正 `u64`；缺失表示零，checked signed adjustment 归零即删除。
-输入按行序逐事件更新：负前缀和 overflow 回滚整个 turn，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。同一 Change 内连续相同 key 只缓存一个 key 和其当前 `u64` 权重；仍逐事件校验及产出边界，key 切换或 turn 结束时才写回最终权重，净变化为零时不写。无效前缀继续毒化 Store 事务。
+输入按行序逐事件更新：负前缀和 overflow 回滚当前 Atomic 页，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。页内连续相同 key 只缓存一个 key 和其当前 `u64` 权重；仍逐事件校验及产出边界，key 切换或页结束时才写回最终权重，净变化为零时不写。无效前缀继续毒化 Store 事务。
+每行先无拷贝检查完整 canonical 编码大小，并在分配 key 前扣共享预算；List 的 NULL children 也按实际 canonical marker 计费，不能用小 Arrow buffer 绕过页界。新 run 的固定 8-byte 权重读取和最终写回分别在访问前按完整 key 加权重计费；损坏权重仍由 Store 的严格正权重 codec 拒绝并毒化事务。预算不足回滚整页，包括已经写回的早先 run；部分输出的 Arrow filter 复制也先准入。
 状态、output 和 input completion 同事务提交，背压与 reopen 保持同一输入语义。
 SQL `SELECT DISTINCT` 复用这一 exact-row identity，包括按原始位模式区分浮点值。
 canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation` 模块；Store 只提供通用 multiplicity，不预建 Aggregate/Join 的关系框架。
@@ -15,134 +16,94 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 
 ## Aggregate
 
-`Aggregate` 的 tag 是 14，是单输入的 grouped relational Transform；至少一个 group expression，aggregate call 可以为空。
-Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。
-它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: PartitionedMultiset<EntryPartition, Vec<u8>>` 和 `aggregate.control: Cell<u64>`：groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个 Fold call 的小状态与每个极值 slot 的缓存极值；entries 的 partition 是 `layout + group ID`，每个 layout 对应一个不同的排序表达式，只维护有序的 extrema argument key，不保存完整输入行；control 只分配不复用的 group ID。
-`GroupState` 的当前开发期 v1 value 以标记字节 `1` 起始，其余字段按 `id`、`weight`、fold states、可空 extrema keys 的顺序使用 big-endian varint bincode/Serde 编码。解码拒绝零权重、超出 `u32` 的集合长度、截断、尾随字节和非规范整数编码；损坏的集合长度不能使短 value 预留大块内存。旧 value 直接重建，不提供格式识别或迁移。
-极值 slot 在绑定期按 `(layout, 方向)` 去重产生，`MIN(x), MAX(x)` 共用一个 layout、两个 slot，重复的同一调用复用一个 slot；group state 里的缓存是该 slot 当前极值键的保序字节，与 entries 在同一事务更新，只有被撤回的正是缓存极值时回分区重取 `first`/`last`，因此 NULL 参数既不进分区也不进缓存。同一组的相邻相同极值参数在当前事务内暂存至每个 layout 一个 key：首次只读该 key 的份数，随后逐事件检查并更新输出；换 key、换组、撤回缓存极值而需重读分区或完成 Change 前，才将最终份数写回 entries。组归零时对已持久化的 pending key 直接暂存 tombstone，丢弃只存在于缓存的新 key，再清理其余持久分区，避免写入随即删除。仅当前连续 key run 的最终份数等于读入份数时，这个 run 不写 entries；其它 run 仍可在同一 Change 内写入。无效前缀仍交给 Store 的 checked adjustment 毒化事务。待写缓存与 entries 合起来是当前事务内的有效极值状态；提交时两者均已同步持久化。
-同一组的相邻事件也只暂存一个 group；一行 lookahead 使每行 group key 只编码一次，单行 run 不复制原状态。已有 group 的 run 至少两行时保留读入的原状态，逐事件结果照常输出，离开 run 或完成 Change 时若最终 group state 等于原状态则不写 groups。若各 layout 的连续极值 key run 也净零且未因缓存极值撤回而重读分区，Aggregate 对此 run 不暂存 groups/entries 写入。
-静态函数 descriptor 唯一声明 stable function tag、arity、binding 和 `Fold`/`Extrema` reduction；COUNT/SUM/AVG 使用每组定长 Fold state，MIN/MAX 从缓存极值取结果，函数实现只接收值或小状态，不接收 Store。
-校验按「分组 + 调用参数」而不是按记录进行：只有从未出现过的分组遇到负 diff、分组行数减为负、某个 Fold call 的非空参数计数减为负、某个极值参数的份数减为负才报错；撤回一行而它的参数组合被其它行覆盖不再报错，需要记录级身份的算子继续按完整行记账。
-每个输入事件按行序完成全部 call 更新和旧行 `-1`/新行 `+1`；组首次出现只输出 `+1`，消失只输出 `-1`，结果未变不输出，整个 Change 的状态、output 和 input completion 同事务提交，任何负权重、overflow 或背压均不留下部分状态。
-COUNT 输出 non-null `Int64`；SUM 仅接受 `Int64/UInt64` 并保持类型；AVG 仅接受 `Int64/UInt64`，以 `i128/u128` 累计后输出 nullable `Float64`；MIN/MAX 接受 non-float flat scalar（Null、Boolean、整数、Utf8、Binary、Date32、Timestamp、Decimal128）并输出 nullable 同类型。
-group key 不能包含 Float32/Float64；global aggregate、grouping sets、aggregate modifier、UDF、浮点 SUM/AVG/MIN/MAX、List/Struct MIN/MAX 均不属于 v1。
+`Aggregate` 的 tag 是 14，是单输入的 grouped relational Atomic Transform；至少一个 group expression，aggregate call 可以为空。Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。
 
-MIN/MAX 的 NULL 参数不进入 entries/cache。
-参数级撤回允许组归零时存在不可达旧 extrema keys；归零必须在同一事务按 layout 清空，空分区仍执行边界检查。清理时从有序首项已取得 key 和份数，直接删除该 key，不再对份数做第二次点读。
+它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: OrderedMap<PartitionKey<EntryPartition, Vec<u8>>, NonZeroU64>` 和 `aggregate.control: Cell<u64>`。groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个不同参数的充分统计和每个极值 slot 的缓存；entries 的 partition 是 `layout + group ID`，只维护排序参数的 key 和正份数；control 分配不复用的 group ID，不保存完整输入行。
+
+绑定按 canonical expression 去重参数，每个不同参数每页只求值一次。`COUNT(*)` 直接读 group weight；同参数 `COUNT(x)`、`SUM(x)`、`AVG(x)` 共用一个非空 count 和 signed `i128` 或 unsigned `u128` sum，只有 COUNT 的非数值参数保存 count。输出调用是统计的读出，无独立 Fold 字节状态。COUNT 输出 non-null `Int64`；SUM 仅接受 `Int64/UInt64` 并保持类型，每个输入事件都检查对应窄 sum（即使与 AVG 共用统计）；AVG 以宽 sum 累计后输出 nullable `Float64`。
+
+`GroupState` 的当前开发期 v1 value 使用固定宽度 big-endian owner codec：标记 `1`、u64 id、u64 正 weight、u32 statistic 数、u32 extrema 数；每个 statistic 固定 32 字节（Count/Signed/Unsigned tag、u64 count、16-byte sum、零 padding），每个 extrema 是 u64 key 长度加 key，`u64::MAX` 单独表示 None。编码长度恰为逻辑状态计费加一字节，因此 Map 在复制/解码前的长度准入也限制充分统计与缓存的解码逻辑大小；集合数先与剩余最短 payload 检查再分配，不因损坏 count 预留大块内存。解码拒绝零 group weight、非法 tag/padding、截断、尾随字节与越界 key。旧 value 直接重建，不提供格式识别或迁移。
+
+`MIN(x), MAX(x)` 共用一个排序 layout、两个 slot，重复方向复用一个 slot；同一个参数也复用上述求值结果。MIN/MAX 接受 non-float flat scalar（Null、Boolean、整数、Utf8、Binary、Date32、Timestamp、Decimal128）并输出 nullable 同类型。NULL 参数不进 entries/cache。相邻相同极值参数在事务内每 layout 暂存一个 key，仍逐事件校验份数；切换 key/group 或页结束才写回。撤回缓存极值时先 flush pending，再通过有界 first/last 刷新缓存，group weight 为零也必须刷新。净变化为零可省最终写入，不省中间校验和有序输出。
+
+校验按分组与参数统计进行，不维护完整行身份；参数组合被其它行覆盖时允许撤回。group 归零时，所有统计必须 count=0、sum=0，所有 extrema cache 必须 None，否则当前页失败并回滚。合法归零由逐事件份数归零自然删除 entries，不执行无界分区清理。需要记录级身份的算子继续按完整行记账。
+
+每个输入事件完成全部更新和旧行 `-1`/新行 `+1`；组首次出现只输出 `+1`，消失只输出 `-1`，结果未变不输出。Atomic kernel 只消费共享逻辑字节预算，不消费 head work items；Flow 在 head 分页后同事务提交该页状态、输出和 Resume，预算不足回滚并缩小 head 页。持久 group 和极值读取在复制、解码前由 Store admission 限制；状态、临时参数、缓存、写入和结果计入该页预算。此前已提交的页不会因后续页非法而撤销。
+
+group key 不能包含 Float32/Float64；global aggregate、grouping sets、aggregate modifier、UDF、浮点 SUM/AVG/MIN/MAX、List/Struct MIN/MAX 均不属于 v1。
 
 ## EquiJoin
 
-`EquiJoin` 的 tag 是 16，是两输入 `TurnTransform`；port `0` 固定为 left，port `1` 固定为 right。
-Definition 显式保存 `EquiJoinKind::{Inner,LeftSemi,LeftAnti,LeftOuter,FullOuter}`、非空有序 key-expression pairs、output names 和可选 residual；Semi/Anti 只输出 left fields，Inner/Outer 输出 left 后 right，Outer 自动把可能补 NULL 的 fields 放宽为 nullable。
-它只接受可重放的 immutable expression、精确相同且可 canonical 编码的扁平非浮点 key；复合 key 任一分量为 NULL 时不匹配。
-Residual 在原始 exact input fields 组成的 `left.* + right.*` candidate Schema 上绑定，必须返回 Boolean，只有 non-null true 匹配。
-所有 kind 声明 `equi_join.left_rows` / `equi_join.right_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>` 和 `equi_join.continuation: Cell<JoinContinuation>`：两侧按完整 canonical key 分区，以完整 canonical row 及正 `u64` multiplicity 表示关系。
-无 residual 的非 Inner 另外声明 `equi_join.key_counts: OrderedMap<Vec<u8>, KeyCounts>`，值是该 key 左右两侧的正 distinct-row counts；NULL key 不进入 counts，zero/zero 必须删除。
-带 residual 的非 Inner 改为声明 `equi_join.match_counts: OrderedMap<Vec<u8>, u64>`，按完整行记录 qualifying distinct opposite rows；FullOuter 跟踪两侧，其他 presence kind 只跟踪 left，真实零必须缺失。
-当前 v1 match-count key 为单字节 port 加完整 canonical row；continuation 的 value 以原有标记字节 `1` 起始，其余字段按 port、row ordinal、match marker、可空排他 resume key 的顺序使用 big-endian varint bincode/Serde 编码，不含 phase。解码拒绝截断、尾随字节和非规范整数编码。旧布局的数据库需重建，不提供格式识别、迁移或兼容路径。
-每个 Claim 先按行序预检本侧 exact admission 和同 Claim 的 presence transitions，在发布输出前拒绝本侧负前缀和 `u64` multiplicity overflow。随后直接分页扫描对侧、求值 residual、更新真实 support 并构造输出，不预演整个 Claim，也不保存影子计数。
-每页同事务提交真实状态、output 与 continuation；每个 outer presence transition 的 null correction 与对应 pair 作为同一分页 work item，当前输入行最后一页同事务调整本侧 rows/counts，最后一行清理 continuation 并 Complete。
-Station durable active pin 保证 Claim 完成前对侧状态不变；continuation 只保存 port、row ordinal、本行 match marker 和排他 resume key，不复制 Subscription identity、Change 或 fingerprint。
-Inner 保持三资源热路径；无 residual 不访问 match counts；五种语义共用一个 Definition/runtime，不建立 per-kind Operation、arrangement、Join Station 或第二套执行协议。
+`EquiJoin` 的 tag 是 16，是两输入 `PagedTransform`；port 0 为 left，port 1 为 right。
+Definition 保留 `Inner/LeftSemi/LeftAnti/LeftOuter/FullOuter`、非空 equality pairs、output names 和可选 residual。
+所有表达式 immutable；每对 key exact 同型、flat non-float，NULL 不匹配。
+residual 在 `left.* + right.*` candidate Schema 上绑定，必须 Boolean，只有 non-null true qualifying。
 
-`EquiJoin` 的输入准备逐个求值并编码 key expression，释放当前 key array 后再处理下一个；全部 key 完成后才编码完整行。
-整批 admission 在任何输出发布前完成，不增加输入硬上限。
+两侧 rows 为 `OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>`，以完整 equality key 和 canonical row
+维护正 multiplicity。无 residual 的非 Inner 另有 `key_counts: OrderedMap<Vec<u8>, KeyCounts>`；
+有 residual 的非 Inner 用 `match_counts: OrderedMap<Vec<u8>, u64>` 按完整行保存 qualifying distinct opposite rows，
+FullOuter 跟踪双侧，其他 presence kind 只跟踪 left。zero counts 必须缺失。
+match-count key 为单字节 port 加 canonical row；不声明 operator continuation。
 
-错误边界是一笔 turn 事务。后续页面的 residual 求值、存储行解码、typed NULL output 或
-`i64` output-diff overflow 可能在前面页面已经发布后失败；合法输入和合法的两侧 multiplicity
-也可能触发计算错误。当前失败页全部回滚，之前提交的状态、输出与 continuation 保留，
-下游及外部 Sink 可能已经看到部分结果。状态可能停在一个输入行处理到一半的位置，
-不能把它解释为完整输入事件前缀的最终关系。只有 Complete 才确认整个 Claim。
+帧 Resume 唯一保存输入 ordinal 与私有 `found_match + exclusive opposite-row key`。
+窗口只准备本预算能处理的输入事件；key expression 逐组批量求值，释放当前 array 后处理下一组。
+每个事件在第一页从真实本侧权重准入，不保存全输入 RowEffect、影子关系或跨事务 prepared rows。
 
-reopen 从持久的排他游标继续，不重复已提交页，也不跳过失败页；确定性错误仍会在同处失败。
-恢复不补偿已发布输出、不自动删除状态，也不提供 skip 或修复坏 Claim 的接口。
-当前行的本侧 rows/counts 仅在最后一页更新，reopen 从当前行重建 admission；
-已提交的 actual support 与 continuation 共同描述行内进度。PreparedClaim 不缓存可推进的分页游标。
+页内批量扫描候选、求值 residual，并立即更新真实 support。
+outer null correction 与对应 pair 共同占一个 head work item，即使该项输出两行，也不二次扣 head 数量。
+最后一页调整本侧 rows/key counts；More 持久位置与状态和输出同事务。
+帧的 DFS 顺序保证当前输入处理完前对侧不被后续事件改变。
 
-成功执行时，对固定有序 `(port, Change)` 输入，展平后的有序 `(row, diff)` 输出不因分页变化而改变。
-turn 数会影响多输入 Flow 的调度交错，因此不承诺全图差分轨迹、输出时间、IPC 字节或
-RunningEventCount 结果不变；纯关系链在每源顺序相同且成功执行到静止后应得到相同最终关系。
-
-`PreparedClaim` 只为整批保留 canonical row、join key、diff 和 admission effect，不再保留每行的全量
-`ScalarValue`；每个 turn 处理当前 row 时，仅在 predicate 或真实输出需要字段值时，才从 Station 固定的
-`RecordBatch` 惰性物化一次短期 values。
-空 bucket、无输出存在性路径和稳定 Semi/Anti 右侧更新不会复制宽行。
-
-Residual 候选的
-常规单批上限是 256 行、1 MiB Store logical bytes 和 16,384 个 candidate scalar slots；实际行数还受
-candidate 字段数及当前 turn 剩余预算约束。
-每批会完整解码候选并构造 Arrow candidate batch，但
-LeftSemi/LeftAnti 的左侧 driving row 只保留 qualifying count，其他路径也只把 predicate 通过的候选
-values 带入当前输出阶段。
-
-`TURN_ITEMS` 和 `TURN_BYTES` 以 256 项和 4 MiB 限制常规单 turn 的逻辑扫描、ScalarValue slot、
-输出和事务工作量。
-分区扫描按每个候选重复计算 partition frame、完整 join key、row key 与 multiplicity，
-driving row 的持久访问也至少逐处理页计入；宽计算 key 或 LeftSemi/LeftAnti 的右侧宽行不会逃逸预算。
-
-这些值不是进程 RSS 硬上限：Station 仍已持有完整 Change，Arrow/DataFusion 可以产生
-额外中间分配，且空 turn 遇到单个超过批字节或 scalar-slot 界限的 Store row 时会单独处理它，以避免永久
-停滞。
-因此峰值至少是 `O(Claim + candidate page)`，还有“单个 oversized row”的活性例外。
-逐行
-`match_counts` 以完整 canonical row 为 key，持久状态与 tracked rows 的总宽度成正比；分页也不限制
-整个 Join 关系的磁盘大小，无法消除连接结果本身的高 fan-out 成本。
-
-Semi/Anti 同一 exact row 仅改变正 multiplicity 时不重扫对侧 bucket；right 更新不改变 support，left 更新直接读已有 actual count。
-Driving-row count 按 qualifying page 合并，对侧 distinct-row count 分别更新。
+晚期负权重、residual、codec 或 output diff overflow 只回滚当前页，先前提交页与帧保留。
+每次页事务后销毁运行实例，再从 Definition、Store 和 Resume 重构，必须得到相同下一页。
 
 ## AsOfJoin
 
-`AsOfJoin` 的 tag 是 17，是两输入 `TurnTransform`；port `0` 固定为 left/probe，port `1` 固定为 right/candidate。
-Definition 保存 `AsOfJoinKind::{Inner,LeftOuter,LeftSemi,LeftAnti}`、零或多组 `Equal`/`NotDistinct` equality pairs、非空 lexicographic order pairs、`Backward`/`Forward`/`Nearest` direction 与 exactness、nearest 等距偏好、显式 right tie-break、canonical/reject fallback、可选 inclusive tolerance、output names 和可选 candidate residual。
-Equality/order/tie 只接受左右精确同型且可稳定 canonical/order 编码的 flat non-float scalar；nearest/tolerance 只允许一个 distance-capable order，其类型为整数、Date32、Timestamp 或 Decimal128。
-它声明 `asof_join.left_rows`、`asof_join.right_rows: OrderedMap<Vec<u8>, RowWeight>` 与 `asof_join.continuation: Cell<AsOfContinuation>`，完整索引 key 依次编码 equality partition、order、right rank 和 canonical row；缺失代表零 multiplicity，只有 RHS presence 的 `0 ↔ positive` 才触发历史 rematch。
-每个 Claim 先按事件顺序整批 preflight 非负权重/overflow，再以持久的 outer/candidate cursors 单遍分页，不预演选择与输出。
-左事件在完成候选选择的同一 turn 更新 left state 并输出。右事件开始历史 rematch 时更新 right state，并与首个历史/候选游标同事务提交；每个历史左行的旧结果 `-left_weight` 与新结果 `+left_weight` 同事务发布。
-右侧 rematch 在前后 winner 相同、没有输出时直接跳过左行输出解码；Semi/Anti 即使 winner 改变，也只在存在性改变时解码左行。
-右行变更前后仅当前事件 key 的可见性不同；先前事件已在真实状态中，不再保存或模拟整批前缀。恢复时由当前输入行、持久游标及 right weight 重建 before/after 权重，不能重复应用已经提交的右侧变更。
-候选 right scan 和 RHS rematch 的 left outer scan 都从 matchable-order marker 精确 seek，不重复读取永不匹配的 NULL-order history。
-运行期只缓存 pinned Claim 的 prepared rows 与逐行准入后的权重；处理当前行时根据固定 diff 逆算变更前权重，不在跨 turn 缓存中再保存一份。可推进位置以 durable continuation 为准。rollback/reopen 从该位置继续，Complete 的缓存释放只在提交后执行；不持久化第二套 input identity。
+`AsOfJoin` 的 tag 是 17，是两输入 `PagedTransform`，固定 SQL left outer 输出。
+Definition 只有 direction/exactness、SQL equality pairs、一个 order pair 和 left-then-right output names。
+所有表达式 immutable、pair exact 同型、flat 可索引 non-float scalar；NULL equality/order 不匹配。
+nearest、tolerance、lexicographic order、residual、tie-break、NotDistinct、canonical fallback 和额外 kind 退休。
 
-错误边界与 EquiJoin 一致：晚期 residual、歧义、解码或输出 diff overflow 可以在早期页面已发布后失败。失败 turn 全部回滚，已提交的状态、输出与 continuation 保留，真实 Sink 可能已经看到部分结果。该状态可以停在单个事件处理到一半，不能解释为完整事件前缀的最终关系。
-Station active pin 保持同一未确认输入，只有 Complete 才 ACK。reopen 不重复已提交页、不跳过确定性错误、不补偿已发布结果，也不自动删除或改写已有状态。
-对固定有序输入成功执行时，展平的有序 `(row, diff)` 保持不变；turn 数减少可能改变全图调度交错，不承诺输出时间或事件计数轨迹不变。
+两侧为 `OrderedMap<Vec<u8>, NonZeroU64>`；当前开发期 v1 index key 依次编码 equality partition、order、canonical row，
+各部分使用零字节转义及终止符，order 首字节区分 NULL 与可匹配值。不保存 rank 或 operator continuation。
+同一 exact RHS row 的多份数只表示一个候选；不同 row 在同一 selected time 时拒绝歧义。
+没有受影响 left 时可以保留歧义 RHS bucket，之后探测或历史修改暴露它时确定性失败。
 
-没有 watermark/retention 时两侧关系永久保留。
-Right/Full ASOF 不属于当前 exact-row weighted relation：没有 occurrence identity 时 unmatched right copy 数量不能由输入关系唯一决定；不得用交换输入伪装成同一选择函数，也不得以任意 physical scan order 补定义。
+左事件直接按 direction/exactness 有界 seek 到最近的 order bucket；最多读两个 exact rows 判断歧义。
+候选探测若因字节上限提前截断，不能将未读部分当作不存在；不足两个探测项，或 overlay bucket 不足三个项且仍有 continuation 时，整页回滚并报预算不足。
+右事件只在 exact-row presence 的零/正边界变化时产生历史修正。
+当前真实 RHS 在全部修正页完成前保持 before 状态；event overlay 仅描述当前行的 after presence，
+只在最后一页将当前事件写入真实 RHS。Resume 只保存当前右事件最后已修正的 left key。
 
-候选搜索和 right-side rematch 都以 Store 的 owned page 进行。
-常规候选页最多 64 项、1 MiB
-logical Store bytes 和 16,384 个 `ScalarValue` slots；整个 turn 常规最多 256 项和 4 MiB 逻辑
-工作量。
-当空 turn 的首个 Store item 本身超限时，为了活性会单独接受它。
-因此普通运行时峰值是
-`O(pinned Claim + candidate page + turn output)`，而非整个 partition；单个 oversized row 仍是显式例外。
+影响区间按严格相邻 RHS 时刻定义。Backward inclusive 为 `[t,next)`，strict 为 `(t,next]`；
+Forward inclusive 为 `(prev,t]`，strict 为 `[prev,t)`，不存在邻居时该端延伸到 partition 边界。
+一页按此区间扫描多个 left；所有 left 共享该事件固定的 before/after winner，不逐 left 重扫整个 RHS history。
+每个 left 的 `-old,+new` 是同一修正原子，至少一次预算扣账；空区间和无输出也前进。
 
-这些边界限制一次 turn 的内存和事务放大，不限制整个关系的磁盘状态。
-没有 watermark 时两侧历史都
-必须保留。
-Residual 可以让最近候选不合格，所以当前正确性路径要分页扫描整个 right partition；
-right presence transition 还要扫描该 partition 的全部 left rows，并对每个 left row 完成候选搜索。
-因而普通左侧
-lookup 成本与候选 partition 大小成正比，最坏右侧历史修正是该 partition 左右状态的乘积；分页只保证
-每个 turn 有界，不会隐藏总成本。
-候选 right scan 与 rematch left scan 都从索引内的
-matchable-order marker 直接 seek，不会读取 order 为 NULL、因而永远不可能参与匹配的历史。
+状态与 output/Resume 同事务；晚页歧义、权重或 diff overflow 保留早页和失败帧。
+reopen 不补偿早页，也不自动修复已有关系或帧。
 
-AsOfContinuation 保存 port、当前行序号、outer/candidate cursor、已经找到的 before/after winner 与歧义标记；当前开发期 v1 value 以原有标记字节 `1` 起始，其余字段按该顺序使用 big-endian varint bincode/Serde 编码，不含 phase。解码拒绝截断、尾随字节和非规范整数编码。受影响旧状态重建，不增加格式识别或迁移。
+## 共享分页与验证
 
-ASOF 的 `Equal` 在任一 NULL equality 分量时不匹配，`NotDistinct` 允许 NULL 分区；NULL order 永远不匹配。
+计算运行实例只能保存编译表达式、布局和 typed handles。
+Resume 是唯一 ordinal 加强类型 cursor，严格 StoreValue codec 限制 control 为 64 KiB，拒绝截断、尾随字节、
+非规范 varint、未知 variant 和超长 cursor。输入与 variant/Schema/port 的绑定由 kernel 校验。
+正常续页的 cursor 绑定验证复用当前驱动行的批量准备，并计入同一 StepBudget；仅恢复检查拥有独立的有界只读额度。
 
-Residual 在候选排名前求值，false/NULL 跳过并继续找更远候选。
-right-only tie-break 每项显式指定升降序和 NULL first/last；
-最终 fallback 必须明确为歧义拒绝或 canonical right row 升/降序。
-同一 right row 的正 multiplicity 只表示候选存在，不再次乘进左侧输出权重。
+一个 StepBudget 贯穿 head 与全部 Atomic tails：head 计输入/扫描/修正数量，所有项共享实际逻辑 bytes。
+Store scans 在读前传 byte bound；已知 key/value/output writes 在写前计费。
+候选扫描成功即计入已读字节，即使后续输出准入拒绝该页；canonical 编码失败前已复制的前缀仍计费。
+需要构造完整行及索引副本时，先无复制检查 canonical 大小，再准入并编码，不能把失败分配留在重试预算之外。
+canonical row 解码先无分配检查 framing，并将顶层及全部嵌套 scalar 槽位、已知 Arrow payload 计入同一预算；
+List 声明的整个临时 scalar Vec，以及嵌套数组转换的 owned/borrowed array Vec 槽位，在遍历和分配前准入；
+NULL Struct/List 的 Arrow shape 也计费。这是已知逻辑 scratch 与 payload 的准入，Arrow concat 的全部内部暂存不构成 RSS 硬界。
+预算不足回滚整页，Flow 以同一 input 和 Resume 确定性减半 head 额度；最小工作项仍超限时返回 `BudgetExceeded`。
+表达式输出仍可能额外分配；这些逻辑工作界不承诺进程 RSS 或执行时间硬界。
 
-Tolerance 使用 order 的物理单位且包含端点，只限制匹配，不授权清理历史。
+correctness 覆盖五种 EquiJoin 与四种 residual 配置的 independent bag oracle、weighted 插删、NULL、
+逐页 rollback 和完整 runtime 重构、晚页负事件、fanout、4096 空 bucket 的批量推进。
+ASOF 覆盖 Forward/Backward strict/inclusive independent bag、相邻时刻插删、重复同 row multiplicity、
+NULL、空区间、歧义暴露和最後页 RHS 落账。Flow 负责 root/child/send/queue 的持久故障窗口和融合 tail 回滚。
 
-
-## EquiJoin 源码分工
-
-`equi_join/runtime.rs` 拥有分页推进、continuation 和持久写入；私有子模块 `runtime/matches.rs` 拥有候选扫描、residual 与批次预算，`runtime/output.rs` 拥有结果构造、修正和 checked diff 验证。
-这些模块仍操作同一个运行对象，不增加 Context、Engine、每种 Join kind 的对象或第二套执行协议。
+EquiJoin 私有 `runtime/matches.rs` 维护候选扫描和 residual 批次，`runtime/output.rs` 维护结果构造和 checked diff。
+ASOF 只有直接的 indexed kernel 与 index codec，不建立通用候选注册、排名层或共享增量框架。

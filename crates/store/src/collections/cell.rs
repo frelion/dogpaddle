@@ -87,7 +87,7 @@ impl<T: StoreValue> CellAccess<'_, T> {
     ///
     /// Returns an error when storage access or value decoding fails.
     pub fn get(&self) -> Result<Option<T>, StoreError> {
-        read_cell(self.data.as_read())
+        self.get_bounded(usize::MAX)
     }
 
     /// Replaces the current value.
@@ -113,8 +113,8 @@ impl<T: StoreValue> CellAccess<'_, T> {
     }
 }
 
-impl CellAccess<'_, Vec<u8>> {
-    /// Reads the current byte value only when its encoded length is within `max_bytes`.
+impl<T: StoreValue> CellAccess<'_, T> {
+    /// Reads the current typed value only when its encoded length is within `max_bytes`.
     ///
     /// The length is checked through the transaction's pinned value before an
     /// owned payload is constructed. [`StoreError::ItemTooLarge`] is retryable,
@@ -124,8 +124,8 @@ impl CellAccess<'_, Vec<u8>> {
     ///
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
-    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
-        self.data.as_read().get_bounded(CELL_KEY, max_bytes)
+    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<T>, StoreError> {
+        read_cell_bounded(self.data.as_read(), max_bytes)
     }
 }
 
@@ -136,12 +136,12 @@ impl<T: StoreValue> CellReadAccess<'_, T> {
     ///
     /// Returns an error when storage access or value decoding fails.
     pub fn get(&self) -> Result<Option<T>, StoreError> {
-        read_cell(&self.data)
+        self.get_bounded(usize::MAX)
     }
 }
 
-impl CellReadAccess<'_, Vec<u8>> {
-    /// Reads the current byte value only when its encoded length is within `max_bytes`.
+impl<T: StoreValue> CellReadAccess<'_, T> {
+    /// Reads the current typed value only when its encoded length is within `max_bytes`.
     ///
     /// The length is checked through the read transaction's pinned value before
     /// an owned payload is constructed.
@@ -150,16 +150,19 @@ impl CellReadAccess<'_, Vec<u8>> {
     ///
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
-    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
-        self.data.get_bounded(CELL_KEY, max_bytes)
+    pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<T>, StoreError> {
+        read_cell_bounded(&self.data, max_bytes)
     }
 }
 
-fn read_cell<T: StoreValue>(data: &ReadDataAccess<'_>) -> Result<Option<T>, StoreError> {
-    let encoded = data.get(CELL_KEY)?;
+fn read_cell_bounded<T: StoreValue>(
+    data: &ReadDataAccess<'_>,
+    max_bytes: usize,
+) -> Result<Option<T>, StoreError> {
+    let encoded = data.get_bounded(CELL_KEY, max_bytes)?;
     data.poison_on_error(
         encoded
-            .map(|encoded| T::decode_value(Cow::Owned(encoded)))
+            .map(|bytes| T::decode_value(Cow::Owned(bytes)))
             .transpose(),
     )
     .map_err(StoreError::from)

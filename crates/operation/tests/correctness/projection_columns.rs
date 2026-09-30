@@ -5,12 +5,12 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, ProjectionError, RuntimeResource, col, decode_definition,
     encode_definition,
-    operation::{Action, OperationInput, transform::SelectDefinition},
+    operation::{OperationInput, transform::SelectDefinition},
 };
 use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
-    TestStore, change, commit_ready, project_input_schema, rollback_ready, turn_input,
+    TestStore, change, project_input_schema, rollback_input, run_input, step_input,
 };
 
 fn decoded_definition() -> OperationDefinition {
@@ -48,14 +48,14 @@ fn project_rejects_invalid_port_and_schema_drift() {
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut project, _) = constructed.into_parts();
+    let (project, _) = constructed.into_parts();
     let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
-    let invalid_port = rollback_ready(
-        &mut project,
-        Some(OperationInput {
+    let invalid_port = rollback_input(
+        &project,
+        OperationInput {
             port: 1,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();
@@ -65,8 +65,7 @@ fn project_rejects_invalid_port_and_schema_drift() {
     ));
 
     let drifted = change(&[1]);
-    let error =
-        rollback_ready(&mut project, Some(turn_input(&drifted)), &mut transactions).unwrap_err();
+    let error = rollback_input(&project, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectionError>(),
         Some(ProjectionError::InputSchemaMismatch)
@@ -86,11 +85,9 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Project did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), 2);
@@ -117,10 +114,10 @@ fn project_preserves_rows_diffs_and_selected_arrow_buffers_without_store_state()
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    let Some(reopened_output) =
+        run_input(&operation, step_input(&input), &mut transactions).unwrap()
     else {
         panic!("reopened Project did not complete with one output Change");
     };

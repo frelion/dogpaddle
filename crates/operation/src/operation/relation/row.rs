@@ -1,6 +1,6 @@
 //! Exact row identity shared by stateful relational operations.
 
-use std::sync::Arc;
+use std::{mem::size_of, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion_common::ScalarValue;
 use thiserror::Error;
 
-use crate::operation::OperationError;
+use crate::operation::{OperationError, StepBudget};
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RowError {
@@ -48,18 +48,6 @@ pub(crate) enum RowError {
     InvalidValue,
 }
 
-pub(crate) fn canonical_row(batch: &RecordBatch, index: usize) -> Result<Vec<u8>, OperationError> {
-    canonical_row_with_limit(batch, index, None)
-}
-
-pub(crate) fn canonical_row_bounded(
-    batch: &RecordBatch,
-    index: usize,
-    max_bytes: usize,
-) -> Result<Vec<u8>, OperationError> {
-    canonical_row_with_limit(batch, index, Some(max_bytes))
-}
-
 pub(crate) fn canonical_row_size_bounded(
     batch: &RecordBatch,
     index: usize,
@@ -89,10 +77,10 @@ pub(crate) fn canonical_row_size_bounded(
     Ok(size)
 }
 
-fn canonical_row_with_limit(
+pub(crate) fn canonical_row_bounded(
     batch: &RecordBatch,
     index: usize,
-    max_bytes: Option<usize>,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, OperationError> {
     let mut bytes = Vec::new();
     if index >= batch.num_rows() {
@@ -110,7 +98,7 @@ fn canonical_row_with_limit(
             index,
             &mut path,
             &mut bytes,
-            max_bytes,
+            Some(max_bytes),
         );
         path.pop();
         result?;
@@ -287,10 +275,136 @@ pub(crate) fn row_hash(bytes: &[u8]) -> [u8; 16] {
         .expect("the truncated hash is exactly 16 bytes")
 }
 
-pub(crate) fn decode_canonical_row(
+/// Admits every nested scalar slot and known Arrow payload before reconstruction.
+pub(crate) fn decode_canonical_row_bounded(
     schema: &Schema,
     encoded: &[u8],
-) -> Result<Vec<ScalarValue>, RowError> {
+    budget: &mut StepBudget,
+) -> Result<Vec<ScalarValue>, OperationError> {
+    budget.charge(
+        schema
+            .fields()
+            .len()
+            .saturating_mul(size_of::<ScalarValue>()),
+    )?;
+    let mut cursor = RowCursor::new(encoded);
+    for field in schema.fields() {
+        admit_decoded_value(field, &mut cursor, budget)?;
+    }
+    cursor.finish()?;
+    Ok(decode_canonical_row(schema, encoded)?)
+}
+
+fn admit_decoded_value(
+    field: &Field,
+    cursor: &mut RowCursor<'_>,
+    budget: &mut StepBudget,
+) -> Result<(), OperationError> {
+    match cursor.u8()? {
+        0 => {
+            if !field.is_nullable() && !matches!(field.data_type(), DataType::Null) {
+                return Err(RowError::UnexpectedNull {
+                    field: field.name().to_owned(),
+                }
+                .into());
+            }
+            admit_null_array(field.data_type(), 1, budget)?;
+        }
+        1 => match field.data_type() {
+            DataType::Null => return Err(RowError::InvalidNullMarker.into()),
+            DataType::Utf8 | DataType::Binary => {
+                let value = cursor.bytes()?;
+                if matches!(field.data_type(), DataType::Utf8) {
+                    std::str::from_utf8(value).map_err(|_| RowError::InvalidUtf8)?;
+                }
+                // Owned scalar payload, reconstructed Arrow payload and offsets.
+                budget.charge(value.len().saturating_mul(2).saturating_add(5))?;
+            }
+            DataType::List(child) => {
+                let length = cursor.length()?;
+                i32::try_from(length).map_err(|_| RowError::LengthOverflow)?;
+                if length > cursor.remaining_len() {
+                    return Err(RowError::Truncated.into());
+                }
+                // Scalar reconstruction plus iter_to_array's owned and borrowed
+                // array vectors are all admitted before walking the list.
+                budget.charge(
+                    length
+                        .saturating_mul(
+                            size_of::<ScalarValue>()
+                                + size_of::<ArrayRef>()
+                                + size_of::<&dyn Array>(),
+                        )
+                        .saturating_add(8 + 2 * size_of::<ArrayRef>()),
+                )?;
+                for _ in 0..length {
+                    admit_decoded_value(child, cursor, budget)?;
+                }
+            }
+            DataType::Struct(fields) => {
+                budget.charge(
+                    fields
+                        .len()
+                        .saturating_mul(size_of::<ScalarValue>() + size_of::<ArrayRef>()),
+                )?;
+                for child in fields {
+                    admit_decoded_value(child, cursor, budget)?;
+                }
+            }
+            data_type => {
+                let width = if matches!(data_type, DataType::Boolean) {
+                    1
+                } else {
+                    data_type.primitive_width().ok_or(RowError::InvalidValue)?
+                };
+                cursor.skip(width)?;
+                // One-value buffers, including nullable children of nested arrays.
+                budget.charge(width.saturating_add(1))?;
+            }
+        },
+        _ => return Err(RowError::InvalidNullMarker.into()),
+    }
+    Ok(())
+}
+
+fn admit_null_array(
+    data_type: &DataType,
+    rows: usize,
+    budget: &mut StepBudget,
+) -> Result<(), OperationError> {
+    match data_type {
+        DataType::Null => {}
+        DataType::List(child) => {
+            budget.charge(
+                rows.saturating_add(1)
+                    .saturating_mul(4)
+                    .saturating_add(2 * size_of::<ArrayRef>()),
+            )?;
+            admit_null_array(child.data_type(), 0, budget)?;
+        }
+        DataType::Struct(fields) => {
+            budget.charge(fields.len().saturating_mul(size_of::<ArrayRef>()))?;
+            for child in fields {
+                admit_null_array(child.data_type(), rows, budget)?;
+            }
+        }
+        DataType::Utf8 | DataType::Binary => {
+            budget.charge(rows.saturating_add(1).saturating_mul(4))?;
+        }
+        data_type => {
+            let width = if matches!(data_type, DataType::Boolean) {
+                1
+            } else {
+                data_type.primitive_width().ok_or(RowError::InvalidValue)?
+            };
+            budget.charge(rows.saturating_mul(width))?;
+        }
+    }
+    budget.charge(rows.div_ceil(8))?;
+    Ok(())
+}
+
+fn decode_canonical_row(schema: &Schema, encoded: &[u8]) -> Result<Vec<ScalarValue>, RowError> {
     let mut cursor = RowCursor::new(encoded);
     let values = schema
         .fields()
@@ -437,6 +551,15 @@ impl<'a> RowCursor<'a> {
             .ok_or(RowError::Truncated)?;
         self.remaining = remaining;
         Ok(value)
+    }
+
+    fn skip(&mut self, length: usize) -> Result<(), RowError> {
+        let (_, remaining) = self
+            .remaining
+            .split_at_checked(length)
+            .ok_or(RowError::Truncated)?;
+        self.remaining = remaining;
+        Ok(())
     }
 
     const fn remaining_len(&self) -> usize {
@@ -738,18 +861,26 @@ mod tests {
         .unwrap();
 
         for row in 0..records.num_rows() {
-            let encoded = canonical_row(&records, row).unwrap();
+            let encoded = canonical_row_bounded(&records, row, usize::MAX).unwrap();
             assert_eq!(
                 canonical_row_size_bounded(&records, row, encoded.len()).unwrap(),
                 encoded.len()
             );
-            let decoded = decode_canonical_row(&schema, &encoded).unwrap();
+            let decoded = decode_canonical_row_bounded(
+                &schema,
+                &encoded,
+                &mut StepBudget::new(1, 4 * 1024 * 1024),
+            )
+            .unwrap();
             let columns = decoded
                 .iter()
                 .map(|value| value.to_array_of_size(1).unwrap())
                 .collect();
             let rebuilt = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-            assert_eq!(canonical_row(&rebuilt, 0).unwrap(), encoded);
+            assert_eq!(
+                canonical_row_bounded(&rebuilt, 0, usize::MAX).unwrap(),
+                encoded
+            );
         }
     }
 
@@ -777,7 +908,7 @@ mod tests {
         )
         .unwrap();
         for index in 0..records.num_rows() {
-            let encoded = canonical_row(&records, index).unwrap();
+            let encoded = canonical_row_bounded(&records, index, usize::MAX).unwrap();
             assert_eq!(
                 canonical_row_size_bounded(&records, index, encoded.len()).unwrap(),
                 encoded.len()
@@ -806,5 +937,116 @@ mod tests {
             decode_canonical_row(&schema, &beyond_remaining),
             Err(RowError::Truncated)
         );
+        for (encoded, expected) in [
+            (&too_wide, RowError::LengthOverflow),
+            (&beyond_remaining, RowError::Truncated),
+        ] {
+            let error = decode_canonical_row_bounded(
+                &schema,
+                encoded,
+                &mut StepBudget::new(1, 4 * 1024 * 1024),
+            )
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<RowError>(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn nested_list_scratch_is_admitted_before_decoding_compact_null_elements() {
+        let schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
+            false,
+        )]);
+        let length = 128 * 1024_usize;
+        let mut encoded = vec![1];
+        encoded.extend_from_slice(&u64::try_from(length).unwrap().to_be_bytes());
+        encoded.resize(encoded.len() + length, 0);
+        let mut tight = StepBudget::new(1, 4 * 1024 * 1024);
+        let error = decode_canonical_row_bounded(&schema, &encoded, &mut tight).unwrap_err();
+        assert!(error.is::<crate::operation::BudgetExceeded>());
+        // The known oversized Vec rejects before inspecting the first child.
+        let mut malformed = encoded.clone();
+        malformed[9] = 7;
+        let error = decode_canonical_row_bounded(
+            &schema,
+            &malformed,
+            &mut StepBudget::new(1, 4 * 1024 * 1024),
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::operation::BudgetExceeded>());
+        let mut enough = StepBudget::new(1, 64 * 1024 * 1024);
+        let values = decode_canonical_row_bounded(&schema, &encoded, &mut enough).unwrap();
+        let ScalarValue::List(values) = &values[0] else {
+            panic!("the decoded value remains a List");
+        };
+        assert_eq!(values.value(0).len(), length);
+        assert!(64 * 1024 * 1024 - enough.remaining_bytes() >= length * size_of::<ScalarValue>());
+        let error = decode_canonical_row_bounded(
+            &schema,
+            &malformed,
+            &mut StepBudget::new(1, 64 * 1024 * 1024),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RowError>(),
+            Some(RowError::InvalidNullMarker)
+        ));
+    }
+
+    #[test]
+    fn nested_array_vectors_fit_only_after_their_per_item_slots_are_admitted() {
+        let length = 64_usize;
+        let scalar_slot = size_of::<ScalarValue>();
+        let array_slots = size_of::<ArrayRef>() + size_of::<&dyn Array>();
+        let list_container = 8 + 2 * size_of::<ArrayRef>();
+        for child_type in [
+            DataType::List(Arc::new(Field::new("leaf", DataType::Null, true))),
+            DataType::Struct(Fields::empty()),
+        ] {
+            let empty_child_list = matches!(&child_type, DataType::List(_));
+            let schema = Schema::new(vec![Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", child_type, false))),
+                false,
+            )]);
+            let mut encoded = vec![1];
+            encoded.extend_from_slice(&u64::try_from(length).unwrap().to_be_bytes());
+            let mut child_encoded = vec![1];
+            if empty_child_list {
+                child_encoded.extend_from_slice(&0_u64.to_be_bytes());
+            }
+            for _ in 0..length {
+                encoded.extend_from_slice(&child_encoded);
+            }
+            let outer_slots = scalar_slot + length * (scalar_slot + array_slots) + list_container;
+            let child_slots = if empty_child_list {
+                length * list_container
+            } else {
+                0
+            };
+            let total = outer_slots + child_slots;
+            // The previous charge omitted exactly these two per-item vectors.
+            let mut old_allowance = StepBudget::new(1, total - length * array_slots);
+            let error =
+                decode_canonical_row_bounded(&schema, &encoded, &mut old_allowance).unwrap_err();
+            assert!(error.is::<crate::operation::BudgetExceeded>());
+            let mut malformed = encoded.clone();
+            malformed[9] = 7;
+            let error = decode_canonical_row_bounded(
+                &schema,
+                &malformed,
+                &mut StepBudget::new(1, outer_slots - 1),
+            )
+            .unwrap_err();
+            assert!(error.is::<crate::operation::BudgetExceeded>());
+            let mut exact = StepBudget::new(1, total);
+            let decoded = decode_canonical_row_bounded(&schema, &encoded, &mut exact).unwrap();
+            assert_eq!(exact.remaining_bytes(), 0);
+            let ScalarValue::List(decoded) = &decoded[0] else {
+                panic!("the decoded outer value remains a List");
+            };
+            assert_eq!(decoded.value(0).len(), length);
+        }
     }
 }

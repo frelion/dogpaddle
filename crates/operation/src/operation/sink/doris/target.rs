@@ -59,6 +59,12 @@ impl DorisTarget {
         }
         if self.connection.is_none() {
             let mut connection = self.config.connect()?;
+            connection
+                .query_drop("SET query_timeout = 5")
+                .map_err(|_| database("set statement deadline"))?;
+            connection
+                .query_drop("SET exec_mem_limit = 67108864")
+                .map_err(|_| database("set statement memory limit"))?;
             let ids: Vec<u64> = connection
                 .query("SELECT DISTINCT ClusterId FROM frontends()")
                 .map_err(|_| database("read cluster identity"))?;
@@ -171,7 +177,7 @@ impl DorisTarget {
     ) -> Result<(), DorisSinkError> {
         let expected_rows = output.len().saturating_add(clauses.len());
         let sql = format!("{} ORDER BY n, id IS NULL, id", clauses.join(" UNION ALL "));
-        let result: Result<Vec<(u64, Option<u64>, u64)>, _> =
+        let result: Result<Vec<(u64, Option<u64>)>, _> =
             self.connect()?.exec(sql, Params::Positional(parameters));
         let Ok(rows) = result else {
             self.connection = None;
@@ -179,25 +185,19 @@ impl DorisTarget {
             return Err(database("match target rows"));
         };
         let mut current = None;
-        for (request_index, id, count) in rows {
+        for (request_index, id) in rows {
             let request_index = usize::try_from(request_index)
                 .map_err(|_| database("decode matching request index"))?;
             if current != Some(request_index) {
                 if request_index != output.len() {
                     return Err(database("decode matching request order"));
                 }
-                output.push(Matches {
-                    count,
-                    ids: Vec::new(),
-                });
+                output.push(Matches { ids: Vec::new() });
                 current = Some(request_index);
             }
             let matched = output
                 .last_mut()
                 .expect("a matching request was installed above");
-            if matched.count != count || (id.is_none() && count != 0) {
-                return Err(database("decode matching-row count"));
-            }
             if let Some(id) = id {
                 matched.ids.push(id);
             }
@@ -441,16 +441,15 @@ fn lookup_clause(
 ) -> String {
     debug_assert!(request.take > 0);
     format!(
-        "(SELECT {request_index} AS n, id, count FROM \
-         (SELECT id, count(id) OVER () AS count FROM \
+        "(SELECT {request_index} AS n, id FROM \
          ((SELECT {} AS id FROM {} WHERE {} = 0 AND {predicate} ORDER BY {} LIMIT {}) \
-         UNION ALL SELECT CAST(NULL AS BIGINT) AS id) AS matched) AS counted \
+         UNION ALL SELECT CAST(NULL AS BIGINT) AS id) AS matched \
          ORDER BY id IS NULL, id LIMIT {})",
         quote(TECHNICAL_ID),
         qualified(spec.database(), &spec.state_table()),
         quote(TECHNICAL_DELETED),
         quote(TECHNICAL_ID),
-        request.needed,
+        request.take,
         request.take
     )
 }
@@ -833,20 +832,18 @@ mod live_tests {
                 &[
                     Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     },
                     Lookup {
                         row_index: 1,
-                        needed: 1,
                         take: 1,
                     },
                 ],
             )
             .unwrap();
-        assert_eq!(found[0].count, 1);
+        assert_eq!(found[0].ids.len() as u64, 1);
         assert_eq!(found[0].ids, [1]);
-        assert_eq!(found[1].count, 0);
+        assert_eq!(found[1].ids.len() as u64, 0);
         assert!(found[1].ids.is_empty());
 
         let rebound = Batch {
@@ -879,12 +876,12 @@ mod live_tests {
                     &input,
                     &[Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     }],
                 )
                 .unwrap()[0]
-                .count,
+                .ids
+                .len(),
             0
         );
         let mut connection = target.config.connect().unwrap();
@@ -907,7 +904,6 @@ mod live_tests {
                     &input,
                     &[Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     }],
                 )
@@ -965,12 +961,11 @@ mod live_tests {
                 &input,
                 &[Lookup {
                     row_index: 0,
-                    needed: 1024,
                     take: 1024,
                 }],
             )
             .unwrap();
-        assert_eq!(found[0].count, 1024);
+        assert_eq!(found[0].ids.len() as u64, 1024);
         assert_eq!(found[0].ids.len(), 1024);
         cleanup(&target.config);
     }

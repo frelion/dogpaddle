@@ -88,10 +88,12 @@ impl RunningEventCountDefinition {
 
 impl AtomicOperation for RunningEventCountOperation {
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         access: TransactionAccess<'_>,
+        budget: &mut crate::operation::StepBudget,
     ) -> Result<Option<Change>, OperationError> {
+        budget.charge(crate::operation::logical_change_bytes(input.change))?;
         if input.port != 0 {
             return Err(RunningEventCountError::InvalidInputPort { port: input.port }.into());
         }
@@ -99,8 +101,11 @@ impl AtomicOperation for RunningEventCountOperation {
             return Err(RunningEventCountError::InputSchemaMismatch.into());
         }
 
+        budget.charge(16_usize.saturating_add(input.change.num_rows().saturating_mul(16)))?;
         let mut count = self.count.access(access)?;
-        let current = count.get()?.unwrap_or_default();
+        let current = count
+            .get_bounded(std::mem::size_of::<u64>())?
+            .unwrap_or_default();
         let rows =
             u64::try_from(input.change.num_rows()).map_err(|_| RunningEventCountError::Overflow)?;
         let final_count = current

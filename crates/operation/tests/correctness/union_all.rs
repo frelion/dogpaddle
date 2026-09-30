@@ -7,15 +7,15 @@ use dogpaddle_operation::{
     DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
     decode_definition, encode_definition,
     operation::{
-        Action, OperationInput,
+        OperationInput,
         transform::{UnionAllDefinition, UnionAllError, UnionAllSchemaError},
     },
 };
 use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
-    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
-    construct_checked, decode_hex, rollback_ready, value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, construct_checked,
+    decode_hex, rollback_input, run_input, value_schema,
 };
 
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
@@ -133,15 +133,15 @@ fn union_all_forwards_every_legal_port_without_copying() {
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = setup.commit(fixture.path(), |_| Ok(())).unwrap();
     for port in 0..2 {
-        let Action::Complete(Some(output)) = commit_ready(
-            &mut operation,
-            Some(OperationInput {
+        let Some(output) = run_input(
+            &operation,
+            OperationInput {
                 port,
                 change: &input,
-            }),
+            },
             &mut transactions,
         )
         .unwrap() else {
@@ -151,12 +151,12 @@ fn union_all_forwards_every_legal_port_without_copying() {
     }
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
+    let error = rollback_input(
+        &operation,
+        OperationInput {
             port: 1,
             change: &drifted,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();
@@ -182,14 +182,14 @@ fn union_all_forwards_every_legal_port_without_copying() {
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_output)) = commit_ready(
-        &mut operation,
-        Some(OperationInput {
+    let Some(reopened_output) = run_input(
+        &operation,
+        OperationInput {
             port: 1,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap() else {
@@ -211,14 +211,14 @@ fn runtime_rejects_missing_and_invalid_ports() {
             RuntimeResource::none(),
         )
         .unwrap();
-    let (mut operation, _) = constructed.into_parts();
+    let (operation, _) = constructed.into_parts();
     let mut transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
+    let error = rollback_input(
+        &operation,
+        OperationInput {
             port: 2,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();

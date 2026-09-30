@@ -201,7 +201,6 @@ fn lookup_row(request_index: usize, request: &Lookup, row: &EncodedRow) -> Strin
     debug_assert!(request.take > 0);
     let mut values = vec![
         request_index.to_string(),
-        request.needed.to_string(),
         request.take.to_string(),
         string_literal(&row.hash),
     ];
@@ -216,7 +215,6 @@ impl ClickHouseTarget {
         output: &mut Vec<Matches>,
     ) -> Result<(), ClickHouseSinkError> {
         let request_columns = std::iter::once("n UInt64".to_owned())
-            .chain(std::iter::once("needed UInt64".to_owned()))
             .chain(std::iter::once("take UInt64".to_owned()))
             .chain(std::iter::once("hash FixedString(32)".to_owned()))
             .chain(
@@ -232,11 +230,11 @@ impl ClickHouseTarget {
         let join = lookup_join_predicate(self.codec.layout());
         let sql = format!(
             "WITH requests AS (SELECT * FROM values({}, {})) \
-             SELECT r.n, least(countIf(isNotNull(s.id)), any(r.needed)) AS count, \
-             arraySlice(arraySort(groupArrayIf(assumeNotNull(s.id), isNotNull(s.id))), 1, any(r.take)) AS ids \
+             SELECT r.n, \
+             arraySlice(groupArraySortedIf(1024)(assumeNotNull(s.id), isNotNull(s.id)), 1, any(r.take)) AS ids \
              FROM requests AS r LEFT JOIN \
              (SELECT {} AS id, {} AS hash{} FROM {} FINAL WHERE {} = 0 AND {} IN (SELECT hash FROM requests)) AS s ON {} \
-             GROUP BY r.n ORDER BY r.n SETTINGS join_use_nulls = 1 FORMAT JSONCompactEachRow",
+             GROUP BY r.n ORDER BY r.n SETTINGS join_use_nulls = 1, max_execution_time = 5, timeout_overflow_mode = 'throw', max_memory_usage = 67108864 FORMAT JSONCompactEachRow",
             string_literal(&request_columns),
             rows.join(","),
             quote(TECHNICAL_ID),
@@ -252,7 +250,7 @@ impl ClickHouseTarget {
         for line in body.lines().filter(|line| !line.is_empty()) {
             let values: Vec<Value> =
                 serde_json::from_str(line).map_err(|_| invalid_response("match target rows"))?;
-            let [n, count, ids] = values.as_slice() else {
+            let [n, ids] = values.as_slice() else {
                 return Err(invalid_response("match target rows"));
             };
             if value_ref_u64(n, "match target rows")?
@@ -260,14 +258,13 @@ impl ClickHouseTarget {
             {
                 return Err(invalid_response("match target rows"));
             }
-            let count = value_ref_u64(count, "match target rows")?;
             let ids = ids
                 .as_array()
                 .ok_or_else(|| invalid_response("match target rows"))?
                 .iter()
                 .map(|id| value_ref_u64(id, "match target rows"))
                 .collect::<Result<Vec<_>, _>>()?;
-            output.push(Matches { count, ids });
+            output.push(Matches { ids });
         }
         if output.len() != expected_rows {
             return Err(invalid_response("match target rows"));
@@ -835,20 +832,18 @@ mod live_tests {
                 &[
                     Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     },
                     Lookup {
                         row_index: 1,
-                        needed: 1,
                         take: 1,
                     },
                 ],
             )
             .unwrap();
-        assert_eq!(found[0].count, 1);
+        assert_eq!(found[0].ids.len() as u64, 1);
         assert_eq!(found[0].ids, [1]);
-        assert_eq!(found[1].count, 0);
+        assert_eq!(found[1].ids.len() as u64, 0);
         assert!(found[1].ids.is_empty());
 
         let rebound = Batch {
@@ -892,12 +887,12 @@ mod live_tests {
                     &input,
                     &[Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     }],
                 )
                 .unwrap()[0]
-                .count,
+                .ids
+                .len(),
             0
         );
         target
@@ -924,7 +919,6 @@ mod live_tests {
                     &input,
                     &[Lookup {
                         row_index: 0,
-                        needed: 1,
                         take: 1,
                     }],
                 )
@@ -982,16 +976,12 @@ mod live_tests {
         }
         let first = ROWS - LOOKUPS;
         let requests = (first..ROWS)
-            .map(|row_index| Lookup {
-                row_index,
-                needed: 1,
-                take: 1,
-            })
+            .map(|row_index| Lookup { row_index, take: 1 })
             .collect::<Vec<_>>();
         let found = target.lookup(&input, &requests).unwrap();
         assert_eq!(found.len(), LOOKUPS);
         for (offset, matches) in found.into_iter().enumerate() {
-            assert_eq!(matches.count, 1);
+            assert_eq!(matches.ids.len() as u64, 1);
             assert_eq!(matches.ids, [u64::try_from(first + offset + 1).unwrap()]);
         }
         cleanup(&target.config);

@@ -7,10 +7,10 @@
 
 具体 `XxxOperation` 运行类型及其构造入口只在 operation crate 内可见；公共调用方通过 `OperationDefinition::construct` 的统一 checked 入口得到 `Operation`，不另设手工装配入口。
 
-`OperationDefinition` 是内建算子的封闭 enum。具体 Definition 只保存自身的计划数据；公共 enum 明确列出允许进入 Flow 的算子，并集中给出每个 variant 的 `OperationKind::Scan`、`AtomicTransform(NonZeroU32)`、`TurnTransform(NonZeroU32)` 或 `Sink(NonZeroU32)`。role、融合资格与非零 input arity 不能从拓扑位置、空 data 或持久化 tag 反向推断。
-每个 Station 包含非空、有序的普通 Operation 列表：首项可以是 Scan、任意 arity 的 Atomic 或 TurnTransform，之后只能是单输入 Atomic；Sink 必须独占。
-TurnTransform 使用完整 turn/continuation 协议，但其未提交 turn 必须能从未变化的 durable state 重放，因此允许吸收 Atomic 尾链。
-首项决定 Station 的输入角色与 arity，末项决定 output 属性，Flow 只校验 Station，不能枚举具体算子。
+`OperationDefinition` 是内建算子的封闭 enum。具体 Definition 只保存自身的计划数据；公共 enum 明确列出允许进入 Flow 的算子，并集中给出每个 variant 的 `OperationKind::Scan`、`AtomicTransform(NonZeroU32)`、`PagedTransform(NonZeroU32)` 或 `Sink(NonZeroU32)`。role、融合资格与非零 input arity 不能从拓扑位置、空 data 或持久化 tag 反向推断。
+head 可接非空或空的单输入 Atomic 尾链，融合索引只在内存中存在，不拥有独立 ID、持久资源或生命周期。
+PagedTransform 使用借用 Resume 的 step；未提交页从未变化的真实状态和帧位置重算。
+Source/Sink 使用具体 capture/delivery 数据协议，不参与通用 prepared/callback 执行接口。
 普通关系表达式统一要求 immutable、逐行可执行；Definition 构造与 decode 都执行相同准入规则，不能借恢复绕过。
 Filter、Select、SchemaAlign、Aggregate 固定声明 Atomic；Aggregate 同时检查 group expression 与 call argument。
 `OperationDefinition::construct` 把有序、精确的 input logical `SchemaRef`、已限定资源名范围的短期 `DataScope` 和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
@@ -22,10 +22,10 @@ Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink �
 ## 分类与注册
 
 `scan`、`transform`、`sink` 分类模块必须能容纳任意多个算子，不得拥有或重导出分类级的单一 tag。每个具体模块拥有唯一稳定 tag 及自身 payload 的校验；公共 enum 的 tag dispatch 只选定具体类型，不承载第二套注册表或动态扩展点。
-新增内建 Operation 必须加入 `OperationDefinition` 和 tag dispatch，并在算子自己的 correctness 文件覆盖 tag 唯一性、literal golden、资源布局、construct、turn 与适用的 reopen。
+新增内建 Operation 必须加入 `OperationDefinition` 和 tag dispatch，并在算子自己的 correctness 文件覆盖 tag 唯一性、literal golden、资源布局、construct、step 与适用的 reopen。
 所有 variant 的 v1 payload 使用 canonical JSON。解码必须完整消费输入且重新编码后的字节逐字相同；具体 Definition 继续校验业务不变量，不能因为 JSON 字段能反序列化就接受无效计划。表达式在 JSON 中保存 canonical protobuf 字节的 base64 表示，decode 仍检查 protobuf 与逐行可重放准入。修改 payload 时直接更新当前 v1 golden 和 reopen 证据，已有状态重建。
 公开 Definition 的 JSON 反序列化也必须保持构造不变量；有非空键、函数 arity 或目标路径等限制的类型先解到私有 payload，再由同一个验证步骤产生可信 Definition。持久解码在该步骤失败时保留具体算子的静态错误原因，不能通过公开反序列化绕开检查。
-Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propagation、runtime-resource 方向、外部副作用边界、持久 data/continuation 或 recovery 阶段时才增加 Flow case，不逐算子复制同一 build/open/reopen 矩阵，也不得用 test-only Operation 代替真实产品语义。
+Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propagation、runtime-resource 方向、外部副作用边界、持久 data/Resume 或 recovery 阶段时才增加 Flow case，不逐算子复制同一 build/open/reopen 矩阵，也不得用 test-only Operation 代替真实产品语义。
 
 ## 表达式
 
@@ -38,7 +38,7 @@ DataFusion Expr protobuf 是 Expression payload 的版本绑定格式，不承�
 工作区全部 DataFusion direct/transitive crate 必须精确 pin 到 `82335b426d8851db6a7b965f3d43053c585cabfd`，并保持唯一 Arrow 59.3.0 与 sqlparser 0.62.0 类型族；升级时必须审查 ASOF logical lowering、proto roundtrip、physical planning 和执行语义。
 开发期持久格式始终按 v1 处理；DataFusion 升级若改变 payload 或执行语义，应更新 v1 golden 与 reopen 证据，并重建受影响的 Flow，不增加旧表达式识别、迁移或兼容分支。
 Filter 的 tag 是 5，output Schema 精确等于 input，只保留 non-null true；全删返回 `None`，部分筛选必须用同一 predicate 保持 records/diffs 对齐。
-Filter 与投影不声明 Operation data；公共证据覆盖 proto golden/roundtrip、静态拒绝无目录副作用、decoded Definition 的 construct/turn、open 重新构造、Filter 空/全量/部分选择与混合 diff 重批，以及投影 Schema metadata/nullability 和 Array/diff 共享。
+Filter 与投影不声明 Operation data；公共证据覆盖 proto golden/roundtrip、静态拒绝无目录副作用、decoded Definition 的 construct/apply、open 重新构造、Filter 空/全量/部分选择与混合 diff 重批，以及投影 Schema metadata/nullability 和 Array/diff 共享。
 
 Project/Extend 的独立 Definition、tag 4/6 和运行实例已删除，tag dispatch 不接受这些 tag。
 选列与改名直接使用 `SelectDefinition::try_new([(name, Expr), ...])`；追加列使用

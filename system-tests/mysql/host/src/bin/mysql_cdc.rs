@@ -11,15 +11,17 @@ use std::{
 };
 
 use arrow_array::{Int32Array, Int64Array, StringArray};
-use dogpaddle_change::{decode_change, encode_change};
+use dogpaddle_change::{SchemaBoundChangeCodec, decode_change, encode_change};
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, decode_definition, encode_definition,
     operation::{
-        Action, Operation, OperationError, Turn,
+        Operation, OperationError,
         scan::{MySqlCdcScanConfig, MySqlCdcScanDefinition},
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Queue, ScanDirection, ScanLimit, Store, Transactions};
+use dogpaddle_store::{
+    Cell, OrderedMap, Queue, ReadTransactions, ScanDirection, ScanLimit, Store, Transactions,
+};
 use serde_json::{Value, json};
 
 const OPERATION_PREFIX: &str = "operation";
@@ -108,12 +110,14 @@ fn respond(response: &Value) -> Result<(), OperationError> {
 
 struct DirectScan {
     scan: Operation,
+    codec: SchemaBoundChangeCodec,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     spool: Queue<Vec<u8>>,
     output: OrderedMap<u64, Vec<u8>>,
     output_tail: Cell<u64>,
     transactions: Transactions,
+    reads: ReadTransactions,
 }
 
 impl DirectScan {
@@ -133,22 +137,30 @@ impl DirectScan {
                     .ok_or("missing definition")?,
             )?
         };
-        let scan = definition
+        let (scan, schema) = definition
             .construct(
                 &[],
                 &mut store.data_scope().scoped(OPERATION_PREFIX),
                 RuntimeResource::new(options.config()?),
             )?
-            .into_parts()
-            .0;
+            .into_parts();
+        let codec = SchemaBoundChangeCodec::try_new(schema.ok_or("missing Source Schema")?)?;
+        let phase = store.open_data(SCAN_PHASE)?;
+        let checkpoint = store.open_data(SCAN_CHECKPOINT)?;
+        let output = store.open_data("output")?;
+        let output_tail = store.open_data("output-tail")?;
+        let spool = store.open_data(SCAN_SPOOL)?;
+        let (transactions, reads) = store.into_transactions().split();
         Ok(Self {
             scan,
-            phase: store.open_data(SCAN_PHASE)?,
-            checkpoint: store.open_data(SCAN_CHECKPOINT)?,
-            spool: store.open_data(SCAN_SPOOL)?,
-            output: store.open_data("output")?,
-            output_tail: store.open_data("output-tail")?,
-            transactions: store.into_transactions(),
+            codec,
+            phase,
+            checkpoint,
+            spool,
+            output,
+            output_tail,
+            transactions,
+            reads,
         })
     }
 
@@ -176,59 +188,74 @@ impl DirectScan {
     }
 
     fn advance(&mut self, command: &str) -> Result<Value, OperationError> {
-        let Turn::Ready(prepared) = self.scan.turn(None)? else {
-            return Ok(json!({"kind": "idle"}));
+        let Operation::Source(source) = &mut self.scan else {
+            return Err("expected source".into());
         };
-        let transaction = self.transactions.begin();
-        let before = self.checkpoint.access(transaction.access())?.get()?;
-        let tail = self
-            .output_tail
-            .access(transaction.access())?
-            .get()?
-            .unwrap_or(0);
-        let (action, completion) = prepared.apply(transaction.access())?;
-        let after = self.checkpoint.access(transaction.access())?.get()?;
-        let checkpoint_present = after.is_some();
-        let checkpoint_changed = before != after;
-        let phase = self.phase.access(transaction.access())?.get()?;
-        let spool_nonempty = !self.spool.access(transaction.access())?.is_empty()?;
-        let has_output = match action {
-            Action::Idle => return Ok(json!({"kind": "idle"})),
-            Action::Commit(Some(change)) => {
-                self.output
-                    .access(transaction.access())?
-                    .put(&tail, &encode_change(&change)?)?;
-                let next = tail.checked_add(1).ok_or("gate output tail exhausted")?;
-                self.output_tail.access(transaction.access())?.set(&next)?;
-                true
+        source.restore(self.reads.begin().access())?;
+        let before = self.checkpoint.read(self.reads.begin().access())?.get()?;
+        let mut delivery = source.poll()?;
+        let mut commits = 0;
+        if let Some(delivery) = delivery.as_mut() {
+            let transaction = self.transactions.begin();
+            if !source.record(transaction.access(), delivery)? {
+                return Ok(json!({"kind": "backpressure", "commits": 0}));
             }
-            Action::Commit(None) => false,
-            Action::Complete(_) => return Err("a Scan cannot complete an input".into()),
-        };
-        transaction.commit()?;
+            transaction.commit()?;
+            commits += 1;
+        }
+        let checkpoint = self.checkpoint.read(self.reads.begin().access())?.get()?;
+        let checkpoint_present = checkpoint.is_some();
+        let checkpoint_changed = before != checkpoint;
+        let phase = self.phase.read(self.reads.begin().access())?.get()?;
         if command == "crash-terminal-capture"
-            && !has_output
             && checkpoint_present
-            && spool_nonempty
             && phase == Some(2)
+            && !self.spool.read(self.reads.begin().access())?.is_empty()?
         {
             respond(&json!({
                 "kind": "durable-terminal-capture", "checkpoint_present": checkpoint_present,
-                "commits": 1,
+                "commits": commits,
             }))?;
             process::exit(76);
         }
+        let published = source.published(self.reads.begin().access())?;
+        let has_output = published.is_some();
+        if let Some(encoded) = published {
+            let change = self.codec.decode_owned(encoded)?;
+            let transaction = self.transactions.begin();
+            let tail = self
+                .output_tail
+                .access(transaction.access())?
+                .get()?
+                .unwrap_or(0);
+            self.output
+                .access(transaction.access())?
+                .put(&tail, &encode_change(&change)?)?;
+            self.output_tail
+                .access(transaction.access())?
+                .set(&tail.checked_add(1).ok_or("gate output tail exhausted")?)?;
+            source.consume_published(transaction.access())?;
+            transaction.commit()?;
+            commits += 1;
+        }
         if command == "crash-before-ack" && has_output && checkpoint_changed && phase == Some(3) {
+            // Capture and consumer commits are separately durable; terminate
+            // before consuming the original real Delivery's ACK capability.
             respond(&json!({
                 "kind": "durable-before-ack", "output": true,
-                "checkpoint_present": checkpoint_present, "commits": 1,
+                "checkpoint_present": checkpoint_present, "commits": commits,
             }))?;
             process::exit(74);
         }
-        completion.run()?;
+        if let Some(delivery) = delivery {
+            source.ack(delivery)?;
+        }
+        if commits == 0 {
+            return Ok(json!({"kind": "idle"}));
+        }
         Ok(json!({
             "kind": "advance", "output": has_output,
-            "checkpoint_present": checkpoint_present, "commits": 1,
+            "checkpoint_present": checkpoint_present, "commits": commits,
         }))
     }
 

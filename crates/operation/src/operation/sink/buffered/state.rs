@@ -2,10 +2,9 @@ use super::invalid;
 use crate::operation::OperationError;
 use crate::operation::sink::relation::{self, Batch};
 
-#[cfg(test)]
-use super::DeliveryBatch;
-
 const VERSION: u8 = 1;
+// Version, phase and head marker; three head fields, three counters and checkpoint.
+pub(super) const MAX_READY_BYTES: usize = 3 + 7 * size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Position {
@@ -121,36 +120,6 @@ impl State {
             }
         }
         output
-    }
-
-    #[cfg(test)]
-    pub(super) fn decode(
-        input: &[u8],
-        prepared_input: Option<&DeliveryBatch>,
-    ) -> Result<Self, OperationError> {
-        match decode_header(input)? {
-            Header::Initialize => Ok(Self::Initialize),
-            Header::Ready(ready) => Ok(Self::Ready(ready)),
-            Header::Prepared {
-                before,
-                after,
-                checkpoint,
-                mut encoded_plan,
-            } => {
-                let change = prepared_input
-                    .ok_or_else(|| invalid("prepared input is required to decode its plan"))?;
-                let plan = relation::decode_plan(&mut encoded_plan, change, checkpoint)?;
-                if !encoded_plan.is_empty() {
-                    return Err(invalid("trailing control-state bytes"));
-                }
-                Ok(Self::Prepared(Prepared {
-                    before,
-                    after,
-                    checkpoint,
-                    plan,
-                }))
-            }
-        }
     }
 }
 

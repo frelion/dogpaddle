@@ -199,3 +199,29 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
         None
     );
 }
+
+#[test]
+fn typed_bounded_cell_reads_check_fixed_width_and_allow_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let cell = create_cell::<u64>(&mut store, "cell").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let transaction = writes.begin();
+        let mut access = cell.access(transaction.access()).unwrap();
+        access.set(&42).unwrap();
+        assert!(matches!(
+            access.get_bounded(7),
+            Err(StoreError::ItemTooLarge { size: 8, limit: 7 })
+        ));
+        assert_eq!(access.get_bounded(8).unwrap(), Some(42));
+        transaction.commit().unwrap();
+    }
+    let snapshot = reads.begin();
+    let access = cell.read(snapshot.access()).unwrap();
+    assert!(matches!(
+        access.get_bounded(7),
+        Err(StoreError::ItemTooLarge { size: 8, limit: 7 })
+    ));
+    assert_eq!(access.get_bounded(8).unwrap(), Some(42));
+}

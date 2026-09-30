@@ -280,3 +280,141 @@ fn queue_has_its_own_persistent_collection_kind() {
         })
     ));
 }
+
+#[test]
+fn bounded_front_checks_length_before_removal_and_allows_same_transaction_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let mut transactions = store.into_transactions();
+    let txn = transactions.begin();
+    let mut access = queue.access(txn.access()).unwrap();
+    assert!(
+        access
+            .try_push(&vec![7; 100], NonZeroU64::new(108).unwrap())
+            .unwrap()
+    );
+    assert!(matches!(
+        access.pop_front_bounded(99),
+        Err(StoreError::ItemTooLarge { .. })
+    ));
+    assert_eq!(access.queued_bytes().unwrap(), 108);
+    assert_eq!(
+        access.pop_front_bounded(100).unwrap(),
+        Some((vec![7; 100], true))
+    );
+    txn.commit().unwrap();
+}
+
+#[test]
+fn read_front_is_bounded_and_keeps_its_snapshot_across_consumption() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    let capacity = NonZeroU64::new(100).unwrap();
+    {
+        let transaction = writes.begin();
+        assert!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .try_push(&vec![7; 10], capacity)
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+    }
+    let snapshot = reads.begin();
+    let front = queue.read(snapshot.access()).unwrap();
+    assert!(matches!(
+        front.front_bounded(9),
+        Err(StoreError::ItemTooLarge { size: 10, limit: 9 })
+    ));
+    assert_eq!(front.front_bounded(10).unwrap(), Some(vec![7; 10]));
+    {
+        let transaction = writes.begin();
+        let mut access = queue.access(transaction.access()).unwrap();
+        assert!(access.try_push(&vec![8; 20], capacity).unwrap());
+        assert!(!access.discard_front(1).unwrap());
+        transaction.commit().unwrap();
+    }
+    assert_eq!(front.front_bounded(10).unwrap(), Some(vec![7; 10]));
+    assert_eq!(
+        queue
+            .read(reads.begin().access())
+            .unwrap()
+            .front_bounded(20)
+            .unwrap(),
+        Some(vec![8; 20])
+    );
+    drop(snapshot);
+    drop(writes);
+    drop(reads);
+
+    let store = Store::open(&path).unwrap();
+    let queue = store.open_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    assert_eq!(
+        queue
+            .read(reads.begin().access())
+            .unwrap()
+            .front_bounded(20)
+            .unwrap(),
+        Some(vec![8; 20])
+    );
+    {
+        let transaction = writes.begin();
+        assert!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .discard_front(1)
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        queue
+            .read(reads.begin().access())
+            .unwrap()
+            .front_bounded(0)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn read_front_codec_failure_poisons_only_its_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let broken = store.open_data::<Queue<BrokenValue>>("queue").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let transaction = writes.begin();
+        assert!(
+            queue
+                .access(transaction.access())
+                .unwrap()
+                .try_push(&vec![1], NonZeroU64::new(100).unwrap())
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+    }
+    let snapshot = reads.begin();
+    let access = broken.read(snapshot.access()).unwrap();
+    assert!(matches!(access.front_bounded(1), Err(StoreError::Codec(_))));
+    assert!(matches!(
+        access.is_empty(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    assert_eq!(
+        queue
+            .read(reads.begin().access())
+            .unwrap()
+            .front_bounded(1)
+            .unwrap(),
+        Some(vec![1])
+    );
+}

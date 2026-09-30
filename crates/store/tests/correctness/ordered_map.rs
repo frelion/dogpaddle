@@ -195,3 +195,37 @@ fn data_objects_isolate_identical_keys() {
         Some(b"right".to_vec())
     );
 }
+
+#[test]
+fn bounded_point_read_checks_value_length_and_can_retry_without_poisoning() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let map = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin();
+        let mut access = map.access(transaction.access()).unwrap();
+        access.put(&7, &vec![1; 64]).unwrap();
+        assert!(matches!(
+            access.get_bounded(&7, 63),
+            Err(StoreError::ItemTooLarge {
+                size: 64,
+                limit: 63
+            })
+        ));
+        assert_eq!(access.get_bounded(&7, 64).unwrap(), Some(vec![1; 64]));
+        assert_eq!(access.get_bounded(&9, 0).unwrap(), None);
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+    let store = Store::open(&path).unwrap();
+    let map = open_map::<u64, Vec<u8>>(&store, "map").unwrap();
+    let snapshot = store.read_transaction();
+    let access = map.read(snapshot.access()).unwrap();
+    assert!(matches!(
+        access.get_bounded(&7, 0),
+        Err(StoreError::ItemTooLarge { .. })
+    ));
+    assert_eq!(access.get_bounded(&7, 64).unwrap(), Some(vec![1; 64]));
+}

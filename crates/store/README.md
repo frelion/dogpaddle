@@ -100,94 +100,37 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 - `DurabilityBatch` 仍保持一个 writer 和逐事务原子性，只把多笔 WAL write 与 fsync 合并到显式 barrier。
 - `ReadTransactions` 不可克隆但可以共享；每次 `begin()` 得到一个稳定的只读 snapshot。
 - snapshot 只看见它开始时已经提交的数据，后续提交由新的 snapshot 看见。
-- transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 进一步约定只在当前 turn 内使用它们。
+- transaction 和 access 借用各自的启动能力，并且都不是 `Send` / `Sync`。Flow 只在当前页的事务内使用它们。
 
 读写权限同时由 collection handle 与 transaction access 两层约束；只读 handle 不能借写事务获得写入权限。
 
 这套类型不是为了模拟 `RocksDB` 的全部能力，而是让上层代码很难绕过 `DogPaddle` 的事务边界。
 
-## 六种持久数据结构
+## 三种持久数据结构
 
 | 结构 | 用一句话理解 | `DogPaddle` 中的典型用途 |
 | --- | --- | --- |
-| `Cell<T>` | 一个可缺省的值 | checkpoint、phase、计数器 |
-| `OrderedMap<K, V>` | 可点查、增删和有序分页的 map | 分组状态、业务索引 |
-| `OrderedMultiset<K>` | `K → 正 u64 份数`，归零即删除 | Distinct、关系行权重 |
-| `PartitionedMultiset<P, K>` | 每个 `P` 下有一棵独立的 multiset | Aggregate 极值、Join 的 key 分区 |
-| `Queue<T>` | 没有独立读取游标、pop 即删除的持久 FIFO | 私有 continuation、CDC 快照 spool |
-| `SubscribedLog<T>` | 一个 producer、固定多个独立 consumer 的日志 | Station 之间的持久输出 |
+| `Cell<T>` | 一个可缺省的值 | checkpoint、frame control、计数器 |
+| `OrderedMap<K, V>` | 可点查、增删和有序分页的 map | 分组状态、行权重、分区索引 |
+| `Queue<T>` | pop 即删除的持久 FIFO | source ingress、CDC 快照 spool |
 
-`StoreData` 是 sealed trait；产品代码只能使用这些结构，不能绕过 catalog 自造新的物理布局。
+`StoreData` 是 sealed trait；只有这三种 catalog kind 和 collection 生命周期。OrderedMap 的当前 kind tag 仍是 2；退役 tag 4、5、7 不被打开，旧数据库直接重建，不提供迁移或 fallback。
 
-`OrderedMap::remove` 先确认 key 是否存在并返回该结果；已经从同一事务取得存在性证据的调用方可用
-`erase` 直接暂存 tombstone，避免删除前重复 point lookup。
+`OrderedMap::remove` 确认 key 存在性并返回结果；已有同事务存在性证据时可用 `erase` 直接暂存 tombstone。
 
-`OrderedMultiset` 和 `PartitionedMultiset` 的 `adjust` 逐次检查 signed difference 的负前缀与
-`u64` overflow。已按事件顺序自行检查权重的调用方可用对应 access 的 `set_multiplicity` 一次写回
-最终值；它不再次读取旧权重，也不替调用方检查中间前缀。写入零会删除 key；调用方仍须在事务内
-保持校验和写回的原子性。
+`OrderedMap<K, NonZeroU64>` 以标准库正整数表示权重，value 是严格八字节 big-endian，零和其他长度是 codec 错误。其 `multiplicity` 把缺失读为零；`adjust` 逐事件 checked signed adjustment，underflow/overflow 毒化事务，结果零删除 key。`set_multiplicity` 直接写此前已逐事件检查的最终权重，零删除，不再点读。公共 `checked_weight` 提供同一纯算术检查；单独调用它不毒化事务。
 
-`Cell<Vec<u8>>` 另提供 `get_bounded(max_bytes)`。它通过一次 pinned lookup 先检查编码长度，再决定是否
-复制 owned value；超限返回 `ItemTooLarge`，不会毒化事务，调用方可以在同一事务提高 limit 后重试。
+`OrderedMap<PartitionKey<P, K>, V>` 使用普通 Map handle 与 catalog。`partition(&P)` 产生当前事务内的泛型 view，只处理 local key `K`，支持点读、写入、erase、有界 scan 和 first/last。分区 framing 将 P 的零字节 escape 为 `00 ff`，并以 `00 00` 终止，K 原样跟随，严格保持 `(P, K)` 字典序，空值、前缀和零字节不会跨分区。分区 view 的正权重方法复用 Map 的 codec 与 checked adjustment，不另设集合、metadata 或状态事实。
 
-### Queue 与 `SubscribedLog` 的区别
+Queue 的只读 `front_bounded(max_value_bytes)` 返回当前 snapshot 的队首，写访问的 `pop_front_bounded(max_value_bytes)` 同时删除队首；两者都在复制或解码前检查编码长度，超限保持事务健康，可在同一 snapshot 或事务提高上限重试。Queue 每项按完整 encoded value 加八字节私有 sequence 计费；空队列也拒绝超大项，队列变空删除 metadata 并重置编号。owner 在每次 `try_push` 传入稳定容量策略，不保存进 metadata；容量不包含 `RocksDB` 开销。`Queue<Vec<u8>>::discard_front(max_entries)` 有界读取长度、验证连续性并暂存删除，不复制或解码完整 value，末尾一次更新 metadata。先只读队首、后事务消费时，owner 必须保持唯一协调消费者；只读访问不预留条目。
 
-两者都保存有序数据，但用途不同：
+`Cell<T>::get_bounded(max_bytes)` 通过 pinned lookup 在复制前检查 encoded value 长度；超限返回 `ItemTooLarge`，不毒化事务。
 
-- `Queue` 的读取就是删除，没有 consumer cursor。它可以 clone，因此调用方必须自己保证只有一个协调者消费；
-  容量是硬上限，空队列也拒绝超大项。
-- `SubscribedLog` 允许多个 consumer 分别读取。每个 subscription 保存自己的下一条位置，最慢的 consumer
-  决定数据何时可以回收。
-
-`Queue` 每项按完整编码 value 加 8-byte 私有 sequence 计费；队列变空时删除 metadata 并重置该私有编号。`Queue<Vec<u8>>` 消费但不需要读取值时，`discard_front(max_entries)` 有界遍历 front：逐项读取编码长度、验证连续性并写 tombstone，不复制或解码完整 value，整批只在末尾更新一次 metadata。它与 `pop_front` 共用最后一项清理与损坏检查，并直接返回删除后的空状态；调用方不必再读一次 metadata，事务仍由调用方统一提交或回滚。
-`SubscribedLog` 每项按完整编码 value 加 8-byte offset 计费。两者的容量都不包含 `RocksDB` 自身开销。
-
-`SubscribedLogWriter::try_append` 的容量是 backlog 高水位：非空 backlog 超限时返回 `false`，但空日志会
-接受一个超大 entry，避免单条合法消息永久卡住。容量不足不是 Store 错误，也不会使事务中毒。
-
-两种容量都由 owner 在每次 `try_push` / `try_append` 时传入，不保存进 collection metadata；同一资源的 owner
-应稳定使用同一策略值。Queue 变空后私有 sequence 可以重置，SubscribedLog 的公开 offset 则单调递增且不复用。
-
-Flow 正是用 `SubscribedLog<Vec<u8>>` 连接 Station：producer 追加一个完整 Change，各 consumer 用自己的
-`Subscription::peek` 读取，并在处理结果提交的同一笔事务里 `acknowledge` 精确 offset。
-
-完整 log handle 只在 setup 使用。新日志必须先以非零 subscriber 数初始化；reopen 时先验证同一个数量，再派生
-职责更窄的 writer 和 subscriptions：
-
-```rust,no_run
-use std::{num::NonZeroU64, path::Path};
-
-use dogpaddle_store::{Store, SubscribedLog};
-
-fn build(path: &Path) -> Result<(), dogpaddle_store::StoreError> {
-    let mut setup = dogpaddle_store::StoreSetup::new();
-    let log = setup.create_data::<SubscribedLog<Vec<u8>>>("output")?;
-    let _transactions = setup.commit(path, |access| {
-        log.initialize(NonZeroU64::MIN, access)
-    })?;
-    let _writer = log.writer();
-    let _consumer = log.subscription(0);
-    Ok(())
-}
-
-fn reopen(path: &Path) -> Result<(), dogpaddle_store::StoreError> {
-    let store = Store::open(path)?;
-    let log = store.open_data::<SubscribedLog<Vec<u8>>>("output")?;
-    let snapshot = store.read_transaction();
-    log.validate(NonZeroU64::MIN, snapshot.access())?;
-    drop(snapshot);
-    let _writer = log.writer();
-    let _consumer = log.subscription(0);
-    Ok(())
-}
-```
-
-`peek` 返回下一条精确 offset 和 owned、已解码的值，不推进位置。`acknowledge` 只接受该 subscription 当前的
-精确 offset；通常应与消费结果和业务状态放在同一笔写事务。
+Cell 与 Map 的 `get` 复用 `get_bounded(..., usize::MAX)`；有界与无界读取共享 owned decode、snapshot 和事务中毒语义。
 
 ## 有序分页
 
-`OrderedMap`、`OrderedMultiset` 和 `PartitionedMultiset` 的 scan 同时限制条目数和编码后的逻辑字节数。
+`OrderedMap` 及其 partition view 的 scan 同时限制条目数和编码后的逻辑字节数。
 返回页拥有已经解码的 entries，以及可选的排他 `continuation`；页面不借用事务，可以在事务结束后继续遍历。
 
 ```rust,no_run
@@ -229,16 +172,14 @@ Store 启用 `RocksDB` 的 manual WAL flush。普通同步事务仍在成功返�
 barrier。barrier 失败表示这一组提交的持久化结果不确定，owner 必须 fail-stop 并从磁盘重新打开，不能继续复用。
 
 以下错误会使当前事务中毒：编码或解码失败、损坏的 metadata、使用另一个 Store 的 handle、RocksDB 访问失败、
-multiset underflow/overflow，以及非法 subscription acknowledgement。之后的访问返回
+checked weight underflow/overflow。之后的访问返回
 `StoreError::TransactionPoisoned`，写事务不能提交。
 
 `StoreSetup::commit` 会消费 draft。初始化闭包确定失败时会留下没有有效 marker 的不完整目录，不能作为 Store 打开；
 底层 `RocksDB` commit 返回存储错误时结果可能不确定，只能通过 reopen 判断。Flow 运行期遇到不确定提交则进入
 fail-stop，并要求重新打开 Flow。Store 不用额外日志去猜测一次不确定提交的结果。
 
-`Cell`、Map、Multiset 和 `Queue` handle 可以 clone，但每次访问都会检查它属于当前事务所在的 Store。
-完整 `SubscribedLog` setup handle、writer 和 subscription 都不可 clone；应在 setup 时各派生一次并 move 给唯一 owner。
-writer 不能确认消费，subscription 不能追加，两者也不能取得 commit 权力。
+`Cell`、Map 和 `Queue` handle 可以 clone，但每次访问都检查它属于当前事务所在的 Store；持久 queue 的 owner 必须保证唯一协调消费者。
 
 ## 持久格式由谁负责
 
@@ -255,19 +196,19 @@ Store catalog 记录资源名、collection kind 和独立 namespace，但不知�
 当前是开发期 v1。修改资源名、collection kind、codec、key framing 或 metadata 就是修改持久 ABI；同步更新布局和
 reopen 测试，然后删除旧 Flow 重建，不增加旧格式迁移或兼容分支。
 
-`SubscribedLog` 的稳定 metadata 保存 big-endian `subscriber_count`、`tail` 和 `retained_bytes`，每个稠密 subscriber 另有一个 big-endian `position`；`head` 只由全部 positions 的最小值派生，不单独持久化。offset 永不重置，`retained_bytes` 只计算 `[head, tail)` 中每条 entry 的 8-byte offset 与完整 encoded value，不包含 metadata、subscriber positions、RocksDB block/WAL/MVCC 或文件开销；`try_append` 与 `acknowledge` 在自身事务内精确维护，Flow 不得复制这套计费与 retention 逻辑。非空 backlog 只有在追加后不超过 capacity 时接受 entry；空 backlog 允许一条 oversize entry，因而该机制是 per-output soft high watermark，不是磁盘或内存硬配额。`Queue` 使用相同的每项逻辑计费，但其 capacity 是硬上限，空队列也拒绝 oversize entry，并在弹出最后一项时删除 metadata、重置不对外暴露的 sequence。
+`Queue` metadata 保存私有 head/tail 与 retained bytes；最后一项删除后清除 metadata，编号不对外公开。分区和正权重是 Map key/value codec 语义，无独立 metadata 或 collection kind。
 
 ## 读代码的顺序
 
 1. [`src/store/mod.rs`](src/store/mod.rs)：`Store`、事务和 access 类型。
 2. [`src/store/transaction.rs`](src/store/transaction.rs)：snapshot、commit 与中毒规则。
-3. [`src/collections/`](src/collections/)：六种结构的公共语义。
+3. [`src/collections/`](src/collections/)：三种结构的公共语义。
 4. [`src/store/data.rs`](src/store/data.rs)：catalog、namespace 和底层读写入口。
 5. [`src/codec.rs`](src/codec.rs)：稳定 key/value 编码契约。
 
 ## 验证与性能
 
-公共 correctness target 覆盖事务、snapshot、六种结构、reopen、raw layout、损坏拒绝、中毒回滚和 SIGKILL
+公共 correctness target 覆盖事务、snapshot、三种结构、reopen、raw layout、损坏拒绝、中毒回滚和 SIGKILL
 crash consistency：
 
 ```bash
@@ -282,3 +223,7 @@ cargo test -p dogpaddle-store --lib --locked -- --test-threads=1
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench cell
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
 ```
+
+### 有界点读与分区端点
+
+`OrderedMapAccess::get_bounded` 与只读 view 的同名方法按 encoded value 长度准入，不计 caller 已持有的 lookup key；读取 pinned bytes 时先检查长度，再复制和解码。`MapPartition::first_bounded/last_bounded` 与只读 partition 同名方法按完整 partition framing、key、value 的 encoded bytes 准入，等同一项有界 scan。超限返回可重试的 `ItemTooLarge`，不毒化事务；端点零 byte limit 返回 `InvalidScanLimit`。类型化 codec 的 storage/encoding/decoding 错误仍毒化事务。这些是返回 payload 的逻辑界，不限制 `RocksDB` page cache、I/O 时间或自定义 codec 内部任意分配。

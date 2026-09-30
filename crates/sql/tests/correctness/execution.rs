@@ -5,7 +5,6 @@ use dogpaddle_sql::{SqlError, SqlProgram};
 use rusqlite::{Connection, OpenFlags};
 
 const TABLE: &str = "selected_numbers";
-const OUTPUT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[test]
 fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
@@ -20,12 +19,14 @@ fn bundled_quickstart_builds_and_reopens_without_duplicate_rows() {
 
     let mut flow = program.start(&flow_path).unwrap();
     assert_eq!(
-        flow.status()
-            .unwrap()
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        ["sql/scan/00000000", "sql/sink"]
+        flow.operation_ids().collect::<Vec<_>>(),
+        [
+            "sql/scan/00000000",
+            "sql/transform/00000000",
+            "sql/transform/00000001",
+            "sql/transform/00000002",
+            "sql/sink"
+        ]
     );
     let before_reopen = advance_until_quickstart_rows(&mut flow, &sqlite_path, 5);
     drop(flow);
@@ -617,8 +618,16 @@ fn native_asof_join_executes_all_directions_and_historical_right_corrections_acr
         .unwrap();
 
         let mut flow = program.start(&flow_path).unwrap();
-        advance_until_first_asof_left_claim(&mut flow, case.name);
+        // Reopen with the first ASOF result saved for sending, before any right input.
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+        let status = flow.status().unwrap();
+        assert!(status.sending, "{}: {status:?}", case.name);
+        let active = flow
+            .operation_ids()
+            .position(|id| Some(id) == status.active_operation.as_deref())
+            .unwrap();
         drop(flow);
+        assert_initial_asof_state(&flow_path, active);
 
         let mut flow = program.start(&flow_path).unwrap();
         advance_to_idle(&mut flow);
@@ -648,7 +657,15 @@ fn select_distinct_deduplicates_projected_rows_across_reopen() {
     .unwrap();
 
     let mut flow = program.start(&flow_path).unwrap();
-    assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
+    assert_eq!(
+        operation_ids(&flow),
+        [
+            "sql/scan/00000000",
+            "sql/transform/00000000",
+            "sql/transform/00000001",
+            "sql/sink"
+        ]
+    );
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
@@ -695,7 +712,15 @@ fn grouped_aggregates_update_one_relation_across_reopen() {
     .unwrap();
 
     let mut flow = program.start(&flow_path).unwrap();
-    assert_eq!(station_ids(&flow), ["sql/scan/00000000", "sql/sink"]);
+    assert_eq!(
+        operation_ids(&flow),
+        [
+            "sql/scan/00000000",
+            "sql/transform/00000000",
+            "sql/transform/00000001",
+            "sql/sink"
+        ]
+    );
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
@@ -780,11 +805,7 @@ fn union_all_keeps_separate_scan_stations() {
 
     let flow = program.start(root.path().join("flow")).unwrap();
     assert_eq!(
-        flow.status()
-            .unwrap()
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
+        flow.operation_ids().collect::<Vec<_>>(),
         [
             "sql/scan/00000000",
             "sql/scan/00000001",
@@ -793,10 +814,8 @@ fn union_all_keeps_separate_scan_stations() {
         ]
     );
     let scan_ids = flow
-        .status()
-        .unwrap()
-        .into_iter()
-        .filter_map(|station| station.id.starts_with("sql/scan/").then_some(station.id))
+        .operation_ids()
+        .filter(|id| id.starts_with("sql/scan/"))
         .collect::<Vec<_>>();
     assert_eq!(scan_ids, ["sql/scan/00000000", "sql/scan/00000001"]);
 }
@@ -880,53 +899,24 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     let mut flow = parsed.start(&flow_path).unwrap();
     assert!(!sqlite_path.exists());
 
-    let status = flow.status().unwrap();
+    let identities = flow.operation_ids().map(str::to_owned).collect::<Vec<_>>();
     assert_eq!(
-        status
+        identities
             .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "sql/scan/00000000",
-            "sql/transform/00000000",
-            "sql/transform/00000002",
-            "sql/transform/00000004",
-            "sql/sink",
-        ]
-    );
-    assert_eq!(
-        status
-            .iter()
-            .filter(|station| station.id.starts_with("sql/scan/"))
+            .filter(|id| id.starts_with("sql/scan/"))
             .count(),
         1
     );
-    for station in &status[..status.len() - 1] {
-        assert_eq!(
-            station.output.as_ref().unwrap().capacity_bytes,
-            OUTPUT_CAPACITY_BYTES
-        );
-    }
-    assert!(status.last().unwrap().output.is_none());
+    assert_eq!(identities.last().unwrap(), "sql/sink");
+    assert_eq!(flow.status().unwrap().depth, 0);
 
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
     let mut reopened = read.start(&flow_path).unwrap();
     assert_eq!(
-        reopened
-            .status()
-            .unwrap()
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "sql/scan/00000000",
-            "sql/transform/00000000",
-            "sql/transform/00000002",
-            "sql/transform/00000004",
-            "sql/sink",
-        ]
+        reopened.operation_ids().collect::<Vec<_>>(),
+        identities.iter().map(String::as_str).collect::<Vec<_>>()
     );
     let mut outcomes = Vec::new();
     for _ in 0..64 {
@@ -963,12 +953,8 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
     assert!(!replacement_path.exists());
 }
 
-fn station_ids(flow: &Flow) -> Vec<String> {
-    flow.status()
-        .unwrap()
-        .into_iter()
-        .map(|station| station.id)
-        .collect()
+fn operation_ids(flow: &Flow) -> Vec<String> {
+    flow.operation_ids().map(str::to_owned).collect()
 }
 
 fn sqlite_program(sqlite_path: &Path) -> String {
@@ -1015,25 +1001,6 @@ fn sqlite_values(path: &Path) -> Vec<u64> {
     values
 }
 
-fn advance_until_first_asof_left_claim(flow: &mut Flow, case: &str) {
-    for _ in 0..32 {
-        let status = flow.status().unwrap();
-        let asof = status
-            .iter()
-            .find(|station| station.inputs.len() == 2)
-            .expect("the SQL ASOF plan has one two-input Station");
-        if asof.inputs[0].position == 1 {
-            assert_eq!(
-                asof.inputs[1].position, 0,
-                "{case} consumed a right candidate before reopen"
-            );
-            return;
-        }
-        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    }
-    panic!("{case} did not finish its first left Claim within 32 advances");
-}
-
 fn asof_rows(path: &Path) -> Vec<(u64, Option<u64>)> {
     let connection = sqlite(path);
     connection
@@ -1048,6 +1015,31 @@ fn asof_rows(path: &Path) -> Vec<(u64, Option<u64>)> {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn assert_initial_asof_state(path: &Path, operation: usize) {
+    use dogpaddle_store::{OrderedMap, ScanDirection, ScanLimit, Store};
+    use std::num::NonZeroU64;
+
+    let store = Store::open(path).unwrap();
+    let read = store.read_transaction();
+    for (side, expected) in [("left", 1), ("right", 0)] {
+        let rows: OrderedMap<Vec<u8>, NonZeroU64> = store
+            .open_data(&format!("operation/{operation:08x}/asof_join.{side}_rows"))
+            .unwrap();
+        let page = rows
+            .read(read.access())
+            .unwrap()
+            .scan(
+                ..,
+                ScanDirection::Ascending,
+                None,
+                ScanLimit::new(2, 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(page.entries.len(), expected, "{side} ASOF state");
+        assert!(page.continuation.is_none());
+    }
 }
 
 fn quickstart_rows(path: &Path) -> Vec<(i64, i64, String)> {
@@ -1089,17 +1081,23 @@ fn expected_quickstart_rows(rows: usize) -> Vec<(i64, i64, String)> {
 }
 
 fn assert_restores_to_idle(flow: &mut Flow) {
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    advance_to_idle(flow);
+    assert_eq!(flow.status().unwrap().depth, 0);
 }
 
 fn advance_to_idle(flow: &mut Flow) {
-    for _ in 0..128 {
+    let mut idle = 0;
+    for _ in 0..512 {
         if flow.advance().unwrap() == AdvanceOutcome::Idle {
+            idle += 1;
+        } else {
+            idle = 0;
+        }
+        if idle > flow.operation_count() {
             return;
         }
     }
-    panic!("SQL Flow did not become idle within 128 advances");
+    panic!("finite SQL flow did not drain");
 }
 
 fn sqlite(path: &Path) -> Connection {

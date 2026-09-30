@@ -149,7 +149,6 @@ fn initialization_and_reconnect_reject_extra_schema_objects() {
                 &input,
                 &[Lookup {
                     row_index: 0,
-                    needed: 1,
                     take: 1,
                 }]
             )
@@ -251,7 +250,7 @@ fn only_primary_key_duplicates_are_ignored_and_other_errors_roll_back_the_batch(
 }
 
 #[test]
-fn lookup_returns_bounded_smallest_ids_and_a_capped_exact_count() {
+fn lookup_returns_only_the_requested_smallest_ids_without_full_count() {
     let mut fixture = Fixture::new(schema());
     fixture.initialize();
     let input = values(&fixture.schema, &[7]);
@@ -268,12 +267,11 @@ fn lookup_returns_bounded_smallest_ids_and_a_capped_exact_count() {
             &input,
             &[Lookup {
                 row_index: 0,
-                needed: 2_000,
                 take: 4,
             }],
         )
         .unwrap();
-    assert_eq!(matches[0].count, 2_000);
+    assert_eq!(matches[0].ids.len(), 4);
     assert_eq!(matches[0].ids, [1, 2, 3, 4]);
     let matches = fixture
         .target
@@ -281,12 +279,11 @@ fn lookup_returns_bounded_smallest_ids_and_a_capped_exact_count() {
             &input,
             &[Lookup {
                 row_index: 0,
-                needed: 3_000,
                 take: 1_024,
             }],
         )
         .unwrap();
-    assert_eq!(matches[0].count, 2_048);
+    assert_eq!(matches[0].ids.len(), 1024);
     assert_eq!(matches[0].ids.len(), 1_024);
     fixture
         .target
@@ -301,7 +298,6 @@ fn lookup_returns_bounded_smallest_ids_and_a_capped_exact_count() {
             &input,
             &[Lookup {
                 row_index: 0,
-                needed: 4,
                 take: 4,
             }],
         )
@@ -332,12 +328,11 @@ fn hash_collisions_do_not_match_other_logical_rows() {
             &input,
             &[Lookup {
                 row_index: 0,
-                needed: 3,
                 take: 3,
             }],
         )
         .unwrap();
-    assert_eq!(matches[0].count, 2);
+    assert_eq!(matches[0].ids.len(), 2);
     assert_eq!(matches[0].ids, [1, 3]);
 }
 
@@ -378,12 +373,10 @@ fn null_and_nul_containing_text_are_matched_exactly_in_request_order() {
             &[
                 Lookup {
                     row_index: 2,
-                    needed: 2,
                     take: 2,
                 },
                 Lookup {
                     row_index: 0,
-                    needed: 2,
                     take: 2,
                 },
             ],
@@ -419,7 +412,6 @@ fn empty_and_maximum_width_schemas_support_insert_lookup_and_delete() {
                 &input,
                 &[Lookup {
                     row_index: 0,
-                    needed: 1,
                     take: 1,
                 }],
             )
@@ -435,7 +427,6 @@ fn empty_and_maximum_width_schemas_support_insert_lookup_and_delete() {
                 &input,
                 &[Lookup {
                     row_index: 0,
-                    needed: 1,
                     take: 1,
                 }],
             )

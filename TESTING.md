@@ -6,7 +6,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 1. `crates/<owner>/src/**/tests.rs`：必须访问私有状态的单元测试、故障注入和独立算法 oracle。
 2. `crates/<owner>/tests/correctness.rs`：该产品 crate 唯一的公共测试 target，领域文件位于相邻的 `tests/correctness/`。
-3. `integration-tests/<seam>/`：仅用于没有产品组合根的 sibling seam。当前只有 `integration-tests/change-store/`。
+3. `integration-tests/<seam>/`：仅用于没有产品组合根的 sibling seam。当前无独立 seam package；Change IPC 的持久调用组合由 Flow 拥有。
 4. `system-tests/`：依赖真实 Java、Debezium、PostgreSQL、MySQL 或其他外部服务的系统验收。
 5. `crates/<owner>/benches/`：由 workload owner 直接拥有的 benchmark。
 
@@ -17,13 +17,12 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 ## 证据所有权
 
 - Change 拥有 Schema、Change、Projection、Arrow IPC 字节格式、互操作、损坏拒绝和稳定事件顺序。
-- Store 拥有事务、能力边界、集合布局、分页、容量、订阅位置与安全回收、reopen 和 crash consistency。
+- Store 拥有事务、能力边界、Cell/OrderedMap/Queue 布局、分区与权重操作、分页、容量、reopen 和 crash consistency。
 - Operation 拥有 Operation + Store：Definition、稳定 tag/payload、checked construct、运行协议、状态和算子语义。
-- Flow 拥有 Flow + Operation + Change + Store：拓扑、全图 binding、subscription 装配、调度、claim、背压、fail-stop、status 和 reopen。
+- Flow 拥有 Flow + Operation + Change + Store：逻辑 DAG、全图 binding、持久调用栈、分页事务、背压、fail-stop、status 和 reopen。
 - SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering、Program identity 和 `start` 的自动构建/恢复选择。
 - `dogpaddle` binary 只拥有 `run SQL_FILE [--state DIR]` 的参数、默认状态路径、短等待循环和 Ctrl-C 有界停止；它不复制 SQL 生命周期。
 - Debezium 拥有 connector-neutral runtime、bundle、checkpoint、delivery 和 ACK 生命周期。
-- Change 与 Store 的外部组合只由 `integration-tests/change-store/` 证明。
 
 能通过公共 API 证明的行为不得留在白盒测试中。删除测试前必须指出更低层或更靠近 owner 的替代证据；测试数量和代码行数不是正确性指标。
 
@@ -33,47 +32,24 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个 
 
 - `definition_codec`：外层 envelope、unknown tag 和通用损坏拒绝；
 - `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
-- `protocol`：`AtomicOperation::apply` 完整消费契约，以及 `turn -> PreparedTurn -> AfterCommit` 事务协议；
+- `protocol`：Atomic 完整消费、Paged 的 `Resume/Progress` 与共享 `StepBudget`，以及 Source/Sink 的具体边界协议；
 - `metamorphic`：稳定重批和独立模型。
 
 生产 tag dispatch、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 dispatch 反向生成期望值。
 
-Aggregate 的 owner 文件必须证明 tag `14` 与 `aggregate.groups/entries/control` 三资源、完整 Definition
-roundtrip、精确 output Schema、被跟踪权重（分组行数、call 非空计数、极值份数）underflow 的整 turn
-rollback、Fold 结果变化、极值缓存与分区 `first`/`last` 重取、缓存跨 reopen，以及不变结果不产生冗余
-output。函数 descriptor、argument tuple framing
-和 group state codec 属于 Operation 私有实现，不在 Flow 或 SQL 复制 oracle。
+Aggregate 的 owner 文件必须证明 tag `14`、精确资源布局与 Schema、Definition roundtrip、共享 argument/moment 与 COUNT/SUM/AVG readout、MIN/MAX layout 复用、正权重 underflow 的整页 rollback、极值缓存重取与 reopen，以及不变结果不产生冗余 output。组权重归零仍须检查统计量一致性。私有 state codec 和表达式去重证据归 Operation。
 
-EquiJoin 的 owner 文件必须用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 与 FullOuter，
-并证明 tag `16` 的 kind payload、Inner 三资源与其余 kind 四资源、NULL key、重复权重、同一 Claim 内的
-presence 往返、outer nullability、正负 diff 边界、分页 rollback 和行内 continuation reopen；residual 还必须
-覆盖逐完整行 support、`FALSE/NULL`、已提交 support 的行内恢复与 Complete rollback。
-晚期 residual、decode 和 output-diff 错误必须证明：当前 turn 回滚，已提交页保留，
-reopen 不重复输出且不跳过确定性失败；整批本侧负前缀与 multiplicity overflow 仍在输出前拒绝。SQL 只证明
-Right Join 的 swap + SchemaAlign、原生 residual 的方向改写，以及每种新增 LogicalPlan lowering
-至少一个最终关系 witness，不复制 Join 状态机。
+EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tag `16`、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/SchemaAlign 和最终关系。
 
-AsOfJoin 的 owner 文件必须用独立 winner/关系 oracle 覆盖 Inner、LeftOuter、LeftSemi 与
-LeftAnti，并证明 tag `17`、`asof_join.left_rows/right_rows/continuation` 三资源、完整
-Definition roundtrip 与精确 output Schema。运行证据覆盖 backward/forward/nearest、exact 开关、
-两种 equidistant policy、空/多 equality partition、`Equal/NotDistinct`、单/多 order、NULL、tolerance 边界、
-显式 tie-break 和三种 fallback、residual 跳过近候选、重复 multiplicity、两侧 insert/retract、旧负新正的
-历史修正顺序，以及候选与外层 left 双重分页中的提交、回滚和 reopen。整批权重准入失败
-（负前缀或 `u64` multiplicity overflow）必须在任何输出前拒绝并回滚整个 Claim；晚期候选歧义或
-output-diff overflow 只回滚失败的当前 turn，已提交的分页状态、输出和 continuation 保留；
-reopen 不重复已提交页，也不跳过确定性失败。SQL 只证明 DataFusion 原生 left-preserving `ASOF JOIN`
-的四个不等方向、零/多等值键、Schema/Program identity 和最终关系，不复制 Operation API 的
-nearest、tolerance、tie 或 residual 状态机。
+AsOfJoin 的 owner 文件固定 tag `17` 与 `asof_join.left_rows/right_rows` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
 
 ### Flow
 
-Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。Flow 只保留能证明全图机制的代表性算子：Select 的纯失败和 reopen/rebind、UnionAll 的多输入、Distinct 持久状态在 output 背压下的原子 rollback/reopen、AsOfJoin 新增的双输入外层/候选双重 continuation 在真实资源路径上的 drop/open、SQLite Sink、PostgreSQL 运行资源，以及 temporal/decimal unary chain。算子自身的 payload、表达式和运行语义归 Operation，不在 Flow 逐个复制。
+Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。代表性算子覆盖融合尾部失败、UnionAll 多输入、Distinct 持久状态、ASOF 历史修正、同源自 Join、SQLite Sink 和 temporal/decimal unary chain；算子关系 oracle 归 Operation。
 
-EquiJoin 的跨 turn 晚期错误由真实 SQLite Sink witness 证明目标可见的部分结果、未确认输入和 reopen；不在 Flow 复制各 Join kind 的关系 oracle。
+Flow 必须证明每个 Run/Send/入栈/出栈边界可 drop/open；父子 ordinal、port 必须对应调用边；子帧直接借用父页，root 直接借用 Source 队首，完成时同事务消费；拒绝损坏、超限与 orphan slot，且不改写已有状态。融合 head/tails 共享一笔小事务和预算，超限缩页时全部回滚；单事件仍超限须有限失败。首次合法输入的计算失败只保存初始 Run，多源及重开后均不能绕过该输入。本页计算与能接收的 Sink 入账同事务；背压或路由预算耗尽时保留结果及下一个消费者，重开后不重放已接收分支；本页内任一 Sink 错误须回滚同页计算和此前 Sink 入账。捕获与 Sink 排空仍获得服务。晚期 Join 错误由真实 SQLite 目标证明之前已提交页保留，失败位置可恢复。
 
-Flow 独有的 runtime、事务、背压、claim、subscription completion、fail-stop 和 status 证据必须保留。Definition
-还必须覆盖 owner identity 的 Some/None 稳定编码，以及 open 在 Schema binding、资源打开和运行构造前拒绝
-identity mismatch。
+Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合与深度上限；owner mismatch 在 binding 和资源打开前拒绝。commit、durability barrier、外部 ACK/delivery 不确定性必须 fail-stop。status 只读，并与 reopen 后一致。
 
 ### SQL
 
@@ -89,7 +65,7 @@ Store/source I/O 前完成、准确映射到具体 connector、bootstrap heartbe
 连接 URL 的 secret 与 transient host/port 不改变 Program identity，database、qualified table、publication、spool
 和查询语义必须改变 identity。CDC 测试只用绝对 `DOGPADDLE_DEBEZIUM_RUNTIME` 指向构建产物。
 
-SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言构建或一次 advance 成功。Distinct witness 必须跨 drop/start，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/start；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证固定 Station ID、64 MiB output capacity、drop/start 后持久 position；语义相同但格式或 endpoint 参数顺序不同的 SQL 必须能恢复，语义或持久 endpoint 身份不同的 Program 必须因 owner identity mismatch 失败且不能替换磁盘 Definition。损坏、不完整、已存在但不可打开或被占用的状态不得触发自动重建。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、目标提交后本地结算前终止和 start 幂等重投；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 start 会恢复既有状态、丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
+SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言构建或一次 advance 成功。Distinct witness 必须跨 drop/start，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/start；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证稳定逻辑 Operation ID、持久调用位置与 drop/start 后最终关系；语义相同但格式或 endpoint 参数顺序不同的 SQL 必须能恢复，语义或持久 endpoint 身份不同的 Program 必须因 owner identity mismatch 失败且不能替换磁盘 Definition。损坏、不完整、已存在但不可打开或被占用的状态不得触发自动重建。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、已结算后的进程终止与 start 保持最终关系和技术 ID；目标提交后本地结算前的固定 Prepared 重投由直接 Sink 系统 gate 验证；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 start 会恢复既有状态、丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
 
 Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 drop/start 恢复；
 Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join family 的 residual 必须证明 predicate
@@ -111,7 +87,7 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 
 每个源码模块目录只有一个 `tests.rs` 入口。超大模块可在同目录的 `tests/` 下按完整领域拆分；不要按每个生产源码文件建立镜像目录。当前较大的分区为：
 
-- Station：`support`、`claim`、`transaction`；
+- Flow：`flow/advance/tests.rs` 只保留需要逐次驱动内部持久动作或注入边界故障的证据；
 - Change codec：`support`、`schema`、`projection`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
 - SQLite Sink：`row`、`target`。
 - EquiJoin correctness：`family` 拥有五种关系语义与持久恢复，`inner_runtime` 拥有 Inner 热路径及 Join
@@ -135,9 +111,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 
 普通 correctness 测试不得依赖 wall-clock 断言、系统 Java 或外部 PostgreSQL。没有覆盖率或代码行数 CI 阈值。
 
-运行期 Schema guard 必须证明 output 违例整 turn 回滚，以及合法 IPC 中的错误 input Schema 不安装 Claim、不 pin、不推进 Subscription position。
-Operation turn 协议必须证明 borrowed linear work 能跨 prepared transaction 到达 AfterCommit；Turn::Idle、Action::Idle、错误、背压和 commit failure 都不运行 completion。
-AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提交前拒绝，并可经 reopen 恢复。
+运行期 Schema guard 必须证明 output 违例回滚 head 与全部 tails，错误 input Schema 在恢复时被拒绝。Source 捕获提交和 durability barrier 必须先于原 Delivery 的 ACK；Delivery 的跨 connector、drop/replay、stop 失效由 Debezium 拥有。Sink 固定 Prepared 的持久化必须先于外部提交，外部提交后本地结算前的中断必须可幂等重投。旧的 Station、订阅、pin 与提交回调测试由这些 owner 证据替换。
 
 ## 性能所有权
 
@@ -156,45 +130,27 @@ AfterCommit error/panic 必须证明 fail-stop，下一轮在任何 Station 提�
 | `change_codec` | Change 自有七路旋转 runner：self-contained/schema-bound encode 与 full decode，加三种 self-contained projected decode；同 fixture 记录两种格式 bytes 与节省比例 |
 | `cell` | Criterion |
 | `projection` | Operation 自有 Criterion：Select/SchemaAlign 的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
-| `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单 turn 多行、单 turn 重复极值 key、同 turn 净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |
-| `distinct` | Operation 自有 Criterion：同一 Change 内同 key 连续正负循环与两 key 交错循环；每轮完整 turn/apply/`Transaction::commit`/AfterCommit，有写才同步 WAL，fixture 和逐事件输出 oracle 不计时 |
-| `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条发布；未完成快照的常规 reset 固定用 257 条窄 entry 跨过 256-entry 批界，wide schema-bound entry 用同一 entry/row 布局配对发布与清理；计时一次只读 restore、publish 的逐 entry 或 reset 的逐 batch turn/apply/同步 commit/AfterCommit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
-| `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整 Claim 的全部分页 turns、同步 commit 与 AfterCommit，fixture、seed 和结果校验不计时 |
-| `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、超过 1 MiB 的单候选活性逃生、分页边界、大 fanout、whole-Claim、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
-| `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 turn/apply/sync commit/AfterCommit；恢复 case 只计时 reopen/bind/materialize 与首个 validation turn。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
-| `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、nearest+tolerance 和 residual 远候选回退；每次计时包含一对使关系回到初始态的完整 Claim、全部分页 turns、同步 commit 和 AfterCommit，fixture、seed 与结果校验不计时 |
-| `asof_join_resources` | Operation 自有进程隔离 runner：分页候选、宽/超大单行、whole-Claim、residual 远回退、右侧历史 rematch、双侧 NULL-order history N/2N，以及 port 1 的 empty-left distinct N/2N preload、same-key 高 multiplicity 和 active-overlay N/2N growth；分别输出一个完整 driving Claim 的 Rust allocator heap、每页产生的 Arrow array memory/行数、turn 数，以及独立 non-profile pass 扫描两个 rows map 得到的持久逻辑 entry/key+value bytes；RSS 明示 unavailable |
+| `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单页多行、单页重复极值 key、页内净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 Atomic apply/`Transaction::commit`，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |
+| `distinct` | Operation 自有 Criterion：同一 Change 内同 key 连续正负循环与两 key 交错循环；每轮完整 Atomic apply/`Transaction::commit`，有写才同步 WAL，fixture 和逐事件输出 oracle 不计时 |
+| `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条发布；未完成快照的常规 reset 固定用 257 条窄 entry 跨过 256-entry 批界，wide schema-bound entry 用同一 entry/row 布局配对发布与清理；计时一次只读 restore；publish 每 entry 包含 record 与同步 commit、published 只读/解码，以及 consume_published 的独立同步 commit；reset 每 batch 包含 record 与同步 commit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
+| `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整输入 的全部分页 step 与同步 commit，fixture、seed 和结果校验不计时 |
+| `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、128 KiB 单候选、分页边界、大 fanout、whole-input、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
+| `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，以及高 multiplicity/有限容量 churn。常规 case 计时完整 admission、Prepared 持久化、sync、deliver 和 settle；恢复 case 只计时 reopen/bind 与首次完整 buffer 校验。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
+| `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、Backward 且允许 exact 的查找与历史修正；每次计时包含一对使关系回到初始态的完整输入、全部分页 step 和同步 commit，fixture、seed 与结果校验不计时 |
+| `asof_join_resources` | Operation 自有进程隔离 runner：历史 lookup、RHS 历史修正、空影响区间和 NULL-order left；记录 Rust allocator heap、输出行数/正负事件、页数与重试数；关系 oracle 归 correctness |
 | `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除 |
-| `subscribed_log` | Criterion；大 payload status/消费、固定 fanout 跨 reopen 有界 churn |
 | `flow_lifecycle` | Criterion |
-| `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含同一 Select（选列）→Select（追加列）→Filter→Select→SchemaAlign 逻辑链的独立 Station 与线性多 Operation Station 对照 |
-| `change_subscribed_log` | Criterion；单 exact Schema 的 schema-bound entries，durable append 与 owned decode/ack consume |
+| `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含 Select（选列）→Select（追加列）→Filter→Select→SchemaAlign、计数链和 fan-out；以相同逻辑输入与最终结果比较 |
 
 自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
-`equi_join_resources` 的每个 case 必须在新子进程中建立 fixture、seed 与 driving Change，再启动一个 `dhat 0.3.3` profiler 覆盖恰好一个完整 Claim。heap 数字只表示经过 Rust global allocator 的 total/current/peak bytes 与 blocks，不包含 profiler 启动前的输入 Arrow/seed/fixture，也不包含 RocksDB native heap。输出 Arrow array memory 单独按每个 Change 的 `get_array_memory_size` 累计；FullOuter 状态另用不受 profiler 影响的独立 pass 在每次 commit 后扫描 `equi_join.match_counts`，只记录实际/影子 entry 数及 decoded key + `u64` 逻辑字节，不代表 WAL、LSM、cache、压缩或文件系统占用。portable runner 不采集平台单位不一致的 RSS，JSONL 中必须保留 `rss_bytes: null` 和原因，各口径不得互相替代。
+`equi_join_resources` 的每个 case 必须在新子进程中建立 fixture、seed 与 driving Change，再启动一个 `dhat 0.3.3` profiler 覆盖一个完整输入的全部分页计算。heap 数字只表示经过 Rust global allocator 的 total/current/peak bytes 与 blocks，不包含 profiler 启动前的输入 Arrow/seed/fixture，也不包含 RocksDB native heap。输出 Arrow array memory 单独按每个 Change 的 `get_array_memory_size` 累计；FullOuter 状态另用不受 profiler 影响的独立 pass 在每次 commit 后扫描 `equi_join.match_counts`，只记录实际 entry 数、零值 entry 数及 decoded key + `u64` 逻辑字节，不代表 WAL、LSM、cache、压缩或文件系统占用。portable runner 不采集平台单位不一致的 RSS，JSONL 中必须保留 `rss_bytes: null` 和原因，各口径不得互相替代。
 
-`asof_join_resources` 遵循相同的新子进程/单完整 Claim `dhat 0.3.3` 边界。除候选分页、宽行、
-whole-Claim、residual 和历史 rematch 外，它还成对比较 empty-left distinct N/2N、same-key 高
-multiplicity、active-overlay N/2N，以及持久 NULL-order left/right history N/2N。NULL-left 对照固定
-同一份 RHS Claim 并必须在一个 turn 内完成；NULL-right 对照固定同一条 left Claim 并必须在一个 turn
-内完成。两者都必须自动断言 N/2N 的 claim 与 Rust heap 记录完全相同，证明双向 scan 都精确 seek 到
-matchable marker，不能让永不匹配的历史放大另一侧更新。Heap 不包含
-profiler 前建立的 fixture、seed 和输入 Arrow，也不包含 RocksDB native heap；output 单独累计
-`RecordBatch::get_array_memory_size` 与 diff array，可能重复计入共享 buffer。持久状态在另一个不受 profiler 影响的
-pass 中以 `OrderedMap<Vec<u8>, u64>` 观察句柄扫描 `asof_join.left_rows/right_rows`，记录解码
-entry 数与 key + 8-byte positive weight；这是 codec 已锁定的逻辑大小，不是 RocksDB/WAL/LSM/cache/
-压缩/文件系统占用。port 1 必须用 empty-left distinct N/2N preload 证明整批准入、turn continuation、
-最终 right state 与撤回闭环，并用 same-key Claim 证明单 entry 的高 multiplicity；active-overlay N/2N
-对照先 seed N 个不同 equality partition 的 left row，再由一个每 partition 一行的 N-row right Claim 驱动，
-使每个事件只 rematch 一个 left 和一个 candidate。该 active case 的 non-profile oracle 必须在插入与撤回两向
-校验每个 group 恰好一次、左右 group/order 对应及精确 `+1/-1` 权重，且最终状态回到 seed；paired 记录用于
-同一次 benchmark 环境下比较 heap/turn 增长，test mode 只验证协议，不作为性能基线。RSS 仍必须明示
-`null` 与 unavailable 原因，各口径不得互相替代。
+`asof_join_resources` 逐 case 运行隔离进程，profile 只覆盖已准备好 fixture/input 之后的计算与同步提交。输出行数、正负事件数与分页计数作基本 witness；独立 winner/bag oracle 由 correctness 拥有。当前 runner 不记录 Arrow output bytes、RocksDB native heap 或 RSS，不将 Rust allocator heap 当作整个进程内存。
 
 Criterion 使用自身 raw samples 和 estimates，并把输出放在 `RunRoot` 管理的 target 目录。Criterion target 设置 `test = true`，使普通 workspace gate 能进入 test mode。`flow_runtime`、`equi_join_resources` 与 `asof_join_resources` 的自有 runner 同样设置 `test = true`；test mode 自动选择小规模 workload，后两者仍逐 case 启动隔离子进程。其他旋转型自有 runner 设置 `test = false`，由明确的 smoke 命令执行。
 
-`flow_runtime` 的线性链对照固定使用相同的 SequenceScan→Select（选列）→Select（追加列）→Filter→Select→SchemaAlign→Discard 逻辑与数据：独立 Station 布局通过 `materialize` 固定边界，是 7 个 Station、6 个 durable output log 和 6 条 input edge；融合布局通过 `FlowFactory::operation` 的自动规划把五个 transform 放入 Scan Station，只保留 2 个 Station、1 个 durable output log 和 1 条 input edge。每个成功 `advance` 分别校验 7/2 次 Station commit、6/1 次 input completion 和 6/1 次 IPC Change append。每个 Station transaction 仍独立原子提交并启用 WAL，但同一 `advance` 内在 durable AfterCommit 或返回前共享 durability barrier；这些语义 commit 数不是 RocksDB WAL sync 次数。每个采样只记录原始 `advance` latency 与 outcome；单行 source Change throughput 由消费者直接从 latency 推导，不在每条记录中重复保存派生值。当前公共 API 只提供完整 `advance` 时长和 output 当前 retained bytes，不提供单次 Store transaction duration、实际 WAL sync 次数或历史累计 IPC bytes，JSONL context 必须把这些字段记为 unavailable，不能用语义 commit 数、均摊延迟或当前 retained bytes 冒充。
+`flow_runtime` 固定逻辑 workload，逐次记录完整有界 `advance` latency；预热、最终 backlog 排空、源捕获数量、计数状态和 reopen oracle 在计时外。单轮可能留下待处理调用，不把捕获数量当作该轮已完成数量。比较重构前后时必须匹配逻辑工作量与最终输入数；已删除的强制 Station 布局不构成新产品模式。实际 WAL sync、单事务 duration、累计 IPC bytes 没有观测 API 时必须标记 unavailable，不可用推算值冒充。
 
 性能环境只有两个入口：
 
@@ -231,7 +187,6 @@ cargo test -p dogpaddle-operation --test correctness aggregate::
 cargo test -p dogpaddle-flow --test correctness runtime_corruption::
 cargo test -p dogpaddle-sql --test correctness
 cargo test -p dogpaddle --test correctness
-cargo test -p dogpaddle-change-store-integration
 ```
 
 性能 test mode 与 smoke：
@@ -241,7 +196,6 @@ cargo test --workspace --benches --locked
 
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change --bench change_codec
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ordered_map
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench projection
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench distinct
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench aggregate_extrema
@@ -251,7 +205,6 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench equi_join_resources
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-operation --bench asof_join_resources
-DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-change-store-integration --bench change_subscribed_log
 DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-flow --bench flow_runtime
 ```
 
@@ -292,7 +245,7 @@ scripts/clean.sh
 `check.sh`、`run.sh` 或日常 CI workflow。
 
 根 workspace 中的 `system-tests/debezium-runtime/host` 只拥有 bundle lifecycle probe；`system-tests/postgres/hosts` 拥有 CDC、Sink、Sink recovery 和 SQL 四个 host；`system-tests/mysql/host` 只拥有 MySQL CDC 的直接 Operation/Store 验收 host。PostgreSQL 公共 support 只共享临时集群、端口、进程和日志，不被 D1 或 MySQL gate 使用。
-`system-tests/mysql/check_cdc.py` 每次使用随机名称的独立 MySQL 8.4 Compose 项目、数据卷和回环端口，不接触现有数据库。它用真正的 Debezium delivery 验证快照封口与 streaming 的 Store commit 后、AfterCommit ACK 前进程退出；重开检查私有 spool、精确有序输出、无重复和后继 binlog 事件；失败保留私有状态、丢弃可能泄露凭据的 host stderr，仅在终端显示脱敏的容器诊断，容器和数据卷仅清理本轮项目。bundle 必须包含 MySQL connector；可用 `--host` 指向已编译的绝对路径，容器 CLI 由 `--engine` 指定。此门禁不属于普通 Cargo gate。
+`system-tests/mysql/check_cdc.py` 每次使用随机名称的独立 MySQL 8.4 Compose 项目、数据卷和回环端口，不接触现有数据库。它用真正的 Debezium delivery 验证快照封口与 streaming 的 Store commit 后、原 Delivery ACK 前进程退出；重开检查私有 spool、精确有序输出、无重复和后继 binlog 事件；失败保留私有状态、丢弃可能泄露凭据的 host stderr，仅在终端显示脱敏的容器诊断，容器和数据卷仅清理本轮项目。bundle 必须包含 MySQL connector；可用 `--host` 指向已编译的绝对路径，容器 CLI 由 `--engine` 指定。此门禁不属于普通 Cargo gate。
 `system-tests/warehouse-sinks/check.sh` 用锁定的官方镜像启动一次性 ClickHouse/Doris fixture，运行产品 crate 内标记为 ignored 的真实 adapter 测试，并在退出时删除容器和 volume；可用 `CONTAINER_ENGINE` 选择兼容 Compose 的容器 CLI。
 PostgreSQL 检查脚本在未提供 host 参数时显式构建该 package 的 release bins；CI 传入
 `--host`（Sink 同时传 `--recovery-host`）以消费同一 workflow 的预构建 artifact。所有显式路径必须是绝对路径。

@@ -1,376 +1,141 @@
-use std::{error::Error, fmt};
+use std::error::Error;
 
 use dogpaddle_change::Change;
 use dogpaddle_store::TransactionAccess;
+use thiserror::Error;
+
+mod boundary;
+mod compute;
+pub use boundary::{SinkOperation, SinkPending, SinkPrepared, SourceDelivery, SourceOperation};
+pub use compute::{BudgetExceeded, PagedOperation, Progress, Resume, Step, StepBudget};
+pub(crate) use compute::{Cursor, logical_array_bytes, logical_change_bytes};
 
 pub(crate) mod relation;
 pub mod scan;
 pub mod sink;
 pub mod transform;
 
-/// One complete input Change borrowed for an Operation turn.
+/// Complete immutable input borrowed for a computation step.
 #[derive(Clone, Copy, Debug)]
 pub struct OperationInput<'change> {
     /// Zero-based ordinal in the Definition's ordered inputs.
     pub port: usize,
-    /// Complete Change offered on `port`.
+    /// Complete immutable input. A head selects its bounded window internally.
     pub change: &'change Change,
 }
 
-/// Transactional decision produced by one prepared Operation turn.
-#[derive(Debug)]
-pub enum Action {
-    /// Makes no progress and asks the caller to roll back the turn.
-    ///
-    /// Any offered input remains current and must be offered again unchanged.
-    Idle,
-    /// Commits the Operation's state and optional output without completing an input.
-    ///
-    /// Any offered input remains current for the next turn. An Operation may
-    /// also use this action to commit internal progress when no input was
-    /// offered.
-    Commit(Option<Change>),
-    /// Commits the Operation's state, optional output, and input completion atomically.
-    ///
-    /// The caller advances the offered input only after the enclosing
-    /// transaction commits successfully. Returning this action from an
-    /// turn without an offered input is a protocol violation.
-    Complete(Option<Change>),
-}
-
-/// Type-erased failure before one prepared Operation turn commits.
+/// Concrete failure requiring the caller to roll back this step.
 pub type OperationError = Box<dyn Error + Send + Sync + 'static>;
 
-/// A transform that completely consumes one Change inside the caller's transaction.
+/// A transform that completes the offered slice in the caller's transaction.
 ///
-/// An atomic operation may update its declared Store data and may emit any
-/// complete output Change, including one with a different row count or diff
-/// sequence. It cannot retain a continuation, perform an external effect, or
-/// produce post-commit work. If this operation or a later operation in the same
-/// Station fails, all replay-sensitive changes must be recoverable by rolling
-/// back the supplied transaction.
+/// Runtime state consists only of compiled expressions and typed handles.
+/// Pending state and output are local to this call and disappear on rollback.
 pub trait AtomicOperation: Send + 'static {
-    /// Applies the complete input inside an existing Store transaction.
-    ///
-    /// `None` represents an empty logical output stream for this input Change.
-    ///
+    /// Applies an input slice, charging shared logical bytes without consuming head items.
     /// # Errors
-    ///
-    /// Returns a failure that requires the caller to roll back the transaction.
-    /// The operation must remain safe to call again from unchanged durable state.
+    /// Returns a semantic, state or budget failure requiring transaction rollback.
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         access: TransactionAccess<'_>,
+        budget: &mut StepBudget,
     ) -> Result<Option<Change>, OperationError>;
 }
 
-/// Failure after one prepared Operation turn has committed.
-///
-/// This phase is deliberately distinct from [`OperationError`]: the local
-/// Store transaction is already committed and cannot be rolled back. A local
-/// completion may run before a shared durability barrier; an external
-/// completion runs only after that barrier.
-#[derive(Debug)]
-pub struct PostCommitError {
-    source: OperationError,
-}
+/// A restored position does not belong to this kernel or immutable input.
+#[derive(Debug, Error)]
+#[error("operation resume is invalid")]
+pub struct InvalidResume;
 
-impl PostCommitError {
-    /// Wraps one concrete post-commit failure.
-    ///
-    /// An already erased [`OperationError`] can instead be converted with
-    /// [`From`].
-    pub fn new<E>(source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self {
-            source: Box::new(source),
-        }
-    }
-}
-
-impl fmt::Display for PostCommitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
-    }
-}
-
-impl Error for PostCommitError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
-impl From<OperationError> for PostCommitError {
-    fn from(source: OperationError) -> Self {
-        Self { source }
-    }
-}
-
-/// Work that may run only after the prepared turn's Store transaction commits.
-///
-/// Dropping this value abandons the work. In particular, dropping it after a
-/// rollback, backpressure, or commit failure must not confirm an external
-/// delivery. The callback itself is never run from [`Drop`].
-///
-/// A local completion only publishes recoverable in-process state and may run
-/// before a shared durability barrier. A durable completion can affect an
-/// external system, so its caller must first make the preceding Store commit
-/// durable. Both kinds run after the transaction becomes atomically visible.
-///
-/// The preceding transaction must persist everything needed to recover if the
-/// process exits before the callback runs or if the callback fails. A callback
-/// is a settlement of durable intent, never the sole owner of replay state.
-/// After a callback error, the caller must not invoke the same runtime
-/// Operation again; it must reconstruct it from durable state first.
-#[must_use = "after-commit work must be run after a successful Store commit or deliberately dropped"]
-pub struct AfterCommit<'turn> {
-    effect: AfterCommitEffect<'turn>,
-}
-
-enum AfterCommitEffect<'turn> {
-    None,
-    Local(Box<dyn FnOnce() -> Result<(), PostCommitError> + 'turn>),
-    Durable(Box<dyn FnOnce() -> Result<(), PostCommitError> + 'turn>),
-}
-
-impl<'turn> AfterCommit<'turn> {
-    /// Creates in-process work that is recoverable without an immediate
-    /// durability barrier.
-    pub fn local<F>(effect: F) -> Self
-    where
-        F: FnOnce() -> Result<(), PostCommitError> + 'turn,
-    {
-        Self {
-            effect: AfterCommitEffect::Local(Box::new(effect)),
-        }
-    }
-
-    /// Creates an external effect that requires the preceding Store commit to
-    /// be durable before it runs.
-    pub fn durable<F>(effect: F) -> Self
-    where
-        F: FnOnce() -> Result<(), PostCommitError> + 'turn,
-    {
-        Self {
-            effect: AfterCommitEffect::Durable(Box::new(effect)),
-        }
-    }
-
-    /// Creates an empty completion for a wholly transactional turn.
-    pub const fn none() -> Self {
-        Self {
-            effect: AfterCommitEffect::None,
-        }
-    }
-
-    /// Returns whether this completion can affect an external system and must
-    /// wait for a durability barrier.
-    ///
-    /// Local and empty completions return `false` so several transactions can
-    /// share a later barrier.
-    #[must_use]
-    pub const fn requires_durability(&self) -> bool {
-        matches!(self.effect, AfterCommitEffect::Durable(_))
-    }
-
-    /// Runs the completion after the enclosing Store transaction has committed.
-    ///
-    /// # Errors
-    ///
-    /// Returns the concrete post-commit failure. The Store transaction has
-    /// already committed when this method is called and cannot be rolled back.
-    pub fn run(self) -> Result<(), PostCommitError> {
-        match self.effect {
-            AfterCommitEffect::None => Ok(()),
-            AfterCommitEffect::Local(effect) | AfterCommitEffect::Durable(effect) => effect(),
-        }
-    }
-}
-
-type PreparedApply<'turn> = Box<
-    dyn for<'transaction> FnOnce(
-            TransactionAccess<'transaction>,
-        ) -> Result<(Action, AfterCommit<'turn>), OperationError>
-        + 'turn,
->;
-
-enum PreparedTurnInner<'turn> {
-    Atomic {
-        operation: &'turn mut dyn AtomicOperation,
-        input: OperationInput<'turn>,
-    },
-    Custom(PreparedApply<'turn>),
-}
-
-/// One transaction-ready Operation turn.
-///
-/// Applying this value consumes it, so its transactional body cannot run
-/// twice. Dropping it abandons the turn without running post-commit work.
-pub struct PreparedTurn<'turn> {
-    inner: PreparedTurnInner<'turn>,
-}
-
-impl<'turn> PreparedTurn<'turn> {
-    fn atomic(operation: &'turn mut dyn AtomicOperation, input: OperationInput<'turn>) -> Self {
-        Self {
-            inner: PreparedTurnInner::Atomic { operation, input },
-        }
-    }
-
-    /// Applies this turn inside an existing Store transaction.
-    ///
-    /// The body may access only its declared Store data through `access`. It
-    /// must not commit the transaction or perform an observable effect that
-    /// cannot be rolled back with it, unless that effect is protected by a
-    /// separately specified durable idempotency protocol that makes replay
-    /// after Store rollback safe.
-    ///
-    /// # Errors
-    ///
-    /// Returns a pre-commit failure without post-commit work. The caller must
-    /// roll back the transaction. The Operation must remain
-    /// safe to prepare again from unchanged durable state; a poisoned transient
-    /// resource must be reset or marked for reconstruction before returning.
-    pub fn apply(
-        self,
-        access: TransactionAccess<'_>,
-    ) -> Result<(Action, AfterCommit<'turn>), OperationError> {
-        match self.inner {
-            PreparedTurnInner::Atomic { operation, input } => {
-                let output = operation.apply(input, access)?;
-                Ok((Action::Complete(output), AfterCommit::none()))
-            }
-            PreparedTurnInner::Custom(apply) => apply(access),
-        }
-    }
-}
-
-/// Result of asking an Operation to produce one bounded turn.
-#[must_use = "an Operation turn must be applied or deliberately abandoned"]
-pub enum Turn<'turn> {
-    /// The Operation currently has no work and no Store transaction is needed.
-    Idle,
-    /// One turn is ready to apply inside a Store transaction.
-    Ready(PreparedTurn<'turn>),
-}
-
-impl<'turn> Turn<'turn> {
-    /// Creates a ready turn from one consuming transactional body.
-    ///
-    /// The body returns both its transactional [`Action`] and any work that may
-    /// run only after that transaction commits. Constructing this value does
-    /// not execute the body; the caller does that through [`PreparedTurn::apply`].
-    pub fn ready<F>(apply: F) -> Self
-    where
-        F: for<'transaction> FnOnce(
-                TransactionAccess<'transaction>,
-            )
-                -> Result<(Action, AfterCommit<'turn>), OperationError>
-            + 'turn,
-    {
-        Self::Ready(PreparedTurn {
-            inner: PreparedTurnInner::Custom(Box::new(apply)),
-        })
-    }
-}
-
-/// Runtime protocol for an operation that owns a complete Station turn.
-pub trait TurnOperation: Send + 'static {
-    /// Produces one bounded turn while no Store write transaction is active.
-    ///
-    /// `None` means that no input Claim is currently offered. A Scan always
-    /// receives `None`; an input Operation may also receive `None` when its
-    /// inputs are caught up, allowing durable internal work to continue. An
-    /// Operation with no such work returns [`Turn::Idle`]. This phase may
-    /// prepare bounded external work, but it must not confirm that work or
-    /// advance any replay-sensitive fact before the returned prepared turn
-    /// commits.
-    ///
-    /// [`Turn::Idle`] avoids opening a Store transaction. [`Turn::Ready`]
-    /// contains a linear prepared turn that the caller applies once in a Store
-    /// transaction. The caller interprets its returned [`Action`] as follows:
-    ///
-    /// - [`Action::Idle`] rolls back every write from the prepared turn.
-    /// - [`Action::Commit`] commits Operation state and optional output without
-    ///   advancing an offered input.
-    /// - [`Action::Complete`] atomically commits Operation state, optional
-    ///   output, and completion of the offered input.
-    ///
-    /// Only after that transaction commits may the caller run the returned
-    /// [`AfterCommit`]. If preparation, application, output admission, or
-    /// commit fails, the prepared turn or completion is dropped instead.
-    /// Replay-sensitive continuation must remain in declared durable data;
-    /// in-memory state may only cache reconstructible runtime resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns a failure that occurred before a Store transaction was opened.
-    /// No prepared turn exists and no external work may have been confirmed.
-    /// A preparation error must leave this runtime safe to call again from
-    /// unchanged durable state. An implementation that observes a poisoned
-    /// transient resource must reset it itself, or remember to reconstruct it
-    /// on its next turn, before returning.
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError>;
-}
-
-/// One materialized operation with its statically validated execution capability.
+/// One materialized operation with its validated execution capability.
 pub enum Operation {
-    /// A complete-Change transform that can participate in a linear Station transaction.
+    /// Transaction-local computation, also usable in a fused tail.
     Atomic(Box<dyn AtomicOperation>),
-    /// An operation that owns the full turn and post-commit protocol.
-    Turn(Box<dyn TurnOperation>),
+    /// Computation with an opaque caller-owned position.
+    Paged(Box<dyn PagedOperation>),
+    /// External source capture and its private published queue.
+    Source(Box<dyn SourceOperation>),
+    /// External sink delivery and its private outbox.
+    Sink(Box<dyn SinkOperation>),
 }
-
 impl Operation {
-    /// Produces one bounded turn, adapting an atomic head into a completed input turn.
-    ///
-    /// # Errors
-    ///
-    /// Returns a concrete preparation failure reported by a full-turn
-    /// Operation.
-    pub fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
+    /// Returns the pure initial position for a computation head.
+    #[must_use]
+    pub fn initial_resume(&self) -> Resume {
         match self {
-            Self::Atomic(operation) => {
-                let Some(input) = input else {
-                    return Ok(Turn::Idle);
-                };
-                Ok(Turn::Ready(PreparedTurn::atomic(operation.as_mut(), input)))
+            Self::Paged(operation) => operation.initial_resume(),
+            _ => Resume::batch(),
+        }
+    }
+    /// Validates a position against this kernel and complete immutable input.
+    /// # Errors
+    /// Returns an error for a wrong variant, port, or position outside the input.
+    pub fn validate_resume(
+        &self,
+        input: OperationInput<'_>,
+        resume: &Resume,
+    ) -> Result<(), OperationError> {
+        match self {
+            Self::Paged(operation) => operation.validate_resume(input, resume),
+            Self::Atomic(_) | Self::Source(_)
+                if matches!(resume.cursor, Cursor::Batch)
+                    && resume.ordinal < u64::try_from(input.change.num_rows())? =>
+            {
+                Ok(())
             }
-            Self::Turn(operation) => operation.turn(input),
+            _ => Err(InvalidResume.into()),
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AtomicOperation, Operation, OperationError, OperationInput, Turn};
-    use dogpaddle_change::Change;
-    use dogpaddle_store::TransactionAccess;
-
-    struct UncalledAtomic;
-
-    impl AtomicOperation for UncalledAtomic {
-        fn apply(
-            &mut self,
-            _input: OperationInput<'_>,
-            _access: TransactionAccess<'_>,
-        ) -> Result<Option<Change>, OperationError> {
-            unreachable!("an atomic adapter without an offered input must idle")
+    /// Computes one page using the same allowance as all fused atomic tails.
+    ///
+    /// A captured Source page is sliced as identity data; this method performs
+    /// no polling, capture or ACK. Every `More` differs from the supplied Resume.
+    /// # Errors
+    /// Returns semantic, state, malformed position or budget failures requiring rollback.
+    pub fn step(
+        &self,
+        input: OperationInput<'_>,
+        resume: &Resume,
+        access: TransactionAccess<'_>,
+        budget: &mut StepBudget,
+    ) -> Result<Step, OperationError> {
+        if let Self::Paged(operation) = self {
+            return operation.step(input, resume, access, budget);
         }
-    }
-
-    #[test]
-    fn atomic_adapters_idle_without_an_offered_input() {
-        let mut atomic = Operation::Atomic(Box::new(UncalledAtomic));
-        assert!(matches!(atomic.turn(None).unwrap(), Turn::Idle));
+        self.validate_resume(input, resume)?;
+        let start = usize::try_from(resume.ordinal)?;
+        let length = budget.head_remaining().min(input.change.num_rows() - start);
+        if length == 0 {
+            return Err(BudgetExceeded.into());
+        }
+        let slice = if start == 0 && length == input.change.num_rows() {
+            input.change.clone()
+        } else {
+            input.change.try_slice(start, length)?
+        };
+        budget.consume_head(length)?;
+        let output = match self {
+            Self::Atomic(operation) => operation.apply(
+                OperationInput {
+                    port: input.port,
+                    change: &slice,
+                },
+                access,
+                budget,
+            )?,
+            Self::Source(_) => Some(slice),
+            _ => return Err(InvalidResume.into()),
+        };
+        let next = start + length;
+        let progress = if next == input.change.num_rows() {
+            Progress::Done
+        } else {
+            Progress::More(Resume {
+                ordinal: u64::try_from(next)?,
+                cursor: Cursor::Batch,
+            })
+        };
+        Ok(Step { output, progress })
     }
 }

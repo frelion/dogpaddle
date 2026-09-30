@@ -36,11 +36,11 @@ fn main() -> Result<(), ExampleError> {
     let program = SqlProgram::read(&options.sql_path)?;
     let mut flow = program.start(&options.state_path)?;
 
-    let station_count = flow.status()?.len();
+    let operation_count = flow.operation_count();
     println!("DogPaddle SQL quickstart");
     println!("SQL       {}", options.sql_path.display());
     println!("state     {}", options.state_path.display());
-    println!("stations  {station_count} persistent");
+    println!("operations {operation_count}");
     println!();
 
     for round in 1..=options.rounds {

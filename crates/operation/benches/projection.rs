@@ -8,7 +8,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, col,
     operation::{
-        Operation, OperationInput,
+        Operation, OperationInput, StepBudget,
         transform::{SchemaAlignDefinition, SchemaAlignField, SelectDefinition},
     },
 };
@@ -96,14 +96,14 @@ fn bench_projections(criterion: &mut Criterion, root: &RunRoot) {
                     )
                     .unwrap()
                     .into_parts();
-                let Operation::Atomic(mut operation) = operation else {
+                let Operation::Atomic(operation) = operation else {
                     panic!("projection must be atomic")
                 };
                 let mut transactions = setup
                     .commit(sample.path().join("store"), |_| Ok(()))
                     .unwrap();
                 let transaction = transactions.begin();
-                let mut apply = || {
+                let apply = || {
                     operation
                         .apply(
                             OperationInput {
@@ -111,6 +111,7 @@ fn bench_projections(criterion: &mut Criterion, root: &RunRoot) {
                                 change: &input,
                             },
                             transaction.access(),
+                            &mut StepBudget::new(0, 4 * 1024 * 1024),
                         )
                         .unwrap()
                         .unwrap()
@@ -176,14 +177,14 @@ fn bench_column_projection(criterion: &mut Criterion, root: &RunRoot) {
                 )
                 .unwrap()
                 .into_parts();
-            let Operation::Atomic(mut operation) = operation else {
+            let Operation::Atomic(operation) = operation else {
                 panic!("projection must be atomic")
             };
             let mut transactions = setup
                 .commit(sample.path().join("store"), |_| Ok(()))
                 .unwrap();
             let transaction = transactions.begin();
-            let mut apply = || {
+            let apply = || {
                 operation
                     .apply(
                         OperationInput {
@@ -191,6 +192,7 @@ fn bench_column_projection(criterion: &mut Criterion, root: &RunRoot) {
                             change: &input,
                         },
                         transaction.access(),
+                        &mut StepBudget::new(0, 4 * 1024 * 1024),
                     )
                     .unwrap()
                     .unwrap()

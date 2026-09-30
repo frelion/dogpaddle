@@ -16,10 +16,10 @@ pub(crate) const TAG: u16 = 8;
 
 /// Pure definition of an order-preserving `UNION ALL` operation.
 ///
-/// Every input must have the same exact logical Schema. Each complete input
-/// Change is forwarded unchanged, preserving row order, differences, and Arrow
+/// Every input must have the same exact logical Schema. Each offered input
+/// slice is forwarded unchanged, preserving row order, differences, and Arrow
 /// buffers. `UnionAll` defines no semantic order across ports: their physical
-/// interleaving follows the owning Station's input schedule and may change when
+/// interleaving follows Flow call-stack scheduling and may change when
 /// inputs are rebatched. Each port's event order and the final relation remain
 /// unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -53,7 +53,7 @@ pub enum UnionAllSchemaError {
     },
 }
 
-/// `UnionAll`-specific failure during one `UnionAllOperation` turn.
+/// `UnionAll`-specific failure during one `UnionAllOperation` application.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum UnionAllError {
@@ -132,9 +132,10 @@ impl UnionAllDefinition {
 
 impl AtomicOperation for UnionAllOperation {
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         _access: TransactionAccess<'_>,
+        budget: &mut crate::operation::StepBudget,
     ) -> Result<Option<dogpaddle_change::Change>, OperationError> {
         if input.port >= self.input_count {
             return Err(UnionAllError::InvalidInputPort {
@@ -153,6 +154,7 @@ impl AtomicOperation for UnionAllOperation {
             .into());
         }
 
+        budget.charge(crate::operation::logical_change_bytes(input.change))?;
         Ok(Some(input.change.clone()))
     }
 }

@@ -225,14 +225,18 @@ impl BoundProjection {
 
 impl AtomicOperation for BoundProjection {
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         _access: TransactionAccess<'_>,
+        budget: &mut crate::operation::StepBudget,
     ) -> Result<Option<Change>, OperationError> {
+        budget.charge(crate::operation::logical_change_bytes(input.change))?;
         if input.port != 0 {
             return Err(ProjectionError::InvalidInputPort { port: input.port }.into());
         }
-        self.evaluate(input.change).map(Some).map_err(Into::into)
+        let output = self.evaluate(input.change)?;
+        budget.charge(crate::operation::logical_change_bytes(&output))?;
+        Ok(Some(output))
     }
 }
 

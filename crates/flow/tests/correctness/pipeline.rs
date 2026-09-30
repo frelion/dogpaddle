@@ -1,4 +1,4 @@
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
@@ -12,13 +12,11 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store, SubscribedLog};
+use dogpaddle_store::{Cell, OrderedMap, Store};
 use rusqlite::{Connection, OpenFlags};
 
-const CAPACITY: NonZeroU64 = NonZeroU64::MAX;
-
 #[test]
-fn five_atomic_transforms_run_in_one_station_across_reopen() {
+fn five_atomic_transforms_run_in_one_fused_tail_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let flow_path = root.path().join("flow");
     let sqlite_path = root.path().join("sink.sqlite");
@@ -65,15 +63,14 @@ fn five_atomic_transforms_run_in_one_station_across_reopen() {
         SqliteSinkDefinition::try_new(&sqlite_path, "events").unwrap(),
         [scan],
     );
-    factory.materialize(scan, CAPACITY);
 
     let mut flow = factory.build().unwrap();
-    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["scan", "sqlite"]);
+    assert_eq!(flow.operation_count(), 7);
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
 
     let mut flow = FlowFactory::new(&flow_path).open().unwrap();
-    assert_eq!(flow.station_count(), 2);
+    assert_eq!(flow.operation_count(), 7);
     run_until_idle(&mut flow);
     drop(flow);
 
@@ -98,18 +95,10 @@ fn five_atomic_transforms_run_in_one_station_across_reopen() {
 
     let store = Store::open(&flow_path).unwrap();
     let _: Cell<u64> = store
-        .open_data("station/00000000/operation/00000000/sequence_scan.position")
+        .open_data("operation/00000000/sequence_scan.position")
         .unwrap();
-    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let _: Cell<Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/sink.control")
-        .unwrap();
-    let _: OrderedMap<u64, Vec<u8>> = store
-        .open_data("station/00000001/operation/00000000/sink.buffer")
-        .unwrap();
-    let transaction = store.read_transaction();
-    let status = output.writer().status(transaction.access()).unwrap();
-    assert_eq!((status.head, status.tail), (2, 2));
+    let _: Cell<Vec<u8>> = store.open_data("operation/00000006/sink.control").unwrap();
+    let _: OrderedMap<u64, Vec<u8>> = store.open_data("operation/00000006/sink.buffer").unwrap();
 }
 
 #[test]
@@ -129,7 +118,6 @@ fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
         [compute],
     );
     factory.operation("sink", DiscardDefinition::new(), [compute]);
-    factory.materialize(compute, CAPACITY);
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
@@ -137,12 +125,11 @@ fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
 
     let store = Store::open(&path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/00000000/sequence_scan.position")
+        .open_data("operation/00000000/sequence_scan.position")
         .unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .open_data("operation/00000002/running_event_count.count")
         .unwrap();
-    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let transaction = store.read_transaction();
     assert_eq!(
         position.read(transaction.access()).unwrap().get().unwrap(),
@@ -152,10 +139,6 @@ fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
         count.read(transaction.access()).unwrap().get().unwrap(),
         Some(1)
     );
-    assert_eq!(
-        output.writer().status(transaction.access()).unwrap().tail,
-        1
-    );
     drop(transaction);
     drop(store);
 
@@ -164,7 +147,7 @@ fn an_empty_intermediate_result_commits_prior_state_and_skips_the_tail() {
 }
 
 #[test]
-fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
+fn a_late_stateful_failure_rolls_back_the_entire_computation_page() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("rollback");
     let mut factory = FlowFactory::new(&path);
@@ -180,13 +163,12 @@ fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
         [compute],
     );
     factory.operation("sink", DiscardDefinition::new(), [compute]);
-    factory.materialize(compute, CAPACITY);
 
     drop(factory.build().unwrap());
 
     let store = Store::open(&path).unwrap();
     let second: Cell<u64> = store
-        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .open_data("operation/00000002/running_event_count.count")
         .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
@@ -200,25 +182,24 @@ fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
 
     let mut flow = FlowFactory::new(&path).open().unwrap();
     let error = flow.advance().unwrap_err();
-    assert_eq!(error.station_id(), "compute");
+    assert_eq!(error.operation_id(), "compute");
     assert!(!error.requires_reopen());
     drop(flow);
 
     let store = Store::open(&path).unwrap();
     let position: Cell<u64> = store
-        .open_data("station/00000000/operation/00000000/sequence_scan.position")
+        .open_data("operation/00000000/sequence_scan.position")
         .unwrap();
     let first: Cell<u64> = store
-        .open_data("station/00000000/operation/00000001/running_event_count.count")
+        .open_data("operation/00000001/running_event_count.count")
         .unwrap();
     let second: Cell<u64> = store
-        .open_data("station/00000000/operation/00000002/running_event_count.count")
+        .open_data("operation/00000002/running_event_count.count")
         .unwrap();
-    let output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
     let transaction = store.read_transaction();
     assert_eq!(
         position.read(transaction.access()).unwrap().get().unwrap(),
-        None
+        Some(u64::MAX)
     );
     assert_eq!(
         first.read(transaction.access()).unwrap().get().unwrap(),
@@ -227,10 +208,6 @@ fn a_late_stateful_failure_rolls_back_the_entire_station_program() {
     assert_eq!(
         second.read(transaction.access()).unwrap().get().unwrap(),
         Some(u64::MAX)
-    );
-    assert_eq!(
-        output.writer().status(transaction.access()).unwrap().tail,
-        0
     );
 }
 
@@ -251,53 +228,29 @@ fn a_multi_input_head_preserves_ports_before_its_atomic_tail() {
         FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
         [union],
     );
-    factory.operation("sink", DiscardDefinition::new(), [union]);
-    for station in [left, right, union] {
-        factory.materialize(station, CAPACITY);
-    }
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [union]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
 
     let mut flow = factory.build().unwrap();
     run_until_idle(&mut flow);
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let active: Cell<u32> = store.open_data("station/00000002/active-input").unwrap();
-    let left_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000000/output").unwrap();
-    let right_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
-    let union_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
-    let transaction = store.read_transaction();
+    let count: Cell<u64> = store
+        .open_data("operation/00000004/running_event_count.count")
+        .unwrap();
     assert_eq!(
-        active.read(transaction.access()).unwrap().get().unwrap(),
-        Some(1)
-    );
-    assert_eq!(
-        left_output
-            .subscription(0)
-            .status(transaction.access())
+        count
+            .read(store.read_transaction().access())
             .unwrap()
-            .position,
-        2
-    );
-    assert_eq!(
-        right_output
-            .subscription(0)
-            .status(transaction.access())
-            .unwrap()
-            .position,
-        1
-    );
-    assert_eq!(
-        union_output
-            .writer()
-            .status(transaction.access())
-            .unwrap()
-            .tail,
-        2
+            .get()
+            .unwrap(),
+        Some(2)
     );
 }
 
 #[test]
-fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
+fn binding_failure_reports_the_logical_operation_id_without_creating_store() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
@@ -313,22 +266,20 @@ fn binding_failure_reports_the_operation_ordinal_without_creating_store() {
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [scan]);
-    factory.materialize(scan, CAPACITY);
 
     let Err(FlowError::Schema {
-        station_id,
-        operation,
+        operation_id,
         source: _,
     }) = factory.build()
     else {
         panic!("invalid intermediate Schema unexpectedly built");
     };
-    assert_eq!((station_id.as_str(), operation), ("scan", 2));
+    assert_eq!(operation_id, "scan/tail-2");
     assert!(!path.exists());
 }
 
 #[test]
-fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
+fn automatic_planning_keeps_a_paged_transform_as_head_with_an_atomic_tail() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
@@ -347,14 +298,11 @@ fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
     let join = factory.operation("join", join_definition(), [left, right]);
     let join = factory.operation("join/tail-2", RunningEventCountDefinition::new(), [join]);
     factory.operation("sink", DiscardDefinition::new(), [join]);
-    for station in [left, right, join] {
-        factory.materialize(station, CAPACITY);
-    }
 
     let mut flow = factory.build().unwrap();
     assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["left", "right", "join", "sink"]
+        flow.operation_ids().collect::<Vec<_>>(),
+        ["left", "right", "join", "join/tail-2", "sink"]
     );
     for _ in 0..8 {
         assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
@@ -364,7 +312,7 @@ fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
     let before_reopen = {
         let store = Store::open(&path).unwrap();
         let count: Cell<u64> = store
-            .open_data("station/00000002/operation/00000001/running_event_count.count")
+            .open_data("operation/00000003/running_event_count.count")
             .unwrap();
         let transaction = store.read_transaction();
         count
@@ -378,8 +326,8 @@ fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
 
     let mut reopened = FlowFactory::new(&path).open().unwrap();
     assert_eq!(
-        reopened.station_ids().collect::<Vec<_>>(),
-        ["left", "right", "join", "sink"]
+        reopened.operation_ids().collect::<Vec<_>>(),
+        ["left", "right", "join", "join/tail-2", "sink"]
     );
     for _ in 0..4 {
         assert_eq!(reopened.advance().unwrap(), AdvanceOutcome::Progressed);
@@ -388,7 +336,7 @@ fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
 
     let store = Store::open(&path).unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000002/operation/00000001/running_event_count.count")
+        .open_data("operation/00000003/running_event_count.count")
         .unwrap();
     let transaction = store.read_transaction();
     assert!(
@@ -403,12 +351,7 @@ fn automatic_planning_keeps_a_turn_transform_as_head_with_an_atomic_tail() {
 }
 
 fn run_until_idle(flow: &mut dogpaddle_flow::Flow) {
-    for _ in 0..64 {
-        if flow.advance().unwrap() == AdvanceOutcome::Idle {
-            return;
-        }
-    }
-    panic!("Flow did not become idle within its bounded fixture");
+    super::support::run_until_idle(flow);
 }
 
 fn decode_u64(value: Vec<u8>) -> u64 {

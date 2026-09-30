@@ -16,8 +16,6 @@ use crate::operation::{
     sink::buffered::{DeliveryBatch, MAX_TARGET_BATCH_BYTES},
 };
 
-#[cfg(test)]
-pub(crate) use crate::operation::relation::canonical_row;
 pub(crate) use crate::operation::relation::{
     RowError, canonical_row_bounded, canonical_row_size_bounded, encode_canonical, row_hash,
 };
@@ -133,17 +131,15 @@ pub(super) fn terminal_mutations(batch: &Batch) -> Vec<TerminalMutation> {
     by_id.into_values().collect()
 }
 
-/// One request per distinct logical row. Counts may exceed the returned ID limit.
+/// One bounded request per distinct canonical row in the current slice.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Lookup {
     pub row_index: usize,
-    pub needed: u64,
     pub take: usize,
 }
 
 #[derive(Debug)]
 pub(crate) struct Matches {
-    pub count: u64,
     pub ids: Vec<u64>,
 }
 
@@ -163,8 +159,8 @@ pub(crate) trait RelationTarget: Send + 'static {
     /// Reopen may repeat this call after an uncertain result, so it must be
     /// idempotent and reject incompatible ownership or layout.
     fn initialize(&mut self) -> Result<(), OperationError>;
-    /// Read-only exact matches in request order, with ascending IDs and counts
-    /// capped at each request's `needed`; return at most `take` IDs per request.
+    /// Read-only exact matches in request order; return at most `take` ascending
+    /// IDs per request. No full-remaining cardinality query is permitted.
     /// A failed read must leave the target session ready for a retry of the same
     /// loaded batch, resetting a poisoned connection before returning the error.
     fn lookup(
@@ -256,6 +252,9 @@ pub(crate) fn validate_admission(
                 .checked_add(diff.unsigned_abs())
                 .ok_or_else(|| invalid("positive event count exceeds u64"))
         })?;
+    if positive_events == 0 {
+        return Ok(());
+    }
     let reserved = buffered_events
         .checked_add(positive_events)
         .ok_or_else(|| invalid("technical ID reservation exceeds u64"))?;

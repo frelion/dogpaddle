@@ -5,22 +5,22 @@ use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
 use dogpaddle_store::{
-    CellAccess, MultisetPartition, OrderedMapAccess, PartitionedMultisetAccess, StoreError,
-    TransactionAccess,
+    CellAccess, MapPartition, OrderedMapAccess, PartitionKey, StoreError, TransactionAccess,
 };
 
 use crate::{
     expression::BoundExpression,
     operation::{
-        AtomicOperation, OperationError, OperationInput,
-        relation::{OrderError, encode_canonical, order_key, ordered_value},
+        AtomicOperation, BudgetExceeded, OperationError, OperationInput, StepBudget,
+        logical_array_bytes,
+        relation::{OrderError, RowError, encode_canonical_bounded, order_key, ordered_value},
     },
 };
 
 use super::{
     AggregateError,
-    functions::{Fold, TrackedWeight, apply_weight},
-    state::{Control, Entries, EntryPartition, GroupState, Groups},
+    functions::{StatisticKind, TrackedWeight, apply_weight},
+    state::{Control, Entries, EntryPartition, GroupState, Groups, Statistic},
     value::null,
 };
 
@@ -30,6 +30,8 @@ pub(crate) struct AggregateOperation {
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[BoundExpression]>,
     pub(super) calls: Box<[BoundCall]>,
+    pub(super) arguments: Box<[BoundArgument]>,
+    pub(super) statistics: Box<[BoundStatistic]>,
     pub(super) layouts: Box<[BoundLayout]>,
     pub(super) slots: Box<[ExtremaSlot]>,
     pub(super) groups: Groups,
@@ -39,14 +41,24 @@ pub(crate) struct AggregateOperation {
 
 /// One bound aggregate call.
 pub(super) enum BoundCall {
-    Fold {
-        state: usize,
-        arguments: Box<[BoundExpression]>,
-        reduction: Box<dyn Fold>,
-    },
-    Extrema {
-        slot: usize,
-    },
+    RowsCount,
+    Count { statistic: usize },
+    Sum { statistic: usize },
+    Average { statistic: usize },
+    Extrema { slot: usize },
+}
+
+pub(super) struct BoundArgument {
+    pub(super) owner: usize,
+    pub(super) expression: BoundExpression,
+    pub(super) field: Arc<Field>,
+}
+
+pub(super) struct BoundStatistic {
+    pub(super) argument: usize,
+    pub(super) kind: StatisticKind,
+    pub(super) count_output: bool,
+    pub(super) sum_output: bool,
 }
 
 /// One distinct ordered-argument expression of the bound aggregate.
@@ -55,9 +67,8 @@ pub(super) enum BoundCall {
 /// [`AggregateOperation::layouts`] is also the partition id it owns in
 /// `aggregate.entries` and the layout index its [`ExtremaSlot`]s reference.
 pub(super) struct BoundLayout {
-    pub(super) owner: usize,
+    pub(super) argument: usize,
     pub(super) field: Arc<Field>,
-    pub(super) expression: BoundExpression,
     pub(super) min_slot: Option<usize>,
     pub(super) max_slot: Option<usize>,
 }
@@ -74,6 +85,8 @@ pub(super) struct ExtremaSlot {
 /// Bound calls, layouts and extrema slots produced by one Schema binding.
 pub(super) struct BoundAggregate {
     pub(super) calls: Box<[BoundCall]>,
+    pub(super) arguments: Box<[BoundArgument]>,
+    pub(super) statistics: Box<[BoundStatistic]>,
     pub(super) layouts: Box<[BoundLayout]>,
     pub(super) slots: Box<[ExtremaSlot]>,
 }
@@ -86,8 +99,7 @@ struct OutputRows {
 /// Expression results materialized before any durable state is accessed.
 struct EvaluatedColumns {
     groups: Vec<ArrayRef>,
-    calls: Vec<Vec<ArrayRef>>,
-    layouts: Vec<ArrayRef>,
+    arguments: Vec<ArrayRef>,
 }
 
 /// State for one contiguous run of the same canonical group key.
@@ -127,39 +139,19 @@ impl EvaluatedColumns {
                     .map_err(|source| AggregateError::GroupExpression { group, source })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let calls = operation
-            .calls
+        let arguments = operation
+            .arguments
             .iter()
-            .enumerate()
-            .map(|(aggregate, call)| match call {
-                BoundCall::Fold { arguments, .. } => arguments
-                    .iter()
-                    .map(|expression| {
-                        expression.evaluate(records).map_err(|source| {
-                            AggregateError::AggregateExpression { aggregate, source }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>(),
-                BoundCall::Extrema { .. } => Ok(Vec::new()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layouts = operation
-            .layouts
-            .iter()
-            .map(|layout| {
-                layout.expression.evaluate(records).map_err(|source| {
+            .map(|argument| {
+                argument.expression.evaluate(records).map_err(|source| {
                     AggregateError::AggregateExpression {
-                        aggregate: layout.owner,
+                        aggregate: argument.owner,
                         source,
                     }
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            groups,
-            calls,
-            layouts,
-        })
+        Ok(Self { groups, arguments })
     }
 }
 
@@ -168,8 +160,17 @@ impl PendingGroup {
         groups: &OrderedMapAccess<'_, Vec<u8>, GroupState>,
         key: Vec<u8>,
         continues: bool,
-    ) -> Result<Self, StoreError> {
-        let state = groups.get(&key)?;
+        budget: &mut StepBudget,
+    ) -> Result<Self, OperationError> {
+        let state = groups
+            .get_bounded(&key, budget.remaining_bytes())
+            .map_err(read_budget_error)?;
+        if let Some(state) = &state {
+            budget.charge(state.logical_bytes())?;
+            if continues {
+                budget.charge(state.logical_bytes())?;
+            }
+        }
         Ok(Self {
             key,
             was_present: state.is_some(),
@@ -188,12 +189,17 @@ impl PendingExtrema {
 
     fn adjust(
         &mut self,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        entries: &mut OrderedMapAccess<
+            '_,
+            PartitionKey<EntryPartition, Vec<u8>>,
+            std::num::NonZeroU64,
+        >,
         layout: u32,
         group: u64,
         key: &Vec<u8>,
         difference: i64,
-    ) -> Result<(u64, u64), AggregateError> {
+        budget: &mut StepBudget,
+    ) -> Result<(u64, u64), OperationError> {
         let slot = &mut self.keys[layout as usize];
         if slot
             .as_ref()
@@ -208,27 +214,29 @@ impl PendingExtrema {
             // Materialize the earlier valid prefix before asking Store to
             // reject this event. Its checked adjustment poisons the transaction
             // exactly as it did on the per-row path.
-            Self::flush_slot(slot, entries, layout)?;
+            Self::flush_slot(slot, entries, layout, budget)?;
             return match entries
                 .partition(&EntryPartition::new(layout, group))?
                 .adjust(key, difference)
             {
-                Err(error) => Err(map_weight_error(error)),
-                Ok(_) => Err(AggregateError::InvalidState),
+                Err(error) => Err(map_weight_error(error).into()),
+                Ok(_) => Err(AggregateError::InvalidState.into()),
             };
         }
 
-        Self::flush_slot(slot, entries, layout)?;
+        Self::flush_slot(slot, entries, layout, budget)?;
         let mut partition = entries.partition(&EntryPartition::new(layout, group))?;
+        budget.charge(key.len().saturating_add(34))?;
         let before = partition.multiplicity(key)?;
         let Some(after) = checked_extrema_weight(before, difference) else {
             // The read validates persisted bytes, while Store still owns the
             // transaction poison on an invalid signed adjustment.
             return match partition.adjust(key, difference) {
-                Err(error) => Err(map_weight_error(error)),
-                Ok(_) => Err(AggregateError::InvalidState),
+                Err(error) => Err(map_weight_error(error).into()),
+                Ok(_) => Err(AggregateError::InvalidState.into()),
             };
         };
+        budget.charge(key.len())?;
         *slot = Some(PendingExtreme {
             group,
             key: key.clone(),
@@ -240,60 +248,55 @@ impl PendingExtrema {
 
     fn flush_layout(
         &mut self,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        entries: &mut OrderedMapAccess<
+            '_,
+            PartitionKey<EntryPartition, Vec<u8>>,
+            std::num::NonZeroU64,
+        >,
         layout: u32,
-    ) -> Result<(), AggregateError> {
-        Self::flush_slot(&mut self.keys[layout as usize], entries, layout)
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        Self::flush_slot(&mut self.keys[layout as usize], entries, layout, budget)
     }
 
     fn flush_all(
         &mut self,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
-    ) -> Result<(), AggregateError> {
+        entries: &mut OrderedMapAccess<
+            '_,
+            PartitionKey<EntryPartition, Vec<u8>>,
+            std::num::NonZeroU64,
+        >,
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
         for (layout, slot) in self.keys.iter_mut().enumerate() {
             Self::flush_slot(
                 slot,
                 entries,
                 u32::try_from(layout).expect("layout count fits the persistent partition id"),
+                budget,
             )?;
             *slot = None;
         }
         Ok(())
     }
 
-    fn discard_group(
-        &mut self,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
-        group: u64,
-    ) -> Result<(), AggregateError> {
-        for (layout, slot) in self.keys.iter_mut().enumerate() {
-            let Some(pending) = slot.take() else {
-                continue;
-            };
-            debug_assert_eq!(pending.group, group);
-            if pending.stored == 0 {
-                continue;
-            }
-            let layout =
-                u32::try_from(layout).expect("layout count fits the persistent partition id");
-            entries
-                .partition(&EntryPartition::new(layout, group))?
-                .set_multiplicity(&pending.key, 0)?;
-        }
-        Ok(())
-    }
-
     fn flush_slot(
         slot: &mut Option<PendingExtreme>,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
+        entries: &mut OrderedMapAccess<
+            '_,
+            PartitionKey<EntryPartition, Vec<u8>>,
+            std::num::NonZeroU64,
+        >,
         layout: u32,
-    ) -> Result<(), AggregateError> {
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
         let Some(pending) = slot.as_mut() else {
             return Ok(());
         };
         if pending.current == pending.stored {
             return Ok(());
         }
+        budget.charge(pending.key.len().saturating_add(34))?;
         entries
             .partition(&EntryPartition::new(layout, pending.group))?
             .set_multiplicity(&pending.key, pending.current)?;
@@ -310,15 +313,6 @@ fn checked_extrema_weight(before: u64, difference: i64) -> Option<u64> {
     }
 }
 
-impl BoundCall {
-    fn initial_fold_state(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Fold { reduction, .. } => Some(reduction.empty()),
-            Self::Extrema { .. } => None,
-        }
-    }
-}
-
 impl AggregateOperation {
     fn new_group_state(
         &self,
@@ -327,16 +321,16 @@ impl AggregateOperation {
     ) -> Result<GroupState, AggregateError> {
         let id = match *next_group_id {
             Some(id) => id,
-            None => control.get()?.unwrap_or(0),
+            None => control.get_bounded(size_of::<u64>())?.unwrap_or(0),
         };
         *next_group_id = Some(id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?);
         Ok(GroupState {
             id,
             weight: 0,
-            folds: self
-                .calls
+            statistics: self
+                .statistics
                 .iter()
-                .filter_map(BoundCall::initial_fold_state)
+                .map(|statistic| statistic.kind.empty())
                 .collect(),
             extremes: vec![None; self.slots.len()].into_boxed_slice(),
         })
@@ -346,11 +340,10 @@ impl AggregateOperation {
         self.calls
             .iter()
             .map(|call| match call {
-                BoundCall::Fold {
-                    state: state_index,
-                    reduction,
-                    ..
-                } => reduction.output(&state.folds[*state_index], state.weight),
+                BoundCall::RowsCount => count_value(state.weight),
+                BoundCall::Count { statistic } => count_value(state.statistics[*statistic].count()),
+                BoundCall::Sum { statistic } => state.statistics[*statistic].sum(),
+                BoundCall::Average { statistic } => state.statistics[*statistic].average(),
                 BoundCall::Extrema { slot } => {
                     let target = &self.slots[*slot];
                     let layout = &self.layouts[target.layout];
@@ -363,6 +356,10 @@ impl AggregateOperation {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one event updates its state, pending keys and transaction using the shared budget"
+    )]
     fn apply_extrema_row(
         &self,
         state: &mut GroupState,
@@ -370,10 +367,22 @@ impl AggregateOperation {
         row: usize,
         difference: i64,
         pending: &mut PendingExtrema,
-        entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
-    ) -> Result<(), AggregateError> {
-        for (layout_index, (layout, column)) in self.layouts.iter().zip(columns).enumerate() {
-            let value = ScalarValue::try_from_array(column.as_ref(), row)?;
+        entries: &mut OrderedMapAccess<
+            '_,
+            PartitionKey<EntryPartition, Vec<u8>>,
+            std::num::NonZeroU64,
+        >,
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        for (layout_index, layout) in self.layouts.iter().enumerate() {
+            // MIN/MAX accept flat scalars. Admit both the owned value and
+            // its ordered key before either payload can be copied.
+            budget.charge(
+                logical_array_bytes(columns[layout.argument].slice(row, 1).as_ref())
+                    .saturating_mul(2)
+                    .saturating_add(size_of::<ScalarValue>()),
+            )?;
+            let value = ScalarValue::try_from_array(columns[layout.argument].as_ref(), row)?;
             // A NULL argument never enters the ordered partition, so it can
             // neither become nor retract an extreme.
             let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? else {
@@ -382,43 +391,54 @@ impl AggregateOperation {
             let partition_id = u32::try_from(layout_index)
                 .expect("the layout count is bounded by the aggregate call count");
             let (before, after) =
-                pending.adjust(entries, partition_id, state.id, &key, difference)?;
+                pending.adjust(entries, partition_id, state.id, &key, difference, budget)?;
             // `Change` rejects zero differences, so an absent key here means
             // the key just entered the partition.
             if before == 0 {
+                budget.charge(key.len().saturating_mul(2))?;
                 promote_cached_extreme(layout, &mut state.extremes, &key);
             }
-            // A group that loses its last row is removed by the caller, so a
-            // partition re-read here would only be discarded.
-            if after == 0 && state.weight != 0 && caches_key(layout, &state.extremes, &key) {
-                pending.flush_layout(entries, partition_id)?;
+            if after == 0 && caches_key(layout, &state.extremes, &key) {
+                pending.flush_layout(entries, partition_id, budget)?;
                 let partition = entries.partition(&EntryPartition::new(partition_id, state.id))?;
-                refresh_cached_extreme(layout, &mut state.extremes, &key, &partition)?;
+                refresh_cached_extreme(layout, &mut state.extremes, &key, &partition, budget)?;
             }
         }
         Ok(())
     }
 
-    fn apply_fold_row(
+    fn apply_statistics_row(
         &self,
         state: &mut GroupState,
-        columns: &[Vec<ArrayRef>],
+        columns: &[ArrayRef],
         row: usize,
         difference: i64,
     ) -> Result<(), AggregateError> {
-        for (aggregate, call) in self.calls.iter().enumerate() {
-            let BoundCall::Fold {
-                state: state_index,
-                reduction,
-                ..
-            } = call
-            else {
-                continue;
-            };
-            // Binding assigns dense indices after persisted shape validation.
-            let call_state = &mut state.folds[*state_index];
-            let values = scalar_tuple(&columns[aggregate], row)?;
-            reduction.apply(call_state, &values, difference, state.weight)?;
+        for (bound, statistic) in self.statistics.iter().zip(&mut state.statistics) {
+            if !matches!(
+                (bound.kind, &*statistic),
+                (StatisticKind::Count, Statistic::Count(_))
+                    | (StatisticKind::Signed, Statistic::Signed { .. })
+                    | (StatisticKind::Unsigned, Statistic::Unsigned { .. })
+            ) {
+                return Err(AggregateError::InvalidState);
+            }
+            let value = ScalarValue::try_from_array(columns[bound.argument].as_ref(), row)?;
+            statistic.apply(&value, difference)?;
+            if bound.count_output {
+                count_value(statistic.count())?;
+            }
+            if bound.sum_output {
+                match statistic {
+                    Statistic::Signed { sum, .. } => {
+                        i64::try_from(*sum).map_err(|_| AggregateError::ArithmeticOverflow)?;
+                    }
+                    Statistic::Unsigned { sum, .. } => {
+                        u64::try_from(*sum).map_err(|_| AggregateError::ArithmeticOverflow)?;
+                    }
+                    Statistic::Count(_) => return Err(AggregateError::InvalidState),
+                }
+            }
         }
         Ok(())
     }
@@ -430,9 +450,10 @@ impl AtomicOperation for AggregateOperation {
         reason = "one loop keeps each ordered input event and its atomic state transition together"
     )]
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         access: TransactionAccess<'_>,
+        budget: &mut StepBudget,
     ) -> Result<Option<Change>, OperationError> {
         if input.port != 0 {
             return Err(AggregateError::InvalidInputPort { port: input.port }.into());
@@ -442,13 +463,11 @@ impl AtomicOperation for AggregateOperation {
         }
 
         let columns = EvaluatedColumns::evaluate(self, input.change.records())?;
+        for column in columns.groups.iter().chain(&columns.arguments) {
+            budget.charge(logical_array_bytes(column.as_ref()))?;
+        }
 
         let group_fields = &self.output_schema.fields()[..self.group_expressions.len()];
-        let fold_count = self
-            .calls
-            .iter()
-            .filter(|call| matches!(call, BoundCall::Fold { .. }))
-            .count();
         let mut output = OutputRows::new(self.output_schema.fields().len());
         let mut groups = self.groups.access(access)?;
         let mut entries = self.entries.access(access)?;
@@ -460,7 +479,7 @@ impl AtomicOperation for AggregateOperation {
         let mut next_group = if row_count == 0 {
             None
         } else {
-            Some(encode_tuple(group_fields, &columns.groups, 0))
+            Some(encode_tuple(group_fields, &columns.groups, 0, budget))
         };
 
         for row in 0..row_count {
@@ -472,13 +491,13 @@ impl AtomicOperation for AggregateOperation {
                 .as_ref()
                 .is_none_or(|pending| pending.key != group);
             if starts_run {
-                pending_extrema.flush_all(&mut entries)?;
+                pending_extrema.flush_all(&mut entries, budget)?;
                 if let Some(pending) = pending_group.take() {
-                    flush_pending_group(&mut groups, pending)?;
+                    flush_pending_group(&mut groups, pending, budget)?;
                 }
             }
             next_group = if row + 1 < row_count {
-                Some(encode_tuple(group_fields, &columns.groups, row + 1))
+                Some(encode_tuple(group_fields, &columns.groups, row + 1, budget))
             } else {
                 None
             };
@@ -487,7 +506,7 @@ impl AtomicOperation for AggregateOperation {
                     next_group.as_ref(),
                     Some(Ok(next)) if next.as_slice() == group.as_slice()
                 );
-                pending_group = Some(PendingGroup::load(&groups, group, continues)?);
+                pending_group = Some(PendingGroup::load(&groups, group, continues, budget)?);
             }
             let pending = pending_group
                 .as_mut()
@@ -498,13 +517,24 @@ impl AtomicOperation for AggregateOperation {
                 None if difference < 0 => {
                     return Err(AggregateError::GroupWeightUnderflow.into());
                 }
-                None => self.new_group_state(&control, &mut next_group_id)?,
+                None => {
+                    budget.charge(
+                        self.statistics
+                            .len()
+                            .saturating_mul(32)
+                            .saturating_add(self.slots.len() * 8 + 24),
+                    )?;
+                    self.new_group_state(&control, &mut next_group_id)?
+                }
             };
-            if state.folds.len() != fold_count || state.extremes.len() != self.slots.len() {
+            if state.statistics.len() != self.statistics.len()
+                || state.extremes.len() != self.slots.len()
+            {
                 return Err(AggregateError::InvalidState.into());
             }
 
             let old_output = if existed {
+                budget.charge(state.logical_bytes().saturating_add(self.calls.len() * 64))?;
                 Some(self.group_output(&state)?)
             } else {
                 None
@@ -513,13 +543,14 @@ impl AtomicOperation for AggregateOperation {
             state.weight = apply_weight(state.weight, difference, TrackedWeight::Group)?;
             self.apply_extrema_row(
                 &mut state,
-                &columns.layouts,
+                &columns.arguments,
                 row,
                 difference,
                 &mut pending_extrema,
                 &mut entries,
+                budget,
             )?;
-            self.apply_fold_row(&mut state, &columns.calls, row, difference)?;
+            self.apply_statistics_row(&mut state, &columns.arguments, row, difference)?;
 
             if state.weight == 0 {
                 output.push(
@@ -527,40 +558,49 @@ impl AtomicOperation for AggregateOperation {
                     row,
                     old_output.expect("an existing group has positive weight"),
                     -1,
+                    budget,
                 )?;
-                // Delete known persisted keys directly and drop keys that only
-                // existed in the pending cache. The drain handles older keys.
-                pending_extrema.discard_group(&mut entries, state.id)?;
-                drain_group_entries(self.layouts.len(), &mut entries, state.id)?;
+                if state
+                    .statistics
+                    .iter()
+                    .any(|statistic| !statistic.is_empty())
+                    || state.extremes.iter().any(Option::is_some)
+                {
+                    return Err(AggregateError::InvalidState.into());
+                }
+                pending_extrema.flush_all(&mut entries, budget)?;
             } else {
+                budget.charge(state.logical_bytes().saturating_add(self.calls.len() * 64))?;
                 let new_output = self.group_output(&state)?;
                 match old_output {
-                    None => output.push(&columns.groups, row, new_output, 1)?,
+                    None => output.push(&columns.groups, row, new_output, 1, budget)?,
                     Some(old_output) if old_output != new_output => {
-                        output.push(&columns.groups, row, old_output, -1)?;
-                        output.push(&columns.groups, row, new_output, 1)?;
+                        output.push(&columns.groups, row, old_output, -1, budget)?;
+                        output.push(&columns.groups, row, new_output, 1, budget)?;
                     }
                     Some(_) => {}
                 }
                 pending.state = Some(state);
             }
         }
-        pending_extrema.flush_all(&mut entries)?;
+        pending_extrema.flush_all(&mut entries, budget)?;
         if let Some(pending) = pending_group {
-            flush_pending_group(&mut groups, pending)?;
+            flush_pending_group(&mut groups, pending, budget)?;
         }
         if let Some(next_group_id) = next_group_id {
+            budget.charge(8)?;
             control.set(&next_group_id)?;
         }
 
-        Ok(output.finish(&self.output_schema)?)
+        output.finish(&self.output_schema, budget)
     }
 }
 
 fn flush_pending_group(
     groups: &mut OrderedMapAccess<'_, Vec<u8>, GroupState>,
     pending: PendingGroup,
-) -> Result<(), AggregateError> {
+    budget: &mut StepBudget,
+) -> Result<(), OperationError> {
     if pending
         .comparison_baseline
         .as_ref()
@@ -569,8 +609,12 @@ fn flush_pending_group(
         return Ok(());
     }
     match pending.state {
-        Some(state) => groups.put(&pending.key, &state)?,
+        Some(state) => {
+            budget.charge(pending.key.len().saturating_add(state.logical_bytes()))?;
+            groups.put(&pending.key, &state)?;
+        }
         None if pending.was_present => {
+            budget.charge(pending.key.len())?;
             groups.erase(&pending.key)?;
         }
         None => {}
@@ -582,45 +626,34 @@ fn encode_tuple(
     fields: &[Arc<Field>],
     columns: &[ArrayRef],
     row: usize,
+    budget: &mut StepBudget,
 ) -> Result<Vec<u8>, OperationError> {
     let mut encoded = Vec::new();
     for (field, column) in fields.iter().zip(columns) {
-        encode_canonical(field, column.as_ref(), row, field.name(), &mut encoded)?;
+        let before = encoded.len();
+        let result = encode_canonical_bounded(
+            field,
+            column.as_ref(),
+            row,
+            field.name(),
+            &mut encoded,
+            before.saturating_add(budget.remaining_bytes()),
+        );
+        budget.charge(encoded.len() - before)?;
+        result.map_err(|error| -> OperationError {
+            match error {
+                RowError::SizeLimit { .. } => Box::new(BudgetExceeded),
+                error => Box::new(error),
+            }
+        })?;
     }
     Ok(encoded)
 }
 
-fn scalar_tuple(columns: &[ArrayRef], row: usize) -> Result<Vec<ScalarValue>, AggregateError> {
-    columns
-        .iter()
-        .map(|column| {
-            ScalarValue::try_from_array(column.as_ref(), row).map_err(AggregateError::from)
-        })
-        .collect()
-}
-
-/// Removes every key a dying group still owns.
-///
-/// The relaxed validation accepts a stream that drives a group's row count to
-/// zero while one of its ordered partitions still holds keys (retracting a row
-/// whose argument is NULL touches no partition). Group IDs are never reused, so
-/// those keys would be unreachable and permanent. A stream that retracts the
-/// rows it inserted empties each partition through its own adjustments, so this
-/// scan normally finds nothing.
-pub(super) fn drain_group_entries(
-    layout_count: usize,
-    entries: &mut PartitionedMultisetAccess<'_, EntryPartition, Vec<u8>>,
-    group: u64,
-) -> Result<(), AggregateError> {
-    for layout_index in 0..layout_count {
-        let partition_id = u32::try_from(layout_index)
-            .expect("the layout count is bounded by the aggregate call count");
-        let mut partition = entries.partition(&EntryPartition::new(partition_id, group))?;
-        while let Some(entry) = partition.first()? {
-            partition.set_multiplicity(&entry.key, 0)?;
-        }
-    }
-    Ok(())
+fn count_value(count: u64) -> Result<ScalarValue, AggregateError> {
+    Ok(ScalarValue::Int64(Some(
+        i64::try_from(count).map_err(|_| AggregateError::ArithmeticOverflow)?,
+    )))
 }
 
 /// Reports whether either slot of one layout currently caches the removed key.
@@ -660,17 +693,18 @@ fn refresh_cached_extreme(
     layout: &BoundLayout,
     extremes: &mut [Option<Vec<u8>>],
     key: &[u8],
-    partition: &MultisetPartition<'_, '_, Vec<u8>>,
-) -> Result<(), AggregateError> {
+    partition: &MapPartition<'_, '_, Vec<u8>, std::num::NonZeroU64>,
+    budget: &mut StepBudget,
+) -> Result<(), OperationError> {
     if let Some(slot) = layout.min_slot
         && extremes[slot].as_deref() == Some(key)
     {
-        extremes[slot] = partition.first()?.map(|entry| entry.key);
+        extremes[slot] = read_extreme(partition.first_bounded(budget.remaining_bytes()), budget)?;
     }
     if let Some(slot) = layout.max_slot
         && extremes[slot].as_deref() == Some(key)
     {
-        extremes[slot] = partition.last()?.map(|entry| entry.key);
+        extremes[slot] = read_extreme(partition.last_bounded(budget.remaining_bytes()), budget)?;
     }
     Ok(())
 }
@@ -701,9 +735,19 @@ impl OutputRows {
         row: usize,
         calls: Vec<ScalarValue>,
         difference: i64,
-    ) -> Result<(), AggregateError> {
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        budget.charge(
+            calls
+                .iter()
+                .map(ScalarValue::size)
+                .sum::<usize>()
+                .saturating_add(8),
+        )?;
         for (column, group) in self.columns.iter_mut().zip(groups) {
-            column.push(ScalarValue::try_from_array(group.as_ref(), row)?);
+            let value = ScalarValue::try_from_array(group.as_ref(), row)?;
+            budget.charge(value.size())?;
+            column.push(value);
         }
         for (column, value) in self.columns[groups.len()..].iter_mut().zip(calls) {
             column.push(value);
@@ -712,10 +756,22 @@ impl OutputRows {
         Ok(())
     }
 
-    fn finish(self, schema: &SchemaRef) -> Result<Option<Change>, AggregateError> {
+    fn finish(
+        self,
+        schema: &SchemaRef,
+        budget: &mut StepBudget,
+    ) -> Result<Option<Change>, OperationError> {
         if self.diffs.is_empty() {
             return Ok(None);
         }
+        budget.charge(
+            self.columns
+                .iter()
+                .flatten()
+                .map(ScalarValue::size)
+                .sum::<usize>()
+                .saturating_add(self.diffs.len() * 8),
+        )?;
         let columns = self
             .columns
             .into_iter()
@@ -726,5 +782,45 @@ impl OutputRows {
             records,
             Int64Array::from(self.diffs),
         )?))
+    }
+}
+
+fn read_budget_error(error: StoreError) -> OperationError {
+    match error {
+        StoreError::ItemTooLarge { .. } | StoreError::InvalidScanLimit => Box::new(BudgetExceeded),
+        error => Box::new(error),
+    }
+}
+
+fn read_extreme(
+    result: Result<Option<(Vec<u8>, std::num::NonZeroU64)>, StoreError>,
+    budget: &mut StepBudget,
+) -> Result<Option<Vec<u8>>, OperationError> {
+    let entry = result.map_err(read_budget_error)?;
+    if let Some(entry) = &entry {
+        budget.charge(entry.0.len().saturating_add(34))?;
+    }
+    Ok(entry.map(|entry| entry.0))
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use arrow_array::BinaryArray;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn rejected_group_encoding_charges_the_prefix_already_copied() {
+        let fields =
+            ["first", "second"].map(|name| Arc::new(Field::new(name, DataType::Binary, false)));
+        let columns: [ArrayRef; 2] = [
+            Arc::new(BinaryArray::from(vec![vec![1; 64].as_slice()])),
+            Arc::new(BinaryArray::from(vec![vec![2; 64].as_slice()])),
+        ];
+        let mut budget = StepBudget::new(1, 100);
+        let error = encode_tuple(&fields, &columns, 0, &mut budget).unwrap_err();
+        assert!(error.is::<BudgetExceeded>());
+        // First value is complete; the second has its null marker and length.
+        assert_eq!(budget.remaining_bytes(), 100 - (1 + 8 + 64) - (1 + 8));
     }
 }

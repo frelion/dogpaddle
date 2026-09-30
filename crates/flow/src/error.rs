@@ -1,168 +1,148 @@
+use crate::build::{FlowDefinitionError, TopologyError};
+use dogpaddle_operation::{OperationBindError, OperationSetupError, operation::OperationError};
+use dogpaddle_store::StoreError;
 use thiserror::Error;
-
-use dogpaddle_change::CodecError as ChangeCodecError;
-use dogpaddle_operation::{OperationBindError, OperationSetupError};
-use dogpaddle_store::{StoreError, StoreError::DataNotFound};
-
-use crate::{
-    build::{FlowDefinitionError, TopologyError},
-    station::StationError,
-};
 
 /// Failure while building or opening a persistent Flow.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FlowError {
-    /// Opening uses the durable Definition, never declarations on the factory.
-    #[error("opening a flow does not accept operation or materialization declarations")]
+    /// Open obtains the graph exclusively from durable state.
+    #[error("opening a flow does not accept operation declarations")]
     OpenWithDefinition,
-    /// The caller does not own the persistent Flow at this path.
-    #[error("persistent flow owner identity does not match the expected identity")]
+    /// The durable owner identity differs from the expected identity.
+    #[error("persistent flow owner identity does not match")]
     OwnerIdentityMismatch,
-    /// A Station received more than one ephemeral resource.
-    #[error("station {station_id:?} has more than one runtime resource")]
+    /// One Operation received duplicate ephemeral resources.
+    #[error("operation {operation_id:?} has more than one runtime resource")]
     DuplicateRuntimeResource {
-        /// Stable Station ID supplied by the caller.
-        station_id: String,
+        /// Stable Operation ID.
+        operation_id: String,
     },
-    /// A resource targets a Station absent from the durable graph.
-    #[error("runtime resource targets unknown station {station_id:?}")]
+    /// No Operation owns the supplied resource.
+    #[error("runtime resource targets unknown operation {operation_id:?}")]
     UnknownRuntimeResource {
-        /// Unknown Station ID supplied by the caller.
-        station_id: String,
+        /// Unknown Operation ID.
+        operation_id: String,
     },
-    /// An Operation's ephemeral resource is absent or has the wrong type.
-    #[error("station {station_id:?} runtime resource is invalid: {source}")]
+    /// The resource is missing or has the wrong concrete type.
+    #[error("operation {operation_id:?} runtime resource is invalid: {source}")]
     RuntimeResource {
-        /// Stable Station ID requiring the resource.
-        station_id: String,
-        /// Exact resource mismatch without exposing its contents.
+        /// Stable Operation ID.
+        operation_id: String,
+        /// Concrete resource mismatch.
         #[source]
         source: OperationSetupError,
     },
-    /// The declared topology is invalid.
+    /// The graph is invalid.
     #[error(transparent)]
     Topology(#[from] TopologyError),
-    /// The durable Flow definition cannot be encoded or decoded.
+    /// The durable definition is invalid.
     #[error(transparent)]
     Definition(#[from] FlowDefinitionError),
-    /// One Station rejected the exact Schemas supplied through its inputs.
-    #[error("station {station_id:?} operation {operation} has an invalid schema binding: {source}")]
+    /// Exact input schemas failed binding.
+    #[error("operation {operation_id:?} has an invalid schema: {source}")]
     Schema {
-        /// Stable ID of the Station whose binding failed.
-        station_id: String,
-        /// Zero-based Operation ordinal inside the Station.
-        operation: usize,
-        /// Operation-level binding failure.
+        /// Stable Operation ID.
+        operation_id: String,
+        /// Binding failure.
         #[source]
         source: OperationBindError,
     },
-    /// Store creation, lookup, transaction, or persistence failed.
+    /// Store access failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// A Station output Schema could not bind its persistent Change codec.
-    #[error("station {station_id:?} output Change codec is invalid: {source}")]
+    /// Output schema could not bind a Change codec.
+    #[error("operation {operation_id:?} has an invalid output codec: {source}")]
     OutputCodec {
-        /// Stable ID of the Station that owns the output.
-        station_id: String,
-        /// Schema validation or canonical codec construction failure.
+        /// Stable Operation ID.
+        operation_id: String,
+        /// Codec error.
         #[source]
-        source: ChangeCodecError,
+        source: dogpaddle_change::CodecError,
     },
-    /// A bound Operation could not be constructed during setup.
-    #[error("station {station_id:?} operation {operation} setup failed: {source}")]
+    /// Operation construction failed.
+    #[error("operation {operation_id:?} setup failed: {source}")]
     OperationSetup {
-        /// Stable Station ID containing the Operation.
-        station_id: String,
-        /// Zero-based Operation ordinal inside the Station.
-        operation: usize,
-        /// Concrete setup or construction failure.
+        /// Stable Operation ID.
+        operation_id: String,
+        /// Construction error.
         #[source]
         source: OperationSetupError,
     },
-    /// A Store exists, but no complete Flow definition was published.
+    /// No complete definition was published.
     #[error("flow build is incomplete")]
     IncompleteBuild,
-    /// A published definition references a required resource that is absent.
-    #[error("published flow is missing required resource {name:?}")]
+    /// A published resource is absent.
+    #[error("published flow is missing resource {name:?}")]
     MissingResource {
-        /// Stable Store data object name that could not be opened.
+        /// Exact catalog name.
         name: String,
     },
-    /// Published subscription or output-retention state is invalid.
-    #[error("station {station_id:?} has invalid runtime state: {reason}")]
+    /// The durable call stack or boundary state is corrupt.
+    #[error("invalid flow runtime state: {reason}")]
     InvalidRuntimeState {
-        /// Stable Station ID whose runtime state is invalid.
-        station_id: String,
-        /// Concrete invariant violation detected while opening or inspecting.
+        /// Concrete invariant violation.
         reason: String,
     },
 }
 
-pub(crate) fn operation_setup_error(
-    station_id: &str,
-    operation: usize,
-    source: OperationSetupError,
-) -> FlowError {
+pub(crate) fn setup_error(id: &str, source: OperationSetupError) -> FlowError {
+    let operation_id = id.to_owned();
     match source {
         OperationSetupError::MissingRuntimeResource
         | OperationSetupError::WrongRuntimeResource
         | OperationSetupError::UnexpectedRuntimeResource => FlowError::RuntimeResource {
-            station_id: station_id.to_owned(),
+            operation_id,
             source,
         },
-        OperationSetupError::Store(DataNotFound(name)) => FlowError::MissingResource { name },
-        OperationSetupError::Store(source) => FlowError::Store(source),
+        OperationSetupError::Store(source) => store_error(source),
+        OperationSetupError::Bind(source) => FlowError::Schema {
+            operation_id,
+            source,
+        },
+        OperationSetupError::Schema { source } => FlowError::Schema {
+            operation_id,
+            source: OperationBindError::Rejected { source },
+        },
         source => FlowError::OperationSetup {
-            station_id: station_id.to_owned(),
-            operation,
+            operation_id,
             source,
         },
     }
 }
-
-pub(crate) fn runtime_state_error(station_id: &str, source: StationError) -> FlowError {
+pub(crate) fn store_error(source: StoreError) -> FlowError {
     match source {
-        StationError::Store(source) => FlowError::Store(source),
-        source => FlowError::InvalidRuntimeState {
-            station_id: station_id.to_owned(),
-            reason: source.to_string(),
-        },
+        StoreError::DataNotFound(name) => FlowError::MissingResource { name },
+        source => FlowError::Store(source),
     }
 }
 
-/// Failure during one Station turn.
+/// Failure in a scheduling round, attributed to its logical Operation.
 #[derive(Debug, Error)]
-#[error("station {station_id:?} failed: {source}")]
+#[error("operation {operation_id:?} failed: {source}")]
 pub struct FlowRunError {
-    station_id: String,
+    operation_id: String,
     #[source]
-    source: StationError,
+    source: OperationError,
+    requires_reopen: bool,
 }
-
 impl FlowRunError {
-    pub(crate) fn new(station_id: &str, source: StationError) -> Self {
+    pub(crate) fn new(id: &str, source: OperationError, requires_reopen: bool) -> Self {
         Self {
-            station_id: station_id.to_owned(),
+            operation_id: id.to_owned(),
             source,
+            requires_reopen,
         }
     }
-
-    /// Returns the stable ID of the Station whose turn failed.
+    /// Returns the responsible logical Operation's stable ID.
     #[must_use]
-    pub fn station_id(&self) -> &str {
-        &self.station_id
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
     }
-
-    /// Returns whether this runtime must be reopened before scheduling can
-    /// continue.
-    ///
-    /// This is true after a Store commit or durability barrier reports failure,
-    /// after a post-commit callback fails, and for later calls rejected by the
-    /// runtime's fail-stop guard. A barrier failure also marks every Station
-    /// with a commit pending in that barrier for reopen.
+    /// Whether commit, durability or external-effect uncertainty requires reopening.
     #[must_use]
-    pub fn requires_reopen(&self) -> bool {
-        self.source.requires_reopen()
+    pub const fn requires_reopen(&self) -> bool {
+        self.requires_reopen
     }
 }

@@ -7,7 +7,6 @@ use std::{
     env,
     error::Error,
     io::{self, BufRead, Write},
-    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -78,26 +77,10 @@ fn main() -> Result<(), GateError> {
                 respond(&response)?;
             }
             "status" => {
-                let stations = flow
-                    .status()?
-                    .into_iter()
-                    .map(|station| {
-                        let inputs = station
-                            .inputs
-                            .into_iter()
-                            .map(|input| json!({"position": input.position, "tail": input.tail}))
-                            .collect::<Vec<_>>();
-                        let output = station.output.map(|output| {
-                            json!({
-                                "head": output.head,
-                                "tail": output.tail,
-                                "retained_bytes": output.retained_bytes,
-                            })
-                        });
-                        json!({"id": station.id, "inputs": inputs, "output": output})
-                    })
-                    .collect::<Vec<_>>();
-                respond(&json!({"kind": "status", "stations": stations}))?;
+                let status = flow.status()?;
+                respond(
+                    &json!({"kind": "status", "flow": {"depth": status.depth, "active_operation": status.active_operation, "sending": status.sending, "needs_reopen": status.needs_reopen}}),
+                )?;
             }
             "quit" => break,
             _ => return Err("unsupported gate command".into()),
@@ -111,7 +94,6 @@ fn build_flow(path: &Path, config: PostgresSinkConfig) -> Result<Flow, GateError
     let mut factory = FlowFactory::new(path);
     let scan = factory.operation(SCAN_ID, SequenceScanDefinition::new(FIRST_VALUE), []);
     factory.operation(SINK_ID, PostgresSinkDefinition::try_new(target)?, [scan]);
-    factory.materialize(scan, NonZeroU64::MAX);
 
     factory.resource(SINK_ID, config)?;
     Ok(factory.build()?)

@@ -1,11 +1,11 @@
 # dogpaddle-sql
 
 `dogpaddle-sql` 是 `DogPaddle` 的产品编译入口。一个 `SqlProgram` 表示一条
-`INSERT INTO sink(...) <query>`：SQL crate 负责解析、类型分析，并直接向 `FlowFactory` 声明 Operation 和输入。Station 划分、执行和恢复由普通 `Flow` 完成。
+`INSERT INTO sink(...) <query>`：SQL crate 负责解析、类型分析，并直接向 `FlowFactory` 声明 Operation 和输入。调用栈、融合、执行和恢复由普通 `Flow` 完成。
 
 它不维护第二套执行引擎，也不引入 Table、View、Catalog、后台 runner 或成本优化器。
 
-endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity、build 和 open 复用已解析值；环境引用与凭据不进入持久 Definition。新建时，各 endpoint 完成发现后将具体运行配置交给内存 `FlowFactory`，只把普通 `OperationDefinition` 交给后续规划和声明。SQL lowering 创建具体 Definition 并直接声明算子图，不维护私有 logical arena、Transform 目录或 Station 融合规则。
+endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity、build 和 open 复用已解析值；环境引用与凭据不进入持久 Definition。新建时，各 endpoint 完成发现后将具体运行配置交给内存 `FlowFactory`，只把普通 `OperationDefinition` 交给后续规划和声明。SQL lowering 创建具体 Definition 并直接声明算子图，不维护私有 logical arena、Transform 目录或 Flow 融合规则。
 
 ## 一条 SQL 如何运行
 
@@ -37,17 +37,9 @@ FROM numbers
 WHERE number % 2 = 0;
 ```
 
-会得到两个 Station：
+会声明完整逻辑 DAG：`Scan → Filter → Select → Sink`。Flow 自动将合法 Atomic 直线链放入同一页事务，
+一页输出送完消费者后再继续。持久调用栈记录当前页的位置，Source 已发布 Queue 和 Sink outbox 分别记录外部交付责任。
 
-```text
-sql/scan/00000000                              sql/sink
-┌──────────────────────────────────────┐       ┌────────────┐
-│ SequenceScan → 投影 → Filter → 投影  │══════▶│ SQLiteSink │
-└──────────────────────────────────────┘       └────────────┘
-             一笔 Store 事务                         独占
-```
-
-Station 是事务和持久化边界。同一 Station 内的线性 Operation 不需要中间持久队列；Station 之间通过持久 `SubscribedLog` 连接，因此进程退出后可以从已提交位置继续。
 
 ## 用户入口
 
@@ -96,11 +88,11 @@ let outcome = flow.advance()?;
 
 ## Program 身份与恢复
 
-SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按 Station ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 自动划分 Station，并通过统一 checked `construct` 取得类型化状态句柄；路径已存在时，它先比较 owner identity，再直接从持久 Definition 构造运行对象，不重新划分 Station。SQL 不声明算子持久数据，也没有自己的 materialize 层。
+SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按逻辑 Operation ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 推导 Atomic 尾链，并通过统一 checked `construct` 取得类型化状态句柄；路径已存在时，它先比较 owner identity，再直接从持久 Definition 构造运行对象，重新推导相同尾链并校验持久调用帧。SQL 不声明算子持久数据，也没有自己的 materialize 层。
 
 SQL identity 使用固定的开发期 v1 域；开发期实现变更直接更新当前 v1 黄金测试，旧状态删除重建，不提供旧版本识别、迁移或兼容分支。
 
-身份覆盖规范化查询、确定性装配 ABI、固定输出容量，以及会改变持久语义的 endpoint 参数。密码、用户名、主机、端口、runtime 位置和环境变量名称不进入身份；因此可以轮换凭据或连接地址，但不能用另一份查询、另一张表或不同的持久参数接管已有状态。SQL 原文、AST、LogicalPlan、凭据和环境引用都不持久化。
+身份覆盖规范化查询、确定性装配 ABI，以及会改变持久语义的 endpoint 参数。密码、用户名、主机、端口、runtime 位置和环境变量名称不进入身份；因此可以轮换凭据或连接地址，但不能用另一份查询、另一张表或不同的持久参数接管已有状态。SQL 原文、AST、LogicalPlan、凭据和环境引用都不持久化。
 
 如果修改了查询语义、表身份、publication、spool 容量或装配规则，应使用新的状态路径。
 
@@ -200,7 +192,7 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
-非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同 Station 的
+非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同一 Atomic 尾链的
 `SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、nullability 和 metadata，并用无歧义的内部字段名继续父级 lowering；query 最终的 positional `SchemaAlign` 再恢复 SQL 字段名。
 
 `ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row
@@ -213,14 +205,10 @@ ASOF equality 与 order 表达式绑定后只接受左右完全相同的稳定�
 `Boolean`、`Int8`、`Int16`、`Int32`、`Int64`、`UInt8`、`UInt16`、`UInt32`、`UInt64`、`Utf8`、
 `Binary`、`Date32`、任意单位与时区的 `Timestamp`，以及 `Decimal128`；`Float32`、`Float64` 和
 其他类型都会在创建状态目录前被拒绝。普通 SQL equality 不匹配 NULL，NULL order 也永远没有
-候选；完整 Rust API 另有 null-safe `NotDistinct`。
-
-完整 `AsOfJoinDefinition` Rust API 的 backward/forward 支持非空 lexicographic order tuple；nearest
-或 tolerance 则必须恰好只有一个可计算距离的 order，其类型限于上述整数、`Date32`、`Timestamp`
-或 `Decimal128`。当前 `DataFusion` 原生 SQL node 固定只携带一个 order comparison；DogPaddle 的原生
-ASOF SQL surface 中，`ON` 只接受 ordinary equality 合取，也没有 candidate residual、nearest、
-tolerance、NULL-safe equality 或 tie-break 子句，因此 SQL 层不伪造这些扩展。SQL 中同一分区和
-order 值若仍有多个不同的 right candidate，会确定性报错，而不会按到达顺序任意选择。没有
+候选。Rust API 与 SQL 使用同一能力范围：left outer、单个 order、Backward/Forward 和
+strict/inclusive 比较，分区条件只有 ordinary equality。nearest、tolerance、多 order、
+candidate residual、NULL-safe equality 和 tie-break 均不属于当前 API。
+被选中的同一分区和 order 值若有多个不同的 right candidate，会确定性报错，而不会按到达顺序任意选择。没有
 watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧修正重配历史 left rows，因此
 控制的是输出基数，不承诺有界状态。
 
@@ -237,9 +225,9 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 
 ## 装配与稳定 ID
 
-Station 融合和持久边界由 [Flow](../flow/README.md#最小公共-api) 唯一决定。SQL lowering 按确定性 postorder 直接调用 `FlowFactory::operation` 声明算子，不维护第二张图或融合规则。
+Atomic 融合和调用栈事务边界由 [Flow](../flow/README.md#最小公共-api) 唯一决定。SQL lowering 按确定性 postorder 直接调用 `FlowFactory::operation` 声明算子，不维护第二张图或融合规则。
 
-每个实际有输出的 Station 固定使用 64 MiB 持久队列；Scan ID 为 `sql/scan/{index:08x}`，每个 logical Transform 使用稠密 `sql/transform/{index:08x}`，Station ID 取其首 Operation ID（因此 Transform Station 编号可以有间隔），最终 Sink 为 `sql/sink`。
+Scan ID 为 `sql/scan/{index:08x}`，logical Transform 使用稠密 `sql/transform/{index:08x}`，最终 Sink 为 `sql/sink`。所有逻辑身份均进入唯一 Flow Definition。Source 已发布队列和每个 Sink outbox 各有独立 64 MiB 容量；图中的计算边不保存订阅日志。
 
 构建时 lowering 只接受 endpoint `TableScan`、`Filter`、`Projection`、`SubqueryAlias`、`Join`、`AsOfJoin`、`Union`、`Distinct::All` 和非空分组 `Aggregate`。
 `SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `SchemaAlign`。
@@ -268,4 +256,4 @@ cargo test -p dogpaddle-sql --doc
 
 ### 分页 Join 的运行错误
 
-普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；输入只有全部完成才确认。重启继续同一未确认输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `SchemaAlign`，普通 Rust 投影使用 `Select`，两者共享执行实现。
+普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；源 Delivery 可以在完整持久捕获后提前 ACK；计算帧的输入只在完成后释放。重启继续同一未完成输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `SchemaAlign`，普通 Rust 投影使用 `Select`，两者共享执行实现。

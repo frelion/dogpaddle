@@ -141,10 +141,12 @@ impl FilterDefinition {
 
 impl AtomicOperation for FilterOperation {
     fn apply(
-        &mut self,
+        &self,
         input: OperationInput<'_>,
         _access: TransactionAccess<'_>,
+        budget: &mut crate::operation::StepBudget,
     ) -> Result<Option<Change>, OperationError> {
+        budget.charge(crate::operation::logical_change_bytes(input.change))?;
         if input.port != 0 {
             return Err(FilterError::InvalidInputPort { port: input.port }.into());
         }
@@ -157,6 +159,7 @@ impl AtomicOperation for FilterOperation {
             .as_any()
             .downcast_ref::<arrow_array::BooleanArray>()
             .ok_or(FilterError::PredicateArray)?;
+        budget.charge(predicate.len().div_ceil(8))?;
         let selected = predicate.true_count();
         if selected == 0 {
             return Ok(None);
@@ -177,6 +180,7 @@ impl AtomicOperation for FilterOperation {
             .ok_or(FilterError::DifferenceArray)?
             .clone();
         let output = Change::try_new(records, diffs).map_err(FilterError::Change)?;
+        budget.charge(crate::operation::logical_change_bytes(&output))?;
         Ok(Some(output))
     }
 }

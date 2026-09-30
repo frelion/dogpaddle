@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{Store, SubscribedLog, TransactionAccess};
+use dogpaddle_store::{Queue, Store, TransactionAccess};
 
 use crate::support::{create_byte_map, open_byte_map, store_path};
 
@@ -20,12 +20,7 @@ fn prepare(path: &Path) {
     let mut store = Store::create(path).unwrap();
     create_byte_map(&mut store, "first").unwrap();
     create_byte_map(&mut store, "second").unwrap();
-    let log = store.create_data::<SubscribedLog<Vec<u8>>>("log").unwrap();
-    let mut transactions = store.into_transactions();
-    let transaction = transactions.begin();
-    log.initialize(NonZeroU64::MIN, transaction.access())
-        .unwrap();
-    transaction.commit().unwrap();
+    store.create_data::<Queue<Vec<u8>>>("log").unwrap();
 }
 
 fn run_worker(path: &Path, scenario: &str) -> ExitStatus {
@@ -57,8 +52,7 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
     let store = Store::open(path).unwrap();
     let first = open_byte_map(&store, "first").unwrap();
     let second = open_byte_map(&store, "second").unwrap();
-    let log = store.open_data::<SubscribedLog<Vec<u8>>>("log").unwrap();
-    let subscription = log.subscription(0);
+    let log = store.open_data::<Queue<Vec<u8>>>("log").unwrap();
     let transaction = store.read_transaction();
     let access = transaction.access();
     assert_eq!(
@@ -66,13 +60,21 @@ fn assert_values(path: &Path, expected: Option<&[u8]>) {
         expected.map(<[u8]>::to_vec)
     );
     assert_eq!(
-        subscription.peek(access).unwrap(),
-        expected.map(|value| (0, value.to_vec()))
-    );
-    assert_eq!(
         second.read(access).unwrap().get(&b"key".to_vec()).unwrap(),
         expected.map(<[u8]>::to_vec)
     );
+    drop(transaction);
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    assert_eq!(
+        log.access(transaction.access())
+            .unwrap()
+            .pop_front()
+            .unwrap()
+            .map(|(value, _)| value),
+        expected.map(<[u8]>::to_vec)
+    );
+    drop(transaction);
 }
 
 #[test]
@@ -107,10 +109,7 @@ fn crash_worker() {
     let store = Store::open(path).unwrap();
     let first = open_byte_map(&store, "first").unwrap();
     let second = open_byte_map(&store, "second").unwrap();
-    let log = store
-        .open_data::<SubscribedLog<Vec<u8>>>("log")
-        .unwrap()
-        .writer();
+    let log = store.open_data::<Queue<Vec<u8>>>("log").unwrap();
     let mut transactions = store.into_transactions();
     let value = if scenario == "batch-after-finish" {
         b"batched".to_vec()
@@ -129,7 +128,9 @@ fn crash_worker() {
             .put(&b"key".to_vec(), &value)
             .unwrap();
         assert!(
-            log.try_append(&value, NonZeroU64::new(1_024).unwrap(), access)
+            log.access(access)
+                .unwrap()
+                .try_push(&value, NonZeroU64::new(1_024).unwrap())
                 .unwrap()
         );
     };

@@ -131,6 +131,10 @@ impl ClickHouseSinkConfig {
             .append_pair("database", &self.database)
             .append_pair("wait_end_of_query", "1")
             .append_pair("max_query_size", "16777216")
+            .append_pair("max_execution_time", "5")
+            .append_pair("timeout_overflow_mode", "throw")
+            .append_pair("max_memory_usage", "67108864")
+            .append_pair("cancel_http_readonly_queries_on_client_close", "1")
             .append_pair("send_progress_in_http_headers", "0");
         Ok(url)
     }

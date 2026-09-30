@@ -1,27 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 
+use super::cdc_runtime::{DeliveryKind, SourceDelivery};
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
-use dogpaddle_store::{Cell, TransactionAccess};
+use dogpaddle_change::SchemaBoundChangeCodec;
+use dogpaddle_store::{Cell, Queue, ReadTransactionAccess, TransactionAccess};
+use std::num::NonZeroU64;
 use thiserror::Error;
 
 use crate::{
     DefinitionCodecError,
     codec::decode_json_payload,
-    definition::ConstructedOperation,
-    operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation},
+    definition::{ConstructedOperation, schema_error},
+    operation::{OperationError, SourceOperation},
 };
 
 pub(crate) const TAG: u16 = 1;
+const PUBLISHED: &str = "sequence_scan.published";
 const POSITION: &str = "sequence_scan.position";
+const PUBLISHED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Pure definition of a monotonically increasing Scan.
 ///
 /// The Scan accepts no inputs and emits `u64` values beginning at `start`.
-/// After committing [`u64::MAX`], subsequent turns return
-/// [`Action::Idle`] without changing persistent state or producing output.
+/// After committing [`u64::MAX`], subsequent polls return
+/// an idle poll without changing persistent state or producing output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceScanDefinition {
@@ -30,21 +35,27 @@ pub struct SequenceScanDefinition {
 
 /// Materialized monotonically increasing Scan operation.
 ///
-/// This value stores only the first value and persistent position needed at
+/// This value stores the first value, published queue and persistent position needed at
 /// execution time. It never retains its definition or begins, commits, or
 /// stores a transaction.
 pub(crate) struct SequenceScanOperation {
     start: u64,
+    codec: SchemaBoundChangeCodec,
     position: Cell<u64>,
+    published: Queue<Vec<u8>>,
+    next: Option<u64>,
 }
 
-/// Sequence-specific failure during one `SequenceScanOperation` turn.
+/// Sequence-specific source protocol or durable state failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SequenceScanError {
-    /// A Scan was incorrectly supplied an input Change.
-    #[error("sequence scan does not accept input")]
-    UnexpectedInput,
+    /// A Scan was supplied a delivery from another source kind.
+    #[error("sequence scan received another source kind")]
+    UnexpectedDelivery,
+    /// The committed position precedes the configured first value or queue exceeds capacity.
+    #[error("sequence scan durable position or published capacity is invalid")]
+    InvalidState,
 }
 
 impl SequenceScanDefinition {
@@ -71,44 +82,80 @@ impl SequenceScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
         let position = scope.data::<Cell<u64>>(POSITION)?;
-        Ok(ConstructedOperation::turn(
+        let published = scope.data::<Queue<Vec<u8>>>(PUBLISHED)?;
+        let codec = SchemaBoundChangeCodec::try_new(output_schema()).map_err(schema_error)?;
+        Ok(ConstructedOperation::source(
             Some(output_schema()),
             SequenceScanOperation {
                 start: self.start,
+                codec,
                 position,
+                published,
+                next: Some(self.start),
             },
         ))
     }
 }
 
-impl TurnOperation for SequenceScanOperation {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'_>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        if input.is_some() {
-            return Err(SequenceScanError::UnexpectedInput.into());
+impl SourceOperation for SequenceScanOperation {
+    fn restore(&mut self, access: ReadTransactionAccess<'_>) -> Result<(), OperationError> {
+        let position = self.position.read(access)?.get_bounded(8)?;
+        if position.is_some_and(|value| value < self.start)
+            || self.published.read(access)?.queued_bytes()? > PUBLISHED_BYTES
+        {
+            return Err(SequenceScanError::InvalidState.into());
         }
-        Ok(Turn::ready(move |access: TransactionAccess<'_>| {
-            let mut position = self.position.access(access)?;
-            let next = match position.get()? {
-                Some(previous) => {
-                    let Some(next) = previous.checked_add(1) else {
-                        return Ok((Action::Idle, AfterCommit::none()));
-                    };
-                    next
-                }
-                None => self.start,
-            };
-            let records = RecordBatch::try_new(
-                output_schema(),
-                vec![Arc::new(UInt64Array::from(vec![next]))],
-            )?;
-            let output = Change::try_new(records, Int64Array::from(vec![1_i64]))?;
-
-            position.set(&next)?;
-            Ok((Action::Commit(Some(output)), AfterCommit::none()))
-        }))
+        self.next = position.map_or(Some(self.start), |value| value.checked_add(1));
+        Ok(())
+    }
+    fn poll(&mut self) -> Result<Option<SourceDelivery>, OperationError> {
+        let Some(next) = self.next else {
+            return Ok(None);
+        };
+        let records = RecordBatch::try_new(
+            self.codec.schema(),
+            vec![Arc::new(UInt64Array::from(vec![next]))],
+        )?;
+        let change = Change::try_new(records, Int64Array::from(vec![1_i64]))?;
+        let encoded = self.codec.encode(&change)?;
+        Ok(Some(SourceDelivery::sequence(next, encoded)))
+    }
+    fn record(
+        &self,
+        access: TransactionAccess<'_>,
+        delivery: &mut SourceDelivery,
+    ) -> Result<bool, OperationError> {
+        let DeliveryKind::Sequence { next, encoded } = &delivery.kind else {
+            return Err(SequenceScanError::UnexpectedDelivery.into());
+        };
+        if !self.published.access(access)?.try_push(
+            encoded,
+            NonZeroU64::new(PUBLISHED_BYTES).expect("capacity is nonzero"),
+        )? {
+            return Ok(false);
+        }
+        self.position.access(access)?.set(next)?;
+        Ok(true)
+    }
+    fn ack(&mut self, delivery: SourceDelivery) -> Result<(), OperationError> {
+        let DeliveryKind::Sequence { next, .. } = delivery.kind else {
+            return Err(SequenceScanError::UnexpectedDelivery.into());
+        };
+        self.next = next.checked_add(1);
+        Ok(())
+    }
+    fn published(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<Option<Vec<u8>>, OperationError> {
+        Ok(self
+            .published
+            .read(access)?
+            .front_bounded(8 * 1024 * 1024)?)
+    }
+    fn consume_published(&self, access: TransactionAccess<'_>) -> Result<(), OperationError> {
+        self.published.access(access)?.discard_front(1)?;
+        Ok(())
     }
 }
 

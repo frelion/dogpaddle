@@ -13,11 +13,8 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
     operation::{
-        Action, Operation, OperationInput, Turn,
-        transform::{
-            AsOfDirection, AsOfEqualityKey, AsOfEqualityMode, AsOfEquidistantPreference,
-            AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieBreak, AsOfTieFallback,
-        },
+        Operation, OperationInput, Progress, StepBudget,
+        transform::{AsOfDirection, AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
@@ -27,11 +24,10 @@ use tempfile::TempDir;
 
 const BENCHMARK: &str = "asof_join";
 
+#[derive(Clone, Copy)]
 struct DefinitionOptions {
     direction: AsOfDirection,
     partitioned: bool,
-    tolerance: Option<u128>,
-    residual: Option<datafusion_expr::Expr>,
 }
 
 struct Fixture {
@@ -41,7 +37,7 @@ struct Fixture {
 }
 
 #[derive(Default)]
-struct ClaimResult {
+struct InputResult {
     output_rows: usize,
     turns: usize,
     positive_rows: usize,
@@ -53,15 +49,11 @@ impl Fixture {
         let sample = root.sample(BENCHMARK);
         let equalities = options
             .partitioned
-            .then(|| AsOfEqualityKey::new(AsOfEqualityMode::Equal, col("group"), col("group")));
+            .then(|| AsOfEqualityKey::new(col("group"), col("group")));
         let definition = AsOfJoinDefinition::try_new(
-            AsOfJoinKind::Inner,
             options.direction,
             equalities,
-            [AsOfOrderKey::new(col("at"), col("at"))],
-            std::iter::empty::<AsOfTieBreak>(),
-            AsOfTieFallback::CanonicalAscending,
-            options.tolerance,
+            AsOfOrderKey::new(col("at"), col("at")),
             [
                 "left_group",
                 "left_at",
@@ -70,7 +62,6 @@ impl Fixture {
                 "right_at",
                 "right_value",
             ],
-            options.residual,
         )
         .expect("define ASOF benchmark");
         let mut setup = StoreSetup::new();
@@ -92,37 +83,33 @@ impl Fixture {
         }
     }
 
-    fn apply(&mut self, port: usize, change: &Change) -> ClaimResult {
-        let mut result = ClaimResult::default();
+    fn apply(&mut self, port: usize, change: &Change) -> InputResult {
+        let mut result = InputResult::default();
+        let mut resume = self.operation.initial_resume();
         for _ in 0..1_000_000 {
-            let Turn::Ready(prepared) = self
-                .operation
-                .turn(Some(OperationInput { port, change }))
-                .expect("prepare ASOF benchmark turn")
-            else {
-                panic!("ASOF benchmark must be ready for a pinned input")
-            };
             let transaction = self.transactions.begin();
-            let (action, completion) = prepared
-                .apply(transaction.access())
-                .expect("apply ASOF benchmark turn");
-            transaction.commit().expect("commit ASOF benchmark turn");
-            completion.run().expect("complete ASOF benchmark turn");
+            let step = self
+                .operation
+                .step(
+                    OperationInput { port, change },
+                    &resume,
+                    transaction.access(),
+                    &mut StepBudget::new(256, 4 * 1024 * 1024),
+                )
+                .expect("apply ASOF benchmark page");
+            transaction.commit().expect("commit ASOF benchmark page");
             result.turns += 1;
-            match action {
-                Action::Commit(output) => result.observe(output.as_ref()),
-                Action::Complete(output) => {
-                    result.observe(output.as_ref());
-                    return result;
-                }
-                Action::Idle => panic!("ASOF benchmark returned Idle for a pinned input"),
+            result.observe(step.output.as_ref());
+            match step.progress {
+                Progress::More(next) => resume = next,
+                Progress::Done => return result,
             }
         }
-        panic!("ASOF benchmark Claim did not complete")
+        panic!("ASOF benchmark input did not complete")
     }
 }
 
-impl ClaimResult {
+impl InputResult {
     fn observe(&mut self, output: Option<&Change>) {
         let Some(output) = output else {
             return;
@@ -202,7 +189,7 @@ fn benchmark_pair(
     });
 }
 
-fn validate_pair(first: &ClaimResult, second: &ClaimResult, expected: [(usize, usize); 2]) {
+fn validate_pair(first: &InputResult, second: &InputResult, expected: [(usize, usize); 2]) {
     assert_eq!(first.output_rows, expected[0].0 + expected[0].1);
     assert_eq!(second.output_rows, expected[1].0 + expected[1].1);
     assert_eq!((first.positive_rows, first.negative_rows), expected[0]);
@@ -224,8 +211,6 @@ fn benchmark_partitioned_lookup(
         DefinitionOptions {
             direction: AsOfDirection::Backward { allow_exact: true },
             partitioned: true,
-            tolerance: None,
-            residual: None,
         },
     );
     let mut groups = Vec::with_capacity(partitions * VERSIONS);
@@ -280,8 +265,6 @@ fn benchmark_global_lookup(
         DefinitionOptions {
             direction: AsOfDirection::Backward { allow_exact: true },
             partitioned: false,
-            tolerance: None,
-            residual: None,
         },
     );
     let orders = signed_ordinals(versions);
@@ -321,8 +304,6 @@ fn rematch_fixture(
         DefinitionOptions {
             direction: AsOfDirection::Backward { allow_exact: true },
             partitioned: true,
-            tolerance: None,
-            residual: None,
         },
     );
     let future_base = i64::try_from(left_rows)
@@ -417,98 +398,6 @@ fn benchmark_right_rematch(
     );
 }
 
-fn benchmark_nearest_tolerance(
-    group: &mut BenchmarkGroup<'_, WallTime>,
-    root: &RunRoot,
-    schema: &SchemaRef,
-    versions: usize,
-) {
-    let mut fixture = Fixture::new(
-        root,
-        schema,
-        DefinitionOptions {
-            direction: AsOfDirection::Nearest {
-                allow_exact: true,
-                equidistant: AsOfEquidistantPreference::Backward,
-            },
-            partitioned: true,
-            tolerance: Some(1),
-            residual: None,
-        },
-    );
-    let orders = (0..versions)
-        .map(|value| {
-            i64::try_from(value)
-                .expect("nearest ordinal fits i64")
-                .saturating_mul(2)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        fixture
-            .apply(
-                1,
-                &change(schema, vec![7; versions], orders.clone(), orders.clone(), 1),
-            )
-            .turns
-            > 0
-    );
-    let probe = orders
-        .last()
-        .copied()
-        .expect("nearest workload has candidates")
-        .saturating_sub(1);
-    let inserted = change(schema, vec![7], vec![probe], vec![0], 1);
-    let retracted = change(schema, vec![7], vec![probe], vec![0], -1);
-    benchmark_pair(
-        group,
-        "nearest_inclusive_tolerance",
-        &mut fixture,
-        0,
-        &inserted,
-        &retracted,
-        [(1, 0), (0, 1)],
-    );
-}
-
-fn benchmark_residual_far_fallback(
-    group: &mut BenchmarkGroup<'_, WallTime>,
-    root: &RunRoot,
-    schema: &SchemaRef,
-    versions: usize,
-) {
-    let mut fixture = Fixture::new(
-        root,
-        schema,
-        DefinitionOptions {
-            direction: AsOfDirection::Backward { allow_exact: true },
-            partitioned: true,
-            tolerance: None,
-            residual: Some(col("right.value").gt(col("left.value"))),
-        },
-    );
-    let orders = signed_ordinals(versions);
-    let mut values = vec![-1; versions];
-    values[0] = 1;
-    assert!(
-        fixture
-            .apply(1, &change(schema, vec![7; versions], orders, values, 1))
-            .turns
-            > 0
-    );
-    let probe = i64::try_from(versions).expect("version count fits i64");
-    let inserted = change(schema, vec![7], vec![probe], vec![0], 1);
-    let retracted = change(schema, vec![7], vec![probe], vec![0], -1);
-    benchmark_pair(
-        group,
-        "residual_far_fallback",
-        &mut fixture,
-        0,
-        &inserted,
-        &retracted,
-        [(1, 0), (0, 1)],
-    );
-}
-
 fn write_context(
     root: &RunRoot,
     profile: PerformanceProfile,
@@ -529,43 +418,31 @@ fn write_context(
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "one insert Claim plus its exact retract Claim, including all committed turns, synchronous commits, and AfterCommit; the pair restores the initial relation",
-            "throughput_unit": "Claims (two per timed iteration)",
+            "timed_boundary": "one insert input plus its exact retract input, including every Operation::step page and synchronous transaction commit; the pair restores the initial relation",
+            "throughput_unit": "complete inputs (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
-            "runtime_counters": "unavailable: Operation does not expose scan-page or logical read/write-byte counters; workload cardinalities and committed turn/output counts are retained instead",
+            "runtime_counters": "unavailable: Operation does not expose scan-page or logical read/write-byte counters; workload cardinalities and committed page/output counts are retained instead",
             "cases": {
                 "partitioned_lookup": {
                     "partitions": partitions,
                     "right_versions_per_partition": 4,
-                    "left_rows_per_claim": partitions,
+                    "left_rows_per_input": partitions,
                 },
                 "global_partition_lookup": {
                     "partitions": 1,
                     "right_versions": versions,
-                    "left_rows_per_claim": 1,
+                    "left_rows_per_input": 1,
                 },
                 "right_tail_small_rematch": {
                     "left_rows": rematch_left_rows,
                     "right_versions": rematch_right_versions,
-                    "corrected_left_rows_per_claim": 2,
+                    "corrected_left_rows_per_input": 2,
                 },
                 "right_historical_full_rematch": {
                     "left_rows": rematch_left_rows,
                     "right_versions": rematch_right_versions,
-                    "corrected_left_rows_per_claim": rematch_left_rows,
+                    "corrected_left_rows_per_input": rematch_left_rows,
                     "candidate_shape": "one eligible old version plus future ineligible history forces the full left-by-right correctness path",
-                },
-                "nearest_inclusive_tolerance": {
-                    "right_versions": versions,
-                    "spacing": 2,
-                    "tolerance": 1,
-                    "equidistant_preference": "backward",
-                },
-                "residual_far_fallback": {
-                    "right_versions": versions,
-                    "predicate": "right.value > left.value",
-                    "qualifying_candidates": 1,
-                    "winner": "oldest/farthest backward candidate",
                 },
             },
         },
@@ -616,8 +493,6 @@ fn main() {
         rematch_left_rows,
         rematch_right_versions,
     );
-    benchmark_nearest_tolerance(&mut group, &root, &schema, versions);
-    benchmark_residual_far_fallback(&mut group, &root, &schema, versions);
     group.finish();
     criterion.final_summary();
 }

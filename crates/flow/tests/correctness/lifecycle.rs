@@ -1,12 +1,11 @@
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{Cell, Store, SubscribedLog};
+use dogpaddle_store::{Cell, Store};
 
-const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
 const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 const OTHER_OWNER_IDENTITY: [u8; 32] = [0x5a; 32];
 
@@ -25,13 +24,10 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
         DiscardDefinition::new(),
         [fanout_scan],
     );
-    for station in [chain_scan, count, fanout_scan] {
-        builder.materialize(station, OUTPUT_CAPACITY_BYTES);
-    }
 
     let flow = builder.build().unwrap();
     assert_eq!(
-        (flow.path(), flow.station_ids().collect::<Vec<_>>()),
+        (flow.path(), flow.operation_ids().collect::<Vec<_>>()),
         (
             path.as_path(),
             vec![
@@ -49,10 +45,8 @@ fn multi_component_chain_and_fanout_survive_the_complete_build_run_reopen_lifecy
     let mut flow = FlowFactory::new(&path).open().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
     drop(flow);
-
     let mut flow = FlowFactory::new(&path).open().unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    super::support::run_until_idle(&mut flow);
     drop(flow);
     assert_completed_state(&path);
 }
@@ -61,20 +55,15 @@ fn assert_completed_state(path: &Path) {
     let store = Store::open(path).unwrap();
     let positions: [Cell<u64>; 2] = [
         store
-            .open_data("station/00000000/operation/00000000/sequence_scan.position")
+            .open_data("operation/00000000/sequence_scan.position")
             .unwrap(),
         store
-            .open_data("station/00000003/operation/00000000/sequence_scan.position")
+            .open_data("operation/00000003/sequence_scan.position")
             .unwrap(),
     ];
     let count: Cell<u64> = store
-        .open_data("station/00000001/operation/00000000/running_event_count.count")
+        .open_data("operation/00000001/running_event_count.count")
         .unwrap();
-    let outputs: [SubscribedLog<Vec<u8>>; 3] = [
-        store.open_data("station/00000000/output").unwrap(),
-        store.open_data("station/00000001/output").unwrap(),
-        store.open_data("station/00000003/output").unwrap(),
-    ];
     let transaction = store.read_transaction();
     let access = transaction.access();
     assert_eq!(
@@ -82,23 +71,6 @@ fn assert_completed_state(path: &Path) {
         [Some(u64::MAX), Some(u64::MAX)]
     );
     assert_eq!(count.read(access).unwrap().get().unwrap(), Some(2));
-    for (output, position) in outputs.iter().zip([2, 2, 1]) {
-        let output = output.writer().status(access).unwrap();
-        assert_eq!(
-            (output.head, output.tail, output.retained_bytes),
-            (position, position, 0)
-        );
-    }
-    let expected_positions: [&[u64]; 3] = [&[2], &[2], &[1, 1]];
-    for (output, positions) in outputs.iter().zip(expected_positions) {
-        for (subscriber, &expected) in positions.iter().enumerate() {
-            let status = output
-                .subscription(u64::try_from(subscriber).unwrap())
-                .status(access)
-                .unwrap();
-            assert_eq!((status.position, status.tail), (expected, expected));
-        }
-    }
 }
 
 #[test]
@@ -108,7 +80,6 @@ fn an_active_flow_exclusively_owns_its_store_path() {
     let mut builder = FlowFactory::new(&path);
     let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
     builder.operation("sink", DiscardDefinition::new(), [scan]);
-    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     let flow = builder.build().unwrap();
 
@@ -128,7 +99,6 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
     builder.owner_identity(OWNER_IDENTITY);
     let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
     builder.operation("sink", DiscardDefinition::new(), [scan]);
-    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     drop(builder.build().unwrap());
 
@@ -153,7 +123,6 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
     let mut builder = FlowFactory::new(&anonymous_path);
     let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
     builder.operation("sink", DiscardDefinition::new(), [scan]);
-    builder.materialize(scan, OUTPUT_CAPACITY_BYTES);
 
     drop(builder.build().unwrap());
 
@@ -167,31 +136,29 @@ fn open_requires_the_exact_owner_identity_before_binding_runtime_resources() {
 }
 
 #[test]
-fn build_and_open_support_many_station_output_logs() {
-    const OUTPUT_STATION_COUNT: usize = 65;
+fn build_and_open_support_many_logical_operations_with_one_fused_tail() {
+    const OPERATION_CHAIN_LENGTH: usize = 65;
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut builder = FlowFactory::new(&path);
     let mut previous = builder.operation("scan", SequenceScanDefinition::new(0), []);
-    builder.materialize(previous, OUTPUT_CAPACITY_BYTES);
-    for index in 1..OUTPUT_STATION_COUNT {
+    for index in 1..OPERATION_CHAIN_LENGTH {
         let current = builder.operation(
             format!("count-{index}"),
             RunningEventCountDefinition::new(),
             [previous],
         );
-        builder.materialize(current, OUTPUT_CAPACITY_BYTES);
 
         previous = current;
     }
     builder.operation("sink", DiscardDefinition::new(), [previous]);
 
     let flow = builder.build().unwrap();
-    assert_eq!(flow.station_count(), OUTPUT_STATION_COUNT + 1);
+    assert_eq!(flow.operation_count(), OPERATION_CHAIN_LENGTH + 1);
     drop(flow);
     assert_eq!(
-        FlowFactory::new(path).open().unwrap().station_count(),
-        OUTPUT_STATION_COUNT + 1
+        FlowFactory::new(path).open().unwrap().operation_count(),
+        OPERATION_CHAIN_LENGTH + 1
     );
 }

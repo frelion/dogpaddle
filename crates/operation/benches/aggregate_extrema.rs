@@ -13,7 +13,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
     operation::{
-        Action, Operation, OperationInput, Turn,
+        Operation, OperationInput, StepBudget,
         transform::{AggregateCall, AggregateDefinition},
     },
 };
@@ -77,21 +77,22 @@ impl Fixture {
         }
     }
 
-    fn apply(&mut self, change: &Change) -> Action {
-        let Turn::Ready(prepared) = self
-            .operation
-            .turn(Some(OperationInput { port: 0, change }))
-            .expect("prepare aggregate")
-        else {
-            panic!("aggregate must be ready")
+    fn apply(&mut self, change: &Change) -> Option<Change> {
+        let Operation::Atomic(operation) = &self.operation else {
+            panic!("aggregate must be atomic")
         };
         let transaction = self.transactions.begin();
-        let (action, completion) = prepared
-            .apply(transaction.access())
+        // Owner benchmark measures the complete supplied batch; production
+        // Flow chooses the bounded head slice before invoking this same kernel.
+        let output = operation
+            .apply(
+                OperationInput { port: 0, change },
+                transaction.access(),
+                &mut StepBudget::new(0, 64 * 1024 * 1024),
+            )
             .expect("apply aggregate");
         transaction.commit().expect("commit aggregate");
-        completion.run().expect("complete aggregate");
-        action
+        output
     }
 }
 
@@ -122,14 +123,11 @@ fn change_with_groups(
 }
 
 fn validate(
-    action: &Action,
+    output: Option<&Change>,
     expected: Option<([i64; 2], [i64; 2])>,
     pairs: usize,
     distinct_layouts: bool,
 ) {
-    let Action::Complete(output) = action else {
-        panic!("aggregate must complete input")
-    };
     let Some((minima, maxima)) = expected else {
         assert!(
             output.is_none(),
@@ -137,7 +135,7 @@ fn validate(
         );
         return;
     };
-    let output = output.as_ref().expect("extrema transition output");
+    let output = output.expect("extrema transition output");
     assert_eq!(output.diffs().values(), &[-1, 1]);
     let column = |index| {
         output
@@ -170,11 +168,8 @@ fn validate(
 ///
 /// The per-row cases assert their whole two-row transition; a turn carrying many
 /// rows emits one transition per row, so its closing state is the stable check.
-fn last_row_extrema(action: &Action, pairs: usize) -> (Vec<i64>, Vec<i64>) {
-    let Action::Complete(output) = action else {
-        panic!("aggregate must complete input")
-    };
-    let output = output.as_ref().expect("extrema transition output");
+fn last_row_extrema(output: Option<&Change>, pairs: usize) -> (Vec<i64>, Vec<i64>) {
+    let output = output.expect("extrema transition output");
     assert_eq!(output.records().num_columns(), 1 + 2 * pairs);
     let column = |index| {
         output
@@ -235,7 +230,7 @@ fn main() {
             "hot_extrema_value": 150,
             "zero_net_group_cycle_rows": BULK_ROWS,
             "bulk_new_groups_per_turn": BULK_ROWS,
-            "timed_boundary": "one or two turns per case; each includes apply, Transaction::commit, AfterCommit; writes synchronize WAL",
+            "timed_boundary": "one or two full-batch Atomic apply calls per case under an explicit 64MiB logical byte allowance; each includes Transaction::commit; writes synchronize WAL",
             "untimed": "fixture, seed, warmup, output validation, teardown"
         }
     });
@@ -285,20 +280,20 @@ fn main() {
         let mut fixture = Fixture::new(&root, schema, pairs, distinct_layouts);
         let seed = change(schema, &[0, 50, 100], vec![1, 1, 1]);
         let seed_action = fixture.apply(&seed);
-        assert!(matches!(seed_action, Action::Complete(Some(_))));
+        assert!(seed_action.is_some());
         let first = change(schema, &[value], vec![difference]);
         let second = change(schema, &[value], vec![-difference]);
         let first_expected = transition.then_some(([0, 50], [100, 100]));
         let second_expected = transition.then_some(([50, 0], [100, 100]));
         // One explicit untimed round verifies the seed and returns to its state.
         validate(
-            &fixture.apply(&first),
+            fixture.apply(&first).as_ref(),
             first_expected,
             pairs,
             distinct_layouts,
         );
         validate(
-            &fixture.apply(&second),
+            fixture.apply(&second).as_ref(),
             second_expected,
             pairs,
             distinct_layouts,
@@ -311,8 +306,18 @@ fn main() {
                     let first_action = fixture.apply(&first);
                     let second_action = fixture.apply(&second);
                     elapsed += started.elapsed();
-                    validate(&first_action, first_expected, pairs, distinct_layouts);
-                    validate(&second_action, second_expected, pairs, distinct_layouts);
+                    validate(
+                        first_action.as_ref(),
+                        first_expected,
+                        pairs,
+                        distinct_layouts,
+                    );
+                    validate(
+                        second_action.as_ref(),
+                        second_expected,
+                        pairs,
+                        distinct_layouts,
+                    );
                 }
                 elapsed
             });
@@ -336,14 +341,14 @@ fn bench_bulk_rows(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef
     let bulk = change(schema, &bulk_values, vec![1; BULK_ROWS]);
     let bulk_undo = change(schema, &bulk_values, vec![-1; BULK_ROWS]);
     let mut fixture = Fixture::new(root, schema, 1, false);
-    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
+    assert!(fixture.apply(seed).is_some());
     // Untimed rounds verify the closing state and return the group to the seed.
     assert_eq!(
-        last_row_extrema(&fixture.apply(&bulk), 1),
+        last_row_extrema(fixture.apply(&bulk).as_ref(), 1),
         (vec![0], vec![rows - 1])
     );
     assert_eq!(
-        last_row_extrema(&fixture.apply(&bulk_undo), 1),
+        last_row_extrema(fixture.apply(&bulk_undo).as_ref(), 1),
         (vec![0], vec![100])
     );
 
@@ -359,8 +364,8 @@ fn bench_bulk_rows(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRef
                 let up = fixture.apply(&bulk);
                 let down = fixture.apply(&bulk_undo);
                 elapsed += started.elapsed();
-                assert!(matches!(up, Action::Complete(Some(_))));
-                assert!(matches!(down, Action::Complete(Some(_))));
+                assert!(up.is_some());
+                assert!(down.is_some());
             }
             elapsed
         });
@@ -380,13 +385,13 @@ fn bench_hot_extrema_key(
     let insert = change(schema, &values, vec![1; BULK_ROWS]);
     let retract = change(schema, &values, vec![-1; BULK_ROWS]);
     let mut fixture = Fixture::new(root, schema, 1, false);
-    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
+    assert!(fixture.apply(seed).is_some());
     assert_eq!(
-        last_row_extrema(&fixture.apply(&insert), 1),
+        last_row_extrema(fixture.apply(&insert).as_ref(), 1),
         (vec![0], vec![150])
     );
     assert_eq!(
-        last_row_extrema(&fixture.apply(&retract), 1),
+        last_row_extrema(fixture.apply(&retract).as_ref(), 1),
         (vec![0], vec![100])
     );
 
@@ -402,8 +407,8 @@ fn bench_hot_extrema_key(
                 let up = fixture.apply(&insert);
                 let down = fixture.apply(&retract);
                 elapsed += started.elapsed();
-                assert_eq!(last_row_extrema(&up, 1), (vec![0], vec![150]));
-                assert_eq!(last_row_extrema(&down, 1), (vec![0], vec![100]));
+                assert_eq!(last_row_extrema(up.as_ref(), 1), (vec![0], vec![150]));
+                assert_eq!(last_row_extrema(down.as_ref(), 1), (vec![0], vec![100]));
             }
             elapsed
         });
@@ -427,17 +432,17 @@ fn bench_zero_net_group_cycles(
     let retract = change(schema, &[100], vec![-1]);
     let restore = change(schema, &[100], vec![1]);
     let mut fixture = Fixture::new(root, schema, 1, false);
-    assert!(matches!(fixture.apply(seed), Action::Complete(Some(_))));
-    assert!(matches!(fixture.apply(&cycle), Action::Complete(None)));
+    assert!(fixture.apply(seed).is_some());
+    assert!(fixture.apply(&cycle).is_none());
     // The visible max transition proves the seed's multiplicity is exactly one.
     validate(
-        &fixture.apply(&retract),
+        fixture.apply(&retract).as_ref(),
         Some(([0, 0], [100, 50])),
         1,
         false,
     );
     validate(
-        &fixture.apply(&restore),
+        fixture.apply(&restore).as_ref(),
         Some(([0, 0], [50, 100])),
         1,
         false,
@@ -454,7 +459,7 @@ fn bench_zero_net_group_cycles(
                 let started = Instant::now();
                 let action = fixture.apply(&cycle);
                 elapsed += started.elapsed();
-                assert!(matches!(action, Action::Complete(None)));
+                assert!(action.is_none());
             }
             elapsed
         });
@@ -470,12 +475,12 @@ fn bench_existing_groups(criterion: &mut Criterion, root: &RunRoot, schema: &Sch
     let retract = change_with_groups(schema, &groups, &values, vec![-1; BULK_ROWS]);
     let mut fixture = Fixture::new(root, schema, 1, false);
 
-    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
-    assert!(matches!(fixture.apply(&insert), Action::Complete(None)));
-    assert!(matches!(fixture.apply(&retract), Action::Complete(None)));
+    validate_group_lifecycle(fixture.apply(&insert).as_ref(), &groups, 1);
+    assert!(fixture.apply(&insert).is_none());
+    assert!(fixture.apply(&retract).is_none());
     // Untimed death and rebirth prove every group returned to weight one.
-    validate_group_lifecycle(&fixture.apply(&retract), &groups, -1);
-    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
+    validate_group_lifecycle(fixture.apply(&retract).as_ref(), &groups, -1);
+    validate_group_lifecycle(fixture.apply(&insert).as_ref(), &groups, 1);
 
     let mut group = criterion.benchmark_group(BENCHMARK);
     group.throughput(Throughput::Elements(
@@ -489,8 +494,8 @@ fn bench_existing_groups(criterion: &mut Criterion, root: &RunRoot, schema: &Sch
                 let increased = fixture.apply(&insert);
                 let restored = fixture.apply(&retract);
                 elapsed += started.elapsed();
-                assert!(matches!(increased, Action::Complete(None)));
-                assert!(matches!(restored, Action::Complete(None)));
+                assert!(increased.is_none());
+                assert!(restored.is_none());
             }
             elapsed
         });
@@ -506,8 +511,8 @@ fn bench_new_groups(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRe
     let retract = change_with_groups(schema, &groups, &values, vec![-1; BULK_ROWS]);
     let mut fixture = Fixture::new(root, schema, 1, false);
 
-    validate_group_lifecycle(&fixture.apply(&insert), &groups, 1);
-    validate_group_lifecycle(&fixture.apply(&retract), &groups, -1);
+    validate_group_lifecycle(fixture.apply(&insert).as_ref(), &groups, 1);
+    validate_group_lifecycle(fixture.apply(&retract).as_ref(), &groups, -1);
 
     let mut group = criterion.benchmark_group(BENCHMARK);
     group.throughput(Throughput::Elements(
@@ -521,8 +526,8 @@ fn bench_new_groups(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRe
                 let inserted = fixture.apply(&insert);
                 let retracted = fixture.apply(&retract);
                 elapsed += started.elapsed();
-                validate_group_lifecycle(&inserted, &groups, 1);
-                validate_group_lifecycle(&retracted, &groups, -1);
+                validate_group_lifecycle(inserted.as_ref(), &groups, 1);
+                validate_group_lifecycle(retracted.as_ref(), &groups, -1);
             }
             elapsed
         });
@@ -530,8 +535,8 @@ fn bench_new_groups(criterion: &mut Criterion, root: &RunRoot, schema: &SchemaRe
     group.finish();
 }
 
-fn validate_group_lifecycle(action: &Action, groups: &[i64], difference: i64) {
-    let Action::Complete(Some(output)) = action else {
+fn validate_group_lifecycle(output: Option<&Change>, groups: &[i64], difference: i64) {
+    let Some(output) = output else {
         panic!("group lifecycle must produce output")
     };
     assert_eq!(output.num_rows(), groups.len());

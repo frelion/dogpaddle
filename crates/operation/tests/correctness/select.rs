@@ -12,16 +12,16 @@ use dogpaddle_operation::{
     DefinitionCodecError, Expr, ExpressionBindError, OperationBindError, OperationKind,
     ProjectionError, col, decode_definition, encode_definition, lit,
     operation::{
-        Action, OperationInput,
+        OperationInput,
         transform::{SelectDefinition, SelectSchemaError},
     },
 };
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, assert_literal_definition, change, change_with_field_name, commit_ready,
-    construct_checked, decode_hex, project_input_schema, rollback_ready, stateless_operation,
-    turn_input, value_schema,
+    TestStore, assert_literal_definition, change, change_with_field_name, construct_checked,
+    decode_hex, project_input_schema, rollback_input, run_input, stateless_operation, step_input,
+    value_schema,
 };
 
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
@@ -61,12 +61,11 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation = stateless_operation(&decoded, Arc::clone(&schema));
+    let operation = stateless_operation(&decoded, Arc::clone(&schema));
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(selected)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    let Some(selected) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
     else {
         panic!("decoded Select did not emit its expected fields");
     };
@@ -91,10 +90,10 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let decoded = decode_definition(&decode_hex(SELECT_V1)).unwrap();
-    let mut operation = stateless_operation(&decoded, input.schema());
+    let operation = stateless_operation(&decoded, input.schema());
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(reopened_selected)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+    let Some(reopened_selected) =
+        run_input(&operation, step_input(&input), &mut transactions).unwrap()
     else {
         panic!("reopened Select did not emit its expected fields");
     };
@@ -231,19 +230,19 @@ fn select_reports_expression_context_and_rejects_invalid_output_names_centrally(
 #[test]
 fn runtime_rejects_invalid_ports() {
     let input = change(&[1]);
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_new([("input", col("input"))]).unwrap(),
         input.schema(),
     );
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
+    let error = rollback_input(
+        &operation,
+        OperationInput {
             port: 1,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();
@@ -271,13 +270,11 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
     let definition =
         SelectDefinition::try_new([("copied", col("label")), ("next", col("id") + lit(1_u64))])
             .unwrap();
-    let mut operation = stateless_operation(&definition, Arc::clone(&schema));
+    let operation = stateless_operation(&definition, Arc::clone(&schema));
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Select did not complete with one output Change");
     };
     assert_eq!(output.schema().field(0).name(), "copied");
@@ -303,13 +300,11 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
 fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let input = change(&[1, -1, 2]);
     let definition = SelectDefinition::try_new(std::iter::empty::<(&str, Expr)>()).unwrap();
-    let mut operation = stateless_operation(&definition, input.schema());
+    let operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("empty Select did not complete with one output Change");
     };
     assert_eq!(output.num_rows(), input.num_rows());
@@ -321,12 +316,7 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     );
 
     let drifted = change_with_field_name("other", &[1, -1, 2]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(turn_input(&drifted)),
-        &mut transactions,
-    )
-    .unwrap_err();
+    let error = rollback_input(&operation, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectionError>(),
         Some(ProjectionError::InputSchemaMismatch)
@@ -339,22 +329,16 @@ fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
     let failing = col("input") / dogpaddle_operation::lit(0_u64);
     let definition =
         SelectDefinition::try_new([("first", col("input")), ("second", failing)]).unwrap();
-    let mut operation = stateless_operation(&definition, input.schema());
+    let operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
     let mut transactions = Store::create(fixture.path()).unwrap().into_transactions();
     let drifted = change_with_field_name("other", &[1, -1]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(turn_input(&drifted)),
-        &mut transactions,
-    )
-    .unwrap_err();
+    let error = rollback_input(&operation, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectionError>(),
         Some(ProjectionError::InputSchemaMismatch)
     ));
-    let error =
-        rollback_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap_err();
+    let error = rollback_input(&operation, step_input(&input), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectionError>(),
         Some(ProjectionError::Expression { field: 1, .. })

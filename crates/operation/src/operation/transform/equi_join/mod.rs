@@ -11,7 +11,7 @@ use crate::{
 
 mod definition;
 mod runtime;
-mod state;
+pub(crate) mod state;
 
 pub use definition::EquiJoinDefinition;
 pub(crate) use definition::{EquiJoinLayout, TAG, decode_definition};
@@ -25,7 +25,6 @@ fn construct(
 ) -> Result<Operation, OperationSetupError> {
     let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
     let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
-    let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
     let has_residual = layout.residual.is_some();
     let key_counts = if layout.kind != EquiJoinKind::Inner && !has_residual {
         Some(scope.data::<state::Counts>(definition::KEY_COUNTS)?)
@@ -37,7 +36,7 @@ fn construct(
     } else {
         None
     };
-    Ok(Operation::Turn(Box::new(EquiJoinOperation {
+    Ok(Operation::Paged(Box::new(EquiJoinOperation {
         kind: layout.kind,
         input_schemas: layout.input_schemas,
         candidate_schema: layout.candidate_schema,
@@ -47,10 +46,8 @@ fn construct(
         nulls: layout.nulls,
         left_rows,
         right_rows,
-        continuation,
         key_counts,
         match_counts,
-        prepared: None,
     })))
 }
 
@@ -177,10 +174,13 @@ pub enum EquiJoinSchemaError {
     NullPadding(#[source] DataFusionError),
 }
 
-/// Failure during one `EquiJoinOperation` turn.
+/// Failure during one `EquiJoinOperation` step.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EquiJoinError {
+    /// This attempt cannot fit the current bounded page.
+    #[error(transparent)]
+    Budget(#[from] crate::operation::BudgetExceeded),
     /// Only the two bound input ports are valid.
     #[error("equi-join does not accept input port {port}")]
     InvalidInputPort {
@@ -193,7 +193,7 @@ pub enum EquiJoinError {
         /// Input port whose Schema drifted.
         port: usize,
     },
-    /// One bound key expression failed while preparing the Claim.
+    /// One bound key expression failed while preparing the input.
     #[error("equi-join key expression {key} failed for input {port}")]
     KeyExpression {
         /// Offered input port.
@@ -232,15 +232,15 @@ pub enum EquiJoinError {
     /// Persisted qualifying-match support disagrees with a distinct-row removal.
     #[error("equi-join match count underflow")]
     MatchCountUnderflow,
-    /// Durable qualifying-match state is inconsistent with the pinned input Claim.
+    /// Durable qualifying-match state is inconsistent with the immutable input.
     #[error("equi-join match count is invalid: {0}")]
     InvalidMatchCount(&'static str),
     /// A matched-pair difference or an existence/NULL-row correction exceeds `i64`.
     #[error("equi-join output difference overflow")]
     OutputDifferenceOverflow,
-    /// Durable continuation is inconsistent with the pinned input Claim.
-    #[error("equi-join continuation is invalid: {0}")]
-    InvalidContinuation(&'static str),
+    /// Opaque resume is inconsistent with the immutable input.
+    #[error("equi-join resume is invalid: {0}")]
+    InvalidResume(&'static str),
     /// Exact canonical row encoding or decoding failed.
     #[error("equi-join canonical row processing failed")]
     CanonicalRow {

@@ -1,7 +1,4 @@
-use crate::{
-    Cell, DataHandle, DataKind, OrderedMap, OrderedMultiset, PartitionedMultiset, Queue, StoreKey,
-    StoreValue, SubscribedLog,
-};
+use crate::{Cell, DataHandle, DataKind, OrderedMap, Queue, StoreKey, StoreValue};
 
 /// A typed persistent data object that can be created and opened by [`crate::Store`].
 ///
@@ -35,13 +32,6 @@ macro_rules! impl_store_data {
 
 impl_store_data!(Cell<T>, DataKind::Cell; T: StoreValue);
 impl_store_data!(Queue<T>, DataKind::Queue; T: StoreValue);
-impl_store_data!(SubscribedLog<T>, DataKind::SubscribedLog; T: StoreValue);
-impl_store_data!(OrderedMultiset<K>, DataKind::OrderedMultiset; K: StoreKey);
-impl_store_data!(
-    PartitionedMultiset<P, K>,
-    DataKind::PartitionedMultiset;
-    P: StoreKey, K: StoreKey
-);
 impl_store_data!(
     OrderedMap<K, V>,
     DataKind::OrderedMap;

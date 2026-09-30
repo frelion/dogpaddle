@@ -17,7 +17,7 @@ pub struct OrderedMap<K, V> {
 
 /// Transaction-bound access to an [`OrderedMap`].
 pub struct OrderedMapAccess<'transaction, K, V> {
-    data: DataAccess<'transaction>,
+    pub(super) data: DataAccess<'transaction>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
@@ -34,7 +34,7 @@ pub struct OrderedMapAccess<'transaction, K, V> {
 /// }
 /// ```
 pub struct OrderedMapReadAccess<'transaction, K, V> {
-    data: ReadDataAccess<'transaction>,
+    pub(super) data: ReadDataAccess<'transaction>,
     _types: PhantomData<fn() -> (K, V)>,
 }
 
@@ -99,7 +99,21 @@ impl<K: StoreKey, V: StoreValue> OrderedMapAccess<'_, K, V> {
     ///
     /// Returns an error when key encoding, storage access, or value decoding fails.
     pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
-        read_map_value(self.data.as_read(), key)
+        self.get_bounded(key, usize::MAX)
+    }
+
+    /// Reads one value after admitting its encoded value length.
+    ///
+    /// The pinned value's length is checked before copying or decoding it.
+    /// The limit excludes the caller-owned lookup key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ItemTooLarge`] without poisoning when the value
+    /// exceeds `max_bytes`. Encoding, storage and decoding failures poison
+    /// the transaction.
+    pub fn get_bounded(&self, key: &K, max_bytes: usize) -> Result<Option<V>, StoreError> {
+        read_map_value_bounded(self.data.as_read(), key, max_bytes)
     }
 
     /// Inserts or replaces one value.
@@ -180,7 +194,21 @@ impl<K: StoreKey, V: StoreValue> OrderedMapReadAccess<'_, K, V> {
     ///
     /// Returns an error when key encoding, storage access or decoding fails.
     pub fn get(&self, key: &K) -> Result<Option<V>, StoreError> {
-        read_map_value(&self.data, key)
+        self.get_bounded(key, usize::MAX)
+    }
+
+    /// Reads one value after admitting its encoded value length.
+    ///
+    /// The pinned value's length is checked before copying or decoding it.
+    /// The limit excludes the caller-owned lookup key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ItemTooLarge`] without poisoning when the value
+    /// exceeds `max_bytes`. Encoding, storage and decoding failures poison
+    /// the transaction.
+    pub fn get_bounded(&self, key: &K, max_bytes: usize) -> Result<Option<V>, StoreError> {
+        read_map_value_bounded(&self.data, key, max_bytes)
     }
 
     /// Returns one fully decoded, owned page visible to this snapshot.
@@ -203,14 +231,13 @@ impl<K: StoreKey, V: StoreValue> OrderedMapReadAccess<'_, K, V> {
     }
 }
 
-fn read_map_value<K: StoreKey, V: StoreValue>(
+fn read_map_value_bounded<K: StoreKey, V: StoreValue>(
     data: &ReadDataAccess<'_>,
     key: &K,
+    max_bytes: usize,
 ) -> Result<Option<V>, StoreError> {
-    let encoded_key = data
-        .poison_on_error(key.encode_key())
-        .map_err(StoreError::from)?;
-    let encoded = data.get(encoded_key.as_ref())?;
+    let encoded_key = data.poison_on_error(key.encode_key())?;
+    let encoded = data.get_bounded(encoded_key.as_ref(), max_bytes)?;
     data.poison_on_error(
         encoded
             .map(|encoded| V::decode_value(Cow::Owned(encoded)))

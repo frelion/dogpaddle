@@ -17,6 +17,7 @@ use super::relation::RelationTarget;
 
 pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
+pub use runtime::{SinkPending, SinkPrepared};
 
 pub(crate) const CONTROL: &str = "sink.control";
 pub(crate) const BUFFER: &str = "sink.buffer";
@@ -29,10 +30,9 @@ pub(crate) fn construct<T: RelationTarget>(
     let control = scope.data::<Cell<Vec<u8>>>(CONTROL)?;
     let buffer = scope.data::<OrderedMap<u64, Vec<u8>>>(BUFFER)?;
     let codec = SchemaBoundChangeCodec::try_new(schema).map_err(schema_error)?;
-    Ok(ConstructedOperation::turn(
-        None,
-        BufferedSink::new(codec, target, control, buffer),
-    ))
+    Ok(ConstructedOperation::sink(BufferedSink::new(
+        codec, target, control, buffer,
+    )))
 }
 pub(crate) const MAX_TARGET_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 

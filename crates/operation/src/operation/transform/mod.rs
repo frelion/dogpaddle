@@ -15,9 +15,8 @@ pub use aggregate::{
     AggregateSchemaError,
 };
 pub use asof_join::{
-    AsOfDirection, AsOfEqualityKey, AsOfEqualityMode, AsOfEquidistantPreference,
-    AsOfJoinDefinition, AsOfJoinDefinitionError, AsOfJoinError, AsOfJoinKind, AsOfJoinSchemaError,
-    AsOfOrderKey, AsOfTieBreak, AsOfTieFallback,
+    AsOfDirection, AsOfEqualityKey, AsOfJoinDefinition, AsOfJoinDefinitionError, AsOfJoinError,
+    AsOfJoinSchemaError, AsOfOrderKey,
 };
 pub use distinct::{DistinctDefinition, DistinctError};
 pub use equi_join::{

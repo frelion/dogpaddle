@@ -1,125 +1,78 @@
+use crate::{assembly::construct, error::FlowError, flow::Flow};
+use dogpaddle_operation::{OperationDefinition, RuntimeResource};
+use dogpaddle_store::{Cell, StoreSetup};
 use std::{
     collections::BTreeMap,
-    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use dogpaddle_operation::{OperationDefinition, RuntimeResource};
-use dogpaddle_store::{Cell, StoreSetup};
-
-use crate::{
-    assembly::{assemble_flow, construct_stations},
-    error::FlowError,
-    flow::Flow,
-};
-
 pub(crate) mod codec;
 mod definition;
 mod open;
-mod validate;
-
+pub(crate) mod validate;
 pub use codec::FlowDefinitionError;
 pub(crate) use definition::FlowDefinition;
 pub(crate) use validate::ResolvedTopology;
-pub use validate::{InvalidStationIdReason, TopologyError};
-
+pub use validate::{InvalidOperationIdReason, TopologyError};
 static NEXT_FACTORY_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Factory for building or opening a persistent Flow.
-///
-/// Declaring Operations and their ordered inputs is side-effect free.
-/// [`FlowFactory::build`] validates the complete graph before creating the Store
-/// at the target path.
-/// [`FlowFactory::open`] restores an already-built Flow using only the path and
-/// any explicitly supplied runtime resources.
+/// Declares a logical DAG or reopens its immutable durable definition.
 pub struct FlowFactory {
     path: PathBuf,
     token: u64,
     owner_identity: Option<[u8; 32]>,
     operations: Vec<DeclaredOperation>,
-    output_capacity: NonZeroU64,
-    materializations: Vec<(OperationRef, NonZeroU64)>,
     resources: BTreeMap<String, RuntimeResource>,
 }
-
-/// Temporary reference to an Operation declared in one [`FlowFactory`].
-///
-/// A reference is valid only while assembling the factory that created it. The
-/// durable Flow definition stores the resulting Station programs instead.
+/// Temporary reference to an earlier Operation in this factory.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OperationRef {
     factory_token: u64,
     index: usize,
 }
-
 struct DeclaredOperation {
     id: String,
     definition: OperationDefinition,
     inputs: Vec<OperationRef>,
 }
-
 impl FlowFactory {
-    /// Starts a side-effect-free factory for building or opening a persistent Flow.
-    ///
+    /// Creates a side-effect-free factory.
     /// # Panics
-    ///
-    /// Panics if the process exhausts the nonzero factory-token space.
+    /// Panics only when the process exhausts factory identities.
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
         let token = NEXT_FACTORY_TOKEN.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(token, 0, "flow factory token space exhausted");
+        assert_ne!(token, 0, "factory token space exhausted");
         Self {
-            path: path.as_ref().to_path_buf(),
+            path: path.as_ref().to_owned(),
             token,
             owner_identity: None,
             operations: Vec::new(),
-            output_capacity: NonZeroU64::new(64 * 1024 * 1024).expect("nonzero default capacity"),
-            materializations: Vec::new(),
             resources: BTreeMap::new(),
         }
     }
-
-    /// Sets the opaque identity of the owner that declares or expects this Flow.
-    ///
-    /// Build persists this value inside the immutable Flow definition. Open
-    /// requires an exact match before binding Operations or runtime resources.
-    /// A factory whose owner identity is unset only matches a definition built
-    /// without one.
+    /// Sets the identity persisted at build and required exactly at open.
     pub fn owner_identity(&mut self, identity: [u8; 32]) -> &mut Self {
         self.owner_identity = Some(identity);
         self
     }
-
-    /// Supplies an ephemeral resource by stable Operation ID, for build or open.
-    ///
-    /// Resources are moved into Operations during assembly and never persisted.
-    /// Flow does not inspect their values or initialize external clients. Resources
-    /// must belong to the first Operation in a resulting Station; build rejects
-    /// resources addressed to fused tails.
-    ///
+    /// Supplies one ephemeral resource by stable logical Operation ID.
     /// # Errors
-    ///
-    /// Returns an error if the same ID is assigned more than one resource.
+    /// Returns an error when the ID already has a resource.
     pub fn resource<R: Send + 'static>(
         &mut self,
-        station_id: impl Into<String>,
+        id: impl Into<String>,
         resource: R,
     ) -> Result<&mut Self, FlowError> {
-        let station_id = station_id.into();
-        if self.resources.contains_key(&station_id) {
-            return Err(FlowError::DuplicateRuntimeResource { station_id });
+        let operation_id = id.into();
+        if self.resources.contains_key(&operation_id) {
+            return Err(FlowError::DuplicateRuntimeResource { operation_id });
         }
         self.resources
-            .insert(station_id, RuntimeResource::new(resource));
+            .insert(operation_id, RuntimeResource::new(resource));
         Ok(self)
     }
-
-    /// Declares an Operation and its complete, ordered inputs.
-    ///
-    /// Inputs must refer to Operations previously declared in this factory.
-    /// Build fuses eligible single-input atomic Operations automatically. Each
-    /// resulting Station takes its first Operation's stable ID.
+    /// Declares an Operation with ordered references to previously declared inputs.
     pub fn operation(
         &mut self,
         id: impl Into<String>,
@@ -137,109 +90,43 @@ impl FlowFactory {
         });
         reference
     }
-
-    /// Sets the retained-byte capacity for automatically created durable outputs.
-    ///
-    /// The default is 64 MiB. Only actual Station outputs persist a capacity.
-    /// An empty output may admit one larger Change to avoid permanent stalls.
-    /// This setting has no effect when opening an existing Flow.
-    pub fn output_capacity_bytes(&mut self, capacity: NonZeroU64) -> &mut Self {
-        self.output_capacity = capacity;
-        self
-    }
-
-    /// Requires a durable output after this Operation, with the given capacity.
-    ///
-    /// This prevents fusion across that output and establishes an explicit
-    /// transaction and backpressure boundary. Build rejects foreign references,
-    /// duplicate declarations, and Operations without an output.
-    pub fn materialize(&mut self, operation: OperationRef, capacity: NonZeroU64) -> &mut Self {
-        self.materializations.push((operation, capacity));
-        self
-    }
-
-    /// Validates the Flow, creates its data objects, and atomically publishes its definition.
-    ///
-    /// Pure topology validation and definition encoding finish before the Store
-    /// path is created. The encoded bytes are decoded as the canonical durable
-    /// Definition, all Operations are purely bound to exact Schemas, required
-    /// data objects are staged, and the complete catalog, initialized data, and
-    /// definition Cell are committed in one setup transaction.
-    ///
+    /// Validates and binds the graph before atomically publishing its complete catalog.
     /// # Errors
-    ///
-    /// Returns a [`FlowError`] for an invalid topology, Schema or runtime resource,
-    /// unencodable definition, occupied path, or Store failure. A Store failure
-    /// after path creation can leave an incomplete build that [`FlowFactory::open`]
-    /// refuses to open.
-    pub fn build(mut self) -> Result<Flow, FlowError> {
-        let resources = std::mem::take(&mut self.resources);
-        let path = self.path.clone();
-        let declared_definition = self.finish_definition()?;
-        let definition_bytes = codec::encode(&declared_definition)?;
-        let (definition, topology) =
-            codec::decode(&definition_bytes).map_err(|error| match error {
-                FlowDefinitionError::Topology(error) => FlowError::Topology(error),
-                error => FlowError::Definition(error),
-            })?;
-        let resources = preflight_resources(&definition, resources)?;
+    /// Returns topology, schema, resource or Store errors. Failed persistent creation
+    /// can leave an incomplete path; open never repairs or deletes it.
+    pub fn build(self) -> Result<Flow, FlowError> {
+        let definition =
+            validate::finish_definition(self.owner_identity, self.token, self.operations)?;
+        let encoded = codec::encode(&definition)?;
+        let (definition, topology) = codec::decode(&encoded)?;
+        let resources = preflight_resources(&definition, self.resources)?;
         let mut setup = StoreSetup::new();
         let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;
-        let station_parts =
-            construct_stations(&definition, &topology, &mut setup.data_scope(), resources)?;
-        let transactions = setup.commit(&path, |access| {
-            for (index, station) in station_parts.iter().enumerate() {
-                station.initialize(topology.subscriber_count(index), access)?;
-            }
-            let mut published = published.access(access)?;
-            published.set(&definition_bytes)?;
-            Ok(())
-        })?;
+        let mut runtime = construct(definition, topology, &mut setup.data_scope(), resources)?;
+        let transactions =
+            setup.commit(&self.path, |access| published.access(access)?.set(&encoded))?;
         let (transactions, reads) = transactions.split();
-        Ok(assemble_flow(
-            path,
-            &definition,
-            topology,
-            station_parts,
-            transactions,
-            reads,
-        ))
-    }
-
-    fn finish_definition(self) -> Result<FlowDefinition, TopologyError> {
-        validate::finish_definition(
-            self.owner_identity,
-            self.token,
-            self.operations,
-            self.output_capacity,
-            &self.materializations,
-        )
+        runtime.restore(reads.begin().access())?;
+        Ok(Flow::from_parts(self.path, runtime, transactions, reads))
     }
 }
 fn preflight_resources(
     definition: &FlowDefinition,
     mut resources: BTreeMap<String, RuntimeResource>,
 ) -> Result<Vec<RuntimeResource>, FlowError> {
-    let mut validated = Vec::with_capacity(definition.stations().len());
-    for station in definition.stations() {
-        let resource = resources.remove(station.id()).unwrap_or_default();
-        for (operation, operation_definition) in station.operations().iter().enumerate() {
-            let empty = RuntimeResource::default();
-            let operation_resource = if operation == 0 { &resource } else { &empty };
-            operation_definition
-                .validate_resource(operation_resource)
-                .map_err(|source| FlowError::RuntimeResource {
-                    station_id: station.id().to_owned(),
-                    source,
-                })?;
-        }
+    let mut validated = Vec::with_capacity(definition.operations.len());
+    for node in &definition.operations {
+        let resource = resources.remove(&node.id).unwrap_or_default();
+        node.definition
+            .validate_resource(&resource)
+            .map_err(|source| FlowError::RuntimeResource {
+                operation_id: node.id.clone(),
+                source,
+            })?;
         validated.push(resource);
     }
-    if let Some(station_id) = resources.into_keys().next() {
-        return Err(FlowError::UnknownRuntimeResource { station_id });
+    if let Some(operation_id) = resources.into_keys().next() {
+        return Err(FlowError::UnknownRuntimeResource { operation_id });
     }
     Ok(validated)
 }
-
-#[cfg(test)]
-mod tests;

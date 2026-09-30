@@ -141,7 +141,7 @@ struct DeliverySnapshot {
 }
 
 impl DeliverySnapshot {
-    fn capture(delivery: &Delivery<'_>) -> Self {
+    fn capture(delivery: &Delivery) -> Self {
         Self {
             checkpoint: delivery.checkpoint().as_bytes().to_vec(),
             records: delivery
@@ -311,7 +311,7 @@ impl Session {
             if observed != expected.delivery {
                 return Err(HostError::Usage("delivery changed before ACK".to_owned()));
             }
-            delivery.ack()?;
+            connector.ack(delivery)?;
         }
         self.outstanding = None;
         let mut response = self.status();

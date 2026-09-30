@@ -52,7 +52,6 @@ DOGPADDLE_PERF_ROOT=/absolute/reference-root \
 cargo bench --locked -p dogpaddle-change --bench change_codec
 ```
 
-Change 不要求持久化 fixture，但仍通过统一的绝对 reference root 保存运行上下文。真实
-Change + `SubscribedLog` 成本由 `integration-tests/change-store` 单独测量。不存在 plan、fingerprint、中央
-validator 或跨 target 结果 schema；不同 baseline epoch 的结果不可直接比较。全局规则见
+Change 不要求持久化 fixture，但仍通过统一的绝对 reference root 保存运行上下文。
+持久页的读写成本由 Flow 与 Operation 的 owner benchmark 测量。不同 baseline epoch 的结果不可直接比较。全局规则见
 [`TESTING.md`](../../TESTING.md)。

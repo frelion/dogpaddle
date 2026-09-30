@@ -1,13 +1,11 @@
 use dogpaddle_operation::operation::transform::SelectDefinition;
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{
-    Cell, Store, StoreError, SubscribedLog, SubscribedLogStatus, SubscriptionStatus,
-};
+use dogpaddle_store::{Cell, OrderedMap, Queue, Store, StoreError};
 
 use super::support::{
     build_scan_sink_and_read_definition, fixture_bytes, read_published_definition,
@@ -15,7 +13,7 @@ use super::support::{
 
 const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
     include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
-const V1_STATION_OPERATIONS: &str = include_str!("../fixtures/v1/station_operations.hex");
+const V1_LOGICAL_OPERATIONS: &str = include_str!("../fixtures/v1/logical_operations.hex");
 const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 
 #[derive(Clone, Copy)]
@@ -40,62 +38,58 @@ fn build_publishes_the_stable_v1_definition_bytes() {
 fn build_publishes_owner_identity_and_multiple_operations_in_stable_order() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    build_multi_operation_station(&path);
+    build_logical_operations(&path);
     assert_eq!(
         read_published_definition(&path),
-        fixture_bytes(V1_STATION_OPERATIONS)
+        fixture_bytes(V1_LOGICAL_OPERATIONS)
     );
 }
 
 #[test]
-fn build_uses_subscribed_outputs_and_only_materializes_multi_input_state() {
+fn build_uses_one_stack_and_operation_owned_source_queue() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     build_chain(&path);
     let store = Store::open(&path).unwrap();
-    let outputs: [SubscribedLog<Vec<u8>>; 2] = [
-        store.open_data("station/00000000/output").unwrap(),
-        store.open_data("station/00000001/output").unwrap(),
-    ];
-    let _running_event_count: Cell<u64> = store
-        .open_data("station/00000001/operation/00000000/running_event_count.count")
+    for name in ["flow/frames", "flow/outputs"] {
+        let map: OrderedMap<u32, Vec<u8>> = store.open_data(name).unwrap();
+        assert!(
+            map.read(store.read_transaction().access())
+                .unwrap()
+                .get(&0)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(matches!(
+        store.open_data::<Cell<Vec<u8>>>("flow/input"),
+        Err(StoreError::DataNotFound(_))
+    ));
+    assert!(matches!(
+        store.open_data::<OrderedMap<u32, Vec<u8>>>("flow/inputs"),
+        Err(StoreError::DataNotFound(_))
+    ));
+    let queue: Queue<Vec<u8>> = store
+        .open_data("operation/00000000/sequence_scan.published")
+        .unwrap();
+    assert!(
+        queue
+            .read(store.read_transaction().access())
+            .unwrap()
+            .is_empty()
+            .unwrap()
+    );
+    let _: Cell<u64> = store
+        .open_data("operation/00000001/running_event_count.count")
         .unwrap();
     assert!(matches!(
-        store.open_data::<SubscribedLog<Vec<u8>>>("station/00000002/output"),
-        Err(StoreError::DataNotFound(name)) if name == "station/00000002/output"
+        store.open_data::<Cell<u32>>("station/00000000/active-input"),
+        Err(StoreError::DataNotFound(_))
     ));
-    for index in 0..3 {
-        let name = format!("station/{index:08x}/active-input");
-        assert!(matches!(
-            store.open_data::<Cell<u32>>(&name),
-            Err(StoreError::DataNotFound(actual)) if actual == name
-        ));
-    }
-    let transaction = store.read_transaction();
-    for output in outputs {
-        output
-            .validate(NonZeroU64::MIN, transaction.access())
-            .unwrap();
-        assert_eq!(
-            output.writer().status(transaction.access()).unwrap(),
-            SubscribedLogStatus {
-                head: 0,
-                tail: 0,
-                retained_bytes: 0,
-            }
-        );
-        assert_eq!(
-            output.subscription(0).status(transaction.access()).unwrap(),
-            SubscriptionStatus {
-                position: 0,
-                tail: 0,
-            }
-        );
-    }
 }
 
 #[test]
-fn open_classifies_each_required_station_resource_fault() {
+fn open_classifies_each_required_source_resource_fault() {
     let root = tempfile::tempdir().unwrap();
     let definition = build_scan_sink_and_read_definition(&root.path().join("complete"));
     for (name, fault) in [
@@ -112,20 +106,20 @@ fn open_classifies_each_required_station_resource_fault() {
             ResourceFault::MissingOutput => assert!(matches!(
                 error,
                 FlowError::MissingResource { name }
-                    if name == "station/00000000/output"
+                    if name == "operation/00000000/sequence_scan.published"
             )),
             ResourceFault::MissingPosition => assert!(matches!(
                 error,
                 FlowError::MissingResource { name }
-                    if name == "station/00000000/operation/00000000/sequence_scan.position"
+                    if name == "operation/00000000/sequence_scan.position"
             )),
             ResourceFault::WrongOutputKind => assert!(matches!(
                 error,
                 FlowError::Store(StoreError::DataKindMismatch {
                     name,
-                    expected: "subscribed log",
+                    expected: "queue",
                     actual: "cell",
-                }) if name == "station/00000000/output"
+                }) if name == "operation/00000000/sequence_scan.published"
             )),
         }
     }
@@ -134,32 +128,26 @@ fn open_classifies_each_required_station_resource_fault() {
 fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault) {
     let mut store = Store::create(path).unwrap();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let output = match fault {
-        ResourceFault::MissingOutput => None,
+    match fault {
+        ResourceFault::MissingOutput => {}
         ResourceFault::WrongOutputKind => {
             store
-                .create_data::<Cell<Vec<u8>>>("station/00000000/output")
+                .create_data::<Cell<Vec<u8>>>("operation/00000000/sequence_scan.published")
                 .unwrap();
-            None
         }
-        ResourceFault::MissingPosition => Some(
+        ResourceFault::MissingPosition => {
             store
-                .create_data::<SubscribedLog<Vec<u8>>>("station/00000000/output")
-                .unwrap(),
-        ),
-    };
+                .create_data::<Queue<Vec<u8>>>("operation/00000000/sequence_scan.published")
+                .unwrap();
+        }
+    }
     if !matches!(fault, ResourceFault::MissingPosition) {
         store
-            .create_data::<Cell<u64>>("station/00000000/operation/00000000/sequence_scan.position")
+            .create_data::<Cell<u64>>("operation/00000000/sequence_scan.position")
             .unwrap();
     }
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
-    if let Some(output) = output {
-        output
-            .initialize(NonZeroU64::MIN, transaction.access())
-            .unwrap();
-    }
     published
         .access(transaction.access())
         .unwrap()
@@ -189,12 +177,10 @@ fn build_chain(path: &Path) {
     let count = builder.operation("count", RunningEventCountDefinition::new(), [scan]);
     builder.operation("sink", DiscardDefinition::new(), [count]);
 
-    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
-    builder.materialize(count, NonZeroU64::new(2_048).unwrap());
     drop(builder.build().unwrap());
 }
 
-fn build_multi_operation_station(path: &Path) {
+fn build_logical_operations(path: &Path) {
     let mut builder = FlowFactory::new(path);
     builder.owner_identity(OWNER_IDENTITY);
     let scan = builder.operation("scan", SequenceScanDefinition::new(7), []);
@@ -211,6 +197,5 @@ fn build_multi_operation_station(path: &Path) {
     );
 
     builder.operation("sink", DiscardDefinition::new(), [scan]);
-    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 }

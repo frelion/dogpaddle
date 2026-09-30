@@ -205,3 +205,13 @@ impl StoreValue for () {
         }
     }
 }
+
+impl StoreValue for std::num::NonZeroU64 {
+    fn encode_value(&self) -> Result<impl AsRef<[u8]>, CodecError> {
+        Ok(self.get().to_be_bytes())
+    }
+    fn decode_value(bytes: Cow<'_, [u8]>) -> Result<Self, CodecError> {
+        Self::new(u64::decode_value(bytes)?)
+            .ok_or_else(|| CodecError::new("stored positive weight is zero"))
+    }
+}

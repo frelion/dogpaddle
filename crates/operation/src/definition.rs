@@ -8,7 +8,9 @@ use thiserror::Error;
 
 use crate::{
     RuntimeResource,
-    operation::{AtomicOperation, Operation, TurnOperation, scan, sink, transform},
+    operation::{
+        AtomicOperation, Operation, SinkOperation, SourceOperation, scan, sink, transform,
+    },
 };
 
 /// Type-erased error from a concrete operation's pure Schema compiler.
@@ -16,16 +18,16 @@ pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
 
 const TWO_INPUTS: NonZeroU32 = NonZeroU32::new(2).expect("two is nonzero");
 
-/// Declared execution role, exact input arity, and station-fusion capability of an operation.
+/// Declared execution role and exact input arity of an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OperationKind {
-    /// Zero-input source driven by turns.
+    /// Zero-input source with a dedicated capture protocol.
     Scan,
     /// Transaction-local transform with the given nonzero input arity.
     AtomicTransform(NonZeroU32),
-    /// Turn-based transform that may head an atomic tail.
-    TurnTransform(NonZeroU32),
+    /// Paged transform that may head an atomic tail.
+    PagedTransform(NonZeroU32),
     /// Outputless terminal operation.
     Sink(NonZeroU32),
 }
@@ -35,7 +37,7 @@ impl OperationKind {
     pub const fn input_count(self) -> u32 {
         match self {
             Self::Scan => 0,
-            Self::AtomicTransform(n) | Self::TurnTransform(n) | Self::Sink(n) => n.get(),
+            Self::AtomicTransform(n) | Self::PagedTransform(n) | Self::Sink(n) => n.get(),
         }
     }
 
@@ -51,19 +53,10 @@ impl OperationKind {
         matches!(self, Self::Sink(_))
     }
 
-    /// Returns whether this kind completely consumes one input Change in the current transaction.
+    /// Returns whether this kind completely consumes its offered input slice in the current transaction.
     #[must_use]
     pub const fn is_atomic(self) -> bool {
         matches!(self, Self::AtomicTransform(_))
-    }
-
-    /// Returns whether this kind may lead a Station's atomic tail.
-    #[must_use]
-    pub const fn allows_atomic_tail(self) -> bool {
-        matches!(
-            self,
-            Self::Scan | Self::AtomicTransform(_) | Self::TurnTransform(_)
-        )
     }
 
     /// Returns whether this kind owns an output stream.
@@ -232,10 +225,16 @@ impl ConstructedOperation {
         }
     }
 
-    pub(crate) fn turn(schema: Option<SchemaRef>, op: impl TurnOperation) -> Self {
+    pub(crate) fn source(schema: Option<SchemaRef>, op: impl SourceOperation) -> Self {
         Self {
-            operation: Operation::Turn(Box::new(op)),
+            operation: Operation::Source(Box::new(op)),
             output_schema: schema,
+        }
+    }
+    pub(crate) fn sink(op: impl SinkOperation) -> Self {
+        Self {
+            operation: Operation::Sink(Box::new(op)),
+            output_schema: None,
         }
     }
 
@@ -267,7 +266,7 @@ impl OperationDefinition {
             Self::MySqlCdcScan(_) | Self::PostgresCdcScan(_) | Self::SequenceScan(_) => {
                 OperationKind::Scan
             }
-            Self::AsOfJoin(_) | Self::EquiJoin(_) => OperationKind::TurnTransform(TWO_INPUTS),
+            Self::AsOfJoin(_) | Self::EquiJoin(_) => OperationKind::PagedTransform(TWO_INPUTS),
             Self::UnionAll(definition) => OperationKind::AtomicTransform(definition.input_count()),
             Self::Aggregate(_)
             | Self::Distinct(_)
@@ -436,10 +435,9 @@ impl OperationDefinition {
         if !matches!(
             (kind, &built.operation),
             (OperationKind::AtomicTransform(_), Operation::Atomic(_))
-                | (
-                    OperationKind::Scan | OperationKind::TurnTransform(_) | OperationKind::Sink(_),
-                    Operation::Turn(_),
-                )
+                | (OperationKind::Scan, Operation::Source(_))
+                | (OperationKind::PagedTransform(_), Operation::Paged(_))
+                | (OperationKind::Sink(_), Operation::Sink(_))
         ) {
             return Err(OperationSetupError::ExecutionKind);
         }

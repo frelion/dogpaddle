@@ -66,8 +66,8 @@ A -1, A +1
 diff 提前相加。Operation 必须从第零行开始依次观察。
 
 如果只比较一条合法事件流展平后的关系结果，大批次可以拆成多个 `Change`，多个小批次也可以合并，
-前提是行与 diff 的顺序完全相同。但 `Change` 同时是一次事务、确认和重试的输入单位；重批会改变哪些
-前缀可以先提交，遇到非法撤回等错误时也会改变失败边界，因此运行层不能静默重批后声称事务行为不变。
+前提是行与 diff 的顺序完全相同。运行层可以按明确的页界分批提交；这会改变哪些前缀可以先提交，以及非法撤回等错误的回滚边界。
+`Change` 本身不承诺整批事务或外部确认，具体边界由调用它的执行层定义。
 日志 offset 加行号只是当前分批方式下的位置，不能当作长期稳定的事件 ID。
 
 `Change` 也没有事件时间、watermark、来源 offset 或已物化关系。它只回答：这批记录按什么顺序，
@@ -76,9 +76,9 @@ diff 提前相加。Operation 必须从第零行开始依次观察。
 有效事件流要求每条记录的「应用前权重 + 已处理前缀累计 diff」非负，维护关系的组件负责报错与回滚。
 Aggregate 不保留完整输入行，只按分组与调用参数检查被跟踪权重，具体例外由 [关系算子契约](../operation/docs/relations.md#aggregate) 定义。
 
-每个端口稳定重批必须逐项保持展平事件序列；Operation 的展平输出和最终业务状态必须同时对稳定重批及同一 Change 的重复 Commit turn 切分不变。
+每个端口稳定重批必须逐项保持展平事件序列；Operation 的展平输出和最终业务状态必须同时对稳定重批及同一 Change 的分页切分不变。
 只有显式窗口、barrier 或 flush 才能引入额外语义边界。跨端口明确无序的算子只要求每端口子序列和最终关系不变，当前 `UnionAll` 采用此契约。
-比较域内每种分批都必须能由声明 Arrow 类型表示。Subscription offset 仅定位完整 Change，片段内 continuation 由 Operation 自己的持久状态拥有。
+比较域内每种分批都必须能由声明 Arrow 类型表示。分页位置由 Operation 返回给调用方；Flow 将位置保存于调用帧，输入仍由 Source 队首或父调用的输出页拥有。
 
 ## Schema 是完整契约
 
@@ -161,13 +161,13 @@ value 等值级约束不会被读取和验证；需要审计全部内容时使�
 
 ```text
 Operation ──产生/消费──> Change
-Flow      ──编码并路由──> 每条 Station output log
+Flow      ──编码并路由──> 挂起调用的输出页
 Store     ──只保存──────> Vec<u8>
 ```
 
 这个 crate 不依赖 Operation、Flow 或 Store。反过来，Operation 用内存中的 `Change` 表达输入输出；
-Flow 把它编码后放入持久日志；Store 看到的只是字节。这个依赖方向让 Arrow 数据契约不需要知道
-事务、拓扑、subscriber 或 `RocksDB` key。
+Flow 在需要跨事务保留数据时编码；Store 看到的只是字节。这个依赖方向让 Arrow 数据契约不需要知道
+事务、拓扑或 `RocksDB` key。
 
 ## 持久化格式
 
@@ -231,9 +231,8 @@ entry。
 两种 codec 的职责不同：[`encode_change`]/[`decode_change`] 用于没有可信外部 Schema 上下文、需要单条
 自描述 Arrow Stream 的边界，[`decode_change_projected`] 也只读取这种自描述格式；
 [`SchemaBoundChangeCodec`] 用于一个持久资源已经由 exact Schema 拥有、会连续保存许多 Change 的边界。
-Flow 的 Station output 使用后一种格式，producer 与全部 input edge 共享同一个 bound codec，并完整解码
-Claim，不按 subscriber 做 projected decode。最慢订阅者决定 entry 何时回收；订阅位置、容量和回收属于
-Flow 与 Store 的职责。
+Source 队列、Flow 挂起页和 Sink outbox 使用后一种格式。Flow 为每个逻辑输出绑定 codec，
+恢复输入时完整解码；子调用直接读取父调用保存的页。页的保留、容量和回收由其 owner 负责。
 
 ## 从哪里继续读
 
@@ -256,5 +255,4 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-change --bench change_code
 ```
 
 工作区测试分层见 [`TESTING.md`](../../TESTING.md)，Change 单体 benchmark 的 workload 与结果解释见
-[`PERFORMANCE.md`](PERFORMANCE.md)。真实的 `Change + SubscribedLog<Vec<u8>>` 接缝由
-[`integration-tests/change-store/`](../../integration-tests/change-store/) 从公共 API 验证。
+[`PERFORMANCE.md`](PERFORMANCE.md)。持久页的组合与恢复由 Flow 和 Operation 的 owner 测试验证。

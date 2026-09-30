@@ -13,7 +13,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
     operation::{
-        Action, Operation, OperationInput, Turn,
+        Operation, OperationInput, Progress, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinKind},
     },
 };
@@ -31,7 +31,7 @@ struct Fixture {
 }
 
 #[derive(Default)]
-struct ClaimResult {
+struct InputResult {
     output_rows: usize,
     turns: usize,
     positive_rows: usize,
@@ -73,46 +73,40 @@ impl Fixture {
         }
     }
 
-    fn apply(&mut self, port: usize, change: &Change) -> ClaimResult {
+    fn apply(&mut self, port: usize, change: &Change) -> InputResult {
         self.apply_inner(port, change, false)
     }
 
-    fn apply_checked(&mut self, port: usize, change: &Change) -> ClaimResult {
+    fn apply_checked(&mut self, port: usize, change: &Change) -> InputResult {
         self.apply_inner(port, change, true)
     }
 
-    fn apply_inner(&mut self, port: usize, change: &Change, check_diffs: bool) -> ClaimResult {
-        let mut result = ClaimResult::default();
+    fn apply_inner(&mut self, port: usize, change: &Change, check_diffs: bool) -> InputResult {
+        let mut result = InputResult::default();
+        let mut resume = self.operation.initial_resume();
         loop {
-            let Turn::Ready(prepared) = self
-                .operation
-                .turn(Some(OperationInput { port, change }))
-                .expect("prepare equi-join")
-            else {
-                panic!("equi-join must be ready")
-            };
             let transaction = self.transactions.begin();
-            let (action, completion) = prepared
-                .apply(transaction.access())
-                .expect("apply equi-join");
-            transaction.commit().expect("commit equi-join");
-            completion.run().expect("complete equi-join");
+            let step = self
+                .operation
+                .step(
+                    OperationInput { port, change },
+                    &resume,
+                    transaction.access(),
+                    &mut StepBudget::new(256, 4 * 1024 * 1024),
+                )
+                .expect("apply equi-join page");
+            transaction.commit().expect("commit equi-join page");
             result.turns += 1;
-            match action {
-                Action::Commit(output) => {
-                    result.record(output.as_ref(), check_diffs);
-                }
-                Action::Complete(output) => {
-                    result.record(output.as_ref(), check_diffs);
-                    return result;
-                }
-                Action::Idle => panic!("equi-join returned Idle for a pinned input"),
+            result.record(step.output.as_ref(), check_diffs);
+            match step.progress {
+                Progress::More(next) => resume = next,
+                Progress::Done => return result,
             }
         }
     }
 }
 
-impl ClaimResult {
+impl InputResult {
     fn record(&mut self, output: Option<&Change>, check_diffs: bool) {
         let Some(output) = output else {
             return;
@@ -151,13 +145,13 @@ fn right_toggle(schema: &SchemaRef, value: i64) -> (Change, Change) {
     )
 }
 
-fn validate_pair(first: &ClaimResult, second: &ClaimResult, expected_rows: usize) {
+fn validate_pair(first: &InputResult, second: &InputResult, expected_rows: usize) {
     assert_eq!(first.output_rows + second.output_rows, expected_rows);
     assert!(first.turns > 0);
     assert!(second.turns > 0);
 }
 
-fn validate_directions(first: &ClaimResult, second: &ClaimResult, expected: [(usize, usize); 2]) {
+fn validate_directions(first: &InputResult, second: &InputResult, expected: [(usize, usize); 2]) {
     assert_eq!((first.positive_rows, first.negative_rows), expected[0]);
     assert_eq!((second.positive_rows, second.negative_rows), expected[1]);
 }
@@ -177,8 +171,8 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "two complete Claims, all paged turns, synchronous commits, AfterCommit",
-            "throughput_unit": "Claims (two per timed iteration)",
+            "timed_boundary": "two complete immutable inputs, including every Operation::step page and synchronous transaction commit",
+            "throughput_unit": "complete inputs (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
             "cases": {
                 "inner_first_last_match": "Inner control without key-count traffic",
@@ -195,7 +189,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
             },
             "residual_workloads": {
                 "predicate": "left.value < right.value for every residual case; the driving right.value changes selectivity without changing the expression shape",
-                "scope": "one timed iteration is a +1 Claim followed by its -1 Claim; right-stable keeps one identical right row present, left-stable keeps the left row and a right fanout present",
+                "scope": "one timed iteration is a +1 input followed by its -1 input; right-stable keeps one identical right row present, left-stable keeps the left row and a right fanout present",
                 "scanning_case_candidate_pairs_per_iteration": 2 * fanout,
                 "scanning_case_predicate_candidate_evaluations_per_iteration": 2 * fanout,
                 "selectivity_cases": [0.0, 0.5, 1.0],
@@ -211,7 +205,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                     "left_semi_residual_left_presence_stable": {
                         "candidate_scans_per_iteration": 0,
                         "match_count_writes_per_iteration": 0,
-                        "match_count_reads": "constant per Claim, independent of right fanout"
+                        "match_count_reads": "constant per input event, independent of right fanout"
                     },
                     "left_semi_residual_partial_transition": {
                         "tracked_sides_per_qualifying_pair": 1,

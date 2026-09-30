@@ -1,12 +1,12 @@
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
-use dogpaddle_flow::{FlowError, FlowFactory, InvalidStationIdReason, OperationRef, TopologyError};
+use dogpaddle_flow::{
+    FlowError, FlowFactory, InvalidOperationIdReason, OperationRef, TopologyError,
+};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
 use dogpaddle_store::{Cell, Store, StoreError};
-
-const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024).unwrap();
 
 #[derive(Clone, Copy, Debug)]
 enum InvalidCase {
@@ -15,10 +15,7 @@ enum InvalidCase {
     NulId,
     NonScanRoot,
     ScanTerminal,
-    UnexpectedCapacity,
-    DuplicateCapacity,
-    ForeignCapacity,
-    SinkFeedsStation,
+    SinkFeedsOperation,
     ForeignConnection,
 }
 
@@ -31,10 +28,7 @@ fn every_topology_rejection_is_precise_and_has_no_store_side_effect() {
         InvalidCase::NulId,
         InvalidCase::NonScanRoot,
         InvalidCase::ScanTerminal,
-        InvalidCase::UnexpectedCapacity,
-        InvalidCase::DuplicateCapacity,
-        InvalidCase::ForeignCapacity,
-        InvalidCase::SinkFeedsStation,
+        InvalidCase::SinkFeedsOperation,
         InvalidCase::ForeignConnection,
     ] {
         let path = root.path().join(format!("{case:?}"));
@@ -53,16 +47,16 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
         InvalidCase::Empty => TopologyError::EmptyTopology,
         InvalidCase::EmptyId => {
             builder.operation("", SequenceScanDefinition::new(0), []);
-            TopologyError::InvalidStationId {
+            TopologyError::InvalidOperationId {
                 id: String::new(),
-                reason: InvalidStationIdReason::Empty,
+                reason: InvalidOperationIdReason::Empty,
             }
         }
         InvalidCase::NulId => {
             builder.operation("contains\0nul", SequenceScanDefinition::new(0), []);
-            TopologyError::InvalidStationId {
+            TopologyError::InvalidOperationId {
                 id: "contains\0nul".to_owned(),
-                reason: InvalidStationIdReason::ContainsNul,
+                reason: InvalidOperationIdReason::ContainsNul,
             }
         }
         InvalidCase::NonScanRoot => {
@@ -70,7 +64,7 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
             builder.operation("sink", DiscardDefinition::new(), [count]);
 
             TopologyError::InputCount {
-                station: "count".to_owned(),
+                operation: "count".to_owned(),
                 expected: 1,
                 actual: 0,
             }
@@ -80,34 +74,15 @@ fn invalid_topology(case: InvalidCase, path: &Path, root: &Path) -> (FlowFactory
             TopologyError::TerminalIsNotSink("scan".to_owned())
         }
 
-        InvalidCase::UnexpectedCapacity => {
-            let (scan, sink) = scan_sink(&mut builder);
-            builder.materialize(scan, CAPACITY);
-            builder.materialize(sink, CAPACITY);
-            TopologyError::UnexpectedOutputCapacity("sink".to_owned())
-        }
-        InvalidCase::DuplicateCapacity => {
-            let (scan, _) = scan_sink(&mut builder);
-            builder.materialize(scan, CAPACITY);
-            builder.materialize(scan, CAPACITY);
-            TopologyError::OutputCapacityAlreadySet("scan".to_owned())
-        }
-        InvalidCase::ForeignCapacity => {
-            let foreign = foreign_scan(root);
-            let (scan, _) = scan_sink(&mut builder);
-            builder.materialize(scan, CAPACITY);
-            builder.materialize(foreign, CAPACITY);
-            TopologyError::ForeignOperationRef(foreign)
-        }
-        InvalidCase::SinkFeedsStation => {
+        InvalidCase::SinkFeedsOperation => {
             let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
             let sink = builder.operation("sink", DiscardDefinition::new(), [scan]);
             let count = builder.operation("count", RunningEventCountDefinition::new(), [sink]);
             builder.operation("terminal", DiscardDefinition::new(), [count]);
 
             TopologyError::InputHasNoOutput {
-                input_station: "sink".to_owned(),
-                station: "count".to_owned(),
+                input: "sink".to_owned(),
+                operation: "count".to_owned(),
             }
         }
         InvalidCase::ForeignConnection => {
@@ -150,8 +125,7 @@ fn build_rejects_an_occupied_path_without_mutating_it() {
     drop(transactions);
 
     let mut builder = FlowFactory::new(&path);
-    let (scan, _) = scan_sink(&mut builder);
-    builder.materialize(scan, CAPACITY);
+    scan_sink(&mut builder);
     assert!(matches!(
         build_error(builder),
         FlowError::Store(StoreError::PathExists(actual)) if actual == path
@@ -180,4 +154,43 @@ fn build_error(builder: FlowFactory) -> FlowError {
         panic!("invalid Flow unexpectedly built");
     };
     error
+}
+
+#[test]
+fn depth_limit_counts_durable_calls_after_fusion_and_rejects_before_creation() {
+    use dogpaddle_operation::operation::transform::UnionAllDefinition;
+    let root = tempfile::tempdir().unwrap();
+    for depth in [64, 65] {
+        let path = root.path().join(format!("depth-{depth}"));
+        let mut factory = FlowFactory::new(&path);
+        let mut tail = factory.operation("source", SequenceScanDefinition::new(0), []);
+        for index in 1..depth {
+            tail = factory.operation(
+                format!("union-{index}"),
+                UnionAllDefinition::new(std::num::NonZeroU32::new(2).unwrap()),
+                [tail, tail],
+            );
+        }
+        factory.operation("sink", DiscardDefinition::new(), [tail]);
+        if depth == 64 {
+            assert!(factory.build().is_ok());
+        } else {
+            assert!(matches!(
+                factory.build(),
+                Err(FlowError::Topology(TopologyError::Limit("64 call frames")))
+            ));
+            assert!(!path.exists());
+        }
+    }
+    let mut factory = FlowFactory::new(root.path().join("fused"));
+    let mut tail = factory.operation("source", SequenceScanDefinition::new(0), []);
+    for index in 0..128 {
+        tail = factory.operation(
+            format!("count-{index}"),
+            RunningEventCountDefinition::new(),
+            [tail],
+        );
+    }
+    factory.operation("sink", DiscardDefinition::new(), [tail]);
+    assert_eq!(factory.build().unwrap().operation_count(), 130);
 }

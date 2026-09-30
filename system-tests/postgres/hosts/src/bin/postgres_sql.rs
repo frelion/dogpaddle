@@ -68,19 +68,10 @@ fn advance_response(
     flow: &dogpaddle_flow::Flow,
     outcome: dogpaddle_flow::AdvanceOutcome,
 ) -> Result<serde_json::Value, HostError> {
-    let sink = flow
-        .status()?
-        .into_iter()
-        .find(|station| station.id == "sql/sink")
-        .ok_or("SQL Flow has no sql/sink Station")?;
-    let [input] = sink.inputs.as_slice() else {
-        return Err("SQL sink must have exactly one input".into());
-    };
-    Ok(json!({
-        "kind": "advance",
-        "outcome": format!("{outcome:?}"),
-        "sink": {"position": input.position, "tail": input.tail},
-    }))
+    let status = flow.status()?;
+    Ok(
+        json!({"kind": "advance", "outcome": format!("{outcome:?}"), "flow": {"depth": status.depth, "active_operation": status.active_operation, "sending": status.sending, "needs_reopen": status.needs_reopen}}),
+    )
 }
 
 fn respond(value: &serde_json::Value) -> Result<(), HostError> {

@@ -1,50 +1,41 @@
-use dogpaddle_operation::operation::transform::SelectDefinition;
-use std::num::{NonZeroU32, NonZeroU64};
-
 use dogpaddle_flow::{FlowError, FlowFactory};
-use dogpaddle_operation::operation::{
-    scan::SequenceScanDefinition, sink::DiscardDefinition, transform::UnionAllDefinition,
+use dogpaddle_operation::{
+    col,
+    operation::{
+        scan::SequenceScanDefinition,
+        sink::DiscardDefinition,
+        transform::{RunningEventCountDefinition, SelectDefinition, UnionAllDefinition},
+    },
 };
+use dogpaddle_store::{Cell, Store};
+use std::num::NonZeroU32;
 
 #[test]
-fn default_fusion_and_capacity_survive_open_without_replanning() {
+fn fusion_preserves_every_logical_identity_on_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     let project = factory.operation(
         "project",
-        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        SelectDefinition::try_new([("value", col("value"))]).unwrap(),
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [project]);
     let flow = factory.build().unwrap();
-    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["scan", "sink"]);
     assert_eq!(
-        flow.status().unwrap()[0]
-            .output
-            .as_ref()
-            .unwrap()
-            .capacity_bytes,
-        64 * 1024 * 1024
+        flow.operation_ids().collect::<Vec<_>>(),
+        ["scan", "project", "sink"]
     );
     drop(flow);
-    let mut opener = FlowFactory::new(&path);
-    opener.output_capacity_bytes(NonZeroU64::MIN);
-    let flow = opener.open().unwrap();
-    assert_eq!(flow.station_ids().collect::<Vec<_>>(), ["scan", "sink"]);
+    let flow = FlowFactory::new(path).open().unwrap();
     assert_eq!(
-        flow.status().unwrap()[0]
-            .output
-            .as_ref()
-            .unwrap()
-            .capacity_bytes,
-        64 * 1024 * 1024
+        flow.operation_ids().collect::<Vec<_>>(),
+        ["scan", "project", "sink"]
     );
 }
-
 #[test]
-fn repeated_producer_ports_have_independent_subscriptions() {
+fn repeated_producer_ports_call_each_input_once() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
@@ -54,54 +45,42 @@ fn repeated_producer_ports_have_independent_subscriptions() {
         UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
         [scan, scan],
     );
-    let project = factory.operation(
-        "project",
-        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
-        [union],
-    );
-    factory.operation("sink", DiscardDefinition::new(), [project]);
+    let count = factory.operation("count", RunningEventCountDefinition::new(), [union]);
+    factory.operation("sink", DiscardDefinition::new(), [count]);
     let mut flow = factory.build().unwrap();
-    assert_eq!(
-        flow.station_ids().collect::<Vec<_>>(),
-        ["scan", "union", "sink"]
-    );
     flow.advance().unwrap();
-    let status = flow.status().unwrap();
-    assert_eq!(status[1].inputs.len(), 2);
-    assert_eq!(
-        status[1]
-            .inputs
-            .iter()
-            .map(|input| input.position)
-            .sum::<u64>(),
-        1
-    );
     drop(flow);
     let mut flow = FlowFactory::new(&path).open().unwrap();
-    flow.advance().unwrap();
-    assert!(
-        flow.status().unwrap()[1]
-            .inputs
-            .iter()
-            .all(|input| input.position == 1)
+    super::support::run_until_idle(&mut flow);
+    drop(flow);
+    let store = Store::open(path).unwrap();
+    let count: Cell<u64> = store
+        .open_data("operation/00000002/running_event_count.count")
+        .unwrap();
+    assert_eq!(
+        count
+            .read(store.read_transaction().access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(2)
     );
 }
-
 #[test]
-fn resource_on_absorbed_operation_is_rejected_before_creating_store() {
+fn unexpected_resource_on_fused_tail_is_rejected_before_creating_store() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = FlowFactory::new(&path);
     let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     let project = factory.operation(
         "project",
-        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
+        SelectDefinition::try_new([("value", col("value"))]).unwrap(),
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [project]);
     factory.resource("project", 42_u64).unwrap();
     assert!(
-        matches!(factory.build(), Err(FlowError::UnknownRuntimeResource { station_id }) if station_id == "project")
+        matches!(factory.build(),Err(FlowError::RuntimeResource{operation_id,..}) if operation_id=="project")
     );
     assert!(!path.exists());
 }

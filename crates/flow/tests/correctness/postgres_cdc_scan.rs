@@ -1,6 +1,6 @@
 use std::{num::NonZeroU64, path::Path};
 
-use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
+use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::{
     OperationSetupError,
     operation::{
@@ -45,22 +45,21 @@ fn factory(path: &Path, field: &str) -> FlowFactory {
     let scan = factory.operation("pg", definition, []);
     factory.operation("sink", DiscardDefinition::new(), [scan]);
 
-    factory.materialize(scan, NonZeroU64::new(1024).unwrap());
     factory
 }
 
 #[test]
-fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creation() {
+fn postgres_cdc_scan_resource_errors_are_operation_scoped_and_precede_store_creation() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let Err(FlowError::RuntimeResource {
-        station_id,
+        operation_id,
         source: OperationSetupError::MissingRuntimeResource,
     }) = factory(&path, "id").build()
     else {
         panic!("missing resource")
     };
-    assert_eq!(station_id, "pg");
+    assert_eq!(operation_id, "pg");
     assert!(!path.exists());
     let mut wrong = factory(&path, "id");
     wrong.resource("pg", 42_u64).unwrap();
@@ -79,7 +78,7 @@ fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creati
         .resource("typo", config())
         .unwrap();
     assert!(
-        matches!(extra.build(), Err(FlowError::UnknownRuntimeResource { station_id }) if station_id == "typo")
+        matches!(extra.build(), Err(FlowError::UnknownRuntimeResource { operation_id }) if operation_id == "typo")
     );
     assert!(!path.exists());
     let mut duplicate = factory(&path, "id");
@@ -91,26 +90,25 @@ fn postgres_cdc_scan_resource_errors_are_station_scoped_and_precede_store_creati
 }
 
 #[test]
-fn postgres_cdc_scan_schema_failure_is_pure_and_identifies_the_station() {
+fn postgres_cdc_scan_schema_failure_is_pure_and_identifies_the_operation() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = factory(&path, "$dogpaddle.reserved");
     factory.resource("pg", config()).unwrap();
-    let Err(FlowError::Schema { station_id, .. }) = factory.build() else {
+    let Err(FlowError::Schema { operation_id, .. }) = factory.build() else {
         panic!("invalid bound schema")
     };
-    assert_eq!(station_id, "pg");
+    assert_eq!(operation_id, "pg");
     assert!(!path.exists());
 }
 
 #[test]
-fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
+fn postgres_cdc_scan_build_and_open_need_neither_postgres_nor_jvm() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut factory = factory(&path, "id");
     factory.resource("pg", config()).unwrap();
-    let mut flow = factory.build().unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    let flow = factory.build().unwrap();
     drop(flow);
     assert!(matches!(
         FlowFactory::new(&path).open(),
@@ -121,19 +119,18 @@ fn postgres_cdc_scan_build_open_and_first_turn_need_neither_postgres_nor_jvm() {
     ));
     let mut factory = FlowFactory::new(&path);
     factory.resource("pg", config()).unwrap();
-    let mut flow = factory.open().unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    let flow = factory.open().unwrap();
     drop(flow);
     let store = dogpaddle_store::Store::open(&path).unwrap();
     let definition: dogpaddle_store::Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
     let phase: dogpaddle_store::Cell<u32> = store
-        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.phase")
+        .open_data("operation/00000000/postgres_cdc_scan.phase")
         .unwrap();
     let checkpoint: dogpaddle_store::Cell<Vec<u8>> = store
-        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.checkpoint")
+        .open_data("operation/00000000/postgres_cdc_scan.checkpoint")
         .unwrap();
     let spool: dogpaddle_store::Queue<Vec<u8>> = store
-        .open_data("station/00000000/operation/00000000/postgres_cdc_scan.bootstrap_spool")
+        .open_data("operation/00000000/postgres_cdc_scan.bootstrap_spool")
         .unwrap();
     {
         let transaction = store.read_transaction();
@@ -187,7 +184,6 @@ fn open_rejects_new_topology_and_self_contained_operations_reject_resources() {
     let mut build = FlowFactory::new(&path);
     let scan = build.operation("scan", SequenceScanDefinition::new(0), []);
     build.operation("sink", DiscardDefinition::new(), [scan]);
-    build.materialize(scan, NonZeroU64::new(1024).unwrap());
 
     build.resource("scan", config()).unwrap();
     assert!(matches!(

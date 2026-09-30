@@ -6,7 +6,7 @@
 ## SQLite
 
 SqliteSink 的 tag 是 10，只接受绝对 UTF-8 文件路径和新的非保留目标表名。
-构造只编译精确 Schema 对应的 `STRICT` 表布局、SQL 和行编码，连接与建表延迟到 turn；不得在 SQLite 中增加元数据表或保存整行 canonical bytes。
+构造只编译精确 Schema 对应的 `STRICT` 表布局、SQL 和行编码，连接与建表延迟到事务外 prepare/deliver；不得在 SQLite 中增加元数据表或保存整行 canonical bytes。
 所有当前 DogPaddle v1 类型都必须无损映射。
 运行实例把 SQLite target 与 crate 私有 relation planner 装入下述唯一 buffered Sink 内核，不保留独立 runtime/state 或兼容出口。
 
@@ -32,31 +32,29 @@ ClickHouseSink 的 tag 是 19，Definition 只持久化 sink ID、database/table
 
 ## 共享 buffered 协议
 
-SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`。四个具体目标直接实现唯一的私有 `RelationTarget`，只提供目标布局、exact-row lookup、事件大小和幂等固定 ID 写入；共享的 `relation` 代码负责 technical-ID 分配、mutation codec 和按 logical row 的纯 mutation 分组。checkpoint 固定为下一个 technical ID `u64`，Prepared plan 固定为 `Batch`，不保留另一层 Sink trait、target wrapper 或第二套 runtime/state。
-不得建立公共通用 Sink trait、backend enum、registry 或 ORM。
+SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`。四个具体目标直接实现唯一的私有 `RelationTarget`，只提供目标布局、exact-row lookup、事件大小和幂等固定 ID 写入；共享的 `relation` 代码负责 technical-ID 分配、mutation codec 和按 logical row 的纯 mutation 分组。checkpoint 固定为下一个 technical ID `u64`，Prepared plan 固定为 `Batch`，不保留 target wrapper 或第二套运行状态。
+公共 `SinkOperation` 仅暴露具体 enqueue/load/prepare/persist/deliver/settle 数据协议；不建立可执行回调、backend registry 或 ORM。
 构造时从固定 input Schema 创建唯一的 `SchemaBoundChangeCodec`，它同时拥有运行时 exact-Schema guard 与 buffer codec。control 状态只有 Initialize、Ready、Prepared；buffer 的每个 value 是一个 schema-bound Change entry，Ready/Prepared 保存连续 `[head, tail)`、当前行剩余 diff、pending event 数和 retained encoded-entry bytes。
-完整 Change admission、control accounting 与 input `Complete` 必须在同一 Store 事务提交；连续小 Claim 可聚合，没有 offered Claim、达到 target event limit 或 8 MiB delivery watermark 时继续无输入内部 drain。
+`try_enqueue(access, page)` 在同一 Store 事务写入 outbox 和控制计费，Flow 在该事务推进父 frame；false 表示暂不能接受，且没有任何 Store 写入或运行状态修改，调用方可以在同一事务保存已计算页等待重试。调用方必须先通过 `load` 恢复和校验控制；之后由唯一 writer 写入合法状态。enqueue 只准入 Ready 的最大 59-byte 控制，超过此长度的合法状态只能是 Prepared，直接返回 false，不复制固定-ID plan；完整 Prepared 校验仍由恢复和 drain 的 `load` 执行。Source/计算节点不再通过边日志复制到 Sink。多个小 page 的 prefix 继续合并为一次最多 1024 mutations 的 target batch；每个 Change 不必单独开启目标事务。
 schema-bound entry 的 v1 持久布局固定为 format marker、canonical physical Schema 的 BLAKE3 fingerprint、单个 uncompressed RecordBatch IPC message 和 EOS，不在每项重复完整 Schema，也不接受 self-contained IPC fallback。单个 encoded entry 加 8-byte key 不得超过 8 MiB，编码前必须无拷贝预检 IPC body；owned decode 仅在对齐合适时共享 backing，否则局部复制仍受 body 上限约束。
 全部 retained buffer 按实际 encoded entry bytes 加 key 的逻辑口径不得超过 64 MiB 或 1,048,576 events，该口径不是 heap、WAL 或磁盘硬配额。
-完整 encoded delivery 与 target-expanded mutation work 分别受 8 MiB 上限；超限或不能在剩余 technical-ID 区间排空的 input 在 ACK 前失败。
-reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、schema fingerprint、single-batch framing、Change value、accounting 与 checkpoint 下剩余正事件容量。
-首次启动在事务外拒绝已有目标，再持久化 Initialize；durable AfterCommit 在 Store barrier 后创建或验证同布局的空目标。
-批次在 Store 写事务外规划；纯正事件批次在保持 canonical 行字节预算和逐行校验的前提下只计算行长度与固定 ID，不为分组构造整行 canonical bytes。混合批次仍按完整行身份分组。读取 buffer 的 Loaded turn 与随后的规划 turn 分开，以免目标查询占用 Store 写事务；规划后直接准备持久写入，若该写事务回滚，下一 turn 从同一 Loaded batch 与 checkpoint 重新规划。apply 只持久化 Prepared 的 before/after settlement、target checkpoint 与至多 1024 个具体 mutation；insert 和 delete 都只保存 buffer delivery 中的行索引与固定 ID，不复制完整行或 Station Claim。
-Prepared 恢复对所有行仍校验 canonical 总预算；只有 delete 引用同一 plan 新分配的 ID 时才暂存该批全部 canonical 行字节做身份对比，纯撤回及只删除既存 ID 的批次无需额外行副本。目标适配器分别编码 canonical 行，并直接从本次编码的字段字节投影目标列值，不对同一字段重复读取 Arrow 数组。
-durable AfterCommit 在 Store barrier 后于一个目标事务中先 insert-on-ID-conflict-do-nothing，再核对所有已存在 mutation ID 仍绑定对应完整逻辑行，最后按 ID delete；恢复、admit、load、publish-ready 和 settle 的纯内存 phase 发布使用 local AfterCommit；下一独立 Store turn 删除完整消费的 buffer entries 并发布 Ready。
-目标已提交而本地未结算时只从原 buffer 重建并依靠 Prepared plan 的固定 technical ID 重投；从不重投已结算批次。
-普通 planning 错误可重试，AfterCommit 错误或提交不确定必须 fail-stop/reopen，全部外部 I/O 不得占用 Store 写事务。
+完整 encoded delivery 与 target-expanded mutation work 分别受 8 MiB 上限；超限或不能在剩余 technical-ID 区间排空的 input 在 ACK 前失败。有正事件的新 input 以已有 buffered absolute events 加本 input 正事件保守预留 ID 容量，不另存 reservation frontier；纯负 input 不需新 ID，可在 ID frontier 耗尽后继续回收。
+reopen 在任何外部副作用前分页校验完整 buffer 的连续 key、schema fingerprint、single-batch framing、Change value、accounting 与 checkpoint 下剩余正事件容量。首次 load 逐页最多读取整个 64 MiB outbox；每页至多 8 MiB，暂存当前页而非全部历史，因此该恢复校验不属于 24 MiB 单动作逻辑工作界。
+外部 drain 是具体数据协议：`load(ReadTransactionAccess)` 有界读取 prefix 或原 Prepared；`prepare(pending)` 在事务外执行 lookup 并生成固定 ID；`persist_prepared(access, &prepared)` 检查 front 未改变并保存 Prepared；Flow commit/barrier 后调用 `deliver(&prepared)`；`settle(access, &prepared)` 在独立短事务删除完整消费的 entries 并发布 Ready/frontier。没有可执行闭包或额外 phase 事实，rollback 后可重读同一 prefix；Prepared 重开直接恢复原 fixed-ID plan。
+首次启动 prepare 在事务外拒绝已有目标，persist 保存 Initialize；barrier 后 deliver 创建或验证兼容空目标，再 settle 发布 Ready。目标已提交、本地未结算时重投同一 Prepared；不能重新 lookup 或重新分配 IDs。外部错误、提交不确定要求 fail-stop/reopen。
+纯正事件批次检查 canonical 总预算和完整 ID 区间，避免 canonical 分组副本；混合批次按完整 canonical row 分组一次 lookup。reopen 的计划校验保留事件顺序、固定 ID 与完整行身份检查。
 
 ## 关系身份与重放
 
 `$dogpaddle.id` 在每个持久化 Sink 的全部输入中稳定递增且永不复用，`sink.control` 中的 relation checkpoint 是唯一分配事实；`$dogpaddle.hash` 为 `BLAKE3("dogpaddle.relation-row.v1\0" || canonical_row)[..16]`。
 hash 只过滤候选，数据库仍按完整逻辑值精确比较并选择最小 ID。
-负事件的第一个 delivery slice 在任何部分落地前验证 buffer 中该行完整剩余 multiplicity，后续 slice 不重复全量 admission；正事件的第一个 slice同样验证完整 ID 区间。
-查询只返回本批至多 1024 个 ID。
+正事件首次切片仍以 O(1) 算术验证完整 remaining ID 区间。负事件仅验证当前切片：每个 canonical group 计算最大负前缀缺口，请求该组本切片负 mutation 数以内的最小 existing IDs；各组返回总量至多 1024，不读取完整 remaining count。事件顺序从 existing-ID deque 优先消费，正事件的新 IDs 加到队尾，因此 +3/-3 可使用新 IDs，+3/-4 至少需要一个既存 ID。缺少本切片必要 IDs 时不写该片并 fail-stop，早先已结算切片保留；退休非法 raw delta 与外部目标损坏的提前全量失败保证。
+ClickHouse 使用 `groupArraySortedIf(1024)`，其 [上游实现](https://github.com/ClickHouse/ClickHouse/blob/master/src/AggregateFunctions/AggregateFunctionGroupArraySorted.cpp) 在累积时保持有限 top-N 状态，禁止 full groupArray 后再截断；每组状态有界不代表 FINAL/filter/扫描总工作有界。lookup 施加 5 秒 max_execution_time、throw overflow 与 64 MiB server memory quota。
+SQLite 一次 lookup 或 fixed-ID write 内的全部语句共用一个 deadline，每个工作单元同时使用 5 秒 busy timeout 与 progress handler（每 1000 VM instructions 检查 deadline 并取消）；PG 使用 5 秒服务器 statement/lock timeout 与 client deadline；Doris连接设置 query_timeout=5、exec_mem_limit=64MiB 并保留client read/write timeout。停止延迟受当前有界数据库工作单元限制，不承诺目标不响应时即时 stop。
 固定-ID insert 与 delete 是 SQLite/PG 原样 Prepared replay 的目标侧幂等 identity；目标重复 ID 或不存在的删除只有在同一 Prepared 重放语义下才是成功，已存在 ID 必须与对应完整逻辑行一致，其他约束错误不能吞掉。
 不另存 receipt、digest 或远端 allocation frontier，因此外部把 Store/目标共同篡改为另一组语义自洽状态不属于恢复契约。
 PG 宽 Schema 遵守 65,535 参数上限并在同一事务内切分 SQL；5 秒 work-unit deadline 包含所有分片往返，极宽 Schema 要求低延迟目标。
-目标布局只在初始化/重新连接时校验，不逐 turn 扫表或查询 MIN/MAX。
+目标布局只在初始化/重新连接时校验，不逐步骤扫表或查询 MIN/MAX。
 输入语义保持事件顺序与非负前缀；目标 SQL 允许整批先插后删，只承诺批次提交后的关系，不承诺目标 WAL 顺序。
 目标表、索引、约束由 Sink 独占，不支持外部写入、额外业务唯一约束、trigger/FK、改表或数据库替换恢复。
 共享 buffered state、schema-bound Change entry、relation codec、row hash 与目标布局取代未发布的旧格式，旧 Flow 和目标必须重建；不提供 alias、fallback、兼容读取或迁移。

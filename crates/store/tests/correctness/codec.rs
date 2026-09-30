@@ -115,3 +115,50 @@ fn malformed_builtin_encodings_are_rejected() {
     assert!(u64::decode_key(Cow::Borrowed(&[0; 7])).is_err());
     assert!(i64::decode_key(Cow::Borrowed(&[0; 9])).is_err());
 }
+
+#[test]
+fn positive_weight_has_one_fixed_width_codec_and_rejects_zero() {
+    use std::num::NonZeroU64;
+    for weight in [1, 7, u64::MAX] {
+        let value = NonZeroU64::new(weight).unwrap();
+        let bytes = value.encode_value().unwrap().as_ref().to_vec();
+        assert_eq!(bytes, weight.to_be_bytes());
+        assert_eq!(
+            NonZeroU64::decode_value(Cow::Borrowed(&bytes)).unwrap(),
+            value
+        );
+        assert_eq!(NonZeroU64::decode_value(Cow::Owned(bytes)).unwrap(), value);
+    }
+    for length in 0..8 {
+        assert!(NonZeroU64::decode_value(Cow::Owned(vec![1; length])).is_err());
+    }
+    assert!(NonZeroU64::decode_value(Cow::Borrowed(&[0; 8])).is_err());
+    assert!(NonZeroU64::decode_value(Cow::Borrowed(&[1; 9])).is_err());
+}
+
+#[test]
+fn partition_key_framing_is_canonical_and_preserves_tuple_order() {
+    use dogpaddle_store::PartitionKey;
+    let key = PartitionKey(vec![0, 1, 0], vec![9]);
+    let bytes = key.encode_key().unwrap().as_ref().to_vec();
+    assert_eq!(bytes, [0, 255, 1, 0, 255, 0, 0, 9]);
+    assert_eq!(
+        PartitionKey::<Vec<u8>, Vec<u8>>::decode_key(Cow::Borrowed(&bytes)).unwrap(),
+        key
+    );
+    let components = [vec![], vec![0], vec![0, 0], vec![0, 1], vec![1], vec![255]];
+    let mut keys = Vec::new();
+    for partition in &components {
+        for local in &components {
+            keys.push(PartitionKey(partition.clone(), local.clone()));
+        }
+    }
+    let encoded = keys
+        .iter()
+        .map(|key| key.encode_key().unwrap().as_ref().to_vec())
+        .collect::<Vec<_>>();
+    assert!(encoded.windows(2).all(|pair| pair[0] < pair[1]));
+    for bytes in [vec![], vec![0], vec![0, 1], vec![1, 0, 255]] {
+        assert!(PartitionKey::<Vec<u8>, Vec<u8>>::decode_key(Cow::Owned(bytes)).is_err());
+    }
+}

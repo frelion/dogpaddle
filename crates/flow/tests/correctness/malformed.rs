@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, panic::catch_unwind};
+use std::panic::catch_unwind;
 
 use dogpaddle_flow::{FlowDefinitionError, FlowError, FlowFactory};
 use dogpaddle_operation::{
@@ -87,15 +87,16 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     );
 
     let mut unknown_input = original.clone();
-    let input_reference = find_last(&unknown_input, b"scan");
-    unknown_input[input_reference..input_reference + 4].copy_from_slice(b"void");
+    // Last node has one u32 input immediately before the checksum.
+    let offset = unknown_input.len() - 8;
+    unknown_input[offset..offset + 4].copy_from_slice(&99_u32.to_be_bytes());
     rewrite_checksum(&mut unknown_input);
     assert_eq!(
         definition_error(root.path(), "unknown-input", &unknown_input),
-        FlowDefinitionError::UnknownInput {
-            station: "count".to_owned(),
-            input_id: "void".to_owned(),
-        }
+        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::UnknownInput {
+            operation: "sink".to_owned(),
+            input: 99
+        })
     );
 
     let mut unknown_operation = original.clone();
@@ -106,8 +107,7 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     assert_eq!(
         definition_error(root.path(), "unknown-operation", &unknown_operation),
         FlowDefinitionError::Operation {
-            station_id: "scan".to_owned(),
-            operation: 0,
+            operation_id: "scan".to_owned(),
             source: DefinitionCodecError::UnknownTag(99),
         }
     );
@@ -120,8 +120,7 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     assert_eq!(
         definition_error(root.path(), "truncated-operation", &truncated_operation),
         FlowDefinitionError::Operation {
-            station_id: "scan".to_owned(),
-            operation: 0,
+            operation_id: "scan".to_owned(),
             source: DefinitionCodecError::Truncated,
         }
     );
@@ -182,7 +181,7 @@ fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
 }
 
 #[test]
-fn open_locates_an_invalid_operation_inside_a_station_program() {
+fn open_locates_an_invalid_operation_by_logical_identity() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let mut factory = FlowFactory::new(&source);
@@ -193,7 +192,6 @@ fn open_locates_an_invalid_operation_inside_a_station_program() {
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [projected]);
-    factory.materialize(projected, NonZeroU64::MIN);
     drop(factory.build().unwrap());
 
     let mut encoded = read_published_definition(&source);
@@ -210,8 +208,7 @@ fn open_locates_an_invalid_operation_inside_a_station_program() {
     assert_eq!(
         definition_error(root.path(), "invalid-second-operation", &encoded),
         FlowDefinitionError::Operation {
-            station_id: "scan".to_owned(),
-            operation: 1,
+            operation_id: "project".to_owned(),
             source: DefinitionCodecError::UnknownTag(99),
         }
     );
@@ -240,9 +237,15 @@ fn find_first(haystack: &[u8], needle: &[u8]) -> usize {
         .expect("fixture contains marker")
 }
 
-fn find_last(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-        .expect("fixture contains marker")
+#[test]
+fn oversized_definition_is_rejected_before_decoding_without_rewriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let bytes = vec![0; 9 * 1024 * 1024];
+    publish_definition(&path, &bytes);
+    assert!(matches!(
+        FlowFactory::new(&path).open(),
+        Err(FlowError::Store(_))
+    ));
+    assert_eq!(read_published_definition(&path), bytes);
 }

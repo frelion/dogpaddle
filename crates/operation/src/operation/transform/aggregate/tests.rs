@@ -1,70 +1,40 @@
-//! White-box coverage for the aggregate's durable layout.
-//!
-//! A dead group's leftover keys are unreachable through the public API because
-//! group IDs are never reused, so reclaiming them can only be observed here.
+//! Private coverage of the sufficient-statistics layout.
 
-use dogpaddle_store::Store;
-
-use super::{
-    runtime::drain_group_entries,
-    state::{Entries, EntryPartition},
-};
+use super::{AggregateCall, AggregateDefinition, functions::StatisticKind, runtime::BoundCall};
+use crate::col;
+use arrow_schema::{DataType, Field, Schema};
+use std::sync::Arc;
 
 #[test]
-fn draining_a_dead_group_removes_only_its_own_partitions() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("store")).unwrap();
-    let entries = store.create_data::<Entries>("entries").unwrap();
-    let mut transactions = store.into_transactions();
-    {
-        let transaction = transactions.begin();
-        let mut access = entries.access(transaction.access()).unwrap();
-        access
-            .partition(&EntryPartition::new(0, 4))
-            .unwrap()
-            .set_multiplicity(&b"dead".to_vec(), u64::MAX)
-            .unwrap();
-        access
-            .partition(&EntryPartition::new(0, 4))
-            .unwrap()
-            .adjust(&b"later".to_vec(), 5)
-            .unwrap();
-        access
-            .partition(&EntryPartition::new(1, 4))
-            .unwrap()
-            .adjust(&b"dead".to_vec(), 1)
-            .unwrap();
-        access
-            .partition(&EntryPartition::new(0, 9))
-            .unwrap()
-            .set_multiplicity(&b"other".to_vec(), u64::MAX)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    {
-        let transaction = transactions.begin();
-        let mut access = entries.access(transaction.access()).unwrap();
-        drain_group_entries(2, &mut access, 4).unwrap();
-        transaction.commit().unwrap();
-    }
-
-    drop(transactions);
-    let store = Store::open(root.path().join("store")).unwrap();
-    let entries = store.open_data::<Entries>("entries").unwrap();
-    let transaction = store.read_transaction();
-    let access = entries.read(transaction.access()).unwrap();
-    for layout in 0..2 {
-        let partition = access.partition(&EntryPartition::new(layout, 4)).unwrap();
-        assert!(partition.first().unwrap().is_none());
-        assert!(partition.last().unwrap().is_none());
-    }
-    assert_eq!(
-        access
-            .partition(&EntryPartition::new(0, 9))
-            .unwrap()
-            .multiplicity(&b"other".to_vec())
-            .unwrap(),
-        u64::MAX
-    );
+fn repeated_calls_share_one_argument_statistic_and_extrema_layout() {
+    let definition = AggregateDefinition::try_new(
+        [("group", col("group"))],
+        [
+            ("rows", AggregateCall::count_all()),
+            ("count", AggregateCall::count(col("value"))),
+            ("sum", AggregateCall::sum(col("value"))),
+            ("avg", AggregateCall::avg(col("value"))),
+            ("count_again", AggregateCall::count(col("value"))),
+            ("min", AggregateCall::min(col("value"))),
+            ("max", AggregateCall::max(col("value"))),
+            ("min_again", AggregateCall::min(col("value"))),
+        ],
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("group", DataType::Int64, false),
+        Field::new("value", DataType::Int64, true),
+    ]));
+    let mut fields = Vec::new();
+    let bound = definition.bind_calls(&schema, &mut fields).unwrap();
+    assert_eq!(bound.arguments.len(), 1);
+    assert_eq!(bound.statistics.len(), 1);
+    assert_eq!(bound.statistics[0].kind, StatisticKind::Signed);
+    assert!(bound.statistics[0].count_output);
+    assert!(bound.statistics[0].sum_output);
+    assert_eq!(bound.layouts.len(), 1);
+    assert_eq!(bound.slots.len(), 2);
+    assert!(matches!(bound.calls[0], BoundCall::RowsCount));
+    assert!(matches!(bound.calls[4], BoundCall::Count { statistic: 0 }));
+    assert!(matches!(bound.calls[7], BoundCall::Extrema { slot: 0 }));
 }

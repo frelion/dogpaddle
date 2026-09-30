@@ -179,6 +179,7 @@ impl PostgresSinkConfig {
                 "-c statement_timeout=5000 \
                  -c lock_timeout=5000 \
                  -c idle_in_transaction_session_timeout=5000 \
+                 -c work_mem=4MB \
                  -c synchronous_commit=on \
                  -c search_path=pg_catalog \
                  -c application_name=dogpaddle_postgres_sink",

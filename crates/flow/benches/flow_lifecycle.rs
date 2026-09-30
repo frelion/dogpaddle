@@ -2,7 +2,6 @@
 
 use std::{
     fs,
-    num::NonZeroU64,
     path::Path,
     time::{Duration, Instant},
 };
@@ -17,13 +16,12 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const BENCHMARK: &str = "flow_lifecycle";
-const SMOKE_STATION_COUNTS: &[usize] = &[2, 3];
-const REFERENCE_STATION_COUNTS: &[usize] = &[2, 64, 1_024];
-const OUTPUT_CAPACITY_BYTES: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+const SMOKE_OPERATION_COUNTS: &[usize] = &[2, 3];
+const REFERENCE_OPERATION_COUNTS: &[usize] = &[2, 64, 1_024];
 
 #[derive(Clone, Copy)]
 struct Config {
-    station_counts: &'static [usize],
+    operation_counts: &'static [usize],
     sample_size: usize,
     warm_up_time: Duration,
     measurement_time: Duration,
@@ -33,13 +31,13 @@ impl Config {
     const fn for_profile(profile: PerformanceProfile) -> Self {
         match profile {
             PerformanceProfile::Smoke => Self {
-                station_counts: SMOKE_STATION_COUNTS,
+                operation_counts: SMOKE_OPERATION_COUNTS,
                 sample_size: 10,
                 warm_up_time: Duration::from_millis(20),
                 measurement_time: Duration::from_secs(1),
             },
             PerformanceProfile::Reference => Self {
-                station_counts: REFERENCE_STATION_COUNTS,
+                operation_counts: REFERENCE_OPERATION_COUNTS,
                 sample_size: 30,
                 warm_up_time: Duration::from_secs(2),
                 measurement_time: Duration::from_secs(5),
@@ -49,11 +47,13 @@ impl Config {
 
     fn validate(self) {
         assert!(
-            self.station_counts.windows(2).all(|pair| pair[0] < pair[1]),
-            "Flow lifecycle Station counts must be strictly increasing"
+            self.operation_counts
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "Flow lifecycle Operation counts must be strictly increasing"
         );
         assert!(
-            self.station_counts.iter().all(|count| *count >= 2),
+            self.operation_counts.iter().all(|count| *count >= 2),
             "Flow lifecycle requires a Source and Sink"
         );
     }
@@ -77,12 +77,11 @@ impl LifecycleRun {
             "result_directory": root.path().display().to_string(),
             "host": HostEnvironment::collect(Some(root.filesystem_root())),
             "configuration": {
-                "station_counts": config.station_counts,
+                "operation_counts": config.operation_counts,
                 "sample_size": config.sample_size,
                 "sampling_mode": "flat",
                 "warm_up_time_ns": nanos(config.warm_up_time),
                 "measurement_time_ns": nanos(config.measurement_time),
-                "output_capacity_bytes": OUTPUT_CAPACITY_BYTES.get(),
                 "scenarios": ["fresh_durable_build", "warm_reopen"],
                 "timing_scope": "FlowFactory::build_or_FlowFactory::open_only",
                 "fixture_and_validation": "outside_timing",
@@ -126,84 +125,87 @@ fn lifecycle(criterion: &mut Criterion, run: &LifecycleRun, config: Config) {
     let mut group = criterion.benchmark_group(BENCHMARK);
     group.sampling_mode(SamplingMode::Flat);
 
-    for &station_count in config.station_counts {
+    for &operation_count in config.operation_counts {
         group.bench_function(
-            BenchmarkId::new("fresh_durable_build", station_count),
+            BenchmarkId::new("fresh_durable_build", operation_count),
             |bencher| {
-                bencher
-                    .iter_custom(|iterations| measure_fresh_build(run, station_count, iterations));
+                bencher.iter_custom(|iterations| {
+                    measure_fresh_build(run, operation_count, iterations)
+                });
             },
         );
 
-        let fixture = run.sample(&format!("warm-reopen-{station_count}"));
+        let fixture = run.sample(&format!("warm-reopen-{operation_count}"));
         let path = fixture.path().join("flow");
-        let flow = linear_factory(&path, station_count)
+        let flow = linear_factory(&path, operation_count)
             .build()
             .expect("build warm-reopen benchmark fixture");
-        validate_flow(&flow, &path, station_count);
+        validate_flow(&flow, &path, operation_count);
         drop(flow);
-        group.bench_function(BenchmarkId::new("warm_reopen", station_count), |bencher| {
-            bencher.iter_custom(|iterations| measure_reopen(&path, station_count, iterations));
-        });
+        group.bench_function(
+            BenchmarkId::new("warm_reopen", operation_count),
+            |bencher| {
+                bencher
+                    .iter_custom(|iterations| measure_reopen(&path, operation_count, iterations));
+            },
+        );
     }
 
     group.finish();
 }
 
-fn measure_fresh_build(run: &LifecycleRun, station_count: usize, iterations: u64) -> Duration {
+fn measure_fresh_build(run: &LifecycleRun, operation_count: usize, iterations: u64) -> Duration {
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
-        let fixture = run.sample(&format!("fresh-build-{station_count}"));
+        let fixture = run.sample(&format!("fresh-build-{operation_count}"));
         let path = fixture.path().join("flow");
-        let factory = linear_factory(&path, station_count);
+        let factory = linear_factory(&path, operation_count);
         let started = Instant::now();
         let flow = factory.build().expect("build benchmark Flow");
         elapsed = checked_add(elapsed, started.elapsed());
-        validate_flow(&flow, &path, station_count);
+        validate_flow(&flow, &path, operation_count);
         drop(flow);
         let reopened = FlowFactory::new(&path)
             .open()
             .expect("reopen freshly built benchmark Flow");
-        validate_flow(&reopened, &path, station_count);
+        validate_flow(&reopened, &path, operation_count);
     }
     elapsed
 }
 
-fn measure_reopen(path: &Path, station_count: usize, iterations: u64) -> Duration {
+fn measure_reopen(path: &Path, operation_count: usize, iterations: u64) -> Duration {
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
         let factory = FlowFactory::new(path);
         let started = Instant::now();
         let flow = factory.open().expect("open benchmark Flow");
         elapsed = checked_add(elapsed, started.elapsed());
-        validate_flow(&flow, path, station_count);
+        validate_flow(&flow, path, operation_count);
     }
     elapsed
 }
 
-fn linear_factory(path: &Path, station_count: usize) -> FlowFactory {
+fn linear_factory(path: &Path, operation_count: usize) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     let mut previous = factory.operation("scan", SequenceScanDefinition::new(0), []);
-    factory.materialize(previous, OUTPUT_CAPACITY_BYTES);
-    for index in 1..station_count - 1 {
+    for index in 1..operation_count - 1 {
         let current = factory.operation(
             format!("count-{index:08x}"),
             RunningEventCountDefinition::new(),
             [previous],
         );
-        factory.materialize(current, OUTPUT_CAPACITY_BYTES);
         previous = current;
     }
     factory.operation("sink", DiscardDefinition::new(), [previous]);
     factory
 }
 
-fn validate_flow(flow: &Flow, path: &Path, station_count: usize) {
+fn validate_flow(flow: &Flow, path: &Path, operation_count: usize) {
     assert_eq!(flow.path(), path);
-    assert_eq!(flow.station_count(), station_count);
-    let mut ids = flow.station_ids();
+    assert_eq!(flow.operation_count(), operation_count);
+    let mut ids = flow.operation_ids();
     assert_eq!(ids.next(), Some("scan"));
-    for index in 1..station_count - 1 {
+    for index in 1..operation_count - 1 {
         let expected = format!("count-{index:08x}");
         assert_eq!(ids.next(), Some(expected.as_str()));
     }

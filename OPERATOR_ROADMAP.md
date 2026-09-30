@@ -1,5 +1,8 @@
 # DogPaddle 算子与执行内核路线图
 
+> 历史路线记录：本文保留持久调用栈重构前的设计与阶段取舍，不再定义当前执行协议或能力范围。
+> 当前约束以 [Operation README](crates/operation/README.md) 和 [Flow 运行契约](crates/flow/docs/runtime.md) 为准。
+
 本文定义 DogPaddle 算子体系和执行内核的演进阶段、语义边界、交付物与退出标准。
 它是实施路线；阶段 0/1、阶段 3 的 Distinct、阶段 4 的 grouped Aggregate，以及阶段 5 的
 EquiJoin family 与 Dynamic ASOF Join 已完成，

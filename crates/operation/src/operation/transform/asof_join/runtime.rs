@@ -1,85 +1,51 @@
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
-    mem::size_of,
-    ops::{Bound, RangeBounds},
-    sync::Arc,
-};
+use std::{num::NonZeroU64, ops::Bound, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions};
-use arrow_schema::{Field, SchemaRef};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
+use arrow_schema::Field;
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
-use dogpaddle_store::{
-    CellAccess, OrderedMapAccess, ScanDirection, ScanLimit, StoreError, TransactionAccess,
-};
+use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
+use super::{
+    AsOfDirection, AsOfJoinError, AsOfJoinLayout,
+    index::{
+        matchable_partition_prefix, order_prefix, parse_row_key, prefix_successor, push_component,
+        row_key,
+    },
+    state::{AsOfCursor, Rows},
+};
 use crate::{
     expression::BoundExpression,
     operation::{
-        Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation,
+        BudgetExceeded, Cursor, OperationError, OperationInput, PagedOperation, Progress, Resume,
+        Step, StepBudget,
         relation::{
-            RowError, canonical_row_bounded, decode_canonical_row, encode_canonical_bounded,
-            order_key, ordered_value,
+            RowError, canonical_row_bounded, canonical_row_size_bounded,
+            decode_canonical_row_bounded, encode_canonical_bounded, order_key,
         },
     },
 };
-
-use super::{
-    AsOfDirection, AsOfEqualityMode, AsOfEquidistantPreference, AsOfJoinError, AsOfJoinKind,
-    AsOfJoinLayout, AsOfTieFallback,
-    index::{
-        ParsedIndexKey, matchable_partition_prefix, parse_row_key, prefix_successor,
-        push_component, push_nullable_ordered_component, row_key, take_component,
-    },
-    state::{AsOfContinuation, Continuation, RowWeight, RowWeightError, Rows},
-};
-
-const TURN_ITEMS: usize = 256;
-const TURN_BYTES: usize = 4 * 1024 * 1024;
-const PREPARED_CLAIM_BYTES: usize = 64 * 1024 * 1024;
-const CANDIDATE_ITEMS: usize = 64;
-const CANDIDATE_BYTES: usize = 1024 * 1024;
-const CANDIDATE_SCALAR_VALUES: usize = 16 * 1024;
-const MAP_VALUE_BYTES: usize = size_of::<u64>();
 
 pub(super) struct BoundScalar {
     pub(super) expression: BoundExpression,
     pub(super) field: Arc<Field>,
 }
-
-pub(super) struct BoundEqualityPair {
-    pub(super) mode: AsOfEqualityMode,
+pub(super) struct BoundPair {
     pub(super) left: BoundScalar,
     pub(super) right: BoundScalar,
 }
-
-pub(super) struct BoundOrderPair {
-    pub(super) left: BoundScalar,
-    pub(super) right: BoundScalar,
+impl BoundPair {
+    fn for_port(&self, port: usize) -> &BoundScalar {
+        if port == 0 { &self.left } else { &self.right }
+    }
 }
 
-pub(super) struct BoundTieBreak {
-    pub(super) value: BoundScalar,
-    pub(super) descending: bool,
-    pub(super) nulls_first: bool,
-}
-
-/// Materialized dynamic ASOF join.
+/// Indexed SQL ASOF kernel; all progress belongs to the caller's Resume.
 pub(crate) struct AsOfJoinOperation {
     pub(super) layout: AsOfJoinLayout,
     pub(super) left_rows: Rows,
     pub(super) right_rows: Rows,
-    pub(super) continuation: Continuation,
-    pub(super) prepared: Option<PreparedClaim>,
 }
-
-pub(super) struct PreparedClaim {
-    port: usize,
-    rows: Vec<PreparedRow>,
-    after_weights: Option<Vec<u64>>,
-}
-
 struct PreparedRow {
     key: Vec<u8>,
     partition: Vec<u8>,
@@ -87,1744 +53,878 @@ struct PreparedRow {
     matchable: bool,
     difference: i64,
 }
-
-struct PreparingRow {
-    row: Vec<u8>,
-    partition: Vec<u8>,
-    order: Vec<u8>,
-    rank: Vec<u8>,
-    matchable: bool,
-    order_matchable: bool,
-    difference: i64,
-}
-
-struct PreparationBudget {
-    bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-struct RowEffect {
-    before: u64,
-    after: u64,
-}
-
-impl RowEffect {
-    const fn changes_presence(self) -> bool {
-        (self.before == 0) != (self.after == 0)
-    }
-}
-
-impl PreparedClaim {
-    fn effect(&self, index: usize) -> Result<RowEffect, AsOfJoinError> {
-        let after = self
-            .after_weights
-            .as_ref()
-            .expect("the ASOF Claim was admitted")[index];
-        Ok(RowEffect {
-            before: reverse_weight(after, self.rows[index].difference)?,
-            after,
-        })
-    }
-}
-
 #[derive(Clone)]
 struct Winner {
     key: Vec<u8>,
-    order: Vec<u8>,
-    rank: Vec<u8>,
     row: Vec<u8>,
 }
-
-struct MergedCandidate {
-    key: Vec<u8>,
-    visible_before: bool,
-    visible_after: bool,
+struct Candidates {
+    winner: Option<Winner>,
+    ambiguous: bool,
 }
-
-struct MergedPage {
-    entries: Vec<MergedCandidate>,
-    continuation: Option<Vec<u8>>,
-    work: (usize, usize),
+impl Candidates {
+    fn checked(&self) -> Result<Option<&Winner>, AsOfJoinError> {
+        if self.ambiguous {
+            Err(AsOfJoinError::AmbiguousTie)
+        } else {
+            Ok(self.winner.as_ref())
+        }
+    }
 }
-
-type EventVisibility<'a> = Option<(&'a [u8], RowEffect)>;
-
-struct SelectionPage {
-    best_before: Option<Winner>,
-    best_after: Option<Winner>,
-    ambiguous_before: bool,
-    ambiguous_after: bool,
-    continuation: Option<Vec<u8>>,
-    work: (usize, usize),
-}
-
-struct OutputRows {
+struct Output {
     columns: Vec<Vec<ScalarValue>>,
     differences: Vec<i64>,
 }
-
-#[derive(Clone)]
-struct KeyRange {
-    start: Bound<Vec<u8>>,
-    end: Bound<Vec<u8>>,
-}
-
-struct TurnBudget {
-    items: usize,
-    bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-enum Metric {
-    Signed(i128),
-    Unsigned(u128),
-}
-
-enum Step {
-    Continue,
-    Yield,
-    Complete,
-}
-
-enum NextLeft {
-    Row(Vec<u8>, u64, PreparedRow),
-    Exhausted,
-    Yield,
-}
-
-impl BoundEqualityPair {
-    fn for_port(&self, port: usize) -> &BoundScalar {
-        match port {
-            0 => &self.left,
-            1 => &self.right,
-            _ => unreachable!("a prepared ASOF claim has a validated port"),
-        }
-    }
-}
-
-impl BoundOrderPair {
-    fn for_port(&self, port: usize) -> &BoundScalar {
-        match port {
-            0 => &self.left,
-            1 => &self.right,
-            _ => unreachable!("a prepared ASOF claim has a validated port"),
-        }
-    }
-}
-
-impl PreparationBudget {
-    fn new(rows: usize) -> Result<Self, AsOfJoinError> {
-        let structural_bytes = rows
-            .checked_mul(size_of::<PreparingRow>().saturating_add(size_of::<PreparedRow>()))
-            .ok_or_else(prepared_claim_too_large)?;
-        if structural_bytes > PREPARED_CLAIM_BYTES {
-            return Err(prepared_claim_too_large());
-        }
-        Ok(Self {
-            bytes: structural_bytes,
-        })
-    }
-
-    fn remaining(&self) -> usize {
-        PREPARED_CLAIM_BYTES.saturating_sub(self.bytes)
-    }
-
-    fn output_limit(&self, current: usize) -> Result<usize, AsOfJoinError> {
-        current
-            .checked_add(self.remaining())
-            .ok_or_else(prepared_claim_too_large)
-    }
-
-    fn charge(&mut self, bytes: usize) -> Result<(), AsOfJoinError> {
-        self.bytes = self
-            .bytes
-            .checked_add(bytes)
-            .filter(|bytes| *bytes <= PREPARED_CLAIM_BYTES)
-            .ok_or_else(prepared_claim_too_large)?;
-        Ok(())
-    }
-
-    fn push_component(
-        &mut self,
-        output: &mut Vec<u8>,
-        component: &[u8],
-    ) -> Result<(), AsOfJoinError> {
-        let bytes = framed_component_bytes(component).ok_or_else(prepared_claim_too_large)?;
-        if bytes > self.remaining() {
-            return Err(prepared_claim_too_large());
-        }
-        push_component(output, component);
-        self.charge(bytes)
-    }
-
-    fn push_nullable_component(
-        &mut self,
-        output: &mut Vec<u8>,
-        component: Option<&[u8]>,
-        descending: bool,
-        nulls_first: bool,
-    ) -> Result<(), AsOfJoinError> {
-        let marker = [u8::from(component.is_none() != nulls_first)];
-        let bytes = framed_component_bytes(&marker)
-            .and_then(|bytes| {
-                component.map_or(Some(bytes), |component| {
-                    bytes.checked_add(framed_component_bytes(component)?)
-                })
-            })
-            .ok_or_else(prepared_claim_too_large)?;
-        if bytes > self.remaining() {
-            return Err(prepared_claim_too_large());
-        }
-        push_nullable_ordered_component(output, component, descending, nulls_first);
-        self.charge(bytes)
-    }
-
-    fn row_key(
-        &mut self,
-        partition: &[u8],
-        order: &[u8],
-        rank: &[u8],
-        row: &[u8],
-    ) -> Result<Vec<u8>, AsOfJoinError> {
-        let bytes = [partition, order, rank, row]
-            .into_iter()
-            .try_fold(0_usize, |bytes, component| {
-                bytes.checked_add(framed_component_bytes(component)?)
-            })
-            .ok_or_else(prepared_claim_too_large)?;
-        if bytes > self.remaining() {
-            return Err(prepared_claim_too_large());
-        }
-        let key = row_key(partition, order, rank, row);
-        debug_assert_eq!(key.len(), bytes);
-        self.charge(bytes)?;
-        Ok(key)
-    }
-}
-
-fn framed_component_bytes(component: &[u8]) -> Option<usize> {
-    component
-        .iter()
-        .try_fold(component.len().checked_add(2)?, |bytes, byte| {
-            if *byte == 0 {
-                bytes.checked_add(1)
-            } else {
-                Some(bytes)
-            }
-        })
-}
-
-const fn prepared_claim_too_large() -> AsOfJoinError {
-    AsOfJoinError::PreparedClaimTooLarge {
-        max_bytes: PREPARED_CLAIM_BYTES,
-    }
-}
-
-fn map_preparation_row_error(source: OperationError) -> AsOfJoinError {
-    if matches!(
-        source.downcast_ref::<RowError>(),
-        Some(RowError::SizeLimit { .. })
-    ) {
-        prepared_claim_too_large()
-    } else {
-        AsOfJoinError::CanonicalRow { source }
-    }
-}
-
-fn map_preparation_codec_error(source: RowError) -> AsOfJoinError {
-    if matches!(source, RowError::SizeLimit { .. }) {
-        prepared_claim_too_large()
-    } else {
-        AsOfJoinError::CanonicalRow {
-            source: Box::new(source),
-        }
-    }
-}
+type Range = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 impl AsOfJoinOperation {
     fn validate_input(&self, input: OperationInput<'_>) -> Result<(), AsOfJoinError> {
-        if input.port >= self.layout.input_schemas.len() {
+        if input.port > 1 {
             return Err(AsOfJoinError::InvalidInputPort { port: input.port });
         }
-        if input.change.schema().as_ref() != self.layout.input_schemas[input.port].as_ref() {
+        if input.change.schema() != self.layout.input_schemas[input.port] {
             return Err(AsOfJoinError::InputSchemaMismatch { port: input.port });
         }
         Ok(())
     }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "preparation evaluates one key expression at a time and bounds every retained encoding"
-    )]
-    fn prepare_claim(&self, input: OperationInput<'_>) -> Result<PreparedClaim, OperationError> {
+    fn prepare(
+        &self,
+        input: OperationInput<'_>,
+        budget: &mut StepBudget,
+    ) -> Result<Vec<PreparedRow>, OperationError> {
         let records = input.change.records();
-        let mut budget = PreparationBudget::new(input.change.num_rows())?;
-        let mut preparing = Vec::with_capacity(input.change.num_rows());
-        for index in 0..input.change.num_rows() {
-            let row = canonical_row_bounded(records, index, budget.remaining())
-                .map_err(map_preparation_row_error)?;
-            budget.charge(row.len())?;
-            budget.charge(1)?;
-            preparing.push(PreparingRow {
-                row,
+        let structural = input
+            .change
+            .num_rows()
+            .saturating_mul(std::mem::size_of::<PreparedRow>());
+        budget.charge(structural)?;
+        let mut rows = (0..input.change.num_rows())
+            .map(|index| PreparedRow {
+                key: Vec::new(),
                 partition: Vec::new(),
                 order: vec![0],
-                rank: Vec::new(),
                 matchable: true,
-                order_matchable: true,
                 difference: input.change.diffs().value(index),
-            });
-        }
-
-        for (expression_index, pair) in self.layout.equalities.iter().enumerate() {
+            })
+            .collect::<Vec<_>>();
+        for (index, pair) in self.layout.equalities.iter().enumerate() {
             let scalar = pair.for_port(input.port);
             let column = scalar.expression.evaluate(records).map_err(|source| {
                 AsOfJoinError::Expression {
                     role: "equality",
-                    index: expression_index,
+                    index,
                     port: input.port,
                     source,
                 }
             })?;
-            for (row_index, row) in preparing.iter_mut().enumerate() {
-                let scalar = pair.for_port(input.port);
-                if pair.mode == AsOfEqualityMode::Equal && column.is_null(row_index) {
-                    row.matchable = false;
-                }
+            budget.charge(crate::operation::logical_array_bytes(column.as_ref()))?;
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.matchable &= !column.is_null(index);
                 let before = row.partition.len();
-                encode_canonical_bounded(
+                let encoded = encode_canonical_bounded(
                     &scalar.field,
                     column.as_ref(),
-                    row_index,
+                    index,
                     "ASOF equality",
                     &mut row.partition,
-                    budget.output_limit(before)?,
-                )
-                .map_err(map_preparation_codec_error)?;
-                budget.charge(row.partition.len().saturating_sub(before))?;
-            }
-        }
-
-        for (expression_index, pair) in self.layout.orders.iter().enumerate() {
-            let scalar = pair.for_port(input.port);
-            let column = scalar.expression.evaluate(records).map_err(|source| {
-                AsOfJoinError::Expression {
-                    role: "order",
-                    index: expression_index,
-                    port: input.port,
-                    source,
-                }
-            })?;
-            for (row_index, row) in preparing.iter_mut().enumerate() {
-                let scalar = pair.for_port(input.port);
-                let value = ScalarValue::try_from_array(column.as_ref(), row_index)?;
-                if let Some(component) = order_key(&scalar.field, &value)
-                    .map_err(|_| AsOfJoinError::InvalidIndex("bound order value is invalid"))?
-                {
-                    budget.push_component(&mut row.order, &component)?;
-                } else {
-                    row.order_matchable = false;
-                    budget.push_component(&mut row.order, &[])?;
-                }
-            }
-        }
-        for row in &mut preparing {
-            row.matchable &= row.order_matchable;
-            row.order[0] = u8::from(row.order_matchable);
-        }
-
-        if input.port == 1 {
-            for (expression_index, tie) in self.layout.ties.iter().enumerate() {
-                let column = tie.value.expression.evaluate(records).map_err(|source| {
-                    AsOfJoinError::Expression {
-                        role: "tie break",
-                        index: expression_index,
-                        port: input.port,
-                        source,
+                    before.saturating_add(budget.remaining_bytes()),
+                );
+                budget.charge(row.partition.len() - before)?;
+                encoded.map_err(|error| {
+                    if matches!(error, RowError::SizeLimit { .. }) {
+                        Box::new(BudgetExceeded) as OperationError
+                    } else {
+                        Box::new(error)
                     }
                 })?;
-                for (row_index, row) in preparing.iter_mut().enumerate() {
-                    let value = ScalarValue::try_from_array(column.as_ref(), row_index)?;
-                    let encoded = order_key(&tie.value.field, &value).map_err(|_| {
-                        AsOfJoinError::InvalidIndex("bound tie-break value is invalid")
-                    })?;
-                    budget.push_nullable_component(
-                        &mut row.rank,
-                        encoded.as_deref(),
-                        tie.descending,
-                        tie.nulls_first,
-                    )?;
-                }
             }
         }
-
-        let mut rows = Vec::with_capacity(preparing.len());
-        for row in preparing {
-            let key = budget.row_key(&row.partition, &row.order, &row.rank, &row.row)?;
-            rows.push(PreparedRow {
-                key,
-                partition: row.partition,
-                order: row.order,
-                matchable: row.matchable,
-                difference: row.difference,
-            });
-        }
-        Ok(PreparedClaim {
-            port: input.port,
-            rows,
-            after_weights: None,
-        })
-    }
-
-    fn initial_continuation(port: usize) -> AsOfContinuation {
-        AsOfContinuation {
-            port: u8::try_from(port).expect("the two ASOF ports fit in a byte"),
-            row: 0,
-            left_resume_after: None,
-            candidate_resume_after: None,
-            best_before: None,
-            best_after: None,
-            ambiguous_before: false,
-            ambiguous_after: false,
-        }
-    }
-
-    fn apply_claim(
-        &self,
-        claim: &mut PreparedClaim,
-        access: TransactionAccess<'_>,
-    ) -> Result<Action, AsOfJoinError> {
-        let mut continuation = self.continuation.access(access)?;
-        let mut state = if let Some(state) = continuation.get()? {
-            Self::validate_continuation(claim, &state)?;
-            state
-        } else {
-            Self::initial_continuation(claim.port)
-        };
-        if claim.after_weights.is_none() {
-            let start = usize::try_from(state.row)
-                .map_err(|_| AsOfJoinError::InvalidContinuation("row exceeds usize"))?;
-            let current_applied = claim.port == 1 && state.left_resume_after.is_some();
-            claim.after_weights =
-                Some(self.preflight_admission(claim, start, current_applied, access)?);
-        }
-
-        let mut budget = TurnBudget::new();
-        let mut output = OutputRows::new(self.layout.output_schema.fields().len());
-        loop {
-            let step = if claim.port == 0 {
-                self.process_left_claim_row(
-                    claim,
-                    &mut state,
-                    &mut continuation,
-                    &mut budget,
-                    &mut output,
-                    access,
-                )?
+        let scalar = self.layout.order.for_port(input.port);
+        let column =
+            scalar
+                .expression
+                .evaluate(records)
+                .map_err(|source| AsOfJoinError::Expression {
+                    role: "order",
+                    index: 0,
+                    port: input.port,
+                    source,
+                })?;
+        budget.charge(crate::operation::logical_array_bytes(column.as_ref()))?;
+        for (index, row) in rows.iter_mut().enumerate() {
+            // All ordered types are flat: admit the owned scalar, component
+            // and worst-case escaped bytes before constructing any of them.
+            budget.charge(
+                crate::operation::logical_array_bytes(column.slice(index, 1).as_ref())
+                    .saturating_mul(4)
+                    .saturating_add(2),
+            )?;
+            let value = ScalarValue::try_from_array(column.as_ref(), index)?;
+            if let Some(component) = order_key(&scalar.field, &value)? {
+                row.order[0] = 1;
+                push_component(&mut row.order, &component);
             } else {
-                self.process_right_claim_row(
-                    claim,
-                    &mut state,
-                    &mut continuation,
-                    &mut budget,
-                    &mut output,
-                    access,
-                )?
-            };
-            match step {
-                Step::Complete => {
-                    return Ok(Action::Complete(output.finish(&self.layout.output_schema)?));
-                }
-                Step::Yield => {
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(output.finish(&self.layout.output_schema)?));
-                }
-                Step::Continue if budget.exhausted() => {
-                    continuation.set(&state)?;
-                    return Ok(Action::Commit(output.finish(&self.layout.output_schema)?));
-                }
-                Step::Continue => {}
+                row.matchable = false;
             }
-        }
-    }
-
-    fn preflight_admission(
-        &self,
-        claim: &PreparedClaim,
-        start: usize,
-        current_applied: bool,
-        access: TransactionAccess<'_>,
-    ) -> Result<Vec<u64>, AsOfJoinError> {
-        let rows = self.rows(claim.port).access(access)?;
-        let mut overlay = BTreeMap::<&[u8], u64>::new();
-        let mut after_weights = vec![0; claim.rows.len()];
-        for (index, row) in claim.rows.iter().enumerate().skip(start) {
-            let before = if index == start && current_applied {
-                let after = rows.get(&row.key)?.map_or(0, RowWeight::get);
-                reverse_weight(after, row.difference)?
-            } else {
-                match overlay.get(row.key.as_slice()) {
-                    Some(weight) => *weight,
-                    None => rows.get(&row.key)?.map_or(0, RowWeight::get),
+            let exact_size = canonical_row_size_bounded(records, index, budget.remaining_bytes())
+                .map_err(|error| {
+                if matches!(
+                    error.downcast_ref::<RowError>(),
+                    Some(RowError::SizeLimit { .. })
+                ) {
+                    Box::new(BudgetExceeded) as OperationError
+                } else {
+                    error
                 }
-            };
-            let after = adjusted_weight(before, row.difference)?;
-            overlay.insert(&row.key, after);
-            after_weights[index] = after;
+            })?;
+            let estimated = row
+                .partition
+                .len()
+                .saturating_add(row.order.len())
+                .saturating_add(exact_size)
+                .saturating_mul(2)
+                .saturating_add(8);
+            budget.charge(exact_size.saturating_add(estimated))?;
+            let exact = canonical_row_bounded(records, index, exact_size)?;
+            row.key = row_key(&row.partition, &row.order, &exact);
         }
-        Ok(after_weights)
+        Ok(rows)
     }
-
-    fn process_left_claim_row(
+    fn cursor<'a>(
         &self,
-        claim: &PreparedClaim,
-        state: &mut AsOfContinuation,
-        continuation: &mut CellAccess<'_, AsOfContinuation>,
-        budget: &mut TurnBudget,
-        output: &mut OutputRows,
-        access: TransactionAccess<'_>,
-    ) -> Result<Step, AsOfJoinError> {
-        debug_assert_eq!(claim.port, 0);
-        let row_index = continuation_row(claim, state)?;
-        let row = &claim.rows[row_index];
-        if !budget.can_start(row) {
-            return Ok(Step::Yield);
-        }
-        let page = if row.matchable {
-            let Some(page) = self.selection_page(row, None, false, state, budget, access)? else {
-                return Ok(Step::Yield);
-            };
-            page
-        } else {
-            SelectionPage {
-                best_before: None,
-                best_after: None,
-                ambiguous_before: false,
-                ambiguous_after: false,
-                continuation: None,
-                work: (0, 0),
-            }
+        input: OperationInput<'_>,
+        resume: &'a Resume,
+    ) -> Result<&'a AsOfCursor, OperationError> {
+        self.validate_input(input)?;
+        let Cursor::AsOf(cursor) = &resume.cursor else {
+            return Err(AsOfJoinError::InvalidResume("cursor belongs to another kernel").into());
         };
-        let result_work = if page.continuation.is_none() {
-            left_result_work(self.layout.kind, row, page.best_after.as_ref())
-        } else {
-            (0, 0)
-        };
-        let work = add_work(page.work, result_work);
-        if !budget.can_accept(work) {
-            return Ok(Step::Yield);
+        if resume.ordinal >= u64::try_from(input.change.num_rows())?
+            || (input.port == 0 && cursor.left_resume_after.is_some())
+        {
+            return Err(
+                AsOfJoinError::InvalidResume("cursor is outside input or wrong port").into(),
+            );
         }
-        budget.charge(work);
-        Self::store_selection_page(state, &page, false);
-        if page.continuation.is_some() {
-            return Ok(Step::Yield);
-        }
-        let winner = finish_selection(state.best_after.as_deref(), state.ambiguous_after)?;
-        state.ambiguous_after = false;
-        let effect = claim.effect(row_index)?;
-        self.append_left_result(row, winner.as_ref(), output)?;
-        self.adjust_actual(0, row, effect, access)?;
-        clear_candidate_state(state);
-        Self::advance_claim_row(claim, state, continuation)
+        Ok(cursor)
     }
-
-    fn process_right_claim_row(
+    fn validate_cursor_binding(
         &self,
-        claim: &mut PreparedClaim,
-        state: &mut AsOfContinuation,
-        continuation: &mut CellAccess<'_, AsOfContinuation>,
-        budget: &mut TurnBudget,
-        output: &mut OutputRows,
-        access: TransactionAccess<'_>,
-    ) -> Result<Step, AsOfJoinError> {
-        debug_assert_eq!(claim.port, 1);
-        let row_index = continuation_row(claim, state)?;
-        let right = &claim.rows[row_index];
-        let effect = claim.effect(row_index)?;
-        if !budget.can_start(right) {
-            return Ok(Step::Yield);
-        }
-        if !right.matchable || !effect.changes_presence() {
-            if !selection_state_is_empty(state) || state.left_resume_after.is_some() {
-                return Err(AsOfJoinError::InvalidContinuation(
-                    "right row without rematch work retains scan state",
-                ));
-            }
-            self.adjust_actual(1, right, effect, access)?;
-            budget.charge(TurnBudget::stored_row_work(right));
-            return Self::advance_claim_row(claim, state, continuation);
-        }
-
-        let applied = state.left_resume_after.is_some();
-        let first_left = state.left_resume_after.is_none();
-        let (left_key, left_weight, left) =
-            match self.current_or_next_left(right, state, budget, access)? {
-                NextLeft::Row(key, weight, row) => (key, weight, row),
-                NextLeft::Yield => return Ok(Step::Yield),
-                NextLeft::Exhausted => {
-                    if first_left {
-                        budget.charge(TurnBudget::stored_row_work(right));
-                    }
-                    if !applied {
-                        self.adjust_actual(1, right, effect, access)?;
-                    }
-                    clear_outer_state(state);
-                    return Self::advance_claim_row(claim, state, continuation);
+        cursor: &AsOfCursor,
+        driving: &PreparedRow,
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        if let Some(key) = &cursor.left_resume_after {
+            budget.charge(key.len().saturating_mul(2))?;
+            let parsed = parse_row_key(key)
+                .map_err(|_| AsOfJoinError::InvalidResume("left key framing is invalid"))?;
+            let eligible = match self.layout.direction {
+                AsOfDirection::Backward { allow_exact } => {
+                    parsed.order > driving.order || (allow_exact && parsed.order == driving.order)
+                }
+                AsOfDirection::Forward { allow_exact } => {
+                    parsed.order < driving.order || (allow_exact && parsed.order == driving.order)
                 }
             };
-
-        // Prior events are already durable. Only the current right row differs
-        // between the before and after views, even after its update commits.
-        let visibility = Some((right.key.as_slice(), effect));
-        let page = self.selection_page(&left, visibility, true, state, budget, access)?;
-        let Some(page) = page else {
-            return Ok(Step::Yield);
-        };
-        let correction_work = if page.continuation.is_none() {
-            correction_work(
-                self.layout.kind,
-                &left,
-                left_weight,
-                page.best_before.as_ref(),
-                page.best_after.as_ref(),
-            )
-        } else {
-            (0, 0)
-        };
-        let work = add_work(
-            add_work(page.work, correction_work),
-            if first_left {
-                TurnBudget::stored_row_work(right)
-            } else {
-                (0, 0)
-            },
-        );
-        if !budget.can_accept(work) {
-            return Ok(Step::Yield);
-        }
-        if applied {
-            self.validate_applied(right, effect, access)?;
-        } else {
-            self.adjust_actual(1, right, effect, access)?;
-        }
-        budget.charge(work);
-        state.left_resume_after = Some(left_key);
-        Self::store_selection_page(state, &page, true);
-        if page.continuation.is_some() {
-            return Ok(Step::Yield);
-        }
-
-        let before = finish_selection(state.best_before.as_deref(), state.ambiguous_before)?;
-        let after = finish_selection(state.best_after.as_deref(), state.ambiguous_after)?;
-        state.ambiguous_before = false;
-        state.ambiguous_after = false;
-        self.append_correction(&left, left_weight, before.as_ref(), after.as_ref(), output)?;
-        clear_candidate_state(state);
-        Ok(Step::Continue)
-    }
-
-    fn current_or_next_left(
-        &self,
-        right: &PreparedRow,
-        state: &AsOfContinuation,
-        budget: &TurnBudget,
-        access: TransactionAccess<'_>,
-    ) -> Result<NextLeft, AsOfJoinError> {
-        let rows = self.left_rows.access(access)?;
-        if state.candidate_resume_after.is_some() {
-            let key =
-                state
-                    .left_resume_after
-                    .as_ref()
-                    .ok_or(AsOfJoinError::InvalidContinuation(
-                        "candidate cursor has no current left row",
-                    ))?;
-            let weight = rows.get(key)?.ok_or(AsOfJoinError::InvalidIndex(
-                "current left row disappeared during right Claim",
-            ))?;
-            let parsed = parse_index_key(key)?;
-            validate_partition(&parsed, &right.partition)?;
-            let prepared = prepared_index_row(key.clone(), parsed, 0)?;
-            if !prepared.matchable {
-                return Err(AsOfJoinError::InvalidContinuation(
-                    "candidate cursor identifies a NULL-order left row",
-                ));
+            if !driving.matchable
+                || parsed.partition != driving.partition
+                || parsed.order.first() != Some(&1)
+                || !eligible
+            {
+                return Err(AsOfJoinError::InvalidResume(
+                    "left cursor is outside the driving influence interval",
+                )
+                .into());
             }
-            return Ok(NextLeft::Row(key.clone(), weight.get(), prepared));
-        }
-
-        // NULL-order left rows can never select any right candidate. Their order
-        // tuple starts with marker `0`; constrain the durable outer scan to marker
-        // `1` so a right presence transition does not rescan irrelevant history during historical rematch.
-        let range = prefix_range(matchable_partition_prefix(&right.partition));
-        let limit = ScanLimit::new(1, budget.remaining_bytes().max(1))
-            .expect("one ASOF left row and positive bytes form a valid limit");
-        let page = match rows.scan(
-            range.bounds(),
-            ScanDirection::Ascending,
-            state.left_resume_after.as_ref(),
-            limit,
-        ) {
-            Ok(page) => page,
-            Err(StoreError::ItemTooLarge { .. }) if !budget.is_empty() => {
-                return Ok(NextLeft::Yield);
-            }
-            Err(StoreError::ItemTooLarge { size, .. }) => {
-                let limit = ScanLimit::new(1, size.max(1))
-                    .expect("one item and positive observed bytes form a valid limit");
-                rows.scan(
-                    range.bounds(),
-                    ScanDirection::Ascending,
-                    state.left_resume_after.as_ref(),
-                    limit,
-                )?
-            }
-            Err(source) => return Err(source.into()),
-        };
-        let Some((key, weight)) = page.entries.into_iter().next() else {
-            return Ok(NextLeft::Exhausted);
-        };
-        let parsed = parse_index_key(&key)?;
-        validate_partition(&parsed, &right.partition)?;
-        let prepared = prepared_index_row(key.clone(), parsed, 0)?;
-        if !prepared.matchable {
-            return Err(AsOfJoinError::InvalidIndex(
-                "matchable left range contains a NULL-order row",
-            ));
-        }
-        Ok(NextLeft::Row(key, weight.get(), prepared))
-    }
-
-    fn selection_page(
-        &self,
-        left: &PreparedRow,
-        overlay: EventVisibility<'_>,
-        track_before: bool,
-        state: &AsOfContinuation,
-        budget: &TurnBudget,
-        access: TransactionAccess<'_>,
-    ) -> Result<Option<SelectionPage>, AsOfJoinError> {
-        let rows = self.right_rows.access(access)?;
-        // NULL-order right rows can never be candidates. Seek directly to the
-        // matchable marker so irrelevant right history cannot turn one left
-        // lookup (or each right-side rematch of a left row) into a full scan.
-        let range = prefix_range(matchable_partition_prefix(&left.partition));
-        let max_items = budget
-            .remaining_items()
-            .min(CANDIDATE_ITEMS)
-            .min(candidate_item_limit(
-                self.layout.candidate_schema.fields().len(),
-                left.key.len(),
-            ));
-        let max_bytes = budget.remaining_bytes().clamp(1, CANDIDATE_BYTES);
-        let Some(page) = merged_page(
-            &rows,
-            overlay,
-            &range,
-            state.candidate_resume_after.as_ref(),
-            max_items,
-            max_bytes,
-            budget.is_empty(),
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let mut eligible = Vec::with_capacity(page.entries.len());
-        for (index, candidate) in page.entries.iter().enumerate() {
-            if !candidate.visible_before && !candidate.visible_after {
-                continue;
-            }
-            let winner = winner_from_key(&candidate.key)?;
-            if self.candidate_is_eligible(left, &winner)? {
-                eligible.push(index);
-            }
-        }
-        let eligible_count = eligible.len();
-        let qualifying = self.evaluate_residual(left, &page.entries, &eligible)?;
-        let mut best_before = state
-            .best_before
-            .as_deref()
-            .map(winner_from_key)
-            .transpose()?;
-        let mut best_after = state
-            .best_after
-            .as_deref()
-            .map(winner_from_key)
-            .transpose()?;
-        let mut ambiguous_before = state.ambiguous_before;
-        let mut ambiguous_after = state.ambiguous_after;
-        for (index, qualifies) in eligible.into_iter().zip(qualifying) {
-            if !qualifies {
-                continue;
-            }
-            let candidate = &page.entries[index];
-            let winner = winner_from_key(&candidate.key)?;
-            if track_before && candidate.visible_before {
-                self.consider(left, &winner, &mut best_before, &mut ambiguous_before)?;
-            }
-            if candidate.visible_after {
-                self.consider(left, &winner, &mut best_after, &mut ambiguous_after)?;
-            }
-        }
-        let scalar_slots = self
-            .layout
-            .candidate_schema
-            .fields()
-            .len()
-            .saturating_mul(eligible_count)
-            .saturating_mul(size_of::<ScalarValue>());
-        let repeated_left = if self.layout.residual.is_some() {
-            left.key.len().saturating_mul(eligible_count)
-        } else {
-            0
-        };
-        Ok(Some(SelectionPage {
-            best_before,
-            best_after,
-            ambiguous_before,
-            ambiguous_after,
-            continuation: page.continuation,
-            work: (
-                page.work.0,
-                page.work
-                    .1
-                    .saturating_add(scalar_slots)
-                    .saturating_add(repeated_left),
-            ),
-        }))
-    }
-
-    fn evaluate_residual(
-        &self,
-        left: &PreparedRow,
-        candidates: &[MergedCandidate],
-        eligible: &[usize],
-    ) -> Result<Vec<bool>, AsOfJoinError> {
-        if self.layout.residual.is_none() {
-            return Ok(vec![true; eligible.len()]);
-        }
-        if eligible.is_empty() {
-            return Ok(Vec::new());
-        }
-        let left_values = decode_row(&self.layout.input_schemas[0], &prepared_row_bytes(left)?)?;
-        let left_fields = left_values.len();
-        let mut columns = (0..self.layout.candidate_schema.fields().len())
-            .map(|_| Vec::with_capacity(eligible.len()))
-            .collect::<Vec<Vec<ScalarValue>>>();
-        for index in eligible {
-            let candidate = &candidates[*index];
-            let winner = winner_from_key(&candidate.key)?;
-            let right_values = decode_row(&self.layout.input_schemas[1], &winner.row)?;
-            for (column, value) in columns[..left_fields].iter_mut().zip(&left_values) {
-                column.push(value.clone());
-            }
-            for (column, value) in columns[left_fields..].iter_mut().zip(right_values) {
-                column.push(value);
-            }
-        }
-        let arrays = columns
-            .into_iter()
-            .map(ScalarValue::iter_to_array)
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(eligible.len()));
-        let records = RecordBatch::try_new_with_options(
-            Arc::clone(&self.layout.candidate_schema),
-            arrays,
-            &options,
-        )?;
-        let predicate = self
-            .layout
-            .residual
-            .as_ref()
-            .expect("the residual path has a bound expression")
-            .evaluate(&records)
-            .map_err(|source| AsOfJoinError::ResidualExpression { source })?;
-        let predicate = predicate
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or(AsOfJoinError::ResidualArray)?;
-        if predicate.len() != eligible.len() {
-            return Err(AsOfJoinError::ResidualArray);
-        }
-        Ok((0..predicate.len())
-            .map(|index| predicate.is_valid(index) && predicate.value(index))
-            .collect())
-    }
-
-    fn consider(
-        &self,
-        left: &PreparedRow,
-        candidate: &Winner,
-        best: &mut Option<Winner>,
-        ambiguous: &mut bool,
-    ) -> Result<(), AsOfJoinError> {
-        debug_assert!(self.candidate_is_eligible(left, candidate)?);
-        let Some(current) = best.as_ref() else {
-            *best = Some(candidate.clone());
-            *ambiguous = false;
-            return Ok(());
-        };
-        if current.key == candidate.key {
-            return Ok(());
-        }
-        match self.compare_quality(left, candidate, current)? {
-            Ordering::Less => {
-                *best = Some(candidate.clone());
-                *ambiguous = false;
-            }
-            Ordering::Greater => {}
-            Ordering::Equal => {
-                debug_assert_eq!(self.layout.tie_fallback, AsOfTieFallback::Reject);
-                *ambiguous = true;
-            }
+            decode_canonical_row_bounded(&self.layout.input_schemas[0], &parsed.row, budget)?;
         }
         Ok(())
     }
-
-    fn candidate_is_eligible(
+    fn scan(
+        rows: &OrderedMapAccess<'_, Vec<u8>, NonZeroU64>,
+        range: Range,
+        direction: ScanDirection,
+        resume: Option<&Vec<u8>>,
+        items: usize,
+        budget: &mut StepBudget,
+    ) -> Result<dogpaddle_store::OrderedMapPage<Vec<u8>, NonZeroU64>, OperationError> {
+        let limit = ScanLimit::new(items, budget.remaining_bytes().max(1))?;
+        let page = rows
+            .scan(range, direction, resume, limit)
+            .map_err(|error| match error {
+                StoreError::ItemTooLarge { .. } => Box::new(BudgetExceeded) as OperationError,
+                error => Box::new(error),
+            })?;
+        budget.charge(
+            page.entries
+                .iter()
+                .map(|entry| entry.0.len().saturating_add(8))
+                .sum(),
+        )?;
+        Ok(page)
+    }
+    fn range_for_partition(partition: &[u8]) -> Range {
+        let prefix = matchable_partition_prefix(partition);
+        (
+            Bound::Included(prefix.clone()),
+            prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded),
+        )
+    }
+    fn bucket(
         &self,
-        left: &PreparedRow,
-        candidate: &Winner,
-    ) -> Result<bool, AsOfJoinError> {
-        if !left.matchable {
-            return Ok(false);
+        partition: &[u8],
+        order: &[u8],
+        overlay: Option<(&PreparedRow, bool)>,
+        budget: &mut StepBudget,
+        access: TransactionAccess<'_>,
+    ) -> Result<Candidates, OperationError> {
+        let prefix = order_prefix(partition, order);
+        let range = (
+            Bound::Included(prefix.clone()),
+            prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded),
+        );
+        let rows = self.right_rows.access(access)?;
+        let page = Self::scan(&rows, range, ScanDirection::Ascending, None, 3, budget)?;
+        if page.continuation.is_some() && page.entries.len() < 3 {
+            return Err(BudgetExceeded.into());
         }
-        if !matchable_order(&candidate.order)? {
-            return Ok(false);
-        }
-        let comparison = candidate.order.cmp(&left.order);
-        let eligible = match self.layout.direction {
-            AsOfDirection::Backward { allow_exact } => {
-                comparison == Ordering::Less || allow_exact && comparison == Ordering::Equal
+        let mut keys = page
+            .entries
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>();
+        if let Some((row, present)) = overlay {
+            keys.retain(|key| key != &row.key);
+            if present {
+                keys.push(row.key.clone());
             }
-            AsOfDirection::Forward { allow_exact } => {
-                comparison == Ordering::Greater || allow_exact && comparison == Ordering::Equal
-            }
-            AsOfDirection::Nearest { allow_exact, .. } => {
-                allow_exact || comparison != Ordering::Equal
-            }
-        };
-        if !eligible {
-            return Ok(false);
         }
-        if let Some(tolerance) = self.layout.tolerance
-            && self.distance(&left.order, &candidate.order)? > tolerance
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        let ambiguous = keys.len() > 1;
+        let winner = keys
+            .into_iter()
+            .next()
+            .map(|key| {
+                parse_row_key(&key).map(|parsed| Winner {
+                    key,
+                    row: parsed.row,
+                })
+            })
+            .transpose()?;
+        Ok(Candidates { winner, ambiguous })
     }
-
-    /// Compares candidate quality; `Less` means `candidate` is preferred.
-    fn compare_quality(
-        &self,
-        left: &PreparedRow,
-        candidate: &Winner,
-        current: &Winner,
-    ) -> Result<Ordering, AsOfJoinError> {
-        let order = if candidate.order == current.order {
-            Ordering::Equal
-        } else {
-            match self.layout.direction {
-                AsOfDirection::Backward { .. } => current.order.cmp(&candidate.order),
-                AsOfDirection::Forward { .. } => candidate.order.cmp(&current.order),
-                AsOfDirection::Nearest { equidistant, .. } => {
-                    let candidate_distance = self.distance(&left.order, &candidate.order)?;
-                    let current_distance = self.distance(&left.order, &current.order)?;
-                    match candidate_distance.cmp(&current_distance) {
-                        Ordering::Equal => match equidistant {
-                            AsOfEquidistantPreference::Backward => {
-                                candidate.order.cmp(&current.order)
-                            }
-                            AsOfEquidistantPreference::Forward => {
-                                current.order.cmp(&candidate.order)
-                            }
-                        },
-                        ordering => ordering,
-                    }
-                }
-            }
-        };
-        if order != Ordering::Equal {
-            return Ok(order);
-        }
-        let rank = candidate.rank.cmp(&current.rank);
-        if rank != Ordering::Equal {
-            return Ok(rank);
-        }
-        Ok(match self.layout.tie_fallback {
-            AsOfTieFallback::Reject => Ordering::Equal,
-            AsOfTieFallback::CanonicalAscending => candidate.row.cmp(&current.row),
-            AsOfTieFallback::CanonicalDescending => current.row.cmp(&candidate.row),
-        })
-    }
-
-    fn distance(&self, left: &[u8], right: &[u8]) -> Result<u128, AsOfJoinError> {
-        let field = &self.layout.orders[0].left.field;
-        match (decode_metric(field, left)?, decode_metric(field, right)?) {
-            (Metric::Signed(left), Metric::Signed(right)) => Ok(left.abs_diff(right)),
-            (Metric::Unsigned(left), Metric::Unsigned(right)) => Ok(left.abs_diff(right)),
-            _ => Err(AsOfJoinError::InvalidIndex(
-                "distance operands have different numeric domains",
-            )),
-        }
-    }
-
-    fn store_selection_page(
-        state: &mut AsOfContinuation,
-        page: &SelectionPage,
-        track_before: bool,
-    ) {
-        state.candidate_resume_after.clone_from(&page.continuation);
-        if track_before {
-            clone_winner_key(&mut state.best_before, page.best_before.as_ref());
-            state.ambiguous_before = page.ambiguous_before;
-        }
-        clone_winner_key(&mut state.best_after, page.best_after.as_ref());
-        state.ambiguous_after = page.ambiguous_after;
-    }
-
-    fn append_left_result(
+    fn neighbor(
         &self,
         row: &PreparedRow,
-        winner: Option<&Winner>,
-        output: &mut OutputRows,
-    ) -> Result<(), AsOfJoinError> {
-        let left = decode_row(&self.layout.input_schemas[0], &prepared_row_bytes(row)?)?;
-        match self.layout.kind {
-            AsOfJoinKind::Inner | AsOfJoinKind::LeftOuter => {
-                if let Some(winner) = winner {
-                    let right = decode_row(&self.layout.input_schemas[1], &winner.row)?;
-                    output.push(&left, &right, row.difference);
-                } else if self.layout.kind == AsOfJoinKind::LeftOuter {
-                    output.push(&left, &self.layout.right_nulls, row.difference);
-                }
-            }
-            AsOfJoinKind::LeftSemi => {
-                if winner.is_some() {
-                    output.push(&left, &[], row.difference);
-                }
-            }
-            AsOfJoinKind::LeftAnti => {
-                if winner.is_none() {
-                    output.push(&left, &[], row.difference);
-                }
-            }
+        forward: bool,
+        budget: &mut StepBudget,
+        access: TransactionAccess<'_>,
+    ) -> Result<Option<Vec<u8>>, OperationError> {
+        let prefix = order_prefix(&row.partition, &row.order);
+        let mut range = Self::range_for_partition(&row.partition);
+        if forward {
+            range.0 = prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Included);
+        } else {
+            range.1 = Bound::Excluded(prefix);
         }
-        Ok(())
-    }
-
-    fn append_correction(
-        &self,
-        left_row: &PreparedRow,
-        left_weight: u64,
-        before: Option<&Winner>,
-        after: Option<&Winner>,
-        output: &mut OutputRows,
-    ) -> Result<(), AsOfJoinError> {
-        if winner_key(before) == winner_key(after) {
-            return Ok(());
-        }
-        let before_matches = before.is_some();
-        let after_matches = after.is_some();
-        if self.layout.kind.left_only() {
-            let (before_emits, after_emits) = match self.layout.kind {
-                AsOfJoinKind::LeftSemi => (before_matches, after_matches),
-                AsOfJoinKind::LeftAnti => (!before_matches, !after_matches),
-                _ => unreachable!("left-only ASOF kind was checked"),
-            };
-            if before_emits != after_emits {
-                let left = decode_row(
-                    &self.layout.input_schemas[0],
-                    &prepared_row_bytes(left_row)?,
-                )?;
-                let difference = if after_emits {
-                    positive_difference(left_weight)?
-                } else {
-                    negative_difference(left_weight)?
-                };
-                output.push(&left, &[], difference);
-            }
-            return Ok(());
-        }
-
-        let left = decode_row(
-            &self.layout.input_schemas[0],
-            &prepared_row_bytes(left_row)?,
+        let rows = self.right_rows.access(access)?;
+        let page = Self::scan(
+            &rows,
+            range,
+            if forward {
+                ScanDirection::Ascending
+            } else {
+                ScanDirection::Descending
+            },
+            None,
+            1,
+            budget,
         )?;
-        if let Some(before) = before {
-            let right = decode_row(&self.layout.input_schemas[1], &before.row)?;
-            output.push(&left, &right, negative_difference(left_weight)?);
-        } else if self.layout.kind == AsOfJoinKind::LeftOuter {
-            output.push(
-                &left,
-                &self.layout.right_nulls,
-                negative_difference(left_weight)?,
-            );
+        page.entries
+            .into_iter()
+            .next()
+            .map(|entry| parse_row_key(&entry.0).map(|parsed| parsed.order))
+            .transpose()
+            .map_err(Into::into)
+    }
+    fn select(
+        &self,
+        left: &PreparedRow,
+        budget: &mut StepBudget,
+        access: TransactionAccess<'_>,
+    ) -> Result<Candidates, OperationError> {
+        if !left.matchable {
+            return Ok(Candidates {
+                winner: None,
+                ambiguous: false,
+            });
         }
-        if let Some(after) = after {
-            let right = decode_row(&self.layout.input_schemas[1], &after.row)?;
-            output.push(&left, &right, positive_difference(left_weight)?);
-        } else if self.layout.kind == AsOfJoinKind::LeftOuter {
-            output.push(
-                &left,
-                &self.layout.right_nulls,
-                positive_difference(left_weight)?,
-            );
+        let mut range = Self::range_for_partition(&left.partition);
+        let prefix = order_prefix(&left.partition, &left.order);
+        let forward = matches!(self.layout.direction, AsOfDirection::Forward { .. });
+        let inclusive = self.layout.direction.allow_exact();
+        if forward {
+            range.0 = if inclusive {
+                Bound::Included(prefix)
+            } else {
+                prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Included)
+            };
+        } else {
+            range.1 = if inclusive {
+                prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded)
+            } else {
+                Bound::Excluded(prefix)
+            };
         }
+        let rows = self.right_rows.access(access)?;
+        let page = Self::scan(
+            &rows,
+            range,
+            if forward {
+                ScanDirection::Ascending
+            } else {
+                ScanDirection::Descending
+            },
+            None,
+            2,
+            budget,
+        )?;
+        if page.continuation.is_some() && page.entries.len() < 2 {
+            return Err(BudgetExceeded.into());
+        }
+        let mut entries = page.entries.into_iter();
+        let Some(first) = entries.next() else {
+            return Ok(Candidates {
+                winner: None,
+                ambiguous: false,
+            });
+        };
+        let parsed = parse_row_key(&first.0)?;
+        let ambiguous = entries
+            .next()
+            .map(|entry| parse_row_key(&entry.0).map(|second| second.order == parsed.order))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Candidates {
+            winner: Some(Winner {
+                key: first.0,
+                row: parsed.row,
+            }),
+            ambiguous,
+        })
+    }
+    fn output(
+        &self,
+        left: &PreparedRow,
+        winner: Option<&Winner>,
+        difference: i64,
+        output: &mut Output,
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        let left = parse_row_key(&left.key)?;
+        budget.charge(
+            left.row
+                .len()
+                .saturating_add(winner.map_or(0, |winner| winner.row.len()))
+                .saturating_add(
+                    self.layout
+                        .output_schema
+                        .fields()
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ScalarValue>()),
+                )
+                .saturating_add(8),
+        )?;
+        let left = decode_canonical_row_bounded(&self.layout.input_schemas[0], &left.row, budget)?;
+        let right = winner
+            .map(|winner| {
+                decode_canonical_row_bounded(&self.layout.input_schemas[1], &winner.row, budget)
+            })
+            .transpose()?
+            .unwrap_or_else(|| self.layout.right_nulls.clone());
+        output.push(&left, &right, difference);
         Ok(())
     }
-
-    fn adjust_actual(
+    fn apply_weight(
         &self,
         port: usize,
         row: &PreparedRow,
-        effect: RowEffect,
+        after: Option<NonZeroU64>,
+        budget: &mut StepBudget,
         access: TransactionAccess<'_>,
-    ) -> Result<(), AsOfJoinError> {
-        let mut rows = self.rows(port).access(access)?;
-        let current = rows.get(&row.key)?.map_or(0, RowWeight::get);
-        if current != effect.before {
-            return Err(AsOfJoinError::InvalidIndex(
-                "actual row weight differs from admitted prefix",
-            ));
-        }
-        match RowWeight::new(effect.after) {
-            Some(weight) => rows.put(&row.key, &weight)?,
-            None => {
-                rows.erase(&row.key)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_applied(
-        &self,
-        row: &PreparedRow,
-        effect: RowEffect,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), AsOfJoinError> {
-        let rows = self.right_rows.access(access)?;
-        if rows.get(&row.key)?.map_or(0, RowWeight::get) != effect.after {
-            return Err(AsOfJoinError::InvalidIndex(
-                "paged right event is not at its admitted weight",
-            ));
-        }
-        Ok(())
-    }
-
-    fn advance_claim_row(
-        claim: &PreparedClaim,
-        state: &mut AsOfContinuation,
-        continuation: &mut CellAccess<'_, AsOfContinuation>,
-    ) -> Result<Step, AsOfJoinError> {
-        let next = continuation_row(claim, state)? + 1;
-        clear_outer_state(state);
-        if next < claim.rows.len() {
-            state.row = persistent_row(next)?;
-            return Ok(Step::Continue);
-        }
-        continuation.clear()?;
-        Ok(Step::Complete)
-    }
-
-    fn validate_continuation(
-        claim: &PreparedClaim,
-        state: &AsOfContinuation,
-    ) -> Result<(), AsOfJoinError> {
-        if usize::from(state.port) != claim.port {
-            return Err(AsOfJoinError::InvalidContinuation(
-                "port differs from the pinned input",
-            ));
-        }
-        let row_index = continuation_row(claim, state)?;
-        let row = &claim.rows[row_index];
-        if claim.port == 0 && state.left_resume_after.is_some() {
-            return Err(AsOfJoinError::InvalidContinuation(
-                "left Claim has an outer left-row cursor",
-            ));
-        }
-        if state.candidate_resume_after.is_some()
-            && claim.port == 1
-            && state.left_resume_after.is_none()
-        {
-            return Err(AsOfJoinError::InvalidContinuation(
-                "right candidate cursor has no current left row",
-            ));
-        }
-        if state.candidate_resume_after.is_none()
-            && (state.best_before.is_some()
-                || state.best_after.is_some()
-                || state.ambiguous_before
-                || state.ambiguous_after)
-        {
-            return Err(AsOfJoinError::InvalidContinuation(
-                "completed candidate scan retains selection state",
-            ));
-        }
-        if state.ambiguous_before && state.best_before.is_none()
-            || state.ambiguous_after && state.best_after.is_none()
-        {
-            return Err(AsOfJoinError::InvalidContinuation(
-                "ambiguity marker has no selected candidate",
-            ));
-        }
-        for key in [
-            state.candidate_resume_after.as_ref(),
-            state.best_before.as_ref(),
-            state.best_after.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let parsed = parse_index_key(key).map_err(|_| {
-                AsOfJoinError::InvalidContinuation("candidate key framing is invalid")
-            })?;
-            if parsed.partition != row.partition {
-                return Err(AsOfJoinError::InvalidContinuation(
-                    "candidate key is outside the current equality partition",
-                ));
-            }
-        }
-        if let Some(left) = &state.left_resume_after {
-            let parsed = parse_index_key(left).map_err(|_| {
-                AsOfJoinError::InvalidContinuation("left cursor framing is invalid")
-            })?;
-            if parsed.partition != row.partition {
-                return Err(AsOfJoinError::InvalidContinuation(
-                    "left cursor is outside the current equality partition",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn rows(&self, port: usize) -> &Rows {
-        match port {
-            0 => &self.left_rows,
-            1 => &self.right_rows,
-            _ => unreachable!("a prepared ASOF claim has a validated port"),
-        }
-    }
-}
-
-impl TurnOperation for AsOfJoinOperation {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        let Some(input) = input else {
-            return Ok(Turn::Idle);
+    ) -> Result<(), OperationError> {
+        budget.charge(row.key.len().saturating_add(8))?;
+        let mut rows = if port == 0 {
+            self.left_rows.access(access)?
+        } else {
+            self.right_rows.access(access)?
         };
-        self.validate_input(input)?;
-        if self.prepared.is_none() {
-            self.prepared = Some(self.prepare_claim(input)?);
+        if let Some(weight) = after {
+            rows.put(&row.key, &weight)?;
+        } else {
+            rows.erase(&row.key)?;
         }
-        let mut claim = self
-            .prepared
-            .take()
-            .expect("the prepared ASOF Claim was initialized above");
-        Ok(Turn::ready(move |access| {
-            let action = self.apply_claim(&mut claim, access)?;
-            let complete = matches!(&action, Action::Complete(_));
-            self.prepared = Some(claim);
-            let after_commit = if complete {
-                AfterCommit::local(move || {
-                    self.prepared = None;
-                    Ok(())
-                })
-            } else {
-                AfterCommit::none()
-            };
-            Ok((action, after_commit))
-        }))
-    }
-}
-
-fn adjusted_weight(weight: u64, difference: i64) -> Result<u64, AsOfJoinError> {
-    RowWeight::adjusted(RowWeight::new(weight), difference)
-        .map(|weight| weight.map_or(0, RowWeight::get))
-        .map_err(map_weight_error)
-}
-
-fn reverse_weight(weight: u64, difference: i64) -> Result<u64, AsOfJoinError> {
-    if difference >= 0 {
-        weight
-            .checked_sub(difference.unsigned_abs())
-            .ok_or(AsOfJoinError::NegativeWeight)
-    } else {
-        weight
-            .checked_add(difference.unsigned_abs())
-            .ok_or(AsOfJoinError::WeightOverflow)
-    }
-}
-
-const fn map_weight_error(error: RowWeightError) -> AsOfJoinError {
-    match error {
-        RowWeightError::Negative => AsOfJoinError::NegativeWeight,
-        RowWeightError::Overflow => AsOfJoinError::WeightOverflow,
-    }
-}
-
-fn merged_page(
-    rows: &OrderedMapAccess<'_, Vec<u8>, RowWeight>,
-    overlay: EventVisibility<'_>,
-    range: &KeyRange,
-    resume_after: Option<&Vec<u8>>,
-    max_items: usize,
-    max_bytes: usize,
-    allow_oversized: bool,
-) -> Result<Option<MergedPage>, AsOfJoinError> {
-    debug_assert!(max_items > 0);
-    debug_assert!(max_bytes > 0);
-    let limit = ScanLimit::new(max_items, max_bytes)
-        .expect("positive ASOF candidate page limits are valid");
-    let actual = match rows.scan(
-        range.bounds(),
-        ScanDirection::Ascending,
-        resume_after,
-        limit,
-    ) {
-        Ok(page) => page,
-        Err(StoreError::ItemTooLarge { .. }) if !allow_oversized => return Ok(None),
-        Err(StoreError::ItemTooLarge { size, .. }) => {
-            let limit = ScanLimit::new(1, size.max(1))
-                .expect("one item and a positive observed byte size are valid");
-            rows.scan(
-                range.bounds(),
-                ScanDirection::Ascending,
-                resume_after,
-                limit,
-            )?
-        }
-        Err(source) => return Err(source.into()),
-    };
-
-    // When the durable page has more entries, unseen actual keys can precede
-    // an overlay key after the page frontier. Defer every such overlay key so
-    // the conceptual merged scan remains globally ordered.
-    let frontier = actual
-        .continuation
-        .as_ref()
-        .and_then(|_| actual.entries.last().map(|(key, _)| key));
-    let mut keys = BTreeSet::<&[u8]>::new();
-    for (key, _) in &actual.entries {
-        keys.insert(key);
-    }
-    if let Some((key, _)) = overlay {
-        let bounds = (range.start_bytes(), range.end_bytes());
-        if RangeBounds::<[u8]>::contains(&bounds, key)
-            && resume_after.is_none_or(|resume| key > resume.as_slice())
-            && frontier.is_none_or(|last| key <= last.as_slice())
-        {
-            keys.insert(key);
-        }
-    }
-
-    let mut entries = Vec::new();
-    let mut examined = 0_usize;
-    let mut bytes = 0_usize;
-    let mut last_examined = None;
-    let mut stopped = false;
-    for key in keys {
-        let item_bytes = key.len().saturating_add(MAP_VALUE_BYTES).max(1);
-        let exceeds = examined >= max_items || bytes.saturating_add(item_bytes) > max_bytes;
-        if exceeds && (examined != 0 || !allow_oversized) {
-            stopped = true;
-            break;
-        }
-        examined = examined.saturating_add(1);
-        bytes = bytes.saturating_add(item_bytes);
-        last_examined = Some(key.to_vec());
-        let actual_present = actual
-            .entries
-            .binary_search_by(|(actual_key, _)| actual_key.as_slice().cmp(key))
-            .is_ok();
-        let (visible_before, visible_after) = overlay
-            .filter(|(event_key, _)| *event_key == key)
-            .map_or((actual_present, actual_present), |(_, effect)| {
-                (effect.before != 0, effect.after != 0)
-            });
-        if visible_before || visible_after {
-            entries.push(MergedCandidate {
-                key: key.to_vec(),
-                visible_before,
-                visible_after,
-            });
-        }
-    }
-    if stopped && last_examined.is_none() {
-        return Ok(None);
-    }
-    let has_more = stopped || actual.continuation.is_some();
-    let continuation = if has_more {
-        last_examined
-            .ok_or(AsOfJoinError::InvalidIndex(
-                "merged candidate page made no progress",
-            ))?
-            .into()
-    } else {
-        None
-    };
-    Ok(Some(MergedPage {
-        entries,
-        continuation,
-        work: (examined.max(1), bytes.max(1)),
-    }))
-}
-
-fn candidate_item_limit(field_count: usize, left_row_bytes: usize) -> usize {
-    let scalar_slots = field_count.max(1);
-    let by_scalar_count = CANDIDATE_SCALAR_VALUES / scalar_slots;
-    let per_candidate = left_row_bytes
-        .saturating_add(scalar_slots.saturating_mul(size_of::<ScalarValue>()))
-        .max(1);
-    let by_materialized_bytes = CANDIDATE_BYTES / per_candidate;
-    by_scalar_count.clamp(1, by_materialized_bytes.max(1))
-}
-
-fn winner_from_key(key: &[u8]) -> Result<Winner, AsOfJoinError> {
-    let parsed = parse_index_key(key)?;
-    Ok(Winner {
-        key: key.to_vec(),
-        order: parsed.order,
-        rank: parsed.rank,
-        row: parsed.row,
-    })
-}
-
-fn finish_selection(
-    winner: Option<&[u8]>,
-    ambiguous: bool,
-) -> Result<Option<Winner>, AsOfJoinError> {
-    if ambiguous {
-        Err(AsOfJoinError::AmbiguousTie)
-    } else {
-        winner.map(winner_from_key).transpose()
-    }
-}
-
-fn parse_index_key(key: &[u8]) -> Result<ParsedIndexKey, AsOfJoinError> {
-    parse_row_key(key).map_err(|_| AsOfJoinError::InvalidIndex("row key framing is invalid"))
-}
-
-fn prepared_index_row(
-    key: Vec<u8>,
-    parsed: ParsedIndexKey,
-    difference: i64,
-) -> Result<PreparedRow, AsOfJoinError> {
-    let matchable = matchable_order(&parsed.order)?;
-    Ok(PreparedRow {
-        key,
-        partition: parsed.partition,
-        order: parsed.order,
-        matchable,
-        difference,
-    })
-}
-
-fn validate_partition(parsed: &ParsedIndexKey, expected: &[u8]) -> Result<(), AsOfJoinError> {
-    if parsed.partition == expected {
         Ok(())
-    } else {
-        Err(AsOfJoinError::InvalidIndex(
-            "scanned row is outside its equality partition",
-        ))
     }
-}
-
-fn matchable_order(order: &[u8]) -> Result<bool, AsOfJoinError> {
-    let (&marker, mut remaining) = order
-        .split_first()
-        .ok_or(AsOfJoinError::InvalidIndex("order tuple is empty"))?;
-    let mut components = 0_usize;
-    while !remaining.is_empty() {
-        take_component(&mut remaining)
-            .map_err(|_| AsOfJoinError::InvalidIndex("order component framing is invalid"))?;
-        components = components.saturating_add(1);
-    }
-    if components == 0 {
-        return Err(AsOfJoinError::InvalidIndex(
-            "order tuple has no scalar components",
-        ));
-    }
-    match marker {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(AsOfJoinError::InvalidIndex(
-            "order matchability marker is invalid",
-        )),
-    }
-}
-
-fn decode_metric(field: &Field, order: &[u8]) -> Result<Metric, AsOfJoinError> {
-    if !matchable_order(order)? {
-        return Err(AsOfJoinError::InvalidIndex(
-            "NULL order value has no distance",
-        ));
-    }
-    let mut remaining = &order[1..];
-    let component = take_component(&mut remaining)
-        .map_err(|_| AsOfJoinError::InvalidIndex("distance component framing is invalid"))?;
-    if !remaining.is_empty() {
-        return Err(AsOfJoinError::InvalidIndex(
-            "distance order contains multiple components",
-        ));
-    }
-    let value = ordered_value(field, &component)
-        .map_err(|_| AsOfJoinError::InvalidIndex("distance scalar encoding is invalid"))?;
-    match value {
-        ScalarValue::Int8(Some(value)) => Ok(Metric::Signed(i128::from(value))),
-        ScalarValue::Int16(Some(value)) => Ok(Metric::Signed(i128::from(value))),
-        ScalarValue::Int32(Some(value)) | ScalarValue::Date32(Some(value)) => {
-            Ok(Metric::Signed(i128::from(value)))
+    fn affected_range(&self, right: &PreparedRow, outer_neighbor: Option<&[u8]>) -> Range {
+        let prefix = order_prefix(&right.partition, &right.order);
+        let inclusive = self.layout.direction.allow_exact();
+        let mut range = Self::range_for_partition(&right.partition);
+        if matches!(self.layout.direction, AsOfDirection::Forward { .. }) {
+            range.1 = if inclusive {
+                prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded)
+            } else {
+                Bound::Excluded(prefix)
+            };
+            if let Some(order) = outer_neighbor {
+                let prefix = order_prefix(&right.partition, order);
+                range.0 = if inclusive {
+                    prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Included)
+                } else {
+                    Bound::Included(prefix)
+                };
+            }
+        } else {
+            range.0 = if inclusive {
+                Bound::Included(prefix)
+            } else {
+                prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Included)
+            };
+            if let Some(order) = outer_neighbor {
+                let prefix = order_prefix(&right.partition, order);
+                range.1 = if inclusive {
+                    Bound::Excluded(prefix)
+                } else {
+                    prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded)
+                };
+            }
         }
-        ScalarValue::Int64(Some(value))
-        | ScalarValue::TimestampSecond(Some(value), _)
-        | ScalarValue::TimestampMillisecond(Some(value), _)
-        | ScalarValue::TimestampMicrosecond(Some(value), _)
-        | ScalarValue::TimestampNanosecond(Some(value), _) => Ok(Metric::Signed(i128::from(value))),
-        ScalarValue::Decimal128(Some(value), _, _) => Ok(Metric::Signed(value)),
-        ScalarValue::UInt8(Some(value)) => Ok(Metric::Unsigned(u128::from(value))),
-        ScalarValue::UInt16(Some(value)) => Ok(Metric::Unsigned(u128::from(value))),
-        ScalarValue::UInt32(Some(value)) => Ok(Metric::Unsigned(u128::from(value))),
-        ScalarValue::UInt64(Some(value)) => Ok(Metric::Unsigned(u128::from(value))),
-        _ => Err(AsOfJoinError::InvalidIndex(
-            "distance scalar has an unsupported type",
-        )),
+        range
     }
-}
-
-fn prefix_range(prefix: Vec<u8>) -> KeyRange {
-    let end = prefix_successor(&prefix).map_or(Bound::Unbounded, Bound::Excluded);
-    KeyRange {
-        start: Bound::Included(prefix),
-        end,
-    }
-}
-
-impl KeyRange {
-    fn bounds(&self) -> (Bound<&Vec<u8>>, Bound<&Vec<u8>>) {
-        (self.start.as_ref(), self.end.as_ref())
-    }
-
-    fn start_bytes(&self) -> Bound<&[u8]> {
-        match &self.start {
-            Bound::Included(key) => Bound::Included(key),
-            Bound::Excluded(key) => Bound::Excluded(key),
-            Bound::Unbounded => Bound::Unbounded,
+    fn right_page(
+        &self,
+        right: &PreparedRow,
+        weights: (Option<NonZeroU64>, Option<NonZeroU64>),
+        cursor: &mut AsOfCursor,
+        output: &mut Output,
+        budget: &mut StepBudget,
+        access: TransactionAccess<'_>,
+    ) -> Result<bool, OperationError> {
+        let (before, after) = weights;
+        if !right.matchable || before.is_some() == after.is_some() {
+            if cursor.left_resume_after.is_some() {
+                return Err(
+                    AsOfJoinError::InvalidResume("non-presence event has a left cursor").into(),
+                );
+            }
+            budget.consume_head(1)?;
+            self.apply_weight(1, right, after, budget, access)?;
+            return Ok(true);
+        }
+        let forward = matches!(self.layout.direction, AsOfDirection::Forward { .. });
+        let outer_neighbor = self.neighbor(right, !forward, budget, access)?;
+        let replacement_order = self.neighbor(right, forward, budget, access)?;
+        let range = self.affected_range(right, outer_neighbor.as_deref());
+        let rows = self.left_rows.access(access)?;
+        if let Some(key) = &cursor.left_resume_after {
+            if !std::ops::RangeBounds::contains(&range, key) {
+                return Err(AsOfJoinError::InvalidResume(
+                    "left cursor exceeds the adjacent influence interval",
+                )
+                .into());
+            }
+            budget.charge(key.len().saturating_add(8))?;
+            if rows.get_bounded(key, 8)?.is_none() {
+                return Err(AsOfJoinError::InvalidResume("left cursor row is absent").into());
+            }
+        }
+        let page = Self::scan(
+            &rows,
+            range,
+            ScanDirection::Ascending,
+            cursor.left_resume_after.as_ref(),
+            budget.head_remaining().max(1),
+            budget,
+        )?;
+        budget.consume_head(page.entries.len().max(1))?;
+        if !page.entries.is_empty() {
+            let old_bucket = self.bucket(&right.partition, &right.order, None, budget, access)?;
+            let new_bucket = self.bucket(
+                &right.partition,
+                &right.order,
+                Some((right, after.is_some())),
+                budget,
+                access,
+            )?;
+            let replacement = if old_bucket.winner.is_none() || new_bucket.winner.is_none() {
+                if let Some(order) = replacement_order {
+                    self.bucket(&right.partition, &order, None, budget, access)?
+                } else {
+                    Candidates {
+                        winner: None,
+                        ambiguous: false,
+                    }
+                }
+            } else {
+                Candidates {
+                    winner: None,
+                    ambiguous: false,
+                }
+            };
+            let old = if old_bucket.winner.is_some() {
+                old_bucket.checked()?
+            } else {
+                replacement.checked()?
+            };
+            let new = if new_bucket.winner.is_some() {
+                new_bucket.checked()?
+            } else {
+                replacement.checked()?
+            };
+            if old.map(|winner| &winner.key) != new.map(|winner| &winner.key) {
+                for entry in &page.entries {
+                    let parsed = parse_row_key(&entry.0)?;
+                    let left = PreparedRow {
+                        key: entry.0.clone(),
+                        partition: parsed.partition,
+                        order: parsed.order,
+                        matchable: true,
+                        difference: 1,
+                    };
+                    let positive = i64::try_from(entry.1.get())
+                        .map_err(|_| AsOfJoinError::OutputDifferenceOverflow)?;
+                    self.output(&left, old, -positive, output, budget)?;
+                    self.output(&left, new, positive, output, budget)?;
+                }
+            }
+        }
+        if let Some(key) = page.continuation {
+            cursor.left_resume_after = Some(key);
+            Ok(false)
+        } else {
+            self.apply_weight(1, right, after, budget, access)?;
+            cursor.left_resume_after = None;
+            Ok(true)
         }
     }
-
-    fn end_bytes(&self) -> Bound<&[u8]> {
-        match &self.end {
-            Bound::Included(key) => Bound::Included(key),
-            Bound::Excluded(key) => Bound::Excluded(key),
-            Bound::Unbounded => Bound::Unbounded,
+}
+impl PagedOperation for AsOfJoinOperation {
+    fn initial_resume(&self) -> Resume {
+        Resume {
+            ordinal: 0,
+            cursor: Cursor::AsOf(AsOfCursor {
+                left_resume_after: None,
+            }),
         }
     }
-}
-
-fn clear_candidate_state(state: &mut AsOfContinuation) {
-    state.candidate_resume_after = None;
-    state.best_before = None;
-    state.best_after = None;
-    state.ambiguous_before = false;
-    state.ambiguous_after = false;
-}
-
-fn clear_outer_state(state: &mut AsOfContinuation) {
-    state.left_resume_after = None;
-    clear_candidate_state(state);
-}
-
-fn selection_state_is_empty(state: &AsOfContinuation) -> bool {
-    state.candidate_resume_after.is_none()
-        && state.best_before.is_none()
-        && state.best_after.is_none()
-        && !state.ambiguous_before
-        && !state.ambiguous_after
-}
-
-fn continuation_row(
-    claim: &PreparedClaim,
-    state: &AsOfContinuation,
-) -> Result<usize, AsOfJoinError> {
-    usize::try_from(state.row)
-        .ok()
-        .filter(|row| *row < claim.rows.len())
-        .ok_or(AsOfJoinError::InvalidContinuation(
-            "row is outside the pinned input",
-        ))
-}
-
-fn persistent_row(row: usize) -> Result<u64, AsOfJoinError> {
-    u64::try_from(row).map_err(|_| AsOfJoinError::InvalidContinuation("input row exceeds u64"))
-}
-
-fn decode_row(schema: &SchemaRef, row: &[u8]) -> Result<Vec<ScalarValue>, AsOfJoinError> {
-    decode_canonical_row(schema.as_ref(), row).map_err(|source| AsOfJoinError::CanonicalRow {
-        source: Box::new(source),
-    })
-}
-
-fn prepared_row_bytes(row: &PreparedRow) -> Result<Vec<u8>, AsOfJoinError> {
-    Ok(parse_index_key(&row.key)?.row)
-}
-
-fn winner_key(winner: Option<&Winner>) -> Option<&[u8]> {
-    winner.map(|winner| winner.key.as_slice())
-}
-
-fn clone_winner_key(target: &mut Option<Vec<u8>>, source: Option<&Winner>) {
-    match (target.as_mut(), source) {
-        (Some(target), Some(source)) => target.clone_from(&source.key),
-        (_, Some(source)) => *target = Some(source.key.clone()),
-        (_, None) => *target = None,
+    fn validate_resume(
+        &self,
+        input: OperationInput<'_>,
+        resume: &Resume,
+    ) -> Result<(), OperationError> {
+        let cursor = self.cursor(input, resume)?;
+        if cursor.left_resume_after.is_some() {
+            let slice = input
+                .change
+                .try_slice(usize::try_from(resume.ordinal)?, 1)?;
+            let mut budget = StepBudget::new(1, 4 * 1024 * 1024);
+            let driving = self.prepare(
+                OperationInput {
+                    port: input.port,
+                    change: &slice,
+                },
+                &mut budget,
+            )?;
+            self.validate_cursor_binding(cursor, &driving[0], &mut budget)?;
+        }
+        Ok(())
+    }
+    fn step(
+        &self,
+        input: OperationInput<'_>,
+        resume: &Resume,
+        access: TransactionAccess<'_>,
+        budget: &mut StepBudget,
+    ) -> Result<Step, OperationError> {
+        let cursor = self.cursor(input, resume)?;
+        let start = usize::try_from(resume.ordinal)?;
+        let length = budget.head_remaining().min(input.change.num_rows() - start);
+        if length == 0 {
+            return Err(BudgetExceeded.into());
+        }
+        let slice = input.change.try_slice(start, length)?;
+        let rows = self.prepare(
+            OperationInput {
+                port: input.port,
+                change: &slice,
+            },
+            budget,
+        )?;
+        self.validate_cursor_binding(cursor, &rows[0], budget)?;
+        let mut cursor = cursor.clone();
+        let mut next = start;
+        let mut output = Output::new(self.layout.output_schema.fields().len());
+        for row in &rows {
+            if budget.head_remaining() == 0 {
+                break;
+            }
+            budget.charge(row.key.len().saturating_add(8))?;
+            let before = if input.port == 0 {
+                self.left_rows.access(access)?.get_bounded(&row.key, 8)?
+            } else {
+                self.right_rows.access(access)?.get_bounded(&row.key, 8)?
+            };
+            let after =
+                dogpaddle_store::checked_weight(before.map_or(0, NonZeroU64::get), row.difference)
+                    .map(NonZeroU64::new)
+                    .map_err(|error| match error {
+                        StoreError::MultiplicityUnderflow => AsOfJoinError::NegativeWeight,
+                        StoreError::MultiplicityOverflow => AsOfJoinError::WeightOverflow,
+                        error => AsOfJoinError::Store(error),
+                    })?;
+            if input.port == 0 {
+                let winner = self.select(row, budget, access)?;
+                self.output(row, winner.checked()?, row.difference, &mut output, budget)?;
+                self.apply_weight(0, row, after, budget, access)?;
+                budget.consume_head(1)?;
+            } else if !self.right_page(
+                row,
+                (before, after),
+                &mut cursor,
+                &mut output,
+                budget,
+                access,
+            )? {
+                break;
+            }
+            next += 1;
+        }
+        let progress = if next == input.change.num_rows() {
+            Progress::Done
+        } else {
+            Progress::More(Resume {
+                ordinal: u64::try_from(next)?,
+                cursor: Cursor::AsOf(cursor),
+            })
+        };
+        if matches!(&progress,Progress::More(next)if next==resume) {
+            return Err(BudgetExceeded.into());
+        }
+        Ok(Step {
+            output: output.finish(&self.layout.output_schema)?,
+            progress,
+        })
     }
 }
-
-fn positive_difference(weight: u64) -> Result<i64, AsOfJoinError> {
-    i64::try_from(weight).map_err(|_| AsOfJoinError::OutputDifferenceOverflow)
-}
-
-fn negative_difference(weight: u64) -> Result<i64, AsOfJoinError> {
-    i64::try_from(-i128::from(weight)).map_err(|_| AsOfJoinError::OutputDifferenceOverflow)
-}
-
-fn add_work(left: (usize, usize), right: (usize, usize)) -> (usize, usize) {
-    (
-        left.0.saturating_add(right.0),
-        left.1.saturating_add(right.1),
-    )
-}
-
-fn left_result_work(
-    kind: AsOfJoinKind,
-    left: &PreparedRow,
-    winner: Option<&Winner>,
-) -> (usize, usize) {
-    let emits = match kind {
-        AsOfJoinKind::Inner | AsOfJoinKind::LeftSemi => winner.is_some(),
-        AsOfJoinKind::LeftOuter => true,
-        AsOfJoinKind::LeftAnti => winner.is_none(),
-    };
-    let mut bytes = TurnBudget::stored_row_work(left).1;
-    if emits {
-        bytes = bytes
-            .saturating_add(decoded_row_work(&left.key))
-            .saturating_add(winner.map_or(0, |winner| decoded_row_work(&winner.row)));
-    }
-    (1, bytes.max(1))
-}
-
-fn correction_work(
-    kind: AsOfJoinKind,
-    left: &PreparedRow,
-    _left_weight: u64,
-    before: Option<&Winner>,
-    after: Option<&Winner>,
-) -> (usize, usize) {
-    if before.map(|winner| winner.key.as_slice()) == after.map(|winner| winner.key.as_slice()) {
-        return TurnBudget::stored_row_work(left);
-    }
-    let output_rows = if kind.left_only() {
-        usize::from(before.is_some() != after.is_some())
-    } else {
-        usize::from(before.is_some() || kind == AsOfJoinKind::LeftOuter).saturating_add(
-            usize::from(after.is_some() || kind == AsOfJoinKind::LeftOuter),
-        )
-    };
-    let mut bytes = TurnBudget::stored_row_work(left).1;
-    bytes = bytes.saturating_add(decoded_row_work(&left.key).saturating_mul(output_rows));
-    if !kind.left_only() {
-        bytes = bytes
-            .saturating_add(before.map_or(0, |winner| decoded_row_work(&winner.row)))
-            .saturating_add(after.map_or(0, |winner| decoded_row_work(&winner.row)));
-    }
-    (output_rows.max(1), bytes.max(1))
-}
-
-fn decoded_row_work(row: &[u8]) -> usize {
-    row.len().saturating_mul(2).max(1)
-}
-
-impl TurnBudget {
-    const fn new() -> Self {
-        Self { items: 0, bytes: 0 }
-    }
-
-    fn can_start(&self, row: &PreparedRow) -> bool {
-        self.is_empty()
-            || self.items < TURN_ITEMS
-                && self.bytes < TURN_BYTES
-                && Self::stored_row_work(row).1 <= self.remaining_bytes().max(1)
-    }
-
-    fn remaining_items(&self) -> usize {
-        TURN_ITEMS.saturating_sub(self.items).max(1)
-    }
-
-    fn remaining_bytes(&self) -> usize {
-        TURN_BYTES.saturating_sub(self.bytes)
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.items == 0
-    }
-
-    fn can_accept(&self, work: (usize, usize)) -> bool {
-        self.is_empty()
-            || self.items.saturating_add(work.0) <= TURN_ITEMS
-                && self.bytes.saturating_add(work.1) <= TURN_BYTES
-    }
-
-    fn charge(&mut self, work: (usize, usize)) {
-        self.items = self.items.saturating_add(work.0);
-        self.bytes = self.bytes.saturating_add(work.1);
-    }
-
-    fn exhausted(&self) -> bool {
-        self.items >= TURN_ITEMS || self.bytes >= TURN_BYTES
-    }
-
-    fn stored_row_work(row: &PreparedRow) -> (usize, usize) {
-        (1, row.key.len().saturating_add(MAP_VALUE_BYTES).max(1))
-    }
-}
-
-impl OutputRows {
-    fn new(column_count: usize) -> Self {
+impl Output {
+    fn new(fields: usize) -> Self {
         Self {
-            columns: (0..column_count).map(|_| Vec::new()).collect(),
+            columns: (0..fields).map(|_| Vec::new()).collect(),
             differences: Vec::new(),
         }
     }
-
-    fn push(&mut self, left: &[ScalarValue], right: &[ScalarValue], difference: i64) {
-        debug_assert_eq!(self.columns.len(), left.len() + right.len());
+    fn push(&mut self, left: &[ScalarValue], right: &[ScalarValue], diff: i64) {
         for (column, value) in self.columns.iter_mut().zip(left.iter().chain(right)) {
             column.push(value.clone());
         }
-        self.differences.push(difference);
+        self.differences.push(diff);
     }
-
-    fn finish(self, schema: &SchemaRef) -> Result<Option<Change>, AsOfJoinError> {
+    fn finish(self, schema: &arrow_schema::SchemaRef) -> Result<Option<Change>, OperationError> {
         if self.differences.is_empty() {
             return Ok(None);
         }
-        let row_count = self.differences.len();
-        let columns = self
+        let count = self.differences.len();
+        let arrays = self
             .columns
             .into_iter()
             .map(ScalarValue::iter_to_array)
             .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-        let records = RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)?;
+        let records = RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(count)),
+        )?;
         Ok(Some(Change::try_new(
             records,
             Int64Array::from(self.differences),
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{col, expression::StoredExpression};
+    use arrow_schema::{DataType, Schema};
+    use dogpaddle_store::StoreSetup;
+
+    #[test]
+    fn rejected_key_encoding_accounts_for_copied_bytes_and_admits_order_payload_first() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Binary, false),
+            Field::new("at", DataType::Int64, false),
+        ]));
+        let scalar = |name: &str, data_type| BoundScalar {
+            expression: StoredExpression::try_new(col(name))
+                .unwrap()
+                .bind(Arc::clone(&schema))
+                .unwrap(),
+            field: Arc::new(Field::new(name, data_type, false)),
+        };
+        let mut setup = StoreSetup::new();
+        let mut operation = AsOfJoinOperation {
+            layout: AsOfJoinLayout {
+                direction: AsOfDirection::Backward { allow_exact: true },
+                input_schemas: [Arc::clone(&schema), Arc::clone(&schema)],
+                output_schema: Arc::clone(&schema),
+                equalities: Box::new([BoundPair {
+                    left: scalar("key", DataType::Binary),
+                    right: scalar("key", DataType::Binary),
+                }]),
+                order: BoundPair {
+                    left: scalar("at", DataType::Int64),
+                    right: scalar("at", DataType::Int64),
+                },
+                right_nulls: vec![],
+            },
+            left_rows: setup.data_scope().data("left").unwrap(),
+            right_rows: setup.data_scope().data("right").unwrap(),
+        };
+        let change = Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow_array::BinaryArray::from(vec![
+                        vec![1; 1024].as_slice(),
+                    ])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap(),
+            Int64Array::from(vec![1]),
+        )
+        .unwrap();
+        let mut budget = StepBudget::new(1, 1800);
+        let error = operation
+            .prepare(
+                OperationInput {
+                    port: 0,
+                    change: &change,
+                },
+                &mut budget,
+            )
+            .err()
+            .unwrap();
+        assert!(error.is::<BudgetExceeded>());
+        assert_eq!(
+            budget.remaining_bytes(),
+            1800 - size_of::<PreparedRow>() - (1024 + 8) - (1 + 8)
+        );
+        operation.layout.equalities = Box::new([]);
+        operation.layout.order = BoundPair {
+            left: scalar("key", DataType::Binary),
+            right: scalar("key", DataType::Binary),
+        };
+        let mut budget = StepBudget::new(1, 4200);
+        let error = operation
+            .prepare(
+                OperationInput {
+                    port: 0,
+                    change: &change,
+                },
+                &mut budget,
+            )
+            .err()
+            .unwrap();
+        assert!(error.is::<BudgetExceeded>());
+        // The evaluated array is charged, but the next owned copies are
+        // rejected together before any partial order component is built.
+        assert_eq!(
+            budget.remaining_bytes(),
+            4200 - size_of::<PreparedRow>() - (1024 + 8)
+        );
+    }
+
+    #[test]
+    fn byte_truncated_bucket_cannot_infer_uniqueness_or_overlay_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("at", DataType::Int64, false)]));
+        let scalar = || BoundScalar {
+            expression: StoredExpression::try_new(col("at"))
+                .unwrap()
+                .bind(Arc::clone(&schema))
+                .unwrap(),
+            field: Arc::new(Field::new("at", DataType::Int64, false)),
+        };
+        let mut setup = StoreSetup::new();
+        let operation = AsOfJoinOperation {
+            layout: AsOfJoinLayout {
+                direction: AsOfDirection::Forward { allow_exact: true },
+                input_schemas: [Arc::clone(&schema), Arc::clone(&schema)],
+                output_schema: Arc::clone(&schema),
+                equalities: Box::new([]),
+                order: BoundPair {
+                    left: scalar(),
+                    right: scalar(),
+                },
+                right_nulls: vec![],
+            },
+            left_rows: setup.data_scope().data("left").unwrap(),
+            right_rows: setup.data_scope().data("right").unwrap(),
+        };
+        let mut transactions = setup.commit(root.path().join("store"), |_| Ok(())).unwrap();
+        let partition = vec![1];
+        let order = vec![1];
+        let small = row_key(&partition, &order, &[1]);
+        let large = row_key(&partition, &order, &vec![2; 64 * 1024]);
+        {
+            let transaction = transactions.begin();
+            let mut rows = operation.right_rows.access(transaction.access()).unwrap();
+            for key in [&small, &large] {
+                rows.put(key, &NonZeroU64::new(1).unwrap()).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let removed = PreparedRow {
+            key: small,
+            partition: partition.clone(),
+            order: order.clone(),
+            matchable: true,
+            difference: -1,
+        };
+        let transaction = transactions.begin();
+        for overlay in [None, Some((&removed, false))] {
+            let error = operation
+                .bucket(
+                    &partition,
+                    &order,
+                    overlay,
+                    &mut StepBudget::new(1, 16 * 1024),
+                    transaction.access(),
+                )
+                .err()
+                .unwrap();
+            assert!(error.is::<BudgetExceeded>());
+        }
+        let before = operation
+            .bucket(
+                &partition,
+                &order,
+                None,
+                &mut StepBudget::new(1, 4 * 1024 * 1024),
+                transaction.access(),
+            )
+            .unwrap();
+        assert!(before.ambiguous);
+        let after = operation
+            .bucket(
+                &partition,
+                &order,
+                Some((&removed, false)),
+                &mut StepBudget::new(1, 4 * 1024 * 1024),
+                transaction.access(),
+            )
+            .unwrap();
+        assert!(!after.ambiguous);
+        assert_eq!(after.winner.unwrap().key, large);
     }
 }

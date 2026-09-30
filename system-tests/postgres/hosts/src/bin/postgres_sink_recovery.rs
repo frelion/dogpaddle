@@ -2,8 +2,8 @@
 //! `system-tests/postgres/check_sink.py`.
 //!
 //! The caller retains the complete input until `Complete`, then drives durable
-//! buffered delivery with explicit no-input turns. Fault boundaries use the
-//! public staged-turn API, not product test hooks.
+//! buffered delivery with explicit no-input steps. Fault boundaries use the
+//! public load/prepare/persist/deliver/settle API.
 
 use std::{
     env,
@@ -22,11 +22,11 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     RuntimeResource, decode_definition, encode_definition,
     operation::{
-        Action, Operation, OperationError, OperationInput, Turn,
+        Operation, OperationError,
         sink::{PostgresSinkConfig, PostgresSinkDefinition},
     },
 };
-use dogpaddle_store::{Cell, Store, Transactions};
+use dogpaddle_store::{Cell, ReadTransactions, Store, Transactions};
 use serde_json::{Value, json};
 
 const OPERATION_PREFIX: &str = "operation";
@@ -36,6 +36,7 @@ struct Host {
     operation: Operation,
     state: Cell<Vec<u8>>,
     transactions: Transactions,
+    reads: ReadTransactions,
 }
 
 impl Host {
@@ -93,49 +94,67 @@ impl Host {
             )?
             .into_parts()
             .0;
+        let state = store.open_data(SINK_CONTROL)?;
+        let (transactions, reads) = store.into_transactions().split();
         Ok(Self {
             operation,
-            state: store.open_data(SINK_CONTROL)?,
-            transactions: store.into_transactions(),
+            state,
+            transactions,
+            reads,
         })
     }
 
     fn advance(&mut self, command: &str, change: Option<&Change>) -> Result<Value, OperationError> {
-        let prepared = match self
-            .operation
-            .turn(change.map(|change| OperationInput { port: 0, change }))
-        {
-            Ok(Turn::Ready(prepared)) => prepared,
-            Ok(Turn::Idle) => {
-                return Ok(json!({"kind": "advance", "outcome": "Idle"}));
+        let Operation::Sink(sink) = &mut self.operation else {
+            return Err("expected sink".into());
+        };
+        if let Some(change) = change {
+            let txn = self.transactions.begin();
+            let before = self.state.access(txn.access())?.get()?;
+            if sink.try_enqueue(txn.access(), change)? {
+                if command == "rollback" {
+                    drop(txn);
+                    return Ok(
+                        json!({"kind": "rollback", "unchanged": self.state.read(self.reads.begin().access())?.get()? == before}),
+                    );
+                }
+                txn.commit()?;
+                return Ok(json!({"kind": "advance", "outcome": "Complete"}));
             }
-            // Ordinary turn errors leave the same runtime retryable. Errors
-            // from apply/completion remain fatal in this small protocol host.
+        }
+        let pending = sink.load(self.reads.begin().access())?;
+        let Some(pending) = pending else {
+            return Ok(json!({"kind": "advance", "outcome": "Idle"}));
+        };
+        let prepared = match sink.prepare(pending) {
+            Ok(prepared) => prepared,
             Err(error) => return Ok(json!({"kind": "error", "message": error.to_string()})),
         };
-        let transaction = self.transactions.begin();
-        let before = self.state.access(transaction.access())?.get()?;
-        let (action, completion) = prepared.apply(transaction.access())?;
-        let action = match action {
-            Action::Commit(None) => "Commit",
-            Action::Complete(None) => "Complete",
-            _ => return Err("sink returned an unexpected action".into()),
-        };
-        if command == "rollback" {
-            drop(completion);
-            drop(transaction);
-            let transaction = self.transactions.begin();
-            let unchanged = self.state.access(transaction.access())?.get()? == before;
-            return Ok(json!({"kind": "rollback", "unchanged": unchanged}));
+        {
+            let txn = self.transactions.begin();
+            let before = self.state.access(txn.access())?.get()?;
+            sink.persist_prepared(txn.access(), &prepared)?;
+            if command == "rollback" {
+                drop(txn);
+                return Ok(
+                    json!({"kind": "rollback", "unchanged": self.state.read(self.reads.begin().access())?.get()? == before}),
+                );
+            }
+            txn.commit()?;
         }
-        transaction.commit()?;
         if command == "prepare-only" {
-            // The driver kills this process immediately, then reopens it.
-            drop(completion);
             return Ok(json!({"kind": "prepared"}));
         }
-        completion.run()?;
-        Ok(json!({"kind": "advance", "outcome": action}))
+        sink.deliver(&prepared)?;
+        if command == "deliver-only" {
+            return Ok(json!({"kind": "delivered"}));
+        }
+        {
+            let txn = self.transactions.begin();
+            sink.settle(txn.access(), &prepared)?;
+            txn.commit()?;
+        }
+        Ok(json!({"kind": "advance", "outcome": "Commit"}))
     }
 }
 
@@ -295,7 +314,9 @@ fn main() -> Result<(), OperationError> {
     for line in io::stdin().lock().lines() {
         let line = line?;
         let mut parts = line.split_ascii_whitespace();
-        let Some(command @ ("advance" | "rollback" | "prepare-only")) = parts.next() else {
+        let Some(command @ ("advance" | "rollback" | "prepare-only" | "deliver-only")) =
+            parts.next()
+        else {
             return Err("unsupported command".into());
         };
         let stage = parts.next();

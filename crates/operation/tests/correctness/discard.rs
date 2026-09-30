@@ -2,16 +2,12 @@ use std::num::NonZeroU32;
 
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, RuntimeResource, decode_definition,
-    operation::{
-        Action, OperationInput, Turn,
-        sink::{DiscardDefinition, DiscardError},
-    },
+    operation::sink::DiscardDefinition,
 };
-use dogpaddle_store::{Store, StoreSetup};
+use dogpaddle_store::StoreSetup;
 
 use super::support::{
-    TestStore, assert_literal_definition, change, commit_ready, construct_checked, decode_hex,
-    rollback_ready, turn_input, value_schema,
+    TestStore, assert_literal_definition, change, construct_checked, decode_hex, value_schema,
 };
 
 const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
@@ -37,11 +33,11 @@ fn definition_has_stable_v1_literal_and_is_a_data_free_exact_sink() {
 }
 
 #[test]
-fn runtime_completes_input_idles_without_input_and_rejects_invalid_ports() {
-    let input = change(&[1, -1]);
+fn enqueue_completes_without_outbox_or_target_work() {
     let root = TestStore::new();
+    let input = change(&[1, -1]);
     let mut setup = StoreSetup::new();
-    let (mut operation, output) = decoded_definition()
+    let (operation, _) = decoded_definition()
         .construct(
             &[input.schema()],
             &mut setup.data_scope().scoped("operation"),
@@ -49,41 +45,12 @@ fn runtime_completes_input_idles_without_input_and_rejects_invalid_ports() {
         )
         .unwrap()
         .into_parts();
-    assert!(output.is_none());
-    let mut transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
-    assert!(matches!(
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
-        Action::Complete(None)
-    ));
-    assert!(matches!(operation.turn(None).unwrap(), Turn::Idle));
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
-            port: 1,
-            change: &input,
-        }),
-        &mut transactions,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<DiscardError>(),
-        Some(DiscardError::InvalidInputPort { port: 1 })
-    ));
-
-    drop((operation, transactions));
-    let store = Store::open(root.path()).unwrap();
-    let (mut operation, output) = decoded_definition()
-        .construct(
-            &[input.schema()],
-            &mut store.data_scope().scoped("operation"),
-            RuntimeResource::none(),
-        )
-        .unwrap()
-        .into_parts();
-    assert!(output.is_none());
-    let mut transactions = store.into_transactions();
-    assert!(matches!(
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions,).unwrap(),
-        Action::Complete(None)
-    ));
+    let (mut writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+    let dogpaddle_operation::operation::Operation::Sink(mut sink) = operation else {
+        panic!("expected sink");
+    };
+    let txn = writes.begin();
+    assert!(sink.try_enqueue(txn.access(), &input).unwrap());
+    txn.commit().unwrap();
+    assert!(sink.load(reads.begin().access()).unwrap().is_none());
 }

@@ -6,6 +6,9 @@
 - **路线**：[`DEBEZIUM_ROADMAP.md`](../../DEBEZIUM_ROADMAP.md)
 - **决策来源**：[GitHub #2](https://github.com/frelion/dogpaddle/issues/2)
 
+> JVM 嵌入决策保留；本文中的 Station、turn 与提交回调描述属于历史实现。
+> 当前持久交接协议见 [CDC 契约](../../crates/operation/docs/cdc.md) 和 [Flow 运行契约](../../crates/flow/docs/runtime.md)。
+
 ## 背景
 
 DogPaddle 是嵌入 Rust 应用进程的持久 Dataflow 引擎。现有运行模型有几个对 CDC 至关

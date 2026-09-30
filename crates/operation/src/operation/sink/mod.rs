@@ -1,6 +1,6 @@
 //! Sink operations that consume records without producing output.
 
-mod buffered;
+pub(crate) mod buffered;
 mod relation;
 
 pub(crate) mod clickhouse;
@@ -13,7 +13,7 @@ pub use clickhouse::{
     ClickHouseSinkConfig, ClickHouseSinkDefinition, ClickHouseSinkError, ClickHouseSinkSchemaError,
     ClickHouseTargetSpec,
 };
-pub use discard::{DiscardDefinition, DiscardError};
+pub use discard::DiscardDefinition;
 pub use doris::{
     DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
 };

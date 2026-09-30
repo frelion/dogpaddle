@@ -9,10 +9,10 @@ DogPaddle 是 Rust 2024 工作区。使用根 `Cargo.toml` 指定的 **Rust 1.96
 | 领域 | 当前约束入口 |
 | --- | --- |
 | Arrow Schema、Change、事件顺序、IPC 与投影 | [Change README](crates/change/README.md) |
-| 事务能力、catalog、六种类型化集合、分页与容量 | [Store README](crates/store/README.md) |
+| 事务能力、catalog、三种类型化集合、分页与容量 | [Store README](crates/store/README.md) |
 | JVM payload、Delivery/checkpoint、start/poll/ack/stop | [Debezium README](crates/debezium/README.md) |
 | Operation 构造、表达式、关系算子、CDC 和 Sink | [Operation README](crates/operation/README.md) 及其 `docs/` 契约 |
-| 算子图、自动 Station 划分、构建/恢复、事务与调度 | [Flow README](crates/flow/README.md) 及 [运行契约](crates/flow/docs/runtime.md) |
+| 算子图、持久调用栈、构建/恢复、事务与调度 | [Flow README](crates/flow/README.md) 及 [运行契约](crates/flow/docs/runtime.md) |
 | SQL subset、endpoint、identity、start 与 lowering | [SQL README](crates/sql/README.md) |
 | 唯一产品命令、状态路径与停止行为 | [CLI README](crates/dogpaddle/README.md) |
 | 测试所有权、系统 host、数据规格和性能口径 | [TESTING.md](TESTING.md) |
@@ -24,15 +24,14 @@ DogPaddle 是 Rust 2024 工作区。使用根 `Cargo.toml` 指定的 **Rust 1.96
 
 - Change 的库和正常依赖不依赖 Flow、Operation 或 Store；Store 不依赖 Arrow 或其他引擎层。
 - Debezium 是独立进程内 runtime，不依赖 Change、Store、Operation 或 Flow。
-- Operation 只拥有计算、类型化状态和具体外部适配，不依赖 Flow；Station 只在 Flow 内部存在。
+- Operation 只拥有计算、类型化状态和具体外部适配，不依赖 Flow；持久 Frame 只在 Flow 内部存在。
 - SQL 是依赖 Flow 与 Operation 的最上层编译入口；底层不反向依赖 SQL。`dogpaddle` 保持薄 binary，不增设 library、runner 或第二套生命周期/执行引擎。
-- 产品不得依赖 `integration-tests/`、system-test host 或 test-support。没有产品组合根的 sibling seam 才进入不可发布的 `integration-tests/<seam>`；当前只有 Change–Store 接缝。
+- 产品不得依赖 `integration-tests/`、system-test host 或 test-support。没有产品组合根的 sibling seam 才进入不可发布的 `integration-tests/<seam>`；当前没有独立接缝包。
 
 ## 构建与验证
 
-- `cargo build --workspace`：使用工作区锁定的依赖构建七个产品 crate、不可发布的 Change–Store 接缝包、三个系统验收 host 包、性能上下文与 xtask。
+- `cargo build --workspace`：使用工作区锁定的依赖构建七个产品 crate、三个系统验收 host 包、性能上下文与 xtask。
 - `cargo test --workspace`：运行单元测试、集成测试和文档测试。
-- `cargo test -p dogpaddle-change-store-integration`：只运行 Change 与 SubscribedLog 的外部组合测试。
 - `cargo test -p dogpaddle-store --test correctness transaction::`：运行指定公共测试区域；所有 crate 的公共测试 target 都统一命名为 `correctness`。
 - `cargo fmt --all -- --check`：检查格式，不修改文件。
 - `cargo clippy --workspace --all-targets -- -D warnings`：执行已配置的 `all` 和 `pedantic` Clippy 规则。若命令不可用，请先安装 Clippy rustup 组件。

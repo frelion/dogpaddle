@@ -198,16 +198,6 @@ impl TransactionRef<'_> {
         }
     }
 
-    fn get(self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        self.ensure_healthy()?;
-        let result = match self {
-            Self::Read(transaction) => transaction.snapshot.get(key),
-            Self::Write(transaction) => transaction.inner.snapshot().get(key),
-        }
-        .map_err(|error| StoreError::storage("read data", error));
-        self.record_result(result)
-    }
-
     fn value_len(self, key: &[u8]) -> Result<Option<usize>, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
@@ -318,11 +308,6 @@ impl ReadDataAccess<'_> {
         self.transaction.record_result(result)
     }
 
-    /// Reads an encoded value.
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        self.transaction.get(&physical_key(self.prefix, key))
-    }
-
     /// Reports whether an encoded key exists.
     pub(crate) fn contains_key(&self, key: &[u8]) -> Result<bool, StoreError> {
         self.value_len(key).map(|length| length.is_some())
@@ -425,7 +410,9 @@ fn scan_data<D: DBAccess>(
     key_suffix_prefix: &[u8],
 ) -> Result<ScanBatch, StoreError> {
     let mut read_options = ReadOptions::default();
-    read_options.set_iterate_lower_bound(prefix.to_vec());
+    read_options.set_iterate_lower_bound(
+        lower.map_or_else(|| prefix.to_vec(), |(key, _)| physical_key(prefix, key)),
+    );
     if direction == ScanDirection::Ascending {
         read_options.set_iterate_upper_bound(prefix_successor(prefix));
     }

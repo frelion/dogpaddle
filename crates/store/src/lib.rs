@@ -8,12 +8,9 @@ mod store;
 
 pub use codec::{CodecError, StoreKey, StoreValue};
 pub use collections::{
-    Cell, CellAccess, CellReadAccess, MultiplicityChange, MultisetEntry, MultisetPage,
-    MultisetPartition, OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess,
-    OrderedMultiset, OrderedMultisetAccess, OrderedMultisetReadAccess, PartitionedMultiset,
-    PartitionedMultisetAccess, PartitionedMultisetReadAccess, Queue, QueueAccess,
-    ReadMultisetPartition, SubscribedLog, SubscribedLogStatus, SubscribedLogWriter, Subscription,
-    SubscriptionStatus,
+    Cell, CellAccess, CellReadAccess, MapPartition, MapReadPartition, MultiplicityChange,
+    OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess, PartitionKey, Queue,
+    QueueAccess, QueueReadAccess, checked_weight,
 };
 pub use data_class::StoreData;
 pub use error::StoreError;

@@ -15,17 +15,16 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError, OperationBindError,
     Operator, ScalarValue, cast, col, decode_definition, encode_definition, lit,
-    operation::{
-        Action,
-        transform::{FilterDefinition, FilterSchemaError, SelectDefinition, SelectSchemaError},
+    operation::transform::{
+        FilterDefinition, FilterSchemaError, SelectDefinition, SelectSchemaError,
     },
     try_cast,
 };
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, commit_ready, construct_checked, project_input_schema, roundtripped_output,
-    stateless_operation, temporal_and_decimal_change, turn_input,
+    TestStore, construct_checked, project_input_schema, roundtripped_output, run_input,
+    stateless_operation, step_input, temporal_and_decimal_change,
 };
 
 fn filter(predicate: Expr) -> FilterDefinition {
@@ -516,12 +515,11 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
     for (name, expression, expected) in kleene_cases() {
-        let mut operation = stateless_operation(
+        let operation = stateless_operation(
             &SelectDefinition::try_extend(&schema, [(name, expression)]).unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) =
-            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
         else {
             panic!("Boolean expression Extend returned the wrong action");
         };
@@ -575,13 +573,12 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
                 comparison(operator, col(column), lit(literal.clone())),
                 comparison(operator, lit(literal.clone()), col(column)),
             ] {
-                let mut operation = stateless_operation(
+                let operation = stateless_operation(
                     &SelectDefinition::try_extend(&schema, [("result", expression)]).unwrap(),
                     Arc::clone(&schema),
                 );
-                let Action::Complete(Some(output)) =
-                    commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions)
-                        .unwrap()
+                let Some(output) =
+                    run_input(&operation, step_input(&input), &mut transactions).unwrap()
                 else {
                     panic!("comparison Extend returned the wrong action");
                 };
@@ -602,7 +599,7 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
         (Operator::Eq, [Some(true), Some(true), None]),
         (Operator::NotEq, [Some(false), Some(false), None]),
     ] {
-        let mut operation = stateless_operation(
+        let operation = stateless_operation(
             &SelectDefinition::try_extend(
                 &schema,
                 [(
@@ -613,8 +610,7 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
             .unwrap(),
             Arc::clone(&schema),
         );
-        let Action::Complete(Some(output)) =
-            commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
+        let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
         else {
             panic!("array comparison Extend returned the wrong action");
         };
@@ -649,13 +645,11 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
     let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_extend(&schema, [("greater", predicate)]).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("arithmetic expression did not produce an output");
     };
     let greater = output
@@ -669,7 +663,7 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         [Some(false), Some(true)]
     );
 
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_extend(
             &schema,
             [("parsed", try_cast(col("text"), DataType::Int64))],
@@ -677,9 +671,7 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
         .unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("try-cast expression did not produce an output");
     };
     let parsed = output

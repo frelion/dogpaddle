@@ -11,9 +11,9 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
     decode_definition, encode_definition,
-    operation::{Action, AfterCommit, Operation, OperationError, OperationInput, Turn},
+    operation::{BudgetExceeded, Operation, OperationError, OperationInput, Progress, StepBudget},
 };
-use dogpaddle_store::{Store, StoreSetup, TransactionAccess, Transactions};
+use dogpaddle_store::{Store, StoreSetup, Transactions};
 use tempfile::TempDir;
 
 pub struct TestStore {
@@ -160,7 +160,7 @@ pub fn temporal_and_decimal_change() -> Change {
     Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2, 3])).unwrap()
 }
 
-pub const fn turn_input(change: &Change) -> OperationInput<'_> {
+pub const fn step_input(change: &Change) -> OperationInput<'_> {
     OperationInput { port: 0, change }
 }
 
@@ -190,43 +190,18 @@ pub fn roundtripped_output<D: Clone + Into<OperationDefinition>>(
     let encoded = encode_definition(&definition.clone().into());
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(encode_definition(&decoded), encoded);
-    let mut operation = stateless_operation(&decoded, input.schema());
+    let operation = stateless_operation(&decoded, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(input), &mut transactions).unwrap() else {
         panic!("round-tripped stateless Operation did not complete with output");
     };
     output
 }
 
-#[derive(Clone, Copy)]
-pub enum ExpectedAction {
-    Commit,
-    Complete,
-}
-
-pub fn output_values(
-    action: Action,
-    expected_action: ExpectedAction,
-    field_name: &str,
-) -> Vec<u64> {
-    let output = match expected_action {
-        ExpectedAction::Commit => {
-            let Action::Commit(Some(output)) = action else {
-                panic!("Operation did not commit one output Change")
-            };
-            output
-        }
-        ExpectedAction::Complete => {
-            let Action::Complete(Some(output)) = action else {
-                panic!("Operation did not complete with one output Change")
-            };
-            output
-        }
-    };
+pub fn output_values(output: Option<Change>, field_name: &str) -> Vec<u64> {
+    let output = output.expect("Operation did not produce an output Change");
     let field = output.schema().field(0).clone();
     assert_eq!(field.name(), field_name);
     assert_eq!(field.data_type(), &DataType::UInt64);
@@ -246,47 +221,79 @@ pub fn output_values(
         .collect()
 }
 
-fn apply_ready<'turn>(
-    turn: Turn<'turn>,
-    access: TransactionAccess<'_>,
-) -> Result<(Action, AfterCommit<'turn>), OperationError> {
-    match turn {
-        Turn::Ready(prepared) => prepared.apply(access),
-        Turn::Idle => panic!("a transactional built-in Operation returned an outer idle turn"),
+/// Applies the whole immutable input through committed bounded pages.
+pub fn run_input(
+    operation: &Operation,
+    input: OperationInput<'_>,
+    transactions: &mut Transactions,
+) -> Result<Option<Change>, OperationError> {
+    let mut resume = operation.initial_resume();
+    let mut outputs = Vec::new();
+    loop {
+        let mut allowance = 256;
+        let step = loop {
+            let transaction = transactions.begin();
+            let mut budget = StepBudget::new(allowance, 4 * 1024 * 1024);
+            match operation.step(input, &resume, transaction.access(), &mut budget) {
+                Ok(step) => {
+                    transaction.commit()?;
+                    break step;
+                }
+                Err(error) if error.is::<BudgetExceeded>() && allowance > 1 => {
+                    drop(transaction);
+                    allowance /= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(output) = step.output {
+            outputs.push(output);
+        }
+        match step.progress {
+            Progress::More(next) => {
+                assert_ne!(next, resume);
+                resume = next;
+            }
+            Progress::Done => break,
+        }
     }
+    combine_output(outputs)
 }
 
-pub fn commit_ready(
-    operation: &mut Operation,
-    input: Option<OperationInput<'_>>,
+/// Runs one bounded step and discards its transaction and position.
+pub fn rollback_input(
+    operation: &Operation,
+    input: OperationInput<'_>,
     transactions: &mut Transactions,
-) -> Result<Action, OperationError> {
-    let turn = operation.turn(input)?;
+) -> Result<Option<Change>, OperationError> {
     let transaction = transactions.begin();
-    let (action, after_commit) = apply_ready(turn, transaction.access())?;
-    if matches!(&action, Action::Idle) {
-        drop(transaction);
-        drop(after_commit);
-        return Ok(action);
-    }
-    transaction.commit()?;
-    after_commit
-        .run()
-        .map_err(|error| Box::new(error) as OperationError)?;
-    Ok(action)
-}
-
-pub fn rollback_ready(
-    operation: &mut Operation,
-    input: Option<OperationInput<'_>>,
-    transactions: &mut Transactions,
-) -> Result<Action, OperationError> {
-    let turn = operation.turn(input)?;
-    let transaction = transactions.begin();
-    let (action, after_commit) = apply_ready(turn, transaction.access())?;
+    let mut budget = StepBudget::new(256, 4 * 1024 * 1024);
+    let step = operation.step(
+        input,
+        &operation.initial_resume(),
+        transaction.access(),
+        &mut budget,
+    )?;
     drop(transaction);
-    drop(after_commit);
-    Ok(action)
+    Ok(step.output)
+}
+
+fn combine_output(mut outputs: Vec<Change>) -> Result<Option<Change>, OperationError> {
+    match outputs.len() {
+        0 => Ok(None),
+        1 => Ok(outputs.pop()),
+        _ => {
+            let records = arrow_select::concat::concat_batches(
+                &outputs[0].schema(),
+                outputs.iter().map(Change::records),
+            )?;
+            let diffs = outputs
+                .iter()
+                .flat_map(|output| output.diffs().values().iter().copied())
+                .collect::<Vec<_>>();
+            Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
+        }
+    }
 }
 
 pub fn decode_hex(encoded: &str) -> Vec<u8> {

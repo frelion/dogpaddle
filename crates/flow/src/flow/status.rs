@@ -1,69 +1,39 @@
-use crate::{FlowError, error::runtime_state_error};
-
-use super::{AdvanceOutcome, Flow};
-
-/// Read-only state of one Station, in Flow declaration order.
+use super::{Flow, frame::FramePhase};
+use crate::error::FlowError;
+/// A read-only view of the one active computation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StationStatus {
-    /// Stable Station ID.
-    pub id: String,
-    /// Whether this runtime must be reopened before another scheduling round.
+pub struct FlowStatus {
+    /// Whether this runtime must be reopened before advancing.
     pub needs_reopen: bool,
-    /// Processing outcome in the most recent `advance` call, without the
-    /// aggregate's progress precedence. None means unvisited or failed.
-    /// This is an observation of that call, not a prediction of the next one.
-    pub last_outcome: Option<AdvanceOutcome>,
-    /// Durably selected input port; None for a Scan.
-    pub active_input: Option<usize>,
-    /// Consumer positions in declared input-port order.
-    pub inputs: Vec<InputStatus>,
-    /// Retained output state; None for a Sink.
-    pub output: Option<OutputStatus>,
+    /// Number of durable active frames; zero means no active root.
+    pub depth: usize,
+    /// Logical ID at the top of the stack.
+    pub active_operation: Option<String>,
+    /// Whether the top is sending its page to consumers.
+    pub sending: bool,
 }
-
-/// One input edge's position in complete Changes, not rows or input events.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InputStatus {
-    /// Subscription position: the next input log offset to complete.
-    pub position: u64,
-    /// Input log's exclusive tail; `tail - position` is this edge's backlog.
-    pub tail: u64,
-}
-
-/// Output retention reported by Store's logical accounting.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OutputStatus {
-    /// First retained Change offset.
-    pub head: u64,
-    /// Exclusive Change tail; `tail - head` is the retained entry count.
-    pub tail: u64,
-    /// Encoded entries and their offset keys, excluding storage-engine overhead.
-    pub retained_bytes: u64,
-    /// Soft high watermark. An empty log may admit one oversized entry.
-    pub capacity_bytes: u64,
-}
-
 impl Flow {
-    /// Reads all Station counters in one short read-only Store snapshot.
-    ///
-    /// Does not call Operations, connect to external systems, decode Changes,
-    /// begin a write transaction, or advance any position. Also available on a
-    /// fail-stopped Flow. Last outcomes and fail-stop flags are runtime-only;
-    /// counters and active inputs survive reopen. No snapshot handle escapes.
-    ///
+    /// Reads durable stack status without advancing work.
     /// # Errors
-    ///
-    /// Returns [`FlowError`] if Store access fails or a durable position is invalid.
-    pub fn status(&self) -> Result<Vec<StationStatus>, FlowError> {
-        let snapshot = self.reads.begin();
-        self.station_ids
-            .iter()
-            .zip(&self.stations)
-            .map(|(id, station)| {
-                station
-                    .status(id, snapshot.access())
-                    .map_err(|error| runtime_state_error(id, error))
-            })
-            .collect()
+    /// Returns Store or control-codec errors.
+    pub fn status(&self) -> Result<FlowStatus, FlowError> {
+        let top = self.runtime.frames.top(self.reads.begin().access())?;
+        let (depth, active_operation, sending) = top.map_or((0, None, false), |(depth, frame)| {
+            (
+                depth as usize + 1,
+                self.runtime
+                    .definition
+                    .operations
+                    .get(frame.head)
+                    .map(|node| node.id.clone()),
+                matches!(frame.phase, FramePhase::Send { .. }),
+            )
+        });
+        Ok(FlowStatus {
+            needs_reopen: self.runtime.needs_reopen,
+            depth,
+            active_operation,
+            sending,
+        })
     }
 }

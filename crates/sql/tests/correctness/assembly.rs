@@ -17,15 +17,15 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     drop(program.start(&path).unwrap());
     let definition = read_definition(&path);
 
-    assert_eq!(definition.len(), 1046);
+    assert_eq!(definition.len(), 957);
     assert_eq!(
         blake3::hash(&definition).to_hex().as_str(),
-        "309085436cb3475edfdbd0342c06c4fcab40c27749742e04f60a98cdacccca61"
+        "8a89fd23a97100f1deca3a4627567f4df1f4faf5037660f078a7ddc434f7057b"
     );
 }
 
 #[test]
-fn outer_join_residual_is_native_and_projection_stays_in_one_transform_station() {
+fn outer_join_residual_is_native_and_projection_retains_logical_identity() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let program = SqlProgram::parse(
@@ -44,40 +44,25 @@ fn outer_join_residual_is_native_and_projection_stays_in_one_transform_station()
         "sql/scan/00000000",
         "sql/scan/00000001",
         "sql/transform/00000000",
+        "sql/transform/00000001",
+        "sql/transform/00000002",
         "sql/sink",
     ];
-    assert_eq!(
-        flow.status()
-            .unwrap()
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        expected
-    );
+    assert_eq!(flow.operation_ids().collect::<Vec<_>>(), expected);
 
     drop(flow);
     let store = Store::open(&path).unwrap();
     let _: OrderedMap<Vec<u8>, u64> = store
-        .open_data("station/00000002/operation/00000000/equi_join.match_counts")
+        .open_data("operation/00000002/equi_join.match_counts")
         .unwrap();
     assert!(matches!(
-        store.open_data::<OrderedMap<Vec<u8>, u64>>(
-            "station/00000002/operation/00000000/equi_join.key_counts"
-        ),
+        store.open_data::<OrderedMap<Vec<u8>, u64>>("operation/00000002/equi_join.key_counts"),
         Err(StoreError::DataNotFound(_))
     ));
     drop(store);
 
     let reopened = program.start(&path).unwrap();
-    assert_eq!(
-        reopened
-            .status()
-            .unwrap()
-            .iter()
-            .map(|station| station.id.as_str())
-            .collect::<Vec<_>>(),
-        expected
-    );
+    assert_eq!(reopened.operation_ids().collect::<Vec<_>>(), expected);
 }
 
 #[test]
@@ -150,15 +135,13 @@ fn native_asof_join_lowers_all_directions_and_constraints() {
         let path = root.path().join(format!("asof-{index}"));
         let flow = program.start(&path).unwrap();
         assert_eq!(
-            flow.status()
-                .unwrap()
-                .iter()
-                .map(|station| station.id.as_str())
-                .collect::<Vec<_>>(),
+            flow.operation_ids().collect::<Vec<_>>(),
             [
                 "sql/scan/00000000",
                 "sql/scan/00000001",
                 "sql/transform/00000000",
+                "sql/transform/00000001",
+                "sql/transform/00000002",
                 "sql/sink",
             ]
         );

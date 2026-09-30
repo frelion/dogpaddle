@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::jvm::{JvmHost, RuntimeObject};
@@ -130,9 +130,9 @@ impl fmt::Debug for Record {
 
 /// A running, single-threaded Debezium connector.
 ///
-/// Every operation needs exclusive access. A live [`Delivery`] borrows that
-/// access, which makes polling, stopping, or acknowledging through another
-/// connector impossible at compile time.
+/// Every connector operation needs exclusive access. An owned [`Delivery`] prevents
+/// another poll until consumed or dropped. ACK validates the original capability;
+/// stopping invalidates it.
 pub struct Connector {
     host: Arc<JvmHost>,
     runtime: Option<RuntimeObject>,
@@ -140,6 +140,7 @@ pub struct Connector {
     class_name: Box<str>,
     max_delivery_bytes: usize,
     poisoned: bool,
+    outstanding: Weak<()>,
 }
 
 impl Connector {
@@ -157,6 +158,7 @@ impl Connector {
             class_name,
             max_delivery_bytes,
             poisoned: false,
+            outstanding: Weak::new(),
         }
     }
 
@@ -170,7 +172,13 @@ impl Connector {
     ///
     /// Returns an error for an invalid duration, connector failure, malformed
     /// bridge response, or use after stop or an uncertain ACK.
-    pub fn poll(&mut self, timeout: Duration) -> Result<Option<Delivery<'_>>, Error> {
+    pub fn poll(&mut self, timeout: Duration) -> Result<Option<Delivery>, Error> {
+        if self.outstanding.upgrade().is_some() {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "a delivery capability is still outstanding",
+            ));
+        }
         let runtime = self.usable_runtime()?;
         let polled = self.host.poll(runtime, timeout, self.max_delivery_bytes);
         let Some(bytes) = (match polled {
@@ -204,8 +212,10 @@ impl Connector {
                 "delivery checkpoint belongs to a different connector",
             ));
         }
+        let capability = Arc::new(());
+        self.outstanding = Arc::downgrade(&capability);
         Ok(Some(Delivery {
-            connector: self,
+            capability,
             checkpoint: decoded.checkpoint,
             records: decoded.records,
         }))
@@ -222,21 +232,43 @@ impl Connector {
     /// Returns an error when the duration is invalid, shutdown fails, or the
     /// deadline expires.
     pub fn stop(&mut self, timeout: Duration) -> Result<(), Error> {
+        self.outstanding = Weak::new();
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
         };
         self.host.stop(runtime, timeout)?;
         self.host.dispose(runtime)?;
         self.runtime = None;
+        self.outstanding = Weak::new();
         Ok(())
     }
 
-    fn acknowledge(&mut self) -> Result<(), Error> {
+    /// Consumes the original delivery after its complete data and checkpoint are durable.
+    ///
+    /// An owned delivery is valid only for this connector's current outstanding batch.
+    /// ACK errors poison the connector; stop and restart from the durable checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign or invalidated capability, stopped connector,
+    /// bridge failure, or uncertain acknowledgement.
+    pub fn ack(&mut self, delivery: Delivery) -> Result<(), Error> {
+        if !self
+            .outstanding
+            .ptr_eq(&Arc::downgrade(&delivery.capability))
+        {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "delivery capability belongs to another connector or was invalidated",
+            ));
+        }
         let runtime = self.usable_runtime()?;
         if let Err(error) = self.host.ack(runtime, ACK_TIMEOUT) {
             self.poisoned = true;
             return Err(error);
         }
+        self.outstanding = Weak::new();
+        drop(delivery);
         Ok(())
     }
 
@@ -261,19 +293,25 @@ impl Drop for Connector {
     }
 }
 
-/// One unacknowledged batch and its pre-ACK recovery checkpoint.
+/// One owned, linear capability for an unacknowledged batch.
 ///
-/// The record and checkpoint data are fully owned by Rust. The lifetime only
-/// reserves exclusive control of the connector until this delivery is `ACKed`
-/// or dropped.
+/// Dropping it leaves the batch unacknowledged and permits polling the same bytes again.
+/// [`Connector::ack`] verifies ownership and consumes the original capability.
+///
+/// ```compile_fail
+/// use dogpaddle_debezium::{Connector, Delivery};
+/// fn duplicate(connector: &mut Connector, delivery: Delivery) {
+///     connector.ack(delivery).unwrap();
+///     connector.ack(delivery).unwrap();
+/// }
+/// ```
 #[must_use = "dropping a delivery leaves it unacknowledged"]
-pub struct Delivery<'connector> {
-    connector: &'connector mut Connector,
+pub struct Delivery {
+    capability: Arc<()>,
     checkpoint: Checkpoint,
     records: Box<[Record]>,
 }
-
-impl Delivery<'_> {
+impl Delivery {
     /// Returns the complete offset-store image that resumes after this batch.
     #[must_use]
     pub const fn checkpoint(&self) -> &Checkpoint {
@@ -285,26 +323,9 @@ impl Delivery<'_> {
     pub fn records(&self) -> &[Record] {
         &self.records
     }
-
-    /// Acknowledges this delivery after its records and checkpoint are durable.
-    ///
-    /// This consumes the delivery capability. If acknowledgement fails, the
-    /// connector is poisoned because the exact outcome may be uncertain; stop
-    /// it and restart from the checkpoint already made durable by the caller.
-    /// Acknowledgement waits at most 30 seconds for the Engine handler and
-    /// offset-store commit to settle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the Java handler cannot finish the exact
-    /// outstanding batch or its actual offset state differs from the pre-ACK
-    /// checkpoint.
-    pub fn ack(self) -> Result<(), Error> {
-        self.connector.acknowledge()
-    }
 }
 
-impl fmt::Debug for Delivery<'_> {
+impl fmt::Debug for Delivery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Delivery")

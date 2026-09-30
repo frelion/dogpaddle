@@ -5,13 +5,13 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaError};
 use dogpaddle_operation::{
     OperationBindError, ProjectionError, ScalarValue, col, lit,
-    operation::{Action, OperationInput, transform::SelectDefinition},
+    operation::{OperationInput, transform::SelectDefinition},
 };
 use dogpaddle_store::Store;
 
 use super::support::{
-    TestStore, change, change_with_field_name, commit_ready, construct_checked,
-    project_input_schema, rollback_ready, stateless_operation, turn_input,
+    TestStore, change, change_with_field_name, construct_checked, project_input_schema,
+    rollback_input, run_input, stateless_operation, step_input,
 };
 
 #[test]
@@ -75,19 +75,19 @@ fn extend_output_schema_rejects_duplicate_and_reserved_names_centrally() {
 #[test]
 fn runtime_rejects_invalid_port_and_schema_drift() {
     let input = change(&[1]);
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_extend(&input.schema(), [("copy", col("input"))]).unwrap(),
         input.schema(),
     );
     let root = TestStore::new();
     let store = Store::create(root.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
+    let error = rollback_input(
+        &operation,
+        OperationInput {
             port: 1,
             change: &input,
-        }),
+        },
         &mut transactions,
     )
     .unwrap_err();
@@ -97,12 +97,7 @@ fn runtime_rejects_invalid_port_and_schema_drift() {
     ));
 
     let drifted = change_with_field_name("renamed", &[1]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(turn_input(&drifted)),
-        &mut transactions,
-    )
-    .unwrap_err();
+    let error = rollback_input(&operation, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ProjectionError>(),
         Some(ProjectionError::InputSchemaMismatch)
@@ -127,16 +122,14 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
     let expression = col("flag")
         .and(lit(ScalarValue::Boolean(None)))
         .or(col("label").is_null());
-    let mut operation = stateless_operation(
+    let operation = stateless_operation(
         &SelectDefinition::try_extend(&input.schema(), [("selected", expression)]).unwrap(),
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
     let mut transactions = store.into_transactions();
-    let Action::Complete(Some(output)) =
-        commit_ready(&mut operation, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Extend did not complete with one output Change");
     };
     assert_eq!(output.schema().fields().len(), 3);
@@ -164,13 +157,11 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
         [None, Some(true), None]
     );
 
-    let mut copy = stateless_operation(
+    let copy = stateless_operation(
         &SelectDefinition::try_extend(&input.schema(), [("label_copy", col("label"))]).unwrap(),
         Arc::clone(&schema),
     );
-    let Action::Complete(Some(copied)) =
-        commit_ready(&mut copy, Some(turn_input(&input)), &mut transactions).unwrap()
-    else {
+    let Some(copied) = run_input(&copy, step_input(&input), &mut transactions).unwrap() else {
         panic!("column-copy Extend did not complete");
     };
     assert!(Arc::ptr_eq(

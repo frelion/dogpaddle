@@ -1,10 +1,9 @@
 mod advance;
+mod frame;
 mod runtime;
 mod status;
-
 pub use advance::AdvanceOutcome;
+pub(crate) use frame::Frames;
 pub use runtime::Flow;
-pub use status::{InputStatus, OutputStatus, StationStatus};
-
-#[cfg(test)]
-mod tests;
+pub(crate) use runtime::Runtime;
+pub use status::FlowStatus;

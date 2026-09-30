@@ -1,21 +1,11 @@
 mod cell;
-mod multiset;
 mod ordered_map;
-mod partitioned_multiset;
+mod partition;
 mod queue;
-mod subscribed_log;
+mod weight;
 
 pub use cell::{Cell, CellAccess, CellReadAccess};
-pub use multiset::{
-    MultiplicityChange, MultisetEntry, MultisetPage, OrderedMultiset, OrderedMultisetAccess,
-    OrderedMultisetReadAccess,
-};
 pub use ordered_map::{OrderedMap, OrderedMapAccess, OrderedMapPage, OrderedMapReadAccess};
-pub use partitioned_multiset::{
-    MultisetPartition, PartitionedMultiset, PartitionedMultisetAccess,
-    PartitionedMultisetReadAccess, ReadMultisetPartition,
-};
-pub use queue::{Queue, QueueAccess};
-pub use subscribed_log::{
-    SubscribedLog, SubscribedLogStatus, SubscribedLogWriter, Subscription, SubscriptionStatus,
-};
+pub use partition::{MapPartition, MapReadPartition, PartitionKey};
+pub use queue::{Queue, QueueAccess, QueueReadAccess};
+pub use weight::{MultiplicityChange, checked_weight};

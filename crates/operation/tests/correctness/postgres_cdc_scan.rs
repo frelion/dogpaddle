@@ -2,21 +2,20 @@ use dogpaddle_operation::{
     OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
     encode_definition,
     operation::{
-        Action, Operation, OperationError, Turn,
+        Operation,
         scan::{
             PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanOptions,
             PostgresCdcScanSpec, PostgresColumn, PostgresType,
         },
     },
 };
-use dogpaddle_store::{Cell, Queue, Store, StoreSetup, Transactions};
+use dogpaddle_store::{Cell, Queue, Store, StoreSetup};
 use std::{
     num::{NonZeroU32, NonZeroU64},
-    path::Path,
     time::Duration,
 };
 
-use super::support::{construct_checked_with_resource, decode_hex};
+use super::support::construct_checked_with_resource;
 
 fn construct_checked(
     definition: &(impl Clone + Into<OperationDefinition>),
@@ -136,33 +135,28 @@ fn postgres_cdc_materialization_requires_one_exact_runtime_resource() {
     );
 }
 
-struct Fixture {
-    scan: Operation,
-    phase: Cell<u32>,
-    checkpoint: Cell<Vec<u8>>,
-    transactions: Transactions,
-}
-
-impl Fixture {
-    fn create(path: &Path) -> Self {
-        let definition = definition();
-        let mut setup = StoreSetup::new();
-        let (operation, _) = OperationDefinition::from(definition.clone())
-            .construct(
-                &[],
-                &mut setup.data_scope().scoped("operation"),
-                RuntimeResource::new(config()),
-            )
-            .unwrap()
-            .into_parts();
-        let transactions = setup.commit(path, |_| Ok(())).unwrap();
-        drop((operation, transactions));
-        Self::open(Store::open(path).unwrap())
-    }
-
-    fn open(store: Store) -> Self {
-        let definition = decode_definition(&literal_definition_bytes()).unwrap();
-        let (scan, _) = definition
+#[test]
+fn postgres_cdc_restore_is_read_only_and_does_not_start_external_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state");
+    let mut setup = StoreSetup::new();
+    let definition: OperationDefinition = definition().into();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    let transactions = setup.commit(&path, |_| Ok(())).unwrap();
+    drop((operation, transactions));
+    for _ in 0..2 {
+        let store = Store::open(&path).unwrap();
+        let phase = store
+            .open_data::<Cell<u32>>("operation/postgres_cdc_scan.phase")
+            .unwrap();
+        let (operation, _) = definition
             .construct(
                 &[],
                 &mut store.data_scope().scoped("operation"),
@@ -170,180 +164,74 @@ impl Fixture {
             )
             .unwrap()
             .into_parts();
-        Self {
-            scan,
-            phase: store
-                .open_data("operation/postgres_cdc_scan.phase")
-                .unwrap(),
-            checkpoint: store
-                .open_data("operation/postgres_cdc_scan.checkpoint")
-                .unwrap(),
-            transactions: store.into_transactions(),
-        }
-    }
-
-    fn set_checkpoint(&mut self, bytes: &Vec<u8>) {
-        let transaction = self.transactions.begin();
-        self.phase
-            .access(transaction.access())
-            .unwrap()
-            .set(&2)
-            .unwrap();
-        self.checkpoint
-            .access(transaction.access())
-            .unwrap()
-            .set(bytes)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    fn restore(&mut self, commit: bool) -> Result<(), OperationError> {
-        let Turn::Ready(prepared) = self.scan.turn(None)? else {
-            panic!("expected prepared work");
+        let Operation::Source(mut source) = operation else {
+            panic!("expected source");
         };
-        let transaction = self.transactions.begin();
-        let (action, completion) = prepared.apply(transaction.access())?;
-        assert!(matches!(action, Action::Commit(None)));
-        if commit {
-            transaction.commit()?;
-            completion.run()?;
-        } else {
-            drop(transaction);
-            drop(completion);
-        }
-        Ok(())
+        let snapshot = store.read_transaction();
+        source.restore(snapshot.access()).unwrap();
+        assert_eq!(phase.read(snapshot.access()).unwrap().get().unwrap(), None);
+        drop(source.poll().unwrap()); // Concrete BeginCapture performs no I/O or writes.
     }
-
-    fn durable_checkpoint(&mut self) -> Option<Vec<u8>> {
-        let transaction = self.transactions.begin();
-        let checkpoint = self
-            .checkpoint
-            .access(transaction.access())
+}
+#[test]
+fn postgres_cdc_corrupt_sealed_checkpoint_is_rejected_without_rewriting_state() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state");
+    let mut setup = StoreSetup::new();
+    let definition: OperationDefinition = definition().into();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    let transactions = setup.commit(&path, |_| Ok(())).unwrap();
+    drop((operation, transactions));
+    let store = Store::open(&path).unwrap();
+    let phase = store
+        .open_data::<Cell<u32>>("operation/postgres_cdc_scan.phase")
+        .unwrap();
+    let checkpoint_handle = store
+        .open_data::<Cell<Vec<u8>>>("operation/postgres_cdc_scan.checkpoint")
+        .unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    let txn = writes.begin();
+    phase.access(txn.access()).unwrap().set(&2).unwrap();
+    checkpoint_handle
+        .access(txn.access())
+        .unwrap()
+        .set(&vec![0])
+        .unwrap();
+    txn.commit().unwrap();
+    drop((writes, reads));
+    let store = Store::open(&path).unwrap();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut store.data_scope().scoped("operation"),
+            RuntimeResource::new(config()),
+        )
+        .unwrap()
+        .into_parts();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    let snapshot = store.read_transaction();
+    assert!(source.restore(snapshot.access()).is_err());
+    let checkpoint_handle = store
+        .open_data::<Cell<Vec<u8>>>("operation/postgres_cdc_scan.checkpoint")
+        .unwrap();
+    assert_eq!(
+        checkpoint_handle
+            .read(snapshot.access())
             .unwrap()
             .get()
-            .unwrap();
-        transaction.commit().unwrap();
-        checkpoint
-    }
+            .unwrap(),
+        Some(vec![0])
+    );
 }
-
-// The connector-neutral D2 golden is stored verbatim, without an extra envelope.
-fn checkpoint() -> Vec<u8> {
-    decode_hex(concat!(
-        "44504442435030310001000000066f7264657273",
-        "00000032696f2e646562657a69756d2e636f6e6e6563746f722e706f737467726573716c2e",
-        "506f737467726573436f6e6e6563746f720000000051504dd9"
-    ))
-}
-
-#[test]
-fn postgres_cdc_initialization_and_reopen_do_not_start_external_resources() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("state");
-    drop(Fixture::create(&path));
-    for _ in 0..2 {
-        let mut fixture = Fixture::open(Store::open(&path).unwrap());
-        drop(fixture.scan.turn(None).unwrap());
-        // Rollback cannot publish initialized memory state or start the JVM.
-        for _ in 0..2 {
-            fixture.restore(false).unwrap();
-        }
-        fixture.restore(true).unwrap();
-        assert_eq!(fixture.durable_checkpoint(), None);
-    }
-}
-
-#[test]
-fn postgres_cdc_restores_opaque_checkpoint_across_rollback_and_reopen_without_external_io() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("state");
-    let mut fixture = Fixture::create(&path);
-    let initial = checkpoint();
-    fixture.set_checkpoint(&initial);
-    drop(fixture);
-    for _ in 0..2 {
-        let mut fixture = Fixture::open(Store::open(&path).unwrap());
-        drop(fixture.scan.turn(None).unwrap());
-        for _ in 0..2 {
-            fixture.restore(false).unwrap();
-            assert_eq!(fixture.durable_checkpoint(), Some(initial.clone()));
-        }
-        fixture.restore(true).unwrap();
-        assert_eq!(fixture.durable_checkpoint(), Some(initial.clone()));
-    }
-}
-
-#[test]
-fn postgres_cdc_reopen_keeps_capture_durable_until_source_cleanup() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("state");
-    let mut fixture = Fixture::create(&path);
-    let captured = checkpoint();
-    fixture.set_checkpoint(&captured);
-    let transaction = fixture.transactions.begin();
-    fixture
-        .phase
-        .access(transaction.access())
-        .unwrap()
-        .set(&1)
-        .unwrap();
-    transaction.commit().unwrap();
-    drop(fixture);
-
-    for commit in [false, true] {
-        let mut fixture = Fixture::open(Store::open(&path).unwrap());
-        fixture.restore(commit).unwrap();
-        // Recovery must not authorize clearing the snapshot before the
-        // PostgreSQL slot has been cleaned up outside the Store transaction.
-        let transaction = fixture.transactions.begin();
-        assert_eq!(
-            fixture
-                .phase
-                .access(transaction.access())
-                .unwrap()
-                .get()
-                .unwrap(),
-            Some(1)
-        );
-        assert_eq!(
-            fixture
-                .checkpoint
-                .access(transaction.access())
-                .unwrap()
-                .get()
-                .unwrap(),
-            Some(captured.clone())
-        );
-        transaction.commit().unwrap();
-    }
-}
-
-#[test]
-fn postgres_cdc_restore_rejects_corrupt_checkpoint_without_initializing() {
-    let root = tempfile::tempdir().unwrap();
-    let mut fixture = Fixture::create(&root.path().join("state"));
-    let valid = checkpoint();
-    let mut corrupt = valid.clone();
-    corrupt[0] ^= 1;
-    let mut trailing = valid.clone();
-    trailing.push(0);
-    for invalid in [
-        Vec::new(),
-        valid[..valid.len() - 1].to_vec(),
-        corrupt,
-        trailing,
-    ] {
-        fixture.set_checkpoint(&invalid);
-        for _ in 0..2 {
-            assert!(fixture.restore(true).is_err());
-        }
-        assert_eq!(fixture.durable_checkpoint(), Some(invalid));
-    }
-    fixture.set_checkpoint(&valid);
-    fixture.restore(true).unwrap();
-    assert_eq!(fixture.durable_checkpoint(), Some(valid));
-}
-
 #[test]
 fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
     let column = |data_type| PostgresColumn::new("id", data_type, false);

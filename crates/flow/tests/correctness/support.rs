@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::FlowFactory;
@@ -17,7 +17,6 @@ pub(super) fn build_scan_sink_and_read_definition(path: &Path) -> Vec<u8> {
     let scan = builder.operation("scan", SequenceScanDefinition::new(0), []);
     builder.operation("sink", DiscardDefinition::new(), [scan]);
 
-    builder.materialize(scan, NonZeroU64::new(1_024).unwrap());
     drop(builder.build().unwrap());
 
     read_published_definition(path)
@@ -87,4 +86,67 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     !checksum
+}
+
+pub(super) fn run_until_idle(flow: &mut dogpaddle_flow::Flow) {
+    // Boundaries rotate independently; require a full sweep without progress.
+    let mut idle = 0;
+    for _ in 0..1000 {
+        if flow.advance().unwrap() == dogpaddle_flow::AdvanceOutcome::Idle {
+            idle += 1;
+        } else {
+            idle = 0;
+        }
+        if idle > flow.operation_count() {
+            return;
+        }
+    }
+    panic!("finite flow did not drain");
+}
+
+pub(super) fn seed_source(path: &Path, index: usize, change: &Change) {
+    use dogpaddle_store::Queue;
+    let store = Store::open(path).unwrap();
+    let position: Cell<u64> = store
+        .open_data(&format!("operation/{index:08x}/sequence_scan.position"))
+        .unwrap();
+    let queue: Queue<Vec<u8>> = store
+        .open_data(&format!("operation/{index:08x}/sequence_scan.published"))
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    position
+        .access(transaction.access())
+        .unwrap()
+        .set(&u64::MAX)
+        .unwrap();
+    assert!(
+        queue
+            .access(transaction.access())
+            .unwrap()
+            .try_push(&encode_output_entry(change), std::num::NonZeroU64::MAX)
+            .unwrap()
+    );
+    transaction.commit().unwrap();
+}
+
+pub(super) fn values_change(values: impl IntoIterator<Item = u64>, diff: i64) -> Change {
+    use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let rows = values.len();
+    Change::try_new(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from(values))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![diff; rows]),
+    )
+    .unwrap()
 }

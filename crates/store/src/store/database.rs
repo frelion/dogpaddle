@@ -302,10 +302,8 @@ impl DataKind {
         match self {
             Self::Cell => 1,
             Self::OrderedMap => 2,
-            Self::OrderedMultiset => 4,
-            Self::PartitionedMultiset => 5,
+
             Self::Queue => 6,
-            Self::SubscribedLog => 7,
         }
     }
 
@@ -313,10 +311,8 @@ impl DataKind {
         match self {
             Self::Cell => "cell",
             Self::OrderedMap => "ordered map",
-            Self::OrderedMultiset => "ordered multiset",
-            Self::PartitionedMultiset => "partitioned multiset",
+
             Self::Queue => "queue",
-            Self::SubscribedLog => "subscribed log",
         }
     }
 
@@ -324,10 +320,7 @@ impl DataKind {
         match tag {
             1 => Some(Self::Cell),
             2 => Some(Self::OrderedMap),
-            4 => Some(Self::OrderedMultiset),
-            5 => Some(Self::PartitionedMultiset),
             6 => Some(Self::Queue),
-            7 => Some(Self::SubscribedLog),
             _ => None,
         }
     }
@@ -352,7 +345,7 @@ pub(super) fn open_database(path: &Path, create: bool) -> Result<Database, Store
 /// false positive only costs the block read we would have paid anyway.
 ///
 /// Nothing else is configured here. A prefix filter would need one fixed-length
-/// partition header shared by all six collections, which is a layout decision
+/// partition header shared by all three collections, which is a layout decision
 /// rather than an option; cache sizing is deliberately left at the `RocksDB`
 /// default until a measurement justifies a number.
 fn table_options() -> BlockBasedOptions {
@@ -490,5 +483,23 @@ mod tests {
         assert_eq!(next, 1);
         assert_eq!(next_data_id, 2);
         assert_eq!(catalog.get("next"), Some(&(1, DataKind::Cell)));
+    }
+    #[test]
+    fn catalog_has_three_kinds_and_rejects_retired_collection_tags() {
+        for (kind, tag) in [
+            (DataKind::Cell, 1),
+            (DataKind::OrderedMap, 2),
+            (DataKind::Queue, 6),
+        ] {
+            let bytes = encode_binding(7, kind);
+            assert_eq!(bytes, [tag, 0, 0, 0, 7]);
+            assert_eq!(decode_binding(&bytes).unwrap(), (7, kind));
+        }
+        for tag in [0, 3, 4, 5, 7, 255] {
+            assert!(matches!(
+                decode_binding(&[tag, 0, 0, 0, 7]),
+                Err(StoreError::InvalidStore)
+            ));
+        }
     }
 }

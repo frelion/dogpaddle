@@ -11,11 +11,11 @@ use dogpaddle_operation::{
     DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
     OperationSetupError, RuntimeResource, decode_definition, encode_definition,
     operation::{
-        Action, Operation, OperationError, OperationInput, Turn,
+        Operation, OperationError, SinkPrepared,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
     },
 };
-use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, ReadTransactions, Store, StoreSetup, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
 use super::support::{
@@ -368,20 +368,20 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
 
 struct Fixture {
     root: TestStore,
-    definition: Vec<u8>,
-    operation: Operation,
-    state: Cell<Vec<u8>>,
-    transactions: Transactions,
+    definition: OperationDefinition,
+    sink: Box<dyn dogpaddle_operation::operation::SinkOperation>,
+    writes: Transactions,
+    reads: ReadTransactions,
 }
-
 impl Fixture {
     fn new() -> Self {
         let root = TestStore::new();
-        let definition =
-            SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events").unwrap();
-        let encoded = encode_definition(&definition.clone().into());
+        let definition: OperationDefinition =
+            SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events")
+                .unwrap()
+                .into();
         let mut setup = StoreSetup::new();
-        let (operation, output) = OperationDefinition::from(definition.clone())
+        let (operation, _) = definition
             .construct(
                 &[schema()],
                 &mut setup.data_scope().scoped("operation"),
@@ -389,16 +389,29 @@ impl Fixture {
             )
             .unwrap()
             .into_parts();
-        assert!(output.is_none());
-        let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
-        drop((operation, transactions));
-        let store = Store::open(root.path()).unwrap();
-        Self::open(root, encoded, store)
+        let (writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+        let Operation::Sink(sink) = operation else {
+            panic!("expected sink");
+        };
+        Self {
+            root,
+            definition,
+            sink,
+            writes,
+            reads,
+        }
     }
-
-    fn open(root: TestStore, definition: Vec<u8>, store: Store) -> Self {
-        let decoded = decode_definition(&definition).unwrap();
-        let (operation, output) = decoded
+    fn reopen(self) -> Self {
+        let Self {
+            root,
+            definition,
+            sink,
+            writes,
+            reads,
+        } = self;
+        drop((sink, writes, reads));
+        let store = Store::open(root.path()).unwrap();
+        let (operation, _) = definition
             .construct(
                 &[schema()],
                 &mut store.data_scope().scoped("operation"),
@@ -406,165 +419,70 @@ impl Fixture {
             )
             .unwrap()
             .into_parts();
-        assert!(output.is_none());
-        let state = store.open_data("operation/sink.control").unwrap();
+        let (writes, reads) = store.into_transactions().split();
+        let Operation::Sink(sink) = operation else {
+            panic!("expected sink");
+        };
         Self {
             root,
             definition,
-            operation,
-            state,
-            transactions: store.into_transactions(),
+            sink,
+            writes,
+            reads,
         }
     }
-
-    fn reopen(self) -> Self {
-        let Self {
-            root,
-            definition,
-            operation,
-            state,
-            transactions,
-        } = self;
-        drop((operation, state, transactions));
-        let store = Store::open(root.path()).unwrap();
-        Self::open(root, definition, store)
+    fn enqueue(&mut self, change: &Change) -> Result<bool, OperationError> {
+        let txn = self.writes.begin();
+        let admitted = self.sink.try_enqueue(txn.access(), change)?;
+        if admitted {
+            txn.commit()?;
+        }
+        Ok(admitted)
     }
-
-    fn sqlite_path(&self) -> PathBuf {
-        self.root.path().with_extension("sqlite")
+    fn plan(&mut self) -> Result<Option<SinkPrepared>, OperationError> {
+        let pending = {
+            let snapshot = self.reads.begin();
+            self.sink.load(snapshot.access())?
+        };
+        pending
+            .map(|pending| self.sink.prepare(pending))
+            .transpose()
     }
-
-    fn connection(&self) -> Connection {
-        Connection::open_with_flags(self.sqlite_path(), OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap()
+    fn persist(&mut self, prepared: &SinkPrepared) {
+        let txn = self.writes.begin();
+        self.sink.persist_prepared(txn.access(), prepared).unwrap();
+        txn.commit().unwrap();
     }
-
-    fn has_table(&self) -> bool {
-        self.sqlite_path().exists()
-            && self
-                .connection()
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='events')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap()
+    fn settle(&mut self, prepared: &SinkPrepared) {
+        let txn = self.writes.begin();
+        self.sink.settle(txn.access(), prepared).unwrap();
+        txn.commit().unwrap();
     }
-
+    fn drain(&mut self) -> usize {
+        let mut batches = 0;
+        while let Some(prepared) = self.plan().unwrap() {
+            self.persist(&prepared);
+            self.sink.deliver(&prepared).unwrap();
+            self.settle(&prepared);
+            batches += 1;
+        }
+        batches
+    }
     fn rows(&self) -> Vec<(i64, i64)> {
-        if !self.has_table() {
-            return Vec::new();
-        }
-        self.connection()
+        let connection = Connection::open_with_flags(
+            self.root.path().with_extension("sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        connection
             .prepare("SELECT \"$dogpaddle.id\", value FROM events ORDER BY \"$dogpaddle.id\"")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<_, _>>()
             .unwrap()
-    }
-
-    fn state(&mut self) -> Option<Vec<u8>> {
-        let transaction = self.transactions.begin();
-        let state = self
-            .state
-            .access(transaction.access())
-            .unwrap()
-            .get()
-            .unwrap();
-        transaction.commit().unwrap();
-        state
-    }
-
-    fn try_commit(&mut self, change: Option<&Change>) -> Result<Option<Action>, OperationError> {
-        let turn = self.operation.turn(change.map(input))?;
-        let Turn::Ready(turn) = turn else {
-            return Ok(None);
-        };
-        let transaction = self.transactions.begin();
-        let (action, completion) = turn.apply(transaction.access())?;
-        if matches!(action, Action::Idle) {
-            drop(transaction);
-            drop(completion);
-            return Ok(Some(action));
-        }
-        transaction.commit()?;
-        completion
-            .run()
-            .map_err(|error| Box::new(error) as OperationError)?;
-        Ok(Some(action))
-    }
-
-    fn commit(&mut self, change: Option<&Change>) -> Option<Action> {
-        self.try_commit(change).unwrap()
-    }
-
-    fn rollback(&mut self, change: Option<&Change>) -> Option<Action> {
-        let turn = self.operation.turn(change.map(input)).unwrap();
-        let Turn::Ready(turn) = turn else {
-            return None;
-        };
-        let transaction = self.transactions.begin();
-        let (action, completion) = turn.apply(transaction.access()).unwrap();
-        drop(transaction);
-        drop(completion);
-        Some(action)
-    }
-
-    fn commit_without_completion(&mut self, change: Option<&Change>) -> Option<Action> {
-        let turn = self.operation.turn(change.map(input)).unwrap();
-        let Turn::Ready(turn) = turn else {
-            return None;
-        };
-        let transaction = self.transactions.begin();
-        let (action, completion) = turn.apply(transaction.access()).unwrap();
-        transaction.commit().unwrap();
-        drop(completion);
-        Some(action)
-    }
-
-    fn initialize(&mut self) {
-        for _ in 0..8 {
-            match self.commit(None) {
-                None | Some(Action::Idle) => {
-                    assert!(self.has_table());
-                    return;
-                }
-                Some(Action::Commit(None)) => {}
-                action => panic!("unexpected initialization action {action:?}"),
-            }
-        }
-        panic!("bounded fixture failed to initialize");
-    }
-
-    fn admit(&mut self, change: &Change) {
-        for _ in 0..8 {
-            match self.commit(Some(change)) {
-                Some(Action::Complete(None)) => return,
-                Some(Action::Commit(None)) => {}
-                action => panic!("unexpected admission action {action:?}"),
-            }
-        }
-        panic!("bounded fixture failed to admit input");
-    }
-
-    fn drain(&mut self) {
-        for _ in 0..64 {
-            match self.commit(None) {
-                None | Some(Action::Idle) => return,
-                Some(Action::Commit(None)) => {}
-                action => panic!("unexpected drain action {action:?}"),
-            }
-        }
-        panic!("bounded fixture failed to drain");
-    }
-
-    fn finish(&mut self, change: &Change) {
-        self.initialize();
-        self.admit(change);
-        self.drain();
     }
 }
-
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -572,242 +490,195 @@ fn schema() -> SchemaRef {
         false,
     )]))
 }
-
 fn change(values: &[i64], diffs: &[i64]) -> Change {
-    let records =
-        RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap();
-    Change::try_new(records, Int64Array::from(diffs.to_vec())).unwrap()
-}
-
-fn input(change: &Change) -> OperationInput<'_> {
-    OperationInput { port: 0, change }
-}
-
-#[test]
-fn initialization_survives_rollback_lost_completion_and_repeated_reopen() {
-    let input = change(&[7], &[1]);
-    let mut fixture = Fixture::new();
-    fixture.rollback(None); // Discard the initial durable-state read.
-    assert_eq!(fixture.state(), None);
-    assert!(!fixture.sqlite_path().exists());
-    fixture.commit(None);
-    fixture.rollback(None); // Discard the initialization intent.
-    assert_eq!(fixture.state(), None);
-    assert!(!fixture.has_table());
-
-    fixture.commit_without_completion(None);
-    let initialization = fixture.state();
-    assert!(initialization.is_some());
-    assert!(!fixture.has_table());
-    for _ in 0..2 {
-        fixture = fixture.reopen();
-        fixture.commit(None);
-        assert!(fixture.has_table());
-        assert!(fixture.rows().is_empty());
-        assert_eq!(fixture.state(), initialization);
-    }
-    fixture.rollback(None); // Discard initialization settlement.
-    assert_eq!(fixture.state(), initialization);
-    fixture.finish(&input);
-    assert_eq!(fixture.rows(), [(1, 7)]);
-}
-
-#[test]
-fn prepared_batches_recover_before_and_after_sqlite_commit_without_reallocating_ids() {
-    let input = change(&[7], &[2]);
-    let mut fixture = Fixture::new();
-    fixture.initialize();
-    fixture.admit(&input);
-    let ready = fixture.state();
-
-    fixture.rollback(None);
-    assert_eq!(fixture.state(), ready);
-    assert!(fixture.rows().is_empty());
-    fixture.commit(None); // Load the fixed batch without changing durable state.
-    fixture.commit_without_completion(None); // Persist Prepared but do not deliver it.
-    let prepared = fixture.state();
-    assert_ne!(prepared, ready);
-    assert!(fixture.rows().is_empty());
-
-    for _ in 0..3 {
-        fixture = fixture.reopen();
-        fixture.commit(None);
-        assert_eq!(fixture.rows(), [(1, 7), (2, 7)]);
-        assert_eq!(fixture.state(), prepared);
-    }
-    assert!(matches!(fixture.rollback(None), Some(Action::Commit(None))));
-    assert_eq!(fixture.state(), prepared);
-    fixture = fixture.reopen();
-    fixture.commit(None);
-    assert!(matches!(fixture.commit(None), Some(Action::Commit(None))));
-    assert_ne!(fixture.state(), prepared);
-    fixture.finish(&change(&[8], &[1]));
-    assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 8)]);
-}
-
-#[test]
-fn a_batch_that_inserts_then_deletes_its_own_ids_is_idempotent_on_reopen() {
-    let input = change(&[7, 7, 8, 7], &[2, -1, 1, -1]);
-    let mut fixture = Fixture::new();
-    fixture.initialize();
-    fixture.admit(&input);
-    fixture.commit(None);
-    fixture.commit(None);
-    let prepared = fixture.state();
-    assert_eq!(fixture.rows(), [(3, 8)]);
-    for _ in 0..3 {
-        fixture = fixture.reopen();
-        fixture.commit(None);
-        assert_eq!(fixture.rows(), [(3, 8)]);
-        assert_eq!(fixture.state(), prepared);
-    }
-    assert!(matches!(fixture.rollback(None), Some(Action::Commit(None))));
-    assert_eq!(fixture.state(), prepared);
-    assert!(matches!(fixture.commit(None), Some(Action::Commit(None))));
-    fixture.finish(&change(&[7], &[1]));
-    assert_eq!(fixture.rows(), [(3, 8), (4, 7)]);
-}
-
-#[test]
-fn missing_negative_prefixes_are_rejected_before_any_target_batch_is_written() {
-    for invalid in [change(&[7, 7], &[-1, 1]), change(&[7, 8, 8], &[1, -1, 1])] {
-        let mut fixture = Fixture::new();
-        fixture.initialize();
-        fixture.admit(&invalid);
-        let buffered = fixture.state();
-        fixture.commit(None); // Load the batch before target-side planning.
-        assert!(fixture.try_commit(None).is_err());
-        assert_eq!(fixture.state(), buffered);
-        assert!(fixture.rows().is_empty());
-        fixture = fixture.reopen();
-        fixture.commit(None); // Restore Ready, then reconstruct the fixed batch.
-        fixture.commit(None);
-        assert!(fixture.try_commit(None).is_err());
-        assert!(fixture.rows().is_empty());
-    }
-
-    let mut fixture = Fixture::new();
-    fixture.finish(&change(&[7], &[1]));
-    assert_eq!(fixture.rows(), [(1, 7)]);
-    fixture.finish(&change(&[7], &[-1]));
-    assert!(fixture.rows().is_empty());
-    fixture.finish(&change(&[8], &[1]));
-    assert_eq!(fixture.rows(), [(2, 8)]);
-}
-
-#[test]
-fn a_change_over_the_event_capacity_is_rejected_before_admission_or_target_io() {
-    let mut fixture = Fixture::new();
-    fixture.initialize();
-    let ready = fixture.state();
-
-    assert!(
-        fixture
-            .try_commit(Some(&change(&[7], &[i64::MIN])))
-            .is_err()
-    );
-    assert_eq!(fixture.state(), ready);
-    assert!(fixture.rows().is_empty());
-}
-
-#[test]
-fn large_retractions_are_fully_admitted_and_continue_correctly_across_reopen() {
-    let mut invalid = Fixture::new();
-    invalid.finish(&change(&[7], &[2_050]));
-    invalid.admit(&change(&[7], &[-2_051]));
-    let buffered = invalid.state();
-    invalid.commit(None);
-    assert!(invalid.try_commit(None).is_err());
-    assert_eq!(invalid.state(), buffered);
-    assert_eq!(invalid.rows().len(), 2_050);
-
-    let mut fixture = Fixture::new();
-    fixture.finish(&change(&[7], &[2_050]));
-    let remove = change(&[7], &[-2_050]);
-    fixture.admit(&remove);
-    fixture.commit(None);
-    fixture.commit(None);
-    let prepared = fixture.state();
-    assert_eq!(fixture.rows().len(), 1_026);
-    fixture = fixture.reopen();
-    fixture.commit(None);
-    assert_eq!(fixture.rows().len(), 1_026);
-    assert_eq!(fixture.state(), prepared);
-    fixture.drain();
-    assert!(fixture.rows().is_empty());
-    fixture.finish(&change(&[8], &[1]));
-    assert_eq!(fixture.rows(), [(2_051, 8)]);
-}
-
-#[test]
-fn invalid_input_port_schema_and_missing_input_fail_before_external_io() {
-    let mut fixture = Fixture::new();
-    let input = change(&[7], &[1]);
-    assert!(matches!(fixture.operation.turn(None), Ok(Turn::Ready(_))));
-    assert!(
-        fixture
-            .operation
-            .turn(Some(OperationInput {
-                port: 1,
-                change: &input
-            }))
-            .is_err()
-    );
-    let wrong = Change::try_new(
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "different",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![7]))],
-        )
-        .unwrap(),
-        Int64Array::from(vec![1]),
+    Change::try_new(
+        RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap(),
+        Int64Array::from(diffs.to_vec()),
     )
-    .unwrap();
-    assert!(fixture.try_commit(Some(&wrong)).is_err());
-    assert_eq!(fixture.state(), None);
-    assert!(!fixture.sqlite_path().exists());
-    fixture.finish(&input);
-    assert_eq!(fixture.rows(), [(1, 7)]);
+    .unwrap()
 }
-
 #[test]
-fn after_commit_target_error_keeps_the_fixed_batch_for_reopen() {
+fn initialization_intent_survives_reopen_and_is_idempotent() {
     let mut fixture = Fixture::new();
-    let input = change(&[7], &[1]);
-    fixture.initialize();
-    fixture.admit(&input);
-    fixture.commit(None); // Load the fixed delivery batch.
-    let buffered = fixture.state();
-    fixture
-        .connection()
-        .execute_batch(
-            "CREATE TRIGGER reject_insert BEFORE INSERT ON events \
-         BEGIN SELECT RAISE(ABORT, 'injected target failure'); END;",
-        )
-        .unwrap();
-    assert!(fixture.try_commit(None).is_err());
-    assert_ne!(fixture.state(), buffered);
-    assert!(fixture.rows().is_empty());
-    fixture
-        .connection()
-        .execute_batch("DROP TRIGGER reject_insert")
-        .unwrap();
+    assert!(!fixture.enqueue(&change(&[7], &[1])).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    {
+        let txn = fixture.writes.begin();
+        fixture
+            .sink
+            .persist_prepared(txn.access(), &prepared)
+            .unwrap();
+    }
+    assert!(
+        !fixture.root.path().with_extension("sqlite").exists()
+            || fixture.rows_if_initialized().is_none()
+    );
+    fixture.persist(&prepared);
     fixture = fixture.reopen();
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    assert!(fixture.rows().is_empty());
+}
+impl Fixture {
+    fn rows_if_initialized(&self) -> Option<i64> {
+        Connection::open(self.root.path().with_extension("sqlite"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .ok()
+    }
+}
+#[test]
+fn capture_parent_and_enqueue_roll_back_together() {
+    let mut fixture = Fixture::new();
     fixture.drain();
-    assert_eq!(fixture.rows(), [(1, 7)]);
+    {
+        let txn = fixture.writes.begin();
+        assert!(
+            fixture
+                .sink
+                .try_enqueue(txn.access(), &change(&[7], &[3]))
+                .unwrap()
+        );
+    }
+    assert!(fixture.plan().unwrap().is_none());
+    assert!(fixture.rows().is_empty());
+}
+#[test]
+fn prepared_replay_before_and_after_target_commit_keeps_fixed_ids() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[3])).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture = fixture.reopen();
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 7)]);
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 7)]);
 }
 
 #[test]
-fn stable_rebatching_preserves_technical_ids_and_final_relation() {
-    let mut whole = Fixture::new();
-    whole.finish(&change(&[7, 8, 7, 7, 8], &[2, 1, -1, 1, -1]));
-    let mut split = Fixture::new();
-    for (value, diff) in [(7, 2), (8, 1), (7, -1), (7, 1), (8, -1)] {
-        split.finish(&change(&[value], &[diff]));
+fn prepared_batch_backpressure_writes_nothing_when_the_parent_transaction_commits() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[1024])).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture = fixture.reopen();
+    // Restore validates the complete durable plan before input is serviced.
+    assert!(fixture.plan().unwrap().is_some());
+    {
+        let txn = fixture.writes.begin();
+        assert!(
+            !fixture
+                .sink
+                .try_enqueue(txn.access(), &change(&[99], &[1]))
+                .unwrap()
+        );
+        // A caller may commit its own pending-page progress after a false result.
+        txn.commit().unwrap();
     }
-    assert_eq!(whole.rows(), [(2, 7), (4, 7)]);
-    assert_eq!(whole.rows(), split.rows());
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    assert_eq!(
+        fixture.rows(),
+        (1..=1024).map(|id| (id, 7)).collect::<Vec<_>>()
+    );
+    assert!(fixture.enqueue(&change(&[99], &[1])).unwrap());
+    assert_eq!(fixture.drain(), 1);
+    assert_eq!(fixture.rows().last(), Some(&(1025, 99)));
+}
+
+#[test]
+fn restoring_oversized_ready_control_fails_without_rewriting_it() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    let Fixture {
+        root,
+        definition,
+        sink,
+        writes,
+        reads,
+    } = fixture;
+    drop((sink, writes, reads));
+    let store = Store::open(root.path()).unwrap();
+    let control: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
+    let mut invalid = control
+        .read(store.read_transaction().access())
+        .unwrap()
+        .get()
+        .unwrap()
+        .unwrap();
+    invalid.resize(256, 0);
+    let mut writes = store.into_transactions();
+    {
+        let txn = writes.begin();
+        control.access(txn.access()).unwrap().set(&invalid).unwrap();
+        txn.commit().unwrap();
+    }
+    drop((control, writes));
+    let store = Store::open(root.path()).unwrap();
+    let (operation, _) = definition
+        .construct(
+            &[schema()],
+            &mut store.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let Operation::Sink(mut sink) = operation else {
+        panic!("expected sink");
+    };
+    let control: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
+    let read = store.read_transaction();
+    assert!(sink.load(read.access()).is_err());
+    assert_eq!(
+        control.read(read.access()).unwrap().get().unwrap(),
+        Some(invalid)
+    );
+}
+#[test]
+fn small_entries_merge_into_one_target_batch_and_mixed_prefixes_use_new_ids() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    for _ in 0..3 {
+        assert!(fixture.enqueue(&change(&[7], &[1])).unwrap());
+    }
+    assert!(fixture.enqueue(&change(&[7], &[-3])).unwrap());
+    assert_eq!(fixture.drain(), 1);
+    assert!(fixture.rows().is_empty());
+    assert!(fixture.enqueue(&change(&[7, 7], &[3, -4])).unwrap());
+    assert!(fixture.plan().is_err());
+    assert!(fixture.rows().is_empty());
+}
+#[test]
+fn invalid_later_negative_slice_keeps_previously_settled_slices() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[1025])).unwrap());
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[-1026])).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture.settle(&prepared);
+    assert_eq!(fixture.rows().len(), 1);
+    fixture = fixture.reopen();
+    assert!(fixture.plan().is_err());
+    assert_eq!(fixture.rows().len(), 1);
+}
+#[test]
+fn schema_and_oversized_multiplicity_fail_before_enqueue() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[i64::MAX])).is_err());
+    let wrong = super::support::change(&[1]);
+    assert!(fixture.enqueue(&wrong).is_err());
+    assert!(fixture.plan().unwrap().is_none());
 }

@@ -49,7 +49,7 @@ loop {
         continue;
     };
     persist_atomically(delivery.records(), delivery.checkpoint().as_bytes())?;
-    delivery.ack()?;
+    connector.ack(delivery)?;
 }
 connector.stop(Duration::from_secs(30))?;
 # Ok(())
@@ -90,16 +90,10 @@ let _connector = runtime.start(config, Some(&checkpoint))?;
 与 `Header` value 使用 Kafka Connect schemas-enabled JSON bytes；Rust 层不解释 connector payload。
 另外两个公共类型 `Error` / `ErrorKind` 提供不会回显 property value 的稳定错误分类。
 
-### 为什么 Delivery 借用 Connector
+### Delivery 的线性确认权
 
-`Delivery<'_>` 活着时独占借用 `Connector`，所以 Rust 类型系统直接阻止以下情况：
-
-- 同时 poll 第二批；
-- 一边持有当前批次一边 stop；
-- 通过另一个 token 重复 ACK。
-
-`ack(self)` 消费 Delivery。直接丢弃 Delivery 不会 ACK；同一个 connector 的下一次 poll 会返回相同的
-outstanding bytes。这里没有额外 delivery ID 或 delivery token，因为 `Delivery` 本身就是唯一确认权。
+`Delivery` 拥有完整 records/checkpoint 与私有线性 capability，不借用 Connector，因此调用方可以把它保留到短 Store 事务和 WAL barrier 完成。`Connector::ack(delivery)` 消费原句柄并检查它属于该 Connector 当前 outstanding batch；不接受根据 checkpoint 或公开 ID 重建的确认权。
+活 Delivery 阻止再次 poll；直接 drop 不 ACK，下一次 poll 重投同一 outstanding bytes。stop 使旧 capability 失效；另一 Connector 或 stop 后的 ACK 拒绝。Delivery 不实现 Clone，成功 ACK 不能重复提交原句柄。capability 不增加持久 delivery identity、共享执行锁或另一套生命周期。
 
 ACK 结果不确定时，Connector 会被标记为不可继续使用。调用方应 stop，并从 ACK 前已经持久化的 checkpoint
 重新 start，而不是猜这次 ACK 是否成功。
@@ -182,7 +176,7 @@ host；产品 archive 在固定 `bin/` 与 `libexec/` 布局中组合两者。
 | --- | --- |
 | `start` | 固定 60 秒 |
 | `poll` | 调用方传入 |
-| `Delivery::ack` | 固定 30 秒 |
+| `Connector::ack` | 固定 30 秒 |
 | `stop` | 调用方传入 |
 
 这些都是同步 API。`poll` 超时返回 `Ok(None)`，表示当前没有一批可交付数据，不代表 connector 已结束。

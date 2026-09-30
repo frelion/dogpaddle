@@ -1,422 +1,266 @@
-use std::{collections::HashSet, num::NonZeroU64};
-
-use dogpaddle_operation::OperationKind;
-use thiserror::Error;
-
 use super::{
     DeclaredOperation, OperationRef,
-    definition::{FlowDefinition, StationDefinition},
+    definition::{FlowDefinition, OperationNode},
 };
+use std::collections::HashSet;
+use thiserror::Error;
 
-#[derive(Debug)]
-pub(crate) struct ResolvedInput {
-    pub(crate) producer: usize,
-    pub(crate) subscriber: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct ResolvedTopology {
-    pub(crate) inputs_by_station: Vec<Vec<ResolvedInput>>,
-    subscriber_counts: Vec<u64>,
-    pub(crate) schedule: Vec<usize>,
-}
-
-impl ResolvedTopology {
-    pub(crate) fn inputs(&self, station: usize) -> &[ResolvedInput] {
-        &self.inputs_by_station[station]
-    }
-
-    pub(crate) fn schedule(&self) -> &[usize] {
-        &self.schedule
-    }
-
-    pub(crate) fn subscriber_count(&self, station: usize) -> u64 {
-        self.subscriber_counts[station]
-    }
-
-    pub(crate) fn input_count(&self, station: usize) -> usize {
-        self.inputs_by_station[station].len()
-    }
-}
+pub(crate) const MAX_OPERATIONS: usize = 1024;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum InvalidStationIdReason {
-    /// The station ID is empty.
-    Empty,
-    /// The station ID contains a NUL character.
-    ContainsNul,
+pub(crate) struct Consumer {
+    pub(crate) operation: usize,
+    pub(crate) port: usize,
 }
 
-/// Failure while validating a Flow's static topology.
+/// Derived indices only: no persistent identity, queue or lifecycle.
+#[derive(Debug)]
+pub(crate) struct ResolvedTopology {
+    pub(crate) schedule: Vec<usize>,
+    pub(crate) tails: Vec<Vec<usize>>,
+    pub(crate) consumers: Vec<Vec<Consumer>>,
+    pub(crate) heads: Vec<bool>,
+}
+
+/// Why a stable Operation ID is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InvalidOperationIdReason {
+    /// The ID is empty.
+    Empty,
+    /// The ID contains NUL.
+    ContainsNul,
+    /// The ID exceeds 1024 UTF-8 bytes.
+    TooLong,
+}
+
+/// Failure while validating the logical DAG.
 #[derive(Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum TopologyError {
-    /// A Flow must contain at least one station.
-    #[error("a flow must contain at least one station")]
+    /// A Flow needs at least one Operation.
+    #[error("a flow must contain at least one operation")]
     EmptyTopology,
-    /// A station ID violates the stable identity rules.
-    #[error("invalid station ID {id:?}: {reason:?}")]
-    InvalidStationId {
-        /// The rejected ID.
+    /// An ID violates the identity rules.
+    #[error("invalid operation ID {id:?}: {reason:?}")]
+    InvalidOperationId {
+        /// Rejected ID.
         id: String,
-        /// Why the ID was rejected.
-        reason: InvalidStationIdReason,
+        /// Rejection reason.
+        reason: InvalidOperationIdReason,
     },
-    /// Two stations declared the same stable ID.
-    #[error("duplicate station ID {0:?}")]
-    DuplicateStationId(String),
-    /// An input or materialization does not reference an earlier declaration
-    /// in the same factory.
+    /// Two Operations share an ID.
+    #[error("duplicate operation ID {0:?}")]
+    DuplicateOperationId(String),
+    /// A reference comes from another factory or is not an earlier declaration.
     #[error("operation reference is not valid in this flow factory")]
     ForeignOperationRef(OperationRef),
-    /// A station directly references itself.
-    #[error("station {0:?} directly references itself")]
-    SelfLoop(String),
-    /// The topology contains an indirect cycle.
+    /// A persisted edge does not identify an Operation.
+    #[error("operation {operation:?} references unknown input {input}")]
+    UnknownInput {
+        /// Consumer ID.
+        operation: String,
+        /// Invalid producer ordinal.
+        input: usize,
+    },
+    /// The graph contains a cycle.
     #[error("flow topology contains a cycle")]
     Cycle,
-    /// A root Station is not a Scan.
-    #[error("root station {0:?} is not a scan")]
+    /// A root is not a source.
+    #[error("root operation {0:?} is not a source")]
     RootIsNotScan(String),
-    /// A terminal Station is not a sink.
-    #[error("terminal station {0:?} is not a sink")]
+    /// A leaf is not a sink.
+    #[error("terminal operation {0:?} is not a sink")]
     TerminalIsNotSink(String),
-    /// The connected input count does not match the Station's input arity.
-    #[error("station {station:?} requires {expected} inputs but received {actual}")]
+    /// The connected arity differs from the declaration.
+    #[error("operation {operation:?} requires {expected} inputs but received {actual}")]
     InputCount {
-        /// Station whose input arity did not match.
-        station: String,
-        /// Required input count.
+        /// Consumer ID.
+        operation: String,
+        /// Declared arity.
         expected: usize,
-        /// Connected input count.
+        /// Connected arity.
         actual: usize,
     },
-    /// A connection uses an outputless Station as an input.
-    #[error("station {station:?} cannot read from outputless input station {input_station:?}")]
+    /// A sink cannot produce an input.
+    #[error("operation {operation:?} reads outputless input {input:?}")]
     InputHasNoOutput {
-        /// Input Station without an output stream.
-        input_station: String,
-        /// Station that attempted to consume it.
-        station: String,
+        /// Consumer ID.
+        operation: String,
+        /// Producer ID.
+        input: String,
     },
-    /// A Station with an output has no declared retained-byte capacity.
-    #[error("output capacity for station {0:?} is missing")]
-    MissingOutputCapacity(String),
-    /// An outputless Station declared an output capacity.
-    #[error("outputless station {0:?} cannot declare an output capacity")]
-    UnexpectedOutputCapacity(String),
-    /// A Station's output capacity was declared more than once.
-    #[error("output capacity for station {0:?} was already set")]
-    OutputCapacityAlreadySet(String),
-    /// A decoded Station contains no Operation.
-    #[error("station {0:?} contains no operation")]
-    EmptyOperationList(String),
-    /// The current final Operation requires a Station boundary.
-    #[error("station {0:?} cannot append another operation")]
-    StationCannotBeExtended(String),
-    /// Only a single-input atomic transform can follow another Operation.
-    #[error("station {station:?} operation {operation} must be a single-input atomic transform")]
-    InvalidAppendedOperation {
-        /// Station containing the invalid Operation.
-        station: String,
-        /// Zero-based Operation ordinal.
-        operation: usize,
-    },
+    /// The graph exceeds a fixed construction bound.
+    #[error("flow exceeds {0}")]
+    Limit(&'static str),
 }
 
 pub(super) fn finish_definition(
     owner_identity: Option<[u8; 32]>,
     token: u64,
-    operations: Vec<DeclaredOperation>,
-    default_capacity: NonZeroU64,
-    materializations: &[(OperationRef, NonZeroU64)],
+    declarations: Vec<DeclaredOperation>,
 ) -> Result<FlowDefinition, TopologyError> {
-    validate_ids(operations.iter().map(|operation| operation.id.as_str()))?;
-    let mut consumers = vec![0_usize; operations.len()];
-    for (index, operation) in operations.iter().enumerate() {
-        let expected = usize::try_from(operation.definition.kind().input_count())
-            .expect("Operation arity fits usize");
-        if operation.inputs.len() != expected {
-            return Err(TopologyError::InputCount {
-                station: operation.id.clone(),
-                expected,
-                actual: operation.inputs.len(),
-            });
-        }
-        for input in &operation.inputs {
-            let input = resolve_ref(token, index, *input)?;
-            if !operations[input].definition.kind().has_output() {
-                return Err(TopologyError::InputHasNoOutput {
-                    input_station: operations[input].id.clone(),
-                    station: operation.id.clone(),
-                });
-            }
-            consumers[input] += 1;
-        }
-    }
-    let mut capacities = vec![None; operations.len()];
-    for (reference, capacity) in materializations {
-        let index = resolve_ref(token, operations.len(), *reference)?;
-        if !operations[index].definition.kind().has_output() {
-            return Err(TopologyError::UnexpectedOutputCapacity(
-                operations[index].id.clone(),
-            ));
-        }
-        if capacities[index].replace(*capacity).is_some() {
-            return Err(TopologyError::OutputCapacityAlreadySet(
-                operations[index].id.clone(),
-            ));
-        }
-    }
-
-    let mut stations: Vec<StationDefinition> = Vec::new();
-    let mut station_by_operation: Vec<usize> = Vec::with_capacity(operations.len());
-    for operation in operations {
-        let is_atomic = matches!(
-            operation.definition.kind(),
-            OperationKind::AtomicTransform(count) if count.get() == 1
-        );
-        let fused_station = operation.inputs.first().and_then(|input| {
-            let station = station_by_operation[input.index];
-            let last = stations[station]
-                .operations
-                .last()
-                .expect("nonempty program");
-            // A sole consumer guarantees this input is still its Station's tail.
-            (is_atomic
-                && consumers[input.index] == 1
-                && capacities[input.index].is_none()
-                && last.kind().allows_atomic_tail())
-            .then_some(station)
+    let mut operations = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let inputs = declaration
+            .inputs
+            .into_iter()
+            .map(|reference| {
+                if reference.factory_token != token || reference.index >= operations.len() {
+                    Err(TopologyError::ForeignOperationRef(reference))
+                } else {
+                    Ok(reference.index)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        operations.push(OperationNode {
+            id: declaration.id,
+            definition: declaration.definition,
+            inputs,
         });
-        let capacity = capacities[station_by_operation.len()].unwrap_or(default_capacity);
-        let station = if let Some(station) = fused_station {
-            stations[station].operations.push(operation.definition);
-            stations[station].output_capacity_bytes = Some(capacity);
-            station
-        } else {
-            let mut station = StationDefinition::new(operation.id, operation.definition);
-            station.inputs = operation
-                .inputs
-                .iter()
-                .map(|input| stations[station_by_operation[input.index]].id.clone())
-                .collect();
-            station.output_capacity_bytes = station.has_output().then_some(capacity);
-            stations.push(station);
-            stations.len() - 1
-        };
-        station_by_operation.push(station);
     }
-    // The canonical decoder owns durable graph validation and scheduling. The
-    // declaration order already guarantees that the input graph is acyclic.
-    Ok(FlowDefinition::new(owner_identity, stations))
+    let definition = FlowDefinition {
+        owner_identity,
+        operations,
+    };
+    resolve(&definition)?;
+    Ok(definition)
 }
 
-fn validate_station_programs(stations: &[StationDefinition]) -> Result<(), TopologyError> {
-    for station in stations {
-        let Some((first, tail)) = station.operations.split_first() else {
-            return Err(TopologyError::EmptyOperationList(station.id.clone()));
-        };
-        if !tail.is_empty() && !first.kind().allows_atomic_tail() {
-            return Err(TopologyError::StationCannotBeExtended(station.id.clone()));
-        }
-        for (operation, definition) in tail.iter().enumerate() {
-            if !matches!(
-                definition.kind(),
-                OperationKind::AtomicTransform(count) if count.get() == 1
-            ) {
-                return Err(TopologyError::InvalidAppendedOperation {
-                    station: station.id.clone(),
-                    operation: operation + 1,
-                });
-            }
-        }
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep bounded DAG validation and derived call indices together."
+)]
+pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, TopologyError> {
+    let nodes = &definition.operations;
+    if nodes.is_empty() {
+        return Err(TopologyError::EmptyTopology);
     }
-    Ok(())
-}
-
-pub(super) fn validate_decoded_topology(
-    stations: &[StationDefinition],
-    inputs_by_station: Vec<Vec<usize>>,
-) -> Result<ResolvedTopology, TopologyError> {
-    validate_station_programs(stations)?;
-    for (station, inputs) in inputs_by_station.iter().enumerate() {
-        if inputs.contains(&station) {
-            return Err(TopologyError::SelfLoop(stations[station].id.clone()));
-        }
+    if nodes.len() > MAX_OPERATIONS {
+        return Err(TopologyError::Limit("1024 operations"));
     }
-    let topology = resolve_topology(inputs_by_station)?;
-    validate_endpoints(stations, &topology)?;
-    validate_input_counts(stations, &topology)?;
-    validate_inputs_have_output(stations, &topology)?;
-    validate_output_capacities(stations)?;
-    Ok(topology)
-}
-
-fn validate_output_capacities(stations: &[StationDefinition]) -> Result<(), TopologyError> {
-    for station in stations {
-        match (station.has_output(), station.output_capacity_bytes) {
-            (true, None) => {
-                return Err(TopologyError::MissingOutputCapacity(station.id.clone()));
-            }
-            (false, Some(_)) => {
-                return Err(TopologyError::UnexpectedOutputCapacity(station.id.clone()));
-            }
-            (true, Some(_)) | (false, None) => {}
-        }
-    }
-    Ok(())
-}
-
-fn validate_endpoints(
-    stations: &[StationDefinition],
-    topology: &ResolvedTopology,
-) -> Result<(), TopologyError> {
-    for (index, station) in stations.iter().enumerate() {
-        let is_root = topology.input_count(index) == 0;
-        if is_root && !station.is_scan() {
-            return Err(TopologyError::RootIsNotScan(station.id.clone()));
-        }
-        if topology.subscriber_count(index) == 0 && !station.is_sink() {
-            return Err(TopologyError::TerminalIsNotSink(station.id.clone()));
-        }
-    }
-    Ok(())
-}
-
-fn validate_inputs_have_output(
-    stations: &[StationDefinition],
-    topology: &ResolvedTopology,
-) -> Result<(), TopologyError> {
-    for (station, inputs) in topology.inputs_by_station.iter().enumerate() {
-        for input in inputs {
-            if !stations[input.producer].has_output() {
-                return Err(TopologyError::InputHasNoOutput {
-                    input_station: stations[input.producer].id.clone(),
-                    station: stations[station].id.clone(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_input_counts(
-    stations: &[StationDefinition],
-    topology: &ResolvedTopology,
-) -> Result<(), TopologyError> {
-    for (station, inputs) in stations.iter().zip(&topology.inputs_by_station) {
-        let expected = station.input_count();
-        let actual = inputs.len();
-        if actual != expected {
-            return Err(TopologyError::InputCount {
-                station: station.id.clone(),
-                expected,
-                actual,
-            });
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_station_ids(stations: &[StationDefinition]) -> Result<(), TopologyError> {
-    validate_ids(stations.iter().map(|station| station.id.as_str()))
-}
-
-fn validate_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<(), TopologyError> {
-    let mut seen = HashSet::new();
-    for id in ids {
-        let reason = if id.is_empty() {
-            Some(InvalidStationIdReason::Empty)
-        } else if id.as_bytes().contains(&0) {
-            Some(InvalidStationIdReason::ContainsNul)
+    let mut ids = HashSet::new();
+    for node in nodes {
+        let reason = if node.id.is_empty() {
+            Some(InvalidOperationIdReason::Empty)
+        } else if node.id.contains('\0') {
+            Some(InvalidOperationIdReason::ContainsNul)
+        } else if node.id.len() > 1024 {
+            Some(InvalidOperationIdReason::TooLong)
         } else {
             None
         };
         if let Some(reason) = reason {
-            return Err(TopologyError::InvalidStationId {
-                id: id.to_owned(),
+            return Err(TopologyError::InvalidOperationId {
+                id: node.id.clone(),
                 reason,
             });
         }
-        if !seen.insert(id) {
-            return Err(TopologyError::DuplicateStationId(id.to_owned()));
+        if !ids.insert(&node.id) {
+            return Err(TopologyError::DuplicateOperationId(node.id.clone()));
         }
     }
-    if seen.is_empty() {
-        return Err(TopologyError::EmptyTopology);
+    let mut consumers = vec![Vec::new(); nodes.len()];
+    let mut indegrees = vec![0; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        let expected = node.definition.kind().input_count() as usize;
+        if expected != node.inputs.len() {
+            return Err(TopologyError::InputCount {
+                operation: node.id.clone(),
+                expected,
+                actual: node.inputs.len(),
+            });
+        }
+        for (port, &input) in node.inputs.iter().enumerate() {
+            let producer = nodes
+                .get(input)
+                .ok_or_else(|| TopologyError::UnknownInput {
+                    operation: node.id.clone(),
+                    input,
+                })?;
+            if !producer.definition.kind().has_output() {
+                return Err(TopologyError::InputHasNoOutput {
+                    operation: node.id.clone(),
+                    input: producer.id.clone(),
+                });
+            }
+            consumers[input].push(Consumer {
+                operation: index,
+                port,
+            });
+            indegrees[index] += 1;
+        }
     }
-    Ok(())
-}
-
-fn resolve_ref(
-    token: u64,
-    station_count: usize,
-    reference: OperationRef,
-) -> Result<usize, TopologyError> {
-    if reference.factory_token != token || reference.index >= station_count {
-        Err(TopologyError::ForeignOperationRef(reference))
-    } else {
-        Ok(reference.index)
+    for (index, node) in nodes.iter().enumerate() {
+        if indegrees[index] == 0 && !node.definition.kind().is_scan() {
+            return Err(TopologyError::RootIsNotScan(node.id.clone()));
+        }
+        if consumers[index].is_empty() && !node.definition.kind().is_sink() {
+            return Err(TopologyError::TerminalIsNotSink(node.id.clone()));
+        }
     }
-}
-
-fn resolve_topology(inputs_by_station: Vec<Vec<usize>>) -> Result<ResolvedTopology, TopologyError> {
-    let station_count = inputs_by_station.len();
-    let mut indegrees = vec![0_usize; station_count];
-    let mut consumers_by_station = vec![Vec::new(); station_count];
-    let mut subscriber_counts = vec![0_u64; station_count];
-    let inputs_by_station = inputs_by_station
-        .into_iter()
-        .enumerate()
-        .map(|(station, inputs)| {
-            inputs
-                .into_iter()
-                .map(|producer| {
-                    let subscriber = subscriber_counts[producer];
-                    subscriber_counts[producer] = subscriber
-                        .checked_add(1)
-                        .expect("a materialized Flow cannot contain u64::MAX edges");
-                    indegrees[station] += 1;
-                    consumers_by_station[producer].push(station);
-                    ResolvedInput {
-                        producer,
-                        subscriber,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
     let mut ready = indegrees
         .iter()
         .enumerate()
-        .filter_map(|(station, indegree)| (*indegree == 0).then_some(station))
+        .filter_map(|(i, &n)| (n == 0).then_some(i))
         .collect::<Vec<_>>();
-    let mut schedule = Vec::with_capacity(station_count);
+    let mut schedule = Vec::with_capacity(nodes.len());
     while !ready.is_empty() {
         let mut next = Vec::new();
-        for station in ready {
-            schedule.push(station);
-            for consumer in &consumers_by_station[station] {
-                indegrees[*consumer] -= 1;
-                if indegrees[*consumer] == 0 {
-                    next.push(*consumer);
+        for index in ready {
+            schedule.push(index);
+            for consumer in &consumers[index] {
+                indegrees[consumer.operation] -= 1;
+                if indegrees[consumer.operation] == 0 {
+                    next.push(consumer.operation);
                 }
             }
         }
         next.sort_unstable();
         ready = next;
     }
-
-    if schedule.len() == station_count {
-        Ok(ResolvedTopology {
-            inputs_by_station,
-            subscriber_counts,
-            schedule,
-        })
-    } else {
-        Err(TopologyError::Cycle)
+    if schedule.len() != nodes.len() {
+        return Err(TopologyError::Cycle);
     }
+    let mut tails = vec![Vec::new(); nodes.len()];
+    let mut heads = vec![true; nodes.len()];
+    let mut head_of = (0..nodes.len()).collect::<Vec<_>>();
+    for &index in &schedule {
+        let node = &nodes[index];
+        if node.definition.kind().is_atomic() && node.inputs.len() == 1 {
+            let producer = node.inputs[0];
+            if consumers[producer].len() == 1 {
+                let head = head_of[producer];
+                tails[head].push(index);
+                heads[index] = false;
+                head_of[index] = head;
+            }
+        }
+    }
+    let mut depth = vec![0; nodes.len()];
+    for &index in &schedule {
+        if !heads[index] || nodes[index].definition.kind().is_sink() {
+            continue;
+        }
+        depth[index] = nodes[index]
+            .inputs
+            .iter()
+            .map(|&input| depth[head_of[input]])
+            .max()
+            .unwrap_or(0)
+            + 1;
+        if depth[index] > MAX_DEPTH {
+            return Err(TopologyError::Limit("64 call frames"));
+        }
+    }
+    let consumers = (0..nodes.len())
+        .map(|index| consumers[tails[index].last().copied().unwrap_or(index)].clone())
+        .collect();
+    Ok(ResolvedTopology {
+        schedule,
+        tails,
+        consumers,
+        heads,
+    })
 }

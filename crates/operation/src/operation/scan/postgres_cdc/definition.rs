@@ -18,6 +18,7 @@ pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "postgres_cdc_scan.phase";
 pub(super) const CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
+pub(super) const PUBLISHED: &str = "postgres_cdc_scan.published";
 pub(super) const BOOTSTRAP_SPOOL: &str = "postgres_cdc_scan.bootstrap_spool";
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
@@ -170,6 +171,7 @@ impl PostgresCdcScanDefinition {
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
         let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
+        let published = scope.data::<Queue<Vec<u8>>>(PUBLISHED)?;
         let config = resource.take::<PostgresCdcScanConfig>()?;
         let operation = PostgresCdcScanOperation::new_bound(
             self,
@@ -177,10 +179,11 @@ impl PostgresCdcScanDefinition {
             phase,
             checkpoint,
             spool,
+            published,
             config,
         )
         .map_err(schema_error)?;
-        Ok(ConstructedOperation::turn(Some(output), operation))
+        Ok(ConstructedOperation::source(Some(output), operation))
     }
 
     pub(crate) fn resource_type() -> TypeId {

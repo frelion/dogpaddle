@@ -32,16 +32,15 @@ impl RelationTarget for Target {
         requests
             .iter()
             .map(|request| {
-                let key = canonical_row(input.records(), request.row_index)?;
+                let key = canonical_row_bounded(input.records(), request.row_index, usize::MAX)?;
                 let ids = self
                     .rows
                     .iter()
                     .filter(|(_, value)| **value == key)
                     .map(|(id, _)| *id)
-                    .take(usize::try_from(request.needed).unwrap())
+                    .take(request.take)
                     .collect::<Vec<_>>();
                 Ok(Matches {
-                    count: u64::try_from(ids.len()).unwrap(),
                     ids: ids.into_iter().take(request.take).collect(),
                 })
             })
@@ -50,8 +49,11 @@ impl RelationTarget for Target {
 
     fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
         for insert in &batch.inserts {
-            let expected =
-                canonical_row(input.records(), usize::try_from(insert.row_index).unwrap())?;
+            let expected = canonical_row_bounded(
+                input.records(),
+                usize::try_from(insert.row_index).unwrap(),
+                usize::MAX,
+            )?;
             match self.rows.entry(insert.technical_id) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(expected);
@@ -64,8 +66,11 @@ impl RelationTarget for Target {
             }
         }
         for delete in &batch.deletes {
-            let expected =
-                canonical_row(input.records(), usize::try_from(delete.row_index).unwrap())?;
+            let expected = canonical_row_bounded(
+                input.records(),
+                usize::try_from(delete.row_index).unwrap(),
+                usize::MAX,
+            )?;
             if self
                 .rows
                 .get(&delete.technical_id)
@@ -220,7 +225,7 @@ fn later_inserts_cannot_cover_an_invalid_negative_prefix() {
 }
 
 #[test]
-fn first_slice_admits_a_large_event_before_any_partial_delivery() {
+fn negative_slice_looks_up_only_current_mutations_while_positive_reserves_full_ids() {
     let mut target = Target::default();
     let mut next_id = 1;
     for (diff, admission) in [(1024, 2050), (1024, 1024), (2, 2)] {
@@ -233,7 +238,7 @@ fn first_slice_admits_a_large_event_before_any_partial_delivery() {
     assert_eq!(target.rows.len(), 2050);
 
     let invalid = delivery(&[(7, -1024)], &[2051]);
-    assert!(plan::prepare(&mut target, &invalid, next_id).is_err());
+    assert!(plan::prepare(&mut target, &invalid, next_id).is_ok());
     assert_eq!(target.rows.len(), 2050);
 
     target.lookups.clear();
@@ -249,9 +254,9 @@ fn first_slice_admits_a_large_event_before_any_partial_delivery() {
         target
             .lookups
             .iter()
-            .map(|requests| (requests[0].needed, requests[0].take))
+            .map(|requests| requests[0].take)
             .collect::<Vec<_>>(),
-        [(2050, 1024), (1024, 1024), (2, 2)]
+        [1024, 1024, 2]
     );
 }
 
@@ -523,4 +528,11 @@ fn zero_width_nested_values_cannot_expand_past_the_planning_budget() {
         .is_err()
     );
     assert!(target.lookups.is_empty());
+}
+
+#[test]
+fn negative_only_admission_needs_no_id_reservation_after_the_frontier_is_exhausted() {
+    validate_admission(&change(&[(7, -1)]), EXHAUSTED_ID, 1024).unwrap();
+    assert!(validate_admission(&change(&[(7, 1)]), EXHAUSTED_ID, 0).is_err());
+    assert!(validate_admission(&change(&[(7, -1), (7, 1)]), EXHAUSTED_ID, 0).is_err());
 }

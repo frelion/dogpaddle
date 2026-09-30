@@ -159,12 +159,8 @@ impl RelationTarget for PostgresTarget {
                     let limits = batch
                         .iter()
                         .map(|request| {
-                            let needed = request.needed.min(i64::MAX.unsigned_abs());
-                            Ok((
-                                i64::try_from(needed).expect("needed was capped at bigint"),
-                                i64::try_from(request.take)
-                                    .map_err(|_| invalid_batch("lookup take exceeds bigint"))?,
-                            ))
+                            i64::try_from(request.take)
+                                .map_err(|_| invalid_batch("lookup take exceeds bigint"))
                         })
                         .collect::<Result<Vec<_>, PostgresSinkError>>()?;
                     let hashes = encoded
@@ -172,8 +168,8 @@ impl RelationTarget for PostgresTarget {
                         .map(|row| row.hash.as_slice())
                         .collect::<Vec<_>>();
                     let mut parameters: Vec<&(dyn ToSql + Sync)> = Vec::new();
-                    for ((row, hash), (needed, take)) in encoded.iter().zip(&hashes).zip(&limits) {
-                        parameters.extend([needed as &(dyn ToSql + Sync), take, hash]);
+                    for ((row, hash), take) in encoded.iter().zip(&hashes).zip(&limits) {
+                        parameters.extend([take as &(dyn ToSql + Sync), hash]);
                         parameters.extend(row.values.iter().map(PostgresValue::as_parameter));
                     }
                     let rows = client
@@ -181,10 +177,8 @@ impl RelationTarget for PostgresTarget {
                         .await
                         .map_err(|error| database_error("match target rows", &error))?;
                     for row in rows {
-                        let count = u64::try_from(row.get::<_, i64>(1))
-                            .map_err(|_| invalid_batch("negative matching-row count"))?;
                         let ids =
-                            row.get::<_, Vec<i64>>(2)
+                            row.get::<_, Vec<i64>>(1)
                                 .into_iter()
                                 .map(|id| {
                                     u64::try_from(id).ok().filter(|id| *id != 0).ok_or_else(|| {
@@ -192,7 +186,7 @@ impl RelationTarget for PostgresTarget {
                                     })
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
-                        matches.push(Matches { count, ids });
+                        matches.push(Matches { ids });
                     }
                 }
                 Ok(matches)
@@ -453,12 +447,7 @@ impl SqlPlan {
         let mut parameter_types = vec!["bigint", "bytea"];
         parameter_types.extend(layout.columns().iter().map(|column| column.storage().sql()));
 
-        let mut request_names = vec![
-            "n".to_owned(),
-            "needed".to_owned(),
-            "take".to_owned(),
-            "hash".to_owned(),
-        ];
+        let mut request_names = vec!["n".to_owned(), "take".to_owned(), "hash".to_owned()];
         request_names.extend((0..logical_names.len()).map(|index| format!("c{index}")));
         let mut exact = String::new();
         for (index, name) in logical_names.iter().enumerate() {
@@ -478,12 +467,7 @@ impl SqlPlan {
              ORDER BY request.n",
             request_names.join(", ")
         );
-        let lookup_prefix = format!(
-            "SELECT request.n, CASE WHEN cardinality(selected.ids) = request.take \
-             AND request.needed > request.take THEN \
-             (SELECT count(*) FROM (SELECT 1 {matching} LIMIT request.needed) AS counted) \
-             ELSE cardinality(selected.ids)::bigint END, selected.ids FROM (VALUES "
-        );
+        let lookup_prefix = "SELECT request.n, selected.ids FROM (VALUES ".to_owned();
         let mut different = format!("target.{hash} IS DISTINCT FROM expected.hash");
         for (index, name) in logical_names.iter().enumerate() {
             write!(
@@ -540,8 +524,7 @@ impl SqlPlan {
     pub(super) fn lookup_statement(&self, rows: usize) -> String {
         assert!((1..=self.lookup_batch_size()).contains(&rows));
         let mut sql = self.lookup_prefix.clone();
-        let mut types = vec!["bigint"];
-        types.extend(&self.parameter_types);
+        let types = self.parameter_types.clone();
         write_values(&mut sql, rows, &types, true);
         sql.push_str(&self.lookup_suffix);
         sql

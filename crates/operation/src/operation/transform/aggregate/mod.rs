@@ -33,6 +33,8 @@ fn construct(
         output_schema: layout.output_schema,
         group_expressions: layout.group_expressions,
         calls: layout.calls,
+        arguments: layout.arguments,
+        statistics: layout.statistics,
         layouts: layout.layouts,
         slots: layout.slots,
         groups,

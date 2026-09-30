@@ -1,39 +1,14 @@
+use super::support::{TestStore, assert_literal_definition, construct_checked, value_schema};
+use arrow_array::UInt64Array;
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
-    operation::{
-        Action, Operation, OperationInput,
-        scan::{SequenceScanDefinition, SequenceScanError},
-    },
+    OperationDefinition, OperationKind, RuntimeResource,
+    operation::{Operation, scan::SequenceScanDefinition},
 };
-use dogpaddle_store::{Cell, Store, StoreError, StoreSetup, Transactions};
-
-use super::support::{
-    ExpectedAction, TestStore, assert_literal_definition, change, commit_ready, construct_checked,
-    decode_hex, output_values, rollback_ready, value_schema,
-};
-
+use dogpaddle_store::{Store, StoreSetup};
 const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_scan_start_42.hex");
-
-fn construct_operation(
-    root: &TestStore,
-    definition: &(impl Clone + Into<OperationDefinition>),
-) -> (Operation, Transactions) {
-    let definition: OperationDefinition = definition.clone().into();
-    let mut setup = StoreSetup::new();
-    let constructed = definition
-        .construct(
-            &[],
-            &mut setup.data_scope().scoped("operation"),
-            RuntimeResource::none(),
-        )
-        .unwrap();
-    let (operation, _) = constructed.into_parts();
-    let transactions = setup.commit(root.path(), |_| Ok(())).unwrap();
-    (operation, transactions)
-}
-
 #[test]
-fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
+fn definition_has_stable_v1_literal_exact_schema_and_published_queue() {
     let definition = SequenceScanDefinition::new(42);
     let decoded = assert_literal_definition(&definition, SEQUENCE_V1, 1, OperationKind::Scan);
     assert_eq!(definition.start(), 42);
@@ -42,132 +17,242 @@ fn definition_has_stable_v1_literal_exact_schema_and_position_declaration() {
         Some(&value_schema())
     );
     let root = TestStore::new();
-    let (mut operation, mut transactions) = construct_operation(&root, &decoded);
-    assert_eq!(
-        output_values(
-            commit_ready(&mut operation, None, &mut transactions).unwrap(),
-            ExpectedAction::Commit,
-            "value",
-        ),
-        [42]
-    );
-    drop((operation, transactions));
-
+    let mut setup = StoreSetup::new();
+    let (operation, _) = decoded
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    source.restore(reads.begin().access()).unwrap();
+    let mut delivery = source.poll().unwrap().unwrap();
+    {
+        let txn = writes.begin();
+        assert!(source.record(txn.access(), &mut delivery).unwrap());
+    }
+    assert!(source.published(reads.begin().access()).unwrap().is_none());
+    {
+        let txn = writes.begin();
+        assert!(source.record(txn.access(), &mut delivery).unwrap());
+        txn.commit().unwrap();
+    }
+    source.ack(delivery).unwrap();
+    {
+        let txn = writes.begin();
+        let encoded = source.published(reads.begin().access()).unwrap().unwrap();
+        let change = SchemaBoundChangeCodec::try_new(value_schema())
+            .unwrap()
+            .decode_owned(encoded)
+            .unwrap();
+        source.consume_published(txn.access()).unwrap();
+        assert_eq!(
+            change
+                .records()
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values(),
+            &[42]
+        );
+    }
+    {
+        let txn = writes.begin();
+        let encoded = source.published(reads.begin().access()).unwrap().unwrap();
+        let change = SchemaBoundChangeCodec::try_new(value_schema())
+            .unwrap()
+            .decode_owned(encoded)
+            .unwrap();
+        source.consume_published(txn.access()).unwrap();
+        assert_eq!(change.num_rows(), 1);
+        txn.commit().unwrap();
+    }
+    drop((source, writes, reads));
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&decode_hex(SEQUENCE_V1)).unwrap();
-    let constructed = decoded
+    store
+        .open_data::<dogpaddle_store::Queue<Vec<u8>>>("operation/sequence_scan.published")
+        .unwrap();
+}
+#[test]
+fn terminal_position_and_captured_data_survive_reopen_before_ack() {
+    let root = TestStore::new();
+    let definition: OperationDefinition = SequenceScanDefinition::new(u64::MAX).into();
+    let mut setup = StoreSetup::new();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    source.restore(reads.begin().access()).unwrap();
+    let mut delivery = source.poll().unwrap().unwrap();
+    {
+        let txn = writes.begin();
+        assert!(source.record(txn.access(), &mut delivery).unwrap());
+        txn.commit().unwrap();
+    }
+    drop((delivery, source, writes, reads));
+    let store = Store::open(root.path()).unwrap();
+    let (operation, _) = definition
         .construct(
             &[],
             &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
-        .unwrap();
-    let (mut operation, _) = constructed.into_parts();
-    let mut transactions = store.into_transactions();
-    assert_eq!(
-        output_values(
-            commit_ready(&mut operation, None, &mut transactions).unwrap(),
-            ExpectedAction::Commit,
-            "value",
-        ),
-        [43]
-    );
-    assert!(matches!(
-        construct_checked(&definition, &[value_schema()]),
-        Err(OperationBindError::InputCount {
-            expected: 0,
-            actual: 1
-        })
-    ));
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = store.into_transactions().split();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    source.restore(reads.begin().access()).unwrap();
+    assert!(source.poll().unwrap().is_none());
+    let txn = writes.begin();
+    assert!(source.published(reads.begin().access()).unwrap().is_some());
+    source.consume_published(txn.access()).unwrap();
+    txn.commit().unwrap();
 }
 
 #[test]
-fn rollback_commit_reopen_and_terminal_position_are_exact() {
+fn restore_rejects_a_position_before_the_definition_without_rewriting_it() {
     let root = TestStore::new();
-    let definition = SequenceScanDefinition::new(u64::MAX - 1);
-    let (mut operation, mut transactions) = construct_operation(&root, &definition);
-    assert_eq!(
-        output_values(
-            rollback_ready(&mut operation, None, &mut transactions).unwrap(),
-            ExpectedAction::Commit,
-            "value",
-        ),
-        [u64::MAX - 1]
-    );
-    assert_eq!(
-        output_values(
-            commit_ready(&mut operation, None, &mut transactions).unwrap(),
-            ExpectedAction::Commit,
-            "value",
-        ),
-        [u64::MAX - 1]
-    );
-    drop((operation, transactions));
-
+    let definition: OperationDefinition = SequenceScanDefinition::new(42).into();
+    let mut setup = StoreSetup::new();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    drop(operation);
+    drop(setup.commit(root.path(), |_| Ok(())).unwrap());
     let store = Store::open(root.path()).unwrap();
-    let position = store
-        .open_data::<Cell<u64>>("operation/sequence_scan.position")
-        .unwrap();
-    let constructed = OperationDefinition::from(definition)
+    let position: dogpaddle_store::Cell<u64> =
+        store.open_data("operation/sequence_scan.position").unwrap();
+    let (operation, _) = definition
         .construct(
             &[],
             &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
-        .unwrap();
-    let (mut operation, _) = constructed.into_parts();
-    let mut transactions = store.into_transactions();
-    assert_eq!(
-        output_values(
-            commit_ready(&mut operation, None, &mut transactions).unwrap(),
-            ExpectedAction::Commit,
-            "value",
-        ),
-        [u64::MAX]
-    );
-    assert!(matches!(
-        rollback_ready(&mut operation, None, &mut transactions).unwrap(),
-        Action::Idle
-    ));
-    let transaction = transactions.begin();
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let txn = writes.begin();
+        position.access(txn.access()).unwrap().set(&41).unwrap();
+        txn.commit().unwrap();
+    }
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    assert!(source.restore(reads.begin().access()).is_err());
     assert_eq!(
         position
-            .access(transaction.access())
+            .read(reads.begin().access())
             .unwrap()
             .get()
             .unwrap(),
-        Some(u64::MAX)
+        Some(41)
     );
-    transaction.commit().unwrap();
 }
 
 #[test]
-fn runtime_rejects_input_and_a_foreign_store() {
+fn capturing_a_successor_preserves_the_front_through_rollback_and_reopen() {
     let root = TestStore::new();
-    let (mut operation, mut transactions) =
-        construct_operation(&root, &SequenceScanDefinition::new(0));
-    let input = change(&[1]);
-    let error = rollback_ready(
-        &mut operation,
-        Some(OperationInput {
-            port: 0,
-            change: &input,
-        }),
-        &mut transactions,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<SequenceScanError>(),
-        Some(SequenceScanError::UnexpectedInput)
-    ));
-    drop(transactions);
-
-    let foreign_root = tempfile::tempdir().unwrap();
-    let foreign = Store::create(foreign_root.path().join("foreign")).unwrap();
-    let mut foreign_transactions = foreign.into_transactions();
-    let error = rollback_ready(&mut operation, None, &mut foreign_transactions).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<StoreError>(),
-        Some(StoreError::WrongStore)
-    ));
+    let definition: OperationDefinition = SequenceScanDefinition::new(42).into();
+    let mut setup = StoreSetup::new();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    source.restore(reads.begin().access()).unwrap();
+    let mut first = source.poll().unwrap().unwrap();
+    {
+        let txn = writes.begin();
+        assert!(source.record(txn.access(), &mut first).unwrap());
+        txn.commit().unwrap();
+    }
+    source.ack(first).unwrap();
+    let front = source.published(reads.begin().access()).unwrap().unwrap();
+    let mut successor = source.poll().unwrap().unwrap();
+    {
+        let txn = writes.begin();
+        assert!(source.record(txn.access(), &mut successor).unwrap());
+        txn.commit().unwrap();
+    }
+    source.ack(successor).unwrap();
+    assert_eq!(
+        source.published(reads.begin().access()).unwrap(),
+        Some(front.clone())
+    );
+    {
+        let txn = writes.begin();
+        source.consume_published(txn.access()).unwrap();
+    }
+    drop((source, writes, reads));
+    let store = Store::open(root.path()).unwrap();
+    let (operation, _) = definition
+        .construct(
+            &[],
+            &mut store.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    let (mut writes, reads) = store.into_transactions().split();
+    let Operation::Source(mut source) = operation else {
+        panic!("expected source");
+    };
+    source.restore(reads.begin().access()).unwrap();
+    assert_eq!(
+        source.published(reads.begin().access()).unwrap(),
+        Some(front)
+    );
+    {
+        let txn = writes.begin();
+        source.consume_published(txn.access()).unwrap();
+        txn.commit().unwrap();
+    }
+    let encoded = source.published(reads.begin().access()).unwrap().unwrap();
+    let change = SchemaBoundChangeCodec::try_new(value_schema())
+        .unwrap()
+        .decode_owned(encoded)
+        .unwrap();
+    let values = change
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(values.values(), &[43]);
+    {
+        let txn = writes.begin();
+        source.consume_published(txn.access()).unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(source.published(reads.begin().access()).unwrap().is_none());
 }

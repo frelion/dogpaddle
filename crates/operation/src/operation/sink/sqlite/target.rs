@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_change::Change;
@@ -54,7 +57,7 @@ impl SqliteTarget {
     }
 
     pub(super) fn require_absent(&mut self) -> Result<(), SqliteSinkError> {
-        let (connection, sql) = self.parts()?;
+        let (connection, sql) = self.parts(Instant::now() + BUSY_TIMEOUT)?;
         for name in [&sql.table_name, &sql.index_name] {
             if object_exists(connection, name)? {
                 return Err(SqliteSinkError::TargetExists { name: name.clone() });
@@ -63,11 +66,11 @@ impl SqliteTarget {
         Ok(())
     }
 
-    fn verify_ready(&mut self) -> Result<(), SqliteSinkError> {
+    fn verify_ready(&mut self, deadline: Instant) -> Result<(), SqliteSinkError> {
         if self.verified {
             return Ok(());
         }
-        let (connection, sql) = self.parts()?;
+        let (connection, sql) = self.parts(deadline)?;
         require_exact_layout(connection, sql)?;
 
         self.verified = true;
@@ -77,15 +80,14 @@ impl SqliteTarget {
     fn matching_ids(
         &mut self,
         encoded: &EncodedRow,
-        scan_limit: u64,
         select_limit: usize,
+        deadline: Instant,
     ) -> Result<Matches, SqliteSinkError> {
-        let (connection, sql) = self.parts()?;
+        let (connection, sql) = self.parts(deadline)?;
         let select_limit = i64::try_from(select_limit).expect("the bounded batch limit fits i64");
         let mut values = std::iter::once(&encoded.hash as &dyn ToSql)
             .chain(encoded.values.iter().map(|value| value as &dyn ToSql))
             .collect::<Vec<_>>();
-        let count_limit = i64::try_from(scan_limit).unwrap_or(i64::MAX);
         values.push(&select_limit);
         let mut statement = connection.prepare_cached(&sql.select_matching_ids)?;
         let mut rows = statement.query(values.as_slice())?;
@@ -98,25 +100,11 @@ impl SqliteTarget {
             let id = u64::try_from(id).expect("a positive SQLite INTEGER fits u64");
             selected.push(id);
         }
-        let selected_count = u64::try_from(selected.len()).expect("the bounded result fits u64");
-        let count = if selected_count == select_limit.unsigned_abs() && scan_limit > selected_count
-        {
-            *values.last_mut().expect("the limit parameter was appended") = &count_limit;
-            let count = connection
-                .prepare_cached(&sql.count_matches)?
-                .query_row(values.as_slice(), |row| row.get::<_, i64>(0))?;
-            u64::try_from(count).expect("SQLite COUNT returns a nonnegative integer")
-        } else {
-            selected_count
-        };
-        Ok(Matches {
-            count,
-            ids: selected,
-        })
+        Ok(Matches { ids: selected })
     }
 
     pub(super) fn initialize(&mut self) -> Result<(), SqliteSinkError> {
-        let (connection, sql) = self.parts()?;
+        let (connection, sql) = self.parts(Instant::now() + BUSY_TIMEOUT)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !object_exists(&transaction, &sql.table_name)? {
             if object_exists(&transaction, &sql.index_name)? {
@@ -139,9 +127,10 @@ impl SqliteTarget {
     }
 
     fn write(&mut self, change: &Change, batch: &Batch) -> Result<(), SqliteSinkError> {
-        self.verify_ready()?;
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        self.verify_ready(deadline)?;
         let (groups, deletes) = self.encode_mutation_groups(change, batch)?;
-        let (connection, sql) = self.parts()?;
+        let (connection, sql) = self.parts(deadline)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for group in &groups {
             let mut statement = transaction.prepare_cached(&sql.insert)?;
@@ -217,7 +206,7 @@ impl SqliteTarget {
         Ok((groups, deletes))
     }
 
-    fn parts(&mut self) -> Result<(&mut Connection, &SqlPlan), SqliteSinkError> {
+    fn parts(&mut self, deadline: Instant) -> Result<(&mut Connection, &SqlPlan), SqliteSinkError> {
         let Self {
             database_path,
             sql,
@@ -227,12 +216,20 @@ impl SqliteTarget {
         if connection.is_none() {
             *connection = Some(open_connection(database_path)?);
         }
-        Ok((
-            connection
-                .as_mut()
-                .expect("the SQLite connection was initialized above"),
-            sql,
-        ))
+        let connection = connection
+            .as_mut()
+            .expect("the SQLite connection was initialized above");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                None,
+            )
+            .into());
+        }
+        connection.busy_timeout(remaining)?;
+        connection.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+        Ok((connection, sql))
     }
 }
 
@@ -256,12 +253,13 @@ impl RelationTarget for SqliteTarget {
         input: &Change,
         requests: &[Lookup],
     ) -> Result<Vec<Matches>, OperationError> {
-        self.verify_ready()?;
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        self.verify_ready(deadline)?;
         requests
             .iter()
             .map(|request| {
                 let encoded = self.encode_row(input, request.row_index)?;
-                self.matching_ids(&encoded, request.needed, request.take)
+                self.matching_ids(&encoded, request.take, deadline)
                     .map_err(OperationError::from)
             })
             .collect()
@@ -279,7 +277,6 @@ struct SqlPlan {
     create_index: String,
     insert: String,
     select_matching_ids: String,
-    count_matches: String,
     row_columns: String,
     row_value_count: usize,
     delete_prefix: String,
@@ -339,9 +336,7 @@ impl SqlPlan {
         let select_matching_ids = format!(
             "SELECT {quoted_id} FROM {quoted_table} WHERE {predicate} ORDER BY {quoted_id} LIMIT ?{limit}"
         );
-        let count_matches = format!(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM {quoted_table} WHERE {predicate} LIMIT ?{limit})"
-        );
+
         let delete_prefix = format!("DELETE FROM {quoted_table} WHERE {quoted_id} IN ");
         let has_rows = format!("SELECT EXISTS(SELECT 1 FROM {quoted_table} LIMIT 1)");
 
@@ -352,7 +347,6 @@ impl SqlPlan {
             create_index,
             insert,
             select_matching_ids,
-            count_matches,
             row_columns,
             row_value_count: columns.len() - 1,
             delete_prefix,
@@ -509,4 +503,34 @@ fn technical_id_as_i64(technical_id: u64) -> Result<i64, SqliteSinkError> {
             "technical ID {technical_id} cannot be represented by SQLite INTEGER"
         ))
     })
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use arrow_schema::Schema;
+    use std::sync::Arc;
+
+    #[test]
+    fn statement_deadline_interrupts_cpu_work_and_next_action_gets_a_fresh_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = SqliteTarget::try_new(
+            root.path().join("target.sqlite"),
+            "rows".into(),
+            Arc::new(Schema::empty()),
+        )
+        .unwrap();
+        let (connection, _) = target.parts(Instant::now() + BUSY_TIMEOUT).unwrap();
+        let error = connection.query_row("WITH RECURSIVE forever(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM forever) SELECT count(*) FROM forever", [], |row| row.get::<_, i64>(0)).unwrap_err();
+        assert!(
+            matches!(error, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::OperationInterrupted)
+        );
+        let (connection, _) = target.parts(Instant::now() + BUSY_TIMEOUT).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+    }
 }

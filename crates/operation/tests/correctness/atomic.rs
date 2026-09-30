@@ -7,7 +7,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, col,
     operation::{
-        AtomicOperation, Operation, OperationInput,
+        AtomicOperation, Operation, OperationInput, StepBudget,
         transform::{
             AggregateCall, AggregateDefinition, DistinctDefinition, FilterDefinition,
             RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
@@ -88,9 +88,8 @@ fn atomic_runtime_applies_a_complete_change_directly() {
     )
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
-    let mut operation =
-        stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
-    let Operation::Atomic(operation) = &mut operation else {
+    let operation = stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
+    let Operation::Atomic(operation) = &operation else {
         panic!("eligible Filter was not created as an atomic operation");
     };
 
@@ -99,12 +98,13 @@ fn atomic_runtime_applies_a_complete_change_directly() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     let output = AtomicOperation::apply(
-        operation.as_mut(),
+        operation.as_ref(),
         OperationInput {
             port: 0,
             change: &input,
         },
         transaction.access(),
+        &mut StepBudget::new(0, 4 * 1024 * 1024),
     )
     .unwrap()
     .unwrap();

@@ -14,8 +14,6 @@ mod queue;
 mod scan;
 #[path = "correctness/store.rs"]
 mod store;
-#[path = "correctness/subscribed_log.rs"]
-mod subscribed_log;
 #[path = "correctness/support.rs"]
 mod support;
 #[path = "correctness/transaction.rs"]

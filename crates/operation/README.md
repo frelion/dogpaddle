@@ -1,490 +1,155 @@
 # dogpaddle-operation
 
-这个 crate 定义 `DogPaddle` 的算子：数据从哪里来、如何变化、最后写到哪里。
-
-第一次读代码时，可以先把一次查询看成下面这条链：
-
-```text
-Scan                 Transform                         Sink
-产生 Change  ──────>  读取并产生 Change  ────────────>  消费 Change
-Postgres CDC          Filter / Aggregate / Join         SQLite
-```
-
-一个算子只负责自己的计算和状态。它不读取 Flow 的边日志，不选择下一个 Station，也不创建或
-提交 Store 事务。Flow 负责把算子连起来，Station 负责执行，Store 负责持久化。
-
-理解这个 crate 最重要的是两条线：
+这个 crate 定义 `DogPaddle` 的计算和具体外部适配：Source 捕获输入，Transform 维护关系，Sink 交付结果。
+Operation 不读取 Flow 调用栈、不选择下一个节点，也不创建或提交 Store 事务。
+Flow 拥有图连接、持久帧和事务边界；Store 拥有 typed collections。
 
 ```text
-构建/恢复：Definition + exact Schemas + scoped DataScope + RuntimeResource
-            ── checked construct ──> Runtime Operation + output Schema
-运行时：输入 Change ──> Operation ──> 状态更新 + 可选的输出 Change
+Source                    Transform                         Sink
+PostgreSQL / MySQL CDC -> Filter / Aggregate / Join -> SQLite / PostgreSQL / Doris / ClickHouse
 ```
 
-普通算子开发从 [`Select`](src/operation/transform/select.rs) 开始，再读
-[`RunningEventCount`](src/operation/transform/running_event_count.rs) 及其
-[correctness 测试](tests/correctness/running_event_count.rs)。日常开发只需要掌握 Definition、
-Schema 绑定、自己的类型化状态与 `AtomicOperation::apply`；Station 提交、订阅确认和恢复调度由 Flow 负责。
-跨 turn 工作和外部 I/O 再使用 `TurnOperation` 与 AfterCommit，详见下文。
-
-公共入口只提供具体 Definition、必要的参数与错误类型，以及统一运行协议。
-具体 `XxxOperation` 和它们的构造函数都是 crate 内部实现；调用方一律通过 Definition 的 checked
-`construct` 取得统一 `Operation`。该入口校验 Schema、执行能力和资源类型，再取得 typed handles
-并构造运行实例，不执行外部 I/O、事务或状态读取。
-
-定义/表达式的精确维护规则见 [定义契约](docs/definitions.md)；Station 的事务与确认由
-[Flow 运行契约](../flow/docs/runtime.md) 唯一规定。本文提供使用与阅读顺序。
-
-## 先认识 Definition 和运行实例
-
-同一个算子有两种形态。
-
-**Definition 是计划。** 例如 Filter Definition 保存谓词，Aggregate Definition 保存分组表达式和
-聚合函数。它是纯数据，可以稳定编码进 Flow Definition。Definition 不持有数据库句柄、连接、
-密码或正在执行到哪一步。
-
-`OperationDefinition` 是列出全部内建算子的封闭 enum。新增算子必须修改这个 enum 和持久化
-tag dispatch；Flow 无法收到未列入其中的实现。其纯
-`output_schema(inputs)` 路径复用具体算子的同一 Schema 编译规则，供 SQL 等上层在接触 Store 前取得
-权威输出 Schema；它不声明状态或构造 runtime，Sink 返回 `None`。
-
-**Runtime Operation 是正在工作的实例。** 它保存已经按输入 Schema 编译好的表达式、Flow 为它
-打开的类型化状态，以及必要的临时客户端。它不再保存 Definition，也不知道自己的稳定资源路径。
-
-中间只有一个 checked construction path：
-
-1. 在接触 Store 前，对全部 Definition 调用 `validate_resource(&resource)`，预检运行资源是否存在且为
-   精确 Rust 类型。Flow 会先对全图完成这一步，因此错误不会留下目录或部分 catalog。
-2. `construct` 接收每个输入端口的完整 Arrow Schema、已限定资源名范围的短期 `DataScope` 和拥有型
-   `RuntimeResource`，统一检查输入数量、DogPaddle Schema 与资源 presence/type。
-3. 具体 Definition 只在本地编译表达式/算法布局，并用 `DataScope::data` 声明或查找固定逻辑名
-   的 typed collections；同一代码同时服务新建与恢复。
-4. 统一入口复核 output Schema 和 `Atomic`/`Turn` 执行能力，返回
-   `ConstructedOperation`。调用方用 `into_parts()` 一次性取出最终 `Operation` 和 output Schema。
-
-下面的无状态 Filter 展示完整的新建和恢复生命周期。实际 Flow 会先对全图做 Schema 传播和
-`validate_resource` preflight，再创建 `StoreSetup`；这里的 `commit(path, init)` 空初始化闭包只因为
-Filter 没有需要写入初值的状态：
-
-```rust
-use std::sync::Arc;
-
-use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_operation::operation::transform::FilterDefinition;
-use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, col, decode_definition, encode_definition, lit,
-};
-use dogpaddle_store::{Store, StoreSetup};
-
-let input = Arc::new(Schema::new(vec![Field::new(
-    "value",
-    DataType::UInt64,
-    false,
-)]));
-let definition = OperationDefinition::from(FilterDefinition::try_new(col("value").eq(lit(7_u64)))?);
-let encoded = encode_definition(&definition);
-let definition = decode_definition(&encoded)?;
-let fixture = tempfile::tempdir()?;
-let path = fixture.path().join("state");
-
-// Preflight every runtime resource before creating or opening Store state.
-let resource = RuntimeResource::none();
-definition.validate_resource(&resource)?;
-
-// New state: the scope declares the concrete Definition's typed data.
-let mut setup = StoreSetup::new();
-let constructed = {
-    let mut data = setup.data_scope();
-    definition.construct(&[Arc::clone(&input)], &mut data.scoped("operation"), resource)?
-};
-assert_eq!(constructed.output_schema(), Some(&input));
-let (_operation, output_schema) = constructed.into_parts();
-assert_eq!(output_schema.as_ref(), Some(&input));
-let transactions = setup.commit(&path, |_init| Ok(()))?;
-drop(transactions);
-
-// Existing state: the same constructor looks up exactly the same typed data.
-let definition = decode_definition(&encoded)?;
-let resource = RuntimeResource::none();
-definition.validate_resource(&resource)?;
-let store = Store::open(&path)?;
-let constructed = {
-    let mut data = store.data_scope();
-    definition.construct(&[Arc::clone(&input)], &mut data.scoped("operation"), resource)?
-};
-let (_operation, output_schema) = constructed.into_parts();
-assert_eq!(output_schema.as_ref(), Some(&input));
-let _transactions = store.into_transactions();
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-`StoreSetup::new()` 只建立内存 draft，不做文件系统 I/O；`setup.data_scope()` 只声明新名称。
-`Store::data_scope()` 则只查找现有名称，并拒绝缺失资源或 collection kind 不匹配。新建路径最终必须
-消费 setup 调用 `commit(path, init)`，在一笔事务中发布 Store marker、完整 catalog 和各算子初值；
-恢复路径不再次初始化，而是在 construction 完成后消费 `Store` 获得运行期事务能力。
-
-正常使用时不需要手工执行这套装配；`FlowFactory::build/open` 会完成它。旧的绑定阶段和双路 setup
-入口没有兼容 API，也不会为旧调用方式保留 alias、fallback 或迁移路径。
-
-## Schema 在这里意味着什么
-
-端口 Schema 是记录列的完整 logical Arrow Schema，不包含 `Change` 编码中的
-`$dogpaddle.diff`。字段名、顺序、类型、nullability、嵌套结构和 metadata 都必须精确匹配。
-
-不同算子在 checked `construct` 时做不同检查：
-
-- Filter 要求谓词输出 Boolean，并保持输入 Schema。
-- Select 从同一个输入计算一组有序输出列。
-- `UnionAll` 要求所有输入 Schema 完全相同。
-- `EquiJoin` 分别绑定左右键，要求每对键具有相同类型；可选 residual 在精确的
-  `left.* + right.*` candidate Schema 上绑定，具体 kind 决定输出列和 outer nullability。
-- `AsOfJoin` 要求左右 equality/order 表达式成对同类型，order 至少一对；nearest 和
-  tolerance 额外要求唯一可计算距离的 order，tie-break 只针对右侧绑定，可选
-  residual 与 `EquiJoin` 一样使用 `left.* + right.*` qualifier。
-- Sink 检查目标系统能否无损表示全部输入列，并且没有输出 Schema。
-
-运行时收到的 `Change` 仍会与绑定时 Schema 比较。这样，磁盘 Definition、编译好的表达式和真实
-输入不会在 Schema 漂移后悄悄错位。
-
-## 三类业务角色，四种执行能力
-
-Scan、Transform、Sink 是容易理解的业务角色；`OperationKind` 进一步告诉 Flow 输入数量，以及
-这个实例能否和相邻算子放进同一个 Station。
-
-| kind | 输入 / 输出 | 如何执行 | Station 装配 |
-| --- | --- | --- | --- |
-| `Scan` | 0 / 有输出 | 主动拉取或生成数据 | 可作为首项，后接单输入 Atomic |
-| `AtomicTransform(N)` | N / 有输出 | 一笔事务完整消费一个 Change | 可作为首项；单输入时也可作为尾项 |
-| `TurnTransform(N)` | N / 有输出 | 一个 Change 可以分成多个有界 turn | 只能作为首项，可后接单输入 Atomic |
-| `Sink(N)` | N / 无输出 | 消费数据并结束这条路径 | 必须独占 Station |
-
-因此一个 Station 的程序始终是一条简单的线：
+构造和运行只有两条入口：
 
 ```text
-首 Operation  ──>  Atomic  ──>  Atomic  ──> ...
+Definition + exact Schemas + scoped DataScope + RuntimeResource
+    -> checked construct -> Operation + output Schema
+
+immutable input + opaque Resume + TransactionAccess + StepBudget
+    -> Step { output, progress: More(Resume) | Done }
 ```
 
-首项可以是 Scan、AtomicTransform 或 TurnTransform；后面只能追加单输入 `AtomicTransform`。
-Station 内没有第二张拓扑图，中间结果也不写日志。最后一个 Operation 的输出才进入 Station 的
-持久日志。Sink 单独装配，外部副作用遵循提交后的交付协议。
+简单算子从 [`Select`](src/operation/transform/select.rs) 和
+[`RunningEventCount`](src/operation/transform/running_event_count.rs) 开始阅读。
+具体运行类型都是私有实现；调用方通过 `OperationDefinition::construct` 构造统一 `Operation`。
+定义和表达式规则见 [定义契约](docs/definitions.md)，关系与分页规则见 [关系契约](docs/relations.md)。
 
-具体 Definition 自己声明 kind。Filter、Select、SchemaAlign 和 Aggregate 只接受逐行 immutable 表达式，固定使用 Atomic。
-Join 的 key、order、tie 和 residual 也必须 immutable；不满足时在 Definition 构造或 decode 阶段拒绝。
-`EquiJoin` 与 `AsOfJoin` 是两输入 TurnTransform，分页完成一个输入，并把每页交给后面的 Atomic 算子。
+## Definition 与 checked construction
 
-## 一次 Station 是怎样运行的
+Definition 是可持久化的纯计划，不持有数据库句柄、连接、密码或执行位置。
+`OperationDefinition` 是全部内建算子的封闭 enum；具体模块拥有 tag、canonical JSON payload 和业务校验。
+不保留旧 tag、格式识别、fallback、迁移或兼容入口。开发期 v1 布局变更后直接重建受影响的状态和目标。
 
-假设 Station 是：
+构造过程按同一路径服务新建和 reopen：
 
-```text
-EquiJoin ──> Filter ──> Select
-```
+1. 在接触 Store 前预检全部 `RuntimeResource` 的 presence 和精确 Rust 类型。
+2. `construct` 校验输入数量、完整 `DogPaddle` Arrow Schema 和执行能力。
+3. 具体 Definition 编译表达式，并在限定的 `DataScope` 内声明或查找固定名称的 typed handles。
+4. 返回最终 `Operation` 与完整 output Schema；Sink 的 output Schema 为 `None`。
 
-运行时大致发生这些事：
+构造不读取业务状态、不打开事务，也不执行外部 I/O。
+`StoreSetup::commit(path, init)` 原子发布新 catalog 和初值；`Store::open` 使用同一构造规则查找既有资源，
+恢复失败不自动删除、重建或改写状态。资源归属稳定 Operation ID，不归属内存中的融合段。
 
-1. Station 从一个输入端口取得一整个 `Change`。多输入 Station 会在这批数据完成前固定这个端口，
-   因而 Join 处理左侧时右侧关系不会在中途变化。
-2. 首 Operation 在没有写事务时准备一次有界工作。
-3. Station 开启一笔 Store 写事务，执行首项本 turn 的状态变化。
-4. 如果首项产生输出，Filter 和 Select 在同一事务中连续处理内存中的 `Change`。
-5. Station 尝试把最终输出写入自己的持久日志；若输入已经完成，也在这笔事务中推进订阅位置。
-6. 事务提交后，才执行外部 ACK 等不可回滚动作。
+`output_schema(inputs)` 复用同一纯 Schema 编译规则，供 SQL 在打开状态前取得权威 Schema。
+字段名、顺序、类型、nullability、嵌套结构和 metadata 都必须精确匹配；logical Schema 不包含 Change 的 diff 列。
+运行期仍检查每份输入的 Schema。
 
-Atomic 尾项、Schema 检查、输出背压或其他提交前错误会确定回滚整个 turn，下一次可以从未改变的
-持久状态重算。`Transaction::commit` 返回错误时，落盘结果可能不确定；Station 会停止继续运行，
-调用方必须 reopen，再由持久状态决定从哪里恢复。
+## 计算能力与分页
 
-这就是算子融合带来的直接收益：Filter 和 Select 之间不再进行 Arrow IPC 编码、RocksDB 写入、
-订阅读取和解码，同时仍共享一笔事务。持久边界只保留在 Station 之间。
+`OperationKind` 声明业务角色、输入 arity 和融合资格：
 
-## 两种运行接口
-
-大多数 Transform 使用更简单的 `AtomicOperation::apply`。它接收完整输入和当前事务访问权，
-一次返回 `Option<Change>`：
-
-- `Some(change)`：产生一批输出。
-- `None`：这批输入没有输出，例如 Filter 删除了全部行。
-- 返回错误：Station 回滚事务；同一输入可以安全重试。
-
-Atomic Operation 可以更新自己声明的 Store 状态，但不能保存跨 turn 进度、执行外部副作用或安排
-提交后的动作。
-
-Scan、Sink 和 Join 使用完整的 `TurnOperation::turn` 协议：
-
-```text
-没有写事务                         Store 写事务                      提交以后
-turn(input) ──> PreparedTurn ──> prepared.apply(access) ──> commit ──> AfterCommit
-        └────> Turn::Idle              └────> Action
-```
-
-`turn` 适合轮询外部来源、恢复临时客户端或准备一个有界页面。它不能提前 ACK，也不能推进任何影响
-重放的事实。`None` 表示本轮没有 Claim：Scan 始终收到 `None`，输入 Operation 在上游暂时没有数据时
-也会收到 `None`，从而可以继续处理自己的持久内部工作；没有这种工作时返回 `Turn::Idle`，Station
-连事务都不需要开启。
-
-`PreparedTurn::apply` 在事务内返回一个 `Action`：
-
-| action | 本 turn 的写入和输出 | 当前输入 |
+| kind | 输入 / 输出 | 执行能力 |
 | --- | --- | --- |
-| `Idle` | 全部回滚 | 保持原样 |
-| `Commit(output)` | 提交 | 若有 Claim 则保留；无 Claim 时只提交内部进度 |
-| `Complete(output)` | 提交 | 同事务完成并推进，要求本轮确实有 Claim |
+| `Scan` | 0 / 有输出 | Source capture；已捕获数据的 identity 切片可作为计算 head |
+| `AtomicTransform(N)` | N / 有输出 | `AtomicOperation::apply` 完整处理当前 slice |
+| `PagedTransform(N)` | N / 有输出 | `PagedOperation::step` 处理有界扫描或修正页 |
+| `Sink(N)` | N / 无输出 | 私有 outbox enqueue 与独立外部 drain |
 
-没有输入的 Scan 和执行内部工作的输入 Operation 都用 `Commit` 表示成功。只有收到 Claim 的
-Operation 可以返回 `Complete`。
-Join 用 `Commit` 保存分页进度，最后一页才返回 `Complete`。
+计算 head 可以接单输入 Atomic 尾链；链的编译索引只在内存中存在。
+尾项直接 `apply`，不创建自己的帧、队列、Resume 或生命周期。
+普通 Atomic head 与 Source identity 在进入首个 Atomic 前先切 input window，再转换为同一 `Step`。
 
-`AfterCommit` 只在事务真正提交后执行，并明确区分两类动作：`local` 只发布可由 Store 状态恢复的
-进程内 phase，可以与其他 Station 共享稍后的持久化 barrier；`durable` 会 ACK delivery 或写目标数据库，
-必须等此前 Store WAL 已经持久化后才能运行。Join 完成时释放 prepared cache、CDC 和 buffered Sink 的
-内部 phase 切换属于 `local`；CDC 外部 delivery ACK、Sink initialize/deliver 属于 `durable`。
-rollback、背压或 commit 失败只会丢弃 completion。任一 completion 失败时，本地事务已经提交，当前
-Station 会停止，必须 reopen 后从持久状态恢复。
+```rust,ignore
+fn apply(
+    &self,
+    input: OperationInput<'_>,
+    access: TransactionAccess<'_>,
+    budget: &mut StepBudget,
+) -> Result<Option<Change>, OperationError>;
 
-可运行的最小协议例子在
-[`examples/support/queue_scan.rs`](examples/support/queue_scan.rs)。它演示“事务外 poll、事务内同时
-保存 checkpoint 和 output、提交后 ACK”，运行方式是：
-
-```bash
-cargo run -p dogpaddle-operation --example queue_scan
+fn step(
+    &self,
+    input: OperationInput<'_>,
+    resume: &Resume,
+    access: TransactionAccess<'_>,
+    budget: &mut StepBudget,
+) -> Result<Step, OperationError>;
 ```
 
-## 状态和外部资源为什么分开
+两个接口都用 `&self`。常驻字段只有编译表达式、布局和 typed handles。
+窗口求值、canonical rows、pending group 和候选批次都是单次调用的 scratch；回滚直接丢弃它们。
+计算不存在 prepare callback、AfterCommit、operator continuation Cell、全输入 admission cache 或内存游标。
 
-Definition 通过稳定逻辑名称声明自己需要的持久数据，例如：
+`Resume` 是唯一输入 ordinal 加封闭、私有的强类型 cursor。
+其严格 `StoreValue` codec 检查版本、完整消费、canonical 编码与 64 KiB control 上限。
+Flow 只保存、传回并校验 variant 与输入绑定，不解释具体 Join cursor。
+`initial_resume` 是纯构造方法；`More` 必须前进，`Done` 表示完整输入用尽。
+无输出扫描仍推进 Resume；最后一页的 `Done` 与输出共同保存，发送完成前仍有明确发送责任。
+帧与发送的持久契约只由 [Flow runtime](../flow/docs/runtime.md) 规定。
 
-```text
-sequence_scan.position: Cell<u64>
-distinct.weights: OrderedMultiset<Vec<u8>>
-equi_join.left_rows: PartitionedMultiset<Vec<u8>, Vec<u8>>
-asof_join.left_rows: OrderedMap<Vec<u8>, RowWeight>
-```
+每个 driving event 在第一页逐事件准入。一个 step 可以批量推进多个事件，候选和 residual 保持 Arrow 向量求值。
+晚页负权重、表达式、codec 或 diff overflow 回滚当前页，早期已提交页保留。
+**完整 Change 或 Delivery 不再是计算事务边界**；reopen 在保留的失败帧上重算同一失败位置。
 
-Flow 用 `station/{station}/operation/{operation}` 前缀限定 build/open 对应的 `DataScope`，
-再将这个子 scope 交给 Operation。具体 Definition 不接收全局前缀，只用固定逻辑名和 codec 声明或查找
-`Cell`、`OrderedMap` 等 handle。旧的 Data declaration、`DataInstances` 和 erased materializer 已不在
-这条路径中，Flow 也不会枚举具体算子或解释其状态布局。
+`StepBudget` 贯穿 head、所有 Atomic tail、control 和 payload 写入。
+head item 额度限制输入事件、扫描候选或修正原子；Atomic tail 只扣共享逻辑 bytes。
+预算不足返回 `BudgetExceeded`，Flow 整页回滚并确定性减半 head item 额度，最小原子仍超限则失败。
+预算描述逻辑事务工作量，Arrow/DataFusion 表达式的临时分配不构成严格 RSS 或执行时间保证。
+可变大小索引读取使用 byte-bounded scan；已知编码写入在写前扣账。
 
-某些外部算子的密码、网络访问参数和临时客户端配置通过 `RuntimeResource` 传入。它只是拥有型
-`Any` 擦除容器：checked construction path 先检查精确 Rust 类型，具体 Definition 再取回该值；它不承载持久状态、codec
-或资源字典。资源每次 build/open 由调用方重新注入，不进入 Store；非敏感 source/target identity、固定
-Schema 和 `SQLite` 路径等稳定信息仍保存在 Definition。普通算子必须收到空资源，且只有 Station 首项
-可以获得运行资源。
+## 内建计算算子
 
-## 四个有状态关系算子的直觉
-
-| 算子 | 状态如何组织 | 一条事件如何改变结果 |
+| 算子 / tag | 能力 | 关系行为与状态 |
 | --- | --- | --- |
-| Distinct | 完整行 → 正权重 | 只在零与正权重之间跨越时输出 |
-| Aggregate | 分组 → Fold 状态与极值缓存 | 旧结果撤回，再发布新结果 |
-| `EquiJoin` | 连接键 → 左右完整行与权重 | 查另一侧同键记录，分页发布匹配和存在性修正 |
-| `AsOfJoin` | 分区、排序键 → 左右完整行与权重 | 为每个左行选择至多一个右行；右侧变化修正历史选择 |
+| `RunningEventCount` / 2 | Atomic | 逐事件递增 count，忽略输入 diff；私有 `Cell<u64>` |
+| Filter / 5 | Atomic | 只保留 non-null true；不声明 state |
+| Select / 7 | Atomic | 有序投影与计算；纯列引用共享 arrays 和 diffs |
+| `UnionAll` / 8 | Atomic | exact-Schema 输入按端口原样转发 |
+| `SchemaAlign` / 9 | Atomic | 显式名字、metadata 和 nullability 对齐 |
+| Distinct / 13 | Atomic | exact canonical row positive weights 的零/正边界 |
+| Aggregate / 14 | Atomic | grouped COUNT/SUM/AVG/MIN/MAX，unique argument statistics 与 extrema indexes |
+| `EquiJoin` / 16 | Paged / 2 | Inner、LeftSemi、LeftAnti、LeftOuter、FullOuter，保留可选 residual |
+| `AsOfJoin` / 17 | Paged / 2 | SQL left outer、单 order、Forward/Backward、strict/inclusive、Reject ties |
 
-Aggregate 按「分组 + 调用参数」校验被跟踪权重，不保存完整输入行；其他三个算子按完整行身份记账。
-`EquiJoin` 与 `AsOfJoin` 先预检本侧权重，再逐页计算并提交；后页计算失败只回滚当前 turn，之前的结果可能已到达 Sink。
-reopen 保留已提交进度，但不会跳过确定性错误或补偿部分结果。只有 Complete 才确认整个输入；状态可能停在单个输入事件的处理中间。
-复杂算法的状态、输入类型、NULL、分页和恢复规则以 [关系算子契约](docs/relations.md) 为准。
+关系计算共享私有 canonical row 和有序 scalar 编码，不在 Store 建立关系框架。
+参数和状态的精确维护规则见 [关系契约](docs/relations.md)。
 
-## 内建算子索引
+`EquiJoin` 分区按 equality key 组织 exact rows。NULL key 不匹配；residual 绑定到 `left.* + right.*`，
+只有 non-null true qualifying。outer null correction 和对应 pair 是同一个分页工作项。
+当前事件最后一页才调整本侧 rows/counts；帧按 DFS 运行保证处理该页期间对侧关系不被后续输入改变。
 
-“精确输入”表示运行期 Schema 固定，并非动态 Schema。“持久状态”一列列出由具体算子代码拥有
-逻辑名和 codec 的 typed collections；`无` 表示只用当前事务中的输入输出。
+ASOF equality 使用 SQL NULL 规则，order 为精确同型可索引 scalar。
+右侧 exact-row multiplicity 不影响单候选选择；distinct rows 在被选中的同一时刻形成歧义并拒绝。
+历史右侧 presence 变化只修正两个邻接时刻定义的 left 区间，页内共享 before/after winner，
+最后一页才将当前右事件记入真实 RHS index。
+nearest、tolerance、多 order、residual、tie-break、NotDistinct、canonical fallback 与额外 kind 不属于当前 API。
 
-| 算子（tag） | kind / 输入数 | 核心行为 | 持久状态 |
-| --- | --- | --- | --- |
-| `SequenceScan` (1) | Scan / 0 | 从起始值连续产生 `UInt64`，diff 固定 `+1` | `sequence_scan.position: Cell<u64>` |
-| `RunningEventCount` (2) | Atomic / 1 | 每观察一行计数加一；忽略输入 diff 值 | `running_event_count.count: Cell<u64>` |
-| `Discard` (3) | Sink / 1 | 完成输入，不产生输出 | 无 |
-| `Filter` (5) | Atomic / 1 | 只保留谓词为 non-null true 的行 | 无 |
-| `Select` (7) | Atomic / 1 | 从同一输入计算完整有序输出列 | 无 |
-| `UnionAll` (8) | Atomic / N | 原样转发 Schema 完全相同的各端口 Change | 无 |
-| `SchemaAlign` (9) | Atomic / 1 | 显式产生目标字段与 metadata | 无 |
-| `SqliteSink` (10) | Sink / 1 | 把精确关系增量写入新的 `SQLite` STRICT 表 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
-| `PostgresCdcScan` (11) | Scan / 0 | `PostgreSQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `PostgresSink` (12) | Sink / 1 | 把精确关系增量幂等写入 `PostgreSQL` | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
-| `Distinct` (13) | Atomic / 1 | 把任意正权重关系变成集合边界变化 | `distinct.weights: OrderedMultiset` |
-| `Aggregate` (14) | Atomic / 1 | 增量维护非空分组聚合 | groups、entries、control |
-| `MySqlCdcScan` (15) | Scan / 0 | `MySQL` 初始快照后持续 CDC | phase、checkpoint、bootstrap spool |
-| `EquiJoin` (16) | Turn / 2 | 增量维护带可选 residual 的 Inner、Left Semi/Anti、Left/Full Outer | left rows、right rows、continuation；非 Inner 使用 key counts 或逐行 match counts |
-| `AsOfJoin` (17) | Turn / 2 | 按 equality partition 增量维护 backward/forward/nearest 的单候选 Inner、Left Outer/Semi/Anti | ordered left rows、ordered right rows、continuation |
-| `DorisSink` (18) | Sink / 1 | 通过 Unique Key merge-on-write 表维护 Apache Doris 精确关系 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
-| `ClickHouseSink` (19) | Sink / 1 | 通过 `ReplacingMergeTree` 与 `FINAL` view 维护 `ClickHouse` 精确关系 | `sink.control: Cell<Vec<u8>>`、`sink.buffer: OrderedMap<u64, Vec<u8>>` |
+## Source 与 Sink 外部边界
 
-源码按业务角色放在 [`operation/scan/`](src/operation/scan/)、
-[`operation/transform/`](src/operation/transform/) 和
-[`operation/sink/`](src/operation/sink/)。目录只是帮助阅读；真正的输入数、输出属性和融合资格
-始终来自每个 Definition 的 `OperationKind`。
+Source 拥有 published queue、bootstrap spool、checkpoint 和真实 Delivery 的 ACK。
+`published` 只读返回 schema-bound front bytes；调用方用 exact Schema 解码，完成全部页和下游调用后以 `consume_published` 同事务删除前项。捕获只追加，不随 consumer 进度延迟 ACK。
+捕获、恢复、容量及 `PostgreSQL` / `MySQL` 差异由 [CDC 契约](docs/cdc.md) 规定。
 
-## 投影入口
+Sink 拥有 outbox、Prepared 和固定 occurrence IDs；enqueue 与独立 drain 的事务、
+目标重投及负 diff 前缀验证由 [Sink 契约](docs/sinks.md) 规定。
 
-普通调用者只需输出名字和表达式：
+## 验证与 benchmark
 
-```rust
-use dogpaddle_operation::{col, lit};
-use dogpaddle_operation::operation::transform::SelectDefinition;
-
-let selected = SelectDefinition::try_new([
-    ("id", col("order_id")),
-    ("amount", col("amount")),
-    ("next_amount", col("amount") + lit(1_u64)),
-])?;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-引擎推导类型和 nullability；直接列引用保留字段 metadata，计算列 metadata 为空，输入 Schema metadata 保留。
-已有输入 Schema 时，`SelectDefinition::try_extend(&input_schema, fields)` 保留原列并追加多个计算列，立即生成普通 Select 定义。
-所有表达式读取原始输入，不能引用同组新别名。空投影保留行数与 diff；直接选列和改名共享输入 array，diff 也不复制。
-编译器使用 `SchemaAlignDefinition` 明确控制 metadata 和目标 nullability，需要转换类型时在 Expr 中显式 cast。
-旧 Project/Extend 类型与持久 tag 不保留；受影响状态重新构建。
-
-## 表达式边界
-
-`Select` 与 `SchemaAlign` 直接使用同一个私有 `BoundProjection` 运行实例：绑定时共享一个 `DFSchema`，每个 Change 只做一次整组 exact Schema 校验，空投影也检查。各 Definition 继续独立决定字段、metadata、nullability 与稳定编码，运行错误统一为 `ProjectionError`，保留输入端口、具体字段序号和底层错误链；两个 Definition 的构造与 Schema 错误仍各自独立。
-
-Filter、Select、SchemaAlign、Aggregate、`EquiJoin` 和 `AsOfJoin` 直接接收 `DataFusion` `Expr`。
-crate 根级重导出 `col`、`ident`、`lit`、`cast`、`try_cast` 和 `ScalarValue`。`ident` 按 Arrow
-字段名逐字引用；`col` 使用 `DataFusion` 自己的 identifier 规则。
-
-Definition 构造时立即把表达式编码并解码为 canonical protobuf；checked `construct` 再针对 exact input
-Schema 生成 `PhysicalExpr`。类型、nullability、cast 和 evaluate 语义由固定版本的 `DataFusion` 提供。
-Operation 层不运行 SQL planner，也不插入隐式 cast，调用者需要显式 `cast`。
-`EquiJoin` residual 的两个输入固定使用 `left` 与 `right` qualifier；它绑定原始输入字段的类型、
-nullability 和 metadata，而不是 Outer 已放宽或 Semi/Anti 已裁剪的输出 Schema。
-`AsOfJoin` residual 使用同样的 qualifier；equality/order 分别针对自己的输入 Schema 绑定，
-tie-break 只针对 right Schema 绑定。
-
-当前产品证据覆盖以下纵向切片：
-
-| 状态 | 能力 |
-| --- | --- |
-| 已承诺 | 精确列引用、Boolean predicate、`UInt64` 同类型 equality、`UInt64 → Utf8` 显式 cast |
-| 已承诺的时间/Decimal 切片 | Date32、无 timezone 的 Millisecond Timestamp、`Decimal128(10,2)` 的直接复制、同类型比较，以及 `SchemaAlign` 中已测试的显式 cast |
-| `DataFusion` 可能支持但 `DogPaddle` 尚未承诺 | 未经 Definition codec、checked construction、runtime 与 Flow reopen 全链验证的其他表达式和类型组合 |
-| 明确拒绝 | 无法 canonical protobuf roundtrip、字段缺失或歧义、Filter 非 Boolean、隐式 coercion、运行时 Schema 漂移 |
-
-普通计算只接受逐行 immutable 表达式。Stable、Volatile、placeholder、subquery、
-aggregate/window、unnest 和外部引用等节点在 Definition 构造或 decode 时拒绝；没有独占计算模式。
-当前默认 codec 无法重建 scalar UDF，包括 immutable UDF。Rust API 能力审计及拒绝阶段见 [定义契约](docs/definitions.md#不可重放表达式的准入与能力审计)。
-
-Expr protobuf 与精确 pin 的 `DataFusion` 版本绑定。升级 `DataFusion` 时必须审查 roundtrip、physical
-planning 和执行语义；当前 v1 不读取或迁移旧 payload，状态库直接删除重建。
-
-## 外部端点边界
-
-CDC 先将初始快照放入私有 spool，封口后逐条发布，再进入持续捕获。PostgreSQL spool 还需要容纳
-封口前的 WAL 重叠；MySQL 把并发变化留在 binlog。Definition 持久保存完整 source 列声明和有序 output
-projection；converter 用前者校验完整 envelope/row image，只为后者构造 array，空投影也保留行数与 diff。
-两者共享一个私有 runtime，并从 projected output Schema 构造唯一 codec；spool 的 schema-bound entry
-既不重复保存完整 Schema，也不保存 projection 之外的 source 列。runtime 统一实现 spool、checkpoint、
-提交后 ACK 和恢复推进；具体源只负责连接、记录转换、checkpoint 校验与源资源清理。阶段、事务、容量、重置和部署前提见
-[CDC Scan 契约](docs/cdc.md)。新增源行为时不需要复制整套事务状态机；具体数据库协议仍分别维护。
-共同的 Connect envelope、完整 row image、未投影列校验与 Arrow array 构造位于
-[`scan/cdc_convert.rs`](src/operation/scan/cdc_convert.rs)；PostgreSQL/MySQL 各自的 converter 只决定 topic、metadata、snapshot 与事件顺序。
-
-`PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
-timeout、进入 polling 后的有限重试次数与最大等待、持续流 heartbeat 和初始 snapshot fetch size。默认显式固定
-5 秒连接与查询 timeout、无限重试、300 毫秒初始/10 秒最大重试等待、1 秒持续流 heartbeat 和
-10240 行 snapshot fetch。捕获阶段 heartbeat 始终为 1 毫秒。PostgreSQL JDBC 的连接 timeout 与
-Debezium JDBC 的 query timeout 都以秒生效，因此 connector 值会向上取整；native discovery 仍使用
-精确毫秒值。这些选项不进入 Definition 或持久状态，reopen 时需要重新提供。
-
-`MySqlCdcScanOptions` 为运行资源提供类型化调优，并由 `MySqlCdcScanConfig` 翻译成固定版本的
-Debezium properties。它可以同时调整 discovery 与 connector 的连接/查询 timeout、进入 polling 后的有限重试次数、
-最大重试等待、持续流 heartbeat 和可选 snapshot fetch size。默认显式固定 Debezium 的 30 秒连接、
-10 分钟查询、无限重试、300 毫秒初始/10 秒最大重试等待与 1 秒持续流 heartbeat；discovery 仍固定
-5 秒。初始快照 heartbeat 始终为 1 毫秒。Debezium JDBC 的 query timeout 向上取整到整秒，discovery
-的 socket timeout 保留精确毫秒值。MySQL 的 snapshot fetch 默认会完全省略 property，以保留
-Connector/J 的特殊流式结果行为；显式 fetch size 也只注入初始 snapshot connector。这些选项不进入
-Definition 或持久状态，reopen 时需要重新提供。这组重试参数不控制初始 task 启动，PostgreSQL 中也不控制 replication slot 创建。两类 connector 进入 polling 的总等待仍由
-`dogpaddle-debezium` 固定为 60 秒，不由单次连接或查询 timeout 推导。
-
-关系 Sink 用固定 input Schema 构造唯一 codec，把输入编码成不重复完整 Schema 的 schema-bound entry 后提交到本地 buffer，再将固定 ID 的 mutation plan 持久化为 Prepared；目标提交后，
-下一 Store turn 才结算本地进度。SQLite、PostgreSQL、Doris 和 `ClickHouse` 共用这套私有内核，具体目标
-直接实现同一个私有 `RelationTarget`，只负责布局、查询与幂等写入。内核固定以 `u64` 保存下一个 technical ID，
-以 `Batch` 保存 Prepared mutation，不再通过第二层通用 Sink adapter 转发。容量口径、恢复校验、行身份和各目标限制见 [关系 Sink 契约](docs/sinks.md)。
-
-## 持久化 ABI
-
-`encode_definition` 的外层格式是：
+公共行为由显式 `correctness` target 验证。
+Join owner tests 覆盖五种 `EquiJoin` 及 residual 的独立 bag oracle、weighted 事件、逐页回滚与 runtime 重构；
+ASOF 覆盖四种方向/exactness、邻接历史插删、multiplicity、NULL、歧义暴露和 last-page RHS 落账。
+预算、tail 失败、调用栈窗口、CDC seal/ACK、目标 commit gap 和系统组合由对应 owner 共同验证。
 
 ```text
-"dogpaddle.operation\0" + format version 1 + u16 operation tag + canonical JSON payload
-```
-
-tag、payload、表达式 protobuf、每个 Definition 的数据逻辑名和类型、canonical row/key 编码、
-`GroupState`、`JoinContinuation`、`AsOfContinuation`、buffered Sink control codec，以及 CDC spool 与
-buffered Sink 内 schema-bound Change entry 的 format marker、Schema fingerprint、single-batch framing 和
-EOS、collection 的 key/value codec，以及 Flow 加上的 Station/Operation 序号路径共同构成
-当前 v1 持久化边界。关系 Sink 使用的 16-byte row hash、固定 technical ID 和 Prepared mutation
-codec 还是目标布局/恢复 ABI。旧状态直接重建，不提供 self-contained IPC fallback、旧格式识别或迁移。
-[`src/codec.rs`](src/codec.rs) 解析统一外层格式后按 tag 选择具体 Definition；不另建 decoder 注册表。
-
-Definition 的固定字节位于 [`tests/fixtures/v1/`](tests/fixtures/v1/) 或算子自己的 literal 测试；
-所有 variant 的 payload 遵守同一 canonical JSON 规则，表达式保存 canonical protobuf 的 base64 字节。
-完整 Flow Definition 基线位于
-[`crates/flow/tests/fixtures/v1/`](../flow/tests/fixtures/v1/)。
-
-## 新增一个算子
-
-建议先读最小的 [`Select`](src/operation/transform/select.rs)，再读带状态的
-[`RunningEventCount`](src/operation/transform/running_event_count.rs)；需要分页时读
-[`EquiJoin`](src/operation/transform/equi_join/) 和
-[`AsOfJoin`](src/operation/transform/asof_join/)，需要外部恢复协议时读
-[`queue_scan`](examples/support/queue_scan.rs)。
-
-新增实现应依次完成：
-
-1. 在 `scan/`、`transform/` 或 `sink/` 下建立具体模块。
-2. 在 `OperationDefinition` 中加入 variant、kind 和唯一 tag；具体 Definition 实现 canonical payload。
-3. 在具体 Definition 的私有 `construct_unchecked` 中编译 exact input Schema 语义，通过 `DataScope` 获取 typed handles，并产生最终 Operation 与唯一 output Schema。统一 checked `construct` 校验边界。
-4. 由算子代码固定逻辑资源名、collection 类型和 codec；新建与恢复使用同一 constructor。
-5. 选择 `AtomicOperation` 或 `TurnOperation`，让所有重放相关写入服从调用方事务；需要临时配置时只从
-   `RuntimeResource` 取回精确类型。
-6. 在 [`src/codec.rs`](src/codec.rs) 的 tag dispatch 中选择具体 payload decoder。
-7. 在 `tests/correctness/<operation>.rs` 覆盖 literal golden、kind、checked construct、typed data、turn、
-   rollback 和适用的 reopen。
-8. 只有引入新的通用执行机制时才增加 Flow witness；普通算子语义由自己的 correctness 文件拥有。
-
-## 测试与性能
-
-Operation 的公共测试集中在 [`tests/correctness/`](tests/correctness/)：
-
-- 每个算子文件纵向覆盖 Definition、codec、checked construct、typed data、运行和 reopen。
-- [`definition_codec.rs`](tests/correctness/definition_codec.rs) 验证共享外层格式。
-- [`atomic.rs`](tests/correctness/atomic.rs) 验证实例级融合资格和 Atomic 执行。
-- [`protocol.rs`](tests/correctness/protocol.rs) 验证 turn、rollback、ACK 与恢复边界。
-- [`metamorphic.rs`](tests/correctness/metamorphic.rs) 验证稳定重批后的语义。
-- Flow 的资源路径、Station program、build/open/reopen 和 Schema guard 由
-  [`crates/flow/tests/correctness/`](../flow/tests/correctness/) 验证。
-
-`Distinct` 的连续同 key 更新、`Aggregate` 的 MIN/MAX、`EquiJoin` 的 match/presence transition、`AsOfJoin` 的 ordered lookup/
-historical rematch 和 durable buffered `SQLite` Sink 各有 owner benchmark；其他组合性能由真正拥有
-workload 的 Flow、Store 或 Change + Store target 负责。
-
-`cdc_bootstrap` 对 PostgreSQL/MySQL 分别验证已封口 spool 的逐条发布与未完成快照的有界批量清理；常规 reset 固定为 257 条窄 entry，跨过 256 条事务边界，另有单条宽 schema-bound entry 的 reset 对照用于观察 payload 宽度是否影响无需复制的丢弃路径。
-计时包含只读恢复 turn、发布时每条 entry 或 reset 时每批的同步事务提交和 AfterCommit，校验输出顺序、完整 Change 与最终持久状态；不启动 Java 或外部数据库，不能用于推断捕获、网络 ACK 或端到端 CDC 吞吐。
-
-`asof_join` Criterion 把两个使关系回到原状的完整 Claim 作为计时单位，覆盖多小 partition、
-单大 partition、尾部小修正、历史全量修正、nearest+tolerance 和 residual 远候选回退。
-`asof_join_resources` 为每个 case 启动新子进程：fixture、seed 与 input Arrow 在 profiler 前建立，
-`dhat` 只覆盖一个完整 driving Claim；output Arrow bytes 和两个 ordered rows map 的 decoded
-key+weight 逻辑大小分开报告。NULL-order left/right history 都使用 N/2N 对照，并自动要求 driving
-Claim 的 turn、output 与 Rust heap 完全不随无关历史增长。Rust allocator、Arrow、Store logical bytes
-都不是 RSS；runner 对 RSS 明确记为 unavailable。
-
-```bash
-cargo test -p dogpaddle-operation
-cargo clippy -p dogpaddle-operation --all-targets --no-deps -- -D warnings
-cargo doc -p dogpaddle-operation --no-deps
-cargo test -p dogpaddle-operation --benches
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench projection
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench distinct
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench aggregate_extrema
+cargo test -p dogpaddle-operation --test correctness
+cargo test -p dogpaddle-operation --benches --locked
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench equi_join
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench buffered_sink
-DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench cdc_bootstrap
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join
 DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_join_resources
 ```
 
-全工作区测试所有权和性能口径见 [`TESTING.md`](../../TESTING.md)。
+ASOF resource target 在独立子进程中记录当前 SQL kernel 的 lookup history、历史修正区间、空影响区间与
+NULL history 的 Rust allocator 和 encoded key/value bytes。输入和 fixture 在 dhat 计时前建立；
+`RocksDB` native allocation、WAL 和 RSS 不混入这些指标。测试模式只验收可运行性，性能比较要求同 host、
+rustc、profile、数据规格与 baseline epoch。完整 target 表与 gate 见 [TESTING.md](../../TESTING.md)。

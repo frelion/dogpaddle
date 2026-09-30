@@ -406,8 +406,8 @@ class Gate:
             response = host.advance()
             if response["outcome"] != "Idle":
                 return False
-            if response["sink"]["position"] != response["sink"]["tail"]:
-                raise RuntimeError("idle SQL sink still has an input backlog")
+            if response["flow"]["depth"] != 0:
+                raise RuntimeError("idle SQL Flow still has an active frame")
             return True
 
         until(description, settled)
@@ -610,7 +610,7 @@ class Gate:
                     return False
                 if response["outcome"] != "Progressed":
                     raise RuntimeError(
-                        "deletion was not observed at the Prepared crash point"
+                        "deletion was not observed in a progressing round"
                     )
                 self.record("boundary", json.dumps(response))
                 return True
@@ -627,9 +627,9 @@ class Gate:
                 raise RuntimeError("PostgreSQL did not log the target deletion")
             self.capture("deleted")
             self.record_target_deletes()
-            # PostgreSQL has committed the delete from the durable Prepared plan.
-            # One Flow advance visits the Sink only once, so its settlement cannot
-            # run until the next round. Kill at that exact external/local boundary.
+            # The complete Flow round committed and settled this deletion.
+            # Kill and reopen its source checkpoint and target together; exact
+            # Prepared-before-settle windows are covered by the direct Sink gate.
             host.kill()
 
         until("killed SQL host releases its slot", lambda: not self.slot_active())
@@ -638,24 +638,22 @@ class Gate:
         with self.host("restart", 2) as host:
             replay = host.advance()
             if (
-                replay["outcome"] != "Progressed"
+                replay["outcome"] not in ("Progressed", "Idle")
                 or self.rows() != crashed_rows
                 or self.technical_ids() != crashed_ids
             ):
                 raise RuntimeError(
-                    "Prepared replay duplicated or changed the fulfillment queue"
+                    "reopen duplicated or changed the fulfillment queue"
                 )
-            until(
-                "Prepared target DELETE is replayed",
-                lambda: self.target_delete_count() > crash_delete_count,
-            )
+            if self.target_delete_count() != crash_delete_count:
+                raise RuntimeError("reopen repeated a settled target deletion")
             self.record("replay", json.dumps(replay))
             self.record_target_deletes()
             self.drive(host, "reopened SQL CDC connector starts", self.slot_active)
             self.settle(host, "reopened Flow settles")
             if self.rows() != crashed_rows or self.technical_ids() != crashed_ids:
                 raise RuntimeError(
-                    "settling Prepared replay changed rows or stable technical IDs"
+                    "reopen changed rows or stable technical IDs"
                 )
             self.capture("recovered")
 

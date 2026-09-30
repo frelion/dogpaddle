@@ -1,7 +1,5 @@
-use dogpaddle_store::{
-    MultisetEntry, OrderedMultiset, PartitionedMultiset, ScanDirection, ScanLimit, Store,
-    StoreError,
-};
+use dogpaddle_store::{OrderedMap, PartitionKey, ScanDirection, ScanLimit, Store, StoreError};
+use std::num::NonZeroU64;
 
 use crate::support::store_path;
 
@@ -11,7 +9,7 @@ fn ordered_multiset_adjusts_exactly_and_survives_reopen() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<OrderedMultiset<Vec<u8>>>("values")
+        .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let absent = b"absent".to_vec();
@@ -41,7 +39,7 @@ fn ordered_multiset_adjusts_exactly_and_survives_reopen() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<OrderedMultiset<Vec<u8>>>("values")
+        .open_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     let values = multiset.read(transaction.access()).unwrap();
@@ -56,7 +54,7 @@ fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<OrderedMultiset<Vec<u8>>>("values")
+        .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let key = b"row".to_vec();
@@ -72,7 +70,7 @@ fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
 
     let store = Store::open(&path).unwrap();
     let multiset = store
-        .open_data::<OrderedMultiset<Vec<u8>>>("values")
+        .open_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     {
@@ -87,7 +85,7 @@ fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<OrderedMultiset<Vec<u8>>>("values")
+        .open_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     assert_eq!(
@@ -105,7 +103,7 @@ fn invalid_multiplicity_adjustments_poison_and_roll_back_the_transaction() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let multiset = store
-        .create_data::<OrderedMultiset<Vec<u8>>>("values")
+        .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let maximum = b"maximum".to_vec();
@@ -166,7 +164,7 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let partition_key = b"a".to_vec();
@@ -190,11 +188,17 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
             }
             assert_eq!(partition.multiplicity(&keys[3]).unwrap(), 4);
             assert_eq!(
-                partition.first().unwrap().map(|entry| entry.key),
+                partition
+                    .first_bounded(usize::MAX)
+                    .unwrap()
+                    .map(|entry| entry.0),
                 Some(keys[0].clone())
             );
             assert_eq!(
-                partition.last().unwrap().map(|entry| entry.key),
+                partition
+                    .last_bounded(usize::MAX)
+                    .unwrap()
+                    .map(|entry| entry.0),
                 Some(keys[5].clone())
             );
             assert_eq!(
@@ -203,14 +207,8 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
                     .unwrap()
                     .entries,
                 vec![
-                    MultisetEntry {
-                        key: keys[0].clone(),
-                        multiplicity: 1,
-                    },
-                    MultisetEntry {
-                        key: keys[1].clone(),
-                        multiplicity: 2,
-                    },
+                    (keys[0].clone(), NonZeroU64::new(1).unwrap()),
+                    (keys[1].clone(), NonZeroU64::new(2).unwrap()),
                 ]
             );
             assert_eq!(
@@ -219,14 +217,8 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
                     .unwrap()
                     .entries,
                 vec![
-                    MultisetEntry {
-                        key: keys[5].clone(),
-                        multiplicity: 6,
-                    },
-                    MultisetEntry {
-                        key: keys[4].clone(),
-                        multiplicity: 5,
-                    },
+                    (keys[5].clone(), NonZeroU64::new(6).unwrap()),
+                    (keys[4].clone(), NonZeroU64::new(5).unwrap()),
                 ]
             );
         }
@@ -236,7 +228,7 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     let values = multiset.read(transaction.access()).unwrap();
@@ -256,7 +248,7 @@ fn partitioned_multiset_replaces_weight_without_changing_other_partitions() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let first = b"first".to_vec();
@@ -317,7 +309,7 @@ fn partitioned_multiset_replaces_weight_without_changing_other_partitions() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     let values = multiset.read(transaction.access()).unwrap();
@@ -345,7 +337,7 @@ fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let empty_partition = Vec::new();
 
@@ -353,8 +345,8 @@ fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
         let transaction = store.read_transaction();
         let values = multiset.read(transaction.access()).unwrap();
         let empty = values.partition(&empty_partition).unwrap();
-        assert_eq!(empty.first().unwrap(), None);
-        assert_eq!(empty.last().unwrap(), None);
+        assert_eq!(empty.first_bounded(usize::MAX).unwrap(), None);
+        assert_eq!(empty.last_bounded(usize::MAX).unwrap(), None);
         assert!(
             empty
                 .scan(
@@ -371,12 +363,16 @@ fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     let values = multiset.read(transaction.access()).unwrap();
     assert_eq!(
-        values.partition(&empty_partition).unwrap().first().unwrap(),
+        values
+            .partition(&empty_partition)
+            .unwrap()
+            .first_bounded(usize::MAX)
+            .unwrap(),
         None
     );
 }
@@ -386,7 +382,7 @@ fn partitioned_multiset_pages_resume_in_both_directions() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let partition_key = b"partition".to_vec();
@@ -417,7 +413,7 @@ fn partitioned_multiset_pages_resume_in_both_directions() {
             let page = partition
                 .scan(direction, continuation.as_ref(), limit)
                 .unwrap();
-            actual.extend(page.entries.into_iter().map(|entry| entry.key));
+            actual.extend(page.entries.into_iter().map(|entry| entry.0));
             continuation = page.continuation;
             if continuation.is_none() {
                 break;
@@ -432,7 +428,7 @@ fn partitioned_multiset_byte_limit_can_be_retried() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let partition_key = b"partition".to_vec();
@@ -458,7 +454,7 @@ fn partitioned_multiset_byte_limit_can_be_retried() {
         )
         .unwrap();
     assert_eq!(page.entries.len(), 1);
-    assert_eq!(page.entries[0].key, key);
+    assert_eq!(page.entries[0].0, key);
     assert_eq!(page.continuation, None);
     transaction.commit().unwrap();
 }
@@ -468,13 +464,19 @@ fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let partition_key = vec![0x11; 256];
     let adjacent_partition = vec![0x12; 256];
     let keys = [vec![0x31; 8 * 1024], vec![0x32; 8 * 1024]];
-    let item_bytes = 8 + partition_key.len() + keys[0].len() + 8;
+    let item_bytes = 2
+        + partition_key.len()
+        + partition_key
+            .iter()
+            .fold(0, |count, byte| count + usize::from(*byte == 0))
+        + keys[0].len()
+        + 8;
 
     {
         let transaction = transactions.begin();
@@ -514,10 +516,10 @@ fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
             .unwrap();
         assert_eq!(
             page.entries,
-            vec![MultisetEntry {
-                key: keys[first].clone(),
-                multiplicity: first as u64 + 2,
-            }]
+            vec![(
+                keys[first].clone(),
+                NonZeroU64::new(first as u64 + 2).unwrap()
+            )]
         );
         assert_eq!(page.continuation, Some(keys[first].clone()));
         let page = partition
@@ -529,10 +531,10 @@ fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
             .unwrap();
         assert_eq!(
             page.entries,
-            vec![MultisetEntry {
-                key: keys[second].clone(),
-                multiplicity: second as u64 + 2,
-            }]
+            vec![(
+                keys[second].clone(),
+                NonZeroU64::new(second as u64 + 2).unwrap()
+            )]
         );
         assert_eq!(page.continuation, None);
     }
@@ -544,7 +546,7 @@ fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     let multiset = store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let mut transactions = store.into_transactions();
     let first_partition = b"a".to_vec();
@@ -575,7 +577,7 @@ fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
 
     let store = Store::open(path).unwrap();
     let multiset = store
-        .open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("values")
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let transaction = store.read_transaction();
     let values = multiset.read(transaction.access()).unwrap();
@@ -606,33 +608,157 @@ fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
 }
 
 #[test]
-fn multiset_collection_kinds_are_distinct() {
+fn weights_and_partitions_use_the_ordered_map_catalog_kind() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
     let mut store = Store::create(&path).unwrap();
     store
-        .create_data::<OrderedMultiset<Vec<u8>>>("ordered")
+        .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("ordered")
         .unwrap();
     store
-        .create_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("partitioned")
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("partitioned")
         .unwrap();
     drop(store);
-
     let store = Store::open(path).unwrap();
+    assert!(
+        store
+            .open_data::<OrderedMap<Vec<u8>, NonZeroU64>>("ordered")
+            .is_ok()
+    );
+    assert!(
+        store
+            .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("partitioned")
+            .is_ok()
+    );
+}
+
+#[test]
+fn bounded_partition_endpoints_admit_framed_bytes_and_retry_after_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut store = Store::create(&path).unwrap();
+    let values = store
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin();
+        let mut access = values.access(transaction.access()).unwrap();
+        let mut partition = access.partition(&vec![1]).unwrap();
+        partition.adjust(&vec![3; 64], 2).unwrap();
+        partition.adjust(&vec![4; 64], 1).unwrap();
+        // One-byte partition + two-byte terminator + key + u64 weight.
+        assert!(matches!(
+            partition.first_bounded(74),
+            Err(StoreError::ItemTooLarge {
+                size: 75,
+                limit: 74
+            })
+        ));
+        assert_eq!(partition.first_bounded(75).unwrap().unwrap().0, vec![3; 64]);
+        assert_eq!(partition.last_bounded(75).unwrap().unwrap().0, vec![4; 64]);
+        transaction.commit().unwrap();
+    }
+    drop(transactions);
+    let store = Store::open(&path).unwrap();
+    let values = store
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
+        .unwrap();
+    let snapshot = store.read_transaction();
+    let access = values.read(snapshot.access()).unwrap();
+    let partition = access.partition(&vec![1]).unwrap();
     assert!(matches!(
-        store.open_data::<PartitionedMultiset<Vec<u8>, Vec<u8>>>("ordered"),
-        Err(StoreError::DataKindMismatch {
-            name,
-            expected: "partitioned multiset",
-            actual: "ordered multiset",
-        }) if name == "ordered"
+        partition.last_bounded(74),
+        Err(StoreError::ItemTooLarge { .. })
     ));
+    assert_eq!(partition.last_bounded(75).unwrap().unwrap().1.get(), 1);
     assert!(matches!(
-        store.open_data::<OrderedMultiset<Vec<u8>>>("partitioned"),
-        Err(StoreError::DataKindMismatch {
-            name,
-            expected: "ordered multiset",
-            actual: "partitioned multiset",
-        }) if name == "partitioned"
+        partition.first_bounded(0),
+        Err(StoreError::InvalidScanLimit)
     ));
+    assert_eq!(partition.first_bounded(75).unwrap().unwrap().1.get(), 2);
+}
+
+#[test]
+fn malformed_weight_poisoning_rolls_back_prior_writes_without_copying_oversized_value() {
+    for bytes in [vec![0; 8], vec![1; 9], vec![1; 64 * 1024]] {
+        let root = tempfile::tempdir().unwrap();
+        let path = store_path(&root);
+        let mut store = Store::create(&path).unwrap();
+        let raw = store
+            .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("weights")
+            .unwrap();
+        let mut transactions = store.into_transactions();
+        let transaction = transactions.begin();
+        raw.access(transaction.access())
+            .unwrap()
+            .put(&vec![1], &bytes)
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(transactions);
+        let store = Store::open(&path).unwrap();
+        let weights = store
+            .open_data::<OrderedMap<Vec<u8>, NonZeroU64>>("weights")
+            .unwrap();
+        let mut transactions = store.into_transactions();
+        let transaction = transactions.begin();
+        let mut access = weights.access(transaction.access()).unwrap();
+        access.adjust(&vec![2], 1).unwrap();
+        assert!(matches!(
+            access.multiplicity(&vec![1]),
+            Err(StoreError::Codec(_))
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(StoreError::TransactionPoisoned)
+        ));
+        let transaction = transactions.begin();
+        assert_eq!(
+            weights
+                .access(transaction.access())
+                .unwrap()
+                .multiplicity(&vec![2])
+                .unwrap(),
+            0
+        );
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
+fn partition_view_reads_and_writes_generic_values_using_the_same_map() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let map = store
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, u64>, String>>("map")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    let mut access = map.access(transaction.access()).unwrap();
+    access
+        .partition(&vec![0])
+        .unwrap()
+        .put(&1, &"first".to_owned())
+        .unwrap();
+    access
+        .partition(&vec![0, 0])
+        .unwrap()
+        .put(&1, &"other".to_owned())
+        .unwrap();
+    let mut partition = access.partition(&vec![0]).unwrap();
+    assert!(matches!(
+        partition.get_bounded(&1, 4),
+        Err(StoreError::ItemTooLarge { size: 5, limit: 4 })
+    ));
+    assert_eq!(
+        partition.first_bounded(32).unwrap(),
+        Some((1, "first".to_owned()))
+    );
+    partition.erase(&1).unwrap();
+    assert_eq!(partition.get(&1).unwrap(), None);
+    assert_eq!(
+        access.get(&PartitionKey(vec![0, 0], 1)).unwrap(),
+        Some("other".to_owned())
+    );
+    transaction.commit().unwrap();
 }

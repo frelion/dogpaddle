@@ -20,7 +20,9 @@ use super::{
     schema::PostgresLayout,
     target::{SqlPlan, quote_identifier},
 };
-use crate::operation::sink::relation::{RowError, canonical_row, encode_canonical, row_hash};
+use crate::operation::sink::relation::{
+    RowError, canonical_row_bounded, encode_canonical, row_hash,
+};
 
 fn spec(table: &str) -> PostgresTargetSpec {
     PostgresTargetSpec::try_new("sink_1", "database", "Target Schema", table, "1", 2).unwrap()
@@ -210,8 +212,14 @@ fn row_codec_maps_fixed_width_values_and_typed_nulls_from_canonical_bytes() {
     let present = codec.encode_row(&batch, 0).unwrap();
     let nulls = codec.encode_row(&batch, 1).unwrap();
 
-    assert_eq!(present.hash, row_hash(&canonical_row(&batch, 0).unwrap()));
-    assert_eq!(nulls.hash, row_hash(&canonical_row(&batch, 1).unwrap()));
+    assert_eq!(
+        present.hash,
+        row_hash(&canonical_row_bounded(&batch, 0, usize::MAX).unwrap())
+    );
+    assert_eq!(
+        nulls.hash,
+        row_hash(&canonical_row_bounded(&batch, 1, usize::MAX).unwrap())
+    );
     assert_eq!(
         present.values,
         vec![
@@ -335,10 +343,10 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
         lookup
             .contains("target.\"b\" = request.c1 OR (target.\"b\" IS NULL AND request.c1 IS NULL)")
     );
-    assert!(lookup.contains("(0, $1::bigint, $2::bigint, $3::bytea, $4::bigint, $5::bytea), (1, $6::bigint, $7::bigint, $8::bytea, $9::bigint, $10::bytea)"));
-    assert!(lookup.contains("LIMIT request.needed"));
+    assert!(lookup.contains("(0, $1::bigint, $2::bytea, $3::bigint, $4::bytea), (1, $5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
+    assert!(!lookup.contains("count(*)"));
     assert!(lookup.contains("LIMIT request.take"));
-    assert!(lookup.contains("request.needed > request.take"));
+    assert!(!lookup.contains("request.needed"));
     assert!(lookup.ends_with("ORDER BY request.n"));
     assert!(!lookup.contains("excluded"));
     assert!(mismatch.contains("$1::bigint[]"));
@@ -374,7 +382,7 @@ fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
     assert!(
         empty
             .lookup_statement(1)
-            .contains("(0, $1::bigint, $2::bigint, $3::bytea)")
+            .contains("(0, $1::bigint, $2::bytea)")
     );
 
     let fields = (0..1_598)
@@ -391,8 +399,8 @@ fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
     assert!(insert.contains("$64000::bigint)"));
     assert!(!insert.contains("$64001"));
     let lookup = wide.lookup_statement(40);
-    assert!(lookup.contains("$64040::bigint)"));
-    assert!(!lookup.contains("$64041"));
+    assert!(lookup.contains("$64000::bigint)"));
+    assert!(!lookup.contains("$64001"));
     let mismatch = wide.mismatch_statement(40);
     assert!(mismatch.contains("$64000::bigint)"));
     assert!(!mismatch.contains("$64001"));

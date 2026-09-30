@@ -1,8 +1,3 @@
-use std::sync::Arc;
-
-use dogpaddle_change::{Change, SchemaBoundChangeCodec};
-use dogpaddle_store::{Cell, OrderedMap, ScanDirection, ScanLimit, StoreError, TransactionAccess};
-
 use super::{
     MAX_TARGET_BATCH_BYTES,
     batch::{self, DeliveryBatch, LoadedBatch},
@@ -10,66 +5,63 @@ use super::{
     state::{self, BufferState, Header, Prepared, Ready, State},
 };
 use crate::operation::sink::relation::{self, RelationTarget};
-use crate::operation::{Action, AfterCommit, OperationError, OperationInput, Turn, TurnOperation};
-
+use crate::operation::{OperationError, SinkOperation};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
+use dogpaddle_store::{
+    Cell, OrderedMap, ReadTransactionAccess, ScanDirection, ScanLimit, StoreError,
+    TransactionAccess,
+};
 const MAX_BUFFERED_EVENTS: u64 = 1_048_576;
 const MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DELIVERY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 const BUFFER_VALIDATION_ITEMS: usize = 256;
-
 struct Admission {
     encoded_change: Vec<u8>,
     item_bytes: u64,
     events: u64,
     first_remaining: u64,
 }
-
 pub(crate) struct BufferedSink<T: RelationTarget> {
     codec: SchemaBoundChangeCodec,
     target: T,
     control: Cell<Vec<u8>>,
     buffer: OrderedMap<u64, Vec<u8>>,
     head_cache: Option<batch::EntryCache>,
-    phase: Phase,
+    recovered: bool,
     #[cfg(test)]
     max_batch_events: u64,
 }
-
-enum Phase {
-    Restore,
-    New,
-    Initialized,
-    Ready(Ready),
-    Loaded(Box<LoadedPhase>),
-    Delivered(Delivered),
-    Failed,
+/// A bounded source prefix, or an already durable prepared front.
+pub struct SinkPending {
+    expected: Option<Vec<u8>>,
+    kind: PendingKind,
 }
-
-struct LoadedPhase {
-    ready: Ready,
-    batch: LoadedBatch,
+enum PendingKind {
+    Initialize { fresh: bool },
+    Loaded { ready: Ready, batch: LoadedBatch },
+    Prepared(PlannedPhase),
 }
-
+/// The concrete fixed-ID target plan retained until local settlement.
+pub struct SinkPrepared {
+    expected: Option<Vec<u8>>,
+    encoded: Vec<u8>,
+    kind: PreparedKind,
+}
+enum PreparedKind {
+    Initialize,
+    Batch(Box<PlannedPhase>),
+}
 struct PlannedPhase {
     prepared: Prepared,
     delivery: DeliveryBatch,
 }
-
-#[derive(Clone, Copy)]
-struct Delivered {
-    before: BufferState,
-    after: BufferState,
-    checkpoint: u64,
-}
-
 enum Restored {
     New,
     Initialize,
     Ready(Ready),
     Prepared(Box<PlannedPhase>),
 }
-
 #[derive(Clone, Copy)]
 struct PreparedRestore<'plan> {
     before: BufferState,
@@ -77,7 +69,6 @@ struct PreparedRestore<'plan> {
     checkpoint: u64,
     encoded_plan: &'plan [u8],
 }
-
 impl<T: RelationTarget> BufferedSink<T> {
     pub(crate) const fn new(
         codec: SchemaBoundChangeCodec,
@@ -91,46 +82,15 @@ impl<T: RelationTarget> BufferedSink<T> {
             control,
             buffer,
             head_cache: None,
-            phase: Phase::Restore,
+            recovered: false,
             #[cfg(test)]
             max_batch_events: relation::MAX_MUTATIONS_PER_BATCH as u64,
         }
     }
-
-    fn restore(&mut self) -> Turn<'_> {
-        Turn::ready(move |access| {
-            let encoded = self
-                .control
-                .access(access)?
-                .get_bounded(MAX_CONTROL_BYTES)?;
-            let restored = self.decode_restored(encoded.as_deref(), access)?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::durable(move || {
-                    self.phase = Phase::Failed;
-                    match restored {
-                        Restored::New => self.phase = Phase::New,
-                        Restored::Initialize => {
-                            self.target.initialize()?;
-                            self.phase = Phase::Initialized;
-                        }
-                        Restored::Ready(ready) => self.phase = Phase::Ready(ready),
-                        Restored::Prepared(planned) => {
-                            self.target
-                                .write_batch(planned.delivery.change(), &planned.prepared.plan)?;
-                            self.phase = Phase::Delivered(delivered(&planned.prepared));
-                        }
-                    }
-                    Ok(())
-                }),
-            ))
-        })
-    }
-
     fn decode_restored(
         &mut self,
         encoded: Option<&[u8]>,
-        access: TransactionAccess<'_>,
+        access: ReadTransactionAccess<'_>,
     ) -> Result<Restored, OperationError> {
         let Some(encoded) = encoded else {
             self.require_empty_buffer(access)?;
@@ -143,8 +103,10 @@ impl<T: RelationTarget> BufferedSink<T> {
             }
             Header::Ready(ready) => {
                 validate_capacity(ready.buffer)?;
-                let positive = self.validate_buffer(ready.buffer, access)?;
-                relation::validate_recovery(ready.checkpoint, positive)?;
+                if !self.recovered {
+                    let positive = self.validate_buffer(ready.buffer, access)?;
+                    relation::validate_recovery(ready.checkpoint, positive)?;
+                }
                 Ok(Restored::Ready(ready))
             }
             Header::Prepared {
@@ -167,11 +129,15 @@ impl<T: RelationTarget> BufferedSink<T> {
     fn restore_prepared(
         &mut self,
         restored: PreparedRestore<'_>,
-        access: TransactionAccess<'_>,
+        access: ReadTransactionAccess<'_>,
     ) -> Result<Restored, OperationError> {
         validate_capacity(restored.before)?;
         validate_capacity(restored.after)?;
-        let positive_before = self.validate_buffer(restored.before, access)?;
+        let positive_before = if self.recovered {
+            None
+        } else {
+            Some(self.validate_buffer(restored.before, access)?)
+        };
         let delivered_events = restored
             .before
             .pending_events
@@ -195,11 +161,13 @@ impl<T: RelationTarget> BufferedSink<T> {
                 "prepared settlement does not match its buffered batch",
             ));
         }
-        let delivered_positive = batch::positive_event_count(loaded.delivery.change())?;
-        let positive_after = positive_before
-            .checked_sub(delivered_positive)
-            .ok_or_else(|| invalid("prepared positive-event settlement underflow"))?;
-        relation::validate_recovery(restored.checkpoint, positive_after)?;
+        if let Some(positive_before) = positive_before {
+            let delivered_positive = batch::positive_event_count(loaded.delivery.change())?;
+            let positive_after = positive_before
+                .checked_sub(delivered_positive)
+                .ok_or_else(|| invalid("prepared positive-event settlement underflow"))?;
+            relation::validate_recovery(restored.checkpoint, positive_after)?;
+        }
         let mut encoded_plan = restored.encoded_plan;
         let plan = relation::decode_plan(&mut encoded_plan, &loaded.delivery, restored.checkpoint)?;
         if !encoded_plan.is_empty() {
@@ -216,14 +184,17 @@ impl<T: RelationTarget> BufferedSink<T> {
         })))
     }
 
-    fn require_empty_buffer(&self, access: TransactionAccess<'_>) -> Result<(), OperationError> {
+    fn require_empty_buffer(
+        &self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<(), OperationError> {
         self.require_empty_range(.., access)
     }
 
     fn validate_buffer(
         &self,
         state: BufferState,
-        access: TransactionAccess<'_>,
+        access: ReadTransactionAccess<'_>,
     ) -> Result<u64, OperationError> {
         let Some(head) = state.head else {
             self.require_empty_buffer(access)?;
@@ -237,7 +208,7 @@ impl<T: RelationTarget> BufferedSink<T> {
             usize::try_from(MAX_DELIVERY_BYTES).expect("the byte limit fits usize"),
         )
         .expect("the buffer validation limits are nonzero");
-        let map = self.buffer.access(access)?;
+        let map = self.buffer.read(access)?;
         let mut continuation = None;
         let mut expected_sequence = head.sequence;
         let mut pending_events = 0_u64;
@@ -316,7 +287,7 @@ impl<T: RelationTarget> BufferedSink<T> {
     fn require_empty_range(
         &self,
         range: impl std::ops::RangeBounds<u64>,
-        access: TransactionAccess<'_>,
+        access: ReadTransactionAccess<'_>,
     ) -> Result<(), OperationError> {
         let limit = ScanLimit::new(
             1,
@@ -325,7 +296,7 @@ impl<T: RelationTarget> BufferedSink<T> {
         .expect("the buffer scan limits are nonzero");
         match self
             .buffer
-            .access(access)?
+            .read(access)?
             .scan(range, ScanDirection::Ascending, None, limit)
         {
             Ok(page) if page.entries.is_empty() => Ok(()),
@@ -336,186 +307,7 @@ impl<T: RelationTarget> BufferedSink<T> {
         }
     }
 
-    fn initialize(&mut self) -> Result<Turn<'_>, OperationError> {
-        self.target.require_absent()?;
-        let encoded = State::Initialize.encode();
-        Ok(Turn::ready(move |access| {
-            self.control.access(access)?.set(&encoded)?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::durable(move || {
-                    self.phase = Phase::Failed;
-                    self.target.initialize()?;
-                    self.phase = Phase::Initialized;
-                    Ok(())
-                }),
-            ))
-        }))
-    }
-
-    fn publish_ready(&mut self) -> Result<Turn<'_>, OperationError> {
-        let ready = Ready {
-            buffer: BufferState::EMPTY,
-            checkpoint: relation::FIRST_TECHNICAL_ID,
-        };
-        let encoded = encode_bounded(&State::Ready(ready))?;
-        Ok(Turn::ready(move |access| {
-            self.control.access(access)?.set(&encoded)?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::local(move || {
-                    self.phase = Phase::Ready(ready);
-                    Ok(())
-                }),
-            ))
-        }))
-    }
-
-    fn admit(&mut self, admission: Admission, ready: Ready) -> Result<Turn<'_>, OperationError> {
-        let retained_bytes = ready
-            .buffer
-            .retained_bytes
-            .checked_add(admission.item_bytes)
-            .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
-            .ok_or_else(|| invalid("buffer retained-byte capacity is exhausted"))?;
-        let pending_events = ready
-            .buffer
-            .pending_events
-            .checked_add(admission.events)
-            .filter(|events| *events <= MAX_BUFFERED_EVENTS)
-            .ok_or_else(|| invalid("buffered-event capacity is exhausted"))?;
-        let sequence = ready.buffer.tail;
-        let tail = sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("buffer sequence is exhausted"))?;
-        let buffer = BufferState {
-            head: ready.buffer.head.or(Some(state::Position {
-                sequence,
-                row_index: 0,
-                remaining: admission.first_remaining,
-            })),
-            tail,
-            pending_events,
-            retained_bytes,
-        };
-        buffer.validate()?;
-        let next = Ready { buffer, ..ready };
-        let encoded_control = encode_bounded(&State::Ready(next))?;
-        Ok(Turn::ready(move |access| {
-            let mut map = self.buffer.access(access)?;
-            if map.get(&sequence)?.is_some() {
-                return Err(invalid(format!("buffer entry {sequence} already exists")));
-            }
-            map.put(&sequence, &admission.encoded_change)?;
-            self.control.access(access)?.set(&encoded_control)?;
-            Ok((
-                Action::Complete(None),
-                AfterCommit::local(move || {
-                    self.phase = Phase::Ready(next);
-                    Ok(())
-                }),
-            ))
-        }))
-    }
-
-    fn load(&mut self, ready: Ready) -> Turn<'_> {
-        let max_events = self.delivery_event_limit();
-        Turn::ready(move |access| {
-            let loaded = batch::load(
-                &self.buffer,
-                ready.buffer,
-                delivery_limits(max_events),
-                &mut self.head_cache,
-                &self.codec,
-                access,
-                |change, row| self.target.event_bytes(change, row),
-            )?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::local(move || {
-                    self.phase = Phase::Loaded(Box::new(LoadedPhase {
-                        ready,
-                        batch: loaded,
-                    }));
-                    Ok(())
-                }),
-            ))
-        })
-    }
-
-    fn plan(&mut self) -> Result<Turn<'_>, OperationError> {
-        let (ready, loaded) = match &self.phase {
-            Phase::Loaded(loaded) => (loaded.ready, loaded.batch.clone()),
-            _ => unreachable!("plan is called only for a loaded batch"),
-        };
-        let (checkpoint, plan) =
-            relation::prepare(&mut self.target, &loaded.delivery, ready.checkpoint)?;
-        let prepared = Prepared {
-            before: ready.buffer,
-            after: loaded.after,
-            checkpoint,
-            plan,
-        };
-        let delivery = loaded.delivery;
-        let encoded = encode_bounded(&State::Prepared(prepared.clone()))?;
-        Ok(Turn::ready(move |access| {
-            self.control.access(access)?.set(&encoded)?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::durable(move || {
-                    self.phase = Phase::Failed;
-                    self.target.write_batch(delivery.change(), &prepared.plan)?;
-                    self.phase = Phase::Delivered(delivered(&prepared));
-                    Ok(())
-                }),
-            ))
-        }))
-    }
-
-    fn settle(&mut self, delivered: Delivered) -> Result<Turn<'_>, OperationError> {
-        let ready = Ready {
-            buffer: delivered.after,
-            checkpoint: delivered.checkpoint,
-        };
-        let encoded = encode_bounded(&State::Ready(ready))?;
-        let remove_end = delivered
-            .after
-            .head
-            .map_or(delivered.before.tail, |head| head.sequence);
-        Ok(Turn::ready(move |access| {
-            let mut buffer = self.buffer.access(access)?;
-            for sequence in delivered
-                .before
-                .head
-                .expect("delivered buffer is nonempty")
-                .sequence..remove_end
-            {
-                if !buffer.remove(&sequence)? {
-                    return Err(invalid(format!(
-                        "settled buffer entry {sequence} is missing"
-                    )));
-                }
-            }
-            self.control.access(access)?.set(&encoded)?;
-            Ok((
-                Action::Commit(None),
-                AfterCommit::local(move || {
-                    let head = ready.buffer.head.map(|position| position.sequence);
-                    if self
-                        .head_cache
-                        .as_ref()
-                        .is_some_and(|cached| Some(cached.sequence) != head)
-                    {
-                        self.head_cache = None;
-                    }
-                    self.phase = Phase::Ready(ready);
-                    Ok(())
-                }),
-            ))
-        }))
-    }
-
-    #[cfg_attr(not(test), allow(clippy::unused_self))] // Tests use a smaller per-fixture batch.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn delivery_event_limit(&self) -> u64 {
         #[cfg(test)]
         {
@@ -527,70 +319,204 @@ impl<T: RelationTarget> BufferedSink<T> {
         }
     }
 }
-
-impl<T: RelationTarget> TurnOperation for BufferedSink<T> {
-    fn turn<'turn>(
-        &'turn mut self,
-        input: Option<OperationInput<'turn>>,
-    ) -> Result<Turn<'turn>, OperationError> {
-        let bound_schema = self.codec.schema();
-        let input = input
-            .map(|input| {
-                if input.port != 0 {
-                    return Err(invalid("only input port zero is supported"));
-                }
-                let actual = input.change.records().schema_ref();
-                if !Arc::ptr_eq(&bound_schema, actual) && bound_schema.as_ref() != actual.as_ref() {
-                    return Err(invalid("input Schema differs from the bound Schema"));
-                }
-                Ok(input.change)
-            })
-            .transpose()?;
-
-        match &self.phase {
-            Phase::Restore => Ok(self.restore()),
-            Phase::New => self.initialize(),
-            Phase::Initialized => self.publish_ready(),
-            Phase::Ready(ready) => {
-                let ready = *ready;
+impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
+    fn try_enqueue(
+        &mut self,
+        access: TransactionAccess<'_>,
+        page: &Change,
+    ) -> Result<bool, OperationError> {
+        if self.codec.schema().as_ref() != page.records().schema_ref().as_ref() {
+            return Err(invalid("input Schema differs from the bound Schema"));
+        }
+        // load validates the complete control before this runtime is serviced.
+        // Our only writer produces canonical states: a value larger than Ready
+        // can only be Prepared, whose fixed-ID plan need not be copied here.
+        let encoded = match self
+            .control
+            .access(access)?
+            .get_bounded(state::MAX_READY_BYTES)
+        {
+            Ok(encoded) => encoded,
+            Err(StoreError::ItemTooLarge { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let Header::Ready(ready) = state::decode_header(&encoded)? else {
+            return Ok(false);
+        };
+        let admission = prepare_admission(
+            &self.codec,
+            &self.target,
+            ready.checkpoint,
+            ready.buffer.pending_events,
+            page,
+        )?;
+        if !fits(&ready, &admission) {
+            return Ok(false);
+        }
+        let sequence = ready.buffer.tail;
+        let next = Ready {
+            checkpoint: ready.checkpoint,
+            buffer: BufferState {
+                head: ready.buffer.head.or(Some(state::Position {
+                    sequence,
+                    row_index: 0,
+                    remaining: admission.first_remaining,
+                })),
+                tail: sequence + 1,
+                pending_events: ready.buffer.pending_events + admission.events,
+                retained_bytes: ready.buffer.retained_bytes + admission.item_bytes,
+            },
+        };
+        let mut map = self.buffer.access(access)?;
+        if map.get_bounded(&sequence, 0)?.is_some() {
+            return Err(invalid("outbox sequence already exists"));
+        }
+        map.put(&sequence, &admission.encoded_change)?;
+        self.control
+            .access(access)?
+            .set(&encode_bounded(&State::Ready(next))?)?;
+        Ok(true)
+    }
+    fn load(
+        &mut self,
+        access: ReadTransactionAccess<'_>,
+    ) -> Result<Option<SinkPending>, OperationError> {
+        let expected = self.control.read(access)?.get_bounded(MAX_CONTROL_BYTES)?;
+        let restored = self.decode_restored(expected.as_deref(), access)?;
+        self.recovered = true;
+        let kind = match restored {
+            Restored::New => PendingKind::Initialize { fresh: true },
+            Restored::Initialize => PendingKind::Initialize { fresh: false },
+            Restored::Prepared(planned) => PendingKind::Prepared(*planned),
+            Restored::Ready(ready) => {
                 if ready.buffer.is_empty() {
-                    match input {
-                        Some(input) => self.admit(
-                            prepare_admission(
-                                &self.codec,
-                                &self.target,
-                                ready.checkpoint,
-                                ready.buffer.pending_events,
-                                input,
-                            )?,
-                            ready,
-                        ),
-                        None => Ok(Turn::Idle),
-                    }
-                } else if input.is_none() || should_drain(&ready, self.delivery_event_limit()) {
-                    Ok(self.load(ready))
-                } else {
-                    match prepare_admission(
-                        &self.codec,
-                        &self.target,
-                        ready.checkpoint,
-                        ready.buffer.pending_events,
-                        input.expect("the offered input was checked"),
-                    ) {
-                        Ok(admission) if fits(&ready, &admission) => self.admit(admission, ready),
-                        Ok(_) | Err(_) => Ok(self.load(ready)),
-                    }
+                    return Ok(None);
                 }
+                let batch = batch::load(
+                    &self.buffer,
+                    ready.buffer,
+                    delivery_limits(self.delivery_event_limit()),
+                    &mut self.head_cache,
+                    &self.codec,
+                    access,
+                    |change, row| self.target.event_bytes(change, row),
+                )?;
+                PendingKind::Loaded { ready, batch }
             }
-            Phase::Loaded(_) => self.plan(),
-            Phase::Delivered(delivered) => self.settle(*delivered),
-            Phase::Failed => Err(invalid(
-                "runtime must be reopened after a post-commit failure",
-            )),
+        };
+        Ok(Some(SinkPending { expected, kind }))
+    }
+    fn prepare(&mut self, pending: SinkPending) -> Result<SinkPrepared, OperationError> {
+        let (encoded, kind) = match pending.kind {
+            PendingKind::Initialize { fresh } => {
+                if fresh {
+                    self.target.require_absent()?;
+                }
+                (State::Initialize.encode(), PreparedKind::Initialize)
+            }
+            PendingKind::Prepared(planned) => (
+                encode_bounded(&State::Prepared(planned.prepared.clone()))?,
+                PreparedKind::Batch(Box::new(planned)),
+            ),
+            PendingKind::Loaded { ready, batch } => {
+                let (checkpoint, plan) =
+                    relation::prepare(&mut self.target, &batch.delivery, ready.checkpoint)?;
+                let prepared = Prepared {
+                    before: ready.buffer,
+                    after: batch.after,
+                    checkpoint,
+                    plan,
+                };
+                (
+                    encode_bounded(&State::Prepared(prepared.clone()))?,
+                    PreparedKind::Batch(Box::new(PlannedPhase {
+                        prepared,
+                        delivery: batch.delivery,
+                    })),
+                )
+            }
+        };
+        Ok(SinkPrepared {
+            expected: pending.expected,
+            encoded,
+            kind,
+        })
+    }
+    fn persist_prepared(
+        &self,
+        access: TransactionAccess<'_>,
+        prepared: &SinkPrepared,
+    ) -> Result<(), OperationError> {
+        let current = self
+            .control
+            .access(access)?
+            .get_bounded(MAX_CONTROL_BYTES)?;
+        if current != prepared.expected && current.as_deref() != Some(prepared.encoded.as_slice()) {
+            return Err(invalid("outbox front changed during planning"));
+        }
+        self.control.access(access)?.set(&prepared.encoded)?;
+        Ok(())
+    }
+    fn deliver(&mut self, prepared: &SinkPrepared) -> Result<(), OperationError> {
+        match &prepared.kind {
+            PreparedKind::Initialize => self.target.initialize(),
+            PreparedKind::Batch(planned) => self
+                .target
+                .write_batch(planned.delivery.change(), &planned.prepared.plan),
         }
     }
+    fn settle(
+        &mut self,
+        access: TransactionAccess<'_>,
+        prepared: &SinkPrepared,
+    ) -> Result<(), OperationError> {
+        if self
+            .control
+            .access(access)?
+            .get_bounded(MAX_CONTROL_BYTES)?
+            .as_deref()
+            != Some(prepared.encoded.as_slice())
+        {
+            return Err(invalid("prepared front differs during settlement"));
+        }
+        let ready = match &prepared.kind {
+            PreparedKind::Initialize => Ready {
+                buffer: BufferState::EMPTY,
+                checkpoint: relation::FIRST_TECHNICAL_ID,
+            },
+            PreparedKind::Batch(planned) => {
+                let prepared = &planned.prepared;
+                let remove_end = prepared
+                    .after
+                    .head
+                    .map_or(prepared.before.tail, |head| head.sequence);
+                let mut buffer = self.buffer.access(access)?;
+                for sequence in prepared
+                    .before
+                    .head
+                    .expect("prepared front is nonempty")
+                    .sequence..remove_end
+                {
+                    if !buffer.remove(&sequence)? {
+                        return Err(invalid("settled outbox entry is missing"));
+                    }
+                }
+                Ready {
+                    buffer: prepared.after,
+                    checkpoint: prepared.checkpoint,
+                }
+            }
+        };
+        self.control
+            .access(access)?
+            .set(&encode_bounded(&State::Ready(ready))?)?;
+        self.head_cache = None;
+        Ok(())
+    }
 }
-
 fn prepare_admission(
     codec: &SchemaBoundChangeCodec,
     target: &impl RelationTarget,
@@ -653,10 +579,6 @@ fn fits(ready: &Ready, admission: &Admission) -> bool {
         && ready.buffer.tail.checked_add(1).is_some()
 }
 
-fn should_drain(ready: &Ready, event_limit: u64) -> bool {
-    ready.buffer.retained_bytes >= MAX_DELIVERY_BYTES || ready.buffer.pending_events >= event_limit
-}
-
 const fn delivery_limits(max_events: u64) -> batch::LoadLimits {
     batch::LoadLimits::new(
         max_events,
@@ -674,14 +596,6 @@ fn validate_capacity(buffer: BufferState) -> Result<(), OperationError> {
     }
 }
 
-fn delivered(prepared: &Prepared) -> Delivered {
-    Delivered {
-        before: prepared.before,
-        after: prepared.after,
-        checkpoint: prepared.checkpoint,
-    }
-}
-
 fn encode_bounded(state: &State) -> Result<Vec<u8>, OperationError> {
     state.validate()?;
     let encoded = state.encode();
@@ -691,6 +605,3 @@ fn encode_bounded(state: &State) -> Result<Vec<u8>, OperationError> {
         Ok(encoded)
     }
 }
-
-#[cfg(test)]
-mod tests;

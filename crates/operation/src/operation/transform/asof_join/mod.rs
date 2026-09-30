@@ -14,9 +14,9 @@ use crate::{
 mod definition;
 mod index;
 mod runtime;
-mod state;
+pub(crate) mod state;
 
-pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey, AsOfTieBreak};
+pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey};
 pub(crate) use definition::{AsOfJoinLayout, TAG, decode_definition};
 pub(crate) use runtime::AsOfJoinOperation;
 
@@ -28,109 +28,41 @@ fn construct(
 ) -> Result<Operation, OperationSetupError> {
     let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
     let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
-    let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
-    Ok(Operation::Turn(Box::new(AsOfJoinOperation {
+    Ok(Operation::Paged(Box::new(AsOfJoinOperation {
         layout,
         left_rows,
         right_rows,
-        continuation,
-        prepared: None,
     })))
 }
 
-/// Relational output semantics of an ASOF join.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum AsOfJoinKind {
-    /// Emits each left row with its selected right row, when one exists.
-    Inner,
-    /// Retains an unmatched left row and fills every right field with NULL.
-    LeftOuter,
-    /// Emits a left row exactly when it selects a right row.
-    LeftSemi,
-    /// Emits a left row exactly when it does not select a right row.
-    LeftAnti,
-}
-
-impl AsOfJoinKind {
-    pub(super) const fn left_only(self) -> bool {
-        matches!(self, Self::LeftSemi | Self::LeftAnti)
-    }
-}
-
-/// Which candidate wins when nearest neighbors are equally distant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum AsOfEquidistantPreference {
-    /// Selects the candidate before the left order value.
-    Backward,
-    /// Selects the candidate after the left order value.
-    Forward,
-}
-
-/// Ordered candidate-search strategy.
+/// Ordered SQL ASOF candidate search direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum AsOfDirection {
     /// Selects the greatest eligible right value before the left value.
     Backward {
-        /// Whether an equal order value is eligible.
+        /// Whether equal order values are eligible.
         allow_exact: bool,
     },
     /// Selects the least eligible right value after the left value.
     Forward {
-        /// Whether an equal order value is eligible.
+        /// Whether equal order values are eligible.
         allow_exact: bool,
-    },
-    /// Selects the right order value with the smallest absolute distance.
-    Nearest {
-        /// Whether an equal order value is eligible.
-        allow_exact: bool,
-        /// Deterministic winner for equal predecessor and successor distances.
-        equidistant: AsOfEquidistantPreference,
     },
 }
-
 impl AsOfDirection {
-    /// Returns whether an exactly equal order value is eligible.
+    /// Returns whether equal values are eligible.
     #[must_use]
     pub const fn allow_exact(self) -> bool {
         match self {
-            Self::Backward { allow_exact }
-            | Self::Forward { allow_exact }
-            | Self::Nearest { allow_exact, .. } => allow_exact,
+            Self::Backward { allow_exact } | Self::Forward { allow_exact } => allow_exact,
         }
     }
-
-    pub(super) const fn nearest(self) -> bool {
-        matches!(self, Self::Nearest { .. })
-    }
-}
-
-/// NULL comparison semantics for one equality partition key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum AsOfEqualityMode {
-    /// SQL equality: a NULL on either side makes the key ineligible.
-    Equal,
-    /// SQL `IS NOT DISTINCT FROM`: two NULL values are equal.
-    NotDistinct,
-}
-
-/// Behavior when explicit right tie-break expressions do not identify one row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub enum AsOfTieFallback {
-    /// Rejects an ambiguous right candidate set at runtime.
-    Reject,
-    /// Uses the exact canonical right row in ascending byte order.
-    CanonicalAscending,
-    /// Uses the exact canonical right row in descending byte order.
-    CanonicalDescending,
 }
 
 /// Failure while constructing a persistent [`AsOfJoinDefinition`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AsOfJoinDefinitionError {
-    /// At least one ordered key pair is required.
-    #[error("ASOF join requires at least one order key pair")]
-    EmptyOrderKeys,
     /// A stable Definition count cannot represent all supplied values.
     #[error("ASOF join definition has too many {kind}")]
     TooMany {
@@ -150,13 +82,6 @@ pub enum AsOfJoinDefinitionError {
         role: &'static str,
         /// Zero-based expression or pair index.
         index: usize,
-        /// Expression persistence failure.
-        #[source]
-        source: ExpressionDefinitionError,
-    },
-    /// The candidate-eligibility predicate cannot be persisted canonically.
-    #[error("ASOF join residual predicate cannot be persisted")]
-    ResidualExpression {
         /// Expression persistence failure.
         #[source]
         source: ExpressionDefinitionError,
@@ -202,25 +127,6 @@ pub enum AsOfJoinSchemaError {
         /// Rejected exact type.
         data_type: DataType,
     },
-    /// The persistent residual cannot bind to the exact candidate-pair Schema.
-    #[error("ASOF join residual predicate cannot bind")]
-    ResidualExpression {
-        /// Expression binding failure.
-        #[source]
-        source: ExpressionBindError,
-    },
-    /// A residual predicate must produce Boolean.
-    #[error("ASOF join residual predicate must produce Boolean, found {actual}")]
-    ResidualType {
-        /// Actual expression result type.
-        actual: DataType,
-    },
-    /// Nearest search and bounded tolerance require one distance-capable order key.
-    #[error("ASOF join {feature} requires exactly one distance-capable order key")]
-    DistanceOrder {
-        /// Feature requiring a scalar distance.
-        feature: &'static str,
-    },
     /// One stable name is required for every emitted field.
     #[error("ASOF join requires {expected} output names but received {actual}")]
     OutputNameCount {
@@ -234,7 +140,7 @@ pub enum AsOfJoinSchemaError {
     NullPadding(#[source] DataFusionError),
 }
 
-/// Failure during one `AsOfJoinOperation` turn.
+/// Failure during one `AsOfJoinOperation` step.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AsOfJoinError {
@@ -263,16 +169,6 @@ pub enum AsOfJoinError {
         #[source]
         source: ExpressionError,
     },
-    /// The exact candidate-pair residual failed during evaluation.
-    #[error("ASOF join residual predicate evaluation failed")]
-    ResidualExpression {
-        /// Predicate evaluation failure.
-        #[source]
-        source: ExpressionError,
-    },
-    /// The residual reported Boolean but did not produce Arrow's canonical Boolean array.
-    #[error("ASOF join residual predicate did not produce a canonical Boolean Arrow array")]
-    ResidualArray,
     /// Applying a difference would make an exact input row negative.
     #[error("ASOF join input would make an exact row weight negative")]
     NegativeWeight,
@@ -282,21 +178,15 @@ pub enum AsOfJoinError {
     /// An output difference exceeds `i64`.
     #[error("ASOF join output difference overflow")]
     OutputDifferenceOverflow,
-    /// Explicit tie-breaks do not identify one right row.
-    #[error("ASOF join right candidates remain ambiguous after explicit tie-breaks")]
+    /// More than one distinct row shares an exposed winning order value.
+    #[error("ASOF join winning right order value is ambiguous")]
     AmbiguousTie,
-    /// Preparing the pinned input would retain an excessive index working set.
-    #[error("ASOF join prepared Claim exceeds its {max_bytes}-byte limit")]
-    PreparedClaimTooLarge {
-        /// Maximum retained preparation working set.
-        max_bytes: usize,
-    },
     /// Durable index state is malformed or inconsistent.
     #[error("ASOF join index is invalid: {0}")]
     InvalidIndex(&'static str),
-    /// Durable continuation is inconsistent with the pinned input Claim.
-    #[error("ASOF join continuation is invalid: {0}")]
-    InvalidContinuation(&'static str),
+    /// Opaque resume is inconsistent with the immutable input.
+    #[error("ASOF join resume is invalid: {0}")]
+    InvalidResume(&'static str),
     /// Canonical row processing failed.
     #[error("ASOF join canonical row processing failed")]
     CanonicalRow {

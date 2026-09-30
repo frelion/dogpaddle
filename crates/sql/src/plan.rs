@@ -29,10 +29,9 @@ use dogpaddle_flow::{FlowFactory, OperationRef};
 use dogpaddle_operation::{
     OperationDefinition,
     operation::transform::{
-        AggregateCall, AggregateDefinition, AsOfDirection, AsOfEqualityKey, AsOfEqualityMode,
-        AsOfJoinDefinition, AsOfJoinKind, AsOfOrderKey, AsOfTieFallback, DistinctDefinition,
-        EquiJoinDefinition, EquiJoinKind, FilterDefinition, SchemaAlignDefinition,
-        SchemaAlignField, UnionAllDefinition,
+        AggregateCall, AggregateDefinition, AsOfDirection, AsOfEqualityKey, AsOfJoinDefinition,
+        AsOfOrderKey, DistinctDefinition, EquiJoinDefinition, EquiJoinKind, FilterDefinition,
+        SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
     },
 };
 
@@ -312,7 +311,6 @@ impl Lowerer<'_> {
             .iter()
             .map(|(left_key, right_key)| {
                 Ok(AsOfEqualityKey::new(
-                    AsOfEqualityMode::Equal,
                     rewrite_columns(left_key.clone(), join.left.schema(), &left.physical_schema)?,
                     rewrite_columns(
                         right_key.clone(),
@@ -339,15 +337,10 @@ impl Lowerer<'_> {
             left.physical_schema.fields().len() + right.physical_schema.fields().len();
         let source_order = (0..output_count).collect::<Vec<_>>();
         let definition = AsOfJoinDefinition::try_new(
-            AsOfJoinKind::LeftOuter,
             direction,
             equalities,
-            [order],
-            [],
-            AsOfTieFallback::Reject,
-            None,
+            order,
             (0..output_count).map(internal_join_field_name),
-            None,
         )
         .map_err(SqlError::endpoint)?;
         let joined = self.add_transform([left, right], definition)?;

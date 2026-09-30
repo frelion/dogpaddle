@@ -1,18 +1,16 @@
 //! Bounded candidate scans and residual evaluation; no durable writes.
 
-use std::{mem::size_of, sync::Arc};
+use std::{mem::size_of, num::NonZeroU64, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions};
 use datafusion_common::ScalarValue;
-use dogpaddle_store::{
-    MultisetEntry, MultisetPage, ScanDirection, ScanLimit, StoreError, TransactionAccess,
-};
+use dogpaddle_store::{OrderedMapPage, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
-use crate::operation::relation::decode_canonical_row;
+use crate::operation::relation::decode_canonical_row_bounded;
 
 use super::{
     ActiveRow, EquiJoinError, EquiJoinOperation, KeyTransition, PreparedMatch, PreparedRow,
-    ResidualPage, RowEffect, TurnBudget,
+    ResidualPage, RowEffect, StepBudget, canonical_error,
 };
 
 const RESIDUAL_BATCH_ITEMS: usize = 256;
@@ -30,14 +28,14 @@ impl EquiJoinOperation {
         row: &PreparedRow,
         effect: RowEffect,
         resume_after: Option<&Vec<u8>>,
-        budget: &TurnBudget,
+        budget: &mut StepBudget,
         access: TransactionAccess<'_>,
-    ) -> Result<Option<MultisetPage<Vec<u8>>>, EquiJoinError> {
+    ) -> Result<Option<OrderedMapPage<Vec<u8>, NonZeroU64>>, EquiJoinError> {
         if !effect.matched
             || (self.kind.left_only()
                 && (port == 0 || matches!(effect.transition, KeyTransition::None)))
         {
-            return Ok(Some(MultisetPage {
+            return Ok(Some(OrderedMapPage {
                 entries: Vec::new(),
                 continuation: None,
             }));
@@ -52,16 +50,12 @@ impl EquiJoinOperation {
         let limit =
             ScanLimit::new(max_items, max_bytes).expect("positive Join page limits are valid");
         match partition.scan(ScanDirection::Ascending, resume_after, limit) {
-            Ok(page) => Ok(Some(page)),
-            Err(StoreError::ItemTooLarge { .. }) if !budget.is_empty() => Ok(None),
-            Err(StoreError::ItemTooLarge { size, .. }) => {
-                let limit = ScanLimit::new(1, size.max(1))
-                    .expect("one item and a positive observed byte size are valid");
-                Ok(Some(partition.scan(
-                    ScanDirection::Ascending,
-                    resume_after,
-                    limit,
-                )?))
+            Ok(page) => {
+                budget.charge(StepBudget::scanned_bytes(row, &page.entries))?;
+                Ok(Some(page))
+            }
+            Err(StoreError::ItemTooLarge { .. }) => {
+                Err(EquiJoinError::Budget(crate::operation::BudgetExceeded))
             }
             Err(source) => Err(source.into()),
         }
@@ -73,17 +67,22 @@ impl EquiJoinOperation {
         row: &ActiveRow<'_>,
         effect: RowEffect,
         resume_after: Option<&Vec<u8>>,
-        budget: &TurnBudget,
+        budget: &mut StepBudget,
         access: TransactionAccess<'_>,
     ) -> Result<Option<ResidualPage>, EquiJoinError> {
         if !row.matchable
             || (self.kind.left_only() && matches!(effect.transition, KeyTransition::None))
         {
+            let work = StepBudget::work(row, &[], true);
+            if !budget.can_accept(work) {
+                return Ok(None);
+            }
+            budget.charge(work.1)?;
             return Ok(Some(ResidualPage {
                 matches: Vec::new(),
                 qualifying: 0,
                 continuation: None,
-                work: TurnBudget::work(row, &[], true),
+                items: work.0,
             }));
         }
         let mut opposite = self.rows(1 - port).access(access)?;
@@ -101,24 +100,24 @@ impl EquiJoinOperation {
             .expect("positive residual Join page limits are valid");
         let page = match partition.scan(ScanDirection::Ascending, resume_after, limit) {
             Ok(page) => page,
-            Err(StoreError::ItemTooLarge { .. }) if !budget.is_empty() => return Ok(None),
-            Err(StoreError::ItemTooLarge { size, .. }) => {
-                let limit = ScanLimit::new(1, size.max(1))
-                    .expect("one item and a positive observed byte size are valid");
-                partition.scan(ScanDirection::Ascending, resume_after, limit)?
+            Err(StoreError::ItemTooLarge { .. }) => {
+                return Err(EquiJoinError::Budget(crate::operation::BudgetExceeded));
             }
             Err(source) => return Err(source.into()),
         };
+        budget.charge(StepBudget::scanned_bytes(row, &page.entries))?;
         let work = self.residual_work(port, row, effect, &page.entries);
         if !budget.can_accept(work) {
             return Ok(None);
         }
-        let (matches, qualifying) = self.evaluate_residual_matches(port, row, page.entries)?;
+        budget.charge(work.1)?;
+        let (matches, qualifying) =
+            self.evaluate_residual_matches(port, row, page.entries, budget)?;
         Ok(Some(ResidualPage {
             matches,
             qualifying,
             continuation: page.continuation,
-            work,
+            items: work.0,
         }))
     }
 
@@ -126,7 +125,8 @@ impl EquiJoinOperation {
         &self,
         port: usize,
         input: &ActiveRow<'_>,
-        entries: Vec<MultisetEntry<Vec<u8>>>,
+        entries: Vec<(Vec<u8>, NonZeroU64)>,
+        budget: &mut StepBudget,
     ) -> Result<(Vec<PreparedMatch>, usize), EquiJoinError> {
         if entries.is_empty() {
             return Ok((Vec::new(), 0));
@@ -139,11 +139,8 @@ impl EquiJoinOperation {
             .collect::<Vec<Vec<ScalarValue>>>();
         let mut candidates = Vec::with_capacity(entries.len());
         for entry in entries {
-            let opposite = decode_canonical_row(opposite_schema, &entry.key).map_err(|source| {
-                EquiJoinError::CanonicalRow {
-                    source: Box::new(source),
-                }
-            })?;
+            let opposite = decode_canonical_row_bounded(opposite_schema, &entry.0, budget)
+                .map_err(canonical_error)?;
             if port == 0 {
                 for (column, value) in columns[..left_fields].iter_mut().zip(input_values) {
                     column.push(value.clone());
@@ -159,7 +156,7 @@ impl EquiJoinOperation {
                     column.push(value.clone());
                 }
             }
-            candidates.push((entry.key, entry.multiplicity));
+            candidates.push((entry.0, entry.1.get()));
         }
         let arrays = columns
             .into_iter()
@@ -220,16 +217,15 @@ impl EquiJoinOperation {
         port: usize,
         row: &PreparedRow,
         effect: RowEffect,
-        candidates: &[MultisetEntry<Vec<u8>>],
+        candidates: &[(Vec<u8>, NonZeroU64)],
     ) -> (usize, usize) {
         // Every raw candidate is materialized to evaluate the predicate, even
         // when it is filtered out and produces no relational output.
-        let (mut items, mut bytes) = TurnBudget::work(row, candidates, true);
+        let (items, mut bytes) = StepBudget::work(row, candidates, true);
         let scalar_slots_per_candidate = self
             .candidate_schema
             .fields()
             .len()
-            .saturating_add(self.input_schemas[1 - port].fields().len())
             .saturating_add(self.output_schema.fields().len().saturating_mul(2));
         bytes = bytes.saturating_add(
             candidates
@@ -241,13 +237,14 @@ impl EquiJoinOperation {
             && self.tracks_match_count(1 - port)
             && !matches!(effect.transition, KeyTransition::None)
         {
-            items = items.saturating_add(candidates.len());
             for candidate in candidates {
-                bytes = bytes.saturating_add(candidate.key.len()).saturating_add(
-                    self.nulls[port]
-                        .len()
-                        .saturating_mul(size_of::<ScalarValue>()),
-                );
+                bytes = bytes
+                    .saturating_add(candidate.0.len().saturating_add(9).saturating_mul(3))
+                    .saturating_add(
+                        self.nulls[port]
+                            .len()
+                            .saturating_mul(size_of::<ScalarValue>()),
+                    );
             }
         }
         (items, bytes)

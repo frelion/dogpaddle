@@ -11,12 +11,12 @@ use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, decode_definition,
     operation::{
-        Action, Operation, Turn,
+        Operation,
         scan::{MySqlCdcScanConfig, PostgresCdcScanConfig},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Cell, Queue, Store, StoreSetup, Transactions};
+use dogpaddle_store::{Cell, Queue, ReadTransactions, Store, StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -98,7 +98,9 @@ impl Source {
 
 struct Fixture {
     operation: Operation,
+    codec: SchemaBoundChangeCodec,
     transactions: Transactions,
+    reads: ReadTransactions,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
     spool: Queue<Vec<u8>>,
@@ -183,9 +185,12 @@ impl Fixture {
             }
             transaction.commit().unwrap();
         }
+        let (transactions, reads) = transactions.split();
         Self {
             operation,
+            codec,
             transactions,
+            reads,
             phase,
             checkpoint,
             spool,
@@ -201,34 +206,34 @@ impl Fixture {
         } else {
             self.expected.len()
         };
-        let mut outputs = Vec::with_capacity(work_turns + 1);
-        // Restore is read-only. Publication commits once per entry; reset
-        // commits once per bounded discard batch.
+        let mut outputs = Vec::with_capacity(work_turns);
         let started = Instant::now();
-        for _ in 0..=work_turns {
-            let Turn::Ready(prepared) = self.operation.turn(None).unwrap() else {
-                panic!("CDC bootstrap unexpectedly idled")
-            };
-            let transaction = self.transactions.begin();
-            let (action, after_commit) = prepared.apply(transaction.access()).unwrap();
-            transaction.commit().unwrap();
-            after_commit.run().unwrap();
-            outputs.push(action);
+        let Operation::Source(source) = &mut self.operation else {
+            panic!("expected source");
+        };
+        source.restore(self.reads.begin().access()).unwrap();
+        for _ in 0..work_turns {
+            let mut delivery = source.poll().unwrap().expect("bootstrap work");
+            {
+                let txn = self.transactions.begin();
+                assert!(source.record(txn.access(), &mut delivery).unwrap());
+                txn.commit().unwrap();
+            }
+            source.ack(delivery).unwrap();
+            let published = source.published(self.reads.begin().access()).unwrap();
+            outputs.push(published.map(|encoded| self.codec.decode_owned(encoded).unwrap()));
+            if outputs.last().unwrap().is_some() {
+                let txn = self.transactions.begin();
+                source.consume_published(txn.access()).unwrap();
+                txn.commit().unwrap();
+            }
         }
         let elapsed = started.elapsed();
-        assert!(matches!(outputs.remove(0), Action::Commit(None)));
         if reset {
-            assert_eq!(outputs.len(), work_turns);
-            assert!(
-                outputs
-                    .into_iter()
-                    .all(|action| matches!(action, Action::Commit(None)))
-            );
+            assert!(outputs.iter().all(Option::is_none));
         } else {
-            for (action, expected) in outputs.into_iter().zip(&self.expected) {
-                let Action::Commit(Some(actual)) = action else {
-                    panic!("publication omitted an entry")
-                };
+            for (output, expected) in outputs.into_iter().zip(&self.expected) {
+                let actual = output.expect("published entry");
                 assert_eq!(actual.records(), expected.records());
                 assert_eq!(actual.diffs(), expected.diffs());
             }
@@ -274,15 +279,15 @@ fn main() {
         "publish_entries": publish_entries, "publish_rows_per_entry": publish_rows,
         "reset_entries": BATCHED_RESET_ENTRIES, "reset_rows_per_entry": RESET_ROWS_PER_ENTRY,
         "wide_entries": 1, "wide_rows_per_entry": wide_rows_per_entry,
-        "publish_turns_per_iteration": publish_entries + 1, "publish_sync_commits_per_iteration": publish_entries,
-        "reset_turns_per_iteration": reset_batches + 1, "reset_sync_commits_per_iteration": reset_batches,
-        "wide_publish_turns": 2, "wide_publish_sync_commits": 1,
-        "wide_reset_turns": 2, "wide_reset_sync_commits": 1,
+        "restore_calls_per_iteration": 1, "publish_sync_commits_per_iteration": 2 * publish_entries,
+        "reset_batches_per_iteration": reset_batches, "reset_sync_commits_per_iteration": reset_batches,
+        "wide_publish_sync_commits": 2,
+        "wide_reset_sync_commits": 1,
         "cases": ["postgres/publish", "postgres/reset", "postgres/publish_wide", "postgres/reset_wide", "mysql/publish", "mysql/reset", "mysql/publish_wide", "mysql/reset_wide"],
-        "timed_boundary": "restore and all publication-entry or reset-batch turns, apply, synchronous commit, AfterCommit, and retaining Actions for untimed validation",
+        "timed_boundary": "one read-only restore; each publish entry records and synchronously commits, ACKs maintenance, reads/decodes published front, then consumes with a second synchronous commit; each reset batch records, synchronously commits and ACKs maintenance; output Changes retained for untimed validation",
         "untimed": "Definition decoding, construction, Store creation/open, fixture encoding/seed, output and durable-state oracle, teardown",
         "external_io": "none; stops at Streaming or Fresh before connector start",
-        "limitations": "does not measure capture, connector polling, ACK, source cleanup, or full Flow output log writes"
+        "limitations": "does not measure capture, connector polling, real Delivery ACK, source cleanup, or Flow computation/routing"
     })).unwrap()).unwrap();
     println!("cdc_bootstrap artifacts: {}", root.path().display());
     let mut criterion = Criterion::default()

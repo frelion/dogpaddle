@@ -12,17 +12,17 @@ use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement:
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
-    operation::{Action, Operation, OperationInput, Turn, sink::SqliteSinkDefinition},
+    operation::{Operation, sink::SqliteSinkDefinition},
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Store, StoreSetup, Transactions};
+use dogpaddle_store::{ReadTransactions, Store, StoreSetup, Transactions};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use tempfile::TempDir;
 
 const BENCHMARK: &str = "buffered_sink";
 const TABLE: &str = "events";
-const MAX_TURNS: usize = 4_096;
+const MAX_STEPS: usize = 4_096;
 const CROSS_PAYLOAD_BYTES: usize = 4 * 1_024 * 1_024 + 4 * 1_024;
 const CROSS_MULTIPLICITY: i64 = 2;
 
@@ -69,14 +69,14 @@ impl Config {
 
 #[derive(Clone, Copy, Default)]
 struct RunStats {
-    turns: u64,
+    steps: u64,
     commits: u64,
     completions: u64,
 }
 
 impl AddAssign for RunStats {
     fn add_assign(&mut self, other: Self) {
-        self.turns += other.turns;
+        self.steps += other.steps;
         self.commits += other.commits;
         self.completions += other.completions;
     }
@@ -84,7 +84,8 @@ impl AddAssign for RunStats {
 
 enum Step {
     Idle,
-    Committed(Action),
+    Admitted,
+    Drained,
 }
 
 struct Fixture {
@@ -92,6 +93,7 @@ struct Fixture {
     schema: SchemaRef,
     operation: Option<Operation>,
     transactions: Option<Transactions>,
+    reads: Option<ReadTransactions>,
     sqlite_path: std::path::PathBuf,
     root: TempDir,
 }
@@ -114,87 +116,101 @@ impl Fixture {
         let transactions = setup
             .commit(sample.path().join("store"), |_| Ok(()))
             .expect("commit Sink setup");
+        let (transactions, reads) = transactions.split();
         let mut fixture = Self {
             definition,
             schema,
             operation: Some(operation),
             transactions: Some(transactions),
+            reads: Some(reads),
             sqlite_path,
             root: sample,
         };
         let initialized = fixture.drain();
-        assert_eq!((initialized.turns, initialized.commits), (3, 3));
+        assert_eq!((initialized.steps, initialized.commits), (1, 2));
         fixture.verify_empty();
         fixture
     }
 
-    fn process_claim(&mut self, change: &Change) -> RunStats {
+    fn enqueue(&mut self, change: &Change) -> RunStats {
         let mut stats = RunStats::default();
-        for _ in 0..MAX_TURNS {
+        for _ in 0..MAX_STEPS {
             match self.step(Some(change), &mut stats) {
-                Step::Committed(Action::Commit(None)) => {}
-                Step::Committed(Action::Complete(None)) => return stats,
-                Step::Committed(action) => panic!("unexpected buffered Sink action {action:?}"),
-                Step::Idle => panic!("buffered Sink idled with an offered Claim"),
+                Step::Drained => {}
+                Step::Admitted => return stats,
+                Step::Idle => panic!("Sink idled with offered input"),
             }
         }
-        panic!("buffered Sink failed to complete a bounded Claim")
+        panic!("buffered Sink failed to complete a bounded input")
     }
 
     fn drain(&mut self) -> RunStats {
         let mut stats = RunStats::default();
-        for _ in 0..MAX_TURNS {
+        for _ in 0..MAX_STEPS {
             match self.step(None, &mut stats) {
                 Step::Idle => return stats,
-                Step::Committed(Action::Commit(None)) => {}
-                Step::Committed(action) => {
-                    panic!("unexpected no-Claim buffered Sink action {action:?}")
-                }
+                Step::Drained => {}
+                Step::Admitted => panic!("drain cannot admit"),
             }
         }
         panic!("buffered Sink failed to drain bounded durable work")
     }
 
     fn round_trip(&mut self, positive: &Change, negative: &Change) -> RunStats {
-        let mut stats = self.process_claim(positive);
+        let mut stats = self.enqueue(positive);
         stats += self.drain();
-        stats += self.process_claim(negative);
+        stats += self.enqueue(negative);
         stats += self.drain();
         stats
     }
 
     fn step(&mut self, change: Option<&Change>, stats: &mut RunStats) -> Step {
-        let input = change.map(|change| OperationInput { port: 0, change });
-        let operation = self.operation.as_mut().expect("live Sink operation");
-        let Turn::Ready(prepared) = operation.turn(input).expect("prepare Sink turn") else {
+        let Operation::Sink(sink) = self.operation.as_mut().expect("live sink") else {
+            panic!("expected sink");
+        };
+        let writes = self.transactions.as_mut().expect("live writer");
+        if let Some(change) = change {
+            let txn = writes.begin();
+            if sink
+                .try_enqueue(txn.access(), change)
+                .expect("enqueue page")
+            {
+                txn.commit().expect("commit enqueue");
+                stats.steps += 1;
+                stats.commits += 1;
+                return Step::Admitted;
+            }
+        }
+        let pending = sink
+            .load(self.reads.as_ref().expect("reader").begin().access())
+            .expect("load prefix");
+        let Some(pending) = pending else {
             return Step::Idle;
         };
-        stats.turns += 1;
-        let transaction = self
-            .transactions
-            .as_mut()
-            .expect("live Sink transactions")
-            .begin();
-        let (action, completion) = prepared
-            .apply(transaction.access())
-            .expect("apply Sink turn");
-        if matches!(action, Action::Idle) {
-            drop(transaction);
-            drop(completion);
-            panic!("buffered Sink returned transactional Idle")
+        let prepared = sink.prepare(pending).expect("plan fixed IDs");
+        {
+            let txn = writes.begin();
+            sink.persist_prepared(txn.access(), &prepared)
+                .expect("persist prepared");
+            txn.commit().expect("commit prepared");
         }
-        transaction.commit().expect("commit Sink turn");
-        stats.commits += 1;
-        completion.run().expect("complete Sink turn");
+        sink.deliver(&prepared).expect("deliver target");
+        {
+            let txn = writes.begin();
+            sink.settle(txn.access(), &prepared).expect("settle prefix");
+            txn.commit().expect("commit settlement");
+        }
+        stats.steps += 1;
+        stats.commits += 2;
         stats.completions += 1;
-        Step::Committed(action)
+        Step::Drained
     }
 
     fn admit_changes(&mut self, changes: &[Change]) -> RunStats {
         let mut total = RunStats::default();
         for change in changes {
-            let stats = self.process_claim(change);
-            assert_eq!((stats.turns, stats.commits, stats.completions), (1, 1, 1));
+            let stats = self.enqueue(change);
+            assert_eq!((stats.steps, stats.commits, stats.completions), (1, 1, 0));
             total += stats;
         }
         total
@@ -203,15 +219,18 @@ impl Fixture {
     fn reopen(&mut self) {
         drop(self.operation.take());
         drop(self.transactions.take());
+        drop(self.reads.take());
         let store = Store::open(self.root.path().join("store")).expect("reopen Sink store");
         self.operation = Some(construct_reopened(&self.definition, &self.schema, &store));
-        self.transactions = Some(store.into_transactions());
+        let (writes, reads) = store.into_transactions().split();
+        self.transactions = Some(writes);
+        self.reads = Some(reads);
     }
 
     fn verify_empty(&mut self) {
         let mut stats = RunStats::default();
         assert!(matches!(self.step(None, &mut stats), Step::Idle));
-        assert_eq!(stats.turns, 0);
+        assert_eq!(stats.steps, 0);
         let connection =
             Connection::open_with_flags(&self.sqlite_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .expect("open benchmark SQLite target");
@@ -288,10 +307,9 @@ fn benchmark_round_trip(
     group.throughput(Throughput::Elements(events));
     let mut fixture = Fixture::new(root, scenario, positive.records().schema());
     let warmup = fixture.round_trip(positive, negative);
-    let minimum_turns = 2 + 6 * minimum_batches_per_direction;
-    assert!(warmup.turns >= minimum_turns);
-    assert_eq!(warmup.turns, warmup.commits);
-    assert_eq!(warmup.commits, warmup.completions);
+    let minimum_steps = 2 + 2 * minimum_batches_per_direction;
+    assert!(warmup.steps >= minimum_steps);
+    assert_eq!(warmup.commits, warmup.steps + warmup.completions);
     fixture.verify_empty();
     group.bench_function(scenario, |bencher| {
         bencher.iter_custom(|iterations| {
@@ -300,9 +318,8 @@ fn benchmark_round_trip(
                 let started = Instant::now();
                 let stats = fixture.round_trip(positive, negative);
                 elapsed += started.elapsed();
-                assert!(stats.turns >= minimum_turns);
-                assert_eq!(stats.turns, stats.commits);
-                assert_eq!(stats.commits, stats.completions);
+                assert!(stats.steps >= minimum_steps);
+                assert_eq!(stats.commits, stats.steps + stats.completions);
                 fixture.verify_empty();
             }
             elapsed
@@ -328,7 +345,7 @@ fn benchmark_multi_entry(group: &mut BenchmarkGroup<'_, WallTime>, root: &RunRoo
     let mut fixture = Fixture::new(root, "multi_entry_batch", schema);
     let mut warmup = fixture.admit_changes(&changes);
     warmup += fixture.drain();
-    assert_eq!(warmup.turns, entries_u64 + 3);
+    assert_eq!(warmup.steps, entries_u64 + 1);
     fixture.verify_empty();
     group.bench_function(BenchmarkId::new("multi_entry_batch", entries), |bencher| {
         bencher.iter_custom(|iterations| {
@@ -338,9 +355,8 @@ fn benchmark_multi_entry(group: &mut BenchmarkGroup<'_, WallTime>, root: &RunRoo
                 let mut stats = fixture.admit_changes(&changes);
                 stats += fixture.drain();
                 elapsed += started.elapsed();
-                assert_eq!(stats.turns, entries_u64 + 3);
-                assert_eq!(stats.turns, stats.commits);
-                assert_eq!(stats.commits, stats.completions);
+                assert_eq!(stats.steps, entries_u64 + 1);
+                assert_eq!(stats.commits, stats.steps + stats.completions);
                 fixture.verify_empty();
             }
             elapsed
@@ -365,21 +381,18 @@ fn benchmark_restore_validation(
     let mut fixture = Fixture::new(root, "restore_validation", schema);
 
     let staged = fixture.admit_changes(&changes);
-    assert_eq!(staged.turns, entries_u64);
+    assert_eq!(staged.steps, entries_u64);
     fixture.reopen();
     let mut restored = RunStats::default();
-    assert!(matches!(
-        fixture.step(None, &mut restored),
-        Step::Committed(Action::Commit(None))
-    ));
+    assert!(matches!(fixture.step(None, &mut restored), Step::Drained));
     assert_eq!(
-        (restored.turns, restored.commits, restored.completions),
-        (1, 1, 1)
+        (restored.steps, restored.commits, restored.completions),
+        (1, 2, 1)
     );
     let drained = fixture.drain();
     assert_eq!(
-        (drained.turns, drained.commits, drained.completions),
-        (3, 3, 3)
+        (drained.steps, drained.commits, drained.completions),
+        (0, 0, 0)
     );
     fixture.verify_empty();
 
@@ -388,25 +401,22 @@ fn benchmark_restore_validation(
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
                 let staged = fixture.admit_changes(&changes);
-                assert_eq!(staged.turns, entries_u64);
+                assert_eq!(staged.steps, entries_u64);
 
                 let started = Instant::now();
                 fixture.reopen();
                 let mut restored = RunStats::default();
-                assert!(matches!(
-                    fixture.step(None, &mut restored),
-                    Step::Committed(Action::Commit(None))
-                ));
+                assert!(matches!(fixture.step(None, &mut restored), Step::Drained));
                 elapsed += started.elapsed();
                 assert_eq!(
-                    (restored.turns, restored.commits, restored.completions),
-                    (1, 1, 1)
+                    (restored.steps, restored.commits, restored.completions),
+                    (1, 2, 1)
                 );
 
                 let drained = fixture.drain();
                 assert_eq!(
-                    (drained.turns, drained.commits, drained.completions),
-                    (3, 3, 3)
+                    (drained.steps, drained.commits, drained.completions),
+                    (0, 0, 0)
                 );
                 fixture.verify_empty();
             }
@@ -434,21 +444,21 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
             "warmup_ms": config.warmup.as_millis(),
             "measurement_ms": config.measurement.as_millis(),
             "timed_boundaries": {
-                "steady_small_admission_drain": "positive and negative Claim admission plus every load/plan/deliver/settle turn, synchronous Store commit, and AfterCommit target write",
-                "multi_entry_batch": "all per-Claim durable admissions followed by every load/plan/deliver/settle turn; no reopen is part of this case",
-                "restore_validation": "Store reopen, Operation bind/materialize, and the first no-Claim restore turn that validates the entire durable buffer and synchronously commits",
-                "large_payload_small_event": "positive and negative Claim admission plus full target delivery and settlement",
-                "large_payload_multiplicity_target_slicing": "positive and negative Claim admission plus full target delivery and settlement across at least two target-byte-bounded batches per direction",
-                "high_multiplicity_finite_capacity_churn": "positive and negative Claim admission plus all 1024-event target batches and settlements"
+                "steady_small_admission_drain": "positive and negative input admission plus every load/plan/deliver/settle step, synchronous Store commit, and explicit target delivery",
+                "multi_entry_batch": "all per-input durable admissions followed by every load/plan/deliver/settle step; no reopen is part of this case",
+                "restore_validation": "Store reopen, Operation bind, and the first no-input drain step that validates the entire durable buffer and delivers/settles the first bounded prefix",
+                "large_payload_small_event": "positive and negative input admission plus full target delivery and settlement",
+                "large_payload_multiplicity_target_slicing": "positive and negative input admission plus full target delivery and settlement across at least two target-byte-bounded batches per direction",
+                "high_multiplicity_finite_capacity_churn": "positive and negative input admission plus all 1024-event target batches and settlements"
             },
             "untimed_boundaries": {
                 "all_cases": "fixture and target initialization, Criterion warmup validation, target relation oracle, and teardown",
-                "restore_validation": "durable input staging before reopen and delivery/settlement after the first validated restore turn"
+                "restore_validation": "durable input staging before reopen and delivery/settlement after the first validated restore step"
             },
             "cases": {
-                "steady_small_admission_drain": "each small Claim admitted and fully drained before the next",
-                "multi_entry_batch": "multiple complete Claims admitted before one delivery, with admission included in the timed sample",
-                "restore_validation": "reopen a staged multi-entry schema-bound buffer and validate all retained entries in the first restore turn",
+                "steady_small_admission_drain": "each small input admitted and fully drained before the next",
+                "multi_entry_batch": "multiple complete inputs admitted before one delivery, with admission included in the timed sample",
+                "restore_validation": "reopen a staged multi-entry schema-bound buffer and validate all retained entries in the first restore step",
                 "large_payload_small_event": "one large UTF-8 value with unit multiplicity",
                 "large_payload_multiplicity_target_slicing": "a 4 MiB-plus UTF-8 value at multiplicity two, forcing at least two target-byte-bounded batches without unbounded amplification",
                 "high_multiplicity_finite_capacity_churn": "one logical row split across bounded 1024-event SQLite deliveries"

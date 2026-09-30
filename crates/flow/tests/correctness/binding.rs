@@ -1,4 +1,4 @@
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 
 use arrow_schema::{DataType, TimeUnit};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
@@ -13,11 +13,10 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::{Cell, Store, StoreError, SubscribedLog};
+use dogpaddle_store::{Cell, Store, StoreError};
 
 use super::support::{read_published_definition, rewrite_checksum};
 
-const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024 * 1_024).unwrap();
 const OWNER_IDENTITY: [u8; 32] = [0xa5; 32];
 
 #[test]
@@ -32,8 +31,6 @@ fn build_reports_the_exact_projection_schema_rejection_without_creating_a_store(
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [project]);
-    factory.materialize(scan, CAPACITY);
-    factory.materialize(project, CAPACITY);
 
     let Err(error @ FlowError::Schema { .. }) = factory.build() else {
         panic!("schema-incompatible Flow did not return FlowError::Schema");
@@ -56,9 +53,6 @@ fn build_reports_a_multi_input_schema_rejection_without_store_side_effects() {
         [left, right],
     );
     factory.operation("sink", DiscardDefinition::new(), [union]);
-    for station in [left, right_scan, right, union] {
-        factory.materialize(station, CAPACITY);
-    }
 
     let Err(error @ FlowError::Schema { .. }) = factory.build() else {
         panic!("schema-incompatible UnionAll Flow unexpectedly built");
@@ -107,8 +101,6 @@ fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources()
         [scan],
     );
     factory.operation("sink", DiscardDefinition::new(), [project]);
-    factory.materialize(scan, CAPACITY);
-    factory.materialize(project, CAPACITY);
 
     drop(factory.build().unwrap());
 
@@ -167,9 +159,6 @@ fn open_rebinds_decoded_multi_input_definitions() {
         [left, right],
     );
     factory.operation("sink", DiscardDefinition::new(), [union]);
-    for station in [left_scan, left, right_scan, right, union] {
-        factory.materialize(station, CAPACITY);
-    }
 
     drop(factory.build().unwrap());
 
@@ -241,9 +230,6 @@ fn select_and_repeated_input_union_run_across_reopen() {
     );
     let count = factory.operation("count", RunningEventCountDefinition::new(), [union]);
     factory.operation("sink", DiscardDefinition::new(), [count]);
-    for station in [scan, select, union, count] {
-        factory.materialize(station, CAPACITY);
-    }
 
     drop(factory.build().unwrap());
 
@@ -252,38 +238,21 @@ fn select_and_repeated_input_union_run_across_reopen() {
     drop(flow);
 
     let mut flow = FlowFactory::new(&path).open().unwrap();
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
-    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    super::support::run_until_idle(&mut flow);
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let select_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000001/output").unwrap();
-    let union_active: Cell<u32> = store.open_data("station/00000002/active-input").unwrap();
-    let union_output: SubscribedLog<Vec<u8>> = store.open_data("station/00000002/output").unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000003/operation/00000000/running_event_count.count")
+        .open_data("operation/00000003/running_event_count.count")
         .unwrap();
-    assert!(matches!(
-        store.open_data::<Cell<u32>>("station/00000001/active-input"),
-        Err(StoreError::DataNotFound(name)) if name == "station/00000001/active-input"
-    ));
-    let transaction = store.read_transaction();
-    let access = transaction.access();
-    assert_eq!(count.read(access).unwrap().get().unwrap(), Some(2));
-    assert_eq!(union_active.read(access).unwrap().get().unwrap(), Some(0));
-    let select_status = select_output.writer().status(access).unwrap();
-    assert_eq!((select_status.head, select_status.tail), (1, 1));
-    for subscriber in 0..2 {
-        let status = select_output
-            .subscription(subscriber)
-            .status(access)
-            .unwrap();
-        assert_eq!((status.position, status.tail), (1, 1));
-    }
-    let union_status = union_output.writer().status(access).unwrap();
-    assert_eq!((union_status.head, union_status.tail), (2, 2));
-    let count_input = union_output.subscription(0).status(access).unwrap();
-    assert_eq!((count_input.position, count_input.tail), (2, 2));
+    assert_eq!(
+        count
+            .read(store.read_transaction().access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        Some(2)
+    );
 }
 
 #[test]
@@ -354,9 +323,6 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     );
     let count = factory.operation("count", RunningEventCountDefinition::new(), [filter]);
     factory.operation("sink", DiscardDefinition::new(), [count]);
-    for station in [scan, align, project, select, extend, filter, count] {
-        factory.materialize(station, CAPACITY);
-    }
 
     let mut flow = factory.build().unwrap();
     assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
@@ -369,7 +335,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
 
     let store = Store::open(&path).unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000006/operation/00000000/running_event_count.count")
+        .open_data("operation/00000006/running_event_count.count")
         .unwrap();
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
@@ -392,9 +358,6 @@ fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
     );
     let count = factory.operation("count", RunningEventCountDefinition::new(), [project]);
     factory.operation("sink", DiscardDefinition::new(), [count]);
-    for station in [scan, project, count] {
-        factory.materialize(station, CAPACITY);
-    }
 
     drop(factory.build().unwrap());
 
@@ -414,10 +377,8 @@ fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
     drop(flow);
 
     let store = Store::open(&path).unwrap();
-    let project_output: SubscribedLog<Vec<u8>> =
-        store.open_data("station/00000001/output").unwrap();
     let count: Cell<u64> = store
-        .open_data("station/00000002/operation/00000000/running_event_count.count")
+        .open_data("operation/00000002/running_event_count.count")
         .unwrap();
     assert!(matches!(
         store.open_data::<Cell<u32>>("station/00000001/active-input"),
@@ -428,21 +389,18 @@ fn empty_projection_schema_runs_through_count_and_discard_across_reopen() {
         count.read(transaction.access()).unwrap().get().unwrap(),
         Some(1)
     );
-    let project_output = project_output
-        .writer()
-        .status(transaction.access())
-        .unwrap();
-    assert_eq!((project_output.head, project_output.tail), (1, 1));
 }
 
 fn assert_projection_field_rejection(error: &FlowError) {
     let FlowError::Schema {
-        station_id, source, ..
+        operation_id,
+        source,
+        ..
     } = error
     else {
         panic!("expected Flow Schema error");
     };
-    assert_eq!(station_id, "project");
+    assert_eq!(operation_id, "project");
     let OperationBindError::Rejected { source } = source else {
         panic!("Project returned a non-concrete Schema binding error");
     };
@@ -454,12 +412,14 @@ fn assert_projection_field_rejection(error: &FlowError) {
 
 fn assert_union_schema_mismatch(error: &FlowError, input: usize) {
     let FlowError::Schema {
-        station_id, source, ..
+        operation_id,
+        source,
+        ..
     } = error
     else {
         panic!("expected Flow Schema error");
     };
-    assert_eq!(station_id, "union");
+    assert_eq!(operation_id, "union");
     let OperationBindError::Rejected { source } = source else {
         panic!("UnionAll returned a non-concrete Schema binding error");
     };
@@ -472,12 +432,14 @@ fn assert_union_schema_mismatch(error: &FlowError, input: usize) {
 
 fn assert_sqlite_identifier_collision(error: &FlowError) {
     let FlowError::Schema {
-        station_id, source, ..
+        operation_id,
+        source,
+        ..
     } = error
     else {
         panic!("expected Flow Schema error");
     };
-    assert_eq!(station_id, "sqlite");
+    assert_eq!(operation_id, "sqlite");
     let OperationBindError::Rejected { source } = source else {
         panic!("SQLite identifier collision returned the wrong binding error");
     };
@@ -503,8 +465,6 @@ fn build_select_sqlite_flow(
         SqliteSinkDefinition::try_new(sqlite_path, "events").unwrap(),
         [select],
     );
-    factory.materialize(scan, CAPACITY);
-    factory.materialize(select, CAPACITY);
 
     factory.build()
 }

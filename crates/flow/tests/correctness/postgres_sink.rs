@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, path::Path};
+use std::path::Path;
 
 use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::{
@@ -13,10 +13,9 @@ use dogpaddle_operation::{
 };
 use dogpaddle_store::{Cell, OrderedMap, Store};
 
-const CAPACITY: NonZeroU64 = NonZeroU64::new(1_024).unwrap();
 const SINK: &str = "postgres";
-const CONTROL: &str = "station/00000001/operation/00000000/sink.control";
-const BUFFER: &str = "station/00000001/operation/00000000/sink.buffer";
+const CONTROL: &str = "operation/00000001/sink.control";
+const BUFFER: &str = "operation/00000001/sink.buffer";
 
 fn config() -> PostgresSinkConfig {
     PostgresSinkConfig::new_unencrypted("127.0.0.1", 1, "database", "writer", "secret-not-durable")
@@ -33,42 +32,41 @@ fn factory(path: &Path) -> FlowFactory {
     let mut factory = FlowFactory::new(path);
     let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
     factory.operation(SINK, definition(), [scan]);
-    factory.materialize(scan, CAPACITY);
 
     factory
 }
 
 #[test]
-fn postgres_sink_resource_errors_are_station_scoped_and_precede_store_creation() {
+fn postgres_sink_resource_errors_are_operation_scoped_and_precede_store_creation() {
     let root = tempfile::tempdir().unwrap();
 
     let missing_path = root.path().join("missing");
     let Err(FlowError::RuntimeResource {
-        station_id,
+        operation_id,
         source: OperationSetupError::MissingRuntimeResource,
     }) = factory(&missing_path).build()
     else {
         panic!("missing PostgreSQL sink resource was accepted");
     };
-    assert_eq!(station_id, SINK);
+    assert_eq!(operation_id, SINK);
     assert!(!missing_path.exists());
 
     let wrong_path = root.path().join("wrong");
     let mut wrong = factory(&wrong_path);
     wrong.resource(SINK, 42_u64).unwrap();
     let Err(FlowError::RuntimeResource {
-        station_id,
+        operation_id,
         source: OperationSetupError::WrongRuntimeResource,
     }) = wrong.build()
     else {
         panic!("wrong PostgreSQL sink resource type was accepted");
     };
-    assert_eq!(station_id, SINK);
+    assert_eq!(operation_id, SINK);
     assert!(!wrong_path.exists());
 }
 
 #[test]
-fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
+fn postgres_sink_schema_rejection_is_pure_and_operation_scoped() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let invalid_name = "x".repeat(64);
@@ -80,18 +78,18 @@ fn postgres_sink_schema_rejection_is_pure_and_station_scoped() {
         [scan],
     );
     factory.operation(SINK, definition(), [select]);
-    factory.materialize(scan, CAPACITY);
-    factory.materialize(select, CAPACITY);
 
     factory.resource(SINK, config()).unwrap();
 
     let Err(FlowError::Schema {
-        station_id, source, ..
+        operation_id,
+        source,
+        ..
     }) = factory.build()
     else {
         panic!("PostgreSQL-incompatible field name unexpectedly bound");
     };
-    assert_eq!(station_id, SINK);
+    assert_eq!(operation_id, SINK);
     let OperationBindError::Rejected { source } = source else {
         panic!("PostgreSQL field-name rejection returned the wrong binding error");
     };
@@ -114,9 +112,9 @@ fn postgres_sink_build_and_reopen_are_offline_and_use_stable_buffered_state() {
     assert!(matches!(
         FlowFactory::new(&path).open(),
         Err(FlowError::RuntimeResource {
-            station_id,
+            operation_id,
             source: OperationSetupError::MissingRuntimeResource,
-        }) if station_id == SINK
+        }) if operation_id == SINK
     ));
 
     for _ in 0..2 {

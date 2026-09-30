@@ -21,7 +21,6 @@ pub(crate) const TAG: u16 = 16;
 
 pub(super) const LEFT_ROWS: &str = "equi_join.left_rows";
 pub(super) const RIGHT_ROWS: &str = "equi_join.right_rows";
-pub(super) const CONTINUATION: &str = "equi_join.continuation";
 pub(super) const KEY_COUNTS: &str = "equi_join.key_counts";
 pub(super) const MATCH_COUNTS: &str = "equi_join.match_counts";
 
