@@ -5,10 +5,10 @@
 //! planning, type derivation, nullability, and evaluation belong to
 //! `DataFusion`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow_schema::{ArrowError, DataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Metadata, SchemaRef};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use datafusion_common::{
     DFSchema, DataFusionError,
@@ -102,7 +102,7 @@ pub(crate) struct BoundExpression {
     physical: Arc<dyn PhysicalExpr>,
     output_type: DataType,
     output_nullable: bool,
-    output_metadata: HashMap<String, String>,
+    output_metadata: Metadata,
 }
 
 /// A group of expressions bound to one exact input Schema.
@@ -467,7 +467,7 @@ impl BoundExpression {
         self.output_nullable
     }
 
-    pub(crate) const fn output_metadata(&self) -> &HashMap<String, String> {
+    pub(crate) const fn output_metadata(&self) -> &Metadata {
         &self.output_metadata
     }
 

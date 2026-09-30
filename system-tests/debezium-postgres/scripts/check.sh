@@ -80,10 +80,10 @@ test -f "$runtime_distribution/MANIFEST"
 test -f "$runtime_distribution/SHA256SUMS"
 test -f "$runtime_distribution/bom.json"
 test -f "$runtime_distribution/lib/dogpaddle-debezium-bridge.jar"
-test -f "$runtime_distribution/lib/debezium-connector-postgres-3.6.2.Final.jar"
+test -f "$runtime_distribution/lib/debezium-connector-postgres-3.6.3.Final.jar"
 test -f "$runtime_bundle/runtime/lib/server/libjvm.so"
 test -f "$runtime_bundle/runtime-sbom.json"
-test -f "$runtime_bundle/debezium/lib/debezium-connector-postgres-3.6.2.Final.jar"
+test -f "$runtime_bundle/debezium/lib/debezium-connector-postgres-3.6.3.Final.jar"
 
 "$script_dir/run.sh" \
   --bundle "$runtime_bundle" \

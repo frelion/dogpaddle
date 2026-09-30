@@ -17,30 +17,30 @@ exclude = ["system-tests/debezium-postgres/host"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
-arrow-array = "=59.3.0"
-arrow-buffer = "=59.3.0"
-arrow-data = "=59.3.0"
-arrow-ipc = "=59.3.0"
-arrow-schema = "=59.3.0"
-arrow-select = "=59.3.0"
+arrow-array = "=60.0.0"
+arrow-buffer = "=60.0.0"
+arrow-data = "=60.0.0"
+arrow-ipc = "=60.0.0"
+arrow-schema = "=60.0.0"
+arrow-select = "=60.0.0"
 base64 = "=0.23.1"
 blake3 = "=1.8.7"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
-crc32fast = "=1.5.1"
+crc32fast = "=1.5.2"
 ctrlc = "=3.5.2"
-datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
-datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "82335b426d8851db6a7b965f3d43053c585cabfd", default-features = false }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "b631f2c7d92d0a38637a8d8ae980e2474b891f34", default-features = false }
 dogpaddle-change = { path = "crates/change" }
 dogpaddle-debezium = { path = "crates/debezium" }
 dogpaddle-flow = { path = "crates/flow" }
@@ -52,7 +52,7 @@ dhat = "=0.3.3"
 flatbuffers = { version = "=25.12.19", default-features = false }
 rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
 jni = { version = "=0.22.4", features = ["invocation"] }
-mysql = { version = "=28.0.2", default-features = false, features = ["minimal-rust"] }
+mysql = { version = "=28.0.3", default-features = false, features = ["minimal-rust"] }
 percent-encoding = "=2.3.2"
 postgres = "=0.19.14"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache", "hooks"] }
@@ -60,7 +60,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 bincode = { version = "=2.0.1", default-features = false, features = ["std", "serde"] }
 sha2 = { version = "=0.11.0", default-features = false }
-thiserror = "=2.0.20"
+thiserror = "=2.0.21"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["rt", "time"] }
 tokio-postgres = "=0.7.18"

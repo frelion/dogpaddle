@@ -383,7 +383,7 @@ def main() -> None:
         bundle = absolute_existing(args.bundle, "--bundle")
         if not bundle.is_dir():
             raise ValueError(f"--bundle is not a directory: {bundle}")
-        mysql_connector = bundle / "debezium/lib/debezium-connector-mysql-3.6.2.Final.jar"
+        mysql_connector = bundle / "debezium/lib/debezium-connector-mysql-3.6.3.Final.jar"
         if not mysql_connector.is_file():
             raise ValueError(f"--bundle lacks the pinned MySQL connector: {bundle}")
         if not COMPOSE_FILE.is_file():

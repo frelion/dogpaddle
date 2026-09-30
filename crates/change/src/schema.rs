@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Metadata, Schema};
 use thiserror::Error;
 
 /// Maximum number of nested Arrow List or Struct boundaries.
@@ -312,7 +312,7 @@ pub(crate) const fn valid_decimal128_parameters(precision: u8, scale: i8) -> boo
 }
 
 fn validate_metadata(
-    metadata: &HashMap<String, String>,
+    metadata: &Metadata,
     path: &[&str],
     budget: &mut SchemaBudget,
 ) -> Result<(), SchemaError> {

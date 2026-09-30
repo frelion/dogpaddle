@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DEBEZIUM_TAG="v3.6.2.Final"
-readonly DEBEZIUM_COMMIT="02810e25b19c04e5095b2b6fbbdcbae549a69f19"
+readonly DEBEZIUM_TAG="v3.6.3.Final"
+readonly DEBEZIUM_COMMIT="8ee69a6972ae1ab50b90550a0b5bef082ff8bdd3"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 crate_dir="$(cd -- "$script_dir/.." && pwd)"

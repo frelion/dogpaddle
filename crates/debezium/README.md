@@ -236,7 +236,7 @@ checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-test
 
 ## 版本边界
 
-当前固定 Debezium `3.6.2.Final`、Kafka Connect `4.3.0`、Java 17 bytecode、Eclipse Temurin JRE
+当前固定 Debezium `3.6.3.Final`、Kafka Connect `4.3.0`、Java 17 bytecode、Eclipse Temurin JRE
 `21.0.12.1+1` 和 `jni-rs` `0.22.4`。checkpoint framing、delivery wire、JNI commands、bundle layout、
 offset converter 和 ACK 语义都是开发期 v1 持久或运行协议。
 

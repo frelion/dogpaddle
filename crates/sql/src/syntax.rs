@@ -1,3 +1,4 @@
+use datafusion_common::config::SqlParserOptions;
 use std::ops::ControlFlow;
 
 use crate::{
@@ -18,7 +19,9 @@ use datafusion_sql::sqlparser::{
 
 pub(crate) fn parse(sql: &str) -> Result<(SinkEndpoint, Query, Vec<ScanEndpoint>), SqlError> {
     let dialect = GenericDialect {};
-    let mut parser = Parser::new(&dialect).try_with_sql(sql)?;
+    let mut parser = Parser::new(&dialect)
+        .with_recursion_limit(SqlParserOptions::default().recursion_limit.get())
+        .try_with_sql(sql)?;
     parser.expect_keyword(Keyword::INSERT)?;
     parser.expect_keyword(Keyword::INTO)?;
     let sink = match parser.parse_expr()? {

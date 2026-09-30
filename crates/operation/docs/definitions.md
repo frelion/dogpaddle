@@ -35,7 +35,7 @@ Schema bind 必须通过 DataFusion `create_physical_expr` 建立 exact-input-Sc
 DogPaddle 只负责 Definition/Flow 边界、完整 Schema guard 及 Change 语义。
 
 DataFusion Expr protobuf 是 Expression payload 的版本绑定格式，不承诺跨 DataFusion 版本兼容。
-工作区全部 DataFusion direct/transitive crate 必须精确 pin 到 `82335b426d8851db6a7b965f3d43053c585cabfd`，并保持唯一 Arrow 59.3.0 与 sqlparser 0.62.0 类型族；升级时必须审查 ASOF logical lowering、proto roundtrip、physical planning 和执行语义。
+工作区全部 DataFusion direct/transitive crate 必须精确 pin 到 `b631f2c7d92d0a38637a8d8ae980e2474b891f34`，并保持唯一 Arrow 60.0.0 与 sqlparser 0.63.0 类型族；升级时必须审查 ASOF logical lowering、proto roundtrip、physical planning 和执行语义。
 开发期持久格式始终按 v1 处理；DataFusion 升级若改变 payload 或执行语义，应更新 v1 golden 与 reopen 证据，并重建受影响的 Flow，不增加旧表达式识别、迁移或兼容分支。
 Filter 的 tag 是 5，output Schema 精确等于 input，只保留 non-null true；全删返回 `None`，部分筛选必须用同一 predicate 保持 records/diffs 对齐。
 Filter 与投影不声明 Operation data；公共证据覆盖 proto golden/roundtrip、静态拒绝无目录副作用、decoded Definition 的 construct/apply、open 重新构造、Filter 空/全量/部分选择与混合 diff 重批，以及投影 Schema metadata/nullability 和 Array/diff 共享。

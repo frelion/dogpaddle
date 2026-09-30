@@ -59,6 +59,8 @@ dogpaddle run /etc/dogpaddle/orders.sql --state /var/lib/dogpaddle/orders
 
 没有 `check`、`status`、`init`、`reset`、`build` 或 `open` 子命令。
 
+SQL 解析使用 `DataFusion` 默认的递归预算；超出预算的嵌套查询、表达式或类型在解析阶段被拒绝。
+
 Rust 嵌入接口同样只有一个生命周期入口：
 
 ```rust,no_run

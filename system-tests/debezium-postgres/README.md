@@ -26,12 +26,12 @@ DebeziumRuntime::open(bundle_root)
   -> DebeziumRuntime::start(config, optional_checkpoint)
   -> Connector::poll(timeout)
   -> Delivery::{records, checkpoint}
-  -> Delivery::ack()
+  -> Connector::ack(delivery)
   -> Connector::stop(timeout)
 ```
 
 The host copies record bytes and the opaque `Checkpoint` only to render
-diagnostic JSON. A returned `Delivery` then falls out of scope without ACK;
+diagnostic JSON. The returned owned `Delivery` then falls out of scope without ACK;
 polling again must yield the same records and checkpoint. The JSON `token` is
 allocated by this test host and is run-local. It is not a product delivery ID
 and is never passed through the product boundary.
@@ -41,13 +41,14 @@ The host protocol deliberately splits durability from acknowledgement:
 1. `poll` observes a delivery and its pre-ACK checkpoint.
 2. `save` atomically replaces `/state/checkpoint.bin` with those opaque bytes.
 3. `ack TOKEN` re-polls the same product `Delivery`, verifies its bytes and
-   checkpoint are unchanged, and consumes `Delivery::ack()`.
+   checkpoint are unchanged, and passes that original owned capability to
+   `Connector::ack(delivery)`.
 4. `stop` never ACKs an outstanding delivery.
 
-`Delivery::ack()` settles the exact Kafka Connect offset-store update. It does
+`Connector::ack(delivery)` settles the exact Kafka Connect offset-store update. It does
 not promise that PostgreSQL's `confirmed_flush_lsn` has already changed when
 the Rust call returns: Debezium's Engine can defer the connector task commit,
-and Debezium 3.6.2 does not surface every `SourceTask.commit()` failure through
+and Debezium 3.6.3 does not surface every `SourceTask.commit()` failure through
 `markBatchFinished`. D1 therefore observes PostgreSQL advancement only after a
 subsequent source poll and/or graceful stop. This is eventual WAL-retention
 feedback, not part of DogPaddle's durability decision.
@@ -59,8 +60,8 @@ store and restores it solely from `Checkpoint`.
 
 ## Pinned environment
 
-- Debezium `3.6.2.Final`, upstream commit
-  `02810e25b19c04e5095b2b6fbbdcbae549a69f19`.
+- Debezium `3.6.3.Final`, upstream commit
+  `8ee69a6972ae1ab50b90550a0b5bef082ff8bdd3`.
 - Kafka Connect `4.3.0`.
 - PostgreSQL `16.15`, using `pgoutput`, one publication, and one persistent
   logical replication slot.
@@ -121,7 +122,7 @@ The real connector run must prove all of these:
 
 1. A normal poll timeout returns idle, and a later PostgreSQL transaction is
    still delivered.
-2. Dropping the borrowed `Delivery` and polling again returns identical
+2. Dropping the owned `Delivery` and polling again returns identical
    record bytes and checkpoint; no implicit ACK occurs.
 3. An unsaved, unacknowledged batch is replayed by a fresh Engine.
 4. Saving the batch's candidate checkpoint before ACK, stopping without ACK,
@@ -193,12 +194,13 @@ retained fixture:
 system-tests/debezium-postgres/scripts/clean.sh
 ```
 
-The current evidence and remaining boundaries are recorded in
-[`REPORT.md`](REPORT.md).
+The earlier Debezium 3.6.2 baseline evidence and remaining boundaries are
+recorded in [`REPORT.md`](REPORT.md). Rerun the gates above for the current pin;
+the historical report does not establish the result of a newer dependency.
 
 ## References
 
 - [Debezium Engine API](https://debezium.io/documentation/reference/3.6/development/engine.html)
-- [Debezium 3.6.2 release](https://debezium.io/releases/3.6/release-notes#release-3.6.2-final)
+- [Debezium 3.6.3 release](https://debezium.io/releases/3.6/release-notes#release-3.6.3-final)
 - [PostgreSQL connector LSN flush modes](https://debezium.io/documentation/reference/3.6/connectors/postgresql.html)
 - [RisingWave incident: uncheckpointed LSN advancement](https://github.com/risingwavelabs/risingwave/issues/25071)

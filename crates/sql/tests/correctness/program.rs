@@ -2,6 +2,25 @@ use dogpaddle_flow::FlowError;
 use dogpaddle_sql::{SqlError, SqlProgram};
 
 #[test]
+fn nested_expressions_parse_within_the_budget_and_excess_depth_is_rejected() {
+    use datafusion_sql::sqlparser::parser::ParserError;
+
+    for (depth, accepted) in [(16, true), (128, false)] {
+        let expression = format!("{}value{}", "(".repeat(depth), ")".repeat(depth));
+        let sql = format!("INSERT INTO discard() SELECT {expression} FROM sequence(start => 0)");
+        let result = SqlProgram::parse(&sql);
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(SqlError::Parse(ParserError::RecursionLimitExceeded))
+            ));
+        }
+    }
+}
+
+#[test]
 fn bundled_sql_examples_parse_through_the_public_file_api() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")

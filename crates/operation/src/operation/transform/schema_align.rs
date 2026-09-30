@@ -316,23 +316,14 @@ impl SchemaAlignDefinition {
                     expression.output_type().clone(),
                     target.nullable,
                 )
-                .with_metadata(
-                    target
-                        .metadata
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                ),
+                .with_metadata(target.metadata.clone()),
             ));
             expressions.push(expression);
         }
 
         let output_schema = Arc::new(Schema::new_with_metadata(
             output_fields,
-            self.metadata
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+            self.metadata.clone(),
         ));
         let operation = BoundProjection::new(
             Arc::clone(input_schema),

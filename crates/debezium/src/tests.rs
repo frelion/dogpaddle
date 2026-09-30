@@ -13,7 +13,7 @@ const FIXTURE_JARS: &[&str] = &[
     "connect-api-4.3.0.jar",
     "connect-json-4.3.0.jar",
     "connect-runtime-4.3.0.jar",
-    "debezium-embedded-3.6.2.Final.jar",
+    "debezium-embedded-3.6.3.Final.jar",
     "dogpaddle-debezium-bridge.jar",
     "slf4j-simple-1.7.36.jar",
 ];
@@ -266,7 +266,7 @@ fn write_fake_distribution(root: &std::path::Path) {
         concat!(
             "dogpaddle.debezium.distribution=1\n",
             "bridge.protocol=1\n",
-            "debezium.version=3.6.2.Final\n",
+            "debezium.version=3.6.3.Final\n",
             "kafka.connect.version=4.3.0\n",
         ),
     )

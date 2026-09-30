@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, io::Write, sync::Arc};
+use std::{fmt, io::Write, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{
@@ -7,7 +7,7 @@ use arrow_ipc::{
     TimeUnit as IpcTimeUnit, Type as IpcType, root_as_message_with_opts,
     writer::{IpcWriteOptions, StreamWriter},
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Metadata, Schema, SchemaRef, TimeUnit};
 
 use super::CodecError;
 use crate::{
@@ -472,7 +472,7 @@ fn parse_metadata<'a>(
     >,
     owner: MetadataOwner<'_>,
     budget: &mut SchemaParseBudget,
-) -> Result<HashMap<String, String>, CodecError> {
+) -> Result<Metadata, CodecError> {
     let metadata_len = metadata.as_ref().map_or(0, flatbuffers::Vector::len);
     budget.metadata_entries = budget
         .metadata_entries
@@ -483,7 +483,7 @@ fn parse_metadata<'a>(
                 "physical Arrow Schema metadata exceeds {MAX_PHYSICAL_METADATA_ENTRIES} total entries while reading {owner}"
             ))
         })?;
-    let mut parsed = HashMap::with_capacity(metadata_len);
+    let mut parsed = Metadata::new();
     let mut previous: Option<&str> = None;
     if let Some(metadata) = metadata {
         for pair in metadata {
