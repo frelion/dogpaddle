@@ -90,7 +90,7 @@ let outcome = flow.advance()?;
 
 `start` 不会在恢复失败后回退为构建。状态不完整、损坏、被占用或属于另一份 Program 时都会失败，已有目录和数据保持不动。低层 Rust 用户若要直接声明 Operation 和拓扑，使用 `dogpaddle-flow` 的 `FlowFactory::build/open`。
 
-`start` 在一次入口中解析 endpoint、计算身份并建立 `FlowFactory`。已存在状态只注入运行资源并 `open`；新状态先做发现和 DataFusion 规划，再向同一 Factory 声明算子并 `build`。
+`start` 在一次入口中解析 endpoint、计算身份并建立 `FlowFactory`。已存在状态只注入运行资源并 `open`；新状态先做发现和 `DataFusion` 规划，再向同一 Factory 声明算子并 `build`。
 
 状态路径必须是 UTF-8。`start` 会创建缺失的父目录，并在派生外部资源身份前规范化路径。每次调用会把所有 endpoint 参数解析成一份临时快照；后续身份计算、发现和 build/open 都只读取这份快照，因此一次启动不会混用凭据轮换前后的值。
 
