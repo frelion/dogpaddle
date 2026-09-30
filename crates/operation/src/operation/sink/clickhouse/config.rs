@@ -264,7 +264,10 @@ impl ClickHouseTargetSpec {
     }
 
     pub(super) fn marker(&self) -> String {
-        format!("dogpaddle.clickhouse-sink.v1:{}", self.sink_id)
+        format!(
+            "dogpaddle.clickhouse-sink.event-address.v1:{}",
+            self.sink_id
+        )
     }
 }
 

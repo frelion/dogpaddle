@@ -24,6 +24,16 @@ use crate::{decode_definition, encode_definition};
 const DATABASE_UUID: &str = "12345678-1234-1234-1234-123456789abc";
 
 #[test]
+fn target_identity_marks_the_event_address_semantics() {
+    assert_eq!(
+        ClickHouseTargetSpec::try_new("sink", "db", "table", DATABASE_UUID)
+            .unwrap()
+            .marker(),
+        "dogpaddle.clickhouse-sink.event-address.v1:sink"
+    );
+}
+
+#[test]
 fn definition_round_trips_canonically() {
     let definition = ClickHouseSinkDefinition::try_new(
         ClickHouseTargetSpec::try_new("sink_1", "analytics", "materialized", DATABASE_UUID)

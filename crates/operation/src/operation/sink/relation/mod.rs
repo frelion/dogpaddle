@@ -2,7 +2,7 @@
 
 mod plan;
 
-pub(crate) use plan::prepare;
+pub(crate) use plan::{prepare, recover};
 
 use std::collections::BTreeMap;
 
@@ -11,10 +11,7 @@ use arrow_schema::{Field, SchemaRef};
 use dogpaddle_change::Change;
 use thiserror::Error;
 
-use crate::operation::{
-    OperationError,
-    sink::buffered::{DeliveryBatch, MAX_TARGET_BATCH_BYTES},
-};
+use crate::operation::{OperationError, sink::buffered::MAX_TARGET_BATCH_BYTES};
 
 pub(crate) use crate::operation::relation::{
     RowError, canonical_row_bounded, canonical_row_size_bounded, encode_canonical, row_hash,
@@ -22,8 +19,7 @@ pub(crate) use crate::operation::relation::{
 
 pub(crate) const MAX_MUTATIONS_PER_BATCH: usize = 1024;
 pub(crate) const FIRST_TECHNICAL_ID: u64 = 1;
-pub(crate) const MAX_TECHNICAL_ID: u64 = i64::MAX.unsigned_abs();
-const EXHAUSTED_ID: u64 = MAX_TECHNICAL_ID + 1;
+pub(crate) const MAX_TECHNICAL_ID: u64 = u64::MAX - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Insert {
@@ -42,6 +38,35 @@ pub(crate) struct Delete {
 pub(crate) struct Batch {
     pub inserts: Vec<Insert>,
     pub deletes: Vec<Delete>,
+}
+
+impl Batch {
+    pub(crate) fn negative_ids(&self) -> Vec<u64> {
+        self.deletes
+            .iter()
+            .map(|delete| delete.technical_id)
+            .collect()
+    }
+}
+
+/// Maps unsigned event positions to SQL BIGINT values while preserving order.
+pub(crate) fn encode_signed_id(id: u64) -> i64 {
+    i64::from_ne_bytes((id ^ (1_u64 << 63)).to_ne_bytes())
+}
+
+/// Decodes a SQL BIGINT event position and rejects the two domain sentinels.
+pub(crate) fn decode_signed_id(value: i64) -> Result<u64, OperationError> {
+    let id = u64::from_ne_bytes(value.to_ne_bytes()) ^ (1_u64 << 63);
+    validate_technical_id(id)?;
+    Ok(id)
+}
+
+pub(crate) fn validate_technical_id(id: u64) -> Result<(), OperationError> {
+    if (FIRST_TECHNICAL_ID..=MAX_TECHNICAL_ID).contains(&id) {
+        Ok(())
+    } else {
+        Err(invalid("technical ID is outside 1..u64::MAX"))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -236,141 +261,12 @@ pub(super) fn relation_event_bytes(
         .ok_or_else(|| invalid("target mutation byte charge exceeds u64"))
 }
 
-pub(crate) fn validate_admission(
-    input: &Change,
-    checkpoint: u64,
-    buffered_events: u64,
-) -> Result<(), OperationError> {
-    validate_next_id(checkpoint)?;
-    let positive_events = input
-        .diffs()
-        .values()
-        .iter()
-        .filter(|diff| **diff > 0)
-        .try_fold(0_u64, |total, diff| {
-            total
-                .checked_add(diff.unsigned_abs())
-                .ok_or_else(|| invalid("positive event count exceeds u64"))
-        })?;
-    if positive_events == 0 {
-        return Ok(());
-    }
-    let reserved = buffered_events
-        .checked_add(positive_events)
-        .ok_or_else(|| invalid("technical ID reservation exceeds u64"))?;
-    if reserved > EXHAUSTED_ID - checkpoint {
-        Err(invalid("technical ID capacity is exhausted"))
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn validate_recovery(
-    checkpoint: u64,
-    remaining_positive_events: u64,
-) -> Result<(), OperationError> {
-    validate_next_id(checkpoint)?;
-    if remaining_positive_events > EXHAUSTED_ID - checkpoint {
-        Err(invalid(
-            "buffered positive events exceed the remaining technical ID capacity",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn encode_checkpoint(checkpoint: u64, output: &mut Vec<u8>) {
-    output.extend(checkpoint.to_be_bytes());
-}
-
-pub(crate) fn decode_checkpoint(input: &mut &[u8]) -> Result<u64, OperationError> {
-    let checkpoint = u64::from_be_bytes(read(input)?);
-    validate_next_id(checkpoint)?;
-    Ok(checkpoint)
-}
-
-pub(crate) fn encode_plan(plan: &Batch, output: &mut Vec<u8>) {
-    output.push(1);
-    output.extend(
-        u16::try_from(plan.inserts.len())
-            .expect("the relation plan is bounded")
-            .to_be_bytes(),
-    );
-    output.extend(
-        u16::try_from(plan.deletes.len())
-            .expect("the relation plan is bounded")
-            .to_be_bytes(),
-    );
-    for insert in &plan.inserts {
-        output.extend(insert.row_index.to_be_bytes());
-        output.extend(insert.technical_id.to_be_bytes());
-    }
-    for delete in &plan.deletes {
-        output.extend(delete.row_index.to_be_bytes());
-        output.extend(delete.technical_id.to_be_bytes());
-    }
-}
-
-pub(crate) fn decode_plan(
-    input: &mut &[u8],
-    batch: &DeliveryBatch,
-    checkpoint: u64,
-) -> Result<Batch, OperationError> {
-    if read::<1>(input)? != [1] {
-        return Err(invalid("unknown relation-plan version"));
-    }
-    let inserts = usize::from(u16::from_be_bytes(read(input)?));
-    let deletes = usize::from(u16::from_be_bytes(read(input)?));
-    let count = inserts
-        .checked_add(deletes)
-        .ok_or_else(|| invalid("relation-plan mutation count overflows usize"))?;
-    if count == 0 || count > MAX_MUTATIONS_PER_BATCH {
-        return Err(invalid("invalid relation-plan mutation count"));
-    }
-    let mut plan = Batch {
-        inserts: Vec::with_capacity(inserts),
-        deletes: Vec::with_capacity(deletes),
-    };
-    for _ in 0..inserts {
-        plan.inserts.push(Insert {
-            row_index: u64::from_be_bytes(read(input)?),
-            technical_id: u64::from_be_bytes(read(input)?),
-        });
-    }
-    for _ in 0..deletes {
-        plan.deletes.push(Delete {
-            row_index: u64::from_be_bytes(read(input)?),
-            technical_id: u64::from_be_bytes(read(input)?),
-        });
-    }
-    plan::validate(&plan, checkpoint, batch.change())?;
-    Ok(plan)
-}
-
 #[derive(Debug, Error)]
 #[error("relation sink: {0}")]
 struct RelationError(String);
 
 fn invalid(message: impl Into<String>) -> OperationError {
     Box::new(RelationError(message.into()))
-}
-
-fn validate_next_id(next_id: u64) -> Result<(), OperationError> {
-    if (FIRST_TECHNICAL_ID..=EXHAUSTED_ID).contains(&next_id) {
-        Ok(())
-    } else {
-        Err(invalid("next ID is outside 1..=i64::MAX+1"))
-    }
-}
-
-fn read<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], OperationError> {
-    let (value, rest) = input
-        .split_at_checked(N)
-        .ok_or_else(|| invalid("truncated relation sink state"))?;
-    *input = rest;
-    Ok(value
-        .try_into()
-        .expect("the split has the requested length"))
 }
 
 #[cfg(test)]

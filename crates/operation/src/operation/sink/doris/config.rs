@@ -229,7 +229,7 @@ impl DorisTargetSpec {
     }
 
     pub(super) fn marker(&self) -> String {
-        format!("dogpaddle.doris-sink.v1:{}", self.sink_id)
+        format!("dogpaddle.doris-sink.event-address.v1:{}", self.sink_id)
     }
 }
 

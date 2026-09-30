@@ -223,6 +223,16 @@ fn target_spec_rejects_zero_cluster_identity() {
 }
 
 #[test]
+fn target_identity_marks_the_event_address_semantics() {
+    assert_eq!(
+        DorisTargetSpec::try_new("sink", "db", "table", 1)
+            .unwrap()
+            .marker(),
+        "dogpaddle.doris-sink.event-address.v1:sink"
+    );
+}
+
+#[test]
 fn target_spec_rejects_case_folded_state_collision() {
     assert!(DorisTargetSpec::try_new("sink", "db", "$DOGPADDLE.STATE.SINK", 1).is_err());
 }

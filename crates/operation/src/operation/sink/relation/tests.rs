@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{ArrayRef, BinaryArray, Int64Array, ListArray, NullArray, RecordBatch};
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{
+    ArrayRef, BinaryArray, Float32Array, Float64Array, Int64Array, ListArray, NullArray,
+    RecordBatch, StructArray,
+};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::SchemaBoundChangeCodec;
 
@@ -12,6 +15,7 @@ use crate::operation::sink::buffered::DeliveryBatch;
 struct Target {
     rows: BTreeMap<u64, Vec<u8>>,
     lookups: Vec<Vec<Lookup>>,
+    lookup_reply: Option<Vec<Vec<u64>>>,
 }
 
 impl RelationTarget for Target {
@@ -29,6 +33,9 @@ impl RelationTarget for Target {
         requests: &[Lookup],
     ) -> Result<Vec<Matches>, OperationError> {
         self.lookups.push(requests.to_vec());
+        if let Some(reply) = self.lookup_reply.take() {
+            return Ok(reply.into_iter().map(|ids| Matches { ids }).collect());
+        }
         requests
             .iter()
             .map(|request| {
@@ -103,109 +110,77 @@ fn change(rows: &[(i64, i64)]) -> Change {
     .unwrap()
 }
 
-fn delivery(rows: &[(i64, i64)], admissions: &[u64]) -> DeliveryBatch {
-    DeliveryBatch::for_test(change(rows), admissions.to_vec()).unwrap()
+fn delivery(rows: &[(i64, i64)], first_event_offset: u64) -> DeliveryBatch {
+    DeliveryBatch::for_test(change(rows), first_event_offset).unwrap()
 }
 
-fn assert_plan_roundtrip(input: &DeliveryBatch, checkpoint: u64, batch: &Batch) {
-    let mut encoded = Vec::new();
-    encode_plan(batch, &mut encoded);
-    let mut cursor = encoded.as_slice();
-    let recovered = decode_plan(&mut cursor, input, checkpoint).unwrap();
-    assert!(cursor.is_empty());
-    assert_eq!(&recovered, batch);
+fn prepare(
+    target: &mut impl RelationTarget,
+    input: &DeliveryBatch,
+    original_head: Option<(u64, &Change)>,
+) -> Result<Batch, OperationError> {
+    super::prepare(
+        target,
+        input,
+        original_head.unwrap_or((input.first_event_offset(), input.change())),
+    )
 }
 
-fn apply(target: &mut Target, input: &DeliveryBatch, next_id: &mut u64) {
-    let (next, plan) = plan::prepare(target, input, *next_id).unwrap();
-    plan::validate(&plan, next, input.change()).unwrap();
-    target.write_batch(input.change(), &plan).unwrap();
+fn recover(
+    input: &DeliveryBatch,
+    negative_ids: &[u64],
+    original_head: Option<(u64, &Change)>,
+) -> Result<Batch, OperationError> {
+    super::recover(
+        input,
+        negative_ids,
+        original_head.unwrap_or((input.first_event_offset(), input.change())),
+    )
+}
+
+fn apply(target: &mut Target, input: &DeliveryBatch) -> Batch {
+    let batch = prepare(target, input, None).unwrap();
+    assert_eq!(recover(input, &batch.negative_ids(), None).unwrap(), batch);
+    target.write_batch(input.change(), &batch).unwrap();
     let once = target.rows.clone();
-    target.write_batch(input.change(), &plan).unwrap();
+    target.write_batch(input.change(), &batch).unwrap();
     assert_eq!(target.rows, once, "fixed plan replay must be idempotent");
-    *next_id = next;
+    batch
 }
 
 #[test]
-fn insert_delete_same_id_replays_empty_and_never_reuses_an_id() {
+fn negative_events_leave_gaps_between_stable_positive_ids() {
     let mut target = Target::default();
-    let mut next_id = 1;
-    apply(
-        &mut target,
-        &delivery(&[(7, 2), (7, -2)], &[2, 2]),
-        &mut next_id,
-    );
+    apply(&mut target, &delivery(&[(7, 2), (7, -2)], 1));
     assert!(target.rows.is_empty());
-    assert_eq!(next_id, 3);
-    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
-    assert_eq!(target.rows.keys().copied().collect::<Vec<_>>(), [3]);
+    apply(&mut target, &delivery(&[(7, 1)], 5));
+    assert_eq!(target.rows.keys().copied().collect::<Vec<_>>(), [5]);
 }
 
 #[test]
-fn insert_only_batch_reserves_ids_in_event_order_without_target_lookup() {
-    let input = delivery(&[(7, 2), (8, 1), (7, 3)], &[2, 1, 3]);
+fn insert_only_ids_follow_event_order_without_lookup_or_negative_plan() {
+    let input = delivery(&[(7, 2), (8, 1), (7, 3)], 100);
     let mut target = Target::default();
-    let (checkpoint, batch) = plan::prepare(&mut target, &input, 1).unwrap();
-    assert_eq!(checkpoint, 7);
+    let batch = prepare(&mut target, &input, None).unwrap();
     assert!(target.lookups.is_empty());
-    assert!(batch.deletes.is_empty());
+    assert!(batch.negative_ids().is_empty());
     assert_eq!(
         batch
             .inserts
             .iter()
             .map(|insert| (insert.row_index, insert.technical_id))
             .collect::<Vec<_>>(),
-        [(0, 1), (0, 2), (1, 3), (2, 4), (2, 5), (2, 6)]
+        [(0, 100), (0, 101), (1, 102), (2, 103), (2, 104), (2, 105)]
     );
-    plan::validate(&batch, checkpoint, input.change()).unwrap();
-    assert_plan_roundtrip(&input, checkpoint, &batch);
-    target.write_batch(input.change(), &batch).unwrap();
-    assert_eq!(target.rows.len(), 6);
+    assert_eq!(recover(&input, &[], None).unwrap(), batch);
 }
 
 #[test]
-fn recovered_delete_only_plan_retains_full_canonical_budget_without_new_row_comparisons() {
+fn retractions_use_oldest_existing_then_current_event_ids() {
     let mut target = Target::default();
-    let mut next_id = 1;
-    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
-    let input = delivery(&[(7, -1)], &[1]);
-    let (checkpoint, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
-    assert!(batch.inserts.is_empty());
-    assert_eq!(batch.deletes[0].technical_id, 1);
-    plan::validate(&batch, checkpoint, input.change()).unwrap();
-    assert_plan_roundtrip(&input, checkpoint, &batch);
-}
-
-#[test]
-fn recovered_mixed_plan_deleting_only_existing_ids_keeps_identity_checks_on_target() {
-    let mut target = Target::default();
-    let mut next_id = 1;
-    apply(&mut target, &delivery(&[(7, 1)], &[1]), &mut next_id);
-    let input = delivery(&[(8, 1), (7, -1)], &[1, 1]);
-    let (checkpoint, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
-    assert_eq!(batch.inserts[0].technical_id, next_id);
-    assert_eq!(batch.deletes[0].technical_id, 1);
-    plan::validate(&batch, checkpoint, input.change()).unwrap();
-    assert_plan_roundtrip(&input, checkpoint, &batch);
-    target.write_batch(input.change(), &batch).unwrap();
-    assert_eq!(target.rows.len(), 1);
-}
-
-#[test]
-fn retractions_use_oldest_existing_then_newly_inserted_ids() {
-    let mut target = Target::default();
-    let mut next_id = 1;
-    apply(&mut target, &delivery(&[(7, 3)], &[3]), &mut next_id);
-    let input = delivery(&[(7, 2), (7, -4)], &[2, 4]);
-    let (_, batch) = plan::prepare(&mut target, &input, next_id).unwrap();
-    assert_eq!(
-        batch
-            .deletes
-            .iter()
-            .map(|delete| delete.technical_id)
-            .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
-    );
+    apply(&mut target, &delivery(&[(7, 3)], 1));
+    let batch = prepare(&mut target, &delivery(&[(7, 2), (7, -4)], 4), None).unwrap();
+    assert_eq!(batch.negative_ids(), [1, 2, 3, 4]);
     assert_eq!(
         batch
             .inserts
@@ -219,35 +194,19 @@ fn retractions_use_oldest_existing_then_newly_inserted_ids() {
 #[test]
 fn later_inserts_cannot_cover_an_invalid_negative_prefix() {
     let mut target = Target::default();
-    let input = delivery(&[(7, -1), (7, 1)], &[1, 1]);
-    assert!(plan::prepare(&mut target, &input, 1).is_err());
+    assert!(prepare(&mut target, &delivery(&[(7, -1), (7, 1)], 1), None).is_err());
     assert!(target.rows.is_empty());
 }
 
 #[test]
-fn negative_slice_looks_up_only_current_mutations_while_positive_reserves_full_ids() {
+fn weighted_slices_keep_absolute_ids_and_only_lookup_current_negative_mutations() {
     let mut target = Target::default();
-    let mut next_id = 1;
-    for (diff, admission) in [(1024, 2050), (1024, 1024), (2, 2)] {
-        apply(
-            &mut target,
-            &delivery(&[(7, diff)], &[admission]),
-            &mut next_id,
-        );
+    for (offset, diff) in [(1, 1024), (1025, 1024), (2049, 2)] {
+        apply(&mut target, &delivery(&[(7, diff)], offset));
     }
     assert_eq!(target.rows.len(), 2050);
-
-    let invalid = delivery(&[(7, -1024)], &[2051]);
-    assert!(plan::prepare(&mut target, &invalid, next_id).is_ok());
-    assert_eq!(target.rows.len(), 2050);
-
-    target.lookups.clear();
-    for (diff, admission) in [(-1024, 2050), (-1024, 1024), (-2, 2)] {
-        apply(
-            &mut target,
-            &delivery(&[(7, diff)], &[admission]),
-            &mut next_id,
-        );
+    for (offset, diff) in [(2051, -1024), (3075, -1024), (4099, -2)] {
+        apply(&mut target, &delivery(&[(7, diff)], offset));
     }
     assert!(target.rows.is_empty());
     assert_eq!(
@@ -261,54 +220,88 @@ fn negative_slice_looks_up_only_current_mutations_while_positive_reserves_full_i
 }
 
 #[test]
-fn last_technical_id_is_usable_but_an_event_cannot_partly_overflow() {
+fn last_event_id_is_usable_and_exclusive_tail_cannot_overflow() {
     let mut target = Target::default();
-    assert!(plan::prepare(&mut target, &delivery(&[(7, 1)], &[2]), MAX_TECHNICAL_ID,).is_err());
-    let (next, batch) =
-        plan::prepare(&mut target, &delivery(&[(7, 1)], &[1]), MAX_TECHNICAL_ID).unwrap();
-    assert_eq!(next, EXHAUSTED_ID);
-    assert_eq!(batch.inserts[0].technical_id, MAX_TECHNICAL_ID);
-    assert!(plan::prepare(&mut target, &delivery(&[(7, 1)], &[1]), next).is_err());
+    let input = delivery(&[(7, 1)], MAX_TECHNICAL_ID);
+    assert_eq!(
+        prepare(&mut target, &input, None).unwrap().inserts[0].technical_id,
+        MAX_TECHNICAL_ID
+    );
+    assert!(DeliveryBatch::for_test(change(&[(7, 2)]), MAX_TECHNICAL_ID).is_err());
+    assert!(DeliveryBatch::for_test(change(&[(7, 1)]), u64::MAX).is_err());
 }
 
 #[test]
-fn relation_checkpoint_and_plan_codecs_are_stable_and_validate_the_batch() {
-    let input = delivery(&[(7, 1), (7, -1)], &[1, 1]);
+fn recovery_derives_indexes_and_rejects_wrong_counts_domains_duplicates_and_birth_rows() {
+    let input = delivery(&[(7, 2), (8, 1), (7, -2), (8, -1)], 100);
     let mut target = Target::default();
-    let (checkpoint, plan) = prepare(&mut target, &input, 1).unwrap();
-    let mut encoded = Vec::new();
-    encode_checkpoint(checkpoint, &mut encoded);
-    encode_plan(&plan, &mut encoded);
-    assert_eq!(
-        encoded,
-        [
-            0, 0, 0, 0, 0, 0, 0, 2, // checkpoint
-            1, 0, 1, 0, 1, // plan header
-            0, 0, 0, 0, 0, 0, 0, 0, // insert row
-            0, 0, 0, 0, 0, 0, 0, 1, // insert ID
-            0, 0, 0, 0, 0, 0, 0, 1, // delete row
-            0, 0, 0, 0, 0, 0, 0, 1, // delete ID
-        ]
-    );
-
-    let mut cursor = encoded.as_slice();
-    let decoded_checkpoint = decode_checkpoint(&mut cursor).unwrap();
-    let decoded = decode_plan(&mut cursor, &input, decoded_checkpoint).unwrap();
-    assert!(cursor.is_empty());
-    assert_eq!(decoded, plan);
-
-    for end in 0..encoded.len() {
-        let mut cursor = &encoded[..end];
-        let result = decode_checkpoint(&mut cursor)
-            .and_then(|checkpoint| decode_plan(&mut cursor, &input, checkpoint));
+    let batch = prepare(&mut target, &input, None).unwrap();
+    assert_eq!(batch.negative_ids(), [100, 101, 102]);
+    assert_eq!(recover(&input, &batch.negative_ids(), None).unwrap(), batch);
+    for ids in [
+        vec![],
+        vec![100],
+        vec![0, 101, 102],
+        vec![u64::MAX, 101, 102],
+        vec![100, 100, 102],
+        vec![102, 101, 100],
+        vec![103, 101, 102],
+        vec![106, 101, 102],
+    ] {
         assert!(
-            result.is_err(),
-            "accepted truncated relation state at {end}"
+            recover(&input, &ids, None).is_err(),
+            "accepted invalid IDs {ids:?}"
         );
     }
-    let different = delivery(&[(7, 1), (8, -1)], &[1, 1]);
-    let mut cursor = encoded[8..].as_ref();
-    assert!(decode_plan(&mut cursor, &different, checkpoint).is_err());
+    let later = delivery(&[(7, -1), (7, 1)], 100);
+    assert!(recover(&later, &[101], None).is_err());
+}
+
+#[test]
+fn retained_head_evidence_rejects_negative_births_and_wrong_full_rows() {
+    let head = change(&[(7, 3), (8, -2), (9, 4)]);
+    let input = delivery(&[(7, -2), (9, -1)], 109);
+    let batch = recover(&input, &[100, 102, 107], Some((100, &head))).unwrap();
+    assert_eq!(batch.negative_ids(), [100, 102, 107]);
+    assert!(recover(&input, &[100, 103, 107], Some((100, &head))).is_err());
+    assert!(recover(&input, &[100, 106, 107], Some((100, &head))).is_err());
+    assert!(
+        recover(
+            &input,
+            &[100, 102, 108],
+            Some((100, &change(&[(7, 3), (8, -2), (8, 4)])))
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reclaimed_negative_gap_has_no_birth_evidence_and_keeps_missing_delete_replay() {
+    let mut target = Target::default();
+    apply(&mut target, &delivery(&[(7, 1), (7, -1), (7, 1)], 1));
+    let input = delivery(&[(7, -1)], 4);
+    let corrupted = recover(&input, &[2], None).unwrap();
+    target.write_batch(input.change(), &corrupted).unwrap();
+    assert_eq!(target.rows.keys().copied().collect::<Vec<_>>(), [3]);
+}
+
+#[test]
+fn signed_sql_ids_roundtrip_and_preserve_unsigned_order() {
+    let ids = [
+        1,
+        2,
+        i64::MAX.unsigned_abs(),
+        1_u64 << 63,
+        (1_u64 << 63) + 1,
+        MAX_TECHNICAL_ID,
+    ];
+    let encoded = ids.map(encode_signed_id);
+    assert!(encoded.windows(2).all(|pair| pair[0] < pair[1]));
+    for (id, sql) in ids.into_iter().zip(encoded) {
+        assert_eq!(decode_signed_id(sql).unwrap(), id);
+    }
+    assert!(decode_signed_id(i64::MIN).is_err());
+    assert!(decode_signed_id(i64::MAX).is_err());
 }
 
 #[test]
@@ -397,23 +390,6 @@ fn mutation_grouping_collects_each_rows_insert_validation_and_delete_ids() {
     );
 }
 
-#[test]
-fn duplicate_technical_ids_remain_a_plan_validation_error() {
-    let input = delivery(&[(7, 1), (8, 1)], &[1, 1]);
-    let mut target = Target::default();
-    let (checkpoint, mut batch) = plan::prepare(&mut target, &input, 1).unwrap();
-    batch.inserts[1].technical_id = batch.inserts[0].technical_id;
-    assert!(plan::validate(&batch, checkpoint, input.change()).is_err());
-}
-
-#[test]
-fn relation_recovery_rejects_positive_work_beyond_the_id_frontier() {
-    assert!(validate_recovery(EXHAUSTED_ID, 0).is_ok());
-    assert!(validate_recovery(EXHAUSTED_ID, 1).is_err());
-    assert!(validate_recovery(EXHAUSTED_ID - 2, 2).is_ok());
-    assert!(validate_recovery(EXHAUSTED_ID - 2, 3).is_err());
-}
-
 fn repeated_binary_change(payload_bytes: usize, diffs: [i64; 2]) -> Change {
     let payload = vec![7_u8; payload_bytes];
     Change::try_new(
@@ -436,57 +412,86 @@ fn repeated_binary_change(payload_bytes: usize, diffs: [i64; 2]) -> Change {
 
 #[test]
 fn recovered_plan_compares_each_large_row_pair_once() {
-    let input = repeated_binary_change(3 * 1024 * 1024, [512, -512]);
-    let batch = Batch {
-        inserts: (1..=512)
-            .map(|technical_id| Insert {
-                row_index: 0,
-                technical_id,
-            })
-            .collect(),
-        deletes: (1..=512)
-            .map(|technical_id| Delete {
-                row_index: 1,
-                technical_id,
-            })
-            .collect(),
-    };
-
-    plan::validate(&batch, 513, &input).unwrap();
+    let input =
+        DeliveryBatch::for_test(repeated_binary_change(3 * 1024 * 1024, [512, -512]), 1).unwrap();
+    let ids = (1..=512).collect::<Vec<_>>();
+    assert_eq!(recover(&input, &ids, None).unwrap().negative_ids(), ids);
 }
 
 #[test]
-fn recovered_deletes_of_existing_ids_still_check_the_full_canonical_budget() {
-    let input = repeated_binary_change(4 * 1024 * 1024, [-1, -1]);
-    let batch = Batch {
-        inserts: Vec::new(),
-        deletes: vec![
-            Delete {
-                row_index: 0,
-                technical_id: 1,
-            },
-            Delete {
-                row_index: 1,
-                technical_id: 2,
-            },
-        ],
-    };
-    assert!(plan::validate(&batch, 3, &input).is_err());
-}
-
-#[test]
-fn insert_only_rows_still_share_the_full_canonical_batch_budget() {
-    let input = repeated_binary_change(4 * 1024 * 1024, [1, 1]);
+fn recovered_old_deletes_and_insert_only_rows_share_the_canonical_budget() {
+    let deletes =
+        DeliveryBatch::for_test(repeated_binary_change(4 * 1024 * 1024, [-1, -1]), 3).unwrap();
+    assert!(recover(&deletes, &[1, 2], None).is_err());
+    let inserts =
+        DeliveryBatch::for_test(repeated_binary_change(4 * 1024 * 1024, [1, 1]), 1).unwrap();
     let mut target = Target::default();
-    assert!(
-        plan::prepare(
-            &mut target,
-            &DeliveryBatch::for_test(input, vec![1, 1]).unwrap(),
-            1
-        )
-        .is_err()
-    );
+    assert!(prepare(&mut target, &inserts, None).is_err());
     assert!(target.lookups.is_empty());
+}
+
+#[test]
+fn retained_wide_birth_comparison_does_not_duplicate_the_canonical_budget() {
+    let head = repeated_binary_change(3 * 1024 * 1024, [3, -1]);
+    let codec = SchemaBoundChangeCodec::try_new(head.records().schema()).unwrap();
+    assert!(codec.encode(&head).unwrap().len() < 8 * 1024 * 1024);
+    let mut target = Target::default();
+    let first = Change::try_new(head.records().slice(0, 1), Int64Array::from(vec![2])).unwrap();
+    apply(&mut target, &DeliveryBatch::for_test(first, 1).unwrap());
+    let current =
+        DeliveryBatch::for_test(repeated_binary_change(3 * 1024 * 1024, [1, -1]), 3).unwrap();
+    let batch = prepare(&mut target, &current, Some((1, &head))).unwrap();
+    assert_eq!(batch.negative_ids(), [1]);
+    assert_eq!(batch.inserts[0].technical_id, 3);
+    assert_eq!(recover(&current, &[1], Some((1, &head))).unwrap(), batch);
+    target.write_batch(current.change(), &batch).unwrap();
+    target.write_batch(current.change(), &batch).unwrap();
+    assert_eq!(target.rows.keys().copied().collect::<Vec<_>>(), [2, 3]);
+}
+
+#[test]
+fn one_wide_retained_delete_needs_no_second_canonical_payload() {
+    let head = repeated_binary_change(6 * 1024 * 1024, [1, -1]);
+    let current = Change::try_new(head.records().slice(1, 1), Int64Array::from(vec![-1])).unwrap();
+    let input = DeliveryBatch::for_test(current, 2).unwrap();
+    assert_eq!(
+        recover(&input, &[1], Some((1, &head)))
+            .unwrap()
+            .negative_ids(),
+        [1]
+    );
+}
+
+#[test]
+fn retained_scan_skips_unreferenced_canonical_rows() {
+    let payload = vec![7_u8; 8 * 1024 * 1024];
+    let input = Change::try_new(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                false,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![
+                Some(payload.as_slice()),
+                Some([1_u8].as_slice()),
+            ]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1, 1]),
+    )
+    .unwrap();
+    let current = Change::try_new(
+        RecordBatch::try_new(
+            input.records().schema(),
+            vec![Arc::new(BinaryArray::from(vec![Some([1_u8].as_slice())]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![-1]),
+    )
+    .unwrap();
+    let delivery = DeliveryBatch::for_test(current, 3).unwrap();
+    assert!(recover(&delivery, &[2], Some((1, &input))).is_ok());
 }
 
 #[test]
@@ -517,13 +522,12 @@ fn zero_width_nested_values_cannot_expand_past_the_planning_budget() {
     .unwrap();
     let codec = SchemaBoundChangeCodec::try_new(input.records().schema()).unwrap();
     assert!(codec.encode(&input).unwrap().len() < 1024);
-
     let mut target = Target::default();
     assert!(
-        plan::prepare(
+        prepare(
             &mut target,
-            &DeliveryBatch::for_test(input, vec![1]).unwrap(),
-            1,
+            &DeliveryBatch::for_test(input, 1).unwrap(),
+            None
         )
         .is_err()
     );
@@ -531,8 +535,142 @@ fn zero_width_nested_values_cannot_expand_past_the_planning_budget() {
 }
 
 #[test]
-fn negative_only_admission_needs_no_id_reservation_after_the_frontier_is_exhausted() {
-    validate_admission(&change(&[(7, -1)]), EXHAUSTED_ID, 1024).unwrap();
-    assert!(validate_admission(&change(&[(7, 1)]), EXHAUSTED_ID, 0).is_err());
-    assert!(validate_admission(&change(&[(7, -1), (7, 1)]), EXHAUSTED_ID, 0).is_err());
+fn lookup_requires_bounded_unique_sorted_ids_below_the_delivery_horizon() {
+    let request = Lookup {
+        row_index: 0,
+        take: 2,
+    };
+    for ids in [vec![0], vec![10], vec![2, 1], vec![1, 1], vec![1, 2, 3]] {
+        assert!(plan::validate_matches(&request, &Matches { ids }, 10).is_err());
+    }
+    assert!(plan::validate_matches(&request, &Matches { ids: vec![1, 9] }, 10).is_ok());
+}
+
+#[test]
+fn lookup_rejects_missing_results_and_ids_shared_between_distinct_rows() {
+    let input = delivery(&[(7, -1), (8, -1)], 10);
+    for reply in [vec![], vec![vec![1]], vec![vec![1], vec![1]]] {
+        let mut target = Target {
+            lookup_reply: Some(reply),
+            ..Target::default()
+        };
+        assert!(prepare(&mut target, &input, None).is_err());
+    }
+}
+
+#[test]
+fn borrowed_retained_row_equality_matches_canonical_float_bits_and_nested_nulls() {
+    let child = Arc::new(Field::new("value", DataType::Int64, true));
+    let fields = vec![
+        Field::new("f32", DataType::Float32, false),
+        Field::new("f64", DataType::Float64, false),
+        Field::new(
+            "nested",
+            DataType::Struct(vec![Arc::clone(&child)].into()),
+            true,
+        ),
+    ];
+    let nested = StructArray::new(
+        vec![child].into(),
+        vec![Arc::new(Int64Array::from(vec![Some(7), Some(99), None]))],
+        Some(NullBuffer::from(vec![false, false, true])),
+    );
+    let nan32 = f32::from_bits(0x7fc0_0001);
+    let nan64 = f64::from_bits(0x7ff8_0000_0000_0001);
+    let records = RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        vec![
+            Arc::new(Float32Array::from(vec![nan32, nan32, nan32])),
+            Arc::new(Float64Array::from(vec![nan64, nan64, nan64])),
+            Arc::new(nested),
+        ],
+    )
+    .unwrap();
+    for (left, right) in [(0, 1), (0, 2)] {
+        assert_eq!(
+            records.slice(left, 1) == records.slice(right, 1),
+            canonical_row_bounded(&records, left, 1024).unwrap()
+                == canonical_row_bounded(&records, right, 1024).unwrap()
+        );
+    }
+    assert_eq!(records.slice(0, 1), records.slice(1, 1));
+    assert_ne!(records.slice(0, 1), records.slice(2, 1));
+    for values in [
+        [-0.0_f64, 0.0],
+        [nan64, f64::from_bits(nan64.to_bits() + 1)],
+    ] {
+        let records = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "float",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(values.to_vec()))],
+        )
+        .unwrap();
+        assert_ne!(records.slice(0, 1), records.slice(1, 1));
+        assert_ne!(
+            canonical_row_bounded(&records, 0, 1024).unwrap(),
+            canonical_row_bounded(&records, 1, 1024).unwrap()
+        );
+    }
+}
+
+#[test]
+fn borrowed_row_equality_matches_canonical_identity_for_every_v1_type_family() {
+    use datafusion_common::ScalarValue;
+
+    let list = ScalarValue::new_list(
+        &[ScalarValue::Int64(Some(7)), ScalarValue::Int64(None)],
+        &DataType::Int64,
+        true,
+    );
+    let values = vec![
+        ScalarValue::Null,
+        ScalarValue::Boolean(Some(true)),
+        ScalarValue::Int8(Some(i8::MIN)),
+        ScalarValue::Int16(Some(i16::MIN)),
+        ScalarValue::Int32(Some(i32::MIN)),
+        ScalarValue::Int64(Some(i64::MIN)),
+        ScalarValue::UInt8(Some(u8::MAX)),
+        ScalarValue::UInt16(Some(u16::MAX)),
+        ScalarValue::UInt32(Some(u32::MAX)),
+        ScalarValue::UInt64(Some(u64::MAX)),
+        ScalarValue::Float32(Some(-0.0)),
+        ScalarValue::Float64(Some(-0.0)),
+        ScalarValue::Date32(Some(-123)),
+        ScalarValue::TimestampSecond(Some(-7), None),
+        ScalarValue::TimestampMillisecond(Some(-7), None),
+        ScalarValue::TimestampMicrosecond(Some(-7), Some("UTC".into())),
+        ScalarValue::TimestampNanosecond(Some(-7), None),
+        ScalarValue::Decimal128(Some(-123), 12, 2),
+        ScalarValue::Utf8(Some("embedded\0text".to_owned())),
+        ScalarValue::Binary(Some(vec![0, 255, 7])),
+        ScalarValue::List(list),
+        ScalarValue::Struct(Arc::new(StructArray::new_empty_fields(1, None))),
+    ];
+    for value in values {
+        let data_type = value.data_type();
+        let null = ScalarValue::try_from(&data_type).unwrap();
+        let values = ScalarValue::iter_to_array([value.clone(), value, null]).unwrap();
+        let records = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                data_type.clone(),
+                true,
+            )])),
+            vec![values],
+        )
+        .unwrap();
+        for left in 0..3 {
+            for right in 0..3 {
+                assert_eq!(
+                    records.slice(left, 1) == records.slice(right, 1),
+                    canonical_row_bounded(&records, left, 1024).unwrap()
+                        == canonical_row_bounded(&records, right, 1024).unwrap(),
+                    "identity mismatch for {data_type} rows {left}/{right}"
+                );
+            }
+        }
+    }
 }

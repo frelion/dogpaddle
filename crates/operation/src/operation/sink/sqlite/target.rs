@@ -15,7 +15,10 @@ use super::{
 };
 use crate::operation::{
     OperationError,
-    sink::relation::{Batch, Lookup, Matches, RelationTarget, group_mutations},
+    sink::relation::{
+        Batch, Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id,
+        group_mutations, validate_technical_id,
+    },
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,10 +97,8 @@ impl SqliteTarget {
         let mut selected = Vec::new();
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
-            if id <= 0 {
-                return Err(SqliteSinkError::InvalidStoredTechnicalId { id });
-            }
-            let id = u64::try_from(id).expect("a positive SQLite INTEGER fits u64");
+            let id = decode_signed_id(id)
+                .map_err(|_| SqliteSinkError::InvalidStoredTechnicalId { id })?;
             selected.push(id);
         }
         Ok(Matches { ids: selected })
@@ -292,7 +293,12 @@ impl SqlPlan {
         let quoted_hash = quote_identifier(TECHNICAL_HASH);
 
         let mut definitions = vec![
-            format!("{quoted_id} INTEGER PRIMARY KEY"),
+            format!(
+                "{quoted_id} INTEGER PRIMARY KEY CONSTRAINT \"$dogpaddle.event-address.v1\" \
+                 CHECK({quoted_id} > {} AND {quoted_id} < {})",
+                i64::MIN,
+                i64::MAX
+            ),
             format!(
                 "{quoted_hash} BLOB NOT NULL CHECK(typeof({quoted_hash}) = 'blob' AND length({quoted_hash}) = 16)"
             ),
@@ -498,11 +504,9 @@ fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), Sq
 }
 
 fn technical_id_as_i64(technical_id: u64) -> Result<i64, SqliteSinkError> {
-    i64::try_from(technical_id).map_err(|_| {
-        super::error::invalid_batch(format!(
-            "technical ID {technical_id} cannot be represented by SQLite INTEGER"
-        ))
-    })
+    validate_technical_id(technical_id)
+        .map_err(|error| super::error::invalid_batch(error.to_string()))?;
+    Ok(encode_signed_id(technical_id))
 }
 
 #[cfg(test)]

@@ -131,7 +131,7 @@ Source 拥有 published queue、bootstrap spool、checkpoint 和真实 Delivery 
 `published` 只读返回 schema-bound front bytes；调用方用 exact Schema 解码，完成全部页和下游调用后以 `consume_published` 同事务删除前项。捕获只追加，不随 consumer 进度延迟 ACK。
 捕获、恢复、容量及 `PostgreSQL` / `MySQL` 差异由 [CDC 契约](docs/cdc.md) 规定。
 
-Sink 拥有 outbox、Prepared 和固定 occurrence IDs；enqueue 与独立 drain 的事务、
+Sink 拥有 outbox，事件位置同时确定消费进度和固定 occurrence IDs；Prepared 只保存边界与删除 IDs。enqueue 与独立 drain 的事务、
 目标重投及负 diff 前缀验证由 [Sink 契约](docs/sinks.md) 规定。
 
 ## 验证与 benchmark
@@ -152,4 +152,4 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench -p dogpaddle-operation --bench asof_joi
 ASOF resource target 在独立子进程中记录当前 SQL kernel 的 lookup history、历史修正区间、空影响区间与
 NULL history 的 Rust allocator 和 encoded key/value bytes。输入和 fixture 在 dhat 计时前建立；
 `RocksDB` native allocation、WAL 和 RSS 不混入这些指标。测试模式只验收可运行性，性能比较要求同 host、
-rustc、profile、数据规格与 baseline epoch。完整 target 表与 gate 见 [TESTING.md](../../TESTING.md)。
+rustc、profile、数据规格与 baseline epoch。Buffered Sink 对照见 [PERFORMANCE.md](PERFORMANCE.md)。完整 target 表与 gate 见 [TESTING.md](../../TESTING.md)。

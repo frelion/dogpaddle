@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
@@ -367,6 +367,7 @@ fn sqlite_sink_declarations_have_exact_cell_types_and_materialization_is_lazy() 
 }
 
 struct Fixture {
+    input_schema: SchemaRef,
     root: TestStore,
     definition: OperationDefinition,
     sink: Box<dyn dogpaddle_operation::operation::SinkOperation>,
@@ -375,6 +376,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_schema(schema())
+    }
+    fn with_schema(input_schema: SchemaRef) -> Self {
         let root = TestStore::new();
         let definition: OperationDefinition =
             SqliteSinkDefinition::try_new(root.path().with_extension("sqlite"), "events")
@@ -383,7 +387,7 @@ impl Fixture {
         let mut setup = StoreSetup::new();
         let (operation, _) = definition
             .construct(
-                &[schema()],
+                &[Arc::clone(&input_schema)],
                 &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
@@ -394,6 +398,7 @@ impl Fixture {
             panic!("expected sink");
         };
         Self {
+            input_schema,
             root,
             definition,
             sink,
@@ -403,6 +408,7 @@ impl Fixture {
     }
     fn reopen(self) -> Self {
         let Self {
+            input_schema,
             root,
             definition,
             sink,
@@ -413,7 +419,7 @@ impl Fixture {
         let store = Store::open(root.path()).unwrap();
         let (operation, _) = definition
             .construct(
-                &[schema()],
+                &[Arc::clone(&input_schema)],
                 &mut store.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
@@ -424,6 +430,7 @@ impl Fixture {
             panic!("expected sink");
         };
         Self {
+            input_schema,
             root,
             definition,
             sink,
@@ -557,10 +564,16 @@ fn prepared_replay_before_and_after_target_commit_keeps_fixed_ids() {
     let prepared = fixture.plan().unwrap().unwrap();
     fixture.persist(&prepared);
     fixture.sink.deliver(&prepared).unwrap();
-    assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 7)]);
+    assert_eq!(
+        fixture.rows(),
+        [(i64::MIN + 1, 7), (i64::MIN + 2, 7), (i64::MIN + 3, 7)]
+    );
     fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
-    assert_eq!(fixture.rows(), [(1, 7), (2, 7), (3, 7)]);
+    assert_eq!(
+        fixture.rows(),
+        [(i64::MIN + 1, 7), (i64::MIN + 2, 7), (i64::MIN + 3, 7)]
+    );
 }
 
 #[test]
@@ -588,11 +601,11 @@ fn prepared_batch_backpressure_writes_nothing_when_the_parent_transaction_commit
     assert_eq!(fixture.drain(), 1);
     assert_eq!(
         fixture.rows(),
-        (1..=1024).map(|id| (id, 7)).collect::<Vec<_>>()
+        (1..=1024).map(|id| (i64::MIN + id, 7)).collect::<Vec<_>>()
     );
     assert!(fixture.enqueue(&change(&[99], &[1])).unwrap());
     assert_eq!(fixture.drain(), 1);
-    assert_eq!(fixture.rows().last(), Some(&(1025, 99)));
+    assert_eq!(fixture.rows().last(), Some(&(i64::MIN + 1025, 99)));
 }
 
 #[test]
@@ -600,6 +613,7 @@ fn restoring_oversized_ready_control_fails_without_rewriting_it() {
     let mut fixture = Fixture::new();
     fixture.drain();
     let Fixture {
+        input_schema,
         root,
         definition,
         sink,
@@ -626,7 +640,7 @@ fn restoring_oversized_ready_control_fails_without_rewriting_it() {
     let store = Store::open(root.path()).unwrap();
     let (operation, _) = definition
         .construct(
-            &[schema()],
+            &[input_schema],
             &mut store.data_scope().scoped("operation"),
             RuntimeResource::none(),
         )
@@ -681,4 +695,107 @@ fn schema_and_oversized_multiplicity_fail_before_enqueue() {
     let wrong = super::support::change(&[1]);
     assert!(fixture.enqueue(&wrong).is_err());
     assert!(fixture.plan().unwrap().is_none());
+}
+
+#[test]
+fn event_positions_keep_negative_gaps_and_survive_an_empty_reopen() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7, 7, 9], &[2, -1, 1])).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    assert_eq!(fixture.rows(), [(i64::MIN + 2, 7), (i64::MIN + 4, 9)]);
+
+    assert!(fixture.enqueue(&change(&[7, 9], &[-1, -1])).unwrap());
+    fixture.drain();
+    assert!(fixture.rows().is_empty());
+    fixture = fixture.reopen();
+    assert!(fixture.plan().unwrap().is_none());
+    assert!(fixture.enqueue(&change(&[42], &[1])).unwrap());
+    fixture.drain();
+    assert_eq!(fixture.rows(), [(i64::MIN + 7, 42)]);
+}
+
+#[test]
+fn repeated_load_and_rolled_back_settlement_follow_the_store_head() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7, 8, 9], &[1023, 2, 2])).unwrap());
+    drop(fixture.plan().unwrap().unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    {
+        let txn = fixture.writes.begin();
+        fixture.sink.settle(txn.access(), &prepared).unwrap();
+    }
+    assert_eq!(fixture.rows().len(), 1024);
+    drop(fixture.plan().unwrap().unwrap());
+    fixture = fixture.reopen();
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture.settle(&prepared);
+    assert_eq!(fixture.drain(), 1);
+    let rows = fixture.rows();
+    assert_eq!(rows.len(), 1027);
+    assert_eq!(
+        &rows[1022..],
+        &[
+            (i64::MIN + 1023, 7),
+            (i64::MIN + 1024, 8),
+            (i64::MIN + 1025, 8),
+            (i64::MIN + 1026, 9),
+            (i64::MIN + 1027, 9),
+        ]
+    );
+}
+
+#[test]
+fn retained_birth_comparison_replays_wide_rows_without_duplicate_payload_budget() {
+    let input_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Utf8,
+        false,
+    )]));
+    let payload = "x".repeat(3 * 1024 * 1024);
+    let change = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(StringArray::from(vec![payload.as_str(); 2]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![3, -1]),
+    )
+    .unwrap();
+    let mut fixture = Fixture::with_schema(input_schema);
+    fixture.drain();
+    assert!(fixture.enqueue(&change).unwrap());
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture.settle(&prepared);
+    let prepared = fixture.plan().unwrap().unwrap();
+    fixture.persist(&prepared);
+    fixture.sink.deliver(&prepared).unwrap();
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    let connection = Connection::open(fixture.root.path().with_extension("sqlite")).unwrap();
+    let rows = connection
+        .prepare("SELECT \"$dogpaddle.id\", length(value) FROM events ORDER BY \"$dogpaddle.id\"")
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (i64::MIN + 2, 3 * 1024 * 1024),
+            (i64::MIN + 3, 3 * 1024 * 1024)
+        ]
+    );
 }

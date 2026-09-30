@@ -1,7 +1,7 @@
 use arrow_array::Int64Array;
 use arrow_select::concat::concat_batches;
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
-use dogpaddle_store::{OrderedMap, OrderedMapReadAccess, ReadTransactionAccess};
+use dogpaddle_store::{OrderedMap, OrderedMapReadAccess, ReadTransactionAccess, StoreError};
 
 use super::{
     invalid,
@@ -11,40 +11,41 @@ use crate::operation::OperationError;
 
 const MAP_KEY_BYTES: u64 = size_of::<u64>() as u64;
 
-/// One bounded delivery and each positive event's first-slice ID reservation.
-/// Negative events are admitted only for the current slice's prefix deficit.
+/// One bounded contiguous absolute-event interval with weighted rows.
 #[derive(Clone)]
 pub(crate) struct DeliveryBatch {
     change: Change,
-    admissions: Vec<u64>,
+    first_event_offset: u64,
 }
 
 impl DeliveryBatch {
-    fn new(change: Change, admissions: Vec<u64>) -> Result<Self, OperationError> {
-        if change.num_rows() != admissions.len()
-            || change
-                .diffs()
-                .values()
-                .iter()
-                .zip(&admissions)
-                .any(|(diff, admission)| *admission < diff.unsigned_abs())
+    fn new(change: Change, first_event_offset: u64) -> Result<Self, OperationError> {
+        let events = event_count(&change)?;
+        if first_event_offset == 0
+            || events == 0
+            || first_event_offset.checked_add(events).is_none()
         {
-            return Err(invalid("delivery admissions do not match the Change"));
+            return Err(invalid("delivery interval exceeds the event domain"));
         }
-        Ok(Self { change, admissions })
+        Ok(Self {
+            change,
+            first_event_offset,
+        })
     }
 
     pub(crate) const fn change(&self) -> &Change {
         &self.change
     }
-
-    pub(crate) fn admission(&self, row_index: usize) -> u64 {
-        self.admissions[row_index]
+    pub(crate) const fn first_event_offset(&self) -> u64 {
+        self.first_event_offset
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(change: Change, admissions: Vec<u64>) -> Result<Self, OperationError> {
-        Self::new(change, admissions)
+    pub(crate) fn for_test(
+        change: Change,
+        first_event_offset: u64,
+    ) -> Result<Self, OperationError> {
+        Self::new(change, first_event_offset)
     }
 }
 
@@ -52,12 +53,25 @@ impl DeliveryBatch {
 pub(super) struct LoadedBatch {
     pub(super) delivery: DeliveryBatch,
     pub(super) after: BufferState,
+    // Preserve the original head across cache replacement when delivery crosses entries.
+    // Its bytes are included in the delivery's encoded-entry budget.
+    pub(super) first_entry: Change,
+    pub(super) consumed_keys: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PositionHint {
+    event_offset: u64,
+    row_index: usize,
+    remaining: u64,
 }
 
 pub(super) struct EntryCache {
-    pub(super) sequence: u64,
+    pub(super) entry_start: u64,
     pub(super) item_bytes: u64,
     pub(super) change: Change,
+    entry_end: u64,
+    position_hint: Option<PositionHint>,
     event_bytes: Option<(usize, u64)>,
 }
 
@@ -103,7 +117,7 @@ impl LoadLimits {
 
 enum LoadProgress {
     Continue,
-    Stop(Option<Position>),
+    Stop(Position),
 }
 
 struct Loader<'resources, 'transaction, SizeEvent> {
@@ -113,9 +127,13 @@ struct Loader<'resources, 'transaction, SizeEvent> {
     cache: &'resources mut Option<EntryCache>,
     codec: &'resources SchemaBoundChangeCodec,
     size_event: SizeEvent,
-    sequence: u64,
+    entry_start: u64,
     row_index: usize,
     remaining: u64,
+    event_offset: u64,
+    entry_end: u64,
+    first_entry: Option<Change>,
+    consumed_keys: Vec<u64>,
     event_budget: u64,
     target_byte_budget: u64,
     encoded_bytes: u64,
@@ -123,7 +141,6 @@ struct Loader<'resources, 'transaction, SizeEvent> {
     retained_bytes: u64,
     record_batches: Vec<arrow_array::RecordBatch>,
     diffs: Vec<i64>,
-    admissions: Vec<u64>,
 }
 
 pub(super) fn encoded_item_bytes(encoded: &[u8]) -> Result<u64, OperationError> {
@@ -145,67 +162,25 @@ pub(super) fn event_count(change: &Change) -> Result<u64, OperationError> {
         })
 }
 
-pub(super) fn positive_event_count(change: &Change) -> Result<u64, OperationError> {
-    change
-        .diffs()
-        .values()
-        .iter()
-        .filter(|diff| **diff > 0)
-        .try_fold(0_u64, |total, diff| {
-            total
-                .checked_add(diff.unsigned_abs())
-                .ok_or_else(|| invalid("Change positive-event count exceeds u64"))
-        })
-}
-
-pub(super) fn remaining_event_counts(
-    change: &Change,
-    position: Position,
-) -> Result<(u64, u64), OperationError> {
-    let row_index = usize::try_from(position.row_index)
-        .map_err(|_| invalid("buffer row index exceeds usize"))?;
-    let first_diff = *change
-        .diffs()
-        .values()
-        .get(row_index)
-        .ok_or_else(|| invalid("buffer row index exceeds its Change"))?;
-    let original = first_diff.unsigned_abs();
-    let current = if position.remaining == 0 {
-        if row_index != 0 {
-            return Err(invalid(
-                "an entry-boundary position has a nonzero row index",
-            ));
-        }
-        original
-    } else if position.remaining <= original {
-        position.remaining
-    } else {
-        return Err(invalid("buffer position does not match its Change"));
-    };
-    let mut total = current;
-    let mut positive = if first_diff > 0 { current } else { 0 };
-    for diff in &change.diffs().values()[row_index + 1..] {
-        total = total
-            .checked_add(diff.unsigned_abs())
-            .ok_or_else(|| invalid("buffer remaining-event count exceeds u64"))?;
-        if *diff > 0 {
-            positive = positive
-                .checked_add(diff.unsigned_abs())
-                .ok_or_else(|| invalid("buffer positive-event count exceeds u64"))?;
-        }
+pub(super) fn entry_end(change: &Change, entry_start: u64) -> Result<u64, OperationError> {
+    let events = event_count(change)?;
+    if events == 0 {
+        return Err(invalid("buffer entry contains no events"));
     }
-    Ok((total, positive))
+    entry_start
+        .checked_add(events)
+        .ok_or_else(|| invalid("buffer event offset is exhausted"))
 }
 
 pub(super) fn decode_entry(
-    sequence: u64,
+    entry_start: u64,
     encoded: Vec<u8>,
     max_bytes: u64,
     codec: &SchemaBoundChangeCodec,
 ) -> Result<Change, OperationError> {
     if encoded_item_bytes(&encoded)? > max_bytes {
         return Err(invalid(format!(
-            "buffer entry {sequence} exceeds the delivery byte limit"
+            "buffer entry {entry_start} exceeds the delivery byte limit"
         )));
     }
     Ok(codec.decode_owned(encoded)?)
@@ -222,11 +197,10 @@ pub(super) fn load(
 ) -> Result<LoadedBatch, OperationError> {
     before.validate()?;
     limits.validate()?;
-    let start = before
-        .head
-        .ok_or_else(|| invalid("cannot load a batch from an empty buffer"))?;
-    let row_index =
-        usize::try_from(start.row_index).map_err(|_| invalid("buffer row index exceeds usize"))?;
+    if before.is_empty() {
+        return Err(invalid("cannot load a batch from an empty buffer"));
+    }
+    let start = before.head;
     Loader {
         map: buffer.read(access)?,
         before,
@@ -234,9 +208,13 @@ pub(super) fn load(
         cache,
         codec,
         size_event,
-        sequence: start.sequence,
-        row_index,
-        remaining: start.remaining,
+        entry_start: start.entry_start,
+        row_index: 0,
+        remaining: 0,
+        event_offset: start.event_offset,
+        entry_end: 0,
+        first_entry: None,
+        consumed_keys: Vec::new(),
         event_budget: limits.events,
         target_byte_budget: limits.target_bytes,
         encoded_bytes: 0,
@@ -244,7 +222,6 @@ pub(super) fn load(
         retained_bytes: before.retained_bytes,
         record_batches: Vec::new(),
         diffs: Vec::new(),
-        admissions: Vec::new(),
     }
     .run()
 }
@@ -255,7 +232,7 @@ where
 {
     fn run(mut self) -> Result<LoadedBatch, OperationError> {
         let after_head = loop {
-            if self.sequence >= self.before.tail {
+            if self.entry_start >= self.before.tail {
                 return Err(invalid("buffer head reaches or exceeds its tail"));
             }
             let (item_bytes, change) = self.load_entry()?;
@@ -270,18 +247,45 @@ where
         if let Some(cached) = self
             .cache
             .as_ref()
-            .filter(|cached| cached.sequence == self.sequence)
+            .filter(|cached| cached.entry_start == self.entry_start)
         {
+            self.entry_end = cached.entry_end;
+            if self.entry_end > self.before.tail {
+                return Err(invalid("buffer entry exceeds its tail"));
+            }
             return Ok((cached.item_bytes, cached.change.clone()));
         }
-        let encoded = self
-            .map
-            .get(&self.sequence)?
-            .ok_or_else(|| invalid(format!("buffer entry {} is missing", self.sequence)))?;
+        let encoded = match self.map.get_bounded(
+            &self.entry_start,
+            usize::try_from(self.limits.item_bytes).expect("the item byte limit fits usize"),
+        ) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => {
+                return Err(invalid(format!(
+                    "buffer entry {} is missing",
+                    self.entry_start
+                )));
+            }
+            Err(StoreError::ItemTooLarge { .. }) => {
+                return Err(invalid("buffer entry exceeds the delivery byte limit"));
+            }
+            Err(source) => return Err(source.into()),
+        };
         let item_bytes = encoded_item_bytes(&encoded)?;
-        let change = decode_entry(self.sequence, encoded, self.limits.item_bytes, self.codec)?;
+        let change = decode_entry(
+            self.entry_start,
+            encoded,
+            self.limits.item_bytes,
+            self.codec,
+        )?;
+        self.entry_end = entry_end(&change, self.entry_start)?;
+        if self.entry_end > self.before.tail {
+            return Err(invalid("buffer entry exceeds its tail"));
+        }
         *self.cache = Some(EntryCache {
-            sequence: self.sequence,
+            entry_start: self.entry_start,
+            entry_end: self.entry_end,
+            position_hint: None,
             item_bytes,
             event_bytes: None,
             change: change.clone(),
@@ -297,7 +301,7 @@ where
         if item_bytes > self.limits.encoded_bytes {
             return Err(invalid(format!(
                 "buffer entry {} exceeds the delivery byte limit",
-                self.sequence
+                self.entry_start
             )));
         }
         let next_encoded_bytes = self
@@ -305,12 +309,13 @@ where
             .checked_add(item_bytes)
             .ok_or_else(|| invalid("delivery encoded-byte count exceeds u64"))?;
         if self.encoded_bytes != 0 && next_encoded_bytes > self.limits.encoded_bytes {
-            return Ok(LoadProgress::Stop(Some(Position::entry_start(
-                self.sequence,
-            ))));
+            return Ok(LoadProgress::Stop(Position::entry_start(self.entry_start)));
         }
         self.encoded_bytes = next_encoded_bytes;
-        self.validate_position(change)?;
+        self.locate_position(change)?;
+        if self.first_entry.is_none() {
+            self.first_entry = Some(change.clone());
+        }
 
         let first_row = self.row_index;
         let (local_diffs, progress) = self.consume_rows(item_bytes, change)?;
@@ -322,21 +327,51 @@ where
         Ok(progress)
     }
 
-    fn validate_position(&mut self, change: &Change) -> Result<(), OperationError> {
-        if self.remaining == 0 {
-            if self.row_index != 0 {
-                return Err(invalid(
-                    "an entry-boundary position has a nonzero row index",
-                ));
-            }
-            self.remaining = change.diffs().value(0).unsigned_abs();
-        }
-        if self.row_index >= change.num_rows()
-            || self.remaining > change.diffs().value(self.row_index).unsigned_abs()
-        {
+    fn locate_position(&mut self, change: &Change) -> Result<(), OperationError> {
+        if self.event_offset < self.entry_start || self.event_offset >= self.entry_end {
             return Err(invalid("buffer position does not match its Change"));
         }
-        Ok(())
+        let cached = self.cache.as_ref().expect("current entry is cached");
+        if let Some(hint) = cached
+            .position_hint
+            .filter(|hint| hint.event_offset == self.event_offset)
+        {
+            self.row_index = hint.row_index;
+            self.remaining = hint.remaining;
+            return Ok(());
+        }
+        // Store's head is authoritative. A hint from a rolled-back later load is ignored.
+        let mut offset = self.entry_start;
+        for (row_index, diff) in change.diffs().values().iter().enumerate() {
+            let end = offset
+                .checked_add(diff.unsigned_abs())
+                .ok_or_else(|| invalid("buffer event offset is exhausted"))?;
+            if self.event_offset < end {
+                self.row_index = row_index;
+                self.remaining = end - self.event_offset;
+                return Ok(());
+            }
+            offset = end;
+        }
+        Err(invalid("buffer position does not match its Change"))
+    }
+
+    fn current_position(&mut self) -> Position {
+        if let Some(cached) = self
+            .cache
+            .as_mut()
+            .filter(|cached| cached.entry_start == self.entry_start)
+        {
+            cached.position_hint = Some(PositionHint {
+                event_offset: self.event_offset,
+                row_index: self.row_index,
+                remaining: self.remaining,
+            });
+        }
+        Position {
+            entry_start: self.entry_start,
+            event_offset: self.event_offset,
+        }
     }
 
     fn consume_rows(
@@ -347,7 +382,6 @@ where
         let mut local_diffs = Vec::new();
         loop {
             let original = change.diffs().value(self.row_index);
-            let first_visible_slice = self.remaining == original.unsigned_abs();
             let bytes_per_event = self.event_bytes(change)?;
             let target_events = self.target_byte_budget / bytes_per_event;
             if target_events == 0 {
@@ -356,27 +390,15 @@ where
                         "one target mutation exceeds the target batch byte limit",
                     ));
                 }
-                return Ok((
-                    local_diffs,
-                    LoadProgress::Stop(Some(self.current_position(original))),
-                ));
+                return Ok((local_diffs, LoadProgress::Stop(self.current_position())));
             }
 
             let take = self.remaining.min(self.event_budget).min(target_events);
             local_diffs.push(signed_count(original, take)?);
-            self.admissions
-                .push(if first_visible_slice && original > 0 {
-                    self.remaining
-                } else {
-                    take
-                });
             self.charge(take, bytes_per_event)?;
 
             if self.remaining != 0 {
-                return Ok((
-                    local_diffs,
-                    LoadProgress::Stop(Some(self.current_position(original))),
-                ));
+                return Ok((local_diffs, LoadProgress::Stop(self.current_position())));
             }
             if let Some(progress) = self.advance_row(item_bytes, change)? {
                 return Ok((local_diffs, progress));
@@ -407,6 +429,10 @@ where
             .delivered_events
             .checked_add(take)
             .ok_or_else(|| invalid("delivered event count exceeds u64"))?;
+        self.event_offset = self
+            .event_offset
+            .checked_add(take)
+            .ok_or_else(|| invalid("delivery event offset is exhausted"))?;
         self.event_budget -= take;
         self.target_byte_budget -= take
             .checked_mul(bytes_per_event)
@@ -426,14 +452,20 @@ where
                 .retained_bytes
                 .checked_sub(item_bytes)
                 .ok_or_else(|| invalid("buffer retained-byte count underflow"))?;
-            self.sequence += 1;
-            if self.sequence == self.before.tail {
-                return Ok(Some(LoadProgress::Stop(None)));
+            if self.event_offset != self.entry_end {
+                return Err(invalid("buffer entry span does not match its rows"));
+            }
+            self.consumed_keys.push(self.entry_start);
+            self.entry_start = self.entry_end;
+            if self.entry_start == self.before.tail {
+                return Ok(Some(LoadProgress::Stop(Position::entry_start(
+                    self.entry_start,
+                ))));
             }
             if self.event_budget == 0 {
-                return Ok(Some(LoadProgress::Stop(Some(Position::entry_start(
-                    self.sequence,
-                )))));
+                return Ok(Some(LoadProgress::Stop(Position::entry_start(
+                    self.entry_start,
+                ))));
             }
             self.row_index = 0;
             self.remaining = 0;
@@ -442,27 +474,13 @@ where
 
         self.remaining = change.diffs().value(self.row_index).unsigned_abs();
         if self.event_budget == 0 {
-            Ok(Some(LoadProgress::Stop(Some(
-                self.current_position(change.diffs().value(self.row_index)),
-            ))))
+            Ok(Some(LoadProgress::Stop(self.current_position())))
         } else {
             Ok(None)
         }
     }
 
-    fn current_position(&self, original: i64) -> Position {
-        if self.row_index == 0 && self.remaining == original.unsigned_abs() {
-            Position::entry_start(self.sequence)
-        } else {
-            Position {
-                sequence: self.sequence,
-                row_index: u64::try_from(self.row_index).expect("an addressable row fits u64"),
-                remaining: self.remaining,
-            }
-        }
-    }
-
-    fn finish(mut self, after_head: Option<Position>) -> Result<LoadedBatch, OperationError> {
+    fn finish(mut self, after_head: Position) -> Result<LoadedBatch, OperationError> {
         let records = if self.record_batches.len() == 1 {
             self.record_batches.pop().expect("one record batch exists")
         } else {
@@ -470,21 +488,22 @@ where
         };
         let delivery = DeliveryBatch::new(
             Change::try_new(records, Int64Array::from(self.diffs))?,
-            self.admissions,
+            self.before.head.event_offset,
         )?;
-        let pending_events = self
-            .before
-            .pending_events
-            .checked_sub(self.delivered_events)
-            .ok_or_else(|| invalid("buffer pending-event count underflow"))?;
-        let after = after_head.map_or(BufferState::EMPTY, |head| BufferState {
-            head: Some(head),
+        let after = BufferState {
+            head: after_head,
             tail: self.before.tail,
-            pending_events,
             retained_bytes: self.retained_bytes,
-        });
+        };
         after.validate()?;
-        Ok(LoadedBatch { delivery, after })
+        Ok(LoadedBatch {
+            delivery,
+            after,
+            first_entry: self
+                .first_entry
+                .expect("a delivery has an original head entry"),
+            consumed_keys: self.consumed_keys,
+        })
     }
 }
 

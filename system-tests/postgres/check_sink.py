@@ -247,7 +247,7 @@ class Gate:
             host.kill()
 
         with self.host("open", 2) as host:
-            expected_rows = list(enumerate(EXPECTED, start=1))
+            expected_rows = list(enumerate(EXPECTED, start=-(1 << 63) + 1))
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 host.advance()
@@ -276,7 +276,7 @@ class Gate:
                                "sending": False, "needs_reopen": False}, drained
 
         rows = self.rows()
-        expected_rows = list(enumerate(EXPECTED, start=1))
+        expected_rows = list(enumerate(EXPECTED, start=-(1 << 63) + 1))
         if rows != expected_rows:
             raise RuntimeError(f"target UInt64 rows differ: {rows}")
 
@@ -372,12 +372,12 @@ class Gate:
             assert self.direct_state("bulk") == first
             self.drain(host, "bulk")
             assert self.direct_state("bulk")[0] == 16_385
-            assert self.sql('SELECT min("$dogpaddle.id"), max("$dogpaddle.id") FROM public.bulk') == "1|16385"
+            assert self.sql('SELECT min("$dogpaddle.id"), max("$dogpaddle.id") FROM public.bulk') == f"{-(1 << 63) + 1}|{-(1 << 63) + 16385}"
             self.admit(host, "bulk", "withdraw")
             assert host.command("deliver-only -") == {"kind": "delivered"}
             deleted = self.direct_state("bulk")
             assert deleted[0] == 16_385 - 1024
-            assert self.sql('SELECT min("$dogpaddle.id") FROM public.bulk') == "1025"
+            assert self.sql('SELECT min("$dogpaddle.id") FROM public.bulk') == str(-(1 << 63) + 1025)
             host.kill()
 
         with self.direct_host(binary, "open", "bulk", 6) as host:
@@ -431,7 +431,7 @@ class Gate:
         with self.direct_host(binary, "build", "updates", 1) as host:
             self.admit(host, "updates", "seed")
             self.drain(host, "updates")
-            expected = "\n".join(f"{value + 1}|{value}" for value in range(1_000))
+            expected = "\n".join(f"{-(1 << 63) + value + 1}|{value}" for value in range(1_000))
             assert self.sql('SELECT "$dogpaddle.id", value FROM public.updates '
                             'ORDER BY "$dogpaddle.id"') == expected
             log_start = (self.root / "postgres.log").stat().st_size
@@ -440,7 +440,7 @@ class Gate:
             with (self.root / "postgres.log").open("rb") as stream:
                 stream.seek(log_start)
                 update_log = stream.read().decode("utf-8")
-            expected = "\n".join(f"{value + 1}|{value}" for value in range(1_000, 2_000))
+            expected = "\n".join(f"{-(1 << 63) + 1002 + 2 * (value - 1000)}|{value}" for value in range(1_000, 2_000))
             assert self.sql('SELECT "$dogpaddle.id", value FROM public.updates '
                             'ORDER BY "$dogpaddle.id"') == expected
             update_inserts = update_log.count('INSERT INTO "public"."updates" (')

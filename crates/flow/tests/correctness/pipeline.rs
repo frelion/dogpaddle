@@ -91,7 +91,10 @@ fn five_atomic_transforms_run_in_one_fused_tail_across_reopen() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows, [(1, u64::MAX - 1, 1), (2, u64::MAX, 2)]);
+    assert_eq!(
+        rows,
+        [(i64::MIN + 1, u64::MAX - 1, 1), (i64::MIN + 2, u64::MAX, 2)]
+    );
 
     let store = Store::open(&flow_path).unwrap();
     let _: Cell<u64> = store

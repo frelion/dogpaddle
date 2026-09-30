@@ -72,7 +72,13 @@ fn transform_chain_materializes_filtered_rows_through_the_public_flow_api() {
     );
 
     let rows = sqlite_u64_rows(&sqlite_path);
-    assert_eq!(rows, [(1, u64::MAX - 1, 1, 16), (2, u64::MAX, 2, 16),]);
+    assert_eq!(
+        rows,
+        [
+            (i64::MIN + 1, u64::MAX - 1, 1, 16),
+            (i64::MIN + 2, u64::MAX, 2, 16)
+        ]
+    );
     println!("advance outcomes: {outcomes:?}");
     println!("SQLite rows (technical_id, scan_value, offset, hash_bytes): {rows:?}");
 }
@@ -125,7 +131,10 @@ fn a_sink_batch_settles_and_reopens_without_reusing_technical_ids() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows, (1..=1025).map(|id| (id, 7)).collect::<Vec<_>>());
+    assert_eq!(
+        rows,
+        (1..=1025).map(|id| (i64::MIN + id, 7)).collect::<Vec<_>>()
+    );
     for _ in 0..2 {
         let mut flow = FlowFactory::new(&path).open().unwrap();
         run_until_idle(&mut flow);

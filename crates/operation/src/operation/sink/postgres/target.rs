@@ -7,7 +7,8 @@ use tokio_postgres::{Client, GenericClient, IsolationLevel, types::ToSql};
 use crate::operation::{
     OperationError,
     sink::relation::{
-        Batch, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget, group_mutations,
+        Batch, Lookup, MAX_MUTATIONS_PER_BATCH, Matches, RelationTarget, decode_signed_id,
+        encode_signed_id, group_mutations, validate_technical_id,
     },
 };
 
@@ -177,15 +178,14 @@ impl RelationTarget for PostgresTarget {
                         .await
                         .map_err(|error| database_error("match target rows", &error))?;
                     for row in rows {
-                        let ids =
-                            row.get::<_, Vec<i64>>(1)
-                                .into_iter()
-                                .map(|id| {
-                                    u64::try_from(id).ok().filter(|id| *id != 0).ok_or_else(|| {
-                                        invalid_batch("nonpositive target technical ID")
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
+                        let ids = row
+                            .get::<_, Vec<i64>>(1)
+                            .into_iter()
+                            .map(|id| {
+                                decode_signed_id(id)
+                                    .map_err(|error| invalid_batch(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
                         matches.push(Matches { ids });
                     }
                 }
@@ -266,12 +266,12 @@ fn encode_mutation_groups(
                 insert_ids: group
                     .insert_ids
                     .into_iter()
-                    .map(positive_i64)
+                    .map(technical_id_as_i64)
                     .collect::<Result<_, _>>()?,
                 mutation_ids: group
                     .mutation_ids
                     .into_iter()
-                    .map(positive_i64)
+                    .map(technical_id_as_i64)
                     .collect::<Result<_, _>>()?,
                 row: Arc::new(codec.encode_row(input.records(), row_index)?),
             })
@@ -280,7 +280,7 @@ fn encode_mutation_groups(
     let deletes = mutations
         .delete_ids
         .into_iter()
-        .map(positive_i64)
+        .map(technical_id_as_i64)
         .collect::<Result<Vec<_>, _>>()?;
     Ok((groups, deletes))
 }
@@ -337,11 +337,9 @@ async fn reject_mismatched_ids(
     }
 }
 
-fn positive_i64(id: u64) -> Result<i64, PostgresSinkError> {
-    i64::try_from(id)
-        .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| invalid_batch("technical ID must fit positive PostgreSQL bigint"))
+fn technical_id_as_i64(id: u64) -> Result<i64, PostgresSinkError> {
+    validate_technical_id(id).map_err(|error| invalid_batch(error.to_string()))?;
+    Ok(encode_signed_id(id))
 }
 
 pub(super) struct SqlPlan {
@@ -412,8 +410,10 @@ impl SqlPlan {
                 quote_identifier(&target_pk)
             ),
             format!(
-                "CONSTRAINT {} CHECK ({id} > 0)",
-                quote_identifier(&id_check)
+                "CONSTRAINT {} CHECK ({id} > {} AND {id} < {})",
+                quote_identifier(&id_check),
+                i64::MIN,
+                i64::MAX
             ),
             format!(
                 "CONSTRAINT {} CHECK (octet_length({hash}) = {HASH_LENGTH})",
@@ -426,7 +426,10 @@ impl SqlPlan {
             quote_identifier(&hash_index_name)
         );
         let marker_hash = blake3::hash(format!("{create_target}\0{create_hash_index}").as_bytes());
-        let marker = format!("dogpaddle.postgres-relation.v1:{}", marker_hash.to_hex());
+        let marker = format!(
+            "dogpaddle.postgres-relation.event-address.v1:{}",
+            marker_hash.to_hex()
+        );
         let marker_literal = quote_literal(&marker);
         let initialize = format!(
             "{create_target}; {create_hash_index}; \

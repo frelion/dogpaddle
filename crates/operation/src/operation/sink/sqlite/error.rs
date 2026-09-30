@@ -42,7 +42,7 @@ pub enum SqliteSinkError {
         /// Target table name.
         table: String,
     },
-    /// The target contains an ID outside the sink-owned positive ID range.
+    /// The target contains an ID outside the signed encoding of event addresses.
     #[error("SQLite sink target contains invalid technical ID {id}")]
     InvalidStoredTechnicalId {
         /// Invalid stored ID.

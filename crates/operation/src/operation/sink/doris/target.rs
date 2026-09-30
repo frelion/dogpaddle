@@ -19,7 +19,8 @@ use super::{
 use crate::operation::{
     OperationError,
     sink::relation::{
-        Batch, Lookup, Matches, RelationTarget, relation_event_bytes, terminal_mutations,
+        Batch, Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id,
+        relation_event_bytes, terminal_mutations, validate_technical_id,
     },
 };
 
@@ -94,7 +95,8 @@ impl RelationTarget for DorisTarget {
     fn event_bytes(&self, input: &Change, row_index: usize) -> Result<u64, OperationError> {
         let baseline = relation_event_bytes(input, row_index)?;
         let row = self.codec.encode_row(input.records(), row_index)?;
-        let encoded = mutation_values(u64::MAX, true, &row)
+        // ID 1 maps to i64::MIN + 1: the longest valid signed BIGINT literal.
+        let encoded = mutation_values(1, true, &row)
             .len()
             .checked_add(insert_prefix(&self.spec, self.codec.layout()).len())
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -177,7 +179,7 @@ impl DorisTarget {
     ) -> Result<(), DorisSinkError> {
         let expected_rows = output.len().saturating_add(clauses.len());
         let sql = format!("{} ORDER BY n, id IS NULL, id", clauses.join(" UNION ALL "));
-        let result: Result<Vec<(u64, Option<u64>)>, _> =
+        let result: Result<Vec<(u64, Option<i64>)>, _> =
             self.connect()?.exec(sql, Params::Positional(parameters));
         let Ok(rows) = result else {
             self.connection = None;
@@ -199,7 +201,9 @@ impl DorisTarget {
                 .last_mut()
                 .expect("a matching request was installed above");
             if let Some(id) = id {
-                matched.ids.push(id);
+                matched
+                    .ids
+                    .push(decode_signed_id(id).map_err(|error| invalid_batch(error.to_string()))?);
             }
         }
         if output.len() != expected_rows {
@@ -341,7 +345,13 @@ impl DorisTarget {
             quote(TECHNICAL_ID),
             quote(TECHNICAL_ID)
         );
-        let parameters = ids.into_iter().map(Value::UInt).collect::<Vec<_>>();
+        let parameters = ids
+            .into_iter()
+            .map(|id| {
+                validate_technical_id(id).map_err(|error| invalid_batch(error.to_string()))?;
+                Ok(Value::Int(encode_signed_id(id)))
+            })
+            .collect::<Result<Vec<_>, DorisSinkError>>()?;
         let rows: Vec<mysql::Row> = self
             .connect()?
             .exec(sql, Params::Positional(parameters))
@@ -349,7 +359,7 @@ impl DorisTarget {
         let mut output = BTreeMap::new();
         for row in rows {
             let mut values = row.unwrap().into_iter();
-            let id = value_u64(
+            let id = value_id(
                 values
                     .next()
                     .ok_or_else(|| database("decode mutation ID"))?,
@@ -394,16 +404,17 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn value_u64(value: Value) -> Result<u64, DorisSinkError> {
-    match value {
-        Value::UInt(value) => Ok(value),
-        Value::Int(value) => u64::try_from(value).map_err(|_| database("decode mutation ID")),
+fn value_id(value: Value) -> Result<u64, DorisSinkError> {
+    let signed = match value {
+        Value::UInt(value) => i64::try_from(value).map_err(|_| database("decode mutation ID")),
+        Value::Int(value) => Ok(value),
         Value::Bytes(value) => std::str::from_utf8(&value)
             .ok()
             .and_then(|value| value.parse().ok())
             .ok_or_else(|| database("decode mutation ID")),
         _ => Err(database("decode mutation ID")),
-    }
+    }?;
+    decode_signed_id(signed).map_err(|error| invalid_batch(error.to_string()))
 }
 
 fn value_bytes(value: Value) -> Result<Vec<u8>, DorisSinkError> {
@@ -510,7 +521,7 @@ fn insert_statements(
 
 fn mutation_values(id: u64, deleted: bool, row: &EncodedRow) -> String {
     let mut values = Vec::with_capacity(row.values.len() + 3);
-    values.push(id.to_string());
+    values.push(encode_signed_id(id).to_string());
     values.push(bytes_literal(&row.hash));
     values.push(u8::from(deleted).to_string());
     values.extend(row.values.iter().map(value_literal));
@@ -783,6 +794,52 @@ fn literal(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn target_id_values_decode_signed_driver_representations() {
+        for (signed, id) in [
+            (i64::MIN + 1, 1),
+            (-1, i64::MAX.unsigned_abs()),
+            (0, 1_u64 << 63),
+            (i64::MAX - 1, u64::MAX - 1),
+        ] {
+            assert_eq!(value_id(Value::Int(signed)).unwrap(), id);
+            assert_eq!(
+                value_id(Value::Bytes(signed.to_string().into_bytes())).unwrap(),
+                id
+            );
+            if let Ok(unsigned) = u64::try_from(signed) {
+                assert_eq!(value_id(Value::UInt(unsigned)).unwrap(), id);
+            }
+        }
+        for value in [
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::UInt(u64::MAX),
+            Value::Bytes(b"18446744073709551615".to_vec()),
+        ] {
+            assert!(value_id(value).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_mutation_literals_fit_the_event_byte_bound() {
+        let row = EncodedRow {
+            hash: b"0123456789abcdef0123456789abcdef".to_vec(),
+            values: vec![],
+        };
+        let bound = mutation_values(1, true, &row).len();
+        assert!(mutation_values(1, false, &row).starts_with("(-9223372036854775807,"));
+        assert!(mutation_values(1_u64 << 63, false, &row).starts_with("(0,"));
+        for id in [1, i64::MAX.unsigned_abs(), 1_u64 << 63, u64::MAX - 1] {
+            assert!(mutation_values(id, true, &row).len() <= bound);
+        }
+    }
+}
+
+#[cfg(test)]
 mod live_tests {
     use std::sync::Arc;
 
@@ -854,6 +911,29 @@ mod live_tests {
             deletes: vec![],
         };
         assert!(target.write_batch(&input, &rebound).is_err());
+        let upper_ids = [1_u64 << 63, u64::MAX - 1];
+        let upper = Batch {
+            inserts: upper_ids
+                .into_iter()
+                .map(|technical_id| Insert {
+                    row_index: 1,
+                    technical_id,
+                })
+                .collect(),
+            deletes: vec![],
+        };
+        target.write_batch(&input, &upper).unwrap();
+        target.write_batch(&input, &upper).unwrap();
+        let upper_found = target
+            .lookup(
+                &input,
+                &[Lookup {
+                    row_index: 1,
+                    take: 2,
+                }],
+            )
+            .unwrap();
+        assert_eq!(upper_found[0].ids, upper_ids);
         let delete = Batch {
             inserts: vec![],
             deletes: vec![Delete {

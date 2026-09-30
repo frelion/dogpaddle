@@ -1,96 +1,85 @@
 use super::invalid;
 use crate::operation::OperationError;
-use crate::operation::sink::relation::{self, Batch};
+use crate::operation::sink::relation::MAX_MUTATIONS_PER_BATCH;
 
 const VERSION: u8 = 1;
-// Version, phase and head marker; three head fields, three counters and checkpoint.
-pub(super) const MAX_READY_BYTES: usize = 3 + 7 * size_of::<u64>();
+const BUFFER_BYTES: usize = 4 * size_of::<u64>();
+pub(super) const MAX_READY_BYTES: usize = 2 + BUFFER_BYTES;
+pub(super) const MAX_CONTROL_BYTES: usize =
+    2 + 2 * BUFFER_BYTES + size_of::<u16>() + MAX_MUTATIONS_PER_BATCH * size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Position {
-    pub(super) sequence: u64,
-    pub(super) row_index: u64,
-    /// Zero denotes an entry boundary whose first diff has not been decoded.
-    pub(super) remaining: u64,
+    pub(super) entry_start: u64,
+    pub(super) event_offset: u64,
 }
 
 impl Position {
-    pub(super) const fn entry_start(sequence: u64) -> Self {
+    pub(super) const fn entry_start(event_offset: u64) -> Self {
         Self {
-            sequence,
-            row_index: 0,
-            remaining: 0,
+            entry_start: event_offset,
+            event_offset,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BufferState {
-    pub(super) head: Option<Position>,
+    pub(super) head: Position,
     pub(super) tail: u64,
-    pub(super) pending_events: u64,
     pub(super) retained_bytes: u64,
 }
 
 impl BufferState {
     pub(super) const EMPTY: Self = Self {
-        head: None,
-        tail: 0,
-        pending_events: 0,
+        head: Position::entry_start(1),
+        tail: 1,
         retained_bytes: 0,
     };
 
     pub(super) const fn is_empty(self) -> bool {
-        self.head.is_none()
+        self.head.event_offset == self.tail
+    }
+
+    pub(super) const fn pending_events(self) -> u64 {
+        self.tail - self.head.event_offset
     }
 
     pub(super) fn validate(self) -> Result<(), OperationError> {
-        match self.head {
-            None if self == Self::EMPTY => Ok(()),
-            Some(head)
-                if head.sequence < self.tail
-                    && (head.remaining != 0 || head.row_index == 0)
-                    && self.pending_events != 0
-                    && self.pending_events >= head.remaining
-                    && self.tail - head.sequence <= self.pending_events
-                    && self.retained_bytes >= size_of::<u64>() as u64 =>
-            {
-                Ok(())
+        if self.head.entry_start == 0
+            || self.head.entry_start > self.head.event_offset
+            || self.head.event_offset > self.tail
+            || if self.is_empty() {
+                self.head.entry_start != self.tail || self.retained_bytes != 0
+            } else {
+                self.retained_bytes < size_of::<u64>() as u64
             }
-            None | Some(_) => Err(invalid("invalid buffer control state")),
+        {
+            return Err(invalid("invalid buffer control state"));
         }
+        Ok(())
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct Ready {
-    pub(super) buffer: BufferState,
-    pub(super) checkpoint: u64,
-}
-
-#[derive(Clone)]
 pub(super) struct Prepared {
     pub(super) before: BufferState,
     pub(super) after: BufferState,
-    pub(super) checkpoint: u64,
-    pub(super) plan: Batch,
+    pub(super) negative_ids: Vec<u64>,
 }
 
-#[derive(Clone)]
 pub(super) enum State {
     Initialize,
-    Ready(Ready),
+    Ready(BufferState),
     Prepared(Prepared),
 }
 
 pub(super) enum Header<'input> {
     Initialize,
-    Ready(Ready),
+    Ready(BufferState),
     Prepared {
         before: BufferState,
         after: BufferState,
-        checkpoint: u64,
-        encoded_plan: &'input [u8],
+        encoded_negative_ids: &'input [u8],
     },
 }
 
@@ -98,8 +87,21 @@ impl State {
     pub(super) fn validate(&self) -> Result<(), OperationError> {
         match self {
             Self::Initialize => Ok(()),
-            Self::Ready(ready) => ready.buffer.validate(),
-            Self::Prepared(prepared) => validate_settlement(prepared.before, prepared.after),
+            Self::Ready(buffer) => buffer.validate(),
+            Self::Prepared(prepared) => {
+                validate_settlement(prepared.before, prepared.after)?;
+                if prepared.negative_ids.len() > MAX_MUTATIONS_PER_BATCH
+                    || prepared.negative_ids.len() as u64
+                        > prepared.after.head.event_offset - prepared.before.head.event_offset
+                    || prepared
+                        .negative_ids
+                        .iter()
+                        .any(|id| *id == 0 || *id == u64::MAX)
+                {
+                    return Err(invalid("invalid prepared negative IDs"));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -107,16 +109,22 @@ impl State {
         let mut output = vec![VERSION];
         match self {
             Self::Initialize => output.push(0),
-            Self::Ready(ready) => {
+            Self::Ready(buffer) => {
                 output.push(1);
-                encode_ready(ready, &mut output);
+                encode_buffer(*buffer, &mut output);
             }
             Self::Prepared(prepared) => {
                 output.push(2);
                 encode_buffer(prepared.before, &mut output);
                 encode_buffer(prepared.after, &mut output);
-                relation::encode_checkpoint(prepared.checkpoint, &mut output);
-                relation::encode_plan(&prepared.plan, &mut output);
+                output.extend(
+                    u16::try_from(prepared.negative_ids.len())
+                        .expect("negative IDs are bounded")
+                        .to_be_bytes(),
+                );
+                for id in &prepared.negative_ids {
+                    output.extend(id.to_be_bytes());
+                }
             }
         }
         output
@@ -133,95 +141,72 @@ pub(super) fn decode_header(mut input: &[u8]) -> Result<Header<'_>, OperationErr
             Ok(Header::Initialize)
         }
         1 => {
-            let ready = decode_ready(&mut input)?;
+            let buffer = decode_buffer(&mut input)?;
             require_end(input)?;
-            Ok(Header::Ready(ready))
+            Ok(Header::Ready(buffer))
         }
         2 => {
             let before = decode_buffer(&mut input)?;
             let after = decode_buffer(&mut input)?;
             validate_settlement(before, after)?;
-            let checkpoint = relation::decode_checkpoint(&mut input)?;
             Ok(Header::Prepared {
                 before,
                 after,
-                checkpoint,
-                encoded_plan: input,
+                encoded_negative_ids: input,
             })
         }
         _ => Err(invalid("unknown control-state phase")),
     }
 }
 
-fn encode_ready(ready: &Ready, output: &mut Vec<u8>) {
-    encode_buffer(ready.buffer, output);
-    relation::encode_checkpoint(ready.checkpoint, output);
-}
-
-fn decode_ready(input: &mut &[u8]) -> Result<Ready, OperationError> {
-    let buffer = decode_buffer(input)?;
-    let checkpoint = relation::decode_checkpoint(input)?;
-    Ok(Ready { buffer, checkpoint })
+pub(super) fn decode_negative_ids(mut input: &[u8]) -> Result<Vec<u64>, OperationError> {
+    let count = usize::from(u16::from_be_bytes(read(&mut input)?));
+    if count > MAX_MUTATIONS_PER_BATCH || input.len() != count * size_of::<u64>() {
+        return Err(invalid("invalid prepared negative-ID count"));
+    }
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = u64::from_be_bytes(read(&mut input)?);
+        if id == 0 || id == u64::MAX {
+            return Err(invalid("prepared negative ID is outside the event domain"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 fn encode_buffer(buffer: BufferState, output: &mut Vec<u8>) {
-    match buffer.head {
-        None => output.push(0),
-        Some(head) => {
-            output.push(1);
-            output.extend(head.sequence.to_be_bytes());
-            output.extend(head.row_index.to_be_bytes());
-            output.extend(head.remaining.to_be_bytes());
-        }
-    }
+    output.extend(buffer.head.entry_start.to_be_bytes());
+    output.extend(buffer.head.event_offset.to_be_bytes());
     output.extend(buffer.tail.to_be_bytes());
-    output.extend(buffer.pending_events.to_be_bytes());
     output.extend(buffer.retained_bytes.to_be_bytes());
 }
 
 fn decode_buffer(input: &mut &[u8]) -> Result<BufferState, OperationError> {
-    let head = match read::<1>(input)?[0] {
-        0 => None,
-        1 => Some(Position {
-            sequence: u64::from_be_bytes(read(input)?),
-            row_index: u64::from_be_bytes(read(input)?),
-            remaining: u64::from_be_bytes(read(input)?),
-        }),
-        _ => return Err(invalid("invalid buffer-head tag")),
-    };
-    let state = BufferState {
-        head,
+    let buffer = BufferState {
+        head: Position {
+            entry_start: u64::from_be_bytes(read(input)?),
+            event_offset: u64::from_be_bytes(read(input)?),
+        },
         tail: u64::from_be_bytes(read(input)?),
-        pending_events: u64::from_be_bytes(read(input)?),
         retained_bytes: u64::from_be_bytes(read(input)?),
     };
-    state.validate()?;
-    Ok(state)
+    buffer.validate()?;
+    Ok(buffer)
 }
 
 fn validate_settlement(before: BufferState, after: BufferState) -> Result<(), OperationError> {
     before.validate()?;
     after.validate()?;
-    let heads_progress = match (before.head, after.head) {
-        (Some(_), None) => after == BufferState::EMPTY,
-        (Some(start), Some(end)) => {
-            before.tail == after.tail
-                && (end.sequence > start.sequence
-                    || (end.sequence == start.sequence
-                        && (end.row_index > start.row_index
-                            || (end.row_index == start.row_index
-                                && if start.remaining == 0 {
-                                    end.remaining != 0
-                                } else {
-                                    end.remaining < start.remaining
-                                }))))
-        }
-        (None, _) => false,
-    };
     if before.is_empty()
-        || !heads_progress
-        || after.pending_events >= before.pending_events
+        || before.tail != after.tail
+        || after.head.event_offset <= before.head.event_offset
+        || after.head.entry_start < before.head.entry_start
         || after.retained_bytes > before.retained_bytes
+        || (after.head.entry_start == before.head.entry_start
+            && after.retained_bytes != before.retained_bytes)
+        || (after.head.entry_start > before.head.entry_start
+            && after.retained_bytes >= before.retained_bytes)
     {
         return Err(invalid("invalid prepared settlement"));
     }
@@ -236,7 +221,7 @@ fn require_end(input: &[u8]) -> Result<(), OperationError> {
     }
 }
 
-pub(super) fn read<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], OperationError> {
+fn read<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], OperationError> {
     let (value, rest) = input
         .split_at_checked(N)
         .ok_or_else(|| invalid("truncated control state"))?;

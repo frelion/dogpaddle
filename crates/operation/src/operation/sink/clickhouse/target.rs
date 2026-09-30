@@ -20,6 +20,7 @@ use crate::operation::{
     OperationError,
     sink::relation::{
         Batch, Lookup, Matches, RelationTarget, relation_event_bytes, terminal_mutations,
+        validate_technical_id,
     },
 };
 
@@ -80,7 +81,7 @@ impl RelationTarget for ClickHouseTarget {
         let baseline = relation_event_bytes(input, row_index)?;
         let row = self.codec.encode_row(input.records(), row_index)?;
         let mut values = vec![
-            Value::from(u64::MAX),
+            Value::from(u64::MAX - 1),
             Value::String(row.hash),
             Value::from(1),
             Value::from(1),
@@ -262,8 +263,12 @@ impl ClickHouseTarget {
                 .as_array()
                 .ok_or_else(|| invalid_response("match target rows"))?
                 .iter()
-                .map(|id| value_ref_u64(id, "match target rows"))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|id| {
+                    let id = value_ref_u64(id, "match target rows")?;
+                    validate_technical_id(id).map_err(|error| invalid_batch(error.to_string()))?;
+                    Ok(id)
+                })
+                .collect::<Result<Vec<_>, ClickHouseSinkError>>()?;
             output.push(Matches { ids });
         }
         if output.len() != expected_rows {
@@ -335,6 +340,9 @@ impl ClickHouseTarget {
         ids: impl IntoIterator<Item = u64>,
     ) -> Result<BTreeMap<u64, StoredRow>, ClickHouseSinkError> {
         let ids = ids.into_iter().collect::<Vec<_>>();
+        for id in &ids {
+            validate_technical_id(*id).map_err(|error| invalid_batch(error.to_string()))?;
+        }
         if ids.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -358,6 +366,7 @@ impl ClickHouseTarget {
             }
             let mut values = values.into_iter();
             let id = value_u64(values.next(), "read mutation IDs")?;
+            validate_technical_id(id).map_err(|error| invalid_batch(error.to_string()))?;
             let hash = value_string(values.next(), "read mutation IDs")?;
             let version = value_u64(values.next(), "read mutation IDs")?;
             let deleted = value_u64(values.next(), "read mutation IDs")?;
@@ -854,6 +863,29 @@ mod live_tests {
             deletes: vec![],
         };
         assert!(target.write_batch(&input, &rebound).is_err());
+        let upper_ids = [1_u64 << 63, u64::MAX - 1];
+        let upper = Batch {
+            inserts: upper_ids
+                .into_iter()
+                .map(|technical_id| Insert {
+                    row_index: 1,
+                    technical_id,
+                })
+                .collect(),
+            deletes: vec![],
+        };
+        target.write_batch(&input, &upper).unwrap();
+        target.write_batch(&input, &upper).unwrap();
+        let upper_found = target
+            .lookup(
+                &input,
+                &[Lookup {
+                    row_index: 1,
+                    take: 2,
+                }],
+            )
+            .unwrap();
+        assert_eq!(upper_found[0].ids, upper_ids);
         let delete = Batch {
             inserts: vec![],
             deletes: vec![Delete {

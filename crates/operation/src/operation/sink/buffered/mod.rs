@@ -50,3 +50,6 @@ impl std::error::Error for BufferedSinkError {}
 fn invalid(message: impl Into<String>) -> OperationError {
     Box::new(BufferedSinkError(message.into()))
 }
+
+#[cfg(test)]
+mod tests;

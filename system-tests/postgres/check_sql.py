@@ -541,7 +541,7 @@ class Gate:
             if self.logical_rows() != inserted:
                 raise RuntimeError("settling changed the initial fulfillment result")
             inserted_ids = self.technical_ids()
-            if inserted_ids != {103: 1}:
+            if inserted_ids != {103: -(1 << 63) + 1}:
                 raise RuntimeError(f"invalid initial technical IDs: {inserted_ids}")
             if self.sql(
                 "SELECT is_nullable FROM information_schema.columns "
@@ -567,7 +567,7 @@ class Gate:
             if self.logical_rows() != paid:
                 raise RuntimeError("settling changed the paid order result")
             paid_ids = self.technical_ids()
-            if paid_ids != {101: 2, 103: 1}:
+            if paid_ids != {101: -(1 << 63) + 2, 103: -(1 << 63) + 1}:
                 raise RuntimeError(
                     f"qualifying an order changed existing identity: {paid_ids}"
                 )
@@ -586,8 +586,9 @@ class Gate:
             self.settle(host, "repriced order settles")
             if self.logical_rows() != repriced:
                 raise RuntimeError("settling changed the repriced result")
+            # The old row retraction occupies event position 3 before the new row.
             repriced_ids = self.technical_ids()
-            if repriced_ids != {101: 2, 103: 3}:
+            if repriced_ids != {101: -(1 << 63) + 2, 103: -(1 << 63) + 4}:
                 raise RuntimeError(
                     "repricing did not replace exactly one relation row: "
                     f"{repriced_ids}"
@@ -618,7 +619,7 @@ class Gate:
             until("fulfillment deletion commits", deletion_target_commit)
             crashed_rows = self.rows()
             crashed_ids = self.technical_ids()
-            if crashed_ids != {103: 3}:
+            if crashed_ids != {103: -(1 << 63) + 4}:
                 raise RuntimeError(
                     f"deletion changed the surviving technical ID: {crashed_ids}"
                 )
@@ -677,8 +678,9 @@ class Gate:
             self.settle(host, "resumed global order settles")
             if self.logical_rows() != resumed:
                 raise RuntimeError("settling changed the resumed result")
+            # Deleting order 101 occupies position 5; positive IDs keep this gap.
             resumed_ids = self.technical_ids()
-            if resumed_ids != {103: 3, 104: 4}:
+            if resumed_ids != {103: -(1 << 63) + 4, 104: -(1 << 63) + 6}:
                 raise RuntimeError(
                     f"resuming changed an existing ID or reused one: {resumed_ids}"
                 )
@@ -705,7 +707,7 @@ class Gate:
             if self.logical_rows() != final:
                 raise RuntimeError("settling changed the nullable global result")
             final_ids = self.technical_ids()
-            if final_ids != {103: 3, 104: 4, 105: 5}:
+            if final_ids != {103: -(1 << 63) + 4, 104: -(1 << 63) + 6, 105: -(1 << 63) + 7}:
                 raise RuntimeError(
                     f"final INSERT changed existing IDs or reused one: {final_ids}"
                 )

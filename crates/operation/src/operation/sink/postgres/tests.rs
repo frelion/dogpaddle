@@ -418,5 +418,14 @@ fn layout_owns_only_the_target_and_two_indexes() {
         &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
     );
     assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
-    assert!(plan.initialize.contains("dogpaddle.postgres-relation.v1:"));
+    assert!(
+        plan.initialize
+            .contains("dogpaddle.postgres-relation.event-address.v1:")
+    );
+    assert!(plan.initialize.contains(&format!(
+        "CHECK (\"$dogpaddle.id\" > {} AND \"$dogpaddle.id\" < {})",
+        i64::MIN,
+        i64::MAX
+    )));
+    assert!(!plan.initialize.contains("CHECK (\"$dogpaddle.id\" > 0)"));
 }

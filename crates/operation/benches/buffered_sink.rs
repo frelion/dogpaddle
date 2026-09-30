@@ -30,6 +30,7 @@ const CROSS_MULTIPLICITY: i64 = 2;
 struct Config {
     steady_rows: usize,
     staged_entries: usize,
+    unit_entry_rows: usize,
     large_payload_bytes: usize,
     multiplicity: i64,
     warmup: Duration,
@@ -42,6 +43,7 @@ impl Config {
             (PerformanceProfile::Smoke, false) => Self {
                 steady_rows: 2,
                 staged_entries: 4,
+                unit_entry_rows: 2048,
                 large_payload_bytes: 4 * 1_024,
                 multiplicity: 16,
                 warmup: Duration::from_millis(5),
@@ -50,6 +52,7 @@ impl Config {
             (PerformanceProfile::Smoke, true) => Self {
                 steady_rows: 16,
                 staged_entries: 16,
+                unit_entry_rows: 8192,
                 large_payload_bytes: 256 * 1_024,
                 multiplicity: 2_048,
                 warmup: Duration::from_millis(20),
@@ -58,6 +61,7 @@ impl Config {
             (PerformanceProfile::Reference, _) => Self {
                 steady_rows: 128,
                 staged_entries: 64,
+                unit_entry_rows: 65536,
                 large_payload_bytes: 4 * 1_024 * 1_024,
                 multiplicity: 8_192,
                 warmup: Duration::from_secs(2),
@@ -425,6 +429,48 @@ fn benchmark_restore_validation(
     });
 }
 
+fn write_storage_context(root: &RunRoot, rows: usize) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        DataType::Utf8,
+        false,
+    )]));
+    let payload = "x".repeat(64);
+    let mut fixture = Fixture::new(root, "target_storage", Arc::clone(&schema));
+    fixture.enqueue(&string_change(
+        &schema,
+        &payload,
+        i64::try_from(rows).expect("rows fit i64"),
+    ));
+    fixture.drain();
+    let connection = Connection::open(&fixture.sqlite_path).expect("open storage target");
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, i64::try_from(rows).expect("row count fits i64"));
+    let page_size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    let pages: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    let free_pages: i64 = connection
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    std::fs::write(
+        root.path().join("target_storage.json"),
+        serde_json::to_vec_pretty(&json!({
+            "rows": rows,
+            "payload_bytes": payload.len(),
+            "page_size": page_size,
+            "pages": pages,
+            "free_pages": free_pages,
+            "sqlite_bytes": page_size * pages,
+            "scope": "untimed initialized real Sink target after durable delivery; table, rowid and hash index pages, excluding Store/WAL/heap",
+        })).expect("encode target storage context"),
+    ).expect("write target storage context");
+}
+
 fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mode: &str) {
     let context = json!({
         "benchmark": BENCHMARK,
@@ -436,6 +482,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
             "mode": mode,
             "steady_rows": config.steady_rows,
             "staged_entries": config.staged_entries,
+            "unit_entry_rows": config.unit_entry_rows,
             "large_payload_bytes": config.large_payload_bytes,
             "multiplicity": config.multiplicity,
             "cross_payload_bytes": CROSS_PAYLOAD_BYTES,
@@ -449,9 +496,11 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
                 "restore_validation": "Store reopen, Operation bind, and the first no-input drain step that validates the entire durable buffer and delivers/settles the first bounded prefix",
                 "large_payload_small_event": "positive and negative input admission plus full target delivery and settlement",
                 "large_payload_multiplicity_target_slicing": "positive and negative input admission plus full target delivery and settlement across at least two target-byte-bounded batches per direction",
+                "large_unit_entry": "one unit-weight entry across many 1024-event pages, including every admission, target delivery and synchronous settlement",
                 "high_multiplicity_finite_capacity_churn": "positive and negative input admission plus all 1024-event target batches and settlements"
             },
             "untimed_boundaries": {
+                "target_storage": "one real Sink target with 64-byte repeated rows, recording SQLite page allocation after delivery outside Criterion timing",
                 "all_cases": "fixture and target initialization, Criterion warmup validation, target relation oracle, and teardown",
                 "restore_validation": "durable input staging before reopen and delivery/settlement after the first validated restore step"
             },
@@ -461,6 +510,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config, mo
                 "restore_validation": "reopen a staged multi-entry schema-bound buffer and validate all retained entries in the first restore step",
                 "large_payload_small_event": "one large UTF-8 value with unit multiplicity",
                 "large_payload_multiplicity_target_slicing": "a 4 MiB-plus UTF-8 value at multiplicity two, forcing at least two target-byte-bounded batches without unbounded amplification",
+                "large_unit_entry": "many distinct unit-weight rows in one IPC entry, guarding repeated decoding and prefix rescans",
                 "high_multiplicity_finite_capacity_churn": "one logical row split across bounded 1024-event SQLite deliveries"
             }
         }
@@ -486,6 +536,7 @@ fn main() {
         config,
         if is_benchmark { "benchmark" } else { "test" },
     );
+    write_storage_context(&root, config.unit_entry_rows);
     let mut criterion = Criterion::default()
         .sample_size(10)
         .warm_up_time(config.warmup)
@@ -544,6 +595,18 @@ fn main() {
         &integer_change(&multiplicity, vec![7], config.multiplicity),
         &integer_change(&multiplicity, vec![7], -config.multiplicity),
         1,
+    );
+
+    let values = (0..config.unit_entry_rows)
+        .map(|value| i64::try_from(value).expect("entry value fits i64"))
+        .collect::<Vec<_>>();
+    benchmark_round_trip(
+        &mut group,
+        &root,
+        "large_unit_entry",
+        &integer_change(&integer, values.clone(), 1),
+        &integer_change(&integer, values, -1),
+        u64::try_from(config.unit_entry_rows.div_ceil(1024)).expect("page count fits u64"),
     );
 
     group.finish();
