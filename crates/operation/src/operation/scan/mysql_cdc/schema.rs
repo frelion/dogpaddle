@@ -4,6 +4,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use super::MySqlCdcScanError;
+use crate::operation::scan::cdc_convert::{WireColumn, WireKind};
 
 /// One supported, lossless `MySQL`-to-Arrow column mapping.
 ///
@@ -75,27 +76,48 @@ impl MySqlColumn {
 
 impl MySqlType {
     pub(super) fn arrow_type(self) -> DataType {
-        match self {
-            Self::Int16 => DataType::Int16,
-            Self::Int32 => DataType::Int32,
-            Self::Int64 => DataType::Int64,
-            Self::Float64 => DataType::Float64,
-            Self::Text => DataType::Utf8,
-            Self::Binary => DataType::Binary,
-            Self::Decimal { precision, scale } => DataType::Decimal128(precision, scale),
-        }
+        self.wire_kind().arrow_type()
     }
 
+    #[cfg(test)]
     pub(super) const fn connect_type(self) -> (&'static str, Option<&'static str>) {
+        self.wire_kind().connect_type()
+    }
+
+    const fn wire_kind(self) -> WireKind {
         match self {
-            Self::Int16 => ("int16", None),
-            Self::Int32 => ("int32", None),
-            Self::Int64 => ("int64", None),
-            Self::Float64 => ("double", None),
-            Self::Text => ("string", None),
-            Self::Binary => ("bytes", None),
-            Self::Decimal { .. } => ("bytes", Some("org.apache.kafka.connect.data.Decimal")),
+            Self::Int16 => WireKind::Int16,
+            Self::Int32 => WireKind::Int32,
+            Self::Int64 => WireKind::Int64,
+            Self::Float64 => WireKind::Float64,
+            Self::Text => WireKind::Text,
+            Self::Binary => WireKind::Binary,
+            Self::Decimal { precision, scale } => WireKind::Decimal { precision, scale },
         }
+    }
+}
+
+impl WireColumn for MySqlColumn {
+    type Error = MySqlCdcScanError;
+
+    const INCOMPLETE_IMAGE: &'static str =
+        "missing complete row image; the captured table requires binlog_row_image=FULL";
+    const DECIMAL_LABEL: &'static str = "decimal";
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn nullable(&self) -> bool {
+        self.nullable
+    }
+
+    fn wire_kind(&self) -> WireKind {
+        self.data_type.wire_kind()
+    }
+
+    fn invalid_record(message: String) -> Self::Error {
+        MySqlCdcScanError::InvalidRecord(message)
     }
 }
 

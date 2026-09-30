@@ -99,9 +99,10 @@ Equality/order/tie 只接受左右精确同型且可稳定 canonical/order 编�
 它声明 `asof_join.left_rows`、`asof_join.right_rows: OrderedMap<Vec<u8>, RowWeight>` 与 `asof_join.continuation: Cell<AsOfContinuation>`，完整索引 key 依次编码 equality partition、order、right rank 和 canonical row；缺失代表零 multiplicity，只有 RHS presence 的 `0 ↔ positive` 才触发历史 rematch。
 每个 Claim 先按事件顺序整批 preflight 非负权重/overflow，再以持久的 outer/candidate cursors 单遍分页，不预演选择与输出。
 左事件在完成候选选择的同一 turn 更新 left state 并输出。右事件开始历史 rematch 时更新 right state，并与首个历史/候选游标同事务提交；每个历史左行的旧结果 `-left_weight` 与新结果 `+left_weight` 同事务发布。
+右侧 rematch 在前后 winner 相同、没有输出时直接跳过左行输出解码；Semi/Anti 即使 winner 改变，也只在存在性改变时解码左行。
 右行变更前后仅当前事件 key 的可见性不同；先前事件已在真实状态中，不再保存或模拟整批前缀。恢复时由当前输入行、持久游标及 right weight 重建 before/after 权重，不能重复应用已经提交的右侧变更。
 候选 right scan 和 RHS rematch 的 left outer scan 都从 matchable-order marker 精确 seek，不重复读取永不匹配的 NULL-order history。
-运行期只缓存 pinned Claim 的 prepared rows 与 admission effects；可推进位置以 durable continuation 为准。rollback/reopen 从该位置继续，Complete 的缓存释放只在提交后执行；不持久化第二套 input identity。
+运行期只缓存 pinned Claim 的 prepared rows 与逐行准入后的权重；处理当前行时根据固定 diff 逆算变更前权重，不在跨 turn 缓存中再保存一份。可推进位置以 durable continuation 为准。rollback/reopen 从该位置继续，Complete 的缓存释放只在提交后执行；不持久化第二套 input identity。
 
 错误边界与 EquiJoin 一致：晚期 residual、歧义、解码或输出 diff overflow 可以在早期页面已发布后失败。失败 turn 全部回滚，已提交的状态、输出与 continuation 保留，真实 Sink 可能已经看到部分结果。该状态可以停在单个事件处理到一半，不能解释为完整事件前缀的最终关系。
 Station active pin 保持同一未确认输入，只有 Complete 才 ACK。reopen 不重复已提交页、不跳过确定性错误、不补偿已发布结果，也不自动删除或改写已有状态。

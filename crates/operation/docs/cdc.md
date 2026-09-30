@@ -43,4 +43,6 @@ RestartStream 在同一 turn 完成 stop、restart 和 poll。运行步骤不另
 `postgres_cdc/runtime.rs` 和 `mysql_cdc/runtime.rs` 只实现私有源适配：启动 snapshot/streaming connector、清理源快照资源、转换记录、恢复 checkpoint 及具体错误分类。它们不访问 Store、不执行 ACK，也不各自维护另一套 Phase/NextStep。私有接口只服务这两种已支持的 Debezium 源，不是公共 connector API、插件 registry 或任意生命周期 hook 框架。
 两种源的 converter 直接返回共享的 `Captured { change, sealed, progress }`，保留跨 delivery 的快照进度，且只在完成通知到达时封口（不以最后一行标记代替）。
 
+`scan/cdc_convert.rs` 统一校验两种源完全相同的 Connect envelope、heartbeat、snapshot notification 与完整 row image，再按有序投影构造 Arrow arrays 和 Change。未投影列仍须完成值校验；空投影保留行数和 diff。两种源各自的 `convert.rs` 保留 topic、tombstone、source metadata、snapshot marker 与事件顺序规则，`schema.rs` 仅将各自支持的类型映射到共享 wire kind。错误继续归因到原来源，并保留 PostgreSQL 的 `REPLICA IDENTITY FULL` / `numeric` 与 MySQL 的 `binlog_row_image=FULL` / `decimal` 文案。该合并不改变 phase、checkpoint、spool、ACK 或持久格式。
+
 恢复仍保留源差异：PG 只在 Publishing/Streaming 解析可恢复 checkpoint，未封口 checkpoint 随完整快照丢弃；MySQL 在全部阶段验证已有 checkpoint，并拒绝 Resetting 中有 spool 却没有 checkpoint 的状态。源的 tag、三个资源名称、phase 数字和 checkpoint 原始字节不变。

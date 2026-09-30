@@ -378,6 +378,8 @@ projection；converter 用前者校验完整 envelope/row image，只为后者�
 既不重复保存完整 Schema，也不保存 projection 之外的 source 列。runtime 统一实现 spool、checkpoint、
 提交后 ACK 和恢复推进；具体源只负责连接、记录转换、checkpoint 校验与源资源清理。阶段、事务、容量、重置和部署前提见
 [CDC Scan 契约](docs/cdc.md)。新增源行为时不需要复制整套事务状态机；具体数据库协议仍分别维护。
+共同的 Connect envelope、完整 row image、未投影列校验与 Arrow array 构造位于
+[`scan/cdc_convert.rs`](src/operation/scan/cdc_convert.rs)；PostgreSQL/MySQL 各自的 converter 只决定 topic、metadata、snapshot 与事件顺序。
 
 `PostgresCdcScanOptions` 为运行资源提供类型化调优，可调整 discovery 与 connector 的连接/查询
 timeout、进入 polling 后的有限重试次数与最大等待、持续流 heartbeat 和初始 snapshot fetch size。默认显式固定

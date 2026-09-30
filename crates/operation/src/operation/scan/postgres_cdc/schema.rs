@@ -1,9 +1,10 @@
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use super::PostgresCdcScanError;
+use crate::operation::scan::cdc_convert::{WireColumn, WireKind};
 
 /// One supported, lossless `PostgreSQL`-to-Arrow column mapping.
 ///
@@ -85,37 +86,53 @@ impl PostgresColumn {
 
 impl PostgresType {
     pub(super) fn arrow_type(self) -> DataType {
-        match self {
-            Self::Boolean => DataType::Boolean,
-            Self::Int16 => DataType::Int16,
-            Self::Int32 => DataType::Int32,
-            Self::Int64 => DataType::Int64,
-            Self::Float32 => DataType::Float32,
-            Self::Float64 => DataType::Float64,
-            Self::Text => DataType::Utf8,
-            Self::Bytea => DataType::Binary,
-            Self::Date => DataType::Date32,
-            Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-            Self::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            Self::Numeric { precision, scale } => DataType::Decimal128(precision, scale),
-        }
+        self.wire_kind().arrow_type()
     }
 
+    #[cfg(test)]
     pub(super) const fn connect_type(self) -> (&'static str, Option<&'static str>) {
+        self.wire_kind().connect_type()
+    }
+
+    const fn wire_kind(self) -> WireKind {
         match self {
-            Self::Boolean => ("boolean", None),
-            Self::Int16 => ("int16", None),
-            Self::Int32 => ("int32", None),
-            Self::Int64 => ("int64", None),
-            Self::Float32 => ("float", None),
-            Self::Float64 => ("double", None),
-            Self::Text => ("string", None),
-            Self::Bytea => ("bytes", None),
-            Self::Date => ("int32", Some("io.debezium.time.Date")),
-            Self::Timestamp => ("int64", Some("io.debezium.time.MicroTimestamp")),
-            Self::TimestampTz => ("string", Some("io.debezium.time.ZonedTimestamp")),
-            Self::Numeric { .. } => ("bytes", Some("org.apache.kafka.connect.data.Decimal")),
+            Self::Boolean => WireKind::Boolean,
+            Self::Int16 => WireKind::Int16,
+            Self::Int32 => WireKind::Int32,
+            Self::Int64 => WireKind::Int64,
+            Self::Float32 => WireKind::Float32,
+            Self::Float64 => WireKind::Float64,
+            Self::Text => WireKind::Text,
+            Self::Bytea => WireKind::Binary,
+            Self::Date => WireKind::Date,
+            Self::Timestamp => WireKind::Timestamp,
+            Self::TimestampTz => WireKind::TimestampTz,
+            Self::Numeric { precision, scale } => WireKind::Decimal { precision, scale },
         }
+    }
+}
+
+impl WireColumn for PostgresColumn {
+    type Error = PostgresCdcScanError;
+
+    const INCOMPLETE_IMAGE: &'static str =
+        "missing complete row image; the captured table requires REPLICA IDENTITY FULL";
+    const DECIMAL_LABEL: &'static str = "numeric";
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn nullable(&self) -> bool {
+        self.nullable
+    }
+
+    fn wire_kind(&self) -> WireKind {
+        self.data_type.wire_kind()
+    }
+
+    fn invalid_record(message: String) -> Self::Error {
+        PostgresCdcScanError::InvalidRecord(message)
     }
 }
 

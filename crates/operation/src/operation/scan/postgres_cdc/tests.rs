@@ -510,6 +510,13 @@ fn postgres_cdc_numeric_decodes_signed_big_endian_bytes_without_rounding() {
 fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
     let columns = [PostgresColumn::new("value", PostgresType::Int64, false)];
     let valid = envelope(&columns, "u", json!({"value":1}), json!({"value":2}));
+    let mut missing_image = valid.clone();
+    missing_image["payload"]["before"] = Value::Null;
+    assert!(matches!(
+        convert(&columns, &[missing_image]),
+        Err(PostgresCdcScanError::InvalidRecord(message))
+            if message == "missing complete row image; the captured table requires REPLICA IDENTITY FULL"
+    ));
     let mut cases = Vec::new();
     for row in ["before", "after"] {
         for value in [
@@ -548,7 +555,11 @@ fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
     for parameter in ["scale", "connect.decimal.precision"] {
         let mut event = envelope(&decimal, "c", Value::Null, json!({"value":"AA=="}));
         event["schema"]["fields"][0]["fields"][0]["parameters"][parameter] = json!("3");
-        assert!(convert(&decimal, &[event]).is_err());
+        assert!(matches!(
+            convert(&decimal, &[event]),
+            Err(PostgresCdcScanError::InvalidRecord(message))
+                if message == "numeric schema changed at column value"
+        ));
     }
 }
 

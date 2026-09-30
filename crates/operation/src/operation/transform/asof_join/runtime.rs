@@ -27,7 +27,7 @@ use crate::{
 
 use super::{
     AsOfDirection, AsOfEqualityMode, AsOfEquidistantPreference, AsOfJoinError, AsOfJoinKind,
-    AsOfTieFallback,
+    AsOfJoinLayout, AsOfTieFallback,
     index::{
         ParsedIndexKey, matchable_partition_prefix, parse_row_key, prefix_successor,
         push_component, push_nullable_ordered_component, row_key, take_component,
@@ -67,18 +67,7 @@ pub(super) struct BoundTieBreak {
 
 /// Materialized dynamic ASOF join.
 pub(crate) struct AsOfJoinOperation {
-    pub(super) kind: AsOfJoinKind,
-    pub(super) direction: AsOfDirection,
-    pub(super) tie_fallback: AsOfTieFallback,
-    pub(super) tolerance: Option<u128>,
-    pub(super) input_schemas: [SchemaRef; 2],
-    pub(super) candidate_schema: SchemaRef,
-    pub(super) output_schema: SchemaRef,
-    pub(super) equalities: Box<[BoundEqualityPair]>,
-    pub(super) orders: Box<[BoundOrderPair]>,
-    pub(super) ties: Box<[BoundTieBreak]>,
-    pub(super) right_nulls: Vec<ScalarValue>,
-    pub(super) residual: Option<BoundExpression>,
+    pub(super) layout: AsOfJoinLayout,
     pub(super) left_rows: Rows,
     pub(super) right_rows: Rows,
     pub(super) continuation: Continuation,
@@ -88,7 +77,7 @@ pub(crate) struct AsOfJoinOperation {
 pub(super) struct PreparedClaim {
     port: usize,
     rows: Vec<PreparedRow>,
-    effects: Option<Vec<RowEffect>>,
+    after_weights: Option<Vec<u64>>,
 }
 
 struct PreparedRow {
@@ -113,7 +102,7 @@ struct PreparationBudget {
     bytes: usize,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct RowEffect {
     before: u64,
     after: u64,
@@ -125,19 +114,25 @@ impl RowEffect {
     }
 }
 
+impl PreparedClaim {
+    fn effect(&self, index: usize) -> Result<RowEffect, AsOfJoinError> {
+        let after = self
+            .after_weights
+            .as_ref()
+            .expect("the ASOF Claim was admitted")[index];
+        Ok(RowEffect {
+            before: reverse_weight(after, self.rows[index].difference)?,
+            after,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct Winner {
     key: Vec<u8>,
     order: Vec<u8>,
     rank: Vec<u8>,
     row: Vec<u8>,
-}
-
-struct Correction {
-    left_row: Vec<u8>,
-    left_weight: u64,
-    before: Option<Winner>,
-    after: Option<Winner>,
 }
 
 struct MergedCandidate {
@@ -348,10 +343,10 @@ fn map_preparation_codec_error(source: RowError) -> AsOfJoinError {
 
 impl AsOfJoinOperation {
     fn validate_input(&self, input: OperationInput<'_>) -> Result<(), AsOfJoinError> {
-        if input.port >= self.input_schemas.len() {
+        if input.port >= self.layout.input_schemas.len() {
             return Err(AsOfJoinError::InvalidInputPort { port: input.port });
         }
-        if input.change.schema().as_ref() != self.input_schemas[input.port].as_ref() {
+        if input.change.schema().as_ref() != self.layout.input_schemas[input.port].as_ref() {
             return Err(AsOfJoinError::InputSchemaMismatch { port: input.port });
         }
         Ok(())
@@ -381,7 +376,7 @@ impl AsOfJoinOperation {
             });
         }
 
-        for (expression_index, pair) in self.equalities.iter().enumerate() {
+        for (expression_index, pair) in self.layout.equalities.iter().enumerate() {
             let scalar = pair.for_port(input.port);
             let column = scalar.expression.evaluate(records).map_err(|source| {
                 AsOfJoinError::Expression {
@@ -410,7 +405,7 @@ impl AsOfJoinOperation {
             }
         }
 
-        for (expression_index, pair) in self.orders.iter().enumerate() {
+        for (expression_index, pair) in self.layout.orders.iter().enumerate() {
             let scalar = pair.for_port(input.port);
             let column = scalar.expression.evaluate(records).map_err(|source| {
                 AsOfJoinError::Expression {
@@ -439,7 +434,7 @@ impl AsOfJoinOperation {
         }
 
         if input.port == 1 {
-            for (expression_index, tie) in self.ties.iter().enumerate() {
+            for (expression_index, tie) in self.layout.ties.iter().enumerate() {
                 let column = tie.value.expression.evaluate(records).map_err(|source| {
                     AsOfJoinError::Expression {
                         role: "tie break",
@@ -477,7 +472,7 @@ impl AsOfJoinOperation {
         Ok(PreparedClaim {
             port: input.port,
             rows,
-            effects: None,
+            after_weights: None,
         })
     }
 
@@ -506,16 +501,16 @@ impl AsOfJoinOperation {
         } else {
             Self::initial_continuation(claim.port)
         };
-        if claim.effects.is_none() {
+        if claim.after_weights.is_none() {
             let start = usize::try_from(state.row)
                 .map_err(|_| AsOfJoinError::InvalidContinuation("row exceeds usize"))?;
             let current_applied = claim.port == 1 && state.left_resume_after.is_some();
-            claim.effects =
+            claim.after_weights =
                 Some(self.preflight_admission(claim, start, current_applied, access)?);
         }
 
         let mut budget = TurnBudget::new();
-        let mut output = OutputRows::new(self.output_schema.fields().len());
+        let mut output = OutputRows::new(self.layout.output_schema.fields().len());
         loop {
             let step = if claim.port == 0 {
                 self.process_left_claim_row(
@@ -538,15 +533,15 @@ impl AsOfJoinOperation {
             };
             match step {
                 Step::Complete => {
-                    return Ok(Action::Complete(output.finish(&self.output_schema)?));
+                    return Ok(Action::Complete(output.finish(&self.layout.output_schema)?));
                 }
                 Step::Yield => {
                     continuation.set(&state)?;
-                    return Ok(Action::Commit(output.finish(&self.output_schema)?));
+                    return Ok(Action::Commit(output.finish(&self.layout.output_schema)?));
                 }
                 Step::Continue if budget.exhausted() => {
                     continuation.set(&state)?;
-                    return Ok(Action::Commit(output.finish(&self.output_schema)?));
+                    return Ok(Action::Commit(output.finish(&self.layout.output_schema)?));
                 }
                 Step::Continue => {}
             }
@@ -559,27 +554,25 @@ impl AsOfJoinOperation {
         start: usize,
         current_applied: bool,
         access: TransactionAccess<'_>,
-    ) -> Result<Vec<RowEffect>, AsOfJoinError> {
+    ) -> Result<Vec<u64>, AsOfJoinError> {
         let rows = self.rows(claim.port).access(access)?;
         let mut overlay = BTreeMap::<&[u8], u64>::new();
-        let mut effects = vec![RowEffect::default(); claim.rows.len()];
+        let mut after_weights = vec![0; claim.rows.len()];
         for (index, row) in claim.rows.iter().enumerate().skip(start) {
-            let effect = if index == start && current_applied {
+            let before = if index == start && current_applied {
                 let after = rows.get(&row.key)?.map_or(0, RowWeight::get);
-                let before = reverse_weight(after, row.difference)?;
-                RowEffect { before, after }
+                reverse_weight(after, row.difference)?
             } else {
-                let before = match overlay.get(row.key.as_slice()) {
+                match overlay.get(row.key.as_slice()) {
                     Some(weight) => *weight,
                     None => rows.get(&row.key)?.map_or(0, RowWeight::get),
-                };
-                let after = adjusted_weight(before, row.difference)?;
-                RowEffect { before, after }
+                }
             };
-            overlay.insert(&row.key, effect.after);
-            effects[index] = effect;
+            let after = adjusted_weight(before, row.difference)?;
+            overlay.insert(&row.key, after);
+            after_weights[index] = after;
         }
-        Ok(effects)
+        Ok(after_weights)
     }
 
     fn process_left_claim_row(
@@ -613,7 +606,7 @@ impl AsOfJoinOperation {
             }
         };
         let result_work = if page.continuation.is_none() {
-            left_result_work(self.kind, row, page.best_after.as_ref())
+            left_result_work(self.layout.kind, row, page.best_after.as_ref())
         } else {
             (0, 0)
         };
@@ -628,7 +621,7 @@ impl AsOfJoinOperation {
         }
         let winner = finish_selection(state.best_after.as_deref(), state.ambiguous_after)?;
         state.ambiguous_after = false;
-        let effect = claim.effects.as_ref().expect("the ASOF Claim was admitted")[row_index];
+        let effect = claim.effect(row_index)?;
         self.append_left_result(row, winner.as_ref(), output)?;
         self.adjust_actual(0, row, effect, access)?;
         clear_candidate_state(state);
@@ -647,7 +640,7 @@ impl AsOfJoinOperation {
         debug_assert_eq!(claim.port, 1);
         let row_index = continuation_row(claim, state)?;
         let right = &claim.rows[row_index];
-        let effect = claim.effects.as_ref().expect("the ASOF Claim was admitted")[row_index];
+        let effect = claim.effect(row_index)?;
         if !budget.can_start(right) {
             return Ok(Step::Yield);
         }
@@ -689,7 +682,7 @@ impl AsOfJoinOperation {
         };
         let correction_work = if page.continuation.is_none() {
             correction_work(
-                self.kind,
+                self.layout.kind,
                 &left,
                 left_weight,
                 page.best_before.as_ref(),
@@ -725,13 +718,7 @@ impl AsOfJoinOperation {
         let after = finish_selection(state.best_after.as_deref(), state.ambiguous_after)?;
         state.ambiguous_before = false;
         state.ambiguous_after = false;
-        let correction = Correction {
-            left_row: prepared_row_bytes(&left)?,
-            left_weight,
-            before,
-            after,
-        };
-        self.append_correction(&correction, output)?;
+        self.append_correction(&left, left_weight, before.as_ref(), after.as_ref(), output)?;
         clear_candidate_state(state);
         Ok(Step::Continue)
     }
@@ -826,7 +813,7 @@ impl AsOfJoinOperation {
             .remaining_items()
             .min(CANDIDATE_ITEMS)
             .min(candidate_item_limit(
-                self.candidate_schema.fields().len(),
+                self.layout.candidate_schema.fields().len(),
                 left.key.len(),
             ));
         let max_bytes = budget.remaining_bytes().clamp(1, CANDIDATE_BYTES);
@@ -881,12 +868,13 @@ impl AsOfJoinOperation {
             }
         }
         let scalar_slots = self
+            .layout
             .candidate_schema
             .fields()
             .len()
             .saturating_mul(eligible_count)
             .saturating_mul(size_of::<ScalarValue>());
-        let repeated_left = if self.residual.is_some() {
+        let repeated_left = if self.layout.residual.is_some() {
             left.key.len().saturating_mul(eligible_count)
         } else {
             0
@@ -913,21 +901,21 @@ impl AsOfJoinOperation {
         candidates: &[MergedCandidate],
         eligible: &[usize],
     ) -> Result<Vec<bool>, AsOfJoinError> {
-        if self.residual.is_none() {
+        if self.layout.residual.is_none() {
             return Ok(vec![true; eligible.len()]);
         }
         if eligible.is_empty() {
             return Ok(Vec::new());
         }
-        let left_values = decode_row(&self.input_schemas[0], &prepared_row_bytes(left)?)?;
+        let left_values = decode_row(&self.layout.input_schemas[0], &prepared_row_bytes(left)?)?;
         let left_fields = left_values.len();
-        let mut columns = (0..self.candidate_schema.fields().len())
+        let mut columns = (0..self.layout.candidate_schema.fields().len())
             .map(|_| Vec::with_capacity(eligible.len()))
             .collect::<Vec<Vec<ScalarValue>>>();
         for index in eligible {
             let candidate = &candidates[*index];
             let winner = winner_from_key(&candidate.key)?;
-            let right_values = decode_row(&self.input_schemas[1], &winner.row)?;
+            let right_values = decode_row(&self.layout.input_schemas[1], &winner.row)?;
             for (column, value) in columns[..left_fields].iter_mut().zip(&left_values) {
                 column.push(value.clone());
             }
@@ -941,11 +929,12 @@ impl AsOfJoinOperation {
             .collect::<Result<Vec<ArrayRef>, _>>()?;
         let options = RecordBatchOptions::new().with_row_count(Some(eligible.len()));
         let records = RecordBatch::try_new_with_options(
-            Arc::clone(&self.candidate_schema),
+            Arc::clone(&self.layout.candidate_schema),
             arrays,
             &options,
         )?;
         let predicate = self
+            .layout
             .residual
             .as_ref()
             .expect("the residual path has a bound expression")
@@ -986,7 +975,7 @@ impl AsOfJoinOperation {
             }
             Ordering::Greater => {}
             Ordering::Equal => {
-                debug_assert_eq!(self.tie_fallback, AsOfTieFallback::Reject);
+                debug_assert_eq!(self.layout.tie_fallback, AsOfTieFallback::Reject);
                 *ambiguous = true;
             }
         }
@@ -1005,7 +994,7 @@ impl AsOfJoinOperation {
             return Ok(false);
         }
         let comparison = candidate.order.cmp(&left.order);
-        let eligible = match self.direction {
+        let eligible = match self.layout.direction {
             AsOfDirection::Backward { allow_exact } => {
                 comparison == Ordering::Less || allow_exact && comparison == Ordering::Equal
             }
@@ -1019,7 +1008,7 @@ impl AsOfJoinOperation {
         if !eligible {
             return Ok(false);
         }
-        if let Some(tolerance) = self.tolerance
+        if let Some(tolerance) = self.layout.tolerance
             && self.distance(&left.order, &candidate.order)? > tolerance
         {
             return Ok(false);
@@ -1037,7 +1026,7 @@ impl AsOfJoinOperation {
         let order = if candidate.order == current.order {
             Ordering::Equal
         } else {
-            match self.direction {
+            match self.layout.direction {
                 AsOfDirection::Backward { .. } => current.order.cmp(&candidate.order),
                 AsOfDirection::Forward { .. } => candidate.order.cmp(&current.order),
                 AsOfDirection::Nearest { equidistant, .. } => {
@@ -1064,7 +1053,7 @@ impl AsOfJoinOperation {
         if rank != Ordering::Equal {
             return Ok(rank);
         }
-        Ok(match self.tie_fallback {
+        Ok(match self.layout.tie_fallback {
             AsOfTieFallback::Reject => Ordering::Equal,
             AsOfTieFallback::CanonicalAscending => candidate.row.cmp(&current.row),
             AsOfTieFallback::CanonicalDescending => current.row.cmp(&candidate.row),
@@ -1072,7 +1061,7 @@ impl AsOfJoinOperation {
     }
 
     fn distance(&self, left: &[u8], right: &[u8]) -> Result<u128, AsOfJoinError> {
-        let field = &self.orders[0].left.field;
+        let field = &self.layout.orders[0].left.field;
         match (decode_metric(field, left)?, decode_metric(field, right)?) {
             (Metric::Signed(left), Metric::Signed(right)) => Ok(left.abs_diff(right)),
             (Metric::Unsigned(left), Metric::Unsigned(right)) => Ok(left.abs_diff(right)),
@@ -1102,14 +1091,14 @@ impl AsOfJoinOperation {
         winner: Option<&Winner>,
         output: &mut OutputRows,
     ) -> Result<(), AsOfJoinError> {
-        let left = decode_row(&self.input_schemas[0], &prepared_row_bytes(row)?)?;
-        match self.kind {
+        let left = decode_row(&self.layout.input_schemas[0], &prepared_row_bytes(row)?)?;
+        match self.layout.kind {
             AsOfJoinKind::Inner | AsOfJoinKind::LeftOuter => {
                 if let Some(winner) = winner {
-                    let right = decode_row(&self.input_schemas[1], &winner.row)?;
+                    let right = decode_row(&self.layout.input_schemas[1], &winner.row)?;
                     output.push(&left, &right, row.difference);
-                } else if self.kind == AsOfJoinKind::LeftOuter {
-                    output.push(&left, &self.right_nulls, row.difference);
+                } else if self.layout.kind == AsOfJoinKind::LeftOuter {
+                    output.push(&left, &self.layout.right_nulls, row.difference);
                 }
             }
             AsOfJoinKind::LeftSemi => {
@@ -1128,51 +1117,60 @@ impl AsOfJoinOperation {
 
     fn append_correction(
         &self,
-        correction: &Correction,
+        left_row: &PreparedRow,
+        left_weight: u64,
+        before: Option<&Winner>,
+        after: Option<&Winner>,
         output: &mut OutputRows,
     ) -> Result<(), AsOfJoinError> {
-        if winner_key(correction.before.as_ref()) == winner_key(correction.after.as_ref()) {
+        if winner_key(before) == winner_key(after) {
             return Ok(());
         }
-        let before_matches = correction.before.is_some();
-        let after_matches = correction.after.is_some();
-        if self.kind.left_only() {
-            let (before_emits, after_emits) = match self.kind {
+        let before_matches = before.is_some();
+        let after_matches = after.is_some();
+        if self.layout.kind.left_only() {
+            let (before_emits, after_emits) = match self.layout.kind {
                 AsOfJoinKind::LeftSemi => (before_matches, after_matches),
                 AsOfJoinKind::LeftAnti => (!before_matches, !after_matches),
                 _ => unreachable!("left-only ASOF kind was checked"),
             };
             if before_emits != after_emits {
-                let left = decode_row(&self.input_schemas[0], &correction.left_row)?;
+                let left = decode_row(
+                    &self.layout.input_schemas[0],
+                    &prepared_row_bytes(left_row)?,
+                )?;
                 let difference = if after_emits {
-                    positive_difference(correction.left_weight)?
+                    positive_difference(left_weight)?
                 } else {
-                    negative_difference(correction.left_weight)?
+                    negative_difference(left_weight)?
                 };
                 output.push(&left, &[], difference);
             }
             return Ok(());
         }
 
-        let left = decode_row(&self.input_schemas[0], &correction.left_row)?;
-        if let Some(before) = &correction.before {
-            let right = decode_row(&self.input_schemas[1], &before.row)?;
-            output.push(&left, &right, negative_difference(correction.left_weight)?);
-        } else if self.kind == AsOfJoinKind::LeftOuter {
+        let left = decode_row(
+            &self.layout.input_schemas[0],
+            &prepared_row_bytes(left_row)?,
+        )?;
+        if let Some(before) = before {
+            let right = decode_row(&self.layout.input_schemas[1], &before.row)?;
+            output.push(&left, &right, negative_difference(left_weight)?);
+        } else if self.layout.kind == AsOfJoinKind::LeftOuter {
             output.push(
                 &left,
-                &self.right_nulls,
-                negative_difference(correction.left_weight)?,
+                &self.layout.right_nulls,
+                negative_difference(left_weight)?,
             );
         }
-        if let Some(after) = &correction.after {
-            let right = decode_row(&self.input_schemas[1], &after.row)?;
-            output.push(&left, &right, positive_difference(correction.left_weight)?);
-        } else if self.kind == AsOfJoinKind::LeftOuter {
+        if let Some(after) = after {
+            let right = decode_row(&self.layout.input_schemas[1], &after.row)?;
+            output.push(&left, &right, positive_difference(left_weight)?);
+        } else if self.layout.kind == AsOfJoinKind::LeftOuter {
             output.push(
                 &left,
-                &self.right_nulls,
-                positive_difference(correction.left_weight)?,
+                &self.layout.right_nulls,
+                positive_difference(left_weight)?,
             );
         }
         Ok(())

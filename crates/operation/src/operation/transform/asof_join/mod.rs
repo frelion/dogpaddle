@@ -30,18 +30,7 @@ fn construct(
     let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
     let continuation = scope.data::<state::Continuation>(definition::CONTINUATION)?;
     Ok(Operation::Turn(Box::new(AsOfJoinOperation {
-        kind: layout.kind,
-        direction: layout.direction,
-        tie_fallback: layout.tie_fallback,
-        tolerance: layout.tolerance,
-        input_schemas: layout.input_schemas,
-        candidate_schema: layout.candidate_schema,
-        output_schema: layout.output_schema,
-        equalities: layout.equalities,
-        orders: layout.orders,
-        ties: layout.ties,
-        right_nulls: layout.right_nulls,
-        residual: layout.residual,
+        layout,
         left_rows,
         right_rows,
         continuation,

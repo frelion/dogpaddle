@@ -426,7 +426,18 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
     })];
     let mut event = envelope(&columns, "c", Value::Null, json!({"value":"AA=="}));
     event["schema"]["fields"][0]["fields"][0]["parameters"]["scale"] = json!("3");
-    assert!(convert(&columns, &[event]).is_err());
+    assert!(matches!(
+        convert(&columns, &[event]),
+        Err(MySqlCdcScanError::InvalidRecord(message))
+            if message == "decimal schema changed at column value"
+    ));
+
+    let image = envelope(&columns, "c", Value::Null, Value::Null);
+    assert!(matches!(
+        convert(&columns, &[image]),
+        Err(MySqlCdcScanError::InvalidRecord(message))
+            if message == "missing complete row image; the captured table requires binlog_row_image=FULL"
+    ));
 
     let heartbeat = serde_json::to_vec(&heartbeat()).unwrap();
     assert!(
