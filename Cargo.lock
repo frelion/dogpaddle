@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ctrlc",
  "dogpaddle-flow",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-change"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-debezium"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crc32fast",
  "jni",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-debezium-runtime-host"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ctrlc",
  "dogpaddle-debezium",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-flow"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-mysql-system-host"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "dogpaddle-change",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-operation"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-perf-context"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-postgres-system-hosts"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-sql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-schema",
  "blake3",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-store"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "criterion",
  "dogpaddle-perf-context",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "dogpaddle-xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dogpaddle-sql",
 ]
