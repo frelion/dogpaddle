@@ -13,7 +13,7 @@ endpoint 在每次 `start` 开头一次解析为临时强类型快照，identity
 SQL 文件
   │
   ├─ syntax：验证一条 INSERT，并提取具体 source / sink
-  ├─ plan：用 DataFusion 做名称解析与类型转换，再翻译受支持的 LogicalPlan
+  ├─ plan：用 DataFusion 做名称解析与类型转换，收集共享 Scan 列并集，再降低算子图
   ├─ endpoint：发现具体 source / sink，注入运行资源并返回 Operation Definition
   └─ program：生成身份，创建或恢复持久 Flow
           │
@@ -89,6 +89,8 @@ let outcome = flow.advance()?;
 | `program.start(state)` | 状态路径不存在时编译并构建；存在时校验身份并恢复 |
 
 `start` 不会在恢复失败后回退为构建。状态不完整、损坏、被占用或属于另一份 Program 时都会失败，已有目录和数据保持不动。低层 Rust 用户若要直接声明 Operation 和拓扑，使用 `dogpaddle-flow` 的 `FlowFactory::build/open`。
+
+`start` 在一次入口中解析 endpoint、计算身份并建立 `FlowFactory`。已存在状态只注入运行资源并 `open`；新状态先做发现和 DataFusion 规划，再向同一 Factory 声明算子并 `build`。
 
 状态路径必须是 UTF-8。`start` 会创建缺失的父目录，并在派生外部资源身份前规范化路径。每次调用会把所有 endpoint 参数解析成一份临时快照；后续身份计算、发现和 build/open 都只读取这份快照，因此一次启动不会混用凭据轮换前后的值。
 
@@ -244,6 +246,7 @@ Station 融合和持久边界由 [Flow](../flow/README.md#最小公共-api) 唯�
 只执行 `TypeCoercion` Analyzer 并关闭 `Utf8View` 映射；语法层先拒绝会被 planner 擦除的 modifier。
 SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata 与 `AggregateCall` lowering，不重复函数目录。
 同一 CTE 的重复引用复用 Scan identity。lowering 先收集各次引用投影的最小并集，让共享 CDC Scan 从 source converter 起只输出这份并集；每个引用再在进入自己的分支前选择所需子集，因此一条分支的额外列不会扩大另一条分支的 Join 或 Aggregate 状态。空并集保留事件行数与 diff。CDC Definition 的 `output_projection` 属于开发期 v1 持久布局，旧状态直接重建。任何已声明却不可达的 Scan 都在创建状态前拒绝。
+这次列并集预遍历是共享 Scan 在第一次声明前确定持久投影所必需的；随后 lowering 在每个 Scan 的同一绑定中保存列并集，将待声明的 Definition 转成 `OperationRef`，重复引用只复用该声明并做自己的列选择。
 `ResolvedEndpoints` 是一次 start 的强类型快照，不复制 Query，也不在 identity/build/open 中重复解析。Program identity 使用手工稳定 framing 的 BLAKE3。
 
 ## 源码入口

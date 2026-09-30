@@ -63,7 +63,7 @@ struct PlanningContext {
 }
 
 impl PlanningContext {
-    fn new(scans: &[&OperationDefinition]) -> Result<Self, SqlError> {
+    fn new(scans: &[OperationDefinition]) -> Result<Self, SqlError> {
         let mut options = ConfigOptions::default();
         options.sql_parser.map_string_types_to_utf8view = false;
         let sources = scans
@@ -149,7 +149,7 @@ impl ContextProvider for PlanningContext {
 
 pub(crate) fn plan(
     query: datafusion_sql::sqlparser::ast::Query,
-    scans: &[&OperationDefinition],
+    scans: &[OperationDefinition],
 ) -> Result<LogicalPlan, SqlError> {
     let context = PlanningContext::new(scans)?;
     let plan = SqlToRel::new(&context).sql_statement_to_plan(Statement::Query(Box::new(query)))?;
@@ -166,21 +166,20 @@ pub(crate) fn plan(
 
 pub(crate) fn lower_query(
     plan: &LogicalPlan,
-    scans: Vec<OperationDefinition>,
-    scan_projections: Vec<Option<Vec<usize>>>,
+    scans: Vec<(OperationDefinition, Vec<usize>)>,
     factory: &mut FlowFactory,
 ) -> Result<OperationRef, SqlError> {
-    if scan_projections.len() != scans.len() {
-        return Err(SqlError::invalid(
-            "scan projection count differs from the declared scans",
-        ));
-    }
     let mut lowerer = Lowerer {
         factory,
         next_transform: 0,
-        scans: scans.into_iter().map(Some).collect(),
-        scan_nodes: HashMap::new(),
-        scan_projections,
+        scans: scans
+            .into_iter()
+            .map(|(definition, projection)| ScanBinding {
+                definition: Some(definition),
+                projection,
+                relation: None,
+            })
+            .collect(),
     };
     let output = lowerer.lower(plan)?;
     // Join lowering keeps unique physical names so parent expressions remain
@@ -189,11 +188,6 @@ pub(crate) fn lower_query(
     let output_schema = Arc::new(plan.schema().as_arrow().clone());
     let output_positions = (0..output_schema.fields().len()).collect::<Vec<_>>();
     let output = lowerer.project_columns(output, &output_positions, &output_schema)?;
-    if lowerer.scans.iter().any(Option::is_some) {
-        return Err(SqlError::invalid(
-            "every declared scan must be reachable from the query result",
-        ));
-    }
     Ok(output.node)
 }
 
@@ -201,6 +195,14 @@ pub(crate) fn lower_query(
 struct LoweredRelation {
     node: OperationRef,
     physical_schema: SchemaRef,
+}
+
+struct ScanBinding {
+    // The first occurrence moves definition into FlowFactory and records relation.
+    // Later occurrences reuse that relation with their own projected columns.
+    definition: Option<OperationDefinition>,
+    projection: Vec<usize>,
+    relation: Option<LoweredRelation>,
 }
 
 type EquiJoinKey = (Expr, Expr);
@@ -216,9 +218,7 @@ struct OrientedJoin {
 struct Lowerer<'a> {
     factory: &'a mut FlowFactory,
     next_transform: usize,
-    scans: Vec<Option<OperationDefinition>>,
-    scan_nodes: HashMap<usize, LoweredRelation>,
-    scan_projections: Vec<Option<Vec<usize>>>,
+    scans: Vec<ScanBinding>,
 }
 
 impl Lowerer<'_> {
@@ -472,14 +472,22 @@ impl Lowerer<'_> {
             .downcast_ref::<ScanSource>()
             .ok_or_else(|| SqlError::invalid("logical plan contains a foreign table source"))?;
         let occurrence = scan_projection(scan, source)?;
-        let shared = if let Some(node) = self.scan_nodes.get(&source.index) {
-            node.clone()
+        let shared = if let Some(relation) = self
+            .scans
+            .get(source.index)
+            .and_then(|scan| scan.relation.as_ref())
+        {
+            relation.clone()
         } else {
-            let definition = self
+            let binding = self
                 .scans
                 .get_mut(source.index)
-                .and_then(Option::take)
                 .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
+            let definition = binding
+                .definition
+                .take()
+                .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?;
+            let projection = binding.projection.clone();
             let physical_schema = definition
                 .output_schema(&[])
                 .map_err(SqlError::endpoint)?
@@ -491,12 +499,6 @@ impl Lowerer<'_> {
                 node,
                 physical_schema,
             };
-            let projection = self
-                .scan_projections
-                .get(source.index)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| SqlError::invalid("logical plan references an unknown scan"))?
-                .clone();
             let schema =
                 Arc::new(source.schema.project(&projection).map_err(|_| {
                     SqlError::invalid("scan projection is outside its source Schema")
@@ -510,12 +512,10 @@ impl Lowerer<'_> {
                     "scan Definition output differs from its full and shared projected Schemas",
                 ));
             };
-            self.scan_nodes.insert(source.index, relation.clone());
+            self.scans[source.index].relation = Some(relation.clone());
             relation
         };
-        let shared_projection = self.scan_projections[source.index]
-            .as_ref()
-            .expect("a lowered scan occurrence was collected first");
+        let shared_projection = &self.scans[source.index].projection;
         let positions = occurrence
             .iter()
             .map(|index| {
@@ -646,7 +646,7 @@ impl Lowerer<'_> {
 pub(crate) fn scan_projections(
     plan: &LogicalPlan,
     scan_count: usize,
-) -> Result<Vec<Option<Vec<usize>>>, SqlError> {
+) -> Result<Vec<Vec<usize>>, SqlError> {
     fn collect(plan: &LogicalPlan, unions: &mut [Option<BTreeSet<usize>>]) -> Result<(), SqlError> {
         if let LogicalPlan::TableScan(scan) = plan {
             let source = scan
@@ -668,10 +668,16 @@ pub(crate) fn scan_projections(
 
     let mut unions = vec![None; scan_count];
     collect(plan, &mut unions)?;
-    Ok(unions
+    unions
         .into_iter()
-        .map(|projection| projection.map(|indices| indices.into_iter().collect()))
-        .collect())
+        .map(|projection| {
+            projection
+                .map(|indices| indices.into_iter().collect())
+                .ok_or_else(|| {
+                    SqlError::invalid("every declared scan must be reachable from the query result")
+                })
+        })
+        .collect()
 }
 
 fn scan_projection(
@@ -994,8 +1000,7 @@ mod tests {
     fn plan_sql(sql: &str, scans: &[OperationDefinition]) -> LogicalPlan {
         let (_, query, endpoints) = crate::syntax::parse(sql).unwrap();
         assert_eq!(endpoints.len(), scans.len());
-        let scans = scans.iter().collect::<Vec<_>>();
-        plan(query, &scans).unwrap()
+        plan(query, scans).unwrap()
     }
 
     fn table_scans<'a>(
@@ -1031,7 +1036,7 @@ mod tests {
 
         assert_eq!(
             scan_projections(&plan, scans.len()).unwrap(),
-            [Some(vec![0, 1, 2]), Some(vec![0])]
+            [vec![0, 1, 2], vec![0]]
         );
     }
 
@@ -1053,7 +1058,7 @@ mod tests {
             &scans,
         );
         let projections = scan_projections(&plan, scans.len()).unwrap();
-        assert_eq!(projections, [Some(vec![0, 1])]);
+        assert_eq!(projections, [vec![0, 1]]);
 
         let full = wide_definition();
         let projected: OperationDefinition = PostgresCdcScanDefinition::try_new_projected(
@@ -1071,9 +1076,11 @@ mod tests {
         let mut lowerer = Lowerer {
             factory: &mut factory,
             next_transform: 0,
-            scans: vec![Some(projected)],
-            scan_nodes: HashMap::new(),
-            scan_projections: projections,
+            scans: vec![ScanBinding {
+                definition: Some(projected),
+                projection: projections[0].clone(),
+                relation: None,
+            }],
         };
         let mut schemas = occurrences
             .into_iter()
@@ -1098,7 +1105,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            lowerer.scan_nodes[&0]
+            lowerer.scans[0]
+                .relation
+                .as_ref()
+                .unwrap()
                 .physical_schema
                 .fields()
                 .iter()

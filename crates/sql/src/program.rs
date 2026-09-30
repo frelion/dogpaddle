@@ -82,11 +82,50 @@ impl SqlProgram {
             .then(resolve_debezium_runtime)
             .transpose()?;
         let (path, exists) = resolve_state_path(supplied_path)?;
+        let mut factory = FlowFactory::new(&path);
+        factory.owner_identity(identity);
         if exists {
-            Self::open_existing(&endpoints, &path, identity, runtime_bundle.as_deref())
-        } else {
-            self.build_new(&endpoints, &path, identity, runtime_bundle.as_deref())
+            for (index, scan) in endpoints.scans.iter().enumerate() {
+                let operation_id = scan_operation_id(index);
+                scan.install_open_runtime_resource(
+                    &mut factory,
+                    &operation_id,
+                    runtime_bundle.as_deref(),
+                )?;
+            }
+            endpoints.sink.install_open_runtime_resource(&mut factory)?;
+            return factory.open().map_err(Into::into);
         }
+
+        factory.output_capacity_bytes(OUTPUT_CAPACITY);
+        let scans = endpoints
+            .scans
+            .iter()
+            .enumerate()
+            .map(|(index, scan)| {
+                scan.build(
+                    &identity,
+                    index,
+                    &path,
+                    runtime_bundle.as_deref(),
+                    &mut factory,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let logical_plan = plan(self.query.clone(), &scans)?;
+        let projections = scan_projections(&logical_plan, scans.len())?;
+        let scans = scans
+            .into_iter()
+            .zip(projections)
+            .map(|(scan, projection)| {
+                project_scan_definition(scan, &projection)
+                    .map(|definition| (definition, projection))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = lower_query(&logical_plan, scans, &mut factory)?;
+        let sink = endpoints.sink.build(&identity, &path, &mut factory)?;
+        factory.operation(SINK_OPERATION_ID, sink, [output]);
+        factory.build().map_err(Into::into)
     }
 
     fn resolve_endpoints(&self) -> Result<ResolvedEndpoints, SqlError> {
@@ -98,62 +137,6 @@ impl SqlProgram {
                 .map(ScanEndpoint::resolve)
                 .collect::<Result<_, _>>()?,
         })
-    }
-
-    fn build_new(
-        &self,
-        endpoints: &ResolvedEndpoints,
-        path: &Path,
-        identity: [u8; 32],
-        runtime_bundle: Option<&Path>,
-    ) -> Result<Flow, SqlError> {
-        let mut factory = FlowFactory::new(path);
-        factory.owner_identity(identity);
-        factory.output_capacity_bytes(OUTPUT_CAPACITY);
-        let scans = endpoints
-            .scans
-            .iter()
-            .enumerate()
-            .map(|(index, scan)| scan.build(&identity, index, path, runtime_bundle, &mut factory))
-            .collect::<Result<Vec<_>, _>>()?;
-        let planning_scans = scans.iter().collect::<Vec<_>>();
-        let logical_plan = plan(self.query.clone(), &planning_scans)?;
-        drop(planning_scans);
-        let projections = scan_projections(&logical_plan, scans.len())?;
-        let scans = scans
-            .into_iter()
-            .zip(&projections)
-            .map(|(scan, projection)| {
-                project_scan_definition(
-                    scan,
-                    projection.as_deref().ok_or_else(|| {
-                        SqlError::invalid(
-                            "every declared scan must be reachable from the query result",
-                        )
-                    })?,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output = lower_query(&logical_plan, scans, projections, &mut factory)?;
-        let sink = endpoints.sink.build(&identity, path, &mut factory)?;
-        factory.operation(SINK_OPERATION_ID, sink, [output]);
-        factory.build().map_err(Into::into)
-    }
-
-    fn open_existing(
-        endpoints: &ResolvedEndpoints,
-        path: &Path,
-        identity: [u8; 32],
-        runtime_bundle: Option<&Path>,
-    ) -> Result<Flow, SqlError> {
-        let mut factory = FlowFactory::new(path);
-        factory.owner_identity(identity);
-        for (index, scan) in endpoints.scans.iter().enumerate() {
-            let operation_id = scan_operation_id(index);
-            scan.install_open_runtime_resource(&mut factory, &operation_id, runtime_bundle)?;
-        }
-        endpoints.sink.install_open_runtime_resource(&mut factory)?;
-        factory.open().map_err(Into::into)
     }
 
     fn identity(&self, endpoints: &ResolvedEndpoints) -> [u8; 32] {
