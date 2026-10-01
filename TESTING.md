@@ -55,6 +55,8 @@ Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合�
 
 SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
 
+CDC 固定列使用 Arrow `Fields`；公共 correctness 必须覆盖两源各自类型集合、Decimal128 范围、精确微秒/UTC、空 metadata、空投影仍完整校验，以及旧 Column JSON 拒绝。v1 literal golden 由真实 codec 验证，Flow 另验证旧列格式恢复失败不改写原定义。
+
 Endpoint 证据固定覆盖 `postgres_cdc(connection,table,publication[,bootstrap_spool_bytes][,CDC tuning...])`、
 `mysql_cdc(connection,table[,bootstrap_spool_bytes][,CDC tuning...])`、`postgres(connection,table)`、
 `clickhouse(connection,table)` 和 `doris(connection,table)`；CDC tuning

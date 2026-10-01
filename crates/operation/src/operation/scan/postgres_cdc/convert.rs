@@ -2,7 +2,7 @@ use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use serde_json::Value;
 
-use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn};
+use super::{PostgresCdcScanError, PostgresCdcScanSpec};
 use crate::operation::scan::{
     cdc_convert::{
         Row, build_change, complete_row, validate_envelope, validate_heartbeat,
@@ -101,7 +101,7 @@ fn convert_values_in_mode<'a>(
             continue;
         }
         if topic == Some(heartbeat_topic.as_str()) {
-            validate_heartbeat::<PostgresColumn>(schema, object_field(&value, "payload")?)?;
+            validate_heartbeat(schema, object_field(&value, "payload")?)?;
             continue;
         }
         validate_envelope(columns, schema)?;
@@ -172,7 +172,7 @@ fn apply_snapshot_notification(
     payload: &Row,
     mode: &mut ConversionMode,
 ) -> Result<(), PostgresCdcScanError> {
-    if !validate_snapshot_notification::<PostgresColumn>(payload)? {
+    if !validate_snapshot_notification(payload)? {
         return Ok(());
     }
     let ConversionMode::Capture { progress, sealed } = mode else {

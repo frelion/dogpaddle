@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field};
+
 use arrow_array::{
     Array, BinaryArray, Decimal128Array, Float64Array, Int16Array, Int32Array, Int64Array,
     StringArray,
@@ -10,42 +12,43 @@ use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
 use super::{
-    MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType,
+    MySqlCdcScanError, MySqlCdcScanSpec,
     convert::{SnapshotProgress, convert_snapshot_values, convert_values},
     schema,
 };
 use crate::operation::scan::cdc_runtime::Captured;
 
-fn column(data_type: MySqlType) -> MySqlColumn {
-    MySqlColumn::new("value", data_type, true)
+fn column(data_type: DataType) -> Field {
+    Field::new("value", data_type, true)
 }
 
-fn spec(columns: &[MySqlColumn]) -> MySqlCdcScanSpec {
+fn spec(columns: &[Field]) -> MySqlCdcScanSpec {
     MySqlCdcScanSpec {
         engine_name: "source".to_owned(),
         database: "shop".to_owned(),
         table: "events".to_owned(),
         server_uuid: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
         table_id: 43,
-        columns: columns.to_vec(),
+        columns: columns.to_vec().into(),
     }
 }
 
-fn identity_projection(columns: &[MySqlColumn]) -> Vec<u32> {
+fn identity_projection(columns: &[Field]) -> Vec<u32> {
     (0..u32::try_from(columns.len()).unwrap()).collect()
 }
 
-fn envelope(columns: &[MySqlColumn], op: &str, before: Value, after: Value) -> Value {
+fn envelope(columns: &[Field], op: &str, before: Value, after: Value) -> Value {
     let fields = columns
         .iter()
         .map(|column| {
-            let (literal, logical) = column.data_type().connect_type();
+            let (literal, logical) =
+                crate::operation::scan::cdc_convert::connect_type(column.data_type()).unwrap();
             let mut field =
                 json!({"field":column.name(),"type":literal,"optional":column.is_nullable()});
             if let Some(logical) = logical {
                 field["name"] = json!(logical);
             }
-            if let MySqlType::Decimal { precision, scale } = column.data_type() {
+            if let DataType::Decimal128(precision, scale) = column.data_type() {
                 field["parameters"] = json!({
                     "scale":scale.to_string(),
                     "connect.decimal.precision":precision.to_string(),
@@ -69,13 +72,13 @@ fn envelope(columns: &[MySqlColumn], op: &str, before: Value, after: Value) -> V
     event
 }
 
-fn convert(columns: &[MySqlColumn], events: &[Value]) -> Result<Option<Change>, MySqlCdcScanError> {
+fn convert(columns: &[Field], events: &[Value]) -> Result<Option<Change>, MySqlCdcScanError> {
     let projection = identity_projection(columns);
     convert_projected(columns, &projection, events)
 }
 
 fn convert_projected(
-    columns: &[MySqlColumn],
+    columns: &[Field],
     projection: &[u32],
     events: &[Value],
 ) -> Result<Option<Change>, MySqlCdcScanError> {
@@ -95,10 +98,10 @@ fn convert_projected(
 }
 
 fn projected_schema(
-    columns: &[MySqlColumn],
+    columns: &[Field],
     projection: &[u32],
 ) -> Result<Arc<Schema>, MySqlCdcScanError> {
-    let full_schema = schema::compile(columns)?;
+    let full_schema = schema::compile(&columns.to_vec().into())?;
     let fields = projection
         .iter()
         .map(|index| full_schema.fields()[usize::try_from(*index).unwrap()].clone())
@@ -124,14 +127,14 @@ fn notification(kind: &str) -> Value {
 }
 
 fn snapshot(
-    columns: &[MySqlColumn],
+    columns: &[Field],
     events: &[Value],
 ) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
     snapshot_after(columns, events, SnapshotProgress::default())
 }
 
 fn snapshot_after(
-    columns: &[MySqlColumn],
+    columns: &[Field],
     events: &[Value],
     progress: SnapshotProgress,
 ) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
@@ -140,7 +143,7 @@ fn snapshot_after(
 }
 
 fn snapshot_after_projected(
-    columns: &[MySqlColumn],
+    columns: &[Field],
     projection: &[u32],
     events: &[Value],
     progress: SnapshotProgress,
@@ -169,7 +172,7 @@ fn snapshot_after_projected(
 
 #[test]
 fn mysql_cdc_conversion_preserves_insert_update_delete_event_order() {
-    let columns = [column(MySqlType::Int64)];
+    let columns = [column(DataType::Int64)];
     let events = [
         envelope(&columns, "c", Value::Null, json!({"value":1})),
         envelope(&columns, "u", json!({"value":1}), json!({"value":2})),
@@ -202,9 +205,9 @@ fn mysql_cdc_conversion_preserves_insert_update_delete_event_order() {
 #[test]
 fn mysql_cdc_projection_validates_full_rows_and_preserves_zero_column_row_count() {
     let columns = [
-        MySqlColumn::new("id", MySqlType::Int64, false),
-        MySqlColumn::new("payload", MySqlType::Text, false),
-        MySqlColumn::new("unused", MySqlType::Binary, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("unused", DataType::Binary, false),
     ];
     let event = envelope(
         &columns,
@@ -252,8 +255,8 @@ fn mysql_cdc_projection_validates_full_rows_and_preserves_zero_column_row_count(
 #[test]
 fn mysql_cdc_projection_rejects_bad_unselected_values_in_streaming_and_capture() {
     let columns = [
-        MySqlColumn::new("id", MySqlType::Int64, false),
-        MySqlColumn::new("unused", MySqlType::Int32, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("unused", DataType::Int32, false),
     ];
     let projections: [&[u32]; 2] = [&[0], &[]];
 
@@ -280,21 +283,14 @@ fn mysql_cdc_projection_rejects_bad_unselected_values_in_streaming_and_capture()
 #[allow(clippy::too_many_lines)]
 fn mysql_cdc_conversion_preserves_every_supported_type_and_null() {
     let columns = [
-        MySqlColumn::new("tiny", MySqlType::Int16, true),
-        MySqlColumn::new("small", MySqlType::Int16, true),
-        MySqlColumn::new("integer", MySqlType::Int32, true),
-        MySqlColumn::new("big", MySqlType::Int64, true),
-        MySqlColumn::new("double", MySqlType::Float64, true),
-        MySqlColumn::new("text", MySqlType::Text, true),
-        MySqlColumn::new("binary", MySqlType::Binary, true),
-        MySqlColumn::new(
-            "decimal",
-            MySqlType::Decimal {
-                precision: 38,
-                scale: 2,
-            },
-            true,
-        ),
+        Field::new("tiny", DataType::Int16, true),
+        Field::new("small", DataType::Int16, true),
+        Field::new("integer", DataType::Int32, true),
+        Field::new("big", DataType::Int64, true),
+        Field::new("double", DataType::Float64, true),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("binary", DataType::Binary, true),
+        Field::new("decimal", DataType::Decimal128(38, 2), true),
     ];
     let unscaled = -99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
     let first = envelope(
@@ -386,7 +382,7 @@ fn mysql_cdc_conversion_preserves_every_supported_type_and_null() {
 
 #[test]
 fn mysql_cdc_conversion_rejects_snapshot_truncate_schema_change_and_wrong_metadata() {
-    let columns = [column(MySqlType::Int64)];
+    let columns = [column(DataType::Int64)];
     for operation in ["r", "t", "m", "unknown"] {
         assert!(
             convert(
@@ -411,7 +407,7 @@ fn mysql_cdc_conversion_rejects_snapshot_truncate_schema_change_and_wrong_metada
         convert_values(
             &spec(&columns),
             &identity_projection(&columns),
-            schema::compile(&columns).unwrap(),
+            schema::compile(&columns.to_vec().into()).unwrap(),
             [(Some("source"), Some(schema_change.as_slice()))],
         )
         .is_err()
@@ -420,10 +416,7 @@ fn mysql_cdc_conversion_rejects_snapshot_truncate_schema_change_and_wrong_metada
 
 #[test]
 fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
-    let columns = [column(MySqlType::Decimal {
-        precision: 4,
-        scale: 2,
-    })];
+    let columns = [column(DataType::Decimal128(4, 2))];
     let mut event = envelope(&columns, "c", Value::Null, json!({"value":"AA=="}));
     event["schema"]["fields"][0]["fields"][0]["parameters"]["scale"] = json!("3");
     assert!(matches!(
@@ -444,7 +437,7 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
         convert_values(
             &spec(&columns),
             &identity_projection(&columns),
-            schema::compile(&columns).unwrap(),
+            schema::compile(&columns.to_vec().into()).unwrap(),
             [(
                 Some("__debezium-heartbeat.source"),
                 Some(heartbeat.as_slice())
@@ -457,7 +450,7 @@ fn mysql_cdc_conversion_validates_exact_schema_and_identified_heartbeat() {
 
 #[test]
 fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
-    let columns = [column(MySqlType::Int64)];
+    let columns = [column(DataType::Int64)];
     let mut row = envelope(&columns, "r", Value::Null, json!({"value":7}));
     row["payload"]["source"]["snapshot"] = json!("last");
 
@@ -503,7 +496,7 @@ fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
 
 #[test]
 fn mysql_cdc_snapshot_accepts_debezium_collection_boundary_markers() {
-    let columns = [column(MySqlType::Int64)];
+    let columns = [column(DataType::Int64)];
     let mut first = envelope(&columns, "r", Value::Null, json!({"value":1}));
     first["payload"]["source"]["snapshot"] = json!("first");
     let progress = snapshot(&columns, &[first]).unwrap().progress;
@@ -523,7 +516,7 @@ fn mysql_cdc_snapshot_accepts_debezium_collection_boundary_markers() {
 
 #[test]
 fn mysql_cdc_snapshot_progress_crosses_delivery_boundaries() {
-    let columns = [column(MySqlType::Int64)];
+    let columns = [column(DataType::Int64)];
     let mut first_row = envelope(&columns, "r", Value::Null, json!({"value":1}));
     first_row["payload"]["source"]["snapshot"] = json!("true");
     let first = snapshot(&columns, &[first_row]).unwrap();
@@ -542,7 +535,7 @@ fn mysql_cdc_snapshot_progress_crosses_delivery_boundaries() {
 
 #[test]
 fn mysql_cdc_float_preserves_signed_zero_nan_and_infinities() {
-    let columns = [column(MySqlType::Float64)];
+    let columns = [column(DataType::Float64)];
     for (value, expected) in [
         (json!(-0.0), -0.0_f64),
         (json!("NaN"), f64::NAN),

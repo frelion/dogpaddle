@@ -1,4 +1,9 @@
-use std::{num::NonZeroU32, time::Duration};
+use arrow_schema::{DataType, Field};
+use dogpaddle_operation::operation::scan::{MySqlCdcScanDefinition, MySqlCdcScanSpec};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use dogpaddle_operation::{
     OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
@@ -37,7 +42,7 @@ fn config() -> MySqlCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
-    expected.extend_from_slice(br#"{"mysql_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
+    expected.extend_from_slice(br#"{"mysql_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
     expected
 }
 
@@ -249,4 +254,77 @@ fn raw_plan_business_validation_precedes_store_handle_access() {
     payload["mysql_cdc_scan"]["output_projection"] = serde_json::json!([1, 0]);
     let plan = serde_json::from_value(payload).unwrap();
     crate::support::assert_rejected_plan_before_data(&plan, &[], RuntimeResource::new(config()));
+}
+
+#[test]
+fn retired_column_layout_is_not_recognized() {
+    let mut legacy = b"dogpaddle.operation\0\0\x01".to_vec();
+    legacy.extend_from_slice(br#"{"mysql_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
+    assert!(decode_definition(&legacy).is_err());
+}
+
+#[test]
+fn arrow_source_types_are_validated_before_encoding_and_store_access() {
+    use arrow_schema::TimeUnit;
+    let mut invalid = vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(
+            "id",
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            false,
+        ),
+        Field::new("id", DataType::Decimal128(255, 0), false),
+        Field::new("id", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new(
+            "id",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Europe/Paris".into())),
+            false,
+        ),
+        Field::new("id", DataType::Int64, false).with_metadata(
+            [("source".to_owned(), "custom".to_owned())]
+                .into_iter()
+                .collect::<arrow_schema::Metadata>(),
+        ),
+    ];
+    invalid.extend(
+        [
+            DataType::Boolean,
+            DataType::Float32,
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ]
+        .map(|data_type| Field::new("id", data_type, false)),
+    );
+    for field in invalid {
+        let mut raw = serde_json::to_value(definition()).unwrap();
+        let mut spec: MySqlCdcScanSpec =
+            serde_json::from_value(raw["mysql_cdc_scan"]["spec"].clone()).unwrap();
+        spec.columns = vec![field].into();
+        raw["mysql_cdc_scan"]["spec"] = serde_json::to_value(&spec).unwrap();
+        assert!(
+            MySqlCdcScanDefinition::try_new_projected(
+                spec,
+                vec![],
+                NonZeroU64::new(1_048_576).unwrap()
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_value::<OperationDefinition>(raw).is_err());
+    }
+}
+
+#[test]
+fn raw_value_rejects_deep_source_types_before_the_plan_can_be_encoded() {
+    let mut field = Field::new("item", DataType::Int64, true);
+    for _ in 0..192 {
+        field = Field::new("item", DataType::List(std::sync::Arc::new(field)), true);
+    }
+    let mut raw = serde_json::to_value(definition()).unwrap();
+    raw["mysql_cdc_scan"]["spec"]["columns"] = serde_json::to_value(vec![field]).unwrap();
+    assert!(serde_json::from_value::<OperationDefinition>(raw).is_err());
 }

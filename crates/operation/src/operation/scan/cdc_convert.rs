@@ -1,149 +1,171 @@
 //! Connect row validation and Arrow construction shared by the two CDC sources.
 
-use std::{io, sync::Arc};
+use std::{collections::HashSet, io, sync::Arc};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use base64::{Engine as _, prelude::BASE64_STANDARD, read::DecoderReader};
 use chrono::DateTime;
 use dogpaddle_change::{Change, ChangeError};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 pub(super) type Row = Map<String, Value>;
 
-/// The Connect representation of one supported Arrow column.
-#[derive(Clone, Copy)]
-pub(super) enum WireKind {
-    Boolean,
-    Int16,
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Text,
-    Binary,
-    Date,
-    Timestamp,
-    TimestampTz,
-    Decimal { precision: u8, scale: i8 },
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ConvertError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("missing complete row image")]
+    IncompleteImage,
+    #[error(transparent)]
+    Arrow(#[from] ArrowError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
 }
 
-impl WireKind {
-    pub(super) fn arrow_type(self) -> DataType {
-        match self {
-            Self::Boolean => DataType::Boolean,
-            Self::Int16 => DataType::Int16,
-            Self::Int32 => DataType::Int32,
-            Self::Int64 => DataType::Int64,
-            Self::Float32 => DataType::Float32,
-            Self::Float64 => DataType::Float64,
-            Self::Text => DataType::Utf8,
-            Self::Binary => DataType::Binary,
-            Self::Date => DataType::Date32,
-            Self::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-            Self::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            Self::Decimal { precision, scale } => DataType::Decimal128(precision, scale),
+fn invalid(message: impl Into<String>) -> ConvertError {
+    ConvertError::Invalid(message.into())
+}
+
+// Arrow DataType is recursive, while source columns are flat. Inspect only the
+// outer type shape before asking Arrow to deserialize the field recursively.
+pub(super) fn deserialize_flat_fields<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Fields, D::Error> {
+    let columns = Vec::<Value>::deserialize(decoder)?;
+    if columns.is_empty() || columns.len() > 1600 {
+        return Err(serde::de::Error::custom(
+            "table must have between 1 and 1600 columns",
+        ));
+    }
+    for column in &columns {
+        let flat = match column.get("data_type") {
+            Some(Value::String(_)) => true,
+            Some(Value::Object(kind)) if kind.len() == 1 => {
+                kind.contains_key("Decimal128") || kind.contains_key("Timestamp")
+            }
+            _ => false,
+        };
+        if !flat {
+            return Err(serde::de::Error::custom("source column type must be flat"));
         }
     }
+    serde_json::from_value(Value::Array(columns)).map_err(serde::de::Error::custom)
+}
 
-    pub(super) const fn connect_type(self) -> (&'static str, Option<&'static str>) {
-        match self {
-            Self::Boolean => ("boolean", None),
-            Self::Int16 => ("int16", None),
-            Self::Int32 => ("int32", None),
-            Self::Int64 => ("int64", None),
-            Self::Float32 => ("float", None),
-            Self::Float64 => ("double", None),
-            Self::Text => ("string", None),
-            Self::Binary => ("bytes", None),
-            Self::Date => ("int32", Some("io.debezium.time.Date")),
-            Self::Timestamp => ("int64", Some("io.debezium.time.MicroTimestamp")),
-            Self::TimestampTz => ("string", Some("io.debezium.time.ZonedTimestamp")),
-            Self::Decimal { .. } => ("bytes", Some("org.apache.kafka.connect.data.Decimal")),
+pub(super) fn source_schema(
+    columns: &Fields,
+    supported: impl Fn(&DataType) -> bool,
+) -> Result<SchemaRef, String> {
+    if columns.is_empty() || columns.len() > 1600 {
+        return Err("table must have between 1 and 1600 columns".into());
+    }
+    let mut names = HashSet::with_capacity(columns.len());
+    for field in columns {
+        if !supported(field.data_type()) {
+            return Err("unsupported source column type".into());
+        }
+        if field.name().is_empty() || field.name().contains('\0') || !names.insert(field.name()) {
+            return Err("column names must be nonempty, NUL-free, and unique".into());
+        }
+        if !field.metadata().is_empty() {
+            return Err("source column metadata must be empty".into());
         }
     }
+    let schema = Arc::new(Schema::new(columns.clone()));
+    dogpaddle_change::validate_schema(&schema).map_err(|error| error.to_string())?;
+    Ok(schema)
 }
 
-/// Binds the common wire algorithm to one source's declared column and error type.
-pub(super) trait WireColumn {
-    type Error: From<ArrowError> + From<ChangeError>;
-
-    const INCOMPLETE_IMAGE: &'static str;
-    const DECIMAL_LABEL: &'static str;
-
-    fn name(&self) -> &str;
-    fn nullable(&self) -> bool;
-    fn wire_kind(&self) -> WireKind;
-    fn invalid_record(message: String) -> Self::Error;
+pub(super) fn connect_type(
+    data_type: &DataType,
+) -> Result<(&'static str, Option<&'static str>), ConvertError> {
+    Ok(match data_type {
+        DataType::Boolean => ("boolean", None),
+        DataType::Int16 => ("int16", None),
+        DataType::Int32 => ("int32", None),
+        DataType::Int64 => ("int64", None),
+        DataType::Float32 => ("float", None),
+        DataType::Float64 => ("double", None),
+        DataType::Utf8 => ("string", None),
+        DataType::Binary => ("bytes", None),
+        DataType::Date32 => ("int32", Some("io.debezium.time.Date")),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            ("int64", Some("io.debezium.time.MicroTimestamp"))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => {
+            ("string", Some("io.debezium.time.ZonedTimestamp"))
+        }
+        DataType::Decimal128(precision, scale) if valid_decimal(*precision, *scale) => {
+            ("bytes", Some("org.apache.kafka.connect.data.Decimal"))
+        }
+        _ => return Err(invalid("unsupported source column type")),
+    })
 }
 
-fn invalid<C: WireColumn>(message: impl Into<String>) -> C::Error {
-    C::invalid_record(message.into())
+pub(super) fn valid_decimal(precision: u8, scale: i8) -> bool {
+    (1..=38).contains(&precision)
+        && scale >= 0
+        && u8::try_from(scale).is_ok_and(|scale| scale <= precision)
 }
 
-fn object_field<'a, C: WireColumn>(value: &'a Value, field: &str) -> Result<&'a Row, C::Error> {
+fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, ConvertError> {
     value
         .get(field)
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid::<C>(format!("missing object field {field}")))
+        .ok_or_else(|| invalid(format!("missing object field {field}")))
 }
 
-pub(super) fn validate_snapshot_notification<C: WireColumn>(
-    payload: &Row,
-) -> Result<bool, C::Error> {
+pub(super) fn validate_snapshot_notification(payload: &Row) -> Result<bool, ConvertError> {
     if payload.get("aggregate_type").and_then(Value::as_str) != Some("Initial Snapshot") {
-        return Err(invalid::<C>("unexpected Debezium notification aggregate"));
+        return Err(invalid("unexpected Debezium notification aggregate"));
     }
     match payload.get("type").and_then(Value::as_str) {
         Some("STARTED" | "IN_PROGRESS" | "TABLE_SCAN_COMPLETED") => Ok(false),
         Some("COMPLETED") => Ok(true),
-        Some("ABORTED" | "SKIPPED") => Err(invalid::<C>(
+        Some("ABORTED" | "SKIPPED") => Err(invalid(
             "Debezium initial snapshot did not complete successfully",
         )),
-        _ => Err(invalid::<C>(
-            "unexpected Debezium initial snapshot notification",
-        )),
+        _ => Err(invalid("unexpected Debezium initial snapshot notification")),
     }
 }
 
-pub(super) fn validate_envelope<C: WireColumn>(
-    columns: &[C],
-    schema: &Row,
-) -> Result<(), C::Error> {
+pub(super) fn validate_envelope(columns: &Fields, schema: &Row) -> Result<(), ConvertError> {
     if schema.get("type").and_then(Value::as_str) != Some("struct") {
-        return Err(invalid::<C>("envelope schema must be a struct"));
+        return Err(invalid("envelope schema must be a struct"));
     }
     let fields = schema
         .get("fields")
         .and_then(Value::as_array)
-        .ok_or_else(|| invalid::<C>("envelope schema has no fields"))?;
+        .ok_or_else(|| invalid("envelope schema has no fields"))?;
     for row_name in ["before", "after"] {
         let mut matches = fields
             .iter()
             .filter(|field| field.get("field").and_then(Value::as_str) == Some(row_name));
         let row = matches
             .next()
-            .ok_or_else(|| invalid::<C>("missing row schema"))?;
+            .ok_or_else(|| invalid("missing row schema"))?;
         if matches.next().is_some()
             || row.get("type").and_then(Value::as_str) != Some("struct")
             || row.get("optional").and_then(Value::as_bool) != Some(true)
         {
-            return Err(invalid::<C>("row schema must be one optional struct"));
+            return Err(invalid("row schema must be one optional struct"));
         }
         let fields = row
             .get("fields")
             .and_then(Value::as_array)
-            .ok_or_else(|| invalid::<C>("row schema has no fields"))?;
+            .ok_or_else(|| invalid("row schema has no fields"))?;
         if fields.len() != columns.len() {
-            return Err(invalid::<C>("table schema changed its column count"));
+            return Err(invalid("table schema changed its column count"));
         }
         for (column, field) in columns.iter().zip(fields) {
-            let kind = column.wire_kind();
-            let (literal, logical) = kind.connect_type();
+            let kind = column.data_type();
+            let (literal, logical) = connect_type(kind)?;
             let logical_matches = match (logical, field.get("name")) {
                 (None, None) => true,
                 (Some(expected), Some(Value::String(actual))) => actual == expected,
@@ -152,15 +174,15 @@ pub(super) fn validate_envelope<C: WireColumn>(
             if field.get("field").and_then(Value::as_str) != Some(column.name())
                 || field.get("type").and_then(Value::as_str) != Some(literal)
                 || !logical_matches
-                || field.get("optional").and_then(Value::as_bool) != Some(column.nullable())
+                || field.get("optional").and_then(Value::as_bool) != Some(column.is_nullable())
             {
-                return Err(invalid::<C>(format!(
+                return Err(invalid(format!(
                     "schema changed at column {}",
                     column.name()
                 )));
             }
-            if let WireKind::Decimal { precision, scale } = kind {
-                let parameters = object_field::<C>(field, "parameters")?;
+            if let DataType::Decimal128(precision, scale) = kind {
+                let parameters = object_field(field, "parameters")?;
                 if parameters.get("scale").and_then(Value::as_str)
                     != Some(scale.to_string().as_str())
                     || parameters
@@ -168,9 +190,8 @@ pub(super) fn validate_envelope<C: WireColumn>(
                         .and_then(Value::as_str)
                         != Some(precision.to_string().as_str())
                 {
-                    return Err(invalid::<C>(format!(
-                        "{} schema changed at column {}",
-                        C::DECIMAL_LABEL,
+                    return Err(invalid(format!(
+                        "decimal schema changed at column {}",
                         column.name()
                     )));
                 }
@@ -180,15 +201,12 @@ pub(super) fn validate_envelope<C: WireColumn>(
     Ok(())
 }
 
-pub(super) fn validate_heartbeat<C: WireColumn>(
-    schema: &Row,
-    payload: &Row,
-) -> Result<(), C::Error> {
+pub(super) fn validate_heartbeat(schema: &Row, payload: &Row) -> Result<(), ConvertError> {
     let fields = schema
         .get("fields")
         .and_then(Value::as_array)
         .filter(|fields| fields.len() == 1)
-        .ok_or_else(|| invalid::<C>("unexpected heartbeat schema"))?;
+        .ok_or_else(|| invalid("unexpected heartbeat schema"))?;
     let timestamp = &fields[0];
     if schema.get("type").and_then(Value::as_str) != Some("struct")
         || schema.get("name").and_then(Value::as_str)
@@ -200,22 +218,22 @@ pub(super) fn validate_heartbeat<C: WireColumn>(
         || payload.len() != 1
         || payload.get("ts_ms").and_then(Value::as_i64).is_none()
     {
-        return Err(invalid::<C>("unexpected heartbeat record"));
+        return Err(invalid("unexpected heartbeat record"));
     }
     Ok(())
 }
 
 #[allow(clippy::cast_possible_truncation)] // A validated source has at most 1600 columns.
-pub(super) fn complete_row<C: WireColumn>(
-    columns: &[C],
+pub(super) fn complete_row(
+    columns: &Fields,
     output_projection: &[u32],
     value: Value,
-) -> Result<Row, C::Error> {
+) -> Result<Row, ConvertError> {
     let Value::Object(mut row) = value else {
-        return Err(invalid::<C>(C::INCOMPLETE_IMAGE));
+        return Err(ConvertError::IncompleteImage);
     };
     if row.len() != columns.len() {
-        return Err(invalid::<C>(
+        return Err(invalid(
             "row image does not contain exactly the declared columns",
         ));
     }
@@ -223,11 +241,11 @@ pub(super) fn complete_row<C: WireColumn>(
     let mut next = projection.next();
     for (index, column) in columns.iter().enumerate() {
         {
-            let value = row.get(column.name()).ok_or_else(|| {
-                invalid::<C>(format!("row image is missing column {}", column.name()))
-            })?;
-            if value.is_null() && !column.nullable() {
-                return Err(invalid::<C>(format!(
+            let value = row
+                .get(column.name())
+                .ok_or_else(|| invalid(format!("row image is missing column {}", column.name())))?;
+            if value.is_null() && !column.is_nullable() {
+                return Err(invalid(format!(
                     "non-null column {} contains null",
                     column.name()
                 )));
@@ -243,13 +261,13 @@ pub(super) fn complete_row<C: WireColumn>(
     Ok(row)
 }
 
-pub(super) fn build_change<C: WireColumn>(
-    columns: &[C],
+pub(super) fn build_change(
+    columns: &Fields,
     output_projection: &[u32],
     output_schema: SchemaRef,
     rows: &[Row],
     diffs: Vec<i64>,
-) -> Result<Option<Change>, C::Error> {
+) -> Result<Option<Change>, ConvertError> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -259,7 +277,7 @@ pub(super) fn build_change<C: WireColumn>(
             let column = usize::try_from(*index)
                 .ok()
                 .and_then(|index| columns.get(index))
-                .ok_or_else(|| invalid::<C>("output projection is outside the source schema"))?;
+                .ok_or_else(|| invalid("output projection is outside the source schema"))?;
             column_array(column, rows)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -268,11 +286,11 @@ pub(super) fn build_change<C: WireColumn>(
     Ok(Some(Change::try_new(records, Int64Array::from(diffs))?))
 }
 
-fn column_values<'a, C: WireColumn, T>(
-    column: &C,
+fn column_values<'a, T>(
+    column: &Field,
     rows: &'a [Row],
     parse: impl Fn(&'a Value) -> Option<T>,
-) -> Result<Vec<Option<T>>, C::Error> {
+) -> Result<Vec<Option<T>>, ConvertError> {
     rows.iter()
         .map(|row| {
             let value = &row[column.name()];
@@ -287,83 +305,87 @@ fn column_values<'a, C: WireColumn, T>(
         .collect()
 }
 
-fn validate_column_value<C: WireColumn>(column: &C, value: &Value) -> Result<(), C::Error> {
+fn validate_column_value(column: &Field, value: &Value) -> Result<(), ConvertError> {
     let valid = value.is_null()
-        || match column.wire_kind() {
-            WireKind::Boolean => value.as_bool().is_some(),
-            WireKind::Int16 => parse_int16(value).is_some(),
-            WireKind::Int32 => parse_int32(value).is_some(),
-            WireKind::Int64 => value.as_i64().is_some(),
-            WireKind::Float32 => parse_float32(value).is_some(),
-            WireKind::Float64 => parse_float64(value).is_some(),
-            WireKind::Text => value.as_str().is_some(),
-            WireKind::Binary => valid_binary(value),
-            WireKind::Date => parse_date(value).is_some(),
-            WireKind::Timestamp => parse_timestamp(value).is_some(),
-            WireKind::TimestampTz => parse_timestamp_tz(value).is_some(),
-            WireKind::Decimal { precision, .. } => parse_decimal(value, precision).is_some(),
+        || match column.data_type() {
+            DataType::Boolean => value.as_bool().is_some(),
+            DataType::Int16 => parse_int16(value).is_some(),
+            DataType::Int32 => parse_int32(value).is_some(),
+            DataType::Int64 => value.as_i64().is_some(),
+            DataType::Float32 => parse_float32(value).is_some(),
+            DataType::Float64 => parse_float64(value).is_some(),
+            DataType::Utf8 => value.as_str().is_some(),
+            DataType::Binary => valid_binary(value),
+            DataType::Date32 => parse_date(value).is_some(),
+            DataType::Timestamp(TimeUnit::Microsecond, None) => parse_timestamp(value).is_some(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => {
+                parse_timestamp_tz(value).is_some()
+            }
+            DataType::Decimal128(precision, _) => parse_decimal(value, *precision).is_some(),
+            _ => false,
         };
     valid
         .then_some(())
         .ok_or_else(|| invalid_column_value(column))
 }
 
-fn invalid_column_value<C: WireColumn>(column: &C) -> C::Error {
-    invalid::<C>(format!(
+fn invalid_column_value(column: &Field) -> ConvertError {
+    invalid(format!(
         "invalid or unsupported value in column {}",
         column.name()
     ))
 }
 
-fn column_array<C: WireColumn>(column: &C, rows: &[Row]) -> Result<ArrayRef, C::Error> {
-    Ok(match column.wire_kind() {
-        WireKind::Boolean => Arc::new(BooleanArray::from(column_values(
+fn column_array(column: &Field, rows: &[Row]) -> Result<ArrayRef, ConvertError> {
+    Ok(match column.data_type() {
+        DataType::Boolean => Arc::new(BooleanArray::from(column_values(
             column,
             rows,
             Value::as_bool,
         )?)),
-        WireKind::Int16 => Arc::new(Int16Array::from(column_values(column, rows, parse_int16)?)),
-        WireKind::Int32 => Arc::new(Int32Array::from(column_values(column, rows, parse_int32)?)),
-        WireKind::Int64 => Arc::new(Int64Array::from(column_values(
+        DataType::Int16 => Arc::new(Int16Array::from(column_values(column, rows, parse_int16)?)),
+        DataType::Int32 => Arc::new(Int32Array::from(column_values(column, rows, parse_int32)?)),
+        DataType::Int64 => Arc::new(Int64Array::from(column_values(
             column,
             rows,
             Value::as_i64,
         )?)),
-        WireKind::Float32 => Arc::new(Float32Array::from(column_values(
+        DataType::Float32 => Arc::new(Float32Array::from(column_values(
             column,
             rows,
             parse_float32,
         )?)),
-        WireKind::Float64 => Arc::new(Float64Array::from(column_values(
+        DataType::Float64 => Arc::new(Float64Array::from(column_values(
             column,
             rows,
             parse_float64,
         )?)),
-        WireKind::Text => Arc::new(StringArray::from(column_values(
+        DataType::Utf8 => Arc::new(StringArray::from(column_values(
             column,
             rows,
             Value::as_str,
         )?)),
-        WireKind::Binary => {
+        DataType::Binary => {
             let values = column_values(column, rows, parse_binary)?;
             Arc::new(values.iter().map(Option::as_deref).collect::<BinaryArray>())
         }
-        WireKind::Date => Arc::new(Date32Array::from(column_values(column, rows, parse_date)?)),
-        WireKind::Timestamp => Arc::new(TimestampMicrosecondArray::from(column_values(
-            column,
-            rows,
-            parse_timestamp,
-        )?)),
-        WireKind::TimestampTz => Arc::new(
-            TimestampMicrosecondArray::from(column_values(column, rows, parse_timestamp_tz)?)
-                .with_timezone("UTC"),
+        DataType::Date32 => Arc::new(Date32Array::from(column_values(column, rows, parse_date)?)),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Arc::new(
+            TimestampMicrosecondArray::from(column_values(column, rows, parse_timestamp)?),
         ),
-        WireKind::Decimal { precision, scale } => Arc::new(
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => {
+            Arc::new(
+                TimestampMicrosecondArray::from(column_values(column, rows, parse_timestamp_tz)?)
+                    .with_timezone("UTC"),
+            )
+        }
+        DataType::Decimal128(precision, scale) => Arc::new(
             Decimal128Array::from(column_values(column, rows, |value| {
-                parse_decimal(value, precision)
+                parse_decimal(value, *precision)
             })?)
-            .with_precision_and_scale(precision, scale)?,
+            .with_precision_and_scale(*precision, *scale)?,
         ),
+        _ => return Err(invalid("unsupported source column type")),
     })
 }
 
@@ -427,6 +449,9 @@ fn parse_float32(value: &Value) -> Option<f32> {
 }
 
 fn parse_decimal(value: &Value, precision: u8) -> Option<i128> {
+    if !(1..=38).contains(&precision) {
+        return None;
+    }
     let encoded_value = value.as_str()?;
     // At most 16 decoded bytes fit in i128; a 24-byte Base64 input needs
     // an 18-byte output slice for the decoder's conservative size estimate.

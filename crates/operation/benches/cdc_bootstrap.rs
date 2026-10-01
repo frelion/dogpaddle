@@ -40,8 +40,8 @@ impl Source {
 
     fn definition(self) -> OperationDefinition {
         let payload: &[u8] = match self {
-            Self::Postgres => br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#,
-            Self::MySql => br#"{"mysql_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#,
+            Self::Postgres => br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#,
+            Self::MySql => br#"{"mysql_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","table":"orders","server_uuid":"01234567-89ab-cdef-0123-456789abcdef","table_id":43,"columns":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#,
         };
         let mut bytes = b"dogpaddle.operation\0\0\x01".to_vec();
         bytes.extend_from_slice(payload);

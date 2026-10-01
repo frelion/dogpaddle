@@ -1,11 +1,11 @@
 use std::{any::TypeId, num::NonZeroU64, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{Fields, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
 
-use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlColumn, schema};
+use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, schema};
 use dogpaddle_store::{Cell, Queue};
 
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
@@ -33,8 +33,13 @@ pub struct MySqlCdcScanSpec {
     pub server_uuid: String,
     /// `InnoDB`'s nonzero durable table identity.
     pub table_id: u64,
-    /// Complete ordered logical columns; unsupported `MySQL` types are rejected.
-    pub columns: Vec<MySqlColumn>,
+    /// Complete ordered Arrow fields, shared with the output Schema.
+    ///
+    /// Only the source's supported flat types are accepted. Field metadata must
+    /// be empty; dictionary-only attributes have Arrow's usual non-dictionary
+    /// semantics. See the crate's CDC contract for native discovery restrictions.
+    #[serde(deserialize_with = "schema::deserialize_fields")]
+    pub columns: Fields,
 }
 
 /// Fixed-Schema, single-table `MySQL` snapshot and binlog CDC Scan.
@@ -110,8 +115,9 @@ impl MySqlCdcScanDefinition {
         Ok(definition)
     }
 
-    fn validate(&self) -> Result<(), MySqlCdcScanError> {
+    fn validate(&self) -> Result<SchemaRef, MySqlCdcScanError> {
         validate_spec(&self.spec)?;
+        let schema = schema::compile(&self.spec.columns)?;
         super::super::ordered_projection(&self.output_projection, self.spec.columns.len())
             .ok_or_else(invalid_projection)?;
         if encode(self)?.len() > MAX_DEFINITION_BYTES {
@@ -119,7 +125,7 @@ impl MySqlCdcScanDefinition {
                 "scan definition exceeds 1 MiB".to_owned(),
             ));
         }
-        Ok(())
+        Ok(schema)
     }
 
     /// Returns the frozen, non-sensitive Scan specification.
@@ -145,8 +151,8 @@ impl MySqlCdcScanDefinition {
     pub(crate) fn output_schema_unchecked(
         &self,
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        self.validate()?;
-        output_schema(&self.spec, &self.output_projection)
+        let full = self.validate()?;
+        output_schema(&full, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
@@ -156,8 +162,8 @@ impl MySqlCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        self.validate().map_err(schema_error)?;
-        let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
+        let full = self.validate().map_err(schema_error)?;
+        let output = output_schema(&full, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
         let input = scope.data::<Queue<Vec<u8>>>(INPUT)?;
@@ -219,11 +225,7 @@ fn is_uuid(value: &str) -> bool {
         })
 }
 
-fn output_schema(
-    spec: &MySqlCdcScanSpec,
-    projection: &[u32],
-) -> Result<SchemaRef, MySqlCdcScanError> {
-    let full = schema::compile(&spec.columns)?;
+fn output_schema(full: &SchemaRef, projection: &[u32]) -> Result<SchemaRef, MySqlCdcScanError> {
     let indices = super::super::ordered_projection(projection, full.fields().len())
         .ok_or_else(invalid_projection)?;
     Ok(Arc::new(
@@ -241,8 +243,8 @@ fn invalid_projection() -> MySqlCdcScanError {
 mod tests {
     use std::num::NonZeroU64;
 
-    use super::super::MySqlType;
     use super::*;
+    use arrow_schema::{DataType, Field};
 
     fn spec(engine_name: &str) -> MySqlCdcScanSpec {
         MySqlCdcScanSpec {
@@ -251,7 +253,7 @@ mod tests {
             table: "orders".to_owned(),
             server_uuid: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
             table_id: 1,
-            columns: vec![MySqlColumn::new("id", MySqlType::Int64, false)],
+            columns: vec![Field::new("id", DataType::Int64, false)].into(),
         }
     }
 
@@ -274,8 +276,11 @@ mod tests {
     #[test]
     fn output_projection_is_ordered_and_can_be_empty() {
         let mut spec = spec("orders");
-        spec.columns
-            .push(MySqlColumn::new("payload", MySqlType::Text, true));
+        spec.columns = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]
+        .into();
 
         let projected =
             MySqlCdcScanDefinition::try_new_projected(spec.clone(), vec![1], capacity()).unwrap();
@@ -308,44 +313,34 @@ mod tests {
     }
 
     #[test]
-    fn source_identity_is_checked_at_definition_and_schema_at_binding() {
+    fn source_identity_and_schema_are_checked_before_definition_encoding() {
         let mut no_columns = spec("orders");
-        no_columns.columns.clear();
+        no_columns.columns = Fields::default();
         assert!(MySqlCdcScanDefinition::try_new(no_columns, capacity()).is_err());
 
-        let column = |data_type| MySqlColumn::new("id", data_type, false);
+        let column = |data_type| Field::new("id", data_type, false);
         for columns in [
-            vec![MySqlColumn::new("", MySqlType::Int64, false)],
-            vec![MySqlColumn::new(
-                "$dogpaddle.value",
-                MySqlType::Int64,
-                false,
-            )],
-            vec![column(MySqlType::Int64), column(MySqlType::Text)],
-            vec![column(MySqlType::Decimal {
-                precision: 0,
-                scale: 0,
-            })],
-            vec![column(MySqlType::Decimal {
-                precision: 39,
-                scale: 0,
-            })],
-            vec![column(MySqlType::Decimal {
-                precision: 2,
-                scale: 3,
-            })],
-            vec![column(MySqlType::Decimal {
-                precision: 2,
-                scale: -1,
-            })],
+            vec![Field::new("", DataType::Int64, false)],
+            vec![Field::new("$dogpaddle.value", DataType::Int64, false)],
+            vec![column(DataType::Int64), column(DataType::Utf8)],
+            vec![column(DataType::Decimal128(0, 0))],
+            vec![column(DataType::Decimal128(39, 0))],
+            vec![column(DataType::Decimal128(2, 3))],
+            vec![column(DataType::Decimal128(2, -1))],
         ] {
             let mut candidate = spec("orders");
-            candidate.columns = columns;
-            let definition = MySqlCdcScanDefinition::try_new(candidate, capacity()).unwrap();
+            candidate.columns = columns.into();
+            assert!(MySqlCdcScanDefinition::try_new(candidate.clone(), capacity()).is_err());
+            let mut raw = serde_json::to_value(
+                MySqlCdcScanDefinition::try_new(spec("orders"), capacity()).unwrap(),
+            )
+            .unwrap();
+            raw["spec"] = serde_json::to_value(candidate).unwrap();
             assert!(
-                crate::OperationDefinition::from(definition)
-                    .output_schema(&[])
-                    .is_err()
+                serde_json::from_value::<crate::OperationDefinition>(
+                    serde_json::json!({"mysql_cdc_scan": raw})
+                )
+                .is_err()
             );
         }
         for (server_uuid, table_id) in [

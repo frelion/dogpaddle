@@ -38,3 +38,18 @@ impl MySqlCdcScanError {
         Self::InvalidRuntime(message.into())
     }
 }
+
+impl From<super::super::cdc_convert::ConvertError> for MySqlCdcScanError {
+    fn from(error: super::super::cdc_convert::ConvertError) -> Self {
+        use super::super::cdc_convert::ConvertError;
+        match error {
+            ConvertError::Invalid(message) => Self::InvalidRecord(message),
+            ConvertError::IncompleteImage => Self::InvalidRecord(
+                "missing complete row image; the captured table requires binlog_row_image=FULL"
+                    .into(),
+            ),
+            ConvertError::Arrow(error) => Self::Arrow(error),
+            ConvertError::Change(error) => Self::Change(error),
+        }
+    }
+}

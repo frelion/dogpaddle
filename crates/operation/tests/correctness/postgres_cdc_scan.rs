@@ -3,10 +3,7 @@ use dogpaddle_operation::{
     encode_definition,
     operation::{
         Operation,
-        scan::{
-            CdcOptions, PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec,
-            PostgresColumn, PostgresType,
-        },
+        scan::{CdcOptions, PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec},
     },
 };
 use dogpaddle_store::{Cell, Queue, Store, StoreSetup};
@@ -14,6 +11,8 @@ use std::{
     num::{NonZeroU32, NonZeroU64},
     time::Duration,
 };
+
+use arrow_schema::{DataType, Field};
 
 use super::support::construct_checked_with_resource;
 
@@ -36,7 +35,7 @@ fn definition() -> PostgresCdcScanDefinition {
             system_identifier: "123".into(),
             database_oid: 42,
             table_oid: 43,
-            columns: vec![PostgresColumn::new("id", PostgresType::Int64, false)],
+            columns: vec![Field::new("id", DataType::Int64, false)].into(),
         },
         NonZeroU64::new(1_048_576).unwrap(),
     )
@@ -57,7 +56,7 @@ fn config() -> PostgresCdcScanConfig {
 
 fn literal_definition_bytes() -> Vec<u8> {
     let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
-    expected.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
+    expected.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
     expected
 }
 
@@ -236,46 +235,35 @@ fn postgres_cdc_corrupt_sealed_checkpoint_is_rejected_without_rewriting_state() 
 }
 #[test]
 fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
-    let column = |data_type| PostgresColumn::new("id", data_type, false);
+    let column = |data_type| Field::new("id", data_type, false);
     let mut no_columns = definition().spec().clone();
-    no_columns.columns.clear();
+    no_columns.columns = arrow_schema::Fields::default();
     assert!(
         PostgresCdcScanDefinition::try_new(no_columns, NonZeroU64::new(1_048_576).unwrap())
             .is_err()
     );
     for columns in [
-        vec![PostgresColumn::new("", PostgresType::Int64, false)],
-        vec![PostgresColumn::new(
-            "$dogpaddle.value",
-            PostgresType::Int64,
-            false,
-        )],
-        vec![column(PostgresType::Int64), column(PostgresType::Text)],
-        vec![column(PostgresType::Numeric {
-            precision: 0,
-            scale: 0,
-        })],
-        vec![column(PostgresType::Numeric {
-            precision: 39,
-            scale: 0,
-        })],
-        vec![column(PostgresType::Numeric {
-            precision: 2,
-            scale: 3,
-        })],
-        vec![column(PostgresType::Numeric {
-            precision: 2,
-            scale: -1,
-        })],
+        vec![Field::new("", DataType::Int64, false)],
+        vec![Field::new("$dogpaddle.value", DataType::Int64, false)],
+        vec![column(DataType::Int64), column(DataType::Utf8)],
+        vec![column(DataType::Decimal128(0, 0))],
+        vec![column(DataType::Decimal128(39, 0))],
+        vec![column(DataType::Decimal128(2, 3))],
+        vec![column(DataType::Decimal128(2, -1))],
     ] {
         let mut spec = definition().spec().clone();
-        spec.columns = columns;
-        let definition =
-            PostgresCdcScanDefinition::try_new(spec, NonZeroU64::new(1_048_576).unwrap()).unwrap();
+        spec.columns = columns.into();
         assert!(
-            OperationDefinition::from(definition.clone())
-                .output_schema(&[])
+            PostgresCdcScanDefinition::try_new(spec.clone(), NonZeroU64::new(1_048_576).unwrap())
                 .is_err()
+        );
+        let mut raw = serde_json::to_value(definition()).unwrap();
+        raw["spec"] = serde_json::to_value(spec).unwrap();
+        assert!(
+            serde_json::from_value::<OperationDefinition>(
+                serde_json::json!({"postgres_cdc_scan": raw})
+            )
+            .is_err()
         );
     }
 }
@@ -283,8 +271,11 @@ fn postgres_cdc_schema_rejects_unsupported_precision_and_invalid_columns() {
 #[test]
 fn postgres_cdc_projection_is_ordered_and_can_preserve_rows_without_columns() {
     let mut spec = definition().spec().clone();
-    spec.columns
-        .push(PostgresColumn::new("payload", PostgresType::Text, true));
+    spec.columns = vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]
+    .into();
     let capacity = NonZeroU64::new(1_048_576).unwrap();
 
     let projected =
@@ -416,4 +407,84 @@ fn raw_plan_business_validation_precedes_store_handle_access() {
     let plan: OperationDefinition =
         serde_json::from_value(serde_json::json!({"postgres_cdc_scan": payload})).unwrap();
     crate::support::assert_rejected_plan_before_data(&plan, &[], RuntimeResource::new(config()));
+}
+
+#[test]
+fn retired_column_layout_is_not_recognized() {
+    let mut legacy = b"dogpaddle.operation\0\0\x01".to_vec();
+    legacy.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
+    assert!(decode_definition(&legacy).is_err());
+}
+
+#[test]
+fn arrow_source_types_are_validated_before_encoding_and_store_access() {
+    use arrow_schema::TimeUnit;
+    let invalid = vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(
+            "id",
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            false,
+        ),
+        Field::new("id", DataType::Decimal128(255, 0), false),
+        Field::new("id", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new(
+            "id",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Europe/Paris".into())),
+            false,
+        ),
+        Field::new("id", DataType::Int64, false).with_metadata(
+            [("source".to_owned(), "custom".to_owned())]
+                .into_iter()
+                .collect::<arrow_schema::Metadata>(),
+        ),
+    ];
+    for field in invalid {
+        let mut raw = serde_json::to_value(OperationDefinition::from(definition())).unwrap();
+        let mut spec: PostgresCdcScanSpec =
+            serde_json::from_value(raw["postgres_cdc_scan"]["spec"].clone()).unwrap();
+        spec.columns = vec![field].into();
+        raw["postgres_cdc_scan"]["spec"] = serde_json::to_value(&spec).unwrap();
+        assert!(
+            PostgresCdcScanDefinition::try_new_projected(
+                spec,
+                vec![],
+                NonZeroU64::new(1_048_576).unwrap()
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_value::<OperationDefinition>(raw).is_err());
+    }
+}
+
+#[test]
+fn projected_schema_shares_the_declared_arrow_fields() {
+    let definition = definition();
+    let output = OperationDefinition::from(definition.clone())
+        .output_schema(&[])
+        .unwrap()
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &definition.spec().columns[0],
+        &output.fields()[0]
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &definition.spec().columns[0],
+        &definition.clone().spec().columns[0]
+    ));
+}
+
+#[test]
+fn raw_value_rejects_deep_source_types_before_the_plan_can_be_encoded() {
+    let mut field = Field::new("item", DataType::Int64, true);
+    for _ in 0..192 {
+        field = Field::new("item", DataType::List(std::sync::Arc::new(field)), true);
+    }
+    let mut raw = serde_json::to_value(OperationDefinition::from(definition())).unwrap();
+    raw["postgres_cdc_scan"]["spec"]["columns"] = serde_json::to_value(vec![field]).unwrap();
+    assert!(serde_json::from_value::<OperationDefinition>(raw).is_err());
 }

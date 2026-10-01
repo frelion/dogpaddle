@@ -27,7 +27,7 @@ immutable input + opaque Resume + TransactionAccess + StepBudget
 ## Definition 与 checked construction
 
 Definition 是可持久化的纯计划，不持有数据库句柄、连接、密码或执行位置。
-`OperationDefinition` 是全部内建算子的封闭 enum，也是唯一的稳定名称 JSON 计划表示；具体模块拥有纯业务验证与编译。反序列化证明结构和表达式可重放性，`output_schema`/`construct` 在访问 Store 句柄前完成业务验证。
+`OperationDefinition` 是全部内建算子的封闭 enum，也是唯一的稳定名称 JSON 计划表示；具体模块拥有纯业务验证与编译。反序列化证明结构、CDC 支持列域和表达式可重放性，`output_schema`/`construct` 在访问 Store 句柄前完成业务验证。
 不保留旧 tag、格式识别、fallback、迁移或兼容入口。开发期 v1 布局变更后直接重建受影响的状态和目标。
 
 构造过程按同一路径服务新建和 reopen：
@@ -129,6 +129,7 @@ nearest、tolerance、多 order、residual、tie-break、NotDistinct、canonical
 Source 拥有一条 input Queue、phase、checkpoint 和真实 Delivery 的 ACK。快照封口前隐藏，封口后在原地可消费，不把 payload 搬到第二条队列。
 `published` 只读返回 schema-bound front bytes；调用方用 exact Schema 解码，完成全部页和下游调用后以 `consume_published` 同事务删除前项。捕获只追加，不随 consumer 进度延迟 ACK。
 捕获、恢复、容量及 `PostgreSQL` / `MySQL` 差异由 [CDC 契约](docs/cdc.md) 规定。
+两种源以 Arrow `Fields` 直接声明完整源列，构造器和 binding 在编码前检查各自支持的类型、空 metadata 与名称；输出 Schema 共享字段，不保留第二套 Column/Type。
 两种源的 Config 均接收 `CdcOptions` 的六项运行覆盖；未设置的项由具体源使用各自默认值，参数校验返回 `CdcOptionsError`。它们不进入 Definition 或持久状态。
 
 Sink 拥有 outbox，事件位置同时确定消费进度和固定 occurrence IDs；Prepared 只保存边界与删除 IDs。enqueue 与独立 drain 的事务、

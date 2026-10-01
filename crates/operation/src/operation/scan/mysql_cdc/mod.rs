@@ -11,7 +11,6 @@ pub use connection::MySqlCdcScanConfig;
 pub use definition::{MySqlCdcScanDefinition, MySqlCdcScanSpec};
 pub use error::MySqlCdcScanError;
 use runtime::MySqlCdcScanOperation;
-pub use schema::{MySqlColumn, MySqlType};
 
 #[cfg(test)]
 mod tests;

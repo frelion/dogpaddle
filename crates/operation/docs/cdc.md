@@ -22,6 +22,14 @@ PG 发现和 connector 默认连接、查询超时均为 5 秒，快照 fetch si
 
 这些覆盖只存在于本次进程的 Config，不改变 Definition、Program 身份、资源布局或恢复状态；重开时再次提供。SQL 两个 endpoint 的同名参数通过同一解析路径产生 `CdcOptions`，参数词汇及单位见 [SQL endpoint 合同](../../sql/README.md#endpoint-合同)。
 
+## 固定列声明
+
+两种 Spec 的 `columns` 直接使用 Arrow `Fields`，字段的名称、`DataType` 和 nullability 是唯一列声明；不再维护独立的源 Column/Type 或转换 WireKind。完整 Schema 与投影 Schema 共享这些 `Arc<Field>`。所有字段必须具有非空、无 NUL、唯一的名称和空 metadata；列数仍为 1–1600。列字段反序列化先临时读取 JSON 列值，浅查 data_type 外形只允许标量字符串或 Decimal128/Timestamp，再交原生 Arrow Field 解码；不递归构造不受支持的 Arrow 类型。之后与构造器、纯 binding 复用同一源 Schema 校验。临时 JSON 值增加解码时的分配和遍历，不保留在 Definition 或运行时，也不宣称该改变降低解码峰值内存。这保留旧闭合类型枚举的准入域：即使 raw `serde_json::from_value` 不经过文本解析深度限额，也不能把深层嵌套列交给 Flow 编码。构造器和 binding 的检查早于 Definition 的 1 MiB 编码检查；Flow 的全图 8 MiB 编码检查仍早于 binding。
+
+PG 允许 Boolean、Int16/32/64、Float32/64、Utf8、Binary、Date32、Timestamp(Microsecond, None)、Timestamp(Microsecond, "UTC") 和 Decimal128；MySQL 仅允许 Int16/32/64、Float64、Utf8、Binary 和 Decimal128。两者 Decimal128 都要求 `1 <= precision <= 38`、`0 <= scale <= precision`。其他 timestamp 单位或时区、嵌套类型、Dictionary 与 unsigned 类型均拒绝。源目录发现继续单独拒绝原生不支持的类型、generated/invisible 列等条件，不能以 Arrow 类型准入代替原生检查。PG 的 microseconds 和两源的 precise decimal connector 配置保持不变。
+
+开发期 v1 Definition 直接保存 Arrow Field 的 serde 表示；上游非 Dictionary 字段的 dictionary-only 属性不参与逻辑 Schema 相等或源身份比较。它们不赋予任何字典能力，不另建字段 codec 或规范化副本。原生 Field 编码含这些默认属性及空 metadata，比旧三字段 Column 更大，完整 Definition 仍受 1 MiB 上限约束；旧列表示不能读取，受影响状态直接重建。输出物理 Schema、schema-bound input entry 和捕获/ACK/恢复协议不变。
+
 ## PostgreSQL
 
 PostgresCdcScan 只有一个具体 Scan，不另建公共 IngressScan 或 connector driver trait。

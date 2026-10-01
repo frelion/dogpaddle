@@ -1,13 +1,11 @@
 use std::{any::TypeId, num::NonZeroU64, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{Fields, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
 
-use super::{
-    PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, PostgresColumn, schema,
-};
+use super::{PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, schema};
 use dogpaddle_store::{Cell, Queue};
 
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
@@ -42,8 +40,13 @@ pub struct PostgresCdcScanSpec {
     pub database_oid: u32,
     /// Table object identity inside this database.
     pub table_oid: u32,
-    /// Complete ordered logical columns; unsupported `PostgreSQL` types are rejected.
-    pub columns: Vec<PostgresColumn>,
+    /// Complete ordered Arrow fields, shared with the output Schema.
+    ///
+    /// Only the source's supported flat types are accepted. Field metadata must
+    /// be empty; dictionary-only attributes have Arrow's usual non-dictionary
+    /// semantics. See the crate's CDC contract for native discovery restrictions.
+    #[serde(deserialize_with = "schema::deserialize_fields")]
+    pub columns: Fields,
 }
 
 /// Fixed-Schema, single-table `PostgreSQL` Scan with an initial snapshot and
@@ -77,7 +80,8 @@ impl PostgresCdcScanDefinition {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid identifiers or an oversized persistent definition.
+    /// Returns an error for invalid identifiers, unsupported source fields, or an
+    /// oversized persistent definition.
     pub fn try_new(
         spec: PostgresCdcScanSpec,
         bootstrap_spool_bytes: NonZeroU64,
@@ -122,8 +126,9 @@ impl PostgresCdcScanDefinition {
         Ok(definition)
     }
 
-    fn validate(&self) -> Result<(), PostgresCdcScanError> {
+    fn validate(&self) -> Result<SchemaRef, PostgresCdcScanError> {
         validate_spec(&self.spec)?;
+        let schema = schema::compile(&self.spec.columns)?;
         super::super::ordered_projection(&self.output_projection, self.spec.columns.len())
             .ok_or_else(invalid_projection)?;
         if encode(self)?.len() > MAX_DEFINITION_BYTES {
@@ -131,7 +136,7 @@ impl PostgresCdcScanDefinition {
                 "scan definition exceeds 1 MiB".to_owned(),
             ));
         }
-        Ok(())
+        Ok(schema)
     }
 
     /// Returns the frozen, non-sensitive Scan specification.
@@ -157,8 +162,8 @@ impl PostgresCdcScanDefinition {
     pub(crate) fn output_schema_unchecked(
         &self,
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
-        self.validate()?;
-        output_schema(&self.spec, &self.output_projection)
+        let full = self.validate()?;
+        output_schema(&full, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
     }
@@ -168,8 +173,8 @@ impl PostgresCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
-        self.validate().map_err(schema_error)?;
-        let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
+        let full = self.validate().map_err(schema_error)?;
+        let output = output_schema(&full, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
         let input = scope.data::<Queue<Vec<u8>>>(INPUT)?;
@@ -238,11 +243,7 @@ fn validate_spec(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError>
     Ok(())
 }
 
-fn output_schema(
-    spec: &PostgresCdcScanSpec,
-    projection: &[u32],
-) -> Result<SchemaRef, PostgresCdcScanError> {
-    let full = schema::compile(&spec.columns)?;
+fn output_schema(full: &SchemaRef, projection: &[u32]) -> Result<SchemaRef, PostgresCdcScanError> {
     let indices = super::super::ordered_projection(projection, full.fields().len())
         .ok_or_else(invalid_projection)?;
     Ok(Arc::new(

@@ -41,3 +41,18 @@ impl PostgresCdcScanError {
         Self::InvalidRuntime(message.into())
     }
 }
+
+impl From<super::super::cdc_convert::ConvertError> for PostgresCdcScanError {
+    fn from(error: super::super::cdc_convert::ConvertError) -> Self {
+        use super::super::cdc_convert::ConvertError;
+        match error {
+            ConvertError::Invalid(message) => Self::InvalidRecord(message),
+            ConvertError::IncompleteImage => Self::InvalidRecord(
+                "missing complete row image; the captured table requires REPLICA IDENTITY FULL"
+                    .into(),
+            ),
+            ConvertError::Arrow(error) => Self::Arrow(error),
+            ConvertError::Change(error) => Self::Change(error),
+        }
+    }
+}

@@ -70,10 +70,10 @@ impl OperationKind {
 ///
 /// This enum is the complete set of operations accepted by Flow. Each variant
 /// contains only persistent plan data; runtime clients and state handles are
-/// acquired through [`Self::construct`]. Deserialization checks plan structure and
-/// canonical, replayable expressions; it does not prove operation-specific
-/// business rules. Both [`Self::output_schema`] and [`Self::construct`] validate
-/// those rules before obtaining owner data handles.
+/// acquired through [`Self::construct`]. Deserialization checks plan structure,
+/// canonical, replayable expressions, and the supported CDC column domain. Other
+/// operation-specific business rules are checked by both [`Self::output_schema`]
+/// and [`Self::construct`] before obtaining owner data handles.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationDefinition {

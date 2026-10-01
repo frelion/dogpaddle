@@ -2,7 +2,7 @@ use arrow_schema::SchemaRef;
 use dogpaddle_change::Change;
 use serde_json::Value;
 
-use super::{MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn};
+use super::{MySqlCdcScanError, MySqlCdcScanSpec};
 use crate::operation::scan::{
     cdc_convert::{
         Row, build_change, complete_row, validate_envelope, validate_heartbeat,
@@ -39,7 +39,7 @@ pub(super) fn convert_snapshot_values<'a>(
             .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
         let schema = object_field(&value, "schema")?;
         if topic == Some(notification_topic.as_str()) {
-            if validate_snapshot_notification::<MySqlColumn>(object_field(&value, "payload")?)? {
+            if validate_snapshot_notification(object_field(&value, "payload")?)? {
                 if complete {
                     return Err(invalid("snapshot completion notification is duplicated"));
                 }
@@ -53,7 +53,7 @@ pub(super) fn convert_snapshot_values<'a>(
             continue;
         }
         if topic == Some(heartbeat_topic.as_str()) {
-            validate_heartbeat::<MySqlColumn>(schema, object_field(&value, "payload")?)?;
+            validate_heartbeat(schema, object_field(&value, "payload")?)?;
             continue;
         }
         if topic != Some(table_topic.as_str()) {
@@ -118,7 +118,7 @@ pub(super) fn convert_values<'a>(
             .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
         let schema = object_field(&value, "schema")?;
         if topic == Some(heartbeat_topic.as_str()) {
-            validate_heartbeat::<MySqlColumn>(schema, object_field(&value, "payload")?)?;
+            validate_heartbeat(schema, object_field(&value, "payload")?)?;
             continue;
         }
         validate_envelope(columns, schema)?;
@@ -150,7 +150,13 @@ pub(super) fn convert_values<'a>(
             _ => return Err(invalid("expected a streaming insert, update, or delete")),
         }
     }
-    build_change(columns, output_projection, output_schema, &rows, diffs)
+    Ok(build_change(
+        columns,
+        output_projection,
+        output_schema,
+        &rows,
+        diffs,
+    )?)
 }
 
 fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Row, MySqlCdcScanError> {

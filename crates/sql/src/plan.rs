@@ -947,11 +947,10 @@ fn internal_join_field_name(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field};
     use std::num::NonZeroU64;
 
-    use dogpaddle_operation::operation::scan::{
-        PostgresCdcScanDefinition, PostgresCdcScanSpec, PostgresColumn, PostgresType,
-    };
+    use dogpaddle_operation::operation::scan::{PostgresCdcScanDefinition, PostgresCdcScanSpec};
 
     fn wide_definition() -> PostgresCdcScanDefinition {
         PostgresCdcScanDefinition::try_new(
@@ -966,11 +965,12 @@ mod tests {
                 database_oid: 2,
                 table_oid: 3,
                 columns: vec![
-                    PostgresColumn::new("id", PostgresType::Int64, false),
-                    PostgresColumn::new("payload", PostgresType::Text, true),
-                    PostgresColumn::new("bucket", PostgresType::Int32, false),
-                    PostgresColumn::new("unused", PostgresType::Bytea, true),
-                ],
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("payload", DataType::Utf8, true),
+                    Field::new("bucket", DataType::Int32, false),
+                    Field::new("unused", DataType::Binary, true),
+                ]
+                .into(),
             },
             NonZeroU64::new(1024).unwrap(),
         )

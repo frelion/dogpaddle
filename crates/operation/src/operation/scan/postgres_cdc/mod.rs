@@ -11,7 +11,6 @@ pub use connection::PostgresCdcScanConfig;
 pub use definition::{PostgresCdcScanDefinition, PostgresCdcScanSpec};
 pub use error::PostgresCdcScanError;
 use runtime::PostgresCdcScanOperation;
-pub use schema::{PostgresColumn, PostgresType};
 
 #[cfg(test)]
 mod tests;

@@ -23,9 +23,9 @@ Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink �
 
 `OperationDefinition` 是唯一的封闭类型分发，也是公开 JSON 和持久格式共同使用的计划表示。v1 外层只有 marker 和版本，随后是以稳定 snake_case 算子名标记的 canonical JSON，例如 `{"filter":{"predicate":"..."}}`；没有数字 tag 目录、逐算子解码分发或第二份 Payload 类型。新增算子在 enum 声明其计划类型并实现已有的能力分发，不增加注册表。
 
-解码完整消费输入并逐字比较重新编码的 JSON，拒绝未知字段、非 canonical 字节和非法结构。`UnionAll` 的非零 arity、CDC 非零容量和 Aggregate 六变体调用由类型表达。`StoredExpression` 保留完整 protobuf roundtrip、canonical 与 immutable/row-local 证明；表达式不是未经验证的计划字节。
+解码完整消费输入并逐字比较重新编码的 JSON，拒绝未知字段、非 canonical 字节和非法结构。`UnionAll` 的非零 arity、CDC 非零容量和 Aggregate 六变体调用由类型表达。CDC 的 Arrow `Fields` 在反序列化时复用源 Schema 的浅类型、名称与空 metadata 校验，保持源支持列域；不引入另一套字段表示或 codec。`StoredExpression` 保留完整 protobuf roundtrip、canonical 与 immutable/row-local 证明；表达式不是未经验证的计划字节。
 
-具体 Definition 是待绑定的计划数据。公开 JSON 反序列化与持久解码不证明非空 join keys、group list、目标身份/路径或 Schema 业务规则；这些约束在同一个纯验证/编译路径执行，`output_schema` 与 `construct` 都必须经过，且早于取得 Store 数据句柄或任何外部 I/O。便利构造器也复用该定义验证；不存在受信任 Definition 包装层。各 owner 的大小上限（CDC/远端 Sink 1 MiB、ASOF 字段上限）保留于该路径。单独调用 decode 可以暂时持有超 owner 上限的待绑定计划；它不再提供每种 owner 的提前字节准入。Flow 在解析前仍限制整个持久 Definition 不超过 8 MiB。
+具体 Definition 是待绑定的计划数据。除上述 CDC 列域外，公开 JSON 反序列化与持久解码不证明非空 join keys、group list、目标身份/路径或 Schema 业务规则；这些约束在同一个纯验证/编译路径执行，`output_schema` 与 `construct` 都必须经过，且早于取得 Store 数据句柄或任何外部 I/O。便利构造器也复用该定义验证；不存在受信任 Definition 包装层。各 owner 的大小上限（CDC/远端 Sink 1 MiB、ASOF 字段上限）保留于该路径。单独调用 decode 可以暂时持有超 owner 上限的待绑定计划；它不再提供每种 owner 的提前字节准入。Flow 在解析前仍限制整个持久 Definition 不超过 8 MiB。
 
 修改计划格式直接更新当前 v1 golden 和 reopen 证据并重建旧状态，不提供旧数字 tag 识别、alias、fallback 或迁移。算子 correctness 覆盖稳定名称、literal golden、资源布局、construct、step 和适用的 reopen。
 Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propagation、runtime-resource 方向、外部副作用边界、持久 data/Resume 或 recovery 阶段时才增加 Flow case，不逐算子复制同一 build/open/reopen 矩阵，也不得用 test-only Operation 代替真实产品语义。

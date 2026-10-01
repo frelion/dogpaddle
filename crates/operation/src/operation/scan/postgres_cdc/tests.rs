@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field};
+
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -10,17 +12,17 @@ use dogpaddle_change::Change;
 use serde_json::{Value, json};
 
 use super::{
-    PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType,
+    PostgresCdcScanError, PostgresCdcScanSpec,
     convert::{CaptureProgress, convert_capture_values, convert_values},
     schema,
 };
 use crate::operation::scan::cdc_runtime::Captured;
 
-fn column(data_type: PostgresType) -> PostgresColumn {
-    PostgresColumn::new("value", data_type, true)
+fn column(data_type: DataType) -> Field {
+    Field::new("value", data_type, true)
 }
 
-fn spec(columns: &[PostgresColumn]) -> PostgresCdcScanSpec {
+fn spec(columns: &[Field]) -> PostgresCdcScanSpec {
     PostgresCdcScanSpec {
         engine_name: "source".to_owned(),
         database: "shop".to_owned(),
@@ -31,24 +33,24 @@ fn spec(columns: &[PostgresColumn]) -> PostgresCdcScanSpec {
         system_identifier: "123".to_owned(),
         database_oid: 42,
         table_oid: 43,
-        columns: columns.to_vec(),
+        columns: columns.to_vec().into(),
     }
 }
 
-fn identity_projection(columns: &[PostgresColumn]) -> Vec<u32> {
+fn identity_projection(columns: &[Field]) -> Vec<u32> {
     (0..u32::try_from(columns.len()).unwrap()).collect()
 }
 
-fn envelope(columns: &[PostgresColumn], op: &str, before: Value, after: Value) -> Value {
+fn envelope(columns: &[Field], op: &str, before: Value, after: Value) -> Value {
     let fields = columns
         .iter()
         .map(|column| {
-            let (literal, logical) = column.data_type().connect_type();
+            let (literal, logical) = crate::operation::scan::cdc_convert::connect_type(column.data_type()).unwrap();
             let mut schema = json!({"field":column.name(),"type":literal,"optional":column.is_nullable()});
             if let Some(logical) = logical {
                 schema["name"] = json!(logical);
             }
-            if let PostgresType::Numeric { precision, scale } = column.data_type() {
+            if let DataType::Decimal128(precision, scale) = column.data_type() {
                 schema["parameters"] = json!({"scale":scale.to_string(),"connect.decimal.precision":precision.to_string()});
             }
             schema
@@ -69,16 +71,13 @@ fn envelope(columns: &[PostgresColumn], op: &str, before: Value, after: Value) -
     event
 }
 
-fn convert(
-    columns: &[PostgresColumn],
-    events: &[Value],
-) -> Result<Option<Change>, PostgresCdcScanError> {
+fn convert(columns: &[Field], events: &[Value]) -> Result<Option<Change>, PostgresCdcScanError> {
     let projection = identity_projection(columns);
     convert_projected(columns, &projection, events)
 }
 
 fn convert_projected(
-    columns: &[PostgresColumn],
+    columns: &[Field],
     projection: &[u32],
     events: &[Value],
 ) -> Result<Option<Change>, PostgresCdcScanError> {
@@ -98,10 +97,10 @@ fn convert_projected(
 }
 
 fn projected_schema(
-    columns: &[PostgresColumn],
+    columns: &[Field],
     projection: &[u32],
 ) -> Result<Arc<Schema>, PostgresCdcScanError> {
-    let full_schema = schema::compile(columns)?;
+    let full_schema = schema::compile(&columns.to_vec().into())?;
     let fields = projection
         .iter()
         .map(|index| full_schema.fields()[usize::try_from(*index).unwrap()].clone())
@@ -123,14 +122,14 @@ fn heartbeat() -> Value {
     })
 }
 
-fn snapshot(columns: &[PostgresColumn], marker: &str, row: Value) -> Value {
+fn snapshot(columns: &[Field], marker: &str, row: Value) -> Value {
     let mut event = envelope(columns, "r", Value::Null, row);
     event["payload"]["source"]["snapshot"] = json!(marker);
     event
 }
 
 fn capture(
-    columns: &[PostgresColumn],
+    columns: &[Field],
     events: &[(&str, Value)],
     progress: CaptureProgress,
 ) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
@@ -139,7 +138,7 @@ fn capture(
 }
 
 fn capture_projected(
-    columns: &[PostgresColumn],
+    columns: &[Field],
     projection: &[u32],
     events: &[(&str, Value)],
     progress: CaptureProgress,
@@ -167,7 +166,7 @@ fn notification(kind: &str) -> Value {
     })
 }
 
-fn inserted(columns: &[PostgresColumn], row: Value) -> Change {
+fn inserted(columns: &[Field], row: Value) -> Change {
     convert(columns, &[envelope(columns, "c", Value::Null, row)])
         .unwrap()
         .unwrap()
@@ -175,7 +174,7 @@ fn inserted(columns: &[PostgresColumn], row: Value) -> Change {
 
 #[test]
 fn postgres_cdc_conversion_preserves_insert_update_delete_event_order() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     let events = [
         envelope(&columns, "c", Value::Null, json!({"value":1})),
         envelope(&columns, "u", json!({"value":1}), json!({"value":2})),
@@ -208,9 +207,9 @@ fn postgres_cdc_conversion_preserves_insert_update_delete_event_order() {
 #[test]
 fn postgres_cdc_projection_validates_full_rows_and_preserves_zero_column_row_count() {
     let columns = [
-        PostgresColumn::new("id", PostgresType::Int64, false),
-        PostgresColumn::new("payload", PostgresType::Text, false),
-        PostgresColumn::new("unused", PostgresType::Bytea, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+        Field::new("unused", DataType::Binary, false),
     ];
     let event = envelope(
         &columns,
@@ -258,8 +257,8 @@ fn postgres_cdc_projection_validates_full_rows_and_preserves_zero_column_row_cou
 #[test]
 fn postgres_cdc_projection_rejects_bad_unselected_values_in_streaming_and_capture() {
     let columns = [
-        PostgresColumn::new("id", PostgresType::Int64, false),
-        PostgresColumn::new("unused", PostgresType::Int32, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("unused", DataType::Int32, false),
     ];
     let projections: [&[u32]; 2] = [&[0], &[]];
 
@@ -284,8 +283,8 @@ fn postgres_cdc_projection_rejects_bad_unselected_values_in_streaming_and_captur
 #[test]
 fn postgres_cdc_conversion_preserves_large_text_binary_and_nulls_across_rebatching() {
     let columns = [
-        PostgresColumn::new("text", PostgresType::Text, true),
-        PostgresColumn::new("binary", PostgresType::Bytea, true),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("binary", DataType::Binary, true),
     ];
     let large = json!({
         "text": "雪🦀\n\"\\".repeat(4096),
@@ -324,25 +323,26 @@ fn postgres_cdc_conversion_preserves_large_text_binary_and_nulls_across_rebatchi
 #[allow(clippy::too_many_lines)]
 fn postgres_cdc_conversion_preserves_every_supported_type_and_null() {
     let columns = [
-        PostgresColumn::new("boolean", PostgresType::Boolean, true),
-        PostgresColumn::new("small", PostgresType::Int16, true),
-        PostgresColumn::new("integer", PostgresType::Int32, true),
-        PostgresColumn::new("big", PostgresType::Int64, true),
-        PostgresColumn::new("real", PostgresType::Float32, true),
-        PostgresColumn::new("double", PostgresType::Float64, true),
-        PostgresColumn::new("text", PostgresType::Text, true),
-        PostgresColumn::new("binary", PostgresType::Bytea, true),
-        PostgresColumn::new("date", PostgresType::Date, true),
-        PostgresColumn::new("timestamp", PostgresType::Timestamp, true),
-        PostgresColumn::new("zoned", PostgresType::TimestampTz, true),
-        PostgresColumn::new(
-            "numeric",
-            PostgresType::Numeric {
-                precision: 38,
-                scale: 2,
-            },
+        Field::new("boolean", DataType::Boolean, true),
+        Field::new("small", DataType::Int16, true),
+        Field::new("integer", DataType::Int32, true),
+        Field::new("big", DataType::Int64, true),
+        Field::new("real", DataType::Float32, true),
+        Field::new("double", DataType::Float64, true),
+        Field::new("text", DataType::Utf8, true),
+        Field::new("binary", DataType::Binary, true),
+        Field::new("date", DataType::Date32, true),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             true,
         ),
+        Field::new(
+            "zoned",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("numeric", DataType::Decimal128(38, 2), true),
     ];
     let unscaled = -99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
     let first = envelope(
@@ -463,16 +463,13 @@ fn postgres_cdc_conversion_preserves_every_supported_type_and_null() {
     assert!(arrays.iter().all(|array| array.is_null(1)));
     assert_eq!(
         change.records().schema(),
-        schema::compile(&columns).unwrap()
+        schema::compile(&columns.to_vec().into()).unwrap()
     );
 }
 
 #[test]
 fn postgres_cdc_numeric_decodes_signed_big_endian_bytes_without_rounding() {
-    let columns = [column(PostgresType::Numeric {
-        precision: 4,
-        scale: 2,
-    })];
+    let columns = [column(DataType::Decimal128(4, 2))];
     for (encoded, expected) in [
         ("AA==", 0),
         ("fw==", 127),
@@ -508,7 +505,7 @@ fn postgres_cdc_numeric_decodes_signed_big_endian_bytes_without_rounding() {
 
 #[test]
 fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
-    let columns = [PostgresColumn::new("value", PostgresType::Int64, false)];
+    let columns = [Field::new("value", DataType::Int64, false)];
     let valid = envelope(&columns, "u", json!({"value":1}), json!({"value":2}));
     let mut missing_image = valid.clone();
     missing_image["payload"]["before"] = Value::Null;
@@ -548,24 +545,21 @@ fn postgres_cdc_conversion_rejects_row_schema_drift_and_incomplete_images() {
     for event in cases {
         assert!(convert(&columns, &[event]).is_err());
     }
-    let decimal = [column(PostgresType::Numeric {
-        precision: 4,
-        scale: 2,
-    })];
+    let decimal = [column(DataType::Decimal128(4, 2))];
     for parameter in ["scale", "connect.decimal.precision"] {
         let mut event = envelope(&decimal, "c", Value::Null, json!({"value":"AA=="}));
         event["schema"]["fields"][0]["fields"][0]["parameters"][parameter] = json!("3");
         assert!(matches!(
             convert(&decimal, &[event]),
             Err(PostgresCdcScanError::InvalidRecord(message))
-                if message == "numeric schema changed at column value"
+                if message == "decimal schema changed at column value"
         ));
     }
 }
 
 #[test]
 fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     for operation in ["r", "m", "unknown"] {
         assert!(
             convert(
@@ -598,7 +592,7 @@ fn postgres_cdc_conversion_rejects_snapshot_truncate_and_wrong_metadata() {
 
 #[test]
 fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     for marker in ["true", "first"] {
         let captured = capture(
             &columns,
@@ -654,7 +648,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
 
 #[test]
 fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_completion_boundary() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     let mut inserted_after_snapshot = envelope(&columns, "c", Value::Null, json!({"value":3}));
     inserted_after_snapshot["payload"]["source"]["snapshot"] = Value::Null;
     let first = capture(
@@ -717,7 +711,7 @@ fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_completion_bounda
 
 #[test]
 fn postgres_cdc_capture_uses_explicit_completion_for_an_empty_snapshot() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     let captured = capture(
         &columns,
         &[
@@ -738,7 +732,7 @@ fn postgres_cdc_capture_uses_explicit_completion_for_an_empty_snapshot() {
 
 #[test]
 fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     let incomplete = capture(
         &columns,
         &[
@@ -818,13 +812,13 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
 
 #[test]
 fn postgres_cdc_conversion_accepts_only_identified_control_records() {
-    let columns = [column(PostgresType::Int64)];
+    let columns = [column(DataType::Int64)];
     let heartbeat = serde_json::to_vec(&json!({"schema":{"type":"struct","name":"io.debezium.connector.common.Heartbeat","fields":[{"field":"ts_ms","type":"int64","optional":false}]},"payload":{"ts_ms":123}})).unwrap();
     let convert_control = |topic, value| {
         convert_values(
             &spec(&columns),
             &identity_projection(&columns),
-            schema::compile(&columns).unwrap(),
+            schema::compile(&columns.to_vec().into()).unwrap(),
             [(topic, value)],
         )
     };
@@ -855,28 +849,31 @@ fn postgres_cdc_conversion_accepts_only_identified_control_records() {
 #[test]
 fn postgres_cdc_conversion_rejects_overflow_and_special_temporal_values() {
     for (data_type, value) in [
-        (PostgresType::Int16, json!(32768)),
-        (PostgresType::Int32, json!(2_147_483_648_u64)),
-        (PostgresType::Int64, json!(u64::MAX)),
-        (PostgresType::Float32, json!(1e100)),
-        (PostgresType::Boolean, json!("true")),
-        (PostgresType::Date, json!(-2_147_483_648_i64)),
+        (DataType::Int16, json!(32768)),
+        (DataType::Int32, json!(2_147_483_648_u64)),
+        (DataType::Int64, json!(u64::MAX)),
+        (DataType::Float32, json!(1e100)),
+        (DataType::Boolean, json!("true")),
+        (DataType::Date32, json!(-2_147_483_648_i64)),
         (
-            PostgresType::Timestamp,
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             json!(9_223_372_036_825_200_000_i64),
         ),
         (
-            PostgresType::Timestamp,
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             json!(-9_223_372_036_832_400_000_i64),
         ),
-        (PostgresType::TimestampTz, json!("infinity")),
         (
-            PostgresType::TimestampTz,
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            json!("infinity"),
+        ),
+        (
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
             json!("1970-01-01T00:00:00.000000001Z"),
         ),
-        (PostgresType::Bytea, json!("bad base64")),
+        (DataType::Binary, json!("bad base64")),
     ] {
-        let columns = [column(data_type)];
+        let columns = [column(data_type.clone())];
         assert!(
             convert(
                 &columns,
@@ -891,13 +888,13 @@ fn postgres_cdc_conversion_rejects_overflow_and_special_temporal_values() {
 #[test]
 fn postgres_cdc_preserves_values_that_equal_debeziums_default_toast_placeholder() {
     for (data_type, value) in [
-        (PostgresType::Text, json!("__debezium_unavailable_value")),
+        (DataType::Utf8, json!("__debezium_unavailable_value")),
         (
-            PostgresType::Bytea,
+            DataType::Binary,
             json!(BASE64_STANDARD.encode(b"__debezium_unavailable_value")),
         ),
     ] {
-        let columns = [column(data_type)];
+        let columns = [column(data_type.clone())];
         assert!(
             convert(
                 &columns,
@@ -911,8 +908,8 @@ fn postgres_cdc_preserves_values_that_equal_debeziums_default_toast_placeholder(
 
 #[test]
 fn postgres_cdc_float_preserves_signed_zero_nan_and_infinities() {
-    for data_type in [PostgresType::Float32, PostgresType::Float64] {
-        let columns = [column(data_type)];
+    for data_type in [DataType::Float32, DataType::Float64] {
+        let columns = [column(data_type.clone())];
         for (value, expected) in [
             (json!(-0.0), -0.0_f64),
             (json!("NaN"), f64::NAN),
@@ -922,14 +919,14 @@ fn postgres_cdc_float_preserves_signed_zero_nan_and_infinities() {
             let change = inserted(&columns, json!({"value":value}));
             let array = change.records().column(0);
             let actual = match data_type {
-                PostgresType::Float32 => f64::from(
+                DataType::Float32 => f64::from(
                     array
                         .as_any()
                         .downcast_ref::<Float32Array>()
                         .unwrap()
                         .value(0),
                 ),
-                PostgresType::Float64 => array
+                DataType::Float64 => array
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()

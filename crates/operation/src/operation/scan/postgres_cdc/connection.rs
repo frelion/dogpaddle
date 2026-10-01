@@ -1,10 +1,12 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
+use arrow_schema::{DataType, Field, Fields};
+
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, ErrorKind};
 use postgres::{Client, Config, GenericClient, NoTls};
 
 use super::super::CdcOptions;
-use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType, schema};
+use super::{PostgresCdcScanError, PostgresCdcScanSpec, schema};
 
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
@@ -338,12 +340,13 @@ impl PostgresCdcScanConfig {
                     "generated PostgreSQL CDC scan columns are unsupported",
                 ));
             }
-            columns.push(PostgresColumn::new(
+            columns.push(Field::new(
                 row.get::<_, String>(0),
                 column_type(row.get(1), row.get(2))?,
                 row.get(3),
             ));
         }
+        let columns: Fields = columns.into();
         schema::compile(&columns)?;
         validate_publication(client, publication, table_schema, table, &columns)?;
         match slot_state {
@@ -467,7 +470,7 @@ fn validate_publication(
     publication: &str,
     table_schema: &str,
     table: &str,
-    columns: &[PostgresColumn],
+    columns: &Fields,
 ) -> Result<(), PostgresCdcScanError> {
     let row = client.query_opt(
         "SELECT p.pubinsert AND p.pubupdate AND p.pubdelete AND p.pubtruncate, t.attnames::text[], t.rowfilter IS NULL FROM pg_catalog.pg_publication p JOIN pg_catalog.pg_publication_tables t ON t.pubname = p.pubname WHERE p.pubname = $1 AND t.schemaname = $2 AND t.tablename = $3",
@@ -480,7 +483,7 @@ fn validate_publication(
         || !actual_columns
             .iter()
             .map(String::as_str)
-            .eq(columns.iter().map(PostgresColumn::name))
+            .eq(columns.iter().map(|field| field.name().as_str()))
     {
         return Err(PostgresCdcScanError::new(
             "PostgreSQL publication must include all columns and insert/update/delete/truncate without a row filter",
@@ -530,19 +533,19 @@ fn validate_streaming_slot(
     Ok(())
 }
 
-fn column_type(oid: u32, modifier: i32) -> Result<PostgresType, PostgresCdcScanError> {
+fn column_type(oid: u32, modifier: i32) -> Result<DataType, PostgresCdcScanError> {
     Ok(match oid {
-        16 => PostgresType::Boolean,
-        21 => PostgresType::Int16,
-        23 => PostgresType::Int32,
-        20 => PostgresType::Int64,
-        700 => PostgresType::Float32,
-        701 => PostgresType::Float64,
-        25 | 1043 => PostgresType::Text,
-        17 => PostgresType::Bytea,
-        1082 => PostgresType::Date,
-        1114 => PostgresType::Timestamp,
-        1184 => PostgresType::TimestampTz,
+        16 => DataType::Boolean,
+        21 => DataType::Int16,
+        23 => DataType::Int32,
+        20 => DataType::Int64,
+        700 => DataType::Float32,
+        701 => DataType::Float64,
+        25 | 1043 => DataType::Utf8,
+        17 => DataType::Binary,
+        1082 => DataType::Date32,
+        1114 => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        1184 => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
         1700 if modifier >= 4 => {
             let modifier = u32::try_from(modifier - 4)
                 .map_err(|_| PostgresCdcScanError::new("invalid PostgreSQL numeric modifier"))?;
@@ -556,7 +559,7 @@ fn column_type(oid: u32, modifier: i32) -> Result<PostgresType, PostgresCdcScanE
             let scale = i8::try_from(scale).map_err(|_| {
                 PostgresCdcScanError::new("PostgreSQL numeric scale is unsupported")
             })?;
-            PostgresType::Numeric { precision, scale }
+            DataType::Decimal128(precision, scale)
         }
         _ => {
             return Err(PostgresCdcScanError::new(format!(

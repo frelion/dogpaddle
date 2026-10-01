@@ -1,11 +1,13 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
+use arrow_schema::{DataType, Field, Fields};
+
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, ErrorKind};
 use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
 
 use super::super::CdcOptions;
 use super::definition::{CONNECTOR_CLASS, validate_spec};
-use super::{MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn, MySqlType, schema};
+use super::{MySqlCdcScanError, MySqlCdcScanSpec, schema};
 
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -281,7 +283,7 @@ impl MySqlCdcScanConfig {
         &self,
         connection: &mut Conn,
         table: &str,
-    ) -> Result<Vec<MySqlColumn>, MySqlCdcScanError> {
+    ) -> Result<Fields, MySqlCdcScanError> {
         let rows: Vec<ColumnRow> = connection
             .exec(
                 "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, EXTRA, GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :database AND TABLE_NAME = :table ORDER BY ORDINAL_POSITION",
@@ -300,7 +302,7 @@ impl MySqlCdcScanConfig {
                     "generated or invisible MySQL CDC scan columns are unsupported",
                 ));
             }
-            columns.push(MySqlColumn::new(
+            columns.push(Field::new(
                 name,
                 column_type(&data_type, &column_definition, precision, scale)?,
                 match nullable.as_str() {
@@ -310,7 +312,7 @@ impl MySqlCdcScanConfig {
                 },
             ));
         }
-        Ok(columns)
+        Ok(columns.into())
     }
 
     fn connector_config(
@@ -450,7 +452,7 @@ fn column_type(
     definition: &str,
     precision: Option<u64>,
     scale: Option<u64>,
-) -> Result<MySqlType, MySqlCdcScanError> {
+) -> Result<DataType, MySqlCdcScanError> {
     let definition = definition.to_ascii_lowercase();
     if definition.contains("unsigned") || definition.contains("zerofill") {
         return Err(MySqlCdcScanError::new(
@@ -458,13 +460,13 @@ fn column_type(
         ));
     }
     match data_type {
-        "tinyint" | "smallint" => Ok(MySqlType::Int16),
-        "mediumint" | "int" | "integer" => Ok(MySqlType::Int32),
-        "bigint" => Ok(MySqlType::Int64),
-        "double" => Ok(MySqlType::Float64),
-        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => Ok(MySqlType::Text),
+        "tinyint" | "smallint" => Ok(DataType::Int16),
+        "mediumint" | "int" | "integer" => Ok(DataType::Int32),
+        "bigint" => Ok(DataType::Int64),
+        "double" => Ok(DataType::Float64),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => Ok(DataType::Utf8),
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => {
-            Ok(MySqlType::Binary)
+            Ok(DataType::Binary)
         }
         "decimal" => {
             let precision = precision
@@ -477,7 +479,7 @@ fn column_type(
                     *value >= 0 && u8::try_from(*value).is_ok_and(|value| value <= precision)
                 })
                 .ok_or_else(|| MySqlCdcScanError::new("MySQL decimal scale is unsupported"))?;
-            Ok(MySqlType::Decimal { precision, scale })
+            Ok(DataType::Decimal128(precision, scale))
         }
         _ => Err(MySqlCdcScanError::new(format!(
             "unsupported MySQL column type {data_type}"
