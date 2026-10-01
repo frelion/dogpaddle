@@ -1,6 +1,87 @@
 use super::*;
 
 #[test]
+fn codecs_cover_source_and_segment_outputs_across_reopen() {
+    use dogpaddle_operation::operation::transform::{SelectDefinition, UnionAllDefinition};
+    use std::num::NonZeroU32;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX), []);
+    let first = factory.operation(
+        "first",
+        SelectDefinition::try_new([("first", col("value"))]).unwrap(),
+        [source],
+    );
+    let second = factory.operation(
+        "second",
+        SelectDefinition::try_new([("second", col("first"))]).unwrap(),
+        [first],
+    );
+    let union = factory.operation(
+        "union",
+        UnionAllDefinition::new(NonZeroU32::new(2).unwrap()),
+        [second, second],
+    );
+    let output = factory.operation(
+        "output",
+        SelectDefinition::try_new([("result", col("second"))]).unwrap(),
+        [union],
+    );
+    factory.operation("sink", DiscardDefinition::new(), [output]);
+    let check = |flow: &Flow| {
+        assert_eq!(
+            flow.runtime
+                .nodes
+                .iter()
+                .map(|node| node.codec.is_some())
+                .collect::<Vec<_>>(),
+            [true, false, true, false, true, false]
+        );
+        assert_eq!(
+            flow.runtime
+                .input_codec(&initial_source_frame(flow, 0))
+                .schema()
+                .field(0)
+                .name(),
+            "value"
+        );
+        assert_eq!(
+            flow.runtime.output_codec(0).schema().field(0).name(),
+            "second"
+        );
+        assert_eq!(
+            flow.runtime.output_codec(3).schema().field(0).name(),
+            "result"
+        );
+        for port in [0, 1] {
+            let frame = Frame {
+                head: 3,
+                input_port: Some(port),
+                phase: FramePhase::Run(flow.runtime.nodes[3].operation.initial_resume()),
+            };
+            assert_eq!(
+                flow.runtime.input_codec(&frame).schema().field(0).name(),
+                "second"
+            );
+        }
+    };
+    let flow = factory.build().unwrap();
+    check(&flow);
+    drop(flow);
+    let mut flow = FlowFactory::new(&path).open().unwrap();
+    check(&flow);
+    for _ in 0..10 {
+        if flow.advance().unwrap() == AdvanceOutcome::Idle {
+            assert_eq!(flow.status().unwrap().depth, 0);
+            return;
+        }
+    }
+    panic!("finite source did not finish");
+}
+
+#[test]
 fn every_durable_call_transition_can_reopen_without_repeating_a_branch() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");

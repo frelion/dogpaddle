@@ -15,7 +15,9 @@ JSON 错误只报告静态类别和行列，不保留原始 serde 错误或表�
 根必须是 Source，叶必须是 Sink，输入数量与角色相符，所有输入有输出。构建引用必须来自同一 factory 的较早声明；持久解码同样要求每条输入 ordinal 严格小于当前节点 ordinal，因此图按声明序天然无环。向前引用、自引用和越界输入统一拒绝，不另维护拓扑排序或运行 schedule。任何 DAG 都可按拓扑声明表达。
 新建只解析一次这份原始计划的连接、融合和深度，编码仅用于持久保存，不进行整图 encode→decode 往返；open 才完整解码和重新验证。所有 Schema 与资源先绑定，再由一笔 StoreSetup 事务发布 catalog 和 Definition。
 Operation 状态前缀为 `operation/{ordinal:08x}`，逻辑 ordinal 与持久 Definition 一致。
-装配按声明序消费每个 Definition，复用其 ID 与 inputs 进入一个 RuntimeNode；该节点直接拥有已构造的 Operation、对应 output codec 和线性的 pending Delivery。运行期不另保留完整纯计划或 Operation/codec/pending 平行数组；Source/Sink 角色直接由已构造的 Operation 表达。持久 Definition 和调用栈格式不变，open 重新解析并绑定后同样释放纯计划。Flow 不保留表达式逻辑 AST 与 protobuf 根；已编译表达式可能共享其必要值，调用者另存的 Definition 也可延长原计划生命周期，因此这不是进程 RSS 上限。
+装配按声明序消费每个 Definition，复用其 ID 与 inputs 进入一个 RuntimeNode；该节点直接拥有已构造的 Operation、必要的 output codec 和线性的 pending Delivery。运行期不另保留完整纯计划或 Operation/codec/pending 平行数组；Source/Sink 角色直接由已构造的 Operation 表达。持久 Definition 和调用栈格式不变，open 重新解析并绑定后同样释放纯计划。Flow 不保留表达式逻辑 AST 与 protobuf 根；已编译表达式可能共享其必要值，调用者另存的 Definition 也可延长原计划生命周期，因此这不是进程 RSS 上限。
+
+Flow codec 只绑定 Source 的原始输出与每个融合段末端的输出。前者解码已发布队首，后者编码/解码跨段传递的页；Source 有改变 Schema 的尾链时，两种 Schema 分别绑定。装配时由既有 heads/tails 临时标记末端，不新增运行期索引。每个逻辑节点仍构造并校验精确 Schema，供下游绑定；段内只传 Arrow Change，不构造未使用的物理 Schema 和 fingerprint。恢复先验证实际 head、端口和父子调用边，再选择 codec；伪造融合尾节点为 head 时只读拒绝。此调整不改变持久字节或融合规则，也不保证整个进程 RSS 的下降幅度。
 
 一个单输入 Atomic 只有在其上游恰有一条消费边时才吸收到上游 head 的尾链。Paged 与多输入 Atomic 可以做 head，
 Source 的 head 执行已捕获输入的 identity 切片。Sink 是终点。融合尾链只保存在内存；不存在第二张持久图。

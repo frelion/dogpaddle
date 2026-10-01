@@ -46,6 +46,8 @@ AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。代表性算子覆盖融合尾部失败、UnionAll 多输入、Distinct 持久状态、ASOF 历史修正、同源自 Join、SQLite Sink 和 temporal/decimal unary chain；算子关系 oracle 归 Operation。
 
+Flow codec 只绑定 Source 原始输出与融合段末端；私有证据检查实际 codec 存在性、不同 Schema 与重复输入端口的选择，公共证据覆盖改变 Schema 的融合链及 reopen，并证明把没有 codec 的中间尾节点伪造成 Frame head 时拒绝且不改写状态。
+
 Flow 必须证明每个 Run/Send/入栈/出栈边界可 drop/open；父子 ordinal、port 必须对应调用边；子帧直接借用父页，root 直接借用 Source 队首，完成时同事务消费；拒绝损坏、超限与 orphan slot，且不改写已有状态。融合 head/tails 共享一笔小事务和预算，超限缩页时全部回滚；单事件仍超限须有限失败。首次合法输入的计算失败只保存初始 Run，多源及重开后均不能绕过该输入。本页计算与能接收的 Sink 入账同事务；背压或路由预算耗尽时保留结果及下一个消费者，重开后不重放已接收分支；本页内任一 Sink 错误须回滚同页计算和此前 Sink 入账。捕获与 Sink 排空仍获得服务。晚期 Join 错误由真实 SQLite 目标证明之前已提交页保留，失败位置可恢复。
 
 Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合与深度上限；单一 Flow typed JSON golden、1024 nodes/ports 第 1025 项解析前拒绝、表达式 protobuf 严格证明、metadata 重复/顺序/None 与 empty、旧布局拒绝不改写及 JSON 错误 Display/Debug/source 脱敏必须保持。owner mismatch 在 binding 和资源打开前拒绝。commit、durability barrier、外部 ACK/delivery 不确定性必须 fail-stop。status 只读，并与 reopen 后一致。

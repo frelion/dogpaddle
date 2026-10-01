@@ -15,6 +15,12 @@ pub(crate) fn construct(
     resources: Vec<RuntimeResource>,
 ) -> Result<Runtime, FlowError> {
     let count = definition.operations.len();
+    let mut message_outputs = vec![false; count];
+    for (head, &is_head) in topology.heads.iter().enumerate() {
+        if is_head {
+            message_outputs[topology.tails[head].last().copied().unwrap_or(head)] = true;
+        }
+    }
     let mut schemas: Vec<Option<SchemaRef>> = Vec::with_capacity(count);
     let mut nodes = Vec::with_capacity(count);
     let mut sources = Vec::new();
@@ -41,6 +47,7 @@ pub(crate) fn construct(
             .into_parts();
         let codec = schema
             .as_ref()
+            .filter(|_| matches!(&operation, Operation::Source(_)) || message_outputs[index])
             .map(|schema| {
                 SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
                     FlowError::OutputCodec {

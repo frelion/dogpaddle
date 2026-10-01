@@ -272,3 +272,35 @@ source 数量、counter 和 reopen oracle 在计时外。两版各场景捕获�
 `runtime-summary.json` 保留每个 sample 的中位数及全量 p50/p95/p99。
 完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 与 workspace build 通过。
 新编译的 release hosts 通过真实 PostgreSQL CDC、SQL 与 Sink/recovery 三个验收入口。
+
+## 只为持久消息构造 codec：2026-10-01 分配对照
+
+Source 保留原始输入的 codec，融合段仅末端保留输出 codec；临时标记在装配后释放。
+这次移除未使用的 physical Schema 和 fingerprint 构造，不改变算子自身的 Schema
+绑定、持久字节或 Frame 协议，也不意味着所有中间 logical Schema 都被释放。
+
+复用上一节同一临时程序：有限 Sequence → 64 个 Select → Discard，每个 Select
+含 16,389 字节的独立字符串字面量。该图省去 63 个中间 codec，保留 Source 与末端两个。
+两侧基线均为 `7502703c01a80ae729a2d3d9fd3e7a580595a998`，candidate 加本轮六文件 diff；
+4 个独立进程分别测两版 build/open，352 个共有依赖条目与 workspace 锁定版本一致。
+build 在 factory 构造前启动 profiler；open 先在计量外 seed/drop，再开始计量并 open。
+下表为实际 build/open 后、首次 advance 前的 Rust global allocator 观察值；peak 和
+累计分配同样截止该观察点。除 blocks 外单位均为 byte，各格为 baseline → candidate。
+
+| case | live bytes | live blocks | peak bytes | 累计分配 |
+| --- | ---: | ---: | ---: | ---: |
+| build | 1,154,969 → 1,104,317 | 1,512 → 882 | 3,608,564 → 3,608,630 | 23,074,456 → 22,904,170 |
+| open | 1,155,660 → 1,105,008 | 1,508 → 878 | 3,605,705 → 3,605,771 | 16,425,793 → 16,255,507 |
+
+两例 live 各减少 50,652 byte/630 blocks，累计分配各减少 170,286 byte；peak 各增加
+66 byte，不能称峰值下降。随后执行有限输入并排空，drop 后 build 两版均剩
+157 byte/4 blocks，open 两版均为 0，再 reopen 检查节点数和空栈。此 oracle 不检查
+Discard 的逐值结果；未测 native heap、RSS、启动延迟或运行吞吐，比例仅适用于该 fixture。
+
+原始数据及上下文在 `/tmp/dogpaddle-flow-message-codecs-memory/` 的
+`baseline.json`、`candidate.json`、`summary.json` 与 `source-context.json`。
+临时源码 SHA-256 为 `62cb4ed22d52c1bc796f774eb365b847219cd4bf41785bcba8041bc1eba972b2`，
+锁文件 SHA-256 为 `75c8d37814acdc99dac5d911bcecdd6e33272bc938bc6e6a5ac52237362fc374`。
+六文件 candidate patch SHA-256 为 `5b7957a93ef744384c0bfbbf356454ea7857f503fbe62d77781a21aa79059a1a`。
+首个元数据核对脚本误用 Sink 程序的 351 条共有依赖预期，在四次测量完成后拒绝；
+改正为实际 352 条后逐项核对，保留原始测量和该失败记录。focused correctness 与 Clippy 已通过。

@@ -10,6 +10,75 @@ use dogpaddle_operation::operation::{
 use dogpaddle_store::{Cell, OrderedMap, Queue, Store, StoreValue};
 use std::{borrow::Cow, num::NonZeroU64, sync::Arc};
 
+#[test]
+fn a_fused_intermediate_frame_head_is_rejected_without_rewriting_state() {
+    use dogpaddle_operation::{col, operation::transform::SelectDefinition};
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX), []);
+    let first = factory.operation(
+        "first",
+        SelectDefinition::try_new([("first", col("value"))]).unwrap(),
+        [source],
+    );
+    let last = factory.operation(
+        "last",
+        SelectDefinition::try_new([("last", col("first"))]).unwrap(),
+        [first],
+    );
+    factory.operation("sink", DiscardDefinition::new(), [last]);
+    drop(factory.build().unwrap());
+    let input = payload("value", u64::MAX);
+    let control = run_frame(1, None);
+    write(&path, &[(0, control.clone())], Some(&input), &[]);
+    let definition = {
+        let store = Store::open(&path).unwrap();
+        let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
+        definition
+            .read(store.read_transaction().access())
+            .unwrap()
+            .get()
+            .unwrap()
+    };
+    assert!(matches!(
+        FlowFactory::new(&path).open(),
+        Err(FlowError::InvalidRuntimeState { reason })
+            if reason == "frame does not refer to a computation head"
+    ));
+    assert_eq!(read_control(&path, 0), Some(control));
+    let store = Store::open(&path).unwrap();
+    let read = store.read_transaction();
+    let persisted_definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
+    assert_eq!(
+        persisted_definition
+            .read(read.access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        definition
+    );
+    let queue: Queue<Vec<u8>> = store
+        .open_data("operation/00000000/sequence_scan.published")
+        .unwrap();
+    assert_eq!(
+        queue
+            .read(read.access())
+            .unwrap()
+            .front_bounded(input.len())
+            .unwrap(),
+        Some(input)
+    );
+    let position: Cell<u64> = store
+        .open_data("operation/00000000/sequence_scan.position")
+        .unwrap();
+    assert_eq!(
+        position.read(read.access()).unwrap().get().unwrap(),
+        Some(u64::MAX)
+    );
+}
+
 fn fixture(path: &std::path::Path) {
     let mut factory = FlowFactory::new(path);
     let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX), []);
