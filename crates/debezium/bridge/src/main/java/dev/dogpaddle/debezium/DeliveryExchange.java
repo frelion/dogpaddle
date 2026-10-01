@@ -17,12 +17,14 @@ final class DeliveryExchange {
         private final CompletableFuture<Decision> decision = new CompletableFuture<>();
         private final CompletableFuture<Void> settled = new CompletableFuture<>();
 
+        // Takes ownership of the completed frame; no caller may modify it.
         Delivery(byte[] encoded) {
             this.encoded = encoded;
         }
 
+        // Read-only borrow for JNI; ACK and shutdown never modify the frame.
         byte[] encoded() {
-            return encoded.clone();
+            return encoded;
         }
     }
 

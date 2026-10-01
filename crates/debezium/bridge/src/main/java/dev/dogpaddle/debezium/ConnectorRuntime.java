@@ -207,8 +207,11 @@ public final class ConnectorRuntime {
         }
     }
 
-    /** Returns one encoded delivery, or null on an ordinary timeout. */
-    public byte[] poll(long timeoutMillis) {
+    /**
+     * Borrows the immutable frame for JNI to copy, or returns null on timeout.
+     * Package-private so Java callers outside the bridge cannot acquire an alias.
+     */
+    byte[] poll(long timeoutMillis) {
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("poll timeout must be non-negative");
         }

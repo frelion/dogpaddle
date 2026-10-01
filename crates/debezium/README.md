@@ -151,6 +151,11 @@ Rust `Connector` 持有对应 Java `ConnectorRuntime` 的 JNI 全局引用，sta
 它不通过数字 handle 注册表查找 connector。成功 stop 后释放引用；Drop 先请求 Java 后台清理，清理线程仍持有对象，
 直到 Engine 退出并注销其 offset store。这个 offset store 注册表仍用于 Kafka Connect 反射创建的 backing store。
 
+Java bridge 的包内 `poll` 只读借用已编码的 outstanding frame；编码完成并交给 exchange 后，bridge
+不再修改该数组。JNI 在本地引用有效期间检查长度并复制到 owned Rust bytes，ACK、stop 和重投都不改写帧。
+这省去每次非空 poll（含重投）的一份等长 Java 数组与复制；编码时的缓冲区、原 outstanding frame 和
+JNI 到 Rust 的复制仍然存在，不表示整个 JVM 峰值或进程 RSS 等量下降。delivery wire、checkpoint 和 ACK 协议不变。
+
 JVM 固定使用 `-Xrs`，将中断与终止信号留给宿主处理，避免覆盖宿主在 `open` 前注册的 Ctrl-C handler。
 宿主负责停止 connector；不能依赖 JVM 的信号 shutdown hook。Unix 的 SIGQUIT thread dump 也因此不可用。
 产品 CLI 收到 Ctrl-C 后仍等待当前有界 `advance` 返回，再正常退出。
