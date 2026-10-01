@@ -347,7 +347,9 @@ impl Fixture {
                     };
                     assert!(
                         budget && items > 1,
-                        "equality resource page failed: {error}"
+                        "equality resource page failed: {error}; port={port}, rows={}, ordinal={}",
+                        change.num_rows(),
+                        serde_json::to_value(&*resume).expect("serialize resume")["ordinal"]
                     );
                     items /= 2;
                 }

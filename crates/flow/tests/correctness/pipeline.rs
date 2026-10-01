@@ -353,6 +353,105 @@ fn automatic_planning_keeps_a_paged_transform_as_head_with_an_atomic_tail() {
     );
 }
 
+#[test]
+fn nested_join_output_shrinks_pages_and_completes_across_reopen() {
+    use arrow_schema::DataType;
+    use dogpaddle_operation::ScalarValue;
+
+    for residual in [None, Some(lit(true))] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("flow");
+        let mut factory = FlowFactory::new(&path);
+        let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX - 15), []);
+        let left = factory.operation(
+            "left/row",
+            SelectDefinition::try_new([
+                ("key", lit(1_u64)),
+                ("id", col("value")),
+                (
+                    "items",
+                    lit(ScalarValue::List(ScalarValue::new_list(
+                        &vec![ScalarValue::Null; 8192],
+                        &DataType::Null,
+                        true,
+                    ))),
+                ),
+            ])
+            .unwrap(),
+            [source],
+        );
+        let right = factory.operation(
+            "right/last",
+            FilterDefinition::try_new(col("value").eq(lit(u64::MAX))).unwrap(),
+            [source],
+        );
+        let right = factory.operation(
+            "right/row",
+            SelectDefinition::try_new([
+                ("key", lit(1_u64)),
+                ("id", col("value")),
+                (
+                    "items",
+                    lit(ScalarValue::List(ScalarValue::new_list(
+                        &[],
+                        &DataType::Null,
+                        true,
+                    ))),
+                ),
+            ])
+            .unwrap(),
+            [right],
+        );
+        let join = factory.operation(
+            "join",
+            EquiJoinDefinition::try_new(
+                EquiJoinKind::Inner,
+                [(col("key"), col("key"))],
+                [
+                    "left_key",
+                    "left_id",
+                    "left_items",
+                    "right_key",
+                    "right_id",
+                    "right_items",
+                ],
+                residual,
+            )
+            .unwrap(),
+            [left, right],
+        );
+        let count = factory.operation("count", RunningEventCountDefinition::new(), [join]);
+        factory.operation("sink", DiscardDefinition::new(), [count]);
+        drop(factory.build().unwrap());
+
+        let mut idle = 0;
+        for _ in 0..100 {
+            let mut flow = FlowFactory::new(&path).open().unwrap();
+            if flow.advance().unwrap() == AdvanceOutcome::Idle {
+                idle += 1;
+            } else {
+                idle = 0;
+            }
+            if idle > flow.operation_count() {
+                break;
+            }
+        }
+        assert!(idle > 7, "finite nested Join must drain");
+        let store = Store::open(&path).unwrap();
+        let count: Cell<u64> = store
+            .open_data("operation/00000005/running_event_count.count")
+            .unwrap();
+        assert_eq!(
+            count
+                .read(store.read_transaction().access())
+                .unwrap()
+                .get()
+                .unwrap(),
+            Some(16)
+        );
+    }
+}
+
 fn run_until_idle(flow: &mut dogpaddle_flow::Flow) {
     super::support::run_until_idle(flow);
 }

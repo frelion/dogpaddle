@@ -179,7 +179,7 @@ pub enum EquiJoinSchemaError {
 #[non_exhaustive]
 pub enum EquiJoinError {
     /// This attempt cannot fit the current bounded page.
-    #[error(transparent)]
+    #[error("{0}")]
     Budget(#[from] crate::operation::BudgetExceeded),
     /// Only the two bound input ports are valid.
     #[error("equi-join does not accept input port {port}")]

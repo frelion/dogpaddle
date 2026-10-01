@@ -246,6 +246,117 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
     }
 }
 
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One fixture verifies real decode rejection, rollback retries and complete nested output."
+)]
+fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows() {
+    use arrow_array::ListArray;
+    use dogpaddle_operation::{
+        lit,
+        operation::{
+            BudgetExceeded, OperationInput, Progress, StepBudget, transform::EquiJoinError,
+        },
+    };
+    use dogpaddle_store::StoreValue;
+
+    for residual in [None, Some(lit(true))] {
+        let item = Arc::new(Field::new("item", DataType::Null, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("items", DataType::List(Arc::clone(&item)), false),
+        ]));
+        let definition = EquiJoinDefinition::try_new(
+            EquiJoinKind::Inner,
+            [(col("key"), col("key"))],
+            ["left_key", "left_items", "right_key", "right_items"],
+            residual,
+        )
+        .unwrap();
+        let (_root, operation, _left_rows, mut transactions) = runtime_fixture(&schema, definition);
+        for length in 8192..8208 {
+            let right = list_event(&schema, &item, length);
+            let transaction = transactions.begin();
+            let step = operation
+                .step(
+                    OperationInput {
+                        port: 1,
+                        change: &right,
+                    },
+                    &operation.initial_resume(),
+                    transaction.access(),
+                    &mut StepBudget::new(1, 4 * 1024 * 1024),
+                )
+                .unwrap();
+            assert_eq!(step.progress, Progress::Done);
+            transaction.commit().unwrap();
+        }
+        let left = list_event(&schema, &item, 0);
+        let mut resume = operation.initial_resume();
+        let mut lengths = Vec::new();
+        let mut refused = false;
+        loop {
+            let mut items = 256;
+            let step = loop {
+                let transaction = transactions.begin();
+                match operation.step(
+                    OperationInput {
+                        port: 0,
+                        change: &left,
+                    },
+                    &resume,
+                    transaction.access(),
+                    &mut StepBudget::new(items, 4 * 1024 * 1024),
+                ) {
+                    Ok(step) => {
+                        transaction.commit().unwrap();
+                        break step;
+                    }
+                    Err(error) => {
+                        assert!(matches!(
+                            error.downcast_ref::<EquiJoinError>(),
+                            Some(EquiJoinError::Budget(_))
+                        ));
+                        let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+                        assert!(
+                            std::iter::successors(Some(cause), |cause| cause.source())
+                                .any(<dyn std::error::Error>::is::<BudgetExceeded>)
+                        );
+                        assert!(items > 1, "one nested candidate must fit: {error}");
+                        refused = true;
+                        items /= 2;
+                    }
+                }
+            };
+            let output = step.output.unwrap();
+            let lists = output
+                .records()
+                .column(3)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for index in 0..output.num_rows() {
+                assert_eq!(output.diffs().value(index), 1);
+                lengths.push(lists.value_length(index));
+            }
+            match step.progress {
+                Progress::Done => break,
+                Progress::More(next) => {
+                    assert!(next.encode_value().unwrap().as_ref().len() < 64 * 1024);
+                    resume = next;
+                }
+            }
+        }
+        assert!(
+            refused,
+            "nested reconstruction must exercise the retry path"
+        );
+        lengths.sort_unstable();
+        assert_eq!(lengths, (8192..8208).collect::<Vec<_>>());
+    }
+}
+
 fn runtime_fixture(
     schema: &arrow_schema::SchemaRef,
     definition: EquiJoinDefinition,
