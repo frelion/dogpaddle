@@ -2,7 +2,7 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource, decode_definition,
+    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
     operation::{
         Operation, OperationInput,
         transform::{RunningEventCountDefinition, RunningEventCountError},
@@ -19,7 +19,10 @@ const RUNNING_EVENT_COUNT_V1: &str =
     include_str!("../fixtures/v1/running_event_count_definition.hex");
 
 fn decoded_definition() -> OperationDefinition {
-    decode_definition(&decode_hex(RUNNING_EVENT_COUNT_V1)).unwrap()
+    serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(
+        RUNNING_EVENT_COUNT_V1,
+    ))
+    .unwrap()
 }
 
 #[test]

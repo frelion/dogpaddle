@@ -3,7 +3,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, col, decode_definition, encode_definition,
+    OperationDefinition, OperationKind, RuntimeResource, col,
     operation::{
         Operation, OperationError, OperationInput, Progress, Resume, Step, StepBudget,
         transform::{
@@ -471,8 +471,12 @@ fn the_current_v1_payload_and_layout_reject_retired_asof_capabilities() {
     let literal = decode_hex(include_str!(
         "../fixtures/v1/asof_join_backward_left_outer.hex"
     ));
-    let decoded = decode_definition(&literal).unwrap();
-    assert_eq!(encode_definition(&decoded), literal);
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&literal).unwrap();
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        literal
+    );
     assert_eq!(
         decoded.kind(),
         OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())

@@ -216,19 +216,15 @@ fn retired_cdc_column_definition_is_rejected_without_rewriting_state() {
     factory.resource("pg", config()).unwrap();
     drop(factory.build().unwrap());
     let mut bytes = read_published_definition(&path);
-    let marker = b"dogpaddle.operation\0";
+    let needle = br#""data_type":"Int64""#;
     let start = bytes
-        .windows(marker.len())
-        .position(|part| part == marker)
+        .windows(needle.len())
+        .position(|part| part == needle)
         .unwrap();
-    let length = usize::try_from(u32::from_be_bytes(
-        bytes[start - 4..start].try_into().unwrap(),
-    ))
-    .unwrap();
-    let mut legacy = b"dogpaddle.operation\0\0\x01".to_vec();
-    legacy.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
-    bytes[start - 4..start].copy_from_slice(&u32::try_from(legacy.len()).unwrap().to_be_bytes());
-    bytes.splice(start..start + length, legacy);
+    bytes.splice(
+        start..start + needle.len(),
+        br#""data_type":"int64""#.iter().copied(),
+    );
     rewrite_checksum(&mut bytes);
     {
         let store = Store::open(&path).unwrap();
@@ -244,9 +240,12 @@ fn retired_cdc_column_definition_is_rejected_without_rewriting_state() {
     }
     let mut reopen = FlowFactory::new(&path);
     reopen.resource("pg", config()).unwrap();
-    assert!(
-        matches!(reopen.open(), Err(FlowError::Definition(dogpaddle_flow::FlowDefinitionError::Operation { operation_id, .. })) if operation_id == "pg")
-    );
+    assert!(matches!(
+        reopen.open(),
+        Err(FlowError::Definition(
+            dogpaddle_flow::FlowDefinitionError::InvalidJson { .. }
+        ))
+    ));
     assert_eq!(read_published_definition(&path), bytes);
 }
 

@@ -3,8 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, ProjectionError, RuntimeResource, col, decode_definition,
-    encode_definition,
+    OperationDefinition, ProjectionError, RuntimeResource, col,
     operation::{OperationInput, transform::SelectDefinition},
 };
 use dogpaddle_store::{Store, StoreSetup};
@@ -16,7 +15,11 @@ use super::support::{
 fn decoded_definition() -> OperationDefinition {
     let definition =
         SelectDefinition::try_new([("id", col("id")), ("score", col("score"))]).unwrap();
-    decode_definition(&encode_definition(&definition.clone().into())).unwrap()
+    serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+        &serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 fn project_change() -> Change {

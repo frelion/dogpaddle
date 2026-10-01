@@ -9,8 +9,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
-    decode_definition, encode_definition,
+    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
     operation::{BudgetExceeded, Operation, OperationError, OperationInput, Progress, StepBudget},
 };
 use dogpaddle_store::{Store, StoreSetup, Transactions};
@@ -41,25 +40,27 @@ pub fn assert_literal_definition<D: Clone + Into<OperationDefinition>>(
     let definition = definition.clone().into();
     let literal = decode_hex(fixture);
     assert_eq!(definition.kind(), expected_kind);
-    assert_eq!(encode_definition(&definition), literal);
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition).unwrap(),
+        literal
+    );
 
-    let decoded = decode_definition(&literal).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&literal).unwrap();
     assert_eq!(decoded.kind(), expected_kind);
-    assert_eq!(encode_definition(&decoded), literal);
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        literal
+    );
     for length in 0..literal.len() {
-        assert_eq!(
-            decode_definition(&literal[..length]).unwrap_err(),
-            DefinitionCodecError::Truncated,
-            "wrong error for definition prefix {length}/{}",
-            literal.len()
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&literal[..length])
+                .is_err()
         );
     }
     let mut trailing = literal;
     trailing.push(0);
-    assert_eq!(
-        decode_definition(&trailing).unwrap_err(),
-        DefinitionCodecError::TrailingBytes
-    );
+    assert!(serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&trailing).is_err());
     decoded
 }
 
@@ -67,7 +68,11 @@ pub fn construct_checked<D: Clone + Into<OperationDefinition>>(
     definition: &D,
     input_schemas: &[SchemaRef],
 ) -> Result<Option<SchemaRef>, OperationBindError> {
-    let definition = decode_definition(&encode_definition(&definition.clone().into())).unwrap();
+    let definition = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+        &serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap(),
+    )
+    .unwrap();
     definition.output_schema(input_schemas)
 }
 
@@ -76,7 +81,11 @@ pub fn construct_checked_with_resource<D: Clone + Into<OperationDefinition>>(
     input_schemas: &[SchemaRef],
     resource: &RuntimeResource,
 ) -> Result<Option<SchemaRef>, OperationBindError> {
-    let definition = decode_definition(&encode_definition(&definition.clone().into())).unwrap();
+    let definition = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+        &serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap(),
+    )
+    .unwrap();
     definition
         .validate_resource(resource)
         .expect("correctness helper received an invalid runtime resource");
@@ -184,9 +193,15 @@ pub fn roundtripped_output<D: Clone + Into<OperationDefinition>>(
     definition: &D,
     input: &Change,
 ) -> Change {
-    let encoded = encode_definition(&definition.clone().into());
-    let decoded = decode_definition(&encoded).unwrap();
-    assert_eq!(encode_definition(&decoded), encoded);
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        encoded
+    );
     let operation = stateless_operation(&decoded, input.schema());
     let fixture = TestStore::new();
     let store = Store::create(fixture.path()).unwrap();
@@ -320,8 +335,10 @@ pub fn assert_rejected_plan_before_data(
     inputs: &[SchemaRef],
     resource: RuntimeResource,
 ) {
-    let encoded = encode_definition(definition);
-    let plan = decode_definition(&encoded).unwrap();
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(definition).unwrap();
+    let plan =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
     assert!(plan.output_schema(inputs).is_err());
     let root = TestStore::new();
     let transactions = StoreSetup::new().commit(root.path(), |_| Ok(())).unwrap();

@@ -17,7 +17,7 @@ use arrow_array::{Int32Array, Int64Array, StringArray};
 use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::{
-    RuntimeResource, decode_definition, encode_definition,
+    RuntimeResource,
     operation::{
         Operation, OperationError,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
@@ -211,7 +211,7 @@ impl DirectScan {
         let definition_cell: Cell<Vec<u8>> = store.open_data("definition")?;
         let definition = {
             let snapshot = store.read_transaction();
-            decode_definition(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
                 &definition_cell
                     .read(snapshot.access())?
                     .get()?
@@ -248,8 +248,11 @@ impl DirectScan {
         definition: PostgresCdcScanDefinition,
         config: PostgresCdcScanConfig,
     ) -> Result<(), OperationError> {
-        let encoded = encode_definition(&definition.into());
-        let canonical = decode_definition(&encoded)?;
+        let encoded =
+            serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.into())
+                .unwrap();
+        let canonical =
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded)?;
         let mut setup = dogpaddle_store::StoreSetup::new();
         let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
         let _operation = canonical.construct(

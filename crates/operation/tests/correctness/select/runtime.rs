@@ -9,8 +9,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaError};
 use dogpaddle_operation::{
-    DefinitionCodecError, Expr, ExpressionBindError, OperationBindError, OperationKind,
-    ProjectionError, col, decode_definition, encode_definition, lit,
+    Expr, ExpressionBindError, OperationBindError, OperationKind, ProjectionError, col, lit,
     operation::{
         OperationInput,
         transform::{SelectDefinition, SelectSchemaError},
@@ -25,7 +24,6 @@ use super::super::support::{
 };
 
 const SELECT_V1: &str = include_str!("../../fixtures/v1/select_named_expressions.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn persisted_definition() -> SelectDefinition {
     SelectDefinition::try_new([
@@ -88,7 +86,9 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
 
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&decode_hex(SELECT_V1)).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(SELECT_V1))
+            .unwrap();
     let operation = stateless_operation(&decoded, input.schema());
     let mut transactions = store.into_transactions();
     let Some(reopened_selected) =
@@ -115,28 +115,27 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
 
 #[test]
 fn decoder_rejects_unknown_fields_and_invalid_utf8_without_panicking() {
-    let canonical = encode_definition(&persisted_definition().into());
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    let canonical = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &persisted_definition().into(),
+    )
+    .unwrap();
+    let payload = std::str::from_utf8(&canonical[..]).unwrap();
     assert!(payload.starts_with("{\"select\":{\"fields\":"));
 
-    let mut missing_fields = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    let mut missing_fields = Vec::new();
     missing_fields.extend_from_slice(
         payload
             .replacen("\"fields\":", "\"unknown\":", 1)
             .as_bytes(),
     );
-    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&missing_fields)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&missing_fields)
+    }));
     assert!(
         result.is_ok(),
         "Select decoder panicked for an unknown field"
     );
-    assert!(matches!(
-        result.unwrap().unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload {
-            reason: "invalid value",
-            ..
-        }
-    ));
+    assert!(result.unwrap().unwrap_err().is_data());
 
     let mut invalid_utf8 = canonical;
     let first_name_offset = invalid_utf8
@@ -144,12 +143,11 @@ fn decoder_rejects_unknown_fields_and_invalid_utf8_without_panicking() {
         .position(|window| window == b"renamed")
         .unwrap();
     invalid_utf8[first_name_offset] = u8::MAX;
-    let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&invalid_utf8)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&invalid_utf8)
+    }));
     assert!(result.is_ok(), "Select decoder panicked for invalid UTF-8");
-    assert!(matches!(
-        result.unwrap().unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload { .. }
-    ));
+    assert!(result.unwrap().is_err());
 }
 
 #[test]

@@ -4,7 +4,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, RuntimeResource, col, decode_definition, encode_definition,
+    OperationDefinition, RuntimeResource, col,
     operation::{
         Operation, OperationInput, Progress, Resume, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinKind},
@@ -68,7 +68,10 @@ fn narrow_rows_with_wide_equality_complete_minimum_pages_after_reopen() {
     );
     // Each exact row has just one short string and one integer. Repeated
     // equality expressions make its index partition exceed 400 KiB instead.
-    let definition = decode_definition(&encode_definition(&definition)).unwrap();
+    let definition = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+        &serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition).unwrap(),
+    )
+    .unwrap();
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
     let mut setup = StoreSetup::new();

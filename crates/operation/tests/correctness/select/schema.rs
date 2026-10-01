@@ -6,8 +6,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Metadata, Schema};
 use dogpaddle_change::{Change, MAX_SCHEMA_TEXT_BYTES, SchemaError};
 use dogpaddle_operation::{
-    DefinitionCodecError, ExpressionBindError, OperationBindError, OperationKind, ProjectionError,
-    cast, col, decode_definition, encode_definition,
+    ExpressionBindError, OperationBindError, OperationKind, ProjectionError, cast, col,
     operation::{
         OperationInput,
         transform::{SelectDefinition, SelectField, SelectSchemaError},
@@ -22,7 +21,6 @@ use super::super::support::{
 };
 
 const SELECT_EXPLICIT_V1: &str = include_str!("../../fixtures/v1/select_explicit_schema.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn align(fields: impl IntoIterator<Item = SelectField>) -> SelectDefinition {
     SelectDefinition::try_new(fields)
@@ -59,61 +57,20 @@ fn persisted_definition() -> SelectDefinition {
 }
 
 #[test]
-fn persistent_codec_rejects_duplicate_schema_and_field_metadata_keys() {
-    let canonical = encode_definition(&persisted_definition().into());
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    for (needle, duplicate) in [
-        (
-            "\"owner\":\"test\"",
-            "\"owner\":\"other\",\"owner\":\"test\"",
-        ),
-        ("\"a\":\"first\"", "\"a\":\"other\",\"a\":\"first\""),
-    ] {
-        let mut forged = canonical[..DEFINITION_HEADER_LEN].to_vec();
-        forged.extend_from_slice(payload.replacen(needle, duplicate, 1).as_bytes());
-        assert_eq!(
-            decode_definition(&forged).unwrap_err(),
-            DefinitionCodecError::InvalidPayload("non-canonical operation definition")
-        );
-    }
-}
-
-#[test]
-fn persistent_codec_rejects_retired_schema_align_variant() {
-    let canonical = encode_definition(&persisted_definition().into());
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    let mut retired = canonical[..DEFINITION_HEADER_LEN].to_vec();
-    retired.extend_from_slice(
-        payload
-            .replacen("\"select\"", "\"schema_align\"", 1)
-            .as_bytes(),
+fn json_plan_rejects_retired_schema_align_variant() {
+    let canonical = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &persisted_definition().into(),
+    )
+    .unwrap();
+    let payload = std::str::from_utf8(&canonical[..]).unwrap();
+    let retired = payload
+        .replacen("\"select\"", "\"schema_align\"", 1)
+        .into_bytes();
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&retired)
+            .unwrap_err()
+            .is_data()
     );
-    assert!(matches!(
-        decode_definition(&retired),
-        Err(DefinitionCodecError::InvalidJsonPayload { .. })
-    ));
-}
-
-#[test]
-fn persistent_codec_omits_absent_overrides_and_rejects_redundant_nulls() {
-    let definition = SelectDefinition::try_new([("id", col("id"))]).unwrap();
-    let canonical = encode_definition(&definition.into());
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    assert!(!payload.contains("nullable"));
-    assert!(!payload.contains("metadata"));
-    for forged_payload in [
-        payload.replacen("\"}]}}", "\",\"nullable\":null}]}}", 1),
-        payload.replacen("\"}]}}", "\",\"metadata\":null}]}}", 1),
-        payload.replacen("]}}", "],\"metadata\":null}}", 1),
-    ] {
-        assert_ne!(forged_payload, payload);
-        let mut forged = canonical[..DEFINITION_HEADER_LEN].to_vec();
-        forged.extend_from_slice(forged_payload.as_bytes());
-        assert_eq!(
-            decode_definition(&forged).unwrap_err(),
-            DefinitionCodecError::InvalidPayload("non-canonical operation definition")
-        );
-    }
 }
 
 #[test]
@@ -144,8 +101,11 @@ fn omitted_metadata_inherits_and_explicit_empty_metadata_clears_without_copying_
     .unwrap()
     .with_metadata(Metadata::new());
     for (definition, preserves) in [(inherited, true), (cleared, false)] {
-        let encoded = encode_definition(&definition.clone().into());
-        let payload = std::str::from_utf8(&encoded[DEFINITION_HEADER_LEN..]).unwrap();
+        let encoded = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+            &definition.clone().into(),
+        )
+        .unwrap();
+        let payload = std::str::from_utf8(&encoded[..]).unwrap();
         assert!(!payload.contains("nullable"));
         assert_eq!(
             payload.matches("\"metadata\":{}").count(),
@@ -259,7 +219,10 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
 
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&decode_hex(SELECT_EXPLICIT_V1)).unwrap();
+    let decoded = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(
+        SELECT_EXPLICIT_V1,
+    ))
+    .unwrap();
     let operation = stateless_operation(&decoded, input.schema());
     let mut transactions = store.into_transactions();
     let Some(reopened_aligned) =
@@ -289,8 +252,11 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
 }
 
 #[test]
-fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
-    let canonical = encode_definition(&persisted_definition().into());
+fn encoding_orders_metadata_and_deserialization_checks_nullability() {
+    let canonical = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &persisted_definition().into(),
+    )
+    .unwrap();
     let reversed_input_order = SelectDefinition::try_new([
         SelectField {
             name: "renamed".into(),
@@ -317,35 +283,22 @@ fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
         ("owner".to_owned(), "test".to_owned()),
     ]);
     assert_eq!(
-        encode_definition(&reversed_input_order.clone().into()),
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+            &reversed_input_order.clone().into()
+        )
+        .unwrap(),
         canonical
     );
 
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    let wrap = |payload: &str| {
-        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
-        encoded.extend_from_slice(payload.as_bytes());
-        encoded
-    };
-
-    let invalid_nullability = wrap(&payload.replacen("\"nullable\":true", "\"nullable\":2", 1));
+    let payload = std::str::from_utf8(&canonical[..]).unwrap();
+    let invalid_nullability = payload
+        .replacen("\"nullable\":true", "\"nullable\":2", 1)
+        .into_bytes();
     assert_ne!(invalid_nullability, canonical);
-    assert!(matches!(
-        decode_definition(&invalid_nullability).unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload {
-            reason: "invalid value",
-            ..
-        }
-    ));
-
-    let unsorted = wrap(&payload.replace(
-        "\"metadata\":{\"owner\":\"test\",\"version\":\"1\"}",
-        "\"metadata\":{\"version\":\"1\",\"owner\":\"test\"}",
-    ));
-    assert_ne!(unsorted, canonical);
-    assert_eq!(
-        decode_definition(&unsorted).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("non-canonical operation definition")
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&invalid_nullability)
+            .unwrap_err()
+            .is_data()
     );
 }
 

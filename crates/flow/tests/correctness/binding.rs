@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use arrow_schema::{DataType, TimeUnit};
 use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
 use dogpaddle_operation::{
-    OperationBindError, ScalarValue, cast, col, encode_definition, lit,
+    OperationBindError, ScalarValue, cast, col, lit,
     operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition, SqliteSinkSchemaError},
@@ -105,20 +105,22 @@ fn open_rebinds_the_decoded_select_definition_before_opening_runtime_resources()
     drop(factory.build().unwrap());
 
     let mut definition = read_published_definition(&path);
-    let valid_project = encode_definition(
+    let valid_project = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
         &SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))])
             .unwrap()
             .into(),
-    );
+    )
+    .unwrap();
     let offset = definition
         .windows(valid_project.len())
         .position(|candidate| candidate == valid_project)
         .expect("published Flow contains the Project definition");
-    let invalid_projection = encode_definition(
+    let invalid_projection = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
         &SelectDefinition::try_new([("value", col("other"))])
             .unwrap()
             .into(),
-    );
+    )
+    .unwrap();
     assert_eq!(invalid_projection.len(), valid_project.len());
     definition[offset..offset + valid_project.len()].copy_from_slice(&invalid_projection);
     rewrite_checksum(&mut definition);
@@ -144,8 +146,13 @@ fn open_rebinds_decoded_multi_input_definitions() {
     let union_path = root.path().join("union");
     let valid_select = SelectDefinition::try_new([("a", col("value"))]).unwrap();
     let invalid_select = SelectDefinition::try_new([("b", col("value"))]).unwrap();
-    let valid_operation = encode_definition(&valid_select.clone().into());
-    let invalid_operation = encode_definition(&invalid_select.into());
+    let valid_operation = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &valid_select.clone().into(),
+    )
+    .unwrap();
+    let invalid_operation =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&invalid_select.into())
+            .unwrap();
     assert_eq!(valid_operation.len(), invalid_operation.len());
 
     let mut factory = FlowFactory::new(&union_path);
@@ -187,8 +194,13 @@ fn open_rebinds_the_decoded_sqlite_sink_input_before_opening_its_database() {
         SelectDefinition::try_new([("Name", col("value")), ("Nome", col("value"))]).unwrap();
     let invalid_select =
         SelectDefinition::try_new([("Name", col("value")), ("name", col("value"))]).unwrap();
-    let valid_operation = encode_definition(&valid_select.clone().into());
-    let invalid_operation = encode_definition(&invalid_select.into());
+    let valid_operation = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &valid_select.clone().into(),
+    )
+    .unwrap();
+    let invalid_operation =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&invalid_select.into())
+            .unwrap();
     assert_eq!(valid_operation.len(), invalid_operation.len());
     drop(build_select_sqlite_flow(&flow_path, &sqlite_path, valid_select).unwrap());
 

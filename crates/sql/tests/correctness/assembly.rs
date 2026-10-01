@@ -17,14 +17,15 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     drop(program.start(&path).unwrap());
     let definition = read_definition(&path);
 
+    // The sole Flow JSON plan preserves the same owner, nodes and input ordinals.
     assert_eq!(
         (
             definition.len(),
             blake3::hash(&definition).to_hex().to_string(),
         ),
         (
-            1031,
-            "e83ef1c97934e51e4109e3ff215bf73e9584410dbf84b7653a0f11f1524daabe".to_owned(),
+            1139,
+            "47ffefc94c1b887209e0da7264a1b67e55f727d91806429441e727524c049d91".to_owned(),
         )
     );
 }

@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    RuntimeResource, decode_definition, encode_definition,
+    RuntimeResource,
     operation::{
         Operation, OperationError,
         sink::{PostgresSinkConfig, PostgresSinkDefinition},
@@ -52,8 +52,11 @@ impl Host {
         if mode == "build" {
             let target = config.discover_target(format!("gate_{scenario}"), "public", scenario)?;
             let definition = PostgresSinkDefinition::try_new(target)?;
-            let encoded = encode_definition(&definition.into());
-            let canonical = decode_definition(&encoded)?;
+            let encoded =
+                serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.into())
+                    .unwrap();
+            let canonical =
+                serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded)?;
             let mut setup = dogpaddle_store::StoreSetup::new();
             let saved: Cell<Vec<u8>> = setup.create_data("definition")?;
             let _operation = canonical.construct(
@@ -79,7 +82,7 @@ impl Host {
         let saved: Cell<Vec<u8>> = store.open_data("definition")?;
         let definition = {
             let snapshot = store.read_transaction();
-            decode_definition(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
                 &saved
                     .read(snapshot.access())?
                     .get()?

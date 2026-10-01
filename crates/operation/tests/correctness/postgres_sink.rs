@@ -5,7 +5,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
-    decode_definition, encode_definition,
     operation::{
         Operation,
         sink::{
@@ -63,7 +62,7 @@ fn input_change() -> Change {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    let mut expected = Vec::new();
     expected.extend_from_slice(br#"{"postgres_sink":{"sink_id":"orders_sink","database":"shop","schema":"public","table":"orders_materialized","system_identifier":"123456789","database_oid":42}}"#);
     expected
 }
@@ -75,21 +74,29 @@ fn postgres_sink_definition_has_canonical_non_secret_variant_bytes() {
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Sink(NonZeroU32::MIN)
     );
-    let encoded = encode_definition(&definition.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     let expected = literal_definition_bytes();
     assert_eq!(encoded, expected);
 
-    let decoded = decode_definition(&encoded).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Sink(NonZeroU32::MIN));
-    assert_eq!(encode_definition(&decoded), encoded);
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        encoded
+    );
     let printable = String::from_utf8(encoded.clone()).unwrap();
     for secret in [PASSWORD, "127.0.0.1", "sink_user"] {
         assert!(!printable.contains(secret));
     }
 
     let mut noncanonical = encoded;
-    noncanonical.push(b' ');
-    assert!(decode_definition(&noncanonical).is_err());
+    noncanonical.push(0);
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&noncanonical).is_err()
+    );
 }
 
 #[test]
@@ -128,7 +135,10 @@ fn postgres_sink_reopens_an_idle_event_position_without_network_io() {
 
     for _ in 0..2 {
         let store = Store::open(store_root.path()).unwrap();
-        let decoded = decode_definition(&literal_definition_bytes()).unwrap();
+        let decoded = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+            &literal_definition_bytes(),
+        )
+        .unwrap();
         let state: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
         let (operation, output) = decoded
             .construct(
@@ -154,10 +164,13 @@ fn postgres_sink_reopens_an_idle_event_position_without_network_io() {
 
 #[test]
 fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
-    let encoded = encode_definition(&definition().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition().into())
+            .unwrap();
     for length in 0..encoded.len() {
         assert!(
-            decode_definition(&encoded[..length]).is_err(),
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded[..length])
+                .is_err(),
             "accepted truncated PostgreSQL sink definition prefix {length}/{}",
             encoded.len()
         );

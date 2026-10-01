@@ -1,8 +1,8 @@
-use std::panic::catch_unwind;
+use std::{error::Error, panic::catch_unwind};
 
 use dogpaddle_flow::{FlowDefinitionError, FlowError, FlowFactory};
 use dogpaddle_operation::{
-    DefinitionCodecError,
+    col,
     operation::{
         scan::SequenceScanDefinition, sink::DiscardDefinition, transform::SelectDefinition,
     },
@@ -13,234 +13,248 @@ use super::support::{
 };
 
 const FLOW_MAGIC: &[u8] = b"dogpaddle.flow\0";
-const OPERATION_MAGIC: &[u8] = b"dogpaddle.operation\0";
-const V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD: &str =
-    include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
+const HEADER: usize = FLOW_MAGIC.len() + 2;
+const GOLDEN: &str = include_str!("../fixtures/v1/sequence_scan_running_event_count_discard.hex");
 
-#[test]
-fn open_reports_semantic_errors_after_a_valid_checksum() {
-    let root = tempfile::tempdir().unwrap();
-    let original = fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD);
+fn frame(json: &str) -> Vec<u8> {
+    let mut bytes = FLOW_MAGIC.to_vec();
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(json.as_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    rewrite_checksum(&mut bytes);
+    bytes
+}
 
-    let mut invalid_magic = original.clone();
-    invalid_magic[0] ^= 1;
-    rewrite_checksum(&mut invalid_magic);
-    assert_eq!(
-        definition_error(root.path(), "invalid-magic", &invalid_magic),
-        FlowDefinitionError::InvalidMagic
-    );
+fn payload(bytes: &[u8]) -> &str {
+    std::str::from_utf8(&bytes[HEADER..bytes.len() - 4]).unwrap()
+}
 
-    let mut integrity_damage = original.clone();
-    let scan = find_first(&integrity_damage, b"scan");
-    integrity_damage[scan] ^= 1;
-    assert_eq!(
-        definition_error(root.path(), "integrity", &integrity_damage),
-        FlowDefinitionError::IntegrityMismatch
-    );
-
-    let payload_end = original.len() - size_of::<u32>();
-    let mut truncated = original[..payload_end - 1].to_vec();
-    truncated.extend_from_slice(&[0; size_of::<u32>()]);
-    rewrite_checksum(&mut truncated);
-    assert_eq!(
-        definition_error(root.path(), "truncated", &truncated),
-        FlowDefinitionError::Truncated
-    );
-
-    let mut trailing = original.clone();
-    trailing.insert(payload_end, 0);
-    rewrite_checksum(&mut trailing);
-    assert_eq!(
-        definition_error(root.path(), "trailing", &trailing),
-        FlowDefinitionError::TrailingBytes
-    );
-
-    let mut unsupported_version = original.clone();
-    let version = FLOW_MAGIC.len();
-    unsupported_version[version..version + 2].copy_from_slice(&u16::MAX.to_be_bytes());
-    rewrite_checksum(&mut unsupported_version);
-    assert_eq!(
-        definition_error(root.path(), "unsupported-version", &unsupported_version),
-        FlowDefinitionError::UnsupportedVersion(u16::MAX)
-    );
-
-    let mut invalid_owner_identity_presence = original.clone();
-    let owner_identity_presence = FLOW_MAGIC.len() + size_of::<u16>();
-    invalid_owner_identity_presence[owner_identity_presence] = 2;
-    rewrite_checksum(&mut invalid_owner_identity_presence);
-    assert_eq!(
-        definition_error(
-            root.path(),
-            "invalid-owner-identity-presence",
-            &invalid_owner_identity_presence,
-        ),
-        FlowDefinitionError::InvalidOwnerIdentityPresence(2)
-    );
-
-    let mut invalid_utf8 = original.clone();
-    let scan_id = find_first(&invalid_utf8, b"scan");
-    invalid_utf8[scan_id] = 0xff;
-    rewrite_checksum(&mut invalid_utf8);
-    assert_eq!(
-        definition_error(root.path(), "invalid-utf8", &invalid_utf8),
-        FlowDefinitionError::InvalidUtf8
-    );
-
-    let mut unknown_input = original.clone();
-    // Last node has one u32 input immediately before the checksum.
-    let offset = unknown_input.len() - 8;
-    unknown_input[offset..offset + 4].copy_from_slice(&99_u32.to_be_bytes());
-    rewrite_checksum(&mut unknown_input);
-    assert_eq!(
-        definition_error(root.path(), "unknown-input", &unknown_input),
-        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
-            operation: "sink".to_owned(),
-            input: 99
-        })
-    );
-
-    let mut unknown_operation = original.clone();
-    let operation = find_first(&unknown_operation, OPERATION_MAGIC);
-    let tag = operation + OPERATION_MAGIC.len() + size_of::<u16>();
-    unknown_operation[tag + 2] = b'x';
-    rewrite_checksum(&mut unknown_operation);
-    assert!(matches!(
-        definition_error(root.path(), "unknown-operation", &unknown_operation),
-        FlowDefinitionError::Operation {
-            operation_id,
-            source: DefinitionCodecError::InvalidJsonPayload {
-                reason: "invalid value",
-                ..
-            },
-        } if operation_id == "scan"
-    ));
-
-    let mut truncated_operation = original;
-    let operation = find_first(&truncated_operation, OPERATION_MAGIC);
-    let operation_length = operation - size_of::<u32>();
-    truncated_operation[operation_length..operation].copy_from_slice(&31_u32.to_be_bytes());
-    rewrite_checksum(&mut truncated_operation);
-    assert_eq!(
-        definition_error(root.path(), "truncated-operation", &truncated_operation),
-        FlowDefinitionError::Operation {
-            operation_id: "scan".to_owned(),
-            source: DefinitionCodecError::Truncated,
-        }
-    );
+fn definition_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowDefinitionError {
+    let path = root.join(name);
+    publish_definition(&path, encoded);
+    let Err(FlowError::Definition(error)) = FlowFactory::new(&path).open() else {
+        panic!("mutated definition did not return a definition error");
+    };
+    assert_eq!(read_published_definition(&path), encoded);
+    error
 }
 
 #[test]
-fn open_never_panics_for_deterministic_malformed_and_mutated_definitions() {
+fn open_checks_integrity_before_json_and_reports_only_safe_categories() {
     let root = tempfile::tempdir().unwrap();
-    let original = fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD);
-    let mut cases = Vec::new();
-
-    for length in [
-        0,
-        1,
-        FLOW_MAGIC.len() - 1,
-        FLOW_MAGIC.len(),
-        FLOW_MAGIC.len() + 1,
-        21,
-        22,
-        original.len() - 5,
-        original.len() - 4,
-        original.len() - 1,
-    ] {
-        cases.push((format!("truncated-{length}"), original[..length].to_vec()));
+    let original = fixture_bytes(GOLDEN);
+    let mut bad_magic = original.clone();
+    bad_magic[0] ^= 1;
+    assert_eq!(
+        definition_error(root.path(), "magic", &bad_magic),
+        FlowDefinitionError::InvalidMagic
+    );
+    let mut bad_crc = original.clone();
+    bad_crc[HEADER] = 0xff;
+    assert_eq!(
+        definition_error(root.path(), "crc", &bad_crc),
+        FlowDefinitionError::IntegrityMismatch
+    );
+    let mut version = original.clone();
+    version[FLOW_MAGIC.len()..HEADER].copy_from_slice(&2_u16.to_be_bytes());
+    rewrite_checksum(&mut version);
+    assert_eq!(
+        definition_error(root.path(), "version", &version),
+        FlowDefinitionError::UnsupportedVersion(2)
+    );
+    for (index, json) in [
+        "{", "{}", "[]", "null", r#"{"owner_identity":2,"operations":[]}"#,
+        r#"{"owner_identity":null,"operations":[{"id":"secret-id","definition":{"secret-variant":{}},"inputs":[]}]}"#,
+        r#"{"owner_identity":null,"operations":[],"secret-field":"secret-value"}"#,
+    ].into_iter().enumerate() {
+        let error = definition_error(root.path(), &format!("json-{index}"), &frame(json));
+        assert!(matches!(error, FlowDefinitionError::InvalidJson { .. }));
+        assert!(!error.to_string().contains("secret"));
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(error.source().is_none());
     }
+    let mut utf8 = original.clone();
+    utf8[HEADER] = 0xff;
+    rewrite_checksum(&mut utf8);
+    assert!(matches!(
+        definition_error(root.path(), "utf8", &utf8),
+        FlowDefinitionError::InvalidJson { .. }
+    ));
+}
 
-    let mutation_stride = (original.len() / 16).max(1);
-    for index in (0..original.len()).step_by(mutation_stride) {
-        let mut mutated = original.clone();
-        mutated[index] ^= 0x80;
-        cases.push((format!("bit-flip-{index}"), mutated));
-    }
-
-    for (name, encoded) in [
-        ("zeros-64", vec![0; 64]),
-        ("ones-64", vec![0xff; 64]),
-        (
-            "byte-cycle-257",
-            (0_u8..=u8::MAX).chain(std::iter::once(0)).collect(),
+#[test]
+fn open_rejects_noncanonical_json_and_extra_values_without_rewriting() {
+    let root = tempfile::tempdir().unwrap();
+    let original = fixture_bytes(GOLDEN);
+    let json = payload(&original);
+    for (index, forged) in [
+        format!(" {json}"),
+        format!("{json} "),
+        json.replacen("\"owner_identity\":null,", "", 1),
+        json.replacen(
+            "\"owner_identity\":null",
+            "\"owner_identity\":null,\"owner_identity\":null",
+            1,
         ),
-    ] {
-        cases.push((name.to_owned(), encoded));
+        format!("{json}null"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(matches!(
+            definition_error(root.path(), &format!("canonical-{index}"), &frame(&forged)),
+            FlowDefinitionError::NonCanonical | FlowDefinitionError::InvalidJson { .. }
+        ));
     }
+}
 
-    for (index, (name, encoded)) in cases.into_iter().enumerate() {
-        let path = root.path().join(format!("case-{index:03}"));
-        publish_definition(&path, &encoded);
-        let outcome = catch_unwind(|| FlowFactory::new(&path).open());
-        assert!(outcome.is_ok(), "FlowFactory::open panicked for {name}");
-        let Err(error) = outcome.unwrap() else {
-            panic!("malformed definition {name} unexpectedly opened");
-        };
-        assert!(
-            matches!(error, FlowError::Definition(_)),
-            "malformed definition {name} returned non-definition error: {error:?}"
+#[test]
+fn metadata_duplicates_order_and_absent_overrides_are_checked_by_the_whole_plan() {
+    use arrow_schema::Metadata;
+    use dogpaddle_operation::operation::transform::SelectField;
+    let root = tempfile::tempdir().unwrap();
+    let mut factory = FlowFactory::new(root.path().join("valid"));
+    let source = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    let selected = factory.operation(
+        "select",
+        SelectDefinition::try_new([SelectField {
+            name: "value".into(),
+            expression: col("value"),
+            nullable: Some(true),
+            metadata: Some(Metadata::from([("a", "first"), ("z", "last")])),
+        }])
+        .unwrap()
+        .with_metadata(Metadata::from([("owner", "test"), ("version", "1")])),
+        [source],
+    );
+    factory.operation("sink", DiscardDefinition::new(), [selected]);
+    drop(factory.build().unwrap());
+    let original = read_published_definition(&root.path().join("valid"));
+    let json = payload(&original);
+    for (index, (needle, replacement)) in [
+        (r#""owner":"test""#, r#""owner":"other","owner":"test""#),
+        (r#""a":"first""#, r#""a":"other","a":"first""#),
+        (r#""a":"first","z":"last""#, r#""z":"last","a":"first""#),
+        (
+            r#""owner":"test","version":"1""#,
+            r#""version":"1","owner":"test""#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let forged = json.replace(needle, replacement);
+        assert_ne!(forged, json);
+        assert_eq!(
+            definition_error(root.path(), &format!("metadata-{index}"), &frame(&forged)),
+            FlowDefinitionError::NonCanonical
+        );
+    }
+    let mut ordinary_factory = FlowFactory::new(root.path().join("ordinary"));
+    let source = ordinary_factory.operation("s", SequenceScanDefinition::new(0), []);
+    let selected = ordinary_factory.operation(
+        "p",
+        SelectDefinition::try_new([("value", col("value"))]).unwrap(),
+        [source],
+    );
+    ordinary_factory.operation("d", DiscardDefinition::new(), [selected]);
+    drop(ordinary_factory.build().unwrap());
+    let ordinary = read_published_definition(&root.path().join("ordinary"));
+    let ordinary = payload(&ordinary);
+    for (index, forged) in [
+        ordinary.replacen("\"}]}}", "\",\"nullable\":null}]}}", 1),
+        ordinary.replacen("\"}]}}", "\",\"metadata\":null}]}}", 1),
+        ordinary.replacen("]}}", "],\"metadata\":null}}", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_ne!(forged, ordinary);
+        assert_eq!(
+            definition_error(root.path(), &format!("null-{index}"), &frame(&forged)),
+            FlowDefinitionError::NonCanonical
+        );
+    }
+    // Explicit empty metadata remains a distinct plan and clears inherited metadata.
+    let empty = json
+        .replace(r#"{"a":"first","z":"last"}"#, "{}")
+        .replace(r#"{"owner":"test","version":"1"}"#, "{}");
+    let empty_path = root.path().join("empty");
+    publish_definition(&empty_path, &frame(&empty));
+    assert!(matches!(
+        FlowFactory::new(&empty_path).open(),
+        Err(FlowError::MissingResource { .. })
+    ));
+}
+
+#[test]
+fn persisted_inputs_must_precede_their_consumers_even_in_an_acyclic_graph() {
+    let root = tempfile::tempdir().unwrap();
+    let forward = frame(
+        r#"{"owner_identity":null,"operations":[{"id":"count","definition":{"running_event_count":{}},"inputs":[1]},{"id":"scan","definition":{"sequence_scan":{"start":7}},"inputs":[]},{"id":"sink","definition":{"discard":{}},"inputs":[0]}]}"#,
+    );
+    assert_eq!(
+        definition_error(root.path(), "forward", &forward),
+        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
+            operation: "count".into(),
+            input: 1
+        })
+    );
+    let original = fixture_bytes(GOLDEN);
+    for input in [2, 99] {
+        let forged =
+            payload(&original).replace(r#""inputs":[1]"#, &format!(r#""inputs":[{input}]"#));
+        assert_eq!(
+            definition_error(root.path(), &format!("input-{input}"), &frame(&forged)),
+            FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
+                operation: "sink".into(),
+                input
+            })
         );
     }
 }
 
 #[test]
-fn open_locates_an_invalid_operation_by_logical_identity() {
+fn open_never_panics_for_truncated_or_mutated_definitions() {
     let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("source");
-    let mut factory = FlowFactory::new(&source);
-    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
-    let projected = factory.operation(
-        "project",
-        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))]).unwrap(),
-        [scan],
+    let original = fixture_bytes(GOLDEN);
+    for length in 0..original.len() {
+        let bytes = &original[..length];
+        assert!(
+            catch_unwind(|| definition_error(root.path(), &format!("prefix-{length}"), bytes))
+                .is_ok()
+        );
+    }
+    let mut state = 0xbb67_ae85_84ca_a73b_u64;
+    for length in 0..=128 {
+        let mut bytes = frame("");
+        bytes.truncate(HEADER);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push(state.to_le_bytes()[0]);
+        }
+        bytes.extend_from_slice(&[0; 4]);
+        rewrite_checksum(&mut bytes);
+        assert!(
+            catch_unwind(|| definition_error(root.path(), &format!("random-{length}"), &bytes))
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn old_binary_definition_is_rejected_without_rewriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    // Exact former valid sequence -> count -> discard persistent golden.
+    let bytes = fixture_bytes(
+        "646f67706164646c652e666c6f770000010000000003000000047363616e00000033646f67706164646c652e6f7065726174696f6e0000017b2273657175656e63655f7363616e223a7b227374617274223a377d7d0000000000000005636f756e7400000030646f67706164646c652e6f7065726174696f6e0000017b2272756e6e696e675f6576656e745f636f756e74223a7b7d7d00000001000000000000000473696e6b00000024646f67706164646c652e6f7065726174696f6e0000017b2264697363617264223a7b7d7d0000000100000001cb7bd0c7",
     );
-    factory.operation("sink", DiscardDefinition::new(), [projected]);
-    drop(factory.build().unwrap());
-
-    let mut encoded = read_published_definition(&source);
-    let second_operation = encoded
-        .windows(OPERATION_MAGIC.len())
-        .enumerate()
-        .filter_map(|(index, bytes)| (bytes == OPERATION_MAGIC).then_some(index))
-        .nth(1)
-        .unwrap();
-    let tag = second_operation + OPERATION_MAGIC.len() + size_of::<u16>();
-    encoded[tag + 2] = b'x';
-    rewrite_checksum(&mut encoded);
-
     assert!(matches!(
-        definition_error(root.path(), "invalid-second-operation", &encoded),
-        FlowDefinitionError::Operation {
-            operation_id,
-            source: DefinitionCodecError::InvalidJsonPayload {
-                reason: "invalid value",
-                ..
-            },
-        } if operation_id == "project"
+        definition_error(root.path(), "old", &bytes),
+        FlowDefinitionError::InvalidJson { .. }
     ));
-}
-
-fn open_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowError {
-    let path = root.join(name);
-    publish_definition(&path, encoded);
-    let Err(error) = FlowFactory::new(path).open() else {
-        panic!("mutated definition unexpectedly opened");
-    };
-    error
-}
-
-fn definition_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowDefinitionError {
-    let FlowError::Definition(error) = open_error(root, name, encoded) else {
-        panic!("mutated definition returned a non-definition error");
-    };
-    error
-}
-
-fn find_first(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-        .expect("fixture contains marker")
 }
 
 #[test]
@@ -254,56 +268,6 @@ fn oversized_definition_is_rejected_before_decoding_without_rewriting_it() {
         Err(FlowError::Store(_))
     ));
     assert_eq!(read_published_definition(&path), bytes);
-}
-
-#[test]
-fn persisted_inputs_must_precede_their_consumers_even_in_an_acyclic_graph() {
-    let root = tempfile::tempdir().unwrap();
-    let original = fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD);
-    let first = FLOW_MAGIC.len() + size_of::<u16>() + 1 + size_of::<u32>();
-    let count = find_first(&original, b"count") - size_of::<u32>();
-    let sink = find_first(&original, b"sink") - size_of::<u32>();
-    let end = original.len() - size_of::<u32>();
-    // Reorder the same valid DAG as count -> scan -> sink. Its first edge now
-    // points forward to scan, and sink still reads count: there is no cycle.
-    let mut count_node = original[count..sink].to_vec();
-    let input = count_node.len() - size_of::<u32>();
-    count_node[input..].copy_from_slice(&1_u32.to_be_bytes());
-    let mut sink_node = original[sink..end].to_vec();
-    let input = sink_node.len() - size_of::<u32>();
-    sink_node[input..].copy_from_slice(&0_u32.to_be_bytes());
-    let mut forward = original[..first].to_vec();
-    forward.extend(count_node);
-    forward.extend_from_slice(&original[first..count]);
-    forward.extend(sink_node);
-    forward.extend_from_slice(&[0; 4]);
-    rewrite_checksum(&mut forward);
-    assert_eq!(
-        definition_error(root.path(), "forward", &forward),
-        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
-            operation: "count".to_owned(),
-            input: 1,
-        })
-    );
-    assert_eq!(
-        read_published_definition(&root.path().join("forward")),
-        forward
-    );
-
-    let mut self_reference = original;
-    self_reference[end - 4..end].copy_from_slice(&2_u32.to_be_bytes());
-    rewrite_checksum(&mut self_reference);
-    assert_eq!(
-        definition_error(root.path(), "self-reference", &self_reference),
-        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
-            operation: "sink".to_owned(),
-            input: 2,
-        })
-    );
-    assert_eq!(
-        read_published_definition(&root.path().join("self-reference")),
-        self_reference,
-    );
 }
 
 #[test]

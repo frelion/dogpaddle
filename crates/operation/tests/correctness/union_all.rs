@@ -4,8 +4,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
-    decode_definition, encode_definition,
+    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
     operation::{
         OperationInput,
         transform::{UnionAllDefinition, UnionAllError, UnionAllSchemaError},
@@ -19,10 +18,10 @@ use super::support::{
 };
 
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn decoded_definition() -> OperationDefinition {
-    decode_definition(&decode_hex(UNION_ALL_V1)).unwrap()
+    serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(UNION_ALL_V1))
+        .unwrap()
 }
 
 fn assert_forwarded_without_copying(input: &Change, output: &Change) {
@@ -58,8 +57,7 @@ fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
     ) else {
         panic!("mismatched UnionAll input unexpectedly bound");
     };
-    assert!(matches!(
-        source.downcast_ref::<UnionAllSchemaError>(),
+    assert!(matches!(source.downcast_ref::<UnionAllSchemaError>(),
         Some(UnionAllSchemaError::InputSchemaMismatch {
             input: 1,
             expected: actual_expected,
@@ -90,18 +88,19 @@ fn literal_definition_preserves_arity_binding_and_data_contract() {
 
 #[test]
 fn decoder_rejects_zero_input_count() {
-    let canonical = encode_definition(&UnionAllDefinition::new(NonZeroU32::new(2).unwrap()).into());
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    let canonical = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+        &UnionAllDefinition::new(NonZeroU32::new(2).unwrap()).into(),
+    )
+    .unwrap();
+    let payload = std::str::from_utf8(&canonical[..]).unwrap();
     assert_eq!(payload, "{\"union_all\":{\"input_count\":2}}");
-    let mut zero = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    let mut zero = Vec::new();
     zero.extend_from_slice(b"{\"union_all\":{\"input_count\":0}}");
-    assert!(matches!(
-        decode_definition(&zero).unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload {
-            reason: "invalid value",
-            ..
-        }
-    ));
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&zero)
+            .unwrap_err()
+            .is_data()
+    );
 }
 
 #[test]

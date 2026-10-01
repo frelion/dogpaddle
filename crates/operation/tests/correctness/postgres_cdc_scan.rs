@@ -1,6 +1,5 @@
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
-    encode_definition,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::{
         Operation,
         scan::{CdcOptions, PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec},
@@ -55,7 +54,7 @@ fn config() -> PostgresCdcScanConfig {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    let mut expected = Vec::new();
     expected.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
     expected
 }
@@ -67,12 +66,18 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_variant_and_exact_schema()
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Scan
     );
-    let bytes = encode_definition(&definition.clone().into());
+    let bytes =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     let expected = literal_definition_bytes();
     assert_eq!(bytes, expected);
-    let decoded = decode_definition(&bytes).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&bytes).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Scan);
-    assert_eq!(encode_definition(&decoded), bytes);
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        bytes
+    );
     let binding = construct_checked(&decoded, &[]).unwrap();
     let output = binding.as_ref().unwrap();
     assert_eq!(output.fields().len(), 1);
@@ -81,10 +86,13 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_variant_and_exact_schema()
     assert!(!output.field(0).is_nullable());
     assert!(!String::from_utf8(bytes).unwrap().contains("password"));
     let mut trailing = expected.clone();
-    trailing.push(b' ');
-    assert!(decode_definition(&trailing).is_err());
+    trailing.push(0);
+    assert!(serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&trailing).is_err());
     for length in 0..expected.len() {
-        assert!(decode_definition(&expected[..length]).is_err());
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&expected[..length])
+                .is_err()
+        );
     }
 }
 
@@ -411,9 +419,9 @@ fn raw_plan_business_validation_precedes_store_handle_access() {
 
 #[test]
 fn retired_column_layout_is_not_recognized() {
-    let mut legacy = b"dogpaddle.operation\0\0\x01".to_vec();
+    let mut legacy = Vec::new();
     legacy.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
-    assert!(decode_definition(&legacy).is_err());
+    assert!(serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&legacy).is_err());
 }
 
 #[test]

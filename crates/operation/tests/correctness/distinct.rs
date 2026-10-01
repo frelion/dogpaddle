@@ -8,7 +8,7 @@ use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::{
         BudgetExceeded, Operation, Progress, StepBudget,
         transform::{DistinctDefinition, DistinctError},
@@ -24,7 +24,8 @@ use super::support::{
 const DISTINCT_V1: &str = include_str!("../fixtures/v1/distinct_definition.hex");
 
 fn decoded_definition() -> OperationDefinition {
-    decode_definition(&decode_hex(DISTINCT_V1)).unwrap()
+    serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(DISTINCT_V1))
+        .unwrap()
 }
 
 fn schema() -> SchemaRef {

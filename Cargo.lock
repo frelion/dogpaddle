@@ -1554,6 +1554,7 @@ dependencies = [
  "dogpaddle-perf-context",
  "dogpaddle-store",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

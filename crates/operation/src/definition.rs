@@ -74,6 +74,8 @@ impl OperationKind {
 /// canonical, replayable expressions, and the supported CDC column domain. Other
 /// operation-specific business rules are checked by both [`Self::output_schema`]
 /// and [`Self::construct`] before obtaining owner data handles.
+/// Flow owns the sole persistent envelope and canonical JSON comparison; plain
+/// Serde deserialization does not provide persistent integrity or error redaction.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationDefinition {

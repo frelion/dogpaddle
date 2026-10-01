@@ -21,11 +21,11 @@ Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink �
 
 ## 计划表示与持久化
 
-`OperationDefinition` 是唯一的封闭类型分发，也是公开 JSON 和持久格式共同使用的计划表示。v1 外层只有 marker 和版本，随后是以稳定 snake_case 算子名标记的 canonical JSON，例如 `{"filter":{"predicate":"..."}}`；没有数字 tag 目录、逐算子解码分发或第二份 Payload 类型。新增算子在 enum 声明其计划类型并实现已有的能力分发，不增加注册表。
+`OperationDefinition` 是唯一的封闭类型分发和公开 Serde JSON 计划表示，以稳定 snake_case 算子名标记，例如 `{"filter":{"predicate":"..."}}`。Operation 不再拥有独立持久 envelope、encode/decode API 或 codec 错误类型；Flow 直接嵌入这份计划，统一拥有版本、完整消费、canonical 字节比较、总长和 checksum。没有数字 tag 目录、逐算子解码分发或第二份 Payload 类型；新增算子只扩充已有 enum 与能力分发，不增加注册表。
 
-解码完整消费输入并逐字比较重新编码的 JSON，拒绝未知字段、非 canonical 字节和非法结构。`UnionAll` 的非零 arity、CDC 非零容量和 Aggregate 六变体调用由类型表达。CDC 的 Arrow `Fields` 在反序列化时复用源 Schema 的浅类型、名称与空 metadata 校验，保持源支持列域；不引入另一套字段表示或 codec。`StoredExpression` 保留完整 protobuf roundtrip、canonical 与 immutable/row-local 证明；表达式不是未经验证的计划字节。
+原生反序列化拒绝未知字段和非法结构；`UnionAll` 的非零 arity、CDC 非零容量和 Aggregate 六变体调用由类型表达。CDC 的 Arrow `Fields` 在反序列化时复用源 Schema 的浅类型、名称与空 metadata 校验，保持源支持列域；不引入另一套字段表示或 codec。`StoredExpression` 保留完整 protobuf roundtrip、canonical 与 immutable/row-local 证明；表达式不是未经验证的计划字节。独立调用 Serde 不承诺 JSON 字节唯一化或错误脱敏；持久 Flow 的 JSON 错误只保留静态类别和位置，Display、Debug 和 source 都不保留原始输入。
 
-具体 Definition 是待绑定的计划数据。除上述 CDC 列域外，公开 JSON 反序列化与持久解码不证明非空 join keys、group list、目标身份/路径或 Schema 业务规则；这些约束在同一个纯验证/编译路径执行，`output_schema` 与 `construct` 都必须经过，且早于取得 Store 数据句柄或任何外部 I/O。便利构造器也复用该定义验证；不存在受信任 Definition 包装层。各 owner 的大小上限（CDC/远端 Sink 1 MiB、ASOF 字段上限）保留于该路径。单独调用 decode 可以暂时持有超 owner 上限的待绑定计划；它不再提供每种 owner 的提前字节准入。Flow 在解析前仍限制整个持久 Definition 不超过 8 MiB。
+具体 Definition 是待绑定的计划数据。除上述 CDC 列域外，公开 JSON 反序列化与持久解码不证明非空 join keys、group list、目标身份/路径或 Schema 业务规则；这些约束在同一个纯验证/编译路径执行，`output_schema` 与 `construct` 都必须经过，且早于取得 Store 数据句柄或任何外部 I/O。便利构造器也复用该定义验证；不存在受信任 Definition 包装层。各 owner 的大小上限（CDC/远端 Sink 1 MiB、ASOF 字段上限）保留于该路径。单独调用 Serde 反序列化可以暂时持有超 owner 上限的待绑定计划；它不再提供每种 owner 的提前字节准入。Flow 在解析前仍限制整个持久 Definition 不超过 8 MiB。
 
 修改计划格式直接更新当前 v1 golden 和 reopen 证据并重建旧状态，不提供旧数字 tag 识别、alias、fallback 或迁移。算子 correctness 覆盖稳定名称、literal golden、资源布局、construct、step 和适用的 reopen。
 Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propagation、runtime-resource 方向、外部副作用边界、持久 data/Resume 或 recovery 阶段时才增加 Flow case，不逐算子复制同一 build/open/reopen 矩阵，也不得用 test-only Operation 代替真实产品语义。
@@ -57,10 +57,10 @@ RunningEventCount 只声明 `running_event_count.count: Cell<u64>`，固定输�
 
 Select 以有序 `SelectField<E = Expr>` 列表一次性计算完整 output；字段直接保存 name、expression 与可选 nullable/metadata 覆盖，普通 `(name, Expr)` 通过标准 `From` 转为无覆盖字段。`try_new` 接收可转为字段的集合，只把每个 Expr 转成一次 `StoredExpression`；Definition 复用同一字段 ADT 保存 canonical 表达式，不另设 Payload、mode 或 SchemaAlign 算子。
 所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。字段类型只从绑定表达式推导，cast/try_cast 必须写在 Expr 中；nullable 的 None 继承表达式推导，Some 只允许 non-null 到 nullable 的放宽，拒绝收窄。
-字段 metadata 的 None 使直接列引用（包括改名）继承源字段 metadata，计算列为空；Some 精确覆盖，Some(empty) 清空。Schema metadata 默认继承输入，可用消费式 `with_metadata` 精确覆盖或清空。覆盖使用 Arrow 的 typed Metadata，按 key canonical 排序；条目数量、文本总量与保留 namespace 统一归完整 output 的 `validate_schema` 检查。typed map 接收已唯一化的键，不另维护 iterator 重复键诊断；持久 codec 的 canonical 比较仍拒绝 JSON 重复键和其它非 canonical 字节。
+字段 metadata 的 None 使直接列引用（包括改名）继承源字段 metadata，计算列为空；Some 精确覆盖，Some(empty) 清空。Schema metadata 默认继承输入，可用消费式 `with_metadata` 精确覆盖或清空。覆盖使用 Arrow 的 typed Metadata，按 key canonical 排序；条目数量、文本总量与保留 namespace 统一归完整 output 的 `validate_schema` 检查。typed map 接收已唯一化的键，不另维护 iterator 重复键诊断；Flow 持久 codec 的 canonical 比较仍拒绝 JSON 重复键和其它非 canonical 字节。
 纯列引用共享输入 Arrow arrays，全部投影共享 diff buffer；保留完整子树，字段重排无需复制数据。
 绑定后的严格递增纯列引用若输出 Schema 精确等于对应输入投影，自动复用 ChangeProjection 快路径，避免重扫已验证的 diff 和 Decimal 值；改名、重排、覆盖与计算按输出 Schema 使用共享执行实现。
-Select 开发期 v1 payload 省略 None 覆盖，显式保留 Some(false) 与 Some(empty)；普通 Select 的原有 canonical 字节保持不变。旧 SchemaAlign variant 不识别或迁移；使用该 variant 的 Flow 与受影响目标直接重建。
+Select 开发期 v1 payload 省略 None 覆盖，显式保留 Some(false) 与 Some(empty)；普通 Select 的 JSON payload 字节保持不变。旧 SchemaAlign variant 不识别或迁移；使用该 variant 的 Flow 与受影响目标直接重建。
 UnionAll Definition 只保存非零 input arity，要求所有输入具有完全相同的 logical Schema，按端口原样转发 Change。
 Select 与 UnionAll 都不声明 Operation data，也不引入 planner、额外表达式层或专用 Flow 抽象。
 

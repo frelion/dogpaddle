@@ -27,7 +27,7 @@ immutable input + opaque Resume + TransactionAccess + StepBudget
 ## Definition 与 checked construction
 
 Definition 是可持久化的纯计划，不持有数据库句柄、连接、密码或执行位置。
-`OperationDefinition` 是全部内建算子的封闭 enum，也是唯一的稳定名称 JSON 计划表示；具体模块拥有纯业务验证与编译。反序列化证明结构、CDC 支持列域和表达式可重放性，`output_schema`/`construct` 在访问 Store 句柄前完成业务验证。
+`OperationDefinition` 是全部内建算子的封闭 enum，也是唯一的稳定名称 JSON 计划表示；具体模块拥有纯业务验证与编译。Flow 直接嵌入该 Serde 计划并拥有唯一持久外壳；Operation 不另提供 encode/decode codec。反序列化证明结构、CDC 支持列域和表达式可重放性，`output_schema`/`construct` 在访问 Store 句柄前完成业务验证。
 不保留旧 tag、格式识别、fallback、迁移或兼容入口。开发期 v1 布局变更后直接重建受影响的状态和目标。
 
 构造过程按同一路径服务新建和 reopen：

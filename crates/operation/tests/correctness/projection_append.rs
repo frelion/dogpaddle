@@ -174,7 +174,7 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
 fn append_expands_to_an_ordinary_select_and_preserves_literal_names_and_nested_buffers() {
     use super::support::roundtripped_output;
     use arrow_array::{ArrayRef, StructArray};
-    use dogpaddle_operation::{encode_definition, ident};
+    use dogpaddle_operation::ident;
     let nested_field = Arc::new(Field::new("child", DataType::UInt64, false));
     let nested: ArrayRef = Arc::new(StructArray::from(vec![(
         Arc::clone(&nested_field),
@@ -211,8 +211,10 @@ fn append_expands_to_an_ordinary_select_and_preserves_literal_names_and_nested_b
     ])
     .unwrap();
     assert_eq!(
-        encode_definition(&definition.clone().into()),
-        encode_definition(&explicit.clone().into())
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap(),
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&explicit.clone().into())
+            .unwrap()
     );
     let output = roundtripped_output(&definition, &input);
     assert_eq!(output.schema().metadata(), &metadata);

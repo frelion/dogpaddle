@@ -10,8 +10,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource, decode_definition,
-    encode_definition,
+    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::{
         Operation, StepBudget,
         transform::{
@@ -561,7 +560,9 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
     };
 
     let root = TestStore::new();
-    let encoded = encode_definition(&definition.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     let (operation, mut transactions) =
         construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
     let initial = make_change(
@@ -588,7 +589,8 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&encoded).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
     let operation = reopen_aggregate_for_schema(&store, &decoded, Arc::clone(&schema));
     let mut transactions = store.into_transactions();
     let retract = make_change(
@@ -1348,14 +1350,17 @@ fn decoded_definition_reopens_group_and_index_state() {
         [("min", AggregateCall::Min(col("value")))],
     )
     .unwrap();
-    let encoded = encode_definition(&definition.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     let (operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(&["A", "A"], &[Some(10), Some(20)], &[1, 1]);
     run_input(&operation, step_input(&initial), &mut transactions).unwrap();
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&encoded).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
     let operation = reopen_aggregate(&store, &decoded);
     let mut transactions = store.into_transactions();
     let retract_min = change(&["A"], &[Some(10)], &[-1]);
@@ -1384,7 +1389,9 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
         ],
     )
     .unwrap();
-    let encoded = encode_definition(&definition.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     let (operation, mut transactions) = construct_aggregate(&root, &definition);
     let initial = change(
         &["A", "A", "A"],
@@ -1395,7 +1402,8 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
     drop((operation, transactions));
 
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&encoded).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
     let operation = reopen_aggregate(&store, &decoded);
     let mut transactions = store.into_transactions();
 

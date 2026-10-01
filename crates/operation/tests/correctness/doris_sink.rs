@@ -3,7 +3,6 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
-    decode_definition, encode_definition,
     operation::sink::{
         DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
     },
@@ -38,7 +37,7 @@ fn config(database: &str) -> DorisSinkConfig {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    let mut expected = Vec::new();
     expected.extend_from_slice(br#"{"doris_sink":{"sink_id":"orders_sink","database":"shop","table":"orders_materialized","cluster_id":42}}"#);
     expected
 }
@@ -46,14 +45,20 @@ fn literal_definition_bytes() -> Vec<u8> {
 #[test]
 fn doris_sink_has_canonical_non_secret_variant_bytes() {
     let definition = definition();
-    let encoded = encode_definition(&definition.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
+            .unwrap();
     assert_eq!(encoded, literal_definition_bytes());
     assert_eq!(
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Sink(NonZeroU32::MIN)
     );
-    let decoded = decode_definition(&encoded).unwrap();
-    assert_eq!(encode_definition(&decoded), encoded);
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+        encoded
+    );
     let printable = String::from_utf8(encoded).unwrap();
     for secret in [PASSWORD, "127.0.0.1", "sink_user"] {
         assert!(!printable.contains(secret));
@@ -124,7 +129,10 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
     ));
 
     let root = TestStore::new();
-    let decoded = decode_definition(&literal_definition_bytes()).unwrap();
+    let decoded = serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+        &literal_definition_bytes(),
+    )
+    .unwrap();
     let mut setup = StoreSetup::new();
     let (operation, output) = decoded
         .construct(
@@ -154,7 +162,10 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
 fn doris_definition_rejects_every_truncated_prefix() {
     let encoded = literal_definition_bytes();
     for length in 0..encoded.len() {
-        assert!(decode_definition(&encoded[..length]).is_err());
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded[..length])
+                .is_err()
+        );
     }
 }
 

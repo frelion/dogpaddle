@@ -1,7 +1,7 @@
 //! `DataFusion` scalar expressions persisted with `DataFusion`'s protobuf codec.
 //!
-//! `DogPaddle` owns only the outer Operation Definition version and the exact
-//! Schema binding boundary. Expression syntax, protobuf conversion, physical
+//! Flow owns the persistent envelope; Operation proves replayability and exact
+//! Schema binding. Expression syntax, protobuf conversion, physical
 //! planning, type derivation, nullability, and evaluation belong to
 //! `DataFusion`.
 
@@ -25,10 +25,7 @@ use dogpaddle_store::TransactionAccess;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 
-use crate::{
-    DefinitionCodecError,
-    operation::{AtomicOperation, OperationError, OperationInput},
-};
+use crate::operation::{AtomicOperation, OperationError, OperationInput};
 
 pub use datafusion_common::ScalarValue;
 pub use datafusion_expr::{Expr, Operator, cast, col, ident, lit, try_cast};
@@ -272,33 +269,24 @@ impl StoredExpression {
         self.expression.as_ref()
     }
 
-    fn decode_protobuf(protobuf: &[u8]) -> Result<Self, DefinitionCodecError> {
+    fn decode_protobuf(protobuf: &[u8]) -> Result<Self, &'static str> {
         if u32::try_from(protobuf.len()).is_err() {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "DataFusion expression protobuf is too large",
-            ));
+            return Err("DataFusion expression protobuf is too large");
         }
-        let expression = Expr::from_bytes(protobuf).map_err(|_| {
-            DefinitionCodecError::InvalidPayload("DataFusion expression protobuf is invalid")
-        })?;
+        let expression =
+            Expr::from_bytes(protobuf).map_err(|_| "DataFusion expression protobuf is invalid")?;
         if has_nondeterministic_protobuf_map(&expression) {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "DataFusion expression protobuf contains non-canonical map metadata",
-            ));
+            return Err("DataFusion expression protobuf contains non-canonical map metadata");
         }
-        let canonical = expression.to_bytes().map_err(|_| {
-            DefinitionCodecError::InvalidPayload("DataFusion expression cannot be re-encoded")
-        })?;
+        let canonical = expression
+            .to_bytes()
+            .map_err(|_| "DataFusion expression cannot be re-encoded")?;
         if canonical.as_ref() != protobuf {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "DataFusion expression protobuf is not canonical",
-            ));
+            return Err("DataFusion expression protobuf is not canonical");
         }
 
         if !replayable_expression(&expression) {
-            return Err(DefinitionCodecError::InvalidPayload(
-                "expression must be immutable and row-local",
-            ));
+            return Err("expression must be immutable and row-local");
         }
         Ok(Self {
             expression: Arc::new(expression),

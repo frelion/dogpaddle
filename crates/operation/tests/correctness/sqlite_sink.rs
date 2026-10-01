@@ -8,8 +8,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, OperationBindError, OperationDefinition, OperationKind,
-    OperationSetupError, RuntimeResource, decode_definition, encode_definition,
+    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::{
         Operation, OperationError, SinkPrepared,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
@@ -18,12 +17,9 @@ use dogpaddle_operation::{
 use dogpaddle_store::{Cell, OrderedMap, ReadTransactions, Store, StoreSetup, Transactions};
 use rusqlite::{Connection, OpenFlags};
 
-use super::support::{
-    TestStore, assert_literal_definition, construct_checked, decode_hex, value_schema,
-};
+use super::support::{TestStore, assert_literal_definition, construct_checked, value_schema};
 
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 #[test]
 fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
@@ -45,9 +41,11 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
             .is_none()
     );
 
-    let encoded = encode_definition(&sqlite.clone().into());
+    let encoded =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&sqlite.clone().into())
+            .unwrap();
     assert_eq!(
-        &encoded[DEFINITION_HEADER_LEN..],
+        &encoded[..],
         br#"{"sqlite_sink":{"database_path":"/var/lib/dogpaddle/output.sqlite","table_name":"events"}}"#
     );
 }
@@ -65,14 +63,15 @@ fn raw_sqlite_plan_rejects_a_relative_path_during_binding() {
 
 #[test]
 fn sqlite_sink_codec_checks_structure_and_binding_checks_paths() {
-    let canonical = encode_definition(
+    let canonical = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
         &SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events")
             .unwrap()
             .into(),
-    );
-    let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
+    )
+    .unwrap();
+    let payload = std::str::from_utf8(&canonical[..]).unwrap();
     for field in ["database_path", "table_name"] {
-        let mut missing = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        let mut missing = Vec::new();
         missing.extend_from_slice(
             payload
                 .replacen(
@@ -82,13 +81,11 @@ fn sqlite_sink_codec_checks_structure_and_binding_checks_paths() {
                 )
                 .as_bytes(),
         );
-        assert!(matches!(
-            decode_definition(&missing).unwrap_err(),
-            DefinitionCodecError::InvalidJsonPayload {
-                reason: "invalid value",
-                ..
-            }
-        ));
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&missing)
+                .unwrap_err()
+                .is_data()
+        );
     }
 
     for value in [b"/var/lib/dogpaddle/output.sqlite".as_slice(), b"events"] {
@@ -98,14 +95,14 @@ fn sqlite_sink_codec_checks_structure_and_binding_checks_paths() {
             .position(|window| window == value)
             .unwrap();
         invalid_utf8[offset] = u8::MAX;
-        assert!(matches!(
-            decode_definition(&invalid_utf8).unwrap_err(),
-            DefinitionCodecError::InvalidJsonPayload { .. }
-        ));
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&invalid_utf8)
+                .is_err()
+        );
     }
 
     let wrap = |path: &str, table: &str| {
-        let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+        let mut encoded = Vec::new();
         encoded.extend_from_slice(
             format!(
                 r#"{{"sqlite_sink":{{"database_path":{},"table_name":{}}}}}"#,
@@ -124,25 +121,26 @@ fn sqlite_sink_codec_checks_structure_and_binding_checks_paths() {
         wrap("/tmp/output.sqlite", "bad\0table"),
         wrap("/tmp/output.sqlite", "SQLITE_reserved"),
     ] {
-        let plan = decode_definition(&invalid).unwrap();
+        let plan =
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&invalid).unwrap();
         assert!(plan.output_schema(&[value_schema()]).is_err());
     }
 }
 
 #[test]
-fn sqlite_sink_decoder_never_panics_for_valid_header_arbitrary_payloads() {
-    let mut header = decode_hex(SQLITE_SINK_V1);
-    header.truncate(DEFINITION_HEADER_LEN);
+fn sqlite_sink_decoder_never_panics_for_arbitrary_json_payloads() {
     let mut state = 0x3c6e_f372_fe94_f82b_u64;
     for length in 0..=256 {
-        let mut input = header.clone();
+        let mut input = Vec::new();
         for _ in 0..length {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             input.push(state.to_le_bytes()[0]);
         }
-        let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&input)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&input)
+        }));
         assert!(
             result.is_ok(),
             "SQLiteSink decoder panicked for payload length {length}"

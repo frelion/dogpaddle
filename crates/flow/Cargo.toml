@@ -17,6 +17,8 @@ crc32fast.workspace = true
 dogpaddle-change.workspace = true
 dogpaddle-operation.workspace = true
 dogpaddle-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -24,7 +26,6 @@ arrow-array.workspace = true
 criterion.workspace = true
 dogpaddle-perf-context.workspace = true
 rusqlite.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [[test]]

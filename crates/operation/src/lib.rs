@@ -1,12 +1,10 @@
 #![doc = include_str!("../README.md")]
 
-mod codec;
 mod definition;
 mod expression;
 pub mod operation;
 mod resource;
 
-pub use codec::{DefinitionCodecError, decode_definition, encode_definition};
 pub use definition::{
     ConstructedOperation, OperationBindError, OperationDefinition, OperationKind,
     OperationSchemaError, OperationSetupError,

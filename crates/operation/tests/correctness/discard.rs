@@ -1,8 +1,7 @@
 use std::num::NonZeroU32;
 
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, decode_definition,
-    operation::sink::DiscardDefinition,
+    OperationDefinition, OperationKind, RuntimeResource, operation::sink::DiscardDefinition,
 };
 use dogpaddle_store::StoreSetup;
 
@@ -13,7 +12,8 @@ use super::support::{
 const DISCARD_V1: &str = include_str!("../fixtures/v1/discard_definition.hex");
 
 fn decoded_definition() -> OperationDefinition {
-    decode_definition(&decode_hex(DISCARD_V1)).unwrap()
+    serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(DISCARD_V1))
+        .unwrap()
 }
 
 #[test]

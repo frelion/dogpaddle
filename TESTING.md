@@ -30,12 +30,11 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、kind、data declaration、checked construct、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
 
-- `definition_codec`：外层 envelope、unknown tag 和通用损坏拒绝；
 - `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
 - `protocol`：Atomic 完整消费、Paged 的 `Resume/Progress` 与共享 `StepBudget`，以及 Source/Sink 的具体边界协议；
 - `metamorphic`：稳定重批和独立模型。
 
-OperationDefinition 的稳定 tagged JSON 名称由各算子公共 v1 literal golden 独立验证；`src/tests.rs` 覆盖公开 JSON 与持久 codec 使用同一计划表示。不得维护第二份数字 tag 目录、建立 `BuiltinContractCase` 或从产品 enum 反向生成期望值。
+OperationDefinition 的稳定 tagged JSON 名称由各算子公共 v1 literal golden 独立验证；`src/tests.rs` 覆盖公开 JSON 计划 roundtrip；完整持久 envelope、checksum、canonical JSON、脱敏和通用损坏拒绝归 Flow。不得维护第二份数字 tag 目录、建立 `BuiltinContractCase` 或从产品 enum 反向生成期望值。
 
 Aggregate 的 owner 文件必须证明稳定 tagged JSON 名称 `aggregate` 与 v1 golden、精确资源布局与 Schema、Definition roundtrip、共享 argument/moment 与 COUNT/SUM/AVG readout、MIN/MAX layout 复用、正权重 underflow 的整页 rollback、极值缓存重取与 reopen，以及不变结果不产生冗余 output。组权重归零仍须检查统计量一致性。私有 state codec 和表达式去重证据归 Operation。
 
@@ -49,7 +48,7 @@ Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行
 
 Flow 必须证明每个 Run/Send/入栈/出栈边界可 drop/open；父子 ordinal、port 必须对应调用边；子帧直接借用父页，root 直接借用 Source 队首，完成时同事务消费；拒绝损坏、超限与 orphan slot，且不改写已有状态。融合 head/tails 共享一笔小事务和预算，超限缩页时全部回滚；单事件仍超限须有限失败。首次合法输入的计算失败只保存初始 Run，多源及重开后均不能绕过该输入。本页计算与能接收的 Sink 入账同事务；背压或路由预算耗尽时保留结果及下一个消费者，重开后不重放已接收分支；本页内任一 Sink 错误须回滚同页计算和此前 Sink 入账。捕获与 Sink 排空仍获得服务。晚期 Join 错误由真实 SQLite 目标证明之前已提交页保留，失败位置可恢复。
 
-Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合与深度上限；owner mismatch 在 binding 和资源打开前拒绝。commit、durability barrier、外部 ACK/delivery 不确定性必须 fail-stop。status 只读，并与 reopen 后一致。
+Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合与深度上限；单一 Flow typed JSON golden、1024 nodes/ports 第 1025 项解析前拒绝、表达式 protobuf 严格证明、metadata 重复/顺序/None 与 empty、旧布局拒绝不改写及 JSON 错误 Display/Debug/source 脱敏必须保持。owner mismatch 在 binding 和资源打开前拒绝。commit、durability barrier、外部 ACK/delivery 不确定性必须 fail-stop。status 只读，并与 reopen 后一致。
 
 ### SQL
 

@@ -267,8 +267,14 @@ mod tests {
         let payload = encode(&definition).unwrap();
         let decoded: MySqlCdcScanDefinition = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
-            crate::encode_definition(&crate::OperationDefinition::from(decoded)),
-            crate::encode_definition(&crate::OperationDefinition::from(definition.clone()))
+            serde_json::to_vec::<crate::OperationDefinition>(&crate::OperationDefinition::from(
+                decoded
+            ))
+            .unwrap(),
+            serde_json::to_vec::<crate::OperationDefinition>(&crate::OperationDefinition::from(
+                definition.clone()
+            ))
+            .unwrap()
         );
         assert_eq!(definition.bootstrap_spool_bytes(), capacity());
     }

@@ -13,8 +13,8 @@ use datafusion_expr::{Volatility, create_udf, expr::Cast, placeholder};
 use datafusion_proto::bytes::Serializeable;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    DefinitionCodecError, Expr, ExpressionBindError, ExpressionDefinitionError, OperationBindError,
-    Operator, ScalarValue, cast, col, decode_definition, encode_definition, lit,
+    Expr, ExpressionBindError, ExpressionDefinitionError, OperationBindError, Operator,
+    ScalarValue, cast, col, lit,
     operation::transform::{
         FilterDefinition, FilterSchemaError, SelectDefinition, SelectSchemaError,
     },
@@ -31,12 +31,10 @@ fn filter(predicate: Expr) -> FilterDefinition {
     FilterDefinition::try_new(predicate).unwrap()
 }
 
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 const MAP_EXPRESSION_PROBE: &str = "DOGPADDLE_MAP_EXPRESSION_PROBE";
 
 fn filter_with_protobuf(protobuf: &[u8]) -> Vec<u8> {
-    let canonical = encode_definition(&filter(lit(true)).into());
-    let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    let mut encoded = Vec::new();
     encoded.extend_from_slice(
         format!(
             r#"{{"filter":{{"predicate":"{}"}}}}"#,
@@ -62,9 +60,12 @@ fn expression_payloads_are_base64_canonical_datafusion_protobuf() {
 
     for expression in expressions {
         let protobuf = expression.to_bytes().unwrap();
-        let encoded = encode_definition(&filter(expression).into());
+        let encoded = serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(
+            &filter(expression).into(),
+        )
+        .unwrap();
         assert_eq!(
-            &encoded[DEFINITION_HEADER_LEN..],
+            &encoded[..],
             format!(
                 r#"{{"filter":{{"predicate":"{}"}}}}"#,
                 BASE64.encode(protobuf.as_ref())
@@ -72,75 +73,72 @@ fn expression_payloads_are_base64_canonical_datafusion_protobuf() {
             .as_bytes()
         );
 
-        let decoded = decode_definition(&encoded).unwrap();
-        assert_eq!(encode_definition(&decoded), encoded);
+        let decoded =
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
+            encoded
+        );
     }
 }
 
 #[test]
 fn expression_decoder_rejects_invalid_base64_malformed_and_noncanonical_protobuf() {
-    let canonical = encode_definition(&filter(lit(true)).into());
+    let canonical =
+        serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&filter(lit(true)).into())
+            .unwrap();
     let protobuf = lit(true).to_bytes().unwrap();
 
     for malformed in [filter_with_protobuf(&[]), filter_with_protobuf(&[u8::MAX])] {
-        assert!(matches!(
-            decode_definition(&malformed).unwrap_err(),
-            DefinitionCodecError::InvalidJsonPayload {
-                reason: "DataFusion expression protobuf is invalid",
-                ..
-            }
-        ));
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("DataFusion expression protobuf is invalid")
+        );
     }
 
-    let mut invalid_base64 = canonical[..DEFINITION_HEADER_LEN].to_vec();
+    let mut invalid_base64 = Vec::new();
     invalid_base64.extend_from_slice(br#"{"filter":{"predicate":"***"}}"#);
-    assert!(matches!(
-        decode_definition(&invalid_base64).unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload {
-            reason: "expression protobuf base64 is invalid",
-            ..
-        }
-    ));
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&invalid_base64)
+            .unwrap_err()
+            .to_string()
+            .contains("expression protobuf base64 is invalid")
+    );
 
     let mut truncated = canonical;
     truncated.pop();
-    assert_eq!(
-        decode_definition(&truncated).unwrap_err(),
-        DefinitionCodecError::Truncated
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&truncated).is_err()
     );
 
     let mut protobuf_with_unknown_field = protobuf.to_vec();
     protobuf_with_unknown_field.extend_from_slice(&[0xf8, 0x07, 0x00]);
-    assert!(matches!(
-        decode_definition(&filter_with_protobuf(&protobuf_with_unknown_field)).unwrap_err(),
-        DefinitionCodecError::InvalidJsonPayload {
-            reason: "DataFusion expression protobuf is not canonical",
-            ..
-        }
-    ));
-
-    let mut noncanonical_json = filter_with_protobuf(&protobuf);
-    noncanonical_json.insert(DEFINITION_HEADER_LEN + 1, b' ');
-    assert_eq!(
-        decode_definition(&noncanonical_json).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("non-canonical operation definition")
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&filter_with_protobuf(
+            &protobuf_with_unknown_field
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("DataFusion expression protobuf is not canonical")
     );
 }
 
 #[test]
-fn expression_decoder_never_panics_for_valid_header_arbitrary_payloads() {
-    let mut header = encode_definition(&filter(lit(true)).into());
-    header.truncate(DEFINITION_HEADER_LEN);
+fn expression_decoder_never_panics_for_arbitrary_json_payloads() {
     let mut state = 0xbb67_ae85_84ca_a73b_u64;
     for length in 0..=256 {
-        let mut input = header.clone();
+        let mut input = Vec::new();
         for _ in 0..length {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             input.push(state.to_le_bytes()[0]);
         }
-        let result = catch_unwind(AssertUnwindSafe(|| decode_definition(&input)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&input)
+        }));
         assert!(
             result.is_ok(),
             "expression decoder panicked for payload length {length}"
@@ -236,13 +234,14 @@ fn map_bearing_expression_is_rejected_consistently_across_processes() {
             FilterDefinition::try_new(map_bearing_cast()),
             Err(ExpressionDefinitionError::NonCanonical)
         ));
-        assert!(matches!(
-            decode_definition(&std::fs::read(path).unwrap()),
-            Err(DefinitionCodecError::InvalidJsonPayload {
-                reason: "DataFusion expression protobuf contains non-canonical map metadata",
-                ..
-            })
-        ));
+        assert!(
+            serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(
+                &std::fs::read(path).unwrap()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("DataFusion expression protobuf contains non-canonical map metadata")
+        );
         return;
     }
 
@@ -722,13 +721,12 @@ fn scalar_functions_of_every_volatility_require_an_unavailable_decode_registry()
 fn decoder_rejects_non_replayable_expressions_even_when_protobuf_is_canonical() {
     let parameter = placeholder("$1").to_bytes().unwrap();
     let encoded = filter_with_protobuf(&parameter);
-    assert!(matches!(
-        decode_definition(&encoded),
-        Err(DefinitionCodecError::InvalidJsonPayload {
-            reason: "expression must be immutable and row-local",
-            ..
-        })
-    ));
+    assert!(
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded)
+            .unwrap_err()
+            .to_string()
+            .contains("expression must be immutable and row-local")
+    );
     assert!(matches!(
         FilterDefinition::try_new(placeholder("$1").eq(lit(1_u64))),
         Err(ExpressionDefinitionError::NonReplayable)

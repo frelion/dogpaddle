@@ -6,8 +6,6 @@ mod asof_join;
 mod atomic;
 #[path = "correctness/clickhouse_sink.rs"]
 mod clickhouse_sink;
-#[path = "correctness/definition_codec.rs"]
-mod definition_codec;
 #[path = "correctness/discard.rs"]
 mod discard;
 #[path = "correctness/distinct.rs"]

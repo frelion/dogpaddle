@@ -172,3 +172,44 @@ fixture 及路径、Operation 数量/ID 验证在计时外；fresh build 另外�
 `after/dogpaddle-flow-lifecycle-run-AzGT3B`；相邻 revision 与 product patch 记录保留版本证据。
 当前组合通过完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc
 及 workspace build；独立审查覆盖声明顺序、1024-node/port 准入、只读恢复和资源绑定。
+
+## 唯一类型化计划：2026-10-01 启动对照
+
+Flow 直接持久保存 canonical JSON 计划；删除逐节点二进制包装、Operation envelope
+与独立 Operation codec。运行帧、计算事务、Source ACK 和 Sink Prepared 协议不变。
+开发期 v1 图字节改变，旧状态直接重建；三个固定图由 218/490/1031 字节变为
+251/614/1139 字节。这项简化减少概念和代码，并未缩小所有持久计划。
+
+同机 Apple M5、aarch64 Darwin 25.6、APFS、Rust 1.96.0 release，未修改的
+`flow_lifecycle` reference 使用 30 samples、2 s warmup、5 s measurement。
+baseline 为 `5f34c3c`；candidate 为产品等价的 `0a27785` 加本轮 source diff。
+benchmark SHA-256 为 `f33eec4c516f23e65f0230f6a1cd58c33475b2dfbc26a80574a73ad9eba8f486`。
+计时包含实际 build/open 和 Store 成本，fixture、factory、ID/count 校验、drop 及
+fresh build 的额外 reopen 在计时外；不等同于 codec CPU 时间或 steady-state throughput。
+测量时没有并行 Cargo、容器或系统验收，桌面负载未隔离。
+
+首轮按 baseline → candidate；为核实共同漂移，再按 candidate → baseline。
+下表保留两轮全部中位数与各自 95% CI，单位 ms；变化为 candidate / baseline - 1。
+
+| 场景 / Operation 数 | 首轮 baseline [95% CI] | 首轮 candidate [95% CI] | 变化 | 反向 baseline [95% CI] | 反向 candidate [95% CI] | 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fresh_durable_build / 2 | 4.4809 [4.4777, 4.4969] | 4.9279 [4.8120, 5.0989] | +9.98% | 4.5204 [4.5061, 4.5613] | 4.6513 [4.6351, 4.6775] | +2.89% |
+| fresh_durable_build / 64 | 4.6174 [4.5658, 4.6410] | 5.1935 [5.0124, 5.4294] | +12.48% | 4.6917 [4.6394, 4.7394] | 4.8123 [4.7651, 4.8302] | +2.57% |
+| fresh_durable_build / 1024 | 6.7866 [6.7565, 6.8500] | 7.7582 [7.6745, 7.8563] | +14.32% | 6.8696 [6.8436, 6.9341] | 6.9785 [6.9662, 7.0100] | +1.59% |
+| warm_reopen / 2 | 5.6845 [5.5217, 5.9571] | 6.2895 [6.2029, 6.4736] | +10.64% | 5.9437 [5.7987, 6.1501] | 5.9431 [5.7624, 6.2308] | -0.01% |
+| warm_reopen / 64 | 5.8612 [5.6529, 6.0198] | 6.7697 [6.6011, 6.9755] | +15.50% | 5.9770 [5.7306, 6.2358] | 6.0963 [5.8625, 6.3550] | +2.00% |
+| warm_reopen / 1024 | 7.0366 [6.8976, 7.2456] | 7.5603 [7.3890, 7.7605] | +7.44% | 7.1993 [7.0383, 7.4264] | 7.2934 [7.1811, 7.4683] | +1.31% |
+
+首轮六项均回退 7.44%–15.50%，各自 median CI 不重叠；反向轮为 -0.01%–+2.89%。
+反向轮 fresh build 仍增加 1.59%–2.89%，三组 CI 不重叠；warm reopen 三组 CI 重叠。
+同一 candidate 第二次运行也比第一次低约 4%–10%，证明存在运行间漂移，尚不能
+将漂移归因于具体 IO、热状态或 codec。保留首轮回归和反向轮的 build 回归，不宣称
+普遍提速、完全无回归或把较好的单轮当作唯一结论。未测分配、native heap 或 RSS。
+
+原始 context、samples、estimates、源码 patch 与实际编译路径日志位于
+`/tmp/dogpaddle-one-flow-plan-performance/`：首轮 `before/dogpaddle-flow-lifecycle-run-FF34UE`
+与 `after/dogpaddle-flow-lifecycle-run-xluEpZ`，反向 `reverse-after/dogpaddle-flow-lifecycle-run-psc2zw`
+与 `reverse-before/dogpaddle-flow-lifecycle-run-lKkpfW`；`paired-order-summary.json`
+保留从每组 30 个样本独立复算的中位数；95% CI 取原 Criterion estimates。
+完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 和 workspace build 通过。
+同一新编译 release host 通过真实 PostgreSQL CDC、SQL、Sink/recovery 与 MySQL CDC 验收。

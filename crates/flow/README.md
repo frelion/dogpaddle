@@ -26,6 +26,7 @@ Operation 负责计算和具体源、目标适配，Store 负责显式事务，F
 
 图中的最大合法 Atomic 直线链在同一页事务中运行。融合只是一组内存索引：没有额外的持久身份、队列、
 Definition 或生命周期。持久 Definition 始终保存完整逻辑 DAG，每个 Operation 保留自己的 ID 和状态前缀。
+Flow 直接持久化这份类型化 JSON 计划，只有一个版本和 checksum 外壳；Operation 不再有独立持久 codec。
 
 长 Join 分成很多笔小事务，不把整个输入放进一个大事务。失败会回滚当前 head 与全部融合尾项的本页工作，
 已经提交的早页保留。普通 Atomic 首链也分页，因此整个 Change 或 CDC Delivery 不再是计算原子边界。

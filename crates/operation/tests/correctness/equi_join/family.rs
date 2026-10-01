@@ -5,8 +5,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, col, decode_definition, encode_definition,
-    lit,
+    OperationDefinition, OperationKind, RuntimeResource, col, lit,
     operation::{
         Operation, OperationError, OperationInput, Progress, Resume, Step, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinError, EquiJoinKind},
@@ -503,13 +502,15 @@ fn definitions_keep_the_five_literal_golden_payloads_and_no_operator_cursor_reso
     ];
     // Golden schemas use id/fk and corresponding physical names.
     for (kind, literal) in KINDS.into_iter().zip(literals) {
-        let decoded = decode_definition(&crate::support::decode_hex(literal)).unwrap();
+        let decoded =
+            serde_json::from_slice::<OperationDefinition>(&crate::support::decode_hex(literal))
+                .unwrap();
         assert_eq!(
             decoded.kind(),
             OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())
         );
         assert_eq!(
-            encode_definition(&decoded),
+            serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
             crate::support::decode_hex(literal)
         );
         let _ = kind;

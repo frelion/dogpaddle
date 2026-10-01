@@ -8,7 +8,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    Expr, ExpressionError, OperationKind, Operator, ScalarValue, col, decode_definition, lit,
+    Expr, ExpressionError, OperationKind, Operator, ScalarValue, col, lit,
     operation::{
         OperationInput,
         transform::{FilterDefinition, FilterError},
@@ -97,7 +97,9 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
 
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
-    let decoded = decode_definition(&decode_hex(FILTER_V1)).unwrap();
+    let decoded =
+        serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&decode_hex(FILTER_V1))
+            .unwrap();
     let operation = stateless_operation(&decoded, input);
     let mut transactions = store.into_transactions();
     let Some(reopened_filtered) =

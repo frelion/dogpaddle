@@ -17,7 +17,7 @@ use super::{
     row::DorisRowCodec,
     schema::DorisLayout,
 };
-use crate::{decode_definition, encode_definition, operation::sink::relation::RowError};
+use crate::operation::sink::relation::RowError;
 
 #[test]
 fn definition_round_trips_canonically() {
@@ -25,9 +25,12 @@ fn definition_round_trips_canonically() {
         DorisTargetSpec::try_new("sink_1", "analytics", "materialized", 42).unwrap(),
     )
     .unwrap();
-    let encoded = encode_definition(&definition.into());
-    let decoded = decode_definition(&encoded).unwrap();
-    assert_eq!(encode_definition(&decoded), encoded);
+    let encoded = serde_json::to_vec::<crate::OperationDefinition>(&definition.into()).unwrap();
+    let decoded = serde_json::from_slice::<crate::OperationDefinition>(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_vec::<crate::OperationDefinition>(&decoded).unwrap(),
+        encoded
+    );
 }
 
 #[test]

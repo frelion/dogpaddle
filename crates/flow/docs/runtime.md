@@ -6,8 +6,11 @@
 ## 图与资源
 
 `flow/definition` 是唯一持久 DAG。它保存 owner identity、每个 Operation 的稳定 ID、具体 Definition 和有序输入 ordinal；
-格式以 `dogpaddle.flow\0`、u16 v1 起始，使用 big-endian u32 长度/ordinal，末尾 CRC32 覆盖此前全部字节。
+格式以 `dogpaddle.flow\0`、big-endian u16 v1 起始，随后直接保存唯一 typed plan 的 canonical JSON，末尾 big-endian u32 CRC32 覆盖此前全部字节。每个节点直接嵌入 Operation 的 Serde 计划，不再包第二个 Operation envelope。
 Definition 最多 8 MiB，Operation 最多 1024，每个 Operation 最多 1024 个输入端口（允许重复生产者），ID 非空、无 NUL、最多 1024 UTF-8 字节且全图唯一。
+解码在解析前检查全图长度和 checksum；nodes/inputs 数组在解码第 1025 个元素之前拒绝，不先分配完整数组再计数。不信任数组 size hint。JSON 直接借用输入解析，保留默认递归限制，不经过整图 Value 暂存；嵌套表达式与类型在 canonical protobuf 字符串中，不增加 JSON 深度。逐字重编码比较拒绝额外空白、字段重排、重复 metadata key、冗余 null 和其它非 canonical 表示；None 覆盖与 Some(empty) 不混同。
+JSON 错误只报告静态类别和行列，不保留原始 serde 错误或表达式细节，不再附加持久解码节点 ID；拓扑和 binding 的逻辑 ID 诊断不变。编码仍先产生完整字节再检查总长，这不是 RSS 硬上限。JSON 字段名、owner identity 数组和 ordinal 表示改变最终字节数，接近 8 MiB 的旧计划可能不再准入；旧二进制节点格式直接重建，不识别或迁移。
+
 
 根必须是 Source，叶必须是 Sink，输入数量与角色相符，所有输入有输出。构建引用必须来自同一 factory 的较早声明；持久解码同样要求每条输入 ordinal 严格小于当前节点 ordinal，因此图按声明序天然无环。向前引用、自引用和越界输入统一拒绝，不另维护拓扑排序或运行 schedule。任何 DAG 都可按拓扑声明表达。
 新建只解析一次这份原始计划的连接、融合和深度，编码仅用于持久保存，不进行整图 encode→decode 往返；open 才完整解码和重新验证。所有 Schema 与资源先绑定，再由一笔 StoreSetup 事务发布 catalog 和 Definition。

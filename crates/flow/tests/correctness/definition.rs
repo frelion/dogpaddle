@@ -199,3 +199,69 @@ fn build_logical_operations(path: &Path) {
     builder.operation("sink", DiscardDefinition::new(), [scan]);
     drop(builder.build().unwrap());
 }
+
+#[test]
+fn deeply_nested_expression_remains_opaque_to_json_depth_and_reopens() {
+    use arrow_schema::{DataType, Field};
+    use dogpaddle_operation::{ScalarValue, cast, lit};
+    use std::sync::Arc;
+    let mut data_type = DataType::Int64;
+    // DataFusion protobuf has its own recursion limit (several messages per List).
+    // Keep that existing admission boundary; Flow adds no JSON nesting to this type.
+    for _ in 0..30 {
+        data_type = DataType::List(Arc::new(Field::new("item", data_type, true)));
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let source = factory.operation("source", SequenceScanDefinition::new(u64::MAX), []);
+    let select = factory.operation(
+        "select",
+        SelectDefinition::try_new([("nested", cast(lit(ScalarValue::Null), data_type))]).unwrap(),
+        [source],
+    );
+    factory.operation("sink", DiscardDefinition::new(), [select]);
+    drop(factory.build().unwrap());
+    let encoded = read_published_definition(&path);
+    // Recursive DataType lives in the canonical protobuf string, not JSON objects.
+    assert!(!String::from_utf8_lossy(&encoded).contains("List"));
+    drop(FlowFactory::new(&path).open().unwrap());
+    assert_eq!(read_published_definition(&path), encoded);
+}
+
+#[test]
+fn exact_eight_mib_json_plan_builds_and_reopens() {
+    fn factory(path: &Path, text: String) -> FlowFactory {
+        let mut factory = FlowFactory::new(path);
+        let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+        let select = factory.operation(
+            "select",
+            SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))])
+                .unwrap()
+                .with_metadata([("size", text)]),
+            [scan],
+        );
+        factory.operation("sink", DiscardDefinition::new(), [select]);
+        factory
+    }
+    let root = tempfile::tempdir().unwrap();
+    let empty = root.path().join("empty");
+    drop(factory(&empty, String::new()).build().unwrap());
+    let overhead = read_published_definition(&empty).len();
+    let path = root.path().join("exact");
+    drop(
+        factory(&path, "x".repeat(8 * 1024 * 1024 - overhead))
+            .build()
+            .unwrap(),
+    );
+    assert_eq!(read_published_definition(&path).len(), 8 * 1024 * 1024);
+    drop(FlowFactory::new(&path).open().unwrap());
+    let too_large = root.path().join("too-large");
+    assert!(matches!(
+        factory(&too_large, "x".repeat(8 * 1024 * 1024 - overhead + 1)).build(),
+        Err(FlowError::Definition(
+            dogpaddle_flow::FlowDefinitionError::LengthOverflow("definition")
+        ))
+    ));
+    assert!(!too_large.exists());
+}
