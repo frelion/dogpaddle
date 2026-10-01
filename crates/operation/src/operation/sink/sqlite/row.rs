@@ -28,7 +28,7 @@ impl RowCodec {
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
         let (canonical, values) =
-            encode_target_values(&self.schema, batch, row_index, |_, field, bytes| {
+            encode_target_values(&self.schema, batch, row_index, |field, bytes| {
                 sqlite_value(field.data_type(), bytes)
             })?;
         Ok(EncodedRow {

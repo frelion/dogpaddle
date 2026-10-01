@@ -7,7 +7,8 @@ use super::{
     buffered,
     config::{DorisSinkConfig, DorisTargetSpec},
     error::{DorisSinkError, invalid_spec},
-    schema::DorisLayout,
+    row::DorisRowCodec,
+    schema,
     target::DorisTarget,
 };
 use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
@@ -56,7 +57,7 @@ impl DorisSinkDefinition {
         inputs: &[SchemaRef],
     ) -> Result<(), crate::OperationSchemaError> {
         self.validate()?;
-        DorisLayout::try_new(Arc::clone(&inputs[0]))?;
+        schema::validate(&inputs[0])?;
         Ok(())
     }
 
@@ -70,10 +71,10 @@ impl DorisSinkDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Doris sink input arity");
-        let layout = DorisLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
+        let codec = DorisRowCodec::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
         let config = resource.take::<DorisSinkConfig>()?;
-        let target = DorisTarget::new_bound(config, self.target.clone(), layout);
+        let target = DorisTarget::new_bound(config, self.target.clone(), codec);
         buffered::construct(input_schema, target, data)
     }
 

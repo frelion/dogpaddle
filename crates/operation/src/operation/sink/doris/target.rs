@@ -1,3 +1,4 @@
+use arrow_schema::Schema;
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
@@ -12,7 +13,7 @@ use super::{
     error::{DorisSinkError, database, invalid_batch},
     row::{DorisRowCodec, EncodedRow},
     schema::{
-        DorisLayout, PUBLIC_TECHNICAL_HASH, PUBLIC_TECHNICAL_ID, TECHNICAL_DELETED, TECHNICAL_HASH,
+        self, PUBLIC_TECHNICAL_HASH, PUBLIC_TECHNICAL_ID, TECHNICAL_DELETED, TECHNICAL_HASH,
         TECHNICAL_HASH_INDEX, TECHNICAL_ID,
     },
 };
@@ -43,12 +44,12 @@ impl DorisTarget {
     pub(super) fn new_bound(
         config: DorisSinkConfig,
         spec: DorisTargetSpec,
-        layout: DorisLayout,
+        codec: DorisRowCodec,
     ) -> Self {
         Self {
             config,
             spec,
-            codec: DorisRowCodec::new(layout),
+            codec,
             connection: None,
             verified: false,
         }
@@ -81,8 +82,8 @@ impl DorisTarget {
         self.connect()?;
         if !self.verified {
             let mut connection = self.connection.take().expect("connection was installed");
-            let result = verify_state(&mut connection, &self.spec, self.codec.layout())
-                .and_then(|()| verify_view(&mut connection, &self.spec, self.codec.layout()));
+            let result = verify_state(&mut connection, &self.spec, self.codec.schema())
+                .and_then(|()| verify_view(&mut connection, &self.spec, self.codec.schema()));
             result?;
             self.connection = Some(connection);
             self.verified = true;
@@ -98,7 +99,7 @@ impl RelationTarget for DorisTarget {
         // ID 1 maps to i64::MIN + 1: the longest valid signed BIGINT literal.
         let encoded = mutation_values(1, true, &row)
             .len()
-            .checked_add(insert_prefix(&self.spec, self.codec.layout()).len())
+            .checked_add(insert_prefix(&self.spec, self.codec.schema()).len())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or_else(|| invalid_batch("Doris event byte charge exceeds u64"))?;
         Ok(baseline.max(encoded))
@@ -133,7 +134,7 @@ impl RelationTarget for DorisTarget {
         let mut sql_bytes = 0_usize;
         for (request_index, request) in requests.iter().enumerate() {
             let row = self.codec.encode_row(input.records(), request.row_index)?;
-            let (predicate, row_parameters) = row_predicate(self.codec.layout(), &row);
+            let (predicate, row_parameters) = row_predicate(self.codec.schema(), &row);
             let clause = lookup_clause(&self.spec, request_index, request, &predicate);
             if !clauses.is_empty()
                 && (clauses.len() == MAX_LOOKUP_CLAUSES
@@ -218,7 +219,7 @@ impl DorisTarget {
         let objects = object_kinds(connection, &self.spec)?;
         match (objects.get(&state), objects.get(&target)) {
             (None, None) => {
-                let create = create_state_sql(&self.spec, self.codec.layout());
+                let create = create_state_sql(&self.spec, self.codec.schema());
                 connection
                     .query_drop(create)
                     .map_err(|_| database("create state table"))?;
@@ -232,14 +233,14 @@ impl DorisTarget {
             }
             (Some(_), Some(_)) => {}
         }
-        verify_state(connection, &self.spec, self.codec.layout())?;
+        verify_state(connection, &self.spec, self.codec.schema())?;
         let objects = object_kinds(connection, &self.spec)?;
         if !objects.contains_key(&target) {
             connection
-                .query_drop(create_view_sql(&self.spec, self.codec.layout()))
+                .query_drop(create_view_sql(&self.spec, self.codec.schema()))
                 .map_err(|_| database("create target view"))?;
         }
-        verify_view(connection, &self.spec, self.codec.layout())?;
+        verify_view(connection, &self.spec, self.codec.schema())?;
         let count: Option<u64> = connection
             .query_first(format!(
                 "SELECT count(*) FROM {}",
@@ -289,7 +290,7 @@ impl DorisTarget {
         if actions.is_empty() {
             return Ok(());
         }
-        let statements = insert_statements(&self.spec, self.codec.layout(), &actions);
+        let statements = insert_statements(&self.spec, self.codec.schema(), &actions);
         let transactional = statements.len() > 1;
         let started = Instant::now();
         let connection = self.connect()?;
@@ -335,7 +336,7 @@ impl DorisTarget {
         if ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let columns = selected_columns(self.codec.layout());
+        let columns = selected_columns(self.codec.schema());
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -434,10 +435,10 @@ fn value_bool(value: Value) -> Result<bool, DorisSinkError> {
     }
 }
 
-fn row_predicate(layout: &DorisLayout, row: &EncodedRow) -> (String, Vec<Value>) {
+fn row_predicate(schema: &Schema, row: &EncodedRow) -> (String, Vec<Value>) {
     let mut predicates = vec![format!("{} = ?", quote(TECHNICAL_HASH))];
     let mut parameters = vec![Value::Bytes(row.hash.clone())];
-    for (column, value) in layout.columns().iter().zip(&row.values) {
+    for (column, value) in schema.fields().iter().zip(&row.values) {
         predicates.push(format!("{} <=> ?", quote(column.name())));
         parameters.push(value.clone());
     }
@@ -465,16 +466,11 @@ fn lookup_clause(
     )
 }
 
-fn insert_prefix(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
+fn insert_prefix(spec: &DorisTargetSpec, schema: &Schema) -> String {
     let columns = std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
         .chain(std::iter::once(TECHNICAL_DELETED))
-        .chain(
-            layout
-                .columns()
-                .iter()
-                .map(super::schema::ColumnLayout::name),
-        )
+        .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
         .join(",");
@@ -486,14 +482,14 @@ fn insert_prefix(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
 
 fn insert_statements(
     spec: &DorisTargetSpec,
-    layout: &DorisLayout,
+    schema: &Schema,
     actions: &[(u64, bool, EncodedRow)],
 ) -> Vec<String> {
-    let prefix = insert_prefix(spec, layout);
+    let prefix = insert_prefix(spec, schema);
     let mut statements = Vec::new();
     let mut statement = prefix.clone();
     let mut rows = 0_usize;
-    let values_per_row = layout.columns().len().saturating_add(3);
+    let values_per_row = schema.fields().len().saturating_add(3);
     for (id, deleted, row) in actions {
         let values = mutation_values(*id, *deleted, row);
         if rows != 0
@@ -552,18 +548,18 @@ fn bytes_literal(value: &[u8]) -> String {
     literal
 }
 
-fn create_state_sql(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
+fn create_state_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} BIGINT NOT NULL", quote(TECHNICAL_ID)),
         format!("{} CHAR(32) NOT NULL", quote(TECHNICAL_HASH)),
         format!("{} TINYINT NOT NULL", quote(TECHNICAL_DELETED)),
     ];
-    columns.extend(layout.columns().iter().map(|column| {
+    columns.extend(schema.fields().iter().map(|column| {
         format!(
             "{} {} {}",
             quote(column.name()),
-            column.storage().sql(),
-            if column.nullable() {
+            schema::sql_type(column.data_type()),
+            if schema::nullable(column) {
                 "NULL"
             } else {
                 "NOT NULL"
@@ -589,11 +585,11 @@ fn create_state_sql(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
     )
 }
 
-fn create_view_sql(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
+fn create_view_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
     format!(
         "CREATE VIEW {} AS SELECT {} FROM {} WHERE {} = 0",
         qualified(spec.database(), spec.table()),
-        selected_public_columns(layout),
+        selected_public_columns(schema),
         qualified(spec.database(), &spec.state_table()),
         quote(TECHNICAL_DELETED)
     )
@@ -602,7 +598,7 @@ fn create_view_sql(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
 fn verify_state(
     connection: &mut Conn,
     spec: &DorisTargetSpec,
-    layout: &DorisLayout,
+    schema: &Schema,
 ) -> Result<(), DorisSinkError> {
     type Column = (String, String, String);
     let columns: Vec<Column> = connection
@@ -617,11 +613,15 @@ fn verify_state(
         (TECHNICAL_HASH.to_owned(), "char(32)", "NO"),
         (TECHNICAL_DELETED.to_owned(), "tinyint(4)", "NO"),
     ];
-    expected.extend(layout.columns().iter().map(|column| {
+    expected.extend(schema.fields().iter().map(|column| {
         (
             column.name().to_owned(),
-            column.storage().catalog_type(),
-            if column.nullable() { "YES" } else { "NO" },
+            schema::catalog_type(column.data_type()),
+            if schema::nullable(column) {
+                "YES"
+            } else {
+                "NO"
+            },
         )
     }));
     let matches = columns.len() == expected.len()
@@ -672,7 +672,7 @@ fn verify_state(
 fn verify_view(
     connection: &mut Conn,
     spec: &DorisTargetSpec,
-    layout: &DorisLayout,
+    schema: &Schema,
 ) -> Result<(), DorisSinkError> {
     let definition: Option<String> = connection
         .exec_first(
@@ -681,7 +681,7 @@ fn verify_view(
             params! { "database" => spec.database(), "table" => spec.table() },
         )
         .map_err(|_| database("inspect target view"))?;
-    let expected = expected_view_definition(spec, layout);
+    let expected = expected_view_definition(spec, schema);
     if definition
         .as_ref()
         .is_none_or(|definition| !compact_sql(definition).eq_ignore_ascii_case(&expected))
@@ -697,7 +697,7 @@ fn verify_view(
             params! { "database" => spec.database(), "table" => spec.table() },
         )
         .map_err(|_| database("inspect target-view columns"))?;
-    if actual != u64::try_from(layout.columns().len() + 2).ok() {
+    if actual != u64::try_from(schema.fields().len() + 2).ok() {
         return Err(DorisSinkError::TargetLayoutMismatch {
             name: spec.table().to_owned(),
         });
@@ -705,15 +705,15 @@ fn verify_view(
     Ok(())
 }
 
-fn expected_view_definition(spec: &DorisTargetSpec, layout: &DorisLayout) -> String {
+fn expected_view_definition(spec: &DorisTargetSpec, schema: &Schema) -> String {
     let source = format!("internal.{}.{}", spec.database(), spec.state_table());
     let columns = std::iter::once(format!("{source}.{TECHNICAL_ID}AS{PUBLIC_TECHNICAL_ID}"))
         .chain(std::iter::once(format!(
             "{source}.{TECHNICAL_HASH}AS{PUBLIC_TECHNICAL_HASH}"
         )))
         .chain(
-            layout
-                .columns()
+            schema
+                .fields()
                 .iter()
                 .map(|column| format!("{source}.{}", column.name())),
         )
@@ -747,22 +747,17 @@ fn object_kinds(
     Ok(rows.into_iter().collect())
 }
 
-fn selected_columns(layout: &DorisLayout) -> String {
+fn selected_columns(schema: &Schema) -> String {
     std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
         .chain(std::iter::once(TECHNICAL_DELETED))
-        .chain(
-            layout
-                .columns()
-                .iter()
-                .map(super::schema::ColumnLayout::name),
-        )
+        .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn selected_public_columns(layout: &DorisLayout) -> String {
+fn selected_public_columns(schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} AS {}", quote(TECHNICAL_ID), quote(PUBLIC_TECHNICAL_ID)),
         format!(
@@ -772,10 +767,10 @@ fn selected_public_columns(layout: &DorisLayout) -> String {
         ),
     ];
     columns.extend(
-        layout
-            .columns()
+        schema
+            .fields()
             .iter()
-            .map(super::schema::ColumnLayout::name)
+            .map(|field| field.name().as_str())
             .map(quote),
     );
     columns.join(",")
@@ -872,7 +867,7 @@ mod live_tests {
         )
         .unwrap();
         let mut target =
-            DorisTarget::new_bound(config, spec, DorisLayout::try_new(schema).unwrap());
+            DorisTarget::new_bound(config, spec, DorisRowCodec::try_new(schema).unwrap());
         target.initialize().unwrap();
         let insert = Batch {
             inserts: vec![Insert {
@@ -946,7 +941,7 @@ mod live_tests {
         let stale_row = target.codec.encode_row(input.records(), 0).unwrap();
         let stale = format!(
             "{}{}",
-            insert_prefix(&target.spec, target.codec.layout()),
+            insert_prefix(&target.spec, target.codec.schema()),
             mutation_values(1, false, &stale_row)
         );
         target.config.connect().unwrap().query_drop(stale).unwrap();
@@ -973,7 +968,7 @@ mod live_tests {
             .unwrap();
         connection
             .query_drop(
-                create_view_sql(&target.spec, target.codec.layout()).replace(" = 0", " = 1"),
+                create_view_sql(&target.spec, target.codec.schema()).replace(" = 0", " = 1"),
             )
             .unwrap();
         target.connection = Some(connection);
@@ -1022,7 +1017,7 @@ mod live_tests {
         )
         .unwrap();
         let mut target =
-            DorisTarget::new_bound(config, spec, DorisLayout::try_new(schema).unwrap());
+            DorisTarget::new_bound(config, spec, DorisRowCodec::try_new(schema).unwrap());
         target.initialize().unwrap();
         let inserts = (1..=1024)
             .map(|technical_id| Insert {

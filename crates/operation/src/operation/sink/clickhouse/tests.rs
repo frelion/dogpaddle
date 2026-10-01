@@ -17,7 +17,6 @@ use super::{
     config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
     definition::ClickHouseSinkDefinition,
     row::ClickHouseRowCodec,
-    schema::ClickHouseLayout,
 };
 const DATABASE_UUID: &str = "12345678-1234-1234-1234-123456789abc";
 
@@ -153,7 +152,8 @@ fn row_codec_preserves_number_widths_and_timestamp_units() {
         all.iter().map(|(_, array, _)| Arc::clone(array)).collect(),
     )
     .unwrap();
-    let row = ClickHouseRowCodec::new(ClickHouseLayout::try_new(schema).unwrap())
+    let row = ClickHouseRowCodec::try_new(schema)
+        .unwrap()
         .encode_row(&batch, 0)
         .unwrap();
     assert_eq!(
@@ -241,7 +241,8 @@ fn row_codec_preserves_encoded_float_bits_and_nested_values() {
             .collect(),
     )
     .unwrap();
-    let row = ClickHouseRowCodec::new(ClickHouseLayout::try_new(schema).unwrap())
+    let row = ClickHouseRowCodec::try_new(schema)
+        .unwrap()
         .encode_row(&batch, 0)
         .unwrap();
     assert_eq!(
@@ -273,7 +274,7 @@ fn row_codec_uses_canonical_null_marker_and_preserves_errors() {
         ],
     )
     .unwrap();
-    let codec = ClickHouseRowCodec::new(ClickHouseLayout::try_new(Arc::clone(&schema)).unwrap());
+    let codec = ClickHouseRowCodec::try_new(Arc::clone(&schema)).unwrap();
     assert_eq!(
         codec.encode_row(&batch, 0).unwrap().values,
         vec![Value::Null; 4]
@@ -329,4 +330,35 @@ fn runtime_config_requires_numeric_ip_and_redacts_password() {
     let debug = format!("{config:?}");
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("secret"));
+}
+
+#[test]
+fn codec_checks_all_identifiers_before_types_and_shares_the_schema() {
+    let invalid = Arc::new(Schema::new(vec![
+        Field::new("future", DataType::Date64, true),
+        Field::new("", DataType::Int64, false),
+    ]));
+    assert!(matches!(
+        ClickHouseRowCodec::try_new(invalid),
+        Err(super::error::ClickHouseSinkSchemaError::InvalidFieldName { field: 1, .. })
+    ));
+    let unsupported = Arc::new(Schema::new(vec![Field::new(
+        "future",
+        DataType::Date64,
+        true,
+    )]));
+    assert!(matches!(
+        ClickHouseRowCodec::try_new(unsupported),
+        Err(super::error::ClickHouseSinkSchemaError::UnsupportedType {
+            data_type: DataType::Date64,
+            ..
+        })
+    ));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let codec = ClickHouseRowCodec::try_new(Arc::clone(&schema)).unwrap();
+    assert!(Arc::ptr_eq(codec.schema(), &schema));
 }

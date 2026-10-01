@@ -12,118 +12,54 @@ pub(super) const PUBLIC_TECHNICAL_ID: &str = "$dogpaddle.id";
 pub(super) const TECHNICAL_HASH_INDEX: &str = "__dogpaddle_hash_idx";
 pub(super) const MAX_LOGICAL_COLUMNS: usize = 1_597;
 
-#[derive(Debug)]
-pub(super) struct DorisLayout {
-    schema: SchemaRef,
-    columns: Box<[ColumnLayout]>,
-}
-
-impl DorisLayout {
-    pub(super) fn try_new(schema: SchemaRef) -> Result<Self, DorisSinkSchemaError> {
-        validate_identifiers(&schema)?;
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| ColumnLayout::try_new(field))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        Ok(Self { schema, columns })
-    }
-
-    pub(super) const fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    pub(super) fn columns(&self) -> &[ColumnLayout] {
-        &self.columns
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StorageType {
-    Boolean,
-    TinyInt,
-    SmallInt,
-    Int,
-    BigInt,
-    Utf8,
-    Encoded,
-    Null,
-}
-
-impl StorageType {
-    pub(super) const fn sql(self) -> &'static str {
-        match self {
-            Self::Boolean => "BOOLEAN",
-            Self::TinyInt => "TINYINT",
-            Self::SmallInt => "SMALLINT",
-            Self::Int => "INT",
-            Self::BigInt => "BIGINT",
-            Self::Utf8 | Self::Encoded | Self::Null => "STRING",
+/// Checks all identifiers before checking the backend's supported type mapping.
+pub(super) fn validate(schema: &SchemaRef) -> Result<(), DorisSinkSchemaError> {
+    validate_identifiers(schema)?;
+    for field in schema.fields() {
+        if storage_type(field.data_type()).is_none() {
+            return Err(DorisSinkSchemaError::UnsupportedType {
+                field: field.name().clone(),
+                data_type: field.data_type().clone(),
+            });
         }
     }
-
-    pub(super) const fn catalog_type(self) -> &'static str {
-        match self {
-            Self::Boolean => "tinyint(1)",
-            Self::TinyInt => "tinyint(4)",
-            Self::SmallInt => "smallint(6)",
-            Self::Int => "int(11)",
-            Self::BigInt => "bigint(20)",
-            Self::Utf8 | Self::Encoded | Self::Null => "string",
-        }
-    }
+    Ok(())
 }
 
-#[derive(Debug)]
-pub(super) struct ColumnLayout {
-    name: String,
-    storage: StorageType,
-    nullable: bool,
+pub(super) fn nullable(field: &Field) -> bool {
+    field.is_nullable() || matches!(field.data_type(), DataType::Null)
 }
 
-impl ColumnLayout {
-    fn try_new(field: &Field) -> Result<Self, DorisSinkSchemaError> {
-        let storage = match field.data_type() {
-            DataType::Null => StorageType::Null,
-            DataType::Boolean => StorageType::Boolean,
-            DataType::Int8 => StorageType::TinyInt,
-            DataType::Int16 | DataType::UInt8 => StorageType::SmallInt,
-            DataType::Int32 | DataType::UInt16 | DataType::Date32 => StorageType::Int,
-            DataType::Int64 | DataType::UInt32 | DataType::Timestamp(_, _) => StorageType::BigInt,
-            DataType::Utf8 => StorageType::Utf8,
-            DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Binary
-            | DataType::List(_)
-            | DataType::Struct(_) => StorageType::Encoded,
-            unsupported => {
-                return Err(DorisSinkSchemaError::UnsupportedType {
-                    field: field.name().clone(),
-                    data_type: unsupported.clone(),
-                });
-            }
-        };
-        Ok(Self {
-            name: field.name().clone(),
-            storage,
-            nullable: field.is_nullable() || matches!(field.data_type(), DataType::Null),
-        })
-    }
+pub(super) fn sql_type(data_type: &DataType) -> &'static str {
+    storage_type(data_type)
+        .expect("the bound Schema has a Doris storage mapping")
+        .0
+}
 
-    pub(super) fn name(&self) -> &str {
-        &self.name
-    }
+pub(super) fn catalog_type(data_type: &DataType) -> &'static str {
+    storage_type(data_type)
+        .expect("the bound Schema has a Doris storage mapping")
+        .1
+}
 
-    pub(super) const fn storage(&self) -> StorageType {
-        self.storage
-    }
-
-    pub(super) const fn nullable(&self) -> bool {
-        self.nullable
-    }
+fn storage_type(data_type: &DataType) -> Option<(&'static str, &'static str)> {
+    Some(match data_type {
+        DataType::Boolean => ("BOOLEAN", "tinyint(1)"),
+        DataType::Int8 => ("TINYINT", "tinyint(4)"),
+        DataType::Int16 | DataType::UInt8 => ("SMALLINT", "smallint(6)"),
+        DataType::Int32 | DataType::UInt16 | DataType::Date32 => ("INT", "int(11)"),
+        DataType::Int64 | DataType::UInt32 | DataType::Timestamp(_, _) => ("BIGINT", "bigint(20)"),
+        DataType::Null
+        | DataType::Utf8
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::Struct(_) => ("STRING", "string"),
+        _ => return None,
+    })
 }
 
 fn validate_identifiers(schema: &SchemaRef) -> Result<(), DorisSinkSchemaError> {

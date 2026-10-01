@@ -1,3 +1,4 @@
+use arrow_schema::Schema;
 use std::{fmt::Write as _, sync::Arc};
 
 use dogpaddle_change::Change;
@@ -16,7 +17,7 @@ use super::{
     config::{PgClient, PostgresSinkConfig, PostgresTargetSpec, bounded, require_absent},
     error::{PostgresSinkError, database_error, invalid_batch},
     row::{EncodedRow, HASH_LENGTH, PostgresRowCodec, PostgresValue},
-    schema::{PostgresLayout, StorageType, TECHNICAL_HASH, TECHNICAL_ID},
+    schema::{self, TECHNICAL_HASH, TECHNICAL_ID},
 };
 
 /// Database-specific SQL and connection. Durable work belongs to the shared sink.
@@ -33,13 +34,13 @@ impl PostgresTarget {
     pub(super) fn new_bound(
         config: PostgresSinkConfig,
         spec: PostgresTargetSpec,
-        layout: PostgresLayout,
+        codec: PostgresRowCodec,
     ) -> Self {
-        let sql = SqlPlan::new(&spec, &layout);
+        let sql = SqlPlan::new(&spec, codec.schema());
         Self {
             config,
             spec,
-            row_codec: PostgresRowCodec::new(layout),
+            row_codec: codec,
             sql,
             client: None,
             layout_verified: false,
@@ -359,7 +360,7 @@ pub(super) struct SqlPlan {
 
 impl SqlPlan {
     #[allow(clippy::too_many_lines)]
-    pub(super) fn new(spec: &PostgresTargetSpec, layout: &PostgresLayout) -> Self {
+    pub(super) fn new(spec: &PostgresTargetSpec, schema: &Schema) -> Self {
         let target = qualified(spec.schema(), spec.table());
         let hash_index_name = spec.hash_index();
         let hash_index = qualified(spec.schema(), &hash_index_name);
@@ -372,25 +373,18 @@ impl SqlPlan {
             format!("{id} bigint NOT NULL"),
             format!("{hash} bytea NOT NULL"),
         ];
-        for (index, column) in layout.columns().iter().enumerate() {
+        for (index, column) in schema.fields().iter().enumerate() {
             let name = quote_identifier(column.name());
-            let mut definition = format!("{name} {}", column.storage().sql());
-            if !column.nullable() {
+            let mut definition = format!("{name} {}", schema::sql_type(column.data_type()));
+            if !schema::nullable(column) {
                 definition.push_str(" NOT NULL");
             }
-            let condition = column
-                .check()
-                .map(|check| format!("{name} {check}"))
-                .or_else(|| {
-                    if let StorageType::Bytes(Some(length)) = column.storage() {
-                        Some(format!("octet_length({name}) = {length}"))
-                    } else {
-                        None
-                    }
-                });
+            let condition = schema::column_check(column.data_type(), &name);
             if let Some(condition) = condition {
                 let constraint = format!("$dogpaddle.c.{index:04x}.{}", spec.sink_id());
-                let checked = if column.nullable() && column.check() != Some("IS NULL") {
+                let checked = if schema::nullable(column)
+                    && !matches!(column.data_type(), arrow_schema::DataType::Null)
+                {
                     format!("{name} IS NULL OR ({condition})")
                 } else {
                     condition
@@ -438,8 +432,8 @@ impl SqlPlan {
              COMMENT ON INDEX {hash_index} IS {marker_literal}",
             qualified(spec.schema(), &target_pk)
         );
-        let logical_names = layout
-            .columns()
+        let logical_names = schema
+            .fields()
             .iter()
             .map(|column| quote_identifier(column.name()))
             .collect::<Vec<_>>();
@@ -448,7 +442,12 @@ impl SqlPlan {
         let insert_prefix = format!("INSERT INTO {target} ({}) VALUES ", all_names.join(", "));
         let insert_suffix = format!(" ON CONFLICT ({id}) DO NOTHING");
         let mut parameter_types = vec!["bigint", "bytea"];
-        parameter_types.extend(layout.columns().iter().map(|column| column.storage().sql()));
+        parameter_types.extend(
+            schema
+                .fields()
+                .iter()
+                .map(|column| schema::sql_type(column.data_type())),
+        );
 
         let mut request_names = vec!["n".to_owned(), "take".to_owned(), "hash".to_owned()];
         request_names.extend((0..logical_names.len()).map(|index| format!("c{index}")));

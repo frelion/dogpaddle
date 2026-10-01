@@ -7,7 +7,8 @@ use super::{
     buffered,
     config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
     error::{ClickHouseSinkError, invalid_spec},
-    schema::ClickHouseLayout,
+    row::ClickHouseRowCodec,
+    schema,
     target::ClickHouseTarget,
 };
 use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
@@ -56,7 +57,7 @@ impl ClickHouseSinkDefinition {
         inputs: &[SchemaRef],
     ) -> Result<(), crate::OperationSchemaError> {
         self.validate()?;
-        ClickHouseLayout::try_new(Arc::clone(&inputs[0]))?;
+        schema::validate(&inputs[0])?;
         Ok(())
     }
 
@@ -70,10 +71,10 @@ impl ClickHouseSinkDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces ClickHouse sink input arity");
-        let layout = ClickHouseLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
+        let codec = ClickHouseRowCodec::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
         let config = resource.take::<ClickHouseSinkConfig>()?;
-        let target = ClickHouseTarget::new_bound(config, self.target.clone(), layout);
+        let target = ClickHouseTarget::new_bound(config, self.target.clone(), codec);
         buffered::construct(input_schema, target, data)
     }
 

@@ -9,112 +9,60 @@ pub(super) const TECHNICAL_ID: &str = "$dogpaddle.id";
 pub(super) const MAX_LOGICAL_COLUMNS: usize = 1_598;
 const SYSTEM_COLUMNS: &[&str] = &["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"];
 
-/// Pure `PostgreSQL` storage layout compiled from one exact logical Schema.
-#[derive(Debug)]
-pub(super) struct PostgresLayout {
-    schema: SchemaRef,
-    columns: Box<[ColumnLayout]>,
-}
-
-impl PostgresLayout {
-    pub(super) fn try_new(schema: SchemaRef) -> Result<Self, PostgresSinkSchemaError> {
-        validate_identifiers(&schema)?;
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| ColumnLayout::try_new(field))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        Ok(Self { schema, columns })
-    }
-
-    pub(super) const fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    pub(super) fn columns(&self) -> &[ColumnLayout] {
-        &self.columns
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StorageType {
-    Boolean,
-    Int16,
-    Int32,
-    Int64,
-    Bytes(Option<usize>),
-}
-
-impl StorageType {
-    pub(super) const fn sql(self) -> &'static str {
-        match self {
-            Self::Boolean => "boolean",
-            Self::Int16 => "smallint",
-            Self::Int32 => "integer",
-            Self::Int64 => "bigint",
-            Self::Bytes(_) => "bytea",
+/// Checks all identifiers before checking the backend's supported type mapping.
+pub(super) fn validate(schema: &SchemaRef) -> Result<(), PostgresSinkSchemaError> {
+    validate_identifiers(schema)?;
+    for field in schema.fields() {
+        if storage_type(field.data_type()).is_none() {
+            return Err(PostgresSinkSchemaError::UnsupportedType {
+                field: field.name().clone(),
+                data_type: field.data_type().clone(),
+            });
         }
     }
+    Ok(())
 }
 
-/// One target column and the checks required for a lossless Arrow mapping.
-#[derive(Debug)]
-pub(super) struct ColumnLayout {
-    name: String,
-    storage: StorageType,
-    nullable: bool,
-    check: Option<&'static str>,
+pub(super) fn nullable(field: &Field) -> bool {
+    field.is_nullable() || matches!(field.data_type(), DataType::Null)
 }
 
-impl ColumnLayout {
-    fn try_new(field: &Field) -> Result<Self, PostgresSinkSchemaError> {
-        let (storage, check) = match field.data_type() {
-            DataType::Null => (StorageType::Bytes(None), Some("IS NULL")),
-            DataType::Boolean => (StorageType::Boolean, None),
-            DataType::Int8 => (StorageType::Int16, Some("BETWEEN -128 AND 127")),
-            DataType::Int16 => (StorageType::Int16, None),
-            DataType::Int32 | DataType::Date32 => (StorageType::Int32, None),
-            DataType::Int64 | DataType::Timestamp(_, _) => (StorageType::Int64, None),
-            DataType::UInt8 => (StorageType::Int16, Some("BETWEEN 0 AND 255")),
-            DataType::UInt16 => (StorageType::Int32, Some("BETWEEN 0 AND 65535")),
-            DataType::UInt32 => (StorageType::Int64, Some("BETWEEN 0 AND 4294967295")),
-            DataType::UInt64 | DataType::Float64 => (StorageType::Bytes(Some(8)), None),
-            DataType::Float32 => (StorageType::Bytes(Some(4)), None),
-            DataType::Decimal128(_, _) => (StorageType::Bytes(Some(16)), None),
-            DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Struct(_) => {
-                (StorageType::Bytes(None), None)
-            }
-            unsupported => {
-                return Err(PostgresSinkSchemaError::UnsupportedType {
-                    field: field.name().clone(),
-                    data_type: unsupported.clone(),
-                });
-            }
-        };
-        Ok(Self {
-            name: field.name().clone(),
-            storage,
-            nullable: field.is_nullable() || matches!(field.data_type(), DataType::Null),
-            check,
-        })
-    }
+pub(super) fn sql_type(data_type: &DataType) -> &'static str {
+    storage_type(data_type).expect("the bound Schema has a PostgreSQL storage mapping")
+}
 
-    pub(super) fn name(&self) -> &str {
-        &self.name
-    }
+fn storage_type(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Boolean => "boolean",
+        DataType::Int8 | DataType::Int16 | DataType::UInt8 => "smallint",
+        DataType::Int32 | DataType::Date32 | DataType::UInt16 => "integer",
+        DataType::Int64 | DataType::Timestamp(_, _) | DataType::UInt32 => "bigint",
+        DataType::Null
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Utf8
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::Struct(_) => "bytea",
+        _ => return None,
+    })
+}
 
-    pub(super) const fn storage(&self) -> StorageType {
-        self.storage
-    }
-
-    pub(super) const fn nullable(&self) -> bool {
-        self.nullable
-    }
-
-    pub(super) const fn check(&self) -> Option<&'static str> {
-        self.check
-    }
+pub(super) fn column_check(data_type: &DataType, name: &str) -> Option<String> {
+    let check = match data_type {
+        DataType::Null => "IS NULL",
+        DataType::Int8 => "BETWEEN -128 AND 127",
+        DataType::UInt8 => "BETWEEN 0 AND 255",
+        DataType::UInt16 => "BETWEEN 0 AND 65535",
+        DataType::UInt32 => "BETWEEN 0 AND 4294967295",
+        DataType::UInt64 | DataType::Float64 => return Some(format!("octet_length({name}) = 8")),
+        DataType::Float32 => return Some(format!("octet_length({name}) = 4")),
+        DataType::Decimal128(_, _) => return Some(format!("octet_length({name}) = 16")),
+        _ => return None,
+    };
+    Some(format!("{name} {check}"))
 }
 
 fn validate_identifiers(schema: &SchemaRef) -> Result<(), PostgresSinkSchemaError> {

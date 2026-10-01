@@ -30,6 +30,8 @@ ClickHouseSink Definition 只持久化 sink ID、database/table 和 Atomic datab
 两者的状态表都必须包含精确 row-hash 索引，并严格校验 key、version/sequence、distribution、view projection/filter 和 ownership marker；删除终态为阻止不确定旧写复活而保留，compaction 只能合并同一 ID，历史 technical-ID 基数不会自动 GC。
 两者均无 TLS、禁止外部写入或在线 Schema evolution，真实容器验收由 `system-tests/warehouse-sinks/check.sh` 拥有。
 
+PG、Doris 与 ClickHouse 的行编码器只持有共享的 exact Arrow `SchemaRef`，不再复制列名、nullability 或另存派生列布局/存储类型 enum。纯 binding 先检查完整 Schema 的列名与碰撞，再检查各后端类型支持；SQL 类型、约束和目录期望直接从原 `Field` 派生，运行时不逐行重新绑定。Arrow `Null` 始终映射为可空物理列；PG 保留正确类型的 NULL 参数、整数范围与固定 bytea 宽度检查，CH 保留整数时间和 whole-canonical base64，Doris 保留 UTF-8 明文与其它复杂值的 canonical base64。该内存表示调整不改变目标 SQL、ownership marker、行 hash 或持久字节。
+
 ## 共享 buffered 协议
 
 SQLite、PG、Doris 与 ClickHouse 共用 crate 私有唯一 buffered Sink 内核，持久资源固定为 `sink.control: Cell<Vec<u8>>` 和 `sink.buffer: OrderedMap<u64, Vec<u8>>`。四个具体目标直接实现私有 `RelationTarget`，只提供布局、exact-row lookup、事件大小和幂等写入；`relation` 负责由事件位置构造临时 mutations 与按 logical row 分组。不保留 allocator、relation checkpoint、持久正 ID 清单、target wrapper 或第二套运行状态。

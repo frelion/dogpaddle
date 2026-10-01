@@ -7,7 +7,8 @@ use super::{
     buffered,
     config::{PostgresSinkConfig, PostgresTargetSpec},
     error::{PostgresSinkError, invalid_spec},
-    schema::PostgresLayout,
+    row::PostgresRowCodec,
+    schema,
     target::PostgresTarget,
 };
 use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
@@ -62,7 +63,7 @@ impl PostgresSinkDefinition {
         inputs: &[SchemaRef],
     ) -> Result<(), crate::OperationSchemaError> {
         self.validate()?;
-        PostgresLayout::try_new(Arc::clone(&inputs[0]))?;
+        schema::validate(&inputs[0])?;
         Ok(())
     }
 
@@ -76,10 +77,10 @@ impl PostgresSinkDefinition {
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces PostgreSQL sink input arity");
-        let layout = PostgresLayout::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
+        let codec = PostgresRowCodec::try_new(Arc::clone(input_schema)).map_err(schema_error)?;
         let input_schema = Arc::clone(input_schema);
         let config = resource.take::<PostgresSinkConfig>()?;
-        let target = PostgresTarget::new_bound(config, self.target.clone(), layout);
+        let target = PostgresTarget::new_bound(config, self.target.clone(), codec);
         buffered::construct(input_schema, target, data)
     }
 

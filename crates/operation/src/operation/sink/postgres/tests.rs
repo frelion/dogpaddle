@@ -17,7 +17,6 @@ use super::{
     PostgresSinkConfig, PostgresSinkError, PostgresTargetSpec,
     config::validate_absence_snapshot,
     row::{PostgresRowCodec, PostgresValue},
-    schema::PostgresLayout,
     target::{SqlPlan, quote_identifier},
 };
 use crate::operation::sink::relation::{
@@ -115,8 +114,8 @@ fn identifiers_are_quoted_as_independent_postgresql_components() {
         DataType::Int64,
         false,
     )]));
-    let layout = PostgresLayout::try_new(schema).unwrap();
-    let plan = SqlPlan::new(&spec("odd.table"), &layout);
+    let codec = PostgresRowCodec::try_new(schema).unwrap();
+    let plan = SqlPlan::new(&spec("odd.table"), codec.schema());
 
     assert!(plan.initialize.contains("\"Target Schema\".\"odd.table\""));
     assert!(
@@ -208,7 +207,7 @@ fn row_codec_maps_fixed_width_values_and_typed_nulls_from_canonical_bytes() {
     ];
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
-    let codec = PostgresRowCodec::new(PostgresLayout::try_new(schema).unwrap());
+    let codec = PostgresRowCodec::try_new(schema).unwrap();
     let present = codec.encode_row(&batch, 0).unwrap();
     let nulls = codec.encode_row(&batch, 1).unwrap();
 
@@ -308,7 +307,8 @@ fn row_codec_uses_shared_canonical_bytes_for_nested_values() {
         ],
     )
     .unwrap();
-    let encoded = PostgresRowCodec::new(PostgresLayout::try_new(Arc::clone(&schema)).unwrap())
+    let encoded = PostgresRowCodec::try_new(Arc::clone(&schema))
+        .unwrap()
         .encode_row(&batch, 0)
         .unwrap();
     let expected = schema
@@ -331,7 +331,10 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Utf8, true),
     ]));
-    let plan = SqlPlan::new(&spec("target"), &PostgresLayout::try_new(schema).unwrap());
+    let plan = SqlPlan::new(
+        &spec("target"),
+        PostgresRowCodec::try_new(schema).unwrap().schema(),
+    );
     let lookup = plan.lookup_statement(2);
     let mismatch = plan.mismatch_statement(2);
 
@@ -370,7 +373,9 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
 fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
     let empty = SqlPlan::new(
         &spec("empty"),
-        &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
+        PostgresRowCodec::try_new(Arc::new(Schema::empty()))
+            .unwrap()
+            .schema(),
     );
     assert_eq!(empty.insert_batch_size(), 1024);
     assert_eq!(empty.lookup_batch_size(), 1024);
@@ -390,7 +395,9 @@ fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
         .collect::<Vec<_>>();
     let wide = SqlPlan::new(
         &spec("wide"),
-        &PostgresLayout::try_new(Arc::new(Schema::new(fields))).unwrap(),
+        PostgresRowCodec::try_new(Arc::new(Schema::new(fields)))
+            .unwrap()
+            .schema(),
     );
     assert_eq!(wide.insert_batch_size(), 40);
     assert_eq!(wide.lookup_batch_size(), 40);
@@ -415,7 +422,9 @@ fn layout_owns_only_the_target_and_two_indexes() {
     );
     let plan = SqlPlan::new(
         &target,
-        &PostgresLayout::try_new(Arc::new(Schema::empty())).unwrap(),
+        PostgresRowCodec::try_new(Arc::new(Schema::empty()))
+            .unwrap()
+            .schema(),
     );
     assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
     assert!(
@@ -428,4 +437,35 @@ fn layout_owns_only_the_target_and_two_indexes() {
         i64::MAX
     )));
     assert!(!plan.initialize.contains("CHECK (\"$dogpaddle.id\" > 0)"));
+}
+
+#[test]
+fn codec_checks_all_identifiers_before_types_and_shares_the_schema() {
+    let invalid = Arc::new(Schema::new(vec![
+        Field::new("future", DataType::Date64, true),
+        Field::new("", DataType::Int64, false),
+    ]));
+    assert!(matches!(
+        PostgresRowCodec::try_new(invalid),
+        Err(super::error::PostgresSinkSchemaError::InvalidFieldName { field: 1, .. })
+    ));
+    let unsupported = Arc::new(Schema::new(vec![Field::new(
+        "future",
+        DataType::Date64,
+        true,
+    )]));
+    assert!(matches!(
+        PostgresRowCodec::try_new(unsupported),
+        Err(super::error::PostgresSinkSchemaError::UnsupportedType {
+            data_type: DataType::Date64,
+            ..
+        })
+    ));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let codec = PostgresRowCodec::try_new(Arc::clone(&schema)).unwrap();
+    assert!(Arc::ptr_eq(codec.schema(), &schema));
 }

@@ -3,8 +3,8 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use postgres::types::ToSql;
 
 use super::{
-    error::PostgresSinkError,
-    schema::{PostgresLayout, StorageType},
+    error::{PostgresSinkError, PostgresSinkSchemaError},
+    schema,
 };
 use crate::operation::sink::relation::{RowError, encode_target_values, row_hash};
 
@@ -13,16 +13,17 @@ pub(super) const HASH_LENGTH: usize = 16;
 /// Schema-bound encoder for one `PostgreSQL` relation target.
 #[derive(Debug)]
 pub(super) struct PostgresRowCodec {
-    layout: PostgresLayout,
+    schema: SchemaRef,
 }
 
 impl PostgresRowCodec {
-    pub(super) const fn new(layout: PostgresLayout) -> Self {
-        Self { layout }
+    pub(super) fn try_new(schema: SchemaRef) -> Result<Self, PostgresSinkSchemaError> {
+        schema::validate(&schema)?;
+        Ok(Self { schema })
     }
 
     pub(super) const fn schema(&self) -> &SchemaRef {
-        self.layout.schema()
+        &self.schema
     }
 
     pub(super) fn encode_row(
@@ -31,9 +32,7 @@ impl PostgresRowCodec {
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
         let (canonical, values) =
-            encode_target_values(self.schema(), batch, row_index, |index, field, bytes| {
-                postgres_value(field, self.layout.columns()[index].storage(), bytes)
-            })?;
+            encode_target_values(self.schema(), batch, row_index, postgres_value)?;
         Ok(EncodedRow {
             hash: row_hash(&canonical),
             values,
@@ -70,10 +69,10 @@ impl PostgresValue {
     }
 }
 
-fn postgres_value(field: &Field, storage: StorageType, canonical: &[u8]) -> PostgresValue {
+fn postgres_value(field: &Field, canonical: &[u8]) -> PostgresValue {
     // encode_canonical validated the marker, width, and array type before this conversion.
     if canonical[0] == 0 {
-        return null_value(storage);
+        return null_value(field.data_type());
     }
     let bytes = &canonical[1..];
     macro_rules! integer {
@@ -97,17 +96,28 @@ fn postgres_value(field: &Field, storage: StorageType, canonical: &[u8]) -> Post
         }
         DataType::Utf8 | DataType::Binary => PostgresValue::Bytes(Some(bytes[8..].to_vec())),
         DataType::List(_) | DataType::Struct(_) => PostgresValue::Bytes(Some(canonical.to_vec())),
-        _ => unreachable!("layout and canonical encoding accept only supported DogPaddle types"),
+        _ => unreachable!("binding and canonical encoding accept only supported DogPaddle types"),
     }
 }
 
-const fn null_value(storage: StorageType) -> PostgresValue {
-    match storage {
-        StorageType::Boolean => PostgresValue::Boolean(None),
-        StorageType::Int16 => PostgresValue::Int16(None),
-        StorageType::Int32 => PostgresValue::Int32(None),
-        StorageType::Int64 => PostgresValue::Int64(None),
-        StorageType::Bytes(_) => PostgresValue::Bytes(None),
+fn null_value(data_type: &DataType) -> PostgresValue {
+    match data_type {
+        DataType::Boolean => PostgresValue::Boolean(None),
+        DataType::Int8 | DataType::Int16 | DataType::UInt8 => PostgresValue::Int16(None),
+        DataType::Int32 | DataType::Date32 | DataType::UInt16 => PostgresValue::Int32(None),
+        DataType::Int64 | DataType::Timestamp(_, _) | DataType::UInt32 => {
+            PostgresValue::Int64(None)
+        }
+        DataType::Null
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Utf8
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::Struct(_) => PostgresValue::Bytes(None),
+        _ => unreachable!("binding accepts only supported DogPaddle types"),
     }
 }
 

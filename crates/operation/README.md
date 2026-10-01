@@ -133,7 +133,7 @@ Source 拥有一条 input Queue、phase、checkpoint 和真实 Delivery 的 ACK�
 两种源的 Config 均接收 `CdcOptions` 的六项运行覆盖；未设置的项由具体源使用各自默认值，参数校验返回 `CdcOptionsError`。它们不进入 Definition 或持久状态。
 
 Sink 拥有 outbox，事件位置同时确定消费进度和固定 occurrence IDs；Prepared 只保存边界与删除 IDs。enqueue 与独立 drain 的事务、
-目标重投及负 diff 前缀验证由 [Sink 契约](docs/sinks.md) 规定。
+目标重投及负 diff 前缀验证由 [Sink 契约](docs/sinks.md) 规定。远端 Sink 直接共享 Arrow Schema，SQL 与目录类型从字段派生，不另保一份列布局。
 
 ## 验证与 benchmark
 

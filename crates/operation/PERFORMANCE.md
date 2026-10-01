@@ -232,3 +232,42 @@ EquiJoin 的 12 个 reference resource case 全部完成，包括此前被错误
 不编码 Flow Frame；64 KiB 行加 canonical framing 仍可能超过 Flow 的 64 KiB Resume
 上限，这项结果不能充作该宽行 Flow workload 的成功证据。公共 Flow 回归使用约
 8 KiB 嵌套候选，已证明旧错误包装失败、修复后缩页完成，并覆盖逐轮重开。
+
+## 三个远程 Sink 共享 Arrow Schema：2026-10-01 构造内存对照
+
+PostgreSQL、ClickHouse、Doris 的 RowCodec 直接持有 `SchemaRef`，删除三套
+Layout、ColumnLayout、StorageType，不再另存每列名称及存储类型/nullable 的镜像。
+DDL、catalog 校验与行编码仍按原规则从 Arrow Field 派生；此改动不改变持久字节、
+目标布局、SQL 或幂等协议，也不减少 PostgreSQL 必要的 typed parameter value。
+
+以下数据来自仓库外临时程序，仅调用公开 `OperationDefinition::construct`。
+baseline 为 `e80c0e70a35ce1329f9b057da176a0c37c374782`，candidate 为同一基线加
+本次 Sink Schema diff；两个构建与工作区共有的 351 项依赖精确锁定相同版本和来源。
+三个后端分别使用 1 列与 1597 列 nullable `Int64`，每列名称 34 UTF-8 bytes；
+每版本、每场景运行一个新进程，共 12 个进程，不是重复采样的耗时基准。
+
+DHAT 只追踪预建 Schema、Definition、Config 之后的构造分配，包括 StoreSetup
+draft 和 PostgreSQL 缓存 SQL。程序不发布 Store，不访问数据库、网络或 JVM。
+存活值在 Operation 与 draft 尚未释放时读取；下表单位为 bytes，箭头为旧 → 新。
+
+| 后端 / 列数 | 存活字节 | 存活块数 | 峰值字节 | 累计分配字节 |
+| --- | ---: | ---: | ---: | ---: |
+| PostgreSQL / 1 | 5740 → 5626 | 33 → 31 | 6843 → 6745 | 18924 → 18554 |
+| PostgreSQL / 1597 | 1226172 → 1069650 | 1629 → 31 | 2671949 → 2515443 | 5736169 → 5317759 |
+| ClickHouse / 1 | 1901 → 1819 | 20 → 18 | 2289 → 2223 | 4880 → 4670 |
+| ClickHouse / 1597 | 120005 → 14587 | 1616 → 18 | 378633 → 273231 | 1013896 → 777534 |
+| Doris / 1 | 1809 → 1727 | 19 → 17 | 2253 → 2187 | 4788 → 4578 |
+| Doris / 1597 | 119913 → 14495 | 1615 → 17 | 378597 → 273195 | 1013804 → 777442 |
+
+宽表中 PostgreSQL 少 156522 存活字节，ClickHouse 与 Doris 各少 105418 字节；
+三者均少 1598 个存活分配块。这是上述字段规格的实际结果，不是任意 Schema 的
+固定分配次数公式。所有 12 个进程在释放 Operation 与 draft 后，追踪存活字节和
+块数均为零。构造 oracle 只检查返回 Sink 且没有输出 Schema，不是逐行或端到端验收。
+这些数字不包括预建输入对象、native heap 或 RSS，不说明行吞吐、目标 I/O 或重连速度。
+
+原始结果与临时程序保存在 `/tmp/dogpaddle-sink-schema-memory/`，包括
+`baseline.json`、`candidate.json`、`summary.json` 与 `source-context.json`。
+程序 source SHA256 为
+`754cfb927ca381f3be5e8e35d71d332255a727863796db9bf247860bab894fae`，
+测量 Cargo.lock SHA256 为
+`4d35f0727efabafd13d9163bdba29dce19243587b42b00960b5ba5416eafb4cc`。

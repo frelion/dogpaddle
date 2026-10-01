@@ -1,3 +1,4 @@
+use arrow_schema::Schema;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -12,7 +13,7 @@ use super::{
     error::{ClickHouseSinkError, database, invalid_batch, invalid_response},
     row::{ClickHouseRowCodec, EncodedRow},
     schema::{
-        ClickHouseLayout, TECHNICAL_DELETED, TECHNICAL_HASH, TECHNICAL_HASH_INDEX, TECHNICAL_ID,
+        self, TECHNICAL_DELETED, TECHNICAL_HASH, TECHNICAL_HASH_INDEX, TECHNICAL_ID,
         TECHNICAL_VERSION,
     },
 };
@@ -38,12 +39,12 @@ impl ClickHouseTarget {
     pub(super) fn new_bound(
         config: ClickHouseSinkConfig,
         spec: ClickHouseTargetSpec,
-        layout: ClickHouseLayout,
+        codec: ClickHouseRowCodec,
     ) -> Self {
         Self {
             config,
             spec,
-            codec: ClickHouseRowCodec::new(layout),
+            codec,
             verified: false,
         }
     }
@@ -68,8 +69,8 @@ impl ClickHouseTarget {
     fn ensure_ready(&mut self) -> Result<(), ClickHouseSinkError> {
         self.verify_identity()?;
         if !self.verified {
-            verify_state(&self.config, &self.spec, self.codec.layout())?;
-            verify_view(&self.config, &self.spec, self.codec.layout())?;
+            verify_state(&self.config, &self.spec, self.codec.schema())?;
+            verify_view(&self.config, &self.spec, self.codec.schema())?;
             self.verified = true;
         }
         Ok(())
@@ -90,7 +91,7 @@ impl RelationTarget for ClickHouseTarget {
         let row_bytes = serde_json::to_vec(&Value::Array(values))
             .expect("ClickHouse row JSON serialization cannot fail")
             .len();
-        let framing = selected_columns(self.codec.layout())
+        let framing = selected_columns(self.codec.schema())
             .len()
             .checked_add(self.spec.database().len())
             .and_then(|bytes| bytes.checked_add(self.spec.state_table().len()))
@@ -117,7 +118,7 @@ impl RelationTarget for ClickHouseTarget {
         match (objects.get(&state), objects.get(self.spec.table())) {
             (None, None) => {
                 self.config.command(
-                    &create_state_sql(&self.spec, self.codec.layout()),
+                    &create_state_sql(&self.spec, self.codec.schema()),
                     "create state table",
                 )?;
             }
@@ -130,15 +131,15 @@ impl RelationTarget for ClickHouseTarget {
             }
             (Some(_), Some(_)) => {}
         }
-        verify_state(&self.config, &self.spec, self.codec.layout())?;
+        verify_state(&self.config, &self.spec, self.codec.schema())?;
         let objects = object_kinds(&self.config, &self.spec)?;
         if !objects.contains_key(self.spec.table()) {
             self.config.command(
-                &create_view_sql(&self.spec, self.codec.layout()),
+                &create_view_sql(&self.spec, self.codec.schema()),
                 "create target view",
             )?;
         }
-        verify_view(&self.config, &self.spec, self.codec.layout())?;
+        verify_view(&self.config, &self.spec, self.codec.schema())?;
         let count = scalar_u64(
             &self.config.command(
                 &format!(
@@ -220,15 +221,15 @@ impl ClickHouseTarget {
             .chain(std::iter::once("hash FixedString(32)".to_owned()))
             .chain(
                 self.codec
-                    .layout()
-                    .columns()
+                    .schema()
+                    .fields()
                     .iter()
                     .enumerate()
-                    .map(|(index, column)| format!("v{index} {}", column.sql_type())),
+                    .map(|(index, column)| format!("v{index} {}", schema::sql_type(column))),
             )
             .collect::<Vec<_>>()
             .join(",");
-        let join = lookup_join_predicate(self.codec.layout());
+        let join = lookup_join_predicate(self.codec.schema());
         let sql = format!(
             "WITH requests AS (SELECT * FROM values({}, {})) \
              SELECT r.n, \
@@ -240,7 +241,7 @@ impl ClickHouseTarget {
             rows.join(","),
             quote(TECHNICAL_ID),
             quote(TECHNICAL_HASH),
-            lookup_state_columns(self.codec.layout()),
+            lookup_state_columns(self.codec.schema()),
             qualified(self.spec.database(), &self.spec.state_table()),
             quote(TECHNICAL_DELETED),
             quote(TECHNICAL_HASH),
@@ -317,7 +318,7 @@ impl ClickHouseTarget {
         let mut payload = format!(
             "INSERT INTO {} ({}) SETTINGS async_insert = 0, wait_for_async_insert = 1, max_insert_block_size = 1048576 FORMAT JSONCompactEachRow\n",
             qualified(self.spec.database(), &self.spec.state_table()),
-            selected_columns(self.codec.layout())
+            selected_columns(self.codec.schema())
         );
         for (id, deleted, row) in actions {
             let mut values = vec![
@@ -349,7 +350,7 @@ impl ClickHouseTarget {
         let body = self.config.command(
             &format!(
                 "SELECT {} FROM {} FINAL WHERE {} IN ({}) ORDER BY {} FORMAT JSONCompactEachRow",
-                selected_columns(self.codec.layout()),
+                selected_columns(self.codec.schema()),
                 qualified(self.spec.database(), &self.spec.state_table()),
                 quote(TECHNICAL_ID),
                 ids.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
@@ -361,7 +362,7 @@ impl ClickHouseTarget {
         for line in body.lines().filter(|line| !line.is_empty()) {
             let values: Vec<Value> =
                 serde_json::from_str(line).map_err(|_| invalid_response("read mutation IDs"))?;
-            if values.len() != self.codec.layout().columns().len() + 4 {
+            if values.len() != self.codec.schema().fields().len() + 4 {
                 return Err(invalid_response("read mutation IDs"));
             }
             let mut values = values.into_iter();
@@ -423,18 +424,18 @@ fn json_equal(actual: &Value, expected: &Value) -> bool {
     }
 }
 
-fn lookup_join_predicate(layout: &ClickHouseLayout) -> String {
+fn lookup_join_predicate(schema: &Schema) -> String {
     std::iter::once("s.hash = r.hash".to_owned())
-        .chain(layout.columns().iter().enumerate().map(|(index, column)| {
+        .chain(schema.fields().iter().enumerate().map(|(index, column)| {
             format!("isNotDistinctFrom(s.{}, r.v{index})", quote(column.name()))
         }))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
-fn lookup_state_columns(layout: &ClickHouseLayout) -> String {
-    layout
-        .columns()
+fn lookup_state_columns(schema: &Schema) -> String {
+    schema
+        .fields()
         .iter()
         .fold(String::new(), |mut sql, column| {
             sql.push(',');
@@ -453,7 +454,7 @@ fn value_literal(value: &Value) -> String {
     }
 }
 
-fn create_state_sql(spec: &ClickHouseTargetSpec, layout: &ClickHouseLayout) -> String {
+fn create_state_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} UInt64", quote(TECHNICAL_ID)),
         format!("{} FixedString(32)", quote(TECHNICAL_HASH)),
@@ -461,10 +462,10 @@ fn create_state_sql(spec: &ClickHouseTargetSpec, layout: &ClickHouseLayout) -> S
         format!("{} UInt8", quote(TECHNICAL_DELETED)),
     ];
     columns.extend(
-        layout
-            .columns()
+        schema
+            .fields()
             .iter()
-            .map(|column| format!("{} {}", quote(column.name()), column.sql_type())),
+            .map(|column| format!("{} {}", quote(column.name()), schema::sql_type(column))),
     );
     columns.push(format!(
         "INDEX {} {} TYPE set(0) GRANULARITY 1",
@@ -482,11 +483,11 @@ fn create_state_sql(spec: &ClickHouseTargetSpec, layout: &ClickHouseLayout) -> S
     )
 }
 
-fn create_view_sql(spec: &ClickHouseTargetSpec, layout: &ClickHouseLayout) -> String {
+fn create_view_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
     format!(
         "CREATE VIEW {} AS SELECT {} FROM {} FINAL WHERE {} = 0",
         qualified(spec.database(), spec.table()),
-        selected_public_columns(layout),
+        selected_public_columns(schema),
         qualified(spec.database(), &spec.state_table()),
         quote(TECHNICAL_DELETED)
     )
@@ -495,7 +496,7 @@ fn create_view_sql(spec: &ClickHouseTargetSpec, layout: &ClickHouseLayout) -> St
 fn verify_state(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
-    layout: &ClickHouseLayout,
+    schema: &Schema,
 ) -> Result<(), ClickHouseSinkError> {
     let expected = std::iter::once((TECHNICAL_ID, "UInt64".to_owned()))
         .chain(std::iter::once((
@@ -505,10 +506,10 @@ fn verify_state(
         .chain(std::iter::once((TECHNICAL_VERSION, "UInt8".to_owned())))
         .chain(std::iter::once((TECHNICAL_DELETED, "UInt8".to_owned())))
         .chain(
-            layout
-                .columns()
+            schema
+                .fields()
                 .iter()
-                .map(|column| (column.name(), column.sql_type())),
+                .map(|column| (column.name().as_str(), schema::sql_type(column))),
         )
         .collect::<Vec<_>>();
     let body = config.command(
@@ -603,11 +604,11 @@ fn has_exact_hash_index(
 fn verify_view(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
-    layout: &ClickHouseLayout,
+    schema: &Schema,
 ) -> Result<(), ClickHouseSinkError> {
     let metadata = object_metadata(config, spec, spec.table())?;
     if metadata.engine != "View"
-        || select_tail(&metadata.create_query) != select_tail(&create_view_sql(spec, layout))
+        || select_tail(&metadata.create_query) != select_tail(&create_view_sql(spec, schema))
     {
         return Err(ClickHouseSinkError::TargetLayoutMismatch {
             name: spec.table().to_owned(),
@@ -624,7 +625,7 @@ fn verify_view(
         )?,
         "inspect target-view columns",
     )?;
-    if count != u64::try_from(layout.columns().len() + 2).expect("column count fits u64") {
+    if count != u64::try_from(schema.fields().len() + 2).expect("column count fits u64") {
         return Err(ClickHouseSinkError::TargetLayoutMismatch {
             name: spec.table().to_owned(),
         });
@@ -704,31 +705,21 @@ fn object_kinds(
         .collect()
 }
 
-fn selected_columns(layout: &ClickHouseLayout) -> String {
+fn selected_columns(schema: &Schema) -> String {
     std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
         .chain(std::iter::once(TECHNICAL_VERSION))
         .chain(std::iter::once(TECHNICAL_DELETED))
-        .chain(
-            layout
-                .columns()
-                .iter()
-                .map(super::schema::ColumnLayout::name),
-        )
+        .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn selected_public_columns(layout: &ClickHouseLayout) -> String {
+fn selected_public_columns(schema: &Schema) -> String {
     std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
-        .chain(
-            layout
-                .columns()
-                .iter()
-                .map(super::schema::ColumnLayout::name),
-        )
+        .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
         .join(",")
@@ -824,7 +815,7 @@ mod live_tests {
         )
         .unwrap();
         let mut target =
-            ClickHouseTarget::new_bound(config, spec, ClickHouseLayout::try_new(schema).unwrap());
+            ClickHouseTarget::new_bound(config, spec, ClickHouseRowCodec::try_new(schema).unwrap());
         target.initialize().unwrap();
         let insert = Batch {
             inserts: vec![Insert {
@@ -899,7 +890,7 @@ mod live_tests {
         let stale = format!(
             "INSERT INTO {} ({}) FORMAT JSONCompactEachRow\n{}\n",
             qualified(target.spec.database(), &target.spec.state_table()),
-            selected_columns(target.codec.layout()),
+            selected_columns(target.codec.schema()),
             serde_json::to_string(&serde_json::json!([
                 1,
                 stale_row.hash,
@@ -940,7 +931,7 @@ mod live_tests {
         target
             .config
             .command(
-                &create_view_sql(&target.spec, target.codec.layout()).replace(" = 0", " = 1"),
+                &create_view_sql(&target.spec, target.codec.schema()).replace(" = 0", " = 1"),
                 "replace target view",
             )
             .unwrap();
@@ -992,7 +983,7 @@ mod live_tests {
         )
         .unwrap();
         let mut target =
-            ClickHouseTarget::new_bound(config, spec, ClickHouseLayout::try_new(schema).unwrap());
+            ClickHouseTarget::new_bound(config, spec, ClickHouseRowCodec::try_new(schema).unwrap());
         target.initialize().unwrap();
         for start in (0..ROWS).step_by(LOOKUPS) {
             let batch = Batch {

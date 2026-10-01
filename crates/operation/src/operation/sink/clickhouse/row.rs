@@ -4,27 +4,24 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Number, Value};
 
 use super::{
-    error::ClickHouseSinkError,
-    schema::{ClickHouseLayout, ColumnLayout},
+    error::{ClickHouseSinkError, ClickHouseSinkSchemaError},
+    schema,
 };
 use crate::operation::sink::relation::{RowError, encode_target_values, row_hash};
 
 #[derive(Debug)]
 pub(super) struct ClickHouseRowCodec {
-    layout: ClickHouseLayout,
+    schema: SchemaRef,
 }
 
 impl ClickHouseRowCodec {
-    pub(super) const fn new(layout: ClickHouseLayout) -> Self {
-        Self { layout }
+    pub(super) fn try_new(schema: SchemaRef) -> Result<Self, ClickHouseSinkSchemaError> {
+        schema::validate(&schema)?;
+        Ok(Self { schema })
     }
 
     pub(super) const fn schema(&self) -> &SchemaRef {
-        self.layout.schema()
-    }
-
-    pub(super) const fn layout(&self) -> &ClickHouseLayout {
-        &self.layout
+        &self.schema
     }
 
     pub(super) fn encode_row(
@@ -33,8 +30,8 @@ impl ClickHouseRowCodec {
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
         let (canonical, values) =
-            encode_target_values(self.schema(), batch, row_index, |index, field, bytes| {
-                clickhouse_value(field.data_type(), &self.layout.columns()[index], bytes)
+            encode_target_values(self.schema(), batch, row_index, |field, bytes| {
+                clickhouse_value(field.data_type(), bytes)
             })?;
         Ok(EncodedRow {
             hash: hex(&row_hash(&canonical)),
@@ -49,12 +46,9 @@ pub(super) struct EncodedRow {
     pub(super) values: Vec<Value>,
 }
 
-fn clickhouse_value(data_type: &DataType, column: &ColumnLayout, canonical: &[u8]) -> Value {
+fn clickhouse_value(data_type: &DataType, canonical: &[u8]) -> Value {
     if canonical[0] == 0 {
         return Value::Null;
-    }
-    if column.encoded() {
-        return Value::String(STANDARD.encode(canonical));
     }
     // encode_canonical already checked the Arrow type and nullability. Fixed-width
     // values follow the non-null marker in big-endian order; encoded columns keep
@@ -76,6 +70,13 @@ fn clickhouse_value(data_type: &DataType, column: &ColumnLayout, canonical: &[u8
         DataType::UInt16 => number!(u16),
         DataType::UInt32 => number!(u32),
         DataType::UInt64 => number!(u64),
+        DataType::Utf8
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::Struct(_) => Value::String(STANDARD.encode(canonical)),
         _ => unreachable!("binding and canonical encoding accept only supported DogPaddle types"),
     }
 }

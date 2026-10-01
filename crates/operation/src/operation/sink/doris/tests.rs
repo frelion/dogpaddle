@@ -15,7 +15,6 @@ use super::{
     config::{DorisSinkConfig, DorisTargetSpec},
     definition::DorisSinkDefinition,
     row::DorisRowCodec,
-    schema::DorisLayout,
 };
 use crate::operation::sink::relation::RowError;
 
@@ -111,7 +110,7 @@ fn row_codec_maps_every_supported_type_without_reinterpreting_canonical_values()
         Field::new("decimal", columns[21].data_type().clone(), true),
     ]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-    let codec = DorisRowCodec::new(DorisLayout::try_new(schema).unwrap());
+    let codec = DorisRowCodec::try_new(schema).unwrap();
     let present = codec.encode_row(&batch, 0).unwrap();
     let absent = codec.encode_row(&batch, 1).unwrap();
 
@@ -164,7 +163,7 @@ fn row_codec_rejects_null_in_non_nullable_nested_child_without_partial_row() {
         true,
     )]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(structure)]).unwrap();
-    let codec = DorisRowCodec::new(DorisLayout::try_new(schema).unwrap());
+    let codec = DorisRowCodec::try_new(schema).unwrap();
     assert_eq!(
         codec.encode_row(&batch, 0).unwrap().values,
         [Value::Bytes(b"AQEAAAAAAAAABw==".to_vec())]
@@ -191,7 +190,7 @@ fn row_codec_preserves_canonical_nested_type_validation_with_relaxed_record_batc
         &RecordBatchOptions::new().with_match_field_names(false),
     )
     .unwrap();
-    let codec = DorisRowCodec::new(DorisLayout::try_new(schema).unwrap());
+    let codec = DorisRowCodec::try_new(schema).unwrap();
 
     assert_eq!(
         codec.encode_row(&batch, 0),
@@ -215,7 +214,7 @@ fn row_codec_rejects_out_of_bounds_index() {
         vec![Arc::new(Int64Array::from(vec![7]))],
     )
     .unwrap();
-    let codec = DorisRowCodec::new(DorisLayout::try_new(schema).unwrap());
+    let codec = DorisRowCodec::try_new(schema).unwrap();
     assert!(codec.encode_row(&batch, 1).is_err());
 }
 
@@ -245,14 +244,14 @@ fn layout_rejects_case_folded_column_collisions() {
         Field::new("value", DataType::Int64, false),
         Field::new("VALUE", DataType::Int64, false),
     ]));
-    assert!(DorisLayout::try_new(duplicate).is_err());
+    assert!(DorisRowCodec::try_new(duplicate).is_err());
 
     let technical = Arc::new(Schema::new(vec![Field::new(
         "__DOGPADDLE_ID",
         DataType::Int64,
         false,
     )]));
-    assert!(DorisLayout::try_new(technical).is_err());
+    assert!(DorisRowCodec::try_new(technical).is_err());
 }
 
 #[test]
@@ -263,4 +262,35 @@ fn runtime_config_requires_numeric_ip_and_redacts_password() {
     let debug = format!("{config:?}");
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("secret"));
+}
+
+#[test]
+fn codec_checks_all_identifiers_before_types_and_shares_the_schema() {
+    let invalid = Arc::new(Schema::new(vec![
+        Field::new("future", DataType::Date64, true),
+        Field::new("", DataType::Int64, false),
+    ]));
+    assert!(matches!(
+        DorisRowCodec::try_new(invalid),
+        Err(super::error::DorisSinkSchemaError::InvalidFieldName { field: 1, .. })
+    ));
+    let unsupported = Arc::new(Schema::new(vec![Field::new(
+        "future",
+        DataType::Date64,
+        true,
+    )]));
+    assert!(matches!(
+        DorisRowCodec::try_new(unsupported),
+        Err(super::error::DorisSinkSchemaError::UnsupportedType {
+            data_type: DataType::Date64,
+            ..
+        })
+    ));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let codec = DorisRowCodec::try_new(Arc::clone(&schema)).unwrap();
+    assert!(Arc::ptr_eq(codec.schema(), &schema));
 }

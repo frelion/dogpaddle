@@ -205,7 +205,7 @@ pub(crate) fn encode_target_values<V>(
     schema: &SchemaRef,
     batch: &RecordBatch,
     row_index: usize,
-    mut value: impl FnMut(usize, &Field, &[u8]) -> V,
+    mut value: impl FnMut(&Field, &[u8]) -> V,
 ) -> Result<(Vec<u8>, Vec<V>), RowError> {
     if batch.schema_ref().as_ref() != schema.as_ref() {
         return Err(RowError::SchemaMismatch);
@@ -219,7 +219,7 @@ pub(crate) fn encode_target_values<V>(
 
     let mut canonical = Vec::new();
     let mut values = Vec::with_capacity(schema.fields().len());
-    for (index, (field, array)) in schema.fields().iter().zip(batch.columns()).enumerate() {
+    for (field, array) in schema.fields().iter().zip(batch.columns()) {
         let start = canonical.len();
         encode_canonical(
             field,
@@ -228,7 +228,7 @@ pub(crate) fn encode_target_values<V>(
             field.name(),
             &mut canonical,
         )?;
-        values.push(value(index, field, &canonical[start..]));
+        values.push(value(field, &canonical[start..]));
     }
     Ok((canonical, values))
 }

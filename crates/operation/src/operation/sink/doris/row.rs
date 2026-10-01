@@ -3,25 +3,25 @@ use arrow_schema::{DataType, SchemaRef};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mysql::Value;
 
-use super::{error::DorisSinkError, schema::DorisLayout};
+use super::{
+    error::{DorisSinkError, DorisSinkSchemaError},
+    schema,
+};
 use crate::operation::sink::relation::{RowError, encode_target_values, row_hash};
 
 #[derive(Debug)]
 pub(super) struct DorisRowCodec {
-    layout: DorisLayout,
+    schema: SchemaRef,
 }
 
 impl DorisRowCodec {
-    pub(super) const fn new(layout: DorisLayout) -> Self {
-        Self { layout }
+    pub(super) fn try_new(schema: SchemaRef) -> Result<Self, DorisSinkSchemaError> {
+        schema::validate(&schema)?;
+        Ok(Self { schema })
     }
 
     pub(super) const fn schema(&self) -> &SchemaRef {
-        self.layout.schema()
-    }
-
-    pub(super) const fn layout(&self) -> &DorisLayout {
-        &self.layout
+        &self.schema
     }
 
     pub(super) fn encode_row(
@@ -30,7 +30,7 @@ impl DorisRowCodec {
         row_index: usize,
     ) -> Result<EncodedRow, RowError> {
         let (canonical, values) =
-            encode_target_values(self.schema(), batch, row_index, |_, field, bytes| {
+            encode_target_values(self.schema(), batch, row_index, |field, bytes| {
                 doris_value(field.data_type(), bytes)
             })?;
         Ok(EncodedRow {
