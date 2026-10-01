@@ -6,7 +6,7 @@
 `bundled_runtime_probe` 在打开 JVM 前注册宿主 Ctrl-C handler，然后用 `/bin/kill` 向自身发送
 SIGINT，并要求在 5 秒内收到 handler 通知。JVM 若重新接管信号，probe 会异常退出或超时失败。
 首次无效 bundle 拒绝后，四个线程同时打开真实 bundle，要求全部成功；随后验证同路径和符号链接别名复用、不同存在目录优先配置冲突，以及缺失路径和普通文件拒绝。测试路径由 `tempfile` 隔离，不修改真实 bundle。
-之后继续验证 start、poll、丢弃 Delivery 后按原 topic/value 与 checkpoint 字节重投、ACK、stop 和 checkpoint-only restart。
+之后继续验证 start、poll、移出 records 保持原 allocation 且重复取出为空、原 Delivery 仍阻止再次 poll；释放 records 并丢弃 Delivery 后，Java 按完整 topic/value 与 checkpoint 字节重投。已移出 records 的原 Delivery 仍必须通过 ACK、跨 connector 拒绝和 stop 失效检查；成功 ACK 返回的 checkpoint 与原 bytes 及 buffer 地址相同。最后验证 checkpoint-only restart。
 probe connector 仍发出 key、Kafka partition、timestamp 和 headers，但 Rust 不导出这些字段；它们不影响 source offset 的推进。
 成功必须由宿主正常返回退出码 0。
 

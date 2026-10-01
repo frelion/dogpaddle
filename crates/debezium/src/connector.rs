@@ -164,13 +164,15 @@ impl Connector {
     /// Consumes the original delivery after its complete data and checkpoint are durable.
     ///
     /// An owned delivery is valid only for this connector's current outstanding batch.
+    /// Records may already have been moved out with [`Delivery::take_records`].
+    /// On success, returns the delivery's original checkpoint without copying its bytes.
     /// ACK errors poison the connector; stop and restart from the durable checkpoint.
     ///
     /// # Errors
     ///
     /// Returns an error for a foreign or invalidated capability, stopped connector,
     /// bridge failure, or uncertain acknowledgement.
-    pub fn ack(&mut self, delivery: Delivery) -> Result<(), Error> {
+    pub fn ack(&mut self, delivery: Delivery) -> Result<Checkpoint, Error> {
         if !self
             .outstanding
             .ptr_eq(&Arc::downgrade(&delivery.capability))
@@ -186,8 +188,7 @@ impl Connector {
             return Err(error);
         }
         self.outstanding = Weak::new();
-        drop(delivery);
-        Ok(())
+        Ok(delivery.checkpoint)
     }
 
     fn usable_runtime(&self) -> Result<&RuntimeObject, Error> {
@@ -236,10 +237,23 @@ impl Delivery {
         &self.checkpoint
     }
 
-    /// Returns source records in Debezium's delivery order.
+    /// Returns source records not yet taken, in Debezium's delivery order.
+    ///
+    /// Returns an empty slice after [`Self::take_records`].
     #[must_use]
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// Moves out the source records, preserving their order and allocations.
+    ///
+    /// Repeated calls return an empty slice. The original delivery retains its
+    /// checkpoint and exclusive ACK capability: taking or dropping the records
+    /// does not acknowledge the batch or permit another poll while this delivery
+    /// is alive. Persist the processed data and checkpoint before acknowledging it.
+    #[must_use]
+    pub fn take_records(&mut self) -> Box<[Record]> {
+        std::mem::take(&mut self.records)
     }
 }
 

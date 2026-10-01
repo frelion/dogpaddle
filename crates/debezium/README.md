@@ -94,8 +94,8 @@ let _connector = runtime.start(config, Some(&checkpoint))?;
 
 ### Delivery 的线性确认权
 
-`Delivery` 拥有完整 records/checkpoint 与私有线性 capability，不借用 Connector，因此调用方可以把它保留到短 Store 事务和 WAL barrier 完成。`Connector::ack(delivery)` 消费原句柄并检查它属于该 Connector 当前 outstanding batch；不接受根据 checkpoint 或公开 ID 重建的确认权。
-活 Delivery 阻止再次 poll；直接 drop 不 ACK，下一次 poll 重投同一 outstanding bytes。stop 使旧 capability 失效；另一 Connector 或 stop 后的 ACK 拒绝。Delivery 不实现 Clone，成功 ACK 不能重复提交原句柄。capability 不增加持久 delivery identity、共享执行锁或另一套生命周期。
+`Delivery` 最初拥有完整 records/checkpoint 与私有线性 capability，不借用 Connector。`take_records()` 可无复制地移出 records，之后 `records()` 和重复 `take_records()` 返回空集合；checkpoint 和原 ACK 权仍留在同一个 Delivery。调用方可在转换或持久化数据后释放 records，把原 Delivery 保留到短 Store 事务和 WAL barrier 完成。`Connector::ack(delivery)` 消费原句柄并检查它属于该 Connector 当前 outstanding batch，成功后移出并返回原 `Checkpoint`，不复制其 bytes；不接受根据 checkpoint 或公开 ID 重建的确认权。
+移出或释放 records 不 ACK，活 Delivery 仍阻止再次 poll；直接 drop Delivery 不 ACK，下一次 poll 从 Java 重投同一完整 outstanding bytes。stop 使旧 capability 失效；另一 Connector 或 stop 后的 ACK 拒绝。Delivery 不实现 Clone，成功 ACK 不能重复提交原句柄。capability 不增加持久 delivery identity、共享执行锁或另一套生命周期。wire 中零 records 的 delivery 仍拒绝；移出 records 后的空集合只表示 Rust payload 已被调用方接管。
 
 ACK 结果不确定时，Connector 会被标记为不可继续使用。调用方应 stop，并从 ACK 前已经持久化的 checkpoint
 重新 start，而不是猜这次 ACK 是否成功。

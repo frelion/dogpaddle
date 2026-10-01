@@ -216,7 +216,7 @@ impl<B: Source> CdcRuntime<B> {
                 self.source.start_snapshot()?
             });
         }
-        let Some(delivery) = self
+        let Some(mut delivery) = self
             .connector
             .as_mut()
             .expect("connector started")
@@ -227,8 +227,9 @@ impl<B: Source> CdcRuntime<B> {
         else {
             return Ok(None);
         };
+        let records = delivery.take_records();
         // Account every envelope before conversion; an update can produce two physical rows.
-        let envelopes = self.source.data_envelopes(delivery.records());
+        let envelopes = self.source.data_envelopes(&records);
         if envelopes > 2048
             || envelopes
                 .saturating_mul(2)
@@ -244,18 +245,17 @@ impl<B: Source> CdcRuntime<B> {
             .checked_sub(checkpoint_bytes)
             .ok_or_else(|| B::invalid_state("source checkpoint exceeds capture admission"))?;
         let (change, sealed) = if streaming {
-            (
-                self.source
-                    .stream(self.codec.schema(), delivery.records())?,
-                false,
-            )
+            (self.source.stream(self.codec.schema(), &records)?, false)
         } else {
-            let captured =
-                self.source
-                    .capture(self.codec.schema(), delivery.records(), self.progress)?;
+            let captured = self
+                .source
+                .capture(self.codec.schema(), &records, self.progress)?;
             self.pending_progress = Some(captured.progress);
             (captured.change, captured.sealed)
         };
+        // Conversion owns its Arrow buffers. Keep only the original ACK capability
+        // and checkpoint while encoding or waiting for input queue capacity.
+        drop(records);
         if change
             .as_ref()
             .is_some_and(|change| change.num_rows() > 4096)
@@ -395,8 +395,8 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                 streaming,
                 ..
             } => {
-                let resumed = delivery.checkpoint().clone();
-                self.connector
+                let resumed = self
+                    .connector
                     .as_mut()
                     .ok_or_else(|| B::invalid_state("delivery connector is absent"))?
                     .ack(delivery)

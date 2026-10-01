@@ -59,23 +59,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         .recv_timeout(Duration::from_secs(5))
         .map_err(|_| probe_error("JVM initialization replaced the host Ctrl-C handler"))?;
 
+    verify_delivery_lifecycle(&runtime)?;
+
+    println!(
+        "PASS bundled Debezium public lifecycle and host Ctrl-C handler: {}",
+        bundle.display()
+    );
+    Ok(())
+}
+
+fn verify_delivery_lifecycle(runtime: &DebeziumRuntime) -> Result<(), Box<dyn Error>> {
     let config = ConnectorConfig::new(ENGINE_NAME, CONNECTOR_CLASS)?;
     let mut connector = runtime.start(config, None)?;
 
     let (checkpoint, records) = {
-        let delivery = required_delivery(&mut connector)?;
+        let mut delivery = required_delivery(&mut connector)?;
         verify_fixture_record(&delivery, 1)?;
+        let taken = take_records(&mut delivery)?;
         require(
             connector.poll(Duration::ZERO).is_err(),
-            "live Delivery allowed a second poll",
+            "drained live Delivery allowed a second poll",
         )?;
         let checkpoint = delivery.checkpoint().as_bytes().to_vec();
         require(!checkpoint.is_empty(), "delivery checkpoint is empty")?;
-        let records = snapshot(delivery.records());
+        let records = snapshot(&taken);
+        drop(taken);
         (checkpoint, records)
     };
 
-    let repeated = required_delivery(&mut connector)?;
+    let mut repeated = required_delivery(&mut connector)?;
     verify_fixture_record(&repeated, 1)?;
     require(
         repeated.checkpoint().as_bytes() == checkpoint,
@@ -85,35 +97,66 @@ fn main() -> Result<(), Box<dyn Error>> {
         snapshot(repeated.records()) == records,
         "dropping a delivery changed its repeated records",
     )?;
+    drop(take_records(&mut repeated)?);
     connector.stop(STOP_TIMEOUT)?;
     require(
-        connector.ack(repeated).is_err(),
-        "stop did not invalidate the outstanding capability",
+        connector
+            .ack(repeated)
+            .is_err_and(|error| error.kind() == ErrorKind::Protocol),
+        "invalidated capability was not rejected before stopped-connector access",
     )?;
 
     let checkpoint = Checkpoint::from_bytes(checkpoint)?;
     let config = ConnectorConfig::new(ENGINE_NAME, CONNECTOR_CLASS)?;
     let mut restored = runtime.start(config, Some(&checkpoint))?;
-    let witness = required_delivery(&mut restored)?;
+    let mut witness = required_delivery(&mut restored)?;
     verify_fixture_record(&witness, 2)?;
     require(
         witness.checkpoint().as_bytes() != checkpoint.as_bytes(),
         "checkpoint restore witness did not advance the checkpoint",
     )?;
+    drop(take_records(&mut witness)?);
     require(
-        connector.ack(witness).is_err(),
-        "another Connector accepted a foreign capability",
+        connector
+            .ack(witness)
+            .is_err_and(|error| error.kind() == ErrorKind::Protocol),
+        "foreign capability was not rejected before stopped-connector access",
     )?;
-    let witness = required_delivery(&mut restored)?;
+    let mut witness = required_delivery(&mut restored)?;
     verify_fixture_record(&witness, 2)?;
-    restored.ack(witness)?;
+    let expected_checkpoint = witness.checkpoint().as_bytes().to_vec();
+    let checkpoint_buffer = witness.checkpoint().as_bytes().as_ptr();
+    drop(take_records(&mut witness)?);
+    require(
+        restored.poll(Duration::ZERO).is_err(),
+        "dropping taken records released the original ACK capability",
+    )?;
+    let acknowledged = restored.ack(witness)?;
+    require(
+        acknowledged.as_bytes() == expected_checkpoint,
+        "ACK returned a different checkpoint",
+    )?;
+    require(
+        acknowledged.as_bytes().as_ptr() == checkpoint_buffer,
+        "ACK copied the checkpoint buffer",
+    )?;
     restored.stop(STOP_TIMEOUT)?;
 
-    println!(
-        "PASS bundled Debezium public lifecycle and host Ctrl-C handler: {}",
-        bundle.display()
-    );
     Ok(())
+}
+
+fn take_records(delivery: &mut Delivery) -> Result<Box<[Record]>, Box<dyn Error>> {
+    let original = delivery.records().as_ptr();
+    let records = delivery.take_records();
+    require(
+        records.as_ptr() == original,
+        "taking records copied their allocation",
+    )?;
+    require(
+        delivery.records().is_empty() && delivery.take_records().is_empty(),
+        "taking records did not empty the delivery",
+    )?;
+    Ok(records)
 }
 
 fn verify_runtime_open(bundle: &Path) -> Result<DebeziumRuntime, Box<dyn Error>> {
