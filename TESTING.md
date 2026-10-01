@@ -136,7 +136,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 | `equi_join` | Operation 自有 Criterion：纯等值 Inner/Semi/Full Outer 对照，residual 0/50/100% 选择率、Semi 同行 multiplicity 稳定快路径及 Semi/Full Outer partial transition；两个完整输入 的全部分页 step 与同步 commit，fixture、seed 和结果校验不计时 |
 | `equi_join_resources` | Operation 自有进程隔离 runner：同一动态 residual 的 0/50/100% 选择率、宽行、128 KiB 单候选、分页边界、大 fanout、whole-input、32 个计算 key 的整批准备，以及窄/宽 FullOuter match-count 状态；分别输出 Rust allocator heap、Arrow array memory 和持久逻辑状态证据，RSS 明示 unavailable |
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，高 multiplicity/有限容量 churn，以及单个大 unit-weight entry 的多页 drain。常规 case 计时完整 admission、Prepared 持久化、sync、deliver 和 settle；恢复 case 计时 reopen/bind 与首次 drain，包含完整 buffer 校验及首批 delivery/settlement。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
-| `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正、Backward 且允许 exact 的查找与历史修正；每次计时包含一对使关系回到初始态的完整输入、全部分页 step 和同步 commit，fixture、seed 与结果校验不计时 |
+| `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正，以及宽 RHS winner 的历史重匹配；每次计时包含一对使关系回到初始态的完整输入、全部分页 step、预算不足后的确定性减半重试和同步 commit，fixture、seed 与结果校验不计时 |
 | `asof_join_resources` | Operation 自有进程隔离 runner：历史 lookup、RHS 历史修正、空影响区间和 NULL-order left；记录 Rust allocator heap、输出行数/正负事件、页数与重试数；关系 oracle 归 correctness |
 | `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除 |
 | `flow_lifecycle` | Criterion |

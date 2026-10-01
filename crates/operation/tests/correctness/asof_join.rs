@@ -653,6 +653,73 @@ fn payload_event(schema: &SchemaRef, at: i64, id: i64, payload: &str) -> Change 
 }
 
 #[test]
+fn shared_winners_still_admit_every_output_reconstruction() {
+    let (_root, schema, operation, mut transactions) =
+        payload_fixture(AsOfDirection::Backward { allow_exact: true });
+    let old_payload = "o".repeat(64 * 1024);
+    let new_payload = "n".repeat(64 * 1024);
+    let old = payload_event(&schema, 10, 0, &old_payload);
+    for (port, event) in std::iter::once((1, old))
+        .chain((0..16).map(|id| (0, payload_event(&schema, 20, id, "left"))))
+    {
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port,
+                    change: &event,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(1, 4 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        transaction.commit().unwrap();
+    }
+    let replacement = payload_event(&schema, 15, 1, &new_payload);
+    {
+        let transaction = transactions.begin();
+        let error = operation
+            .step(
+                OperationInput {
+                    port: 1,
+                    change: &replacement,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(16, 4 * 1024 * 1024),
+            )
+            .unwrap_err();
+        assert!(error.is::<dogpaddle_operation::operation::BudgetExceeded>());
+    }
+    let transaction = transactions.begin();
+    let step = operation
+        .step(
+            OperationInput {
+                port: 1,
+                change: &replacement,
+            },
+            &operation.initial_resume(),
+            transaction.access(),
+            &mut StepBudget::new(1, 4 * 1024 * 1024),
+        )
+        .unwrap();
+    assert!(matches!(step.progress, Progress::More(_)));
+    let output = step.output.unwrap();
+    assert_eq!(output.diffs().values().as_ref(), &[-1, 1]);
+    let payloads = output
+        .records()
+        .column(5)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert_eq!(payloads.value(0), old_payload);
+    assert_eq!(payloads.value(1), new_payload);
+    transaction.commit().unwrap();
+}
+
+#[test]
 fn continued_right_correction_validates_its_cursor_with_the_shared_byte_budget() {
     let (root, schema, operation, mut transactions) =
         payload_fixture(AsOfDirection::Backward { allow_exact: true });

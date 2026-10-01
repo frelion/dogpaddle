@@ -55,6 +55,7 @@ outer null correction 与对应 pair 共同占一个 head work item，即使该�
 帧的 DFS 顺序保证当前输入处理完前对侧不被后续事件改变。
 
 晚期负权重、residual、codec 或 output diff overflow 只回滚当前页，先前提交页与帧保留。
+候选扫描或嵌套行解码的预算拒绝通过标准错误 source 链保留 `BudgetExceeded`，调用者因此能回滚并缩小同一页；不能将包装后的预算错误当作语义失败。
 每次页事务后销毁运行实例，再从 Definition、Store 和 Resume 重构，必须得到相同下一页。
 
 ## AsOfJoin
@@ -78,6 +79,7 @@ nearest、tolerance、lexicographic order、residual、tie-break、NotDistinct�
 影响区间按严格相邻 RHS 时刻定义。Backward inclusive 为 `[t,next)`，strict 为 `(t,next]`；
 Forward inclusive 为 `(prev,t]`，strict 为 `[prev,t)`，不存在邻居时该端延伸到 partition 边界。
 一页按此区间扫描多个 left；所有 left 共享该事件固定的 before/after winner，不逐 left 重扫整个 RHS history。
+before/after winner 的 canonical 值每页各解码一次，每个 left 解码一次供负正输出使用；每条输出仍保留原有的嵌套值与 Arrow 重建准入，不因复用解码而免去复制预算。
 每个 left 的 `-old,+new` 是同一修正原子，至少一次预算扣账；空区间和无输出也前进。
 
 状态与 output/Resume 同事务；晚页歧义、权重或 diff overflow 保留早页和失败帧。

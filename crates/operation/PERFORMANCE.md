@@ -157,3 +157,51 @@ MySQL 还证明已封口 input 无需 poll/record 即可在一次消费者事务
 唯一 input resource 是开发期 v1 layout 变化，受影响状态必须重建。提前 poll
 streaming 可能更早遇到源错误并 fail-stop，原封口 input/checkpoint 保留；
 具体恢复与容量边界见 [CDC 契约](docs/cdc.md)。
+
+## ASOF 页内 winner 复用：2026-10-01 reference 对照
+
+历史修正的 before/after winner 每页各严格解码一次，每个 left 只解码一次供
+`-old,+new` 使用。复用只减少执行和临时分配；每条输出仍预扣原有的完整嵌套值与
+Arrow 重建费用，Scalar 复制与最终 Arrow 构造没有免账，不靠增加页大小取得收益。
+没有新增持久缓存、输出表示或执行层，索引、Resume 与最后一页 RHS 提交边界不变。
+
+baseline 产品为 `a3dc2dc`，测量快照 `b4cfb68` 只增加相同的 ASOF benchmark
+instrumentation。candidate 为 `35e9662` 加当前 ASOF diff。Apple M5、aarch64
+Darwin 25.6、APFS、Rust 1.96.0、release；顺序执行，无并发 Cargo、容器或归档。
+每个 Criterion case 为 10 samples、100 ms warmup、5 s measurement；包含完整正负
+输入、确定性缩页重试和每页同步 commit，fixture/seed/oracle 在计时外。
+reference 宽 winner case 为 128 个 left 与 64 KiB RHS 字符串。
+
+以下为整轮中位数，单位 ms；变化为 candidate / baseline - 1。
+
+| 场景 | baseline | candidate | 变化 |
+| --- | ---: | ---: | ---: |
+| partitioned_lookup | 3.5538 | 3.2342 | -9.0% |
+| global_partition_lookup | 0.0533 | 0.0521 | -2.3% |
+| right_tail_small_rematch | 0.0712 | 0.0819 | +15.0% |
+| right_historical_full_rematch | 0.3241 | 0.1932 | -40.4% |
+| right_wide_winner_rematch | 63.0524 | 47.8234 | -24.2% |
+
+宽 winner 中位数 95% CI 为旧 `[61.6964,64.8942]`、新 `[46.0040,51.0359]` ms。
+小尾部场景为旧 `[0.0705,0.0721]`、新 `[0.0690,0.1043]` ms，candidate 波动较大；
+保留其较慢的中位数，不从区间重叠宣称全面无回归。
+
+独立进程 `asof_join_resources` 的 4096-left 历史修正，页数均 16、输出均 8192、
+失败重试均 0，持久索引 entry 数和编码逻辑字节相同。Rust allocator 分配次数由
+119,289 降为 45,249（-62.1%），累计分配字节由 13,948,191 降为 9,574,155
+（-31.4%）；peak 为 238,963 → 239,044 bytes，基本持平。单 lookup 累计分配不变，
+peak 为 3113 → 3213 bytes；空区间和 NULL-order 场景各项相同。
+这些数字排除 fixture/input/seed 与 RocksDB native heap，未测 RSS，不能解释为
+进程内存下降 31.4%。
+
+原始证据位于 `/tmp/dogpaddle-arrow-join-performance/`：Criterion baseline 使用
+`before-retried/dogpaddle-asof-join-run-8K1qsB`，candidate 使用
+`after/dogpaddle-asof-join-run-AjzmE0`；resources 使用
+`before/dogpaddle-asof-join-resources-run-AQT7g5` 与
+`after/dogpaddle-asof-join-resources-run-FvfJOR`。初次未支持缩页的宽 winner 失败记录
+保留于 `before-asof.log`，不混入此表。
+
+原 Arrow JoinOutput 原型因净增代码、宽行最小原子退化与嵌套 List scratch 漏账而
+淘汰，备份位于 `/tmp/dogpaddle-arrow-join-rejected`；其测试不作为本候选证据。
+当前候选经过三份独立完整 diff 审查，修复重复输出的重建准入缺口，并以公共宽 winner
+缩页与输出 payload 证据防止再次漏账；`cargo xtask check` 和工作区构建通过。

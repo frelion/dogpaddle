@@ -58,6 +58,7 @@ struct Winner {
     key: Vec<u8>,
     row: Vec<u8>,
 }
+#[derive(Default)]
 struct Candidates {
     winner: Option<Winner>,
     ambiguous: bool,
@@ -353,10 +354,7 @@ impl AsOfJoinOperation {
         access: TransactionAccess<'_>,
     ) -> Result<Candidates, OperationError> {
         if !left.matchable {
-            return Ok(Candidates {
-                winner: None,
-                ambiguous: false,
-            });
+            return Ok(Candidates::default());
         }
         let mut range = Self::range_for_partition(&left.partition);
         let prefix = order_prefix(&left.partition, &left.order);
@@ -393,10 +391,7 @@ impl AsOfJoinOperation {
         }
         let mut entries = page.entries.into_iter();
         let Some(first) = entries.next() else {
-            return Ok(Candidates {
-                winner: None,
-                ambiguous: false,
-            });
+            return Ok(Candidates::default());
         };
         let parsed = parse_row_key(&first.0)?;
         let ambiguous = entries
@@ -412,37 +407,16 @@ impl AsOfJoinOperation {
             ambiguous,
         })
     }
-    fn output(
+    fn winner_values(
         &self,
-        left: &PreparedRow,
         winner: Option<&Winner>,
-        difference: i64,
-        output: &mut Output,
         budget: &mut StepBudget,
-    ) -> Result<(), OperationError> {
-        let left = parse_row_key(&left.key)?;
-        budget.charge(
-            left.row
-                .len()
-                .saturating_add(winner.map_or(0, |winner| winner.row.len()))
-                .saturating_add(
-                    self.layout
-                        .output_schema
-                        .fields()
-                        .len()
-                        .saturating_mul(std::mem::size_of::<ScalarValue>()),
-                )
-                .saturating_add(8),
-        )?;
-        let left = decode_canonical_row_bounded(&self.layout.input_schemas[0], &left.row, budget)?;
-        let right = winner
+    ) -> Result<Option<Vec<ScalarValue>>, OperationError> {
+        winner
             .map(|winner| {
                 decode_canonical_row_bounded(&self.layout.input_schemas[1], &winner.row, budget)
             })
-            .transpose()?
-            .unwrap_or_else(|| self.layout.right_nulls.clone());
-        output.push(&left, &right, difference);
-        Ok(())
+            .transpose()
     }
     fn apply_weight(
         &self,
@@ -555,45 +529,49 @@ impl AsOfJoinOperation {
                 budget,
                 access,
             )?;
-            let replacement = if old_bucket.winner.is_none() || new_bucket.winner.is_none() {
-                if let Some(order) = replacement_order {
-                    self.bucket(&right.partition, &order, None, budget, access)?
-                } else {
-                    Candidates {
-                        winner: None,
-                        ambiguous: false,
-                    }
-                }
+            let replacement = if (old_bucket.winner.is_none() || new_bucket.winner.is_none())
+                && let Some(order) = replacement_order
+            {
+                self.bucket(&right.partition, &order, None, budget, access)?
             } else {
-                Candidates {
-                    winner: None,
-                    ambiguous: false,
-                }
+                Candidates::default()
             };
-            let old = if old_bucket.winner.is_some() {
-                old_bucket.checked()?
-            } else {
-                replacement.checked()?
-            };
-            let new = if new_bucket.winner.is_some() {
-                new_bucket.checked()?
-            } else {
-                replacement.checked()?
-            };
+            let replacement = replacement.checked()?;
+            let old = old_bucket.checked()?.or(replacement);
+            let new = new_bucket.checked()?.or(replacement);
             if old.map(|winner| &winner.key) != new.map(|winner| &winner.key) {
+                let before_decode = budget.remaining_bytes();
+                let old_values = self.winner_values(old, budget)?;
+                let new_values = self.winner_values(new, budget)?;
+                // Every output still reconstructs Arrow; only decoding is shared.
+                let winner_work = before_decode - budget.remaining_bytes();
+                budget.charge(winner_work.saturating_mul(page.entries.len() - 1))?;
                 for entry in &page.entries {
                     let parsed = parse_row_key(&entry.0)?;
-                    let left = PreparedRow {
-                        key: entry.0.clone(),
-                        partition: parsed.partition,
-                        order: parsed.order,
-                        matchable: true,
-                        difference: 1,
-                    };
+                    let before_decode = budget.remaining_bytes();
+                    let left = decode_canonical_row_bounded(
+                        &self.layout.input_schemas[0],
+                        &parsed.row,
+                        budget,
+                    )?;
+                    budget.charge(before_decode - budget.remaining_bytes())?;
                     let positive = i64::try_from(entry.1.get())
                         .map_err(|_| AsOfJoinError::OutputDifferenceOverflow)?;
-                    self.output(&left, old, -positive, output, budget)?;
-                    self.output(&left, new, positive, output, budget)?;
+                    for (winner, values, difference) in [
+                        (old, old_values.as_deref(), -positive),
+                        (new, new_values.as_deref(), positive),
+                    ] {
+                        output.push(
+                            &left,
+                            values.unwrap_or(&self.layout.right_nulls),
+                            difference,
+                            parsed
+                                .row
+                                .len()
+                                .saturating_add(winner.map_or(0, |winner| winner.row.len())),
+                            budget,
+                        )?;
+                    }
                 }
             }
         }
@@ -683,7 +661,24 @@ impl PagedOperation for AsOfJoinOperation {
                     })?;
             if input.port == 0 {
                 let winner = self.select(row, budget, access)?;
-                self.output(row, winner.checked()?, row.difference, &mut output, budget)?;
+                let winner = winner.checked()?;
+                let values = self.winner_values(winner, budget)?;
+                let parsed = parse_row_key(&row.key)?;
+                let left = decode_canonical_row_bounded(
+                    &self.layout.input_schemas[0],
+                    &parsed.row,
+                    budget,
+                )?;
+                output.push(
+                    &left,
+                    values.as_deref().unwrap_or(&self.layout.right_nulls),
+                    row.difference,
+                    parsed
+                        .row
+                        .len()
+                        .saturating_add(winner.map_or(0, |winner| winner.row.len())),
+                    budget,
+                )?;
                 self.apply_weight(0, row, after, budget, access)?;
                 budget.consume_head(1)?;
             } else if !self.right_page(
@@ -722,11 +717,25 @@ impl Output {
             differences: Vec::new(),
         }
     }
-    fn push(&mut self, left: &[ScalarValue], right: &[ScalarValue], diff: i64) {
+    fn push(
+        &mut self,
+        left: &[ScalarValue],
+        right: &[ScalarValue],
+        diff: i64,
+        encoded_bytes: usize,
+        budget: &mut StepBudget,
+    ) -> Result<(), OperationError> {
+        let row_bytes = self
+            .columns
+            .len()
+            .saturating_mul(std::mem::size_of::<ScalarValue>())
+            .saturating_add(8);
+        budget.charge(encoded_bytes.saturating_add(row_bytes))?;
         for (column, value) in self.columns.iter_mut().zip(left.iter().chain(right)) {
             column.push(value.clone());
         }
         self.differences.push(diff);
+        Ok(())
     }
     fn finish(self, schema: &arrow_schema::SchemaRef) -> Result<Option<Change>, OperationError> {
         if self.differences.is_empty() {

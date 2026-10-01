@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{BenchmarkGroup, Criterion, Throughput, measurement::WallTime};
 use datafusion_expr::col;
@@ -13,7 +13,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource,
     operation::{
-        Operation, OperationInput, Progress, StepBudget,
+        BudgetExceeded, Operation, OperationInput, Progress, StepBudget,
         transform::{AsOfDirection, AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey},
     },
 };
@@ -54,14 +54,12 @@ impl Fixture {
             options.direction,
             equalities,
             AsOfOrderKey::new(col("at"), col("at")),
-            [
-                "left_group",
-                "left_at",
-                "left_value",
-                "right_group",
-                "right_at",
-                "right_value",
-            ],
+            ["left", "right"].into_iter().flat_map(|side| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(move |field| format!("{side}_{}", field.name()))
+            }),
         )
         .expect("define ASOF benchmark");
         let mut setup = StoreSetup::new();
@@ -87,17 +85,23 @@ impl Fixture {
         let mut result = InputResult::default();
         let mut resume = self.operation.initial_resume();
         for _ in 0..1_000_000 {
-            let transaction = self.transactions.begin();
-            let step = self
-                .operation
-                .step(
+            let mut items = 256;
+            let step = loop {
+                let transaction = self.transactions.begin();
+                match self.operation.step(
                     OperationInput { port, change },
                     &resume,
                     transaction.access(),
-                    &mut StepBudget::new(256, 4 * 1024 * 1024),
-                )
-                .expect("apply ASOF benchmark page");
-            transaction.commit().expect("commit ASOF benchmark page");
+                    &mut StepBudget::new(items, 4 * 1024 * 1024),
+                ) {
+                    Ok(step) => {
+                        transaction.commit().expect("commit ASOF benchmark page");
+                        break step;
+                    }
+                    Err(error) if error.is::<BudgetExceeded>() && items > 1 => items /= 2,
+                    Err(error) => panic!("apply ASOF benchmark page: {error}"),
+                }
+            };
             result.turns += 1;
             result.observe(step.output.as_ref());
             match step.progress {
@@ -418,7 +422,7 @@ fn write_context(
                 PerformanceProfile::Smoke => 200,
                 PerformanceProfile::Reference => 5_000,
             },
-            "timed_boundary": "one insert input plus its exact retract input, including every Operation::step page and synchronous transaction commit; the pair restores the initial relation",
+            "timed_boundary": "one insert input plus its exact retract input, including every Operation::step attempt, deterministic item-budget halving from 256 to one on BudgetExceeded, and synchronous successful-page commit; the pair restores the initial relation",
             "throughput_unit": "complete inputs (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
             "runtime_counters": "unavailable: Operation does not expose scan-page or logical read/write-byte counters; workload cardinalities and committed page/output counts are retained instead",
@@ -444,6 +448,14 @@ fn write_context(
                     "corrected_left_rows_per_input": rematch_left_rows,
                     "candidate_shape": "one eligible old version plus future ineligible history forces the full left-by-right correctness path",
                 },
+                "right_wide_winner_rematch": {
+                    "left_rows": wide_workload(profile).0,
+                    "winner_utf8_bytes": wide_workload(profile).1,
+                    "right_versions": 1,
+                    "left_utf8_bytes": 1,
+                    "outputs_per_left_per_input": 2,
+                    "page_budget": "256 items and 4 MiB logical bytes; page count may differ with implementation scratch cost",
+                },
             },
         },
     });
@@ -452,6 +464,70 @@ fn write_context(
         serde_json::to_vec_pretty(&context).expect("encode ASOF context"),
     )
     .expect("write ASOF context");
+}
+
+fn wide_workload(profile: PerformanceProfile) -> (usize, usize) {
+    match profile {
+        PerformanceProfile::Smoke => (16, 4 * 1024),
+        PerformanceProfile::Reference => (128, 64 * 1024),
+    }
+}
+
+fn wide_change(schema: &SchemaRef, orders: Vec<i64>, payload: &str, difference: i64) -> Change {
+    let rows = orders.len();
+    let records = RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(UInt64Array::from(vec![7; rows])),
+            Arc::new(Int64Array::from(orders)),
+            Arc::new(Int64Array::from(vec![0; rows])),
+            Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                payload, rows,
+            ))),
+        ],
+    )
+    .expect("build wide ASOF benchmark records");
+    Change::try_new(records, Int64Array::from(vec![difference; rows]))
+        .expect("build wide ASOF benchmark Change")
+}
+
+fn benchmark_wide_rematch(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    root: &RunRoot,
+    profile: PerformanceProfile,
+) {
+    let (left_rows, payload_bytes) = wide_workload(profile);
+    let mut fields = schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new("payload", DataType::Utf8, false)));
+    let schema = Arc::new(Schema::new(fields));
+    let mut fixture = Fixture::new(
+        root,
+        &schema,
+        DefinitionOptions {
+            direction: AsOfDirection::Backward { allow_exact: true },
+            partitioned: true,
+        },
+    );
+    fixture.apply(
+        1,
+        &wide_change(&schema, vec![0], &"o".repeat(payload_bytes), 1),
+    );
+    let orders = (1..=left_rows)
+        .map(|value| i64::try_from(value).expect("wide ASOF ordinal fits i64"))
+        .collect();
+    fixture.apply(0, &wide_change(&schema, orders, "l", 1));
+    let payload = "n".repeat(payload_bytes);
+    let inserted = wide_change(&schema, vec![1], &payload, 1);
+    let retracted = wide_change(&schema, vec![1], &payload, -1);
+    benchmark_pair(
+        group,
+        "right_wide_winner_rematch",
+        &mut fixture,
+        1,
+        &inserted,
+        &retracted,
+        [(left_rows, left_rows), (left_rows, left_rows)],
+    );
 }
 
 fn main() {
@@ -493,6 +569,7 @@ fn main() {
         rematch_left_rows,
         rematch_right_versions,
     );
+    benchmark_wide_rematch(&mut group, &root, profile);
     group.finish();
     criterion.final_summary();
 }
