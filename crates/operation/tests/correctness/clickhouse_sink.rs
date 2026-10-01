@@ -5,7 +5,7 @@ use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::sink::{
         ClickHouseSinkConfig, ClickHouseSinkDefinition, ClickHouseSinkError,
-        ClickHouseSinkSchemaError, ClickHouseTargetSpec,
+        ClickHouseSinkSchemaError,
     },
 };
 use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
@@ -22,13 +22,9 @@ fn construct_checked(
 const DATABASE_UUID: &str = "12345678-1234-1234-1234-123456789abc";
 const PASSWORD: &str = "do-not-persist-clickhouse-password";
 
-fn target() -> ClickHouseTargetSpec {
-    ClickHouseTargetSpec::try_new("orders_sink", "shop", "orders_materialized", DATABASE_UUID)
-        .unwrap()
-}
-
 fn definition() -> ClickHouseSinkDefinition {
-    ClickHouseSinkDefinition::try_new(target()).unwrap()
+    ClickHouseSinkDefinition::try_new("orders_sink", "shop", "orders_materialized", DATABASE_UUID)
+        .unwrap()
 }
 
 fn schema() -> SchemaRef {
@@ -127,7 +123,7 @@ fn clickhouse_sink_validates_schema_target_and_decoded_materialization_offline()
         Some(ClickHouseSinkSchemaError::InvalidFieldName { field: 0, name }) if name.len() == 256
     ));
     assert!(matches!(
-        ClickHouseTargetSpec::try_new("Bad-ID", "shop", "output", DATABASE_UUID),
+        ClickHouseSinkDefinition::try_new("Bad-ID", "shop", "output", DATABASE_UUID),
         Err(ClickHouseSinkError::InvalidSpec { .. })
     ));
 

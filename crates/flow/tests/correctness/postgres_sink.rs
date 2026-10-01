@@ -5,9 +5,7 @@ use dogpaddle_operation::{
     OperationBindError, OperationSetupError, col,
     operation::{
         scan::SequenceScanDefinition,
-        sink::{
-            PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkSchemaError, PostgresTargetSpec,
-        },
+        sink::{PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkSchemaError},
         transform::SelectDefinition,
     },
 };
@@ -23,9 +21,7 @@ fn config() -> PostgresSinkConfig {
 }
 
 fn definition() -> PostgresSinkDefinition {
-    let target =
-        PostgresTargetSpec::try_new("sink_1", "database", "public", "events", "1", 2).unwrap();
-    PostgresSinkDefinition::try_new(target).unwrap()
+    PostgresSinkDefinition::try_new("sink_1", "database", "public", "events", "1", 2).unwrap()
 }
 
 fn factory(path: &Path) -> FlowFactory {

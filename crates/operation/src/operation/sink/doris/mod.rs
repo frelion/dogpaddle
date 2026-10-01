@@ -7,7 +7,7 @@ mod row;
 mod schema;
 mod target;
 
-pub use config::{DorisSinkConfig, DorisTargetSpec};
+pub use config::DorisSinkConfig;
 pub use definition::DorisSinkDefinition;
 pub use error::{DorisSinkError, DorisSinkSchemaError};
 

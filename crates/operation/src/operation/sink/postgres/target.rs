@@ -21,7 +21,8 @@ use crate::operation::{
 };
 
 use super::{
-    config::{PgClient, PostgresSinkConfig, PostgresTargetSpec, bounded_until, require_absent},
+    config::{PgClient, PostgresSinkConfig, bounded_until, require_absent},
+    definition::PostgresSinkDefinition,
     error::{PostgresSinkError, database_error, invalid_batch},
     row::{EncodedRow, HASH_LENGTH, PostgresRowCodec, PostgresValue},
     schema::{self, TECHNICAL_HASH, TECHNICAL_ID},
@@ -30,7 +31,7 @@ use super::{
 /// Database-specific SQL and connection. Durable work belongs to the shared sink.
 pub(super) struct PostgresTarget {
     config: PostgresSinkConfig,
-    spec: PostgresTargetSpec,
+    spec: PostgresSinkDefinition,
     row_codec: PostgresRowCodec,
     sql: SqlPlan,
     client: Option<PgClient>,
@@ -40,7 +41,7 @@ pub(super) struct PostgresTarget {
 impl PostgresTarget {
     pub(super) fn new_bound(
         config: PostgresSinkConfig,
-        spec: PostgresTargetSpec,
+        spec: PostgresSinkDefinition,
         codec: PostgresRowCodec,
     ) -> Self {
         let sql = SqlPlan::new(&spec, codec.schema());
@@ -59,7 +60,7 @@ impl PostgresTarget {
         action: impl FnOnce(
             &Runtime,
             &mut Client,
-            &PostgresTargetSpec,
+            &PostgresSinkDefinition,
             &SqlPlan,
             &PostgresRowCodec,
             &mut bool,
@@ -384,7 +385,7 @@ pub(super) struct SqlPlan {
 
 impl SqlPlan {
     #[allow(clippy::too_many_lines)]
-    pub(super) fn new(spec: &PostgresTargetSpec, schema: &Schema) -> Self {
+    pub(super) fn new(spec: &PostgresSinkDefinition, schema: &Schema) -> Self {
         let target = qualified(spec.schema(), spec.table());
         let hash_index_name = spec.hash_index();
         let hash_index = qualified(spec.schema(), &hash_index_name);
@@ -583,7 +584,7 @@ fn write_values(sql: &mut String, rows: usize, types: &[&str], ordinal: bool) {
 
 async fn verify_identity(
     client: &Client,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
 ) -> Result<(), PostgresSinkError> {
     let row = client
         .query_one(
@@ -613,7 +614,7 @@ async fn verify_identity(
 
 async fn verify_once(
     client: &impl GenericClient,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
     sql: &SqlPlan,
     verified: &mut bool,
 ) -> Result<(), PostgresSinkError> {
@@ -626,7 +627,7 @@ async fn verify_once(
 
 async fn require_owned_layout(
     client: &impl GenericClient,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
     sql: &SqlPlan,
 ) -> Result<(), PostgresSinkError> {
     for name in [&sql.table_name, &sql.frontier_name] {
@@ -678,7 +679,7 @@ async fn require_owned_layout(
 
 async fn require_frontier_layout(
     client: &impl GenericClient,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
     sql: &SqlPlan,
 ) -> Result<(), PostgresSinkError> {
     let relation = qualified(spec.schema(), &sql.frontier_name);
@@ -759,7 +760,7 @@ async fn require_frontier_layout(
 
 async fn object_count(
     client: &impl GenericClient,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
 ) -> Result<usize, PostgresSinkError> {
     let names = spec.object_names().to_vec();
     let count: i64 = client

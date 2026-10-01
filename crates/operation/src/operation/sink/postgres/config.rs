@@ -5,15 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls};
 
-use super::error::{PostgresSinkError, database_error, invalid_config, invalid_spec, timeout};
-use crate::operation::sink::is_valid_sink_id;
+use super::{
+    definition::{PostgresSinkDefinition, validate_names},
+    error::{PostgresSinkError, database_error, invalid_config, timeout},
+};
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_IDENTIFIER_BYTES: usize = 63;
 
 pub(super) struct PgClient {
     pub(super) runtime: Runtime,
@@ -103,8 +103,9 @@ impl PostgresSinkConfig {
         Ok(config)
     }
 
-    /// Discovers stable target identity and verifies that every sink-owned
-    /// schema object is absent. The call performs read-only catalog access.
+    /// Returns a pure sink plan with the discovered stable target identity.
+    /// Verifies that every sink-owned schema object is absent through read-only
+    /// catalog access.
     ///
     /// # Errors
     ///
@@ -115,8 +116,8 @@ impl PostgresSinkConfig {
         sink_id: impl Into<String>,
         schema: impl Into<String>,
         table: impl Into<String>,
-    ) -> Result<PostgresTargetSpec, PostgresSinkError> {
-        let mut spec = PostgresTargetSpec {
+    ) -> Result<PostgresSinkDefinition, PostgresSinkError> {
+        let mut spec = PostgresSinkDefinition {
             sink_id: sink_id.into(),
             database: self.database.clone(),
             schema: schema.into(),
@@ -159,7 +160,7 @@ impl PostgresSinkConfig {
             if !identity.get::<_, bool>(4) {
                 return Err(PostgresSinkError::UnsupportedServerEncoding);
             }
-            validate_identity(&spec)?;
+            spec.validate()?;
 
             require_absent(&transaction, &spec).await?;
             transaction
@@ -226,7 +227,7 @@ const ABSENCE_QUERY: &str = "SELECT \
 
 pub(super) async fn require_absent(
     client: &impl GenericClient,
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
 ) -> Result<(), PostgresSinkError> {
     let names = spec.object_names().to_vec();
     let types = [spec.table().to_owned(), spec.frontier_table()];
@@ -243,7 +244,7 @@ pub(super) async fn require_absent(
 }
 
 pub(super) fn validate_absence_snapshot(
-    spec: &PostgresTargetSpec,
+    spec: &PostgresSinkDefinition,
     schema_exists: bool,
     class_conflict: Option<String>,
     row_type_conflict: Option<String>,
@@ -273,165 +274,4 @@ impl fmt::Debug for PostgresSinkConfig {
             .field("password", &"[redacted]")
             .finish()
     }
-}
-
-/// Non-sensitive, persistent identity of a sink-owned `PostgreSQL` target.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PostgresTargetSpec {
-    sink_id: String,
-    database: String,
-    schema: String,
-    table: String,
-    system_identifier: String,
-    database_oid: u32,
-}
-
-impl PostgresTargetSpec {
-    /// Validates a manually assembled target identity.
-    ///
-    /// Production callers normally obtain this value through
-    /// [`PostgresSinkConfig::discover_target`]. Constructing a value manually
-    /// does not adopt or share objects owned by another Flow.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed identifiers and zero cluster/database identities.
-    pub fn try_new(
-        sink_id: impl Into<String>,
-        database: impl Into<String>,
-        schema: impl Into<String>,
-        table: impl Into<String>,
-        system_identifier: impl Into<String>,
-        database_oid: u32,
-    ) -> Result<Self, PostgresSinkError> {
-        let spec = Self {
-            sink_id: sink_id.into(),
-            database: database.into(),
-            schema: schema.into(),
-            table: table.into(),
-            system_identifier: system_identifier.into(),
-            database_oid,
-        };
-        spec.validate()?;
-        Ok(spec)
-    }
-
-    /// Validates all persistent fields after decoding.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed identifiers and zero cluster/database identities.
-    pub fn validate(&self) -> Result<(), PostgresSinkError> {
-        validate_names(self)?;
-        validate_identity(self)
-    }
-
-    /// Returns the stable identity of this sink instance.
-    #[must_use]
-    pub fn sink_id(&self) -> &str {
-        &self.sink_id
-    }
-
-    /// Returns the `PostgreSQL` database name.
-    #[must_use]
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    /// Returns the exact quoted target schema component.
-    #[must_use]
-    pub fn schema(&self) -> &str {
-        &self.schema
-    }
-
-    /// Returns the exact quoted target table component.
-    #[must_use]
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
-    /// Returns the `PostgreSQL` cluster system identifier as decimal text.
-    #[must_use]
-    pub fn system_identifier(&self) -> &str {
-        &self.system_identifier
-    }
-
-    /// Returns the database OID captured during discovery.
-    #[must_use]
-    pub const fn database_oid(&self) -> u32 {
-        self.database_oid
-    }
-
-    pub(super) fn hash_index(&self) -> String {
-        format!("$dogpaddle.hash.{}", self.sink_id)
-    }
-
-    pub(super) fn frontier_table(&self) -> String {
-        format!("$dogpaddle.frontier.{}", self.sink_id)
-    }
-
-    pub(super) fn frontier_pk(&self) -> String {
-        format!("$dogpaddle.frontier_pk.{}", self.sink_id)
-    }
-
-    pub(super) fn object_names(&self) -> [String; 5] {
-        [
-            self.table.clone(),
-            self.hash_index(),
-            format!("$dogpaddle.pk.{}", self.sink_id),
-            self.frontier_table(),
-            self.frontier_pk(),
-        ]
-    }
-}
-
-fn validate_names(spec: &PostgresTargetSpec) -> Result<(), PostgresSinkError> {
-    if !is_valid_sink_id(&spec.sink_id) {
-        return Err(invalid_spec(
-            "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
-        ));
-    }
-    for (label, value) in [
-        ("database", spec.database.as_str()),
-        ("schema", spec.schema.as_str()),
-        ("table", spec.table.as_str()),
-    ] {
-        if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.contains('\0') {
-            return Err(invalid_spec(format!(
-                "{label} must be a nonempty PostgreSQL identifier of at most 63 bytes"
-            )));
-        }
-    }
-    for name in spec.object_names() {
-        if name.len() > MAX_IDENTIFIER_BYTES {
-            return Err(invalid_spec("derived sink object name exceeds 63 bytes"));
-        }
-    }
-    if spec
-        .object_names()
-        .into_iter()
-        .skip(1)
-        .any(|name| name == spec.table)
-    {
-        return Err(invalid_spec(
-            "target table name collides with a sink-owned object",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_identity(spec: &PostgresTargetSpec) -> Result<(), PostgresSinkError> {
-    if spec
-        .system_identifier
-        .parse::<u64>()
-        .ok()
-        .is_none_or(|identifier| identifier == 0)
-        || spec.database_oid == 0
-    {
-        return Err(invalid_spec(
-            "cluster system identifier and database OID must be nonzero",
-        ));
-    }
-    Ok(())
 }

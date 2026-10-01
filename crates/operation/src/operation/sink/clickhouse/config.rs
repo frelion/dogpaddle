@@ -5,15 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
 use ureq::Agent;
 use url::Url;
 
-use super::error::{ClickHouseSinkError, database, invalid_config, invalid_response, invalid_spec};
-use crate::operation::sink::is_valid_sink_id;
+use super::{
+    definition::ClickHouseSinkDefinition,
+    error::{ClickHouseSinkError, database, invalid_config, invalid_response},
+};
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_IDENTIFIER_BYTES: usize = 255;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Ephemeral HTTP credentials and endpoint for one `ClickHouse` sink.
@@ -72,7 +72,8 @@ impl ClickHouseSinkConfig {
         })
     }
 
-    /// Discovers the Atomic database UUID and rejects existing target objects.
+    /// Returns a pure sink plan with the discovered Atomic database UUID.
+    /// Rejects existing target objects before returning the plan.
     ///
     /// # Errors
     ///
@@ -82,8 +83,8 @@ impl ClickHouseSinkConfig {
         &self,
         sink_id: impl Into<String>,
         table: impl Into<String>,
-    ) -> Result<ClickHouseTargetSpec, ClickHouseSinkError> {
-        let mut spec = ClickHouseTargetSpec {
+    ) -> Result<ClickHouseSinkDefinition, ClickHouseSinkError> {
+        let mut spec = ClickHouseSinkDefinition {
             sink_id: sink_id.into(),
             database: self.database.clone(),
             table: table.into(),
@@ -185,123 +186,9 @@ impl fmt::Debug for ClickHouseSinkConfig {
     }
 }
 
-/// Non-sensitive persistent identity of a sink-owned `ClickHouse` target.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClickHouseTargetSpec {
-    sink_id: String,
-    database: String,
-    table: String,
-    database_uuid: String,
-}
-
-impl ClickHouseTargetSpec {
-    /// Builds and validates a target specification.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid names or a zero/malformed database UUID.
-    pub fn try_new(
-        sink_id: impl Into<String>,
-        database: impl Into<String>,
-        table: impl Into<String>,
-        database_uuid: impl Into<String>,
-    ) -> Result<Self, ClickHouseSinkError> {
-        let spec = Self {
-            sink_id: sink_id.into(),
-            database: database.into(),
-            table: table.into(),
-            database_uuid: database_uuid.into(),
-        };
-        spec.validate()?;
-        Ok(spec)
-    }
-
-    /// Validates decoded persistent fields.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid names or a zero/malformed database UUID.
-    pub fn validate(&self) -> Result<(), ClickHouseSinkError> {
-        self.validate_names()?;
-        if self.database_uuid.len() != 36
-            || !self.database_uuid.bytes().enumerate().all(|(index, byte)| {
-                if matches!(index, 8 | 13 | 18 | 23) {
-                    byte == b'-'
-                } else {
-                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                }
-            })
-            || self.database_uuid == "00000000-0000-0000-0000-000000000000"
-        {
-            return Err(invalid_spec(
-                "database UUID must be a nonzero canonical UUID",
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_names(&self) -> Result<(), ClickHouseSinkError> {
-        if !is_valid_sink_id(&self.sink_id) {
-            return Err(invalid_spec(
-                "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
-            ));
-        }
-        for (label, value) in [("database", &self.database), ("table", &self.table)] {
-            if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.contains('\0') {
-                return Err(invalid_spec(format!(
-                    "{label} must be a nonempty ClickHouse identifier of at most 255 bytes"
-                )));
-            }
-        }
-        if self.state_table().len() > MAX_IDENTIFIER_BYTES {
-            return Err(invalid_spec("derived state-table name exceeds 255 bytes"));
-        }
-        if self.table == self.state_table() {
-            return Err(invalid_spec("target view collides with the state table"));
-        }
-        Ok(())
-    }
-
-    /// Sink identity.
-    #[must_use]
-    pub fn sink_id(&self) -> &str {
-        &self.sink_id
-    }
-
-    /// Database name.
-    #[must_use]
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    /// Exposed target view.
-    #[must_use]
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
-    /// Atomic database UUID captured during discovery.
-    #[must_use]
-    pub fn database_uuid(&self) -> &str {
-        &self.database_uuid
-    }
-
-    pub(super) fn state_table(&self) -> String {
-        format!("$dogpaddle.state.{}", self.sink_id)
-    }
-
-    pub(super) fn marker(&self) -> String {
-        format!(
-            "dogpaddle.clickhouse-sink.occurrence-version.v1:{}",
-            self.sink_id
-        )
-    }
-}
-
 pub(super) fn require_absent(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
     let sql = format!(

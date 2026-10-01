@@ -11,15 +11,11 @@ pub(crate) mod sqlite;
 
 pub use clickhouse::{
     ClickHouseSinkConfig, ClickHouseSinkDefinition, ClickHouseSinkError, ClickHouseSinkSchemaError,
-    ClickHouseTargetSpec,
 };
 pub use discard::DiscardDefinition;
-pub use doris::{
-    DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
-};
+pub use doris::{DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError};
 pub use postgres::{
     PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError, PostgresSinkSchemaError,
-    PostgresTargetSpec,
 };
 pub use sqlite::{
     SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkError, SqliteSinkSchemaError,

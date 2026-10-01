@@ -11,19 +11,13 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use mysql::Value;
 
-use super::{
-    config::{DorisSinkConfig, DorisTargetSpec},
-    definition::DorisSinkDefinition,
-    row::DorisRowCodec,
-};
+use super::{config::DorisSinkConfig, definition::DorisSinkDefinition, row::DorisRowCodec};
 use crate::operation::sink::relation::RowError;
 
 #[test]
 fn definition_round_trips_canonically() {
-    let definition = DorisSinkDefinition::try_new(
-        DorisTargetSpec::try_new("sink_1", "analytics", "materialized", 42).unwrap(),
-    )
-    .unwrap();
+    let definition =
+        DorisSinkDefinition::try_new("sink_1", "analytics", "materialized", 42).unwrap();
     let encoded = serde_json::to_vec::<crate::OperationDefinition>(&definition.into()).unwrap();
     let decoded = serde_json::from_slice::<crate::OperationDefinition>(&encoded).unwrap();
     assert_eq!(
@@ -219,14 +213,14 @@ fn row_codec_rejects_out_of_bounds_index() {
 }
 
 #[test]
-fn target_spec_rejects_zero_cluster_identity() {
-    assert!(DorisTargetSpec::try_new("sink", "db", "table", 0).is_err());
+fn definition_rejects_zero_cluster_identity() {
+    assert!(DorisSinkDefinition::try_new("sink", "db", "table", 0).is_err());
 }
 
 #[test]
 fn target_identity_marks_the_event_address_semantics() {
     assert_eq!(
-        DorisTargetSpec::try_new("sink", "db", "table", 1)
+        DorisSinkDefinition::try_new("sink", "db", "table", 1)
             .unwrap()
             .marker(),
         "dogpaddle.doris-sink.occurrence-version.v1:sink"
@@ -234,8 +228,8 @@ fn target_identity_marks_the_event_address_semantics() {
 }
 
 #[test]
-fn target_spec_rejects_case_folded_state_collision() {
-    assert!(DorisTargetSpec::try_new("sink", "db", "$DOGPADDLE.STATE.SINK", 1).is_err());
+fn definition_rejects_case_folded_state_collision() {
+    assert!(DorisSinkDefinition::try_new("sink", "db", "$DOGPADDLE.STATE.SINK", 1).is_err());
 }
 
 #[test]

@@ -3,9 +3,7 @@ use std::{num::NonZeroU32, sync::Arc};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
-    operation::sink::{
-        DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError, DorisTargetSpec,
-    },
+    operation::sink::{DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError},
 };
 use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
@@ -20,12 +18,8 @@ fn construct_checked(
 
 const PASSWORD: &str = "do-not-persist-doris-password";
 
-fn target() -> DorisTargetSpec {
-    DorisTargetSpec::try_new("orders_sink", "shop", "orders_materialized", 42).unwrap()
-}
-
 fn definition() -> DorisSinkDefinition {
-    DorisSinkDefinition::try_new(target()).unwrap()
+    DorisSinkDefinition::try_new("orders_sink", "shop", "orders_materialized", 42).unwrap()
 }
 
 fn schema() -> SchemaRef {
@@ -124,7 +118,7 @@ fn doris_sink_validates_schema_target_and_decoded_materialization_offline() {
         Some(DorisSinkSchemaError::InvalidFieldName { field: 0, name }) if name.len() == 65
     ));
     assert!(matches!(
-        DorisTargetSpec::try_new("Bad-ID", "shop", "output", 42),
+        DorisSinkDefinition::try_new("Bad-ID", "shop", "output", 42),
         Err(DorisSinkError::InvalidSpec { .. })
     ));
 

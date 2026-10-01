@@ -14,16 +14,14 @@ use serde_json::{Number, Value};
 use crate::operation::sink::relation::RowError;
 
 use super::{
-    config::{ClickHouseSinkConfig, ClickHouseTargetSpec},
-    definition::ClickHouseSinkDefinition,
-    row::ClickHouseRowCodec,
+    config::ClickHouseSinkConfig, definition::ClickHouseSinkDefinition, row::ClickHouseRowCodec,
 };
 const DATABASE_UUID: &str = "12345678-1234-1234-1234-123456789abc";
 
 #[test]
 fn target_identity_marks_the_event_address_semantics() {
     assert_eq!(
-        ClickHouseTargetSpec::try_new("sink", "db", "table", DATABASE_UUID)
+        ClickHouseSinkDefinition::try_new("sink", "db", "table", DATABASE_UUID)
             .unwrap()
             .marker(),
         "dogpaddle.clickhouse-sink.occurrence-version.v1:sink"
@@ -32,11 +30,9 @@ fn target_identity_marks_the_event_address_semantics() {
 
 #[test]
 fn definition_round_trips_canonically() {
-    let definition = ClickHouseSinkDefinition::try_new(
-        ClickHouseTargetSpec::try_new("sink_1", "analytics", "materialized", DATABASE_UUID)
-            .unwrap(),
-    )
-    .unwrap();
+    let definition =
+        ClickHouseSinkDefinition::try_new("sink_1", "analytics", "materialized", DATABASE_UUID)
+            .unwrap();
     let encoded = serde_json::to_vec::<crate::OperationDefinition>(&definition.into()).unwrap();
     let decoded = serde_json::from_slice::<crate::OperationDefinition>(&encoded).unwrap();
     assert_eq!(
@@ -300,9 +296,9 @@ fn row_codec_uses_canonical_null_marker_and_preserves_errors() {
 }
 
 #[test]
-fn target_spec_rejects_zero_database_uuid() {
+fn definition_rejects_zero_database_uuid() {
     assert!(
-        ClickHouseTargetSpec::try_new(
+        ClickHouseSinkDefinition::try_new(
             "sink",
             "db",
             "table",
@@ -311,11 +307,16 @@ fn target_spec_rejects_zero_database_uuid() {
         .is_err()
     );
     assert!(
-        ClickHouseTargetSpec::try_new("sink", "db", "table", "123456781234-1234-1234-123456789abc")
-            .is_err()
+        ClickHouseSinkDefinition::try_new(
+            "sink",
+            "db",
+            "table",
+            "123456781234-1234-1234-123456789abc"
+        )
+        .is_err()
     );
     assert!(
-        ClickHouseTargetSpec::try_new("sink", "db", "$dogpaddle.state.sink", DATABASE_UUID)
+        ClickHouseSinkDefinition::try_new("sink", "db", "$dogpaddle.state.sink", DATABASE_UUID)
             .is_err()
     );
 }

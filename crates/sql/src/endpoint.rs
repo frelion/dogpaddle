@@ -18,8 +18,8 @@ use dogpaddle_operation::operation::{
         PostgresCdcScanDefinition, SequenceScanDefinition,
     },
     sink::{
-        ClickHouseSinkConfig, ClickHouseSinkDefinition, DiscardDefinition, DorisSinkConfig,
-        DorisSinkDefinition, PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition,
+        ClickHouseSinkConfig, DiscardDefinition, DorisSinkConfig, PostgresSinkConfig,
+        SqliteSinkDefinition,
     },
 };
 use percent_encoding::percent_decode_str;
@@ -782,11 +782,9 @@ impl ResolvedSinkEndpoint {
                 let connection = &endpoint.connection;
                 let table = &endpoint.table;
                 let config = connection.clickhouse_sink_config()?;
-                let target = config
+                let definition = config
                     .discover_target(sink_name(identity, state_path), table)
                     .map_err(SqlError::endpoint)?;
-                let definition =
-                    ClickHouseSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
                 Ok(definition.into())
             }
@@ -794,11 +792,9 @@ impl ResolvedSinkEndpoint {
                 let connection = &endpoint.connection;
                 let table = &endpoint.table;
                 let config = connection.doris_sink_config()?;
-                let target = config
+                let definition = config
                     .discover_target(sink_name(identity, state_path), table)
                     .map_err(SqlError::endpoint)?;
-                let definition =
-                    DorisSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
                 Ok(definition.into())
             }
@@ -806,11 +802,9 @@ impl ResolvedSinkEndpoint {
                 let connection = &endpoint.connection;
                 let table = &endpoint.table;
                 let config = connection.postgres_sink_config()?;
-                let target = config
+                let definition = config
                     .discover_target(sink_name(identity, state_path), &endpoint.namespace, table)
                     .map_err(SqlError::endpoint)?;
-                let definition =
-                    PostgresSinkDefinition::try_new(target).map_err(SqlError::endpoint)?;
                 factory.resource(SINK_OPERATION_ID, config)?;
                 Ok(definition.into())
             }

@@ -5,13 +5,13 @@ use std::{
 };
 
 use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
-use serde::{Deserialize, Serialize};
 
-use super::error::{DorisSinkError, database, invalid_config, invalid_spec};
-use crate::operation::sink::is_valid_sink_id;
+use super::{
+    definition::DorisSinkDefinition,
+    error::{DorisSinkError, database, invalid_config, invalid_spec},
+};
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_IDENTIFIER_BYTES: usize = 64;
 
 /// Ephemeral credentials and endpoint for one Apache Doris sink.
 pub struct DorisSinkConfig {
@@ -59,7 +59,8 @@ impl DorisSinkConfig {
         Ok(config)
     }
 
-    /// Discovers the stable cluster identity and rejects existing target objects.
+    /// Returns a pure sink plan with the discovered cluster identity.
+    /// Rejects existing target objects before returning the plan.
     ///
     /// # Errors
     ///
@@ -69,8 +70,8 @@ impl DorisSinkConfig {
         &self,
         sink_id: impl Into<String>,
         table: impl Into<String>,
-    ) -> Result<DorisTargetSpec, DorisSinkError> {
-        let mut spec = DorisTargetSpec {
+    ) -> Result<DorisSinkDefinition, DorisSinkError> {
+        let mut spec = DorisSinkDefinition {
             sink_id: sink_id.into(),
             database: self.database.clone(),
             table: table.into(),
@@ -137,116 +138,9 @@ impl fmt::Debug for DorisSinkConfig {
     }
 }
 
-/// Non-sensitive persistent identity of a sink-owned Doris target.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DorisTargetSpec {
-    sink_id: String,
-    database: String,
-    table: String,
-    cluster_id: u64,
-}
-
-impl DorisTargetSpec {
-    /// Builds and validates a target specification.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid identifiers or a zero cluster identity.
-    pub fn try_new(
-        sink_id: impl Into<String>,
-        database: impl Into<String>,
-        table: impl Into<String>,
-        cluster_id: u64,
-    ) -> Result<Self, DorisSinkError> {
-        let spec = Self {
-            sink_id: sink_id.into(),
-            database: database.into(),
-            table: table.into(),
-            cluster_id,
-        };
-        spec.validate()?;
-        Ok(spec)
-    }
-
-    /// Validates decoded persistent fields.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid identifiers or a zero cluster identity.
-    pub fn validate(&self) -> Result<(), DorisSinkError> {
-        self.validate_names()?;
-        if self.cluster_id == 0 {
-            return Err(invalid_spec("cluster identity must be nonzero"));
-        }
-        Ok(())
-    }
-
-    fn validate_names(&self) -> Result<(), DorisSinkError> {
-        if !is_valid_sink_id(&self.sink_id) {
-            return Err(invalid_spec(
-                "sink ID must contain 1–32 lowercase ASCII letters, digits, or underscores",
-            ));
-        }
-        for (label, value) in [("database", &self.database), ("table", &self.table)] {
-            if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.contains('\0') {
-                return Err(invalid_spec(format!(
-                    "{label} must be a nonempty Doris identifier of at most 64 bytes"
-                )));
-            }
-        }
-        if self.state_table().len() > MAX_IDENTIFIER_BYTES {
-            return Err(invalid_spec("derived state-table name exceeds 64 bytes"));
-        }
-        if self.table.eq_ignore_ascii_case(&self.state_table()) {
-            return Err(invalid_spec("target view collides with the state table"));
-        }
-        Ok(())
-    }
-
-    /// Stable sink identity.
-    #[must_use]
-    pub fn sink_id(&self) -> &str {
-        &self.sink_id
-    }
-
-    /// Target database.
-    #[must_use]
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    /// Exposed target view.
-    #[must_use]
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
-    /// Doris cluster identity captured during discovery.
-    #[must_use]
-    pub const fn cluster_id(&self) -> u64 {
-        self.cluster_id
-    }
-
-    pub(super) fn state_table(&self) -> String {
-        format!("$dogpaddle.state.{}", self.sink_id)
-    }
-
-    pub(super) fn object_names(&self) -> [String; 2] {
-        [self.table.clone(), self.state_table()]
-    }
-
-    pub(super) fn marker(&self) -> String {
-        format!(
-            "dogpaddle.doris-sink.occurrence-version.v1:{}",
-            self.sink_id
-        )
-    }
-}
-
 pub(super) fn require_absent(
     connection: &mut Conn,
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
 ) -> Result<(), DorisSinkError> {
     let names = spec.object_names();
     let existing: Vec<String> = connection

@@ -21,10 +21,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     RuntimeResource,
-    operation::{
-        Operation, OperationError,
-        sink::{PostgresSinkConfig, PostgresSinkDefinition},
-    },
+    operation::{Operation, OperationError, sink::PostgresSinkConfig},
 };
 use dogpaddle_store::{Cell, ReadTransactions, Store, Transactions};
 use serde_json::{Value, json};
@@ -50,8 +47,8 @@ impl Host {
         )?;
         let schema = fixture(scenario, "seed")?.schema();
         if mode == "build" {
-            let target = config.discover_target(format!("gate_{scenario}"), "public", scenario)?;
-            let definition = PostgresSinkDefinition::try_new(target)?;
+            let definition =
+                config.discover_target(format!("gate_{scenario}"), "public", scenario)?;
             let encoded =
                 serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.into())
                     .unwrap();

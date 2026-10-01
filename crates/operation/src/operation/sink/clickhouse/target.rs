@@ -9,7 +9,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    config::{ClickHouseSinkConfig, ClickHouseTargetSpec, require_absent, string_literal},
+    config::{ClickHouseSinkConfig, require_absent, string_literal},
+    definition::ClickHouseSinkDefinition,
     error::{ClickHouseSinkError, database, invalid_batch, invalid_response},
     row::{ClickHouseRowCodec, EncodedRow},
     schema::{self, TECHNICAL_HASH, TECHNICAL_HASH_INDEX, TECHNICAL_ID, TECHNICAL_VERSION},
@@ -28,7 +29,7 @@ const WORK_UNIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct ClickHouseTarget {
     config: ClickHouseSinkConfig,
-    spec: ClickHouseTargetSpec,
+    spec: ClickHouseSinkDefinition,
     codec: ClickHouseRowCodec,
     verified: bool,
 }
@@ -36,7 +37,7 @@ pub(super) struct ClickHouseTarget {
 impl ClickHouseTarget {
     pub(super) fn new_bound(
         config: ClickHouseSinkConfig,
-        spec: ClickHouseTargetSpec,
+        spec: ClickHouseSinkDefinition,
         codec: ClickHouseRowCodec,
     ) -> Self {
         Self {
@@ -484,7 +485,7 @@ fn value_literal(value: &Value) -> String {
     }
 }
 
-fn create_state_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
+fn create_state_sql(spec: &ClickHouseSinkDefinition, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} UInt64", quote(TECHNICAL_ID)),
         format!("{} FixedString(32)", quote(TECHNICAL_HASH)),
@@ -512,7 +513,7 @@ fn create_state_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
     )
 }
 
-fn create_view_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
+fn create_view_sql(spec: &ClickHouseSinkDefinition, schema: &Schema) -> String {
     format!(
         "CREATE VIEW {} AS SELECT {} FROM {} FINAL WHERE {} = {}",
         qualified(spec.database(), spec.table()),
@@ -525,7 +526,7 @@ fn create_view_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
 
 fn verify_state(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     schema: &Schema,
     deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
@@ -603,7 +604,7 @@ fn verify_state(
 
 fn has_exact_hash_index(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     deadline: Instant,
 ) -> Result<bool, ClickHouseSinkError> {
     let body = config.command_before(
@@ -635,7 +636,7 @@ fn has_exact_hash_index(
 
 fn verify_view(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     schema: &Schema,
     deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
@@ -680,7 +681,7 @@ struct ObjectMetadata {
 
 fn object_metadata(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     name: &str,
     deadline: Instant,
 ) -> Result<ObjectMetadata, ClickHouseSinkError> {
@@ -707,7 +708,7 @@ fn select_tail(sql: &str) -> Option<String> {
 
 fn object_kinds(
     config: &ClickHouseSinkConfig,
-    spec: &ClickHouseTargetSpec,
+    spec: &ClickHouseSinkDefinition,
     deadline: Instant,
 ) -> Result<BTreeMap<String, String>, ClickHouseSinkError> {
     let body = config.command_before(deadline,

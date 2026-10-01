@@ -9,7 +9,6 @@ use dogpaddle_operation::{
         Operation,
         sink::{
             PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError, PostgresSinkSchemaError,
-            PostgresTargetSpec,
         },
     },
 };
@@ -26,8 +25,8 @@ fn construct_checked(
 
 const PASSWORD: &str = "do-not-persist-postgres-sink-password";
 
-fn target() -> PostgresTargetSpec {
-    PostgresTargetSpec::try_new(
+fn definition() -> PostgresSinkDefinition {
+    PostgresSinkDefinition::try_new(
         "orders_sink",
         "shop",
         "public",
@@ -36,10 +35,6 @@ fn target() -> PostgresTargetSpec {
         42,
     )
     .unwrap()
-}
-
-fn definition() -> PostgresSinkDefinition {
-    PostgresSinkDefinition::try_new(target()).unwrap()
 }
 
 fn input_schema() -> SchemaRef {
@@ -227,8 +222,8 @@ fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
 }
 
 #[test]
-fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs() {
-    let target = target();
+fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_plans() {
+    let target = definition();
     assert_eq!(target.sink_id(), "orders_sink");
     assert_eq!(target.database(), "shop");
     assert_eq!(target.schema(), "public");
@@ -274,9 +269,9 @@ fn postgres_sink_accepts_its_schema_and_rejects_invalid_schema_and_target_specs(
     ));
 
     for invalid in [
-        PostgresTargetSpec::try_new("Bad-ID", "shop", "public", "output", "123", 42),
-        PostgresTargetSpec::try_new("sink", "shop", "public", "output", "0", 42),
-        PostgresTargetSpec::try_new("sink", "shop", "public", "output", "123", 0),
+        PostgresSinkDefinition::try_new("Bad-ID", "shop", "public", "output", "123", 42),
+        PostgresSinkDefinition::try_new("sink", "shop", "public", "output", "0", 42),
+        PostgresSinkDefinition::try_new("sink", "shop", "public", "output", "123", 0),
     ] {
         assert!(matches!(
             invalid,
@@ -324,4 +319,53 @@ fn raw_plan_business_validation_precedes_store_handle_access() {
         &[input_schema()],
         RuntimeResource::new(config()),
     );
+}
+
+#[test]
+fn oversized_positive_cluster_identity_is_rejected_before_owner_data_access() {
+    let mut identifier = "0".repeat(1024 * 1024);
+    identifier.push('1');
+    assert_eq!(identifier.parse::<u64>().unwrap(), 1);
+    assert!(matches!(
+        PostgresSinkDefinition::try_new(
+            "orders_sink",
+            "shop",
+            "public",
+            "orders_materialized",
+            &identifier,
+            42,
+        ),
+        Err(PostgresSinkError::InvalidSpec { message })
+            if message == "target specification exceeds the 1 MiB definition limit"
+    ));
+
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["system_identifier"] = serde_json::json!(identifier);
+    let plan: OperationDefinition =
+        serde_json::from_value(serde_json::json!({"postgres_sink": payload})).unwrap();
+    let Err(OperationBindError::Rejected { source }) = plan.output_schema(&[input_schema()]) else {
+        panic!("an oversized decoded PostgreSQL plan unexpectedly bound");
+    };
+    assert!(matches!(
+        source.downcast_ref::<PostgresSinkError>(),
+        Some(PostgresSinkError::InvalidSpec { message })
+            if message == "target specification exceeds the 1 MiB definition limit"
+    ));
+
+    let root = TestStore::new();
+    let transactions = StoreSetup::new().commit(root.path(), |_| Ok(())).unwrap();
+    drop(transactions);
+    let store = Store::open(root.path()).unwrap();
+    let Err(OperationSetupError::Schema { source }) = plan.construct(
+        &[input_schema()],
+        &mut store.data_scope().scoped("absent"),
+        RuntimeResource::new(config()),
+    ) else {
+        panic!("oversized plan validation did not precede missing owner handles");
+    };
+    assert!(matches!(
+        source.downcast_ref::<PostgresSinkError>(),
+        Some(PostgresSinkError::InvalidSpec { message })
+            if message == "target specification exceeds the 1 MiB definition limit"
+    ));
 }

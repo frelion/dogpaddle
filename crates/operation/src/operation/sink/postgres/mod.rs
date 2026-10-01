@@ -7,7 +7,7 @@ mod row;
 mod schema;
 mod target;
 
-pub use config::{PostgresSinkConfig, PostgresTargetSpec};
+pub use config::PostgresSinkConfig;
 pub use definition::PostgresSinkDefinition;
 pub use error::{PostgresSinkError, PostgresSinkSchemaError};
 

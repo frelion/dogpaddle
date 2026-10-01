@@ -14,7 +14,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::{
-    PostgresSinkConfig, PostgresSinkError, PostgresTargetSpec,
+    PostgresSinkConfig, PostgresSinkDefinition, PostgresSinkError,
     config::validate_absence_snapshot,
     row::{PostgresRowCodec, PostgresValue},
     target::{SqlPlan, quote_identifier},
@@ -23,8 +23,8 @@ use crate::operation::sink::relation::{
     RowError, canonical_row_bounded, encode_canonical, row_hash,
 };
 
-fn spec(table: &str) -> PostgresTargetSpec {
-    PostgresTargetSpec::try_new("sink_1", "database", "Target Schema", table, "1", 2).unwrap()
+fn spec(table: &str) -> PostgresSinkDefinition {
+    PostgresSinkDefinition::try_new("sink_1", "database", "Target Schema", table, "1", 2).unwrap()
 }
 
 #[test]
@@ -134,7 +134,8 @@ fn identifiers_are_quoted_as_independent_postgresql_components() {
 #[test]
 fn maximum_sink_identity_keeps_derived_names_below_postgresql_limit() {
     let sink_id = "a".repeat(32);
-    let spec = PostgresTargetSpec::try_new(sink_id, "database", "schema", "table", "1", 2).unwrap();
+    let spec =
+        PostgresSinkDefinition::try_new(sink_id, "database", "schema", "table", "1", 2).unwrap();
 
     assert!(spec.object_names().iter().all(|name| name.len() <= 63));
 }
@@ -428,7 +429,7 @@ fn frontier_name_or_row_type_conflicts_are_not_treated_as_absent() {
         matches!(error,PostgresSinkError::TargetExists{name} if name=="$dogpaddle.frontier.sink_1")
     );
     assert!(
-        PostgresTargetSpec::try_new(
+        PostgresSinkDefinition::try_new(
             "sink_1",
             "database",
             "schema",
@@ -439,7 +440,7 @@ fn frontier_name_or_row_type_conflicts_are_not_treated_as_absent() {
         .is_err()
     );
     assert!(
-        PostgresTargetSpec::try_new(
+        PostgresSinkDefinition::try_new(
             "sink_1",
             "database",
             "schema",

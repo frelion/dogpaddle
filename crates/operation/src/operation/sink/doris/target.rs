@@ -9,7 +9,8 @@ use dogpaddle_change::Change;
 use mysql::{Conn, Params, Value, params, prelude::Queryable};
 
 use super::{
-    config::{DorisSinkConfig, DorisTargetSpec, require_absent},
+    config::{DorisSinkConfig, require_absent},
+    definition::DorisSinkDefinition,
     error::{DorisSinkError, database, invalid_batch},
     row::{DorisRowCodec, EncodedRow},
     schema::{
@@ -122,7 +123,7 @@ fn require_visible(mut input: &[u8], connection_info: &[u8]) -> Result<(), Doris
 
 pub(super) struct DorisTarget {
     config: DorisSinkConfig,
-    spec: DorisTargetSpec,
+    spec: DorisSinkDefinition,
     codec: DorisRowCodec,
     connection: Option<Conn>,
     verified: bool,
@@ -131,7 +132,7 @@ pub(super) struct DorisTarget {
 impl DorisTarget {
     pub(super) fn new_bound(
         config: DorisSinkConfig,
-        spec: DorisTargetSpec,
+        spec: DorisSinkDefinition,
         codec: DorisRowCodec,
     ) -> Self {
         Self {
@@ -594,7 +595,7 @@ fn row_predicate(schema: &Schema, row: &EncodedRow) -> (String, Vec<Value>) {
 }
 
 fn lookup_clause(
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
     request_index: usize,
     request: &Lookup,
     predicate: &str,
@@ -611,7 +612,7 @@ fn lookup_clause(
     )
 }
 
-fn insert_prefix(spec: &DorisTargetSpec, schema: &Schema) -> String {
+fn insert_prefix(spec: &DorisSinkDefinition, schema: &Schema) -> String {
     let columns = std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
         .chain(std::iter::once(TECHNICAL_VERSION))
@@ -626,7 +627,7 @@ fn insert_prefix(spec: &DorisTargetSpec, schema: &Schema) -> String {
 }
 
 fn insert_statements(
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
     schema: &Schema,
     actions: &[(u64, u64, EncodedRow)],
 ) -> Vec<String> {
@@ -693,7 +694,7 @@ fn bytes_literal(value: &[u8]) -> String {
     literal
 }
 
-fn create_state_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
+fn create_state_sql(spec: &DorisSinkDefinition, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} BIGINT NOT NULL", quote(TECHNICAL_ID)),
         format!("{} CHAR(32) NOT NULL", quote(TECHNICAL_HASH)),
@@ -730,7 +731,7 @@ fn create_state_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
     )
 }
 
-fn create_view_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
+fn create_view_sql(spec: &DorisSinkDefinition, schema: &Schema) -> String {
     format!(
         "CREATE VIEW {} AS SELECT {} FROM {} WHERE {} = {}",
         qualified(spec.database(), spec.table()),
@@ -743,7 +744,7 @@ fn create_view_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
 
 fn verify_state(
     connection: &mut Conn,
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
     schema: &Schema,
 ) -> Result<(), DorisSinkError> {
     type Column = (String, String, String);
@@ -817,7 +818,7 @@ fn verify_state(
 
 fn verify_view(
     connection: &mut Conn,
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
     schema: &Schema,
 ) -> Result<(), DorisSinkError> {
     let definition: Option<String> = connection
@@ -851,7 +852,7 @@ fn verify_view(
     Ok(())
 }
 
-fn expected_view_definition(spec: &DorisTargetSpec, schema: &Schema) -> String {
+fn expected_view_definition(spec: &DorisSinkDefinition, schema: &Schema) -> String {
     let source = format!("internal.{}.{}", spec.database(), spec.state_table());
     let columns = std::iter::once(format!("{source}.{TECHNICAL_ID}AS{PUBLIC_TECHNICAL_ID}"))
         .chain(std::iter::once(format!(
@@ -876,7 +877,7 @@ fn compact_sql(sql: &str) -> String {
 
 fn object_kinds(
     connection: &mut Conn,
-    spec: &DorisTargetSpec,
+    spec: &DorisSinkDefinition,
 ) -> Result<BTreeMap<String, String>, DorisSinkError> {
     let names = spec.object_names();
     let rows: Vec<(String, String)> = connection

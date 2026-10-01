@@ -7,7 +7,7 @@ mod row;
 mod schema;
 mod target;
 
-pub use config::{ClickHouseSinkConfig, ClickHouseTargetSpec};
+pub use config::ClickHouseSinkConfig;
 pub use definition::ClickHouseSinkDefinition;
 pub use error::{ClickHouseSinkError, ClickHouseSinkSchemaError};
 

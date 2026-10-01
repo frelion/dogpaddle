@@ -39,7 +39,7 @@ planner 只执行 `ordinal >= from && ordinal > through` 的单位。既存 IDs 
 
 ## SQLite 与 PostgreSQL
 
-SQLite 只接受绝对 UTF-8 文件路径和新的非保留表名，完整 v1 Arrow 类型无损映射到 STRICT 表。唯一额外 owned 元表保存单例 F，表示下一个尚未提交的事件位置；不保存整行 canonical bytes。PG Definition 只保存 discovery 得到的非敏感 `PostgresTargetSpec`，numeric IP/port/user/password 只存在于构造时注入的 `PostgresSinkConfig`，不接受 DNS 或 TLS。
+SQLite 只接受绝对 UTF-8 文件路径和新的非保留表名，完整 v1 Arrow 类型无损映射到 STRICT 表。唯一额外 owned 元表保存单例 F，表示下一个尚未提交的事件位置；不保存整行 canonical bytes。三个远端 Sink 的 `discover_target` 直接返回对应 Definition；同一个纯计划拥有非敏感目标身份、getter 和完整验证，不另有 TargetSpec 或包裹它的 Definition。纯 `try_new` 接收身份字段，不要求网络；Serde 仍只得到待绑定计划，`output_schema` 和 `construct` 在取得 owner handles 前复用完整字段与 1 MiB 验证。JSON 字段顺序、目标布局与 identity 保持不变。PG numeric IP/port/user/password 只存在于构造时注入的 `PostgresSinkConfig`，不接受 DNS 或 TLS。
 
 初始化在同一目标事务建立业务表、索引和单例 F=1。SQLite `BEGIN IMMEDIATE`、PG `SELECT ... FOR UPDATE` 锁内读 F；先检查 `loaded start <= F <= durable tail`。F 已覆盖本批时直接成功；否则 from=F、lookup through=F−1，在同一事务规划和普通 INSERT/DELETE，原子更新 F 到本批排他 end 并 commit。F 可以等于 `u64::MAX`，该值仍不可成为事件 ID。目标已提交但本地未结算、旧长批后重新切短批都由同一个 F 处理；新 ID 冲突是真错误。
 

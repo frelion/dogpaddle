@@ -21,7 +21,7 @@ use dogpaddle_operation::{
     operation::{
         Operation, OperationError,
         scan::{PostgresCdcScanConfig, PostgresCdcScanDefinition},
-        sink::{PostgresSinkConfig, PostgresSinkDefinition, SqliteSinkDefinition},
+        sink::{PostgresSinkConfig, SqliteSinkDefinition},
         transform::DistinctDefinition,
     },
 };
@@ -174,8 +174,8 @@ fn open_flow(options: &Options) -> Result<Flow, OperationError> {
     let scan = factory.operation("pg", options.definition()?, []);
     let scan = factory.operation("distinct", DistinctDefinition::new(), [scan]);
     if let Some(config) = &sink_config {
-        let target = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
-        factory.operation("sink", PostgresSinkDefinition::try_new(target)?, [scan])
+        let definition = config.discover_target("roundtrip_sink", "public", "roundtrip_target")?;
+        factory.operation("sink", definition, [scan])
     } else {
         factory.operation(
             "sqlite",
