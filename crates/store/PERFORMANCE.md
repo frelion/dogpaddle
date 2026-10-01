@@ -102,3 +102,41 @@ cargo bench --locked -p dogpaddle-store --bench ordered_map
 
 不同 baseline epoch、提交、rustc、机器、profile、文件系统或 workload 的结果不可直接比较。工作区
 分类和准入规则见根目录 [`TESTING.md`](../../TESTING.md)。
+
+## 2026-10-01：直接类型化读取的 reference 对照
+
+基线产品为 `fa7f43d`，新版产品为 `29d713a`（Store 变更为 `df0364f`）。基线仅移入新版
+相同的三份 `ordered_map` benchmark 文件，以使新增 `weight_scan` 的 fixture 和预热负担一致；
+该 instrumentation patch 与两版 Store 源码状态分别保存为 `benchmark.patch`、
+`before-store-source.patch`、`after-store-source.patch`。两份 Store 源码 patch 都为空。
+Rust 1.96.0 release、Apple M5、APFS，顺序执行且无并行 Cargo 或容器负载。全部 oracle 通过。
+`ordered_map` 使用 15 samples、3 秒预热、5 秒测量，`cell` 使用 10 samples。
+以下为完整 workload 的 Criterion median，单位 ms；区间为 95% CI。
+
+| workload | 基线 | 新版 | 变化 |
+| --- | --- | --- | ---: |
+| point_get / 100000 | 49.4409 `[49.2978,50.8217]` | 48.7459 `[48.5998,49.7661]` | -1.4% |
+| ascending_scan / 100000 | 8.5354 `[8.4813,8.5615]` | 7.0650 `[7.0287,7.1486]` | -17.2% |
+| descending_scan / 100000 | 30.2438 `[28.9246,31.1342]` | 28.7992 `[27.4801,29.7032]` | -4.8% |
+| weight_scan / 100000 | 8.3877 `[8.3200,8.7425]` | 5.4622 `[5.4213,5.5133]` | -34.9% |
+| wide_scan / 10000 | 2.2735 `[2.2596,2.3099]` | 2.1216 `[2.1182,2.1694]` | -6.7% |
+| station_step / 1000 | 32.1665 `[31.8500,33.1034]` | 32.0064 `[31.5328,33.5706]` | -0.5% |
+| cell hot_get_one_tx / 100000 | 21.5250 `[21.4479,21.5810]` | 20.0576 `[19.9885,21.2782]` | -6.8% |
+
+点查、降序与同步事务更新的区间重叠，不据中位数宣称稳定加速。普通升序、正权重与宽值
+分页在这次配对中更快，不能推广为所有自定义 codec 的保证：continuation 仍经 key codec
+构建，每个有续页的 page 多一次 key 编码，不要求 `K: Clone`。
+
+同时使用未修改的 Operation `equi_join_resources` reference 复测 12 cases。基线为此前冻结
+`fa7f43d` 的 `frozen/dogpaddle-equi-join-resources-run-vdrMOy`，新版为
+`after/dogpaddle-equi-join-resources-run-iFoSNy`。逐 case 核对 workload、输入页与输出计数、
+持久 match-count 状态完全相同。4096-candidate fanout 的累计 Rust 分配块
+17593 → 13497（-23.3%）、累计分配字节 6354996 → 6192180（-2.6%），峰值仍为 188137 bytes；
+FullOuter 257 × 64 KiB case 21213 → 18615 blocks，峰值仍为 2303806 bytes。
+其余 case 分配块/字节减少或相同；没有增加。这些量排除 RocksDB 原生堆，且 runner 不采 RSS；
+不能解释为整个进程峰值内存同比下降。Flow 的 64 KiB Resume 边界也没有因该直接 Operation
+resource workload 而放宽。
+
+本轮只改变私有解码路径，typed API、扫描准入、poison/rollback 与持久字节保持相同。原始
+samples、estimates、context 与日志在 `/tmp/dogpaddle-typed-store-performance/{before,after}`；
+独立复审覆盖抽象重复、事务/恢复与资源风险。
