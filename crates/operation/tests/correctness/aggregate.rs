@@ -514,6 +514,136 @@ fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
     assert_eq!(max_bytes.value(last), b"aa");
 }
 
+type MixedAggregateValues<'a> = (i64, u64, i64, &'a str, u64, i64, &'a str, i64, f64, f64);
+
+fn assert_mixed_aggregate_trace(
+    output: &Change,
+    expected: &[MixedAggregateValues<'_>],
+    diffs: &[i64],
+) {
+    let records = RecordBatch::try_new(
+        output.records().schema(),
+        vec![
+            Arc::new(StringArray::from(vec!["A"; expected.len()])),
+            Arc::new(Int64Array::from(
+                expected.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                expected.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                expected.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                expected.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                expected.iter().map(|row| row.4).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                expected.iter().map(|row| row.5).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                expected.iter().map(|row| row.6).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                expected.iter().map(|row| row.7).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                expected.iter().map(|row| row.8).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                expected.iter().map(|row| row.9).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    assert_eq!(output.records(), &records);
+    assert_eq!(output.diffs().values(), diffs);
+}
+
+#[test]
+fn mixed_argument_roles_preserve_dense_state_addresses_and_trace_across_reopen() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("department", DataType::Utf8, false),
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::UInt64, true),
+        Field::new("c", DataType::Utf8, true),
+    ]));
+    let definition = AggregateDefinition::try_new(
+        [("department", col("department"))],
+        [
+            ("min_a", AggregateCall::Min(col("a"))),
+            ("sum_b", AggregateCall::Sum(col("b"))),
+            ("count_a", AggregateCall::Count(col("a"))),
+            ("max_c", AggregateCall::Max(col("c"))),
+            ("min_b", AggregateCall::Min(col("b"))),
+            ("sum_a", AggregateCall::Sum(col("a"))),
+            ("min_c", AggregateCall::Min(col("c"))),
+            ("max_a", AggregateCall::Max(col("a"))),
+            ("avg_b", AggregateCall::Avg(col("b"))),
+            ("avg_a", AggregateCall::Avg(col("a"))),
+        ],
+    )
+    .unwrap();
+    let make_change = |a: Vec<i64>, b: Vec<u64>, c: Vec<&str>, diffs: Vec<i64>| {
+        Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["A"; a.len()])),
+                    Arc::new(Int64Array::from(a)),
+                    Arc::new(UInt64Array::from(b)),
+                    Arc::new(StringArray::from(c)),
+                ],
+            )
+            .unwrap(),
+            Int64Array::from(diffs),
+        )
+        .unwrap()
+    };
+    let first = (10, 9, 1, "m", 9, 10, "m", 10, 9.0, 10.0);
+    let second = (4, 11, 2, "z", 2, 14, "m", 10, 5.5, 7.0);
+    let third = (4, 18, 3, "z", 2, 34, "a", 20, 6.0, 34.0 / 3.0);
+    let remaining = (10, 16, 2, "m", 7, 30, "a", 20, 8.0, 15.0);
+    let root = TestStore::new();
+    let (operation, mut transactions) =
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+    let initial = make_change(
+        vec![10, 4, 20],
+        vec![9, 2, 7],
+        vec!["m", "z", "a"],
+        vec![1; 3],
+    );
+    let output = run_input(&operation, step_input(&initial), &mut transactions)
+        .unwrap()
+        .unwrap();
+    assert_mixed_aggregate_trace(
+        &output,
+        &[first, first, second, second, third],
+        &[1, -1, 1, -1, 1],
+    );
+    drop((operation, transactions));
+
+    let store = Store::open(root.path()).unwrap();
+    let operation = reopen_aggregate_for_schema(&store, &definition, Arc::clone(&schema));
+    let mut transactions = store.into_transactions();
+    let retract = make_change(vec![4, 20], vec![2, 7], vec!["z", "a"], vec![-1; 2]);
+    let output = run_input(&operation, step_input(&retract), &mut transactions)
+        .unwrap()
+        .unwrap();
+    assert_mixed_aggregate_trace(
+        &output,
+        &[third, remaining, remaining, first],
+        &[-1, 1, -1, 1],
+    );
+    let remove = make_change(vec![10], vec![9], vec!["m"], vec![-1]);
+    let output = run_input(&operation, step_input(&remove), &mut transactions)
+        .unwrap()
+        .unwrap();
+    assert_mixed_aggregate_trace(&output, &[first], &[-1]);
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,

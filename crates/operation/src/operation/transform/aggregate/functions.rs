@@ -1,32 +1,7 @@
 use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 
-use crate::expression::BoundExpression;
-
 use super::{AggregateError, AggregateSchemaError, state::Statistic};
-
-use super::definition::AggregateCall;
-use crate::operation::relation::indexable;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ExtremaDirection {
-    Min,
-    Max,
-}
-
-pub(super) struct BoundReduction {
-    pub(super) reduction: Reduction,
-    pub(super) output_type: DataType,
-    pub(super) nullable: bool,
-}
-
-pub(super) enum Reduction {
-    RowsCount,
-    Count,
-    Sum(StatisticKind),
-    Average(StatisticKind),
-    Extrema(ExtremaDirection),
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StatisticKind {
@@ -45,52 +20,7 @@ impl StatisticKind {
     }
 }
 
-pub(super) fn bind(
-    call: AggregateCall<BoundExpression>,
-) -> Result<(Option<BoundExpression>, BoundReduction), AggregateSchemaError> {
-    let (argument, reduction, output_type, nullable) = match call {
-        AggregateCall::CountAll => (None, Reduction::RowsCount, DataType::Int64, false),
-        AggregateCall::Count(value) => (Some(value), Reduction::Count, DataType::Int64, false),
-        AggregateCall::Sum(value) => {
-            let kind = numeric_kind("SUM", value.output_type())?;
-            let output = value.output_type().clone();
-            (Some(value), Reduction::Sum(kind), output, true)
-        }
-        AggregateCall::Avg(value) => {
-            let kind = numeric_kind("AVG", value.output_type())?;
-            (
-                Some(value),
-                Reduction::Average(kind),
-                DataType::Float64,
-                true,
-            )
-        }
-        AggregateCall::Min(value) => bind_extrema(value, ExtremaDirection::Min, "MIN")?,
-        AggregateCall::Max(value) => bind_extrema(value, ExtremaDirection::Max, "MAX")?,
-    };
-    Ok((
-        argument,
-        BoundReduction {
-            reduction,
-            output_type,
-            nullable,
-        },
-    ))
-}
-
-fn bind_extrema(
-    value: BoundExpression,
-    direction: ExtremaDirection,
-    name: &'static str,
-) -> Result<(Option<BoundExpression>, Reduction, DataType, bool), AggregateSchemaError> {
-    if !indexable(value.output_type()) {
-        return Err(unsupported(name, value.output_type()));
-    }
-    let output = value.output_type().clone();
-    Ok((Some(value), Reduction::Extrema(direction), output, true))
-}
-
-fn numeric_kind(
+pub(super) fn numeric_kind(
     function: &'static str,
     data_type: &DataType,
 ) -> Result<StatisticKind, AggregateSchemaError> {

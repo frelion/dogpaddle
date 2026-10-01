@@ -2,17 +2,17 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::{
     ConstructedOperation, Expr, OperationSchemaError, definition::schema_error,
-    expression::StoredExpression,
+    expression::StoredExpression, operation::relation::indexable,
 };
 
 use super::{
     AggregateDefinitionError, AggregateSchemaError,
-    functions::{ExtremaDirection, Reduction, bind},
-    runtime::{BoundAggregate, BoundArgument, BoundCall, BoundLayout, BoundStatistic, ExtremaSlot},
+    functions::{StatisticKind, numeric_kind, unsupported},
+    runtime::{BoundArgument, BoundExtrema, BoundStatistic},
     value::contains_float,
 };
 
@@ -24,11 +24,11 @@ pub(crate) struct AggregateLayout {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[crate::expression::BoundExpression]>,
-    pub(super) calls: Box<[BoundCall]>,
+    pub(super) calls: Box<[AggregateCall<usize>]>,
     pub(super) arguments: Box<[BoundArgument]>,
-    pub(super) statistics: Box<[BoundStatistic]>,
-    pub(super) layouts: Box<[BoundLayout]>,
-    pub(super) slots: Box<[ExtremaSlot]>,
+    pub(super) statistic_count: usize,
+    pub(super) layout_count: usize,
+    pub(super) extrema_count: usize,
 }
 
 /// One built-in aggregate invocation without its output field name.
@@ -88,17 +88,6 @@ impl<E> AggregateCall<E> {
             Self::Min(value) => AggregateCall::Min(map(value)?),
             Self::Max(value) => AggregateCall::Max(map(value)?),
         })
-    }
-
-    fn argument(&self) -> Option<&E> {
-        match self {
-            Self::CountAll => None,
-            Self::Count(value)
-            | Self::Sum(value)
-            | Self::Avg(value)
-            | Self::Min(value)
-            | Self::Max(value) => Some(value),
-        }
     }
 }
 
@@ -189,20 +178,36 @@ impl AggregateDefinition {
         Ok(())
     }
 
-    fn compile_layout(
+    pub(super) fn compile_layout(
         &self,
         input_schema: &SchemaRef,
     ) -> Result<AggregateLayout, OperationSchemaError> {
         self.validate()?;
         let mut output_fields = Vec::with_capacity(self.groups.len() + self.calls.len());
         let group_expressions = self.bind_groups(input_schema, &mut output_fields)?;
-        let BoundAggregate {
-            calls,
-            arguments,
-            statistics,
-            layouts,
-            slots,
-        } = self.bind_calls(input_schema, &mut output_fields)?;
+        let mut calls = Vec::with_capacity(self.calls.len());
+        let mut arguments = Vec::new();
+        let mut statistic_count = 0;
+        let mut layout_count = 0;
+        let mut extrema_count = 0;
+        for (aggregate, named) in self.calls.iter().enumerate() {
+            let call = named.call.clone().try_map(|stored| {
+                indexed_argument(&mut arguments, stored, input_schema, aggregate)
+            })?;
+            let output_type = configure_call(
+                &call,
+                &mut arguments,
+                &mut statistic_count,
+                &mut layout_count,
+                &mut extrema_count,
+            )?;
+            output_fields.push(Arc::new(Field::new(
+                &named.name,
+                output_type,
+                !matches!(call, AggregateCall::CountAll | AggregateCall::Count(_)),
+            )));
+            calls.push(call);
+        }
         let output_schema = Arc::new(Schema::new_with_metadata(
             output_fields,
             input_schema.metadata().clone(),
@@ -212,11 +217,14 @@ impl AggregateDefinition {
             input_schema: Arc::clone(input_schema),
             output_schema,
             group_expressions,
-            calls,
-            arguments,
-            statistics,
-            layouts,
-            slots,
+            calls: calls.into_boxed_slice(),
+            arguments: arguments
+                .into_iter()
+                .map(|(_, argument)| argument)
+                .collect(),
+            statistic_count,
+            layout_count,
+            extrema_count,
         })
     }
 
@@ -246,127 +254,32 @@ impl AggregateDefinition {
         }
         Ok(expressions.into_boxed_slice())
     }
-
-    pub(super) fn bind_calls(
-        &self,
-        input_schema: &SchemaRef,
-        output_fields: &mut Vec<Arc<Field>>,
-    ) -> Result<BoundAggregate, OperationSchemaError> {
-        let mut calls = Vec::with_capacity(self.calls.len());
-        let mut arguments: Vec<(StoredExpression, BoundArgument)> = Vec::new();
-        let mut statistics: Vec<BoundStatistic> = Vec::new();
-        let mut layouts: Vec<BoundLayout> = Vec::new();
-        let mut slots = Vec::new();
-        for (aggregate, call) in self.calls.iter().enumerate() {
-            let bound_call = call.call.clone().try_map(|argument| {
-                argument
-                    .bind(Arc::clone(input_schema))
-                    .map_err(|source| -> OperationSchemaError {
-                        Box::new(AggregateSchemaError::AggregateExpression { aggregate, source })
-                    })
-            })?;
-            let (bound_argument, bound) = bind(bound_call)?;
-            output_fields.push(Arc::new(Field::new(
-                &call.name,
-                bound.output_type,
-                bound.nullable,
-            )));
-            let argument = bound_argument
-                .zip(call.call.argument())
-                .map(|(expression, stored)| {
-                    indexed_argument(&mut arguments, stored, expression, aggregate)
-                });
-            calls.push(match bound.reduction {
-                Reduction::RowsCount => BoundCall::RowsCount,
-                Reduction::Extrema(direction) => {
-                    let argument = argument.expect("extrema has one argument");
-                    let layout = if let Some(index) = layouts
-                        .iter()
-                        .position(|layout| layout.argument == argument)
-                    {
-                        index
-                    } else {
-                        let index = layouts.len();
-                        layouts.push(BoundLayout {
-                            argument,
-                            field: Arc::clone(&arguments[argument].1.field),
-                            min_slot: None,
-                            max_slot: None,
-                        });
-                        index
-                    };
-                    BoundCall::Extrema {
-                        slot: indexed_slot(&mut slots, &mut layouts[layout], layout, direction),
-                    }
-                }
-                reduction => {
-                    let argument = argument.expect("statistics have one argument");
-                    let kind = match reduction {
-                        Reduction::Count => super::functions::StatisticKind::Count,
-                        Reduction::Sum(kind) | Reduction::Average(kind) => kind,
-                        _ => unreachable!(),
-                    };
-                    let statistic = if let Some(index) = statistics
-                        .iter()
-                        .position(|statistic| statistic.argument == argument)
-                    {
-                        if kind != super::functions::StatisticKind::Count {
-                            statistics[index].kind = kind;
-                        }
-                        index
-                    } else {
-                        let index = statistics.len();
-                        statistics.push(BoundStatistic {
-                            argument,
-                            kind,
-                            count_output: false,
-                            sum_output: false,
-                        });
-                        index
-                    };
-                    match reduction {
-                        Reduction::Count => {
-                            statistics[statistic].count_output = true;
-                            BoundCall::Count { statistic }
-                        }
-                        Reduction::Sum(_) => {
-                            statistics[statistic].sum_output = true;
-                            BoundCall::Sum { statistic }
-                        }
-                        Reduction::Average(_) => BoundCall::Average { statistic },
-                        _ => unreachable!(),
-                    }
-                }
-            });
-        }
-        Ok(BoundAggregate {
-            calls: calls.into_boxed_slice(),
-            arguments: arguments
-                .into_iter()
-                .map(|(_, argument)| argument)
-                .collect(),
-            statistics: statistics.into_boxed_slice(),
-            layouts: layouts.into_boxed_slice(),
-            slots: slots.into_boxed_slice(),
-        })
-    }
 }
 
 fn indexed_argument(
     arguments: &mut Vec<(StoredExpression, BoundArgument)>,
-    stored: &StoredExpression,
-    expression: crate::expression::BoundExpression,
+    stored: StoredExpression,
+    input_schema: &SchemaRef,
     owner: usize,
-) -> usize {
+) -> Result<usize, OperationSchemaError> {
     if let Some(index) = arguments
         .iter()
-        .position(|(existing, _)| existing == stored)
+        .position(|(existing, _)| *existing == stored)
     {
-        return index;
+        return Ok(index);
     }
+    let expression =
+        stored
+            .bind(Arc::clone(input_schema))
+            .map_err(|source| -> OperationSchemaError {
+                Box::new(AggregateSchemaError::AggregateExpression {
+                    aggregate: owner,
+                    source,
+                })
+            })?;
     let index = arguments.len();
     arguments.push((
-        stored.clone(),
+        stored,
         BoundArgument {
             owner,
             field: Arc::new(Field::new(
@@ -375,33 +288,94 @@ fn indexed_argument(
                 expression.output_nullable(),
             )),
             expression,
+            statistic: None,
+            extrema: None,
         },
     ));
-    index
+    Ok(index)
 }
 
-/// Returns the dense slot of one (layout, direction) pair, adding it if absent.
-///
-/// `MIN(x), MAX(x)` share the layout but need one slot each; repeating the same
-/// call reuses one slot, so the cached group state stays proportional to the
-/// distinct extremes the definition actually reads.
-fn indexed_slot(
-    slots: &mut Vec<ExtremaSlot>,
-    bound_layout: &mut BoundLayout,
-    layout: usize,
-    direction: ExtremaDirection,
-) -> usize {
-    let cached_slot = match direction {
-        ExtremaDirection::Min => &mut bound_layout.min_slot,
-        ExtremaDirection::Max => &mut bound_layout.max_slot,
-    };
-    if let Some(slot) = *cached_slot {
-        return slot;
+fn configure_call(
+    call: &AggregateCall<usize>,
+    arguments: &mut [(StoredExpression, BoundArgument)],
+    statistic_count: &mut usize,
+    layout_count: &mut usize,
+    extrema_count: &mut usize,
+) -> Result<DataType, AggregateSchemaError> {
+    match *call {
+        AggregateCall::CountAll => Ok(DataType::Int64),
+        AggregateCall::Count(index) => {
+            statistic(
+                &mut arguments[index].1,
+                statistic_count,
+                StatisticKind::Count,
+            )
+            .count_output = true;
+            Ok(DataType::Int64)
+        }
+        AggregateCall::Sum(index) | AggregateCall::Avg(index) => {
+            let argument = &mut arguments[index].1;
+            let is_sum = matches!(call, AggregateCall::Sum(_));
+            let function = if is_sum { "SUM" } else { "AVG" };
+            let kind = numeric_kind(function, argument.field.data_type())?;
+            let bound = statistic(argument, statistic_count, kind);
+            bound.sum_output |= is_sum;
+            Ok(if is_sum {
+                argument.field.data_type().clone()
+            } else {
+                DataType::Float64
+            })
+        }
+        AggregateCall::Min(index) | AggregateCall::Max(index) => {
+            let argument = &mut arguments[index].1;
+            let is_min = matches!(call, AggregateCall::Min(_));
+            let function = if is_min { "MIN" } else { "MAX" };
+            if !indexable(argument.field.data_type()) {
+                return Err(unsupported(function, argument.field.data_type()));
+            }
+            let extrema = argument.extrema.get_or_insert_with(|| {
+                let partition = *layout_count;
+                *layout_count += 1;
+                BoundExtrema {
+                    partition,
+                    min_slot: None,
+                    max_slot: None,
+                }
+            });
+            let slot = if is_min {
+                &mut extrema.min_slot
+            } else {
+                &mut extrema.max_slot
+            };
+            slot.get_or_insert_with(|| {
+                let slot = *extrema_count;
+                *extrema_count += 1;
+                slot
+            });
+            Ok(argument.field.data_type().clone())
+        }
     }
-    let slot = slots.len();
-    slots.push(ExtremaSlot { layout });
-    *cached_slot = Some(slot);
-    slot
+}
+
+fn statistic<'a>(
+    argument: &'a mut BoundArgument,
+    count: &mut usize,
+    kind: StatisticKind,
+) -> &'a mut BoundStatistic {
+    let statistic = argument.statistic.get_or_insert_with(|| {
+        let index = *count;
+        *count += 1;
+        BoundStatistic {
+            index,
+            kind,
+            count_output: false,
+            sum_output: false,
+        }
+    });
+    if kind != StatisticKind::Count {
+        statistic.kind = kind;
+    }
+    statistic
 }
 
 fn ensure_count(index: usize) -> Result<(), AggregateDefinitionError> {

@@ -577,3 +577,38 @@ elements、128 KiB prefix）现在在 4 MiB 内合法成功。两版本做了不
 correctness 另证明更紧预算仍拒绝并回滚真实 payload，以及单候选可重试和完整结果；
 whole-workspace gate 和 native SQL 组合验证分别记录实际执行，不能把 smoke/test
 mode 当 release 性能证据。
+
+## 2026-10-02 Aggregate 参数拥有状态地址
+
+本轮删除统计、layout、slot 到参数的三张反查表，以及重复的调用 ADT；唯一参数直接拥有可选角色地址，调用仍使用 `AggregateCall<usize>`。生产代码净减 96 行，持久 `GroupState` codec、dense 地址、entries 分区与逻辑费用不变。跨参数同时非法时首个错误的顺序不承诺；逐事件校验、Store poison 与整页回滚仍保留。
+
+性能原始证据位于 `/tmp/dogpaddle-aggregate-argument-owner-performance-v2`：同一最终 owner harness 编译 A/C，依次 reference A1/C1/C2/A2，四次实际退出码均为 0。基线只将四个 Aggregate 生产文件还原为 `1cdf5e0`，构建后逐字节恢复当前实现；共享 harness、lock、其余源码 SHA 均核对相同。Cargo artifact 均为 release、fresh=false，binary、源码、host、raw samples、估计值与命令保存在 source-context/runs/comparison JSON。旧九个 workload 和计时界不变；新增 64 个 COUNT 参数 ×512 行及 2 个统计/64 个极值参数 ×512 行，两次 apply/commit 回到 seed。每次 apply 仍使用 64 MiB 逻辑预算。
+
+下表为 median 的相对耗时，正数表示增时；“CI重叠”分别列两轮 95% median 区间是否相交。不能将区间相交解释为精确无回归。
+
+| case | C1/A1 | C2/A2 | CI重叠：第一/第二轮 |
+| --- | ---: | ---: | --- |
+| `distinct_layout_min_max` | -2.81% | +4.29% | 否/否 |
+| `extrema_retraction` | +1.35% | -1.38% | 是/是 |
+| `many_count_arguments_one_turn` | +1.65% | -0.05% | 否/是 |
+| `many_existing_groups_one_turn` | +2.94% | -0.41% | 是/是 |
+| `many_new_groups_one_turn` | -4.74% | -0.23% | 是/是 |
+| `many_rows_one_turn` | +0.27% | +3.34% | 是/是 |
+| `repeated_extrema_key_one_turn` | +1.69% | -0.06% | 否/是 |
+| `repeated_min_max` | -1.37% | -1.90% | 是/是 |
+| `same_group_high_multiplicity` | -1.29% | -4.29% | 是/是 |
+| `sparse_statistics_many_extrema_one_turn` | +0.15% | -0.27% | 是/是 |
+| `zero_net_group_extrema_cycles_one_turn` | +1.59% | -0.99% | 否/否 |
+
+没有一致的热运行提速或增时结论。COUNT-heavy 第一轮增时 1.65% 且 CI 不重叠，第二轮 −0.05% 且重叠；distinct layout 第一轮 −2.81%、第二轮 +4.29%，两轮均不重叠，方向相反。净删代码不等于加速；上述负结果没有删去。
+
+临时私有 `size_of` witness 使用实际 Rust 1.96/aarch64 类型，执行退出码 0，随后移除临时 module。记录位于 `/tmp/dogpaddle-aggregate-argument-owner-performance/compiled-sizes.log` 和 `compiled-sizes-context.json`。旧 argument 80 B、新 argument 136 B；旧 statistic/layout/方向 slot 分别 16/48/8 B，调用 enum 新旧均为 16 B。下表只比较每个唯一参数的绑定记录及旧反查记录，不包括固定数组 header、表达式内部 heap、Arc 所指的 Field/表达式堆对象、统计状态或 RSS。
+
+| 参数角色 | 旧绑定记录 | 新绑定记录 | 变化 |
+| --- | ---: | ---: | ---: |
+| COUNT-only | 96 B | 136 B | +40 B |
+| MIN-only | 136 B | 136 B | 0 B |
+| MIN/MAX | 144 B | 136 B | −8 B |
+| 统计 + MIN/MAX | 160 B | 136 B | −24 B |
+
+全部结果包含完整 Atomic apply 和同步 `Transaction::commit`；fixture、绑定、完整输出 oracle 与返回输出的释放不计时。新增 NULL/count 与 extrema 小样例、512 行批次检查全部输出列及 diff。新 case 测热运行的记录跨度和稀疏角色遍历，未隔离冷缓存延迟；没有测绑定构造、大量新 group 的统计初始化、allocator 或 RSS，不能据此声称这些方面改善。持久状态和历史保留不增大；COUNT-only 冷态记录增长是本轮保留的明确代价。

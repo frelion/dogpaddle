@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    AggregateError,
+    AggregateCall, AggregateError,
     functions::{StatisticKind, TrackedWeight, apply_weight},
     state::{Control, Entries, EntryPartition, GroupState, Groups, Statistic},
     value::null,
@@ -29,66 +29,36 @@ pub(crate) struct AggregateOperation {
     pub(super) input_schema: SchemaRef,
     pub(super) output_schema: SchemaRef,
     pub(super) group_expressions: Box<[BoundExpression]>,
-    pub(super) calls: Box<[BoundCall]>,
+    pub(super) calls: Box<[AggregateCall<usize>]>,
     pub(super) arguments: Box<[BoundArgument]>,
-    pub(super) statistics: Box<[BoundStatistic]>,
-    pub(super) layouts: Box<[BoundLayout]>,
-    pub(super) slots: Box<[ExtremaSlot]>,
+    pub(super) statistic_count: usize,
+    pub(super) layout_count: usize,
+    pub(super) extrema_count: usize,
     pub(super) groups: Groups,
     pub(super) entries: Entries,
     pub(super) control: Control,
-}
-
-/// One bound aggregate call.
-pub(super) enum BoundCall {
-    RowsCount,
-    Count { statistic: usize },
-    Sum { statistic: usize },
-    Average { statistic: usize },
-    Extrema { slot: usize },
 }
 
 pub(super) struct BoundArgument {
     pub(super) owner: usize,
     pub(super) expression: BoundExpression,
     pub(super) field: Arc<Field>,
+    pub(super) statistic: Option<BoundStatistic>,
+    pub(super) extrema: Option<BoundExtrema>,
 }
 
 pub(super) struct BoundStatistic {
-    pub(super) argument: usize,
+    pub(super) index: usize,
     pub(super) kind: StatisticKind,
     pub(super) count_output: bool,
     pub(super) sum_output: bool,
 }
 
-/// One distinct ordered-argument expression of the bound aggregate.
-///
-/// Layouts are dense and 0-based, so a layout's position in
-/// [`AggregateOperation::layouts`] is also the partition id it owns in
-/// `aggregate.entries` and the layout index its [`ExtremaSlot`]s reference.
-pub(super) struct BoundLayout {
-    pub(super) argument: usize,
-    pub(super) field: Arc<Field>,
+/// Addresses assigned when an argument first needs an ordered partition or direction.
+pub(super) struct BoundExtrema {
+    pub(super) partition: usize,
     pub(super) min_slot: Option<usize>,
     pub(super) max_slot: Option<usize>,
-}
-
-/// One distinct (layout, direction) pair whose extreme is cached per group.
-///
-/// `MIN(x), MAX(x)` share one layout and need two slots; repeating the same
-/// call needs one. Caching only the directions that are bound keeps the cached
-/// state proportional to what the definition actually reads.
-pub(super) struct ExtremaSlot {
-    pub(super) layout: usize,
-}
-
-/// Bound calls, layouts and extrema slots produced by one Schema binding.
-pub(super) struct BoundAggregate {
-    pub(super) calls: Box<[BoundCall]>,
-    pub(super) arguments: Box<[BoundArgument]>,
-    pub(super) statistics: Box<[BoundStatistic]>,
-    pub(super) layouts: Box<[BoundLayout]>,
-    pub(super) slots: Box<[ExtremaSlot]>,
 }
 
 struct OutputRows {
@@ -324,32 +294,52 @@ impl AggregateOperation {
             None => control.get_bounded(size_of::<u64>())?.unwrap_or(0),
         };
         *next_group_id = Some(id.checked_add(1).ok_or(AggregateError::GroupIdExhausted)?);
+        let mut statistics = vec![Statistic::Count(0); self.statistic_count];
+        if self.statistic_count > 0 {
+            for argument in &self.arguments {
+                if let Some(statistic) = &argument.statistic {
+                    statistics[statistic.index] = statistic.kind.empty();
+                }
+            }
+        }
         Ok(GroupState {
             id,
             weight: 0,
-            statistics: self
-                .statistics
-                .iter()
-                .map(|statistic| statistic.kind.empty())
-                .collect(),
-            extremes: vec![None; self.slots.len()].into_boxed_slice(),
+            statistics,
+            extremes: vec![None; self.extrema_count].into_boxed_slice(),
         })
     }
 
     fn group_output(&self, state: &GroupState) -> Result<Vec<ScalarValue>, AggregateError> {
+        let statistic = |argument: usize| {
+            let bound = self.arguments[argument]
+                .statistic
+                .as_ref()
+                .expect("a statistical call assigned its argument a state slot");
+            &state.statistics[bound.index]
+        };
         self.calls
             .iter()
             .map(|call| match call {
-                BoundCall::RowsCount => count_value(state.weight),
-                BoundCall::Count { statistic } => count_value(state.statistics[*statistic].count()),
-                BoundCall::Sum { statistic } => state.statistics[*statistic].sum(),
-                BoundCall::Average { statistic } => state.statistics[*statistic].average(),
-                BoundCall::Extrema { slot } => {
-                    let target = &self.slots[*slot];
-                    let layout = &self.layouts[target.layout];
-                    match state.extremes[*slot].as_deref() {
-                        None => null(layout.field.data_type()),
-                        Some(key) => ordered_value(&layout.field, key).map_err(map_order_error),
+                AggregateCall::CountAll => count_value(state.weight),
+                AggregateCall::Count(argument) => count_value(statistic(*argument).count()),
+                AggregateCall::Sum(argument) => statistic(*argument).sum(),
+                AggregateCall::Avg(argument) => statistic(*argument).average(),
+                AggregateCall::Min(argument) | AggregateCall::Max(argument) => {
+                    let bound = &self.arguments[*argument];
+                    let extrema = bound
+                        .extrema
+                        .as_ref()
+                        .expect("an extrema call assigned its argument an ordered partition");
+                    let slot = if matches!(call, AggregateCall::Min(_)) {
+                        extrema.min_slot
+                    } else {
+                        extrema.max_slot
+                    }
+                    .expect("an extrema call assigned its direction a cache slot");
+                    match state.extremes[slot].as_deref() {
+                        None => null(bound.field.data_type()),
+                        Some(key) => ordered_value(&bound.field, key).map_err(map_order_error),
                     }
                 }
             })
@@ -374,21 +364,24 @@ impl AggregateOperation {
         >,
         budget: &mut StepBudget,
     ) -> Result<(), OperationError> {
-        for (layout_index, layout) in self.layouts.iter().enumerate() {
+        for (argument_index, argument) in self.arguments.iter().enumerate() {
+            let Some(extrema) = &argument.extrema else {
+                continue;
+            };
             // MIN/MAX accept flat scalars. Admit both the owned value and
             // its ordered key before either payload can be copied.
             budget.charge(
-                logical_array_bytes(columns[layout.argument].slice(row, 1).as_ref())
+                logical_array_bytes(columns[argument_index].slice(row, 1).as_ref())
                     .saturating_mul(2)
                     .saturating_add(size_of::<ScalarValue>()),
             )?;
-            let value = ScalarValue::try_from_array(columns[layout.argument].as_ref(), row)?;
+            let value = ScalarValue::try_from_array(columns[argument_index].as_ref(), row)?;
             // A NULL argument never enters the ordered partition, so it can
             // neither become nor retract an extreme.
-            let Some(key) = order_key(&layout.field, &value).map_err(map_order_error)? else {
+            let Some(key) = order_key(&argument.field, &value).map_err(map_order_error)? else {
                 continue;
             };
-            let partition_id = u32::try_from(layout_index)
+            let partition_id = u32::try_from(extrema.partition)
                 .expect("the layout count is bounded by the aggregate call count");
             let (before, after) =
                 pending.adjust(entries, partition_id, state.id, &key, difference, budget)?;
@@ -396,12 +389,12 @@ impl AggregateOperation {
             // the key just entered the partition.
             if before == 0 {
                 budget.charge(key.len().saturating_mul(2))?;
-                promote_cached_extreme(layout, &mut state.extremes, &key);
+                promote_cached_extreme(extrema, &mut state.extremes, &key);
             }
-            if after == 0 && caches_key(layout, &state.extremes, &key) {
+            if after == 0 && caches_key(extrema, &state.extremes, &key) {
                 pending.flush_layout(entries, partition_id, budget)?;
                 let partition = entries.partition(&EntryPartition::new(partition_id, state.id))?;
-                refresh_cached_extreme(layout, &mut state.extremes, &key, &partition, budget)?;
+                refresh_cached_extreme(extrema, &mut state.extremes, &key, &partition, budget)?;
             }
         }
         Ok(())
@@ -414,7 +407,11 @@ impl AggregateOperation {
         row: usize,
         difference: i64,
     ) -> Result<(), AggregateError> {
-        for (bound, statistic) in self.statistics.iter().zip(&mut state.statistics) {
+        for (argument_index, argument) in self.arguments.iter().enumerate() {
+            let Some(bound) = &argument.statistic else {
+                continue;
+            };
+            let statistic = &mut state.statistics[bound.index];
             if !matches!(
                 (bound.kind, &*statistic),
                 (StatisticKind::Count, Statistic::Count(_))
@@ -423,7 +420,7 @@ impl AggregateOperation {
             ) {
                 return Err(AggregateError::InvalidState);
             }
-            let value = ScalarValue::try_from_array(columns[bound.argument].as_ref(), row)?;
+            let value = ScalarValue::try_from_array(columns[argument_index].as_ref(), row)?;
             statistic.apply(&value, difference)?;
             if bound.count_output {
                 count_value(statistic.count())?;
@@ -474,7 +471,7 @@ impl AtomicOperation for AggregateOperation {
         let mut control = self.control.access(access)?;
         let mut next_group_id = None;
         let mut pending_group: Option<PendingGroup> = None;
-        let mut pending_extrema = PendingExtrema::new(self.layouts.len());
+        let mut pending_extrema = PendingExtrema::new(self.layout_count);
         let row_count = input.change.num_rows();
         let mut next_group = if row_count == 0 {
             None
@@ -519,16 +516,15 @@ impl AtomicOperation for AggregateOperation {
                 }
                 None => {
                     budget.charge(
-                        self.statistics
-                            .len()
+                        self.statistic_count
                             .saturating_mul(32)
-                            .saturating_add(self.slots.len() * 8 + 24),
+                            .saturating_add(self.extrema_count * 8 + 24),
                     )?;
                     self.new_group_state(&control, &mut next_group_id)?
                 }
             };
-            if state.statistics.len() != self.statistics.len()
-                || state.extremes.len() != self.slots.len()
+            if state.statistics.len() != self.statistic_count
+                || state.extremes.len() != self.extrema_count
             {
                 return Err(AggregateError::InvalidState.into());
             }
@@ -541,16 +537,20 @@ impl AtomicOperation for AggregateOperation {
             };
 
             state.weight = apply_weight(state.weight, difference, TrackedWeight::Group)?;
-            self.apply_extrema_row(
-                &mut state,
-                &columns.arguments,
-                row,
-                difference,
-                &mut pending_extrema,
-                &mut entries,
-                budget,
-            )?;
-            self.apply_statistics_row(&mut state, &columns.arguments, row, difference)?;
+            if self.layout_count > 0 {
+                self.apply_extrema_row(
+                    &mut state,
+                    &columns.arguments,
+                    row,
+                    difference,
+                    &mut pending_extrema,
+                    &mut entries,
+                    budget,
+                )?;
+            }
+            if self.statistic_count > 0 {
+                self.apply_statistics_row(&mut state, &columns.arguments, row, difference)?;
+            }
 
             if state.weight == 0 {
                 output.push(
@@ -660,7 +660,7 @@ fn count_value(count: u64) -> Result<ScalarValue, AggregateError> {
 ///
 /// A key that never was an extreme leaves both caches untouched, so the
 /// partition does not need to be opened at all.
-fn caches_key(layout: &BoundLayout, extremes: &[Option<Vec<u8>>], key: &[u8]) -> bool {
+fn caches_key(layout: &BoundExtrema, extremes: &[Option<Vec<u8>>], key: &[u8]) -> bool {
     [layout.min_slot, layout.max_slot]
         .into_iter()
         .flatten()
@@ -668,7 +668,7 @@ fn caches_key(layout: &BoundLayout, extremes: &[Option<Vec<u8>>], key: &[u8]) ->
 }
 
 /// Promotes a key that just entered its partition when it beats a cached extreme.
-fn promote_cached_extreme(layout: &BoundLayout, extremes: &mut [Option<Vec<u8>>], key: &[u8]) {
+fn promote_cached_extreme(layout: &BoundExtrema, extremes: &mut [Option<Vec<u8>>], key: &[u8]) {
     if let Some(slot) = layout.min_slot
         && extremes[slot]
             .as_deref()
@@ -690,7 +690,7 @@ fn promote_cached_extreme(layout: &BoundLayout, extremes: &mut [Option<Vec<u8>>]
 /// The partition is the source of truth, so the retraction of the cached
 /// extreme is the only case that pays for an ordered read.
 fn refresh_cached_extreme(
-    layout: &BoundLayout,
+    layout: &BoundExtrema,
     extremes: &mut [Option<Vec<u8>>],
     key: &[u8],
     partition: &MapPartition<'_, '_, Vec<u8>, std::num::NonZeroU64>,

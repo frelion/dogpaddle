@@ -20,13 +20,13 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 
 它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: OrderedMap<PartitionKey<EntryPartition, Vec<u8>>, NonZeroU64>` 和 `aggregate.control: Cell<u64>`。groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个不同参数的充分统计和每个极值 slot 的缓存；entries 的 partition 是 `layout + group ID`，只维护排序参数的 key 和正份数；control 分配不复用的 group ID，不保存完整输入行。
 
-绑定按 canonical expression 去重参数，每个不同参数每页只求值一次。`COUNT(*)` 直接读 group weight；同参数 `COUNT(x)`、`SUM(x)`、`AVG(x)` 共用一个非空 count 和 signed `i128` 或 unsigned `u128` sum，只有 COUNT 的非数值参数保存 count。输出调用是统计的读出，无独立 Fold 字节状态。COUNT 输出 non-null `Int64`；SUM 仅接受 `Int64/UInt64` 并保持类型，每个输入事件都检查对应窄 sum（即使与 AVG 共用统计）；AVG 以宽 sum 累计后输出 nullable `Float64`。
+绑定先按 canonical expression 去重参数，只绑定每个不同参数一次，并且每页只求值一次。参数直接拥有可选的统计槽地址和排序 partition/cache 地址，调用继续使用 `AggregateCall<usize>`，其中索引始终指向参数；不另建统计、layout 或 slot 到参数的反查表。统计、partition 和极值 slot 各自按首次使用分配 dense 地址，group 初始化按统计地址填槽，不按参数顺序收集。`COUNT(*)` 直接读 group weight；同参数 `COUNT(x)`、`SUM(x)`、`AVG(x)` 共用一个非空 count 和 signed `i128` 或 unsigned `u128` sum，只有 COUNT 的非数值参数保存 count。输出调用是统计的读出，无独立 Fold 字节状态。COUNT 输出 non-null `Int64`；SUM 仅接受 `Int64/UInt64` 并保持类型，每个输入事件都检查对应窄 sum（即使与 AVG 共用统计）；AVG 以宽 sum 累计后输出 nullable `Float64`。
 
 `GroupState` 的当前开发期 v1 value 使用固定宽度 big-endian owner codec：标记 `1`、u64 id、u64 正 weight、u32 statistic 数、u32 extrema 数；每个 statistic 固定 32 字节（Count/Signed/Unsigned tag、u64 count、16-byte sum、零 padding），每个 extrema 是 u64 key 长度加 key，`u64::MAX` 单独表示 None。编码长度恰为逻辑状态计费加一字节，因此 Map 在复制/解码前的长度准入也限制充分统计与缓存的解码逻辑大小；集合数先与剩余最短 payload 检查再分配，不因损坏 count 预留大块内存。解码拒绝零 group weight、非法 tag/padding、截断、尾随字节与越界 key。旧 value 直接重建，不提供格式识别或迁移。
 
 `MIN(x), MAX(x)` 共用一个排序 layout、两个 slot，重复方向复用一个 slot；同一个参数也复用上述求值结果。MIN/MAX 接受 non-float flat scalar（Null、Boolean、整数、Utf8、Binary、Date32、Timestamp、Decimal128）并输出 nullable 同类型。NULL 参数不进 entries/cache。相邻相同极值参数在事务内每 layout 暂存一个 key，仍逐事件校验份数；切换 key/group 或页结束才写回。撤回缓存极值时先 flush pending，再通过有界 first/last 刷新缓存，group weight 为零也必须刷新。净变化为零可省最终写入，不省中间校验和有序输出。
 
-校验按分组与参数统计进行，不维护完整行身份；参数组合被其它行覆盖时允许撤回。group 归零时，所有统计必须 count=0、sum=0，所有 extrema cache 必须 None，否则当前页失败并回滚。合法归零由逐事件份数归零自然删除 entries，不执行无界分区清理。需要记录级身份的算子继续按完整行记账。
+每个事件先处理全部 extrema，再处理全部统计；各阶段按参数首次出现顺序遍历，只在有相应角色时进入阶段。不同参数同时非法或超预算时，不承诺首个错误的参数或种类；仍逐事件校验并保留 Store 对非法份数调整的事务 poison。校验按分组与参数统计进行，不维护完整行身份；参数组合被其它行覆盖时允许撤回。group 归零时，所有统计必须 count=0、sum=0，所有 extrema cache 必须 None，否则当前页失败并回滚。合法归零由逐事件份数归零自然删除 entries，不执行无界分区清理。需要记录级身份的算子继续按完整行记账。
 
 每个输入事件完成全部更新和旧行 `-1`/新行 `+1`；组首次出现只输出 `+1`，消失只输出 `-1`，结果未变不输出。Atomic kernel 只消费共享逻辑字节预算，不消费 head work items；Flow 在 head 分页后同事务提交该页状态、输出和 Resume，预算不足回滚并缩小 head 页。持久 group 和极值读取在复制、解码前由 Store admission 限制；状态、临时参数、缓存、写入和结果计入该页预算。此前已提交的页不会因后续页非法而撤销。
 

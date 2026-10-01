@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{Criterion, Throughput};
 use datafusion_expr::col;
@@ -30,6 +30,8 @@ const BENCHMARK: &str = "aggregate_extrema";
 /// fixed and varies the rows inside it, which is where the aggregate used to pay
 /// two ordered partition reads per row.
 const BULK_ROWS: usize = 4096;
+const ARGUMENT_COUNT: usize = 64;
+const ARGUMENT_ROWS: usize = 512;
 
 struct Fixture {
     operation: Operation,
@@ -39,7 +41,6 @@ struct Fixture {
 
 impl Fixture {
     fn new(root: &RunRoot, schema: &SchemaRef, pairs: usize, distinct_layouts: bool) -> Self {
-        let sample = root.sample(BENCHMARK);
         let definition = AggregateDefinition::try_new(
             [("group", col("group"))],
             (0..pairs).flat_map(|index| {
@@ -58,8 +59,17 @@ impl Fixture {
             }),
         )
         .expect("define aggregate");
+        Self::with_definition(root, schema, definition)
+    }
+
+    fn with_definition(
+        root: &RunRoot,
+        schema: &SchemaRef,
+        definition: AggregateDefinition,
+    ) -> Self {
+        let sample = root.sample(BENCHMARK);
         let mut setup = StoreSetup::new();
-        let (operation, _) = OperationDefinition::from(definition.clone())
+        let (operation, _) = OperationDefinition::from(definition)
             .construct(
                 &[Arc::clone(schema)],
                 &mut setup.data_scope().scoped("operation"),
@@ -230,6 +240,19 @@ fn main() {
             "hot_extrema_value": 150,
             "zero_net_group_cycle_rows": BULK_ROWS,
             "bulk_new_groups_per_turn": BULK_ROWS,
+            "many_argument_cases": {
+                "unique_arguments": ARGUMENT_COUNT,
+                "rows_per_turn": ARGUMENT_ROWS,
+                "group_count": 1,
+                "seed_weight": 1,
+                "argument_values": "50 + argument index, repeated within the batch",
+                "count_only_statistics": ARGUMENT_COUNT,
+                "sparse_statistics": 2,
+                "sparse_extrema_partitions": ARGUMENT_COUNT,
+                "sparse_extrema_slots": ARGUMENT_COUNT * 2,
+                "oracle": "untimed two-event insert/retract trace and every output column/diff of the full timed batches",
+                "scope": "complete apply and commit; constructor binding is outside timing"
+            },
             "timed_boundary": "one or two full-batch Atomic apply calls per case under an explicit 64MiB logical byte allowance; each includes Transaction::commit; writes synchronize WAL",
             "untimed": "fixture, seed, warmup, output validation, teardown"
         }
@@ -330,6 +353,8 @@ fn main() {
     bench_zero_net_group_cycles(&mut criterion, &root, &historical_schema, &seed);
     bench_existing_groups(&mut criterion, &root, &historical_schema);
     bench_new_groups(&mut criterion, &root, &historical_schema);
+    bench_count_arguments(&mut criterion, &root);
+    bench_sparse_statistics(&mut criterion, &root);
     criterion.final_summary();
 }
 
@@ -562,4 +587,210 @@ fn validate_group_lifecycle(output: Option<&Change>, groups: &[i64], difference:
             .expect("Int64 extrema output");
         assert!(values.values().iter().all(|value| *value == 50));
     }
+}
+
+fn argument_schema() -> SchemaRef {
+    Arc::new(Schema::new(
+        std::iter::once(Field::new("group", DataType::Int64, false))
+            .chain(
+                (0..ARGUMENT_COUNT)
+                    .map(|index| Field::new(format!("value_{index}"), DataType::Int64, true)),
+            )
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn assert_argument_output(output: Option<&Change>, columns: &[Vec<i64>], diffs: &[i64]) {
+    let output = output.expect("argument transition output");
+    assert_eq!(output.num_rows(), diffs.len());
+    assert_eq!(output.diffs().values(), diffs);
+    assert_eq!(output.records().num_columns(), columns.len());
+    for (column, expected) in output.records().columns().iter().zip(columns) {
+        let values = column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 output");
+        assert_eq!(values.null_count(), 0);
+        assert_eq!(values.values(), expected.as_slice());
+    }
+}
+
+fn count_columns(counts: &[i64]) -> Vec<Vec<i64>> {
+    std::iter::once(vec![1; counts.len()])
+        .chain((0..ARGUMENT_COUNT).map(|_| counts.to_vec()))
+        .collect()
+}
+
+fn sparse_columns(counts: &[i64], extrema: &[(i64, i64)]) -> Vec<Vec<i64>> {
+    assert_eq!(counts.len(), extrema.len());
+    let mut columns = vec![vec![1; counts.len()], counts.to_vec(), counts.to_vec()];
+    for argument in 0..ARGUMENT_COUNT {
+        let offset = i64::try_from(argument).expect("argument index fits i64");
+        columns.push(extrema.iter().map(|(min, _)| min + offset).collect());
+        columns.push(extrema.iter().map(|(_, max)| max + offset).collect());
+    }
+    columns
+}
+
+/// The two-event oracle checks each COUNT argument's NULL handling before the
+/// common non-NULL timed workload.
+fn check_count_arguments(fixture: &mut Fixture, schema: &SchemaRef) {
+    let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(Int64Array::from(vec![1, 1]))];
+    let mut inserted = vec![vec![1; 3]];
+    let mut retracted = vec![vec![1; 3]];
+    for argument in 0..ARGUMENT_COUNT {
+        let first = (argument % 3 != 1).then_some(10);
+        let second = (argument % 3 != 2).then_some(20);
+        columns.push(Arc::new(Int64Array::from(vec![first, second])));
+        let before = i64::from(first.is_some());
+        let after = i64::from(second.is_some());
+        inserted.push(vec![before, before, before + after]);
+        retracted.push(vec![before + after, after, after]);
+    }
+    let records = RecordBatch::try_new(Arc::clone(schema), columns).expect("two-event records");
+    let insert = Change::try_new(records.clone(), Int64Array::from(vec![1, 1])).unwrap();
+    let retract = Change::try_new(records, Int64Array::from(vec![-1, -1])).unwrap();
+    assert_argument_output(fixture.apply(&insert).as_ref(), &inserted, &[1, -1, 1]);
+    assert_argument_output(fixture.apply(&retract).as_ref(), &retracted, &[-1, 1, -1]);
+}
+
+/// All 64 COUNT arguments participate in every event. Construction remains
+/// untimed; this case measures traversal of the wider bound argument records.
+fn bench_count_arguments(criterion: &mut Criterion, root: &RunRoot) {
+    let schema = argument_schema();
+    let definition = AggregateDefinition::try_new(
+        [("group", col("group"))],
+        (0..ARGUMENT_COUNT).map(|index| {
+            (
+                format!("count_{index}"),
+                AggregateCall::Count(col(format!("value_{index}"))),
+            )
+        }),
+    )
+    .expect("define COUNT arguments");
+    let mut fixture = Fixture::with_definition(root, &schema, definition);
+    check_count_arguments(&mut fixture, &schema);
+    let seed = change(&schema, &[50], vec![1]);
+    assert_argument_output(fixture.apply(&seed).as_ref(), &count_columns(&[1]), &[1]);
+    let insert = change(&schema, &vec![50; ARGUMENT_ROWS], vec![1; ARGUMENT_ROWS]);
+    let retract = change(&schema, &vec![50; ARGUMENT_ROWS], vec![-1; ARGUMENT_ROWS]);
+    let rows = i64::try_from(ARGUMENT_ROWS).expect("argument rows fit i64");
+    let up = count_columns(
+        &(1..=rows)
+            .flat_map(|count| [count, count + 1])
+            .collect::<Vec<_>>(),
+    );
+    let down = count_columns(
+        &(2..=rows + 1)
+            .rev()
+            .flat_map(|count| [count, count - 1])
+            .collect::<Vec<_>>(),
+    );
+    let diffs: Vec<_> = (0..ARGUMENT_ROWS).flat_map(|_| [-1, 1]).collect();
+    assert_argument_output(fixture.apply(&insert).as_ref(), &up, &diffs);
+    assert_argument_output(fixture.apply(&retract).as_ref(), &down, &diffs);
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(ARGUMENT_ROWS * 2).unwrap(),
+    ));
+    group.bench_function("many_count_arguments_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let increased = fixture.apply(&insert);
+                let restored = fixture.apply(&retract);
+                elapsed += started.elapsed();
+                assert_argument_output(increased.as_ref(), &up, &diffs);
+                assert_argument_output(restored.as_ref(), &down, &diffs);
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+/// Two statistical roles are sparse among 64 extrema arguments. Repeated keys
+/// use the existing pending-key path while both role loops inspect arguments.
+fn bench_sparse_statistics(criterion: &mut Criterion, root: &RunRoot) {
+    let schema = argument_schema();
+    let calls = (0..2)
+        .map(|index| {
+            (
+                format!("count_{index}"),
+                AggregateCall::Count(col(format!("value_{index}"))),
+            )
+        })
+        .chain((0..ARGUMENT_COUNT).flat_map(|index| {
+            let expression = col(format!("value_{index}"));
+            [
+                (
+                    format!("min_{index}"),
+                    AggregateCall::Min(expression.clone()),
+                ),
+                (format!("max_{index}"), AggregateCall::Max(expression)),
+            ]
+        }));
+    let definition = AggregateDefinition::try_new([("group", col("group"))], calls)
+        .expect("define sparse statistics and extrema");
+    let mut fixture = Fixture::with_definition(root, &schema, definition);
+    let small = change(&schema, &[10, 20], vec![1, 1]);
+    let small_undo = change(&schema, &[10, 20], vec![-1, -1]);
+    assert_argument_output(
+        fixture.apply(&small).as_ref(),
+        &sparse_columns(&[1, 1, 2], &[(10, 10), (10, 10), (10, 20)]),
+        &[1, -1, 1],
+    );
+    assert_argument_output(
+        fixture.apply(&small_undo).as_ref(),
+        &sparse_columns(&[2, 1, 1], &[(10, 20), (20, 20), (20, 20)]),
+        &[-1, 1, -1],
+    );
+    let seed = change(&schema, &[50], vec![1]);
+    assert_argument_output(
+        fixture.apply(&seed).as_ref(),
+        &sparse_columns(&[1], &[(50, 50)]),
+        &[1],
+    );
+    let insert = change(&schema, &vec![50; ARGUMENT_ROWS], vec![1; ARGUMENT_ROWS]);
+    let retract = change(&schema, &vec![50; ARGUMENT_ROWS], vec![-1; ARGUMENT_ROWS]);
+    let rows = i64::try_from(ARGUMENT_ROWS).expect("argument rows fit i64");
+    let extrema = vec![(50, 50); ARGUMENT_ROWS * 2];
+    let up = sparse_columns(
+        &(1..=rows)
+            .flat_map(|count| [count, count + 1])
+            .collect::<Vec<_>>(),
+        &extrema,
+    );
+    let down = sparse_columns(
+        &(2..=rows + 1)
+            .rev()
+            .flat_map(|count| [count, count - 1])
+            .collect::<Vec<_>>(),
+        &extrema,
+    );
+    let diffs: Vec<_> = (0..ARGUMENT_ROWS).flat_map(|_| [-1, 1]).collect();
+    assert_argument_output(fixture.apply(&insert).as_ref(), &up, &diffs);
+    assert_argument_output(fixture.apply(&retract).as_ref(), &down, &diffs);
+
+    let mut group = criterion.benchmark_group(BENCHMARK);
+    group.throughput(Throughput::Elements(
+        u64::try_from(ARGUMENT_ROWS * 2).unwrap(),
+    ));
+    group.bench_function("sparse_statistics_many_extrema_one_turn", |bencher| {
+        bencher.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let increased = fixture.apply(&insert);
+                let restored = fixture.apply(&retract);
+                elapsed += started.elapsed();
+                assert_argument_output(increased.as_ref(), &up, &diffs);
+                assert_argument_output(restored.as_ref(), &down, &diffs);
+            }
+            elapsed
+        });
+    });
+    group.finish();
 }
