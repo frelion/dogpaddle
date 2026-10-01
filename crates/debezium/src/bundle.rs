@@ -53,15 +53,7 @@ pub(crate) struct Bundle {
 
 impl Bundle {
     pub(crate) fn open(root: &Path) -> Result<Self, Error> {
-        let root = root.canonicalize().map_err(|_| {
-            invalid(format!(
-                "Debezium runtime bundle does not exist: {}",
-                root.display()
-            ))
-        })?;
-        if !root.is_dir() {
-            return Err(invalid("Debezium runtime bundle root is not a directory"));
-        }
+        let root = canonical_root(root)?;
 
         validate_bundle_manifest(&root)?;
         validate_runtime_release(&root)?;
@@ -94,6 +86,19 @@ impl Bundle {
     pub(crate) fn jvm_library(&self) -> &Path {
         &self.jvm_library
     }
+}
+
+pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf, Error> {
+    let root = root.canonicalize().map_err(|_| {
+        invalid(format!(
+            "Debezium runtime bundle does not exist: {}",
+            root.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(invalid("Debezium runtime bundle root is not a directory"));
+    }
+    Ok(root)
 }
 
 fn validate_bundle_manifest(root: &Path) -> Result<(), Error> {

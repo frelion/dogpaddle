@@ -132,7 +132,7 @@ dogpaddle-debezium-runtime-<target>/
 └── debezium/             # bridge、connector 和依赖 JAR
 ```
 
-`open` 校验 target、Temurin release、必要运行文件、JAR 清单与 hash，并通过 bundle 内的绝对路径加载
+首次 `open` 校验 target、Temurin release、必要运行文件、JAR 清单与 hash，并通过 bundle 内的绝对路径加载
 `libjvm`。它不会搜索 `PATH`、`JAVA_HOME`、`JDK_HOME` 或系统 Java。
 
 产品 archive 把这份 payload 安装在 `<archive>/libexec/dogpaddle/debezium`，与
@@ -140,8 +140,8 @@ dogpaddle-debezium-runtime-<target>/
 向上定位安装根。源码树和系统测试可以用绝对路径环境变量 `DOGPADDLE_DEBEZIUM_RUNTIME` 覆盖默认位置，
 生产安装沿用 archive 布局即可。这个定位规则属于产品 SQL 层；`DebeziumRuntime::open` 本身仍只接受显式路径。
 
-一个进程最多只有一个 `HotSpot` JVM。再次打开同一个 canonical bundle path 会复用它；尝试打开另一个 bundle
-会明确失败。`DebeziumRuntime` 被丢弃不会卸载 JVM：进程级 `OnceLock` 会让它存活到进程结束，也不能重新配置。
+一个进程最多只有一个 `HotSpot` JVM。再次打开同一个 canonical bundle path 只检查目录路径并复用已经验证的 host，不重新读取或 hash JAR；符号链接别名解析到同一目录也可复用。已有 host 时，另一个存在的目录在内容校验前以 `JvmConfigurationConflict` 拒绝，即使其 bundle 内容无效；不存在的路径或普通文件仍以 `InvalidBundle` 拒绝。初次完整校验和 JVM 启动在同一进程锁内完成，只有 bridge/runtime 校验成功才发布 host；启动前失败不会缓存成功事实。
+`DebeziumRuntime` 被丢弃不会卸载 JVM：进程级 `OnceLock` 会让它存活到进程结束，也不能重新配置。
 `DogPaddle` 必须是进程内第一个且唯一的 JVM initializer；JVM 启动后的 bridge/runtime 校验失败通常也需要重启进程。
 bundle 必须在整个进程生命周期内保持不可修改，并安装在不受非信任用户写入的位置。
 
@@ -233,6 +233,13 @@ runtime bundle workflow 会在四个平台上验证完整生命周期：open、s
 checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-tests/debezium-runtime/`；真实 `PostgreSQL`
 恢复矩阵由独立的 `system-tests/debezium-postgres/scripts/run.sh` 拥有。完整入口见
 [`TESTING.md`](../../TESTING.md)。
+
+2026-10-01 在 Apple M5、macOS arm64、Rust 1.96 上，用同一真实 bundle 和同一 probe 的 `--measure-open`
+分别测量 32 次同路径重复 `open`。bundle 含 80 个 JAR，共 50,015,105 字节；初始化 JVM、返回值 drop 和 stdout
+均在计时外，只计 `DebeziumRuntime::open`。中位数从 17.808 ms 降到 5.375 µs；样本范围分别为
+17.628–19.947 ms 和 5.166–27.417 µs。这只反映已启动 host 的重复打开成本，不表示 JVM 首次启动或 CDC 吞吐提速。
+原始上下文、32 个样本、二进制 SHA 和验证日志位于 `/tmp/dogpaddle-validated-jvm-performance/`；
+其中 `*-stale-artifact.*` 使用了未重编的旧二进制，已作废，不计入结果。
 
 ## 版本边界
 

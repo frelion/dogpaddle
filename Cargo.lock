@@ -1538,6 +1538,7 @@ dependencies = [
  "ctrlc",
  "dogpaddle-debezium",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

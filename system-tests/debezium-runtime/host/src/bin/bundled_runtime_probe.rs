@@ -1,12 +1,15 @@
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Barrier, mpsc};
+use std::time::{Duration, Instant};
 
-use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, Delivery, Header, Record};
+use dogpaddle_debezium::{
+    Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, Delivery, ErrorKind, Header, Record,
+};
 use serde_json::Value;
 
 const CONNECTOR_CLASS: &str = "dev.dogpaddle.debezium.probe.LifecycleProbeConnector";
@@ -29,9 +32,16 @@ struct RecordSnapshot {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let bundle = match (arguments.next(), arguments.next()) {
-        (Some(bundle), None) => PathBuf::from(bundle),
-        _ => return Err(probe_error("usage: bundled_runtime_probe BUNDLE_ROOT")),
+    let (bundle, measure_open) = match (arguments.next(), arguments.next(), arguments.next()) {
+        (Some(bundle), None, None) => (PathBuf::from(bundle), false),
+        (Some(bundle), Some(flag), None) if flag == "--measure-open" => {
+            (PathBuf::from(bundle), true)
+        }
+        _ => {
+            return Err(probe_error(
+                "usage: bundled_runtime_probe BUNDLE_ROOT [--measure-open]",
+            ));
+        }
     };
 
     // Match the product host: install its handler before initializing the JVM.
@@ -39,7 +49,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     ctrlc::set_handler(move || {
         let _ = interrupt.try_send(());
     })?;
-    let runtime = dogpaddle_debezium::DebeziumRuntime::open(&bundle)?;
+    if measure_open {
+        return measure_repeated_open(&bundle);
+    }
+
+    let runtime = verify_runtime_open(&bundle)?;
     require(
         Command::new("/bin/kill")
             .args(["-INT", &std::process::id().to_string()])
@@ -105,6 +119,75 @@ fn main() -> Result<(), Box<dyn Error>> {
         "PASS bundled Debezium public lifecycle and host Ctrl-C handler: {}",
         bundle.display()
     );
+    Ok(())
+}
+
+fn verify_runtime_open(bundle: &Path) -> Result<DebeziumRuntime, Box<dyn Error>> {
+    let paths = tempfile::tempdir()?;
+    let invalid_bundle = paths.path().join("invalid-bundle");
+    fs::create_dir(&invalid_bundle)?;
+    fs::write(invalid_bundle.join("MANIFEST"), b"invalid")?;
+    require_open_error(&invalid_bundle, ErrorKind::InvalidBundle)?;
+
+    let barrier = Barrier::new(4);
+    let runtimes = std::thread::scope(|scope| {
+        let workers = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    DebeziumRuntime::open(bundle)
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| probe_error("concurrent runtime open panicked"))?
+                    .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()
+    })?;
+    let runtime = runtimes
+        .into_iter()
+        .next()
+        .ok_or_else(|| probe_error("concurrent runtime open returned no host"))?;
+    drop(DebeziumRuntime::open(bundle)?);
+    let alias = paths.path().join("bundle-alias");
+    std::os::unix::fs::symlink(bundle.canonicalize()?, &alias)?;
+    drop(DebeziumRuntime::open(&alias)?);
+    require_open_error(&invalid_bundle, ErrorKind::JvmConfigurationConflict)?;
+    require_open_error(&paths.path().join("missing"), ErrorKind::InvalidBundle)?;
+    let file = paths.path().join("file");
+    fs::write(&file, b"not a directory")?;
+    require_open_error(&file, ErrorKind::InvalidBundle)?;
+    Ok(runtime)
+}
+
+fn require_open_error(path: &Path, kind: ErrorKind) -> Result<(), Box<dyn Error>> {
+    require(
+        DebeziumRuntime::open(path)
+            .err()
+            .is_some_and(|error| error.kind() == kind),
+        format!("runtime open did not reject {} as {kind:?}", path.display()),
+    )
+}
+
+fn measure_repeated_open(bundle: &Path) -> Result<(), Box<dyn Error>> {
+    let runtime = DebeziumRuntime::open(bundle)?;
+    for sample in 0..32 {
+        let started = Instant::now();
+        let reopened = DebeziumRuntime::open(bundle)?;
+        let elapsed = started.elapsed();
+        std::hint::black_box(&reopened);
+        drop(reopened);
+        println!(
+            "repeated_open sample={sample} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
+    drop(runtime);
     Ok(())
 }
 

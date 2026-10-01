@@ -216,6 +216,8 @@ system-tests 的稳定 host 布局：根 workspace 的 `system-tests/debezium-ru
 
 ## 系统验收
 
+真实 runtime bundle probe 覆盖失败首次打开后的重试、四线程首次启动、同 canonical 路径/符号链接别名复用、不同目录的配置冲突和无效路径拒绝。可选 `--measure-open` 只观测初始化后 32 次同路径 open，旧、新产品共用相同 probe 源码；初始化、输出和 drop 在计时外，默认完整生命周期仍由系统验收执行。
+
 普通 Cargo gate 保持离线。真实系统入口为：
 
 ```bash

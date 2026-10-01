@@ -5,7 +5,7 @@ use std::time::Duration;
 use jni::objects::{Global, JByteArray, JObject, Reference};
 use jni::{InitArgsBuilder, JValue, JavaVM, jni_sig, jni_str};
 
-use crate::bundle::Bundle;
+use crate::bundle::{Bundle, canonical_root};
 use crate::connector::Connector;
 use crate::{Checkpoint, ConnectorConfig, Error, ErrorKind};
 
@@ -41,12 +41,18 @@ impl DebeziumRuntime {
     /// `debezium/`. No system Java installation or `JAVA_HOME` fallback is
     /// consulted.
     ///
+    /// Only initial startup validates the complete bundle and JAR checksums.
+    /// Later calls resolve its directory and reuse the already validated host.
+    /// The bundle must remain immutable for the entire process lifetime.
+    ///
     /// # Errors
     ///
     /// Returns an error when the bundle is invalid, the bundled JVM cannot be
-    /// started, or another bundle already initialized the process JVM.
+    /// started, or another bundle already initialized the process JVM. An existing
+    /// different directory is rejected as a configuration conflict before its
+    /// contents are validated; missing paths and non-directories are invalid bundles.
     pub fn open(bundle: impl AsRef<Path>) -> Result<Self, Error> {
-        let bundle = Bundle::open(bundle.as_ref())?;
+        let root = canonical_root(bundle.as_ref())?;
         let slot = JVM_HOST.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().map_err(|_| {
             Error::new(
@@ -56,7 +62,7 @@ impl DebeziumRuntime {
         })?;
 
         if let Some(host) = guard.as_ref() {
-            if host.bundle_root != bundle.root() {
+            if host.bundle_root != root {
                 return Err(Error::new(
                     ErrorKind::JvmConfigurationConflict,
                     format!(
@@ -70,6 +76,7 @@ impl DebeziumRuntime {
             });
         }
 
+        let bundle = Bundle::open(&root)?;
         let host = Arc::new(JvmHost::launch(&bundle)?);
         *guard = Some(Arc::clone(&host));
         Ok(Self { host })
