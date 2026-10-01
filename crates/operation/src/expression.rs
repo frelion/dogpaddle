@@ -115,7 +115,7 @@ pub(crate) struct BoundProjection {
     column_projection: Option<ChangeProjection>,
 }
 
-/// Failure while executing a `Select` or `SchemaAlign` expression projection.
+/// Failure while executing a `Select` expression projection.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProjectionError {

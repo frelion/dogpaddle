@@ -7,10 +7,7 @@ use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, col, lit,
     operation::{
         OperationInput,
-        transform::{
-            FilterDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition,
-        },
+        transform::{FilterDefinition, SelectDefinition, SelectField, UnionAllDefinition},
     },
 };
 use dogpaddle_store::{Store, StoreSetup};
@@ -93,7 +90,7 @@ fn structural_trace(
 }
 
 #[test]
-fn project_select_and_schema_align_preserve_flattened_records_and_diffs_across_rebatching() {
+fn select_projections_preserve_flattened_records_and_diffs_across_rebatching() {
     let rows = [(1, 10, 1), (2, 20, -1), (3, 30, 2), (4, 40, -2)];
     let cases: [(&str, OperationDefinition); 3] = [
         (
@@ -112,12 +109,23 @@ fn project_select_and_schema_align_preserve_flattened_records_and_diffs_across_r
             .into(),
         ),
         (
-            "SchemaAlign",
-            SchemaAlignDefinition::try_new([
-                SchemaAlignField::try_new("right", col("right"), false).unwrap(),
-                SchemaAlignField::try_new("left", col("left"), true).unwrap(),
+            "Select explicit Schema",
+            SelectDefinition::try_new([
+                SelectField {
+                    name: "right".into(),
+                    expression: col("right"),
+                    nullable: Some(false),
+                    metadata: Some(arrow_schema::Metadata::new()),
+                },
+                SelectField {
+                    name: "left".into(),
+                    expression: col("left"),
+                    nullable: Some(true),
+                    metadata: Some(arrow_schema::Metadata::new()),
+                },
             ])
             .unwrap()
+            .with_metadata(arrow_schema::Metadata::new())
             .into(),
         ),
     ];

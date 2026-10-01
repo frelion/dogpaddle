@@ -36,8 +36,6 @@ mod projection_columns;
 mod protocol;
 #[path = "correctness/running_event_count.rs"]
 mod running_event_count;
-#[path = "correctness/schema_align.rs"]
-mod schema_align;
 #[path = "correctness/select.rs"]
 mod select;
 #[path = "correctness/sequence_scan.rs"]

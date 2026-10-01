@@ -31,7 +31,7 @@ use dogpaddle_operation::{
     operation::transform::{
         AggregateCall, AggregateDefinition, AsOfDirection, AsOfEqualityKey, AsOfJoinDefinition,
         AsOfOrderKey, DistinctDefinition, EquiJoinDefinition, EquiJoinKind, FilterDefinition,
-        SchemaAlignDefinition, SchemaAlignField, UnionAllDefinition,
+        SelectDefinition, SelectField, UnionAllDefinition,
     },
 };
 
@@ -243,24 +243,21 @@ impl Lowerer<'_> {
                     .cloned()
                     .zip(projection.schema.fields())
                     .map(|(expression, field)| {
-                        SchemaAlignField::try_new_with_metadata(
-                            field.name().to_owned(),
-                            rewrite_columns(
+                        Ok(SelectField {
+                            name: field.name().to_owned(),
+                            expression: rewrite_columns(
                                 expression.unalias(),
                                 projection.input.schema(),
                                 &input.physical_schema,
                             )?,
-                            field.is_nullable(),
-                            field.metadata().clone(),
-                        )
-                        .map_err(SqlError::endpoint)
+                            nullable: Some(field.is_nullable()),
+                            metadata: Some(field.metadata().clone()),
+                        })
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let definition = SchemaAlignDefinition::try_new_with_metadata(
-                    fields,
-                    projection.schema.metadata().clone(),
-                )
-                .map_err(SqlError::endpoint)?;
+                    .collect::<Result<Vec<_>, SqlError>>()?;
+                let definition = SelectDefinition::try_new(fields)
+                    .map_err(SqlError::endpoint)?
+                    .with_metadata(projection.schema.metadata().clone());
                 self.add_transform([input], definition)
             }
             LogicalPlan::Distinct(LogicalDistinct::All(input)) => {
@@ -544,21 +541,18 @@ impl Lowerer<'_> {
         let fields = positions
             .iter()
             .zip(target.fields())
-            .map(|(position, target)| {
-                SchemaAlignField::try_new_with_metadata(
-                    target.name().to_owned(),
-                    Expr::Column(Column::new_unqualified(
-                        input.physical_schema.field(*position).name(),
-                    )),
-                    target.is_nullable(),
-                    target.metadata().clone(),
-                )
-                .map_err(SqlError::endpoint)
+            .map(|(position, target)| SelectField {
+                name: target.name().to_owned(),
+                expression: Expr::Column(Column::new_unqualified(
+                    input.physical_schema.field(*position).name(),
+                )),
+                nullable: Some(target.is_nullable()),
+                metadata: Some(target.metadata().clone()),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let definition =
-            SchemaAlignDefinition::try_new_with_metadata(fields, target.metadata().clone())
-                .map_err(SqlError::endpoint)?;
+            .collect::<Vec<_>>();
+        let definition = SelectDefinition::try_new(fields)
+            .map_err(SqlError::endpoint)?
+            .with_metadata(target.metadata().clone());
         self.add_transform([input], definition)
     }
 
@@ -591,21 +585,18 @@ impl Lowerer<'_> {
             .iter()
             .zip(join_schema.fields())
             .enumerate()
-            .map(|(index, (source, target))| {
-                SchemaAlignField::try_new_with_metadata(
-                    internal_join_field_name(index),
-                    Expr::Column(Column::new_unqualified(
-                        input.physical_schema.field(*source).name(),
-                    )),
-                    target.is_nullable(),
-                    target.metadata().clone(),
-                )
-                .map_err(SqlError::endpoint)
+            .map(|(index, (source, target))| SelectField {
+                name: internal_join_field_name(index),
+                expression: Expr::Column(Column::new_unqualified(
+                    input.physical_schema.field(*source).name(),
+                )),
+                nullable: Some(target.is_nullable()),
+                metadata: Some(target.metadata().clone()),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let definition =
-            SchemaAlignDefinition::try_new_with_metadata(fields, join_schema.metadata().clone())
-                .map_err(SqlError::endpoint)?;
+            .collect::<Vec<_>>();
+        let definition = SelectDefinition::try_new(fields)
+            .map_err(SqlError::endpoint)?
+            .with_metadata(join_schema.metadata().clone());
         self.add_transform([input], definition)
     }
 

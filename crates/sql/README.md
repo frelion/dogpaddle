@@ -195,7 +195,7 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
 非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同一 Atomic 尾链的
-`SchemaAlign` 恢复 `DataFusion` 给出的字段顺序、nullability 和 metadata，并用无歧义的内部字段名继续父级 lowering；query 最终的 positional `SchemaAlign` 再恢复 SQL 字段名。
+`Select` 恢复 `DataFusion` 给出的字段顺序、nullability 和 metadata，并用无歧义的内部字段名继续父级 lowering；query 最终的 positional `Select` 再恢复 SQL 字段名。
 
 `ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row
 选择至多一个 right row，没有匹配时仍保留 left row，并把 right 字段补为 NULL。`MATCH_CONDITION`
@@ -223,7 +223,7 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 - Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
 - 会在规划时丢失语义的 sampling、hint、row lock、typed alias 等语法。
 
-`DataFusion` 只做 parser、`SqlToRel`、`TypeCoercion` 和单条 `OptimizeProjections` 规则；SQL crate 不运行完整 logical optimizer、physical planner 或 `SessionContext`。列裁剪会把下游确实使用的列穿过 Join 和 Aggregate 推回 Scan，避免这些持久算子保存无关宽列。CDC Definition 在 Flow build 前直接采用同源引用的列并集，因此 bootstrap input Queue 和 Scan output 都不写入无用 source 列；Sequence 保持通用的 Scan 后 positional `SchemaAlign`。Projection、Union 分支和 query 最终输出也通过 positional `SchemaAlign` 精确保留分析后的 Arrow Schema；即使优化器删除根部 identity Projection，Sink 仍收到 SQL 字段名、nullability 和 metadata。
+`DataFusion` 只做 parser、`SqlToRel`、`TypeCoercion` 和单条 `OptimizeProjections` 规则；SQL crate 不运行完整 logical optimizer、physical planner 或 `SessionContext`。列裁剪会把下游确实使用的列穿过 Join 和 Aggregate 推回 Scan，避免这些持久算子保存无关宽列。CDC Definition 在 Flow build 前直接采用同源引用的列并集，因此 bootstrap input Queue 和 Scan output 都不写入无用 source 列；Sequence 保持通用的 Scan 后 positional `Select`。Projection、Union 分支和 query 最终输出也通过 positional `Select` 精确保留分析后的 Arrow Schema；即使优化器删除根部 identity Projection，Sink 仍收到 SQL 字段名、nullability 和 metadata。
 
 ## 装配与稳定 ID
 
@@ -232,7 +232,7 @@ Atomic 融合和调用栈事务边界由 [Flow](../flow/README.md#最小公共-a
 Scan ID 为 `sql/scan/{index:08x}`，logical Transform 使用稠密 `sql/transform/{index:08x}`，最终 Sink 为 `sql/sink`。所有逻辑身份均进入唯一 Flow Definition。Source input Queue 的 streaming 捕获和每个 Sink outbox 各有独立 64 MiB 容量；封口后尚未消费的 bootstrap input 可以超过 64 MiB，期间 streaming record 不获准提交；图中的计算边不保存订阅日志。
 
 构建时 lowering 只接受 endpoint `TableScan`、`Filter`、`Projection`、`SubqueryAlias`、`Join`、`AsOfJoin`、`Union`、`Distinct::All` 和非空分组 `Aggregate`。
-`SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `SchemaAlign`。
+`SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `Select`。
 只执行 `TypeCoercion` Analyzer 并关闭 `Utf8View` 映射；语法层先拒绝会被 planner 擦除的 modifier。
 SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata 与 `AggregateCall` lowering，不重复函数目录。
 同一 CTE 的重复引用复用 Scan identity。lowering 先收集各次引用投影的最小并集，让共享 CDC Scan 从 source converter 起只输出这份并集；每个引用再在进入自己的分支前选择所需子集，因此一条分支的额外列不会扩大另一条分支的 Join 或 Aggregate 状态。空并集保留事件行数与 diff。CDC Definition 的 `output_projection` 属于开发期 v1 持久布局，旧状态直接重建。任何已声明却不可达的 Scan 都在创建状态前拒绝。
@@ -258,4 +258,4 @@ cargo test -p dogpaddle-sql --doc
 
 ### 分页 Join 的运行错误
 
-普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；源 Delivery 可以在完整持久捕获后提前 ACK；计算帧的输入只在完成后释放。重启继续同一未完成输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `SchemaAlign`，普通 Rust 投影使用 `Select`，两者共享执行实现。
+普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；源 Delivery 可以在完整持久捕获后提前 ACK；计算帧的输入只在完成后释放。重启继续同一未完成输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `Select`，Rust 与 SQL 投影均使用同一 `Select` Definition 与执行实现。

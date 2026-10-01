@@ -10,8 +10,7 @@ use dogpaddle_operation::{
         AtomicOperation, Operation, OperationInput, StepBudget,
         transform::{
             AggregateCall, AggregateDefinition, DistinctDefinition, FilterDefinition,
-            RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField, SelectDefinition,
-            UnionAllDefinition,
+            RunningEventCountDefinition, SelectDefinition, UnionAllDefinition,
         },
     },
 };
@@ -30,11 +29,6 @@ fn transform_kind_declares_atomic_execution_explicitly() {
         SelectDefinition::try_new([("id", col("id"))])
             .unwrap()
             .into(),
-        SchemaAlignDefinition::try_new(
-            [SchemaAlignField::try_new("id", col("id"), false).unwrap()],
-        )
-        .unwrap()
-        .into(),
         RunningEventCountDefinition::new().into(),
         DistinctDefinition::new().into(),
         AggregateDefinition::try_new([("id", col("id"))], [("count", AggregateCall::CountAll)])
@@ -56,7 +50,6 @@ fn every_expression_owner_rejects_unbound_parameters_at_definition_time() {
     let parameter = placeholder("$1");
     assert!(FilterDefinition::try_new(parameter.clone().eq(parameter.clone())).is_err());
     assert!(SelectDefinition::try_new([("parameter", parameter.clone())]).is_err());
-    assert!(SchemaAlignField::try_new("parameter", parameter.clone(), true).is_err());
     assert!(
         AggregateDefinition::try_new(
             [("parameter", parameter.clone())],

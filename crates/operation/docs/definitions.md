@@ -12,7 +12,7 @@ head 可接非空或空的单输入 Atomic 尾链，融合索引只在内存中�
 PagedTransform 使用借用 Resume 的 step；未提交页从未变化的真实状态和帧位置重算。
 Source/Sink 使用具体 capture/delivery 数据协议，不参与通用 prepared/callback 执行接口。
 普通关系表达式统一要求 immutable、逐行可执行；Definition 构造与 decode 都执行相同准入规则，不能借恢复绕过。
-Filter、Select、SchemaAlign、Aggregate 固定声明 Atomic；Aggregate 同时检查 group expression 与 call argument。
+Filter、Select、Aggregate 固定声明 Atomic；Aggregate 同时检查 group expression 与 call argument。
 `OperationDefinition::construct` 把有序、精确的 input logical `SchemaRef`、已限定资源名范围的短期 `DataScope` 和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
 入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型、kind/output 与执行能力一致性；各具体 Definition 的私有 `construct_unchecked` 只实现自身规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
 资源前缀由调用方通过 `DataScope::scoped` 限定；具体 Definition 只向 `DataScope::data` 传固定逻辑名，不拼接全局资源名。Store 声明/查找错误透明传递，保留完整资源名。
@@ -32,7 +32,7 @@ Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propaga
 
 ## 表达式
 
-Filter、Select 与 SchemaAlign 的公共入口直接接收 DataFusion `Expr`；fallible `try_new` 使用 `datafusion-proto` 编码表达式，Definition 在 JSON payload 中以 base64 保存这份 protobuf，并在 decode/open 时用同一 DataFusion 版本还原。
+Filter 与 Select 的公共入口直接接收 DataFusion `Expr`；fallible `try_new` 使用 `datafusion-proto` 编码表达式，Definition 在 JSON payload 中以 base64 保存这份 protobuf，并在 decode/open 时用同一 DataFusion 版本还原。
 DogPaddle 不再维护另一套表达式 AST、operator/type/nullability 规则或递归深度限制。
 Schema bind 必须通过 DataFusion `create_physical_expr` 建立 exact-input-Schema-bound `PhysicalExpr`，表达式类型、nullability、cast 与运行期 `evaluate` 语义均以 DataFusion 为唯一实现；该 API 假定 logical coercion 已完成，Operation 层不运行 logical/SQL planner，也不额外插入隐式 cast，直接调用 Operation API 时需要显式 `cast`。
 DogPaddle 只负责 Definition/Flow 边界、完整 Schema guard 及 Change 语义。
@@ -47,7 +47,7 @@ Project/Extend 的独立 Definition 和运行实例已删除。
 选列与改名直接使用 `SelectDefinition::try_new([(name, Expr), ...])`；追加列使用
 `SelectDefinition::try_extend(&input_schema, fields)`，它立即展开为普通 Select 字段列表，不保存 mode、输入 Schema 或单独的持久格式。
 
-Select 与 SchemaAlign 直接构造同一个私有 `BoundProjection`，由它实现 `AtomicOperation`，不另设算子运行包装类型：同组表达式共享 `DFSchema`，执行时整组检查一次 exact input Schema（空投影也检查），运行错误使用公共 `ProjectionError`，保留 port、逐字段错误上下文及底层错误链；各 Definition 仍拥有独立 Schema/metadata/codec 规则。
+Select 直接构造私有 `BoundProjection`，由它实现 `AtomicOperation`，不另设算子运行包装类型：同组表达式共享 `DFSchema`，执行时整组检查一次 exact input Schema（空投影也检查），运行错误使用公共 `ProjectionError`，保留 port、逐字段错误上下文及底层错误链。
 
 ## 简单 Transform
 
@@ -55,18 +55,14 @@ RunningEventCount 只声明 `running_event_count.count: Cell<u64>`，固定输�
 它按输入行序观察每一行并将 durable count 加一，忽略 diff 数值，输出每个更新后的 count 且 diff 固定为 `+1`；它是事件观测算子，不是关系 cardinality Aggregate。
 公共 API 与资源路径的破坏性重命名不提供 alias、fallback 或迁移；旧数据库直接删除并重建，不为旧版本增加识别或兼容协议。
 
-Select 以有序 `name + Expr` 列表一次性计算完整 output，所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。
-Select 保留输入 Schema metadata；直接列引用（包括改名）保留源字段 metadata，计算列 metadata 为空。
+Select 以有序 `SelectField<E = Expr>` 列表一次性计算完整 output；字段直接保存 name、expression 与可选 nullable/metadata 覆盖，普通 `(name, Expr)` 通过标准 `From` 转为无覆盖字段。`try_new` 接收可转为字段的集合，只把每个 Expr 转成一次 `StoredExpression`；Definition 复用同一字段 ADT 保存 canonical 表达式，不另设 Payload、mode 或 SchemaAlign 算子。
+所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。字段类型只从绑定表达式推导，cast/try_cast 必须写在 Expr 中；nullable 的 None 继承表达式推导，Some 只允许 non-null 到 nullable 的放宽，拒绝收窄。
+字段 metadata 的 None 使直接列引用（包括改名）继承源字段 metadata，计算列为空；Some 精确覆盖，Some(empty) 清空。Schema metadata 默认继承输入，可用消费式 `with_metadata` 精确覆盖或清空。覆盖使用 Arrow 的 typed Metadata，按 key canonical 排序；条目数量、文本总量与保留 namespace 统一归完整 output 的 `validate_schema` 检查。typed map 接收已唯一化的键，不另维护 iterator 重复键诊断；持久 codec 的 canonical 比较仍拒绝 JSON 重复键和其它非 canonical 字节。
 纯列引用共享输入 Arrow arrays，全部投影共享 diff buffer；保留完整子树，字段重排无需复制数据。
-绑定后的严格递增纯列引用若输出 Schema 精确等于对应输入投影，自动复用 ChangeProjection 快路径，避免重扫已验证的 diff 和 Decimal 值；不增加公开或持久 mode。改名、重排和计算走共享表达式执行。
-这改变了原 Select 直接列引用的字段 metadata 规则；受影响的精确 Schema、Flow 与目标布局应重建。
+绑定后的严格递增纯列引用若输出 Schema 精确等于对应输入投影，自动复用 ChangeProjection 快路径，避免重扫已验证的 diff 和 Decimal 值；改名、重排、覆盖与计算按输出 Schema 使用共享执行实现。
+Select 开发期 v1 payload 省略 None 覆盖，显式保留 Some(false) 与 Some(empty)；普通 Select 的原有 canonical 字节保持不变。旧 SchemaAlign variant 不识别或迁移；使用该 variant 的 Flow 与受影响目标直接重建。
 UnionAll Definition 只保存非零 input arity，要求所有输入具有完全相同的 logical Schema，按端口原样转发 Change。
-二者都不声明 Operation data，也不引入 planner、额外表达式层或专用 Flow 抽象。
-
-SchemaAlign 以有序 `name + Expr + target nullability + Field metadata` 和独立 Schema metadata 显式产生完整 output Schema；字段类型只从绑定表达式推导，cast/try_cast 必须写在 Expr 中。
-它允许 non-null 到 nullable 的放宽，拒绝 nullable 到 non-null 的收窄；所有表达式绑定同一个原始 input Schema，空字段定义合法并保留输入行数与 diff。
-metadata 按 key canonical 排序，重复 key 必须在构造期拒绝，不能静默覆盖。
-SchemaAlign 不声明 Operation data，不提供隐式 coercion，也不为 SQL 或其他上层接口引入专用 Flow 抽象。
+Select 与 UnionAll 都不声明 Operation data，也不引入 planner、额外表达式层或专用 Flow 抽象。
 
 ## 不可重放表达式的准入与能力审计
 

@@ -101,8 +101,6 @@ pub enum OperationDefinition {
     Select(Box<transform::SelectDefinition>),
     /// `UnionAll` operation plan.
     UnionAll(Box<transform::UnionAllDefinition>),
-    /// `SchemaAlign` operation plan.
-    SchemaAlign(Box<transform::SchemaAlignDefinition>),
     /// `ClickHouseSink` operation plan.
     #[serde(rename = "clickhouse_sink")]
     ClickHouseSink(Box<sink::ClickHouseSinkDefinition>),
@@ -179,12 +177,6 @@ impl From<transform::SelectDefinition> for OperationDefinition {
 impl From<transform::UnionAllDefinition> for OperationDefinition {
     fn from(definition: transform::UnionAllDefinition) -> Self {
         Self::UnionAll(Box::new(definition))
-    }
-}
-
-impl From<transform::SchemaAlignDefinition> for OperationDefinition {
-    fn from(definition: transform::SchemaAlignDefinition) -> Self {
-        Self::SchemaAlign(Box::new(definition))
     }
 }
 
@@ -278,8 +270,7 @@ impl OperationDefinition {
             | Self::Distinct(_)
             | Self::RunningEventCount(_)
             | Self::Filter(_)
-            | Self::Select(_)
-            | Self::SchemaAlign(_) => OperationKind::AtomicTransform(NonZeroU32::MIN),
+            | Self::Select(_) => OperationKind::AtomicTransform(NonZeroU32::MIN),
             Self::ClickHouseSink(_)
             | Self::Discard(_)
             | Self::DorisSink(_)
@@ -310,7 +301,6 @@ impl OperationDefinition {
             Self::EquiJoin(definition) => definition.output_schema_unchecked(inputs),
             Self::Select(definition) => definition.output_schema_unchecked(inputs),
             Self::UnionAll(_) => transform::UnionAllDefinition::compile_schema(inputs).map(Some),
-            Self::SchemaAlign(definition) => definition.output_schema_unchecked(inputs),
             Self::ClickHouseSink(definition) => {
                 definition.output_schema_unchecked(inputs)?;
                 Ok(None)
@@ -351,7 +341,6 @@ impl OperationDefinition {
             Self::EquiJoin(definition) => definition.construct_unchecked(inputs, data),
             Self::Select(definition) => definition.construct_unchecked(inputs),
             Self::UnionAll(definition) => (**definition).construct_unchecked(inputs),
-            Self::SchemaAlign(definition) => definition.construct_unchecked(inputs),
             Self::ClickHouseSink(definition) => {
                 definition.construct_unchecked(inputs, data, resource)
             }

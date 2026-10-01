@@ -9,7 +9,7 @@ use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, col,
     operation::{
         Operation, OperationInput, StepBudget,
-        transform::{SchemaAlignDefinition, SchemaAlignField, SelectDefinition},
+        transform::{SelectDefinition, SelectField},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
@@ -76,12 +76,15 @@ fn bench_projections(criterion: &mut Criterion, root: &RunRoot) {
                     .into(),
                 ),
                 (
-                    "align",
-                    SchemaAlignDefinition::try_new((0..width).map(|i| {
-                        SchemaAlignField::try_new(format!("v{i}"), col(format!("v{i}")), false)
-                            .unwrap()
+                    "explicit_select",
+                    SelectDefinition::try_new((0..width).map(|i| SelectField {
+                        name: format!("v{i}"),
+                        expression: col(format!("v{i}")),
+                        nullable: Some(false),
+                        metadata: Some(arrow_schema::Metadata::new()),
                     }))
                     .unwrap()
+                    .with_metadata(arrow_schema::Metadata::new())
                     .into(),
                 ),
             ];

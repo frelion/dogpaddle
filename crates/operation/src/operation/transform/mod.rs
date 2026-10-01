@@ -6,7 +6,6 @@ pub(crate) mod distinct;
 pub(crate) mod equi_join;
 pub(crate) mod filter;
 pub(crate) mod running_event_count;
-pub(crate) mod schema_align;
 pub(crate) mod select;
 pub(crate) mod union_all;
 
@@ -24,9 +23,5 @@ pub use equi_join::{
 };
 pub use filter::{FilterDefinition, FilterError, FilterSchemaError};
 pub use running_event_count::{RunningEventCountDefinition, RunningEventCountError};
-pub use schema_align::{
-    SchemaAlignDefinition, SchemaAlignDefinitionError, SchemaAlignField, SchemaAlignFieldError,
-    SchemaAlignSchemaError,
-};
-pub use select::{SelectDefinition, SelectDefinitionError, SelectSchemaError};
+pub use select::{SelectDefinition, SelectDefinitionError, SelectField, SelectSchemaError};
 pub use union_all::{UnionAllDefinition, UnionAllError, UnionAllSchemaError};

@@ -104,9 +104,8 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 | --- | --- | --- |
 | `RunningEventCount` | Atomic | 逐事件递增 count，忽略输入 diff；私有 `Cell<u64>` |
 | Filter | Atomic | 只保留 non-null true；不声明 state |
-| Select | Atomic | 有序投影与计算；纯列引用共享 arrays 和 diffs |
+| Select | Atomic | 有序投影与计算，可显式覆盖 metadata/nullability；纯列引用共享 arrays 和 diffs |
 | `UnionAll` | Atomic | exact-Schema 输入按端口原样转发 |
-| `SchemaAlign` | Atomic | 显式名字、metadata 和 nullability 对齐 |
 | Distinct | Atomic | exact canonical row positive weights 的零/正边界 |
 | Aggregate | Atomic | grouped COUNT/SUM/AVG/MIN/MAX，unique argument statistics 与 extrema indexes |
 | `EquiJoin` | Paged / 2 | Inner、LeftSemi、LeftAnti、LeftOuter、FullOuter，保留可选 residual |

@@ -8,8 +8,8 @@ use dogpaddle_operation::{
         scan::SequenceScanDefinition,
         sink::{DiscardDefinition, SqliteSinkDefinition, SqliteSinkSchemaError},
         transform::{
-            FilterDefinition, RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField,
-            SelectDefinition, SelectSchemaError, UnionAllDefinition, UnionAllSchemaError,
+            FilterDefinition, RunningEventCountDefinition, SelectDefinition, SelectField,
+            SelectSchemaError, UnionAllDefinition, UnionAllSchemaError,
         },
     },
 };
@@ -263,7 +263,7 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
     let scan = factory.operation("scan", SequenceScanDefinition::new(1), []);
     let align = factory.operation(
         "schema-align",
-        SchemaAlignDefinition::try_new(
+        SelectDefinition::try_new(
             [
                 (
                     "event_date",
@@ -278,9 +278,15 @@ fn temporal_and_decimal_schema_chain_builds_runs_and_rebinds_across_reopen() {
                 ),
                 ("amount", cast(col("value"), DataType::Decimal128(10, 2))),
             ]
-            .map(|(name, expression)| SchemaAlignField::try_new(name, expression, false).unwrap()),
+            .map(|(name, expression)| SelectField {
+                name: name.into(),
+                expression,
+                nullable: Some(false),
+                metadata: Some(arrow_schema::Metadata::new()),
+            }),
         )
-        .unwrap(),
+        .unwrap()
+        .with_metadata(arrow_schema::Metadata::new()),
         [scan],
     );
     let project = factory.operation(

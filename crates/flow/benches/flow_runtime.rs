@@ -5,10 +5,7 @@ use dogpaddle_operation::{
     operation::{
         scan::SequenceScanDefinition,
         sink::DiscardDefinition,
-        transform::{
-            FilterDefinition, RunningEventCountDefinition, SchemaAlignDefinition, SchemaAlignField,
-            SelectDefinition,
-        },
+        transform::{FilterDefinition, RunningEventCountDefinition, SelectDefinition, SelectField},
     },
 };
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
@@ -143,11 +140,22 @@ fn build(path: &Path, scenario: Scenario) -> Flow {
             );
             tail = factory.operation(
                 "align",
-                SchemaAlignDefinition::try_new([
-                    SchemaAlignField::try_new("source_value", col("value"), false).unwrap(),
-                    SchemaAlignField::try_new("derived_value", col("next"), false).unwrap(),
+                SelectDefinition::try_new([
+                    SelectField {
+                        name: "source_value".into(),
+                        expression: col("value"),
+                        nullable: Some(false),
+                        metadata: Some(arrow_schema::Metadata::new()),
+                    },
+                    SelectField {
+                        name: "derived_value".into(),
+                        expression: col("next"),
+                        nullable: Some(false),
+                        metadata: Some(arrow_schema::Metadata::new()),
+                    },
                 ])
-                .unwrap(),
+                .unwrap()
+                .with_metadata(arrow_schema::Metadata::new()),
                 [tail],
             );
         }

@@ -8,7 +8,7 @@ use dogpaddle_operation::{
         sink::{DiscardDefinition, SqliteSinkDefinition},
         transform::{
             EquiJoinDefinition, EquiJoinKind, FilterDefinition, RunningEventCountDefinition,
-            SchemaAlignDefinition, SchemaAlignField, SelectDefinition, UnionAllDefinition,
+            SelectDefinition, SelectField, UnionAllDefinition,
         },
     },
 };
@@ -51,11 +51,22 @@ fn five_atomic_transforms_run_in_one_fused_tail_across_reopen() {
     );
     let scan = factory.operation(
         "scan/tail-5",
-        SchemaAlignDefinition::try_new([
-            SchemaAlignField::try_new("scan_value", col("scan_value"), false).unwrap(),
-            SchemaAlignField::try_new("offset", col("offset"), false).unwrap(),
+        SelectDefinition::try_new([
+            SelectField {
+                name: "scan_value".into(),
+                expression: col("scan_value"),
+                nullable: Some(false),
+                metadata: Some(arrow_schema::Metadata::new()),
+            },
+            SelectField {
+                name: "offset".into(),
+                expression: col("offset"),
+                nullable: Some(false),
+                metadata: Some(arrow_schema::Metadata::new()),
+            },
         ])
-        .unwrap(),
+        .unwrap()
+        .with_metadata(arrow_schema::Metadata::new()),
         [scan],
     );
     factory.operation(

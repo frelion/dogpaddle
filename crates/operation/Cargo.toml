@@ -14,7 +14,7 @@ bench = false
 [dependencies]
 arrow-array.workspace = true
 arrow-buffer.workspace = true
-arrow-schema.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 arrow-select.workspace = true
 base64.workspace = true
 blake3.workspace = true

@@ -39,7 +39,7 @@ OperationDefinition 的稳定 tagged JSON 名称由各算子公共 v1 literal go
 
 Aggregate 的 owner 文件必须证明稳定 tagged JSON 名称 `aggregate` 与 v1 golden、精确资源布局与 Schema、Definition roundtrip、共享 argument/moment 与 COUNT/SUM/AVG readout、MIN/MAX layout 复用、正权重 underflow 的整页 rollback、极值缓存重取与 reopen，以及不变结果不产生冗余 output。组权重归零仍须检查统计量一致性。私有 state codec 和表达式去重证据归 Operation。
 
-EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tagged JSON 名称 `equi_join` 与 v1 golden、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/SchemaAlign 和最终关系。
+EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tagged JSON 名称 `equi_join` 与 v1 golden、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/Select 和最终关系。
 
 AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `asof_join.left_rows/right_rows` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
 
@@ -129,7 +129,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 | `change_core` | Criterion |
 | `change_codec` | Change 自有七路旋转 runner：self-contained/schema-bound encode 与 full decode，加三种 self-contained projected decode；同 fixture 记录两种格式 bytes 与节省比例 |
 | `cell` | Criterion |
-| `projection` | Operation 自有 Criterion：Select/SchemaAlign 的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
+| `projection` | Operation 自有 Criterion：Select 默认/显式 Schema 覆盖的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单页多行、单页重复极值 key、页内净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 Atomic apply/`Transaction::commit`，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |
 | `distinct` | Operation 自有 Criterion：同一 Change 内同 key 连续正负循环与两 key 交错循环；每轮完整 Atomic apply/`Transaction::commit`，有写才同步 WAL，fixture 和逐事件输出 oracle 不计时 |
 | `cdc_bootstrap` | Operation 自有 Criterion：PG/MySQL 已封口快照逐条消费；未完成快照的常规 reset 固定用 257 条窄 entry 跨过 256-entry 批界，wide schema-bound entry 用同一 entry/row 布局配对发布与清理；计时一次只读 restore；publish 每 entry 包含原 input 的 published 只读/解码与 consume_published 的一次同步 commit，无 payload 搬运；reset 每 batch 包含 record 与同步 commit，构造、seed、输出和最终持久状态 oracle 不计时；不启动外部 connector，不代表 capture、ACK 或端到端 CDC 吞吐 |
@@ -140,7 +140,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 | `asof_join_resources` | Operation 自有进程隔离 runner：历史 lookup、RHS 历史修正、空影响区间和 NULL-order left；记录 Rust allocator heap、输出行数/正负事件、页数与重试数；关系 oracle 归 correctness |
 | `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除 |
 | `flow_lifecycle` | Criterion |
-| `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含 Select（选列）→Select（追加列）→Filter→Select→SchemaAlign、计数链和 fan-out；以相同逻辑输入与最终结果比较 |
+| `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含 Select（选列）→Select（追加列）→Filter→Select→Select（显式 Schema）、计数链和 fan-out；以相同逻辑输入与最终结果比较 |
 
 自有 runner 的 stdout 只输出 owner-specific JSONL，stderr 只输出人类进度。失败前已经产生的样本必须保留。需要旋转顺序的 benchmark 不得由多次独立运行的 median 代替；Flow runtime 必须保留每次采样 `advance` 的原始 latency，预热只推进并校验，不进入计时或输出。
 
