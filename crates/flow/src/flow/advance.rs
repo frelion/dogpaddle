@@ -70,7 +70,7 @@ impl Flow {
         }
         result.map_err(|(index, error)| {
             FlowRunError::new(
-                &self.runtime.definition.operations[index].id,
+                &self.runtime.nodes[index].id,
                 error,
                 self.runtime.needs_reopen,
             )
@@ -136,13 +136,14 @@ impl Runtime {
         index: usize,
         batch: &mut DurabilityBatch<'_>,
     ) -> Result<AdvanceOutcome, OperationError> {
-        let Operation::Source(source) = &mut self.operations[index] else {
+        let node = &mut self.nodes[index];
+        let Operation::Source(source) = &mut node.operation else {
             unreachable!("source role checked at construction")
         };
-        if self.pending[index].is_none() {
-            self.pending[index] = source.poll().inspect_err(|_| self.needs_reopen = true)?;
+        if node.pending.is_none() {
+            node.pending = source.poll().inspect_err(|_| self.needs_reopen = true)?;
         }
-        let Some(delivery) = self.pending[index].as_mut() else {
+        let Some(delivery) = node.pending.as_mut() else {
             return Ok(AdvanceOutcome::Idle);
         };
         let transaction = batch.begin();
@@ -154,9 +155,7 @@ impl Runtime {
         if requires_barrier {
             sync(batch, &mut self.needs_reopen)?;
         }
-        let delivery = self.pending[index]
-            .take()
-            .expect("captured delivery exists");
+        let delivery = node.pending.take().expect("captured delivery exists");
         source
             .ack(delivery)
             .inspect_err(|_| self.needs_reopen = true)?;
@@ -176,7 +175,7 @@ impl Runtime {
             index = self.sources[self.root_cursor];
             self.root_cursor = (self.root_cursor + 1) % self.sources.len();
             *remaining -= 64;
-            let Operation::Source(source) = &self.operations[index] else {
+            let Operation::Source(source) = &self.nodes[index].operation else {
                 unreachable!("source role")
             };
             let Some(bytes) = source
@@ -189,7 +188,7 @@ impl Runtime {
             let frame = Frame {
                 head: index,
                 input_port: None,
-                phase: FramePhase::Run(self.operations[index].initial_resume()),
+                phase: FramePhase::Run(self.nodes[index].operation.initial_resume()),
             };
             let input = self
                 .input_codec(&frame)
@@ -219,7 +218,7 @@ impl Runtime {
         reads: &ReadTransactions,
         batch: &mut DurabilityBatch<'_>,
     ) -> Result<AdvanceOutcome, OperationError> {
-        let Operation::Sink(sink) = &mut self.operations[index] else {
+        let Operation::Sink(sink) = &mut self.nodes[index].operation else {
             unreachable!("sink role")
         };
         let Some(pending) = sink.load(reads.begin().access())? else {
@@ -308,7 +307,7 @@ impl Runtime {
             unreachable!("running frame")
         };
         budget.charge(CONTROL_BYTES)?;
-        let mut step = self.operations[frame.head].step(
+        let mut step = self.nodes[frame.head].operation.step(
             OperationInput {
                 port: frame.input_port.unwrap_or(0),
                 change: input,
@@ -324,7 +323,7 @@ impl Runtime {
             let Some(change) = step.output.as_ref() else {
                 break;
             };
-            let Operation::Atomic(operation) = &self.operations[tail] else {
+            let Operation::Atomic(operation) = &self.nodes[tail].operation else {
                 unreachable!("validated atomic tail")
             };
             step.output = operation.apply(OperationInput { port: 0, change }, access, budget)?;
@@ -420,7 +419,7 @@ impl Runtime {
                 self.finish_frame(depth, &frame, after, access)?;
                 return Ok(AdvanceOutcome::Progressed);
             };
-            if matches!(self.operations[consumer.operation], Operation::Sink(_)) {
+            if matches!(self.nodes[consumer.operation].operation, Operation::Sink(_)) {
                 let bytes = encoded.len().saturating_mul(2).saturating_add(128);
                 if bytes > budget.remaining_bytes() {
                     break None;
@@ -429,7 +428,7 @@ impl Runtime {
                 if output.is_none() {
                     output = Some(self.output_codec(frame.head).decode(encoded)?);
                 }
-                let Operation::Sink(sink) = &mut self.operations[consumer.operation] else {
+                let Operation::Sink(sink) = &mut self.nodes[consumer.operation].operation else {
                     unreachable!()
                 };
                 // Capacity rejection guarantees no writes, so this page and
@@ -444,7 +443,9 @@ impl Runtime {
                 break Some(Frame {
                     head: consumer.operation,
                     input_port: Some(consumer.port),
-                    phase: FramePhase::Run(self.operations[consumer.operation].initial_resume()),
+                    phase: FramePhase::Run(
+                        self.nodes[consumer.operation].operation.initial_resume(),
+                    ),
                 });
             }
         };
@@ -480,7 +481,7 @@ impl Runtime {
         match after {
             Progress::Done => {
                 if depth == 0 {
-                    let Operation::Source(source) = &self.operations[frame.head] else {
+                    let Operation::Source(source) = &self.nodes[frame.head].operation else {
                         unreachable!("root source role")
                     };
                     source.consume_published(access)?;

@@ -42,14 +42,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let program = match SqlProgram::read(&sql_path) {
-        Ok(program) => program,
-        Err(error) => {
-            report_error(&error);
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut flow = match program.start(&state_path) {
+    let mut flow = match SqlProgram::read(&sql_path).and_then(|program| program.start(&state_path))
+    {
         Ok(flow) => flow,
         Err(error) => {
             report_error(&error);

@@ -1,11 +1,11 @@
 use crate::{
     build::{FlowDefinition, ResolvedTopology, codec},
     error::{FlowError, setup_error},
-    flow::{Frames, Runtime},
+    flow::{Frames, Runtime, RuntimeNode},
 };
 use arrow_schema::SchemaRef;
 use dogpaddle_change::SchemaBoundChangeCodec;
-use dogpaddle_operation::RuntimeResource;
+use dogpaddle_operation::{RuntimeResource, operation::Operation};
 use dogpaddle_store::DataScope;
 
 pub(crate) fn construct(
@@ -16,11 +16,10 @@ pub(crate) fn construct(
 ) -> Result<Runtime, FlowError> {
     let count = definition.operations.len();
     let mut schemas: Vec<Option<SchemaRef>> = Vec::with_capacity(count);
-    let mut operations = Vec::with_capacity(count);
-    let mut codecs = Vec::with_capacity(count);
+    let mut nodes = Vec::with_capacity(count);
     let mut sources = Vec::new();
     let mut sinks = Vec::new();
-    for (index, (node, resource)) in definition.operations.iter().zip(resources).enumerate() {
+    for (index, (node, resource)) in definition.operations.into_iter().zip(resources).enumerate() {
         let inputs = node
             .inputs
             .iter()
@@ -40,41 +39,41 @@ pub(crate) fn construct(
             )
             .map_err(|source| setup_error(&node.id, source))?
             .into_parts();
-        codecs.push(
-            schema
-                .as_ref()
-                .map(|schema| {
-                    SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
-                        FlowError::OutputCodec {
-                            operation_id: node.id.clone(),
-                            source,
-                        }
-                    })
+        let codec = schema
+            .as_ref()
+            .map(|schema| {
+                SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
+                    FlowError::OutputCodec {
+                        operation_id: node.id.clone(),
+                        source,
+                    }
                 })
-                .transpose()?,
-        );
+            })
+            .transpose()?;
         schemas.push(schema);
-        operations.push(operation);
-        let kind = node.definition.kind();
-        if kind.is_scan() {
-            sources.push(index);
-        } else if kind.is_sink() {
-            sinks.push(index);
+        match &operation {
+            Operation::Source(_) => sources.push(index),
+            Operation::Sink(_) => sinks.push(index),
+            _ => {}
         }
+        nodes.push(RuntimeNode {
+            id: node.id,
+            inputs: node.inputs,
+            operation,
+            codec,
+            pending: None,
+        });
     }
     let frames = Frames::bind(data)?;
     Ok(Runtime {
-        definition,
         topology,
-        operations,
-        codecs,
+        nodes,
         frames,
         sources,
         sinks,
         source_cursor: 0,
         sink_cursor: 0,
         root_cursor: 0,
-        pending: (0..count).map(|_| None).collect(),
         needs_reopen: false,
     })
 }

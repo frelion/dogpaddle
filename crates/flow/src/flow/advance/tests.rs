@@ -50,7 +50,7 @@ fn initial_source_frame(flow: &Flow, index: usize) -> Frame {
     Frame {
         head: index,
         input_port: None,
-        phase: FramePhase::Run(flow.runtime.operations[index].initial_resume()),
+        phase: FramePhase::Run(flow.runtime.nodes[index].operation.initial_resume()),
     }
 }
 
@@ -140,23 +140,22 @@ fn install_probe(
     panic_on_load: bool,
 ) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
     let index = flow.runtime.sinks[0];
-    let Operation::Sink(inner) = flow.runtime.operations.remove(index) else {
+    let mut node = flow.runtime.nodes.remove(index);
+    let Operation::Sink(inner) = node.operation else {
         unreachable!()
     };
     let blocked = Arc::new(AtomicBool::new(blocked));
     let loads = Arc::new(AtomicUsize::new(0));
-    flow.runtime.operations.insert(
-        index,
-        Operation::Sink(Box::new(SinkProbe {
-            inner,
-            blocked: blocked.clone(),
-            loads: loads.clone(),
-            panic_on_load,
-            enqueues: Arc::new(AtomicUsize::new(0)),
-            accepted: Arc::new(AtomicUsize::new(0)),
-            fail_after_enqueue: false,
-        })),
-    );
+    node.operation = Operation::Sink(Box::new(SinkProbe {
+        inner,
+        blocked: blocked.clone(),
+        loads: loads.clone(),
+        panic_on_load,
+        enqueues: Arc::new(AtomicUsize::new(0)),
+        accepted: Arc::new(AtomicUsize::new(0)),
+        fail_after_enqueue: false,
+    }));
+    flow.runtime.nodes.insert(index, node);
     (blocked, loads)
 }
 
@@ -168,21 +167,20 @@ fn install_routing_probe(
     accepted: Arc<AtomicUsize>,
     fail_after_enqueue: bool,
 ) {
-    let Operation::Sink(inner) = flow.runtime.operations.remove(index) else {
+    let mut node = flow.runtime.nodes.remove(index);
+    let Operation::Sink(inner) = node.operation else {
         unreachable!()
     };
-    flow.runtime.operations.insert(
-        index,
-        Operation::Sink(Box::new(SinkProbe {
-            inner,
-            blocked,
-            loads: Arc::new(AtomicUsize::new(0)),
-            panic_on_load: false,
-            enqueues,
-            accepted,
-            fail_after_enqueue,
-        })),
-    );
+    node.operation = Operation::Sink(Box::new(SinkProbe {
+        inner,
+        blocked,
+        loads: Arc::new(AtomicUsize::new(0)),
+        panic_on_load: false,
+        enqueues,
+        accepted,
+        fail_after_enqueue,
+    }));
+    flow.runtime.nodes.insert(index, node);
 }
 
 fn counted_flow(path: &std::path::Path) -> Flow {

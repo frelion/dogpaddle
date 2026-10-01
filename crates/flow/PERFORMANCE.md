@@ -213,3 +213,62 @@ fresh build 的额外 reopen 在计时外；不等同于 codec CPU 时间或 ste
 保留从每组 30 个样本独立复算的中位数；95% CI 取原 Criterion estimates。
 完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 和 workspace build 通过。
 同一新编译 release host 通过真实 PostgreSQL CDC、SQL、Sink/recovery 与 MySQL CDC 验收。
+
+## 构造后释放计划：2026-10-01 内存与运行对照
+
+Flow 装配消费 Definition，每个运行节点直接拥有 ID、inputs、Operation、output codec
+与 pending Delivery；退休常驻完整计划及 Operation/codec/pending 平行数组。CLI 在
+start 后也释放 SqlProgram。此轮生产代码净减 5 行，主要收益是删除常驻重复表示，
+没有改变持久 Definition、Frame、事务、ACK 或 Sink Prepared。
+
+allocator 对照使用相同临时程序与锁定依赖：有限 Sequence → 64 个 Select → Discard，
+每个 Select 有一个含 16,389 ASCII 字节的独立字符串字面量，总计 66 个节点。
+baseline 为 `d2c90b9`，candidate 为相同产品树的 `ddb7ee0` 加本轮 diff；
+Apple M5、aarch64 Darwin 25.6、APFS、Rust 1.96.0 release，dhat 0.3.3。
+每个 case 是独立进程，build 在创建 factory 前启 profiler；open 在 profiler 启动前 seed/drop，
+随后启 profiler 并实际 open。调用者不保留 Definition clone。
+下表在 build/open 和 ID/count/depth 校验后、首次 advance 前读取 Rust global allocator，
+peak 与累计分配也只截止此观察点，单位 byte。
+
+| case | baseline live | candidate live | 释放 | baseline peak | candidate peak | baseline 累计分配 | candidate 累计分配 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| build | 3,270,849 | 1,154,969 | 2,115,880 (64.69%) | 4,711,033 | 3,608,564 | 23,071,288 | 23,074,456 |
+| open | 3,275,508 | 1,155,660 | 2,119,848 (64.72%) | 4,708,174 | 3,605,705 | 16,422,625 | 16,425,793 |
+
+两例 live blocks 均减少 388，观察点 peak 约减 23.4%；累计分配反而各增加 3,168 byte。
+约 1.15 MB 的 live 分配仍包含必要的已编译字面量，不宣称所有表达式内存都释放。
+随后真实执行至 Idle/空栈、drop 并 reopen 检查数量和空栈；这不是逐值输出 oracle。
+drop 后两版 build 都剩 157 byte/4 blocks，open 都为 0。未测 RocksDB native heap、
+JVM 或进程 RSS；64 个宽字面量的比例不代表所有 SQL。build 与 open 的初始化口径
+不同，不互作性能对照。该内存见证也不证明运行吞吐。
+
+为检查更宽 RuntimeNode 的访问成本，再运行未修改的 `flow_runtime` reference。
+每个场景 64 轮预热，9 个 sample × 1024 次完整有界 advance；fixture、最终排空、
+source 数量、counter 和 reopen oracle 在计时外。两版各场景捕获数都为 9,280，
+计时结束前均已追平，排空与重开 oracle 一致。无并行 Cargo、容器或系统验收。
+下表 median 为 9 个 sample 中位数的中位数，p95 对全部 9,216 次原始 latency
+按 (n−1)×0.95 线性插值；单位 µs，仅描述这组采样，不作为统计置信区间。
+
+| 场景 | baseline median | candidate median | 变化 | baseline p95 | candidate p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Sink | 37.000 | 36.833 | -0.45% | 49.291 | 49.635 |
+| PureChain | 39.958 | 39.583 | -0.94% | 52.750 | 51.750 |
+| CountChain(1) | 38.667 | 39.083 | +1.08% | 51.125 | 51.292 |
+| CountChain(14) | 62.167 | 61.708 | -0.74% | 75.375 | 75.625 |
+| CountChain(62) | 149.708 | 149.645 | -0.04% | 164.250 | 163.375 |
+| Fanout(4) | 36.625 | 35.938 | -1.88% | 49.333 | 48.166 |
+| Fanout(16) | 37.125 | 35.208 | -5.16% | 49.469 | 48.386 |
+
+保留 CountChain(1) 中位数 +1.08% 与部分 p95 的增加，不宣称所有场景提速或
+无回归。最长计数链基本持平；fan-out 16 的本轮中位数降低约 5.16%，没有额外
+吞吐计时，也未观测单事务 duration、实际 WAL sync 或累计 IPC bytes。
+
+原始 4 份 allocator JSONL、编译 log 与空 stderr 位于
+`/tmp/dogpaddle-runtime-nodes-memory-{baseline,candidate}-{build,open}.*`；
+相同临时源码在 `/tmp/dogpaddle-runtime-plan-memory/src/main.rs`，SHA-256 为
+`62cb4ed22d52c1bc796f774eb365b847219cd4bf41785bcba8041bc1eba972b2`。
+`/tmp/dogpaddle-runtime-nodes-performance/` 保留源码 patch、版本/context、memory-summary，
+以及 `before.jsonl`、`after.jsonl` 的全部运行 latency、7 个 oracle 与 completion；
+`runtime-summary.json` 保留每个 sample 的中位数及全量 p50/p95/p99。
+完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 与 workspace build 通过。
+新编译的 release hosts 通过真实 PostgreSQL CDC、SQL 与 Sink/recovery 三个验收入口。

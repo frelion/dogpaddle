@@ -22,8 +22,7 @@ impl Flow {
             (
                 depth as usize + 1,
                 self.runtime
-                    .definition
-                    .operations
+                    .nodes
                     .get(frame.head)
                     .map(|node| node.id.clone()),
                 matches!(frame.phase, FramePhase::Send { .. }),

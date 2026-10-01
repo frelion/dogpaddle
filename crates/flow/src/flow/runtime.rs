@@ -3,7 +3,7 @@ use super::{
     frame::{CONTROL_BYTES, Frame, FramePhase, PAGE_BYTES},
 };
 use crate::{
-    build::{FlowDefinition, ResolvedTopology, validate::MAX_DEPTH},
+    build::{ResolvedTopology, validate::MAX_DEPTH},
     error::FlowError,
 };
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
@@ -22,18 +22,22 @@ pub struct Flow {
     pub(super) transactions: Transactions,
     pub(super) reads: ReadTransactions,
 }
+pub(crate) struct RuntimeNode {
+    pub(crate) id: String,
+    pub(crate) inputs: Vec<usize>,
+    pub(crate) operation: Operation,
+    pub(crate) codec: Option<SchemaBoundChangeCodec>,
+    pub(crate) pending: Option<SourceDelivery>,
+}
 pub(crate) struct Runtime {
-    pub(crate) definition: FlowDefinition,
     pub(crate) topology: ResolvedTopology,
-    pub(crate) operations: Vec<Operation>,
-    pub(crate) codecs: Vec<Option<SchemaBoundChangeCodec>>,
+    pub(crate) nodes: Vec<RuntimeNode>,
     pub(crate) frames: Frames,
     pub(crate) sources: Vec<usize>,
     pub(crate) sinks: Vec<usize>,
     pub(crate) source_cursor: usize,
     pub(crate) sink_cursor: usize,
     pub(crate) root_cursor: usize,
-    pub(crate) pending: Vec<Option<SourceDelivery>>,
     pub(crate) needs_reopen: bool,
 }
 impl Flow {
@@ -58,16 +62,12 @@ impl Flow {
     /// Returns the number of logical Operations, including fused tails.
     #[must_use]
     pub fn operation_count(&self) -> usize {
-        self.runtime.operations.len()
+        self.runtime.nodes.len()
     }
     /// Returns stable logical IDs in declaration order.
     #[must_use]
     pub fn operation_ids(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.runtime
-            .definition
-            .operations
-            .iter()
-            .map(|node| node.id.as_str())
+        self.runtime.nodes.iter().map(|node| node.id.as_str())
     }
 }
 impl Runtime {
@@ -80,7 +80,7 @@ impl Runtime {
         if depth != 0 {
             return self.frames.output(depth - 1, access);
         }
-        let Operation::Source(source) = &self.operations[frame.head] else {
+        let Operation::Source(source) = &self.nodes[frame.head].operation else {
             return Err("root frame is not a source".into());
         };
         source
@@ -89,16 +89,18 @@ impl Runtime {
     }
 
     pub(super) fn input_codec(&self, frame: &Frame) -> &SchemaBoundChangeCodec {
-        let producer = frame.input_port.map_or(frame.head, |port| {
-            self.definition.operations[frame.head].inputs[port]
-        });
-        self.codecs[producer]
+        let producer = frame
+            .input_port
+            .map_or(frame.head, |port| self.nodes[frame.head].inputs[port]);
+        self.nodes[producer]
+            .codec
             .as_ref()
             .expect("validated input has schema")
     }
     pub(super) fn output_codec(&self, head: usize) -> &SchemaBoundChangeCodec {
         let last = self.topology.tails[head].last().copied().unwrap_or(head);
-        self.codecs[last]
+        self.nodes[last]
+            .codec
             .as_ref()
             .expect("computation has output schema")
     }
@@ -107,8 +109,8 @@ impl Runtime {
             .map_err(|error| FlowError::InvalidRuntimeState {
                 reason: error.to_string(),
             })?;
-        for operation in &mut self.operations {
-            let result = match operation {
+        for node in &mut self.nodes {
+            let result = match &mut node.operation {
                 Operation::Source(source) => source.restore(access),
                 Operation::Sink(sink) => sink.load(access).map(|_| ()),
                 _ => Ok(()),
@@ -150,17 +152,17 @@ impl Runtime {
             if *depth as usize != expected {
                 return Err("call stack depths are not continuous".into());
             }
-            let Some(node) = self.definition.operations.get(frame.head) else {
+            let Some(node) = self.nodes.get(frame.head) else {
                 return Err("frame refers to unknown head".into());
             };
-            if !self.topology.heads[frame.head] || node.definition.kind().is_sink() {
+            if !self.topology.heads[frame.head] || matches!(&node.operation, Operation::Sink(_)) {
                 return Err("frame does not refer to a computation head".into());
             }
             match frame.input_port {
-                None if expected == 0 && node.definition.kind().is_scan() => {}
+                None if expected == 0 && matches!(&node.operation, Operation::Source(_)) => {}
                 Some(port)
                     if expected > 0
-                        && !node.definition.kind().is_scan()
+                        && !matches!(&node.operation, Operation::Source(_))
                         && port < node.inputs.len() => {}
                 _ => return Err("frame has invalid input port or source depth".into()),
             }
@@ -190,7 +192,7 @@ impl Runtime {
             };
             match &frame.phase {
                 FramePhase::Run(resume) => {
-                    self.operations[frame.head].validate_resume(input, resume)?;
+                    node.operation.validate_resume(input, resume)?;
                     if self
                         .frames
                         .outputs
@@ -212,7 +214,7 @@ impl Runtime {
                         return Err("frame consumer ordinal exceeds fanout".into());
                     }
                     if let Progress::More(resume) = after {
-                        self.operations[frame.head].validate_resume(input, resume)?;
+                        node.operation.validate_resume(input, resume)?;
                     }
                     let output = self.frames.output(*depth, access)?;
                     check_shape(&self.output_codec(frame.head).decode(&output)?, 256, 16384)?;
