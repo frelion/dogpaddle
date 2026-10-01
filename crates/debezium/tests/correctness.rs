@@ -55,13 +55,13 @@ fn connector_configuration_enforces_checkpoint_and_java_delivery_bounds() {
     assert!(
         ConnectorConfig::new("e", "c")
             .unwrap()
-            .max_delivery_bytes(67)
+            .max_delivery_bytes(57)
             .is_err()
     );
     assert!(
         ConnectorConfig::new("e", "c")
             .unwrap()
-            .max_delivery_bytes(68)
+            .max_delivery_bytes(58)
             .is_ok()
     );
     assert!(

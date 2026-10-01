@@ -356,22 +356,7 @@ def replay_semantics(delivery: dict[str, Any]) -> str:
     require(isinstance(events, list), "delivery.events is not an array")
     for event in events:
         require(isinstance(event, dict), "delivery contains a non-object event")
-        headers = event.get("headers")
-        if isinstance(headers, list):
-            headers = [
-                header
-                for header in headers
-                if not (
-                    isinstance(header, dict)
-                    and header.get("key") == "__debezium.context.runId"
-                )
-            ]
-        projected: dict[str, Any] = {
-            "topic": event.get("topic"),
-            "kafka_partition": event.get("kafka_partition"),
-            "key": event.get("key"),
-            "headers": headers,
-        }
+        projected: dict[str, Any] = {"topic": event.get("topic")}
         value = event.get("value")
         if isinstance(value, dict) and isinstance(value.get("payload"), dict):
             payload = dict(value["payload"])

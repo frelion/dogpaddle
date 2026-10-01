@@ -33,7 +33,7 @@ DATABASE = "dogpaddle_gate"
 TABLE = "direct_events"
 INITIAL = [[1, 10, 10, "pre-existing"]]
 STREAMING = [[-1, 10, 10, "pre-existing"], [1, 10, 11, "updated"],
-             [1, 20, 20, "after-reopen"]]
+             [1, 20, 20, "after-reopen"], [-1, 10, 11, "updated"]]
 SUCCESSOR = [1, 30, 30, "last-witness"]
 COMPOSE_FILE = Path(__file__).resolve().with_name("compose.yaml")
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -277,10 +277,11 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
 
         until("sealed snapshot input is consumed once", consume_sealed)
         assert_rows(host, INITIAL, phase=2)
-        # Update produces [-1 old, +1 new] and INSERT follows in this transaction.
+        # UPDATE, INSERT and DELETE must keep source order across the pre-ACK crash.
         container.sql(f"START TRANSACTION; UPDATE {DATABASE}.{TABLE} "
                       "SET tx_seq=11,payload='updated' WHERE id=10; "
-                      f"INSERT INTO {DATABASE}.{TABLE} VALUES (20,20,'after-reopen'); COMMIT")
+                      f"INSERT INTO {DATABASE}.{TABLE} VALUES (20,20,'after-reopen'); "
+                      f"DELETE FROM {DATABASE}.{TABLE} WHERE id=10; COMMIT")
 
         def streaming_crash() -> bool:
             response = host.request("crash-before-ack")
@@ -296,7 +297,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
                 raise RuntimeError(f"streaming capture and consumption were not durable before ACK: {response}")
             return True
 
-        until("streaming UPDATE/INSERT committed before ACK", streaming_crash)
+        until("streaming UPDATE/INSERT/DELETE committed before ACK", streaming_crash)
         if host.process.wait(timeout=15) != 74:
             raise RuntimeError("streaming delivery did not exit at the pre-ACK boundary (74)")
 
@@ -331,7 +332,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
               replay_and_follow)
         assert_rows(host, expected, phase=3)
     print("PASS MySQL sealed snapshot input, terminal pre-ACK recovery, "
-          "streaming pre-ACK UPDATE/INSERT replay and successor")
+          "streaming pre-ACK UPDATE/INSERT/DELETE replay and successor")
 
 
 def check_password_not_persisted(root: Path, password: str) -> None:

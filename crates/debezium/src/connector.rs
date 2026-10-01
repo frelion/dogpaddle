@@ -8,71 +8,18 @@ use crate::{Checkpoint, Error, ErrorKind};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One encoded Kafka Connect header.
-pub struct Header {
-    key: Box<str>,
-    value: Option<Box<[u8]>>,
-}
-
-impl Header {
-    pub(crate) const fn new(key: Box<str>, value: Option<Box<[u8]>>) -> Self {
-        Self { key, value }
-    }
-
-    /// Returns the header name.
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    /// Returns the schemas-enabled Kafka Connect JSON value, or `None` for a
-    /// Java null.
-    #[must_use]
-    pub fn value(&self) -> Option<&[u8]> {
-        self.value.as_deref()
-    }
-}
-
-impl fmt::Debug for Header {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Header")
-            .field("key", &self.key)
-            .field("value_bytes", &self.value.as_ref().map(|value| value.len()))
-            .finish()
-    }
-}
-
-/// An owned Kafka Connect `SourceRecord` representation.
+/// An owned topic and value from a Kafka Connect `SourceRecord`.
 ///
-/// Key, value, and header values use Kafka Connect's schemas-enabled JSON
-/// encoding. They remain owned Rust bytes after the JNI call returns.
+/// Values use schemas-enabled Kafka Connect JSON and remain owned Rust bytes
+/// after the JNI call returns. Other record metadata is not exported.
 pub struct Record {
     topic: Option<Box<str>>,
-    kafka_partition: Option<i32>,
-    timestamp: Option<i64>,
-    key: Option<Box<[u8]>>,
     value: Option<Box<[u8]>>,
-    headers: Box<[Header]>,
 }
 
 impl Record {
-    pub(crate) const fn new(
-        topic: Option<Box<str>>,
-        kafka_partition: Option<i32>,
-        timestamp: Option<i64>,
-        key: Option<Box<[u8]>>,
-        value: Option<Box<[u8]>>,
-        headers: Box<[Header]>,
-    ) -> Self {
-        Self {
-            topic,
-            kafka_partition,
-            timestamp,
-            key,
-            value,
-            headers,
-        }
+    pub(crate) const fn new(topic: Option<Box<str>>, value: Option<Box<[u8]>>) -> Self {
+        Self { topic, value }
     }
 
     /// Returns the Kafka topic attached to this source record, if any.
@@ -81,36 +28,11 @@ impl Record {
         self.topic.as_deref()
     }
 
-    /// Returns the optional Kafka partition metadata.
-    #[must_use]
-    pub const fn kafka_partition(&self) -> Option<i32> {
-        self.kafka_partition
-    }
-
-    /// Returns the optional source-record timestamp in Unix milliseconds.
-    #[must_use]
-    pub const fn timestamp(&self) -> Option<i64> {
-        self.timestamp
-    }
-
-    /// Returns the schemas-enabled Kafka Connect JSON key, or `None` for a
-    /// Java null.
-    #[must_use]
-    pub fn key(&self) -> Option<&[u8]> {
-        self.key.as_deref()
-    }
-
     /// Returns the schemas-enabled Kafka Connect JSON value, or `None` for a
     /// Java null.
     #[must_use]
     pub fn value(&self) -> Option<&[u8]> {
         self.value.as_deref()
-    }
-
-    /// Returns headers in their original order.
-    #[must_use]
-    pub fn headers(&self) -> &[Header] {
-        &self.headers
     }
 }
 
@@ -119,11 +41,7 @@ impl fmt::Debug for Record {
         formatter
             .debug_struct("Record")
             .field("topic", &self.topic)
-            .field("kafka_partition", &self.kafka_partition)
-            .field("timestamp", &self.timestamp)
-            .field("key_bytes", &self.key.as_ref().map(|key| key.len()))
             .field("value_bytes", &self.value.as_ref().map(|value| value.len()))
-            .field("headers", &self.headers)
             .finish()
     }
 }

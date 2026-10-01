@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dogpaddle_debezium::{
-    Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, Delivery, Header, Record,
+    Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, Delivery, Record,
 };
 use serde_json::{Value, json};
 
@@ -70,66 +70,23 @@ impl Configuration {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct HeaderSnapshot {
-    key: String,
-    value: Option<Vec<u8>>,
-}
-
-impl HeaderSnapshot {
-    fn capture(header: &Header) -> Self {
-        Self {
-            key: header.key().to_owned(),
-            value: header.value().map(<[u8]>::to_vec),
-        }
-    }
-
-    fn json(&self) -> Result<Value, HostError> {
-        Ok(json!({
-            "key": self.key,
-            "value": decode_json(self.value.as_deref())?,
-        }))
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
 struct RecordSnapshot {
     topic: Option<String>,
-    kafka_partition: Option<i32>,
-    timestamp: Option<i64>,
-    key: Option<Vec<u8>>,
     value: Option<Vec<u8>>,
-    headers: Vec<HeaderSnapshot>,
 }
 
 impl RecordSnapshot {
     fn capture(record: &Record) -> Self {
         Self {
             topic: record.topic().map(str::to_owned),
-            kafka_partition: record.kafka_partition(),
-            timestamp: record.timestamp(),
-            key: record.key().map(<[u8]>::to_vec),
             value: record.value().map(<[u8]>::to_vec),
-            headers: record
-                .headers()
-                .iter()
-                .map(HeaderSnapshot::capture)
-                .collect(),
         }
     }
 
     fn json(&self) -> Result<Value, HostError> {
-        let headers = self
-            .headers
-            .iter()
-            .map(HeaderSnapshot::json)
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
             "topic": self.topic,
-            "kafka_partition": self.kafka_partition,
-            "timestamp": self.timestamp,
-            "key": decode_json(self.key.as_deref())?,
             "value": decode_json(self.value.as_deref())?,
-            "headers": headers,
         }))
     }
 }

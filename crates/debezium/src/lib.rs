@@ -10,7 +10,7 @@ mod protocol;
 
 pub use checkpoint::Checkpoint;
 pub use config::ConnectorConfig;
-pub use connector::{Connector, Delivery, Header, Record};
+pub use connector::{Connector, Delivery, Record};
 pub use error::{Error, ErrorKind};
 pub use jvm::DebeziumRuntime;
 

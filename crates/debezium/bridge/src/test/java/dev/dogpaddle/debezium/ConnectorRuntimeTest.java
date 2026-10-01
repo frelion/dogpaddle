@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 class ConnectorRuntimeTest {
     @Test
     void protocol_version_is_available_without_creating_a_connector() {
-        assertEquals(1, ConnectorRuntime.protocolVersion());
+        assertEquals(2, ConnectorRuntime.protocolVersion());
     }
 
     @Test
@@ -33,7 +33,7 @@ class ConnectorRuntimeTest {
                         null,
                         DeliveryCodec.MINIMUM_MAXIMUM_BYTES - 1));
 
-        assertEquals("maximum delivery bytes must be at least 68", error.getMessage());
+        assertEquals("maximum delivery bytes must be at least 58", error.getMessage());
     }
 
     @Test
@@ -44,9 +44,9 @@ class ConnectorRuntimeTest {
 
         IllegalArgumentException empty = assertThrows(
                 IllegalArgumentException.class,
-                () -> ConnectorRuntime.create(configuration, null, 88));
+                () -> ConnectorRuntime.create(configuration, null, 78));
         assertEquals(
-                "maximum delivery bytes must be at least 89 for the initial checkpoint",
+                "maximum delivery bytes must be at least 79 for the initial checkpoint",
                 empty.getMessage());
 
         Checkpoint restored = new Checkpoint(

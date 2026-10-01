@@ -40,7 +40,7 @@ const REQUIRED_JARS: &[&str] = &[
 ];
 const EXPECTED_DISTRIBUTION_MANIFEST: &str = concat!(
     "dogpaddle.debezium.distribution=1\n",
-    "bridge.protocol=1\n",
+    "bridge.protocol=2\n",
     "debezium.version=3.6.3.Final\n",
     "kafka.connect.version=4.3.0\n",
 );

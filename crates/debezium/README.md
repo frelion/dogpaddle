@@ -86,8 +86,10 @@ let _connector = runtime.start(config, Some(&checkpoint))?;
 | `Delivery` | 当前唯一一批尚未确认的数据 |
 | `Checkpoint` | 接受当前批次后完整 offset store 的不透明快照 |
 
-`Record` 是 owned Rust 数据，保留 topic、Kafka partition、时间戳、key、value 和有序 headers。key、value
-与 `Header` value 使用 Kafka Connect schemas-enabled JSON bytes；Rust 层不解释 connector payload。
+`Record` 是 owned Rust 数据，只保留 nullable topic 和 nullable value，保持所有源记录的顺序；value
+使用 Kafka Connect schemas-enabled JSON bytes，Rust 层不解释 connector payload。Kafka partition、时间戳、key
+和 headers 不导出，也不再验证这些未消费字段的 JSON 可转换性。Java 原始 `SourceRecord` 及其 source partition/offset
+仍完整参与 checkpoint 预演和实际 committer；产品 CDC 所需的完整行验证不变。
 另外两个公共类型 `Error` / `ErrorKind` 提供不会回显 property value 的稳定错误分类。
 
 ### Delivery 的线性确认权
@@ -184,7 +186,8 @@ host；产品 archive 在固定 `bin/` 与 `libexec/` 布局中组合两者。
 它高于当前 Debezium Async Engine 默认的 40 秒 task-management 上限。
 
 `ConnectorConfig::max_delivery_bytes` 限制一次完成后跨 JNI 复制的编码 frame，默认 16 MiB。它不限制 JVM heap、
-connector 内部队列或数据库日志占用。单个 delivery 超限是终止性 connector 错误，需要调整配置并重启。
+connector 内部队列或数据库日志占用。最小 frame 是 checkpoint 加 30 字节（一个 null topic/value record）；
+最短绑定的 checkpoint 为 28 字节，所以全局最小上限是 58 字节，实际配置还按绑定及恢复 checkpoint 长度校验。单个 delivery 超限是终止性 connector 错误，需要调整配置并重启。
 
 Connector properties 中与 task、offset、commit、converter、SMT 和 `DogPaddle` 协议相关的 key 由 runtime 保留，
 调用方不能覆盖。错误只包含 runtime 控制的上下文，不回显 property value，避免泄露密码。
@@ -245,7 +248,8 @@ checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-test
 
 当前固定 Debezium `3.6.3.Final`、Kafka Connect `4.3.0`、Java 17 bytecode、Eclipse Temurin JRE
 `21.0.12.1+1` 和 `jni-rs` `0.22.4`。checkpoint framing、delivery wire、JNI commands、bundle layout、
-offset converter 和 ACK 语义都是开发期 v1 持久或运行协议。
+offset converter 和 ACK 语义都有独立版本边界。持久 checkpoint 保持 v1；topic/value delivery wire 和 bridge protocol
+为 v2，旧 bundle 在启动校验时拒绝，必须重建 runtime payload，不提供旧 Record 格式兼容。
 
 升级必须重新通过 preview-versus-actual、checkpoint restore、四平台 bundle 和真实 connector gate。当前不提供旧
 runtime、旧 wire 或旧 checkpoint 的迁移和兼容分支；开发期 fixture 直接重建。

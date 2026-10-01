@@ -8,7 +8,7 @@ use std::sync::{Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use dogpaddle_debezium::{
-    Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, Delivery, ErrorKind, Header, Record,
+    Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, Delivery, ErrorKind, Record,
 };
 use serde_json::Value;
 
@@ -18,16 +18,10 @@ const TOPIC: &str = "dogpaddle-lifecycle-probe";
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-type HeaderSnapshot = (Box<str>, Option<Box<[u8]>>);
-
 #[derive(Debug, Eq, PartialEq)]
 struct RecordSnapshot {
     topic: Option<Box<str>>,
-    kafka_partition: Option<i32>,
-    timestamp: Option<i64>,
-    key: Option<Box<[u8]>>,
     value: Option<Box<[u8]>>,
-    headers: Box<[HeaderSnapshot]>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -207,50 +201,13 @@ fn verify_fixture_record(
         ));
     };
     require(record.topic() == Some(TOPIC), "unexpected record topic")?;
-    require(
-        record.kafka_partition() == Some(7),
-        "unexpected record Kafka partition",
-    )?;
-    require(
-        record.timestamp() == Some(1_700_000_000_000 + expected_position),
-        "unexpected record timestamp",
-    )?;
-    require_json_payload(
-        record.key(),
-        &format!("probe-key-{expected_position}"),
-        "record key",
-    )?;
     require_json_payload(
         record.value(),
         &format!("probe-value-{expected_position}"),
         "record value",
     )?;
 
-    let [first, second] = record.headers() else {
-        return Err(probe_error(
-            "lifecycle probe record must contain two headers",
-        ));
-    };
-    verify_header(
-        first,
-        "probe-header-a",
-        &format!("header-a-{expected_position}"),
-    )?;
-    verify_header(
-        second,
-        "probe-header-b",
-        &format!("header-b-{expected_position}"),
-    )?;
     Ok(())
-}
-
-fn verify_header(
-    header: &Header,
-    expected_key: &str,
-    expected_payload: &str,
-) -> Result<(), Box<dyn Error>> {
-    require(header.key() == expected_key, "unexpected record header key")?;
-    require_json_payload(header.value(), expected_payload, "record header")
 }
 
 fn require_json_payload(
@@ -271,20 +228,7 @@ fn snapshot(records: &[Record]) -> Box<[RecordSnapshot]> {
         .iter()
         .map(|record| RecordSnapshot {
             topic: record.topic().map(Into::into),
-            kafka_partition: record.kafka_partition(),
-            timestamp: record.timestamp(),
-            key: record.key().map(Into::into),
             value: record.value().map(Into::into),
-            headers: record
-                .headers()
-                .iter()
-                .map(|header| {
-                    (
-                        Box::<str>::from(header.key()),
-                        header.value().map(Into::into),
-                    )
-                })
-                .collect(),
         })
         .collect()
 }

@@ -88,7 +88,7 @@ fn bundle_requires_runtime_security_legal_and_distribution_evidence() {
 fn resume_checkpoint_must_fit_inside_the_delivery_bound() {
     let config = ConnectorConfig::new("e", "c")
         .unwrap()
-        .max_delivery_bytes(68)
+        .max_delivery_bytes(58)
         .unwrap();
     let bytes = checkpoint_bytes("e", "c", &[(b"key", &[0; 32])]);
     let checkpoint = Checkpoint::from_bytes(bytes).unwrap();
@@ -117,93 +117,139 @@ fn bundle_rejects_a_corrupt_or_unlisted_distribution_jar() {
 }
 
 #[test]
-fn delivery_decoder_preserves_all_fields_and_source_order() {
+fn delivery_decoder_preserves_topic_value_and_source_order() {
     let checkpoint = checkpoint_bytes("engine", "connector", &[(b"offset", b"42")]);
     let records = [
         EncodedRecord {
             topic: Some("orders"),
-            partition: Some(3),
-            timestamp: Some(17),
-            key: Some(br#"{"schema":{"type":"int32"},"payload":7}"#),
             value: Some(br#"{"schema":{"type":"string"},"payload":"first"}"#),
-            headers: &[("trace", Some(br#"{"schema":null,"payload":"a"}"#))],
         },
         EncodedRecord {
             topic: None,
-            partition: None,
-            timestamp: None,
-            key: None,
             value: Some(br#"{"schema":null,"payload":"second"}"#),
-            headers: &[],
         },
     ];
     let bytes = delivery_bytes(&checkpoint, &records);
 
     let decoded = decode_delivery(&bytes, bytes.len()).unwrap();
+    drop(bytes);
 
     assert_eq!(decoded.checkpoint.as_bytes(), checkpoint);
     assert_eq!(decoded.records.len(), 2);
     assert_eq!(decoded.records[0].topic(), Some("orders"));
-    assert_eq!(decoded.records[0].kafka_partition(), Some(3));
-    assert_eq!(decoded.records[0].timestamp(), Some(17));
-    assert_eq!(decoded.records[0].key(), records[0].key);
     assert_eq!(decoded.records[0].value(), records[0].value);
-    assert_eq!(decoded.records[0].headers()[0].key(), "trace");
-    assert_eq!(
-        decoded.records[0].headers()[0].value(),
-        records[0].headers[0].1
-    );
     assert_eq!(decoded.records[1].topic(), None);
-    assert_eq!(decoded.records[1].kafka_partition(), None);
-    assert_eq!(decoded.records[1].timestamp(), None);
-    assert_eq!(decoded.records[1].key(), None);
     assert_eq!(decoded.records[1].value(), records[1].value);
 }
 
 #[test]
 fn delivery_wire_matches_the_java_bridge_golden() {
     let bytes = decode_hex(concat!(
-        "44504442445630310001000000334450444243503031000100000008656e67696e652d61",
+        "44504442445630310002000000334450444243503031000100000008656e67696e652d61",
         "000000116578616d706c652e436f6e6e6563746f720000000033b0f22100000002000000",
-        "05746f706963010000000101000000000000000a0000003f7b22736368656d61223a7b22",
-        "74797065223a22737472696e67222c226f7074696f6e616c223a66616c73657d2c227061",
-        "796c6f6164223a226669727374227d0000003f7b22736368656d61223a7b227479706522",
-        "3a22737472696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164",
-        "223a226669727374227d0000000100000007617474656d7074000000387b22736368656d",
-        "61223a7b2274797065223a22696e743332222c226f7074696f6e616c223a66616c73657d",
-        "2c227061796c6f6164223a337d00000005746f706963010000000201000000000000000b",
-        "000000407b22736368656d61223a7b2274797065223a22737472696e67222c226f707469",
-        "6f6e616c223a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000040",
-        "7b22736368656d61223a7b2274797065223a22737472696e67222c226f7074696f6e616c",
-        "223a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000000f6e0afee",
+        "05746f7069630000003f7b22736368656d61223a7b2274797065223a22737472696e6722",
+        "2c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a22666972737422",
+        "7d00000005746f706963000000407b22736368656d61223a7b2274797065223a22737472",
+        "696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a227365",
+        "636f6e64227de6f872b3",
     ));
 
     let decoded = decode_delivery(&bytes, bytes.len()).unwrap();
 
-    assert_eq!(bytes.len(), 468);
+    assert_eq!(bytes.len(), 226);
     assert_eq!(
         decoded.checkpoint.as_bytes(),
         checkpoint_bytes("engine-a", "example.Connector", &[])
     );
     assert_eq!(decoded.records.len(), 2);
     assert_eq!(decoded.records[0].topic(), Some("topic"));
-    assert_eq!(decoded.records[0].kafka_partition(), Some(1));
-    assert_eq!(decoded.records[0].timestamp(), Some(10));
-    assert!(decoded.records[0].key().unwrap().ends_with(br#""first"}"#));
-    assert_eq!(decoded.records[0].key(), decoded.records[0].value());
-    assert_eq!(decoded.records[0].headers()[0].key(), "attempt");
     assert!(
-        decoded.records[0].headers()[0]
+        decoded.records[0]
             .value()
             .unwrap()
-            .ends_with(br"3}")
+            .ends_with(br#""first"}"#)
     );
     assert_eq!(decoded.records[1].topic(), Some("topic"));
-    assert_eq!(decoded.records[1].kafka_partition(), Some(2));
-    assert_eq!(decoded.records[1].timestamp(), Some(11));
-    assert!(decoded.records[1].key().unwrap().ends_with(br#""second"}"#));
-    assert_eq!(decoded.records[1].key(), decoded.records[1].value());
-    assert!(decoded.records[1].headers().is_empty());
+    assert!(
+        decoded.records[1]
+            .value()
+            .unwrap()
+            .ends_with(br#""second"}"#)
+    );
+}
+
+#[test]
+fn delivery_minimum_is_one_null_record_plus_the_exact_checkpoint() {
+    let checkpoint = checkpoint_bytes("e", "c", &[]);
+    assert_eq!(checkpoint.len(), 28);
+    let bytes = delivery_bytes(&checkpoint, &[EncodedRecord::empty()]);
+    assert_eq!(bytes.len(), 58);
+    let decoded = decode_delivery(&bytes, 58).unwrap();
+    drop(bytes);
+    assert_eq!(decoded.checkpoint.as_bytes(), checkpoint);
+    assert_eq!(decoded.records.len(), 1);
+    assert!(decoded.records[0].topic().is_none());
+    assert!(decoded.records[0].value().is_none());
+    ConnectorConfig::new("e", "c")
+        .unwrap()
+        .max_delivery_bytes(58)
+        .unwrap();
+    assert!(
+        ConnectorConfig::new("e", "c")
+            .unwrap()
+            .max_delivery_bytes(57)
+            .is_err()
+    );
+}
+
+#[test]
+fn nullable_record_fields_preserve_empty_values_and_reject_bad_lengths() {
+    let checkpoint = checkpoint_bytes("e", "c", &[]);
+    let record = EncodedRecord {
+        topic: Some(""),
+        value: Some(b""),
+    };
+    let bytes = delivery_bytes(&checkpoint, &[record]);
+    let decoded = decode_delivery(&bytes, bytes.len()).unwrap();
+    assert_eq!(decoded.records[0].topic(), Some(""));
+    assert_eq!(decoded.records[0].value(), Some(b"".as_slice()));
+    let record_start = 8 + 2 + 4 + checkpoint.len() + 4;
+    for offset in [record_start, record_start + 4] {
+        let mut invalid = bytes.clone();
+        invalid[offset..offset + 4].copy_from_slice(&(-2_i32).to_be_bytes());
+        invalid.truncate(invalid.len() - size_of::<u32>());
+        append_checksum(&mut invalid);
+        assert_eq!(
+            decode_delivery(&invalid, invalid.len()).unwrap_err().kind(),
+            ErrorKind::Protocol
+        );
+    }
+}
+
+#[test]
+fn retired_delivery_version_is_rejected_even_with_a_valid_checksum() {
+    let checkpoint = checkpoint_bytes("e", "c", &[]);
+    let mut bytes = delivery_bytes(&checkpoint, &[EncodedRecord::empty()]);
+    bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    bytes.truncate(bytes.len() - size_of::<u32>());
+    append_checksum(&mut bytes);
+    let error = decode_delivery(&bytes, bytes.len()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Protocol);
+    assert!(error.to_string().contains("version"));
+}
+
+#[test]
+fn retired_bridge_manifest_is_rejected_before_jvm_startup() {
+    let directory = fake_bundle();
+    let manifest = directory.path().join("debezium/MANIFEST");
+    let old = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("bridge.protocol=2", "bridge.protocol=1");
+    fs::write(manifest, old).unwrap();
+    assert_eq!(
+        Bundle::open(directory.path()).err().unwrap().kind(),
+        ErrorKind::InvalidBundle
+    );
 }
 
 #[test]
@@ -247,7 +293,7 @@ fn delivery_decoder_applies_bounds_before_copying_nested_frames() {
 
     let mut oversized_checkpoint = Vec::new();
     oversized_checkpoint.extend_from_slice(b"DPDBDV01");
-    oversized_checkpoint.extend_from_slice(&1_u16.to_be_bytes());
+    oversized_checkpoint.extend_from_slice(&2_u16.to_be_bytes());
     oversized_checkpoint.extend_from_slice(&(64_u32 * 1024 * 1024 + 1).to_be_bytes());
     append_checksum(&mut oversized_checkpoint);
     assert_eq!(
@@ -265,7 +311,7 @@ fn write_fake_distribution(root: &std::path::Path) {
         root.join("MANIFEST"),
         concat!(
             "dogpaddle.debezium.distribution=1\n",
-            "bridge.protocol=1\n",
+            "bridge.protocol=2\n",
             "debezium.version=3.6.3.Final\n",
             "kafka.connect.version=4.3.0\n",
         ),
@@ -368,22 +414,14 @@ fn write_fake_checksums(root: &std::path::Path) {
 #[derive(Clone, Copy)]
 struct EncodedRecord<'a> {
     topic: Option<&'a str>,
-    partition: Option<i32>,
-    timestamp: Option<i64>,
-    key: Option<&'a [u8]>,
     value: Option<&'a [u8]>,
-    headers: &'a [(&'a str, Option<&'a [u8]>)],
 }
 
 impl EncodedRecord<'_> {
     const fn empty() -> Self {
         Self {
             topic: None,
-            partition: None,
-            timestamp: None,
-            key: None,
             value: None,
-            headers: &[],
         }
     }
 }
@@ -391,20 +429,12 @@ impl EncodedRecord<'_> {
 fn delivery_bytes(checkpoint: &[u8], records: &[EncodedRecord<'_>]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"DPDBDV01");
-    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&2_u16.to_be_bytes());
     push_u32_bytes(&mut bytes, checkpoint);
     bytes.extend_from_slice(&u32::try_from(records.len()).unwrap().to_be_bytes());
     for record in records {
         push_nullable_bytes(&mut bytes, record.topic.map(str::as_bytes));
-        push_optional_i32(&mut bytes, record.partition);
-        push_optional_i64(&mut bytes, record.timestamp);
-        push_nullable_bytes(&mut bytes, record.key);
         push_nullable_bytes(&mut bytes, record.value);
-        bytes.extend_from_slice(&u32::try_from(record.headers.len()).unwrap().to_be_bytes());
-        for (key, value) in record.headers {
-            push_u32_bytes(&mut bytes, key.as_bytes());
-            push_nullable_bytes(&mut bytes, *value);
-        }
     }
     append_checksum(&mut bytes);
     bytes
@@ -437,24 +467,6 @@ fn push_nullable_bytes(target: &mut Vec<u8>, value: Option<&[u8]>) {
         target.extend_from_slice(value);
     } else {
         target.extend_from_slice(&(-1_i32).to_be_bytes());
-    }
-}
-
-fn push_optional_i32(target: &mut Vec<u8>, value: Option<i32>) {
-    if let Some(value) = value {
-        target.push(1);
-        target.extend_from_slice(&value.to_be_bytes());
-    } else {
-        target.push(0);
-    }
-}
-
-fn push_optional_i64(target: &mut Vec<u8>, value: Option<i64>) {
-    if let Some(value) = value {
-        target.push(1);
-        target.extend_from_slice(&value.to_be_bytes());
-    } else {
-        target.push(0);
     }
 }
 

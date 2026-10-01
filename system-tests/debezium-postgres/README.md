@@ -141,10 +141,10 @@ The real connector run must prove all of these:
     contained `libjvm`, not Java from the container environment.
 
 Within one live connector, byte-for-byte stability includes the opaque
-checkpoint and every encoded key, value, and header. Across a fresh Engine, the
-replay oracle excludes only outer `SourceRecord.timestamp`, the envelope's
-processing `ts_ms`/`ts_us`/`ts_ns`, and the
-`__debezium.context.runId` header. The JSON remains diagnostic and is not a
+checkpoint and every exported topic/value in source order. Across a fresh Engine,
+the replay oracle excludes only the value envelope's `ts_ms`, `ts_us`, and `ts_ns`
+run-time fields. Keys, Kafka partitions, outer timestamps, and headers are no
+longer exported by the runtime. The JSON remains diagnostic and is not a
 product protocol.
 
 ## Source audit

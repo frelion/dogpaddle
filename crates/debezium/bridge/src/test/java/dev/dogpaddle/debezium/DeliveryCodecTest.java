@@ -17,17 +17,13 @@ import org.junit.jupiter.api.Test;
 
 class DeliveryCodecTest {
     private static final byte[] GOLDEN = HexFormat.of().parseHex(
-            "44504442445630310001000000334450444243503031000100000008656e67696e652d61000000116578616d"
-                    + "706c652e436f6e6e6563746f720000000033b0f2210000000200000005746f70696301000000010100000000"
-                    + "0000000a0000003f7b22736368656d61223a7b2274797065223a22737472696e67222c226f7074696f6e616c"
-                    + "223a66616c73657d2c227061796c6f6164223a226669727374227d0000003f7b22736368656d61223a7b2274"
-                    + "797065223a22737472696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a2266"
-                    + "69727374227d0000000100000007617474656d7074000000387b22736368656d61223a7b2274797065223a22"
-                    + "696e743332222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a337d00000005746f70"
-                    + "6963010000000201000000000000000b000000407b22736368656d61223a7b2274797065223a22737472696e"
-                    + "67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a227365636f6e64227d00000040"
-                    + "7b22736368656d61223a7b2274797065223a22737472696e67222c226f7074696f6e616c223a66616c73657d"
-                    + "2c227061796c6f6164223a227365636f6e64227d00000000f6e0afee");
+            "44504442445630310002000000334450444243503031000100000008656e67696e652d61"
+                    + "000000116578616d706c652e436f6e6e6563746f720000000033b0f22100000002000000"
+                    + "05746f7069630000003f7b22736368656d61223a7b2274797065223a22737472696e6722"
+                    + "2c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a22666972737422"
+                    + "7d00000005746f706963000000407b22736368656d61223a7b2274797065223a22737472"
+                    + "696e67222c226f7074696f6e616c223a66616c73657d2c227061796c6f6164223a227365"
+                    + "636f6e64227de6f872b3");
 
     @Test
     void delivery_contains_checkpoint_and_owned_connect_json_in_source_order() {
@@ -43,6 +39,49 @@ class DeliveryCodecTest {
                     checkpointBytes, List.of(first, second), 64 * 1024);
         }
         assertArrayEquals(GOLDEN, encoded);
+    }
+
+    @Test
+    void minimum_delivery_is_one_null_record_plus_the_exact_checkpoint() {
+        byte[] checkpoint = CheckpointCodec.encode(new Checkpoint("e", "c", Map.of()));
+        SourceRecord record = new SourceRecord(Map.of(), Map.of(), null, null, null);
+        assertEquals(28, checkpoint.length);
+        try (DeliveryCodec codec = new DeliveryCodec()) {
+            byte[] encoded = codec.encode(checkpoint, List.of(record), 58);
+            assertEquals(58, encoded.length);
+            assertEquals(DeliveryCodec.MINIMUM_BYTES_EXCLUDING_CHECKPOINT,
+                    encoded.length - checkpoint.length);
+            assertEquals(DeliveryCodec.MINIMUM_MAXIMUM_BYTES, encoded.length);
+            assertThrows(IllegalArgumentException.class,
+                    () -> codec.encode(checkpoint, List.of(record), 57));
+        }
+    }
+
+    @Test
+    void unexported_key_and_headers_are_not_converted_or_validated() {
+        byte[] checkpoint = CheckpointCodec.encode(new Checkpoint("e", "c", Map.of()));
+        SourceRecord record = new SourceRecord(
+                Map.of("partition", 1), Map.of("position", 1L), "topic", 7,
+                Schema.INT32_SCHEMA, "not an integer", Schema.STRING_SCHEMA, "value", 10L);
+        record.headers().addString("unused-\ud800", "value");
+        SourceRecord plain = new SourceRecord(
+                Map.of("partition", 1), Map.of("position", 1L), "topic",
+                Schema.STRING_SCHEMA, "value");
+        try (DeliveryCodec codec = new DeliveryCodec()) {
+            assertArrayEquals(codec.encode(checkpoint, List.of(plain), 1024),
+                    codec.encode(checkpoint, List.of(record), 1024));
+        }
+    }
+
+    @Test
+    void exported_value_still_requires_a_valid_connect_schema_value_pair() {
+        byte[] checkpoint = CheckpointCodec.encode(new Checkpoint("e", "c", Map.of()));
+        SourceRecord record = new SourceRecord(
+                Map.of(), Map.of(), "topic", Schema.INT32_SCHEMA, "not an integer");
+        try (DeliveryCodec codec = new DeliveryCodec()) {
+            assertThrows(org.apache.kafka.connect.errors.DataException.class,
+                    () -> codec.encode(checkpoint, List.of(record), 1024));
+        }
     }
 
     @Test

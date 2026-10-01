@@ -7,25 +7,24 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.zip.CRC32;
-import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.source.SourceRecord;
 
 /** Encodes one complete, Rust-owned delivery with an exact size ceiling. */
 final class DeliveryCodec implements AutoCloseable {
     static final byte[] MAGIC = "DPDBDV01".getBytes(StandardCharsets.US_ASCII);
-    static final int VERSION = 1;
-    static final int MINIMUM_MAXIMUM_BYTES = 68;
-    static final int MINIMUM_BYTES_EXCLUDING_CHECKPOINT = 40;
+    static final int VERSION = 2;
+    static final int MINIMUM_MAXIMUM_BYTES = 58;
+    static final int MINIMUM_BYTES_EXCLUDING_CHECKPOINT = 30;
 
     private static final int CHECKSUM_BYTES = Integer.BYTES;
 
-    private final JsonConverter keyConverter;
     private final JsonConverter valueConverter;
 
     DeliveryCodec() {
-        keyConverter = converter(true);
-        valueConverter = converter(false);
+        valueConverter = new JsonConverter();
+        valueConverter.configure(
+                Map.of("schemas.enable", true, "replace.null.with.default", false), false);
     }
 
     byte[] encode(
@@ -71,7 +70,6 @@ final class DeliveryCodec implements AutoCloseable {
 
     @Override
     public void close() {
-        keyConverter.close();
         valueConverter.close();
     }
 
@@ -81,60 +79,16 @@ final class DeliveryCodec implements AutoCloseable {
         }
         writeNullableUtf8(output, record.topic());
 
-        Integer partition = record.kafkaPartition();
-        output.writeByte(partition == null ? 0 : 1);
-        if (partition != null) {
-            output.writeInt(partition);
-        }
-
-        Long timestamp = record.timestamp();
-        output.writeByte(timestamp == null ? 0 : 1);
-        if (timestamp != null) {
-            output.writeLong(timestamp);
-        }
-
-        writeNullableBytes(
-                output,
-                keyConverter.fromConnectData(
-                        record.topic(), record.keySchema(), record.key()));
         writeNullableBytes(
                 output,
                 valueConverter.fromConnectData(
                         record.topic(), record.valueSchema(), record.value()));
-
-        int headerCount = 0;
-        for (Header ignored : record.headers()) {
-            headerCount = Math.incrementExact(headerCount);
-        }
-        output.writeInt(headerCount);
-        for (Header header : record.headers()) {
-            if (header.key() == null) {
-                throw new IllegalArgumentException("SourceRecord header key must not be null");
-            }
-            writeRequiredUtf8(output, header.key());
-            writeNullableBytes(
-                    output,
-                    valueConverter.fromConnectHeader(
-                            record.topic(), header.key(), header.schema(), header.value()));
-        }
-    }
-
-    private static JsonConverter converter(boolean isKey) {
-        JsonConverter converter = new JsonConverter();
-        converter.configure(
-                Map.of("schemas.enable", true, "replace.null.with.default", false), isKey);
-        return converter;
     }
 
     private static void writeNullableUtf8(DataOutputStream output, String value)
             throws IOException {
         writeNullableBytes(
                 output, value == null ? null : canonicalUtf8(value));
-    }
-
-    private static void writeRequiredUtf8(DataOutputStream output, String value)
-            throws IOException {
-        writeRequiredBytes(output, canonicalUtf8(value));
     }
 
     private static byte[] canonicalUtf8(String value) {

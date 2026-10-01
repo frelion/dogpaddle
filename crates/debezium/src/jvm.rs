@@ -10,7 +10,7 @@ use crate::connector::Connector;
 use crate::{Checkpoint, ConnectorConfig, Error, ErrorKind};
 
 const START_TIMEOUT: Duration = Duration::from_mins(1);
-const BRIDGE_PROTOCOL_VERSION: i32 = 1;
+const BRIDGE_PROTOCOL_VERSION: i32 = 2;
 const FAILURE_NONE: i32 = 0;
 const FAILURE_DELIVERY_TOO_LARGE: i32 = 1;
 

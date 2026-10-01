@@ -114,7 +114,7 @@ public final class ConnectorRuntime {
 
     /** Returns the JNI and wire protocol version without creating a connector. */
     public static int protocolVersion() {
-        return 1;
+        return 2;
     }
 
     /** Verifies the bundled runtime resources required by connector operation. */
