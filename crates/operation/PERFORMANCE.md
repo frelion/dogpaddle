@@ -205,3 +205,30 @@ peak 为 3113 → 3213 bytes；空区间和 NULL-order 场景各项相同。
 淘汰，备份位于 `/tmp/dogpaddle-arrow-join-rejected`；其测试不作为本候选证据。
 当前候选经过三份独立完整 diff 审查，修复重复输出的重建准入缺口，并以公共宽 winner
 缩页与输出 payload 证据防止再次漏账；`cargo xtask check` 和工作区构建通过。
+
+冻结到 `fa7f43d` 后又顺序运行全部 ASOF reference 与两个 Join resource target。
+采集时 tracked diff 为空，唯一 untracked 文件为用户历史提案；源码状态证据为
+`frozen-source.patch` 与 `frozen-source-status.txt`。五个场景的冻结结果如下；单位为 ms，
+变化相对上表 baseline，区间为冻结版本的 95% CI。
+
+| workload | 冻结中位数 | 95% CI | 变化 |
+| --- | ---: | --- | ---: |
+| global single lookup | 0.0565 | `[0.0526,0.0567]` | +6.0% |
+| partitioned single lookup | 3.2281 | `[3.1874,3.2943]` | -9.2% |
+| historical correction | 0.1909 | `[0.1887,0.1930]` | -41.1% |
+| small tail | 0.0729 | `[0.0722,0.0734]` | +2.4% |
+| wide winner | 48.4836 | `[47.5342,48.6963]` | -23.1% |
+
+历史修正资源计数与上表 candidate 完全相同。global 单次查找与 baseline 区间重叠，
+不能据此声称稳定回归；小尾部仍略慢，不撤销原较慢样本。原始结果保存在同一证据目录的
+`frozen/dogpaddle-asof-join-run-tNQdYf` 与
+`frozen/dogpaddle-asof-join-resources-run-arOD0T`。
+
+EquiJoin 的 12 个 reference resource case 全部完成，包括此前被错误链阻断的
+`full_outer_wide_state`：257 个 64 KiB 候选、32 个提交页、256 个输出。
+修复 `BudgetExceeded` 的标准 source 后，runner 能按既有规则缩页；此前失败发生在
+首个 256-item 尝试，不是已证明最小一项不能执行。结果位于
+`frozen/dogpaddle-equi-join-resources-run-vdrMOy`。该 target 直接调用 Operation，
+不编码 Flow Frame；64 KiB 行加 canonical framing 仍可能超过 Flow 的 64 KiB Resume
+上限，这项结果不能充作该宽行 Flow workload 的成功证据。公共 Flow 回归使用约
+8 KiB 嵌套候选，已证明旧错误包装失败、修复后缩页完成，并覆盖逐轮重开。
