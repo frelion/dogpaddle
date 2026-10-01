@@ -194,3 +194,55 @@ fn depth_limit_counts_durable_calls_after_fusion_and_rejects_before_creation() {
     factory.operation("sink", DiscardDefinition::new(), [tail]);
     assert_eq!(factory.build().unwrap().operation_count(), 130);
 }
+
+#[test]
+fn repeated_input_ports_obey_the_same_limit_at_build_and_open() {
+    use dogpaddle_operation::operation::transform::UnionAllDefinition;
+    use std::num::NonZeroU32;
+
+    let root = tempfile::tempdir().unwrap();
+    for inputs in [1024, 1025] {
+        let path = root.path().join(format!("ports-{inputs}"));
+        let mut factory = FlowFactory::new(&path);
+        let scan = factory.operation("scan", SequenceScanDefinition::new(u64::MAX), []);
+        let union = factory.operation(
+            "union",
+            UnionAllDefinition::new(NonZeroU32::new(inputs).unwrap()),
+            std::iter::repeat_n(scan, inputs as usize),
+        );
+        factory.operation("sink", DiscardDefinition::new(), [union]);
+        if inputs == 1024 {
+            drop(factory.build().unwrap());
+            assert_eq!(FlowFactory::new(&path).open().unwrap().operation_count(), 3);
+        } else {
+            assert!(matches!(
+                factory.build(),
+                Err(FlowError::Topology(TopologyError::Limit(
+                    "1024 inputs per operation"
+                )))
+            ));
+            assert!(!path.exists());
+        }
+    }
+}
+
+#[test]
+fn operation_count_limit_is_checked_before_publishing_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("too-many-operations");
+    let mut factory = FlowFactory::new(&path);
+    let mut tail = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    for index in 0..1023 {
+        tail = factory.operation(
+            format!("count-{index}"),
+            RunningEventCountDefinition::new(),
+            [tail],
+        );
+    }
+    factory.operation("sink", DiscardDefinition::new(), [tail]);
+    assert!(matches!(
+        factory.build(),
+        Err(FlowError::Topology(TopologyError::Limit("1024 operations")))
+    ));
+    assert!(!path.exists());
+}

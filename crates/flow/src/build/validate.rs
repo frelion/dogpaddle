@@ -17,7 +17,6 @@ pub(crate) struct Consumer {
 /// Derived indices only: no persistent identity, queue or lifecycle.
 #[derive(Debug)]
 pub(crate) struct ResolvedTopology {
-    pub(crate) schedule: Vec<usize>,
     pub(crate) tails: Vec<Vec<usize>>,
     pub(crate) consumers: Vec<Vec<Consumer>>,
     pub(crate) heads: Vec<bool>,
@@ -56,17 +55,14 @@ pub enum TopologyError {
     /// A reference comes from another factory or is not an earlier declaration.
     #[error("operation reference is not valid in this flow factory")]
     ForeignOperationRef(OperationRef),
-    /// A persisted edge does not identify an Operation.
-    #[error("operation {operation:?} references unknown input {input}")]
-    UnknownInput {
+    /// An input does not refer to an earlier declaration.
+    #[error("operation {operation:?} input {input} is not an earlier declaration")]
+    InputNotEarlier {
         /// Consumer ID.
         operation: String,
         /// Invalid producer ordinal.
         input: usize,
     },
-    /// The graph contains a cycle.
-    #[error("flow topology contains a cycle")]
-    Cycle,
     /// A root is not a source.
     #[error("root operation {0:?} is not a source")]
     RootIsNotScan(String),
@@ -100,7 +96,7 @@ pub(super) fn finish_definition(
     owner_identity: Option<[u8; 32]>,
     token: u64,
     declarations: Vec<DeclaredOperation>,
-) -> Result<FlowDefinition, TopologyError> {
+) -> Result<(FlowDefinition, ResolvedTopology), TopologyError> {
     let mut operations = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let inputs = declaration
@@ -124,8 +120,8 @@ pub(super) fn finish_definition(
         owner_identity,
         operations,
     };
-    resolve(&definition)?;
-    Ok(definition)
+    let topology = resolve(&definition)?;
+    Ok((definition, topology))
 }
 
 #[expect(
@@ -162,8 +158,10 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
         }
     }
     let mut consumers = vec![Vec::new(); nodes.len()];
-    let mut indegrees = vec![0; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
+        if node.inputs.len() > MAX_OPERATIONS {
+            return Err(TopologyError::Limit("1024 inputs per operation"));
+        }
         let expected = node.definition.kind().input_count() as usize;
         if expected != node.inputs.len() {
             return Err(TopologyError::InputCount {
@@ -173,12 +171,13 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
             });
         }
         for (port, &input) in node.inputs.iter().enumerate() {
-            let producer = nodes
-                .get(input)
-                .ok_or_else(|| TopologyError::UnknownInput {
-                    operation: node.id.clone(),
-                    input,
-                })?;
+            let producer =
+                nodes[..index]
+                    .get(input)
+                    .ok_or_else(|| TopologyError::InputNotEarlier {
+                        operation: node.id.clone(),
+                        input,
+                    })?;
             if !producer.definition.kind().has_output() {
                 return Err(TopologyError::InputHasNoOutput {
                     operation: node.id.clone(),
@@ -189,45 +188,20 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
                 operation: index,
                 port,
             });
-            indegrees[index] += 1;
         }
     }
     for (index, node) in nodes.iter().enumerate() {
-        if indegrees[index] == 0 && !node.definition.kind().is_scan() {
+        if node.inputs.is_empty() && !node.definition.kind().is_scan() {
             return Err(TopologyError::RootIsNotScan(node.id.clone()));
         }
         if consumers[index].is_empty() && !node.definition.kind().is_sink() {
             return Err(TopologyError::TerminalIsNotSink(node.id.clone()));
         }
     }
-    let mut ready = indegrees
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &n)| (n == 0).then_some(i))
-        .collect::<Vec<_>>();
-    let mut schedule = Vec::with_capacity(nodes.len());
-    while !ready.is_empty() {
-        let mut next = Vec::new();
-        for index in ready {
-            schedule.push(index);
-            for consumer in &consumers[index] {
-                indegrees[consumer.operation] -= 1;
-                if indegrees[consumer.operation] == 0 {
-                    next.push(consumer.operation);
-                }
-            }
-        }
-        next.sort_unstable();
-        ready = next;
-    }
-    if schedule.len() != nodes.len() {
-        return Err(TopologyError::Cycle);
-    }
     let mut tails = vec![Vec::new(); nodes.len()];
     let mut heads = vec![true; nodes.len()];
     let mut head_of = (0..nodes.len()).collect::<Vec<_>>();
-    for &index in &schedule {
-        let node = &nodes[index];
+    for (index, node) in nodes.iter().enumerate() {
         if node.definition.kind().is_atomic() && node.inputs.len() == 1 {
             let producer = node.inputs[0];
             if consumers[producer].len() == 1 {
@@ -239,11 +213,11 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
         }
     }
     let mut depth = vec![0; nodes.len()];
-    for &index in &schedule {
-        if !heads[index] || nodes[index].definition.kind().is_sink() {
+    for (index, node) in nodes.iter().enumerate() {
+        if !heads[index] || node.definition.kind().is_sink() {
             continue;
         }
-        depth[index] = nodes[index]
+        depth[index] = node
             .inputs
             .iter()
             .map(|&input| depth[head_of[input]])
@@ -258,7 +232,6 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
         .map(|index| consumers[tails[index].last().copied().unwrap_or(index)].clone())
         .collect();
     Ok(ResolvedTopology {
-        schedule,
         tails,
         consumers,
         heads,

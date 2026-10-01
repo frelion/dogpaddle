@@ -40,7 +40,7 @@ Sink 拥有有界 outbox；事件位置同时表示消费进度和正事件身�
 Sink 不占调用帧；outbox 满时父帧停在同一个消费者，目标 drain 仍能继续。
 
 捕获、计算和交付由同一个 `advance()` 显式驱动，没有后台执行器。一次调用轮转服务一个 Source、
-最多 32 个栈动作和一个 Sink。多个源和目标跨调用轮转；一个长 root 会阻塞后续 root 的计算，
+最多 32 个栈动作和一个 Sink。多个源和目标各自按声明顺序跨调用轮转；一个长 root 会阻塞后续 root 的计算，
 但不阻止捕获和目标交付。`Idle` 表示本轮没有进展，不代表所有外部源永久结束。
 
 ## 最小公共 API
@@ -71,7 +71,8 @@ fn run(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `resource(operation_id, value)` 注入临时凭据或连接配置，`owner_identity` 设置 build/open 必须精确匹配的身份。
-`build()` 在创建路径前检查图、资源和 Schema，然后原子发布完整 catalog 和 Definition；
+每个输入必须引用同一 factory 中较早声明的 Operation；声明顺序就是唯一的构造与轮询顺序，不另排拓扑序。
+`build()` 在创建路径前只解析一次图并检查资源和 Schema，将原计划编码后原子发布完整 catalog 和 Definition，不先把自己编码的计划重新解码；
 `open()` 只读已存在的资源，验证帧与图的对应关系后恢复运行。失败不删除、修复或重建状态。
 
 `operation_ids()` 返回全部逻辑 ID；`status()` 返回栈深度、栈顶 Operation、是否正在发送，以及是否必须重开。
@@ -79,7 +80,7 @@ fn run(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
 ## 固定执行界限
 
-- 图最多 1024 个 Operation，计算调用深度最多 64；Sink 不占深度。
+- 图最多 1024 个 Operation，每个 Operation 最多 1024 个输入端口，计算调用深度最多 64；Sink 不占深度。
 - 捕获输入最多 8 MiB；后代页最多 1 MiB、256 行、16,384 个顶层标量槽。
 - 每次计算 attempt 最多 4 MiB 逻辑访问/写入；head 工作量从 256 逐次减半，最多尝试九次。
 - 一次栈动作不会跨调度轮遗忘缩页结果。最小工作项连同完整尾链仍超限时明确失败。

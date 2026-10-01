@@ -245,3 +245,56 @@ fn sqlite_u64_rows(sqlite_path: &Path) -> Vec<(i64, u64, u64, i64)> {
 fn decode_u64_blob(value: Vec<u8>) -> u64 {
     u64::from_be_bytes(value.try_into().expect("UInt64 uses an 8-byte BLOB"))
 }
+
+#[test]
+fn target_draining_follows_declaration_order_across_unequal_depths_and_reopen() {
+    use dogpaddle_operation::operation::transform::RunningEventCountDefinition;
+
+    let root = tempfile::tempdir().unwrap();
+    for reopen in [false, true] {
+        let path = root.path().join(format!("flow-{reopen}"));
+        let first_target = root.path().join(format!("first-{reopen}.sqlite"));
+        let second_target = root.path().join(format!("second-{reopen}.sqlite"));
+        let mut factory = FlowFactory::new(&path);
+        let first = factory.operation("first-source", SequenceScanDefinition::new(u64::MAX), []);
+        let counted = factory.operation("count", RunningEventCountDefinition::new(), [first]);
+        factory.operation(
+            "first-sink",
+            SqliteSinkDefinition::try_new(&first_target, TABLE).unwrap(),
+            [counted],
+        );
+        let second = factory.operation("second-source", SequenceScanDefinition::new(u64::MAX), []);
+        factory.operation(
+            "second-sink",
+            SqliteSinkDefinition::try_new(&second_target, TABLE).unwrap(),
+            [second],
+        );
+        let mut flow = factory.build().unwrap();
+        if reopen {
+            drop(flow);
+            flow = FlowFactory::new(&path).open().unwrap();
+        }
+        assert!(!first_target.exists());
+        assert!(!second_target.exists());
+        flow.advance().unwrap();
+        // The first declared sink is deeper than the second. Its external
+        // initialization still comes first, without a separate breadth-first order.
+        assert!(first_target.exists());
+        assert!(!second_target.exists());
+        flow.advance().unwrap();
+        assert!(second_target.exists());
+        run_until_idle(&mut flow);
+        drop(flow);
+        for target in [&first_target, &second_target] {
+            let connection =
+                Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM events", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+            );
+        }
+    }
+}

@@ -73,6 +73,7 @@ impl FlowFactory {
         Ok(self)
     }
     /// Declares an Operation with ordered references to previously declared inputs.
+    /// Declaration order also determines construction and source/sink rotation.
     pub fn operation(
         &mut self,
         id: impl Into<String>,
@@ -90,15 +91,15 @@ impl FlowFactory {
         });
         reference
     }
-    /// Validates and binds the graph before atomically publishing its complete catalog.
+    /// Validates and binds the graph in declaration order before atomically publishing its catalog.
+    /// The original plan is encoded for persistence without a decode round-trip.
     /// # Errors
     /// Returns topology, schema, resource or Store errors. Failed persistent creation
     /// can leave an incomplete path; open never repairs or deletes it.
     pub fn build(self) -> Result<Flow, FlowError> {
-        let definition =
+        let (definition, topology) =
             validate::finish_definition(self.owner_identity, self.token, self.operations)?;
         let encoded = codec::encode(&definition)?;
-        let (definition, topology) = codec::decode(&encoded)?;
         let resources = preflight_resources(&definition, self.resources)?;
         let mut setup = StoreSetup::new();
         let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;

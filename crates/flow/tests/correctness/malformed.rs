@@ -93,7 +93,7 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     rewrite_checksum(&mut unknown_input);
     assert_eq!(
         definition_error(root.path(), "unknown-input", &unknown_input),
-        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::UnknownInput {
+        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
             operation: "sink".to_owned(),
             input: 99
         })
@@ -254,4 +254,77 @@ fn oversized_definition_is_rejected_before_decoding_without_rewriting_it() {
         Err(FlowError::Store(_))
     ));
     assert_eq!(read_published_definition(&path), bytes);
+}
+
+#[test]
+fn persisted_inputs_must_precede_their_consumers_even_in_an_acyclic_graph() {
+    let root = tempfile::tempdir().unwrap();
+    let original = fixture_bytes(V1_SEQUENCE_RUNNING_EVENT_COUNT_DISCARD);
+    let first = FLOW_MAGIC.len() + size_of::<u16>() + 1 + size_of::<u32>();
+    let count = find_first(&original, b"count") - size_of::<u32>();
+    let sink = find_first(&original, b"sink") - size_of::<u32>();
+    let end = original.len() - size_of::<u32>();
+    // Reorder the same valid DAG as count -> scan -> sink. Its first edge now
+    // points forward to scan, and sink still reads count: there is no cycle.
+    let mut count_node = original[count..sink].to_vec();
+    let input = count_node.len() - size_of::<u32>();
+    count_node[input..].copy_from_slice(&1_u32.to_be_bytes());
+    let mut sink_node = original[sink..end].to_vec();
+    let input = sink_node.len() - size_of::<u32>();
+    sink_node[input..].copy_from_slice(&0_u32.to_be_bytes());
+    let mut forward = original[..first].to_vec();
+    forward.extend(count_node);
+    forward.extend_from_slice(&original[first..count]);
+    forward.extend(sink_node);
+    forward.extend_from_slice(&[0; 4]);
+    rewrite_checksum(&mut forward);
+    assert_eq!(
+        definition_error(root.path(), "forward", &forward),
+        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
+            operation: "count".to_owned(),
+            input: 1,
+        })
+    );
+    assert_eq!(
+        read_published_definition(&root.path().join("forward")),
+        forward
+    );
+
+    let mut self_reference = original;
+    self_reference[end - 4..end].copy_from_slice(&2_u32.to_be_bytes());
+    rewrite_checksum(&mut self_reference);
+    assert_eq!(
+        definition_error(root.path(), "self-reference", &self_reference),
+        FlowDefinitionError::Topology(dogpaddle_flow::TopologyError::InputNotEarlier {
+            operation: "sink".to_owned(),
+            input: 2,
+        })
+    );
+    assert_eq!(
+        read_published_definition(&root.path().join("self-reference")),
+        self_reference,
+    );
+}
+
+#[test]
+fn fresh_build_checks_the_complete_encoded_size_without_a_decode_round_trip() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    let mut factory = FlowFactory::new(&path);
+    let scan = factory.operation("scan", SequenceScanDefinition::new(0), []);
+    let select = factory.operation(
+        "select",
+        SelectDefinition::try_new([("value", dogpaddle_operation::col("value"))])
+            .unwrap()
+            .with_metadata([("size".to_owned(), "x".repeat(8 * 1024 * 1024))]),
+        [scan],
+    );
+    factory.operation("sink", DiscardDefinition::new(), [select]);
+    assert!(matches!(
+        factory.build(),
+        Err(FlowError::Definition(FlowDefinitionError::LengthOverflow(
+            "definition"
+        )))
+    ));
+    assert!(!path.exists());
 }

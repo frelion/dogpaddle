@@ -8,7 +8,6 @@ use thiserror::Error;
 const MAGIC: &[u8] = b"dogpaddle.flow\0";
 const FORMAT_VERSION: u16 = 1;
 pub(super) const CHECKSUM_LENGTH: usize = size_of::<u32>();
-const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
 pub(crate) const DEFINITION_DATA_NAME: &str = "flow/definition";
 pub(super) const MAX_DEFINITION_BYTES: usize = 8 * 1024 * 1024;
 
@@ -90,7 +89,7 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
     if encoded.len() > MAX_DEFINITION_BYTES - CHECKSUM_LENGTH {
         return Err(FlowDefinitionError::LengthOverflow("definition"));
     }
-    encoded.extend_from_slice(&crc32(&encoded).to_be_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&encoded).to_be_bytes());
     Ok(encoded)
 }
 
@@ -110,7 +109,8 @@ pub(crate) fn decode(
         return Err(FlowDefinitionError::Truncated);
     }
     let (payload, checksum) = encoded.split_at(encoded.len() - CHECKSUM_LENGTH);
-    if crc32(payload) != u32::from_be_bytes(checksum.try_into().expect("fixed checksum")) {
+    if crc32fast::hash(payload) != u32::from_be_bytes(checksum.try_into().expect("fixed checksum"))
+    {
         return Err(FlowDefinitionError::IntegrityMismatch);
     }
     let mut cursor = Cursor::new(&payload[MAGIC.len()..]);
@@ -178,18 +178,6 @@ fn encode_bytes(
     encoded.extend_from_slice(&length.to_be_bytes());
     encoded.extend_from_slice(value);
     Ok(())
-}
-
-pub(super) fn crc32(bytes: &[u8]) -> u32 {
-    let mut checksum = u32::MAX;
-    for byte in bytes {
-        checksum ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (checksum & 1).wrapping_neg();
-            checksum = (checksum >> 1) ^ (CRC32_POLYNOMIAL & mask);
-        }
-    }
-    !checksum
 }
 
 struct Cursor<'a> {

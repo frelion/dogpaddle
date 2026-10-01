@@ -1546,6 +1546,7 @@ version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "crc32fast",
  "criterion",
  "dogpaddle-change",
  "dogpaddle-operation",

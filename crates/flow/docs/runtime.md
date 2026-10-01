@@ -7,10 +7,10 @@
 
 `flow/definition` 是唯一持久 DAG。它保存 owner identity、每个 Operation 的稳定 ID、具体 Definition 和有序输入 ordinal；
 格式以 `dogpaddle.flow\0`、u16 v1 起始，使用 big-endian u32 长度/ordinal，末尾 CRC32 覆盖此前全部字节。
-Definition 最多 8 MiB，Operation 最多 1024，ID 非空、无 NUL、最多 1024 UTF-8 字节且全图唯一。
+Definition 最多 8 MiB，Operation 最多 1024，每个 Operation 最多 1024 个输入端口（允许重复生产者），ID 非空、无 NUL、最多 1024 UTF-8 字节且全图唯一。
 
-根必须是 Source，叶必须是 Sink，输入数量与角色相符，所有输入有输出，图无环。构建引用必须来自同一 factory 的较早声明。
-解码图允许拓扑排序，但拒绝未知输入和环。所有 Schema 与资源先绑定，再由一笔 StoreSetup 事务发布 catalog 和 Definition。
+根必须是 Source，叶必须是 Sink，输入数量与角色相符，所有输入有输出。构建引用必须来自同一 factory 的较早声明；持久解码同样要求每条输入 ordinal 严格小于当前节点 ordinal，因此图按声明序天然无环。向前引用、自引用和越界输入统一拒绝，不另维护拓扑排序或运行 schedule。任何 DAG 都可按拓扑声明表达。
+新建只解析一次这份原始计划的连接、融合和深度，编码仅用于持久保存，不进行整图 encode→decode 往返；open 才完整解码和重新验证。所有 Schema 与资源先绑定，再由一笔 StoreSetup 事务发布 catalog 和 Definition。
 Operation 状态前缀为 `operation/{ordinal:08x}`，逻辑 ordinal 与持久 Definition 一致。
 
 一个单输入 Atomic 只有在其上游恰有一条消费边时才吸收到上游 head 的尾链。Paged 与多输入 Atomic 可以做 head，
@@ -67,7 +67,7 @@ Aggregate 或 ASOF 产生的一对 `-old,+new` 在其本页和尾链中原子，
 最坏额外涉及 36 MiB。运行时按实际已扣逻辑预算累计失败 attempt；为整个有限重试序列预留调度额度。
 首次 root 失败另预留一份 control 写入，以固定失败输入；一轮最多 32 个栈动作，栈工作预留 80 MiB；Source 捕获另有 24 MiB 界。Sink 首次恢复校验可读取整个最多 64 MiB outbox，
 普通 drain 读取有界前缀并持久化 Prepared；此额外工作按 Sink owner 契约计，不冒称整轮 128 MiB 硬界。
-Source、root 选择与 Sink 跨轮轮转；空栈在本轮剩余额度内检查 Source 的已发布队列，空队列不阻止检查后续 Source。
+Source、root 选择与 Sink 各自按 Operation 声明顺序跨轮轮转；空栈在本轮剩余额度内检查 Source 的已发布队列，空队列不阻止检查后续 Source。
 
 每个 Source 的 input Queue 按捕获/封口与 Streaming 阶段计容量，未确认 Delivery 另计；每个 Sink 的 outbox 单独有界。
 栈层保留槽不与祖先或 outbox 共用容量，因此 child 不会等待祖先释放自己必须依赖的同一池。
@@ -75,7 +75,7 @@ Source、root 选择与 Sink 跨轮轮转；空栈在本轮剩余额度内检查
 关系历史和外部日志保留不在此界内。
 
 `advance()` 轮转服务一个 Source、有限栈工作、一个 Sink。长 root 允许后续 root 计算头部阻塞。
-容量拒绝不阻止本轮 drain；Idle 只表示本轮无进展。外部语句 deadline 属于具体 adapter，不能把轮转机会解释为即时取消。
+较早声明的深层 Sink 先于较晚声明的浅层 Sink 获得交付轮次，不按图层数排序；reopen 从各自首个声明重新轮转。容量拒绝不阻止本轮 drain；Idle 只表示本轮无进展。外部语句 deadline 属于具体 adapter，不能把轮转机会解释为即时取消。
 
 ## Durability 与重开
 

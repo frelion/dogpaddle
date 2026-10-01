@@ -35,6 +35,7 @@ const STACK_ACTIONS: usize = 32;
 const STACK_ROUND_BYTES: usize = 80 * PAGE_BYTES;
 impl Flow {
     /// Services one source, at most 32 stack actions, and one sink, in rotation.
+    /// Sources and sinks each rotate in declaration order, starting anew on reopen.
     ///
     /// Capturing and draining continue while computation is backpressured. One
     /// stack action may retry a page at most nine times, halving head work from

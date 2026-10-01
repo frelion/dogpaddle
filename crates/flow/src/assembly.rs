@@ -5,7 +5,7 @@ use crate::{
 };
 use arrow_schema::SchemaRef;
 use dogpaddle_change::SchemaBoundChangeCodec;
-use dogpaddle_operation::{RuntimeResource, operation::Operation};
+use dogpaddle_operation::RuntimeResource;
 use dogpaddle_store::DataScope;
 
 pub(crate) fn construct(
@@ -15,12 +15,12 @@ pub(crate) fn construct(
     resources: Vec<RuntimeResource>,
 ) -> Result<Runtime, FlowError> {
     let count = definition.operations.len();
-    let mut resources = resources.into_iter().map(Some).collect::<Vec<_>>();
-    let mut schemas: Vec<Option<SchemaRef>> = vec![None; count];
-    let mut operations: Vec<Option<Operation>> = (0..count).map(|_| None).collect();
-    let mut codecs: Vec<Option<SchemaBoundChangeCodec>> = (0..count).map(|_| None).collect();
-    for &index in &topology.schedule {
-        let node = &definition.operations[index];
+    let mut schemas: Vec<Option<SchemaRef>> = Vec::with_capacity(count);
+    let mut operations = Vec::with_capacity(count);
+    let mut codecs = Vec::with_capacity(count);
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    for (index, (node, resource)) in definition.operations.iter().zip(resources).enumerate() {
         let inputs = node
             .inputs
             .iter()
@@ -36,44 +36,37 @@ pub(crate) fn construct(
             .construct(
                 &inputs,
                 &mut data.scoped(&codec::operation_prefix(index)),
-                resources[index].take().expect("resource consumed once"),
+                resource,
             )
             .map_err(|source| setup_error(&node.id, source))?
             .into_parts();
-        codecs[index] = schema
-            .as_ref()
-            .map(|schema| {
-                SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
-                    FlowError::OutputCodec {
-                        operation_id: node.id.clone(),
-                        source,
-                    }
+        codecs.push(
+            schema
+                .as_ref()
+                .map(|schema| {
+                    SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
+                        FlowError::OutputCodec {
+                            operation_id: node.id.clone(),
+                            source,
+                        }
+                    })
                 })
-            })
-            .transpose()?;
-        schemas[index] = schema;
-        operations[index] = Some(operation);
+                .transpose()?,
+        );
+        schemas.push(schema);
+        operations.push(operation);
+        let kind = node.definition.kind();
+        if kind.is_scan() {
+            sources.push(index);
+        } else if kind.is_sink() {
+            sinks.push(index);
+        }
     }
     let frames = Frames::bind(data)?;
-    let sources = topology
-        .schedule
-        .iter()
-        .copied()
-        .filter(|&index| definition.operations[index].definition.kind().is_scan())
-        .collect();
-    let sinks = topology
-        .schedule
-        .iter()
-        .copied()
-        .filter(|&index| definition.operations[index].definition.kind().is_sink())
-        .collect();
     Ok(Runtime {
         definition,
         topology,
-        operations: operations
-            .into_iter()
-            .map(|operation| operation.expect("all operations constructed"))
-            .collect(),
+        operations,
         codecs,
         frames,
         sources,
