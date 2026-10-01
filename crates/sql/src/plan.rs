@@ -572,32 +572,22 @@ impl Lowerer<'_> {
         join_schema: &DFSchema,
         source_order: &[usize],
     ) -> Result<LoweredRelation, SqlError> {
-        if source_order.len() != join_schema.fields().len()
-            || source_order
-                .iter()
-                .any(|source| *source >= input.physical_schema.fields().len())
-        {
-            return Err(SqlError::invalid(
-                "DataFusion JOIN Schema and physical output shape diverged",
-            ));
-        }
-        let fields = source_order
+        let fields = join_schema
+            .fields()
             .iter()
-            .zip(join_schema.fields())
             .enumerate()
-            .map(|(index, (source, target))| SelectField {
-                name: internal_join_field_name(index),
-                expression: Expr::Column(Column::new_unqualified(
-                    input.physical_schema.field(*source).name(),
-                )),
-                nullable: Some(target.is_nullable()),
-                metadata: Some(target.metadata().clone()),
+            .map(|(index, field)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_name(internal_join_field_name(index))
             })
             .collect::<Vec<_>>();
-        let definition = SelectDefinition::try_new(fields)
-            .map_err(SqlError::endpoint)?
-            .with_metadata(join_schema.metadata().clone());
-        self.add_transform([input], definition)
+        let target = Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            join_schema.metadata().clone(),
+        ));
+        self.project_columns(input, source_order, &target)
     }
 
     fn add_transform<I, D>(&mut self, inputs: I, definition: D) -> Result<LoweredRelation, SqlError>

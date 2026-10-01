@@ -19,7 +19,7 @@ use crate::{
 
 // Development v1: persist the logical DAG; Flow derives atomic tails.
 // Update v1 golden fixtures in place; old development state is discarded, not migrated.
-const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1/call-stack";
+const IDENTITY_DOMAIN: &[u8] = b"dogpaddle-sql/program-identity/v1/call-stack/join-projection";
 pub(crate) const SINK_OPERATION_ID: &str = "sql/sink";
 
 pub(crate) fn scan_operation_id(index: usize) -> String {
@@ -62,6 +62,10 @@ impl SqlProgram {
     }
 
     /// Starts this program from new or existing durable state.
+    ///
+    /// Program identity includes the current deterministic assembly ABI.
+    /// An assembly change requires new state and rebuilt affected targets;
+    /// rejected existing state is never replaced or removed.
     ///
     /// # Errors
     ///
@@ -254,7 +258,7 @@ mod tests {
         );
         assert_eq!(
             blake3::Hash::from(identity).to_hex().as_str(),
-            "ed9c0edd4c9c98b9a0463ca28820988038fd0f97b4c44cc3410fb1bb211199d8"
+            "fc330c712fdb763201b7df1fd3c552e44b9b7b3800fced24bcb954d79c7821b2"
         );
     }
 

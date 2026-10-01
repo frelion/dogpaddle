@@ -92,7 +92,9 @@ let outcome = flow.advance()?;
 
 SQL crate 为 Program 计算稳定的 32 字节身份，并通过 `FlowFactory::owner_identity` 写入 canonical Flow Definition。`start` 先把 endpoint 参数解析成一次性快照，并将凭据/连接配置按逻辑 Operation ID 作为不透明 `RuntimeResource` 交给 Flow。状态路径不存在时，Flow 推导 Atomic 尾链，并通过统一 checked `construct` 取得类型化状态句柄；路径已存在时，它先比较 owner identity，再直接从持久 Definition 构造运行对象，重新推导相同尾链并校验持久调用帧。SQL 不声明算子持久数据，也没有自己的 materialize 层。
 
-SQL identity 使用固定的开发期 v1 域；开发期实现变更直接更新当前 v1 黄金测试，旧状态删除重建，不提供旧版本识别、迁移或兼容分支。
+SQL identity 使用唯一的开发期 v1 域 `dogpaddle-sql/program-identity/v1/call-stack/join-projection`；开发期实现变更直接更新当前 v1 黄金测试，不提供旧版本识别、迁移或兼容分支。
+
+Join 输出复用精确投影准入改变了确定性装配规则，本次域更新会改变所有 SQL Program 身份，也会改变由它派生的 source engine、slot 和 Sink ID。旧 SQL 状态及受影响目标需显式重建；用新程序打开旧状态会先报 owner identity 不匹配，原目录和数据保持不动，不会自动删除或替换。
 
 身份覆盖规范化查询、确定性装配 ABI，以及会改变持久语义的 endpoint 参数。密码、用户名、主机、端口、runtime 位置和环境变量名称不进入身份；因此可以轮换凭据或连接地址，但不能用另一份查询、另一张表或不同的持久参数接管已有状态。SQL 原文、AST、LogicalPlan、凭据和环境引用都不持久化。
 
@@ -196,8 +198,7 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
-非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier，再用同一 Atomic 尾链的
-`Select` 恢复 `DataFusion` 给出的字段顺序、nullability 和 metadata，并用无歧义的内部字段名继续父级 lowering；query 最终的 positional `Select` 再恢复 SQL 字段名。
+非右向 Join 先确定 kind 与输出列数，再按原输入顺序组装；Right Join 通过交换输入复用 Left 语义，同时交换 residual 的端口 qualifier。普通 Join 和 ASOF 的输出都使用无歧义的内部字段名，并复用 positional projection 准入：只有完整 Arrow Schema 相等且列位置是 identity 时才省略对齐 `Select`。需要重排的 Right Join，以及 nullability、字段或 Schema metadata 等差异，仍由同一 Atomic 尾链的 `Select` 精确对齐；query 最终的 positional `Select` 再恢复 SQL 字段名。
 
 `ASOF JOIN` 直接采用 `DataFusion` 的 Snowflake 风格语法，不建立另一套 SQL planner。每个 left row
 选择至多一个 right row，没有匹配时仍保留 left row，并把 right 字段补为 NULL。`MATCH_CONDITION`

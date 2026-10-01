@@ -1,5 +1,7 @@
-use dogpaddle_sql::SqlProgram;
-use dogpaddle_store::{Cell, OrderedMap, Store, StoreError};
+use dogpaddle_flow::{AdvanceOutcome, FlowError, FlowFactory};
+use dogpaddle_operation::operation::{scan::SequenceScanDefinition, sink::DiscardDefinition};
+use dogpaddle_sql::{SqlError, SqlProgram};
+use dogpaddle_store::{Cell, OrderedMap, Queue, ScanDirection, ScanLimit, Store, StoreError};
 
 #[test]
 fn physical_assembly_keeps_the_canonical_flow_definition() {
@@ -17,16 +19,93 @@ fn physical_assembly_keeps_the_canonical_flow_definition() {
     drop(program.start(&path).unwrap());
     let definition = read_definition(&path);
 
-    // The sole Flow JSON plan preserves the same owner, nodes and input ordinals.
+    // The sole Flow JSON fixes the current assembly owner, nodes and input ordinals.
     assert_eq!(
         (
             definition.len(),
             blake3::hash(&definition).to_hex().to_string(),
         ),
         (
-            1139,
-            "47ffefc94c1b887209e0da7264a1b67e55f727d91806429441e727524c049d91".to_owned(),
+            1143,
+            "a7e67982804701b94f57b759a5f4dea335f1171b910827f0206f1d5dcd8884ef".to_owned(),
         )
+    );
+}
+
+#[test]
+fn prior_assembly_identity_is_rejected_without_replacing_durable_state() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("flow");
+    // Prior SQL identity for the exact program below, before join projection reuse.
+    let old_identity =
+        *blake3::Hash::from_hex("ed9c0edd4c9c98b9a0463ca28820988038fd0f97b4c44cc3410fb1bb211199d8")
+            .unwrap()
+            .as_bytes();
+    let mut factory = FlowFactory::new(&path);
+    factory.owner_identity(old_identity);
+    let source = factory.operation("sequence", SequenceScanDefinition::new(7), []);
+    factory.operation("discard", DiscardDefinition::new(), [source]);
+    let mut flow = factory.build().unwrap();
+    assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    drop(flow);
+    let definition = read_definition(&path);
+
+    let program = SqlProgram::parse(
+        "INSERT INTO discard() SELECT value FROM sequence(start => 7) WHERE value > 10",
+    )
+    .unwrap();
+    assert!(matches!(
+        program.start(&path),
+        Err(SqlError::Flow(FlowError::OwnerIdentityMismatch))
+    ));
+    assert_eq!(read_definition(&path), definition);
+
+    {
+        let store = Store::open(&path).unwrap();
+        // Rebind every resource in the original five-entry typed catalog.
+        let _: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
+        let frames: OrderedMap<u32, Vec<u8>> = store.open_data("flow/frames").unwrap();
+        let outputs: OrderedMap<u32, Vec<u8>> = store.open_data("flow/outputs").unwrap();
+        let position: Cell<u64> = store
+            .open_data("operation/00000000/sequence_scan.position")
+            .unwrap();
+        let published: Queue<Vec<u8>> = store
+            .open_data("operation/00000000/sequence_scan.published")
+            .unwrap();
+        let transaction = store.read_transaction();
+        assert_eq!(
+            position.read(transaction.access()).unwrap().get().unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            published
+                .read(transaction.access())
+                .unwrap()
+                .queued_bytes()
+                .unwrap(),
+            0
+        );
+        for map in [frames, outputs] {
+            let page = map
+                .read(transaction.access())
+                .unwrap()
+                .scan(
+                    ..,
+                    ScanDirection::Ascending,
+                    None,
+                    ScanLimit::new(1, 64 * 1024).unwrap(),
+                )
+                .unwrap();
+            assert!(page.entries.is_empty());
+            assert!(page.continuation.is_none());
+        }
+    }
+    let mut factory = FlowFactory::new(&path);
+    factory.owner_identity(old_identity);
+    let reopened = factory.open().unwrap();
+    assert_eq!(
+        reopened.operation_ids().collect::<Vec<_>>(),
+        ["sequence", "discard"]
     );
 }
 
@@ -51,7 +130,6 @@ fn outer_join_residual_is_native_and_projection_retains_logical_identity() {
         "sql/scan/00000001",
         "sql/transform/00000000",
         "sql/transform/00000001",
-        "sql/transform/00000002",
         "sql/sink",
     ];
     assert_eq!(flow.operation_ids().collect::<Vec<_>>(), expected);
@@ -147,7 +225,6 @@ fn native_asof_join_lowers_all_directions_and_constraints() {
                 "sql/scan/00000001",
                 "sql/transform/00000000",
                 "sql/transform/00000001",
-                "sql/transform/00000002",
                 "sql/sink",
             ]
         );
